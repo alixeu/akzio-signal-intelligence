@@ -1,0 +1,63 @@
+[package]
+name = "orchestrator-cli"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+clap.workspace = true
+futures.workspace = true
+html-escape.workspace = true
+orchestrator-core = { path = "../orchestrator-core" }
+orchestrator-llm = { path = "../orchestrator-llm" }
+orchestrator-sql = { path = "../orchestrator-sql" }
+regex.workspace = true
+reqwest.workspace = true
+rusqlite.workspace = true
+scraper.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+urlencoding.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[[bin]]
+name = "orchestrator-exec"
+path = "src/bin/orchestrator_exec.rs"
+
+[[bin]]
+name = "orchestrator-sql"
+path = "src/bin/orchestrator_sql.rs"
+
+[[bin]]
+name = "report-email"
+path = "src/bin/report_email.rs"
+
+[[bin]]
+name = "fetch-jin10-flash"
+path = "src/bin/fetch_jin10_flash.rs"
+
+[[bin]]
+name = "fetch-youtube-transcript"
+path = "src/bin/fetch_youtube_transcript.rs"
+
+[[bin]]
+name = "fetch-wayinvideo-transcript"
+path = "src/bin/fetch_wayinvideo_transcript.rs"
+
+[[bin]]
+name = "run-technical-indicators"
+path = "src/bin/run_technical_indicators.rs"
+
+[[bin]]
+name = "fetch-last30days-context"
+path = "src/bin/fetch_last30days_context.rs"

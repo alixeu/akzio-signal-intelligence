@@ -1,0 +1,30 @@
+.DS_Store
+
+# Rust
+/target/
+**/*.rs.bk
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Local runtime outputs
+/outputs/
+/config/local*.yaml
+/config/*.local.yaml
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Codex and local indexes
+.codegraph/
+!AGENTS.md
+
+# Editor state
+.idea/
+.vscode/

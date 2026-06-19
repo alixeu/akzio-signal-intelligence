@@ -1,0 +1,38 @@
+[workspace]
+members = [
+    "crates/orchestrator-core",
+    "crates/orchestrator-sql",
+    "crates/orchestrator-llm",
+    "crates/orchestrator-cli",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+anyhow = "1.0.95"
+chrono = { version = "0.4.39", features = ["serde"] }
+clap = { version = "4.5.26", features = ["derive", "env"] }
+csv = "1.3.1"
+futures = "0.3.31"
+html-escape = "0.2.13"
+regex = "1.11.1"
+reqwest = { version = "0.12.12", default-features = false, features = ["json", "rustls-tls"] }
+rig-core = { version = "0.38.2", features = ["websocket"] }
+rusqlite = { version = "0.32.1", features = ["bundled", "chrono"] }
+schemars = "1.0.4"
+scraper = "0.22.0"
+serde = { version = "1.0.217", features = ["derive"] }
+serde_json = "1.0.135"
+serde_yaml = "0.9.34"
+sha2 = "0.10.8"
+tempfile = "3.15.0"
+thiserror = "2.0.11"
+tokio = { version = "1.43.0", features = ["full"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+urlencoding = "2.1.3"
+uuid = { version = "1.12.0", features = ["v4", "serde"] }

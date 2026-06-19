@@ -1,0 +1,142 @@
+orchestrator:
+  tickers: "QQQ,VIX,SOXX"
+  phase1_agents: "technical,news,youtube,reddit,x"
+  run_dir_pattern: "outputs/{dir_slug}/{date}_exec"
+  db_path: "outputs/orchestrator.sqlite"
+
+  data_source:
+    strict_sqlite: true
+    required_contexts:
+      - technical
+
+  runtime:
+    lang: zh
+    window_days: 150
+    max_debate_rounds: 5
+    max_topics_per_side: 10
+
+  web_search:
+    mode: live
+    provider: exa
+    base_url: "https://mcp.exa.ai/mcp"
+    api_key: ""
+    context_size: medium
+    max_result_chars: 12000
+
+  llm:
+    gateway:
+      base_url: &llm_gateway_base_url "https://oneapi-comate.baidu-int.com/v1"
+      api_key: &llm_gateway_api_key "sk-GASkzZyd3qELeEcC35D239D73f3c49D784659995B3114a6a"
+    defaults:
+      route: deepseek
+      model: DeepSeek-V4-Flash
+      base_url: *llm_gateway_base_url
+      api_key: *llm_gateway_api_key
+      native_web_search: false
+      max_turns: null
+      reasoning_effort: medium
+      transport: http
+      think_tool: false
+      tools: all
+    roles:
+      analyst.technical:
+        max_turns: 2
+        tools:
+          - read_run_context
+      analyst.news_macro: {}
+      analyst.youtube: {}
+      analyst.reddit: {}
+      analyst.x: {}
+      researcher.bull.initial: {}
+      researcher.bear.initial: {}
+      researcher.bull.interaction: {}
+      researcher.bear.interaction: {}
+      mediator.topic: {}
+      mediator.topic_controller: {}
+      reducer.evidence:
+        max_turns: 2
+        tools:
+          - read_run_context
+      reducer.debate_final: {}
+      manager.research:
+        tools:
+          - read_run_context
+      meta.memory_reflector:
+        max_turns: 4
+        tools:
+          - read_run_context
+
+  analyst_weights:
+    technical: 40.0
+    news_macro: 35.0
+    youtube: 8.0
+    reddit: 9.0
+    x: 8.0
+
+  prompts:
+    analyst:
+      technical: "prompts/analysts/technical.md"
+      news_macro: "prompts/analysts/news_macro.md"
+      youtube: "prompts/analysts/youtube.md"
+      reddit: "prompts/analysts/reddit.md"
+      x: "prompts/analysts/x.md"
+    phase2:
+      bull_initial: "prompts/researchers/bull_initial.md"
+      bull_interaction: "prompts/researchers/bull_interaction.md"
+      bear_initial: "prompts/researchers/bear_initial.md"
+      bear_interaction: "prompts/researchers/bear_interaction.md"
+    mediator:
+      topic: "prompts/mediators/topic_generation.md"
+    manager:
+      research: "prompts/managers/research_manager.md"
+    meta:
+      memory_reflector: "prompts/meta/memory_reflector.md"
+
+technical:
+  symbols: "QQQ,VIX,SOXX"
+  intervals: "1d,3h,20min"
+  days: 60
+  model: "TwelveDataTechnical"
+  api_key: "ad5ef13bed394201b5f1b9ef9c8b98ca"
+  sleep_sec: 9
+
+jin10:
+  api_url: "https://4a735ea38f8146198dc205d2e2d1bd28.z3c.jin10.com/flash"
+  channel: -8200
+  vip: 1
+  classify: "24,27,31,86,90,92,76,83,2,168,53,47,48,50,157,16"
+  lookback_hours: 24.0
+  pages: 200
+  sleep: 0.0
+  timeout: 15.0
+
+youtube:
+  default_channel: "rhino"
+  max_videos: 6
+  timeout_sec: 20
+  user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Codex TQQQ report"
+  channels:
+    rhino:
+      handle: "rhinofinance"
+      display_name: "Rhino Finance"
+      source_url: "https://youtube.com/@rhinofinance"
+
+wayinvideo:
+  task: "视频逐字稿"
+  existing_task_url: "https://wayinvideo-api.wayin.ai/api/highlight_moment/task"
+  timeout_sec: 60
+
+report:
+  mode: build-and-send
+  output_dir: "outputs/TQQQ"
+  default_run_dir_pattern: "outputs/QQQ_VIX_SOXX/{date}_exec"
+  subject_template: "TQQQ strategy report {date}"
+  email:
+    enabled: true
+    probability_threshold: 0.68
+    state_path: "outputs/TQQQ/report_email_state.json"
+    smtp_url: "smtps://smtp.mail.me.com:465"
+    username: "your-icloud-email@icloud.com"
+    password: "your-icloud-app-specific-password"
+    from: "your-icloud-email@icloud.com"
+    to: "recipient@example.com"

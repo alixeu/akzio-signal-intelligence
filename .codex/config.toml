@@ -1,0 +1,11 @@
+# Project-local Codex defaults.
+# User-level credentials, model providers, and plugin settings remain in ~/.codex/config.toml.
+
+persistent_instructions = "Follow AGENTS.md. Use CodeGraph for structural code questions and rtk-prefixed shell commands."
+
+[features]
+multi_agent = true
+
+[mcp_servers.codegraph]
+command = "codegraph"
+args = ["mcp"]
