@@ -5,7 +5,6 @@ use std::{future::Future, pin::Pin, time::Duration};
 
 const DEFAULT_MAX_RESULT_CHARS: usize = 12_000;
 const DEFAULT_MAX_RESULTS: usize = 5;
-const DEFAULT_TAVILY_BASE_URL: &str = "https://api.tavily.com";
 const DEFAULT_EXA_MCP_URL: &str = "https://mcp.exa.ai/mcp";
 const EXA_MCP_TIMEOUT_SECS: u64 = 25;
 const EXA_MCP_MAX_BODY_BYTES: u64 = 256 * 1024;
@@ -29,7 +28,6 @@ pub enum WebSearchMode {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WebSearchProviderKind {
-    Tavily,
     Exa,
     #[default]
     Mock,
@@ -118,18 +116,6 @@ pub fn validate_web_search_runtime_config(config: &WebSearchConfig, role: &str) 
             WebSearchProviderKind::Mock => Ok(()),
             WebSearchProviderKind::Exa => {
                 validate_optional_http_base_url(config.base_url.as_deref(), role)
-            }
-            WebSearchProviderKind::Tavily => {
-                validate_optional_http_base_url(config.base_url.as_deref(), role)?;
-                if config
-                    .api_key
-                    .as_deref()
-                    .map(str::trim)
-                    .is_some_and(|value| !value.is_empty())
-                {
-                    return Ok(());
-                }
-                bail!("web_search for role {role:?} requires api_key for tavily")
             }
         },
     }
@@ -367,146 +353,6 @@ impl WebSearchProvider for MockWebSearchProvider {
 
             assign_ref_ids(&mut results);
             Ok(results)
-        })
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct TavilyWebSearchProvider {
-    client: reqwest::Client,
-    base_url: reqwest::Url,
-    api_key: Option<String>,
-}
-
-impl TavilyWebSearchProvider {
-    pub fn from_config(config: &WebSearchConfig) -> Self {
-        let api_key = config
-            .api_key
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToString::to_string);
-        let base_url = tavily_base_url(config.base_url.as_deref());
-        Self {
-            client: reqwest::Client::new(),
-            base_url,
-            api_key,
-        }
-    }
-
-    fn search_depth(context_size: WebSearchContextSize) -> &'static str {
-        match context_size {
-            WebSearchContextSize::Low => "fast",
-            WebSearchContextSize::Medium => "basic",
-            WebSearchContextSize::High => "advanced",
-        }
-    }
-
-    fn search_url(&self) -> reqwest::Url {
-        self.base_url
-            .join("search")
-            .expect("validated Tavily base URL should join /search")
-    }
-}
-
-fn tavily_base_url(configured: Option<&str>) -> reqwest::Url {
-    let value = configured
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or(DEFAULT_TAVILY_BASE_URL);
-    reqwest::Url::parse(&ensure_trailing_slash(value)).unwrap_or_else(|_| {
-        reqwest::Url::parse(&ensure_trailing_slash(DEFAULT_TAVILY_BASE_URL))
-            .expect("default Tavily base URL should be valid")
-    })
-}
-
-fn ensure_trailing_slash(value: &str) -> String {
-    if value.ends_with('/') {
-        value.to_string()
-    } else {
-        format!("{value}/")
-    }
-}
-
-impl WebSearchProvider for TavilyWebSearchProvider {
-    fn search<'a>(
-        &'a self,
-        queries: Vec<SearchQuery>,
-        options: WebSearchOptions,
-    ) -> WebSearchFuture<'a, Vec<SearchResult>> {
-        Box::pin(async move {
-            let api_key = self
-                .api_key
-                .as_deref()
-                .filter(|value| !value.trim().is_empty())
-                .context("web search provider API key is missing")?;
-            let mut all_results = Vec::new();
-            for query in queries {
-                let query_text = query.q.trim();
-                if query_text.is_empty() {
-                    bail!("tavily web search requires a non-empty query");
-                }
-                let include_domains =
-                    merged_allowed_domains(&options.allowed_domains, &query.domains);
-                let mut body = json!({
-                    "query": query_text,
-                    "search_depth": Self::search_depth(options.context_size),
-                    "max_results": DEFAULT_MAX_RESULTS,
-                    "include_answer": false,
-                    "include_raw_content": false,
-                    "include_images": false,
-                    "include_domains": include_domains,
-                    "exclude_domains": options.blocked_domains,
-                });
-                if let Some(recency) = query.recency {
-                    body["time_range"] = Value::String(recency_to_time_range(recency).to_string());
-                }
-                let response = self
-                    .client
-                    .post(self.search_url())
-                    .bearer_auth(api_key)
-                    .json(&body)
-                    .timeout(Duration::from_secs(30))
-                    .send()
-                    .await
-                    .context("web search provider request failed")?;
-                if !response.status().is_success() {
-                    bail!("web search provider returned an error");
-                }
-                let payload: Value = response
-                    .json()
-                    .await
-                    .context("web search provider returned invalid JSON")?;
-                if let Some(items) = payload.get("results").and_then(Value::as_array) {
-                    all_results.extend(items.iter().filter_map(|item| {
-                        let url = item.get("url").and_then(Value::as_str)?.trim();
-                        let title = item
-                            .get("title")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .trim();
-                        let snippet = item
-                            .get("content")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .trim();
-                        Some(SearchResult {
-                            ref_id: String::new(),
-                            title: first_chars(title, options.max_result_chars),
-                            url: url.to_string(),
-                            snippet: first_chars(snippet, options.max_result_chars),
-                            published_at: item
-                                .get("published_date")
-                                .or_else(|| item.get("publishedAt"))
-                                .and_then(Value::as_str)
-                                .map(ToString::to_string),
-                            source: Some("tavily".to_string()),
-                        })
-                    }));
-                }
-            }
-            assign_ref_ids(&mut all_results);
-            Ok(all_results)
         })
     }
 }
@@ -763,15 +609,6 @@ fn merged_allowed_domains(global: &[String], query: &[String]) -> Vec<String> {
     }
 }
 
-fn recency_to_time_range(days: u32) -> &'static str {
-    match days {
-        0 | 1 => "day",
-        2..=7 => "week",
-        8..=31 => "month",
-        _ => "year",
-    }
-}
-
 fn assign_ref_ids(results: &mut [SearchResult]) {
     for (index, result) in results.iter_mut().enumerate() {
         result.ref_id = format!("search{index}");
@@ -891,7 +728,7 @@ mod tests {
         let global = WebSearchConfig {
             mode: WebSearchMode::Cached,
             provider: WebSearchProviderKind::Mock,
-            base_url: Some("https://gateway.example.com/tavily".to_string()),
+            base_url: Some("https://gateway.example.com/exa".to_string()),
             api_key: Some("global-key".to_string()),
             context_size: WebSearchContextSize::Low,
             allowed_domains: vec!["example.com".to_string()],
@@ -900,7 +737,7 @@ mod tests {
         };
         let role = WebSearchConfigOverride {
             mode: Some(WebSearchMode::Live),
-            provider: Some(WebSearchProviderKind::Tavily),
+            provider: Some(WebSearchProviderKind::Exa),
             api_key: Some("role-key".to_string()),
             allowed_domains: Some(vec!["role.example".to_string()]),
             max_result_chars: Some(8_000),
@@ -910,58 +747,16 @@ mod tests {
         let merged = global.merge_override(Some(&role));
 
         assert_eq!(merged.mode, WebSearchMode::Live);
-        assert_eq!(merged.provider, WebSearchProviderKind::Tavily);
+        assert_eq!(merged.provider, WebSearchProviderKind::Exa);
         assert_eq!(
             merged.base_url.as_deref(),
-            Some("https://gateway.example.com/tavily")
+            Some("https://gateway.example.com/exa")
         );
         assert_eq!(merged.api_key.as_deref(), Some("role-key"));
         assert_eq!(merged.context_size, WebSearchContextSize::Low);
         assert_eq!(merged.allowed_domains, vec!["role.example"]);
         assert_eq!(merged.blocked_domains, vec!["blocked.example"]);
         assert_eq!(merged.max_result_chars, 8_000);
-    }
-
-    #[test]
-    fn tavily_provider_uses_configurable_base_url() {
-        let provider = TavilyWebSearchProvider::from_config(&WebSearchConfig {
-            provider: WebSearchProviderKind::Tavily,
-            base_url: Some("https://gateway.example.com/tavily".to_string()),
-            ..WebSearchConfig::default()
-        });
-
-        assert_eq!(
-            provider.search_url().as_str(),
-            "https://gateway.example.com/tavily/search"
-        );
-    }
-
-    #[test]
-    fn tavily_provider_defaults_to_official_base_url() {
-        let provider = TavilyWebSearchProvider::from_config(&WebSearchConfig {
-            provider: WebSearchProviderKind::Tavily,
-            ..WebSearchConfig::default()
-        });
-
-        assert_eq!(
-            provider.search_url().as_str(),
-            "https://api.tavily.com/search"
-        );
-    }
-
-    #[test]
-    fn tavily_base_url_requires_http_or_https_when_live() {
-        let config = WebSearchConfig {
-            mode: WebSearchMode::Live,
-            provider: WebSearchProviderKind::Tavily,
-            base_url: Some("file:///tmp/tavily".to_string()),
-            api_key: Some("test-key".to_string()),
-            ..WebSearchConfig::default()
-        };
-
-        let err = validate_web_search_runtime_config(&config, "analyst.news_macro").unwrap_err();
-
-        assert!(err.to_string().contains("must use http or https"));
     }
 
     #[test]

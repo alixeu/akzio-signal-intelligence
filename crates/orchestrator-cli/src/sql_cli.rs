@@ -86,7 +86,10 @@ pub fn run(args: SqlArgs) -> Result<Value> {
 fn read_command(command: SqlCommand) -> Result<Value> {
     let (name, read_args) = read_command_name_args(command);
     let ctx = runtime_context()?;
-    let conn = connect(&ctx.db_path)?;
+    let db_path = std::env::var("ORCH_DB_PATH")
+        .map(std::path::PathBuf::from)
+        .with_context(|| "ORCH_DB_PATH is required")?;
+    let conn = connect(&db_path)?;
     handle_read_command(
         &conn,
         name,
@@ -122,7 +125,6 @@ fn read_command_name_args(command: SqlCommand) -> (&'static str, ReadArgs) {
 }
 
 fn runtime_context() -> Result<RuntimeContext> {
-    let db_path = env_required("ORCH_DB_PATH")?;
     let run_id = env_required("ORCH_RUN_ID")?;
     let ticker = env::var("ORCH_TICKER").unwrap_or_default();
     let tickers = parse_tickers(env::var("ORCH_TICKERS").unwrap_or_else(|_| ticker.clone()));
@@ -132,7 +134,6 @@ fn runtime_context() -> Result<RuntimeContext> {
         .unwrap_or(0);
     let role = env::var("ORCH_ROLE").unwrap_or_default();
     Ok(RuntimeContext {
-        db_path: PathBuf::from(db_path),
         run_id,
         ticker,
         tickers,

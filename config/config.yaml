@@ -28,8 +28,8 @@ orchestrator:
       base_url: &llm_gateway_base_url "https://oneapi-comate.baidu-int.com/v1"
       api_key: &llm_gateway_api_key "sk-GASkzZyd3qELeEcC35D239D73f3c49D784659995B3114a6a"
     defaults:
-      route: deepseek
-      model: DeepSeek-V4-Flash
+      route: responses
+      model: gpt-5.4
       base_url: *llm_gateway_base_url
       api_key: *llm_gateway_api_key
       native_web_search: false

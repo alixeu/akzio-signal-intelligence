@@ -13,12 +13,12 @@
 - current_date: {date}
 
 上下文读取要求：
-- 先使用 `read_run_context` 读取 `research_inputs`，从中获取 Phase 1 brief、debate brief 和 Phase 3 final research artifact。
+- 先使用 `read_run_context` 读取 `prior_memory`（带 ticker、limit=20、include_body=true），再读取 `research_inputs`，从中获取历史长期记忆、Phase 1 brief、debate brief 和 Phase 3 final research artifact。
 - 不要请求 raw SQL，不要调用未配置的历史或投资记忆工具。
 
 历史引用规则：
 - 新 thesis 使用 `thesis.status = "new"`，`prior_thesis_id = null`。
-- 更新旧 thesis 只能基于本次 run 已入库上下文中的明确 prior thesis 标识；然后使用 `thesis.status = "update"` 并填写非空 `prior_thesis_id`。
+- 更新旧 thesis 只能基于 `prior_memory` 返回的明确 `memory_id`；然后使用 `thesis.status = "update"` 并把 `prior_thesis_id` 填为该 `memory_id`。
 - 如果无法确认旧 thesis 标识，必须标记为 `new`，不要伪造 prior id。
 
 输出要求：

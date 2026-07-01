@@ -1,12 +1,9 @@
 pub mod cli_config;
-pub mod exec;
-pub mod jin10;
-pub mod report;
-pub mod social;
 pub mod sql_cli;
-pub mod technical;
-pub mod wayinvideo;
-pub mod youtube;
+
+pub use orchestrator_ingest::{jin10, social, technical, wayinvideo, youtube};
+pub use orchestrator_report::report;
+pub use orchestrator_workflow::exec;
 
 pub fn init_tracing() {
     let _ = tracing_subscriber::fmt()

@@ -8,11 +8,6 @@ use std::collections::BTreeMap;
 
 pub fn import_jin10_payload(conn: &mut Connection, payload: &Value) -> Result<usize> {
     ensure_schema(conn)?;
-    let fetched_at = payload
-        .get("fetched_at")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
     let items = payload
         .get("items")
         .and_then(Value::as_array)
@@ -36,8 +31,8 @@ pub fn import_jin10_payload(conn: &mut Connection, payload: &Value) -> Result<us
         tx.execute(
             r#"
             INSERT OR REPLACE INTO jin10_items
-                (event_key, item_time, content, item_json, content_hash, fetched_at, imported_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                (event_key, item_time, content, item_json, content_hash, imported_at)
+            VALUES (?, ?, ?, ?, ?, ?)
             "#,
             params![
                 event_key,
@@ -45,7 +40,6 @@ pub fn import_jin10_payload(conn: &mut Connection, payload: &Value) -> Result<us
                 content,
                 item_json,
                 content_hash,
-                fetched_at,
                 imported_at
             ],
         )?;

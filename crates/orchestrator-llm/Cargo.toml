@@ -8,12 +8,12 @@ publish.workspace = true
 [dependencies]
 anyhow.workspace = true
 orchestrator-core = { path = "../orchestrator-core" }
+orchestrator-ingest = { path = "../orchestrator-ingest" }
 orchestrator-sql = { path = "../orchestrator-sql" }
 futures.workspace = true
 rig-core.workspace = true
 reqwest.workspace = true
 rusqlite.workspace = true
-schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

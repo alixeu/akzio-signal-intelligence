@@ -1,8 +1,8 @@
 use anyhow::{bail, Context, Result};
+use orchestrator_core;
 use orchestrator_sql::{
     append_agent_turn_item, session_history_items, update_agent_turn_end,
-    update_agent_turn_item_content, upsert_agent_turn, write_turn_tool_call, AgentTurnInput,
-    AgentTurnItemInput, TurnToolCallInput,
+    update_agent_turn_item_content, upsert_agent_turn, AgentTurnInput, AgentTurnItemInput,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -10,11 +10,12 @@ use std::{
     collections::{BTreeMap, VecDeque},
     future::Future,
     pin::Pin,
+    time::Duration,
 };
 use tracing::{debug, warn};
 use uuid::Uuid;
 
-use crate::tools;
+use crate::tools::{self, truncate_chars};
 use crate::RigSettings;
 
 const DEFAULT_MAX_AGENT_LOOPS: usize = 8;
@@ -54,25 +55,12 @@ impl TurnItemType {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolMode {
-    Blocking,
-    Background,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCallRequest {
     pub call_id: String,
     pub name: String,
     #[serde(default)]
     pub arguments: Value,
-    #[serde(default = "default_tool_mode")]
-    pub mode: ToolMode,
-}
-
-fn default_tool_mode() -> ToolMode {
-    ToolMode::Blocking
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,8 +72,6 @@ pub struct ToolResultItem {
     pub output: Value,
     #[serde(default)]
     pub error: Option<String>,
-    #[serde(default)]
-    pub background_job_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -400,6 +386,7 @@ impl Turn {
 
 #[derive(Debug, Clone)]
 pub struct ModelInput {
+    pub system_instruction: Option<String>,
     pub items: Vec<TurnItem>,
     pub available_tools: Vec<String>,
 }
@@ -493,11 +480,11 @@ pub(crate) fn response_to_stream_events(response: ModelResponse) -> Result<Vec<M
     Ok(events)
 }
 
-pub trait LoopToolRuntime {
+pub trait LoopToolRuntime: Send + Sync {
     fn set_turn_context(&mut self, _context: ToolRuntimeTurnContext) {}
 
     fn execute<'a>(
-        &'a mut self,
+        &'a self,
         call: ToolCallRequest,
     ) -> Pin<Box<dyn Future<Output = ToolResultItem> + Send + 'a>>;
 }
@@ -508,13 +495,6 @@ pub struct ToolRuntimeTurnContext {
     pub session_id: String,
     pub turn_id: String,
     pub role: String,
-}
-
-pub struct JsonPromptModel<F>
-where
-    F: for<'a> FnMut(&'a str) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> + Send,
-{
-    prompt_fn: F,
 }
 
 pub struct RigLoopModel {
@@ -552,37 +532,12 @@ impl LoopModel for RigLoopModel {
     }
 }
 
-impl<F> JsonPromptModel<F>
-where
-    F: for<'a> FnMut(&'a str) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> + Send,
-{
-    pub fn new(prompt_fn: F) -> Self {
-        Self { prompt_fn }
-    }
-}
-
-impl<F> LoopModel for JsonPromptModel<F>
-where
-    F: for<'a> FnMut(&'a str) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> + Send,
-{
-    fn generate<'a>(
-        &'a mut self,
-        input: ModelInput,
-    ) -> Pin<Box<dyn Future<Output = Result<ModelResponse>> + Send + 'a>> {
-        Box::pin(async move {
-            let prompt = react_prompt(&input)?;
-            let text = (self.prompt_fn)(&prompt).await?;
-            let value = extract_json_value(&text)?;
-            parse_react_response(value)
-        })
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct AgentLoopConfig {
     pub max_agent_loops: Option<usize>,
     pub history_limit: usize,
     pub compact_after_items: usize,
+    pub max_context_tokens: Option<usize>,
 }
 
 impl Default for AgentLoopConfig {
@@ -591,6 +546,7 @@ impl Default for AgentLoopConfig {
             max_agent_loops: Some(DEFAULT_MAX_AGENT_LOOPS),
             history_limit: 200,
             compact_after_items: 120,
+            max_context_tokens: Some(orchestrator_core::token::MAX_PROMPT_TOKENS),
         }
     }
 }
@@ -681,53 +637,41 @@ where
 
         if !turn.pending_tool_calls.is_empty() {
             let calls = std::mem::take(&mut turn.pending_tool_calls);
-            for call in calls {
-                let call_id = call.call_id.clone();
-                let call_name = call.name.clone();
-                let call_args = call.arguments.clone();
-                debug!(
-                    turn_id = turn.turn_id,
-                    call_id = call.call_id,
-                    tool = call.name,
-                    mode = ?call.mode,
-                    "agent loop tool call starting"
-                );
-                emit_tool_call_status(turn, sink, &call, AgentItemStatus::Running).await?;
-                let result = tools.execute(call).await;
-                write_turn_tool_call(
-                    conn,
-                    &TurnToolCallInput {
-                        run_id: turn.run_id.clone(),
-                        turn_id: turn.turn_id.clone(),
-                        role: turn.role.clone(),
-                        phase: turn.phase,
-                        ticker: turn
-                            .model_context
-                            .lines()
-                            .find_map(|line| line.strip_prefix("tickers="))
-                            .and_then(|value| value.split(',').next())
-                            .unwrap_or_default()
-                            .to_string(),
-                        item_time: String::new(),
-                        topic_id: None,
-                        debate_id: None,
-                        tool_call_id: call_id,
-                        tool_type: call_name.clone(),
-                        tool_name: call_name,
-                        args_json: call_args,
-                        status: result.status.clone(),
-                        error: result.error.clone().unwrap_or_default(),
-                    },
-                )?;
-                debug!(
-                    turn_id = turn.turn_id,
-                    call_id = result.call_id,
-                    tool = result.name,
-                    status = result.status,
-                    background_job_id = result.background_job_id,
-                    error = result.error,
-                    "agent loop tool call completed"
-                );
+
+            // Emit "running" status for all tools (sequentially, fast)
+            for call in &calls {
+                emit_tool_call_status(turn, sink, call, AgentItemStatus::Running).await?;
+            }
+
+            // Execute all tools concurrently
+            let futures: Vec<_> = calls
+                .into_iter()
+                .map(|call| async {
+                    let call_id = call.call_id.clone();
+                    let name = call.name.clone();
+                    debug!(
+                        turn_id = turn.turn_id,
+                        call_id = call_id,
+                        tool = name,
+                        "agent loop tool call starting"
+                    );
+                    let result = tools.execute(call).await;
+                    debug!(
+                        turn_id = turn.turn_id,
+                        call_id = result.call_id,
+                        tool = result.name,
+                        status = result.status,
+                        error = result.error,
+                        "agent loop tool call completed"
+                    );
+                    (result, call_id, name)
+                })
+                .collect();
+
+            let results = futures::future::join_all(futures).await;
+
+            // Emit results and append to DB (sequentially, in completion order)
+            for (result, _call_id, _name) in results {
                 emit_tool_result(turn, sink, &result).await?;
                 append_turn_item(conn, turn, &TurnItem::tool_result(&result))?;
             }
@@ -1058,9 +1002,29 @@ fn build_model_input(
         append_turn_item(conn, turn, &item)?;
         items = vec![item];
     }
+    if let Some(max_tokens) = config.max_context_tokens {
+        let mut kept: Vec<TurnItem> = Vec::new();
+        let mut total_tokens = 0usize;
+        for item in items.iter().rev() {
+            let tokens = orchestrator_core::token::estimate_turn_item_tokens(
+                item.item_type.as_str(),
+                &item.role,
+                &item.content_text,
+                &item.content_json,
+            );
+            if total_tokens + tokens <= max_tokens || kept.is_empty() {
+                total_tokens += tokens;
+                kept.push(item.clone());
+            }
+        }
+        kept.reverse();
+        items = kept;
+    }
+    let tools = turn_available_tools(turn);
     Ok(ModelInput {
         items,
-        available_tools: turn_available_tools(turn),
+        available_tools: tools.clone(),
+        system_instruction: Some(react_system_instruction(&tools)),
     })
 }
 
@@ -1298,7 +1262,6 @@ impl<'a, S: AgentEventSink> ModelStreamHandler<'a, S> {
                     turn_id = self.turn.turn_id,
                     call_id = tool_call.call_id,
                     tool = tool_call.name,
-                    mode = ?tool_call.mode,
                     "model stream tool call requested"
                 );
                 let item = TurnItem::tool_call(&tool_call);
@@ -1492,7 +1455,27 @@ pub(crate) fn assistant_message_needs_follow_up(text: &str) -> bool {
     .any(|pattern| lower.contains(pattern) || trimmed.contains(pattern))
 }
 
-pub fn react_prompt(input: &ModelInput) -> Result<String> {
+pub fn react_system_instruction(available_tools: &[String]) -> String {
+    format!(
+        "You are running inside an agent loop runtime. Decide the next step from these ordered context items.\n\
+Return newline-delimited JSON events only. Each line must be one complete JSON object, with no markdown fences.\n\
+Use assistant message events for visible text. Intermediate explanations, plans, and current action notes should be emitted as assistant_message items; the runtime records them as commentary until the turn truly ends.\n\
+Supported event shapes:\n\
+{{\"type\":\"assistant_message_started\",\"item_id\":\"msg-1\"}}\n\
+{{\"type\":\"assistant_text_delta\",\"item_id\":\"msg-1\",\"delta\":\"visible text chunk\"}}\n\
+{{\"type\":\"assistant_message_completed\",\"item_id\":\"msg-1\"}}\n\
+{{\"type\":\"reasoning_summary_delta\",\"item_id\":\"reasoning-1\",\"delta\":\"brief reasoning summary chunk\"}}\n\
+{{\"type\":\"reasoning_summary_completed\",\"item_id\":\"reasoning-1\"}}\n\
+{{\"type\":\"plan_update_completed\",\"item_id\":\"plan-1\",\"content\":\"plan or status update\"}}\n\
+{{\"type\":\"tool_call_completed\",\"tool_call\":{{\"call_id\":\"call-1\",\"name\":\"tool_name\",\"arguments\":{{}},\"mode\":\"blocking\"}}}}\n\
+{{\"type\":\"response_completed\",\"end_turn\":true}}\n\
+If you need a tool, emit any visible commentary first, then tool_call_completed, then response_completed with end_turn=false. If tool results answer the task, emit the final assistant_message and response_completed with end_turn=true. A final assistant_message must be the complete role artifact, preferably one JSON object with id, role, status, report, and per_ticker. Do not end the turn with text saying you are about to retry, fetch, analyze, or wait for inputs; call the tool or produce the final artifact. For web.run use {{\"search_query\":[{{\"q\":\"TQQQ QQQ VIX site:reddit.com\",\"domains\":[\"reddit.com\"],\"numResults\":10}}],\"response_length\":\"medium\"}}. For fetch_last30days_context use {{\"source\":\"reddit\",\"tickers\":[\"TQQQ\"]}}. The runtime also accepts the older single-object response shape only as a compatibility fallback.\n\n\
+Available tools:\n{}",
+        serde_json::to_string_pretty(available_tools).unwrap_or_default()
+    )
+}
+
+pub(crate) fn react_context_prompt(input: &ModelInput) -> Result<String> {
     let items = input
         .items
         .iter()
@@ -1507,25 +1490,13 @@ pub fn react_prompt(input: &ModelInput) -> Result<String> {
             })
         })
         .collect::<Vec<_>>();
-    Ok(format!(
-        "You are running inside an agent loop runtime. Decide the next step from these ordered context items.\n\
-Return newline-delimited JSON events only. Each line must be one complete JSON object, with no markdown fences.\n\
-Use assistant message events for visible text. Intermediate explanations, plans, and current action notes should be emitted as assistant_message items; the runtime records them as commentary until the turn truly ends.\n\
-Supported event shapes:\n\
-{{\"type\":\"assistant_message_started\",\"item_id\":\"msg-1\"}}\n\
-{{\"type\":\"assistant_text_delta\",\"item_id\":\"msg-1\",\"delta\":\"visible text chunk\"}}\n\
-{{\"type\":\"assistant_message_completed\",\"item_id\":\"msg-1\"}}\n\
-{{\"type\":\"reasoning_summary_delta\",\"item_id\":\"reasoning-1\",\"delta\":\"brief reasoning summary chunk\"}}\n\
-{{\"type\":\"reasoning_summary_completed\",\"item_id\":\"reasoning-1\"}}\n\
-{{\"type\":\"plan_update_completed\",\"item_id\":\"plan-1\",\"content\":\"plan or status update\"}}\n\
-{{\"type\":\"tool_call_completed\",\"tool_call\":{{\"call_id\":\"call-1\",\"name\":\"tool_name\",\"arguments\":{{}},\"mode\":\"blocking\"}}}}\n\
-{{\"type\":\"response_completed\",\"end_turn\":true}}\n\
-If you need a tool, emit any visible commentary first, then tool_call_completed, then response_completed with end_turn=false. If tool results answer the task, emit the final assistant_message and response_completed with end_turn=true. A final assistant_message must be the complete role artifact, preferably one JSON object with id, role, status, report, and per_ticker. Do not end the turn with text saying you are about to retry, fetch, analyze, or wait for inputs; call the tool or produce the final artifact. For web.run use {{\"search_query\":[{{\"q\":\"TQQQ QQQ VIX site:reddit.com\",\"domains\":[\"reddit.com\"],\"numResults\":10}}],\"response_length\":\"medium\"}}. For fetch_last30days_context use {{\"source\":\"reddit\",\"tickers\":[\"TQQQ\"]}}. The runtime also accepts the older single-object response shape only as a compatibility fallback.\n\n\
-Available tools:\n{}\n\n\
-Context items:\n{}",
-        serde_json::to_string_pretty(&input.available_tools)?,
-        serde_json::to_string_pretty(&items)?
-    ))
+    Ok(serde_json::to_string_pretty(&items)?)
+}
+
+pub fn react_prompt(input: &ModelInput) -> Result<String> {
+    let system = react_system_instruction(&input.available_tools);
+    let context = react_context_prompt(input)?;
+    Ok(format!("{system}\n\nContext items:\n{context}"))
 }
 
 pub(crate) fn extract_json_value(text: &str) -> Result<Value> {
@@ -1563,23 +1534,16 @@ pub fn compact_summary_card(items: &[TurnItem]) -> String {
     )
 }
 
-fn truncate_chars(value: &str, max_chars: usize) -> String {
-    if value.chars().count() <= max_chars {
-        return value.to_string();
-    }
-    let mut out = value.chars().take(max_chars).collect::<String>();
-    out.push_str("\n[truncated]");
-    out
-}
-
+#[cfg(test)]
 pub struct StaticToolRuntime {
-    tools: BTreeMap<String, Box<dyn Fn(Value) -> ToolResultItem + Send>>,
+    tools: BTreeMap<String, Box<dyn Fn(Value) -> ToolResultItem + Send + Sync>>,
 }
 
 pub struct ProjectToolRuntime {
     config: tools::ExternalToolConfig,
     web_run: Option<tools::WebRunRuntime>,
     turn_context: Option<ToolRuntimeTurnContext>,
+    cache: std::sync::Arc<std::sync::Mutex<orchestrator_core::cache::TtlCache>>,
 }
 
 impl ProjectToolRuntime {
@@ -1588,6 +1552,9 @@ impl ProjectToolRuntime {
             config,
             web_run: None,
             turn_context: None,
+            cache: std::sync::Arc::new(std::sync::Mutex::new(
+                orchestrator_core::cache::TtlCache::new(),
+            )),
         }
     }
 
@@ -1610,14 +1577,17 @@ impl LoopToolRuntime for ProjectToolRuntime {
     }
 
     fn execute<'a>(
-        &'a mut self,
+        &'a self,
         call: ToolCallRequest,
     ) -> Pin<Box<dyn Future<Output = ToolResultItem> + Send + 'a>> {
+        let config = self.config.clone();
+        let web_run = self.web_run.clone();
+        let turn_context = self.turn_context.clone();
+        let cache = self.cache.clone();
         Box::pin(async move {
             debug!(
                 call_id = call.call_id,
                 tool = call.name,
-                mode = ?call.mode,
                 "project tool runtime dispatching tool"
             );
             if call.name == "think" {
@@ -1630,10 +1600,9 @@ impl LoopToolRuntime for ProjectToolRuntime {
                         "summary": call.arguments
                     }),
                     error: None,
-                    background_job_id: None,
                 };
             }
-            let web_run_config = self.web_run.as_ref().map(tools::WebRunRuntime::config);
+            let web_run_config = web_run.as_ref().map(tools::WebRunRuntime::config);
             if call.name != tools::WEB_RUN_TOOL_NAME
                 && !tools::enabled_tool_names(web_run_config).contains(&call.name.as_str())
             {
@@ -1648,20 +1617,35 @@ impl LoopToolRuntime for ProjectToolRuntime {
                     status: "error".to_string(),
                     output: Value::Null,
                     error: Some("unknown tool name".to_string()),
-                    background_job_id: None,
                 };
             }
             let call_id = call.call_id;
             let name = call.name;
+            // TTL cache: check before dispatching
+            let cache_meta: Option<(String, Duration)> =
+                orchestrator_core::cache::cache_key_for_args(&name, &call.arguments).zip(
+                    orchestrator_core::cache::ttl_for_tool(&name, &call.arguments),
+                );
+            if let Some((ref key, _ttl)) = cache_meta {
+                if let Some(cached) = cache.lock().unwrap().get(key) {
+                    return ToolResultItem {
+                        call_id,
+                        name,
+                        status: "completed".to_string(),
+                        output: cached.clone(),
+                        error: None,
+                    };
+                }
+            }
             if name == tools::WEB_RUN_TOOL_NAME {
-                let output = if let Some(web_run) = &self.web_run {
+                let output = if let Some(web_run) = &web_run {
                     web_run.execute(call.arguments).await
                 } else {
                     tools::execute_named_tool(
                         &name,
                         call.arguments,
-                        &self.config,
-                        self.turn_context.as_ref(),
+                        &config,
+                        turn_context.as_ref(),
                         None,
                     )
                     .await
@@ -1669,13 +1653,15 @@ impl LoopToolRuntime for ProjectToolRuntime {
                 return match output {
                     Ok(output) => {
                         debug!(call_id, tool = name, "web.run tool completed");
+                        if let Some((ref key, ttl)) = cache_meta {
+                            cache.lock().unwrap().set(key.clone(), output.clone(), ttl);
+                        }
                         ToolResultItem {
                             call_id,
                             name,
                             status: "completed".to_string(),
                             output,
                             error: None,
-                            background_job_id: None,
                         }
                     }
                     Err(error) => {
@@ -1686,7 +1672,6 @@ impl LoopToolRuntime for ProjectToolRuntime {
                             status: "error".to_string(),
                             output: Value::Null,
                             error: Some(error.to_string()),
-                            background_job_id: None,
                         }
                     }
                 };
@@ -1694,21 +1679,23 @@ impl LoopToolRuntime for ProjectToolRuntime {
             match tools::execute_named_tool(
                 &name,
                 call.arguments,
-                &self.config,
-                self.turn_context.as_ref(),
-                self.web_run.as_ref(),
+                &config,
+                turn_context.as_ref(),
+                web_run.as_ref(),
             )
             .await
             {
                 Ok(output) => {
                     debug!(call_id, tool = name, "project tool completed");
+                    if let Some((ref key, ttl)) = cache_meta {
+                        cache.lock().unwrap().set(key.clone(), output.clone(), ttl);
+                    }
                     ToolResultItem {
                         call_id,
                         name,
                         status: "completed".to_string(),
                         output,
                         error: None,
-                        background_job_id: None,
                     }
                 }
                 Err(error) => {
@@ -1719,7 +1706,6 @@ impl LoopToolRuntime for ProjectToolRuntime {
                         status: "error".to_string(),
                         output: Value::Null,
                         error: Some(error.to_string()),
-                        background_job_id: None,
                     }
                 }
             }
@@ -1727,6 +1713,7 @@ impl LoopToolRuntime for ProjectToolRuntime {
     }
 }
 
+#[cfg(test)]
 impl StaticToolRuntime {
     pub fn new() -> Self {
         Self {
@@ -1736,21 +1723,23 @@ impl StaticToolRuntime {
 
     pub fn add_tool<F>(&mut self, name: impl Into<String>, tool: F)
     where
-        F: Fn(Value) -> ToolResultItem + Send + 'static,
+        F: Fn(Value) -> ToolResultItem + Send + Sync + 'static,
     {
         self.tools.insert(name.into(), Box::new(tool));
     }
 }
 
+#[cfg(test)]
 impl Default for StaticToolRuntime {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(test)]
 impl LoopToolRuntime for StaticToolRuntime {
     fn execute<'a>(
-        &'a mut self,
+        &'a self,
         call: ToolCallRequest,
     ) -> Pin<Box<dyn Future<Output = ToolResultItem> + Send + 'a>> {
         Box::pin(async move {
@@ -1761,7 +1750,6 @@ impl LoopToolRuntime for StaticToolRuntime {
                     status: "error".to_string(),
                     output: Value::Null,
                     error: Some("unknown tool name".to_string()),
-                    background_job_id: None,
                 };
             };
             tool(call.arguments)
@@ -1920,7 +1908,6 @@ mod tests {
             call_id: "call-1".to_string(),
             name: "echo".to_string(),
             arguments: json!({"text": "observed"}),
-            mode: ToolMode::Blocking,
         }];
         let mut model = FakeModel::new(vec![
             first,
@@ -1933,7 +1920,6 @@ mod tests {
             status: "completed".to_string(),
             output: args,
             error: None,
-            background_job_id: None,
         });
         let mut turn = Turn::new("turn-1", "session-1", "run-1", "analyst.test", "start");
 
@@ -2233,7 +2219,6 @@ mod tests {
                     call_id: "call-1".to_string(),
                     name: "echo".to_string(),
                     arguments: json!({"text": "observed"}),
-                    mode: ToolMode::Blocking,
                 }],
                 end_turn: false,
                 raw: json!({"step": 1}),
@@ -2253,7 +2238,6 @@ mod tests {
             status: "completed".to_string(),
             output: args,
             error: None,
-            background_job_id: None,
         });
         let mut turn = Turn::new("turn-1", "session-1", "run-1", "analyst.test", "start");
 
@@ -2302,7 +2286,6 @@ mod tests {
                     call_id: "call-web".to_string(),
                     name: tools::WEB_RUN_TOOL_NAME.to_string(),
                     arguments: json!({"search_query": [{"q": "TQQQ liquidity"}]}),
-                    mode: ToolMode::Blocking,
                 }],
                 end_turn: false,
                 raw: json!({"step": 1}),

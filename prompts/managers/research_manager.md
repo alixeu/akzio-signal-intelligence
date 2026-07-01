@@ -60,6 +60,15 @@
 - `probability_drivers` 的 impact 合计应约等于 `debate_adjustment`；如果不相等，必须解释 rounding 或冲突折扣。
 - 不允许用“Bull 说得更好”“Bear 更有说服力”作为 driver；必须落到遗漏、误读、未计价、证据缺口、重复计权或主导驱动。
 
+### ETF 结构质量调整
+
+对于 ETF ticker，probability_drivers 必须额外包括：
+- `structural_quality`: ETF 结构（费用率、跟踪误差、流动性）是否支持或削弱方向性判断
+- `flow_pressure`: AUM 变化 / 资金流是否与方向性判断一致，是否存在资金流背离
+- `leverage_decay` (杠杆 ETF 专属): 路径依赖损耗是否显著改变了概率估计；若 VIX 高企且行情震荡，概率应收敛
+
+这些 driver 的来源应为 Phase 1 news_macro analyst 的 ETF 基本面覆盖结果。若 news_macro 未覆盖某项，标记为 `missing_from_phase1` 并降权。
+
 **最终写出概率前，逐项回答**：
 - `base_probability` 是多少，来自 weighted base 哪些维度？
 - Mediator 压缩出的 `agreed_facts` 和 `decision_hinges` 是什么？
@@ -86,7 +95,7 @@
 - 多 ticker 时必须使用已入库记录的 `ticker` 与 artifact 的 `per_ticker` 字段分别更新 QQQ、VIX、SOXX 等标的；不得把 `QQQ,VIX,SOXX` 混合作为一个单独 ticker 的概率。
 
 **上下文读取要求：**
-- 先使用 `read_run_context` 读取 `compose_context`（带 ticker、token_budget），从中获取 Phase 1 加权基础概率、Phase 2 辩论历史和 Phase 2.5 中间人压缩；需要细查时再读取 `research_inputs`。
+- 先使用 `read_run_context` 读取 `prior_memory`（带 ticker、limit=20、include_body=true），再读取 `compose_context`（带 ticker、token_budget），从中获取可复用长期记忆、Phase 1 加权基础概率、Phase 2 辩论历史和 Phase 2.5 中间人压缩；需要细查时再读取 `research_inputs`。
 - 需要按 topic 细查时使用 `read_run_context` 读取 `topic_state` / `debate_history`。
 - 不要请求 raw SQL，不要调用未配置的历史搜索工具。
 

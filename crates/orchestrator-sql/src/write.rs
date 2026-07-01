@@ -43,13 +43,7 @@ pub struct AgentMessageInput {
 #[derive(Debug, Clone)]
 pub struct RunRecordInput<'a> {
     pub run_id: &'a str,
-    pub ticker: &'a str,
-    pub tickers: &'a [String],
     pub current_date: &'a str,
-    pub mode: &'a str,
-    pub run_dir: &'a str,
-    pub db_path: &'a str,
-    pub config: &'a Value,
 }
 
 #[derive(Debug, Clone)]
@@ -90,24 +84,6 @@ pub struct AgentTurnItemInput {
 }
 
 #[derive(Debug, Clone)]
-pub struct TurnToolCallInput {
-    pub run_id: String,
-    pub turn_id: String,
-    pub role: String,
-    pub phase: Option<i64>,
-    pub ticker: String,
-    pub item_time: String,
-    pub topic_id: Option<String>,
-    pub debate_id: Option<String>,
-    pub tool_call_id: String,
-    pub tool_type: String,
-    pub tool_name: String,
-    pub args_json: Value,
-    pub status: String,
-    pub error: String,
-}
-
-#[derive(Debug, Clone)]
 pub struct RoleTurnSummaryInput {
     pub run_id: String,
     pub turn_id: String,
@@ -121,10 +97,6 @@ pub struct RoleTurnSummaryInput {
     pub summary: String,
     pub summary_json: Value,
     pub confidence: f64,
-}
-
-pub fn parse_tickers_for_sql(raw: &str) -> Vec<String> {
-    parse_tickers(raw)
 }
 
 pub fn safe_ticker_value(ticker: &str, scope: Scope) -> Result<(&str, Scope)> {
@@ -158,38 +130,16 @@ pub fn new_message_group_id(
     format!("{:x}", hasher.finalize())[..24].to_string()
 }
 
-pub fn write_run_record(conn: &mut Connection, input: RunRecordInput<'_>) -> Result<()> {
-    ensure_schema(conn)?;
+pub fn write_run_record(conn: &mut Connection, input: &RunRecordInput) -> Result<()> {
     let tx = conn.transaction()?;
-    let now = Utc::now().to_rfc3339();
     tx.execute(
-        r#"
-        INSERT OR REPLACE INTO runs
-            (run_id, ticker, tickers_json, current_date, mode, run_dir, db_path, created_at, config_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        "#,
-        params![
+        "INSERT OR REPLACE INTO runs (run_id, current_date, created_at) VALUES (?1, ?2, ?3)",
+        rusqlite::params![
             input.run_id,
-            input.ticker,
-            serde_json::to_string(input.tickers)?,
             input.current_date,
-            input.mode,
-            input.run_dir,
-            input.db_path,
-            now,
-            serde_json::to_string(input.config)?
+            chrono::Utc::now().to_rfc3339()
         ],
     )?;
-    tx.execute(
-        "DELETE FROM run_tickers WHERE run_id = ?",
-        params![input.run_id],
-    )?;
-    for (ordinal, ticker) in input.tickers.iter().enumerate() {
-        tx.execute(
-            "INSERT OR REPLACE INTO run_tickers (run_id, ticker, ordinal) VALUES (?, ?, ?)",
-            params![input.run_id, ticker, ordinal as i64],
-        )?;
-    }
     tx.commit()?;
     Ok(())
 }
@@ -258,33 +208,46 @@ pub fn update_agent_turn_end(
 
 pub fn append_agent_turn_item(conn: &Connection, input: &AgentTurnItemInput) -> Result<i64> {
     ensure_schema(conn)?;
-    let next_index: i64 = conn.query_row(
-        "SELECT COALESCE(MAX(item_index), -1) + 1 FROM agent_turn_items WHERE turn_id = ?",
-        params![input.turn_id],
-        |row| row.get(0),
-    )?;
-    conn.execute(
-        r#"
-        INSERT INTO agent_turn_items
-            (turn_id, session_id, run_id, item_index, item_type, role, tool_call_id,
-             tool_name, content_json, content_text, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        "#,
-        params![
-            input.turn_id,
-            input.session_id,
-            input.run_id,
-            next_index,
-            input.item_type,
-            input.role,
-            input.tool_call_id,
-            input.tool_name,
-            serde_json::to_string(&input.content_json)?,
-            input.content_text,
-            Utc::now().to_rfc3339()
-        ],
-    )?;
-    Ok(conn.last_insert_rowid())
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| -> Result<i64> {
+        let next_index: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(item_index), -1) + 1 FROM agent_turn_items WHERE turn_id = ?",
+            params![input.turn_id],
+            |row| row.get(0),
+        )?;
+        conn.execute(
+            r#"
+            INSERT INTO agent_turn_items
+                (turn_id, session_id, run_id, item_index, item_type, role, tool_call_id,
+                 tool_name, content_json, content_text, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+            params![
+                input.turn_id,
+                input.session_id,
+                input.run_id,
+                next_index,
+                input.item_type,
+                input.role,
+                input.tool_call_id,
+                input.tool_name,
+                serde_json::to_string(&input.content_json)?,
+                input.content_text,
+                Utc::now().to_rfc3339()
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    })();
+    match result {
+        Ok(row_id) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(row_id)
+        }
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
 }
 
 pub fn update_agent_turn_item_content(
@@ -305,42 +268,6 @@ pub fn update_agent_turn_item_content(
     if updated == 0 {
         bail!("agent_turn_items row id {row_id} does not exist");
     }
-    Ok(())
-}
-
-pub fn write_turn_tool_call(conn: &Connection, input: &TurnToolCallInput) -> Result<()> {
-    ensure_schema(conn)?;
-    if input.ticker.contains(',') {
-        bail!(
-            "turn_tool_calls cannot use comma-joined ticker {:?}",
-            input.ticker
-        );
-    }
-    conn.execute(
-        r#"
-        INSERT OR REPLACE INTO turn_tool_calls
-            (run_id, turn_id, role, phase, ticker, item_time, topic_id, debate_id,
-             tool_call_id, tool_type, tool_name, args_json, status, error, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        "#,
-        params![
-            input.run_id,
-            input.turn_id,
-            input.role,
-            input.phase,
-            input.ticker,
-            input.item_time,
-            input.topic_id,
-            input.debate_id,
-            input.tool_call_id,
-            input.tool_type,
-            input.tool_name,
-            serde_json::to_string(&input.args_json)?,
-            input.status,
-            input.error,
-            Utc::now().to_rfc3339()
-        ],
-    )?;
     Ok(())
 }
 
@@ -456,38 +383,19 @@ fn write_dedicated_source_item(
     imported_at: &str,
 ) -> Result<usize> {
     match input.source.as_str() {
-        "reddit" => conn
+        "reddit" | "x" => conn
             .execute(
                 r#"
-                INSERT OR REPLACE INTO reddit_items
-                    (item_key, ticker, item_time, subreddit, title, content, item_json, content_hash, imported_at)
+                INSERT OR REPLACE INTO social_items
+                    (source, item_key, ticker, item_time, title, content, item_json, content_hash, imported_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 "#,
                 params![
+                    input.source,
                     input.item_key,
                     input.ticker,
                     input.item_time,
-                    input.item_json.get("subreddit").and_then(Value::as_str).unwrap_or_default(),
                     input.item_json.get("title").and_then(Value::as_str).unwrap_or_default(),
-                    input.content,
-                    item_json,
-                    content_hash,
-                    imported_at
-                ],
-            )
-            .map_err(Into::into),
-        "x" => conn
-            .execute(
-                r#"
-                INSERT OR REPLACE INTO x_items
-                    (item_key, ticker, item_time, author, content, item_json, content_hash, imported_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                "#,
-                params![
-                    input.item_key,
-                    input.ticker,
-                    input.item_time,
-                    input.item_json.get("author").and_then(Value::as_str).unwrap_or_default(),
                     input.content,
                     item_json,
                     content_hash,
@@ -504,16 +412,14 @@ fn write_dedicated_source_item(
             conn.execute(
                 r#"
                 INSERT OR REPLACE INTO youtube_videos
-                    (video_id, ticker, published_at, title, channel, url, item_json, content_hash, imported_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (video_id, ticker, published_at, title, item_json, content_hash, imported_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 "#,
                 params![
                     video_id,
                     input.ticker,
                     input.item_time,
                     input.item_json.get("title").and_then(Value::as_str).unwrap_or_default(),
-                    input.item_json.get("channel").and_then(Value::as_str).unwrap_or_default(),
-                    input.item_json.get("url").and_then(Value::as_str).unwrap_or_default(),
                     item_json,
                     content_hash,
                     imported_at

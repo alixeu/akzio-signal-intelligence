@@ -19,6 +19,8 @@ use crate::web_search::{
 };
 pub use crate::web_search::{WebSearchConfig, WebSearchProvider};
 
+use orchestrator_ingest::{jin10, social, technical};
+
 pub const WEB_RUN_TOOL_NAME: &str = "web.run";
 const WEB_RUN_MAX_SEARCH_QUERIES: usize = 4;
 const WEB_RUN_MAX_QUERY_CHARS: usize = 512;
@@ -124,6 +126,23 @@ pub struct FetchJin10FlashArgs {
     pub classify: Option<String>,
     #[serde(default)]
     pub output: Option<String>,
+}
+
+impl FetchJin10FlashArgs {
+    fn to_ingest_args(&self) -> jin10::Jin10Args {
+        jin10::Jin10Args {
+            lookback_hours: self.lookback_hours,
+            pages: self.pages,
+            classify: self.classify.clone(),
+            channel: None,
+            vip: None,
+            sleep: None,
+            timeout: None,
+            output: String::new(),
+            jsonl: String::new(),
+            pretty: false,
+        }
+    }
 }
 
 impl rig_core::tool::Tool for FetchJin10FlashTool {
@@ -322,7 +341,8 @@ impl rig_core::tool::Tool for ReadRunContextTool {
                             "technical_20min",
                             "role_summaries",
                             "turn_context",
-                            "jin10"
+                            "jin10",
+                            "prior_memory"
                         ]
                     },
                     "run_id": {"type": "string"},
@@ -332,7 +352,13 @@ impl rig_core::tool::Tool for ReadRunContextTool {
                     "role": {"type": "string"},
                     "topic_id": {"type": "string"},
                     "turn_id": {"type": "string"},
-                    "token_budget": {"type": "integer"}
+                    "token_budget": {"type": "integer"},
+                    "query": {"type": "string"},
+                    "memory_types": {"type": "array", "items": {"type": "string"}},
+                    "statuses": {"type": "array", "items": {"type": "string"}},
+                    "include_expired": {"type": "boolean"},
+                    "limit": {"type": "integer"},
+                    "include_body": {"type": "boolean"}
                 },
                 "required": ["kind"],
                 "additionalProperties": false
@@ -372,6 +398,27 @@ pub struct RunTechnicalIndicatorsArgs {
     pub model: Option<String>,
     #[serde(default)]
     pub db_path: Option<String>,
+}
+
+impl RunTechnicalIndicatorsArgs {
+    fn to_ingest_args(&self, db_path: Option<PathBuf>) -> technical::TechnicalArgs {
+        technical::TechnicalArgs {
+            symbols: if self.symbols.is_empty() {
+                None
+            } else {
+                Some(self.symbols.join(","))
+            },
+            intervals: self.intervals.join(","),
+            start: self.start.clone(),
+            end: self.end.clone(),
+            days: self.days,
+            db_path,
+            model: self.model.clone(),
+            api_key: None,
+            timeout: None,
+            sleep: None,
+        }
+    }
 }
 
 impl rig_core::tool::Tool for RunTechnicalIndicatorsTool {
@@ -434,6 +481,15 @@ pub struct FetchLast30DaysContextArgs {
     pub limit: Option<usize>,
     #[serde(default)]
     pub depth: Option<String>,
+}
+
+impl FetchLast30DaysContextArgs {
+    fn effective_tickers(&self) -> Vec<String> {
+        if !self.tickers.is_empty() {
+            return self.tickers.clone();
+        }
+        self.ticker.clone().into_iter().collect()
+    }
 }
 
 impl rig_core::tool::Tool for FetchLast30DaysContextTool {
@@ -1279,7 +1335,7 @@ fn clean_text_field(value: &str) -> String {
         .to_string()
 }
 
-fn truncate_chars(value: &str, max_chars: usize) -> String {
+pub(crate) fn truncate_chars(value: &str, max_chars: usize) -> String {
     if value.chars().count() <= max_chars {
         return value.to_string();
     }
@@ -1348,12 +1404,12 @@ pub async fn execute_named_tool(
             }
         }
         FetchJin10FlashTool::NAME => {
-            let args = serde_json::from_value::<FetchJin10FlashArgs>(args)
+            let tool_args = serde_json::from_value::<FetchJin10FlashArgs>(args)
                 .context("invalid fetch_jin10_flash arguments")?;
-            let result = FetchJin10FlashTool::new(config.clone())
-                .call(args)
+            let ingest_args = tool_args.to_ingest_args();
+            let result = jin10::run(ingest_args)
                 .await
-                .map_err(|error| anyhow::anyhow!(error.to_string()));
+                .map_err(|e| anyhow::anyhow!("{e}"));
             log_named_tool_result(name, &result);
             result
         }
@@ -1378,22 +1434,47 @@ pub async fn execute_named_tool(
             result
         }
         RunTechnicalIndicatorsTool::NAME => {
-            let args = serde_json::from_value::<RunTechnicalIndicatorsArgs>(args)
+            let tool_args = serde_json::from_value::<RunTechnicalIndicatorsArgs>(args)
                 .context("invalid run_technical_indicators arguments")?;
-            let result = RunTechnicalIndicatorsTool::new(config.clone())
-                .call(args)
+            let db_path = config.db_path.clone();
+            let ingest_args = tool_args.to_ingest_args(db_path);
+            let result = technical::run(ingest_args)
                 .await
-                .map_err(|error| anyhow::anyhow!(error.to_string()));
+                .map_err(|e| anyhow::anyhow!("{e}"));
             log_named_tool_result(name, &result);
             result
         }
         FetchLast30DaysContextTool::NAME => {
-            let args = serde_json::from_value::<FetchLast30DaysContextArgs>(args)
+            let tool_args = serde_json::from_value::<FetchLast30DaysContextArgs>(args)
                 .context("invalid fetch_last30days_context arguments")?;
-            let result = FetchLast30DaysContextTool::new(config.clone())
-                .call(args)
+            let tickers = tool_args.effective_tickers();
+            let tickers = if tickers.is_empty() {
+                config.tickers.clone()
+            } else {
+                tickers
+            };
+            let source = normalize_last30days_source(tool_args.source.as_deref());
+            let source_enum = match source {
+                Some("reddit") => social::Source::Reddit,
+                Some("x") | Some("twitter") => social::Source::X,
+                Some("youtube") => social::Source::Youtube,
+                _ => social::Source::Reddit,
+            };
+            let social_args = social::SocialArgs {
+                source: source_enum,
+                tickers,
+                days: tool_args.days.unwrap_or(30),
+                depth: match tool_args.depth.as_deref() {
+                    Some("quick") => social::Depth::Quick,
+                    Some("deep") => social::Depth::Deep,
+                    _ => social::Depth::Balanced,
+                },
+                limit: tool_args.limit,
+                ..Default::default()
+            };
+            let result = social::run(social_args)
                 .await
-                .map_err(|error| anyhow::anyhow!(error.to_string()));
+                .map_err(|e| anyhow::anyhow!("{e}"));
             log_named_tool_result(name, &result);
             result
         }
@@ -1499,6 +1580,22 @@ mod tests {
 
         assert_eq!(output["query"], "get-technical-context");
         assert!(output["daily"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn read_run_context_schema_exposes_prior_memory() {
+        let definition = ReadRunContextTool::new(external_config())
+            .definition(String::new())
+            .await;
+        let kinds = definition.parameters["properties"]["kind"]["enum"]
+            .as_array()
+            .unwrap();
+
+        assert!(kinds.iter().any(|kind| kind == "prior_memory"));
+        assert!(definition.parameters["properties"].get("query").is_some());
+        assert!(definition.parameters["properties"]
+            .get("include_body")
+            .is_some());
     }
 
     #[tokio::test]
@@ -1736,7 +1833,6 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("domain is not allowed"));
-        assert!(!output.to_string().contains("TAVILY"));
     }
 
     #[derive(Debug)]

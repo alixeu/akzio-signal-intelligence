@@ -4,6 +4,10 @@ members = [
     "crates/orchestrator-sql",
     "crates/orchestrator-llm",
     "crates/orchestrator-cli",
+    "crates/orchestrator-domain",
+    "crates/orchestrator-workflow",
+    "crates/orchestrator-ingest",
+    "crates/orchestrator-report",
 ]
 resolver = "2"
 
@@ -16,15 +20,14 @@ publish = false
 anyhow = "1.0.95"
 chrono = { version = "0.4.39", features = ["serde"] }
 clap = { version = "4.5.26", features = ["derive", "env"] }
-csv = "1.3.1"
 futures = "0.3.31"
 html-escape = "0.2.13"
 regex = "1.11.1"
 reqwest = { version = "0.12.12", default-features = false, features = ["json", "rustls-tls"] }
 rig-core = { version = "0.38.2", features = ["websocket"] }
 rusqlite = { version = "0.32.1", features = ["bundled", "chrono"] }
-schemars = "1.0.4"
 scraper = "0.22.0"
+schemars = "1.0.4"
 serde = { version = "1.0.217", features = ["derive"] }
 serde_json = "1.0.135"
 serde_yaml = "0.9.34"

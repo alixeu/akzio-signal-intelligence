@@ -1,15 +1,13 @@
-use crate::AGGREGATE_TICKER;
+use crate::{read_prior_memory, PriorMemoryQuery, AGGREGATE_TICKER};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use rusqlite::{params, params_from_iter, Connection, Row};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
 pub struct RuntimeContext {
-    pub db_path: PathBuf,
     pub run_id: String,
     pub ticker: String,
     pub tickers: Vec<String>,
@@ -17,7 +15,7 @@ pub struct RuntimeContext {
     pub role: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct RunContextReadRequest {
     #[serde(default)]
     pub kind: String,
@@ -37,6 +35,18 @@ pub struct RunContextReadRequest {
     pub turn_id: Option<String>,
     #[serde(default)]
     pub token_budget: Option<usize>,
+    #[serde(default)]
+    pub query: Option<String>,
+    #[serde(default)]
+    pub memory_types: Vec<String>,
+    #[serde(default)]
+    pub statuses: Vec<String>,
+    #[serde(default)]
+    pub include_expired: bool,
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub include_body: bool,
 }
 
 pub fn read_run_context(conn: &mut Connection, request: &RunContextReadRequest) -> Result<Value> {
@@ -55,9 +65,27 @@ pub fn read_run_context(conn: &mut Connection, request: &RunContextReadRequest) 
     match kind {
         "jin10" | "jin10_context" => return jin10_context(conn),
         "technical" | "technical_context" => return technical_context(conn),
-        "technical_daily" => return technical_table_context(conn, "technical_daily_indicators"),
-        "technical_3h" => return technical_table_context(conn, "technical_3h_indicators"),
-        "technical_20min" => return technical_table_context(conn, "technical_20min_indicators"),
+        "technical_daily" => return technical_interval_context(conn, "daily"),
+        "technical_3h" => return technical_interval_context(conn, "3h"),
+        "technical_20min" => return technical_interval_context(conn, "20min"),
+        "prior_memory" => {
+            return read_prior_memory(
+                conn,
+                &PriorMemoryQuery {
+                    query: request.query.clone(),
+                    ticker: request.ticker.clone(),
+                    memory_types: request.memory_types.clone(),
+                    statuses: if request.statuses.is_empty() {
+                        vec!["active".to_string()]
+                    } else {
+                        request.statuses.clone()
+                    },
+                    include_expired: request.include_expired,
+                    limit: request.limit.unwrap_or(20),
+                    include_body: request.include_body,
+                },
+            )
+        }
         _ => {}
     }
     let run_id = request
@@ -69,7 +97,6 @@ pub fn read_run_context(conn: &mut Connection, request: &RunContextReadRequest) 
         .unwrap_or_else(|| latest_run_id(conn))?;
     let ticker = request.ticker.clone().unwrap_or_default();
     let ctx = RuntimeContext {
-        db_path: PathBuf::new(),
         run_id: run_id.clone(),
         ticker: ticker.clone(),
         tickers: request.tickers.clone(),
@@ -283,20 +310,18 @@ fn collect_technical_blocks(
     ctx: &RuntimeContext,
     blocks: &mut Vec<ContextBlock>,
 ) -> Result<()> {
-    for (table, context_type) in [
-        ("technical_daily_indicators", "technical_daily"),
-        ("technical_3h_indicators", "technical_3h"),
-        ("technical_20min_indicators", "technical_20min"),
+    for (interval, context_type) in [
+        ("daily", "technical_daily"),
+        ("3h", "technical_3h"),
+        ("20min", "technical_20min"),
     ] {
-        let sql = format!(
-            "SELECT id, ticker, kline_time, indicator_name, indicator_value, unit, model, payload_json
-             FROM {table}
-             WHERE (? = '' OR ticker = ?)
+        let sql = "SELECT id, ticker, kline_time, indicator_name, indicator_value, unit, model, payload_json
+             FROM technical_indicators
+             WHERE interval = ? AND (? = '' OR ticker = ?)
              ORDER BY kline_time DESC
-             LIMIT 40"
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params![ctx.ticker, ctx.ticker], |row| {
+             LIMIT 40";
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map(params![interval, ctx.ticker, ctx.ticker], |row| {
             let id: i64 = row.get("id")?;
             let payload_json: String = row.get("payload_json")?;
             let name: String = row.get("indicator_name")?;
@@ -305,13 +330,13 @@ fn collect_technical_blocks(
             let model: String = row.get("model")?;
             Ok(ContextBlock {
                 context_type: context_type.to_string(),
-                context_ref: format!("{table}:{id}"),
+                context_ref: format!("technical_indicators:{id}"),
                 ticker: row.get("ticker")?,
                 item_time: row.get("kline_time")?,
                 title: format!("{context_type} {name}"),
                 content: format!("{name}={value}{unit} model={model}"),
                 weight: 1.5,
-                source_table: table.to_string(),
+                source_table: "technical_indicators".to_string(),
                 item_json: serde_json::from_str(&payload_json)
                     .unwrap_or(Value::String(payload_json)),
             })
@@ -340,32 +365,7 @@ fn collect_external_blocks(
         blocks,
     )?;
     collect_youtube_transcript_blocks(conn, ctx, blocks)?;
-    collect_simple_external_blocks(
-        conn,
-        ExternalTable {
-            table: "reddit_items",
-            context_type: "reddit",
-            key_column: "item_key",
-            time_column: "item_time",
-            title_column: "title",
-            content_column: "content",
-        },
-        ctx,
-        blocks,
-    )?;
-    collect_simple_external_blocks(
-        conn,
-        ExternalTable {
-            table: "x_items",
-            context_type: "x",
-            key_column: "item_key",
-            time_column: "item_time",
-            title_column: "author",
-            content_column: "content",
-        },
-        ctx,
-        blocks,
-    )?;
+    collect_social_blocks(conn, ctx, blocks)?;
     Ok(())
 }
 
@@ -456,6 +456,39 @@ fn collect_youtube_transcript_blocks(
     Ok(())
 }
 
+fn collect_social_blocks(
+    conn: &Connection,
+    ctx: &RuntimeContext,
+    blocks: &mut Vec<ContextBlock>,
+) -> Result<()> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT source, item_key, ticker, item_time, title, content, item_json
+        FROM social_items
+        WHERE source IN ('reddit', 'x') AND (? = '' OR ticker = ?)
+        ORDER BY item_time DESC
+        LIMIT 80
+        "#,
+    )?;
+    let rows = stmt.query_map(params![ctx.ticker, ctx.ticker], |row| {
+        let item_json: String = row.get("item_json")?;
+        let source: String = row.get("source")?;
+        Ok(ContextBlock {
+            context_type: source,
+            context_ref: format!("social_items:{}", row.get::<_, String>("item_key")?),
+            ticker: row.get("ticker")?,
+            item_time: row.get("item_time")?,
+            title: row.get("title")?,
+            content: row.get("content")?,
+            weight: 1.0,
+            source_table: "social_items".to_string(),
+            item_json: serde_json::from_str(&item_json).unwrap_or(Value::String(item_json)),
+        })
+    })?;
+    blocks.extend(rows.collect::<rusqlite::Result<Vec<_>>>()?);
+    Ok(())
+}
+
 fn collect_turn_history_blocks(
     conn: &Connection,
     ctx: &RuntimeContext,
@@ -531,9 +564,9 @@ fn write_turn_context_items(
         tx.execute(
             r#"
             INSERT INTO turn_context_items
-                (run_id, turn_id, role, phase, ticker, item_time, topic_id, debate_id,
+                (run_id, turn_id, role, phase, ticker, item_time, topic_id,
                  context_type, context_ref, content, item_json, weight, content_hash, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
             params![
                 ctx.run_id,
@@ -752,19 +785,16 @@ pub fn context_count(conn: &Connection, name: &str) -> Result<i64> {
     }
     let sql = match name {
         "technical" | "technical-context" | "technical_context" => {
-            "SELECT
-                (SELECT COUNT(*) FROM technical_daily_indicators) +
-                (SELECT COUNT(*) FROM technical_3h_indicators) +
-                (SELECT COUNT(*) FROM technical_20min_indicators)"
+            "SELECT COUNT(*) FROM technical_indicators"
         }
-        "technical_daily" => "SELECT COUNT(*) FROM technical_daily_indicators",
-        "technical_3h" => "SELECT COUNT(*) FROM technical_3h_indicators",
-        "technical_20min" => "SELECT COUNT(*) FROM technical_20min_indicators",
+        "technical_daily" => "SELECT COUNT(*) FROM technical_indicators WHERE interval = 'daily'",
+        "technical_3h" => "SELECT COUNT(*) FROM technical_indicators WHERE interval = '3h'",
+        "technical_20min" => "SELECT COUNT(*) FROM technical_indicators WHERE interval = '20min'",
         "jin10" | "jin10-context" => "SELECT COUNT(*) FROM jin10_items",
         "youtube" | "sources" => "SELECT COUNT(*) FROM youtube_videos",
         "youtube_transcripts" => "SELECT COUNT(*) FROM youtube_transcripts",
-        "reddit" => "SELECT COUNT(*) FROM reddit_items",
-        "x" => "SELECT COUNT(*) FROM x_items",
+        "reddit" => "SELECT COUNT(*) FROM social_items WHERE source = 'reddit'",
+        "x" => "SELECT COUNT(*) FROM social_items WHERE source = 'x'",
         other => {
             return if table_exists(conn, other)? {
                 conn.query_row(&format!("SELECT COUNT(*) FROM {other}"), [], |row| {
@@ -796,9 +826,9 @@ fn jin10_context(conn: &Connection) -> Result<Value> {
 }
 
 fn technical_context(conn: &Connection) -> Result<Value> {
-    let daily = technical_rows(conn, "technical_daily_indicators")?;
-    let three_hour = technical_rows(conn, "technical_3h_indicators")?;
-    let twenty_minute = technical_rows(conn, "technical_20min_indicators")?;
+    let daily = technical_rows(conn, "daily")?;
+    let three_hour = technical_rows(conn, "3h")?;
+    let twenty_minute = technical_rows(conn, "20min")?;
     Ok(json!({
         "query": "get-technical-context",
         "daily": daily,
@@ -807,25 +837,26 @@ fn technical_context(conn: &Connection) -> Result<Value> {
     }))
 }
 
-fn technical_table_context(conn: &Connection, table: &str) -> Result<Value> {
+fn technical_interval_context(conn: &Connection, interval: &str) -> Result<Value> {
     Ok(json!({
-        "query": table,
-        "items": technical_rows(conn, table)?
+        "query": interval,
+        "items": technical_rows(conn, interval)?
     }))
 }
 
-fn technical_rows(conn: &Connection, table: &str) -> Result<Vec<Value>> {
-    if !table_exists(conn, table)? {
+fn technical_rows(conn: &Connection, interval: &str) -> Result<Vec<Value>> {
+    if !table_exists(conn, "technical_indicators")? {
         return Ok(Vec::new());
     }
-    let mut stmt = conn.prepare(&format!(
+    let mut stmt = conn.prepare(
         "SELECT id, ticker, kline_time, indicator_name, indicator_value, unit, model, payload_json, imported_at
-         FROM {table}
+         FROM technical_indicators
+         WHERE interval = ?
          ORDER BY kline_time DESC, indicator_name ASC
          LIMIT 80"
-    ))?;
+    )?;
     let rows = stmt
-        .query_map([], |row| {
+        .query_map([interval], |row| {
             let payload_json: String = row.get("payload_json")?;
             Ok(json!({
                 "id": row.get::<_, i64>("id")?,
@@ -947,20 +978,7 @@ fn external_sources_context(conn: &Connection) -> Result<Value> {
         "published_at",
         "title",
     )?);
-    rows.extend(source_table_rows(
-        conn,
-        "reddit_items",
-        "reddit",
-        "item_time",
-        "content",
-    )?);
-    rows.extend(source_table_rows(
-        conn,
-        "x_items",
-        "x",
-        "item_time",
-        "content",
-    )?);
+    rows.extend(social_source_rows(conn)?);
     Ok(json!({"query": "source-items", "items": rows}))
 }
 
@@ -983,6 +1001,28 @@ fn source_table_rows(
             let item_json: String = row.get("item_json")?;
             Ok(json!({
                 "source": source,
+                "ticker": row.get::<_, String>("ticker")?,
+                "time": row.get::<_, String>("item_time")?,
+                "content": row.get::<_, String>("content")?,
+                "item": serde_json::from_str::<Value>(&item_json).unwrap_or(Value::String(item_json))
+            }))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+fn social_source_rows(conn: &Connection) -> Result<Vec<Value>> {
+    let sql = "SELECT source, ticker, item_time, content, item_json
+         FROM social_items
+         WHERE source IN ('reddit', 'x')
+         ORDER BY imported_at DESC, item_time DESC
+         LIMIT 80";
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt
+        .query_map(params![], |row| {
+            let item_json: String = row.get("item_json")?;
+            Ok(json!({
+                "source": row.get::<_, String>("source")?,
                 "ticker": row.get::<_, String>("ticker")?,
                 "time": row.get::<_, String>("item_time")?,
                 "content": row.get::<_, String>("content")?,

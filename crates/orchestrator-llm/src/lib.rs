@@ -1,55 +1,37 @@
 use agent_loop::{
     AgentLoopConfig, ModelEventHandler, ModelStreamEvent, ProjectToolRuntime, RigLoopModel,
-    ToolCallRequest, ToolMode, Turn,
+    ToolCallRequest, Turn,
 };
 use anyhow::{bail, Context, Result};
 use futures::StreamExt;
 use orchestrator_core::{
     default_project_root, extract_json_artifact, validate_research_artifact, ResearchArtifact,
 };
-use orchestrator_sql::{handle_read_command, AgentMessageInput, RuntimeContext};
 use rig_core::{
     agent::AgentBuilder,
     client::CompletionClient,
-    completion::{CompletionModel, Prompt, TypedPrompt},
+    completion::{CompletionModel, Prompt},
     providers::openai::{self, responses_api},
     streaming::StreamedAssistantContent,
-    tool::{
-        server::{ToolServer, ToolServerHandle},
-        Tool,
-    },
-    tools::ThinkTool,
 };
 use rusqlite::Connection;
-use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{collections::BTreeMap, fs, path::PathBuf, sync::Arc};
+use std::{fs, path::PathBuf, sync::Arc};
 use uuid::Uuid;
 use web_search::{
     validate_web_search_runtime_config, ExaWebSearchProvider, MockWebSearchProvider,
-    TavilyWebSearchProvider, WebSearchConfig, WebSearchMode, WebSearchProviderKind,
+    WebSearchConfig, WebSearchMode, WebSearchProviderKind,
 };
 
 pub mod agent_loop;
 pub mod tools;
 pub mod web_search;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RoleSpec {
-    pub role: String,
-    pub phase: i64,
-    pub prompt_path: String,
-    pub output_contract: String,
-    pub validation: String,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LlmRoute {
     Responses,
-    ChatCompletions,
-    Deepseek,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,12 +46,6 @@ pub enum LlmTransport {
 pub enum OutputMode {
     JsonArtifact,
     ResearchArtifact,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-struct JsonObjectArtifact {
-    #[serde(flatten)]
-    fields: BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -158,17 +134,6 @@ pub struct RigSettings {
     pub reasoning_effort_override: Option<String>,
     pub tools: Option<tools::ExternalToolConfig>,
     pub web_search: WebSearchConfig,
-}
-
-pub async fn run_rig_agent(settings: &RigSettings, prompt: &str) -> Result<Value> {
-    settings.llm.validate(&settings.role)?;
-    validate_fallback_web_search_runtime_config(settings)?;
-    match settings.llm.route {
-        LlmRoute::Responses => run_openai_compatible_responses(settings, prompt).await,
-        LlmRoute::ChatCompletions | LlmRoute::Deepseek => {
-            run_openai_compatible_chat_completions(settings, prompt).await
-        }
-    }
 }
 
 pub async fn run_rig_agent_loop(settings: &RigSettings, prompt: &str) -> Result<Value> {
@@ -299,9 +264,6 @@ fn web_search_provider(config: &WebSearchConfig) -> Option<tools::SharedWebSearc
         WebSearchMode::Cached => Some(Arc::new(MockWebSearchProvider::default())),
         WebSearchMode::Live => match config.provider {
             WebSearchProviderKind::Mock => Some(Arc::new(MockWebSearchProvider::default())),
-            WebSearchProviderKind::Tavily => {
-                Some(Arc::new(TavilyWebSearchProvider::from_config(config)))
-            }
             WebSearchProviderKind::Exa => Some(Arc::new(ExaWebSearchProvider::from_config(config))),
         },
     }
@@ -328,9 +290,7 @@ fn web_run_runtime_for_settings(settings: &RigSettings) -> Option<tools::WebRunR
 }
 
 fn uses_native_web_search(settings: &RigSettings) -> bool {
-    settings.llm.native_web_search
-        && settings.web_search.mode != WebSearchMode::Disabled
-        && matches!(settings.llm.route, LlmRoute::Responses)
+    settings.llm.native_web_search && settings.web_search.mode != WebSearchMode::Disabled
 }
 
 fn uses_web_run_fallback(settings: &RigSettings) -> bool {
@@ -345,88 +305,21 @@ fn validate_fallback_web_search_runtime_config(settings: &RigSettings) -> Result
     }
 }
 
-async fn run_openai_compatible_responses(settings: &RigSettings, prompt: &str) -> Result<Value> {
-    let client = openai_compatible_responses_client(&settings.llm)?;
-    let tool_server = tool_server(settings)?;
-    let model = client.completion_model(&settings.llm.model);
-    let builder = AgentBuilder::new(model).tool_server_handle(tool_server);
-    let builder = if let Some(max_turns) = settings.llm.max_turns {
-        builder.default_max_turns(max_turns)
-    } else {
-        builder
-    };
-    let builder = apply_optional_preamble(builder, &settings.llm);
-    let builder = if let Some(params) = additional_params(settings) {
-        builder.additional_params(params)
-    } else {
-        builder
-    };
-    let agent = builder.build();
-    run_agent_prompt(agent, settings, prompt).await
-}
-
-async fn run_openai_compatible_chat_completions(
-    settings: &RigSettings,
-    prompt: &str,
-) -> Result<Value> {
-    let client = openai_compatible_chat_completions_client(&settings.llm)?;
-    let tool_server = tool_server(settings)?;
-    let model = client
-        .completion_model(&settings.llm.model)
-        .with_tool_result_array_content();
-    let builder = AgentBuilder::new(model).tool_server_handle(tool_server);
-    let builder = if let Some(max_turns) = settings.llm.max_turns {
-        builder.default_max_turns(max_turns)
-    } else {
-        builder
-    };
-    let builder = apply_optional_preamble(builder, &settings.llm);
-    let builder = if let Some(params) = additional_params(settings) {
-        builder.additional_params(params)
-    } else {
-        builder
-    };
-    let agent = builder.build();
-    run_agent_prompt(agent, settings, prompt).await
-}
-
 async fn run_model_text_once(settings: &RigSettings, prompt: &str) -> Result<String> {
-    match settings.llm.route {
-        LlmRoute::Responses => {
-            let client = openai_compatible_responses_client(&settings.llm)?;
-            let model = client.completion_model(&settings.llm.model);
-            let builder = AgentBuilder::new(model).default_max_turns(1);
-            let builder = apply_optional_preamble(builder, &settings.llm);
-            let builder = if let Some(params) = additional_params(settings) {
-                builder.additional_params(params)
-            } else {
-                builder
-            };
-            builder
-                .build()
-                .prompt(prompt)
-                .await
-                .context("OpenAI-compatible Responses ReAct prompt failed")
-        }
-        LlmRoute::ChatCompletions | LlmRoute::Deepseek => {
-            let client = openai_compatible_chat_completions_client(&settings.llm)?;
-            let model = client
-                .completion_model(&settings.llm.model)
-                .with_tool_result_array_content();
-            let builder = AgentBuilder::new(model).default_max_turns(1);
-            let builder = apply_optional_preamble(builder, &settings.llm);
-            let builder = if let Some(params) = additional_params(settings) {
-                builder.additional_params(params)
-            } else {
-                builder
-            };
-            builder
-                .build()
-                .prompt(prompt)
-                .await
-                .context("OpenAI-compatible Chat Completions ReAct prompt failed")
-        }
-    }
+    let client = openai_compatible_responses_client(&settings.llm)?;
+    let model = client.completion_model(&settings.llm.model);
+    let builder = AgentBuilder::new(model).default_max_turns(1);
+    let builder = apply_optional_preamble(builder, &settings.llm);
+    let builder = if let Some(params) = additional_params(settings) {
+        builder.additional_params(params)
+    } else {
+        builder
+    };
+    builder
+        .build()
+        .prompt(prompt)
+        .await
+        .context("OpenAI-compatible Responses ReAct prompt failed")
 }
 
 pub async fn run_model_event_stream(
@@ -434,66 +327,14 @@ pub async fn run_model_event_stream(
     prompt: &str,
     handler: &mut dyn ModelEventHandler,
 ) -> Result<()> {
-    match settings.llm.route {
-        LlmRoute::Responses => {
-            let client = openai_compatible_responses_client(&settings.llm)?;
-            let model = client.completion_model(&settings.llm.model);
-            match settings.llm.transport {
-                LlmTransport::Http => {
-                    stream_completion_model(settings, model, prompt, handler).await
-                }
-                LlmTransport::Ws => {
-                    stream_openai_compatible_responses_websocket(settings, model, prompt, handler)
-                        .await
-                }
-            }
+    let client = openai_compatible_responses_client(&settings.llm)?;
+    let model = client.completion_model(&settings.llm.model);
+    match settings.llm.transport {
+        LlmTransport::Http => stream_completion_model(settings, model, prompt, handler).await,
+        LlmTransport::Ws => {
+            stream_openai_compatible_responses_websocket(settings, model, prompt, handler).await
         }
-        LlmRoute::ChatCompletions => {
-            let client = openai_compatible_chat_completions_client(&settings.llm)?;
-            let model = client
-                .completion_model(&settings.llm.model)
-                .with_tool_result_array_content();
-            stream_completion_model(settings, model, prompt, handler).await
-        }
-        LlmRoute::Deepseek => complete_text_as_events(settings, prompt, handler).await,
     }
-}
-
-async fn complete_text_as_events(
-    settings: &RigSettings,
-    prompt: &str,
-    handler: &mut dyn ModelEventHandler,
-) -> Result<()> {
-    let text = run_model_text_once(settings, prompt).await?;
-    let mut parser = RuntimeEventStreamParser::default();
-    if parser
-        .push_json_values(&text, handler)
-        .await
-        .unwrap_or(false)
-        || (parser.push_text(&text, handler).await.is_ok()
-            && parser.finish(handler, &text).await.is_ok()
-            && (parser.emitted_assistant || parser.emitted_tool))
-    {
-        Ok(())
-    } else {
-        emit_fallback_events(&text, handler).await
-    }
-}
-
-async fn emit_fallback_events(text: &str, handler: &mut dyn ModelEventHandler) -> Result<()> {
-    let response = agent_loop::extract_json_value(text)
-        .and_then(agent_loop::parse_react_response)
-        .unwrap_or_else(|_| agent_loop::ModelResponse {
-            assistant_message: Some(text.to_string()),
-            reasoning_summary: None,
-            tool_calls: Vec::new(),
-            end_turn: true,
-            raw: serde_json::json!({"fallback_text": text}),
-        });
-    for event in agent_loop::response_to_stream_events(response)? {
-        handler.handle(event).await?;
-    }
-    Ok(())
 }
 
 async fn stream_openai_compatible_responses_websocket(
@@ -570,7 +411,6 @@ async fn stream_openai_compatible_responses_websocket_events(
                                     call_id: function_call.call_id,
                                     name: function_call.name,
                                     arguments: function_call.arguments,
-                                    mode: ToolMode::Blocking,
                                 },
                             })
                             .await?;
@@ -702,7 +542,6 @@ where
                             call_id: tool_call.call_id.unwrap_or(tool_call.id),
                             name: tool_call.function.name,
                             arguments: tool_call.function.arguments,
-                            mode: ToolMode::Blocking,
                         },
                     })
                     .await?;
@@ -733,11 +572,10 @@ where
 struct RuntimeEventStreamParser {
     buffer: String,
     parsed_any: bool,
-    emitted_assistant: bool,
-    emitted_tool: bool,
 }
 
 impl RuntimeEventStreamParser {
+    #[cfg(test)]
     async fn push_json_values(
         &mut self,
         text: &str,
@@ -789,19 +627,7 @@ impl RuntimeEventStreamParser {
         Ok(())
     }
 
-    fn record_event(&mut self, event: &ModelStreamEvent) {
-        match event {
-            ModelStreamEvent::AssistantMessageStarted { .. }
-            | ModelStreamEvent::AssistantTextDelta { .. }
-            | ModelStreamEvent::AssistantMessageCompleted { .. } => {
-                self.emitted_assistant = true;
-            }
-            ModelStreamEvent::ToolCallCompleted { .. } => {
-                self.emitted_tool = true;
-            }
-            _ => {}
-        }
-    }
+    fn record_event(&mut self, _event: &ModelStreamEvent) {}
 
     async fn emit_line(&mut self, line: &str, handler: &mut dyn ModelEventHandler) -> Result<()> {
         let Some(start) = line.find('{').or_else(|| line.find('[')) else {
@@ -1085,61 +911,11 @@ fn openai_compatible_responses_client(settings: &RoleLlmSettings) -> Result<open
         .context("failed to build OpenAI-compatible responses client")
 }
 
-fn openai_compatible_chat_completions_client(
-    settings: &RoleLlmSettings,
-) -> Result<openai::CompletionsClient> {
-    let api_key = openai_compatible_api_key(settings)?;
-    let base_url = openai_compatible_base_url(settings)?;
-    openai::CompletionsClient::builder()
-        .api_key(&api_key)
-        .base_url(base_url)
-        .build()
-        .context("failed to build OpenAI-compatible chat completions client")
-}
-
-async fn run_agent_prompt<M, P>(
-    agent: rig_core::agent::Agent<M, P>,
-    settings: &RigSettings,
-    prompt: &str,
-) -> Result<Value>
-where
-    M: rig_core::completion::CompletionModel + 'static,
-    P: rig_core::agent::PromptHook<M> + 'static,
-{
-    match settings.output_mode {
-        OutputMode::ResearchArtifact => {
-            let prompt_builder = agent.prompt_typed(prompt);
-            let artifact: ResearchArtifact = if let Some(max_turns) = settings.llm.max_turns {
-                prompt_builder.max_turns(max_turns).await
-            } else {
-                prompt_builder.await
-            }
-            .context("Rig typed research artifact prompt failed")?;
-            validate_research_artifact(&artifact, &settings.tickers)
-                .map_err(|error| anyhow::anyhow!(error))?;
-            serde_json::to_value(artifact).context("failed to serialize research artifact")
-        }
-        OutputMode::JsonArtifact => {
-            let prompt_builder = agent.prompt_typed(prompt);
-            let artifact: JsonObjectArtifact = if let Some(max_turns) = settings.llm.max_turns {
-                prompt_builder.max_turns(max_turns).await
-            } else {
-                prompt_builder.await
-            }
-            .context("Rig typed JSON artifact prompt failed")?;
-            serde_json::to_value(artifact).context("failed to serialize JSON artifact")
-        }
-    }
-}
-
 pub fn additional_params(settings: &RigSettings) -> Option<Value> {
     let mut params = settings
         .llm
         .effective_reasoning_effort(settings.reasoning_effort_override.as_deref())
-        .and_then(|effort| match settings.llm.route {
-            LlmRoute::Responses => Some(openai_responses_reasoning_params(effort)),
-            LlmRoute::ChatCompletions | LlmRoute::Deepseek => None,
-        });
+        .map(openai_responses_reasoning_params);
     if uses_native_web_search(settings) {
         params = Some(add_openai_responses_native_web_search(params));
     }
@@ -1183,64 +959,6 @@ fn configured_tool_names(settings: &RigSettings) -> Vec<&str> {
         names.push(tools::WEB_RUN_TOOL_NAME);
     }
     names
-}
-
-fn tool_server(settings: &RigSettings) -> Result<ToolServerHandle> {
-    let tool_config = settings.tools.clone().unwrap_or_else(default_tool_config);
-    let web_run_runtime = web_run_runtime_for_settings(settings);
-    let mut server = ToolServer::new();
-    for tool in configured_tool_names(settings) {
-        server = add_named_tool(
-            server,
-            tool,
-            &tool_config,
-            &settings.web_search,
-            web_run_runtime.clone(),
-        )?;
-    }
-    Ok(server.run())
-}
-
-fn add_named_tool(
-    server: ToolServer,
-    name: &str,
-    config: &tools::ExternalToolConfig,
-    web_search: &WebSearchConfig,
-    web_run: Option<tools::WebRunRuntime>,
-) -> Result<ToolServer> {
-    match name {
-        "think" => Ok(server.tool(ThinkTool)),
-        tools::READ_RUN_CONTEXT_TOOL_NAME => {
-            Ok(server.tool(tools::ReadRunContextTool::new(config.clone())))
-        }
-        tools::FetchJin10FlashTool::NAME => {
-            Ok(server.tool(tools::FetchJin10FlashTool::new(config.clone())))
-        }
-        tools::FetchYoutubeTranscriptTool::NAME => {
-            Ok(server.tool(tools::FetchYoutubeTranscriptTool::new(config.clone())))
-        }
-        tools::FetchWayinVideoTranscriptTool::NAME => {
-            Ok(server.tool(tools::FetchWayinVideoTranscriptTool::new(config.clone())))
-        }
-        tools::RunTechnicalIndicatorsTool::NAME => {
-            Ok(server.tool(tools::RunTechnicalIndicatorsTool::new(config.clone())))
-        }
-        tools::FetchLast30DaysContextTool::NAME => {
-            Ok(server.tool(tools::FetchLast30DaysContextTool::new(config.clone())))
-        }
-        tools::WEB_RUN_TOOL_NAME => {
-            let tool = tools::WebRunTool::new(web_search.clone());
-            let tool = if let Some(provider) =
-                web_run.and_then(|runtime| web_search_provider(runtime.config()))
-            {
-                tool.with_provider(provider)
-            } else {
-                tool
-            };
-            Ok(server.tool(tool))
-        }
-        other => bail!("unknown tool name: {other}"),
-    }
 }
 
 fn validate_tool_name(name: &str) -> Result<()> {
@@ -1305,26 +1023,6 @@ pub fn mock_role_artifact(role: &str, tickers: &[String]) -> Value {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SqlToolRequest {
-    pub command: String,
-    #[serde(default)]
-    pub topic_id: Option<String>,
-}
-
-pub fn run_sql_context_tool(
-    conn: &Connection,
-    ctx: &RuntimeContext,
-    request: SqlToolRequest,
-) -> Result<Value> {
-    handle_read_command(conn, &request.command, ctx, request.topic_id.as_deref())
-}
-
-pub fn put_agent_message_tool(conn: &mut Connection, input: AgentMessageInput) -> Result<Value> {
-    let written = orchestrator_sql::write_agent_message_scoped(conn, &input)?;
-    Ok(serde_json::json!({"ok": true, "written_rows": written}))
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1382,18 +1080,12 @@ mod tests {
             serde_json::from_value::<LlmRoute>(json!("responses")).unwrap(),
             LlmRoute::Responses
         );
-        assert_eq!(
-            serde_json::from_value::<LlmRoute>(json!("chat_completions")).unwrap(),
-            LlmRoute::ChatCompletions
-        );
-        assert_eq!(
-            serde_json::from_value::<LlmRoute>(json!("deepseek")).unwrap(),
-            LlmRoute::Deepseek
-        );
+        assert!(serde_json::from_value::<LlmRoute>(json!("chat_completions")).is_err());
+        assert!(serde_json::from_value::<LlmRoute>(json!("deepseek")).is_err());
     }
 
     #[test]
-    fn ws_transport_is_allowed_for_responses_and_deepseek() {
+    fn ws_transport_is_allowed_for_responses() {
         let responses = RoleLlmSettings {
             transport: LlmTransport::Ws,
             base_url: Some("https://llm.example.com/v1".to_string()),
@@ -1401,22 +1093,6 @@ mod tests {
             ..base_settings(LlmRoute::Responses).llm
         };
         responses.validate("manager.research").unwrap();
-
-        let deepseek = RoleLlmSettings {
-            transport: LlmTransport::Ws,
-            base_url: Some("https://api.deepseek.com/v1".to_string()),
-            api_key: Some("test-key".to_string()),
-            ..base_settings(LlmRoute::Deepseek).llm
-        };
-        deepseek.validate("manager.research").unwrap();
-    }
-
-    #[test]
-    fn generic_json_artifact_serializes_as_top_level_object() {
-        let artifact = super::JsonObjectArtifact {
-            fields: [("ok".to_string(), json!(true))].into(),
-        };
-        assert_eq!(serde_json::to_value(artifact).unwrap(), json!({"ok": true}));
     }
 
     #[test]
@@ -1425,7 +1101,6 @@ mod tests {
             call_id: "call_file_001".to_string(),
             name: "read_file".to_string(),
             arguments: json!({"path": "README.md"}),
-            mode: agent_loop::ToolMode::Blocking,
         };
         let tool_result = agent_loop::ToolResultItem {
             call_id: "call_file_001".to_string(),
@@ -1433,7 +1108,6 @@ mod tests {
             status: "completed".to_string(),
             output: json!({"content": "# My Project"}),
             error: None,
-            background_job_id: None,
         };
 
         assert_eq!(
@@ -1698,31 +1372,6 @@ mod tests {
             super::additional_params(&settings),
             Some(json!({"reasoning": {"effort": "high"}}))
         );
-    }
-
-    #[test]
-    fn chat_completions_omits_responses_only_additional_params() {
-        let mut settings = base_settings(LlmRoute::ChatCompletions);
-        settings.llm.base_url = Some("https://api.deepseek.com/v1".to_string());
-        settings.llm.api_key = Some("test-key".to_string());
-        settings.llm.native_web_search = true;
-        settings.web_search.mode = WebSearchMode::Live;
-
-        assert_eq!(super::additional_params(&settings), None);
-        assert!(super::configured_tool_names(&settings).contains(&tools::WEB_RUN_TOOL_NAME));
-    }
-
-    #[test]
-    fn deepseek_route_uses_chat_completions_behavior() {
-        let mut settings = base_settings(LlmRoute::Deepseek);
-        settings.llm.base_url = Some("https://api.deepseek.com/v1".to_string());
-        settings.llm.api_key = Some("test-key".to_string());
-        settings.llm.native_web_search = true;
-        settings.web_search.mode = WebSearchMode::Live;
-
-        assert_eq!(super::additional_params(&settings), None);
-        assert!(super::configured_tool_names(&settings).contains(&tools::WEB_RUN_TOOL_NAME));
-        assert!(!super::uses_native_web_search(&settings));
     }
 
     #[test]

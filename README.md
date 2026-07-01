@@ -147,14 +147,14 @@ Defaults and each role support:
 
 | Field | Purpose |
 | --- | --- |
-| `route` | Use `responses` for `${base_url}/responses`, `chat_completions` for `${base_url}/chat/completions`, or `deepseek` for DeepSeek chat completions. |
+| `route` | Use `responses` for `${base_url}/responses`. |
 | `model` | Provider model name for that role. |
 | `base_url` | Gateway API root, usually ending in `/v1`; the runtime appends `/responses`. |
 | `api_key` | Direct local API key value for the configured provider. |
 | `preamble` | Optional Rig agent preamble for role-level steering. It is omitted by default and should not be used as the structured-output enforcement mechanism. |
 | `max_turns` | Optional agent-loop turn cap. Set `null` or omit it for no role-level max-turn cap; set a positive number on a role to override. |
 | `reasoning_effort` | Optional Responses reasoning effort, injected as `additional_params.reasoning.effort` when set. |
-| `transport` | Use `http` by default. Use `ws` for tool-aware event handling; Responses uses WebSocket mode, while DeepSeek stays on Chat Completions streaming because its function calling is not a Responses WebSocket protocol. |
+| `transport` | Use `http` by default. Use `ws` for Responses WebSocket mode. |
 | `think_tool` | Registers Rig `ThinkTool` for that role when `true`. |
 | `tools` | Names of external tools available to that role. Use `all` in defaults to expose every registered project tool, then override per role when needed. |
 | `native_web_search` | Set `true` when the gateway/model supports provider-native web search. When enabled and `orchestrator.web_search.mode` is not `disabled`, the request uses hosted `web_search` and does not expose the configured `web.run` fallback. |
@@ -162,11 +162,9 @@ Defaults and each role support:
 Responses routing behavior:
 
 - `route: responses` uses Rig's OpenAI Responses client with the role's `base_url`; the final request path is `${base_url}/responses`, so set `base_url` to the gateway API root ending in `/v1`.
-- `route: chat_completions` and `route: deepseek` use Rig's OpenAI Chat Completions client; the final request path is `${base_url}/chat/completions`, so set DeepSeek `base_url` to `https://api.deepseek.com/v1`.
-- DeepSeek tool calls use the Chat Completions function-calling shape (`tools`, returned `tool_calls`, and follow-up `role: tool` messages). They do not use the Responses API tool item protocol.
-- `transport: ws` enables tool-aware event handling. For Responses this uses Responses WebSocket mode. For DeepSeek this keeps the runtime on Chat Completions streaming, where tool calls are surfaced from streamed `tool_calls` chunks.
+- `transport: ws` enables Responses WebSocket mode for tool-aware event handling.
 - Reasoning params are injected as `additional_params.reasoning.effort` for Responses routes only.
-- Web search follows role capability: when `orchestrator.web_search.mode` is `disabled`, no web search tool is sent. When it is enabled, roles with `native_web_search: true` use provider-native web search; all other roles receive the `web.run` agent tool backed by the configured fallback provider, such as Exa or Tavily.
+- Web search follows role capability: when `orchestrator.web_search.mode` is `disabled`, no web search tool is sent. When it is enabled, roles with `native_web_search: true` use provider-native web search; all other roles receive the `web.run` agent tool backed by Exa MCP.
 - `manager.research` uses Rig typed structured output for `ResearchArtifact`; on Responses routes, the runtime uses provider-native Responses structured output when the gateway/model supports it, then validates probabilities and ticker payloads.
 - Other JsonArtifact roles still parse JSON text from their prompt/contracts and validate those artifacts after the model response.
 
@@ -200,22 +198,6 @@ orchestrator:
           - read_run_context
 ```
 
-DeepSeek `/v1/chat/completions` gateway example:
-
-```yaml
-orchestrator:
-  llm:
-    defaults:
-      route: deepseek
-      model: DeepSeek-V4-Pro
-      base_url: "https://your-unified-llm-gateway.example.com/v1"
-      api_key: "your-local-gateway-key"
-      native_web_search: false
-      max_turns: null
-      transport: http
-      tools: all
-```
-
 Web search fallback example:
 
 ```yaml
@@ -246,7 +228,7 @@ orchestrator:
         native_web_search: false
 ```
 
-The `analyst.news_macro` role uses provider-hosted `web_search` through the Responses gateway. The `analyst.reddit` role does not declare native web search, so it sees `web.run`; the runtime executes the configured fallback provider only when the model asks for that tool. Exa uses the remote MCP endpoint at `https://mcp.exa.ai/mcp` anonymously and posts a JSON-RPC `tools/call` request for `web_search_exa`. Tavily remains supported with `provider: tavily`; its `web_search.base_url` is optional and defaults to `https://api.tavily.com`, and the runtime appends `/search`.
+The `analyst.news_macro` role uses provider-hosted `web_search` through the Responses gateway. The `analyst.reddit` role does not declare native web search, so it sees `web.run`; the runtime executes Exa only when the model asks for that tool. Exa uses the remote MCP endpoint at `https://mcp.exa.ai/mcp` anonymously and posts a JSON-RPC `tools/call` request for `web_search_exa`.
 
 Keep real gateway and provider keys in local config or environment variables only. Do not commit real provider keys.
 

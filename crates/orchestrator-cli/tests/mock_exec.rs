@@ -27,8 +27,6 @@ async fn mock_exec_writes_state_and_final_summary() {
         youtube_weight: 8.0,
         reddit_weight: 9.0,
         x_weight: 8.0,
-        cleanup_days: 0,
-        cleanup_old_runs: false,
         from_phase: 1,
         to_phase: 3,
         tech_refresh_enabled: false,
@@ -41,10 +39,6 @@ async fn mock_exec_writes_state_and_final_summary() {
         jin10_refresh_lookback_hours: 24.0,
         jin10_refresh_script_path: None,
         jin10_refresh_timeout_sec: 120,
-        wait_for_monitor_time: None,
-        monitor_probability_threshold: None,
-        monitor_reversal_threshold: None,
-        monitor_email_enabled: None,
         mock: true,
     })
     .await
@@ -74,15 +68,7 @@ async fn mock_exec_writes_state_and_final_summary() {
             |row| row.get(0),
         )
         .unwrap();
-    let tool_comma_rows: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM turn_tool_calls WHERE ticker LIKE '%,%'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
     assert_eq!(summary_comma_rows, 0);
-    assert_eq!(tool_comma_rows, 0);
 }
 
 #[tokio::test]
@@ -412,11 +398,7 @@ async fn mock_exec_writes_reducer_turn_summaries() {
             row.get(0)
         })
         .unwrap();
-    let tool_call_rows: i64 = conn
-        .query_row("SELECT COUNT(*) FROM turn_tool_calls", [], |row| row.get(0))
-        .unwrap();
     assert_eq!(turn_item_rows, 0);
-    assert_eq!(tool_call_rows, 0);
 }
 
 fn test_args(
@@ -438,15 +420,13 @@ fn test_args(
         config,
         model: Some("gpt-5.4".to_string()),
         reasoning_effort: Some("low".to_string()),
-        max_debate_rounds: 1,
+        max_debate_rounds: 5,
         max_topics_per_side: 10,
         technical_weight: 40.0,
         news_weight: 35.0,
         youtube_weight: 8.0,
         reddit_weight: 9.0,
         x_weight: 8.0,
-        cleanup_days: 0,
-        cleanup_old_runs: false,
         from_phase: 1,
         to_phase: 3,
         tech_refresh_enabled: false,
@@ -459,10 +439,6 @@ fn test_args(
         jin10_refresh_lookback_hours: 24.0,
         jin10_refresh_script_path: None,
         jin10_refresh_timeout_sec: 120,
-        wait_for_monitor_time: None,
-        monitor_probability_threshold: None,
-        monitor_reversal_threshold: None,
-        monitor_email_enabled: None,
         mock,
     }
 }

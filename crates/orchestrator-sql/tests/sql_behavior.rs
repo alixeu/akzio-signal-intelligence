@@ -2,28 +2,27 @@ use orchestrator_sql::{
     append_agent_turn_item, connect, context_count, ensure_schema, handle_read_command,
     import_jin10_payload, read_run_context, session_history_items, update_agent_turn_end,
     update_agent_turn_item_content, upsert_agent_turn, write_agent_message_scoped,
-    write_role_turn_summary, write_run_record, write_source_item, write_turn_tool_call,
-    AgentMessageInput, AgentTurnInput, AgentTurnItemInput, RoleTurnSummaryInput,
-    RunContextReadRequest, RunRecordInput, RuntimeContext, SourceItemInput, TurnToolCallInput,
+    write_role_turn_summary, write_run_record, write_source_item, AgentMessageInput,
+    AgentTurnInput, AgentTurnItemInput, RoleTurnSummaryInput, RunContextReadRequest,
+    RunRecordInput, RuntimeContext, SourceItemInput,
 };
 use serde_json::json;
 
 const TABLES: &[&str] = &[
     "runs",
-    "run_tickers",
     "agent_turns",
     "agent_turn_items",
     "turn_context_items",
-    "turn_tool_calls",
     "role_turn_summaries",
     "jin10_items",
     "youtube_videos",
     "youtube_transcripts",
-    "reddit_items",
-    "x_items",
-    "technical_daily_indicators",
-    "technical_3h_indicators",
-    "technical_20min_indicators",
+    "social_items",
+    "technical_indicators",
+    "memory_items",
+    "memory_versions",
+    "memory_links",
+    "memory_search_fts",
 ];
 
 const REMOVED_TABLES: &[&str] = &[
@@ -49,6 +48,13 @@ const REMOVED_TABLES: &[&str] = &[
     "runtime_jobs",
     "runtime_job_events",
     "agent_mailbox_messages",
+    "run_tickers",
+    "turn_tool_calls",
+    "reddit_items",
+    "x_items",
+    "technical_daily_indicators",
+    "technical_3h_indicators",
+    "technical_20min_indicators",
 ];
 
 #[test]
@@ -73,25 +79,17 @@ fn run_record_only_writes_runs_and_run_tickers() {
     let temp = tempfile::tempdir().unwrap();
     let db_path = temp.path().join("orchestrator.sqlite");
     let mut conn = connect(&db_path).unwrap();
-    let tickers = vec!["QQQ".to_string(), "VIX".to_string()];
 
     write_run_record(
         &mut conn,
-        RunRecordInput {
+        &RunRecordInput {
             run_id: "run-1",
-            ticker: "QQQ,VIX",
-            tickers: &tickers,
             current_date: "2026-06-19",
-            mode: "probability",
-            run_dir: "/tmp/run",
-            db_path: db_path.to_str().unwrap(),
-            config: &json!({"mode":"test"}),
         },
     )
     .unwrap();
 
     assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM runs"), 1);
-    assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM run_tickers"), 2);
     assert_eq!(table_exists(&conn, "workflow_nodes"), 0);
 }
 
@@ -104,7 +102,6 @@ fn jin10_import_writes_only_jin10_items() {
     let imported = import_jin10_payload(
         &mut conn,
         &json!({
-            "fetched_at": "2026-06-19T00:00:00Z",
             "items": [
                 {"time": "2026-06-19T09:00:00Z", "content": "rate cut odds move"},
                 {"time": "", "content": "skip"}
@@ -129,6 +126,7 @@ fn jin10_import_writes_only_jin10_items() {
             topic_id: None,
             turn_id: None,
             token_budget: None,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -143,30 +141,30 @@ fn technical_context_reads_indicator_tables() {
 
     conn.execute(
         r#"
-        INSERT INTO technical_daily_indicators
-            (ticker, kline_time, indicator_name, indicator_value, unit, model, payload_json, imported_at)
+        INSERT INTO technical_indicators
+            (ticker, kline_time, indicator_name, indicator_value, unit, model, interval, payload_json, imported_at)
         VALUES
-            ('TQQQ', '2026-06-19', 'rsi', 55.5, 'points', 'm', '{"window":14}', '2026-06-19T00:00:00Z')
+            ('TQQQ', '2026-06-19', 'rsi', 55.5, 'points', 'm', 'daily', '{"window":14}', '2026-06-19T00:00:00Z')
         "#,
         [],
     )
     .unwrap();
     conn.execute(
         r#"
-        INSERT INTO technical_3h_indicators
-            (ticker, kline_time, indicator_name, indicator_value, model, imported_at)
+        INSERT INTO technical_indicators
+            (ticker, kline_time, indicator_name, indicator_value, model, interval, imported_at)
         VALUES
-            ('TQQQ', '2026-06-19T09:00:00Z', 'macd', 1.5, 'm', '2026-06-19T00:00:00Z')
+            ('TQQQ', '2026-06-19T09:00:00Z', 'macd', 1.5, 'm', '3h', '2026-06-19T00:00:00Z')
         "#,
         [],
     )
     .unwrap();
     conn.execute(
         r#"
-        INSERT INTO technical_20min_indicators
-            (ticker, kline_time, indicator_name, indicator_value, model, imported_at)
+        INSERT INTO technical_indicators
+            (ticker, kline_time, indicator_name, indicator_value, model, interval, imported_at)
         VALUES
-            ('TQQQ', '2026-06-19T09:20:00Z', 'vwap', 12.5, 'm', '2026-06-19T00:00:00Z')
+            ('TQQQ', '2026-06-19T09:20:00Z', 'vwap', 12.5, 'm', '20min', '2026-06-19T00:00:00Z')
         "#,
         [],
     )
@@ -184,6 +182,7 @@ fn technical_context_reads_indicator_tables() {
             topic_id: None,
             turn_id: None,
             token_budget: None,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -211,8 +210,6 @@ fn source_items_write_only_dedicated_source_tables() {
                 item_json: json!({
                     "video_id": "vid-1",
                     "title": "Video title",
-                    "channel": "Desk",
-                    "url": "https://youtube.example/vid-1"
                 }),
             },
         )
@@ -228,7 +225,7 @@ fn source_items_write_only_dedicated_source_tables() {
                 ticker: "TQQQ".to_string(),
                 item_time: "2026-06-19T01:00:00Z".to_string(),
                 content: "Post body".to_string(),
-                item_json: json!({"subreddit": "TQQQ", "title": "Post title"}),
+                item_json: json!({"title": "Post title"}),
             },
         )
         .unwrap(),
@@ -243,7 +240,7 @@ fn source_items_write_only_dedicated_source_tables() {
                 ticker: "TQQQ".to_string(),
                 item_time: "2026-06-19T02:00:00Z".to_string(),
                 content: "Tweet body".to_string(),
-                item_json: json!({"author": "macro"}),
+                item_json: json!({}),
             },
         )
         .unwrap(),
@@ -251,8 +248,20 @@ fn source_items_write_only_dedicated_source_tables() {
     );
 
     assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM youtube_videos"), 1);
-    assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM reddit_items"), 1);
-    assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM x_items"), 1);
+    assert_eq!(
+        scalar(
+            &conn,
+            "SELECT COUNT(*) FROM social_items WHERE source = 'reddit'"
+        ),
+        1
+    );
+    assert_eq!(
+        scalar(
+            &conn,
+            "SELECT COUNT(*) FROM social_items WHERE source = 'x'"
+        ),
+        1
+    );
     assert_eq!(table_exists(&conn, "source_items"), 0);
 }
 
@@ -312,7 +321,6 @@ fn summaries_are_written_and_read_from_role_turn_summaries() {
     assert_eq!(table_exists(&conn, "artifacts"), 0);
 
     let ctx = RuntimeContext {
-        db_path,
         run_id: "run-1".to_string(),
         ticker: "QQQ,VIX".to_string(),
         tickers: vec!["QQQ".to_string(), "VIX".to_string()],
@@ -324,7 +332,7 @@ fn summaries_are_written_and_read_from_role_turn_summaries() {
 }
 
 #[test]
-fn turn_tables_persist_items_tool_calls_and_history() {
+fn turn_tables_persist_items_and_history() {
     let temp = tempfile::tempdir().unwrap();
     let db_path = temp.path().join("orchestrator.sqlite");
     let conn = connect(&db_path).unwrap();
@@ -363,31 +371,10 @@ fn turn_tables_persist_items_tool_calls_and_history() {
     .unwrap();
     update_agent_turn_item_content(&conn, item_id, &json!({"text": "done"}), "done").unwrap();
     update_agent_turn_end(&conn, "turn-1", true, "needs_input").unwrap();
-    write_turn_tool_call(
-        &conn,
-        &TurnToolCallInput {
-            run_id: "run-1".to_string(),
-            turn_id: "turn-1".to_string(),
-            role: "analyst.technical".to_string(),
-            phase: Some(1),
-            ticker: "TQQQ".to_string(),
-            item_time: "2026-06-19T00:00:00Z".to_string(),
-            topic_id: None,
-            debate_id: None,
-            tool_call_id: "call-1".to_string(),
-            tool_type: "function".to_string(),
-            tool_name: "read_context".to_string(),
-            args_json: json!({"kind":"technical"}),
-            status: "ok".to_string(),
-            error: String::new(),
-        },
-    )
-    .unwrap();
 
     let history = session_history_items(&conn, "session-1", 10).unwrap();
     assert_eq!(history[0]["content_text"], "done");
     assert_eq!(scalar(&conn, "SELECT needs_follow_up FROM agent_turns"), 1);
-    assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM turn_tool_calls"), 1);
 }
 
 #[test]
@@ -441,10 +428,10 @@ fn compose_context_scores_trims_and_audits_blocks() {
     .unwrap();
     conn.execute(
         r#"
-        INSERT INTO technical_daily_indicators
-            (ticker, kline_time, indicator_name, indicator_value, model, payload_json, imported_at)
+        INSERT INTO technical_indicators
+            (ticker, kline_time, indicator_name, indicator_value, model, interval, payload_json, imported_at)
         VALUES
-            ('TQQQ', '2026-06-19', 'rsi', 61.0, 'm', '{"window":14}', '2026-06-19T13:00:00Z')
+            ('TQQQ', '2026-06-19', 'rsi', 61.0, 'm', 'daily', '{"window":14}', '2026-06-19T13:00:00Z')
         "#,
         [],
     )
@@ -523,6 +510,7 @@ fn compose_context_scores_trims_and_audits_blocks() {
             topic_id: Some("topic-1".to_string()),
             turn_id: Some("turn-compose".to_string()),
             token_budget: Some(4096),
+            ..Default::default()
         },
     )
     .unwrap();
@@ -563,10 +551,72 @@ fn compose_context_scores_trims_and_audits_blocks() {
             topic_id: Some("topic-1".to_string()),
             turn_id: Some("turn-compose-small".to_string()),
             token_budget: Some(5),
+            ..Default::default()
         },
     )
     .unwrap();
     assert!(trimmed["blocks"].as_array().unwrap().len() < blocks.len());
+}
+
+#[test]
+fn memory_proposal_applies_and_prior_memory_reads_without_run_id() {
+    let temp = tempfile::tempdir().unwrap();
+    let db_path = temp.path().join("orchestrator.sqlite");
+    let mut conn = connect(&db_path).unwrap();
+    let artifact = json!({
+        "artifact_type": "MemoryUpdateProposal",
+        "schema_version": 1,
+        "source_role": "manager.research",
+        "run_id": "run-1",
+        "generated_at": "2026-06-19T00:00:00Z",
+        "proposals": [{
+            "update_type": "observation",
+            "ticker": "TQQQ",
+            "scope": "ticker",
+            "observed_at": "2026-06-19T00:00:00Z",
+            "source_date": "2026-06-19",
+            "expires_at": null,
+            "confidence": 0.8,
+            "summary": "Liquidity support remains constructive.",
+            "evidence_refs": [{"source_type":"final_research","source_id":"run-1","quote_or_fact":"liquidity improved"}],
+            "invalidation_conditions": ["liquidity breaks down"],
+            "follow_up_checks": ["check breadth"]
+        }]
+    });
+
+    let applied = orchestrator_sql::apply_memory_update_proposal(&mut conn, &artifact).unwrap();
+    assert_eq!(applied.applied, 1);
+
+    let recent = read_run_context(
+        &mut conn,
+        &RunContextReadRequest {
+            kind: "prior_memory".to_string(),
+            ticker: Some("TQQQ".to_string()),
+            include_body: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        recent["items"][0]["summary"],
+        "Liquidity support remains constructive."
+    );
+    assert_eq!(
+        recent["items"][0]["body"]["summary"],
+        "Liquidity support remains constructive."
+    );
+
+    let searched = read_run_context(
+        &mut conn,
+        &RunContextReadRequest {
+            kind: "prior_memory".to_string(),
+            ticker: Some("TQQQ".to_string()),
+            query: Some("liquidity".to_string()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(searched["items"].as_array().unwrap().len(), 1);
 }
 
 fn table_exists(conn: &rusqlite::Connection, table: &str) -> i64 {
