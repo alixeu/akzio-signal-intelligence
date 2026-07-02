@@ -126,7 +126,6 @@ fn jin10_import_writes_only_jin10_items() {
             topic_id: None,
             turn_id: None,
             token_budget: None,
-            ..Default::default()
         },
     )
     .unwrap();
@@ -182,7 +181,6 @@ fn technical_context_reads_indicator_tables() {
             topic_id: None,
             turn_id: None,
             token_budget: None,
-            ..Default::default()
         },
     )
     .unwrap();
@@ -510,7 +508,6 @@ fn compose_context_scores_trims_and_audits_blocks() {
             topic_id: Some("topic-1".to_string()),
             turn_id: Some("turn-compose".to_string()),
             token_budget: Some(4096),
-            ..Default::default()
         },
     )
     .unwrap();
@@ -551,72 +548,10 @@ fn compose_context_scores_trims_and_audits_blocks() {
             topic_id: Some("topic-1".to_string()),
             turn_id: Some("turn-compose-small".to_string()),
             token_budget: Some(5),
-            ..Default::default()
         },
     )
     .unwrap();
     assert!(trimmed["blocks"].as_array().unwrap().len() < blocks.len());
-}
-
-#[test]
-fn memory_proposal_applies_and_prior_memory_reads_without_run_id() {
-    let temp = tempfile::tempdir().unwrap();
-    let db_path = temp.path().join("orchestrator.sqlite");
-    let mut conn = connect(&db_path).unwrap();
-    let artifact = json!({
-        "artifact_type": "MemoryUpdateProposal",
-        "schema_version": 1,
-        "source_role": "manager.research",
-        "run_id": "run-1",
-        "generated_at": "2026-06-19T00:00:00Z",
-        "proposals": [{
-            "update_type": "observation",
-            "ticker": "TQQQ",
-            "scope": "ticker",
-            "observed_at": "2026-06-19T00:00:00Z",
-            "source_date": "2026-06-19",
-            "expires_at": null,
-            "confidence": 0.8,
-            "summary": "Liquidity support remains constructive.",
-            "evidence_refs": [{"source_type":"final_research","source_id":"run-1","quote_or_fact":"liquidity improved"}],
-            "invalidation_conditions": ["liquidity breaks down"],
-            "follow_up_checks": ["check breadth"]
-        }]
-    });
-
-    let applied = orchestrator_sql::apply_memory_update_proposal(&mut conn, &artifact).unwrap();
-    assert_eq!(applied.applied, 1);
-
-    let recent = read_run_context(
-        &mut conn,
-        &RunContextReadRequest {
-            kind: "prior_memory".to_string(),
-            ticker: Some("TQQQ".to_string()),
-            include_body: true,
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    assert_eq!(
-        recent["items"][0]["summary"],
-        "Liquidity support remains constructive."
-    );
-    assert_eq!(
-        recent["items"][0]["body"]["summary"],
-        "Liquidity support remains constructive."
-    );
-
-    let searched = read_run_context(
-        &mut conn,
-        &RunContextReadRequest {
-            kind: "prior_memory".to_string(),
-            ticker: Some("TQQQ".to_string()),
-            query: Some("liquidity".to_string()),
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    assert_eq!(searched["items"].as_array().unwrap().len(), 1);
 }
 
 fn table_exists(conn: &rusqlite::Connection, table: &str) -> i64 {

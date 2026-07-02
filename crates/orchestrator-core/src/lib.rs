@@ -1,5 +1,4 @@
 pub mod artifact;
-pub mod cache;
 pub mod config;
 pub mod paths;
 pub mod prompt;
@@ -17,8 +16,5 @@ pub use config::{
 };
 pub use paths::{default_project_root, project_path};
 pub use prompt::replace_placeholders;
-pub use role_registry::{
-    AgentDefinition, AgentRegistry, DEFAULT_PHASE1_AGENTS, MEMORY_REFLECTOR_PHASE,
-    MEMORY_REFLECTOR_ROLE,
-};
+pub use role_registry::{AgentDefinition, AgentRegistry, DEFAULT_PHASE1_AGENTS};
 pub use ticker::{display_ticker, parse_tickers, run_slug, slug_ticker};

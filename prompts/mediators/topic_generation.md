@@ -11,5 +11,3 @@
 3. 每个主题说明多空双方初始证据引用或缺口。
 4. 多 ticker 必须隔离；不要把 QQQ 方向主题和 VIX 波动主题混成一个主题。
 5. 不输出胜负、概率、评级、交易动作。
-
-输出受 structured output 约束的 JSON object。字段形状由运行时 schema / validator 约束，不在 prompt 中重复展开。

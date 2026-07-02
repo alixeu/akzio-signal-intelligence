@@ -125,7 +125,7 @@ impl AgentRegistry {
             short_name: "youtube".into(),
             phase: 1,
             prompt_path: "prompts/analysts/youtube.md".into(),
-            preflight_tool: Some("fetch_social_youtube".into()),
+            preflight_tool: None,
             default_tools: vec![],
             default_weight: 8.0,
             is_critical: false,
@@ -135,7 +135,7 @@ impl AgentRegistry {
             short_name: "reddit".into(),
             phase: 1,
             prompt_path: "prompts/analysts/reddit.md".into(),
-            preflight_tool: Some("fetch_social_reddit".into()),
+            preflight_tool: None,
             default_tools: vec![],
             default_weight: 9.0,
             is_critical: false,
@@ -145,7 +145,7 @@ impl AgentRegistry {
             short_name: "x".into(),
             phase: 1,
             prompt_path: "prompts/analysts/x.md".into(),
-            preflight_tool: Some("fetch_social_x".into()),
+            preflight_tool: None,
             default_tools: vec![],
             default_weight: 8.0,
             is_critical: false,
@@ -155,5 +155,3 @@ impl AgentRegistry {
 }
 
 pub const DEFAULT_PHASE1_AGENTS: &str = "technical,news,youtube,reddit,x";
-pub const MEMORY_REFLECTOR_ROLE: &str = "meta.memory_reflector";
-pub const MEMORY_REFLECTOR_PHASE: i64 = 35;

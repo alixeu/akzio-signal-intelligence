@@ -1,5 +1,7 @@
 use anyhow::{bail, Context, Result};
-use orchestrator_core::{config_bool, config_get, config_str, config_strings, project_path};
+use orchestrator_core::{
+    config_bool, config_get, config_int, config_str, config_strings, project_path,
+};
 use orchestrator_llm::{
     web_search::{validate_web_search_runtime_config, WebSearchConfig, WebSearchConfigOverride},
     OutputMode, RoleLlmSettings,
@@ -32,7 +34,6 @@ pub(crate) struct WorkflowConfig {
 pub(crate) struct PromptConfig {
     pub prompts: BTreeMap<String, PathBuf>,
     pub manager_research: PathBuf,
-    pub memory_reflector: Option<PathBuf>,
 }
 
 impl RuntimeConfig {
@@ -112,43 +113,18 @@ impl RuntimeConfig {
         );
         prompts.insert(
             "mediator.topic".to_string(),
-            prompt_path_any(
+            prompt_path(
                 config,
-                &[
-                    "orchestrator.prompts.phase2.topic_generation",
-                    "orchestrator.prompts.mediator.topic",
-                ],
+                "orchestrator.prompts.mediator.topic",
                 "prompts/mediators/topic_generation.md",
             )?,
         );
         prompts.insert(
             "mediator.topic_controller".to_string(),
-            prompt_path_any(
+            prompt_path(
                 config,
-                &[
-                    "orchestrator.prompts.phase25.topic_controller",
-                    "orchestrator.prompts.mediator.topic_controller",
-                ],
+                "orchestrator.prompts.mediator.topic_controller",
                 "prompts/mediators/topic_controller.md",
-            )?,
-        );
-        prompts.insert(
-            "reducer.evidence".to_string(),
-            prompt_path_any(
-                config,
-                &[
-                    "orchestrator.prompts.reducers.evidence",
-                    "orchestrator.prompts.reducer.evidence",
-                ],
-                "prompts/reducers/evidence.md",
-            )?,
-        );
-        prompts.insert(
-            "reducer.debate_final".to_string(),
-            prompt_path_any(
-                config,
-                &["orchestrator.prompts.reducers.debate_final"],
-                "prompts/reducers/debate_final.md",
             )?,
         );
         let prompts_config = PromptConfig {
@@ -157,10 +133,6 @@ impl RuntimeConfig {
                 config,
                 "orchestrator.prompts.manager.research",
                 "prompts/managers/research_manager.md",
-            )?,
-            memory_reflector: prompt_path_optional(
-                config,
-                "orchestrator.prompts.meta.memory_reflector",
             )?,
         };
         let llm_roles = llm_roles_from_config(config)?;
@@ -329,8 +301,6 @@ pub(crate) fn required_llm_roles() -> Vec<String> {
         "researcher.bear.interaction",
         "mediator.topic",
         "mediator.topic_controller",
-        "reducer.evidence",
-        "reducer.debate_final",
         "manager.research",
     ] {
         if !ids.contains(&id.to_string()) {
@@ -342,49 +312,20 @@ pub(crate) fn required_llm_roles() -> Vec<String> {
 
 impl WorkflowConfig {
     pub fn from_value(config: &Value) -> Self {
-        let phase1_parallelism = config_int_any(
+        let phase1_parallelism =
+            config_int(config, "orchestrator.workflow.phase1.parallelism", 5).max(1) as usize;
+        let agent_timeout_sec =
+            config_int(config, "orchestrator.workflow.agent_timeout_sec", 300).max(1) as u64;
+        let reducer_timeout_sec =
+            config_int(config, "orchestrator.workflow.reducer_timeout_sec", 300).max(1) as u64;
+        let critical_roles = config_strings(
             config,
-            &[
-                "orchestrator.workflow.phase1.parallelism",
-                "orchestrator.workflow.parallel.max_worker_concurrency",
-            ],
-            5,
-        )
-        .max(1) as usize;
-        let agent_timeout_sec = config_int_any(
-            config,
-            &[
-                "orchestrator.workflow.agent_timeout_sec",
-                "orchestrator.workflow.timeouts.worker_sec",
-            ],
-            300,
-        )
-        .max(1) as u64;
-        let reducer_timeout_sec = config_int_any(
-            config,
-            &[
-                "orchestrator.workflow.reducer_timeout_sec",
-                "orchestrator.workflow.timeouts.reducer_sec",
-            ],
-            300,
-        )
-        .max(1) as u64;
-        let mut critical_roles = config_strings_any(
-            config,
-            &[
-                "orchestrator.workflow.phase1.critical_roles",
-                "orchestrator.workflow.critical_roles.phase1",
-            ],
+            "orchestrator.workflow.phase1.critical_roles",
             &["analyst.technical", "analyst.news_macro"],
         )
         .into_iter()
         .map(|role| normalize_phase1_role_name(&role))
         .collect::<BTreeSet<_>>();
-        critical_roles.extend(config_strings_any(
-            config,
-            &["orchestrator.workflow.critical_roles.reducers"],
-            &["reducer.evidence", "reducer.debate_final"],
-        ));
         let late_evidence_enabled =
             config_bool(config, "orchestrator.workflow.late_evidence.enabled", true);
         Self {
@@ -416,66 +357,6 @@ pub(crate) fn prompt_path(config: &Value, key: &str, default: &str) -> Result<Pa
         );
     }
     Ok(path)
-}
-
-pub(crate) fn prompt_path_optional(config: &Value, key: &str) -> Result<Option<PathBuf>> {
-    let Some(value) = config_get(config, key) else {
-        return Ok(None);
-    };
-    let Some(path_text) = value
-        .as_str()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        bail!("{key} must be a non-empty prompt path");
-    };
-    Ok(Some(project_path(path_text)))
-}
-
-pub(crate) fn prompt_path_any(config: &Value, keys: &[&str], default: &str) -> Result<PathBuf> {
-    for key in keys {
-        if let Some(value) = config_get(config, key).and_then(Value::as_str) {
-            let path = project_path(value);
-            if !path.exists() {
-                bail!(
-                    "configured prompt path does not exist for {key}: {}",
-                    path.display()
-                );
-            }
-            return Ok(path);
-        }
-    }
-    let path = project_path(default);
-    if !path.exists() {
-        bail!(
-            "configured prompt path does not exist for {}: {}",
-            keys.first().copied().unwrap_or("prompt"),
-            path.display()
-        );
-    }
-    Ok(path)
-}
-
-pub(crate) fn config_int_any(config: &Value, keys: &[&str], default: i64) -> i64 {
-    keys.iter()
-        .find_map(|key| config_get(config, key).and_then(Value::as_i64))
-        .unwrap_or(default)
-}
-
-pub(crate) fn config_strings_any(config: &Value, keys: &[&str], default: &[&str]) -> Vec<String> {
-    keys.iter()
-        .find_map(|key| {
-            config_get(config, key).and_then(|value| {
-                value.as_array().map(|items| {
-                    items
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>()
-                })
-            })
-        })
-        .unwrap_or_else(|| default.iter().map(|value| (*value).to_string()).collect())
 }
 
 pub(crate) fn normalize_phase1_role_name(role: &str) -> String {

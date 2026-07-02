@@ -4,7 +4,6 @@ members = [
     "crates/orchestrator-sql",
     "crates/orchestrator-llm",
     "crates/orchestrator-cli",
-    "crates/orchestrator-domain",
     "crates/orchestrator-workflow",
     "crates/orchestrator-ingest",
     "crates/orchestrator-report",

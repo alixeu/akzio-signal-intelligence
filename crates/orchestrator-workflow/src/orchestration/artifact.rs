@@ -4,26 +4,7 @@ use serde_json::{json, Value};
 use std::collections::BTreeSet;
 
 use super::config::RuntimeConfig;
-use super::degraded::degraded_fallback;
 use super::state::tickers_from_state;
-
-pub(crate) fn phase1_reducer_fallback(base: Value, error: anyhow::Error) -> Value {
-    let tickers: Vec<String> = base
-        .get("tickers")
-        .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-    let _degraded = degraded_fallback("reducer.evidence", &tickers, &error);
-    let mut result = base;
-    result["status"] = json!("degraded");
-    result["degraded"] = json!(true);
-    result["error"] = json!(error.to_string());
-    result
-}
 
 pub(crate) fn build_phase1_state_artifact(state: &Value, config: &RuntimeConfig) -> Value {
     let tickers = tickers_from_state(state);

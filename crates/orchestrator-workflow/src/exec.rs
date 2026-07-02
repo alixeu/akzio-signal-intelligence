@@ -6,35 +6,31 @@ use orchestrator_core::{
     project_path, run_slug,
 };
 use orchestrator_sql;
-use orchestrator_sql::{apply_memory_update_proposal, connect, write_run_record, RunRecordInput};
+use orchestrator_sql::{connect, write_run_record, RunRecordInput};
 use serde_json::{json, Value};
 use std::{fs, path::PathBuf};
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::orchestration::artifact::{
     build_debate_state_artifact, build_phase1_state_artifact, build_topic_controller_artifact,
     build_topic_generation_artifact, merge_reducer_output, persist_artifact,
-    persist_artifact_with_last_md, persist_message, persist_message_with_topic,
-    phase1_reducer_fallback, reducer_brief_md, topic_id_from_topic,
-    topics_from_generation_artifact,
+    persist_artifact_with_last_md, persist_message, persist_message_with_topic, reducer_brief_md,
+    topic_id_from_topic, topics_from_generation_artifact,
 };
 use crate::orchestration::config::{config_weight, validate_sqlite_context, RuntimeConfig};
 use crate::orchestration::degraded::{manager_research_fallback, role_artifact_or_degraded};
-use crate::orchestration::memory::{
-    record_memory_reflector_status, validate_memory_update_proposal,
-};
 use crate::orchestration::preflight::{enforce_preflight_policy, run_phase1_preflight};
 use crate::orchestration::render::mode_prompt_path;
 use crate::orchestration::role_jobs::{
-    prepare_role_job, run_role_job_with_timeout, run_role_jobs, run_single_role_job, RoleRun,
+    prepare_role_job, run_role_jobs, run_single_role_job, RoleRun,
 };
 use crate::orchestration::state::{
     append_topic_controller_artifact, append_topic_turn, run_id_for, set_phase_status,
     set_topic_controller_state, tickers_from_state, upsert_topic_debate_state, write_final_summary,
     write_json,
 };
-use orchestrator_core::role_registry::{DEFAULT_PHASE1_AGENTS, MEMORY_REFLECTOR_ROLE};
-use orchestrator_domain::Phase;
+use crate::orchestration::PHASE2_REDUCER;
+use orchestrator_core::role_registry::DEFAULT_PHASE1_AGENTS;
 
 #[derive(Debug, Clone, ValueEnum)]
 pub enum Mode {
@@ -256,7 +252,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         )
         .await?;
         set_phase_status(&mut state, 2, "done");
-        set_phase_status(&mut state, Phase::Phase2Reducer.as_i64(), "done");
+        set_phase_status(&mut state, PHASE2_REDUCER, "done");
         debug!("phase 2 completed");
     }
     if args.from_phase <= 3 && args.to_phase >= 3 {
@@ -891,7 +887,7 @@ async fn run_topic_controller(
         RoleRun {
             state: state.clone(),
             role: "mediator.topic_controller",
-            phase: Phase::Phase2Reducer.as_i64(),
+            phase: PHASE2_REDUCER,
             kind: checkpoint,
             round: Some(round),
             topic_id: Some(topic_id),
@@ -928,39 +924,11 @@ async fn run_topic_controller(
 async fn run_phase1_reducer(
     conn: &mut rusqlite::Connection,
     state: &mut Value,
-    model_override: Option<&str>,
-    reasoning_effort_override: Option<&str>,
+    _model_override: Option<&str>,
+    _reasoning_effort_override: Option<&str>,
     config: &RuntimeConfig,
 ) -> Result<()> {
-    let mock = is_mock(state);
-    let base = build_phase1_state_artifact(state, config);
-    state["phase1_state_artifact"] = base.clone();
-    let reducer_result = run_single_role_job(
-        RoleRun {
-            state: state.clone(),
-            role: "reducer.evidence",
-            phase: 15,
-            kind: "artifact",
-            round: None,
-            topic_id: None,
-            mock,
-            model_override,
-            reasoning_effort_override,
-            config,
-            prompt_path: config
-                .prompts
-                .path_for("reducer.evidence")
-                .map(|p| p.as_path()),
-        },
-        config.workflow.reducer_timeout_sec,
-        config,
-        state,
-    )
-    .await;
-    let artifact = match reducer_result {
-        Ok(reducer_output) => merge_reducer_output(base, reducer_output),
-        Err(error) => phase1_reducer_fallback(base, error),
-    };
+    let artifact = build_phase1_state_artifact(state, config);
     let brief = reducer_brief_md(&artifact);
     state["phase1_state_artifact"] = artifact.clone();
     state["phase1_brief_md"] = Value::String(brief.clone());
@@ -972,48 +940,23 @@ async fn run_phase1_reducer(
 async fn run_phase2_final_reducer(
     conn: &mut rusqlite::Connection,
     state: &mut Value,
-    model_override: Option<&str>,
-    reasoning_effort_override: Option<&str>,
+    _model_override: Option<&str>,
+    _reasoning_effort_override: Option<&str>,
     config: &RuntimeConfig,
 ) -> Result<()> {
-    let mock = is_mock(state);
-    let base = build_debate_state_artifact(state, config);
-    state["debate_state_artifact"] = base.clone();
-    let reducer_output = run_single_role_job(
-        RoleRun {
-            state: state.clone(),
-            role: "reducer.debate_final",
-            phase: Phase::Phase2Reducer.as_i64(),
-            kind: "final_artifact",
-            round: None,
-            topic_id: None,
-            mock,
-            model_override,
-            reasoning_effort_override,
-            config,
-            prompt_path: config
-                .prompts
-                .path_for("reducer.debate_final")
-                .map(|p| p.as_path()),
-        },
-        config.workflow.reducer_timeout_sec,
-        config,
-        state,
-    )
-    .await?;
-    let artifact = merge_reducer_output(base, reducer_output);
+    let artifact = build_debate_state_artifact(state, config);
     let brief = reducer_brief_md(&artifact);
     state["debate_state_artifact"] = artifact.clone();
     state["debate_brief_md"] = Value::String(brief.clone());
     persist_artifact_with_last_md(
         conn,
         state,
-        Phase::Phase2Reducer.as_i64(),
+        PHASE2_REDUCER,
         "reducer.debate_final",
         artifact,
         brief,
     )?;
-    set_phase_status(state, Phase::Phase2Reducer.as_i64(), "done");
+    set_phase_status(state, PHASE2_REDUCER, "done");
     Ok(())
 }
 
@@ -1067,141 +1010,6 @@ async fn run_phase3(
     persist_artifact(conn, state, 3, "manager.research", artifact.clone())?;
     state["research_plan"] = artifact;
     debug!("manager research role completed");
-    run_memory_reflector_after_phase3(
-        conn,
-        state,
-        model_override,
-        reasoning_effort_override,
-        config,
-    )
-    .await?;
-    Ok(())
-}
-
-async fn run_memory_reflector_after_phase3(
-    conn: &mut rusqlite::Connection,
-    state: &mut Value,
-    model_override: Option<&str>,
-    reasoning_effort_override: Option<&str>,
-    config: &RuntimeConfig,
-) -> Result<()> {
-    let mock = is_mock(state);
-    let Some(prompt_path) = config.prompts.memory_reflector.as_deref() else {
-        debug!("memory reflector skipped: prompt not configured");
-        record_memory_reflector_status(
-            state,
-            "skipped",
-            "optional prompt orchestrator.prompts.meta.memory_reflector is not configured",
-        );
-        return Ok(());
-    };
-    if !config.llm_roles.contains_key(MEMORY_REFLECTOR_ROLE) {
-        debug!("memory reflector skipped: role not configured");
-        record_memory_reflector_status(
-            state,
-            "skipped",
-            "optional role meta.memory_reflector is not configured",
-        );
-        return Ok(());
-    }
-    if mock {
-        debug!("memory reflector skipped: mock run");
-        record_memory_reflector_status(state, "skipped", "mock run");
-        return Ok(());
-    }
-
-    debug!("memory reflector role starting");
-    let job = match prepare_role_job(RoleRun {
-        state: state.clone(),
-        role: MEMORY_REFLECTOR_ROLE,
-        phase: Phase::Phase3MemoryReflector.as_i64(),
-        kind: "memory_update_proposal",
-        round: None,
-        topic_id: None,
-        mock,
-        model_override,
-        reasoning_effort_override,
-        config,
-        prompt_path: Some(prompt_path),
-    }) {
-        Ok(job) => job,
-        Err(error) => {
-            record_memory_reflector_status(
-                state,
-                "failed",
-                &format!("failed to prepare reflector role: {error}"),
-            );
-            return Ok(());
-        }
-    };
-
-    let result = run_role_job_with_timeout(job, config.workflow.reducer_timeout_sec).await;
-    let Some(artifact) = result.artifact else {
-        let message = result
-            .error
-            .unwrap_or_else(|| "memory reflector role failed".to_string());
-        warn!(message, "memory reflector failed");
-        record_memory_reflector_status(state, "failed", &message);
-        return Ok(());
-    };
-
-    if let Err(error) = validate_memory_update_proposal(&artifact, &tickers_from_state(state)) {
-        state["memory_update_proposal_rejected"] = artifact;
-        record_memory_reflector_status(
-            state,
-            "invalid",
-            &format!("MemoryUpdateProposal validation failed: {error}"),
-        );
-        return Ok(());
-    }
-
-    match persist_artifact(
-        conn,
-        state,
-        Phase::Phase3MemoryReflector.as_i64(),
-        MEMORY_REFLECTOR_ROLE,
-        artifact.clone(),
-    ) {
-        Ok(()) => {
-            state["memory_update_proposal"] = artifact.clone();
-            match apply_memory_update_proposal(conn, &artifact) {
-                Ok(result) => {
-                    debug!(
-                        applied = result.applied,
-                        reused = result.reused,
-                        memory_ids = ?result.memory_ids,
-                        "memory update proposal applied"
-                    );
-                    state["memory_reflector"] = json!({
-                        "status": "applied",
-                        "role": MEMORY_REFLECTOR_ROLE,
-                        "phase": Phase::Phase3MemoryReflector.as_i64(),
-                        "persisted_agent_message": true,
-                        "applied": result.applied,
-                        "reused": result.reused,
-                        "memory_ids": result.memory_ids
-                    });
-                }
-                Err(error) => {
-                    warn!(%error, "memory update proposal apply failed");
-                    record_memory_reflector_status(
-                        state,
-                        "apply_failed",
-                        &format!("proposal persisted but memory apply failed: {error}"),
-                    );
-                }
-            }
-        }
-        Err(error) => {
-            state["memory_update_proposal"] = artifact;
-            record_memory_reflector_status(
-                state,
-                "validated_not_persisted",
-                &format!("proposal validated but agent_message persistence failed: {error}"),
-            );
-        }
-    }
-
     Ok(())
 }
 
@@ -1220,6 +1028,9 @@ mod tests {
             preamble: None,
             max_turns: Some(4),
             reasoning_effort: None,
+            reasoning_summary: None,
+            preserve_reasoning_state: false,
+            text_verbosity: None,
             transport: Default::default(),
             base_url: Some("https://llm.example.com/v1".to_string()),
             api_key: Some("test-key".to_string()),
@@ -1669,198 +1480,5 @@ mod tests {
             state["preflight"]["run_technical_indicators"]["status"],
             "skipped"
         );
-    }
-
-    #[test]
-    fn memory_update_proposal_contract_accepts_valid_thesis_update() {
-        let artifact = json!({
-            "artifact_type": "MemoryUpdateProposal",
-            "schema_version": 1,
-            "source_role": "manager.research",
-            "generated_at": "2026-06-18T09:30:00Z",
-            "run_id": "run-1",
-            "proposals": [{
-                "update_type": "thesis",
-                "ticker": "TQQQ",
-                "scope": "ticker",
-                "observed_at": "2026-06-18T09:00:00Z",
-                "source_date": "2026-06-18",
-                "expires_at": null,
-                "confidence": 0.72,
-                "summary": "Liquidity improved while breadth remained narrow.",
-                "evidence_refs": [{
-                    "source_type": "final_research",
-                    "source_id": "manager.research",
-                    "quote_or_fact": "Final research raised the liquidity caveat."
-                }],
-                "invalidation_conditions": ["Breadth weakens below the stated threshold."],
-                "follow_up_checks": ["Check next session market breadth."],
-                "thesis": {
-                    "status": "update",
-                    "prior_thesis_id": "thesis-previous"
-                }
-            }]
-        });
-
-        validate_memory_update_proposal(&artifact, &["TQQQ".to_string()]).unwrap();
-    }
-
-    #[test]
-    fn memory_update_proposal_contract_requires_prior_thesis_for_updates() {
-        let artifact = json!({
-            "artifact_type": "MemoryUpdateProposal",
-            "schema_version": 1,
-            "source_role": "manager.research",
-            "run_id": "run-1",
-            "generated_at": "2026-06-18T09:30:00Z",
-            "proposals": [{
-                "update_type": "thesis",
-                "ticker": "TQQQ",
-                "scope": "ticker",
-                "observed_at": "2026-06-18T09:00:00Z",
-                "source_date": "2026-06-18",
-                "expires_at": null,
-                "confidence": 0.72,
-                "summary": "Liquidity improved while breadth remained narrow.",
-                "evidence_refs": [{
-                    "source_type": "final_research",
-                    "source_id": "manager.research",
-                    "quote_or_fact": "Final research raised the liquidity caveat."
-                }],
-                "invalidation_conditions": ["Breadth weakens below the stated threshold."],
-                "follow_up_checks": ["Check next session market breadth."],
-                "thesis": {
-                    "status": "update"
-                }
-            }]
-        });
-
-        let err = validate_memory_update_proposal(&artifact, &["TQQQ".to_string()]).unwrap_err();
-        assert!(err.to_string().contains("prior_thesis_id"));
-    }
-
-    #[test]
-    fn memory_update_proposal_apply_result_can_be_persisted_after_validation() {
-        let temp = tempfile::tempdir().unwrap();
-        let db_path = temp.path().join("memory.sqlite");
-        let mut conn = connect(&db_path).unwrap();
-        let artifact = json!({
-            "artifact_type": "MemoryUpdateProposal",
-            "schema_version": 1,
-            "source_role": "manager.research",
-            "run_id": "run-1",
-            "generated_at": "2026-06-19T00:00:00Z",
-            "proposals": [{
-                "update_type": "observation",
-                "ticker": "TQQQ",
-                "scope": "ticker",
-                "observed_at": "2026-06-19T00:00:00Z",
-                "source_date": "2026-06-19",
-                "expires_at": null,
-                "confidence": 0.72,
-                "summary": "Liquidity improved while breadth remained narrow.",
-                "evidence_refs": [{
-                    "source_type": "final_research",
-                    "source_id": "manager.research",
-                    "quote_or_fact": "Final research raised the liquidity caveat."
-                }],
-                "invalidation_conditions": ["Breadth weakens below the stated threshold."],
-                "follow_up_checks": ["Check next session market breadth."]
-            }]
-        });
-        validate_memory_update_proposal(&artifact, &["TQQQ".to_string()]).unwrap();
-
-        let applied = apply_memory_update_proposal(&mut conn, &artifact).unwrap();
-
-        assert_eq!(applied.applied, 1);
-        assert_eq!(
-            conn.query_row("SELECT COUNT(*) FROM memory_items", [], |row| row
-                .get::<_, i64>(0))
-                .unwrap(),
-            1
-        );
-    }
-
-    #[test]
-    fn runtime_config_accepts_optional_memory_reflector_role() {
-        let temp = tempfile::tempdir().unwrap();
-        let prompt_path = temp.path().join("memory_reflector.md");
-        fs::write(&prompt_path, "Return JSON").unwrap();
-        let prompt_value = prompt_path.display().to_string();
-        let mut config = json!({
-            "orchestrator": {
-                "data_source": {
-                    "strict_sqlite": true,
-                    "required_contexts": ["technical"]
-                },
-                "prompts": {
-                    "analyst": {
-                        "technical": prompt_value.clone(),
-                        "news_macro": prompt_value.clone(),
-                        "youtube": prompt_value.clone(),
-                        "reddit": prompt_value.clone(),
-                        "x": prompt_value.clone()
-                    },
-                    "phase2": {
-                        "topic_generation": prompt_value.clone(),
-                        "topic_controller": prompt_value.clone(),
-                        "bull_initial": prompt_value.clone(),
-                        "bull_interaction": prompt_value.clone(),
-                        "bear_initial": prompt_value.clone(),
-                        "bear_interaction": prompt_value.clone()
-                    },
-                    "reducers": {
-                        "evidence": prompt_value.clone(),
-                        "debate_final": prompt_value.clone()
-                    },
-                    "manager": {
-                        "research": prompt_value.clone()
-                    },
-                    "meta": {
-                        "memory_reflector": prompt_value
-                    }
-                },
-                "llm": {
-                    "roles": test_complete_llm_roles_config()
-                }
-            }
-        });
-        config["orchestrator"]["llm"]["roles"][MEMORY_REFLECTOR_ROLE] = serde_json::json!({
-            "route": "responses",
-            "model": "gpt-5.4",
-            "base_url": "https://llm.example.com/v1",
-            "api_key": "test-key",
-            "max_turns": 4,
-            "reasoning_effort": "medium",
-            "think_tool": false,
-            "tools": ["read_run_context"]
-        });
-
-        let config = RuntimeConfig::from_value(&config).unwrap();
-        assert_eq!(
-            config.prompts.memory_reflector.as_deref(),
-            Some(prompt_path.as_path())
-        );
-        assert!(config.llm_roles.contains_key(MEMORY_REFLECTOR_ROLE));
-    }
-
-    fn test_complete_llm_roles_config() -> Value {
-        let mut roles = serde_json::Map::new();
-        for role in crate::orchestration::config::required_llm_roles() {
-            roles.insert(
-                (*role).to_string(),
-                serde_json::json!({
-                    "route": "responses",
-                    "model": "gpt-5.4",
-                    "base_url": "https://llm.example.com/v1",
-                    "api_key": "test-key",
-                    "max_turns": 4,
-                    "reasoning_effort": null,
-                    "think_tool": false,
-                    "tools": []
-                }),
-            );
-        }
-        Value::Object(roles)
     }
 }

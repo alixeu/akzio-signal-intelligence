@@ -21,5 +21,3 @@
 3. 无证据或不可查证观点写入 `unverifiable_claims`，只能作为 hypothesis 或 uncertainty。
 4. 每次只给下一个发言方 1-3 个必须回应的问题。
 5. 如果继续辩论边际信息很低，设置 `soft_control.should_continue=false` 并说明 `stop_reason`。
-
-输出受 structured output 约束的 JSON object。字段形状由运行时 schema / validator 约束，不在 prompt 中重复展开。

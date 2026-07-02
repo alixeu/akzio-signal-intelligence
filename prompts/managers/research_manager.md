@@ -89,20 +89,11 @@
 输出受 structured output 约束的 research artifact。多 ticker 时覆盖全部 ticker。
 ---
 
-**已入库上下文读取要求**：
-- 你必须把运行时结构化上下文作为当前 run 的事实入口，优先读取 Phase 1 / Phase 2 / Phase 2.5 的压缩上下文；只有需要追溯具体原始 node/source ID 时才读取原始输入。
-- 如需量化/技术特征背景，使用已入库的 `LGBM`、`ETF`、`1d/2h/30min` 等技术特征记录；不要读取运行时上下文之外的本地文件。
-- 多 ticker 时必须使用已入库记录的 `ticker` 与 artifact 的 `per_ticker` 字段分别更新 QQQ、VIX、SOXX 等标的；不得把 `QQQ,VIX,SOXX` 混合作为一个单独 ticker 的概率。
-
 **上下文读取要求：**
-- 先使用 `read_run_context` 读取 `prior_memory`（带 ticker、limit=20、include_body=true），再读取 `compose_context`（带 ticker、token_budget），从中获取可复用长期记忆、Phase 1 加权基础概率、Phase 2 辩论历史和 Phase 2.5 中间人压缩；需要细查时再读取 `research_inputs`。
+- 先使用 `read_run_context` 读取 `compose_context`（带 ticker、token_budget），从中获取 Phase 1 加权基础概率、Phase 2 辩论历史和 Phase 2.5 中间人压缩；需要细查时再读取 `research_inputs`。
 - 需要按 topic 细查时使用 `read_run_context` 读取 `topic_state` / `debate_history`。
 - 不要请求 raw SQL，不要调用未配置的历史搜索工具。
-
-**已入库上下文要求：**
-- 你必须优先获取本次 run 的 Phase 1、Phase 2、Phase 2.5 压缩结构化数据，再使用上方摘要作为导航；不要默认读取全量辩论原文。
-- Phase 3 只使用本次 run 的已入库数据和摘要，不从外部文件补充新事实；如摘要与已入库数据冲突，以已入库的有效 artifact、topic_final、checkpoint、final 为准。
-- 多 ticker 时必须逐个 ticker 读取并更新概率；QQQ、VIX 或其他 ticker 的证据不得混同，不能因为主题标题相似而共享概率更新。
+- 只使用本次 run 的已入库结构化数据；多 ticker 时逐个 ticker 更新概率，不混用 QQQ、VIX 或其他 ticker 的证据。
 
 辩论执行模式固定为实时房间沟通：
 - `辩论历史` 包含每个 topic 的实时消息摘要、bull final、bear final、summary final。

@@ -1,16 +1,7 @@
 use anyhow::{bail, Context, Result};
-use rig_core::{
-    completion::ToolDefinition,
-    tool::{Tool, ToolError},
-};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Instant,
-};
-use tokio::process::Command;
+use std::{path::PathBuf, sync::Arc};
 use tracing::{debug, warn};
 
 use crate::agent_loop::ToolRuntimeTurnContext;
@@ -19,12 +10,17 @@ use crate::web_search::{
 };
 pub use crate::web_search::{WebSearchConfig, WebSearchProvider};
 
-use orchestrator_ingest::{jin10, social, technical};
+use orchestrator_ingest::{jin10, social, technical, wayinvideo, youtube};
 
 pub const WEB_RUN_TOOL_NAME: &str = "web.run";
 const WEB_RUN_MAX_SEARCH_QUERIES: usize = 4;
 const WEB_RUN_MAX_QUERY_CHARS: usize = 512;
 pub const READ_RUN_CONTEXT_TOOL_NAME: &str = "read_run_context";
+pub const FETCH_JIN10_FLASH_TOOL_NAME: &str = "fetch_jin10_flash";
+pub const FETCH_YOUTUBE_TRANSCRIPT_TOOL_NAME: &str = "fetch_youtube_transcript";
+pub const FETCH_WAYINVIDEO_TRANSCRIPT_TOOL_NAME: &str = "fetch_wayinvideo_transcript";
+pub const RUN_TECHNICAL_INDICATORS_TOOL_NAME: &str = "run_technical_indicators";
+pub const FETCH_LAST30DAYS_CONTEXT_TOOL_NAME: &str = "fetch_last30days_context";
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ExternalToolConfig {
@@ -34,23 +30,6 @@ pub struct ExternalToolConfig {
     #[serde(default)]
     pub run_id: Option<String>,
     pub tickers: Vec<String>,
-}
-
-impl ExternalToolConfig {
-    fn command_spec(&self, bin_name: &str) -> CommandSpec {
-        CommandSpec {
-            program: "cargo".to_string(),
-            args: vec![
-                "run".to_string(),
-                "-q".to_string(),
-                "-p".to_string(),
-                "orchestrator-cli".to_string(),
-                "--bin".to_string(),
-                bin_name.to_string(),
-                "--".to_string(),
-            ],
-        }
-    }
 }
 
 pub type SharedWebSearchProvider = Arc<dyn WebSearchProvider>;
@@ -83,37 +62,11 @@ impl WebRunRuntime {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
-struct CommandSpec {
-    program: String,
-    args: Vec<String>,
-}
-
-impl CommandSpec {
-    fn command(&self, cwd: &Path) -> Command {
-        let mut cmd = Command::new(&self.program);
-        cmd.current_dir(cwd).args(&self.args);
-        cmd
-    }
-
-    fn push_arg(&mut self, value: impl Into<String>) {
-        self.args.push(value.into());
-    }
-
-    fn push_path(&mut self, value: PathBuf) {
-        self.args.push(value.to_string_lossy().to_string());
-    }
-}
-
 #[derive(Debug, Clone)]
-pub struct FetchJin10FlashTool {
-    config: ExternalToolConfig,
-}
+pub struct FetchJin10FlashTool;
 
 impl FetchJin10FlashTool {
-    pub fn new(config: ExternalToolConfig) -> Self {
-        Self { config }
-    }
+    pub const NAME: &'static str = FETCH_JIN10_FLASH_TOOL_NAME;
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -145,47 +98,11 @@ impl FetchJin10FlashArgs {
     }
 }
 
-impl rig_core::tool::Tool for FetchJin10FlashTool {
-    const NAME: &'static str = "fetch_jin10_flash";
-    type Error = ToolError;
-    type Args = FetchJin10FlashArgs;
-    type Output = Value;
-
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: Self::NAME.to_string(),
-            description: "Fetch recent Jin10 flash news and return structured JSON.".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "lookback_hours": {"type": "number"},
-                    "pages": {"type": "integer"},
-                    "classify": {"type": "string"},
-                    "output": {"type": "string"}
-                }
-            }),
-        }
-    }
-
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        run_json_command(
-            fetch_jin10_flash_spec(&self.config, &args).command(&self.config.project_root),
-            Self::NAME,
-        )
-        .await
-        .map_err(tool_error)
-    }
-}
-
 #[derive(Debug, Clone)]
-pub struct FetchYoutubeTranscriptTool {
-    config: ExternalToolConfig,
-}
+pub struct FetchYoutubeTranscriptTool;
 
 impl FetchYoutubeTranscriptTool {
-    pub fn new(config: ExternalToolConfig) -> Self {
-        Self { config }
-    }
+    pub const NAME: &'static str = FETCH_YOUTUBE_TRANSCRIPT_TOOL_NAME;
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -202,49 +119,11 @@ pub struct FetchYoutubeTranscriptArgs {
     pub output: Option<String>,
 }
 
-impl rig_core::tool::Tool for FetchYoutubeTranscriptTool {
-    const NAME: &'static str = "fetch_youtube_transcript";
-    type Error = ToolError;
-    type Args = FetchYoutubeTranscriptArgs;
-    type Output = Value;
-
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: Self::NAME.to_string(),
-            description: "Fetch YouTube channel/video candidates and transcript metadata as JSON."
-                .to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "all": {"type": "boolean"},
-                    "channel": {"type": "string"},
-                    "url": {"type": "string"},
-                    "max_videos": {"type": "integer"},
-                    "output": {"type": "string"}
-                }
-            }),
-        }
-    }
-
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        run_json_command(
-            fetch_youtube_transcript_spec(&self.config, &args).command(&self.config.project_root),
-            Self::NAME,
-        )
-        .await
-        .map_err(tool_error)
-    }
-}
-
 #[derive(Debug, Clone)]
-pub struct FetchWayinVideoTranscriptTool {
-    config: ExternalToolConfig,
-}
+pub struct FetchWayinVideoTranscriptTool;
 
 impl FetchWayinVideoTranscriptTool {
-    pub fn new(config: ExternalToolConfig) -> Self {
-        Self { config }
-    }
+    pub const NAME: &'static str = FETCH_WAYINVIDEO_TRANSCRIPT_TOOL_NAME;
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -262,124 +141,18 @@ pub struct FetchWayinVideoTranscriptArgs {
     pub output: Option<String>,
 }
 
-impl rig_core::tool::Tool for FetchWayinVideoTranscriptTool {
-    const NAME: &'static str = "fetch_wayinvideo_transcript";
-    type Error = ToolError;
-    type Args = FetchWayinVideoTranscriptArgs;
-    type Output = Value;
-
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: Self::NAME.to_string(),
-            description: "Fetch a WayinVideo transcript for a YouTube URL or existing task id."
-                .to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "url": {"type": "string"},
-                    "title": {"type": "string"},
-                    "published": {"type": "string"},
-                    "task": {"type": "string"},
-                    "task_id": {"type": "string"},
-                    "output": {"type": "string"}
-                },
-                "required": ["url"]
-            }),
-        }
-    }
-
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        run_json_command(
-            fetch_wayinvideo_transcript_spec(&self.config, &args)
-                .command(&self.config.project_root),
-            Self::NAME,
-        )
-        .await
-        .map_err(tool_error)
-    }
-}
-
 #[derive(Debug, Clone)]
-pub struct ReadRunContextTool {
-    config: ExternalToolConfig,
-}
+pub struct ReadRunContextTool;
 
 impl ReadRunContextTool {
-    pub fn new(config: ExternalToolConfig) -> Self {
-        Self { config }
-    }
-}
-
-impl rig_core::tool::Tool for ReadRunContextTool {
-    const NAME: &'static str = READ_RUN_CONTEXT_TOOL_NAME;
-    type Error = ToolError;
-    type Args = Value;
-    type Output = Value;
-
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: Self::NAME.to_string(),
-            description:
-                "Read scoped current-run context from SQLite through structured named slices."
-                    .to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "kind": {
-                        "type": "string",
-                        "enum": [
-                            "context_packet",
-                            "compose_context",
-                            "analyst_reports",
-                            "debate_history",
-                            "research_inputs",
-                            "topic_state",
-                            "mediator_reviews",
-                            "technical",
-                            "technical_daily",
-                            "technical_3h",
-                            "technical_20min",
-                            "role_summaries",
-                            "turn_context",
-                            "jin10",
-                            "prior_memory"
-                        ]
-                    },
-                    "run_id": {"type": "string"},
-                    "ticker": {"type": "string"},
-                    "tickers": {"type": "array", "items": {"type": "string"}},
-                    "phase": {"type": "integer"},
-                    "role": {"type": "string"},
-                    "topic_id": {"type": "string"},
-                    "turn_id": {"type": "string"},
-                    "token_budget": {"type": "integer"},
-                    "query": {"type": "string"},
-                    "memory_types": {"type": "array", "items": {"type": "string"}},
-                    "statuses": {"type": "array", "items": {"type": "string"}},
-                    "include_expired": {"type": "boolean"},
-                    "limit": {"type": "integer"},
-                    "include_body": {"type": "boolean"}
-                },
-                "required": ["kind"],
-                "additionalProperties": false
-            }),
-        }
-    }
-
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        execute_read_run_context(args, &self.config, None).map_err(tool_error)
-    }
+    pub const NAME: &'static str = READ_RUN_CONTEXT_TOOL_NAME;
 }
 
 #[derive(Debug, Clone)]
-pub struct RunTechnicalIndicatorsTool {
-    config: ExternalToolConfig,
-}
+pub struct RunTechnicalIndicatorsTool;
 
 impl RunTechnicalIndicatorsTool {
-    pub fn new(config: ExternalToolConfig) -> Self {
-        Self { config }
-    }
+    pub const NAME: &'static str = RUN_TECHNICAL_INDICATORS_TOOL_NAME;
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -421,50 +194,11 @@ impl RunTechnicalIndicatorsArgs {
     }
 }
 
-impl rig_core::tool::Tool for RunTechnicalIndicatorsTool {
-    const NAME: &'static str = "run_technical_indicators";
-    type Error = ToolError;
-    type Args = RunTechnicalIndicatorsArgs;
-    type Output = Value;
-
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: Self::NAME.to_string(),
-            description: "Download Twelve Data bars, compute local technical indicators, and import them into technical tables.".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "symbols": {"type": "array", "items": {"type": "string"}},
-                    "intervals": {"type": "array", "items": {"type": "string"}},
-                    "start": {"type": "string"},
-                    "end": {"type": "string"},
-                    "days": {"type": "integer"},
-                    "model": {"type": "string"},
-                    "db_path": {"type": "string"}
-                }
-            }),
-        }
-    }
-
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        run_json_command(
-            run_technical_indicators_spec(&self.config, &args).command(&self.config.project_root),
-            Self::NAME,
-        )
-        .await
-        .map_err(tool_error)
-    }
-}
-
 #[derive(Debug, Clone)]
-pub struct FetchLast30DaysContextTool {
-    config: ExternalToolConfig,
-}
+pub struct FetchLast30DaysContextTool;
 
 impl FetchLast30DaysContextTool {
-    pub fn new(config: ExternalToolConfig) -> Self {
-        Self { config }
-    }
+    pub const NAME: &'static str = FETCH_LAST30DAYS_CONTEXT_TOOL_NAME;
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -492,47 +226,6 @@ impl FetchLast30DaysContextArgs {
     }
 }
 
-impl rig_core::tool::Tool for FetchLast30DaysContextTool {
-    const NAME: &'static str = "fetch_last30days_context";
-    type Error = ToolError;
-    type Args = FetchLast30DaysContextArgs;
-    type Output = Value;
-
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: Self::NAME.to_string(),
-            description: "Fetch recent Reddit, X, or YouTube social context for ticker analysis."
-                .to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "tickers": {"type": "array", "items": {"type": "string"}},
-                    "source": {"type": "string", "enum": ["reddit", "x", "youtube"]},
-                    "days": {"type": "integer"},
-                    "limit": {"type": "integer"},
-                    "depth": {"type": "string", "enum": ["quick", "default", "deep"]}
-                },
-                "required": ["source"]
-            }),
-        }
-    }
-
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        let tickers = last30days_tickers(&args);
-        run_last30days_context(
-            &self.config,
-            normalize_last30days_source(args.source.as_deref()),
-            tickers,
-            args.days,
-            args.limit,
-            args.depth.as_deref(),
-            Self::NAME,
-        )
-        .await
-        .map_err(tool_error)
-    }
-}
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct WebRunInput {
     #[serde(default, deserialize_with = "deserialize_web_run_search_query")]
@@ -541,10 +234,6 @@ pub struct WebRunInput {
     pub query: Option<String>,
     #[serde(default)]
     pub include_domains: Vec<String>,
-    #[serde(default)]
-    pub open: Vec<WebRunOpenInput>,
-    #[serde(default)]
-    pub find: Vec<WebRunFindInput>,
     #[serde(default)]
     pub response_length: WebRunResponseLength,
     #[serde(default)]
@@ -572,19 +261,6 @@ pub struct WebRunSearchQueryInput {
     pub context_max_characters: Option<usize>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct WebRunOpenInput {
-    pub ref_id: String,
-    #[serde(default)]
-    pub lineno: Option<usize>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct WebRunFindInput {
-    pub ref_id: String,
-    pub pattern: String,
-}
-
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WebRunResponseLength {
@@ -592,285 +268,6 @@ pub enum WebRunResponseLength {
     #[default]
     Medium,
     Long,
-}
-
-#[derive(Clone)]
-pub struct WebRunTool {
-    config: WebSearchConfig,
-    provider: Option<SharedWebSearchProvider>,
-}
-
-impl WebRunTool {
-    pub fn new(config: WebSearchConfig) -> Self {
-        Self {
-            config,
-            provider: None,
-        }
-    }
-
-    pub fn with_provider(mut self, provider: SharedWebSearchProvider) -> Self {
-        self.provider = Some(provider);
-        self
-    }
-}
-
-impl rig_core::tool::Tool for WebRunTool {
-    const NAME: &'static str = WEB_RUN_TOOL_NAME;
-    type Error = ToolError;
-    type Args = WebRunInput;
-    type Output = Value;
-
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        web_run_tool_definition()
-    }
-
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        let args = serde_json::to_value(args).map_err(|error| {
-            ToolError::ToolCallError(Box::new(std::io::Error::other(error.to_string())))
-        })?;
-        execute_web_run(args, &self.config, self.provider.as_deref())
-            .await
-            .map_err(tool_error)
-    }
-}
-
-async fn run_last30days_context(
-    config: &ExternalToolConfig,
-    source: Option<&str>,
-    tickers: Vec<String>,
-    days: Option<i64>,
-    limit: Option<usize>,
-    depth: Option<&str>,
-    tool_name: &str,
-) -> Result<Value> {
-    run_json_command(
-        last30days_context_spec(config, source, tickers, days, limit, depth)
-            .command(&config.project_root),
-        tool_name,
-    )
-    .await
-}
-
-fn fetch_jin10_flash_spec(config: &ExternalToolConfig, args: &FetchJin10FlashArgs) -> CommandSpec {
-    let mut spec = config.command_spec("fetch-jin10-flash");
-    if let Some(value) = args.lookback_hours {
-        spec.push_arg("--lookback-hours");
-        spec.push_arg(value.to_string());
-    }
-    if let Some(value) = args.pages {
-        spec.push_arg("--pages");
-        spec.push_arg(value.to_string());
-    }
-    if let Some(value) = args.classify.as_deref().filter(|value| !value.is_empty()) {
-        spec.push_arg("--classify");
-        spec.push_arg(value);
-    }
-    if let Some(value) = args.output.as_deref().filter(|value| !value.is_empty()) {
-        spec.push_arg("--output");
-        spec.push_arg(value);
-    }
-    spec
-}
-
-fn fetch_youtube_transcript_spec(
-    config: &ExternalToolConfig,
-    args: &FetchYoutubeTranscriptArgs,
-) -> CommandSpec {
-    let mut spec = config.command_spec("fetch-youtube-transcript");
-    if args.all {
-        spec.push_arg("--all");
-    }
-    if let Some(value) = args.channel.as_deref().filter(|value| !value.is_empty()) {
-        spec.push_arg("--channel");
-        spec.push_arg(value);
-    }
-    if let Some(value) = args.url.as_deref().filter(|value| !value.is_empty()) {
-        spec.push_arg("--url");
-        spec.push_arg(value);
-    }
-    if let Some(value) = args.max_videos {
-        spec.push_arg("--max-videos");
-        spec.push_arg(value.to_string());
-    }
-    if let Some(value) = args.output.as_deref().filter(|value| !value.is_empty()) {
-        spec.push_arg("--output");
-        spec.push_arg(value);
-    }
-    spec
-}
-
-fn fetch_wayinvideo_transcript_spec(
-    config: &ExternalToolConfig,
-    args: &FetchWayinVideoTranscriptArgs,
-) -> CommandSpec {
-    let mut spec = config.command_spec("fetch-wayinvideo-transcript");
-    spec.push_arg("--url");
-    spec.push_arg(&args.url);
-    if let Some(value) = args.title.as_deref().filter(|value| !value.is_empty()) {
-        spec.push_arg("--title");
-        spec.push_arg(value);
-    }
-    if let Some(value) = args.published.as_deref().filter(|value| !value.is_empty()) {
-        spec.push_arg("--published");
-        spec.push_arg(value);
-    }
-    if let Some(value) = args.task.as_deref().filter(|value| !value.is_empty()) {
-        spec.push_arg("--task");
-        spec.push_arg(value);
-    }
-    if let Some(value) = args.task_id.as_deref().filter(|value| !value.is_empty()) {
-        spec.push_arg("--task-id");
-        spec.push_arg(value);
-    }
-    if let Some(value) = args.output.as_deref().filter(|value| !value.is_empty()) {
-        spec.push_arg("--output");
-        spec.push_arg(value);
-    }
-    spec
-}
-
-fn run_technical_indicators_spec(
-    config: &ExternalToolConfig,
-    args: &RunTechnicalIndicatorsArgs,
-) -> CommandSpec {
-    let mut spec = config.command_spec("run-technical-indicators");
-    let symbols = if args.symbols.is_empty() {
-        config.tickers.clone()
-    } else {
-        args.symbols.clone()
-    };
-    if !symbols.is_empty() {
-        spec.push_arg("--symbols");
-        spec.push_arg(symbols.join(","));
-    }
-    let db_path = args
-        .db_path
-        .as_ref()
-        .map(PathBuf::from)
-        .or_else(|| config.db_path.clone());
-    if let Some(path) = db_path {
-        spec.push_arg("--db-path");
-        spec.push_path(path);
-    }
-    if !args.intervals.is_empty() {
-        spec.push_arg("--intervals");
-        spec.push_arg(args.intervals.join(","));
-    }
-    if let Some(value) = args.start.as_deref().filter(|value| !value.is_empty()) {
-        spec.push_arg("--start");
-        spec.push_arg(value);
-    }
-    if let Some(value) = args.end.as_deref().filter(|value| !value.is_empty()) {
-        spec.push_arg("--end");
-        spec.push_arg(value);
-    }
-    if let Some(value) = args.days {
-        spec.push_arg("--days");
-        spec.push_arg(value.to_string());
-    }
-    if let Some(value) = args.model.as_deref().filter(|value| !value.is_empty()) {
-        spec.push_arg("--model");
-        spec.push_arg(value);
-    }
-    spec
-}
-
-fn last30days_context_spec(
-    config: &ExternalToolConfig,
-    source: Option<&str>,
-    tickers: Vec<String>,
-    days: Option<i64>,
-    limit: Option<usize>,
-    depth: Option<&str>,
-) -> CommandSpec {
-    let mut spec = config.command_spec("fetch-last30days-context");
-    let tickers = if tickers.is_empty() {
-        config.tickers.clone()
-    } else {
-        tickers
-    };
-    if !tickers.is_empty() {
-        spec.push_arg("--tickers");
-        spec.push_arg(tickers.join(","));
-    }
-    if let Some(value) = source.filter(|value| !value.is_empty()) {
-        spec.push_arg("--source");
-        spec.push_arg(value);
-    }
-    if let Some(value) = days {
-        spec.push_arg("--days");
-        spec.push_arg(value.to_string());
-    }
-    if let Some(value) = limit {
-        spec.push_arg("--limit");
-        spec.push_arg(value.to_string());
-    }
-    if let Some(value) = depth.filter(|value| !value.is_empty()) {
-        spec.push_arg("--depth");
-        spec.push_arg(value);
-    }
-    spec
-}
-
-async fn run_json_command(mut cmd: Command, tool_name: &str) -> Result<Value> {
-    let started_at = Instant::now();
-    debug!(tool = tool_name, "external json command starting");
-    let output = cmd
-        .output()
-        .await
-        .with_context(|| format!("{tool_name} command failed to start"))?;
-    let elapsed_ms = started_at.elapsed().as_millis();
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    if !output.status.success() {
-        warn!(
-            tool = tool_name,
-            elapsed_ms,
-            exit_code = output.status.code(),
-            stderr_chars = stderr.len(),
-            stdout_chars = stdout.len(),
-            "external json command failed"
-        );
-        return Ok(json!({
-            "status": "error",
-            "tool": tool_name,
-            "exit_code": output.status.code(),
-            "message": stderr,
-            "stdout": stdout
-        }));
-    }
-    if stdout.is_empty() {
-        debug!(
-            tool = tool_name,
-            elapsed_ms, "external json command completed without stdout"
-        );
-        return Ok(json!({"status": "success", "tool": tool_name}));
-    }
-    debug!(
-        tool = tool_name,
-        elapsed_ms,
-        stdout_chars = stdout.len(),
-        stderr_chars = stderr.len(),
-        "external json command completed"
-    );
-    serde_json::from_str(&stdout).with_context(|| {
-        format!(
-            "{tool_name} returned non-JSON stdout: {}",
-            stdout.chars().take(240).collect::<String>()
-        )
-    })
-}
-
-fn tool_error(error: anyhow::Error) -> ToolError {
-    ToolError::ToolCallError(Box::new(std::io::Error::other(error.to_string())))
-}
-
-pub fn web_run_tool_definition() -> ToolDefinition {
-    ToolDefinition {
-        name: WEB_RUN_TOOL_NAME.to_string(),
-        description: "Search the web and return source links for current information.".to_string(),
-        parameters: web_run_tool_parameters(),
-    }
 }
 
 pub fn web_run_tool_parameters() -> Value {
@@ -893,28 +290,6 @@ pub fn web_run_tool_parameters() -> Value {
                     "required": ["q"]
                 }
             },
-            "open": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "ref_id": {"type": "string"},
-                        "lineno": {"type": "integer"}
-                    },
-                    "required": ["ref_id"]
-                }
-            },
-            "find": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "ref_id": {"type": "string"},
-                        "pattern": {"type": "string"}
-                    },
-                    "required": ["ref_id", "pattern"]
-                }
-            },
             "response_length": {"type": "string", "enum": ["short", "medium", "long"]}
         }
     })
@@ -927,7 +302,6 @@ async fn execute_web_run(
 ) -> Result<Value> {
     debug!(
         mode = ?config.mode,
-        provider = ?config.provider,
         "web.run starting"
     );
     if config.mode == WebSearchMode::Disabled {
@@ -940,12 +314,6 @@ async fn execute_web_run(
         Err(_) => return Ok(safe_web_run_error("Invalid web.run arguments.")),
     };
     let args = normalize_web_run_input(args);
-    if !args.open.is_empty() {
-        return Ok(safe_web_run_error("web.run open is not implemented in v1."));
-    }
-    if !args.find.is_empty() {
-        return Ok(safe_web_run_error("web.run find is not implemented in v1."));
-    }
     if args.search_query.is_empty() {
         return Ok(safe_web_run_error("web.run requires search_query for v1."));
     }
@@ -1028,18 +396,6 @@ fn response_length_context_size(response_length: WebRunResponseLength) -> WebSea
         WebRunResponseLength::Medium => WebSearchContextSize::Medium,
         WebRunResponseLength::Long => WebSearchContextSize::High,
     }
-}
-
-fn last30days_tickers(args: &FetchLast30DaysContextArgs) -> Vec<String> {
-    if !args.tickers.is_empty() {
-        return args.tickers.clone();
-    }
-    args.ticker
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| vec![value.to_string()])
-        .unwrap_or_default()
 }
 
 fn normalize_last30days_source(source: Option<&str>) -> Option<&str> {
@@ -1242,7 +598,6 @@ fn format_web_search_results(results: &[SearchResult]) -> String {
             output.push_str(&format!("Snippet: {}\n", result.snippet));
         }
     }
-    output.push_str("Use open with ref_id to inspect a result if needed.");
     output
 }
 
@@ -1414,22 +769,35 @@ pub async fn execute_named_tool(
             result
         }
         FetchYoutubeTranscriptTool::NAME => {
-            let args = serde_json::from_value::<FetchYoutubeTranscriptArgs>(args)
+            let tool_args = serde_json::from_value::<FetchYoutubeTranscriptArgs>(args)
                 .context("invalid fetch_youtube_transcript arguments")?;
-            let result = FetchYoutubeTranscriptTool::new(config.clone())
-                .call(args)
+            let ingest_args = youtube::YoutubeArgs {
+                all: tool_args.all,
+                channel: tool_args.channel,
+                url: tool_args.url,
+                max_videos: tool_args.max_videos,
+                output: tool_args.output,
+            };
+            let result = youtube::run(ingest_args)
                 .await
-                .map_err(|error| anyhow::anyhow!(error.to_string()));
+                .map_err(|e| anyhow::anyhow!("{e}"));
             log_named_tool_result(name, &result);
             result
         }
         FetchWayinVideoTranscriptTool::NAME => {
-            let args = serde_json::from_value::<FetchWayinVideoTranscriptArgs>(args)
+            let tool_args = serde_json::from_value::<FetchWayinVideoTranscriptArgs>(args)
                 .context("invalid fetch_wayinvideo_transcript arguments")?;
-            let result = FetchWayinVideoTranscriptTool::new(config.clone())
-                .call(args)
+            let ingest_args = wayinvideo::WayinVideoArgs {
+                url: tool_args.url,
+                title: tool_args.title,
+                published: tool_args.published,
+                task: tool_args.task,
+                task_id: tool_args.task_id,
+                output: tool_args.output,
+            };
+            let result = wayinvideo::run(ingest_args)
                 .await
-                .map_err(|error| anyhow::anyhow!(error.to_string()));
+                .map_err(|e| anyhow::anyhow!("{e}"));
             log_named_tool_result(name, &result);
             result
         }
@@ -1583,22 +951,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_run_context_schema_exposes_prior_memory() {
-        let definition = ReadRunContextTool::new(external_config())
-            .definition(String::new())
-            .await;
-        let kinds = definition.parameters["properties"]["kind"]["enum"]
-            .as_array()
-            .unwrap();
-
-        assert!(kinds.iter().any(|kind| kind == "prior_memory"));
-        assert!(definition.parameters["properties"].get("query").is_some());
-        assert!(definition.parameters["properties"]
-            .get("include_body")
-            .is_some());
-    }
-
-    #[tokio::test]
     async fn run_technical_indicators_is_dispatchable() {
         let error = execute_named_tool(
             RunTechnicalIndicatorsTool::NAME,
@@ -1629,28 +981,6 @@ mod tests {
 
         assert_eq!(output["status"], "error");
         assert_eq!(output["content"], "Web search is disabled.");
-    }
-
-    #[tokio::test]
-    async fn web_run_open_is_safe_not_implemented_for_v1() {
-        let provider = MockWebSearchProvider::default();
-        let config = WebSearchConfig {
-            mode: WebSearchMode::Cached,
-            ..WebSearchConfig::default()
-        };
-
-        let output = execute_named_tool(
-            WEB_RUN_TOOL_NAME,
-            json!({"open": [{"ref_id": "search0"}]}),
-            &external_config(),
-            None,
-            Some(&web_run_runtime(config, provider)),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(output["status"], "error");
-        assert_eq!(output["content"], "web.run open is not implemented in v1.");
     }
 
     #[tokio::test]

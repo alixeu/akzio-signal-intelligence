@@ -10,7 +10,6 @@ use std::{
     collections::{BTreeMap, VecDeque},
     future::Future,
     pin::Pin,
-    time::Duration,
 };
 use tracing::{debug, warn};
 use uuid::Uuid;
@@ -21,14 +20,13 @@ use crate::RigSettings;
 const DEFAULT_MAX_AGENT_LOOPS: usize = 8;
 const MAX_CONTEXT_FRAGMENT_CHARS: usize = 12_000;
 const MAX_TOOL_RESULT_CHARS: usize = 8_000;
-const FINALIZE_STEER: &str = "The previous assistant message was an action note, not final output. Do not ask for more input. Use the current prompt, context, and tool results. Either call the required next tool now, or return the complete final JSON artifact for this role. If data is missing, encode the gap inside the JSON artifact.";
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TurnItemType {
     UserMessage,
     AssistantMessage,
     ReasoningSummary,
+    ReasoningState,
     PlanUpdate,
     ToolCall,
     ToolResult,
@@ -44,6 +42,7 @@ impl TurnItemType {
             Self::UserMessage => "user_message",
             Self::AssistantMessage => "assistant_message",
             Self::ReasoningSummary => "reasoning_summary",
+            Self::ReasoningState => "reasoning_state",
             Self::PlanUpdate => "plan_update",
             Self::ToolCall => "tool_call",
             Self::ToolResult => "tool_result",
@@ -402,15 +401,34 @@ pub struct ModelResponse {
 
 #[derive(Debug, Clone)]
 pub enum ModelStreamEvent {
-    AssistantMessageStarted { item_id: String },
-    AssistantTextDelta { item_id: String, delta: String },
-    AssistantMessageCompleted { item_id: String },
-    ReasoningSummaryDelta { item_id: String, delta: String },
-    ReasoningSummaryCompleted { item_id: String },
-    PlanUpdateCompleted { item_id: String, content: String },
-    ToolCallCompleted { tool_call: ToolCallRequest },
-    ResponseCompleted { end_turn: bool, raw: Value },
-    StreamInterrupted { error: String },
+    AssistantMessageStarted {
+        item_id: String,
+    },
+    AssistantTextDelta {
+        item_id: String,
+        delta: String,
+    },
+    AssistantMessageCompleted {
+        item_id: String,
+    },
+    ReasoningSummaryDelta {
+        item_id: String,
+        delta: String,
+    },
+    ReasoningSummaryCompleted {
+        item_id: String,
+    },
+    ReasoningStateCompleted {
+        item_id: String,
+        encrypted_content: String,
+    },
+    ToolCallCompleted {
+        tool_call: ToolCallRequest,
+    },
+    ResponseCompleted {
+        end_turn: bool,
+        raw: Value,
+    },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -514,7 +532,7 @@ impl LoopModel for RigLoopModel {
     ) -> Pin<Box<dyn Future<Output = Result<ModelResponse>> + Send + 'a>> {
         Box::pin(async move {
             let prompt = react_prompt(&input)?;
-            let text = crate::run_model_text_once(&self.settings, &prompt).await?;
+            let text = crate::run_model_text_once(&self.settings, &input, &prompt).await?;
             let value = extract_json_value(&text)?;
             parse_react_response(value)
         })
@@ -527,7 +545,7 @@ impl LoopModel for RigLoopModel {
     ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
         Box::pin(async move {
             let prompt = react_prompt(&input)?;
-            crate::run_model_event_stream(&self.settings, &prompt, handler).await
+            crate::run_model_event_stream(&self.settings, &input, &prompt, handler).await
         })
     }
 }
@@ -693,19 +711,6 @@ where
         }
 
         if let Some(item_id) = stream_result.last_assistant_message_id {
-            let final_text = turn
-                .emitted_items
-                .iter()
-                .rev()
-                .find(|item| item.output_item_id == item_id)
-                .map(|item| item.content_text.clone())
-                .unwrap_or_default();
-            if assistant_message_needs_follow_up(&final_text) {
-                turn.push_pending_input(FINALIZE_STEER);
-                turn.needs_follow_up = true;
-                persist_turn(conn, turn)?;
-                continue;
-            }
             mark_last_assistant_message_as_final(conn, turn, &item_id, sink).await?;
         }
         turn.end_reason = Some("completed".to_string());
@@ -915,21 +920,6 @@ fn started_reasoning_item(item_id: &str) -> TurnItem {
     }
 }
 
-fn completed_plan_item(item_id: &str, content: String) -> TurnItem {
-    TurnItem {
-        item_type: TurnItemType::PlanUpdate,
-        role: "assistant".to_string(),
-        content_text: content,
-        content_json: merge_item_metadata(Value::Null, item_id, None, AgentItemStatus::Completed),
-        tool_call_id: String::new(),
-        tool_name: String::new(),
-        output_item_id: item_id.to_string(),
-        phase: None,
-        status: Some(AgentItemStatus::Completed),
-        db_row_id: None,
-    }
-}
-
 async fn emit_tool_call_status<S: AgentEventSink>(
     turn: &Turn,
     sink: &mut S,
@@ -985,6 +975,11 @@ fn build_model_input(
         append_turn_item(conn, turn, &item)?;
         items.push(item);
     }
+    let latest_reasoning_state = items
+        .iter()
+        .rev()
+        .find(|item| item.item_type == TurnItemType::ReasoningState)
+        .cloned();
     if items.len() > config.compact_after_items {
         let summary = compact_summary_card(&items);
         let item = TurnItem {
@@ -1001,11 +996,18 @@ fn build_model_input(
         };
         append_turn_item(conn, turn, &item)?;
         items = vec![item];
+        if let Some(reasoning_state) = latest_reasoning_state.clone() {
+            items.push(reasoning_state);
+        }
     }
     if let Some(max_tokens) = config.max_context_tokens {
         let mut kept: Vec<TurnItem> = Vec::new();
         let mut total_tokens = 0usize;
         for item in items.iter().rev() {
+            if item.item_type == TurnItemType::ReasoningState {
+                kept.push(item.clone());
+                continue;
+            }
             let tokens = orchestrator_core::token::estimate_turn_item_tokens(
                 item.item_type.as_str(),
                 &item.role,
@@ -1048,6 +1050,7 @@ fn history_items(
                 "user_message" => TurnItemType::UserMessage,
                 "assistant_message" => TurnItemType::AssistantMessage,
                 "reasoning_summary" => TurnItemType::ReasoningSummary,
+                "reasoning_state" => TurnItemType::ReasoningState,
                 "plan_update" => TurnItemType::PlanUpdate,
                 "tool_call" => TurnItemType::ToolCall,
                 "tool_result" => TurnItemType::ToolResult,
@@ -1128,7 +1131,6 @@ struct ModelStreamHandler<'a, S: AgentEventSink> {
     result: ModelStreamResult,
     assistant_buffers: BTreeMap<String, String>,
     reasoning_buffers: BTreeMap<String, String>,
-    in_progress: Vec<String>,
 }
 
 impl<'a, S: AgentEventSink> ModelStreamHandler<'a, S> {
@@ -1140,7 +1142,6 @@ impl<'a, S: AgentEventSink> ModelStreamHandler<'a, S> {
             result: ModelStreamResult::default(),
             assistant_buffers: BTreeMap::new(),
             reasoning_buffers: BTreeMap::new(),
-            in_progress: Vec::new(),
         }
     }
 
@@ -1161,7 +1162,6 @@ impl<'a, S: AgentEventSink> ModelStreamHandler<'a, S> {
                 .await?;
                 self.assistant_buffers
                     .insert(item_id.clone(), String::new());
-                self.in_progress.push(item_id);
             }
             ModelStreamEvent::AssistantTextDelta { item_id, delta } => {
                 let buffer = self.assistant_buffers.entry(item_id.clone()).or_default();
@@ -1194,7 +1194,6 @@ impl<'a, S: AgentEventSink> ModelStreamHandler<'a, S> {
                 )? {
                     emit_completed(self.turn, self.sink, &item).await?;
                 }
-                self.in_progress.retain(|value| value != &item_id);
                 self.result.last_assistant_message_id = Some(item_id);
             }
             ModelStreamEvent::ReasoningSummaryDelta { item_id, delta } => {
@@ -1207,7 +1206,6 @@ impl<'a, S: AgentEventSink> ModelStreamHandler<'a, S> {
                         self.turn.emitted_items.last().expect("just appended"),
                     )
                     .await?;
-                    self.in_progress.push(item_id.clone());
                 }
                 let buffer = self.reasoning_buffers.entry(item_id.clone()).or_default();
                 buffer.push_str(&delta);
@@ -1239,23 +1237,34 @@ impl<'a, S: AgentEventSink> ModelStreamHandler<'a, S> {
                 )? {
                     emit_completed(self.turn, self.sink, &item).await?;
                 }
-                self.in_progress.retain(|value| value != &item_id);
             }
-            ModelStreamEvent::PlanUpdateCompleted { item_id, content } => {
+            ModelStreamEvent::ReasoningStateCompleted {
+                item_id,
+                encrypted_content,
+            } => {
                 debug!(
                     turn_id = self.turn.turn_id,
                     item_id,
-                    content_chars = content.len(),
-                    "model stream plan update completed"
+                    state_chars = encrypted_content.len(),
+                    "model stream reasoning state completed"
                 );
-                let item = completed_plan_item(&item_id, content);
+                let item = TurnItem {
+                    item_type: TurnItemType::ReasoningState,
+                    role: "assistant".to_string(),
+                    content_text: String::new(),
+                    content_json: json!({
+                        "output_item_id": item_id,
+                        "encrypted_content": encrypted_content,
+                        "summary": []
+                    }),
+                    tool_call_id: String::new(),
+                    tool_name: String::new(),
+                    output_item_id: item_id,
+                    phase: None,
+                    status: Some(AgentItemStatus::Completed),
+                    db_row_id: None,
+                };
                 append_turn_item(self.conn, self.turn, &item)?;
-                emit_completed(
-                    self.turn,
-                    self.sink,
-                    self.turn.emitted_items.last().expect("just appended"),
-                )
-                .await?;
             }
             ModelStreamEvent::ToolCallCompleted { tool_call } => {
                 debug!(
@@ -1284,43 +1293,6 @@ impl<'a, S: AgentEventSink> ModelStreamHandler<'a, S> {
                 if !end_turn {
                     self.result.needs_follow_up = true;
                 }
-            }
-            ModelStreamEvent::StreamInterrupted { error } => {
-                warn!(
-                    turn_id = self.turn.turn_id,
-                    error, "model stream interrupted"
-                );
-                self.mark_in_progress_interrupted().await?;
-                bail!("model stream interrupted: {error}");
-            }
-        }
-        Ok(())
-    }
-
-    async fn mark_in_progress_interrupted(&mut self) -> Result<()> {
-        let ids = self.in_progress.clone();
-        for item_id in ids {
-            let text = self
-                .assistant_buffers
-                .remove(&item_id)
-                .or_else(|| self.reasoning_buffers.remove(&item_id))
-                .unwrap_or_default();
-            let phase = self
-                .turn
-                .emitted_items
-                .iter()
-                .rev()
-                .find(|item| item.output_item_id == item_id)
-                .and_then(|item| item.phase.clone());
-            if let Some(item) = update_turn_item(
-                self.conn,
-                self.turn,
-                &item_id,
-                text,
-                phase,
-                AgentItemStatus::Interrupted,
-            )? {
-                emit_completed(self.turn, self.sink, &item).await?;
             }
         }
         Ok(())
@@ -1466,7 +1438,6 @@ Supported event shapes:\n\
 {{\"type\":\"assistant_message_completed\",\"item_id\":\"msg-1\"}}\n\
 {{\"type\":\"reasoning_summary_delta\",\"item_id\":\"reasoning-1\",\"delta\":\"brief reasoning summary chunk\"}}\n\
 {{\"type\":\"reasoning_summary_completed\",\"item_id\":\"reasoning-1\"}}\n\
-{{\"type\":\"plan_update_completed\",\"item_id\":\"plan-1\",\"content\":\"plan or status update\"}}\n\
 {{\"type\":\"tool_call_completed\",\"tool_call\":{{\"call_id\":\"call-1\",\"name\":\"tool_name\",\"arguments\":{{}},\"mode\":\"blocking\"}}}}\n\
 {{\"type\":\"response_completed\",\"end_turn\":true}}\n\
 If you need a tool, emit any visible commentary first, then tool_call_completed, then response_completed with end_turn=false. If tool results answer the task, emit the final assistant_message and response_completed with end_turn=true. A final assistant_message must be the complete role artifact, preferably one JSON object with id, role, status, report, and per_ticker. Do not end the turn with text saying you are about to retry, fetch, analyze, or wait for inputs; call the tool or produce the final artifact. For web.run use {{\"search_query\":[{{\"q\":\"TQQQ QQQ VIX site:reddit.com\",\"domains\":[\"reddit.com\"],\"numResults\":10}}],\"response_length\":\"medium\"}}. For fetch_last30days_context use {{\"source\":\"reddit\",\"tickers\":[\"TQQQ\"]}}. The runtime also accepts the older single-object response shape only as a compatibility fallback.\n\n\
@@ -1479,6 +1450,7 @@ pub(crate) fn react_context_prompt(input: &ModelInput) -> Result<String> {
     let items = input
         .items
         .iter()
+        .filter(|item| item.item_type != TurnItemType::ReasoningState)
         .map(|item| {
             json!({
                 "type": item.item_type.as_str(),
@@ -1516,6 +1488,7 @@ pub fn compact_summary_card(items: &[TurnItem]) -> String {
     let recent = items
         .iter()
         .rev()
+        .filter(|item| item.item_type != TurnItemType::ReasoningState)
         .take(8)
         .map(|item| {
             format!(
@@ -1541,20 +1514,31 @@ pub struct StaticToolRuntime {
 
 pub struct ProjectToolRuntime {
     config: tools::ExternalToolConfig,
+    available_tools: Vec<String>,
     web_run: Option<tools::WebRunRuntime>,
     turn_context: Option<ToolRuntimeTurnContext>,
-    cache: std::sync::Arc<std::sync::Mutex<orchestrator_core::cache::TtlCache>>,
 }
 
 impl ProjectToolRuntime {
     pub fn new(config: tools::ExternalToolConfig) -> Self {
+        Self::with_available_tools(
+            config,
+            tools::tool_names()
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
+        )
+    }
+
+    pub fn with_available_tools(
+        config: tools::ExternalToolConfig,
+        available_tools: Vec<String>,
+    ) -> Self {
         Self {
             config,
+            available_tools,
             web_run: None,
             turn_context: None,
-            cache: std::sync::Arc::new(std::sync::Mutex::new(
-                orchestrator_core::cache::TtlCache::new(),
-            )),
         }
     }
 
@@ -1581,9 +1565,9 @@ impl LoopToolRuntime for ProjectToolRuntime {
         call: ToolCallRequest,
     ) -> Pin<Box<dyn Future<Output = ToolResultItem> + Send + 'a>> {
         let config = self.config.clone();
+        let available_tools = self.available_tools.clone();
         let web_run = self.web_run.clone();
         let turn_context = self.turn_context.clone();
-        let cache = self.cache.clone();
         Box::pin(async move {
             debug!(
                 call_id = call.call_id,
@@ -1603,9 +1587,10 @@ impl LoopToolRuntime for ProjectToolRuntime {
                 };
             }
             let web_run_config = web_run.as_ref().map(tools::WebRunRuntime::config);
-            if call.name != tools::WEB_RUN_TOOL_NAME
-                && !tools::enabled_tool_names(web_run_config).contains(&call.name.as_str())
-            {
+            let configured = available_tools.iter().any(|name| name == &call.name);
+            let enabled = call.name == "think"
+                || tools::enabled_tool_names(web_run_config).contains(&call.name.as_str());
+            if !configured || !enabled {
                 warn!(
                     call_id = call.call_id,
                     tool = call.name,
@@ -1621,22 +1606,6 @@ impl LoopToolRuntime for ProjectToolRuntime {
             }
             let call_id = call.call_id;
             let name = call.name;
-            // TTL cache: check before dispatching
-            let cache_meta: Option<(String, Duration)> =
-                orchestrator_core::cache::cache_key_for_args(&name, &call.arguments).zip(
-                    orchestrator_core::cache::ttl_for_tool(&name, &call.arguments),
-                );
-            if let Some((ref key, _ttl)) = cache_meta {
-                if let Some(cached) = cache.lock().unwrap().get(key) {
-                    return ToolResultItem {
-                        call_id,
-                        name,
-                        status: "completed".to_string(),
-                        output: cached.clone(),
-                        error: None,
-                    };
-                }
-            }
             if name == tools::WEB_RUN_TOOL_NAME {
                 let output = if let Some(web_run) = &web_run {
                     web_run.execute(call.arguments).await
@@ -1653,9 +1622,6 @@ impl LoopToolRuntime for ProjectToolRuntime {
                 return match output {
                     Ok(output) => {
                         debug!(call_id, tool = name, "web.run tool completed");
-                        if let Some((ref key, ttl)) = cache_meta {
-                            cache.lock().unwrap().set(key.clone(), output.clone(), ttl);
-                        }
                         ToolResultItem {
                             call_id,
                             name,
@@ -1687,9 +1653,6 @@ impl LoopToolRuntime for ProjectToolRuntime {
             {
                 Ok(output) => {
                     debug!(call_id, tool = name, "project tool completed");
-                    if let Some((ref key, ttl)) = cache_meta {
-                        cache.lock().unwrap().set(key.clone(), output.clone(), ttl);
-                    }
                     ToolResultItem {
                         call_id,
                         name,
@@ -1897,6 +1860,31 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn project_runtime_rejects_unconfigured_tool() {
+        let runtime = ProjectToolRuntime::with_available_tools(
+            tools::ExternalToolConfig {
+                project_root: PathBuf::from("."),
+                db_path: None,
+                run_dir: None,
+                run_id: None,
+                tickers: Vec::new(),
+            },
+            vec![tools::READ_RUN_CONTEXT_TOOL_NAME.to_string()],
+        );
+
+        let result = runtime
+            .execute(ToolCallRequest {
+                call_id: "call-unknown".to_string(),
+                name: "unknown_tool".to_string(),
+                arguments: json!({"command": "printf no"}),
+            })
+            .await;
+
+        assert_eq!(result.status, "error");
+        assert_eq!(result.error.as_deref(), Some("unknown tool name"));
     }
 
     #[tokio::test]
@@ -2149,65 +2137,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn streaming_interruption_marks_in_progress_assistant_item_interrupted() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        ensure_schema(&conn).unwrap();
-        let mut model = FakeStreamModel::new(vec![vec![
-            ModelStreamEvent::AssistantMessageStarted {
-                item_id: "msg-1".to_string(),
-            },
-            ModelStreamEvent::AssistantTextDelta {
-                item_id: "msg-1".to_string(),
-                delta: "Partial before interruption.".to_string(),
-            },
-            ModelStreamEvent::StreamInterrupted {
-                error: "connection closed".to_string(),
-            },
-        ]]);
-        let mut tools = StaticToolRuntime::new();
-        let mut sink = RecordingSink::default();
-        let mut turn = Turn::new("turn-1", "session-1", "run-1", "analyst.test", "start");
-
-        let result = run_turn_with_events(
-            &conn,
-            &mut turn,
-            &mut model,
-            &mut tools,
-            AgentLoopConfig {
-                max_agent_loops: Some(1),
-                ..AgentLoopConfig::default()
-            },
-            &mut sink,
-        )
-        .await;
-
-        assert!(result.is_err());
-        let content_json: String = conn
-            .query_row(
-                "SELECT content_json FROM agent_turn_items \
-                 WHERE item_type = 'assistant_message'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let content_json: Value = serde_json::from_str(&content_json).unwrap();
-        assert_eq!(content_json["status"], "interrupted");
-        assert!(sink.events.iter().any(|event| {
-            matches!(
-                event,
-                AgentLoopEvent::TurnItemCompleted {
-                    item: AgentOutputItem::AssistantMessage {
-                        id,
-                        status: AgentItemStatus::Interrupted,
-                        ..
-                    },
-                    ..
-                } if id == "msg-1"
-            )
-        }));
-    }
-
-    #[tokio::test]
     async fn run_turn_executes_tool_and_feeds_result_back_to_model() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         ensure_schema(&conn).unwrap();
@@ -2307,13 +2236,16 @@ mod tests {
             url: "https://research.example.com/tqqq-liquidity".to_string(),
             content: "TQQQ liquidity and volatility context for the current session.".to_string(),
         }]);
-        let mut tools = ProjectToolRuntime::new(tools::ExternalToolConfig {
-            project_root: PathBuf::from("."),
-            db_path: None,
-            run_dir: None,
-            run_id: None,
-            tickers: vec!["TQQQ".to_string()],
-        })
+        let mut tools = ProjectToolRuntime::with_available_tools(
+            tools::ExternalToolConfig {
+                project_root: PathBuf::from("."),
+                db_path: None,
+                run_dir: None,
+                run_id: None,
+                tickers: vec!["TQQQ".to_string()],
+            },
+            vec![tools::WEB_RUN_TOOL_NAME.to_string()],
+        )
         .with_web_run_runtime(tools::WebRunRuntime::new(config).with_provider(Arc::new(provider)));
         let mut turn = Turn::new("turn-web", "session-1", "run-1", "analyst.test", "start");
 
@@ -2383,6 +2315,38 @@ mod tests {
         assert_eq!(response.assistant_message.as_deref(), Some("checking"));
         assert!(!response.end_turn);
         assert_eq!(response.tool_calls[0].name, "read_context");
+    }
+
+    #[test]
+    fn react_context_prompt_hides_encrypted_reasoning_state() {
+        let input = ModelInput {
+            system_instruction: None,
+            items: vec![
+                TurnItem::user("visible request"),
+                TurnItem {
+                    item_type: TurnItemType::ReasoningState,
+                    role: "assistant".to_string(),
+                    content_text: String::new(),
+                    content_json: json!({
+                        "output_item_id": "rs_1",
+                        "encrypted_content": "secret-state"
+                    }),
+                    tool_call_id: String::new(),
+                    tool_name: String::new(),
+                    output_item_id: "rs_1".to_string(),
+                    phase: None,
+                    status: Some(AgentItemStatus::Completed),
+                    db_row_id: None,
+                },
+            ],
+            available_tools: Vec::new(),
+        };
+
+        let prompt = react_context_prompt(&input).unwrap();
+
+        assert!(prompt.contains("visible request"));
+        assert!(!prompt.contains("secret-state"));
+        assert!(!prompt.contains("reasoning_state"));
     }
 
     #[test]

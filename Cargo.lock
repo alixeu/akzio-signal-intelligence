@@ -1426,17 +1426,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "orchestrator-domain"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "serde",
- "serde_json",
- "thiserror",
-]
-
-[[package]]
 name = "orchestrator-ingest"
 version = "0.1.0"
 dependencies = [
@@ -1512,12 +1501,10 @@ dependencies = [
  "clap",
  "futures",
  "orchestrator-core",
- "orchestrator-domain",
  "orchestrator-ingest",
  "orchestrator-llm",
  "orchestrator-sql",
  "rusqlite",
- "serde",
  "serde_json",
  "tempfile",
  "tokio",

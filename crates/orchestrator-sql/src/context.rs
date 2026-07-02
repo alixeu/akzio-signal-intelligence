@@ -1,4 +1,4 @@
-use crate::{read_prior_memory, PriorMemoryQuery, AGGREGATE_TICKER};
+use crate::AGGREGATE_TICKER;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use rusqlite::{params, params_from_iter, Connection, Row};
@@ -35,18 +35,6 @@ pub struct RunContextReadRequest {
     pub turn_id: Option<String>,
     #[serde(default)]
     pub token_budget: Option<usize>,
-    #[serde(default)]
-    pub query: Option<String>,
-    #[serde(default)]
-    pub memory_types: Vec<String>,
-    #[serde(default)]
-    pub statuses: Vec<String>,
-    #[serde(default)]
-    pub include_expired: bool,
-    #[serde(default)]
-    pub limit: Option<usize>,
-    #[serde(default)]
-    pub include_body: bool,
 }
 
 pub fn read_run_context(conn: &mut Connection, request: &RunContextReadRequest) -> Result<Value> {
@@ -68,24 +56,6 @@ pub fn read_run_context(conn: &mut Connection, request: &RunContextReadRequest) 
         "technical_daily" => return technical_interval_context(conn, "daily"),
         "technical_3h" => return technical_interval_context(conn, "3h"),
         "technical_20min" => return technical_interval_context(conn, "20min"),
-        "prior_memory" => {
-            return read_prior_memory(
-                conn,
-                &PriorMemoryQuery {
-                    query: request.query.clone(),
-                    ticker: request.ticker.clone(),
-                    memory_types: request.memory_types.clone(),
-                    statuses: if request.statuses.is_empty() {
-                        vec!["active".to_string()]
-                    } else {
-                        request.statuses.clone()
-                    },
-                    include_expired: request.include_expired,
-                    limit: request.limit.unwrap_or(20),
-                    include_body: request.include_body,
-                },
-            )
-        }
         _ => {}
     }
     let run_id = request

@@ -38,6 +38,10 @@ Run a mock market research workflow:
 cargo run -p orchestrator-cli --bin orchestrator-exec -- TQQQ --mock
 ```
 
+Phase 1 defaults to `technical,news`. Social analysts remain available by
+explicit opt-in, for example `--phase1-agents technical,news,reddit` after
+their source context has been imported into SQLite.
+
 Run only Phase 1:
 
 ```bash
@@ -89,23 +93,13 @@ The orchestrator is moving toward a `Workflow -> Stage/Sub-workflow -> Agent wor
 
 - `phase1.parallelism` or `parallel.max_worker_concurrency` controls Phase 1 worker fan-out.
 - `agent_timeout_sec` or `timeouts.worker_sec` controls worker timeout seconds.
-- `reducer_timeout_sec` or `timeouts.reducer_sec` controls reducer/controller timeout seconds.
-- `critical_roles.phase1` and `critical_roles.reducers` list roles that must complete for a stage to proceed.
+- `reducer_timeout_sec` or `timeouts.reducer_sec` controls LLM controller timeout seconds.
+- `critical_roles.phase1` lists roles that must complete for a stage to proceed.
 - `late_evidence.enabled` controls whether delayed worker/source outputs are appended to state artifacts and marked as late.
 
-Roles not listed under `critical_roles` are treated as noncritical. A noncritical role failure should degrade the relevant state artifact with an explicit evidence gap instead of blocking the whole workflow. Critical role or reducer failure should block the affected stage unless the runtime explicitly overrides that policy.
+Roles not listed under `critical_roles` are treated as noncritical. A noncritical role failure should degrade the relevant state artifact with an explicit evidence gap instead of blocking the whole workflow. Critical role failure should block the affected stage unless the runtime explicitly overrides that policy.
 
-Reducer prompts can be configured under `orchestrator.prompts.reducers`; the current default config relies on the Rust fallback paths:
-
-```yaml
-orchestrator:
-  prompts:
-    reducers:
-      evidence: "prompts/reducers/evidence.md"
-      debate_final: "prompts/reducers/debate_final.md"
-```
-
-`prompts/reducers/evidence.md` produces the Phase 1.5 evidence state artifact. It is a single neutral reducer, not separate bull/bear workers, and it partitions long, short, neutral, conflicting, and missing evidence for downstream topic forks. Phase 2 first runs `mediator.topic` to generate topic candidates from that Phase 1.5 artifact. Each topic then runs sequential bull/bear micro-turns with a per-topic `mediator.topic_controller` Phase 2.5a artifact after every micro-turn. `prompts/reducers/debate_final.md` is Phase 2.5b and compresses all topic controller artifacts into the final debate state brief.
+Reducer state artifacts are built deterministically in Rust. Phase 1.5 writes the evidence state artifact from existing analyst artifacts. Phase 2 first runs `mediator.topic` to generate topic candidates from that Phase 1.5 artifact. Each topic then runs sequential bull/bear micro-turns with a per-topic `mediator.topic_controller` Phase 2.5a artifact after every micro-turn. Phase 2.5b writes the final debate state brief from topic controller artifacts.
 
 Standalone `fundamental` analyst execution was removed. Fundamental company facts belong inside `analyst.news_macro` and are treated as a news sub-signal rather than an independent vote.
 
@@ -153,18 +147,20 @@ Defaults and each role support:
 | `api_key` | Direct local API key value for the configured provider. |
 | `preamble` | Optional Rig agent preamble for role-level steering. It is omitted by default and should not be used as the structured-output enforcement mechanism. |
 | `max_turns` | Optional agent-loop turn cap. Set `null` or omit it for no role-level max-turn cap; set a positive number on a role to override. |
-| `reasoning_effort` | Optional Responses reasoning effort, injected as `additional_params.reasoning.effort` when set. |
+| `reasoning_effort` | Optional Responses reasoning effort, injected as `additional_params.reasoning.effort` when set to a value other than `none`. |
+| `reasoning_summary` | Optional Responses reasoning summary level: `auto`, `concise`, or `detailed`. |
+| `preserve_reasoning_state` | When `true`, requests include `reasoning.encrypted_content`, set `store: false`, persist encrypted reasoning state, and replay it on the next model iteration. |
 | `transport` | Use `http` by default. Use `ws` for Responses WebSocket mode. |
 | `think_tool` | Registers Rig `ThinkTool` for that role when `true`. |
 | `tools` | Names of external tools available to that role. Use `all` in defaults to expose every registered project tool, then override per role when needed. |
-| `native_web_search` | Set `true` when the gateway/model supports provider-native web search. When enabled and `orchestrator.web_search.mode` is not `disabled`, the request uses hosted `web_search` and does not expose the configured `web.run` fallback. |
+| `native_web_search` | Set `true` when the gateway/model supports provider-native web search. When enabled and `orchestrator.web_search.mode` is `live`, the request uses hosted `web_search` and does not expose the configured `web.run` fallback. |
 
 Responses routing behavior:
 
 - `route: responses` uses Rig's OpenAI Responses client with the role's `base_url`; the final request path is `${base_url}/responses`, so set `base_url` to the gateway API root ending in `/v1`.
 - `transport: ws` enables Responses WebSocket mode for tool-aware event handling.
-- Reasoning params are injected as `additional_params.reasoning.effort` for Responses routes only.
-- Web search follows role capability: when `orchestrator.web_search.mode` is `disabled`, no web search tool is sent. When it is enabled, roles with `native_web_search: true` use provider-native web search; all other roles receive the `web.run` agent tool backed by Exa MCP.
+- Reasoning params are injected for Responses routes only. With `preserve_reasoning_state: true`, the runtime stores OpenAI encrypted reasoning state locally and replays it as a typed Responses `reasoning` input item on the next iteration.
+- Web search follows role capability: when `orchestrator.web_search.mode` is `live`, roles with `native_web_search: true` use provider-native web search; all other roles receive the `web.run` agent tool backed by Exa MCP. Other modes send no web search tool.
 - `manager.research` uses Rig typed structured output for `ResearchArtifact`; on Responses routes, the runtime uses provider-native Responses structured output when the gateway/model supports it, then validates probabilities and ticker payloads.
 - Other JsonArtifact roles still parse JSON text from their prompt/contracts and validate those artifacts after the model response.
 
@@ -182,17 +178,18 @@ orchestrator:
       api_key: &llm_gateway_api_key "your-local-gateway-key"
     defaults:
       route: responses
-      model: gpt-5.4
+      model: gpt-5.5
       base_url: *llm_gateway_base_url
       api_key: *llm_gateway_api_key
       native_web_search: true
       max_turns: null
-      reasoning_effort: medium
+      reasoning_effort: low
+      reasoning_summary: auto
+      preserve_reasoning_state: true
       transport: http
       think_tool: false
-      tools: all
+      tools: []
     roles:
-      reducer.evidence: {}
       manager.research:
         tools:
           - read_run_context
@@ -204,7 +201,6 @@ Web search fallback example:
 orchestrator:
   web_search:
     mode: live
-    provider: exa
     base_url: "https://mcp.exa.ai/mcp"
     api_key: ""
     context_size: medium
@@ -215,20 +211,20 @@ orchestrator:
       api_key: &llm_gateway_api_key "your-local-gateway-key"
     defaults:
       route: responses
-      model: gpt-5.4
+      model: gpt-5.5
       base_url: *llm_gateway_base_url
       api_key: *llm_gateway_api_key
       native_web_search: true
       max_turns: null
       transport: http
-      tools: all
+      tools: []
     roles:
       analyst.news_macro: {}
       analyst.reddit:
         native_web_search: false
 ```
 
-The `analyst.news_macro` role uses provider-hosted `web_search` through the Responses gateway. The `analyst.reddit` role does not declare native web search, so it sees `web.run`; the runtime executes Exa only when the model asks for that tool. Exa uses the remote MCP endpoint at `https://mcp.exa.ai/mcp` anonymously and posts a JSON-RPC `tools/call` request for `web_search_exa`.
+The `analyst.news_macro` role uses provider-hosted `web_search` through the Responses gateway. Social analyst roles are opt-in and default to reading imported SQLite context only.
 
 Keep real gateway and provider keys in local config or environment variables only. Do not commit real provider keys.
 
@@ -256,10 +252,8 @@ Phase 2 uses four separate templates:
 | `bear_initial` | Bear-side initial analysis and thesis generation. |
 | `bear_interaction` | Bear-side research and response to Bull arguments. |
 | `bull_initial_monitor` / `bear_initial_monitor` | Monitor-mode initial prompt selected by the runtime when `--mode monitor` is active. |
-| `reducers.evidence` | Phase 1 evidence reducer that emits a state artifact brief. |
 | `phase2.topic_generation` / `mediator.topic` | Phase 2 topic generator that forks debate topics from Phase 1.5 evidence. |
 | `mediator.topic_controller` | Phase 2.5a per-topic controller that tracks claim ledger, repeats, unverifiable claims, and next agenda. |
-| `reducers.debate_final` | Phase 2.5b final debate reducer that emits adjudication, fact-check, and compression state. |
 
 All prompt paths are validated at startup. Missing prompt files fail before live LLM execution.
 

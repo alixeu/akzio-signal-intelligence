@@ -112,12 +112,7 @@ impl WebSearchConfig {
 pub fn validate_web_search_runtime_config(config: &WebSearchConfig, role: &str) -> Result<()> {
     match config.mode {
         WebSearchMode::Disabled | WebSearchMode::Cached => Ok(()),
-        WebSearchMode::Live => match config.provider {
-            WebSearchProviderKind::Mock => Ok(()),
-            WebSearchProviderKind::Exa => {
-                validate_optional_http_base_url(config.base_url.as_deref(), role)
-            }
-        },
+        WebSearchMode::Live => validate_optional_http_base_url(config.base_url.as_deref(), role),
     }
 }
 

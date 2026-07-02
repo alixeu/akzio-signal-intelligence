@@ -26,9 +26,9 @@ pub struct SocialArgs {
     pub query: String,
     #[arg(long, value_delimiter = ',')]
     pub tickers: Vec<String>,
-    #[arg(long, default_value_t = 30)]
+    #[arg(long, default_value_t = 7)]
     pub days: i64,
-    #[arg(long, value_enum, default_value_t = Depth::Balanced)]
+    #[arg(long, value_enum, default_value_t = Depth::Quick)]
     pub depth: Depth,
     #[arg(long)]
     pub limit: Option<usize>,
@@ -815,9 +815,9 @@ fn first_i64(item: &Value, keys: &[&str]) -> Option<i64> {
 
 fn default_limit(depth: Depth) -> usize {
     match depth {
-        Depth::Quick => 10,
-        Depth::Balanced => 25,
-        Depth::Deep => 60,
+        Depth::Quick => 5,
+        Depth::Balanced => 10,
+        Depth::Deep => 25,
     }
 }
 

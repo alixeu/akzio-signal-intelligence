@@ -2,7 +2,7 @@
 
 你的任务不是泛泛总结社交媒体，而是围绕 `{ticker}` 在 X 上的讨论，识别哪些言论、账号、叙事与注意力变化真正会影响当前分析窗口内的方向概率。
 
-如果 `fetch_last30days_context` 返回 `empty` / `error` / 无可用样本，必须调用 `web.run` 使用 Exa 搜索 X / Twitter 公开讨论，再基于 Exa 结果输出。
+如果已入库上下文没有可用 X / Twitter 样本，不要继续调用外部搜索；输出 `direction=unobserved`、`confidence=0.0`，并把缺口写入 `data_gaps`。
 
 先使用 `read_run_context` 读取 `research_inputs`；如果已入库上下文里已经提供 X / Twitter 最近 30 天上下文：
 - 优先使用这份已入库上下文作为主证据源，不要忽略它。
@@ -14,12 +14,11 @@
 - 如果拿不到可验证的 X 样本，必须输出 `direction=unobserved`，`confidence=0.0`
 - 不要把高互动等同于高质量；必须区分官方披露、行业观察、KOL 观点、散户情绪和噪音
 - 不要把单条极端热帖写成“市场共识”；先判断样本代表性、跨账号共振度与叙事持续性
-- 如果 `{ticker}` 是 `QQQ`、`TQQQ`、`SQQQ` 或明显以 QQQ / 纳指为底层风险资产，X 维度必须同时分析 `QQQ` 与 `VIX` 相关讨论：QQQ 风险偏好、纳指动量、波动率抬升/回落、避险情绪或低波动拥挤如何影响当前方向概率。
 
 ## 数据获取要求
 
-1. 若运行时结构化上下文已提供 X / Twitter 最近 30 天材料，先消费该上下文，再决定是否需要额外搜索。只有当已入库上下文明显不足以支持结论时，才使用可用工具补充搜索。
-2. 使用运行时可用工具或已入库上下文查询最近 30 天围绕 `{ticker}` 的公开讨论，但你的输出只聚焦其中的 X / Twitter 样本。
+1. 若运行时结构化上下文已提供 X / Twitter 最近 30 天材料，先消费该上下文；若没有可用样本，直接报告未观测。
+2. 只使用已入库上下文中最近 30 天围绕 `{ticker}` 的 X / Twitter 样本。
 3. 查询关键词至少覆盖：
    - `{ticker}`
    - 若 `{ticker}` 为 `QQQ` / `TQQQ` / `SQQQ`，必须额外覆盖 `QQQ`、`Nasdaq`、`VIX`、`volatility`、`risk off`、`risk on`
@@ -75,10 +74,9 @@
    - 每条叙事说明更像 `issuer_management_claim`、`market_commentary`、`retail_sentiment_sample` 还是 `analyst_interpretation`
 4. 叙事温度与拥挤度：说明当前更像扩散初期、拥挤共识、还是降温反转
 5. 已计价 vs 未充分计价：判断 X 上的主流叙事是否大概率已被市场注意到
-6. 若分析 QQQ / TQQQ / SQQQ，单列“QQQ / VIX 联动判断”
-7. 验证 / 证伪触发器
-8. 数据缺口与不确定性
-9. Markdown 表格汇总（维度 | 结论 | 置信度 | 样本质量 | 备注）
+6. 验证 / 证伪触发器
+7. 数据缺口与不确定性
+8. Markdown 表格汇总（维度 | 结论 | 置信度 | 样本质量 | 备注）
 
 如果输入包含多个 ticker：
 - 按 ticker 完全分组，不共享 X 样本。

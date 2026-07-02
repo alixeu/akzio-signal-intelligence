@@ -20,5 +20,3 @@
 上下文读取要求：
 - 先使用 `read_run_context` 读取 `compose_context`（带 ticker、topic_id、token_budget），需要细查时再读取 `research_inputs`、`topic_state` 和 `debate_history`。
 - 不要请求 raw SQL，不要调用未配置的历史搜索工具。
-
-输出受 structured output 约束的 JSON object。字段形状由运行时 schema / validator 约束，不在 prompt 中重复展开。

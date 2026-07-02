@@ -30,15 +30,6 @@ pub struct Bar {
     pub vwap: Option<f64>,
 }
 
-pub trait MarketDataSource {
-    fn fetch_daily_bars(
-        &self,
-        symbol: &str,
-        start: NaiveDate,
-        end: NaiveDate,
-    ) -> impl std::future::Future<Output = Result<Vec<Bar>>> + Send;
-}
-
 #[derive(Clone)]
 pub struct TwelveDataSource {
     client: Client,
@@ -53,6 +44,15 @@ impl TwelveDataSource {
                 .build()?,
             api_key,
         })
+    }
+
+    async fn fetch_daily_bars(
+        &self,
+        symbol: &str,
+        start: NaiveDate,
+        end: NaiveDate,
+    ) -> Result<Vec<Bar>> {
+        self.fetch_bars(symbol, start, end, "1day").await
     }
 
     async fn fetch_bars(
@@ -89,17 +89,6 @@ fn provider_symbol(symbol: &str) -> &str {
         // ponytail: Twelve Data does not expose cash VIX on this endpoint; use liquid VIXY proxy until a paid index symbol is configured.
         "VIX" => "VIXY",
         other => other,
-    }
-}
-
-impl MarketDataSource for TwelveDataSource {
-    async fn fetch_daily_bars(
-        &self,
-        symbol: &str,
-        start: NaiveDate,
-        end: NaiveDate,
-    ) -> Result<Vec<Bar>> {
-        self.fetch_bars(symbol, start, end, "1day").await
     }
 }
 

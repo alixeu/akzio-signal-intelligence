@@ -11,8 +11,10 @@ use rig_core::{
     agent::AgentBuilder,
     client::CompletionClient,
     completion::{CompletionModel, Prompt},
+    message::{AssistantContent, Message, Reasoning},
     providers::openai::{self, responses_api},
     streaming::StreamedAssistantContent,
+    OneOrMany,
 };
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -20,8 +22,7 @@ use serde_json::{json, Value};
 use std::{fs, path::PathBuf, sync::Arc};
 use uuid::Uuid;
 use web_search::{
-    validate_web_search_runtime_config, ExaWebSearchProvider, MockWebSearchProvider,
-    WebSearchConfig, WebSearchMode, WebSearchProviderKind,
+    validate_web_search_runtime_config, ExaWebSearchProvider, WebSearchConfig, WebSearchMode,
 };
 
 pub mod agent_loop;
@@ -58,6 +59,12 @@ pub struct RoleLlmSettings {
     pub max_turns: Option<usize>,
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub reasoning_summary: Option<String>,
+    #[serde(default)]
+    pub preserve_reasoning_state: bool,
+    #[serde(default)]
+    pub text_verbosity: Option<String>,
     #[serde(default)]
     pub transport: LlmTransport,
     #[serde(default)]
@@ -103,6 +110,13 @@ impl RoleLlmSettings {
         }
         if let Some(effort) = &self.reasoning_effort {
             validate_reasoning_effort(effort)?;
+        }
+        if let Some(summary) = &self.reasoning_summary {
+            validate_reasoning_summary(summary)?;
+        }
+        if let Some(verbosity) = &self.text_verbosity {
+            validate_text_verbosity(verbosity)?;
+            bail!("text_verbosity is not supported by the current Rig Responses transport");
         }
         Ok(())
     }
@@ -158,7 +172,13 @@ pub async fn run_rig_agent_loop(settings: &RigSettings, prompt: &str) -> Result<
         serde_json::to_string(&configured_tool_names(settings))?
     );
     let tool_config = settings.tools.clone().unwrap_or_else(default_tool_config);
-    let mut tools = ProjectToolRuntime::new(tool_config);
+    let mut tools = ProjectToolRuntime::with_available_tools(
+        tool_config,
+        configured_tool_names(settings)
+            .into_iter()
+            .map(ToString::to_string)
+            .collect(),
+    );
     if let Some(web_run) = web_run_runtime_for_settings(settings) {
         tools = tools.with_web_run_runtime(web_run);
     }
@@ -258,27 +278,14 @@ fn safe_path_part(value: &str) -> String {
         .collect()
 }
 
-fn web_search_provider(config: &WebSearchConfig) -> Option<tools::SharedWebSearchProvider> {
-    match config.mode {
-        WebSearchMode::Disabled => None,
-        WebSearchMode::Cached => Some(Arc::new(MockWebSearchProvider::default())),
-        WebSearchMode::Live => match config.provider {
-            WebSearchProviderKind::Mock => Some(Arc::new(MockWebSearchProvider::default())),
-            WebSearchProviderKind::Exa => Some(Arc::new(ExaWebSearchProvider::from_config(config))),
-        },
-    }
-}
-
 fn web_run_runtime(config: &WebSearchConfig) -> Option<tools::WebRunRuntime> {
-    if config.mode == WebSearchMode::Disabled {
-        return None;
+    match config.mode {
+        WebSearchMode::Live => Some(
+            tools::WebRunRuntime::new(config.clone())
+                .with_provider(Arc::new(ExaWebSearchProvider::from_config(config))),
+        ),
+        WebSearchMode::Disabled | WebSearchMode::Cached => None,
     }
-    let runtime = tools::WebRunRuntime::new(config.clone());
-    Some(if let Some(provider) = web_search_provider(config) {
-        runtime.with_provider(provider)
-    } else {
-        runtime
-    })
 }
 
 fn web_run_runtime_for_settings(settings: &RigSettings) -> Option<tools::WebRunRuntime> {
@@ -290,11 +297,11 @@ fn web_run_runtime_for_settings(settings: &RigSettings) -> Option<tools::WebRunR
 }
 
 fn uses_native_web_search(settings: &RigSettings) -> bool {
-    settings.llm.native_web_search && settings.web_search.mode != WebSearchMode::Disabled
+    settings.llm.native_web_search && settings.web_search.mode == WebSearchMode::Live
 }
 
 fn uses_web_run_fallback(settings: &RigSettings) -> bool {
-    !uses_native_web_search(settings) && settings.web_search.mode != WebSearchMode::Disabled
+    !uses_native_web_search(settings) && settings.web_search.mode == WebSearchMode::Live
 }
 
 fn validate_fallback_web_search_runtime_config(settings: &RigSettings) -> Result<()> {
@@ -305,7 +312,11 @@ fn validate_fallback_web_search_runtime_config(settings: &RigSettings) -> Result
     }
 }
 
-async fn run_model_text_once(settings: &RigSettings, prompt: &str) -> Result<String> {
+async fn run_model_text_once(
+    settings: &RigSettings,
+    _input: &agent_loop::ModelInput,
+    prompt: &str,
+) -> Result<String> {
     let client = openai_compatible_responses_client(&settings.llm)?;
     let model = client.completion_model(&settings.llm.model);
     let builder = AgentBuilder::new(model).default_max_turns(1);
@@ -324,32 +335,31 @@ async fn run_model_text_once(settings: &RigSettings, prompt: &str) -> Result<Str
 
 pub async fn run_model_event_stream(
     settings: &RigSettings,
+    input: &agent_loop::ModelInput,
     prompt: &str,
     handler: &mut dyn ModelEventHandler,
 ) -> Result<()> {
     let client = openai_compatible_responses_client(&settings.llm)?;
     let model = client.completion_model(&settings.llm.model);
     match settings.llm.transport {
-        LlmTransport::Http => stream_completion_model(settings, model, prompt, handler).await,
+        LlmTransport::Http => {
+            stream_completion_model(settings, input, model, prompt, handler).await
+        }
         LlmTransport::Ws => {
-            stream_openai_compatible_responses_websocket(settings, model, prompt, handler).await
+            stream_openai_compatible_responses_websocket(settings, input, model, prompt, handler)
+                .await
         }
     }
 }
 
 async fn stream_openai_compatible_responses_websocket(
     settings: &RigSettings,
+    input: &agent_loop::ModelInput,
     model: rig_core::providers::openai::responses_api::ResponsesCompletionModel,
     prompt: &str,
     handler: &mut dyn ModelEventHandler,
 ) -> Result<()> {
-    let mut builder = model.completion_request(prompt.to_string());
-    if let Some(preamble) = settings.llm.effective_preamble() {
-        builder = builder.preamble(preamble.to_string());
-    }
-    if let Some(params) = additional_params(settings) {
-        builder = builder.additional_params(params);
-    }
+    let builder = completion_request_builder(settings, input, model, prompt);
     let client = openai_compatible_responses_client(&settings.llm)?;
     let mut session = client
         .responses_websocket(settings.llm.model.clone())
@@ -404,16 +414,48 @@ async fn stream_openai_compatible_responses_websocket_events(
                     }
                 }
                 responses_api::streaming::ItemChunkKind::OutputItemDone(output) => {
-                    if let responses_api::Output::FunctionCall(function_call) = output.item {
-                        handler
-                            .handle(ModelStreamEvent::ToolCallCompleted {
-                                tool_call: ToolCallRequest {
-                                    call_id: function_call.call_id,
-                                    name: function_call.name,
-                                    arguments: function_call.arguments,
-                                },
-                            })
-                            .await?;
+                    match output.item {
+                        responses_api::Output::FunctionCall(function_call) => {
+                            handler
+                                .handle(ModelStreamEvent::ToolCallCompleted {
+                                    tool_call: ToolCallRequest {
+                                        call_id: function_call.call_id,
+                                        name: function_call.name,
+                                        arguments: function_call.arguments,
+                                    },
+                                })
+                                .await?;
+                        }
+                        responses_api::Output::Reasoning {
+                            id,
+                            summary,
+                            encrypted_content,
+                            ..
+                        } => {
+                            if let Some(encrypted_content) = encrypted_content {
+                                handler
+                                    .handle(ModelStreamEvent::ReasoningStateCompleted {
+                                        item_id: id.clone(),
+                                        encrypted_content,
+                                    })
+                                    .await?;
+                            }
+                            for item in summary {
+                                let responses_api::ReasoningSummary::SummaryText { text } = item;
+                                if !text.trim().is_empty() {
+                                    handler
+                                        .handle(ModelStreamEvent::ReasoningSummaryDelta {
+                                            item_id: id.clone(),
+                                            delta: text,
+                                        })
+                                        .await?;
+                                }
+                            }
+                            handler
+                                .handle(ModelStreamEvent::ReasoningSummaryCompleted { item_id: id })
+                                .await?;
+                        }
+                        _ => {}
                     }
                 }
                 _ => {}
@@ -481,8 +523,63 @@ fn response_status_result(response: responses_api::CompletionResponse) -> Result
     }
 }
 
+fn completion_request_builder<M>(
+    settings: &RigSettings,
+    input: &agent_loop::ModelInput,
+    model: M,
+    prompt: &str,
+) -> rig_core::completion::CompletionRequestBuilder<M>
+where
+    M: CompletionModel,
+{
+    let mut builder = model.completion_request(Message::user(prompt.to_string()));
+    if let Some(preamble) = settings.llm.effective_preamble() {
+        builder = builder.preamble(preamble.to_string());
+    }
+    if let Some(reasoning) = reasoning_history_message(&settings.llm, input) {
+        builder = builder.message(reasoning);
+    }
+    if let Some(params) = additional_params(settings) {
+        builder = builder.additional_params(params);
+    }
+    builder
+}
+
+fn reasoning_history_message(
+    settings: &RoleLlmSettings,
+    input: &agent_loop::ModelInput,
+) -> Option<Message> {
+    if !settings.preserve_reasoning_state {
+        return None;
+    }
+    input
+        .items
+        .iter()
+        .rev()
+        .find(|item| item.item_type == agent_loop::TurnItemType::ReasoningState)
+        .and_then(|item| {
+            let id = item
+                .content_json
+                .get("output_item_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())?;
+            let encrypted_content = item
+                .content_json
+                .get("encrypted_content")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())?;
+            Some(Message::Assistant {
+                id: None,
+                content: OneOrMany::one(AssistantContent::Reasoning(
+                    Reasoning::encrypted(encrypted_content.to_string()).with_id(id.to_string()),
+                )),
+            })
+        })
+}
+
 async fn stream_completion_model<M>(
     settings: &RigSettings,
+    input: &agent_loop::ModelInput,
     model: M,
     prompt: &str,
     handler: &mut dyn ModelEventHandler,
@@ -491,13 +588,7 @@ where
     M: CompletionModel,
     M::StreamingResponse: Clone + Unpin,
 {
-    let mut builder = model.completion_request(prompt.to_string());
-    if let Some(preamble) = settings.llm.effective_preamble() {
-        builder = builder.preamble(preamble.to_string());
-    }
-    if let Some(params) = additional_params(settings) {
-        builder = builder.additional_params(params);
-    }
+    let builder = completion_request_builder(settings, input, model, prompt);
     let mut stream = builder.stream().await.context("LLM stream failed")?;
     let mut parser = RuntimeEventStreamParser::default();
     let mut fallback_text = String::new();
@@ -508,6 +599,16 @@ where
                 parser.push_text(text.text(), handler).await?;
             }
             StreamedAssistantContent::Reasoning(reasoning) => {
+                if let (Some(id), Some(encrypted_content)) =
+                    (reasoning.id.clone(), reasoning.encrypted_content())
+                {
+                    handler
+                        .handle(ModelStreamEvent::ReasoningStateCompleted {
+                            item_id: id,
+                            encrypted_content: encrypted_content.to_string(),
+                        })
+                        .await?;
+                }
                 let text = reasoning.display_text();
                 if !text.trim().is_empty() {
                     let item_id = reasoning
@@ -586,7 +687,6 @@ impl RuntimeEventStreamParser {
         for value in stream {
             let value = value?;
             let event = stream_event_from_value(value)?;
-            self.record_event(&event);
             self.parsed_any = true;
             emitted = true;
             handler.handle(event).await?;
@@ -620,14 +720,11 @@ impl RuntimeEventStreamParser {
             for event in
                 agent_loop::response_to_stream_events(agent_loop::parse_react_response(value)?)?
             {
-                self.record_event(&event);
                 handler.handle(event).await?;
             }
         }
         Ok(())
     }
-
-    fn record_event(&mut self, _event: &ModelStreamEvent) {}
 
     async fn emit_line(&mut self, line: &str, handler: &mut dyn ModelEventHandler) -> Result<()> {
         let Some(start) = line.find('{').or_else(|| line.find('[')) else {
@@ -647,7 +744,6 @@ impl RuntimeEventStreamParser {
                 }
             };
             let event = stream_event_from_value(value)?;
-            self.record_event(&event);
             self.parsed_any = true;
             emitted = true;
             handler.handle(event).await?;
@@ -686,14 +782,6 @@ fn stream_event_from_value(value: Value) -> Result<ModelStreamEvent> {
         }),
         "reasoning_summary_completed" => Ok(ModelStreamEvent::ReasoningSummaryCompleted {
             item_id: stream_item_id(&value)?,
-        }),
-        "plan_update_completed" => Ok(ModelStreamEvent::PlanUpdateCompleted {
-            item_id: stream_item_id(&value)?,
-            content: value
-                .get("content")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
         }),
         "tool_call_completed" => Ok(ModelStreamEvent::ToolCallCompleted {
             tool_call: serde_json::from_value(
@@ -912,22 +1000,49 @@ fn openai_compatible_responses_client(settings: &RoleLlmSettings) -> Result<open
 }
 
 pub fn additional_params(settings: &RigSettings) -> Option<Value> {
-    let mut params = settings
-        .llm
-        .effective_reasoning_effort(settings.reasoning_effort_override.as_deref())
-        .map(openai_responses_reasoning_params);
+    let mut params = openai_responses_reasoning_params(
+        &settings.llm,
+        settings
+            .llm
+            .effective_reasoning_effort(settings.reasoning_effort_override.as_deref()),
+    );
     if uses_native_web_search(settings) {
         params = Some(add_openai_responses_native_web_search(params));
     }
     params
 }
 
-pub fn openai_responses_reasoning_params(effort: &str) -> Value {
-    json!({
-        "reasoning": {
-            "effort": effort.trim().to_ascii_lowercase()
-        }
-    })
+pub fn openai_responses_reasoning_params(
+    settings: &RoleLlmSettings,
+    effort: Option<&str>,
+) -> Option<Value> {
+    let mut params = serde_json::Map::new();
+    let mut reasoning = serde_json::Map::new();
+    if let Some(effort) = effort
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("none"))
+    {
+        reasoning.insert("effort".to_string(), json!(effort.to_ascii_lowercase()));
+    }
+    if let Some(summary) = settings
+        .reasoning_summary
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        reasoning.insert("summary".to_string(), json!(summary.to_ascii_lowercase()));
+    }
+    if !reasoning.is_empty() {
+        params.insert("reasoning".to_string(), Value::Object(reasoning));
+    }
+    if settings.preserve_reasoning_state {
+        params.insert("store".to_string(), json!(false));
+        params.insert(
+            "include".to_string(),
+            json!(["reasoning.encrypted_content"]),
+        );
+    }
+    (!params.is_empty()).then_some(Value::Object(params))
 }
 
 fn add_openai_responses_native_web_search(params: Option<Value>) -> Value {
@@ -973,6 +1088,20 @@ fn validate_reasoning_effort(value: &str) -> Result<()> {
     match value.trim().to_ascii_lowercase().as_str() {
         "none" | "minimal" | "low" | "medium" | "high" | "xhigh" => Ok(()),
         other => bail!("unsupported reasoning_effort {other:?}"),
+    }
+}
+
+fn validate_reasoning_summary(value: &str) -> Result<()> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "auto" | "concise" | "detailed" => Ok(()),
+        other => bail!("unsupported reasoning_summary {other:?}"),
+    }
+}
+
+fn validate_text_verbosity(value: &str) -> Result<()> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "low" | "medium" | "high" => Ok(()),
+        other => bail!("unsupported text_verbosity {other:?}"),
     }
 }
 
@@ -1046,6 +1175,9 @@ mod tests {
                 preamble: None,
                 max_turns: Some(6),
                 reasoning_effort: Some("low".to_string()),
+                reasoning_summary: None,
+                preserve_reasoning_state: false,
+                text_verbosity: None,
                 transport: Default::default(),
                 base_url: None,
                 api_key: None,
@@ -1279,6 +1411,9 @@ mod tests {
             preamble: None,
             max_turns: Some(4),
             reasoning_effort: None,
+            reasoning_summary: None,
+            preserve_reasoning_state: false,
+            text_verbosity: None,
             transport: Default::default(),
             base_url: Some("https://llm.example.com/v1".to_string()),
             api_key: Some("test-key".to_string()),
@@ -1320,6 +1455,9 @@ mod tests {
             preamble: None,
             max_turns: Some(4),
             reasoning_effort: None,
+            reasoning_summary: None,
+            preserve_reasoning_state: false,
+            text_verbosity: None,
             transport: Default::default(),
             base_url: Some("https://llm.example.com/v1".to_string()),
             api_key: Some("test-key".to_string()),
@@ -1371,6 +1509,17 @@ mod tests {
         assert_eq!(
             super::additional_params(&settings),
             Some(json!({"reasoning": {"effort": "high"}}))
+        );
+
+        settings.llm.reasoning_summary = Some("auto".to_string());
+        settings.llm.preserve_reasoning_state = true;
+        assert_eq!(
+            super::additional_params(&settings),
+            Some(json!({
+                "reasoning": {"effort": "high", "summary": "auto"},
+                "store": false,
+                "include": ["reasoning.encrypted_content"]
+            }))
         );
     }
 
@@ -1448,7 +1597,7 @@ mod tests {
         assert!(!super::configured_tool_names(&settings).contains(&tools::WEB_RUN_TOOL_NAME));
 
         settings.web_search.mode = WebSearchMode::Cached;
-        assert!(super::configured_tool_names(&settings).contains(&tools::WEB_RUN_TOOL_NAME));
+        assert!(!super::configured_tool_names(&settings).contains(&tools::WEB_RUN_TOOL_NAME));
 
         settings.web_search.mode = WebSearchMode::Live;
         assert!(super::configured_tool_names(&settings).contains(&tools::WEB_RUN_TOOL_NAME));

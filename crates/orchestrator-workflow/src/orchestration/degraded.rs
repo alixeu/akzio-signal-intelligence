@@ -1,5 +1,4 @@
 use anyhow::{self, Result};
-use orchestrator_domain::{ConfidenceImpact, DegradedEntry, DegradedReport};
 use orchestrator_llm::mock_role_artifact;
 use serde_json::{json, Value};
 use tracing::warn;
@@ -7,6 +6,48 @@ use tracing::warn;
 use super::config::{is_critical_role, RuntimeConfig};
 use super::role_jobs::RoleJobResult;
 use super::state::tickers_from_state;
+
+enum ConfidenceImpact {
+    Minor,
+    Moderate,
+}
+
+impl ConfidenceImpact {
+    fn as_str(&self) -> &'static str {
+        match self {
+            ConfidenceImpact::Minor => "Minor",
+            ConfidenceImpact::Moderate => "Moderate",
+        }
+    }
+}
+
+struct DegradedEntry {
+    role: String,
+    phase: i64,
+    error: String,
+    used_fallback: bool,
+    confidence_impact: ConfidenceImpact,
+}
+
+impl DegradedEntry {
+    fn into_value(self) -> Value {
+        let DegradedEntry {
+            role,
+            phase,
+            error,
+            used_fallback,
+            confidence_impact,
+        } = self;
+
+        json!({
+            "role": role,
+            "phase": phase,
+            "error": error,
+            "used_fallback": used_fallback,
+            "confidence_impact": confidence_impact.as_str(),
+        })
+    }
+}
 
 pub(crate) fn degraded_fallback(role: &str, tickers: &[String], error: &anyhow::Error) -> Value {
     let mut artifact = mock_role_artifact(role, tickers);
@@ -17,18 +58,15 @@ pub(crate) fn degraded_fallback(role: &str, tickers: &[String], error: &anyhow::
     artifact
 }
 
-pub(crate) fn push_degraded_entry(state: &mut Value, entry: DegradedEntry) {
+fn push_degraded_entry(state: &mut Value, entry: DegradedEntry) {
     if state.get("degraded_report").is_none() {
-        let report = DegradedReport::new();
-        state["degraded_report"] =
-            serde_json::to_value(&report).unwrap_or(json!({"is_degraded": false, "roles": []}));
+        state["degraded_report"] = json!({"is_degraded": false, "roles": []});
     }
 
     if let Some(report_val) = state.get_mut("degraded_report") {
         if let Some(roles) = report_val.get_mut("roles") {
             if let Some(arr) = roles.as_array_mut() {
-                let entry_val = serde_json::to_value(&entry).unwrap_or(json!({}));
-                arr.push(entry_val);
+                arr.push(entry.into_value());
             }
         }
         report_val["is_degraded"] = json!(true);
