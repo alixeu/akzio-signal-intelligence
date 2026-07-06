@@ -7,12 +7,14 @@ pub mod ticker;
 pub mod token;
 
 pub use artifact::{
-    extract_json_artifact, normalize_probability, validate_research_artifact, ResearchArtifact,
-    ValidationError,
+    analyst_artifact_schema, extract_json_artifact, final_validation_schema, normalize_probability,
+    portfolio_allocation_schema, research_artifact_schema, risk_constraints_schema, schema_for,
+    trade_intent_schema, validate_research_artifact, AnalystTickerArtifact, FinalValidation,
+    PortfolioAllocation, ResearchArtifact, RiskConstraints, TradeIntent, ValidationError,
 };
 pub use config::{
     config_bool, config_float, config_get, config_int, config_str, config_strings, deep_merge,
-    load_config,
+    expand_env_placeholders, load_config,
 };
 pub use paths::{default_project_root, project_path};
 pub use prompt::replace_placeholders;

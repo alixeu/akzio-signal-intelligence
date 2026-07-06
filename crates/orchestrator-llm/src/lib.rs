@@ -150,6 +150,14 @@ pub struct RigSettings {
     pub web_search: WebSearchConfig,
 }
 
+#[derive(Debug, Clone)]
+pub struct SteerLoopInput<'a> {
+    pub session_id: String,
+    pub turn_id: String,
+    pub prompt: &'a str,
+    pub steer: Option<String>,
+}
+
 pub async fn run_rig_agent_loop(settings: &RigSettings, prompt: &str) -> Result<Value> {
     settings.llm.validate(&settings.role)?;
     validate_fallback_web_search_runtime_config(settings)?;
@@ -171,6 +179,78 @@ pub async fn run_rig_agent_loop(settings: &RigSettings, prompt: &str) -> Result<
         settings.tickers.join(","),
         serde_json::to_string(&configured_tool_names(settings))?
     );
+    let tool_config = settings.tools.clone().unwrap_or_else(default_tool_config);
+    let mut tools = ProjectToolRuntime::with_available_tools(
+        tool_config,
+        configured_tool_names(settings)
+            .into_iter()
+            .map(ToString::to_string)
+            .collect(),
+    );
+    if let Some(web_run) = web_run_runtime_for_settings(settings) {
+        tools = tools.with_web_run_runtime(web_run);
+    }
+    let mut model = RigLoopModel::new(settings.clone());
+    agent_loop::run_turn(
+        &conn,
+        &mut turn,
+        &mut model,
+        &mut tools,
+        AgentLoopConfig {
+            max_agent_loops: settings.llm.max_turns,
+            ..AgentLoopConfig::default()
+        },
+    )
+    .await?;
+    write_role_end_context(settings, &turn)?;
+    let final_text = turn
+        .emitted_items
+        .iter()
+        .rev()
+        .find(|item| item.item_type == agent_loop::TurnItemType::AssistantMessage)
+        .map(|item| {
+            if !item.content_text.trim().is_empty() {
+                item.content_text.clone()
+            } else {
+                item.content_json.to_string()
+            }
+        })
+        .context("agent loop finished without assistant message")?;
+    parse_final_output(settings, &final_text)
+}
+
+pub async fn run_rig_agent_steer_loop(
+    settings: &RigSettings,
+    input: SteerLoopInput<'_>,
+) -> Result<Value> {
+    settings.llm.validate(&settings.role)?;
+    validate_fallback_web_search_runtime_config(settings)?;
+    let conn = open_loop_connection(settings)?;
+    let has_existing_history =
+        !orchestrator_sql::session_history_items(&conn, &input.session_id, 1)?.is_empty();
+    let user_input = if has_existing_history {
+        "".to_string()
+    } else {
+        input.prompt.to_string()
+    };
+    let mut turn = Turn::new(
+        input.turn_id,
+        input.session_id,
+        loop_run_id(settings),
+        settings.role.clone(),
+        user_input,
+    );
+    turn.phase = settings.phase;
+    turn.model_context = format!(
+        "role={}, output_mode={:?}, tickers={}\navailable_tools={}",
+        settings.role,
+        settings.output_mode,
+        settings.tickers.join(","),
+        serde_json::to_string(&configured_tool_names(settings))?
+    );
+    if let Some(steer) = input.steer {
+        turn.push_pending_input(steer);
+    }
     let tool_config = settings.tools.clone().unwrap_or_else(default_tool_config);
     let mut tools = ProjectToolRuntime::with_available_tools(
         tool_config,
@@ -840,7 +920,7 @@ fn text_fallback_artifact(settings: &RigSettings, text: &str) -> Value {
             (
                 ticker.clone(),
                 json!({
-                    "direction": "neutral",
+                    "direction": "unobserved",
                     "confidence": 0.0,
                     "report": text,
                     "data_gaps": ["model returned non-JSON artifact; raw text preserved"]
@@ -851,7 +931,8 @@ fn text_fallback_artifact(settings: &RigSettings, text: &str) -> Value {
     json!({
         "id": settings.role,
         "role": settings.role,
-        "status": "completed",
+        "status": "degraded",
+        "degraded": true,
         "report": text,
         "per_ticker": per_ticker
     })
@@ -1128,6 +1209,10 @@ fn default_tool_config() -> tools::ExternalToolConfig {
 pub fn mock_role_artifact(role: &str, tickers: &[String]) -> Value {
     match role {
         "manager.research" => orchestrator_sql::write::mock_research_artifact(tickers),
+        "trader" => mock_trader_artifact(),
+        "risk.aggressive" | "risk.conservative" | "risk.neutral" => mock_risk_artifact(role),
+        "portfolio.manager" => mock_portfolio_artifact(),
+        "allocation.manager" => mock_allocation_artifact(tickers),
         _ => {
             let per_ticker = tickers
                 .iter()
@@ -1150,6 +1235,95 @@ pub fn mock_role_artifact(role: &str, tickers: &[String]) -> Value {
             })
         }
     }
+}
+
+fn mock_trader_artifact() -> Value {
+    serde_json::json!({
+        "id": "trader",
+        "role": "trader",
+        "action": "Hold",
+        "entry_price": null,
+        "stop_loss": null,
+        "position_size": "0%-30%",
+        "rationale": "Mock trader plan based on neutral research."
+    })
+}
+
+fn mock_risk_artifact(role: &str) -> Value {
+    let stance = role.strip_prefix("risk.").unwrap_or("neutral");
+    serde_json::json!({
+        "id": role,
+        "role": role,
+        "stance": stance,
+        "argument": format!("Mock {stance} risk argument."),
+        "recommended_adjustment": "No change in mock mode."
+    })
+}
+
+fn mock_portfolio_artifact() -> Value {
+    serde_json::json!({
+        "id": "portfolio.manager",
+        "role": "portfolio.manager",
+        "rating": "Hold",
+        "execution_summary": "Mock final portfolio decision.",
+        "investment_thesis": "Mock probability analysis.",
+        "target_price": null,
+        "horizon": "1-5 trading days",
+        "risk_controls": ["Keep allocation capped in mock mode"],
+        "rationale": "Mock portfolio manager decision based on neutral research and risk debate."
+    })
+}
+
+fn mock_allocation_artifact(tickers: &[String]) -> Value {
+    let investable: Vec<&String> = tickers.iter().filter(|t| t.as_str() != "VIX").collect();
+    if investable.is_empty() {
+        return serde_json::json!({
+            "id": "allocation.manager",
+            "role": "allocation.manager",
+            "weights": {
+                "cash_hedge": {
+                    "weight": 1.0,
+                    "rationale": "Mock cash allocation; no investable tickers"
+                }
+            },
+            "total_equity_exposure": 0.0,
+            "vix_regime": "normal",
+            "correlation_note": "Mock correlation note",
+            "summary": "Mock allocation artifact.",
+            "allocation_method": "mock"
+        });
+    }
+    let count = investable.len().max(1);
+    let equity = 0.6_f64;
+    let per = (equity / count as f64 * 10_000.0).round() / 10_000.0;
+    let cash = (1.0 - per * count as f64).max(0.0);
+    let mut weights = serde_json::Map::new();
+    for ticker in &investable {
+        weights.insert(
+            ticker.to_string(),
+            serde_json::json!({
+                "weight": per,
+                "rationale": format!("Mock allocation for {}", ticker)
+            }),
+        );
+    }
+    weights.insert(
+        "cash_hedge".to_string(),
+        serde_json::json!({
+            "weight": cash,
+            "rationale": "Mock cash hedge"
+        }),
+    );
+    serde_json::json!({
+        "id": "allocation.manager",
+        "role": "allocation.manager",
+        "weights": weights,
+        "total_equity_exposure": per * count as f64,
+        "vix_regime": "normal",
+        "correlation_note": "Mock correlation note",
+        "summary": "Mock allocation artifact.",
+        "allocation_method": "mock"
+    })
 }
 
 #[cfg(test)]

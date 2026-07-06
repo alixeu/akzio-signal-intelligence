@@ -8,29 +8,46 @@ use orchestrator_core::{
 use orchestrator_sql;
 use orchestrator_sql::{connect, write_run_record, RunRecordInput};
 use serde_json::{json, Value};
-use std::{fs, path::PathBuf};
+use std::{fs, path::PathBuf, time::Instant};
 use tracing::debug;
 
+use crate::orchestration::allocation::{compute_allocation_context, normalize_allocation};
 use crate::orchestration::artifact::{
-    build_debate_state_artifact, build_phase1_state_artifact, build_topic_controller_artifact,
-    build_topic_generation_artifact, merge_reducer_output, persist_artifact,
-    persist_artifact_with_last_md, persist_message, persist_message_with_topic, reducer_brief_md,
-    topic_id_from_topic, topics_from_generation_artifact,
+    build_debate_state_artifact, build_phase1_state_artifact, build_topic_generation_artifact,
+    merge_reducer_output, persist_artifact, persist_artifact_with_last_md, persist_message,
+    persist_message_with_topic, reducer_brief_md, topic_id_from_topic,
+    topics_from_generation_artifact,
 };
 use crate::orchestration::config::{config_weight, validate_sqlite_context, RuntimeConfig};
+use crate::orchestration::contract::record_contracts;
 use crate::orchestration::degraded::{manager_research_fallback, role_artifact_or_degraded};
+use crate::orchestration::market_truth::market_truth_violation_report;
+use crate::orchestration::policy::{
+    evaluate_workflow_policy, record_workflow_policy, WorkflowPolicyDecision, WorkflowPolicyMode,
+    WorkflowPolicySignals,
+};
 use crate::orchestration::preflight::{enforce_preflight_policy, run_phase1_preflight};
 use crate::orchestration::render::mode_prompt_path;
 use crate::orchestration::role_jobs::{
-    prepare_role_job, run_role_jobs, run_single_role_job, RoleRun,
+    merge_role_job_metrics, prepare_role_job, record_role_job_metrics, run_role_jobs,
+    run_single_role_job, run_single_steer_role_job, RoleRun, SteerRoleRun,
 };
 use crate::orchestration::state::{
     append_topic_controller_artifact, append_topic_turn, run_id_for, set_phase_status,
     set_topic_controller_state, tickers_from_state, upsert_topic_debate_state, write_final_summary,
     write_json,
 };
+use crate::orchestration::trade_intent::research_plan_to_trade_intent;
 use crate::orchestration::PHASE2_REDUCER;
 use orchestrator_core::role_registry::DEFAULT_PHASE1_AGENTS;
+
+type TopicDebateResult = (String, Vec<Value>, Value, Value);
+
+struct PhaseTimer {
+    phase: i64,
+    label: &'static str,
+    started_at: Instant,
+}
 
 #[derive(Debug, Clone, ValueEnum)]
 pub enum Mode {
@@ -86,7 +103,7 @@ pub struct ExecArgs {
     pub x_weight: f64,
     #[arg(long, default_value_t = 1)]
     pub from_phase: i64,
-    #[arg(long, default_value_t = 3)]
+    #[arg(long, default_value_t = 7)]
     pub to_phase: i64,
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub tech_refresh_enabled: bool,
@@ -216,6 +233,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
 
     if args.from_phase <= 1 && args.to_phase >= 1 {
         debug!(roles = ?phase1_agents, "phase 1 starting");
+        let phase_timer = start_phase_timer(1, "phase1");
         run_phase1(
             &mut conn,
             &mut state,
@@ -226,6 +244,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         )
         .await?;
         set_phase_status(&mut state, 1, "done");
+        record_phase_elapsed(&mut state, phase_timer);
         debug!("phase 1 completed");
     }
     if args.from_phase <= 2 && args.to_phase >= 2 {
@@ -233,6 +252,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             max_debate_rounds = args.max_debate_rounds,
             "phase 2 starting"
         );
+        let phase_timer = start_phase_timer(2, "phase2");
         conn = run_phase2(
             conn,
             &mut state,
@@ -253,10 +273,12 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         .await?;
         set_phase_status(&mut state, 2, "done");
         set_phase_status(&mut state, PHASE2_REDUCER, "done");
+        record_phase_elapsed(&mut state, phase_timer);
         debug!("phase 2 completed");
     }
     if args.from_phase <= 3 && args.to_phase >= 3 {
         debug!("phase 3 starting");
+        let phase_timer = start_phase_timer(3, "phase3");
         run_phase3(
             &mut conn,
             &mut state,
@@ -266,9 +288,88 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         )
         .await?;
         set_phase_status(&mut state, 3, "done");
+        record_phase_elapsed(&mut state, phase_timer);
         debug!("phase 3 completed");
     }
+    let policy = if state.get("research_plan").is_some() {
+        Some(apply_workflow_policy(&mut state, &conn, &runtime_config))
+    } else {
+        None
+    };
+    if args.from_phase <= 4 && args.to_phase >= 4 {
+        debug!("phase 4 (trader) starting");
+        let phase_timer = start_phase_timer(4, "phase4");
+        if should_run_llm_trader(policy.as_ref(), &runtime_config) {
+            run_phase4(
+                &mut conn,
+                &mut state,
+                model_override.as_deref(),
+                reasoning_effort_override.as_deref(),
+                &runtime_config,
+            )
+            .await?;
+        } else {
+            run_phase4_rust_rule(&mut conn, &mut state)?;
+        }
+        set_phase_status(&mut state, 4, "done");
+        record_phase_elapsed(&mut state, phase_timer);
+        debug!("phase 4 (trader) completed");
+    }
+    if args.from_phase <= 5 && args.to_phase >= 5 {
+        debug!("phase 5 (risk debate) starting");
+        let phase_timer = start_phase_timer(5, "phase5");
+        if should_run_risk_review(policy.as_ref(), &runtime_config) {
+            run_phase5(
+                &mut conn,
+                &mut state,
+                model_override.as_deref(),
+                reasoning_effort_override.as_deref(),
+                &runtime_config,
+            )
+            .await?;
+        } else {
+            run_phase5_skipped(&mut conn, &mut state)?;
+        }
+        set_phase_status(&mut state, 5, "done");
+        record_phase_elapsed(&mut state, phase_timer);
+        debug!("phase 5 (risk debate) completed");
+    }
+    if args.from_phase <= 6 && args.to_phase >= 6 {
+        debug!("phase 6 (portfolio manager) starting");
+        let phase_timer = start_phase_timer(6, "phase6");
+        if should_run_portfolio_review(policy.as_ref(), &runtime_config) {
+            run_phase6(
+                &mut conn,
+                &mut state,
+                model_override.as_deref(),
+                reasoning_effort_override.as_deref(),
+                &runtime_config,
+            )
+            .await?;
+        } else {
+            run_phase6_derived(&mut conn, &mut state)?;
+        }
+        set_phase_status(&mut state, 6, "done");
+        record_phase_elapsed(&mut state, phase_timer);
+        debug!("phase 6 (portfolio manager) completed");
+    }
+    if args.from_phase <= 7 && args.to_phase >= 7 {
+        debug!("phase 7 (allocation) starting");
+        let phase_timer = start_phase_timer(7, "phase7");
+        run_phase7(
+            &mut conn,
+            &mut state,
+            model_override.as_deref(),
+            reasoning_effort_override.as_deref(),
+            &runtime_config,
+        )
+        .await?;
+        set_phase_status(&mut state, 7, "done");
+        record_phase_elapsed(&mut state, phase_timer);
+        debug!("phase 7 (allocation) completed");
+    }
 
+    record_contracts(&mut state);
     write_json(&state_path, &state)?;
     write_final_summary(&run_dir, &state)?;
     debug!(
@@ -285,6 +386,18 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         .get("research_plan")
         .cloned()
         .unwrap_or_else(|| json!({}));
+    let allocation = state
+        .get("portfolio_allocation")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let trader = state
+        .get("trader_investment_plan")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let final_decision = state
+        .get("final_trade_decision")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
     let result = json!({
         "ticker": ticker,
         "tickers": tickers_from_state(&state),
@@ -297,11 +410,15 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         "state": state_path,
         "final_summary": run_dir.join("final_summary.md"),
         "degraded": state.get("degraded").and_then(Value::as_bool).unwrap_or(false),
-        "rating": research.get("rating").cloned().unwrap_or(Value::Null),
-        "action": Value::Null,
+        "rating": final_decision.get("rating").cloned().or_else(|| research.get("rating").cloned()).unwrap_or(Value::Null),
+        "action": trader.get("action").cloned().unwrap_or(Value::Null),
         "research_rating": research.get("rating").cloned().unwrap_or(Value::Null),
         "long_probability": research.get("long_probability").cloned().unwrap_or(Value::Null),
         "short_probability": research.get("short_probability").cloned().unwrap_or(Value::Null),
+        "trader_investment_plan": trader,
+        "final_trade_decision": final_decision,
+        "vix_regime": allocation.get("vix_regime").cloned().unwrap_or(Value::Null),
+        "portfolio_allocation": allocation,
     });
     Ok(result)
 }
@@ -313,11 +430,11 @@ fn validate_args(args: &ExecArgs) -> Result<()> {
     if args.max_topics_per_side < 1 {
         bail!("--max-topics-per-side must be >= 1");
     }
-    if args.from_phase < 1 || args.from_phase > 3 {
-        bail!("--from-phase must be 1, 2, or 3");
+    if args.from_phase < 1 || args.from_phase > 7 {
+        bail!("--from-phase must be 1-7");
     }
-    if args.to_phase < args.from_phase || args.to_phase > 3 {
-        bail!("--to-phase must be between --from-phase and 3");
+    if args.to_phase < args.from_phase || args.to_phase > 7 {
+        bail!("--to-phase must be between --from-phase and 7");
     }
     for (name, value) in [
         ("--technical-weight", args.technical_weight),
@@ -338,6 +455,260 @@ fn parse_phase1_agents(raw: &str) -> Result<Vec<String>> {
     registry
         .parse_role_list(raw)
         .map_err(|e| anyhow::anyhow!(e))
+}
+
+fn apply_workflow_policy(
+    state: &mut Value,
+    conn: &rusqlite::Connection,
+    config: &RuntimeConfig,
+) -> WorkflowPolicyDecision {
+    let allocation_context = compute_allocation_context(state, conn, &config.allocation);
+    state["allocation_context"] = allocation_context.clone();
+    let signals = workflow_policy_signals(state, &allocation_context);
+    let decision = evaluate_workflow_policy(
+        config.workflow.policy_mode,
+        3,
+        &signals,
+        &config.workflow.policy_thresholds,
+    );
+    record_workflow_policy(state, &decision);
+    decision
+}
+
+fn workflow_policy_signals(state: &Value, allocation_context: &Value) -> WorkflowPolicySignals {
+    let research = state.get("research_plan").unwrap_or(&Value::Null);
+    WorkflowPolicySignals {
+        confidence: research_confidence(research),
+        long_probability: research.get("long_probability").and_then(Value::as_f64),
+        volatility: max_allocation_volatility(allocation_context),
+        correlation: allocation_context
+            .get("correlation_60d")
+            .and_then(Value::as_f64),
+        position_size: None,
+        high_risk_flag: has_high_risk_flag(research),
+        trade_research_conflict: false,
+        high_impact_risk_constraint: false,
+        force_portfolio_review: false,
+    }
+}
+
+fn research_confidence(research: &Value) -> Option<f64> {
+    research
+        .get("confidence")
+        .and_then(Value::as_f64)
+        .or_else(|| {
+            let values = research
+                .get("per_ticker")
+                .and_then(Value::as_object)?
+                .values()
+                .filter_map(|item| item.get("confidence").and_then(Value::as_f64))
+                .collect::<Vec<_>>();
+            if values.is_empty() {
+                None
+            } else {
+                Some(values.iter().sum::<f64>() / values.len() as f64)
+            }
+        })
+}
+
+fn max_allocation_volatility(allocation_context: &Value) -> Option<f64> {
+    allocation_context
+        .get("per_ticker")
+        .and_then(Value::as_object)
+        .and_then(|items| {
+            items
+                .values()
+                .filter_map(|item| item.get("vol_pct").and_then(Value::as_f64))
+                .reduce(f64::max)
+        })
+}
+
+fn has_high_risk_flag(research: &Value) -> bool {
+    research
+        .get("high_risk_flag")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || research
+            .get("risk_flags")
+            .and_then(Value::as_array)
+            .is_some_and(|items| !items.is_empty())
+}
+
+fn is_selective_policy(config: &RuntimeConfig) -> bool {
+    config.workflow.policy_mode == WorkflowPolicyMode::Selective
+}
+
+fn should_run_llm_trader(policy: Option<&WorkflowPolicyDecision>, config: &RuntimeConfig) -> bool {
+    !is_selective_policy(config) || policy.is_none_or(|decision| decision.need_trader)
+}
+
+fn should_run_risk_review(policy: Option<&WorkflowPolicyDecision>, config: &RuntimeConfig) -> bool {
+    !is_selective_policy(config) || policy.is_none_or(|decision| decision.need_risk_review)
+}
+
+fn should_run_portfolio_review(
+    policy: Option<&WorkflowPolicyDecision>,
+    config: &RuntimeConfig,
+) -> bool {
+    !is_selective_policy(config) || policy.is_none_or(|decision| decision.need_portfolio_review)
+}
+
+fn start_phase_timer(phase: i64, label: &'static str) -> PhaseTimer {
+    PhaseTimer {
+        phase,
+        label,
+        started_at: Instant::now(),
+    }
+}
+
+fn record_phase_elapsed(state: &mut Value, timer: PhaseTimer) {
+    let elapsed_ms = timer.started_at.elapsed().as_millis() as u64;
+    if !state.get("phase_metrics").is_some_and(Value::is_array) {
+        state["phase_metrics"] = json!([]);
+    }
+    if let Some(items) = state["phase_metrics"].as_array_mut() {
+        items.push(json!({
+            "phase": timer.phase,
+            "label": timer.label,
+            "elapsed_ms": elapsed_ms,
+        }));
+    }
+    let total = state
+        .get("phase_metrics")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.get("elapsed_ms").and_then(Value::as_u64))
+                .sum::<u64>()
+        })
+        .unwrap_or(0);
+    if !state.get("workflow_metrics").is_some_and(Value::is_object) {
+        state["workflow_metrics"] = json!({});
+    }
+    state["workflow_metrics"]["phase_count"] = state
+        .get("phase_metrics")
+        .and_then(Value::as_array)
+        .map(|items| json!(items.len()))
+        .unwrap_or_else(|| json!(0));
+    state["workflow_metrics"]["total_phase_elapsed_ms"] = json!(total);
+}
+
+fn record_market_truth_check(state: &mut Value, downstream_name: &str, downstream: &Value) {
+    let Some(research_plan) = state.get("research_plan").cloned() else {
+        return;
+    };
+    let report = market_truth_violation_report(&research_plan, downstream_name, downstream);
+    if !state
+        .get("market_truth_checks")
+        .is_some_and(Value::is_array)
+    {
+        state["market_truth_checks"] = json!([]);
+    }
+    if let Some(items) = state["market_truth_checks"].as_array_mut() {
+        items.push(report.clone());
+    }
+
+    if report
+        .get("status")
+        .and_then(Value::as_str)
+        .is_some_and(|status| status == "violation")
+    {
+        if !state
+            .get("market_truth_violations")
+            .is_some_and(Value::is_array)
+        {
+            state["market_truth_violations"] = json!([]);
+        }
+        if let Some(items) = state["market_truth_violations"].as_array_mut() {
+            items.push(report);
+        }
+    }
+
+    let violation_count = state
+        .get("market_truth_violations")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.get("violation_count").and_then(Value::as_u64))
+                .sum::<u64>()
+        })
+        .unwrap_or(0);
+    let check_count = state
+        .get("market_truth_checks")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    if !state.get("workflow_metrics").is_some_and(Value::is_object) {
+        state["workflow_metrics"] = json!({});
+    }
+    state["workflow_metrics"]["market_truth_check_count"] = json!(check_count);
+    state["workflow_metrics"]["market_truth_violation_count"] = json!(violation_count);
+}
+
+fn enforce_phase3_market_truth(state: &Value, downstream: &mut Value) {
+    let Some(research) = state.get("research_plan") else {
+        return;
+    };
+    for (research_field, downstream_field, shadow_field) in [
+        ("rating", "rating", "llm_rating"),
+        ("plan", "investment_thesis", "llm_investment_thesis"),
+    ] {
+        let Some(authoritative) = research.get(research_field).cloned() else {
+            continue;
+        };
+        if let Some(existing) = downstream.get(downstream_field).cloned() {
+            if existing != authoritative {
+                downstream[shadow_field] = existing;
+            }
+        }
+        downstream[downstream_field] = authoritative;
+    }
+    strip_non_authoritative_market_truth_fields(downstream);
+}
+
+fn strip_downstream_market_truth_fields(downstream: &mut Value) {
+    let Some(object) = downstream.as_object_mut() else {
+        return;
+    };
+    for field in [
+        "rating",
+        "long_probability",
+        "short_probability",
+        "probability_rationale",
+        "plan",
+        "thesis",
+        "investment_thesis",
+        "market_thesis",
+    ] {
+        if let Some(value) = object.remove(field) {
+            object.insert(format!("llm_{field}"), value);
+        }
+    }
+}
+
+fn strip_non_authoritative_market_truth_fields(downstream: &mut Value) {
+    let Some(object) = downstream.as_object_mut() else {
+        return;
+    };
+    for field in [
+        "long_probability",
+        "short_probability",
+        "probability_rationale",
+        "plan",
+        "thesis",
+        "market_thesis",
+    ] {
+        if let Some(value) = object.remove(field) {
+            object.insert(format!("llm_{field}"), value);
+        }
+    }
+}
+
+fn sanitize_downstream_constraints(state: &mut Value, downstream_name: &str, artifact: &mut Value) {
+    record_market_truth_check(state, downstream_name, artifact);
+    strip_downstream_market_truth_fields(artifact);
 }
 
 fn resolve_run_dir(args: &ExecArgs, tickers: &[String], date: &str, config: &Value) -> PathBuf {
@@ -427,6 +798,7 @@ async fn run_phase1(
             ok = result.artifact.is_some(),
             "phase 1 role finished"
         );
+        record_role_job_metrics(state, &result);
         let artifact = role_artifact_or_degraded(state, config, result)?;
         persist_artifact(conn, state, 1, &role, artifact.clone())?;
         reports.insert(role.clone(), artifact);
@@ -519,11 +891,11 @@ async fn run_phase2(
         });
     }
 
-    let results: Vec<Result<(String, Vec<Value>, Value)>> =
-        futures::future::join_all(topic_futures).await;
+    let results: Vec<Result<TopicDebateResult>> = futures::future::join_all(topic_futures).await;
 
     for result in results {
-        let (topic_id, turns, topic_state) = result?;
+        let (topic_id, turns, topic_state, role_metrics) = result?;
+        merge_role_job_metrics(state, &role_metrics);
         // Merge turns into global state
         if let Some(turns_arr) = state["debate_turns"].as_array_mut() {
             turns_arr.extend(turns);
@@ -551,147 +923,99 @@ async fn run_one_topic_debate(
     reasoning_effort_override: Option<String>,
     max_debate_rounds: i64,
     config: &RuntimeConfig,
-) -> Result<(String, Vec<Value>, Value)> {
+) -> Result<TopicDebateResult> {
     let topic_id = topic_id_from_topic(&topic);
-    debug!(topic_id, "phase 2 topic debate starting (parallel)");
+    debug!(topic_id, "phase 2 steer-room topic debate starting");
 
     let model_override_ref = model_override.as_deref();
     let reasoning_effort_ref = reasoning_effort_override.as_deref();
-
-    // Initialize local mutable state for this topic
     let mut local_state = state.clone();
-    local_state["debate_turns"] = json!([]);
+    let sessions = steer_topic_sessions(&local_state, &topic_id);
     let initial_topic_state = json!({
-        "topic": topic,
+        "topic": topic.clone(),
+        "mode": "steer_room",
         "turns": [],
-        "controller_artifacts": []
+        "controller_artifacts": [],
+        "thread": sessions
     });
     upsert_topic_debate_state(&mut local_state, &topic_id, initial_topic_state);
-
     let mut turns = Vec::new();
 
-    // ── Round 1: bull_initial + bear_initial (sequential) ──
-    {
-        let mut bull_state = local_state.clone();
-        let mut bear_state = local_state.clone();
-
-        let bull_opening = run_topic_debate_step(
-            &mut conn,
-            &mut bull_state,
-            "researcher.bull.initial",
-            "analysis_initial",
-            1,
-            &topic_id,
-            model_override_ref,
-            reasoning_effort_ref,
-            config,
-            mode_prompt_path(
-                config.prompts.path_for("researcher.bull.initial").unwrap(),
-                state,
-            ),
-        )
-        .await?;
-
-        let bear_opening = run_topic_debate_step(
-            &mut conn,
-            &mut bear_state,
-            "researcher.bear.initial",
-            "analysis_initial",
-            1,
-            &topic_id,
-            model_override_ref,
-            reasoning_effort_ref,
-            config,
-            mode_prompt_path(
-                config.prompts.path_for("researcher.bear.initial").unwrap(),
-                state,
-            ),
-        )
-        .await?;
-
-        // Merge: bull's state is the base; add bear's turns and degradation
-        if let Some(src_turns) = bear_state
-            .get("topic_debate_states")
-            .and_then(|s| s.get(&*topic_id))
-            .and_then(|t| t.get("turns"))
-            .and_then(|t| t.as_array())
-        {
-            if !bull_state
-                .get("topic_debate_states")
-                .is_some_and(Value::is_object)
-            {
-                bull_state["topic_debate_states"] = json!({});
-            }
-            let entry = bull_state["topic_debate_states"]
-                .as_object_mut()
-                .unwrap()
-                .entry(topic_id.to_string())
-                .or_insert_with(|| {
-                    json!({
-                        "topic": {"topic_id": topic_id.clone(), "topic": topic_id.clone(), "tickers": []},
-                        "turns": [],
-                        "controller_artifacts": []
-                    })
-                });
-            if !entry.get("turns").is_some_and(Value::is_array) {
-                entry["turns"] = json!([]);
-            }
-            if let Some(tgt_turns) = entry["turns"].as_array_mut() {
-                tgt_turns.extend(src_turns.iter().cloned());
-            }
-        }
-        if let Some(src_degraded) = bear_state.get("degraded").and_then(|v| v.as_object()) {
-            if !bull_state.get("degraded").is_some_and(Value::is_object) {
-                bull_state["degraded"] = json!({});
-            }
-            if let Some(tgt_degraded) = bull_state["degraded"].as_object_mut() {
-                for (k, v) in src_degraded {
-                    tgt_degraded.insert(k.clone(), v.clone());
-                }
-            }
-        }
-        local_state = bull_state;
-        turns.push(bull_opening);
-        turns.push(bear_opening);
-    }
-
-    // Controllers after openings (sequential)
-    run_topic_controller(
+    let bull_seed = run_topic_steer_step(
         &mut conn,
         &mut local_state,
-        &topic_id,
-        "after_bull_opening",
+        "researcher.bull.initial",
+        "bull_seed",
         1,
+        &topic_id,
+        &sessions,
+        None,
         model_override_ref,
         reasoning_effort_ref,
         config,
+        mode_prompt_path(
+            config.prompts.path_for("researcher.bull.initial").unwrap(),
+            state,
+        ),
     )
     .await?;
-    run_topic_controller(
+    let bear_seed = run_topic_steer_step(
         &mut conn,
         &mut local_state,
-        &topic_id,
-        "after_bear_opening",
+        "researcher.bear.initial",
+        "bear_seed",
         1,
+        &topic_id,
+        &sessions,
+        None,
         model_override_ref,
         reasoning_effort_ref,
         config,
+        mode_prompt_path(
+            config.prompts.path_for("researcher.bear.initial").unwrap(),
+            state,
+        ),
     )
     .await?;
+    turns.push(bull_seed.clone());
+    turns.push(bear_seed.clone());
 
-    // ── Rounds 2+ (sequential) ──
-    for round in 2..=max_debate_rounds {
-        debug!(
-            topic_id,
-            round, "phase 2 debate round starting (parallel topic)"
-        );
-        let bull_rebuttal = run_topic_debate_step(
+    let mut mediator_output = run_topic_steer_step(
+        &mut conn,
+        &mut local_state,
+        "mediator.topic_controller",
+        "controller_packet",
+        1,
+        &topic_id,
+        &sessions,
+        Some(steer_payload(
+            "seed_claims",
+            &json!({"bull_seed": bull_seed, "bear_seed": bear_seed}),
+        )),
+        model_override_ref,
+        reasoning_effort_ref,
+        config,
+        config
+            .prompts
+            .path_for("mediator.topic_controller")
+            .unwrap()
+            .clone(),
+    )
+    .await?;
+    turns.push(mediator_output.clone());
+
+    for round in 2..=max_debate_rounds.max(2) {
+        let bull_steer = steer_for_role(&mediator_output, "bull")
+            .unwrap_or_else(|| steer_payload("respond_to_mediator", &mediator_output));
+        let bull_rebuttal = run_topic_steer_step(
             &mut conn,
             &mut local_state,
             "researcher.bull.interaction",
-            "interaction_research",
+            "bull_packet",
             round,
             &topic_id,
+            &sessions,
+            Some(bull_steer),
             model_override_ref,
             reasoning_effort_ref,
             config,
@@ -702,26 +1026,17 @@ async fn run_one_topic_debate(
                 .clone(),
         )
         .await?;
-        turns.push(bull_rebuttal);
-        run_topic_controller(
-            &mut conn,
-            &mut local_state,
-            &topic_id,
-            "after_bull_rebuttal",
-            round,
-            model_override_ref,
-            reasoning_effort_ref,
-            config,
-        )
-        .await?;
-
-        let bear_rebuttal = run_topic_debate_step(
+        let bear_steer = steer_for_role(&mediator_output, "bear")
+            .unwrap_or_else(|| steer_payload("respond_to_mediator", &mediator_output));
+        let bear_rebuttal = run_topic_steer_step(
             &mut conn,
             &mut local_state,
             "researcher.bear.interaction",
-            "interaction_research",
+            "bear_packet",
             round,
             &topic_id,
+            &sessions,
+            Some(bear_steer),
             model_override_ref,
             reasoning_effort_ref,
             config,
@@ -732,18 +1047,35 @@ async fn run_one_topic_debate(
                 .clone(),
         )
         .await?;
-        turns.push(bear_rebuttal);
-        run_topic_controller(
+        mediator_output = run_topic_steer_step(
             &mut conn,
             &mut local_state,
-            &topic_id,
-            "after_bear_rebuttal",
+            "mediator.topic_controller",
+            if round == max_debate_rounds.max(2) {
+                "topic_summary_final"
+            } else {
+                "controller_packet"
+            },
             round,
+            &topic_id,
+            &sessions,
+            Some(steer_payload(
+                "debater_packets",
+                &json!({"bull_packet": bull_rebuttal, "bear_packet": bear_rebuttal}),
+            )),
             model_override_ref,
             reasoning_effort_ref,
             config,
+            config
+                .prompts
+                .path_for("mediator.topic_controller")
+                .unwrap()
+                .clone(),
         )
         .await?;
+        turns.push(bull_rebuttal);
+        turns.push(bear_rebuttal);
+        turns.push(mediator_output.clone());
     }
 
     let turn_count = turns.len();
@@ -758,7 +1090,145 @@ async fn run_one_topic_debate(
         .cloned()
         .unwrap_or_else(|| json!({}));
 
-    Ok((topic_id, turns, topic_state))
+    Ok((
+        topic_id,
+        turns,
+        topic_state,
+        local_state
+            .get("role_job_metrics")
+            .cloned()
+            .unwrap_or_else(|| json!([])),
+    ))
+}
+
+fn steer_topic_sessions(state: &Value, topic_id: &str) -> Value {
+    let run_id = state.get("run_id").and_then(Value::as_str).unwrap_or("run");
+    json!({
+        "bull": {
+            "session_id": format!("{run_id}:phase2:{topic_id}:bull"),
+            "turn_id": format!("turn-{topic_id}-bull")
+        },
+        "bear": {
+            "session_id": format!("{run_id}:phase2:{topic_id}:bear"),
+            "turn_id": format!("turn-{topic_id}-bear")
+        },
+        "mediator": {
+            "session_id": format!("{run_id}:phase2:{topic_id}:mediator"),
+            "turn_id": format!("turn-{topic_id}-mediator")
+        }
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_topic_steer_step(
+    conn: &mut rusqlite::Connection,
+    state: &mut Value,
+    role: &str,
+    kind: &str,
+    round: i64,
+    topic_id: &str,
+    sessions: &Value,
+    steer: Option<String>,
+    model_override: Option<&str>,
+    reasoning_effort_override: Option<&str>,
+    config: &RuntimeConfig,
+    prompt_path: PathBuf,
+) -> Result<Value> {
+    let session_key = if role.contains("bull") {
+        "bull"
+    } else if role.contains("bear") {
+        "bear"
+    } else {
+        "mediator"
+    };
+    let session = sessions
+        .get(session_key)
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let artifact = run_single_steer_role_job(
+        SteerRoleRun {
+            state: state.clone(),
+            role,
+            phase: if role == "mediator.topic_controller" {
+                PHASE2_REDUCER
+            } else {
+                2
+            },
+            kind,
+            round: Some(round),
+            topic_id: Some(topic_id),
+            mock: is_mock(state),
+            model_override,
+            reasoning_effort_override,
+            config,
+            prompt_path: Some(prompt_path.as_path()),
+            session_id: session
+                .get("session_id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            turn_id: session
+                .get("turn_id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            steer,
+        },
+        if role == "mediator.topic_controller" {
+            config.workflow.reducer_timeout_sec
+        } else {
+            config.workflow.agent_timeout_sec
+        },
+        config,
+        state,
+    )
+    .await?;
+    persist_message_with_topic(
+        conn,
+        state,
+        if role == "mediator.topic_controller" {
+            PHASE2_REDUCER
+        } else {
+            2
+        },
+        role,
+        kind,
+        Some(round),
+        Some(topic_id),
+        artifact.clone(),
+    )?;
+    let turn = json!({
+        "role": role,
+        "phase": if role == "mediator.topic_controller" { PHASE2_REDUCER } else { 2 },
+        "kind": kind,
+        "round": round,
+        "topic_id": topic_id,
+        "artifact": artifact,
+        "session": session
+    });
+    append_topic_turn(state, topic_id, turn.clone());
+    if role == "mediator.topic_controller" {
+        set_topic_controller_state(state, topic_id, turn["artifact"].clone());
+        append_topic_controller_artifact(state, topic_id, turn["artifact"].clone());
+    }
+    Ok(turn)
+}
+
+fn steer_payload(kind: &str, value: &Value) -> String {
+    json!({"kind": kind, "payload": value}).to_string()
+}
+
+fn steer_for_role(controller_turn: &Value, side: &str) -> Option<String> {
+    let artifact = controller_turn.get("artifact").unwrap_or(controller_turn);
+    let keys = match side {
+        "bull" => ["bull", "researcher.bull.interaction", "to_bull"],
+        _ => ["bear", "researcher.bear.interaction", "to_bear"],
+    };
+    artifact
+        .get("next_steers")
+        .and_then(Value::as_object)
+        .and_then(|object| keys.iter().find_map(|key| object.get(*key).cloned()))
+        .map(|value| steer_payload("mediator_instruction", &value))
 }
 
 async fn run_phase2_topic_generation(
@@ -812,113 +1282,6 @@ async fn run_phase2_topic_generation(
         artifact,
     )?;
     Ok(topics)
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn run_topic_debate_step(
-    conn: &mut rusqlite::Connection,
-    state: &mut Value,
-    role: &str,
-    kind: &str,
-    round: i64,
-    topic_id: &str,
-    model_override: Option<&str>,
-    reasoning_effort_override: Option<&str>,
-    config: &RuntimeConfig,
-    prompt_path: PathBuf,
-) -> Result<Value> {
-    let mock = is_mock(state);
-    let artifact = run_single_role_job(
-        RoleRun {
-            state: state.clone(),
-            role,
-            phase: 2,
-            kind,
-            round: Some(round),
-            topic_id: Some(topic_id),
-            mock,
-            model_override,
-            reasoning_effort_override,
-            config,
-            prompt_path: Some(prompt_path.as_path()),
-        },
-        config.workflow.agent_timeout_sec,
-        config,
-        state,
-    )
-    .await?;
-    persist_message_with_topic(
-        conn,
-        state,
-        2,
-        role,
-        kind,
-        Some(round),
-        Some(topic_id),
-        artifact.clone(),
-    )?;
-    let turn = json!({
-        "role": role,
-        "phase": 2,
-        "kind": kind,
-        "round": round,
-        "topic_id": topic_id,
-        "artifact": artifact
-    });
-    append_topic_turn(state, topic_id, turn.clone());
-    Ok(turn)
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn run_topic_controller(
-    conn: &mut rusqlite::Connection,
-    state: &mut Value,
-    topic_id: &str,
-    checkpoint: &str,
-    round: i64,
-    model_override: Option<&str>,
-    reasoning_effort_override: Option<&str>,
-    config: &RuntimeConfig,
-) -> Result<()> {
-    let mock = is_mock(state);
-    let base = build_topic_controller_artifact(state, topic_id, checkpoint, round, config);
-    set_topic_controller_state(state, topic_id, base.clone());
-    let output = run_single_role_job(
-        RoleRun {
-            state: state.clone(),
-            role: "mediator.topic_controller",
-            phase: PHASE2_REDUCER,
-            kind: checkpoint,
-            round: Some(round),
-            topic_id: Some(topic_id),
-            mock,
-            model_override,
-            reasoning_effort_override,
-            config,
-            prompt_path: config
-                .prompts
-                .path_for("mediator.topic_controller")
-                .map(|p| p.as_path()),
-        },
-        config.workflow.reducer_timeout_sec,
-        config,
-        state,
-    )
-    .await?;
-    let artifact = merge_reducer_output(base, output);
-    set_topic_controller_state(state, topic_id, artifact.clone());
-    append_topic_controller_artifact(state, topic_id, artifact.clone());
-    persist_message_with_topic(
-        conn,
-        state,
-        25,
-        "mediator.topic_controller",
-        checkpoint,
-        Some(round),
-        Some(topic_id),
-        artifact,
-    )?;
-    Ok(())
 }
 
 async fn run_phase1_reducer(
@@ -1010,6 +1373,234 @@ async fn run_phase3(
     persist_artifact(conn, state, 3, "manager.research", artifact.clone())?;
     state["research_plan"] = artifact;
     debug!("manager research role completed");
+    Ok(())
+}
+
+async fn run_phase4(
+    conn: &mut rusqlite::Connection,
+    state: &mut Value,
+    model_override: Option<&str>,
+    reasoning_effort_override: Option<&str>,
+    config: &RuntimeConfig,
+) -> Result<()> {
+    let mut artifact = run_single_role_job(
+        RoleRun {
+            state: state.clone(),
+            role: "trader",
+            phase: 4,
+            kind: "artifact",
+            round: None,
+            topic_id: None,
+            mock: is_mock(state),
+            model_override,
+            reasoning_effort_override,
+            config,
+            prompt_path: Some(config.prompts.trader.as_path()),
+        },
+        config.workflow.agent_timeout_sec,
+        config,
+        state,
+    )
+    .await?;
+    sanitize_downstream_constraints(state, "trader_investment_plan", &mut artifact);
+    persist_artifact(conn, state, 4, "trader", artifact.clone())?;
+    state["trader_investment_plan"] = artifact;
+    Ok(())
+}
+
+fn run_phase4_rust_rule(conn: &mut rusqlite::Connection, state: &mut Value) -> Result<()> {
+    let mut artifact =
+        research_plan_to_trade_intent(state.get("research_plan").unwrap_or(&Value::Null));
+    artifact["id"] = json!("trader");
+    artifact["role"] = json!("trader");
+    artifact["phase"] = json!(4);
+    artifact["kind"] = json!("artifact");
+    artifact["status"] = json!("derived");
+    artifact["derived_from"] = json!("research_plan");
+    sanitize_downstream_constraints(state, "trader_investment_plan", &mut artifact);
+    persist_artifact(conn, state, 4, "trader", artifact.clone())?;
+    state["trader_investment_plan"] = artifact;
+    Ok(())
+}
+
+async fn run_phase5(
+    conn: &mut rusqlite::Connection,
+    state: &mut Value,
+    model_override: Option<&str>,
+    reasoning_effort_override: Option<&str>,
+    config: &RuntimeConfig,
+) -> Result<()> {
+    state["risk_debate_state"] = json!({"history": []});
+    for round in 1..=config.workflow.risk_rounds {
+        for (role, prompt_path) in [
+            ("risk.aggressive", config.prompts.risk_aggressive.as_path()),
+            (
+                "risk.conservative",
+                config.prompts.risk_conservative.as_path(),
+            ),
+            ("risk.neutral", config.prompts.risk_neutral.as_path()),
+        ] {
+            let mut artifact = run_single_role_job(
+                RoleRun {
+                    state: state.clone(),
+                    role,
+                    phase: 5,
+                    kind: "risk_argument",
+                    round: Some(round),
+                    topic_id: None,
+                    mock: is_mock(state),
+                    model_override,
+                    reasoning_effort_override,
+                    config,
+                    prompt_path: Some(prompt_path),
+                },
+                config.workflow.agent_timeout_sec,
+                config,
+                state,
+            )
+            .await?;
+            sanitize_downstream_constraints(state, role, &mut artifact);
+            let turn = json!({
+                "role": role,
+                "phase": 5,
+                "kind": "risk_argument",
+                "round": round,
+                "artifact": artifact
+            });
+            if let Some(history) = state["risk_debate_state"]["history"].as_array_mut() {
+                history.push(turn.clone());
+            }
+            persist_message(conn, state, 5, role, "risk_argument", Some(round), turn)?;
+        }
+    }
+    Ok(())
+}
+
+fn run_phase5_skipped(conn: &mut rusqlite::Connection, state: &mut Value) -> Result<()> {
+    let mut artifact = json!({
+        "id": "risk.review",
+        "role": "risk.review",
+        "phase": 5,
+        "kind": "risk_review",
+        "status": "skipped",
+        "history": [],
+        "reason": "workflow_policy_not_triggered",
+        "constraints": [],
+    });
+    sanitize_downstream_constraints(state, "risk.review", &mut artifact);
+    persist_message(
+        conn,
+        state,
+        5,
+        "risk.review",
+        "skipped",
+        None,
+        artifact.clone(),
+    )?;
+    state["risk_debate_state"] = artifact;
+    Ok(())
+}
+
+async fn run_phase6(
+    conn: &mut rusqlite::Connection,
+    state: &mut Value,
+    model_override: Option<&str>,
+    reasoning_effort_override: Option<&str>,
+    config: &RuntimeConfig,
+) -> Result<()> {
+    let mut artifact = run_single_role_job(
+        RoleRun {
+            state: state.clone(),
+            role: "portfolio.manager",
+            phase: 6,
+            kind: "artifact",
+            round: None,
+            topic_id: None,
+            mock: is_mock(state),
+            model_override,
+            reasoning_effort_override,
+            config,
+            prompt_path: Some(config.prompts.portfolio_manager.as_path()),
+        },
+        config.workflow.agent_timeout_sec,
+        config,
+        state,
+    )
+    .await?;
+    record_market_truth_check(state, "final_trade_decision", &artifact);
+    enforce_phase3_market_truth(state, &mut artifact);
+    persist_artifact(conn, state, 6, "portfolio.manager", artifact.clone())?;
+    state["final_trade_decision"] = artifact;
+    Ok(())
+}
+
+fn run_phase6_derived(conn: &mut rusqlite::Connection, state: &mut Value) -> Result<()> {
+    let research = state.get("research_plan").unwrap_or(&Value::Null);
+    let trader = state.get("trader_investment_plan").unwrap_or(&Value::Null);
+    let artifact = json!({
+        "id": "portfolio.manager",
+        "role": "portfolio.manager",
+        "phase": 6,
+        "kind": "artifact",
+        "status": "derived",
+        "derived_from": ["research_plan", "trader_investment_plan", "workflow_policy"],
+        "rating": research.get("rating").cloned().unwrap_or_else(|| json!("Hold")),
+        "execution_summary": "Portfolio review skipped by workflow policy; Phase 3 market view remains authoritative.",
+        "investment_thesis": research.get("plan").cloned().unwrap_or_else(|| json!("")),
+        "target_price": Value::Null,
+        "horizon": "Use the Phase 3 research horizon.",
+        "risk_controls": [],
+        "rationale": format!(
+            "Derived validation preserved Phase 3 rating and used trader action {} without recalculating probability or thesis.",
+            trader.get("action").and_then(Value::as_str).unwrap_or("Hold")
+        )
+    });
+    let mut artifact = artifact;
+    record_market_truth_check(state, "final_trade_decision", &artifact);
+    enforce_phase3_market_truth(state, &mut artifact);
+    persist_artifact(conn, state, 6, "portfolio.manager", artifact.clone())?;
+    state["final_trade_decision"] = artifact;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_phase7(
+    conn: &mut rusqlite::Connection,
+    state: &mut Value,
+    model_override: Option<&str>,
+    reasoning_effort_override: Option<&str>,
+    config: &RuntimeConfig,
+) -> Result<()> {
+    let mock = is_mock(state);
+    debug!("allocation context computation starting");
+    let context = compute_allocation_context(state, conn, &config.allocation);
+    state["allocation_context"] = context.clone();
+    debug!(vix_regime = ?context.get("vix").and_then(|v| v.get("regime")), "allocation context ready");
+
+    let raw_artifact = run_single_role_job(
+        RoleRun {
+            state: state.clone(),
+            role: "allocation.manager",
+            phase: 7,
+            kind: "artifact",
+            round: None,
+            topic_id: None,
+            mock,
+            model_override,
+            reasoning_effort_override,
+            config,
+            prompt_path: Some(config.prompts.allocation_manager.as_path()),
+        },
+        config.workflow.agent_timeout_sec,
+        config,
+        state,
+    )
+    .await?;
+    let mut allocation = normalize_allocation(&raw_artifact, &context, &config.allocation);
+    sanitize_downstream_constraints(state, "portfolio_allocation", &mut allocation);
+    persist_artifact(conn, state, 7, "allocation.manager", allocation.clone())?;
+    state["portfolio_allocation"] = allocation;
+    debug!("allocation manager role completed");
     Ok(())
 }
 
@@ -1445,6 +2036,79 @@ mod tests {
                 "analyst.x"
             ]
         );
+    }
+
+    #[test]
+    fn phase3_market_truth_overrides_portfolio_market_fields() {
+        let state = json!({
+            "research_plan": {
+                "rating": "Buy",
+                "long_probability": 0.68,
+                "short_probability": 0.32,
+                "plan": "Phase 3 authoritative thesis."
+            }
+        });
+        let mut downstream = json!({
+            "rating": "Sell",
+            "long_probability": 0.41,
+            "investment_thesis": "Downstream rewritten thesis.",
+            "execution_summary": "Reduce execution strength."
+        });
+
+        enforce_phase3_market_truth(&state, &mut downstream);
+
+        assert_eq!(downstream["rating"], "Buy");
+        assert_eq!(
+            downstream["investment_thesis"],
+            "Phase 3 authoritative thesis."
+        );
+        assert_eq!(downstream["llm_rating"], "Sell");
+        assert_eq!(
+            downstream["llm_investment_thesis"],
+            "Downstream rewritten thesis."
+        );
+        assert!(downstream.get("long_probability").is_none());
+        assert_eq!(downstream["llm_long_probability"], 0.41);
+        assert_eq!(
+            downstream["execution_summary"],
+            "Reduce execution strength."
+        );
+    }
+
+    #[test]
+    fn downstream_constraints_strip_market_truth_fields() {
+        let mut downstream = json!({
+            "rating": "Sell",
+            "long_probability": 0.41,
+            "short_probability": 0.59,
+            "probability_rationale": "Downstream probability rewrite.",
+            "investment_thesis": "Downstream thesis rewrite.",
+            "action": "Hold",
+            "position_size": "0%"
+        });
+
+        strip_downstream_market_truth_fields(&mut downstream);
+
+        for field in [
+            "rating",
+            "long_probability",
+            "short_probability",
+            "probability_rationale",
+            "investment_thesis",
+        ] {
+            assert!(
+                downstream.get(field).is_none(),
+                "{field} should be stripped"
+            );
+        }
+        assert_eq!(downstream["llm_rating"], "Sell");
+        assert_eq!(downstream["llm_long_probability"], 0.41);
+        assert_eq!(
+            downstream["llm_investment_thesis"],
+            "Downstream thesis rewrite."
+        );
+        assert_eq!(downstream["action"], "Hold");
+        assert_eq!(downstream["position_size"], "0%");
     }
 
     #[test]

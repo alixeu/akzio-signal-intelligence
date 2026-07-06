@@ -1401,6 +1401,7 @@ dependencies = [
  "orchestrator-report",
  "orchestrator-sql",
  "orchestrator-workflow",
+ "reqwest 0.12.28",
  "rusqlite",
  "serde",
  "serde_json",

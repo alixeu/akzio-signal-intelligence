@@ -31,7 +31,56 @@ pub fn load_config(path: Option<&Path>) -> Result<Value> {
         .with_context(|| format!("failed to read config file {}", path.display()))?;
     let yaml: serde_yaml::Value = serde_yaml::from_str(&text)
         .with_context(|| format!("failed to parse YAML config {}", path.display()))?;
-    serde_json::to_value(yaml).context("failed to convert YAML config to JSON value")
+    let mut value =
+        serde_json::to_value(yaml).context("failed to convert YAML config to JSON value")?;
+    expand_env_placeholders(&mut value);
+    Ok(value)
+}
+
+/// Recursively expand `${VAR}` and `${VAR:-default}` placeholders in string
+/// config values using process environment variables. This keeps secrets
+/// (API keys, SMTP passwords, provider tokens) out of the committed config
+/// file: the YAML references an env var, the value is injected at load time.
+/// An unset variable with no default expands to an empty string.
+pub fn expand_env_placeholders(value: &mut Value) {
+    match value {
+        Value::String(text) => {
+            if text.contains("${") {
+                *text = expand_env_str(text);
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(expand_env_placeholders),
+        Value::Object(map) => map.values_mut().for_each(expand_env_placeholders),
+        _ => {}
+    }
+}
+
+fn expand_env_str(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        if let Some(end) = after.find('}') {
+            let token = &after[..end];
+            let (name, default) = match token.split_once(":-") {
+                Some((name, default)) => (name.trim(), Some(default)),
+                None => (token.trim(), None),
+            };
+            let resolved = std::env::var(name)
+                .ok()
+                .or_else(|| default.map(ToString::to_string))
+                .unwrap_or_default();
+            out.push_str(&resolved);
+            rest = &after[end + 1..];
+        } else {
+            // No closing brace; emit the remainder verbatim.
+            out.push_str(&rest[start..]);
+            rest = "";
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 pub fn config_get<'a>(config: &'a Value, path: &str) -> Option<&'a Value> {
@@ -106,4 +155,56 @@ pub fn config_bool(config: &Value, path: &str, default: bool) -> bool {
             _ => None,
         })
         .unwrap_or(default)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn expands_plain_var() {
+        std::env::set_var("AKZIO_TEST_KEY", "secret-123");
+        let mut value = json!({"api_key": "${AKZIO_TEST_KEY}"});
+        expand_env_placeholders(&mut value);
+        assert_eq!(value["api_key"], json!("secret-123"));
+        std::env::remove_var("AKZIO_TEST_KEY");
+    }
+
+    #[test]
+    fn uses_default_when_unset() {
+        std::env::remove_var("AKZIO_TEST_MISSING");
+        let mut value = json!({"url": "${AKZIO_TEST_MISSING:-https://fallback}"});
+        expand_env_placeholders(&mut value);
+        assert_eq!(value["url"], json!("https://fallback"));
+    }
+
+    #[test]
+    fn unset_without_default_becomes_empty() {
+        std::env::remove_var("AKZIO_TEST_MISSING2");
+        let mut value = json!({"api_key": "${AKZIO_TEST_MISSING2}"});
+        expand_env_placeholders(&mut value);
+        assert_eq!(value["api_key"], json!(""));
+    }
+
+    #[test]
+    fn expands_nested_and_arrays() {
+        std::env::set_var("AKZIO_TEST_NESTED", "v");
+        let mut value = json!({
+            "a": {"b": "${AKZIO_TEST_NESTED}"},
+            "list": ["${AKZIO_TEST_NESTED}", "literal"]
+        });
+        expand_env_placeholders(&mut value);
+        assert_eq!(value["a"]["b"], json!("v"));
+        assert_eq!(value["list"][0], json!("v"));
+        assert_eq!(value["list"][1], json!("literal"));
+        std::env::remove_var("AKZIO_TEST_NESTED");
+    }
+
+    #[test]
+    fn leaves_plain_strings_untouched() {
+        let mut value = json!({"model": "gpt-5.5"});
+        expand_env_placeholders(&mut value);
+        assert_eq!(value["model"], json!("gpt-5.5"));
+    }
 }

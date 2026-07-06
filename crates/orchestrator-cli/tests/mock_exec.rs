@@ -59,6 +59,8 @@ async fn mock_exec_writes_state_and_final_summary() {
             "analyst.x"
         ])
     );
+    assert_role_metrics_ok(&state);
+    assert_phase_metrics_ok(&state, 3);
 
     let conn = rusqlite::Connection::open(db_path).unwrap();
     let summary_comma_rows: i64 = conn
@@ -93,6 +95,185 @@ async fn mock_exec_can_stop_after_phase1() {
     assert_eq!(state["phase_status"]["1"], "done");
     assert!(state["phase_status"].get("2").is_none());
     assert!(state["phase_status"].get("3").is_none());
+    assert_contracts_ok(&state);
+    assert_phase_metrics_ok(&state, 1);
+}
+
+#[tokio::test]
+async fn mock_exec_phase7_writes_portfolio_allocation() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = write_test_config(temp.path());
+    let run_dir = temp.path().join("phase7-run");
+    let db_path = temp.path().join("phase7.sqlite");
+    let mut args = test_args(
+        "QQQ,SOXX,VIX",
+        Some(db_path),
+        Some(run_dir.clone()),
+        Some(config_path),
+        true,
+    );
+    args.to_phase = 7;
+
+    let result = exec::run(args).await.unwrap();
+
+    assert_eq!(result["vix_regime"], "normal");
+    assert_eq!(result["action"], "Hold");
+    assert_eq!(result["final_trade_decision"]["rating"], "Hold");
+    assert_eq!(
+        result["portfolio_allocation"]["weights"]["QQQ"]["weight"],
+        0.3
+    );
+    assert_eq!(
+        result["portfolio_allocation"]["weights"]["SOXX"]["weight"],
+        0.3
+    );
+    assert!(result["portfolio_allocation"]["weights"]
+        .get("VIX")
+        .is_none());
+
+    let state: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(run_dir.join("state.json")).unwrap()).unwrap();
+    assert_eq!(state["phase_status"]["4"], "done");
+    assert_eq!(state["phase_status"]["5"], "done");
+    assert_eq!(state["phase_status"]["6"], "done");
+    assert_eq!(state["phase_status"]["7"], "done");
+    assert_eq!(state["trader_investment_plan"]["action"], "Hold");
+    assert_eq!(
+        state["risk_debate_state"]["history"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    assert_eq!(state["portfolio_allocation"]["total_equity_exposure"], 0.6);
+    assert_market_truth_ok(&state);
+    assert_contracts_ok(&state);
+    assert_role_metrics_ok(&state);
+    assert_phase_metrics_ok(&state, 7);
+    assert!(fs::read_to_string(run_dir.join("final_summary.md"))
+        .unwrap()
+        .contains("Portfolio Allocation"));
+}
+
+#[tokio::test]
+async fn selective_policy_derives_trader_runs_triggered_risk_and_allocates() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = write_test_config(temp.path());
+    let mut config: serde_json::Value =
+        serde_yaml::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+    config["orchestrator"]["workflow"]["policy"]["mode"] =
+        serde_json::Value::String("selective".to_string());
+    fs::write(&config_path, serde_yaml::to_string(&config).unwrap()).unwrap();
+    let run_dir = temp.path().join("selective-run");
+    let db_path = temp.path().join("selective.sqlite");
+    let mut args = test_args(
+        "QQQ,SOXX,VIX",
+        Some(db_path),
+        Some(run_dir.clone()),
+        Some(config_path),
+        true,
+    );
+    args.to_phase = 7;
+
+    let result = exec::run(args).await.unwrap();
+
+    let state: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(run_dir.join("state.json")).unwrap()).unwrap();
+    assert_eq!(state["workflow_policy"]["mode"], "selective");
+    assert_eq!(
+        state["workflow_policy"]["skipped_phases"],
+        serde_json::json!(["trader", "portfolio_review"])
+    );
+    assert_eq!(state["workflow_metrics"]["policy_mode"], "selective");
+    assert_eq!(
+        state["workflow_metrics"]["skipped_phases"],
+        serde_json::json!(["trader", "portfolio_review"])
+    );
+    assert_eq!(state["trader_investment_plan"]["status"], "derived");
+    assert_eq!(
+        state["trader_investment_plan"]["method"],
+        "conservative_research_plan_mapping"
+    );
+    assert_eq!(
+        state["risk_debate_state"]["history"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    assert_eq!(state["final_trade_decision"]["status"], "derived");
+    assert_eq!(
+        state["portfolio_allocation"]["weights"]["QQQ"]["weight"],
+        0.3
+    );
+    assert_eq!(
+        state["portfolio_allocation"]["weights"]["SOXX"]["weight"],
+        0.3
+    );
+    assert_eq!(
+        result["long_probability"],
+        state["research_plan"]["long_probability"]
+    );
+    assert_eq!(
+        result["short_probability"],
+        state["research_plan"]["short_probability"]
+    );
+    assert_eq!(result["portfolio_allocation"]["total_equity_exposure"], 0.6);
+    assert_market_truth_ok(&state);
+    assert_contracts_ok(&state);
+    assert_role_metrics_ok(&state);
+    assert_phase_metrics_ok(&state, 7);
+    assert!(state["role_job_metrics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|item| item["role"] != "trader" && item["role"] != "portfolio.manager"));
+}
+
+#[tokio::test]
+async fn legacy_policy_runs_all_optional_phases_and_allocates() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = write_test_config(temp.path());
+    let mut config: serde_json::Value =
+        serde_yaml::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+    config["orchestrator"]["workflow"]["policy"]["mode"] =
+        serde_json::Value::String("legacy".to_string());
+    fs::write(&config_path, serde_yaml::to_string(&config).unwrap()).unwrap();
+    let run_dir = temp.path().join("legacy-run");
+    let db_path = temp.path().join("legacy.sqlite");
+    let mut args = test_args(
+        "QQQ,SOXX,VIX",
+        Some(db_path),
+        Some(run_dir.clone()),
+        Some(config_path),
+        true,
+    );
+    args.to_phase = 7;
+
+    let result = exec::run(args).await.unwrap();
+
+    let state: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(run_dir.join("state.json")).unwrap()).unwrap();
+    assert_eq!(state["workflow_policy"]["mode"], "legacy");
+    assert_eq!(
+        state["workflow_policy"]["skipped_phases"],
+        serde_json::json!([])
+    );
+    assert_eq!(state["workflow_metrics"]["policy_mode"], "legacy");
+    assert_eq!(
+        state["trader_investment_plan"]["status"],
+        serde_json::Value::Null
+    );
+    assert!(!state["risk_debate_state"]["history"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        state["final_trade_decision"]["status"],
+        serde_json::Value::Null
+    );
+    assert_eq!(result["portfolio_allocation"]["total_equity_exposure"], 0.6);
+    assert_contracts_ok(&state);
 }
 
 #[tokio::test]
@@ -325,19 +506,19 @@ async fn mock_phase2_writes_initial_and_interaction_turns() {
     assert!(rows.contains(&("mediator.topic".to_string(), "topic_final".to_string())));
     assert!(rows.contains(&(
         "researcher.bull.initial".to_string(),
-        "analysis_initial".to_string(),
+        "bull_seed".to_string(),
     )));
     assert!(rows.contains(&(
         "researcher.bull.interaction".to_string(),
-        "interaction_research".to_string(),
+        "bull_packet".to_string(),
     )));
     assert!(rows.contains(&(
         "researcher.bear.initial".to_string(),
-        "analysis_initial".to_string(),
+        "bear_seed".to_string(),
     )));
     assert!(rows.contains(&(
         "researcher.bear.interaction".to_string(),
-        "interaction_research".to_string(),
+        "bear_packet".to_string(),
     )));
 
     let controller_count: i64 = conn
@@ -347,7 +528,7 @@ async fn mock_phase2_writes_initial_and_interaction_turns() {
             |row| row.get(0),
         )
         .unwrap();
-    assert!(controller_count >= 4);
+    assert!(controller_count >= 2);
 }
 
 #[tokio::test]
@@ -399,6 +580,63 @@ async fn mock_exec_writes_reducer_turn_summaries() {
         })
         .unwrap();
     assert_eq!(turn_item_rows, 0);
+}
+
+fn assert_market_truth_ok(state: &serde_json::Value) {
+    assert_eq!(
+        state
+            .get("market_truth_violations")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([])),
+        serde_json::json!([])
+    );
+    let checks = state["market_truth_checks"].as_array().unwrap();
+    assert_eq!(checks.len(), 6);
+    assert!(checks.iter().all(|check| check["status"] == "ok"));
+    assert_eq!(state["workflow_metrics"]["market_truth_check_count"], 6);
+    assert_eq!(state["workflow_metrics"]["market_truth_violation_count"], 0);
+}
+
+fn assert_contracts_ok(state: &serde_json::Value) {
+    assert_eq!(state["workflow_contracts"].as_array().unwrap().len(), 9);
+    assert_eq!(state["contract_violations"], serde_json::json!([]));
+    assert_downstream_contract_schemas_ok(state);
+}
+
+fn assert_downstream_contract_schemas_ok(state: &serde_json::Value) {
+    let contracts = state["workflow_contracts"].as_array().unwrap();
+    for (phase, name, state_field) in [
+        (4, "TradeIntent", "trader_investment_plan"),
+        (5, "RiskConstraints", "risk_debate_state"),
+        (6, "FinalValidation", "final_trade_decision"),
+        (7, "PortfolioAllocation", "portfolio_allocation"),
+    ] {
+        let contract = contracts
+            .iter()
+            .find(|item| item["phase"] == phase)
+            .unwrap();
+        assert_eq!(contract["name"], name);
+        assert_eq!(contract["state_field"], state_field);
+        assert!(contract["schema"].as_str().unwrap().contains("properties"));
+    }
+}
+
+fn assert_role_metrics_ok(state: &serde_json::Value) {
+    let jobs = state["role_job_metrics"].as_array().unwrap();
+    assert!(!jobs.is_empty());
+    assert_eq!(state["workflow_metrics"]["role_job_count"], jobs.len());
+    assert_eq!(state["workflow_metrics"]["llm_call_count"], jobs.len());
+    assert_eq!(state["workflow_metrics"]["timed_out_role_count"], 0);
+    assert!(jobs.iter().all(|job| job["status"] == "ok"));
+}
+
+fn assert_phase_metrics_ok(state: &serde_json::Value, expected_count: usize) {
+    let phases = state["phase_metrics"].as_array().unwrap();
+    assert_eq!(phases.len(), expected_count);
+    assert_eq!(state["workflow_metrics"]["phase_count"], expected_count);
+    assert!(phases
+        .iter()
+        .all(|phase| phase["elapsed_ms"].as_u64().is_some()));
 }
 
 fn test_args(
@@ -458,6 +696,12 @@ fn write_test_config(root: &std::path::Path) -> PathBuf {
         "topic_generation.md",
         "topic_controller.md",
         "manager.md",
+        "trader.md",
+        "risk_aggressive.md",
+        "risk_conservative.md",
+        "risk_neutral.md",
+        "portfolio_manager.md",
+        "allocation.md",
     ] {
         fs::write(prompt_dir.join(name), format!("{name} {{ticker}}")).unwrap();
     }
@@ -469,6 +713,16 @@ orchestrator:
     strict_sqlite: true
     required_contexts:
       - technical
+  allocation:
+    investable_tickers: [QQQ, SOXX]
+    regime_signal: VIX
+    regime_thresholds: [15, 20, 30]
+    regime_labels: [risk_on, normal, elevated, defensive]
+    correlation_window_days: 60
+    max_single_position: 0.70
+    vol_indicator: STD20
+  runtime:
+    max_risk_rounds: 1
   prompts:
     analyst:
       technical: "{}"
@@ -487,6 +741,15 @@ orchestrator:
       debate_final: "{}"
     manager:
       research: "{}"
+    trader: "{}"
+    risk:
+      aggressive: "{}"
+      conservative: "{}"
+      neutral: "{}"
+    portfolio:
+      manager: "{}"
+    allocation:
+      manager: "{}"
 "#,
         prompt_dir.join("analyst_technical.md").display(),
         prompt_dir.join("analyst_news.md").display(),
@@ -500,6 +763,12 @@ orchestrator:
         prompt_dir.join("reducer_evidence.md").display(),
         prompt_dir.join("reducer_debate_final.md").display(),
         prompt_dir.join("manager.md").display(),
+        prompt_dir.join("trader.md").display(),
+        prompt_dir.join("risk_aggressive.md").display(),
+        prompt_dir.join("risk_conservative.md").display(),
+        prompt_dir.join("risk_neutral.md").display(),
+        prompt_dir.join("portfolio_manager.md").display(),
+        prompt_dir.join("allocation.md").display(),
     );
     let mut config: serde_json::Value = serde_yaml::from_str(&config_text).unwrap();
     config["orchestrator"]["llm"]["roles"] = complete_llm_roles_config();
@@ -524,6 +793,12 @@ fn complete_llm_roles_config() -> serde_json::Value {
         "reducer.debate_final",
         "mediator.topic",
         "manager.research",
+        "trader",
+        "risk.aggressive",
+        "risk.conservative",
+        "risk.neutral",
+        "portfolio.manager",
+        "allocation.manager",
     ] {
         let is_phase1 = role.starts_with("analyst.");
         roles.insert(
@@ -560,6 +835,12 @@ fn openai_compatible_llm_roles_config() -> serde_json::Value {
         "reducer.debate_final",
         "mediator.topic",
         "manager.research",
+        "trader",
+        "risk.aggressive",
+        "risk.conservative",
+        "risk.neutral",
+        "portfolio.manager",
+        "allocation.manager",
     ] {
         let is_phase1 = role.starts_with("analyst.");
         roles.insert(

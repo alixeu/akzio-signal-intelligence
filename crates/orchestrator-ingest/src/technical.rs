@@ -334,6 +334,7 @@ fn feature_rows_for_symbol(interval: &str, bars: &[Bar]) -> Vec<FeatureRow> {
             price_ratio[i].map(|value| value - 1.0),
         );
         features.insert("LogReturn".to_string(), price_ratio[i].map(f64::ln));
+        features.insert("Close".to_string(), close[i]);
         features.insert(
             "Gap".to_string(),
             match (open[i], ref_value(&close, i, 1)) {

@@ -38,6 +38,13 @@ Run a mock market research workflow:
 cargo run -p orchestrator-cli --bin orchestrator-exec -- TQQQ --mock
 ```
 
+Run the default ETF allocation workflow for QQQ/SOXX with VIX as the volatility
+regime signal:
+
+```bash
+cargo run -p orchestrator-cli --bin orchestrator-exec -- QQQ,SOXX,VIX --mock
+```
+
 Phase 1 defaults to `technical,news`. Social analysts remain available by
 explicit opt-in, for example `--phase1-agents technical,news,reddit` after
 their source context has been imported into SQLite.
@@ -85,6 +92,15 @@ Live orchestrator runs use a strict SQLite data-source policy by default. Networ
 
 `orchestrator.db_path` is the shared runtime SQLite database, defaulting to `outputs/orchestrator.sqlite`. Direct `orchestrator-exec`, the Rust daily flow, and technical imports use this same database unless a CLI `--db-path` is provided.
 
+`orchestrator.allocation` controls ETF portfolio sizing. `investable_tickers`
+lists the assets that may receive weight, `regime_signal` is usually `VIX`,
+`regime_thresholds`/`regime_labels` classify volatility regimes,
+`correlation_window_days` controls the rolling correlation window,
+`max_single_position` caps concentration, and `vol_indicator` selects the
+technical volatility proxy (default `STD20`). Technical imports store a `Close`
+indicator so Phase 7 can read VIX levels and compute cross-asset correlations
+from SQLite.
+
 ### Workflow Stages And Reducers
 
 The orchestrator is moving toward a `Workflow -> Stage/Sub-workflow -> Agent workers -> Reducer -> state artifact` execution model. Agent workers produce role-specific artifacts; reducers compress those artifacts into durable state briefs that downstream stages can consume without rereading every raw message.
@@ -96,10 +112,27 @@ The orchestrator is moving toward a `Workflow -> Stage/Sub-workflow -> Agent wor
 - `reducer_timeout_sec` or `timeouts.reducer_sec` controls LLM controller timeout seconds.
 - `critical_roles.phase1` lists roles that must complete for a stage to proceed.
 - `late_evidence.enabled` controls whether delayed worker/source outputs are appended to state artifacts and marked as late.
+- `policy.mode` defaults to `selective`, letting Rust derive or skip optional Phase 4/5/6 work after Phase 3 while preserving legacy state fields. Set it to `legacy` only when you need the old always-run path.
 
 Roles not listed under `critical_roles` are treated as noncritical. A noncritical role failure should degrade the relevant state artifact with an explicit evidence gap instead of blocking the whole workflow. Critical role failure should block the affected stage unless the runtime explicitly overrides that policy.
 
 Reducer state artifacts are built deterministically in Rust. Phase 1.5 writes the evidence state artifact from existing analyst artifacts. Phase 2 first runs `mediator.topic` to generate topic candidates from that Phase 1.5 artifact. Each topic then runs sequential bull/bear micro-turns with a per-topic `mediator.topic_controller` Phase 2.5a artifact after every micro-turn. Phase 2.5b writes the final debate state brief from topic controller artifacts.
+
+Phase 4 runs `trader` to convert `research_plan` into `trader_investment_plan`.
+Phase 5 runs a fixed risk debate rotation: `risk.aggressive` →
+`risk.conservative` → `risk.neutral`. Phase 6 runs `portfolio.manager` to write
+`final_trade_decision`. Phase 7 writes `portfolio_allocation` for ETF runs. Rust
+builds an allocation context from `research_plan`, `trader_investment_plan`,
+`risk_debate_state`, `final_trade_decision`, latest VIX `Close`, per-asset
+volatility, and rolling correlation from stored `Close` rows. The
+`allocation.manager` role decides QQQ/SOXX/`cash_hedge` weights; Rust filters
+invalid assets, caps single positions, normalizes weights to 100%, and falls
+back to inverse-vol allocation if the LLM output is unusable. VIX is a regime
+signal only, never an allocated asset.
+
+Phase 3 is the only market-decision phase. Downstream optional phases may add
+execution constraints, skipped/derived artifacts, and allocation inputs, but must
+not rewrite Phase 3 probability, rating, or thesis.
 
 Standalone `fundamental` analyst execution was removed. Fundamental company facts belong inside `analyst.news_macro` and are treated as a news sub-signal rather than an independent vote.
 

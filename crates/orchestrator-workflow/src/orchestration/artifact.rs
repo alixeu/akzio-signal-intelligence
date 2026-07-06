@@ -350,63 +350,6 @@ pub(crate) fn debate_topic_brief_from_state(
     brief
 }
 
-pub(crate) fn build_topic_controller_artifact(
-    state: &Value,
-    topic_id: &str,
-    checkpoint: &str,
-    round: i64,
-    config: &RuntimeConfig,
-) -> Value {
-    let topic_state = super::state::topic_state(state, topic_id).unwrap_or_else(|| json!({}));
-    let topic = topic_state
-        .get("topic")
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-    let turns = topic_state
-        .get("turns")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    json!({
-        "id": format!("mediator.topic_controller:{topic_id}:{checkpoint}:{round}"),
-        "role": "mediator.topic_controller",
-        "artifact_type": "topic_debate_state_artifact",
-        "phase": "phase2.5a",
-        "status": "ready",
-        "topic_id": topic_id,
-        "topic": topic,
-        "checkpoint": checkpoint,
-        "round": round,
-        "turn_count": turns.len(),
-        "claim_ledger": [],
-        "duplicate_claims": [],
-        "unverifiable_claims": [],
-        "supported_claims": [],
-        "contested_claims": [],
-        "blocked_repeats": [],
-        "next_agenda": [],
-        "soft_control": {
-            "should_continue": true,
-            "stop_reason": "",
-            "hard_stop_enforced": false,
-            "max_rounds_remains_runtime_cap": true
-        },
-        "latest_turns": turns,
-        "phase1_state_artifact": state.get("phase1_state_artifact").cloned().unwrap_or(Value::Null),
-        "late_evidence_effect": {
-            "has_late_evidence": state.get("late_evidence").and_then(Value::as_array).is_some_and(|items| !items.is_empty()),
-            "used": config.workflow.late_evidence_enabled,
-            "effect": "pending",
-            "reason": ""
-        },
-        "reducer_checks": {
-            "json_valid": true,
-            "no_winner_declared": true,
-            "no_new_external_facts": true
-        }
-    })
-}
-
 pub(crate) fn fallback_topics_for_tickers(tickers: &[String]) -> Vec<Value> {
     tickers
         .iter()
@@ -517,12 +460,20 @@ pub(crate) fn weighted_probability_base(
             let mut confidence_total = 0.0;
             let mut weight_total = 0.0;
             let mut source_roles = Vec::new();
+            let mut skipped_roles = Vec::new();
             for (role, report) in reports {
                 let weight = weights.get(role).and_then(Value::as_f64).unwrap_or(0.0);
                 if weight <= 0.0 {
                     continue;
                 }
                 let payload = artifact_for_ticker(report, ticker).unwrap_or(report);
+                // Skip degraded / fallback / unobserved contributions instead of
+                // letting a neutral 0.0-confidence placeholder drag the base toward
+                // 0.50. A silently-failed analyst must not count as evidence.
+                if is_non_contributing(report, payload) {
+                    skipped_roles.push(Value::String(role.clone()));
+                    continue;
+                }
                 let confidence = payload
                     .get("confidence")
                     .and_then(Value::as_f64)
@@ -560,11 +511,39 @@ pub(crate) fn weighted_probability_base(
                     "long_probability": long_probability,
                     "short_probability": short_probability,
                     "confidence": confidence,
-                    "source_roles": source_roles
+                    "source_roles": source_roles,
+                    "skipped_roles": skipped_roles
                 }),
             )
         })
         .collect()
+}
+
+/// A report contributes no directional evidence when it was degraded, used a
+/// fallback, or explicitly reported no observation. Such artifacts carry a
+/// neutral/0.0 placeholder that must be excluded from the weighted base rather
+/// than counted as a real neutral vote.
+fn is_non_contributing(report: &Value, payload: &Value) -> bool {
+    if report
+        .get("degraded")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    let flagged_status = |value: &Value| {
+        matches!(
+            value.get("status").and_then(Value::as_str),
+            Some("degraded") | Some("missing") | Some("error")
+        )
+    };
+    if flagged_status(report) || flagged_status(payload) {
+        return true;
+    }
+    matches!(
+        payload.get("direction").and_then(Value::as_str),
+        Some("unobserved")
+    )
 }
 
 pub(crate) fn artifact_for_ticker<'a>(artifact: &'a Value, ticker: &str) -> Option<&'a Value> {
@@ -680,4 +659,86 @@ pub(crate) fn persist_agent_content(
         },
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn state_with_weights() -> Value {
+        json!({
+            "analyst_weights": {
+                "analyst.technical": 40.0,
+                "analyst.news_macro": 35.0
+            }
+        })
+    }
+
+    #[test]
+    fn degraded_report_is_skipped_not_counted_as_neutral() {
+        let state = state_with_weights();
+        let tickers = vec!["QQQ".to_string()];
+        let mut reports = serde_json::Map::new();
+        // Strong bullish technical.
+        reports.insert(
+            "analyst.technical".to_string(),
+            json!({"per_ticker": {"QQQ": {"direction": "bullish", "confidence": 0.8}}}),
+        );
+        // Degraded news_macro that would otherwise drag toward 0.50.
+        reports.insert(
+            "analyst.news_macro".to_string(),
+            json!({
+                "degraded": true,
+                "per_ticker": {"QQQ": {"direction": "neutral", "confidence": 0.0}}
+            }),
+        );
+
+        let base = weighted_probability_base(&state, &tickers, &reports);
+        let qqq = &base["QQQ"];
+        // Only the bullish technical contributes -> net = +1 -> long_prob = 1.0.
+        assert!((qqq["long_probability"].as_f64().unwrap() - 1.0).abs() < 1e-9);
+        assert_eq!(qqq["source_roles"], json!(["analyst.technical"]));
+        assert_eq!(qqq["skipped_roles"], json!(["analyst.news_macro"]));
+    }
+
+    #[test]
+    fn unobserved_direction_is_skipped() {
+        let state = state_with_weights();
+        let tickers = vec!["QQQ".to_string()];
+        let mut reports = serde_json::Map::new();
+        reports.insert(
+            "analyst.technical".to_string(),
+            json!({"per_ticker": {"QQQ": {"direction": "bearish", "confidence": 0.6}}}),
+        );
+        reports.insert(
+            "analyst.news_macro".to_string(),
+            json!({"per_ticker": {"QQQ": {"direction": "unobserved", "confidence": 0.0}}}),
+        );
+
+        let base = weighted_probability_base(&state, &tickers, &reports);
+        let qqq = &base["QQQ"];
+        assert!(qqq["long_probability"].as_f64().unwrap() < 0.5);
+        assert_eq!(qqq["skipped_roles"], json!(["analyst.news_macro"]));
+    }
+
+    #[test]
+    fn all_contributing_reports_are_counted() {
+        let state = state_with_weights();
+        let tickers = vec!["QQQ".to_string()];
+        let mut reports = serde_json::Map::new();
+        reports.insert(
+            "analyst.technical".to_string(),
+            json!({"per_ticker": {"QQQ": {"direction": "bullish", "confidence": 0.5}}}),
+        );
+        reports.insert(
+            "analyst.news_macro".to_string(),
+            json!({"per_ticker": {"QQQ": {"direction": "bearish", "confidence": 0.5}}}),
+        );
+
+        let base = weighted_probability_base(&state, &tickers, &reports);
+        let qqq = &base["QQQ"];
+        assert_eq!(qqq["skipped_roles"], json!([]));
+        assert_eq!(qqq["source_roles"].as_array().unwrap().len(), 2);
+    }
 }

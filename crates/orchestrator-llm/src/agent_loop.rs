@@ -615,7 +615,9 @@ where
         turn_id: turn.turn_id.clone(),
         role: turn.role.clone(),
     });
-    append_turn_item(conn, turn, &TurnItem::user(turn.user_input.clone()))?;
+    if !turn.user_input.trim().is_empty() {
+        append_turn_item(conn, turn, &TurnItem::user(turn.user_input.clone()))?;
+    }
     let mut first_iteration = true;
     let max_loops = config.max_agent_loops.map(|value| value.max(1));
     let mut loop_index = 0usize;
@@ -967,7 +969,7 @@ fn build_model_input(
     config: &AgentLoopConfig,
 ) -> Result<ModelInput> {
     let mut items = history_items(conn, &turn.session_id, config.history_limit)?;
-    if first_iteration && items.is_empty() {
+    if first_iteration && items.is_empty() && !turn.user_input.trim().is_empty() {
         items.push(TurnItem::user(turn.user_input.clone()));
     }
     while let Some(input) = turn.pending_input.pop_front() {

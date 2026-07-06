@@ -11,6 +11,8 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
+use super::policy::{WorkflowPolicyMode, WorkflowPolicyThresholds};
+
 #[derive(Debug, Clone)]
 pub(crate) struct RuntimeConfig {
     pub llm_roles: BTreeMap<String, RoleLlmSettings>,
@@ -19,6 +21,18 @@ pub(crate) struct RuntimeConfig {
     pub required_contexts: Vec<String>,
     pub prompts: PromptConfig,
     pub workflow: WorkflowConfig,
+    pub allocation: AllocationConfig,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct AllocationConfig {
+    pub investable_tickers: Vec<String>,
+    pub regime_signal: String,
+    pub regime_thresholds: Vec<f64>,
+    pub regime_labels: Vec<String>,
+    pub correlation_window_days: usize,
+    pub max_single_position: f64,
+    pub vol_indicator: String,
 }
 
 #[derive(Debug, Clone)]
@@ -26,14 +40,23 @@ pub(crate) struct WorkflowConfig {
     pub phase1_parallelism: usize,
     pub agent_timeout_sec: u64,
     pub reducer_timeout_sec: u64,
+    pub risk_rounds: i64,
     pub critical_roles: BTreeSet<String>,
     pub late_evidence_enabled: bool,
+    pub policy_mode: WorkflowPolicyMode,
+    pub policy_thresholds: WorkflowPolicyThresholds,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct PromptConfig {
     pub prompts: BTreeMap<String, PathBuf>,
     pub manager_research: PathBuf,
+    pub trader: PathBuf,
+    pub risk_aggressive: PathBuf,
+    pub risk_conservative: PathBuf,
+    pub risk_neutral: PathBuf,
+    pub portfolio_manager: PathBuf,
+    pub allocation_manager: PathBuf,
 }
 
 impl RuntimeConfig {
@@ -134,6 +157,36 @@ impl RuntimeConfig {
                 "orchestrator.prompts.manager.research",
                 "prompts/managers/research_manager.md",
             )?,
+            trader: prompt_path(
+                config,
+                "orchestrator.prompts.trader",
+                "prompts/traders/trader.md",
+            )?,
+            risk_aggressive: prompt_path(
+                config,
+                "orchestrator.prompts.risk.aggressive",
+                "prompts/risk/aggressive.md",
+            )?,
+            risk_conservative: prompt_path(
+                config,
+                "orchestrator.prompts.risk.conservative",
+                "prompts/risk/conservative.md",
+            )?,
+            risk_neutral: prompt_path(
+                config,
+                "orchestrator.prompts.risk.neutral",
+                "prompts/risk/neutral.md",
+            )?,
+            portfolio_manager: prompt_path(
+                config,
+                "orchestrator.prompts.portfolio.manager",
+                "prompts/managers/portfolio_manager.md",
+            )?,
+            allocation_manager: prompt_path(
+                config,
+                "orchestrator.prompts.allocation.manager",
+                "prompts/allocation/manager.md",
+            )?,
         };
         let llm_roles = llm_roles_from_config(config)?;
         let web_search = web_search_by_role_from_config(config, llm_roles.iter())?;
@@ -149,6 +202,7 @@ impl RuntimeConfig {
             ),
             prompts: prompts_config,
             workflow,
+            allocation: AllocationConfig::from_value(config),
         })
     }
 }
@@ -318,6 +372,7 @@ impl WorkflowConfig {
             config_int(config, "orchestrator.workflow.agent_timeout_sec", 300).max(1) as u64;
         let reducer_timeout_sec =
             config_int(config, "orchestrator.workflow.reducer_timeout_sec", 300).max(1) as u64;
+        let risk_rounds = config_int(config, "orchestrator.runtime.max_risk_rounds", 1).max(1);
         let critical_roles = config_strings(
             config,
             "orchestrator.workflow.phase1.critical_roles",
@@ -332,10 +387,61 @@ impl WorkflowConfig {
             phase1_parallelism,
             agent_timeout_sec,
             reducer_timeout_sec,
+            risk_rounds,
             critical_roles,
             late_evidence_enabled,
+            policy_mode: policy_mode_from_config(config),
+            policy_thresholds: policy_thresholds_from_config(config),
         }
     }
+}
+
+fn policy_mode_from_config(config: &Value) -> WorkflowPolicyMode {
+    match config_str(config, "orchestrator.workflow.policy.mode", "selective")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "selective" | "gated" => WorkflowPolicyMode::Selective,
+        _ => WorkflowPolicyMode::Legacy,
+    }
+}
+
+fn policy_thresholds_from_config(config: &Value) -> WorkflowPolicyThresholds {
+    let defaults = WorkflowPolicyThresholds::default();
+    WorkflowPolicyThresholds {
+        min_confidence: config_f64(
+            config,
+            "orchestrator.workflow.policy.min_confidence",
+            defaults.min_confidence,
+        ),
+        neutral_probability_band: config_f64(
+            config,
+            "orchestrator.workflow.policy.neutral_probability_band",
+            defaults.neutral_probability_band,
+        ),
+        max_volatility: config_f64(
+            config,
+            "orchestrator.workflow.policy.max_volatility",
+            defaults.max_volatility,
+        ),
+        max_correlation: config_f64(
+            config,
+            "orchestrator.workflow.policy.max_correlation",
+            defaults.max_correlation,
+        ),
+        max_position: config_f64(
+            config,
+            "orchestrator.workflow.policy.max_position",
+            defaults.max_position,
+        ),
+    }
+}
+
+fn config_f64(config: &Value, path: &str, default: f64) -> f64 {
+    config_get(config, path)
+        .and_then(|value| value.as_f64().or_else(|| value.as_str()?.parse().ok()))
+        .unwrap_or(default)
 }
 
 impl PromptConfig {

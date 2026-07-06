@@ -109,10 +109,48 @@ fn build_html(payload: &Value) -> String {
         .get("final_summary")
         .and_then(Value::as_str)
         .unwrap_or("");
+    let allocation_html = allocation_html(payload);
     format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>{}</title></head><body><h1>{}</h1><pre>{}</pre></body></html>",
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>{}</title></head><body><h1>{}</h1>{}<pre>{}</pre></body></html>",
         encode_text(subject),
         encode_text(subject),
+        allocation_html,
+        encode_text(summary)
+    )
+}
+
+fn allocation_html(payload: &Value) -> String {
+    let allocation = payload
+        .get("orchestrator_state")
+        .and_then(|state| state.get("portfolio_allocation"))
+        .unwrap_or(&Value::Null);
+    let Some(weights) = allocation.get("weights").and_then(Value::as_object) else {
+        return String::new();
+    };
+    let mut rows = String::new();
+    for (asset, payload) in weights {
+        let weight = payload.get("weight").and_then(Value::as_f64).unwrap_or(0.0);
+        let rationale = payload
+            .get("rationale")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        rows.push_str(&format!(
+            "<tr><td>{}</td><td>{:.1}%</td><td>{}</td></tr>",
+            encode_text(asset),
+            weight * 100.0,
+            encode_text(rationale)
+        ));
+    }
+    let summary = allocation
+        .get("summary")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    format!(
+        "<section><h2>Portfolio Allocation</h2><p><strong>VIX regime:</strong> {} &nbsp; <strong>Total equity exposure:</strong> {} &nbsp; <strong>Correlation:</strong> {}</p><table border=\"1\" cellspacing=\"0\" cellpadding=\"6\"><thead><tr><th>Asset</th><th>Weight</th><th>Rationale</th></tr></thead><tbody>{}</tbody></table><p>{}</p></section>",
+        encode_text(allocation.get("vix_regime").and_then(Value::as_str).unwrap_or("")),
+        encode_text(&allocation.get("total_equity_exposure").map(Value::to_string).unwrap_or_default()),
+        encode_text(allocation.get("correlation_note").and_then(Value::as_str).unwrap_or("")),
+        rows,
         encode_text(summary)
     )
 }
@@ -253,8 +291,9 @@ fn email_decision(payload: &Value, state: &Value, probability_threshold: f64) ->
 
 fn payload_direction(payload: &Value) -> (&'static str, f64) {
     let state = payload.get("orchestrator_state").unwrap_or(payload);
-    let long = normalize_probability(state.get("long_probability")).unwrap_or(0.0);
-    let short = normalize_probability(state.get("short_probability")).unwrap_or(0.0);
+    let research = state.get("research_plan").unwrap_or(state);
+    let long = normalize_probability(research.get("long_probability")).unwrap_or(0.0);
+    let short = normalize_probability(research.get("short_probability")).unwrap_or(0.0);
     if long > short {
         ("long", long)
     } else if short > long {

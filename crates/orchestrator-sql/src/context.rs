@@ -142,7 +142,7 @@ fn compose_context(
         collect_jin10_blocks(conn, &mut blocks)?;
         collect_technical_blocks(conn, ctx, &mut blocks)?;
         collect_external_blocks(conn, ctx, &mut blocks)?;
-        collect_turn_history_blocks(conn, ctx, &mut blocks)?;
+        collect_turn_history_blocks(conn, ctx, request.topic_id.as_deref(), &mut blocks)?;
     }
 
     for block in &mut blocks {
@@ -462,18 +462,22 @@ fn collect_social_blocks(
 fn collect_turn_history_blocks(
     conn: &Connection,
     ctx: &RuntimeContext,
+    topic_id: Option<&str>,
     blocks: &mut Vec<ContextBlock>,
 ) -> Result<()> {
+    let topic_filter = topic_id.unwrap_or_default();
     let mut stmt = conn.prepare(
         r#"
         SELECT id, turn_id, item_type, role, tool_name, content_json, content_text, created_at
         FROM agent_turn_items
         WHERE run_id = ?
+          AND item_type IN ('user_message', 'assistant_message')
+          AND (? = '' OR session_id LIKE '%' || ? || '%')
         ORDER BY id DESC
-        LIMIT 40
+        LIMIT 12
         "#,
     )?;
-    let rows = stmt.query_map([&ctx.run_id], |row| {
+    let rows = stmt.query_map(params![&ctx.run_id, topic_filter, topic_filter], |row| {
         let id: i64 = row.get("id")?;
         let content_json: String = row.get("content_json")?;
         let role: String = row.get("role")?;

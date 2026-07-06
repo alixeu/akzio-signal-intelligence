@@ -14,6 +14,7 @@ orchestrator-sql = { path = "../orchestrator-sql" }
 orchestrator-ingest = { path = "../orchestrator-ingest" }
 orchestrator-report = { path = "../orchestrator-report" }
 orchestrator-workflow = { path = "../orchestrator-workflow" }
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
@@ -57,3 +58,7 @@ path = "src/bin/run_technical_indicators.rs"
 [[bin]]
 name = "fetch-last30days-context"
 path = "src/bin/fetch_last30days_context.rs"
+
+[[bin]]
+name = "probe-strict-schema"
+path = "src/bin/probe_strict_schema.rs"

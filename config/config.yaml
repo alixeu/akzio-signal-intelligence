@@ -1,8 +1,17 @@
 orchestrator:
-  tickers: "QQQ,VIX,SOXX"
+  tickers: "QQQ,SOXX,VIX"
   phase1_agents: "technical,news"
   run_dir_pattern: "outputs/{dir_slug}/{date}_exec"
   db_path: "outputs/orchestrator.sqlite"
+
+  allocation:
+    investable_tickers: [QQQ, SOXX]
+    regime_signal: VIX
+    regime_thresholds: [15, 20, 30]
+    regime_labels: [risk_on, normal, elevated, defensive]
+    correlation_window_days: 60
+    max_single_position: 0.70
+    vol_indicator: STD20
 
   data_source:
     strict_sqlite: true
@@ -14,6 +23,20 @@ orchestrator:
     window_days: 150
     max_debate_rounds: 1
     max_topics_per_side: 1
+    max_risk_rounds: 1
+
+  workflow:
+    policy:
+      mode: selective
+
+  prompts:
+    trader: "prompts/traders/trader.md"
+    risk:
+      aggressive: "prompts/risk/aggressive.md"
+      conservative: "prompts/risk/conservative.md"
+      neutral: "prompts/risk/neutral.md"
+    portfolio:
+      manager: "prompts/managers/portfolio_manager.md"
 
   web_search:
     mode: live
@@ -24,8 +47,8 @@ orchestrator:
 
   llm:
     gateway:
-      base_url: &llm_gateway_base_url "https://oneapi-comate.baidu-int.com/v1"
-      api_key: &llm_gateway_api_key "sk-GASkzZyd3qELeEcC35D239D73f3c49D784659995B3114a6a"
+      base_url: &llm_gateway_base_url "${LLM_GATEWAY_BASE_URL:-https://oneapi-comate.baidu-int.com/v1}"
+      api_key: &llm_gateway_api_key "${LLM_GATEWAY_API_KEY}"
     defaults:
       route: responses
       model: gpt-5.5
@@ -93,6 +116,36 @@ orchestrator:
           mode: disabled
         tools:
           - read_run_context
+      trader:
+        web_search:
+          mode: disabled
+        tools:
+          - read_run_context
+      risk.aggressive:
+        web_search:
+          mode: disabled
+        tools:
+          - read_run_context
+      risk.conservative:
+        web_search:
+          mode: disabled
+        tools:
+          - read_run_context
+      risk.neutral:
+        web_search:
+          mode: disabled
+        tools:
+          - read_run_context
+      portfolio.manager:
+        web_search:
+          mode: disabled
+        tools:
+          - read_run_context
+      allocation.manager:
+        tools:
+          - read_run_context
+        web_search:
+          mode: disabled
 
   analyst_weights:
     technical: 40.0
@@ -102,15 +155,15 @@ orchestrator:
     x: 0.0
 
 technical:
-  symbols: "QQQ,VIX,SOXX"
+  symbols: "QQQ,SOXX,VIX"
   intervals: "1d,3h,20min"
   days: 60
   model: "TwelveDataTechnical"
-  api_key: "ad5ef13bed394201b5f1b9ef9c8b98ca"
+  api_key: "${TWELVE_DATA_API_KEY}"
   sleep_sec: 9
 
 jin10:
-  api_url: "https://4a735ea38f8146198dc205d2e2d1bd28.z3c.jin10.com/flash"
+  api_url: "${JIN10_API_URL}"
   channel: -8200
   vip: 1
   classify: "24,27,31,86,90,92,76,83,2,168,53,47,48,50,157,16"
@@ -138,14 +191,14 @@ wayinvideo:
 report:
   mode: build-and-send
   output_dir: "outputs/TQQQ"
-  default_run_dir_pattern: "outputs/QQQ_VIX_SOXX/{date}_exec"
+  default_run_dir_pattern: "outputs/QQQ_SOXX_VIX/{date}_exec"
   subject_template: "TQQQ strategy report {date}"
   email:
     enabled: true
     probability_threshold: 0.68
     state_path: "outputs/TQQQ/report_email_state.json"
     smtp_url: "smtps://smtp.mail.me.com:465"
-    username: "your-icloud-email@icloud.com"
-    password: "your-icloud-app-specific-password"
-    from: "your-icloud-email@icloud.com"
-    to: "recipient@example.com"
+    username: "${REPORT_SMTP_USERNAME}"
+    password: "${REPORT_SMTP_PASSWORD}"
+    from: "${REPORT_SMTP_FROM}"
+    to: "${REPORT_SMTP_TO}"
