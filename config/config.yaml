@@ -21,27 +21,98 @@ orchestrator:
   runtime:
     lang: zh
     window_days: 150
-    max_debate_rounds: 1
+    max_debate_rounds: 3
     max_topics_per_side: 1
     max_risk_rounds: 1
 
   workflow:
     policy:
       mode: selective
+    phase1:
+      skip_zero_weight: true
+
+  plugins:
+    enabled: true
+    components_dir: "prompts/components"
+    roles_dir: "prompts/roles"
+    disabled_components: []
+    extra_component_dirs: []
 
   prompts:
-    trader: "prompts/traders/trader.md"
+    # Analysts
+    analyst:
+      technical:
+        path: "prompts/analysts/technical.md"
+        version: v1
+      news_macro:
+        path: "prompts/analysts/news_macro.md"
+        version: v1
+      youtube:
+        path: "prompts/analysts/youtube.md"
+        version: v1
+      reddit:
+        path: "prompts/analysts/reddit.md"
+        version: v1
+      x:
+        path: "prompts/analysts/x.md"
+        version: v1
+    # Researchers (note: config keys use phase2.* prefix, not researcher.*)
+    phase2:
+      bull_initial:
+        path: "prompts/researchers/bull_initial.md"
+        version: v1
+      bull_interaction:
+        path: "prompts/researchers/bull_interaction.md"
+        version: v1
+      bear_initial:
+        path: "prompts/researchers/bear_initial.md"
+        version: v1
+      bear_interaction:
+        path: "prompts/researchers/bear_interaction.md"
+        version: v1
+    # Mediators
+    mediator:
+      topic:
+        path: "prompts/mediators/topic_generation.md"
+        version: v1
+      topic_controller:
+        path: "prompts/mediators/topic_controller.md"
+        version: v1
+    # Managers
+    manager:
+      research:
+        path: "prompts/managers/research_manager.md"
+        version: v1
+    # Trader
+    trader:
+      path: "prompts/traders/trader.md"
+      version: v1
+    # Risk
     risk:
-      aggressive: "prompts/risk/aggressive.md"
-      conservative: "prompts/risk/conservative.md"
-      neutral: "prompts/risk/neutral.md"
+      aggressive:
+        path: "prompts/risk/aggressive.md"
+        version: v1
+      conservative:
+        path: "prompts/risk/conservative.md"
+        version: v1
+      neutral:
+        path: "prompts/risk/neutral.md"
+        version: v1
+    # Portfolio
     portfolio:
-      manager: "prompts/managers/portfolio_manager.md"
+      manager:
+        path: "prompts/managers/portfolio_manager.md"
+        version: v1
+    # Allocation
+    allocation:
+      manager:
+        path: "prompts/allocation/manager.md"
+        version: v1
 
   web_search:
     mode: live
     base_url: "https://mcp.exa.ai/mcp"
-    api_key: ""
+    api_key: "${EXA_API_KEY}"
     context_size: medium
     max_result_chars: 12000
 
@@ -49,6 +120,10 @@ orchestrator:
     gateway:
       base_url: &llm_gateway_base_url "${LLM_GATEWAY_BASE_URL:-https://oneapi-comate.baidu-int.com/v1}"
       api_key: &llm_gateway_api_key "${LLM_GATEWAY_API_KEY}"
+    judge:
+      enabled: true
+      model: "gpt-4o-mini"
+      max_messages_per_turn: 3
     defaults:
       route: responses
       model: gpt-5.5
@@ -59,89 +134,128 @@ orchestrator:
       reasoning_effort: low
       reasoning_summary: auto
       preserve_reasoning_state: true
+      compact_at_token_ratio: 0.8
       transport: http
       think_tool: false
       tools: []
+    truncation:
+      tool_result_chars: 8000
+      context_fragment_chars: 12000
+      strategy: semantic
+      json:
+        preserve_fields: ["status", "error", "summary", "artifact_type", "role", "id"]
+        max_array_elements: 50
+      text:
+        head_ratio: 0.6
+        tail_ratio: 0.4
     roles:
       analyst.technical:
+        max_turns: 3
+        web_search:
+          mode: disabled
+        tools:
+          - read_run_context
+          - run_technical_indicators
+      analyst.news_macro:
+        max_turns: 3
+        tools:
+          - read_run_context
+          - fetch_jin10_flash
+        web_search:
+          mode: live
+      analyst.youtube:
+        max_turns: 3
+        tools:
+          - read_run_context
+          - fetch_youtube_transcript
+          - fetch_wayinvideo_transcript
+      analyst.reddit:
+        max_turns: 3
+        tools:
+          - read_run_context
+          - fetch_last30days_context
+      analyst.x:
+        max_turns: 3
+        tools:
+          - read_run_context
+          - fetch_last30days_context
+      researcher.bull.initial:
         max_turns: 2
         web_search:
           mode: disabled
         tools:
           - read_run_context
-      analyst.news_macro:
-        tools:
-          - read_run_context
-      analyst.youtube:
-        tools:
-          - read_run_context
-      analyst.reddit:
-        tools:
-          - read_run_context
-      analyst.x:
-        tools:
-          - read_run_context
-      researcher.bull.initial:
-        web_search:
-          mode: disabled
-        tools:
-          - read_run_context
       researcher.bear.initial:
+        max_turns: 2
         web_search:
           mode: disabled
         tools:
           - read_run_context
       researcher.bull.interaction:
+        max_turns: 3
         web_search:
           mode: disabled
         tools:
           - read_run_context
       researcher.bear.interaction:
+        max_turns: 3
         web_search:
           mode: disabled
         tools:
           - read_run_context
       mediator.topic:
+        max_turns: 2
         web_search:
           mode: disabled
         tools:
           - read_run_context
       mediator.topic_controller:
+        max_turns: 3
+        reasoning_effort: medium
         web_search:
           mode: disabled
         tools:
           - read_run_context
       manager.research:
+        max_turns: 3
+        reasoning_effort: medium
         web_search:
           mode: disabled
         tools:
           - read_run_context
       trader:
+        max_turns: 2
         web_search:
           mode: disabled
         tools:
           - read_run_context
       risk.aggressive:
+        max_turns: 2
         web_search:
           mode: disabled
         tools:
           - read_run_context
       risk.conservative:
+        max_turns: 2
         web_search:
           mode: disabled
         tools:
           - read_run_context
       risk.neutral:
+        max_turns: 2
         web_search:
           mode: disabled
         tools:
           - read_run_context
       portfolio.manager:
+        max_turns: 2
+        reasoning_effort: medium
         web_search:
           mode: disabled
         tools:
           - read_run_context
       allocation.manager:
+        max_turns: 2
         tools:
           - read_run_context
         web_search:

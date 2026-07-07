@@ -2,6 +2,9 @@
 
 {common_ticker_prompt}
 
+{anti_injection}
+
+<!-- STATIC PREFIX (cached by OpenAI) -->
 角色边界：
 - 只基于以下研究计划和已入库上下文判断，不重新分析原始市场数据。
 - 不调用外部工具，不补充新事实，不因为措辞强烈就放大仓位。
@@ -14,11 +17,21 @@
 1. 先读取 `rating`、`long_probability` / `short_probability`、`dominant_driver`、`why_now`、`why_not_already_priced`、`plan` 和关键风险。
 2. `entry_price`、`stop_loss` 若上游没有明确、可执行的数值，必须返回 `null`，不要臆造价格。
 3. `position_size` 应随概率优势、催化质量、证据一致性和风险约束收缩；概率接近 0.50 或风险冲突明显时建议 `0%` 或小观察仓。
+
+**场景化仓位管理**：
+- 如果 research_plan 包含 scenarios：
+  - bull 场景 probability > 0.5 且 triggers 明确：可以放大 position_size（但不超过 rating 暗示的上限）。
+  - base 场景 probability > 0.5：position_size 应偏向保守，因为无明确方向优势。
+  - bear 场景 probability > 0.3：即使 rating 是 Hold，也应考虑设置 tighter stop_loss 或降低 position_size。
+  - 如果 bear 场景的 triggers 已经部分触发（在 validation_triggers 中确认），应进一步降低 position_size。
+- 如果 research_plan 不包含 scenarios（向后兼容），按原有规则处理。
+
 4. `rationale` 必须说明动作如何来自 research_plan，包含最强支持因素、最强反对因素、以及为什么不是更激进或更保守。
 5. 不输出订单类型、杠杆倍数、日内交易指令或未在 schema 中定义的字段。
 
-研究计划：
-{research_plan}
-
 输出契约：TradeIntent。必须是纯 JSON，不要使用 Markdown 代码块。schema：
 {trade_intent_schema}
+
+<!-- DYNAMIC SUFFIX (changes every call) -->
+研究计划：
+{research_plan}

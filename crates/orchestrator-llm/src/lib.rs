@@ -1,9 +1,10 @@
 use agent_loop::{
-    AgentLoopConfig, ModelEventHandler, ModelStreamEvent, ProjectToolRuntime, RigLoopModel,
-    ToolCallRequest, Turn,
+    AgentLoopConfig, ModelEventHandler, ModelStreamEvent, ModelStreamResult, ProjectToolRuntime,
+    RigLoopModel, ToolCallRequest, Turn,
 };
 use anyhow::{bail, Context, Result};
 use futures::StreamExt;
+use llm_judge::JudgeConfig;
 use orchestrator_core::{
     default_project_root, extract_json_artifact, validate_research_artifact, ResearchArtifact,
 };
@@ -20,13 +21,16 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{fs, path::PathBuf, sync::Arc};
+use truncation::TruncationConfig;
 use uuid::Uuid;
 use web_search::{
     validate_web_search_runtime_config, ExaWebSearchProvider, WebSearchConfig, WebSearchMode,
 };
 
 pub mod agent_loop;
+pub mod llm_judge;
 pub mod tools;
+pub mod truncation;
 pub mod web_search;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -148,6 +152,8 @@ pub struct RigSettings {
     pub reasoning_effort_override: Option<String>,
     pub tools: Option<tools::ExternalToolConfig>,
     pub web_search: WebSearchConfig,
+    pub truncation: TruncationConfig,
+    pub judge: JudgeConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -158,7 +164,24 @@ pub struct SteerLoopInput<'a> {
     pub steer: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct AgentLoopOutput {
+    pub artifact: Value,
+    pub metrics: ModelStreamResult,
+    pub turn_id: String,
+    pub session_id: String,
+}
+
 pub async fn run_rig_agent_loop(settings: &RigSettings, prompt: &str) -> Result<Value> {
+    Ok(run_rig_agent_loop_with_metrics(settings, prompt)
+        .await?
+        .artifact)
+}
+
+pub async fn run_rig_agent_loop_with_metrics(
+    settings: &RigSettings,
+    prompt: &str,
+) -> Result<AgentLoopOutput> {
     settings.llm.validate(&settings.role)?;
     validate_fallback_web_search_runtime_config(settings)?;
     let conn = open_loop_connection(settings)?;
@@ -191,13 +214,17 @@ pub async fn run_rig_agent_loop(settings: &RigSettings, prompt: &str) -> Result<
         tools = tools.with_web_run_runtime(web_run);
     }
     let mut model = RigLoopModel::new(settings.clone());
-    agent_loop::run_turn(
+    let metrics = agent_loop::run_turn(
         &conn,
         &mut turn,
         &mut model,
         &mut tools,
         AgentLoopConfig {
             max_agent_loops: settings.llm.max_turns,
+            truncation: settings.truncation.clone(),
+            judge: settings.judge.clone(),
+            judge_endpoint: settings.llm.base_url.clone(),
+            judge_api_key: settings.llm.api_key.clone(),
             ..AgentLoopConfig::default()
         },
     )
@@ -216,13 +243,27 @@ pub async fn run_rig_agent_loop(settings: &RigSettings, prompt: &str) -> Result<
             }
         })
         .context("agent loop finished without assistant message")?;
-    parse_final_output(settings, &final_text)
+    Ok(AgentLoopOutput {
+        artifact: parse_final_output(settings, &final_text)?,
+        metrics,
+        turn_id: turn.turn_id,
+        session_id: turn.session_id,
+    })
 }
 
 pub async fn run_rig_agent_steer_loop(
     settings: &RigSettings,
     input: SteerLoopInput<'_>,
 ) -> Result<Value> {
+    Ok(run_rig_agent_steer_loop_with_metrics(settings, input)
+        .await?
+        .artifact)
+}
+
+pub async fn run_rig_agent_steer_loop_with_metrics(
+    settings: &RigSettings,
+    input: SteerLoopInput<'_>,
+) -> Result<AgentLoopOutput> {
     settings.llm.validate(&settings.role)?;
     validate_fallback_web_search_runtime_config(settings)?;
     let conn = open_loop_connection(settings)?;
@@ -263,13 +304,17 @@ pub async fn run_rig_agent_steer_loop(
         tools = tools.with_web_run_runtime(web_run);
     }
     let mut model = RigLoopModel::new(settings.clone());
-    agent_loop::run_turn(
+    let metrics = agent_loop::run_turn(
         &conn,
         &mut turn,
         &mut model,
         &mut tools,
         AgentLoopConfig {
             max_agent_loops: settings.llm.max_turns,
+            truncation: settings.truncation.clone(),
+            judge: settings.judge.clone(),
+            judge_endpoint: settings.llm.base_url.clone(),
+            judge_api_key: settings.llm.api_key.clone(),
             ..AgentLoopConfig::default()
         },
     )
@@ -288,7 +333,12 @@ pub async fn run_rig_agent_steer_loop(
             }
         })
         .context("agent loop finished without assistant message")?;
-    parse_final_output(settings, &final_text)
+    Ok(AgentLoopOutput {
+        artifact: parse_final_output(settings, &final_text)?,
+        metrics,
+        turn_id: turn.turn_id,
+        session_id: turn.session_id,
+    })
 }
 
 fn write_role_end_context(settings: &RigSettings, turn: &Turn) -> Result<()> {
@@ -362,6 +412,7 @@ fn web_run_runtime(config: &WebSearchConfig) -> Option<tools::WebRunRuntime> {
     match config.mode {
         WebSearchMode::Live => Some(
             tools::WebRunRuntime::new(config.clone())
+                .with_truncation(TruncationConfig::default())
                 .with_provider(Arc::new(ExaWebSearchProvider::from_config(config))),
         ),
         WebSearchMode::Disabled | WebSearchMode::Cached => None,
@@ -371,6 +422,7 @@ fn web_run_runtime(config: &WebSearchConfig) -> Option<tools::WebRunRuntime> {
 fn web_run_runtime_for_settings(settings: &RigSettings) -> Option<tools::WebRunRuntime> {
     if uses_web_run_fallback(settings) {
         web_run_runtime(&settings.web_search)
+            .map(|runtime| runtime.with_truncation(settings.truncation.clone()))
     } else {
         None
     }
@@ -851,6 +903,7 @@ fn stream_event_from_value(value: Value) -> Result<ModelStreamEvent> {
         }),
         "assistant_message_completed" => Ok(ModelStreamEvent::AssistantMessageCompleted {
             item_id: stream_item_id(&value)?,
+            turn_status: agent_loop::extract_turn_status(&value),
         }),
         "reasoning_summary_delta" => Ok(ModelStreamEvent::ReasoningSummaryDelta {
             item_id: stream_item_id(&value)?,
@@ -1329,7 +1382,8 @@ fn mock_allocation_artifact(tickers: &[String]) -> Value {
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_loop, tools, LlmRoute, LlmTransport, OutputMode, RigSettings, RoleLlmSettings,
+        agent_loop, llm_judge::JudgeConfig, tools, LlmRoute, LlmTransport, OutputMode, RigSettings,
+        RoleLlmSettings, TruncationConfig,
     };
     use crate::web_search::{WebSearchConfig, WebSearchMode};
     use crate::{ModelEventHandler, ModelStreamEvent, RuntimeEventStreamParser};
@@ -1362,6 +1416,8 @@ mod tests {
             reasoning_effort_override: None,
             tools: None,
             web_search: WebSearchConfig::default(),
+            truncation: TruncationConfig::default(),
+            judge: JudgeConfig::default(),
         }
     }
 
@@ -1435,7 +1491,11 @@ mod tests {
             })
         );
         assert_eq!(
-            super::end_context_item(&agent_loop::TurnItem::tool_result(&tool_result)).unwrap(),
+            super::end_context_item(&agent_loop::TurnItem::tool_result(
+                &tool_result,
+                &TruncationConfig::default(),
+            ))
+            .unwrap(),
             json!({"role": "tool", "tool_call_id": "call_file_001", "content": "# My Project"})
         );
         assert_eq!(

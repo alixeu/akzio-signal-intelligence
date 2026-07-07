@@ -1,0 +1,6 @@
+name = "ticker"
+injection_points = ["*"]
+priority = 10
+placeholder_key = "common_ticker_prompt"
+required_variables = ["ticker", "tickers"]
+enabled = true

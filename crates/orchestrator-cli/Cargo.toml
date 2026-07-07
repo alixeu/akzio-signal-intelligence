@@ -9,7 +9,9 @@ publish.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
+regex.workspace = true
 orchestrator-core = { path = "../orchestrator-core" }
+orchestrator-eval = { path = "../orchestrator-eval" }
 orchestrator-sql = { path = "../orchestrator-sql" }
 orchestrator-ingest = { path = "../orchestrator-ingest" }
 orchestrator-report = { path = "../orchestrator-report" }
@@ -62,3 +64,15 @@ path = "src/bin/fetch_last30days_context.rs"
 [[bin]]
 name = "probe-strict-schema"
 path = "src/bin/probe_strict_schema.rs"
+
+[[bin]]
+name = "orchestrator-eval"
+path = "src/bin/orchestrator_eval.rs"
+
+[[bin]]
+name = "orchestrator-prompt-lint"
+path = "src/bin/orchestrator_prompt_lint.rs"
+
+[[bin]]
+name = "orchestrator-metrics"
+path = "src/bin/orchestrator_metrics.rs"

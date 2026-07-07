@@ -18,7 +18,9 @@ use crate::orchestration::artifact::{
     persist_message_with_topic, reducer_brief_md, topic_id_from_topic,
     topics_from_generation_artifact,
 };
-use crate::orchestration::config::{config_weight, validate_sqlite_context, RuntimeConfig};
+use crate::orchestration::config::{
+    config_weight, is_critical_role, validate_sqlite_context, RuntimeConfig,
+};
 use crate::orchestration::contract::record_contracts;
 use crate::orchestration::degraded::{manager_research_fallback, role_artifact_or_degraded};
 use crate::orchestration::market_truth::market_truth_violation_report;
@@ -29,8 +31,8 @@ use crate::orchestration::policy::{
 use crate::orchestration::preflight::{enforce_preflight_policy, run_phase1_preflight};
 use crate::orchestration::render::mode_prompt_path;
 use crate::orchestration::role_jobs::{
-    merge_role_job_metrics, prepare_role_job, record_role_job_metrics, run_role_jobs,
-    run_single_role_job, run_single_steer_role_job, RoleRun, SteerRoleRun,
+    merge_role_job_metrics, persist_prompt_metric, prepare_role_job, record_role_job_metrics,
+    run_role_jobs, run_single_role_job, run_single_steer_role_job, RoleRun, SteerRoleRun,
 };
 use crate::orchestration::state::{
     append_topic_controller_artifact, append_topic_turn, run_id_for, set_phase_status,
@@ -165,6 +167,12 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         load_config(Some(&config_path)).unwrap_or_else(|_| json!({}))
     };
     let runtime_config = RuntimeConfig::from_value(&config)?;
+    debug!(
+        plugins_enabled = runtime_config.plugins.enabled,
+        component_plugins = runtime_config.component_plugins.components.len(),
+        role_plugins = runtime_config.role_plugins.roles.len(),
+        "prompt plugin runtime config loaded"
+    );
     let run_dir = resolve_run_dir(&args, &tickers, &date, &config);
     fs::create_dir_all(&run_dir)
         .with_context(|| format!("failed to create run dir {}", run_dir.display()))?;
@@ -177,7 +185,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
     } else {
         args.phase1_agents.clone()
     };
-    let phase1_agents = parse_phase1_agents(&phase1_agents_raw)?;
+    let phase1_agents = parse_phase1_agents_with_config(&phase1_agents_raw, &runtime_config)?;
     let model_override = args.model.clone().filter(|value| !value.is_empty());
     let reasoning_effort_override = args
         .reasoning_effort
@@ -215,6 +223,16 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         },
         "degraded": false
     });
+    if let Some(weights) = state
+        .get_mut("analyst_weights")
+        .and_then(Value::as_object_mut)
+    {
+        for def in runtime_config.agent_registry.phase1_agents() {
+            weights
+                .entry(def.role_id.clone())
+                .or_insert_with(|| json!(def.default_weight));
+        }
+    }
     state["mock"] = Value::Bool(args.mock);
     write_run_record(
         &mut conn,
@@ -453,6 +471,13 @@ fn validate_args(args: &ExecArgs) -> Result<()> {
 fn parse_phase1_agents(raw: &str) -> Result<Vec<String>> {
     let registry = orchestrator_core::role_registry::AgentRegistry::builtin();
     registry
+        .parse_role_list(raw)
+        .map_err(|e| anyhow::anyhow!(e))
+}
+
+fn parse_phase1_agents_with_config(raw: &str, config: &RuntimeConfig) -> Result<Vec<String>> {
+    config
+        .agent_registry
         .parse_role_list(raw)
         .map_err(|e| anyhow::anyhow!(e))
 }
@@ -765,8 +790,14 @@ async fn run_phase1(
         }
     }
 
+    let effective_roles = effective_phase1_roles(config, state, roles);
+    if effective_roles.is_empty() {
+        bail!("all phase 1 analysts have zero weight; check analyst_weights config");
+    }
+    record_phase1_skipped_zero_weight(config, state, roles, &effective_roles);
+
     let mut jobs = Vec::new();
-    for role in roles {
+    for &role in &effective_roles {
         jobs.push(prepare_role_job(RoleRun {
             state: state.clone(),
             role,
@@ -781,6 +812,10 @@ async fn run_phase1(
             prompt_path: config.prompts.analyst_path(role),
         })?);
     }
+    debug!(
+        job_count = jobs.len(),
+        "phase 1 jobs prepared after zero-weight filter"
+    );
     let results = run_role_jobs(
         jobs,
         config.workflow.phase1_parallelism,
@@ -798,6 +833,7 @@ async fn run_phase1(
             ok = result.artifact.is_some(),
             "phase 1 role finished"
         );
+        persist_prompt_metric(state, &result);
         record_role_job_metrics(state, &result);
         let artifact = role_artifact_or_degraded(state, config, result)?;
         persist_artifact(conn, state, 1, &role, artifact.clone())?;
@@ -813,6 +849,68 @@ async fn run_phase1(
     )
     .await?;
     Ok(())
+}
+
+fn effective_phase1_roles<'a>(
+    config: &RuntimeConfig,
+    state: &Value,
+    roles: &'a [String],
+) -> Vec<&'a str> {
+    if !config.workflow.skip_zero_weight_analysts {
+        return roles.iter().map(String::as_str).collect();
+    }
+
+    roles
+        .iter()
+        .filter_map(|role| {
+            if is_critical_role(config, role) {
+                return Some(role.as_str());
+            }
+            let weight = analyst_weight(state, role);
+            if weight <= 0.0 {
+                debug!(
+                    role = role.as_str(),
+                    weight, "skipping zero-weight analyst in phase 1"
+                );
+                None
+            } else {
+                Some(role.as_str())
+            }
+        })
+        .collect()
+}
+
+fn record_phase1_skipped_zero_weight(
+    config: &RuntimeConfig,
+    state: &mut Value,
+    roles: &[String],
+    effective_roles: &[&str],
+) {
+    if !config.workflow.skip_zero_weight_analysts {
+        return;
+    }
+
+    let skipped = roles
+        .iter()
+        .filter(|role| !effective_roles.contains(&role.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !skipped.is_empty() {
+        state["phase1_skipped_zero_weight"] = json!(skipped);
+        debug!(
+            skipped = ?state["phase1_skipped_zero_weight"],
+            "skipped zero-weight analysts in phase 1"
+        );
+    }
+}
+
+fn analyst_weight(state: &Value, role: &str) -> f64 {
+    state
+        .get("analyst_weights")
+        .and_then(Value::as_object)
+        .and_then(|weights| weights.get(role))
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0)
 }
 
 async fn run_phase2(
@@ -1641,6 +1739,137 @@ mod tests {
             .into_iter()
             .map(|role| (role.to_string(), test_llm_settings(false)))
             .collect()
+    }
+
+    fn test_runtime_config(skip_zero_weight_analysts: bool) -> RuntimeConfig {
+        RuntimeConfig {
+            llm_roles: std::collections::BTreeMap::new(),
+            web_search: std::collections::BTreeMap::new(),
+            truncation: orchestrator_llm::truncation::TruncationConfig::default(),
+            judge: orchestrator_llm::llm_judge::JudgeConfig::default(),
+            strict_sqlite: true,
+            required_contexts: Vec::new(),
+            prompts: crate::orchestration::config::PromptConfig {
+                prompts: std::collections::BTreeMap::new(),
+                manager_research: std::path::PathBuf::new(),
+                trader: std::path::PathBuf::new(),
+                risk_aggressive: std::path::PathBuf::new(),
+                risk_conservative: std::path::PathBuf::new(),
+                risk_neutral: std::path::PathBuf::new(),
+                portfolio_manager: std::path::PathBuf::new(),
+                allocation_manager: std::path::PathBuf::new(),
+            },
+            workflow: crate::orchestration::config::WorkflowConfig {
+                phase1_parallelism: 5,
+                agent_timeout_sec: 300,
+                reducer_timeout_sec: 300,
+                risk_rounds: 1,
+                critical_roles: ["analyst.technical", "analyst.news_macro"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+                late_evidence_enabled: true,
+                policy_mode: WorkflowPolicyMode::Selective,
+                policy_thresholds: Default::default(),
+                skip_zero_weight_analysts,
+            },
+            allocation: crate::orchestration::config::AllocationConfig {
+                investable_tickers: vec!["QQQ".to_string(), "SOXX".to_string()],
+                regime_signal: "VIX".to_string(),
+                regime_thresholds: vec![15.0, 20.0, 30.0],
+                regime_labels: vec![
+                    "risk_on".to_string(),
+                    "normal".to_string(),
+                    "elevated".to_string(),
+                    "defensive".to_string(),
+                ],
+                correlation_window_days: 60,
+                max_single_position: 0.70,
+                vol_indicator: "STD20".to_string(),
+            },
+            plugins: crate::orchestration::config::PluginConfig {
+                enabled: false,
+                components_dir: std::path::PathBuf::new(),
+                roles_dir: std::path::PathBuf::new(),
+                disabled_components: Vec::new(),
+                extra_component_dirs: Vec::new(),
+            },
+            component_plugins: crate::orchestration::plugin_loader::ComponentRegistry::default(),
+            role_plugins: crate::orchestration::plugin_loader::RolePluginRegistry::default(),
+            agent_registry: orchestrator_core::AgentRegistry::builtin(),
+        }
+    }
+
+    #[test]
+    fn phase1_zero_weight_filter_skips_non_critical_roles() {
+        let config = test_runtime_config(true);
+        let state = json!({
+            "analyst_weights": {
+                "analyst.technical": 40.0,
+                "analyst.news_macro": 35.0,
+                "analyst.youtube": 0.0
+            }
+        });
+        let roles = vec![
+            "analyst.technical".to_string(),
+            "analyst.news_macro".to_string(),
+            "analyst.youtube".to_string(),
+        ];
+
+        let effective_roles = effective_phase1_roles(&config, &state, &roles);
+
+        assert_eq!(
+            effective_roles,
+            vec!["analyst.technical", "analyst.news_macro"]
+        );
+    }
+
+    #[test]
+    fn phase1_zero_weight_filter_keeps_critical_roles() {
+        let config = test_runtime_config(true);
+        let state = json!({
+            "analyst_weights": {
+                "analyst.technical": 0.0,
+                "analyst.news_macro": 0.0,
+                "analyst.youtube": 0.0
+            }
+        });
+        let roles = vec![
+            "analyst.technical".to_string(),
+            "analyst.news_macro".to_string(),
+            "analyst.youtube".to_string(),
+        ];
+
+        let effective_roles = effective_phase1_roles(&config, &state, &roles);
+
+        assert_eq!(
+            effective_roles,
+            vec!["analyst.technical", "analyst.news_macro"]
+        );
+    }
+
+    #[test]
+    fn phase1_zero_weight_filter_can_be_disabled() {
+        let config = test_runtime_config(false);
+        let state = json!({
+            "analyst_weights": {
+                "analyst.technical": 40.0,
+                "analyst.news_macro": 35.0,
+                "analyst.youtube": 0.0
+            }
+        });
+        let roles = vec![
+            "analyst.technical".to_string(),
+            "analyst.news_macro".to_string(),
+            "analyst.youtube".to_string(),
+        ];
+
+        let effective_roles = effective_phase1_roles(&config, &state, &roles);
+
+        assert_eq!(
+            effective_roles,
+            vec!["analyst.technical", "analyst.news_macro", "analyst.youtube"]
+        );
     }
 
     #[test]

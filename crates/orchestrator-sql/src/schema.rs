@@ -225,6 +225,34 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_technical_lookup
             ON technical_indicators(ticker, indicator_name, interval, kline_time);
+        CREATE TABLE IF NOT EXISTS prompt_metrics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT NOT NULL DEFAULT '',
+            turn_id TEXT NOT NULL DEFAULT '',
+            session_id TEXT NOT NULL DEFAULT '',
+            role TEXT NOT NULL DEFAULT '',
+            phase INTEGER,
+            kind TEXT NOT NULL DEFAULT '',
+            round INTEGER,
+            topic_id TEXT,
+            prompt_version TEXT NOT NULL DEFAULT 'v1',
+            model TEXT NOT NULL DEFAULT '',
+            input_tokens INTEGER NOT NULL DEFAULT 0,
+            output_tokens INTEGER NOT NULL DEFAULT 0,
+            cached_tokens INTEGER NOT NULL DEFAULT 0,
+            total_tokens INTEGER NOT NULL DEFAULT 0,
+            turn_count INTEGER NOT NULL DEFAULT 0,
+            tool_call_count INTEGER NOT NULL DEFAULT 0,
+            latency_ms INTEGER NOT NULL DEFAULT 0,
+            validation_result TEXT NOT NULL DEFAULT 'unknown',
+            fallback_triggered INTEGER NOT NULL DEFAULT 0,
+            error_message TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_prompt_metrics_run
+            ON prompt_metrics(run_id, role);
+        CREATE INDEX IF NOT EXISTS idx_prompt_metrics_role_date
+            ON prompt_metrics(role, created_at);
         "#,
     )?;
 

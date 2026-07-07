@@ -2,8 +2,10 @@ use anyhow::{Context, Result};
 use futures::{stream, StreamExt};
 use orchestrator_core::default_project_root;
 use orchestrator_llm::{
-    mock_role_artifact, run_rig_agent_loop, run_rig_agent_steer_loop, tools::ExternalToolConfig,
-    OutputMode, RigSettings, RoleLlmSettings, SteerLoopInput,
+    agent_loop::ModelStreamResult, llm_judge::JudgeConfig, mock_role_artifact,
+    run_rig_agent_loop_with_metrics, run_rig_agent_steer_loop_with_metrics,
+    tools::ExternalToolConfig, truncation::TruncationConfig, AgentLoopOutput, OutputMode,
+    RigSettings, RoleLlmSettings, SteerLoopInput,
 };
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -11,9 +13,9 @@ use std::time::{Duration, Instant};
 use tokio::time;
 use tracing::{debug, warn};
 
-use super::config::{output_mode_for_role, RuntimeConfig};
+use super::config::{output_mode_for_role, prompt_version, RuntimeConfig};
 use super::degraded::role_artifact_or_degraded;
-use super::render::render_prompt;
+use super::render::render_prompt_with_plugins;
 use super::state::tickers_from_state;
 
 pub(crate) struct RoleRun<'a> {
@@ -57,12 +59,15 @@ pub(crate) struct RoleJob {
     pub mock: bool,
     pub prompt: String,
     pub prompt_path: Option<String>,
+    pub prompt_version: Option<String>,
     pub tickers: Vec<String>,
     pub output_mode: OutputMode,
     pub llm: Option<RoleLlmSettings>,
     pub reasoning_effort_override: Option<String>,
     pub tools: ExternalToolConfig,
     pub web_search: orchestrator_llm::web_search::WebSearchConfig,
+    pub truncation: TruncationConfig,
+    pub judge: JudgeConfig,
 }
 
 #[derive(Debug)]
@@ -73,10 +78,46 @@ pub(crate) struct RoleJobResult {
     pub round: Option<i64>,
     pub topic_id: Option<String>,
     pub tickers: Vec<String>,
+    pub prompt_version: Option<String>,
+    pub model: String,
+    pub turn_id: String,
+    pub session_id: String,
     pub artifact: Option<Value>,
     pub error: Option<String>,
     pub timed_out: bool,
     pub elapsed_ms: u128,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cached_tokens: u64,
+    pub total_tokens: u64,
+    pub turn_count: u64,
+    pub tool_call_count: u64,
+}
+
+fn prompt_version_for_role(state: &Value, role: &str) -> Option<String> {
+    let config = state.get("config")?;
+    let prompt_key = match role {
+        "analyst.technical" => "orchestrator.prompts.analyst.technical",
+        "analyst.news_macro" => "orchestrator.prompts.analyst.news_macro",
+        "analyst.youtube" => "orchestrator.prompts.analyst.youtube",
+        "analyst.reddit" => "orchestrator.prompts.analyst.reddit",
+        "analyst.x" => "orchestrator.prompts.analyst.x",
+        "researcher.bull.initial" => "orchestrator.prompts.phase2.bull_initial",
+        "researcher.bull.interaction" => "orchestrator.prompts.phase2.bull_interaction",
+        "researcher.bear.initial" => "orchestrator.prompts.phase2.bear_initial",
+        "researcher.bear.interaction" => "orchestrator.prompts.phase2.bear_interaction",
+        "mediator.topic" => "orchestrator.prompts.mediator.topic",
+        "mediator.topic_controller" => "orchestrator.prompts.mediator.topic_controller",
+        "manager.research" => "orchestrator.prompts.manager.research",
+        "trader" => "orchestrator.prompts.trader",
+        "risk.aggressive" => "orchestrator.prompts.risk.aggressive",
+        "risk.conservative" => "orchestrator.prompts.risk.conservative",
+        "risk.neutral" => "orchestrator.prompts.risk.neutral",
+        "portfolio.manager" => "orchestrator.prompts.portfolio.manager",
+        "allocation.manager" => "orchestrator.prompts.allocation.manager",
+        _ => return None,
+    };
+    Some(prompt_version(config, prompt_key))
 }
 
 pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
@@ -94,10 +135,20 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
         prompt_path,
     } = input;
     let tickers = tickers_from_state(&state);
+    let prompt_version = prompt_version_for_role(&state, role);
     let prompt = if mock {
         String::new()
     } else {
-        render_prompt(&state, role, phase, kind, round, topic_id, prompt_path)?
+        render_prompt_with_plugins(
+            &state,
+            role,
+            phase,
+            kind,
+            round,
+            topic_id,
+            prompt_path,
+            Some(&config.component_plugins),
+        )?
     };
     let llm = if mock {
         None
@@ -120,6 +171,7 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
         topic_id,
         mock,
         prompt_path = prompt_path.map(|path| path.display().to_string()),
+        prompt_version,
         prompt_chars = prompt.len(),
         "prepared role job"
     );
@@ -132,6 +184,7 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
         mock,
         prompt,
         prompt_path: prompt_path.map(|path| path.display().to_string()),
+        prompt_version,
         tickers: tickers.clone(),
         output_mode: output_mode_for_role(role),
         llm,
@@ -153,6 +206,8 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
             tickers,
         },
         web_search: config.web_search.get(role).cloned().unwrap_or_default(),
+        truncation: config.truncation.clone(),
+        judge: config.judge.clone(),
     })
 }
 
@@ -182,6 +237,7 @@ pub(crate) async fn run_single_role_job(
 ) -> Result<Value> {
     let job = prepare_role_job(input)?;
     let result = run_role_job_with_timeout(job, timeout_sec).await;
+    persist_prompt_metric(state_for_degraded, &result);
     record_role_job_metrics(state_for_degraded, &result);
     role_artifact_or_degraded(state_for_degraded, config, result)
 }
@@ -213,6 +269,7 @@ pub(crate) async fn run_single_steer_role_job(
         timeout_sec,
     )
     .await;
+    persist_prompt_metric(state_for_degraded, &result);
     record_role_job_metrics(state_for_degraded, &result);
     role_artifact_or_degraded(state_for_degraded, config, result)
 }
@@ -228,12 +285,77 @@ pub(crate) fn record_role_job_metrics(state: &mut Value, result: &RoleJobResult)
             "kind": result.kind,
             "round": result.round,
             "topic_id": result.topic_id,
+            "prompt_version": result.prompt_version,
             "timed_out": result.timed_out,
             "elapsed_ms": result.elapsed_ms,
-            "status": if result.artifact.is_some() { "ok" } else { "degraded" }
+            "status": if result.artifact.is_some() { "ok" } else { "degraded" },
+            "input_tokens": result.input_tokens,
+            "output_tokens": result.output_tokens,
+            "cached_tokens": result.cached_tokens,
+            "total_tokens": result.total_tokens,
+            "turn_count": result.turn_count,
+            "tool_call_count": result.tool_call_count
         }));
     }
     refresh_role_job_metrics(state);
+}
+
+pub(crate) fn persist_prompt_metric(state: &Value, result: &RoleJobResult) {
+    let Some(db_path) = state.get("db_path").and_then(Value::as_str) else {
+        return;
+    };
+    let Ok(conn) = orchestrator_sql::connect(db_path) else {
+        return;
+    };
+    let run_id = state
+        .get("run_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let session_id = if result.session_id.is_empty() {
+        state
+            .get("session_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    } else {
+        result.session_id.clone()
+    };
+    let validation_result = if result.artifact.is_some() {
+        "pass"
+    } else if result.timed_out || result.error.is_some() {
+        "degraded"
+    } else {
+        "unknown"
+    };
+    let _ = orchestrator_sql::metrics::insert_prompt_metric(
+        &conn,
+        &orchestrator_sql::metrics::PromptMetricInput {
+            run_id,
+            turn_id: result.turn_id.clone(),
+            session_id,
+            role: result.role.clone(),
+            phase: Some(result.phase),
+            kind: result.kind.clone(),
+            round: result.round,
+            topic_id: result.topic_id.clone(),
+            prompt_version: result
+                .prompt_version
+                .clone()
+                .unwrap_or_else(|| "v1".to_string()),
+            model: result.model.clone(),
+            input_tokens: result.input_tokens,
+            output_tokens: result.output_tokens,
+            cached_tokens: result.cached_tokens,
+            total_tokens: result.total_tokens,
+            turn_count: result.turn_count,
+            tool_call_count: result.tool_call_count,
+            latency_ms: result.elapsed_ms.min(u64::MAX as u128) as u64,
+            validation_result: validation_result.to_string(),
+            fallback_triggered: result.artifact.is_none(),
+            error_message: result.error.clone().unwrap_or_default(),
+        },
+    );
 }
 
 pub(crate) fn merge_role_job_metrics(state: &mut Value, metrics: &Value) {
@@ -289,6 +411,7 @@ async fn run_steer_role_job_with_timeout(
     let round = job.round;
     let topic_id = job.topic_id.clone();
     let tickers = job.tickers.clone();
+    let prompt_version = job.prompt_version.clone();
     let started_at = Instant::now();
     debug!(
         role,
@@ -300,7 +423,7 @@ async fn run_steer_role_job_with_timeout(
     )
     .await
     {
-        Ok(Ok(artifact)) => {
+        Ok(Ok(output)) => {
             let elapsed_ms = started_at.elapsed().as_millis();
             debug!(role, phase, kind, elapsed_ms, "steer role job completed");
             RoleJobResult {
@@ -310,10 +433,25 @@ async fn run_steer_role_job_with_timeout(
                 round,
                 topic_id,
                 tickers,
-                artifact: Some(artifact),
+                prompt_version,
+                model: output
+                    .artifact
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                turn_id: output.turn_id,
+                session_id: output.session_id,
+                artifact: Some(output.artifact),
                 error: None,
                 timed_out: false,
                 elapsed_ms,
+                input_tokens: output.metrics.input_tokens,
+                output_tokens: output.metrics.output_tokens,
+                cached_tokens: output.metrics.cached_tokens,
+                total_tokens: output.metrics.total_tokens,
+                turn_count: output.metrics.turn_count,
+                tool_call_count: output.metrics.tool_call_count,
             }
         }
         Ok(Err(error)) => {
@@ -326,10 +464,20 @@ async fn run_steer_role_job_with_timeout(
                 round,
                 topic_id,
                 tickers,
+                prompt_version,
+                model: String::new(),
+                turn_id: String::new(),
+                session_id: String::new(),
                 artifact: None,
                 error: Some(error.to_string()),
                 timed_out: false,
                 elapsed_ms,
+                input_tokens: 0,
+                output_tokens: 0,
+                cached_tokens: 0,
+                total_tokens: 0,
+                turn_count: 0,
+                tool_call_count: 0,
             }
         }
         Err(_) => {
@@ -345,10 +493,20 @@ async fn run_steer_role_job_with_timeout(
                 round,
                 topic_id,
                 tickers,
+                prompt_version,
+                model: String::new(),
+                turn_id: String::new(),
+                session_id: String::new(),
                 artifact: None,
                 error: Some(format!("role execution timed out after {timeout_sec}s")),
                 timed_out: true,
                 elapsed_ms,
+                input_tokens: 0,
+                output_tokens: 0,
+                cached_tokens: 0,
+                total_tokens: 0,
+                turn_count: 0,
+                tool_call_count: 0,
             }
         }
     }
@@ -361,6 +519,7 @@ pub(crate) async fn run_role_job_with_timeout(job: RoleJob, timeout_sec: u64) ->
     let round = job.round;
     let topic_id = job.topic_id.clone();
     let tickers = job.tickers.clone();
+    let prompt_version = job.prompt_version.clone();
     let started_at = Instant::now();
     debug!(
         role,
@@ -372,7 +531,7 @@ pub(crate) async fn run_role_job_with_timeout(job: RoleJob, timeout_sec: u64) ->
     )
     .await
     {
-        Ok(Ok(artifact)) => {
+        Ok(Ok(output)) => {
             let elapsed_ms = started_at.elapsed().as_millis();
             debug!(role, phase, kind, elapsed_ms, "role job completed");
             RoleJobResult {
@@ -382,10 +541,25 @@ pub(crate) async fn run_role_job_with_timeout(job: RoleJob, timeout_sec: u64) ->
                 round,
                 topic_id,
                 tickers,
-                artifact: Some(artifact),
+                prompt_version,
+                model: output
+                    .artifact
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                turn_id: output.turn_id,
+                session_id: output.session_id,
+                artifact: Some(output.artifact),
                 error: None,
                 timed_out: false,
                 elapsed_ms,
+                input_tokens: output.metrics.input_tokens,
+                output_tokens: output.metrics.output_tokens,
+                cached_tokens: output.metrics.cached_tokens,
+                total_tokens: output.metrics.total_tokens,
+                turn_count: output.metrics.turn_count,
+                tool_call_count: output.metrics.tool_call_count,
             }
         }
         Ok(Err(error)) => {
@@ -405,10 +579,20 @@ pub(crate) async fn run_role_job_with_timeout(job: RoleJob, timeout_sec: u64) ->
                 round,
                 topic_id,
                 tickers,
+                prompt_version,
+                model: String::new(),
+                turn_id: String::new(),
+                session_id: String::new(),
                 artifact: None,
                 error: Some(error.to_string()),
                 timed_out: false,
                 elapsed_ms,
+                input_tokens: 0,
+                output_tokens: 0,
+                cached_tokens: 0,
+                total_tokens: 0,
+                turn_count: 0,
+                tool_call_count: 0,
             }
         }
         Err(_) => {
@@ -424,16 +608,26 @@ pub(crate) async fn run_role_job_with_timeout(job: RoleJob, timeout_sec: u64) ->
                 round,
                 topic_id,
                 tickers,
+                prompt_version,
+                model: String::new(),
+                turn_id: String::new(),
+                session_id: String::new(),
                 artifact: None,
                 error: Some(format!("role execution timed out after {timeout_sec}s")),
                 timed_out: true,
                 elapsed_ms,
+                input_tokens: 0,
+                output_tokens: 0,
+                cached_tokens: 0,
+                total_tokens: 0,
+                turn_count: 0,
+                tool_call_count: 0,
             }
         }
     }
 }
 
-async fn execute_role_job(job: RoleJob) -> Result<Value> {
+async fn execute_role_job(job: RoleJob) -> Result<AgentLoopOutput> {
     if job.mock {
         debug!(
             role = job.role,
@@ -453,7 +647,15 @@ async fn execute_role_job(job: RoleJob) -> Result<Value> {
         if let Some(path) = job.prompt_path {
             artifact["prompt_path"] = Value::String(path);
         }
-        return Ok(artifact);
+        if let Some(version) = job.prompt_version {
+            artifact["prompt_version"] = Value::String(version);
+        }
+        return Ok(AgentLoopOutput {
+            artifact,
+            metrics: ModelStreamResult::default(),
+            turn_id: String::new(),
+            session_id: String::new(),
+        });
     }
     let llm = job
         .llm
@@ -467,6 +669,8 @@ async fn execute_role_job(job: RoleJob) -> Result<Value> {
         reasoning_effort_override: job.reasoning_effort_override,
         tools: Some(job.tools),
         web_search: job.web_search,
+        truncation: job.truncation,
+        judge: job.judge,
     };
     debug!(
         role = settings.role,
@@ -474,7 +678,7 @@ async fn execute_role_job(job: RoleJob) -> Result<Value> {
         prompt_chars = job.prompt.len(),
         "calling rig agent loop"
     );
-    run_rig_agent_loop(&settings, &job.prompt).await
+    run_rig_agent_loop_with_metrics(&settings, &job.prompt).await
 }
 
 async fn execute_steer_role_job(
@@ -482,7 +686,7 @@ async fn execute_steer_role_job(
     session_id: String,
     turn_id: String,
     steer: Option<String>,
-) -> Result<Value> {
+) -> Result<AgentLoopOutput> {
     if job.mock {
         let mut artifact = mock_role_artifact(&job.role, &job.tickers);
         artifact["phase"] = Value::Number(job.phase.into());
@@ -496,12 +700,20 @@ async fn execute_steer_role_job(
         if let Some(path) = job.prompt_path {
             artifact["prompt_path"] = Value::String(path);
         }
+        if let Some(version) = job.prompt_version {
+            artifact["prompt_version"] = Value::String(version);
+        }
         if let Some(steer) = steer {
             artifact["steer"] = Value::String(steer);
         }
-        artifact["session_id"] = Value::String(session_id);
-        artifact["turn_id"] = Value::String(turn_id);
-        return Ok(artifact);
+        artifact["session_id"] = Value::String(session_id.clone());
+        artifact["turn_id"] = Value::String(turn_id.clone());
+        return Ok(AgentLoopOutput {
+            artifact,
+            metrics: ModelStreamResult::default(),
+            turn_id,
+            session_id,
+        });
     }
     let llm = job
         .llm
@@ -515,8 +727,10 @@ async fn execute_steer_role_job(
         reasoning_effort_override: job.reasoning_effort_override,
         tools: Some(job.tools),
         web_search: job.web_search,
+        truncation: job.truncation,
+        judge: job.judge,
     };
-    run_rig_agent_steer_loop(
+    run_rig_agent_steer_loop_with_metrics(
         &settings,
         SteerLoopInput {
             session_id,
@@ -540,10 +754,20 @@ mod tests {
             round: None,
             topic_id: None,
             tickers: vec!["QQQ".to_string()],
+            prompt_version: Some("v1".to_string()),
+            model: "test-model".to_string(),
+            turn_id: "turn-1".to_string(),
+            session_id: "session-1".to_string(),
             artifact: if timed_out { None } else { Some(json!({})) },
             error: timed_out.then(|| "timeout".to_string()),
             timed_out,
             elapsed_ms,
+            input_tokens: 10,
+            output_tokens: 4,
+            cached_tokens: 2,
+            total_tokens: 14,
+            turn_count: 1,
+            tool_call_count: 3,
         }
     }
 
@@ -555,6 +779,13 @@ mod tests {
         record_role_job_metrics(&mut state, &result("trader", true, 11));
 
         assert_eq!(state["role_job_metrics"].as_array().unwrap().len(), 2);
+        assert_eq!(state["role_job_metrics"][0]["prompt_version"], "v1");
+        assert_eq!(state["role_job_metrics"][0]["input_tokens"], 10);
+        assert_eq!(state["role_job_metrics"][0]["output_tokens"], 4);
+        assert_eq!(state["role_job_metrics"][0]["cached_tokens"], 2);
+        assert_eq!(state["role_job_metrics"][0]["total_tokens"], 14);
+        assert_eq!(state["role_job_metrics"][0]["turn_count"], 1);
+        assert_eq!(state["role_job_metrics"][0]["tool_call_count"], 3);
         assert_eq!(state["workflow_metrics"]["role_job_count"], 2);
         assert_eq!(state["workflow_metrics"]["llm_call_count"], 2);
         assert_eq!(state["workflow_metrics"]["total_role_elapsed_ms"], 18);

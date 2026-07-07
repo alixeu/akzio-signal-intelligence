@@ -12,7 +12,7 @@ pub(crate) fn enforce_preflight_policy(
     role: &str,
     #[allow(unused_variables)] config: &RuntimeConfig,
 ) -> Result<()> {
-    let Some(tool) = preflight_tool_for_role(role) else {
+    let Some(tool) = preflight_tool_for_role_with_config(role, config) else {
         return Ok(());
     };
     let Some(status) = preflight_status(state, tool) else {
@@ -45,6 +45,17 @@ pub(crate) fn enforce_preflight_policy(
 
 pub(crate) fn preflight_tool_for_role(role: &str) -> Option<&'static str> {
     let registry = orchestrator_core::role_registry::AgentRegistry::builtin();
+    preflight_tool_from_registry(role, &registry)
+}
+
+fn preflight_tool_for_role_with_config(role: &str, config: &RuntimeConfig) -> Option<&'static str> {
+    preflight_tool_from_registry(role, &config.agent_registry)
+}
+
+fn preflight_tool_from_registry(
+    role: &str,
+    registry: &orchestrator_core::role_registry::AgentRegistry,
+) -> Option<&'static str> {
     match registry
         .get(role)
         .and_then(|def| def.preflight_tool.as_deref())
@@ -61,7 +72,7 @@ pub(crate) async fn run_phase1_preflight(
     role: &str,
     #[allow(unused_variables)] config: &RuntimeConfig,
 ) -> Result<()> {
-    match preflight_tool_for_role(role) {
+    match preflight_tool_for_role_with_config(role, config) {
         Some("run_technical_indicators") => run_technical_preflight(state).await,
         Some("fetch_jin10_flash") => run_jin10_preflight(conn, state).await,
         _ => Ok(()),

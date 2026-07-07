@@ -10,5 +10,6 @@ anyhow = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
 html-escape = { workspace = true }
+pulldown-cmark = "0.12"
 serde_json = { workspace = true }
 orchestrator-core = { path = "../orchestrator-core" }

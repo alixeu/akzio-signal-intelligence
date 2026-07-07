@@ -1,5 +1,6 @@
 pub mod context;
 pub mod importers;
+pub mod metrics;
 pub mod schema;
 pub mod write;
 

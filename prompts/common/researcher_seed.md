@@ -1,6 +1,10 @@
+<!-- This template has been inlined into researchers/bull_initial.md and researchers/bear_initial.md. It is no longer loaded by the renderer. -->
+
 你是一位{side_label}研究员。本轮只做初始分析和提出观点，不研究或回应对方观点。
 
 {common_ticker_prompt}
+
+{anti_injection}
 
 目标：
 - 作为{side_label} seed agent，只提出当前主题下可辩论的{side_label} candidate claims。

@@ -14,12 +14,12 @@ use std::{
 use tracing::{debug, warn};
 use uuid::Uuid;
 
+use crate::llm_judge::{judge_message_status, JudgeConfig};
 use crate::tools::{self, truncate_chars};
+use crate::truncation::{truncate_semantic, TruncationConfig};
 use crate::RigSettings;
 
 const DEFAULT_MAX_AGENT_LOOPS: usize = 8;
-const MAX_CONTEXT_FRAGMENT_CHARS: usize = 12_000;
-const MAX_TOOL_RESULT_CHARS: usize = 8_000;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TurnItemType {
@@ -270,7 +270,7 @@ impl TurnItem {
         }
     }
 
-    pub fn tool_result(result: &ToolResultItem) -> Self {
+    pub fn tool_result(result: &ToolResultItem, truncation: &TruncationConfig) -> Self {
         let status = if result.status == "completed" || result.status == "started" {
             AgentItemStatus::Completed
         } else {
@@ -286,7 +286,7 @@ impl TurnItem {
         Self {
             item_type: TurnItemType::ToolResult,
             role: "tool".to_string(),
-            content_text: truncate_chars(&content_text, MAX_TOOL_RESULT_CHARS),
+            content_text: truncate_tool_result(&content_text, truncation),
             content_json: json!({
                 "result": result,
                 "output_item_id": format!("result-{}", result.call_id),
@@ -388,6 +388,7 @@ pub struct ModelInput {
     pub system_instruction: Option<String>,
     pub items: Vec<TurnItem>,
     pub available_tools: Vec<String>,
+    pub truncation: TruncationConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -397,6 +398,7 @@ pub struct ModelResponse {
     pub tool_calls: Vec<ToolCallRequest>,
     pub end_turn: bool,
     pub raw: Value,
+    pub turn_status: TurnStatus,
 }
 
 #[derive(Debug, Clone)]
@@ -410,6 +412,7 @@ pub enum ModelStreamEvent {
     },
     AssistantMessageCompleted {
         item_id: String,
+        turn_status: TurnStatus,
     },
     ReasoningSummaryDelta {
         item_id: String,
@@ -436,6 +439,20 @@ pub struct ModelStreamResult {
     pub needs_follow_up: bool,
     pub last_assistant_message_id: Option<String>,
     pub tool_calls: Vec<ToolCallRequest>,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cached_tokens: u64,
+    pub total_tokens: u64,
+    pub turn_count: u64,
+    pub tool_call_count: u64,
+    pub(crate) assistant_message_decisions: Vec<AssistantMessageDecision>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct AssistantMessageDecision {
+    pub item_id: String,
+    pub text: String,
+    pub decision: FollowUpDecision,
 }
 
 pub trait LoopModel: Send {
@@ -486,7 +503,10 @@ pub(crate) fn response_to_stream_events(response: ModelResponse) -> Result<Vec<M
             item_id: item_id.clone(),
             delta: message,
         });
-        events.push(ModelStreamEvent::AssistantMessageCompleted { item_id });
+        events.push(ModelStreamEvent::AssistantMessageCompleted {
+            item_id,
+            turn_status: response.turn_status,
+        });
     }
     for tool_call in response.tool_calls {
         events.push(ModelStreamEvent::ToolCallCompleted { tool_call });
@@ -556,6 +576,11 @@ pub struct AgentLoopConfig {
     pub history_limit: usize,
     pub compact_after_items: usize,
     pub max_context_tokens: Option<usize>,
+    pub compact_at_token_ratio: f64,
+    pub truncation: TruncationConfig,
+    pub judge: JudgeConfig,
+    pub judge_endpoint: Option<String>,
+    pub judge_api_key: Option<String>,
 }
 
 impl Default for AgentLoopConfig {
@@ -565,6 +590,11 @@ impl Default for AgentLoopConfig {
             history_limit: 200,
             compact_after_items: 120,
             max_context_tokens: Some(orchestrator_core::token::MAX_PROMPT_TOKENS),
+            compact_at_token_ratio: 0.8,
+            truncation: TruncationConfig::default(),
+            judge: JudgeConfig::default(),
+            judge_endpoint: None,
+            judge_api_key: None,
         }
     }
 }
@@ -575,7 +605,7 @@ pub async fn run_turn<M, T>(
     model: &mut M,
     tools: &mut T,
     config: AgentLoopConfig,
-) -> Result<()>
+) -> Result<ModelStreamResult>
 where
     M: LoopModel,
     T: LoopToolRuntime,
@@ -591,7 +621,7 @@ pub async fn run_turn_with_events<M, T, S>(
     tools: &mut T,
     config: AgentLoopConfig,
     sink: &mut S,
-) -> Result<()>
+) -> Result<ModelStreamResult>
 where
     M: LoopModel,
     T: LoopToolRuntime,
@@ -606,9 +636,12 @@ where
         max_agent_loops = config.max_agent_loops,
         history_limit = config.history_limit,
         compact_after_items = config.compact_after_items,
+        max_context_tokens = config.max_context_tokens,
+        compact_at_token_ratio = config.compact_at_token_ratio,
+        truncation_strategy = ?config.truncation.strategy,
         "agent loop starting"
     );
-    persist_turn(conn, turn)?;
+    persist_turn(conn, turn, &config.truncation)?;
     tools.set_turn_context(ToolRuntimeTurnContext {
         run_id: turn.run_id.clone(),
         session_id: turn.session_id.clone(),
@@ -616,11 +649,18 @@ where
         role: turn.role.clone(),
     });
     if !turn.user_input.trim().is_empty() {
-        append_turn_item(conn, turn, &TurnItem::user(turn.user_input.clone()))?;
+        append_turn_item(
+            conn,
+            turn,
+            &TurnItem::user(turn.user_input.clone()),
+            &config.truncation,
+        )?;
     }
     let mut first_iteration = true;
     let max_loops = config.max_agent_loops.map(|value| value.max(1));
     let mut loop_index = 0usize;
+    let mut aggregate_result = ModelStreamResult::default();
+    let mut judge_call_count = 0usize;
     loop {
         if let Some(max_loops) = max_loops {
             if loop_index >= max_loops {
@@ -642,9 +682,12 @@ where
             "agent loop model iteration starting"
         );
         first_iteration = false;
-        let mut stream_handler = ModelStreamHandler::new(conn, turn, sink);
+        let mut stream_handler =
+            ModelStreamHandler::new(conn, turn, sink, config.truncation.clone());
         model.stream_events(input, &mut stream_handler).await?;
-        let stream_result = stream_handler.finish().await?;
+        let mut stream_result = stream_handler.finish().await?;
+        apply_judge_to_stream_result(turn, &config, &mut stream_result, &mut judge_call_count)
+            .await?;
         debug!(
             turn_id = turn.turn_id,
             role = turn.role,
@@ -652,8 +695,22 @@ where
             tool_calls = stream_result.tool_calls.len(),
             needs_follow_up = stream_result.needs_follow_up,
             last_assistant_message_id = stream_result.last_assistant_message_id,
+            input_tokens = stream_result.input_tokens,
+            output_tokens = stream_result.output_tokens,
+            cached_tokens = stream_result.cached_tokens,
+            total_tokens = stream_result.total_tokens,
             "agent loop model iteration completed"
         );
+        aggregate_result.input_tokens += stream_result.input_tokens;
+        aggregate_result.output_tokens += stream_result.output_tokens;
+        aggregate_result.cached_tokens += stream_result.cached_tokens;
+        aggregate_result.total_tokens += stream_result.total_tokens;
+        aggregate_result.turn_count += stream_result.turn_count;
+        aggregate_result.tool_call_count += stream_result.tool_call_count;
+        aggregate_result
+            .tool_calls
+            .extend(stream_result.tool_calls.iter().cloned());
+        aggregate_result.needs_follow_up = stream_result.needs_follow_up;
 
         if !turn.pending_tool_calls.is_empty() {
             let calls = std::mem::take(&mut turn.pending_tool_calls);
@@ -693,27 +750,34 @@ where
             // Emit results and append to DB (sequentially, in completion order)
             for (result, _call_id, _name) in results {
                 emit_tool_result(turn, sink, &result).await?;
-                append_turn_item(conn, turn, &TurnItem::tool_result(&result))?;
+                append_turn_item(
+                    conn,
+                    turn,
+                    &TurnItem::tool_result(&result, &config.truncation),
+                    &config.truncation,
+                )?;
             }
             turn.needs_follow_up = true;
-            persist_turn(conn, turn)?;
+            persist_turn(conn, turn, &config.truncation)?;
             continue;
         }
 
         if !turn.pending_input.is_empty() {
             turn.needs_follow_up = true;
-            persist_turn(conn, turn)?;
+            persist_turn(conn, turn, &config.truncation)?;
             continue;
         }
 
         if turn.needs_follow_up {
             turn.needs_follow_up = false;
-            persist_turn(conn, turn)?;
+            persist_turn(conn, turn, &config.truncation)?;
             continue;
         }
 
-        if let Some(item_id) = stream_result.last_assistant_message_id {
-            mark_last_assistant_message_as_final(conn, turn, &item_id, sink).await?;
+        if let Some(item_id) = stream_result.last_assistant_message_id.clone() {
+            aggregate_result.last_assistant_message_id = Some(item_id.clone());
+            mark_last_assistant_message_as_final(conn, turn, &item_id, sink, &config.truncation)
+                .await?;
         }
         turn.end_reason = Some("completed".to_string());
         update_agent_turn_end(conn, &turn.turn_id, false, "completed")?;
@@ -721,13 +785,127 @@ where
             turn_id = turn.turn_id,
             role = turn.role,
             loop_index,
+            input_tokens = aggregate_result.input_tokens,
+            output_tokens = aggregate_result.output_tokens,
+            cached_tokens = aggregate_result.cached_tokens,
+            total_tokens = aggregate_result.total_tokens,
+            turn_count = aggregate_result.turn_count,
+            tool_call_count = aggregate_result.tool_call_count,
             "agent loop completed"
         );
-        return Ok(());
+        return Ok(aggregate_result);
     }
 }
 
-fn persist_turn(conn: &rusqlite::Connection, turn: &Turn) -> Result<()> {
+async fn apply_judge_to_stream_result(
+    turn: &mut Turn,
+    config: &AgentLoopConfig,
+    stream_result: &mut ModelStreamResult,
+    judge_call_count: &mut usize,
+) -> Result<()> {
+    for item in &mut stream_result.assistant_message_decisions {
+        if !matches!(item.decision, FollowUpDecision::Ambiguous) {
+            continue;
+        }
+        if !config.judge.enabled {
+            debug!(
+                turn_id = turn.turn_id,
+                item_id = item.item_id,
+                "LLM judge disabled, defaulting ambiguous assistant message to Final"
+            );
+            item.decision = FollowUpDecision::Final;
+            continue;
+        }
+        if *judge_call_count >= config.judge.max_messages_per_turn {
+            warn!(
+                turn_id = turn.turn_id,
+                item_id = item.item_id,
+                count = *judge_call_count,
+                max = config.judge.max_messages_per_turn,
+                "LLM judge call limit reached, defaulting to Final"
+            );
+            item.decision = FollowUpDecision::Final;
+            continue;
+        }
+        let Some(endpoint) = config
+            .judge_endpoint
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            warn!(
+                turn_id = turn.turn_id,
+                item_id = item.item_id,
+                "LLM judge endpoint missing, defaulting to Final"
+            );
+            item.decision = FollowUpDecision::Final;
+            continue;
+        };
+        let Some(api_key) = config
+            .judge_api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            warn!(
+                turn_id = turn.turn_id,
+                item_id = item.item_id,
+                "LLM judge API key missing, defaulting to Final"
+            );
+            item.decision = FollowUpDecision::Final;
+            continue;
+        };
+        *judge_call_count += 1;
+        match judge_message_status(&item.text, endpoint, api_key, &config.judge.model).await {
+            Ok(true) => {
+                debug!(
+                    turn_id = turn.turn_id,
+                    item_id = item.item_id,
+                    "LLM judge classified assistant message as stall"
+                );
+                item.decision = FollowUpDecision::NeedsFollowUp;
+            }
+            Ok(false) => {
+                debug!(
+                    turn_id = turn.turn_id,
+                    item_id = item.item_id,
+                    "LLM judge classified assistant message as final"
+                );
+                item.decision = FollowUpDecision::Final;
+            }
+            Err(error) => {
+                warn!(
+                    turn_id = turn.turn_id,
+                    item_id = item.item_id,
+                    error = %error,
+                    "LLM judge failed, defaulting to Final"
+                );
+                item.decision = FollowUpDecision::Final;
+            }
+        }
+    }
+    stream_result.needs_follow_up = stream_result.needs_follow_up
+        || stream_result
+            .assistant_message_decisions
+            .iter()
+            .any(|item| matches!(item.decision, FollowUpDecision::NeedsFollowUp));
+    turn.needs_follow_up = stream_result.needs_follow_up;
+    Ok(())
+}
+
+fn truncate_tool_result(content: &str, truncation: &TruncationConfig) -> String {
+    truncate_semantic(content, truncation.tool_result_chars, truncation)
+}
+
+fn truncate_context_fragment(content: &str, truncation: &TruncationConfig) -> String {
+    truncate_semantic(content, truncation.context_fragment_chars, truncation)
+}
+
+fn persist_turn(
+    conn: &rusqlite::Connection,
+    turn: &Turn,
+    truncation: &TruncationConfig,
+) -> Result<()> {
     upsert_agent_turn(
         conn,
         &AgentTurnInput {
@@ -737,7 +915,7 @@ fn persist_turn(conn: &rusqlite::Connection, turn: &Turn) -> Result<()> {
             phase: turn.phase,
             role: turn.role.clone(),
             user_input: turn.user_input.clone(),
-            model_context: truncate_chars(&turn.model_context, MAX_CONTEXT_FRAGMENT_CHARS),
+            model_context: truncate_context_fragment(&turn.model_context, truncation),
             cancellation_state: turn.cancellation_state.clone(),
             needs_follow_up: turn.needs_follow_up,
             end_reason: turn.end_reason.clone().unwrap_or_default(),
@@ -745,7 +923,12 @@ fn persist_turn(conn: &rusqlite::Connection, turn: &Turn) -> Result<()> {
     )
 }
 
-fn append_turn_item(conn: &rusqlite::Connection, turn: &mut Turn, item: &TurnItem) -> Result<i64> {
+fn append_turn_item(
+    conn: &rusqlite::Connection,
+    turn: &mut Turn,
+    item: &TurnItem,
+    truncation: &TruncationConfig,
+) -> Result<i64> {
     let row_id = append_agent_turn_item(
         conn,
         &AgentTurnItemInput {
@@ -757,7 +940,7 @@ fn append_turn_item(conn: &rusqlite::Connection, turn: &mut Turn, item: &TurnIte
             tool_call_id: item.tool_call_id.clone(),
             tool_name: item.tool_name.clone(),
             content_json: item.content_json.clone(),
-            content_text: truncate_chars(&item.content_text, MAX_TOOL_RESULT_CHARS),
+            content_text: truncate_tool_result(&item.content_text, truncation),
         },
     )?;
     let mut stored = item.clone();
@@ -773,6 +956,7 @@ fn update_turn_item(
     content_text: String,
     phase: Option<AgentItemPhase>,
     status: AgentItemStatus,
+    truncation: &TruncationConfig,
 ) -> Result<Option<TurnItem>> {
     let Some(index) = turn
         .emitted_items
@@ -796,7 +980,7 @@ fn update_turn_item(
             conn,
             row_id,
             &item.content_json,
-            &truncate_chars(&item.content_text, MAX_TOOL_RESULT_CHARS),
+            &truncate_tool_result(&item.content_text, truncation),
         )?;
     }
     turn.emitted_items[index] = item.clone();
@@ -974,7 +1158,7 @@ fn build_model_input(
     }
     while let Some(input) = turn.pending_input.pop_front() {
         let item = TurnItem::user(format!("Steer: {input}"));
-        append_turn_item(conn, turn, &item)?;
+        append_turn_item(conn, turn, &item, &config.truncation)?;
         items.push(item);
     }
     let latest_reasoning_state = items
@@ -982,13 +1166,42 @@ fn build_model_input(
         .rev()
         .find(|item| item.item_type == TurnItemType::ReasoningState)
         .cloned();
-    if items.len() > config.compact_after_items {
+    let total_tokens = estimate_items_tokens(&items);
+    let token_threshold = config
+        .max_context_tokens
+        .map(|max_tokens| token_compaction_threshold(max_tokens, config.compact_at_token_ratio))
+        .unwrap_or(usize::MAX);
+    let needs_token_compaction = total_tokens > token_threshold;
+    let needs_item_compaction = items.len() > config.compact_after_items;
+    if needs_token_compaction || needs_item_compaction {
+        let trigger = if needs_token_compaction {
+            "token_threshold"
+        } else {
+            "item_count"
+        };
+        let items_before = items.len();
+        debug!(
+            turn_id = turn.turn_id,
+            role = turn.role,
+            items_count = items_before,
+            estimated_tokens = total_tokens,
+            token_threshold,
+            compact_after_items = config.compact_after_items,
+            trigger,
+            "compaction triggered"
+        );
         let summary = compact_summary_card(&items);
         let item = TurnItem {
             item_type: TurnItemType::CompactSummary,
             role: "system".to_string(),
             content_text: summary.clone(),
-            content_json: json!({"summary": summary}),
+            content_json: json!({
+                "summary": summary,
+                "compaction_trigger": trigger,
+                "items_compacted": items_before,
+                "estimated_tokens_before": total_tokens,
+                "token_threshold": token_threshold,
+            }),
             tool_call_id: String::new(),
             tool_name: String::new(),
             output_item_id: String::new(),
@@ -996,11 +1209,21 @@ fn build_model_input(
             status: None,
             db_row_id: None,
         };
-        append_turn_item(conn, turn, &item)?;
+        append_turn_item(conn, turn, &item, &config.truncation)?;
         items = vec![item];
         if let Some(reasoning_state) = latest_reasoning_state.clone() {
             items.push(reasoning_state);
         }
+        debug!(
+            turn_id = turn.turn_id,
+            role = turn.role,
+            trigger,
+            items_before,
+            items_after = items.len(),
+            tokens_before = total_tokens,
+            tokens_after = estimate_items_tokens(&items),
+            "compaction completed"
+        );
     }
     if let Some(max_tokens) = config.max_context_tokens {
         let mut kept: Vec<TurnItem> = Vec::new();
@@ -1010,12 +1233,7 @@ fn build_model_input(
                 kept.push(item.clone());
                 continue;
             }
-            let tokens = orchestrator_core::token::estimate_turn_item_tokens(
-                item.item_type.as_str(),
-                &item.role,
-                &item.content_text,
-                &item.content_json,
-            );
+            let tokens = estimate_turn_item_tokens(item);
             if total_tokens + tokens <= max_tokens || kept.is_empty() {
                 total_tokens += tokens;
                 kept.push(item.clone());
@@ -1029,7 +1247,28 @@ fn build_model_input(
         items,
         available_tools: tools.clone(),
         system_instruction: Some(react_system_instruction(&tools)),
+        truncation: config.truncation.clone(),
     })
+}
+
+fn estimate_turn_item_tokens(item: &TurnItem) -> usize {
+    orchestrator_core::token::estimate_turn_item_tokens(
+        item.item_type.as_str(),
+        &item.role,
+        &item.content_text,
+        &item.content_json,
+    )
+}
+
+fn estimate_items_tokens(items: &[TurnItem]) -> usize {
+    items.iter().map(estimate_turn_item_tokens).sum()
+}
+
+fn token_compaction_threshold(max_tokens: usize, ratio: f64) -> usize {
+    if !ratio.is_finite() || ratio <= 0.0 {
+        return max_tokens;
+    }
+    ((max_tokens as f64) * ratio).floor().max(1.0) as usize
 }
 
 fn turn_available_tools(turn: &Turn) -> Vec<String> {
@@ -1133,10 +1372,16 @@ struct ModelStreamHandler<'a, S: AgentEventSink> {
     result: ModelStreamResult,
     assistant_buffers: BTreeMap<String, String>,
     reasoning_buffers: BTreeMap<String, String>,
+    truncation: TruncationConfig,
 }
 
 impl<'a, S: AgentEventSink> ModelStreamHandler<'a, S> {
-    fn new(conn: &'a rusqlite::Connection, turn: &'a mut Turn, sink: &'a mut S) -> Self {
+    fn new(
+        conn: &'a rusqlite::Connection,
+        turn: &'a mut Turn,
+        sink: &'a mut S,
+        truncation: TruncationConfig,
+    ) -> Self {
         Self {
             conn,
             turn,
@@ -1144,6 +1389,7 @@ impl<'a, S: AgentEventSink> ModelStreamHandler<'a, S> {
             result: ModelStreamResult::default(),
             assistant_buffers: BTreeMap::new(),
             reasoning_buffers: BTreeMap::new(),
+            truncation,
         }
     }
 
@@ -1155,7 +1401,7 @@ impl<'a, S: AgentEventSink> ModelStreamHandler<'a, S> {
                     item_id, "model stream assistant message started"
                 );
                 let item = started_assistant_item(&item_id);
-                append_turn_item(self.conn, self.turn, &item)?;
+                append_turn_item(self.conn, self.turn, &item, &self.truncation)?;
                 emit_started(
                     self.turn,
                     self.sink,
@@ -1175,17 +1421,34 @@ impl<'a, S: AgentEventSink> ModelStreamHandler<'a, S> {
                     buffer.clone(),
                     Some(AgentItemPhase::Commentary),
                     AgentItemStatus::InProgress,
+                    &self.truncation,
                 )?;
                 emit_delta(self.turn, self.sink, &item_id, &delta).await?;
             }
-            ModelStreamEvent::AssistantMessageCompleted { item_id } => {
+            ModelStreamEvent::AssistantMessageCompleted {
+                item_id,
+                turn_status,
+            } => {
                 let text = self.assistant_buffers.remove(&item_id).unwrap_or_default();
                 debug!(
                     turn_id = self.turn.turn_id,
                     item_id,
                     text_chars = text.len(),
+                    turn_status = ?turn_status,
                     "model stream assistant message completed"
                 );
+                let decision = classify_assistant_message(&text, turn_status);
+                let needs_follow_up = matches!(decision, FollowUpDecision::NeedsFollowUp);
+                if needs_follow_up {
+                    self.result.needs_follow_up = true;
+                }
+                self.result
+                    .assistant_message_decisions
+                    .push(AssistantMessageDecision {
+                        item_id: item_id.clone(),
+                        text: text.clone(),
+                        decision,
+                    });
                 if let Some(item) = update_turn_item(
                     self.conn,
                     self.turn,
@@ -1193,6 +1456,7 @@ impl<'a, S: AgentEventSink> ModelStreamHandler<'a, S> {
                     text,
                     Some(AgentItemPhase::Commentary),
                     AgentItemStatus::Completed,
+                    &self.truncation,
                 )? {
                     emit_completed(self.turn, self.sink, &item).await?;
                 }
@@ -1201,7 +1465,7 @@ impl<'a, S: AgentEventSink> ModelStreamHandler<'a, S> {
             ModelStreamEvent::ReasoningSummaryDelta { item_id, delta } => {
                 if !self.reasoning_buffers.contains_key(&item_id) {
                     let item = started_reasoning_item(&item_id);
-                    append_turn_item(self.conn, self.turn, &item)?;
+                    append_turn_item(self.conn, self.turn, &item, &self.truncation)?;
                     emit_started(
                         self.turn,
                         self.sink,
@@ -1218,6 +1482,7 @@ impl<'a, S: AgentEventSink> ModelStreamHandler<'a, S> {
                     buffer.clone(),
                     None,
                     AgentItemStatus::InProgress,
+                    &self.truncation,
                 )?;
                 emit_delta(self.turn, self.sink, &item_id, &delta).await?;
             }
@@ -1236,6 +1501,7 @@ impl<'a, S: AgentEventSink> ModelStreamHandler<'a, S> {
                     text,
                     None,
                     AgentItemStatus::Completed,
+                    &self.truncation,
                 )? {
                     emit_completed(self.turn, self.sink, &item).await?;
                 }
@@ -1266,7 +1532,7 @@ impl<'a, S: AgentEventSink> ModelStreamHandler<'a, S> {
                     status: Some(AgentItemStatus::Completed),
                     db_row_id: None,
                 };
-                append_turn_item(self.conn, self.turn, &item)?;
+                append_turn_item(self.conn, self.turn, &item, &self.truncation)?;
             }
             ModelStreamEvent::ToolCallCompleted { tool_call } => {
                 debug!(
@@ -1276,7 +1542,7 @@ impl<'a, S: AgentEventSink> ModelStreamHandler<'a, S> {
                     "model stream tool call requested"
                 );
                 let item = TurnItem::tool_call(&tool_call);
-                append_turn_item(self.conn, self.turn, &item)?;
+                append_turn_item(self.conn, self.turn, &item, &self.truncation)?;
                 emit_completed(
                     self.turn,
                     self.sink,
@@ -1284,14 +1550,27 @@ impl<'a, S: AgentEventSink> ModelStreamHandler<'a, S> {
                 )
                 .await?;
                 self.result.needs_follow_up = true;
+                self.result.tool_call_count += 1;
                 self.result.tool_calls.push(tool_call.clone());
                 self.turn.pending_tool_calls.push(tool_call);
             }
-            ModelStreamEvent::ResponseCompleted { end_turn, raw: _ } => {
+            ModelStreamEvent::ResponseCompleted { end_turn, raw } => {
+                let (input_tokens, output_tokens, cached_tokens, total_tokens) =
+                    extract_token_usage(&raw);
                 debug!(
                     turn_id = self.turn.turn_id,
-                    end_turn, "model stream response completed"
+                    end_turn,
+                    input_tokens,
+                    output_tokens,
+                    cached_tokens,
+                    total_tokens,
+                    "model stream response completed"
                 );
+                self.result.input_tokens += input_tokens;
+                self.result.output_tokens += output_tokens;
+                self.result.cached_tokens += cached_tokens;
+                self.result.total_tokens += total_tokens;
+                self.result.turn_count += 1;
                 if !end_turn {
                     self.result.needs_follow_up = true;
                 }
@@ -1302,10 +1581,15 @@ impl<'a, S: AgentEventSink> ModelStreamHandler<'a, S> {
 
     async fn finish(mut self) -> Result<ModelStreamResult> {
         self.result.needs_follow_up = self.result.needs_follow_up
+            || self
+                .result
+                .assistant_message_decisions
+                .iter()
+                .any(|item| matches!(item.decision, FollowUpDecision::NeedsFollowUp))
             || !self.turn.pending_tool_calls.is_empty()
             || !self.turn.pending_input.is_empty();
         self.turn.needs_follow_up = self.result.needs_follow_up;
-        persist_turn(self.conn, self.turn)?;
+        persist_turn(self.conn, self.turn, &self.truncation)?;
         Ok(self.result)
     }
 }
@@ -1324,6 +1608,7 @@ async fn mark_last_assistant_message_as_final<S: AgentEventSink>(
     turn: &mut Turn,
     item_id: &str,
     sink: &mut S,
+    truncation: &TruncationConfig,
 ) -> Result<()> {
     if let Some(item) = update_turn_item(
         conn,
@@ -1337,6 +1622,7 @@ async fn mark_last_assistant_message_as_final<S: AgentEventSink>(
             .unwrap_or_default(),
         Some(AgentItemPhase::Final),
         AgentItemStatus::Completed,
+        truncation,
     )? {
         emit_completed(turn, sink, &item).await?;
     }
@@ -1356,6 +1642,7 @@ pub fn parse_react_response(value: Value) -> Result<ModelResponse> {
             tool_calls: Vec::new(),
             end_turn: true,
             raw: value,
+            turn_status: TurnStatus::Unknown,
         });
     }
     let assistant_message = value
@@ -1371,6 +1658,7 @@ pub fn parse_react_response(value: Value) -> Result<ModelResponse> {
         .get("end_turn")
         .and_then(Value::as_bool)
         .unwrap_or(true);
+    let turn_status = extract_turn_status(&value);
     let tool_calls = value
         .get("tool_calls")
         .and_then(Value::as_array)
@@ -1391,22 +1679,70 @@ pub fn parse_react_response(value: Value) -> Result<ModelResponse> {
         tool_calls,
         end_turn,
         raw: value,
+        turn_status,
     })
 }
 
-pub(crate) fn assistant_message_needs_follow_up(text: &str) -> bool {
+/// Turn status as reported by the LLM in the assistant_message_completed event.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TurnStatus {
+    /// LLM reports this is the final artifact.
+    Final,
+    /// LLM reports this is an intermediate/stall message.
+    Intermediate,
+    /// LLM did not report a status (legacy or omitted).
+    #[default]
+    Unknown,
+}
+
+/// Result of stall detection for an assistant message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FollowUpDecision {
+    /// The message is a stall; the agent loop should continue.
+    NeedsFollowUp,
+    /// The message is final; the agent loop should end the turn.
+    Final,
+    /// The message is ambiguous; run the LLM judge to decide.
+    Ambiguous,
+}
+
+/// Extract turn_status from the assistant_message_completed event metadata.
+/// The event may carry {"turn_status": "final" | "intermediate"} as an extra field.
+pub fn extract_turn_status(event: &Value) -> TurnStatus {
+    match event
+        .get("turn_status")
+        .and_then(Value::as_str)
+        .map(|value| value.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("final") => TurnStatus::Final,
+        Some("intermediate") => TurnStatus::Intermediate,
+        _ => TurnStatus::Unknown,
+    }
+}
+
+/// Fast first-pass stall detection (no LLM call).
+/// Uses self-reported status, phrase matching, length check, and JSON detection.
+pub fn classify_assistant_message(text: &str, turn_status: TurnStatus) -> FollowUpDecision {
     let trimmed = text.trim();
+
+    match turn_status {
+        TurnStatus::Final => return FollowUpDecision::Final,
+        TurnStatus::Intermediate => return FollowUpDecision::NeedsFollowUp,
+        TurnStatus::Unknown => {}
+    }
+
     if trimmed.is_empty() {
-        return true;
+        return FollowUpDecision::NeedsFollowUp;
     }
     if trimmed.chars().count() > 1_200 {
-        return false;
+        return FollowUpDecision::Final;
     }
     if extract_json_value(trimmed).is_ok_and(|value| value.is_object()) {
-        return false;
+        return FollowUpDecision::Final;
     }
     let lower = trimmed.to_ascii_lowercase();
-    [
+    let phrase_match = [
         "i need a few key inputs",
         "i need a ticker",
         "without a ticker",
@@ -1426,7 +1762,24 @@ pub(crate) fn assistant_message_needs_follow_up(text: &str) -> bool {
         "需要补上",
     ]
     .iter()
-    .any(|pattern| lower.contains(pattern) || trimmed.contains(pattern))
+    .any(|pattern| lower.contains(pattern) || trimmed.contains(pattern));
+
+    if phrase_match {
+        return FollowUpDecision::NeedsFollowUp;
+    }
+    if trimmed.chars().count() < 200 {
+        return FollowUpDecision::Ambiguous;
+    }
+    FollowUpDecision::Final
+}
+
+/// Synchronous wrapper for backward compatibility.
+/// Does NOT run the LLM judge; ambiguous messages default to Final.
+pub(crate) fn assistant_message_needs_follow_up(text: &str) -> bool {
+    matches!(
+        classify_assistant_message(text, TurnStatus::Unknown),
+        FollowUpDecision::NeedsFollowUp
+    )
 }
 
 pub fn react_system_instruction(available_tools: &[String]) -> String {
@@ -1437,40 +1790,86 @@ Use assistant message events for visible text. Intermediate explanations, plans,
 Supported event shapes:\n\
 {{\"type\":\"assistant_message_started\",\"item_id\":\"msg-1\"}}\n\
 {{\"type\":\"assistant_text_delta\",\"item_id\":\"msg-1\",\"delta\":\"visible text chunk\"}}\n\
-{{\"type\":\"assistant_message_completed\",\"item_id\":\"msg-1\"}}\n\
+{{\"type\":\"assistant_message_completed\",\"item_id\":\"msg-1\",\"turn_status\":\"final\"}}\n\
 {{\"type\":\"reasoning_summary_delta\",\"item_id\":\"reasoning-1\",\"delta\":\"brief reasoning summary chunk\"}}\n\
 {{\"type\":\"reasoning_summary_completed\",\"item_id\":\"reasoning-1\"}}\n\
 {{\"type\":\"tool_call_completed\",\"tool_call\":{{\"call_id\":\"call-1\",\"name\":\"tool_name\",\"arguments\":{{}},\"mode\":\"blocking\"}}}}\n\
 {{\"type\":\"response_completed\",\"end_turn\":true}}\n\
+The `turn_status` field in assistant_message_completed events is optional but recommended. Set it to \"final\" when the message contains the complete role artifact (JSON with id, role, status, per_ticker). Set it to \"intermediate\" when the message is commentary, planning, or asking for inputs before producing the final artifact. If omitted, the runtime will infer the status from message content.\n\
 If you need a tool, emit any visible commentary first, then tool_call_completed, then response_completed with end_turn=false. If tool results answer the task, emit the final assistant_message and response_completed with end_turn=true. A final assistant_message must be the complete role artifact, preferably one JSON object with id, role, status, report, and per_ticker. Do not end the turn with text saying you are about to retry, fetch, analyze, or wait for inputs; call the tool or produce the final artifact. For web.run use {{\"search_query\":[{{\"q\":\"TQQQ QQQ VIX site:reddit.com\",\"domains\":[\"reddit.com\"],\"numResults\":10}}],\"response_length\":\"medium\"}}. For fetch_last30days_context use {{\"source\":\"reddit\",\"tickers\":[\"TQQQ\"]}}. The runtime also accepts the older single-object response shape only as a compatibility fallback.\n\n\
 Available tools:\n{}",
         serde_json::to_string_pretty(available_tools).unwrap_or_default()
     )
 }
 
-pub(crate) fn react_context_prompt(input: &ModelInput) -> Result<String> {
-    let items = input
-        .items
-        .iter()
-        .filter(|item| item.item_type != TurnItemType::ReasoningState)
-        .map(|item| {
-            json!({
-                "type": item.item_type.as_str(),
-                "role": item.role,
-                "content_text": truncate_chars(&item.content_text, MAX_CONTEXT_FRAGMENT_CHARS),
-                "content_json": item.content_json,
-                "tool_call_id": item.tool_call_id,
-                "tool_name": item.tool_name
-            })
-        })
-        .collect::<Vec<_>>();
-    Ok(serde_json::to_string_pretty(&items)?)
+fn turn_item_prompt_json(
+    item: &TurnItem,
+    include_tool_metadata: bool,
+    truncation: &TruncationConfig,
+) -> Value {
+    let mut value = json!({
+        "type": item.item_type.as_str(),
+        "role": item.role,
+        "content_text": truncate_context_fragment(&item.content_text, truncation),
+        "content_json": item.content_json,
+    });
+    if include_tool_metadata {
+        if let Some(map) = value.as_object_mut() {
+            map.insert("tool_call_id".to_string(), json!(item.tool_call_id));
+            map.insert("tool_name".to_string(), json!(item.tool_name));
+        }
+    }
+    value
+}
+
+pub fn extract_token_usage(raw: &Value) -> (u64, u64, u64, u64) {
+    let usage = raw
+        .get("usage")
+        .or_else(|| raw.get("raw").and_then(|raw| raw.get("usage")));
+    let input_tokens = usage
+        .and_then(|usage| usage.get("input_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let output_tokens = usage
+        .and_then(|usage| usage.get("output_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let cached_tokens = usage
+        .and_then(|usage| usage.get("input_tokens_details"))
+        .and_then(|details| details.get("cached_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let total_tokens = usage
+        .and_then(|usage| usage.get("total_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(input_tokens + output_tokens);
+    (input_tokens, output_tokens, cached_tokens, total_tokens)
 }
 
 pub fn react_prompt(input: &ModelInput) -> Result<String> {
     let system = react_system_instruction(&input.available_tools);
-    let context = react_context_prompt(input)?;
-    Ok(format!("{system}\n\nContext items:\n{context}"))
+    let mut static_items = Vec::new();
+    let mut dynamic_items = Vec::new();
+    let mut captured_role_prompt = false;
+
+    for item in input
+        .items
+        .iter()
+        .filter(|item| item.item_type != TurnItemType::ReasoningState)
+    {
+        if !captured_role_prompt && item.item_type == TurnItemType::UserMessage {
+            static_items.push(turn_item_prompt_json(item, false, &input.truncation));
+            captured_role_prompt = true;
+        } else {
+            dynamic_items.push(turn_item_prompt_json(item, true, &input.truncation));
+        }
+    }
+
+    let static_context = serde_json::to_string_pretty(&static_items)?;
+    let dynamic_context = serde_json::to_string_pretty(&dynamic_items)?;
+    Ok(format!(
+        "{system}\n\nStatic context:\n{static_context}\n\nDynamic context:\n{dynamic_context}"
+    ))
 }
 
 pub(crate) fn extract_json_value(text: &str) -> Result<Value> {
@@ -1487,6 +1886,8 @@ pub(crate) fn extract_json_value(text: &str) -> Result<Value> {
 }
 
 pub fn compact_summary_card(items: &[TurnItem]) -> String {
+    let total_tokens = estimate_items_tokens(items);
+    let chars_per_item = if total_tokens > 20_000 { 500 } else { 240 };
     let recent = items
         .iter()
         .rev()
@@ -1497,16 +1898,92 @@ pub fn compact_summary_card(items: &[TurnItem]) -> String {
                 "- {} {} {}",
                 item.item_type.as_str(),
                 item.tool_name,
-                truncate_chars(&item.content_text, 240)
+                truncate_chars(&item.content_text, chars_per_item)
             )
         })
         .collect::<Vec<_>>()
         .join("\n");
+    let critical_context = extract_critical_context(items);
     format!(
-        "Conversation Summary Card\n\nGoal:\n- Continue the current agent turn.\n\nDecisions:\n- Preserve ReAct item order and only inject compact state into the next model request.\n\nCurrent State:\n- {} items were compacted.\n\nOpen Tasks:\n- Continue from the latest pending input, tool result, or assistant request.\n\nImportant Context:\n- Do not drop file paths, commands, errors, or user steering.\n\nRecent Tool Results:\n{}",
+        "Conversation Summary Card\n\nGoal:\n- Continue the current agent turn.\n\nDecisions:\n- Preserve ReAct item order and only inject compact state into the next model request.\n\nCurrent State:\n- {} items were compacted (~{} tokens).\n\nOpen Tasks:\n- Continue from the latest pending input, tool result, or assistant request.\n\nImportant Context:\n- Do not drop file paths, commands, errors, or user steering.\n\nCritical Context Preserved:\n{}\n\nRecent Tool Results:\n{}",
         items.len(),
+        total_tokens,
+        critical_context,
         recent
     )
+}
+
+fn extract_critical_context(items: &[TurnItem]) -> String {
+    let mut critical = Vec::new();
+    for item in items {
+        collect_paths(&item.content_text, &mut critical);
+        collect_urls(&item.content_text, &mut critical);
+        if item.item_type == TurnItemType::ToolResult && contains_error_signal(&item.content_text) {
+            critical.push(format!(
+                "error: {}",
+                truncate_chars(&item.content_text, 200)
+            ));
+        }
+        if critical.len() >= 20 {
+            break;
+        }
+    }
+
+    if critical.is_empty() {
+        "None".to_string()
+    } else {
+        critical.into_iter().take(20).collect::<Vec<_>>().join("\n")
+    }
+}
+
+fn collect_paths(text: &str, critical: &mut Vec<String>) {
+    for token in text.split_whitespace() {
+        if critical.len() >= 20 {
+            break;
+        }
+        let candidate = trim_context_token(token);
+        if candidate.starts_with('/') && has_important_path_extension(candidate) {
+            critical.push(format!("path: {candidate}"));
+        }
+    }
+}
+
+fn collect_urls(text: &str, critical: &mut Vec<String>) {
+    for token in text.split_whitespace() {
+        if critical.len() >= 20 {
+            break;
+        }
+        let candidate = trim_context_token(token);
+        if candidate.starts_with("http://") || candidate.starts_with("https://") {
+            critical.push(format!("url: {candidate}"));
+        }
+    }
+}
+
+fn trim_context_token(token: &str) -> &str {
+    token.trim_matches(|ch: char| {
+        matches!(
+            ch,
+            ',' | '.' | ':' | ';' | '"' | '\'' | ')' | ']' | '}' | '(' | '[' | '{' | '<' | '>'
+        )
+    })
+}
+
+fn has_important_path_extension(path: &str) -> bool {
+    [
+        ".rs", ".md", ".json", ".yaml", ".yml", ".sqlite", ".db", ".txt",
+    ]
+    .iter()
+    .any(|extension| path.ends_with(extension))
+}
+
+fn contains_error_signal(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("error")
+        || lower.contains("failed")
+        || lower.contains("panic")
+        || lower.contains("bail!")
+        || lower.contains("unwrap")
 }
 
 #[cfg(test)]
@@ -1826,7 +2303,171 @@ mod tests {
                 "assistant_message": message,
                 "end_turn": end_turn
             }),
+            turn_status: TurnStatus::Unknown,
         }
+    }
+
+    fn agent_loop_config_with_judge(judge: JudgeConfig) -> AgentLoopConfig {
+        AgentLoopConfig {
+            judge,
+            judge_endpoint: Some("http://127.0.0.1:9".to_string()),
+            judge_api_key: Some("test-key".to_string()),
+            ..AgentLoopConfig::default()
+        }
+    }
+
+    #[test]
+    fn empty_message_needs_follow_up() {
+        assert!(assistant_message_needs_follow_up(""));
+        assert!(assistant_message_needs_follow_up("   "));
+    }
+
+    #[test]
+    fn long_message_is_final() {
+        let long = "x".repeat(1201);
+        assert!(!assistant_message_needs_follow_up(&long));
+    }
+
+    #[test]
+    fn json_object_is_final() {
+        let json = r#"{"id": "test", "role": "analyst.technical", "per_ticker": {}}"#;
+        assert!(!assistant_message_needs_follow_up(json));
+    }
+
+    #[test]
+    fn phrase_match_needs_follow_up() {
+        assert!(assistant_message_needs_follow_up(
+            "I need a few key inputs to proceed"
+        ));
+        assert!(assistant_message_needs_follow_up("接下来我会分析"));
+        assert!(assistant_message_needs_follow_up("retry the request"));
+    }
+
+    #[test]
+    fn turn_status_final_overrides_phrase_match() {
+        let decision = classify_assistant_message("retry the request", TurnStatus::Final);
+        assert_eq!(decision, FollowUpDecision::Final);
+    }
+
+    #[test]
+    fn turn_status_intermediate_overrides_json() {
+        let json = r#"{"id": "test", "role": "analyst", "per_ticker": {}}"#;
+        let decision = classify_assistant_message(json, TurnStatus::Intermediate);
+        assert_eq!(decision, FollowUpDecision::NeedsFollowUp);
+    }
+
+    #[test]
+    fn short_non_json_no_phrase_is_ambiguous() {
+        let decision = classify_assistant_message("Let me check the data.", TurnStatus::Unknown);
+        assert_eq!(decision, FollowUpDecision::Ambiguous);
+        assert!(!assistant_message_needs_follow_up("Let me check the data."));
+    }
+
+    #[test]
+    fn medium_non_json_no_phrase_is_final() {
+        let msg = "This is a medium-length message that does not match any phrases ".to_string()
+            + &"and is over 200 chars ".repeat(10)
+            + "but under 1200.";
+        let decision = classify_assistant_message(&msg, TurnStatus::Unknown);
+        assert_eq!(decision, FollowUpDecision::Final);
+    }
+
+    #[test]
+    fn extract_turn_status_reads_optional_metadata() {
+        assert_eq!(
+            extract_turn_status(&json!({"turn_status": "final"})),
+            TurnStatus::Final
+        );
+        assert_eq!(
+            extract_turn_status(&json!({"turn_status": "intermediate"})),
+            TurnStatus::Intermediate
+        );
+        assert_eq!(extract_turn_status(&json!({})), TurnStatus::Unknown);
+    }
+
+    #[tokio::test]
+    async fn ambiguous_message_defaults_final_when_judge_disabled() {
+        let mut turn = Turn::new("turn-judge", "session-1", "run-1", "analyst.test", "start");
+        let mut result = ModelStreamResult {
+            needs_follow_up: false,
+            assistant_message_decisions: vec![AssistantMessageDecision {
+                item_id: "msg-1".to_string(),
+                text: "Let me check the data.".to_string(),
+                decision: FollowUpDecision::Ambiguous,
+            }],
+            ..ModelStreamResult::default()
+        };
+        let config = agent_loop_config_with_judge(JudgeConfig {
+            enabled: false,
+            ..JudgeConfig::default()
+        });
+        let mut judge_calls = 0;
+
+        apply_judge_to_stream_result(&mut turn, &config, &mut result, &mut judge_calls)
+            .await
+            .unwrap();
+
+        assert_eq!(judge_calls, 0);
+        assert!(!result.needs_follow_up);
+        assert_eq!(
+            result.assistant_message_decisions[0].decision,
+            FollowUpDecision::Final
+        );
+    }
+
+    #[tokio::test]
+    async fn ambiguous_message_defaults_final_when_judge_cap_reached() {
+        let mut turn = Turn::new("turn-judge", "session-1", "run-1", "analyst.test", "start");
+        let mut result = ModelStreamResult::default();
+        result
+            .assistant_message_decisions
+            .push(AssistantMessageDecision {
+                item_id: "msg-1".to_string(),
+                text: "Let me check the data.".to_string(),
+                decision: FollowUpDecision::Ambiguous,
+            });
+        let config = agent_loop_config_with_judge(JudgeConfig {
+            max_messages_per_turn: 0,
+            ..JudgeConfig::default()
+        });
+        let mut judge_calls = 0;
+
+        apply_judge_to_stream_result(&mut turn, &config, &mut result, &mut judge_calls)
+            .await
+            .unwrap();
+
+        assert_eq!(judge_calls, 0);
+        assert!(!result.needs_follow_up);
+        assert_eq!(
+            result.assistant_message_decisions[0].decision,
+            FollowUpDecision::Final
+        );
+    }
+
+    #[tokio::test]
+    async fn ambiguous_message_defaults_final_when_judge_fails() {
+        let mut turn = Turn::new("turn-judge", "session-1", "run-1", "analyst.test", "start");
+        let mut result = ModelStreamResult::default();
+        result
+            .assistant_message_decisions
+            .push(AssistantMessageDecision {
+                item_id: "msg-1".to_string(),
+                text: "Let me check the data.".to_string(),
+                decision: FollowUpDecision::Ambiguous,
+            });
+        let config = agent_loop_config_with_judge(JudgeConfig::default());
+        let mut judge_calls = 0;
+
+        apply_judge_to_stream_result(&mut turn, &config, &mut result, &mut judge_calls)
+            .await
+            .unwrap();
+
+        assert_eq!(judge_calls, 1);
+        assert!(!result.needs_follow_up);
+        assert_eq!(
+            result.assistant_message_decisions[0].decision,
+            FollowUpDecision::Final
+        );
     }
 
     fn assistant_texts(conn: &rusqlite::Connection) -> Vec<String> {
@@ -1840,6 +2481,28 @@ mod tests {
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap()
+    }
+
+    fn test_item(item_type: TurnItemType, role: &str, content_text: String) -> TurnItem {
+        TurnItem {
+            item_type,
+            role: role.to_string(),
+            content_text,
+            content_json: Value::Null,
+            tool_call_id: String::new(),
+            tool_name: String::new(),
+            output_item_id: String::new(),
+            phase: None,
+            status: None,
+            db_row_id: None,
+        }
+    }
+
+    fn append_history(conn: &rusqlite::Connection, turn: &mut Turn, items: Vec<TurnItem>) {
+        persist_turn(conn, turn, &TruncationConfig::default()).unwrap();
+        for item in items {
+            append_turn_item(conn, turn, &item, &TruncationConfig::default()).unwrap();
+        }
     }
 
     fn item_count(conn: &rusqlite::Connection, item_type: &str) -> i64 {
@@ -1862,6 +2525,138 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    #[test]
+    fn token_based_compaction_triggers_before_item_count() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+        let mut turn = Turn::new(
+            "turn-compact",
+            "session-compact",
+            "run-1",
+            "analyst.test",
+            "",
+        );
+        let items = (0..10)
+            .map(|index| {
+                test_item(
+                    TurnItemType::ToolResult,
+                    "tool",
+                    format!("/tmp/large-{index}.rs {}", "x".repeat(8_000)),
+                )
+            })
+            .collect::<Vec<_>>();
+        let total_tokens = estimate_items_tokens(&items);
+        assert!(total_tokens > 9_600);
+        assert!(items.len() < 120);
+        append_history(&conn, &mut turn, items);
+
+        let input =
+            build_model_input(&conn, &mut turn, false, &AgentLoopConfig::default()).unwrap();
+
+        assert_eq!(input.items[0].item_type, TurnItemType::CompactSummary);
+        assert_eq!(
+            input.items[0].content_json["compaction_trigger"],
+            "token_threshold"
+        );
+        assert_eq!(input.items[0].content_json["items_compacted"], 10);
+        assert!(
+            input.items[0].content_json["estimated_tokens_before"]
+                .as_u64()
+                .unwrap()
+                > 9_600
+        );
+        assert!(input.items[0].content_text.contains("~"));
+        assert!(input.items[0].content_text.contains("path: /tmp/large-"));
+    }
+
+    #[test]
+    fn item_count_compaction_still_works_as_fallback() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+        let mut turn = Turn::new("turn-items", "session-items", "run-1", "analyst.test", "");
+        let items = (0..121)
+            .map(|index| {
+                test_item(
+                    TurnItemType::AssistantMessage,
+                    "assistant",
+                    format!("msg {index}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let total_tokens = estimate_items_tokens(&items);
+        assert!(total_tokens < 9_600);
+        assert!(items.len() > 120);
+        append_history(&conn, &mut turn, items);
+
+        let input =
+            build_model_input(&conn, &mut turn, false, &AgentLoopConfig::default()).unwrap();
+
+        assert_eq!(input.items[0].item_type, TurnItemType::CompactSummary);
+        assert_eq!(
+            input.items[0].content_json["compaction_trigger"],
+            "item_count"
+        );
+        assert_eq!(input.items[0].content_json["items_compacted"], 121);
+    }
+
+    #[test]
+    fn compaction_does_not_trigger_under_item_and_token_thresholds() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+        let mut turn = Turn::new("turn-small", "session-small", "run-1", "analyst.test", "");
+        let items = (0..50)
+            .map(|index| {
+                test_item(
+                    TurnItemType::AssistantMessage,
+                    "assistant",
+                    format!("msg {index} {}", "x".repeat(100)),
+                )
+            })
+            .collect::<Vec<_>>();
+        let total_tokens = estimate_items_tokens(&items);
+        assert!(total_tokens < 9_600);
+        append_history(&conn, &mut turn, items);
+
+        let input =
+            build_model_input(&conn, &mut turn, false, &AgentLoopConfig::default()).unwrap();
+
+        assert_eq!(input.items.len(), 50);
+        assert!(!input
+            .items
+            .iter()
+            .any(|item| item.item_type == TurnItemType::CompactSummary));
+    }
+
+    #[test]
+    fn compact_summary_card_preserves_critical_context() {
+        let items = vec![
+            test_item(
+                TurnItemType::UserMessage,
+                "user",
+                "Please edit /Users/alixeu/project/akzio-signal-intelligence/crates/orchestrator-llm/src/agent_loop.rs".to_string(),
+            ),
+            test_item(
+                TurnItemType::ToolResult,
+                "tool",
+                "Command failed with error: panic while reading https://example.com/context".to_string(),
+            ),
+        ];
+
+        let summary = compact_summary_card(&items);
+
+        assert!(summary.contains("items were compacted (~"));
+        assert!(summary.contains("path: /Users/alixeu/project/akzio-signal-intelligence/crates/orchestrator-llm/src/agent_loop.rs"));
+        assert!(summary.contains("url: https://example.com/context"));
+        assert!(summary.contains("error: Command failed with error"));
+    }
+
+    #[test]
+    fn token_compaction_threshold_defaults_to_max_tokens_for_invalid_ratio() {
+        assert_eq!(token_compaction_threshold(12_000, 0.8), 9_600);
+        assert_eq!(token_compaction_threshold(12_000, 0.0), 12_000);
+        assert_eq!(token_compaction_threshold(12_000, f64::NAN), 12_000);
     }
 
     #[tokio::test]
@@ -2014,6 +2809,57 @@ mod tests {
         );
     }
 
+    #[test]
+    fn react_prompt_splits_static_role_prompt_from_dynamic_turn_items() {
+        let tool_result = ToolResultItem {
+            call_id: "call-1".to_string(),
+            name: "read_run_context".to_string(),
+            status: "ok".to_string(),
+            output: json!({"dynamic": true}),
+            error: None,
+        };
+        let input = ModelInput {
+            system_instruction: None,
+            items: vec![
+                TurnItem::user("STATIC ROLE PROMPT"),
+                TurnItem::assistant("dynamic assistant note", Value::Null),
+                TurnItem::tool_result(&tool_result, &TruncationConfig::default()),
+            ],
+            available_tools: vec!["read_run_context".to_string()],
+            truncation: TruncationConfig::default(),
+        };
+
+        let prompt = react_prompt(&input).unwrap();
+        let static_index = prompt.find("Static context:").unwrap();
+        let dynamic_index = prompt.find("Dynamic context:").unwrap();
+        assert!(static_index < dynamic_index);
+        assert!(prompt[static_index..dynamic_index].contains("STATIC ROLE PROMPT"));
+        assert!(!prompt[static_index..dynamic_index].contains("dynamic assistant note"));
+        assert!(prompt[dynamic_index..].contains("dynamic assistant note"));
+        assert!(prompt[dynamic_index..].contains("read_run_context"));
+    }
+
+    #[test]
+    fn extract_token_usage_reads_cached_tokens_from_response_usage() {
+        let raw = json!({
+            "usage": {
+                "input_tokens": 1200,
+                "output_tokens": 80,
+                "total_tokens": 1280,
+                "input_tokens_details": {"cached_tokens": 384}
+            }
+        });
+
+        assert_eq!(extract_token_usage(&raw), (1200, 80, 384, 1280));
+        assert_eq!(extract_token_usage(&json!({"usage": {}})), (0, 0, 0, 0));
+        assert_eq!(
+            extract_token_usage(
+                &json!({"raw": {"usage": {"input_tokens": 7, "output_tokens": 5}}})
+            ),
+            (7, 5, 0, 12)
+        );
+    }
+
     #[tokio::test]
     async fn streaming_assistant_text_deltas_merge_into_one_intermediate_item() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -2037,6 +2883,7 @@ mod tests {
                 },
                 ModelStreamEvent::AssistantMessageCompleted {
                     item_id: "msg-1".to_string(),
+                    turn_status: TurnStatus::Unknown,
                 },
                 ModelStreamEvent::ResponseCompleted {
                     end_turn: false,
@@ -2053,6 +2900,7 @@ mod tests {
                 },
                 ModelStreamEvent::AssistantMessageCompleted {
                     item_id: "msg-2".to_string(),
+                    turn_status: TurnStatus::Unknown,
                 },
                 ModelStreamEvent::ResponseCompleted {
                     end_turn: true,
@@ -2098,10 +2946,11 @@ mod tests {
         ensure_schema(&conn).unwrap();
         let mut sink = RecordingSink::default();
         let mut turn = Turn::new("turn-1", "session-1", "run-1", "analyst.test", "start");
-        persist_turn(&conn, &turn).unwrap();
+        persist_turn(&conn, &turn, &TruncationConfig::default()).unwrap();
 
         {
-            let mut handler = ModelStreamHandler::new(&conn, &mut turn, &mut sink);
+            let mut handler =
+                ModelStreamHandler::new(&conn, &mut turn, &mut sink, TruncationConfig::default());
             handler
                 .handle(ModelStreamEvent::AssistantMessageStarted {
                     item_id: "msg-live".to_string(),
@@ -2153,6 +3002,7 @@ mod tests {
                 }],
                 end_turn: false,
                 raw: json!({"step": 1}),
+                turn_status: TurnStatus::Unknown,
             },
             ModelResponse {
                 assistant_message: Some("Final after observed.".to_string()),
@@ -2160,6 +3010,7 @@ mod tests {
                 tool_calls: vec![],
                 end_turn: true,
                 raw: json!({"step": 2}),
+                turn_status: TurnStatus::Unknown,
             },
         ]);
         let mut tools = StaticToolRuntime::new();
@@ -2220,6 +3071,7 @@ mod tests {
                 }],
                 end_turn: false,
                 raw: json!({"step": 1}),
+                turn_status: TurnStatus::Unknown,
             },
             ModelResponse {
                 assistant_message: Some("Final after web result.".to_string()),
@@ -2227,6 +3079,7 @@ mod tests {
                 tool_calls: vec![],
                 end_turn: true,
                 raw: json!({"step": 2}),
+                turn_status: TurnStatus::Unknown,
             },
         ]);
         let config = WebSearchConfig {
@@ -2320,7 +3173,7 @@ mod tests {
     }
 
     #[test]
-    fn react_context_prompt_hides_encrypted_reasoning_state() {
+    fn react_prompt_hides_encrypted_reasoning_state() {
         let input = ModelInput {
             system_instruction: None,
             items: vec![
@@ -2342,9 +3195,10 @@ mod tests {
                 },
             ],
             available_tools: Vec::new(),
+            truncation: TruncationConfig::default(),
         };
 
-        let prompt = react_context_prompt(&input).unwrap();
+        let prompt = react_prompt(&input).unwrap();
 
         assert!(prompt.contains("visible request"));
         assert!(!prompt.contains("secret-state"));

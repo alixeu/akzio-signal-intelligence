@@ -85,18 +85,32 @@ fn build_payload(
     } else {
         json!({})
     };
-    let summary = fs::read_to_string(&final_summary_path).unwrap_or_default();
+
+    // Generate the structured human-readable report from state artifacts.
+    let report_markdown = crate::builder::build_human_readable_report(&state);
+    let report_html = crate::builder::report_to_html(&report_markdown);
+    let report_md_path = run_dir.join("report.md");
+    fs::write(&report_md_path, &report_markdown)?;
+
+    // Preserve final_summary.md content for backward compatibility with any
+    // callers that still read the raw field.
+    let final_summary = fs::read_to_string(&final_summary_path).unwrap_or_default();
+
     Ok(json!({
         "subject": config_str(config, "report.subject_template", "TQQQ strategy report {date}").replace("{date}", today),
         "today": today,
-        "orchestrator_status": if state_path.exists() && final_summary_path.exists() { "complete" } else { "missing" },
+        "orchestrator_status": if state_path.exists() && report_md_path.exists() { "complete" } else { "missing" },
         "run_dir": run_dir,
         "state_path": state_path,
         "final_summary_path": final_summary_path,
+        "report_md_path": report_md_path,
         "html_path": html_path,
         "payload_path": payload_path,
         "orchestrator_state": state,
-        "final_summary": summary
+        "report_markdown": report_markdown,
+        "report_html": report_html,
+        // Keep final_summary for backward compat (raw final_summary.md text).
+        "final_summary": final_summary
     }))
 }
 
@@ -105,6 +119,15 @@ fn build_html(payload: &Value) -> String {
         .get("subject")
         .and_then(Value::as_str)
         .unwrap_or("Daily Report");
+
+    // Use the structured report HTML when the builder produced one.
+    if let Some(report_html) = payload.get("report_html").and_then(Value::as_str) {
+        if !report_html.is_empty() {
+            return report_html.to_string();
+        }
+    }
+
+    // Fallback to the legacy raw <pre> wrapper for backward compatibility.
     let summary = payload
         .get("final_summary")
         .and_then(Value::as_str)

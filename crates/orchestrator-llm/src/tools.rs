@@ -5,6 +5,7 @@ use std::{path::PathBuf, sync::Arc};
 use tracing::{debug, warn};
 
 use crate::agent_loop::ToolRuntimeTurnContext;
+use crate::truncation::{truncate_semantic, TruncationConfig};
 use crate::web_search::{
     SearchQuery, SearchResult, WebSearchContextSize, WebSearchMode, WebSearchOptions,
 };
@@ -38,6 +39,7 @@ pub type SharedWebSearchProvider = Arc<dyn WebSearchProvider>;
 pub struct WebRunRuntime {
     config: WebSearchConfig,
     provider: Option<SharedWebSearchProvider>,
+    truncation: TruncationConfig,
 }
 
 impl WebRunRuntime {
@@ -45,7 +47,13 @@ impl WebRunRuntime {
         Self {
             config,
             provider: None,
+            truncation: TruncationConfig::default(),
         }
+    }
+
+    pub fn with_truncation(mut self, truncation: TruncationConfig) -> Self {
+        self.truncation = truncation;
+        self
     }
 
     pub fn with_provider(mut self, provider: SharedWebSearchProvider) -> Self {
@@ -58,7 +66,13 @@ impl WebRunRuntime {
     }
 
     pub async fn execute(&self, args: Value) -> Result<Value> {
-        execute_web_run(args, &self.config, self.provider.as_deref()).await
+        execute_web_run(
+            args,
+            &self.config,
+            self.provider.as_deref(),
+            &self.truncation,
+        )
+        .await
     }
 }
 
@@ -299,6 +313,7 @@ async fn execute_web_run(
     args: Value,
     config: &WebSearchConfig,
     provider: Option<&dyn WebSearchProvider>,
+    truncation: &TruncationConfig,
 ) -> Result<Value> {
     debug!(
         mode = ?config.mode,
@@ -358,6 +373,7 @@ async fn execute_web_run(
         allowed_domains: config.allowed_domains.clone(),
         blocked_domains: config.blocked_domains.clone(),
         max_result_chars: config.max_result_chars,
+        truncation: truncation.clone(),
     };
     let results = match provider.search(search_queries, options).await {
         Ok(results) => results,
@@ -368,9 +384,10 @@ async fn execute_web_run(
     };
     let results = filter_web_search_results(results, config);
     debug!(result_count = results.len(), "web.run completed");
-    let text = truncate_chars(
+    let text = truncate_semantic(
         &format_web_search_results(&results),
         config.max_result_chars,
+        truncation,
     );
     Ok(json!({
         "status": "success",
@@ -690,7 +707,7 @@ fn clean_text_field(value: &str) -> String {
         .to_string()
 }
 
-pub(crate) fn truncate_chars(value: &str, max_chars: usize) -> String {
+pub fn truncate_chars(value: &str, max_chars: usize) -> String {
     if value.chars().count() <= max_chars {
         return value.to_string();
     }
@@ -1136,7 +1153,9 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(truncated["text"].as_str().unwrap().ends_with("[truncated]"));
+        let truncated_text = truncated["text"].as_str().unwrap();
+        assert!(truncated_text.contains("[... middle truncated ...]"));
+        assert!(truncated_text.chars().count() <= 80);
     }
 
     #[tokio::test]

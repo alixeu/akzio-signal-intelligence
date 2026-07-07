@@ -4,6 +4,7 @@ use serde_json::{json, Value};
 use std::collections::BTreeSet;
 
 use super::config::RuntimeConfig;
+use super::conflict_detection::detect_all_conflicts;
 use super::state::tickers_from_state;
 
 pub(crate) fn build_phase1_state_artifact(state: &Value, config: &RuntimeConfig) -> Value {
@@ -67,17 +68,29 @@ pub(crate) fn build_phase1_state_artifact(state: &Value, config: &RuntimeConfig)
                     let payload = reports
                         .get(role)
                         .and_then(|artifact| artifact_for_ticker(artifact, ticker));
+                    let key_evidence = payload
+                        .and_then(|value| value.get("key_evidence").or_else(|| value.get("evidence")))
+                        .cloned()
+                        .unwrap_or_else(|| json!([]));
                     json!({
                         "role": role,
                         "status": if missing_sources.contains(role) { "missing" } else { "ready" },
                         "stance": payload.and_then(|value| value.get("direction")).and_then(Value::as_str).unwrap_or("neutral"),
                         "confidence": payload.and_then(|value| value.get("confidence")).cloned().unwrap_or(Value::Null),
-                        "key_evidence": payload.and_then(|value| value.get("evidence")).cloned().unwrap_or_else(|| json!([])),
+                        "key_evidence": key_evidence,
+                        "evidence_type_summary": payload
+                            .map(summarize_evidence_types)
+                            .unwrap_or_else(empty_evidence_type_summary),
                         "weaknesses": payload.and_then(|value| value.get("weaknesses")).cloned().unwrap_or_else(|| json!([])),
                         "source_node_ids": payload.and_then(|value| value.get("source_node_ids")).cloned().unwrap_or_else(|| json!([])),
                         "summary": payload.and_then(|value| value.get("report")).and_then(Value::as_str).unwrap_or("")
                     })
                 })
+                .collect::<Vec<_>>();
+            let conflicts = detect_all_conflicts(ticker, &role_summaries);
+            let conflict_values = conflicts
+                .iter()
+                .map(|conflict| conflict.to_json())
                 .collect::<Vec<_>>();
             (
                 ticker.clone(),
@@ -93,7 +106,8 @@ pub(crate) fn build_phase1_state_artifact(state: &Value, config: &RuntimeConfig)
                     "evidence_clusters": [],
                     "independent_signals": [],
                     "duplicate_signals": [],
-                    "conflicts": [],
+                    "cross_analyst_conflicts": conflict_values.clone(),
+                    "conflicts": conflict_values,
                     "missing_evidence": degraded_noncritical_roles,
                     "decision_hinges": [],
                     "topic_candidates": [
@@ -111,6 +125,13 @@ pub(crate) fn build_phase1_state_artifact(state: &Value, config: &RuntimeConfig)
             )
         })
         .collect::<serde_json::Map<_, _>>();
+    let cross_analyst_conflicts_summary = per_ticker
+        .values()
+        .filter_map(|ticker_artifact| ticker_artifact.get("cross_analyst_conflicts"))
+        .filter_map(Value::as_array)
+        .flatten()
+        .cloned()
+        .collect::<Vec<_>>();
     json!({
         "id": "reducer.evidence",
         "role": "reducer.evidence",
@@ -128,12 +149,60 @@ pub(crate) fn build_phase1_state_artifact(state: &Value, config: &RuntimeConfig)
         "weighted_probability_base": weighted_probability_base,
         "per_ticker": per_ticker,
         "topic_candidates": fallback_topics_for_tickers(&tickers),
+        "cross_analyst_conflicts_summary": cross_analyst_conflicts_summary,
         "cross_ticker_notes": [],
         "reducer_checks": {
             "json_valid": true,
             "no_new_external_facts": true,
             "all_claims_source_backed": true
         }
+    })
+}
+
+fn empty_evidence_type_summary() -> Value {
+    json!({
+        "fact_count": 0,
+        "opinion_count": 0,
+        "speculation_count": 0,
+        "unclassified_count": 0,
+        "speculation_ratio": 0.0
+    })
+}
+
+fn summarize_evidence_types(payload: &Value) -> Value {
+    let evidence = payload
+        .get("key_evidence")
+        .or_else(|| payload.get("evidence"))
+        .and_then(Value::as_array);
+    let Some(evidence) = evidence else {
+        return empty_evidence_type_summary();
+    };
+
+    let mut fact_count = 0;
+    let mut opinion_count = 0;
+    let mut speculation_count = 0;
+    let mut unclassified_count = 0;
+
+    for item in evidence {
+        match item {
+            Value::String(_) => unclassified_count += 1,
+            Value::Object(object) => match object.get("evidence_type").and_then(Value::as_str) {
+                Some("fact") => fact_count += 1,
+                Some("opinion") => opinion_count += 1,
+                Some("speculation") => speculation_count += 1,
+                _ => unclassified_count += 1,
+            },
+            _ => unclassified_count += 1,
+        }
+    }
+
+    let total = evidence.len().max(1);
+    json!({
+        "fact_count": fact_count,
+        "opinion_count": opinion_count,
+        "speculation_count": speculation_count,
+        "unclassified_count": unclassified_count,
+        "speculation_ratio": speculation_count as f64 / total as f64
     })
 }
 
@@ -673,6 +742,213 @@ mod tests {
                 "analyst.news_macro": 35.0
             }
         })
+    }
+
+    fn test_runtime_config() -> RuntimeConfig {
+        RuntimeConfig {
+            llm_roles: std::collections::BTreeMap::new(),
+            web_search: std::collections::BTreeMap::new(),
+            truncation: orchestrator_llm::truncation::TruncationConfig::default(),
+            judge: orchestrator_llm::llm_judge::JudgeConfig::default(),
+            strict_sqlite: true,
+            required_contexts: Vec::new(),
+            prompts: crate::orchestration::config::PromptConfig {
+                prompts: std::collections::BTreeMap::new(),
+                manager_research: std::path::PathBuf::new(),
+
+                trader: std::path::PathBuf::new(),
+                risk_aggressive: std::path::PathBuf::new(),
+                risk_conservative: std::path::PathBuf::new(),
+                risk_neutral: std::path::PathBuf::new(),
+                portfolio_manager: std::path::PathBuf::new(),
+                allocation_manager: std::path::PathBuf::new(),
+            },
+            workflow: crate::orchestration::config::WorkflowConfig {
+                phase1_parallelism: 5,
+                agent_timeout_sec: 300,
+                reducer_timeout_sec: 300,
+                risk_rounds: 1,
+                critical_roles: ["analyst.technical", "analyst.news_macro"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+                late_evidence_enabled: true,
+                policy_mode: crate::orchestration::policy::WorkflowPolicyMode::Selective,
+                policy_thresholds: Default::default(),
+                skip_zero_weight_analysts: false,
+            },
+            allocation: crate::orchestration::config::AllocationConfig {
+                investable_tickers: vec!["QQQ".to_string(), "SOXX".to_string()],
+                regime_signal: "VIX".to_string(),
+                regime_thresholds: vec![15.0, 20.0, 30.0],
+                regime_labels: vec![
+                    "risk_on".to_string(),
+                    "normal".to_string(),
+                    "elevated".to_string(),
+                    "defensive".to_string(),
+                ],
+                correlation_window_days: 60,
+                max_single_position: 0.70,
+                vol_indicator: "STD20".to_string(),
+            },
+            plugins: crate::orchestration::config::PluginConfig {
+                enabled: false,
+                components_dir: std::path::PathBuf::new(),
+                roles_dir: std::path::PathBuf::new(),
+                disabled_components: Vec::new(),
+                extra_component_dirs: Vec::new(),
+            },
+            component_plugins: crate::orchestration::plugin_loader::ComponentRegistry::default(),
+            role_plugins: crate::orchestration::plugin_loader::RolePluginRegistry::default(),
+            agent_registry: orchestrator_core::AgentRegistry::builtin(),
+        }
+    }
+
+    #[test]
+    fn phase1_state_artifact_populates_cross_analyst_conflicts() {
+        let config = test_runtime_config();
+        let state = json!({
+            "tickers": ["TQQQ"],
+            "phase1_agents": ["analyst.technical", "analyst.news_macro"],
+            "analyst_weights": {
+                "analyst.technical": 40.0,
+                "analyst.news_macro": 35.0
+            },
+            "analyst_reports": {
+                "analyst.technical": {
+                    "per_ticker": {
+                        "TQQQ": {
+                            "direction": "bullish",
+                            "confidence": 0.7,
+                            "key_evidence": ["breakout above 50MA"]
+                        }
+                    }
+                },
+                "analyst.news_macro": {
+                    "per_ticker": {
+                        "TQQQ": {
+                            "direction": "bearish",
+                            "confidence": 0.8,
+                            "key_evidence": ["Fed hawkish surprise"]
+                        }
+                    }
+                }
+            }
+        });
+
+        let artifact = build_phase1_state_artifact(&state, &config);
+        let ticker_artifact = &artifact["per_ticker"]["TQQQ"];
+        let conflicts = ticker_artifact["cross_analyst_conflicts"]
+            .as_array()
+            .expect("cross_analyst_conflicts should be an array");
+
+        assert!(conflicts
+            .iter()
+            .any(|conflict| conflict["type"] == "direction_conflict"));
+        assert_eq!(
+            ticker_artifact["conflicts"],
+            ticker_artifact["cross_analyst_conflicts"]
+        );
+        assert_eq!(
+            artifact["cross_analyst_conflicts_summary"],
+            ticker_artifact["cross_analyst_conflicts"]
+        );
+    }
+
+    #[test]
+    fn phase1_state_artifact_summarizes_typed_evidence() {
+        let config = test_runtime_config();
+        let state = json!({
+            "tickers": ["TQQQ"],
+            "phase1_agents": ["analyst.technical"],
+            "analyst_reports": {
+                "analyst.technical": {
+                    "per_ticker": {
+                        "TQQQ": {
+                            "direction": "bullish",
+                            "confidence": 0.7,
+                            "key_evidence": [
+                                {"claim": "CPI 3.2%", "evidence_type": "fact", "source": "BLS"},
+                                {"claim": "Fed may cut", "evidence_type": "opinion", "source": "Fed funds futures"},
+                                {"claim": "Options whale rumored", "evidence_type": "speculation", "source": "Reddit"}
+                            ]
+                        }
+                    }
+                }
+            }
+        });
+
+        let artifact = build_phase1_state_artifact(&state, &config);
+        let summary = &artifact["per_ticker"]["TQQQ"]["role_summaries"][0]["evidence_type_summary"];
+
+        assert_eq!(summary["fact_count"], json!(1));
+        assert_eq!(summary["opinion_count"], json!(1));
+        assert_eq!(summary["speculation_count"], json!(1));
+        assert_eq!(summary["unclassified_count"], json!(0));
+        assert!((summary["speculation_ratio"].as_f64().unwrap() - (1.0 / 3.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn phase1_state_artifact_summarizes_legacy_evidence_as_unclassified() {
+        let config = test_runtime_config();
+        let state = json!({
+            "tickers": ["TQQQ"],
+            "phase1_agents": ["analyst.technical"],
+            "analyst_reports": {
+                "analyst.technical": {
+                    "per_ticker": {
+                        "TQQQ": {
+                            "direction": "bullish",
+                            "confidence": 0.7,
+                            "evidence": ["breakout above 50MA", "volume confirmation"]
+                        }
+                    }
+                }
+            }
+        });
+
+        let artifact = build_phase1_state_artifact(&state, &config);
+        let role_summary = &artifact["per_ticker"]["TQQQ"]["role_summaries"][0];
+
+        assert_eq!(
+            role_summary["key_evidence"],
+            json!(["breakout above 50MA", "volume confirmation"])
+        );
+        assert_eq!(
+            role_summary["evidence_type_summary"]["unclassified_count"],
+            json!(2)
+        );
+        assert_eq!(
+            role_summary["evidence_type_summary"]["speculation_ratio"],
+            json!(0.0)
+        );
+    }
+
+    #[test]
+    fn phase1_state_artifact_includes_empty_conflicts_when_analysts_agree() {
+        let config = test_runtime_config();
+        let state = json!({
+            "tickers": ["TQQQ"],
+            "phase1_agents": ["analyst.technical", "analyst.news_macro"],
+            "analyst_reports": {
+                "analyst.technical": {
+                    "per_ticker": {
+                        "TQQQ": {"direction": "bullish", "confidence": 0.7}
+                    }
+                },
+                "analyst.news_macro": {
+                    "per_ticker": {
+                        "TQQQ": {"direction": "bullish", "confidence": 0.6}
+                    }
+                }
+            }
+        });
+
+        let artifact = build_phase1_state_artifact(&state, &config);
+        let ticker_artifact = &artifact["per_ticker"]["TQQQ"];
+
+        assert_eq!(ticker_artifact["cross_analyst_conflicts"], json!([]));
+        assert_eq!(ticker_artifact["conflicts"], json!([]));
     }
 
     #[test]

@@ -6,6 +6,7 @@ use orchestrator_core::{
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
+use super::plugin_loader::ComponentRegistry;
 use super::state::{tickers_from_state, topic_state};
 
 pub(crate) fn mode_prompt_path(base: &std::path::Path, state: &Value) -> PathBuf {
@@ -26,11 +27,21 @@ pub(crate) fn mode_prompt_path(base: &std::path::Path, state: &Value) -> PathBuf
 /// Load a shared prompt component from `prompts/common/<file_name>` relative to
 /// the role prompt path. Missing components resolve to an empty string so a role
 /// prompt that does not reference the placeholder is unaffected.
+fn prompts_dir_from_prompt_path(prompt_path: Option<&std::path::Path>) -> Option<PathBuf> {
+    let path = prompt_path?;
+    for ancestor in path.ancestors() {
+        if ancestor.join("common").is_dir()
+            || ancestor.join("components").is_dir()
+            || ancestor.join("roles").is_dir()
+        {
+            return Some(ancestor.to_path_buf());
+        }
+    }
+    path.parent()?.parent().map(PathBuf::from)
+}
+
 fn common_component(prompt_path: Option<&std::path::Path>, file_name: &str) -> Result<String> {
-    let Some(path) = prompt_path else {
-        return Ok(String::new());
-    };
-    let Some(prompts_dir) = path.parent().and_then(|parent| parent.parent()) else {
+    let Some(prompts_dir) = prompts_dir_from_prompt_path(prompt_path) else {
         return Ok(String::new());
     };
     let common_path = prompts_dir.join("common").join(file_name);
@@ -39,56 +50,6 @@ fn common_component(prompt_path: Option<&std::path::Path>, file_name: &str) -> R
             .with_context(|| format!("failed to read prompt template {}", common_path.display()))
     } else {
         Ok(String::new())
-    }
-}
-
-/// Map a researcher role to (side, side_label, opponent, opponent_label) so the
-/// bull and bear prompts can share one template body parameterized by `{side}`.
-/// Non-researcher roles get empty strings (their prompts don't use the keys).
-fn researcher_side_params(role: &str) -> (&'static str, &'static str, &'static str, &'static str) {
-    if role.starts_with("researcher.bull") {
-        ("bull", "看多", "bear", "看空")
-    } else if role.starts_with("researcher.bear") {
-        ("bear", "看空", "bull", "看多")
-    } else {
-        ("", "", "", "")
-    }
-}
-
-/// Map a risk role (`risk.aggressive` / `risk.neutral` / `risk.conservative`) to
-/// its stance token so the three risk prompts can share one template body.
-fn risk_stance_label(role: &str) -> &'static str {
-    match role {
-        "risk.aggressive" => "aggressive",
-        "risk.conservative" => "conservative",
-        "risk.neutral" => "neutral",
-        _ => "",
-    }
-}
-
-/// Stance-specific fragments for the shared risk analyst template:
-/// (label, intro, stance-specific numbered rules, extra JSON schema field).
-fn risk_stance_fragments(role: &str) -> (&'static str, &'static str, &'static str, &'static str) {
-    match role {
-        "risk.aggressive" => (
-            "激进风险分析师",
-            "你的任务是为高回报路径辩护，指出保守和中性视角可能错失的机会，但不能无视已知风险或编造新催化。",
-            "2. 指出支持更高风险的 1-3 个最强依据，并说明它们是否已在 analyst_reports 中独立出现。\n3. 明确列出愿意接受的风险，不把风险淡化成机会；若 trader_plan 已很激进，优先建议保持而非继续加码。",
-            "\n  \"key_risks_accepted\": [\"接受的风险\"],",
-        ),
-        "risk.conservative" => (
-            "保守风险分析师",
-            "你的任务是保护资产、降低波动，指出拟议方案中过度冒险的部分，但不能因为天然保守就否定所有机会。",
-            "2. `key_risks` 只列 2-5 个真正会改变执行的风险，区分“必须降风险”与“只需监控”。\n3. 若 trader_plan 已经保守，指出无需进一步收缩，避免过度防御。",
-            "\n  \"key_risks\": [\"主要风险\"],",
-        ),
-        "risk.neutral" => (
-            "中性风险分析师",
-            "你的任务是在激进与保守之间给出平衡观点，评估收益与风险，并给出最少改动的折中方案；既不因单一利好追高，也不因单一风险完全否定方案。",
-            "2. `balanced_view` 列出 2-4 条平衡观察，每条都连接到 trader_plan 或 analyst_reports。\n3. 如果证据不足以支持执行，明确建议转为观察，而不是模糊折中。",
-            "\n  \"balanced_view\": [\"平衡观察\"],",
-        ),
-        _ => ("", "", "", ""),
     }
 }
 
@@ -101,6 +62,38 @@ pub(crate) fn render_prompt(
     round: Option<i64>,
     topic_id: Option<&str>,
     prompt_path: Option<&std::path::Path>,
+    component_registry: Option<&ComponentRegistry>,
+) -> Result<String> {
+    let discovered_registry = if component_registry.is_none() {
+        prompt_path
+            .and_then(|_| prompts_dir_from_prompt_path(prompt_path))
+            .map(|prompts_dir| ComponentRegistry::discover(&prompts_dir))
+            .transpose()?
+    } else {
+        None
+    };
+    render_prompt_with_plugins(
+        state,
+        role,
+        phase,
+        kind,
+        round,
+        topic_id,
+        prompt_path,
+        component_registry.or(discovered_registry.as_ref()),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_prompt_with_plugins(
+    state: &Value,
+    role: &str,
+    phase: i64,
+    kind: &str,
+    round: Option<i64>,
+    topic_id: Option<&str>,
+    prompt_path: Option<&std::path::Path>,
+    component_registry: Option<&ComponentRegistry>,
 ) -> Result<String> {
     let tickers = tickers_from_state(state);
     let ticker = state
@@ -138,10 +131,13 @@ pub(crate) fn render_prompt(
     let analyst_output_contract_template =
         common_component(prompt_path, "analyst_output_contract.md")?;
     let anti_injection_template = common_component(prompt_path, "anti_injection.md")?;
-    let researcher_seed_template = common_component(prompt_path, "researcher_seed.md")?;
-    let researcher_interaction_template =
-        common_component(prompt_path, "researcher_interaction.md")?;
+    let research_calibration_template = common_component(prompt_path, "research_calibration.md")?;
+    let research_dedup_template = common_component(prompt_path, "research_dedup.md")?;
+    let research_drivers_template = common_component(prompt_path, "research_drivers.md")?;
     let risk_analyst_template = common_component(prompt_path, "risk_analyst.md")?;
+    let leveraged_etf_rules_template = common_component(prompt_path, "leveraged_etf_rules.md")?;
+    let analyst_output_structure_template =
+        common_component(prompt_path, "analyst_output_structure.md")?;
     // Render components with the schema in scope so a `{analyst_artifact_schema}`
     // placeholder inside the contract is resolved before the component text is
     // spliced into the role prompt (the outer pass runs once, in key order, and
@@ -161,38 +157,57 @@ pub(crate) fn render_prompt(
     let analyst_output_contract =
         replace_placeholders(&analyst_output_contract_template, &component_values);
     let anti_injection = replace_placeholders(&anti_injection_template, &component_values);
-    let (side, side_label, opponent, opponent_label) = researcher_side_params(role);
-    let stance_label = risk_stance_label(role);
-    let (stance_role_label, stance_intro, stance_rules, stance_schema_extra) =
-        risk_stance_fragments(role);
-    let values = json!({
-        "run_id": state.get("run_id").and_then(Value::as_str).unwrap_or(""),
+    let research_calibration =
+        replace_placeholders(&research_calibration_template, &component_values);
+    let research_dedup = replace_placeholders(&research_dedup_template, &component_values);
+    let research_drivers = replace_placeholders(&research_drivers_template, &component_values);
+    let leveraged_etf_rules =
+        replace_placeholders(&leveraged_etf_rules_template, &component_values);
+    let analyst_output_structure =
+        replace_placeholders(&analyst_output_structure_template, &component_values);
+    let stance_role_label = match role {
+        "risk.aggressive" => "aggressive",
+        "risk.neutral" => "neutral",
+        "risk.conservative" => "conservative",
+        _ => "",
+    };
+    let static_values = json!({
         "ticker": ticker,
         "tickers": tickers.join(","),
         "common_ticker_prompt": common_ticker_prompt,
         "analyst_output_contract": analyst_output_contract,
         "anti_injection": anti_injection,
+        "research_calibration": research_calibration,
+        "research_dedup": research_dedup,
+        "research_drivers": research_drivers,
+        "leveraged_etf_rules": leveraged_etf_rules,
+        "analyst_output_structure": analyst_output_structure,
         "analyst_artifact_schema": analyst_artifact_schema(),
         "research_artifact_schema": research_artifact_schema(),
         "trade_intent_schema": trade_intent_schema(),
         "risk_constraints_schema": risk_constraints_schema(),
         "final_validation_schema": final_validation_schema(),
         "portfolio_allocation_schema": portfolio_allocation_schema(),
-        "side": side,
-        "side_label": side_label,
-        "opponent": opponent,
-        "opponent_label": opponent_label,
-        "stance": stance_label,
-        "stance_label": stance_role_label,
-        "stance_intro": stance_intro,
-        "stance_rules": stance_rules,
-        "stance_schema_extra": stance_schema_extra,
-        "date": state.get("current_date").and_then(Value::as_str).unwrap_or(""),
-        "lang": state.get("lang").and_then(Value::as_str).unwrap_or("zh"),
-        "window_days": state.get("window_days").cloned().unwrap_or(Value::Null),
         "role": role,
         "phase": phase,
         "kind": kind,
+        "lang": state.get("lang").and_then(Value::as_str).unwrap_or("zh"),
+        "side": "",
+        "side_label": "",
+        "opponent": "",
+        "opponent_label": "",
+        "stance": stance_role_label,
+        "stance_label": stance_role_label,
+        "stance_intro": "",
+        "stance_rules": "",
+        "stance_schema_extra": "",
+        "researcher_body": "",
+        "workflow_pattern": "Workflow -> Stage/Sub-workflow -> Agent workers -> Reducer -> state artifact"
+    });
+    let dynamic_values = json!({
+        "run_id": state.get("run_id").and_then(Value::as_str).unwrap_or(""),
+        "date": state.get("current_date").and_then(Value::as_str).unwrap_or(""),
+        "window_days": state.get("window_days").cloned().unwrap_or(Value::Null),
         "round": round.unwrap_or_default(),
         "topic_id": topic_id.unwrap_or(""),
         "topic": serde_json::to_string_pretty(&current_topic)?,
@@ -204,26 +219,30 @@ pub(crate) fn render_prompt(
         "risk_history": serde_json::to_string_pretty(&state.get("risk_debate_state").and_then(|v| v.get("history")).cloned().unwrap_or_else(|| json!([])))?,
         "portfolio_decision": serde_json::to_string_pretty(&state.get("final_trade_decision").cloned().unwrap_or(Value::Null))?,
         "allocation_context": serde_json::to_string_pretty(&state.get("allocation_context").cloned().unwrap_or(Value::Null))?,
-        "workflow_pattern": "Workflow -> Stage/Sub-workflow -> Agent workers -> Reducer -> state artifact"
     });
-    // Researcher (bull/bear) and risk-tier bodies live in shared components,
-    // parameterized by {side}/{stance}. Render them against the value set, then
-    // expose the result so the thin role file includes one placeholder each.
-    let researcher_body_template = if side.is_empty() {
-        String::new()
-    } else if role.ends_with(".interaction") {
-        researcher_interaction_template
-    } else {
-        researcher_seed_template
-    };
-    let researcher_body = replace_placeholders(&researcher_body_template, &values);
+    let mut values = static_values;
+    if let (Some(static_map), Some(dynamic_map)) =
+        (values.as_object_mut(), dynamic_values.as_object())
+    {
+        for (key, value) in dynamic_map {
+            static_map.insert(key.clone(), value.clone());
+        }
+    }
+    if let Some(registry) = component_registry {
+        for plugin in registry.for_role(role) {
+            let rendered = replace_placeholders(&plugin.template, &values);
+            if let Some(map) = values.as_object_mut() {
+                map.insert(
+                    plugin.manifest.placeholder_key.clone(),
+                    Value::String(rendered),
+                );
+            }
+        }
+    }
+    // Risk-tier prompts use a shared component. Render it against the value set,
+    // then expose the result so role files can include it via one placeholder.
     let risk_analyst_body = replace_placeholders(&risk_analyst_template, &values);
-    let mut values = values;
     if let Some(map) = values.as_object_mut() {
-        map.insert(
-            "researcher_body".to_string(),
-            Value::String(researcher_body),
-        );
         map.insert(
             "risk_analyst_body".to_string(),
             Value::String(risk_analyst_body),
@@ -235,6 +254,8 @@ pub(crate) fn render_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::orchestration::config::resolve_versioned_prompt_path;
+    use crate::orchestration::plugin_loader::ComponentRegistry;
     use serde_json::json;
     use tempfile::TempDir;
 
@@ -261,10 +282,55 @@ mod tests {
             None,
             None,
             Some(&prompt_path),
+            None,
         )
         .unwrap();
 
         assert!(prompt.contains("Ticker boundary: TQQQ; all: TQQQ,VIX"));
+    }
+
+    #[test]
+    fn render_prompt_with_plugins_overrides_legacy_component() {
+        let temp = TempDir::new().unwrap();
+        let prompts = temp.path().join("prompts");
+        std::fs::create_dir_all(prompts.join("common")).unwrap();
+        std::fs::create_dir_all(prompts.join("components/ticker")).unwrap();
+        std::fs::create_dir_all(prompts.join("analysts")).unwrap();
+        std::fs::write(prompts.join("common/ticker.md"), "LEGACY {ticker}").unwrap();
+        std::fs::write(
+            prompts.join("components/ticker/manifest.toml"),
+            r#"name = "ticker"
+injection_points = ["analyst.technical"]
+priority = 10
+placeholder_key = "common_ticker_prompt"
+required_variables = ["ticker"]
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            prompts.join("components/ticker/component.md"),
+            "PLUGIN {ticker}",
+        )
+        .unwrap();
+        let prompt_path = prompts.join("analysts/technical.md");
+        std::fs::write(&prompt_path, "{common_ticker_prompt}").unwrap();
+        let state = json!({"ticker": "QQQ", "tickers": ["QQQ"]});
+        let registry = ComponentRegistry::discover(&prompts).unwrap();
+
+        let prompt = render_prompt_with_plugins(
+            &state,
+            "analyst.technical",
+            1,
+            "analysis",
+            None,
+            None,
+            Some(&prompt_path),
+            Some(&registry),
+        )
+        .unwrap();
+
+        assert!(prompt.contains("PLUGIN QQQ"));
+        assert!(!prompt.contains("LEGACY QQQ"));
     }
 
     #[test]
@@ -300,6 +366,7 @@ mod tests {
             None,
             None,
             Some(&prompt_path),
+            None,
         )
         .unwrap();
 
@@ -332,6 +399,7 @@ mod tests {
             None,
             None,
             Some(&prompt_path),
+            None,
         )
         .unwrap();
 
@@ -365,6 +433,7 @@ mod tests {
             None,
             None,
             Some(&prompt_path),
+            None,
         )
         .unwrap();
 
@@ -375,35 +444,25 @@ mod tests {
     }
 
     #[test]
-    fn researcher_side_params_map_correctly() {
-        assert_eq!(researcher_side_params("researcher.bull.initial").0, "bull");
-        assert_eq!(
-            researcher_side_params("researcher.bear.interaction").0,
-            "bear"
-        );
-        assert_eq!(researcher_side_params("analyst.technical").0, "");
-    }
-
-    #[test]
-    fn bull_and_bear_share_body_with_swapped_side() {
+    fn bull_and_bear_initial_prompts_are_standalone() {
         let temp = TempDir::new().unwrap();
         let prompts = temp.path().join("prompts");
         std::fs::create_dir_all(prompts.join("common")).unwrap();
         std::fs::create_dir_all(prompts.join("researchers")).unwrap();
-        std::fs::write(prompts.join("common/ticker.md"), "").unwrap();
+        std::fs::write(prompts.join("common/ticker.md"), "TICK {ticker}").unwrap();
         std::fs::write(
             prompts.join("common/researcher_seed.md"),
-            "side={side} label={side_label} opp={opponent} role=researcher.{side}.initial",
+            "SHOULD NOT LOAD {side}",
         )
         .unwrap();
         std::fs::write(
             prompts.join("researchers/bull_initial.md"),
-            "{researcher_body}",
+            "看多研究员\n{common_ticker_prompt}\nrole=researcher.bull.initial artifact=bull_seed_packet field=known_bear_constraint",
         )
         .unwrap();
         std::fs::write(
             prompts.join("researchers/bear_initial.md"),
-            "{researcher_body}",
+            "看空研究员\n{common_ticker_prompt}\nrole=researcher.bear.initial artifact=bear_seed_packet field=known_bull_constraint",
         )
         .unwrap();
         let state = json!({"ticker": "QQQ", "tickers": ["QQQ"]});
@@ -416,6 +475,7 @@ mod tests {
             None,
             None,
             Some(&prompts.join("researchers/bull_initial.md")),
+            None,
         )
         .unwrap();
         let bear = render_prompt(
@@ -426,30 +486,42 @@ mod tests {
             None,
             None,
             Some(&prompts.join("researchers/bear_initial.md")),
+            None,
         )
         .unwrap();
 
-        assert!(bull.contains("side=bull label=看多 opp=bear role=researcher.bull.initial"));
-        assert!(bear.contains("side=bear label=看空 opp=bull role=researcher.bear.initial"));
-        assert!(!bull.contains("{researcher_body}"));
+        assert!(bull.contains("看多研究员"));
+        assert!(bull.contains("role=researcher.bull.initial"));
+        assert!(bull.contains("artifact=bull_seed_packet"));
+        assert!(bull.contains("field=known_bear_constraint"));
+        assert!(bear.contains("看空研究员"));
+        assert!(bear.contains("role=researcher.bear.initial"));
+        assert!(bear.contains("artifact=bear_seed_packet"));
+        assert!(bear.contains("field=known_bull_constraint"));
+        for prompt in [&bull, &bear] {
+            assert!(prompt.contains("TICK QQQ"));
+            assert!(!prompt.contains("{researcher_body}"));
+            assert!(!prompt.contains("{side}"));
+            assert!(!prompt.contains("SHOULD NOT LOAD"));
+        }
     }
 
     #[test]
-    fn interaction_role_selects_interaction_body() {
+    fn interaction_role_uses_standalone_interaction_prompt() {
         let temp = TempDir::new().unwrap();
         let prompts = temp.path().join("prompts");
         std::fs::create_dir_all(prompts.join("common")).unwrap();
         std::fs::create_dir_all(prompts.join("researchers")).unwrap();
-        std::fs::write(prompts.join("common/ticker.md"), "").unwrap();
+        std::fs::write(prompts.join("common/ticker.md"), "TICK {ticker}").unwrap();
         std::fs::write(prompts.join("common/researcher_seed.md"), "SEED {side}").unwrap();
         std::fs::write(
             prompts.join("common/researcher_interaction.md"),
-            "INTERACTION {side}",
+            "SHOULD NOT LOAD {side}",
         )
         .unwrap();
         std::fs::write(
             prompts.join("researchers/bull_interaction.md"),
-            "{researcher_body}",
+            "看多研究员\n{common_ticker_prompt}\nrole=researcher.bull.interaction artifact=bull_debate_packet target=看空 claim",
         )
         .unwrap();
         let state = json!({"ticker": "QQQ", "tickers": ["QQQ"]});
@@ -462,15 +534,23 @@ mod tests {
             Some(2),
             None,
             Some(&prompts.join("researchers/bull_interaction.md")),
+            None,
         )
         .unwrap();
 
-        assert!(out.contains("INTERACTION bull"));
+        assert!(out.contains("看多研究员"));
+        assert!(out.contains("TICK QQQ"));
+        assert!(out.contains("role=researcher.bull.interaction"));
+        assert!(out.contains("artifact=bull_debate_packet"));
+        assert!(out.contains("看空 claim"));
         assert!(!out.contains("SEED"));
+        assert!(!out.contains("SHOULD NOT LOAD"));
+        assert!(!out.contains("{researcher_body}"));
+        assert!(!out.contains("{side}"));
     }
 
     #[test]
-    fn risk_tiers_share_body_with_stance_fragments() {
+    fn risk_tiers_share_body_with_markdown_stance_content() {
         let temp = TempDir::new().unwrap();
         let prompts = temp.path().join("prompts");
         std::fs::create_dir_all(prompts.join("common")).unwrap();
@@ -478,11 +558,19 @@ mod tests {
         std::fs::write(prompts.join("common/ticker.md"), "").unwrap();
         std::fs::write(
             prompts.join("common/risk_analyst.md"),
-            "stance={stance} label={stance_label}{stance_schema_extra}",
+            "shared body {trader_plan} {analyst_reports} {risk_history}",
         )
         .unwrap();
-        std::fs::write(prompts.join("risk/aggressive.md"), "{risk_analyst_body}").unwrap();
-        std::fs::write(prompts.join("risk/conservative.md"), "{risk_analyst_body}").unwrap();
+        std::fs::write(
+            prompts.join("risk/aggressive.md"),
+            "激进风险分析师\n{risk_analyst_body}\n\"key_risks_accepted\": [\"接受的风险\"]",
+        )
+        .unwrap();
+        std::fs::write(
+            prompts.join("risk/conservative.md"),
+            "保守风险分析师\n{risk_analyst_body}\n\"key_risks\": [\"主要风险\"]",
+        )
+        .unwrap();
         let state = json!({"ticker": "QQQ", "tickers": ["QQQ"]});
 
         let aggressive = render_prompt(
@@ -493,6 +581,7 @@ mod tests {
             None,
             None,
             Some(&prompts.join("risk/aggressive.md")),
+            None,
         )
         .unwrap();
         let conservative = render_prompt(
@@ -503,14 +592,21 @@ mod tests {
             None,
             None,
             Some(&prompts.join("risk/conservative.md")),
+            None,
         )
         .unwrap();
 
-        assert!(aggressive.contains("stance=aggressive label=激进风险分析师"));
+        assert!(aggressive.contains("激进风险分析师"));
         assert!(aggressive.contains("key_risks_accepted"));
-        assert!(conservative.contains("stance=conservative label=保守风险分析师"));
+        assert!(conservative.contains("保守风险分析师"));
         assert!(conservative.contains("\"key_risks\""));
-        assert!(!aggressive.contains("{risk_analyst_body}"));
+        for prompt in [&aggressive, &conservative] {
+            assert!(!prompt.contains("{risk_analyst_body}"));
+            assert!(!prompt.contains("{stance_label}"));
+            assert!(!prompt.contains("{stance_intro}"));
+            assert!(!prompt.contains("{stance_rules}"));
+            assert!(!prompt.contains("{stance_schema_extra}"));
+        }
     }
 
     // ---- Golden regression over the real prompt pack -----------------------
@@ -538,23 +634,18 @@ mod tests {
         "{common_ticker_prompt}",
         "{analyst_output_contract}",
         "{anti_injection}",
+        "{research_calibration}",
+        "{research_dedup}",
+        "{research_drivers}",
+        "{leveraged_etf_rules}",
+        "{analyst_output_structure}",
         "{analyst_artifact_schema}",
         "{research_artifact_schema}",
         "{trade_intent_schema}",
         "{risk_constraints_schema}",
         "{final_validation_schema}",
         "{portfolio_allocation_schema}",
-        "{researcher_body}",
         "{risk_analyst_body}",
-        "{side}",
-        "{side_label}",
-        "{opponent}",
-        "{opponent_label}",
-        "{stance}",
-        "{stance_label}",
-        "{stance_intro}",
-        "{stance_rules}",
-        "{stance_schema_extra}",
         "{date}",
         "{window_days}",
         "{topic_id}",
@@ -568,10 +659,14 @@ mod tests {
     ];
 
     fn golden_mock_state() -> Value {
+        golden_mock_state_with_date("2026-07-03")
+    }
+
+    fn golden_mock_state_with_date(date: &str) -> Value {
         json!({
             "ticker": "QQQ",
             "tickers": ["QQQ", "SOXX", "VIX"],
-            "current_date": "2026-07-03",
+            "current_date": date,
             "window_days": 5,
             "lang": "zh",
             "run_id": "golden-run",
@@ -585,6 +680,64 @@ mod tests {
     }
 
     #[test]
+    fn static_prefix_is_stable_across_dynamic_changes() {
+        let prompts = project_prompts_dir();
+        if !prompts.exists() {
+            return;
+        }
+        let path = prompts.join("analysts/technical.md");
+        let prompt_a = render_prompt(
+            &golden_mock_state_with_date("2026-07-01"),
+            "analyst.technical",
+            1,
+            "artifact",
+            None,
+            None,
+            Some(&path),
+            None,
+        )
+        .unwrap();
+        let prompt_b = render_prompt(
+            &golden_mock_state_with_date("2026-07-06"),
+            "analyst.technical",
+            1,
+            "artifact",
+            None,
+            None,
+            Some(&path),
+            None,
+        )
+        .unwrap();
+        let split_marker = "<!-- DYNAMIC SUFFIX";
+        let prefix_a = prompt_a.split(split_marker).next().unwrap_or("");
+        let prefix_b = prompt_b.split(split_marker).next().unwrap_or("");
+
+        assert_eq!(
+            prefix_a, prefix_b,
+            "Static prefix must be identical across calls with different dates"
+        );
+    }
+
+    #[test]
+    fn versioned_prompt_path_resolves_correctly() {
+        let temp = TempDir::new().unwrap();
+        let prompts = temp.path().join("prompts/analysts");
+        std::fs::create_dir_all(&prompts).unwrap();
+        std::fs::write(prompts.join("technical.md"), "v1 content").unwrap();
+        std::fs::write(prompts.join("technical_v2.md"), "v2 content").unwrap();
+
+        let base = prompts.join("technical.md");
+        let v1 = resolve_versioned_prompt_path(&base, Some("v1")).unwrap();
+        let absent = resolve_versioned_prompt_path(&base, None).unwrap();
+        let v2 = resolve_versioned_prompt_path(&base, Some("v2")).unwrap();
+        let v3_fallback = resolve_versioned_prompt_path(&base, Some("v3")).unwrap();
+        assert_eq!(v1, base);
+        assert_eq!(absent, base);
+        assert_eq!(v2, prompts.join("technical_v2.md"));
+        assert_eq!(v3_fallback, base);
+    }
+
+    #[test]
     fn golden_all_role_prompts_render_without_unresolved_placeholders() {
         let prompts = project_prompts_dir();
         if !prompts.exists() {
@@ -592,6 +745,17 @@ mod tests {
             return;
         }
         let state = golden_mock_state();
+        let plugin_registry = ComponentRegistry::discover(&prompts).unwrap();
+        let mut known_placeholders = KNOWN_PLACEHOLDERS
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect::<Vec<_>>();
+        known_placeholders.extend(
+            plugin_registry
+                .placeholder_keys()
+                .into_iter()
+                .map(|key| format!("{{{key}}}")),
+        );
         // (role, relative prompt path, kind)
         let cases: &[(&str, &str, &str)] = &[
             ("analyst.technical", "analysts/technical.md", "artifact"),
@@ -667,6 +831,7 @@ mod tests {
                 Some(2),
                 Some("QQQ-aggregate"),
                 Some(&path),
+                None,
             )
             .unwrap_or_else(|e| panic!("render failed for {role} ({rel}): {e}"));
 
@@ -674,7 +839,7 @@ mod tests {
                 prompt.trim().len() > 40,
                 "rendered prompt for {role} ({rel}) is suspiciously short"
             );
-            for token in KNOWN_PLACEHOLDERS {
+            for token in &known_placeholders {
                 assert!(
                     !prompt.contains(token),
                     "unresolved placeholder {token} in {role} ({rel})"
@@ -703,7 +868,7 @@ mod tests {
                 rel.trim_start_matches("analysts/").trim_end_matches(".md")
             );
             let prompt =
-                render_prompt(&state, &role, 1, "artifact", None, None, Some(&path)).unwrap();
+                render_prompt(&state, &role, 1, "artifact", None, None, Some(&path), None).unwrap();
             // Machine-readable contract fields must reach the model.
             assert!(
                 prompt.contains("direction"),

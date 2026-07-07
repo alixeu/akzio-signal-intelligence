@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{future::Future, pin::Pin, time::Duration};
 
+use crate::truncation::{truncate_semantic, TruncationConfig};
+
 const DEFAULT_MAX_RESULT_CHARS: usize = 12_000;
 const DEFAULT_MAX_RESULTS: usize = 5;
 const DEFAULT_EXA_MCP_URL: &str = "https://mcp.exa.ai/mcp";
@@ -42,7 +44,7 @@ pub enum WebSearchContextSize {
     High,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WebSearchConfig {
     pub mode: WebSearchMode,
@@ -59,6 +61,7 @@ pub struct WebSearchConfig {
     pub blocked_domains: Vec<String>,
     #[serde(alias = "maxResultChars")]
     pub max_result_chars: usize,
+    pub truncation: TruncationConfig,
 }
 
 impl Default for WebSearchConfig {
@@ -72,6 +75,7 @@ impl Default for WebSearchConfig {
             allowed_domains: Vec::new(),
             blocked_domains: Vec::new(),
             max_result_chars: DEFAULT_MAX_RESULT_CHARS,
+            truncation: TruncationConfig::default(),
         }
     }
 }
@@ -105,6 +109,7 @@ impl WebSearchConfig {
             max_result_chars: role_override
                 .max_result_chars
                 .unwrap_or(self.max_result_chars),
+            truncation: self.truncation.clone(),
         }
     }
 }
@@ -182,13 +187,14 @@ pub struct SearchResult {
     pub source: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WebSearchOptions {
     pub context_size: WebSearchContextSize,
     pub allowed_domains: Vec<String>,
     pub blocked_domains: Vec<String>,
     pub max_result_chars: usize,
+    pub truncation: TruncationConfig,
 }
 
 impl Default for WebSearchOptions {
@@ -198,6 +204,7 @@ impl Default for WebSearchOptions {
             allowed_domains: Vec::new(),
             blocked_domains: Vec::new(),
             max_result_chars: DEFAULT_MAX_RESULT_CHARS,
+            truncation: TruncationConfig::default(),
         }
     }
 }
@@ -209,6 +216,7 @@ impl From<&WebSearchConfig> for WebSearchOptions {
             allowed_domains: config.allowed_domains.clone(),
             blocked_domains: config.blocked_domains.clone(),
             max_result_chars: config.max_result_chars,
+            truncation: config.truncation.clone(),
         }
     }
 }
@@ -298,7 +306,7 @@ impl WebSearchProvider for MockWebSearchProvider {
                                     ref_id: String::new(),
                                     title: page.title.clone(),
                                     url: page.url.clone(),
-                                    snippet: first_chars(&page.content, options.max_result_chars),
+                                    snippet: truncate_search_snippet(&page.content, &options),
                                     published_at: None,
                                     source: Some("mock".to_string()),
                                 },
@@ -328,9 +336,9 @@ impl WebSearchProvider for MockWebSearchProvider {
                             ref_id: String::new(),
                             title: format!("Mock result for {query_text}"),
                             url: "https://mock.local/search/result".to_string(),
-                            snippet: first_chars(
+                            snippet: truncate_search_snippet(
                                 &format!("Mock search result for {query_text}."),
-                                options.max_result_chars,
+                                &options,
                             ),
                             published_at: None,
                             source: Some("mock".to_string()),
@@ -412,7 +420,7 @@ impl WebSearchProvider for ExaWebSearchProvider {
                     ref_id: String::new(),
                     title: format!("Exa search: {query_text}"),
                     url,
-                    snippet: first_chars(&snippet, options.max_result_chars),
+                    snippet: truncate_search_snippet(&snippet, &options),
                     published_at: None,
                     source: Some("exa".to_string()),
                 });
@@ -686,8 +694,8 @@ fn normalize_domain(value: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_string())
 }
 
-fn first_chars(text: &str, max_chars: usize) -> String {
-    text.chars().take(max_chars).collect()
+fn truncate_search_snippet(text: &str, options: &WebSearchOptions) -> String {
+    truncate_semantic(text, options.max_result_chars, &options.truncation)
 }
 
 #[cfg(test)]
@@ -729,6 +737,7 @@ mod tests {
             allowed_domains: vec!["example.com".to_string()],
             blocked_domains: vec!["blocked.example".to_string()],
             max_result_chars: 4_000,
+            truncation: TruncationConfig::default(),
         };
         let role = WebSearchConfigOverride {
             mode: Some(WebSearchMode::Live),

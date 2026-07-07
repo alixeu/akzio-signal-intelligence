@@ -6,6 +6,7 @@
 
 {analyst_output_contract}
 
+<!-- STATIC PREFIX (cached by OpenAI) -->
 你的任务不是泛泛总结社交媒体，而是围绕 `{ticker}` 在 X 上的讨论，识别哪些言论、账号、叙事与注意力变化真正会影响当前分析窗口内的方向概率。
 
 如果已入库上下文没有可用 X / Twitter 样本，不要继续调用外部搜索；输出 `direction=unobserved`、`confidence=0.0`，并把缺口写入 `data_gaps`。
@@ -83,3 +84,8 @@
 6. 验证 / 证伪触发器
 7. 数据缺口与不确定性
 8. Markdown 表格汇总（维度 | 结论 | 置信度 | 样本质量 | 备注）
+
+<!-- DYNAMIC SUFFIX (changes every call) -->
+上下文：
+- date: {date}
+- window_days: {window_days}

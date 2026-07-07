@@ -1,6 +1,7 @@
 pub mod artifact;
 pub mod config;
 pub mod paths;
+pub mod plugin_manifest;
 pub mod prompt;
 pub mod role_registry;
 pub mod ticker;

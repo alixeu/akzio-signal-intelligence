@@ -1,3 +1,4 @@
+use crate::plugin_manifest::RoleManifest;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -15,6 +16,19 @@ pub struct AgentDefinition {
 }
 
 impl AgentDefinition {
+    pub fn from_manifest(manifest: &RoleManifest, prompt_path: PathBuf) -> Self {
+        Self {
+            role_id: manifest.role_id.clone(),
+            short_name: manifest.short_name.clone(),
+            phase: manifest.phase,
+            prompt_path,
+            preflight_tool: manifest.preflight_tool.clone(),
+            default_tools: manifest.tools.clone(),
+            default_weight: manifest.default_weight,
+            is_critical: manifest.is_critical,
+        }
+    }
+
     pub fn preflight_tool_name(&self) -> Option<&str> {
         self.preflight_tool.as_deref()
     }
@@ -96,6 +110,25 @@ impl AgentRegistry {
         };
         self.role_id_from_short(lookup)
             .unwrap_or_else(|| trimmed.to_string())
+    }
+
+    pub fn from_role_manifests<'a>(
+        plugins: impl IntoIterator<Item = (&'a RoleManifest, PathBuf)>,
+    ) -> Self {
+        let mut registry = Self::new();
+        for (manifest, prompt_path) in plugins {
+            registry.register(AgentDefinition::from_manifest(manifest, prompt_path));
+        }
+        registry
+    }
+
+    pub fn extend_role_manifests<'a>(
+        &mut self,
+        plugins: impl IntoIterator<Item = (&'a RoleManifest, PathBuf)>,
+    ) {
+        for (manifest, prompt_path) in plugins {
+            self.register(AgentDefinition::from_manifest(manifest, prompt_path));
+        }
     }
 
     pub fn builtin() -> Self {

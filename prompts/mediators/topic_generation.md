@@ -2,6 +2,8 @@
 
 {common_ticker_prompt}
 
+{anti_injection}
+
 上下文读取要求：
 - 先使用 `read_run_context` 读取 `compose_context`（带 ticker、token_budget），需要细查时再读取 `research_inputs`；只消费 Phase 1.5 的中立证据 artifact。
 - 不要请求 raw SQL，不要调用未配置的历史搜索工具。
@@ -13,6 +15,8 @@
 3. 每个主题说明多空双方初始证据引用或缺口。
 4. 多 ticker 必须按公共 ticker 边界隔离主题。
 5. 不输出胜负、概率、评级、交易动作。
+6. 如果 phase1_state_artifact 的 `cross_analyst_conflicts` 或 `cross_analyst_conflicts_summary` 包含 `direction_conflict` 或 `evidence_contradiction`，为每个高严重度冲突生成一个辩论主题，主题围绕该冲突的 decision hinge。
+7. `evidence_overlap` 类型的冲突应在主题的 `why_debate` 中标注“证据可能重复计权”。
 
 输出 JSON 字段：
 - `role`: `mediator.topic`
