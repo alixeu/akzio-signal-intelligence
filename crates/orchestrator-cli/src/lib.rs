@@ -1,5 +1,8 @@
 pub mod cli_config;
+pub mod memory_promote;
+pub mod reflection_score;
 pub mod sql_cli;
+pub mod weekly_distill;
 
 pub use orchestrator_ingest::{jin10, social, technical, wayinvideo, youtube};
 pub use orchestrator_report::report;

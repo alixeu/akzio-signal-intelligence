@@ -791,6 +791,12 @@ mod tests {
                 max_single_position: 0.70,
                 vol_indicator: "STD20".to_string(),
             },
+            reflection: crate::orchestration::config::ReflectionConfig {
+                enabled: true,
+                reflection_version: "v1".to_string(),
+                _promote_mode: "auto".to_string(),
+                retrieval: orchestrator_core::RetrievalBudget::default(),
+            },
             plugins: crate::orchestration::config::PluginConfig {
                 enabled: false,
                 components_dir: std::path::PathBuf::new(),

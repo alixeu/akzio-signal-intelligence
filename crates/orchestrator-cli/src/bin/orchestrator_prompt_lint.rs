@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! Prompt template lint CLI.
 //!
 //! Validates all prompt files under `prompts/` for placeholder completeness,

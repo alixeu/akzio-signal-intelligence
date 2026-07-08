@@ -1,265 +1,35 @@
 orchestrator:
-  tickers: "QQQ,SOXX,VIX"
-  phase1_agents: "technical,news"
-  run_dir_pattern: "outputs/{dir_slug}/{date}_exec"
-  db_path: "outputs/orchestrator.sqlite"
-
-  allocation:
-    investable_tickers: [QQQ, SOXX]
-    regime_signal: VIX
-    regime_thresholds: [15, 20, 30]
-    regime_labels: [risk_on, normal, elevated, defensive]
-    correlation_window_days: 60
-    max_single_position: 0.70
-    vol_indicator: STD20
-
-  data_source:
-    strict_sqlite: true
-    required_contexts:
-      - technical
+  tickers: QQQ,SOXX,VIX
+  phase1_agents: technical,news
+  db_path: outputs/orchestrator.sqlite
 
   runtime:
     lang: zh
     window_days: 150
     max_debate_rounds: 3
-    max_topics_per_side: 1
-    max_risk_rounds: 1
 
-  workflow:
-    policy:
-      mode: selective
-    phase1:
-      skip_zero_weight: true
-
-  plugins:
-    enabled: true
-    components_dir: "prompts/components"
-    roles_dir: "prompts/roles"
-    disabled_components: []
-    extra_component_dirs: []
-
-  prompts:
-    # Analysts
-    analyst:
-      technical:
-        path: "prompts/analysts/technical.md"
-        version: v1
-      news_macro:
-        path: "prompts/analysts/news_macro.md"
-        version: v1
-      youtube:
-        path: "prompts/analysts/youtube.md"
-        version: v1
-      reddit:
-        path: "prompts/analysts/reddit.md"
-        version: v1
-      x:
-        path: "prompts/analysts/x.md"
-        version: v1
-    # Researchers (note: config keys use phase2.* prefix, not researcher.*)
-    phase2:
-      bull_initial:
-        path: "prompts/researchers/bull_initial.md"
-        version: v1
-      bull_interaction:
-        path: "prompts/researchers/bull_interaction.md"
-        version: v1
-      bear_initial:
-        path: "prompts/researchers/bear_initial.md"
-        version: v1
-      bear_interaction:
-        path: "prompts/researchers/bear_interaction.md"
-        version: v1
-    # Mediators
-    mediator:
-      topic:
-        path: "prompts/mediators/topic_generation.md"
-        version: v1
-      topic_controller:
-        path: "prompts/mediators/topic_controller.md"
-        version: v1
-    # Managers
-    manager:
-      research:
-        path: "prompts/managers/research_manager.md"
-        version: v1
-    # Trader
-    trader:
-      path: "prompts/traders/trader.md"
-      version: v1
-    # Risk
-    risk:
-      aggressive:
-        path: "prompts/risk/aggressive.md"
-        version: v1
-      conservative:
-        path: "prompts/risk/conservative.md"
-        version: v1
-      neutral:
-        path: "prompts/risk/neutral.md"
-        version: v1
-    # Portfolio
-    portfolio:
-      manager:
-        path: "prompts/managers/portfolio_manager.md"
-        version: v1
-    # Allocation
-    allocation:
-      manager:
-        path: "prompts/allocation/manager.md"
-        version: v1
-
-  web_search:
-    mode: live
-    base_url: "https://mcp.exa.ai/mcp"
-    api_key: "${EXA_API_KEY}"
-    context_size: medium
-    max_result_chars: 12000
+  allocation:
+    investable_tickers: [QQQ, SOXX]
 
   llm:
     gateway:
-      base_url: &llm_gateway_base_url "${LLM_GATEWAY_BASE_URL:-https://oneapi-comate.baidu-int.com/v1}"
-      api_key: &llm_gateway_api_key "${LLM_GATEWAY_API_KEY}"
-    judge:
-      enabled: true
-      model: "gpt-4o-mini"
-      max_messages_per_turn: 3
+      base_url: &llm_gateway_base_url ${LLM_GATEWAY_BASE_URL:-https://oneapi-comate.baidu-int.com/v1}
+      api_key: &llm_gateway_api_key ${LLM_GATEWAY_API_KEY}
     defaults:
       route: responses
       model: gpt-5.5
       base_url: *llm_gateway_base_url
       api_key: *llm_gateway_api_key
-      native_web_search: false
-      max_turns: null
-      reasoning_effort: low
+      reasoning_effort: xhigh
       reasoning_summary: auto
       preserve_reasoning_state: true
-      compact_at_token_ratio: 0.8
-      transport: http
-      think_tool: false
-      tools: []
-    truncation:
-      tool_result_chars: 8000
-      context_fragment_chars: 12000
-      strategy: semantic
-      json:
-        preserve_fields: ["status", "error", "summary", "artifact_type", "role", "id"]
-        max_array_elements: 50
-      text:
-        head_ratio: 0.6
-        tail_ratio: 0.4
-    roles:
-      analyst.technical:
-        max_turns: 3
-        web_search:
-          mode: disabled
-        tools:
-          - read_run_context
-          - run_technical_indicators
-      analyst.news_macro:
-        max_turns: 3
-        tools:
-          - read_run_context
-          - fetch_jin10_flash
-        web_search:
-          mode: live
-      analyst.youtube:
-        max_turns: 3
-        tools:
-          - read_run_context
-          - fetch_youtube_transcript
-          - fetch_wayinvideo_transcript
-      analyst.reddit:
-        max_turns: 3
-        tools:
-          - read_run_context
-          - fetch_last30days_context
-      analyst.x:
-        max_turns: 3
-        tools:
-          - read_run_context
-          - fetch_last30days_context
-      researcher.bull.initial:
-        max_turns: 2
-        web_search:
-          mode: disabled
-        tools:
-          - read_run_context
-      researcher.bear.initial:
-        max_turns: 2
-        web_search:
-          mode: disabled
-        tools:
-          - read_run_context
-      researcher.bull.interaction:
-        max_turns: 3
-        web_search:
-          mode: disabled
-        tools:
-          - read_run_context
-      researcher.bear.interaction:
-        max_turns: 3
-        web_search:
-          mode: disabled
-        tools:
-          - read_run_context
-      mediator.topic:
-        max_turns: 2
-        web_search:
-          mode: disabled
-        tools:
-          - read_run_context
-      mediator.topic_controller:
-        max_turns: 3
-        reasoning_effort: medium
-        web_search:
-          mode: disabled
-        tools:
-          - read_run_context
-      manager.research:
-        max_turns: 3
-        reasoning_effort: medium
-        web_search:
-          mode: disabled
-        tools:
-          - read_run_context
-      trader:
-        max_turns: 2
-        web_search:
-          mode: disabled
-        tools:
-          - read_run_context
-      risk.aggressive:
-        max_turns: 2
-        web_search:
-          mode: disabled
-        tools:
-          - read_run_context
-      risk.conservative:
-        max_turns: 2
-        web_search:
-          mode: disabled
-        tools:
-          - read_run_context
-      risk.neutral:
-        max_turns: 2
-        web_search:
-          mode: disabled
-        tools:
-          - read_run_context
-      portfolio.manager:
-        max_turns: 2
-        reasoning_effort: medium
-        web_search:
-          mode: disabled
-        tools:
-          - read_run_context
-      allocation.manager:
-        max_turns: 2
-        tools:
-          - read_run_context
-        web_search:
-          mode: disabled
+      tools: read_run_context
+
+  web_search:
+    provider: exa
+    base_url: https://mcp.exa.ai/mcp
+    context_size: medium
+    max_result_chars: 12000
 
   analyst_weights:
     technical: 40.0
@@ -269,50 +39,47 @@ orchestrator:
     x: 0.0
 
 technical:
-  symbols: "QQQ,SOXX,VIX"
-  intervals: "1d,3h,20min"
+  symbols: QQQ,SOXX,VIX
+  intervals: 1d,3h,20min
   days: 60
-  model: "TwelveDataTechnical"
-  api_key: "${TWELVE_DATA_API_KEY}"
-  sleep_sec: 9
+  model: YahooTechnical
+  sleep_sec: 1
 
 jin10:
-  api_url: "${JIN10_API_URL}"
+  api_url: ${JIN10_API_URL}
   channel: -8200
   vip: 1
-  classify: "24,27,31,86,90,92,76,83,2,168,53,47,48,50,157,16"
+  classify: 24,27,31,86,90,92,76,83,2,168,53,47,48,50,157,16
   lookback_hours: 24.0
   pages: 200
-  sleep: 0.0
   timeout: 15.0
 
 youtube:
-  default_channel: "rhino"
+  default_channel: rhino
   max_videos: 6
   timeout_sec: 20
-  user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Codex TQQQ report"
+  user_agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Codex TQQQ report
   channels:
     rhino:
-      handle: "rhinofinance"
-      display_name: "Rhino Finance"
-      source_url: "https://youtube.com/@rhinofinance"
+      handle: rhinofinance
+      display_name: Rhino Finance
+      source_url: https://youtube.com/@rhinofinance
 
 wayinvideo:
-  task: "视频逐字稿"
-  existing_task_url: "https://wayinvideo-api.wayin.ai/api/highlight_moment/task"
+  task: 视频逐字稿
+  existing_task_url: https://wayinvideo-api.wayin.ai/api/highlight_moment/task
   timeout_sec: 60
 
 report:
   mode: build-and-send
-  output_dir: "outputs/TQQQ"
-  default_run_dir_pattern: "outputs/QQQ_SOXX_VIX/{date}_exec"
-  subject_template: "TQQQ strategy report {date}"
+  output_dir: outputs/TQQQ
+  default_run_dir_pattern: outputs/QQQ_SOXX_VIX/{date}_exec
+  subject_template: TQQQ strategy report {date}
   email:
     enabled: true
-    probability_threshold: 0.68
-    state_path: "outputs/TQQQ/report_email_state.json"
-    smtp_url: "smtps://smtp.mail.me.com:465"
-    username: "${REPORT_SMTP_USERNAME}"
-    password: "${REPORT_SMTP_PASSWORD}"
-    from: "${REPORT_SMTP_FROM}"
-    to: "${REPORT_SMTP_TO}"
+    state_path: outputs/TQQQ/report_email_state.json
+    smtp_url: smtps://smtp.mail.me.com:465
+    username: ${REPORT_SMTP_USERNAME}
+    password: ${REPORT_SMTP_PASSWORD}
+    from: ${REPORT_SMTP_FROM}
+    to: ${REPORT_SMTP_TO}

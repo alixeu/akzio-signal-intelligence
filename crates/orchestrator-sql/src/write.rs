@@ -372,7 +372,39 @@ pub fn write_source_item(conn: &mut Connection, input: &SourceItemInput) -> Resu
     hasher.update(item_json.as_bytes());
     let content_hash = format!("{:x}", hasher.finalize());
     let imported_at = Utc::now().to_rfc3339();
+    write_external_source_item(conn, input, &item_json, &content_hash, &imported_at)?;
     write_dedicated_source_item(conn, input, &item_json, &content_hash, &imported_at)
+}
+
+fn write_external_source_item(
+    conn: &Connection,
+    input: &SourceItemInput,
+    item_json: &str,
+    content_hash: &str,
+    imported_at: &str,
+) -> Result<usize> {
+    Ok(conn.execute(
+        r#"
+        INSERT OR REPLACE INTO external_source_items
+            (source, source_key, ticker, item_time, title, content, item_json, content_hash, imported_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        "#,
+        params![
+            input.source,
+            input.item_key,
+            input.ticker,
+            input.item_time,
+            input
+                .item_json
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            input.content,
+            item_json,
+            content_hash,
+            imported_at
+        ],
+    )?)
 }
 
 fn write_dedicated_source_item(

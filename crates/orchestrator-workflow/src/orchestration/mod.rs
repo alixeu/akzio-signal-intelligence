@@ -9,6 +9,7 @@ pub(crate) mod plugin_loader;
 pub(crate) mod policy;
 pub(crate) mod preflight;
 pub(crate) mod render;
+pub(crate) mod retrieval;
 pub(crate) mod role_jobs;
 pub(crate) mod state;
 pub(crate) mod trade_intent;

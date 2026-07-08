@@ -1,22 +1,194 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
 use clap::{Args, ValueEnum};
+use decrypt_cookies::{browser::cookies::CookiesInfo, safari::SafariBuilder};
 use html_escape::decode_html_entities;
 use regex::Regex;
-use reqwest::Client;
+use reqwest::{cookie::Jar, Client};
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     path::PathBuf,
+    sync::Arc,
     time::Duration as StdDuration,
+};
+use twikit::{
+    constants, endpoints::GqlEndpoint, utils::find_values, Client as TwikitClient, Tweet,
+    TweetSearchProduct,
 };
 
 const REDDIT_RSS_URL: &str = "https://www.reddit.com/search.rss";
-const XQUIK_SEARCH_URL: &str = "https://xquik.com/api/v1/x/tweets/search";
+const REDDIT_JSON_URL: &str = "https://www.reddit.com/search.json";
 const YOUTUBE_SEARCH_URL: &str = "https://www.youtube.com/results";
 const DEFAULT_USER_AGENT: &str =
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Codex social last30days";
+const SOCIAL_COOKIE_HOSTS: &[&str] = &[
+    "reddit.com",
+    "www.reddit.com",
+    "old.reddit.com",
+    "x.com",
+    "twitter.com",
+    "api.x.com",
+];
+const X_SEARCH_TIMELINE_2026: GqlEndpoint = GqlEndpoint {
+    query_id: "4fpceYZ6-YQCx_JSl_Cn_A",
+    operation: "SearchTimeline",
+};
+
+#[derive(Debug, Clone)]
+struct BrowserCookieAuth {
+    enabled: bool,
+    cookies_loaded: usize,
+    twikit_cookies_loaded: usize,
+    warnings: Vec<String>,
+    browser_cookies: Value,
+}
+
+#[derive(Clone)]
+struct SocialClient {
+    client: Client,
+    browser_cookie_auth: BrowserCookieAuth,
+}
+
+impl SocialClient {
+    async fn build(source: Source) -> Result<Self> {
+        let mut builder = Client::builder()
+            .timeout(StdDuration::from_secs(20))
+            .user_agent(DEFAULT_USER_AGENT);
+        let mut browser_cookie_auth = BrowserCookieAuth {
+            enabled: matches!(source, Source::Reddit | Source::X),
+            cookies_loaded: 0,
+            twikit_cookies_loaded: 0,
+            warnings: Vec::new(),
+            browser_cookies: json!({ "cookies": [] }),
+        };
+        if browser_cookie_auth.enabled {
+            let (jar, auth) = load_browser_cookie_jar(SOCIAL_COOKIE_HOSTS).await;
+            browser_cookie_auth = auth;
+            if browser_cookie_auth.cookies_loaded > 0 {
+                builder = builder.cookie_provider(jar);
+            }
+        }
+        Ok(Self {
+            client: builder.build()?,
+            browser_cookie_auth,
+        })
+    }
+
+    fn auth_json(&self) -> Value {
+        json!({
+            "enabled": self.browser_cookie_auth.enabled,
+            "cookies_loaded": self.browser_cookie_auth.cookies_loaded,
+            "twikit_cookies_loaded": self.browser_cookie_auth.twikit_cookies_loaded,
+            "twikit_has_auth_token": twikit_cookie_present(&self.browser_cookie_auth.browser_cookies, "auth_token"),
+            "twikit_has_ct0": twikit_cookie_present(&self.browser_cookie_auth.browser_cookies, "ct0"),
+            "warnings": self.browser_cookie_auth.warnings,
+        })
+    }
+
+    fn auth_gaps(&self) -> Vec<String> {
+        if !self.browser_cookie_auth.enabled || self.browser_cookie_auth.cookies_loaded > 0 {
+            return Vec::new();
+        }
+        let mut gaps = vec![
+            "browser cookie auth enabled but no usable reddit/x cookies were loaded".to_string(),
+        ];
+        gaps.extend(
+            self.browser_cookie_auth
+                .warnings
+                .iter()
+                .map(|warning| format!("browser cookie auth: {warning}")),
+        );
+        gaps
+    }
+}
+
+fn add_browser_cookie(jar: &Jar, cookie: &impl CookiesInfo) {
+    if cookie.name().is_empty() || cookie.value().is_empty() || cookie.domain().is_empty() {
+        return;
+    }
+    if let Ok(url) = reqwest::Url::parse(&cookie.url()) {
+        jar.add_cookie_str(&cookie.set_cookie_header(), &url);
+    }
+}
+
+fn twikit_cookie_json(cookie: &impl CookiesInfo) -> Option<Value> {
+    if cookie.name().is_empty() || cookie.value().is_empty() {
+        return None;
+    }
+    let domain = normalize_twikit_cookie_domain(&cookie.domain())?;
+    Some(json!({
+        "name": cookie.name(),
+        "value": cookie.value(),
+        "domain": domain,
+        "path": cookie.path(),
+    }))
+}
+
+fn normalize_twikit_cookie_domain(domain: &str) -> Option<&'static str> {
+    match domain.trim_start_matches('.').to_ascii_lowercase().as_str() {
+        "x.com" | "twitter.com" => Some(".x.com"),
+        _ => None,
+    }
+}
+
+fn twikit_cookie_present(cookies: &Value, name: &str) -> bool {
+    cookies
+        .get("cookies")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|cookie| cookie.get("name").and_then(Value::as_str) == Some(name))
+}
+
+fn cookie_matches_hosts(cookie: &impl CookiesInfo, hosts: &[&str]) -> bool {
+    let domain = cookie.domain().trim_start_matches('.').to_ascii_lowercase();
+    hosts.iter().any(|host| {
+        let host = host.trim_start_matches('.').to_ascii_lowercase();
+        domain == host || domain.ends_with(&format!(".{host}"))
+    })
+}
+
+async fn load_browser_cookie_jar(hosts: &[&str]) -> (Arc<Jar>, BrowserCookieAuth) {
+    let jar = Arc::new(Jar::default());
+    let mut cookies_loaded = 0usize;
+    let mut twikit_cookies = Vec::new();
+    let mut warnings = Vec::new();
+
+    match SafariBuilder::new().build().await {
+        Ok(getter) => {
+            let mut seen = BTreeSet::new();
+            for cookie in getter.cookies_all() {
+                if !cookie_matches_hosts(cookie, hosts) {
+                    continue;
+                }
+                let cookie_key =
+                    format!("{}\t{}\t{}", cookie.domain(), cookie.path(), cookie.name());
+                if !seen.insert(cookie_key) {
+                    continue;
+                }
+                add_browser_cookie(&jar, cookie);
+                if let Some(cookie) = twikit_cookie_json(cookie) {
+                    twikit_cookies.push(cookie);
+                }
+                cookies_loaded += 1;
+            }
+        }
+        Err(error) => warnings.push(format!("safari browser unavailable: {error}")),
+    }
+
+    (
+        jar,
+        BrowserCookieAuth {
+            enabled: true,
+            cookies_loaded,
+            twikit_cookies_loaded: twikit_cookies.len(),
+            warnings,
+            browser_cookies: json!({ "cookies": twikit_cookies }),
+        },
+    )
+}
 
 #[derive(Debug, Clone, Args, Default)]
 pub struct SocialArgs {
@@ -57,10 +229,7 @@ pub enum Depth {
 
 pub async fn run(args: SocialArgs) -> Result<Value> {
     validate_args(&args)?;
-    let client = Client::builder()
-        .timeout(StdDuration::from_secs(20))
-        .user_agent(DEFAULT_USER_AGENT)
-        .build()?;
+    let client = SocialClient::build(args.source).await?;
     let result = if args.tickers.is_empty() {
         run_single(&client, &args).await?
     } else {
@@ -75,24 +244,15 @@ pub async fn run(args: SocialArgs) -> Result<Value> {
     Ok(result)
 }
 
-async fn run_single(client: &Client, args: &SocialArgs) -> Result<Value> {
+async fn run_single(client: &SocialClient, args: &SocialArgs) -> Result<Value> {
     match args.source {
         Source::Reddit => run_reddit(client, args).await,
-        Source::X => {
-            run_x(
-                client,
-                args,
-                std::env::var("XQUIK_API_KEY")
-                    .ok()
-                    .filter(|value| !value.trim().is_empty()),
-            )
-            .await
-        }
+        Source::X => run_x(client, args).await,
         Source::Youtube => run_youtube(client, args).await,
     }
 }
 
-async fn run_per_ticker(client: &Client, args: &SocialArgs) -> Result<Value> {
+async fn run_per_ticker(client: &SocialClient, args: &SocialArgs) -> Result<Value> {
     let mut per_ticker = serde_json::Map::new();
     let mut all_items = Vec::new();
     let mut data_gaps = Vec::new();
@@ -166,50 +326,30 @@ fn validate_args(args: &SocialArgs) -> Result<()> {
     Ok(())
 }
 
-async fn run_reddit(client: &Client, args: &SocialArgs) -> Result<Value> {
+async fn run_reddit(client: &SocialClient, args: &SocialArgs) -> Result<Value> {
     let now = Utc::now();
     let limit = args.limit.unwrap_or_else(|| default_limit(args.depth));
-    let rss_url = format!(
-        "{REDDIT_RSS_URL}?q={}&sort=new&t=month",
-        urlencoding::encode(args.query.trim())
-    );
-    let rss_response = match client.get(&rss_url).send().await {
-        Ok(response) => response,
+    let encoded_query = urlencoding::encode(args.query.trim());
+    let rss_url = format!("{REDDIT_RSS_URL}?q={encoded_query}&sort=new&t=month");
+    let json_url = format!("{REDDIT_JSON_URL}?q={encoded_query}&sort=new&t=month&limit={limit}");
+    let mut gaps = client.auth_gaps();
+    let mut items = match fetch_reddit_rss_items(client, &rss_url, now, args).await {
+        Ok(items) => items,
         Err(error) => {
-            return Ok(unavailable_result(
-                "reddit",
-                args,
-                now,
-                format!("failed to fetch Reddit RSS search: {error}"),
-            ));
+            gaps.push(error);
+            Vec::new()
         }
     };
-    let rss_response = match rss_response.error_for_status() {
-        Ok(response) => response,
-        Err(error) => {
-            return Ok(unavailable_result(
-                "reddit",
-                args,
-                now,
-                format!("Reddit RSS search returned an error status: {error}"),
-            ));
-        }
-    };
-    let rss_text = match rss_response.text().await {
-        Ok(text) => text,
-        Err(error) => {
-            return Ok(unavailable_result(
-                "reddit",
-                args,
-                now,
-                format!("failed to read Reddit RSS response body: {error}"),
-            ));
-        }
-    };
-    let mut gaps = Vec::new();
-    let mut items = parse_reddit_rss(&rss_text, now, args.days, &args.query);
     if items.is_empty() {
-        gaps.push("reddit RSS search returned no date-filtered relevant items".to_string());
+        match fetch_reddit_json_items(client, &json_url, now, args).await {
+            Ok(json_items) if !json_items.is_empty() => {
+                gaps.push("reddit RSS search failed or returned no usable items; used Reddit JSON fallback".to_string());
+                items = json_items;
+            }
+            Ok(_) => gaps
+                .push("reddit JSON fallback returned no date-filtered relevant items".to_string()),
+            Err(error) => gaps.push(error),
+        }
     }
     let allowed_subreddits = normalize_subreddit_filter(&args.subreddits);
     if !allowed_subreddits.is_empty() {
@@ -239,7 +379,7 @@ async fn run_reddit(client: &Client, args: &SocialArgs) -> Result<Value> {
     let mut backfilled = 0usize;
     for item in &mut items {
         if let Some(url) = item.url.as_deref() {
-            match fetch_reddit_listing_backfill(client, url).await {
+            match fetch_reddit_listing_backfill(&client.client, url).await {
                 Ok(Some(backfill)) => {
                     item.apply_backfill(backfill);
                     backfilled += 1;
@@ -277,9 +417,58 @@ async fn run_reddit(client: &Client, args: &SocialArgs) -> Result<Value> {
         "fetched_at": now.to_rfc3339(),
         "data_gaps": gaps,
         "rss_url": rss_url,
+        "json_fallback_url": json_url,
         "backfilled_items": backfilled,
+        "browser_cookie_auth": client.auth_json(),
         "items": items.into_iter().map(RedditItem::into_json).collect::<Vec<_>>()
     }))
+}
+
+async fn fetch_reddit_rss_items(
+    client: &SocialClient,
+    rss_url: &str,
+    now: DateTime<Utc>,
+    args: &SocialArgs,
+) -> std::result::Result<Vec<RedditItem>, String> {
+    let response = client
+        .client
+        .get(rss_url)
+        .send()
+        .await
+        .map_err(|error| format!("failed to fetch Reddit RSS search: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("Reddit RSS search returned an error status: {error}"))?;
+    let rss_text = response
+        .text()
+        .await
+        .map_err(|error| format!("failed to read Reddit RSS response body: {error}"))?;
+    let items = parse_reddit_rss(&rss_text, now, args.days, &args.query);
+    if items.is_empty() {
+        Err("reddit RSS search returned no date-filtered relevant items".to_string())
+    } else {
+        Ok(items)
+    }
+}
+
+async fn fetch_reddit_json_items(
+    client: &SocialClient,
+    json_url: &str,
+    now: DateTime<Utc>,
+    args: &SocialArgs,
+) -> std::result::Result<Vec<RedditItem>, String> {
+    let response = client
+        .client
+        .get(json_url)
+        .send()
+        .await
+        .map_err(|error| format!("failed to fetch Reddit JSON fallback: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("Reddit JSON fallback returned an error status: {error}"))?;
+    let value = response
+        .json::<Value>()
+        .await
+        .map_err(|error| format!("failed to parse Reddit JSON fallback body: {error}"))?;
+    Ok(parse_reddit_json(&value, now, args.days, &args.query))
 }
 
 async fn fetch_reddit_listing_backfill(
@@ -296,70 +485,200 @@ async fn fetch_reddit_listing_backfill(
     Ok(parse_shreddit_listing(&html))
 }
 
-async fn run_x(client: &Client, args: &SocialArgs, api_key: Option<String>) -> Result<Value> {
+async fn run_x(client: &SocialClient, args: &SocialArgs) -> Result<Value> {
     let now = Utc::now();
-    let Some(api_key) = api_key else {
-        return Ok(x_unavailable(args, now));
+    let limit = args
+        .limit
+        .unwrap_or_else(|| default_limit(args.depth))
+        .min(20);
+    let twikit_client = match TwikitClient::builder().build() {
+        Ok(client) => client,
+        Err(error) => {
+            return Ok(x_unavailable(
+                args,
+                now,
+                client,
+                format!("failed to build twikit client: {error}"),
+            ))
+        }
     };
-    let limit = args.limit.unwrap_or_else(|| default_limit(args.depth));
-    let response: Value = client
-        .post(XQUIK_SEARCH_URL)
-        .bearer_auth(&api_key)
-        .header("X-API-Key", &api_key)
-        .json(&json!({
-            "query": args.query,
-            "limit": limit,
-            "days": args.days
-        }))
-        .send()
+    if client.browser_cookie_auth.twikit_cookies_loaded == 0 {
+        return Ok(x_unavailable(
+            args,
+            now,
+            client,
+            "twikit search requires x.com browser cookies, but no usable x.com cookies were loaded"
+                .to_string(),
+        ));
+    }
+    if let Err(error) =
+        twikit_client.set_browser_cookies(client.browser_cookie_auth.browser_cookies.clone())
+    {
+        return Ok(x_unavailable(
+            args,
+            now,
+            client,
+            format!("failed to set browser cookies on twikit client: {error}"),
+        ));
+    }
+    let (tweets, raw, mut data_gaps) = match twikit_client
+        .search_tweet(
+            args.query.clone(),
+            TweetSearchProduct::Latest,
+            limit as i64,
+            None,
+        )
         .await
-        .context("failed to call XQuik tweet search")?
-        .error_for_status()
-        .context("XQuik tweet search returned an error status")?
-        .json()
-        .await
-        .context("failed to parse XQuik tweet search JSON")?;
-    let items = normalize_x_items(&response, now, args.days, limit);
+    {
+        Ok(timeline) => (timeline.items, timeline.raw, Vec::new()),
+        Err(error) => match run_x_search_timeline_2026(&twikit_client, args, limit).await {
+            Ok((tweets, raw)) => (
+                tweets,
+                raw,
+                vec![format!(
+                    "twikit default SearchTimeline failed, used 2026 fallback: {error}"
+                )],
+            ),
+            Err(fallback_error) => {
+                return Ok(x_unavailable(
+                    args,
+                    now,
+                    client,
+                    format!(
+                        "twikit tweet search failed: {error}; 2026 SearchTimeline fallback failed: {fallback_error}"
+                    ),
+                ))
+            }
+        },
+    };
+    let items = normalize_twikit_tweets(tweets, now, args.days, limit);
+    if items.is_empty() {
+        data_gaps.push("twikit returned no date-filtered tweet items".to_string());
+    }
     Ok(json!({
         "status": if items.is_empty() { "empty" } else { "success" },
         "source": "x",
+        "provider": "twikit-rs",
         "query": args.query,
         "depth": depth_name(args.depth),
         "window_days": args.days,
         "fetched_at": now.to_rfc3339(),
-        "data_gaps": if items.is_empty() {
-            vec!["XQuik returned no date-filtered tweet items"]
-        } else {
-            Vec::<&str>::new()
-        },
+        "browser_cookie_auth": client.auth_json(),
+        "data_gaps": data_gaps,
         "items": items,
-        "raw": response
+        "raw": raw
     }))
 }
 
-fn x_unavailable(args: &SocialArgs, now: DateTime<Utc>) -> Value {
+async fn run_x_search_timeline_2026(
+    twikit_client: &TwikitClient,
+    args: &SocialArgs,
+    limit: usize,
+) -> Result<(Vec<Tweet>, Value)> {
+    let raw = twikit_client
+        .gql_get_raw(
+            X_SEARCH_TIMELINE_2026,
+            json!({
+                "rawQuery": args.query,
+                "count": limit,
+                "querySource": "typed_query",
+                "product": "Latest",
+                "withGrokTranslatedBio": false
+            }),
+            Some(constants::features()),
+            Some(json!({ "fieldToggles": { "withArticleRichContentState": false } })),
+        )
+        .await?;
+    let tweets = parse_twikit_tweets_from_raw(&raw, limit);
+    Ok((tweets, raw))
+}
+
+fn parse_twikit_tweets_from_raw(raw: &Value, limit: usize) -> Vec<Tweet> {
+    let mut tweet_results = Vec::new();
+    find_values(raw, "tweet_results", &mut tweet_results);
+    let mut seen = BTreeSet::new();
+    tweet_results
+        .into_iter()
+        .filter_map(|value| value.get("result").cloned())
+        .filter_map(|value| Tweet::from_value(value).ok())
+        .filter(|tweet| seen.insert(tweet.id.clone()))
+        .take(limit)
+        .collect()
+}
+
+fn x_unavailable(
+    args: &SocialArgs,
+    now: DateTime<Utc>,
+    client: &SocialClient,
+    reason: String,
+) -> Value {
+    let (failure_kind, next_action) = diagnose_x_failure(client, &reason);
+    let mut data_gaps = client.auth_gaps();
+    data_gaps.push(reason);
     json!({
         "status": "unavailable",
         "source": "x",
+        "provider": "twikit-rs",
         "query": args.query,
         "depth": depth_name(args.depth),
         "window_days": args.days,
         "fetched_at": now.to_rfc3339(),
-        "data_gaps": [
-            "XQUIK_API_KEY is not set; X search was skipped"
-        ],
+        "failure_kind": failure_kind,
+        "next_action": next_action,
+        "browser_cookie_auth": client.auth_json(),
+        "data_gaps": data_gaps,
         "items": []
     })
 }
 
-async fn run_youtube(client: &Client, args: &SocialArgs) -> Result<Value> {
+fn diagnose_x_failure(client: &SocialClient, reason: &str) -> (&'static str, &'static str) {
+    let lower_reason = reason.to_ascii_lowercase();
+    let has_auth_token =
+        twikit_cookie_present(&client.browser_cookie_auth.browser_cookies, "auth_token");
+    let has_ct0 = twikit_cookie_present(&client.browser_cookie_auth.browser_cookies, "ct0");
+
+    if lower_reason.contains("failed to build twikit client") {
+        return (
+            "x_client_initialization_failed",
+            "Check twikit-rs dependency initialization before retrying X ingest.",
+        );
+    }
+
+    if client.browser_cookie_auth.twikit_cookies_loaded == 0 || !has_auth_token || !has_ct0 {
+        return (
+            "x_missing_browser_session",
+            "Open Safari, sign in to x.com, then rerun last30days X ingest.",
+        );
+    }
+
+    if lower_reason.contains("failed to set browser cookies") {
+        return (
+            "x_cookie_format_rejected",
+            "Refresh the Safari x.com session and verify exported cookies include auth_token and ct0.",
+        );
+    }
+
+    if lower_reason.contains("status 403") && lower_reason.contains("body: ") {
+        return (
+            "x_blocked_by_cloudflare_or_client_fingerprint",
+            "Use a browser-backed X retrieval path or the official X API; Safari cookies are present but reqwest/twikit is being rejected.",
+        );
+    }
+
+    (
+        "x_request_failed",
+        "Retry later, then inspect the raw twikit-rs error if the failure persists.",
+    )
+}
+
+async fn run_youtube(client: &SocialClient, args: &SocialArgs) -> Result<Value> {
     let now = Utc::now();
     let limit = args.limit.unwrap_or_else(|| default_limit(args.depth));
     let url = format!(
         "{YOUTUBE_SEARCH_URL}?search_query={}&sp=CAI%253D",
         urlencoding::encode(args.query.trim())
     );
-    let response = match client.get(&url).send().await {
+    let response = match client.client.get(&url).send().await {
         Ok(response) => response,
         Err(error) => {
             return Ok(unavailable_result(
@@ -475,6 +794,48 @@ fn parse_reddit_rss(rss: &str, now: DateTime<Utc>, days: i64, query: &str) -> Ve
     by_key.into_values().collect()
 }
 
+fn parse_reddit_json(value: &Value, now: DateTime<Utc>, days: i64, query: &str) -> Vec<RedditItem> {
+    let cutoff = now - Duration::days(days);
+    value
+        .pointer("/data/children")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|child| child.get("data"))
+        .filter_map(|post| {
+            let created = post
+                .get("created_utc")
+                .and_then(Value::as_f64)
+                .and_then(|value| DateTime::<Utc>::from_timestamp(value as i64, 0))?;
+            if created < cutoff || created > now + Duration::minutes(5) {
+                return None;
+            }
+            let title = first_string(post, &["title"]).unwrap_or_default();
+            let summary = first_string(post, &["selftext", "body", "text"]).unwrap_or_default();
+            let subreddit = first_string(post, &["subreddit"]);
+            let relevance = relevance_score(query, &title, &summary, subreddit.as_deref());
+            if relevance == 0 {
+                return None;
+            }
+            let permalink =
+                first_string(post, &["permalink"]).map(|value| format_reddit_url(&value));
+            let url = permalink.or_else(|| first_string(post, &["url", "link"]));
+            Some(RedditItem {
+                id: first_string(post, &["id", "name"]),
+                title,
+                url,
+                subreddit,
+                author: first_string(post, &["author"]),
+                published: created,
+                summary,
+                relevance,
+                score: first_i64(post, &["score", "ups"]),
+                comments: first_i64(post, &["num_comments", "comments"]),
+            })
+        })
+        .collect()
+}
+
 fn parse_shreddit_listing(html: &str) -> Option<RedditListingBackfill> {
     let post_re = Regex::new(r#"(?is)<shreddit-post\b([^>]*)>"#).expect("valid post regex");
     let attrs = post_re
@@ -501,46 +862,39 @@ fn parse_shreddit_listing(html: &str) -> Option<RedditListingBackfill> {
     }
 }
 
-fn normalize_x_items(response: &Value, now: DateTime<Utc>, days: i64, limit: usize) -> Vec<Value> {
+fn normalize_twikit_tweets(
+    tweets: Vec<Tweet>,
+    now: DateTime<Utc>,
+    days: i64,
+    limit: usize,
+) -> Vec<Value> {
     let cutoff = now - Duration::days(days);
-    let raw_items = response
-        .get("data")
-        .or_else(|| response.get("tweets"))
-        .or_else(|| response.get("items"))
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    raw_items
+    tweets
         .into_iter()
-        .filter_map(|item| {
-            let created_at = first_string(
-                &item,
-                &[
-                    "created_at",
-                    "createdAt",
-                    "timestamp",
-                    "date",
-                    "published_at",
-                ],
-            )
-            .and_then(|value| parse_datetime(&value));
-            if let Some(created_at) = created_at {
-                if created_at < cutoff || created_at > now + Duration::minutes(5) {
+        .filter_map(|tweet| {
+            let published = tweet
+                .created_at_datetime()
+                .and_then(|value| value.ok())
+                .map(|value| value.with_timezone(&Utc));
+            if let Some(published) = published {
+                if published < cutoff || published > now + Duration::minutes(5) {
                     return None;
                 }
             }
-            let text =
-                first_string(&item, &["text", "full_text", "content", "body"]).unwrap_or_default();
+            let id = tweet.id;
             Some(json!({
-                "id": first_string(&item, &["id", "tweet_id", "rest_id"]),
-                "author": first_string(&item, &["author", "username", "screen_name", "user"]),
-                "text": text,
-                "url": first_string(&item, &["url", "tweet_url", "link"]),
-                "published": created_at.map(|value| value.to_rfc3339()),
-                "likes": first_i64(&item, &["likes", "favorite_count", "like_count"]),
-                "reposts": first_i64(&item, &["retweets", "retweet_count", "reposts"]),
-                "replies": first_i64(&item, &["replies", "reply_count"]),
-                "raw": item
+                "id": id.clone(),
+                "author": tweet.user.as_ref().and_then(|user| user.screen_name.clone()),
+                "author_name": tweet.user.as_ref().and_then(|user| user.name.clone()),
+                "text": tweet.full_text.or(tweet.text),
+                "url": format!("https://x.com/i/web/status/{id}"),
+                "published": published.map(|value| value.to_rfc3339()),
+                "likes": tweet.favorite_count,
+                "reposts": tweet.retweet_count,
+                "replies": tweet.reply_count,
+                "bookmarks": tweet.bookmark_count,
+                "views": tweet.view_count,
+                "raw": tweet.raw
             }))
         })
         .take(limit)
@@ -699,6 +1053,14 @@ fn reddit_id_from_url(url: Option<&str>) -> Option<String> {
     re.captures(url?)
         .and_then(|cap| cap.get(1))
         .map(|m| m.as_str().to_string())
+}
+
+fn format_reddit_url(value: &str) -> String {
+    if value.starts_with("http://") || value.starts_with("https://") {
+        value.to_string()
+    } else {
+        format!("https://www.reddit.com/{}", value.trim_start_matches('/'))
+    }
 }
 
 fn subreddit_from_url(url: &str) -> Option<&str> {
@@ -902,6 +1264,48 @@ mod tests {
     }
 
     #[test]
+    fn twikit_cookie_domain_filter_accepts_only_x_root_domain() {
+        assert_eq!(normalize_twikit_cookie_domain("x.com"), Some(".x.com"));
+        assert_eq!(normalize_twikit_cookie_domain(".x.com"), Some(".x.com"));
+        assert_eq!(
+            normalize_twikit_cookie_domain("twitter.com"),
+            Some(".x.com")
+        );
+        assert_eq!(
+            normalize_twikit_cookie_domain(".twitter.com"),
+            Some(".x.com")
+        );
+        assert_eq!(normalize_twikit_cookie_domain("api.x.com"), None);
+        assert_eq!(normalize_twikit_cookie_domain("reddit.com"), None);
+    }
+
+    #[test]
+    fn auth_json_reports_twikit_key_cookie_presence_without_values() {
+        let client = SocialClient {
+            client: Client::new(),
+            browser_cookie_auth: BrowserCookieAuth {
+                enabled: true,
+                cookies_loaded: 2,
+                twikit_cookies_loaded: 2,
+                warnings: Vec::new(),
+                browser_cookies: json!({
+                    "cookies": [
+                        {"name": "auth_token", "value": "secret"},
+                        {"name": "ct0", "value": "csrf"}
+                    ]
+                }),
+            },
+        };
+
+        let auth = client.auth_json();
+
+        assert_eq!(auth["twikit_has_auth_token"], true);
+        assert_eq!(auth["twikit_has_ct0"], true);
+        assert!(!auth.to_string().contains("secret"));
+        assert!(!auth.to_string().contains("csrf"));
+    }
+
+    #[test]
     fn reddit_rss_parser_dedupes_filters_dates_and_scores_relevance() {
         let rss = r#"
         <feed>
@@ -949,6 +1353,58 @@ mod tests {
     }
 
     #[test]
+    fn reddit_json_parser_reads_posts_from_fallback_shape() {
+        let value = json!({
+            "data": {
+                "children": [
+                    {
+                        "data": {
+                            "id": "abc123",
+                            "title": "QQQ SOXX rotation gets debated",
+                            "selftext": "VIX is rising while semis lag.",
+                            "permalink": "/r/stocks/comments/abc123/qqq_soxx_rotation/",
+                            "subreddit": "stocks",
+                            "author": "macrodesk",
+                            "created_utc": 1781546400.0,
+                            "score": 42,
+                            "num_comments": 9
+                        }
+                    },
+                    {
+                        "data": {
+                            "id": "old",
+                            "title": "QQQ old",
+                            "created_utc": 1777593600.0,
+                            "subreddit": "stocks"
+                        }
+                    },
+                    {
+                        "data": {
+                            "id": "irrelevant",
+                            "title": "Gardening",
+                            "created_utc": 1781546400.0,
+                            "subreddit": "plants"
+                        }
+                    }
+                ]
+            }
+        });
+
+        let items = parse_reddit_json(&value, fixed_now(), 30, "QQQ SOXX VIX");
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id.as_deref(), Some("abc123"));
+        assert_eq!(items[0].subreddit.as_deref(), Some("stocks"));
+        assert_eq!(items[0].author.as_deref(), Some("macrodesk"));
+        assert_eq!(items[0].score, Some(42));
+        assert_eq!(items[0].comments, Some(9));
+        assert_eq!(
+            items[0].url.as_deref(),
+            Some("https://www.reddit.com/r/stocks/comments/abc123/qqq_soxx_rotation/")
+        );
+    }
+
+    #[test]
     fn shreddit_listing_parser_reads_score_comments_and_subreddit() {
         let html = r#"
         <html>
@@ -975,9 +1431,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn x_without_key_returns_unavailable_with_data_gap() {
-        let args = SocialArgs {
+    fn x_args() -> SocialArgs {
+        SocialArgs {
             source: Source::X,
             query: "TQQQ".to_string(),
             tickers: Vec::new(),
@@ -986,16 +1441,78 @@ mod tests {
             limit: Some(5),
             subreddits: Vec::new(),
             output: None,
+        }
+    }
+
+    #[test]
+    fn x_without_browser_cookies_returns_unavailable_with_data_gap() {
+        let client = SocialClient {
+            client: Client::new(),
+            browser_cookie_auth: BrowserCookieAuth {
+                enabled: true,
+                cookies_loaded: 0,
+                twikit_cookies_loaded: 0,
+                warnings: vec!["no browser cookies".to_string()],
+                browser_cookies: json!({ "cookies": [] }),
+            },
         };
 
-        let value = x_unavailable(&args, fixed_now());
+        let value = x_unavailable(
+            &x_args(),
+            fixed_now(),
+            &client,
+            "request failed".to_string(),
+        );
 
         assert_eq!(value["status"], "unavailable");
         assert_eq!(value["source"], "x");
         assert_eq!(value["items"].as_array().unwrap().len(), 0);
-        assert!(value["data_gaps"][0]
+        assert_eq!(value["failure_kind"], "x_missing_browser_session");
+        let gaps = value["data_gaps"].as_array().unwrap();
+        assert!(gaps
+            .iter()
+            .any(|gap| gap.as_str().unwrap().contains("request failed")));
+        assert!(gaps
+            .iter()
+            .any(|gap| gap.as_str().unwrap().contains("browser cookie auth")));
+        assert_eq!(value["browser_cookie_auth"]["cookies_loaded"], 0);
+    }
+
+    #[test]
+    fn x_forbidden_with_key_cookies_reports_client_fingerprint_block() {
+        let client = SocialClient {
+            client: Client::new(),
+            browser_cookie_auth: BrowserCookieAuth {
+                enabled: true,
+                cookies_loaded: 2,
+                twikit_cookies_loaded: 2,
+                warnings: Vec::new(),
+                browser_cookies: json!({
+                    "cookies": [
+                        {"name": "auth_token", "value": "secret"},
+                        {"name": "ct0", "value": "csrf"}
+                    ]
+                }),
+            },
+        };
+
+        let value = x_unavailable(
+            &x_args(),
+            fixed_now(),
+            &client,
+            "twikit tweet search failed: forbidden: status 403, body: ; 2026 SearchTimeline fallback failed: forbidden: status 403, body: ".to_string(),
+        );
+
+        assert_eq!(value["status"], "unavailable");
+        assert_eq!(
+            value["failure_kind"],
+            "x_blocked_by_cloudflare_or_client_fingerprint"
+        );
+        assert!(value["next_action"]
             .as_str()
             .unwrap()
-            .contains("XQUIK_API_KEY"));
+            .contains("browser-backed X retrieval path"));
+        assert_eq!(value["browser_cookie_auth"]["twikit_has_auth_token"], true);
+        assert_eq!(value["browser_cookie_auth"]["twikit_has_ct0"], true);
     }
 }

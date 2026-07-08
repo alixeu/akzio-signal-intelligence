@@ -1,7 +1,13 @@
+pub mod archive;
+pub mod candidate;
 pub mod context;
 pub mod importers;
+pub mod memory;
 pub mod metrics;
+pub mod outcome;
+pub mod prediction;
 pub mod schema;
+pub mod system_metrics;
 pub mod write;
 
 pub use context::{

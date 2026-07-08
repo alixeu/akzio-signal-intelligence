@@ -3,6 +3,7 @@ pub mod config;
 pub mod paths;
 pub mod plugin_manifest;
 pub mod prompt;
+pub mod reflection;
 pub mod role_registry;
 pub mod ticker;
 pub mod token;
@@ -19,5 +20,8 @@ pub use config::{
 };
 pub use paths::{default_project_root, project_path};
 pub use prompt::replace_placeholders;
+pub use reflection::{
+    DefaultQualityScorer, MarketRegime, MemoryQualityInput, QualityScorer, RetrievalBudget, Scope,
+};
 pub use role_registry::{AgentDefinition, AgentRegistry, DEFAULT_PHASE1_AGENTS};
 pub use ticker::{display_ticker, parse_tickers, run_slug, slug_ticker};

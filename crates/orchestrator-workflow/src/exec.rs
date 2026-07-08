@@ -3,10 +3,16 @@ use chrono::{Local, NaiveDate};
 use clap::{Args, ValueEnum};
 use orchestrator_core::{
     config_int, config_str, default_project_root, display_ticker, load_config, parse_tickers,
-    project_path, run_slug,
+    project_path, run_slug, MarketRegime,
 };
 use orchestrator_sql;
-use orchestrator_sql::{connect, write_run_record, RunRecordInput};
+use orchestrator_sql::{
+    archive::{upsert_run_archive, RunArchiveInput},
+    connect,
+    prediction::{upsert_prediction, PredictionInput},
+    system_metrics::{rewrite_system_metrics_from_prompt_metrics, SystemMetricsCopyInput},
+    write_run_record, RunRecordInput,
+};
 use serde_json::{json, Value};
 use std::{fs, path::PathBuf, time::Instant};
 use tracing::debug;
@@ -30,6 +36,7 @@ use crate::orchestration::policy::{
 };
 use crate::orchestration::preflight::{enforce_preflight_policy, run_phase1_preflight};
 use crate::orchestration::render::mode_prompt_path;
+use crate::orchestration::retrieval::inject_phase0_reflection;
 use crate::orchestration::role_jobs::{
     merge_role_job_metrics, persist_prompt_metric, prepare_role_job, record_role_job_metrics,
     run_role_jobs, run_single_role_job, run_single_steer_role_job, RoleRun, SteerRoleRun,
@@ -105,7 +112,7 @@ pub struct ExecArgs {
     pub x_weight: f64,
     #[arg(long, default_value_t = 1)]
     pub from_phase: i64,
-    #[arg(long, default_value_t = 7)]
+    #[arg(long, default_value_t = 8)]
     pub to_phase: i64,
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub tech_refresh_enabled: bool,
@@ -180,10 +187,11 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
     let mut conn = connect(&db_path)?;
     let run_id = run_id_for(&tickers, &date, &run_dir);
     let state_path = run_dir.join("state.json");
-    let phase1_agents_raw = if args.phase1_agents == DEFAULT_PHASE1_AGENTS {
-        config_str(&config, "orchestrator.phase1_agents", DEFAULT_PHASE1_AGENTS)
-    } else {
+    let explicit_phase1_agents = args.phase1_agents != DEFAULT_PHASE1_AGENTS;
+    let phase1_agents_raw = if explicit_phase1_agents {
         args.phase1_agents.clone()
+    } else {
+        config_str(&config, "orchestrator.phase1_agents", DEFAULT_PHASE1_AGENTS)
     };
     let phase1_agents = parse_phase1_agents_with_config(&phase1_agents_raw, &runtime_config)?;
     let model_override = args.model.clone().filter(|value| !value.is_empty());
@@ -201,6 +209,8 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         "orchestrator exec resolved runtime paths"
     );
 
+    let analyst_weights =
+        phase1_analyst_weights(&config, &args, &phase1_agents, explicit_phase1_agents);
     let mut state = json!({
         "run_id": run_id,
         "ticker": ticker,
@@ -214,13 +224,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         "phase_status": {},
         "phase1_agents": phase1_agents,
         "tech_refresh_enabled": args.tech_refresh_enabled,
-        "analyst_weights": {
-            "analyst.technical": config_weight(&config, "technical", args.technical_weight),
-            "analyst.news_macro": config_weight(&config, "news_macro", args.news_weight),
-            "analyst.youtube": config_weight(&config, "youtube", args.youtube_weight),
-            "analyst.reddit": config_weight(&config, "reddit", args.reddit_weight),
-            "analyst.x": config_weight(&config, "x", args.x_weight)
-        },
+        "analyst_weights": analyst_weights,
         "degraded": false
     });
     if let Some(weights) = state
@@ -248,6 +252,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         );
         validate_sqlite_context(&conn, &runtime_config)?;
     }
+    inject_phase0_reflection(&conn, &mut state, &runtime_config)?;
 
     if args.from_phase <= 1 && args.to_phase >= 1 {
         debug!(roles = ?phase1_agents, "phase 1 starting");
@@ -386,6 +391,14 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         record_phase_elapsed(&mut state, phase_timer);
         debug!("phase 7 (allocation) completed");
     }
+    if args.from_phase <= 8 && args.to_phase >= 8 {
+        debug!("phase 8 (archive + predict) starting");
+        let phase_timer = start_phase_timer(8, "phase8");
+        run_phase8(&conn, &mut state, &runtime_config)?;
+        set_phase_status(&mut state, 8, "done");
+        record_phase_elapsed(&mut state, phase_timer);
+        debug!("phase 8 (archive + predict) completed");
+    }
 
     record_contracts(&mut state);
     write_json(&state_path, &state)?;
@@ -448,11 +461,11 @@ fn validate_args(args: &ExecArgs) -> Result<()> {
     if args.max_topics_per_side < 1 {
         bail!("--max-topics-per-side must be >= 1");
     }
-    if args.from_phase < 1 || args.from_phase > 7 {
-        bail!("--from-phase must be 1-7");
+    if args.from_phase < 1 || args.from_phase > 8 {
+        bail!("--from-phase must be 1-8");
     }
-    if args.to_phase < args.from_phase || args.to_phase > 7 {
-        bail!("--to-phase must be between --from-phase and 7");
+    if args.to_phase < args.from_phase || args.to_phase > 8 {
+        bail!("--to-phase must be between --from-phase and 8");
     }
     for (name, value) in [
         ("--technical-weight", args.technical_weight),
@@ -773,6 +786,57 @@ fn resolve_db_path(args: &ExecArgs, config: &Value) -> PathBuf {
     project_path("outputs/orchestrator.sqlite")
 }
 
+fn phase1_analyst_weights(
+    config: &Value,
+    args: &ExecArgs,
+    phase1_agents: &[String],
+    explicit_phase1_agents: bool,
+) -> Value {
+    let mut weights = json!({
+        "analyst.technical": config_weight(config, "technical", args.technical_weight),
+        "analyst.news_macro": config_weight(config, "news_macro", args.news_weight),
+        "analyst.youtube": config_weight(config, "youtube", args.youtube_weight),
+        "analyst.reddit": config_weight(config, "reddit", args.reddit_weight),
+        "analyst.x": config_weight(config, "x", args.x_weight)
+    });
+    if explicit_phase1_agents {
+        restore_default_weight_for_explicit_agent(
+            &mut weights,
+            phase1_agents,
+            "analyst.youtube",
+            args.youtube_weight,
+        );
+        restore_default_weight_for_explicit_agent(
+            &mut weights,
+            phase1_agents,
+            "analyst.reddit",
+            args.reddit_weight,
+        );
+        restore_default_weight_for_explicit_agent(
+            &mut weights,
+            phase1_agents,
+            "analyst.x",
+            args.x_weight,
+        );
+    }
+    weights
+}
+
+fn restore_default_weight_for_explicit_agent(
+    weights: &mut Value,
+    phase1_agents: &[String],
+    role: &str,
+    default_weight: f64,
+) {
+    if default_weight <= 0.0 || !phase1_agents.iter().any(|agent| agent == role) {
+        return;
+    }
+    let current_weight = weights.get(role).and_then(Value::as_f64).unwrap_or(0.0);
+    if current_weight <= 0.0 {
+        weights[role] = json!(default_weight);
+    }
+}
+
 async fn run_phase1(
     conn: &mut rusqlite::Connection,
     state: &mut Value,
@@ -792,7 +856,10 @@ async fn run_phase1(
 
     let effective_roles = effective_phase1_roles(config, state, roles);
     if effective_roles.is_empty() {
-        bail!("all phase 1 analysts have zero weight; check analyst_weights config");
+        bail!(
+            "all selected phase 1 analysts have zero weight: {}; pass a non-zero weight flag or update orchestrator.analyst_weights in config/config.yaml",
+            zero_weight_roles(state, roles).join(", ")
+        );
     }
     record_phase1_skipped_zero_weight(config, state, roles, &effective_roles);
 
@@ -911,6 +978,14 @@ fn analyst_weight(state: &Value, role: &str) -> f64 {
         .and_then(|weights| weights.get(role))
         .and_then(Value::as_f64)
         .unwrap_or(0.0)
+}
+
+fn zero_weight_roles(state: &Value, roles: &[String]) -> Vec<String> {
+    roles
+        .iter()
+        .filter(|role| analyst_weight(state, role) <= 0.0)
+        .cloned()
+        .collect()
 }
 
 async fn run_phase2(
@@ -1662,6 +1737,222 @@ fn run_phase6_derived(conn: &mut rusqlite::Connection, state: &mut Value) -> Res
 }
 
 #[allow(clippy::too_many_arguments)]
+fn run_phase8(
+    conn: &rusqlite::Connection,
+    state: &mut Value,
+    config: &RuntimeConfig,
+) -> Result<()> {
+    let run_id = state
+        .get("run_id")
+        .and_then(Value::as_str)
+        .context("state.run_id is required for phase 8")?
+        .to_string();
+    let ticker = state
+        .get("ticker")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let tickers = tickers_from_state(state);
+    let prediction_date = state
+        .get("current_date")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let run_dir = state
+        .get("run_dir")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let research_plan = state.get("research_plan").cloned().unwrap_or(Value::Null);
+    let market_regime = market_regime_from_state(state);
+    let market_regime_json = serde_json::to_value(&market_regime)?;
+    let phase_count = state
+        .get("workflow_metrics")
+        .and_then(|value| value.get("phase_count"))
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+    let total_elapsed_ms = state
+        .get("workflow_metrics")
+        .and_then(|value| value.get("total_phase_elapsed_ms"))
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+
+    upsert_run_archive(
+        conn,
+        &RunArchiveInput {
+            run_id: run_id.clone(),
+            ticker: ticker.clone(),
+            tickers_json: json!(tickers),
+            prediction_date: prediction_date.clone(),
+            workflow_version: "v1".to_string(),
+            prompt_versions_json: json!({}),
+            git_sha: String::new(),
+            config_hash: String::new(),
+            market_regime_json: market_regime_json.clone(),
+            artifact_path: run_dir,
+            state_summary_json: phase8_state_summary(state),
+            research_plan_json: research_plan.clone(),
+            degraded: state
+                .get("degraded")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            phase_count,
+            total_elapsed_ms,
+        },
+    )?;
+
+    let mut written_predictions = 0usize;
+    let window_days = state
+        .get("window_days")
+        .and_then(Value::as_i64)
+        .unwrap_or(5);
+    for item_ticker in tickers_from_state(state) {
+        if let Some(decision) = research_decision_for_ticker(&research_plan, &item_ticker) {
+            let long_probability = decision.get("long_probability").and_then(Value::as_f64);
+            let short_probability = decision.get("short_probability").and_then(Value::as_f64);
+            if let (Some(long_probability), Some(short_probability)) =
+                (long_probability, short_probability)
+            {
+                upsert_prediction(
+                    conn,
+                    &PredictionInput {
+                        run_id: run_id.clone(),
+                        ticker: item_ticker.clone(),
+                        prediction_date: prediction_date.clone(),
+                        long_probability,
+                        short_probability,
+                        rating: decision
+                            .get("rating")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        window_days,
+                        market_regime_json: market_regime_json.clone(),
+                        agent_probabilities_json: agent_probabilities_for_ticker(
+                            state,
+                            &item_ticker,
+                        ),
+                        weighted_base_probability: weighted_base_probability_for_ticker(
+                            state,
+                            &item_ticker,
+                        ),
+                    },
+                )?;
+                written_predictions += 1;
+            }
+        }
+    }
+    if written_predictions == 0 {
+        state["degraded"] = Value::Bool(true);
+        state["phase8_warning"] = json!("no complete ticker probabilities found in research_plan");
+    }
+
+    rewrite_system_metrics_from_prompt_metrics(
+        conn,
+        &SystemMetricsCopyInput {
+            run_id,
+            workflow_version: "v1".to_string(),
+            reflection_version: config.reflection.reflection_version.clone(),
+            agent_count: state
+                .get("phase1_agents")
+                .and_then(Value::as_array)
+                .map(|items| items.len() as i64)
+                .unwrap_or_default(),
+            prediction_date,
+            ticker,
+            market_regime_json,
+        },
+    )?;
+    Ok(())
+}
+
+fn market_regime_from_state(state: &Value) -> MarketRegime {
+    let volatility = state
+        .get("allocation_context")
+        .and_then(|value| value.get("vix"))
+        .and_then(|value| value.get("regime"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            state
+                .get("portfolio_allocation")
+                .and_then(|value| value.get("vix_regime"))
+                .and_then(Value::as_str)
+        })
+        .unwrap_or_default()
+        .to_string();
+    MarketRegime {
+        volatility,
+        ..Default::default()
+    }
+}
+
+fn phase8_state_summary(state: &Value) -> Value {
+    let research = state.get("research_plan").unwrap_or(&Value::Null);
+    json!({
+        "ticker": state.get("ticker").cloned().unwrap_or(Value::Null),
+        "tickers": state.get("tickers").cloned().unwrap_or(Value::Null),
+        "rating": research.get("rating").cloned().unwrap_or(Value::Null),
+        "long_probability": research.get("long_probability").cloned().unwrap_or(Value::Null),
+        "short_probability": research.get("short_probability").cloned().unwrap_or(Value::Null),
+        "degraded": state.get("degraded").and_then(Value::as_bool).unwrap_or(false),
+        "portfolio_allocation": state.get("portfolio_allocation").cloned().unwrap_or(Value::Null),
+    })
+}
+
+fn research_decision_for_ticker(research_plan: &Value, ticker: &str) -> Option<Value> {
+    if let Some(item) = research_plan
+        .get("per_ticker")
+        .and_then(Value::as_object)
+        .and_then(|items| items.get(ticker))
+    {
+        return Some(item.clone());
+    }
+    if let Some(item) = research_plan
+        .get("ticker_decisions")
+        .and_then(Value::as_array)
+        .and_then(|items| {
+            items.iter().find(|item| {
+                item.get("ticker")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| value == ticker)
+            })
+        })
+    {
+        return Some(item.clone());
+    }
+    research_plan
+        .get("long_probability")
+        .is_some()
+        .then(|| research_plan.clone())
+}
+
+fn agent_probabilities_for_ticker(state: &Value, ticker: &str) -> Value {
+    state
+        .get("phase1_state_artifact")
+        .and_then(|value| value.get("per_ticker"))
+        .and_then(Value::as_object)
+        .and_then(|items| items.get(ticker))
+        .and_then(|value| value.get("role_summaries"))
+        .cloned()
+        .unwrap_or_else(|| json!({}))
+}
+
+fn weighted_base_probability_for_ticker(state: &Value, ticker: &str) -> Option<f64> {
+    state
+        .get("phase1_state_artifact")
+        .and_then(|value| value.get("weighted_probability_base"))
+        .and_then(Value::as_object)
+        .and_then(|items| items.get(ticker))
+        .and_then(|value| {
+            value
+                .get("long_probability")
+                .or_else(|| value.get("weighted_long_probability"))
+                .or_else(|| value.get("probability"))
+        })
+        .and_then(Value::as_f64)
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_phase7(
     conn: &mut rusqlite::Connection,
     state: &mut Value,
@@ -1787,6 +2078,12 @@ mod tests {
                 max_single_position: 0.70,
                 vol_indicator: "STD20".to_string(),
             },
+            reflection: crate::orchestration::config::ReflectionConfig {
+                enabled: true,
+                reflection_version: "v1".to_string(),
+                _promote_mode: "auto".to_string(),
+                retrieval: orchestrator_core::RetrievalBudget::default(),
+            },
             plugins: crate::orchestration::config::PluginConfig {
                 enabled: false,
                 components_dir: std::path::PathBuf::new(),
@@ -1873,7 +2170,125 @@ mod tests {
     }
 
     #[test]
-    fn llm_roles_inherit_global_defaults_and_expand_all_tools() {
+    fn zero_weight_roles_names_only_selected_zero_weight_roles() {
+        let state = json!({
+            "analyst_weights": {
+                "analyst.youtube": 0.0,
+                "analyst.reddit": 9.0,
+                "analyst.x": 0.0
+            }
+        });
+        let roles = vec!["analyst.youtube".to_string(), "analyst.reddit".to_string()];
+
+        assert_eq!(zero_weight_roles(&state, &roles), vec!["analyst.youtube"]);
+    }
+
+    #[test]
+    fn explicit_phase1_agent_restores_cli_default_for_configured_zero_weight() {
+        let config = json!({
+            "orchestrator": {
+                "analyst_weights": {
+                    "youtube": 0.0,
+                    "reddit": 0.0,
+                    "x": 0.0
+                }
+            }
+        });
+        let args = ExecArgs {
+            ticker: "QQQ".to_string(),
+            date: None,
+            lang: "zh".to_string(),
+            mode: Mode::Probability,
+            window_days: 150,
+            phase1_agents: "youtube".to_string(),
+            db_path: None,
+            run_dir: None,
+            config: None,
+            model: None,
+            reasoning_effort: None,
+            max_debate_rounds: 5,
+            max_topics_per_side: 10,
+            technical_weight: 40.0,
+            news_weight: 35.0,
+            youtube_weight: 8.0,
+            reddit_weight: 9.0,
+            x_weight: 8.0,
+            from_phase: 1,
+            to_phase: 8,
+            tech_refresh_enabled: true,
+            tech_refresh_intervals: "1d,2h,30min".to_string(),
+            tech_refresh_save_bars: 120,
+            tech_refresh_script_path: None,
+            tech_refresh_timeout_sec: 900,
+            tech_refresh_python_bin: None,
+            jin10_refresh_enabled: true,
+            jin10_refresh_lookback_hours: 24.0,
+            jin10_refresh_script_path: None,
+            jin10_refresh_timeout_sec: 120,
+            mock: false,
+        };
+        let roles = vec!["analyst.youtube".to_string()];
+
+        let weights = phase1_analyst_weights(&config, &args, &roles, true);
+
+        assert_eq!(
+            weights["analyst.youtube"].as_f64(),
+            Some(args.youtube_weight)
+        );
+        assert_eq!(weights["analyst.reddit"].as_f64(), Some(0.0));
+    }
+
+    #[test]
+    fn config_phase1_agents_keep_configured_zero_weight() {
+        let config = json!({
+            "orchestrator": {
+                "analyst_weights": {
+                    "youtube": 0.0
+                }
+            }
+        });
+        let args = ExecArgs {
+            ticker: "QQQ".to_string(),
+            date: None,
+            lang: "zh".to_string(),
+            mode: Mode::Probability,
+            window_days: 150,
+            phase1_agents: DEFAULT_PHASE1_AGENTS.to_string(),
+            db_path: None,
+            run_dir: None,
+            config: None,
+            model: None,
+            reasoning_effort: None,
+            max_debate_rounds: 5,
+            max_topics_per_side: 10,
+            technical_weight: 40.0,
+            news_weight: 35.0,
+            youtube_weight: 8.0,
+            reddit_weight: 9.0,
+            x_weight: 8.0,
+            from_phase: 1,
+            to_phase: 8,
+            tech_refresh_enabled: true,
+            tech_refresh_intervals: "1d,2h,30min".to_string(),
+            tech_refresh_save_bars: 120,
+            tech_refresh_script_path: None,
+            tech_refresh_timeout_sec: 900,
+            tech_refresh_python_bin: None,
+            jin10_refresh_enabled: true,
+            jin10_refresh_lookback_hours: 24.0,
+            jin10_refresh_script_path: None,
+            jin10_refresh_timeout_sec: 120,
+            mock: false,
+        };
+        let roles = vec!["analyst.youtube".to_string()];
+
+        let weights = phase1_analyst_weights(&config, &args, &roles, false);
+
+        assert_eq!(weights["analyst.youtube"].as_f64(), Some(0.0));
+    }
+
+    #[test]
+    fn llm_roles_inherit_global_defaults_and_builtin_role_values() {
         let roles = crate::orchestration::config::required_llm_roles()
             .iter()
             .map(|role| ((*role).to_string(), json!({})))
@@ -1900,7 +2315,7 @@ mod tests {
         let roles = crate::orchestration::config::llm_roles_from_config(&config).unwrap();
         let settings = &roles["analyst.technical"];
         assert_eq!(settings.model, "gpt-5.4");
-        assert_eq!(settings.max_turns, None);
+        assert_eq!(settings.max_turns, Some(3));
         assert_eq!(settings.reasoning_effort.as_deref(), Some("medium"));
         assert!(settings.native_web_search);
         assert!(settings.tools.contains(&"read_run_context".to_string()));
@@ -1983,7 +2398,7 @@ mod tests {
     }
 
     #[test]
-    fn web_search_defaults_to_disabled_mock_medium_limit() {
+    fn web_search_applies_builtin_role_defaults() {
         let config = json!({
             "orchestrator": {
                 "llm": {
@@ -2000,16 +2415,21 @@ mod tests {
             crate::orchestration::config::web_search_by_role_from_config(&config, roles.iter())
                 .unwrap();
 
-        for config in web_search.values() {
-            assert_eq!(
-                config,
-                &orchestrator_llm::web_search::WebSearchConfig::default()
-            );
-            assert_eq!(config.mode, WebSearchMode::Disabled);
-            assert_eq!(config.provider, WebSearchProviderKind::Mock);
-            assert_eq!(config.context_size, WebSearchContextSize::Medium);
-            assert_eq!(config.max_result_chars, 12_000);
-        }
+        let technical = &web_search["analyst.technical"];
+        assert_eq!(
+            technical,
+            &orchestrator_llm::web_search::WebSearchConfig::default()
+        );
+        assert_eq!(technical.mode, WebSearchMode::Disabled);
+        assert_eq!(technical.provider, WebSearchProviderKind::Mock);
+        assert_eq!(technical.context_size, WebSearchContextSize::Medium);
+        assert_eq!(technical.max_result_chars, 12_000);
+
+        let news_macro = &web_search["analyst.news_macro"];
+        assert_eq!(news_macro.mode, WebSearchMode::Live);
+        assert_eq!(news_macro.provider, WebSearchProviderKind::Mock);
+        assert_eq!(news_macro.context_size, WebSearchContextSize::Medium);
+        assert_eq!(news_macro.max_result_chars, 12_000);
     }
 
     #[test]
@@ -2050,10 +2470,7 @@ mod tests {
             WebSearchContextSize::High
         );
         assert_eq!(web_search["analyst.technical"].max_result_chars, 9000);
-        assert_eq!(
-            web_search["analyst.news_macro"].mode,
-            WebSearchMode::Disabled
-        );
+        assert_eq!(web_search["analyst.news_macro"].mode, WebSearchMode::Live);
         assert_eq!(
             web_search["analyst.news_macro"].provider,
             WebSearchProviderKind::Mock

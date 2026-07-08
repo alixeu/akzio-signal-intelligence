@@ -1,10 +1,17 @@
 use orchestrator_sql::{
-    append_agent_turn_item, connect, context_count, ensure_schema, handle_read_command,
-    import_jin10_payload, read_run_context, session_history_items, update_agent_turn_end,
-    update_agent_turn_item_content, upsert_agent_turn, write_agent_message_scoped,
-    write_role_turn_summary, write_run_record, write_source_item, AgentMessageInput,
-    AgentTurnInput, AgentTurnItemInput, RoleTurnSummaryInput, RunContextReadRequest,
-    RunRecordInput, RuntimeContext, SourceItemInput,
+    append_agent_turn_item,
+    candidate::{insert_candidate_experience, pending_candidates, CandidateExperienceInput},
+    connect, context_count, ensure_schema, handle_read_command, import_jin10_payload,
+    memory::{promote_candidate_to_memory, PromoteMemoryInput},
+    metrics::{insert_prompt_metric, PromptMetricInput},
+    outcome::{upsert_outcome, OutcomeInput},
+    prediction::{upsert_prediction, PredictionInput},
+    read_run_context, session_history_items,
+    system_metrics::{rewrite_system_metrics_from_prompt_metrics, SystemMetricsCopyInput},
+    update_agent_turn_end, update_agent_turn_item_content, upsert_agent_turn,
+    write_agent_message_scoped, write_role_turn_summary, write_run_record, write_source_item,
+    AgentMessageInput, AgentTurnInput, AgentTurnItemInput, RoleTurnSummaryInput,
+    RunContextReadRequest, RunRecordInput, RuntimeContext, SourceItemInput,
 };
 use serde_json::json;
 
@@ -23,6 +30,11 @@ const TABLES: &[&str] = &[
     "memory_versions",
     "memory_links",
     "memory_search_fts",
+    "predictions",
+    "run_archive",
+    "outcomes",
+    "candidate_experiences",
+    "system_metrics",
 ];
 
 const REMOVED_TABLES: &[&str] = &[
@@ -94,7 +106,77 @@ fn run_record_only_writes_runs_and_run_tickers() {
 }
 
 #[test]
-fn jin10_import_writes_only_jin10_items() {
+fn system_metrics_sync_updates_existing_prompt_metric_projection() {
+    let temp = tempfile::tempdir().unwrap();
+    let db_path = temp.path().join("orchestrator.sqlite");
+    let conn = connect(&db_path).unwrap();
+
+    insert_prompt_metric(
+        &conn,
+        &PromptMetricInput {
+            run_id: "run-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            session_id: "session-1".to_string(),
+            role: "analyst.technical".to_string(),
+            phase: Some(1),
+            kind: "role_job".to_string(),
+            round: None,
+            topic_id: None,
+            prompt_version: "v1".to_string(),
+            model: "mock-model".to_string(),
+            input_tokens: 10,
+            output_tokens: 20,
+            cached_tokens: 0,
+            total_tokens: 30,
+            turn_count: 1,
+            tool_call_count: 0,
+            latency_ms: 100,
+            validation_result: "ok".to_string(),
+            fallback_triggered: false,
+            error_message: String::new(),
+        },
+    )
+    .unwrap();
+
+    let mut input = SystemMetricsCopyInput {
+        run_id: "run-1".to_string(),
+        workflow_version: "v1".to_string(),
+        reflection_version: "r1".to_string(),
+        agent_count: 2,
+        prediction_date: "2026-06-19".to_string(),
+        ticker: "TQQQ".to_string(),
+        market_regime_json: json!({"regime": "trend"}),
+    };
+    assert_eq!(
+        rewrite_system_metrics_from_prompt_metrics(&conn, &input).unwrap(),
+        1
+    );
+
+    input.ticker = "QQQ".to_string();
+    input.workflow_version = "v2".to_string();
+    assert_eq!(
+        rewrite_system_metrics_from_prompt_metrics(&conn, &input).unwrap(),
+        1
+    );
+    assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM system_metrics"), 1);
+    assert_eq!(
+        text_scalar(
+            &conn,
+            "SELECT ticker FROM system_metrics WHERE run_id = 'run-1'"
+        ),
+        "QQQ"
+    );
+    assert_eq!(
+        text_scalar(
+            &conn,
+            "SELECT workflow_version FROM system_metrics WHERE run_id = 'run-1'"
+        ),
+        "v2"
+    );
+}
+
+#[test]
+fn jin10_import_writes_compatibility_and_unified_source_items() {
     let temp = tempfile::tempdir().unwrap();
     let db_path = temp.path().join("orchestrator.sqlite");
     let mut conn = connect(&db_path).unwrap();
@@ -112,6 +194,13 @@ fn jin10_import_writes_only_jin10_items() {
 
     assert_eq!(imported, 1);
     assert_eq!(context_count(&conn, "jin10").unwrap(), 1);
+    assert_eq!(
+        scalar(
+            &conn,
+            "SELECT COUNT(*) FROM external_source_items WHERE source = 'jin10'"
+        ),
+        1
+    );
     assert_eq!(table_exists(&conn, "jin10_flash_items"), 0);
 
     let context = read_run_context(
@@ -125,6 +214,7 @@ fn jin10_import_writes_only_jin10_items() {
             role: None,
             topic_id: None,
             turn_id: None,
+            persist_context: true,
             token_budget: None,
         },
     )
@@ -180,6 +270,7 @@ fn technical_context_reads_indicator_tables() {
             role: None,
             topic_id: None,
             turn_id: None,
+            persist_context: true,
             token_budget: None,
         },
     )
@@ -191,7 +282,7 @@ fn technical_context_reads_indicator_tables() {
 }
 
 #[test]
-fn source_items_write_only_dedicated_source_tables() {
+fn source_items_write_dedicated_and_unified_tables() {
     let temp = tempfile::tempdir().unwrap();
     let db_path = temp.path().join("orchestrator.sqlite");
     let mut conn = connect(&db_path).unwrap();
@@ -246,6 +337,39 @@ fn source_items_write_only_dedicated_source_tables() {
     );
 
     assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM youtube_videos"), 1);
+    assert_eq!(
+        scalar(&conn, "SELECT COUNT(*) FROM external_source_items"),
+        3
+    );
+    assert_eq!(
+        write_source_item(
+            &mut conn,
+            &SourceItemInput {
+                source: "youtube".to_string(),
+                item_key: "vid-1".to_string(),
+                ticker: "TQQQ".to_string(),
+                item_time: "2026-06-19T03:00:00Z".to_string(),
+                content: "Updated video title".to_string(),
+                item_json: json!({
+                    "video_id": "vid-1",
+                    "title": "Updated video title",
+                }),
+            },
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        scalar(&conn, "SELECT COUNT(*) FROM external_source_items"),
+        3
+    );
+    assert_eq!(
+        text_scalar(
+            &conn,
+            "SELECT content FROM external_source_items WHERE source = 'youtube' AND source_key = 'vid-1'"
+        ),
+        "Updated video title"
+    );
     assert_eq!(
         scalar(
             &conn,
@@ -507,6 +631,7 @@ fn compose_context_scores_trims_and_audits_blocks() {
             role: Some("manager.research".to_string()),
             topic_id: Some("topic-1".to_string()),
             turn_id: Some("turn-compose".to_string()),
+            persist_context: true,
             token_budget: Some(4096),
         },
     )
@@ -547,11 +672,195 @@ fn compose_context_scores_trims_and_audits_blocks() {
             role: Some("manager.research".to_string()),
             topic_id: Some("topic-1".to_string()),
             turn_id: Some("turn-compose-small".to_string()),
+            persist_context: false,
             token_budget: Some(5),
         },
     )
     .unwrap();
     assert!(trimmed["blocks"].as_array().unwrap().len() < blocks.len());
+    assert_eq!(
+        scalar(
+            &conn,
+            "SELECT COUNT(*) FROM turn_context_items WHERE turn_id = 'turn-compose-small'"
+        ),
+        0
+    );
+}
+
+#[test]
+fn read_run_context_exposes_reflection_memory_contexts() {
+    let temp = tempfile::tempdir().unwrap();
+    let db_path = temp.path().join("orchestrator.sqlite");
+    let mut conn = connect(&db_path).unwrap();
+    seed_reflection_context(&conn);
+
+    let prior_memory = read_run_context(
+        &mut conn,
+        &context_request("prior_memory", Some("TQQQ"), Some(256)),
+    )
+    .unwrap();
+    assert_eq!(prior_memory["query"], "prior_memory");
+    assert_eq!(prior_memory["items"].as_array().unwrap().len(), 1);
+    assert_eq!(prior_memory["items"][0]["ticker"], "TQQQ");
+    assert!(prior_memory["items"][0].get("body").is_some());
+
+    let track_record = read_run_context(
+        &mut conn,
+        &context_request("track_record", Some("TQQQ"), None),
+    )
+    .unwrap();
+    assert_eq!(track_record["query"], "track_record");
+    assert_eq!(track_record["aggregate"]["total_predictions"], 1);
+    assert_eq!(track_record["ticker_record"]["total_predictions"], 1);
+
+    let agent_accuracy = read_run_context(
+        &mut conn,
+        &context_request("agent_accuracy", Some("TQQQ"), None),
+    )
+    .unwrap();
+    assert_eq!(agent_accuracy["query"], "agent_accuracy");
+    assert_eq!(
+        agent_accuracy["roles"]["analyst.technical"]["total_predictions"],
+        1
+    );
+
+    let composed = read_run_context(
+        &mut conn,
+        &RunContextReadRequest {
+            kind: "compose_context".to_string(),
+            run_id: Some("run-1".to_string()),
+            ticker: Some("TQQQ".to_string()),
+            tickers: vec!["TQQQ".to_string()],
+            phase: Some(1),
+            role: Some("manager.research".to_string()),
+            topic_id: None,
+            turn_id: None,
+            persist_context: true,
+            token_budget: Some(256),
+        },
+    )
+    .unwrap();
+    assert!(composed["blocks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|block| block["context_type"] == "prior_memory"));
+
+    let err =
+        read_run_context(&mut conn, &context_request("not_supported", None, None)).unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("unsupported read_run_context kind"));
+}
+
+#[test]
+fn ensure_schema_adds_reflection_memory_columns() {
+    let temp = tempfile::tempdir().unwrap();
+    let db_path = temp.path().join("orchestrator.sqlite");
+    let conn = connect(&db_path).unwrap();
+
+    for column in [
+        "market_regime_json",
+        "quality_score",
+        "sample_count",
+        "recent_success_rate",
+        "reflection_version",
+        "promoted_from",
+    ] {
+        assert!(
+            column_exists(&conn, "memory_items", column),
+            "missing {column}"
+        );
+    }
+}
+
+fn context_request(
+    kind: &str,
+    ticker: Option<&str>,
+    token_budget: Option<usize>,
+) -> RunContextReadRequest {
+    RunContextReadRequest {
+        kind: kind.to_string(),
+        run_id: Some("run-1".to_string()),
+        ticker: ticker.map(ToString::to_string),
+        tickers: ticker.into_iter().map(ToString::to_string).collect(),
+        phase: Some(1),
+        role: Some("manager.research".to_string()),
+        topic_id: None,
+        turn_id: None,
+        persist_context: true,
+        token_budget,
+    }
+}
+
+fn seed_reflection_context(conn: &rusqlite::Connection) {
+    insert_candidate_experience(
+        conn,
+        &CandidateExperienceInput {
+            scope: "ticker".to_string(),
+            scope_value: "TQQQ".to_string(),
+            experience_type: "calibration".to_string(),
+            market_regime_json: json!({}),
+            finding: "long setup works after breadth confirmation".to_string(),
+            recommendation: "calibrate long probability upward only with breadth".to_string(),
+            evidence_json: json!([]),
+            counter_evidence_json: json!([]),
+            metrics_json: json!({"direction_accuracy": 1.0}),
+            sample_count: 8,
+            sample_run_ids_json: json!(["run-1"]),
+            confidence: 0.9,
+            effect_size: 0.2,
+            distiller_version: "v1".to_string(),
+            reflection_version: "v1".to_string(),
+            source_window: "2026-W01".to_string(),
+        },
+    )
+    .unwrap();
+    let candidate = pending_candidates(conn).unwrap().pop().unwrap();
+    promote_candidate_to_memory(
+        conn,
+        &PromoteMemoryInput {
+            candidate,
+            quality_score: 0.8,
+            recent_success_rate: 1.0,
+        },
+    )
+    .unwrap();
+
+    let prediction_id = upsert_prediction(
+        conn,
+        &PredictionInput {
+            run_id: "run-1".to_string(),
+            ticker: "TQQQ".to_string(),
+            prediction_date: "2026-01-01".to_string(),
+            long_probability: 0.7,
+            short_probability: 0.3,
+            rating: "long".to_string(),
+            window_days: 5,
+            market_regime_json: json!({}),
+            agent_probabilities_json: json!({"analyst.technical": {"long_probability": 0.7}}),
+            weighted_base_probability: None,
+        },
+    )
+    .unwrap();
+    upsert_outcome(
+        conn,
+        &OutcomeInput {
+            prediction_id,
+            run_id: "run-1".to_string(),
+            ticker: "TQQQ".to_string(),
+            prediction_date: "2026-01-01".to_string(),
+            outcome_date: "2026-01-06".to_string(),
+            window_days: 5,
+            baseline_close: 100.0,
+            outcome_close: 110.0,
+            actual_return: 0.1,
+            direction_correct: true,
+            probability_error: -0.3,
+            market_regime_json: json!({}),
+        },
+    )
+    .unwrap();
 }
 
 fn table_exists(conn: &rusqlite::Connection, table: &str) -> i64 {
@@ -565,4 +874,20 @@ fn table_exists(conn: &rusqlite::Connection, table: &str) -> i64 {
 
 fn scalar(conn: &rusqlite::Connection, sql: &str) -> i64 {
     conn.query_row(sql, [], |row| row.get(0)).unwrap()
+}
+
+fn text_scalar(conn: &rusqlite::Connection, sql: &str) -> String {
+    conn.query_row(sql, [], |row| row.get(0)).unwrap()
+}
+
+fn column_exists(conn: &rusqlite::Connection, table: &str, column: &str) -> bool {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .unwrap();
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    columns.iter().any(|item| item == column)
 }

@@ -13,3 +13,6 @@ html-escape = { workspace = true }
 pulldown-cmark = "0.12"
 serde_json = { workspace = true }
 orchestrator-core = { path = "../orchestrator-core" }
+
+[dev-dependencies]
+tempfile = { workspace = true }

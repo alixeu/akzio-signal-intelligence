@@ -155,6 +155,25 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
         );
         CREATE VIRTUAL TABLE IF NOT EXISTS memory_search_fts
             USING fts5(memory_id UNINDEXED, version_id UNINDEXED, ticker UNINDEXED, memory_type UNINDEXED, summary, search_text);
+        CREATE TABLE IF NOT EXISTS external_source_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source TEXT NOT NULL,
+            source_key TEXT NOT NULL,
+            ticker TEXT NOT NULL DEFAULT '',
+            item_time TEXT NOT NULL DEFAULT '',
+            title TEXT NOT NULL DEFAULT '',
+            content TEXT NOT NULL DEFAULT '',
+            item_json TEXT NOT NULL DEFAULT '{}',
+            content_hash TEXT NOT NULL DEFAULT '',
+            imported_at TEXT NOT NULL,
+            UNIQUE(source, source_key, ticker)
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_external_source_items_key
+            ON external_source_items(source, source_key, ticker);
+        CREATE INDEX IF NOT EXISTS idx_external_source_items_lookup
+            ON external_source_items(source, ticker, item_time);
+        CREATE INDEX IF NOT EXISTS idx_external_source_items_hash
+            ON external_source_items(content_hash);
         CREATE TABLE IF NOT EXISTS jin10_items (
             event_key TEXT PRIMARY KEY,
             item_time TEXT NOT NULL,
@@ -253,6 +272,115 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
             ON prompt_metrics(run_id, role);
         CREATE INDEX IF NOT EXISTS idx_prompt_metrics_role_date
             ON prompt_metrics(role, created_at);
+        CREATE TABLE IF NOT EXISTS predictions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT NOT NULL,
+            ticker TEXT NOT NULL,
+            prediction_date TEXT NOT NULL,
+            long_probability REAL NOT NULL,
+            short_probability REAL NOT NULL,
+            rating TEXT NOT NULL DEFAULT '',
+            window_days INTEGER NOT NULL DEFAULT 5,
+            market_regime_json TEXT NOT NULL DEFAULT '{}',
+            agent_probabilities_json TEXT NOT NULL DEFAULT '{}',
+            weighted_base_probability REAL,
+            created_at TEXT NOT NULL,
+            UNIQUE(run_id, ticker)
+        );
+        CREATE INDEX IF NOT EXISTS idx_predictions_ticker_date
+            ON predictions(ticker, prediction_date);
+        CREATE TABLE IF NOT EXISTS run_archive (
+            run_id TEXT PRIMARY KEY,
+            ticker TEXT NOT NULL,
+            tickers_json TEXT NOT NULL DEFAULT '[]',
+            prediction_date TEXT NOT NULL,
+            workflow_version TEXT NOT NULL DEFAULT 'v1',
+            prompt_versions_json TEXT NOT NULL DEFAULT '{}',
+            git_sha TEXT NOT NULL DEFAULT '',
+            config_hash TEXT NOT NULL DEFAULT '',
+            market_regime_json TEXT NOT NULL DEFAULT '{}',
+            artifact_path TEXT NOT NULL DEFAULT '',
+            state_summary_json TEXT NOT NULL DEFAULT '{}',
+            research_plan_json TEXT NOT NULL DEFAULT '{}',
+            degraded INTEGER NOT NULL DEFAULT 0,
+            phase_count INTEGER NOT NULL DEFAULT 0,
+            total_elapsed_ms INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_run_archive_ticker_date
+            ON run_archive(ticker, prediction_date);
+        CREATE TABLE IF NOT EXISTS outcomes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            prediction_id INTEGER NOT NULL REFERENCES predictions(id),
+            run_id TEXT NOT NULL,
+            ticker TEXT NOT NULL,
+            prediction_date TEXT NOT NULL,
+            outcome_date TEXT NOT NULL,
+            window_days INTEGER NOT NULL,
+            baseline_close REAL NOT NULL,
+            outcome_close REAL NOT NULL,
+            actual_return REAL NOT NULL,
+            direction_correct INTEGER NOT NULL,
+            probability_error REAL NOT NULL,
+            market_regime_json TEXT NOT NULL DEFAULT '{}',
+            scored_at TEXT NOT NULL,
+            UNIQUE(prediction_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_outcomes_ticker_date
+            ON outcomes(ticker, prediction_date);
+        CREATE TABLE IF NOT EXISTS candidate_experiences (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scope TEXT NOT NULL,
+            scope_value TEXT NOT NULL,
+            experience_type TEXT NOT NULL,
+            market_regime_json TEXT NOT NULL DEFAULT '{}',
+            finding TEXT NOT NULL,
+            recommendation TEXT NOT NULL,
+            evidence_json TEXT NOT NULL DEFAULT '[]',
+            counter_evidence_json TEXT NOT NULL DEFAULT '[]',
+            metrics_json TEXT NOT NULL DEFAULT '{}',
+            sample_count INTEGER NOT NULL,
+            sample_run_ids_json TEXT NOT NULL DEFAULT '[]',
+            confidence REAL NOT NULL,
+            effect_size REAL NOT NULL DEFAULT 0.0,
+            distiller_version TEXT NOT NULL DEFAULT 'v1',
+            reflection_version TEXT NOT NULL DEFAULT 'v1',
+            source_window TEXT NOT NULL DEFAULT '',
+            review_status TEXT NOT NULL DEFAULT 'pending',
+            reviewed_at TEXT,
+            review_reason TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_candidate_exp_status
+            ON candidate_experiences(review_status, scope, experience_type);
+        CREATE TABLE IF NOT EXISTS system_metrics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            phase INTEGER,
+            model TEXT NOT NULL DEFAULT '',
+            prompt_version TEXT NOT NULL DEFAULT '',
+            prompt_tokens INTEGER NOT NULL DEFAULT 0,
+            completion_tokens INTEGER NOT NULL DEFAULT 0,
+            total_tokens INTEGER NOT NULL DEFAULT 0,
+            latency_ms INTEGER NOT NULL DEFAULT 0,
+            cost_usd REAL NOT NULL DEFAULT 0.0,
+            workflow_version TEXT NOT NULL DEFAULT '',
+            reflection_version TEXT NOT NULL DEFAULT '',
+            agent_count INTEGER NOT NULL DEFAULT 0,
+            prediction_date TEXT NOT NULL DEFAULT '',
+            ticker TEXT NOT NULL DEFAULT '',
+            market_regime_json TEXT NOT NULL DEFAULT '{}',
+            prompt_metric_id INTEGER,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_system_metrics_run
+            ON system_metrics(run_id, role);
+        CREATE INDEX IF NOT EXISTS idx_system_metrics_model
+            ON system_metrics(model, prediction_date);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_system_metrics_prompt_metric
+            ON system_metrics(prompt_metric_id)
+            WHERE prompt_metric_id IS NOT NULL;
         "#,
     )?;
 
@@ -262,6 +390,19 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
     ] {
         add_column_if_missing(conn, "runs", column_sql)?;
     }
+
+    for column_sql in [
+        "market_regime_json TEXT NOT NULL DEFAULT '{}'",
+        "quality_score REAL NOT NULL DEFAULT 0.0",
+        "sample_count INTEGER NOT NULL DEFAULT 0",
+        "recent_success_rate REAL NOT NULL DEFAULT 0.0",
+        "reflection_version TEXT NOT NULL DEFAULT 'v1'",
+        "promoted_from INTEGER",
+    ] {
+        add_column_if_missing(conn, "memory_items", column_sql)?;
+    }
+
+    add_column_if_missing(conn, "system_metrics", "prompt_metric_id INTEGER")?;
 
     Ok(())
 }

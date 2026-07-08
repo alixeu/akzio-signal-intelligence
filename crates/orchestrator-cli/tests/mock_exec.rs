@@ -107,7 +107,7 @@ async fn mock_exec_phase7_writes_portfolio_allocation() {
     let db_path = temp.path().join("phase7.sqlite");
     let mut args = test_args(
         "QQQ,SOXX,VIX",
-        Some(db_path),
+        Some(db_path.clone()),
         Some(run_dir.clone()),
         Some(config_path),
         true,
@@ -150,9 +150,51 @@ async fn mock_exec_phase7_writes_portfolio_allocation() {
     assert_contracts_ok(&state);
     assert_role_metrics_ok(&state);
     assert_phase_metrics_ok(&state, 7);
+    assert!(state["phase_status"].get("8").is_none());
+    let conn = Connection::open(db_path).unwrap();
+    let phase8_rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM run_archive", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(phase8_rows, 0);
     assert!(fs::read_to_string(run_dir.join("final_summary.md"))
         .unwrap()
         .contains("Portfolio Allocation"));
+}
+
+#[tokio::test]
+async fn mock_exec_phase8_writes_archive_predictions_and_system_metrics() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = write_test_config(temp.path());
+    let run_dir = temp.path().join("phase8-run");
+    let db_path = temp.path().join("phase8.sqlite");
+    let mut args = test_args(
+        "QQQ,SOXX,VIX",
+        Some(db_path.clone()),
+        Some(run_dir.clone()),
+        Some(config_path),
+        true,
+    );
+    args.to_phase = 8;
+
+    exec::run(args).await.unwrap();
+
+    let state: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(run_dir.join("state.json")).unwrap()).unwrap();
+    assert_eq!(state["phase_status"]["8"], "done");
+
+    let conn = Connection::open(db_path).unwrap();
+    let archive_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM run_archive", [], |row| row.get(0))
+        .unwrap();
+    let prediction_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM predictions", [], |row| row.get(0))
+        .unwrap();
+    let system_metric_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM system_metrics", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(archive_count, 1);
+    assert!(prediction_count >= 1);
+    assert!(system_metric_count >= 1);
 }
 
 #[tokio::test]
@@ -322,16 +364,6 @@ async fn live_exec_requires_unknown_sqlite_context_when_strict() {
         config_text.replace("- technical", "- technical\n      - required-custom-source"),
     )
     .unwrap();
-    let mut config: serde_json::Value =
-        serde_yaml::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
-    for role in config["orchestrator"]["llm"]["roles"]
-        .as_object_mut()
-        .unwrap()
-        .values_mut()
-    {
-        role["api_key"] = serde_json::Value::String("configured-key".to_string());
-    }
-    fs::write(&config_path, serde_yaml::to_string(&config).unwrap()).unwrap();
     let run_dir = temp.path().join("strict-run");
     let db_path = temp.path().join("strict.sqlite");
 
@@ -388,17 +420,13 @@ async fn openai_compatible_provider_can_use_configured_api_key() {
 }
 
 #[tokio::test]
-async fn explicit_llm_roles_must_include_all_required_roles() {
+async fn explicit_partial_llm_roles_merge_with_builtin_defaults() {
     let temp = tempfile::tempdir().unwrap();
     let config_path = write_test_config(temp.path());
     let mut config: serde_json::Value =
         serde_yaml::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
     config["orchestrator"]["llm"]["roles"] = serde_json::json!({
         "analyst.technical": {
-            "route": "responses",
-            "model": "gpt-5.4",
-            "base_url": "https://llm.example.com/v1",
-            "api_key": "test-key",
             "max_turns": 4,
             "think_tool": false,
             "tools": []
@@ -406,44 +434,60 @@ async fn explicit_llm_roles_must_include_all_required_roles() {
     });
     fs::write(&config_path, serde_yaml::to_string(&config).unwrap()).unwrap();
 
-    let err = exec::run(test_args(
+    let output = exec::run(test_args(
         "QQQ",
-        Some(temp.path().join("missing-roles.sqlite")),
-        Some(temp.path().join("missing-roles-run")),
+        Some(temp.path().join("partial-roles.sqlite")),
+        Some(temp.path().join("partial-roles-run")),
         Some(config_path),
         true,
     ))
     .await
-    .unwrap_err();
+    .unwrap();
 
-    assert!(err.to_string().contains("missing LLM config"));
+    assert_eq!(
+        output["phase1_agents"],
+        serde_json::json!([
+            "analyst.technical",
+            "analyst.news_macro",
+            "analyst.youtube",
+            "analyst.reddit",
+            "analyst.x"
+        ])
+    );
 }
 
 #[tokio::test]
-async fn llm_roles_map_is_required() {
+async fn llm_roles_map_defaults_when_omitted() {
     let temp = tempfile::tempdir().unwrap();
     let config_path = write_test_config(temp.path());
     let mut config: serde_json::Value =
         serde_yaml::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
-    config["orchestrator"]
+    config["orchestrator"]["llm"]
         .as_object_mut()
         .unwrap()
-        .remove("llm");
+        .remove("roles");
     fs::write(&config_path, serde_yaml::to_string(&config).unwrap()).unwrap();
 
-    let err = exec::run(test_args(
+    let output = exec::run(test_args(
         "QQQ",
-        Some(temp.path().join("missing-roles-map.sqlite")),
-        Some(temp.path().join("missing-roles-map-run")),
+        Some(temp.path().join("default-roles.sqlite")),
+        Some(temp.path().join("default-roles-run")),
         Some(config_path),
         true,
     ))
     .await
-    .unwrap_err();
+    .unwrap();
 
-    assert!(err
-        .to_string()
-        .contains("orchestrator.llm.roles is required"));
+    assert_eq!(
+        output["phase1_agents"],
+        serde_json::json!([
+            "analyst.technical",
+            "analyst.news_macro",
+            "analyst.youtube",
+            "analyst.reddit",
+            "analyst.x"
+        ])
+    );
 }
 
 #[tokio::test]
@@ -771,7 +815,15 @@ orchestrator:
         prompt_dir.join("allocation.md").display(),
     );
     let mut config: serde_json::Value = serde_yaml::from_str(&config_text).unwrap();
-    config["orchestrator"]["llm"]["roles"] = complete_llm_roles_config();
+    config["orchestrator"]["llm"]["defaults"] = serde_json::json!({
+        "route": "responses",
+        "model": "gpt-5.4",
+        "base_url": "https://llm.example.com/v1",
+        "api_key": "test-key",
+        "reasoning_effort": "low",
+        "think_tool": false,
+        "tools": []
+    });
     fs::write(&config_path, serde_yaml::to_string(&config).unwrap()).unwrap();
     config_path
 }

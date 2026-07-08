@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use chrono::{Duration, Local, NaiveDateTime, Timelike};
 use clap::Args;
 use orchestrator_core::{config_float, config_int, config_str};
@@ -35,6 +35,7 @@ pub struct Jin10Args {
 
 pub async fn run(args: Jin10Args) -> Result<Value> {
     let args = ResolvedJin10Args::from_args(args);
+    validate_api_url(&args.api_url)?;
     let classify = parse_classify(&args.classify)?;
     let end_time = Local::now().naive_local().with_nanosecond(0).unwrap();
     let earliest_time =
@@ -180,6 +181,13 @@ impl ResolvedJin10Args {
     }
 }
 
+fn validate_api_url(value: &str) -> Result<()> {
+    if value.trim().is_empty() {
+        bail!("missing JIN10 API URL; set JIN10_API_URL or jin10.api_url in config/config.yaml");
+    }
+    Ok(())
+}
+
 fn parse_classify(value: &str) -> Result<Vec<i64>> {
     let items = value
         .split(',')
@@ -242,4 +250,18 @@ fn next_cursor(items: &[Value]) -> Option<String> {
                 .format(TIME_FORMAT)
                 .to_string()
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_api_url_rejects_empty_config_value() {
+        let err = validate_api_url("   ").unwrap_err().to_string();
+
+        assert!(err.contains("missing JIN10 API URL"));
+        assert!(err.contains("JIN10_API_URL"));
+        assert!(err.contains("jin10.api_url"));
+    }
 }

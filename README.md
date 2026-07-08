@@ -6,7 +6,7 @@ Rust workspace for running AI-assisted market-signal research workflows. The pro
 
 - Multi-crate Rust workspace with shared core, SQL, LLM, and CLI crates.
 - Prompt packs for analysts, researchers, mediators, managers, and risk profiles.
-- CLI binaries for orchestrator runs, SQL context tools, transcript fetching, Jin10 flash data, Twelve Data technical indicators, and report email delivery.
+- CLI binaries for orchestrator runs, SQL context tools, transcript fetching, Jin10 flash data, Yahoo Finance technical indicators, reflection scoring/distillation/promotion, and report email delivery.
 - Explicit mock execution paths for local development without live provider API keys.
 
 ## Workspace Layout
@@ -82,13 +82,18 @@ probability is at least `report.email.probability_threshold`.
 | `fetch-last30days-context` | Fetch Reddit, X, or YouTube social context. |
 | `fetch-youtube-transcript` | Fetch YouTube transcript data. |
 | `fetch-wayinvideo-transcript` | Fetch transcript data through WayinVideo. |
-| `run-technical-indicators` | Fetch Twelve Data bars and compute local technical indicators. |
+| `run-technical-indicators` | Fetch Yahoo Finance bars and compute local technical indicators. |
+| `reflection-score` | Score expired prediction snapshots against stored `Close` prices and write outcomes. |
+| `weekly-distill` | Aggregate scored outcomes into candidate long-term experiences. |
+| `memory-promote` | Gate candidate experiences, promote approved ones into active memory, and degrade stale low-quality memories. |
 
 ## Configuration
 
-Runtime configuration is loaded from `config/config.yaml`. This file is the default source for role-level LLM settings, prompt paths, output paths, analyst weights, SQLite requirements, and data-ingestion defaults. CLI flags still override config values when provided.
+Runtime configuration is loaded from `config/config.yaml`. This file is the default source for role-level LLM settings, prompt paths, output paths, analyst weights, SQLite requirements, and data-ingestion defaults. Before expanding `${VAR}` placeholders, the loader reads `.env` from the config directory or project root when present, so local live-run secrets can live in an untracked `.env`. CLI flags still override config values when provided.
 
 Live orchestrator runs use a strict SQLite data-source policy by default. Network, CSV, and file-based collectors should run before the orchestrator and import their outputs into SQLite. The orchestrator then reads context from SQLite only.
+
+External source imports now land in the unified `external_source_items` table as well as their compatibility tables, so new source readers can use one canonical lookup path without breaking existing Jin10, YouTube, or social queries. Composed context snapshots still persist by default for traceability; callers can pass `persist_context=false` to `read_run_context` when they only need the composed response and do not want per-turn `turn_context_items` rows.
 
 `orchestrator.db_path` is the shared runtime SQLite database, defaulting to `outputs/orchestrator.sqlite`. Direct `orchestrator-exec`, the Rust daily flow, and technical imports use this same database unless a CLI `--db-path` is provided.
 
@@ -100,6 +105,14 @@ lists the assets that may receive weight, `regime_signal` is usually `VIX`,
 technical volatility proxy (default `STD20`). Technical imports store a `Close`
 indicator so Phase 7 can read VIX levels and compute cross-asset correlations
 from SQLite.
+
+`orchestrator.reflection` controls the long-term memory layer. `enabled` gates
+Phase 0 retrieval injection and Phase 8 archive/prediction capture,
+`reflection_version` labels generated snapshots and promoted memories,
+`promote_mode` controls whether promotion is automatic or review-oriented, and
+`retrieval.token_budget` / `retrieval.max_items` / `retrieval.min_quality` bound
+how many active memories can be injected before Phase 1 or returned through
+`read_run_context(kind="prior_memory")`.
 
 ### Workflow Stages And Reducers
 
@@ -116,7 +129,15 @@ The orchestrator is moving toward a `Workflow -> Stage/Sub-workflow -> Agent wor
 
 Roles not listed under `critical_roles` are treated as noncritical. A noncritical role failure should degrade the relevant state artifact with an explicit evidence gap instead of blocking the whole workflow. Critical role failure should block the affected stage unless the runtime explicitly overrides that policy.
 
-Reducer state artifacts are built deterministically in Rust. Phase 1.5 writes the evidence state artifact from existing analyst artifacts. Phase 2 first runs `mediator.topic` to generate topic candidates from that Phase 1.5 artifact. Each topic then runs sequential bull/bear micro-turns with a per-topic `mediator.topic_controller` Phase 2.5a artifact after every micro-turn. Phase 2.5b writes the final debate state brief from topic controller artifacts.
+Reducer state artifacts are built deterministically in Rust. Phase 0 runs before
+Phase 1 when reflection is enabled: it retrieves active prior memories with
+quality/regime/budget filtering and injects `prior_memory`, `track_record`, and
+`agent_accuracy` into run state. Phase 1.5 writes the evidence state artifact
+from existing analyst artifacts. Phase 2 first runs `mediator.topic` to generate
+topic candidates from that Phase 1.5 artifact. Each topic then runs sequential
+bull/bear micro-turns with a per-topic `mediator.topic_controller` Phase 2.5a
+artifact after every micro-turn. Phase 2.5b writes the final debate state brief
+from topic controller artifacts.
 
 Phase 4 runs `trader` to convert `research_plan` into `trader_investment_plan`.
 Phase 5 runs a fixed risk debate rotation: `risk.aggressive` →
@@ -128,7 +149,9 @@ volatility, and rolling correlation from stored `Close` rows. The
 `allocation.manager` role decides QQQ/SOXX/`cash_hedge` weights; Rust filters
 invalid assets, caps single positions, normalizes weights to 100%, and falls
 back to inverse-vol allocation if the LLM output is unusable. VIX is a regime
-signal only, never an allocated asset.
+signal only, never an allocated asset. Phase 8 archives the completed run,
+writes per-ticker prediction snapshots, and copies prompt/system metrics into
+reflection tables for later scoring and distillation.
 
 Phase 3 is the only market-decision phase. Downstream optional phases may add
 execution constraints, skipped/derived artifacts, and allocation inputs, but must
@@ -180,7 +203,7 @@ Defaults and each role support:
 | `api_key` | Direct local API key value for the configured provider. |
 | `preamble` | Optional Rig agent preamble for role-level steering. It is omitted by default and should not be used as the structured-output enforcement mechanism. |
 | `max_turns` | Optional agent-loop turn cap. Set `null` or omit it for no role-level max-turn cap; set a positive number on a role to override. |
-| `reasoning_effort` | Optional Responses reasoning effort, injected as `additional_params.reasoning.effort` when set to a value other than `none`. |
+| `reasoning_effort` | Optional Responses reasoning effort, injected as `additional_params.reasoning.effort` when set to a value other than `none`/`0`. |
 | `reasoning_summary` | Optional Responses reasoning summary level: `auto`, `concise`, or `detailed`. |
 | `preserve_reasoning_state` | When `true`, requests include `reasoning.encrypted_content`, set `store: false`, persist encrypted reasoning state, and replay it on the next model iteration. |
 | `transport` | Use `http` by default. Use `ws` for Responses WebSocket mode. |
@@ -199,7 +222,7 @@ Responses routing behavior:
 
 `--model` overrides only the role model names. `--reasoning-effort` overrides only role Responses reasoning effort. `--mock` bypasses live LLM calls; live daily runs no longer silently downgrade to mock output when provider keys are missing.
 
-Prompts now receive only run-boundary values such as ticker, date, role, phase, round, and topic id. Agents read current-run data through the structured `read_run_context` tool instead of having analyst reports, debate history, or large context packets injected into the prompt.
+Prompts now receive only run-boundary values such as ticker, date, role, phase, round, and topic id. Agents read current-run data through the structured `read_run_context` tool instead of having analyst reports, debate history, or large context packets injected into the prompt. Supported long-term memory context kinds include `prior_memory`, `track_record`, and `agent_accuracy`; `compose_context` can include prior-memory blocks while respecting its token budget.
 
 Unified `/v1/responses` gateway example:
 
@@ -302,6 +325,14 @@ Useful import commands:
 cargo run -p orchestrator-cli --bin run-technical-indicators -- --symbols QQQ,VIX,SOXX --days 60 --intervals 1d,3h,20min
 cargo run -p orchestrator-cli --bin fetch-jin10-flash
 cargo run -p orchestrator-cli --bin fetch-last30days-context -- --source youtube --ticker QQQ
+```
+
+Useful reflection commands:
+
+```bash
+cargo run -p orchestrator-cli --bin reflection-score -- --as-of 2026-07-07
+cargo run -p orchestrator-cli --bin weekly-distill -- --since 2026-06-30 --until 2026-07-07
+cargo run -p orchestrator-cli --bin memory-promote -- --mode auto
 ```
 
 With `strict_sqlite: true`, live `orchestrator-exec` fails when required SQLite contexts are empty. `--mock` runs skip this check for local development.

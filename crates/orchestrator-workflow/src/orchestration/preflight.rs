@@ -108,7 +108,6 @@ pub(crate) async fn run_technical_preflight(state: &mut Value) -> Result<()> {
         intervals: String::new(),
         db_path,
         model: None,
-        api_key: None,
         timeout: None,
         sleep: None,
     })

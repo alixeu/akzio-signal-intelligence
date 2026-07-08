@@ -1,6 +1,7 @@
 use anyhow::{bail, Context, Result};
 use orchestrator_core::{
     config_bool, config_get, config_int, config_str, config_strings, project_path, AgentRegistry,
+    RetrievalBudget,
 };
 use orchestrator_llm::{
     llm_judge::JudgeConfig,
@@ -35,6 +36,7 @@ pub(crate) struct RuntimeConfig {
     pub prompts: PromptConfig,
     pub workflow: WorkflowConfig,
     pub allocation: AllocationConfig,
+    pub reflection: ReflectionConfig,
     pub plugins: PluginConfig,
     pub component_plugins: ComponentRegistry,
     pub role_plugins: RolePluginRegistry,
@@ -59,6 +61,14 @@ pub(crate) struct AllocationConfig {
     pub correlation_window_days: usize,
     pub max_single_position: f64,
     pub vol_indicator: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ReflectionConfig {
+    pub enabled: bool,
+    pub reflection_version: String,
+    pub _promote_mode: String,
+    pub retrieval: RetrievalBudget,
 }
 
 #[derive(Debug, Clone)]
@@ -314,6 +324,7 @@ impl RuntimeConfig {
             prompts: prompts_config,
             workflow,
             allocation: AllocationConfig::from_value(config),
+            reflection: ReflectionConfig::from_value(config),
             plugins: plugin_config,
             component_plugins,
             role_plugins,
@@ -388,22 +399,18 @@ fn merge_plugin_llm_role_defaults(
 }
 
 pub(crate) fn llm_roles_from_config(config: &Value) -> Result<BTreeMap<String, RoleLlmSettings>> {
-    let value = config_get(config, "orchestrator.llm.roles")
-        .context("orchestrator.llm.roles is required")?;
-    let object = value
-        .as_object()
-        .context("orchestrator.llm.roles must be a map")?;
     let defaults = config_get(config, "orchestrator.llm.defaults");
+    let role_values = effective_llm_role_values(config)?;
     let mut roles = BTreeMap::new();
-    for (role, role_value) in object {
+    for (role, role_value) in role_values {
         let mut effective = defaults
             .cloned()
             .unwrap_or_else(|| Value::String(String::new()));
-        orchestrator_core::deep_merge(&mut effective, role_value.clone());
-        normalize_llm_role_tools(&mut effective, role)?;
+        orchestrator_core::deep_merge(&mut effective, role_value);
+        normalize_llm_role_tools(&mut effective, &role)?;
         let settings: RoleLlmSettings = serde_json::from_value(effective)
             .with_context(|| format!("invalid LLM config for role {role:?}"))?;
-        roles.insert(role.clone(), settings);
+        roles.insert(role, settings);
     }
     for role in required_llm_roles() {
         let settings = roles
@@ -412,6 +419,166 @@ pub(crate) fn llm_roles_from_config(config: &Value) -> Result<BTreeMap<String, R
         settings.validate(&role)?;
     }
     Ok(roles)
+}
+
+fn effective_llm_role_values(config: &Value) -> Result<BTreeMap<String, Value>> {
+    let configured_roles = config_get(config, "orchestrator.llm.roles")
+        .map(|value| {
+            value
+                .as_object()
+                .context("orchestrator.llm.roles must be a map")
+        })
+        .transpose()?;
+    let mut role_values = builtin_llm_role_values();
+    if let Some(object) = configured_roles {
+        for (role, role_value) in object {
+            role_values
+                .entry(role.clone())
+                .and_modify(|effective| {
+                    orchestrator_core::deep_merge(effective, role_value.clone())
+                })
+                .or_insert_with(|| role_value.clone());
+        }
+    }
+    Ok(role_values)
+}
+
+fn builtin_llm_role_values() -> BTreeMap<String, Value> {
+    let mut roles = BTreeMap::new();
+    for (role, max_turns, reasoning_effort, tools, web_search_live) in [
+        (
+            "analyst.technical",
+            3,
+            None,
+            vec!["read_run_context", "run_technical_indicators"],
+            false,
+        ),
+        (
+            "analyst.news_macro",
+            3,
+            None,
+            vec!["read_run_context", "fetch_jin10_flash"],
+            true,
+        ),
+        (
+            "analyst.youtube",
+            3,
+            None,
+            vec![
+                "read_run_context",
+                "fetch_youtube_transcript",
+                "fetch_wayinvideo_transcript",
+            ],
+            false,
+        ),
+        (
+            "analyst.reddit",
+            3,
+            None,
+            vec!["read_run_context", "fetch_last30days_context"],
+            false,
+        ),
+        (
+            "analyst.x",
+            3,
+            None,
+            vec!["read_run_context", "fetch_last30days_context"],
+            false,
+        ),
+        (
+            "researcher.bull.initial",
+            2,
+            None,
+            vec!["read_run_context"],
+            false,
+        ),
+        (
+            "researcher.bear.initial",
+            2,
+            None,
+            vec!["read_run_context"],
+            false,
+        ),
+        (
+            "researcher.bull.interaction",
+            3,
+            None,
+            vec!["read_run_context"],
+            false,
+        ),
+        (
+            "researcher.bear.interaction",
+            3,
+            None,
+            vec!["read_run_context"],
+            false,
+        ),
+        ("mediator.topic", 2, None, vec!["read_run_context"], false),
+        (
+            "mediator.topic_controller",
+            3,
+            Some("medium"),
+            vec!["read_run_context"],
+            false,
+        ),
+        (
+            "manager.research",
+            3,
+            Some("medium"),
+            vec!["read_run_context"],
+            false,
+        ),
+        ("trader", 2, None, vec!["read_run_context"], false),
+        ("risk.aggressive", 2, None, vec!["read_run_context"], false),
+        (
+            "risk.conservative",
+            2,
+            None,
+            vec!["read_run_context"],
+            false,
+        ),
+        ("risk.neutral", 2, None, vec!["read_run_context"], false),
+        (
+            "portfolio.manager",
+            2,
+            Some("medium"),
+            vec!["read_run_context"],
+            false,
+        ),
+        (
+            "allocation.manager",
+            2,
+            None,
+            vec!["read_run_context"],
+            false,
+        ),
+    ] {
+        let mut object = serde_json::Map::new();
+        object.insert("max_turns".to_string(), Value::from(max_turns));
+        object.insert(
+            "tools".to_string(),
+            Value::Array(
+                tools
+                    .into_iter()
+                    .map(|tool| Value::String(tool.to_string()))
+                    .collect(),
+            ),
+        );
+        if let Some(reasoning_effort) = reasoning_effort {
+            object.insert(
+                "reasoning_effort".to_string(),
+                Value::String(reasoning_effort.to_string()),
+            );
+        }
+        if web_search_live {
+            object.insert(
+                "web_search".to_string(),
+                serde_json::json!({ "mode": "live" }),
+            );
+        }
+        roles.insert(role.to_string(), Value::Object(object));
+    }
+    roles
 }
 
 pub(crate) fn normalize_llm_role_tools(value: &mut Value, role: &str) -> Result<()> {
@@ -456,9 +623,7 @@ pub(crate) fn web_search_by_role_from_config<'a>(
 ) -> Result<BTreeMap<String, WebSearchConfig>> {
     let global = web_search_config_at_path(config, "orchestrator.web_search")?
         .unwrap_or_else(WebSearchConfig::default);
-    let role_values = config_get(config, "orchestrator.llm.roles")
-        .and_then(Value::as_object)
-        .context("orchestrator.llm.roles must be a map")?;
+    let role_values = effective_llm_role_values(config)?;
     let mut web_search = BTreeMap::new();
     for (role, llm_settings) in roles {
         let role_path = format!("orchestrator.llm.roles.{role}.web_search");
@@ -542,6 +707,41 @@ pub(crate) fn required_llm_roles() -> Vec<String> {
         }
     }
     ids
+}
+
+impl ReflectionConfig {
+    pub fn from_value(config: &Value) -> Self {
+        let defaults = RetrievalBudget::default();
+        Self {
+            enabled: config_bool(config, "orchestrator.reflection.enabled", true),
+            reflection_version: config_str(
+                config,
+                "orchestrator.reflection.reflection_version",
+                "v1",
+            ),
+            _promote_mode: config_str(config, "orchestrator.reflection.promote_mode", "auto"),
+            retrieval: RetrievalBudget {
+                token_budget: config_int(
+                    config,
+                    "orchestrator.reflection.retrieval.token_budget",
+                    defaults.token_budget as i64,
+                )
+                .max(1) as usize,
+                max_items: config_int(
+                    config,
+                    "orchestrator.reflection.retrieval.max_items",
+                    defaults.max_items as i64,
+                )
+                .max(1) as usize,
+                min_quality: config_f64(
+                    config,
+                    "orchestrator.reflection.retrieval.min_quality",
+                    defaults.min_quality,
+                )
+                .clamp(0.0, 1.0),
+            },
+        }
+    }
 }
 
 impl WorkflowConfig {

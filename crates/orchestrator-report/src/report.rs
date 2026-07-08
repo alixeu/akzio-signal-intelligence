@@ -90,6 +90,9 @@ fn build_payload(
     let report_markdown = crate::builder::build_human_readable_report(&state);
     let report_html = crate::builder::report_to_html(&report_markdown);
     let report_md_path = run_dir.join("report.md");
+    if let Some(parent) = report_md_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
     fs::write(&report_md_path, &report_markdown)?;
 
     // Preserve final_summary.md content for backward compatibility with any
@@ -354,6 +357,20 @@ mod tests {
         let decision = email_decision(&payload, &json!({}), 0.68);
         assert!(decision.should_send);
         assert_eq!(decision.reason, "first_send_today");
+    }
+
+    #[test]
+    fn build_payload_creates_missing_run_dir_for_report_markdown() {
+        let temp = tempfile::tempdir().unwrap();
+        let run_dir = temp.path().join("missing-run-dir");
+        let html_path = temp.path().join("report.html");
+        let payload_path = temp.path().join("payload.json");
+        std::env::set_var("CODEX_ORCH_RUN_DIR", &run_dir);
+        let payload = build_payload("2026-06-19", &html_path, &payload_path, &json!({})).unwrap();
+        std::env::remove_var("CODEX_ORCH_RUN_DIR");
+
+        assert_eq!(payload["orchestrator_status"], "missing");
+        assert!(run_dir.join("report.md").exists());
     }
 
     #[test]

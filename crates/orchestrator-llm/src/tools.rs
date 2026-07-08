@@ -201,7 +201,6 @@ impl RunTechnicalIndicatorsArgs {
             days: self.days,
             db_path,
             model: self.model.clone(),
-            api_key: None,
             timeout: None,
             sleep: None,
         }

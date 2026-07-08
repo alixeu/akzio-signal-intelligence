@@ -11,8 +11,8 @@ use std::{collections::HashMap, time::Duration as StdDuration};
 
 const EPS: f64 = 1e-12;
 const DEFAULT_SYMBOLS: &str = "QQQ,VIX,SOXX";
-const DEFAULT_MODEL: &str = "TwelveDataTechnical";
-const TWELVE_DATA_URL: &str = "https://api.twelvedata.com/time_series";
+const DEFAULT_MODEL: &str = "YahooTechnical";
+const YAHOO_CHART_BASE_URL: &str = "https://query1.finance.yahoo.com/v8/finance/chart";
 const PERIODS: [usize; 5] = [5, 10, 20, 30, 60];
 
 #[derive(Debug, Clone)]
@@ -31,18 +31,16 @@ pub struct Bar {
 }
 
 #[derive(Clone)]
-pub struct TwelveDataSource {
+pub struct YahooDataSource {
     client: Client,
-    api_key: String,
 }
 
-impl TwelveDataSource {
-    pub fn new(api_key: String, timeout_sec: f64) -> Result<Self> {
+impl YahooDataSource {
+    pub fn new(timeout_sec: f64) -> Result<Self> {
         Ok(Self {
             client: Client::builder()
                 .timeout(StdDuration::from_secs_f64(timeout_sec))
                 .build()?,
-            api_key,
         })
     }
 
@@ -52,7 +50,7 @@ impl TwelveDataSource {
         start: NaiveDate,
         end: NaiveDate,
     ) -> Result<Vec<Bar>> {
-        self.fetch_bars(symbol, start, end, "1day").await
+        self.fetch_bars(symbol, start, end, "1d").await
     }
 
     async fn fetch_bars(
@@ -63,32 +61,50 @@ impl TwelveDataSource {
         interval: &str,
     ) -> Result<Vec<Bar>> {
         let provider_symbol = provider_symbol(symbol);
+        let mut url = reqwest::Url::parse(YAHOO_CHART_BASE_URL)?;
+        url.path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("invalid Yahoo chart base URL"))?
+            .push(&provider_symbol);
         let response = self
             .client
-            .get(TWELVE_DATA_URL)
+            .get(url)
             .query(&[
-                ("symbol", provider_symbol.to_string()),
+                (
+                    "period1",
+                    start
+                        .and_hms_opt(0, 0, 0)
+                        .unwrap()
+                        .and_utc()
+                        .timestamp()
+                        .to_string(),
+                ),
+                (
+                    "period2",
+                    (end + Duration::days(1))
+                        .and_hms_opt(0, 0, 0)
+                        .unwrap()
+                        .and_utc()
+                        .timestamp()
+                        .to_string(),
+                ),
                 ("interval", interval.to_string()),
-                ("start_date", start.to_string()),
-                ("end_date", end.to_string()),
-                ("outputsize", "5000".to_string()),
-                ("apikey", self.api_key.clone()),
+                ("events", "history".to_string()),
+                ("includeAdjustedClose", "true".to_string()),
             ])
             .send()
             .await
-            .with_context(|| format!("failed to fetch Twelve Data time_series for {symbol}"))?;
+            .with_context(|| format!("failed to fetch Yahoo chart data for {symbol}"))?;
         if !response.status().is_success() {
-            bail!("Twelve Data HTTP {} for {symbol}", response.status());
+            bail!("Yahoo chart HTTP {} for {symbol}", response.status());
         }
-        parse_twelve_data(symbol, response.json::<TwelveDataResponse>().await?)
+        parse_yahoo_chart(symbol, response.json::<YahooChartResponse>().await?)
     }
 }
 
-fn provider_symbol(symbol: &str) -> &str {
+fn provider_symbol(symbol: &str) -> String {
     match symbol {
-        // ponytail: Twelve Data does not expose cash VIX on this endpoint; use liquid VIXY proxy until a paid index symbol is configured.
-        "VIX" => "VIXY",
-        other => other,
+        "VIX" => "^VIX".to_string(),
+        other => other.to_string(),
     }
 }
 
@@ -109,8 +125,6 @@ pub struct TechnicalArgs {
     #[arg(long)]
     pub model: Option<String>,
     #[arg(long)]
-    pub api_key: Option<String>,
-    #[arg(long)]
     pub timeout: Option<f64>,
     #[arg(long)]
     pub sleep: Option<f64>,
@@ -118,7 +132,7 @@ pub struct TechnicalArgs {
 
 pub async fn run(args: TechnicalArgs) -> Result<Value> {
     let args = ResolvedTechnicalArgs::from_args(args)?;
-    let source = TwelveDataSource::new(args.api_key.clone(), args.timeout)?;
+    let source = YahooDataSource::new(args.timeout)?;
     let conn = connect(&args.db_path)?;
     ensure_schema(&conn)?;
     let imported_at = Utc::now().to_rfc3339();
@@ -154,7 +168,7 @@ pub async fn run(args: TechnicalArgs) -> Result<Value> {
                 ),
                 "20min" => resample_bars(
                     source
-                        .fetch_bars(symbol, args.start, args.end, "5min")
+                        .fetch_bars(symbol, args.start, args.end, "5m")
                         .await?,
                     "20min",
                     4,
@@ -174,7 +188,7 @@ pub async fn run(args: TechnicalArgs) -> Result<Value> {
     }
     Ok(json!({
         "status": "success",
-        "source": "TwelveData",
+        "source": "Yahoo",
         "model": args.model,
         "start": args.start.to_string(),
         "end": args.end.to_string(),
@@ -192,7 +206,6 @@ struct ResolvedTechnicalArgs {
     intervals: Vec<String>,
     db_path: std::path::PathBuf,
     model: String,
-    api_key: String,
     timeout: f64,
     sleep: f64,
 }
@@ -243,24 +256,15 @@ impl ResolvedTechnicalArgs {
             model: args
                 .model
                 .unwrap_or_else(|| config_str(&config, "technical.model", DEFAULT_MODEL)),
-            api_key: args
-                .api_key
-                .or_else(|| std::env::var("TWELVE_DATA_API_KEY").ok())
-                .unwrap_or_else(|| config_str(&config, "technical.api_key", ""))
-                .trim()
-                .to_string(),
             timeout: args.timeout.unwrap_or(20.0),
             sleep: args
                 .sleep
-                .unwrap_or_else(|| config_int(&config, "technical.sleep_sec", 9) as f64),
+                .unwrap_or_else(|| config_int(&config, "technical.sleep_sec", 1) as f64),
         }
         .validate()
     }
 
     fn validate(self) -> Result<Self> {
-        if self.api_key.is_empty() {
-            bail!("missing Twelve Data API key; set --api-key, TWELVE_DATA_API_KEY, or technical.api_key in config/config.yaml");
-        }
         Ok(self)
     }
 }
@@ -891,45 +895,90 @@ fn has_fresh_rows(
 }
 
 #[derive(Debug, Deserialize)]
-struct TwelveDataResponse {
-    values: Option<Vec<TwelveDataBar>>,
-    status: Option<String>,
-    code: Option<i64>,
-    message: Option<String>,
+struct YahooChartResponse {
+    chart: YahooChart,
 }
 
 #[derive(Debug, Deserialize)]
-struct TwelveDataBar {
-    datetime: String,
-    open: Option<String>,
-    high: Option<String>,
-    low: Option<String>,
-    close: Option<String>,
-    volume: Option<String>,
+struct YahooChart {
+    result: Option<Vec<YahooChartResult>>,
+    error: Option<YahooChartError>,
 }
 
-fn parse_twelve_data(symbol: &str, response: TwelveDataResponse) -> Result<Vec<Bar>> {
-    if response.status.as_deref() == Some("error") {
+#[derive(Debug, Deserialize)]
+struct YahooChartError {
+    code: Option<String>,
+    description: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct YahooChartResult {
+    timestamp: Option<Vec<i64>>,
+    indicators: YahooIndicators,
+}
+
+#[derive(Debug, Deserialize)]
+struct YahooIndicators {
+    quote: Vec<YahooQuote>,
+    adjclose: Option<Vec<YahooAdjClose>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct YahooQuote {
+    open: Option<Vec<Option<f64>>>,
+    high: Option<Vec<Option<f64>>>,
+    low: Option<Vec<Option<f64>>>,
+    close: Option<Vec<Option<f64>>>,
+    volume: Option<Vec<Option<f64>>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct YahooAdjClose {
+    adjclose: Option<Vec<Option<f64>>>,
+}
+
+fn parse_yahoo_chart(symbol: &str, response: YahooChartResponse) -> Result<Vec<Bar>> {
+    if let Some(error) = response.chart.error {
         bail!(
-            "Twelve Data error for {symbol}: {} {}",
-            response.code.unwrap_or_default(),
-            response.message.unwrap_or_default()
+            "Yahoo chart error for {symbol}: {} {}",
+            error.code.unwrap_or_default(),
+            error.description.unwrap_or_default()
         );
     }
-    let values = response
-        .values
-        .with_context(|| format!("Twelve Data values missing for {symbol}"))?;
-    let mut bars = values
+    let mut results = response
+        .chart
+        .result
+        .with_context(|| format!("Yahoo chart result missing for {symbol}"))?;
+    let result = results
+        .pop()
+        .with_context(|| format!("Yahoo chart result empty for {symbol}"))?;
+    let timestamps = result
+        .timestamp
+        .with_context(|| format!("Yahoo chart timestamps missing for {symbol}"))?;
+    let quote = result
+        .indicators
+        .quote
         .into_iter()
-        .map(|item| Bar {
+        .next()
+        .with_context(|| format!("Yahoo chart quote missing for {symbol}"))?;
+    let adjclose = result
+        .indicators
+        .adjclose
+        .and_then(|values| values.into_iter().next())
+        .and_then(|item| item.adjclose)
+        .unwrap_or_default();
+    let mut bars = timestamps
+        .into_iter()
+        .enumerate()
+        .map(|(index, timestamp)| Bar {
             symbol: symbol.to_string(),
-            date: item.datetime,
-            open: parse_number(item.open.as_deref()),
-            high: parse_number(item.high.as_deref()),
-            low: parse_number(item.low.as_deref()),
-            close: parse_number(item.close.as_deref()),
-            volume: parse_number(item.volume.as_deref()),
-            adj_close: None,
+            date: timestamp_to_date(timestamp),
+            open: value_at(quote.open.as_deref(), index),
+            high: value_at(quote.high.as_deref(), index),
+            low: value_at(quote.low.as_deref(), index),
+            close: value_at(quote.close.as_deref(), index),
+            volume: value_at(quote.volume.as_deref(), index),
+            adj_close: value_at(Some(&adjclose), index),
             amount: None,
             turnover: None,
             vwap: None,
@@ -939,8 +988,14 @@ fn parse_twelve_data(symbol: &str, response: TwelveDataResponse) -> Result<Vec<B
     Ok(bars)
 }
 
-fn parse_number(value: Option<&str>) -> Option<f64> {
-    value?.parse().ok()
+fn value_at(values: Option<&[Option<f64>]>, index: usize) -> Option<f64> {
+    values?.get(index).copied().flatten()
+}
+
+fn timestamp_to_date(timestamp: i64) -> String {
+    chrono::DateTime::from_timestamp(timestamp, 0)
+        .map(|value| value.naive_utc().to_string())
+        .unwrap_or_else(|| timestamp.to_string())
 }
 
 #[cfg(test)]
@@ -971,19 +1026,31 @@ mod tests {
     }
 
     #[test]
-    fn parses_twelve_data_values_oldest_first() {
-        let response: TwelveDataResponse = serde_json::from_value(json!({
-            "status": "ok",
-            "values": [
-                {"datetime": "2026-06-20", "open": "2", "high": "3", "low": "1", "close": "2.5", "volume": "20"},
-                {"datetime": "2026-06-19", "open": "1", "high": "2", "low": "0.5", "close": "1.5", "volume": null}
-            ]
+    fn parses_yahoo_chart_values_oldest_first() {
+        let response: YahooChartResponse = serde_json::from_value(json!({
+            "chart": {
+                "result": [{
+                    "timestamp": [1782000000, 1781913600],
+                    "indicators": {
+                        "quote": [{
+                            "open": [2.0, 1.0],
+                            "high": [3.0, 2.0],
+                            "low": [1.0, 0.5],
+                            "close": [2.5, 1.5],
+                            "volume": [20.0, null]
+                        }],
+                        "adjclose": [{"adjclose": [2.4, 1.4]}]
+                    }
+                }],
+                "error": null
+            }
         }))
         .unwrap();
-        let bars = parse_twelve_data("QQQ", response).unwrap();
-        assert_eq!(bars[0].date, "2026-06-19");
+        let bars = parse_yahoo_chart("QQQ", response).unwrap();
+        assert!(bars[0].date < bars[1].date);
         assert_eq!(bars[0].volume, None);
         assert_eq!(bars[1].close, Some(2.5));
+        assert_eq!(bars[1].adj_close, Some(2.4));
     }
 
     #[test]
@@ -1030,11 +1097,11 @@ mod tests {
             features: HashMap::from([("Return".to_string(), Some(0.01))]),
         }];
         assert_eq!(
-            insert_feature_rows(&conn, "TwelveDataTechnical", &rows, "now").unwrap(),
+            insert_feature_rows(&conn, "YahooTechnical", &rows, "now").unwrap(),
             1
         );
         assert_eq!(
-            insert_feature_rows(&conn, "TwelveDataTechnical", &rows, "later").unwrap(),
+            insert_feature_rows(&conn, "YahooTechnical", &rows, "later").unwrap(),
             0
         );
     }

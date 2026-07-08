@@ -87,6 +87,9 @@ pub fn check_common_components(
         ("common_ticker_prompt", &["ticker.md"]),
         ("analyst_output_contract", &["analyst_output_contract.md"]),
         ("anti_injection", &["anti_injection.md"]),
+        ("research_calibration", &["research_calibration.md"]),
+        ("research_dedup", &["research_dedup.md"]),
+        ("research_drivers", &["research_drivers.md"]),
         ("leveraged_etf_rules", &["leveraged_etf_rules.md"]),
         ("analyst_output_structure", &["analyst_output_structure.md"]),
         (
@@ -326,6 +329,9 @@ fn render_for_lint(
     let analyst_output_contract_template =
         common_component(prompt_path, "analyst_output_contract.md")?;
     let anti_injection_template = common_component(prompt_path, "anti_injection.md")?;
+    let research_calibration_template = common_component(prompt_path, "research_calibration.md")?;
+    let research_dedup_template = common_component(prompt_path, "research_dedup.md")?;
+    let research_drivers_template = common_component(prompt_path, "research_drivers.md")?;
     let researcher_seed_template = common_component(prompt_path, "researcher_seed.md")?;
     let researcher_interaction_template =
         common_component(prompt_path, "researcher_interaction.md")?;
@@ -348,6 +354,10 @@ fn render_for_lint(
     let analyst_output_contract =
         replace_placeholders(&analyst_output_contract_template, &component_values);
     let anti_injection = replace_placeholders(&anti_injection_template, &component_values);
+    let research_calibration =
+        replace_placeholders(&research_calibration_template, &component_values);
+    let research_dedup = replace_placeholders(&research_dedup_template, &component_values);
+    let research_drivers = replace_placeholders(&research_drivers_template, &component_values);
     let leveraged_etf_rules =
         replace_placeholders(&leveraged_etf_rules_template, &component_values);
     let analyst_output_structure =
@@ -363,6 +373,9 @@ fn render_for_lint(
         "common_ticker_prompt": common_ticker_prompt,
         "analyst_output_contract": analyst_output_contract,
         "anti_injection": anti_injection,
+        "research_calibration": research_calibration,
+        "research_dedup": research_dedup,
+        "research_drivers": research_drivers,
         "leveraged_etf_rules": leveraged_etf_rules,
         "analyst_output_structure": analyst_output_structure,
         "analyst_artifact_schema": analyst_artifact_schema(),

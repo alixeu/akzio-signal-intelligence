@@ -1,10 +1,16 @@
-use crate::AGGREGATE_TICKER;
+use crate::{
+    memory::{read_prior_memory, PriorMemoryQuery},
+    outcome::track_record,
+    AGGREGATE_TICKER,
+};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+use orchestrator_core::{MarketRegime, RetrievalBudget};
 use rusqlite::{params, params_from_iter, Connection, Row};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone)]
 pub struct RuntimeContext {
@@ -33,8 +39,14 @@ pub struct RunContextReadRequest {
     pub topic_id: Option<String>,
     #[serde(default)]
     pub turn_id: Option<String>,
+    #[serde(default = "default_persist_context")]
+    pub persist_context: bool,
     #[serde(default)]
     pub token_budget: Option<usize>,
+}
+
+fn default_persist_context() -> bool {
+    true
 }
 
 pub fn read_run_context(conn: &mut Connection, request: &RunContextReadRequest) -> Result<Value> {
@@ -93,6 +105,9 @@ pub fn read_run_context(conn: &mut Connection, request: &RunContextReadRequest) 
         ),
         "role_summaries" => role_summaries_context(conn, &ctx),
         "turn_context" => turn_context(conn, &ctx),
+        "prior_memory" => prior_memory_context(conn, request, &ctx),
+        "track_record" => track_record_context(conn, &ctx),
+        "agent_accuracy" => agent_accuracy_context(conn),
         "compose_context" => compose_context(conn, request, &ctx),
         other => anyhow::bail!("unsupported read_run_context kind {other:?}"),
     }
@@ -137,6 +152,7 @@ fn compose_context(
     ctx: &RuntimeContext,
 ) -> Result<Value> {
     let mut blocks = Vec::new();
+    collect_prior_memory_blocks(conn, request, ctx, &mut blocks)?;
     collect_summary_blocks(conn, ctx, request.topic_id.as_deref(), &mut blocks)?;
     if ctx.phase >= 2 {
         collect_jin10_blocks(conn, &mut blocks)?;
@@ -169,8 +185,10 @@ fn compose_context(
         selected.push(block);
     }
 
-    if let Some(turn_id) = request.turn_id.as_deref().filter(|value| !value.is_empty()) {
-        write_turn_context_items(conn, turn_id, ctx, request.topic_id.as_deref(), &selected)?;
+    if request.persist_context {
+        if let Some(turn_id) = request.turn_id.as_deref().filter(|value| !value.is_empty()) {
+            write_turn_context_items(conn, turn_id, ctx, request.topic_id.as_deref(), &selected)?;
+        }
     }
 
     Ok(json!({
@@ -185,6 +203,196 @@ fn compose_context(
         "estimated_tokens": used_tokens,
         "blocks": selected.iter().map(ContextBlock::value).collect::<Vec<_>>()
     }))
+}
+
+fn prior_memory_context(
+    conn: &Connection,
+    request: &RunContextReadRequest,
+    ctx: &RuntimeContext,
+) -> Result<Value> {
+    read_prior_memory(
+        conn,
+        &PriorMemoryQuery {
+            ticker: context_ticker(ctx),
+            market_regime: MarketRegime::default(),
+            budget: RetrievalBudget {
+                token_budget: request.token_budget.unwrap_or(2048).max(1),
+                max_items: 20,
+                min_quality: 0.0,
+            },
+            include_body: true,
+        },
+    )
+}
+
+fn track_record_context(conn: &Connection, ctx: &RuntimeContext) -> Result<Value> {
+    let ticker = ctx.ticker.trim();
+    let aggregate = track_record(conn, None)?;
+    let ticker_record = if ticker.is_empty() {
+        Value::Null
+    } else {
+        track_record(conn, Some(ticker))?
+    };
+    Ok(json!({
+        "query": "track_record",
+        "ticker": ticker,
+        "aggregate": aggregate,
+        "ticker_record": ticker_record,
+    }))
+}
+
+fn agent_accuracy_context(conn: &Connection) -> Result<Value> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT p.agent_probabilities_json, o.direction_correct, o.probability_error
+        FROM outcomes o
+        JOIN predictions p ON p.id = o.prediction_id
+        ORDER BY o.scored_at DESC
+        "#,
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)? != 0,
+            row.get::<_, f64>(2)?,
+        ))
+    })?;
+
+    let mut stats: BTreeMap<String, RoleAccuracy> = BTreeMap::new();
+    for row in rows {
+        let (raw, direction_correct, probability_error) = row?;
+        for role in roles_from_agent_probabilities(&raw) {
+            stats
+                .entry(role)
+                .or_default()
+                .record(direction_correct, probability_error);
+        }
+    }
+
+    Ok(json!({
+        "query": "agent_accuracy",
+        "roles": Value::Object(
+            stats
+                .into_iter()
+                .map(|(role, stat)| (role, stat.value()))
+                .collect()
+        )
+    }))
+}
+
+fn collect_prior_memory_blocks(
+    conn: &Connection,
+    request: &RunContextReadRequest,
+    ctx: &RuntimeContext,
+    blocks: &mut Vec<ContextBlock>,
+) -> Result<()> {
+    let memory = prior_memory_context(conn, request, ctx)?;
+    let Some(items) = memory.get("items").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for item in items {
+        let summary = item
+            .get("summary")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if summary.is_empty() {
+            continue;
+        }
+        let memory_id = item
+            .get("memory_id")
+            .and_then(Value::as_str)
+            .unwrap_or("memory");
+        let quality_score = item
+            .get("quality_score")
+            .and_then(Value::as_f64)
+            .unwrap_or_default();
+        blocks.push(ContextBlock {
+            context_type: "prior_memory".to_string(),
+            context_ref: format!("memory_items:{memory_id}"),
+            ticker: item
+                .get("ticker")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            item_time: item
+                .get("observed_at")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            title: item
+                .get("memory_type")
+                .and_then(Value::as_str)
+                .unwrap_or("prior_memory")
+                .to_string(),
+            content: summary,
+            weight: 2.0 + quality_score,
+            source_table: "memory_items".to_string(),
+            item_json: item.clone(),
+        });
+    }
+    Ok(())
+}
+
+fn context_ticker(ctx: &RuntimeContext) -> Option<String> {
+    if ctx.ticker.trim().is_empty() {
+        None
+    } else {
+        Some(ctx.ticker.clone())
+    }
+}
+
+#[derive(Debug, Default)]
+struct RoleAccuracy {
+    total: usize,
+    correct: usize,
+    probability_error_sum: f64,
+    brier_sum: f64,
+}
+
+impl RoleAccuracy {
+    fn record(&mut self, direction_correct: bool, probability_error: f64) {
+        self.total += 1;
+        if direction_correct {
+            self.correct += 1;
+        }
+        self.probability_error_sum += probability_error;
+        self.brier_sum += probability_error * probability_error;
+    }
+
+    fn value(self) -> Value {
+        if self.total == 0 {
+            return json!({
+                "total_predictions": 0,
+                "direction_accuracy": 0.0,
+                "mean_probability_error": 0.0,
+                "mean_brier_score": 0.0,
+            });
+        }
+        let total = self.total as f64;
+        json!({
+            "total_predictions": self.total,
+            "direction_accuracy": self.correct as f64 / total,
+            "mean_probability_error": self.probability_error_sum / total,
+            "mean_brier_score": self.brier_sum / total,
+        })
+    }
+}
+
+fn roles_from_agent_probabilities(raw: &str) -> Vec<String> {
+    match serde_json::from_str::<Value>(raw).unwrap_or(Value::Null) {
+        Value::Object(map) => map.keys().cloned().collect(),
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|item| {
+                item.get("role")
+                    .or_else(|| item.get("agent"))
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 fn collect_summary_blocks(

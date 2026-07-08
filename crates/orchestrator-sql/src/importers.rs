@@ -43,6 +43,14 @@ pub fn import_jin10_payload(conn: &mut Connection, payload: &Value) -> Result<us
                 imported_at
             ],
         )?;
+        tx.execute(
+            r#"
+            INSERT OR REPLACE INTO external_source_items
+                (source, source_key, ticker, item_time, title, content, item_json, content_hash, imported_at)
+            VALUES ('jin10', ?, '', ?, '', ?, ?, ?, ?)
+            "#,
+            params![event_key, item_time, content, item_json, content_hash, imported_at],
+        )?;
         count += 1;
     }
     tx.commit()?;

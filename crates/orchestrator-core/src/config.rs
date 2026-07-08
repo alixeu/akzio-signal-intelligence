@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use serde_json::{Map, Value};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub fn deep_merge(base: &mut Value, extra: Value) {
     match (base, extra) {
@@ -24,6 +24,7 @@ pub fn load_config(path: Option<&Path>) -> Result<Value> {
     let Some(path) = path else {
         return Ok(Value::Object(Map::new()));
     };
+    load_dotenv_for_config(path)?;
     if !path.exists() {
         return Ok(Value::Object(Map::new()));
     }
@@ -35,6 +36,29 @@ pub fn load_config(path: Option<&Path>) -> Result<Value> {
         serde_json::to_value(yaml).context("failed to convert YAML config to JSON value")?;
     expand_env_placeholders(&mut value);
     Ok(value)
+}
+
+fn load_dotenv_for_config(path: &Path) -> Result<()> {
+    for dotenv_path in dotenv_candidates(path) {
+        if dotenv_path.exists() {
+            dotenvy::from_path(&dotenv_path)
+                .with_context(|| format!("failed to load env file {}", dotenv_path.display()))?;
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn dotenv_candidates(path: &Path) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(parent) = path.parent() {
+        candidates.push(parent.join(".env"));
+        if let Some(grandparent) = parent.parent() {
+            candidates.push(grandparent.join(".env"));
+        }
+    }
+    candidates.push(crate::project_path(".env"));
+    candidates
 }
 
 /// Recursively expand `${VAR}` and `${VAR:-default}` placeholders in string
@@ -185,6 +209,26 @@ mod tests {
         let mut value = json!({"api_key": "${AKZIO_TEST_MISSING2}"});
         expand_env_placeholders(&mut value);
         assert_eq!(value["api_key"], json!(""));
+    }
+
+    #[test]
+    fn load_config_reads_project_dotenv_before_expanding_placeholders() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let env_name = "AKZIO_TEST_DOTENV_KEY";
+        std::env::remove_var(env_name);
+        std::fs::write(
+            temp.path().join(".env"),
+            format!("{env_name}=dotenv-secret\n"),
+        )
+        .unwrap();
+        let config_path = config_dir.join("config.yaml");
+        std::fs::write(&config_path, format!("api_key: ${{{env_name}}}\n")).unwrap();
+
+        let value = load_config(Some(&config_path)).unwrap();
+        assert_eq!(value["api_key"], json!("dotenv-secret"));
+        std::env::remove_var(env_name);
     }
 
     #[test]

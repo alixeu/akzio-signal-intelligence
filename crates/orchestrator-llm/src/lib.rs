@@ -1154,7 +1154,7 @@ pub fn openai_responses_reasoning_params(
     let mut reasoning = serde_json::Map::new();
     if let Some(effort) = effort
         .map(str::trim)
-        .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("none"))
+        .filter(|value| !value.is_empty() && !is_zero_reasoning_effort(value))
     {
         reasoning.insert("effort".to_string(), json!(effort.to_ascii_lowercase()));
     }
@@ -1220,9 +1220,13 @@ fn validate_tool_name(name: &str) -> Result<()> {
 
 fn validate_reasoning_effort(value: &str) -> Result<()> {
     match value.trim().to_ascii_lowercase().as_str() {
-        "none" | "minimal" | "low" | "medium" | "high" | "xhigh" => Ok(()),
+        "0" | "none" | "minimal" | "low" | "medium" | "high" | "xhigh" => Ok(()),
         other => bail!("unsupported reasoning_effort {other:?}"),
     }
+}
+
+fn is_zero_reasoning_effort(value: &str) -> bool {
+    matches!(value.trim().to_ascii_lowercase().as_str(), "0" | "none")
 }
 
 fn validate_reasoning_summary(value: &str) -> Result<()> {
@@ -1745,6 +1749,10 @@ mod tests {
             Some(json!({"reasoning": {"effort": "high"}}))
         );
 
+        settings.reasoning_effort_override = Some("0".to_string());
+        assert_eq!(super::additional_params(&settings), None);
+
+        settings.reasoning_effort_override = Some("HIGH".to_string());
         settings.llm.reasoning_summary = Some("auto".to_string());
         settings.llm.preserve_reasoning_state = true;
         assert_eq!(
