@@ -29,8 +29,9 @@
 - 所有权重必须 `>= 0`，且合计**精确等于 1.0**。
 - 单个 investable ticker 的权重不得超过 `max_single_position`。
 - 评级越高 + 波动越低 → 权重越高；评级越低 + 波动越高 → 权重越低。
-- `correlation_60d > 0.85` 表示高度相关、分散化收益有限，应在 `correlation_note` 中指出集中度风险，避免简单按评级等比例堆叠。
+- `correlation_60d > 0.85` 的标的之间属**高度相关**，彼此**不能**当作相互独立的机会分别给满权重；它们的合计权重必须主动反映集中度风险（即叠加后显著低于各自按评级独立应得分位之和），而**不是**简单地按各自的 rating / long_probability 等比例堆高。`correlation_note` 中一旦将多个高度相关标的并列堆叠，必须**显式点名**这些 ticker 及其 correlation_60d 数值，说明为何其合并敞口被压低、分散化收益有限，不得仅以泛泛一句“相关性较高”带过。
 - `cash_hedge` 权重 = 1 − 总股票敞口；VIX 越高、相关性越高、方向概率越模糊，`cash_hedge` 应越高。
+- 当 VIX `regime` 为 `elevated` 或 `defensive` 时，`cash_hedge` 的 `rationale` **必须解释为何提高现金对冲**，而不能只写出数值：要结合（a）波动率升高放大回撤风险、（b）高度相关标的叠加使分散化失效、（c）上游 long_probability / 方向概率模糊导致胜率不确定，说明提高 `cash_hedge` 是上述三重风险下的主动收缩，而非单纯引用 `equity_budget_hint` 区间。
 - 每个 ticker 的 `rationale` 必须引用该 ticker 的 rating、long_probability、vol_pct，并结合 `trader_plan`、`risk_debate_state`、`final_trade_decision` 中的关键约束；理由必须与最终权重方向一致。
 
 **输出契约：PortfolioAllocation**（必须返回合法 JSON）：
@@ -42,6 +43,8 @@
 - `vix_regime`：原样回传 allocation context 中的 `vix.regime`。
 - `correlation_note`：引用 `correlation_60d` 数值并说明集中度风险；若相关性 <= 0.85 也要简要说明分散化尚可。
 - `summary`：2-4 句中文，概括配置逻辑（VIX 体制、相关性、评级差异如何共同决定了权重切分）。
+
+**前向说明（暂不实现）**：若未来 run 在输入中提供 `previous_weights`（上一期配置），则会引入再平衡摩擦阈值，对偏离上一期过大的调仓施加约束；但当前输入**不含** `previous_weights`，故本次不实现该逻辑，留待上游补齐历史配置输入后再补。
 
 请返回纯 JSON，不要包含 markdown 代码块标记。
 

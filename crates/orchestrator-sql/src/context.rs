@@ -216,11 +216,11 @@ fn prior_memory_context(
             ticker: context_ticker(ctx),
             market_regime: MarketRegime::default(),
             budget: RetrievalBudget {
-                token_budget: request.token_budget.unwrap_or(2048).max(1),
-                max_items: 20,
+                token_budget: request.token_budget.unwrap_or(1024).max(1),
+                max_items: 8,
                 min_quality: 0.0,
             },
-            include_body: true,
+            include_body: false,
         },
     )
 }
@@ -747,8 +747,8 @@ fn write_turn_context_items(
             r#"
             INSERT INTO turn_context_items
                 (run_id, turn_id, role, phase, ticker, item_time, topic_id,
-                 context_type, context_ref, content, item_json, weight, content_hash, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 context_type, context_ref, weight, content_hash, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
             params![
                 ctx.run_id,
@@ -760,8 +760,6 @@ fn write_turn_context_items(
                 topic_id,
                 block.context_type,
                 block.context_ref,
-                block.content,
-                item_json_text,
                 block.weight,
                 content_hash,
                 Utc::now().to_rfc3339()
@@ -978,6 +976,11 @@ pub fn context_count(conn: &Connection, name: &str) -> Result<i64> {
         "reddit" => "SELECT COUNT(*) FROM social_items WHERE source = 'reddit'",
         "x" => "SELECT COUNT(*) FROM social_items WHERE source = 'x'",
         other => {
+            // Only allow safe SQL identifiers so untrusted names cannot inject
+            // via table interpolation. Existence is still checked separately.
+            if !is_safe_sql_identifier(other) {
+                return Ok(0);
+            }
             return if table_exists(conn, other)? {
                 conn.query_row(&format!("SELECT COUNT(*) FROM {other}"), [], |row| {
                     row.get(0)
@@ -1068,7 +1071,7 @@ fn role_summaries_context(conn: &Connection, ctx: &RuntimeContext) -> Result<Val
         sql.push_str(" AND role = ?");
         params.push(rusqlite::types::Value::Text(ctx.role.clone()));
     }
-    sql.push_str(" ORDER BY created_at DESC LIMIT 80");
+    sql.push_str(" ORDER BY created_at DESC LIMIT 40");
     let items = query_rows(conn, &sql, params)?;
     Ok(json!({"query": "role-summaries", "run_id": ctx.run_id, "items": items}))
 }
@@ -1080,6 +1083,15 @@ fn turn_context(conn: &Connection, ctx: &RuntimeContext) -> Result<Value> {
     sql.push_str(" ORDER BY created_at DESC, id DESC LIMIT 80");
     let items = query_rows(conn, &sql, params)?;
     Ok(json!({"query": "turn-context", "run_id": ctx.run_id, "items": items}))
+}
+
+fn is_safe_sql_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 fn table_exists(conn: &Connection, table: &str) -> Result<bool> {

@@ -1,6 +1,7 @@
 //! Prompt lint data structures and orchestration.
 
 use anyhow::Result;
+use orchestrator_core::ComponentRegistry;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -41,7 +42,6 @@ pub const VALID_PLACEHOLDERS: &[&str] = &[
     "analyst_output_contract",
     "anti_injection",
     "research_calibration",
-    "research_dedup",
     "research_drivers",
     "leveraged_etf_rules",
     "analyst_output_structure",
@@ -95,15 +95,12 @@ pub const SCHEMA_PLACEHOLDERS: &[&str] = &[
 /// Shared component files under `prompts/common/`.
 #[allow(dead_code)]
 pub const COMMON_COMPONENTS: &[&str] = &[
-    "ticker.md",
     "anti_injection.md",
     "analyst_output_contract.md",
     "leveraged_etf_rules.md",
     "analyst_output_structure.md",
     "research_calibration.md",
-    "research_dedup.md",
     "research_drivers.md",
-    "researcher_seed.md",
     "researcher_interaction.md",
     "risk_analyst.md",
 ];
@@ -116,15 +113,29 @@ pub fn run_all_checks(prompts_dir: &Path) -> Result<LintReport> {
 
     let mut prompt_files: Vec<(PathBuf, String)> = Vec::new();
     collect_md_files(prompts_dir, &mut prompt_files)?;
+    let component_registry = ComponentRegistry::discover(prompts_dir)?;
+    component_registry.validate_required_variables()?;
 
     for (path, content) in &prompt_files {
         files_checked += 1;
         let role = infer_role_from_path(path, prompts_dir);
-        checks::check_placeholder_completeness(path, content, &mut issues);
+        checks::check_placeholder_completeness(path, content, &component_registry, &mut issues);
         checks::check_schema_references(path, content, &mut issues);
-        checks::check_common_components(path, content, prompts_dir, &mut issues);
+        checks::check_common_components(
+            path,
+            content,
+            prompts_dir,
+            &component_registry,
+            &mut issues,
+        );
         if !role.is_empty() {
-            checks::check_orphan_placeholders(path, content, &role, &mut issues);
+            checks::check_orphan_placeholders(
+                path,
+                content,
+                &role,
+                &component_registry,
+                &mut issues,
+            );
         }
         checks::check_file_size(path, content, &mut issues);
         checks::check_anti_injection(path, content, &role, &config, &mut issues);

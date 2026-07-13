@@ -13,20 +13,20 @@ async fn mock_exec_writes_state_and_final_summary() {
         date: Some("2026-06-15".to_string()),
         lang: "zh".to_string(),
         mode: Mode::Probability,
-        window_days: 150,
-        phase1_agents: "technical,news,youtube,reddit,x".to_string(),
+        window_days: None,
+        phase1_agents: None,
         db_path: Some(db_path.clone()),
         run_dir: Some(run_dir.clone()),
         config: Some(config_path),
         model: Some("gpt-5.4".to_string()),
         reasoning_effort: Some("low".to_string()),
-        max_debate_rounds: 5,
-        max_topics_per_side: 10,
-        technical_weight: 40.0,
-        news_weight: 35.0,
-        youtube_weight: 8.0,
-        reddit_weight: 9.0,
-        x_weight: 8.0,
+        max_debate_rounds: None,
+        max_topics_per_side: None,
+        technical_weight: None,
+        news_weight: None,
+        youtube_weight: None,
+        reddit_weight: None,
+        x_weight: None,
         from_phase: 1,
         to_phase: 3,
         tech_refresh_enabled: false,
@@ -44,11 +44,8 @@ async fn mock_exec_writes_state_and_final_summary() {
     .await
     .unwrap();
     assert_eq!(result["long_probability"], 0.5);
-    assert!(run_dir.join("state.json").exists());
-    assert!(run_dir.join("final_summary.md").exists());
 
-    let state: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(run_dir.join("state.json")).unwrap()).unwrap();
+    let state = &result["run_state"];
     assert_eq!(
         state["phase1_agents"],
         serde_json::json!([
@@ -88,10 +85,15 @@ async fn mock_exec_can_stop_after_phase1() {
     );
     args.to_phase = 1;
 
-    exec::run(args).await.unwrap();
+    let result = exec::run(args).await.unwrap();
 
-    let state: serde_json::Value =
+    assert!(run_dir.join("state.json").exists());
+    assert!(run_dir.join("final_summary.md").exists());
+
+    let persisted_state: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(run_dir.join("state.json")).unwrap()).unwrap();
+    let state = &result["run_state"];
+    assert_eq!(&persisted_state, state);
     assert_eq!(state["phase_status"]["1"], "done");
     assert!(state["phase_status"].get("2").is_none());
     assert!(state["phase_status"].get("3").is_none());
@@ -131,11 +133,12 @@ async fn mock_exec_phase7_writes_portfolio_allocation() {
         .get("VIX")
         .is_none());
 
-    let state: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(run_dir.join("state.json")).unwrap()).unwrap();
-    assert_eq!(state["phase_status"]["4"], "done");
+    let state = &result["run_state"];
+    // Default policy mode is selective: trader/portfolio may be derived while
+    // risk still runs when probability is near-neutral (mock Hold @ 0.5).
+    assert_eq!(state["phase_status"]["4"], "derived");
     assert_eq!(state["phase_status"]["5"], "done");
-    assert_eq!(state["phase_status"]["6"], "done");
+    assert_eq!(state["phase_status"]["6"], "derived");
     assert_eq!(state["phase_status"]["7"], "done");
     assert_eq!(state["trader_investment_plan"]["action"], "Hold");
     assert_eq!(
@@ -153,12 +156,13 @@ async fn mock_exec_phase7_writes_portfolio_allocation() {
     assert!(state["phase_status"].get("8").is_none());
     let conn = Connection::open(db_path).unwrap();
     let phase8_rows: i64 = conn
-        .query_row("SELECT COUNT(*) FROM run_archive", [], |row| row.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM runs WHERE phase_count > 0",
+            [],
+            |row| row.get(0),
+        )
         .unwrap();
     assert_eq!(phase8_rows, 0);
-    assert!(fs::read_to_string(run_dir.join("final_summary.md"))
-        .unwrap()
-        .contains("Portfolio Allocation"));
 }
 
 #[tokio::test]
@@ -176,21 +180,24 @@ async fn mock_exec_phase8_writes_archive_predictions_and_system_metrics() {
     );
     args.to_phase = 8;
 
-    exec::run(args).await.unwrap();
+    let result = exec::run(args).await.unwrap();
 
-    let state: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(run_dir.join("state.json")).unwrap()).unwrap();
+    let state = &result["run_state"];
     assert_eq!(state["phase_status"]["8"], "done");
 
     let conn = Connection::open(db_path).unwrap();
     let archive_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM run_archive", [], |row| row.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM runs WHERE phase_count > 0",
+            [],
+            |row| row.get(0),
+        )
         .unwrap();
     let prediction_count: i64 = conn
         .query_row("SELECT COUNT(*) FROM predictions", [], |row| row.get(0))
         .unwrap();
     let system_metric_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM system_metrics", [], |row| row.get(0))
+        .query_row("SELECT COUNT(*) FROM prompt_metrics", [], |row| row.get(0))
         .unwrap();
     assert_eq!(archive_count, 1);
     assert!(prediction_count >= 1);
@@ -219,8 +226,7 @@ async fn selective_policy_derives_trader_runs_triggered_risk_and_allocates() {
 
     let result = exec::run(args).await.unwrap();
 
-    let state: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(run_dir.join("state.json")).unwrap()).unwrap();
+    let state = &result["run_state"];
     assert_eq!(state["workflow_policy"]["mode"], "selective");
     assert_eq!(
         state["workflow_policy"]["skipped_phases"],
@@ -294,8 +300,7 @@ async fn legacy_policy_runs_all_optional_phases_and_allocates() {
 
     let result = exec::run(args).await.unwrap();
 
-    let state: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(run_dir.join("state.json")).unwrap()).unwrap();
+    let state = &result["run_state"];
     assert_eq!(state["workflow_policy"]["mode"], "legacy");
     assert_eq!(
         state["workflow_policy"]["skipped_phases"],
@@ -343,8 +348,7 @@ async fn mock_exec_uses_configured_shared_db_path_by_default() {
     assert!(db_path.exists());
     assert!(!run_dir.join("run.sqlite").exists());
 
-    let state: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(run_dir.join("state.json")).unwrap()).unwrap();
+    let state = &result["run_state"];
     assert_eq!(state["db_path"], db_path.display().to_string());
 
     let conn = Connection::open(db_path).unwrap();
@@ -695,20 +699,20 @@ fn test_args(
         date: Some("2026-06-15".to_string()),
         lang: "zh".to_string(),
         mode: Mode::Probability,
-        window_days: 150,
-        phase1_agents: "technical,news,youtube,reddit,x".to_string(),
+        window_days: None,
+        phase1_agents: None,
         db_path,
         run_dir,
         config,
         model: Some("gpt-5.4".to_string()),
         reasoning_effort: Some("low".to_string()),
-        max_debate_rounds: 5,
-        max_topics_per_side: 10,
-        technical_weight: 40.0,
-        news_weight: 35.0,
-        youtube_weight: 8.0,
-        reddit_weight: 9.0,
-        x_weight: 8.0,
+        max_debate_rounds: None,
+        max_topics_per_side: None,
+        technical_weight: None,
+        news_weight: None,
+        youtube_weight: None,
+        reddit_weight: None,
+        x_weight: None,
         from_phase: 1,
         to_phase: 3,
         tech_refresh_enabled: false,
@@ -758,7 +762,7 @@ orchestrator:
     required_contexts:
       - technical
   allocation:
-    investable_tickers: [QQQ, SOXX]
+    investable_assets: [QQQ, SOXX]
     regime_signal: VIX
     regime_thresholds: [15, 20, 30]
     regime_labels: [risk_on, normal, elevated, defensive]

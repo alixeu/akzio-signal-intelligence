@@ -54,7 +54,7 @@ pub(crate) struct PluginConfig {
 
 #[derive(Debug, Clone)]
 pub(crate) struct AllocationConfig {
-    pub investable_tickers: Vec<String>,
+    pub investable_assets: Vec<String>,
     pub regime_signal: String,
     pub regime_thresholds: Vec<f64>,
     pub regime_labels: Vec<String>,
@@ -82,6 +82,7 @@ pub(crate) struct WorkflowConfig {
     pub policy_mode: WorkflowPolicyMode,
     pub policy_thresholds: WorkflowPolicyThresholds,
     pub skip_zero_weight_analysts: bool,
+    pub force_portfolio_review: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -745,10 +746,6 @@ impl ReflectionConfig {
 }
 
 impl WorkflowConfig {
-    pub fn from_value(config: &Value) -> Self {
-        Self::from_value_with_registry(config, &RolePluginRegistry::default())
-    }
-
     pub fn from_value_with_registry(config: &Value, role_plugins: &RolePluginRegistry) -> Self {
         let phase1_parallelism =
             config_int(config, "orchestrator.workflow.phase1.parallelism", 5).max(1) as usize;
@@ -779,6 +776,11 @@ impl WorkflowConfig {
             "orchestrator.workflow.phase1.skip_zero_weight",
             true,
         );
+        let force_portfolio_review = config_bool(
+            config,
+            "orchestrator.workflow.policy.force_portfolio_review",
+            false,
+        );
         Self {
             phase1_parallelism,
             agent_timeout_sec,
@@ -789,6 +791,7 @@ impl WorkflowConfig {
             policy_mode: policy_mode_from_config(config),
             policy_thresholds: policy_thresholds_from_config(config),
             skip_zero_weight_analysts,
+            force_portfolio_review,
         }
     }
 }
@@ -945,27 +948,21 @@ pub(crate) fn prompt_path(config: &Value, key: &str, default: &str) -> Result<Pa
     Ok(path)
 }
 
-pub(crate) fn normalize_phase1_role_name(role: &str) -> String {
-    let registry = AgentRegistry::builtin();
-    registry.normalize_role_name(role)
-}
-
-pub(crate) fn config_weight(config: &Value, name: &str, cli_value: f64) -> f64 {
-    let cli_default = match name {
+pub(crate) fn config_weight(config: &Value, name: &str, cli_value: Option<f64>) -> f64 {
+    if let Some(value) = cli_value {
+        return value;
+    }
+    let builtin_default = match name {
         "technical" => 40.0,
         "news_macro" => 35.0,
         "youtube" => 8.0,
         "reddit" => 9.0,
         "x" => 8.0,
-        _ => cli_value,
+        _ => 0.0,
     };
-    if (cli_value - cli_default).abs() > f64::EPSILON {
-        return cli_value;
-    }
-
     config_get(config, &format!("orchestrator.analyst_weights.{name}"))
         .and_then(|value| value.as_f64())
-        .unwrap_or(cli_value)
+        .unwrap_or(builtin_default)
 }
 
 pub(crate) fn validate_sqlite_context(

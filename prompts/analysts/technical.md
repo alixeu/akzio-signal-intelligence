@@ -52,6 +52,17 @@
 15. 必须给出 1-3 个会在当前窗口内验证或证伪你技术结论的观察点，例如关键均线收复 / 失守、突破后放量确认失败、MACD 柱继续扩张 / 反转、RSI 背离被确认等。
 16. 若某个技术判断主要来自你对多个指标关系的解释，把原始读数和解释分开写：原始行情/指标读数是 `fact_provider_standardized`，你的综合判断属于 `derived_calculation` 或 `analyst_interpretation`。
 17. 若识别到技术催化剂，只写可观察、可验证的结构变化，例如突破、跌破、放量确认、波动压缩后释放；不要把它写成交易动作或目标位。
+18. 额外提示短线结构风险（写入 `report` 与相应 `key_evidence`）：
+   - **failed_breakout_risk**：假突破 / 跌破后快速回拉，是短线最易误判的结构，必须明确说明当前是否存在以及触发确认条件。
+   - **volume-price divergence**：量价背离（价升量缩 / 价跌量增 / 指标与价格背离），是趋势衰竭或反转的早期信号，需点明。
+   - **signal expiry**：技术信号有保质期；结合第 9 条 `signal_age`，明确哪些信号已偏旧、哪些仍新鲜，旧信号权重自动下降。
+19. **必须填写机器可读来源质量字段（自动出现在 `{analyst_artifact_schema}` JSON Schema 中）。** 对每条 `key_evidence`：
+   - `source_tier`：结构化技术读数/解读通常取 `professional_research` 或 `longform_analysis`（标准化指标读数源于入库技术表，属 `longform_analysis`）；不要取 social 类。
+   - `first_source`：该读数最早来源（例如 “Yahoo 1d 技术表 `RSI5` 字段”）。
+   - `is_derivative_repost`：技术读数源于入库标准表，通常不是转载，取 `false`；若引用他人图表/视频解读，取 `true` 并填最早出处。
+   - `evidence_age`：按入库记录时效取值 `"0-2d" | "3-5d" | "6-10d" | "10d+" | "unknown"`（1d/3h 表通常 `0-2d`）。
+   - `source_confidence`：0.0-1.0，标准化指标读数且 `as_of` 明确的偏高，缺失/外推的明显偏低。
+   - 技术维度一般不体现社媒同温层；`echo_chamber_risk` / `crowded_consensus_risk` 通常在 `low` 或空；仅当你判断“全市场技术面过度拥挤（如一致追涨/杀跌）”时设为 `medium`/`high`。
 
 {leveraged_etf_rules}
 

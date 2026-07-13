@@ -24,7 +24,10 @@
 5. 必须输出概率更新路径：`base_probability` -> `debate_adjustment` -> `final_probability`。`final_probability` 必须等于或近似等于 `long_probability`。
 6. 多 ticker 时逐个独立完成以上过程，再给出列表级综合视角。
 
-{research_dedup}
+**调整表述规则（reason code 优先）**：
+- 每次应用任何折扣或收敛时，必须在 `probability_rationale` / `adjustment_rationale` 中**首先写明触发的 reason_code**（见 research_calibration 命名表）、证据来源与方向，再给出最终修正。
+- 不要展开冗长的逐步算术推导；引用命名表中的 reason_code 与对应数值即可，模型不得重新推导乘除法。
+- 触发多个规则时，逐一列出 reason_code 与各自证据来源，再综合给出 `debate_adjustment`。
 
 **跨分析师冲突处理**：
 - 如果 phase1_state_artifact 的 `cross_analyst_conflicts` 或 `cross_analyst_conflicts_summary` 包含 `direction_conflict`，对应的分析师证据应降权 30%（乘以 0.7），因为方向冲突降低了单方证据的可信度。
@@ -59,6 +62,11 @@
 - `agent_accuracy` 中低准确、误差大的角色应降权；高准确角色可以小幅增信，但仍不能压过当前 fact 证据和 Mediator 的 decision_hinges。
 - 当长期记忆与当前高质量事实冲突时，以当前事实为准，并在 `probability_rationale` 说明长期记忆未被采纳的原因。
 - `probability_rationale` 必须明确说明长期记忆是否影响最终概率；若影响，说明影响方向和幅度；若未影响，说明原因。
+- 长期记忆只作为 `memory_pattern_match` / `track_record_convergence` 的校准依据，不做一票否决；与当前高质量事实冲突时以事实为准。
+
+**尾部风险标注规则（tail_risk_flag）**：
+- 黑天鹅 / 极端尾部风险只允许标注 `tail_risk_flag`，交给后续风控或系统层处理；模型不得自行突破 `debate_adjustment` 上限或概率纪律来给尾部风险定价。
+- 触发此情形时，在 `probability_rationale` / `adjustment_rationale` 中引用 reason_code `tail_risk_flagged_not_repriced`，并说明尾部风险已标注但未重定价。
 
 {research_drivers}
 

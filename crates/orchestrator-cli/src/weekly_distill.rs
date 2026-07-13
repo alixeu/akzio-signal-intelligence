@@ -106,10 +106,11 @@ pub fn distill_weekly(conn: &Connection, options: &DistillOptions) -> Result<Dis
 fn outcome_samples(conn: &Connection, since: &str, until: &str) -> Result<Vec<OutcomeSample>> {
     let mut stmt = conn.prepare(
         r#"
-        SELECT run_id, ticker, prediction_date, direction_correct, probability_error, market_regime_json
-        FROM outcomes
-        WHERE date(prediction_date) >= date(?) AND date(prediction_date) <= date(?)
-        ORDER BY ticker ASC, market_regime_json ASC, prediction_date ASC, run_id ASC
+        SELECT o.run_id, o.ticker, o.prediction_date, o.direction_correct, o.probability_error, p.market_regime_json
+        FROM outcomes o
+        JOIN predictions p ON p.id = o.prediction_id
+        WHERE date(o.prediction_date) >= date(?) AND date(o.prediction_date) <= date(?)
+        ORDER BY o.ticker ASC, p.market_regime_json ASC, o.prediction_date ASC, o.run_id ASC
         "#,
     )?;
     let rows = stmt.query_map(params![since, until], |row| {
@@ -303,7 +304,6 @@ mod tests {
                 actual_return: 0.05,
                 direction_correct,
                 probability_error,
-                market_regime_json: json!({"volatility":"normal"}),
             },
         )
         .unwrap();

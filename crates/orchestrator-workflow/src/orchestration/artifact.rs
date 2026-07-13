@@ -543,20 +543,33 @@ pub(crate) fn weighted_probability_base(
                     skipped_roles.push(Value::String(role.clone()));
                     continue;
                 }
-                let confidence = payload
-                    .get("confidence")
-                    .and_then(Value::as_f64)
-                    .unwrap_or(0.5)
-                    .clamp(0.0, 1.0);
-                let direction = match payload
-                    .get("direction")
-                    .and_then(Value::as_str)
-                    .unwrap_or("neutral")
-                {
+                // Missing confidence/direction is a contract violation, not a
+                // silent 0.5/neutral vote. Skip so the weighted base stays honest.
+                let Some(confidence) = payload.get("confidence").and_then(Value::as_f64) else {
+                    skipped_roles.push(Value::String(role.clone()));
+                    continue;
+                };
+                let confidence = confidence.clamp(0.0, 1.0);
+                let Some(direction_raw) = payload.get("direction").and_then(Value::as_str) else {
+                    skipped_roles.push(Value::String(role.clone()));
+                    continue;
+                };
+                let direction = match direction_raw {
                     "bullish" | "long" | "positive" => 1.0,
                     "bearish" | "short" | "negative" => -1.0,
-                    _ => 0.0,
+                    "neutral" | "mixed" => 0.0,
+                    "unobserved" => {
+                        skipped_roles.push(Value::String(role.clone()));
+                        continue;
+                    }
+                    _ => {
+                        skipped_roles.push(Value::String(role.clone()));
+                        continue;
+                    }
                 };
+                // Apply research_calibration speculation_discount in Rust so
+                // prompt promises are enforced rather than left to the LLM.
+                let confidence = apply_speculation_discount(payload, confidence);
                 weighted_direction += weight * confidence * direction;
                 confidence_total += weight * confidence;
                 weight_total += weight;
@@ -586,6 +599,54 @@ pub(crate) fn weighted_probability_base(
             )
         })
         .collect()
+}
+
+
+/// Apply `speculation_discount` from research_calibration.md:
+/// opinion ×0.7, speculation ×0.3 (fact ×1.0, unclassified ×0.5), and if
+/// speculation ratio > 50% apply an additional ×0.7 overall haircut.
+fn apply_speculation_discount(payload: &Value, confidence: f64) -> f64 {
+    let Some(items) = payload
+        .get("key_evidence")
+        .or_else(|| payload.get("evidence"))
+        .and_then(Value::as_array)
+    else {
+        return confidence;
+    };
+    if items.is_empty() {
+        return confidence;
+    }
+
+    let mut type_weight_sum = 0.0;
+    let mut speculation_count = 0usize;
+    for item in items {
+        let evidence_type = match item {
+            Value::Object(object) => object
+                .get("evidence_type")
+                .and_then(Value::as_str)
+                .unwrap_or("unclassified"),
+            Value::String(_) => "unclassified",
+            _ => "unclassified",
+        };
+        let type_weight = match evidence_type {
+            "fact" => 1.0,
+            "opinion" => 0.7,
+            "speculation" => {
+                speculation_count += 1;
+                0.3
+            }
+            _ => 0.5,
+        };
+        type_weight_sum += type_weight;
+    }
+    let avg_type_weight = type_weight_sum / items.len() as f64;
+    let speculation_ratio = speculation_count as f64 / items.len() as f64;
+    let overall = if speculation_ratio > 0.5 {
+        avg_type_weight * 0.7
+    } else {
+        avg_type_weight
+    };
+    (confidence * overall).clamp(0.0, 1.0)
 }
 
 /// A report contributes no directional evidence when it was degraded, used a
@@ -776,9 +837,10 @@ mod tests {
                 policy_mode: crate::orchestration::policy::WorkflowPolicyMode::Selective,
                 policy_thresholds: Default::default(),
                 skip_zero_weight_analysts: false,
+                force_portfolio_review: false,
             },
             allocation: crate::orchestration::config::AllocationConfig {
-                investable_tickers: vec!["QQQ".to_string(), "SOXX".to_string()],
+                investable_assets: vec!["QQQ".to_string(), "SOXX".to_string()],
                 regime_signal: "VIX".to_string(),
                 regime_thresholds: vec![15.0, 20.0, 30.0],
                 regime_labels: vec![
@@ -1023,4 +1085,64 @@ mod tests {
         assert_eq!(qqq["skipped_roles"], json!([]));
         assert_eq!(qqq["source_roles"].as_array().unwrap().len(), 2);
     }
+
+
+    #[test]
+    fn skips_reports_missing_confidence_or_direction() {
+        let state = json!({
+            "analyst_weights": {
+                "analyst.technical": 1.0,
+                "analyst.news_macro": 1.0
+            }
+        });
+        let tickers = vec!["QQQ".to_string()];
+        let mut reports = serde_json::Map::new();
+        reports.insert(
+            "analyst.technical".to_string(),
+            json!({"per_ticker": {"QQQ": {"direction": "bullish"}}}),
+        );
+        reports.insert(
+            "analyst.news_macro".to_string(),
+            json!({"per_ticker": {"QQQ": {"confidence": 0.8}}}),
+        );
+        let base = weighted_probability_base(&state, &tickers, &reports);
+        let qqq = base.get("QQQ").unwrap();
+        assert_eq!(qqq["confidence"], json!(0.0));
+        assert_eq!(qqq["long_probability"], json!(0.5));
+        let skipped = qqq["skipped_roles"].as_array().unwrap();
+        assert_eq!(skipped.len(), 2);
+        assert!(skipped.iter().any(|v| v == "analyst.technical"));
+        assert!(skipped.iter().any(|v| v == "analyst.news_macro"));
+    }
+
+
+
+    #[test]
+    fn applies_speculation_discount_to_confidence() {
+        let state = json!({
+            "analyst_weights": { "analyst.news_macro": 1.0 }
+        });
+        let tickers = vec!["QQQ".to_string()];
+        let mut reports = serde_json::Map::new();
+        reports.insert(
+            "analyst.news_macro".to_string(),
+            json!({
+                "per_ticker": {
+                    "QQQ": {
+                        "direction": "bullish",
+                        "confidence": 1.0,
+                        "key_evidence": [
+                            {"claim": "rumor A", "evidence_type": "speculation"},
+                            {"claim": "rumor B", "evidence_type": "speculation"}
+                        ]
+                    }
+                }
+            }),
+        );
+        let base = weighted_probability_base(&state, &tickers, &reports);
+        let confidence = base["QQQ"]["confidence"].as_f64().unwrap();
+        // avg type weight = 0.3, speculation_ratio=1.0 => *0.7 => 0.21
+        assert!((confidence - 0.21).abs() < 1e-9, "got {confidence}");
+    }
+
 }

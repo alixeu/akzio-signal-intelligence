@@ -65,12 +65,19 @@
    - 是否有明确事件依附
    - 是否只是标题党或情绪宣泄
    - 是否存在机器人刷屏、单一大 V 主导或明显回音室效应
-6. 识别反身性风险：
+6. **必须填写机器可读来源质量字段（自动出现在 `{analyst_artifact_schema}` JSON Schema 中）。** 对每条 `key_evidence`：
+   - `source_tier`：已验证机构/官方/媒体账号取 `social_verified`，匿名或单一散户账号取 `social_unverified`，无法判断取 `unknown`。
+   - `first_source`：该言论最早可溯源出处（原创账号 + 帖子，或最初引发传播的源头），用于跨平台归因。
+   - `is_derivative_repost`：若某条 X 言论只是复述别处（新闻/Reddit/YouTube）已存在的叙事，设为 `true` 并在 `first_source` 填最早出处；不要把重复搬运计数成多条独立证据。
+   - `evidence_age`：按 X 样本时效取值 `"0-2d" | "3-5d" | "6-10d" | "10d+" | "unknown"`。
+   - `source_confidence`：0.0-1.0，已验证账号且有事件依附的偏高，匿名情绪宣泄/疑似刷屏的明显偏低。
+   - 在 ticker 级评估同温层与拥挤：若 X 上存在机器人刷屏、单一大 V 主导或明显回音室效应，将 `echo_chamber_risk` 设为 `medium`/`high`；若 X 呈现极端一致方向共识（可能成为逆向拥挤信号），将 `crowded_consensus_risk` 设为 `medium`/`high`，并说明依据。
+7. 识别反身性风险：
    - 过热多头叙事本身可能意味着已计价
    - 过度悲观可能意味着预期已低
    - 互动最强的观点不一定是最有信息量的观点
-7. 至少列出 1-3 个 validation triggers / falsifiers，说明后续哪些官方披露、价格反应、管理层表态或宏观变化会验证 / 证伪当前 X 叙事。
-8. 对 `QQQ` / `TQQQ` / `SQQQ`，必须单列 `QQQ / VIX 联动判断`：X 上的 QQQ 方向叙事是否被 VIX 叙事确认、削弱或冲突；如果 X 上 VIX 样本不足，必须降低 confidence 或说明不能验证风险偏好。
+8. 至少列出 1-3 个 validation triggers / falsifiers，说明后续哪些官方披露、价格反应、管理层表态或宏观变化会验证 / 证伪当前 X 叙事。
+9. 对 `QQQ` / `TQQQ` / `SQQQ`，必须单列 `QQQ / VIX 联动判断`：X 上的 QQQ 方向叙事是否被 VIX 叙事确认、削弱或冲突；如果 X 上 VIX 样本不足，必须降低 confidence 或说明不能验证风险偏好。
 
 ## 输出要求
 

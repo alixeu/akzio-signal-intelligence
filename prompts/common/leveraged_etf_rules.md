@@ -1,6 +1,6 @@
 ## 杠杆 ETF 通用规则
 
-1. 只有当本次输入 ticker 包含 `TQQQ`、`SQQQ`、`UPRO`、`SOXL` 等杠杆 ETF 时，才执行本节规则；否则不要新增或替换 ticker。
+1. 只有当本次输入 ticker 包含 `TQQQ`、`SQQQ`、`UPRO`、`SOXL` 等杠杆 ETF 时，才执行本节规则；否则不要新增或替换 ticker。注意：当 CLI 传入 `TQQQ` 但 `analysis_universe` / `investable_assets` 仅含 `QQQ` 时，系统通过 QQQ 代理 + 杠杆规则覆盖 TQQQ 分析；此时 `per_ticker` 输出 `TQQQ`，但方向判断必须以 `QQQ` 价格结构为基础。
 2. 若 ticker 为杠杆 ETF，必须检查其对应基础指数 ETF 或行业 ETF 的价格结构 / 基本面是否同向。对应关系至少包括：
    - `TQQQ` / `SQQQ` -> `QQQ`
    - `UPRO` -> `SPY`

@@ -12,11 +12,11 @@ pub(crate) enum WorkflowPolicyReason {
     ProbabilityNearNeutral,
     HighVolatility,
     HighCorrelation,
-    LargePosition,
+    HighPosition,
     HighRiskFlag,
     TradeResearchConflict,
-    HighImpactRiskConstraint,
     PolicyForcePortfolioReview,
+    ResearchDegraded,
 }
 
 impl WorkflowPolicyReason {
@@ -26,11 +26,11 @@ impl WorkflowPolicyReason {
             Self::ProbabilityNearNeutral => "PROBABILITY_NEAR_NEUTRAL",
             Self::HighVolatility => "HIGH_VOLATILITY",
             Self::HighCorrelation => "HIGH_CORRELATION",
-            Self::LargePosition => "LARGE_POSITION",
+            Self::HighPosition => "HIGH_POSITION",
             Self::HighRiskFlag => "HIGH_RISK_FLAG",
             Self::TradeResearchConflict => "TRADE_RESEARCH_CONFLICT",
-            Self::HighImpactRiskConstraint => "HIGH_IMPACT_RISK_CONSTRAINT",
             Self::PolicyForcePortfolioReview => "POLICY_FORCE_PORTFOLIO_REVIEW",
+            Self::ResearchDegraded => "RESEARCH_DEGRADED",
         }
     }
 }
@@ -73,11 +73,12 @@ pub(crate) struct WorkflowPolicySignals {
     pub(crate) long_probability: Option<f64>,
     pub(crate) volatility: Option<f64>,
     pub(crate) correlation: Option<f64>,
-    pub(crate) position_size: Option<f64>,
+    /// Estimated / proposed max single-name weight in [0, 1].
+    pub(crate) proposed_position: Option<f64>,
     pub(crate) high_risk_flag: bool,
     pub(crate) trade_research_conflict: bool,
-    pub(crate) high_impact_risk_constraint: bool,
     pub(crate) force_portfolio_review: bool,
+    pub(crate) research_degraded: bool,
 }
 
 pub(crate) fn legacy_workflow_policy(evaluated_at_phase: i64) -> WorkflowPolicyDecision {
@@ -127,26 +128,26 @@ pub(crate) fn evaluate_workflow_policy(
     {
         reasons.push(WorkflowPolicyReason::HighCorrelation);
     }
-    if signals
-        .position_size
-        .is_some_and(|value| value > thresholds.max_position)
-    {
-        reasons.push(WorkflowPolicyReason::LargePosition);
-    }
     if signals.high_risk_flag {
         reasons.push(WorkflowPolicyReason::HighRiskFlag);
     }
     if signals.trade_research_conflict {
         reasons.push(WorkflowPolicyReason::TradeResearchConflict);
     }
-    if signals.high_impact_risk_constraint {
-        reasons.push(WorkflowPolicyReason::HighImpactRiskConstraint);
-    }
     if signals.force_portfolio_review {
         reasons.push(WorkflowPolicyReason::PolicyForcePortfolioReview);
     }
+    if signals
+        .proposed_position
+        .is_some_and(|value| value > thresholds.max_position)
+    {
+        reasons.push(WorkflowPolicyReason::HighPosition);
+    }
+    if signals.research_degraded {
+        reasons.push(WorkflowPolicyReason::ResearchDegraded);
+    }
 
-    let need_trader = false;
+    let need_trader = signals.trade_research_conflict;
     let need_risk_review = has_any(
         &reasons,
         &[
@@ -154,19 +155,19 @@ pub(crate) fn evaluate_workflow_policy(
             WorkflowPolicyReason::ProbabilityNearNeutral,
             WorkflowPolicyReason::HighVolatility,
             WorkflowPolicyReason::HighCorrelation,
-            WorkflowPolicyReason::LargePosition,
+            WorkflowPolicyReason::HighPosition,
             WorkflowPolicyReason::HighRiskFlag,
             WorkflowPolicyReason::TradeResearchConflict,
-            WorkflowPolicyReason::HighImpactRiskConstraint,
+            WorkflowPolicyReason::ResearchDegraded,
         ],
     );
     let need_portfolio_review = has_any(
         &reasons,
         &[
             WorkflowPolicyReason::HighCorrelation,
-            WorkflowPolicyReason::LargePosition,
-            WorkflowPolicyReason::HighImpactRiskConstraint,
+            WorkflowPolicyReason::HighPosition,
             WorkflowPolicyReason::PolicyForcePortfolioReview,
+            WorkflowPolicyReason::ResearchDegraded,
         ],
     );
 
@@ -301,11 +302,10 @@ mod tests {
     }
 
     #[test]
-    fn market_and_position_risks_trigger_risk_and_portfolio_review() {
+    fn market_risks_trigger_risk_review() {
         let decision = selective(WorkflowPolicySignals {
             volatility: Some(0.05),
             correlation: Some(0.90),
-            position_size: Some(0.80),
             high_risk_flag: true,
             ..WorkflowPolicySignals::default()
         });
@@ -317,28 +317,25 @@ mod tests {
             vec![
                 WorkflowPolicyReason::HighVolatility,
                 WorkflowPolicyReason::HighCorrelation,
-                WorkflowPolicyReason::LargePosition,
                 WorkflowPolicyReason::HighRiskFlag
             ]
         );
     }
 
     #[test]
-    fn conflict_and_constraints_trigger_review_reasons() {
+    fn trade_research_conflict_triggers_trader_and_risk_review() {
         let decision = selective(WorkflowPolicySignals {
             trade_research_conflict: true,
-            high_impact_risk_constraint: true,
             force_portfolio_review: true,
             ..WorkflowPolicySignals::default()
         });
-        assert!(!decision.need_trader);
+        assert!(decision.need_trader);
         assert!(decision.need_risk_review);
         assert!(decision.need_portfolio_review);
         assert_eq!(
             decision.reasons,
             vec![
                 WorkflowPolicyReason::TradeResearchConflict,
-                WorkflowPolicyReason::HighImpactRiskConstraint,
                 WorkflowPolicyReason::PolicyForcePortfolioReview
             ]
         );
@@ -374,4 +371,28 @@ mod tests {
         assert_eq!(state["workflow_metrics"]["policy_mode"], "selective");
         assert_eq!(state["workflow_metrics"]["llm_calls_skipped_estimate"], 3);
     }
+
+
+    #[test]
+    fn selective_high_position_triggers_reviews() {
+        let decision = selective(WorkflowPolicySignals {
+            proposed_position: Some(0.85),
+            ..WorkflowPolicySignals::default()
+        });
+        assert!(decision.need_risk_review);
+        assert!(decision.need_portfolio_review);
+        assert!(decision.reasons.contains(&WorkflowPolicyReason::HighPosition));
+    }
+
+    #[test]
+    fn selective_research_degraded_triggers_reviews() {
+        let decision = selective(WorkflowPolicySignals {
+            research_degraded: true,
+            ..WorkflowPolicySignals::default()
+        });
+        assert!(decision.need_risk_review);
+        assert!(decision.need_portfolio_review);
+        assert!(decision.reasons.contains(&WorkflowPolicyReason::ResearchDegraded));
+    }
+
 }

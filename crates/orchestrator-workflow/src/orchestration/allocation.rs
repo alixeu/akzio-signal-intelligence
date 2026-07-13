@@ -21,14 +21,14 @@ pub(crate) fn compute_allocation_context(
         })
         .unwrap_or_default();
 
-    let investable = if config.investable_tickers.is_empty() {
+    let investable = if config.investable_assets.is_empty() {
         tickers
             .iter()
             .filter(|t| t.as_str() != config.regime_signal)
             .cloned()
             .collect::<Vec<_>>()
     } else {
-        config.investable_tickers.clone()
+        config.investable_assets.clone()
     };
 
     let vix_info = query_vix_regime(
@@ -113,7 +113,7 @@ pub(crate) fn compute_allocation_context(
     };
 
     json!({
-        "investable_tickers": investable,
+        "investable_assets": investable,
         "vix": vix_info,
         "per_ticker": per_ticker,
         "research_plan": state.get("research_plan").cloned().unwrap_or(Value::Null),
@@ -132,7 +132,7 @@ pub(crate) fn normalize_allocation(
     config: &AllocationConfig,
 ) -> Value {
     let investable = context
-        .get("investable_tickers")
+        .get("investable_assets")
         .and_then(Value::as_array)
         .map(|arr| {
             arr.iter()
@@ -247,7 +247,7 @@ pub(crate) fn normalize_allocation(
 
 fn fallback_inverse_vol(context: &Value, config: &AllocationConfig, reason: &str) -> Value {
     let investable = context
-        .get("investable_tickers")
+        .get("investable_assets")
         .and_then(Value::as_array)
         .map(|arr| {
             arr.iter()
@@ -467,7 +467,7 @@ fn pearson_correlation(a: &[f64], b: &[f64]) -> Option<f64> {
 
 impl AllocationConfig {
     pub(crate) fn from_value(config: &Value) -> Self {
-        let investable = config_get(config, "orchestrator.allocation.investable_tickers")
+        let investable = config_get(config, "orchestrator.allocation.investable_assets")
             .and_then(Value::as_array)
             .map(|arr| {
                 arr.iter()
@@ -517,7 +517,7 @@ impl AllocationConfig {
             .unwrap_or("STD20")
             .to_string();
         Self {
-            investable_tickers: investable,
+            investable_assets: investable,
             regime_signal,
             regime_thresholds,
             regime_labels,
@@ -534,7 +534,7 @@ mod tests {
 
     fn test_config() -> AllocationConfig {
         AllocationConfig {
-            investable_tickers: vec!["QQQ".to_string(), "SOXX".to_string()],
+            investable_assets: vec!["QQQ".to_string(), "SOXX".to_string()],
             regime_signal: "VIX".to_string(),
             regime_thresholds: vec![15.0, 20.0, 30.0],
             regime_labels: vec![
@@ -551,7 +551,7 @@ mod tests {
 
     fn test_context() -> Value {
         json!({
-            "investable_tickers": ["QQQ", "SOXX"],
+            "investable_assets": ["QQQ", "SOXX"],
             "vix": {"level": 22.0, "regime": "elevated", "equity_budget_hint": "0.30-0.70"},
             "per_ticker": {
                 "QQQ": {"vol_pct": 0.01},

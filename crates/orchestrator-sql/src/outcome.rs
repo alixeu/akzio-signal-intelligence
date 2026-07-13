@@ -3,8 +3,6 @@ use chrono::Utc;
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 
-use crate::ensure_schema;
-
 #[derive(Debug, Clone)]
 pub struct OutcomeInput {
     pub prediction_id: i64,
@@ -18,19 +16,17 @@ pub struct OutcomeInput {
     pub actual_return: f64,
     pub direction_correct: bool,
     pub probability_error: f64,
-    pub market_regime_json: Value,
 }
 
 pub fn upsert_outcome(conn: &Connection, input: &OutcomeInput) -> Result<i64> {
-    ensure_schema(conn)?;
     let now = Utc::now().to_rfc3339();
     conn.execute(
         r#"
         INSERT INTO outcomes
             (prediction_id, run_id, ticker, prediction_date, outcome_date, window_days,
              baseline_close, outcome_close, actual_return, direction_correct, probability_error,
-             market_regime_json, scored_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             scored_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(prediction_id) DO UPDATE SET
             outcome_date = excluded.outcome_date,
             window_days = excluded.window_days,
@@ -39,7 +35,6 @@ pub fn upsert_outcome(conn: &Connection, input: &OutcomeInput) -> Result<i64> {
             actual_return = excluded.actual_return,
             direction_correct = excluded.direction_correct,
             probability_error = excluded.probability_error,
-            market_regime_json = excluded.market_regime_json,
             scored_at = excluded.scored_at
         "#,
         params![
@@ -54,19 +49,19 @@ pub fn upsert_outcome(conn: &Connection, input: &OutcomeInput) -> Result<i64> {
             input.actual_return,
             input.direction_correct as i64,
             input.probability_error,
-            serde_json::to_string(&input.market_regime_json)?,
             now,
         ],
     )?;
-    Ok(conn.query_row(
+    let outcome_id = conn.query_row(
         "SELECT id FROM outcomes WHERE prediction_id = ?",
         params![input.prediction_id],
-        |row| row.get(0),
-    )?)
+        |row| row.get::<_, i64>(0),
+    )?;
+
+    Ok(outcome_id)
 }
 
 pub fn track_record(conn: &Connection, ticker: Option<&str>) -> Result<Value> {
-    ensure_schema(conn)?;
     let (sql, params): (&str, Vec<String>) = if let Some(ticker) = ticker.filter(|v| !v.is_empty())
     {
         (
@@ -96,7 +91,6 @@ pub fn latest_close_on_or_before(
     date: &str,
     interval: &str,
 ) -> Result<Option<(String, f64)>> {
-    ensure_schema(conn)?;
     let mut stmt = conn.prepare(
         r#"
         SELECT kline_time, indicator_value
@@ -119,7 +113,6 @@ pub fn earliest_close_on_or_after(
     date: &str,
     interval: &str,
 ) -> Result<Option<(String, f64)>> {
-    ensure_schema(conn)?;
     let mut stmt = conn.prepare(
         r#"
         SELECT kline_time, indicator_value
@@ -178,7 +171,6 @@ mod tests {
                 actual_return: 0.05,
                 direction_correct: true,
                 probability_error: 0.3,
-                market_regime_json: json!({}),
             },
         )
         .unwrap();

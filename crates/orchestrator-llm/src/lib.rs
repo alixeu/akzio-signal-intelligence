@@ -6,7 +6,7 @@ use anyhow::{bail, Context, Result};
 use futures::StreamExt;
 use llm_judge::JudgeConfig;
 use orchestrator_core::{
-    default_project_root, extract_json_artifact, validate_research_artifact, ResearchArtifact,
+    default_project_root, extract_json_artifact, validate_analyst_ticker_artifact, validate_research_artifact, AnalystTickerArtifact, ResearchArtifact,
 };
 use rig_core::{
     agent::AgentBuilder,
@@ -960,7 +960,13 @@ fn parse_final_output(settings: &RigSettings, text: &str) -> Result<Value> {
             if agent_loop::assistant_message_needs_follow_up(text) {
                 bail!("agent ended with an action note instead of a JSON artifact");
             }
-            parse_json_object_artifact(text).or_else(|_| Ok(text_fallback_artifact(settings, text)))
+            match parse_json_object_artifact(text) {
+                Ok(artifact) => {
+                    validate_json_artifact_contract(settings, &artifact)?;
+                    Ok(artifact)
+                }
+                Err(_) => Ok(text_fallback_artifact(settings, text)),
+            }
         }
     }
 }
@@ -989,6 +995,25 @@ fn text_fallback_artifact(settings: &RigSettings, text: &str) -> Value {
         "report": text,
         "per_ticker": per_ticker
     })
+}
+
+fn validate_json_artifact_contract(settings: &RigSettings, artifact: &Value) -> Result<()> {
+    if !settings.role.starts_with("analyst.") {
+        return Ok(());
+    }
+    let Some(per_ticker) = artifact.get("per_ticker").and_then(Value::as_object) else {
+        bail!("analyst artifact requires per_ticker object");
+    };
+    for ticker in &settings.tickers {
+        let Some(payload) = per_ticker.get(ticker) else {
+            bail!("analyst artifact missing per_ticker.{ticker}");
+        };
+        let parsed: AnalystTickerArtifact = serde_json::from_value(payload.clone())
+            .with_context(|| format!("invalid analyst per_ticker.{ticker} payload"))?;
+        validate_analyst_ticker_artifact(&parsed)
+            .map_err(|error| anyhow::anyhow!("analyst per_ticker.{ticker}: {error}"))?;
+    }
+    Ok(())
 }
 
 fn parse_json_object_artifact(text: &str) -> Result<Value> {
@@ -1516,6 +1541,25 @@ mod tests {
         );
         let err = super::parse_json_object_artifact("[{\"ok\":true}]").unwrap_err();
         assert!(err.to_string().contains("must be an object"));
+    }
+
+    #[test]
+    fn parse_final_output_enforces_analyst_direction_and_confidence() {
+        let mut settings = base_settings(LlmRoute::Responses);
+        settings.role = "analyst.technical".to_string();
+        settings.tickers = vec!["QQQ".to_string()];
+        settings.output_mode = OutputMode::JsonArtifact;
+
+        let missing_direction = r#"{"id":"analyst.technical","role":"analyst.technical","per_ticker":{"QQQ":{"confidence":0.7,"report":"x"}}}"#;
+        let err = super::parse_final_output(&settings, missing_direction).unwrap_err();
+        assert!(
+            err.to_string().contains("direction") || err.to_string().contains("invalid analyst"),
+            "unexpected error: {err}"
+        );
+
+        let valid = r#"{"id":"analyst.technical","role":"analyst.technical","per_ticker":{"QQQ":{"direction":"bullish","confidence":0.7,"report":"ok"}}}"#;
+        let artifact = super::parse_final_output(&settings, valid).unwrap();
+        assert_eq!(artifact["per_ticker"]["QQQ"]["direction"], json!("bullish"));
     }
 
     #[test]

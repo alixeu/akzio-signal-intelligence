@@ -2,10 +2,10 @@
 
 use super::{LintIssue, SCHEMA_PLACEHOLDERS, VALID_PLACEHOLDERS};
 use anyhow::{Context, Result};
-use orchestrator_core::replace_placeholders;
 use orchestrator_core::{
     analyst_artifact_schema, final_validation_schema, portfolio_allocation_schema,
-    research_artifact_schema, risk_constraints_schema, trade_intent_schema,
+    replace_placeholders, research_artifact_schema, risk_constraints_schema, trade_intent_schema,
+    ComponentRegistry,
 };
 use serde_json::{json, Value};
 use std::collections::HashSet;
@@ -26,6 +26,7 @@ fn placeholder_regex() -> &'static regex::Regex {
 pub fn check_placeholder_completeness(
     file_path: &Path,
     content: &str,
+    component_registry: &ComponentRegistry,
     issues: &mut Vec<LintIssue>,
 ) {
     let re = placeholder_regex();
@@ -40,7 +41,9 @@ pub fn check_placeholder_completeness(
         }
         for cap in re.captures_iter(line) {
             let placeholder = cap.get(1).unwrap().as_str();
-            if !VALID_PLACEHOLDERS.contains(&placeholder) {
+            if !VALID_PLACEHOLDERS.contains(&placeholder)
+                && !component_registry.has_enabled_placeholder(placeholder)
+            {
                 issues.push(LintIssue {
                     file: file_path.display().to_string(),
                     line: Some(line_num + 1),
@@ -81,20 +84,19 @@ pub fn check_common_components(
     file_path: &Path,
     content: &str,
     prompts_dir: &Path,
+    component_registry: &ComponentRegistry,
     issues: &mut Vec<LintIssue>,
 ) {
     let checks: &[(&str, &[&str])] = &[
-        ("common_ticker_prompt", &["ticker.md"]),
         ("analyst_output_contract", &["analyst_output_contract.md"]),
         ("anti_injection", &["anti_injection.md"]),
         ("research_calibration", &["research_calibration.md"]),
-        ("research_dedup", &["research_dedup.md"]),
         ("research_drivers", &["research_drivers.md"]),
         ("leveraged_etf_rules", &["leveraged_etf_rules.md"]),
         ("analyst_output_structure", &["analyst_output_structure.md"]),
         (
             "researcher_body",
-            &["researcher_seed.md", "researcher_interaction.md"],
+            &["researcher_interaction.md"],
         ),
         ("risk_analyst_body", &["risk_analyst.md"]),
     ];
@@ -117,6 +119,20 @@ pub fn check_common_components(
             }
         }
     }
+    for placeholder in ["common_ticker_prompt"] {
+        let token = format!("{{{placeholder}}}");
+        if content.contains(&token) && !component_registry.has_enabled_placeholder(placeholder) {
+            issues.push(LintIssue {
+                file: file_path.display().to_string(),
+                line: None,
+                severity: "error".to_string(),
+                check: "component_existence".to_string(),
+                message: format!(
+                    "Prompt references {{{placeholder}}} but no enabled prompt component provides it"
+                ),
+            });
+        }
+    }
 }
 
 /// Check 4: render the prompt against a mock state and flag surviving
@@ -126,6 +142,7 @@ pub fn check_orphan_placeholders(
     file_path: &Path,
     _content: &str,
     role: &str,
+    component_registry: &ComponentRegistry,
     issues: &mut Vec<LintIssue>,
 ) {
     let state = json!({
@@ -140,7 +157,7 @@ pub fn check_orphan_placeholders(
         "trader_investment_plan": {"action": "Hold"},
         "risk_debate_state": {"history": []},
         "final_trade_decision": {"rating": "Hold"},
-        "allocation_context": {"investable_tickers": ["QQQ", "SOXX"]},
+        "allocation_context": {"investable_assets": ["QQQ", "SOXX"]},
     });
     match render_for_lint(
         &state,
@@ -150,6 +167,7 @@ pub fn check_orphan_placeholders(
         Some(2),
         Some("QQQ-aggregate"),
         Some(file_path),
+        component_registry,
     ) {
         Ok(rendered) => {
             let re = placeholder_regex();
@@ -292,6 +310,7 @@ fn render_for_lint(
     round: Option<i64>,
     topic_id: Option<&str>,
     prompt_path: Option<&Path>,
+    component_registry: &ComponentRegistry,
 ) -> Result<String> {
     let tickers = tickers_from_state(state);
     let ticker = state
@@ -325,12 +344,10 @@ fn render_for_lint(
         .get("next_agenda")
         .cloned()
         .unwrap_or_else(|| json!([]));
-    let common_ticker_prompt_template = common_component(prompt_path, "ticker.md")?;
     let analyst_output_contract_template =
         common_component(prompt_path, "analyst_output_contract.md")?;
     let anti_injection_template = common_component(prompt_path, "anti_injection.md")?;
     let research_calibration_template = common_component(prompt_path, "research_calibration.md")?;
-    let research_dedup_template = common_component(prompt_path, "research_dedup.md")?;
     let research_drivers_template = common_component(prompt_path, "research_drivers.md")?;
     let researcher_seed_template = common_component(prompt_path, "researcher_seed.md")?;
     let researcher_interaction_template =
@@ -349,14 +366,11 @@ fn render_for_lint(
         "final_validation_schema": final_validation_schema(),
         "portfolio_allocation_schema": portfolio_allocation_schema(),
     });
-    let common_ticker_prompt =
-        replace_placeholders(&common_ticker_prompt_template, &component_values);
     let analyst_output_contract =
         replace_placeholders(&analyst_output_contract_template, &component_values);
     let anti_injection = replace_placeholders(&anti_injection_template, &component_values);
     let research_calibration =
         replace_placeholders(&research_calibration_template, &component_values);
-    let research_dedup = replace_placeholders(&research_dedup_template, &component_values);
     let research_drivers = replace_placeholders(&research_drivers_template, &component_values);
     let leveraged_etf_rules =
         replace_placeholders(&leveraged_etf_rules_template, &component_values);
@@ -366,15 +380,14 @@ fn render_for_lint(
     let stance_label = risk_stance_label(role);
     let (stance_role_label, stance_intro, stance_rules, stance_schema_extra) =
         risk_stance_fragments(role);
-    let values = json!({
+    let mut values = json!({
         "run_id": state.get("run_id").and_then(Value::as_str).unwrap_or(""),
         "ticker": ticker,
         "tickers": tickers.join(","),
-        "common_ticker_prompt": common_ticker_prompt,
+        "common_ticker_prompt": "",
         "analyst_output_contract": analyst_output_contract,
         "anti_injection": anti_injection,
         "research_calibration": research_calibration,
-        "research_dedup": research_dedup,
         "research_drivers": research_drivers,
         "leveraged_etf_rules": leveraged_etf_rules,
         "analyst_output_structure": analyst_output_structure,
@@ -412,6 +425,20 @@ fn render_for_lint(
         "allocation_context": serde_json::to_string_pretty(&state.get("allocation_context").cloned().unwrap_or(Value::Null))?,
         "workflow_pattern": "Workflow -> Stage/Sub-workflow -> Agent workers -> Reducer -> state artifact"
     });
+    component_registry.render_for_role(role, &mut values)?;
+    if template.contains("{common_ticker_prompt}")
+        && values
+            .get("common_ticker_prompt")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+    {
+        let path = prompt_path
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "<inline prompt>".to_string());
+        anyhow::bail!(
+            "prompt {path} references {{common_ticker_prompt}} but no enabled ticker component injected it for role {role}"
+        );
+    }
     let researcher_body_template = if side.is_empty() {
         String::new()
     } else if role.ends_with(".interaction") {

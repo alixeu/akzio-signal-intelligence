@@ -25,9 +25,7 @@ pub async fn run(args: WayinVideoArgs) -> Result<Value> {
     let args = ResolvedWayinVideoArgs::from_args(args);
     let result = if !args.task_id.is_empty() {
         fetch_existing_task(&args).await?
-    } else if std::env::var("WAYINVIDEO_PASSWORD").is_ok()
-        || std::env::var("RUN_LIVE_TESTS").ok().as_deref() == Some("1")
-    {
+    } else if !args.password.is_empty() {
         start_and_fetch_task(&args).await?
     } else {
         json!({
@@ -57,6 +55,9 @@ struct ResolvedWayinVideoArgs {
     task: String,
     task_id: String,
     output: String,
+    #[allow(dead_code)]
+    username: String,
+    password: String,
     existing_task_url: String,
     timeout_sec: u64,
 }
@@ -79,6 +80,8 @@ impl ResolvedWayinVideoArgs {
                 "https://wayinvideo-api.wayin.ai/api/highlight_moment/task",
             ),
             timeout_sec: config_int(&config, "wayinvideo.timeout_sec", 60) as u64,
+            username: config_str(&config, "wayinvideo.username", ""),
+            password: config_str(&config, "wayinvideo.password", ""),
         }
     }
 }

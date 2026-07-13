@@ -71,7 +71,6 @@ pub fn score_predictions(conn: &Connection, options: &ScoreOptions) -> Result<Sc
                 actual_return,
                 direction_correct: predicted_long == actual_long,
                 probability_error,
-                market_regime_json: prediction.market_regime_json,
             },
         )?;
         summary.scored += 1;

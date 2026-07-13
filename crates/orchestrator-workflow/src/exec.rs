@@ -10,11 +10,12 @@ use orchestrator_sql::{
     archive::{upsert_run_archive, RunArchiveInput},
     connect,
     prediction::{upsert_prediction, PredictionInput},
+    set_run_current_phase,
     system_metrics::{rewrite_system_metrics_from_prompt_metrics, SystemMetricsCopyInput},
-    write_run_record, RunRecordInput,
+    update_run_status, write_run_record, RunRecordInput,
 };
 use serde_json::{json, Value};
-use std::{fs, path::PathBuf, time::Instant};
+use std::{fs, path::{Path, PathBuf}, time::Instant};
 use tracing::debug;
 
 use crate::orchestration::allocation::{compute_allocation_context, normalize_allocation};
@@ -43,8 +44,7 @@ use crate::orchestration::role_jobs::{
 };
 use crate::orchestration::state::{
     append_topic_controller_artifact, append_topic_turn, run_id_for, set_phase_status,
-    set_topic_controller_state, tickers_from_state, upsert_topic_debate_state, write_final_summary,
-    write_json,
+    set_topic_controller_state, tickers_from_state, upsert_topic_debate_state,
 };
 use crate::orchestration::trade_intent::research_plan_to_trade_intent;
 use crate::orchestration::PHASE2_REDUCER;
@@ -82,10 +82,10 @@ pub struct ExecArgs {
     pub lang: String,
     #[arg(long, value_enum, default_value_t = Mode::Probability)]
     pub mode: Mode,
-    #[arg(long, default_value_t = 150)]
-    pub window_days: i64,
-    #[arg(long, default_value = "technical,news,youtube,reddit,x")]
-    pub phase1_agents: String,
+    #[arg(long)]
+    pub window_days: Option<i64>,
+    #[arg(long)]
+    pub phase1_agents: Option<String>,
     #[arg(long)]
     pub db_path: Option<PathBuf>,
     #[arg(long)]
@@ -96,20 +96,20 @@ pub struct ExecArgs {
     pub model: Option<String>,
     #[arg(long)]
     pub reasoning_effort: Option<String>,
-    #[arg(long, default_value_t = 5)]
-    pub max_debate_rounds: i64,
-    #[arg(long, default_value_t = 10)]
-    pub max_topics_per_side: i64,
-    #[arg(long, default_value_t = 40.0)]
-    pub technical_weight: f64,
-    #[arg(long, default_value_t = 35.0)]
-    pub news_weight: f64,
-    #[arg(long, default_value_t = 8.0)]
-    pub youtube_weight: f64,
-    #[arg(long, default_value_t = 9.0)]
-    pub reddit_weight: f64,
-    #[arg(long, default_value_t = 8.0)]
-    pub x_weight: f64,
+    #[arg(long)]
+    pub max_debate_rounds: Option<i64>,
+    #[arg(long)]
+    pub max_topics_per_side: Option<i64>,
+    #[arg(long)]
+    pub technical_weight: Option<f64>,
+    #[arg(long)]
+    pub news_weight: Option<f64>,
+    #[arg(long)]
+    pub youtube_weight: Option<f64>,
+    #[arg(long)]
+    pub reddit_weight: Option<f64>,
+    #[arg(long)]
+    pub x_weight: Option<f64>,
     #[arg(long, default_value_t = 1)]
     pub from_phase: i64,
     #[arg(long, default_value_t = 8)]
@@ -181,24 +181,23 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         "prompt plugin runtime config loaded"
     );
     let run_dir = resolve_run_dir(&args, &tickers, &date, &config);
-    fs::create_dir_all(&run_dir)
-        .with_context(|| format!("failed to create run dir {}", run_dir.display()))?;
     let db_path = resolve_db_path(&args, &config);
     let mut conn = connect(&db_path)?;
     let run_id = run_id_for(&tickers, &date, &run_dir);
     let state_path = run_dir.join("state.json");
-    let explicit_phase1_agents = args.phase1_agents != DEFAULT_PHASE1_AGENTS;
-    let phase1_agents_raw = if explicit_phase1_agents {
-        args.phase1_agents.clone()
-    } else {
+    let explicit_phase1_agents = args.phase1_agents.is_some();
+    let phase1_agents_raw = args.phase1_agents.clone().unwrap_or_else(|| {
         config_str(&config, "orchestrator.phase1_agents", DEFAULT_PHASE1_AGENTS)
-    };
+    });
     let phase1_agents = parse_phase1_agents_with_config(&phase1_agents_raw, &runtime_config)?;
     let model_override = args.model.clone().filter(|value| !value.is_empty());
     let reasoning_effort_override = args
         .reasoning_effort
         .clone()
         .filter(|value| !value.trim().is_empty());
+    let window_days = args
+        .window_days
+        .unwrap_or_else(|| config_int(&config, "orchestrator.runtime.window_days", 150));
     debug!(
         run_id,
         ticker,
@@ -218,12 +217,13 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         "current_date": date,
         "lang": if args.lang == "zh" { config_str(&config, "orchestrator.runtime.lang", "zh") } else { args.lang.clone() },
         "mode": args.mode.as_str(),
-        "window_days": if args.window_days == 150 { config_int(&config, "orchestrator.runtime.window_days", 150) } else { args.window_days },
+        "window_days": window_days,
         "run_dir": run_dir,
         "db_path": db_path,
         "phase_status": {},
         "phase1_agents": phase1_agents,
         "tech_refresh_enabled": args.tech_refresh_enabled,
+        "jin10_lookback_hours": args.jin10_refresh_lookback_hours,
         "analyst_weights": analyst_weights,
         "degraded": false
     });
@@ -252,11 +252,11 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         );
         validate_sqlite_context(&conn, &runtime_config)?;
     }
-    inject_phase0_reflection(&conn, &mut state, &runtime_config)?;
 
     if args.from_phase <= 1 && args.to_phase >= 1 {
         debug!(roles = ?phase1_agents, "phase 1 starting");
         let phase_timer = start_phase_timer(1, "phase1");
+        set_run_current_phase(&mut conn, &run_id, 1)?;
         run_phase1(
             &mut conn,
             &mut state,
@@ -271,26 +271,22 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         debug!("phase 1 completed");
     }
     if args.from_phase <= 2 && args.to_phase >= 2 {
-        debug!(
-            max_debate_rounds = args.max_debate_rounds,
-            "phase 2 starting"
-        );
+        let max_debate_rounds = args
+            .max_debate_rounds
+            .unwrap_or_else(|| config_int(&config, "orchestrator.runtime.max_debate_rounds", 5));
+        let max_topics_per_side = args
+            .max_topics_per_side
+            .unwrap_or_else(|| config_int(&config, "orchestrator.runtime.max_topics_per_side", 10));
+        debug!(max_debate_rounds, "phase 2 starting");
         let phase_timer = start_phase_timer(2, "phase2");
+        set_run_current_phase(&mut conn, &run_id, 2)?;
         conn = run_phase2(
             conn,
             &mut state,
             model_override.as_deref(),
             reasoning_effort_override.as_deref(),
-            if args.max_debate_rounds == 5 {
-                config_int(&config, "orchestrator.runtime.max_debate_rounds", 5)
-            } else {
-                args.max_debate_rounds
-            },
-            if args.max_topics_per_side == 10 {
-                config_int(&config, "orchestrator.runtime.max_topics_per_side", 10)
-            } else {
-                args.max_topics_per_side
-            },
+            max_debate_rounds,
+            max_topics_per_side,
             &runtime_config,
         )
         .await?;
@@ -299,9 +295,11 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         record_phase_elapsed(&mut state, phase_timer);
         debug!("phase 2 completed");
     }
+    inject_phase0_reflection(&conn, &mut state, &runtime_config)?;
     if args.from_phase <= 3 && args.to_phase >= 3 {
         debug!("phase 3 starting");
         let phase_timer = start_phase_timer(3, "phase3");
+        set_run_current_phase(&mut conn, &run_id, 3)?;
         run_phase3(
             &mut conn,
             &mut state,
@@ -322,7 +320,8 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
     if args.from_phase <= 4 && args.to_phase >= 4 {
         debug!("phase 4 (trader) starting");
         let phase_timer = start_phase_timer(4, "phase4");
-        if should_run_llm_trader(policy.as_ref(), &runtime_config) {
+        set_run_current_phase(&mut conn, &run_id, 4)?;
+        let phase4_status = if should_run_llm_trader(policy.as_ref(), &runtime_config) {
             run_phase4(
                 &mut conn,
                 &mut state,
@@ -331,17 +330,20 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
                 &runtime_config,
             )
             .await?;
+            "done"
         } else {
             run_phase4_rust_rule(&mut conn, &mut state)?;
-        }
-        set_phase_status(&mut state, 4, "done");
+            "derived"
+        };
+        set_phase_status(&mut state, 4, phase4_status);
         record_phase_elapsed(&mut state, phase_timer);
         debug!("phase 4 (trader) completed");
     }
     if args.from_phase <= 5 && args.to_phase >= 5 {
         debug!("phase 5 (risk debate) starting");
         let phase_timer = start_phase_timer(5, "phase5");
-        if should_run_risk_review(policy.as_ref(), &runtime_config) {
+        set_run_current_phase(&mut conn, &run_id, 5)?;
+        let phase5_status = if should_run_risk_review(policy.as_ref(), &runtime_config) {
             run_phase5(
                 &mut conn,
                 &mut state,
@@ -350,17 +352,20 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
                 &runtime_config,
             )
             .await?;
+            "done"
         } else {
             run_phase5_skipped(&mut conn, &mut state)?;
-        }
-        set_phase_status(&mut state, 5, "done");
+            "skipped"
+        };
+        set_phase_status(&mut state, 5, phase5_status);
         record_phase_elapsed(&mut state, phase_timer);
         debug!("phase 5 (risk debate) completed");
     }
     if args.from_phase <= 6 && args.to_phase >= 6 {
         debug!("phase 6 (portfolio manager) starting");
         let phase_timer = start_phase_timer(6, "phase6");
-        if should_run_portfolio_review(policy.as_ref(), &runtime_config) {
+        set_run_current_phase(&mut conn, &run_id, 6)?;
+        let phase6_status = if should_run_portfolio_review(policy.as_ref(), &runtime_config) {
             run_phase6(
                 &mut conn,
                 &mut state,
@@ -369,16 +374,19 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
                 &runtime_config,
             )
             .await?;
+            "done"
         } else {
             run_phase6_derived(&mut conn, &mut state)?;
-        }
-        set_phase_status(&mut state, 6, "done");
+            "derived"
+        };
+        set_phase_status(&mut state, 6, phase6_status);
         record_phase_elapsed(&mut state, phase_timer);
         debug!("phase 6 (portfolio manager) completed");
     }
     if args.from_phase <= 7 && args.to_phase >= 7 {
         debug!("phase 7 (allocation) starting");
         let phase_timer = start_phase_timer(7, "phase7");
+        set_run_current_phase(&mut conn, &run_id, 7)?;
         run_phase7(
             &mut conn,
             &mut state,
@@ -394,15 +402,16 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
     if args.from_phase <= 8 && args.to_phase >= 8 {
         debug!("phase 8 (archive + predict) starting");
         let phase_timer = start_phase_timer(8, "phase8");
+        set_run_current_phase(&mut conn, &run_id, 8)?;
         run_phase8(&conn, &mut state, &runtime_config)?;
         set_phase_status(&mut state, 8, "done");
         record_phase_elapsed(&mut state, phase_timer);
         debug!("phase 8 (archive + predict) completed");
     }
 
+    update_run_status(&mut conn, &run_id, "completed", None)?;
     record_contracts(&mut state);
-    write_json(&state_path, &state)?;
-    write_final_summary(&run_dir, &state)?;
+    persist_run_outputs(&run_dir, &state_path, &state)?;
     debug!(
         state_path = %state_path.display(),
         final_summary = %run_dir.join("final_summary.md").display(),
@@ -450,16 +459,37 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         "final_trade_decision": final_decision,
         "vix_regime": allocation.get("vix_regime").cloned().unwrap_or(Value::Null),
         "portfolio_allocation": allocation,
+        "run_state": state.clone(),
     });
     Ok(result)
 }
 
+
+fn persist_run_outputs(run_dir: &Path, state_path: &Path, state: &Value) -> Result<()> {
+    fs::create_dir_all(run_dir)
+        .with_context(|| format!("failed to create run dir {}", run_dir.display()))?;
+    fs::write(
+        state_path,
+        serde_json::to_string_pretty(state).context("failed to serialize run state")?,
+    )
+    .with_context(|| format!("failed to write {}", state_path.display()))?;
+    let summary = orchestrator_report::builder::build_human_readable_report(state);
+    let summary_path = run_dir.join("final_summary.md");
+    fs::write(&summary_path, summary)
+        .with_context(|| format!("failed to write {}", summary_path.display()))?;
+    Ok(())
+}
+
 fn validate_args(args: &ExecArgs) -> Result<()> {
-    if args.max_debate_rounds < 1 {
-        bail!("--max-debate-rounds must be >= 1");
+    if let Some(rounds) = args.max_debate_rounds {
+        if rounds < 1 {
+            bail!("--max-debate-rounds must be >= 1");
+        }
     }
-    if args.max_topics_per_side < 1 {
-        bail!("--max-topics-per-side must be >= 1");
+    if let Some(topics) = args.max_topics_per_side {
+        if topics < 1 {
+            bail!("--max-topics-per-side must be >= 1");
+        }
     }
     if args.from_phase < 1 || args.from_phase > 8 {
         bail!("--from-phase must be 1-8");
@@ -474,8 +504,10 @@ fn validate_args(args: &ExecArgs) -> Result<()> {
         ("--reddit-weight", args.reddit_weight),
         ("--x-weight", args.x_weight),
     ] {
-        if value < 0.0 {
-            bail!("{name} must be >= 0");
+        if let Some(v) = value {
+            if v < 0.0 {
+                bail!("{name} must be >= 0");
+            }
         }
     }
     Ok(())
@@ -502,7 +534,7 @@ fn apply_workflow_policy(
 ) -> WorkflowPolicyDecision {
     let allocation_context = compute_allocation_context(state, conn, &config.allocation);
     state["allocation_context"] = allocation_context.clone();
-    let signals = workflow_policy_signals(state, &allocation_context);
+    let signals = workflow_policy_signals(state, &allocation_context, config);
     let decision = evaluate_workflow_policy(
         config.workflow.policy_mode,
         3,
@@ -513,7 +545,11 @@ fn apply_workflow_policy(
     decision
 }
 
-fn workflow_policy_signals(state: &Value, allocation_context: &Value) -> WorkflowPolicySignals {
+fn workflow_policy_signals(
+    state: &Value,
+    allocation_context: &Value,
+    config: &RuntimeConfig,
+) -> WorkflowPolicySignals {
     let research = state.get("research_plan").unwrap_or(&Value::Null);
     WorkflowPolicySignals {
         confidence: research_confidence(research),
@@ -522,12 +558,69 @@ fn workflow_policy_signals(state: &Value, allocation_context: &Value) -> Workflo
         correlation: allocation_context
             .get("correlation_60d")
             .and_then(Value::as_f64),
-        position_size: None,
+        proposed_position: proposed_position_signal(state, research),
         high_risk_flag: has_high_risk_flag(research),
-        trade_research_conflict: false,
-        high_impact_risk_constraint: false,
-        force_portfolio_review: false,
+        trade_research_conflict: compute_trade_research_conflict(state),
+        force_portfolio_review: config.workflow.force_portfolio_review,
+        research_degraded: research_is_degraded(research),
     }
+}
+
+fn research_is_degraded(research: &Value) -> bool {
+    research
+        .get("degraded")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || research.get("usable").and_then(Value::as_bool) == Some(false)
+        || research.get("status").and_then(Value::as_str) == Some("degraded")
+}
+
+/// Estimate the largest single-name weight the run is heading toward.
+/// Prefers an explicit numeric recommendation, then trader position_size,
+/// then a conviction proxy from |long_probability - 0.5| * 2.
+fn proposed_position_signal(state: &Value, research: &Value) -> Option<f64> {
+    if let Some(value) = research
+        .get("recommended_position")
+        .or_else(|| research.get("position_pct"))
+        .or_else(|| research.get("max_position"))
+        .and_then(Value::as_f64)
+    {
+        return Some(value.clamp(0.0, 1.0));
+    }
+
+    if let Some(size) = state
+        .get("trader_investment_plan")
+        .and_then(|plan| plan.get("position_size"))
+        .and_then(Value::as_str)
+    {
+        if let Some(parsed) = parse_position_size_pct(size) {
+            return Some(parsed);
+        }
+    }
+
+    research
+        .get("long_probability")
+        .and_then(Value::as_f64)
+        .map(|probability| ((probability - 0.5).abs() * 2.0).clamp(0.0, 1.0))
+}
+
+fn parse_position_size_pct(raw: &str) -> Option<f64> {
+    let trimmed = raw.trim();
+    if trimmed == "0%" {
+        return Some(0.0);
+    }
+    // Prefer the upper bound of ranges like "0%-30%" or "30%-50%".
+    let mut values = Vec::new();
+    for part in trimmed.split(|c: char| c == '-' || c == '/' || c.is_whitespace()) {
+        let part = part.trim().trim_end_matches('%');
+        if part.is_empty() {
+            continue;
+        }
+        if let Ok(value) = part.parse::<f64>() {
+            values.push((value / 100.0).clamp(0.0, 1.0));
+        }
+    }
+    values.into_iter().reduce(f64::max)
 }
 
 fn research_confidence(research: &Value) -> Option<f64> {
@@ -570,6 +663,43 @@ fn has_high_risk_flag(research: &Value) -> bool {
             .get("risk_flags")
             .and_then(Value::as_array)
             .is_some_and(|items| !items.is_empty())
+}
+
+/// Detect a conflict between the research manager's final probability and the
+/// Phase 1 weighted analyst base. A large divergence (|delta| > 0.15) means the
+/// research manager significantly departed from the analyst consensus, which
+/// warrants running the LLM trader to carefully reconcile rather than using the
+/// mechanical rust rule.
+fn compute_trade_research_conflict(state: &Value) -> bool {
+    const CONFLICT_THRESHOLD: f64 = 0.15;
+
+    let research_long = state
+        .get("research_plan")
+        .and_then(|r| r.get("long_probability"))
+        .and_then(Value::as_f64);
+    let Some(research_long) = research_long else {
+        return false;
+    };
+
+    let weighted_base = state
+        .get("phase1_state_artifact")
+        .and_then(|artifact| artifact.get("weighted_probability_base"))
+        .and_then(Value::as_object);
+
+    let Some(weighted_base) = weighted_base else {
+        return false;
+    };
+
+    let base_values: Vec<f64> = weighted_base
+        .values()
+        .filter_map(|item| item.get("long_probability").and_then(Value::as_f64))
+        .collect();
+    if base_values.is_empty() {
+        return false;
+    }
+
+    let avg_base = base_values.iter().sum::<f64>() / base_values.len() as f64;
+    (research_long - avg_base).abs() > CONFLICT_THRESHOLD
 }
 
 fn is_selective_policy(config: &RuntimeConfig) -> bool {
@@ -826,8 +956,11 @@ fn restore_default_weight_for_explicit_agent(
     weights: &mut Value,
     phase1_agents: &[String],
     role: &str,
-    default_weight: f64,
+    cli_weight: Option<f64>,
 ) {
+    let Some(default_weight) = cli_weight else {
+        return;
+    };
     if default_weight <= 0.0 || !phase1_agents.iter().any(|agent| agent == role) {
         return;
     }
@@ -1066,15 +1199,39 @@ async fn run_phase2(
 
     let results: Vec<Result<TopicDebateResult>> = futures::future::join_all(topic_futures).await;
 
+    let mut failed_topics = Vec::new();
+    let mut succeeded = 0usize;
     for result in results {
-        let (topic_id, turns, topic_state, role_metrics) = result?;
-        merge_role_job_metrics(state, &role_metrics);
-        // Merge turns into global state
-        if let Some(turns_arr) = state["debate_turns"].as_array_mut() {
-            turns_arr.extend(turns);
+        match result {
+            Ok((topic_id, turns, topic_state, role_metrics)) => {
+                merge_role_job_metrics(state, &role_metrics);
+                if let Some(turns_arr) = state["debate_turns"].as_array_mut() {
+                    turns_arr.extend(turns);
+                }
+                upsert_topic_debate_state(state, &topic_id, topic_state);
+                succeeded += 1;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "phase 2 topic debate failed, skipping topic"
+                );
+                failed_topics.push(error.to_string());
+            }
         }
-        // Merge topic state into global state
-        upsert_topic_debate_state(state, &topic_id, topic_state);
+    }
+    if succeeded == 0 && !failed_topics.is_empty() {
+        bail!(
+            "all phase 2 topic debates failed: {}",
+            failed_topics.join("; ")
+        );
+    }
+    if !failed_topics.is_empty() {
+        state["degraded"] = json!(true);
+        if !state.get("degraded_report").is_some_and(Value::is_object) {
+            state["degraded_report"] = json!({"is_degraded": true, "roles": []});
+        }
+        state["phase2_failed_topics"] = json!(failed_topics);
     }
 
     run_phase2_final_reducer(
@@ -1249,6 +1406,19 @@ async fn run_one_topic_debate(
         turns.push(bull_rebuttal);
         turns.push(bear_rebuttal);
         turns.push(mediator_output.clone());
+
+        let should_continue = mediator_output
+            .get("artifact")
+            .and_then(|a| a.get("soft_control"))
+            .and_then(|sc| sc.get("should_continue"))
+            .and_then(Value::as_bool);
+        if should_continue == Some(false) && round < max_debate_rounds.max(2) {
+            debug!(
+                topic_id,
+                round, "phase 2 debate converged early via mediator signal, stopping"
+            );
+            break;
+        }
     }
 
     let turn_count = turns.len();
@@ -1752,13 +1922,13 @@ fn run_phase8(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    let tickers = tickers_from_state(state);
+    let _tickers = tickers_from_state(state);
     let prediction_date = state
         .get("current_date")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    let run_dir = state
+    let _run_dir = state
         .get("run_dir")
         .and_then(Value::as_str)
         .unwrap_or_default()
@@ -1781,17 +1951,11 @@ fn run_phase8(
         conn,
         &RunArchiveInput {
             run_id: run_id.clone(),
-            ticker: ticker.clone(),
-            tickers_json: json!(tickers),
-            prediction_date: prediction_date.clone(),
             workflow_version: "v1".to_string(),
             prompt_versions_json: json!({}),
             git_sha: String::new(),
             config_hash: String::new(),
-            market_regime_json: market_regime_json.clone(),
-            artifact_path: run_dir,
-            state_summary_json: phase8_state_summary(state),
-            research_plan_json: research_plan.clone(),
+            artifact_path: String::new(),
             degraded: state
                 .get("degraded")
                 .and_then(Value::as_bool)
@@ -1860,7 +2024,6 @@ fn run_phase8(
                 .unwrap_or_default(),
             prediction_date,
             ticker,
-            market_regime_json,
         },
     )?;
     Ok(())
@@ -1884,19 +2047,6 @@ fn market_regime_from_state(state: &Value) -> MarketRegime {
         volatility,
         ..Default::default()
     }
-}
-
-fn phase8_state_summary(state: &Value) -> Value {
-    let research = state.get("research_plan").unwrap_or(&Value::Null);
-    json!({
-        "ticker": state.get("ticker").cloned().unwrap_or(Value::Null),
-        "tickers": state.get("tickers").cloned().unwrap_or(Value::Null),
-        "rating": research.get("rating").cloned().unwrap_or(Value::Null),
-        "long_probability": research.get("long_probability").cloned().unwrap_or(Value::Null),
-        "short_probability": research.get("short_probability").cloned().unwrap_or(Value::Null),
-        "degraded": state.get("degraded").and_then(Value::as_bool).unwrap_or(false),
-        "portfolio_allocation": state.get("portfolio_allocation").cloned().unwrap_or(Value::Null),
-    })
 }
 
 fn research_decision_for_ticker(research_plan: &Value, ticker: &str) -> Option<Value> {
@@ -2063,9 +2213,10 @@ mod tests {
                 policy_mode: WorkflowPolicyMode::Selective,
                 policy_thresholds: Default::default(),
                 skip_zero_weight_analysts,
+                force_portfolio_review: false,
             },
             allocation: crate::orchestration::config::AllocationConfig {
-                investable_tickers: vec!["QQQ".to_string(), "SOXX".to_string()],
+                investable_assets: vec!["QQQ".to_string(), "SOXX".to_string()],
                 regime_signal: "VIX".to_string(),
                 regime_thresholds: vec![15.0, 20.0, 30.0],
                 regime_labels: vec![
@@ -2199,20 +2350,20 @@ mod tests {
             date: None,
             lang: "zh".to_string(),
             mode: Mode::Probability,
-            window_days: 150,
-            phase1_agents: "youtube".to_string(),
+            window_days: None,
+            phase1_agents: Some("youtube".to_string()),
             db_path: None,
             run_dir: None,
             config: None,
             model: None,
             reasoning_effort: None,
-            max_debate_rounds: 5,
-            max_topics_per_side: 10,
-            technical_weight: 40.0,
-            news_weight: 35.0,
-            youtube_weight: 8.0,
-            reddit_weight: 9.0,
-            x_weight: 8.0,
+            max_debate_rounds: None,
+            max_topics_per_side: None,
+            technical_weight: None,
+            news_weight: None,
+            youtube_weight: Some(8.0),
+            reddit_weight: None,
+            x_weight: None,
             from_phase: 1,
             to_phase: 8,
             tech_refresh_enabled: true,
@@ -2231,10 +2382,7 @@ mod tests {
 
         let weights = phase1_analyst_weights(&config, &args, &roles, true);
 
-        assert_eq!(
-            weights["analyst.youtube"].as_f64(),
-            Some(args.youtube_weight)
-        );
+        assert_eq!(weights["analyst.youtube"].as_f64(), Some(8.0));
         assert_eq!(weights["analyst.reddit"].as_f64(), Some(0.0));
     }
 
@@ -2252,20 +2400,20 @@ mod tests {
             date: None,
             lang: "zh".to_string(),
             mode: Mode::Probability,
-            window_days: 150,
-            phase1_agents: DEFAULT_PHASE1_AGENTS.to_string(),
+            window_days: None,
+            phase1_agents: Some(DEFAULT_PHASE1_AGENTS.to_string()),
             db_path: None,
             run_dir: None,
             config: None,
             model: None,
             reasoning_effort: None,
-            max_debate_rounds: 5,
-            max_topics_per_side: 10,
-            technical_weight: 40.0,
-            news_weight: 35.0,
-            youtube_weight: 8.0,
-            reddit_weight: 9.0,
-            x_weight: 8.0,
+            max_debate_rounds: None,
+            max_topics_per_side: None,
+            technical_weight: None,
+            news_weight: None,
+            youtube_weight: None,
+            reddit_weight: None,
+            x_weight: None,
             from_phase: 1,
             to_phase: 8,
             tech_refresh_enabled: true,

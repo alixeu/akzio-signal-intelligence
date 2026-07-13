@@ -66,7 +66,14 @@
    - Reddit 多头过热可能意味着已计价或短线拥挤
    - Reddit 过度悲观可能意味着预期已低
    - 期权/杠杆讨论升温可能放大短线波动，但不是基本面证据
-6. 对 `QQQ` / `TQQQ` / `SQQQ`，必须单列 `QQQ / VIX 联动判断`：Reddit 上的 QQQ 方向叙事是否被 VIX / 波动率叙事确认、削弱或冲突；如果 VIX 样本不足，必须降低 confidence 或说明不能验证风险偏好。
+6. **必须填写机器可读来源质量字段（自动出现在 `{analyst_artifact_schema}` JSON Schema 中）。** 对每条 `key_evidence`：
+   - `source_tier`：Reddit 样本统一取 `social_verified`（已验证账号）或 `social_unverified`（匿名/未验证），无法判断时取 `unknown`。
+   - `first_source`：该讨论最早可溯源出处（如具体 subreddit + 帖子标题，或创始讨论链），用于跨平台归因。
+   - `is_derivative_repost`：若某条讨论是别的平台/帖子搬运来的二手内容，设为 `true` 并在 `first_source` 填最早出处，不要当独立证据。
+   - `evidence_age`：按 Reddit 样本时效取值 `"0-2d" | "3-5d" | "6-10d" | "10d+" | "unknown"`。
+   - `source_confidence`：0.0-1.0，匿名 meme / 单帖噪音应明显偏低，跨 subreddit 共振且有事件依附的应偏高。
+   - 在 ticker 级评估同温层与拥挤：`comment` 区若只有同声附和、缺反证，将 `echo_chamber_risk` 设为 `medium`/`high`；若 Reddit 呈现极端一致方向共识（可能成为逆向拥挤信号），将 `crowded_consensus_risk` 设为 `medium`/`high`，并说明依据。
+7. 对 `QQQ` / `TQQQ` / `SQQQ`，必须单列 `QQQ / VIX 联动判断`：Reddit 上的 QQQ 方向叙事是否被 VIX / 波动率叙事确认、削弱或冲突；如果 VIX 样本不足，必须降低 confidence 或说明不能验证风险偏好。
 
 ## 输出要求
 

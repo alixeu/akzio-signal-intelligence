@@ -19,10 +19,17 @@
           "claim": "证据正文，1-2 句话",
           "evidence_type": "fact" | "opinion" | "speculation",
           "source": "证据来源（工具名/数据源/URL 描述）",
-          "timestamp": "ISO 日期"
+          "timestamp": "ISO 日期",
+          "source_tier": "official" | "major_media" | "professional_research" | "longform_analysis" | "social_verified" | "social_unverified" | "unknown",
+          "first_source": "信息最早可溯源出处（归因）",
+          "is_derivative_repost": false,
+          "evidence_age": "0-2d" | "3-5d" | "6-10d" | "10d+" | "unknown",
+          "source_confidence": 0.0-1.0
         }
       ],
       "priced_in": "already_priced" | "under_priced" | "unclear",
+      "echo_chamber_risk": "low" | "medium" | "high",
+      "crowded_consensus_risk": "low" | "medium" | "high",
       "validation_triggers": ["会强化或推翻当前判断的 1-3 个可观察触发点"],
       "data_gaps": ["数据缺口与不确定性；无缺口时给空数组"]
     }
@@ -49,6 +56,19 @@
   - 权重：0.3x（下游角色给予 30% 权重）
 
 每条 `key_evidence` 必须包含 `evidence_type` 字段。若证据类型不明确，使用 `speculation` 并在 `source` 中说明不确定性。
+
+每条 `key_evidence` 还需尽量填写来源质量字段（这些字段会自动出现在下方 `{analyst_artifact_schema}` 注入的 JSON Schema 中，无需手动对齐）：
+- `source_tier`：来源质量分层。`official`（官方/监管/交易所/审计财报）、`major_media`（主流媒体）、`professional_research`（券商/研究机构报告）、`longform_analysis`（长文深度分析/Substack/博客）、`social_verified`（已验证社媒账号）、`social_unverified`（未验证社媒/匿名）、`unknown`（未知/无法判断）。无把握时给 `unknown`，不要臆造。
+- `first_source`：信息最早可溯源的出处（谁先提出、哪个原始帖子/文件）。用于跨平台去重与归因。
+- `is_derivative_repost`：本条是否为二手转载/重复搬运（原始信息来自别处）。是则 `true` 并在 `first_source` 填最早出处。
+- `evidence_age`：证据的人读时效，取值 `"0-2d" | "3-5d" | "6-10d" | "10d+" | "unknown"`。
+- `source_confidence`：0.0-1.0 对本条来源质量的置信度。
+
+每个 `per_ticker.<ticker>` 还需填写两条共识风险字段（自动出现在注入的 JSON Schema 中）：
+- `echo_chamber_risk`：本 ticker 的讨论是否陷入同温层/回声室（信息高度同质、缺乏异见）。取值 `low | medium | high`。
+- `crowded_consensus_risk`：当前是否呈现极端一致共识（可能成为逆向拥挤信号）。取值 `low | medium | high`。无把握时给 `low` 或空字符串，不要臆造。
+
+无数据时的纪律：当某 ticker 没有可用样本，仍输出 `direction="unobserved"`、`confidence=0.0` 并填写 `data_gaps`（说明缺口、为何缺口重要、什么会扭转观点）；**严禁臆造"暗流/undercurrents"** 等未经数据支撑的叙事。
 
 每个 `per_ticker.<ticker>` 值的字段形状必须符合以下 JSON Schema（权威定义，与运行时校验同源）：
 

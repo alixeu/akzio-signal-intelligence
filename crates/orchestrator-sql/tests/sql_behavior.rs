@@ -28,13 +28,9 @@ const TABLES: &[&str] = &[
     "technical_indicators",
     "memory_items",
     "memory_versions",
-    "memory_links",
-    "memory_search_fts",
     "predictions",
-    "run_archive",
     "outcomes",
     "candidate_experiences",
-    "system_metrics",
 ];
 
 const REMOVED_TABLES: &[&str] = &[
@@ -67,6 +63,16 @@ const REMOVED_TABLES: &[&str] = &[
     "technical_daily_indicators",
     "technical_3h_indicators",
     "technical_20min_indicators",
+    "events",
+    "run_phases",
+    "workflow_snapshots",
+    "market_regimes",
+    "memory_links",
+    "memory_metrics",
+    "agent_probabilities",
+    "memory_search_fts",
+    "external_source_items",
+    "run_archive",
 ];
 
 #[test]
@@ -84,6 +90,12 @@ fn ensure_schema_creates_only_current_tables_and_is_idempotent() {
     for table in REMOVED_TABLES {
         assert_eq!(table_exists(&conn, table), 0, "old table {table} survived");
     }
+    // system_metrics view was removed; prompt_metrics is the single source of truth.
+    assert_eq!(
+        view_exists(&conn, "system_metrics"),
+        0,
+        "system_metrics view should not exist"
+    );
 }
 
 #[test]
@@ -145,7 +157,6 @@ fn system_metrics_sync_updates_existing_prompt_metric_projection() {
         agent_count: 2,
         prediction_date: "2026-06-19".to_string(),
         ticker: "TQQQ".to_string(),
-        market_regime_json: json!({"regime": "trend"}),
     };
     assert_eq!(
         rewrite_system_metrics_from_prompt_metrics(&conn, &input).unwrap(),
@@ -158,18 +169,18 @@ fn system_metrics_sync_updates_existing_prompt_metric_projection() {
         rewrite_system_metrics_from_prompt_metrics(&conn, &input).unwrap(),
         1
     );
-    assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM system_metrics"), 1);
+    assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM prompt_metrics"), 1);
     assert_eq!(
         text_scalar(
             &conn,
-            "SELECT ticker FROM system_metrics WHERE run_id = 'run-1'"
+            "SELECT ticker FROM prompt_metrics WHERE run_id = 'run-1'"
         ),
         "QQQ"
     );
     assert_eq!(
         text_scalar(
             &conn,
-            "SELECT workflow_version FROM system_metrics WHERE run_id = 'run-1'"
+            "SELECT workflow_version FROM prompt_metrics WHERE run_id = 'run-1'"
         ),
         "v2"
     );
@@ -194,13 +205,6 @@ fn jin10_import_writes_compatibility_and_unified_source_items() {
 
     assert_eq!(imported, 1);
     assert_eq!(context_count(&conn, "jin10").unwrap(), 1);
-    assert_eq!(
-        scalar(
-            &conn,
-            "SELECT COUNT(*) FROM external_source_items WHERE source = 'jin10'"
-        ),
-        1
-    );
     assert_eq!(table_exists(&conn, "jin10_flash_items"), 0);
 
     let context = read_run_context(
@@ -338,10 +342,6 @@ fn source_items_write_dedicated_and_unified_tables() {
 
     assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM youtube_videos"), 1);
     assert_eq!(
-        scalar(&conn, "SELECT COUNT(*) FROM external_source_items"),
-        3
-    );
-    assert_eq!(
         write_source_item(
             &mut conn,
             &SourceItemInput {
@@ -360,13 +360,9 @@ fn source_items_write_dedicated_and_unified_tables() {
         1
     );
     assert_eq!(
-        scalar(&conn, "SELECT COUNT(*) FROM external_source_items"),
-        3
-    );
-    assert_eq!(
         text_scalar(
             &conn,
-            "SELECT content FROM external_source_items WHERE source = 'youtube' AND source_key = 'vid-1'"
+            "SELECT title FROM youtube_videos WHERE video_id = 'vid-1' AND ticker = 'TQQQ'"
         ),
         "Updated video title"
     );
@@ -604,6 +600,12 @@ fn compose_context_scores_trims_and_audits_blocks() {
         },
     )
     .unwrap();
+    conn.execute(
+        "INSERT INTO agent_turns (turn_id, session_id, run_id, created_at, updated_at) \
+         VALUES ('history-turn', 'session-1', 'run-1', '2026-06-19T12:00:00Z', '2026-06-19T12:00:00Z')",
+        [],
+    )
+    .unwrap();
     append_agent_turn_item(
         &conn,
         &AgentTurnItemInput {
@@ -620,6 +622,12 @@ fn compose_context_scores_trims_and_audits_blocks() {
     )
     .unwrap();
 
+    conn.execute(
+        "INSERT INTO agent_turns (turn_id, session_id, run_id, created_at, updated_at) \
+         VALUES ('turn-compose', 'session-1', 'run-1', '2026-06-19T12:00:00Z', '2026-06-19T12:00:00Z')",
+        [],
+    )
+    .unwrap();
     let composed = read_run_context(
         &mut conn,
         &RunContextReadRequest {
@@ -702,7 +710,7 @@ fn read_run_context_exposes_reflection_memory_contexts() {
     assert_eq!(prior_memory["query"], "prior_memory");
     assert_eq!(prior_memory["items"].as_array().unwrap().len(), 1);
     assert_eq!(prior_memory["items"][0]["ticker"], "TQQQ");
-    assert!(prior_memory["items"][0].get("body").is_some());
+    assert!(prior_memory["items"][0].get("body").is_none());
 
     let track_record = read_run_context(
         &mut conn,
@@ -724,6 +732,12 @@ fn read_run_context_exposes_reflection_memory_contexts() {
         1
     );
 
+    conn.execute(
+        "INSERT INTO agent_turns (turn_id, session_id, run_id, created_at, updated_at) \
+         VALUES ('turn-compose', 'session-1', 'run-1', '2026-06-19T12:00:00Z', '2026-06-19T12:00:00Z')",
+        [],
+    )
+    .unwrap();
     let composed = read_run_context(
         &mut conn,
         &RunContextReadRequest {
@@ -857,7 +871,6 @@ fn seed_reflection_context(conn: &rusqlite::Connection) {
             actual_return: 0.1,
             direction_correct: true,
             probability_error: -0.3,
-            market_regime_json: json!({}),
         },
     )
     .unwrap();
@@ -867,6 +880,15 @@ fn table_exists(conn: &rusqlite::Connection, table: &str) -> i64 {
     conn.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
         [table],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+fn view_exists(conn: &rusqlite::Connection, view: &str) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'view' AND name = ?1",
+        [view],
         |row| row.get(0),
     )
     .unwrap()
@@ -890,4 +912,22 @@ fn column_exists(conn: &rusqlite::Connection, table: &str, column: &str) -> bool
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap();
     columns.iter().any(|item| item == column)
+}
+
+
+#[test]
+fn context_count_rejects_unsafe_table_identifiers() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ctx.sqlite");
+    let conn = connect(&db_path).unwrap();
+    ensure_schema(&conn).unwrap();
+
+    // Malicious identifiers must not be interpolated; treat as zero.
+    assert_eq!(
+        context_count(&conn, "jin10; DROP TABLE jin10_items;--").unwrap(),
+        0
+    );
+    assert_eq!(context_count(&conn, "jin10'").unwrap(), 0);
+    // Safe known alias still works.
+    assert_eq!(context_count(&conn, "jin10").unwrap(), 0);
 }

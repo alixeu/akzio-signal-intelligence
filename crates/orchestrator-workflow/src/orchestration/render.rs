@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use orchestrator_core::{
     analyst_artifact_schema, final_validation_schema, portfolio_allocation_schema,
     replace_placeholders, research_artifact_schema, risk_constraints_schema, trade_intent_schema,
@@ -127,12 +127,10 @@ pub(crate) fn render_prompt_with_plugins(
         .get("next_agenda")
         .cloned()
         .unwrap_or_else(|| json!([]));
-    let common_ticker_prompt_template = common_component(prompt_path, "ticker.md")?;
     let analyst_output_contract_template =
         common_component(prompt_path, "analyst_output_contract.md")?;
     let anti_injection_template = common_component(prompt_path, "anti_injection.md")?;
     let research_calibration_template = common_component(prompt_path, "research_calibration.md")?;
-    let research_dedup_template = common_component(prompt_path, "research_dedup.md")?;
     let research_drivers_template = common_component(prompt_path, "research_drivers.md")?;
     let risk_analyst_template = common_component(prompt_path, "risk_analyst.md")?;
     let leveraged_etf_rules_template = common_component(prompt_path, "leveraged_etf_rules.md")?;
@@ -152,14 +150,11 @@ pub(crate) fn render_prompt_with_plugins(
         "final_validation_schema": final_validation_schema(),
         "portfolio_allocation_schema": portfolio_allocation_schema(),
     });
-    let common_ticker_prompt =
-        replace_placeholders(&common_ticker_prompt_template, &component_values);
     let analyst_output_contract =
         replace_placeholders(&analyst_output_contract_template, &component_values);
     let anti_injection = replace_placeholders(&anti_injection_template, &component_values);
     let research_calibration =
         replace_placeholders(&research_calibration_template, &component_values);
-    let research_dedup = replace_placeholders(&research_dedup_template, &component_values);
     let research_drivers = replace_placeholders(&research_drivers_template, &component_values);
     let leveraged_etf_rules =
         replace_placeholders(&leveraged_etf_rules_template, &component_values);
@@ -174,11 +169,10 @@ pub(crate) fn render_prompt_with_plugins(
     let static_values = json!({
         "ticker": ticker,
         "tickers": tickers.join(","),
-        "common_ticker_prompt": common_ticker_prompt,
+        "common_ticker_prompt": "",
         "analyst_output_contract": analyst_output_contract,
         "anti_injection": anti_injection,
         "research_calibration": research_calibration,
-        "research_dedup": research_dedup,
         "research_drivers": research_drivers,
         "leveraged_etf_rules": leveraged_etf_rules,
         "analyst_output_structure": analyst_output_structure,
@@ -229,15 +223,20 @@ pub(crate) fn render_prompt_with_plugins(
         }
     }
     if let Some(registry) = component_registry {
-        for plugin in registry.for_role(role) {
-            let rendered = replace_placeholders(&plugin.template, &values);
-            if let Some(map) = values.as_object_mut() {
-                map.insert(
-                    plugin.manifest.placeholder_key.clone(),
-                    Value::String(rendered),
-                );
-            }
-        }
+        registry.render_for_role(role, &mut values)?;
+    }
+    if template.contains("{common_ticker_prompt}")
+        && values
+            .get("common_ticker_prompt")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+    {
+        let path = prompt_path
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "<inline prompt>".to_string());
+        bail!(
+            "prompt {path} references {{common_ticker_prompt}} but no enabled ticker component injected it for role {role}"
+        );
     }
     // Risk-tier prompts use a shared component. Render it against the value set,
     // then expose the result so role files can include it via one placeholder.
@@ -259,17 +258,27 @@ mod tests {
     use serde_json::json;
     use tempfile::TempDir;
 
+    fn write_ticker_component(prompts: &std::path::Path, body: &str) {
+        std::fs::create_dir_all(prompts.join("components/ticker")).unwrap();
+        std::fs::write(
+            prompts.join("components/ticker/manifest.toml"),
+            r#"name = "ticker"
+injection_points = ["*"]
+priority = 10
+placeholder_key = "common_ticker_prompt"
+required_variables = ["ticker", "tickers"]
+"#,
+        )
+        .unwrap();
+        std::fs::write(prompts.join("components/ticker/component.md"), body).unwrap();
+    }
+
     #[test]
     fn render_prompt_injects_common_ticker_prompt() {
         let temp = TempDir::new().unwrap();
         let prompts = temp.path().join("prompts");
-        std::fs::create_dir_all(prompts.join("common")).unwrap();
         std::fs::create_dir_all(prompts.join("analysts")).unwrap();
-        std::fs::write(
-            prompts.join("common/ticker.md"),
-            "Ticker boundary: {ticker}; all: {tickers}",
-        )
-        .unwrap();
+        write_ticker_component(&prompts, "Ticker boundary: {ticker}; all: {tickers}");
         let prompt_path = prompts.join("analysts/test.md");
         std::fs::write(&prompt_path, "Role prompt\n{common_ticker_prompt}").unwrap();
         let state = json!({"ticker": "TQQQ", "tickers": ["TQQQ", "VIX"]});
@@ -294,24 +303,9 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let prompts = temp.path().join("prompts");
         std::fs::create_dir_all(prompts.join("common")).unwrap();
-        std::fs::create_dir_all(prompts.join("components/ticker")).unwrap();
         std::fs::create_dir_all(prompts.join("analysts")).unwrap();
         std::fs::write(prompts.join("common/ticker.md"), "LEGACY {ticker}").unwrap();
-        std::fs::write(
-            prompts.join("components/ticker/manifest.toml"),
-            r#"name = "ticker"
-injection_points = ["analyst.technical"]
-priority = 10
-placeholder_key = "common_ticker_prompt"
-required_variables = ["ticker"]
-"#,
-        )
-        .unwrap();
-        std::fs::write(
-            prompts.join("components/ticker/component.md"),
-            "PLUGIN {ticker}",
-        )
-        .unwrap();
+        write_ticker_component(&prompts, "PLUGIN {ticker}");
         let prompt_path = prompts.join("analysts/technical.md");
         std::fs::write(&prompt_path, "{common_ticker_prompt}").unwrap();
         let state = json!({"ticker": "QQQ", "tickers": ["QQQ"]});
@@ -339,7 +333,7 @@ required_variables = ["ticker"]
         let prompts = temp.path().join("prompts");
         std::fs::create_dir_all(prompts.join("common")).unwrap();
         std::fs::create_dir_all(prompts.join("analysts")).unwrap();
-        std::fs::write(prompts.join("common/ticker.md"), "TICK {ticker}").unwrap();
+        write_ticker_component(&prompts, "TICK {ticker}");
         std::fs::write(
             prompts.join("common/analyst_output_contract.md"),
             "CONTRACT for {ticker}",
@@ -381,7 +375,6 @@ required_variables = ["ticker"]
         let prompts = temp.path().join("prompts");
         std::fs::create_dir_all(prompts.join("common")).unwrap();
         std::fs::create_dir_all(prompts.join("analysts")).unwrap();
-        std::fs::write(prompts.join("common/ticker.md"), "TICK").unwrap();
         std::fs::write(
             prompts.join("common/analyst_output_contract.md"),
             "schema:\n{analyst_artifact_schema}",
@@ -415,7 +408,6 @@ required_variables = ["ticker"]
         let prompts = temp.path().join("prompts");
         std::fs::create_dir_all(prompts.join("common")).unwrap();
         std::fs::create_dir_all(prompts.join("analysts")).unwrap();
-        std::fs::write(prompts.join("common/ticker.md"), "TICK").unwrap();
         // No analyst_output_contract.md / anti_injection.md on disk.
         let prompt_path = prompts.join("analysts/technical.md");
         std::fs::write(
@@ -449,7 +441,7 @@ required_variables = ["ticker"]
         let prompts = temp.path().join("prompts");
         std::fs::create_dir_all(prompts.join("common")).unwrap();
         std::fs::create_dir_all(prompts.join("researchers")).unwrap();
-        std::fs::write(prompts.join("common/ticker.md"), "TICK {ticker}").unwrap();
+        write_ticker_component(&prompts, "TICK {ticker}");
         std::fs::write(
             prompts.join("common/researcher_seed.md"),
             "SHOULD NOT LOAD {side}",
@@ -512,7 +504,7 @@ required_variables = ["ticker"]
         let prompts = temp.path().join("prompts");
         std::fs::create_dir_all(prompts.join("common")).unwrap();
         std::fs::create_dir_all(prompts.join("researchers")).unwrap();
-        std::fs::write(prompts.join("common/ticker.md"), "TICK {ticker}").unwrap();
+        write_ticker_component(&prompts, "TICK {ticker}");
         std::fs::write(prompts.join("common/researcher_seed.md"), "SEED {side}").unwrap();
         std::fs::write(
             prompts.join("common/researcher_interaction.md"),
@@ -555,7 +547,6 @@ required_variables = ["ticker"]
         let prompts = temp.path().join("prompts");
         std::fs::create_dir_all(prompts.join("common")).unwrap();
         std::fs::create_dir_all(prompts.join("risk")).unwrap();
-        std::fs::write(prompts.join("common/ticker.md"), "").unwrap();
         std::fs::write(
             prompts.join("common/risk_analyst.md"),
             "shared body {trader_plan} {analyst_reports} {risk_history}",
@@ -635,7 +626,6 @@ required_variables = ["ticker"]
         "{analyst_output_contract}",
         "{anti_injection}",
         "{research_calibration}",
-        "{research_dedup}",
         "{research_drivers}",
         "{leveraged_etf_rules}",
         "{analyst_output_structure}",
@@ -675,7 +665,7 @@ required_variables = ["ticker"]
             "trader_investment_plan": {"action": "Hold"},
             "risk_debate_state": {"history": []},
             "final_trade_decision": {"rating": "Hold"},
-            "allocation_context": {"investable_tickers": ["QQQ", "SOXX"]}
+            "allocation_context": {"investable_assets": ["QQQ", "SOXX"]}
         })
     }
 

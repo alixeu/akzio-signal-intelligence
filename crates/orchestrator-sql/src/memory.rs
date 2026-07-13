@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::{candidate::CandidateExperience, ensure_schema, AGGREGATE_TICKER};
+use crate::{candidate::CandidateExperience, AGGREGATE_TICKER};
 
 #[derive(Debug, Clone)]
 pub struct PriorMemoryQuery {
@@ -27,7 +27,6 @@ pub fn promote_candidate_to_memory(
     conn: &Connection,
     input: &PromoteMemoryInput,
 ) -> Result<String> {
-    ensure_schema(conn)?;
     let memory_id = format!("mem-{}", Uuid::new_v4());
     let version_id = format!("memv-{}", Uuid::new_v4());
     let now = Utc::now().to_rfc3339();
@@ -49,9 +48,9 @@ pub fn promote_candidate_to_memory(
         r#"
         INSERT INTO memory_items
             (memory_id, ticker, scope, memory_type, status, current_version_id, confidence,
-             expires_at, source_run_id, source_role, created_at, updated_at, market_regime_json,
+             expires_at, created_at, updated_at, market_regime_json,
              quality_score, sample_count, recent_success_rate, reflection_version, promoted_from)
-        VALUES (?, ?, ?, ?, 'active', ?, ?, NULL, '', 'reflection', ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, 'active', ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
         params![
             memory_id,
@@ -74,9 +73,9 @@ pub fn promote_candidate_to_memory(
         r#"
         INSERT INTO memory_versions
             (version_id, memory_id, version_index, summary, body_json, evidence_refs_json,
-             invalidation_conditions_json, follow_up_checks_json, source_run_id, source_role,
+             source_run_id, source_role,
              source_date, observed_at, content_hash, created_at)
-        VALUES (?, ?, 1, ?, ?, ?, '[]', '[]', '', 'reflection', ?, ?, ?, ?)
+        VALUES (?, ?, 1, ?, ?, ?, '', 'reflection', ?, ?, ?, ?)
         "#,
         params![
             version_id,
@@ -90,7 +89,6 @@ pub fn promote_candidate_to_memory(
             now,
         ],
     )?;
-    refresh_memory_fts(conn, &memory_id)?;
     Ok(memory_id)
 }
 
@@ -102,7 +100,6 @@ pub fn degrade_stale_memories(
     min_quality: f64,
     except_promoted_from: Option<i64>,
 ) -> Result<usize> {
-    ensure_schema(conn)?;
     let updated = conn.execute(
         r#"
         UPDATE memory_items
@@ -129,7 +126,6 @@ pub fn degrade_stale_memories(
 }
 
 pub fn read_prior_memory(conn: &Connection, query: &PriorMemoryQuery) -> Result<Value> {
-    ensure_schema(conn)?;
     let mut candidates = active_memory_candidates(conn, query)?;
     candidates.sort_by(|a, b| {
         b.quality_score
@@ -256,40 +252,6 @@ fn active_memory_candidates(
         }
     }
     Ok(candidates)
-}
-
-pub fn refresh_memory_fts(conn: &Connection, memory_id: &str) -> Result<()> {
-    conn.execute(
-        "DELETE FROM memory_search_fts WHERE memory_id = ?",
-        params![memory_id],
-    )?;
-    let row = conn.query_row(
-        r#"
-        SELECT i.memory_id, v.version_id, i.ticker, i.memory_type, i.status, v.summary, v.body_json
-        FROM memory_items i
-        JOIN memory_versions v ON v.version_id = i.current_version_id
-        WHERE i.memory_id = ?
-        "#,
-        params![memory_id],
-        |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, String>(6)?,
-            ))
-        },
-    )?;
-    if row.4 == "active" {
-        conn.execute(
-            "INSERT INTO memory_search_fts (memory_id, version_id, ticker, memory_type, summary, search_text) VALUES (?, ?, ?, ?, ?, ?)",
-            params![row.0, row.1, row.2, row.3, row.5, row.6],
-        )?;
-    }
-    Ok(())
 }
 
 fn scope_value_as_ticker(candidate: &CandidateExperience) -> String {

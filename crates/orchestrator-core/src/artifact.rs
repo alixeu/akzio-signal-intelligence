@@ -83,6 +83,30 @@ pub struct RiskConstraints {
     pub argument: String,
     #[serde(default)]
     pub recommended_adjustment: String,
+    /// none | tight | trailing | event_based | time_based
+    #[serde(default)]
+    pub stop_type: String,
+    /// 0.0-1.0 fraction of capital at risk before stopping.
+    #[serde(default)]
+    pub max_drawdown_pct: f64,
+    /// 0.0-1.0 maximum single-position weight cap.
+    #[serde(default)]
+    pub position_cap_pct: f64,
+    /// Condition that triggers a portfolio rebalance.
+    #[serde(default)]
+    pub rebalance_trigger: String,
+    /// Condition that forces a risk-off / de-risk event.
+    #[serde(default)]
+    pub risk_off_trigger: String,
+    /// How long until the risk view is revisited (human readable).
+    #[serde(default)]
+    pub review_window: String,
+    /// Cash-hedge recommendation (size / instrument / rationale).
+    #[serde(default)]
+    pub cash_hedge_recommendation: String,
+    /// 0.0-1.0 confidence in the constraints themselves.
+    #[serde(default)]
+    pub constraint_confidence: f64,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -144,6 +168,12 @@ pub struct AnalystTickerArtifact {
     /// already_priced | under_priced | unclear
     #[serde(default)]
     pub priced_in: String,
+    /// low | medium | high
+    #[serde(default)]
+    pub echo_chamber_risk: String,
+    /// low | medium | high
+    #[serde(default)]
+    pub crowded_consensus_risk: String,
     /// Observations that would strengthen or overturn the current call.
     #[serde(default)]
     pub validation_triggers: Vec<String>,
@@ -165,6 +195,22 @@ pub struct EvidenceItem {
     /// ISO date when the evidence was observed or published.
     #[serde(default)]
     pub timestamp: String,
+    /// Source quality tier: official | major_media | professional_research |
+    /// longform_analysis | social_verified | social_unverified | unknown.
+    #[serde(default)]
+    pub source_tier: String,
+    /// Earliest traceable origin of the information (attribution).
+    #[serde(default)]
+    pub first_source: String,
+    /// Whether this is a repost / derivative of earlier-reported information.
+    #[serde(default)]
+    pub is_derivative_repost: bool,
+    /// Human-readable evidence age: "0-2d" | "3-5d" | "6-10d" | "10d+" | "unknown".
+    #[serde(default)]
+    pub evidence_age: String,
+    /// 0.0-1.0 confidence in the quality of the source.
+    #[serde(default)]
+    pub source_confidence: f64,
 }
 
 /// Deserialize key_evidence accepting both structured objects and plain strings.
@@ -185,6 +231,11 @@ where
                 evidence_type: "unclassified".to_string(),
                 source: String::new(),
                 timestamp: String::new(),
+                source_tier: String::new(),
+                first_source: String::new(),
+                is_derivative_repost: false,
+                evidence_age: String::new(),
+                source_confidence: 0.0,
             }),
             Value::Object(_) => serde_json::from_value::<EvidenceItem>(value)
                 .map_err(|error| Error::custom(format!("invalid evidence item: {error}"))),
@@ -196,6 +247,15 @@ where
 pub fn validate_evidence_types(
     artifact: &AnalystTickerArtifact,
 ) -> std::result::Result<(), String> {
+    const ALLOWED_SOURCE_TIERS: &[&str] = &[
+        "official",
+        "major_media",
+        "professional_research",
+        "longform_analysis",
+        "social_verified",
+        "social_unverified",
+        "unknown",
+    ];
     for evidence in &artifact.key_evidence {
         match evidence.evidence_type.as_str() {
             "fact" | "opinion" | "speculation" | "unclassified" => {}
@@ -206,6 +266,97 @@ pub fn validate_evidence_types(
                 ));
             }
         }
+        if !evidence.source_tier.is_empty()
+            && !ALLOWED_SOURCE_TIERS.contains(&evidence.source_tier.as_str())
+        {
+            return Err(format!(
+                "invalid source_tier '{}' in evidence '{}'; must be one of: {}",
+                evidence.source_tier,
+                evidence.claim,
+                ALLOWED_SOURCE_TIERS.join(", ")
+            ));
+        }
+        for (field, value) in [
+            ("echo_chamber_risk", artifact.echo_chamber_risk.as_str()),
+            (
+                "crowded_consensus_risk",
+                artifact.crowded_consensus_risk.as_str(),
+            ),
+        ] {
+            if !value.is_empty() && !["low", "medium", "high"].contains(&value) {
+                return Err(format!(
+                    "invalid {field} '{value}'; must be low, medium, high, or empty"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate machine-read fields on an analyst per-ticker payload.
+///
+/// Enforces the contract promised by `analyst_output_contract.md`:
+/// `direction` and `confidence` must exist and be legal, and evidence typing
+/// must pass `validate_evidence_types`.
+pub fn validate_analyst_ticker_artifact(
+    artifact: &AnalystTickerArtifact,
+) -> std::result::Result<(), String> {
+    const ALLOWED_DIRECTIONS: &[&str] =
+        &["bullish", "bearish", "neutral", "mixed", "unobserved"];
+    if !ALLOWED_DIRECTIONS.contains(&artifact.direction.as_str()) {
+        return Err(format!(
+            "invalid direction '{}'; must be one of: {}",
+            artifact.direction,
+            ALLOWED_DIRECTIONS.join(", ")
+        ));
+    }
+    if !(0.0..=1.0).contains(&artifact.confidence) {
+        return Err(format!(
+            "confidence {} out of range; must be in [0.0, 1.0]",
+            artifact.confidence
+        ));
+    }
+    validate_evidence_types(artifact)
+}
+
+
+/// Validate a parsed `RiskConstraints` artifact for well-formed enum and
+/// range values. Tolerant of empty / zero (unspecified) fields so legacy
+/// artifacts continue to deserialize.
+pub fn validate_risk_constraints(artifact: &RiskConstraints) -> std::result::Result<(), String> {
+    const ALLOWED_STOP_TYPES: &[&str] =
+        &["none", "tight", "trailing", "event_based", "time_based", ""];
+    if !ALLOWED_STOP_TYPES.contains(&artifact.stop_type.as_str()) {
+        return Err(format!(
+            "invalid stop_type '{}'; must be one of: {}",
+            artifact.stop_type,
+            ALLOWED_STOP_TYPES
+                .iter()
+                .filter(|s| !s.is_empty())
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if artifact.max_drawdown_pct != 0.0 && !(0.0..=1.0).contains(&artifact.max_drawdown_pct) {
+        return Err(format!(
+            "max_drawdown_pct {} out of range; must be in [0.0, 1.0] when specified",
+            artifact.max_drawdown_pct
+        ));
+    }
+    if artifact.position_cap_pct != 0.0 && !(0.0..=1.0).contains(&artifact.position_cap_pct) {
+        return Err(format!(
+            "position_cap_pct {} out of range; must be in [0.0, 1.0] when specified",
+            artifact.position_cap_pct
+        ));
+    }
+    if artifact.constraint_confidence != 0.0
+        && !(0.0..=1.0).contains(&artifact.constraint_confidence)
+    {
+        return Err(format!(
+            "constraint_confidence {} out of range; must be in [0.0, 1.0] when specified",
+            artifact.constraint_confidence
+        ));
     }
     Ok(())
 }
@@ -466,14 +617,217 @@ mod tests {
                 evidence_type: "rumor".to_string(),
                 source: String::new(),
                 timestamp: String::new(),
+                source_tier: String::new(),
+                first_source: String::new(),
+                is_derivative_repost: false,
+                evidence_age: String::new(),
+                source_confidence: 0.0,
             }],
             priced_in: String::new(),
+            echo_chamber_risk: String::new(),
+            crowded_consensus_risk: String::new(),
             validation_triggers: Vec::new(),
             data_gaps: Vec::new(),
         };
 
         let error = validate_evidence_types(&artifact).unwrap_err();
         assert!(error.contains("invalid evidence_type 'rumor'"));
+    }
+
+    #[test]
+    fn analyst_schema_lists_new_quality_fields() {
+        let schema = analyst_artifact_schema();
+        for field in [
+            "source_tier",
+            "first_source",
+            "is_derivative_repost",
+            "evidence_age",
+            "source_confidence",
+            "echo_chamber_risk",
+            "crowded_consensus_risk",
+        ] {
+            assert!(
+                schema.contains(field),
+                "analyst schema missing field {field}"
+            );
+        }
+        serde_json::from_str::<Value>(&schema).expect("analyst schema is valid JSON");
+    }
+
+    #[test]
+    fn risk_constraints_schema_lists_new_structured_fields() {
+        let schema = risk_constraints_schema();
+        for field in [
+            "stop_type",
+            "max_drawdown_pct",
+            "position_cap_pct",
+            "rebalance_trigger",
+            "risk_off_trigger",
+            "review_window",
+            "cash_hedge_recommendation",
+            "constraint_confidence",
+        ] {
+            assert!(schema.contains(field), "risk schema missing field {field}");
+        }
+        serde_json::from_str::<Value>(&schema).expect("risk schema is valid JSON");
+    }
+
+    #[test]
+    fn validate_evidence_types_rejects_invalid_source_tier() {
+        let artifact = AnalystTickerArtifact {
+            direction: "bullish".to_string(),
+            confidence: 0.7,
+            report: String::new(),
+            key_evidence: vec![EvidenceItem {
+                claim: "a claim".to_string(),
+                evidence_type: "fact".to_string(),
+                source: String::new(),
+                timestamp: String::new(),
+                source_tier: "garbage".to_string(),
+                first_source: String::new(),
+                is_derivative_repost: false,
+                evidence_age: String::new(),
+                source_confidence: 0.0,
+            }],
+            priced_in: String::new(),
+            echo_chamber_risk: String::new(),
+            crowded_consensus_risk: String::new(),
+            validation_triggers: Vec::new(),
+            data_gaps: Vec::new(),
+        };
+        let error = validate_evidence_types(&artifact).unwrap_err();
+        assert!(error.contains("invalid source_tier 'garbage'"));
+    }
+
+    #[test]
+    fn validate_evidence_types_rejects_invalid_echo_chamber_risk() {
+        let artifact = AnalystTickerArtifact {
+            direction: "bullish".to_string(),
+            confidence: 0.7,
+            report: String::new(),
+            key_evidence: vec![EvidenceItem {
+                claim: "a claim".to_string(),
+                evidence_type: "fact".to_string(),
+                source: String::new(),
+                timestamp: String::new(),
+                source_tier: String::new(),
+                first_source: String::new(),
+                is_derivative_repost: false,
+                evidence_age: String::new(),
+                source_confidence: 0.0,
+            }],
+            priced_in: String::new(),
+            echo_chamber_risk: "extreme".to_string(),
+            crowded_consensus_risk: String::new(),
+            validation_triggers: Vec::new(),
+            data_gaps: Vec::new(),
+        };
+        let error = validate_evidence_types(&artifact).unwrap_err();
+        assert!(error.contains("invalid echo_chamber_risk 'extreme'"));
+    }
+
+    #[test]
+    fn validate_risk_constraints_rejects_out_of_range_drawdown() {
+        let artifact = RiskConstraints {
+            stance: "neutral".to_string(),
+            argument: String::new(),
+            recommended_adjustment: String::new(),
+            stop_type: String::new(),
+            max_drawdown_pct: 1.5,
+            position_cap_pct: 0.0,
+            rebalance_trigger: String::new(),
+            risk_off_trigger: String::new(),
+            review_window: String::new(),
+            cash_hedge_recommendation: String::new(),
+            constraint_confidence: 0.0,
+            extra: Map::new(),
+        };
+        let error = validate_risk_constraints(&artifact).unwrap_err();
+        assert!(error.contains("max_drawdown_pct 1.5 out of range"));
+    }
+
+    #[test]
+    fn validate_risk_constraints_rejects_invalid_stop_type() {
+        let artifact = RiskConstraints {
+            stance: "neutral".to_string(),
+            argument: String::new(),
+            recommended_adjustment: String::new(),
+            stop_type: "weird".to_string(),
+            max_drawdown_pct: 0.0,
+            position_cap_pct: 0.0,
+            rebalance_trigger: String::new(),
+            risk_off_trigger: String::new(),
+            review_window: String::new(),
+            cash_hedge_recommendation: String::new(),
+            constraint_confidence: 0.0,
+            extra: Map::new(),
+        };
+        let error = validate_risk_constraints(&artifact).unwrap_err();
+        assert!(error.contains("invalid stop_type 'weird'"));
+    }
+
+    #[test]
+    fn analyst_artifact_with_new_fields_round_trips() {
+        let json = r#"{
+            "direction": "bullish",
+            "confidence": 0.7,
+            "echo_chamber_risk": "medium",
+            "crowded_consensus_risk": "high",
+            "key_evidence": [
+                {
+                    "claim": "CPI 3.2%",
+                    "evidence_type": "fact",
+                    "source": "BLS",
+                    "timestamp": "2026-07-06",
+                    "source_tier": "official",
+                    "first_source": "BLS release",
+                    "is_derivative_repost": false,
+                    "evidence_age": "0-2d",
+                    "source_confidence": 0.9
+                }
+            ]
+        }"#;
+        let artifact: AnalystTickerArtifact = serde_json::from_str(json).unwrap();
+        assert_eq!(artifact.echo_chamber_risk, "medium");
+        assert_eq!(artifact.crowded_consensus_risk, "high");
+        assert_eq!(artifact.key_evidence[0].source_tier, "official");
+        assert_eq!(artifact.key_evidence[0].first_source, "BLS release");
+        assert!(!artifact.key_evidence[0].is_derivative_repost);
+        assert_eq!(artifact.key_evidence[0].evidence_age, "0-2d");
+        assert!((artifact.key_evidence[0].source_confidence - 0.9).abs() < f64::EPSILON);
+
+        // Legacy artifact without new fields still deserializes via serde(default).
+        let legacy: AnalystTickerArtifact =
+            serde_json::from_str(r#"{"direction":"neutral","confidence":0.5}"#).unwrap();
+        assert_eq!(legacy.echo_chamber_risk, "");
+        assert_eq!(legacy.crowded_consensus_risk, "");
+        assert!(legacy.key_evidence.is_empty());
+    }
+
+    #[test]
+    fn risk_constraints_with_new_fields_round_trips() {
+        let json = r#"{
+            "stance": "conservative",
+            "recommended_adjustment": "Cap exposure at 50%.",
+            "stop_type": "trailing",
+            "max_drawdown_pct": 0.15,
+            "position_cap_pct": 0.5,
+            "rebalance_trigger": "VIX > 25",
+            "risk_off_trigger": "Overnight gap > 3%",
+            "review_window": "3d",
+            "cash_hedge_recommendation": "Hold 20% cash.",
+            "constraint_confidence": 0.8
+        }"#;
+        let artifact: RiskConstraints = serde_json::from_str(json).unwrap();
+        assert_eq!(artifact.stop_type, "trailing");
+        assert!((artifact.max_drawdown_pct - 0.15).abs() < f64::EPSILON);
+        assert!((artifact.position_cap_pct - 0.5).abs() < f64::EPSILON);
+        assert_eq!(artifact.rebalance_trigger, "VIX > 25");
+        assert_eq!(artifact.risk_off_trigger, "Overnight gap > 3%");
+        assert_eq!(artifact.review_window, "3d");
+        assert_eq!(artifact.cash_hedge_recommendation, "Hold 20% cash.");
+        assert!((artifact.constraint_confidence - 0.8).abs() < f64::EPSILON);
+        assert!(validate_risk_constraints(&artifact).is_ok());
     }
 
     fn valid_scenarios() -> Scenarios {
@@ -670,4 +1024,39 @@ mod tests {
             }
         }
     }
+
+
+    #[test]
+    fn validate_analyst_ticker_artifact_rejects_bad_direction() {
+        let artifact = AnalystTickerArtifact {
+            direction: "sideways".to_string(),
+            confidence: 0.5,
+            report: String::new(),
+            key_evidence: Vec::new(),
+            priced_in: String::new(),
+            echo_chamber_risk: String::new(),
+            crowded_consensus_risk: String::new(),
+            validation_triggers: Vec::new(),
+            data_gaps: Vec::new(),
+        };
+        let err = validate_analyst_ticker_artifact(&artifact).unwrap_err();
+        assert!(err.contains("invalid direction"));
+    }
+
+    #[test]
+    fn validate_analyst_ticker_artifact_accepts_valid_payload() {
+        let artifact = AnalystTickerArtifact {
+            direction: "bullish".to_string(),
+            confidence: 0.7,
+            report: "ok".to_string(),
+            key_evidence: Vec::new(),
+            priced_in: String::new(),
+            echo_chamber_risk: String::new(),
+            crowded_consensus_risk: String::new(),
+            validation_triggers: Vec::new(),
+            data_gaps: Vec::new(),
+        };
+        validate_analyst_ticker_artifact(&artifact).unwrap();
+    }
+
 }

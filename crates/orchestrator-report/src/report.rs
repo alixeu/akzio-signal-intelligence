@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use chrono::Local;
 use clap::{Args, ValueEnum};
 use html_escape::encode_text;
-use orchestrator_core::{config_float, config_str};
+use orchestrator_core::{config_float, config_str, config_strings, display_ticker, run_slug};
 use serde_json::{json, Value};
 use std::{fs, path::PathBuf, process::Command};
 
@@ -17,66 +17,36 @@ pub enum ReportMode {
 pub struct ReportArgs {
     #[arg(long, value_enum, default_value_t = ReportMode::BuildAndSend)]
     pub mode: ReportMode,
-    #[arg(long)]
-    pub payload_path: Option<PathBuf>,
-    #[arg(long)]
-    pub html_path: Option<PathBuf>,
 }
 
 pub fn run(args: ReportArgs) -> Result<Value> {
     let config = crate::config::load_default_config();
-    let today = Local::now().date_naive().to_string();
-    let report_dir = crate::config::project_path_from_config(config_str(
-        &config,
-        "report.output_dir",
-        "outputs/TQQQ",
-    ));
-    fs::create_dir_all(&report_dir)?;
-    let payload_path = args.payload_path.clone().unwrap_or_else(|| {
-        report_dir.join(format!("daily_tqqq_strategy_report_{today}.payload.json"))
-    });
-    let html_path = args
-        .html_path
-        .clone()
-        .unwrap_or_else(|| report_dir.join(format!("daily_tqqq_strategy_report_{today}.html")));
-    let mut payload = if matches!(args.mode, ReportMode::Send) {
-        serde_json::from_str(&fs::read_to_string(&payload_path)?)?
+    let tickers = config_strings(&config, "orchestrator.analysis_universe", &[]);
+    let slug = if tickers.is_empty() {
+        "TQQQ".to_string()
     } else {
-        build_payload(&today, &html_path, &payload_path, &config)?
+        run_slug(&tickers)
     };
-    if matches!(args.mode, ReportMode::Build | ReportMode::BuildAndSend) {
-        let html = build_html(&payload);
-        fs::write(&html_path, &html)?;
-        payload["html_body"] = Value::String(html);
-        fs::write(&payload_path, serde_json::to_string_pretty(&payload)?)?;
-    }
+    let today = Local::now().date_naive().to_string();
+    let payload = build_payload(&today, &slug, &tickers)?;
     let mut result = json!({
         "subject": payload.get("subject").and_then(Value::as_str).unwrap_or("Daily TQQQ Strategy Report"),
         "orchestrator_status": payload.get("orchestrator_status").and_then(Value::as_str).unwrap_or("unknown")
     });
     if matches!(args.mode, ReportMode::Send | ReportMode::BuildAndSend) {
-        let email = send_report(&payload)?;
+        let html = build_html(&payload);
+        let email = send_report(&config, &slug, &payload, &html)?;
         result["email_status"] = email["status"].clone();
         result["email_detail"] = email["detail"].clone();
     }
     Ok(result)
 }
 
-fn build_payload(
-    today: &str,
-    html_path: &PathBuf,
-    payload_path: &PathBuf,
-    config: &Value,
-) -> Result<Value> {
+fn build_payload(today: &str, slug: &str, tickers: &[String]) -> Result<Value> {
     let run_dir = if let Ok(value) = std::env::var("CODEX_ORCH_RUN_DIR") {
         PathBuf::from(value)
     } else {
-        let pattern = config_str(
-            config,
-            "report.default_run_dir_pattern",
-            "outputs/QQQ_VIX_SOXX/{date}_exec",
-        );
-        crate::config::project_path_from_config(pattern.replace("{date}", today))
+        crate::config::project_path_from_config(format!("outputs/{}/{}_exec", slug, today))
     };
     let state_path = run_dir.join("state.json");
     let final_summary_path = run_dir.join("final_summary.md");
@@ -85,34 +55,18 @@ fn build_payload(
     } else {
         json!({})
     };
-
-    // Generate the structured human-readable report from state artifacts.
     let report_markdown = crate::builder::build_human_readable_report(&state);
     let report_html = crate::builder::report_to_html(&report_markdown);
-    let report_md_path = run_dir.join("report.md");
-    if let Some(parent) = report_md_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(&report_md_path, &report_markdown)?;
-
-    // Preserve final_summary.md content for backward compatibility with any
-    // callers that still read the raw field.
     let final_summary = fs::read_to_string(&final_summary_path).unwrap_or_default();
 
     Ok(json!({
-        "subject": config_str(config, "report.subject_template", "TQQQ strategy report {date}").replace("{date}", today),
+        "subject": format!("{} strategy report {}", display_ticker(tickers), today),
         "today": today,
-        "orchestrator_status": if state_path.exists() && report_md_path.exists() { "complete" } else { "missing" },
+        "orchestrator_status": if state_path.exists() { "complete" } else { "missing" },
         "run_dir": run_dir,
-        "state_path": state_path,
-        "final_summary_path": final_summary_path,
-        "report_md_path": report_md_path,
-        "html_path": html_path,
-        "payload_path": payload_path,
         "orchestrator_state": state,
         "report_markdown": report_markdown,
         "report_html": report_html,
-        // Keep final_summary for backward compat (raw final_summary.md text).
         "final_summary": final_summary
     }))
 }
@@ -122,15 +76,11 @@ fn build_html(payload: &Value) -> String {
         .get("subject")
         .and_then(Value::as_str)
         .unwrap_or("Daily Report");
-
-    // Use the structured report HTML when the builder produced one.
     if let Some(report_html) = payload.get("report_html").and_then(Value::as_str) {
         if !report_html.is_empty() {
             return report_html.to_string();
         }
     }
-
-    // Fallback to the legacy raw <pre> wrapper for backward compatibility.
     let summary = payload
         .get("final_summary")
         .and_then(Value::as_str)
@@ -181,38 +131,32 @@ fn allocation_html(payload: &Value) -> String {
     )
 }
 
-fn send_report(payload: &Value) -> Result<Value> {
-    let config = crate::config::load_default_config();
-    if config_str(&config, "report.email.enabled", "true") == "false" {
+fn send_report(config: &Value, slug: &str, payload: &Value, html: &str) -> Result<Value> {
+    if config_str(config, "report.email.enabled", "true") == "false" {
         return Ok(json!({"status": "skipped", "detail": "report.email.enabled=false"}));
     }
-    let state_path = crate::config::project_path_from_config(config_str(
-        &config,
-        "report.email.state_path",
-        "outputs/TQQQ/report_email_state.json",
+    let state_path = crate::config::project_path_from_config(format!(
+        "outputs/{}/report_email_state.json",
+        slug
     ));
     let state = fs::read_to_string(&state_path)
         .ok()
         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
         .unwrap_or_else(|| json!({}));
-    let probability_threshold = config_float(&config, "report.email.probability_threshold", 0.68);
+    let probability_threshold = config_float(config, "report.email.probability_threshold", 0.68);
     let decision = email_decision(payload, &state, probability_threshold);
     if !decision.should_send {
         return Ok(json!({"status": "skipped", "detail": decision.reason}));
     }
-    let html_path = payload
-        .get("html_path")
-        .and_then(Value::as_str)
-        .unwrap_or("");
     let subject = payload
         .get("subject")
         .and_then(Value::as_str)
         .unwrap_or("Daily Report");
-    let smtp_url = config_str(&config, "report.email.smtp_url", "");
-    let username = config_str(&config, "report.email.username", "");
-    let password = config_str(&config, "report.email.password", "");
-    let from = config_str(&config, "report.email.from", &username);
-    let to = config_str(&config, "report.email.to", "");
+    let smtp_url = config_str(config, "report.email.smtp_url", "");
+    let username = config_str(config, "report.email.username", "");
+    let password = config_str(config, "report.email.password", "");
+    let from = config_str(config, "report.email.from", &username);
+    let to = config_str(config, "report.email.to", "");
     if [
         smtp_url.as_str(),
         username.as_str(),
@@ -225,14 +169,12 @@ fn send_report(payload: &Value) -> Result<Value> {
     {
         bail!("report.email requires smtp_url, username, password, from, and to");
     }
-    let message_path = PathBuf::from(html_path).with_extension("eml");
-    fs::write(
-        &message_path,
-        format!(
-            "From: {from}\nTo: {to}\nSubject: {subject}\nMIME-Version: 1.0\nContent-Type: text/html; charset=utf-8\n\n{}",
-            fs::read_to_string(html_path)?
-        ),
-    )?;
+    let eml = format!(
+        "From: {from}\nTo: {to}\nSubject: {subject}\nMIME-Version: 1.0\nContent-Type: text/html; charset=utf-8\n\n{html}"
+    );
+    let temp_dir = tempfile::tempdir()?;
+    let message_path = temp_dir.path().join("message.eml");
+    fs::write(&message_path, &eml)?;
     let status = Command::new("curl")
         .arg("--ssl-reqd")
         .arg("--url")
@@ -360,17 +302,15 @@ mod tests {
     }
 
     #[test]
-    fn build_payload_creates_missing_run_dir_for_report_markdown() {
+    fn build_payload_reads_state_from_run_dir() {
         let temp = tempfile::tempdir().unwrap();
-        let run_dir = temp.path().join("missing-run-dir");
-        let html_path = temp.path().join("report.html");
-        let payload_path = temp.path().join("payload.json");
+        let run_dir = temp.path().join("run-dir");
+        fs::create_dir_all(&run_dir).unwrap();
+        fs::write(run_dir.join("state.json"), "{}").unwrap();
         std::env::set_var("CODEX_ORCH_RUN_DIR", &run_dir);
-        let payload = build_payload("2026-06-19", &html_path, &payload_path, &json!({})).unwrap();
+        let payload = build_payload("2026-06-19", "TQQQ", &[]).unwrap();
         std::env::remove_var("CODEX_ORCH_RUN_DIR");
-
-        assert_eq!(payload["orchestrator_status"], "missing");
-        assert!(run_dir.join("report.md").exists());
+        assert_eq!(payload["orchestrator_status"], "complete");
     }
 
     #[test]

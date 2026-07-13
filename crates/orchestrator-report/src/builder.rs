@@ -206,6 +206,11 @@ fn bull_case(debate: &Value) -> String {
             section.push_str(&format!("{}. {}\n", i + 1, text));
         }
     }
+    let quality = collect_evidence_quality(debate, "bull");
+    if !quality.is_empty() {
+        section.push_str("\n\n**Source Quality:**\n");
+        section.push_str(&quality);
+    }
     section
 }
 
@@ -222,6 +227,11 @@ fn bear_case(debate: &Value) -> String {
                     .unwrap_or("(no description)");
                 section.push_str(&format!("{}. {}\n", i + 1, text));
             }
+            let quality = collect_evidence_quality(debate, "bear");
+            if !quality.is_empty() {
+                section.push_str("\n\n**Source Quality:**\n");
+                section.push_str(&quality);
+            }
             return section;
         }
     }
@@ -234,6 +244,11 @@ fn bear_case(debate: &Value) -> String {
         for (i, text) in evidence.iter().take(3).enumerate() {
             section.push_str(&format!("{}. {}\n", i + 1, text));
         }
+    }
+    let quality = collect_evidence_quality(debate, "bear");
+    if !quality.is_empty() {
+        section.push_str("\n\n**Source Quality:**\n");
+        section.push_str(&quality);
     }
     section
 }
@@ -282,6 +297,77 @@ fn extract_debate_evidence(debate: &Value, side: &str) -> Vec<String> {
         }
     }
     evidence
+}
+
+/// Collect per-evidence source-quality and ticker-level consensus-risk
+/// metadata for one debate side ("bull" / "bear"). Returns a Markdown-ready
+/// string (empty when no structured quality data is present). Defensive:
+/// missing fields are skipped, plain-string evidence is ignored.
+fn collect_evidence_quality(debate: &Value, side: &str) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    if let Some(turns) = debate.get("debate_turns").and_then(Value::as_array) {
+        for turn in turns {
+            let role = turn.get("role").and_then(Value::as_str).unwrap_or("");
+            if !role.to_ascii_lowercase().contains(side) {
+                continue;
+            }
+            let artifact = turn.get("artifact").unwrap_or(&Value::Null);
+            if let Some(per_ticker) = artifact.get("per_ticker").and_then(Value::as_object) {
+                for data in per_ticker.values() {
+                    for field in ["echo_chamber_risk", "crowded_consensus_risk"] {
+                        if let Some(value) = data.get(field).and_then(Value::as_str) {
+                            if !value.trim().is_empty() {
+                                lines.push(format!("- {}: {}", field.replace('_', " "), value));
+                            }
+                        }
+                    }
+                    if let Some(items) = data.get("key_evidence").and_then(Value::as_array) {
+                        for item in items {
+                            if let Some(obj) = item.as_object() {
+                                let tier =
+                                    obj.get("source_tier").and_then(Value::as_str).unwrap_or("");
+                                let first = obj
+                                    .get("first_source")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("");
+                                let mut bits: Vec<String> = Vec::new();
+                                if !tier.is_empty() {
+                                    bits.push(format!("source tier: {tier}"));
+                                }
+                                if !first.is_empty() {
+                                    bits.push(format!("first source: {first}"));
+                                }
+                                if let Some(true) =
+                                    obj.get("is_derivative_repost").and_then(Value::as_bool)
+                                {
+                                    bits.push("derivative repost".to_string());
+                                }
+                                if !bits.is_empty() {
+                                    let claim =
+                                        obj.get("claim").and_then(Value::as_str).unwrap_or("");
+                                    lines.push(format!("- {claim} ({})", bits.join(", ")));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    lines.join("\n")
+}
+
+fn risk_field_str<'a>(rc: &'a Value, field: &str) -> Option<&'a str> {
+    rc.get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn risk_field_pct(rc: &Value, field: &str) -> Option<String> {
+    rc.get(field)
+        .and_then(Value::as_f64)
+        .filter(|value| *value != 0.0)
+        .map(|value| format!("{:.0}%", value * 100.0))
 }
 
 fn risk_assessment(risk_state: &Value, allocation: &Value) -> String {
@@ -374,6 +460,37 @@ fn risk_assessment(risk_state: &Value, allocation: &Value) -> String {
     } else {
         for risk in risks.iter().take(5) {
             section.push_str(&format!("- {}\n", risk));
+        }
+    }
+
+    // Surface structured RiskConstraints fields when present. These live at
+    // the top level of `risk_debate_state` or inside the last history
+    // artifact in some flows. Missing fields are skipped.
+    let rc = history
+        .last()
+        .map(|entry| entry.get("artifact").unwrap_or(entry))
+        .unwrap_or(risk_state);
+    let structured: Vec<String> = vec![
+        risk_field_str(rc, "stop_type").map(|value| format!("- **Stop Type:** {value}")),
+        risk_field_pct(rc, "max_drawdown_pct").map(|value| format!("- **Max Drawdown:** {value}")),
+        risk_field_pct(rc, "position_cap_pct").map(|value| format!("- **Position Cap:** {value}")),
+        risk_field_str(rc, "rebalance_trigger")
+            .map(|value| format!("- **Rebalance Trigger:** {value}")),
+        risk_field_str(rc, "risk_off_trigger")
+            .map(|value| format!("- **Risk-Off Trigger:** {value}")),
+        risk_field_str(rc, "review_window").map(|value| format!("- **Review Window:** {value}")),
+        risk_field_str(rc, "cash_hedge_recommendation")
+            .map(|value| format!("- **Cash Hedge:** {value}")),
+        risk_field_pct(rc, "constraint_confidence")
+            .map(|value| format!("- **Constraint Confidence:** {value}")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if !structured.is_empty() {
+        section.push_str("\n**Structured Risk Constraints:**\n");
+        for line in structured {
+            section.push_str(&format!("{line}\n"));
         }
     }
     section

@@ -1,18 +1,21 @@
 use anyhow::{bail, Context, Result};
 use chrono::{Duration, NaiveDate, Utc};
 use clap::Args;
-use orchestrator_core::{config_int, config_str, parse_tickers};
+use orchestrator_core::{config_int, config_str, config_strings, parse_tickers};
 use orchestrator_sql::{connect, ensure_schema};
-use reqwest::Client;
+use reqwest::header;
 use rusqlite::{params, Connection};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::{collections::HashMap, time::Duration as StdDuration};
+use std::{collections::HashMap, sync::Arc, time::Duration as StdDuration};
+use tokio::sync::Mutex;
 
 const EPS: f64 = 1e-12;
-const DEFAULT_SYMBOLS: &str = "QQQ,VIX,SOXX";
 const DEFAULT_MODEL: &str = "YahooTechnical";
 const YAHOO_CHART_BASE_URL: &str = "https://query1.finance.yahoo.com/v8/finance/chart";
+const YAHOO_CRUMB_URL: &str = "https://query1.finance.yahoo.com/v1/test/getcrumb";
+const YAHOO_COOKIE_URL: &str = "https://fc.yahoo.com/";
+const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 const PERIODS: [usize; 5] = [5, 10, 20, 30, 60];
 
 #[derive(Debug, Clone)]
@@ -32,16 +35,55 @@ pub struct Bar {
 
 #[derive(Clone)]
 pub struct YahooDataSource {
-    client: Client,
+    client: reqwest::Client,
+    crumb: Arc<Mutex<Option<String>>>,
 }
 
 impl YahooDataSource {
     pub fn new(timeout_sec: f64) -> Result<Self> {
+        let mut headers = header::HeaderMap::new();
+        headers.insert(
+            header::USER_AGENT,
+            header::HeaderValue::from_static(USER_AGENT),
+        );
         Ok(Self {
-            client: Client::builder()
+            client: reqwest::Client::builder()
                 .timeout(StdDuration::from_secs_f64(timeout_sec))
+                .cookie_store(true)
+                .default_headers(headers)
                 .build()?,
+            crumb: Arc::new(Mutex::new(None)),
         })
+    }
+
+    async fn ensure_crumb(&self) -> Result<String> {
+        {
+            let guard = self.crumb.lock().await;
+            if let Some(ref crumb) = *guard {
+                return Ok(crumb.clone());
+            }
+        }
+        self.client
+            .get(YAHOO_COOKIE_URL)
+            .send()
+            .await
+            .context("failed to fetch Yahoo session cookie")?;
+        let crumb = self
+            .client
+            .get(YAHOO_CRUMB_URL)
+            .send()
+            .await
+            .context("failed to fetch Yahoo crumb")?
+            .text()
+            .await
+            .context("failed to read Yahoo crumb body")?;
+        let crumb = crumb.trim().to_string();
+        if crumb.is_empty() || crumb.contains("Too Many Requests") {
+            bail!("Yahoo crumb endpoint returned unusable value: {crumb:?}");
+        }
+        let mut guard = self.crumb.lock().await;
+        *guard = Some(crumb.clone());
+        Ok(crumb)
     }
 
     async fn fetch_daily_bars(
@@ -60,11 +102,20 @@ impl YahooDataSource {
         end: NaiveDate,
         interval: &str,
     ) -> Result<Vec<Bar>> {
+        let crumb = self.ensure_crumb().await?;
         let provider_symbol = provider_symbol(symbol);
         let mut url = reqwest::Url::parse(YAHOO_CHART_BASE_URL)?;
         url.path_segments_mut()
             .map_err(|_| anyhow::anyhow!("invalid Yahoo chart base URL"))?
             .push(&provider_symbol);
+        // ponytail: cap intraday range to 59-day window; Yahoo allows ≤60 days for 1h/5m
+        let (start, end) = match interval {
+            "1d" => (start, end),
+            _ => {
+                let max_start = end - Duration::days(59);
+                (start.max(max_start), end)
+            }
+        };
         let response = self
             .client
             .get(url)
@@ -90,12 +141,16 @@ impl YahooDataSource {
                 ("interval", interval.to_string()),
                 ("events", "history".to_string()),
                 ("includeAdjustedClose", "true".to_string()),
+                ("crumb", crumb),
             ])
             .send()
             .await
             .with_context(|| format!("failed to fetch Yahoo chart data for {symbol}"))?;
-        if !response.status().is_success() {
-            bail!("Yahoo chart HTTP {} for {symbol}", response.status());
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            let truncated: String = body.chars().take(500).collect();
+            bail!("Yahoo chart HTTP {status} for {symbol}: {truncated}");
         }
         parse_yahoo_chart(symbol, response.json::<YahooChartResponse>().await?)
     }
@@ -228,8 +283,8 @@ impl ResolvedTechnicalArgs {
         };
         let symbols = args
             .symbols
-            .unwrap_or_else(|| config_str(&config, "technical.symbols", DEFAULT_SYMBOLS));
-        let symbols = parse_tickers(symbols);
+            .map(|s| parse_tickers(&s))
+            .unwrap_or_else(|| config_strings(&config, "orchestrator.analysis_universe", &[]));
         if symbols.is_empty() {
             bail!("no symbols configured");
         }

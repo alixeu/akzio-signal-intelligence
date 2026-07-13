@@ -1,5 +1,4 @@
 use anyhow::{self, Result};
-use orchestrator_llm::mock_role_artifact;
 use serde_json::{json, Value};
 use tracing::warn;
 
@@ -49,13 +48,88 @@ impl DegradedEntry {
     }
 }
 
+/// Honest degraded artifact for a failed role.
+///
+/// Deliberately does **not** call `mock_role_artifact`: mock payloads carry
+/// synthetic `direction=neutral/confidence=0.5` (or research Hold@0.5) that look
+/// like real evidence downstream. Degraded paths must emit unobserved / missing
+/// markers with confidence 0 so weighted bases and policy treat them as
+/// non-contributing.
 pub(crate) fn degraded_fallback(role: &str, tickers: &[String], error: &anyhow::Error) -> Value {
-    let mut artifact = mock_role_artifact(role, tickers);
-    artifact["status"] = json!("degraded");
-    artifact["degraded"] = json!(true);
-    artifact["error"] = json!(error.to_string());
-    artifact["probability_rationale"] = json!(format!("{role} fallback used: {error}"));
-    artifact
+    let error_text = error.to_string();
+    if role == "manager.research" {
+        return degraded_research_artifact(tickers, &error_text);
+    }
+
+    let per_ticker = tickers
+        .iter()
+        .map(|ticker| {
+            (
+                ticker.clone(),
+                json!({
+                    "status": "missing",
+                    "direction": "unobserved",
+                    "confidence": 0.0,
+                    "report": format!("{role} did not produce usable evidence: {error_text}"),
+                    "data_gaps": [format!("{role} degraded: {error_text}")],
+                    "error": error_text,
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+
+    json!({
+        "id": role,
+        "role": role,
+        "status": "degraded",
+        "degraded": true,
+        "usable": false,
+        "error": error_text,
+        "report": format!("{role} fallback used: {error_text}"),
+        "probability_rationale": format!("{role} fallback used: {error_text}"),
+        "per_ticker": per_ticker,
+    })
+}
+
+fn degraded_research_artifact(tickers: &[String], error_text: &str) -> Value {
+    let per_ticker = tickers
+        .iter()
+        .map(|ticker| {
+            (
+                ticker.clone(),
+                json!({
+                    "status": "missing",
+                    "rating": "Hold",
+                    "long_probability": Value::Null,
+                    "short_probability": Value::Null,
+                    "confidence": 0.0,
+                    "plan": format!("manager.research degraded for {ticker}: {error_text}"),
+                    "probability_rationale": format!(
+                        "manager.research fallback used; probabilities unavailable: {error_text}"
+                    ),
+                    "error": error_text,
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+
+    json!({
+        "id": "manager.research",
+        "role": "manager.research",
+        "status": "degraded",
+        "degraded": true,
+        "usable": false,
+        "rating": "Hold",
+        "long_probability": Value::Null,
+        "short_probability": Value::Null,
+        "confidence": 0.0,
+        "plan": format!("manager.research degraded: {error_text}"),
+        "probability_rationale": format!(
+            "manager.research fallback used; probabilities unavailable: {error_text}"
+        ),
+        "error": error_text,
+        "per_ticker": per_ticker,
+    })
 }
 
 fn push_degraded_entry(state: &mut Value, entry: DegradedEntry) {
@@ -112,42 +186,22 @@ pub(crate) fn record_degraded_role(state: &mut Value, result: &RoleJobResult, me
 }
 
 pub(crate) fn degraded_role_artifact(result: &RoleJobResult, message: &str) -> Value {
-    let base = degraded_fallback(
+    // Build the honest missing payload first, then only copy non-conflicting
+    // envelope metadata. Never let a mock `per_ticker` overwrite the missing
+    // markers — that was the P0 bug that turned failed analysts into fake
+    // neutral/0.5 votes.
+    let mut artifact = degraded_fallback(
         &result.role,
         &result.tickers,
         &anyhow::anyhow!("{}", message),
     );
-    let per_ticker = result
-        .tickers
-        .iter()
-        .map(|ticker| {
-            (
-                ticker.clone(),
-                json!({
-                    "status": "missing",
-                    "direction": "neutral",
-                    "confidence": 0.0,
-                    "report": format!("{} did not produce usable evidence: {message}", result.role),
-                    "error": message
-                }),
-            )
-        })
-        .collect::<serde_json::Map<_, _>>();
-    let mut artifact = json!({
-        "id": result.role,
-        "role": result.role,
-        "phase": result.phase,
-        "kind": result.kind,
-        "round": result.round,
-        "topic_id": result.topic_id,
-        "timed_out": result.timed_out,
-        "elapsed_ms": result.elapsed_ms,
-        "per_ticker": per_ticker
-    });
     if let Some(obj) = artifact.as_object_mut() {
-        for (k, v) in base.as_object().into_iter().flat_map(|o| o.iter()) {
-            obj.insert(k.clone(), v.clone());
-        }
+        obj.insert("phase".to_string(), json!(result.phase));
+        obj.insert("kind".to_string(), json!(result.kind));
+        obj.insert("round".to_string(), json!(result.round));
+        obj.insert("topic_id".to_string(), json!(result.topic_id));
+        obj.insert("timed_out".to_string(), json!(result.timed_out));
+        obj.insert("elapsed_ms".to_string(), json!(result.elapsed_ms));
     }
     artifact
 }
@@ -230,4 +284,58 @@ pub(crate) fn manager_research_fallback(state: &mut Value, error: anyhow::Error)
         },
     );
     artifact
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn degraded_analyst_artifact_is_unobserved_not_mock_neutral() {
+        let result = RoleJobResult {
+            role: "analyst.youtube".to_string(),
+            phase: 1,
+            kind: "artifact".to_string(),
+            round: None,
+            topic_id: None,
+            tickers: vec!["QQQ".to_string()],
+            prompt_version: None,
+            model: "test".to_string(),
+            turn_id: "turn".to_string(),
+            session_id: "session".to_string(),
+            artifact: None,
+            error: Some("timeout".to_string()),
+            timed_out: false,
+            elapsed_ms: 12,
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_tokens: 0,
+            total_tokens: 0,
+            turn_count: 0,
+            tool_call_count: 0,
+        };
+        let artifact = degraded_role_artifact(&result, "timeout");
+        assert_eq!(artifact["degraded"], json!(true));
+        assert_eq!(artifact["usable"], json!(false));
+        assert_eq!(
+            artifact["per_ticker"]["QQQ"]["direction"],
+            json!("unobserved")
+        );
+        assert_eq!(artifact["per_ticker"]["QQQ"]["confidence"], json!(0.0));
+        assert_ne!(artifact["per_ticker"]["QQQ"]["confidence"], json!(0.5));
+    }
+
+    #[test]
+    fn degraded_research_artifact_does_not_emit_fake_half_probabilities() {
+        let artifact = degraded_fallback(
+            "manager.research",
+            &["QQQ".to_string()],
+            &anyhow::anyhow!("llm failed"),
+        );
+        assert_eq!(artifact["degraded"], json!(true));
+        assert_eq!(artifact["usable"], json!(false));
+        assert!(artifact["long_probability"].is_null());
+        assert!(artifact["short_probability"].is_null());
+        assert_eq!(artifact["confidence"], json!(0.0));
+    }
 }

@@ -67,6 +67,13 @@
    - `analyst_note`
    - `rumor`
    `rumor` 不得作为核心证据。
+16b. **必须同步填写机器可读来源质量字段（这些字段会自动出现在 `{analyst_artifact_schema}` 注入的 JSON Schema 中）。** 对每条 `key_evidence`：
+   - `source_tier`：取 `official | major_media | professional_research | longform_analysis | social_verified | social_unverified | unknown`，与上面的 `source_quality` 对应（`analyst_note`→`professional_research`，`industry_media`/`major_media`→`major_media`，`rumor`→`social_unverified`）。
+   - `first_source`：信息最早可溯源出处（如 “BLS CPI 发布”、“Fed 声明”）。
+   - `is_derivative_repost`：若本条是转载 / 二手搬运（原始信息来自别处），设为 `true` 并在 `first_source` 填最早出处；不要把同一事件的重复转载当成多条独立证据。
+   - `evidence_age`：按上面第 6 条的催化剂时效取值 `"0-2d" | "3-5d" | "6-10d" | "10d+" | "unknown"`。
+   - `source_confidence`：0.0-1.0 对本条来源质量的置信度（rumor 应明显偏低）。
+   - 当窗口内呈现极端一致共识、可能成为逆向拥挤信号时，在 ticker 级将 `crowded_consensus_risk` 设为 `medium` 或 `high`，并说明为何。
 17. 评估催化剂质量：是否有明确日期或触发条件、传导路径是否直接、市场是否早有一致预期、后续能否用官方宏观数据、收益率、FedWatch、VIX、指数价格行为或公司披露验证。
 18. 至少列出 1-3 个 validation triggers / falsifiers，说明哪些后续公告、宏观发布、行业数据、收益率变化或公司回应会强化当前判断，哪些会削弱甚至推翻它。
 19. 若已入库 Jin10 上下文中出现多条快讯，必须先做去重和相关性排序：

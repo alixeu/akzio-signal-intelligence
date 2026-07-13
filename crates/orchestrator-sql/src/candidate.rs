@@ -3,8 +3,6 @@ use chrono::Utc;
 use rusqlite::{params, Connection};
 use serde_json::Value;
 
-use crate::ensure_schema;
-
 #[derive(Debug, Clone)]
 pub struct CandidateExperienceInput {
     pub scope: String,
@@ -51,7 +49,6 @@ pub fn insert_candidate_experience(
     conn: &Connection,
     input: &CandidateExperienceInput,
 ) -> Result<i64> {
-    ensure_schema(conn)?;
     let now = Utc::now().to_rfc3339();
     conn.execute(
         r#"
@@ -89,7 +86,6 @@ pub fn pending_candidates(conn: &Connection) -> Result<Vec<CandidateExperience>>
 }
 
 pub fn candidates_by_status(conn: &Connection, status: &str) -> Result<Vec<CandidateExperience>> {
-    ensure_schema(conn)?;
     let mut stmt = conn.prepare(
         r#"
         SELECT id, scope, scope_value, experience_type, market_regime_json, finding, recommendation,
@@ -110,7 +106,6 @@ pub fn update_candidate_status(
     status: &str,
     reason: &str,
 ) -> Result<()> {
-    ensure_schema(conn)?;
     conn.execute(
         r#"
         UPDATE candidate_experiences

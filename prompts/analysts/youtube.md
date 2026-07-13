@@ -46,6 +46,13 @@
    - 带事实引用的二手解读
 4. 优先保留能解释“为什么今天重要”的观点，而不是泛泛复述视频内容。
 5. 对 `QQQ` / `TQQQ` / `SQQQ`，必须单列 `VIX / 风险偏好联动`：说明视频中的宏观、波动率或风险偏好表述是否和 QQQ 方向一致；如果视频完全未覆盖 VIX，也要明确写成数据缺口。
+6. **必须填写机器可读来源质量字段（自动出现在 `{analyst_artifact_schema}` JSON Schema 中）。** 对每条 `key_evidence`：
+   - `source_tier`：结构化深度解读频道取 `longform_analysis`，普通/匿名 up 主取 `social_unverified`，无法判断取 `unknown`。
+   - `first_source`：该观点最早可溯源出处（频道名 + 视频标题，或最初提出该观点的源头）。
+   - `is_derivative_repost`：若视频/字幕只是复述别处（新闻/其他平台）已存在的叙事，设为 `true` 并在 `first_source` 填最早出处。
+   - `evidence_age`：YouTube 样本严格按 3 天窗口，取值 `"0-2d" | "3-5d" | "unknown"`（超过 3 天的旧视频只作背景，不主导结论）。
+   - `source_confidence`：0.0-1.0，有字幕且带事实引用的二手解读偏高，纯情绪宣泄明显偏低。
+   - 在 ticker 级评估同温层与拥挤：若多个高传播视频只复述同一叙事、缺反证，将 `echo_chamber_risk` 设为 `medium`/`high`；若 YouTube 呈现极端一致方向共识（可能成为逆向拥挤信号），将 `crowded_consensus_risk` 设为 `medium`/`high`，并说明依据。
 
 输出要求：
 1. 先给一句话结论：`direction`、`confidence`、今天 YouTube 维度是否支持偏多/偏空/混合/未观测

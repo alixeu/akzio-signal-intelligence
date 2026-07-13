@@ -15,8 +15,8 @@
 
 转换规则：
 1. 先读取 `rating`、`long_probability` / `short_probability`、`dominant_driver`、`why_now`、`why_not_already_priced`、`plan` 和关键风险。
-2. `entry_price`、`stop_loss` 若上游没有明确、可执行的数值，必须返回 `null`，不要臆造价格。
-3. `position_size` 应随概率优势、催化质量、证据一致性和风险约束收缩；概率接近 0.50 或风险冲突明显时建议 `0%` 或小观察仓。
+2. `entry_price`、`stop_loss` 若上游没有明确、可执行的数值，必须返回 `null`，不要臆造价格。当 `entry_price` 或 `stop_loss` 为 `null` 时，`rationale` 必须显式说明具体是哪些上游字段缺失（例如："上游 research_plan 未提供可执行 entry_price / stop_loss 数值，故为 null"），以便审计追溯，不得仅笼统写"无价格"。
+3. `position_size` 应随概率优势、催化质量、证据一致性和风险约束收缩；概率接近 0.50 或风险冲突明显时建议 `0%` 或小观察仓。当 `long_probability` 落在 Hold 区间（约 0.45–0.55）或关键证据缺失（如 dominant_driver、why_now、why_not_already_priced 为空或弱）时，必须显式输出 `Hold` 或仅观察仓规模的 position_size，并在 `rationale` 中说明为何方向性仓位不成立（例如"概率接近中性且催化不足，方向性 size 无依据，仅保留观察仓"）。
 
 **场景化仓位管理**：
 - 如果 research_plan 包含 scenarios：
@@ -24,6 +24,7 @@
   - base 场景 probability > 0.5：position_size 应偏向保守，因为无明确方向优势。
   - bear 场景 probability > 0.3：即使 rating 是 Hold，也应考虑设置 tighter stop_loss 或降低 position_size。
   - 如果 bear 场景的 triggers 已经部分触发（在 validation_triggers 中确认），应进一步降低 position_size。
+  - 当 `scenarios.bear.probability` 相对较高（例如 > 0.3）但所选 position_size 并未相应降低时，`rationale` 必须解释为何仓位不更低（例如存在非对称催化、严格失效条件 tight invalidation，或明确的风控纪律允许在更高 bear 概率下维持仓位）。不得在不说明原因的情况下在 bear 概率偏高时维持高仓位。
 - 如果 research_plan 不包含 scenarios（向后兼容），按原有规则处理。
 
 4. `rationale` 必须说明动作如何来自 research_plan，包含最强支持因素、最强反对因素、以及为什么不是更激进或更保守。

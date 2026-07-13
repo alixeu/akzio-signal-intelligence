@@ -19,6 +19,7 @@ orchestrator-core = { path = "../orchestrator-core" }
 orchestrator-sql = { path = "../orchestrator-sql" }
 orchestrator-llm = { path = "../orchestrator-llm" }
 orchestrator-ingest = { path = "../orchestrator-ingest" }
+orchestrator-report = { path = "../orchestrator-report" }
 
 [dev-dependencies]
 tempfile = { workspace = true }

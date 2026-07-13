@@ -2814,6 +2814,7 @@ dependencies = [
  "orchestrator-core",
  "orchestrator-ingest",
  "orchestrator-llm",
+ "orchestrator-report",
  "orchestrator-sql",
  "rusqlite",
  "serde_json",

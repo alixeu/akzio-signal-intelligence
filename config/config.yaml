@@ -1,28 +1,31 @@
 orchestrator:
-  tickers: QQQ,SOXX,VIX
+  analysis_universe: [QQQ, SOXX, VIX]
   phase1_agents: technical,news
   db_path: outputs/orchestrator.sqlite
 
   runtime:
     lang: zh
-    window_days: 150
+    # window_days: 数据检索窗口(read_run_context 返回的时间跨度)。
+    # 与 technical.days 对齐;分析判断窗口(1-5 交易日)由各 analyst prompt 内部定义。
+    window_days: 60
     max_debate_rounds: 3
 
   allocation:
-    investable_tickers: [QQQ, SOXX]
+    investable_assets: [QQQ, SOXX]
 
   llm:
     gateway:
       base_url: &llm_gateway_base_url ${LLM_GATEWAY_BASE_URL:-https://oneapi-comate.baidu-int.com/v1}
+      # Require an env-provided key; never ship a real default secret in-repo.
       api_key: &llm_gateway_api_key ${LLM_GATEWAY_API_KEY}
     defaults:
       route: responses
-      model: gpt-5.5
+      model: gpt-5.6-terra
       base_url: *llm_gateway_base_url
       api_key: *llm_gateway_api_key
-      reasoning_effort: xhigh
+      reasoning_effort: low
       reasoning_summary: auto
-      preserve_reasoning_state: true
+      preserve_reasoning_state: false
       tools: read_run_context
 
   web_search:
@@ -34,19 +37,14 @@ orchestrator:
   analyst_weights:
     technical: 40.0
     news_macro: 35.0
-    youtube: 0.0
-    reddit: 0.0
-    x: 0.0
 
 technical:
-  symbols: QQQ,SOXX,VIX
-  intervals: 1d,3h,20min
   days: 60
   model: YahooTechnical
   sleep_sec: 1
 
 jin10:
-  api_url: ${JIN10_API_URL}
+  api_url: https://4a735ea38f8146198dc205d2e2d1bd28.z3c.jin10.com/flash
   channel: -8200
   vip: 1
   classify: 24,27,31,86,90,92,76,83,2,168,53,47,48,50,157,16
@@ -58,7 +56,6 @@ youtube:
   default_channel: rhino
   max_videos: 6
   timeout_sec: 20
-  user_agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Codex TQQQ report
   channels:
     rhino:
       handle: rhinofinance
@@ -69,15 +66,13 @@ wayinvideo:
   task: 视频逐字稿
   existing_task_url: https://wayinvideo-api.wayin.ai/api/highlight_moment/task
   timeout_sec: 60
+  username: ${WAYINVIDEO_USERNAME}
+  password: ${WAYINVIDEO_PASSWORD}
 
 report:
   mode: build-and-send
-  output_dir: outputs/TQQQ
-  default_run_dir_pattern: outputs/QQQ_SOXX_VIX/{date}_exec
-  subject_template: TQQQ strategy report {date}
   email:
     enabled: true
-    state_path: outputs/TQQQ/report_email_state.json
     smtp_url: smtps://smtp.mail.me.com:465
     username: ${REPORT_SMTP_USERNAME}
     password: ${REPORT_SMTP_PASSWORD}

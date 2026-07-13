@@ -1,6 +1,7 @@
 use orchestrator_core::{
     final_validation_schema, portfolio_allocation_schema, risk_constraints_schema,
-    trade_intent_schema, FinalValidation, PortfolioAllocation, RiskConstraints, TradeIntent,
+    trade_intent_schema, validate_risk_constraints, FinalValidation, PortfolioAllocation,
+    RiskConstraints, TradeIntent,
 };
 use serde_json::{json, Value};
 
@@ -129,12 +130,17 @@ fn contract_schema(name: &str) -> Option<String> {
 }
 
 fn phase_done(state: &Value, phase: i64) -> bool {
-    state
-        .get("phase_status")
-        .and_then(Value::as_object)
-        .and_then(|value| value.get(&phase.to_string()))
-        .and_then(Value::as_str)
-        == Some("done")
+    matches!(
+        state
+            .get("phase_status")
+            .and_then(Value::as_object)
+            .and_then(|value| value.get(&phase.to_string()))
+            .and_then(Value::as_str),
+        // Selective policy may finish a phase via derived/skipped artifacts
+        // rather than a full LLM run; those still count as completed for
+        // contract presence checks.
+        Some("done") | Some("derived") | Some("skipped")
+    )
 }
 
 fn validate_contract_payload(name: &str, payload: &Value) -> Option<String> {
@@ -158,8 +164,14 @@ fn validate_risk_constraints_payload(payload: &Value) -> Option<String> {
     if payload.get("status").and_then(Value::as_str) == Some("skipped") {
         return None;
     }
-    if serde_json::from_value::<RiskConstraints>(payload.clone()).is_ok() {
-        return required_string_error(payload, "recommended_adjustment");
+    if let Ok(parsed) = serde_json::from_value::<RiskConstraints>(payload.clone()) {
+        let combined = validate_risk_constraints(&parsed)
+            .err()
+            .or_else(|| required_string_error(payload, "recommended_adjustment"));
+        if let Some(error) = combined {
+            return Some(error);
+        }
+        return None;
     }
 
     let Some(history) = payload.get("history").and_then(Value::as_array) else {
@@ -171,12 +183,18 @@ fn validate_risk_constraints_payload(payload: &Value) -> Option<String> {
         let Some(artifact) = turn.get("artifact") else {
             return Some(format!("history[{index}].artifact is missing"));
         };
-        if let Some(error) = serde_json::from_value::<RiskConstraints>(artifact.clone())
-            .err()
-            .map(|error| error.to_string())
-            .or_else(|| required_string_error(artifact, "recommended_adjustment"))
-        {
-            return Some(format!("history[{index}].artifact: {error}"));
+        match serde_json::from_value::<RiskConstraints>(artifact.clone()) {
+            Ok(parsed) => {
+                let combined = validate_risk_constraints(&parsed)
+                    .err()
+                    .or_else(|| required_string_error(artifact, "recommended_adjustment"));
+                if let Some(error) = combined {
+                    return Some(format!("history[{index}].artifact: {error}"));
+                }
+            }
+            Err(error) => {
+                return Some(format!("history[{index}].artifact: {}", error));
+            }
         }
     }
     None

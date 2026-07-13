@@ -8,7 +8,7 @@ use rusqlite::Connection;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
-use crate::orchestration::config::RuntimeConfig;
+use crate::orchestration::config::{AllocationConfig, RuntimeConfig};
 
 pub(crate) fn inject_phase0_reflection(
     conn: &Connection,
@@ -20,7 +20,7 @@ pub(crate) fn inject_phase0_reflection(
     }
 
     let tickers = tickers_from_state(state);
-    let market_regime = market_regime_from_state(state);
+    let market_regime = market_regime_from_state(conn, state, &config.allocation);
     let mut items_by_ticker = serde_json::Map::new();
     for ticker in &tickers {
         let result = read_prior_memory(
@@ -76,24 +76,77 @@ fn tickers_from_state(state: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn market_regime_from_state(state: &Value) -> MarketRegime {
-    let volatility = state
+fn market_regime_from_state(
+    conn: &Connection,
+    state: &Value,
+    allocation: &AllocationConfig,
+) -> MarketRegime {
+    // Prefer regime already computed downstream (available after phase 3).
+    if let Some(regime) = state
         .get("allocation_context")
         .and_then(|value| value.get("vix"))
         .and_then(|value| value.get("regime"))
         .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
         .or_else(|| {
             state
                 .get("portfolio_allocation")
                 .and_then(|value| value.get("vix_regime"))
                 .and_then(Value::as_str)
         })
-        .unwrap_or_default()
-        .to_string();
+        .filter(|value| !value.is_empty())
+    {
+        return MarketRegime {
+            volatility: regime.to_string(),
+            ..Default::default()
+        };
+    }
+
+    // Fallback: query the latest VIX close from the technical_indicators table
+    // and classify it using the allocation regime thresholds. This works during
+    // phase 3 reflection injection when downstream state is not yet populated.
+    let volatility = query_latest_vix_close(conn)
+        .ok()
+        .flatten()
+        .map(|close| classify_vix_regime(close, allocation))
+        .unwrap_or_default();
     MarketRegime {
         volatility,
         ..Default::default()
     }
+}
+
+/// Query the most recent VIX close price from the technical_indicators table.
+fn query_latest_vix_close(conn: &Connection) -> Result<Option<f64>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT indicator_value
+        FROM technical_indicators
+        WHERE ticker = 'VIX' AND indicator_name = 'Close'
+        ORDER BY kline_time DESC
+        LIMIT 1
+        "#,
+    )?;
+    let mut rows = stmt.query([])?;
+    Ok(rows.next()?.map(|row| row.get::<_, f64>(0)).transpose()?)
+}
+
+/// Classify a VIX close into a regime label using the configured thresholds.
+fn classify_vix_regime(vix_close: f64, allocation: &AllocationConfig) -> String {
+    let labels = &allocation.regime_labels;
+    let thresholds = &allocation.regime_thresholds;
+    if labels.is_empty() {
+        return String::new();
+    }
+    // thresholds divide the range into labels.len() buckets.
+    // e.g. thresholds [15, 20, 30] + labels [risk_on, normal, elevated, defensive]
+    //      vix < 15 -> risk_on, < 20 -> normal, < 30 -> elevated, >= 30 -> defensive
+    let bucket = thresholds
+        .iter()
+        .position(|&threshold| vix_close < threshold)
+        .unwrap_or(labels.len() - 1)
+        .min(labels.len() - 1);
+    labels[bucket].clone()
 }
 
 fn track_record_by_ticker(conn: &Connection, tickers: &[String]) -> Value {
@@ -126,6 +179,7 @@ fn agent_accuracy(conn: &Connection) -> Result<Value> {
         FROM outcomes o
         JOIN predictions p ON p.id = o.prediction_id
         ORDER BY o.scored_at DESC
+        LIMIT 500
         "#,
     )?;
     let rows = stmt.query_map([], |row| {
@@ -324,7 +378,6 @@ mod tests {
                 actual_return: 0.1,
                 direction_correct: true,
                 probability_error: -0.3,
-                market_regime_json: json!({}),
             },
         )
         .unwrap();

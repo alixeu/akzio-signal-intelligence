@@ -3,8 +3,6 @@ use chrono::Utc;
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 
-use crate::ensure_schema;
-
 #[derive(Debug, Clone)]
 pub struct PredictionInput {
     pub run_id: String,
@@ -32,7 +30,6 @@ pub struct ExpiredPrediction {
 }
 
 pub fn upsert_prediction(conn: &Connection, input: &PredictionInput) -> Result<i64> {
-    ensure_schema(conn)?;
     let now = Utc::now().to_rfc3339();
     conn.execute(
         r#"
@@ -64,7 +61,9 @@ pub fn upsert_prediction(conn: &Connection, input: &PredictionInput) -> Result<i
             now,
         ],
     )?;
-    prediction_id(conn, &input.run_id, &input.ticker)
+    let pid = prediction_id(conn, &input.run_id, &input.ticker)?;
+
+    Ok(pid)
 }
 
 pub fn prediction_id(conn: &Connection, run_id: &str, ticker: &str) -> Result<i64> {
@@ -76,7 +75,6 @@ pub fn prediction_id(conn: &Connection, run_id: &str, ticker: &str) -> Result<i6
 }
 
 pub fn prediction_by_run_ticker(conn: &Connection, run_id: &str, ticker: &str) -> Result<Value> {
-    ensure_schema(conn)?;
     let text = conn.query_row(
         r#"
         SELECT json_object(
@@ -107,7 +105,6 @@ pub fn expired_unscored_predictions(
     as_of: &str,
     limit: usize,
 ) -> Result<Vec<ExpiredPrediction>> {
-    ensure_schema(conn)?;
     let mut stmt = conn.prepare(
         r#"
         SELECT p.id, p.run_id, p.ticker, p.prediction_date, p.long_probability,

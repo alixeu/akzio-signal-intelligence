@@ -387,7 +387,11 @@ fn evidence_text(summary: &Value) -> String {
         .map(|items| {
             items
                 .iter()
-                .filter_map(Value::as_str)
+                .filter_map(|item| match item {
+                    Value::String(text) => Some(text.as_str()),
+                    Value::Object(object) => object.get("claim").and_then(Value::as_str),
+                    _ => None,
+                })
                 .collect::<Vec<_>>()
                 .join(" ")
         })
@@ -528,6 +532,44 @@ mod tests {
         let summaries = vec![
             json!({"role": "analyst.news_macro", "stance": "bullish", "confidence": 0.7, "key_evidence": ["CPI came in at 3.2 percent"]}),
             json!({"role": "analyst.reddit", "stance": "bearish", "confidence": 0.6, "key_evidence": ["CPI was 3.4 percent bearish"]}),
+        ];
+
+        let conflicts = detect_evidence_contradiction("TQQQ", &summaries);
+
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(
+            conflicts[0].conflict_type,
+            ConflictType::EvidenceContradiction
+        );
+        assert_eq!(conflicts[0].severity, Severity::High);
+    }
+
+    #[test]
+    fn detects_evidence_overlap_with_structured_objects() {
+        let summaries = vec![
+            json!({"role": "analyst.youtube", "stance": "bullish", "confidence": 0.5, "key_evidence": [
+                {"claim": "Rhino Finance QQQ 500 target YouTube", "evidence_type": "opinion", "source": "YouTube"}
+            ]}),
+            json!({"role": "analyst.reddit", "stance": "bullish", "confidence": 0.5, "key_evidence": [
+                {"claim": "Reddit discusses Rhino QQQ 500 call", "evidence_type": "opinion", "source": "Reddit"}
+            ]}),
+        ];
+
+        let conflicts = detect_evidence_overlap("TQQQ", &summaries);
+
+        assert_eq!(conflicts.len(), 1);
+        assert!(conflicts[0].details.contains_key("shared_keywords"));
+    }
+
+    #[test]
+    fn detects_evidence_contradiction_with_structured_objects() {
+        let summaries = vec![
+            json!({"role": "analyst.news_macro", "stance": "bullish", "confidence": 0.7, "key_evidence": [
+                {"claim": "CPI came in at 3.2 percent", "evidence_type": "fact", "source": "BLS"}
+            ]}),
+            json!({"role": "analyst.reddit", "stance": "bearish", "confidence": 0.6, "key_evidence": [
+                {"claim": "CPI was 3.4 percent bearish", "evidence_type": "speculation", "source": "Reddit"}
+            ]}),
         ];
 
         let conflicts = detect_evidence_contradiction("TQQQ", &summaries);

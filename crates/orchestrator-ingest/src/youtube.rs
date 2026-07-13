@@ -51,11 +51,7 @@ pub async fn run(args: YoutubeArgs) -> Result<Value> {
         .timeout(StdDuration::from_secs(
             config_int(&config, "youtube.timeout_sec", 20) as u64,
         ))
-        .user_agent(config_str(
-            &config,
-            "youtube.user_agent",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Codex TQQQ report",
-        ))
+        .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Codex TQQQ report")
         .build()?;
     let mut results = Vec::new();
     for key in keys {

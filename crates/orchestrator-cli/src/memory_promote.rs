@@ -160,12 +160,14 @@ mod tests {
         assert_eq!(summary.promoted, 1);
         assert_eq!(status_count(&conn, "promoted"), 1);
         assert_eq!(memory_count(&conn, "active"), 1);
-        let fts_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM memory_search_fts", [], |row| {
-                row.get(0)
-            })
+        let active_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_items WHERE status='active'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
-        assert_eq!(fts_count, 1);
+        assert_eq!(active_count, 1);
     }
 
     #[test]

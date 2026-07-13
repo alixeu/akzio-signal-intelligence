@@ -43,11 +43,6 @@ pub(crate) fn enforce_preflight_policy(
     Ok(())
 }
 
-pub(crate) fn preflight_tool_for_role(role: &str) -> Option<&'static str> {
-    let registry = orchestrator_core::role_registry::AgentRegistry::builtin();
-    preflight_tool_from_registry(role, &registry)
-}
-
 fn preflight_tool_for_role_with_config(role: &str, config: &RuntimeConfig) -> Option<&'static str> {
     preflight_tool_from_registry(role, &config.agent_registry)
 }
@@ -124,11 +119,15 @@ pub(crate) async fn run_jin10_preflight(
     if preflight_status(state, tool).is_some() {
         return Ok(());
     }
+    let lookback_hours = state
+        .get("jin10_lookback_hours")
+        .and_then(Value::as_f64)
+        .unwrap_or(24.0);
     let result = jin10::run(jin10::Jin10Args {
         channel: None,
         vip: None,
         classify: None,
-        lookback_hours: Some(24.0),
+        lookback_hours: Some(lookback_hours),
         pages: None,
         sleep: None,
         timeout: None,

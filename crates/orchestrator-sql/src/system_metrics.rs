@@ -1,9 +1,5 @@
 use anyhow::Result;
-use chrono::Utc;
 use rusqlite::{params, Connection};
-use serde_json::Value;
-
-use crate::ensure_schema;
 
 #[derive(Debug, Clone)]
 pub struct SystemMetricsCopyInput {
@@ -13,72 +9,35 @@ pub struct SystemMetricsCopyInput {
     pub agent_count: i64,
     pub prediction_date: String,
     pub ticker: String,
-    pub market_regime_json: Value,
 }
 
 pub fn rewrite_system_metrics_from_prompt_metrics(
     conn: &Connection,
     input: &SystemMetricsCopyInput,
 ) -> Result<usize> {
-    ensure_schema(conn)?;
-    let now = Utc::now().to_rfc3339();
-    let market_regime_json = serde_json::to_string(&input.market_regime_json)?;
-    let updated = conn.execute(
-        r#"
-        UPDATE system_metrics
-        SET workflow_version = ?,
-            reflection_version = ?,
-            agent_count = ?,
-            prediction_date = ?,
-            ticker = ?,
-            market_regime_json = ?
-        WHERE run_id = ?
-          AND prompt_metric_id IS NOT NULL
-        "#,
+    conn.execute(
+        "UPDATE prompt_metrics
+         SET workflow_version = ?,
+             reflection_version = ?,
+             agent_count = ?,
+             prediction_date = ?,
+             ticker = ?
+         WHERE run_id = ?",
         params![
             input.workflow_version,
             input.reflection_version,
             input.agent_count,
             input.prediction_date,
             input.ticker,
-            market_regime_json,
             input.run_id,
         ],
     )?;
-    let inserted = conn.execute(
-        r#"
-        INSERT OR IGNORE INTO system_metrics
-            (run_id, role, phase, model, prompt_version, prompt_tokens, completion_tokens,
-             total_tokens, latency_ms, workflow_version, reflection_version, agent_count,
-             prediction_date, ticker, market_regime_json, prompt_metric_id, created_at)
-        SELECT pm.run_id, pm.role, pm.phase, pm.model, pm.prompt_version, pm.input_tokens,
-               pm.output_tokens, pm.total_tokens, pm.latency_ms, ?, ?, ?, ?, ?, ?, pm.id, ?
-        FROM prompt_metrics pm
-        WHERE pm.run_id = ?
-          AND NOT EXISTS (
-              SELECT 1
-              FROM system_metrics sm
-              WHERE sm.prompt_metric_id = pm.id
-          )
-        "#,
-        params![
-            input.workflow_version,
-            input.reflection_version,
-            input.agent_count,
-            input.prediction_date,
-            input.ticker,
-            market_regime_json,
-            now,
-            input.run_id,
-        ],
-    )?;
-    Ok(updated + inserted)
+    Ok(conn.changes() as usize)
 }
 
 pub fn system_metrics_count(conn: &Connection, run_id: &str) -> Result<i64> {
-    ensure_schema(conn)?;
     Ok(conn.query_row(
-        "SELECT COUNT(*) FROM system_metrics WHERE run_id = ?",
+        "SELECT COUNT(*) FROM prompt_metrics WHERE run_id = ?",
         params![run_id],
         |row| row.get(0),
     )?)
@@ -91,7 +50,6 @@ mod tests {
         connect,
         metrics::{insert_prompt_metric, PromptMetricInput},
     };
-    use serde_json::json;
 
     #[test]
     fn rewrites_system_metrics_from_prompt_metrics() {
@@ -132,7 +90,6 @@ mod tests {
                 agent_count: 2,
                 prediction_date: "2026-01-01".to_string(),
                 ticker: "QQQ".to_string(),
-                market_regime_json: json!({}),
             },
         )
         .unwrap();
