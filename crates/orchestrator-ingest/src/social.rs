@@ -117,7 +117,7 @@ fn twikit_cookie_json(cookie: &impl CookiesInfo) -> Option<Value> {
     if cookie.name().is_empty() || cookie.value().is_empty() {
         return None;
     }
-    let domain = normalize_twikit_cookie_domain(&cookie.domain())?;
+    let domain = normalize_twikit_cookie_domain(cookie.domain())?;
     Some(json!({
         "name": cookie.name(),
         "value": cookie.value(),

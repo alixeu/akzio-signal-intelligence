@@ -29,6 +29,7 @@
 - 所有权重必须 `>= 0`，且合计**精确等于 1.0**。
 - 单个 investable ticker 的权重不得超过 `max_single_position`。
 - 评级越高 + 波动越低 → 权重越高；评级越低 + 波动越高 → 权重越低。
+- **杠杆 ETF 波动率衰耗**：对 TQQQ（及其他 3x 杠杆标的），当 `vol_pct` 明显高于常态且 `long_probability` 接近中性 / rating 为 Hold 时，必须额外下调其权重（相对同评级低波标的），在该 ticker 的 `rationale` 中写明“volatility drag / 横盘衰耗”理由；不得在方向模糊时仍按名义评级给满权重。
 - `correlation_60d > 0.85` 的标的之间属**高度相关**，彼此**不能**当作相互独立的机会分别给满权重；它们的合计权重必须主动反映集中度风险（即叠加后显著低于各自按评级独立应得分位之和），而**不是**简单地按各自的 rating / long_probability 等比例堆高。`correlation_note` 中一旦将多个高度相关标的并列堆叠，必须**显式点名**这些 ticker 及其 correlation_60d 数值，说明为何其合并敞口被压低、分散化收益有限，不得仅以泛泛一句“相关性较高”带过。
 - `cash_hedge` 权重 = 1 − 总股票敞口；VIX 越高、相关性越高、方向概率越模糊，`cash_hedge` 应越高。
 - 当 VIX `regime` 为 `elevated` 或 `defensive` 时，`cash_hedge` 的 `rationale` **必须解释为何提高现金对冲**，而不能只写出数值：要结合（a）波动率升高放大回撤风险、（b）高度相关标的叠加使分散化失效、（c）上游 long_probability / 方向概率模糊导致胜率不确定，说明提高 `cash_hedge` 是上述三重风险下的主动收缩，而非单纯引用 `equity_budget_hint` 区间。

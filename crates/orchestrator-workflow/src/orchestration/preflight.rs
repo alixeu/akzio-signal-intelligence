@@ -95,10 +95,30 @@ pub(crate) async fn run_technical_preflight(state: &mut Value) -> Result<()> {
         .get("db_path")
         .and_then(Value::as_str)
         .map(PathBuf::from);
+    // Prefer configured analysis_universe (QQQ/SOXX/VIX). investable_assets is only
+    // for later allocation and must not drive Yahoo refresh.
+    let symbols = state
+        .get("analysis_universe")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .filter(|value| !value.is_empty());
+    // Always refresh against the run date so phase-1 analysts do not inherit
+    // stale Yahoo rows from an older import window.
+    let end = state
+        .get("current_date")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     let result = technical::run(technical::TechnicalArgs {
-        symbols: None,
+        // None falls back to config orchestrator.analysis_universe inside ingest.
+        symbols,
         start: None,
-        end: None,
+        end,
         days: None,
         intervals: String::new(),
         db_path,

@@ -38,86 +38,55 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
         DROP TABLE IF EXISTS memory_search_fts;
         DROP TABLE IF EXISTS external_source_items;
         DROP TABLE IF EXISTS run_archive;
+        DROP TABLE IF EXISTS system_metrics;
         DROP VIEW IF EXISTS system_metrics;
+        DROP TABLE IF EXISTS turn_context_items;
+        DROP TABLE IF EXISTS prompt_metrics;
+        DROP TABLE IF EXISTS agent_turns;
+        DROP TABLE IF EXISTS agent_turn_items;
 
-        -- Phase 6: drop unused indexes from prior schema versions
+        -- Phase 2 cleanup: merge jin10 + youtube + social → external_items
+        DROP TABLE IF EXISTS jin10_items;
+        DROP TABLE IF EXISTS youtube_videos;
+        DROP TABLE IF EXISTS youtube_transcripts;
+        DROP TABLE IF EXISTS social_items;
+
+        -- Phase 4 cleanup: dead indexes
         DROP INDEX IF EXISTS idx_agent_turn_items_session;
+        DROP INDEX IF EXISTS idx_agent_turn_items_turn;
+        DROP INDEX IF EXISTS idx_agent_turn_items_run_type;
+        DROP INDEX IF EXISTS idx_agent_turn_items_run_created;
+        DROP INDEX IF EXISTS idx_agent_turns_session;
+        DROP INDEX IF EXISTS idx_agent_turns_run_phase_role;
+        DROP INDEX IF EXISTS idx_agent_turns_created;
         DROP INDEX IF EXISTS idx_role_turn_summaries_run_role;
-        DROP INDEX IF EXISTS idx_prompt_metrics_model_prediction;
         DROP INDEX IF EXISTS idx_jin10_items_hash;
         DROP INDEX IF EXISTS idx_youtube_videos_hash;
         DROP INDEX IF EXISTS idx_youtube_transcripts_hash;
+        DROP INDEX IF EXISTS idx_jin10_items_time;
+        DROP INDEX IF EXISTS idx_youtube_videos_ticker_time;
+        DROP INDEX IF EXISTS idx_social_items_source_ticker;
 
         CREATE TABLE IF NOT EXISTS runs (
             run_id TEXT PRIMARY KEY,
             current_date TEXT NOT NULL,
-            created_at TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
             status TEXT NOT NULL DEFAULT 'pending',
             current_phase INTEGER,
             error_message TEXT NOT NULL DEFAULT '',
-            completed_at TEXT
+            completed_at INTEGER
         );
-        CREATE TABLE IF NOT EXISTS agent_turns (
-            turn_id TEXT PRIMARY KEY,
-            session_id TEXT NOT NULL,
+        CREATE TABLE IF NOT EXISTS agent_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            turn_id TEXT NOT NULL UNIQUE,
             run_id TEXT NOT NULL DEFAULT '',
             phase INTEGER,
+            turn_number INTEGER NOT NULL DEFAULT 0,
             role TEXT NOT NULL DEFAULT '',
-            user_input TEXT NOT NULL DEFAULT '',
-            model_context TEXT NOT NULL DEFAULT '',
-            cancellation_state TEXT NOT NULL DEFAULT 'none',
-            needs_follow_up INTEGER NOT NULL DEFAULT 0,
-            end_reason TEXT NOT NULL DEFAULT '',
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
+            created_at INTEGER NOT NULL,
+            full_context_json TEXT NOT NULL DEFAULT '[]',
+            summary TEXT NOT NULL DEFAULT ''
         );
-        CREATE INDEX IF NOT EXISTS idx_agent_turns_session
-            ON agent_turns(session_id, updated_at);
-        CREATE INDEX IF NOT EXISTS idx_agent_turns_run_phase_role
-            ON agent_turns(run_id, phase, role);
-        CREATE INDEX IF NOT EXISTS idx_agent_turns_created
-            ON agent_turns(created_at);
-        CREATE TABLE IF NOT EXISTS agent_turn_items (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            turn_id TEXT NOT NULL,
-            session_id TEXT NOT NULL,
-            run_id TEXT NOT NULL DEFAULT '',
-            item_index INTEGER NOT NULL,
-            item_type TEXT NOT NULL,
-            role TEXT NOT NULL DEFAULT '',
-            tool_call_id TEXT NOT NULL DEFAULT '',
-            tool_name TEXT NOT NULL DEFAULT '',
-            content_json TEXT NOT NULL DEFAULT '{}',
-            content_text TEXT NOT NULL DEFAULT '',
-            created_at TEXT NOT NULL,
-            FOREIGN KEY(turn_id) REFERENCES agent_turns(turn_id)
-        );
-        CREATE INDEX IF NOT EXISTS idx_agent_turn_items_turn
-            ON agent_turn_items(turn_id, item_index);
-        CREATE INDEX IF NOT EXISTS idx_agent_turn_items_run_type
-            ON agent_turn_items(run_id, item_type);
-        CREATE INDEX IF NOT EXISTS idx_agent_turn_items_run_created
-            ON agent_turn_items(run_id, created_at);
-        CREATE TABLE IF NOT EXISTS turn_context_items (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            run_id TEXT NOT NULL DEFAULT '',
-            turn_id TEXT NOT NULL,
-            role TEXT NOT NULL DEFAULT '',
-            phase INTEGER,
-            ticker TEXT NOT NULL DEFAULT '',
-            item_time TEXT NOT NULL DEFAULT '',
-            topic_id TEXT,
-            context_type TEXT NOT NULL DEFAULT '',
-            context_ref TEXT NOT NULL DEFAULT '',
-            weight REAL NOT NULL DEFAULT 1,
-            content_hash TEXT NOT NULL DEFAULT '',
-            created_at TEXT NOT NULL,
-            FOREIGN KEY(turn_id) REFERENCES agent_turns(turn_id)
-        );
-        CREATE INDEX IF NOT EXISTS idx_turn_context_items_turn
-            ON turn_context_items(turn_id, id);
-        CREATE INDEX IF NOT EXISTS idx_turn_context_items_run_source
-            ON turn_context_items(run_id, context_type);
         CREATE TABLE IF NOT EXISTS role_turn_summaries (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             run_id TEXT NOT NULL DEFAULT '',
@@ -125,14 +94,14 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
             phase INTEGER,
             role TEXT NOT NULL DEFAULT '',
             ticker TEXT NOT NULL DEFAULT '',
-            item_time TEXT NOT NULL DEFAULT '',
+            item_time INTEGER NOT NULL DEFAULT 0,
             topic_id TEXT,
             debate_id TEXT,
             summary_type TEXT NOT NULL DEFAULT '',
             summary TEXT NOT NULL,
             summary_json TEXT NOT NULL DEFAULT '{}',
             confidence REAL NOT NULL DEFAULT 0.5,
-            created_at TEXT NOT NULL
+            created_at INTEGER NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_role_turn_summaries_run_ticker_phase_role
             ON role_turn_summaries(run_id, ticker, phase, role);
@@ -146,9 +115,9 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
             status TEXT NOT NULL DEFAULT 'active',
             current_version_id TEXT NOT NULL DEFAULT '',
             confidence REAL NOT NULL DEFAULT 0.5,
-            expires_at TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
+            expires_at INTEGER,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_memory_items_lookup
             ON memory_items(ticker, status, memory_type, updated_at);
@@ -162,114 +131,64 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
             source_run_id TEXT NOT NULL DEFAULT '',
             source_role TEXT NOT NULL DEFAULT '',
             source_date TEXT NOT NULL DEFAULT '',
-            observed_at TEXT NOT NULL DEFAULT '',
+            observed_at INTEGER NOT NULL DEFAULT 0,
             content_hash TEXT NOT NULL,
-            created_at TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
             UNIQUE(memory_id, version_index),
             FOREIGN KEY(memory_id) REFERENCES memory_items(memory_id)
         );
         CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_versions_hash
             ON memory_versions(content_hash);
-        CREATE TABLE IF NOT EXISTS jin10_items (
-            event_key TEXT PRIMARY KEY,
-            item_time TEXT NOT NULL,
-            content TEXT NOT NULL,
-            item_json TEXT NOT NULL,
-            content_hash TEXT NOT NULL,
-            imported_at TEXT NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_jin10_items_time
-            ON jin10_items(item_time);
-        CREATE TABLE IF NOT EXISTS youtube_videos (
-            video_id TEXT NOT NULL,
-            ticker TEXT NOT NULL DEFAULT '',
-            published_at TEXT NOT NULL DEFAULT '',
-            title TEXT NOT NULL DEFAULT '',
-            item_json TEXT NOT NULL DEFAULT '{}',
-            content_hash TEXT NOT NULL DEFAULT '',
-            imported_at TEXT NOT NULL,
-            PRIMARY KEY(video_id, ticker)
-        );
-        CREATE INDEX IF NOT EXISTS idx_youtube_videos_ticker_time
-            ON youtube_videos(ticker, published_at);
-        CREATE TABLE IF NOT EXISTS youtube_transcripts (
+        CREATE TABLE IF NOT EXISTS memory_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            video_id TEXT NOT NULL,
-            ticker TEXT NOT NULL DEFAULT '',
-            transcript TEXT NOT NULL DEFAULT '',
-            segments_json TEXT NOT NULL DEFAULT '[]',
-            language TEXT NOT NULL DEFAULT '',
-            provider TEXT NOT NULL DEFAULT '',
-            content_hash TEXT NOT NULL DEFAULT '',
-            imported_at TEXT NOT NULL,
-            UNIQUE(video_id, ticker, provider, content_hash)
+            memory_id TEXT NOT NULL,
+            action TEXT NOT NULL,
+            version_id TEXT NOT NULL DEFAULT '',
+            old_status TEXT NOT NULL DEFAULT '',
+            new_status TEXT NOT NULL DEFAULT '',
+            quality_score REAL,
+            reason TEXT NOT NULL DEFAULT '',
+            source_run_id TEXT NOT NULL DEFAULT '',
+            created_at INTEGER NOT NULL,
+            FOREIGN KEY(memory_id) REFERENCES memory_items(memory_id)
         );
-        CREATE TABLE IF NOT EXISTS social_items (
+        CREATE INDEX IF NOT EXISTS idx_memory_history_memory
+            ON memory_history(memory_id, created_at);
+
+        CREATE TABLE IF NOT EXISTS external_items (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             source TEXT NOT NULL,
             item_key TEXT NOT NULL,
             ticker TEXT NOT NULL DEFAULT '',
-            item_time TEXT NOT NULL DEFAULT '',
+            item_time INTEGER NOT NULL DEFAULT 0,
             title TEXT NOT NULL DEFAULT '',
             content TEXT NOT NULL DEFAULT '',
-            item_json TEXT NOT NULL DEFAULT '{}',
+            metadata_json TEXT NOT NULL DEFAULT '{}',
             content_hash TEXT NOT NULL DEFAULT '',
-            imported_at TEXT NOT NULL,
+            imported_at INTEGER NOT NULL,
             UNIQUE(source, item_key)
         );
-        CREATE INDEX IF NOT EXISTS idx_social_items_source_ticker
-            ON social_items(source, ticker, item_time);
-        CREATE TABLE IF NOT EXISTS technical_indicators (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+        CREATE INDEX IF NOT EXISTS idx_external_items_source_time
+            ON external_items(source, ticker, item_time);
+        CREATE TABLE IF NOT EXISTS technical_features (
             ticker TEXT NOT NULL,
-            kline_time TEXT NOT NULL,
-            indicator_name TEXT NOT NULL,
-            indicator_value REAL NOT NULL,
-            unit TEXT NOT NULL DEFAULT '',
-            model TEXT NOT NULL DEFAULT '',
+            date TEXT NOT NULL,
             interval TEXT NOT NULL,
-            payload_json TEXT NOT NULL DEFAULT '{}',
-            imported_at TEXT NOT NULL,
-            UNIQUE(ticker, kline_time, indicator_name, model, interval)
-        );
-        CREATE INDEX IF NOT EXISTS idx_technical_lookup
-            ON technical_indicators(ticker, indicator_name, interval, kline_time);
-        CREATE TABLE IF NOT EXISTS prompt_metrics (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            run_id TEXT NOT NULL DEFAULT '',
-            turn_id TEXT NOT NULL DEFAULT '',
-            session_id TEXT NOT NULL DEFAULT '',
-            role TEXT NOT NULL DEFAULT '',
-            phase INTEGER,
-            kind TEXT NOT NULL DEFAULT '',
-            round INTEGER,
-            topic_id TEXT,
-            prompt_version TEXT NOT NULL DEFAULT 'v1',
             model TEXT NOT NULL DEFAULT '',
-            input_tokens INTEGER NOT NULL DEFAULT 0,
-            output_tokens INTEGER NOT NULL DEFAULT 0,
-            cached_tokens INTEGER NOT NULL DEFAULT 0,
-            total_tokens INTEGER NOT NULL DEFAULT 0,
-            turn_count INTEGER NOT NULL DEFAULT 0,
-            tool_call_count INTEGER NOT NULL DEFAULT 0,
-            latency_ms INTEGER NOT NULL DEFAULT 0,
-            validation_result TEXT NOT NULL DEFAULT 'unknown',
-            fallback_triggered INTEGER NOT NULL DEFAULT 0,
-            error_message TEXT NOT NULL DEFAULT '',
-            workflow_version TEXT NOT NULL DEFAULT '',
-            reflection_version TEXT NOT NULL DEFAULT '',
-            agent_count INTEGER NOT NULL DEFAULT 0,
-            prediction_date TEXT NOT NULL DEFAULT '',
-            ticker TEXT NOT NULL DEFAULT '',
-            cost_usd REAL NOT NULL DEFAULT 0.0,
-            created_at TEXT NOT NULL
+            close REAL,
+            return_pct REAL,
+            gap REAL,
+            body REAL,
+            vstd5 REAL,
+            vstd20 REAL,
+            beta5 REAL,
+            beta20 REAL,
+            features_json TEXT NOT NULL DEFAULT '{}',
+            imported_at INTEGER NOT NULL,
+            PRIMARY KEY(ticker, date, interval)
         );
-        CREATE INDEX IF NOT EXISTS idx_prompt_metrics_run
-            ON prompt_metrics(run_id, role);
-        CREATE INDEX IF NOT EXISTS idx_prompt_metrics_role_date
-            ON prompt_metrics(role, created_at);
-        CREATE INDEX IF NOT EXISTS idx_prompt_metrics_model_date
-            ON prompt_metrics(model, created_at);
+        CREATE INDEX IF NOT EXISTS idx_technical_features_ticker
+            ON technical_features(ticker, interval, date);
         CREATE TABLE IF NOT EXISTS predictions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             run_id TEXT NOT NULL,
@@ -282,7 +201,7 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
             market_regime_json TEXT NOT NULL DEFAULT '{}',
             agent_probabilities_json TEXT NOT NULL DEFAULT '{}',
             weighted_base_probability REAL,
-            created_at TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
             UNIQUE(run_id, ticker)
         );
         CREATE INDEX IF NOT EXISTS idx_predictions_ticker_date
@@ -302,7 +221,7 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
             actual_return REAL NOT NULL,
             direction_correct INTEGER NOT NULL,
             probability_error REAL NOT NULL,
-            scored_at TEXT NOT NULL,
+            scored_at INTEGER NOT NULL,
             UNIQUE(prediction_id)
         );
         CREATE INDEX IF NOT EXISTS idx_outcomes_ticker_date
@@ -330,9 +249,9 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
             reflection_version TEXT NOT NULL DEFAULT 'v1',
             source_window TEXT NOT NULL DEFAULT '',
             review_status TEXT NOT NULL DEFAULT 'pending',
-            reviewed_at TEXT,
+            reviewed_at INTEGER,
             review_reason TEXT NOT NULL DEFAULT '',
-            created_at TEXT NOT NULL
+            created_at INTEGER NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_candidate_exp_status
             ON candidate_experiences(review_status, scope, experience_type);
@@ -341,7 +260,13 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
         "#,
     )?;
 
+    rebuild_agent_events_if_legacy(conn)?;
+
     for column_sql in [
+        "status TEXT NOT NULL DEFAULT 'pending'",
+        "current_phase INTEGER",
+        "error_message TEXT NOT NULL DEFAULT ''",
+        "completed_at INTEGER",
         "run_dir TEXT NOT NULL DEFAULT ''",
         "db_path TEXT NOT NULL DEFAULT ''",
         "git_sha TEXT NOT NULL DEFAULT ''",
@@ -372,27 +297,75 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
     )?;
 
     for column_sql in [
-        "workflow_version TEXT NOT NULL DEFAULT ''",
-        "reflection_version TEXT NOT NULL DEFAULT ''",
-        "agent_count INTEGER NOT NULL DEFAULT 0",
-        "prediction_date TEXT NOT NULL DEFAULT ''",
-        "ticker TEXT NOT NULL DEFAULT ''",
+        "phase INTEGER",
+        "turn_number INTEGER NOT NULL DEFAULT 0",
+        "full_context_json TEXT NOT NULL DEFAULT '[]'",
+        "summary TEXT NOT NULL DEFAULT ''",
+        "model TEXT NOT NULL DEFAULT ''",
+        "input_tokens INTEGER NOT NULL DEFAULT 0",
+        "output_tokens INTEGER NOT NULL DEFAULT 0",
+        "cached_tokens INTEGER NOT NULL DEFAULT 0",
+        "reasoning_tokens INTEGER NOT NULL DEFAULT 0",
+        "total_tokens INTEGER NOT NULL DEFAULT 0",
+        "non_cached_input_tokens INTEGER NOT NULL DEFAULT 0",
+        "visible_output_tokens INTEGER NOT NULL DEFAULT 0",
         "cost_usd REAL NOT NULL DEFAULT 0.0",
+        "context_warning INTEGER NOT NULL DEFAULT 0",
+        "elapsed_ms INTEGER NOT NULL DEFAULT 0",
     ] {
-        add_column_if_missing(conn, "prompt_metrics", column_sql)?;
+        add_column_if_missing(conn, "agent_events", column_sql)?;
     }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_agent_events_run_phase ON agent_events(run_id, phase);
+         CREATE INDEX IF NOT EXISTS idx_agent_events_run_role ON agent_events(run_id, role)",
+    )?;
 
-    // Phase 2: drop dead columns from prior schema versions
     drop_column_if_exists(conn, "predictions", "prediction_horizon")?;
     drop_column_if_exists(conn, "outcomes", "market_regime_json")?;
-    drop_column_if_exists(conn, "prompt_metrics", "market_regime_json")?;
     drop_column_if_exists(conn, "memory_versions", "invalidation_conditions_json")?;
     drop_column_if_exists(conn, "memory_versions", "follow_up_checks_json")?;
     drop_column_if_exists(conn, "memory_items", "source_run_id")?;
     drop_column_if_exists(conn, "memory_items", "source_role")?;
-    drop_column_if_exists(conn, "turn_context_items", "content")?;
-    drop_column_if_exists(conn, "turn_context_items", "item_json")?;
 
+    Ok(())
+}
+
+fn rebuild_agent_events_if_legacy(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(agent_events)")?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if columns.is_empty() {
+        return Ok(());
+    }
+    let legacy = columns
+        .iter()
+        .any(|c| c == "event_index" || c == "content_json")
+        || !columns.iter().any(|c| c == "full_context_json");
+    if !legacy {
+        return Ok(());
+    }
+
+    // Legacy event-stream schema is incompatible with turn-summary agent_events.
+    conn.execute_batch(
+        r#"
+        DROP TABLE IF EXISTS agent_events_legacy_stream;
+        ALTER TABLE agent_events RENAME TO agent_events_legacy_stream;
+        CREATE TABLE agent_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            turn_id TEXT NOT NULL UNIQUE,
+            run_id TEXT NOT NULL DEFAULT '',
+            phase INTEGER,
+            turn_number INTEGER NOT NULL DEFAULT 0,
+            role TEXT NOT NULL DEFAULT '',
+            created_at INTEGER NOT NULL,
+            full_context_json TEXT NOT NULL DEFAULT '[]',
+            summary TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_agent_events_run_phase
+            ON agent_events(run_id, phase);
+        "#,
+    )?;
     Ok(())
 }
 

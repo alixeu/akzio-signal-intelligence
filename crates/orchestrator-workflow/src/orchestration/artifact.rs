@@ -601,7 +601,6 @@ pub(crate) fn weighted_probability_base(
         .collect()
 }
 
-
 /// Apply `speculation_discount` from research_calibration.md:
 /// opinion ×0.7, speculation ×0.3 (fact ×1.0, unclassified ×0.5), and if
 /// speculation ratio > 50% apply an additional ×0.7 overall haircut.
@@ -1086,7 +1085,6 @@ mod tests {
         assert_eq!(qqq["source_roles"].as_array().unwrap().len(), 2);
     }
 
-
     #[test]
     fn skips_reports_missing_confidence_or_direction() {
         let state = json!({
@@ -1115,8 +1113,6 @@ mod tests {
         assert!(skipped.iter().any(|v| v == "analyst.news_macro"));
     }
 
-
-
     #[test]
     fn applies_speculation_discount_to_confidence() {
         let state = json!({
@@ -1144,5 +1140,4 @@ mod tests {
         // avg type weight = 0.3, speculation_ratio=1.0 => *0.7 => 0.21
         assert!((confidence - 0.21).abs() < 1e-9, "got {confidence}");
     }
-
 }

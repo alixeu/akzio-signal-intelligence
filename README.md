@@ -1,345 +1,671 @@
-# Akzio Signal Intelligence
+<p align="center">
+  <h1 align="center">Akzio Signal Intelligence</h1>
+  <p align="center">
+    <strong>Rust-native Multi-Agent Investment Research Engine</strong>
+  </p>
+  <p align="center">
+    一个自主运行的 AI 投资研究团队 —— 它辩论、校准概率、管理风险，并从历史决策中持续学习。
+  </p>
+</p>
 
-Rust workspace for running AI-assisted market-signal research workflows. The project orchestrates analyst prompts, LLM-backed role execution, SQLite-backed run state, technical-data imports, and daily TQQQ-oriented report generation.
+<p align="center">
+  <img src="https://img.shields.io/badge/language-Rust-orange?style=flat-square&logo=rust" alt="Rust">
+  <img src="https://img.shields.io/badge/edition-2021-blue?style=flat-square" alt="Edition">
+  <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="MIT">
+  <img src="https://img.shields.io/badge/agents-8+%20roles-purple?style=flat-square" alt="Agents">
+  <img src="https://img.shields.io/badge/architecture-Multi--Agent%20Workflow-red?style=flat-square" alt="Architecture">
+</p>
 
-## What Is Included
+---
 
-- Multi-crate Rust workspace with shared core, SQL, LLM, and CLI crates.
-- Prompt packs for analysts, researchers, mediators, managers, and risk profiles.
-- CLI binaries for orchestrator runs, SQL context tools, transcript fetching, Jin10 flash data, Yahoo Finance technical indicators, reflection scoring/distillation/promotion, and report email delivery.
-- Explicit mock execution paths for local development without live provider API keys.
+> **免责声明**：本系统是投资研究辅助工具，不构成投资建议。所有输出应作为决策过程中的参考信号之一，而非直接交易指令。
 
-## Workspace Layout
+---
 
-| Path | Purpose |
-| --- | --- |
-| `crates/orchestrator-core` | Shared config loading, project paths, ticker parsing, prompt helpers, and artifact validation. |
-| `crates/orchestrator-sql` | SQLite schema, imports, scoped agent messages, and read-context commands. |
-| `crates/orchestrator-llm` | Rig LLM integration, OpenAI-compatible Responses routing, tool registration, and mock agent artifacts. |
-| `crates/orchestrator-cli` | Binary entry points and orchestration commands. |
-| `prompts/` | Markdown prompt templates for analyst, researcher, mediator, manager, meta, and risk roles. |
+## Overview
 
-## Requirements
+### 为什么需要这个系统
 
-- Rust toolchain with Cargo.
-- Live provider API keys configured locally when a selected provider requires them.
-- Optional `curl` command for SMTP report delivery.
+大语言模型改变了信息处理方式，但将 LLM 直接用于投资决策存在根本性缺陷：
 
-## Quick Start
+| 问题 | 后果 |
+|------|------|
+| **单模型观点偏差** | 模型倾向于确认自身假设，没有内部挑战机制 |
+| **缺乏反方验证** | 所有证据都被同一个模型解读，confirmation bias 不可避免 |
+| **没有概率校准** | "看涨"或"看跌"缺少量化置信度，无法指导仓位 |
+| **没有失败复盘** | 错误判断不被记录、不被分析、不改善未来决策 |
+| **没有长期经验积累** | 每次分析从零开始，不具备机构记忆 |
 
-```bash
-cargo test
-cargo build
+Akzio Signal Intelligence 的回答不是"让 AI 更擅长预测"，而是：
+
+> **构建一个具备辩论、校准、风控、记忆能力的 AI 投资研究流程。**
+
+它模拟真实投资机构中的完整决策链路：
+
+```
+Research Team → Investment Committee → Risk Committee → Portfolio Manager → Post-Mortem
 ```
 
-Run a mock market research workflow:
+---
 
-```bash
-cargo run -p orchestrator-cli --bin orchestrator-exec -- TQQQ --mock
+## Core Philosophy
+
+### Research ≠ Prediction
+
+本系统不是：
+
+```
+Input:  股票代码
+Output: 买 / 卖
 ```
 
-Run the default ETF allocation workflow for QQQ/SOXX with VIX as the volatility
-regime signal:
+本系统是：
 
-```bash
-cargo run -p orchestrator-cli --bin orchestrator-exec -- QQQ,SOXX,VIX --mock
+```
+Input:   多维市场证据（技术面、宏观、新闻、社交媒体、视频分析）
+Process: 多 Agent 独立推理 → 对抗辩论 → 证据加权 → 概率更新
+Output:  概率分布 + 置信区间 + 风险约束 + Portfolio Allocation
 ```
 
-Phase 1 defaults to `technical,news`. Social analysts remain available by
-explicit opt-in, for example `--phase1-agents technical,news,reddit` after
-their source context has been imported into SQLite.
+核心问题不是：
 
-Run only Phase 1:
+> "AI 能不能预测股票？"
 
-```bash
-cargo run -p orchestrator-cli --bin orchestrator-exec -- TQQQ --mock --to-phase 1
+而是：
+
+> "AI 能不能构建一个持续学习、自我修正的研究流程？"
+
+---
+
+## System Architecture
+
+```mermaid
+graph TD
+    subgraph "数据层 Data Layer"
+        YAHOO[Yahoo Finance<br/>OHLCV + 技术指标]
+        JIN10[Jin10 金融快讯]
+        YT[YouTube 分析师]
+        SOCIAL[Reddit · X]
+        SQL[(SQLite WAL<br/>统一状态存储)]
+    end
+
+    subgraph "Phase 1 — 多源研究"
+        TA[技术分析 Agent<br/>权重 40%]
+        NA[新闻/宏观 Agent<br/>权重 35%]
+        YA[视频分析 Agent]
+        SA[社交情绪 Agent]
+    end
+
+    subgraph "Phase 2 — 对抗辩论"
+        TG[议题生成器]
+        BULL[Bull Researcher<br/>寻找上涨逻辑]
+        BEAR[Bear Researcher<br/>寻找下跌风险]
+        TC[辩论裁判<br/>Topic Controller]
+        RED[证据压缩器<br/>Reducer]
+    end
+
+    subgraph "Phase 3 — 概率裁决"
+        RM[Research Manager<br/>Bayesian Updater]
+    end
+
+    subgraph "Phase 4-6 — 执行链路"
+        TR[Trader Agent<br/>交易转换]
+        RISK[风险委员会<br/>保守 · 中性 · 激进]
+        PM[Portfolio Manager<br/>最终决策]
+    end
+
+    subgraph "Phase 7-8 — 输出与学习"
+        ALLOC[配置引擎<br/>Rust 硬约束]
+        REF[反思归档<br/>Reflection]
+    end
+
+    subgraph "记忆层 Memory Layer"
+        MEM[经验记忆<br/>质量评分 · Regime 感知]
+        CAND[候选经验池]
+        OUT[预测 vs 结果]
+    end
+
+    YAHOO & JIN10 & YT & SOCIAL --> SQL
+    SQL --> TA & NA & YA & SA
+    TA & NA & YA & SA --> TG
+    TG --> BULL & BEAR
+    BULL & BEAR --> TC
+    TC --> RED
+    RED --> RM
+    RM --> TR
+    TR --> RISK
+    RISK --> PM
+    PM --> ALLOC
+    ALLOC --> REF
+    REF --> MEM
+    OUT --> CAND
+    CAND --> MEM
+    MEM --> SQL
 ```
 
-Build a report payload/HTML from the latest run output:
+---
 
-```bash
-cargo run -p orchestrator-cli --bin report-email -- --mode build
+## Workflow Engine
+
+系统执行确定性 8 阶段流水线。每个阶段可通过 `--from-phase` / `--to-phase` 独立寻址。
+
+### Phase 1 — 多源研究（Multi-Source Research）
+
+**目的**：从多个独立数据源收集市场证据，形成初始分析基础。
+
+**输入**：
+- SQLite 中的技术指标数据（60 日窗口）
+- 金融快讯（Jin10，24 小时回溯）
+- YouTube 分析师视频逐字稿
+- Reddit / X 社交媒体内容
+- 历史记忆注入（Phase 0 Reflection）
+
+**处理**：
+- 多个 Analyst Agent 并行执行（可配置并行度）
+- 每个 Agent 具有独立权重
+- Preflight 检查确保 SQLite 中存在必需数据
+- 关键角色（technical, news_macro）失败触发降级标记
+
+**输出**：
+- 结构化分析 Artifact（JSON schema 强约束）
+- 每个 Agent 的置信度评分
+- 加权后的 Base Probability
+
+| Agent | 数据源 | 默认权重 |
+|-------|--------|----------|
+| `technical` | Yahoo Finance OHLCV + 指标 | 40% |
+| `news_macro` | Jin10 快讯 + Web Search | 35% |
+| `youtube` | 视频分析师逐字稿 | 可配置 |
+| `reddit` | Subreddit 情绪 | 可配置 |
+| `x` | Twitter/X 帖子 | 可配置 |
+
+---
+
+### Phase 2 — 对抗辩论（Adversarial Debate）
+
+**目的**：通过结构化多轮辩论消除单方向偏差，确保每个重要观点都被正反两方检验。
+
+**输入**：
+- Phase 1 所有 Agent 的分析 Artifact
+- 当前市场 Regime 信息
+
+**处理**：
+
+1. **议题生成** — Mediator 从 Phase 1 证据中提取可辩论议题
+2. **多轮辩论** — Bull/Bear Researcher 就每个议题进行 N 轮交锋（默认 3 轮）
+3. **辩论裁判** — Topic Controller 评估论据质量，决定何时结束
+4. **证据压缩** — Reducer 将辩论输出压缩为加权证据摘要
+
+**输出**：
+- 每个议题的净证据方向和强度
+- 压缩后的辩论摘要
+- Debate Adjustment 值
+
+---
+
+### Phase 3 — 贝叶斯概率裁决（Bayesian Probability Adjudication）
+
+**目的**：将所有证据合成为校准后的概率判断。**不是重新预测市场。**
+
+**输入**：
+- Weighted Base Probability（来自 Phase 1 权重加总）
+- Debate Adjustment（来自 Phase 2 辩论净值）
+- Evidence Strength（各信号的证据强度）
+- Market Regime（波动率、趋势、流动性、利率、广度）
+
+**处理**：
+
+```
+Final Probability = Base Probability + Debate Adjustment + Evidence Modifier
 ```
 
-Send the built report by email:
+**硬约束**：
+- 单信号调整幅度上限 **±8%**
+- 最终概率限制在 `[0.05, 0.95]` 区间
+- 必须输出 Confidence 评分
+- 高波动率 Regime 自动扩大不确定性带
 
-```bash
-cargo run -p orchestrator-cli --bin report-email -- --mode send
+**输出**：
+
+```json
+{
+  "long_probability": 0.63,
+  "short_probability": 0.37,
+  "confidence": 0.72,
+  "investment_thesis": "...",
+  "market_regime": {
+    "volatility": "medium",
+    "trend": "bullish",
+    "liquidity": "normal"
+  }
+}
 ```
 
-`report-email` sends the first report each day. After that, it sends again only
-when the direction reverses between long and short and the new direction
-probability is at least `report.email.probability_threshold`.
+---
 
-## Main CLI Binaries
+### Phase 4 — 交易转换（Trading Translation）
 
-| Binary | Purpose |
-| --- | --- |
-| `orchestrator-exec` | Run the phased stock-analysis orchestrator. |
-| `orchestrator-sql` | Read/write run context in SQLite for agent tools. |
-| `report-email` | Build and send the daily report email. |
-| `fetch-jin10-flash` | Fetch Jin10 flash/news context. |
-| `fetch-last30days-context` | Fetch Reddit, X, or YouTube social context. |
-| `fetch-youtube-transcript` | Fetch YouTube transcript data. |
-| `fetch-wayinvideo-transcript` | Fetch transcript data through WayinVideo. |
-| `run-technical-indicators` | Fetch Yahoo Finance bars and compute local technical indicators. |
-| `reflection-score` | Score expired prediction snapshots against stored `Close` prices and write outcomes. |
-| `weekly-distill` | Aggregate scored outcomes into candidate long-term experiences. |
-| `memory-promote` | Gate candidate experiences, promote approved ones into active memory, and degrade stale low-quality memories. |
+**目的**：将研究结论转化为可执行的交易参数。
 
-## Configuration
+**输入**：Research Plan（Phase 3 输出）
 
-Runtime configuration is loaded from `config/config.yaml`. This file is the default source for role-level LLM settings, prompt paths, output paths, analyst weights, SQLite requirements, and data-ingestion defaults. Before expanding `${VAR}` placeholders, the loader reads `.env` from the config directory or project root when present, so local live-run secrets can live in an untracked `.env`. CLI flags still override config values when provided.
+**处理**：
+- LLM Trader Agent 生成方向、仓位逻辑、入场条件
+- 当 Policy 信号指示高置信度 + 明确方向时，启用 **Rust 规则引擎** 绕过 LLM 进行确定性转换
 
-Live orchestrator runs use a strict SQLite data-source policy by default. Network, CSV, and file-based collectors should run before the orchestrator and import their outputs into SQLite. The orchestrator then reads context from SQLite only.
+**输出**：交易意图（方向、凸性、仓位建议）
 
-External source imports now land in the unified `external_source_items` table as well as their compatibility tables, so new source readers can use one canonical lookup path without breaking existing Jin10, YouTube, or social queries. Composed context snapshots still persist by default for traceability; callers can pass `persist_context=false` to `read_run_context` when they only need the composed response and do not want per-turn `turn_context_items` rows.
+---
 
-`orchestrator.db_path` is the shared runtime SQLite database, defaulting to `outputs/orchestrator.sqlite`. Direct `orchestrator-exec`, the Rust daily flow, and technical imports use this same database unless a CLI `--db-path` is provided.
+### Phase 5 — 风险辩论（Risk Debate）
 
-`orchestrator.allocation` controls ETF portfolio sizing. `investable_tickers`
-lists the assets that may receive weight, `regime_signal` is usually `VIX`,
-`regime_thresholds`/`regime_labels` classify volatility regimes,
-`correlation_window_days` controls the rolling correlation window,
-`max_single_position` caps concentration, and `vol_indicator` selects the
-technical volatility proxy (default `STD20`). Technical imports store a `Close`
-indicator so Phase 7 can read VIX levels and compute cross-asset correlations
-from SQLite.
+**目的**：模拟风险委员会对交易方案的压力测试。
 
-`orchestrator.reflection` controls the long-term memory layer. `enabled` gates
-Phase 0 retrieval injection and Phase 8 archive/prediction capture,
-`reflection_version` labels generated snapshots and promoted memories,
-`promote_mode` controls whether promotion is automatic or review-oriented, and
-`retrieval.token_budget` / `retrieval.max_items` / `retrieval.min_quality` bound
-how many active memories can be injected before Phase 1 or returned through
-`read_run_context(kind="prior_memory")`.
+**输入**：Trader 输出 + Research Plan
 
-### Workflow Stages And Reducers
+**处理**：
 
-The orchestrator is moving toward a `Workflow -> Stage/Sub-workflow -> Agent workers -> Reducer -> state artifact` execution model. Agent workers produce role-specific artifacts; reducers compress those artifacts into durable state briefs that downstream stages can consume without rereading every raw message.
+三位不同风格的风险分析师同时评估：
 
-`orchestrator.workflow` controls the implemented runtime knobs. Missing keys use conservative defaults in the Rust orchestrator:
+| 角色 | 视角 |
+|------|------|
+| `conservative` | 最大回撤、尾部风险、相关性暴露 |
+| `neutral` | 风险回报平衡、仓位适当性 |
+| `aggressive` | 低配机会成本 |
 
-- `phase1.parallelism` or `parallel.max_worker_concurrency` controls Phase 1 worker fan-out.
-- `agent_timeout_sec` or `timeouts.worker_sec` controls worker timeout seconds.
-- `reducer_timeout_sec` or `timeouts.reducer_sec` controls LLM controller timeout seconds.
-- `critical_roles.phase1` lists roles that must complete for a stage to proceed.
-- `late_evidence.enabled` controls whether delayed worker/source outputs are appended to state artifacts and marked as late.
-- `policy.mode` defaults to `selective`, letting Rust derive or skip optional Phase 4/5/6 work after Phase 3 while preserving legacy state fields. Set it to `legacy` only when you need the old always-run path.
+**输出**：综合风险评估 + 仓位调整建议
 
-Roles not listed under `critical_roles` are treated as noncritical. A noncritical role failure should degrade the relevant state artifact with an explicit evidence gap instead of blocking the whole workflow. Critical role failure should block the affected stage unless the runtime explicitly overrides that policy.
+---
 
-Reducer state artifacts are built deterministically in Rust. Phase 0 runs before
-Phase 1 when reflection is enabled: it retrieves active prior memories with
-quality/regime/budget filtering and injects `prior_memory`, `track_record`, and
-`agent_accuracy` into run state. Phase 1.5 writes the evidence state artifact
-from existing analyst artifacts. Phase 2 first runs `mediator.topic` to generate
-topic candidates from that Phase 1.5 artifact. Each topic then runs sequential
-bull/bear micro-turns with a per-topic `mediator.topic_controller` Phase 2.5a
-artifact after every micro-turn. Phase 2.5b writes the final debate state brief
-from topic controller artifacts.
+### Phase 6 — 最终决策（Portfolio Manager）
 
-Phase 4 runs `trader` to convert `research_plan` into `trader_investment_plan`.
-Phase 5 runs a fixed risk debate rotation: `risk.aggressive` →
-`risk.conservative` → `risk.neutral`. Phase 6 runs `portfolio.manager` to write
-`final_trade_decision`. Phase 7 writes `portfolio_allocation` for ETF runs. Rust
-builds an allocation context from `research_plan`, `trader_investment_plan`,
-`risk_debate_state`, `final_trade_decision`, latest VIX `Close`, per-asset
-volatility, and rolling correlation from stored `Close` rows. The
-`allocation.manager` role decides QQQ/SOXX/`cash_hedge` weights; Rust filters
-invalid assets, caps single positions, normalizes weights to 100%, and falls
-back to inverse-vol allocation if the LLM output is unusable. VIX is a regime
-signal only, never an allocated asset. Phase 8 archives the completed run,
-writes per-ticker prediction snapshots, and copies prompt/system metrics into
-reflection tables for later scoring and distillation.
+**目的**：整合交易意图和风险评估，生成人类可读的投资决策。
 
-Phase 3 is the only market-decision phase. Downstream optional phases may add
-execution constraints, skipped/derived artifacts, and allocation inputs, but must
-not rewrite Phase 3 probability, rating, or thesis.
+**输入**：Trade Intent + Risk Assessment
 
-Standalone `fundamental` analyst execution was removed. Fundamental company facts belong inside `analyst.news_macro` and are treated as a news sub-signal rather than an independent vote.
+**输出**：Final Trade Decision（含理由链）
 
-### Agent Loop And ReAct Runtime
+---
 
-The runtime now has an explicit Turn loop instead of relying only on one prompt returning one final artifact. A Turn is the lifecycle unit for a role request and records ordered items:
+### Phase 7 — 组合配置（Allocation）
 
-- `user_message`
-- `assistant_message`
-- `reasoning_summary`
-- `tool_call`
-- `tool_result`
-- `system_context`
-- `developer_context`
-- `compact_summary`
-- `injected_context`
+**目的**：Rust 硬约束下的组合构建。
 
-Current gap from the old path: the underlying model library already had an internal tool loop, but that loop hid tool calls, tool results, follow-up decisions, and conversation history from this project. The project runtime now owns those pieces. Every live role call enters `run_rig_agent_loop`, which builds a Turn, asks the model for a structured next action, executes any requested tool through the runtime, appends the tool result to session history, and continues until the model produces a final assistant message or a stop condition is hit.
+**Rust 层强制执行**：
+- 权重归一化至 100%
+- 可投资资产宇宙验证（`orchestrator.allocation.investable_assets`）
+- 单标的仓位上限
+- 现金下限保护
 
-Turn history is append-only in SQLite:
+**输出**：
 
-- `agent_turns` stores lifecycle state such as `turn_id`, `session_id`, `user_input`, `model_context`, `needs_follow_up`, and `end_reason`.
-- `agent_turn_items` stores ordered context items, tool calls, tool results, compact summaries, and injected context.
+```json
+{
+  "QQQ": 0.45,
+  "SOXX": 0.30,
+  "Cash": 0.25
+}
+```
 
-The first implementation focuses on the minimal closed loop:
+---
 
-1. Build model input from session history, user input, pending steer input, and tool results.
-2. Ask the model to return the loop action fields: `assistant_message`, `reasoning_summary`, `tool_calls`, and `end_turn`.
-3. Validate tool names and arguments in the runtime.
-4. Execute blocking tools and append `tool_result`.
-5. Continue while there are tool calls, tool results, pending steer inputs, or `end_turn=false`.
-6. End with `completed`, `max_loops`, or an explicit error reason.
+### Phase 8 — 反思归档（Reflection & Archive）
 
-### Role-Level LLM Settings
+**目的**：记录预测、为未来 Outcome Scoring 播种。
 
-Every business role must have an entry under `orchestrator.llm.roles`. Common provider, model, reasoning, turn-limit, key, and tool settings can live under `orchestrator.llm.defaults`; each role inherits those defaults and only needs to define fields that differ. Missing roles, unknown tools, missing gateway fields, or missing direct API keys fail during startup.
+**处理**：
+- 持久化结构化 Prediction 记录（ticker、date、probabilities、regime）
+- 归档 Run 元数据（耗时、模型版本、降级状态）
+- 启动 Reflection Pipeline 的数据准备
 
-Defaults and each role support:
+---
 
-| Field | Purpose |
-| --- | --- |
-| `route` | Use `responses` for `${base_url}/responses`. |
-| `model` | Provider model name for that role. |
-| `base_url` | Gateway API root, usually ending in `/v1`; the runtime appends `/responses`. |
-| `api_key` | Direct local API key value for the configured provider. |
-| `preamble` | Optional Rig agent preamble for role-level steering. It is omitted by default and should not be used as the structured-output enforcement mechanism. |
-| `max_turns` | Optional agent-loop turn cap. Set `null` or omit it for no role-level max-turn cap; set a positive number on a role to override. |
-| `reasoning_effort` | Optional Responses reasoning effort, injected as `additional_params.reasoning.effort` when set to a value other than `none`/`0`. |
-| `reasoning_summary` | Optional Responses reasoning summary level: `auto`, `concise`, or `detailed`. |
-| `preserve_reasoning_state` | When `true`, requests include `reasoning.encrypted_content`, set `store: false`, persist encrypted reasoning state, and replay it on the next model iteration. |
-| `transport` | Use `http` by default. Use `ws` for Responses WebSocket mode. |
-| `think_tool` | Registers Rig `ThinkTool` for that role when `true`. |
-| `tools` | Names of external tools available to that role. Use `all` in defaults to expose every registered project tool, then override per role when needed. |
-| `native_web_search` | Set `true` when the gateway/model supports provider-native web search. When enabled and `orchestrator.web_search.mode` is `live`, the request uses hosted `web_search` and does not expose the configured `web.run` fallback. |
+## Agent Architecture
 
-Responses routing behavior:
+### 设计原则
 
-- `route: responses` uses Rig's OpenAI Responses client with the role's `base_url`; the final request path is `${base_url}/responses`, so set `base_url` to the gateway API root ending in `/v1`.
-- `transport: ws` enables Responses WebSocket mode for tool-aware event handling.
-- Reasoning params are injected for Responses routes only. With `preserve_reasoning_state: true`, the runtime stores OpenAI encrypted reasoning state locally and replays it as a typed Responses `reasoning` input item on the next iteration.
-- Web search follows role capability: when `orchestrator.web_search.mode` is `live`, roles with `native_web_search: true` use provider-native web search; all other roles receive the `web.run` agent tool backed by Exa MCP. Other modes send no web search tool.
-- `manager.research` uses Rig typed structured output for `ResearchArtifact`; on Responses routes, the runtime uses provider-native Responses structured output when the gateway/model supports it, then validates probabilities and ticker payloads.
-- Other JsonArtifact roles still parse JSON text from their prompt/contracts and validate those artifacts after the model response.
+每个 Agent 运行在 Rig 框架的 Agent Loop 中，具备：
 
-`--model` overrides only the role model names. `--reasoning-effort` overrides only role Responses reasoning effort. `--mock` bypasses live LLM calls; live daily runs no longer silently downgrade to mock output when provider keys are missing.
+- **作用域隔离的 SQLite 上下文** — `read_run_context` 工具提供时间窗口和 Ticker 过滤后的精确数据
+- **结构化输出契约** — Prompt 层 JSON Schema 强约束输出格式
+- **Turn 级持久化** — 每个 Agent Turn 的完整对话上下文和摘要存入 `agent_events`
+- **优雅降级** — 失败的 Agent 产生 Degraded 标记，后续阶段在降低置信度下继续运行
+- **Web Search 能力** — Exa 驱动的实时搜索（可配置）
 
-Prompts now receive only run-boundary values such as ticker, date, role, phase, round, and topic id. Agents read current-run data through the structured `read_run_context` tool instead of having analyst reports, debate history, or large context packets injected into the prompt. Supported long-term memory context kinds include `prior_memory`, `track_record`, and `agent_accuracy`; `compose_context` can include prior-memory blocks while respecting its token budget.
+### 角色体系
 
-Unified `/v1/responses` gateway example:
+```
+prompts/
+├── analysts/           # Phase 1 研究 Agent
+│   ├── technical.md    # 技术分析
+│   ├── news_macro.md   # 新闻/宏观
+│   ├── youtube.md      # 视频分析
+│   ├── reddit.md       # Reddit 情绪
+│   └── x.md           # Twitter/X
+├── researchers/        # Phase 2 辩论 Agent
+│   ├── bull_initial.md
+│   ├── bear_initial.md
+│   ├── bull_interaction.md
+│   └── bear_interaction.md
+├── mediators/          # 辩论编排
+│   ├── topic_generation.md
+│   └── topic_controller.md
+├── managers/           # 决策综合
+│   ├── research_manager.md
+│   └── portfolio_manager.md
+├── traders/            # 交易转换
+│   └── trader.md
+├── risk/               # 风险委员会
+│   ├── conservative.md
+│   ├── neutral.md
+│   └── aggressive.md
+└── allocation/         # 配置管理
+    └── manager.md
+```
+
+---
+
+## Decision Engine
+
+### 为什么是 Probability-First，不是 LLM Direct Trading
+
+| 方法 | 失败模式 |
+|------|----------|
+| "TQQQ 会涨吗？" | 锚定效应、近因偏差、虚构的确定性 |
+| "基于这 12 条证据，调整 base probability ±X%" | 有界、可审计、抗单点失效 |
+
+### 决策公式
+
+```
+Prior Probability (加权 Analyst 基础概率)
+    ×
+Evidence Weight (证据强度系数)
+    +
+Debate Adjustment (辩论净方向)
+    =
+Posterior Probability (校准后概率)
+```
+
+### 职责分离
+
+| 层 | 职责 |
+|----|------|
+| **LLM** | 推理、证据解读、论据构建 |
+| **Rust** | 约束执行、概率边界、权重归一化、Policy 门控 |
+
+LLM 负责 *thinking*，Rust 负责 *decision safety*。
+
+### Workflow Policy 系统
+
+`WorkflowPolicyMode::Selective` 在执行昂贵的 LLM Phase 之前评估信号：
+
+| Policy Reason | 触发条件 | 效果 |
+|---------------|----------|------|
+| `LOW_CONFIDENCE` | 概率接近 0.5 + 低置信度 | 触发额外审查 |
+| `HIGH_VOLATILITY` | VIX 飙升或 Regime 波动率升高 | 自动降低仓位上限 |
+| `TRADE_RESEARCH_CONFLICT` | Trader 输出与 Research 矛盾 | 触发冲突调和 |
+| `PROBABILITY_NEAR_NEUTRAL` | 方向不明确 | 偏向现金配置 |
+| `RESEARCH_DEGRADED` | Phase 1 降级 | 限制下游置信度 |
+| `HIGH_CORRELATION` | 标的间高相关性 | 分散化要求 |
+
+---
+
+## Reflection Layer
+
+这是系统的核心竞争力 — **从失败中学习**。
+
+```
+┌─────────────┐     ┌─────────────┐     ┌──────────────────┐
+│ Prediction  │────▶│   Outcome   │────▶│   Evaluation     │
+│             │     │             │     │                  │
+│ · 概率判断  │     │ · 实际收益  │     │ · 方向正确？     │
+│ · 市场 Regime│     │ · N日后价格 │     │ · 概率误差多大？ │
+│ · 置信度    │     │             │     │ · 哪个信号有效？ │
+└─────────────┘     └─────────────┘     └──────────────────┘
+                                                  │
+                                                  ▼
+                                        ┌──────────────────┐
+                                        │   Candidate      │
+                                        │   Experience     │
+                                        │                  │
+                                        │ · Finding        │
+                                        │ · Recommendation │
+                                        │ · Effect Size    │
+                                        │ · Sample Count   │
+                                        └──────────────────┘
+                                                  │
+                                          Quality Gate
+                                          (置信度 + 样本量 + 效应量)
+                                                  │
+                                                  ▼
+                                        ┌──────────────────┐
+                                        │  Active Memory   │
+                                        │                  │
+                                        │ · Regime 标签    │
+                                        │ · 质量评分       │
+                                        │ · 版本化内容     │
+                                        │ · 过期机制       │
+                                        └──────────────────┘
+                                                  │
+                                                  ▼
+                                        ┌──────────────────┐
+                                        │  Phase 0 注入    │
+                                        │  (未来运行)      │
+                                        └──────────────────┘
+```
+
+### 记忆生命周期
+
+1. **记录预测** — 每次运行存储 ticker、date、概率、regime
+2. **结果评分** — `reflection_score` 在 N 日后对比预测与实际收益
+3. **候选生成** — `weekly_distill` 聚合评分结果为经验候选
+4. **质量门控** — 候选需满足最低样本量、置信度和效应量
+5. **晋升激活** — `memory_promote` 将通过审核的候选提升为活跃记忆
+6. **检索注入** — 未来运行中按 ticker、scope、当前 regime 兼容性检索相关记忆
+
+### 记忆作用域
+
+| Scope | 示例 |
+|-------|------|
+| `ticker` | "QQQ 在低波动率 Regime 中 3 日跌幅超 5% 后倾向均值回归" |
+| `sector` | "半导体板块在 Fed 利率不确定期表现滞后" |
+| `macro` | "市场广度背离通常领先修正 2-3 周" |
+| `market_regime` | "高波动率 Regime 偏好小仓位和宽止损" |
+| `strategy` | "当 VIX 从低位转中位时动量信号衰减" |
+| `agent` | "技术分析 Agent 在震荡市中过度依赖 RSI 背离" |
+
+---
+
+## Database Architecture
+
+单一 SQLite 数据库（WAL 模式，5s busy timeout），设计思想：**一切可追溯、一切可回放**。
+
+### 设计理念
+
+| 模块 | 用途 | 价值 |
+|------|------|------|
+| **Run Archive** | 保存每次完整研究过程 | 任意历史运行可回放审计 |
+| **Agent Turns** | 保存每次 LLM 对话轮次 | Token 用量分析、质量追踪 |
+| **Predictions** | 保存当时概率判断 | Outcome Scoring 的基准线 |
+| **Outcomes** | 保存实际市场结果 | 验证系统校准度 |
+| **Candidate Experiences** | 保存待晋升的学习成果 | 质量门控，防止噪声记忆 |
+| **Memory Items** | 保存活跃经验记忆 | 未来运行的先验知识 |
+| **Prompt Metrics** | Token 使用、延迟、成本 | 运营成本监控和优化 |
+| **Technical Indicators** | 多周期 OHLCV + 指标 | 可重放的数据快照 |
+
+### 核心表结构
+
+```
+runs                    ← 运行元数据、状态、耗时
+agent_events            ← 每 Turn 完整对话上下文 + 摘要
+role_turn_summaries     ← 各角色的结构化分析输出
+predictions             ← 校准后的概率预测
+outcomes                ← 实际收益 vs 预测
+memory_items            ← 活跃经验记忆（版本化）
+memory_versions         ← 记忆内容版本 + 证据引用
+candidate_experiences   ← 预晋升的经验候选
+external_items          ← 外部源（Jin10/Youtube/Reddit/X）内容
+technical_features      ← 多周期技术指标快照
+```
+
+时间字段统一使用 Unix 时间戳（INTEGER）存储。
+```
+
+---
+
+## Engineering Design
+
+### 为什么是 Rust
+
+| 特性 | 价值 |
+|------|------|
+| **类型系统** | 编译期保证 Allocation 权重归一化、概率边界、Policy 枚举完备 |
+| **所有权模型** | 长时间运行（8 Phase × 多轮辩论）无内存泄漏 |
+| **async/await** | Phase 1 多 Agent 并发调度，不阻塞辩论评估 |
+| **零成本抽象** | Workflow Policy 判断在纳秒级完成，不增加 LLM 调用延迟 |
+| **Crate 边界** | 强制模块化 — 每个 Crate 有明确职责和公开 API |
+| **rusqlite bundled** | 单二进制部署，无外部数据库依赖 |
+
+### Crate 结构
+
+```
+crates/
+├── orchestrator-core       # 配置、路径、Ticker 解析、Prompt 辅助、Reflection 类型
+├── orchestrator-sql        # SQLite Schema、数据访问、Context 检索、Memory 操作
+├── orchestrator-llm        # LLM 执行（Rig 框架）、Agent Loop、工具、Web Search、截断
+├── orchestrator-ingest     # 数据采集：Yahoo、Jin10、YouTube、Reddit、X
+├── orchestrator-workflow   # Phase 编排、Policy 引擎、Allocation、状态管理
+├── orchestrator-cli        # CLI 二进制入口
+├── orchestrator-report     # 报告生成和邮件发送
+└── orchestrator-eval       # 评估框架
+```
+
+---
+
+## Token Efficiency
+
+LLM 调用是系统的主要成本。设计中采用多层策略降低 Token 消耗：
+
+| 策略 | 实现 |
+|------|------|
+| **Evidence Compression** | Phase 2 Reducer 将多轮辩论压缩为结构化摘要 |
+| **Artifact Passing** | Phase 间只传递结构化 Artifact，不传原始对话 |
+| **Scoped Context** | `read_run_context` 按时间窗口 + Ticker 精确过滤 |
+| **Memory Retrieval** | 仅检索当前 Regime 兼容的记忆，不全量注入 |
+| **Truncation Engine** | `orchestrator-llm/truncation.rs` 智能截断超长内容 |
+| **Skip Zero-Weight** | 权重为 0 的 Analyst 在 Phase 1 直接跳过 |
+| **Rust Rule Bypass** | 高置信度场景用 Rust 规则代替 LLM Trader |
+| **Policy Skip** | Workflow Policy 门控跳过不必要的 LLM Phase |
+
+---
+
+## Example Research Run
 
 ```yaml
-orchestrator:
-  llm:
-    gateway:
-      base_url: &llm_gateway_base_url "https://your-unified-llm-gateway.example.com/v1"
-      api_key: &llm_gateway_api_key "your-local-gateway-key"
-    defaults:
-      route: responses
-      model: gpt-5.5
-      base_url: *llm_gateway_base_url
-      api_key: *llm_gateway_api_key
-      native_web_search: true
-      max_turns: null
-      reasoning_effort: low
-      reasoning_summary: auto
-      preserve_reasoning_state: true
-      transport: http
-      think_tool: false
-      tools: []
-    roles:
-      manager.research:
-        tools:
-          - read_run_context
+# 运行命令
+# cargo run -p orchestrator-cli --bin orchestrator-exec -- QQQ,SOXX
+
+Ticker: QQQ, SOXX
+Date: 2025-07-14
+Mode: probability
+Market Regime:
+  volatility: medium
+  trend: bullish
+  liquidity: normal
+  rates: stable
+
+Phase 1 Research Summary:
+  technical:  "RSI 62, MACD 金叉确认, 布林带中轨支撑有效"
+  news_macro: "Fed 按兵不动, AI 资本开支持续超预期, 中美关系缓和"
+
+Phase 2 Debate Result:
+  Bull Case: "Earnings momentum + 资金面宽松 + 半导体周期上行"
+  Bear Case: "估值历史高位 + 集中度风险 + 9月季节性弱势"
+  Net Adjustment: +3.2%
+
+Phase 3 Probability:
+  long_probability:  0.63
+  short_probability: 0.37
+  confidence: 0.72
+
+Phase 5 Risk Assessment:
+  max_drawdown_concern: moderate
+  concentration_risk: elevated
+  recommendation: "reduce SOXX weight by 5%"
+
+Phase 7 Portfolio Allocation:
+  QQQ:  45%
+  SOXX: 30%
+  Cash: 25%
+
+Policy Applied: selective
+Degraded: false
+Total Elapsed: 4m 32s
 ```
 
-Web search fallback example:
+---
 
-```yaml
-orchestrator:
-  web_search:
-    mode: live
-    base_url: "https://mcp.exa.ai/mcp"
-    api_key: ""
-    context_size: medium
-    max_result_chars: 12000
-  llm:
-    gateway:
-      base_url: &llm_gateway_base_url "https://your-unified-llm-gateway.example.com/v1"
-      api_key: &llm_gateway_api_key "your-local-gateway-key"
-    defaults:
-      route: responses
-      model: gpt-5.5
-      base_url: *llm_gateway_base_url
-      api_key: *llm_gateway_api_key
-      native_web_search: true
-      max_turns: null
-      transport: http
-      tools: []
-    roles:
-      analyst.news_macro: {}
-      analyst.reddit:
-        native_web_search: false
-```
+## Comparison
 
-The `analyst.news_macro` role uses provider-hosted `web_search` through the Responses gateway. Social analyst roles are opt-in and default to reading imported SQLite context only.
+|  | 传统 LLM Chat | Trading Bot | 量化模型 | **本系统** |
+|--|--------------|-------------|----------|-----------|
+| Multi-Agent | ❌ 单模型 | ❌ 单策略 | ❌ 单因子模型 | ✅ 8+ 角色协作 |
+| 对抗辩论 | ❌ | ❌ | ❌ | ✅ Bull/Bear 多轮 |
+| 概率校准 | ❌ 定性判断 | ⚠️ 信号阈值 | ✅ 统计回测 | ✅ Bayesian + 约束 |
+| 风险控制 | ❌ | ⚠️ 止损线 | ✅ VaR/CVaR | ✅ 多角色风控委员会 |
+| 记忆学习 | ❌ 无状态 | ❌ | ⚠️ 参数更新 | ✅ Reflection Layer |
+| 可解释性 | ⚠️ CoT | ❌ 黑盒 | ❌ 因子归因 | ✅ 全链路审计 |
+| 自我修正 | ❌ | ❌ | ⚠️ 再训练 | ✅ Outcome → Experience |
+| 工程可靠性 | ❌ Python script | ⚠️ | ✅ C++/Rust | ✅ Rust 类型安全 |
 
-Keep real gateway and provider keys in local config or environment variables only. Do not commit real provider keys.
+---
 
-| Variable | Purpose |
-| --- | --- |
-| `CODEX_PROJECT_ROOT` | Overrides automatic project-root detection. |
-| `CODEX_ORCH_DIR_SLUG` | Output directory slug override. |
-| `CODEX_ORCH_RUN_DIR` | Explicit run output directory. |
-| `CODEX_ORCH_LOG` | Background log path override. |
-| `ORCH_DB_PATH` | SQLite path for SQL context commands. |
-| `ORCH_RUN_ID` | Run ID for SQL context commands. |
-| `ORCH_TICKER` / `ORCH_TICKERS` | Active ticker context for SQL commands. |
-| `ORCH_PHASE` / `ORCH_ROLE` | Active phase/role context for SQL commands. |
+## Installation
 
-## Prompt Flow
+### 前置条件
 
-Prompt templates are configured under `orchestrator.prompts` in `config/config.yaml`.
+- Rust 1.75+（2021 edition）
+- SQLite 3.35+（通过 `rusqlite` bundled，无需单独安装）
+- LLM API 访问（OpenAI 兼容端点）
 
-Phase 2 uses four separate templates:
-
-| Template | Purpose |
-| --- | --- |
-| `bull_initial` | Bull-side initial analysis and thesis generation. |
-| `bull_interaction` | Bull-side research and response to Bear arguments. |
-| `bear_initial` | Bear-side initial analysis and thesis generation. |
-| `bear_interaction` | Bear-side research and response to Bull arguments. |
-| `bull_initial_monitor` / `bear_initial_monitor` | Monitor-mode initial prompt selected by the runtime when `--mode monitor` is active. |
-| `phase2.topic_generation` / `mediator.topic` | Phase 2 topic generator that forks debate topics from Phase 1.5 evidence. |
-| `mediator.topic_controller` | Phase 2.5a per-topic controller that tracks claim ledger, repeats, unverifiable claims, and next agenda. |
-
-All prompt paths are validated at startup. Missing prompt files fail before live LLM execution.
-
-## SQLite Data Preparation
-
-The SQLite schema is initialized automatically by `orchestrator_sql::connect`. Required context is controlled by `orchestrator.data_source.required_contexts`.
-
-By default, runtime data and imports are written to `orchestrator.db_path` in `config/config.yaml` (`outputs/orchestrator.sqlite`). Use `--db-path` only when intentionally isolating a run.
-
-Useful import commands:
+### 构建
 
 ```bash
-cargo run -p orchestrator-cli --bin run-technical-indicators -- --symbols QQQ,VIX,SOXX --days 60 --intervals 1d,3h,20min
-cargo run -p orchestrator-cli --bin fetch-jin10-flash
-cargo run -p orchestrator-cli --bin fetch-last30days-context -- --source youtube --ticker QQQ
+git clone https://github.com/your-org/akzio-signal-intelligence.git
+cd akzio-signal-intelligence
+
+cargo build --release
 ```
 
-Useful reflection commands:
+### 运行
 
 ```bash
-cargo run -p orchestrator-cli --bin reflection-score -- --as-of 2026-07-07
-cargo run -p orchestrator-cli --bin weekly-distill -- --since 2026-06-30 --until 2026-07-07
-cargo run -p orchestrator-cli --bin memory-promote -- --mode auto
+# 完整分析运行（需要 LLM_GATEWAY_API_KEY）
+cargo run -p orchestrator-cli --bin orchestrator-exec -- QQQ,SOXX
+
+# Mock 模式（无 LLM 调用，使用固定响应）
+cargo run -p orchestrator-cli --bin orchestrator-exec -- QQQ --mock
+
+# 仅运行特定阶段
+cargo run -p orchestrator-cli --bin orchestrator-exec -- QQQ --from-phase 3 --to-phase 6
+
+# Monitor 模式（监控而非概率判断）
+cargo run -p orchestrator-cli --bin orchestrator-exec -- QQQ --mode monitor
+
+# 评分历史预测
+cargo run -p orchestrator-cli --bin reflection-score
+
+# 蒸馏经验候选
+cargo run -p orchestrator-cli --bin weekly-distill
+
+# 晋升记忆
+cargo run -p orchestrator-cli --bin memory-promote
+
+# 生成并发送每日报告
+cargo run -p orchestrator-cli --bin run-daily-tqqq-report
 ```
 
-With `strict_sqlite: true`, live `orchestrator-exec` fails when required SQLite contexts are empty. `--mock` runs skip this check for local development.
-
-## Development
-
-Use standard Cargo commands:
+### 验证
 
 ```bash
 cargo fmt --all
@@ -347,8 +673,116 @@ cargo test
 cargo clippy --workspace --all-targets
 ```
 
-Generated artifacts are written under `outputs/` by default and are intentionally ignored by Git.
+---
+
+## Configuration
+
+运行时配置位于 `config/config.yaml`：
+
+```yaml
+orchestrator:
+  analysis_universe: [QQQ, SOXX, VIX]
+  phase1_agents: technical,news
+  db_path: outputs/orchestrator.sqlite
+
+  runtime:
+    lang: zh
+    window_days: 60
+    max_debate_rounds: 3
+
+  allocation:
+    investable_assets: [QQQ, SOXX]
+
+  llm:
+    gateway:
+      base_url: ${LLM_GATEWAY_BASE_URL}
+      api_key: ${LLM_GATEWAY_API_KEY}
+    defaults:
+      model: gpt-4o
+      tools: read_run_context
+
+  analyst_weights:
+    technical: 40.0
+    news_macro: 35.0
+```
+
+### 环境变量
+
+| 变量 | 用途 |
+|------|------|
+| `LLM_GATEWAY_API_KEY` | LLM 服务 API Key（live 运行必须） |
+| `LLM_GATEWAY_BASE_URL` | OpenAI 兼容端点 URL |
+| `WAYINVIDEO_USERNAME` / `PASSWORD` | YouTube 逐字稿服务凭证 |
+| `REPORT_SMTP_*` | 邮件报告发送配置 |
+
+---
+
+## Roadmap
+
+| 版本 | 聚焦 | 状态 |
+|------|------|------|
+| **v0.1** | 核心 Multi-Agent Workflow + 辩论 + 概率引擎 | ✅ 完成 |
+| **v0.2** | Memory System + Reflection Scoring + 记忆晋升 | ✅ 完成 |
+| **v0.3** | Backtesting Framework + Outcome 自动评估 | 🔄 进行中 |
+| **v0.4** | Self-Improvement — 记忆驱动的 Prompt 自适应 | 📋 规划中 |
+| **v0.5** | 多资产相关性推理 + 跨板块传导 | 📋 规划中 |
+| **v0.6** | 实时 Monitor 模式 + 增量更新 | 📋 规划中 |
+| **v1.0** | Autonomous Research Organization | 🎯 远景目标 |
+
+---
+
+## Limitations
+
+诚实面对系统的边界：
+
+- **不保证收益** — 概率判断不等于确定结果；所有输出是研究辅助信号
+- **数据质量依赖** — 垃圾数据输入必然导致低质量分析
+- **LLM 推理错误** — 大模型仍可能产生逻辑谬误、虚构论据
+- **Regime 识别滞后** — 市场状态转换的识别总有延迟
+- **样本不足** — Reflection 系统需要足够的历史预测才能产出有意义的经验
+- **黑天鹅盲区** — 对从未遇到过的极端事件无法产生有效记忆
+- **需要人工监督** — 本系统设计为研究辅助，不是自主交易系统
+
+---
+
+## Future Vision
+
+最终目标不是一个交易机器人。
+
+而是：
+
+> **一个持续学习、自我修正的 AI 投资研究组织。**
+
+它具备：
+- 机构级的分工与制衡
+- 概率驱动的决策纪律
+- 从每一次判断中学习的能力
+- 对自身局限性的认知
+
+这不是 "AI 预测股票" — 这是 "AI 作为研究基础设施"。
+
+---
+
+## Contributing
+
+1. Fork 仓库
+2. 从 `main` 创建 feature branch
+3. 确保 `cargo fmt --all && cargo test && cargo clippy --workspace --all-targets` 通过
+4. 保持变更在现有 Crate 边界内
+5. 优先使用 `orchestrator-core` 和 `orchestrator-sql` 中的现有工具函数
+6. 为新功能添加测试
+7. 不要提交 SQLite 数据库、API Key 或生成输出
+
+### 添加新 Analyst Agent
+
+1. 在 `prompts/analysts/` 下创建 Prompt 模板
+2. 在 Role Registry 或 Plugin Manifest 中注册角色
+3. 在 `orchestrator.phase1_agents` 中添加 Agent Key
+4. 在 `orchestrator-ingest` 中实现所需的数据采集
+5. 在 `orchestrator.analyst_weights` 中配置权重
+
+---
 
 ## License
 
-MIT, as declared by the workspace package metadata.
+MIT

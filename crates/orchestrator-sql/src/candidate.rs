@@ -1,5 +1,4 @@
 use anyhow::Result;
-use chrono::Utc;
 use rusqlite::{params, Connection};
 use serde_json::Value;
 
@@ -49,7 +48,7 @@ pub fn insert_candidate_experience(
     conn: &Connection,
     input: &CandidateExperienceInput,
 ) -> Result<i64> {
-    let now = Utc::now().to_rfc3339();
+    let now = chrono::Utc::now().timestamp();
     conn.execute(
         r#"
         INSERT INTO candidate_experiences
@@ -112,7 +111,7 @@ pub fn update_candidate_status(
         SET review_status = ?, reviewed_at = ?, review_reason = ?
         WHERE id = ?
         "#,
-        params![status, Utc::now().to_rfc3339(), reason, id],
+        params![status, chrono::Utc::now().timestamp(), reason, id],
     )?;
     Ok(())
 }

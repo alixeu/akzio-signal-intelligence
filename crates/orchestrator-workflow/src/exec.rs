@@ -2,20 +2,21 @@ use anyhow::{bail, Context, Result};
 use chrono::{Local, NaiveDate};
 use clap::{Args, ValueEnum};
 use orchestrator_core::{
-    config_int, config_str, default_project_root, display_ticker, load_config, parse_tickers,
-    project_path, run_slug, MarketRegime,
+    config_int, config_str, config_strings, default_project_root, display_ticker, load_config,
+    parse_tickers, project_path, MarketRegime,
 };
-use orchestrator_sql;
 use orchestrator_sql::{
     archive::{upsert_run_archive, RunArchiveInput},
-    connect,
+    clear_agent_loop_history, connect,
     prediction::{upsert_prediction, PredictionInput},
-    set_run_current_phase,
-    system_metrics::{rewrite_system_metrics_from_prompt_metrics, SystemMetricsCopyInput},
-    update_run_status, write_run_record, RunRecordInput,
+    set_run_current_phase, update_run_status, write_run_record, RunRecordInput,
 };
 use serde_json::{json, Value};
-use std::{fs, path::{Path, PathBuf}, time::Instant};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    time::Instant,
+};
 use tracing::debug;
 
 use crate::orchestration::allocation::{compute_allocation_context, normalize_allocation};
@@ -88,6 +89,8 @@ pub struct ExecArgs {
     pub phase1_agents: Option<String>,
     #[arg(long)]
     pub db_path: Option<PathBuf>,
+    /// Optional debug dump directory for state.json / final_summary.md / end_context.
+    /// Omitted by default; run state is persisted to SQLite only.
     #[arg(long)]
     pub run_dir: Option<PathBuf>,
     #[arg(long)]
@@ -116,7 +119,7 @@ pub struct ExecArgs {
     pub to_phase: i64,
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub tech_refresh_enabled: bool,
-    #[arg(long, default_value = "1d,2h,30min")]
+    #[arg(long, default_value = "1d,3h,20min")]
     pub tech_refresh_intervals: String,
     #[arg(long, default_value_t = 120)]
     pub tech_refresh_save_bars: i64,
@@ -136,6 +139,9 @@ pub struct ExecArgs {
     pub jin10_refresh_timeout_sec: u64,
     #[arg(long)]
     pub mock: bool,
+    /// Write each LLM call record to outputs/debug/phaseXX/{role}.jsonl.
+    #[arg(long)]
+    pub debug: bool,
 }
 
 fn is_mock(state: &Value) -> bool {
@@ -148,6 +154,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         ticker = %args.ticker,
         mode = args.mode.as_str(),
         mock = args.mock,
+        debug = args.debug,
         from_phase = args.from_phase,
         to_phase = args.to_phase,
         "orchestrator exec starting"
@@ -180,11 +187,11 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         role_plugins = runtime_config.role_plugins.roles.len(),
         "prompt plugin runtime config loaded"
     );
-    let run_dir = resolve_run_dir(&args, &tickers, &date, &config);
+    let run_dir = resolve_run_dir(&args);
     let db_path = resolve_db_path(&args, &config);
     let mut conn = connect(&db_path)?;
-    let run_id = run_id_for(&tickers, &date, &run_dir);
-    let state_path = run_dir.join("state.json");
+    let run_id = run_id_for(&tickers, &date);
+    let state_path = run_dir.as_ref().map(|path| path.join("state.json"));
     let explicit_phase1_agents = args.phase1_agents.is_some();
     let phase1_agents_raw = args.phase1_agents.clone().unwrap_or_else(|| {
         config_str(&config, "orchestrator.phase1_agents", DEFAULT_PHASE1_AGENTS)
@@ -202,7 +209,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         run_id,
         ticker,
         date,
-        run_dir = %run_dir.display(),
+        run_dir = ?run_dir.as_ref().map(|path| path.display().to_string()),
         db_path = %db_path.display(),
         config_path = %config_path.display(),
         "orchestrator exec resolved runtime paths"
@@ -210,10 +217,21 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
 
     let analyst_weights =
         phase1_analyst_weights(&config, &args, &phase1_agents, explicit_phase1_agents);
+    // Yahoo/technical preflight follows analysis_universe (includes VIX).
+    // allocation.investable_assets is separate and only used later for sizing.
+    let analysis_universe = {
+        let configured = config_strings(&config, "orchestrator.analysis_universe", &[]);
+        if configured.is_empty() {
+            tickers.clone()
+        } else {
+            configured
+        }
+    };
     let mut state = json!({
         "run_id": run_id,
         "ticker": ticker,
         "tickers": tickers,
+        "analysis_universe": analysis_universe,
         "current_date": date,
         "lang": if args.lang == "zh" { config_str(&config, "orchestrator.runtime.lang", "zh") } else { args.lang.clone() },
         "mode": args.mode.as_str(),
@@ -238,6 +256,11 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         }
     }
     state["mock"] = Value::Bool(args.mock);
+    state["debug"] = Value::Bool(args.debug);
+    {
+        let conn = connect(&db_path)?;
+        clear_agent_loop_history(&conn, &run_id)?;
+    }
     write_run_record(
         &mut conn,
         &RunRecordInput {
@@ -411,10 +434,17 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
 
     update_run_status(&mut conn, &run_id, "completed", None)?;
     record_contracts(&mut state);
-    persist_run_outputs(&run_dir, &state_path, &state)?;
+    let final_summary_path = if let (Some(run_dir), Some(state_path)) = (&run_dir, &state_path) {
+        persist_run_outputs(run_dir, state_path, &state)?;
+        Some(run_dir.join("final_summary.md"))
+    } else {
+        None
+    };
     debug!(
-        state_path = %state_path.display(),
-        final_summary = %run_dir.join("final_summary.md").display(),
+        state_path = ?state_path.as_ref().map(|path| path.display().to_string()),
+        final_summary = ?final_summary_path
+            .as_ref()
+            .map(|path| path.display().to_string()),
         degraded = state
             .get("degraded")
             .and_then(|value| value.as_bool())
@@ -448,7 +478,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         "run_dir": run_dir,
         "db_path": db_path,
         "state": state_path,
-        "final_summary": run_dir.join("final_summary.md"),
+        "final_summary": final_summary_path,
         "degraded": state.get("degraded").and_then(Value::as_bool).unwrap_or(false),
         "rating": final_decision.get("rating").cloned().or_else(|| research.get("rating").cloned()).unwrap_or(Value::Null),
         "action": trader.get("action").cloned().unwrap_or(Value::Null),
@@ -463,7 +493,6 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
     });
     Ok(result)
 }
-
 
 fn persist_run_outputs(run_dir: &Path, state_path: &Path, state: &Value) -> Result<()> {
     fs::create_dir_all(run_dir)
@@ -513,6 +542,7 @@ fn validate_args(args: &ExecArgs) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn parse_phase1_agents(raw: &str) -> Result<Vec<String>> {
     let registry = orchestrator_core::role_registry::AgentRegistry::builtin();
     registry
@@ -879,25 +909,14 @@ fn sanitize_downstream_constraints(state: &mut Value, downstream_name: &str, art
     strip_downstream_market_truth_fields(artifact);
 }
 
-fn resolve_run_dir(args: &ExecArgs, tickers: &[String], date: &str, config: &Value) -> PathBuf {
-    if let Some(path) = &args.run_dir {
-        return if path.is_absolute() {
+fn resolve_run_dir(args: &ExecArgs) -> Option<PathBuf> {
+    args.run_dir.as_ref().map(|path| {
+        if path.is_absolute() {
             path.clone()
         } else {
             default_project_root().join(path)
-        };
-    }
-    let slug = run_slug(tickers);
-    let pattern = config_str(
-        config,
-        "orchestrator.run_dir_pattern",
-        "outputs/{dir_slug}/{date}_exec",
-    );
-    let path = pattern
-        .replace("{dir_slug}", &slug)
-        .replace("{dir_slug_lower}", &slug.to_ascii_lowercase())
-        .replace("{date}", date);
-    project_path(path)
+        }
+    })
 }
 
 fn resolve_db_path(args: &ExecArgs, config: &Value) -> PathBuf {
@@ -1033,7 +1052,7 @@ async fn run_phase1(
             ok = result.artifact.is_some(),
             "phase 1 role finished"
         );
-        persist_prompt_metric(state, &result);
+        persist_prompt_metric(conn, &result);
         record_role_job_metrics(state, &result);
         let artifact = role_artifact_or_degraded(state, config, result)?;
         persist_artifact(conn, state, 1, &role, artifact.clone())?;
@@ -1524,6 +1543,7 @@ async fn run_topic_steer_step(
         },
         config,
         state,
+        conn,
     )
     .await?;
     persist_message_with_topic(
@@ -1605,6 +1625,7 @@ async fn run_phase2_topic_generation(
         config.workflow.reducer_timeout_sec,
         config,
         state,
+        conn,
     )
     .await?;
     let artifact = merge_reducer_output(base, output);
@@ -1692,6 +1713,7 @@ async fn run_phase3(
         config.workflow.agent_timeout_sec,
         config,
         state,
+        conn,
     )
     .await
     .unwrap_or_else(|error| manager_research_fallback(state, error));
@@ -1743,6 +1765,7 @@ async fn run_phase4(
         config.workflow.agent_timeout_sec,
         config,
         state,
+        conn,
     )
     .await?;
     sanitize_downstream_constraints(state, "trader_investment_plan", &mut artifact);
@@ -1800,6 +1823,7 @@ async fn run_phase5(
                 config.workflow.agent_timeout_sec,
                 config,
                 state,
+                conn,
             )
             .await?;
             sanitize_downstream_constraints(state, role, &mut artifact);
@@ -1868,6 +1892,7 @@ async fn run_phase6(
         config.workflow.agent_timeout_sec,
         config,
         state,
+        conn,
     )
     .await?;
     record_market_truth_check(state, "final_trade_decision", &artifact);
@@ -1910,26 +1935,16 @@ fn run_phase6_derived(conn: &mut rusqlite::Connection, state: &mut Value) -> Res
 fn run_phase8(
     conn: &rusqlite::Connection,
     state: &mut Value,
-    config: &RuntimeConfig,
+    _config: &RuntimeConfig,
 ) -> Result<()> {
     let run_id = state
         .get("run_id")
         .and_then(Value::as_str)
         .context("state.run_id is required for phase 8")?
         .to_string();
-    let ticker = state
-        .get("ticker")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
     let _tickers = tickers_from_state(state);
     let prediction_date = state
         .get("current_date")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    let _run_dir = state
-        .get("run_dir")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
@@ -2011,21 +2026,6 @@ fn run_phase8(
         state["phase8_warning"] = json!("no complete ticker probabilities found in research_plan");
     }
 
-    rewrite_system_metrics_from_prompt_metrics(
-        conn,
-        &SystemMetricsCopyInput {
-            run_id,
-            workflow_version: "v1".to_string(),
-            reflection_version: config.reflection.reflection_version.clone(),
-            agent_count: state
-                .get("phase1_agents")
-                .and_then(Value::as_array)
-                .map(|items| items.len() as i64)
-                .unwrap_or_default(),
-            prediction_date,
-            ticker,
-        },
-    )?;
     Ok(())
 }
 
@@ -2133,6 +2133,7 @@ async fn run_phase7(
         config.workflow.agent_timeout_sec,
         config,
         state,
+        conn,
     )
     .await?;
     let mut allocation = normalize_allocation(&raw_artifact, &context, &config.allocation);
@@ -2367,7 +2368,7 @@ mod tests {
             from_phase: 1,
             to_phase: 8,
             tech_refresh_enabled: true,
-            tech_refresh_intervals: "1d,2h,30min".to_string(),
+            tech_refresh_intervals: "1d,3h,20min".to_string(),
             tech_refresh_save_bars: 120,
             tech_refresh_script_path: None,
             tech_refresh_timeout_sec: 900,
@@ -2377,6 +2378,7 @@ mod tests {
             jin10_refresh_script_path: None,
             jin10_refresh_timeout_sec: 120,
             mock: false,
+            debug: false,
         };
         let roles = vec!["analyst.youtube".to_string()];
 
@@ -2417,7 +2419,7 @@ mod tests {
             from_phase: 1,
             to_phase: 8,
             tech_refresh_enabled: true,
-            tech_refresh_intervals: "1d,2h,30min".to_string(),
+            tech_refresh_intervals: "1d,3h,20min".to_string(),
             tech_refresh_save_bars: 120,
             tech_refresh_script_path: None,
             tech_refresh_timeout_sec: 900,
@@ -2427,6 +2429,7 @@ mod tests {
             jin10_refresh_script_path: None,
             jin10_refresh_timeout_sec: 120,
             mock: false,
+            debug: false,
         };
         let roles = vec!["analyst.youtube".to_string()];
 
@@ -2463,7 +2466,7 @@ mod tests {
         let roles = crate::orchestration::config::llm_roles_from_config(&config).unwrap();
         let settings = &roles["analyst.technical"];
         assert_eq!(settings.model, "gpt-5.4");
-        assert_eq!(settings.max_turns, Some(3));
+        assert_eq!(settings.max_turns, Some(6));
         assert_eq!(settings.reasoning_effort.as_deref(), Some("medium"));
         assert!(settings.native_web_search);
         assert!(settings.tools.contains(&"read_run_context".to_string()));

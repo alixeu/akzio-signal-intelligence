@@ -1,5 +1,4 @@
 use anyhow::Result;
-use chrono::Utc;
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 
@@ -19,7 +18,7 @@ pub struct OutcomeInput {
 }
 
 pub fn upsert_outcome(conn: &Connection, input: &OutcomeInput) -> Result<i64> {
-    let now = Utc::now().to_rfc3339();
+    let now = chrono::Utc::now().timestamp();
     conn.execute(
         r#"
         INSERT INTO outcomes
@@ -93,10 +92,10 @@ pub fn latest_close_on_or_before(
 ) -> Result<Option<(String, f64)>> {
     let mut stmt = conn.prepare(
         r#"
-        SELECT kline_time, indicator_value
-        FROM technical_indicators
-        WHERE ticker = ? AND indicator_name = 'Close' AND interval = ? AND date(kline_time) <= date(?)
-        ORDER BY date(kline_time) DESC, kline_time DESC
+        SELECT date, close
+        FROM technical_features
+        WHERE ticker = ? AND interval = ? AND close IS NOT NULL AND date(date) <= date(?)
+        ORDER BY date(date) DESC, date DESC
         LIMIT 1
         "#,
     )?;
@@ -115,10 +114,10 @@ pub fn earliest_close_on_or_after(
 ) -> Result<Option<(String, f64)>> {
     let mut stmt = conn.prepare(
         r#"
-        SELECT kline_time, indicator_value
-        FROM technical_indicators
-        WHERE ticker = ? AND indicator_name = 'Close' AND interval = ? AND date(kline_time) >= date(?)
-        ORDER BY date(kline_time) ASC, kline_time ASC
+        SELECT date, close
+        FROM technical_features
+        WHERE ticker = ? AND interval = ? AND close IS NOT NULL AND date(date) >= date(?)
+        ORDER BY date(date) ASC, date ASC
         LIMIT 1
         "#,
     )?;

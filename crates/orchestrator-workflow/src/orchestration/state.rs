@@ -1,17 +1,8 @@
 use orchestrator_core::run_slug;
 use serde_json::{json, Value};
-use std::path::Path;
 
-pub(crate) fn run_id_for(tickers: &[String], date: &str, run_dir: &Path) -> String {
-    format!(
-        "{}-{}-{}",
-        run_slug(tickers).to_ascii_lowercase(),
-        date,
-        run_dir
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("run")
-    )
+pub(crate) fn run_id_for(tickers: &[String], date: &str) -> String {
+    format!("{}-{}-exec", run_slug(tickers).to_ascii_lowercase(), date)
 }
 
 pub(crate) fn set_phase_status(state: &mut Value, phase: i64, status: &str) {
@@ -122,5 +113,19 @@ pub(crate) fn append_topic_controller_artifact(state: &mut Value, topic_id: &str
         if let Some(items) = entry["controller_artifacts"].as_array_mut() {
             items.push(artifact);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::run_id_for;
+
+    #[test]
+    fn run_id_does_not_depend_on_filesystem_path() {
+        let tickers = vec!["QQQ".to_string(), "SOXX".to_string(), "VIX".to_string()];
+        assert_eq!(
+            run_id_for(&tickers, "2026-07-10"),
+            "qqq_soxx_vix-2026-07-10-exec"
+        );
     }
 }

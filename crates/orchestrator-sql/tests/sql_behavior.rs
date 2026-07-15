@@ -1,33 +1,25 @@
 use orchestrator_sql::{
-    append_agent_turn_item,
     candidate::{insert_candidate_experience, pending_candidates, CandidateExperienceInput},
     connect, context_count, ensure_schema, handle_read_command, import_jin10_payload,
     memory::{promote_candidate_to_memory, PromoteMemoryInput},
-    metrics::{insert_prompt_metric, PromptMetricInput},
     outcome::{upsert_outcome, OutcomeInput},
     prediction::{upsert_prediction, PredictionInput},
-    read_run_context, session_history_items,
-    system_metrics::{rewrite_system_metrics_from_prompt_metrics, SystemMetricsCopyInput},
-    update_agent_turn_end, update_agent_turn_item_content, upsert_agent_turn,
-    write_agent_message_scoped, write_role_turn_summary, write_run_record, write_source_item,
-    AgentMessageInput, AgentTurnInput, AgentTurnItemInput, RoleTurnSummaryInput,
-    RunContextReadRequest, RunRecordInput, RuntimeContext, SourceItemInput,
+    read_run_context, session_history_items, upsert_agent_turn, write_agent_message_scoped,
+    write_role_turn_summary, write_run_record, write_source_item, AgentMessageInput,
+    AgentTurnInput, RoleTurnSummaryInput, RunContextReadRequest, RunRecordInput, RuntimeContext,
+    SourceItemInput,
 };
 use serde_json::json;
 
 const TABLES: &[&str] = &[
     "runs",
-    "agent_turns",
-    "agent_turn_items",
-    "turn_context_items",
+    "agent_events",
     "role_turn_summaries",
-    "jin10_items",
-    "youtube_videos",
-    "youtube_transcripts",
-    "social_items",
-    "technical_indicators",
+    "external_items",
+    "technical_features",
     "memory_items",
     "memory_versions",
+    "memory_history",
     "predictions",
     "outcomes",
     "candidate_experiences",
@@ -73,7 +65,34 @@ const REMOVED_TABLES: &[&str] = &[
     "memory_search_fts",
     "external_source_items",
     "run_archive",
+    "system_metrics",
+    "turn_context_items",
+    "prompt_metrics",
+    "technical_indicators",
+    "jin10_items",
+    "youtube_videos",
+    "youtube_transcripts",
+    "social_items",
+    "agent_turn_items",
+    "agent_turns",
 ];
+
+fn ts(s: &str) -> i64 {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .map(|dt| dt.timestamp())
+        .unwrap_or(0)
+}
+
+#[allow(dead_code)]
+fn ts_date(s: &str) -> i64 {
+    chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+        .ok()
+        .and_then(|d| {
+            d.and_hms_opt(0, 0, 0)
+                .and_then(|dt| dt.and_utc().timestamp().into())
+        })
+        .unwrap_or(0)
+}
 
 #[test]
 fn ensure_schema_creates_only_current_tables_and_is_idempotent() {
@@ -90,12 +109,61 @@ fn ensure_schema_creates_only_current_tables_and_is_idempotent() {
     for table in REMOVED_TABLES {
         assert_eq!(table_exists(&conn, table), 0, "old table {table} survived");
     }
-    // system_metrics view was removed; prompt_metrics is the single source of truth.
     assert_eq!(
         view_exists(&conn, "system_metrics"),
         0,
         "system_metrics view should not exist"
     );
+    assert_eq!(
+        table_exists(&conn, "system_metrics"),
+        0,
+        "system_metrics table should not exist"
+    );
+}
+
+#[test]
+fn ensure_schema_drops_legacy_system_metrics_table() {
+    let temp = tempfile::tempdir().unwrap();
+    let db_path = temp.path().join("legacy.sqlite");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE system_metrics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT NOT NULL
+        );",
+    )
+    .unwrap();
+    assert_eq!(table_exists(&conn, "system_metrics"), 1);
+
+    ensure_schema(&conn).unwrap();
+    assert_eq!(
+        table_exists(&conn, "system_metrics"),
+        0,
+        "legacy system_metrics table should be dropped"
+    );
+    assert_eq!(view_exists(&conn, "system_metrics"), 0);
+}
+
+#[test]
+fn ensure_schema_adds_missing_runs_status_columns() {
+    let temp = tempfile::tempdir().unwrap();
+    let db_path = temp.path().join("legacy-runs.sqlite");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE runs (
+            run_id TEXT PRIMARY KEY,
+            current_date TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        );",
+    )
+    .unwrap();
+    assert!(!column_exists(&conn, "runs", "status"));
+
+    ensure_schema(&conn).unwrap();
+    assert!(column_exists(&conn, "runs", "status"));
+    assert!(column_exists(&conn, "runs", "current_phase"));
+    assert!(column_exists(&conn, "runs", "error_message"));
+    assert!(column_exists(&conn, "runs", "completed_at"));
 }
 
 #[test]
@@ -118,75 +186,6 @@ fn run_record_only_writes_runs_and_run_tickers() {
 }
 
 #[test]
-fn system_metrics_sync_updates_existing_prompt_metric_projection() {
-    let temp = tempfile::tempdir().unwrap();
-    let db_path = temp.path().join("orchestrator.sqlite");
-    let conn = connect(&db_path).unwrap();
-
-    insert_prompt_metric(
-        &conn,
-        &PromptMetricInput {
-            run_id: "run-1".to_string(),
-            turn_id: "turn-1".to_string(),
-            session_id: "session-1".to_string(),
-            role: "analyst.technical".to_string(),
-            phase: Some(1),
-            kind: "role_job".to_string(),
-            round: None,
-            topic_id: None,
-            prompt_version: "v1".to_string(),
-            model: "mock-model".to_string(),
-            input_tokens: 10,
-            output_tokens: 20,
-            cached_tokens: 0,
-            total_tokens: 30,
-            turn_count: 1,
-            tool_call_count: 0,
-            latency_ms: 100,
-            validation_result: "ok".to_string(),
-            fallback_triggered: false,
-            error_message: String::new(),
-        },
-    )
-    .unwrap();
-
-    let mut input = SystemMetricsCopyInput {
-        run_id: "run-1".to_string(),
-        workflow_version: "v1".to_string(),
-        reflection_version: "r1".to_string(),
-        agent_count: 2,
-        prediction_date: "2026-06-19".to_string(),
-        ticker: "TQQQ".to_string(),
-    };
-    assert_eq!(
-        rewrite_system_metrics_from_prompt_metrics(&conn, &input).unwrap(),
-        1
-    );
-
-    input.ticker = "QQQ".to_string();
-    input.workflow_version = "v2".to_string();
-    assert_eq!(
-        rewrite_system_metrics_from_prompt_metrics(&conn, &input).unwrap(),
-        1
-    );
-    assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM prompt_metrics"), 1);
-    assert_eq!(
-        text_scalar(
-            &conn,
-            "SELECT ticker FROM prompt_metrics WHERE run_id = 'run-1'"
-        ),
-        "QQQ"
-    );
-    assert_eq!(
-        text_scalar(
-            &conn,
-            "SELECT workflow_version FROM prompt_metrics WHERE run_id = 'run-1'"
-        ),
-        "v2"
-    );
-}
-
-#[test]
 fn jin10_import_writes_compatibility_and_unified_source_items() {
     let temp = tempfile::tempdir().unwrap();
     let db_path = temp.path().join("orchestrator.sqlite");
@@ -196,7 +195,7 @@ fn jin10_import_writes_compatibility_and_unified_source_items() {
         &mut conn,
         &json!({
             "items": [
-                {"time": "2026-06-19T09:00:00Z", "content": "rate cut odds move"},
+                {"time": "2026-06-19 09:00:00", "content": "rate cut odds move"},
                 {"time": "", "content": "skip"}
             ]
         }),
@@ -227,39 +226,77 @@ fn jin10_import_writes_compatibility_and_unified_source_items() {
 }
 
 #[test]
-fn technical_context_reads_indicator_tables() {
+fn technical_context_stays_within_tool_budget() {
+    let db_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../outputs/orchestrator.sqlite");
+    if !db_path.exists() {
+        return;
+    }
+    let mut conn = connect(&db_path).unwrap();
+    if context_count(&conn, "technical").unwrap_or(0) == 0 {
+        return;
+    }
+    let Ok(grouped) = read_run_context(
+        &mut conn,
+        &RunContextReadRequest {
+            kind: "technical".to_string(),
+            run_id: None,
+            ticker: Some("QQQ".to_string()),
+            tickers: vec!["QQQ".to_string()],
+            phase: None,
+            role: None,
+            topic_id: None,
+            turn_id: None,
+            persist_context: false,
+            token_budget: None,
+        },
+    ) else {
+        // Production DB may be mid-migration / incompatible with current schema helpers.
+        return;
+    };
+    let encoded = serde_json::to_string(&grouped).unwrap();
+    assert!(
+        encoded.chars().count() < 8_000,
+        "technical context should fit default tool truncation budget, got {} chars",
+        encoded.chars().count()
+    );
+}
+
+#[test]
+fn technical_context_reads_features_table() {
     let temp = tempfile::tempdir().unwrap();
     let db_path = temp.path().join("orchestrator.sqlite");
     let mut conn = connect(&db_path).unwrap();
 
+    let now = chrono::Utc::now().timestamp();
     conn.execute(
         r#"
-        INSERT INTO technical_indicators
-            (ticker, kline_time, indicator_name, indicator_value, unit, model, interval, payload_json, imported_at)
+        INSERT INTO technical_features
+            (ticker, date, interval, model, close, return_pct, features_json, imported_at)
         VALUES
-            ('TQQQ', '2026-06-19', 'rsi', 55.5, 'points', 'm', 'daily', '{"window":14}', '2026-06-19T00:00:00Z')
+            ('TQQQ', '2026-06-19', 'daily', 'm', 55.5, 0.01, '{"Close":55.5,"Return":0.01}', ?1)
         "#,
-        [],
+        [now],
     )
     .unwrap();
     conn.execute(
         r#"
-        INSERT INTO technical_indicators
-            (ticker, kline_time, indicator_name, indicator_value, model, interval, imported_at)
+        INSERT INTO technical_features
+            (ticker, date, interval, model, return_pct, features_json, imported_at)
         VALUES
-            ('TQQQ', '2026-06-19T09:00:00Z', 'macd', 1.5, 'm', '3h', '2026-06-19T00:00:00Z')
+            ('TQQQ', '2026-06-19T09:00:00Z', '3h', 'm', 1.5, '{"Return":1.5}', ?1)
         "#,
-        [],
+        [now],
     )
     .unwrap();
     conn.execute(
         r#"
-        INSERT INTO technical_indicators
-            (ticker, kline_time, indicator_name, indicator_value, model, interval, imported_at)
+        INSERT INTO technical_features
+            (ticker, date, interval, model, gap, features_json, imported_at)
         VALUES
-            ('TQQQ', '2026-06-19T09:20:00Z', 'vwap', 12.5, 'm', '20min', '2026-06-19T00:00:00Z')
+            ('TQQQ', '2026-06-19T09:20:00Z', '20min', 'm', 12.5, '{"Gap":12.5}', ?1)
         "#,
-        [],
+        [now],
     )
     .unwrap();
 
@@ -279,9 +316,10 @@ fn technical_context_reads_indicator_tables() {
         },
     )
     .unwrap();
-    assert_eq!(grouped["daily"][0]["indicator_name"], "rsi");
-    assert_eq!(grouped["three_hour"][0]["indicator_name"], "macd");
-    assert_eq!(grouped["twenty_minute"][0]["indicator_name"], "vwap");
+    assert_eq!(grouped["daily"][0]["ticker"], "TQQQ");
+    assert_eq!(grouped["daily"][0]["indicators"]["Close"], 55.5);
+    assert_eq!(grouped["three_hour"][0]["indicators"]["Return"], 1.5);
+    assert_eq!(grouped["twenty_minute"][0]["indicators"]["Gap"], 12.5);
     assert_eq!(context_count(&conn, "technical").unwrap(), 3);
 }
 
@@ -298,7 +336,7 @@ fn source_items_write_dedicated_and_unified_tables() {
                 source: "youtube".to_string(),
                 item_key: "vid-1".to_string(),
                 ticker: "TQQQ".to_string(),
-                item_time: "2026-06-19T00:00:00Z".to_string(),
+                item_time: ts("2026-06-19T00:00:00Z"),
                 content: "Video title".to_string(),
                 item_json: json!({
                     "video_id": "vid-1",
@@ -316,7 +354,7 @@ fn source_items_write_dedicated_and_unified_tables() {
                 source: "reddit".to_string(),
                 item_key: "post-1".to_string(),
                 ticker: "TQQQ".to_string(),
-                item_time: "2026-06-19T01:00:00Z".to_string(),
+                item_time: ts("2026-06-19T01:00:00Z"),
                 content: "Post body".to_string(),
                 item_json: json!({"title": "Post title"}),
             },
@@ -331,7 +369,7 @@ fn source_items_write_dedicated_and_unified_tables() {
                 source: "x".to_string(),
                 item_key: "tweet-1".to_string(),
                 ticker: "TQQQ".to_string(),
-                item_time: "2026-06-19T02:00:00Z".to_string(),
+                item_time: ts("2026-06-19T02:00:00Z"),
                 content: "Tweet body".to_string(),
                 item_json: json!({}),
             },
@@ -340,7 +378,13 @@ fn source_items_write_dedicated_and_unified_tables() {
         1
     );
 
-    assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM youtube_videos"), 1);
+    assert_eq!(
+        scalar(
+            &conn,
+            "SELECT COUNT(*) FROM external_items WHERE source = 'youtube'"
+        ),
+        1
+    );
     assert_eq!(
         write_source_item(
             &mut conn,
@@ -348,7 +392,7 @@ fn source_items_write_dedicated_and_unified_tables() {
                 source: "youtube".to_string(),
                 item_key: "vid-1".to_string(),
                 ticker: "TQQQ".to_string(),
-                item_time: "2026-06-19T03:00:00Z".to_string(),
+                item_time: ts("2026-06-19T03:00:00Z"),
                 content: "Updated video title".to_string(),
                 item_json: json!({
                     "video_id": "vid-1",
@@ -362,21 +406,21 @@ fn source_items_write_dedicated_and_unified_tables() {
     assert_eq!(
         text_scalar(
             &conn,
-            "SELECT title FROM youtube_videos WHERE video_id = 'vid-1' AND ticker = 'TQQQ'"
+            "SELECT title FROM external_items WHERE source = 'youtube' AND item_key = 'vid-1'"
         ),
         "Updated video title"
     );
     assert_eq!(
         scalar(
             &conn,
-            "SELECT COUNT(*) FROM social_items WHERE source = 'reddit'"
+            "SELECT COUNT(*) FROM external_items WHERE source = 'reddit'"
         ),
         1
     );
     assert_eq!(
         scalar(
             &conn,
-            "SELECT COUNT(*) FROM social_items WHERE source = 'x'"
+            "SELECT COUNT(*) FROM external_items WHERE source = 'x'"
         ),
         1
     );
@@ -423,7 +467,7 @@ fn summaries_are_written_and_read_from_role_turn_summaries() {
             role: "manager.research".to_string(),
             phase: Some(3),
             ticker: "QQQ".to_string(),
-            item_time: "2026-06-19T03:00:00Z".to_string(),
+            item_time: ts("2026-06-19T03:00:00Z"),
             topic_id: None,
             debate_id: None,
             summary_type: "final".to_string(),
@@ -459,40 +503,23 @@ fn turn_tables_persist_items_and_history() {
         &conn,
         &AgentTurnInput {
             turn_id: "turn-1".to_string(),
-            session_id: "session-1".to_string(),
             run_id: "run-1".to_string(),
             phase: Some(1),
+            turn_number: 1,
             role: "analyst.technical".to_string(),
-            user_input: "go".to_string(),
-            model_context: "ctx".to_string(),
-            cancellation_state: "none".to_string(),
-            needs_follow_up: false,
-            end_reason: String::new(),
+            full_context_json: json!([
+                {"event_type":"user_message","role":"user","content_text":"go","content_json":{},"tool_call_id":"","tool_name":""},
+                {"event_type":"assistant_message","role":"assistant","content_text":"hello","content_json":{"text":"hello"},"tool_call_id":"","tool_name":""}
+            ]),
+            summary: "test turn".to_string(),
         },
     )
     .unwrap();
 
-    let item_id = append_agent_turn_item(
-        &conn,
-        &AgentTurnItemInput {
-            turn_id: "turn-1".to_string(),
-            session_id: "session-1".to_string(),
-            run_id: "run-1".to_string(),
-            item_type: "message".to_string(),
-            role: "assistant".to_string(),
-            tool_call_id: String::new(),
-            tool_name: String::new(),
-            content_json: json!({"text": "hello"}),
-            content_text: "hello".to_string(),
-        },
-    )
-    .unwrap();
-    update_agent_turn_item_content(&conn, item_id, &json!({"text": "done"}), "done").unwrap();
-    update_agent_turn_end(&conn, "turn-1", true, "needs_input").unwrap();
-
-    let history = session_history_items(&conn, "session-1", 10).unwrap();
-    assert_eq!(history[0]["content_text"], "done");
-    assert_eq!(scalar(&conn, "SELECT needs_follow_up FROM agent_turns"), 1);
+    let history = session_history_items(&conn, "run-1", 10).unwrap();
+    assert!(!history.is_empty());
+    assert_eq!(history[0]["content_text"], "go");
+    assert_eq!(history[1]["content_text"], "hello");
 }
 
 #[test]
@@ -509,7 +536,7 @@ fn compose_context_scores_trims_and_audits_blocks() {
             role: "mediator.topic_controller".to_string(),
             phase: Some(25),
             ticker: "TQQQ".to_string(),
-            item_time: "2026-06-19T12:00:00Z".to_string(),
+            item_time: ts("2026-06-19T12:00:00Z"),
             topic_id: Some("topic-1".to_string()),
             debate_id: None,
             summary_type: "topic_final".to_string(),
@@ -527,7 +554,7 @@ fn compose_context_scores_trims_and_audits_blocks() {
             role: "analyst.news_macro".to_string(),
             phase: Some(1),
             ticker: "VIX".to_string(),
-            item_time: "2026-06-18T12:00:00Z".to_string(),
+            item_time: ts("2026-06-18T12:00:00Z"),
             topic_id: None,
             debate_id: None,
             summary_type: "artifact".to_string(),
@@ -540,18 +567,19 @@ fn compose_context_scores_trims_and_audits_blocks() {
     import_jin10_payload(
         &mut conn,
         &json!({
-            "items": [{"time": "2026-06-19T13:00:00Z", "content": "macro flash"}]
+            "items": [{"time": "2026-06-19 13:00:00", "content": "macro flash"}]
         }),
     )
     .unwrap();
+    let now = chrono::Utc::now().timestamp();
     conn.execute(
         r#"
-        INSERT INTO technical_indicators
-            (ticker, kline_time, indicator_name, indicator_value, model, interval, payload_json, imported_at)
+        INSERT INTO technical_features
+            (ticker, date, interval, model, close, features_json, imported_at)
         VALUES
-            ('TQQQ', '2026-06-19', 'rsi', 61.0, 'm', 'daily', '{"window":14}', '2026-06-19T13:00:00Z')
+            ('TQQQ', '2026-06-19', 'daily', 'm', 61.0, '{"Close":61.0}', ?1)
         "#,
-        [],
+        [now],
     )
     .unwrap();
     write_source_item(
@@ -560,20 +588,22 @@ fn compose_context_scores_trims_and_audits_blocks() {
             source: "youtube".to_string(),
             item_key: "vid-1".to_string(),
             ticker: "TQQQ".to_string(),
-            item_time: "2026-06-19T11:00:00Z".to_string(),
+            item_time: ts("2026-06-19T11:00:00Z"),
             content: "video title".to_string(),
             item_json: json!({"video_id": "vid-1", "title": "video title"}),
         },
     )
     .unwrap();
-    conn.execute(
-        r#"
-        INSERT INTO youtube_transcripts
-            (video_id, ticker, transcript, segments_json, language, provider, content_hash, imported_at)
-        VALUES
-            ('vid-1', 'TQQQ', 'transcript text', '[]', 'en', 'test', 'hash-1', '2026-06-19T11:30:00Z')
-        "#,
-        [],
+    write_source_item(
+        &mut conn,
+        &SourceItemInput {
+            source: "youtube_transcript".to_string(),
+            item_key: "vid-1-transcript".to_string(),
+            ticker: "TQQQ".to_string(),
+            item_time: ts("2026-06-19T11:30:00Z"),
+            content: "transcript text".to_string(),
+            item_json: json!({"video_id": "vid-1", "language": "en", "provider": "test"}),
+        },
     )
     .unwrap();
     write_source_item(
@@ -582,7 +612,7 @@ fn compose_context_scores_trims_and_audits_blocks() {
             source: "reddit".to_string(),
             item_key: "post-1".to_string(),
             ticker: "TQQQ".to_string(),
-            item_time: "2026-06-19T10:00:00Z".to_string(),
+            item_time: ts("2026-06-19T10:00:00Z"),
             content: "reddit body".to_string(),
             item_json: json!({"title": "reddit title"}),
         },
@@ -594,40 +624,28 @@ fn compose_context_scores_trims_and_audits_blocks() {
             source: "x".to_string(),
             item_key: "x-1".to_string(),
             ticker: "TQQQ".to_string(),
-            item_time: "2026-06-19T10:30:00Z".to_string(),
+            item_time: ts("2026-06-19T10:30:00Z"),
             content: "x body".to_string(),
             item_json: json!({"author": "macro"}),
         },
     )
     .unwrap();
-    conn.execute(
-        "INSERT INTO agent_turns (turn_id, session_id, run_id, created_at, updated_at) \
-         VALUES ('history-turn', 'session-1', 'run-1', '2026-06-19T12:00:00Z', '2026-06-19T12:00:00Z')",
-        [],
-    )
-    .unwrap();
-    append_agent_turn_item(
+    upsert_agent_turn(
         &conn,
-        &AgentTurnItemInput {
+        &AgentTurnInput {
             turn_id: "history-turn".to_string(),
-            session_id: "session-1".to_string(),
             run_id: "run-1".to_string(),
-            item_type: "assistant_message".to_string(),
+            phase: Some(1),
+            turn_number: 1,
             role: "researcher.bull.initial".to_string(),
-            tool_call_id: String::new(),
-            tool_name: String::new(),
-            content_json: json!({"text": "history"}),
-            content_text: "history item".to_string(),
+            full_context_json: json!([
+                {"event_type":"assistant_message","role":"assistant","content_text":"history item","content_json":{"text":"history"},"tool_call_id":"","tool_name":""}
+            ]),
+            summary: "history item".to_string(),
         },
     )
     .unwrap();
 
-    conn.execute(
-        "INSERT INTO agent_turns (turn_id, session_id, run_id, created_at, updated_at) \
-         VALUES ('turn-compose', 'session-1', 'run-1', '2026-06-19T12:00:00Z', '2026-06-19T12:00:00Z')",
-        [],
-    )
-    .unwrap();
     let composed = read_run_context(
         &mut conn,
         &RunContextReadRequest {
@@ -661,13 +679,6 @@ fn compose_context_scores_trims_and_audits_blocks() {
     assert!(blocks.iter().any(|block| block["context_type"] == "reddit"));
     assert!(blocks.iter().any(|block| block["context_type"] == "x"));
     assert_eq!(blocks[0]["content"], "same ticker same topic summary");
-    assert_eq!(
-        scalar(
-            &conn,
-            "SELECT COUNT(*) FROM turn_context_items WHERE turn_id = 'turn-compose'"
-        ),
-        blocks.len() as i64
-    );
 
     let trimmed = read_run_context(
         &mut conn,
@@ -686,13 +697,6 @@ fn compose_context_scores_trims_and_audits_blocks() {
     )
     .unwrap();
     assert!(trimmed["blocks"].as_array().unwrap().len() < blocks.len());
-    assert_eq!(
-        scalar(
-            &conn,
-            "SELECT COUNT(*) FROM turn_context_items WHERE turn_id = 'turn-compose-small'"
-        ),
-        0
-    );
 }
 
 #[test]
@@ -732,12 +736,6 @@ fn read_run_context_exposes_reflection_memory_contexts() {
         1
     );
 
-    conn.execute(
-        "INSERT INTO agent_turns (turn_id, session_id, run_id, created_at, updated_at) \
-         VALUES ('turn-compose', 'session-1', 'run-1', '2026-06-19T12:00:00Z', '2026-06-19T12:00:00Z')",
-        [],
-    )
-    .unwrap();
     let composed = read_run_context(
         &mut conn,
         &RunContextReadRequest {
@@ -914,7 +912,6 @@ fn column_exists(conn: &rusqlite::Connection, table: &str, column: &str) -> bool
     columns.iter().any(|item| item == column)
 }
 
-
 #[test]
 fn context_count_rejects_unsafe_table_identifiers() {
     let dir = tempfile::tempdir().unwrap();
@@ -922,12 +919,46 @@ fn context_count_rejects_unsafe_table_identifiers() {
     let conn = connect(&db_path).unwrap();
     ensure_schema(&conn).unwrap();
 
-    // Malicious identifiers must not be interpolated; treat as zero.
     assert_eq!(
-        context_count(&conn, "jin10; DROP TABLE jin10_items;--").unwrap(),
+        context_count(&conn, "jin10; DROP TABLE external_items;--").unwrap(),
         0
     );
     assert_eq!(context_count(&conn, "jin10'").unwrap(), 0);
-    // Safe known alias still works.
     assert_eq!(context_count(&conn, "jin10").unwrap(), 0);
+}
+
+#[test]
+fn jin10_context_returns_compact_recent_items() {
+    let temp = tempfile::tempdir().unwrap();
+    let db_path = temp.path().join("runtime.sqlite");
+    let mut conn = connect(&db_path).unwrap();
+    ensure_schema(&conn).unwrap();
+    let long = "x".repeat(600);
+    import_jin10_payload(
+        &mut conn,
+        &serde_json::json!({
+            "items": [
+                {"time": "2026-07-13 10:00:00", "content": long},
+                {"time": "2026-07-13 11:00:00", "content": "short headline"}
+            ]
+        }),
+    )
+    .unwrap();
+    let value = read_run_context(
+        &mut conn,
+        &RunContextReadRequest {
+            kind: "jin10".to_string(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(value["query"], "get-jin10-context");
+    assert_eq!(value["item_count"], 2);
+    let items = value["items"].as_array().unwrap();
+    assert!(items.iter().any(|item| item["content"] == "short headline"));
+    let long_item = items
+        .iter()
+        .find(|item| item["content"].as_str().unwrap_or("").contains('…'))
+        .expect("long content should be clipped");
+    assert!(long_item["content"].as_str().unwrap().chars().count() <= 401);
 }

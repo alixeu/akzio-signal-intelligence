@@ -182,9 +182,9 @@ mod tests {
     fn insert_close(conn: &Connection, ticker: &str, date: &str, value: f64) {
         conn.execute(
             r#"
-            INSERT INTO technical_indicators
-                (ticker, kline_time, indicator_name, indicator_value, model, interval, imported_at)
-            VALUES (?, ?, 'Close', ?, 'test', '1d', '2026-01-01T00:00:00Z')
+            INSERT OR REPLACE INTO technical_features
+                (ticker, date, interval, model, close, features_json, imported_at)
+            VALUES (?, ?, '1d', 'test', ?, '{}', '2026-01-01T00:00:00Z')
             "#,
             params![ticker, date, value],
         )

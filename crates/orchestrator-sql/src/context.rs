@@ -4,12 +4,10 @@ use crate::{
     AGGREGATE_TICKER,
 };
 use anyhow::Result;
-use chrono::{DateTime, Utc};
 use orchestrator_core::{MarketRegime, RetrievalBudget};
-use rusqlite::{params, params_from_iter, Connection, Row};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone)]
@@ -64,10 +62,33 @@ pub fn read_run_context(conn: &mut Connection, request: &RunContextReadRequest) 
     };
     match kind {
         "jin10" | "jin10_context" => return jin10_context(conn),
-        "technical" | "technical_context" => return technical_context(conn),
-        "technical_daily" => return technical_interval_context(conn, "daily"),
-        "technical_3h" => return technical_interval_context(conn, "3h"),
-        "technical_20min" => return technical_interval_context(conn, "20min"),
+        "technical" | "technical_context" => {
+            return technical_context(conn, &request.tickers, request.ticker.as_deref())
+        }
+        "technical_daily" => {
+            return technical_interval_context(
+                conn,
+                "daily",
+                &request.tickers,
+                request.ticker.as_deref(),
+            )
+        }
+        "technical_3h" => {
+            return technical_interval_context(
+                conn,
+                "3h",
+                &request.tickers,
+                request.ticker.as_deref(),
+            )
+        }
+        "technical_20min" => {
+            return technical_interval_context(
+                conn,
+                "20min",
+                &request.tickers,
+                request.ticker.as_deref(),
+            )
+        }
         _ => {}
     }
     let run_id = request
@@ -104,7 +125,6 @@ pub fn read_run_context(conn: &mut Connection, request: &RunContextReadRequest) 
             request.topic_id.as_deref(),
         ),
         "role_summaries" => role_summaries_context(conn, &ctx),
-        "turn_context" => turn_context(conn, &ctx),
         "prior_memory" => prior_memory_context(conn, request, &ctx),
         "track_record" => track_record_context(conn, &ctx),
         "agent_accuracy" => agent_accuracy_context(conn),
@@ -118,7 +138,7 @@ struct ContextBlock {
     context_type: String,
     context_ref: String,
     ticker: String,
-    item_time: String,
+    item_time: i64,
     title: String,
     content: String,
     weight: f64,
@@ -154,16 +174,17 @@ fn compose_context(
     let mut blocks = Vec::new();
     collect_prior_memory_blocks(conn, request, ctx, &mut blocks)?;
     collect_summary_blocks(conn, ctx, request.topic_id.as_deref(), &mut blocks)?;
-    if ctx.phase >= 2 {
-        collect_jin10_blocks(conn, &mut blocks)?;
-        collect_technical_blocks(conn, ctx, &mut blocks)?;
-        collect_external_blocks(conn, ctx, &mut blocks)?;
-        collect_turn_history_blocks(conn, ctx, request.topic_id.as_deref(), &mut blocks)?;
-    }
+    // Always include source/evidence blocks for compose_context. Downstream roles
+    // rely on this as the default empty-kind payload; gating on phase previously
+    // returned near-empty context when phase was unset on the tool request.
+    collect_jin10_blocks(conn, &mut blocks)?;
+    collect_technical_blocks(conn, ctx, &mut blocks)?;
+    collect_external_blocks(conn, ctx, &mut blocks)?;
+    collect_turn_history_blocks(conn, ctx, request.topic_id.as_deref(), &mut blocks)?;
 
     for block in &mut blocks {
         block.weight += ticker_weight(&block.ticker, &ctx.ticker);
-        block.weight += freshness_weight(&block.item_time);
+        block.weight += freshness_weight(block.item_time);
     }
 
     blocks.sort_by(|a, b| {
@@ -183,12 +204,6 @@ fn compose_context(
         }
         used_tokens += tokens;
         selected.push(block);
-    }
-
-    if request.persist_context {
-        if let Some(turn_id) = request.turn_id.as_deref().filter(|value| !value.is_empty()) {
-            write_turn_context_items(conn, turn_id, ctx, request.topic_id.as_deref(), &selected)?;
-        }
     }
 
     Ok(json!({
@@ -317,9 +332,8 @@ fn collect_prior_memory_blocks(
                 .to_string(),
             item_time: item
                 .get("observed_at")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
+                .and_then(Value::as_i64)
+                .unwrap_or_default(),
             title: item
                 .get("memory_type")
                 .and_then(Value::as_str)
@@ -441,8 +455,8 @@ fn collect_summary_blocks(
                 context_ref: format!("role_turn_summaries:{id}"),
                 ticker: row.get("ticker")?,
                 item_time: row
-                    .get::<_, String>("item_time")
-                    .or_else(|_| row.get::<_, String>("created_at"))?,
+                    .get::<_, i64>("item_time")
+                    .or_else(|_| row.get::<_, i64>("created_at"))?,
                 title,
                 content: summary,
                 weight,
@@ -457,26 +471,36 @@ fn collect_summary_blocks(
 }
 
 fn collect_jin10_blocks(conn: &Connection, blocks: &mut Vec<ContextBlock>) -> Result<()> {
+    const MAX_CONTENT_CHARS: usize = 400;
     let mut stmt = conn.prepare(
         r#"
-        SELECT event_key, item_time, content, item_json
-        FROM jin10_items
+        SELECT item_key, item_time, content
+        FROM external_items
+        WHERE source = 'jin10'
         ORDER BY item_time DESC
-        LIMIT 40
+        LIMIT 20
         "#,
     )?;
     let rows = stmt.query_map([], |row| {
-        let item_json: String = row.get("item_json")?;
+        let item_key: String = row.get("item_key")?;
+        let item_time: i64 = row.get("item_time")?;
+        let content: String = row.get("content")?;
+        let clipped = if content.chars().count() > MAX_CONTENT_CHARS {
+            let clipped: String = content.chars().take(MAX_CONTENT_CHARS).collect();
+            format!("{clipped}…")
+        } else {
+            content
+        };
         Ok(ContextBlock {
             context_type: "jin10".to_string(),
-            context_ref: format!("jin10_items:{}", row.get::<_, String>("event_key")?),
+            context_ref: format!("external_items:{item_key}"),
             ticker: String::new(),
-            item_time: row.get("item_time")?,
+            item_time,
             title: "Jin10".to_string(),
-            content: row.get("content")?,
+            content: clipped.clone(),
             weight: 1.0,
-            source_table: "jin10_items".to_string(),
-            item_json: serde_json::from_str(&item_json).unwrap_or(Value::String(item_json)),
+            source_table: "external_items".to_string(),
+            item_json: json!({ "time": item_time, "content": clipped }),
         })
     })?;
     blocks.extend(rows.collect::<rusqlite::Result<Vec<_>>>()?);
@@ -488,38 +512,50 @@ fn collect_technical_blocks(
     ctx: &RuntimeContext,
     blocks: &mut Vec<ContextBlock>,
 ) -> Result<()> {
+    // Keep compose_context aligned with get-technical-context: one compact
+    // latest-bar snapshot per ticker/interval. Raw payload_json rows previously
+    // blew the tool-result budget and forced early compaction.
+    let tickers = effective_technical_tickers(&ctx.tickers, Some(ctx.ticker.as_str()));
     for (interval, context_type) in [
         ("daily", "technical_daily"),
         ("3h", "technical_3h"),
         ("20min", "technical_20min"),
     ] {
-        let sql = "SELECT id, ticker, kline_time, indicator_name, indicator_value, unit, model, payload_json
-             FROM technical_indicators
-             WHERE interval = ? AND (? = '' OR ticker = ?)
-             ORDER BY kline_time DESC
-             LIMIT 40";
-        let mut stmt = conn.prepare(sql)?;
-        let rows = stmt.query_map(params![interval, ctx.ticker, ctx.ticker], |row| {
-            let id: i64 = row.get("id")?;
-            let payload_json: String = row.get("payload_json")?;
-            let name: String = row.get("indicator_name")?;
-            let value: f64 = row.get("indicator_value")?;
-            let unit: String = row.get("unit")?;
-            let model: String = row.get("model")?;
-            Ok(ContextBlock {
+        for snapshot in technical_snapshots(conn, interval, &tickers)? {
+            let ticker = snapshot
+                .get("ticker")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let kline_time = snapshot
+                .get("kline_time")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let item_time = date_str_to_timestamp(&kline_time);
+            let model = snapshot
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let indicators = snapshot
+                .get("indicators")
+                .cloned()
+                .unwrap_or(Value::Object(Default::default()));
+            let content = format!(
+                "{context_type} {ticker} @{kline_time} model={model} indicators={indicators}"
+            );
+            blocks.push(ContextBlock {
                 context_type: context_type.to_string(),
-                context_ref: format!("technical_indicators:{id}"),
-                ticker: row.get("ticker")?,
-                item_time: row.get("kline_time")?,
-                title: format!("{context_type} {name}"),
-                content: format!("{name}={value}{unit} model={model}"),
+                context_ref: format!("technical_snapshot:{interval}:{ticker}:{kline_time}"),
+                ticker,
+                item_time,
+                title: context_type.to_string(),
+                content,
                 weight: 1.5,
-                source_table: "technical_indicators".to_string(),
-                item_json: serde_json::from_str(&payload_json)
-                    .unwrap_or(Value::String(payload_json)),
-            })
-        })?;
-        blocks.extend(rows.collect::<rusqlite::Result<Vec<_>>>()?);
+                source_table: "technical_features".to_string(),
+                item_json: snapshot,
+            });
+        }
     }
     Ok(())
 }
@@ -529,138 +565,29 @@ fn collect_external_blocks(
     ctx: &RuntimeContext,
     blocks: &mut Vec<ContextBlock>,
 ) -> Result<()> {
-    collect_simple_external_blocks(
-        conn,
-        ExternalTable {
-            table: "youtube_videos",
-            context_type: "youtube",
-            key_column: "video_id",
-            time_column: "published_at",
-            title_column: "title",
-            content_column: "title",
-        },
-        ctx,
-        blocks,
-    )?;
-    collect_youtube_transcript_blocks(conn, ctx, blocks)?;
-    collect_social_blocks(conn, ctx, blocks)?;
-    Ok(())
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ExternalTable {
-    table: &'static str,
-    context_type: &'static str,
-    key_column: &'static str,
-    time_column: &'static str,
-    title_column: &'static str,
-    content_column: &'static str,
-}
-
-fn collect_simple_external_blocks(
-    conn: &Connection,
-    source: ExternalTable,
-    ctx: &RuntimeContext,
-    blocks: &mut Vec<ContextBlock>,
-) -> Result<()> {
-    let table = source.table;
-    let key_column = source.key_column;
-    let time_column = source.time_column;
-    let title_column = source.title_column;
-    let content_column = source.content_column;
-    let sql = format!(
-        "SELECT {key_column} AS item_key, ticker, {time_column} AS item_time,
-                {title_column} AS title, {content_column} AS content, item_json
-         FROM {table}
-         WHERE (? = '' OR ticker = ?)
-         ORDER BY {time_column} DESC
-         LIMIT 40"
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params![ctx.ticker, ctx.ticker], |row| {
-        let item_json: String = row.get("item_json")?;
-        Ok(ContextBlock {
-            context_type: source.context_type.to_string(),
-            context_ref: format!("{table}:{}", row.get::<_, String>("item_key")?),
-            ticker: row.get("ticker")?,
-            item_time: row.get("item_time")?,
-            title: row.get("title")?,
-            content: row.get("content")?,
-            weight: 1.0,
-            source_table: table.to_string(),
-            item_json: serde_json::from_str(&item_json).unwrap_or(Value::String(item_json)),
-        })
-    })?;
-    blocks.extend(rows.collect::<rusqlite::Result<Vec<_>>>()?);
-    Ok(())
-}
-
-fn collect_youtube_transcript_blocks(
-    conn: &Connection,
-    ctx: &RuntimeContext,
-    blocks: &mut Vec<ContextBlock>,
-) -> Result<()> {
     let mut stmt = conn.prepare(
         r#"
-        SELECT id, video_id, ticker, transcript, segments_json, language, provider, imported_at
-        FROM youtube_transcripts
-        WHERE (? = '' OR ticker = ?)
-        ORDER BY imported_at DESC
-        LIMIT 20
-        "#,
-    )?;
-    let rows = stmt.query_map(params![ctx.ticker, ctx.ticker], |row| {
-        let id: i64 = row.get("id")?;
-        let segments_json: String = row.get("segments_json")?;
-        let video_id: String = row.get("video_id")?;
-        Ok(ContextBlock {
-            context_type: "youtube_transcript".to_string(),
-            context_ref: format!("youtube_transcripts:{id}"),
-            ticker: row.get("ticker")?,
-            item_time: row.get("imported_at")?,
-            title: format!("YouTube transcript {video_id}"),
-            content: row.get("transcript")?,
-            weight: 1.0,
-            source_table: "youtube_transcripts".to_string(),
-            item_json: json!({
-                "video_id": video_id,
-                "segments": serde_json::from_str::<Value>(&segments_json).unwrap_or(Value::String(segments_json)),
-                "language": row.get::<_, String>("language")?,
-                "provider": row.get::<_, String>("provider")?
-            }),
-        })
-    })?;
-    blocks.extend(rows.collect::<rusqlite::Result<Vec<_>>>()?);
-    Ok(())
-}
-
-fn collect_social_blocks(
-    conn: &Connection,
-    ctx: &RuntimeContext,
-    blocks: &mut Vec<ContextBlock>,
-) -> Result<()> {
-    let mut stmt = conn.prepare(
-        r#"
-        SELECT source, item_key, ticker, item_time, title, content, item_json
-        FROM social_items
-        WHERE source IN ('reddit', 'x') AND (? = '' OR ticker = ?)
+        SELECT source, item_key, ticker, item_time, title, content, metadata_json
+        FROM external_items
+        WHERE source != 'jin10' AND (? = '' OR ticker = ?)
         ORDER BY item_time DESC
-        LIMIT 80
+        LIMIT 120
         "#,
     )?;
     let rows = stmt.query_map(params![ctx.ticker, ctx.ticker], |row| {
-        let item_json: String = row.get("item_json")?;
+        let metadata_json: String = row.get("metadata_json")?;
         let source: String = row.get("source")?;
+        let item_key: String = row.get("item_key")?;
         Ok(ContextBlock {
-            context_type: source,
-            context_ref: format!("social_items:{}", row.get::<_, String>("item_key")?),
+            context_type: source.clone(),
+            context_ref: format!("external_items:{item_key}"),
             ticker: row.get("ticker")?,
             item_time: row.get("item_time")?,
             title: row.get("title")?,
             content: row.get("content")?,
             weight: 1.0,
-            source_table: "social_items".to_string(),
-            item_json: serde_json::from_str(&item_json).unwrap_or(Value::String(item_json)),
+            source_table: "external_items".to_string(),
+            item_json: serde_json::from_str(&metadata_json).unwrap_or(Value::String(metadata_json)),
         })
     })?;
     blocks.extend(rows.collect::<rusqlite::Result<Vec<_>>>()?);
@@ -670,36 +597,31 @@ fn collect_social_blocks(
 fn collect_turn_history_blocks(
     conn: &Connection,
     ctx: &RuntimeContext,
-    topic_id: Option<&str>,
+    _topic_id: Option<&str>,
     blocks: &mut Vec<ContextBlock>,
 ) -> Result<()> {
-    let topic_filter = topic_id.unwrap_or_default();
     let mut stmt = conn.prepare(
         r#"
-        SELECT id, turn_id, item_type, role, tool_name, content_json, content_text, created_at
-        FROM agent_turn_items
+        SELECT id, turn_id, role, created_at, summary
+        FROM agent_events
         WHERE run_id = ?
-          AND item_type IN ('user_message', 'assistant_message')
-          AND (? = '' OR session_id LIKE '%' || ? || '%')
-        ORDER BY id DESC
+        ORDER BY turn_number DESC
         LIMIT 12
         "#,
     )?;
-    let rows = stmt.query_map(params![&ctx.run_id, topic_filter, topic_filter], |row| {
+    let rows = stmt.query_map(params![&ctx.run_id], |row| {
         let id: i64 = row.get("id")?;
-        let content_json: String = row.get("content_json")?;
         let role: String = row.get("role")?;
-        let item_type: String = row.get("item_type")?;
         Ok(ContextBlock {
             context_type: "turn_history".to_string(),
-            context_ref: format!("agent_turn_items:{id}"),
+            context_ref: format!("agent_events:{id}"),
             ticker: String::new(),
             item_time: row.get("created_at")?,
-            title: format!("{role} {item_type}"),
-            content: row.get("content_text")?,
+            title: format!("{role} turn"),
+            content: row.get("summary")?,
             weight: 0.5,
-            source_table: "agent_turn_items".to_string(),
-            item_json: serde_json::from_str(&content_json).unwrap_or(Value::String(content_json)),
+            source_table: "agent_events".to_string(),
+            item_json: Value::Null,
         })
     })?;
     blocks.extend(rows.collect::<rusqlite::Result<Vec<_>>>()?);
@@ -718,62 +640,19 @@ fn ticker_weight(block_ticker: &str, request_ticker: &str) -> f64 {
     }
 }
 
-fn freshness_weight(item_time: &str) -> f64 {
-    DateTime::parse_from_rfc3339(item_time)
-        .map(|time| {
-            let age_days = (Utc::now() - time.with_timezone(&Utc)).num_days().max(0) as f64;
-            (2.0 / (1.0 + age_days / 7.0)).max(0.1)
+fn freshness_weight(item_time: i64) -> f64 {
+    let age_days = (chrono::Utc::now().timestamp() - item_time).max(0) as f64 / 86400.0;
+    (2.0 / (1.0 + age_days / 7.0)).max(0.1)
+}
+
+fn date_str_to_timestamp(s: &str) -> i64 {
+    chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+        .ok()
+        .and_then(|d| {
+            d.and_hms_opt(0, 0, 0)
+                .and_then(|dt| dt.and_utc().timestamp().into())
         })
-        .unwrap_or(0.5)
-}
-
-fn write_turn_context_items(
-    conn: &mut Connection,
-    turn_id: &str,
-    ctx: &RuntimeContext,
-    topic_id: Option<&str>,
-    blocks: &[ContextBlock],
-) -> Result<()> {
-    let tx = conn.transaction()?;
-    tx.execute(
-        "DELETE FROM turn_context_items WHERE turn_id = ?",
-        [turn_id],
-    )?;
-    for block in blocks {
-        let item_json = block.value();
-        let item_json_text = serde_json::to_string(&item_json)?;
-        let content_hash = sha256_hex(&item_json_text);
-        tx.execute(
-            r#"
-            INSERT INTO turn_context_items
-                (run_id, turn_id, role, phase, ticker, item_time, topic_id,
-                 context_type, context_ref, weight, content_hash, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            "#,
-            params![
-                ctx.run_id,
-                turn_id,
-                ctx.role,
-                ctx.phase,
-                block.ticker,
-                block.item_time,
-                topic_id,
-                block.context_type,
-                block.context_ref,
-                block.weight,
-                content_hash,
-                Utc::now().to_rfc3339()
-            ],
-        )?;
-    }
-    tx.commit()?;
-    Ok(())
-}
-
-fn sha256_hex(value: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(value.as_bytes());
-    format!("{:x}", hasher.finalize())
+        .unwrap_or(0)
 }
 
 fn latest_run_id(conn: &Connection) -> Result<String> {
@@ -837,7 +716,7 @@ fn row_to_message(row: &Row<'_>) -> rusqlite::Result<Value> {
         "valid": row.get::<_, f64>("confidence")? > 0.0,
         "content": content,
         "last_md": row.get::<_, String>("summary")?,
-        "created_at": row.get::<_, String>("created_at")?
+        "created_at": row.get::<_, i64>("created_at")?
     }))
 }
 
@@ -859,43 +738,19 @@ pub fn messages_text(items: &[Value]) -> String {
         .join("\n")
 }
 
-pub fn session_history_items(
-    conn: &Connection,
-    session_id: &str,
-    limit: usize,
-) -> Result<Vec<Value>> {
-    let mut stmt = conn.prepare(
-        r#"
-        SELECT turn_id, session_id, run_id, item_index, item_type, role, tool_call_id,
-               tool_name, content_json, content_text, created_at
-        FROM agent_turn_items
-        WHERE session_id = ?
-        ORDER BY id DESC
-        LIMIT ?
-        "#,
-    )?;
-    let mut rows = stmt
-        .query_map(rusqlite::params![session_id, limit.max(1) as i64], |row| {
-            let content_text: String = row.get("content_json")?;
-            let content_json =
-                serde_json::from_str::<Value>(&content_text).unwrap_or(Value::String(content_text));
-            Ok(json!({
-                "turn_id": row.get::<_, String>("turn_id")?,
-                "session_id": row.get::<_, String>("session_id")?,
-                "run_id": row.get::<_, String>("run_id")?,
-                "item_index": row.get::<_, i64>("item_index")?,
-                "item_type": row.get::<_, String>("item_type")?,
-                "role": row.get::<_, String>("role")?,
-                "tool_call_id": row.get::<_, String>("tool_call_id")?,
-                "tool_name": row.get::<_, String>("tool_name")?,
-                "content_json": content_json,
-                "content_text": row.get::<_, String>("content_text")?,
-                "created_at": row.get::<_, String>("created_at")?
-            }))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    rows.reverse();
-    Ok(rows)
+pub fn session_history_items(conn: &Connection, run_id: &str, _limit: usize) -> Result<Vec<Value>> {
+    let full_context_json: String = conn
+        .query_row(
+            "SELECT full_context_json FROM agent_events WHERE run_id = ? ORDER BY turn_number DESC LIMIT 1",
+            params![run_id],
+            |row| row.get(0),
+        )
+        .unwrap_or_default();
+    if full_context_json.is_empty() || full_context_json == "[]" {
+        return Ok(Vec::new());
+    }
+    let messages: Vec<Value> = serde_json::from_str(&full_context_json).unwrap_or_default();
+    Ok(messages)
 }
 
 pub fn handle_read_command(
@@ -918,7 +773,9 @@ pub fn handle_read_command(
         ),
         "get-research-inputs" | "get-run-inputs" => (vec![1, 2, 25, 3], vec![]),
         "get-jin10-context" => return jin10_context(conn),
-        "get-technical-context" => return technical_context(conn),
+        "get-technical-context" => {
+            return technical_context(conn, &ctx.tickers, Some(ctx.ticker.as_str()))
+        }
         "get-previous-topics"
         | "get-opponent-last"
         | "get-topics"
@@ -949,7 +806,7 @@ pub fn sqlite_context(conn: &Connection, run_id: &str) -> Result<Value> {
         "run_id": run_id,
         "analyst_messages": analyst_messages,
         "debate_messages": debate_messages,
-        "technical": technical_context(conn)?,
+        "technical": technical_context(conn, &[], None)?,
         "jin10": jin10_context(conn)?,
         "sources": external_sources_context(conn)?
     }))
@@ -965,16 +822,18 @@ pub fn context_count(conn: &Connection, name: &str) -> Result<i64> {
     }
     let sql = match name {
         "technical" | "technical-context" | "technical_context" => {
-            "SELECT COUNT(*) FROM technical_indicators"
+            "SELECT COUNT(*) FROM technical_features"
         }
-        "technical_daily" => "SELECT COUNT(*) FROM technical_indicators WHERE interval = 'daily'",
-        "technical_3h" => "SELECT COUNT(*) FROM technical_indicators WHERE interval = '3h'",
-        "technical_20min" => "SELECT COUNT(*) FROM technical_indicators WHERE interval = '20min'",
-        "jin10" | "jin10-context" => "SELECT COUNT(*) FROM jin10_items",
-        "youtube" | "sources" => "SELECT COUNT(*) FROM youtube_videos",
-        "youtube_transcripts" => "SELECT COUNT(*) FROM youtube_transcripts",
-        "reddit" => "SELECT COUNT(*) FROM social_items WHERE source = 'reddit'",
-        "x" => "SELECT COUNT(*) FROM social_items WHERE source = 'x'",
+        "technical_daily" => "SELECT COUNT(*) FROM technical_features WHERE interval = 'daily'",
+        "technical_3h" => "SELECT COUNT(*) FROM technical_features WHERE interval = '3h'",
+        "technical_20min" => "SELECT COUNT(*) FROM technical_features WHERE interval = '20min'",
+        "jin10" | "jin10-context" => "SELECT COUNT(*) FROM external_items WHERE source = 'jin10'",
+        "youtube" | "sources" => "SELECT COUNT(*) FROM external_items WHERE source = 'youtube'",
+        "youtube_transcripts" | "youtube_transcript" => {
+            "SELECT COUNT(*) FROM external_items WHERE source = 'youtube_transcript'"
+        }
+        "reddit" => "SELECT COUNT(*) FROM external_items WHERE source = 'reddit'",
+        "x" => "SELECT COUNT(*) FROM external_items WHERE source = 'x'",
         other => {
             // Only allow safe SQL identifiers so untrusted names cannot inject
             // via table interpolation. Existence is still checked separately.
@@ -996,67 +855,196 @@ pub fn context_count(conn: &Connection, name: &str) -> Result<i64> {
 }
 
 fn jin10_context(conn: &Connection) -> Result<Value> {
-    let rows = table_rows(conn, "jin10_items", &["item_time", "imported_at"])?;
-    let items = rows
+    const MAX_ITEMS: usize = 20;
+    const MAX_CONTENT_CHARS: usize = 400;
+    let mut stmt = conn.prepare(
+        "SELECT item_time, content FROM external_items \
+         WHERE source = 'jin10' ORDER BY item_time DESC LIMIT ?",
+    )?;
+    let items = stmt
+        .query_map(params![MAX_ITEMS as i64], |row| {
+            let item_time: i64 = row.get(0)?;
+            let content: String = row.get(1)?;
+            Ok((item_time, content))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
         .into_iter()
-        .map(|item| {
-            json!({
-                "time": item.get("item_time").cloned().unwrap_or(Value::Null),
-                "content": item.get("content").cloned().unwrap_or(Value::Null),
-                "item": item
-            })
+        .map(|(time, content)| {
+            let content = if content.chars().count() > MAX_CONTENT_CHARS {
+                let clipped: String = content.chars().take(MAX_CONTENT_CHARS).collect();
+                format!("{clipped}…")
+            } else {
+                content
+            };
+            json!({ "time": time, "content": content })
         })
         .collect::<Vec<_>>();
-    Ok(json!({"query": "get-jin10-context", "items": items}))
+    Ok(json!({
+        "query": "get-jin10-context",
+        "item_count": items.len(),
+        "items": items
+    }))
 }
 
-fn technical_context(conn: &Connection) -> Result<Value> {
-    let daily = technical_rows(conn, "daily")?;
-    let three_hour = technical_rows(conn, "3h")?;
-    let twenty_minute = technical_rows(conn, "20min")?;
+fn technical_context(conn: &Connection, tickers: &[String], ticker: Option<&str>) -> Result<Value> {
+    let tickers = effective_technical_tickers(tickers, ticker);
     Ok(json!({
         "query": "get-technical-context",
-        "daily": daily,
-        "three_hour": three_hour,
-        "twenty_minute": twenty_minute
+        "daily": technical_snapshots(conn, "daily", &tickers)?,
+        "three_hour": technical_snapshots(conn, "3h", &tickers)?,
+        "twenty_minute": technical_snapshots(conn, "20min", &tickers)?
     }))
 }
 
-fn technical_interval_context(conn: &Connection, interval: &str) -> Result<Value> {
+fn technical_interval_context(
+    conn: &Connection,
+    interval: &str,
+    tickers: &[String],
+    ticker: Option<&str>,
+) -> Result<Value> {
+    let tickers = effective_technical_tickers(tickers, ticker);
     Ok(json!({
         "query": interval,
-        "items": technical_rows(conn, interval)?
+        "items": technical_snapshots(conn, interval, &tickers)?
     }))
 }
 
-fn technical_rows(conn: &Connection, interval: &str) -> Result<Vec<Value>> {
-    if !table_exists(conn, "technical_indicators")? {
+fn effective_technical_tickers(tickers: &[String], ticker: Option<&str>) -> Vec<String> {
+    let mut out = tickers
+        .iter()
+        .map(|value| value.trim().to_ascii_uppercase())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    if out.is_empty() {
+        if let Some(ticker) = ticker.map(str::trim).filter(|value| !value.is_empty()) {
+            out.push(ticker.to_ascii_uppercase());
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Compact latest-per-ticker snapshots for one interval.
+/// Reads from `technical_features` (one JSON row per ticker/date/interval).
+fn technical_snapshots(
+    conn: &Connection,
+    interval: &str,
+    tickers: &[String],
+) -> Result<Vec<Value>> {
+    if !table_exists(conn, "technical_features")? {
         return Ok(Vec::new());
     }
+
+    let mut snapshots = Vec::new();
+    if tickers.is_empty() {
+        let latest_tickers = latest_technical_tickers(conn, interval, 6)?;
+        for ticker in latest_tickers {
+            if let Some(snapshot) = technical_snapshot_for_ticker(conn, interval, &ticker)? {
+                snapshots.push(snapshot);
+            }
+        }
+        return Ok(snapshots);
+    }
+
+    for ticker in tickers {
+        if let Some(snapshot) = technical_snapshot_for_ticker(conn, interval, ticker)? {
+            snapshots.push(snapshot);
+        }
+    }
+    Ok(snapshots)
+}
+
+fn latest_technical_tickers(
+    conn: &Connection,
+    interval: &str,
+    limit: usize,
+) -> Result<Vec<String>> {
     let mut stmt = conn.prepare(
-        "SELECT id, ticker, kline_time, indicator_name, indicator_value, unit, model, payload_json, imported_at
-         FROM technical_indicators
+        "SELECT ticker
+         FROM technical_features
          WHERE interval = ?
-         ORDER BY kline_time DESC, indicator_name ASC
-         LIMIT 80"
+         GROUP BY ticker
+         ORDER BY MAX(date) DESC
+         LIMIT ?",
     )?;
     let rows = stmt
-        .query_map([interval], |row| {
-            let payload_json: String = row.get("payload_json")?;
-            Ok(json!({
-                "id": row.get::<_, i64>("id")?,
-                "ticker": row.get::<_, String>("ticker")?,
-                "kline_time": row.get::<_, String>("kline_time")?,
-                "indicator_name": row.get::<_, String>("indicator_name")?,
-                "indicator_value": row.get::<_, f64>("indicator_value")?,
-                "unit": row.get::<_, String>("unit")?,
-                "model": row.get::<_, String>("model")?,
-                "payload": serde_json::from_str::<Value>(&payload_json).unwrap_or(Value::String(payload_json)),
-                "imported_at": row.get::<_, String>("imported_at")?
-            }))
+        .query_map(rusqlite::params![interval, limit as i64], |row| {
+            row.get::<_, String>(0)
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
+}
+
+const TECHNICAL_CONTEXT_KEYS: &[&str] = &[
+    "Close",
+    "Return",
+    "LogReturn",
+    "Gap",
+    "Body",
+    "BETA5",
+    "BETA20",
+    "CORR5",
+    "CORR20",
+    "CNTD5",
+    "CNTD20",
+    "CNTP5",
+    "CNTP20",
+    "RSQR5",
+    "RSQR20",
+    "VSTD5",
+    "VSTD20",
+    "WVMA5",
+    "WVMA20",
+    "IMAX5",
+    "IMAX20",
+    "IMIN5",
+    "IMIN20",
+];
+
+fn technical_snapshot_for_ticker(
+    conn: &Connection,
+    interval: &str,
+    ticker: &str,
+) -> Result<Option<Value>> {
+    let row: Option<(String, String, String, i64)> = conn
+        .query_row(
+            "SELECT date, model, features_json, imported_at
+             FROM technical_features
+             WHERE interval = ? AND ticker = ?
+             ORDER BY date DESC
+             LIMIT 1",
+            rusqlite::params![interval, ticker],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((kline_time, model, features_raw, imported_at)) = row else {
+        return Ok(None);
+    };
+    let all_features: serde_json::Map<String, Value> =
+        serde_json::from_str(&features_raw).unwrap_or_default();
+    let indicators: serde_json::Map<String, Value> = all_features
+        .into_iter()
+        .filter(|(key, _)| TECHNICAL_CONTEXT_KEYS.contains(&key.as_str()))
+        .collect();
+    if indicators.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(json!({
+        "ticker": ticker,
+        "interval": interval,
+        "kline_time": kline_time,
+        "model": model,
+        "imported_at": imported_at,
+        "indicators": indicators
+    })))
 }
 
 fn role_summaries_context(conn: &Connection, ctx: &RuntimeContext) -> Result<Value> {
@@ -1076,15 +1064,6 @@ fn role_summaries_context(conn: &Connection, ctx: &RuntimeContext) -> Result<Val
     Ok(json!({"query": "role-summaries", "run_id": ctx.run_id, "items": items}))
 }
 
-fn turn_context(conn: &Connection, ctx: &RuntimeContext) -> Result<Value> {
-    let mut sql = String::from("SELECT * FROM turn_context_items WHERE run_id = ?");
-    let params: Vec<rusqlite::types::Value> =
-        vec![rusqlite::types::Value::Text(ctx.run_id.clone())];
-    sql.push_str(" ORDER BY created_at DESC, id DESC LIMIT 80");
-    let items = query_rows(conn, &sql, params)?;
-    Ok(json!({"query": "turn-context", "run_id": ctx.run_id, "items": items}))
-}
-
 fn is_safe_sql_identifier(name: &str) -> bool {
     let mut chars = name.chars();
     match chars.next() {
@@ -1101,20 +1080,6 @@ fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
         |row| row.get::<_, bool>(0),
     )
     .map_err(Into::into)
-}
-
-fn table_rows(conn: &Connection, table: &str, order_candidates: &[&str]) -> Result<Vec<Value>> {
-    if !table_exists(conn, table)? {
-        return Ok(Vec::new());
-    }
-    let columns = table_columns(conn, table)?;
-    let order = order_candidates
-        .iter()
-        .find(|column| columns.iter().any(|existing| existing == **column))
-        .map(|column| format!(" ORDER BY {column} DESC"))
-        .unwrap_or_default();
-    let sql = format!("SELECT * FROM {table}{order} LIMIT 80");
-    query_rows(conn, &sql, Vec::new())
 }
 
 fn query_rows(
@@ -1140,15 +1105,6 @@ fn query_rows(
     Ok(rows)
 }
 
-fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
-    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
-    let columns = stmt
-        .query_map([], |row| row.get::<_, String>("name"))?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(Into::into);
-    columns
-}
-
 fn sqlite_value(row: &Row<'_>, index: usize) -> rusqlite::Result<Value> {
     use rusqlite::types::ValueRef;
     Ok(match row.get_ref(index)? {
@@ -1164,65 +1120,24 @@ fn sqlite_value(row: &Row<'_>, index: usize) -> rusqlite::Result<Value> {
 }
 
 fn external_sources_context(conn: &Connection) -> Result<Value> {
-    let mut rows = Vec::new();
-    rows.extend(source_table_rows(
-        conn,
-        "youtube_videos",
-        "youtube",
-        "published_at",
-        "title",
-    )?);
-    rows.extend(social_source_rows(conn)?);
-    Ok(json!({"query": "source-items", "items": rows}))
-}
-
-fn source_table_rows(
-    conn: &Connection,
-    table: &str,
-    source: &str,
-    time_column: &str,
-    content_column: &str,
-) -> Result<Vec<Value>> {
-    let sql = format!(
-        "SELECT ticker, {time_column} AS item_time, {content_column} AS content, item_json
-         FROM {table}
-         ORDER BY imported_at DESC, {time_column} DESC
-         LIMIT 40"
-    );
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare(
+        "SELECT source, ticker, item_time, content, metadata_json \
+         FROM external_items \
+         WHERE source != 'jin10' \
+         ORDER BY imported_at DESC, item_time DESC \
+         LIMIT 120",
+    )?;
     let rows = stmt
         .query_map(params![], |row| {
-            let item_json: String = row.get("item_json")?;
-            Ok(json!({
-                "source": source,
-                "ticker": row.get::<_, String>("ticker")?,
-                "time": row.get::<_, String>("item_time")?,
-                "content": row.get::<_, String>("content")?,
-                "item": serde_json::from_str::<Value>(&item_json).unwrap_or(Value::String(item_json))
-            }))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(rows)
-}
-
-fn social_source_rows(conn: &Connection) -> Result<Vec<Value>> {
-    let sql = "SELECT source, ticker, item_time, content, item_json
-         FROM social_items
-         WHERE source IN ('reddit', 'x')
-         ORDER BY imported_at DESC, item_time DESC
-         LIMIT 80";
-    let mut stmt = conn.prepare(sql)?;
-    let rows = stmt
-        .query_map(params![], |row| {
-            let item_json: String = row.get("item_json")?;
+            let metadata_json: String = row.get("metadata_json")?;
             Ok(json!({
                 "source": row.get::<_, String>("source")?,
                 "ticker": row.get::<_, String>("ticker")?,
-                "time": row.get::<_, String>("item_time")?,
+                "time": row.get::<_, i64>("item_time")?,
                 "content": row.get::<_, String>("content")?,
-                "item": serde_json::from_str::<Value>(&item_json).unwrap_or(Value::String(item_json))
+                "item": serde_json::from_str::<Value>(&metadata_json).unwrap_or(Value::String(metadata_json))
             }))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(rows)
+    Ok(json!({"query": "source-items", "items": rows}))
 }

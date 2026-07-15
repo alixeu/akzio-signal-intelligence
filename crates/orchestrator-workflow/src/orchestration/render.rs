@@ -53,6 +53,7 @@ fn common_component(prompt_path: Option<&std::path::Path>, file_name: &str) -> R
     }
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn render_prompt(
     state: &Value,

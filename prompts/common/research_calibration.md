@@ -22,7 +22,8 @@
 | `duplicate_evidence_discount` | 重复证据只按一次计权，不当作独立信号 | `evidence_overlap` 冲突：重复证据只按一次计权 |
 | `direction_conflict_discount` | 方向冲突证据降权 | `direction_conflict` 冲突：证据降权 30%（×0.7） |
 | `evidence_contradiction_discount` | 证据矛盾双方降权 | `evidence_contradiction` 冲突：双方各降权 50%（×0.5） |
-| `speculation_discount` | speculation 证据降权 | opinion ×0.7，speculation ×0.3；speculation 占比 >50% 整体降权 30% |
+| `speculation_discount` | speculation 证据降权 | opinion ×0.7，speculation ×0.3；speculation 占比 >50% 整体降权 30%。**Phase 1 `weighted_probability_base` 已由 Rust 按此规则对 analyst confidence 强制折减**；Research Manager 仍须对 `probability_drivers` / Phase 2 证据应用同规则并引用本 reason_code |
+| `missing_data_premium` | 高影响缺失证据向 0.50 收敛 | 每存在一个 Mediator `missing_high_impact_factors`（或等价 high-impact `missing_evidence`）项，`final_probability` 向 0.50 收敛 **0.02–0.03**（多项可叠加，但单次累计通常不超过 0.08，除非同时触发其他高严重度收敛） |
 | `missing_hinge_convergence` | 缺少共同 decision hinge / 未收敛，概率向 0.50 或 base 收敛 | `confidence_divergence` 高严重度、mediator 为空/`should_continue=false` 且信息增量低：向 0.50 或 base 收敛 |
 | `track_record_convergence` | 历史 track record 偏差，向 0.50 或 weighted base 收敛 | `track_record` 方向准确率低 / Brier 高 / error 持续同向、与当前高质量事实冲突时以事实为准 |
 | `low_info_gain_no_adjustment` | Mediator info_gain_score 低 / Phase2 重复 Phase1，`debate_adjustment`≈0 | Phase 2 重复 Phase 1 或 `info_gain_score` 很低：`debate_adjustment` 接近 0 |
@@ -39,6 +40,7 @@
 - 普通情况下，`debate_adjustment` 绝对值不得超过 `0.08`；只有发现重大遗漏、重大误读、重大 surprise 或明显未计价硬催化时，才允许扩大到 `0.15`。超过 `0.08` 必须在 `adjustment_rationale` 中明确标注 `large_adjustment_reason`。
 - 如果 Phase 2 只是重复 Phase 1 信息，或 Mediator 的 `info_gain_score` 很低，`debate_adjustment` 应接近 `0`。
 - 如果关键数据缺失、时点不匹配、分歧未解决、或 Mediator 标出高影响缺失因素，应把最终概率向 `0.50` 或 `base_probability` 收敛，而不是向 Bull/Bear 一方大幅漂移。
+- **Missing Data Premium（必须量化）**：读取 Mediator 的 `missing_high_impact_factors` / 高影响 `missing_evidence`。每有一项，在 `adjustment_rationale` 中引用 reason_code `missing_data_premium`，并将 `final_probability` 向 `0.50` 收敛 0.02–0.03；多项叠加时写明项数与累计收敛幅度。不得只写“存在缺口”而不改概率。
 
 **去重与独立性检查**（`duplicate_evidence_discount` 的底层依据）：
 - 必须识别 `independent_signals`：真正相对独立、能够单独影响价格的信号。

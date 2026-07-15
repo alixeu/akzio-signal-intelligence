@@ -371,11 +371,34 @@ fn classify_regime(level: f64, thresholds: &[f64], labels: &[String]) -> (String
 }
 
 fn query_latest_indicator(conn: &Connection, ticker: &str, indicator: &str) -> Option<f64> {
+    let column = match indicator {
+        "Close" => "close",
+        "Return" => "return_pct",
+        "Gap" => "gap",
+        "Body" => "body",
+        "VSTD5" => "vstd5",
+        "VSTD20" => "vstd20",
+        "BETA5" => "beta5",
+        "BETA20" => "beta20",
+        _ => {
+            return conn
+                .query_row(
+                    "SELECT json_extract(features_json, '$.' || ?) FROM technical_features
+                     WHERE ticker = ? AND interval = 'daily'
+                     ORDER BY date DESC LIMIT 1",
+                    rusqlite::params![indicator, ticker],
+                    |row| row.get::<_, f64>(0),
+                )
+                .ok()
+        }
+    };
     conn.query_row(
-        "SELECT indicator_value FROM technical_indicators
-         WHERE ticker = ? AND indicator_name = ? AND interval = '1d'
-         ORDER BY kline_time DESC LIMIT 1",
-        rusqlite::params![ticker, indicator],
+        &format!(
+            "SELECT {column} FROM technical_features
+             WHERE ticker = ? AND interval = 'daily' AND {column} IS NOT NULL
+             ORDER BY date DESC LIMIT 1"
+        ),
+        rusqlite::params![ticker],
         |row| row.get::<_, f64>(0),
     )
     .ok()
@@ -389,12 +412,12 @@ fn query_correlation(
 ) -> Option<f64> {
     let mut stmt = conn
         .prepare(
-            "SELECT a.kline_time, a.indicator_value AS close_a, b.indicator_value AS close_b
-         FROM technical_indicators a
-         JOIN technical_indicators b ON a.kline_time = b.kline_time
-         WHERE a.ticker = ? AND a.indicator_name = 'Close' AND a.interval = '1d'
-           AND b.ticker = ? AND b.indicator_name = 'Close' AND b.interval = '1d'
-         ORDER BY a.kline_time DESC LIMIT ?",
+            "SELECT a.date, a.close AS close_a, b.close AS close_b
+         FROM technical_features a
+         JOIN technical_features b ON a.date = b.date
+         WHERE a.ticker = ? AND a.interval = 'daily' AND a.close IS NOT NULL
+           AND b.ticker = ? AND b.interval = 'daily' AND b.close IS NOT NULL
+         ORDER BY a.date DESC LIMIT ?",
         )
         .ok()?;
 

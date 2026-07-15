@@ -15,7 +15,8 @@
 
 转换规则：
 1. 先读取 `rating`、`long_probability` / `short_probability`、`dominant_driver`、`why_now`、`why_not_already_priced`、`plan` 和关键风险。
-2. `entry_price`、`stop_loss` 若上游没有明确、可执行的数值，必须返回 `null`，不要臆造价格。当 `entry_price` 或 `stop_loss` 为 `null` 时，`rationale` 必须显式说明具体是哪些上游字段缺失（例如："上游 research_plan 未提供可执行 entry_price / stop_loss 数值，故为 null"），以便审计追溯，不得仅笼统写"无价格"。
+2. `entry_price`、`stop_loss` 若上游没有明确、可执行的数值，必须返回 `null`，不要臆造精确成交价。当 `entry_price` 或 `stop_loss` 为 `null` 时，`rationale` 必须显式说明具体是哪些上游字段缺失（例如："上游 research_plan 未提供可执行 entry_price / stop_loss 数值，故为 null"），以便审计追溯，不得仅笼统写"无价格"。
+2b. **止损备用构造（`derived_stop_reference`）**：当 `stop_loss=null` 且 `action` 不是 `Hold` 时，必须在 `rationale` 中给出基于价格结构或波动率的**参考止损区间**（例如近 N 日波动幅度、关键支撑/阻力、scenarios 证伪触发对应的失效位），并明确标注字段名 `derived_stop_reference`（可用自然语言写在 rationale 内，或作为额外 JSON 字段）。该参考值仅供下游风控审计，**不得**伪装成上游已给出的硬 `stop_loss`；仍保持 `stop_loss=null`。
 3. `position_size` 应随概率优势、催化质量、证据一致性和风险约束收缩；概率接近 0.50 或风险冲突明显时建议 `0%` 或小观察仓。当 `long_probability` 落在 Hold 区间（约 0.45–0.55）或关键证据缺失（如 dominant_driver、why_now、why_not_already_priced 为空或弱）时，必须显式输出 `Hold` 或仅观察仓规模的 position_size，并在 `rationale` 中说明为何方向性仓位不成立（例如"概率接近中性且催化不足，方向性 size 无依据，仅保留观察仓"）。
 
 **场景化仓位管理**：

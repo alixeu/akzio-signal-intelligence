@@ -1,10 +1,10 @@
 use anyhow::{bail, Context, Result};
-use chrono::{Duration, NaiveDate, Utc};
+use chrono::{Datelike, Duration, NaiveDate, Utc, Weekday};
 use clap::Args;
 use orchestrator_core::{config_int, config_str, config_strings, parse_tickers};
 use orchestrator_sql::{connect, ensure_schema};
 use reqwest::header;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{collections::HashMap, sync::Arc, time::Duration as StdDuration};
@@ -108,12 +108,17 @@ impl YahooDataSource {
         url.path_segments_mut()
             .map_err(|_| anyhow::anyhow!("invalid Yahoo chart base URL"))?
             .push(&provider_symbol);
-        // ponytail: cap intraday range to 59-day window; Yahoo allows ≤60 days for 1h/5m
+        // Cap intraday range to Yahoo's rolling ≤60-day window relative to *now*,
+        // not only the requested end date. Otherwise historical end-59 can fall
+        // outside the live API window and return HTTP 422.
         let (start, end) = match interval {
             "1d" => (start, end),
             _ => {
+                let today = Utc::now().date_naive();
+                let end = end.min(today);
+                let api_floor = today - Duration::days(59);
                 let max_start = end - Duration::days(59);
-                (start.max(max_start), end)
+                (start.max(max_start).max(api_floor), end)
             }
         };
         let response = self
@@ -190,11 +195,11 @@ pub async fn run(args: TechnicalArgs) -> Result<Value> {
     let source = YahooDataSource::new(args.timeout)?;
     let conn = connect(&args.db_path)?;
     ensure_schema(&conn)?;
-    let imported_at = Utc::now().to_rfc3339();
+    let imported_at = Utc::now().timestamp();
     let mut results = Vec::new();
     for symbol in &args.symbols {
         for interval in &args.intervals {
-            if has_fresh_rows(&conn, symbol, interval, &args.model, args.start)? {
+            if has_fresh_rows(&conn, symbol, interval, &args.model, args.start, args.end)? {
                 results.push(json!({
                     "symbol": symbol,
                     "interval": interval,
@@ -209,29 +214,36 @@ pub async fn run(args: TechnicalArgs) -> Result<Value> {
                 tokio::time::sleep(StdDuration::from_secs_f64(args.sleep)).await;
             }
             let bars = match interval.as_str() {
-                "1d" => {
-                    source
-                        .fetch_daily_bars(symbol, args.start, args.end)
-                        .await?
+                "1d" => source.fetch_daily_bars(symbol, args.start, args.end).await,
+                "3h" => source
+                    .fetch_bars(symbol, args.start, args.end, "1h")
+                    .await
+                    .map(|bars| resample_bars(bars, "3h", 3)),
+                "20min" => source
+                    .fetch_bars(symbol, args.start, args.end, "5m")
+                    .await
+                    .map(|bars| resample_bars(bars, "20min", 4)),
+                other => Err(anyhow::anyhow!(
+                    "unsupported interval {other:?}; use 1d, 3h, 20min"
+                )),
+            };
+            let bars = match bars {
+                Ok(bars) => bars,
+                Err(error) => {
+                    results.push(json!({
+                        "symbol": symbol,
+                        "interval": interval,
+                        "bars": 0,
+                        "feature_rows": 0,
+                        "inserted_indicators": 0,
+                        "status": "error",
+                        "error": error.to_string(),
+                    }));
+                    continue;
                 }
-                "3h" => resample_bars(
-                    source
-                        .fetch_bars(symbol, args.start, args.end, "1h")
-                        .await?,
-                    "3h",
-                    3,
-                ),
-                "20min" => resample_bars(
-                    source
-                        .fetch_bars(symbol, args.start, args.end, "5m")
-                        .await?,
-                    "20min",
-                    4,
-                ),
-                other => bail!("unsupported interval {other:?}; use 1d, 3h, 20min"),
             };
             let rows = feature_rows(interval, &bars);
-            let inserted = insert_feature_rows(&conn, &args.model, &rows, &imported_at)?;
+            let inserted = insert_feature_rows(&conn, &args.model, &rows, imported_at)?;
             results.push(json!({
                 "symbol": symbol,
                 "interval": interval,
@@ -884,40 +896,46 @@ fn insert_feature_rows(
     conn: &Connection,
     model: &str,
     rows: &[FeatureRow],
-    imported_at: &str,
+    imported_at: i64,
 ) -> Result<usize> {
     let mut inserted = 0;
     for row in rows {
         let Some(interval) = technical_interval(&row.interval) else {
             continue;
         };
-        let payload = serde_json::to_string(&json!({
-            "symbol": row.symbol,
-            "date": row.date,
-            "interval": row.interval,
-            "features": row.features
-        }))?;
-        for (name, value) in &row.features {
-            let Some(value) = value.filter(|value| value.is_finite()) else {
-                continue;
-            };
-            conn.execute(
-                "INSERT OR IGNORE INTO technical_indicators
-                    (ticker, kline_time, indicator_name, indicator_value, model, interval, payload_json, imported_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                params![
-                    row.symbol,
-                    row.date,
-                    name,
-                    value,
-                    model,
-                    interval,
-                    payload,
-                    imported_at
-                ],
-            )
-            .map(|changed| inserted += changed)?;
+        let finite_features: HashMap<String, f64> = row
+            .features
+            .iter()
+            .filter_map(|(k, v)| v.filter(|v| v.is_finite()).map(|v| (k.clone(), v)))
+            .collect();
+        if finite_features.is_empty() {
+            continue;
         }
+        let features_json = serde_json::to_string(&finite_features)?;
+        let get = |key: &str| -> Option<f64> { finite_features.get(key).copied() };
+        conn.execute(
+            "INSERT OR REPLACE INTO technical_features
+                (ticker, date, interval, model, close, return_pct, gap, body,
+                 vstd5, vstd20, beta5, beta20, features_json, imported_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                row.symbol,
+                row.date,
+                interval,
+                model,
+                get("Close"),
+                get("Return"),
+                get("Gap"),
+                get("Body"),
+                get("VSTD5"),
+                get("VSTD20"),
+                get("BETA5"),
+                get("BETA20"),
+                features_json,
+                imported_at
+            ],
+        )
+        .map(|changed| inserted += changed)?;
     }
     Ok(inserted)
 }
@@ -937,16 +955,39 @@ fn has_fresh_rows(
     interval: &str,
     model: &str,
     start: NaiveDate,
+    end: NaiveDate,
 ) -> Result<bool> {
     let Some(interval) = technical_interval(interval) else {
         return Ok(false);
     };
     let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM technical_indicators WHERE ticker = ? AND model = ? AND interval = ? AND kline_time >= ?",
+        "SELECT COUNT(*) FROM technical_features WHERE ticker = ? AND model = ? AND interval = ? AND date >= ?",
         params![symbol, model, interval, start.to_string()],
         |row| row.get(0),
     )?;
-    Ok(count > 0)
+    if count == 0 {
+        return Ok(false);
+    }
+    let latest: Option<String> = conn
+        .query_row(
+            "SELECT MAX(date) FROM technical_features WHERE ticker = ? AND model = ? AND interval = ?",
+            params![symbol, model, interval],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(latest) = latest.filter(|value| !value.trim().is_empty()) else {
+        return Ok(false);
+    };
+    let latest_day = latest.get(..10).unwrap_or(latest.as_str());
+    let Ok(latest_date) = NaiveDate::parse_from_str(latest_day, "%Y-%m-%d") else {
+        return Ok(false);
+    };
+    let required_end = match end.weekday() {
+        Weekday::Sat => end - Duration::days(1),
+        Weekday::Sun => end - Duration::days(2),
+        _ => end,
+    };
+    Ok(latest_date >= required_end)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1142,7 +1183,7 @@ mod tests {
     }
 
     #[test]
-    fn insert_feature_rows_only_adds_missing_rows() {
+    fn insert_feature_rows_upserts_per_ticker_date_interval() {
         let conn = Connection::open_in_memory().unwrap();
         ensure_schema(&conn).unwrap();
         let rows = vec![FeatureRow {
@@ -1152,12 +1193,18 @@ mod tests {
             features: HashMap::from([("Return".to_string(), Some(0.01))]),
         }];
         assert_eq!(
-            insert_feature_rows(&conn, "YahooTechnical", &rows, "now").unwrap(),
+            insert_feature_rows(&conn, "YahooTechnical", &rows, 1000).unwrap(),
             1
         );
         assert_eq!(
-            insert_feature_rows(&conn, "YahooTechnical", &rows, "later").unwrap(),
-            0
+            insert_feature_rows(&conn, "YahooTechnical", &rows, 2000).unwrap(),
+            1
         );
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM technical_features", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 1);
     }
 }

@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 use thiserror::Error;
 
@@ -301,8 +301,7 @@ pub fn validate_evidence_types(
 pub fn validate_analyst_ticker_artifact(
     artifact: &AnalystTickerArtifact,
 ) -> std::result::Result<(), String> {
-    const ALLOWED_DIRECTIONS: &[&str] =
-        &["bullish", "bearish", "neutral", "mixed", "unobserved"];
+    const ALLOWED_DIRECTIONS: &[&str] = &["bullish", "bearish", "neutral", "mixed", "unobserved"];
     if !ALLOWED_DIRECTIONS.contains(&artifact.direction.as_str()) {
         return Err(format!(
             "invalid direction '{}'; must be one of: {}",
@@ -318,7 +317,6 @@ pub fn validate_analyst_ticker_artifact(
     }
     validate_evidence_types(artifact)
 }
-
 
 /// Validate a parsed `RiskConstraints` artifact for well-formed enum and
 /// range values. Tolerant of empty / zero (unspecified) fields so legacy
@@ -443,6 +441,151 @@ pub fn extract_json_artifact(text: &str) -> Result<Value> {
         text
     };
     serde_json::from_str(candidate.trim()).context("failed to parse artifact JSON")
+}
+
+/// Normalize multi-ticker research envelopes before deserializing into
+/// [`ResearchArtifact`].
+///
+/// Models often emit rating/probabilities only under `per_ticker` (and may
+/// emit `plan` as a string array). Downstream still expects top-level
+/// `rating` / `long_probability` / `short_probability` for single-ticker
+/// consumers such as trader mapping and report builders.
+pub fn normalize_research_artifact_value(mut value: Value, tickers: &[String]) -> Result<Value> {
+    let obj = value
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("research artifact must be a JSON object"))?;
+
+    if let Some(plan) = obj.get("plan").cloned() {
+        if let Some(text) = coerce_plan_to_string(&plan) {
+            obj.insert("plan".to_string(), Value::String(text));
+        }
+    }
+
+    let needs_rating = obj
+        .get("rating")
+        .and_then(Value::as_str)
+        .is_none_or(|value| value.trim().is_empty());
+    let needs_long = obj
+        .get("long_probability")
+        .and_then(normalize_probability)
+        .is_none();
+    let needs_short = obj
+        .get("short_probability")
+        .and_then(normalize_probability)
+        .is_none();
+    let needs_plan = obj
+        .get("plan")
+        .and_then(Value::as_str)
+        .map(|value| value.trim().is_empty())
+        .unwrap_or(true);
+    let needs_rationale = obj
+        .get("probability_rationale")
+        .and_then(Value::as_str)
+        .map(|value| value.trim().is_empty())
+        .unwrap_or(true);
+
+    if needs_rating || needs_long || needs_short || needs_plan || needs_rationale {
+        if let Some(primary) = select_primary_research_ticker(obj, tickers) {
+            let payload = obj
+                .get("per_ticker")
+                .and_then(Value::as_object)
+                .and_then(|items| items.get(&primary))
+                .cloned()
+                .unwrap_or(Value::Null);
+
+            if needs_rating {
+                if let Some(rating) = payload
+                    .get("rating")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    obj.insert("rating".to_string(), Value::String(rating.to_string()));
+                }
+            }
+            if needs_long {
+                if let Some(probability) = payload
+                    .get("long_probability")
+                    .and_then(normalize_probability)
+                {
+                    obj.insert("long_probability".to_string(), json!(probability));
+                }
+            }
+            if needs_short {
+                if let Some(probability) = payload
+                    .get("short_probability")
+                    .and_then(normalize_probability)
+                {
+                    obj.insert("short_probability".to_string(), json!(probability));
+                }
+            }
+            if needs_plan {
+                if let Some(plan) = payload.get("plan").and_then(coerce_plan_to_string) {
+                    obj.insert("plan".to_string(), Value::String(plan));
+                }
+            }
+            if needs_rationale {
+                if let Some(rationale) = payload
+                    .get("probability_rationale")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    obj.insert(
+                        "probability_rationale".to_string(),
+                        Value::String(rationale.to_string()),
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(value)
+}
+
+fn select_primary_research_ticker(obj: &Map<String, Value>, tickers: &[String]) -> Option<String> {
+    let per_ticker = obj.get("per_ticker")?.as_object()?;
+    if per_ticker.is_empty() {
+        return None;
+    }
+    for ticker in tickers {
+        if per_ticker.contains_key(ticker) {
+            return Some(ticker.clone());
+        }
+    }
+    per_ticker.keys().next().cloned()
+}
+
+fn coerce_plan_to_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+        Value::Array(items) => {
+            let parts = items
+                .iter()
+                .filter_map(|item| match item {
+                    Value::String(text) => {
+                        let trimmed = text.trim();
+                        (!trimmed.is_empty()).then(|| trimmed.to_string())
+                    }
+                    Value::Number(number) => Some(number.to_string()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join("; "))
+            }
+        }
+        _ => None,
+    }
 }
 
 pub fn validate_research_artifact(
@@ -999,6 +1142,91 @@ mod tests {
     }
 
     #[test]
+    fn normalize_lifts_per_ticker_fields_to_top_level() {
+        let value = json!({
+            "id": "research-manager",
+            "role": "research_manager",
+            "status": "completed",
+            "report": "compressed evidence only",
+            "per_ticker": {
+                "QQQ": {
+                    "rating": "Overweight",
+                    "long_probability": 0.57,
+                    "short_probability": 0.43,
+                    "plan": [
+                        "Verify volume confirmation",
+                        "Watch short-horizon break"
+                    ],
+                    "probability_rationale": "Near base after duplicate discount."
+                },
+                "SOXX": {
+                    "rating": "Hold",
+                    "long_probability": 0.51,
+                    "short_probability": 0.49,
+                    "plan": "Wait for SOXX-specific confirmation",
+                    "probability_rationale": "Insufficient SOXX-specific evidence."
+                }
+            }
+        });
+
+        let normalized =
+            normalize_research_artifact_value(value, &["QQQ".to_string(), "SOXX".to_string()])
+                .unwrap();
+        let artifact: ResearchArtifact = serde_json::from_value(normalized).unwrap();
+        assert_eq!(artifact.rating, "Overweight");
+        assert!((artifact.long_probability - 0.57).abs() < 1e-9);
+        assert!((artifact.short_probability - 0.43).abs() < 1e-9);
+        assert!(artifact.plan.contains("Verify volume confirmation"));
+        assert!(artifact
+            .probability_rationale
+            .contains("duplicate discount"));
+        assert!(artifact.per_ticker.contains_key("QQQ"));
+        assert!(artifact.per_ticker.contains_key("SOXX"));
+        assert!(
+            validate_research_artifact(&artifact, &["QQQ".to_string(), "SOXX".to_string()]).is_ok()
+        );
+    }
+
+    #[test]
+    fn normalize_preserves_existing_top_level_fields() {
+        let value = json!({
+            "rating": "Hold",
+            "long_probability": 0.52,
+            "short_probability": 0.48,
+            "plan": "Keep existing plan",
+            "probability_rationale": "Top-level rationale",
+            "per_ticker": {
+                "QQQ": {
+                    "rating": "Buy",
+                    "long_probability": 0.7,
+                    "short_probability": 0.3,
+                    "plan": "Should not replace top-level",
+                    "probability_rationale": "Nested rationale"
+                }
+            }
+        });
+        let normalized = normalize_research_artifact_value(value, &["QQQ".to_string()]).unwrap();
+        let artifact: ResearchArtifact = serde_json::from_value(normalized).unwrap();
+        assert_eq!(artifact.rating, "Hold");
+        assert!((artifact.long_probability - 0.52).abs() < 1e-9);
+        assert_eq!(artifact.plan, "Keep existing plan");
+        assert_eq!(artifact.probability_rationale, "Top-level rationale");
+    }
+
+    #[test]
+    fn normalize_coerces_top_level_plan_array() {
+        let value = json!({
+            "rating": "Hold",
+            "long_probability": 0.5,
+            "short_probability": 0.5,
+            "plan": ["Watch VIX", "Reassess breadth"]
+        });
+        let normalized = normalize_research_artifact_value(value, &[]).unwrap();
+        let artifact: ResearchArtifact = serde_json::from_value(normalized).unwrap();
+        assert_eq!(artifact.plan, "Watch VIX; Reassess breadth");
+    }
+
+    #[test]
     fn downstream_contract_schemas_list_machine_fields() {
         for (schema, fields) in [
             (
@@ -1024,7 +1252,6 @@ mod tests {
             }
         }
     }
-
 
     #[test]
     fn validate_analyst_ticker_artifact_rejects_bad_direction() {
@@ -1058,5 +1285,4 @@ mod tests {
         };
         validate_analyst_ticker_artifact(&artifact).unwrap();
     }
-
 }

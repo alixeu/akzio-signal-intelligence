@@ -2,10 +2,12 @@ use anyhow::{Context, Result};
 use futures::{stream, StreamExt};
 use orchestrator_core::default_project_root;
 use orchestrator_llm::{
-    agent_loop::ModelStreamResult, llm_judge::JudgeConfig, mock_role_artifact,
-    run_rig_agent_loop_with_metrics, run_rig_agent_steer_loop_with_metrics,
-    tools::ExternalToolConfig, truncation::TruncationConfig, AgentLoopOutput, OutputMode,
-    RigSettings, RoleLlmSettings, SteerLoopInput,
+    agent_loop::{ModelStreamResult, TokenUsage},
+    llm_judge::JudgeConfig,
+    mock_role_artifact, run_rig_agent_loop_with_metrics, run_rig_agent_steer_loop_with_metrics,
+    tools::ExternalToolConfig,
+    truncation::TruncationConfig,
+    AgentLoopOutput, OutputMode, RigSettings, RoleLlmSettings, SteerLoopInput,
 };
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -49,7 +51,7 @@ pub(crate) struct SteerRoleRun<'a> {
     pub steer: Option<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct RoleJob {
     pub role: String,
     pub phase: i64,
@@ -57,6 +59,7 @@ pub(crate) struct RoleJob {
     pub round: Option<i64>,
     pub topic_id: Option<String>,
     pub mock: bool,
+    pub debug: bool,
     pub prompt: String,
     pub prompt_path: Option<String>,
     pub prompt_version: Option<String>,
@@ -71,6 +74,7 @@ pub(crate) struct RoleJob {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub(crate) struct RoleJobResult {
     pub role: String,
     pub phase: i64,
@@ -86,10 +90,7 @@ pub(crate) struct RoleJobResult {
     pub error: Option<String>,
     pub timed_out: bool,
     pub elapsed_ms: u128,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub cached_tokens: u64,
-    pub total_tokens: u64,
+    pub usage: TokenUsage,
     pub turn_count: u64,
     pub tool_call_count: u64,
 }
@@ -134,6 +135,7 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
         config,
         prompt_path,
     } = input;
+    let debug_enabled = state.get("debug").and_then(Value::as_bool).unwrap_or(false);
     let tickers = tickers_from_state(&state);
     let prompt_version = prompt_version_for_role(&state, role);
     let prompt = if mock {
@@ -170,6 +172,7 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
         round,
         topic_id,
         mock,
+        debug = debug_enabled,
         prompt_path = prompt_path.map(|path| path.display().to_string()),
         prompt_version,
         prompt_chars = prompt.len(),
@@ -182,6 +185,7 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
         round,
         topic_id: topic_id.map(ToString::to_string),
         mock,
+        debug: debug_enabled,
         prompt,
         prompt_path: prompt_path.map(|path| path.display().to_string()),
         prompt_version,
@@ -234,10 +238,11 @@ pub(crate) async fn run_single_role_job(
     timeout_sec: u64,
     config: &RuntimeConfig,
     state_for_degraded: &mut Value,
+    conn: &rusqlite::Connection,
 ) -> Result<Value> {
     let job = prepare_role_job(input)?;
     let result = run_role_job_with_timeout(job, timeout_sec).await;
-    persist_prompt_metric(state_for_degraded, &result);
+    persist_prompt_metric(conn, &result);
     record_role_job_metrics(state_for_degraded, &result);
     role_artifact_or_degraded(state_for_degraded, config, result)
 }
@@ -247,6 +252,7 @@ pub(crate) async fn run_single_steer_role_job(
     timeout_sec: u64,
     config: &RuntimeConfig,
     state_for_degraded: &mut Value,
+    conn: &rusqlite::Connection,
 ) -> Result<Value> {
     let job = prepare_role_job(RoleRun {
         state: input.state,
@@ -269,7 +275,7 @@ pub(crate) async fn run_single_steer_role_job(
         timeout_sec,
     )
     .await;
-    persist_prompt_metric(state_for_degraded, &result);
+    persist_prompt_metric(conn, &result);
     record_role_job_metrics(state_for_degraded, &result);
     role_artifact_or_degraded(state_for_degraded, config, result)
 }
@@ -286,13 +292,17 @@ pub(crate) fn record_role_job_metrics(state: &mut Value, result: &RoleJobResult)
             "round": result.round,
             "topic_id": result.topic_id,
             "prompt_version": result.prompt_version,
+            "model": result.model,
             "timed_out": result.timed_out,
             "elapsed_ms": result.elapsed_ms,
             "status": if result.artifact.is_some() { "ok" } else { "degraded" },
-            "input_tokens": result.input_tokens,
-            "output_tokens": result.output_tokens,
-            "cached_tokens": result.cached_tokens,
-            "total_tokens": result.total_tokens,
+            "input_tokens": result.usage.input_tokens,
+            "output_tokens": result.usage.output_tokens,
+            "cached_tokens": result.usage.cached_tokens,
+            "reasoning_tokens": result.usage.reasoning_tokens,
+            "total_tokens": result.usage.total_tokens,
+            "non_cached_input_tokens": result.usage.non_cached_input_tokens(),
+            "visible_output_tokens": result.usage.visible_output_tokens(),
             "turn_count": result.turn_count,
             "tool_call_count": result.tool_call_count
         }));
@@ -300,62 +310,8 @@ pub(crate) fn record_role_job_metrics(state: &mut Value, result: &RoleJobResult)
     refresh_role_job_metrics(state);
 }
 
-pub(crate) fn persist_prompt_metric(state: &Value, result: &RoleJobResult) {
-    let Some(db_path) = state.get("db_path").and_then(Value::as_str) else {
-        return;
-    };
-    let Ok(conn) = orchestrator_sql::connect(db_path) else {
-        return;
-    };
-    let run_id = state
-        .get("run_id")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    let session_id = if result.session_id.is_empty() {
-        state
-            .get("session_id")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string()
-    } else {
-        result.session_id.clone()
-    };
-    let validation_result = if result.artifact.is_some() {
-        "pass"
-    } else if result.timed_out || result.error.is_some() {
-        "degraded"
-    } else {
-        "unknown"
-    };
-    let _ = orchestrator_sql::metrics::insert_prompt_metric(
-        &conn,
-        &orchestrator_sql::metrics::PromptMetricInput {
-            run_id,
-            turn_id: result.turn_id.clone(),
-            session_id,
-            role: result.role.clone(),
-            phase: Some(result.phase),
-            kind: result.kind.clone(),
-            round: result.round,
-            topic_id: result.topic_id.clone(),
-            prompt_version: result
-                .prompt_version
-                .clone()
-                .unwrap_or_else(|| "v1".to_string()),
-            model: result.model.clone(),
-            input_tokens: result.input_tokens,
-            output_tokens: result.output_tokens,
-            cached_tokens: result.cached_tokens,
-            total_tokens: result.total_tokens,
-            turn_count: result.turn_count,
-            tool_call_count: result.tool_call_count,
-            latency_ms: result.elapsed_ms.min(u64::MAX as u128) as u64,
-            validation_result: validation_result.to_string(),
-            fallback_triggered: result.artifact.is_none(),
-            error_message: result.error.clone().unwrap_or_default(),
-        },
-    );
+pub(crate) fn persist_prompt_metric(_conn: &rusqlite::Connection, _result: &RoleJobResult) {
+    // ponytail: agent_events restructured — prompt metrics deferred
 }
 
 pub(crate) fn merge_role_job_metrics(state: &mut Value, metrics: &Value) {
@@ -446,10 +402,7 @@ async fn run_steer_role_job_with_timeout(
                 error: None,
                 timed_out: false,
                 elapsed_ms,
-                input_tokens: output.metrics.input_tokens,
-                output_tokens: output.metrics.output_tokens,
-                cached_tokens: output.metrics.cached_tokens,
-                total_tokens: output.metrics.total_tokens,
+                usage: output.metrics.usage,
                 turn_count: output.metrics.turn_count,
                 tool_call_count: output.metrics.tool_call_count,
             }
@@ -472,10 +425,7 @@ async fn run_steer_role_job_with_timeout(
                 error: Some(error.to_string()),
                 timed_out: false,
                 elapsed_ms,
-                input_tokens: 0,
-                output_tokens: 0,
-                cached_tokens: 0,
-                total_tokens: 0,
+                usage: TokenUsage::default(),
                 turn_count: 0,
                 tool_call_count: 0,
             }
@@ -501,15 +451,27 @@ async fn run_steer_role_job_with_timeout(
                 error: Some(format!("role execution timed out after {timeout_sec}s")),
                 timed_out: true,
                 elapsed_ms,
-                input_tokens: 0,
-                output_tokens: 0,
-                cached_tokens: 0,
-                total_tokens: 0,
+                usage: TokenUsage::default(),
                 turn_count: 0,
                 tool_call_count: 0,
             }
         }
     }
+}
+
+fn is_transient_role_error(message: &str) -> bool {
+    let text = message.to_ascii_lowercase();
+    text.contains("503")
+        || text.contains("502")
+        || text.contains("429")
+        || text.contains("bad_response_status_code")
+        || text.contains("no healthy upstream")
+        || text.contains("llm stream chunk failed")
+        || text.contains("llm stream failed")
+        || text.contains("timeout")
+        || text.contains("timed out")
+        || text.contains("connection reset")
+        || text.contains("temporarily unavailable")
 }
 
 pub(crate) async fn run_role_job_with_timeout(job: RoleJob, timeout_sec: u64) -> RoleJobResult {
@@ -525,13 +487,61 @@ pub(crate) async fn run_role_job_with_timeout(job: RoleJob, timeout_sec: u64) ->
         role,
         phase, kind, round, topic_id, timeout_sec, "role job starting"
     );
-    match time::timeout(
-        Duration::from_secs(timeout_sec.max(1)),
-        execute_role_job(job),
-    )
-    .await
-    {
-        Ok(Ok(output)) => {
+
+    // Live gateway 503s can exhaust stream-level retries; retry the whole role a
+    // couple of times before surfacing a critical failure.
+    const MAX_ROLE_ATTEMPTS: usize = 3;
+    let mut attempt = 0usize;
+    let result = loop {
+        attempt += 1;
+        match time::timeout(
+            Duration::from_secs(timeout_sec.max(1)),
+            execute_role_job(job.clone()),
+        )
+        .await
+        {
+            Ok(Ok(output)) => break Ok(output),
+            Ok(Err(error)) => {
+                let message = error.to_string();
+                if attempt < MAX_ROLE_ATTEMPTS && is_transient_role_error(&message) {
+                    let backoff_ms = 1_000u64 * attempt as u64;
+                    warn!(
+                        role = role.as_str(),
+                        phase,
+                        kind = kind.as_str(),
+                        attempt,
+                        backoff_ms,
+                        error = %message,
+                        "retrying transient role job failure"
+                    );
+                    time::sleep(Duration::from_millis(backoff_ms)).await;
+                    continue;
+                }
+                break Err((message, false));
+            }
+            Err(_) => {
+                let message = format!("role execution timed out after {timeout_sec}s");
+                if attempt < MAX_ROLE_ATTEMPTS {
+                    let backoff_ms = 1_000u64 * attempt as u64;
+                    warn!(
+                        role = role.as_str(),
+                        phase,
+                        kind = kind.as_str(),
+                        attempt,
+                        backoff_ms,
+                        error = %message,
+                        "retrying timed-out role job"
+                    );
+                    time::sleep(Duration::from_millis(backoff_ms)).await;
+                    continue;
+                }
+                break Err((message, true));
+            }
+        }
+    };
+
+    match result {
+        Ok(output) => {
             let elapsed_ms = started_at.elapsed().as_millis();
             debug!(role, phase, kind, elapsed_ms, "role job completed");
             RoleJobResult {
@@ -554,22 +564,20 @@ pub(crate) async fn run_role_job_with_timeout(job: RoleJob, timeout_sec: u64) ->
                 error: None,
                 timed_out: false,
                 elapsed_ms,
-                input_tokens: output.metrics.input_tokens,
-                output_tokens: output.metrics.output_tokens,
-                cached_tokens: output.metrics.cached_tokens,
-                total_tokens: output.metrics.total_tokens,
+                usage: output.metrics.usage,
                 turn_count: output.metrics.turn_count,
                 tool_call_count: output.metrics.tool_call_count,
             }
         }
-        Ok(Err(error)) => {
+        Err((message, timed_out)) => {
             let elapsed_ms = started_at.elapsed().as_millis();
             warn!(
                 role,
                 phase,
                 kind,
                 elapsed_ms,
-                error = %error,
+                error = %message,
+                timed_out,
                 "role job failed"
             );
             RoleJobResult {
@@ -584,42 +592,10 @@ pub(crate) async fn run_role_job_with_timeout(job: RoleJob, timeout_sec: u64) ->
                 turn_id: String::new(),
                 session_id: String::new(),
                 artifact: None,
-                error: Some(error.to_string()),
-                timed_out: false,
+                error: Some(message),
+                timed_out,
                 elapsed_ms,
-                input_tokens: 0,
-                output_tokens: 0,
-                cached_tokens: 0,
-                total_tokens: 0,
-                turn_count: 0,
-                tool_call_count: 0,
-            }
-        }
-        Err(_) => {
-            let elapsed_ms = started_at.elapsed().as_millis();
-            warn!(
-                role,
-                phase, kind, elapsed_ms, timeout_sec, "role job timed out"
-            );
-            RoleJobResult {
-                role,
-                phase,
-                kind,
-                round,
-                topic_id,
-                tickers,
-                prompt_version,
-                model: String::new(),
-                turn_id: String::new(),
-                session_id: String::new(),
-                artifact: None,
-                error: Some(format!("role execution timed out after {timeout_sec}s")),
-                timed_out: true,
-                elapsed_ms,
-                input_tokens: 0,
-                output_tokens: 0,
-                cached_tokens: 0,
-                total_tokens: 0,
+                usage: TokenUsage::default(),
                 turn_count: 0,
                 tool_call_count: 0,
             }
@@ -671,6 +647,7 @@ async fn execute_role_job(job: RoleJob) -> Result<AgentLoopOutput> {
         web_search: job.web_search,
         truncation: job.truncation,
         judge: job.judge,
+        debug: job.debug,
     };
     debug!(
         role = settings.role,
@@ -729,6 +706,7 @@ async fn execute_steer_role_job(
         web_search: job.web_search,
         truncation: job.truncation,
         judge: job.judge,
+        debug: job.debug,
     };
     run_rig_agent_steer_loop_with_metrics(
         &settings,
@@ -762,10 +740,13 @@ mod tests {
             error: timed_out.then(|| "timeout".to_string()),
             timed_out,
             elapsed_ms,
-            input_tokens: 10,
-            output_tokens: 4,
-            cached_tokens: 2,
-            total_tokens: 14,
+            usage: TokenUsage {
+                input_tokens: 10,
+                output_tokens: 4,
+                cached_tokens: 2,
+                reasoning_tokens: 0,
+                total_tokens: 14,
+            },
             turn_count: 1,
             tool_call_count: 3,
         }
@@ -783,7 +764,11 @@ mod tests {
         assert_eq!(state["role_job_metrics"][0]["input_tokens"], 10);
         assert_eq!(state["role_job_metrics"][0]["output_tokens"], 4);
         assert_eq!(state["role_job_metrics"][0]["cached_tokens"], 2);
+        assert_eq!(state["role_job_metrics"][0]["reasoning_tokens"], 0);
         assert_eq!(state["role_job_metrics"][0]["total_tokens"], 14);
+        assert_eq!(state["role_job_metrics"][0]["non_cached_input_tokens"], 8);
+        assert_eq!(state["role_job_metrics"][0]["visible_output_tokens"], 4);
+        assert_eq!(state["role_job_metrics"][0]["model"], "test-model");
         assert_eq!(state["role_job_metrics"][0]["turn_count"], 1);
         assert_eq!(state["role_job_metrics"][0]["tool_call_count"], 3);
         assert_eq!(state["workflow_metrics"]["role_job_count"], 2);

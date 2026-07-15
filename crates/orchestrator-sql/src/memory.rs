@@ -1,5 +1,4 @@
 use anyhow::Result;
-use chrono::{DateTime, Utc};
 use orchestrator_core::{MarketRegime, RetrievalBudget};
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
@@ -23,13 +22,47 @@ pub struct PromoteMemoryInput {
     pub recent_success_rate: f64,
 }
 
+pub struct MemoryHistoryEntry<'a> {
+    pub memory_id: &'a str,
+    pub action: &'a str,
+    pub version_id: &'a str,
+    pub old_status: &'a str,
+    pub new_status: &'a str,
+    pub quality_score: Option<f64>,
+    pub reason: &'a str,
+    pub source_run_id: &'a str,
+}
+
+pub fn log_memory_history(conn: &Connection, entry: &MemoryHistoryEntry<'_>) -> Result<()> {
+    conn.execute(
+        r#"
+        INSERT INTO memory_history
+            (memory_id, action, version_id, old_status, new_status,
+             quality_score, reason, source_run_id, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        "#,
+        params![
+            entry.memory_id,
+            entry.action,
+            entry.version_id,
+            entry.old_status,
+            entry.new_status,
+            entry.quality_score,
+            entry.reason,
+            entry.source_run_id,
+            chrono::Utc::now().timestamp()
+        ],
+    )?;
+    Ok(())
+}
+
 pub fn promote_candidate_to_memory(
     conn: &Connection,
     input: &PromoteMemoryInput,
 ) -> Result<String> {
     let memory_id = format!("mem-{}", Uuid::new_v4());
     let version_id = format!("memv-{}", Uuid::new_v4());
-    let now = Utc::now().to_rfc3339();
+    let now = chrono::Utc::now().timestamp();
     let summary = format!(
         "Finding: {}\nRecommendation: {}",
         input.candidate.finding, input.candidate.recommendation
@@ -89,6 +122,19 @@ pub fn promote_candidate_to_memory(
             now,
         ],
     )?;
+    log_memory_history(
+        conn,
+        &MemoryHistoryEntry {
+            memory_id: &memory_id,
+            action: "created",
+            version_id: &version_id,
+            old_status: "",
+            new_status: "active",
+            quality_score: Some(input.quality_score),
+            reason: &format!("promoted from candidate #{}", input.candidate.id),
+            source_run_id: "",
+        },
+    )?;
     Ok(memory_id)
 }
 
@@ -100,6 +146,31 @@ pub fn degrade_stale_memories(
     min_quality: f64,
     except_promoted_from: Option<i64>,
 ) -> Result<usize> {
+    let mut id_stmt = conn.prepare(
+        r#"
+        SELECT memory_id, quality_score FROM memory_items
+        WHERE scope = ?
+          AND (ticker = ? OR ? = '')
+          AND memory_type = ?
+          AND status = 'active'
+          AND quality_score < ?
+          AND (? IS NULL OR promoted_from IS NULL OR promoted_from != ?)
+        "#,
+    )?;
+    let ids: Vec<(String, f64)> = id_stmt
+        .query_map(
+            params![
+                scope,
+                scope_value,
+                scope_value,
+                memory_type,
+                min_quality,
+                except_promoted_from,
+                except_promoted_from,
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?
+        .collect::<rusqlite::Result<_>>()?;
     let updated = conn.execute(
         r#"
         UPDATE memory_items
@@ -112,7 +183,7 @@ pub fn degrade_stale_memories(
           AND (? IS NULL OR promoted_from IS NULL OR promoted_from != ?)
         "#,
         params![
-            Utc::now().to_rfc3339(),
+            chrono::Utc::now().timestamp(),
             scope,
             scope_value,
             scope_value,
@@ -122,6 +193,21 @@ pub fn degrade_stale_memories(
             except_promoted_from,
         ],
     )?;
+    for (memory_id, quality) in &ids {
+        let _ = log_memory_history(
+            conn,
+            &MemoryHistoryEntry {
+                memory_id,
+                action: "degraded",
+                version_id: "",
+                old_status: "active",
+                new_status: "inactive",
+                quality_score: Some(*quality),
+                reason: &format!("quality {quality:.2} below threshold {min_quality:.2}"),
+                source_run_id: "",
+            },
+        );
+    }
     Ok(updated)
 }
 
@@ -172,7 +258,7 @@ struct MemoryCandidate {
     sample_count: i64,
     recent_success_rate: f64,
     market_regime_json: Value,
-    observed_at: String,
+    observed_at: i64,
     evidence_refs: Value,
     body: Value,
 }
@@ -236,13 +322,13 @@ fn active_memory_candidates(
                 evidence_refs: parse_json(row.get::<_, String>(12)?),
                 body: parse_json(row.get::<_, String>(13)?),
             },
-            row.get::<_, Option<String>>(14)?,
+            row.get::<_, Option<i64>>(14)?,
         ))
     })?;
     let mut candidates = Vec::new();
     for row in rows {
         let (candidate, expires_at) = row?;
-        if is_expired(expires_at.as_deref()) {
+        if is_expired(expires_at) {
             continue;
         }
         let regime: MarketRegime =
@@ -262,11 +348,8 @@ fn scope_value_as_ticker(candidate: &CandidateExperience) -> String {
     }
 }
 
-fn is_expired(expires_at: Option<&str>) -> bool {
-    expires_at
-        .and_then(|text| DateTime::parse_from_rfc3339(text).ok())
-        .map(|time| time.with_timezone(&Utc) < Utc::now())
-        .unwrap_or(false)
+fn is_expired(expires_at: Option<i64>) -> bool {
+    expires_at.is_some_and(|ts| ts < chrono::Utc::now().timestamp())
 }
 
 fn parse_json(text: String) -> Value {

@@ -55,6 +55,10 @@
 - 如果一个 analyst 的 `key_evidence` 中 speculation 类型占比超过 50%，该 analyst 的整体贡献应降权 30%。
 - 如果关键方向性判断仅依赖 speculation 类型证据，最终概率应向 0.50 收敛。
 - 优先读取 Phase 1.5 `role_summaries[].evidence_type_summary`，用 fact/opinion/speculation/unclassified 的数量结构校准证据质量；不要把 `unclassified` 当作 fact。
+- 注意：Phase 1 `weighted_probability_base` 的 speculation 折减已由 Rust 执行；你仍须对 Phase 2 / drivers 侧应用 `speculation_discount`，并在 rationale 中引用 reason_code，不要假设 base 未折减。
+
+**Missing Data Premium（强制）**：
+- 若 Mediator 给出 `missing_high_impact_factors` 或高影响 `missing_evidence`，必须按 research_calibration 的 `missing_data_premium` 向 0.50 量化收敛，并在 `adjustment_rationale` 列出触发项。
 
 **长期记忆校准规则**：
 - `prior_memory` 只能回答“类似市场结构下曾经如何误判 / 如何有效校准”，不得把历史经验当作当前事实或新催化。

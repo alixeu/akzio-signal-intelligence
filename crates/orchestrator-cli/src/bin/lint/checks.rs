@@ -94,10 +94,8 @@ pub fn check_common_components(
         ("research_drivers", &["research_drivers.md"]),
         ("leveraged_etf_rules", &["leveraged_etf_rules.md"]),
         ("analyst_output_structure", &["analyst_output_structure.md"]),
-        (
-            "researcher_body",
-            &["researcher_interaction.md"],
-        ),
+        // researcher prompts are standalone; {researcher_body} is only a
+        // compatibility placeholder and no longer expands a common component.
         ("risk_analyst_body", &["risk_analyst.md"]),
     ];
     for (placeholder, files) in checks {
@@ -119,7 +117,8 @@ pub fn check_common_components(
             }
         }
     }
-    for placeholder in ["common_ticker_prompt"] {
+    {
+        let placeholder = "common_ticker_prompt";
         let token = format!("{{{placeholder}}}");
         if content.contains(&token) && !component_registry.has_enabled_placeholder(placeholder) {
             issues.push(LintIssue {
@@ -349,9 +348,6 @@ fn render_for_lint(
     let anti_injection_template = common_component(prompt_path, "anti_injection.md")?;
     let research_calibration_template = common_component(prompt_path, "research_calibration.md")?;
     let research_drivers_template = common_component(prompt_path, "research_drivers.md")?;
-    let researcher_seed_template = common_component(prompt_path, "researcher_seed.md")?;
-    let researcher_interaction_template =
-        common_component(prompt_path, "researcher_interaction.md")?;
     let risk_analyst_template = common_component(prompt_path, "risk_analyst.md")?;
     let leveraged_etf_rules_template = common_component(prompt_path, "leveraged_etf_rules.md")?;
     let analyst_output_structure_template =
@@ -439,16 +435,10 @@ fn render_for_lint(
             "prompt {path} references {{common_ticker_prompt}} but no enabled ticker component injected it for role {role}"
         );
     }
-    let researcher_body_template = if side.is_empty() {
-        String::new()
-    } else if role.ends_with(".interaction") {
-        researcher_interaction_template
-    } else {
-        researcher_seed_template
-    };
-    let researcher_body = replace_placeholders(&researcher_body_template, &values);
+    // Researcher prompts are standalone markdown files; keep researcher_body
+    // empty for placeholder compatibility only.
+    let researcher_body = String::new();
     let risk_analyst_body = replace_placeholders(&risk_analyst_template, &values);
-    let mut values = values;
     if let Some(map) = values.as_object_mut() {
         map.insert(
             "researcher_body".to_string(),

@@ -66,7 +66,8 @@
 
 每个 `per_ticker.<ticker>` 还需填写两条共识风险字段（自动出现在注入的 JSON Schema 中）：
 - `echo_chamber_risk`：本 ticker 的讨论是否陷入同温层/回声室（信息高度同质、缺乏异见）。取值 `low | medium | high`。
-- `crowded_consensus_risk`：当前是否呈现极端一致共识（可能成为逆向拥挤信号）。取值 `low | medium | high`。无把握时给 `low` 或空字符串，不要臆造。
+- `crowded_consensus_risk`：当前是否呈现极端一致共识（可能成为逆向拥挤信号）。取值 `low | medium | high`。无把握时给 `low`，不要臆造。
+- **量化阈值**：当某一方向叙事在本分析师可用样本中占比 **> 80%** 且缺乏实质异见时，必须将 `crowded_consensus_risk` 标为 `high`，并在 `report` 中提示下游对该方向证据降权；占比约 60–80% 标 `medium`。
 
 无数据时的纪律：当某 ticker 没有可用样本，仍输出 `direction="unobserved"`、`confidence=0.0` 并填写 `data_gaps`（说明缺口、为何缺口重要、什么会扭转观点）；**严禁臆造"暗流/undercurrents"** 等未经数据支撑的叙事。
 

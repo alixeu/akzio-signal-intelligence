@@ -1,5 +1,4 @@
 use anyhow::Result;
-use chrono::Utc;
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 
@@ -30,7 +29,7 @@ pub struct ExpiredPrediction {
 }
 
 pub fn upsert_prediction(conn: &Connection, input: &PredictionInput) -> Result<i64> {
-    let now = Utc::now().to_rfc3339();
+    let now = chrono::Utc::now().timestamp();
     conn.execute(
         r#"
         INSERT INTO predictions

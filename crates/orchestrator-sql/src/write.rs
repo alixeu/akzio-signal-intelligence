@@ -1,6 +1,5 @@
 use crate::schema::AGGREGATE_TICKER;
 use anyhow::{bail, Result};
-use chrono::Utc;
 use orchestrator_core::{display_ticker, parse_tickers};
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
@@ -51,36 +50,9 @@ pub struct SourceItemInput {
     pub source: String,
     pub item_key: String,
     pub ticker: String,
-    pub item_time: String,
+    pub item_time: i64,
     pub content: String,
     pub item_json: Value,
-}
-
-#[derive(Debug, Clone)]
-pub struct AgentTurnInput {
-    pub turn_id: String,
-    pub session_id: String,
-    pub run_id: String,
-    pub phase: Option<i64>,
-    pub role: String,
-    pub user_input: String,
-    pub model_context: String,
-    pub cancellation_state: String,
-    pub needs_follow_up: bool,
-    pub end_reason: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct AgentTurnItemInput {
-    pub turn_id: String,
-    pub session_id: String,
-    pub run_id: String,
-    pub item_type: String,
-    pub role: String,
-    pub tool_call_id: String,
-    pub tool_name: String,
-    pub content_json: Value,
-    pub content_text: String,
 }
 
 #[derive(Debug, Clone)]
@@ -90,13 +62,24 @@ pub struct RoleTurnSummaryInput {
     pub role: String,
     pub phase: Option<i64>,
     pub ticker: String,
-    pub item_time: String,
+    pub item_time: i64,
     pub topic_id: Option<String>,
     pub debate_id: Option<String>,
     pub summary_type: String,
     pub summary: String,
     pub summary_json: Value,
     pub confidence: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentTurnInput {
+    pub turn_id: String,
+    pub run_id: String,
+    pub phase: Option<i64>,
+    pub turn_number: i64,
+    pub role: String,
+    pub full_context_json: Value,
+    pub summary: String,
 }
 
 pub fn safe_ticker_value(ticker: &str, scope: Scope) -> Result<(&str, Scope)> {
@@ -122,12 +105,20 @@ pub fn new_message_group_id(
         kind,
         topic_id.unwrap_or_default(),
         round.map(|n| n.to_string()).unwrap_or_default(),
-        Utc::now().to_rfc3339(),
+        chrono::Utc::now().timestamp(),
         Uuid::new_v4()
     );
     let mut hasher = Sha256::new();
     hasher.update(seed.as_bytes());
     format!("{:x}", hasher.finalize())[..24].to_string()
+}
+
+pub fn clear_agent_loop_history(conn: &Connection, run_id: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM agent_events WHERE run_id = ?1",
+        rusqlite::params![run_id],
+    )?;
+    Ok(())
 }
 
 pub fn write_run_record(conn: &mut Connection, input: &RunRecordInput) -> Result<()> {
@@ -137,7 +128,7 @@ pub fn write_run_record(conn: &mut Connection, input: &RunRecordInput) -> Result
         rusqlite::params![
             input.run_id,
             input.current_date,
-            chrono::Utc::now().to_rfc3339(),
+            chrono::Utc::now().timestamp(),
             "running"
         ],
     )?;
@@ -146,125 +137,30 @@ pub fn write_run_record(conn: &mut Connection, input: &RunRecordInput) -> Result
 }
 
 pub fn upsert_agent_turn(conn: &Connection, input: &AgentTurnInput) -> Result<()> {
-    let now = Utc::now().to_rfc3339();
+    let now = chrono::Utc::now().timestamp();
     conn.execute(
         r#"
-        INSERT INTO agent_turns
-            (turn_id, session_id, run_id, phase, role, user_input, model_context,
-             cancellation_state, needs_follow_up, end_reason, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO agent_events
+            (turn_id, run_id, phase, turn_number, role, created_at, full_context_json, summary)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(turn_id) DO UPDATE SET
-            session_id = excluded.session_id,
             run_id = excluded.run_id,
             phase = excluded.phase,
             role = excluded.role,
-            user_input = excluded.user_input,
-            model_context = excluded.model_context,
-            cancellation_state = excluded.cancellation_state,
-            needs_follow_up = excluded.needs_follow_up,
-            end_reason = excluded.end_reason,
-            updated_at = excluded.updated_at
+            full_context_json = excluded.full_context_json,
+            summary = excluded.summary
         "#,
         params![
             input.turn_id,
-            input.session_id,
             input.run_id,
             input.phase,
+            input.turn_number,
             input.role,
-            input.user_input,
-            input.model_context,
-            input.cancellation_state,
-            if input.needs_follow_up { 1 } else { 0 },
-            input.end_reason,
             now,
-            now
+            serde_json::to_string(&input.full_context_json)?,
+            input.summary,
         ],
     )?;
-    Ok(())
-}
-
-pub fn update_agent_turn_end(
-    conn: &Connection,
-    turn_id: &str,
-    needs_follow_up: bool,
-    end_reason: &str,
-) -> Result<()> {
-    conn.execute(
-        r#"
-        UPDATE agent_turns
-        SET needs_follow_up = ?, end_reason = ?, updated_at = ?
-        WHERE turn_id = ?
-        "#,
-        params![
-            if needs_follow_up { 1 } else { 0 },
-            end_reason,
-            Utc::now().to_rfc3339(),
-            turn_id
-        ],
-    )?;
-    Ok(())
-}
-
-pub fn append_agent_turn_item(conn: &Connection, input: &AgentTurnItemInput) -> Result<i64> {
-    conn.execute_batch("BEGIN")?;
-    let result = (|| -> Result<i64> {
-        let next_index: i64 = conn.query_row(
-            "SELECT COALESCE(MAX(item_index), -1) + 1 FROM agent_turn_items WHERE turn_id = ?",
-            params![input.turn_id],
-            |row| row.get(0),
-        )?;
-        conn.execute(
-            r#"
-            INSERT INTO agent_turn_items
-                (turn_id, session_id, run_id, item_index, item_type, role, tool_call_id,
-                 tool_name, content_json, content_text, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            "#,
-            params![
-                input.turn_id,
-                input.session_id,
-                input.run_id,
-                next_index,
-                input.item_type,
-                input.role,
-                input.tool_call_id,
-                input.tool_name,
-                serde_json::to_string(&input.content_json)?,
-                input.content_text,
-                Utc::now().to_rfc3339()
-            ],
-        )?;
-        Ok(conn.last_insert_rowid())
-    })();
-    match result {
-        Ok(row_id) => {
-            conn.execute_batch("COMMIT")?;
-            Ok(row_id)
-        }
-        Err(error) => {
-            let _ = conn.execute_batch("ROLLBACK");
-            Err(error)
-        }
-    }
-}
-
-pub fn update_agent_turn_item_content(
-    conn: &Connection,
-    row_id: i64,
-    content_json: &Value,
-    content_text: &str,
-) -> Result<()> {
-    let updated = conn.execute(
-        r#"
-        UPDATE agent_turn_items
-        SET content_json = ?, content_text = ?
-        WHERE id = ?
-        "#,
-        params![serde_json::to_string(content_json)?, content_text, row_id],
-    )?;
-    if updated == 0 {
-        bail!("agent_turn_items row id {row_id} does not exist");
-    }
     Ok(())
 }
 
@@ -275,6 +171,7 @@ pub fn write_role_turn_summary(conn: &Connection, input: &RoleTurnSummaryInput) 
             input.ticker
         );
     }
+    let now = chrono::Utc::now().timestamp();
     conn.execute(
         r#"
         INSERT INTO role_turn_summaries
@@ -295,7 +192,7 @@ pub fn write_role_turn_summary(conn: &Connection, input: &RoleTurnSummaryInput) 
             input.summary,
             serde_json::to_string(&input.summary_json)?,
             input.confidence,
-            Utc::now().to_rfc3339()
+            now
         ],
     )?;
     let _id = conn.last_insert_rowid();
@@ -332,7 +229,7 @@ pub fn write_agent_message_scoped(
     let mut written = 0;
     for (ticker, scope, payload) in rows {
         let (ticker, scope) = safe_ticker_value(&ticker, scope)?;
-        let created_at = Utc::now().to_rfc3339();
+        let now = chrono::Utc::now().timestamp();
         let _ = scope;
         write_role_turn_summary(
             &tx,
@@ -342,7 +239,7 @@ pub fn write_agent_message_scoped(
                 role: input.role.clone(),
                 phase: Some(input.phase),
                 ticker: ticker.to_string(),
-                item_time: created_at.clone(),
+                item_time: now,
                 topic_id: input.topic_id.clone(),
                 debate_id: None,
                 summary_type: input.kind.clone(),
@@ -366,8 +263,8 @@ pub fn write_source_item(conn: &mut Connection, input: &SourceItemInput) -> Resu
     let mut hasher = Sha256::new();
     hasher.update(item_json.as_bytes());
     let content_hash = format!("{:x}", hasher.finalize());
-    let imported_at = Utc::now().to_rfc3339();
-    write_dedicated_source_item(conn, input, &item_json, &content_hash, &imported_at)
+    let imported_at = chrono::Utc::now().timestamp();
+    write_dedicated_source_item(conn, input, &item_json, &content_hash, imported_at)
 }
 
 fn write_dedicated_source_item(
@@ -375,55 +272,32 @@ fn write_dedicated_source_item(
     input: &SourceItemInput,
     item_json: &str,
     content_hash: &str,
-    imported_at: &str,
+    imported_at: i64,
 ) -> Result<usize> {
-    match input.source.as_str() {
-        "reddit" | "x" => conn
-            .execute(
-                r#"
-                INSERT OR REPLACE INTO social_items
-                    (source, item_key, ticker, item_time, title, content, item_json, content_hash, imported_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                "#,
-                params![
-                    input.source,
-                    input.item_key,
-                    input.ticker,
-                    input.item_time,
-                    input.item_json.get("title").and_then(Value::as_str).unwrap_or_default(),
-                    input.content,
-                    item_json,
-                    content_hash,
-                    imported_at
-                ],
-            )
-            .map_err(Into::into),
-        "youtube" => {
-            let video_id = input
-                .item_json
-                .get("video_id")
-                .and_then(Value::as_str)
-                .unwrap_or(&input.item_key);
-            conn.execute(
-                r#"
-                INSERT OR REPLACE INTO youtube_videos
-                    (video_id, ticker, published_at, title, item_json, content_hash, imported_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                "#,
-                params![
-                    video_id,
-                    input.ticker,
-                    input.item_time,
-                    input.item_json.get("title").and_then(Value::as_str).unwrap_or_default(),
-                    item_json,
-                    content_hash,
-                    imported_at
-                ],
-            )
-            .map_err(Into::into)
-        }
-        _ => Ok(0),
-    }
+    let title = input
+        .item_json
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    conn.execute(
+        r#"
+        INSERT OR REPLACE INTO external_items
+            (source, item_key, ticker, item_time, title, content, metadata_json, content_hash, imported_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        "#,
+        params![
+            input.source,
+            input.item_key,
+            input.ticker,
+            input.item_time,
+            title,
+            input.content,
+            item_json,
+            content_hash,
+            imported_at
+        ],
+    )
+    .map_err(Into::into)
 }
 
 fn ticker_payloads(
@@ -550,7 +424,7 @@ pub fn update_run_status(
     status: &str,
     error_message: Option<&str>,
 ) -> Result<()> {
-    let now = Some(Utc::now().to_rfc3339());
+    let now = chrono::Utc::now().timestamp();
     conn.execute(
         r#"
         UPDATE runs
@@ -590,7 +464,7 @@ mod tests {
         )
         .unwrap();
         update_run_status(&mut conn, "run-1", "completed", None).unwrap();
-        let (status, completed_at): (String, Option<String>) = conn
+        let (status, completed_at): (String, Option<i64>) = conn
             .query_row(
                 "SELECT status, completed_at FROM runs WHERE run_id = ?1",
                 params!["run-1"],

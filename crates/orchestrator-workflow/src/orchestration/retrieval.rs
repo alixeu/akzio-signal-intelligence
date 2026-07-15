@@ -102,7 +102,7 @@ fn market_regime_from_state(
         };
     }
 
-    // Fallback: query the latest VIX close from the technical_indicators table
+    // Fallback: query the latest VIX close from the technical_features table
     // and classify it using the allocation regime thresholds. This works during
     // phase 3 reflection injection when downstream state is not yet populated.
     let volatility = query_latest_vix_close(conn)
@@ -116,14 +116,13 @@ fn market_regime_from_state(
     }
 }
 
-/// Query the most recent VIX close price from the technical_indicators table.
 fn query_latest_vix_close(conn: &Connection) -> Result<Option<f64>> {
     let mut stmt = conn.prepare(
         r#"
-        SELECT indicator_value
-        FROM technical_indicators
-        WHERE ticker = 'VIX' AND indicator_name = 'Close'
-        ORDER BY kline_time DESC
+        SELECT close
+        FROM technical_features
+        WHERE ticker = 'VIX' AND close IS NOT NULL
+        ORDER BY date DESC
         LIMIT 1
         "#,
     )?;

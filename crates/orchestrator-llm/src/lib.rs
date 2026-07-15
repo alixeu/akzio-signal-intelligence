@@ -6,7 +6,9 @@ use anyhow::{bail, Context, Result};
 use futures::StreamExt;
 use llm_judge::JudgeConfig;
 use orchestrator_core::{
-    default_project_root, extract_json_artifact, validate_analyst_ticker_artifact, validate_research_artifact, AnalystTickerArtifact, ResearchArtifact,
+    default_project_root, extract_json_artifact, normalize_research_artifact_value,
+    validate_analyst_ticker_artifact, validate_research_artifact, AnalystTickerArtifact,
+    ResearchArtifact,
 };
 use rig_core::{
     agent::AgentBuilder,
@@ -154,6 +156,7 @@ pub struct RigSettings {
     pub web_search: WebSearchConfig,
     pub truncation: TruncationConfig,
     pub judge: JudgeConfig,
+    pub debug: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -267,8 +270,13 @@ pub async fn run_rig_agent_steer_loop_with_metrics(
     settings.llm.validate(&settings.role)?;
     validate_fallback_web_search_runtime_config(settings)?;
     let conn = open_loop_connection(settings)?;
+    let run_id = input
+        .session_id
+        .split(':')
+        .next()
+        .unwrap_or(&input.session_id);
     let has_existing_history =
-        !orchestrator_sql::session_history_items(&conn, &input.session_id, 1)?.is_empty();
+        !orchestrator_sql::session_history_items(&conn, run_id, 1)?.is_empty();
     let user_input = if has_existing_history {
         "".to_string()
     } else {
@@ -364,6 +372,37 @@ fn write_role_end_context(settings: &RigSettings, turn: &Turn) -> Result<()> {
         }
     }
     fs::write(path, lines.join("\n"))?;
+    Ok(())
+}
+
+pub fn append_debug_llm_record(settings: &RigSettings, record: Value) -> Result<()> {
+    if !settings.debug {
+        return Ok(());
+    }
+    let phase = settings.phase.unwrap_or_default();
+    let root = settings
+        .tools
+        .as_ref()
+        .map(|tools| tools.project_root.clone())
+        .unwrap_or_else(default_project_root);
+    let path = root.join(format!(
+        "outputs/debug/phase{phase:02}/{}.jsonl",
+        safe_path_part(&settings.role)
+    ));
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create debug dir {}", parent.display()))?;
+    }
+    let mut line = serde_json::to_string(&record)?;
+    line.push('\n');
+    use std::io::Write;
+    fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("failed to open debug llm record {}", path.display()))?
+        .write_all(line.as_bytes())
+        .with_context(|| format!("failed to append debug llm record {}", path.display()))?;
     Ok(())
 }
 
@@ -717,32 +756,98 @@ async fn stream_completion_model<M>(
     handler: &mut dyn ModelEventHandler,
 ) -> Result<()>
 where
+    M: CompletionModel + Clone,
+    M::StreamingResponse: Clone + Unpin,
+{
+    // Live gateway blips (502/503/429) are common. Retry only when the attempt
+    // made no observable progress, so we never double-emit partial stream events.
+    const MAX_ATTEMPTS: usize = 5;
+    let mut attempt = 0usize;
+    loop {
+        attempt += 1;
+        match stream_completion_model_once(settings, input, model.clone(), prompt, handler).await {
+            Ok(()) => return Ok(()),
+            Err((error, made_progress))
+                if attempt < MAX_ATTEMPTS && !made_progress && is_transient_llm_error(&error) =>
+            {
+                let backoff_ms = 1_000u64 * (1u64 << (attempt - 1)).min(8);
+                tracing::warn!(
+                    attempt,
+                    backoff_ms,
+                    error = %error,
+                    role = %settings.role,
+                    "retrying transient LLM stream failure"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+            }
+            Err((error, _)) => return Err(error),
+        }
+    }
+}
+
+fn is_transient_llm_error(error: &anyhow::Error) -> bool {
+    let text = format!("{error:#}").to_ascii_lowercase();
+    text.contains("503")
+        || text.contains("502")
+        || text.contains("429")
+        || text.contains("bad_response_status_code")
+        || text.contains("no healthy upstream")
+        || text.contains("timeout")
+        || text.contains("timed out")
+        || text.contains("connection reset")
+        || text.contains("temporarily unavailable")
+}
+
+async fn stream_completion_model_once<M>(
+    settings: &RigSettings,
+    input: &agent_loop::ModelInput,
+    model: M,
+    prompt: &str,
+    handler: &mut dyn ModelEventHandler,
+) -> std::result::Result<(), (anyhow::Error, bool)>
+where
     M: CompletionModel,
     M::StreamingResponse: Clone + Unpin,
 {
     let builder = completion_request_builder(settings, input, model, prompt);
-    let mut stream = builder.stream().await.context("LLM stream failed")?;
+    let mut stream = builder
+        .stream()
+        .await
+        .context("LLM stream failed")
+        .map_err(|error| (error, false))?;
     let mut parser = RuntimeEventStreamParser::default();
     let mut fallback_text = String::new();
+    let mut made_progress = false;
     while let Some(chunk) = stream.next().await {
-        match chunk.context("LLM stream chunk failed")? {
+        let chunk = match chunk.context("LLM stream chunk failed") {
+            Ok(chunk) => chunk,
+            Err(error) => return Err((error, made_progress)),
+        };
+        match chunk {
             StreamedAssistantContent::Text(text) => {
+                made_progress = true;
                 fallback_text.push_str(text.text());
-                parser.push_text(text.text(), handler).await?;
+                parser
+                    .push_text(text.text(), handler)
+                    .await
+                    .map_err(|error| (error, made_progress))?;
             }
             StreamedAssistantContent::Reasoning(reasoning) => {
                 if let (Some(id), Some(encrypted_content)) =
                     (reasoning.id.clone(), reasoning.encrypted_content())
                 {
+                    made_progress = true;
                     handler
                         .handle(ModelStreamEvent::ReasoningStateCompleted {
                             item_id: id,
                             encrypted_content: encrypted_content.to_string(),
                         })
-                        .await?;
+                        .await
+                        .map_err(|error| (error, made_progress))?;
                 }
                 let text = reasoning.display_text();
                 if !text.trim().is_empty() {
+                    made_progress = true;
                     let item_id = reasoning
                         .id
                         .clone()
@@ -752,23 +857,28 @@ where
                             item_id: item_id.clone(),
                             delta: text,
                         })
-                        .await?;
+                        .await
+                        .map_err(|error| (error, made_progress))?;
                     handler
                         .handle(ModelStreamEvent::ReasoningSummaryCompleted { item_id })
-                        .await?;
+                        .await
+                        .map_err(|error| (error, made_progress))?;
                 }
             }
             StreamedAssistantContent::ReasoningDelta { id, reasoning } => {
                 if !reasoning.trim().is_empty() {
+                    made_progress = true;
                     handler
                         .handle(ModelStreamEvent::ReasoningSummaryDelta {
                             item_id: id.unwrap_or_else(|| "reasoning-stream".to_string()),
                             delta: reasoning,
                         })
-                        .await?;
+                        .await
+                        .map_err(|error| (error, made_progress))?;
                 }
             }
             StreamedAssistantContent::ToolCall { tool_call, .. } => {
+                made_progress = true;
                 handler
                     .handle(ModelStreamEvent::ToolCallCompleted {
                         tool_call: ToolCallRequest {
@@ -777,13 +887,17 @@ where
                             arguments: tool_call.function.arguments,
                         },
                     })
-                    .await?;
+                    .await
+                    .map_err(|error| (error, made_progress))?;
             }
             StreamedAssistantContent::ToolCallDelta { .. } => {}
             StreamedAssistantContent::Final(_) => {}
         }
     }
-    parser.finish(handler, &fallback_text).await
+    parser
+        .finish(handler, &fallback_text)
+        .await
+        .map_err(|error| (error, made_progress))
 }
 
 fn apply_optional_preamble<M, P, ToolState>(
@@ -950,6 +1064,8 @@ fn parse_final_output(settings: &RigSettings, text: &str) -> Result<Value> {
     match settings.output_mode {
         OutputMode::ResearchArtifact => {
             let value = extract_json_artifact(text)?;
+            let value = normalize_research_artifact_value(value, &settings.tickers)
+                .context("failed to normalize research artifact JSON")?;
             let artifact: ResearchArtifact =
                 serde_json::from_value(value).context("failed to parse research artifact JSON")?;
             validate_research_artifact(&artifact, &settings.tickers)
@@ -965,6 +1081,8 @@ fn parse_final_output(settings: &RigSettings, text: &str) -> Result<Value> {
                     validate_json_artifact_contract(settings, &artifact)?;
                     Ok(artifact)
                 }
+                Err(error) if settings.role.starts_with("analyst.") => Err(error)
+                    .context("analyst role requires a JSON artifact; refusing text fallback"),
                 Err(_) => Ok(text_fallback_artifact(settings, text)),
             }
         }
@@ -1447,6 +1565,7 @@ mod tests {
             web_search: WebSearchConfig::default(),
             truncation: TruncationConfig::default(),
             judge: JudgeConfig::default(),
+            debug: false,
         }
     }
 
@@ -1534,6 +1653,50 @@ mod tests {
     }
 
     #[test]
+    fn append_debug_llm_record_writes_jsonl_under_outputs_debug() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut settings = base_settings(LlmRoute::Responses);
+        settings.debug = true;
+        settings.phase = Some(1);
+        settings.role = "analyst.technical".to_string();
+        settings.tools = Some(tools::ExternalToolConfig {
+            project_root: temp.path().to_path_buf(),
+            db_path: None,
+            run_dir: None,
+            run_id: None,
+            tickers: vec!["TQQQ".to_string()],
+        });
+
+        super::append_debug_llm_record(
+            &settings,
+            json!({
+                "kind": "generate",
+                "prompt": "hello",
+                "response_text": "world",
+            }),
+        )
+        .unwrap();
+        super::append_debug_llm_record(
+            &settings,
+            json!({
+                "kind": "stream",
+                "prompt": "again",
+                "response_text": "ok",
+            }),
+        )
+        .unwrap();
+
+        let path = temp
+            .path()
+            .join("outputs/debug/phase01/analyst_technical.jsonl");
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<_> = contents.lines().filter(|line| !line.is_empty()).collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("\"kind\":\"generate\""));
+        assert!(lines[1].contains("\"kind\":\"stream\""));
+    }
+
+    #[test]
     fn json_artifact_parser_requires_object() {
         assert_eq!(
             super::parse_json_object_artifact("{\"ok\":true}").unwrap(),
@@ -1560,6 +1723,44 @@ mod tests {
         let valid = r#"{"id":"analyst.technical","role":"analyst.technical","per_ticker":{"QQQ":{"direction":"bullish","confidence":0.7,"report":"ok"}}}"#;
         let artifact = super::parse_final_output(&settings, valid).unwrap();
         assert_eq!(artifact["per_ticker"]["QQQ"]["direction"], json!("bullish"));
+    }
+
+    #[test]
+    fn parse_final_output_accepts_per_ticker_only_research_envelope() {
+        let mut settings = base_settings(LlmRoute::Responses);
+        settings.role = "manager.research".to_string();
+        settings.tickers = vec!["QQQ".to_string(), "SOXX".to_string()];
+        settings.output_mode = OutputMode::ResearchArtifact;
+
+        let text = r#"{
+            "id":"research-manager",
+            "role":"research_manager",
+            "status":"completed",
+            "report":"compressed evidence only",
+            "per_ticker":{
+                "QQQ":{
+                    "rating":"Overweight",
+                    "long_probability":0.57,
+                    "short_probability":0.43,
+                    "plan":["Verify volume","Watch break"],
+                    "probability_rationale":"Near base after discount."
+                },
+                "SOXX":{
+                    "rating":"Hold",
+                    "long_probability":0.51,
+                    "short_probability":0.49,
+                    "plan":"Wait for confirmation",
+                    "probability_rationale":"Insufficient SOXX-specific evidence."
+                }
+            }
+        }"#;
+
+        let artifact = super::parse_final_output(&settings, text).unwrap();
+        assert_eq!(artifact["rating"], json!("Overweight"));
+        assert_eq!(artifact["long_probability"], json!(0.57));
+        assert_eq!(artifact["short_probability"], json!(0.43));
+        assert!(artifact["plan"].as_str().unwrap().contains("Verify volume"));
+        assert_eq!(artifact["per_ticker"]["SOXX"]["rating"], json!("Hold"));
     }
 
     #[test]

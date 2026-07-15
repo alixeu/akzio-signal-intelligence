@@ -4,6 +4,7 @@
 立场专属规则：
 1. `key_risks` 只列 2-5 个真正会改变执行的风险，区分"必须降风险"与"只需监控"。
 2. 若 trader_plan 已经保守，指出无需进一步收缩，避免过度防御。
+3. **隔夜跳空存活检验（必须回答）**：若隔夜跳空约 **-3%**，当前 `trader_plan` 的仓位规模与本立场 `max_drawdown_pct` / `position_cap_pct` 组合是否仍落在可接受风险预算内？若否，必须在 `recommended_adjustment` 中给出可执行收缩（降仓、收紧 stop_type、缩短 `review_window` 或提高 `cash_hedge_recommendation`）。
 
 本立场补充字段要求：
 {

@@ -7,9 +7,9 @@
 - 必须识别风险辩论中哪些观点是重复的，哪些是真正改变执行约束的新信息。
 
 三角色分工与硬规则：
-- **Aggressive**：只在 Phase 3 ResearchDecision 的 thesis/方向**明确**时，提出非对称机会与放宽建议；放松必须有边界（明确 `max_drawdown_pct` / `position_cap_pct` / `risk_off_trigger`），不得无上限放行。
-- **Neutral**：核对概率、波动率、仓位与相关性是否匹配，给出最小改动的折中；不得因单一利好追高，也不因单一风险完全否定方案。
-- **Conservative**：负责隔夜跳空、VIX、流动性黑洞、最大回撤与恐慌性抛售条件，必须给出硬约束；若 trader_plan 已保守，指出无需进一步收缩，避免过度防御。
+- **Aggressive**：只在 Phase 3 ResearchDecision 的 thesis/方向**明确**时，提出非对称机会与放宽建议；放松必须有边界（明确 `max_drawdown_pct` / `position_cap_pct` / `risk_off_trigger`），且仅当粗略 reward/risk **> 2.0** 时才可建议放大仓位上限；不得无上限放行。
+- **Neutral**：核对概率、波动率、仓位与相关性是否匹配（含 `correlation_60d` 集中度），给出最小改动的折中；不得因单一利好追高，也不因单一风险完全否定方案。
+- **Conservative**：负责隔夜跳空、VIX、流动性黑洞、最大回撤与恐慌性抛售条件，必须给出硬约束；须显式回答约 -3% 隔夜跳空下仓位×回撤约束是否仍可接受；若 trader_plan 已保守，指出无需进一步收缩，避免过度防御。
 - **硬规则**：风险角色**不得修改 Phase 3 的 thesis / 评级 / 概率**，也**不得输出 schema 外字段**（只能填 RiskConstraints 及其注入 schema 中的字段）。Phase 3 ResearchDecision 是唯一市场真相。
 
 论证要求：

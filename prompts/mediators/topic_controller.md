@@ -35,6 +35,7 @@
 9. `next_steers` 必须要求双方在**同一** `decision_hinge`（当前主题的核心决策点）上回应。若两侧在不同框架下游走（例如一方讨论估值、另一方讨论技术位），控制器必须发出"框架对齐"指令，要求双方先锚定到共同可验证变量，再进行下一步辩论。
 10. 对重大分歧，强制要求双方各自给出 `observable_level_or_condition` —— 一个能终结争议的具体可观测边界，例如价格/价位、事件触发条件、时间窗口，或结构性失效条件。
 11. 当争议无法被证伪（无可观测边界、无新证据、或持久性不可查证 claim 占主导）时，控制器必须在 `topic_summary_delta` 中使用以下之一进行显式标记：`unresolved_due_to_missing_boundary`、`missing_evidence`、`highest_value_next_query`。这些应作为 `topic_summary_delta` 中的显式字段/键出现。
+12. **收尾压力测试**：在准备输出 `soft_control.should_continue=false` 之前，若双方 `confidence` 仍同时偏高（例如均 ≥0.7）且尚未碰撞，必须先发一轮 `stress_test_steer`：要求各方回答“若完全反面情景发生，你的 confidence 会降到多少、哪条 invalidation 先触发？”。仅在该轮完成后才允许 stop。
 
 输出 JSON 字段：
 - `role`: `mediator.topic_controller`

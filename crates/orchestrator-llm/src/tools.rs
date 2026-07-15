@@ -171,7 +171,8 @@ impl RunTechnicalIndicatorsTool {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RunTechnicalIndicatorsArgs {
-    #[serde(default)]
+    /// Preferred field name. Models often send `tickers`, so accept that alias too.
+    #[serde(default, alias = "tickers")]
     pub symbols: Vec<String>,
     #[serde(default)]
     pub intervals: Vec<String>,
@@ -778,11 +779,37 @@ pub async fn execute_named_tool(
             let tool_args = serde_json::from_value::<FetchJin10FlashArgs>(args)
                 .context("invalid fetch_jin10_flash arguments")?;
             let ingest_args = tool_args.to_ingest_args();
-            let result = jin10::run(ingest_args)
+            let mut result = jin10::run(ingest_args)
                 .await
-                .map_err(|e| anyhow::anyhow!("{e}"));
-            log_named_tool_result(name, &result);
-            result
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            // Persist flash items so later read_run_context(kind=jin10) works even
+            // after conversation compaction drops the large fetch payload.
+            let mut conn = tool_connection(config)?;
+            let imported = orchestrator_sql::import_jin10_payload(&mut conn, &result)?;
+            let jin10_context = orchestrator_sql::read_run_context(
+                &mut conn,
+                &orchestrator_sql::RunContextReadRequest {
+                    kind: "jin10".to_string(),
+                    run_id: turn_context.map(|context| context.run_id.clone()),
+                    ticker: config.tickers.first().cloned(),
+                    tickers: config.tickers.clone(),
+                    phase: None,
+                    role: turn_context.map(|context| context.role.clone()),
+                    topic_id: None,
+                    turn_id: turn_context.map(|context| context.turn_id.clone()),
+                    persist_context: false,
+                    token_budget: None,
+                },
+            )?;
+            if let Some(object) = result.as_object_mut() {
+                // Prefer the compact DB snapshot in the tool result so the model
+                // can finish without another read_run_context round-trip.
+                object.remove("items");
+                object.insert("imported_rows".to_string(), json!(imported));
+                object.insert("jin10_context".to_string(), jin10_context);
+            }
+            log_named_tool_result(name, &Ok(result.clone()));
+            Ok(result)
         }
         FetchYoutubeTranscriptTool::NAME => {
             let tool_args = serde_json::from_value::<FetchYoutubeTranscriptArgs>(args)
@@ -822,11 +849,38 @@ pub async fn execute_named_tool(
                 .context("invalid run_technical_indicators arguments")?;
             let db_path = config.db_path.clone();
             let ingest_args = tool_args.to_ingest_args(db_path);
-            let result = technical::run(ingest_args)
+            let mut result = technical::run(ingest_args)
                 .await
-                .map_err(|e| anyhow::anyhow!("{e}"));
-            log_named_tool_result(name, &result);
-            result
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            // When rows already exist, the ingest call only reports `skipped`.
+            // Attach compact snapshots so the agent can finish without another
+            // read_run_context round-trip.
+            let tickers = if tool_args.symbols.is_empty() {
+                config.tickers.clone()
+            } else {
+                tool_args.symbols.clone()
+            };
+            let mut conn = tool_connection(config)?;
+            let technical_context = orchestrator_sql::read_run_context(
+                &mut conn,
+                &orchestrator_sql::RunContextReadRequest {
+                    kind: "technical".to_string(),
+                    run_id: turn_context.map(|context| context.run_id.clone()),
+                    ticker: tickers.first().cloned(),
+                    tickers,
+                    phase: None,
+                    role: turn_context.map(|context| context.role.clone()),
+                    topic_id: None,
+                    turn_id: turn_context.map(|context| context.turn_id.clone()),
+                    persist_context: false,
+                    token_budget: None,
+                },
+            )?;
+            if let Some(object) = result.as_object_mut() {
+                object.insert("technical_context".to_string(), technical_context);
+            }
+            log_named_tool_result(name, &Ok(result.clone()));
+            Ok(result)
         }
         FetchLast30DaysContextTool::NAME => {
             let tool_args = serde_json::from_value::<FetchLast30DaysContextArgs>(args)
@@ -897,14 +951,122 @@ fn execute_read_run_context(
     if request.role.is_none() {
         request.role = turn_context.map(|context| context.role.clone());
     }
-    if request.kind.trim().is_empty() && request.role.as_deref() == Some("analyst.technical") {
-        request.kind = "technical".to_string();
+    if request.phase.is_none() {
+        request.phase = turn_context.and_then(|context| context.phase);
     }
     if request.tickers.is_empty() {
         request.tickers = config.tickers.clone();
     }
     let mut conn = tool_connection(config)?;
-    orchestrator_sql::read_run_context(&mut conn, &request)
+    let prior_reads = turn_context
+        .map(|context| count_turn_tool_results(&conn, &context.turn_id, READ_RUN_CONTEXT_TOOL_NAME))
+        .transpose()?
+        .unwrap_or(0);
+    if request.kind.trim().is_empty() {
+        request.kind = match request.role.as_deref() {
+            Some("analyst.technical") => "technical".to_string(),
+            Some("analyst.news_macro") => "jin10".to_string(),
+            // Phase-2+ roles: first call compose_context, then research_inputs for detail.
+            Some(role)
+                if role.starts_with("researcher.")
+                    || role.starts_with("mediator.")
+                    || role.starts_with("manager.")
+                    || role.starts_with("risk.")
+                    || matches!(role, "trader" | "portfolio.manager" | "allocation.manager") =>
+            {
+                if prior_reads == 0 {
+                    "compose_context".to_string()
+                } else {
+                    "research_inputs".to_string()
+                }
+            }
+            _ => String::new(),
+        };
+    }
+    if request.kind == "compose_context" && request.token_budget.is_none() {
+        request.token_budget = Some(4096);
+    }
+    let evidence = orchestrator_sql::read_run_context(&mut conn, &request)?;
+    // Models often re-read the same default context looking for schema/tickers that
+    // already live in the role prompt. Wrap evidence with explicit run metadata and,
+    // after the first successful read in a turn, refuse further identical rereads.
+    if request.role.as_deref().is_some_and(|role| {
+        role.starts_with("analyst.")
+            || role.starts_with("researcher.")
+            || role.starts_with("mediator.")
+            || role.starts_with("manager.")
+            || role.starts_with("risk.")
+            || matches!(role, "trader" | "portfolio.manager" | "allocation.manager")
+    }) {
+        let tickers = if request.tickers.is_empty() {
+            config.tickers.clone()
+        } else {
+            request.tickers.clone()
+        };
+        let same_default_reread = prior_reads >= 1
+            && matches!(
+                request.kind.as_str(),
+                "technical" | "jin10" | "compose_context" | "research_inputs"
+            );
+        let artifact_hint = if request
+            .role
+            .as_deref()
+            .is_some_and(|role| role.starts_with("analyst."))
+        {
+            "Emit one JSON object with id/role for this analyst, status=completed, and per_ticker.<TICKER>.{direction,confidence,report}. direction must be bullish|bearish|neutral|mixed|unobserved; confidence must be a 0..1 number."
+        } else {
+            "Emit the final JSON artifact required by the role prompt now."
+        };
+        if same_default_reread {
+            return Ok(json!({
+                "status": "stop_rereading",
+                "role": request.role,
+                "tickers": tickers,
+                "kind": request.kind,
+                "message": format!(
+                    "read_run_context already returned evidence in this turn. Do not call it again unless requesting a different kind. {artifact_hint}"
+                ),
+                "evidence": evidence,
+            }));
+        }
+        return Ok(json!({
+            "status": "ok",
+            "role": request.role,
+            "tickers": tickers,
+            "kind": request.kind,
+            "message": format!(
+                "Evidence payload only. Tickers are listed in this object and the role prompt. {artifact_hint}"
+            ),
+            "evidence": evidence,
+        }));
+    }
+    Ok(evidence)
+}
+
+fn count_turn_tool_results(
+    conn: &rusqlite::Connection,
+    turn_id: &str,
+    tool_name: &str,
+) -> Result<i64> {
+    let full_context_json: String = match conn.query_row(
+        "SELECT full_context_json FROM agent_events WHERE turn_id = ?",
+        rusqlite::params![turn_id],
+        |row| row.get(0),
+    ) {
+        Ok(json) => json,
+        Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(0),
+        Err(e) => return Err(e.into()),
+    };
+    let items: Vec<serde_json::Value> =
+        serde_json::from_str(&full_context_json).unwrap_or_default();
+    let count = items
+        .iter()
+        .filter(|item| {
+            item.get("event_type").and_then(|v| v.as_str()) == Some("tool_result")
+                && item.get("tool_name").and_then(|v| v.as_str()) == Some(tool_name)
+        })
+        .count() as i64;
+    Ok(count)
 }
 
 fn tool_connection(config: &ExternalToolConfig) -> Result<rusqlite::Connection> {
@@ -964,6 +1126,126 @@ mod tests {
 
         assert_eq!(output["query"], "get-technical-context");
         assert!(output["daily"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn news_macro_defaults_empty_kind_to_jin10() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("runtime.sqlite");
+        {
+            let mut conn = orchestrator_sql::connect(&db_path).unwrap();
+            orchestrator_sql::ensure_schema(&conn).unwrap();
+            orchestrator_sql::import_jin10_payload(
+                &mut conn,
+                &json!({
+                    "items": [{
+                        "time": "2026-07-13 12:00:00",
+                        "content": "macro headline for test"
+                    }]
+                }),
+            )
+            .unwrap();
+        }
+        let config = ExternalToolConfig {
+            project_root: PathBuf::from("."),
+            db_path: Some(db_path),
+            run_dir: None,
+            run_id: Some("run-news".to_string()),
+            tickers: vec!["QQQ".to_string()],
+        };
+        let turn = ToolRuntimeTurnContext {
+            run_id: "run-news".to_string(),
+            session_id: "session-news".to_string(),
+            turn_id: "turn-news".to_string(),
+            role: "analyst.news_macro".to_string(),
+            phase: None,
+        };
+        let output = execute_named_tool(
+            READ_RUN_CONTEXT_TOOL_NAME,
+            json!({}),
+            &config,
+            Some(&turn),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(output["status"], "ok");
+        assert_eq!(output["kind"], "jin10");
+        assert_eq!(output["tickers"], json!(["QQQ"]));
+        assert_eq!(output["evidence"]["query"], "get-jin10-context");
+        assert_eq!(output["evidence"]["item_count"], 1);
+        assert_eq!(
+            output["evidence"]["items"][0]["content"],
+            "macro headline for test"
+        );
+        assert!(output["evidence"]["items"][0].get("item").is_none());
+    }
+
+    #[tokio::test]
+    async fn news_macro_stop_rereading_after_first_context() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("runtime.sqlite");
+        {
+            let mut conn = orchestrator_sql::connect(&db_path).unwrap();
+            orchestrator_sql::ensure_schema(&conn).unwrap();
+            orchestrator_sql::import_jin10_payload(
+                &mut conn,
+                &json!({"items":[{"time":"2026-07-13 12:00:00","content":"macro headline for test"}]}),
+            )
+            .unwrap();
+            orchestrator_sql::upsert_agent_turn(
+                &conn,
+                &orchestrator_sql::AgentTurnInput {
+                    turn_id: "turn-news".to_string(),
+                    run_id: "run-news".to_string(),
+                    phase: Some(1),
+                    turn_number: 1,
+                    role: "analyst.news_macro".to_string(),
+                    full_context_json: json!([
+                        {"event_type":"tool_result","role":"tool","content_text":"prior","content_json":{},"tool_call_id":"call-0","tool_name":"read_run_context"},
+                        {"event_type":"tool_result","role":"tool","content_text":"prior","content_json":{},"tool_call_id":"call-1","tool_name":"read_run_context"}
+                    ]),
+                    summary: "test turn".to_string(),
+                },
+            )
+            .unwrap();
+        }
+        let config = ExternalToolConfig {
+            project_root: PathBuf::from("."),
+            db_path: Some(db_path),
+            run_dir: None,
+            run_id: Some("run-news".to_string()),
+            tickers: vec!["QQQ".to_string(), "SOXX".to_string()],
+        };
+        let turn = ToolRuntimeTurnContext {
+            run_id: "run-news".to_string(),
+            session_id: "session-news".to_string(),
+            turn_id: "turn-news".to_string(),
+            role: "analyst.news_macro".to_string(),
+            phase: None,
+        };
+        let output = execute_named_tool(
+            READ_RUN_CONTEXT_TOOL_NAME,
+            json!({}),
+            &config,
+            Some(&turn),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(output["status"], "stop_rereading");
+        assert_eq!(output["tickers"], json!(["QQQ", "SOXX"]));
+        assert!(output["message"]
+            .as_str()
+            .unwrap()
+            .contains("Emit one JSON object"));
+    }
+
+    #[test]
+    fn run_technical_args_accept_tickers_alias() {
+        let args: RunTechnicalIndicatorsArgs =
+            serde_json::from_value(json!({"tickers": ["QQQ", "SOXX"]})).unwrap();
+        assert_eq!(args.symbols, vec!["QQQ".to_string(), "SOXX".to_string()]);
     }
 
     #[tokio::test]

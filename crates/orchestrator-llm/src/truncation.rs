@@ -166,7 +166,9 @@ fn truncate_json(content: &str, max_chars: usize, config: &TruncationConfig) -> 
             return serialized;
         }
 
-        let next_array_elements = max_array_elements.saturating_div(2);
+        // Keep at least one array element while shrinking so useful payloads
+        // are not reduced to empty shells before the final compact fallback.
+        let next_array_elements = max_array_elements.saturating_div(2).max(1);
         let next_string_chars = max_string_chars.saturating_div(2).max(16);
         if next_array_elements == max_array_elements && next_string_chars == max_string_chars {
             break;
@@ -511,6 +513,30 @@ mod tests {
         assert_eq!(parsed["status"], json!("completed"));
         assert_eq!(parsed["role"], json!("analyst.technical"));
         assert!(result.chars().count() <= 500);
+    }
+
+    #[test]
+    fn keeps_at_least_one_array_element_while_shrinking_large_json() {
+        let mut items = Vec::new();
+        for i in 0..80 {
+            items.push(json!({
+                "ticker": "QQQ",
+                "kline_time": format!("2026-07-07T{i:02}:00:00Z"),
+                "indicators": {"Close": 500.0 + i as f64, "Return": 0.01}
+            }));
+        }
+        let content = serde_json::to_string(&json!({
+            "query": "get-technical-context",
+            "daily": items
+        }))
+        .unwrap();
+        let truncated = truncate_semantic(&content, 800, &TruncationConfig::default());
+        let parsed: Value = serde_json::from_str(&truncated).unwrap();
+        let daily = parsed.get("daily").and_then(Value::as_array).unwrap();
+        assert!(
+            !daily.is_empty(),
+            "truncation should retain at least one daily snapshot, got {truncated}"
+        );
     }
 
     #[test]

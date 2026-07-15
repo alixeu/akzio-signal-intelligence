@@ -30,7 +30,7 @@ async fn mock_exec_writes_state_and_final_summary() {
         from_phase: 1,
         to_phase: 3,
         tech_refresh_enabled: false,
-        tech_refresh_intervals: "1d,2h,30min".to_string(),
+        tech_refresh_intervals: "1d,3h,20min".to_string(),
         tech_refresh_save_bars: 120,
         tech_refresh_script_path: None,
         tech_refresh_timeout_sec: 900,
@@ -40,6 +40,7 @@ async fn mock_exec_writes_state_and_final_summary() {
         jin10_refresh_script_path: None,
         jin10_refresh_timeout_sec: 120,
         mock: true,
+        debug: false,
     })
     .await
     .unwrap();
@@ -56,8 +57,8 @@ async fn mock_exec_writes_state_and_final_summary() {
             "analyst.x"
         ])
     );
-    assert_role_metrics_ok(&state);
-    assert_phase_metrics_ok(&state, 3);
+    assert_role_metrics_ok(state);
+    assert_phase_metrics_ok(state, 3);
 
     let conn = rusqlite::Connection::open(db_path).unwrap();
     let summary_comma_rows: i64 = conn
@@ -97,8 +98,8 @@ async fn mock_exec_can_stop_after_phase1() {
     assert_eq!(state["phase_status"]["1"], "done");
     assert!(state["phase_status"].get("2").is_none());
     assert!(state["phase_status"].get("3").is_none());
-    assert_contracts_ok(&state);
-    assert_phase_metrics_ok(&state, 1);
+    assert_contracts_ok(state);
+    assert_phase_metrics_ok(state, 1);
 }
 
 #[tokio::test]
@@ -149,10 +150,10 @@ async fn mock_exec_phase7_writes_portfolio_allocation() {
         3
     );
     assert_eq!(state["portfolio_allocation"]["total_equity_exposure"], 0.6);
-    assert_market_truth_ok(&state);
-    assert_contracts_ok(&state);
-    assert_role_metrics_ok(&state);
-    assert_phase_metrics_ok(&state, 7);
+    assert_market_truth_ok(state);
+    assert_contracts_ok(state);
+    assert_role_metrics_ok(state);
+    assert_phase_metrics_ok(state, 7);
     assert!(state["phase_status"].get("8").is_none());
     let conn = Connection::open(db_path).unwrap();
     let phase8_rows: i64 = conn
@@ -196,12 +197,8 @@ async fn mock_exec_phase8_writes_archive_predictions_and_system_metrics() {
     let prediction_count: i64 = conn
         .query_row("SELECT COUNT(*) FROM predictions", [], |row| row.get(0))
         .unwrap();
-    let system_metric_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM prompt_metrics", [], |row| row.get(0))
-        .unwrap();
     assert_eq!(archive_count, 1);
     assert!(prediction_count >= 1);
-    assert!(system_metric_count >= 1);
 }
 
 #[tokio::test]
@@ -267,10 +264,10 @@ async fn selective_policy_derives_trader_runs_triggered_risk_and_allocates() {
         state["research_plan"]["short_probability"]
     );
     assert_eq!(result["portfolio_allocation"]["total_equity_exposure"], 0.6);
-    assert_market_truth_ok(&state);
-    assert_contracts_ok(&state);
-    assert_role_metrics_ok(&state);
-    assert_phase_metrics_ok(&state, 7);
+    assert_market_truth_ok(state);
+    assert_contracts_ok(state);
+    assert_role_metrics_ok(state);
+    assert_phase_metrics_ok(state, 7);
     assert!(state["role_job_metrics"]
         .as_array()
         .unwrap()
@@ -320,7 +317,7 @@ async fn legacy_policy_runs_all_optional_phases_and_allocates() {
         serde_json::Value::Null
     );
     assert_eq!(result["portfolio_allocation"]["total_equity_exposure"], 0.6);
-    assert_contracts_ok(&state);
+    assert_contracts_ok(state);
 }
 
 #[tokio::test]
@@ -622,12 +619,10 @@ async fn mock_exec_writes_reducer_turn_summaries() {
             && summary_json.contains("reducer.debate_final")
     }));
 
-    let turn_item_rows: i64 = conn
-        .query_row("SELECT COUNT(*) FROM agent_turn_items", [], |row| {
-            row.get(0)
-        })
+    let event_rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM agent_events", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(turn_item_rows, 0);
+    assert_eq!(event_rows, 0);
 }
 
 fn assert_market_truth_ok(state: &serde_json::Value) {
@@ -716,7 +711,7 @@ fn test_args(
         from_phase: 1,
         to_phase: 3,
         tech_refresh_enabled: false,
-        tech_refresh_intervals: "1d,2h,30min".to_string(),
+        tech_refresh_intervals: "1d,3h,20min".to_string(),
         tech_refresh_save_bars: 120,
         tech_refresh_script_path: None,
         tech_refresh_timeout_sec: 900,
@@ -726,6 +721,7 @@ fn test_args(
         jin10_refresh_script_path: None,
         jin10_refresh_timeout_sec: 120,
         mock,
+        debug: false,
     }
 }
 

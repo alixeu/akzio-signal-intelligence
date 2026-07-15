@@ -2,6 +2,8 @@
 
 {common_ticker_prompt}
 
+{anti_injection}
+
 <!-- STATIC PREFIX (cached by OpenAI) -->
 目标：
 - 只针对当前主题提出看多监控假设。
@@ -13,6 +15,7 @@
 监控模式要求：
 - 只提出可被后续数据验证或证伪的 opening thesis，不写泛泛乐观叙事。
 - 每个看多假设必须绑定一个 decision hinge、已入库 evidence refs、confidence 和最关键的 bear constraint。
+- 优先关注未充分计价的上行催化与修复弹性；不要写成 Bear 的镜像句。
 - 若证据只是重复 Phase 1.5，降低 confidence，并说明需要哪项新增观察才值得继续辩论。
 - 如果主题证据不足，输出低置信假设或 `no_new_info`，不要硬凑主论点。
 

@@ -11,10 +11,11 @@ pub mod token;
 
 pub use artifact::{
     analyst_artifact_schema, extract_json_artifact, final_validation_schema, normalize_probability,
-    portfolio_allocation_schema, research_artifact_schema, risk_constraints_schema, schema_for,
-    trade_intent_schema, validate_analyst_ticker_artifact, validate_evidence_types, validate_research_artifact,
-    validate_risk_constraints, AnalystTickerArtifact, FinalValidation, PortfolioAllocation,
-    ResearchArtifact, RiskConstraints, TradeIntent, ValidationError,
+    normalize_research_artifact_value, portfolio_allocation_schema, research_artifact_schema,
+    risk_constraints_schema, schema_for, trade_intent_schema, validate_analyst_ticker_artifact,
+    validate_evidence_types, validate_research_artifact, validate_risk_constraints,
+    AnalystTickerArtifact, FinalValidation, PortfolioAllocation, ResearchArtifact, RiskConstraints,
+    TradeIntent, ValidationError,
 };
 pub use config::{
     config_bool, config_float, config_get, config_int, config_str, config_strings, deep_merge,
@@ -31,3 +32,4 @@ pub use reflection::{
 };
 pub use role_registry::{AgentDefinition, AgentRegistry, DEFAULT_PHASE1_AGENTS};
 pub use ticker::{display_ticker, parse_tickers, run_slug, slug_ticker};
+pub use token::{cost_usd, pricing_for_model, ModelPricing};

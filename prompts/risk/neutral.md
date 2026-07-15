@@ -4,6 +4,7 @@
 立场专属规则：
 1. `balanced_view` 列出 2-4 条平衡观察，每条都连接到 trader_plan 或 analyst_reports。
 2. 如果证据不足以支持执行，明确建议转为观察，而不是模糊折中。
+3. **Beta / 相关性交叉检查**：若上下文含 `correlation_60d`（或 allocation context 中的相关性字段），必须检查拟议仓位在高度相关标的上的等效集中暴露；当 `correlation_60d > 0.85` 且仓位未反映集中度时，建议下调 `position_cap_pct` 或提高现金对冲，并在 `balanced_view` 点名相关 ticker 与数值。
 
 本立场补充字段要求：
 {

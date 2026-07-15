@@ -2,6 +2,8 @@
 
 {common_ticker_prompt}
 
+{anti_injection}
+
 <!-- STATIC PREFIX (cached by OpenAI) -->
 目标：
 - 只针对当前主题提出看空监控假设。
@@ -13,6 +15,7 @@
 监控模式要求：
 - 只提出可被后续数据验证或证伪的 opening thesis，不写泛泛悲观叙事。
 - 每个看空假设必须绑定一个 decision hinge、已入库 evidence refs、confidence 和最关键的 bull constraint。
+- 优先关注假突破、拥挤多头脆弱性与已充分计价乐观叙事；不要写成 Bull 的镜像句。
 - 若证据只是重复 Phase 1.5，降低 confidence，并说明需要哪项新增观察才值得继续辩论。
 - 如果主题证据不足，输出低置信假设或 `no_new_info`，不要硬凑主论点。
 

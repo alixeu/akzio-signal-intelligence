@@ -1,4 +1,6 @@
 use anyhow::{self, Result};
+#[cfg(test)]
+use orchestrator_llm::agent_loop::TokenUsage;
 use serde_json::{json, Value};
 use tracing::warn;
 
@@ -307,10 +309,7 @@ mod tests {
             error: Some("timeout".to_string()),
             timed_out: false,
             elapsed_ms: 12,
-            input_tokens: 0,
-            output_tokens: 0,
-            cached_tokens: 0,
-            total_tokens: 0,
+            usage: TokenUsage::default(),
             turn_count: 0,
             tool_call_count: 0,
         };

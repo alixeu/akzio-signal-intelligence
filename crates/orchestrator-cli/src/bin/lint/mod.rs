@@ -101,7 +101,6 @@ pub const COMMON_COMPONENTS: &[&str] = &[
     "analyst_output_structure.md",
     "research_calibration.md",
     "research_drivers.md",
-    "researcher_interaction.md",
     "risk_analyst.md",
 ];
 

@@ -372,7 +372,6 @@ mod tests {
         assert_eq!(state["workflow_metrics"]["llm_calls_skipped_estimate"], 3);
     }
 
-
     #[test]
     fn selective_high_position_triggers_reviews() {
         let decision = selective(WorkflowPolicySignals {
@@ -381,7 +380,9 @@ mod tests {
         });
         assert!(decision.need_risk_review);
         assert!(decision.need_portfolio_review);
-        assert!(decision.reasons.contains(&WorkflowPolicyReason::HighPosition));
+        assert!(decision
+            .reasons
+            .contains(&WorkflowPolicyReason::HighPosition));
     }
 
     #[test]
@@ -392,7 +393,8 @@ mod tests {
         });
         assert!(decision.need_risk_review);
         assert!(decision.need_portfolio_review);
-        assert!(decision.reasons.contains(&WorkflowPolicyReason::ResearchDegraded));
+        assert!(decision
+            .reasons
+            .contains(&WorkflowPolicyReason::ResearchDegraded));
     }
-
 }
