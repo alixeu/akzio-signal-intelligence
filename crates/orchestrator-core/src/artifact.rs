@@ -194,8 +194,10 @@ pub struct AnalystTickerArtifact {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 pub struct EvidenceItem {
     /// The evidence claim in 1-2 sentences.
+    #[serde(default, alias = "summary", alias = "event", alias = "description")]
     pub claim: String,
     /// Evidence type: "fact" | "opinion" | "speculation" | "unclassified".
+    #[serde(default, alias = "classification", alias = "type")]
     pub evidence_type: String,
     /// Where the evidence came from (tool name, data source, URL description).
     #[serde(default)]
@@ -214,7 +216,7 @@ pub struct EvidenceItem {
     #[serde(default)]
     pub is_derivative_repost: bool,
     /// Human-readable evidence age: "0-2d" | "3-5d" | "6-10d" | "10d+" | "unknown".
-    #[serde(default)]
+    #[serde(default, alias = "catalyst_age", alias = "age")]
     pub evidence_age: String,
     /// 0.0-1.0 confidence in the quality of the source.
     #[serde(default)]

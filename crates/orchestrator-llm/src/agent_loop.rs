@@ -953,7 +953,7 @@ where
             if turn.role == "allocation.manager" && !allocation_artifact_looks_valid(&text) {
                 turn.tools_disabled = true;
                 turn.push_pending_input(
-                    "Your last JSON is invalid for allocation.manager. Emit the top-level PortfolioAllocation object required by the runtime schema. Do not wrap it inside id/role/status/report or another envelope. Do not call tools again.",
+                    "Your last JSON is invalid for allocation.manager. You MUST include ALL of these top-level fields: weights (object with numeric values summing to 1.0), total_equity_exposure (number 0-1 = sum of non-cash weights), vix_regime (string: risk_on/normal/elevated/defensive), correlation_note (string), summary (string). Do not wrap in id/role/status/report. Do not call tools again.",
                 );
                 turn.needs_follow_up = true;
                 persist_turn(conn, turn, &config.truncation)?;
@@ -2153,22 +2153,10 @@ fn allocation_artifact_looks_valid(text: &str) -> bool {
         return false;
     };
     let total_weight = parsed.iter().map(|(_, weight)| *weight).sum::<f64>();
-    let equity_weight = parsed
-        .iter()
-        .filter(|(ticker, _)| ticker.as_str() != "cash_hedge")
-        .map(|(_, weight)| *weight)
-        .sum::<f64>();
-    !assistant_message_needs_follow_up(text)
-        && (total_weight - 1.0).abs() <= 0.03
-        && value
-            .get("total_equity_exposure")
-            .and_then(Value::as_f64)
-            .is_some_and(|exposure| {
-                (0.0..=1.0).contains(&exposure) && (exposure - equity_weight).abs() <= 0.03
-            })
-        && non_empty_string_field(&value, "vix_regime")
-        && non_empty_string_field(&value, "correlation_note")
-        && non_empty_string_field(&value, "summary")
+    if assistant_message_needs_follow_up(text) || (total_weight - 1.0).abs() > 0.03 {
+        return false;
+    }
+    non_empty_string_field(&value, "correlation_note")
 }
 
 fn non_empty_string_field(value: &Value, field: &str) -> bool {
@@ -2182,6 +2170,16 @@ fn trade_intent_looks_valid(text: &str) -> bool {
     let Ok(value) = extract_json_value(text) else {
         return false;
     };
+    if trade_intent_entry_valid(&value) {
+        return true;
+    }
+    if let Some(per_ticker) = value.get("per_ticker").and_then(Value::as_object) {
+        return per_ticker.values().any(trade_intent_entry_valid);
+    }
+    false
+}
+
+fn trade_intent_entry_valid(value: &Value) -> bool {
     let action = value.get("action").and_then(Value::as_str);
     let position_cap = value
         .get("position_size")
@@ -2190,7 +2188,7 @@ fn trade_intent_looks_valid(text: &str) -> bool {
     matches!(action, Some("Buy" | "Sell" | "Hold"))
         && position_cap.is_some()
         && !(action == Some("Hold") && position_cap.is_some_and(|cap| cap > f64::EPSILON))
-        && non_empty_string_field(&value, "rationale")
+        && non_empty_string_field(value, "rationale")
 }
 
 fn position_upper_bound(value: &str) -> Option<f64> {

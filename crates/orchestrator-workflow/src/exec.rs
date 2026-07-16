@@ -14,6 +14,7 @@ use orchestrator_sql::{
 use serde_json::{json, Value};
 use std::{
     fs,
+    io::Write,
     path::{Path, PathBuf},
     time::Instant,
 };
@@ -138,7 +139,7 @@ pub struct ExecArgs {
     pub jin10_refresh_timeout_sec: u64,
     #[arg(long)]
     pub mock: bool,
-    /// Write each LLM call record to outputs/debug/phaseXX/{role}.jsonl.
+    /// Write LLM/local reducer records to outputs/debug/phaseXX/{role}.jsonl.
     #[arg(long)]
     pub debug: bool,
 }
@@ -334,7 +335,11 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         debug!("phase 3 completed");
     }
     let policy = if state.get("research_plan").is_some() {
-        Some(apply_workflow_policy(&mut state, &conn, &runtime_config))
+        Some(apply_workflow_policy(
+            &mut state,
+            &conn,
+            &runtime_config,
+        ))
     } else {
         None
     };
@@ -735,18 +740,24 @@ fn is_selective_policy(config: &RuntimeConfig) -> bool {
 }
 
 fn should_run_llm_trader(policy: Option<&WorkflowPolicyDecision>, config: &RuntimeConfig) -> bool {
-    !is_selective_policy(config) || policy.is_none_or(|decision| decision.need_trader)
+    policy
+        .map(|decision| decision.need_trader)
+        .unwrap_or_else(|| !is_selective_policy(config))
 }
 
 fn should_run_risk_review(policy: Option<&WorkflowPolicyDecision>, config: &RuntimeConfig) -> bool {
-    !is_selective_policy(config) || policy.is_none_or(|decision| decision.need_risk_review)
+    policy
+        .map(|decision| decision.need_risk_review)
+        .unwrap_or_else(|| !is_selective_policy(config))
 }
 
 fn should_run_portfolio_review(
     policy: Option<&WorkflowPolicyDecision>,
     config: &RuntimeConfig,
 ) -> bool {
-    !is_selective_policy(config) || policy.is_none_or(|decision| decision.need_portfolio_review)
+    policy
+        .map(|decision| decision.need_portfolio_review)
+        .unwrap_or_else(|| !is_selective_policy(config))
 }
 
 const PHASE3_PROBABILITY_DRIFT_LIMIT: f64 = 0.08;
@@ -1993,7 +2004,8 @@ async fn run_phase1_reducer(
     let brief = reducer_brief_md(&artifact);
     state["phase1_state_artifact"] = artifact.clone();
     state["phase1_brief_md"] = Value::String(brief.clone());
-    persist_artifact_with_last_md(conn, state, 15, "reducer.evidence", artifact, brief)?;
+    persist_artifact_with_last_md(conn, state, 15, "reducer.evidence", artifact.clone(), brief)?;
+    record_local_debug_artifact(state, 15, "reducer.evidence", &artifact)?;
     set_phase_status(state, 15, "done");
     Ok(())
 }
@@ -2014,10 +2026,60 @@ async fn run_phase2_final_reducer(
         state,
         PHASE2_REDUCER,
         "reducer.debate_final",
-        artifact,
+        artifact.clone(),
         brief,
     )?;
+    record_local_debug_artifact(state, PHASE2_REDUCER, "reducer.debate_final", &artifact)?;
     set_phase_status(state, PHASE2_REDUCER, "done");
+    Ok(())
+}
+
+fn record_local_debug_artifact(
+    state: &mut Value,
+    phase: i64,
+    role: &str,
+    artifact: &Value,
+) -> Result<()> {
+    if state.get("debug").and_then(Value::as_bool) != Some(true) {
+        return Ok(());
+    }
+
+    let relative_path = orchestrator_llm::debug_record_relative_path(phase, role);
+    let path = default_project_root().join(&relative_path);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create debug dir {}", parent.display()))?;
+    }
+    let record = json!({
+        "kind": "local_reducer",
+        "phase": phase,
+        "role": role,
+        "artifact": artifact
+    });
+    let mut line = serde_json::to_string(&record)?;
+    line.push('\n');
+    fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("failed to open debug workflow record {}", path.display()))?
+        .write_all(line.as_bytes())
+        .with_context(|| format!("failed to append debug workflow record {}", path.display()))?;
+
+    if !state
+        .get("debug_phase_records")
+        .is_some_and(Value::is_array)
+    {
+        state["debug_phase_records"] = json!([]);
+    }
+    if let Some(records) = state["debug_phase_records"].as_array_mut() {
+        records.push(json!({
+            "kind": "local_reducer",
+            "phase": phase,
+            "role": role,
+            "path": relative_path
+        }));
+    }
     Ok(())
 }
 

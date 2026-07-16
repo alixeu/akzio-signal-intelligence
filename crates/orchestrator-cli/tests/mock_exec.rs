@@ -170,6 +170,59 @@ async fn mock_exec_phase7_writes_portfolio_allocation() {
 }
 
 #[tokio::test]
+async fn debug_exec_records_local_reducers_without_changing_workflow_policy() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = write_test_config(temp.path());
+    let run_dir = temp.path().join("debug-run");
+    let db_path = temp.path().join("debug.sqlite");
+    let mut args = test_args(
+        Some(db_path.clone()),
+        Some(run_dir),
+        Some(config_path),
+        true,
+    );
+    args.debug = true;
+    args.to_phase = 4;
+
+    let result = exec::run(args).await.unwrap();
+    let state = &result["run_state"];
+
+    assert_eq!(state["phase_status"]["15"], "done");
+    assert_eq!(state["phase_status"]["2"], "done");
+    assert_eq!(state["phase_status"]["25"], "done");
+    assert!(matches!(
+        state["phase_status"]["4"].as_str(),
+        Some("done" | "derived")
+    ));
+    assert_eq!(state["workflow_policy"]["mode"], "selective");
+    assert!(state["debug_phase_records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|record| record["phase"] == 15 && record["role"] == "reducer.evidence"));
+    assert!(state["role_job_metrics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|job| job["role"] == "mediator.topic"));
+    assert!(state["role_job_metrics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|job| job["role"] == "trader"));
+
+    let conn = Connection::open(db_path).unwrap();
+    let phase2_debate_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM role_turn_summaries WHERE phase IN (2, 25) AND role != 'reducer.debate_final'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(phase2_debate_rows > 0);
+}
+
+#[tokio::test]
 async fn mock_exec_phase8_writes_archive_predictions_and_system_metrics() {
     let temp = tempfile::tempdir().unwrap();
     let config_path = write_test_config(temp.path());

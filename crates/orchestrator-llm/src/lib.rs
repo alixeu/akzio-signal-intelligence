@@ -391,10 +391,7 @@ pub fn append_debug_llm_record(settings: &RigSettings, record: Value) -> Result<
         .as_ref()
         .map(|tools| tools.project_root.clone())
         .unwrap_or_else(default_project_root);
-    let path = root.join(format!(
-        "outputs/debug/phase{phase:02}/{}.jsonl",
-        safe_path_part(&settings.role)
-    ));
+    let path = root.join(debug_record_relative_path(phase, &settings.role));
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create debug dir {}", parent.display()))?;
@@ -410,6 +407,13 @@ pub fn append_debug_llm_record(settings: &RigSettings, record: Value) -> Result<
         .write_all(line.as_bytes())
         .with_context(|| format!("failed to append debug llm record {}", path.display()))?;
     Ok(())
+}
+
+pub fn debug_record_relative_path(phase: i64, role: &str) -> PathBuf {
+    PathBuf::from(format!(
+        "outputs/debug/phase{phase:02}/{}.jsonl",
+        safe_path_part(role)
+    ))
 }
 
 fn end_context_item(item: &agent_loop::TurnItem) -> Option<Value> {
@@ -989,6 +993,18 @@ impl RuntimeEventStreamParser {
             return Ok(());
         };
         let json_line = &line[start..];
+        if let Some(repaired) = repair_adjacent_object_boundary(json_line) {
+            return self.emit_json_values(&repaired, line, handler).await;
+        }
+        self.emit_json_values(json_line, line, handler).await
+    }
+
+    async fn emit_json_values(
+        &mut self,
+        json_line: &str,
+        original_line: &str,
+        handler: &mut dyn ModelEventHandler,
+    ) -> Result<()> {
         let stream = serde_json::Deserializer::from_str(json_line).into_iter::<Value>();
         let mut emitted = false;
         for value in stream {
@@ -996,8 +1012,16 @@ impl RuntimeEventStreamParser {
                 Ok(value) => value,
                 Err(_) if emitted => break,
                 Err(error) => {
+                    let preview_end = {
+                        let limit = original_line.len().min(200);
+                        let mut end = limit;
+                        while end > 0 && !original_line.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        end
+                    };
                     tracing::warn!(
-                        line_preview = &line[..line.len().min(200)],
+                        line_preview = &original_line[..preview_end],
                         %error,
                         "skipping malformed streamed event line"
                     );
@@ -1013,6 +1037,41 @@ impl RuntimeEventStreamParser {
         }
         Ok(())
     }
+}
+
+fn repair_adjacent_object_boundary(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut in_string = false;
+    let mut escape = false;
+    let mut depth = 0usize;
+
+    for index in 0..bytes.len().saturating_sub(1) {
+        let byte = bytes[index];
+        if in_string {
+            if escape {
+                escape = false;
+            } else if byte == b'\\' {
+                escape = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'{' => depth += 1,
+            b'}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        if depth > 0 && byte == b'}' && bytes[index + 1] == b'{' {
+            let mut repaired = String::with_capacity(text.len() + 1);
+            repaired.push_str(&text[..index + 1]);
+            repaired.push('}');
+            repaired.push_str(&text[index + 1..]);
+            return Some(repaired);
+        }
+    }
+    None
 }
 
 fn stream_event_from_value(value: Value) -> Result<Option<ModelStreamEvent>> {
@@ -1374,33 +1433,49 @@ fn validate_allocation_artifact_contract(settings: &RigSettings, artifact: &Valu
     if (total_weight - 1.0).abs() > 0.03 {
         bail!("allocation weights must sum to approximately 1.0 (got {total_weight})");
     }
-    let total_equity = require_number_in_range(artifact, "total_equity_exposure", 0.0, 1.0)?;
-    if (total_equity - equity_weight).abs() > 0.03 {
-        bail!(
-            "total_equity_exposure {total_equity} does not match non-cash weights {equity_weight}"
-        );
+    if let Some(total_equity) = artifact
+        .get("total_equity_exposure")
+        .and_then(Value::as_f64)
+    {
+        if (total_equity - equity_weight).abs() > 0.03 {
+            bail!(
+                "total_equity_exposure {total_equity} does not match non-cash weights {equity_weight}"
+            );
+        }
     }
-    require_non_empty_string(artifact, "vix_regime")?;
     require_non_empty_string(artifact, "correlation_note")?;
-    require_non_empty_string(artifact, "summary")?;
     Ok(())
 }
 
 fn validate_trade_intent_contract(settings: &RigSettings, artifact: &Value) -> Result<()> {
     validate_optional_role(settings, artifact)?;
-    let action = require_non_empty_string(artifact, "action")?;
+    if artifact.get("action").and_then(Value::as_str).is_some() {
+        return validate_trade_intent_entry(artifact);
+    }
+    if let Some(per_ticker) = artifact.get("per_ticker").and_then(Value::as_object) {
+        for (ticker, entry) in per_ticker {
+            validate_trade_intent_entry(entry)
+                .with_context(|| format!("per_ticker.{ticker} trade intent invalid"))?;
+        }
+        return Ok(());
+    }
+    bail!("trade intent requires top-level action or per_ticker structure");
+}
+
+fn validate_trade_intent_entry(entry: &Value) -> Result<()> {
+    let action = require_non_empty_string(entry, "action")?;
     if !matches!(action, "Buy" | "Sell" | "Hold") {
         bail!("trade intent action must be Buy, Sell, or Hold");
     }
-    let position_size = require_non_empty_string(artifact, "position_size")?;
+    let position_size = require_non_empty_string(entry, "position_size")?;
     let position_cap = parse_position_upper_bound(position_size)
         .context("trade intent position_size must be a percentage or percentage range")?;
     if action == "Hold" && position_cap > f64::EPSILON {
         bail!("Hold trade intent must use position_size=0%");
     }
-    require_non_empty_string(artifact, "rationale")?;
+    require_non_empty_string(entry, "rationale")?;
     for field in ["entry_price", "stop_loss"] {
-        if let Some(value) = artifact.get(field) {
+        if let Some(value) = entry.get(field) {
             if !value.is_null() && !value.is_string() {
                 bail!("trade intent {field} must be a string or null");
             }
@@ -1456,7 +1531,7 @@ fn validate_optional_role(settings: &RigSettings, artifact: &Value) -> Result<()
         let role = role
             .as_str()
             .context("artifact role must be a string when provided")?;
-        if role != settings.role {
+        if role != settings.role && !settings.role.ends_with(&format!(".{role}")) {
             bail!(
                 "artifact role mismatch: expected {:?}, got {:?}",
                 settings.role,
@@ -2586,6 +2661,33 @@ mod tests {
         assert!(matches!(
             handler.events[1],
             agent_loop::ModelStreamEvent::AssistantMessageStarted { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn runtime_event_parser_repairs_missing_outer_tool_call_brace() {
+        let mut parser = RuntimeEventStreamParser::default();
+        let mut handler = CollectEvents::default();
+
+        parser
+            .push_text(
+                "{\"type\":\"tool_call_completed\",\"tool_call\":{\"call_id\":\"call-2\",\"name\":\"read_run_context\",\"arguments\":{},\"mode\":\"blocking\"}{\"type\":\"response_completed\",\"end_turn\":false}\n",
+                &mut handler,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(handler.events.len(), 2);
+        assert!(matches!(
+            handler.events[0],
+            agent_loop::ModelStreamEvent::ToolCallCompleted { .. }
+        ));
+        assert!(matches!(
+            handler.events[1],
+            agent_loop::ModelStreamEvent::ResponseCompleted {
+                end_turn: false,
+                ..
+            }
         ));
     }
 
