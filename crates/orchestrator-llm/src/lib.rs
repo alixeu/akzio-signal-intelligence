@@ -198,8 +198,9 @@ pub async fn run_rig_agent_loop_with_metrics(
         prompt.to_string(),
     );
     turn.phase = settings.phase;
+    turn.tools_disabled = role_disables_tools(&settings.role);
     turn.model_context = format!(
-        "role={}, output_mode={:?}, tickers={}\navailable_tools={}",
+        "role={}\noutput_mode={:?}\ntickers={}\navailable_tools={}",
         settings.role,
         settings.output_mode,
         settings.tickers.join(","),
@@ -290,8 +291,9 @@ pub async fn run_rig_agent_steer_loop_with_metrics(
         user_input,
     );
     turn.phase = settings.phase;
+    turn.tools_disabled = role_disables_tools(&settings.role);
     turn.model_context = format!(
-        "role={}, output_mode={:?}, tickers={}\navailable_tools={}",
+        "role={}\noutput_mode={:?}\ntickers={}\navailable_tools={}",
         settings.role,
         settings.output_mode,
         settings.tickers.join(","),
@@ -350,18 +352,9 @@ pub async fn run_rig_agent_steer_loop_with_metrics(
 }
 
 fn write_role_end_context(settings: &RigSettings, turn: &Turn) -> Result<()> {
-    let Some(run_dir) = settings
-        .tools
-        .as_ref()
-        .and_then(|tools| tools.run_dir.as_ref())
-    else {
+    let Some(path) = role_end_context_path(settings, turn) else {
         return Ok(());
     };
-    let phase = settings.phase.unwrap_or_default();
-    let path = run_dir.join(format!("phase{phase:02}")).join(format!(
-        "{}_end_context.jsonl",
-        safe_path_part(&settings.role)
-    ));
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -373,6 +366,19 @@ fn write_role_end_context(settings: &RigSettings, turn: &Turn) -> Result<()> {
     }
     fs::write(path, lines.join("\n"))?;
     Ok(())
+}
+
+fn role_end_context_path(settings: &RigSettings, turn: &Turn) -> Option<PathBuf> {
+    let run_dir = settings
+        .tools
+        .as_ref()
+        .and_then(|tools| tools.run_dir.as_ref())?;
+    let phase = settings.phase.unwrap_or_default();
+    Some(run_dir.join(format!("phase{phase:02}")).join(format!(
+        "{}_{}_end_context.jsonl",
+        safe_path_part(&settings.role),
+        safe_path_part(&turn.turn_id)
+    )))
 }
 
 pub fn append_debug_llm_record(settings: &RigSettings, record: Value) -> Result<()> {
@@ -468,11 +474,15 @@ fn web_run_runtime_for_settings(settings: &RigSettings) -> Option<tools::WebRunR
 }
 
 fn uses_native_web_search(settings: &RigSettings) -> bool {
-    settings.llm.native_web_search && settings.web_search.mode == WebSearchMode::Live
+    !role_disables_tools(&settings.role)
+        && settings.llm.native_web_search
+        && settings.web_search.mode == WebSearchMode::Live
 }
 
 fn uses_web_run_fallback(settings: &RigSettings) -> bool {
-    !uses_native_web_search(settings) && settings.web_search.mode == WebSearchMode::Live
+    !role_disables_tools(&settings.role)
+        && !uses_native_web_search(settings)
+        && settings.web_search.mode == WebSearchMode::Live
 }
 
 fn validate_fallback_web_search_runtime_config(settings: &RigSettings) -> Result<()> {
@@ -932,7 +942,9 @@ impl RuntimeEventStreamParser {
         let mut emitted = false;
         for value in stream {
             let value = value?;
-            let event = stream_event_from_value(value)?;
+            let Some(event) = stream_event_from_value(value)? else {
+                continue;
+            };
             self.parsed_any = true;
             emitted = true;
             handler.handle(event).await?;
@@ -984,12 +996,17 @@ impl RuntimeEventStreamParser {
                 Ok(value) => value,
                 Err(_) if emitted => break,
                 Err(error) => {
-                    return Err(error).with_context(|| {
-                        format!("failed to parse streamed runtime event line: {line}")
-                    });
+                    tracing::warn!(
+                        line_preview = &line[..line.len().min(200)],
+                        %error,
+                        "skipping malformed streamed event line"
+                    );
+                    break;
                 }
             };
-            let event = stream_event_from_value(value)?;
+            let Some(event) = stream_event_from_value(value)? else {
+                continue;
+            };
             self.parsed_any = true;
             emitted = true;
             handler.handle(event).await?;
@@ -998,39 +1015,39 @@ impl RuntimeEventStreamParser {
     }
 }
 
-fn stream_event_from_value(value: Value) -> Result<ModelStreamEvent> {
-    let event_type = value
-        .get("type")
-        .and_then(Value::as_str)
-        .context("streamed runtime event requires type")?;
+fn stream_event_from_value(value: Value) -> Result<Option<ModelStreamEvent>> {
+    let Some(event_type) = value.get("type").and_then(Value::as_str) else {
+        tracing::debug!(?value, "skipping streamed event without type field");
+        return Ok(None);
+    };
     match event_type {
-        "assistant_message_started" => Ok(ModelStreamEvent::AssistantMessageStarted {
+        "assistant_message_started" => Ok(Some(ModelStreamEvent::AssistantMessageStarted {
             item_id: stream_item_id(&value)?,
-        }),
-        "assistant_text_delta" => Ok(ModelStreamEvent::AssistantTextDelta {
+        })),
+        "assistant_text_delta" => Ok(Some(ModelStreamEvent::AssistantTextDelta {
             item_id: stream_item_id(&value)?,
             delta: value
                 .get("delta")
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string(),
-        }),
-        "assistant_message_completed" => Ok(ModelStreamEvent::AssistantMessageCompleted {
+        })),
+        "assistant_message_completed" => Ok(Some(ModelStreamEvent::AssistantMessageCompleted {
             item_id: stream_item_id(&value)?,
             turn_status: agent_loop::extract_turn_status(&value),
-        }),
-        "reasoning_summary_delta" => Ok(ModelStreamEvent::ReasoningSummaryDelta {
+        })),
+        "reasoning_summary_delta" => Ok(Some(ModelStreamEvent::ReasoningSummaryDelta {
             item_id: stream_item_id(&value)?,
             delta: value
                 .get("delta")
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string(),
-        }),
-        "reasoning_summary_completed" => Ok(ModelStreamEvent::ReasoningSummaryCompleted {
+        })),
+        "reasoning_summary_completed" => Ok(Some(ModelStreamEvent::ReasoningSummaryCompleted {
             item_id: stream_item_id(&value)?,
-        }),
-        "tool_call_completed" => Ok(ModelStreamEvent::ToolCallCompleted {
+        })),
+        "tool_call_completed" => Ok(Some(ModelStreamEvent::ToolCallCompleted {
             tool_call: serde_json::from_value(
                 value
                     .get("tool_call")
@@ -1038,16 +1055,22 @@ fn stream_event_from_value(value: Value) -> Result<ModelStreamEvent> {
                     .cloned()
                     .context("tool_call_completed requires tool_call")?,
             )?,
-        }),
-        "response_completed" => Ok(ModelStreamEvent::ResponseCompleted {
+        })),
+        "response_completed" => Ok(Some(ModelStreamEvent::ResponseCompleted {
             end_turn: value
                 .get("end_turn")
                 .or_else(|| value.get("endTurn"))
                 .and_then(Value::as_bool)
                 .unwrap_or(true),
             raw: value,
-        }),
-        other => bail!("unsupported streamed runtime event type {other:?}"),
+        })),
+        other => {
+            tracing::debug!(
+                event_type = other,
+                "skipping unrecognized streamed event type"
+            );
+            Ok(None)
+        }
     }
 }
 
@@ -1066,6 +1089,7 @@ fn parse_final_output(settings: &RigSettings, text: &str) -> Result<Value> {
             let value = extract_json_artifact(text)?;
             let value = normalize_research_artifact_value(value, &settings.tickers)
                 .context("failed to normalize research artifact JSON")?;
+            validate_optional_role(settings, &value)?;
             let artifact: ResearchArtifact =
                 serde_json::from_value(value).context("failed to parse research artifact JSON")?;
             validate_research_artifact(&artifact, &settings.tickers)
@@ -1081,8 +1105,13 @@ fn parse_final_output(settings: &RigSettings, text: &str) -> Result<Value> {
                     validate_json_artifact_contract(settings, &artifact)?;
                     Ok(artifact)
                 }
-                Err(error) if settings.role.starts_with("analyst.") => Err(error)
-                    .context("analyst role requires a JSON artifact; refusing text fallback"),
+                Err(error) if requires_structured_final_artifact(&settings.role) => Err(error)
+                    .with_context(|| {
+                        format!(
+                            "{role} requires a JSON artifact; refusing text fallback",
+                            role = settings.role
+                        )
+                    }),
                 Err(_) => Ok(text_fallback_artifact(settings, text)),
             }
         }
@@ -1115,13 +1144,77 @@ fn text_fallback_artifact(settings: &RigSettings, text: &str) -> Value {
     })
 }
 
+fn requires_structured_final_artifact(role: &str) -> bool {
+    role.starts_with("analyst.")
+        || matches!(
+            role,
+            "researcher.bull.initial"
+                | "researcher.bear.initial"
+                | "researcher.bull.interaction"
+                | "researcher.bear.interaction"
+                | "mediator.topic"
+                | "mediator.topic_controller"
+                | "trader"
+                | "risk.aggressive"
+                | "risk.neutral"
+                | "risk.conservative"
+                | "allocation.manager"
+        )
+}
+
 fn validate_json_artifact_contract(settings: &RigSettings, artifact: &Value) -> Result<()> {
-    if !settings.role.starts_with("analyst.") {
-        return Ok(());
+    if settings.role.starts_with("analyst.") {
+        return validate_analyst_artifact_contract(settings, artifact);
+    }
+    match settings.role.as_str() {
+        "researcher.bull.initial" | "researcher.bear.initial" => {
+            validate_seed_packet_contract(settings, artifact)
+        }
+        "researcher.bull.interaction" | "researcher.bear.interaction" => {
+            validate_interaction_packet_contract(settings, artifact)
+        }
+        "mediator.topic_controller" => validate_controller_packet_contract(settings, artifact),
+        "mediator.topic" => validate_topic_generation_contract(settings, artifact),
+        "trader" => validate_trade_intent_contract(settings, artifact),
+        "risk.aggressive" | "risk.neutral" | "risk.conservative" => {
+            validate_risk_constraints_contract(settings, artifact)
+        }
+        "allocation.manager" => validate_allocation_artifact_contract(settings, artifact),
+        _ => Ok(()),
+    }
+}
+
+fn validate_analyst_artifact_contract(settings: &RigSettings, artifact: &Value) -> Result<()> {
+    let actual_role = artifact
+        .get("role")
+        .and_then(Value::as_str)
+        .context("analyst artifact requires role")?;
+    if actual_role != settings.role {
+        bail!(
+            "analyst artifact role mismatch: expected {:?}, got {:?}",
+            settings.role,
+            actual_role
+        );
     }
     let Some(per_ticker) = artifact.get("per_ticker").and_then(Value::as_object) else {
         bail!("analyst artifact requires per_ticker object");
     };
+    let expected = settings
+        .tickers
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let actual = per_ticker
+        .keys()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    if actual != expected {
+        bail!(
+            "analyst artifact per_ticker keys mismatch: expected {:?}, got {:?}",
+            expected,
+            actual
+        );
+    }
     for ticker in &settings.tickers {
         let Some(payload) = per_ticker.get(ticker) else {
             bail!("analyst artifact missing per_ticker.{ticker}");
@@ -1132,6 +1225,309 @@ fn validate_json_artifact_contract(settings: &RigSettings, artifact: &Value) -> 
             .map_err(|error| anyhow::anyhow!("analyst per_ticker.{ticker}: {error}"))?;
     }
     Ok(())
+}
+
+fn validate_seed_packet_contract(settings: &RigSettings, artifact: &Value) -> Result<()> {
+    require_exact_role(settings, artifact)?;
+    let expected_type = if settings.role.contains("bull") {
+        "bull_seed_packet"
+    } else {
+        "bear_seed_packet"
+    };
+    require_exact_string(artifact, "artifact_type", expected_type)?;
+    require_non_empty_string(artifact, "topic_id")?;
+    let claims = require_array(artifact, "claims")?;
+    if claims.is_empty() {
+        bail!("initial seed packet claims must not be empty");
+    }
+    let constraint_field = if settings.role.contains("bull") {
+        "known_bear_constraint"
+    } else {
+        "known_bull_constraint"
+    };
+    for (index, claim) in claims.iter().enumerate() {
+        let claim = claim
+            .as_object()
+            .with_context(|| format!("initial seed claim {index} must be an object"))?;
+        let claim = Value::Object(claim.clone());
+        require_non_empty_string(&claim, "claim_id")?;
+        require_non_empty_string(&claim, "decision_hinge")?;
+        require_non_empty_string(&claim, "claim")?;
+        require_array(&claim, "evidence_refs")?;
+        require_number_in_range(&claim, "confidence", 0.0, 1.0)?;
+        require_non_empty_string(&claim, constraint_field)?;
+        if claim
+            .get("needs_mediator_check")
+            .and_then(Value::as_bool)
+            .is_none()
+        {
+            bail!("initial seed claim requires needs_mediator_check boolean");
+        }
+    }
+    require_non_empty_string(artifact, "summary")?;
+    require_object(artifact, "reducer_checks")?;
+    Ok(())
+}
+
+fn validate_interaction_packet_contract(settings: &RigSettings, artifact: &Value) -> Result<()> {
+    require_exact_role(settings, artifact)?;
+    let expected_type = if settings.role.contains("bull") {
+        "bull_debate_packet"
+    } else {
+        "bear_debate_packet"
+    };
+    require_exact_string(artifact, "artifact_type", expected_type)?;
+    require_non_empty_string(artifact, "topic_id")?;
+    require_non_empty_string(artifact, "reply_to")?;
+    let stance = require_non_empty_string(artifact, "stance")?;
+    if !matches!(
+        stance,
+        "accept" | "rebut" | "downgrade" | "needs_evidence" | "no_new_info"
+    ) {
+        bail!("interaction packet has invalid stance {stance:?}");
+    }
+    require_non_empty_string(artifact, "claim")?;
+    require_array(artifact, "evidence_refs")?;
+    require_number_in_range(artifact, "confidence", 0.0, 1.0)?;
+    require_non_empty_string(artifact, "send_to_mediator")?;
+    require_array(artifact, "blocked_ack")?;
+    if stance != "no_new_info" {
+        require_object(artifact, "steelman")?;
+    }
+    Ok(())
+}
+
+fn validate_controller_packet_contract(settings: &RigSettings, artifact: &Value) -> Result<()> {
+    require_exact_role(settings, artifact)?;
+    require_exact_string(artifact, "artifact_type", "topic_controller_packet")?;
+    require_non_empty_string(artifact, "topic_id")?;
+    require_array(artifact, "claim_ledger")?;
+    require_array(artifact, "accepted_for_opponent")?;
+    require_array(artifact, "rejected_to_origin")?;
+    require_array(artifact, "blocked_claims")?;
+    require_array(artifact, "agreed_facts")?;
+    let decision_hinges = require_array(artifact, "decision_hinges")?;
+    for (index, hinge) in decision_hinges.iter().enumerate() {
+        require_non_empty_string(hinge, "hinge")
+            .with_context(|| format!("decision_hinges[{index}] is invalid"))?;
+        let refs = require_array(hinge, "evidence_refs")?;
+        if refs.is_empty() {
+            bail!("decision_hinges[{index}].evidence_refs must not be empty");
+        }
+    }
+    require_number_in_range(artifact, "info_gain_score", 0.0, 1.0)?;
+    require_object(artifact, "next_steers")?;
+    require_object(artifact, "topic_summary_delta")?;
+    let soft_control = require_object(artifact, "soft_control")?;
+    if soft_control
+        .get("should_continue")
+        .and_then(Value::as_bool)
+        .is_none()
+    {
+        bail!("controller packet requires soft_control.should_continue boolean");
+    }
+    if soft_control
+        .get("stop_reason")
+        .and_then(Value::as_str)
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        bail!("controller packet requires soft_control.stop_reason string");
+    }
+    require_object(artifact, "reducer_checks")?;
+    Ok(())
+}
+
+fn validate_topic_generation_contract(settings: &RigSettings, artifact: &Value) -> Result<()> {
+    require_exact_role(settings, artifact)?;
+    require_exact_string(
+        artifact,
+        "artifact_type",
+        "phase2_topic_generation_artifact",
+    )?;
+    require_array(artifact, "topics")?;
+    require_non_empty_string(artifact, "summary")?;
+    require_object(artifact, "reducer_checks")?;
+    Ok(())
+}
+
+fn validate_allocation_artifact_contract(settings: &RigSettings, artifact: &Value) -> Result<()> {
+    validate_optional_role(settings, artifact)?;
+    let weights = require_object(artifact, "weights")?;
+    if weights.is_empty() {
+        bail!("allocation artifact weights must not be empty");
+    }
+    let mut total_weight = 0.0;
+    let mut equity_weight = 0.0;
+    for (ticker, entry) in weights {
+        let weight = entry
+            .as_f64()
+            .or_else(|| entry.get("weight").and_then(Value::as_f64))
+            .with_context(|| format!("allocation weight for {ticker} must be numeric"))?;
+        if !(0.0..=1.0).contains(&weight) {
+            bail!("allocation weight for {ticker} must be in 0..1");
+        }
+        total_weight += weight;
+        if ticker != "cash_hedge" {
+            equity_weight += weight;
+        }
+    }
+    if (total_weight - 1.0).abs() > 0.03 {
+        bail!("allocation weights must sum to approximately 1.0 (got {total_weight})");
+    }
+    let total_equity = require_number_in_range(artifact, "total_equity_exposure", 0.0, 1.0)?;
+    if (total_equity - equity_weight).abs() > 0.03 {
+        bail!(
+            "total_equity_exposure {total_equity} does not match non-cash weights {equity_weight}"
+        );
+    }
+    require_non_empty_string(artifact, "vix_regime")?;
+    require_non_empty_string(artifact, "correlation_note")?;
+    require_non_empty_string(artifact, "summary")?;
+    Ok(())
+}
+
+fn validate_trade_intent_contract(settings: &RigSettings, artifact: &Value) -> Result<()> {
+    validate_optional_role(settings, artifact)?;
+    let action = require_non_empty_string(artifact, "action")?;
+    if !matches!(action, "Buy" | "Sell" | "Hold") {
+        bail!("trade intent action must be Buy, Sell, or Hold");
+    }
+    let position_size = require_non_empty_string(artifact, "position_size")?;
+    let position_cap = parse_position_upper_bound(position_size)
+        .context("trade intent position_size must be a percentage or percentage range")?;
+    if action == "Hold" && position_cap > f64::EPSILON {
+        bail!("Hold trade intent must use position_size=0%");
+    }
+    require_non_empty_string(artifact, "rationale")?;
+    for field in ["entry_price", "stop_loss"] {
+        if let Some(value) = artifact.get(field) {
+            if !value.is_null() && !value.is_string() {
+                bail!("trade intent {field} must be a string or null");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_position_upper_bound(value: &str) -> Option<f64> {
+    value
+        .split(['-', '–', '—'])
+        .filter_map(|part| {
+            part.trim()
+                .strip_suffix('%')
+                .and_then(|percent| percent.trim().parse::<f64>().ok())
+                .map(|percent| (percent / 100.0).clamp(0.0, 1.0))
+        })
+        .max_by(f64::total_cmp)
+}
+
+fn validate_risk_constraints_contract(settings: &RigSettings, artifact: &Value) -> Result<()> {
+    validate_optional_role(settings, artifact)?;
+    let stance = require_non_empty_string(artifact, "stance")?;
+    let expected_stance = settings.role.strip_prefix("risk.").unwrap_or_default();
+    if stance != expected_stance {
+        bail!("risk stance mismatch: expected {expected_stance:?}, got {stance:?}");
+    }
+    require_non_empty_string(artifact, "argument")?;
+    require_non_empty_string(artifact, "recommended_adjustment")?;
+    let stop_type = require_non_empty_string(artifact, "stop_type")?;
+    if !matches!(
+        stop_type,
+        "none" | "tight" | "trailing" | "event_based" | "time_based"
+    ) {
+        bail!("risk stop_type is invalid: {stop_type:?}");
+    }
+    require_number_in_range(artifact, "max_drawdown_pct", 0.0, 1.0)?;
+    require_number_in_range(artifact, "position_cap_pct", 0.0, 1.0)?;
+    require_number_in_range(artifact, "constraint_confidence", 0.0, 1.0)?;
+    for field in [
+        "rebalance_trigger",
+        "risk_off_trigger",
+        "review_window",
+        "cash_hedge_recommendation",
+    ] {
+        require_non_empty_string(artifact, field)?;
+    }
+    Ok(())
+}
+
+fn validate_optional_role(settings: &RigSettings, artifact: &Value) -> Result<()> {
+    if let Some(role) = artifact.get("role") {
+        let role = role
+            .as_str()
+            .context("artifact role must be a string when provided")?;
+        if role != settings.role {
+            bail!(
+                "artifact role mismatch: expected {:?}, got {:?}",
+                settings.role,
+                role
+            );
+        }
+    }
+    Ok(())
+}
+
+fn require_exact_role<'a>(settings: &RigSettings, artifact: &'a Value) -> Result<&'a str> {
+    let role = artifact
+        .get("role")
+        .and_then(Value::as_str)
+        .context("artifact requires role")?;
+    if role != settings.role {
+        bail!(
+            "artifact role mismatch: expected {:?}, got {:?}",
+            settings.role,
+            role
+        );
+    }
+    Ok(role)
+}
+
+fn require_exact_string<'a>(artifact: &'a Value, field: &str, expected: &str) -> Result<&'a str> {
+    let actual = require_non_empty_string(artifact, field)?;
+    if actual != expected {
+        bail!(
+            "artifact {field} mismatch: expected {:?}, got {:?}",
+            expected,
+            actual
+        );
+    }
+    Ok(actual)
+}
+
+fn require_non_empty_string<'a>(artifact: &'a Value, field: &str) -> Result<&'a str> {
+    artifact
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .with_context(|| format!("artifact requires non-empty {field} string"))
+}
+
+fn require_array<'a>(artifact: &'a Value, field: &str) -> Result<&'a Vec<Value>> {
+    artifact
+        .get(field)
+        .and_then(Value::as_array)
+        .with_context(|| format!("artifact requires {field} array"))
+}
+
+fn require_object<'a>(
+    artifact: &'a Value,
+    field: &str,
+) -> Result<&'a serde_json::Map<String, Value>> {
+    artifact
+        .get(field)
+        .and_then(Value::as_object)
+        .with_context(|| format!("artifact requires {field} object"))
+}
+
+fn require_number_in_range(artifact: &Value, field: &str, min: f64, max: f64) -> Result<f64> {
+    let value = artifact
+        .get(field)
+        .and_then(Value::as_f64)
+        .with_context(|| format!("artifact requires numeric {field}"))?;
+    if !value.is_finite() || !(min..=max).contains(&value) {
+        bail!("artifact {field} must be within {min}..={max}");
+    }
+    Ok(value)
 }
 
 fn parse_json_object_artifact(text: &str) -> Result<Value> {
@@ -1342,6 +1738,9 @@ fn add_openai_responses_native_web_search(params: Option<Value>) -> Value {
 }
 
 fn configured_tool_names(settings: &RigSettings) -> Vec<&str> {
+    if role_disables_tools(&settings.role) {
+        return Vec::new();
+    }
     let mut names = Vec::new();
     if settings.llm.think_tool {
         names.push("think");
@@ -1351,6 +1750,10 @@ fn configured_tool_names(settings: &RigSettings) -> Vec<&str> {
         names.push(tools::WEB_RUN_TOOL_NAME);
     }
     names
+}
+
+fn role_disables_tools(role: &str) -> bool {
+    matches!(role, "manager.research" | "allocation.manager")
 }
 
 fn validate_tool_name(name: &str) -> Result<()> {
@@ -1444,19 +1847,32 @@ fn mock_trader_artifact() -> Value {
         "action": "Hold",
         "entry_price": null,
         "stop_loss": null,
-        "position_size": "0%-30%",
+        "position_size": "0%",
         "rationale": "Mock trader plan based on neutral research."
     })
 }
 
 fn mock_risk_artifact(role: &str) -> Value {
     let stance = role.strip_prefix("risk.").unwrap_or("neutral");
+    let position_cap_pct = match stance {
+        "aggressive" => 0.5,
+        "conservative" => 0.15,
+        _ => 0.3,
+    };
     serde_json::json!({
         "id": role,
         "role": role,
         "stance": stance,
         "argument": format!("Mock {stance} risk argument."),
-        "recommended_adjustment": "No change in mock mode."
+        "recommended_adjustment": "No change in mock mode.",
+        "stop_type": "event_based",
+        "max_drawdown_pct": 0.1,
+        "position_cap_pct": position_cap_pct,
+        "rebalance_trigger": "Mock rebalance trigger.",
+        "risk_off_trigger": "Mock risk-off trigger.",
+        "review_window": "1d",
+        "cash_hedge_recommendation": "Maintain cash reserve.",
+        "constraint_confidence": 0.8
     })
 }
 
@@ -1653,6 +2069,41 @@ mod tests {
     }
 
     #[test]
+    fn role_end_context_paths_do_not_collide_for_parallel_turns() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut settings = base_settings(LlmRoute::Responses);
+        settings.phase = Some(25);
+        settings.role = "researcher.bull.interaction".to_string();
+        settings.tools = Some(tools::ExternalToolConfig {
+            project_root: temp.path().to_path_buf(),
+            db_path: None,
+            run_dir: Some(temp.path().to_path_buf()),
+            run_id: None,
+            tickers: vec!["QQQ".to_string()],
+        });
+        let first = agent_loop::Turn::new(
+            "turn-topic-a",
+            "run:topic-a",
+            "run",
+            "researcher.bull.interaction",
+            "",
+        );
+        let second = agent_loop::Turn::new(
+            "turn-topic-b",
+            "run:topic-b",
+            "run",
+            "researcher.bull.interaction",
+            "",
+        );
+
+        let first_path = super::role_end_context_path(&settings, &first).unwrap();
+        let second_path = super::role_end_context_path(&settings, &second).unwrap();
+
+        assert_ne!(first_path, second_path);
+        assert!(first_path.ends_with("researcher_bull_interaction_turn_topic_a_end_context.jsonl"));
+    }
+
+    #[test]
     fn append_debug_llm_record_writes_jsonl_under_outputs_debug() {
         let temp = tempfile::tempdir().unwrap();
         let mut settings = base_settings(LlmRoute::Responses);
@@ -1726,6 +2177,301 @@ mod tests {
     }
 
     #[test]
+    fn parse_final_output_rejects_analyst_role_mismatch() {
+        let mut settings = base_settings(LlmRoute::Responses);
+        settings.role = "analyst.technical".to_string();
+        settings.tickers = vec!["QQQ".to_string()];
+        settings.output_mode = OutputMode::JsonArtifact;
+
+        let text = r#"{"id":"analyst.youtube","role":"analyst.youtube","per_ticker":{"QQQ":{"direction":"bullish","confidence":0.7,"report":"ok"}}}"#;
+        let error = super::parse_final_output(&settings, text).unwrap_err();
+
+        assert!(
+            error.to_string().contains("role"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn parse_final_output_rejects_analyst_ticker_substitution_without_repairing_it() {
+        let mut settings = base_settings(LlmRoute::Responses);
+        settings.role = "analyst.technical".to_string();
+        settings.tickers = vec!["QQQ".to_string(), "SOXX".to_string()];
+        settings.output_mode = OutputMode::JsonArtifact;
+
+        let text = r#"{
+            "id":"analyst.technical",
+            "role":"analyst.technical",
+            "per_ticker":{
+                "QQQ":{"direction":"bullish","confidence":0.7,"report":"ok"},
+                "TQQQ":{"direction":"bullish","confidence":0.7,"report":"wrong ticker"}
+            }
+        }"#;
+        let error = super::parse_final_output(&settings, text).unwrap_err();
+
+        assert!(
+            error.to_string().contains("per_ticker keys mismatch"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn parse_final_output_rejects_non_json_allocation_artifact() {
+        let mut settings = base_settings(LlmRoute::Responses);
+        settings.role = "allocation.manager".to_string();
+        settings.tickers = vec!["QQQ".to_string()];
+        settings.output_mode = OutputMode::JsonArtifact;
+
+        let text = "The allocation review is complete, but this response deliberately contains no JSON artifact. It repeats enough prose to be treated as a terminal answer by the agent loop rather than a short action note. The runtime must reject this execution-critical response instead of converting it into a degraded text artifact that downstream allocation normalization could misinterpret.";
+        let error = super::parse_final_output(&settings, text).unwrap_err();
+
+        assert!(
+            error.to_string().contains("allocation.manager")
+                || error.to_string().contains("JSON artifact"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn parse_final_output_rejects_wrapped_allocation_artifact() {
+        let mut settings = base_settings(LlmRoute::Responses);
+        settings.role = "allocation.manager".to_string();
+        settings.tickers = vec!["QQQ".to_string()];
+        settings.output_mode = OutputMode::JsonArtifact;
+
+        let text = r#"{
+            "id":"allocation.manager",
+            "role":"allocation.manager",
+            "report":{
+                "weights":{"QQQ":{"weight":0.0},"cash_hedge":{"weight":1.0}},
+                "total_equity_exposure":0.0,
+                "vix_regime":"normal",
+                "correlation_note":"none",
+                "summary":"cash"
+            }
+        }"#;
+        let error = super::parse_final_output(&settings, text).unwrap_err();
+
+        assert!(
+            error.to_string().contains("weights"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn parse_final_output_accepts_direct_allocation_without_runtime_identity() {
+        let mut settings = base_settings(LlmRoute::Responses);
+        settings.role = "allocation.manager".to_string();
+        settings.tickers = vec!["QQQ".to_string()];
+        settings.output_mode = OutputMode::JsonArtifact;
+
+        let text = r#"{
+            "weights":{"QQQ":{"weight":0.0},"cash_hedge":{"weight":1.0}},
+            "total_equity_exposure":0.0,
+            "vix_regime":"normal",
+            "correlation_note":"none",
+            "summary":"cash"
+        }"#;
+        let artifact = super::parse_final_output(&settings, text).unwrap();
+
+        assert_eq!(artifact["total_equity_exposure"], 0.0);
+        assert!(artifact.get("role").is_none());
+    }
+
+    #[test]
+    fn parse_final_output_rejects_allocation_weight_sum_mismatch() {
+        let mut settings = base_settings(LlmRoute::Responses);
+        settings.role = "allocation.manager".to_string();
+        settings.tickers = vec!["QQQ".to_string()];
+        settings.output_mode = OutputMode::JsonArtifact;
+
+        let text = r#"{
+            "weights":{"QQQ":{"weight":0.10}},
+            "total_equity_exposure":0.10,
+            "vix_regime":"normal",
+            "correlation_note":"none",
+            "summary":"incomplete"
+        }"#;
+        let error = super::parse_final_output(&settings, text).unwrap_err();
+
+        assert!(
+            error.to_string().contains("sum"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn parse_final_output_rejects_hold_trade_intent_with_positive_position() {
+        let mut settings = base_settings(LlmRoute::Responses);
+        settings.role = "trader".to_string();
+        settings.output_mode = OutputMode::JsonArtifact;
+
+        let text = r#"{
+            "action":"Hold",
+            "entry_price":null,
+            "stop_loss":null,
+            "position_size":"0%-30%",
+            "rationale":"observe"
+        }"#;
+        let error = super::parse_final_output(&settings, text).unwrap_err();
+
+        assert!(
+            error.to_string().contains("Hold"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn parse_final_output_rejects_incomplete_risk_constraints() {
+        let mut settings = base_settings(LlmRoute::Responses);
+        settings.role = "risk.conservative".to_string();
+        settings.output_mode = OutputMode::JsonArtifact;
+
+        let text = r#"{
+            "stance":"conservative",
+            "argument":"Protect capital.",
+            "recommended_adjustment":"Reduce size."
+        }"#;
+        let error = super::parse_final_output(&settings, text).unwrap_err();
+
+        assert!(
+            error.to_string().contains("position_cap_pct")
+                || error.to_string().contains("max_drawdown_pct")
+                || error.to_string().contains("stop_type"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn parse_final_output_rejects_interaction_packet_from_another_role() {
+        let mut settings = base_settings(LlmRoute::Responses);
+        settings.role = "researcher.bull.interaction".to_string();
+        settings.output_mode = OutputMode::JsonArtifact;
+
+        let text = r#"{
+            "role":"mediator.topic_controller",
+            "artifact_type":"topic_controller_packet",
+            "topic_id":"qqq-trend",
+            "claim_ledger":[],
+            "accepted_for_opponent":[],
+            "rejected_to_origin":[],
+            "blocked_claims":[],
+            "next_steers":{},
+            "topic_summary_delta":{},
+            "soft_control":{"should_continue":false,"stop_reason":"done"},
+            "reducer_checks":{}
+        }"#;
+        let error = super::parse_final_output(&settings, text).unwrap_err();
+
+        assert!(
+            error.to_string().contains("role mismatch"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn parse_final_output_rejects_non_json_initial_debate_packet() {
+        let mut settings = base_settings(LlmRoute::Responses);
+        settings.role = "researcher.bull.initial".to_string();
+        settings.output_mode = OutputMode::JsonArtifact;
+
+        let text = "The bullish seed analysis is complete, but this terminal response contains no JSON packet and therefore cannot be consumed by the debate reducer. The runtime must reject it instead of manufacturing a generic degraded artifact.";
+        let error = super::parse_final_output(&settings, text).unwrap_err();
+
+        assert!(
+            error.to_string().contains("researcher.bull.initial")
+                || error.to_string().contains("JSON artifact"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn parse_final_output_rejects_initial_packet_from_another_role() {
+        let mut settings = base_settings(LlmRoute::Responses);
+        settings.role = "researcher.bear.initial".to_string();
+        settings.output_mode = OutputMode::JsonArtifact;
+
+        let text = r#"{
+            "role":"researcher.bull.initial",
+            "artifact_type":"bull_seed_packet",
+            "topic_id":"qqq-trend",
+            "claims":[],
+            "summary":"wrong side",
+            "reducer_checks":{}
+        }"#;
+        let error = super::parse_final_output(&settings, text).unwrap_err();
+
+        assert!(
+            error.to_string().contains("role mismatch"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn parse_final_output_rejects_incomplete_initial_claim() {
+        let mut settings = base_settings(LlmRoute::Responses);
+        settings.role = "researcher.bull.initial".to_string();
+        settings.output_mode = OutputMode::JsonArtifact;
+
+        let text = r#"{
+            "role":"researcher.bull.initial",
+            "artifact_type":"bull_seed_packet",
+            "topic_id":"qqq-trend",
+            "claims":[{"claim":"upside"}],
+            "summary":"one claim",
+            "reducer_checks":{}
+        }"#;
+        let error = super::parse_final_output(&settings, text).unwrap_err();
+
+        assert!(
+            error.to_string().contains("claim_id")
+                || error.to_string().contains("initial seed claim"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn parse_final_output_accepts_role_specific_initial_packets() {
+        for (role, artifact_type, constraint_field) in [
+            (
+                "researcher.bull.initial",
+                "bull_seed_packet",
+                "known_bear_constraint",
+            ),
+            (
+                "researcher.bear.initial",
+                "bear_seed_packet",
+                "known_bull_constraint",
+            ),
+        ] {
+            let mut settings = base_settings(LlmRoute::Responses);
+            settings.role = role.to_string();
+            settings.output_mode = OutputMode::JsonArtifact;
+            let packet = json!({
+                "role": role,
+                "artifact_type": artifact_type,
+                "topic_id": "qqq-trend",
+                "claims": [{
+                    "claim_id": "claim-1",
+                    "decision_hinge": "trend confirmation",
+                    "claim": "directional claim",
+                    "evidence_refs": ["phase1.5:qqq"],
+                    "confidence": 0.65,
+                    (constraint_field): "opposing constraint",
+                    "needs_mediator_check": true
+                }],
+                "summary": "one evidence-backed seed claim",
+                "reducer_checks": {}
+            });
+
+            let artifact = super::parse_final_output(&settings, &packet.to_string())
+                .expect("valid seed packet");
+            assert_eq!(artifact["role"], json!(role));
+            assert_eq!(artifact["artifact_type"], json!(artifact_type));
+        }
+    }
+
+    #[test]
     fn parse_final_output_accepts_per_ticker_only_research_envelope() {
         let mut settings = base_settings(LlmRoute::Responses);
         settings.role = "manager.research".to_string();
@@ -1733,15 +2479,12 @@ mod tests {
         settings.output_mode = OutputMode::ResearchArtifact;
 
         let text = r#"{
-            "id":"research-manager",
-            "role":"research_manager",
-            "status":"completed",
-            "report":"compressed evidence only",
             "per_ticker":{
                 "QQQ":{
                     "rating":"Overweight",
                     "long_probability":0.57,
                     "short_probability":0.43,
+                    "confidence_basis":"directional_evidence",
                     "plan":["Verify volume","Watch break"],
                     "probability_rationale":"Near base after discount."
                 },
@@ -1749,6 +2492,8 @@ mod tests {
                     "rating":"Hold",
                     "long_probability":0.51,
                     "short_probability":0.49,
+                    "confidence_basis":"data_insufficient",
+                    "hold_reason":"evidence_insufficient",
                     "plan":"Wait for confirmation",
                     "probability_rationale":"Insufficient SOXX-specific evidence."
                 }
@@ -1761,6 +2506,35 @@ mod tests {
         assert_eq!(artifact["short_probability"], json!(0.43));
         assert!(artifact["plan"].as_str().unwrap().contains("Verify volume"));
         assert_eq!(artifact["per_ticker"]["SOXX"]["rating"], json!("Hold"));
+    }
+
+    #[test]
+    fn parse_final_output_rejects_research_artifact_from_another_role() {
+        let mut settings = base_settings(LlmRoute::Responses);
+        settings.role = "manager.research".to_string();
+        settings.tickers = vec!["QQQ".to_string()];
+        settings.output_mode = OutputMode::ResearchArtifact;
+
+        let text = r#"{
+            "role":"analyst.technical",
+            "rating":"Hold",
+            "long_probability":0.5,
+            "short_probability":0.5,
+            "confidence_basis":"evidence_balanced",
+            "hold_reason":"evidence_balanced",
+            "plan":"Wait.",
+            "probability_rationale":"Balanced evidence.",
+            "per_ticker":{"QQQ":{
+                "rating":"Hold",
+                "long_probability":0.5,
+                "short_probability":0.5,
+                "confidence_basis":"evidence_balanced",
+                "hold_reason":"evidence_balanced"
+            }}
+        }"#;
+
+        let error = super::parse_final_output(&settings, text).unwrap_err();
+        assert!(error.to_string().contains("role mismatch"));
     }
 
     #[test]
@@ -2013,6 +2787,7 @@ mod tests {
     #[test]
     fn native_web_search_adds_provider_tool_to_additional_params() {
         let mut settings = base_settings(LlmRoute::Responses);
+        settings.role = "analyst.news_macro".to_string();
         settings.llm.base_url = Some("https://llm.example.com/v1".to_string());
         settings.llm.api_key = Some("test-key".to_string());
         settings.llm.native_web_search = true;
@@ -2041,6 +2816,7 @@ mod tests {
     #[test]
     fn openai_compatible_responses_uses_responses_reasoning_and_native_web_search() {
         let mut settings = base_settings(LlmRoute::Responses);
+        settings.role = "analyst.news_macro".to_string();
         settings.llm.base_url = Some("https://llm.example.com/v1".to_string());
         settings.llm.api_key = Some("test-key".to_string());
         settings.llm.native_web_search = true;
@@ -2059,6 +2835,7 @@ mod tests {
     #[test]
     fn think_tool_registration_is_role_controlled() {
         let mut settings = base_settings(LlmRoute::Responses);
+        settings.role = "analyst.technical".to_string();
         settings.llm.base_url = Some("https://llm.example.com/v1".to_string());
         settings.llm.api_key = Some("test-key".to_string());
         settings.llm.tools = vec!["run_technical_indicators".to_string()];
@@ -2075,8 +2852,29 @@ mod tests {
     }
 
     #[test]
+    fn execution_roles_disable_loop_and_native_tools() {
+        for role in ["manager.research", "allocation.manager"] {
+            let mut settings = base_settings(LlmRoute::Responses);
+            settings.role = role.to_string();
+            settings.llm.base_url = Some("https://llm.example.com/v1".to_string());
+            settings.llm.api_key = Some("test-key".to_string());
+            settings.llm.tools = vec!["read_run_context".to_string()];
+            settings.llm.native_web_search = true;
+            settings.web_search.mode = WebSearchMode::Live;
+
+            assert!(super::configured_tool_names(&settings).is_empty());
+            assert_eq!(
+                super::additional_params(&settings),
+                Some(json!({"reasoning": {"effort": "low"}}))
+            );
+            assert!(super::web_run_runtime_for_settings(&settings).is_none());
+        }
+    }
+
+    #[test]
     fn web_run_tool_registration_follows_web_search_mode() {
         let mut settings = base_settings(LlmRoute::Responses);
+        settings.role = "analyst.news_macro".to_string();
         settings.llm.base_url = Some("https://llm.example.com/v1".to_string());
         settings.llm.api_key = Some("test-key".to_string());
         settings.llm.think_tool = false;
@@ -2093,6 +2891,7 @@ mod tests {
     #[test]
     fn native_web_search_suppresses_web_run_fallback_tool() {
         let mut settings = base_settings(LlmRoute::Responses);
+        settings.role = "analyst.news_macro".to_string();
         settings.llm.base_url = Some("https://llm.example.com/v1".to_string());
         settings.llm.api_key = Some("test-key".to_string());
         settings.llm.think_tool = false;

@@ -53,6 +53,119 @@ fn common_component(prompt_path: Option<&std::path::Path>, file_name: &str) -> R
     }
 }
 
+fn compact_evidence(value: &Value) -> Value {
+    const FIELDS: &[&str] = &[
+        "claim",
+        "evidence_type",
+        "source",
+        "timestamp",
+        "source_tier",
+        "first_source",
+        "is_derivative_repost",
+        "evidence_age",
+        "source_confidence",
+    ];
+    let Some(object) = value.as_object() else {
+        return Value::Null;
+    };
+    Value::Object(
+        FIELDS
+            .iter()
+            .filter_map(|field| {
+                object
+                    .get(*field)
+                    .map(|value| ((*field).to_string(), value.clone()))
+            })
+            .collect(),
+    )
+}
+
+fn compact_role_summary(value: &Value) -> Value {
+    let evidence = value
+        .get("key_evidence")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .take(3)
+        .map(compact_evidence)
+        .collect::<Vec<_>>();
+    json!({
+        "role": value.get("role").cloned().unwrap_or(Value::Null),
+        "status": value.get("status").cloned().unwrap_or(Value::Null),
+        "stance": value.get("stance").cloned().unwrap_or(Value::Null),
+        "confidence": value.get("confidence").cloned().unwrap_or(Value::Null),
+        "key_evidence": evidence,
+        "evidence_type_summary": value.get("evidence_type_summary").cloned().unwrap_or(Value::Null),
+        "weaknesses": value.get("weaknesses").cloned().unwrap_or_else(|| json!([])),
+        "source_node_ids": value.get("source_node_ids").cloned().unwrap_or_else(|| json!([]))
+    })
+}
+
+fn compact_phase1_ticker(value: &Value) -> Value {
+    let role_summaries = value
+        .get("role_summaries")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(compact_role_summary)
+        .collect::<Vec<_>>();
+    json!({
+        "weighted_probability_base": value.get("weighted_probability_base").cloned().unwrap_or(Value::Null),
+        "evidence_quality": value.get("evidence_quality").cloned().unwrap_or(Value::Null),
+        "role_summaries": role_summaries,
+        "cross_analyst_conflicts": value.get("cross_analyst_conflicts").cloned().unwrap_or_else(|| json!([])),
+        "decision_hinges": value.get("decision_hinges").cloned().unwrap_or_else(|| json!([])),
+        "missing_evidence": value.get("missing_evidence").cloned().unwrap_or_else(|| json!([])),
+        "independent_signals": value.get("independent_signals").cloned().unwrap_or_else(|| json!([])),
+        "duplicate_signals": value.get("duplicate_signals").cloned().unwrap_or_else(|| json!([])),
+        "state_summary": value.get("state_summary").cloned().unwrap_or(Value::Null)
+    })
+}
+
+fn compact_phase1_per_ticker(phase1: &Value) -> Value {
+    Value::Object(
+        phase1
+            .get("per_ticker")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flatten()
+            .map(|(ticker, value)| (ticker.clone(), compact_phase1_ticker(value)))
+            .collect(),
+    )
+}
+
+fn phase3_context(state: &Value) -> Value {
+    let phase1 = state
+        .get("phase1_state_artifact")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let debate = state
+        .get("debate_state_artifact")
+        .cloned()
+        .unwrap_or(Value::Null);
+
+    json!({
+        "phase1": {
+            "status": phase1.get("status").cloned().unwrap_or(Value::Null),
+            "evidence_quality": phase1.get("evidence_quality").cloned().unwrap_or(Value::Null),
+            "weighted_probability_base": phase1.get("weighted_probability_base").cloned().unwrap_or(Value::Null),
+            "per_ticker": compact_phase1_per_ticker(&phase1),
+            "reducer_checks": phase1.get("reducer_checks").cloned().unwrap_or_else(|| json!({}))
+        },
+        "phase2_5": {
+            "status": debate.get("status").cloned().unwrap_or(Value::Null),
+            "convergence_status": debate.get("convergence_status").cloned().unwrap_or(Value::Null),
+            "reason": debate.get("reason").cloned().unwrap_or(Value::Null),
+            "topic_briefs": debate.get("topic_briefs").cloned().unwrap_or_else(|| json!([])),
+            "per_ticker": debate.get("per_ticker").cloned().unwrap_or_else(|| json!({})),
+            "reducer_checks": debate.get("reducer_checks").cloned().unwrap_or_else(|| json!({}))
+        },
+        "prior_memory": state.get("prior_memory").cloned().unwrap_or(Value::Null),
+        "track_record": state.get("track_record").cloned().unwrap_or(Value::Null),
+        "agent_accuracy": state.get("agent_accuracy").cloned().unwrap_or(Value::Null)
+    })
+}
+
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn render_prompt(
@@ -214,6 +327,7 @@ pub(crate) fn render_prompt_with_plugins(
         "risk_history": serde_json::to_string_pretty(&state.get("risk_debate_state").and_then(|v| v.get("history")).cloned().unwrap_or_else(|| json!([])))?,
         "portfolio_decision": serde_json::to_string_pretty(&state.get("final_trade_decision").cloned().unwrap_or(Value::Null))?,
         "allocation_context": serde_json::to_string_pretty(&state.get("allocation_context").cloned().unwrap_or(Value::Null))?,
+        "phase3_context": serde_json::to_string_pretty(&phase3_context(state))?,
     });
     let mut values = static_values;
     if let (Some(static_map), Some(dynamic_map)) =
@@ -647,6 +761,7 @@ required_variables = ["ticker", "tickers"]
         "{analyst_reports}",
         "{risk_history}",
         "{allocation_context}",
+        "{phase3_context}",
     ];
 
     fn golden_mock_state() -> Value {
@@ -668,6 +783,65 @@ required_variables = ["ticker", "tickers"]
             "final_trade_decision": {"rating": "Hold"},
             "allocation_context": {"investable_assets": ["QQQ", "SOXX"]}
         })
+    }
+
+    #[test]
+    fn phase3_context_preserves_canonical_inputs_without_turn_history() {
+        let context = phase3_context(&json!({
+            "phase1_state_artifact": {
+                "status": "insufficient",
+                "weighted_probability_base": {"QQQ": {"long_probability": 0.5}},
+                "per_ticker": {"QQQ": {
+                    "decision_hinges": ["price confirmation"],
+                    "role_summaries": [{
+                        "role": "analyst.technical",
+                        "status": "ready",
+                        "stance": "neutral",
+                        "confidence": 0.5,
+                        "summary": "full analyst report must not be forwarded",
+                        "key_evidence": [
+                            {"claim": "one", "evidence_type": "fact", "report": "drop"},
+                            {"claim": "two", "evidence_type": "opinion"},
+                            {"claim": "three", "evidence_type": "fact"},
+                            {"claim": "four", "evidence_type": "fact"}
+                        ]
+                    }]
+                }}
+            },
+            "debate_state_artifact": {
+                "status": "skipped_no_actionable_evidence",
+                "topic_briefs": [{"topic_id": "QQQ-gap"}],
+                "debate_turns": [{"should_not": "be forwarded"}]
+            },
+            "prior_memory": {"items": []},
+            "track_record": {"sample_size": 2},
+            "agent_accuracy": {"analyst.technical": 0.7}
+        }));
+
+        assert_eq!(context["phase1"]["status"], "insufficient");
+        assert_eq!(
+            context["phase2_5"]["topic_briefs"][0]["topic_id"],
+            "QQQ-gap"
+        );
+        assert!(context["phase2_5"].get("debate_turns").is_none());
+        assert_eq!(context["track_record"]["sample_size"], 2);
+        let role = &context["phase1"]["per_ticker"]["QQQ"]["role_summaries"][0];
+        assert!(role.get("summary").is_none());
+        assert_eq!(role["key_evidence"].as_array().unwrap().len(), 3);
+        assert!(role["key_evidence"][0].get("report").is_none());
+    }
+
+    #[test]
+    fn shipped_analyst_contract_delegates_shape_to_runtime_validation() {
+        let contract = std::fs::read_to_string(
+            project_prompts_dir().join("common/analyst_output_contract.md"),
+        )
+        .unwrap();
+
+        assert!(contract.contains("运行时 schema"));
+        assert!(!contract.contains("{analyst_artifact_schema}"));
+        assert!(!contract.contains("顶层结构"));
+        assert!(!contract.contains("```json"));
     }
 
     #[test]
@@ -840,7 +1014,7 @@ required_variables = ["ticker", "tickers"]
     }
 
     #[test]
-    fn golden_analyst_prompts_carry_schema_and_boundaries() {
+    fn golden_analyst_prompts_carry_runtime_contract_and_boundaries() {
         let prompts = project_prompts_dir();
         if !prompts.exists() {
             return;
@@ -860,7 +1034,8 @@ required_variables = ["ticker", "tickers"]
             );
             let prompt =
                 render_prompt(&state, &role, 1, "artifact", None, None, Some(&path), None).unwrap();
-            // Machine-readable contract fields must reach the model.
+            // The model still receives the key behavioral contract, while the
+            // runtime validator remains the only source of structural truth.
             assert!(
                 prompt.contains("direction"),
                 "{rel} missing direction field"
@@ -868,6 +1043,11 @@ required_variables = ["ticker", "tickers"]
             assert!(
                 prompt.contains("confidence"),
                 "{rel} missing confidence field"
+            );
+            assert!(!prompt.contains("顶层结构"), "{rel} embeds a JSON shape");
+            assert!(
+                !prompt.contains("{analyst_artifact_schema}"),
+                "{rel} contains a schema placeholder"
             );
             // Anti-injection boundary must be present for external-content roles.
             assert!(

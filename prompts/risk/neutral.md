@@ -14,7 +14,7 @@
   "recommended_adjustment": "对 trader_plan 的中性调整建议"
 }
 
-结构化风险字段（这些字段会自动出现在下方 `{risk_constraints_schema}` 注入的 JSON Schema 中，按需要填写，缺失留空或 0/默认值）：
+结构化风险字段由运行时 RiskConstraints schema 校验，必须完整填写：
 - `stop_type`：`none | tight | trailing | event_based | time_based`。中性立场通常建议 `trailing` 或 `event_based`。
 - `max_drawdown_pct`：0.0-1.0，中性立场给出的回撤上限，介于激进与保守之间。
 - `position_cap_pct`：0.0-1.0，单标的仓位上限。

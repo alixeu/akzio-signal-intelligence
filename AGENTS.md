@@ -30,7 +30,7 @@ rtk cargo clippy --workspace --all-targets
 Common local runs:
 
 ```bash
-rtk cargo run -p orchestrator-cli --bin orchestrator-exec -- TQQQ --mock
+rtk cargo run -p orchestrator-cli --bin orchestrator-exec -- --mock
 rtk cargo run -p orchestrator-cli --bin run-daily-tqqq-report -- --mock --skip-send
 ```
 

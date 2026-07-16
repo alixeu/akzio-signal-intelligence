@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{bail, Result};
 use orchestrator_sql::{write_agent_message_scoped, AgentMessageInput};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
@@ -47,21 +47,21 @@ pub(crate) fn build_phase1_state_artifact(state: &Value, config: &RuntimeConfig)
         .filter(|role| !config.workflow.critical_roles.contains(*role))
         .cloned()
         .collect::<Vec<_>>();
-    let status = if !missing_critical_roles.is_empty() {
-        "blocked"
-    } else if state
-        .get("degraded")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        "partial"
-    } else {
-        "ready"
-    };
     let weighted_probability_base = weighted_probability_base(state, &tickers, &reports);
+    let required_critical_roles = roles
+        .iter()
+        .filter(|role| config.workflow.critical_roles.contains(*role))
+        .cloned()
+        .collect::<Vec<_>>();
     let per_ticker = tickers
         .iter()
         .map(|ticker| {
+            let ticker_evidence_quality = evidence_quality_for_ticker(
+                weighted_probability_base.get(ticker),
+                &required_critical_roles,
+                &missing_sources,
+            );
+            let ticker_is_actionable = ticker_evidence_quality["status"] == "actionable";
             let role_summaries = roles
                 .iter()
                 .map(|role| {
@@ -110,21 +110,38 @@ pub(crate) fn build_phase1_state_artifact(state: &Value, config: &RuntimeConfig)
                     "conflicts": conflict_values,
                     "missing_evidence": degraded_noncritical_roles,
                     "decision_hinges": [],
-                    "topic_candidates": [
-                        {
-                            "topic_id": format!("{ticker}-aggregate"),
-                            "topic": format!("Highest-impact unresolved long/short evidence for {ticker}"),
-                            "tickers": [ticker],
-                            "long_evidence_refs": [],
-                            "short_evidence_refs": [],
-                            "why_debate": "Fallback topic generated from Phase 1.5 state."
-                        }
-                    ],
-                    "state_summary": format!("Phase 1 state for {ticker}: {status}.")
+                    "evidence_quality": ticker_evidence_quality,
+                    "topic_candidates": if ticker_is_actionable {
+                        json!([fallback_topic_for_ticker(ticker)])
+                    } else {
+                        json!([])
+                    },
+                    "state_summary": format!("Phase 1 state for {ticker}: {}.", ticker_evidence_quality["status"].as_str().unwrap_or("unknown"))
                 }),
             )
         })
         .collect::<serde_json::Map<_, _>>();
+    let evidence_quality = aggregate_evidence_quality(
+        &per_ticker,
+        &missing_critical_roles,
+        state
+            .get("degraded")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    );
+    let status = match evidence_quality["status"].as_str() {
+        Some("actionable") => "ready",
+        Some("partial") => "partial",
+        Some("blocked") => "blocked",
+        _ => "insufficient",
+    };
+    let topic_candidates = per_ticker
+        .values()
+        .filter(|artifact| artifact["evidence_quality"]["status"] == "actionable")
+        .filter_map(|artifact| artifact.get("topic_candidates").and_then(Value::as_array))
+        .flatten()
+        .cloned()
+        .collect::<Vec<_>>();
     let cross_analyst_conflicts_summary = per_ticker
         .values()
         .filter_map(|ticker_artifact| ticker_artifact.get("cross_analyst_conflicts"))
@@ -138,6 +155,7 @@ pub(crate) fn build_phase1_state_artifact(state: &Value, config: &RuntimeConfig)
         "artifact_type": "phase1_state_artifact",
         "phase": "phase1.5",
         "status": status,
+        "evidence_quality": evidence_quality,
         "workflow_pattern": "Workflow -> Stage/Sub-workflow -> Agent workers -> Reducer -> state artifact",
         "generated_from": {
             "worker_roles": roles,
@@ -148,13 +166,87 @@ pub(crate) fn build_phase1_state_artifact(state: &Value, config: &RuntimeConfig)
         "late_evidence": state.get("late_evidence").cloned().unwrap_or_else(|| json!([])),
         "weighted_probability_base": weighted_probability_base,
         "per_ticker": per_ticker,
-        "topic_candidates": fallback_topics_for_tickers(&tickers),
+        "topic_candidates": topic_candidates,
         "cross_analyst_conflicts_summary": cross_analyst_conflicts_summary,
         "cross_ticker_notes": [],
         "reducer_checks": {
             "json_valid": true,
             "no_new_external_facts": true,
             "all_claims_source_backed": true
+        }
+    })
+}
+
+fn evidence_quality_for_ticker(
+    weighted_probability: Option<&Value>,
+    required_critical_roles: &[String],
+    missing_sources: &BTreeSet<String>,
+) -> Value {
+    let source_roles = weighted_probability
+        .and_then(|value| value.get("source_roles"))
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToString::to_string)
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    let unavailable_critical_roles = required_critical_roles
+        .iter()
+        .filter(|role| missing_sources.contains(*role) || !source_roles.contains(*role))
+        .cloned()
+        .collect::<Vec<_>>();
+    let actionable = !source_roles.is_empty() && unavailable_critical_roles.is_empty();
+    json!({
+        "status": if actionable { "actionable" } else { "insufficient" },
+        "confidence_basis": if actionable { "evidence_available" } else { "data_insufficient" },
+        "usable_source_roles": source_roles.into_iter().collect::<Vec<_>>(),
+        "unusable_critical_roles": unavailable_critical_roles,
+        "reason": if actionable {
+            "All critical roles supplied usable directional evidence."
+        } else {
+            "One or more critical roles supplied no usable directional evidence."
+        }
+    })
+}
+
+fn aggregate_evidence_quality(
+    per_ticker: &serde_json::Map<String, Value>,
+    missing_critical_roles: &[String],
+    workflow_degraded: bool,
+) -> Value {
+    let actionable_tickers = per_ticker
+        .iter()
+        .filter(|(_, artifact)| artifact["evidence_quality"]["status"] == "actionable")
+        .map(|(ticker, _)| ticker.clone())
+        .collect::<Vec<_>>();
+    let insufficient_tickers = per_ticker
+        .iter()
+        .filter(|(_, artifact)| artifact["evidence_quality"]["status"] != "actionable")
+        .map(|(ticker, _)| ticker.clone())
+        .collect::<Vec<_>>();
+    let status = if !missing_critical_roles.is_empty() {
+        "blocked"
+    } else if actionable_tickers.is_empty() {
+        "insufficient"
+    } else if !insufficient_tickers.is_empty() || workflow_degraded {
+        "partial"
+    } else {
+        "actionable"
+    };
+    json!({
+        "status": status,
+        "confidence_basis": if status == "actionable" { "evidence_available" } else { "data_insufficient" },
+        "actionable_tickers": actionable_tickers,
+        "insufficient_tickers": insufficient_tickers,
+        "missing_critical_roles": missing_critical_roles,
+        "reason": match status {
+            "actionable" => "All analyzed tickers have usable critical-role evidence.",
+            "partial" => "Only a subset of analyzed tickers has usable critical-role evidence.",
+            "blocked" => "One or more critical roles did not produce an artifact.",
+            _ => "No analyzed ticker has usable critical-role evidence."
         }
     })
 }
@@ -208,13 +300,20 @@ fn summarize_evidence_types(payload: &Value) -> Value {
 
 pub(crate) fn build_topic_generation_artifact(state: &Value) -> Value {
     let tickers = tickers_from_state(state);
-    let topics = phase1_topic_candidates(state);
+    let actionable = phase1_evidence_is_actionable(state);
+    let topics = if actionable {
+        phase1_topic_candidates(state)
+    } else {
+        Vec::new()
+    };
     json!({
         "id": "mediator.topic",
         "role": "mediator.topic",
         "artifact_type": "phase2_topic_generation_artifact",
         "phase": "phase2.topic_generation",
-        "status": "ready",
+        "status": if actionable { "ready" } else { "skipped_no_actionable_evidence" },
+        "actionable": actionable,
+        "skip_reason": if actionable { Value::Null } else { json!("phase1_evidence_insufficient") },
         "generated_from": {
             "source_artifact": "phase1_state_artifact",
             "tickers": tickers
@@ -245,34 +344,17 @@ pub(crate) fn build_debate_state_artifact(state: &Value, config: &RuntimeConfig)
         .and_then(Value::as_array)
         .map(|items| !items.is_empty())
         .unwrap_or(false);
-    let per_ticker = tickers
-        .iter()
-        .map(|ticker| {
-            (
-                ticker.clone(),
-                json!({
-                    "id": "reducer.debate_final",
-                    "role": "reducer.debate_final",
-                    "artifact_type": "phase2_5_debate_state_artifact",
-                    "status": "ready",
-                    "turn_count": turns.len(),
-                    "decision_hinges": [],
-                    "missing_evidence": [],
-                    "manager_handoff": {
-                        "directional_pressure": "mixed",
-                        "confidence_modifier": "neutral",
-                        "why": format!("Debate reducer compressed {} turns for {ticker}.", turns.len()),
-                        "do_not_exceed": "Do not treat this as final probability or rating."
-                    }
-                }),
-            )
-        })
-        .collect::<serde_json::Map<_, _>>();
-    let topic_briefs = if topic_states.is_empty() {
-        fallback_topics_for_tickers(&tickers)
-            .into_iter()
-            .map(|topic| debate_topic_brief(topic, turns.len(), late_evidence, config))
-            .collect::<Vec<_>>()
+    let skipped_for_insufficient_evidence = state
+        .get("topic_generation_artifact")
+        .and_then(|artifact| artifact.get("actionable"))
+        .and_then(Value::as_bool)
+        == Some(false)
+        || !phase1_evidence_is_actionable(state);
+    let has_controller_artifact = topic_states
+        .values()
+        .any(topic_state_has_controller_artifact);
+    let topic_briefs = if skipped_for_insufficient_evidence || topic_states.is_empty() {
+        Vec::new()
     } else {
         topic_states
             .values()
@@ -281,27 +363,88 @@ pub(crate) fn build_debate_state_artifact(state: &Value, config: &RuntimeConfig)
                     .get("topic")
                     .cloned()
                     .unwrap_or_else(|| json!({}));
-                let latest = topic_state
-                    .get("controller_artifact")
-                    .cloned()
-                    .or_else(|| {
-                        topic_state
-                            .get("controller_artifacts")
-                            .and_then(Value::as_array)
-                            .and_then(|items| items.last())
-                            .cloned()
-                    })
-                    .unwrap_or_else(|| json!({}));
-                debate_topic_brief_from_state(topic, latest, late_evidence, config)
+                match latest_controller_artifact(topic_state) {
+                    Some(latest) => {
+                        debate_topic_brief_from_state(topic, latest, late_evidence, config)
+                    }
+                    None => not_converged_debate_topic_brief(topic, late_evidence, config),
+                }
             })
             .collect::<Vec<_>>()
     };
+    let all_topics_converged = !topic_briefs.is_empty()
+        && topic_briefs
+            .iter()
+            .all(|brief| brief.get("status").and_then(Value::as_str) == Some("converged"));
+    let (status, convergence_status, reason) = if skipped_for_insufficient_evidence {
+        (
+            "skipped_no_actionable_evidence",
+            "skipped",
+            "Phase 1 evidence was insufficient for an actionable debate.",
+        )
+    } else if all_topics_converged {
+        (
+            "ready",
+            "converged",
+            "All topic controllers resolved an evidence-backed decision hinge.",
+        )
+    } else if has_controller_artifact {
+        (
+            "ready",
+            "converged_or_pending_review",
+            "Controller artifacts were recorded but not every topic produced an evidence-backed convergence proof.",
+        )
+    } else {
+        (
+            "not_converged",
+            "not_converged",
+            "No topic-controller artifact was recorded.",
+        )
+    };
+    let per_ticker = tickers
+        .iter()
+        .map(|ticker| {
+            let ticker_briefs = topic_briefs
+                .iter()
+                .filter(|brief| debate_brief_targets_ticker(brief, ticker))
+                .collect::<Vec<_>>();
+            let ticker_converged = !ticker_briefs.is_empty()
+                && ticker_briefs.iter().all(|brief| {
+                    brief.get("status").and_then(Value::as_str) == Some("converged")
+                });
+            let decision_hinges = ticker_briefs
+                .iter()
+                .flat_map(|brief| collect_decision_hinges(brief))
+                .collect::<Vec<_>>();
+            (
+                ticker.clone(),
+                json!({
+                    "id": "reducer.debate_final",
+                    "role": "reducer.debate_final",
+                    "artifact_type": "phase2_5_debate_state_artifact",
+                    "status": status,
+                    "convergence_status": if ticker_converged { "converged" } else { convergence_status },
+                    "turn_count": turns.len(),
+                    "decision_hinges": decision_hinges,
+                    "missing_evidence": if ticker_converged { json!([]) } else { json!([reason]) },
+                    "manager_handoff": {
+                        "directional_pressure": if status == "ready" { "mixed" } else { "unavailable" },
+                        "confidence_modifier": if status == "ready" { "neutral" } else { "data_insufficient" },
+                        "why": format!("{reason} Debate reducer inspected {} turns for {ticker}.", turns.len()),
+                        "do_not_exceed": "Do not treat this as final probability or rating."
+                    }
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
     json!({
         "id": "reducer.debate_final",
         "role": "reducer.debate_final",
         "artifact_type": "phase2_5_debate_state_artifact",
         "phase": "phase2.5b",
-        "status": "ready",
+        "status": status,
+        "convergence_status": convergence_status,
+        "convergence_reason": reason,
         "workflow_pattern": "Workflow -> Stage/Sub-workflow -> Agent workers -> Reducer -> state artifact",
         "generated_from": {
             "worker_roles": [
@@ -328,6 +471,118 @@ pub(crate) fn build_debate_state_artifact(state: &Value, config: &RuntimeConfig)
             "no_new_external_facts": true
         }
     })
+}
+
+fn topic_state_has_controller_artifact(topic_state: &Value) -> bool {
+    latest_controller_artifact(topic_state).is_some()
+}
+
+fn debate_brief_targets_ticker(brief: &Value, ticker: &str) -> bool {
+    brief
+        .get("tickers")
+        .and_then(Value::as_array)
+        .is_some_and(|items| items.iter().any(|item| item.as_str() == Some(ticker)))
+}
+
+fn collect_decision_hinges(value: &Value) -> Vec<Value> {
+    match value {
+        Value::Array(items) => items.iter().flat_map(collect_decision_hinges).collect(),
+        Value::Object(object) => {
+            let mut hinges = Vec::new();
+            if object
+                .get("hinge")
+                .or_else(|| object.get("decision_hinge"))
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.trim().is_empty())
+                && object
+                    .get("evidence_refs")
+                    .and_then(Value::as_array)
+                    .is_some_and(|refs| !refs.is_empty())
+            {
+                hinges.push(Value::Object(object.clone()));
+            }
+            hinges.extend(
+                object
+                    .get("decision_hinges")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default(),
+            );
+            hinges.extend(
+                object
+                    .iter()
+                    .filter(|(key, _)| key.as_str() != "decision_hinges")
+                    .flat_map(|(_, child)| collect_decision_hinges(child)),
+            );
+            hinges
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn controller_artifact_is_converged(artifact: &Value) -> bool {
+    let stop_advised = artifact
+        .get("soft_control")
+        .and_then(|control| control.get("should_continue"))
+        .and_then(Value::as_bool)
+        == Some(false);
+    stop_advised
+        && collect_decision_hinges(artifact).iter().any(|hinge| {
+            let has_hinge = hinge
+                .get("hinge")
+                .or_else(|| hinge.get("decision_hinge"))
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.trim().is_empty());
+            let has_refs = hinge
+                .get("evidence_refs")
+                .and_then(Value::as_array)
+                .is_some_and(|refs| !refs.is_empty());
+            has_hinge && has_refs
+        })
+}
+
+fn latest_controller_artifact(topic_state: &Value) -> Option<Value> {
+    topic_state
+        .get("controller_artifact")
+        .filter(|artifact| artifact.is_object())
+        .cloned()
+        .or_else(|| {
+            topic_state
+                .get("controller_artifacts")
+                .and_then(Value::as_array)
+                .and_then(|items| items.last())
+                .filter(|artifact| artifact.is_object())
+                .cloned()
+        })
+}
+
+fn not_converged_debate_topic_brief(
+    topic: Value,
+    late_evidence: bool,
+    config: &RuntimeConfig,
+) -> Value {
+    let mut brief = debate_topic_brief(topic, 0, late_evidence, config);
+    if let Some(object) = brief.as_object_mut() {
+        object.insert(
+            "status".to_string(),
+            Value::String("not_converged".to_string()),
+        );
+        object.insert("needs_manager_attention".to_string(), Value::Bool(true));
+        if let Some(compressed_state) = object
+            .get_mut("compressed_state")
+            .and_then(Value::as_object_mut)
+        {
+            compressed_state.insert(
+                "missing_evidence".to_string(),
+                json!(["No topic-controller artifact was recorded."]),
+            );
+            compressed_state.insert(
+                "stop_reason".to_string(),
+                Value::String("Topic debate did not reach controller review.".to_string()),
+            );
+        }
+    }
+    brief
 }
 
 pub(crate) fn debate_topic_brief(
@@ -399,9 +654,17 @@ pub(crate) fn debate_topic_brief_from_state(
 ) -> Value {
     let mut brief = debate_topic_brief(topic, 0, late_evidence, config);
     if let Some(object) = brief.as_object_mut() {
-        if let Some(status) = controller_artifact.get("status").cloned() {
-            object.insert("status".to_string(), status);
-        }
+        object.insert(
+            "status".to_string(),
+            Value::String(
+                if controller_artifact_is_converged(&controller_artifact) {
+                    "converged"
+                } else {
+                    "not_converged"
+                }
+                .to_string(),
+            ),
+        );
         if let Some(claims) = controller_artifact.get("claim_ledger").cloned() {
             object.insert("claim_ledger".to_string(), claims);
         }
@@ -422,17 +685,19 @@ pub(crate) fn debate_topic_brief_from_state(
 pub(crate) fn fallback_topics_for_tickers(tickers: &[String]) -> Vec<Value> {
     tickers
         .iter()
-        .map(|ticker| {
-            json!({
-                "topic_id": format!("{ticker}-aggregate"),
-                "topic": format!("Highest-impact unresolved long/short evidence for {ticker}"),
-                "tickers": [ticker],
-                "long_evidence_refs": [],
-                "short_evidence_refs": [],
-                "why_debate": "Fallback topic generated from Phase 1.5 state."
-            })
-        })
+        .map(|ticker| fallback_topic_for_ticker(ticker))
         .collect()
+}
+
+fn fallback_topic_for_ticker(ticker: &str) -> Value {
+    json!({
+        "topic_id": format!("{ticker}-aggregate"),
+        "topic": format!("Highest-impact unresolved long/short evidence for {ticker}"),
+        "tickers": [ticker],
+        "long_evidence_refs": [],
+        "short_evidence_refs": [],
+        "why_debate": "Fallback topic generated from Phase 1.5 state."
+    })
 }
 
 pub(crate) fn phase1_topic_candidates(state: &Value) -> Vec<Value> {
@@ -445,7 +710,31 @@ pub(crate) fn phase1_topic_candidates(state: &Value) -> Vec<Value> {
         .unwrap_or_else(|| fallback_topics_for_tickers(&tickers_from_state(state)))
 }
 
+pub(crate) fn phase1_evidence_is_actionable(state: &Value) -> bool {
+    state
+        .get("phase1_state_artifact")
+        .and_then(|artifact| artifact.get("evidence_quality"))
+        .and_then(|quality| quality.get("status"))
+        .and_then(Value::as_str)
+        .map(|status| !matches!(status, "insufficient" | "blocked"))
+        // Preserve existing workflow behavior for states produced before the
+        // evidence-quality contract existed.
+        .unwrap_or(true)
+}
+
 pub(crate) fn topics_from_generation_artifact(artifact: &Value) -> Vec<Value> {
+    if artifact
+        .get("actionable")
+        .or_else(|| {
+            artifact
+                .get("reducer_output")
+                .and_then(|output| output.get("actionable"))
+        })
+        .and_then(Value::as_bool)
+        == Some(false)
+    {
+        return Vec::new();
+    }
     artifact
         .get("reducer_output")
         .and_then(|output| {
@@ -457,7 +746,6 @@ pub(crate) fn topics_from_generation_artifact(artifact: &Value) -> Vec<Value> {
         .or_else(|| artifact.get("topic_candidates"))
         .and_then(Value::as_array)
         .cloned()
-        .filter(|items| !items.is_empty())
         .unwrap_or_else(|| fallback_topics_for_tickers(&tickers_from_state(artifact)))
 }
 
@@ -682,6 +970,30 @@ pub(crate) fn artifact_for_ticker<'a>(artifact: &'a Value, ticker: &str) -> Opti
         .and_then(|items| items.get(ticker))
 }
 
+/// Verify runtime identity without rewriting the model's content. Callers must
+/// retry or degrade an invalid artifact; relabeling it would make a foreign
+/// role's evidence appear trustworthy to downstream reducers.
+pub(crate) fn validate_artifact_identity(artifact: &Value, executing_role: &str) -> Result<()> {
+    let artifact_id = artifact
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("artifact id is missing or empty"))?;
+    let artifact_role = artifact
+        .get("role")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|role| !role.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("artifact role is missing or empty"))?;
+    if artifact_role != executing_role {
+        bail!(
+            "artifact role mismatch: expected {executing_role}, received {artifact_role} (id={artifact_id})"
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn persist_artifact(
     conn: &mut rusqlite::Connection,
     state: &Value,
@@ -689,6 +1001,7 @@ pub(crate) fn persist_artifact(
     role: &str,
     artifact: Value,
 ) -> Result<()> {
+    validate_artifact_identity(&artifact, role)?;
     persist_artifact_with_last_md(conn, state, phase, role, artifact, String::new())
 }
 
@@ -700,6 +1013,7 @@ pub(crate) fn persist_artifact_with_last_md(
     artifact: Value,
     last_md: String,
 ) -> Result<()> {
+    validate_artifact_identity(&artifact, role)?;
     persist_agent_content(
         conn,
         state,
@@ -1139,5 +1453,160 @@ mod tests {
         let confidence = base["QQQ"]["confidence"].as_f64().unwrap();
         // avg type weight = 0.3, speculation_ratio=1.0 => *0.7 => 0.21
         assert!((confidence - 0.21).abs() < 1e-9, "got {confidence}");
+    }
+
+    #[test]
+    fn phase1_marks_unusable_critical_evidence_as_insufficient_not_neutral() {
+        let config = test_runtime_config();
+        let state = json!({
+            "tickers": ["QQQ"],
+            "phase1_agents": ["analyst.technical", "analyst.news_macro"],
+            "analyst_weights": {
+                "analyst.technical": 1.0,
+                "analyst.news_macro": 1.0
+            },
+            "analyst_reports": {
+                "analyst.technical": {
+                    "per_ticker": {"QQQ": {"direction": "unobserved", "confidence": 0.0}}
+                },
+                "analyst.news_macro": {
+                    "per_ticker": {"QQQ": {"direction": "unobserved", "confidence": 0.0}}
+                }
+            }
+        });
+
+        let artifact = build_phase1_state_artifact(&state, &config);
+
+        assert_eq!(artifact["status"], "insufficient");
+        assert_eq!(artifact["evidence_quality"]["status"], "insufficient");
+        assert_eq!(
+            artifact["per_ticker"]["QQQ"]["evidence_quality"]["confidence_basis"],
+            "data_insufficient"
+        );
+        assert_eq!(
+            artifact["weighted_probability_base"]["QQQ"]["long_probability"],
+            0.5
+        );
+    }
+
+    #[test]
+    fn topic_generation_skips_debate_when_phase1_evidence_is_insufficient() {
+        let state = json!({
+            "tickers": ["QQQ"],
+            "phase1_state_artifact": {
+                "evidence_quality": {"status": "insufficient"},
+                "per_ticker": {
+                    "QQQ": {"evidence_quality": {"status": "insufficient"}}
+                }
+            }
+        });
+
+        let artifact = build_topic_generation_artifact(&state);
+
+        assert_eq!(artifact["actionable"], false);
+        assert_eq!(artifact["status"], "skipped_no_actionable_evidence");
+        assert_eq!(artifact["topics"], json!([]));
+        assert_eq!(
+            topics_from_generation_artifact(&artifact),
+            Vec::<Value>::new()
+        );
+    }
+
+    #[test]
+    fn debate_state_without_controller_is_not_converged() {
+        let config = test_runtime_config();
+        let state = json!({
+            "tickers": ["QQQ"],
+            "topic_generation_artifact": {
+                "actionable": true,
+                "topics": [{
+                    "topic_id": "QQQ-trend",
+                    "topic": "QQQ trend",
+                    "tickers": ["QQQ"]
+                }]
+            },
+            "topic_debate_states": {},
+            "debate_turns": []
+        });
+
+        let artifact = build_debate_state_artifact(&state, &config);
+
+        assert_eq!(artifact["status"], "not_converged");
+        assert_eq!(artifact["convergence_status"], "not_converged");
+        assert_eq!(artifact["per_ticker"]["QQQ"]["status"], "not_converged");
+        assert_eq!(artifact["topic_briefs"], json!([]));
+    }
+
+    #[test]
+    fn debate_state_marks_evidence_backed_controller_resolution_converged() {
+        let config = test_runtime_config();
+        let state = json!({
+            "tickers": ["QQQ"],
+            "phase1_state_artifact": {
+                "evidence_quality": {"status": "actionable"},
+                "per_ticker": {"QQQ": {"evidence_quality": {"status": "actionable"}}}
+            },
+            "topic_generation_artifact": {"actionable": true},
+            "topic_debate_states": {
+                "QQQ-trend": {
+                    "topic": {"topic_id": "QQQ-trend", "topic": "QQQ trend", "tickers": ["QQQ"]},
+                    "controller_artifact": {
+                        "soft_control": {"should_continue": false, "stop_reason": "resolved"},
+                        "decision_hinges": [{
+                            "hinge": "price confirmation",
+                            "evidence_refs": ["technical:QQQ:breakout"]
+                        }]
+                    }
+                }
+            },
+            "debate_turns": []
+        });
+
+        let artifact = build_debate_state_artifact(&state, &config);
+
+        assert_eq!(artifact["convergence_status"], "converged");
+        assert_eq!(
+            artifact["per_ticker"]["QQQ"]["convergence_status"],
+            "converged"
+        );
+        assert_eq!(
+            artifact["per_ticker"]["QQQ"]["decision_hinges"][0]["evidence_refs"][0],
+            "technical:QQQ:breakout"
+        );
+    }
+
+    #[test]
+    fn debate_state_skips_when_topic_generation_is_not_actionable() {
+        let config = test_runtime_config();
+        let state = json!({
+            "tickers": ["QQQ"],
+            "topic_generation_artifact": {"actionable": false},
+            "topic_debate_states": {},
+            "debate_turns": []
+        });
+
+        let artifact = build_debate_state_artifact(&state, &config);
+
+        assert_eq!(artifact["status"], "skipped_no_actionable_evidence");
+        assert_eq!(artifact["convergence_status"], "skipped");
+        assert_eq!(
+            artifact["per_ticker"]["QQQ"]["manager_handoff"]["confidence_modifier"],
+            "data_insufficient"
+        );
+    }
+
+    #[test]
+    fn artifact_identity_validation_does_not_mutate_mismatched_payload() {
+        let artifact = json!({
+            "id": "youtube",
+            "role": "analyst.youtube",
+            "per_ticker": {"QQQ": {}}
+        });
+        let original = artifact.clone();
+
+        let error = validate_artifact_identity(&artifact, "analyst.technical").unwrap_err();
+
+        assert!(error.to_string().contains("role mismatch"));
+        assert_eq!(artifact, original);
     }
 }

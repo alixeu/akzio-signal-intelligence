@@ -18,7 +18,7 @@
 
 ---
 
-> **免责声明**：本系统是投资研究辅助工具，不构成投资建议。所有输出应作为决策过程中的参考信号之一，而非直接交易指令。
+**免责声明**：本系统是投资研究辅助工具，不构成投资建议。所有输出应作为决策过程中的参考信号之一，而非直接交易指令。
 
 ---
 
@@ -563,7 +563,7 @@ LLM 调用是系统的主要成本。设计中采用多层策略降低 Token 消
 
 ```yaml
 # 运行命令
-# cargo run -p orchestrator-cli --bin orchestrator-exec -- QQQ,SOXX
+# cargo run -p orchestrator-cli --bin orchestrator-exec
 
 Ticker: QQQ, SOXX
 Date: 2025-07-14
@@ -641,16 +641,17 @@ cargo build --release
 
 ```bash
 # 完整分析运行（需要 LLM_GATEWAY_API_KEY）
-cargo run -p orchestrator-cli --bin orchestrator-exec -- QQQ,SOXX
+# 标的来自 config orchestrator.analysis_universe；可投资池来自 allocation.investable_assets
+cargo run -p orchestrator-cli --bin orchestrator-exec
 
 # Mock 模式（无 LLM 调用，使用固定响应）
-cargo run -p orchestrator-cli --bin orchestrator-exec -- QQQ --mock
+cargo run -p orchestrator-cli --bin orchestrator-exec -- --mock
 
 # 仅运行特定阶段
-cargo run -p orchestrator-cli --bin orchestrator-exec -- QQQ --from-phase 3 --to-phase 6
+cargo run -p orchestrator-cli --bin orchestrator-exec -- --from-phase 3 --to-phase 6
 
 # Monitor 模式（监控而非概率判断）
-cargo run -p orchestrator-cli --bin orchestrator-exec -- QQQ --mode monitor
+cargo run -p orchestrator-cli --bin orchestrator-exec -- --mode monitor
 
 # 评分历史预测
 cargo run -p orchestrator-cli --bin reflection-score

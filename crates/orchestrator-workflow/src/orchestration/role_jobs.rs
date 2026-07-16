@@ -681,7 +681,14 @@ async fn execute_steer_role_job(
             artifact["prompt_version"] = Value::String(version);
         }
         if let Some(steer) = steer {
-            artifact["steer"] = Value::String(steer);
+            let steer_kind = serde_json::from_str::<Value>(&steer)
+                .ok()
+                .and_then(|value| value.get("kind").cloned())
+                .unwrap_or_else(|| Value::String("unknown".to_string()));
+            artifact["steer_ref"] = json!({
+                "kind": steer_kind,
+                "payload_omitted": true
+            });
         }
         artifact["session_id"] = Value::String(session_id.clone());
         artifact["turn_id"] = Value::String(turn_id.clone());

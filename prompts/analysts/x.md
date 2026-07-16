@@ -65,7 +65,7 @@
    - 是否有明确事件依附
    - 是否只是标题党或情绪宣泄
    - 是否存在机器人刷屏、单一大 V 主导或明显回音室效应
-6. **必须填写机器可读来源质量字段（自动出现在 `{analyst_artifact_schema}` JSON Schema 中）。** 对每条 `key_evidence`：
+6. **必须填写运行时 analyst artifact schema 定义的机器可读来源质量字段。** 对每条 `key_evidence`：
    - `source_tier`：已验证机构/官方/媒体账号取 `social_verified`，匿名或单一散户账号取 `social_unverified`，无法判断取 `unknown`。
    - `first_source`：该言论最早可溯源出处（原创账号 + 帖子，或最初引发传播的源头），用于跨平台归因。
    - `is_derivative_repost`：若某条 X 言论只是复述别处（新闻/Reddit/YouTube）已存在的叙事，设为 `true` 并在 `first_source` 填最早出处；不要把重复搬运计数成多条独立证据。

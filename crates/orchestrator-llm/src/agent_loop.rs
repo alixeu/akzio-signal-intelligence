@@ -881,7 +881,9 @@ where
         }
 
         if let Some(text) = last_assistant_message_text(turn) {
-            if turn.role.starts_with("analyst.") && !analyst_final_artifact_looks_valid(&text) {
+            if turn.role.starts_with("analyst.")
+                && !analyst_final_artifact_looks_valid(&turn.role, &turn_tickers(turn), &text)
+            {
                 turn.tools_disabled = true;
                 turn.push_pending_input(
                     "Your last JSON is invalid for this analyst role. Emit one JSON object with id/role for this analyst, status=completed, and per_ticker.<TICKER>.{direction,confidence,report}. direction must be bullish|bearish|neutral|mixed|unobserved; confidence must be a 0..1 number. Do not invent alternate schemas (no stance-only payloads).",
@@ -899,19 +901,59 @@ where
                 persist_turn(conn, turn, &config.truncation)?;
                 continue;
             }
-            if turn.role == "manager.research" && !research_artifact_looks_valid(&text) {
+            if turn.role == "manager.research"
+                && !research_artifact_looks_valid(&turn_tickers(turn), &text)
+            {
                 turn.tools_disabled = true;
                 turn.push_pending_input(
-                    "Your last output is invalid for manager.research. Emit one ResearchArtifact JSON object with top-level rating, long_probability, short_probability (summing to ~1.0), plan, probability_rationale, and per_ticker for every ticker. If probabilities live under per_ticker, also copy the primary ticker's rating/probabilities to the top level. Do not call tools again.",
+                    "Your last output is invalid for manager.research. Emit the ResearchArtifact required by the current role schema. Use a valid confidence_basis and, for Hold, the matching hold_reason. If probabilities live under per_ticker, also copy the primary ticker's rating/probabilities to the top level. Do not call tools again.",
                 );
                 turn.needs_follow_up = true;
                 persist_turn(conn, turn, &config.truncation)?;
                 continue;
             }
-            if interaction_packet_role(&turn.role) && !interaction_packet_looks_valid(&text) {
+            if turn.role == "trader" && !trade_intent_looks_valid(&text) {
                 turn.tools_disabled = true;
                 turn.push_pending_input(
-                    "Your last message is commentary, not the required debate packet JSON. Emit the interaction packet JSON required by the role prompt now. Do not call tools again.",
+                    "Your last output is invalid for trader. Emit the TradeIntent required by the current role schema. Hold must use position_size=0%. Do not call tools again.",
+                );
+                turn.needs_follow_up = true;
+                persist_turn(conn, turn, &config.truncation)?;
+                continue;
+            }
+            if turn.role.starts_with("risk.") && !risk_constraints_look_valid(&turn.role, &text) {
+                turn.tools_disabled = true;
+                turn.push_pending_input(
+                    "Your last output is invalid for this risk role. Emit the RiskConstraints required by the current role schema, including stance, numeric caps, stop policy, triggers, review window, hedge recommendation, and confidence. Do not call tools again.",
+                );
+                turn.needs_follow_up = true;
+                persist_turn(conn, turn, &config.truncation)?;
+                continue;
+            }
+            if interaction_packet_role(&turn.role)
+                && !interaction_packet_looks_valid(&turn.role, &text)
+            {
+                turn.tools_disabled = true;
+                turn.push_pending_input(
+                    "Your last JSON is invalid for this interaction role. Emit the exact role-specific debate packet with role, artifact_type, topic_id, reply_to, stance, claim, evidence_refs, confidence, send_to_mediator, blocked_ack, and steelman unless stance=no_new_info. Do not call tools again.",
+                );
+                turn.needs_follow_up = true;
+                persist_turn(conn, turn, &config.truncation)?;
+                continue;
+            }
+            if turn.role == "mediator.topic_controller" && !controller_packet_looks_valid(&text) {
+                turn.tools_disabled = true;
+                turn.push_pending_input(
+                    "Your last JSON is invalid for mediator.topic_controller. Emit the topic_controller_packet required by the current role schema, including evidence-backed decision_hinges, agreed_facts, info_gain_score, and soft_control. Do not call tools again.",
+                );
+                turn.needs_follow_up = true;
+                persist_turn(conn, turn, &config.truncation)?;
+                continue;
+            }
+            if turn.role == "allocation.manager" && !allocation_artifact_looks_valid(&text) {
+                turn.tools_disabled = true;
+                turn.push_pending_input(
+                    "Your last JSON is invalid for allocation.manager. Emit the top-level PortfolioAllocation object required by the runtime schema. Do not wrap it inside id/role/status/report or another envelope. Do not call tools again.",
                 );
                 turn.needs_follow_up = true;
                 persist_turn(conn, turn, &config.truncation)?;
@@ -1429,9 +1471,31 @@ fn build_model_input(
     Ok(ModelInput {
         items,
         available_tools: tools.clone(),
-        system_instruction: Some(react_system_instruction(&tools)),
+        system_instruction: Some(react_system_instruction(
+            &tools,
+            &turn.role,
+            &turn_tickers(turn),
+        )),
         truncation: config.truncation.clone(),
     })
+}
+
+fn turn_tickers(turn: &Turn) -> Vec<String> {
+    turn.model_context
+        .lines()
+        .find_map(|line| {
+            line.split(", ")
+                .find_map(|field| field.strip_prefix("tickers="))
+        })
+        .map(|tickers| {
+            tickers
+                .split(',')
+                .map(str::trim)
+                .filter(|ticker| !ticker.is_empty())
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn estimate_turn_item_tokens(item: &TurnItem) -> usize {
@@ -1930,27 +1994,257 @@ fn seed_packet_looks_valid(role: &str, text: &str) -> bool {
     } else {
         "bull_seed_packet"
     };
-    value.get("artifact_type").and_then(Value::as_str) == Some(expected)
+    let constraint_field = if role.contains("bear") {
+        "known_bull_constraint"
+    } else {
+        "known_bear_constraint"
+    };
+    value.get("role").and_then(Value::as_str) == Some(role)
+        && value.get("artifact_type").and_then(Value::as_str) == Some(expected)
         && value
             .get("claims")
             .and_then(Value::as_array)
-            .is_some_and(|claims| !claims.is_empty())
+            .is_some_and(|claims| {
+                !claims.is_empty()
+                    && claims.iter().all(|claim| {
+                        non_empty_string_field(claim, "claim_id")
+                            && non_empty_string_field(claim, "decision_hinge")
+                            && non_empty_string_field(claim, "claim")
+                            && claim
+                                .get("evidence_refs")
+                                .and_then(Value::as_array)
+                                .is_some()
+                            && claim
+                                .get("confidence")
+                                .and_then(Value::as_f64)
+                                .is_some_and(|confidence| (0.0..=1.0).contains(&confidence))
+                            && non_empty_string_field(claim, constraint_field)
+                            && claim
+                                .get("needs_mediator_check")
+                                .and_then(Value::as_bool)
+                                .is_some()
+                    })
+            })
         && value
             .get("topic_id")
             .and_then(Value::as_str)
             .is_some_and(|topic| !topic.trim().is_empty())
+        && non_empty_string_field(&value, "summary")
+        && value
+            .get("reducer_checks")
+            .and_then(Value::as_object)
+            .is_some()
 }
 
 fn interaction_packet_role(role: &str) -> bool {
     role.contains(".interaction")
 }
 
-fn interaction_packet_looks_valid(text: &str) -> bool {
+fn interaction_packet_looks_valid(role: &str, text: &str) -> bool {
+    let Ok(value) = extract_json_value(text) else {
+        return false;
+    };
+    let expected_type = if role == "researcher.bull.interaction" {
+        "bull_debate_packet"
+    } else if role == "researcher.bear.interaction" {
+        "bear_debate_packet"
+    } else {
+        return false;
+    };
     !assistant_message_needs_follow_up(text)
-        && extract_json_value(text).is_ok_and(|value| value.is_object())
+        && value.get("role").and_then(Value::as_str) == Some(role)
+        && value.get("artifact_type").and_then(Value::as_str) == Some(expected_type)
+        && non_empty_string_field(&value, "topic_id")
+        && non_empty_string_field(&value, "reply_to")
+        && value
+            .get("stance")
+            .and_then(Value::as_str)
+            .is_some_and(|stance| {
+                matches!(
+                    stance,
+                    "accept" | "rebut" | "downgrade" | "needs_evidence" | "no_new_info"
+                )
+            })
+        && non_empty_string_field(&value, "claim")
+        && value
+            .get("evidence_refs")
+            .and_then(Value::as_array)
+            .is_some()
+        && value
+            .get("confidence")
+            .and_then(Value::as_f64)
+            .is_some_and(|confidence| (0.0..=1.0).contains(&confidence))
+        && non_empty_string_field(&value, "send_to_mediator")
+        && value.get("blocked_ack").and_then(Value::as_array).is_some()
+        && (value.get("stance").and_then(Value::as_str) == Some("no_new_info")
+            || value.get("steelman").and_then(Value::as_object).is_some())
 }
 
-fn research_artifact_looks_valid(text: &str) -> bool {
+fn controller_packet_looks_valid(text: &str) -> bool {
+    let Ok(value) = extract_json_value(text) else {
+        return false;
+    };
+    !assistant_message_needs_follow_up(text)
+        && value.get("role").and_then(Value::as_str) == Some("mediator.topic_controller")
+        && value.get("artifact_type").and_then(Value::as_str) == Some("topic_controller_packet")
+        && non_empty_string_field(&value, "topic_id")
+        && [
+            "claim_ledger",
+            "accepted_for_opponent",
+            "rejected_to_origin",
+            "blocked_claims",
+            "agreed_facts",
+            "decision_hinges",
+        ]
+        .iter()
+        .all(|field| value.get(*field).and_then(Value::as_array).is_some())
+        && ["next_steers", "topic_summary_delta", "reducer_checks"]
+            .iter()
+            .all(|field| value.get(*field).and_then(Value::as_object).is_some())
+        && value
+            .get("decision_hinges")
+            .and_then(Value::as_array)
+            .is_some_and(|hinges| {
+                hinges.iter().all(|hinge| {
+                    non_empty_string_field(hinge, "hinge")
+                        && hinge
+                            .get("evidence_refs")
+                            .and_then(Value::as_array)
+                            .is_some_and(|refs| !refs.is_empty())
+                })
+            })
+        && value
+            .get("info_gain_score")
+            .and_then(Value::as_f64)
+            .is_some_and(|score| (0.0..=1.0).contains(&score))
+        && value
+            .get("soft_control")
+            .and_then(Value::as_object)
+            .is_some_and(|soft_control| {
+                soft_control
+                    .get("should_continue")
+                    .and_then(Value::as_bool)
+                    .is_some()
+                    && soft_control
+                        .get("stop_reason")
+                        .and_then(Value::as_str)
+                        .is_some_and(|reason| !reason.trim().is_empty())
+            })
+}
+
+fn allocation_artifact_looks_valid(text: &str) -> bool {
+    let Ok(value) = extract_json_value(text) else {
+        return false;
+    };
+    let Some(weights) = value.get("weights").and_then(Value::as_object) else {
+        return false;
+    };
+    let parsed = weights
+        .iter()
+        .map(|(ticker, entry)| {
+            entry
+                .as_f64()
+                .or_else(|| entry.get("weight").and_then(Value::as_f64))
+                .filter(|weight| (0.0..=1.0).contains(weight))
+                .map(|weight| (ticker, weight))
+        })
+        .collect::<Option<Vec<_>>>();
+    let Some(parsed) = parsed.filter(|items| !items.is_empty()) else {
+        return false;
+    };
+    let total_weight = parsed.iter().map(|(_, weight)| *weight).sum::<f64>();
+    let equity_weight = parsed
+        .iter()
+        .filter(|(ticker, _)| ticker.as_str() != "cash_hedge")
+        .map(|(_, weight)| *weight)
+        .sum::<f64>();
+    !assistant_message_needs_follow_up(text)
+        && (total_weight - 1.0).abs() <= 0.03
+        && value
+            .get("total_equity_exposure")
+            .and_then(Value::as_f64)
+            .is_some_and(|exposure| {
+                (0.0..=1.0).contains(&exposure) && (exposure - equity_weight).abs() <= 0.03
+            })
+        && non_empty_string_field(&value, "vix_regime")
+        && non_empty_string_field(&value, "correlation_note")
+        && non_empty_string_field(&value, "summary")
+}
+
+fn non_empty_string_field(value: &Value, field: &str) -> bool {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .is_some_and(|field| !field.trim().is_empty())
+}
+
+fn trade_intent_looks_valid(text: &str) -> bool {
+    let Ok(value) = extract_json_value(text) else {
+        return false;
+    };
+    let action = value.get("action").and_then(Value::as_str);
+    let position_cap = value
+        .get("position_size")
+        .and_then(Value::as_str)
+        .and_then(position_upper_bound);
+    matches!(action, Some("Buy" | "Sell" | "Hold"))
+        && position_cap.is_some()
+        && !(action == Some("Hold") && position_cap.is_some_and(|cap| cap > f64::EPSILON))
+        && non_empty_string_field(&value, "rationale")
+}
+
+fn position_upper_bound(value: &str) -> Option<f64> {
+    value
+        .split(['-', '–', '—'])
+        .filter_map(|part| {
+            part.trim()
+                .strip_suffix('%')
+                .and_then(|percent| percent.trim().parse::<f64>().ok())
+                .map(|percent| (percent / 100.0).clamp(0.0, 1.0))
+        })
+        .max_by(f64::total_cmp)
+}
+
+fn risk_constraints_look_valid(role: &str, text: &str) -> bool {
+    let Ok(value) = extract_json_value(text) else {
+        return false;
+    };
+    let expected_stance = role.strip_prefix("risk.").unwrap_or_default();
+    value.get("stance").and_then(Value::as_str) == Some(expected_stance)
+        && non_empty_string_field(&value, "argument")
+        && non_empty_string_field(&value, "recommended_adjustment")
+        && value
+            .get("stop_type")
+            .and_then(Value::as_str)
+            .is_some_and(|stop_type| {
+                matches!(
+                    stop_type,
+                    "none" | "tight" | "trailing" | "event_based" | "time_based"
+                )
+            })
+        && [
+            "max_drawdown_pct",
+            "position_cap_pct",
+            "constraint_confidence",
+        ]
+        .iter()
+        .all(|field| {
+            value
+                .get(*field)
+                .and_then(Value::as_f64)
+                .is_some_and(|number| (0.0..=1.0).contains(&number))
+        })
+        && [
+            "rebalance_trigger",
+            "risk_off_trigger",
+            "review_window",
+            "cash_hedge_recommendation",
+        ]
+        .iter()
+        .all(|field| non_empty_string_field(&value, field))
+}
+
+fn research_artifact_looks_valid(tickers: &[String], text: &str) -> bool {
     let Ok(value) = extract_json_value(text) else {
         return false;
     };
@@ -1961,17 +2255,24 @@ fn research_artifact_looks_valid(text: &str) -> bool {
     else {
         return false;
     };
-    orchestrator_core::validate_research_artifact(&artifact, &[]).is_ok()
+    orchestrator_core::validate_research_artifact(&artifact, tickers).is_ok()
 }
 
-fn analyst_final_artifact_looks_valid(text: &str) -> bool {
+fn analyst_final_artifact_looks_valid(role: &str, expected_tickers: &[String], text: &str) -> bool {
     let Ok(value) = extract_json_value(text) else {
         return false;
     };
+    if value.get("role").and_then(Value::as_str) != Some(role) {
+        return false;
+    }
     let Some(per_ticker) = value.get("per_ticker").and_then(Value::as_object) else {
         return false;
     };
-    if per_ticker.is_empty() {
+    let expected = expected_tickers
+        .iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    let actual = per_ticker.keys().collect::<std::collections::BTreeSet<_>>();
+    if actual != expected {
         return false;
     }
     per_ticker.values().all(|payload| {
@@ -2058,9 +2359,14 @@ pub(crate) fn assistant_message_needs_follow_up(text: &str) -> bool {
     )
 }
 
-pub fn react_system_instruction(available_tools: &[String]) -> String {
+pub fn react_system_instruction(
+    available_tools: &[String],
+    executing_role: &str,
+    tickers: &[String],
+) -> String {
     format!(
         "You are running inside an agent loop runtime. Decide the next step from these ordered context items.\n\
+You are executing role `{executing_role}` for exactly these tickers: {}. A final artifact's role must exactly equal `{executing_role}`. Analyst final artifacts must contain per_ticker entries for exactly this ticker set; do not substitute, rename, or omit tickers.\n\
 Return newline-delimited JSON events only. Each line must be one complete JSON object, with no markdown fences.\n\
 Use assistant message events for visible text. Intermediate explanations, plans, and current action notes should be emitted as assistant_message items; the runtime records them as commentary until the turn truly ends.\n\
 Supported event shapes:\n\
@@ -2071,9 +2377,10 @@ Supported event shapes:\n\
 {{\"type\":\"reasoning_summary_completed\",\"item_id\":\"reasoning-1\"}}\n\
 {{\"type\":\"tool_call_completed\",\"tool_call\":{{\"call_id\":\"call-1\",\"name\":\"tool_name\",\"arguments\":{{}},\"mode\":\"blocking\"}}}}\n\
 {{\"type\":\"response_completed\",\"end_turn\":true}}\n\
-The `turn_status` field in assistant_message_completed events is optional but recommended. Set it to \"final\" when the message contains the complete role artifact (JSON with id, role, status, per_ticker). Set it to \"intermediate\" when the message is commentary, planning, or asking for inputs before producing the final artifact. If omitted, the runtime will infer the status from message content.\n\
-If you need a tool, emit any visible commentary first, then tool_call_completed, then response_completed with end_turn=false. If tool results answer the task, emit the final assistant_message and response_completed with end_turn=true. A final assistant_message must be the complete role artifact, preferably one JSON object with id, role, status, report, and per_ticker. Do not end the turn with text saying you are about to retry, fetch, analyze, or wait for inputs; call the tool or produce the final artifact. For web.run use {{\"search_query\":[{{\"q\":\"TQQQ QQQ VIX site:reddit.com\",\"domains\":[\"reddit.com\"],\"numResults\":10}}],\"response_length\":\"medium\"}}. For fetch_last30days_context use {{\"source\":\"reddit\",\"tickers\":[\"TQQQ\"]}}. The runtime also accepts the older single-object response shape only as a compatibility fallback.\n\n\
+The `turn_status` field in assistant_message_completed events is optional but recommended. Set it to \"final\" when the message contains the complete artifact required by the current role schema. Set it to \"intermediate\" when the message is commentary, planning, or asking for inputs before producing the final artifact. If omitted, the runtime will infer the status from message content.\n\
+If you need a tool, emit any visible commentary first, then tool_call_completed, then response_completed with end_turn=false. If tool results answer the task, emit the final assistant_message and response_completed with end_turn=true. A final assistant_message must exactly match the current role prompt and runtime validator; do not add a generic id/role/status/report envelope unless that role schema defines one. Do not end the turn with text saying you are about to retry, fetch, analyze, or wait for inputs; call the tool or produce the final artifact. For web.run use {{\"search_query\":[{{\"q\":\"<TICKER> site:reddit.com\",\"domains\":[\"reddit.com\"],\"numResults\":10}}],\"response_length\":\"medium\"}} (replace <TICKER> with the actual tickers from your role prompt). For fetch_last30days_context use {{\"source\":\"reddit\",\"tickers\":[\"<TICKER>\"]}}. The runtime also accepts the older single-object response shape only as a compatibility fallback.\n\n\
 Available tools:\n{}",
+        serde_json::to_string(tickers).unwrap_or_default(),
         serde_json::to_string_pretty(available_tools).unwrap_or_default()
     )
 }
@@ -2164,7 +2471,10 @@ pub fn extract_token_usage(raw: &Value) -> TokenUsage {
 }
 
 pub fn react_prompt(input: &ModelInput) -> Result<String> {
-    let system = react_system_instruction(&input.available_tools);
+    let system = input
+        .system_instruction
+        .clone()
+        .unwrap_or_else(|| react_system_instruction(&input.available_tools, "unknown", &[]));
     let mut static_items = Vec::new();
     let mut dynamic_items = Vec::new();
     let mut captured_role_prompt = false;
@@ -2432,18 +2742,6 @@ impl LoopToolRuntime for ProjectToolRuntime {
                 tool = call.name,
                 "project tool runtime dispatching tool"
             );
-            if call.name == "think" {
-                return ToolResultItem {
-                    call_id: call.call_id,
-                    name: call.name,
-                    status: "completed".to_string(),
-                    output: json!({
-                        "status": "completed",
-                        "summary": call.arguments
-                    }),
-                    error: None,
-                };
-            }
             let web_run_config = web_run.as_ref().map(tools::WebRunRuntime::config);
             let configured = available_tools.iter().any(|name| name == &call.name);
             let enabled = call.name == "think"
@@ -2460,6 +2758,18 @@ impl LoopToolRuntime for ProjectToolRuntime {
                     status: "error".to_string(),
                     output: Value::Null,
                     error: Some("unknown tool name".to_string()),
+                };
+            }
+            if call.name == "think" {
+                return ToolResultItem {
+                    call_id: call.call_id,
+                    name: call.name,
+                    status: "completed".to_string(),
+                    output: json!({
+                        "status": "completed",
+                        "summary": call.arguments
+                    }),
+                    error: None,
                 };
             }
             let call_id = call.call_id;
@@ -2581,6 +2891,22 @@ impl LoopToolRuntime for StaticToolRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn turn_tickers_reads_generated_model_context() {
+        let mut turn = Turn::new(
+            "turn-1",
+            "session-1",
+            "run-1",
+            "analyst.technical",
+            "prompt",
+        );
+        turn.model_context =
+            "role=analyst.technical, output_mode=JsonArtifact, tickers=QQQ,SOXX\navailable_tools=[]"
+                .to_string();
+
+        assert_eq!(turn_tickers(&turn), vec!["QQQ", "SOXX"]);
+    }
     use crate::web_search::{MockWebPage, MockWebSearchProvider, WebSearchConfig, WebSearchMode};
     use orchestrator_sql::ensure_schema;
     use serde_json::json;
@@ -2754,22 +3080,114 @@ mod tests {
                     "rating":"Hold",
                     "long_probability":0.55,
                     "short_probability":0.45,
-                    "plan":["Watch confirmation"]
+                    "confidence_basis":"evidence_balanced",
+                    "hold_reason":"evidence_balanced",
+                    "plan":["Watch confirmation"],
+                    "probability_rationale":"Evidence remains balanced."
                 }
             }
         }"#;
-        assert!(research_artifact_looks_valid(text));
-        assert!(!research_artifact_looks_valid("正在读取完整上下文"));
+        assert!(research_artifact_looks_valid(&["QQQ".to_string()], text));
+        assert!(!research_artifact_looks_valid(
+            &["QQQ".to_string()],
+            "正在读取完整上下文"
+        ));
     }
 
     #[test]
     fn interaction_packet_looks_valid_rejects_action_notes() {
         assert!(interaction_packet_role("researcher.bull.interaction"));
         assert!(!interaction_packet_looks_valid(
+            "researcher.bull.interaction",
             "接下来我会分析并给出 packet"
         ));
-        assert!(interaction_packet_looks_valid(
-            r#"{"role":"researcher.bull.interaction","artifact_type":"bull_debate_packet","claims":[]}"#
+        assert!(!interaction_packet_looks_valid(
+            "researcher.bull.interaction",
+            r#"{"role":"mediator.topic_controller","artifact_type":"topic_controller_packet"}"#
+        ));
+    }
+
+    #[test]
+    fn seed_packet_looks_valid_rejects_another_role() {
+        let text = r#"{
+            "role":"researcher.bear.initial",
+            "artifact_type":"bull_seed_packet",
+            "topic_id":"qqq-trend",
+            "claims":[{"claim":"upside"}]
+        }"#;
+
+        assert!(!seed_packet_looks_valid("researcher.bull.initial", text));
+    }
+
+    #[test]
+    fn seed_packet_looks_valid_rejects_incomplete_claims() {
+        let text = r#"{
+            "role":"researcher.bull.initial",
+            "artifact_type":"bull_seed_packet",
+            "topic_id":"qqq-trend",
+            "claims":[{"claim":"upside"}],
+            "summary":"one claim",
+            "reducer_checks":{}
+        }"#;
+
+        assert!(!seed_packet_looks_valid("researcher.bull.initial", text));
+    }
+
+    #[test]
+    fn analyst_final_packet_requires_exact_role_and_ticker_set() {
+        let expected_tickers = vec!["QQQ".to_string(), "SOXX".to_string()];
+        let wrong_role = r#"{
+            "role":"analyst.youtube",
+            "per_ticker":{
+                "QQQ":{"direction":"bullish","confidence":0.7},
+                "SOXX":{"direction":"bearish","confidence":0.6}
+            }
+        }"#;
+        let wrong_ticker = r#"{
+            "role":"analyst.technical",
+            "per_ticker":{
+                "QQQ":{"direction":"bullish","confidence":0.7},
+                "TQQQ":{"direction":"bearish","confidence":0.6}
+            }
+        }"#;
+
+        assert!(!analyst_final_artifact_looks_valid(
+            "analyst.technical",
+            &expected_tickers,
+            wrong_role
+        ));
+        assert!(!analyst_final_artifact_looks_valid(
+            "analyst.technical",
+            &expected_tickers,
+            wrong_ticker
+        ));
+    }
+
+    #[test]
+    fn controller_and_allocation_final_packets_reject_incomplete_or_wrapped_json() {
+        assert!(!controller_packet_looks_valid(
+            r#"{"role":"mediator.topic_controller","artifact_type":"topic_controller_packet","topic_id":"qqq"}"#
+        ));
+        assert!(!allocation_artifact_looks_valid(
+            r#"{
+                "role":"allocation.manager",
+                "report":{
+                    "weights":{"cash_hedge":{"weight":1.0}},
+                    "total_equity_exposure":0.0,
+                    "vix_regime":"normal",
+                    "correlation_note":"none",
+                    "summary":"cash"
+                }
+            }"#
+        ));
+        assert!(allocation_artifact_looks_valid(
+            r#"{
+                "weights":{"cash_hedge":{"weight":1.0}},
+                "total_equity_exposure":0.0,
+                "vix_regime":"normal",
+                "correlation_note":"none",
+                "summary":"cash"
+            }"#
         ));
     }
 
@@ -3095,6 +3513,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn project_runtime_rejects_unconfigured_think_tool() {
+        let runtime = ProjectToolRuntime::with_available_tools(
+            tools::ExternalToolConfig {
+                project_root: PathBuf::from("."),
+                db_path: None,
+                run_dir: None,
+                run_id: None,
+                tickers: Vec::new(),
+            },
+            Vec::new(),
+        );
+
+        let result = runtime
+            .execute(ToolCallRequest {
+                call_id: "call-think".to_string(),
+                name: "think".to_string(),
+                arguments: json!({"summary": "should not run"}),
+            })
+            .await;
+
+        assert_eq!(result.status, "error");
+        assert_eq!(result.error.as_deref(), Some("unknown tool name"));
+    }
+
+    #[tokio::test]
     async fn intermediate_assistant_text_before_tool_call_keeps_turn_open_for_follow_up() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         ensure_schema(&conn).unwrap();
@@ -3238,6 +3681,21 @@ mod tests {
         assert!(!prompt[static_index..dynamic_index].contains("dynamic assistant note"));
         assert!(prompt[dynamic_index..].contains("dynamic assistant note"));
         assert!(prompt[dynamic_index..].contains("read_run_context"));
+    }
+
+    #[test]
+    fn react_system_instruction_keeps_executing_role_and_tickers_visible() {
+        let instruction = react_system_instruction(
+            &[],
+            "analyst.technical",
+            &["QQQ".to_string(), "SOXX".to_string()],
+        );
+
+        assert!(instruction.contains("analyst.technical"));
+        assert!(instruction.contains("QQQ"));
+        assert!(instruction.contains("SOXX"));
+        assert!(instruction.contains("artifact required by the current role schema"));
+        assert!(!instruction.contains("JSON with id, role, status, per_ticker"));
     }
 
     #[test]

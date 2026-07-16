@@ -31,8 +31,7 @@
 4. `rationale` 必须说明动作如何来自 research_plan，包含最强支持因素、最强反对因素、以及为什么不是更激进或更保守。
 5. 不输出订单类型、杠杆倍数、日内交易指令或未在 schema 中定义的字段。
 
-输出契约：TradeIntent。必须是纯 JSON，不要使用 Markdown 代码块。schema：
-{trade_intent_schema}
+输出受运行时 TradeIntent schema 与 validator 约束。只返回顶层 TradeIntent JSON，不要使用 Markdown 代码块或额外 envelope；`Hold` 必须使用 `position_size="0%"`。
 
 <!-- DYNAMIC SUFFIX (changes every call) -->
 研究计划：

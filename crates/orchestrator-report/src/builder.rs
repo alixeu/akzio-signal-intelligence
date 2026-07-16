@@ -129,10 +129,26 @@ fn executive_summary(research: &Value, trader: &Value, final_decision: &Value) -
         .get("action")
         .and_then(Value::as_str)
         .unwrap_or("N/A");
+    let confidence_basis = research
+        .get("confidence_basis")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty());
+    let hold_reason = research
+        .get("hold_reason")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty());
+    let mut basis_summary = String::new();
+    if let Some(value) = confidence_basis {
+        basis_summary.push_str(&format!("Confidence basis: {value}\n"));
+    }
+    if let Some(value) = hold_reason {
+        basis_summary.push_str(&format!("Hold reason: {value}\n"));
+    }
 
     format!(
         "## 1. Executive Summary\n\n\
         Current rating: **{rating}** (long: {long_prob}, short: {short_prob}).\n\
+        {basis_summary}\
         {rationale}\n\n\
         **Dominant Driver:** {dominant_driver}\n\
         **Why Now:** {why_now}\n\n\
@@ -849,6 +865,8 @@ mod tests {
                 "rating": "Hold",
                 "long_probability": 0.5,
                 "short_probability": 0.5,
+                "confidence_basis": "data_insufficient",
+                "hold_reason": "evidence_insufficient",
                 "probability_rationale": "Neutral.",
                 "plan": "Monitor."
             }
@@ -859,6 +877,8 @@ mod tests {
         assert!(report.contains("- Monitor."));
         assert!(report.contains("- No bull evidence recorded."));
         assert!(report.contains("- No specific risks identified."));
+        assert!(report.contains("Confidence basis: data_insufficient"));
+        assert!(report.contains("Hold reason: evidence_insufficient"));
     }
 
     #[test]

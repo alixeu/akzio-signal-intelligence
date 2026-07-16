@@ -56,7 +56,7 @@
    - **failed_breakout_risk**：假突破 / 跌破后快速回拉，是短线最易误判的结构，必须明确说明当前是否存在以及触发确认条件。
    - **volume-price divergence**：量价背离（价升量缩 / 价跌量增 / 指标与价格背离），是趋势衰竭或反转的早期信号，需点明。
    - **signal expiry**：技术信号有保质期；结合第 9 条 `signal_age`，明确哪些信号已偏旧、哪些仍新鲜，旧信号权重自动下降。
-19. **必须填写机器可读来源质量字段（自动出现在 `{analyst_artifact_schema}` JSON Schema 中）。** 对每条 `key_evidence`：
+19. **必须填写运行时 analyst artifact schema 定义的机器可读来源质量字段。** 对每条 `key_evidence`：
    - `source_tier`：结构化技术读数/解读通常取 `professional_research` 或 `longform_analysis`（标准化指标读数源于入库技术表，属 `longform_analysis`）；不要取 social 类。
    - `first_source`：该读数最早来源（例如 “Yahoo 1d 技术表 `RSI5` 字段”）。
    - `is_derivative_repost`：技术读数源于入库标准表，通常不是转载，取 `false`；若引用他人图表/视频解读，取 `true` 并填最早出处。

@@ -76,7 +76,6 @@ impl Mode {
 
 #[derive(Debug, Clone, Args)]
 pub struct ExecArgs {
-    pub ticker: String,
     #[arg(long)]
     pub date: Option<String>,
     #[arg(long, default_value = "zh")]
@@ -151,7 +150,6 @@ fn is_mock(state: &Value) -> bool {
 pub async fn run(args: ExecArgs) -> Result<Value> {
     validate_args(&args)?;
     debug!(
-        ticker = %args.ticker,
         mode = args.mode.as_str(),
         mock = args.mock,
         debug = args.debug,
@@ -159,11 +157,6 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         to_phase = args.to_phase,
         "orchestrator exec starting"
     );
-    let tickers = parse_tickers(&args.ticker);
-    if tickers.is_empty() {
-        bail!("ticker is required");
-    }
-    let ticker = display_ticker(&tickers);
     let date = args
         .date
         .clone()
@@ -180,6 +173,15 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
     } else {
         load_config(Some(&config_path)).unwrap_or_else(|_| json!({}))
     };
+    // Run tickers come from config analysis_universe (includes VIX for research).
+    // allocation.investable_assets is separate and only used later for sizing.
+    let tickers =
+        parse_tickers(config_strings(&config, "orchestrator.analysis_universe", &[]).join(","));
+    if tickers.is_empty() {
+        bail!("orchestrator.analysis_universe is required in config (e.g. [QQQ, SOXX, VIX])");
+    }
+    let ticker = display_ticker(&tickers);
+    let analysis_universe = tickers.clone();
     let runtime_config = RuntimeConfig::from_value(&config)?;
     debug!(
         plugins_enabled = runtime_config.plugins.enabled,
@@ -217,16 +219,6 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
 
     let analyst_weights =
         phase1_analyst_weights(&config, &args, &phase1_agents, explicit_phase1_agents);
-    // Yahoo/technical preflight follows analysis_universe (includes VIX).
-    // allocation.investable_assets is separate and only used later for sizing.
-    let analysis_universe = {
-        let configured = config_strings(&config, "orchestrator.analysis_universe", &[]);
-        if configured.is_empty() {
-            tickers.clone()
-        } else {
-            configured
-        }
-    };
     let mut state = json!({
         "run_id": run_id,
         "ticker": ticker,
@@ -313,8 +305,14 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             &runtime_config,
         )
         .await?;
-        set_phase_status(&mut state, 2, "done");
-        set_phase_status(&mut state, PHASE2_REDUCER, "done");
+        let phase2_actionable = state
+            .get("topic_generation_artifact")
+            .and_then(|artifact| artifact.get("actionable"))
+            .and_then(Value::as_bool)
+            != Some(false);
+        let phase2_status = if phase2_actionable { "done" } else { "skipped" };
+        set_phase_status(&mut state, 2, phase2_status);
+        set_phase_status(&mut state, PHASE2_REDUCER, phase2_status);
         record_phase_elapsed(&mut state, phase_timer);
         debug!("phase 2 completed");
     }
@@ -749,6 +747,266 @@ fn should_run_portfolio_review(
     config: &RuntimeConfig,
 ) -> bool {
     !is_selective_policy(config) || policy.is_none_or(|decision| decision.need_portfolio_review)
+}
+
+const PHASE3_PROBABILITY_DRIFT_LIMIT: f64 = 0.08;
+const PHASE3_PROBABILITY_DRIFT_CRITICAL: f64 = 0.15;
+
+fn phase3_probability_drift_violations(state: &Value, artifact: &Value) -> Vec<Value> {
+    let weighted_base = state
+        .get("phase1_state_artifact")
+        .and_then(|value| value.get("weighted_probability_base"))
+        .and_then(Value::as_object);
+    let primary_ticker = tickers_from_state(state)
+        .into_iter()
+        .next()
+        .or_else(|| weighted_base.and_then(|items| items.keys().next().cloned()));
+    weighted_base
+        .into_iter()
+        .flatten()
+        .filter_map(|(ticker, base)| {
+            let base_long = base
+                .get("long_probability")
+                .or_else(|| base.get("weighted_long_probability"))
+                .or_else(|| base.get("probability"))
+                .and_then(Value::as_f64)?;
+            let base_short = base
+                .get("short_probability")
+                .or_else(|| base.get("weighted_short_probability"))
+                .and_then(Value::as_f64)
+                .unwrap_or(1.0 - base_long);
+            let is_primary = primary_ticker.as_deref() == Some(ticker.as_str());
+            let proposed_long = research_decision_for_ticker(artifact, ticker)
+                .and_then(|decision| {
+                    decision
+                .get("long_probability")
+                        .and_then(Value::as_f64)
+                })
+                .or_else(|| {
+                    is_primary
+                        .then(|| artifact.get("long_probability").and_then(Value::as_f64))
+                        .flatten()
+                });
+            let base_confidence_basis = state
+                .get("phase1_state_artifact")
+                .and_then(|value| value.get("per_ticker"))
+                .and_then(Value::as_object)
+                .and_then(|items| items.get(ticker))
+                .and_then(|value| value.get("evidence_quality"))
+                .and_then(|value| value.get("confidence_basis"))
+                .cloned()
+                .unwrap_or_else(|| json!("evidence_available"));
+            let Some(proposed_long) = proposed_long else {
+                return Some(json!({
+                    "ticker": ticker,
+                    "base_long_probability": base_long,
+                    "base_short_probability": base_short,
+                    "base_confidence_basis": base_confidence_basis,
+                    "proposed_long_probability": Value::Null,
+                    "delta": Value::Null,
+                    "severity": "critical",
+                    "is_primary": is_primary,
+                    "reason": "manager.research omitted a numeric per-ticker long_probability"
+                }));
+            };
+            let delta = (proposed_long - base_long).abs();
+            (delta > PHASE3_PROBABILITY_DRIFT_LIMIT
+                && !debate_justifies_probability_drift(state, ticker))
+            .then(|| {
+                json!({
+                    "ticker": ticker,
+                    "base_long_probability": base_long,
+                    "base_short_probability": base_short,
+                    "base_confidence_basis": base_confidence_basis,
+                    "proposed_long_probability": proposed_long,
+                    "delta": delta,
+                    "severity": if delta > PHASE3_PROBABILITY_DRIFT_CRITICAL { "critical" } else { "warning" },
+                    "is_primary": is_primary,
+                    "reason": "probability drift exceeds 0.08 without a converged decision hinge and evidence references"
+                })
+            })
+        })
+        .collect()
+}
+
+fn debate_justifies_probability_drift(state: &Value, ticker: &str) -> bool {
+    let Some(debate) = state.get("debate_state_artifact") else {
+        return false;
+    };
+    let per_ticker_support = debate
+        .get("per_ticker")
+        .and_then(Value::as_object)
+        .and_then(|items| items.get(ticker))
+        .is_some_and(|item| is_explicitly_converged(item) && has_evidence_backed_hinge(item));
+    per_ticker_support
+        || debate
+            .get("topic_briefs")
+            .and_then(Value::as_array)
+            .is_some_and(|briefs| {
+                briefs.iter().any(|brief| {
+                    topic_brief_targets_ticker(brief, ticker)
+                        && is_explicitly_converged(brief)
+                        && has_evidence_backed_hinge(brief)
+                })
+            })
+}
+
+fn is_explicitly_converged(value: &Value) -> bool {
+    ["convergence_status", "status"]
+        .iter()
+        .any(|key| value.get(*key).and_then(Value::as_str) == Some("converged"))
+        || value
+            .get("controller_artifact")
+            .is_some_and(is_explicitly_converged)
+}
+
+fn topic_brief_targets_ticker(brief: &Value, ticker: &str) -> bool {
+    brief
+        .get("tickers")
+        .and_then(Value::as_array)
+        .is_some_and(|items| items.iter().any(|item| item.as_str() == Some(ticker)))
+        || brief.get("target_ticker").and_then(Value::as_str) == Some(ticker)
+}
+
+fn has_evidence_backed_hinge(value: &Value) -> bool {
+    match value {
+        Value::Array(items) => items.iter().any(has_evidence_backed_hinge),
+        Value::Object(object) => {
+            let direct_hinge = object
+                .get("decision_hinge")
+                .or_else(|| object.get("hinge"))
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.trim().is_empty());
+            let hinge_list = object
+                .get("decision_hinges")
+                .and_then(Value::as_array)
+                .is_some_and(|items| !items.is_empty());
+            let direct_evidence = [
+                "evidence_refs",
+                "source_refs",
+                "long_evidence_refs",
+                "short_evidence_refs",
+            ]
+            .iter()
+            .any(|key| {
+                object
+                    .get(*key)
+                    .and_then(Value::as_array)
+                    .is_some_and(|items| !items.is_empty())
+            });
+            ((direct_hinge || hinge_list) && direct_evidence)
+                || object.values().any(has_evidence_backed_hinge)
+        }
+        _ => false,
+    }
+}
+
+fn phase3_probability_retry_state(state: &Value, violations: &[Value]) -> Value {
+    let mut retry_state = state.clone();
+    for violation in violations {
+        let Some(ticker) = violation.get("ticker").and_then(Value::as_str) else {
+            continue;
+        };
+        retry_state["debate_state_artifact"]["per_ticker"][ticker]
+            ["manager_probability_guard_retry"] = json!({
+            "status": "previous_manager_probability_rejected",
+            "base_long_probability": violation.get("base_long_probability").cloned().unwrap_or(Value::Null),
+            "proposed_long_probability": violation.get("proposed_long_probability").cloned().unwrap_or(Value::Null),
+            "delta": violation.get("delta").cloned().unwrap_or(Value::Null),
+            "requirement": "Keep abs(final-base) <= 0.08 unless an explicitly converged decision hinge has evidence references."
+        });
+    }
+    retry_state
+}
+
+fn apply_phase3_probability_fallback(mut artifact: Value, violations: &[Value]) -> Value {
+    for violation in violations {
+        let Some(ticker) = violation.get("ticker").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(base_long) = violation
+            .get("base_long_probability")
+            .and_then(Value::as_f64)
+        else {
+            continue;
+        };
+        let base_short = violation
+            .get("base_short_probability")
+            .and_then(Value::as_f64)
+            .unwrap_or(1.0 - base_long);
+        if !artifact.get("per_ticker").is_some_and(Value::is_object) {
+            artifact["per_ticker"] = json!({});
+        }
+        let base_is_insufficient = violation
+            .get("base_confidence_basis")
+            .and_then(Value::as_str)
+            == Some("data_insufficient");
+        let rating = if base_is_insufficient || (base_long - 0.5).abs() <= 0.05 {
+            "Hold"
+        } else if base_long > 0.5 {
+            "Overweight"
+        } else {
+            "Underweight"
+        };
+        let confidence_basis = if base_is_insufficient {
+            "data_insufficient"
+        } else if rating == "Hold" {
+            "evidence_balanced"
+        } else {
+            "directional_evidence"
+        };
+        let hold_reason = (rating == "Hold").then_some(if base_is_insufficient {
+            "evidence_insufficient"
+        } else {
+            "evidence_balanced"
+        });
+        let fallback_rationale = format!(
+            "Probability guard rejected the manager adjustment and restored the Phase 1.5 base for {ticker}."
+        );
+        {
+            let payload = artifact
+                .get_mut("per_ticker")
+                .and_then(Value::as_object_mut)
+                .expect("per_ticker initialized above")
+                .entry(ticker.to_string())
+                .or_insert_with(|| json!({}));
+            payload["rating"] = json!(rating);
+            payload["long_probability"] = json!(base_long);
+            payload["short_probability"] = json!(base_short);
+            payload["confidence_basis"] = json!(confidence_basis);
+            if let Some(hold_reason) = hold_reason {
+                payload["hold_reason"] = json!(hold_reason);
+            } else if let Some(object) = payload.as_object_mut() {
+                object.remove("hold_reason");
+            }
+            if let Some(object) = payload.as_object_mut() {
+                object.remove("scenarios");
+            }
+            payload["probability_rationale"] = json!(fallback_rationale.clone());
+            payload["probability_guard"] = json!({
+                "status": "clamped_to_phase1_base",
+                "proposed_long_probability": violation.get("proposed_long_probability").cloned().unwrap_or(Value::Null),
+                "delta": violation.get("delta").cloned().unwrap_or(Value::Null),
+                "severity": violation.get("severity").cloned().unwrap_or(Value::Null)
+            });
+        }
+        if violation.get("is_primary").and_then(Value::as_bool) == Some(true) {
+            artifact["rating"] = json!(rating);
+            artifact["long_probability"] = json!(base_long);
+            artifact["short_probability"] = json!(base_short);
+            artifact["confidence_basis"] = json!(confidence_basis);
+            artifact["hold_reason"] = hold_reason.map(Value::from).unwrap_or(Value::Null);
+            if let Some(object) = artifact.as_object_mut() {
+                object.remove("scenarios");
+            }
+            artifact["probability_rationale"] = json!(fallback_rationale);
+        }
+    }
+    artifact["probability_guard"] = json!({
+        "status": "clamped_to_phase1_base",
+        "violations": violations
+    });
+    artifact
 }
 
 fn start_phase_timer(phase: i64, label: &'static str) -> PhaseTimer {
@@ -1339,7 +1597,10 @@ async fn run_one_topic_debate(
         &sessions,
         Some(steer_payload(
             "seed_claims",
-            &json!({"bull_seed": bull_seed, "bear_seed": bear_seed}),
+            &json!({
+                "bull_seed": compact_debate_turn(&bull_seed),
+                "bear_seed": compact_debate_turn(&bear_seed)
+            }),
         )),
         model_override_ref,
         reasoning_effort_ref,
@@ -1354,8 +1615,12 @@ async fn run_one_topic_debate(
     turns.push(mediator_output.clone());
 
     for round in 2..=max_debate_rounds.max(2) {
-        let bull_steer = steer_for_role(&mediator_output, "bull")
-            .unwrap_or_else(|| steer_payload("respond_to_mediator", &mediator_output));
+        let bull_steer = steer_for_role(&mediator_output, "bull").unwrap_or_else(|| {
+            steer_payload(
+                "respond_to_mediator",
+                &compact_debate_turn(&mediator_output),
+            )
+        });
         let bull_rebuttal = run_topic_steer_step(
             &mut conn,
             &mut local_state,
@@ -1375,8 +1640,12 @@ async fn run_one_topic_debate(
                 .clone(),
         )
         .await?;
-        let bear_steer = steer_for_role(&mediator_output, "bear")
-            .unwrap_or_else(|| steer_payload("respond_to_mediator", &mediator_output));
+        let bear_steer = steer_for_role(&mediator_output, "bear").unwrap_or_else(|| {
+            steer_payload(
+                "respond_to_mediator",
+                &compact_debate_turn(&mediator_output),
+            )
+        });
         let bear_rebuttal = run_topic_steer_step(
             &mut conn,
             &mut local_state,
@@ -1410,7 +1679,10 @@ async fn run_one_topic_debate(
             &sessions,
             Some(steer_payload(
                 "debater_packets",
-                &json!({"bull_packet": bull_rebuttal, "bear_packet": bear_rebuttal}),
+                &json!({
+                    "bull_packet": compact_debate_turn(&bull_rebuttal),
+                    "bear_packet": compact_debate_turn(&bear_rebuttal)
+                }),
             )),
             model_override_ref,
             reasoning_effort_ref,
@@ -1434,9 +1706,9 @@ async fn run_one_topic_debate(
         if should_continue == Some(false) && round < max_debate_rounds.max(2) {
             debug!(
                 topic_id,
-                round, "phase 2 debate converged early via mediator signal, stopping"
+                round,
+                "phase 2 mediator advised stopping; continuing until the configured hard round limit"
             );
-            break;
         }
     }
 
@@ -1581,6 +1853,62 @@ fn steer_payload(kind: &str, value: &Value) -> String {
     json!({"kind": kind, "payload": value}).to_string()
 }
 
+fn compact_debate_turn(turn: &Value) -> Value {
+    let artifact = turn.get("artifact").unwrap_or(turn);
+    json!({
+        "role": turn.get("role").or_else(|| artifact.get("role")).cloned().unwrap_or(Value::Null),
+        "kind": turn.get("kind").or_else(|| artifact.get("kind")).cloned().unwrap_or(Value::Null),
+        "round": turn.get("round").or_else(|| artifact.get("round")).cloned().unwrap_or(Value::Null),
+        "topic_id": turn.get("topic_id").or_else(|| artifact.get("topic_id")).cloned().unwrap_or(Value::Null),
+        "artifact": compact_debate_artifact(artifact)
+    })
+}
+
+fn compact_debate_artifact(artifact: &Value) -> Value {
+    const FIELDS: &[&str] = &[
+        "id",
+        "role",
+        "artifact_type",
+        "topic_id",
+        "claims",
+        "summary",
+        "reducer_checks",
+        "reply_to",
+        "stance",
+        "claim",
+        "evidence_refs",
+        "confidence",
+        "send_to_mediator",
+        "blocked_ack",
+        "steelman",
+        "claim_ledger",
+        "accepted_for_opponent",
+        "rejected_to_origin",
+        "blocked_claims",
+        "next_steers",
+        "topic_summary_delta",
+        "soft_control",
+        "info_gain_score",
+        "agreed_facts",
+        "decision_hinges",
+        "missing_evidence",
+        "highest_value_next_query",
+    ];
+    let Some(object) = artifact.as_object() else {
+        return Value::Null;
+    };
+    Value::Object(
+        FIELDS
+            .iter()
+            .filter_map(|field| {
+                object
+                    .get(*field)
+                    .map(|value| ((*field).to_string(), value.clone()))
+            })
+            .collect(),
+    )
+}
+
 fn steer_for_role(controller_turn: &Value, side: &str) -> Option<String> {
     let artifact = controller_turn.get("artifact").unwrap_or(controller_turn);
     let keys = match side {
@@ -1604,6 +1932,12 @@ async fn run_phase2_topic_generation(
     let mock = is_mock(state);
     let base = build_topic_generation_artifact(state);
     state["topic_generation_artifact"] = base.clone();
+    if base.get("actionable").and_then(Value::as_bool) == Some(false) {
+        state["debate_topics"] = json!([]);
+        persist_message(conn, state, 2, "mediator.topic", "topic_final", None, base)?;
+        debug!("phase 2 topic generation skipped: no actionable Phase 1 evidence");
+        return Ok(Vec::new());
+    }
     debug!("phase 2 topic generation role starting");
     let output = run_single_role_job(
         RoleRun {
@@ -1734,6 +2068,87 @@ async fn run_phase3(
         )
     } else {
         artifact
+    };
+    let initial_violations = phase3_probability_drift_violations(state, &artifact);
+    let artifact = if initial_violations.is_empty() {
+        artifact
+    } else if mock {
+        state["degraded"] = Value::Bool(true);
+        state["phase3_probability_guard"] = json!({
+            "status": "clamped_to_phase1_base",
+            "retry_attempted": false,
+            "violations": initial_violations
+        });
+        apply_phase3_probability_fallback(artifact, &initial_violations)
+    } else {
+        let retry_state = phase3_probability_retry_state(state, &initial_violations);
+        let retry_result = run_single_role_job(
+            RoleRun {
+                state: retry_state,
+                role: "manager.research",
+                phase: 3,
+                kind: "artifact",
+                round: None,
+                topic_id: None,
+                mock: false,
+                model_override,
+                reasoning_effort_override,
+                config,
+                prompt_path: Some(config.prompts.manager_research.as_path()),
+            },
+            config.workflow.agent_timeout_sec,
+            config,
+            state,
+            conn,
+        )
+        .await;
+        match retry_result {
+            Ok(retry_artifact)
+                if !retry_artifact
+                    .get("degraded")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false) =>
+            {
+                let retry_violations = phase3_probability_drift_violations(state, &retry_artifact);
+                if retry_violations.is_empty() {
+                    state["phase3_probability_guard"] = json!({
+                        "status": "retry_accepted",
+                        "retry_attempted": true,
+                        "initial_violations": initial_violations
+                    });
+                    retry_artifact
+                } else {
+                    state["degraded"] = Value::Bool(true);
+                    state["phase3_probability_guard"] = json!({
+                        "status": "clamped_to_phase1_base",
+                        "retry_attempted": true,
+                        "initial_violations": initial_violations,
+                        "violations": retry_violations
+                    });
+                    apply_phase3_probability_fallback(retry_artifact, &retry_violations)
+                }
+            }
+            Ok(retry_artifact) => {
+                state["degraded"] = Value::Bool(true);
+                state["phase3_probability_guard"] = json!({
+                    "status": "clamped_to_phase1_base",
+                    "retry_attempted": true,
+                    "retry_error": retry_artifact.get("error").cloned().unwrap_or_else(|| json!("manager.research retry degraded")),
+                    "violations": initial_violations
+                });
+                apply_phase3_probability_fallback(artifact, &initial_violations)
+            }
+            Err(error) => {
+                state["degraded"] = Value::Bool(true);
+                state["phase3_probability_guard"] = json!({
+                    "status": "clamped_to_phase1_base",
+                    "retry_attempted": true,
+                    "retry_error": error.to_string(),
+                    "violations": initial_violations
+                });
+                apply_phase3_probability_fallback(artifact, &initial_violations)
+            }
+        }
     };
     persist_artifact(conn, state, 3, "manager.research", artifact.clone())?;
     state["research_plan"] = artifact;
@@ -2137,6 +2552,9 @@ async fn run_phase7(
     )
     .await?;
     let mut allocation = normalize_allocation(&raw_artifact, &context, &config.allocation);
+    allocation["id"] = json!("allocation.manager");
+    allocation["role"] = json!("allocation.manager");
+    allocation["status"] = json!("usable");
     sanitize_downstream_constraints(state, "portfolio_allocation", &mut allocation);
     persist_artifact(conn, state, 7, "allocation.manager", allocation.clone())?;
     state["portfolio_allocation"] = allocation;
@@ -2347,7 +2765,6 @@ mod tests {
             }
         });
         let args = ExecArgs {
-            ticker: "QQQ".to_string(),
             date: None,
             lang: "zh".to_string(),
             mode: Mode::Probability,
@@ -2398,7 +2815,6 @@ mod tests {
             }
         });
         let args = ExecArgs {
-            ticker: "QQQ".to_string(),
             date: None,
             lang: "zh".to_string(),
             mode: Mode::Probability,
@@ -2873,6 +3289,198 @@ mod tests {
     }
 
     #[test]
+    fn phase3_probability_drift_without_converged_evidence_falls_back_to_base() {
+        let state = json!({
+            "tickers": ["QQQ"],
+            "phase1_state_artifact": {
+                "weighted_probability_base": {
+                    "QQQ": {"long_probability": 0.50, "short_probability": 0.50}
+                }
+            },
+            "debate_state_artifact": {
+                "convergence_status": "converged_or_pending_review",
+                "per_ticker": {
+                    "QQQ": {
+                        "convergence_status": "converged_or_pending_review",
+                        "decision_hinges": []
+                    }
+                },
+                "topic_briefs": [{
+                    "tickers": ["QQQ"],
+                    "controller_artifact": {
+                        "soft_control": {"should_continue": false, "stop_reason": "no_info_gain"}
+                    }
+                }]
+            }
+        });
+        let artifact = json!({
+            "rating": "Overweight",
+            "long_probability": 0.59,
+            "short_probability": 0.41,
+            "plan": "Track confirmation.",
+            "probability_rationale": "Manager adjustment.",
+            "per_ticker": {
+                "QQQ": {
+                    "rating": "Overweight",
+                    "long_probability": 0.59,
+                    "short_probability": 0.41,
+                    "plan": "Track confirmation.",
+                    "probability_rationale": "Manager adjustment."
+                }
+            }
+        });
+
+        let violations = phase3_probability_drift_violations(&state, &artifact);
+        let guarded = apply_phase3_probability_fallback(artifact, &violations);
+
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0]["ticker"], "QQQ");
+        assert_eq!(violations[0]["severity"], "warning");
+        assert_eq!(guarded["long_probability"], 0.50);
+        assert_eq!(guarded["short_probability"], 0.50);
+        assert_eq!(guarded["per_ticker"]["QQQ"]["long_probability"], 0.50);
+        assert_eq!(
+            guarded["probability_guard"]["status"],
+            "clamped_to_phase1_base"
+        );
+    }
+
+    #[test]
+    fn phase3_probability_drift_with_converged_evidence_is_accepted() {
+        let state = json!({
+            "tickers": ["QQQ"],
+            "phase1_state_artifact": {
+                "weighted_probability_base": {
+                    "QQQ": {"long_probability": 0.50, "short_probability": 0.50}
+                }
+            },
+            "debate_state_artifact": {
+                "per_ticker": {
+                    "QQQ": {
+                        "convergence_status": "converged",
+                        "decision_hinges": [{
+                            "hinge": "earnings revision breadth",
+                            "evidence_refs": ["evidence:earnings-breadth"]
+                        }]
+                    }
+                }
+            }
+        });
+        let artifact = json!({
+            "rating": "Overweight",
+            "long_probability": 0.60,
+            "short_probability": 0.40,
+            "plan": "Track earnings revisions.",
+            "probability_rationale": "Converged evidence supports the adjustment.",
+            "per_ticker": {
+                "QQQ": {
+                    "rating": "Overweight",
+                    "long_probability": 0.60,
+                    "short_probability": 0.40,
+                    "plan": "Track earnings revisions.",
+                    "probability_rationale": "Converged evidence supports the adjustment."
+                }
+            }
+        });
+
+        assert!(phase3_probability_drift_violations(&state, &artifact).is_empty());
+    }
+
+    #[test]
+    fn phase3_probability_adjustment_at_guardrail_limit_is_accepted() {
+        let state = json!({
+            "tickers": ["QQQ"],
+            "phase1_state_artifact": {
+                "weighted_probability_base": {
+                    "QQQ": {"long_probability": 0.50, "short_probability": 0.50}
+                }
+            }
+        });
+        let artifact = json!({
+            "rating": "Overweight",
+            "long_probability": 0.58,
+            "short_probability": 0.42,
+            "per_ticker": {
+                "QQQ": {
+                    "rating": "Overweight",
+                    "long_probability": 0.58,
+                    "short_probability": 0.42
+                }
+            }
+        });
+
+        assert!(phase3_probability_drift_violations(&state, &artifact).is_empty());
+    }
+
+    #[test]
+    fn phase3_critical_probability_drift_is_clamped_per_ticker() {
+        let state = json!({
+            "tickers": ["QQQ", "SOXX"],
+            "phase1_state_artifact": {
+                "weighted_probability_base": {
+                    "QQQ": {"long_probability": 0.55, "short_probability": 0.45},
+                    "SOXX": {"long_probability": 0.45, "short_probability": 0.55}
+                }
+            }
+        });
+        let artifact = json!({
+            "rating": "Overweight",
+            "long_probability": 0.57,
+            "short_probability": 0.43,
+            "per_ticker": {
+                "QQQ": {
+                    "rating": "Overweight",
+                    "long_probability": 0.57,
+                    "short_probability": 0.43
+                },
+                "SOXX": {
+                    "rating": "Overweight",
+                    "long_probability": 0.66,
+                    "short_probability": 0.34
+                }
+            }
+        });
+
+        let violations = phase3_probability_drift_violations(&state, &artifact);
+        let guarded = apply_phase3_probability_fallback(artifact, &violations);
+
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0]["ticker"], "SOXX");
+        assert_eq!(violations[0]["severity"], "critical");
+        assert_eq!(guarded["per_ticker"]["SOXX"]["long_probability"], 0.45);
+        assert_eq!(guarded["per_ticker"]["SOXX"]["short_probability"], 0.55);
+        assert_eq!(guarded["per_ticker"]["QQQ"]["long_probability"], 0.57);
+        assert_eq!(guarded["long_probability"], 0.57);
+    }
+
+    #[test]
+    fn phase3_missing_ticker_probability_is_clamped_to_base() {
+        let state = json!({
+            "tickers": ["QQQ"],
+            "phase1_state_artifact": {
+                "weighted_probability_base": {
+                    "QQQ": {"long_probability": 0.50, "short_probability": 0.50}
+                }
+            }
+        });
+        let artifact = json!({
+            "rating": "Buy",
+            "long_probability": 0.90,
+            "short_probability": 0.10,
+            "per_ticker": {"QQQ": {}}
+        });
+
+        let violations = phase3_probability_drift_violations(&state, &artifact);
+        let guarded = apply_phase3_probability_fallback(artifact, &violations);
+
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0]["severity"], "critical");
+        assert_eq!(guarded["long_probability"], 0.50);
+        assert_eq!(guarded["per_ticker"]["QQQ"]["long_probability"], 0.50);
+        assert_eq!(guarded["per_ticker"]["QQQ"]["rating"], "Hold");
+    }
+
+    #[test]
     fn downstream_constraints_strip_market_truth_fields() {
         let mut downstream = json!({
             "rating": "Sell",
@@ -2942,4 +3550,31 @@ mod tests {
             "skipped"
         );
     }
+}
+#[test]
+fn steer_packets_exclude_recursive_transport_fields() {
+    let turn = json!({
+        "role": "researcher.bull.interaction",
+        "kind": "bull_packet",
+        "round": 2,
+        "topic_id": "QQQ-aggregate",
+        "session": {"session_id": "session", "turn_id": "turn"},
+        "artifact": {
+            "claims": [{"claim": "price confirmation", "evidence_ref": "tech-1"}],
+            "summary": "one-line delta",
+            "steer": "recursively nested prior artifact",
+            "prompt_path": "/large/path",
+            "session_id": "session",
+            "turn_id": "turn"
+        }
+    });
+
+    let compact = compact_debate_turn(&turn);
+
+    assert_eq!(compact["artifact"]["claims"][0]["evidence_ref"], "tech-1");
+    assert_eq!(compact["artifact"]["summary"], "one-line delta");
+    assert!(compact.get("session").is_none());
+    assert!(compact["artifact"].get("steer").is_none());
+    assert!(compact["artifact"].get("prompt_path").is_none());
+    assert!(compact["artifact"].get("session_id").is_none());
 }

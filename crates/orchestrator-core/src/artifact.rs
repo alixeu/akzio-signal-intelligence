@@ -22,6 +22,14 @@ pub struct ResearchArtifact {
     pub rating: String,
     pub long_probability: f64,
     pub short_probability: f64,
+    /// Why the probability is confident or uncertain: evidence_balanced,
+    /// data_insufficient, conflicting_evidence, or directional_evidence.
+    #[serde(default)]
+    pub confidence_basis: String,
+    /// Required for Hold: evidence_balanced, evidence_insufficient, or
+    /// conflicting_evidence.
+    #[serde(default)]
+    pub hold_reason: Option<String>,
     #[serde(default)]
     pub plan: String,
     #[serde(default)]
@@ -146,9 +154,9 @@ pub struct PortfolioAllocation {
 
 /// Per-ticker payload every analyst (technical / news_macro / reddit / x /
 /// youtube) must emit. This is the single source of truth for the analyst
-/// output contract: `prompts/common/analyst_output_contract.md` documents it in
-/// prose, and `analyst_artifact_schema()` derives the machine schema injected
-/// into those prompts so the two never drift.
+/// output contract: `prompts/common/analyst_output_contract.md` documents its
+/// behavioral rules, while `analyst_artifact_schema()` and runtime validation
+/// remain the sole source of structural truth.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 pub struct AnalystTickerArtifact {
     /// bullish | bearish | neutral | mixed | unobserved
@@ -404,6 +412,14 @@ pub enum ValidationError {
     ScenarioProbabilitySum(f64),
     #[error("long_probability ({long}) inconsistent with scenarios (expected ~{expected})")]
     InconsistentLongProbability { long: f64, expected: f64 },
+    #[error("confidence_basis is invalid: {0}")]
+    InvalidConfidenceBasis(String),
+    #[error("hold_reason is invalid: {0}")]
+    InvalidHoldReason(String),
+    #[error("research ticker {ticker} is invalid: {reason}")]
+    InvalidResearchTicker { ticker: String, reason: String },
+    #[error("research artifact field is invalid: {0}")]
+    InvalidResearchField(String),
 }
 
 pub fn normalize_probability(value: &Value) -> Option<f64> {
@@ -448,8 +464,8 @@ pub fn extract_json_artifact(text: &str) -> Result<Value> {
 ///
 /// Models often emit rating/probabilities only under `per_ticker` (and may
 /// emit `plan` as a string array). Downstream still expects top-level
-/// `rating` / `long_probability` / `short_probability` for single-ticker
-/// consumers such as trader mapping and report builders.
+/// `rating` / probabilities / confidence basis for single-ticker consumers
+/// such as trader mapping and report builders.
 pub fn normalize_research_artifact_value(mut value: Value, tickers: &[String]) -> Result<Value> {
     let obj = value
         .as_object_mut()
@@ -483,8 +499,23 @@ pub fn normalize_research_artifact_value(mut value: Value, tickers: &[String]) -
         .and_then(Value::as_str)
         .map(|value| value.trim().is_empty())
         .unwrap_or(true);
+    let needs_confidence_basis = obj
+        .get("confidence_basis")
+        .and_then(Value::as_str)
+        .is_none_or(|value| value.trim().is_empty());
+    let needs_hold_reason = obj
+        .get("hold_reason")
+        .and_then(Value::as_str)
+        .is_none_or(|value| value.trim().is_empty());
 
-    if needs_rating || needs_long || needs_short || needs_plan || needs_rationale {
+    if needs_rating
+        || needs_long
+        || needs_short
+        || needs_plan
+        || needs_rationale
+        || needs_confidence_basis
+        || needs_hold_reason
+    {
         if let Some(primary) = select_primary_research_ticker(obj, tickers) {
             let payload = obj
                 .get("per_ticker")
@@ -534,6 +565,32 @@ pub fn normalize_research_artifact_value(mut value: Value, tickers: &[String]) -
                     obj.insert(
                         "probability_rationale".to_string(),
                         Value::String(rationale.to_string()),
+                    );
+                }
+            }
+            if needs_confidence_basis {
+                if let Some(confidence_basis) = payload
+                    .get("confidence_basis")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    obj.insert(
+                        "confidence_basis".to_string(),
+                        Value::String(confidence_basis.to_string()),
+                    );
+                }
+            }
+            if needs_hold_reason {
+                if let Some(hold_reason) = payload
+                    .get("hold_reason")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    obj.insert(
+                        "hold_reason".to_string(),
+                        Value::String(hold_reason.to_string()),
                     );
                 }
             }
@@ -592,6 +649,45 @@ pub fn validate_research_artifact(
     artifact: &ResearchArtifact,
     tickers: &[String],
 ) -> std::result::Result<(), ValidationError> {
+    let valid_confidence_basis = [
+        "evidence_balanced",
+        "data_insufficient",
+        "conflicting_evidence",
+        "directional_evidence",
+    ];
+    if !valid_confidence_basis.contains(&artifact.confidence_basis.as_str()) {
+        return Err(ValidationError::InvalidConfidenceBasis(
+            artifact.confidence_basis.clone(),
+        ));
+    }
+    if artifact.rating.eq_ignore_ascii_case("hold") {
+        let expected_hold_reason = match artifact.confidence_basis.as_str() {
+            "evidence_balanced" => "evidence_balanced",
+            "data_insufficient" => "evidence_insufficient",
+            "conflicting_evidence" => "conflicting_evidence",
+            other => {
+                return Err(ValidationError::InvalidHoldReason(format!(
+                    "Hold cannot use confidence_basis={other}"
+                )))
+            }
+        };
+        if artifact.hold_reason.as_deref() != Some(expected_hold_reason) {
+            return Err(ValidationError::InvalidHoldReason(format!(
+                "expected {expected_hold_reason} for confidence_basis={}",
+                artifact.confidence_basis
+            )));
+        }
+    }
+    if artifact.plan.trim().is_empty() {
+        return Err(ValidationError::InvalidResearchField(
+            "plan must not be empty".to_string(),
+        ));
+    }
+    if artifact.probability_rationale.trim().is_empty() {
+        return Err(ValidationError::InvalidResearchField(
+            "probability_rationale must not be empty".to_string(),
+        ));
+    }
     if !(0.0..=1.0).contains(&artifact.long_probability) {
         return Err(ValidationError::InvalidProbability(
             "long_probability".to_string(),
@@ -643,8 +739,90 @@ pub fn validate_research_artifact(
         }
     }
     for ticker in tickers {
-        if !artifact.per_ticker.contains_key(ticker) {
-            return Err(ValidationError::MissingTicker(ticker.clone()));
+        let payload = artifact
+            .per_ticker
+            .get(ticker)
+            .ok_or_else(|| ValidationError::MissingTicker(ticker.clone()))?;
+        let rating = payload
+            .get("rating")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| ValidationError::InvalidResearchTicker {
+                ticker: ticker.clone(),
+                reason: "rating is missing or empty".to_string(),
+            })?;
+        let long = payload
+            .get("long_probability")
+            .and_then(Value::as_f64)
+            .filter(|value| (0.0..=1.0).contains(value))
+            .ok_or_else(|| ValidationError::InvalidResearchTicker {
+                ticker: ticker.clone(),
+                reason: "long_probability must be a number in 0..1".to_string(),
+            })?;
+        let short = payload
+            .get("short_probability")
+            .and_then(Value::as_f64)
+            .filter(|value| (0.0..=1.0).contains(value))
+            .ok_or_else(|| ValidationError::InvalidResearchTicker {
+                ticker: ticker.clone(),
+                reason: "short_probability must be a number in 0..1".to_string(),
+            })?;
+        if (long + short - 1.0).abs() > 0.03 {
+            return Err(ValidationError::InvalidResearchTicker {
+                ticker: ticker.clone(),
+                reason: "long_probability + short_probability must be approximately 1.0"
+                    .to_string(),
+            });
+        }
+        let confidence_basis = payload
+            .get("confidence_basis")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !valid_confidence_basis.contains(&confidence_basis) {
+            return Err(ValidationError::InvalidResearchTicker {
+                ticker: ticker.clone(),
+                reason: format!("invalid confidence_basis {confidence_basis:?}"),
+            });
+        }
+        if rating.eq_ignore_ascii_case("hold") {
+            let expected = match confidence_basis {
+                "evidence_balanced" => "evidence_balanced",
+                "data_insufficient" => "evidence_insufficient",
+                "conflicting_evidence" => "conflicting_evidence",
+                other => {
+                    return Err(ValidationError::InvalidResearchTicker {
+                        ticker: ticker.clone(),
+                        reason: format!("Hold cannot use confidence_basis={other}"),
+                    })
+                }
+            };
+            if payload.get("hold_reason").and_then(Value::as_str) != Some(expected) {
+                return Err(ValidationError::InvalidResearchTicker {
+                    ticker: ticker.clone(),
+                    reason: format!("Hold requires hold_reason={expected}"),
+                });
+            }
+        }
+        if payload
+            .get("plan")
+            .and_then(coerce_plan_to_string)
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            return Err(ValidationError::InvalidResearchTicker {
+                ticker: ticker.clone(),
+                reason: "plan must not be empty".to_string(),
+            });
+        }
+        if payload
+            .get("probability_rationale")
+            .and_then(Value::as_str)
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            return Err(ValidationError::InvalidResearchTicker {
+                ticker: ticker.clone(),
+                reason: "probability_rationale must not be empty".to_string(),
+            });
         }
     }
     Ok(())
@@ -1001,8 +1179,10 @@ mod tests {
             rating: "Hold".to_string(),
             long_probability: 0.575,
             short_probability: 0.425,
-            plan: String::new(),
-            probability_rationale: String::new(),
+            confidence_basis: "evidence_balanced".to_string(),
+            hold_reason: Some("evidence_balanced".to_string()),
+            plan: "Monitor validation triggers.".to_string(),
+            probability_rationale: "Evidence is balanced near the base probability.".to_string(),
             scenarios,
             per_ticker: BTreeMap::new(),
             extra: Map::new(),
@@ -1016,6 +1196,8 @@ mod tests {
             "rating",
             "long_probability",
             "short_probability",
+            "confidence_basis",
+            "hold_reason",
             "scenarios",
             "Scenario",
             "Scenarios",
@@ -1098,6 +1280,39 @@ mod tests {
     }
 
     #[test]
+    fn research_artifact_requires_a_confidence_basis() {
+        let mut artifact = research_artifact_with_scenarios(None);
+        artifact.confidence_basis.clear();
+
+        assert!(matches!(
+            validate_research_artifact(&artifact, &["QQQ".to_string()]),
+            Err(ValidationError::InvalidConfidenceBasis(_))
+        ));
+    }
+
+    #[test]
+    fn hold_research_artifact_requires_a_hold_reason() {
+        let mut artifact = research_artifact_with_scenarios(None);
+        artifact.hold_reason = None;
+
+        assert!(matches!(
+            validate_research_artifact(&artifact, &["QQQ".to_string()]),
+            Err(ValidationError::InvalidHoldReason(_))
+        ));
+    }
+
+    #[test]
+    fn research_artifact_rejects_empty_per_ticker_decision() {
+        let mut artifact = research_artifact_with_scenarios(None);
+        artifact.per_ticker.insert("QQQ".to_string(), json!({}));
+
+        assert!(matches!(
+            validate_research_artifact(&artifact, &["QQQ".to_string()]),
+            Err(ValidationError::InvalidResearchTicker { ticker, .. }) if ticker == "QQQ"
+        ));
+    }
+
+    #[test]
     fn scenario_drivers_are_required() {
         let mut scenarios = valid_scenarios();
         scenarios.bull.drivers.clear();
@@ -1134,7 +1349,11 @@ mod tests {
         let json = r#"{
             "rating": "Hold",
             "long_probability": 0.55,
-            "short_probability": 0.45
+            "short_probability": 0.45,
+            "confidence_basis": "evidence_balanced",
+            "hold_reason": "evidence_balanced",
+            "plan": "Monitor validation triggers.",
+            "probability_rationale": "Evidence is balanced."
         }"#;
         let artifact: ResearchArtifact = serde_json::from_str(json).unwrap();
         assert_eq!(artifact.scenarios, None);
@@ -1153,6 +1372,7 @@ mod tests {
                     "rating": "Overweight",
                     "long_probability": 0.57,
                     "short_probability": 0.43,
+                    "confidence_basis": "directional_evidence",
                     "plan": [
                         "Verify volume confirmation",
                         "Watch short-horizon break"
@@ -1163,6 +1383,8 @@ mod tests {
                     "rating": "Hold",
                     "long_probability": 0.51,
                     "short_probability": 0.49,
+                    "confidence_basis": "data_insufficient",
+                    "hold_reason": "evidence_insufficient",
                     "plan": "Wait for SOXX-specific confirmation",
                     "probability_rationale": "Insufficient SOXX-specific evidence."
                 }
@@ -1176,6 +1398,8 @@ mod tests {
         assert_eq!(artifact.rating, "Overweight");
         assert!((artifact.long_probability - 0.57).abs() < 1e-9);
         assert!((artifact.short_probability - 0.43).abs() < 1e-9);
+        assert_eq!(artifact.confidence_basis, "directional_evidence");
+        assert_eq!(artifact.hold_reason, None);
         assert!(artifact.plan.contains("Verify volume confirmation"));
         assert!(artifact
             .probability_rationale

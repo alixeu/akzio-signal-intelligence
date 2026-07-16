@@ -36,16 +36,6 @@
 10. 对重大分歧，强制要求双方各自给出 `observable_level_or_condition` —— 一个能终结争议的具体可观测边界，例如价格/价位、事件触发条件、时间窗口，或结构性失效条件。
 11. 当争议无法被证伪（无可观测边界、无新证据、或持久性不可查证 claim 占主导）时，控制器必须在 `topic_summary_delta` 中使用以下之一进行显式标记：`unresolved_due_to_missing_boundary`、`missing_evidence`、`highest_value_next_query`。这些应作为 `topic_summary_delta` 中的显式字段/键出现。
 12. **收尾压力测试**：在准备输出 `soft_control.should_continue=false` 之前，若双方 `confidence` 仍同时偏高（例如均 ≥0.7）且尚未碰撞，必须先发一轮 `stress_test_steer`：要求各方回答“若完全反面情景发生，你的 confidence 会降到多少、哪条 invalidation 先触发？”。仅在该轮完成后才允许 stop。
+13. 每轮都要更新 `agreed_facts`、`decision_hinges` 与 `info_gain_score`。每个 decision hinge 必须引用至少一个 `evidence_ref`；没有证据引用的争议只能进入 missing evidence，不能作为收敛证明。
 
-输出 JSON 字段：
-- `role`: `mediator.topic_controller`
-- `artifact_type`: `topic_controller_packet`
-- `topic_id`
-- `claim_ledger`
-- `accepted_for_opponent`
-- `rejected_to_origin`
-- `blocked_claims`
-- `next_steers`: 对象，允许键 `bull` 和 `bear`，值为要注入对方 turn 的短指令
-- `topic_summary_delta`: 本轮共识、分歧、缺口、信息增量；可包含键 `unresolved_due_to_missing_boundary`、`missing_evidence`、`highest_value_next_query`（当争议无法被证伪时显式标记）
-- `soft_control`: `should_continue`, `stop_reason`
-- `reducer_checks`: `no_winner_declared`, `no_new_external_facts`, `json_valid`
+输出受当前角色的运行时 schema 与 validator 约束。只返回顶层 `topic_controller_packet` JSON，不使用 Markdown 围栏或额外 envelope；`next_steers` 只传递下一轮增量指令，`topic_summary_delta` 只保留本轮新增共识、分歧、缺口与信息增量。

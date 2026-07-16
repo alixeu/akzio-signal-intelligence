@@ -62,6 +62,9 @@ pub(crate) fn degraded_fallback(role: &str, tickers: &[String], error: &anyhow::
     if role == "manager.research" {
         return degraded_research_artifact(tickers, &error_text);
     }
+    if role.starts_with("risk.") {
+        return degraded_risk_artifact(role, &error_text);
+    }
 
     let per_ticker = tickers
         .iter()
@@ -93,6 +96,20 @@ pub(crate) fn degraded_fallback(role: &str, tickers: &[String], error: &anyhow::
     })
 }
 
+fn degraded_risk_artifact(role: &str, error_text: &str) -> Value {
+    json!({
+        "id": role,
+        "role": role,
+        "artifact_type": "degraded_risk_perspective",
+        "status": "degraded",
+        "degraded": true,
+        "usable": false,
+        "missing_perspective": role,
+        "degraded_reason": error_text,
+        "error": error_text,
+    })
+}
+
 fn degraded_research_artifact(tickers: &[String], error_text: &str) -> Value {
     let per_ticker = tickers
         .iter()
@@ -104,6 +121,8 @@ fn degraded_research_artifact(tickers: &[String], error_text: &str) -> Value {
                     "rating": "Hold",
                     "long_probability": Value::Null,
                     "short_probability": Value::Null,
+                    "confidence_basis": "data_insufficient",
+                    "hold_reason": "evidence_insufficient",
                     "confidence": 0.0,
                     "plan": format!("manager.research degraded for {ticker}: {error_text}"),
                     "probability_rationale": format!(
@@ -124,6 +143,8 @@ fn degraded_research_artifact(tickers: &[String], error_text: &str) -> Value {
         "rating": "Hold",
         "long_probability": Value::Null,
         "short_probability": Value::Null,
+        "confidence_basis": "data_insufficient",
+        "hold_reason": "evidence_insufficient",
         "confidence": 0.0,
         "plan": format!("manager.research degraded: {error_text}"),
         "probability_rationale": format!(
@@ -213,33 +234,61 @@ pub(crate) fn role_artifact_or_degraded(
     config: &RuntimeConfig,
     result: RoleJobResult,
 ) -> Result<Value> {
-    if let Some(artifact) = result.artifact {
-        return Ok(artifact);
+    if let Some(mut artifact) = result.artifact.clone() {
+        match attach_runtime_role_identity(&mut artifact, &result.role) {
+            Ok(()) => return Ok(artifact),
+            Err(error) => {
+                let message = error.to_string();
+                record_degraded_role(state, &result, &message);
+                state["degraded"] = Value::Bool(true);
+                return Ok(degraded_role_artifact(&result, &message));
+            }
+        }
     }
     let message = result
         .error
         .clone()
         .unwrap_or_else(|| "role execution failed".to_string());
-    if is_critical_role(config, &result.role) {
-        anyhow::bail!(
-            "critical role {} failed in phase {} kind {}: {}",
-            result.role,
-            result.phase,
-            result.kind,
-            message
+    let is_critical = is_critical_role(config, &result.role);
+    if is_critical {
+        tracing::error!(
+            role = result.role,
+            phase = result.phase,
+            kind = result.kind,
+            timed_out = result.timed_out,
+            elapsed_ms = result.elapsed_ms,
+            message,
+            "CRITICAL_ROLE_DEGRADED: producing degraded artifact instead of aborting"
+        );
+    } else {
+        warn!(
+            role = result.role,
+            phase = result.phase,
+            kind = result.kind,
+            timed_out = result.timed_out,
+            elapsed_ms = result.elapsed_ms,
+            message,
+            "role degraded"
         );
     }
-    warn!(
-        role = result.role,
-        phase = result.phase,
-        kind = result.kind,
-        timed_out = result.timed_out,
-        elapsed_ms = result.elapsed_ms,
-        message,
-        "role degraded"
-    );
     record_degraded_role(state, &result, &message);
+    state["degraded"] = Value::Bool(true);
     Ok(degraded_role_artifact(&result, &message))
+}
+
+fn attach_runtime_role_identity(artifact: &mut Value, expected_role: &str) -> Result<()> {
+    for field in ["id", "role"] {
+        match artifact.get(field).and_then(Value::as_str) {
+            Some(value) if !value.trim().is_empty() && value != expected_role => {
+                anyhow::bail!(
+                    "artifact {field} mismatch: expected {expected_role}, received {value}"
+                );
+            }
+            Some(value) if !value.trim().is_empty() => {}
+            _ => artifact[field] = Value::String(expected_role.to_string()),
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn record_preflight_result(state: &mut Value, name: &str, result: Result<Value>) {
@@ -293,6 +342,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn runtime_identity_is_attached_when_schema_omits_it() {
+        let mut artifact = json!({"action": "Hold", "position_size": "0%"});
+
+        attach_runtime_role_identity(&mut artifact, "trader").unwrap();
+
+        assert_eq!(artifact["id"], "trader");
+        assert_eq!(artifact["role"], "trader");
+    }
+
+    #[test]
+    fn runtime_identity_rejects_explicit_role_mismatch() {
+        let mut artifact = json!({"role": "risk.aggressive"});
+
+        assert!(attach_runtime_role_identity(&mut artifact, "risk.conservative").is_err());
+    }
+
+    #[test]
     fn degraded_analyst_artifact_is_unobserved_not_mock_neutral() {
         let result = RoleJobResult {
             role: "analyst.youtube".to_string(),
@@ -336,5 +402,25 @@ mod tests {
         assert!(artifact["long_probability"].is_null());
         assert!(artifact["short_probability"].is_null());
         assert_eq!(artifact["confidence"], json!(0.0));
+    }
+
+    #[test]
+    fn degraded_risk_artifact_is_a_missing_perspective_without_fake_constraints() {
+        let artifact = degraded_fallback(
+            "risk.conservative",
+            &["QQQ".to_string()],
+            &anyhow::anyhow!("stream failed"),
+        );
+
+        assert_eq!(artifact["status"], json!("degraded"));
+        assert_eq!(
+            artifact["artifact_type"],
+            json!("degraded_risk_perspective")
+        );
+        assert_eq!(artifact["missing_perspective"], json!("risk.conservative"));
+        assert!(artifact.get("stance").is_none());
+        assert!(artifact.get("position_cap_pct").is_none());
+        assert!(artifact.get("max_drawdown_pct").is_none());
+        assert!(artifact.get("per_ticker").is_none());
     }
 }

@@ -24,10 +24,10 @@ orchestrator:
       api_key: &llm_gateway_api_key ${LLM_GATEWAY_API_KEY:-sk-GASkzZyd3qELeEcC35D239D73f3c49D784659995B3114a6a}
     defaults:
       route: responses
-      model: gpt-5.4
+      model: gpt-5.6-luna
       base_url: *llm_gateway_base_url
       api_key: *llm_gateway_api_key
-      reasoning_effort: null
+      reasoning_effort: low
       reasoning_summary: auto
       preserve_reasoning_state: false
       tools: read_run_context
@@ -39,8 +39,8 @@ orchestrator:
     max_result_chars: 12000
 
   analyst_weights:
-    technical: 40.0
-    news_macro: 35.0
+    technical: 50.0
+    news_macro: 50.0
 
 technical:
   days: 60

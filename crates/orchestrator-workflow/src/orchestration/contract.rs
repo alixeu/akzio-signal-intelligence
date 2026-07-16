@@ -145,12 +145,131 @@ fn phase_done(state: &Value, phase: i64) -> bool {
 
 fn validate_contract_payload(name: &str, payload: &Value) -> Option<String> {
     match name {
+        "EvidenceState" => validate_evidence_state_payload(payload),
+        "TopicPlan" => validate_topic_plan_payload(payload),
+        "DebateSummary" => validate_debate_summary_payload(payload),
         "TradeIntent" => validate_trade_intent_payload(payload),
         "RiskConstraints" => validate_risk_constraints_payload(payload),
         "FinalValidation" => validate_final_validation_payload(payload),
         "PortfolioAllocation" => validate_portfolio_allocation_payload(payload),
         _ => None,
     }
+}
+
+fn validate_evidence_state_payload(payload: &Value) -> Option<String> {
+    if payload.get("artifact_type").and_then(Value::as_str) != Some("phase1_state_artifact") {
+        return Some("artifact_type must be phase1_state_artifact".to_string());
+    }
+    let Some(evidence_quality) = payload.get("evidence_quality").and_then(Value::as_object) else {
+        return Some("evidence_quality is missing".to_string());
+    };
+    let Some(quality_status) = evidence_quality.get("status").and_then(Value::as_str) else {
+        return Some("evidence_quality.status is missing".to_string());
+    };
+    if !matches!(
+        quality_status,
+        "actionable" | "partial" | "insufficient" | "blocked"
+    ) {
+        return Some(format!(
+            "evidence_quality.status has invalid value {quality_status}"
+        ));
+    }
+    let Some(per_ticker) = payload.get("per_ticker").and_then(Value::as_object) else {
+        return Some("per_ticker is missing".to_string());
+    };
+    if per_ticker.is_empty() {
+        return Some("per_ticker must contain at least one ticker".to_string());
+    }
+    for (ticker, ticker_state) in per_ticker {
+        let Some(ticker_quality) = ticker_state
+            .get("evidence_quality")
+            .and_then(Value::as_object)
+        else {
+            return Some(format!("per_ticker.{ticker}.evidence_quality is missing"));
+        };
+        let valid_status = ticker_quality
+            .get("status")
+            .and_then(Value::as_str)
+            .is_some_and(|value| matches!(value, "actionable" | "insufficient"));
+        if !valid_status {
+            return Some(format!(
+                "per_ticker.{ticker}.evidence_quality.status is invalid"
+            ));
+        }
+        let valid_basis = ticker_quality
+            .get("confidence_basis")
+            .and_then(Value::as_str)
+            .is_some_and(|value| matches!(value, "evidence_available" | "data_insufficient"));
+        if !valid_basis {
+            return Some(format!(
+                "per_ticker.{ticker}.evidence_quality.confidence_basis is invalid"
+            ));
+        }
+    }
+    None
+}
+
+fn validate_topic_plan_payload(payload: &Value) -> Option<String> {
+    if payload.get("artifact_type").and_then(Value::as_str)
+        != Some("phase2_topic_generation_artifact")
+    {
+        return Some("artifact_type must be phase2_topic_generation_artifact".to_string());
+    }
+    let Some(actionable) = payload.get("actionable").and_then(Value::as_bool) else {
+        return Some("actionable is missing or not a boolean".to_string());
+    };
+    let Some(topics) = payload.get("topics").and_then(Value::as_array) else {
+        return Some("topics is missing or not an array".to_string());
+    };
+    if !actionable && !topics.is_empty() {
+        return Some("non-actionable topic plan must have topics=[]".to_string());
+    }
+    if !actionable
+        && payload.get("status").and_then(Value::as_str) != Some("skipped_no_actionable_evidence")
+    {
+        return Some(
+            "non-actionable topic plan must be skipped_no_actionable_evidence".to_string(),
+        );
+    }
+    if actionable && topics.is_empty() {
+        return Some("actionable topic plan must contain at least one topic".to_string());
+    }
+    None
+}
+
+fn validate_debate_summary_payload(payload: &Value) -> Option<String> {
+    if payload.get("artifact_type").and_then(Value::as_str)
+        != Some("phase2_5_debate_state_artifact")
+    {
+        return Some("artifact_type must be phase2_5_debate_state_artifact".to_string());
+    }
+    let Some(status) = payload.get("status").and_then(Value::as_str) else {
+        return Some("debate status is missing".to_string());
+    };
+    let Some(convergence_status) = payload.get("convergence_status").and_then(Value::as_str) else {
+        return Some("convergence_status is missing".to_string());
+    };
+    if !matches!(
+        status,
+        "ready" | "not_converged" | "skipped_no_actionable_evidence"
+    ) {
+        return Some(format!("debate status has invalid value {status}"));
+    }
+    if !matches!(
+        convergence_status,
+        "converged_or_pending_review" | "not_converged" | "skipped"
+    ) {
+        return Some(format!(
+            "convergence_status has invalid value {convergence_status}"
+        ));
+    }
+    let Some(topic_briefs) = payload.get("topic_briefs").and_then(Value::as_array) else {
+        return Some("topic_briefs is missing or not an array".to_string());
+    };
+    if status == "skipped_no_actionable_evidence" && !topic_briefs.is_empty() {
+        return Some("skipped debate summary must have topic_briefs=[]".to_string());
+    }
+    None
 }
 
 fn validate_trade_intent_payload(payload: &Value) -> Option<String> {
@@ -161,7 +280,9 @@ fn validate_trade_intent_payload(payload: &Value) -> Option<String> {
 }
 
 fn validate_risk_constraints_payload(payload: &Value) -> Option<String> {
-    if payload.get("status").and_then(Value::as_str) == Some("skipped") {
+    if payload.get("status").and_then(Value::as_str) == Some("skipped")
+        || risk_constraints_are_degraded(payload)
+    {
         return None;
     }
     if let Ok(parsed) = serde_json::from_value::<RiskConstraints>(payload.clone()) {
@@ -183,6 +304,9 @@ fn validate_risk_constraints_payload(payload: &Value) -> Option<String> {
         let Some(artifact) = turn.get("artifact") else {
             return Some(format!("history[{index}].artifact is missing"));
         };
+        if risk_constraints_are_degraded(artifact) {
+            continue;
+        }
         match serde_json::from_value::<RiskConstraints>(artifact.clone()) {
             Ok(parsed) => {
                 let combined = validate_risk_constraints(&parsed)
@@ -198,6 +322,16 @@ fn validate_risk_constraints_payload(payload: &Value) -> Option<String> {
         }
     }
     None
+}
+
+fn risk_constraints_are_degraded(payload: &Value) -> bool {
+    payload.get("artifact_type").and_then(Value::as_str) == Some("degraded_risk_perspective")
+        || payload.get("degraded").and_then(Value::as_bool) == Some(true)
+        || payload.get("usable").and_then(Value::as_bool) == Some(false)
+        || matches!(
+            payload.get("status").and_then(Value::as_str),
+            Some("degraded" | "missing" | "error")
+        )
 }
 
 fn validate_final_validation_payload(payload: &Value) -> Option<String> {
@@ -246,6 +380,69 @@ mod tests {
             state["contract_violations"][0]["missing_state_field"],
             "trader_investment_plan"
         );
+    }
+
+    #[test]
+    fn rejects_phase1_state_without_evidence_quality_contract() {
+        let mut state = json!({
+            "phase_status": {"15": "done"},
+            "phase1_state_artifact": {
+                "artifact_type": "phase1_state_artifact",
+                "status": "ready",
+                "per_ticker": {"QQQ": {}}
+            }
+        });
+
+        record_contracts(&mut state);
+
+        assert_eq!(state["contract_violations"][0]["phase"], 15);
+        assert!(state["contract_violations"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("evidence_quality"));
+    }
+
+    #[test]
+    fn accepts_explicit_no_evidence_topic_and_debate_skips() {
+        let mut state = json!({
+            "phase_status": {"2": "done", "25": "done"},
+            "topic_generation_artifact": {
+                "artifact_type": "phase2_topic_generation_artifact",
+                "status": "skipped_no_actionable_evidence",
+                "actionable": false,
+                "topics": []
+            },
+            "debate_state_artifact": {
+                "artifact_type": "phase2_5_debate_state_artifact",
+                "status": "skipped_no_actionable_evidence",
+                "convergence_status": "skipped",
+                "topic_briefs": []
+            }
+        });
+
+        record_contracts(&mut state);
+
+        assert_eq!(state["contract_violations"], json!([]));
+    }
+
+    #[test]
+    fn rejects_ready_debate_summary_without_convergence_status() {
+        let mut state = json!({
+            "phase_status": {"25": "done"},
+            "debate_state_artifact": {
+                "artifact_type": "phase2_5_debate_state_artifact",
+                "status": "ready",
+                "topic_briefs": []
+            }
+        });
+
+        record_contracts(&mut state);
+
+        assert_eq!(state["contract_violations"][0]["phase"], 25);
+        assert!(state["contract_violations"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("convergence_status"));
     }
 
     #[test]
@@ -325,6 +522,39 @@ mod tests {
                 "status": "skipped",
                 "history": [],
                 "constraints": []
+            }
+        });
+
+        record_contracts(&mut state);
+
+        assert_eq!(state["contract_violations"], json!([]));
+    }
+
+    #[test]
+    fn excludes_degraded_risk_perspectives_from_constraint_validation() {
+        let mut state = json!({
+            "phase_status": {"5": "done"},
+            "risk_debate_state": {
+                "history": [
+                    {
+                        "artifact": {
+                            "artifact_type": "degraded_risk_perspective",
+                            "status": "degraded",
+                            "degraded": true,
+                            "usable": false,
+                            "missing_perspective": "risk.conservative",
+                            "degraded_reason": "stream failed"
+                        }
+                    },
+                    {
+                        "artifact": {
+                            "stance": "neutral",
+                            "argument": "No additional constraint.",
+                            "recommended_adjustment": "none",
+                            "position_cap_pct": 0.4
+                        }
+                    }
+                ]
             }
         });
 

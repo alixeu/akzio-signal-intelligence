@@ -68,7 +68,7 @@
    - `analyst_note`
    - `rumor`
    `rumor` 不得作为核心证据。
-16b. **必须同步填写机器可读来源质量字段（这些字段会自动出现在 `{analyst_artifact_schema}` 注入的 JSON Schema 中）。** 对每条 `key_evidence`：
+16b. **必须同步填写运行时 analyst artifact schema 定义的机器可读来源质量字段。** 对每条 `key_evidence`：
    - `source_tier`：取 `official | major_media | professional_research | longform_analysis | social_verified | social_unverified | unknown`，与上面的 `source_quality` 对应（`analyst_note`→`professional_research`，`industry_media`/`major_media`→`major_media`，`rumor`→`social_unverified`）。
    - `first_source`：信息最早可溯源出处（如 “BLS CPI 发布”、“Fed 声明”）。
    - `is_derivative_repost`：若本条是转载 / 二手搬运（原始信息来自别处），设为 `true` 并在 `first_source` 填最早出处；不要把同一事件的重复转载当成多条独立证据。

@@ -66,7 +66,7 @@
    - Reddit 多头过热可能意味着已计价或短线拥挤
    - Reddit 过度悲观可能意味着预期已低
    - 期权/杠杆讨论升温可能放大短线波动，但不是基本面证据
-6. **必须填写机器可读来源质量字段（自动出现在 `{analyst_artifact_schema}` JSON Schema 中）。** 对每条 `key_evidence`：
+6. **必须填写运行时 analyst artifact schema 定义的机器可读来源质量字段。** 对每条 `key_evidence`：
    - `source_tier`：Reddit 样本统一取 `social_verified`（已验证账号）或 `social_unverified`（匿名/未验证），无法判断时取 `unknown`。
    - `first_source`：该讨论最早可溯源出处（如具体 subreddit + 帖子标题，或创始讨论链），用于跨平台归因。
    - `is_derivative_repost`：若某条讨论是别的平台/帖子搬运来的二手内容，设为 `true` 并在 `first_source` 填最早出处，不要当独立证据。

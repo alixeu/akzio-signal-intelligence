@@ -14,7 +14,7 @@
   "recommended_adjustment": "对 trader_plan 的保守调整建议"
 }
 
-结构化风险字段（这些字段会自动出现在下方 `{risk_constraints_schema}` 注入的 JSON Schema 中，按需要填写，缺失留空或 0/默认值）：
+结构化风险字段由运行时 RiskConstraints schema 校验，必须完整填写：
 - `stop_type`：`none | tight | trailing | event_based | time_based`。保守立场通常建议 `tight` 或 `event_based`，并对隔夜风险用 `time_based` 复评。
 - `max_drawdown_pct`：0.0-1.0，保守立场必须给出严格且较低的最大回撤上限。
 - `position_cap_pct`：0.0-1.0，单标的仓位上限，保守应明显低于激进。

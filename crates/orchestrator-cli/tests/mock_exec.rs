@@ -9,7 +9,6 @@ async fn mock_exec_writes_state_and_final_summary() {
     let run_dir = temp.path().join("run");
     let db_path = temp.path().join("orchestrator.sqlite");
     let result = exec::run(ExecArgs {
-        ticker: "QQQ,VIX,SOXX".to_string(),
         date: Some("2026-06-15".to_string()),
         lang: "zh".to_string(),
         mode: Mode::Probability,
@@ -78,7 +77,6 @@ async fn mock_exec_can_stop_after_phase1() {
     let run_dir = temp.path().join("phase1-only");
     let db_path = temp.path().join("orchestrator.sqlite");
     let mut args = test_args(
-        "QQQ,VIX,SOXX",
         Some(db_path),
         Some(run_dir.clone()),
         Some(config_path),
@@ -109,7 +107,6 @@ async fn mock_exec_phase7_writes_portfolio_allocation() {
     let run_dir = temp.path().join("phase7-run");
     let db_path = temp.path().join("phase7.sqlite");
     let mut args = test_args(
-        "QQQ,SOXX,VIX",
         Some(db_path.clone()),
         Some(run_dir.clone()),
         Some(config_path),
@@ -119,17 +116,23 @@ async fn mock_exec_phase7_writes_portfolio_allocation() {
 
     let result = exec::run(args).await.unwrap();
 
-    assert_eq!(result["vix_regime"], "normal");
     assert_eq!(result["action"], "Hold");
     assert_eq!(result["final_trade_decision"]["rating"], "Hold");
+    assert_eq!(result["portfolio_allocation"]["total_equity_exposure"], 0.0);
     assert_eq!(
-        result["portfolio_allocation"]["weights"]["QQQ"]["weight"],
-        0.3
+        result["portfolio_allocation"]["weights"]["cash_hedge"]["weight"],
+        1.0
     );
     assert_eq!(
-        result["portfolio_allocation"]["weights"]["SOXX"]["weight"],
-        0.3
+        result["portfolio_allocation"]["allocation_method"],
+        "fallback_cash"
     );
+    assert!(result["portfolio_allocation"]["weights"]
+        .get("QQQ")
+        .is_none());
+    assert!(result["portfolio_allocation"]["weights"]
+        .get("SOXX")
+        .is_none());
     assert!(result["portfolio_allocation"]["weights"]
         .get("VIX")
         .is_none());
@@ -149,7 +152,7 @@ async fn mock_exec_phase7_writes_portfolio_allocation() {
             .len(),
         3
     );
-    assert_eq!(state["portfolio_allocation"]["total_equity_exposure"], 0.6);
+    assert_eq!(state["portfolio_allocation"]["total_equity_exposure"], 0.0);
     assert_market_truth_ok(state);
     assert_contracts_ok(state);
     assert_role_metrics_ok(state);
@@ -173,7 +176,6 @@ async fn mock_exec_phase8_writes_archive_predictions_and_system_metrics() {
     let run_dir = temp.path().join("phase8-run");
     let db_path = temp.path().join("phase8.sqlite");
     let mut args = test_args(
-        "QQQ,SOXX,VIX",
         Some(db_path.clone()),
         Some(run_dir.clone()),
         Some(config_path),
@@ -213,7 +215,6 @@ async fn selective_policy_derives_trader_runs_triggered_risk_and_allocates() {
     let run_dir = temp.path().join("selective-run");
     let db_path = temp.path().join("selective.sqlite");
     let mut args = test_args(
-        "QQQ,SOXX,VIX",
         Some(db_path),
         Some(run_dir.clone()),
         Some(config_path),
@@ -247,14 +248,17 @@ async fn selective_policy_derives_trader_runs_triggered_risk_and_allocates() {
         3
     );
     assert_eq!(state["final_trade_decision"]["status"], "derived");
+    assert_eq!(state["portfolio_allocation"]["total_equity_exposure"], 0.0);
     assert_eq!(
-        state["portfolio_allocation"]["weights"]["QQQ"]["weight"],
-        0.3
+        state["portfolio_allocation"]["weights"]["cash_hedge"]["weight"],
+        1.0
     );
-    assert_eq!(
-        state["portfolio_allocation"]["weights"]["SOXX"]["weight"],
-        0.3
-    );
+    assert!(state["portfolio_allocation"]["weights"]
+        .get("QQQ")
+        .is_none());
+    assert!(state["portfolio_allocation"]["weights"]
+        .get("SOXX")
+        .is_none());
     assert_eq!(
         result["long_probability"],
         state["research_plan"]["long_probability"]
@@ -263,7 +267,7 @@ async fn selective_policy_derives_trader_runs_triggered_risk_and_allocates() {
         result["short_probability"],
         state["research_plan"]["short_probability"]
     );
-    assert_eq!(result["portfolio_allocation"]["total_equity_exposure"], 0.6);
+    assert_eq!(result["portfolio_allocation"]["total_equity_exposure"], 0.0);
     assert_market_truth_ok(state);
     assert_contracts_ok(state);
     assert_role_metrics_ok(state);
@@ -287,7 +291,6 @@ async fn legacy_policy_runs_all_optional_phases_and_allocates() {
     let run_dir = temp.path().join("legacy-run");
     let db_path = temp.path().join("legacy.sqlite");
     let mut args = test_args(
-        "QQQ,SOXX,VIX",
         Some(db_path),
         Some(run_dir.clone()),
         Some(config_path),
@@ -316,7 +319,7 @@ async fn legacy_policy_runs_all_optional_phases_and_allocates() {
         state["final_trade_decision"]["status"],
         serde_json::Value::Null
     );
-    assert_eq!(result["portfolio_allocation"]["total_equity_exposure"], 0.6);
+    assert_eq!(result["portfolio_allocation"]["total_equity_exposure"], 0.0);
     assert_contracts_ok(state);
 }
 
@@ -332,7 +335,6 @@ async fn mock_exec_uses_configured_shared_db_path_by_default() {
     fs::write(&config_path, serde_yaml::to_string(&config).unwrap()).unwrap();
 
     let result = exec::run(test_args(
-        "QQQ,VIX,SOXX",
         None,
         Some(run_dir.clone()),
         Some(config_path),
@@ -369,7 +371,6 @@ async fn live_exec_requires_unknown_sqlite_context_when_strict() {
     let db_path = temp.path().join("strict.sqlite");
 
     let err = exec::run(test_args(
-        "QQQ",
         Some(db_path),
         Some(run_dir),
         Some(config_path),
@@ -405,7 +406,6 @@ async fn openai_compatible_provider_can_use_configured_api_key() {
     )
     .unwrap();
     let err = exec::run(test_args(
-        "QQQ",
         Some(temp.path().join("configured-third-party-key.sqlite")),
         Some(temp.path().join("configured-third-party-key-run")),
         Some(config_path),
@@ -436,7 +436,6 @@ async fn explicit_partial_llm_roles_merge_with_builtin_defaults() {
     fs::write(&config_path, serde_yaml::to_string(&config).unwrap()).unwrap();
 
     let output = exec::run(test_args(
-        "QQQ",
         Some(temp.path().join("partial-roles.sqlite")),
         Some(temp.path().join("partial-roles-run")),
         Some(config_path),
@@ -470,7 +469,6 @@ async fn llm_roles_map_defaults_when_omitted() {
     fs::write(&config_path, serde_yaml::to_string(&config).unwrap()).unwrap();
 
     let output = exec::run(test_args(
-        "QQQ",
         Some(temp.path().join("default-roles.sqlite")),
         Some(temp.path().join("default-roles-run")),
         Some(config_path),
@@ -503,7 +501,6 @@ async fn llm_role_config_rejects_unknown_route() {
     fs::write(&config_path, serde_yaml::to_string(&config).unwrap()).unwrap();
 
     let err = exec::run(test_args(
-        "QQQ",
         Some(temp.path().join("bad-provider.sqlite")),
         Some(temp.path().join("bad-provider-run")),
         Some(config_path),
@@ -523,7 +520,6 @@ async fn mock_phase2_writes_initial_and_interaction_turns() {
     let db_path = temp.path().join("phase2.sqlite");
 
     exec::run(test_args(
-        "QQQ",
         Some(db_path.clone()),
         Some(run_dir),
         Some(config_path),
@@ -584,7 +580,6 @@ async fn mock_exec_writes_reducer_turn_summaries() {
     let db_path = temp.path().join("reducer.sqlite");
 
     exec::run(test_args(
-        "QQQ",
         Some(db_path.clone()),
         Some(run_dir),
         Some(config_path),
@@ -609,7 +604,7 @@ async fn mock_exec_writes_reducer_turn_summaries() {
             .unwrap()
     };
 
-    assert_eq!(rows.len(), 2);
+    assert_eq!(rows.len(), 6);
     assert!(rows.iter().any(|(phase, role, summary_json)| {
         *phase == 15 && role == "reducer.evidence" && summary_json.contains("reducer.evidence")
     }));
@@ -618,6 +613,18 @@ async fn mock_exec_writes_reducer_turn_summaries() {
             && role == "reducer.debate_final"
             && summary_json.contains("reducer.debate_final")
     }));
+    assert_eq!(
+        rows.iter()
+            .filter(|(_, role, _)| role == "reducer.evidence")
+            .count(),
+        3
+    );
+    assert_eq!(
+        rows.iter()
+            .filter(|(_, role, _)| role == "reducer.debate_final")
+            .count(),
+        3
+    );
 
     let event_rows: i64 = conn
         .query_row("SELECT COUNT(*) FROM agent_events", [], |row| row.get(0))
@@ -683,14 +690,12 @@ fn assert_phase_metrics_ok(state: &serde_json::Value, expected_count: usize) {
 }
 
 fn test_args(
-    ticker: &str,
     db_path: Option<PathBuf>,
     run_dir: Option<PathBuf>,
     config: Option<PathBuf>,
     mock: bool,
 ) -> ExecArgs {
     ExecArgs {
-        ticker: ticker.to_string(),
         date: Some("2026-06-15".to_string()),
         lang: "zh".to_string(),
         mode: Mode::Probability,
@@ -753,6 +758,7 @@ fn write_test_config(root: &std::path::Path) -> PathBuf {
     let config_text = format!(
         r#"
 orchestrator:
+  analysis_universe: [QQQ, SOXX, VIX]
   data_source:
     strict_sqlite: true
     required_contexts:

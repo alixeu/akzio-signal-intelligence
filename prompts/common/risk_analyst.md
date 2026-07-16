@@ -27,6 +27,4 @@
 风险辩论历史：
 {risk_history}
 
-输出契约：RiskConstraints 的单轮 risk argument。请返回纯 JSON，不要使用 Markdown 代码块。schema：
-基础契约：
-{risk_constraints_schema}
+输出受运行时 RiskConstraints schema 与 validator 约束。请返回顶层单轮 risk argument JSON，不要使用 Markdown 代码块或额外 envelope。数值 cap、stop policy、触发器、复评窗口、现金对冲建议与约束置信度均需给出真实、可执行的值；不得用缺失字段冒充默认约束。
