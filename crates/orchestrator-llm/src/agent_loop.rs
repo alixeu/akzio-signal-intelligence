@@ -282,12 +282,24 @@ impl TurnItem {
             .and_then(Value::as_str)
             .map(ToString::to_string)
             .unwrap_or_else(|| result.output.to_string());
+        let truncated_text = truncate_tool_result(&content_text, truncation);
+        // Keep content_json lean. Storing the raw tool payload here previously
+        // re-inflated truncated content_text when model_prompt serialized both.
+        let compact_output =
+            compact_tool_output_for_history(&result.output, &truncated_text, truncation);
+        let compact_result = ToolResultItem {
+            call_id: result.call_id.clone(),
+            name: result.name.clone(),
+            status: result.status.clone(),
+            output: compact_output,
+            error: result.error.clone(),
+        };
         Self {
             item_type: TurnItemType::ToolResult,
             role: "tool".to_string(),
-            content_text: truncate_tool_result(&content_text, truncation),
+            content_text: truncated_text,
             content_json: json!({
-                "result": result,
+                "result": compact_result,
                 "output_item_id": format!("result-{}", result.call_id),
                 "status": status.as_str()
             }),
@@ -562,11 +574,12 @@ impl LoopModel for RigLoopModel {
         input: ModelInput,
     ) -> Pin<Box<dyn Future<Output = Result<ModelResponse>> + Send + 'a>> {
         Box::pin(async move {
-            // Non-stream path: rig prompt text is the assistant message body.
-            // Tool loops use stream_events + native function calling instead.
+            let started = Instant::now();
+            let req_messages = input_to_debug_messages(&input);
             let prompt = model_prompt(&input)?;
             let text = crate::run_model_text_once(&self.settings, &input, &prompt).await?;
             if self.settings.debug {
+                let elapsed_ms = started.elapsed().as_millis();
                 crate::append_debug_llm_record(
                     &self.settings,
                     json!({
@@ -575,7 +588,13 @@ impl LoopModel for RigLoopModel {
                         "phase": self.settings.phase,
                         "topic_id": self.settings.topic_id,
                         "model": self.settings.llm.model,
-                        "prompt": prompt,
+                        "req": { "messages": req_messages },
+                        "resp": {
+                            "status": "completed",
+                            "output": [{"type": "output_text", "text": &text}],
+                        },
+                        "elapsed_ms": elapsed_ms,
+                        "token": null,
                         "response_text": text,
                     }),
                 )?;
@@ -591,13 +610,13 @@ impl LoopModel for RigLoopModel {
     ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
         Box::pin(async move {
             let prompt = model_prompt(&input)?;
-            let mut capture = DebugLlmCapture::new(handler);
+            let mut capture = DebugLlmCapture::new(handler, &input);
             let result =
                 crate::run_model_event_stream(&self.settings, &input, &prompt, &mut capture).await;
             if self.settings.debug {
                 crate::append_debug_llm_record(
                     &self.settings,
-                    capture.into_record(&self.settings, &prompt),
+                    capture.into_record(&self.settings),
                 )?;
             }
             result
@@ -607,43 +626,102 @@ impl LoopModel for RigLoopModel {
 
 struct DebugLlmCapture<'a> {
     inner: &'a mut dyn ModelEventHandler,
+    req_messages: Vec<Value>,
     assistant_text: String,
     tool_calls: Vec<Value>,
     raw: Value,
     end_turn: Option<bool>,
+    started: Instant,
 }
 
 impl<'a> DebugLlmCapture<'a> {
-    fn new(inner: &'a mut dyn ModelEventHandler) -> Self {
+    fn new(inner: &'a mut dyn ModelEventHandler, input: &ModelInput) -> Self {
         Self {
             inner,
+            req_messages: input_to_debug_messages(input),
             assistant_text: String::new(),
             tool_calls: Vec::new(),
             raw: Value::Null,
             end_turn: None,
+            started: Instant::now(),
         }
     }
 
-    fn into_record(self, settings: &RigSettings, prompt: &str) -> Value {
-        // Tool calls always continue the agent loop; never report end_turn=true
-        // alongside tools even if the model protocol stream said otherwise.
+    fn into_record(self, settings: &RigSettings) -> Value {
         let end_turn = if self.tool_calls.is_empty() {
             self.end_turn
         } else {
             Some(false)
         };
+        let elapsed_ms = self.started.elapsed().as_millis();
+        let usage = extract_token_usage(&self.raw);
         json!({
             "kind": "stream",
             "role": settings.role,
             "phase": settings.phase,
             "topic_id": settings.topic_id,
             "model": settings.llm.model,
-            "prompt": prompt,
+            "req": { "messages": self.req_messages },
+            "resp": self.raw,
+            "elapsed_ms": elapsed_ms,
+            "token": {
+                "input_tokens": usage.input_tokens,
+                "output_tokens": usage.output_tokens,
+                "cached_tokens": usage.cached_tokens,
+                "reasoning_tokens": usage.reasoning_tokens,
+                "total_tokens": usage.total_tokens,
+            },
             "response_text": self.assistant_text,
             "tool_calls": self.tool_calls,
             "end_turn": end_turn,
-            "raw": self.raw,
         })
+    }
+}
+
+pub fn input_to_debug_messages(input: &ModelInput) -> Vec<Value> {
+    let mut messages = Vec::new();
+    if let Some(system) = &input.system_instruction {
+        messages.push(json!({"role": "system", "content": system}));
+    }
+    for item in &input.items {
+        if let Some(msg) = turn_item_to_debug_message(item) {
+            messages.push(msg);
+        }
+    }
+    messages
+}
+
+fn turn_item_to_debug_message(item: &TurnItem) -> Option<Value> {
+    match item.item_type {
+        TurnItemType::UserMessage | TurnItemType::CompactSummary => Some(json!({
+            "role": if item.item_type == TurnItemType::CompactSummary { "system" } else { "user" },
+            "content": item.content_text,
+        })),
+        TurnItemType::AssistantMessage => Some(json!({
+            "role": "assistant",
+            "content": item.content_text,
+        })),
+        TurnItemType::ToolCall => {
+            let call = item.content_json.get("call")?;
+            let arguments = call.get("arguments").cloned().unwrap_or(Value::Null);
+            Some(json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": call.get("call_id").and_then(Value::as_str).unwrap_or(&item.tool_call_id),
+                    "type": "function",
+                    "function": {
+                        "name": call.get("name").and_then(Value::as_str).unwrap_or(&item.tool_name),
+                        "arguments": serde_json::to_string(&arguments).unwrap_or_else(|_| "null".to_string())
+                    }
+                }]
+            }))
+        }
+        TurnItemType::ToolResult => Some(json!({
+            "role": "tool",
+            "tool_call_id": item.tool_call_id,
+            "content": item.content_text,
+        })),
+        _ => None,
     }
 }
 
@@ -1183,6 +1261,26 @@ fn truncate_tool_result(content: &str, truncation: &TruncationConfig) -> String 
 
 fn truncate_context_fragment(content: &str, truncation: &TruncationConfig) -> String {
     truncate_semantic(content, truncation.context_fragment_chars, truncation)
+}
+
+/// Shrink oversized tool outputs before they are stored in turn history / prompts.
+fn compact_tool_output_for_history(
+    output: &Value,
+    truncated_text: &str,
+    truncation: &TruncationConfig,
+) -> Value {
+    let encoded = output.to_string();
+    if encoded.chars().count() <= truncation.tool_result_chars {
+        return output.clone();
+    }
+    // Prefer structured preview when the original payload was JSON-like.
+    if let Ok(parsed) = serde_json::from_str::<Value>(truncated_text) {
+        return parsed;
+    }
+    json!({
+        "truncated": true,
+        "preview": truncated_text,
+    })
 }
 
 fn persist_turn(
@@ -2584,11 +2682,34 @@ fn turn_item_prompt_json(
     include_tool_metadata: bool,
     truncation: &TruncationConfig,
 ) -> Value {
+    let content_text = truncate_context_fragment(&item.content_text, truncation);
+    // Tool results already carry the truncated payload in content_text. Re-emitting
+    // content_json would duplicate (and historically re-inflate) that evidence.
+    let content_json = match item.item_type {
+        TurnItemType::ToolResult => json!({
+            "status": item
+                .status
+                .as_ref()
+                .map(AgentItemStatus::as_str)
+                .unwrap_or("completed"),
+        }),
+        _ => {
+            let encoded = item.content_json.to_string();
+            if encoded.chars().count() > truncation.context_fragment_chars {
+                json!({
+                    "truncated": true,
+                    "preview": truncate_context_fragment(&encoded, truncation),
+                })
+            } else {
+                item.content_json.clone()
+            }
+        }
+    };
     let mut value = json!({
         "type": item.item_type.as_str(),
         "role": item.role,
-        "content_text": truncate_context_fragment(&item.content_text, truncation),
-        "content_json": item.content_json,
+        "content_text": content_text,
+        "content_json": content_json,
     });
     if include_tool_metadata {
         if let Some(map) = value.as_object_mut() {
@@ -4008,7 +4129,8 @@ mod tests {
                 run_dir: None,
                 run_id: None,
                 tickers: Vec::new(),
-            phase00_index: None,
+                phase00_index: None,
+            phase00_gate: None,
         },
             vec![tools::READ_RUN_CONTEXT_TOOL_NAME.to_string()],
         );
@@ -4034,7 +4156,8 @@ mod tests {
                 run_dir: None,
                 run_id: None,
                 tickers: Vec::new(),
-            phase00_index: None,
+                phase00_index: None,
+            phase00_gate: None,
         },
             Vec::new(),
         );
@@ -4195,6 +4318,40 @@ mod tests {
         assert!(!prompt[static_index..dynamic_index].contains("dynamic assistant note"));
         assert!(prompt[dynamic_index..].contains("dynamic assistant note"));
         assert!(prompt[dynamic_index..].contains("read_run_context"));
+    }
+
+    #[test]
+    fn tool_result_history_does_not_store_full_mega_payload() {
+        let huge = "x".repeat(50_000);
+        let tool_result = ToolResultItem {
+            call_id: "call-huge".to_string(),
+            name: "read_run_context".to_string(),
+            status: "completed".to_string(),
+            output: json!({
+                "status": "ok",
+                "evidence": { "csv": huge.clone() },
+            }),
+            error: None,
+        };
+        let item = TurnItem::tool_result(&tool_result, &TruncationConfig::default());
+        assert!(item.content_text.chars().count() <= TruncationConfig::default().tool_result_chars);
+        let stored = item.content_json.to_string();
+        assert!(
+            stored.chars().count() < 20_000,
+            "content_json must not re-embed the raw mega payload, got {} chars",
+            stored.chars().count()
+        );
+        assert!(!stored.contains(&huge));
+
+        let prompt = react_prompt(&ModelInput {
+            system_instruction: Some("sys".to_string()),
+            items: vec![item],
+            available_tools: vec![],
+            truncation: TruncationConfig::default(),
+        })
+        .unwrap();
+        assert!(!prompt.contains(&huge));
+        assert!(prompt.chars().count() < 30_000);
     }
 
     #[test]
@@ -4532,7 +4689,8 @@ mod tests {
                 run_dir: None,
                 run_id: None,
                 tickers: vec!["TQQQ".to_string()],
-            phase00_index: None,
+                phase00_index: None,
+            phase00_gate: None,
         },
             vec![tools::WEB_RUN_TOOL_NAME.to_string()],
         )

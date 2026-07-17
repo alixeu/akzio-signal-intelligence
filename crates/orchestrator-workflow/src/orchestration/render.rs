@@ -140,10 +140,7 @@ fn phase1_index_fork(state: &Value) -> Value {
         .get("phase00_tables")
         .and_then(|tables| tables.get("1"))
         .filter(|value| !value.is_null());
-    let phase1 = state
-        .get("phase1_index")
-        .cloned()
-        .unwrap_or(Value::Null);
+    let phase1 = state.get("phase1_index").cloned().unwrap_or(Value::Null);
     let source = if phase1.get("status").is_some() {
         "phase1_index"
     } else if from_index.is_some() {
@@ -212,10 +209,7 @@ fn prior_phase_summaries(state: &Value, current_phase: i64) -> Value {
 }
 
 fn phase3_context(state: &Value) -> Value {
-    let phase1 = state
-        .get("phase1_index")
-        .cloned()
-        .unwrap_or(Value::Null);
+    let phase1 = state.get("phase1_index").cloned().unwrap_or(Value::Null);
     let debate = state
         .get("debate_state_artifact")
         .cloned()

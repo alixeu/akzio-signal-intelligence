@@ -115,8 +115,11 @@ fn prompt_version_for_role(state: &Value, role: &str) -> Option<String> {
         "analyst.youtube" => "orchestrator.prompts.analyst.youtube",
         "analyst.reddit" => "orchestrator.prompts.analyst.reddit",
         "analyst.x" => "orchestrator.prompts.analyst.x",
+        "compressor.phase00" => "orchestrator.prompts.compressor.phase00",
+        "researcher.bull.warmup" => "orchestrator.prompts.phase2.bull_warmup",
         "researcher.bull.initial" => "orchestrator.prompts.phase2.bull_initial",
         "researcher.bull.interaction" => "orchestrator.prompts.phase2.bull_interaction",
+        "researcher.bear.warmup" => "orchestrator.prompts.phase2.bear_warmup",
         "researcher.bear.initial" => "orchestrator.prompts.phase2.bear_initial",
         "researcher.bear.interaction" => "orchestrator.prompts.phase2.bear_interaction",
         "mediator.topic" => "orchestrator.prompts.mediator.topic",
@@ -170,6 +173,14 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
         let mut llm = config
             .llm_roles
             .get(role)
+            .or_else(|| {
+                // Live phase00 compressor reuses research-manager LLM defaults when not configured.
+                if role == "compressor.phase00" {
+                    config.llm_roles.get("manager.research")
+                } else {
+                    None
+                }
+            })
             .with_context(|| format!("missing LLM config for role {role:?}"))?
             .clone();
         if let Some(model) = model_override.filter(|value| !value.trim().is_empty()) {
@@ -223,6 +234,10 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
             phase00_index: state.get("phase00_memory").map(|raw| {
                 std::sync::Arc::new(orchestrator_sql::Phase00MemoryIndex::from_state_value(raw))
             }),
+            phase00_gate: state
+                .get("run_id")
+                .and_then(Value::as_str)
+                .and_then(orchestrator_sql::phase00_gate),
         },
         web_search: config.web_search.get(role).cloned().unwrap_or_default(),
         truncation: config.truncation.clone(),
@@ -543,17 +558,37 @@ async fn run_steer_role_job_with_timeout(
 
 fn is_transient_role_error(message: &str) -> bool {
     let text = message.to_ascii_lowercase();
+    // Permanent request/context errors must not burn role retries.
+    // Do not treat bare "llm stream failed" wrappers as transient — that
+    // previously retried context-window-full 400s after stream retries finished.
+    if is_permanent_role_error_text(&text) {
+        return false;
+    }
     text.contains("503")
         || text.contains("502")
         || text.contains("429")
         || text.contains("bad_response_status_code")
         || text.contains("no healthy upstream")
-        || text.contains("llm stream chunk failed")
-        || text.contains("llm stream failed")
         || text.contains("timeout")
         || text.contains("timed out")
         || text.contains("connection reset")
         || text.contains("temporarily unavailable")
+        || text.contains("upstream_error")
+        || text.contains("upstream request failed")
+}
+
+fn is_permanent_role_error_text(text: &str) -> bool {
+    text.contains("context window is full")
+        || text.contains("reduce conversation history")
+        || text.contains("invalid_request_error")
+        || text.contains("请精简对话历史")
+        || text.contains("context window")
+        || text.contains("max_agent_loops")
+        || (text.contains("400")
+            && (text.contains("invalid_request")
+                || text.contains("context")
+                || text.contains("too large")
+                || text.contains("token")))
 }
 
 pub(crate) async fn run_role_job_with_timeout(job: RoleJob, timeout_sec: u64) -> RoleJobResult {
@@ -584,7 +619,9 @@ pub(crate) async fn run_role_job_with_timeout(job: RoleJob, timeout_sec: u64) ->
         {
             Ok(Ok(output)) => break Ok(output),
             Ok(Err(error)) => {
-                let message = error.to_string();
+                // Use the full chain so permanent upstream messages (e.g. context
+                // window full) are not masked by outer "LLM stream chunk failed".
+                let message = format!("{error:#}");
                 if attempt < MAX_ROLE_ATTEMPTS && is_transient_role_error(&message) {
                     let backoff_ms = 1_000u64 * attempt as u64;
                     warn!(
@@ -857,6 +894,27 @@ mod tests {
         assert_eq!(job.llm_ms, 50);
         assert_eq!(job.tool_ms, 25);
         assert_eq!(job.wait_ms(), 25);
+    }
+
+    #[test]
+    fn context_window_full_is_not_transient_role_error() {
+        let message = "LLM stream chunk failed: InvalidStatusCodeWithMessage(400, \
+            \"{\\\"error\\\":{\\\"message\\\":\\\"Context window is full — reduce conversation history\\\",\\\"type\\\":\\\"invalid_request_error\\\"}}\")";
+        assert!(!is_transient_role_error(message));
+        assert!(is_permanent_role_error_text(&message.to_ascii_lowercase()));
+    }
+
+    #[test]
+    fn bare_stream_wrapper_is_not_transient_without_upstream_marker() {
+        // Outer wrapper alone used to retry permanent 400s after chain was lost.
+        assert!(!is_transient_role_error("LLM stream chunk failed"));
+    }
+
+    #[test]
+    fn gateway_502_is_transient_role_error() {
+        let message = "LLM stream chunk failed: InvalidStatusCodeWithMessage(502, \
+            \"{\\\"error\\\":{\\\"message\\\":\\\"Upstream request failed\\\",\\\"type\\\":\\\"upstream_error\\\"}}\")";
+        assert!(is_transient_role_error(message));
     }
 
     #[test]

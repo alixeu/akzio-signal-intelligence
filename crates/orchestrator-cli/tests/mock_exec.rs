@@ -188,7 +188,10 @@ async fn debug_exec_records_local_reducers_without_changing_workflow_policy() {
     let state = &result["run_state"];
 
     assert_eq!(state["phase_status"]["1"], "done");
-    assert!(state.get("phase1_index").is_some(), "phase1_index materialized");
+    assert!(
+        state.get("phase1_index").is_some(),
+        "phase1_index materialized"
+    );
     assert_eq!(state["phase_status"]["2"], "done");
     assert_eq!(state["phase_status"]["25"], "done");
     assert!(matches!(
@@ -723,8 +726,7 @@ async fn mock_exec_writes_reducer_turn_summaries() {
         "expected reducer.debate_final rows, got {rows:?}"
     );
     assert!(
-        rows
-            .iter()
+        rows.iter()
             .filter(|(_, role, _)| role == "reducer.debate_final")
             .count()
             >= 1

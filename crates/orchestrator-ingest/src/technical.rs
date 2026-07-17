@@ -1,7 +1,10 @@
 use anyhow::{bail, Context, Result};
 use chrono::{Datelike, Duration, NaiveDate, Utc, Weekday};
 use clap::Args;
-use orchestrator_core::{config_int, config_str, config_strings, parse_tickers, default_technical_csv_dir, technical_csv_path, write_technical_csv, TechnicalCsvRow, DEFAULT_TECHNICAL_BARS};
+use orchestrator_core::{
+    config_int, config_str, config_strings, default_technical_csv_dir, parse_tickers,
+    technical_csv_path, write_technical_csv, TechnicalCsvRow, DEFAULT_TECHNICAL_BARS,
+};
 use orchestrator_sql::{connect, ensure_schema};
 use reqwest::header;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -249,7 +252,9 @@ pub async fn run(args: TechnicalArgs) -> Result<Value> {
                 rows = rows.split_off(rows.len() - keep);
             }
             let inserted = insert_feature_rows(&conn, &args.model, &rows, imported_at)?;
-            if let Some(csv_path) = technical_csv_path(&default_technical_csv_dir(), symbol, interval) {
+            if let Some(csv_path) =
+                technical_csv_path(&default_technical_csv_dir(), symbol, interval)
+            {
                 let csv_rows: Vec<TechnicalCsvRow> = rows
                     .iter()
                     .map(|row| TechnicalCsvRow {
@@ -257,7 +262,9 @@ pub async fn run(args: TechnicalArgs) -> Result<Value> {
                         values: row
                             .features
                             .iter()
-                            .filter_map(|(k, v)| v.filter(|v| v.is_finite()).map(|v| (k.clone(), v)))
+                            .filter_map(|(k, v)| {
+                                v.filter(|v| v.is_finite()).map(|v| (k.clone(), v))
+                            })
                             .collect(),
                     })
                     .filter(|row| !row.values.is_empty())

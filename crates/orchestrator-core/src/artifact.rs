@@ -338,8 +338,7 @@ pub fn evidence_item_from_value(value: Value) -> Result<EvidenceItem, String> {
             ));
             let source = value_as_string(obj.get("source"));
             let timestamp = value_as_string(obj.get("timestamp"));
-            let mut source_tier =
-                first_nonempty_string(&obj, &["source_tier", "source_quality"]);
+            let mut source_tier = first_nonempty_string(&obj, &["source_tier", "source_quality"]);
             source_tier = match source_tier.as_str() {
                 "industry_media" | "analyst_note" => "professional_research".to_string(),
                 "rumor" => "social_unverified".to_string(),

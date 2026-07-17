@@ -164,16 +164,8 @@ impl Phase00PhaseBatch {
     /// Debug / prompt snapshot for one phase (no DB).
     pub fn debug_snapshot(&self) -> Value {
         let written = self.written();
-        let summary_items: Vec<Value> = self
-            .summaries
-            .iter()
-            .map(|row| summary_row_to_value(row))
-            .collect();
-        let detail_items: Vec<Value> = self
-            .details
-            .iter()
-            .map(|row| detail_row_to_value(row))
-            .collect();
+        let summary_items: Vec<Value> = self.summaries.iter().map(summary_row_to_value).collect();
+        let detail_items: Vec<Value> = self.details.iter().map(detail_row_to_value).collect();
         json!({
             "role": "compressor",
             "kind": "phase_compress",
@@ -224,11 +216,7 @@ impl Phase00MemoryIndex {
         self.phases.insert(batch.source_phase, batch);
     }
 
-    pub fn list_summaries(
-        &self,
-        max_source_phase: Option<i64>,
-        ticker: Option<&str>,
-    ) -> Value {
+    pub fn list_summaries(&self, max_source_phase: Option<i64>, ticker: Option<&str>) -> Value {
         let mut items = Vec::new();
         for (phase, batch) in &self.phases {
             if max_source_phase.is_some_and(|max| *phase > max) {
@@ -236,7 +224,7 @@ impl Phase00MemoryIndex {
             }
             for row in &batch.summaries {
                 if let Some(t) = ticker.filter(|t| !t.is_empty()) {
-                    if row.ticker != t && row.ticker != "" && row.ticker != "__ALL__" {
+                    if row.ticker != t && !row.ticker.is_empty() && row.ticker != "__ALL__" {
                         continue;
                     }
                 }
@@ -261,11 +249,7 @@ impl Phase00MemoryIndex {
                 }
             }
         }
-        items.sort_by_key(|item| {
-            item.get("sort_order")
-                .and_then(Value::as_i64)
-                .unwrap_or(0)
-        });
+        items.sort_by_key(|item| item.get("sort_order").and_then(Value::as_i64).unwrap_or(0));
         json!({
             "query": "phase_summary_details",
             "summary_id": summary_id,

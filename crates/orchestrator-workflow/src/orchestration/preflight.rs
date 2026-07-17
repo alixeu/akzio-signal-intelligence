@@ -131,17 +131,19 @@ pub(crate) async fn run_technical_preflight(state: &mut Value) -> Result<()> {
         if let Some(dir) = value.get("output_dir").and_then(|v| v.as_str()) {
             state["technical_csv_dir"] = serde_json::json!(dir);
         } else {
-            state["technical_csv_dir"] = serde_json::json!(
-                orchestrator_core::default_technical_csv_dir().display().to_string()
-            );
+            state["technical_csv_dir"] =
+                serde_json::json!(orchestrator_core::default_technical_csv_dir()
+                    .display()
+                    .to_string());
         }
         if let Some(paths) = value.get("csv_paths") {
             state["technical_csv_paths"] = paths.clone();
         }
     } else {
-        state["technical_csv_dir"] = serde_json::json!(
-            orchestrator_core::default_technical_csv_dir().display().to_string()
-        );
+        state["technical_csv_dir"] =
+            serde_json::json!(orchestrator_core::default_technical_csv_dir()
+                .display()
+                .to_string());
     }
     record_preflight_result(state, tool, result);
     Ok(())

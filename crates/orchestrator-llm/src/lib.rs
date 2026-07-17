@@ -1141,6 +1141,10 @@ where
 
 fn is_transient_llm_error(error: &anyhow::Error) -> bool {
     let text = format!("{error:#}").to_ascii_lowercase();
+    // Permanent request/context errors must not burn stream retries.
+    if is_permanent_llm_error_text(&text) {
+        return false;
+    }
     text.contains("503")
         || text.contains("502")
         || text.contains("429")
@@ -1150,6 +1154,21 @@ fn is_transient_llm_error(error: &anyhow::Error) -> bool {
         || text.contains("timed out")
         || text.contains("connection reset")
         || text.contains("temporarily unavailable")
+        || text.contains("upstream_error")
+        || text.contains("upstream request failed")
+}
+
+fn is_permanent_llm_error_text(text: &str) -> bool {
+    text.contains("context window is full")
+        || text.contains("reduce conversation history")
+        || text.contains("invalid_request_error")
+        || text.contains("请精简对话历史")
+        || text.contains("context window")
+        || (text.contains("400")
+            && (text.contains("invalid_request")
+                || text.contains("context")
+                || text.contains("too large")
+                || text.contains("token")))
 }
 
 async fn stream_completion_model_once<M>(
@@ -1272,6 +1291,7 @@ where
         let elapsed_ms = started.elapsed().as_millis();
         let root = debug_project_root(settings);
         let usage = agent_loop::extract_token_usage(&final_raw);
+        let req_messages = agent_loop::input_to_debug_messages(input);
         debug_log_time(
             &root,
             json!({
@@ -1310,6 +1330,28 @@ where
                 "saw_tool_call": saw_tool_call,
             }),
         );
+        if let Err(error) = append_debug_llm_record(
+            settings,
+            json!({
+                "kind": "llm_stream",
+                "role": settings.role,
+                "phase": settings.phase,
+                "topic_id": settings.topic_id,
+                "model": settings.llm.model,
+                "req": { "messages": req_messages },
+                "resp": final_raw,
+                "elapsed_ms": elapsed_ms,
+                "token": {
+                    "input_tokens": usage.input_tokens,
+                    "output_tokens": usage.output_tokens,
+                    "cached_tokens": usage.cached_tokens,
+                    "reasoning_tokens": usage.reasoning_tokens,
+                    "total_tokens": usage.total_tokens,
+                },
+            }),
+        ) {
+            tracing::warn!(error = %error, "failed to write debug llm record from stream");
+        }
     }
     Ok(())
 }
@@ -2045,10 +2087,8 @@ fn configured_tool_names(settings: &RigSettings) -> Vec<&str> {
 fn role_disables_tools(role: &str) -> bool {
     // manager.research may call read_run_context for phase_summaries / attention.
     // Trader / risk / PM stay tool-free.
-    matches!(
-        role,
-        "trader" | "portfolio.manager" | "allocation.manager"
-    ) || role.starts_with("risk.")
+    matches!(role, "trader" | "portfolio.manager" | "allocation.manager")
+        || role.starts_with("risk.")
 }
 
 fn validate_tool_name(name: &str) -> Result<()> {
@@ -2102,6 +2142,7 @@ fn default_tool_config() -> tools::ExternalToolConfig {
             })
             .unwrap_or_default(),
         phase00_index: None,
+        phase00_gate: None,
     }
 }
 
@@ -2244,14 +2285,36 @@ fn mock_allocation_artifact(tickers: &[String]) -> Value {
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_loop, llm_judge::JudgeConfig, tools, LlmRoute, LlmTransport, OutputMode, RigSettings,
-        RoleLlmSettings, TruncationConfig,
+        agent_loop, is_permanent_llm_error_text, is_transient_llm_error, llm_judge::JudgeConfig,
+        tools, LlmRoute, LlmTransport, OutputMode, RigSettings, RoleLlmSettings, TruncationConfig,
     };
     use crate::web_search::{WebSearchConfig, WebSearchMode};
     use crate::{AssistantTextAccumulator, ModelEventHandler, ModelStreamEvent};
-    use anyhow::Result;
+    use anyhow::{anyhow, Result};
     use serde_json::json;
     use std::{future::Future, path::PathBuf, pin::Pin};
+
+    #[test]
+    fn context_window_full_is_not_transient() {
+        let err = anyhow!(
+            "LLM stream chunk failed: InvalidStatusCodeWithMessage(400, \
+             \"{{\\\"error\\\":{{\\\"message\\\":\\\"Context window is full — reduce conversation history\\\"\
+             ,\\\"type\\\":\\\"invalid_request_error\\\"}}}}\")"
+        );
+        assert!(!is_transient_llm_error(&err));
+        assert!(is_permanent_llm_error_text(
+            &format!("{err:#}").to_ascii_lowercase()
+        ));
+    }
+
+    #[test]
+    fn gateway_502_upstream_is_transient() {
+        let err = anyhow!(
+            "LLM stream chunk failed: InvalidStatusCodeWithMessage(502, \
+             \"{{\\\"error\\\":{{\\\"message\\\":\\\"Upstream request failed\\\",\\\"type\\\":\\\"upstream_error\\\"}}}}\")"
+        );
+        assert!(is_transient_llm_error(&err));
+    }
 
     fn base_settings(route: LlmRoute) -> RigSettings {
         RigSettings {
@@ -2381,6 +2444,7 @@ mod tests {
             run_id: None,
             tickers: vec!["QQQ".to_string()],
             phase00_index: None,
+            phase00_gate: None,
         });
         let first = agent_loop::Turn::new(
             "turn-topic-a",
@@ -2418,14 +2482,17 @@ mod tests {
             run_id: None,
             tickers: vec!["TQQQ".to_string()],
             phase00_index: None,
+            phase00_gate: None,
         });
 
         super::append_debug_llm_record(
             &settings,
             json!({
                 "kind": "generate",
-                "prompt": "hello",
-                "response_text": "world",
+                "req": { "messages": [{"role": "user", "content": "hello"}] },
+                "resp": { "status": "completed", "output": [{"type": "output_text", "text": "world"}] },
+                "elapsed_ms": 50,
+                "token": null,
             }),
         )
         .unwrap();
@@ -2433,8 +2500,10 @@ mod tests {
             &settings,
             json!({
                 "kind": "stream",
-                "prompt": "again",
-                "response_text": "ok",
+                "req": { "messages": [{"role": "user", "content": "again"}] },
+                "resp": { "id": "resp_1", "status": "completed" },
+                "elapsed_ms": 120,
+                "token": { "input_tokens": 10, "output_tokens": 5, "total_tokens": 15 },
             }),
         )
         .unwrap();
@@ -2447,7 +2516,10 @@ mod tests {
         // Latest turn only — intermediate tool turns are overwritten.
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("\"kind\":\"stream\""));
-        assert!(lines[0].contains("again"));
+        assert!(lines[0].contains("\"req\""));
+        assert!(lines[0].contains("\"resp\""));
+        assert!(lines[0].contains("\"elapsed_ms\""));
+        assert!(lines[0].contains("\"token\""));
     }
 
     #[test]

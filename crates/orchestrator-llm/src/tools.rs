@@ -31,9 +31,12 @@ pub struct ExternalToolConfig {
     #[serde(default)]
     pub run_id: Option<String>,
     pub tickers: Vec<String>,
-    /// In-run phase00 index (authoritative until SQLite flush at run end).
+    /// In-run phase00 index snapshot (optional cache).
     #[serde(skip)]
     pub phase00_index: Option<std::sync::Arc<orchestrator_sql::Phase00MemoryIndex>>,
+    /// Shared gate: wait for in-flight phase00 compress before serving index tools.
+    #[serde(skip)]
+    pub phase00_gate: Option<std::sync::Arc<orchestrator_sql::Phase00Gate>>,
 }
 
 impl Default for ExternalToolConfig {
@@ -45,6 +48,7 @@ impl Default for ExternalToolConfig {
             run_id: None,
             tickers: Vec::new(),
             phase00_index: None,
+            phase00_gate: None,
         }
     }
 }
@@ -1167,12 +1171,47 @@ fn execute_read_run_context(
         request.token_budget = Some(4096);
     }
 
+    // If phase00 compress is still running for prior phases, wait before serving index tools.
+    maybe_wait_phase00_gate(config, &request);
+
     let evidence = if let Some(from_mem) = try_read_phase00_from_memory(config, &request) {
         from_mem
     } else {
         orchestrator_sql::read_run_context(&mut conn, &request)?
     };
     wrap_read_run_context_evidence(config, &request, prior_reads, evidence)
+}
+
+fn maybe_wait_phase00_gate(
+    config: &ExternalToolConfig,
+    request: &orchestrator_sql::RunContextReadRequest,
+) {
+    let needs_index = matches!(
+        request.kind.as_str(),
+        "phase_summaries"
+            | "prior_phase_summaries"
+            | "phase_summary_details"
+            | "attention_expand"
+    );
+    if !needs_index {
+        return;
+    }
+    let gate = config
+        .phase00_gate
+        .clone()
+        .or_else(|| {
+            config
+                .run_id
+                .as_deref()
+                .and_then(orchestrator_sql::phase00_gate)
+        });
+    let Some(gate) = gate else {
+        return;
+    };
+    // Wait for compress of phases strictly before current role phase (if known).
+    let max_prior = request.phase.filter(|p| *p > 0).map(|p| p - 1);
+    let ok = gate.wait_until_ready(max_prior, std::time::Duration::from_secs(600));
+    let _ = ok; // on timeout, try_read still serves partial index
 }
 
 fn is_phase2_plus_role(role: &str) -> bool {
@@ -1187,7 +1226,27 @@ fn try_read_phase00_from_memory(
     config: &ExternalToolConfig,
     request: &orchestrator_sql::RunContextReadRequest,
 ) -> Option<Value> {
-    let index = config.phase00_index.as_ref()?;
+    // Prefer live gate snapshot (post-wait); fall back to static snapshot.
+    let owned;
+    let index: &orchestrator_sql::Phase00MemoryIndex = if let Some(gate) = config
+        .phase00_gate
+        .as_ref()
+        .cloned()
+        .or_else(|| {
+            config
+                .run_id
+                .as_deref()
+                .and_then(orchestrator_sql::phase00_gate)
+        })
+    {
+        owned = gate.snapshot();
+        &owned
+    } else if let Some(idx) = config.phase00_index.as_ref() {
+        idx.as_ref()
+    } else {
+        return None;
+    };
+
     match request.kind.as_str() {
         "phase_summaries" | "prior_phase_summaries" => {
             let max_source_phase = request.phase.filter(|p| *p > 0).map(|p| p - 1);
@@ -1364,6 +1423,7 @@ mod tests {
             run_id: None,
             tickers: Vec::new(),
             phase00_index: None,
+            phase00_gate: None,
         }
     }
 
@@ -1385,6 +1445,7 @@ mod tests {
             run_id: None,
             tickers: vec!["TQQQ".to_string()],
             phase00_index: None,
+            phase00_gate: None,
         };
 
         let output = execute_named_tool(
@@ -1450,6 +1511,7 @@ mod tests {
             run_id: Some("run-news".to_string()),
             tickers: vec!["QQQ".to_string()],
             phase00_index: None,
+            phase00_gate: None,
         };
         let turn = ToolRuntimeTurnContext {
             run_id: "run-news".to_string(),
@@ -1524,6 +1586,7 @@ mod tests {
             run_id: Some("run-news".to_string()),
             tickers: vec!["QQQ".to_string(), "SOXX".to_string()],
             phase00_index: None,
+            phase00_gate: None,
         };
         let turn = ToolRuntimeTurnContext {
             run_id: "run-news".to_string(),

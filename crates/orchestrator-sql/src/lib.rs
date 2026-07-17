@@ -4,6 +4,7 @@ pub mod context;
 pub mod importers;
 pub mod memory;
 pub mod outcome;
+pub mod phase00_gate;
 pub mod phase_index;
 pub mod prediction;
 pub mod schema;
@@ -17,6 +18,9 @@ pub use context::{
 pub use importers::{
     import_jin10_payload, jin10_item_id, record_jin10_attention, record_jin10_attention_for_turn,
     Jin10Attention,
+};
+pub use phase00_gate::{
+    phase00_gate, register_phase00_gate, unregister_phase00_gate, Phase00Gate,
 };
 pub use phase_index::{
     clear_phase_compress, compressor_debug_snapshot, expand_attention_subjects, list_attention,

@@ -273,10 +273,12 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         validate_sqlite_context(&conn, &runtime_config)?;
     }
 
-    // Phase-00 compress jobs run overlapping the next stage; wait when that
-    // stage needs summaries (phase 2 tools / phase 3 prompt inject / end).
+    // Phase-00 compress jobs run overlapping the next stage.
+    // Tools that need the index wait via Phase00Gate; do not block phase start.
     let mut compress_jobs: Vec<(i64, tokio::task::JoinHandle<Result<CompressJobResult>>)> =
         Vec::new();
+    let phase00_gate = std::sync::Arc::new(orchestrator_sql::Phase00Gate::new(&run_id));
+    orchestrator_sql::register_phase00_gate(&run_id, phase00_gate.clone());
 
     if args.from_phase <= 1 && args.to_phase >= 1 {
         debug!(roles = ?phase1_agents, "phase 1 starting");
@@ -293,12 +295,12 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         .await?;
         set_phase_status(&mut state, 1, "done");
         record_phase_elapsed(&mut state, phase_timer);
-        compress_jobs.push((1, spawn_compress_job(&db_path, &state, 1)));
-        debug!("phase 1 completed; phase00 compress(1) scheduled");
+        compress_jobs.push((1, spawn_compress_job(phase00_gate.clone(), &state, 1)));
+        debug!("phase 1 completed; phase00 compress(1) scheduled (concurrent with next phase)");
     }
     if args.from_phase <= 2 && args.to_phase >= 2 {
-        // Phase 2 tools (phase_summaries) need phase1 compress done first.
-        await_all_compress_jobs(&mut compress_jobs, &mut state).await?;
+        // Do NOT await compress here — run phase 2 concurrently with phase00(1).
+        // Tools needing phase_summaries wait on Phase00Gate inside read_run_context.
         // Weighting is phase 2/3 work, not phase1 organize.
         materialize_weighted_probability_base(&mut state);
         let max_debate_rounds = args
@@ -330,14 +332,18 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         set_phase_status(&mut state, PHASE2_REDUCER, phase2_status);
         record_phase2_summary_debug_artifact(&mut state, phase2_status)?;
         record_phase_elapsed(&mut state, phase_timer);
-        compress_jobs.push((2, spawn_compress_job(&db_path, &state, 2)));
+        compress_jobs.push((2, spawn_compress_job(phase00_gate.clone(), &state, 2)));
         debug!("phase 2 completed; phase00 compress(2) scheduled");
     }
     inject_phase0_reflection(&conn, &mut state, &runtime_config)?;
     if args.from_phase <= 3 && args.to_phase >= 3 {
-        // Research manager injects phase00_tables + may expand via tools.
-        await_all_compress_jobs(&mut compress_jobs, &mut state).await?;
-        // Recompute weighting for phase 3 (idempotent; also covers from_phase=3 skips).
+        // Concurrent with phase00(1..2). Tools wait on Phase00Gate.
+        // Best-effort: if compress already finished, refresh state for prompt inject.
+        if let Some(g) = orchestrator_sql::phase00_gate(&run_id) {
+            if !g.has_inflight() {
+                state["phase00_memory"] = g.snapshot().to_state_value();
+            }
+        }
         materialize_weighted_probability_base(&mut state);
         debug!("phase 3 starting");
         let phase_timer = start_phase_timer(3, "phase3");
@@ -352,7 +358,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         .await?;
         set_phase_status(&mut state, 3, "done");
         record_phase_elapsed(&mut state, phase_timer);
-        compress_jobs.push((3, spawn_compress_job(&db_path, &state, 3)));
+        compress_jobs.push((3, spawn_compress_job(phase00_gate.clone(), &state, 3)));
         debug!("phase 3 completed; phase00 compress(3) scheduled");
     }
     let policy = if state.get("research_plan").is_some() {
@@ -382,7 +388,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         set_phase_status(&mut state, 4, phase4_status);
         await_all_compress_jobs(&mut compress_jobs, &mut state).await?;
         record_phase_elapsed(&mut state, phase_timer);
-        compress_jobs.push((4, spawn_compress_job(&db_path, &state, 4)));
+        compress_jobs.push((4, spawn_compress_job(phase00_gate.clone(), &state, 4)));
         debug!("phase 4 (trader) completed; phase00 compress(4) scheduled");
     }
     if args.from_phase <= 5 && args.to_phase >= 5 {
@@ -406,7 +412,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         set_phase_status(&mut state, 5, phase5_status);
         await_all_compress_jobs(&mut compress_jobs, &mut state).await?;
         record_phase_elapsed(&mut state, phase_timer);
-        compress_jobs.push((5, spawn_compress_job(&db_path, &state, 5)));
+        compress_jobs.push((5, spawn_compress_job(phase00_gate.clone(), &state, 5)));
         debug!("phase 5 (risk debate) completed; phase00 compress(5) scheduled");
     }
     if args.from_phase <= 6 && args.to_phase >= 6 {
@@ -430,7 +436,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         set_phase_status(&mut state, 6, phase6_status);
         await_all_compress_jobs(&mut compress_jobs, &mut state).await?;
         record_phase_elapsed(&mut state, phase_timer);
-        compress_jobs.push((6, spawn_compress_job(&db_path, &state, 6)));
+        compress_jobs.push((6, spawn_compress_job(phase00_gate.clone(), &state, 6)));
         debug!("phase 6 (portfolio manager) completed; phase00 compress(6) scheduled");
     }
     if args.from_phase <= 7 && args.to_phase >= 7 {
@@ -448,7 +454,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         set_phase_status(&mut state, 7, "done");
         await_all_compress_jobs(&mut compress_jobs, &mut state).await?;
         record_phase_elapsed(&mut state, phase_timer);
-        compress_jobs.push((7, spawn_compress_job(&db_path, &state, 7)));
+        compress_jobs.push((7, spawn_compress_job(phase00_gate.clone(), &state, 7)));
         debug!("phase 7 (allocation) completed; phase00 compress(7) scheduled");
     }
     if args.from_phase <= 8 && args.to_phase >= 8 {
@@ -467,7 +473,11 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
     // Phase00 summaries stay in memory during the run; materialize to SQLite once at the end.
     let phase00_flushed =
         crate::orchestration::compress::flush_phase00_to_sqlite(&conn, &mut state)?;
-    debug!(phase00_flushed, "phase00 memory flushed to sqlite at run end");
+    orchestrator_sql::unregister_phase00_gate(&run_id);
+    debug!(
+        phase00_flushed,
+        "phase00 memory flushed to sqlite at run end"
+    );
 
     update_run_status(&mut conn, &run_id, "completed", None)?;
     record_contracts(&mut state);
@@ -1784,10 +1794,7 @@ fn topic_fork_user_message(topic: &Value, common_ground: &Value) -> String {
         .get("topic_id")
         .and_then(Value::as_str)
         .unwrap_or(title);
-    let hinge = topic
-        .get("decision_hinge")
-        .cloned()
-        .unwrap_or(Value::Null);
+    let hinge = topic.get("decision_hinge").cloned().unwrap_or(Value::Null);
     let cg = serde_json::to_string(common_ground).unwrap_or_else(|_| "{}".into());
     format!(
         "请对「{title}」主题说明你的看法。\n\
@@ -1808,7 +1815,10 @@ async fn run_one_topic_debate(
     config: &RuntimeConfig,
 ) -> Result<TopicDebateResult> {
     let topic_id = topic_id_from_topic(&topic);
-    debug!(topic_id, "phase 2 steer-room topic debate starting (forked after warm-up)");
+    debug!(
+        topic_id,
+        "phase 2 steer-room topic debate starting (forked after warm-up)"
+    );
 
     let model_override_ref = model_override.as_deref();
     let reasoning_effort_ref = reasoning_effort_override.as_deref();
@@ -2435,8 +2445,7 @@ fn compress_phase_job(state: Value, source_phase: i64) -> Result<CompressJobResu
 }
 
 fn apply_compress_result(state: &mut Value, result: CompressJobResult) -> Result<()> {
-    let snapshot =
-        crate::orchestration::compress::apply_phase00_batch(state, result.batch)?;
+    let snapshot = crate::orchestration::compress::apply_phase00_batch(state, result.batch)?;
     if result.debug_enabled {
         let role = format!("compressor.after_phase_{}", result.source_phase);
         record_local_debug_artifact(state, 0, &role, &snapshot)?;
@@ -2449,14 +2458,24 @@ fn apply_compress_result(state: &mut Value, result: CompressJobResult) -> Result
     Ok(())
 }
 
-/// Spawn phase-00 compress overlapping the next pipeline stage (memory-only build).
+/// Spawn phase-00 after a business phase; runs concurrent with the next phase.
+/// Tools wait on `Phase00Gate` if they need the index before this job finishes.
 fn spawn_compress_job(
-    _db_path: &std::path::Path,
+    gate: std::sync::Arc<orchestrator_sql::Phase00Gate>,
     state: &Value,
     source_phase: i64,
 ) -> tokio::task::JoinHandle<Result<CompressJobResult>> {
+    gate.mark_inflight(source_phase);
     let state_snapshot = state.clone();
-    tokio::task::spawn_blocking(move || compress_phase_job(state_snapshot, source_phase))
+    let gate_job = gate.clone();
+    tokio::task::spawn_blocking(move || {
+        let result = compress_phase_job(state_snapshot, source_phase);
+        match &result {
+            Ok(ok) => gate_job.complete(source_phase, ok.batch.clone()),
+            Err(err) => gate_job.fail(source_phase, err.to_string()),
+        }
+        result
+    })
 }
 
 async fn await_compress_job(
