@@ -447,7 +447,8 @@ pub(crate) fn build_debate_state_artifact(state: &Value, config: &RuntimeConfig)
         "convergence_reason": reason,
         "workflow_pattern": "Workflow -> Stage/Sub-workflow -> Agent workers -> Reducer -> state artifact",
         "generated_from": {
-            "worker_roles": [
+            "worker_roles": executed_phase2_worker_roles(state),
+            "planned_worker_roles": [
                 "mediator.topic",
                 "researcher.bull.initial",
                 "researcher.bear.initial",
@@ -471,6 +472,43 @@ pub(crate) fn build_debate_state_artifact(state: &Value, config: &RuntimeConfig)
             "no_new_external_facts": true
         }
     })
+}
+
+fn executed_phase2_worker_roles(state: &Value) -> Vec<String> {
+    let mut roles = BTreeSet::new();
+    if state
+        .get("topic_generation_artifact")
+        .and_then(|artifact| artifact.get("status"))
+        .and_then(Value::as_str)
+        .is_some_and(|status| !status.starts_with("skipped"))
+    {
+        roles.insert("mediator.topic".to_string());
+    }
+    for turn in state
+        .get("debate_turns")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if let Some(role) = turn.get("role").and_then(Value::as_str) {
+            roles.insert(role.to_string());
+        }
+    }
+    for topic in state
+        .get("topic_debate_states")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|topics| topics.values())
+    {
+        if topic
+            .get("controller_artifacts")
+            .and_then(Value::as_array)
+            .is_some_and(|items| !items.is_empty())
+        {
+            roles.insert("mediator.topic_controller".to_string());
+        }
+    }
+    roles.into_iter().collect()
 }
 
 fn topic_state_has_controller_artifact(topic_state: &Value) -> bool {
@@ -818,6 +856,7 @@ pub(crate) fn weighted_probability_base(
             let mut weight_total = 0.0;
             let mut source_roles = Vec::new();
             let mut skipped_roles = Vec::new();
+            let mut unobserved_roles = Vec::new();
             for (role, report) in reports {
                 let weight = weights.get(role).and_then(Value::as_f64).unwrap_or(0.0);
                 if weight <= 0.0 {
@@ -828,6 +867,19 @@ pub(crate) fn weighted_probability_base(
                 // letting a neutral 0.0-confidence placeholder drag the base toward
                 // 0.50. A silently-failed analyst must not count as evidence.
                 if is_non_contributing(report, payload) {
+                    if payload.get("direction").and_then(Value::as_str) == Some("unobserved")
+                        && !report
+                            .get("degraded")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false)
+                        && !matches!(
+                            report.get("status").and_then(Value::as_str),
+                            Some("degraded" | "missing" | "error")
+                        )
+                    {
+                        unobserved_roles.push(Value::String(role.clone()));
+                        continue;
+                    }
                     skipped_roles.push(Value::String(role.clone()));
                     continue;
                 }
@@ -847,7 +899,7 @@ pub(crate) fn weighted_probability_base(
                     "bearish" | "short" | "negative" => -1.0,
                     "neutral" | "mixed" => 0.0,
                     "unobserved" => {
-                        skipped_roles.push(Value::String(role.clone()));
+                        unobserved_roles.push(Value::String(role.clone()));
                         continue;
                     }
                     _ => {
@@ -882,7 +934,8 @@ pub(crate) fn weighted_probability_base(
                     "short_probability": short_probability,
                     "confidence": confidence,
                     "source_roles": source_roles,
-                    "skipped_roles": skipped_roles
+                    "skipped_roles": skipped_roles,
+                    "unobserved_roles": unobserved_roles
                 }),
             )
         })
@@ -1360,7 +1413,7 @@ mod tests {
     }
 
     #[test]
-    fn unobserved_direction_is_skipped() {
+    fn unobserved_direction_is_recorded_separately_from_skipped() {
         let state = state_with_weights();
         let tickers = vec!["QQQ".to_string()];
         let mut reports = serde_json::Map::new();
@@ -1376,7 +1429,43 @@ mod tests {
         let base = weighted_probability_base(&state, &tickers, &reports);
         let qqq = &base["QQQ"];
         assert!(qqq["long_probability"].as_f64().unwrap() < 0.5);
-        assert_eq!(qqq["skipped_roles"], json!(["analyst.news_macro"]));
+        assert_eq!(qqq["skipped_roles"], json!([]));
+        assert_eq!(qqq["unobserved_roles"], json!(["analyst.news_macro"]));
+    }
+
+    #[test]
+    fn debate_generated_from_lists_only_executed_workers() {
+        let config = test_runtime_config();
+        let skipped = json!({
+            "tickers": ["QQQ"],
+            "topic_generation_artifact": {
+                "status": "skipped_no_actionable_evidence",
+                "actionable": false
+            }
+        });
+        let skipped_artifact = build_debate_state_artifact(&skipped, &config);
+        assert_eq!(
+            skipped_artifact["generated_from"]["worker_roles"],
+            json!([])
+        );
+
+        let executed = json!({
+            "tickers": ["QQQ"],
+            "topic_generation_artifact": {"status": "ready", "actionable": true},
+            "debate_turns": [
+                {"role": "researcher.bull.initial"},
+                {"role": "researcher.bear.initial"}
+            ]
+        });
+        let executed_artifact = build_debate_state_artifact(&executed, &config);
+        assert_eq!(
+            executed_artifact["generated_from"]["worker_roles"],
+            json!([
+                "mediator.topic",
+                "researcher.bear.initial",
+                "researcher.bull.initial"
+            ])
+        );
     }
 
     #[test]
@@ -1592,6 +1681,14 @@ mod tests {
         assert_eq!(
             artifact["per_ticker"]["QQQ"]["manager_handoff"]["confidence_modifier"],
             "data_insufficient"
+        );
+        assert_eq!(artifact["generated_from"]["worker_roles"], json!([]));
+        assert_eq!(
+            artifact["generated_from"]["planned_worker_roles"]
+                .as_array()
+                .unwrap()
+                .len(),
+            6
         );
     }
 

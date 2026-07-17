@@ -14,13 +14,14 @@ use orchestrator_sql::{
 use serde_json::{json, Value};
 use std::{
     fs,
-    io::Write,
     path::{Path, PathBuf},
     time::Instant,
 };
 use tracing::debug;
 
-use crate::orchestration::allocation::{compute_allocation_context, normalize_allocation};
+use crate::orchestration::allocation::{
+    allocation_prompt_context, compute_allocation_context, normalize_allocation,
+};
 use crate::orchestration::artifact::{
     build_debate_state_artifact, build_phase1_state_artifact, build_topic_generation_artifact,
     merge_reducer_output, persist_artifact, persist_artifact_with_last_md, persist_message,
@@ -250,6 +251,9 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
     }
     state["mock"] = Value::Bool(args.mock);
     state["debug"] = Value::Bool(args.debug);
+    if args.debug {
+        orchestrator_llm::reset_debug_output_dir(&default_project_root())?;
+    }
     {
         let conn = connect(&db_path)?;
         clear_agent_loop_history(&conn, &run_id)?;
@@ -314,6 +318,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         let phase2_status = if phase2_actionable { "done" } else { "skipped" };
         set_phase_status(&mut state, 2, phase2_status);
         set_phase_status(&mut state, PHASE2_REDUCER, phase2_status);
+        record_phase2_summary_debug_artifact(&mut state, phase2_status)?;
         record_phase_elapsed(&mut state, phase_timer);
         debug!("phase 2 completed");
     }
@@ -331,15 +336,12 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         )
         .await?;
         set_phase_status(&mut state, 3, "done");
+        compress_phase_and_debug(&conn, &mut state, 3)?;
         record_phase_elapsed(&mut state, phase_timer);
         debug!("phase 3 completed");
     }
     let policy = if state.get("research_plan").is_some() {
-        Some(apply_workflow_policy(
-            &mut state,
-            &conn,
-            &runtime_config,
-        ))
+        Some(apply_workflow_policy(&mut state, &conn, &runtime_config))
     } else {
         None
     };
@@ -362,6 +364,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             "derived"
         };
         set_phase_status(&mut state, 4, phase4_status);
+        compress_phase_and_debug(&conn, &mut state, 4)?;
         record_phase_elapsed(&mut state, phase_timer);
         debug!("phase 4 (trader) completed");
     }
@@ -384,6 +387,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             "skipped"
         };
         set_phase_status(&mut state, 5, phase5_status);
+        compress_phase_and_debug(&conn, &mut state, 5)?;
         record_phase_elapsed(&mut state, phase_timer);
         debug!("phase 5 (risk debate) completed");
     }
@@ -406,6 +410,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             "derived"
         };
         set_phase_status(&mut state, 6, phase6_status);
+        compress_phase_and_debug(&conn, &mut state, 6)?;
         record_phase_elapsed(&mut state, phase_timer);
         debug!("phase 6 (portfolio manager) completed");
     }
@@ -422,6 +427,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         )
         .await?;
         set_phase_status(&mut state, 7, "done");
+        compress_phase_and_debug(&conn, &mut state, 7)?;
         record_phase_elapsed(&mut state, phase_timer);
         debug!("phase 7 (allocation) completed");
     }
@@ -1059,6 +1065,17 @@ fn record_phase_elapsed(state: &mut Value, timer: PhaseTimer) {
         .map(|items| json!(items.len()))
         .unwrap_or_else(|| json!(0));
     state["workflow_metrics"]["total_phase_elapsed_ms"] = json!(total);
+    if state.get("debug").and_then(Value::as_bool) == Some(true) {
+        orchestrator_llm::debug_log_time(
+            &default_project_root(),
+            json!({
+                "kind": "phase",
+                "name": timer.label,
+                "phase": timer.phase,
+                "elapsed_ms": elapsed_ms,
+            }),
+        );
+    }
 }
 
 fn record_market_truth_check(state: &mut Value, downstream_name: &str, downstream: &Value) {
@@ -1597,6 +1614,8 @@ async fn run_one_topic_debate(
     .await?;
     turns.push(bull_seed.clone());
     turns.push(bear_seed.clone());
+    let mut latest_bull = bull_seed;
+    let mut latest_bear = bear_seed;
 
     let mut mediator_output = run_topic_steer_step(
         &mut conn,
@@ -1609,8 +1628,9 @@ async fn run_one_topic_debate(
         Some(steer_payload(
             "seed_claims",
             &json!({
-                "bull_seed": compact_debate_turn(&bull_seed),
-                "bear_seed": compact_debate_turn(&bear_seed)
+                "requirement": "Package both sides into claim-level next_steers so each side must address the opponent's claim_ids.",
+                "bull_seed": compact_debate_turn(&latest_bull),
+                "bear_seed": compact_debate_turn(&latest_bear)
             }),
         )),
         model_override_ref,
@@ -1625,13 +1645,11 @@ async fn run_one_topic_debate(
     .await?;
     turns.push(mediator_output.clone());
 
+    // Sequential point debate: bull rebuts latest bear claims, then bear rebuts
+    // this-round bull claims, then mediator packages the next claim ledger.
     for round in 2..=max_debate_rounds.max(2) {
-        let bull_steer = steer_for_role(&mediator_output, "bull").unwrap_or_else(|| {
-            steer_payload(
-                "respond_to_mediator",
-                &compact_debate_turn(&mediator_output),
-            )
-        });
+        let bull_steer =
+            build_point_debate_steer(&mediator_output, "bull", &latest_bear, &latest_bull);
         let bull_rebuttal = run_topic_steer_step(
             &mut conn,
             &mut local_state,
@@ -1651,12 +1669,10 @@ async fn run_one_topic_debate(
                 .clone(),
         )
         .await?;
-        let bear_steer = steer_for_role(&mediator_output, "bear").unwrap_or_else(|| {
-            steer_payload(
-                "respond_to_mediator",
-                &compact_debate_turn(&mediator_output),
-            )
-        });
+        latest_bull = bull_rebuttal.clone();
+
+        let bear_steer =
+            build_point_debate_steer(&mediator_output, "bear", &latest_bull, &latest_bear);
         let bear_rebuttal = run_topic_steer_step(
             &mut conn,
             &mut local_state,
@@ -1676,6 +1692,8 @@ async fn run_one_topic_debate(
                 .clone(),
         )
         .await?;
+        latest_bear = bear_rebuttal.clone();
+
         mediator_output = run_topic_steer_step(
             &mut conn,
             &mut local_state,
@@ -1691,8 +1709,9 @@ async fn run_one_topic_debate(
             Some(steer_payload(
                 "debater_packets",
                 &json!({
-                    "bull_packet": compact_debate_turn(&bull_rebuttal),
-                    "bear_packet": compact_debate_turn(&bear_rebuttal)
+                    "requirement": "Force claim-level cross-examination: each next_steers entry must list opponent claim_ids that side must accept/rebut.",
+                    "bull_packet": compact_debate_turn(&latest_bull),
+                    "bear_packet": compact_debate_turn(&latest_bear)
                 }),
             )),
             model_override_ref,
@@ -1714,12 +1733,12 @@ async fn run_one_topic_debate(
             .and_then(|a| a.get("soft_control"))
             .and_then(|sc| sc.get("should_continue"))
             .and_then(Value::as_bool);
-        if should_continue == Some(false) && round < max_debate_rounds.max(2) {
+        if should_continue == Some(false) {
             debug!(
                 topic_id,
-                round,
-                "phase 2 mediator advised stopping; continuing until the configured hard round limit"
+                round, "phase 2 mediator soft-stop; ending topic debate early"
             );
+            break;
         }
     }
 
@@ -1751,17 +1770,33 @@ fn steer_topic_sessions(state: &Value, topic_id: &str) -> Value {
     json!({
         "bull": {
             "session_id": format!("{run_id}:phase2:{topic_id}:bull"),
-            "turn_id": format!("turn-{topic_id}-bull")
+            "turn_id": format!("turn-{topic_id}-bull-initial")
         },
         "bear": {
             "session_id": format!("{run_id}:phase2:{topic_id}:bear"),
-            "turn_id": format!("turn-{topic_id}-bear")
+            "turn_id": format!("turn-{topic_id}-bear-initial")
         },
         "mediator": {
             "session_id": format!("{run_id}:phase2:{topic_id}:mediator"),
             "turn_id": format!("turn-{topic_id}-mediator")
         }
     })
+}
+
+/// Initial and interaction roles must not share a turn_id — shared history drops the
+/// interaction role prompt and burns max_agent_loops on schema mismatch.
+fn steer_turn_id_for_role(topic_id: &str, role: &str) -> String {
+    if role.contains("bull.initial") {
+        format!("turn-{topic_id}-bull-initial")
+    } else if role.contains("bull.interaction") {
+        format!("turn-{topic_id}-bull-interaction")
+    } else if role.contains("bear.initial") {
+        format!("turn-{topic_id}-bear-initial")
+    } else if role.contains("bear.interaction") {
+        format!("turn-{topic_id}-bear-interaction")
+    } else {
+        format!("turn-{topic_id}-mediator")
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1812,11 +1847,7 @@ async fn run_topic_steer_step(
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string(),
-            turn_id: session
-                .get("turn_id")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string(),
+            turn_id: steer_turn_id_for_role(topic_id, role),
             steer,
         },
         if role == "mediator.topic_controller" {
@@ -1864,6 +1895,97 @@ fn steer_payload(kind: &str, value: &Value) -> String {
     json!({"kind": kind, "payload": value}).to_string()
 }
 
+/// Build a claim-level debate steer so bull/bear must address the opponent's points.
+fn build_point_debate_steer(
+    controller_turn: &Value,
+    side: &str,
+    opponent_turn: &Value,
+    own_previous_turn: &Value,
+) -> String {
+    let mediator_instruction = mediator_instruction_for_side(controller_turn, side);
+    let opponent_packet = compact_debate_turn(opponent_turn);
+    let opponent_claims = extract_addressable_claims(&opponent_packet);
+    let accepted_for_you = accepted_claims_for_side(controller_turn, side);
+    json!({
+        "kind": "point_debate",
+        "side": side,
+        "requirement": "You MUST run claim-level cross-examination. For every item in opponent_claims_to_address and accepted_for_you, set reply_to to that claim_id and choose stance accept|rebut|downgrade|needs_evidence. Do not invent a parallel monologue that ignores opponent points.",
+        "mediator_instruction": mediator_instruction,
+        "opponent_packet": opponent_packet,
+        "opponent_claims_to_address": opponent_claims,
+        "accepted_for_you": accepted_for_you,
+        "own_previous_packet": compact_debate_turn(own_previous_turn),
+        "reply_to_required": true
+    })
+    .to_string()
+}
+
+fn mediator_instruction_for_side(controller_turn: &Value, side: &str) -> Value {
+    let artifact = controller_turn.get("artifact").unwrap_or(controller_turn);
+    let keys = match side {
+        "bull" => ["bull", "researcher.bull.interaction", "to_bull"],
+        _ => ["bear", "researcher.bear.interaction", "to_bear"],
+    };
+    artifact
+        .get("next_steers")
+        .and_then(Value::as_object)
+        .and_then(|object| keys.iter().find_map(|key| object.get(*key).cloned()))
+        .unwrap_or_else(|| compact_debate_turn(controller_turn))
+}
+
+fn accepted_claims_for_side(controller_turn: &Value, side: &str) -> Value {
+    let artifact = controller_turn.get("artifact").unwrap_or(controller_turn);
+    let accepted = artifact
+        .get("accepted_for_opponent")
+        .cloned()
+        .unwrap_or(Value::Null);
+    // Controller may nest by side or return a flat claim list.
+    if let Some(object) = accepted.as_object() {
+        let keys = match side {
+            "bull" => ["bull", "to_bull", "researcher.bull.interaction"],
+            _ => ["bear", "to_bear", "researcher.bear.interaction"],
+        };
+        if let Some(value) = keys.iter().find_map(|key| object.get(*key).cloned()) {
+            return value;
+        }
+    }
+    accepted
+}
+
+fn extract_addressable_claims(packet: &Value) -> Value {
+    let artifact = packet.get("artifact").unwrap_or(packet);
+    if let Some(claims) = artifact.get("claims").and_then(Value::as_array) {
+        let items: Vec<Value> = claims
+            .iter()
+            .map(|claim| {
+                json!({
+                    "claim_id": claim.get("claim_id").cloned().unwrap_or(Value::Null),
+                    "claim": claim.get("claim").cloned().unwrap_or(Value::Null),
+                    "decision_hinge": claim.get("decision_hinge").cloned().unwrap_or(Value::Null),
+                    "confidence": claim.get("confidence").cloned().unwrap_or(Value::Null),
+                    "evidence_refs": claim.get("evidence_refs").cloned().unwrap_or(Value::Null)
+                })
+            })
+            .collect();
+        if !items.is_empty() {
+            return Value::Array(items);
+        }
+    }
+    if artifact.get("claim").is_some() {
+        return json!([{
+            "claim_id": artifact.get("reply_to").cloned()
+                .or_else(|| artifact.get("claim_id").cloned())
+                .unwrap_or(Value::Null),
+            "claim": artifact.get("claim").cloned().unwrap_or(Value::Null),
+            "decision_hinge": artifact.get("decision_hinge").cloned().unwrap_or(Value::Null),
+            "confidence": artifact.get("confidence").cloned().unwrap_or(Value::Null),
+            "evidence_refs": artifact.get("evidence_refs").cloned().unwrap_or(Value::Null),
+            "stance": artifact.get("stance").cloned().unwrap_or(Value::Null)
+        }]);
+    }
+    json!([])
+}
+
 fn compact_debate_turn(turn: &Value) -> Value {
     let artifact = turn.get("artifact").unwrap_or(turn);
     json!({
@@ -1892,6 +2014,12 @@ fn compact_debate_artifact(artifact: &Value) -> Value {
         "send_to_mediator",
         "blocked_ack",
         "steelman",
+        "fatal_weakness",
+        "invalidation_condition",
+        "evidence_needed",
+        "unresolved",
+        "upside_asymmetry",
+        "downside_asymmetry",
         "claim_ledger",
         "accepted_for_opponent",
         "rejected_to_origin",
@@ -1918,19 +2046,6 @@ fn compact_debate_artifact(artifact: &Value) -> Value {
             })
             .collect(),
     )
-}
-
-fn steer_for_role(controller_turn: &Value, side: &str) -> Option<String> {
-    let artifact = controller_turn.get("artifact").unwrap_or(controller_turn);
-    let keys = match side {
-        "bull" => ["bull", "researcher.bull.interaction", "to_bull"],
-        _ => ["bear", "researcher.bear.interaction", "to_bear"],
-    };
-    artifact
-        .get("next_steers")
-        .and_then(Value::as_object)
-        .and_then(|object| keys.iter().find_map(|key| object.get(*key).cloned()))
-        .map(|value| steer_payload("mediator_instruction", &value))
 }
 
 async fn run_phase2_topic_generation(
@@ -2007,6 +2122,7 @@ async fn run_phase1_reducer(
     persist_artifact_with_last_md(conn, state, 15, "reducer.evidence", artifact.clone(), brief)?;
     record_local_debug_artifact(state, 15, "reducer.evidence", &artifact)?;
     set_phase_status(state, 15, "done");
+    compress_phase_and_debug(conn, state, 1)?;
     Ok(())
 }
 
@@ -2031,6 +2147,42 @@ async fn run_phase2_final_reducer(
     )?;
     record_local_debug_artifact(state, PHASE2_REDUCER, "reducer.debate_final", &artifact)?;
     set_phase_status(state, PHASE2_REDUCER, "done");
+    compress_phase_and_debug(conn, state, 2)?;
+    Ok(())
+}
+
+/// Run post-phase compressor and dump a phase-00 debug snapshot when `--debug`.
+fn compress_phase_and_debug(
+    conn: &rusqlite::Connection,
+    state: &mut Value,
+    source_phase: i64,
+) -> Result<()> {
+    let written = crate::orchestration::compress::compress_phase(conn, state, source_phase)?;
+    record_compressor_debug_artifact(conn, state, source_phase, written)?;
+    Ok(())
+}
+
+/// Writes `outputs/debug/phase00/compressor_after_phase_{N}.jsonl` with summaries/details.
+fn record_compressor_debug_artifact(
+    conn: &rusqlite::Connection,
+    state: &mut Value,
+    source_phase: i64,
+    written: usize,
+) -> Result<()> {
+    if state.get("debug").and_then(Value::as_bool) != Some(true) {
+        return Ok(());
+    }
+    let run_id = state
+        .get("run_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if run_id.is_empty() {
+        return Ok(());
+    }
+    let artifact =
+        orchestrator_sql::compressor_debug_snapshot(conn, run_id, source_phase, written)?;
+    let role = format!("compressor.after_phase_{source_phase}");
+    record_local_debug_artifact(state, 0, &role, &artifact)?;
     Ok(())
 }
 
@@ -2044,6 +2196,7 @@ fn record_local_debug_artifact(
         return Ok(());
     }
 
+    let started = Instant::now();
     let relative_path = orchestrator_llm::debug_record_relative_path(phase, role);
     let path = default_project_root().join(&relative_path);
     if let Some(parent) = path.parent() {
@@ -2058,13 +2211,8 @@ fn record_local_debug_artifact(
     });
     let mut line = serde_json::to_string(&record)?;
     line.push('\n');
-    fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .with_context(|| format!("failed to open debug workflow record {}", path.display()))?
-        .write_all(line.as_bytes())
-        .with_context(|| format!("failed to append debug workflow record {}", path.display()))?;
+    fs::write(&path, line.as_bytes())
+        .with_context(|| format!("failed to write debug workflow record {}", path.display()))?;
 
     if !state
         .get("debug_phase_records")
@@ -2080,7 +2228,34 @@ fn record_local_debug_artifact(
             "path": relative_path
         }));
     }
+    orchestrator_llm::debug_log_time(
+        &default_project_root(),
+        json!({
+            "kind": "function",
+            "name": format!("record_local_debug_artifact:{role}"),
+            "phase": phase,
+            "role": role,
+            "elapsed_ms": started.elapsed().as_millis(),
+        }),
+    );
     Ok(())
+}
+
+fn record_phase2_summary_debug_artifact(state: &mut Value, status: &str) -> Result<()> {
+    let artifact = json!({
+        "id": "phase2.summary",
+        "role": "phase2.summary",
+        "phase": 2,
+        "status": status,
+        "reason": state
+            .get("topic_generation_artifact")
+            .and_then(|artifact| artifact.get("reason"))
+            .cloned()
+            .unwrap_or(Value::Null),
+        "topic_generation": state.get("topic_generation_artifact").cloned().unwrap_or(Value::Null),
+        "debate_turn_count": state.get("debate_turns").and_then(Value::as_array).map(Vec::len).unwrap_or_default()
+    });
+    record_local_debug_artifact(state, 2, "phase2.summary", &artifact)
 }
 
 async fn run_phase3(
@@ -2212,10 +2387,229 @@ async fn run_phase3(
             }
         }
     };
+    let mut artifact = artifact;
+    apply_missing_data_premium(state, &mut artifact);
     persist_artifact(conn, state, 3, "manager.research", artifact.clone())?;
     state["research_plan"] = artifact;
     debug!("manager research role completed");
     Ok(())
+}
+
+fn apply_missing_data_premium(state: &Value, artifact: &mut Value) {
+    let tickers = tickers_from_state(state);
+    for (index, ticker) in tickers.iter().enumerate() {
+        let missing_items = missing_high_impact_items(state, ticker);
+        if missing_items.is_empty() {
+            continue;
+        }
+        let (current, adjusted, requested, applied, premium) = {
+            let Some(payload) = artifact
+                .get_mut("per_ticker")
+                .and_then(Value::as_object_mut)
+                .and_then(|items| items.get_mut(ticker))
+            else {
+                continue;
+            };
+            let Some(current) = payload
+                .get("final_probability")
+                .or_else(|| payload.get("long_probability"))
+                .and_then(Value::as_f64)
+            else {
+                continue;
+            };
+            let requested = (missing_items.len() as f64 * 0.025).min(0.08);
+            let adjusted = converge_toward_neutral(current, requested);
+            let applied = (adjusted - current).abs();
+            set_research_probability(payload, adjusted);
+            adjust_scenario_probabilities(payload, adjusted - current);
+            let premium = json!({
+                "reason_code": "missing_data_premium",
+                "item_count": missing_items.len(),
+                "items": missing_items,
+                "requested_convergence": requested,
+                "applied_convergence": applied,
+                "from_probability": current,
+                "to_probability": adjusted
+            });
+            payload["missing_data_premium"] = premium.clone();
+            append_adjustment_rationale(
+                payload,
+                &format!(
+                    "missing_data_premium: {} high-impact missing items; requested convergence {:.3}, applied {:.3}, final {:.3}.",
+                    missing_items.len(), requested, applied, adjusted
+                ),
+            );
+            (current, adjusted, requested, applied, premium)
+        };
+        if index == 0 {
+            set_research_probability(artifact, adjusted);
+            adjust_scenario_probabilities(artifact, adjusted - current);
+            artifact["missing_data_premium"] = premium;
+            append_adjustment_rationale(
+                artifact,
+                &format!(
+                    "missing_data_premium: {} high-impact missing items for {ticker}; requested convergence {:.3}, applied {:.3}, final {:.3}.",
+                    missing_items.len(),
+                    requested,
+                    applied,
+                    adjusted
+                ),
+            );
+        }
+    }
+}
+
+fn missing_high_impact_items(state: &Value, ticker: &str) -> Vec<String> {
+    let mut items = std::collections::BTreeSet::new();
+    let ticker_debate = state
+        .get("debate_state_artifact")
+        .and_then(|value| value.get("per_ticker"))
+        .and_then(|value| value.get(ticker));
+
+    if let Some(factors) = ticker_debate
+        .and_then(|value| value.get("missing_high_impact_factors"))
+        .and_then(Value::as_array)
+    {
+        for item in factors {
+            if let Some(text) = item.as_str().map(str::trim).filter(|text| !text.is_empty()) {
+                items.insert(text.to_string());
+            } else if let Some(text) = item
+                .get("factor")
+                .or_else(|| item.get("claim"))
+                .or_else(|| item.get("description"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+            {
+                items.insert(text.to_string());
+            }
+        }
+    }
+
+    if let Some(evidence) = ticker_debate
+        .and_then(|value| value.get("missing_evidence"))
+        .and_then(Value::as_array)
+    {
+        for item in evidence {
+            let is_high_impact = item
+                .get("impact")
+                .or_else(|| item.get("severity"))
+                .and_then(Value::as_str)
+                .is_some_and(|value| value.eq_ignore_ascii_case("high"));
+            if is_high_impact {
+                if let Some(text) = item
+                    .get("factor")
+                    .or_else(|| item.get("claim"))
+                    .or_else(|| item.get("description"))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                {
+                    items.insert(text.to_string());
+                }
+            }
+        }
+    }
+
+    if let Some(roles) = state
+        .get("phase1_state_artifact")
+        .and_then(|value| value.get("evidence_quality"))
+        .and_then(|value| value.get("missing_critical_roles"))
+        .and_then(Value::as_array)
+    {
+        for role in roles.iter().filter_map(Value::as_str) {
+            items.insert(format!("missing critical role: {role}"));
+        }
+    }
+
+    // Phase 1.5 "insufficient" is itself a high-impact evidence gap: no critical
+    // role produced usable direction for this ticker, even when roles are ready
+    // with direction=unobserved (not listed under missing_critical_roles).
+    let evidence_quality = state
+        .get("phase1_state_artifact")
+        .and_then(|value| value.get("evidence_quality"));
+    let phase1_insufficient = evidence_quality
+        .and_then(|value| value.get("status"))
+        .and_then(Value::as_str)
+        == Some("insufficient");
+    let ticker_marked_insufficient = evidence_quality
+        .and_then(|value| value.get("insufficient_tickers"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .any(|value| value == ticker);
+    if phase1_insufficient
+        && (ticker_marked_insufficient
+            || evidence_quality
+                .and_then(|value| value.get("insufficient_tickers"))
+                .and_then(Value::as_array)
+                .map(|items| items.is_empty())
+                .unwrap_or(true))
+    {
+        items.insert(format!("phase1 evidence insufficient for {ticker}"));
+    }
+    items.into_iter().collect()
+}
+
+fn converge_toward_neutral(probability: f64, amount: f64) -> f64 {
+    if probability > 0.5 {
+        (probability - amount).max(0.5)
+    } else if probability < 0.5 {
+        (probability + amount).min(0.5)
+    } else {
+        0.5
+    }
+}
+
+fn set_research_probability(value: &mut Value, probability: f64) {
+    value["long_probability"] = json!(probability);
+    value["short_probability"] = json!(1.0 - probability);
+    value["final_probability"] = json!(probability);
+    if let Some(base) = value.get("base_probability").and_then(Value::as_f64) {
+        value["debate_adjustment"] = json!(probability - base);
+    }
+    if (probability - 0.5).abs() <= 0.05 {
+        value["rating"] = json!("Hold");
+        value["confidence_basis"] = json!("data_insufficient");
+        value["hold_reason"] = json!("evidence_insufficient");
+    }
+}
+
+fn adjust_scenario_probabilities(value: &mut Value, long_delta: f64) {
+    let Some(scenarios) = value.get_mut("scenarios") else {
+        return;
+    };
+    let Some(bull) = scenarios
+        .get("bull")
+        .and_then(|value| value.get("probability"))
+        .and_then(Value::as_f64)
+    else {
+        return;
+    };
+    let Some(bear) = scenarios
+        .get("bear")
+        .and_then(|value| value.get("probability"))
+        .and_then(Value::as_f64)
+    else {
+        return;
+    };
+    let bounded_delta = long_delta.max(-bull).min(bear);
+    scenarios["bull"]["probability"] = json!(bull + bounded_delta);
+    scenarios["bear"]["probability"] = json!(bear - bounded_delta);
+}
+
+fn append_adjustment_rationale(value: &mut Value, addition: &str) {
+    let existing = value
+        .get("adjustment_rationale")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    value["adjustment_rationale"] = json!(if existing.is_empty() {
+        addition.to_string()
+    } else {
+        format!("{existing} {addition}")
+    });
 }
 
 async fn run_phase4(
@@ -2247,6 +2641,7 @@ async fn run_phase4(
     .await?;
     sanitize_downstream_constraints(state, "trader_investment_plan", &mut artifact);
     persist_artifact(conn, state, 4, "trader", artifact.clone())?;
+    record_local_debug_artifact(state, 4, "trader", &artifact)?;
     state["trader_investment_plan"] = artifact;
     Ok(())
 }
@@ -2262,6 +2657,7 @@ fn run_phase4_rust_rule(conn: &mut rusqlite::Connection, state: &mut Value) -> R
     artifact["derived_from"] = json!("research_plan");
     sanitize_downstream_constraints(state, "trader_investment_plan", &mut artifact);
     persist_artifact(conn, state, 4, "trader", artifact.clone())?;
+    record_local_debug_artifact(state, 4, "trader", &artifact)?;
     state["trader_investment_plan"] = artifact;
     Ok(())
 }
@@ -2590,7 +2986,7 @@ async fn run_phase7(
     let mock = is_mock(state);
     debug!("allocation context computation starting");
     let context = compute_allocation_context(state, conn, &config.allocation);
-    state["allocation_context"] = context.clone();
+    state["allocation_context"] = allocation_prompt_context(&context);
     debug!(vix_regime = ?context.get("vix").and_then(|v| v.get("regime")), "allocation context ready");
 
     let raw_artifact = run_single_role_job(
@@ -2951,6 +3347,17 @@ mod tests {
         assert!(settings
             .tools
             .contains(&"run_technical_indicators".to_string()));
+        for role in [
+            "manager.research",
+            "trader",
+            "risk.aggressive",
+            "risk.conservative",
+            "risk.neutral",
+            "portfolio.manager",
+            "allocation.manager",
+        ] {
+            assert!(roles[role].tools.is_empty(), "role={role}");
+        }
     }
 
     #[test]
@@ -3475,6 +3882,75 @@ mod tests {
     }
 
     #[test]
+    fn missing_data_premium_is_enforced_from_itemized_and_critical_gaps() {
+        let state = json!({
+            "tickers": ["QQQ"],
+            "phase1_state_artifact": {
+                "evidence_quality": {"missing_critical_roles": ["analyst.technical"]},
+                "per_ticker": {"QQQ": {"missing_evidence": ["current price confirmation"]}}
+            },
+            "debate_state_artifact": {
+                "per_ticker": {"QQQ": {"missing_high_impact_factors": ["rate-path surprise"]}}
+            }
+        });
+        let mut artifact = json!({
+            "rating": "Overweight",
+            "long_probability": 0.65,
+            "short_probability": 0.35,
+            "base_probability": 0.60,
+            "debate_adjustment": 0.05,
+            "scenarios": {
+                "bull": {"probability": 0.50},
+                "base": {"probability": 0.30},
+                "bear": {"probability": 0.20}
+            },
+            "per_ticker": {"QQQ": {
+                "rating": "Overweight",
+                "long_probability": 0.65,
+                "short_probability": 0.35,
+                "base_probability": 0.60,
+                "debate_adjustment": 0.05,
+                "scenarios": {
+                    "bull": {"probability": 0.50},
+                    "base": {"probability": 0.30},
+                    "bear": {"probability": 0.20}
+                }
+            }}
+        });
+
+        apply_missing_data_premium(&state, &mut artifact);
+
+        let premium = &artifact["per_ticker"]["QQQ"]["missing_data_premium"];
+        assert_eq!(premium["item_count"], 2);
+        assert!((premium["requested_convergence"].as_f64().unwrap() - 0.05).abs() < 1e-9);
+        assert!(
+            (artifact["per_ticker"]["QQQ"]["long_probability"]
+                .as_f64()
+                .unwrap()
+                - 0.60)
+                .abs()
+                < 1e-9
+        );
+        assert!((artifact["long_probability"].as_f64().unwrap() - 0.60).abs() < 1e-9);
+        assert!(
+            (artifact["per_ticker"]["QQQ"]["scenarios"]["bull"]["probability"]
+                .as_f64()
+                .unwrap()
+                - 0.45)
+                .abs()
+                < 1e-9
+        );
+        assert!(
+            (artifact["per_ticker"]["QQQ"]["scenarios"]["bear"]["probability"]
+                .as_f64()
+                .unwrap()
+                - 0.25)
+                .abs()
+                < 1e-9
+        );
+    }
+
+    #[test]
     fn phase3_critical_probability_drift_is_clamped_per_ticker() {
         let state = json!({
             "tickers": ["QQQ", "SOXX"],
@@ -3639,4 +4115,57 @@ fn steer_packets_exclude_recursive_transport_fields() {
     assert!(compact["artifact"].get("steer").is_none());
     assert!(compact["artifact"].get("prompt_path").is_none());
     assert!(compact["artifact"].get("session_id").is_none());
+}
+
+#[test]
+fn point_debate_steer_embeds_opponent_claims() {
+    let controller = json!({
+        "role": "mediator.topic_controller",
+        "artifact": {
+            "next_steers": {
+                "to_bull": {"must_address": ["bear-1"], "instruction": "rebut liquidity claim"}
+            },
+            "accepted_for_opponent": {
+                "bull": [{"claim_id": "bear-1", "claim": "failed breakout"}]
+            }
+        }
+    });
+    let opponent = json!({
+        "role": "researcher.bear.initial",
+        "kind": "bear_seed",
+        "artifact": {
+            "claims": [{
+                "claim_id": "bear-1",
+                "claim": "failed breakout risk",
+                "decision_hinge": "price reclaim",
+                "confidence": 0.6,
+                "evidence_refs": ["tech-1"]
+            }]
+        }
+    });
+    let own = json!({
+        "role": "researcher.bull.initial",
+        "kind": "bull_seed",
+        "artifact": {
+            "claims": [{"claim_id": "bull-1", "claim": "repair bounce"}]
+        }
+    });
+
+    let steer: Value = serde_json::from_str(&build_point_debate_steer(
+        &controller,
+        "bull",
+        &opponent,
+        &own,
+    ))
+    .unwrap();
+    assert_eq!(steer["kind"], "point_debate");
+    assert_eq!(steer["side"], "bull");
+    assert_eq!(steer["reply_to_required"], true);
+    assert_eq!(steer["opponent_claims_to_address"][0]["claim_id"], "bear-1");
+    assert_eq!(steer["accepted_for_you"][0]["claim_id"], "bear-1");
+    assert!(steer["mediator_instruction"]
+        .get("instruction")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .contains("rebut"));
 }

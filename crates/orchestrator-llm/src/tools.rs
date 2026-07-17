@@ -746,6 +746,155 @@ pub fn enabled_tool_names(web_run: Option<&WebSearchConfig>) -> Vec<&'static str
     names
 }
 
+/// Build rig-native tool definitions for the names available in this turn.
+pub fn rig_tool_definitions(names: &[String]) -> Vec<rig_core::completion::ToolDefinition> {
+    names
+        .iter()
+        .filter_map(|name| tool_definition(name))
+        .collect()
+}
+
+/// OpenAI-compatible function names reject `.`; map internal names to API-safe form.
+pub fn api_tool_name(name: &str) -> String {
+    name.replace('.', "_")
+}
+
+/// Map a model-emitted function name back to the internal tool id.
+pub fn resolve_tool_name(api_name: &str) -> String {
+    match api_name {
+        "web_run" => WEB_RUN_TOOL_NAME.to_string(),
+        other => other.to_string(),
+    }
+}
+
+pub fn tool_definition(name: &str) -> Option<rig_core::completion::ToolDefinition> {
+    let (description, parameters) = match name {
+        "think" => (
+            "Record a short internal note before calling another tool or emitting the final artifact.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "note": {"type": "string", "description": "Brief planning note"}
+                },
+                "additionalProperties": true
+            }),
+        ),
+        READ_RUN_CONTEXT_TOOL_NAME => (
+            "Read structured SQLite run context for the current role (technical, jin10, compose_context, research_inputs, etc.).",
+            json!({
+                "type": "object",
+                "properties": {
+                    "kind": {
+                        "type": "string",
+                        "description": "Context kind. Analysts use technical/jin10; debate roles use compose_context then research_inputs."
+                    },
+                    "ticker": {"type": "string"},
+                    "tickers": {"type": "array", "items": {"type": "string"}},
+                    "token_budget": {"type": "integer", "minimum": 256}
+                },
+                "additionalProperties": true
+            }),
+        ),
+        WEB_RUN_TOOL_NAME => (
+            "Live web search via the configured provider. Prefer focused queries with domains when possible.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "search_query": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "q": {"type": "string"},
+                                "domains": {"type": "array", "items": {"type": "string"}},
+                                "numResults": {"type": "integer", "minimum": 1, "maximum": 20}
+                            },
+                            "required": ["q"]
+                        }
+                    },
+                    "response_length": {"type": "string"}
+                },
+                "required": ["search_query"],
+                "additionalProperties": true
+            }),
+        ),
+        FETCH_JIN10_FLASH_TOOL_NAME => (
+            "Fetch recent Jin10 flash news and import into SQLite.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "lookback_hours": {"type": "number"},
+                    "pages": {"type": "integer"},
+                    "classify": {"type": "string"}
+                },
+                "additionalProperties": true
+            }),
+        ),
+        FETCH_YOUTUBE_TRANSCRIPT_TOOL_NAME => (
+            "Fetch YouTube video transcripts for configured channels or a specific URL.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "all": {"type": "boolean"},
+                    "channel": {"type": "string"},
+                    "url": {"type": "string"},
+                    "max_videos": {"type": "integer"}
+                },
+                "additionalProperties": true
+            }),
+        ),
+        FETCH_WAYINVIDEO_TRANSCRIPT_TOOL_NAME => (
+            "Fetch a WayinVideo transcript for a URL.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string"},
+                    "title": {"type": "string"},
+                    "published": {"type": "string"},
+                    "task": {"type": "string"},
+                    "task_id": {"type": "string"}
+                },
+                "required": ["url"],
+                "additionalProperties": true
+            }),
+        ),
+        RUN_TECHNICAL_INDICATORS_TOOL_NAME => (
+            "Run technical indicators for symbols/intervals and import bars into SQLite.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "symbols": {"type": "array", "items": {"type": "string"}},
+                    "tickers": {"type": "array", "items": {"type": "string"}},
+                    "intervals": {"type": "array", "items": {"type": "string"}},
+                    "start": {"type": "string"},
+                    "end": {"type": "string"},
+                    "days": {"type": "integer"},
+                    "model": {"type": "string"}
+                },
+                "additionalProperties": true
+            }),
+        ),
+        FETCH_LAST30DAYS_CONTEXT_TOOL_NAME => (
+            "Fetch last-30-days social/web context for tickers/source.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "source": {"type": "string", "description": "e.g. reddit, x, youtube"},
+                    "tickers": {"type": "array", "items": {"type": "string"}},
+                    "query": {"type": "string"}
+                },
+                "additionalProperties": true
+            }),
+        ),
+        _ => return None,
+    };
+    Some(rig_core::completion::ToolDefinition {
+        name: api_tool_name(name),
+        description: description.to_string(),
+        parameters,
+    })
+}
+
 pub async fn execute_named_tool(
     name: &str,
     args: Value,
@@ -1128,6 +1277,22 @@ mod tests {
         assert!(output["daily"].as_array().unwrap().is_empty());
     }
 
+    #[test]
+    fn rig_tool_definitions_map_web_run_api_name() {
+        let defs = rig_tool_definitions(&[
+            WEB_RUN_TOOL_NAME.to_string(),
+            READ_RUN_CONTEXT_TOOL_NAME.to_string(),
+        ]);
+        assert_eq!(defs.len(), 2);
+        assert!(defs.iter().any(|tool| tool.name == "web_run"));
+        assert!(defs.iter().any(|tool| tool.name == "read_run_context"));
+        assert_eq!(resolve_tool_name("web_run"), WEB_RUN_TOOL_NAME);
+        assert_eq!(
+            resolve_tool_name("read_run_context"),
+            READ_RUN_CONTEXT_TOOL_NAME
+        );
+    }
+
     #[tokio::test]
     async fn news_macro_defaults_empty_kind_to_jin10() {
         let temp = tempfile::tempdir().unwrap();
@@ -1135,7 +1300,7 @@ mod tests {
         {
             let mut conn = orchestrator_sql::connect(&db_path).unwrap();
             orchestrator_sql::ensure_schema(&conn).unwrap();
-            orchestrator_sql::import_jin10_payload(
+            let imported = orchestrator_sql::import_jin10_payload(
                 &mut conn,
                 &json!({
                     "items": [{
@@ -1145,6 +1310,7 @@ mod tests {
                 }),
             )
             .unwrap();
+            assert_eq!(imported, 1);
         }
         let config = ExternalToolConfig {
             project_root: PathBuf::from("."),
@@ -1178,6 +1344,15 @@ mod tests {
             output["evidence"]["items"][0]["content"],
             "macro headline for test"
         );
+        assert!(
+            output["evidence"]["items"][0]
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap()
+                .len()
+                == 32
+        );
+        assert_eq!(output["evidence"]["items"][0]["attention_score"], 0.0);
         assert!(output["evidence"]["items"][0].get("item").is_none());
     }
 

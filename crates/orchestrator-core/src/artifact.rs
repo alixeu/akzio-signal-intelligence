@@ -89,6 +89,16 @@ pub struct RiskConstraints {
     pub stance: String,
     #[serde(default)]
     pub argument: String,
+    /// The stance-specific constraint or counterargument not already supplied
+    /// by prior risk turns.
+    #[serde(default)]
+    pub unique_risk_contribution: String,
+    /// Explicit agreement/disagreement with the strongest prior constraint.
+    #[serde(default)]
+    pub disagreement_with_prior: String,
+    /// True only when the role found no genuine incremental constraint.
+    #[serde(default)]
+    pub no_new_information: bool,
     #[serde(default)]
     pub recommended_adjustment: String,
     /// none | tight | trailing | event_based | time_based
@@ -738,6 +748,15 @@ pub fn validate_research_artifact(
                     "scenario {name} must have at least 1 trigger"
                 )));
             }
+            if scenario
+                .drivers
+                .iter()
+                .any(|driver| scenario_driver_is_missing_evidence_placeholder(driver))
+            {
+                return Err(ValidationError::InvalidProbability(format!(
+                    "scenario {name} drivers must describe causal market factors, not missing evidence"
+                )));
+            }
         }
     }
     for ticker in tickers {
@@ -828,6 +847,22 @@ pub fn validate_research_artifact(
         }
     }
     Ok(())
+}
+
+fn scenario_driver_is_missing_evidence_placeholder(driver: &str) -> bool {
+    let normalized = driver.trim().to_ascii_lowercase();
+    [
+        "no actionable",
+        "no evidence",
+        "evidence is insufficient",
+        "evidence insufficient",
+        "missing evidence",
+        "缺乏证据",
+        "证据不足",
+        "没有证据",
+    ]
+    .iter()
+    .any(|phrase| normalized.contains(phrase))
 }
 
 #[cfg(test)]
@@ -981,6 +1016,9 @@ mod tests {
     fn risk_constraints_schema_lists_new_structured_fields() {
         let schema = risk_constraints_schema();
         for field in [
+            "unique_risk_contribution",
+            "disagreement_with_prior",
+            "no_new_information",
             "stop_type",
             "max_drawdown_pct",
             "position_cap_pct",
@@ -1054,6 +1092,9 @@ mod tests {
         let artifact = RiskConstraints {
             stance: "neutral".to_string(),
             argument: String::new(),
+            unique_risk_contribution: String::new(),
+            disagreement_with_prior: String::new(),
+            no_new_information: false,
             recommended_adjustment: String::new(),
             stop_type: String::new(),
             max_drawdown_pct: 1.5,
@@ -1074,6 +1115,9 @@ mod tests {
         let artifact = RiskConstraints {
             stance: "neutral".to_string(),
             argument: String::new(),
+            unique_risk_contribution: String::new(),
+            disagreement_with_prior: String::new(),
+            no_new_information: false,
             recommended_adjustment: String::new(),
             stop_type: "weird".to_string(),
             max_drawdown_pct: 0.0,
@@ -1324,6 +1368,19 @@ mod tests {
             validate_research_artifact(&artifact, &[]),
             Err(ValidationError::InvalidProbability(message))
                 if message == "scenario bull must have at least 1 driver"
+        ));
+    }
+
+    #[test]
+    fn scenario_drivers_reject_missing_evidence_as_a_causal_factor() {
+        let mut scenarios = valid_scenarios();
+        scenarios.bull.drivers = vec!["No actionable bullish evidence is available".into()];
+        let artifact = research_artifact_with_scenarios(Some(scenarios));
+
+        assert!(matches!(
+            validate_research_artifact(&artifact, &[]),
+            Err(ValidationError::InvalidProbability(message))
+                if message.contains("causal market factors")
         ));
     }
 

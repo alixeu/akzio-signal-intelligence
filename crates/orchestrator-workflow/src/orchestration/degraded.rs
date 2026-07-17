@@ -359,6 +359,17 @@ mod tests {
     }
 
     #[test]
+    fn runtime_identity_rejects_descriptive_artifact_id() {
+        let mut artifact = json!({
+            "id": "technical-analysis-2026-07-16",
+            "role": "analyst.technical"
+        });
+
+        let error = attach_runtime_role_identity(&mut artifact, "analyst.technical").unwrap_err();
+        assert!(error.to_string().contains("artifact id mismatch"));
+    }
+
+    #[test]
     fn degraded_analyst_artifact_is_unobserved_not_mock_neutral() {
         let result = RoleJobResult {
             role: "analyst.youtube".to_string(),
@@ -375,6 +386,8 @@ mod tests {
             error: Some("timeout".to_string()),
             timed_out: false,
             elapsed_ms: 12,
+            llm_ms: 0,
+            tool_ms: 0,
             usage: TokenUsage::default(),
             turn_count: 0,
             tool_call_count: 0,

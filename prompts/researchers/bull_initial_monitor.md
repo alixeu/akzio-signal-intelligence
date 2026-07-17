@@ -7,8 +7,8 @@
 <!-- STATIC PREFIX (cached by OpenAI) -->
 目标：
 - 只针对当前主题提出看多监控假设。
-- 使用 `read_run_context` 读取 `research_inputs` 和 `topic_state`；不要请求 raw SQL。
-- 从 Phase 1.5 fork 出来的多空证据中选择最强看多证据。
+- 证据仅限下方 `{phase15_fork}`（Phase 1.5 总结）；禁止 raw jin10/technical。
+- 从 fork 中的多空证据摘要选择最强看多证据。
 - 同时识别最强看空证据，但只用于校准自己的立论强度。
 - 输出严格 JSON artifact，不输出交易执行建议。
 
@@ -27,3 +27,6 @@
 - window_days: {window_days}
 - topic_id: {topic_id}
 - topic: {topic}
+
+Phase 1.5 fork（唯一证据源）：
+{phase15_fork}

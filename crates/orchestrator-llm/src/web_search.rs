@@ -266,6 +266,21 @@ impl Default for MockWebSearchProvider {
                     url: "https://mock.local/risk/dashboard".to_string(),
                     content: "Mock risk dashboard with drawdown, breadth, rates, and credit stress notes.".to_string(),
                 },
+                MockWebPage {
+                    title: "Mock Reuters QQQ macro update".to_string(),
+                    url: "https://www.reuters.com/mock/markets/qqq-macro-update".to_string(),
+                    content: "Mock Reuters market update for QQQ covering rates, Federal Reserve expectations, Nasdaq risk appetite, and near-term catalysts.".to_string(),
+                },
+                MockWebPage {
+                    title: "Mock Bloomberg SOXX semiconductor update".to_string(),
+                    url: "https://www.bloomberg.com/mock/markets/soxx-semiconductors".to_string(),
+                    content: "Mock Bloomberg market update for SOXX covering semiconductor demand, AI capital spending, rates, and near-term catalysts.".to_string(),
+                },
+                MockWebPage {
+                    title: "Mock WSJ VIX volatility update".to_string(),
+                    url: "https://www.wsj.com/mock/markets/vix-volatility".to_string(),
+                    content: "Mock WSJ market update for VIX covering volatility, risk appetite, rates, and near-term macro catalysts.".to_string(),
+                },
             ],
         }
     }
@@ -875,5 +890,29 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].title, "Allowed result");
+    }
+
+    #[tokio::test]
+    async fn default_mock_provider_covers_news_macro_domain_queries() {
+        let provider = MockWebSearchProvider::default();
+        let results = provider
+            .search(
+                vec![SearchQuery::new("QQQ rates macro catalyst")],
+                WebSearchOptions {
+                    allowed_domains: vec![
+                        "reuters.com".to_string(),
+                        "bloomberg.com".to_string(),
+                        "wsj.com".to_string(),
+                    ],
+                    ..WebSearchOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(!results.is_empty());
+        assert!(results
+            .iter()
+            .any(|result| result.url.contains("reuters.com")));
     }
 }

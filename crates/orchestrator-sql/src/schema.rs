@@ -45,11 +45,13 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
         DROP TABLE IF EXISTS agent_turns;
         DROP TABLE IF EXISTS agent_turn_items;
 
-        -- Phase 2 cleanup: merge jin10 + youtube + social → external_items
-        DROP TABLE IF EXISTS jin10_items;
+        -- Legacy multi-source external_items removed. Jin10 uses jin10_items;
+        -- youtube/reddit/x will get dedicated tables when those paths are revived.
+        DROP TABLE IF EXISTS external_items;
         DROP TABLE IF EXISTS youtube_videos;
         DROP TABLE IF EXISTS youtube_transcripts;
         DROP TABLE IF EXISTS social_items;
+        DROP TABLE IF EXISTS jin10_flash_items;
 
         -- Phase 4 cleanup: dead indexes
         DROP INDEX IF EXISTS idx_agent_turn_items_session;
@@ -61,6 +63,7 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
         DROP INDEX IF EXISTS idx_agent_turns_created;
         DROP INDEX IF EXISTS idx_role_turn_summaries_run_role;
         DROP INDEX IF EXISTS idx_jin10_items_hash;
+        DROP INDEX IF EXISTS idx_jin10_items_usage;
         DROP INDEX IF EXISTS idx_youtube_videos_hash;
         DROP INDEX IF EXISTS idx_youtube_transcripts_hash;
         DROP INDEX IF EXISTS idx_jin10_items_time;
@@ -155,21 +158,77 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_memory_history_memory
             ON memory_history(memory_id, created_at);
 
-        CREATE TABLE IF NOT EXISTS external_items (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            source TEXT NOT NULL,
-            item_key TEXT NOT NULL,
-            ticker TEXT NOT NULL DEFAULT '',
+        -- Dedicated Jin10 flash table.
+        -- id = md5(time + content); content_json is the payload passed to the LLM;
+        -- attention_score is the latest LLM attention weight (0.0-1.0).
+        CREATE TABLE IF NOT EXISTS jin10_items (
+            id TEXT PRIMARY KEY,
+            content_json TEXT NOT NULL,
+            attention_score REAL NOT NULL DEFAULT 0.0,
             item_time INTEGER NOT NULL DEFAULT 0,
-            title TEXT NOT NULL DEFAULT '',
-            content TEXT NOT NULL DEFAULT '',
-            metadata_json TEXT NOT NULL DEFAULT '{}',
-            content_hash TEXT NOT NULL DEFAULT '',
-            imported_at INTEGER NOT NULL,
-            UNIQUE(source, item_key)
+            imported_at INTEGER NOT NULL
         );
-        CREATE INDEX IF NOT EXISTS idx_external_items_source_time
-            ON external_items(source, ticker, item_time);
+        CREATE INDEX IF NOT EXISTS idx_jin10_items_time
+            ON jin10_items(item_time DESC);
+        CREATE INDEX IF NOT EXISTS idx_jin10_items_attention
+            ON jin10_items(attention_score DESC);
+
+        -- Post-phase compressor: summary → detail index
+        CREATE TABLE IF NOT EXISTS phase_summaries (
+            id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            source_phase INTEGER NOT NULL,
+            role TEXT NOT NULL DEFAULT 'compressor',
+            ticker TEXT NOT NULL DEFAULT '',
+            topic_id TEXT,
+            summary TEXT NOT NULL DEFAULT '',
+            summary_json TEXT NOT NULL DEFAULT '{}',
+            confidence REAL NOT NULL DEFAULT 0.5,
+            created_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_phase_summaries_run_phase
+            ON phase_summaries(run_id, source_phase);
+        CREATE INDEX IF NOT EXISTS idx_phase_summaries_run_ticker_phase
+            ON phase_summaries(run_id, ticker, source_phase);
+
+        CREATE TABLE IF NOT EXISTS phase_summary_details (
+            id TEXT PRIMARY KEY,
+            summary_id TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            source_phase INTEGER NOT NULL,
+            detail TEXT NOT NULL DEFAULT '',
+            detail_json TEXT NOT NULL DEFAULT '{}',
+            source_ref TEXT NOT NULL DEFAULT '',
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL,
+            FOREIGN KEY(summary_id) REFERENCES phase_summaries(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_phase_summary_details_summary
+            ON phase_summary_details(summary_id);
+        CREATE INDEX IF NOT EXISTS idx_phase_summary_details_run_phase
+            ON phase_summary_details(run_id, source_phase);
+
+        -- Unified attention ledger (jin10 + summaries + details + future subjects)
+        CREATE TABLE IF NOT EXISTS attention_ledger (
+            id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            turn_id TEXT NOT NULL DEFAULT '',
+            role TEXT NOT NULL DEFAULT '',
+            subject_kind TEXT NOT NULL,
+            subject_id TEXT NOT NULL,
+            score REAL NOT NULL DEFAULT 0.0,
+            phase INTEGER,
+            created_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_attention_ledger_run_turn
+            ON attention_ledger(run_id, turn_id);
+        CREATE INDEX IF NOT EXISTS idx_attention_ledger_run_role
+            ON attention_ledger(run_id, role);
+        CREATE INDEX IF NOT EXISTS idx_attention_ledger_subject
+            ON attention_ledger(run_id, subject_kind, subject_id);
+        CREATE INDEX IF NOT EXISTS idx_attention_ledger_run_score
+            ON attention_ledger(run_id, score DESC);
+
         CREATE TABLE IF NOT EXISTS technical_features (
             ticker TEXT NOT NULL,
             date TEXT NOT NULL,
@@ -261,6 +320,7 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
     )?;
 
     rebuild_agent_events_if_legacy(conn)?;
+    migrate_jin10_items_attention_score(conn)?;
 
     for column_sql in [
         "status TEXT NOT NULL DEFAULT 'pending'",
@@ -327,6 +387,57 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
     drop_column_if_exists(conn, "memory_items", "source_run_id")?;
     drop_column_if_exists(conn, "memory_items", "source_role")?;
 
+    Ok(())
+}
+
+/// Migrate jin10_items from llm_usage_count → attention_score (0.0-1.0).
+fn migrate_jin10_items_attention_score(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(jin10_items)")?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if columns.is_empty() {
+        return Ok(());
+    }
+    let has_attention = columns.iter().any(|c| c == "attention_score");
+    let has_usage = columns.iter().any(|c| c == "llm_usage_count");
+    if has_attention && !has_usage {
+        return Ok(());
+    }
+    if has_attention && has_usage {
+        drop_column_if_exists(conn, "jin10_items", "llm_usage_count")?;
+        return Ok(());
+    }
+    // Rebuild: map old integer usage into a soft prior attention in [0,1].
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS jin10_items_attention_mig (
+            id TEXT PRIMARY KEY,
+            content_json TEXT NOT NULL,
+            attention_score REAL NOT NULL DEFAULT 0.0,
+            item_time INTEGER NOT NULL DEFAULT 0,
+            imported_at INTEGER NOT NULL
+        );
+        INSERT OR REPLACE INTO jin10_items_attention_mig
+            (id, content_json, attention_score, item_time, imported_at)
+        SELECT
+            id,
+            content_json,
+            CASE
+                WHEN llm_usage_count IS NULL OR llm_usage_count <= 0 THEN 0.0
+                ELSE MIN(1.0, 1.0 - 1.0 / (1.0 + CAST(llm_usage_count AS REAL)))
+            END,
+            item_time,
+            imported_at
+        FROM jin10_items;
+        DROP TABLE jin10_items;
+        ALTER TABLE jin10_items_attention_mig RENAME TO jin10_items;
+        CREATE INDEX IF NOT EXISTS idx_jin10_items_time
+            ON jin10_items(item_time DESC);
+        CREATE INDEX IF NOT EXISTS idx_jin10_items_attention
+            ON jin10_items(attention_score DESC);
+        "#,
+    )?;
     Ok(())
 }
 

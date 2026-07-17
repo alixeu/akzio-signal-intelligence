@@ -13,8 +13,8 @@ use orchestrator_core::{
 use rig_core::{
     agent::AgentBuilder,
     client::CompletionClient,
-    completion::{CompletionModel, Prompt},
-    message::{AssistantContent, Message, Reasoning},
+    completion::{CompletionModel, GetTokenUsage, Prompt},
+    message::{AssistantContent, Message, Reasoning, ToolChoice},
     providers::openai::{self, responses_api},
     streaming::StreamedAssistantContent,
     OneOrMany,
@@ -148,6 +148,8 @@ impl RoleLlmSettings {
 pub struct RigSettings {
     pub role: String,
     pub phase: Option<i64>,
+    /// Optional debate topic id so phase-2 debug files do not clobber each other.
+    pub topic_id: Option<String>,
     pub tickers: Vec<String>,
     pub output_mode: OutputMode,
     pub llm: RoleLlmSettings,
@@ -223,14 +225,7 @@ pub async fn run_rig_agent_loop_with_metrics(
         &mut turn,
         &mut model,
         &mut tools,
-        AgentLoopConfig {
-            max_agent_loops: settings.llm.max_turns,
-            truncation: settings.truncation.clone(),
-            judge: settings.judge.clone(),
-            judge_endpoint: settings.llm.base_url.clone(),
-            judge_api_key: settings.llm.api_key.clone(),
-            ..AgentLoopConfig::default()
-        },
+        agent_loop_config_from_settings(settings),
     )
     .await?;
     write_role_end_context(settings, &turn)?;
@@ -247,12 +242,31 @@ pub async fn run_rig_agent_loop_with_metrics(
             }
         })
         .context("agent loop finished without assistant message")?;
+    let artifact = parse_final_output(settings, &final_text)?;
+    record_jin10_usage_from_artifact(settings, &conn, &turn.turn_id, &artifact)?;
     Ok(AgentLoopOutput {
-        artifact: parse_final_output(settings, &final_text)?,
+        artifact,
         metrics,
         turn_id: turn.turn_id,
         session_id: turn.session_id,
     })
+}
+
+fn agent_loop_config_from_settings(settings: &RigSettings) -> AgentLoopConfig {
+    AgentLoopConfig {
+        max_agent_loops: settings.llm.max_turns,
+        truncation: settings.truncation.clone(),
+        judge: settings.judge.clone(),
+        judge_endpoint: settings.llm.base_url.clone(),
+        judge_api_key: settings.llm.api_key.clone(),
+        debug: settings.debug,
+        project_root: Some(debug_project_root(settings)),
+        role: settings.role.clone(),
+        phase: settings.phase,
+        model: settings.llm.model.clone(),
+        topic_id: settings.topic_id.clone(),
+        ..AgentLoopConfig::default()
+    }
 }
 
 pub async fn run_rig_agent_steer_loop(
@@ -271,25 +285,35 @@ pub async fn run_rig_agent_steer_loop_with_metrics(
     settings.llm.validate(&settings.role)?;
     validate_fallback_web_search_runtime_config(settings)?;
     let conn = open_loop_connection(settings)?;
-    let run_id = input
-        .session_id
-        .split(':')
-        .next()
-        .unwrap_or(&input.session_id);
-    let has_existing_history =
-        !orchestrator_sql::session_history_items(&conn, run_id, 1)?.is_empty();
+    // Scope resume detection to this turn_id. Using run_id-latest history made
+    // later phase-2 roles see sibling turns as "existing history" and drop their
+    // own role prompt (live debate mass max_agent_loops / empty context).
+    let prior_history = orchestrator_sql::turn_history_items(&conn, &input.turn_id)?;
+    let has_existing_history = !prior_history.is_empty();
     let user_input = if has_existing_history {
-        "".to_string()
+        String::new()
     } else {
         input.prompt.to_string()
     };
     let mut turn = Turn::new(
-        input.turn_id,
-        input.session_id,
+        input.turn_id.clone(),
+        input.session_id.clone(),
         loop_run_id(settings),
         settings.role.clone(),
         user_input,
     );
+    if has_existing_history {
+        // Seed in-memory history so multi-round steer resumes do not wipe the
+        // previous full_context snapshot on the next persist_turn.
+        turn.emitted_items = prior_history
+            .into_iter()
+            .map(|value| {
+                // Reuse agent-loop mapping via a thin JSON round-trip shape the
+                // history loader already understands.
+                agent_loop::turn_item_from_history_value(value)
+            })
+            .collect();
+    }
     turn.phase = settings.phase;
     turn.tools_disabled = role_disables_tools(&settings.role);
     turn.model_context = format!(
@@ -319,14 +343,7 @@ pub async fn run_rig_agent_steer_loop_with_metrics(
         &mut turn,
         &mut model,
         &mut tools,
-        AgentLoopConfig {
-            max_agent_loops: settings.llm.max_turns,
-            truncation: settings.truncation.clone(),
-            judge: settings.judge.clone(),
-            judge_endpoint: settings.llm.base_url.clone(),
-            judge_api_key: settings.llm.api_key.clone(),
-            ..AgentLoopConfig::default()
-        },
+        agent_loop_config_from_settings(settings),
     )
     .await?;
     write_role_end_context(settings, &turn)?;
@@ -343,12 +360,144 @@ pub async fn run_rig_agent_steer_loop_with_metrics(
             }
         })
         .context("agent loop finished without assistant message")?;
+    let artifact = parse_final_output(settings, &final_text)?;
+    record_jin10_usage_from_artifact(settings, &conn, &turn.turn_id, &artifact)?;
     Ok(AgentLoopOutput {
-        artifact: parse_final_output(settings, &final_text)?,
+        artifact,
         metrics,
         turn_id: turn.turn_id,
         session_id: turn.session_id,
     })
+}
+
+fn record_jin10_usage_from_artifact(
+    settings: &RigSettings,
+    conn: &rusqlite::Connection,
+    turn_id: &str,
+    artifact: &Value,
+) -> Result<()> {
+    if settings.role != "analyst.news_macro" {
+        return Ok(());
+    }
+    let attention = extract_jin10_attention(artifact);
+    if attention.is_empty() {
+        return Ok(());
+    }
+    let run_id = loop_run_id(settings);
+    let updated = orchestrator_sql::record_jin10_attention_for_turn(
+        conn,
+        &run_id,
+        turn_id,
+        &settings.role,
+        settings.phase,
+        &attention,
+    )?;
+    tracing::debug!(
+        role = %settings.role,
+        turn_id,
+        scored = attention.len(),
+        updated,
+        "recorded jin10 attention scores to ledger"
+    );
+    Ok(())
+}
+
+fn extract_jin10_attention(artifact: &Value) -> Vec<orchestrator_sql::Jin10Attention> {
+    use orchestrator_sql::Jin10Attention;
+    let mut out: Vec<Jin10Attention> = Vec::new();
+    let mut push = |id: &str, score: f64| {
+        let id = id.trim();
+        if id.is_empty() {
+            return;
+        }
+        if let Some(existing) = out.iter_mut().find(|item| item.id == id) {
+            existing.score = existing.score.max(score.clamp(0.0, 1.0));
+        } else {
+            out.push(Jin10Attention {
+                id: id.to_string(),
+                score: score.clamp(0.0, 1.0),
+            });
+        }
+    };
+
+    // Preferred: jin10_attention: [{id, score}, ...] or {id: score}
+    if let Some(items) = artifact.get("jin10_attention").and_then(Value::as_array) {
+        for item in items {
+            if let Some(id) = item.get("id").and_then(Value::as_str) {
+                let score = item
+                    .get("score")
+                    .or_else(|| item.get("attention_score"))
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.5);
+                push(id, score);
+            }
+        }
+    } else if let Some(object) = artifact.get("jin10_attention").and_then(Value::as_object) {
+        for (id, score) in object {
+            if let Some(score) = score.as_f64() {
+                push(id, score);
+            }
+        }
+    }
+
+    // Backward-compatible: bare id lists default to mid attention 0.5
+    if let Some(items) = artifact
+        .get("referenced_jin10_ids")
+        .and_then(Value::as_array)
+    {
+        for item in items {
+            if let Some(id) = item.as_str() {
+                push(id, 0.5);
+            }
+        }
+    }
+
+    if let Some(per_ticker) = artifact.get("per_ticker").and_then(Value::as_object) {
+        for payload in per_ticker.values() {
+            if let Some(items) = payload.get("jin10_attention").and_then(Value::as_array) {
+                for item in items {
+                    if let Some(id) = item.get("id").and_then(Value::as_str) {
+                        let score = item
+                            .get("score")
+                            .or_else(|| item.get("attention_score"))
+                            .and_then(Value::as_f64)
+                            .unwrap_or(0.5);
+                        push(id, score);
+                    }
+                }
+            }
+            if let Some(items) = payload
+                .get("referenced_jin10_ids")
+                .and_then(Value::as_array)
+            {
+                for item in items {
+                    if let Some(id) = item.as_str() {
+                        push(id, 0.5);
+                    }
+                }
+            }
+            if let Some(items) = payload.get("key_evidence").and_then(Value::as_array) {
+                for evidence in items {
+                    if let Some(id) = evidence
+                        .get("jin10_id")
+                        .and_then(Value::as_str)
+                        .or_else(|| evidence.get("id").and_then(Value::as_str))
+                    {
+                        let trimmed = id.trim();
+                        if trimmed.len() == 32 && trimmed.chars().all(|ch| ch.is_ascii_hexdigit()) {
+                            let score = evidence
+                                .get("attention_score")
+                                .or_else(|| evidence.get("score"))
+                                .and_then(Value::as_f64)
+                                .unwrap_or(0.55);
+                            push(trimmed, score);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 fn write_role_end_context(settings: &RigSettings, turn: &Turn) -> Result<()> {
@@ -391,7 +540,55 @@ pub fn append_debug_llm_record(settings: &RigSettings, record: Value) -> Result<
         .as_ref()
         .map(|tools| tools.project_root.clone())
         .unwrap_or_else(default_project_root);
-    let path = root.join(debug_record_relative_path(phase, &settings.role));
+    let path = root.join(debug_record_relative_path_with_topic(
+        phase,
+        &settings.role,
+        settings.topic_id.as_deref(),
+    ));
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create debug dir {}", parent.display()))?;
+    }
+    // Keep only the latest LLM turn per role/topic (last prompt already includes prior tool context).
+    let mut line = serde_json::to_string(&record)?;
+    line.push('\n');
+    fs::write(&path, line.as_bytes())
+        .with_context(|| format!("failed to write debug llm record {}", path.display()))?;
+    Ok(())
+}
+
+pub fn reset_debug_output_dir(project_root: &std::path::Path) -> Result<()> {
+    let debug_dir = project_root.join("outputs/debug");
+    if debug_dir.exists() {
+        fs::remove_dir_all(&debug_dir)
+            .with_context(|| format!("failed to clear debug dir {}", debug_dir.display()))?;
+    }
+    fs::create_dir_all(&debug_dir)
+        .with_context(|| format!("failed to create debug dir {}", debug_dir.display()))?;
+    Ok(())
+}
+
+/// Append one timing record to `outputs/debug/time.jsonl` (debug mode only callers).
+pub fn append_debug_time_record(project_root: &std::path::Path, record: Value) -> Result<()> {
+    append_debug_jsonl_line(project_root, "outputs/debug/time.jsonl", record)
+}
+
+/// Append one token-usage record to `outputs/debug/token.jsonl` (debug mode only callers).
+pub fn append_debug_token_record(project_root: &std::path::Path, record: Value) -> Result<()> {
+    append_debug_jsonl_line(project_root, "outputs/debug/token.jsonl", record)
+}
+
+fn append_debug_jsonl_line(
+    project_root: &std::path::Path,
+    relative: &str,
+    mut record: Value,
+) -> Result<()> {
+    if let Some(object) = record.as_object_mut() {
+        object
+            .entry("ts_ms".to_string())
+            .or_insert_with(|| json!(debug_now_ms()));
+    }
+    let path = project_root.join(relative);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create debug dir {}", parent.display()))?;
@@ -403,17 +600,57 @@ pub fn append_debug_llm_record(settings: &RigSettings, record: Value) -> Result<
         .create(true)
         .append(true)
         .open(&path)
-        .with_context(|| format!("failed to open debug llm record {}", path.display()))?
+        .with_context(|| format!("failed to open debug metrics {}", path.display()))?
         .write_all(line.as_bytes())
-        .with_context(|| format!("failed to append debug llm record {}", path.display()))?;
+        .with_context(|| format!("failed to append debug metrics {}", path.display()))?;
     Ok(())
 }
 
+fn debug_now_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+/// Resolve project root used for debug artifacts from settings.
+pub fn debug_project_root(settings: &RigSettings) -> PathBuf {
+    settings
+        .tools
+        .as_ref()
+        .map(|tools| tools.project_root.clone())
+        .unwrap_or_else(default_project_root)
+}
+
+/// Best-effort time log; never fails the main workflow.
+pub fn debug_log_time(project_root: &std::path::Path, record: Value) {
+    if let Err(error) = append_debug_time_record(project_root, record) {
+        tracing::warn!(error = %error, "failed to write debug time.jsonl");
+    }
+}
+
+/// Best-effort token log; never fails the main workflow.
+pub fn debug_log_token(project_root: &std::path::Path, record: Value) {
+    if let Err(error) = append_debug_token_record(project_root, record) {
+        tracing::warn!(error = %error, "failed to write debug token.jsonl");
+    }
+}
+
 pub fn debug_record_relative_path(phase: i64, role: &str) -> PathBuf {
-    PathBuf::from(format!(
-        "outputs/debug/phase{phase:02}/{}.jsonl",
-        safe_path_part(role)
-    ))
+    debug_record_relative_path_with_topic(phase, role, None)
+}
+
+pub fn debug_record_relative_path_with_topic(
+    phase: i64,
+    role: &str,
+    topic_id: Option<&str>,
+) -> PathBuf {
+    let role_part = safe_path_part(role);
+    let file_stem = match topic_id.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(topic) => format!("{role_part}__{}", safe_path_part(topic)),
+        None => role_part,
+    };
+    PathBuf::from(format!("outputs/debug/phase{phase:02}/{file_stem}.jsonl"))
 }
 
 fn end_context_item(item: &agent_loop::TurnItem) -> Option<Value> {
@@ -515,7 +752,7 @@ async fn run_model_text_once(
         .build()
         .prompt(prompt)
         .await
-        .context("OpenAI-compatible Responses ReAct prompt failed")
+        .context("OpenAI-compatible Responses prompt failed")
 }
 
 pub async fn run_model_event_stream(
@@ -568,20 +805,20 @@ async fn stream_openai_compatible_responses_websocket_events(
     handler: &mut dyn ModelEventHandler,
 ) -> Result<()> {
     session.send(request).await?;
+    let mut saw_tool_call = false;
+    let mut text_message = AssistantTextAccumulator::new();
     loop {
         match session.next_event().await? {
             responses_api::websocket::ResponsesWebSocketEvent::Item(chunk) => match chunk.data {
                 responses_api::streaming::ItemChunkKind::OutputTextDelta(delta)
                 | responses_api::streaming::ItemChunkKind::RefusalDelta(delta) => {
                     if !delta.delta.is_empty() {
-                        handler
-                            .handle(ModelStreamEvent::AssistantTextDelta {
-                                item_id: chunk
-                                    .item_id
-                                    .clone()
-                                    .unwrap_or_else(|| format!("ws-text-{}", Uuid::new_v4())),
-                                delta: delta.delta,
-                            })
+                        let fallback_id = chunk
+                            .item_id
+                            .clone()
+                            .unwrap_or_else(|| format!("ws-text-{}", Uuid::new_v4()));
+                        text_message
+                            .push_delta(handler, fallback_id, delta.delta)
                             .await?;
                     }
                 }
@@ -601,15 +838,20 @@ async fn stream_openai_compatible_responses_websocket_events(
                 responses_api::streaming::ItemChunkKind::OutputItemDone(output) => {
                     match output.item {
                         responses_api::Output::FunctionCall(function_call) => {
+                            saw_tool_call = true;
                             handler
                                 .handle(ModelStreamEvent::ToolCallCompleted {
                                     tool_call: ToolCallRequest {
                                         call_id: function_call.call_id,
-                                        name: function_call.name,
+                                        name: tools::resolve_tool_name(&function_call.name),
                                         arguments: function_call.arguments,
                                     },
                                 })
                                 .await?;
+                        }
+                        responses_api::Output::Message(message) => {
+                            text_message.ensure_item_id(message.id);
+                            text_message.complete(handler).await?;
                         }
                         responses_api::Output::Reasoning {
                             id,
@@ -648,9 +890,11 @@ async fn stream_openai_compatible_responses_websocket_events(
             responses_api::websocket::ResponsesWebSocketEvent::Response(chunk) => {
                 match chunk.kind {
                     responses_api::streaming::ResponseChunkKind::ResponseCompleted => {
+                        text_message.complete(handler).await?;
                         handler
                             .handle(ModelStreamEvent::ResponseCompleted {
-                                end_turn: true,
+                                // Tools present => continue loop; do not force end_turn.
+                                end_turn: !saw_tool_call,
                                 raw: serde_json::to_value(chunk.response)
                                     .context("failed to serialize websocket response")?,
                             })
@@ -666,9 +910,10 @@ async fn stream_openai_compatible_responses_websocket_events(
                 }
             }
             responses_api::websocket::ResponsesWebSocketEvent::Done(done) => {
+                text_message.complete(handler).await?;
                 handler
                     .handle(ModelStreamEvent::ResponseCompleted {
-                        end_turn: true,
+                        end_turn: !saw_tool_call,
                         raw: done.response,
                     })
                     .await?;
@@ -679,6 +924,96 @@ async fn stream_openai_compatible_responses_websocket_events(
             }
         }
     }
+}
+
+/// Tracks assistant text lifecycle while mapping rig stream chunks to agent events.
+struct AssistantTextAccumulator {
+    item_id: Option<String>,
+    started: bool,
+    completed: bool,
+}
+
+impl AssistantTextAccumulator {
+    fn new() -> Self {
+        Self {
+            item_id: None,
+            started: false,
+            completed: false,
+        }
+    }
+
+    fn ensure_item_id(&mut self, item_id: String) {
+        if self.item_id.is_none() {
+            self.item_id = Some(item_id);
+        }
+    }
+
+    async fn push_delta(
+        &mut self,
+        handler: &mut dyn ModelEventHandler,
+        fallback_item_id: String,
+        delta: String,
+    ) -> Result<()> {
+        self.ensure_item_id(fallback_item_id);
+        let item_id = self
+            .item_id
+            .clone()
+            .context("assistant text item id missing")?;
+        if !self.started {
+            handler
+                .handle(ModelStreamEvent::AssistantMessageStarted {
+                    item_id: item_id.clone(),
+                })
+                .await?;
+            self.started = true;
+        }
+        handler
+            .handle(ModelStreamEvent::AssistantTextDelta { item_id, delta })
+            .await?;
+        Ok(())
+    }
+
+    async fn complete(&mut self, handler: &mut dyn ModelEventHandler) -> Result<()> {
+        if self.completed || !self.started {
+            return Ok(());
+        }
+        let item_id = self
+            .item_id
+            .clone()
+            .context("assistant text item id missing")?;
+        handler
+            .handle(ModelStreamEvent::AssistantMessageCompleted {
+                item_id,
+                turn_status: agent_loop::TurnStatus::Unknown,
+            })
+            .await?;
+        self.completed = true;
+        Ok(())
+    }
+}
+
+fn token_usage_raw<R>(response: &R) -> Value
+where
+    R: GetTokenUsage,
+{
+    response
+        .token_usage()
+        .map(|usage| {
+            json!({
+                "usage": {
+                    "input_tokens": usage.input_tokens,
+                    "output_tokens": usage.output_tokens,
+                    "total_tokens": usage.total_tokens,
+                    "input_tokens_details": {
+                        "cached_tokens": usage.cached_input_tokens
+                    },
+                    "output_tokens_details": {
+                        "reasoning_tokens": usage.reasoning_tokens
+                    }
+                }
+            })
+        })
+        .unwrap_or(Value::Null)
 }
 
 fn response_status_result(response: responses_api::CompletionResponse) -> Result<()> {
@@ -723,6 +1058,11 @@ where
     }
     if let Some(reasoning) = reasoning_history_message(&settings.llm, input) {
         builder = builder.message(reasoning);
+    }
+    // Native rig function-calling tools (not text-protocol tool calls).
+    let tool_defs = tools::rig_tool_definitions(&input.available_tools);
+    if !tool_defs.is_empty() {
+        builder = builder.tools(tool_defs).tool_choice(ToolChoice::Auto);
     }
     if let Some(params) = additional_params(settings) {
         builder = builder.additional_params(params);
@@ -771,7 +1111,7 @@ async fn stream_completion_model<M>(
 ) -> Result<()>
 where
     M: CompletionModel + Clone,
-    M::StreamingResponse: Clone + Unpin,
+    M::StreamingResponse: Clone + Unpin + GetTokenUsage,
 {
     // Live gateway blips (502/503/429) are common. Retry only when the attempt
     // made no observable progress, so we never double-emit partial stream events.
@@ -821,16 +1161,19 @@ async fn stream_completion_model_once<M>(
 ) -> std::result::Result<(), (anyhow::Error, bool)>
 where
     M: CompletionModel,
-    M::StreamingResponse: Clone + Unpin,
+    M::StreamingResponse: Clone + Unpin + GetTokenUsage,
 {
+    // Map rig's StreamedAssistantContent directly — no custom event-JSON reparse.
+    let started = std::time::Instant::now();
     let builder = completion_request_builder(settings, input, model, prompt);
     let mut stream = builder
         .stream()
         .await
         .context("LLM stream failed")
         .map_err(|error| (error, false))?;
-    let mut parser = RuntimeEventStreamParser::default();
-    let mut fallback_text = String::new();
+    let mut text_message = AssistantTextAccumulator::new();
+    let mut saw_tool_call = false;
+    let mut final_raw = Value::Null;
     let mut made_progress = false;
     while let Some(chunk) = stream.next().await {
         let chunk = match chunk.context("LLM stream chunk failed") {
@@ -840,9 +1183,12 @@ where
         match chunk {
             StreamedAssistantContent::Text(text) => {
                 made_progress = true;
-                fallback_text.push_str(text.text());
-                parser
-                    .push_text(text.text(), handler)
+                text_message
+                    .push_delta(
+                        handler,
+                        format!("msg-{}", Uuid::new_v4()),
+                        text.text().to_string(),
+                    )
                     .await
                     .map_err(|error| (error, made_progress))?;
             }
@@ -893,11 +1239,12 @@ where
             }
             StreamedAssistantContent::ToolCall { tool_call, .. } => {
                 made_progress = true;
+                saw_tool_call = true;
                 handler
                     .handle(ModelStreamEvent::ToolCallCompleted {
                         tool_call: ToolCallRequest {
                             call_id: tool_call.call_id.unwrap_or(tool_call.id),
-                            name: tool_call.function.name,
+                            name: tools::resolve_tool_name(&tool_call.function.name),
                             arguments: tool_call.function.arguments,
                         },
                     })
@@ -905,13 +1252,66 @@ where
                     .map_err(|error| (error, made_progress))?;
             }
             StreamedAssistantContent::ToolCallDelta { .. } => {}
-            StreamedAssistantContent::Final(_) => {}
+            StreamedAssistantContent::Final(response) => {
+                final_raw = token_usage_raw(&response);
+            }
         }
     }
-    parser
-        .finish(handler, &fallback_text)
+    text_message
+        .complete(handler)
         .await
-        .map_err(|error| (error, made_progress))
+        .map_err(|error| (error, made_progress))?;
+    handler
+        .handle(ModelStreamEvent::ResponseCompleted {
+            end_turn: !saw_tool_call,
+            raw: final_raw.clone(),
+        })
+        .await
+        .map_err(|error| (error, made_progress))?;
+    if settings.debug {
+        let elapsed_ms = started.elapsed().as_millis();
+        let root = debug_project_root(settings);
+        let usage = agent_loop::extract_token_usage(&final_raw);
+        debug_log_time(
+            &root,
+            json!({
+                "kind": "llm_stream",
+                "name": settings.role,
+                "role": settings.role,
+                "phase": settings.phase,
+                "topic_id": settings.topic_id,
+                "model": settings.llm.model,
+                "transport": "http",
+                "elapsed_ms": elapsed_ms,
+                "llm_ms": elapsed_ms,
+                "tool_ms": 0,
+                "wait_ms": 0,
+                "saw_tool_call": saw_tool_call,
+            }),
+        );
+        debug_log_token(
+            &root,
+            json!({
+                "kind": "llm_stream",
+                "role": settings.role,
+                "phase": settings.phase,
+                "topic_id": settings.topic_id,
+                "model": settings.llm.model,
+                "transport": "http",
+                "input_tokens": usage.input_tokens,
+                "output_tokens": usage.output_tokens,
+                "cached_tokens": usage.cached_tokens,
+                "reasoning_tokens": usage.reasoning_tokens,
+                "total_tokens": usage.total_tokens,
+                "elapsed_ms": elapsed_ms,
+                "llm_ms": elapsed_ms,
+                "tool_ms": 0,
+                "wait_ms": 0,
+                "saw_tool_call": saw_tool_call,
+            }),
+        );
+    }
+    Ok(())
 }
 
 fn apply_optional_preamble<M, P, ToolState>(
@@ -927,219 +1327,6 @@ where
     } else {
         builder
     }
-}
-
-#[derive(Default)]
-struct RuntimeEventStreamParser {
-    buffer: String,
-    parsed_any: bool,
-}
-
-impl RuntimeEventStreamParser {
-    #[cfg(test)]
-    async fn push_json_values(
-        &mut self,
-        text: &str,
-        handler: &mut dyn ModelEventHandler,
-    ) -> Result<bool> {
-        let stream = serde_json::Deserializer::from_str(text).into_iter::<Value>();
-        let mut emitted = false;
-        for value in stream {
-            let value = value?;
-            let Some(event) = stream_event_from_value(value)? else {
-                continue;
-            };
-            self.parsed_any = true;
-            emitted = true;
-            handler.handle(event).await?;
-        }
-        Ok(emitted)
-    }
-
-    async fn push_text(&mut self, text: &str, handler: &mut dyn ModelEventHandler) -> Result<()> {
-        self.buffer.push_str(text);
-        while let Some(index) = self.buffer.find('\n') {
-            let line = self.buffer[..index].trim().to_string();
-            self.buffer = self.buffer[index + 1..].to_string();
-            if !line.is_empty() {
-                self.emit_line(&line, handler).await?;
-            }
-        }
-        Ok(())
-    }
-
-    async fn finish(
-        &mut self,
-        handler: &mut dyn ModelEventHandler,
-        fallback_text: &str,
-    ) -> Result<()> {
-        let line = self.buffer.trim().to_string();
-        if !line.is_empty() {
-            let _ = self.emit_line(&line, handler).await;
-        }
-        if !self.parsed_any {
-            let value = agent_loop::extract_json_value(fallback_text)?;
-            for event in
-                agent_loop::response_to_stream_events(agent_loop::parse_react_response(value)?)?
-            {
-                handler.handle(event).await?;
-            }
-        }
-        Ok(())
-    }
-
-    async fn emit_line(&mut self, line: &str, handler: &mut dyn ModelEventHandler) -> Result<()> {
-        let Some(start) = line.find('{').or_else(|| line.find('[')) else {
-            return Ok(());
-        };
-        let json_line = &line[start..];
-        if let Some(repaired) = repair_adjacent_object_boundary(json_line) {
-            return self.emit_json_values(&repaired, line, handler).await;
-        }
-        self.emit_json_values(json_line, line, handler).await
-    }
-
-    async fn emit_json_values(
-        &mut self,
-        json_line: &str,
-        original_line: &str,
-        handler: &mut dyn ModelEventHandler,
-    ) -> Result<()> {
-        let stream = serde_json::Deserializer::from_str(json_line).into_iter::<Value>();
-        let mut emitted = false;
-        for value in stream {
-            let value = match value {
-                Ok(value) => value,
-                Err(_) if emitted => break,
-                Err(error) => {
-                    let preview_end = {
-                        let limit = original_line.len().min(200);
-                        let mut end = limit;
-                        while end > 0 && !original_line.is_char_boundary(end) {
-                            end -= 1;
-                        }
-                        end
-                    };
-                    tracing::warn!(
-                        line_preview = &original_line[..preview_end],
-                        %error,
-                        "skipping malformed streamed event line"
-                    );
-                    break;
-                }
-            };
-            let Some(event) = stream_event_from_value(value)? else {
-                continue;
-            };
-            self.parsed_any = true;
-            emitted = true;
-            handler.handle(event).await?;
-        }
-        Ok(())
-    }
-}
-
-fn repair_adjacent_object_boundary(text: &str) -> Option<String> {
-    let bytes = text.as_bytes();
-    let mut in_string = false;
-    let mut escape = false;
-    let mut depth = 0usize;
-
-    for index in 0..bytes.len().saturating_sub(1) {
-        let byte = bytes[index];
-        if in_string {
-            if escape {
-                escape = false;
-            } else if byte == b'\\' {
-                escape = true;
-            } else if byte == b'"' {
-                in_string = false;
-            }
-            continue;
-        }
-        match byte {
-            b'"' => in_string = true,
-            b'{' => depth += 1,
-            b'}' => depth = depth.saturating_sub(1),
-            _ => {}
-        }
-        if depth > 0 && byte == b'}' && bytes[index + 1] == b'{' {
-            let mut repaired = String::with_capacity(text.len() + 1);
-            repaired.push_str(&text[..index + 1]);
-            repaired.push('}');
-            repaired.push_str(&text[index + 1..]);
-            return Some(repaired);
-        }
-    }
-    None
-}
-
-fn stream_event_from_value(value: Value) -> Result<Option<ModelStreamEvent>> {
-    let Some(event_type) = value.get("type").and_then(Value::as_str) else {
-        tracing::debug!(?value, "skipping streamed event without type field");
-        return Ok(None);
-    };
-    match event_type {
-        "assistant_message_started" => Ok(Some(ModelStreamEvent::AssistantMessageStarted {
-            item_id: stream_item_id(&value)?,
-        })),
-        "assistant_text_delta" => Ok(Some(ModelStreamEvent::AssistantTextDelta {
-            item_id: stream_item_id(&value)?,
-            delta: value
-                .get("delta")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-        })),
-        "assistant_message_completed" => Ok(Some(ModelStreamEvent::AssistantMessageCompleted {
-            item_id: stream_item_id(&value)?,
-            turn_status: agent_loop::extract_turn_status(&value),
-        })),
-        "reasoning_summary_delta" => Ok(Some(ModelStreamEvent::ReasoningSummaryDelta {
-            item_id: stream_item_id(&value)?,
-            delta: value
-                .get("delta")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-        })),
-        "reasoning_summary_completed" => Ok(Some(ModelStreamEvent::ReasoningSummaryCompleted {
-            item_id: stream_item_id(&value)?,
-        })),
-        "tool_call_completed" => Ok(Some(ModelStreamEvent::ToolCallCompleted {
-            tool_call: serde_json::from_value(
-                value
-                    .get("tool_call")
-                    .or_else(|| value.get("toolCall"))
-                    .cloned()
-                    .context("tool_call_completed requires tool_call")?,
-            )?,
-        })),
-        "response_completed" => Ok(Some(ModelStreamEvent::ResponseCompleted {
-            end_turn: value
-                .get("end_turn")
-                .or_else(|| value.get("endTurn"))
-                .and_then(Value::as_bool)
-                .unwrap_or(true),
-            raw: value,
-        })),
-        other => {
-            tracing::debug!(
-                event_type = other,
-                "skipping unrecognized streamed event type"
-            );
-            Ok(None)
-        }
-    }
-}
-
-fn stream_item_id(value: &Value) -> Result<String> {
-    Ok(value
-        .get("item_id")
-        .or_else(|| value.get("itemId"))
-        .and_then(Value::as_str)
-        .map(ToString::to_string)
-        .unwrap_or_else(|| format!("item-{}", Uuid::new_v4())))
 }
 
 fn parse_final_output(settings: &RigSettings, text: &str) -> Result<Value> {
@@ -1254,6 +1441,20 @@ fn validate_analyst_artifact_contract(settings: &RigSettings, artifact: &Value) 
             settings.role,
             actual_role
         );
+    }
+    if actual_role == "analyst.news_macro" {
+        if let Some(attention) = artifact.get("jin10_attention") {
+            if !attention.is_array() && !attention.is_object() {
+                bail!(
+                    "analyst.news_macro jin10_attention must be an array of {{id,score}} or a map id->score"
+                );
+            }
+        }
+        if let Some(ids) = artifact.get("referenced_jin10_ids") {
+            if !ids.is_array() {
+                bail!("analyst.news_macro referenced_jin10_ids must be an array of jin10 ids");
+            }
+        }
     }
     let Some(per_ticker) = artifact.get("per_ticker").and_then(Value::as_object) else {
         bail!("analyst artifact requires per_ticker object");
@@ -1418,6 +1619,9 @@ fn validate_allocation_artifact_contract(settings: &RigSettings, artifact: &Valu
     let mut total_weight = 0.0;
     let mut equity_weight = 0.0;
     for (ticker, entry) in weights {
+        if ticker.eq_ignore_ascii_case("VIX") {
+            bail!("VIX is a regime signal and must not appear in allocation weights");
+        }
         let weight = entry
             .as_f64()
             .or_else(|| entry.get("weight").and_then(Value::as_f64))
@@ -1429,6 +1633,17 @@ fn validate_allocation_artifact_contract(settings: &RigSettings, artifact: &Valu
         if ticker != "cash_hedge" {
             equity_weight += weight;
         }
+    }
+    if artifact
+        .get("per_ticker")
+        .and_then(Value::as_object)
+        .is_some_and(|items| {
+            items
+                .keys()
+                .any(|ticker| ticker.eq_ignore_ascii_case("VIX"))
+        })
+    {
+        bail!("VIX is a regime signal and must not appear in allocation per_ticker");
     }
     if (total_weight - 1.0).abs() > 0.03 {
         bail!("allocation weights must sum to approximately 1.0 (got {total_weight})");
@@ -1828,7 +2043,11 @@ fn configured_tool_names(settings: &RigSettings) -> Vec<&str> {
 }
 
 fn role_disables_tools(role: &str) -> bool {
-    matches!(role, "manager.research" | "allocation.manager")
+    // Phase-2 debate roles keep tools enabled (allowlisted to summary/attention kinds).
+    matches!(
+        role,
+        "manager.research" | "trader" | "portfolio.manager" | "allocation.manager"
+    ) || role.starts_with("risk.")
 }
 
 fn validate_tool_name(name: &str) -> Result<()> {
@@ -1939,6 +2158,9 @@ fn mock_risk_artifact(role: &str) -> Value {
         "role": role,
         "stance": stance,
         "argument": format!("Mock {stance} risk argument."),
+        "unique_risk_contribution": format!("Mock {stance} stance-specific constraint."),
+        "disagreement_with_prior": "Mock review records whether prior constraints require a stance-specific change.",
+        "no_new_information": false,
         "recommended_adjustment": "No change in mock mode.",
         "stop_type": "event_based",
         "max_drawdown_pct": 0.1,
@@ -2024,15 +2246,16 @@ mod tests {
         RoleLlmSettings, TruncationConfig,
     };
     use crate::web_search::{WebSearchConfig, WebSearchMode};
-    use crate::{ModelEventHandler, ModelStreamEvent, RuntimeEventStreamParser};
+    use crate::{AssistantTextAccumulator, ModelEventHandler, ModelStreamEvent};
     use anyhow::Result;
     use serde_json::json;
-    use std::{future::Future, pin::Pin};
+    use std::{future::Future, path::PathBuf, pin::Pin};
 
     fn base_settings(route: LlmRoute) -> RigSettings {
         RigSettings {
             role: "manager.research".to_string(),
             phase: None,
+            topic_id: None,
             tickers: vec!["TQQQ".to_string()],
             output_mode: OutputMode::ResearchArtifact,
             llm: RoleLlmSettings {
@@ -2217,9 +2440,85 @@ mod tests {
             .join("outputs/debug/phase01/analyst_technical.jsonl");
         let contents = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<_> = contents.lines().filter(|line| !line.is_empty()).collect();
-        assert_eq!(lines.len(), 2);
-        assert!(lines[0].contains("\"kind\":\"generate\""));
-        assert!(lines[1].contains("\"kind\":\"stream\""));
+        // Latest turn only — intermediate tool turns are overwritten.
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("\"kind\":\"stream\""));
+        assert!(lines[0].contains("again"));
+    }
+
+    #[test]
+    fn append_debug_time_and_token_records_append_jsonl() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        super::append_debug_time_record(
+            root,
+            json!({
+                "kind": "role_job",
+                "name": "analyst.technical",
+                "elapsed_ms": 100,
+                "llm_ms": 60,
+                "tool_ms": 25,
+                "wait_ms": 15
+            }),
+        )
+        .unwrap();
+        super::append_debug_time_record(
+            root,
+            json!({"kind": "phase", "name": "phase1", "elapsed_ms": 40}),
+        )
+        .unwrap();
+        super::append_debug_token_record(
+            root,
+            json!({
+                "kind": "role_job",
+                "role": "analyst.technical",
+                "input_tokens": 10,
+                "output_tokens": 4,
+                "total_tokens": 14
+            }),
+        )
+        .unwrap();
+
+        let time_path = root.join("outputs/debug/time.jsonl");
+        let token_path = root.join("outputs/debug/token.jsonl");
+        let time_contents = std::fs::read_to_string(&time_path).unwrap();
+        let time_lines: Vec<_> = time_contents
+            .lines()
+            .filter(|line| !line.is_empty())
+            .collect();
+        let token_contents = std::fs::read_to_string(&token_path).unwrap();
+        let token_lines: Vec<_> = token_contents
+            .lines()
+            .filter(|line| !line.is_empty())
+            .collect();
+        assert_eq!(time_lines.len(), 2);
+        assert!(time_lines[0].contains("role_job"));
+        assert!(time_lines[0].contains("\"llm_ms\":60"));
+        assert!(time_lines[0].contains("\"tool_ms\":25"));
+        assert!(time_lines[0].contains("\"wait_ms\":15"));
+        assert!(time_lines[1].contains("phase1"));
+        assert_eq!(token_lines.len(), 1);
+        assert!(token_lines[0].contains("\"total_tokens\":14"));
+        assert!(token_lines[0].contains("ts_ms"));
+    }
+
+    #[test]
+    fn debug_record_path_includes_topic_id_for_phase2_roles() {
+        let path = super::debug_record_relative_path_with_topic(
+            2,
+            "researcher.bull.initial",
+            Some("QQQ-rate-volatility-confirmation"),
+        );
+        assert_eq!(
+            path,
+            PathBuf::from(
+                "outputs/debug/phase02/researcher_bull_initial__QQQ_rate_volatility_confirmation.jsonl"
+            )
+        );
+        assert_eq!(
+            super::debug_record_relative_path(1, "analyst.news_macro"),
+            PathBuf::from("outputs/debug/phase01/analyst_news_macro.jsonl")
+        );
     }
 
     #[test]
@@ -2638,127 +2937,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_event_parser_accepts_adjacent_json_objects() {
-        let mut parser = RuntimeEventStreamParser::default();
+    async fn assistant_text_accumulator_emits_started_delta_completed() {
+        let mut text = AssistantTextAccumulator::new();
         let mut handler = CollectEvents::default();
 
-        parser
-            .push_text(
-                "{\"type\":\"response_completed\",\"end_turn\":false}{\"type\":\"assistant_message_started\",\"item_id\":\"msg-2\"}\n",
-                &mut handler,
-            )
+        text.push_delta(&mut handler, "msg-1".to_string(), "hello".to_string())
             .await
             .unwrap();
+        text.push_delta(
+            &mut handler,
+            "msg-ignored".to_string(),
+            " world".to_string(),
+        )
+        .await
+        .unwrap();
+        text.complete(&mut handler).await.unwrap();
+        // complete is idempotent
+        text.complete(&mut handler).await.unwrap();
 
-        assert_eq!(handler.events.len(), 2);
+        assert_eq!(handler.events.len(), 4);
         assert!(matches!(
-            handler.events[0],
-            agent_loop::ModelStreamEvent::ResponseCompleted {
-                end_turn: false,
-                ..
-            }
+            &handler.events[0],
+            ModelStreamEvent::AssistantMessageStarted { item_id } if item_id == "msg-1"
         ));
         assert!(matches!(
-            handler.events[1],
-            agent_loop::ModelStreamEvent::AssistantMessageStarted { .. }
-        ));
-    }
-
-    #[tokio::test]
-    async fn runtime_event_parser_repairs_missing_outer_tool_call_brace() {
-        let mut parser = RuntimeEventStreamParser::default();
-        let mut handler = CollectEvents::default();
-
-        parser
-            .push_text(
-                "{\"type\":\"tool_call_completed\",\"tool_call\":{\"call_id\":\"call-2\",\"name\":\"read_run_context\",\"arguments\":{},\"mode\":\"blocking\"}{\"type\":\"response_completed\",\"end_turn\":false}\n",
-                &mut handler,
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(handler.events.len(), 2);
-        assert!(matches!(
-            handler.events[0],
-            agent_loop::ModelStreamEvent::ToolCallCompleted { .. }
+            &handler.events[1],
+            ModelStreamEvent::AssistantTextDelta { item_id, delta }
+                if item_id == "msg-1" && delta == "hello"
         ));
         assert!(matches!(
-            handler.events[1],
-            agent_loop::ModelStreamEvent::ResponseCompleted {
-                end_turn: false,
-                ..
-            }
-        ));
-    }
-
-    #[tokio::test]
-    async fn runtime_event_parser_accepts_pretty_json_object_stream() {
-        let mut parser = RuntimeEventStreamParser::default();
-        let mut handler = CollectEvents::default();
-
-        let emitted = parser
-            .push_json_values(
-                "{\n  \"type\": \"assistant_message_started\",\n  \"item_id\": \"msg-1\"\n}\n{\n  \"type\": \"response_completed\",\n  \"end_turn\": false\n}",
-                &mut handler,
-            )
-            .await
-            .unwrap();
-
-        assert!(emitted);
-        assert_eq!(handler.events.len(), 2);
-        assert!(matches!(
-            handler.events[0],
-            agent_loop::ModelStreamEvent::AssistantMessageStarted { .. }
+            &handler.events[2],
+            ModelStreamEvent::AssistantTextDelta { item_id, delta }
+                if item_id == "msg-1" && delta == " world"
         ));
         assert!(matches!(
-            handler.events[1],
-            agent_loop::ModelStreamEvent::ResponseCompleted {
-                end_turn: false,
-                ..
-            }
-        ));
-    }
-
-    #[tokio::test]
-    async fn runtime_event_parser_ignores_non_json_lines() {
-        let mut parser = RuntimeEventStreamParser::default();
-        let mut handler = CollectEvents::default();
-
-        parser
-            .push_text(
-                "reasoning text before events\n{\"type\":\"response_completed\",\"end_turn\":true}\n",
-                &mut handler,
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(handler.events.len(), 1);
-        assert!(matches!(
-            handler.events[0],
-            agent_loop::ModelStreamEvent::ResponseCompleted { .. }
-        ));
-    }
-
-    #[tokio::test]
-    async fn runtime_event_parser_accepts_embedded_json_event() {
-        let mut parser = RuntimeEventStreamParser::default();
-        let mut handler = CollectEvents::default();
-
-        parser
-            .push_text(
-                "event shape: {\"type\":\"response_completed\",\"end_turn\":false}_completed.\n",
-                &mut handler,
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(handler.events.len(), 1);
-        assert!(matches!(
-            handler.events[0],
-            agent_loop::ModelStreamEvent::ResponseCompleted {
-                end_turn: false,
-                ..
-            }
+            &handler.events[3],
+            ModelStreamEvent::AssistantMessageCompleted { item_id, .. } if item_id == "msg-1"
         ));
     }
 

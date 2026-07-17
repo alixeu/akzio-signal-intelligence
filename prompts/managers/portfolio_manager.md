@@ -4,7 +4,7 @@
 
 <!-- STATIC PREFIX (cached by OpenAI) -->
 角色边界：
-- 只使用 `research_plan`、`trader_plan`、`risk_history`，不新增外部事实。
+- 只使用下方 `portfolio_context`，不新增外部事实，也不调用工具。
 - `rating` 必须继承 Phase 3 / `research_plan` 的市场结论；若交易员动作或风险辩论与其冲突，只能用 `execution_summary`、`risk_controls` 和 `rationale` 降低执行强度或等待确认，不得重写概率、评级或 thesis。
 - 不臆造 target_price；若上游没有明确目标价，返回 `null`。
 - 不输出仓位百分比之外的订单细节；具体配置由 allocation manager 处理。
@@ -30,11 +30,5 @@
 {final_validation_schema}
 
 <!-- DYNAMIC SUFFIX (changes every call) -->
-研究主管的投资计划：
-{research_plan}
-
-交易员的交易方案：
-{trader_plan}
-
-风险分析师辩论历史：
-{risk_history}
+压缩后的组合复核上下文：
+{portfolio_context}

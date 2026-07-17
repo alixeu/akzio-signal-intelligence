@@ -9,6 +9,7 @@
 - 无可用样本时使用 `direction="unobserved"`、`confidence=0.0`，并在 `data_gaps` 说明缺口、重要性和可恢复条件；严禁臆造数据或叙事。
 - `confidence` 表示证据一致性与结论清晰度，使用 0.0-1.0 小数，不是上涨概率或百分比。
 - 不输出 BUY/HOLD/SELL、仓位、止损、止盈或目标价。
+- 若角色为 `analyst.news_macro`：顶层应包含 `jin10_attention`（数组 `[{id, score}]` 或 map `id->score`，可为空），给出本轮引用 Jin10 条目的注意力打分（0.0-1.0）。可额外附带 `referenced_jin10_ids` 作兼容。
 
 证据纪律：
 - `fact` 仅用于可由官方、监管、交易所、审计财报或标准化数据直接核验的事实。

@@ -1,9 +1,14 @@
 use anyhow::Result;
+use md5::{Digest, Md5};
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
 
+/// Import Jin10 flash items into the dedicated `jin10_items` table.
+///
+/// - `id` = md5(time + "\n" + content)
+/// - `content_json` = compact JSON payload passed to the LLM (`{id,time,content}`)
+/// - `attention_score` is preserved across re-imports (0.0-1.0 LLM attention)
+/// - `item_time` / `imported_at` are unix timestamps
 pub fn import_jin10_payload(conn: &mut Connection, payload: &Value) -> Result<usize> {
     let items = payload
         .get("items")
@@ -23,28 +28,94 @@ pub fn import_jin10_payload(conn: &mut Connection, payload: &Value) -> Result<us
             continue;
         }
         let item_time = parse_jin10_time(item_time_str);
-        let metadata_json = serde_json::to_string(&item)?;
-        let item_key = jin10_event_key(&item);
-        let content_hash = sha256_hex(&metadata_json);
+        let id = jin10_item_id(item_time_str, content);
+        let content_json = serde_json::to_string(&json!({
+            "id": id,
+            "time": item_time,
+            "time_raw": item_time_str,
+            "content": content,
+        }))?;
         tx.execute(
             r#"
-            INSERT OR REPLACE INTO external_items
-                (source, item_key, ticker, item_time, title, content, metadata_json, content_hash, imported_at)
-            VALUES ('jin10', ?, '', ?, '', ?, ?, ?, ?)
+            INSERT INTO jin10_items (id, content_json, attention_score, item_time, imported_at)
+            VALUES (?1, ?2, 0.0, ?3, ?4)
+            ON CONFLICT(id) DO UPDATE SET
+                content_json = excluded.content_json,
+                item_time = excluded.item_time,
+                imported_at = excluded.imported_at
             "#,
-            params![
-                item_key,
-                item_time,
-                content,
-                metadata_json,
-                content_hash,
-                imported_at
-            ],
+            params![id, content_json, item_time, imported_at],
         )?;
         count += 1;
     }
     tx.commit()?;
     Ok(count)
+}
+
+/// A single Jin10 attention assignment from the news analyst.
+#[derive(Debug, Clone)]
+pub struct Jin10Attention {
+    pub id: String,
+    /// Attention weight in [0.0, 1.0].
+    pub score: f64,
+}
+
+/// Record Jin10 attention into the unified ledger and cache on `jin10_items`.
+///
+/// Prefer `record_jin10_attention_for_turn` when `run_id` / `turn_id` / `role` are known.
+pub fn record_jin10_attention(conn: &Connection, items: &[Jin10Attention]) -> Result<usize> {
+    record_jin10_attention_for_turn(conn, "", "", "analyst.news_macro", Some(1), items)
+}
+
+/// Authoritative attention write: ledger + cached `jin10_items.attention_score`.
+pub fn record_jin10_attention_for_turn(
+    conn: &Connection,
+    run_id: &str,
+    turn_id: &str,
+    role: &str,
+    phase: Option<i64>,
+    items: &[Jin10Attention],
+) -> Result<usize> {
+    use crate::phase_index::{record_attention, AttentionEvent};
+    let mut seen = std::collections::BTreeSet::new();
+    let mut updated = 0usize;
+    for item in items {
+        let id = item.id.trim();
+        if id.is_empty() || !seen.insert(id.to_string()) {
+            continue;
+        }
+        let score = item.score.clamp(0.0, 1.0);
+        if !run_id.is_empty() {
+            record_attention(
+                conn,
+                &AttentionEvent {
+                    run_id: run_id.to_string(),
+                    turn_id: turn_id.to_string(),
+                    role: role.to_string(),
+                    subject_kind: "jin10".to_string(),
+                    subject_id: id.to_string(),
+                    score,
+                    phase,
+                },
+            )?;
+        } else {
+            let _ = conn.execute(
+                "UPDATE jin10_items SET attention_score = ?1 WHERE id = ?2",
+                params![score, id],
+            )?;
+        }
+        updated += 1;
+    }
+    Ok(updated)
+}
+
+/// Stable Jin10 primary key: md5(time_raw + "\\n" + content).
+pub fn jin10_item_id(time_raw: &str, content: &str) -> String {
+    let mut hasher = Md5::new();
+    hasher.update(time_raw.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(content.as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 fn parse_jin10_time(s: &str) -> i64 {
@@ -56,18 +127,84 @@ fn parse_jin10_time(s: &str) -> i64 {
         .unwrap_or(0)
 }
 
-fn jin10_event_key(item: &Value) -> String {
-    let mut seed = BTreeMap::new();
-    seed.insert("time", item.get("time").cloned().unwrap_or(Value::Null));
-    seed.insert(
-        "content",
-        item.get("content").cloned().unwrap_or(Value::Null),
-    );
-    sha256_hex(&serde_json::to_string(&json!(seed)).unwrap_or_default())
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::{connect, ensure_schema};
 
-fn sha256_hex(value: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(value.as_bytes());
-    format!("{:x}", hasher.finalize())
+    #[test]
+    fn jin10_id_is_stable_md5() {
+        let a = jin10_item_id("2026-06-19 09:00:00", "rate cut odds move");
+        let b = jin10_item_id("2026-06-19 09:00:00", "rate cut odds move");
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 32);
+        assert_ne!(a, jin10_item_id("2026-06-19 09:00:00", "other"));
+    }
+
+    #[test]
+    fn import_preserves_attention_and_record_updates_score() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("t.sqlite");
+        let mut conn = connect(&db_path).unwrap();
+        ensure_schema(&conn).unwrap();
+        let payload = json!({
+            "items": [
+                {"time": "2026-06-19 09:00:00", "content": "rate cut odds move"}
+            ]
+        });
+        assert_eq!(import_jin10_payload(&mut conn, &payload).unwrap(), 1);
+        let id = jin10_item_id("2026-06-19 09:00:00", "rate cut odds move");
+        assert_eq!(
+            record_jin10_attention(
+                &conn,
+                &[Jin10Attention {
+                    id: id.clone(),
+                    score: 0.82,
+                }]
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT attention_score FROM jin10_items WHERE id = ?",
+                [&id],
+                |row| row.get::<_, f64>(0)
+            )
+            .unwrap(),
+            0.82
+        );
+        // Re-import must not reset attention.
+        assert_eq!(import_jin10_payload(&mut conn, &payload).unwrap(), 1);
+        assert_eq!(
+            conn.query_row(
+                "SELECT attention_score FROM jin10_items WHERE id = ?",
+                [&id],
+                |row| row.get::<_, f64>(0)
+            )
+            .unwrap(),
+            0.82
+        );
+        // Latest score wins.
+        assert_eq!(
+            record_jin10_attention(
+                &conn,
+                &[Jin10Attention {
+                    id: id.clone(),
+                    score: 0.35,
+                }]
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT attention_score FROM jin10_items WHERE id = ?",
+                [&id],
+                |row| row.get::<_, f64>(0)
+            )
+            .unwrap(),
+            0.35
+        );
+    }
 }

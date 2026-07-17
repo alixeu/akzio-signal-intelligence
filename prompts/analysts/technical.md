@@ -11,7 +11,7 @@
 
 数据入口规则（必须遵守）：
 1. 不要重新抓取外部行情，也不要读取运行时上下文之外的本地文件。
-2. 必须先使用 `read_run_context` 读取 `technical` 技术表记录。
+2. 运行时会在首轮前预加载 `technical` 技术表记录到 dynamic context；优先直接使用。仅当预加载缺失时再调用 `read_run_context`。
 3. 这些已入库记录覆盖 Yahoo Finance 本地计算的 `1d/3h/20min` 技术特征口径。你的技术面结论必须基于这些已入库记录。
 4. 如果已入库上下文中某个 ticker、interval 或指标缺失，直接写入“数据缺口与不确定性”，不得补抓或臆造。
 5. 按公共 ticker 边界输出 `per_ticker`。

@@ -205,12 +205,6 @@ async fn debug_exec_records_local_reducers_without_changing_workflow_policy() {
         .unwrap()
         .iter()
         .any(|job| job["role"] == "mediator.topic"));
-    assert!(state["role_job_metrics"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|job| job["role"] == "trader"));
-
     let conn = Connection::open(db_path).unwrap();
     let phase2_debate_rows: i64 = conn
         .query_row(
@@ -220,6 +214,58 @@ async fn debug_exec_records_local_reducers_without_changing_workflow_policy() {
         )
         .unwrap();
     assert!(phase2_debate_rows > 0);
+
+    assert!(state["debug_phase_records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|record| record["phase"] == 2 && record["role"] == "phase2.summary"));
+    assert!(state["debug_phase_records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|record| record["phase"] == 4 && record["role"] == "trader"));
+
+    // Debug jsonl keeps only the latest record per role (final LLM turn already has full context).
+    let phase2_summary = orchestrator_core::default_project_root()
+        .join("outputs/debug/phase02/phase2_summary.jsonl");
+    let summary_contents = fs::read_to_string(&phase2_summary).unwrap();
+    let summary_lines: Vec<_> = summary_contents
+        .lines()
+        .filter(|line| !line.is_empty())
+        .collect();
+    assert_eq!(
+        summary_lines.len(),
+        1,
+        "phase2_summary.jsonl should keep only the latest debug record"
+    );
+    assert!(summary_lines[0].contains("\"role\":\"phase2.summary\""));
+
+    let root = orchestrator_core::default_project_root();
+    let time_path = root.join("outputs/debug/time.jsonl");
+    let token_path = root.join("outputs/debug/token.jsonl");
+    let time_contents = fs::read_to_string(&time_path).unwrap();
+    assert!(
+        time_contents
+            .lines()
+            .any(|line| line.contains("\"kind\":\"phase\"")),
+        "time.jsonl should record phase timings"
+    );
+    assert!(
+        time_contents
+            .lines()
+            .any(|line| line.contains("\"kind\":\"role_job\"")
+                || line.contains("\"kind\":\"function\"")),
+        "time.jsonl should record role or function timings"
+    );
+    // Mock roles still write token rows (usually zeros) for each role job.
+    let token_contents = fs::read_to_string(&token_path).unwrap();
+    assert!(
+        token_contents
+            .lines()
+            .any(|line| line.contains("\"kind\":\"role_job\"")),
+        "token.jsonl should record per-role token usage"
+    );
 }
 
 #[tokio::test]

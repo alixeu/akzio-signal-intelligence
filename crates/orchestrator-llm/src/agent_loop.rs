@@ -1,12 +1,14 @@
 use anyhow::{bail, Context, Result};
 use orchestrator_core;
-use orchestrator_sql::{session_history_items, upsert_agent_turn, AgentTurnInput};
+use orchestrator_sql::{turn_history_items, upsert_agent_turn, AgentTurnInput};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, VecDeque},
     future::Future,
+    path::PathBuf,
     pin::Pin,
+    time::Instant,
 };
 use tracing::{debug, warn};
 use uuid::Uuid;
@@ -442,7 +444,18 @@ pub struct ModelStreamResult {
     pub usage: TokenUsage,
     pub turn_count: u64,
     pub tool_call_count: u64,
+    /// Wall time spent inside model stream/generate calls (sum of iterations).
+    pub llm_ms: u128,
+    /// Wall time spent executing tools (sum of concurrent batch wall times).
+    pub tool_ms: u128,
     pub(crate) assistant_message_decisions: Vec<AssistantMessageDecision>,
+}
+
+impl ModelStreamResult {
+    /// Wait/overhead = total - llm - tool (clamped at 0).
+    pub fn wait_ms(&self, total_elapsed_ms: u128) -> u128 {
+        total_elapsed_ms.saturating_sub(self.llm_ms.saturating_add(self.tool_ms))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -549,7 +562,9 @@ impl LoopModel for RigLoopModel {
         input: ModelInput,
     ) -> Pin<Box<dyn Future<Output = Result<ModelResponse>> + Send + 'a>> {
         Box::pin(async move {
-            let prompt = react_prompt(&input)?;
+            // Non-stream path: rig prompt text is the assistant message body.
+            // Tool loops use stream_events + native function calling instead.
+            let prompt = model_prompt(&input)?;
             let text = crate::run_model_text_once(&self.settings, &input, &prompt).await?;
             if self.settings.debug {
                 crate::append_debug_llm_record(
@@ -558,14 +573,14 @@ impl LoopModel for RigLoopModel {
                         "kind": "generate",
                         "role": self.settings.role,
                         "phase": self.settings.phase,
+                        "topic_id": self.settings.topic_id,
                         "model": self.settings.llm.model,
                         "prompt": prompt,
                         "response_text": text,
                     }),
                 )?;
             }
-            let value = extract_json_value(&text)?;
-            parse_react_response(value)
+            Ok(model_response_from_assistant_text(&text))
         })
     }
 
@@ -575,7 +590,7 @@ impl LoopModel for RigLoopModel {
         handler: &'a mut dyn ModelEventHandler,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
         Box::pin(async move {
-            let prompt = react_prompt(&input)?;
+            let prompt = model_prompt(&input)?;
             let mut capture = DebugLlmCapture::new(handler);
             let result =
                 crate::run_model_event_stream(&self.settings, &input, &prompt, &mut capture).await;
@@ -610,15 +625,23 @@ impl<'a> DebugLlmCapture<'a> {
     }
 
     fn into_record(self, settings: &RigSettings, prompt: &str) -> Value {
+        // Tool calls always continue the agent loop; never report end_turn=true
+        // alongside tools even if the model protocol stream said otherwise.
+        let end_turn = if self.tool_calls.is_empty() {
+            self.end_turn
+        } else {
+            Some(false)
+        };
         json!({
             "kind": "stream",
             "role": settings.role,
             "phase": settings.phase,
+            "topic_id": settings.topic_id,
             "model": settings.llm.model,
             "prompt": prompt,
             "response_text": self.assistant_text,
             "tool_calls": self.tool_calls,
-            "end_turn": self.end_turn,
+            "end_turn": end_turn,
             "raw": self.raw,
         })
     }
@@ -663,6 +686,13 @@ pub struct AgentLoopConfig {
     pub judge: JudgeConfig,
     pub judge_endpoint: Option<String>,
     pub judge_api_key: Option<String>,
+    /// When true, write per-iteration timing/token rows under outputs/debug/.
+    pub debug: bool,
+    pub project_root: Option<PathBuf>,
+    pub role: String,
+    pub phase: Option<i64>,
+    pub model: String,
+    pub topic_id: Option<String>,
 }
 
 impl Default for AgentLoopConfig {
@@ -677,6 +707,12 @@ impl Default for AgentLoopConfig {
             judge: JudgeConfig::default(),
             judge_endpoint: None,
             judge_api_key: None,
+            debug: false,
+            project_root: None,
+            role: String::new(),
+            phase: None,
+            model: String::new(),
+            topic_id: None,
         }
     }
 }
@@ -735,6 +771,27 @@ where
         turn.emitted_items
             .push(TurnItem::user(turn.user_input.clone()));
     }
+    // Preload role default evidence before the first LLM hop (jin10/technical/compose).
+    if !turn.tools_disabled {
+        if let Some(kind) = preseed_context_kind(&turn.role) {
+            let already = turn
+                .emitted_items
+                .iter()
+                .any(|item| item.item_type == TurnItemType::ToolResult);
+            if !already {
+                let call = ToolCallRequest {
+                    call_id: "preseed-read_run_context".to_string(),
+                    name: "read_run_context".to_string(),
+                    arguments: json!({ "kind": kind }),
+                };
+                turn.emitted_items.push(TurnItem::tool_call(&call));
+                let result = tools.execute(call).await;
+                turn.emitted_items
+                    .push(TurnItem::tool_result(&result, &config.truncation));
+                persist_turn(conn, turn, &config.truncation)?;
+            }
+        }
+    }
     let mut first_iteration = true;
     let max_loops = config.max_agent_loops.map(|value| value.max(1));
     let mut loop_index = 0usize;
@@ -760,12 +817,14 @@ where
             "agent loop model iteration starting"
         );
         first_iteration = false;
+        let llm_started = Instant::now();
         let mut stream_handler =
             ModelStreamHandler::new(conn, turn, sink, config.truncation.clone());
         model.stream_events(input, &mut stream_handler).await?;
         let mut stream_result = stream_handler.finish().await?;
         apply_judge_to_stream_result(turn, &config, &mut stream_result, &mut judge_call_count)
             .await?;
+        let llm_elapsed_ms = llm_started.elapsed().as_millis();
         debug!(
             turn_id = turn.turn_id,
             role = turn.role,
@@ -778,11 +837,16 @@ where
             cached_tokens = stream_result.usage.cached_tokens,
             reasoning_tokens = stream_result.usage.reasoning_tokens,
             total_tokens = stream_result.usage.total_tokens,
+            elapsed_ms = llm_elapsed_ms,
             "agent loop model iteration completed"
         );
+        if config.debug {
+            log_debug_llm_iteration(&config, turn, loop_index, llm_elapsed_ms, &stream_result);
+        }
         aggregate_result.usage += stream_result.usage;
         aggregate_result.turn_count += stream_result.turn_count;
         aggregate_result.tool_call_count += stream_result.tool_call_count;
+        aggregate_result.llm_ms = aggregate_result.llm_ms.saturating_add(llm_elapsed_ms);
         aggregate_result
             .tool_calls
             .extend(stream_result.tool_calls.iter().cloned());
@@ -797,24 +861,53 @@ where
             }
 
             // Execute all tools concurrently
+            let debug_metrics = config.debug;
+            let debug_root = config.project_root.clone();
+            let debug_role = turn.role.clone();
+            let debug_phase = turn.phase;
+            let debug_topic = config.topic_id.clone();
+            let debug_loop = loop_index;
+            let tool_batch_started = Instant::now();
             let futures: Vec<_> = calls
                 .into_iter()
                 .map(|call| async {
                     let call_id = call.call_id.clone();
                     let name = call.name.clone();
                     debug!(
-                        turn_id = turn.turn_id,
                         call_id = call_id,
                         tool = name,
                         "agent loop tool call starting"
                     );
+                    let tool_started = Instant::now();
                     let result = tools.execute(call).await;
+                    let tool_elapsed_ms = tool_started.elapsed().as_millis();
+                    if debug_metrics {
+                        if let Some(root) = debug_root.as_ref() {
+                            crate::debug_log_time(
+                                root,
+                                json!({
+                                    "kind": "tool",
+                                    "name": result.name,
+                                    "role": debug_role,
+                                    "phase": debug_phase,
+                                    "topic_id": debug_topic,
+                                    "loop_index": debug_loop,
+                                    "call_id": result.call_id,
+                                    "status": result.status,
+                                    "elapsed_ms": tool_elapsed_ms,
+                                    "llm_ms": 0,
+                                    "tool_ms": tool_elapsed_ms,
+                                    "wait_ms": 0,
+                                }),
+                            );
+                        }
+                    }
                     debug!(
-                        turn_id = turn.turn_id,
                         call_id = result.call_id,
                         tool = result.name,
                         status = result.status,
                         error = result.error,
+                        elapsed_ms = tool_elapsed_ms,
                         "agent loop tool call completed"
                     );
                     (result, call_id, name)
@@ -822,6 +915,9 @@ where
                 .collect();
 
             let results = futures::future::join_all(futures).await;
+            // Concurrent tools share wall time; charge the batch duration once.
+            let tool_batch_ms = tool_batch_started.elapsed().as_millis();
+            aggregate_result.tool_ms = aggregate_result.tool_ms.saturating_add(tool_batch_ms);
             let stop_rereading = results.iter().any(|(result, _, _)| {
                 result.output.get("status").and_then(Value::as_str) == Some("stop_rereading")
             });
@@ -924,7 +1020,7 @@ where
             if turn.role.starts_with("risk.") && !risk_constraints_look_valid(&turn.role, &text) {
                 turn.tools_disabled = true;
                 turn.push_pending_input(
-                    "Your last output is invalid for this risk role. Emit the RiskConstraints required by the current role schema, including stance, numeric caps, stop policy, triggers, review window, hedge recommendation, and confidence. Do not call tools again.",
+                    "Your last output is invalid for this risk role. Emit the RiskConstraints required by the current role schema, including stance, unique_risk_contribution (or no_new_information=true), disagreement_with_prior, numeric caps, stop policy, triggers, review window, hedge recommendation, and confidence. Do not call tools again.",
                 );
                 turn.needs_follow_up = true;
                 persist_turn(conn, turn, &config.truncation)?;
@@ -1333,12 +1429,18 @@ async fn emit_tool_result<S: AgentEventSink>(
 fn build_model_input(
     conn: &rusqlite::Connection,
     turn: &mut Turn,
-    first_iteration: bool,
+    _first_iteration: bool,
     config: &AgentLoopConfig,
 ) -> Result<ModelInput> {
     let mut items = history_items(conn, turn, config.history_limit)?;
-    if first_iteration && items.is_empty() && !turn.user_input.trim().is_empty() {
-        items.push(TurnItem::user(turn.user_input.clone()));
+    let role_prompt =
+        (!turn.user_input.trim().is_empty()).then(|| TurnItem::user(turn.user_input.clone()));
+    if let Some(role_prompt) = &role_prompt {
+        items.retain(|item| {
+            item.item_type != TurnItemType::UserMessage
+                || item.content_text != role_prompt.content_text
+        });
+        items.insert(0, role_prompt.clone());
     }
     while let Some(input) = turn.pending_input.pop_front() {
         let item = TurnItem::user(format!("Steer: {input}"));
@@ -1350,7 +1452,9 @@ fn build_model_input(
         .rev()
         .find(|item| item.item_type == TurnItemType::ReasoningState)
         .cloned();
-    let total_tokens = estimate_items_tokens(&items);
+    // Budget the dynamic suffix independently so a large, cacheable role
+    // prompt cannot evict fresh tool evidence on the next loop iteration.
+    let total_tokens = estimate_items_tokens(&items[usize::from(role_prompt.is_some())..]);
     let token_threshold = config
         .max_context_tokens
         .map(|max_tokens| token_compaction_threshold(max_tokens, config.compact_at_token_ratio))
@@ -1397,13 +1501,11 @@ fn build_model_input(
         // Keep the original role prompt + a capped slice of latest tool evidence.
         // Previously we kept two full tool results, which often made tokens_after
         // larger than tokens_before and defeated token-threshold compaction.
-        let role_prompt = items
-            .iter()
-            .find(|item| {
-                item.item_type == TurnItemType::UserMessage && !item.content_text.trim().is_empty()
-            })
-            .cloned();
-        let evidence_char_cap = if needs_token_compaction { 1_500 } else { 4_000 };
+        let evidence_char_cap = if needs_token_compaction {
+            8_000
+        } else {
+            10_000
+        };
         let recent_tool_results: Vec<TurnItem> = items
             .iter()
             .rev()
@@ -1427,7 +1529,7 @@ fn build_model_input(
             })
             .collect();
         items = Vec::new();
-        if let Some(role_prompt) = role_prompt {
+        if let Some(role_prompt) = role_prompt.clone() {
             items.push(role_prompt);
         }
         items.push(item);
@@ -1447,9 +1549,18 @@ fn build_model_input(
         );
     }
     if let Some(max_tokens) = config.max_context_tokens {
+        let pinned_role_prompt = role_prompt.clone();
         let mut kept: Vec<TurnItem> = Vec::new();
         let mut total_tokens = 0usize;
-        for item in items.iter().rev() {
+        for item in items
+            .iter()
+            .filter(|item| {
+                pinned_role_prompt
+                    .as_ref()
+                    .is_none_or(|prompt| item.content_text != prompt.content_text)
+            })
+            .rev()
+        {
             if item.item_type == TurnItemType::ReasoningState {
                 kept.push(item.clone());
                 continue;
@@ -1461,6 +1572,9 @@ fn build_model_input(
             }
         }
         kept.reverse();
+        if let Some(role_prompt) = pinned_role_prompt {
+            kept.insert(0, role_prompt);
+        }
         items = kept;
     }
     let tools = if turn.tools_disabled {
@@ -1471,7 +1585,7 @@ fn build_model_input(
     Ok(ModelInput {
         items,
         available_tools: tools.clone(),
-        system_instruction: Some(react_system_instruction(
+        system_instruction: Some(model_system_instruction(
             &tools,
             &turn.role,
             &turn_tickers(turn),
@@ -1527,88 +1641,98 @@ fn turn_available_tools(turn: &Turn) -> Vec<String> {
 }
 
 fn history_items(conn: &rusqlite::Connection, turn: &Turn, limit: usize) -> Result<Vec<TurnItem>> {
-    session_history_items(conn, &turn.run_id, limit)?
-        .into_iter()
-        .map(|value| {
-            let item_type = match value
-                .get("event_type")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-            {
-                "user_message" => TurnItemType::UserMessage,
-                "assistant_message" => TurnItemType::AssistantMessage,
-                "reasoning_summary" => TurnItemType::ReasoningSummary,
-                "reasoning_state" => TurnItemType::ReasoningState,
-                "plan_update" => TurnItemType::PlanUpdate,
-                "tool_call" => TurnItemType::ToolCall,
-                "tool_result" => TurnItemType::ToolResult,
-                "system_context" => TurnItemType::SystemContext,
-                "developer_context" => TurnItemType::DeveloperContext,
-                "compact_summary" => TurnItemType::CompactSummary,
-                _ => TurnItemType::InjectedContext,
-            };
-            Ok(TurnItem {
-                item_type,
-                role: value
-                    .get("role")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string(),
-                content_text: value
-                    .get("content_text")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string(),
-                content_json: value.get("content_json").cloned().unwrap_or(Value::Null),
-                tool_call_id: value
-                    .get("tool_call_id")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string(),
-                tool_name: value
-                    .get("tool_name")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string(),
-                output_item_id: value
-                    .get("content_json")
-                    .and_then(|value| value.get("output_item_id"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string(),
-                phase: value
-                    .get("content_json")
-                    .and_then(|value| value.get("phase"))
-                    .and_then(Value::as_str)
-                    .and_then(parse_agent_item_phase),
-                status: value
-                    .get("content_json")
-                    .and_then(|value| value.get("status"))
-                    .and_then(Value::as_str)
-                    .and_then(parse_agent_item_status),
-                db_row_id: None,
-            })
-        })
-        .collect()
-}
-
-fn parse_agent_item_phase(value: &str) -> Option<AgentItemPhase> {
-    match value {
-        "commentary" => Some(AgentItemPhase::Commentary),
-        "final" => Some(AgentItemPhase::Final),
-        _ => None,
+    // Prefer in-memory emitted items for the active loop iteration.
+    //
+    // Loading "latest full_context_json for this run_id" is wrong when multiple
+    // roles share a run: parallel phase-1 jobs each own a distinct turn_id, so a
+    // later-persisted sibling role would replace this role's tool evidence and
+    // cause analysts to claim "no technical/Jin10 data" despite successful
+    // tool calls (live F1 regression).
+    let items = if !turn.emitted_items.is_empty() {
+        turn.emitted_items.clone()
+    } else {
+        // Resume path for multi-round steer sessions that recreate a Turn with
+        // the same turn_id: reload only this turn's snapshot.
+        turn_history_items(conn, &turn.turn_id)?
+            .into_iter()
+            .map(turn_item_from_history_value)
+            .collect()
+    };
+    if limit == 0 || items.len() <= limit {
+        return Ok(items);
     }
+    Ok(items[items.len() - limit..].to_vec())
 }
 
-fn parse_agent_item_status(value: &str) -> Option<AgentItemStatus> {
-    match value {
-        "in_progress" => Some(AgentItemStatus::InProgress),
-        "completed" => Some(AgentItemStatus::Completed),
-        "pending" => Some(AgentItemStatus::Pending),
-        "running" => Some(AgentItemStatus::Running),
-        "failed" => Some(AgentItemStatus::Failed),
-        "interrupted" => Some(AgentItemStatus::Interrupted),
-        _ => None,
+/// Convert a persisted agent-event history value into a runtime turn item.
+pub fn turn_item_from_history_value(value: Value) -> TurnItem {
+    let item_type = match value
+        .get("event_type")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+    {
+        "user_message" => TurnItemType::UserMessage,
+        "assistant_message" => TurnItemType::AssistantMessage,
+        "reasoning_summary" => TurnItemType::ReasoningSummary,
+        "reasoning_state" => TurnItemType::ReasoningState,
+        "plan_update" => TurnItemType::PlanUpdate,
+        "tool_call" => TurnItemType::ToolCall,
+        "tool_result" => TurnItemType::ToolResult,
+        "system_context" => TurnItemType::SystemContext,
+        "developer_context" => TurnItemType::DeveloperContext,
+        "compact_summary" => TurnItemType::CompactSummary,
+        _ => TurnItemType::InjectedContext,
+    };
+    let content_json = value.get("content_json").cloned().unwrap_or(Value::Null);
+    TurnItem {
+        item_type,
+        role: value
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        content_text: value
+            .get("content_text")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        content_json: content_json.clone(),
+        tool_call_id: value
+            .get("tool_call_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        tool_name: value
+            .get("tool_name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        output_item_id: content_json
+            .get("output_item_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        phase: content_json
+            .get("phase")
+            .and_then(Value::as_str)
+            .and_then(|value| match value {
+                "commentary" => Some(AgentItemPhase::Commentary),
+                "final" => Some(AgentItemPhase::Final),
+                _ => None,
+            }),
+        status: content_json
+            .get("status")
+            .and_then(Value::as_str)
+            .and_then(|value| match value {
+                "in_progress" => Some(AgentItemStatus::InProgress),
+                "completed" => Some(AgentItemStatus::Completed),
+                "pending" => Some(AgentItemStatus::Pending),
+                "running" => Some(AgentItemStatus::Running),
+                "failed" => Some(AgentItemStatus::Failed),
+                "interrupted" => Some(AgentItemStatus::Interrupted),
+                _ => None,
+            }),
+        db_row_id: None,
     }
 }
 
@@ -1873,7 +1997,48 @@ async fn mark_last_assistant_message_as_final<S: AgentEventSink>(
     Ok(())
 }
 
+fn preseed_context_kind(role: &str) -> Option<&'static str> {
+    match role {
+        "analyst.technical" => Some("technical"),
+        "analyst.news_macro" => Some("jin10"),
+        // Phase-2 topic/debate roles fork Phase 1.5 summary from the prompt
+        // (`{phase15_fork}`); do not preseed raw compose_context/jin10/technical.
+        _ => None,
+    }
+}
+
+/// Map plain assistant text (rig stream/text output) into a ModelResponse.
+/// Tool calls are expected via native function-calling on the stream path.
+pub fn model_response_from_assistant_text(text: &str) -> ModelResponse {
+    let trimmed = text.trim();
+    // Compatibility: if a legacy ReAct wrapper still appears, unwrap it.
+    if let Ok(value) = extract_json_value(trimmed) {
+        if value.get("assistant_message").is_some()
+            || value.get("tool_calls").is_some()
+            || value.get("end_turn").is_some()
+        {
+            if let Ok(parsed) = parse_legacy_react_response(value) {
+                return parsed;
+            }
+        }
+    }
+    ModelResponse {
+        assistant_message: Some(text.to_string()),
+        reasoning_summary: None,
+        tool_calls: Vec::new(),
+        end_turn: true,
+        raw: json!({"source": "rig_text"}),
+        turn_status: TurnStatus::Unknown,
+    }
+}
+
+/// Legacy ReAct JSON wrapper (assistant_message/tool_calls/end_turn). Kept only for
+/// compatibility with older fixtures and non-stream generate fallbacks.
 pub fn parse_react_response(value: Value) -> Result<ModelResponse> {
+    parse_legacy_react_response(value)
+}
+
+fn parse_legacy_react_response(value: Value) -> Result<ModelResponse> {
     let has_react_shape = value.get("assistant_message").is_some()
         || value.get("message").is_some()
         || value.get("reasoning_summary").is_some()
@@ -1898,10 +2063,6 @@ pub fn parse_react_response(value: Value) -> Result<ModelResponse> {
         .get("reasoning_summary")
         .and_then(Value::as_str)
         .map(ToString::to_string);
-    let end_turn = value
-        .get("end_turn")
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
     let turn_status = extract_turn_status(&value);
     let tool_calls = value
         .get("tool_calls")
@@ -1917,6 +2078,15 @@ pub fn parse_react_response(value: Value) -> Result<ModelResponse> {
         })
         .transpose()?
         .unwrap_or_default();
+    // Tool calls always continue the loop; never honor end_turn=true alongside tools.
+    let end_turn = if tool_calls.is_empty() {
+        value
+            .get("end_turn")
+            .and_then(Value::as_bool)
+            .unwrap_or(true)
+    } else {
+        false
+    };
     Ok(ModelResponse {
         assistant_message,
         reasoning_summary,
@@ -2139,6 +2309,15 @@ fn allocation_artifact_looks_valid(text: &str) -> bool {
     let Some(weights) = value.get("weights").and_then(Value::as_object) else {
         return false;
     };
+    if weights.contains_key("VIX")
+        || value
+            .get("per_ticker")
+            .and_then(Value::as_object)
+            .and_then(|items| items.get("VIX"))
+            .is_some_and(|payload| payload.get("weight").is_some())
+    {
+        return false;
+    }
     let parsed = weights
         .iter()
         .map(|(ticker, entry)| {
@@ -2210,6 +2389,9 @@ fn risk_constraints_look_valid(role: &str, text: &str) -> bool {
     let expected_stance = role.strip_prefix("risk.").unwrap_or_default();
     value.get("stance").and_then(Value::as_str) == Some(expected_stance)
         && non_empty_string_field(&value, "argument")
+        && (non_empty_string_field(&value, "unique_risk_contribution")
+            || value.get("no_new_information").and_then(Value::as_bool) == Some(true))
+        && non_empty_string_field(&value, "disagreement_with_prior")
         && non_empty_string_field(&value, "recommended_adjustment")
         && value
             .get("stop_type")
@@ -2260,7 +2442,9 @@ fn analyst_final_artifact_looks_valid(role: &str, expected_tickers: &[String], t
     let Ok(value) = extract_json_value(text) else {
         return false;
     };
-    if value.get("role").and_then(Value::as_str) != Some(role) {
+    if value.get("id").and_then(Value::as_str) != Some(role)
+        || value.get("role").and_then(Value::as_str) != Some(role)
+    {
         return false;
     }
     let Some(per_ticker) = value.get("per_ticker").and_then(Value::as_object) else {
@@ -2357,30 +2541,42 @@ pub(crate) fn assistant_message_needs_follow_up(text: &str) -> bool {
     )
 }
 
+/// System instruction for rig-native tool calling + plain-text final artifacts.
+pub fn model_system_instruction(
+    available_tools: &[String],
+    executing_role: &str,
+    tickers: &[String],
+) -> String {
+    let tools_line = if available_tools.is_empty() {
+        "No tools are available for this turn. Emit the final JSON artifact required by the current role schema now.".to_string()
+    } else {
+        format!(
+            "Native function-calling tools are available (use the API tool channel, not invented JSON tool events): {}.\n\
+If evidence is missing, call the appropriate tool. When tool evidence is enough, stop calling tools and emit the final JSON artifact as plain assistant text (one JSON object, no markdown fences).",
+            serde_json::to_string(available_tools).unwrap_or_default()
+        )
+    };
+    format!(
+        "You are running inside an agent loop powered by the rig completion API.\n\
+You are executing role `{executing_role}` for exactly these tickers: {}.\n\
+A final artifact's role must exactly equal `{executing_role}`. Analyst final artifacts must contain per_ticker entries for exactly this ticker set; do not substitute, rename, or omit tickers.\n\
+Protocol:\n\
+1) Use native function calls for tools (read_run_context, web.run, etc.). Do not invent custom event JSON lines.\n\
+2) Intermediate commentary may be plain text, but the turn must end with the complete artifact required by the current role schema as a single JSON object in assistant text.\n\
+3) Do not end with text saying you are about to retry, fetch, analyze, or wait for inputs; call the tool or produce the final artifact.\n\
+4) Do not wrap the artifact in id/role/status/report envelopes unless that role schema defines them.\n\
+{tools_line}",
+        serde_json::to_string(tickers).unwrap_or_default(),
+    )
+}
+
+/// Backward-compatible alias.
 pub fn react_system_instruction(
     available_tools: &[String],
     executing_role: &str,
     tickers: &[String],
 ) -> String {
-    format!(
-        "You are running inside an agent loop runtime. Decide the next step from these ordered context items.\n\
-You are executing role `{executing_role}` for exactly these tickers: {}. A final artifact's role must exactly equal `{executing_role}`. Analyst final artifacts must contain per_ticker entries for exactly this ticker set; do not substitute, rename, or omit tickers.\n\
-Return newline-delimited JSON events only. Each line must be one complete JSON object, with no markdown fences.\n\
-Use assistant message events for visible text. Intermediate explanations, plans, and current action notes should be emitted as assistant_message items; the runtime records them as commentary until the turn truly ends.\n\
-Supported event shapes:\n\
-{{\"type\":\"assistant_message_started\",\"item_id\":\"msg-1\"}}\n\
-{{\"type\":\"assistant_text_delta\",\"item_id\":\"msg-1\",\"delta\":\"visible text chunk\"}}\n\
-{{\"type\":\"assistant_message_completed\",\"item_id\":\"msg-1\",\"turn_status\":\"final\"}}\n\
-{{\"type\":\"reasoning_summary_delta\",\"item_id\":\"reasoning-1\",\"delta\":\"brief reasoning summary chunk\"}}\n\
-{{\"type\":\"reasoning_summary_completed\",\"item_id\":\"reasoning-1\"}}\n\
-{{\"type\":\"tool_call_completed\",\"tool_call\":{{\"call_id\":\"call-1\",\"name\":\"tool_name\",\"arguments\":{{}},\"mode\":\"blocking\"}}}}\n\
-{{\"type\":\"response_completed\",\"end_turn\":true}}\n\
-The `turn_status` field in assistant_message_completed events is optional but recommended. Set it to \"final\" when the message contains the complete artifact required by the current role schema. Set it to \"intermediate\" when the message is commentary, planning, or asking for inputs before producing the final artifact. If omitted, the runtime will infer the status from message content.\n\
-If you need a tool, emit any visible commentary first, then tool_call_completed, then response_completed with end_turn=false. If tool results answer the task, emit the final assistant_message and response_completed with end_turn=true. A final assistant_message must exactly match the current role prompt and runtime validator; do not add a generic id/role/status/report envelope unless that role schema defines one. Do not end the turn with text saying you are about to retry, fetch, analyze, or wait for inputs; call the tool or produce the final artifact. For web.run use {{\"search_query\":[{{\"q\":\"<TICKER> site:reddit.com\",\"domains\":[\"reddit.com\"],\"numResults\":10}}],\"response_length\":\"medium\"}} (replace <TICKER> with the actual tickers from your role prompt). For fetch_last30days_context use {{\"source\":\"reddit\",\"tickers\":[\"<TICKER>\"]}}. The runtime also accepts the older single-object response shape only as a compatibility fallback.\n\n\
-Available tools:\n{}",
-        serde_json::to_string(tickers).unwrap_or_default(),
-        serde_json::to_string_pretty(available_tools).unwrap_or_default()
-    )
+    model_system_instruction(available_tools, executing_role, tickers)
 }
 
 fn turn_item_prompt_json(
@@ -2433,6 +2629,63 @@ impl std::ops::AddAssign for TokenUsage {
     }
 }
 
+fn log_debug_llm_iteration(
+    config: &AgentLoopConfig,
+    turn: &Turn,
+    loop_index: usize,
+    elapsed_ms: u128,
+    stream_result: &ModelStreamResult,
+) {
+    let Some(root) = config.project_root.as_ref() else {
+        return;
+    };
+    let role = if config.role.is_empty() {
+        turn.role.as_str()
+    } else {
+        config.role.as_str()
+    };
+    let phase = config.phase.or(turn.phase);
+    crate::debug_log_time(
+        root,
+        json!({
+            "kind": "llm_iteration",
+            "name": role,
+            "role": role,
+            "phase": phase,
+            "topic_id": config.topic_id,
+            "model": config.model,
+            "loop_index": loop_index,
+            "turn_id": turn.turn_id,
+            "elapsed_ms": elapsed_ms,
+            "llm_ms": elapsed_ms,
+            "tool_ms": 0,
+            "wait_ms": 0,
+            "tool_calls": stream_result.tool_calls.len(),
+        }),
+    );
+    crate::debug_log_token(
+        root,
+        json!({
+            "kind": "llm_iteration",
+            "role": role,
+            "phase": phase,
+            "topic_id": config.topic_id,
+            "model": config.model,
+            "loop_index": loop_index,
+            "turn_id": turn.turn_id,
+            "input_tokens": stream_result.usage.input_tokens,
+            "output_tokens": stream_result.usage.output_tokens,
+            "cached_tokens": stream_result.usage.cached_tokens,
+            "reasoning_tokens": stream_result.usage.reasoning_tokens,
+            "total_tokens": stream_result.usage.total_tokens,
+            "non_cached_input_tokens": stream_result.usage.non_cached_input_tokens(),
+            "visible_output_tokens": stream_result.usage.visible_output_tokens(),
+            "elapsed_ms": elapsed_ms,
+            "tool_calls": stream_result.tool_calls.len(),
+        }),
+    );
+}
+
 pub fn extract_token_usage(raw: &Value) -> TokenUsage {
     let usage = raw
         .get("usage")
@@ -2468,11 +2721,12 @@ pub fn extract_token_usage(raw: &Value) -> TokenUsage {
     }
 }
 
-pub fn react_prompt(input: &ModelInput) -> Result<String> {
+/// Build the user prompt for a rig completion request from turn items.
+pub fn model_prompt(input: &ModelInput) -> Result<String> {
     let system = input
         .system_instruction
         .clone()
-        .unwrap_or_else(|| react_system_instruction(&input.available_tools, "unknown", &[]));
+        .unwrap_or_else(|| model_system_instruction(&input.available_tools, "unknown", &[]));
     let mut static_items = Vec::new();
     let mut dynamic_items = Vec::new();
     let mut captured_role_prompt = false;
@@ -2493,8 +2747,14 @@ pub fn react_prompt(input: &ModelInput) -> Result<String> {
     let static_context = serde_json::to_string_pretty(&static_items)?;
     let dynamic_context = serde_json::to_string_pretty(&dynamic_items)?;
     Ok(format!(
-        "{system}\n\nStatic context:\n{static_context}\n\nDynamic context:\n{dynamic_context}"
+        "{system}\n\nStatic context:\n{static_context}\n\nDynamic context:\n{dynamic_context}\n\n\
+Respond with either a native tool call or the final JSON artifact as plain assistant text."
     ))
+}
+
+/// Backward-compatible alias.
+pub fn react_prompt(input: &ModelInput) -> Result<String> {
+    model_prompt(input)
 }
 
 pub(crate) fn extract_json_value(text: &str) -> Result<Value> {
@@ -3159,6 +3419,20 @@ mod tests {
             &expected_tickers,
             wrong_ticker
         ));
+
+        let wrong_id = r#"{
+            "id":"technical-analysis-2026-07-16",
+            "role":"analyst.technical",
+            "per_ticker":{
+                "QQQ":{"direction":"bullish","confidence":0.7},
+                "SOXX":{"direction":"bearish","confidence":0.6}
+            }
+        }"#;
+        assert!(!analyst_final_artifact_looks_valid(
+            "analyst.technical",
+            &expected_tickers,
+            wrong_id
+        ));
     }
 
     #[test]
@@ -3186,6 +3460,48 @@ mod tests {
                 "correlation_note":"none",
                 "summary":"cash"
             }"#
+        ));
+        assert!(!allocation_artifact_looks_valid(
+            r#"{
+                "weights":{"VIX":{"weight":0.0},"cash_hedge":{"weight":1.0}},
+                "total_equity_exposure":0.0,
+                "vix_regime":"normal",
+                "correlation_note":"none",
+                "summary":"cash"
+            }"#
+        ));
+    }
+
+    #[test]
+    fn risk_packet_requires_explicit_information_gain() {
+        let base = json!({
+            "stance": "neutral",
+            "argument": "Balanced review.",
+            "recommended_adjustment": "Keep the existing cap.",
+            "stop_type": "event_based",
+            "max_drawdown_pct": 0.04,
+            "position_cap_pct": 0.10,
+            "rebalance_trigger": "Review on confirmation.",
+            "risk_off_trigger": "Reduce on invalidation.",
+            "review_window": "1d",
+            "cash_hedge_recommendation": "Keep cash.",
+            "constraint_confidence": 0.8
+        });
+        assert!(!risk_constraints_look_valid(
+            "risk.neutral",
+            &base.to_string()
+        ));
+
+        let mut valid = base;
+        valid["unique_risk_contribution"] =
+            json!("Correlation concentration requires a combined cap.");
+        valid["disagreement_with_prior"] = json!(
+            "Agree with the prior zero-position result, but use correlation as the binding reason."
+        );
+        valid["no_new_information"] = json!(false);
+        assert!(risk_constraints_look_valid(
+            "risk.neutral",
+            &valid.to_string()
         ));
     }
 
@@ -3395,6 +3711,204 @@ mod tests {
         );
         assert!(input.items[0].content_text.contains("~"));
         assert!(input.items[0].content_text.contains("path: /tmp/large-"));
+    }
+
+    #[test]
+    fn dynamic_budget_keeps_role_prompt_and_latest_tool_evidence() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+        let role_prompt = format!("TECHNICAL ROLE {}", "p".repeat(30_000));
+        let mut turn = Turn::new(
+            "turn-evidence",
+            "session-evidence",
+            "run-1",
+            "analyst.technical",
+            role_prompt.clone(),
+        );
+        turn.model_context = "tickers=QQQ,SOXX,VIX".to_string();
+        let tool_result = ToolResultItem {
+            call_id: "call-1".to_string(),
+            name: "read_run_context".to_string(),
+            status: "completed".to_string(),
+            output: json!({
+                "evidence": {
+                    "daily": [
+                        {"ticker": "QQQ", "Close": 717.73},
+                        {"ticker": "SOXX", "Close": 555.27},
+                        {"ticker": "VIX", "Close": 15.67}
+                    ]
+                }
+            }),
+            error: None,
+        };
+        append_history(
+            &conn,
+            &mut turn,
+            vec![TurnItem::tool_result(
+                &tool_result,
+                &TruncationConfig::default(),
+            )],
+        );
+        turn.push_pending_input("emit the final artifact");
+
+        let input =
+            build_model_input(&conn, &mut turn, false, &AgentLoopConfig::default()).unwrap();
+
+        assert_eq!(input.items[0].content_text, role_prompt);
+        assert!(input.items.iter().any(|item| {
+            item.item_type == TurnItemType::ToolResult
+                && item.content_text.contains("717.73")
+                && item.content_text.contains("555.27")
+                && item.content_text.contains("15.67")
+        }));
+        assert!(input.items.iter().any(|item| {
+            item.item_type == TurnItemType::UserMessage
+                && item.content_text.contains("emit the final artifact")
+        }));
+    }
+
+    #[test]
+    fn turn_history_resume_loads_only_matching_turn_id() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+
+        let mut technical = Turn::new(
+            "turn-tech",
+            "session-tech",
+            "run-shared",
+            "analyst.technical",
+            "TECH PROMPT",
+        );
+        technical.emitted_items.push(TurnItem::user("TECH PROMPT"));
+        technical.emitted_items.push(TurnItem::tool_result(
+            &ToolResultItem {
+                call_id: "call-1".to_string(),
+                name: "read_run_context".to_string(),
+                status: "completed".to_string(),
+                output: json!({"status": "ok", "evidence": {"daily": [{"ticker": "QQQ", "Close": 100.0}]}}),
+                error: None,
+            },
+            &TruncationConfig::default(),
+        ));
+        persist_turn(&conn, &technical, &TruncationConfig::default()).unwrap();
+
+        let mut news = Turn::new(
+            "turn-news",
+            "session-news",
+            "run-shared",
+            "analyst.news_macro",
+            "NEWS PROMPT",
+        );
+        news.emitted_items.push(TurnItem::user("NEWS PROMPT ONLY"));
+        persist_turn(&conn, &news, &TruncationConfig::default()).unwrap();
+
+        // Simulate multi-round resume: empty in-memory turn with same turn_id.
+        let resumed = Turn::new(
+            "turn-tech",
+            "session-tech",
+            "run-shared",
+            "analyst.technical",
+            "",
+        );
+        let items = history_items(&conn, &resumed, 200).unwrap();
+        assert!(
+            items.iter().any(|item| {
+                item.item_type == TurnItemType::ToolResult && item.content_text.contains("100.0")
+            }),
+            "resume must load technical tool evidence by turn_id"
+        );
+        assert!(!items
+            .iter()
+            .any(|item| item.content_text.contains("NEWS PROMPT ONLY")));
+    }
+
+    #[test]
+    fn parallel_roles_do_not_steal_each_others_tool_evidence() {
+        // Live F1: two phase-1 roles share run_id. session_history_items used to
+        // load ORDER BY turn_number DESC for the whole run, so news_macro's later
+        // turn replaced technical's tool evidence on the next model iteration.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+
+        let technical_prompt = "TECHNICAL ROLE PROMPT";
+        let mut technical = Turn::new(
+            "turn-technical",
+            "session-technical",
+            "run-shared",
+            "analyst.technical",
+            technical_prompt,
+        );
+        technical.model_context = "tickers=QQQ,SOXX,VIX".to_string();
+        technical
+            .emitted_items
+            .push(TurnItem::user(technical_prompt));
+        technical.emitted_items.push(TurnItem::tool_result(
+            &ToolResultItem {
+                call_id: "call-tech".to_string(),
+                name: "read_run_context".to_string(),
+                status: "completed".to_string(),
+                output: json!({
+                    "status": "ok",
+                    "evidence": {
+                        "daily": [
+                            {"ticker": "QQQ", "Close": 717.73, "RSI14": 55.0},
+                            {"ticker": "SOXX", "Close": 555.27},
+                            {"ticker": "VIX", "Close": 15.67}
+                        ]
+                    }
+                }),
+                error: None,
+            },
+            &TruncationConfig::default(),
+        ));
+        persist_turn(&conn, &technical, &TruncationConfig::default()).unwrap();
+
+        // Sibling role persists a higher turn_number without technical evidence.
+        let mut news = Turn::new(
+            "turn-news",
+            "session-news",
+            "run-shared",
+            "analyst.news_macro",
+            "NEWS ROLE PROMPT",
+        );
+        news.emitted_items.push(TurnItem::user(
+            "NEWS ROLE PROMPT without technical snapshots",
+        ));
+        persist_turn(&conn, &news, &TruncationConfig::default()).unwrap();
+
+        technical.push_pending_input(
+            "Tool evidence is already available. Tools are now disabled. Emit final JSON.",
+        );
+        let input =
+            build_model_input(&conn, &mut technical, false, &AgentLoopConfig::default()).unwrap();
+
+        assert!(
+            input.items.iter().any(|item| {
+                item.item_type == TurnItemType::ToolResult
+                    && item.content_text.contains("717.73")
+                    && item.content_text.contains("RSI14")
+            }),
+            "technical tool evidence must survive a later sibling role persist; items={:?}",
+            input
+                .items
+                .iter()
+                .map(|item| (
+                    item.item_type.as_str(),
+                    item.tool_name.as_str(),
+                    item.content_text.chars().take(80).collect::<String>()
+                ))
+                .collect::<Vec<_>>()
+        );
+        assert!(input.items.iter().any(|item| {
+            item.item_type == TurnItemType::UserMessage
+                && item
+                    .content_text
+                    .contains("Tool evidence is already available")
+        }));
+        assert!(!input
+            .items
+            .iter()
+            .any(|item| item.content_text.contains("NEWS ROLE PROMPT")));
     }
 
     #[test]
@@ -4112,6 +4626,22 @@ mod tests {
         assert_eq!(response.assistant_message.as_deref(), Some("checking"));
         assert!(!response.end_turn);
         assert_eq!(response.tool_calls[0].name, "read_context");
+    }
+
+    #[test]
+    fn parse_react_response_forces_end_turn_false_when_tools_present() {
+        let response = parse_react_response(json!({
+            "assistant_message": "fetching",
+            "end_turn": true,
+            "tool_calls": [{
+                "call_id": "call-1",
+                "name": "read_run_context",
+                "arguments": {"kind": "jin10"}
+            }]
+        }))
+        .unwrap();
+        assert!(!response.end_turn);
+        assert_eq!(response.tool_calls.len(), 1);
     }
 
     #[test]

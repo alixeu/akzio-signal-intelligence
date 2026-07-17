@@ -486,73 +486,50 @@ fn builtin_llm_role_values() -> BTreeMap<String, Value> {
             vec!["read_run_context", "fetch_last30days_context"],
             false,
         ),
+        // Phase-2 roles expand prior summaries / attention (not raw jin10/technical).
         (
             "researcher.bull.initial",
-            6,
+            10,
             None,
             vec!["read_run_context"],
             false,
         ),
         (
             "researcher.bear.initial",
-            6,
+            10,
             None,
             vec!["read_run_context"],
             false,
         ),
         (
             "researcher.bull.interaction",
-            6,
+            10,
             None,
             vec!["read_run_context"],
             false,
         ),
         (
             "researcher.bear.interaction",
-            6,
+            10,
             None,
             vec!["read_run_context"],
             false,
         ),
-        ("mediator.topic", 6, None, vec!["read_run_context"], false),
+        ("mediator.topic", 8, None, vec!["read_run_context"], false),
         (
             "mediator.topic_controller",
-            6,
+            10,
             Some("medium"),
             vec!["read_run_context"],
             false,
         ),
-        (
-            "manager.research",
-            6,
-            Some("medium"),
-            vec!["read_run_context"],
-            false,
-        ),
-        ("trader", 6, None, vec!["read_run_context"], false),
-        ("risk.aggressive", 6, None, vec!["read_run_context"], false),
-        (
-            "risk.conservative",
-            6,
-            None,
-            vec!["read_run_context"],
-            false,
-        ),
-        ("risk.neutral", 6, None, vec!["read_run_context"], false),
-        (
-            "portfolio.manager",
-            6,
-            Some("medium"),
-            vec!["read_run_context"],
-            false,
-        ),
-        (
-            "allocation.manager",
-            6,
-            None,
-            vec!["read_run_context"],
-            false,
-        ),
+        ("manager.research", 6, Some("medium"), vec![], false),
+        ("trader", 6, None, vec![], false),
+        ("risk.aggressive", 6, None, vec![], false),
+        ("risk.conservative", 6, None, vec![], false),
+        ("risk.neutral", 6, None, vec![], false),
+        ("portfolio.manager", 6, Some("medium"), vec![], false),
+        ("allocation.manager", 6, None, vec![], false),
     ] {
         let mut object = serde_json::Map::new();
         object.insert("max_turns".to_string(), Value::from(max_turns));
@@ -1070,5 +1047,33 @@ mod tests {
             "orchestrator": {"llm": {"truncation": {"strategy": "not-valid"}}}
         }));
         assert_eq!(invalid, TruncationConfig::default());
+    }
+
+    #[test]
+    fn static_context_roles_do_not_inherit_read_run_context() {
+        let roles = builtin_llm_role_values();
+        for role in [
+            "manager.research",
+            "trader",
+            "risk.aggressive",
+            "risk.conservative",
+            "risk.neutral",
+            "portfolio.manager",
+            "allocation.manager",
+        ] {
+            assert_eq!(roles[role]["tools"], json!([]), "role={role}");
+        }
+        for role in [
+            "researcher.bull.initial",
+            "researcher.bear.initial",
+            "mediator.topic",
+            "mediator.topic_controller",
+        ] {
+            assert_eq!(
+                roles[role]["tools"],
+                json!(["read_run_context"]),
+                "role={role}"
+            );
+        }
     }
 }

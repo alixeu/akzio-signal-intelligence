@@ -1,5 +1,6 @@
 pub(crate) mod allocation;
 pub(crate) mod artifact;
+pub(crate) mod compress;
 pub(crate) mod config;
 pub(crate) mod conflict_detection;
 pub(crate) mod contract;

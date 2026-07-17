@@ -5,9 +5,8 @@ use orchestrator_sql::{
     outcome::{upsert_outcome, OutcomeInput},
     prediction::{upsert_prediction, PredictionInput},
     read_run_context, session_history_items, upsert_agent_turn, write_agent_message_scoped,
-    write_role_turn_summary, write_run_record, write_source_item, AgentMessageInput,
-    AgentTurnInput, RoleTurnSummaryInput, RunContextReadRequest, RunRecordInput, RuntimeContext,
-    SourceItemInput,
+    write_role_turn_summary, write_run_record, AgentMessageInput, AgentTurnInput,
+    RoleTurnSummaryInput, RunContextReadRequest, RunRecordInput, RuntimeContext,
 };
 use serde_json::json;
 
@@ -15,7 +14,10 @@ const TABLES: &[&str] = &[
     "runs",
     "agent_events",
     "role_turn_summaries",
-    "external_items",
+    "jin10_items",
+    "phase_summaries",
+    "phase_summary_details",
+    "attention_ledger",
     "technical_features",
     "memory_items",
     "memory_versions",
@@ -31,6 +33,7 @@ const REMOVED_TABLES: &[&str] = &[
     "summaries",
     "source_items",
     "jin10_flash_items",
+    "external_items",
     "workflow_sources",
     "workflow_nodes",
     "workflow_edges",
@@ -69,7 +72,6 @@ const REMOVED_TABLES: &[&str] = &[
     "turn_context_items",
     "prompt_metrics",
     "technical_indicators",
-    "jin10_items",
     "youtube_videos",
     "youtube_transcripts",
     "social_items",
@@ -186,7 +188,7 @@ fn run_record_only_writes_runs_and_run_tickers() {
 }
 
 #[test]
-fn jin10_import_writes_compatibility_and_unified_source_items() {
+fn jin10_import_writes_dedicated_jin10_items_table() {
     let temp = tempfile::tempdir().unwrap();
     let db_path = temp.path().join("orchestrator.sqlite");
     let mut conn = connect(&db_path).unwrap();
@@ -204,7 +206,7 @@ fn jin10_import_writes_compatibility_and_unified_source_items() {
 
     assert_eq!(imported, 1);
     assert_eq!(context_count(&conn, "jin10").unwrap(), 1);
-    assert_eq!(table_exists(&conn, "jin10_flash_items"), 0);
+    assert_eq!(table_exists(&conn, "jin10_items"), 1);
 
     let context = read_run_context(
         &mut conn,
@@ -223,6 +225,29 @@ fn jin10_import_writes_compatibility_and_unified_source_items() {
     )
     .unwrap();
     assert_eq!(context["items"][0]["content"], "rate cut odds move");
+    assert!(context["items"][0]["id"].as_str().unwrap().len() == 32);
+    assert_eq!(context["items"][0]["attention_score"], 0.0);
+
+    let id = context["items"][0]["id"].as_str().unwrap().to_string();
+    assert_eq!(
+        orchestrator_sql::record_jin10_attention(
+            &conn,
+            &[orchestrator_sql::Jin10Attention {
+                id: id.clone(),
+                score: 0.77,
+            }]
+        )
+        .unwrap(),
+        1
+    );
+    let score: f64 = conn
+        .query_row(
+            "SELECT attention_score FROM jin10_items WHERE id = ?",
+            [&id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!((score - 0.77).abs() < 1e-9);
 }
 
 #[test]
@@ -324,107 +349,16 @@ fn technical_context_reads_features_table() {
 }
 
 #[test]
-fn source_items_write_dedicated_and_unified_tables() {
+fn external_items_table_is_dropped() {
     let temp = tempfile::tempdir().unwrap();
     let db_path = temp.path().join("orchestrator.sqlite");
-    let mut conn = connect(&db_path).unwrap();
-
-    assert_eq!(
-        write_source_item(
-            &mut conn,
-            &SourceItemInput {
-                source: "youtube".to_string(),
-                item_key: "vid-1".to_string(),
-                ticker: "TQQQ".to_string(),
-                item_time: ts("2026-06-19T00:00:00Z"),
-                content: "Video title".to_string(),
-                item_json: json!({
-                    "video_id": "vid-1",
-                    "title": "Video title",
-                }),
-            },
-        )
-        .unwrap(),
-        1
-    );
-    assert_eq!(
-        write_source_item(
-            &mut conn,
-            &SourceItemInput {
-                source: "reddit".to_string(),
-                item_key: "post-1".to_string(),
-                ticker: "TQQQ".to_string(),
-                item_time: ts("2026-06-19T01:00:00Z"),
-                content: "Post body".to_string(),
-                item_json: json!({"title": "Post title"}),
-            },
-        )
-        .unwrap(),
-        1
-    );
-    assert_eq!(
-        write_source_item(
-            &mut conn,
-            &SourceItemInput {
-                source: "x".to_string(),
-                item_key: "tweet-1".to_string(),
-                ticker: "TQQQ".to_string(),
-                item_time: ts("2026-06-19T02:00:00Z"),
-                content: "Tweet body".to_string(),
-                item_json: json!({}),
-            },
-        )
-        .unwrap(),
-        1
-    );
-
-    assert_eq!(
-        scalar(
-            &conn,
-            "SELECT COUNT(*) FROM external_items WHERE source = 'youtube'"
-        ),
-        1
-    );
-    assert_eq!(
-        write_source_item(
-            &mut conn,
-            &SourceItemInput {
-                source: "youtube".to_string(),
-                item_key: "vid-1".to_string(),
-                ticker: "TQQQ".to_string(),
-                item_time: ts("2026-06-19T03:00:00Z"),
-                content: "Updated video title".to_string(),
-                item_json: json!({
-                    "video_id": "vid-1",
-                    "title": "Updated video title",
-                }),
-            },
-        )
-        .unwrap(),
-        1
-    );
-    assert_eq!(
-        text_scalar(
-            &conn,
-            "SELECT title FROM external_items WHERE source = 'youtube' AND item_key = 'vid-1'"
-        ),
-        "Updated video title"
-    );
-    assert_eq!(
-        scalar(
-            &conn,
-            "SELECT COUNT(*) FROM external_items WHERE source = 'reddit'"
-        ),
-        1
-    );
-    assert_eq!(
-        scalar(
-            &conn,
-            "SELECT COUNT(*) FROM external_items WHERE source = 'x'"
-        ),
-        1
-    );
-    assert_eq!(table_exists(&conn, "source_items"), 0);
+    let conn = connect(&db_path).unwrap();
+    ensure_schema(&conn).unwrap();
+    assert_eq!(table_exists(&conn, "external_items"), 0);
+    assert_eq!(table_exists(&conn, "jin10_items"), 1);
+    assert_eq!(context_count(&conn, "youtube").unwrap(), 0);
+    assert_eq!(context_count(&conn, "reddit").unwrap(), 0);
+    assert_eq!(context_count(&conn, "x").unwrap(), 0);
 }
 
 #[test]
@@ -523,6 +457,58 @@ fn turn_tables_persist_items_and_history() {
 }
 
 #[test]
+fn turn_history_items_are_scoped_to_turn_id_not_latest_run_event() {
+    use orchestrator_sql::{turn_history_items, upsert_agent_turn, AgentTurnInput};
+
+    let temp = tempfile::tempdir().unwrap();
+    let db_path = temp.path().join("orchestrator.sqlite");
+    let conn = connect(&db_path).unwrap();
+
+    upsert_agent_turn(
+        &conn,
+        &AgentTurnInput {
+            turn_id: "turn-technical".to_string(),
+            run_id: "run-shared".to_string(),
+            phase: Some(1),
+            turn_number: 1,
+            role: "analyst.technical".to_string(),
+            full_context_json: json!([
+                {"event_type":"tool_result","role":"tool","content_text":"QQQ Close=100","content_json":{},"tool_call_id":"c1","tool_name":"read_run_context"}
+            ]),
+            summary: "technical".to_string(),
+        },
+    )
+    .unwrap();
+    upsert_agent_turn(
+        &conn,
+        &AgentTurnInput {
+            turn_id: "turn-news".to_string(),
+            run_id: "run-shared".to_string(),
+            phase: Some(1),
+            turn_number: 2,
+            role: "analyst.news_macro".to_string(),
+            full_context_json: json!([
+                {"event_type":"user_message","role":"user","content_text":"NEWS ONLY","content_json":{},"tool_call_id":"","tool_name":""}
+            ]),
+            summary: "news".to_string(),
+        },
+    )
+    .unwrap();
+
+    let technical = turn_history_items(&conn, "turn-technical").unwrap();
+    assert_eq!(technical.len(), 1);
+    assert_eq!(technical[0]["content_text"], "QQQ Close=100");
+
+    let news = turn_history_items(&conn, "turn-news").unwrap();
+    assert_eq!(news.len(), 1);
+    assert_eq!(news[0]["content_text"], "NEWS ONLY");
+
+    // run-scoped helper still returns latest turn for the run (legacy behavior).
+    let latest = session_history_items(&conn, "run-shared", 10).unwrap();
+    assert_eq!(latest[0]["content_text"], "NEWS ONLY");
+}
+
+#[test]
 fn compose_context_scores_trims_and_audits_blocks() {
     let temp = tempfile::tempdir().unwrap();
     let db_path = temp.path().join("orchestrator.sqlite");
@@ -582,54 +568,6 @@ fn compose_context_scores_trims_and_audits_blocks() {
         [now],
     )
     .unwrap();
-    write_source_item(
-        &mut conn,
-        &SourceItemInput {
-            source: "youtube".to_string(),
-            item_key: "vid-1".to_string(),
-            ticker: "TQQQ".to_string(),
-            item_time: ts("2026-06-19T11:00:00Z"),
-            content: "video title".to_string(),
-            item_json: json!({"video_id": "vid-1", "title": "video title"}),
-        },
-    )
-    .unwrap();
-    write_source_item(
-        &mut conn,
-        &SourceItemInput {
-            source: "youtube_transcript".to_string(),
-            item_key: "vid-1-transcript".to_string(),
-            ticker: "TQQQ".to_string(),
-            item_time: ts("2026-06-19T11:30:00Z"),
-            content: "transcript text".to_string(),
-            item_json: json!({"video_id": "vid-1", "language": "en", "provider": "test"}),
-        },
-    )
-    .unwrap();
-    write_source_item(
-        &mut conn,
-        &SourceItemInput {
-            source: "reddit".to_string(),
-            item_key: "post-1".to_string(),
-            ticker: "TQQQ".to_string(),
-            item_time: ts("2026-06-19T10:00:00Z"),
-            content: "reddit body".to_string(),
-            item_json: json!({"title": "reddit title"}),
-        },
-    )
-    .unwrap();
-    write_source_item(
-        &mut conn,
-        &SourceItemInput {
-            source: "x".to_string(),
-            item_key: "x-1".to_string(),
-            ticker: "TQQQ".to_string(),
-            item_time: ts("2026-06-19T10:30:00Z"),
-            content: "x body".to_string(),
-            item_json: json!({"author": "macro"}),
-        },
-    )
-    .unwrap();
     upsert_agent_turn(
         &conn,
         &AgentTurnInput {
@@ -670,14 +608,13 @@ fn compose_context_scores_trims_and_audits_blocks() {
         .iter()
         .any(|block| block["context_type"] == "technical_daily"));
     assert!(blocks.iter().any(|block| block["context_type"] == "jin10"));
-    assert!(blocks
-        .iter()
-        .any(|block| block["context_type"] == "youtube"));
-    assert!(blocks
-        .iter()
-        .any(|block| block["context_type"] == "youtube_transcript"));
-    assert!(blocks.iter().any(|block| block["context_type"] == "reddit"));
-    assert!(blocks.iter().any(|block| block["context_type"] == "x"));
+    assert!(
+        blocks.iter().all(|block| !matches!(
+            block["context_type"].as_str(),
+            Some("youtube" | "youtube_transcript" | "reddit" | "x")
+        )),
+        "social/video external blocks should not be present without external_items"
+    );
     assert_eq!(blocks[0]["content"], "same ticker same topic summary");
 
     let trimmed = read_run_context(
@@ -896,10 +833,6 @@ fn scalar(conn: &rusqlite::Connection, sql: &str) -> i64 {
     conn.query_row(sql, [], |row| row.get(0)).unwrap()
 }
 
-fn text_scalar(conn: &rusqlite::Connection, sql: &str) -> String {
-    conn.query_row(sql, [], |row| row.get(0)).unwrap()
-}
-
 fn column_exists(conn: &rusqlite::Connection, table: &str, column: &str) -> bool {
     let mut stmt = conn
         .prepare(&format!("PRAGMA table_info({table})"))
@@ -928,7 +861,7 @@ fn context_count_rejects_unsafe_table_identifiers() {
 }
 
 #[test]
-fn jin10_context_returns_compact_recent_items() {
+fn jin10_context_returns_id_and_content_json_payload() {
     let temp = tempfile::tempdir().unwrap();
     let db_path = temp.path().join("runtime.sqlite");
     let mut conn = connect(&db_path).unwrap();
@@ -956,9 +889,19 @@ fn jin10_context_returns_compact_recent_items() {
     assert_eq!(value["item_count"], 2);
     let items = value["items"].as_array().unwrap();
     assert!(items.iter().any(|item| item["content"] == "short headline"));
+    // Dedicated jin10 context passes full content_json to the LLM (with stable id).
     let long_item = items
         .iter()
-        .find(|item| item["content"].as_str().unwrap_or("").contains('…'))
-        .expect("long content should be clipped");
-    assert!(long_item["content"].as_str().unwrap().chars().count() <= 401);
+        .find(|item| {
+            item["content"]
+                .as_str()
+                .is_some_and(|content| content.starts_with('x') && content.len() >= 600)
+        })
+        .expect("full long content should be available for LLM");
+    assert_eq!(
+        long_item["id"].as_str().unwrap().len(),
+        32,
+        "jin10 id must be md5 hex"
+    );
+    assert_eq!(long_item["attention_score"], 0.0);
 }

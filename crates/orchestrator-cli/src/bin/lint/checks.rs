@@ -419,6 +419,9 @@ fn render_for_lint(
         "risk_history": serde_json::to_string_pretty(&state.get("risk_debate_state").and_then(|v| v.get("history")).cloned().unwrap_or_else(|| json!([])))?,
         "portfolio_decision": serde_json::to_string_pretty(&state.get("final_trade_decision").cloned().unwrap_or(Value::Null))?,
         "allocation_context": serde_json::to_string_pretty(&state.get("allocation_context").cloned().unwrap_or(Value::Null))?,
+        "phase3_context": "{}",
+        "risk_context": "{}",
+        "portfolio_context": "{}",
         "workflow_pattern": "Workflow -> Stage/Sub-workflow -> Agent workers -> Reducer -> state artifact"
     });
     component_registry.render_for_role(role, &mut values)?;

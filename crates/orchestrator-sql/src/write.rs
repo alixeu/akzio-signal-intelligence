@@ -46,16 +46,6 @@ pub struct RunRecordInput<'a> {
 }
 
 #[derive(Debug, Clone)]
-pub struct SourceItemInput {
-    pub source: String,
-    pub item_key: String,
-    pub ticker: String,
-    pub item_time: i64,
-    pub content: String,
-    pub item_json: Value,
-}
-
-#[derive(Debug, Clone)]
 pub struct RoleTurnSummaryInput {
     pub run_id: String,
     pub turn_id: String,
@@ -256,48 +246,6 @@ pub fn write_agent_message_scoped(
     }
     tx.commit()?;
     Ok(written)
-}
-
-pub fn write_source_item(conn: &mut Connection, input: &SourceItemInput) -> Result<usize> {
-    let item_json = serde_json::to_string(&input.item_json)?;
-    let mut hasher = Sha256::new();
-    hasher.update(item_json.as_bytes());
-    let content_hash = format!("{:x}", hasher.finalize());
-    let imported_at = chrono::Utc::now().timestamp();
-    write_dedicated_source_item(conn, input, &item_json, &content_hash, imported_at)
-}
-
-fn write_dedicated_source_item(
-    conn: &Connection,
-    input: &SourceItemInput,
-    item_json: &str,
-    content_hash: &str,
-    imported_at: i64,
-) -> Result<usize> {
-    let title = input
-        .item_json
-        .get("title")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    conn.execute(
-        r#"
-        INSERT OR REPLACE INTO external_items
-            (source, item_key, ticker, item_time, title, content, metadata_json, content_hash, imported_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        "#,
-        params![
-            input.source,
-            input.item_key,
-            input.ticker,
-            input.item_time,
-            title,
-            input.content,
-            item_json,
-            content_hash,
-            imported_at
-        ],
-    )
-    .map_err(Into::into)
 }
 
 fn ticker_payloads(

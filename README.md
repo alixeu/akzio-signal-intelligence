@@ -504,7 +504,10 @@ outcomes                ← 实际收益 vs 预测
 memory_items            ← 活跃经验记忆（版本化）
 memory_versions         ← 记忆内容版本 + 证据引用
 candidate_experiences   ← 预晋升的经验候选
-external_items          ← 外部源（Jin10/Youtube/Reddit/X）内容
+jin10_items             ← Jin10 快讯（id=md5, content_json, attention_score 缓存）
+phase_summaries         ← 每阶段压缩后的总结性内容
+phase_summary_details   ← 详细点 → 所属 summary_id
+attention_ledger        ← 统一注意力（role/turn_id/subject/score）
 technical_features      ← 多周期技术指标快照
 ```
 

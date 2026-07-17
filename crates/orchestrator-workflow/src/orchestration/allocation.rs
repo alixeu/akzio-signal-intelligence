@@ -126,6 +126,47 @@ pub(crate) fn compute_allocation_context(
     })
 }
 
+pub(crate) fn allocation_prompt_context(context: &Value) -> Value {
+    let risk_constraints = context
+        .get("risk_debate_state")
+        .and_then(|value| value.get("history"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|turn| turn.get("artifact"))
+        .map(|artifact| {
+            json!({
+                "role": artifact.get("role").cloned().unwrap_or(Value::Null),
+                "stance": artifact.get("stance").cloned().unwrap_or(Value::Null),
+                "position_cap_pct": artifact.get("position_cap_pct").cloned().unwrap_or(Value::Null),
+                "max_drawdown_pct": artifact.get("max_drawdown_pct").cloned().unwrap_or(Value::Null),
+                "rebalance_trigger": artifact.get("rebalance_trigger").cloned().unwrap_or(Value::Null),
+                "risk_off_trigger": artifact.get("risk_off_trigger").cloned().unwrap_or(Value::Null),
+                "unique_risk_contribution": artifact.get("unique_risk_contribution").cloned().unwrap_or(Value::Null)
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "investable_assets": context.get("investable_assets").cloned().unwrap_or_else(|| json!([])),
+        "vix": context.get("vix").cloned().unwrap_or(Value::Null),
+        "per_ticker": context.get("per_ticker").cloned().unwrap_or_else(|| json!({})),
+        "trader_plan": context.get("trader_plan").map(|plan| json!({
+            "action": plan.get("action").cloned().unwrap_or(Value::Null),
+            "position_size": plan.get("position_size").cloned().unwrap_or(Value::Null),
+            "rationale": plan.get("rationale").cloned().unwrap_or(Value::Null)
+        })).unwrap_or(Value::Null),
+        "risk_constraints": risk_constraints,
+        "final_trade_decision": context.get("final_trade_decision").map(|decision| json!({
+            "rating": decision.get("rating").cloned().unwrap_or(Value::Null),
+            "execution_summary": decision.get("execution_summary").cloned().unwrap_or(Value::Null),
+            "risk_controls": decision.get("risk_controls").cloned().unwrap_or_else(|| json!([]))
+        })).unwrap_or(Value::Null),
+        "correlation_60d": context.get("correlation_60d").cloned().unwrap_or(Value::Null),
+        "correlation_warning": context.get("correlation_warning").cloned().unwrap_or(Value::Null),
+        "max_single_position": context.get("max_single_position").cloned().unwrap_or(Value::Null)
+    })
+}
+
 pub(crate) fn normalize_allocation(
     raw: &Value,
     context: &Value,
@@ -275,6 +316,7 @@ pub(crate) fn normalize_allocation(
         "correlation_note": allocation_payload.get("correlation_note").cloned()
             .or_else(|| context.get("correlation_warning").cloned())
             .unwrap_or_else(|| json!("")),
+        "equity_budget_deviation": equity_budget_deviation(context, total_equity),
         "summary": allocation_payload.get("summary").and_then(Value::as_str).unwrap_or(""),
         "allocation_method": "llm"
     })
@@ -382,6 +424,7 @@ fn fallback_inverse_vol(context: &Value, config: &AllocationConfig, reason: &str
         "weights": weights,
         "total_equity_exposure": (equity_actual * 10_000.0).round() / 10_000.0,
         "vix_regime": vix_regime,
+        "equity_budget_deviation": equity_budget_deviation(context, equity_actual),
         "correlation_note": context.get("correlation_warning").cloned().unwrap_or_else(|| json!("")),
         "summary": format!("Fallback inverse-vol allocation (reason: {})", reason),
         "allocation_method": "fallback_inverse_vol"
@@ -484,6 +527,11 @@ fn cash_only_allocation(context: &Value, rationale: &str) -> Value {
         .and_then(Value::as_str)
         .unwrap_or("normal");
 
+    let budget_hint = context
+        .get("vix")
+        .and_then(|v| v.get("equity_budget_hint"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
     json!({
         "weights": {
             "cash_hedge": {
@@ -493,9 +541,41 @@ fn cash_only_allocation(context: &Value, rationale: &str) -> Value {
         },
         "total_equity_exposure": 0.0,
         "vix_regime": vix_regime,
+        "equity_budget_hint": budget_hint,
+        "equity_budget_deviation": equity_budget_deviation(context, 0.0),
         "correlation_note": context.get("correlation_warning").cloned().unwrap_or_else(|| json!("")),
         "summary": format!("Fallback cash allocation ({rationale})"),
         "allocation_method": "fallback_cash"
+    })
+}
+
+fn equity_budget_deviation(context: &Value, actual: f64) -> Value {
+    let hint = context
+        .get("vix")
+        .and_then(|value| value.get("equity_budget_hint"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let bounds = hint
+        .split_once('-')
+        .and_then(|(low, high)| Some((low.parse::<f64>().ok()?, high.parse::<f64>().ok()?)));
+    let (status, amount) = match bounds {
+        Some((low, _)) if actual < low => ("material_below_hint", low - actual),
+        Some((_, high)) if actual > high => ("material_above_hint", actual - high),
+        Some(_) => ("within_hint", 0.0),
+        None => ("unknown_hint", 0.0),
+    };
+    json!({
+        "status": status,
+        "actual_equity_exposure": actual,
+        "hint": hint,
+        "absolute_deviation": amount,
+        "explanation": if status == "material_below_hint" {
+            "Upstream trader/risk constraints override the non-binding VIX regime hint."
+        } else if status == "material_above_hint" {
+            "The proposed exposure exceeds the non-binding VIX regime hint and requires explicit upstream conviction."
+        } else {
+            "Equity exposure is consistent with the VIX regime hint."
+        }
     })
 }
 
@@ -1054,6 +1134,14 @@ mod tests {
 
         assert_eq!(allocation["total_equity_exposure"], 0.0);
         assert_eq!(allocation["weights"]["cash_hedge"]["weight"], 1.0);
+        assert_eq!(
+            allocation["equity_budget_deviation"]["status"],
+            "material_below_hint"
+        );
+        assert_eq!(
+            allocation["equity_budget_deviation"]["absolute_deviation"],
+            0.3
+        );
     }
 
     #[test]

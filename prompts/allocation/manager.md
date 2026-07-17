@@ -14,7 +14,7 @@
 
 ---
 
-**输入**：allocation context（JSON），包含 `investable_tickers`、`vix`（含 `level`、`regime`、`equity_budget_hint`）、`per_ticker`（含 `rating`、`long_probability`、`vol_pct`、`thesis`）、`research_plan`、`trader_plan`、`risk_debate_state`、`final_trade_decision`、`correlation_60d`、`correlation_warning`、`max_single_position`。
+**输入**：allocation context（JSON），包含 `investable_assets`、`vix`（含 `level`、`regime`、`equity_budget_hint`）、`per_ticker`（含 `rating`、`long_probability`、`vol_pct`、`thesis`）、压缩后的 `trader_plan`、压缩后的 `risk_constraints`（每项含 role/stance/caps/triggers/`unique_risk_contribution`）、压缩后的 `final_trade_decision`、`correlation_60d`、`correlation_warning`、`max_single_position`。完整 research/risk 原文不会再注入。
 
 ---
 
@@ -25,7 +25,7 @@
 - VIX 只通过 `equity_budget_hint` 影响股票 vs 现金的切分。
 
 **约束**：
-- `weights` 的键只能来自 `investable_tickers` 加 `cash_hedge`。
+- `weights` 的键只能来自 `investable_assets` 加 `cash_hedge`。
 - 所有权重必须 `>= 0`，且合计**精确等于 1.0**。
 - 单个 investable ticker 的权重不得超过 `max_single_position`。
 - 评级越高 + 波动越低 → 权重越高；评级越低 + 波动越高 → 权重越低。
@@ -33,7 +33,7 @@
 - `correlation_60d > 0.85` 的标的之间属**高度相关**，彼此**不能**当作相互独立的机会分别给满权重；它们的合计权重必须主动反映集中度风险（即叠加后显著低于各自按评级独立应得分位之和），而**不是**简单地按各自的 rating / long_probability 等比例堆高。`correlation_note` 中一旦将多个高度相关标的并列堆叠，必须**显式点名**这些 ticker 及其 correlation_60d 数值，说明为何其合并敞口被压低、分散化收益有限，不得仅以泛泛一句“相关性较高”带过。
 - `cash_hedge` 权重 = 1 − 总股票敞口；VIX 越高、相关性越高、方向概率越模糊，`cash_hedge` 应越高。
 - 当 VIX `regime` 为 `elevated` 或 `defensive` 时，`cash_hedge` 的 `rationale` **必须解释为何提高现金对冲**，而不能只写出数值：要结合（a）波动率升高放大回撤风险、（b）高度相关标的叠加使分散化失效、（c）上游 long_probability / 方向概率模糊导致胜率不确定，说明提高 `cash_hedge` 是上述三重风险下的主动收缩，而非单纯引用 `equity_budget_hint` 区间。
-- 每个 ticker 的 `rationale` 必须引用该 ticker 的 rating、long_probability、vol_pct，并结合 `trader_plan`、`risk_debate_state`、`final_trade_decision` 中的关键约束；理由必须与最终权重方向一致。
+- 每个 ticker 的 `rationale` 必须引用该 ticker 的 rating、long_probability、vol_pct，并结合 `trader_plan`、`risk_constraints`、`final_trade_decision` 中的关键约束；理由必须与最终权重方向一致。
 
 输出受 `PortfolioAllocation` structured output 约束。直接返回该对象作为顶层 JSON，不使用 `id/role/status/report` envelope；字段形状和值域由运行时 validator 强制执行。
 

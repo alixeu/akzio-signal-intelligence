@@ -134,6 +134,67 @@ fn compact_phase1_per_ticker(phase1: &Value) -> Value {
     )
 }
 
+/// Compact Phase 1.5 reducer output used as the sole forked context for Phase 2
+/// topic generation and bull/bear debate (not raw jin10/technical rows).
+fn phase15_fork(state: &Value) -> Value {
+    let phase1 = state
+        .get("phase1_state_artifact")
+        .cloned()
+        .unwrap_or(Value::Null);
+    json!({
+        "source": "phase1.5",
+        "artifact_type": phase1.get("artifact_type").cloned().unwrap_or(Value::Null),
+        "status": phase1.get("status").cloned().unwrap_or(Value::Null),
+        "evidence_quality": phase1.get("evidence_quality").cloned().unwrap_or(Value::Null),
+        "weighted_probability_base": phase1.get("weighted_probability_base").cloned().unwrap_or(Value::Null),
+        "topic_candidates": phase1.get("topic_candidates").cloned().unwrap_or_else(|| json!([])),
+        "cross_analyst_conflicts_summary": phase1
+            .get("cross_analyst_conflicts_summary")
+            .cloned()
+            .unwrap_or_else(|| json!([])),
+        "per_ticker": compact_phase1_per_ticker(&phase1),
+        "brief_md": state.get("phase1_brief_md").cloned().unwrap_or(Value::Null),
+        "reducer_checks": phase1.get("reducer_checks").cloned().unwrap_or_else(|| json!({})),
+        "note": "Forked Phase 1.5 summary only. Do not invent external facts or re-fetch raw jin10/technical."
+    })
+}
+
+/// Prior phase compressor summaries for any downstream role.
+/// Newer `source_phase` gets higher `recency_weight` (attention prior).
+fn prior_phase_summaries(state: &Value, current_phase: i64) -> Value {
+    let compress = state.get("phase_compress").cloned().unwrap_or(Value::Null);
+    let phase1 = phase15_fork(state);
+    let mut phases = Vec::new();
+    // Always include phase1 fork when available.
+    if phase1.get("status").is_some() || phase1.get("brief_md").is_some() {
+        phases.push(json!({
+            "source_phase": 1,
+            "recency_weight": 1.0 + 0.15 * 1.0,
+            "payload": phase1
+        }));
+    }
+    if current_phase > 2 {
+        if let Some(debate) = state.get("debate_state_artifact") {
+            phases.push(json!({
+                "source_phase": 2,
+                "recency_weight": 1.0 + 0.15 * 2.0,
+                "payload": {
+                    "status": debate.get("status"),
+                    "convergence_status": debate.get("convergence_status"),
+                    "topic_briefs": debate.get("topic_briefs").cloned().unwrap_or_else(|| json!([])),
+                    "brief_md": state.get("debate_brief_md"),
+                }
+            }));
+        }
+    }
+    json!({
+        "current_phase": current_phase,
+        "attention_rule": "Prefer higher recency_weight (more recent source_phase). Expand details via read_run_context kinds phase_summaries / phase_summary_details / attention_expand.",
+        "phases": phases,
+        "phase_compress_status": compress,
+    })
+}
+
 fn phase3_context(state: &Value) -> Value {
     let phase1 = state
         .get("phase1_state_artifact")
@@ -163,6 +224,120 @@ fn phase3_context(state: &Value) -> Value {
         "prior_memory": state.get("prior_memory").cloned().unwrap_or(Value::Null),
         "track_record": state.get("track_record").cloned().unwrap_or(Value::Null),
         "agent_accuracy": state.get("agent_accuracy").cloned().unwrap_or(Value::Null)
+    })
+}
+
+fn compact_object_fields(value: &Value, fields: &[&str]) -> Value {
+    Value::Object(
+        fields
+            .iter()
+            .filter_map(|field| {
+                value
+                    .get(*field)
+                    .map(|item| ((*field).to_string(), item.clone()))
+            })
+            .collect(),
+    )
+}
+
+fn compact_research_plan(state: &Value) -> Value {
+    const FIELDS: &[&str] = &[
+        "rating",
+        "long_probability",
+        "short_probability",
+        "confidence",
+        "confidence_basis",
+        "hold_reason",
+        "base_probability",
+        "debate_adjustment",
+        "final_probability",
+        "dominant_driver",
+        "why_now",
+        "why_not_already_priced",
+        "probability_rationale",
+        "adjustment_rationale",
+        "scenarios",
+        "plan",
+        "data_gaps",
+        "risk_flags",
+        "tail_risk_flag",
+        "missing_data_premium",
+    ];
+    let plan = state.get("research_plan").unwrap_or(&Value::Null);
+    let mut compact = compact_object_fields(plan, FIELDS);
+    compact["per_ticker"] = Value::Object(
+        plan.get("per_ticker")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flatten()
+            .map(|(ticker, payload)| (ticker.clone(), compact_object_fields(payload, FIELDS)))
+            .collect(),
+    );
+    compact
+}
+
+fn compact_risk_history(state: &Value) -> Value {
+    const FIELDS: &[&str] = &[
+        "role",
+        "stance",
+        "argument",
+        "recommended_adjustment",
+        "unique_risk_contribution",
+        "disagreement_with_prior",
+        "no_new_information",
+        "stop_type",
+        "max_drawdown_pct",
+        "position_cap_pct",
+        "rebalance_trigger",
+        "risk_off_trigger",
+        "review_window",
+        "cash_hedge_recommendation",
+        "constraint_confidence",
+    ];
+    Value::Array(
+        state
+            .get("risk_debate_state")
+            .and_then(|value| value.get("history"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .map(|turn| compact_object_fields(turn.get("artifact").unwrap_or(turn), FIELDS))
+            .collect(),
+    )
+}
+
+fn compact_trader_plan(state: &Value) -> Value {
+    compact_object_fields(
+        state.get("trader_investment_plan").unwrap_or(&Value::Null),
+        &[
+            "action",
+            "position_size",
+            "entry_price",
+            "stop_loss",
+            "rationale",
+            "status",
+        ],
+    )
+}
+
+fn risk_context(state: &Value) -> Value {
+    json!({
+        "research_plan": compact_research_plan(state),
+        "trader_plan": compact_trader_plan(state),
+        "phase1_evidence_quality": state
+            .get("phase1_state_artifact")
+            .and_then(|value| value.get("evidence_quality"))
+            .cloned()
+            .unwrap_or(Value::Null),
+        "prior_risk_arguments": compact_risk_history(state)
+    })
+}
+
+fn portfolio_context(state: &Value) -> Value {
+    json!({
+        "research_plan": compact_research_plan(state),
+        "trader_plan": compact_trader_plan(state),
+        "risk_history": compact_risk_history(state)
     })
 }
 
@@ -327,7 +502,11 @@ pub(crate) fn render_prompt_with_plugins(
         "risk_history": serde_json::to_string_pretty(&state.get("risk_debate_state").and_then(|v| v.get("history")).cloned().unwrap_or_else(|| json!([])))?,
         "portfolio_decision": serde_json::to_string_pretty(&state.get("final_trade_decision").cloned().unwrap_or(Value::Null))?,
         "allocation_context": serde_json::to_string_pretty(&state.get("allocation_context").cloned().unwrap_or(Value::Null))?,
+        "risk_context": serde_json::to_string_pretty(&risk_context(state))?,
+        "portfolio_context": serde_json::to_string_pretty(&portfolio_context(state))?,
         "phase3_context": serde_json::to_string_pretty(&phase3_context(state))?,
+        "phase15_fork": serde_json::to_string_pretty(&phase15_fork(state))?,
+        "prior_phase_summaries": serde_json::to_string_pretty(&prior_phase_summaries(state, phase))?,
     });
     let mut values = static_values;
     if let (Some(static_map), Some(dynamic_map)) =
@@ -760,8 +939,12 @@ required_variables = ["ticker", "tickers"]
         "{research_plan}",
         "{analyst_reports}",
         "{risk_history}",
+        "{risk_context}",
+        "{portfolio_context}",
         "{allocation_context}",
         "{phase3_context}",
+        "{phase15_fork}",
+        "{prior_phase_summaries}",
     ];
 
     fn golden_mock_state() -> Value {
@@ -829,6 +1012,42 @@ required_variables = ["ticker", "tickers"]
         assert!(role.get("summary").is_none());
         assert_eq!(role["key_evidence"].as_array().unwrap().len(), 3);
         assert!(role["key_evidence"][0].get("report").is_none());
+    }
+
+    #[test]
+    fn downstream_contexts_drop_full_analyst_and_risk_payloads() {
+        let state = json!({
+            "research_plan": {
+                "rating": "Hold",
+                "long_probability": 0.5,
+                "short_probability": 0.5,
+                "report": "DROP_FULL_RESEARCH_REPORT",
+                "per_ticker": {"QQQ": {
+                    "rating": "Hold",
+                    "long_probability": 0.5,
+                    "short_probability": 0.5,
+                    "report": "DROP_TICKER_REPORT"
+                }}
+            },
+            "trader_investment_plan": {"action": "Hold", "position_size": "0%"},
+            "analyst_reports": {"analyst.technical": {"report": "DROP_ANALYST_REPORT"}},
+            "risk_debate_state": {"history": [{"artifact": {
+                "role": "risk.aggressive",
+                "stance": "aggressive",
+                "argument": "compact argument",
+                "raw_context": "DROP_RISK_CONTEXT"
+            }}]}
+        });
+
+        let risk = serde_json::to_string(&risk_context(&state)).unwrap();
+        let portfolio = serde_json::to_string(&portfolio_context(&state)).unwrap();
+        for context in [&risk, &portfolio] {
+            assert!(!context.contains("DROP_FULL_RESEARCH_REPORT"));
+            assert!(!context.contains("DROP_TICKER_REPORT"));
+            assert!(!context.contains("DROP_ANALYST_REPORT"));
+            assert!(!context.contains("DROP_RISK_CONTEXT"));
+            assert!(context.contains("compact argument"));
+        }
     }
 
     #[test]

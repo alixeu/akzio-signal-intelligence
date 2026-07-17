@@ -129,8 +129,67 @@ pub fn read_run_context(conn: &mut Connection, request: &RunContextReadRequest) 
         "track_record" => track_record_context(conn, &ctx),
         "agent_accuracy" => agent_accuracy_context(conn),
         "compose_context" => compose_context(conn, request, &ctx),
+        "phase_summaries" | "prior_phase_summaries" => {
+            // If caller sets phase=N, return summaries for phases < N (prior only).
+            let max_source_phase = request.phase.filter(|p| *p > 0).map(|p| p - 1);
+            crate::phase_index::list_phase_summaries(
+                conn,
+                &ctx.run_id,
+                max_source_phase,
+                request.ticker.as_deref().filter(|t| !t.is_empty()),
+            )
+        }
+        "phase_summary_details" => {
+            // summary_id is passed in topic_id for this kind.
+            let summary_id = request
+                .topic_id
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .or_else(|| request.turn_id.as_deref().filter(|s| !s.is_empty()))
+                .unwrap_or_default();
+            if summary_id.is_empty() {
+                anyhow::bail!(
+                    "phase_summary_details requires topic_id set to the phase_summaries.id"
+                );
+            }
+            crate::phase_index::list_phase_summary_details(conn, summary_id)
+        }
+        "attention" => crate::phase_index::list_attention(
+            conn,
+            &ctx.run_id,
+            request.role.as_deref().filter(|r| !r.is_empty()),
+            request.turn_id.as_deref().filter(|t| !t.is_empty()),
+            None,
+            request.token_budget.unwrap_or(50).max(1),
+        ),
+        "attention_expand" => {
+            // Expect request to encode subjects in tickers as "kind:id" pairs, or role as JSON.
+            let subjects = parse_attention_expand_subjects(request);
+            crate::phase_index::expand_attention_subjects(conn, &subjects)
+        }
         other => anyhow::bail!("unsupported read_run_context kind {other:?}"),
     }
+}
+
+fn parse_attention_expand_subjects(request: &RunContextReadRequest) -> Vec<(String, String)> {
+    // Prefer tickers entries shaped as "jin10:<id>" / "summary:<id>" / "detail:<id>".
+    let mut subjects = Vec::new();
+    for entry in &request.tickers {
+        if let Some((kind, id)) = entry.split_once(':') {
+            let kind = kind.trim();
+            let id = id.trim();
+            if !kind.is_empty() && !id.is_empty() {
+                subjects.push((kind.to_string(), id.to_string()));
+            }
+        }
+    }
+    if subjects.is_empty() {
+        if let Some(id) = request.turn_id.as_deref().filter(|s| !s.is_empty()) {
+            // Fallback: treat as summary expand
+            subjects.push(("summary".to_string(), id.to_string()));
+        }
+    }
+    subjects
 }
 
 #[derive(Debug, Clone)]
@@ -179,7 +238,6 @@ fn compose_context(
     // returned near-empty context when phase was unset on the tool request.
     collect_jin10_blocks(conn, &mut blocks)?;
     collect_technical_blocks(conn, ctx, &mut blocks)?;
-    collect_external_blocks(conn, ctx, &mut blocks)?;
     collect_turn_history_blocks(conn, ctx, request.topic_id.as_deref(), &mut blocks)?;
 
     for block in &mut blocks {
@@ -474,33 +532,52 @@ fn collect_jin10_blocks(conn: &Connection, blocks: &mut Vec<ContextBlock>) -> Re
     const MAX_CONTENT_CHARS: usize = 400;
     let mut stmt = conn.prepare(
         r#"
-        SELECT item_key, item_time, content
-        FROM external_items
-        WHERE source = 'jin10'
-        ORDER BY item_time DESC
+        SELECT id, content_json, attention_score, item_time
+        FROM jin10_items
+        ORDER BY attention_score DESC, item_time DESC
         LIMIT 20
         "#,
     )?;
     let rows = stmt.query_map([], |row| {
-        let item_key: String = row.get("item_key")?;
+        let id: String = row.get("id")?;
+        let content_json: String = row.get("content_json")?;
+        let attention_score: f64 = row.get("attention_score")?;
         let item_time: i64 = row.get("item_time")?;
-        let content: String = row.get("content")?;
+        let parsed: Value = serde_json::from_str(&content_json).unwrap_or(Value::Null);
+        let content = parsed
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or(content_json.as_str())
+            .to_string();
         let clipped = if content.chars().count() > MAX_CONTENT_CHARS {
             let clipped: String = content.chars().take(MAX_CONTENT_CHARS).collect();
             format!("{clipped}…")
         } else {
             content
         };
+        let mut item_json = if parsed.is_object() {
+            parsed
+        } else {
+            json!({ "content": clipped.clone() })
+        };
+        if let Some(object) = item_json.as_object_mut() {
+            object.insert("id".to_string(), json!(id));
+            object.insert("attention_score".to_string(), json!(attention_score));
+            if !object.contains_key("time") {
+                object.insert("time".to_string(), json!(item_time));
+            }
+        }
         Ok(ContextBlock {
             context_type: "jin10".to_string(),
-            context_ref: format!("external_items:{item_key}"),
+            context_ref: format!("jin10_items:{id}"),
             ticker: String::new(),
             item_time,
-            title: "Jin10".to_string(),
-            content: clipped.clone(),
-            weight: 1.0,
-            source_table: "external_items".to_string(),
-            item_json: json!({ "time": item_time, "content": clipped }),
+            title: format!("Jin10 {id}"),
+            content: clipped,
+            // Prefer high-attention items in compose budget selection.
+            weight: 1.0 + attention_score.clamp(0.0, 1.0),
+            source_table: "jin10_items".to_string(),
+            item_json,
         })
     })?;
     blocks.extend(rows.collect::<rusqlite::Result<Vec<_>>>()?);
@@ -557,40 +634,6 @@ fn collect_technical_blocks(
             });
         }
     }
-    Ok(())
-}
-
-fn collect_external_blocks(
-    conn: &Connection,
-    ctx: &RuntimeContext,
-    blocks: &mut Vec<ContextBlock>,
-) -> Result<()> {
-    let mut stmt = conn.prepare(
-        r#"
-        SELECT source, item_key, ticker, item_time, title, content, metadata_json
-        FROM external_items
-        WHERE source != 'jin10' AND (? = '' OR ticker = ?)
-        ORDER BY item_time DESC
-        LIMIT 120
-        "#,
-    )?;
-    let rows = stmt.query_map(params![ctx.ticker, ctx.ticker], |row| {
-        let metadata_json: String = row.get("metadata_json")?;
-        let source: String = row.get("source")?;
-        let item_key: String = row.get("item_key")?;
-        Ok(ContextBlock {
-            context_type: source.clone(),
-            context_ref: format!("external_items:{item_key}"),
-            ticker: row.get("ticker")?,
-            item_time: row.get("item_time")?,
-            title: row.get("title")?,
-            content: row.get("content")?,
-            weight: 1.0,
-            source_table: "external_items".to_string(),
-            item_json: serde_json::from_str(&metadata_json).unwrap_or(Value::String(metadata_json)),
-        })
-    })?;
-    blocks.extend(rows.collect::<rusqlite::Result<Vec<_>>>()?);
     Ok(())
 }
 
@@ -753,6 +796,26 @@ pub fn session_history_items(conn: &Connection, run_id: &str, _limit: usize) -> 
     Ok(messages)
 }
 
+/// Load the full_context snapshot for a single agent-loop turn.
+///
+/// Prefer this over [`session_history_items`] when resuming multi-round steer
+/// sessions: multiple roles share one `run_id`, so run-scoped latest-row reload
+/// steals sibling history and drops role prompts / tool evidence.
+pub fn turn_history_items(conn: &Connection, turn_id: &str) -> Result<Vec<Value>> {
+    let full_context_json: String = conn
+        .query_row(
+            "SELECT full_context_json FROM agent_events WHERE turn_id = ?",
+            params![turn_id],
+            |row| row.get(0),
+        )
+        .unwrap_or_default();
+    if full_context_json.is_empty() || full_context_json == "[]" {
+        return Ok(Vec::new());
+    }
+    let messages: Vec<Value> = serde_json::from_str(&full_context_json).unwrap_or_default();
+    Ok(messages)
+}
+
 pub fn handle_read_command(
     conn: &Connection,
     command: &str,
@@ -808,7 +871,7 @@ pub fn sqlite_context(conn: &Connection, run_id: &str) -> Result<Value> {
         "debate_messages": debate_messages,
         "technical": technical_context(conn, &[], None)?,
         "jin10": jin10_context(conn)?,
-        "sources": external_sources_context(conn)?
+        "sources": json!({"query": "source-items", "items": [], "note": "external_items removed; youtube/reddit/x not persisted yet"})
     }))
 }
 
@@ -827,13 +890,11 @@ pub fn context_count(conn: &Connection, name: &str) -> Result<i64> {
         "technical_daily" => "SELECT COUNT(*) FROM technical_features WHERE interval = 'daily'",
         "technical_3h" => "SELECT COUNT(*) FROM technical_features WHERE interval = '3h'",
         "technical_20min" => "SELECT COUNT(*) FROM technical_features WHERE interval = '20min'",
-        "jin10" | "jin10-context" => "SELECT COUNT(*) FROM external_items WHERE source = 'jin10'",
-        "youtube" | "sources" => "SELECT COUNT(*) FROM external_items WHERE source = 'youtube'",
-        "youtube_transcripts" | "youtube_transcript" => {
-            "SELECT COUNT(*) FROM external_items WHERE source = 'youtube_transcript'"
+        "jin10" | "jin10-context" => "SELECT COUNT(*) FROM jin10_items",
+        // Social/video sources temporarily unpersisted (external_items dropped).
+        "youtube" | "sources" | "youtube_transcripts" | "youtube_transcript" | "reddit" | "x" => {
+            return Ok(0);
         }
-        "reddit" => "SELECT COUNT(*) FROM external_items WHERE source = 'reddit'",
-        "x" => "SELECT COUNT(*) FROM external_items WHERE source = 'x'",
         other => {
             // Only allow safe SQL identifiers so untrusted names cannot inject
             // via table interpolation. Existence is still checked separately.
@@ -856,33 +917,38 @@ pub fn context_count(conn: &Connection, name: &str) -> Result<i64> {
 
 fn jin10_context(conn: &Connection) -> Result<Value> {
     const MAX_ITEMS: usize = 20;
-    const MAX_CONTENT_CHARS: usize = 400;
     let mut stmt = conn.prepare(
-        "SELECT item_time, content FROM external_items \
-         WHERE source = 'jin10' ORDER BY item_time DESC LIMIT ?",
+        "SELECT id, content_json, attention_score, item_time FROM jin10_items \
+         ORDER BY attention_score DESC, item_time DESC LIMIT ?",
     )?;
     let items = stmt
         .query_map(params![MAX_ITEMS as i64], |row| {
-            let item_time: i64 = row.get(0)?;
-            let content: String = row.get(1)?;
-            Ok((item_time, content))
+            let id: String = row.get(0)?;
+            let content_json: String = row.get(1)?;
+            let attention_score: f64 = row.get(2)?;
+            let item_time: i64 = row.get(3)?;
+            Ok((id, content_json, attention_score, item_time))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?
         .into_iter()
-        .map(|(time, content)| {
-            let content = if content.chars().count() > MAX_CONTENT_CHARS {
-                let clipped: String = content.chars().take(MAX_CONTENT_CHARS).collect();
-                format!("{clipped}…")
-            } else {
-                content
-            };
-            json!({ "time": time, "content": content })
+        .map(|(id, content_json, attention_score, item_time)| {
+            // Pass the stored content_json to the LLM, ensuring id/attention fields are present.
+            let mut payload: Value = serde_json::from_str(&content_json)
+                .unwrap_or_else(|_| json!({ "raw": content_json }));
+            if let Some(object) = payload.as_object_mut() {
+                object.insert("id".to_string(), json!(id));
+                object.insert("attention_score".to_string(), json!(attention_score));
+                object.entry("time").or_insert(json!(item_time));
+            }
+            payload
         })
         .collect::<Vec<_>>();
     Ok(json!({
         "query": "get-jin10-context",
         "item_count": items.len(),
-        "items": items
+        "items": items,
+        "id_field": "id",
+        "attention_note": "Return jin10_attention: [{id, score}] with score in 0.0-1.0 for items that actually influenced the analysis."
     }))
 }
 
@@ -1117,27 +1183,4 @@ fn sqlite_value(row: &Row<'_>, index: usize) -> rusqlite::Result<Value> {
         }
         ValueRef::Blob(value) => json!(value),
     })
-}
-
-fn external_sources_context(conn: &Connection) -> Result<Value> {
-    let mut stmt = conn.prepare(
-        "SELECT source, ticker, item_time, content, metadata_json \
-         FROM external_items \
-         WHERE source != 'jin10' \
-         ORDER BY imported_at DESC, item_time DESC \
-         LIMIT 120",
-    )?;
-    let rows = stmt
-        .query_map(params![], |row| {
-            let metadata_json: String = row.get("metadata_json")?;
-            Ok(json!({
-                "source": row.get::<_, String>("source")?,
-                "ticker": row.get::<_, String>("ticker")?,
-                "time": row.get::<_, i64>("item_time")?,
-                "content": row.get::<_, String>("content")?,
-                "item": serde_json::from_str::<Value>(&metadata_json).unwrap_or(Value::String(metadata_json))
-            }))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(json!({"query": "source-items", "items": rows}))
 }

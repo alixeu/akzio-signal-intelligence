@@ -47,6 +47,7 @@
 - `bear` 场景：偏空/下跌方向的最可能路径。
 - 如果某个方向的证据极度匮乏，该场景 probability 可以很低（如 0.05），但不能为 0。
 - 场景分析不是重新分析市场；它是把已有的概率判断结构化为多条路径，帮助下游角色评估风险和触发条件。
+- `drivers` 必须是可导致价格路径的条件性市场因素（例如收益率、价格确认、盈利预期或风险偏好变化）；“没有证据 / 证据不足”只能写入 data_gaps，绝不能作为 bull/base/bear driver。
 
 **证据类型加权**：
 - `probability_drivers` 中每个 driver 的 `source` 必须标注证据类型（fact/opinion/speculation）。

@@ -77,6 +77,9 @@ pub const VALID_PLACEHOLDERS: &[&str] = &[
     "risk_history",
     "portfolio_decision",
     "allocation_context",
+    "phase3_context",
+    "risk_context",
+    "portfolio_context",
     "workflow_pattern",
     "researcher_body",
     "risk_analyst_body",
@@ -213,6 +216,14 @@ fn collect_paths(dir: &Path, out: &mut Vec<PathBuf>) {
     };
     for entry in read_dir.flatten() {
         let path = entry.path();
+        // Retired prompts under prompts/_archive are documentation-only.
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == "_archive" || name.starts_with('.'))
+        {
+            continue;
+        }
         if path.is_dir() {
             collect_paths(&path, out);
         } else {

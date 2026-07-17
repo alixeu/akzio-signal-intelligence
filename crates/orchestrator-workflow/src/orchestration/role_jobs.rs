@@ -90,9 +90,21 @@ pub(crate) struct RoleJobResult {
     pub error: Option<String>,
     pub timed_out: bool,
     pub elapsed_ms: u128,
+    /// Time spent waiting on the LLM API (sum of model iterations).
+    pub llm_ms: u128,
+    /// Time spent running tools invoked by the LLM.
+    pub tool_ms: u128,
     pub usage: TokenUsage,
     pub turn_count: u64,
     pub tool_call_count: u64,
+}
+
+impl RoleJobResult {
+    /// Orchestration / idle wait: total - llm - tool.
+    pub fn wait_ms(&self) -> u128 {
+        self.elapsed_ms
+            .saturating_sub(self.llm_ms.saturating_add(self.tool_ms))
+    }
 }
 
 fn prompt_version_for_role(state: &Value, role: &str) -> Option<String> {
@@ -281,9 +293,15 @@ pub(crate) async fn run_single_steer_role_job(
 }
 
 pub(crate) fn record_role_job_metrics(state: &mut Value, result: &RoleJobResult) {
+    let status = if result.artifact.is_some() {
+        "ok"
+    } else {
+        "degraded"
+    };
     if !state.get("role_job_metrics").is_some_and(Value::is_array) {
         state["role_job_metrics"] = json!([]);
     }
+    let wait_ms = result.wait_ms();
     if let Some(items) = state["role_job_metrics"].as_array_mut() {
         items.push(json!({
             "role": result.role,
@@ -295,7 +313,10 @@ pub(crate) fn record_role_job_metrics(state: &mut Value, result: &RoleJobResult)
             "model": result.model,
             "timed_out": result.timed_out,
             "elapsed_ms": result.elapsed_ms,
-            "status": if result.artifact.is_some() { "ok" } else { "degraded" },
+            "llm_ms": result.llm_ms,
+            "tool_ms": result.tool_ms,
+            "wait_ms": wait_ms,
+            "status": status,
             "input_tokens": result.usage.input_tokens,
             "output_tokens": result.usage.output_tokens,
             "cached_tokens": result.usage.cached_tokens,
@@ -308,6 +329,58 @@ pub(crate) fn record_role_job_metrics(state: &mut Value, result: &RoleJobResult)
         }));
     }
     refresh_role_job_metrics(state);
+    if state.get("debug").and_then(Value::as_bool) == Some(true) {
+        let root = default_project_root();
+        // One role-level timing row: llm + tool + wait breakdown.
+        orchestrator_llm::debug_log_time(
+            &root,
+            json!({
+                "kind": "role_job",
+                "name": result.role,
+                "role": result.role,
+                "phase": result.phase,
+                "kind_job": result.kind,
+                "round": result.round,
+                "topic_id": result.topic_id,
+                "model": result.model,
+                "status": status,
+                "timed_out": result.timed_out,
+                "elapsed_ms": result.elapsed_ms,
+                "llm_ms": result.llm_ms,
+                "tool_ms": result.tool_ms,
+                "wait_ms": wait_ms,
+                "turn_count": result.turn_count,
+                "tool_call_count": result.tool_call_count,
+            }),
+        );
+        orchestrator_llm::debug_log_token(
+            &root,
+            json!({
+                "kind": "role_job",
+                "role": result.role,
+                "phase": result.phase,
+                "kind_job": result.kind,
+                "round": result.round,
+                "topic_id": result.topic_id,
+                "model": result.model,
+                "status": status,
+                "timed_out": result.timed_out,
+                "elapsed_ms": result.elapsed_ms,
+                "llm_ms": result.llm_ms,
+                "tool_ms": result.tool_ms,
+                "wait_ms": wait_ms,
+                "input_tokens": result.usage.input_tokens,
+                "output_tokens": result.usage.output_tokens,
+                "cached_tokens": result.usage.cached_tokens,
+                "reasoning_tokens": result.usage.reasoning_tokens,
+                "total_tokens": result.usage.total_tokens,
+                "non_cached_input_tokens": result.usage.non_cached_input_tokens(),
+                "visible_output_tokens": result.usage.visible_output_tokens(),
+                "turn_count": result.turn_count,
+                "tool_call_count": result.tool_call_count,
+            }),
+        );
+    }
 }
 
 pub(crate) fn persist_prompt_metric(_conn: &rusqlite::Connection, _result: &RoleJobResult) {
@@ -402,6 +475,8 @@ async fn run_steer_role_job_with_timeout(
                 error: None,
                 timed_out: false,
                 elapsed_ms,
+                llm_ms: output.metrics.llm_ms,
+                tool_ms: output.metrics.tool_ms,
                 usage: output.metrics.usage,
                 turn_count: output.metrics.turn_count,
                 tool_call_count: output.metrics.tool_call_count,
@@ -425,6 +500,8 @@ async fn run_steer_role_job_with_timeout(
                 error: Some(error.to_string()),
                 timed_out: false,
                 elapsed_ms,
+                llm_ms: 0,
+                tool_ms: 0,
                 usage: TokenUsage::default(),
                 turn_count: 0,
                 tool_call_count: 0,
@@ -451,6 +528,8 @@ async fn run_steer_role_job_with_timeout(
                 error: Some(format!("role execution timed out after {timeout_sec}s")),
                 timed_out: true,
                 elapsed_ms,
+                llm_ms: 0,
+                tool_ms: 0,
                 usage: TokenUsage::default(),
                 turn_count: 0,
                 tool_call_count: 0,
@@ -564,6 +643,8 @@ pub(crate) async fn run_role_job_with_timeout(job: RoleJob, timeout_sec: u64) ->
                 error: None,
                 timed_out: false,
                 elapsed_ms,
+                llm_ms: output.metrics.llm_ms,
+                tool_ms: output.metrics.tool_ms,
                 usage: output.metrics.usage,
                 turn_count: output.metrics.turn_count,
                 tool_call_count: output.metrics.tool_call_count,
@@ -595,6 +676,8 @@ pub(crate) async fn run_role_job_with_timeout(job: RoleJob, timeout_sec: u64) ->
                 error: Some(message),
                 timed_out,
                 elapsed_ms,
+                llm_ms: 0,
+                tool_ms: 0,
                 usage: TokenUsage::default(),
                 turn_count: 0,
                 tool_call_count: 0,
@@ -639,6 +722,7 @@ async fn execute_role_job(job: RoleJob) -> Result<AgentLoopOutput> {
     let settings = RigSettings {
         role: job.role,
         phase: Some(job.phase),
+        topic_id: job.topic_id,
         tickers: job.tickers,
         output_mode: job.output_mode,
         llm,
@@ -705,6 +789,7 @@ async fn execute_steer_role_job(
     let settings = RigSettings {
         role: job.role,
         phase: Some(job.phase),
+        topic_id: job.topic_id,
         tickers: job.tickers,
         output_mode: job.output_mode,
         llm,
@@ -732,6 +817,8 @@ mod tests {
     use super::*;
 
     fn result(role: &str, timed_out: bool, elapsed_ms: u128) -> RoleJobResult {
+        let llm_ms = elapsed_ms / 2;
+        let tool_ms = elapsed_ms / 4;
         RoleJobResult {
             role: role.to_string(),
             phase: 3,
@@ -747,6 +834,8 @@ mod tests {
             error: timed_out.then(|| "timeout".to_string()),
             timed_out,
             elapsed_ms,
+            llm_ms,
+            tool_ms,
             usage: TokenUsage {
                 input_tokens: 10,
                 output_tokens: 4,
@@ -757,6 +846,14 @@ mod tests {
             turn_count: 1,
             tool_call_count: 3,
         }
+    }
+
+    #[test]
+    fn wait_ms_is_total_minus_llm_and_tool() {
+        let job = result("manager.research", false, 100);
+        assert_eq!(job.llm_ms, 50);
+        assert_eq!(job.tool_ms, 25);
+        assert_eq!(job.wait_ms(), 25);
     }
 
     #[test]
