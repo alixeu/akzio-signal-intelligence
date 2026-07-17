@@ -200,6 +200,58 @@ pub struct AnalystTickerArtifact {
     pub data_gaps: Vec<String>,
 }
 
+/// Canonical evidence-type tokens accepted by runtime validators and reducers.
+pub const CANONICAL_EVIDENCE_TYPES: &[&str] = &["fact", "opinion", "speculation", "unclassified"];
+
+/// Normalize model-invented / legacy evidence-type labels onto the canonical set.
+pub fn normalize_evidence_type(raw: &str) -> String {
+    let normalized = raw
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|ch| match ch {
+            '-' | ' ' => '_',
+            other => other,
+        })
+        .collect::<String>();
+    match normalized.as_str() {
+        "fact" | "opinion" | "speculation" | "unclassified" => normalized,
+        "fact_provider_standardized"
+        | "fact_source_reported"
+        | "fact_source"
+        | "standardized_fact"
+        | "provider_fact"
+        | "provider_standardized"
+        | "data"
+        | "observation"
+        | "official_fact"
+        | "reported_fact" => "fact".to_string(),
+        "derived_calculation"
+        | "analyst_interpretation"
+        | "interpretation"
+        | "analysis"
+        | "market_commentary"
+        | "issuer_management_claim"
+        | "management_claim"
+        | "retail_sentiment_sample"
+        | "calculation"
+        | "derived"
+        | "commentary" => "opinion".to_string(),
+        "rumor" | "hearsay" | "unverified" | "speculation_only" | "speculative" => {
+            "speculation".to_string()
+        }
+        "" => "unclassified".to_string(),
+        _ => "unclassified".to_string(),
+    }
+}
+
+/// Rewrite `key_evidence[].evidence_type` onto canonical tokens in place.
+pub fn normalize_analyst_ticker_artifact(artifact: &mut AnalystTickerArtifact) {
+    for item in &mut artifact.key_evidence {
+        item.evidence_type = normalize_evidence_type(&item.evidence_type);
+    }
+}
+
 /// A single piece of evidence with type classification.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 pub struct EvidenceItem {
@@ -233,8 +285,99 @@ pub struct EvidenceItem {
     pub source_confidence: f64,
 }
 
+fn value_as_string(value: Option<&Value>) -> String {
+    match value {
+        Some(Value::String(text)) => text.trim().to_string(),
+        Some(Value::Number(number)) => number.to_string(),
+        Some(Value::Bool(flag)) => flag.to_string(),
+        Some(Value::Null) | None => String::new(),
+        Some(other) => other.to_string(),
+    }
+}
+
+fn first_nonempty_string(obj: &Map<String, Value>, keys: &[&str]) -> String {
+    for key in keys {
+        let text = value_as_string(obj.get(*key));
+        if !text.is_empty() {
+            return text;
+        }
+    }
+    String::new()
+}
+
+/// Normalize a free-form evidence object into [`EvidenceItem`].
+/// Handles model drift: both evidence_age+catalyst_age, claim under assessment, source_quality.
+pub fn evidence_item_from_value(value: Value) -> Result<EvidenceItem, String> {
+    match value {
+        Value::String(text) => Ok(EvidenceItem {
+            claim: text,
+            evidence_type: "unclassified".to_string(),
+            source: String::new(),
+            timestamp: String::new(),
+            source_tier: String::new(),
+            first_source: String::new(),
+            is_derivative_repost: false,
+            evidence_age: String::new(),
+            source_confidence: 0.0,
+        }),
+        Value::Object(obj) => {
+            let claim = first_nonempty_string(
+                &obj,
+                &[
+                    "claim",
+                    "summary",
+                    "event",
+                    "description",
+                    "assessment",
+                    "actual",
+                ],
+            );
+            let evidence_type = normalize_evidence_type(&first_nonempty_string(
+                &obj,
+                &["evidence_type", "classification", "type"],
+            ));
+            let source = value_as_string(obj.get("source"));
+            let timestamp = value_as_string(obj.get("timestamp"));
+            let mut source_tier =
+                first_nonempty_string(&obj, &["source_tier", "source_quality"]);
+            source_tier = match source_tier.as_str() {
+                "industry_media" | "analyst_note" => "professional_research".to_string(),
+                "rumor" => "social_unverified".to_string(),
+                other => other.to_string(),
+            };
+            let first_source = value_as_string(obj.get("first_source"));
+            let is_derivative_repost = match obj.get("is_derivative_repost") {
+                Some(Value::Bool(flag)) => *flag,
+                Some(Value::String(text)) => matches!(
+                    text.trim().to_ascii_lowercase().as_str(),
+                    "true" | "1" | "yes"
+                ),
+                _ => false,
+            };
+            let evidence_age =
+                first_nonempty_string(&obj, &["evidence_age", "catalyst_age", "age"]);
+            let source_confidence = match obj.get("source_confidence") {
+                Some(Value::Number(number)) => number.as_f64().unwrap_or(0.0),
+                Some(Value::String(text)) => text.parse().unwrap_or(0.0),
+                _ => 0.0,
+            };
+            Ok(EvidenceItem {
+                claim,
+                evidence_type,
+                source,
+                timestamp,
+                source_tier,
+                first_source,
+                is_derivative_repost,
+                evidence_age,
+                source_confidence,
+            })
+        }
+        _ => Err("evidence item must be string or object".to_string()),
+    }
+}
+
 /// Deserialize key_evidence accepting both structured objects and plain strings.
-/// Plain strings are converted to EvidenceItem with evidence_type="unclassified".
 fn deserialize_key_evidence<'de, D>(
     deserializer: D,
 ) -> std::result::Result<Vec<EvidenceItem>, D::Error>
@@ -245,21 +388,9 @@ where
 
     let raw: Vec<Value> = Vec::deserialize(deserializer)?;
     raw.into_iter()
-        .map(|value| match value {
-            Value::String(text) => Ok(EvidenceItem {
-                claim: text,
-                evidence_type: "unclassified".to_string(),
-                source: String::new(),
-                timestamp: String::new(),
-                source_tier: String::new(),
-                first_source: String::new(),
-                is_derivative_repost: false,
-                evidence_age: String::new(),
-                source_confidence: 0.0,
-            }),
-            Value::Object(_) => serde_json::from_value::<EvidenceItem>(value)
-                .map_err(|error| Error::custom(format!("invalid evidence item: {error}"))),
-            _ => Err(Error::custom("evidence item must be string or object")),
+        .map(|value| {
+            evidence_item_from_value(value)
+                .map_err(|error| Error::custom(format!("invalid evidence item: {error}")))
         })
         .collect()
 }
@@ -277,14 +408,12 @@ pub fn validate_evidence_types(
         "unknown",
     ];
     for evidence in &artifact.key_evidence {
-        match evidence.evidence_type.as_str() {
-            "fact" | "opinion" | "speculation" | "unclassified" => {}
-            other => {
-                return Err(format!(
-                    "invalid evidence_type '{other}' in evidence '{}'; must be fact, opinion, or speculation",
-                    evidence.claim
-                ));
-            }
+        let canonical = normalize_evidence_type(&evidence.evidence_type);
+        if !CANONICAL_EVIDENCE_TYPES.contains(&canonical.as_str()) {
+            return Err(format!(
+                "invalid evidence_type '{}' in evidence '{}'; must be fact, opinion, or speculation",
+                evidence.evidence_type, evidence.claim
+            ));
         }
         if !evidence.source_tier.is_empty()
             && !ALLOWED_SOURCE_TIERS.contains(&evidence.source_tier.as_str())
@@ -965,8 +1094,10 @@ mod tests {
     }
 
     #[test]
-    fn validate_evidence_types_rejects_invalid_type() {
-        let artifact = AnalystTickerArtifact {
+    fn normalize_evidence_type_maps_legacy_labels() {
+        assert_eq!(normalize_evidence_type("rumor"), "speculation");
+        assert_eq!(normalize_evidence_type("analyst_interpretation"), "opinion");
+        let mut artifact = AnalystTickerArtifact {
             direction: "bullish".to_string(),
             confidence: 0.7,
             report: String::new(),
@@ -987,9 +1118,31 @@ mod tests {
             validation_triggers: Vec::new(),
             data_gaps: Vec::new(),
         };
+        normalize_analyst_ticker_artifact(&mut artifact);
+        assert_eq!(artifact.key_evidence[0].evidence_type, "speculation");
+        validate_evidence_types(&artifact).unwrap();
+    }
 
-        let error = validate_evidence_types(&artifact).unwrap_err();
-        assert!(error.contains("invalid evidence_type 'rumor'"));
+    #[test]
+    fn analyst_artifact_accepts_duplicate_age_aliases_and_assessment_claim() {
+        let json = r#"{
+            "direction": "bearish",
+            "confidence": 0.62,
+            "crowded_consensus_risk": "medium",
+            "report": "short prose",
+            "key_evidence": [{
+                "evidence_type": "fact",
+                "source_tier": "major_media",
+                "evidence_age": "0-2d",
+                "catalyst_age": "0-2d",
+                "assessment": "半导体权重同步走弱",
+                "source_confidence": 0.72
+            }]
+        }"#;
+        let artifact: AnalystTickerArtifact = serde_json::from_str(json).unwrap();
+        assert_eq!(artifact.key_evidence[0].claim, "半导体权重同步走弱");
+        assert_eq!(artifact.key_evidence[0].evidence_age, "0-2d");
+        validate_analyst_ticker_artifact(&artifact).unwrap();
     }
 
     #[test]

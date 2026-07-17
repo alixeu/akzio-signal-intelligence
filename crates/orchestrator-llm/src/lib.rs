@@ -2043,10 +2043,11 @@ fn configured_tool_names(settings: &RigSettings) -> Vec<&str> {
 }
 
 fn role_disables_tools(role: &str) -> bool {
-    // Phase-2 debate roles keep tools enabled (allowlisted to summary/attention kinds).
+    // manager.research may call read_run_context for phase_summaries / attention.
+    // Trader / risk / PM stay tool-free.
     matches!(
         role,
-        "manager.research" | "trader" | "portfolio.manager" | "allocation.manager"
+        "trader" | "portfolio.manager" | "allocation.manager"
     ) || role.starts_with("risk.")
 }
 
@@ -2100,6 +2101,7 @@ fn default_tool_config() -> tools::ExternalToolConfig {
                     .collect()
             })
             .unwrap_or_default(),
+        phase00_index: None,
     }
 }
 
@@ -2378,6 +2380,7 @@ mod tests {
             run_dir: Some(temp.path().to_path_buf()),
             run_id: None,
             tickers: vec!["QQQ".to_string()],
+            phase00_index: None,
         });
         let first = agent_loop::Turn::new(
             "turn-topic-a",
@@ -2414,6 +2417,7 @@ mod tests {
             run_dir: None,
             run_id: None,
             tickers: vec!["TQQQ".to_string()],
+            phase00_index: None,
         });
 
         super::append_debug_llm_record(

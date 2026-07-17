@@ -1,9 +1,14 @@
 //! Post-phase compressor index: summaries → details, and unified attention ledger.
+//!
+//! Runtime authority for phase00 rows is the in-memory [`Phase00MemoryIndex`].
+//! SQLite is filled by [`Phase00MemoryIndex::flush`] at run end (or tests).
 
 use anyhow::Result;
 use md5::{Digest, Md5};
 use rusqlite::{params, Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -69,6 +74,305 @@ pub fn phase_detail_id(summary_id: &str, sort_order: i64, detail: &str) -> Strin
     hasher.update(b"|");
     hasher.update(detail.as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+/// In-memory phase00 summary row (same shape as SQLite / tool JSON).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PhaseSummaryRow {
+    pub id: String,
+    pub run_id: String,
+    pub source_phase: i64,
+    pub role: String,
+    pub ticker: String,
+    pub topic_id: Option<String>,
+    pub summary: String,
+    pub summary_json: Value,
+    pub confidence: f64,
+    pub created_at: i64,
+}
+
+/// In-memory phase00 detail row.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PhaseSummaryDetailRow {
+    pub id: String,
+    pub summary_id: String,
+    pub run_id: String,
+    pub source_phase: i64,
+    pub detail: String,
+    pub detail_json: Value,
+    pub source_ref: String,
+    pub sort_order: i64,
+    pub created_at: i64,
+}
+
+/// One phase's compressor batch before SQLite flush.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Phase00PhaseBatch {
+    pub source_phase: i64,
+    pub summaries: Vec<PhaseSummaryRow>,
+    pub details: Vec<PhaseSummaryDetailRow>,
+}
+
+impl Phase00PhaseBatch {
+    pub fn written(&self) -> usize {
+        self.summaries.len() + self.details.len()
+    }
+
+    pub fn push_summary(&mut self, input: &PhaseSummaryInput) -> String {
+        let id = phase_summary_id(
+            &input.run_id,
+            input.source_phase,
+            &input.role,
+            &input.ticker,
+            &input.summary,
+        );
+        let created_at = chrono::Utc::now().timestamp();
+        let recency_weight = 1.0 + 0.15 * (input.source_phase as f64);
+        let _ = recency_weight;
+        self.summaries.push(PhaseSummaryRow {
+            id: id.clone(),
+            run_id: input.run_id.clone(),
+            source_phase: input.source_phase,
+            role: input.role.clone(),
+            ticker: input.ticker.clone(),
+            topic_id: input.topic_id.clone(),
+            summary: input.summary.clone(),
+            summary_json: input.summary_json.clone(),
+            confidence: input.confidence.clamp(0.0, 1.0),
+            created_at,
+        });
+        id
+    }
+
+    pub fn push_detail(&mut self, input: &PhaseSummaryDetailInput) -> String {
+        let id = phase_detail_id(&input.summary_id, input.sort_order, &input.detail);
+        let created_at = chrono::Utc::now().timestamp();
+        self.details.push(PhaseSummaryDetailRow {
+            id: id.clone(),
+            summary_id: input.summary_id.clone(),
+            run_id: input.run_id.clone(),
+            source_phase: input.source_phase,
+            detail: input.detail.clone(),
+            detail_json: input.detail_json.clone(),
+            source_ref: input.source_ref.clone(),
+            sort_order: input.sort_order,
+            created_at,
+        });
+        id
+    }
+
+    /// Debug / prompt snapshot for one phase (no DB).
+    pub fn debug_snapshot(&self) -> Value {
+        let written = self.written();
+        let summary_items: Vec<Value> = self
+            .summaries
+            .iter()
+            .map(|row| summary_row_to_value(row))
+            .collect();
+        let detail_items: Vec<Value> = self
+            .details
+            .iter()
+            .map(|row| detail_row_to_value(row))
+            .collect();
+        json!({
+            "role": "compressor",
+            "kind": "phase_compress",
+            "source_phase": self.source_phase,
+            "written": written,
+            "status": "done",
+            "summaries": summary_items,
+            "details": detail_items,
+            "attention": [],
+            "summary_count": self.summaries.len(),
+            "detail_count": self.details.len(),
+            "attention_count": 0,
+            "persisted": false,
+            "note": "In-memory phase00 batch; SQLite flush happens at run end."
+        })
+    }
+}
+
+/// Run-scoped phase00 memory index (authoritative during the run).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Phase00MemoryIndex {
+    pub run_id: String,
+    pub phases: BTreeMap<i64, Phase00PhaseBatch>,
+}
+
+impl Phase00MemoryIndex {
+    pub fn new(run_id: impl Into<String>) -> Self {
+        Self {
+            run_id: run_id.into(),
+            phases: BTreeMap::new(),
+        }
+    }
+
+    pub fn from_state_value(value: &Value) -> Self {
+        serde_json::from_value(value.clone()).unwrap_or_default()
+    }
+
+    pub fn to_state_value(&self) -> Value {
+        serde_json::to_value(self).unwrap_or(json!({}))
+    }
+
+    pub fn merge(&mut self, batch: Phase00PhaseBatch) {
+        if self.run_id.is_empty() {
+            if let Some(first) = batch.summaries.first() {
+                self.run_id = first.run_id.clone();
+            }
+        }
+        self.phases.insert(batch.source_phase, batch);
+    }
+
+    pub fn list_summaries(
+        &self,
+        max_source_phase: Option<i64>,
+        ticker: Option<&str>,
+    ) -> Value {
+        let mut items = Vec::new();
+        for (phase, batch) in &self.phases {
+            if max_source_phase.is_some_and(|max| *phase > max) {
+                continue;
+            }
+            for row in &batch.summaries {
+                if let Some(t) = ticker.filter(|t| !t.is_empty()) {
+                    if row.ticker != t && row.ticker != "" && row.ticker != "__ALL__" {
+                        continue;
+                    }
+                }
+                items.push(summary_row_to_value(row));
+            }
+        }
+        json!({
+            "query": "phase_summaries",
+            "item_count": items.len(),
+            "items": items,
+            "source": "phase00_memory",
+            "note": "Newer source_phase has higher recency_weight; prefer recent summaries. Runtime reads memory until run-end SQLite flush."
+        })
+    }
+
+    pub fn list_details(&self, summary_id: &str) -> Value {
+        let mut items = Vec::new();
+        for batch in self.phases.values() {
+            for row in &batch.details {
+                if row.summary_id == summary_id {
+                    items.push(detail_row_to_value(row));
+                }
+            }
+        }
+        items.sort_by_key(|item| {
+            item.get("sort_order")
+                .and_then(Value::as_i64)
+                .unwrap_or(0)
+        });
+        json!({
+            "query": "phase_summary_details",
+            "summary_id": summary_id,
+            "item_count": items.len(),
+            "items": items,
+            "source": "phase00_memory"
+        })
+    }
+
+    pub fn expand_summary(&self, id: &str) -> Option<Value> {
+        for batch in self.phases.values() {
+            if let Some(row) = batch.summaries.iter().find(|r| r.id == id) {
+                let mut v = summary_row_to_value(row);
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert("subject_kind".into(), json!("summary"));
+                    obj.insert("subject_id".into(), json!(id));
+                }
+                return Some(v);
+            }
+        }
+        None
+    }
+
+    pub fn expand_detail(&self, id: &str) -> Option<Value> {
+        for batch in self.phases.values() {
+            if let Some(row) = batch.details.iter().find(|r| r.id == id) {
+                let mut v = detail_row_to_value(row);
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert("subject_kind".into(), json!("detail"));
+                    obj.insert("subject_id".into(), json!(id));
+                }
+                return Some(v);
+            }
+        }
+        None
+    }
+
+    /// Persist all phases to SQLite (idempotent clear + upsert per phase).
+    pub fn flush(&self, conn: &Connection) -> Result<usize> {
+        let mut total = 0usize;
+        for batch in self.phases.values() {
+            clear_phase_compress(conn, &self.run_id, batch.source_phase)?;
+            for row in &batch.summaries {
+                upsert_phase_summary(
+                    conn,
+                    &PhaseSummaryInput {
+                        run_id: row.run_id.clone(),
+                        source_phase: row.source_phase,
+                        role: row.role.clone(),
+                        ticker: row.ticker.clone(),
+                        topic_id: row.topic_id.clone(),
+                        summary: row.summary.clone(),
+                        summary_json: row.summary_json.clone(),
+                        confidence: row.confidence,
+                    },
+                )?;
+                total += 1;
+            }
+            for row in &batch.details {
+                upsert_phase_summary_detail(
+                    conn,
+                    &PhaseSummaryDetailInput {
+                        summary_id: row.summary_id.clone(),
+                        run_id: row.run_id.clone(),
+                        source_phase: row.source_phase,
+                        detail: row.detail.clone(),
+                        detail_json: row.detail_json.clone(),
+                        source_ref: row.source_ref.clone(),
+                        sort_order: row.sort_order,
+                    },
+                )?;
+                total += 1;
+            }
+        }
+        Ok(total)
+    }
+}
+
+fn summary_row_to_value(row: &PhaseSummaryRow) -> Value {
+    let recency_weight = 1.0 + 0.15 * (row.source_phase as f64);
+    json!({
+        "id": row.id,
+        "run_id": row.run_id,
+        "source_phase": row.source_phase,
+        "role": row.role,
+        "ticker": row.ticker,
+        "topic_id": row.topic_id,
+        "summary": row.summary,
+        "summary_json": row.summary_json,
+        "confidence": row.confidence,
+        "created_at": row.created_at,
+        "recency_weight": recency_weight,
+    })
+}
+
+fn detail_row_to_value(row: &PhaseSummaryDetailRow) -> Value {
+    json!({
+        "id": row.id,
+        "summary_id": row.summary_id,
+        "run_id": row.run_id,
+        "source_phase": row.source_phase,
+        "detail": row.detail,
+        "detail_json": row.detail_json,
+        "source_ref": row.source_ref,
+        "sort_order": row.sort_order,
+        "created_at": row.created_at,
+    })
 }
 
 pub fn upsert_phase_summary(conn: &Connection, input: &PhaseSummaryInput) -> Result<String> {

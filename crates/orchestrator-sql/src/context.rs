@@ -3,8 +3,11 @@ use crate::{
     outcome::track_record,
     AGGREGATE_TICKER,
 };
-use anyhow::Result;
-use orchestrator_core::{MarketRegime, RetrievalBudget};
+use anyhow::{Context, Result};
+use orchestrator_core::{
+    default_technical_csv_dir, read_technical_csv, storage_interval, technical_csv_path,
+    MarketRegime, RetrievalBudget,
+};
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -952,18 +955,19 @@ fn jin10_context(conn: &Connection) -> Result<Value> {
     }))
 }
 
-fn technical_context(conn: &Connection, tickers: &[String], ticker: Option<&str>) -> Result<Value> {
+fn technical_context(_conn: &Connection, tickers: &[String], ticker: Option<&str>) -> Result<Value> {
     let tickers = effective_technical_tickers(tickers, ticker);
     Ok(json!({
         "query": "get-technical-context",
-        "daily": technical_snapshots(conn, "daily", &tickers)?,
-        "three_hour": technical_snapshots(conn, "3h", &tickers)?,
-        "twenty_minute": technical_snapshots(conn, "20min", &tickers)?
+        "source": "technical_csv",
+        "csv_dir": default_technical_csv_dir().display().to_string(),
+        "note": "Full CSV bodies under files[].csv (same as prompt <file id: qqq_day.csv>). No YahooTechnical snapshot table.",
+        "files": technical_csv_files(&["daily", "3h", "20min"], &tickers)?,
     }))
 }
 
 fn technical_interval_context(
-    conn: &Connection,
+    _conn: &Connection,
     interval: &str,
     tickers: &[String],
     ticker: Option<&str>,
@@ -971,8 +975,96 @@ fn technical_interval_context(
     let tickers = effective_technical_tickers(tickers, ticker);
     Ok(json!({
         "query": interval,
-        "items": technical_snapshots(conn, interval, &tickers)?
+        "source": "technical_csv",
+        "files": technical_csv_files(&[interval], &tickers)?
     }))
+}
+
+fn technical_csv_files(intervals: &[&str], tickers: &[String]) -> Result<Vec<Value>> {
+    let dir = default_technical_csv_dir();
+    let resolved = if tickers.is_empty() {
+        let mut found = Vec::new();
+        for interval in intervals {
+            for ticker in discover_technical_tickers_from_csv(&dir, interval, 6) {
+                if !found.iter().any(|t: &String| t == &ticker) {
+                    found.push(ticker);
+                }
+            }
+        }
+        found
+    } else {
+        tickers.to_vec()
+    };
+    let mut files = Vec::new();
+    for ticker in &resolved {
+        for interval in intervals {
+            if let Some(file) = technical_csv_file_for_ticker(&dir, interval, ticker)? {
+                files.push(file);
+            }
+        }
+    }
+    Ok(files)
+}
+
+fn discover_technical_tickers_from_csv(
+    dir: &std::path::Path,
+    interval: &str,
+    limit: usize,
+) -> Vec<String> {
+    let label = match interval {
+        "daily" | "1d" | "day" => "day",
+        "3h" => "3h",
+        "20min" => "20min",
+        other => other,
+    };
+    let suffix = format!("_{label}.csv");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut tickers = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            if !name.ends_with(&suffix) {
+                return None;
+            }
+            Some(name.trim_end_matches(&suffix).to_ascii_uppercase())
+        })
+        .collect::<Vec<_>>();
+    tickers.sort();
+    tickers.dedup();
+    tickers.truncate(limit);
+    tickers
+}
+
+fn technical_csv_file_for_ticker(
+    dir: &std::path::Path,
+    interval: &str,
+    ticker: &str,
+) -> Result<Option<Value>> {
+    let Some(path) = technical_csv_path(dir, ticker, interval) else {
+        return Ok(None);
+    };
+    if !path.exists() {
+        return Ok(None);
+    }
+    let rows = read_technical_csv(&path)?;
+    let csv = std::fs::read_to_string(&path)
+        .with_context(|| format!("failed to read technical csv {}", path.display()))?;
+    let name = path
+        .file_name()
+        .and_then(|v| v.to_str())
+        .unwrap_or("technical.csv");
+    Ok(Some(json!({
+        "ticker": ticker.to_ascii_uppercase(),
+        "interval": storage_interval(interval).unwrap_or(interval),
+        "path": path.display().to_string(),
+        "file_id": name,
+        "bars": rows.len(),
+        "first_date": rows.first().map(|r| r.date.as_str()).unwrap_or(""),
+        "last_date": rows.last().map(|r| r.date.as_str()).unwrap_or(""),
+        "csv": csv,
+    })))
 }
 
 fn effective_technical_tickers(tickers: &[String], ticker: Option<&str>) -> Vec<String> {

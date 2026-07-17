@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use chrono::{Datelike, Duration, NaiveDate, Utc, Weekday};
 use clap::Args;
-use orchestrator_core::{config_int, config_str, config_strings, parse_tickers};
+use orchestrator_core::{config_int, config_str, config_strings, parse_tickers, default_technical_csv_dir, technical_csv_path, write_technical_csv, TechnicalCsvRow, DEFAULT_TECHNICAL_BARS};
 use orchestrator_sql::{connect, ensure_schema};
 use reqwest::header;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -243,7 +243,27 @@ pub async fn run(args: TechnicalArgs) -> Result<Value> {
                 }
             };
             let rows = feature_rows(interval, &bars);
+            let mut rows = rows;
+            let keep = DEFAULT_TECHNICAL_BARS;
+            if rows.len() > keep {
+                rows = rows.split_off(rows.len() - keep);
+            }
             let inserted = insert_feature_rows(&conn, &args.model, &rows, imported_at)?;
+            if let Some(csv_path) = technical_csv_path(&default_technical_csv_dir(), symbol, interval) {
+                let csv_rows: Vec<TechnicalCsvRow> = rows
+                    .iter()
+                    .map(|row| TechnicalCsvRow {
+                        date: row.date.clone(),
+                        values: row
+                            .features
+                            .iter()
+                            .filter_map(|(k, v)| v.filter(|v| v.is_finite()).map(|v| (k.clone(), v)))
+                            .collect(),
+                    })
+                    .filter(|row| !row.values.is_empty())
+                    .collect();
+                let _ = write_technical_csv(&csv_path, &csv_rows);
+            }
             results.push(json!({
                 "symbol": symbol,
                 "interval": interval,
@@ -259,6 +279,8 @@ pub async fn run(args: TechnicalArgs) -> Result<Value> {
         "model": args.model,
         "start": args.start.to_string(),
         "end": args.end.to_string(),
+        "output_dir": default_technical_csv_dir().display().to_string(),
+        "bars": DEFAULT_TECHNICAL_BARS,
         "symbols": args.symbols,
         "intervals": args.intervals,
         "results": results

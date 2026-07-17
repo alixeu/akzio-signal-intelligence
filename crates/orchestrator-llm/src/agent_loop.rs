@@ -4008,7 +4008,8 @@ mod tests {
                 run_dir: None,
                 run_id: None,
                 tickers: Vec::new(),
-            },
+            phase00_index: None,
+        },
             vec![tools::READ_RUN_CONTEXT_TOOL_NAME.to_string()],
         );
 
@@ -4033,7 +4034,8 @@ mod tests {
                 run_dir: None,
                 run_id: None,
                 tickers: Vec::new(),
-            },
+            phase00_index: None,
+        },
             Vec::new(),
         );
 
@@ -4530,7 +4532,8 @@ mod tests {
                 run_dir: None,
                 run_id: None,
                 tickers: vec!["TQQQ".to_string()],
-            },
+            phase00_index: None,
+        },
             vec![tools::WEB_RUN_TOOL_NAME.to_string()],
         )
         .with_web_run_runtime(tools::WebRunRuntime::new(config).with_provider(Arc::new(provider)));

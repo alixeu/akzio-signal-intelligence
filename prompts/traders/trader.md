@@ -31,8 +31,20 @@
 4. `rationale` 必须说明动作如何来自 research_plan，包含最强支持因素、最强反对因素、以及为什么不是更激进或更保守。
 5. 不输出订单类型、杠杆倍数、日内交易指令或未在 schema 中定义的字段。
 
-输出受运行时 TradeIntent schema 与 validator 约束。只返回顶层 TradeIntent JSON，不要使用 Markdown 代码块或额外 envelope；`Hold` 必须使用 `position_size="0%"`。
+## 运行时硬契约（违反 → 产物被拒绝/降级）
+- 顶层单一 JSON 对象（TradeIntent）；禁止 Markdown 围栏；禁止外层 envelope。
+- 二选一结构：顶层 `action` **或** `per_ticker.<TICKER>` 下的 action 条目。
+- 每条 intent 必须含：
+  - `action`：`Buy` | `Sell` | `Hold`（字面量）
+  - `position_size`：百分比或区间字符串（如 `"0%"` / `"10%-20%"`）
+  - `rationale`：非空字符串
+- `Hold` 必须使用 `position_size="0%"`（上限必须为 0）。
+- `entry_price` / `stop_loss`：字符串或 `null`；缺明确数值时必须为 `null`，不得臆造精确价。
 
 <!-- DYNAMIC SUFFIX (changes every call) -->
 研究计划：
+## Phase00 上游总结（唯一市场结论入口；禁止重新分析）
+{phase00_context}
+
+## 兼容字段（若 phase00 缺失时可参考 compact；优先 phase00）
 {research_plan}

@@ -109,8 +109,8 @@ fn compact_phase1_ticker(value: &Value) -> Value {
         .flatten()
         .map(compact_role_summary)
         .collect::<Vec<_>>();
+    // No weighted_probability_base here — weighting is phase 2/3, not phase1 index.
     json!({
-        "weighted_probability_base": value.get("weighted_probability_base").cloned().unwrap_or(Value::Null),
         "evidence_quality": value.get("evidence_quality").cloned().unwrap_or(Value::Null),
         "role_summaries": role_summaries,
         "cross_analyst_conflicts": value.get("cross_analyst_conflicts").cloned().unwrap_or_else(|| json!([])),
@@ -134,19 +134,32 @@ fn compact_phase1_per_ticker(phase1: &Value) -> Value {
     )
 }
 
-/// Compact Phase 1.5 reducer output used as the sole forked context for Phase 2
-/// topic generation and bull/bear debate (not raw jin10/technical rows).
-fn phase15_fork(state: &Value) -> Value {
+/// Phase 1 materialised index fork for Phase 2/3 prompts.
+fn phase1_index_fork(state: &Value) -> Value {
+    let from_index = state
+        .get("phase00_tables")
+        .and_then(|tables| tables.get("1"))
+        .filter(|value| !value.is_null());
     let phase1 = state
-        .get("phase1_state_artifact")
+        .get("phase1_index")
         .cloned()
         .unwrap_or(Value::Null);
+    let source = if phase1.get("status").is_some() {
+        "phase1_index"
+    } else if from_index.is_some() {
+        "phase00_tables.1"
+    } else {
+        "missing"
+    };
     json!({
-        "source": "phase1.5",
+        "source": source,
         "artifact_type": phase1.get("artifact_type").cloned().unwrap_or(Value::Null),
         "status": phase1.get("status").cloned().unwrap_or(Value::Null),
         "evidence_quality": phase1.get("evidence_quality").cloned().unwrap_or(Value::Null),
-        "weighted_probability_base": phase1.get("weighted_probability_base").cloned().unwrap_or(Value::Null),
+        "weighted_probability_base": state
+            .get("weighted_probability_base")
+            .cloned()
+            .unwrap_or(Value::Null),
         "topic_candidates": phase1.get("topic_candidates").cloned().unwrap_or_else(|| json!([])),
         "cross_analyst_conflicts_summary": phase1
             .get("cross_analyst_conflicts_summary")
@@ -154,18 +167,21 @@ fn phase15_fork(state: &Value) -> Value {
             .unwrap_or_else(|| json!([])),
         "per_ticker": compact_phase1_per_ticker(&phase1),
         "brief_md": state.get("phase1_brief_md").cloned().unwrap_or(Value::Null),
-        "reducer_checks": phase1.get("reducer_checks").cloned().unwrap_or_else(|| json!({})),
-        "note": "Forked Phase 1.5 summary only. Do not invent external facts or re-fetch raw jin10/technical."
+        "index_checks": phase1
+            .get("index_checks")
+            .or_else(|| phase1.get("reducer_checks"))
+            .cloned()
+            .unwrap_or_else(|| json!({})),
+        "phase00_table": from_index.cloned().unwrap_or(Value::Null),
+        "note": "Phase 1 index organizes evidence only. weighted_probability_base is filled at phase 2/3."
     })
 }
 
 /// Prior phase compressor summaries for any downstream role.
-/// Newer `source_phase` gets higher `recency_weight` (attention prior).
 fn prior_phase_summaries(state: &Value, current_phase: i64) -> Value {
     let compress = state.get("phase_compress").cloned().unwrap_or(Value::Null);
-    let phase1 = phase15_fork(state);
+    let phase1 = phase1_index_fork(state);
     let mut phases = Vec::new();
-    // Always include phase1 fork when available.
     if phase1.get("status").is_some() || phase1.get("brief_md").is_some() {
         phases.push(json!({
             "source_phase": 1,
@@ -197,22 +213,34 @@ fn prior_phase_summaries(state: &Value, current_phase: i64) -> Value {
 
 fn phase3_context(state: &Value) -> Value {
     let phase1 = state
-        .get("phase1_state_artifact")
+        .get("phase1_index")
         .cloned()
         .unwrap_or(Value::Null);
     let debate = state
         .get("debate_state_artifact")
         .cloned()
         .unwrap_or(Value::Null);
+    let phase00_tables = state
+        .get("phase00_tables")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
 
     json!({
         "phase1": {
             "status": phase1.get("status").cloned().unwrap_or(Value::Null),
             "evidence_quality": phase1.get("evidence_quality").cloned().unwrap_or(Value::Null),
-            "weighted_probability_base": phase1.get("weighted_probability_base").cloned().unwrap_or(Value::Null),
             "per_ticker": compact_phase1_per_ticker(&phase1),
-            "reducer_checks": phase1.get("reducer_checks").cloned().unwrap_or_else(|| json!({}))
+            "index_checks": phase1
+                .get("index_checks")
+                .or_else(|| phase1.get("reducer_checks"))
+                .cloned()
+                .unwrap_or_else(|| json!({}))
         },
+        "weighted_probability_base": state
+            .get("weighted_probability_base")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "analyst_weights": state.get("analyst_weights").cloned().unwrap_or(Value::Null),
         "phase2_5": {
             "status": debate.get("status").cloned().unwrap_or(Value::Null),
             "convergence_status": debate.get("convergence_status").cloned().unwrap_or(Value::Null),
@@ -221,6 +249,7 @@ fn phase3_context(state: &Value) -> Value {
             "per_ticker": debate.get("per_ticker").cloned().unwrap_or_else(|| json!({})),
             "reducer_checks": debate.get("reducer_checks").cloned().unwrap_or_else(|| json!({}))
         },
+        "phase00_tables": phase00_tables,
         "prior_memory": state.get("prior_memory").cloned().unwrap_or(Value::Null),
         "track_record": state.get("track_record").cloned().unwrap_or(Value::Null),
         "agent_accuracy": state.get("agent_accuracy").cloned().unwrap_or(Value::Null)
@@ -325,7 +354,7 @@ fn risk_context(state: &Value) -> Value {
         "research_plan": compact_research_plan(state),
         "trader_plan": compact_trader_plan(state),
         "phase1_evidence_quality": state
-            .get("phase1_state_artifact")
+            .get("phase1_index")
             .and_then(|value| value.get("evidence_quality"))
             .cloned()
             .unwrap_or(Value::Null),
@@ -505,7 +534,17 @@ pub(crate) fn render_prompt_with_plugins(
         "risk_context": serde_json::to_string_pretty(&risk_context(state))?,
         "portfolio_context": serde_json::to_string_pretty(&portfolio_context(state))?,
         "phase3_context": serde_json::to_string_pretty(&phase3_context(state))?,
-        "phase15_fork": serde_json::to_string_pretty(&phase15_fork(state))?,
+        "phase1_index": serde_json::to_string_pretty(&phase1_index_fork(state))?,
+        // Alias for newer prompts / phase00-era templates.
+        "phase1_index": serde_json::to_string_pretty(&phase1_index_fork(state))?,
+        "phase00_context": serde_json::to_string_pretty(&state.get("phase00_tables").cloned().unwrap_or(serde_json::json!({})))?,
+        "common_ground": serde_json::to_string_pretty(
+            &state
+                .get("common_ground")
+                .or_else(|| state.get("topic_generation_artifact").and_then(|a| a.get("common_ground")))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+        )?,
         "prior_phase_summaries": serde_json::to_string_pretty(&prior_phase_summaries(state, phase))?,
     });
     let mut values = static_values;
@@ -943,7 +982,7 @@ required_variables = ["ticker", "tickers"]
         "{portfolio_context}",
         "{allocation_context}",
         "{phase3_context}",
-        "{phase15_fork}",
+        "{phase1_index}",
         "{prior_phase_summaries}",
     ];
 
@@ -971,7 +1010,7 @@ required_variables = ["ticker", "tickers"]
     #[test]
     fn phase3_context_preserves_canonical_inputs_without_turn_history() {
         let context = phase3_context(&json!({
-            "phase1_state_artifact": {
+            "phase1_index": {
                 "status": "insufficient",
                 "weighted_probability_base": {"QQQ": {"long_probability": 0.5}},
                 "per_ticker": {"QQQ": {
@@ -1149,33 +1188,33 @@ required_variables = ["ticker", "tickers"]
             ("analyst.x", "analysts/x.md", "artifact"),
             (
                 "researcher.bull.initial",
-                "researchers/bull_initial.md",
+                "researchers/bull.md",
                 "bull_seed",
             ),
             (
                 "researcher.bear.initial",
-                "researchers/bear_initial.md",
+                "researchers/bear.md",
                 "bear_seed",
             ),
             (
                 "researcher.bull.interaction",
-                "researchers/bull_interaction.md",
+                "researchers/bull.md",
                 "bull_packet",
             ),
             (
                 "researcher.bear.interaction",
-                "researchers/bear_interaction.md",
+                "researchers/bear.md",
                 "bear_packet",
             ),
             (
-                "researcher.bull.initial",
-                "researchers/bull_initial_monitor.md",
-                "bull_seed",
+                "researcher.bull.warmup",
+                "researchers/bull.md",
+                "warmup_ack",
             ),
             (
-                "researcher.bear.initial",
-                "researchers/bear_initial_monitor.md",
-                "bear_seed",
+                "researcher.bear.warmup",
+                "researchers/bear.md",
+                "warmup_ack",
             ),
             (
                 "mediator.topic",

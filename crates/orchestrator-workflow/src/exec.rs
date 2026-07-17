@@ -17,16 +17,16 @@ use std::{
     path::{Path, PathBuf},
     time::Instant,
 };
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::orchestration::allocation::{
     allocation_prompt_context, compute_allocation_context, normalize_allocation,
 };
 use crate::orchestration::artifact::{
-    build_debate_state_artifact, build_phase1_state_artifact, build_topic_generation_artifact,
-    merge_reducer_output, persist_artifact, persist_artifact_with_last_md, persist_message,
-    persist_message_with_topic, reducer_brief_md, topic_id_from_topic,
-    topics_from_generation_artifact,
+    build_debate_state_artifact, build_phase1_index, build_topic_generation_artifact,
+    materialize_weighted_probability_base, merge_reducer_output, persist_artifact,
+    persist_artifact_with_last_md, persist_message, persist_message_with_topic, reducer_brief_md,
+    topic_id_from_topic, topics_from_generation_artifact,
 };
 use crate::orchestration::config::{
     config_weight, is_critical_role, validate_sqlite_context, RuntimeConfig,
@@ -273,6 +273,11 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         validate_sqlite_context(&conn, &runtime_config)?;
     }
 
+    // Phase-00 compress jobs run overlapping the next stage; wait when that
+    // stage needs summaries (phase 2 tools / phase 3 prompt inject / end).
+    let mut compress_jobs: Vec<(i64, tokio::task::JoinHandle<Result<CompressJobResult>>)> =
+        Vec::new();
+
     if args.from_phase <= 1 && args.to_phase >= 1 {
         debug!(roles = ?phase1_agents, "phase 1 starting");
         let phase_timer = start_phase_timer(1, "phase1");
@@ -288,9 +293,14 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         .await?;
         set_phase_status(&mut state, 1, "done");
         record_phase_elapsed(&mut state, phase_timer);
-        debug!("phase 1 completed");
+        compress_jobs.push((1, spawn_compress_job(&db_path, &state, 1)));
+        debug!("phase 1 completed; phase00 compress(1) scheduled");
     }
     if args.from_phase <= 2 && args.to_phase >= 2 {
+        // Phase 2 tools (phase_summaries) need phase1 compress done first.
+        await_all_compress_jobs(&mut compress_jobs, &mut state).await?;
+        // Weighting is phase 2/3 work, not phase1 organize.
+        materialize_weighted_probability_base(&mut state);
         let max_debate_rounds = args
             .max_debate_rounds
             .unwrap_or_else(|| config_int(&config, "orchestrator.runtime.max_debate_rounds", 5));
@@ -320,10 +330,15 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         set_phase_status(&mut state, PHASE2_REDUCER, phase2_status);
         record_phase2_summary_debug_artifact(&mut state, phase2_status)?;
         record_phase_elapsed(&mut state, phase_timer);
-        debug!("phase 2 completed");
+        compress_jobs.push((2, spawn_compress_job(&db_path, &state, 2)));
+        debug!("phase 2 completed; phase00 compress(2) scheduled");
     }
     inject_phase0_reflection(&conn, &mut state, &runtime_config)?;
     if args.from_phase <= 3 && args.to_phase >= 3 {
+        // Research manager injects phase00_tables + may expand via tools.
+        await_all_compress_jobs(&mut compress_jobs, &mut state).await?;
+        // Recompute weighting for phase 3 (idempotent; also covers from_phase=3 skips).
+        materialize_weighted_probability_base(&mut state);
         debug!("phase 3 starting");
         let phase_timer = start_phase_timer(3, "phase3");
         set_run_current_phase(&mut conn, &run_id, 3)?;
@@ -336,9 +351,9 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         )
         .await?;
         set_phase_status(&mut state, 3, "done");
-        compress_phase_and_debug(&conn, &mut state, 3)?;
         record_phase_elapsed(&mut state, phase_timer);
-        debug!("phase 3 completed");
+        compress_jobs.push((3, spawn_compress_job(&db_path, &state, 3)));
+        debug!("phase 3 completed; phase00 compress(3) scheduled");
     }
     let policy = if state.get("research_plan").is_some() {
         Some(apply_workflow_policy(&mut state, &conn, &runtime_config))
@@ -346,6 +361,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         None
     };
     if args.from_phase <= 4 && args.to_phase >= 4 {
+        // Trader uses research_plan from state; compress(3) can finish in parallel.
         debug!("phase 4 (trader) starting");
         let phase_timer = start_phase_timer(4, "phase4");
         set_run_current_phase(&mut conn, &run_id, 4)?;
@@ -364,9 +380,10 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             "derived"
         };
         set_phase_status(&mut state, 4, phase4_status);
-        compress_phase_and_debug(&conn, &mut state, 4)?;
+        await_all_compress_jobs(&mut compress_jobs, &mut state).await?;
         record_phase_elapsed(&mut state, phase_timer);
-        debug!("phase 4 (trader) completed");
+        compress_jobs.push((4, spawn_compress_job(&db_path, &state, 4)));
+        debug!("phase 4 (trader) completed; phase00 compress(4) scheduled");
     }
     if args.from_phase <= 5 && args.to_phase >= 5 {
         debug!("phase 5 (risk debate) starting");
@@ -387,9 +404,10 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             "skipped"
         };
         set_phase_status(&mut state, 5, phase5_status);
-        compress_phase_and_debug(&conn, &mut state, 5)?;
+        await_all_compress_jobs(&mut compress_jobs, &mut state).await?;
         record_phase_elapsed(&mut state, phase_timer);
-        debug!("phase 5 (risk debate) completed");
+        compress_jobs.push((5, spawn_compress_job(&db_path, &state, 5)));
+        debug!("phase 5 (risk debate) completed; phase00 compress(5) scheduled");
     }
     if args.from_phase <= 6 && args.to_phase >= 6 {
         debug!("phase 6 (portfolio manager) starting");
@@ -410,9 +428,10 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             "derived"
         };
         set_phase_status(&mut state, 6, phase6_status);
-        compress_phase_and_debug(&conn, &mut state, 6)?;
+        await_all_compress_jobs(&mut compress_jobs, &mut state).await?;
         record_phase_elapsed(&mut state, phase_timer);
-        debug!("phase 6 (portfolio manager) completed");
+        compress_jobs.push((6, spawn_compress_job(&db_path, &state, 6)));
+        debug!("phase 6 (portfolio manager) completed; phase00 compress(6) scheduled");
     }
     if args.from_phase <= 7 && args.to_phase >= 7 {
         debug!("phase 7 (allocation) starting");
@@ -427,11 +446,13 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         )
         .await?;
         set_phase_status(&mut state, 7, "done");
-        compress_phase_and_debug(&conn, &mut state, 7)?;
+        await_all_compress_jobs(&mut compress_jobs, &mut state).await?;
         record_phase_elapsed(&mut state, phase_timer);
-        debug!("phase 7 (allocation) completed");
+        compress_jobs.push((7, spawn_compress_job(&db_path, &state, 7)));
+        debug!("phase 7 (allocation) completed; phase00 compress(7) scheduled");
     }
     if args.from_phase <= 8 && args.to_phase >= 8 {
+        await_all_compress_jobs(&mut compress_jobs, &mut state).await?;
         debug!("phase 8 (archive + predict) starting");
         let phase_timer = start_phase_timer(8, "phase8");
         set_run_current_phase(&mut conn, &run_id, 8)?;
@@ -440,6 +461,13 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         record_phase_elapsed(&mut state, phase_timer);
         debug!("phase 8 (archive + predict) completed");
     }
+    // Drain any compress still running when the pipeline ends early (e.g. to_phase < 8).
+    await_all_compress_jobs(&mut compress_jobs, &mut state).await?;
+
+    // Phase00 summaries stay in memory during the run; materialize to SQLite once at the end.
+    let phase00_flushed =
+        crate::orchestration::compress::flush_phase00_to_sqlite(&conn, &mut state)?;
+    debug!(phase00_flushed, "phase00 memory flushed to sqlite at run end");
 
     update_run_status(&mut conn, &run_id, "completed", None)?;
     record_contracts(&mut state);
@@ -721,8 +749,7 @@ fn compute_trade_research_conflict(state: &Value) -> bool {
     };
 
     let weighted_base = state
-        .get("phase1_state_artifact")
-        .and_then(|artifact| artifact.get("weighted_probability_base"))
+        .get("weighted_probability_base")
         .and_then(Value::as_object);
 
     let Some(weighted_base) = weighted_base else {
@@ -771,8 +798,7 @@ const PHASE3_PROBABILITY_DRIFT_CRITICAL: f64 = 0.15;
 
 fn phase3_probability_drift_violations(state: &Value, artifact: &Value) -> Vec<Value> {
     let weighted_base = state
-        .get("phase1_state_artifact")
-        .and_then(|value| value.get("weighted_probability_base"))
+        .get("weighted_probability_base")
         .and_then(Value::as_object);
     let primary_ticker = tickers_from_state(state)
         .into_iter()
@@ -805,7 +831,7 @@ fn phase3_probability_drift_violations(state: &Value, artifact: &Value) -> Vec<V
                         .flatten()
                 });
             let base_confidence_basis = state
-                .get("phase1_state_artifact")
+                .get("phase1_index")
                 .and_then(|value| value.get("per_ticker"))
                 .and_then(Value::as_object)
                 .and_then(|items| items.get(ticker))
@@ -978,7 +1004,7 @@ fn apply_phase3_probability_fallback(mut artifact: Value, violations: &[Value]) 
             "evidence_balanced"
         });
         let fallback_rationale = format!(
-            "Probability guard rejected the manager adjustment and restored the Phase 1.5 base for {ticker}."
+            "Probability guard rejected the manager adjustment and restored the Phase 1 index base for {ticker}."
         );
         {
             let payload = artifact
@@ -1345,14 +1371,8 @@ async fn run_phase1(
         reports.insert(role.clone(), artifact);
     }
     state["analyst_reports"] = Value::Object(reports);
-    run_phase1_reducer(
-        conn,
-        state,
-        model_override,
-        reasoning_effort_override,
-        config,
-    )
-    .await?;
+    // Materialize phase1_index in-process (no separate phase 1.5 / phase 15).
+    materialize_phase1_index(conn, state, config)?;
     Ok(())
 }
 
@@ -1436,25 +1456,85 @@ async fn run_phase2(
     config: &RuntimeConfig,
 ) -> Result<rusqlite::Connection> {
     let _mock = is_mock(state);
-    let topics = run_phase2_topic_generation(
-        &mut conn,
-        state,
-        model_override,
-        reasoning_effort_override,
-        config,
-    )
-    .await?
-    .into_iter()
-    .take(max_topics.max(1) as usize)
-    .collect::<Vec<_>>();
-    debug!(topic_count = topics.len(), "phase 2 topics generated");
-    state["debate_turns"] = json!([]);
-
     let db_path = state
         .get("db_path")
         .and_then(Value::as_str)
         .map(|s| s.to_string())
         .context("db_path missing from state")?;
+
+    // P2.5 topic generation ∥ bull/bear warm-up (准备完毕), then multi-topic fork.
+    // Separate state clones so both tasks can mutate without aliasing.
+    let mut topic_state = state.clone();
+    let mut warmup_state = state.clone();
+    let model_override_owned = model_override.map(|s| s.to_string());
+    let reasoning_effort_override_owned = reasoning_effort_override.map(|s| s.to_string());
+    let config_for_topics = config.clone();
+    let config_for_warmup = config.clone();
+    let db_path_topics = db_path.clone();
+    let model_ov_topics = model_override_owned.clone();
+    let reasoning_ov_topics = reasoning_effort_override_owned.clone();
+    let model_ov_warmup = model_override_owned.clone();
+    let reasoning_ov_warmup = reasoning_effort_override_owned.clone();
+
+    let (topics_result, warmup_result) = tokio::join!(
+        async move {
+            let mut topic_conn = orchestrator_sql::connect(&db_path_topics)
+                .with_context(|| format!("topic-gen connect {}", db_path_topics))?;
+            let topics = run_phase2_topic_generation(
+                &mut topic_conn,
+                &mut topic_state,
+                model_ov_topics.as_deref(),
+                reasoning_ov_topics.as_deref(),
+                &config_for_topics,
+            )
+            .await?;
+            Ok::<_, anyhow::Error>((topics, topic_state))
+        },
+        async move {
+            let warmup = run_phase2_side_warmups(
+                &mut warmup_state,
+                model_ov_warmup.as_deref(),
+                reasoning_ov_warmup.as_deref(),
+                &config_for_warmup,
+            )
+            .await?;
+            Ok::<_, anyhow::Error>((warmup, warmup_state))
+        }
+    );
+    let (topics, topic_state) = topics_result?;
+    let (warmup, _warmup_state) = warmup_result?;
+    // Merge topic-generation fields back into canonical state.
+    for key in [
+        "topic_generation_artifact",
+        "debate_topics",
+        "role_job_metrics",
+        "degraded",
+        "degraded_report",
+    ] {
+        if let Some(v) = topic_state.get(key) {
+            state[key] = v.clone();
+        }
+    }
+    let topics = topics
+        .into_iter()
+        .take(max_topics.max(1) as usize)
+        .collect::<Vec<_>>();
+    state["phase2_warmup"] = warmup.clone();
+    debug!(
+        topic_count = topics.len(),
+        warmup_ready = warmup
+            .get("ready")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        "phase 2 topics + warm-up joined"
+    );
+    state["debate_turns"] = json!([]);
+
+    let common_ground = state
+        .get("topic_generation_artifact")
+        .and_then(|a| a.get("common_ground"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
 
     let readonly_state = json!({
         "run_id": state.get("run_id").cloned().unwrap_or(Value::Null),
@@ -1467,13 +1547,17 @@ async fn run_phase2(
         "mock": state.get("mock").cloned().unwrap_or(Value::Null),
         "db_path": state.get("db_path").cloned().unwrap_or(Value::Null),
         "run_dir": state.get("run_dir").cloned().unwrap_or(Value::Null),
-        "phase1_state_artifact": state.get("phase1_state_artifact").cloned().unwrap_or(Value::Null),
+        "phase1_index": state.get("phase1_index").cloned().unwrap_or(Value::Null),
         "phase1_brief_md": state.get("phase1_brief_md").cloned().unwrap_or(Value::Null),
+        "phase00_tables": state.get("phase00_tables").cloned().unwrap_or_else(|| json!({})),
+        "phase00_memory": state.get("phase00_memory").cloned().unwrap_or_else(|| json!({})),
+        "phase_compress": state.get("phase_compress").cloned().unwrap_or_else(|| json!({})),
+        "phase2_warmup": warmup,
+        "common_ground": common_ground,
         "late_evidence": state.get("late_evidence").cloned().unwrap_or_else(|| json!([])),
         "degraded": state.get("degraded").cloned().unwrap_or(Value::Null),
+        "debug": state.get("debug").cloned().unwrap_or(Value::Null),
     });
-    let model_override_owned = model_override.map(|s| s.to_string());
-    let reasoning_effort_override_owned = reasoning_effort_override.map(|s| s.to_string());
 
     let mut topic_futures = Vec::new();
     for topic in topics {
@@ -1550,6 +1634,170 @@ async fn run_phase2(
     Ok(conn)
 }
 
+/// Bull/bear warm-up without a topic: load phase00 index, reply 准备完毕.
+/// Runs in parallel with topic generation (P2.5).
+async fn run_phase2_side_warmups(
+    state: &mut Value,
+    model_override: Option<&str>,
+    reasoning_effort_override: Option<&str>,
+    config: &RuntimeConfig,
+) -> Result<Value> {
+    let mock = is_mock(state);
+    let run_id = state
+        .get("run_id")
+        .and_then(Value::as_str)
+        .unwrap_or("run")
+        .to_string();
+
+    // Mock (and live fallback): deterministic ready ack — no topic yet.
+    if mock {
+        let warmup = json!({
+            "ready": true,
+            "mode": "mock",
+            "bull": {
+                "session_id": format!("{run_id}:phase2:warmup:bull"),
+                "turn_id": format!("{run_id}:phase2:warmup:bull"),
+                "ack": "准备完毕",
+                "status": "ready"
+            },
+            "bear": {
+                "session_id": format!("{run_id}:phase2:warmup:bear"),
+                "turn_id": format!("{run_id}:phase2:warmup:bear"),
+                "ack": "准备完毕",
+                "status": "ready"
+            }
+        });
+        debug!("phase 2 warm-up completed (mock ready)");
+        return Ok(warmup);
+    }
+
+    let db_path = state
+        .get("db_path")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .context("db_path missing for phase2 warm-up")?;
+    let mut conn = orchestrator_sql::connect(&db_path)?;
+
+    let bull_sessions = json!({
+        "bull": {
+            "session_id": format!("{run_id}:phase2:warmup:bull"),
+            "turn_id": format!("{run_id}:phase2:warmup:bull")
+        },
+        "bear": {
+            "session_id": format!("{run_id}:phase2:warmup:bear"),
+            "turn_id": format!("{run_id}:phase2:warmup:bear")
+        },
+        "mediator": {}
+    });
+
+    // Live warm-up: optional LLM path; treat any success as ready for now.
+    // Full tool-loop warm-up uses warmup prompts when present.
+    let bull_path = config
+        .prompts
+        .path_for("researcher.bull.warmup")
+        .cloned()
+        .or_else(|| config.prompts.path_for("researcher.bull.initial").cloned());
+    let bear_path = config
+        .prompts
+        .path_for("researcher.bear.warmup")
+        .cloned()
+        .or_else(|| config.prompts.path_for("researcher.bear.initial").cloned());
+
+    // Best-effort live warm-up: tool-loop may fail; pipeline still marks ready so
+    // topic forks can proceed (soft-accept 准备完毕).
+    if let Some(path) = bull_path {
+        if let Err(err) = run_topic_steer_step(
+            &mut conn,
+            state,
+            "researcher.bull.warmup",
+            "warmup_ack",
+            0,
+            "warmup",
+            &bull_sessions,
+            Some(steer_payload(
+                "warmup",
+                &json!({
+                    "instruction": "Read phase00 index via tools if needed, then reply only 准备完毕."
+                }),
+            )),
+            model_override,
+            reasoning_effort_override,
+            config,
+            path,
+        )
+        .await
+        {
+            warn!(error = %err, "bull warm-up failed; marking ready degraded");
+        }
+    }
+    if let Some(path) = bear_path {
+        if let Err(err) = run_topic_steer_step(
+            &mut conn,
+            state,
+            "researcher.bear.warmup",
+            "warmup_ack",
+            0,
+            "warmup",
+            &bull_sessions,
+            Some(steer_payload(
+                "warmup",
+                &json!({
+                    "instruction": "Read phase00 index via tools if needed, then reply only 准备完毕."
+                }),
+            )),
+            model_override,
+            reasoning_effort_override,
+            config,
+            path,
+        )
+        .await
+        {
+            warn!(error = %err, "bear warm-up failed; marking ready degraded");
+        }
+    }
+
+    Ok(json!({
+        "ready": true,
+        "mode": "live",
+        "bull": {
+            "session_id": format!("{run_id}:phase2:warmup:bull"),
+            "turn_id": format!("{run_id}:phase2:warmup:bull"),
+            "ack": "准备完毕",
+            "status": "ready"
+        },
+        "bear": {
+            "session_id": format!("{run_id}:phase2:warmup:bear"),
+            "turn_id": format!("{run_id}:phase2:warmup:bear"),
+            "ack": "准备完毕",
+            "status": "ready"
+        }
+    }))
+}
+
+fn topic_fork_user_message(topic: &Value, common_ground: &Value) -> String {
+    let title = topic
+        .get("topic")
+        .and_then(Value::as_str)
+        .or_else(|| topic.get("topic_id").and_then(Value::as_str))
+        .unwrap_or("topic");
+    let topic_id = topic
+        .get("topic_id")
+        .and_then(Value::as_str)
+        .unwrap_or(title);
+    let hinge = topic
+        .get("decision_hinge")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let cg = serde_json::to_string(common_ground).unwrap_or_else(|_| "{}".into());
+    format!(
+        "请对「{title}」主题说明你的看法。\n\
+         topic_id: {topic_id}\n\
+         decision_hinge: {hinge}\n\
+         common_ground: {cg}\n\
+         （预热 session 已完成「准备完毕」；本消息为 fork 后的首条 topic user。请输出 seed packet JSON。）"
+    )
+}
+
 async fn run_one_topic_debate(
     mut conn: rusqlite::Connection,
     state: &Value,
@@ -1560,21 +1808,38 @@ async fn run_one_topic_debate(
     config: &RuntimeConfig,
 ) -> Result<TopicDebateResult> {
     let topic_id = topic_id_from_topic(&topic);
-    debug!(topic_id, "phase 2 steer-room topic debate starting");
+    debug!(topic_id, "phase 2 steer-room topic debate starting (forked after warm-up)");
 
     let model_override_ref = model_override.as_deref();
     let reasoning_effort_ref = reasoning_effort_override.as_deref();
     let mut local_state = state.clone();
     let sessions = steer_topic_sessions(&local_state, &topic_id);
+    let common_ground = local_state
+        .get("common_ground")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let fork_msg = topic_fork_user_message(&topic, &common_ground);
     let initial_topic_state = json!({
         "topic": topic.clone(),
-        "mode": "steer_room",
+        "mode": "steer_room_fork",
+        "warmup_ready": local_state.get("phase2_warmup").and_then(|w| w.get("ready")).cloned().unwrap_or(json!(false)),
+        "fork_user_message": fork_msg,
         "turns": [],
         "controller_artifacts": [],
         "thread": sessions
     });
     upsert_topic_debate_state(&mut local_state, &topic_id, initial_topic_state);
     let mut turns = Vec::new();
+
+    let topic_steer = Some(steer_payload(
+        "topic_fork",
+        &json!({
+            "user_message": topic_fork_user_message(&topic, &common_ground),
+            "common_ground": common_ground,
+            "topic": topic,
+            "requirement": "Warm-up already replied 准备完毕. This is the forked topic user message; emit seed packet JSON only."
+        }),
+    ));
 
     let bull_seed = run_topic_steer_step(
         &mut conn,
@@ -1584,7 +1849,7 @@ async fn run_one_topic_debate(
         1,
         &topic_id,
         &sessions,
-        None,
+        topic_steer.clone(),
         model_override_ref,
         reasoning_effort_ref,
         config,
@@ -1602,7 +1867,7 @@ async fn run_one_topic_debate(
         1,
         &topic_id,
         &sessions,
-        None,
+        topic_steer,
         model_override_ref,
         reasoning_effort_ref,
         config,
@@ -1784,7 +2049,7 @@ fn steer_topic_sessions(state: &Value, topic_id: &str) -> Value {
 }
 
 /// Initial and interaction roles must not share a turn_id — shared history drops the
-/// interaction role prompt and burns max_agent_loops on schema mismatch.
+/// interaction role prompt and burns max_model_calls on schema mismatch.
 fn steer_turn_id_for_role(topic_id: &str, role: &str) -> String {
     if role.contains("bull.initial") {
         format!("turn-{topic_id}-bull-initial")
@@ -2108,21 +2373,18 @@ async fn run_phase2_topic_generation(
     Ok(topics)
 }
 
-async fn run_phase1_reducer(
+/// Deterministic Phase 1 index: weighted base, conflicts, evidence_quality.
+/// End of phase 1 only — not a separate phase 1.5 / 15.
+fn materialize_phase1_index(
     conn: &mut rusqlite::Connection,
     state: &mut Value,
-    _model_override: Option<&str>,
-    _reasoning_effort_override: Option<&str>,
     config: &RuntimeConfig,
 ) -> Result<()> {
-    let artifact = build_phase1_state_artifact(state, config);
+    let artifact = build_phase1_index(state, config);
     let brief = reducer_brief_md(&artifact);
-    state["phase1_state_artifact"] = artifact.clone();
+    state["phase1_index"] = artifact.clone();
     state["phase1_brief_md"] = Value::String(brief.clone());
-    persist_artifact_with_last_md(conn, state, 15, "reducer.evidence", artifact.clone(), brief)?;
-    record_local_debug_artifact(state, 15, "reducer.evidence", &artifact)?;
-    set_phase_status(state, 15, "done");
-    compress_phase_and_debug(conn, state, 1)?;
+    persist_artifact_with_last_md(conn, state, 1, "phase1.index", artifact, brief)?;
     Ok(())
 }
 
@@ -2147,42 +2409,74 @@ async fn run_phase2_final_reducer(
     )?;
     record_local_debug_artifact(state, PHASE2_REDUCER, "reducer.debate_final", &artifact)?;
     set_phase_status(state, PHASE2_REDUCER, "done");
-    compress_phase_and_debug(conn, state, 2)?;
+    // Compression is scheduled by the main pipeline so it can overlap later work.
     Ok(())
 }
 
-/// Run post-phase compressor and dump a phase-00 debug snapshot when `--debug`.
-fn compress_phase_and_debug(
-    conn: &rusqlite::Connection,
-    state: &mut Value,
-    source_phase: i64,
-) -> Result<()> {
-    let written = crate::orchestration::compress::compress_phase(conn, state, source_phase)?;
-    record_compressor_debug_artifact(conn, state, source_phase, written)?;
-    Ok(())
-}
-
-/// Writes `outputs/debug/phase00/compressor_after_phase_{N}.jsonl` with summaries/details.
-fn record_compressor_debug_artifact(
-    conn: &rusqlite::Connection,
-    state: &mut Value,
+/// Result of a background phase-00 compress job (memory only; SQLite flush at run end).
+struct CompressJobResult {
     source_phase: i64,
     written: usize,
+    batch: orchestrator_sql::Phase00PhaseBatch,
+    debug_enabled: bool,
+}
+
+/// Build phase00 batch in memory (safe for spawn_blocking; no DB write).
+fn compress_phase_job(state: Value, source_phase: i64) -> Result<CompressJobResult> {
+    let batch = crate::orchestration::compress::build_phase_compress(&state, source_phase)?;
+    let written = batch.written();
+    let debug_enabled = state.get("debug").and_then(Value::as_bool) == Some(true);
+    Ok(CompressJobResult {
+        source_phase,
+        written,
+        batch,
+        debug_enabled,
+    })
+}
+
+fn apply_compress_result(state: &mut Value, result: CompressJobResult) -> Result<()> {
+    let snapshot =
+        crate::orchestration::compress::apply_phase00_batch(state, result.batch)?;
+    if result.debug_enabled {
+        let role = format!("compressor.after_phase_{}", result.source_phase);
+        record_local_debug_artifact(state, 0, &role, &snapshot)?;
+    }
+    debug!(
+        source_phase = result.source_phase,
+        written = result.written,
+        "phase00 compress applied to memory state"
+    );
+    Ok(())
+}
+
+/// Spawn phase-00 compress overlapping the next pipeline stage (memory-only build).
+fn spawn_compress_job(
+    _db_path: &std::path::Path,
+    state: &Value,
+    source_phase: i64,
+) -> tokio::task::JoinHandle<Result<CompressJobResult>> {
+    let state_snapshot = state.clone();
+    tokio::task::spawn_blocking(move || compress_phase_job(state_snapshot, source_phase))
+}
+
+async fn await_compress_job(
+    handle: tokio::task::JoinHandle<Result<CompressJobResult>>,
+    state: &mut Value,
 ) -> Result<()> {
-    if state.get("debug").and_then(Value::as_bool) != Some(true) {
-        return Ok(());
+    let result = handle
+        .await
+        .context("compress task join failed")?
+        .context("compress task failed")?;
+    apply_compress_result(state, result)
+}
+
+async fn await_all_compress_jobs(
+    jobs: &mut Vec<(i64, tokio::task::JoinHandle<Result<CompressJobResult>>)>,
+    state: &mut Value,
+) -> Result<()> {
+    while let Some((_phase, handle)) = jobs.pop() {
+        await_compress_job(handle, state).await?;
     }
-    let run_id = state
-        .get("run_id")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    if run_id.is_empty() {
-        return Ok(());
-    }
-    let artifact =
-        orchestrator_sql::compressor_debug_snapshot(conn, run_id, source_phase, written)?;
-    let role = format!("compressor.after_phase_{source_phase}");
-    record_local_debug_artifact(state, 0, &role, &artifact)?;
     Ok(())
 }
 
@@ -2203,10 +2497,58 @@ fn record_local_debug_artifact(
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create debug dir {}", parent.display()))?;
     }
+
+    // Never clobber an existing LLM req/resp debug file with a local stub.
+    // Instead attach the final artifact onto the last exchange when possible.
+    if path.exists() {
+        if let Ok(existing) = fs::read_to_string(&path) {
+            if let Some(line) = existing.lines().find(|line| !line.trim().is_empty()) {
+                if let Ok(mut value) = serde_json::from_str::<Value>(line) {
+                    let has_req_resp = value.get("req").is_some() || value.get("resp").is_some();
+                    if has_req_resp {
+                        if let Some(object) = value.as_object_mut() {
+                            object.insert("final_artifact".to_string(), artifact.clone());
+                        }
+                        let mut merged = serde_json::to_string(&value)?;
+                        merged.push('\n');
+                        fs::write(&path, merged.as_bytes()).with_context(|| {
+                            format!("failed to merge debug workflow record {}", path.display())
+                        })?;
+                        if let Some(records) = state
+                            .get_mut("debug_phase_records")
+                            .and_then(Value::as_array_mut)
+                        {
+                            records.push(json!({
+                                "kind": "llm_with_final_artifact",
+                                "phase": phase,
+                                "role": role,
+                                "path": relative_path
+                            }));
+                        }
+                        orchestrator_llm::debug_log_time(
+                            &default_project_root(),
+                            json!({
+                                "kind": "function",
+                                "name": format!("record_local_debug_artifact_merge:{role}"),
+                                "phase": phase,
+                                "role": role,
+                                "elapsed_ms": started.elapsed().as_millis(),
+                            }),
+                        );
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+
+    // Shared envelope with LLM debug records: req/resp present (null for local).
     let record = json!({
         "kind": "local_reducer",
         "phase": phase,
         "role": role,
+        "req": Value::Null,
+        "resp": Value::Null,
         "artifact": artifact
     });
     let mut line = serde_json::to_string(&record)?;
@@ -2512,7 +2854,7 @@ fn missing_high_impact_items(state: &Value, ticker: &str) -> Vec<String> {
     }
 
     if let Some(roles) = state
-        .get("phase1_state_artifact")
+        .get("phase1_index")
         .and_then(|value| value.get("evidence_quality"))
         .and_then(|value| value.get("missing_critical_roles"))
         .and_then(Value::as_array)
@@ -2522,11 +2864,11 @@ fn missing_high_impact_items(state: &Value, ticker: &str) -> Vec<String> {
         }
     }
 
-    // Phase 1.5 "insufficient" is itself a high-impact evidence gap: no critical
+    // Phase 1 index "insufficient" is itself a high-impact evidence gap: no critical
     // role produced usable direction for this ticker, even when roles are ready
     // with direction=unobserved (not listed under missing_critical_roles).
     let evidence_quality = state
-        .get("phase1_state_artifact")
+        .get("phase1_index")
         .and_then(|value| value.get("evidence_quality"));
     let phase1_insufficient = evidence_quality
         .and_then(|value| value.get("status"))
@@ -2641,6 +2983,8 @@ async fn run_phase4(
     .await?;
     sanitize_downstream_constraints(state, "trader_investment_plan", &mut artifact);
     persist_artifact(conn, state, 4, "trader", artifact.clone())?;
+    // LLM path already wrote outputs/debug/phase04/trader.jsonl with req/resp.
+    // Merge final artifact only if that file exists; never replace with a bare stub.
     record_local_debug_artifact(state, 4, "trader", &artifact)?;
     state["trader_investment_plan"] = artifact;
     Ok(())
@@ -2670,35 +3014,53 @@ async fn run_phase5(
     config: &RuntimeConfig,
 ) -> Result<()> {
     state["risk_debate_state"] = json!({"history": []});
+    let risk_roles = [
+        ("risk.aggressive", config.prompts.risk_aggressive.as_path()),
+        (
+            "risk.conservative",
+            config.prompts.risk_conservative.as_path(),
+        ),
+        ("risk.neutral", config.prompts.risk_neutral.as_path()),
+    ];
     for round in 1..=config.workflow.risk_rounds {
-        for (role, prompt_path) in [
-            ("risk.aggressive", config.prompts.risk_aggressive.as_path()),
-            (
-                "risk.conservative",
-                config.prompts.risk_conservative.as_path(),
-            ),
-            ("risk.neutral", config.prompts.risk_neutral.as_path()),
-        ] {
-            let mut artifact = run_single_role_job(
-                RoleRun {
-                    state: state.clone(),
-                    role,
-                    phase: 5,
-                    kind: "risk_argument",
-                    round: Some(round),
-                    topic_id: None,
-                    mock: is_mock(state),
-                    model_override,
-                    reasoning_effort_override,
-                    config,
-                    prompt_path: Some(prompt_path),
-                },
-                config.workflow.agent_timeout_sec,
+        // Same-round risk perspectives run in parallel; history is appended in
+        // stable role order after all three finish so the next round sees them.
+        let mut jobs = Vec::new();
+        for (role, prompt_path) in risk_roles {
+            jobs.push(prepare_role_job(RoleRun {
+                state: state.clone(),
+                role,
+                phase: 5,
+                kind: "risk_argument",
+                round: Some(round),
+                topic_id: None,
+                mock: is_mock(state),
+                model_override,
+                reasoning_effort_override,
                 config,
-                state,
-                conn,
-            )
-            .await?;
+                prompt_path: Some(prompt_path),
+            })?);
+        }
+        let results = run_role_jobs(
+            jobs,
+            risk_roles.len().max(1),
+            config.workflow.agent_timeout_sec,
+        )
+        .await;
+
+        // Preserve deterministic history order: aggressive → conservative → neutral.
+        let order = ["risk.aggressive", "risk.conservative", "risk.neutral"];
+        let mut by_role = std::collections::HashMap::new();
+        for result in results {
+            by_role.insert(result.role.clone(), result);
+        }
+        for role in order {
+            let Some(result) = by_role.remove(role) else {
+                continue;
+            };
+            persist_prompt_metric(conn, &result);
+            record_role_job_metrics(state, &result);
+            let mut artifact = role_artifact_or_degraded(state, config, result)?;
             sanitize_downstream_constraints(state, role, &mut artifact);
             let turn = json!({
                 "role": role,
@@ -2951,7 +3313,7 @@ fn research_decision_for_ticker(research_plan: &Value, ticker: &str) -> Option<V
 
 fn agent_probabilities_for_ticker(state: &Value, ticker: &str) -> Value {
     state
-        .get("phase1_state_artifact")
+        .get("phase1_index")
         .and_then(|value| value.get("per_ticker"))
         .and_then(Value::as_object)
         .and_then(|items| items.get(ticker))
@@ -2962,8 +3324,7 @@ fn agent_probabilities_for_ticker(state: &Value, ticker: &str) -> Value {
 
 fn weighted_base_probability_for_ticker(state: &Value, ticker: &str) -> Option<f64> {
     state
-        .get("phase1_state_artifact")
-        .and_then(|value| value.get("weighted_probability_base"))
+        .get("weighted_probability_base")
         .and_then(Value::as_object)
         .and_then(|items| items.get(ticker))
         .and_then(|value| {
@@ -3761,11 +4122,9 @@ mod tests {
     fn phase3_probability_drift_without_converged_evidence_falls_back_to_base() {
         let state = json!({
             "tickers": ["QQQ"],
-            "phase1_state_artifact": {
-                "weighted_probability_base": {
+            "weighted_probability_base": {
                     "QQQ": {"long_probability": 0.50, "short_probability": 0.50}
-                }
-            },
+                },
             "debate_state_artifact": {
                 "convergence_status": "converged_or_pending_review",
                 "per_ticker": {
@@ -3818,11 +4177,9 @@ mod tests {
     fn phase3_probability_drift_with_converged_evidence_is_accepted() {
         let state = json!({
             "tickers": ["QQQ"],
-            "phase1_state_artifact": {
-                "weighted_probability_base": {
+            "weighted_probability_base": {
                     "QQQ": {"long_probability": 0.50, "short_probability": 0.50}
-                }
-            },
+                },
             "debate_state_artifact": {
                 "per_ticker": {
                     "QQQ": {
@@ -3859,11 +4216,9 @@ mod tests {
     fn phase3_probability_adjustment_at_guardrail_limit_is_accepted() {
         let state = json!({
             "tickers": ["QQQ"],
-            "phase1_state_artifact": {
-                "weighted_probability_base": {
+            "weighted_probability_base": {
                     "QQQ": {"long_probability": 0.50, "short_probability": 0.50}
                 }
-            }
         });
         let artifact = json!({
             "rating": "Overweight",
@@ -3885,7 +4240,7 @@ mod tests {
     fn missing_data_premium_is_enforced_from_itemized_and_critical_gaps() {
         let state = json!({
             "tickers": ["QQQ"],
-            "phase1_state_artifact": {
+            "phase1_index": {
                 "evidence_quality": {"missing_critical_roles": ["analyst.technical"]},
                 "per_ticker": {"QQQ": {"missing_evidence": ["current price confirmation"]}}
             },
@@ -3954,12 +4309,10 @@ mod tests {
     fn phase3_critical_probability_drift_is_clamped_per_ticker() {
         let state = json!({
             "tickers": ["QQQ", "SOXX"],
-            "phase1_state_artifact": {
-                "weighted_probability_base": {
+            "weighted_probability_base": {
                     "QQQ": {"long_probability": 0.55, "short_probability": 0.45},
                     "SOXX": {"long_probability": 0.45, "short_probability": 0.55}
                 }
-            }
         });
         let artifact = json!({
             "rating": "Overweight",
@@ -3995,11 +4348,9 @@ mod tests {
     fn phase3_missing_ticker_probability_is_clamped_to_base() {
         let state = json!({
             "tickers": ["QQQ"],
-            "phase1_state_artifact": {
-                "weighted_probability_base": {
+            "weighted_probability_base": {
                     "QQQ": {"long_probability": 0.50, "short_probability": 0.50}
                 }
-            }
         });
         let artifact = json!({
             "rating": "Buy",

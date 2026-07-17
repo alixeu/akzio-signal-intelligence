@@ -23,7 +23,8 @@ pub use phase_index::{
     list_phase_details_for_phase, list_phase_summaries, list_phase_summaries_for_phase,
     list_phase_summary_details, phase_detail_id, phase_summary_id, record_attention,
     record_attention_batch, upsert_phase_summary, upsert_phase_summary_detail, AttentionEvent,
-    PhaseSummaryDetailInput, PhaseSummaryInput,
+    Phase00MemoryIndex, Phase00PhaseBatch, PhaseSummaryDetailInput, PhaseSummaryDetailRow,
+    PhaseSummaryInput, PhaseSummaryRow,
 };
 pub use schema::{connect, ensure_schema, AGGREGATE_TICKER};
 pub use write::{

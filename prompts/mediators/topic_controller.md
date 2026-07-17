@@ -21,8 +21,8 @@
 当前主题 ID：{topic_id}
 当前主题：{topic}
 
-Phase 1.5 fork（背景证据，不可扩展外部事实）：
-{phase15_fork}
+Phase 1 index fork（背景证据，不可扩展外部事实）：
+{phase1_index}
 
 Prior phase summaries：
 {prior_phase_summaries}

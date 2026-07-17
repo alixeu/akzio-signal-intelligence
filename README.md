@@ -343,10 +343,8 @@ prompts/
 │   ├── reddit.md       # Reddit 情绪
 │   └── x.md           # Twitter/X
 ├── researchers/        # Phase 2 辩论 Agent
-│   ├── bull_initial.md
-│   ├── bear_initial.md
-│   ├── bull_interaction.md
-│   └── bear_interaction.md
+│   ├── bull.md                # 看多长会话（预热/立论/对辩/按中间人整改）
+│   └── bear.md                # 看空长会话（同上）
 ├── mediators/          # 辩论编排
 │   ├── topic_generation.md
 │   └── topic_controller.md
@@ -505,11 +503,12 @@ memory_items            ← 活跃经验记忆（版本化）
 memory_versions         ← 记忆内容版本 + 证据引用
 candidate_experiences   ← 预晋升的经验候选
 jin10_items             ← Jin10 快讯（id=md5, content_json, attention_score 缓存）
-phase_summaries         ← 每阶段压缩后的总结性内容
+phase_summaries         ← 每阶段压缩总结（运行时权威在内存 phase00_memory；run 结束 flush 到 SQLite）
 phase_summary_details   ← 详细点 → 所属 summary_id
 attention_ledger        ← 统一注意力（role/turn_id/subject/score）
-technical_features      ← 多周期技术指标快照
 ```
+
+技术指标不再入库：Yahoo 多周期序列写到 `outputs/technical/` CSV（如 `qqq_day.csv`、`qqq_3h.csv`、`vix_20min.csv`），每个级别默认保留最近 60 条 K 线。
 
 时间字段统一使用 Unix 时间戳（INTEGER）存储。
 ```
@@ -691,7 +690,7 @@ orchestrator:
 
   runtime:
     lang: zh
-    window_days: 60
+    window_days: 60   # technical: K-lines kept per interval (not calendar days)
     max_debate_rounds: 3
 
   allocation:
@@ -703,6 +702,9 @@ orchestrator:
       api_key: ${LLM_GATEWAY_API_KEY}
     defaults:
       model: gpt-4o
+      # transport: non_stream | http | ws
+      # non_stream (default) avoids flaky SSE on Baidu/oneapi gateways
+      transport: non_stream
       tools: read_run_context
 
   analyst_weights:

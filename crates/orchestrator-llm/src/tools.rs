@@ -31,6 +31,22 @@ pub struct ExternalToolConfig {
     #[serde(default)]
     pub run_id: Option<String>,
     pub tickers: Vec<String>,
+    /// In-run phase00 index (authoritative until SQLite flush at run end).
+    #[serde(skip)]
+    pub phase00_index: Option<std::sync::Arc<orchestrator_sql::Phase00MemoryIndex>>,
+}
+
+impl Default for ExternalToolConfig {
+    fn default() -> Self {
+        Self {
+            project_root: PathBuf::from("."),
+            db_path: None,
+            run_dir: None,
+            run_id: None,
+            tickers: Vec::new(),
+            phase00_index: None,
+        }
+    }
 }
 
 pub type SharedWebSearchProvider = Arc<dyn WebSearchProvider>;
@@ -1115,7 +1131,7 @@ fn execute_read_run_context(
         request.kind = match request.role.as_deref() {
             Some("analyst.technical") => "technical".to_string(),
             Some("analyst.news_macro") => "jin10".to_string(),
-            // Phase-2+ roles: first call compose_context, then research_inputs for detail.
+            // Phase-2+ roles expand Phase-00 compressor tables only (memory index).
             Some(role)
                 if role.starts_with("researcher.")
                     || role.starts_with("mediator.")
@@ -1123,22 +1139,123 @@ fn execute_read_run_context(
                     || role.starts_with("risk.")
                     || matches!(role, "trader" | "portfolio.manager" | "allocation.manager") =>
             {
-                if prior_reads == 0 {
-                    "compose_context".to_string()
-                } else {
-                    "research_inputs".to_string()
-                }
+                "phase_summaries".to_string()
             }
             _ => String::new(),
         };
     }
+    // Phase-2+: only phase00 / attention; block raw market re-reads.
+    if request.role.as_deref().is_some_and(is_phase2_plus_role) {
+        let allowed = matches!(
+            request.kind.as_str(),
+            "phase_summaries"
+                | "prior_phase_summaries"
+                | "phase_summary_details"
+                | "attention"
+                | "attention_expand"
+        );
+        if !allowed {
+            bail!(
+                "role {:?} may only call read_run_context kinds \
+                 phase_summaries|phase_summary_details|attention|attention_expand; got {:?}",
+                request.role,
+                request.kind
+            );
+        }
+    }
     if request.kind == "compose_context" && request.token_budget.is_none() {
         request.token_budget = Some(4096);
     }
-    let evidence = orchestrator_sql::read_run_context(&mut conn, &request)?;
-    // Models often re-read the same default context looking for schema/tickers that
-    // already live in the role prompt. Wrap evidence with explicit run metadata and,
-    // after the first successful read in a turn, refuse further identical rereads.
+
+    let evidence = if let Some(from_mem) = try_read_phase00_from_memory(config, &request) {
+        from_mem
+    } else {
+        orchestrator_sql::read_run_context(&mut conn, &request)?
+    };
+    wrap_read_run_context_evidence(config, &request, prior_reads, evidence)
+}
+
+fn is_phase2_plus_role(role: &str) -> bool {
+    role.starts_with("researcher.")
+        || role.starts_with("mediator.")
+        || role.starts_with("manager.")
+        || role.starts_with("risk.")
+        || matches!(role, "trader" | "portfolio.manager" | "allocation.manager")
+}
+
+fn try_read_phase00_from_memory(
+    config: &ExternalToolConfig,
+    request: &orchestrator_sql::RunContextReadRequest,
+) -> Option<Value> {
+    let index = config.phase00_index.as_ref()?;
+    match request.kind.as_str() {
+        "phase_summaries" | "prior_phase_summaries" => {
+            let max_source_phase = request.phase.filter(|p| *p > 0).map(|p| p - 1);
+            Some(index.list_summaries(
+                max_source_phase,
+                request.ticker.as_deref().filter(|t| !t.is_empty()),
+            ))
+        }
+        "phase_summary_details" => {
+            let summary_id = request
+                .topic_id
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .or_else(|| request.turn_id.as_deref().filter(|s| !s.is_empty()))
+                .unwrap_or_default();
+            if summary_id.is_empty() {
+                return None;
+            }
+            Some(index.list_details(summary_id))
+        }
+        "attention_expand" => {
+            let mut items = Vec::new();
+            let mut any = false;
+            for entry in &request.tickers {
+                if let Some((kind, id)) = entry.split_once(':') {
+                    let kind = kind.trim();
+                    let id = id.trim();
+                    if kind.is_empty() || id.is_empty() {
+                        continue;
+                    }
+                    match kind {
+                        "summary" => {
+                            if let Some(v) = index.expand_summary(id) {
+                                items.push(v);
+                                any = true;
+                            }
+                        }
+                        "detail" => {
+                            if let Some(v) = index.expand_detail(id) {
+                                items.push(v);
+                                any = true;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if any {
+                Some(json!({
+                    "query": "attention_expand",
+                    "item_count": items.len(),
+                    "items": items,
+                    "source": "phase00_memory"
+                }))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn wrap_read_run_context_evidence(
+    config: &ExternalToolConfig,
+    request: &orchestrator_sql::RunContextReadRequest,
+    prior_reads: i64,
+    evidence: Value,
+) -> Result<Value> {
     if request.role.as_deref().is_some_and(|role| {
         role.starts_with("analyst.")
             || role.starts_with("researcher.")
@@ -1155,7 +1272,12 @@ fn execute_read_run_context(
         let same_default_reread = prior_reads >= 1
             && matches!(
                 request.kind.as_str(),
-                "technical" | "jin10" | "compose_context" | "research_inputs"
+                "technical"
+                    | "jin10"
+                    | "compose_context"
+                    | "research_inputs"
+                    | "phase_summaries"
+                    | "prior_phase_summaries"
             );
         let artifact_hint = if request
             .role
@@ -1241,6 +1363,7 @@ mod tests {
             run_dir: None,
             run_id: None,
             tickers: Vec::new(),
+            phase00_index: None,
         }
     }
 
@@ -1261,6 +1384,7 @@ mod tests {
             run_dir: None,
             run_id: None,
             tickers: vec!["TQQQ".to_string()],
+            phase00_index: None,
         };
 
         let output = execute_named_tool(
@@ -1273,8 +1397,15 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(output["query"], "get-technical-context");
-        assert!(output["daily"].as_array().unwrap().is_empty());
+        // Wrapped by execute_read_run_context when role is present; here no role so raw payload.
+        let evidence = output.get("evidence").unwrap_or(&output);
+        assert_eq!(evidence["query"], "get-technical-context");
+        assert!(
+            evidence.get("files").is_some()
+                || evidence.get("daily").is_some()
+                || evidence.get("source").is_some(),
+            "unexpected technical payload: {evidence}"
+        );
     }
 
     #[test]
@@ -1318,6 +1449,7 @@ mod tests {
             run_dir: None,
             run_id: Some("run-news".to_string()),
             tickers: vec!["QQQ".to_string()],
+            phase00_index: None,
         };
         let turn = ToolRuntimeTurnContext {
             run_id: "run-news".to_string(),
@@ -1391,6 +1523,7 @@ mod tests {
             run_dir: None,
             run_id: Some("run-news".to_string()),
             tickers: vec!["QQQ".to_string(), "SOXX".to_string()],
+            phase00_index: None,
         };
         let turn = ToolRuntimeTurnContext {
             run_id: "run-news".to_string(),

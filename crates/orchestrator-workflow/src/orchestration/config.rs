@@ -172,13 +172,24 @@ impl RuntimeConfig {
             "orchestrator.prompts.analyst.x",
             "prompts/analysts/x.md",
         )?;
+        // One long-session prompt per side (warmup + seed + debate + mediator revise).
+        const BULL_PROMPT: &str = "prompts/researchers/bull.md";
+        const BEAR_PROMPT: &str = "prompts/researchers/bear.md";
+        insert_prompt_entry(
+            config,
+            &mut prompts,
+            &mut versions,
+            "researcher.bull.warmup",
+            "orchestrator.prompts.phase2.bull_warmup",
+            BULL_PROMPT,
+        )?;
         insert_prompt_entry(
             config,
             &mut prompts,
             &mut versions,
             "researcher.bull.initial",
             "orchestrator.prompts.phase2.bull_initial",
-            "prompts/researchers/bull_initial.md",
+            BULL_PROMPT,
         )?;
         insert_prompt_entry(
             config,
@@ -186,7 +197,15 @@ impl RuntimeConfig {
             &mut versions,
             "researcher.bull.interaction",
             "orchestrator.prompts.phase2.bull_interaction",
-            "prompts/researchers/bull_interaction.md",
+            BULL_PROMPT,
+        )?;
+        insert_prompt_entry(
+            config,
+            &mut prompts,
+            &mut versions,
+            "researcher.bear.warmup",
+            "orchestrator.prompts.phase2.bear_warmup",
+            BEAR_PROMPT,
         )?;
         insert_prompt_entry(
             config,
@@ -194,7 +213,7 @@ impl RuntimeConfig {
             &mut versions,
             "researcher.bear.initial",
             "orchestrator.prompts.phase2.bear_initial",
-            "prompts/researchers/bear_initial.md",
+            BEAR_PROMPT,
         )?;
         insert_prompt_entry(
             config,
@@ -202,7 +221,7 @@ impl RuntimeConfig {
             &mut versions,
             "researcher.bear.interaction",
             "orchestrator.prompts.phase2.bear_interaction",
-            "prompts/researchers/bear_interaction.md",
+            BEAR_PROMPT,
         )?;
         insert_prompt_entry(
             config,

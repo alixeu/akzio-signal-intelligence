@@ -7,7 +7,7 @@ use super::config::RuntimeConfig;
 use super::conflict_detection::detect_all_conflicts;
 use super::state::tickers_from_state;
 
-pub(crate) fn build_phase1_state_artifact(state: &Value, config: &RuntimeConfig) -> Value {
+pub(crate) fn build_phase1_index(state: &Value, config: &RuntimeConfig) -> Value {
     let tickers = tickers_from_state(state);
     let reports = state
         .get("analyst_reports")
@@ -47,7 +47,8 @@ pub(crate) fn build_phase1_state_artifact(state: &Value, config: &RuntimeConfig)
         .filter(|role| !config.workflow.critical_roles.contains(*role))
         .cloned()
         .collect::<Vec<_>>();
-    let weighted_probability_base = weighted_probability_base(state, &tickers, &reports);
+    // Phase 1 index only organizes evidence (role summaries, conflicts, quality).
+    // Weighted probability is computed in Phase 2 / Phase 3 (see materialize_weighted_probability_base).
     let required_critical_roles = roles
         .iter()
         .filter(|role| config.workflow.critical_roles.contains(*role))
@@ -56,12 +57,6 @@ pub(crate) fn build_phase1_state_artifact(state: &Value, config: &RuntimeConfig)
     let per_ticker = tickers
         .iter()
         .map(|ticker| {
-            let ticker_evidence_quality = evidence_quality_for_ticker(
-                weighted_probability_base.get(ticker),
-                &required_critical_roles,
-                &missing_sources,
-            );
-            let ticker_is_actionable = ticker_evidence_quality["status"] == "actionable";
             let role_summaries = roles
                 .iter()
                 .map(|role| {
@@ -87,6 +82,13 @@ pub(crate) fn build_phase1_state_artifact(state: &Value, config: &RuntimeConfig)
                     })
                 })
                 .collect::<Vec<_>>();
+            let ticker_evidence_quality = evidence_quality_for_ticker(
+                &reports,
+                ticker,
+                &required_critical_roles,
+                &missing_sources,
+            );
+            let ticker_is_actionable = ticker_evidence_quality["status"] == "actionable";
             let conflicts = detect_all_conflicts(ticker, &role_summaries);
             let conflict_values = conflicts
                 .iter()
@@ -95,10 +97,9 @@ pub(crate) fn build_phase1_state_artifact(state: &Value, config: &RuntimeConfig)
             (
                 ticker.clone(),
                 json!({
-                    "id": "reducer.evidence",
-                    "role": "reducer.evidence",
-                    "artifact_type": "phase1_state_artifact",
-                    "weighted_probability_base": weighted_probability_base.get(ticker).cloned().unwrap_or(Value::Null),
+                    "id": "phase1.index",
+                    "role": "phase1.index",
+                    "artifact_type": "phase1_index",
                     "role_summaries": role_summaries,
                     "long_evidence": [],
                     "short_evidence": [],
@@ -150,13 +151,13 @@ pub(crate) fn build_phase1_state_artifact(state: &Value, config: &RuntimeConfig)
         .cloned()
         .collect::<Vec<_>>();
     json!({
-        "id": "reducer.evidence",
-        "role": "reducer.evidence",
-        "artifact_type": "phase1_state_artifact",
-        "phase": "phase1.5",
+        "id": "phase1.index",
+        "role": "phase1.index",
+        "artifact_type": "phase1_index",
+        "phase": "phase1",
         "status": status,
         "evidence_quality": evidence_quality,
-        "workflow_pattern": "Workflow -> Stage/Sub-workflow -> Agent workers -> Reducer -> state artifact",
+        "workflow_pattern": "Workflow -> Stage/Sub-workflow -> Agent workers -> Phase1 index (organize only) -> state",
         "generated_from": {
             "worker_roles": roles,
             "critical_roles": config.workflow.critical_roles.iter().cloned().collect::<Vec<_>>(),
@@ -164,35 +165,55 @@ pub(crate) fn build_phase1_state_artifact(state: &Value, config: &RuntimeConfig)
             "degraded_noncritical_roles": degraded_noncritical_roles
         },
         "late_evidence": state.get("late_evidence").cloned().unwrap_or_else(|| json!([])),
-        "weighted_probability_base": weighted_probability_base,
         "per_ticker": per_ticker,
         "topic_candidates": topic_candidates,
         "cross_analyst_conflicts_summary": cross_analyst_conflicts_summary,
         "cross_ticker_notes": [],
-        "reducer_checks": {
+        "index_checks": {
             "json_valid": true,
             "no_new_external_facts": true,
-            "all_claims_source_backed": true
+            "all_claims_source_backed": true,
+            "weighting_deferred_to_phase2_and_3": true
         }
     })
 }
 
+/// Whether a report payload has usable directional fields for gating (not weighting).
+fn role_has_usable_direction(report: &Value, payload: &Value) -> bool {
+    if is_non_contributing(report, payload) {
+        return false;
+    }
+    if payload.get("confidence").and_then(Value::as_f64).is_none() {
+        return false;
+    }
+    matches!(
+        payload.get("direction").and_then(Value::as_str),
+        Some(
+            "bullish"
+                | "long"
+                | "positive"
+                | "bearish"
+                | "short"
+                | "negative"
+                | "neutral"
+                | "mixed"
+        )
+    )
+}
+
 fn evidence_quality_for_ticker(
-    weighted_probability: Option<&Value>,
+    reports: &serde_json::Map<String, Value>,
+    ticker: &str,
     required_critical_roles: &[String],
     missing_sources: &BTreeSet<String>,
 ) -> Value {
-    let source_roles = weighted_probability
-        .and_then(|value| value.get("source_roles"))
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(Value::as_str)
-                .map(ToString::to_string)
-                .collect::<BTreeSet<_>>()
-        })
-        .unwrap_or_default();
+    let mut source_roles = BTreeSet::new();
+    for (role, report) in reports {
+        let payload = artifact_for_ticker(report, ticker).unwrap_or(report);
+        if role_has_usable_direction(report, payload) {
+            source_roles.insert(role.clone());
+        }
+    }
     let unavailable_critical_roles = required_critical_roles
         .iter()
         .filter(|role| missing_sources.contains(*role) || !source_roles.contains(*role))
@@ -210,6 +231,21 @@ fn evidence_quality_for_ticker(
             "One or more critical roles supplied no usable directional evidence."
         }
     })
+}
+
+/// Phase 2 / Phase 3 entry: compute analyst-weighted base probability (Rust).
+///
+/// Phase 1 index only organizes evidence; weighting is owned by debate (phase 2)
+/// and Research Manager (phase 3) inputs, not by the phase-1 organize step.
+pub(crate) fn materialize_weighted_probability_base(state: &mut Value) {
+    let tickers = tickers_from_state(state);
+    let reports = state
+        .get("analyst_reports")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let base = weighted_probability_base(state, &tickers, &reports);
+    state["weighted_probability_base"] = Value::Object(base);
 }
 
 fn aggregate_evidence_quality(
@@ -306,6 +342,7 @@ pub(crate) fn build_topic_generation_artifact(state: &Value) -> Value {
     } else {
         Vec::new()
     };
+    let common_ground = derive_common_ground_from_phase1(state);
     json!({
         "id": "mediator.topic",
         "role": "mediator.topic",
@@ -315,16 +352,83 @@ pub(crate) fn build_topic_generation_artifact(state: &Value) -> Value {
         "actionable": actionable,
         "skip_reason": if actionable { Value::Null } else { json!("phase1_evidence_insufficient") },
         "generated_from": {
-            "source_artifact": "phase1_state_artifact",
+            "source_artifact": "phase1_index",
             "tickers": tickers
         },
+        "common_ground": common_ground,
         "topics": topics,
         "reducer_checks": {
             "json_valid": true,
-            "from_phase1_5_only": true,
+            "from_phase1_index_only": true,
             "no_new_external_facts": true
         }
     })
+}
+
+/// Neutral facts/constraints shared across analysts — seed for bull/bear warm-up and topics.
+fn derive_common_ground_from_phase1(state: &Value) -> Value {
+    let phase1 = state.get("phase1_index").unwrap_or(&Value::Null);
+    let mut agreed_facts = Vec::new();
+    let mut shared_constraints = Vec::new();
+    let mut evidence_refs = Vec::new();
+
+    if let Some(eq) = phase1.get("evidence_quality") {
+        if let Some(status) = eq.get("status").and_then(Value::as_str) {
+            agreed_facts.push(json!(format!("phase1 evidence_quality.status={status}")));
+        }
+        if let Some(roles) = eq
+            .get("usable_source_roles")
+            .and_then(Value::as_array)
+            .cloned()
+        {
+            for role in roles {
+                if let Some(r) = role.as_str() {
+                    evidence_refs.push(json!(format!("role:{r}")));
+                }
+            }
+        }
+    }
+    if let Some(brief) = state.get("phase1_brief_md").and_then(Value::as_str) {
+        if !brief.trim().is_empty() {
+            agreed_facts.push(json!(truncate_str(brief, 240)));
+        }
+    }
+    // Conflicts become shared constraints (what both sides must acknowledge).
+    if let Some(conflicts) = phase1
+        .get("cross_analyst_conflicts_summary")
+        .and_then(Value::as_array)
+    {
+        for c in conflicts {
+            let ctype = c
+                .get("conflict_type")
+                .or_else(|| c.get("type"))
+                .and_then(Value::as_str)
+                .unwrap_or("conflict");
+            shared_constraints.push(json!(format!("acknowledge_{ctype}")));
+        }
+    }
+    if agreed_facts.is_empty() {
+        agreed_facts.push(json!(
+            "Only phase00 / phase1 index summaries are admissible; no raw market re-fetch."
+        ));
+    }
+    json!({
+        "agreed_facts": agreed_facts,
+        "shared_constraints": shared_constraints,
+        "non_debated_assumptions": [
+            "Do not invent external facts beyond phase00 index."
+        ],
+        "evidence_refs": evidence_refs
+    })
+}
+
+fn truncate_str(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let clipped: String = s.chars().take(max.saturating_sub(1)).collect();
+        format!("{clipped}…")
+    }
 }
 
 pub(crate) fn build_debate_state_artifact(state: &Value, config: &RuntimeConfig) -> Value {
@@ -734,13 +838,13 @@ fn fallback_topic_for_ticker(ticker: &str) -> Value {
         "tickers": [ticker],
         "long_evidence_refs": [],
         "short_evidence_refs": [],
-        "why_debate": "Fallback topic generated from Phase 1.5 state."
+        "why_debate": "Fallback topic generated from Phase 1 index."
     })
 }
 
 pub(crate) fn phase1_topic_candidates(state: &Value) -> Vec<Value> {
     state
-        .get("phase1_state_artifact")
+        .get("phase1_index")
         .and_then(|artifact| artifact.get("topic_candidates"))
         .and_then(Value::as_array)
         .cloned()
@@ -750,7 +854,7 @@ pub(crate) fn phase1_topic_candidates(state: &Value) -> Vec<Value> {
 
 pub(crate) fn phase1_evidence_is_actionable(state: &Value) -> bool {
     state
-        .get("phase1_state_artifact")
+        .get("phase1_index")
         .and_then(|artifact| artifact.get("evidence_quality"))
         .and_then(|quality| quality.get("status"))
         .and_then(Value::as_str)
@@ -773,18 +877,96 @@ pub(crate) fn topics_from_generation_artifact(artifact: &Value) -> Vec<Value> {
     {
         return Vec::new();
     }
-    artifact
-        .get("reducer_output")
-        .and_then(|output| {
-            output
-                .get("topics")
-                .or_else(|| output.get("topic_candidates"))
-        })
-        .or_else(|| artifact.get("topics"))
-        .or_else(|| artifact.get("topic_candidates"))
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_else(|| fallback_topics_for_tickers(&tickers_from_state(artifact)))
+
+    // Prefer non-empty arrays; empty `topics: []` from a partial coerce must not
+    // hide alternate shapes that still carry real debate hinges.
+    for source in [
+        artifact
+            .get("reducer_output")
+            .and_then(|output| output.get("topics")),
+        artifact
+            .get("reducer_output")
+            .and_then(|output| output.get("topic_candidates")),
+        artifact.get("topics"),
+        artifact.get("topic_candidates"),
+    ] {
+        if let Some(items) = source.and_then(Value::as_array) {
+            if !items.is_empty() {
+                return items.clone();
+            }
+        }
+    }
+
+    let from_per_ticker = topics_from_per_ticker_shape(
+        artifact
+            .get("reducer_output")
+            .and_then(|output| output.get("per_ticker"))
+            .or_else(|| artifact.get("per_ticker")),
+    );
+    if !from_per_ticker.is_empty() {
+        return from_per_ticker;
+    }
+
+    fallback_topics_for_tickers(&tickers_from_state(artifact))
+}
+
+/// Recover topics when the model nested them under `per_ticker` instead of `topics[]`.
+fn topics_from_per_ticker_shape(per_ticker: Option<&Value>) -> Vec<Value> {
+    let Some(object) = per_ticker.and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    let mut topics = Vec::new();
+    let mut seen_ids = std::collections::BTreeSet::new();
+    for (ticker, body) in object {
+        if let Some(candidates) = body
+            .get("topic_candidates")
+            .or_else(|| body.get("topics"))
+            .and_then(Value::as_array)
+        {
+            for candidate in candidates {
+                push_topic_with_default_ticker(&mut topics, &mut seen_ids, candidate, ticker);
+            }
+            continue;
+        }
+        // Live shape: per_ticker.T is itself one topic object.
+        if body
+            .get("topic_id")
+            .or_else(|| body.get("id"))
+            .or_else(|| body.get("topic"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+        {
+            push_topic_with_default_ticker(&mut topics, &mut seen_ids, body, ticker);
+        }
+    }
+    topics
+}
+
+fn push_topic_with_default_ticker(
+    topics: &mut Vec<Value>,
+    seen_ids: &mut std::collections::BTreeSet<String>,
+    candidate: &Value,
+    ticker: &str,
+) {
+    let mut topic = candidate.clone();
+    if let Some(topic_obj) = topic.as_object_mut() {
+        if topic_obj.get("tickers").and_then(Value::as_array).is_none() {
+            topic_obj.insert("tickers".to_string(), json!([ticker]));
+        }
+        if let Some(topic_id) = topic_obj
+            .get("topic_id")
+            .or_else(|| topic_obj.get("id"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            if !seen_ids.insert(topic_id.to_string()) {
+                return;
+            }
+        }
+    }
+    topics.push(topic);
 }
 
 pub(crate) fn topic_id_from_topic(topic: &Value) -> String {
@@ -1239,7 +1421,7 @@ mod tests {
     }
 
     #[test]
-    fn phase1_state_artifact_populates_cross_analyst_conflicts() {
+    fn phase1_index_populates_cross_analyst_conflicts() {
         let config = test_runtime_config();
         let state = json!({
             "tickers": ["TQQQ"],
@@ -1270,7 +1452,7 @@ mod tests {
             }
         });
 
-        let artifact = build_phase1_state_artifact(&state, &config);
+        let artifact = build_phase1_index(&state, &config);
         let ticker_artifact = &artifact["per_ticker"]["TQQQ"];
         let conflicts = ticker_artifact["cross_analyst_conflicts"]
             .as_array()
@@ -1290,7 +1472,7 @@ mod tests {
     }
 
     #[test]
-    fn phase1_state_artifact_summarizes_typed_evidence() {
+    fn phase1_index_summarizes_typed_evidence() {
         let config = test_runtime_config();
         let state = json!({
             "tickers": ["TQQQ"],
@@ -1312,7 +1494,7 @@ mod tests {
             }
         });
 
-        let artifact = build_phase1_state_artifact(&state, &config);
+        let artifact = build_phase1_index(&state, &config);
         let summary = &artifact["per_ticker"]["TQQQ"]["role_summaries"][0]["evidence_type_summary"];
 
         assert_eq!(summary["fact_count"], json!(1));
@@ -1323,7 +1505,7 @@ mod tests {
     }
 
     #[test]
-    fn phase1_state_artifact_summarizes_legacy_evidence_as_unclassified() {
+    fn phase1_index_summarizes_legacy_evidence_as_unclassified() {
         let config = test_runtime_config();
         let state = json!({
             "tickers": ["TQQQ"],
@@ -1341,7 +1523,7 @@ mod tests {
             }
         });
 
-        let artifact = build_phase1_state_artifact(&state, &config);
+        let artifact = build_phase1_index(&state, &config);
         let role_summary = &artifact["per_ticker"]["TQQQ"]["role_summaries"][0];
 
         assert_eq!(
@@ -1359,7 +1541,7 @@ mod tests {
     }
 
     #[test]
-    fn phase1_state_artifact_includes_empty_conflicts_when_analysts_agree() {
+    fn phase1_index_includes_empty_conflicts_when_analysts_agree() {
         let config = test_runtime_config();
         let state = json!({
             "tickers": ["TQQQ"],
@@ -1378,7 +1560,7 @@ mod tests {
             }
         });
 
-        let artifact = build_phase1_state_artifact(&state, &config);
+        let artifact = build_phase1_index(&state, &config);
         let ticker_artifact = &artifact["per_ticker"]["TQQQ"];
 
         assert_eq!(ticker_artifact["cross_analyst_conflicts"], json!([]));
@@ -1564,7 +1746,7 @@ mod tests {
             }
         });
 
-        let artifact = build_phase1_state_artifact(&state, &config);
+        let artifact = build_phase1_index(&state, &config);
 
         assert_eq!(artifact["status"], "insufficient");
         assert_eq!(artifact["evidence_quality"]["status"], "insufficient");
@@ -1572,17 +1754,46 @@ mod tests {
             artifact["per_ticker"]["QQQ"]["evidence_quality"]["confidence_basis"],
             "data_insufficient"
         );
-        assert_eq!(
-            artifact["weighted_probability_base"]["QQQ"]["long_probability"],
-            0.5
+        // Weighting is not part of phase1 index.
+        assert!(artifact.get("weighted_probability_base").is_none());
+    }
+
+    #[test]
+    fn materialize_weighted_probability_base_is_phase23_state_field() {
+        let mut state = json!({
+            "tickers": ["QQQ"],
+            "analyst_weights": {
+                "analyst.technical": 1.0,
+                "analyst.news_macro": 1.0
+            },
+            "analyst_reports": {
+                "analyst.technical": {
+                    "per_ticker": {"QQQ": {"direction": "bullish", "confidence": 0.8}}
+                },
+                "analyst.news_macro": {
+                    "per_ticker": {"QQQ": {"direction": "bullish", "confidence": 0.6}}
+                }
+            }
+        });
+        materialize_weighted_probability_base(&mut state);
+        let long = state["weighted_probability_base"]["QQQ"]["long_probability"]
+            .as_f64()
+            .unwrap();
+        assert!(
+            long > 0.9,
+            "both bullish should yield high long_prob, got {long}"
         );
+        assert!(state
+            .get("phase1_index")
+            .and_then(|v| v.get("weighted_probability_base"))
+            .is_none());
     }
 
     #[test]
     fn topic_generation_skips_debate_when_phase1_evidence_is_insufficient() {
         let state = json!({
             "tickers": ["QQQ"],
-            "phase1_state_artifact": {
+            "phase1_index": {
                 "evidence_quality": {"status": "insufficient"},
                 "per_ticker": {
                     "QQQ": {"evidence_quality": {"status": "insufficient"}}
@@ -1599,6 +1810,48 @@ mod tests {
             topics_from_generation_artifact(&artifact),
             Vec::<Value>::new()
         );
+    }
+
+    #[test]
+    fn topics_from_generation_recovers_per_ticker_direct_topic_objects() {
+        // Live shape that previously produced topic_count=0 and skipped all researchers:
+        // coerce wrote topics:[], while real hinges lived under reducer_output.per_ticker.
+        let artifact = json!({
+            "actionable": true,
+            "topics": [],
+            "summary": "no actionable debate topics",
+            "reducer_output": {
+                "role": "mediator.topic",
+                "artifact_type": "phase2_topic_generation_artifact",
+                "topics": [],
+                "per_ticker": {
+                    "QQQ": {
+                        "topic_id": "QQQ-valuation-risk-vs-ai-support",
+                        "topic": "Will valuation risk overpower AI support?",
+                        "why_debate": "tech weak vs AI demand"
+                    },
+                    "SOXX": {
+                        "topic_id": "SOXX-ai-capex-return-vs-overinvestment",
+                        "topic": "Is SOXX pricing AI capex returns correctly?"
+                    },
+                    "VIX": {
+                        "topic_id": "VIX-risk-regime-persistence",
+                        "topic": "Is VIX a persistent regime shift?"
+                    }
+                }
+            }
+        });
+
+        let topics = topics_from_generation_artifact(&artifact);
+        assert_eq!(topics.len(), 3, "expected recovered topics: {topics:?}");
+        assert!(topics.iter().any(|topic| {
+            topic.get("topic_id").and_then(Value::as_str)
+                == Some("QQQ-valuation-risk-vs-ai-support")
+                && topic
+                    .get("tickers")
+                    .and_then(Value::as_array)
+                    .is_some_and(|tickers| tickers.iter().any(|value| value == "QQQ"))
+        }));
     }
 
     #[test]
@@ -1631,7 +1884,7 @@ mod tests {
         let config = test_runtime_config();
         let state = json!({
             "tickers": ["QQQ"],
-            "phase1_state_artifact": {
+            "phase1_index": {
                 "evidence_quality": {"status": "actionable"},
                 "per_ticker": {"QQQ": {"evidence_quality": {"status": "actionable"}}}
             },

@@ -187,7 +187,8 @@ async fn debug_exec_records_local_reducers_without_changing_workflow_policy() {
     let result = exec::run(args).await.unwrap();
     let state = &result["run_state"];
 
-    assert_eq!(state["phase_status"]["15"], "done");
+    assert_eq!(state["phase_status"]["1"], "done");
+    assert!(state.get("phase1_index").is_some(), "phase1_index materialized");
     assert_eq!(state["phase_status"]["2"], "done");
     assert_eq!(state["phase_status"]["25"], "done");
     assert!(matches!(
@@ -195,11 +196,20 @@ async fn debug_exec_records_local_reducers_without_changing_workflow_policy() {
         Some("done" | "derived")
     ));
     assert_eq!(state["workflow_policy"]["mode"], "selective");
-    assert!(state["debug_phase_records"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|record| record["phase"] == 15 && record["role"] == "reducer.evidence"));
+    // Phase1 index is in-process; phase00 compressor records land as phase=0 debug rows.
+    assert!(
+        state["debug_phase_records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|record| {
+                record["phase"] == 0
+                    && record["role"]
+                        .as_str()
+                        .is_some_and(|role| role.contains("compressor.after_phase_1"))
+            }),
+        "expected phase00 compressor_after_phase_1 debug record"
+    );
     assert!(state["role_job_metrics"]
         .as_array()
         .unwrap()
@@ -703,26 +713,28 @@ async fn mock_exec_writes_reducer_turn_summaries() {
             .unwrap()
     };
 
-    assert_eq!(rows.len(), 6);
-    assert!(rows.iter().any(|(phase, role, summary_json)| {
-        *phase == 15 && role == "reducer.evidence" && summary_json.contains("reducer.evidence")
-    }));
-    assert!(rows.iter().any(|(phase, role, summary_json)| {
-        *phase == 25
-            && role == "reducer.debate_final"
-            && summary_json.contains("reducer.debate_final")
-    }));
+    // Phase1 index is in-process (no reducer.evidence phase-15 rows); debate final still persists.
+    assert!(
+        rows.iter().any(|(phase, role, summary_json)| {
+            *phase == 25
+                && role == "reducer.debate_final"
+                && summary_json.contains("reducer.debate_final")
+        }),
+        "expected reducer.debate_final rows, got {rows:?}"
+    );
+    assert!(
+        rows
+            .iter()
+            .filter(|(_, role, _)| role == "reducer.debate_final")
+            .count()
+            >= 1
+    );
     assert_eq!(
         rows.iter()
             .filter(|(_, role, _)| role == "reducer.evidence")
             .count(),
-        3
-    );
-    assert_eq!(
-        rows.iter()
-            .filter(|(_, role, _)| role == "reducer.debate_final")
-            .count(),
-        3
+        0,
+        "phase-15 evidence reducer removed under phase00-era pipeline"
     );
 
     let event_rows: i64 = conn

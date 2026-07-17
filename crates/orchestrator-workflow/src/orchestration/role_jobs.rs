@@ -220,6 +220,9 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
                 .and_then(Value::as_str)
                 .map(ToString::to_string),
             tickers,
+            phase00_index: state.get("phase00_memory").map(|raw| {
+                std::sync::Arc::new(orchestrator_sql::Phase00MemoryIndex::from_state_value(raw))
+            }),
         },
         web_search: config.web_search.get(role).cloned().unwrap_or_default(),
         truncation: config.truncation.clone(),
