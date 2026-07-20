@@ -1,4 +1,5 @@
-use orchestrator_core::config_get;
+use orchestrator_core::{closes_for_correlation, config_get, latest_indicator};
+use orchestrator_sql::load_technical_csv;
 use rusqlite::Connection;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -613,86 +614,45 @@ fn classify_regime(level: f64, thresholds: &[f64], labels: &[String]) -> (String
     (regime, budget.to_string())
 }
 
-fn query_latest_indicator(conn: &Connection, ticker: &str, indicator: &str) -> Option<f64> {
-    let column = match indicator {
-        "Close" => "close",
-        "Return" => "return_pct",
-        "Gap" => "gap",
-        "Body" => "body",
-        "VSTD5" => "vstd5",
-        "VSTD20" => "vstd20",
-        "BETA5" => "beta5",
-        "BETA20" => "beta20",
-        _ => {
-            return conn
-                .query_row(
-                    "SELECT json_extract(features_json, '$.' || ?) FROM technical_features
-                     WHERE ticker = ? AND interval = 'daily'
-                     ORDER BY date DESC LIMIT 1",
-                    rusqlite::params![indicator, ticker],
-                    |row| row.get::<_, f64>(0),
-                )
-                .ok()
-        }
-    };
-    conn.query_row(
-        &format!(
-            "SELECT {column} FROM technical_features
-             WHERE ticker = ? AND interval = 'daily' AND {column} IS NOT NULL
-             ORDER BY date DESC LIMIT 1"
-        ),
-        rusqlite::params![ticker],
-        |row| row.get::<_, f64>(0),
-    )
-    .ok()
+fn query_latest_indicator(_conn: &Connection, ticker: &str, indicator: &str) -> Option<f64> {
+    let rows = load_technical_csv(ticker, "1d");
+    latest_indicator(&rows, indicator)
 }
 
 fn query_correlation(
-    conn: &Connection,
+    _conn: &Connection,
     ticker_a: &str,
     ticker_b: &str,
     window: usize,
 ) -> Option<f64> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT a.date, a.close AS close_a, b.close AS close_b
-         FROM technical_features a
-         JOIN technical_features b ON a.date = b.date
-         WHERE a.ticker = ? AND a.interval = 'daily' AND a.close IS NOT NULL
-           AND b.ticker = ? AND b.interval = 'daily' AND b.close IS NOT NULL
-         ORDER BY a.date DESC LIMIT ?",
-        )
-        .ok()?;
+    let rows_a = load_technical_csv(ticker_a, "1d");
+    let rows_b = load_technical_csv(ticker_b, "1d");
 
-    let rows = stmt
-        .query_map(
-            rusqlite::params![ticker_a, ticker_b, window as i64 + 1],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Option<f64>>(1)?,
-                    row.get::<_, Option<f64>>(2)?,
-                ))
-            },
-        )
-        .ok()?
-        .filter_map(|r| r.ok())
-        .collect::<Vec<_>>();
+    let closes_a = closes_for_correlation(&rows_a, window + 1);
+    let closes_b = closes_for_correlation(&rows_b, window + 1);
 
-    let mut closes_a: Vec<f64> = Vec::new();
-    let mut closes_b: Vec<f64> = Vec::new();
-    for (_, a, b) in rows.into_iter().rev() {
-        if let (Some(a), Some(b)) = (a, b) {
-            closes_a.push(a);
-            closes_b.push(b);
+    // Align by date
+    let dates_b: std::collections::HashMap<&str, f64> = closes_b
+        .iter()
+        .map(|(d, c)| (d.get(..10).unwrap_or(d.as_str()), *c))
+        .collect();
+
+    let mut aligned_a = Vec::new();
+    let mut aligned_b = Vec::new();
+    for (date, close_a) in &closes_a {
+        let day = date.get(..10).unwrap_or(date.as_str());
+        if let Some(&close_b) = dates_b.get(day) {
+            aligned_a.push(*close_a);
+            aligned_b.push(close_b);
         }
     }
-    if closes_a.len() < 10 {
+
+    if aligned_a.len() < 10 {
         return None;
     }
 
-    let rets_a = log_returns(&closes_a);
-    let rets_b = log_returns(&closes_b);
+    let rets_a = log_returns(&aligned_a);
+    let rets_b = log_returns(&aligned_b);
     pearson_correlation(&rets_a, &rets_b)
 }
 

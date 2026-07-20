@@ -27,8 +27,8 @@
 
 上下文边界（硬性）：
 - 证据背景：`{phase15_fork}` / `{prior_phase_summaries}` + 本轮 `Steer:` 对手 claim。
-- 可用 tool kinds：`phase_summaries`、`phase_summary_details`、`attention`、`attention_expand`。
-- **禁止** raw jin10 / technical / compose_context。
+- 动态区与对手 packet 已够用时不要重复拉上下文；仅在 claim 引用某条 summary 但正文不足、或需要注意力排序/展开时再补读。
+- **禁止** raw jin10 / technical / compose_context；不补外部事实。
 - **注意力规则**：更近 phase 的 summary 默认注意力更高。
 
 输出 JSON 字段：

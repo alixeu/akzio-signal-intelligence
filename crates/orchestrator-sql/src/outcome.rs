@@ -1,4 +1,8 @@
 use anyhow::Result;
+use orchestrator_core::{
+    close_on_or_after, close_on_or_before, default_technical_csv_dir, read_technical_csv,
+    storage_interval, technical_csv_path,
+};
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 
@@ -85,47 +89,33 @@ pub fn track_record(conn: &Connection, ticker: Option<&str>) -> Result<Value> {
 }
 
 pub fn latest_close_on_or_before(
-    conn: &Connection,
+    _conn: &Connection,
     ticker: &str,
     date: &str,
     interval: &str,
 ) -> Result<Option<(String, f64)>> {
-    let mut stmt = conn.prepare(
-        r#"
-        SELECT date, close
-        FROM technical_features
-        WHERE ticker = ? AND interval = ? AND close IS NOT NULL AND date(date) <= date(?)
-        ORDER BY date(date) DESC, date DESC
-        LIMIT 1
-        "#,
-    )?;
-    let mut rows = stmt.query(params![ticker, interval, date])?;
-    Ok(rows
-        .next()?
-        .map(|row| Ok::<_, rusqlite::Error>((row.get::<_, String>(0)?, row.get::<_, f64>(1)?)))
-        .transpose()?)
+    let csv_interval = storage_interval(interval).unwrap_or(interval);
+    let csv_dir = default_technical_csv_dir();
+    let Some(path) = technical_csv_path(&csv_dir, ticker, csv_interval) else {
+        return Ok(None);
+    };
+    let rows = read_technical_csv(&path).unwrap_or_default();
+    Ok(close_on_or_before(&rows, date))
 }
 
 pub fn earliest_close_on_or_after(
-    conn: &Connection,
+    _conn: &Connection,
     ticker: &str,
     date: &str,
     interval: &str,
 ) -> Result<Option<(String, f64)>> {
-    let mut stmt = conn.prepare(
-        r#"
-        SELECT date, close
-        FROM technical_features
-        WHERE ticker = ? AND interval = ? AND close IS NOT NULL AND date(date) >= date(?)
-        ORDER BY date(date) ASC, date ASC
-        LIMIT 1
-        "#,
-    )?;
-    let mut rows = stmt.query(params![ticker, interval, date])?;
-    Ok(rows
-        .next()?
-        .map(|row| Ok::<_, rusqlite::Error>((row.get::<_, String>(0)?, row.get::<_, f64>(1)?)))
-        .transpose()?)
+    let csv_interval = storage_interval(interval).unwrap_or(interval);
+    let csv_dir = default_technical_csv_dir();
+    let Some(path) = technical_csv_path(&csv_dir, ticker, csv_interval) else {
+        return Ok(None);
+    };
+    let rows = read_technical_csv(&path).unwrap_or_default();
+    Ok(close_on_or_after(&rows, date))
 }
 
 #[cfg(test)]

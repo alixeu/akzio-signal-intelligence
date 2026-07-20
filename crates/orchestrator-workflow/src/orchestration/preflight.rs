@@ -1,8 +1,6 @@
 use anyhow::{bail, Result};
 use orchestrator_ingest::{jin10, technical};
-use orchestrator_sql::import_jin10_payload;
 use serde_json::{json, Value};
-use std::path::PathBuf;
 
 use super::config::RuntimeConfig;
 use super::degraded::record_preflight_result;
@@ -55,8 +53,8 @@ fn preflight_tool_from_registry(
         .get(role)
         .and_then(|def| def.preflight_tool.as_deref())
     {
-        Some("run_technical_indicators") => Some("run_technical_indicators"),
-        Some("fetch_jin10_flash") => Some("fetch_jin10_flash"),
+        Some("read_technical_csv") | Some("run_technical_indicators") => Some("read_technical_csv"),
+        Some("read_jin10_csv") | Some("fetch_jin10_flash") => Some("read_jin10_csv"),
         _ => None,
     }
 }
@@ -68,14 +66,14 @@ pub(crate) async fn run_phase1_preflight(
     #[allow(unused_variables)] config: &RuntimeConfig,
 ) -> Result<()> {
     match preflight_tool_for_role_with_config(role, config) {
-        Some("run_technical_indicators") => run_technical_preflight(state).await,
-        Some("fetch_jin10_flash") => run_jin10_preflight(conn, state).await,
+        Some("read_technical_csv") => run_technical_csv_preflight(state).await,
+        Some("read_jin10_csv") => run_jin10_preflight(conn, state).await,
         _ => Ok(()),
     }
 }
 
-pub(crate) async fn run_technical_preflight(state: &mut Value) -> Result<()> {
-    let tool = "run_technical_indicators";
+pub(crate) async fn run_technical_csv_preflight(state: &mut Value) -> Result<()> {
+    let tool = "read_technical_csv";
     if preflight_status(state, tool).is_some() {
         return Ok(());
     }
@@ -84,6 +82,8 @@ pub(crate) async fn run_technical_preflight(state: &mut Value) -> Result<()> {
         .and_then(Value::as_bool)
         .is_some_and(|enabled| !enabled)
     {
+        let csv_dir = orchestrator_core::default_technical_csv_dir();
+        state["technical_csv_dir"] = json!(csv_dir.display().to_string());
         record_preflight_result(
             state,
             tool,
@@ -91,12 +91,7 @@ pub(crate) async fn run_technical_preflight(state: &mut Value) -> Result<()> {
         );
         return Ok(());
     }
-    let db_path = state
-        .get("db_path")
-        .and_then(Value::as_str)
-        .map(PathBuf::from);
-    // Prefer configured analysis_universe (QQQ/SOXX/VIX). investable_assets is only
-    // for later allocation and must not drive Yahoo refresh.
+
     let symbols = state
         .get("analysis_universe")
         .and_then(Value::as_array)
@@ -108,52 +103,44 @@ pub(crate) async fn run_technical_preflight(state: &mut Value) -> Result<()> {
                 .join(",")
         })
         .filter(|value| !value.is_empty());
-    // Always refresh against the run date so phase-1 analysts do not inherit
-    // stale Yahoo rows from an older import window.
     let end = state
         .get("current_date")
         .and_then(Value::as_str)
         .map(str::to_string);
+
     let result = technical::run(technical::TechnicalArgs {
-        // None falls back to config orchestrator.analysis_universe inside ingest.
         symbols,
         start: None,
         end,
         days: None,
         intervals: String::new(),
-        db_path,
-        model: None,
         timeout: None,
         sleep: None,
     })
     .await;
+
+    let csv_dir = orchestrator_core::default_technical_csv_dir();
     if let Ok(value) = &result {
         if let Some(dir) = value.get("output_dir").and_then(|v| v.as_str()) {
-            state["technical_csv_dir"] = serde_json::json!(dir);
+            state["technical_csv_dir"] = json!(dir);
         } else {
-            state["technical_csv_dir"] =
-                serde_json::json!(orchestrator_core::default_technical_csv_dir()
-                    .display()
-                    .to_string());
+            state["technical_csv_dir"] = json!(csv_dir.display().to_string());
         }
         if let Some(paths) = value.get("csv_paths") {
             state["technical_csv_paths"] = paths.clone();
         }
     } else {
-        state["technical_csv_dir"] =
-            serde_json::json!(orchestrator_core::default_technical_csv_dir()
-                .display()
-                .to_string());
+        state["technical_csv_dir"] = json!(csv_dir.display().to_string());
     }
     record_preflight_result(state, tool, result);
     Ok(())
 }
 
 pub(crate) async fn run_jin10_preflight(
-    conn: &mut rusqlite::Connection,
+    _conn: &mut rusqlite::Connection,
     state: &mut Value,
 ) -> Result<()> {
-    let tool = "fetch_jin10_flash";
+    let tool = "read_jin10_csv";
     if preflight_status(state, tool).is_some() {
         return Ok(());
     }
@@ -175,11 +162,42 @@ pub(crate) async fn run_jin10_preflight(
     })
     .await
     .and_then(|payload| {
-        let imported = import_jin10_payload(conn, &payload)?;
+        let items = payload
+            .get("items")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let csv_rows: Vec<orchestrator_core::Jin10CsvRow> = items
+            .iter()
+            .filter_map(|item| {
+                let time = item.get("time").and_then(Value::as_str)?;
+                let content = item.get("content").and_then(Value::as_str)?;
+                if time.is_empty() || content.is_empty() {
+                    return None;
+                }
+                let id = orchestrator_sql::jin10_item_id(time, content);
+                Some(orchestrator_core::Jin10CsvRow {
+                    id,
+                    time: time.to_string(),
+                    content: content.to_string(),
+                })
+            })
+            .collect();
+        let date = state
+            .get("current_date")
+            .and_then(Value::as_str)
+            .or_else(|| payload.get("fetched_at").and_then(Value::as_str))
+            .unwrap_or("unknown")
+            .to_string();
+        let date_part = &date[..10.min(date.len())];
+        let csv_dir = orchestrator_core::default_jin10_csv_dir();
+        let csv_path = orchestrator_core::jin10_csv_path(&csv_dir, date_part);
+        orchestrator_core::write_jin10_csv(&csv_path, &csv_rows)?;
+        state["jin10_csv_path"] = json!(csv_path.display().to_string());
         Ok(json!({
             "status": "success",
-            "imported_rows": imported,
-            "payload": payload
+            "csv_rows": csv_rows.len(),
+            "csv_path": csv_path.display().to_string()
         }))
     });
     record_preflight_result(state, tool, result);

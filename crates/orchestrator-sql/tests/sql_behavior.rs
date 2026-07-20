@@ -1,3 +1,4 @@
+use orchestrator_core::{technical_csv_path, write_technical_csv, TechnicalCsvRow};
 use orchestrator_sql::{
     candidate::{insert_candidate_experience, pending_candidates, CandidateExperienceInput},
     connect, context_count, ensure_schema, handle_read_command, import_jin10_payload,
@@ -18,7 +19,6 @@ const TABLES: &[&str] = &[
     "phase_summaries",
     "phase_summary_details",
     "attention_ledger",
-    "technical_features",
     "memory_items",
     "memory_versions",
     "memory_history",
@@ -34,6 +34,7 @@ const REMOVED_TABLES: &[&str] = &[
     "source_items",
     "jin10_flash_items",
     "external_items",
+    "technical_features",
     "workflow_sources",
     "workflow_nodes",
     "workflow_edges",
@@ -288,40 +289,44 @@ fn technical_context_stays_within_tool_budget() {
 }
 
 #[test]
-fn technical_context_reads_features_table() {
+fn technical_context_reads_csv_files() {
     let temp = tempfile::tempdir().unwrap();
+    let csv_dir = temp.path().join("technical");
+    std::fs::create_dir_all(&csv_dir).unwrap();
+    std::env::set_var("ORCHESTRATOR_TECHNICAL_CSV_DIR", csv_dir.to_str().unwrap());
+
     let db_path = temp.path().join("orchestrator.sqlite");
     let mut conn = connect(&db_path).unwrap();
 
-    let now = chrono::Utc::now().timestamp();
-    conn.execute(
-        r#"
-        INSERT INTO technical_features
-            (ticker, date, interval, model, close, return_pct, features_json, imported_at)
-        VALUES
-            ('TQQQ', '2026-06-19', 'daily', 'm', 55.5, 0.01, '{"Close":55.5,"Return":0.01}', ?1)
-        "#,
-        [now],
+    // Write CSV files for TQQQ at different intervals
+    use std::collections::HashMap;
+    let daily_rows = vec![TechnicalCsvRow {
+        date: "2026-06-19".to_string(),
+        values: HashMap::from([("Close".into(), 55.5), ("Return".into(), 0.01)]),
+    }];
+    write_technical_csv(
+        &technical_csv_path(&csv_dir, "TQQQ", "1d").unwrap(),
+        &daily_rows,
     )
     .unwrap();
-    conn.execute(
-        r#"
-        INSERT INTO technical_features
-            (ticker, date, interval, model, return_pct, features_json, imported_at)
-        VALUES
-            ('TQQQ', '2026-06-19T09:00:00Z', '3h', 'm', 1.5, '{"Return":1.5}', ?1)
-        "#,
-        [now],
+
+    let h3_rows = vec![TechnicalCsvRow {
+        date: "2026-06-19T09:00:00Z".to_string(),
+        values: HashMap::from([("Return".into(), 1.5)]),
+    }];
+    write_technical_csv(
+        &technical_csv_path(&csv_dir, "TQQQ", "3h").unwrap(),
+        &h3_rows,
     )
     .unwrap();
-    conn.execute(
-        r#"
-        INSERT INTO technical_features
-            (ticker, date, interval, model, gap, features_json, imported_at)
-        VALUES
-            ('TQQQ', '2026-06-19T09:20:00Z', '20min', 'm', 12.5, '{"Gap":12.5}', ?1)
-        "#,
-        [now],
+
+    let min20_rows = vec![TechnicalCsvRow {
+        date: "2026-06-19T09:20:00Z".to_string(),
+        values: HashMap::from([("Gap".into(), 12.5)]),
+    }];
+    write_technical_csv(
+        &technical_csv_path(&csv_dir, "TQQQ", "20min").unwrap(),
+        &min20_rows,
     )
     .unwrap();
 
@@ -330,8 +335,8 @@ fn technical_context_reads_features_table() {
         &RunContextReadRequest {
             kind: "technical".to_string(),
             run_id: None,
-            ticker: None,
-            tickers: vec![],
+            ticker: Some("TQQQ".to_string()),
+            tickers: vec!["TQQQ".to_string()],
             phase: None,
             role: None,
             topic_id: None,
@@ -346,6 +351,7 @@ fn technical_context_reads_features_table() {
     assert_eq!(grouped["three_hour"][0]["indicators"]["Return"], 1.5);
     assert_eq!(grouped["twenty_minute"][0]["indicators"]["Gap"], 12.5);
     assert_eq!(context_count(&conn, "technical").unwrap(), 3);
+    std::env::remove_var("ORCHESTRATOR_TECHNICAL_CSV_DIR");
 }
 
 #[test]
@@ -557,17 +563,21 @@ fn compose_context_scores_trims_and_audits_blocks() {
         }),
     )
     .unwrap();
-    let now = chrono::Utc::now().timestamp();
-    conn.execute(
-        r#"
-        INSERT INTO technical_features
-            (ticker, date, interval, model, close, features_json, imported_at)
-        VALUES
-            ('TQQQ', '2026-06-19', 'daily', 'm', 61.0, '{"Close":61.0}', ?1)
-        "#,
-        [now],
-    )
-    .unwrap();
+    let csv_dir = temp.path().join("technical");
+    std::fs::create_dir_all(&csv_dir).unwrap();
+    std::env::set_var("ORCHESTRATOR_TECHNICAL_CSV_DIR", csv_dir.to_str().unwrap());
+    {
+        use std::collections::HashMap;
+        let daily_rows = vec![TechnicalCsvRow {
+            date: "2026-06-19".to_string(),
+            values: HashMap::from([("Close".into(), 61.0)]),
+        }];
+        write_technical_csv(
+            &technical_csv_path(&csv_dir, "TQQQ", "1d").unwrap(),
+            &daily_rows,
+        )
+        .unwrap();
+    }
     upsert_agent_turn(
         &conn,
         &AgentTurnInput {
@@ -634,6 +644,7 @@ fn compose_context_scores_trims_and_audits_blocks() {
     )
     .unwrap();
     assert!(trimmed["blocks"].as_array().unwrap().len() < blocks.len());
+    std::env::remove_var("ORCHESTRATOR_TECHNICAL_CSV_DIR");
 }
 
 #[test]

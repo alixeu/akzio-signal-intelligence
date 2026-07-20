@@ -7,7 +7,7 @@
 上下文边界（硬性）：
 - 下方 `{phase1_index}` / `{prior_phase_summaries}` 是本轮证据源：Phase 1 **只做整理**（role_summaries / conflicts / evidence_quality；phase00 summary→detail 运行时在内存，run 末才落库）。
 - 若 fork 中出现 `weighted_probability_base`，那是 Phase 2 入口 Rust 合成的 analyst 加权基线，可作主题优先级参考，**不是** Phase 1 index 字段。
-- 可用 `read_run_context` kinds：`phase_summaries`、`phase_summary_details`（topic_id=summary_id）、`attention`、`attention_expand`（tickers 填 `kind:id`）。
+- 动态区已够用时不要重复拉上下文；仅在需要 phase00 总结列表、某条 summary 正文（按 summary id）、或注意力排序/按 subject 展开时再补读。
 - **禁止**拉取 raw jin10 / technical / compose_context 补外部事实。
 - **注意力规则**：越近的 `source_phase`（`recency_weight` 更高）默认应获得更高注意力。
 - date / window_days 只作为运行边界，不是证据正文。

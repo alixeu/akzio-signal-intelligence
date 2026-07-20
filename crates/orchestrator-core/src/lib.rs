@@ -1,5 +1,6 @@
 pub mod artifact;
 pub mod config;
+pub mod jin10_csv;
 pub mod paths;
 pub mod plugin_manifest;
 pub mod prompt;
@@ -22,6 +23,10 @@ pub use artifact::{
 pub use config::{
     config_bool, config_float, config_get, config_int, config_str, config_strings, deep_merge,
     expand_env_placeholders, load_config,
+};
+pub use jin10_csv::{
+    default_jin10_csv_dir, jin10_csv_path, load_jin10_csv, load_jin10_csv_recent, read_jin10_csv,
+    write_jin10_csv, Jin10CsvRow, DEFAULT_JIN10_CSV_DIR,
 };
 pub use paths::{default_project_root, project_path};
 pub use prompt::replace_placeholders;

@@ -9,9 +9,9 @@
 <!-- STATIC PREFIX (cached by OpenAI) -->
 你的任务不是泛泛总结社交媒体，而是围绕 `{ticker}` 在 X 上的讨论，识别哪些言论、账号、叙事与注意力变化真正会影响当前分析窗口内的方向概率。
 
-如果已入库上下文没有可用 X / Twitter 样本，不要继续调用外部搜索；输出 `direction=unobserved`、`confidence=0.0`，并把缺口写入 `data_gaps`。
+如果已入库上下文没有可用 X / Twitter 样本，不要为了补样本继续长时间外部搜索；输出 `direction=unobserved`、`confidence=0.0`，并把缺口写入 `data_gaps`。
 
-先使用 `read_run_context` 读取 `research_inputs`；如果已入库上下文里已经提供 X / Twitter 最近 30 天上下文：
+需要 X / Twitter 证据时，先消费本 run 已导入的最近 30 天研究输入/结构化上下文：
 - 优先使用这份已入库上下文作为主证据源，不要忽略它。
 - 如果该上下文明确显示某个 ticker 的状态为 `error`、`missing`、`none`、`unavailable`，且信息含义等同于“当前拿不到 X 样本/当前没有 X source available”，则把该 ticker 视为 `unobserved`，`confidence=0.0`，并把原因写入 `data_gaps`。
 - 在已入库上下文已经足够说明“X 样本缺失”的情况下，不要为了补样本继续长时间搜索。

@@ -470,15 +470,15 @@ fn builtin_llm_role_values() -> BTreeMap<String, Value> {
             "analyst.technical",
             6,
             None,
-            vec!["read_run_context", "run_technical_indicators"],
+            vec!["read_run_context", "read_technical_csv"],
             false,
         ),
         (
             "analyst.news_macro",
             6,
             None,
-            vec!["read_run_context", "fetch_jin10_flash"],
-            true,
+            vec!["read_run_context", "read_jin10_csv"],
+            false,
         ),
         (
             "analyst.youtube",
@@ -506,6 +506,20 @@ fn builtin_llm_role_values() -> BTreeMap<String, Value> {
             false,
         ),
         // Phase-2 roles expand prior summaries / attention (not raw jin10/technical).
+        (
+            "researcher.bull.warmup",
+            4,
+            None,
+            vec!["read_run_context"],
+            false,
+        ),
+        (
+            "researcher.bear.warmup",
+            4,
+            None,
+            vec!["read_run_context"],
+            false,
+        ),
         (
             "researcher.bull.initial",
             10,

@@ -13,7 +13,6 @@ decrypt-cookies = { workspace = true }
 html-escape = { workspace = true }
 regex = { workspace = true }
 reqwest = { workspace = true }
-rusqlite = { workspace = true }
 scraper = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -21,4 +20,3 @@ tokio = { workspace = true }
 twikit = { workspace = true }
 urlencoding = { workspace = true }
 orchestrator-core = { path = "../orchestrator-core" }
-orchestrator-sql = { path = "../orchestrator-sql" }

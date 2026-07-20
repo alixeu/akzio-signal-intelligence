@@ -52,6 +52,38 @@ pub fn import_jin10_payload(conn: &mut Connection, payload: &Value) -> Result<us
     Ok(count)
 }
 
+/// Import only the specified jin10 items (by id) into the database.
+/// Used when LLM has scored items — only scored items get persisted.
+pub fn import_scored_jin10_items(
+    conn: &Connection,
+    items: &[orchestrator_core::Jin10CsvRow],
+) -> Result<usize> {
+    let imported_at = chrono::Utc::now().timestamp();
+    let mut count = 0;
+    for item in items {
+        if item.id.is_empty() || item.content.is_empty() {
+            continue;
+        }
+        let item_time = parse_jin10_time(&item.time);
+        let content_json = serde_json::to_string(&json!({
+            "id": item.id,
+            "time": item_time,
+            "time_raw": item.time,
+            "content": item.content,
+        }))?;
+        conn.execute(
+            r#"
+            INSERT INTO jin10_items (id, content_json, attention_score, item_time, imported_at)
+            VALUES (?1, ?2, 0.0, ?3, ?4)
+            ON CONFLICT(id) DO NOTHING
+            "#,
+            params![item.id, content_json, item_time, imported_at],
+        )?;
+        count += 1;
+    }
+    Ok(count)
+}
+
 /// A single Jin10 attention assignment from the news analyst.
 #[derive(Debug, Clone)]
 pub struct Jin10Attention {

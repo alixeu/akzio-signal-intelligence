@@ -14,8 +14,11 @@ use rig_core::{
     agent::AgentBuilder,
     client::CompletionClient,
     completion::{CompletionModel, GetTokenUsage, Prompt},
-    message::{AssistantContent, Message, Reasoning, ToolChoice},
-    providers::openai::{self, responses_api},
+    message::{
+        AssistantContent, Message, Reasoning, Text, ToolCall, ToolChoice, ToolFunction,
+        ToolResult as RigToolResult, ToolResultContent, UserContent,
+    },
+    providers::openai,
     streaming::StreamedAssistantContent,
     OneOrMany,
 };
@@ -25,9 +28,7 @@ use serde_json::{json, Value};
 use std::{fs, path::PathBuf, sync::Arc};
 use truncation::TruncationConfig;
 use uuid::Uuid;
-use web_search::{
-    validate_web_search_runtime_config, ExaWebSearchProvider, WebSearchConfig, WebSearchMode,
-};
+use web_search::{validate_web_search_runtime_config, ExaWebSearchProvider, WebSearchConfig};
 
 pub mod agent_loop;
 pub mod llm_judge;
@@ -383,6 +384,20 @@ fn record_jin10_usage_from_artifact(
     if attention.is_empty() {
         return Ok(());
     }
+    // Only scored items get persisted to the database.
+    let scored_ids: std::collections::BTreeSet<&str> =
+        attention.iter().map(|a| a.id.as_str()).collect();
+    let csv_rows = orchestrator_core::load_jin10_csv_recent(3);
+    let scored_rows: Vec<orchestrator_core::Jin10CsvRow> = csv_rows
+        .into_iter()
+        .filter(|row| scored_ids.contains(row.id.as_str()))
+        .collect();
+    if !scored_rows.is_empty() {
+        if let Err(e) = orchestrator_sql::import_scored_jin10_items(conn, &scored_rows) {
+            tracing::warn!("failed to import scored jin10 items: {e}");
+        }
+    }
+
     let run_id = loop_run_id(settings);
     let updated = orchestrator_sql::record_jin10_attention_for_turn(
         conn,
@@ -695,14 +710,11 @@ fn safe_path_part(value: &str) -> String {
 }
 
 fn web_run_runtime(config: &WebSearchConfig) -> Option<tools::WebRunRuntime> {
-    match config.mode {
-        WebSearchMode::Live => Some(
-            tools::WebRunRuntime::new(config.clone())
-                .with_truncation(TruncationConfig::default())
-                .with_provider(Arc::new(ExaWebSearchProvider::from_config(config))),
-        ),
-        WebSearchMode::Disabled | WebSearchMode::Cached => None,
-    }
+    Some(
+        tools::WebRunRuntime::new(config.clone())
+            .with_truncation(TruncationConfig::default())
+            .with_provider(Arc::new(ExaWebSearchProvider::from_config(config))),
+    )
 }
 
 fn web_run_runtime_for_settings(settings: &RigSettings) -> Option<tools::WebRunRuntime> {
@@ -715,15 +727,11 @@ fn web_run_runtime_for_settings(settings: &RigSettings) -> Option<tools::WebRunR
 }
 
 fn uses_native_web_search(settings: &RigSettings) -> bool {
-    !role_disables_tools(&settings.role)
-        && settings.llm.native_web_search
-        && settings.web_search.mode == WebSearchMode::Live
+    !role_disables_tools(&settings.role) && settings.llm.native_web_search
 }
 
 fn uses_web_run_fallback(settings: &RigSettings) -> bool {
-    !role_disables_tools(&settings.role)
-        && !uses_native_web_search(settings)
-        && settings.web_search.mode == WebSearchMode::Live
+    !role_disables_tools(&settings.role) && !uses_native_web_search(settings)
 }
 
 fn validate_fallback_web_search_runtime_config(settings: &RigSettings) -> Result<()> {
@@ -762,166 +770,13 @@ pub async fn run_model_event_stream(
     handler: &mut dyn ModelEventHandler,
 ) -> Result<()> {
     let client = openai_compatible_responses_client(&settings.llm)?;
-    let model = client.completion_model(&settings.llm.model);
+    let tool_defs = tools::responses_tool_definitions(&input.available_tools);
+    let model = client
+        .completion_model(&settings.llm.model)
+        .with_tools(tool_defs);
     match settings.llm.transport {
-        LlmTransport::Http => {
+        LlmTransport::Http | LlmTransport::Ws => {
             stream_completion_model(settings, input, model, prompt, handler).await
-        }
-        LlmTransport::Ws => {
-            stream_openai_compatible_responses_websocket(settings, input, model, prompt, handler)
-                .await
-        }
-    }
-}
-
-async fn stream_openai_compatible_responses_websocket(
-    settings: &RigSettings,
-    input: &agent_loop::ModelInput,
-    model: rig_core::providers::openai::responses_api::ResponsesCompletionModel,
-    prompt: &str,
-    handler: &mut dyn ModelEventHandler,
-) -> Result<()> {
-    let builder = completion_request_builder(settings, input, model, prompt);
-    let client = openai_compatible_responses_client(&settings.llm)?;
-    let mut session = client
-        .responses_websocket(settings.llm.model.clone())
-        .await
-        .context("OpenAI-compatible Responses websocket connection failed")?;
-    let result =
-        stream_openai_compatible_responses_websocket_events(&mut session, builder.build(), handler)
-            .await
-            .context("OpenAI-compatible Responses websocket completion failed");
-    let close_result = session.close().await;
-    if let Err(error) = close_result {
-        return Err(anyhow::anyhow!(error))
-            .context("OpenAI-compatible Responses websocket close failed");
-    }
-    result
-}
-
-async fn stream_openai_compatible_responses_websocket_events(
-    session: &mut responses_api::websocket::ResponsesWebSocketSession,
-    request: rig_core::completion::CompletionRequest,
-    handler: &mut dyn ModelEventHandler,
-) -> Result<()> {
-    session.send(request).await?;
-    let mut saw_tool_call = false;
-    let mut text_message = AssistantTextAccumulator::new();
-    loop {
-        match session.next_event().await? {
-            responses_api::websocket::ResponsesWebSocketEvent::Item(chunk) => match chunk.data {
-                responses_api::streaming::ItemChunkKind::OutputTextDelta(delta)
-                | responses_api::streaming::ItemChunkKind::RefusalDelta(delta) => {
-                    if !delta.delta.is_empty() {
-                        let fallback_id = chunk
-                            .item_id
-                            .clone()
-                            .unwrap_or_else(|| format!("ws-text-{}", Uuid::new_v4()));
-                        text_message
-                            .push_delta(handler, fallback_id, delta.delta)
-                            .await?;
-                    }
-                }
-                responses_api::streaming::ItemChunkKind::ReasoningSummaryTextDelta(delta) => {
-                    if !delta.delta.is_empty() {
-                        handler
-                            .handle(ModelStreamEvent::ReasoningSummaryDelta {
-                                item_id: chunk
-                                    .item_id
-                                    .clone()
-                                    .unwrap_or_else(|| "ws-reasoning".to_string()),
-                                delta: delta.delta,
-                            })
-                            .await?;
-                    }
-                }
-                responses_api::streaming::ItemChunkKind::OutputItemDone(output) => {
-                    match output.item {
-                        responses_api::Output::FunctionCall(function_call) => {
-                            saw_tool_call = true;
-                            handler
-                                .handle(ModelStreamEvent::ToolCallCompleted {
-                                    tool_call: ToolCallRequest {
-                                        call_id: function_call.call_id,
-                                        name: tools::resolve_tool_name(&function_call.name),
-                                        arguments: function_call.arguments,
-                                    },
-                                })
-                                .await?;
-                        }
-                        responses_api::Output::Message(message) => {
-                            text_message.ensure_item_id(message.id);
-                            text_message.complete(handler).await?;
-                        }
-                        responses_api::Output::Reasoning {
-                            id,
-                            summary,
-                            encrypted_content,
-                            ..
-                        } => {
-                            if let Some(encrypted_content) = encrypted_content {
-                                handler
-                                    .handle(ModelStreamEvent::ReasoningStateCompleted {
-                                        item_id: id.clone(),
-                                        encrypted_content,
-                                    })
-                                    .await?;
-                            }
-                            for item in summary {
-                                let responses_api::ReasoningSummary::SummaryText { text } = item;
-                                if !text.trim().is_empty() {
-                                    handler
-                                        .handle(ModelStreamEvent::ReasoningSummaryDelta {
-                                            item_id: id.clone(),
-                                            delta: text,
-                                        })
-                                        .await?;
-                                }
-                            }
-                            handler
-                                .handle(ModelStreamEvent::ReasoningSummaryCompleted { item_id: id })
-                                .await?;
-                        }
-                        _ => {}
-                    }
-                }
-                _ => {}
-            },
-            responses_api::websocket::ResponsesWebSocketEvent::Response(chunk) => {
-                match chunk.kind {
-                    responses_api::streaming::ResponseChunkKind::ResponseCompleted => {
-                        text_message.complete(handler).await?;
-                        handler
-                            .handle(ModelStreamEvent::ResponseCompleted {
-                                // Tools present => continue loop; do not force end_turn.
-                                end_turn: !saw_tool_call,
-                                raw: serde_json::to_value(chunk.response)
-                                    .context("failed to serialize websocket response")?,
-                            })
-                            .await?;
-                        return Ok(());
-                    }
-                    responses_api::streaming::ResponseChunkKind::ResponseFailed
-                    | responses_api::streaming::ResponseChunkKind::ResponseIncomplete => {
-                        response_status_result(chunk.response)?;
-                    }
-                    responses_api::streaming::ResponseChunkKind::ResponseCreated
-                    | responses_api::streaming::ResponseChunkKind::ResponseInProgress => {}
-                }
-            }
-            responses_api::websocket::ResponsesWebSocketEvent::Done(done) => {
-                text_message.complete(handler).await?;
-                handler
-                    .handle(ModelStreamEvent::ResponseCompleted {
-                        end_turn: !saw_tool_call,
-                        raw: done.response,
-                    })
-                    .await?;
-                return Ok(());
-            }
-            responses_api::websocket::ResponsesWebSocketEvent::Error(error) => {
-                bail!("OpenAI-compatible Responses websocket error: {error}");
-            }
         }
     }
 }
@@ -1016,33 +871,6 @@ where
         .unwrap_or(Value::Null)
 }
 
-fn response_status_result(response: responses_api::CompletionResponse) -> Result<()> {
-    match response.status {
-        responses_api::ResponseStatus::Completed => Ok(()),
-        responses_api::ResponseStatus::Failed => {
-            let message = response
-                .error
-                .map(|error| {
-                    if error.code.is_empty() {
-                        error.message
-                    } else {
-                        format!("{}: {}", error.code, error.message)
-                    }
-                })
-                .unwrap_or_else(|| "OpenAI-compatible Responses websocket failed".to_string());
-            bail!("{message}")
-        }
-        responses_api::ResponseStatus::Incomplete => {
-            let reason = response
-                .incomplete_details
-                .map(|details| details.reason)
-                .unwrap_or_else(|| "unknown reason".to_string());
-            bail!("OpenAI-compatible Responses websocket incomplete: {reason}")
-        }
-        status => bail!("OpenAI-compatible Responses websocket ended with status {status:?}"),
-    }
-}
-
 fn completion_request_builder<M>(
     settings: &RigSettings,
     input: &agent_loop::ModelInput,
@@ -1053,21 +881,114 @@ where
     M: CompletionModel,
 {
     let mut builder = model.completion_request(Message::user(prompt.to_string()));
-    if let Some(preamble) = settings.llm.effective_preamble() {
+    // System instruction (agent loop protocol) takes priority as preamble;
+    // fall back to the optional config-level preamble.
+    if let Some(system) = &input.system_instruction {
+        builder = builder.preamble(system.clone());
+    } else if let Some(preamble) = settings.llm.effective_preamble() {
         builder = builder.preamble(preamble.to_string());
+    }
+    // Convert tool call / tool result history to native rig Messages so the
+    // API receives proper multi-turn structure instead of a text blob.
+    let history = turn_items_to_history_messages(input);
+    if !history.is_empty() {
+        builder = builder.messages(history);
     }
     if let Some(reasoning) = reasoning_history_message(&settings.llm, input) {
         builder = builder.message(reasoning);
     }
-    // Native rig function-calling tools (not text-protocol tool calls).
-    let tool_defs = tools::rig_tool_definitions(&input.available_tools);
-    if !tool_defs.is_empty() {
-        builder = builder.tools(tool_defs).tool_choice(ToolChoice::Auto);
+    // Tool definitions live on the model (via with_tools) so they bypass rig's
+    // strict-mode schema normalization.  We only set tool_choice here.
+    let has_tools = input
+        .available_tools
+        .iter()
+        .any(|name| tools::tool_definition(name).is_some());
+    if has_tools {
+        builder = builder.tool_choice(ToolChoice::Auto);
     }
     if let Some(params) = additional_params(settings) {
         builder = builder.additional_params(params);
     }
     builder
+}
+
+/// Convert TurnItems (tool calls, tool results, steer messages, assistant
+/// commentary) into native rig `Message` objects for proper multi-turn
+/// conversation structure. The first UserMessage (role prompt) is skipped
+/// because it is passed as the main prompt separately.
+fn turn_items_to_history_messages(input: &agent_loop::ModelInput) -> Vec<Message> {
+    let mut messages = Vec::new();
+    let mut seen_first_user = false;
+
+    for item in &input.items {
+        if item.item_type == agent_loop::TurnItemType::ReasoningState {
+            continue;
+        }
+        match item.item_type {
+            agent_loop::TurnItemType::UserMessage => {
+                if !seen_first_user {
+                    seen_first_user = true;
+                    continue;
+                }
+                messages.push(Message::user(item.content_text.clone()));
+            }
+            agent_loop::TurnItemType::AssistantMessage => {
+                if !item.content_text.is_empty() {
+                    messages.push(Message::Assistant {
+                        id: None,
+                        content: OneOrMany::one(AssistantContent::Text(Text::new(
+                            item.content_text.clone(),
+                        ))),
+                    });
+                }
+            }
+            agent_loop::TurnItemType::ToolCall => {
+                let call = item.content_json.get("call");
+                let arguments = call
+                    .and_then(|c| c.get("arguments"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let name = call
+                    .and_then(|c| c.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or(&item.tool_name)
+                    .to_string();
+                let call_id = item.tool_call_id.clone();
+                messages.push(Message::Assistant {
+                    id: None,
+                    content: OneOrMany::one(AssistantContent::ToolCall(ToolCall {
+                        id: call_id.clone(),
+                        call_id: Some(call_id),
+                        function: ToolFunction::new(name, arguments),
+                        signature: None,
+                        additional_params: None,
+                    })),
+                });
+            }
+            agent_loop::TurnItemType::ToolResult => {
+                let content_text = truncation::truncate_semantic(
+                    &item.content_text,
+                    input.truncation.tool_result_chars,
+                    &input.truncation,
+                );
+                messages.push(Message::User {
+                    content: OneOrMany::one(UserContent::ToolResult(RigToolResult {
+                        id: item.tool_call_id.clone(),
+                        call_id: Some(item.tool_call_id.clone()),
+                        content: OneOrMany::one(ToolResultContent::Text(Text::new(content_text))),
+                    })),
+                });
+            }
+            agent_loop::TurnItemType::CompactSummary => {
+                messages.push(Message::user(format!(
+                    "[Compacted Context] {}",
+                    item.content_text
+                )));
+            }
+            _ => {}
+        }
+    }
+    messages
 }
 
 fn reasoning_history_message(
@@ -2358,6 +2279,8 @@ mod tests {
                 "fetch_youtube_transcript",
                 "fetch_wayinvideo_transcript",
                 "run_technical_indicators",
+                "read_technical_csv",
+                "read_jin10_csv",
                 "fetch_last30days_context",
             ]
         );
@@ -3183,12 +3106,7 @@ mod tests {
         settings.llm.base_url = Some("https://llm.example.com/v1".to_string());
         settings.llm.api_key = Some("test-key".to_string());
         settings.llm.native_web_search = true;
-        assert_eq!(
-            super::additional_params(&settings),
-            Some(json!({"reasoning": {"effort": "low"}}))
-        );
 
-        settings.web_search.mode = WebSearchMode::Live;
         assert_eq!(
             super::additional_params(&settings),
             Some(json!({
@@ -3233,19 +3151,19 @@ mod tests {
         settings.llm.tools = vec!["run_technical_indicators".to_string()];
         assert_eq!(
             super::configured_tool_names(&settings),
-            vec!["think", "run_technical_indicators"]
+            vec!["think", "run_technical_indicators", "web.run"]
         );
 
         settings.llm.think_tool = false;
         assert_eq!(
             super::configured_tool_names(&settings),
-            vec!["run_technical_indicators"]
+            vec!["run_technical_indicators", "web.run"]
         );
     }
 
     #[test]
     fn execution_roles_disable_loop_and_native_tools() {
-        for role in ["manager.research", "allocation.manager"] {
+        for role in ["trader", "allocation.manager"] {
             let mut settings = base_settings(LlmRoute::Responses);
             settings.role = role.to_string();
             settings.llm.base_url = Some("https://llm.example.com/v1".to_string());
@@ -3261,23 +3179,28 @@ mod tests {
             );
             assert!(super::web_run_runtime_for_settings(&settings).is_none());
         }
+
+        // manager.research is NOT tool-disabled, so it gets web.run
+        let mut settings = base_settings(LlmRoute::Responses);
+        settings.role = "manager.research".to_string();
+        settings.llm.base_url = Some("https://llm.example.com/v1".to_string());
+        settings.llm.api_key = Some("test-key".to_string());
+        settings.llm.tools = vec!["read_run_context".to_string()];
+        assert!(super::configured_tool_names(&settings).contains(&tools::WEB_RUN_TOOL_NAME));
     }
 
     #[test]
-    fn web_run_tool_registration_follows_web_search_mode() {
+    fn web_run_tool_always_injected_for_non_disabled_roles() {
         let mut settings = base_settings(LlmRoute::Responses);
         settings.role = "analyst.news_macro".to_string();
         settings.llm.base_url = Some("https://llm.example.com/v1".to_string());
         settings.llm.api_key = Some("test-key".to_string());
         settings.llm.think_tool = false;
 
-        assert!(!super::configured_tool_names(&settings).contains(&tools::WEB_RUN_TOOL_NAME));
-
-        settings.web_search.mode = WebSearchMode::Cached;
-        assert!(!super::configured_tool_names(&settings).contains(&tools::WEB_RUN_TOOL_NAME));
-
-        settings.web_search.mode = WebSearchMode::Live;
         assert!(super::configured_tool_names(&settings).contains(&tools::WEB_RUN_TOOL_NAME));
+
+        settings.role = "trader".to_string();
+        assert!(!super::configured_tool_names(&settings).contains(&tools::WEB_RUN_TOOL_NAME));
     }
 
     #[test]

@@ -18,8 +18,8 @@
 
 上下文边界（硬性）：
 - 下方 `{phase15_fork}` / `{prior_phase_summaries}` 是 Phase 1 compressor 总结 fork。
-- 可用 tool kinds：`phase_summaries`、`phase_summary_details`、`attention`、`attention_expand`。
-- **禁止** raw jin10 / technical / compose_context；不要请求 raw SQL。
+- 动态区已够用时不要重复拉上下文；仅在需要 phase00 总结列表、某条 summary 正文、或注意力排序/展开时再补读。
+- **禁止** raw jin10 / technical / compose_context；不要请求 raw SQL；不补外部事实。
 - **注意力规则**：`recency_weight` 更高（更近 phase）应优先。
 
 输出 JSON 字段：

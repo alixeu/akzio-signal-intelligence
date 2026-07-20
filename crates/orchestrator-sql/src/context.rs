@@ -4,8 +4,11 @@ use crate::{
     AGGREGATE_TICKER,
 };
 use anyhow::Result;
-use orchestrator_core::{MarketRegime, RetrievalBudget};
-use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row};
+use orchestrator_core::{
+    default_technical_csv_dir, latest_snapshot, read_technical_csv, storage_interval,
+    technical_csv_path, MarketRegime, RetrievalBudget, TechnicalCsvRow,
+};
+use rusqlite::{params, params_from_iter, Connection, Row};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -585,20 +588,17 @@ fn collect_jin10_blocks(conn: &Connection, blocks: &mut Vec<ContextBlock>) -> Re
 }
 
 fn collect_technical_blocks(
-    conn: &Connection,
+    _conn: &Connection,
     ctx: &RuntimeContext,
     blocks: &mut Vec<ContextBlock>,
 ) -> Result<()> {
-    // Keep compose_context aligned with get-technical-context: one compact
-    // latest-bar snapshot per ticker/interval. Raw payload_json rows previously
-    // blew the tool-result budget and forced early compaction.
     let tickers = effective_technical_tickers(&ctx.tickers, Some(ctx.ticker.as_str()));
     for (interval, context_type) in [
         ("daily", "technical_daily"),
         ("3h", "technical_3h"),
         ("20min", "technical_20min"),
     ] {
-        for snapshot in technical_snapshots(conn, interval, &tickers)? {
+        for snapshot in technical_snapshots_from_csv(interval, &tickers) {
             let ticker = snapshot
                 .get("ticker")
                 .and_then(Value::as_str)
@@ -610,17 +610,11 @@ fn collect_technical_blocks(
                 .unwrap_or_default()
                 .to_string();
             let item_time = date_str_to_timestamp(&kline_time);
-            let model = snapshot
-                .get("model")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
             let indicators = snapshot
                 .get("indicators")
                 .cloned()
                 .unwrap_or(Value::Object(Default::default()));
-            let content = format!(
-                "{context_type} {ticker} @{kline_time} model={model} indicators={indicators}"
-            );
+            let content = format!("{context_type} {ticker} @{kline_time} indicators={indicators}");
             blocks.push(ContextBlock {
                 context_type: context_type.to_string(),
                 context_ref: format!("technical_snapshot:{interval}:{ticker}:{kline_time}"),
@@ -629,7 +623,7 @@ fn collect_technical_blocks(
                 title: context_type.to_string(),
                 content,
                 weight: 1.5,
-                source_table: "technical_features".to_string(),
+                source_table: "technical_csv".to_string(),
                 item_json: snapshot,
             });
         }
@@ -885,11 +879,17 @@ pub fn context_count(conn: &Connection, name: &str) -> Result<i64> {
     }
     let sql = match name {
         "technical" | "technical-context" | "technical_context" => {
-            "SELECT COUNT(*) FROM technical_features"
+            return Ok(csv_row_count_all());
         }
-        "technical_daily" => "SELECT COUNT(*) FROM technical_features WHERE interval = 'daily'",
-        "technical_3h" => "SELECT COUNT(*) FROM technical_features WHERE interval = '3h'",
-        "technical_20min" => "SELECT COUNT(*) FROM technical_features WHERE interval = '20min'",
+        "technical_daily" => {
+            return Ok(csv_row_count("daily"));
+        }
+        "technical_3h" => {
+            return Ok(csv_row_count("3h"));
+        }
+        "technical_20min" => {
+            return Ok(csv_row_count("20min"));
+        }
         "jin10" | "jin10-context" => "SELECT COUNT(*) FROM jin10_items",
         // Social/video sources temporarily unpersisted (external_items dropped).
         "youtube" | "sources" | "youtube_transcripts" | "youtube_transcript" | "reddit" | "x" => {
@@ -952,21 +952,23 @@ fn jin10_context(conn: &Connection) -> Result<Value> {
     }))
 }
 
-fn technical_context(conn: &Connection, tickers: &[String], ticker: Option<&str>) -> Result<Value> {
-    // Compact latest-bar snapshots only. Full CSV bodies blew the gateway
-    // context window (hundreds of KB per role call) and defeated tool truncation.
+fn technical_context(
+    _conn: &Connection,
+    tickers: &[String],
+    ticker: Option<&str>,
+) -> Result<Value> {
     let tickers = effective_technical_tickers(tickers, ticker);
     Ok(json!({
         "query": "get-technical-context",
-        "source": "technical_features",
-        "daily": technical_snapshots(conn, "daily", &tickers)?,
-        "three_hour": technical_snapshots(conn, "3h", &tickers)?,
-        "twenty_minute": technical_snapshots(conn, "20min", &tickers)?
+        "source": "technical_csv",
+        "daily": technical_snapshots_from_csv("daily", &tickers),
+        "three_hour": technical_snapshots_from_csv("3h", &tickers),
+        "twenty_minute": technical_snapshots_from_csv("20min", &tickers)
     }))
 }
 
 fn technical_interval_context(
-    conn: &Connection,
+    _conn: &Connection,
     interval: &str,
     tickers: &[String],
     ticker: Option<&str>,
@@ -974,8 +976,8 @@ fn technical_interval_context(
     let tickers = effective_technical_tickers(tickers, ticker);
     Ok(json!({
         "query": interval,
-        "source": "technical_features",
-        "items": technical_snapshots(conn, interval, &tickers)?
+        "source": "technical_csv",
+        "items": technical_snapshots_from_csv(interval, &tickers)
     }))
 }
 
@@ -995,55 +997,23 @@ fn effective_technical_tickers(tickers: &[String], ticker: Option<&str>) -> Vec<
     out
 }
 
-/// Compact latest-per-ticker snapshots for one interval.
-/// Reads from `technical_features` (one JSON row per ticker/date/interval).
-fn technical_snapshots(
-    conn: &Connection,
-    interval: &str,
-    tickers: &[String],
-) -> Result<Vec<Value>> {
-    if !table_exists(conn, "technical_features")? {
-        return Ok(Vec::new());
-    }
-
+/// Compact latest-per-ticker snapshots for one interval, read from CSV files.
+fn technical_snapshots_from_csv(interval: &str, tickers: &[String]) -> Vec<Value> {
+    let csv_dir = default_technical_csv_dir();
     let mut snapshots = Vec::new();
-    if tickers.is_empty() {
-        let latest_tickers = latest_technical_tickers(conn, interval, 6)?;
-        for ticker in latest_tickers {
-            if let Some(snapshot) = technical_snapshot_for_ticker(conn, interval, &ticker)? {
-                snapshots.push(snapshot);
-            }
-        }
-        return Ok(snapshots);
-    }
-
     for ticker in tickers {
-        if let Some(snapshot) = technical_snapshot_for_ticker(conn, interval, ticker)? {
-            snapshots.push(snapshot);
+        let Some(path) = technical_csv_path(&csv_dir, ticker, interval) else {
+            continue;
+        };
+        let rows = match read_technical_csv(&path) {
+            Ok(rows) => rows,
+            Err(_) => continue,
+        };
+        if let Some(snap) = latest_snapshot(ticker, interval, &rows, TECHNICAL_CONTEXT_KEYS) {
+            snapshots.push(snap);
         }
     }
-    Ok(snapshots)
-}
-
-fn latest_technical_tickers(
-    conn: &Connection,
-    interval: &str,
-    limit: usize,
-) -> Result<Vec<String>> {
-    let mut stmt = conn.prepare(
-        "SELECT ticker
-         FROM technical_features
-         WHERE interval = ?
-         GROUP BY ticker
-         ORDER BY MAX(date) DESC
-         LIMIT ?",
-    )?;
-    let rows = stmt
-        .query_map(rusqlite::params![interval, limit as i64], |row| {
-            row.get::<_, String>(0)
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(rows)
+    snapshots
 }
 
 const TECHNICAL_CONTEXT_KEYS: &[&str] = &[
@@ -1072,49 +1042,42 @@ const TECHNICAL_CONTEXT_KEYS: &[&str] = &[
     "IMIN20",
 ];
 
-fn technical_snapshot_for_ticker(
-    conn: &Connection,
-    interval: &str,
-    ticker: &str,
-) -> Result<Option<Value>> {
-    let row: Option<(String, String, String, i64)> = conn
-        .query_row(
-            "SELECT date, model, features_json, imported_at
-             FROM technical_features
-             WHERE interval = ? AND ticker = ?
-             ORDER BY date DESC
-             LIMIT 1",
-            rusqlite::params![interval, ticker],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
-                ))
-            },
-        )
-        .optional()?;
-    let Some((kline_time, model, features_raw, imported_at)) = row else {
-        return Ok(None);
+fn csv_row_count(interval: &str) -> i64 {
+    let csv_dir = default_technical_csv_dir();
+    let Ok(entries) = std::fs::read_dir(&csv_dir) else {
+        return 0;
     };
-    let all_features: serde_json::Map<String, Value> =
-        serde_json::from_str(&features_raw).unwrap_or_default();
-    let indicators: serde_json::Map<String, Value> = all_features
-        .into_iter()
-        .filter(|(key, _)| TECHNICAL_CONTEXT_KEYS.contains(&key.as_str()))
-        .collect();
-    if indicators.is_empty() {
-        return Ok(None);
+    let suffix = match storage_interval(interval) {
+        Some("daily") => "_day.csv",
+        Some("3h") => "_3h.csv",
+        Some("20min") => "_20min.csv",
+        _ => return 0,
+    };
+    let mut count: i64 = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.ends_with(suffix) {
+            continue;
+        }
+        if let Ok(rows) = read_technical_csv(&entry.path()) {
+            count += rows.len() as i64;
+        }
     }
-    Ok(Some(json!({
-        "ticker": ticker,
-        "interval": interval,
-        "kline_time": kline_time,
-        "model": model,
-        "imported_at": imported_at,
-        "indicators": indicators
-    })))
+    count
+}
+
+fn csv_row_count_all() -> i64 {
+    csv_row_count("daily") + csv_row_count("3h") + csv_row_count("20min")
+}
+
+/// Load CSV rows for a ticker/interval from the default CSV directory.
+pub fn load_technical_csv(ticker: &str, interval: &str) -> Vec<TechnicalCsvRow> {
+    let csv_dir = default_technical_csv_dir();
+    let Some(path) = technical_csv_path(&csv_dir, ticker, interval) else {
+        return Vec::new();
+    };
+    read_technical_csv(&path).unwrap_or_default()
 }
 
 fn role_summaries_context(conn: &Connection, ctx: &RuntimeContext) -> Result<Value> {

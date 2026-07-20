@@ -104,9 +104,9 @@
 
 **上下文纪律：**
 - 动态区的 `canonical_phase3_context`（`{phase3_context}`）是本阶段权威输入，**以 Phase-00 总结表为主**（`phase00_tables` / memory index），并含 `common_ground`、加权基线与长期记忆校准摘要。
-- 可用 `read_run_context` **仅限** kinds：`phase_summaries` / `phase_summary_details`（`topic_id`=summary id）/ `attention` / `attention_expand`，用于展开 Phase-00 总结表（运行时读内存索引）。
-- **禁止** raw jin10 / technical / compose_context / research_inputs / raw SQL；禁止重新分析完整辩论原文。
-- 只使用上述结构化上下文；多 ticker 时按公共 ticker 边界逐个更新概率。
+- 只消费该动态区；不要补外部事实，不要重新分析完整辩论原文。
+- **禁止** raw jin10 / technical / compose_context / research_inputs / raw SQL。
+- 多 ticker 时按公共 ticker 边界逐个更新概率。
 
 辩论执行模式固定为 Steer Room：
 - 每个 topic 由 bull/bear/mediator 三个长 session 通过 `Steer:` 小消息沟通。

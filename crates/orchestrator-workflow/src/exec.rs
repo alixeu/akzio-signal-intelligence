@@ -3724,9 +3724,7 @@ mod tests {
         assert_eq!(settings.reasoning_effort.as_deref(), Some("medium"));
         assert!(settings.native_web_search);
         assert!(settings.tools.contains(&"read_run_context".to_string()));
-        assert!(settings
-            .tools
-            .contains(&"run_technical_indicators".to_string()));
+        assert!(settings.tools.contains(&"read_technical_csv".to_string()));
         for role in [
             "manager.research",
             "trader",
@@ -3842,7 +3840,7 @@ mod tests {
         assert_eq!(technical.max_result_chars, 12_000);
 
         let news_macro = &web_search["analyst.news_macro"];
-        assert_eq!(news_macro.mode, WebSearchMode::Live);
+        assert_eq!(news_macro.mode, WebSearchMode::Disabled);
         assert_eq!(news_macro.provider, WebSearchProviderKind::Mock);
         assert_eq!(news_macro.context_size, WebSearchContextSize::Medium);
         assert_eq!(news_macro.max_result_chars, 12_000);
@@ -3886,7 +3884,10 @@ mod tests {
             WebSearchContextSize::High
         );
         assert_eq!(web_search["analyst.technical"].max_result_chars, 9000);
-        assert_eq!(web_search["analyst.news_macro"].mode, WebSearchMode::Live);
+        assert_eq!(
+            web_search["analyst.news_macro"].mode,
+            WebSearchMode::Disabled
+        );
         assert_eq!(
             web_search["analyst.news_macro"].provider,
             WebSearchProviderKind::Mock
@@ -4429,32 +4430,27 @@ mod tests {
         let mut state = json!({"degraded": false});
         crate::orchestration::degraded::record_preflight_result(
             &mut state,
-            "run_technical_indicators",
+            "read_technical_csv",
             Err(anyhow::anyhow!("missing technical data")),
         );
 
         assert_eq!(state["degraded"], true);
-        assert_eq!(
-            state["preflight"]["run_technical_indicators"]["status"],
-            "error"
-        );
-        assert!(state["preflight"]["run_technical_indicators"]["message"]
+        assert_eq!(state["preflight"]["read_technical_csv"]["status"], "error");
+        assert!(state["preflight"]["read_technical_csv"]["message"]
             .as_str()
             .unwrap()
             .contains("missing technical data"));
     }
 
     #[tokio::test]
-    async fn technical_preflight_can_be_skipped() {
+    async fn technical_csv_preflight_checks_dir() {
         let mut state = json!({"degraded": false, "tech_refresh_enabled": false});
-
-        crate::orchestration::preflight::run_technical_preflight(&mut state)
+        crate::orchestration::preflight::run_technical_csv_preflight(&mut state)
             .await
             .unwrap();
-
-        assert_eq!(state["degraded"], false);
+        assert!(state.get("technical_csv_dir").is_some());
         assert_eq!(
-            state["preflight"]["run_technical_indicators"]["status"],
+            state["preflight"]["read_technical_csv"]["status"],
             "skipped"
         );
     }

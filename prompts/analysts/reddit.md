@@ -9,9 +9,9 @@
 <!-- STATIC PREFIX (cached by OpenAI) -->
 你的任务不是泛泛总结 Reddit，而是围绕 `{ticker}` 识别哪些 subreddit、帖子、评论链、上升叙事与分歧会影响当前分析窗口内的方向概率。
 
-如果已入库上下文没有可用 Reddit 样本，不要继续调用外部搜索；输出 `direction=unobserved`、`confidence=0.0`，并把缺口写入 `data_gaps`。
+如果已入库上下文没有可用 Reddit 样本，不要为了补样本继续长时间外部搜索；输出 `direction=unobserved`、`confidence=0.0`，并把缺口写入 `data_gaps`。
 
-先使用 `read_run_context` 读取 `research_inputs`；如果已入库上下文里已经提供 Reddit 最近 30 天上下文：
+需要 Reddit 证据时，先消费本 run 已导入的最近 30 天研究输入/结构化上下文：
 - 优先使用这份已入库上下文作为主证据源，不要忽略它。
 - 如果该上下文明确显示某个 ticker 的状态为 `error`、`missing`、`none`、`unavailable`，但同时包含可解析的 Reddit 摘要或样本，则先使用这些已有摘要；不要因为有错误字样就丢弃全部样本。
 - 如果该上下文明确显示某个 ticker 当前拿不到 Reddit 样本，或上下文只剩错误/空结果而没有任何可用 Reddit 摘要，则把该 ticker 视为 `unobserved`，`confidence=0.0`，并把原因写入 `data_gaps`。

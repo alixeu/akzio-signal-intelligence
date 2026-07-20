@@ -53,6 +53,9 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
         DROP TABLE IF EXISTS social_items;
         DROP TABLE IF EXISTS jin10_flash_items;
 
+        -- technical_features replaced by CSV files under outputs/technical.
+        DROP TABLE IF EXISTS technical_features;
+
         -- Phase 4 cleanup: dead indexes
         DROP INDEX IF EXISTS idx_agent_turn_items_session;
         DROP INDEX IF EXISTS idx_agent_turn_items_turn;
@@ -229,25 +232,6 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_attention_ledger_run_score
             ON attention_ledger(run_id, score DESC);
 
-        CREATE TABLE IF NOT EXISTS technical_features (
-            ticker TEXT NOT NULL,
-            date TEXT NOT NULL,
-            interval TEXT NOT NULL,
-            model TEXT NOT NULL DEFAULT '',
-            close REAL,
-            return_pct REAL,
-            gap REAL,
-            body REAL,
-            vstd5 REAL,
-            vstd20 REAL,
-            beta5 REAL,
-            beta20 REAL,
-            features_json TEXT NOT NULL DEFAULT '{}',
-            imported_at INTEGER NOT NULL,
-            PRIMARY KEY(ticker, date, interval)
-        );
-        CREATE INDEX IF NOT EXISTS idx_technical_features_ticker
-            ON technical_features(ticker, interval, date);
         CREATE TABLE IF NOT EXISTS predictions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             run_id TEXT NOT NULL,

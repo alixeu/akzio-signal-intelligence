@@ -1,6 +1,7 @@
 use anyhow::Result;
-use orchestrator_core::MarketRegime;
+use orchestrator_core::{latest_close, MarketRegime};
 use orchestrator_sql::{
+    load_technical_csv,
     memory::{read_prior_memory, PriorMemoryQuery},
     outcome::track_record,
 };
@@ -77,7 +78,7 @@ fn tickers_from_state(state: &Value) -> Vec<String> {
 }
 
 fn market_regime_from_state(
-    conn: &Connection,
+    _conn: &Connection,
     state: &Value,
     allocation: &AllocationConfig,
 ) -> MarketRegime {
@@ -102,12 +103,9 @@ fn market_regime_from_state(
         };
     }
 
-    // Fallback: query the latest VIX close from the technical_features table
-    // and classify it using the allocation regime thresholds. This works during
-    // phase 3 reflection injection when downstream state is not yet populated.
-    let volatility = query_latest_vix_close(conn)
-        .ok()
-        .flatten()
+    // Fallback: query the latest VIX close from CSV
+    // and classify it using the allocation regime thresholds.
+    let volatility = query_latest_vix_close()
         .map(|close| classify_vix_regime(close, allocation))
         .unwrap_or_default();
     MarketRegime {
@@ -116,18 +114,9 @@ fn market_regime_from_state(
     }
 }
 
-fn query_latest_vix_close(conn: &Connection) -> Result<Option<f64>> {
-    let mut stmt = conn.prepare(
-        r#"
-        SELECT close
-        FROM technical_features
-        WHERE ticker = 'VIX' AND close IS NOT NULL
-        ORDER BY date DESC
-        LIMIT 1
-        "#,
-    )?;
-    let mut rows = stmt.query([])?;
-    Ok(rows.next()?.map(|row| row.get::<_, f64>(0)).transpose()?)
+fn query_latest_vix_close() -> Option<f64> {
+    let rows = load_technical_csv("VIX", "1d");
+    latest_close(&rows).map(|(_, close)| close)
 }
 
 /// Classify a VIX close into a regime label using the configured thresholds.

@@ -23,9 +23,7 @@ pub fn register_phase00_gate(run_id: &str, gate: Arc<Phase00Gate>) {
 }
 
 pub fn phase00_gate(run_id: &str) -> Option<Arc<Phase00Gate>> {
-    registry()
-        .as_ref()
-        .and_then(|m| m.get(run_id).cloned())
+    registry().as_ref().and_then(|m| m.get(run_id).cloned())
 }
 
 pub fn unregister_phase00_gate(run_id: &str) {
@@ -176,6 +174,7 @@ impl Phase00Gate {
 mod tests {
     use super::*;
     use crate::phase_index::PhaseSummaryInput;
+    use crate::AGGREGATE_TICKER;
     use serde_json::json;
     use std::thread;
 

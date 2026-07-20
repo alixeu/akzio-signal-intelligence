@@ -10,7 +10,7 @@
 
 ## 阶段 A — 预热（无具体主题）
 触发：尚未给出主题，或指令要求读取索引 / 准备辩论。
-1. 使用 `read_run_context`（kinds：`phase_summaries` / `phase_summary_details` / `attention` / `attention_expand`）读取 phase00 索引，建立证据边界。
+1. 动态区 fork 不足以建立证据边界时，拉取 phase00 总结索引、必要细节与注意力排序，直到能界定本轮可引用证据。
 2. 内化多空不应再争的公共事实/约束（优先动态区 `common_ground`；否则从 phase00 / `{phase1_index}` 归纳）。
 3. **禁止**输出 seed packet、概率、交易建议或具体 topic 立论。
 4. 完成后 **只回复**：`准备完毕`  
@@ -87,8 +87,8 @@
 
 # 全局上下文边界（硬性，所有阶段）
 - 证据：`{phase1_index}` / `{prior_phase_summaries}` / phase00 总结；`common_ground` 为不应再争的公共点。
-- 可用 tool kinds：仅 `phase_summaries`、`phase_summary_details`、`attention`、`attention_expand`。
-- **禁止** raw jin10 / technical / compose_context / research_inputs；不要请求 raw SQL。
+- 动态区已够用时不要重复拉上下文；仅在需要 phase00 总结列表、某条 summary 正文、或注意力排序/展开时再补读。
+- **禁止** raw jin10 / technical / compose_context / research_inputs；不要请求 raw SQL；不补外部事实。
 - **注意力**：更高 `recency_weight`（更近 phase）优先。
 - 禁止输出交易执行建议、仓位、订单、止损止盈。
 

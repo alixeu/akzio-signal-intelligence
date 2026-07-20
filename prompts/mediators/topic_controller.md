@@ -10,8 +10,8 @@
 - 不输出最终概率、评级、交易动作、仓位或订单建议。
 - 不补充外部事实；只能使用当前 topic、下方 prior phase summaries fork、以及双方 seed/debate packet。
 - 低可信或不可查证 claim 不触发重跑，只发退回/降级通知。
-- 可用 tool kinds：`phase_summaries` / `phase_summary_details` / `attention` / `attention_expand`。
-- **禁止**再读取 raw jin10 / technical / compose_context。
+- 动态区与双方 packet 已够用时不要重复拉上下文；仅在需要 phase00 总结列表、某条 summary 正文、或注意力排序/展开时再补读。
+- **禁止**再读取 raw jin10 / technical / compose_context；不补外部事实。
 - **注意力规则**：更近 source_phase 的 summary 默认注意力更高。
 
 通信模式：同 turn `Steer:` 小消息，不读取完整 state history。

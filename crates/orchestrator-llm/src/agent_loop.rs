@@ -609,7 +609,7 @@ impl LoopModel for RigLoopModel {
         handler: &'a mut dyn ModelEventHandler,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
         Box::pin(async move {
-            let prompt = model_prompt(&input)?;
+            let prompt = model_role_prompt(&input)?;
             let mut capture = DebugLlmCapture::new(handler, &input);
             let result =
                 crate::run_model_event_stream(&self.settings, &input, &prompt, &mut capture).await;
@@ -627,6 +627,7 @@ impl LoopModel for RigLoopModel {
 struct DebugLlmCapture<'a> {
     inner: &'a mut dyn ModelEventHandler,
     req_messages: Vec<Value>,
+    req_tools: Vec<Value>,
     assistant_text: String,
     tool_calls: Vec<Value>,
     raw: Value,
@@ -639,6 +640,7 @@ impl<'a> DebugLlmCapture<'a> {
         Self {
             inner,
             req_messages: input_to_debug_messages(input),
+            req_tools: tools::tool_definitions_json(&input.available_tools),
             assistant_text: String::new(),
             tool_calls: Vec::new(),
             raw: Value::Null,
@@ -661,7 +663,10 @@ impl<'a> DebugLlmCapture<'a> {
             "phase": settings.phase,
             "topic_id": settings.topic_id,
             "model": settings.llm.model,
-            "req": { "messages": self.req_messages },
+            "req": {
+                "messages": self.req_messages,
+                "tools": self.req_tools,
+            },
             "resp": self.raw,
             "elapsed_ms": elapsed_ms,
             "token": {
@@ -2842,7 +2847,24 @@ pub fn extract_token_usage(raw: &Value) -> TokenUsage {
     }
 }
 
+/// Extract the role prompt (first user message) for use as the main prompt
+/// in the rig completion request. History items (tool calls, tool results,
+/// steer messages) are handled separately via native multi-turn Messages.
+pub fn model_role_prompt(input: &ModelInput) -> Result<String> {
+    let role_prompt = input
+        .items
+        .iter()
+        .find(|item| item.item_type == TurnItemType::UserMessage)
+        .map(|item| item.content_text.clone())
+        .unwrap_or_default();
+    if role_prompt.trim().is_empty() {
+        bail!("no role prompt found in model input items");
+    }
+    Ok(role_prompt)
+}
+
 /// Build the user prompt for a rig completion request from turn items.
+/// Used by the generate (non-streaming) path which sends a single text blob.
 pub fn model_prompt(input: &ModelInput) -> Result<String> {
     let system = input
         .system_instruction
@@ -4130,8 +4152,8 @@ mod tests {
                 run_id: None,
                 tickers: Vec::new(),
                 phase00_index: None,
-            phase00_gate: None,
-        },
+                phase00_gate: None,
+            },
             vec![tools::READ_RUN_CONTEXT_TOOL_NAME.to_string()],
         );
 
@@ -4157,8 +4179,8 @@ mod tests {
                 run_id: None,
                 tickers: Vec::new(),
                 phase00_index: None,
-            phase00_gate: None,
-        },
+                phase00_gate: None,
+            },
             Vec::new(),
         );
 
@@ -4690,8 +4712,8 @@ mod tests {
                 run_id: None,
                 tickers: vec!["TQQQ".to_string()],
                 phase00_index: None,
-            phase00_gate: None,
-        },
+                phase00_gate: None,
+            },
             vec![tools::WEB_RUN_TOOL_NAME.to_string()],
         )
         .with_web_run_runtime(tools::WebRunRuntime::new(config).with_provider(Arc::new(provider)));

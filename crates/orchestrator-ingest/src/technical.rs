@@ -3,18 +3,16 @@ use chrono::{Datelike, Duration, NaiveDate, Utc, Weekday};
 use clap::Args;
 use orchestrator_core::{
     config_int, config_str, config_strings, default_technical_csv_dir, parse_tickers,
-    technical_csv_path, write_technical_csv, TechnicalCsvRow, DEFAULT_TECHNICAL_BARS,
+    read_technical_csv, technical_csv_path, write_technical_csv, TechnicalCsvRow,
+    DEFAULT_TECHNICAL_BARS,
 };
-use orchestrator_sql::{connect, ensure_schema};
 use reqwest::header;
-use rusqlite::{params, Connection, OptionalExtension};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{collections::HashMap, sync::Arc, time::Duration as StdDuration};
 use tokio::sync::Mutex;
 
 const EPS: f64 = 1e-12;
-const DEFAULT_MODEL: &str = "YahooTechnical";
 const YAHOO_CHART_BASE_URL: &str = "https://query1.finance.yahoo.com/v8/finance/chart";
 const YAHOO_CRUMB_URL: &str = "https://query1.finance.yahoo.com/v1/test/getcrumb";
 const YAHOO_COOKIE_URL: &str = "https://fc.yahoo.com/";
@@ -184,10 +182,6 @@ pub struct TechnicalArgs {
     #[arg(long, default_value = "")]
     pub intervals: String,
     #[arg(long)]
-    pub db_path: Option<std::path::PathBuf>,
-    #[arg(long)]
-    pub model: Option<String>,
-    #[arg(long)]
     pub timeout: Option<f64>,
     #[arg(long)]
     pub sleep: Option<f64>,
@@ -196,20 +190,17 @@ pub struct TechnicalArgs {
 pub async fn run(args: TechnicalArgs) -> Result<Value> {
     let args = ResolvedTechnicalArgs::from_args(args)?;
     let source = YahooDataSource::new(args.timeout)?;
-    let conn = connect(&args.db_path)?;
-    ensure_schema(&conn)?;
-    let imported_at = Utc::now().timestamp();
+    let csv_dir = default_technical_csv_dir();
     let mut results = Vec::new();
     for symbol in &args.symbols {
         for interval in &args.intervals {
-            if has_fresh_rows(&conn, symbol, interval, &args.model, args.start, args.end)? {
+            if has_fresh_csv(&csv_dir, symbol, interval, args.start, args.end) {
                 results.push(json!({
                     "symbol": symbol,
                     "interval": interval,
                     "bars": 0,
                     "feature_rows": 0,
-                    "inserted_indicators": 0,
-                    "skipped": "existing_rows"
+                    "skipped": "existing_csv"
                 }));
                 continue;
             }
@@ -238,7 +229,6 @@ pub async fn run(args: TechnicalArgs) -> Result<Value> {
                         "interval": interval,
                         "bars": 0,
                         "feature_rows": 0,
-                        "inserted_indicators": 0,
                         "status": "error",
                         "error": error.to_string(),
                     }));
@@ -251,42 +241,35 @@ pub async fn run(args: TechnicalArgs) -> Result<Value> {
             if rows.len() > keep {
                 rows = rows.split_off(rows.len() - keep);
             }
-            let inserted = insert_feature_rows(&conn, &args.model, &rows, imported_at)?;
-            if let Some(csv_path) =
-                technical_csv_path(&default_technical_csv_dir(), symbol, interval)
-            {
-                let csv_rows: Vec<TechnicalCsvRow> = rows
-                    .iter()
-                    .map(|row| TechnicalCsvRow {
-                        date: row.date.clone(),
-                        values: row
-                            .features
-                            .iter()
-                            .filter_map(|(k, v)| {
-                                v.filter(|v| v.is_finite()).map(|v| (k.clone(), v))
-                            })
-                            .collect(),
-                    })
-                    .filter(|row| !row.values.is_empty())
-                    .collect();
+            let csv_rows: Vec<TechnicalCsvRow> = rows
+                .iter()
+                .map(|row| TechnicalCsvRow {
+                    date: row.date.clone(),
+                    values: row
+                        .features
+                        .iter()
+                        .filter_map(|(k, v)| v.filter(|v| v.is_finite()).map(|v| (k.clone(), v)))
+                        .collect(),
+                })
+                .filter(|row| !row.values.is_empty())
+                .collect();
+            if let Some(csv_path) = technical_csv_path(&csv_dir, symbol, interval) {
                 let _ = write_technical_csv(&csv_path, &csv_rows);
             }
             results.push(json!({
                 "symbol": symbol,
                 "interval": interval,
                 "bars": bars.len(),
-                "feature_rows": rows.len(),
-                "inserted_indicators": inserted
+                "feature_rows": csv_rows.len(),
             }));
         }
     }
     Ok(json!({
         "status": "success",
         "source": "Yahoo",
-        "model": args.model,
         "start": args.start.to_string(),
         "end": args.end.to_string(),
-        "output_dir": default_technical_csv_dir().display().to_string(),
+        "output_dir": csv_dir.display().to_string(),
         "bars": DEFAULT_TECHNICAL_BARS,
         "symbols": args.symbols,
         "intervals": args.intervals,
@@ -300,8 +283,6 @@ struct ResolvedTechnicalArgs {
     start: NaiveDate,
     end: NaiveDate,
     intervals: Vec<String>,
-    db_path: std::path::PathBuf,
-    model: String,
     timeout: f64,
     sleep: f64,
 }
@@ -346,12 +327,6 @@ impl ResolvedTechnicalArgs {
             start,
             end,
             intervals,
-            db_path: args
-                .db_path
-                .unwrap_or_else(|| crate::config::shared_db_path_from_config(&config)),
-            model: args
-                .model
-                .unwrap_or_else(|| config_str(&config, "technical.model", DEFAULT_MODEL)),
             timeout: args.timeout.unwrap_or(20.0),
             sleep: args
                 .sleep
@@ -367,8 +342,10 @@ impl ResolvedTechnicalArgs {
 
 #[derive(Debug, Clone)]
 struct FeatureRow {
+    #[allow(dead_code)]
     symbol: String,
     date: String,
+    #[allow(dead_code)]
     interval: String,
     features: HashMap<String, Option<f64>>,
 }
@@ -921,102 +898,33 @@ fn resample_day_key(bar: &Bar) -> (&str, &str) {
     )
 }
 
-fn insert_feature_rows(
-    conn: &Connection,
-    model: &str,
-    rows: &[FeatureRow],
-    imported_at: i64,
-) -> Result<usize> {
-    let mut inserted = 0;
-    for row in rows {
-        let Some(interval) = technical_interval(&row.interval) else {
-            continue;
-        };
-        let finite_features: HashMap<String, f64> = row
-            .features
-            .iter()
-            .filter_map(|(k, v)| v.filter(|v| v.is_finite()).map(|v| (k.clone(), v)))
-            .collect();
-        if finite_features.is_empty() {
-            continue;
-        }
-        let features_json = serde_json::to_string(&finite_features)?;
-        let get = |key: &str| -> Option<f64> { finite_features.get(key).copied() };
-        conn.execute(
-            "INSERT OR REPLACE INTO technical_features
-                (ticker, date, interval, model, close, return_pct, gap, body,
-                 vstd5, vstd20, beta5, beta20, features_json, imported_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            params![
-                row.symbol,
-                row.date,
-                interval,
-                model,
-                get("Close"),
-                get("Return"),
-                get("Gap"),
-                get("Body"),
-                get("VSTD5"),
-                get("VSTD20"),
-                get("BETA5"),
-                get("BETA20"),
-                features_json,
-                imported_at
-            ],
-        )
-        .map(|changed| inserted += changed)?;
-    }
-    Ok(inserted)
-}
-
-fn technical_interval(interval: &str) -> Option<&'static str> {
-    match interval {
-        "1d" => Some("daily"),
-        "3h" => Some("3h"),
-        "20min" => Some("20min"),
-        _ => None,
-    }
-}
-
-fn has_fresh_rows(
-    conn: &Connection,
+fn has_fresh_csv(
+    csv_dir: &std::path::Path,
     symbol: &str,
     interval: &str,
-    model: &str,
-    start: NaiveDate,
+    _start: NaiveDate,
     end: NaiveDate,
-) -> Result<bool> {
-    let Some(interval) = technical_interval(interval) else {
-        return Ok(false);
+) -> bool {
+    let Some(path) = technical_csv_path(csv_dir, symbol, interval) else {
+        return false;
     };
-    let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM technical_features WHERE ticker = ? AND model = ? AND interval = ? AND date >= ?",
-        params![symbol, model, interval, start.to_string()],
-        |row| row.get(0),
-    )?;
-    if count == 0 {
-        return Ok(false);
-    }
-    let latest: Option<String> = conn
-        .query_row(
-            "SELECT MAX(date) FROM technical_features WHERE ticker = ? AND model = ? AND interval = ?",
-            params![symbol, model, interval],
-            |row| row.get(0),
-        )
-        .optional()?;
-    let Some(latest) = latest.filter(|value| !value.trim().is_empty()) else {
-        return Ok(false);
+    let rows = match read_technical_csv(&path) {
+        Ok(rows) => rows,
+        Err(_) => return false,
     };
-    let latest_day = latest.get(..10).unwrap_or(latest.as_str());
+    let Some(last) = rows.last() else {
+        return false;
+    };
+    let latest_day = last.date.get(..10).unwrap_or(last.date.as_str());
     let Ok(latest_date) = NaiveDate::parse_from_str(latest_day, "%Y-%m-%d") else {
-        return Ok(false);
+        return false;
     };
     let required_end = match end.weekday() {
         Weekday::Sat => end - Duration::days(1),
         Weekday::Sun => end - Duration::days(2),
         _ => end,
     };
-    Ok(latest_date >= required_end)
+    latest_date >= required_end
 }
 
 #[derive(Debug, Deserialize)]
@@ -1209,31 +1117,5 @@ mod tests {
         assert_eq!(sampled[0].open, Some(1.0));
         assert_eq!(sampled[0].close, Some(3.0));
         assert_eq!(sampled[0].volume, Some(306.0));
-    }
-
-    #[test]
-    fn insert_feature_rows_upserts_per_ticker_date_interval() {
-        let conn = Connection::open_in_memory().unwrap();
-        ensure_schema(&conn).unwrap();
-        let rows = vec![FeatureRow {
-            symbol: "QQQ".to_string(),
-            date: "2026-01-01".to_string(),
-            interval: "1d".to_string(),
-            features: HashMap::from([("Return".to_string(), Some(0.01))]),
-        }];
-        assert_eq!(
-            insert_feature_rows(&conn, "YahooTechnical", &rows, 1000).unwrap(),
-            1
-        );
-        assert_eq!(
-            insert_feature_rows(&conn, "YahooTechnical", &rows, 2000).unwrap(),
-            1
-        );
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM technical_features", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert_eq!(count, 1);
     }
 }

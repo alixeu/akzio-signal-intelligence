@@ -44,7 +44,6 @@ orchestrator:
 
 technical:
   days: 60
-  model: YahooTechnical
   sleep_sec: 1
 
 jin10:
