@@ -15,8 +15,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use tracing::warn;
 
-use super::plugin_loader::{validate_plugins, ComponentRegistry, RolePluginRegistry};
 use super::policy::{WorkflowPolicyMode, WorkflowPolicyThresholds};
+use orchestrator_core::{validate_plugins, ComponentRegistry, RolePluginRegistry};
 
 // Prompt versioning convention:
 // - v1 is the current/base prompt path and keeps backward compatibility with flat string config.

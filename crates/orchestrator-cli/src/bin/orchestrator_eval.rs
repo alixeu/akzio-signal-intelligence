@@ -16,10 +16,10 @@
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-use orchestrator_eval::baseline::{check_regression, load_baseline, save_baseline};
-use orchestrator_eval::runner::{CaseResult, EvalRunner};
-use orchestrator_eval::{EvalCase, EvalMode};
-use std::path::{Path, PathBuf};
+use orchestrator_cli::eval::baseline::{check_regression, load_baseline, save_baseline};
+use orchestrator_cli::eval::runner::{CaseResult, EvalRunner};
+use orchestrator_cli::eval::{EvalCase, EvalMode};
+use std::path::Path;
 
 #[derive(Parser)]
 struct Args {
@@ -152,10 +152,4 @@ fn print_summary(results: &[CaseResult]) {
         );
     }
     println!("{:-<80}", "");
-}
-
-/// Helper to resolve workspace-relative paths.
-#[allow(dead_code)]
-fn workspace_path(relative: &str) -> PathBuf {
-    PathBuf::from(relative)
 }

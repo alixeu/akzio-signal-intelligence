@@ -1,9 +1,128 @@
 use orchestrator_core::{
-    final_validation_schema, portfolio_allocation_schema, risk_constraints_schema,
+    final_validation_schema, portfolio_allocation_schema, risk_constraints_schema, run_slug,
     trade_intent_schema, validate_risk_constraints, FinalValidation, PortfolioAllocation,
     RiskConstraints, TradeIntent,
 };
 use serde_json::{json, Value};
+
+// --- state management ---
+
+pub(crate) fn run_id_for(tickers: &[String], date: &str) -> String {
+    format!("{}-{}-exec", run_slug(tickers).to_ascii_lowercase(), date)
+}
+
+pub(crate) fn set_phase_status(state: &mut Value, phase: i64, status: &str) {
+    if !state.get("phase_status").is_some_and(Value::is_object) {
+        state["phase_status"] = json!({});
+    }
+    state["phase_status"][phase.to_string()] = Value::String(status.to_string());
+}
+
+pub(crate) fn tickers_from_state(state: &Value) -> Vec<String> {
+    state
+        .get("tickers")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub(crate) fn topic_state(state: &Value, topic_id: &str) -> Option<Value> {
+    state
+        .get("topic_debate_states")
+        .and_then(Value::as_object)
+        .and_then(|items| items.get(topic_id))
+        .cloned()
+}
+
+pub(crate) fn upsert_topic_debate_state(state: &mut Value, topic_id: &str, topic_state: Value) {
+    if !state
+        .get("topic_debate_states")
+        .is_some_and(Value::is_object)
+    {
+        state["topic_debate_states"] = json!({});
+    }
+    if let Some(items) = state["topic_debate_states"].as_object_mut() {
+        items.insert(topic_id.to_string(), topic_state);
+    }
+}
+
+pub(crate) fn append_topic_turn(state: &mut Value, topic_id: &str, turn: Value) {
+    if !state
+        .get("topic_debate_states")
+        .is_some_and(Value::is_object)
+    {
+        state["topic_debate_states"] = json!({});
+    }
+    if let Some(items) = state["topic_debate_states"].as_object_mut() {
+        let entry = items.entry(topic_id.to_string()).or_insert_with(|| {
+            json!({
+                "topic": {"topic_id": topic_id, "topic": topic_id, "tickers": []},
+                "turns": [],
+                "controller_artifacts": []
+            })
+        });
+        if !entry.get("turns").is_some_and(Value::is_array) {
+            entry["turns"] = json!([]);
+        }
+        if let Some(turns) = entry["turns"].as_array_mut() {
+            turns.push(turn);
+        }
+    }
+}
+
+pub(crate) fn set_topic_controller_state(state: &mut Value, topic_id: &str, artifact: Value) {
+    if !state
+        .get("topic_debate_states")
+        .is_some_and(Value::is_object)
+    {
+        state["topic_debate_states"] = json!({});
+    }
+    if let Some(items) = state["topic_debate_states"].as_object_mut() {
+        let entry = items.entry(topic_id.to_string()).or_insert_with(|| {
+            json!({
+                "topic": {"topic_id": topic_id, "topic": topic_id, "tickers": []},
+                "turns": [],
+                "controller_artifacts": []
+            })
+        });
+        entry["controller_artifact"] = artifact;
+    }
+}
+
+pub(crate) fn append_topic_controller_artifact(state: &mut Value, topic_id: &str, artifact: Value) {
+    if !state
+        .get("topic_debate_states")
+        .is_some_and(Value::is_object)
+    {
+        state["topic_debate_states"] = json!({});
+    }
+    if let Some(items) = state["topic_debate_states"].as_object_mut() {
+        let entry = items.entry(topic_id.to_string()).or_insert_with(|| {
+            json!({
+                "topic": {"topic_id": topic_id, "topic": topic_id, "tickers": []},
+                "turns": [],
+                "controller_artifacts": []
+            })
+        });
+        if !entry
+            .get("controller_artifacts")
+            .is_some_and(Value::is_array)
+        {
+            entry["controller_artifacts"] = json!([]);
+        }
+        if let Some(items) = entry["controller_artifacts"].as_array_mut() {
+            items.push(artifact);
+        }
+    }
+}
+
+// --- workflow contracts ---
 
 struct PhaseContract {
     phase: i64,
@@ -136,9 +255,6 @@ fn phase_done(state: &Value, phase: i64) -> bool {
             .and_then(Value::as_object)
             .and_then(|value| value.get(&phase.to_string()))
             .and_then(Value::as_str),
-        // Selective policy may finish a phase via derived/skipped artifacts
-        // rather than a full LLM run; those still count as completed for
-        // contract presence checks.
         Some("done") | Some("derived") | Some("skipped")
     )
 }
@@ -361,8 +477,87 @@ fn required_string_error(payload: &Value, field: &str) -> Option<String> {
     }
 }
 
+// --- trade intent mapping ---
+
+pub(crate) fn research_plan_to_trade_intent(research_plan: &Value) -> Value {
+    let rating = research_plan
+        .get("rating")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let long_probability = research_plan
+        .get("long_probability")
+        .and_then(Value::as_f64);
+    let short_probability = research_plan
+        .get("short_probability")
+        .and_then(Value::as_f64);
+    let action = trade_action(rating, long_probability, short_probability);
+    json!({
+        "action": action,
+        "entry_price": null,
+        "stop_loss": null,
+        "position_size": position_size(action),
+        "rationale": rationale(action, research_plan),
+        "method": "conservative_research_plan_mapping",
+        "source": "research_plan"
+    })
+}
+
+fn trade_action(
+    rating: &str,
+    long_probability: Option<f64>,
+    short_probability: Option<f64>,
+) -> &'static str {
+    let rating = rating.to_ascii_lowercase();
+    if matches!(
+        rating.as_str(),
+        "buy" | "strong buy" | "long" | "bullish" | "overweight"
+    ) && long_probability.is_some_and(|probability| probability >= 0.60)
+    {
+        "Buy"
+    } else if matches!(
+        rating.as_str(),
+        "sell" | "strong sell" | "short" | "bearish" | "underweight"
+    ) && (short_probability.is_some_and(|probability| probability >= 0.60)
+        || long_probability.is_some_and(|probability| probability <= 0.40))
+    {
+        "Sell"
+    } else {
+        "Hold"
+    }
+}
+
+fn position_size(action: &str) -> &'static str {
+    match action {
+        "Buy" | "Sell" => "0%-30%",
+        _ => "0%",
+    }
+}
+
+fn rationale(action: &str, research_plan: &Value) -> String {
+    let suffix = research_plan
+        .get("probability_rationale")
+        .and_then(Value::as_str)
+        .or_else(|| research_plan.get("plan").and_then(Value::as_str))
+        .unwrap_or("Research data is missing or not decisive.");
+    format!("{action} mapped conservatively from research_plan. {suffix}")
+}
+
 #[cfg(test)]
-mod tests {
+mod state_tests {
+    use super::run_id_for;
+
+    #[test]
+    fn run_id_does_not_depend_on_filesystem_path() {
+        let tickers = vec!["QQQ".to_string(), "SOXX".to_string(), "VIX".to_string()];
+        assert_eq!(
+            run_id_for(&tickers, "2026-07-10"),
+            "qqq_soxx_vix-2026-07-10-exec"
+        );
+    }
+}
+
+#[cfg(test)]
+mod contract_tests {
     use super::*;
 
     #[test]
@@ -580,5 +775,62 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("recommended_adjustment"));
+    }
+}
+
+#[cfg(test)]
+mod trade_intent_tests {
+    use super::*;
+
+    #[test]
+    fn maps_supported_buy_without_copying_market_decision_fields() {
+        let research_plan = json!({
+            "rating": "Buy",
+            "long_probability": 0.67,
+            "short_probability": 0.33,
+            "plan": "Upside thesis stays in research.",
+            "probability_rationale": "Bull case has enough support."
+        });
+
+        let intent = research_plan_to_trade_intent(&research_plan);
+
+        assert_eq!(intent["action"], "Buy");
+        assert_eq!(intent["entry_price"], Value::Null);
+        assert_eq!(intent["stop_loss"], Value::Null);
+        assert_eq!(intent["position_size"], "0%-30%");
+        assert!(intent.get("rating").is_none());
+        assert!(intent.get("long_probability").is_none());
+        assert!(intent.get("short_probability").is_none());
+        assert!(intent.get("plan").is_none());
+    }
+
+    #[test]
+    fn holds_when_rating_or_probability_is_missing_or_neutral() {
+        for research_plan in [
+            json!({"rating": "Buy", "long_probability": 0.59}),
+            json!({"long_probability": 0.80, "short_probability": 0.20}),
+            json!({"rating": "Hold", "long_probability": 0.80}),
+            json!({}),
+        ] {
+            let intent = research_plan_to_trade_intent(&research_plan);
+            assert_eq!(intent["action"], "Hold");
+            assert_eq!(intent["position_size"], "0%");
+        }
+    }
+
+    #[test]
+    fn maps_supported_sell_from_short_or_low_long_probability() {
+        let short_supported = research_plan_to_trade_intent(&json!({
+            "rating": "Sell",
+            "long_probability": 0.45,
+            "short_probability": 0.61
+        }));
+        let low_long_supported = research_plan_to_trade_intent(&json!({
+            "rating": "Bearish",
+            "long_probability": 0.39
+        }));
+
+        assert_eq!(short_supported["action"], "Sell");
+        assert_eq!(low_long_supported["action"], "Sell");
     }
 }

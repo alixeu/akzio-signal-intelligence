@@ -1,6 +1,5 @@
 use anyhow::{bail, Context, Result};
 use chrono::{Local, NaiveDate};
-use clap::{Args, ValueEnum};
 use orchestrator_core::{
     config_int, config_str, config_strings, default_project_root, display_ticker, load_config,
     parse_tickers, project_path, MarketRegime,
@@ -22,6 +21,7 @@ use tracing::{debug, warn};
 use crate::orchestration::allocation::{
     allocation_prompt_context, compute_allocation_context, normalize_allocation,
 };
+use crate::orchestration::artifact::market_truth_violation_report;
 use crate::orchestration::artifact::{
     build_debate_state_artifact, build_phase1_index, build_topic_generation_artifact,
     materialize_weighted_probability_base, merge_reducer_output, persist_artifact,
@@ -31,27 +31,28 @@ use crate::orchestration::artifact::{
 use crate::orchestration::config::{
     config_weight, is_critical_role, validate_sqlite_context, RuntimeConfig,
 };
-use crate::orchestration::contract::record_contracts;
 use crate::orchestration::degraded::{manager_research_fallback, role_artifact_or_degraded};
-use crate::orchestration::market_truth::market_truth_violation_report;
+use crate::orchestration::lifecycle::{
+    append_topic_controller_artifact, append_topic_turn, record_contracts,
+    research_plan_to_trade_intent, run_id_for, set_phase_status, set_topic_controller_state,
+    tickers_from_state, upsert_topic_debate_state,
+};
+use crate::orchestration::policy::{enforce_preflight_policy, run_phase1_preflight};
 use crate::orchestration::policy::{
     evaluate_workflow_policy, record_workflow_policy, WorkflowPolicyDecision, WorkflowPolicyMode,
     WorkflowPolicySignals,
 };
-use crate::orchestration::preflight::{enforce_preflight_policy, run_phase1_preflight};
 use crate::orchestration::render::mode_prompt_path;
 use crate::orchestration::retrieval::inject_phase0_reflection;
 use crate::orchestration::role_jobs::{
     merge_role_job_metrics, persist_prompt_metric, prepare_role_job, record_role_job_metrics,
     run_role_jobs, run_single_role_job, run_single_steer_role_job, RoleRun, SteerRoleRun,
 };
-use crate::orchestration::state::{
-    append_topic_controller_artifact, append_topic_turn, run_id_for, set_phase_status,
-    set_topic_controller_state, tickers_from_state, upsert_topic_debate_state,
-};
-use crate::orchestration::trade_intent::research_plan_to_trade_intent;
 use crate::orchestration::PHASE2_REDUCER;
 use orchestrator_core::role_registry::DEFAULT_PHASE1_AGENTS;
+
+mod args;
+pub use args::*;
 
 type TopicDebateResult = (String, Vec<Value>, Value, Value);
 
@@ -59,90 +60,6 @@ struct PhaseTimer {
     phase: i64,
     label: &'static str,
     started_at: Instant,
-}
-
-#[derive(Debug, Clone, ValueEnum)]
-pub enum Mode {
-    Probability,
-    Monitor,
-}
-
-impl Mode {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Mode::Probability => "probability",
-            Mode::Monitor => "monitor",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Args)]
-pub struct ExecArgs {
-    #[arg(long)]
-    pub date: Option<String>,
-    #[arg(long, default_value = "zh")]
-    pub lang: String,
-    #[arg(long, value_enum, default_value_t = Mode::Probability)]
-    pub mode: Mode,
-    #[arg(long)]
-    pub window_days: Option<i64>,
-    #[arg(long)]
-    pub phase1_agents: Option<String>,
-    #[arg(long)]
-    pub db_path: Option<PathBuf>,
-    /// Optional debug dump directory for state.json / final_summary.md / end_context.
-    /// Omitted by default; run state is persisted to SQLite only.
-    #[arg(long)]
-    pub run_dir: Option<PathBuf>,
-    #[arg(long)]
-    pub config: Option<PathBuf>,
-    #[arg(long)]
-    pub model: Option<String>,
-    #[arg(long)]
-    pub reasoning_effort: Option<String>,
-    #[arg(long)]
-    pub max_debate_rounds: Option<i64>,
-    #[arg(long)]
-    pub max_topics_per_side: Option<i64>,
-    #[arg(long)]
-    pub technical_weight: Option<f64>,
-    #[arg(long)]
-    pub news_weight: Option<f64>,
-    #[arg(long)]
-    pub youtube_weight: Option<f64>,
-    #[arg(long)]
-    pub reddit_weight: Option<f64>,
-    #[arg(long)]
-    pub x_weight: Option<f64>,
-    #[arg(long, default_value_t = 1)]
-    pub from_phase: i64,
-    #[arg(long, default_value_t = 8)]
-    pub to_phase: i64,
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-    pub tech_refresh_enabled: bool,
-    #[arg(long, default_value = "1d,3h,20min")]
-    pub tech_refresh_intervals: String,
-    #[arg(long, default_value_t = 120)]
-    pub tech_refresh_save_bars: i64,
-    #[arg(long)]
-    pub tech_refresh_script_path: Option<PathBuf>,
-    #[arg(long, default_value_t = 900)]
-    pub tech_refresh_timeout_sec: u64,
-    #[arg(long)]
-    pub tech_refresh_python_bin: Option<PathBuf>,
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-    pub jin10_refresh_enabled: bool,
-    #[arg(long, default_value_t = 24.0)]
-    pub jin10_refresh_lookback_hours: f64,
-    #[arg(long)]
-    pub jin10_refresh_script_path: Option<PathBuf>,
-    #[arg(long, default_value_t = 120)]
-    pub jin10_refresh_timeout_sec: u64,
-    #[arg(long)]
-    pub mock: bool,
-    /// Write LLM/local reducer records to outputs/debug/phaseXX/{role}.jsonl.
-    #[arg(long)]
-    pub debug: bool,
 }
 
 fn is_mock(state: &Value) -> bool {
@@ -549,7 +466,7 @@ fn persist_run_outputs(run_dir: &Path, state_path: &Path, state: &Value) -> Resu
         serde_json::to_string_pretty(state).context("failed to serialize run state")?,
     )
     .with_context(|| format!("failed to write {}", state_path.display()))?;
-    let summary = orchestrator_report::builder::build_human_readable_report(state);
+    let summary = crate::report::builder::build_human_readable_report(state);
     let summary_path = run_dir.join("final_summary.md");
     fs::write(&summary_path, summary)
         .with_context(|| format!("failed to write {}", summary_path.display()))?;
@@ -3499,8 +3416,8 @@ mod tests {
                 disabled_components: Vec::new(),
                 extra_component_dirs: Vec::new(),
             },
-            component_plugins: crate::orchestration::plugin_loader::ComponentRegistry::default(),
-            role_plugins: crate::orchestration::plugin_loader::RolePluginRegistry::default(),
+            component_plugins: orchestrator_core::ComponentRegistry::default(),
+            role_plugins: orchestrator_core::RolePluginRegistry::default(),
             agent_registry: orchestrator_core::AgentRegistry::builtin(),
         }
     }
@@ -4445,7 +4362,7 @@ mod tests {
     #[tokio::test]
     async fn technical_csv_preflight_checks_dir() {
         let mut state = json!({"degraded": false, "tech_refresh_enabled": false});
-        crate::orchestration::preflight::run_technical_csv_preflight(&mut state)
+        crate::orchestration::policy::run_technical_csv_preflight(&mut state)
             .await
             .unwrap();
         assert!(state.get("technical_csv_dir").is_some());

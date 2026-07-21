@@ -6,8 +6,8 @@ use orchestrator_core::{
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
-use super::plugin_loader::ComponentRegistry;
-use super::state::{tickers_from_state, topic_state};
+use super::lifecycle::{tickers_from_state, topic_state};
+use orchestrator_core::ComponentRegistry;
 
 pub(crate) fn mode_prompt_path(base: &std::path::Path, state: &Value) -> PathBuf {
     if state.get("mode").and_then(Value::as_str) != Some("monitor") {
@@ -202,7 +202,7 @@ fn prior_phase_summaries(state: &Value, current_phase: i64) -> Value {
     }
     json!({
         "current_phase": current_phase,
-        "attention_rule": "Prefer higher recency_weight (more recent source_phase). Expand details via read_run_context kinds phase_summaries / phase_summary_details / attention_expand.",
+        "attention_rule": "Prefer higher recency_weight (more recent source_phase). Expand details via read_run_context(kind=phase_summary_details, topic_id=<id>).",
         "phases": phases,
         "phase_compress_status": compress,
     })
@@ -581,7 +581,7 @@ pub(crate) fn render_prompt_with_plugins(
 mod tests {
     use super::*;
     use crate::orchestration::config::resolve_versioned_prompt_path;
-    use crate::orchestration::plugin_loader::ComponentRegistry;
+    use orchestrator_core::ComponentRegistry;
     use serde_json::json;
     use tempfile::TempDir;
 

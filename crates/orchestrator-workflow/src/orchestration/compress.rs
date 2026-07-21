@@ -9,7 +9,7 @@ use rusqlite::Connection;
 use serde_json::{json, Value};
 use tracing::debug;
 
-use super::state::tickers_from_state;
+use super::lifecycle::tickers_from_state;
 
 /// Build a deterministic phase00 batch from in-memory phase artifacts (no DB I/O).
 pub(crate) fn build_phase_compress(state: &Value, source_phase: i64) -> Result<Phase00PhaseBatch> {

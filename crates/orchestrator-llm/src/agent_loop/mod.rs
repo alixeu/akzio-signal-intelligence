@@ -1,17 +1,26 @@
+mod types;
+mod debug_capture;
+mod streaming;
+
+pub use types::*;
+pub use debug_capture::input_to_debug_messages;
+
+use streaming::ModelStreamHandler;
+
 use anyhow::{bail, Context, Result};
 use orchestrator_core;
 use orchestrator_sql::{turn_history_items, upsert_agent_turn, AgentTurnInput};
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    collections::{BTreeMap, VecDeque},
     future::Future,
     path::PathBuf,
     pin::Pin,
     time::Instant,
 };
 use tracing::{debug, warn};
-use uuid::Uuid;
+
+#[cfg(test)]
+use std::collections::{BTreeMap, VecDeque};
 
 use crate::llm_judge::{judge_message_status, JudgeConfig};
 use crate::tools::{self, truncate_chars};
@@ -19,544 +28,6 @@ use crate::truncation::{truncate_semantic, TruncationConfig};
 use crate::RigSettings;
 
 const DEFAULT_MAX_AGENT_LOOPS: usize = 8;
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TurnItemType {
-    UserMessage,
-    AssistantMessage,
-    ReasoningSummary,
-    ReasoningState,
-    PlanUpdate,
-    ToolCall,
-    ToolResult,
-    SystemContext,
-    DeveloperContext,
-    CompactSummary,
-    InjectedContext,
-}
-
-impl TurnItemType {
-    fn as_str(&self) -> &'static str {
-        match self {
-            Self::UserMessage => "user_message",
-            Self::AssistantMessage => "assistant_message",
-            Self::ReasoningSummary => "reasoning_summary",
-            Self::ReasoningState => "reasoning_state",
-            Self::PlanUpdate => "plan_update",
-            Self::ToolCall => "tool_call",
-            Self::ToolResult => "tool_result",
-            Self::SystemContext => "system_context",
-            Self::DeveloperContext => "developer_context",
-            Self::CompactSummary => "compact_summary",
-            Self::InjectedContext => "injected_context",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolCallRequest {
-    pub call_id: String,
-    pub name: String,
-    #[serde(default)]
-    pub arguments: Value,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolResultItem {
-    pub call_id: String,
-    pub name: String,
-    pub status: String,
-    #[serde(default)]
-    pub output: Value,
-    #[serde(default)]
-    pub error: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AgentItemPhase {
-    Commentary,
-    Final,
-}
-
-impl AgentItemPhase {
-    fn as_str(&self) -> &'static str {
-        match self {
-            Self::Commentary => "commentary",
-            Self::Final => "final",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AgentItemStatus {
-    InProgress,
-    Completed,
-    Pending,
-    Running,
-    Failed,
-    Interrupted,
-}
-
-impl AgentItemStatus {
-    fn as_str(&self) -> &'static str {
-        match self {
-            Self::InProgress => "in_progress",
-            Self::Completed => "completed",
-            Self::Pending => "pending",
-            Self::Running => "running",
-            Self::Failed => "failed",
-            Self::Interrupted => "interrupted",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum AgentOutputItem {
-    AssistantMessage {
-        id: String,
-        phase: AgentItemPhase,
-        content: String,
-        status: AgentItemStatus,
-    },
-    ReasoningSummary {
-        id: String,
-        content: String,
-        status: AgentItemStatus,
-    },
-    PlanUpdate {
-        id: String,
-        content: String,
-        status: AgentItemStatus,
-    },
-    ToolCall {
-        id: String,
-        tool_name: String,
-        arguments: Value,
-        status: AgentItemStatus,
-    },
-    ToolResult {
-        id: String,
-        tool_call_id: String,
-        content: String,
-        status: AgentItemStatus,
-    },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum AgentLoopEvent {
-    TurnItemStarted {
-        turn_id: String,
-        item: AgentOutputItem,
-    },
-    TurnItemDelta {
-        turn_id: String,
-        item_id: String,
-        delta: String,
-    },
-    TurnItemCompleted {
-        turn_id: String,
-        item: AgentOutputItem,
-    },
-}
-
-pub trait AgentEventSink {
-    fn emit<'a>(
-        &'a mut self,
-        event: AgentLoopEvent,
-    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
-}
-
-pub trait ModelEventHandler {
-    fn handle<'a>(
-        &'a mut self,
-        event: ModelStreamEvent,
-    ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>>;
-}
-
-#[derive(Debug, Default)]
-pub struct NoopAgentEventSink;
-
-impl AgentEventSink for NoopAgentEventSink {
-    fn emit<'a>(
-        &'a mut self,
-        _event: AgentLoopEvent,
-    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
-        Box::pin(async { Ok(()) })
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TurnItem {
-    pub item_type: TurnItemType,
-    #[serde(default)]
-    pub role: String,
-    #[serde(default)]
-    pub content_text: String,
-    #[serde(default)]
-    pub content_json: Value,
-    #[serde(default)]
-    pub tool_call_id: String,
-    #[serde(default)]
-    pub tool_name: String,
-    #[serde(default)]
-    pub output_item_id: String,
-    #[serde(default)]
-    pub phase: Option<AgentItemPhase>,
-    #[serde(default)]
-    pub status: Option<AgentItemStatus>,
-    #[serde(skip)]
-    pub db_row_id: Option<i64>,
-}
-
-impl TurnItem {
-    pub fn user(text: impl Into<String>) -> Self {
-        Self {
-            item_type: TurnItemType::UserMessage,
-            role: "user".to_string(),
-            content_text: text.into(),
-            content_json: Value::Null,
-            tool_call_id: String::new(),
-            tool_name: String::new(),
-            output_item_id: String::new(),
-            phase: None,
-            status: None,
-            db_row_id: None,
-        }
-    }
-
-    pub fn assistant(text: impl Into<String>, json_value: Value) -> Self {
-        let text = text.into();
-        Self {
-            item_type: TurnItemType::AssistantMessage,
-            role: "assistant".to_string(),
-            content_text: text.clone(),
-            content_json: merge_item_metadata(
-                json_value,
-                "",
-                Some(AgentItemPhase::Commentary),
-                AgentItemStatus::Completed,
-            ),
-            tool_call_id: String::new(),
-            tool_name: String::new(),
-            output_item_id: String::new(),
-            phase: Some(AgentItemPhase::Commentary),
-            status: Some(AgentItemStatus::Completed),
-            db_row_id: None,
-        }
-    }
-
-    pub fn tool_call(call: &ToolCallRequest) -> Self {
-        let content_json = json!({
-            "call": call,
-            "output_item_id": call.call_id,
-            "status": AgentItemStatus::Pending.as_str()
-        });
-        Self {
-            item_type: TurnItemType::ToolCall,
-            role: "assistant".to_string(),
-            content_text: String::new(),
-            content_json,
-            tool_call_id: call.call_id.clone(),
-            tool_name: call.name.clone(),
-            output_item_id: call.call_id.clone(),
-            phase: None,
-            status: Some(AgentItemStatus::Pending),
-            db_row_id: None,
-        }
-    }
-
-    pub fn tool_result(result: &ToolResultItem, truncation: &TruncationConfig) -> Self {
-        let status = if result.status == "completed" || result.status == "started" {
-            AgentItemStatus::Completed
-        } else {
-            AgentItemStatus::Failed
-        };
-        let content_text = result
-            .output
-            .get("content")
-            .or_else(|| result.output.get("text"))
-            .and_then(Value::as_str)
-            .map(ToString::to_string)
-            .unwrap_or_else(|| result.output.to_string());
-        let truncated_text = truncate_tool_result(&content_text, truncation);
-        // Keep content_json lean. Storing the raw tool payload here previously
-        // re-inflated truncated content_text when model_prompt serialized both.
-        let compact_output =
-            compact_tool_output_for_history(&result.output, &truncated_text, truncation);
-        let compact_result = ToolResultItem {
-            call_id: result.call_id.clone(),
-            name: result.name.clone(),
-            status: result.status.clone(),
-            output: compact_output,
-            error: result.error.clone(),
-        };
-        Self {
-            item_type: TurnItemType::ToolResult,
-            role: "tool".to_string(),
-            content_text: truncated_text,
-            content_json: json!({
-                "result": compact_result,
-                "output_item_id": format!("result-{}", result.call_id),
-                "status": status.as_str()
-            }),
-            tool_call_id: result.call_id.clone(),
-            tool_name: result.name.clone(),
-            output_item_id: format!("result-{}", result.call_id),
-            phase: None,
-            status: Some(status),
-            db_row_id: None,
-        }
-    }
-}
-
-fn merge_item_metadata(
-    value: Value,
-    output_item_id: &str,
-    phase: Option<AgentItemPhase>,
-    status: AgentItemStatus,
-) -> Value {
-    let mut object = match value {
-        Value::Object(map) => map,
-        other if other.is_null() => serde_json::Map::new(),
-        other => {
-            let mut map = serde_json::Map::new();
-            map.insert("raw".to_string(), other);
-            map
-        }
-    };
-    if !output_item_id.is_empty() {
-        object.insert(
-            "output_item_id".to_string(),
-            Value::String(output_item_id.to_string()),
-        );
-    }
-    if let Some(phase) = phase {
-        object.insert(
-            "phase".to_string(),
-            Value::String(phase.as_str().to_string()),
-        );
-    }
-    object.insert(
-        "status".to_string(),
-        Value::String(status.as_str().to_string()),
-    );
-    Value::Object(object)
-}
-
-#[derive(Debug, Clone)]
-pub struct Turn {
-    pub turn_id: String,
-    pub session_id: String,
-    pub run_id: String,
-    pub phase: Option<i64>,
-    pub role: String,
-    pub user_input: String,
-    pub model_context: String,
-    pub pending_input: VecDeque<String>,
-    pub emitted_items: Vec<TurnItem>,
-    pub pending_tool_calls: Vec<ToolCallRequest>,
-    pub cancellation_state: String,
-    pub needs_follow_up: bool,
-    pub end_reason: Option<String>,
-    /// When true, subsequent model iterations get no tools and must emit the artifact.
-    pub tools_disabled: bool,
-}
-
-impl Turn {
-    pub fn new(
-        turn_id: impl Into<String>,
-        session_id: impl Into<String>,
-        run_id: impl Into<String>,
-        role: impl Into<String>,
-        user_input: impl Into<String>,
-    ) -> Self {
-        Self {
-            turn_id: turn_id.into(),
-            session_id: session_id.into(),
-            run_id: run_id.into(),
-            phase: None,
-            role: role.into(),
-            user_input: user_input.into(),
-            model_context: String::new(),
-            pending_input: VecDeque::new(),
-            emitted_items: Vec::new(),
-            pending_tool_calls: Vec::new(),
-            cancellation_state: "none".to_string(),
-            needs_follow_up: false,
-            end_reason: None,
-            tools_disabled: false,
-        }
-    }
-
-    pub fn push_pending_input(&mut self, input: impl Into<String>) {
-        self.pending_input.push_back(input.into());
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct ModelInput {
-    pub system_instruction: Option<String>,
-    pub items: Vec<TurnItem>,
-    pub available_tools: Vec<String>,
-    pub truncation: TruncationConfig,
-}
-
-#[derive(Debug, Clone)]
-pub struct ModelResponse {
-    pub assistant_message: Option<String>,
-    pub reasoning_summary: Option<String>,
-    pub tool_calls: Vec<ToolCallRequest>,
-    pub end_turn: bool,
-    pub raw: Value,
-    pub turn_status: TurnStatus,
-}
-
-#[derive(Debug, Clone)]
-pub enum ModelStreamEvent {
-    AssistantMessageStarted {
-        item_id: String,
-    },
-    AssistantTextDelta {
-        item_id: String,
-        delta: String,
-    },
-    AssistantMessageCompleted {
-        item_id: String,
-        turn_status: TurnStatus,
-    },
-    ReasoningSummaryDelta {
-        item_id: String,
-        delta: String,
-    },
-    ReasoningSummaryCompleted {
-        item_id: String,
-    },
-    ReasoningStateCompleted {
-        item_id: String,
-        encrypted_content: String,
-    },
-    ToolCallCompleted {
-        tool_call: ToolCallRequest,
-    },
-    ResponseCompleted {
-        end_turn: bool,
-        raw: Value,
-    },
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct ModelStreamResult {
-    pub needs_follow_up: bool,
-    pub last_assistant_message_id: Option<String>,
-    pub tool_calls: Vec<ToolCallRequest>,
-    pub usage: TokenUsage,
-    pub turn_count: u64,
-    pub tool_call_count: u64,
-    /// Wall time spent inside model stream/generate calls (sum of iterations).
-    pub llm_ms: u128,
-    /// Wall time spent executing tools (sum of concurrent batch wall times).
-    pub tool_ms: u128,
-    pub(crate) assistant_message_decisions: Vec<AssistantMessageDecision>,
-}
-
-impl ModelStreamResult {
-    /// Wait/overhead = total - llm - tool (clamped at 0).
-    pub fn wait_ms(&self, total_elapsed_ms: u128) -> u128 {
-        total_elapsed_ms.saturating_sub(self.llm_ms.saturating_add(self.tool_ms))
-    }
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct AssistantMessageDecision {
-    pub item_id: String,
-    pub text: String,
-    pub decision: FollowUpDecision,
-}
-
-pub trait LoopModel: Send {
-    fn generate<'a>(
-        &'a mut self,
-        input: ModelInput,
-    ) -> Pin<Box<dyn Future<Output = Result<ModelResponse>> + Send + 'a>>;
-
-    fn stream_events<'a>(
-        &'a mut self,
-        input: ModelInput,
-        handler: &'a mut dyn ModelEventHandler,
-    ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
-        Box::pin(async move {
-            let response = self.generate(input).await?;
-            for event in response_to_stream_events(response)? {
-                handler.handle(event).await?;
-            }
-            Ok(())
-        })
-    }
-}
-
-pub(crate) fn response_to_stream_events(response: ModelResponse) -> Result<Vec<ModelStreamEvent>> {
-    let mut events = Vec::new();
-    if let Some(summary) = response
-        .reasoning_summary
-        .clone()
-        .filter(|value| !value.trim().is_empty())
-    {
-        let item_id = format!("reasoning-{}", Uuid::new_v4());
-        events.push(ModelStreamEvent::ReasoningSummaryDelta {
-            item_id: item_id.clone(),
-            delta: summary,
-        });
-        events.push(ModelStreamEvent::ReasoningSummaryCompleted { item_id });
-    }
-    if let Some(message) = response
-        .assistant_message
-        .clone()
-        .filter(|value| !value.trim().is_empty())
-    {
-        let item_id = format!("msg-{}", Uuid::new_v4());
-        events.push(ModelStreamEvent::AssistantMessageStarted {
-            item_id: item_id.clone(),
-        });
-        events.push(ModelStreamEvent::AssistantTextDelta {
-            item_id: item_id.clone(),
-            delta: message,
-        });
-        events.push(ModelStreamEvent::AssistantMessageCompleted {
-            item_id,
-            turn_status: response.turn_status,
-        });
-    }
-    for tool_call in response.tool_calls {
-        events.push(ModelStreamEvent::ToolCallCompleted { tool_call });
-    }
-    events.push(ModelStreamEvent::ResponseCompleted {
-        end_turn: response.end_turn,
-        raw: response.raw,
-    });
-    Ok(events)
-}
-
-pub trait LoopToolRuntime: Send + Sync {
-    fn set_turn_context(&mut self, _context: ToolRuntimeTurnContext) {}
-
-    fn execute<'a>(
-        &'a self,
-        call: ToolCallRequest,
-    ) -> Pin<Box<dyn Future<Output = ToolResultItem> + Send + 'a>>;
-}
-
-#[derive(Debug, Clone)]
-pub struct ToolRuntimeTurnContext {
-    pub run_id: String,
-    pub session_id: String,
-    pub turn_id: String,
-    pub role: String,
-    pub phase: Option<i64>,
-}
 
 pub struct RigLoopModel {
     settings: RigSettings,
@@ -610,7 +81,7 @@ impl LoopModel for RigLoopModel {
     ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
         Box::pin(async move {
             let prompt = model_role_prompt(&input)?;
-            let mut capture = DebugLlmCapture::new(handler, &input);
+            let mut capture = debug_capture::DebugLlmCapture::new(handler, &input);
             let result =
                 crate::run_model_event_stream(&self.settings, &input, &prompt, &mut capture).await;
             if self.settings.debug {
@@ -623,141 +94,6 @@ impl LoopModel for RigLoopModel {
         })
     }
 }
-
-struct DebugLlmCapture<'a> {
-    inner: &'a mut dyn ModelEventHandler,
-    req_messages: Vec<Value>,
-    req_tools: Vec<Value>,
-    assistant_text: String,
-    tool_calls: Vec<Value>,
-    raw: Value,
-    end_turn: Option<bool>,
-    started: Instant,
-}
-
-impl<'a> DebugLlmCapture<'a> {
-    fn new(inner: &'a mut dyn ModelEventHandler, input: &ModelInput) -> Self {
-        Self {
-            inner,
-            req_messages: input_to_debug_messages(input),
-            req_tools: tools::tool_definitions_json(&input.available_tools),
-            assistant_text: String::new(),
-            tool_calls: Vec::new(),
-            raw: Value::Null,
-            end_turn: None,
-            started: Instant::now(),
-        }
-    }
-
-    fn into_record(self, settings: &RigSettings) -> Value {
-        let end_turn = if self.tool_calls.is_empty() {
-            self.end_turn
-        } else {
-            Some(false)
-        };
-        let elapsed_ms = self.started.elapsed().as_millis();
-        let usage = extract_token_usage(&self.raw);
-        json!({
-            "kind": "stream",
-            "role": settings.role,
-            "phase": settings.phase,
-            "topic_id": settings.topic_id,
-            "model": settings.llm.model,
-            "req": {
-                "messages": self.req_messages,
-                "tools": self.req_tools,
-            },
-            "resp": self.raw,
-            "elapsed_ms": elapsed_ms,
-            "token": {
-                "input_tokens": usage.input_tokens,
-                "output_tokens": usage.output_tokens,
-                "cached_tokens": usage.cached_tokens,
-                "reasoning_tokens": usage.reasoning_tokens,
-                "total_tokens": usage.total_tokens,
-            },
-            "response_text": self.assistant_text,
-            "tool_calls": self.tool_calls,
-            "end_turn": end_turn,
-        })
-    }
-}
-
-pub fn input_to_debug_messages(input: &ModelInput) -> Vec<Value> {
-    let mut messages = Vec::new();
-    if let Some(system) = &input.system_instruction {
-        messages.push(json!({"role": "system", "content": system}));
-    }
-    for item in &input.items {
-        if let Some(msg) = turn_item_to_debug_message(item) {
-            messages.push(msg);
-        }
-    }
-    messages
-}
-
-fn turn_item_to_debug_message(item: &TurnItem) -> Option<Value> {
-    match item.item_type {
-        TurnItemType::UserMessage | TurnItemType::CompactSummary => Some(json!({
-            "role": if item.item_type == TurnItemType::CompactSummary { "system" } else { "user" },
-            "content": item.content_text,
-        })),
-        TurnItemType::AssistantMessage => Some(json!({
-            "role": "assistant",
-            "content": item.content_text,
-        })),
-        TurnItemType::ToolCall => {
-            let call = item.content_json.get("call")?;
-            let arguments = call.get("arguments").cloned().unwrap_or(Value::Null);
-            Some(json!({
-                "role": "assistant",
-                "tool_calls": [{
-                    "id": call.get("call_id").and_then(Value::as_str).unwrap_or(&item.tool_call_id),
-                    "type": "function",
-                    "function": {
-                        "name": call.get("name").and_then(Value::as_str).unwrap_or(&item.tool_name),
-                        "arguments": serde_json::to_string(&arguments).unwrap_or_else(|_| "null".to_string())
-                    }
-                }]
-            }))
-        }
-        TurnItemType::ToolResult => Some(json!({
-            "role": "tool",
-            "tool_call_id": item.tool_call_id,
-            "content": item.content_text,
-        })),
-        _ => None,
-    }
-}
-
-impl ModelEventHandler for DebugLlmCapture<'_> {
-    fn handle<'a>(
-        &'a mut self,
-        event: ModelStreamEvent,
-    ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
-        Box::pin(async move {
-            match &event {
-                ModelStreamEvent::AssistantTextDelta { delta, .. } => {
-                    self.assistant_text.push_str(delta);
-                }
-                ModelStreamEvent::ToolCallCompleted { tool_call } => {
-                    self.tool_calls.push(json!({
-                        "call_id": tool_call.call_id,
-                        "name": tool_call.name,
-                        "arguments": tool_call.arguments,
-                    }));
-                }
-                ModelStreamEvent::ResponseCompleted { end_turn, raw } => {
-                    self.end_turn = Some(*end_turn);
-                    self.raw = raw.clone();
-                }
-                _ => {}
-            }
-            self.inner.handle(event).await
-        })
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct AgentLoopConfig {
     pub max_agent_loops: Option<usize>,
@@ -1001,18 +337,6 @@ where
             // Concurrent tools share wall time; charge the batch duration once.
             let tool_batch_ms = tool_batch_started.elapsed().as_millis();
             aggregate_result.tool_ms = aggregate_result.tool_ms.saturating_add(tool_batch_ms);
-            let stop_rereading = results.iter().any(|(result, _, _)| {
-                result.output.get("status").and_then(Value::as_str) == Some("stop_rereading")
-            });
-            let analyst_evidence_ready = turn.role.starts_with("analyst.")
-                && results.iter().any(|(result, _, name)| {
-                    name == "read_run_context"
-                        && matches!(
-                            result.output.get("status").and_then(Value::as_str),
-                            Some("ok") | Some("stop_rereading")
-                        )
-                });
-
             // Emit results and append to DB (sequentially, in completion order)
             for (result, _call_id, _name) in results {
                 emit_tool_result(turn, sink, &result).await?;
@@ -1020,10 +344,7 @@ where
                     .push(TurnItem::tool_result(&result, &config.truncation));
             }
             persist_turn(conn, turn, &config.truncation)?;
-            // Detect stop_rereading / enough evidence and force artifact emission.
-            // Analysts only need one successful context read; waiting for loop_index>=3
-            // left live runs hanging on long tool-enabled streams.
-            if stop_rereading || analyst_evidence_ready || loop_index >= 3 {
+            if loop_index >= 3 {
                 turn.tools_disabled = true;
                 let hint = if turn.role.starts_with("analyst.") {
                     "Emit one JSON object with id/role for this analyst, status=completed, and per_ticker.<TICKER>.{direction,confidence,report}. direction must be bullish|bearish|neutral|mixed|unobserved; confidence must be a 0..1 number."
@@ -1260,7 +581,7 @@ async fn apply_judge_to_stream_result(
     Ok(())
 }
 
-fn truncate_tool_result(content: &str, truncation: &TruncationConfig) -> String {
+pub(super) fn truncate_tool_result(content: &str, truncation: &TruncationConfig) -> String {
     truncate_semantic(content, truncation.tool_result_chars, truncation)
 }
 
@@ -1269,7 +590,7 @@ fn truncate_context_fragment(content: &str, truncation: &TruncationConfig) -> St
 }
 
 /// Shrink oversized tool outputs before they are stored in turn history / prompts.
-fn compact_tool_output_for_history(
+pub(super) fn compact_tool_output_for_history(
     output: &Value,
     truncated_text: &str,
     truncation: &TruncationConfig,
@@ -1288,7 +609,7 @@ fn compact_tool_output_for_history(
     })
 }
 
-fn persist_turn(
+pub(super) fn persist_turn(
     conn: &rusqlite::Connection,
     turn: &Turn,
     truncation: &TruncationConfig,
@@ -1340,7 +661,7 @@ fn persist_turn(
     )
 }
 
-fn update_turn_item(
+pub(super) fn update_turn_item(
     _conn: &rusqlite::Connection,
     turn: &mut Turn,
     output_item_id: &str,
@@ -1414,7 +735,7 @@ fn output_item_for(item: &TurnItem) -> Option<AgentOutputItem> {
     }
 }
 
-async fn emit_started<S: AgentEventSink>(turn: &Turn, sink: &mut S, item: &TurnItem) -> Result<()> {
+pub(super) async fn emit_started<S: AgentEventSink>(turn: &Turn, sink: &mut S, item: &TurnItem) -> Result<()> {
     if let Some(output_item) = output_item_for(item) {
         sink.emit(AgentLoopEvent::TurnItemStarted {
             turn_id: turn.turn_id.clone(),
@@ -1425,7 +746,7 @@ async fn emit_started<S: AgentEventSink>(turn: &Turn, sink: &mut S, item: &TurnI
     Ok(())
 }
 
-async fn emit_completed<S: AgentEventSink>(
+pub(super) async fn emit_completed<S: AgentEventSink>(
     turn: &Turn,
     sink: &mut S,
     item: &TurnItem,
@@ -1440,7 +761,7 @@ async fn emit_completed<S: AgentEventSink>(
     Ok(())
 }
 
-async fn emit_delta<S: AgentEventSink>(
+pub(super) async fn emit_delta<S: AgentEventSink>(
     turn: &Turn,
     sink: &mut S,
     item_id: &str,
@@ -1454,7 +775,7 @@ async fn emit_delta<S: AgentEventSink>(
     .await
 }
 
-fn started_assistant_item(item_id: &str) -> TurnItem {
+pub(super) fn started_assistant_item(item_id: &str) -> TurnItem {
     TurnItem {
         item_type: TurnItemType::AssistantMessage,
         role: "assistant".to_string(),
@@ -1474,7 +795,7 @@ fn started_assistant_item(item_id: &str) -> TurnItem {
     }
 }
 
-fn started_reasoning_item(item_id: &str) -> TurnItem {
+pub(super) fn started_reasoning_item(item_id: &str) -> TurnItem {
     TurnItem {
         item_type: TurnItemType::ReasoningSummary,
         role: "assistant".to_string(),
@@ -1839,241 +1160,6 @@ pub fn turn_item_from_history_value(value: Value) -> TurnItem {
     }
 }
 
-struct ModelStreamHandler<'a, S: AgentEventSink> {
-    conn: &'a rusqlite::Connection,
-    turn: &'a mut Turn,
-    sink: &'a mut S,
-    result: ModelStreamResult,
-    assistant_buffers: BTreeMap<String, String>,
-    reasoning_buffers: BTreeMap<String, String>,
-    truncation: TruncationConfig,
-}
-
-impl<'a, S: AgentEventSink> ModelStreamHandler<'a, S> {
-    fn new(
-        conn: &'a rusqlite::Connection,
-        turn: &'a mut Turn,
-        sink: &'a mut S,
-        truncation: TruncationConfig,
-    ) -> Self {
-        Self {
-            conn,
-            turn,
-            sink,
-            result: ModelStreamResult::default(),
-            assistant_buffers: BTreeMap::new(),
-            reasoning_buffers: BTreeMap::new(),
-            truncation,
-        }
-    }
-
-    async fn handle_event(&mut self, event: ModelStreamEvent) -> Result<()> {
-        match event {
-            ModelStreamEvent::AssistantMessageStarted { item_id } => {
-                debug!(
-                    turn_id = self.turn.turn_id,
-                    item_id, "model stream assistant message started"
-                );
-                let item = started_assistant_item(&item_id);
-                self.turn.emitted_items.push(item);
-                emit_started(
-                    self.turn,
-                    self.sink,
-                    self.turn.emitted_items.last().expect("just appended"),
-                )
-                .await?;
-                self.assistant_buffers
-                    .insert(item_id.clone(), String::new());
-            }
-            ModelStreamEvent::AssistantTextDelta { item_id, delta } => {
-                let buffer = self.assistant_buffers.entry(item_id.clone()).or_default();
-                buffer.push_str(&delta);
-                let _ = update_turn_item(
-                    self.conn,
-                    self.turn,
-                    &item_id,
-                    buffer.clone(),
-                    Some(AgentItemPhase::Commentary),
-                    AgentItemStatus::InProgress,
-                    &self.truncation,
-                )?;
-                emit_delta(self.turn, self.sink, &item_id, &delta).await?;
-            }
-            ModelStreamEvent::AssistantMessageCompleted {
-                item_id,
-                turn_status,
-            } => {
-                let text = self.assistant_buffers.remove(&item_id).unwrap_or_default();
-                debug!(
-                    turn_id = self.turn.turn_id,
-                    item_id,
-                    text_chars = text.len(),
-                    turn_status = ?turn_status,
-                    "model stream assistant message completed"
-                );
-                let decision = classify_assistant_message(&text, turn_status);
-                let needs_follow_up = matches!(decision, FollowUpDecision::NeedsFollowUp);
-                if needs_follow_up {
-                    self.result.needs_follow_up = true;
-                }
-                self.result
-                    .assistant_message_decisions
-                    .push(AssistantMessageDecision {
-                        item_id: item_id.clone(),
-                        text: text.clone(),
-                        decision,
-                    });
-                if let Some(item) = update_turn_item(
-                    self.conn,
-                    self.turn,
-                    &item_id,
-                    text,
-                    Some(AgentItemPhase::Commentary),
-                    AgentItemStatus::Completed,
-                    &self.truncation,
-                )? {
-                    emit_completed(self.turn, self.sink, &item).await?;
-                }
-                self.result.last_assistant_message_id = Some(item_id);
-            }
-            ModelStreamEvent::ReasoningSummaryDelta { item_id, delta } => {
-                if !self.reasoning_buffers.contains_key(&item_id) {
-                    let item = started_reasoning_item(&item_id);
-                    self.turn.emitted_items.push(item);
-                    emit_started(
-                        self.turn,
-                        self.sink,
-                        self.turn.emitted_items.last().expect("just appended"),
-                    )
-                    .await?;
-                }
-                let buffer = self.reasoning_buffers.entry(item_id.clone()).or_default();
-                buffer.push_str(&delta);
-                let _ = update_turn_item(
-                    self.conn,
-                    self.turn,
-                    &item_id,
-                    buffer.clone(),
-                    None,
-                    AgentItemStatus::InProgress,
-                    &self.truncation,
-                )?;
-                emit_delta(self.turn, self.sink, &item_id, &delta).await?;
-            }
-            ModelStreamEvent::ReasoningSummaryCompleted { item_id } => {
-                let text = self.reasoning_buffers.remove(&item_id).unwrap_or_default();
-                debug!(
-                    turn_id = self.turn.turn_id,
-                    item_id,
-                    text_chars = text.len(),
-                    "model stream reasoning summary completed"
-                );
-                if let Some(item) = update_turn_item(
-                    self.conn,
-                    self.turn,
-                    &item_id,
-                    text,
-                    None,
-                    AgentItemStatus::Completed,
-                    &self.truncation,
-                )? {
-                    emit_completed(self.turn, self.sink, &item).await?;
-                }
-            }
-            ModelStreamEvent::ReasoningStateCompleted {
-                item_id,
-                encrypted_content,
-            } => {
-                debug!(
-                    turn_id = self.turn.turn_id,
-                    item_id,
-                    state_chars = encrypted_content.len(),
-                    "model stream reasoning state completed"
-                );
-                let item = TurnItem {
-                    item_type: TurnItemType::ReasoningState,
-                    role: "assistant".to_string(),
-                    content_text: String::new(),
-                    content_json: json!({
-                        "output_item_id": item_id,
-                        "encrypted_content": encrypted_content,
-                        "summary": []
-                    }),
-                    tool_call_id: String::new(),
-                    tool_name: String::new(),
-                    output_item_id: item_id,
-                    phase: None,
-                    status: Some(AgentItemStatus::Completed),
-                    db_row_id: None,
-                };
-                self.turn.emitted_items.push(item);
-            }
-            ModelStreamEvent::ToolCallCompleted { tool_call } => {
-                debug!(
-                    turn_id = self.turn.turn_id,
-                    call_id = tool_call.call_id,
-                    tool = tool_call.name,
-                    "model stream tool call requested"
-                );
-                let item = TurnItem::tool_call(&tool_call);
-                self.turn.emitted_items.push(item);
-                emit_completed(
-                    self.turn,
-                    self.sink,
-                    self.turn.emitted_items.last().expect("just appended"),
-                )
-                .await?;
-                self.result.needs_follow_up = true;
-                self.result.tool_call_count += 1;
-                self.result.tool_calls.push(tool_call.clone());
-                self.turn.pending_tool_calls.push(tool_call);
-            }
-            ModelStreamEvent::ResponseCompleted { end_turn, raw } => {
-                let token_usage = extract_token_usage(&raw);
-                debug!(
-                    turn_id = self.turn.turn_id,
-                    end_turn,
-                    input_tokens = token_usage.input_tokens,
-                    output_tokens = token_usage.output_tokens,
-                    cached_tokens = token_usage.cached_tokens,
-                    reasoning_tokens = token_usage.reasoning_tokens,
-                    total_tokens = token_usage.total_tokens,
-                    "model stream response completed"
-                );
-                self.result.usage += token_usage;
-                self.result.turn_count += 1;
-                if !end_turn {
-                    self.result.needs_follow_up = true;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    async fn finish(mut self) -> Result<ModelStreamResult> {
-        self.result.needs_follow_up = self.result.needs_follow_up
-            || self
-                .result
-                .assistant_message_decisions
-                .iter()
-                .any(|item| matches!(item.decision, FollowUpDecision::NeedsFollowUp))
-            || !self.turn.pending_tool_calls.is_empty()
-            || !self.turn.pending_input.is_empty();
-        self.turn.needs_follow_up = self.result.needs_follow_up;
-        persist_turn(self.conn, self.turn, &self.truncation)?;
-        Ok(self.result)
-    }
-}
-
-impl<S: AgentEventSink> ModelEventHandler for ModelStreamHandler<'_, S> {
-    fn handle<'a>(
-        &'a mut self,
-        event: ModelStreamEvent,
-    ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
-        Box::pin(async move { self.handle_event(event).await })
-    }
-}
-
 async fn mark_last_assistant_message_as_final<S: AgentEventSink>(
     conn: &rusqlite::Connection,
     turn: &mut Turn,
@@ -2100,14 +1186,8 @@ async fn mark_last_assistant_message_as_final<S: AgentEventSink>(
     Ok(())
 }
 
-fn preseed_context_kind(role: &str) -> Option<&'static str> {
-    match role {
-        "analyst.technical" => Some("technical"),
-        "analyst.news_macro" => Some("jin10"),
-        // Phase-2 topic/debate roles fork Phase 1.5 summary from the prompt
-        // (`{phase15_fork}`); do not preseed raw compose_context/jin10/technical.
-        _ => None,
-    }
+fn preseed_context_kind(_role: &str) -> Option<&'static str> {
+    None
 }
 
 /// Map plain assistant text (rig stream/text output) into a ModelResponse.
@@ -2200,28 +1280,6 @@ fn parse_legacy_react_response(value: Value) -> Result<ModelResponse> {
     })
 }
 
-/// Turn status as reported by the LLM in the assistant_message_completed event.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum TurnStatus {
-    /// LLM reports this is the final artifact.
-    Final,
-    /// LLM reports this is an intermediate/stall message.
-    Intermediate,
-    /// LLM did not report a status (legacy or omitted).
-    #[default]
-    Unknown,
-}
-
-/// Result of stall detection for an assistant message.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FollowUpDecision {
-    /// The message is a stall; the agent loop should continue.
-    NeedsFollowUp,
-    /// The message is final; the agent loop should end the turn.
-    Final,
-    /// The message is ambiguous; run the LLM judge to decide.
-    Ambiguous,
-}
 
 /// Extract turn_status from the assistant_message_completed event metadata.
 /// The event may carry {"turn_status": "final" | "intermediate"} as an extra field.
@@ -2664,7 +1722,7 @@ If evidence is missing, call the appropriate tool. When tool evidence is enough,
 You are executing role `{executing_role}` for exactly these tickers: {}.\n\
 A final artifact's role must exactly equal `{executing_role}`. Analyst final artifacts must contain per_ticker entries for exactly this ticker set; do not substitute, rename, or omit tickers.\n\
 Protocol:\n\
-1) Use native function calls for tools (read_run_context, web.run, etc.). Do not invent custom event JSON lines.\n\
+1) Use native function calls for tools. Do not invent custom event JSON lines.\n\
 2) Intermediate commentary may be plain text, but the turn must end with the complete artifact required by the current role schema as a single JSON object in assistant text.\n\
 3) Do not end with text saying you are about to retry, fetch, analyze, or wait for inputs; call the tool or produce the final artifact.\n\
 4) Do not wrap the artifact in id/role/status/report envelopes unless that role schema defines them.\n\
@@ -2725,35 +1783,6 @@ fn turn_item_prompt_json(
     value
 }
 
-/// Token usage from a single OpenAI Responses API call.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct TokenUsage {
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub cached_tokens: u64,
-    pub reasoning_tokens: u64,
-    pub total_tokens: u64,
-}
-
-impl TokenUsage {
-    pub fn non_cached_input_tokens(&self) -> u64 {
-        self.input_tokens.saturating_sub(self.cached_tokens)
-    }
-
-    pub fn visible_output_tokens(&self) -> u64 {
-        self.output_tokens.saturating_sub(self.reasoning_tokens)
-    }
-}
-
-impl std::ops::AddAssign for TokenUsage {
-    fn add_assign(&mut self, rhs: Self) {
-        self.input_tokens += rhs.input_tokens;
-        self.output_tokens += rhs.output_tokens;
-        self.cached_tokens += rhs.cached_tokens;
-        self.reasoning_tokens += rhs.reasoning_tokens;
-        self.total_tokens += rhs.total_tokens;
-    }
-}
 
 fn log_debug_llm_iteration(
     config: &AgentLoopConfig,

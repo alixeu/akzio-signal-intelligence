@@ -12,7 +12,7 @@
   <img src="https://img.shields.io/badge/language-Rust-orange?style=flat-square&logo=rust" alt="Rust">
   <img src="https://img.shields.io/badge/edition-2021-blue?style=flat-square" alt="Edition">
   <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="MIT">
-  <img src="https://img.shields.io/badge/agents-8+%20roles-purple?style=flat-square" alt="Agents">
+  <img src="https://img.shields.io/badge/agents-10+%20roles-purple?style=flat-square" alt="Agents">
   <img src="https://img.shields.io/badge/architecture-Multi--Agent%20Workflow-red?style=flat-square" alt="Architecture">
 </p>
 
@@ -90,8 +90,8 @@ graph TD
     end
 
     subgraph "Phase 1 — 多源研究"
-        TA[技术分析 Agent<br/>权重 40%]
-        NA[新闻/宏观 Agent<br/>权重 35%]
+        TA[技术分析 Agent<br/>权重 50%]
+        NA[新闻/宏观 Agent<br/>权重 50%]
         YA[视频分析 Agent]
         SA[社交情绪 Agent]
     end
@@ -173,8 +173,8 @@ graph TD
 
 | Agent | 数据源 | 默认权重 |
 |-------|--------|----------|
-| `technical` | Yahoo Finance OHLCV + 指标 | 40% |
-| `news_macro` | Jin10 快讯 + Web Search | 35% |
+| `technical` | Yahoo Finance OHLCV + 指标 | 50% |
+| `news_macro` | Jin10 快讯 + Web Search | 50% |
 | `youtube` | 视频分析师逐字稿 | 可配置 |
 | `reddit` | Subreddit 情绪 | 可配置 |
 | `x` | Twitter/X 帖子 | 可配置 |
@@ -327,38 +327,59 @@ Final Probability = Base Probability + Debate Adjustment + Evidence Modifier
 每个 Agent 运行在 Rig 框架的 Agent Loop 中，具备：
 
 - **作用域隔离的 SQLite 上下文** — `read_run_context` 工具提供时间窗口和 Ticker 过滤后的精确数据
-- **结构化输出契约** — Prompt 层 JSON Schema 强约束输出格式
-- **Turn 级持久化** — 每个 Agent Turn 的完整对话上下文和摘要存入 `agent_events`
+- **结构化输出契约** — Prompt 层 JSON Schema 强约束输出格式（通过 `common/` 共享组件标准化）
+- **Turn 级持久化** — 每个 Agent Turn 的完整对话上下文、Token 用量和成本存入 `agent_events`
 - **优雅降级** — 失败的 Agent 产生 Degraded 标记，后续阶段在降低置信度下继续运行
-- **Web Search 能力** — Exa 驱动的实时搜索（可配置）
+- **Web Search 能力** — Exa MCP 驱动的实时搜索（可配置 context_size 和 max_result_chars）
+- **注意力机制** — `attention_ledger` 记录各角色对关键主题的关注度评分
+- **冲突检测** — Trader 输出与 Research 结论的一致性自动校验
+- **Plugin 组件系统** — `ComponentRegistry` 支持可组合的 Prompt 组件注入
+- **防注入保护** — 所有 Prompt 自动包含 `anti_injection.md` 安全指令
 
 ### 角色体系
 
 ```
 prompts/
-├── analysts/           # Phase 1 研究 Agent
-│   ├── technical.md    # 技术分析
-│   ├── news_macro.md   # 新闻/宏观
-│   ├── youtube.md      # 视频分析
-│   ├── reddit.md       # Reddit 情绪
-│   └── x.md           # Twitter/X
-├── researchers/        # Phase 2 辩论 Agent
-│   ├── bull.md                # 看多长会话（预热/立论/对辩/按中间人整改）
-│   └── bear.md                # 看空长会话（同上）
-├── mediators/          # 辩论编排
-│   ├── topic_generation.md
-│   └── topic_controller.md
-├── managers/           # 决策综合
-│   ├── research_manager.md
-│   └── portfolio_manager.md
-├── traders/            # 交易转换
+├── analysts/                # Phase 1 研究 Agent
+│   ├── technical.md         # 技术分析
+│   ├── news_macro.md        # 新闻/宏观
+│   ├── youtube.md           # 视频分析
+│   ├── reddit.md            # Reddit 情绪
+│   └── x.md                # Twitter/X
+├── researchers/             # Phase 2 辩论 Agent（多阶段 Prompt）
+│   ├── bull.md              # 看多系统 Prompt
+│   ├── bull_initial.md      # 看多初始立论
+│   ├── bull_interaction.md  # 看多对辩交互
+│   ├── bull_initial_monitor.md  # Monitor 模式看多
+│   ├── bear.md              # 看空系统 Prompt
+│   ├── bear_initial.md      # 看空初始立论
+│   ├── bear_interaction.md  # 看空对辩交互
+│   └── bear_initial_monitor.md  # Monitor 模式看空
+├── mediators/               # 辩论编排
+│   ├── topic_generation.md  # 议题提取
+│   └── topic_controller.md  # 辩论裁判
+├── managers/                # 决策综合
+│   ├── research_manager.md  # 贝叶斯概率裁决
+│   └── portfolio_manager.md # 最终投资决策
+├── traders/                 # 交易转换
 │   └── trader.md
-├── risk/               # 风险委员会
+├── risk/                    # 风险委员会
 │   ├── conservative.md
 │   ├── neutral.md
 │   └── aggressive.md
-└── allocation/         # 配置管理
-    └── manager.md
+├── allocation/              # 配置管理
+│   └── manager.md
+├── common/                  # 共享 Prompt 组件
+│   ├── anti_injection.md           # 防注入指令
+│   ├── analyst_output_contract.md  # Analyst 输出契约
+│   ├── analyst_output_structure.md # 输出结构规范
+│   ├── leveraged_etf_rules.md      # 杠杆 ETF 规则
+│   ├── research_calibration.md     # 研究校准指导
+│   ├── research_drivers.md         # 驱动因子分析框架
+│   └── risk_analyst.md             # 风险分析师通用规则
+└── components/              # 可组合 Prompt 组件（Plugin 注册）
+    └── ticker/
+        └── component.md     # Ticker 级上下文注入
 ```
 
 ---
@@ -495,7 +516,7 @@ LLM 负责 *thinking*，Rust 负责 *decision safety*。
 
 ```
 runs                    ← 运行元数据、状态、耗时
-agent_events            ← 每 Turn 完整对话上下文 + 摘要
+agent_events            ← 每 Turn 完整对话上下文 + Token 用量 + 成本 + 缓存统计
 role_turn_summaries     ← 各角色的结构化分析输出
 predictions             ← 校准后的概率预测
 outcomes                ← 实际收益 vs 预测
@@ -503,15 +524,14 @@ memory_items            ← 活跃经验记忆（版本化）
 memory_versions         ← 记忆内容版本 + 证据引用
 candidate_experiences   ← 预晋升的经验候选
 jin10_items             ← Jin10 快讯（id=md5, content_json, attention_score 缓存）
-phase_summaries         ← 每阶段压缩总结（运行时权威在内存 phase00_memory；run 结束 flush 到 SQLite）
+phase_summaries         ← 每阶段压缩总结（运行时权威在内存；run 结束 flush 到 SQLite）
 phase_summary_details   ← 详细点 → 所属 summary_id
-attention_ledger        ← 统一注意力（role/turn_id/subject/score）
+attention_ledger        ← 统一注意力评分（role/turn_id/subject/score）
 ```
 
-技术指标不再入库：Yahoo 多周期序列写到 `outputs/technical/` CSV（如 `qqq_day.csv`、`qqq_3h.csv`、`vix_20min.csv`），每个级别默认保留最近 60 条 K 线。
+技术指标不入库：Yahoo 多周期序列写到 `outputs/technical/` CSV（如 `qqq_day.csv`、`qqq_3h.csv`、`vix_20min.csv`），每个级别默认保留最近 60 条 K 线。Jin10 快讯同样支持 CSV 缓存到 `outputs/jin10/`。
 
 时间字段统一使用 Unix 时间戳（INTEGER）存储。
-```
 
 ---
 
@@ -530,17 +550,67 @@ attention_ledger        ← 统一注意力（role/turn_id/subject/score）
 
 ### Crate 结构
 
+Workspace 包含 6 个成员 crate：
+
 ```
 crates/
-├── orchestrator-core       # 配置、路径、Ticker 解析、Prompt 辅助、Reflection 类型
+├── orchestrator-core       # 配置、路径、Ticker 解析、Prompt 辅助、Artifact 类型与校验
+│                           # Reflection 类型、Token 定价、Plugin Manifest、Role Registry
+│                           # 技术指标 CSV / Jin10 CSV 读写
 ├── orchestrator-sql        # SQLite Schema、数据访问、Context 检索、Memory 操作
-├── orchestrator-llm        # LLM 执行（Rig 框架）、Agent Loop、工具、Web Search、截断
-├── orchestrator-ingest     # 数据采集：Yahoo、Jin10、YouTube、Reddit、X
-├── orchestrator-workflow   # Phase 编排、Policy 引擎、Allocation、状态管理
-├── orchestrator-cli        # CLI 二进制入口
-├── orchestrator-report     # 报告生成和邮件发送
-└── orchestrator-eval       # 评估框架
+│                           # Phase 索引 / 注意力账本 / Phase00 Gate / Prediction & Outcome
+├── orchestrator-llm        # LLM 执行（Rig 框架）、Agent Loop、Web Search（Exa MCP）
+│                           # 截断引擎、LLM Judge 自动质量评估
+├── orchestrator-ingest     # 数据采集：Yahoo Finance 技术指标、Jin10 快讯
+│                           # YouTube / WayinVideo 逐字稿、Reddit / X 社交媒体
+├── orchestrator-workflow   # Phase 编排、Policy 引擎、Allocation、冲突检测
+│                           # 降级管理、报告生成、Exec 入口
+└── orchestrator-cli        # CLI 二进制入口（8 个命令）、Eval 框架、Prompt Lint
+                            # 记忆晋升、Reflection 评分、Weekly Distill、SQL CLI
 ```
+
+---
+
+## Quality Toolchain
+
+### Prompt Lint
+
+`orchestrator-prompt-lint` 对 `prompts/` 目录执行静态分析：
+
+| 检查项 | 说明 |
+|--------|------|
+| 占位符完整性 | 所有 `{{placeholder}}` 在渲染时有对应值 |
+| Schema 引用有效性 | 引用的 JSON Schema 文件存在且合法 |
+| 共享组件存在性 | `common/` 下引用的组件文件存在 |
+| 孤儿占位符 | 未被任何角色引用的占位符 |
+| 文件大小 | Prompt 文件不超过合理上限 |
+| 重复内容 | 检测跨文件的冗余内容 |
+| 反注入检查 | 验证 `anti_injection.md` 被正确引用 |
+
+支持 `--strict` 模式（warning 视为 error），输出格式 JSON 或 Text。
+
+### Eval Framework
+
+`orchestrator-eval` 提供 Prompt 回归检测：
+
+- 从 `tests/eval/cases/` 加载 JSON 测试用例
+- 在 Mock 或 Live 模式下运行，对 Artifact 评分
+- 评分维度：JSON 有效性、Schema 合规性、字段完整性、方向合理性、证据质量
+- 与 `tests/eval/baseline.json` 对比检测退化，退化时返回非零退出码
+
+### Metrics
+
+`orchestrator-metrics` 查询 SQLite 中的 `agent_events` 表：
+
+- `by-role` — 按角色聚合 Token 消耗和成本
+- `by-phase` — 按阶段聚合
+- `cache-hit-rate` — Prompt 缓存命中率
+- `context-warnings` — 上下文截断告警记录
+- `run-summary` — 单次运行的综合摘要
+
+### LLM Judge
+
+`orchestrator-llm` 内置的 `llm_judge` 模块提供自动化质量评估，用于对 Agent 输出进行结构化打分。
 
 ---
 
@@ -551,10 +621,12 @@ LLM 调用是系统的主要成本。设计中采用多层策略降低 Token 消
 | 策略 | 实现 |
 |------|------|
 | **Evidence Compression** | Phase 2 Reducer 将多轮辩论压缩为结构化摘要 |
+| **Phase Index** | `phase_summaries` 压缩每阶段输出，后续阶段读取摘要而非原文 |
 | **Artifact Passing** | Phase 间只传递结构化 Artifact，不传原始对话 |
 | **Scoped Context** | `read_run_context` 按时间窗口 + Ticker 精确过滤 |
-| **Memory Retrieval** | 仅检索当前 Regime 兼容的记忆，不全量注入 |
+| **Memory Retrieval** | Phase00 Gate 仅检索当前 Regime 兼容的记忆，不全量注入 |
 | **Truncation Engine** | `orchestrator-llm/truncation.rs` 智能截断超长内容 |
+| **Prompt Cache** | 支持推理缓存（`cached_tokens` 追踪，`cache-hit-rate` 可查询） |
 | **Skip Zero-Weight** | 权重为 0 的 Analyst 在 Phase 1 直接跳过 |
 | **Rust Rule Bypass** | 高置信度场景用 Rust 规则代替 LLM Trader |
 | **Policy Skip** | Workflow Policy 门控跳过不必要的 LLM Phase |
@@ -565,10 +637,10 @@ LLM 调用是系统的主要成本。设计中采用多层策略降低 Token 消
 
 ```yaml
 # 运行命令
-# cargo run -p orchestrator-cli --bin orchestrator-exec
+# cargo run -p orchestrator-cli --bin orchestrator-exec -- --mode probability
 
 Ticker: QQQ, SOXX
-Date: 2025-07-14
+Date: 2026-07-14
 Mode: probability
 Market Regime:
   volatility: medium
@@ -628,7 +700,7 @@ Total Elapsed: 4m 32s
 
 - Rust 1.75+（2021 edition）
 - SQLite 3.35+（通过 `rusqlite` bundled，无需单独安装）
-- LLM API 访问（OpenAI 兼容端点）
+- LLM API 访问（OpenAI 兼容端点，支持 Responses API）
 
 ### 构建
 
@@ -639,7 +711,11 @@ cd akzio-signal-intelligence
 cargo build --release
 ```
 
-### 运行
+### CLI 命令
+
+所有二进制均通过 `orchestrator-cli` crate 统一提供：
+
+#### 核心执行
 
 ```bash
 # 完整分析运行（需要 LLM_GATEWAY_API_KEY）
@@ -655,17 +731,75 @@ cargo run -p orchestrator-cli --bin orchestrator-exec -- --from-phase 3 --to-pha
 # Monitor 模式（监控而非概率判断）
 cargo run -p orchestrator-cli --bin orchestrator-exec -- --mode monitor
 
+# 指定模型和推理强度
+cargo run -p orchestrator-cli --bin orchestrator-exec -- --model gpt-5.6-luna --reasoning-effort low
+
+# 调试模式（将 LLM 记录写入 outputs/debug/）
+cargo run -p orchestrator-cli --bin orchestrator-exec -- --debug
+```
+
+#### 数据采集（orchestrator-ingest）
+
+```bash
+# 采集 Jin10 金融快讯
+cargo run -p orchestrator-cli --bin orchestrator-ingest -- jin10-flash
+
+# 采集 YouTube 分析师视频逐字稿
+cargo run -p orchestrator-cli --bin orchestrator-ingest -- youtube-transcript
+
+# 采集 WayinVideo 逐字稿
+cargo run -p orchestrator-cli --bin orchestrator-ingest -- wayinvideo-transcript
+
+# 采集社交媒体上下文（Reddit / X）
+cargo run -p orchestrator-cli --bin orchestrator-ingest -- last30days-context
+
+# 下载技术指标数据
+cargo run -p orchestrator-cli --bin orchestrator-ingest -- technical-indicators
+```
+
+#### 运维操作（orchestrator-ops）
+
+```bash
 # 评分历史预测
-cargo run -p orchestrator-cli --bin reflection-score
+cargo run -p orchestrator-cli --bin orchestrator-ops -- reflection-score
 
 # 蒸馏经验候选
-cargo run -p orchestrator-cli --bin weekly-distill
+cargo run -p orchestrator-cli --bin orchestrator-ops -- weekly-distill
 
 # 晋升记忆
-cargo run -p orchestrator-cli --bin memory-promote
+cargo run -p orchestrator-cli --bin orchestrator-ops -- memory-promote
 
-# 生成并发送每日报告
-cargo run -p orchestrator-cli --bin run-daily-tqqq-report
+# 探测 LLM 网关 strict-schema 支持
+cargo run -p orchestrator-cli --bin orchestrator-ops -- probe-strict-schema
+```
+
+#### 质量与评估
+
+```bash
+# Prompt 模板 Lint（占位符完整性、Schema 引用、反注入检查）
+cargo run -p orchestrator-cli --bin orchestrator-prompt-lint
+cargo run -p orchestrator-cli --bin orchestrator-prompt-lint -- --strict --format text
+
+# Prompt 回归评估（对比 baseline 检测退化）
+cargo run -p orchestrator-cli --bin orchestrator-eval
+cargo run -p orchestrator-cli --bin orchestrator-eval -- --live --filter test_id
+
+# Token 用量与成本分析
+cargo run -p orchestrator-cli --bin orchestrator-metrics -- by-role
+cargo run -p orchestrator-cli --bin orchestrator-metrics -- by-phase
+cargo run -p orchestrator-cli --bin orchestrator-metrics -- cache-hit-rate
+cargo run -p orchestrator-cli --bin orchestrator-metrics -- context-warnings
+cargo run -p orchestrator-cli --bin orchestrator-metrics -- run-summary --run-id <RUN_ID>
+```
+
+#### 其他工具
+
+```bash
+# SQLite 数据操作
+cargo run -p orchestrator-cli --bin orchestrator-sql
+
+# 报告生成与邮件发送
+cargo run -p orchestrator-cli --bin report-email
 ```
 
 ### 验证
@@ -690,26 +824,53 @@ orchestrator:
 
   runtime:
     lang: zh
-    window_days: 60   # technical: K-lines kept per interval (not calendar days)
+    window_days: 60        # 数据检索窗口（K 线条数，非日历天）
     max_debate_rounds: 3
 
   allocation:
     investable_assets: [QQQ, SOXX]
+
+  workflow:
+    agent_timeout_sec: 600
+    reducer_timeout_sec: 600
 
   llm:
     gateway:
       base_url: ${LLM_GATEWAY_BASE_URL}
       api_key: ${LLM_GATEWAY_API_KEY}
     defaults:
-      model: gpt-4o
-      # transport: non_stream | http | ws
-      # non_stream (default) avoids flaky SSE on Baidu/oneapi gateways
-      transport: non_stream
+      route: responses           # 使用 OpenAI Responses API
+      model: gpt-5.6-luna
+      reasoning_effort: low      # low | medium | high
+      reasoning_summary: auto    # auto | concise | detailed
       tools: read_run_context
 
+  web_search:
+    provider: exa
+    base_url: https://mcp.exa.ai/mcp
+    context_size: medium
+    max_result_chars: 12000
+
   analyst_weights:
-    technical: 40.0
-    news_macro: 35.0
+    technical: 50.0
+    news_macro: 50.0
+
+technical:
+  days: 60
+  sleep_sec: 1
+
+jin10:
+  lookback_hours: 24.0
+  pages: 200
+
+youtube:
+  default_channel: rhino
+  max_videos: 6
+
+report:
+  mode: build-and-send
+  email:
+    smtp_url: smtps://smtp.mail.me.com:465
 ```
 
 ### 环境变量
@@ -718,8 +879,11 @@ orchestrator:
 |------|------|
 | `LLM_GATEWAY_API_KEY` | LLM 服务 API Key（live 运行必须） |
 | `LLM_GATEWAY_BASE_URL` | OpenAI 兼容端点 URL |
-| `WAYINVIDEO_USERNAME` / `PASSWORD` | YouTube 逐字稿服务凭证 |
-| `REPORT_SMTP_*` | 邮件报告发送配置 |
+| `ORCH_DB_PATH` | 覆盖默认 SQLite 路径（ops/metrics 命令用） |
+| `WAYINVIDEO_USERNAME` / `WAYINVIDEO_PASSWORD` | YouTube 逐字稿服务凭证 |
+| `REPORT_SMTP_USERNAME` / `REPORT_SMTP_PASSWORD` | 邮件报告 SMTP 凭证 |
+| `REPORT_SMTP_FROM` / `REPORT_SMTP_TO` | 邮件报告发送/接收地址 |
+| `LLM_PROBE_MODEL` | `probe-strict-schema` 命令使用的模型 |
 
 ---
 
@@ -729,10 +893,11 @@ orchestrator:
 |------|------|------|
 | **v0.1** | 核心 Multi-Agent Workflow + 辩论 + 概率引擎 | ✅ 完成 |
 | **v0.2** | Memory System + Reflection Scoring + 记忆晋升 | ✅ 完成 |
-| **v0.3** | Backtesting Framework + Outcome 自动评估 | 🔄 进行中 |
-| **v0.4** | Self-Improvement — 记忆驱动的 Prompt 自适应 | 📋 规划中 |
-| **v0.5** | 多资产相关性推理 + 跨板块传导 | 📋 规划中 |
-| **v0.6** | 实时 Monitor 模式 + 增量更新 | 📋 规划中 |
+| **v0.3** | Eval Framework + Prompt Lint + Metrics 工具链 | ✅ 完成 |
+| **v0.4** | 统一 CLI（ingest/ops/metrics）+ 数据采集管道 | ✅ 完成 |
+| **v0.5** | 注意力机制 + Phase 索引 + 冲突检测 | ✅ 完成 |
+| **v0.6** | Self-Improvement — 记忆驱动的 Prompt 自适应 | 📋 规划中 |
+| **v0.7** | 多资产相关性推理 + 跨板块传导 | 📋 规划中 |
 | **v1.0** | Autonomous Research Organization | 🎯 远景目标 |
 
 ---
@@ -781,11 +946,13 @@ orchestrator:
 
 ### 添加新 Analyst Agent
 
-1. 在 `prompts/analysts/` 下创建 Prompt 模板
-2. 在 Role Registry 或 Plugin Manifest 中注册角色
+1. 在 `prompts/analysts/` 下创建 Prompt 模板（引用 `common/` 中的共享组件）
+2. 在 Role Registry（`orchestrator-core/role_registry.rs`）或 Plugin Manifest 中注册角色
 3. 在 `orchestrator.phase1_agents` 中添加 Agent Key
 4. 在 `orchestrator-ingest` 中实现所需的数据采集
 5. 在 `orchestrator.analyst_weights` 中配置权重
+6. 在 `tests/eval/cases/` 下添加对应的评估用例
+7. 运行 `orchestrator-prompt-lint --strict` 验证 Prompt 合规性
 
 ---
 

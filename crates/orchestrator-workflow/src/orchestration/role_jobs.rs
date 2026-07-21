@@ -17,8 +17,8 @@ use tracing::{debug, warn};
 
 use super::config::{output_mode_for_role, prompt_version, RuntimeConfig};
 use super::degraded::role_artifact_or_degraded;
+use super::lifecycle::tickers_from_state;
 use super::render::render_prompt_with_plugins;
-use super::state::tickers_from_state;
 
 pub(crate) struct RoleRun<'a> {
     pub state: Value,

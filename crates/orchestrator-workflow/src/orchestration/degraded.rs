@@ -5,8 +5,8 @@ use serde_json::{json, Value};
 use tracing::warn;
 
 use super::config::{is_critical_role, RuntimeConfig};
+use super::lifecycle::tickers_from_state;
 use super::role_jobs::RoleJobResult;
-use super::state::tickers_from_state;
 
 enum ConfidenceImpact {
     Minor,

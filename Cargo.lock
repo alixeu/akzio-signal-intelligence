@@ -2696,9 +2696,8 @@ dependencies = [
  "clap",
  "html-escape",
  "orchestrator-core",
- "orchestrator-eval",
  "orchestrator-ingest",
- "orchestrator-report",
+ "orchestrator-llm",
  "orchestrator-sql",
  "orchestrator-workflow",
  "regex",
@@ -2727,19 +2726,6 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "toml",
-]
-
-[[package]]
-name = "orchestrator-eval"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "orchestrator-core",
- "orchestrator-llm",
- "serde",
- "serde_json",
- "tempfile",
 ]
 
 [[package]]
@@ -2783,20 +2769,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "orchestrator-report"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "clap",
- "html-escape",
- "orchestrator-core",
- "pulldown-cmark",
- "serde_json",
- "tempfile",
-]
-
-[[package]]
 name = "orchestrator-sql"
 version = "0.1.0"
 dependencies = [
@@ -2820,11 +2792,12 @@ dependencies = [
  "chrono",
  "clap",
  "futures",
+ "html-escape",
  "orchestrator-core",
  "orchestrator-ingest",
  "orchestrator-llm",
- "orchestrator-report",
  "orchestrator-sql",
+ "pulldown-cmark",
  "rusqlite",
  "serde_json",
  "tempfile",
