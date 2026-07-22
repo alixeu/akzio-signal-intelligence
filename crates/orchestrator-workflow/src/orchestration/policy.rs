@@ -414,7 +414,7 @@ fn import_technical_universe(conn: &mut rusqlite::Connection, state: &Value) -> 
 }
 
 pub(crate) async fn run_jin10_preflight(
-    conn: &mut rusqlite::Connection,
+    _conn: &mut rusqlite::Connection,
     state: &mut Value,
 ) -> Result<()> {
     let tool = "read_jin10_context";
@@ -439,14 +439,16 @@ pub(crate) async fn run_jin10_preflight(
     })
     .await
     .and_then(|payload| {
-        let imported = orchestrator_sql::import_jin10_payload(conn, &payload)?;
-        if imported == 0 {
+        let csv = payload.get("csv").cloned().unwrap_or(Value::Null);
+        let rows = csv.get("rows").and_then(Value::as_u64).unwrap_or_default();
+        if rows == 0 {
             bail!("Jin10 refresh returned no non-empty, timestamped news items");
         }
         Ok(json!({
             "status": "success",
-            "table": "jin10_items",
-            "sqlite_rows": imported
+            "csv": csv,
+            "sqlite_rows": 0,
+            "persistence": "deferred_until_attention_scored"
         }))
     });
     record_preflight_result(state, tool, result);

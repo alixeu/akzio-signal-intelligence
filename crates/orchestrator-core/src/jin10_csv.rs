@@ -98,8 +98,12 @@ pub fn load_jin10_csv(date: &str) -> Vec<Jin10CsvRow> {
 
 /// Load jin10 CSV rows from all recent files in the directory.
 pub fn load_jin10_csv_recent(max_files: usize) -> Vec<Jin10CsvRow> {
-    let csv_dir = default_jin10_csv_dir();
-    let Ok(entries) = fs::read_dir(&csv_dir) else {
+    load_jin10_csv_recent_from_dir(&default_jin10_csv_dir(), max_files)
+}
+
+/// Load Jin10 CSV rows from the newest files in a specific directory.
+pub fn load_jin10_csv_recent_from_dir(csv_dir: &Path, max_files: usize) -> Vec<Jin10CsvRow> {
+    let Ok(entries) = fs::read_dir(csv_dir) else {
         return Vec::new();
     };
     let mut paths: Vec<PathBuf> = entries

@@ -26,7 +26,8 @@ pub use config::{
 };
 pub use jin10_csv::{
     default_jin10_csv_dir, jin10_csv_path, jin10_item_id, load_jin10_csv, load_jin10_csv_recent,
-    read_jin10_csv, write_jin10_csv, Jin10CsvRow, DEFAULT_JIN10_CSV_DIR,
+    load_jin10_csv_recent_from_dir, read_jin10_csv, write_jin10_csv, Jin10CsvRow,
+    DEFAULT_JIN10_CSV_DIR,
 };
 pub use paths::{default_project_root, project_path};
 pub use prompt::replace_placeholders;

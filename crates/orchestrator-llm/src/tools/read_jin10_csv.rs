@@ -9,7 +9,7 @@ pub const NAME: &str = "read_jin10_context";
 pub fn definition() -> ToolDefinition {
     ToolDefinition {
         name: api_tool_name(NAME),
-        description: "Read the preflight Jin10 feed (stable id/time/content) from the run SQLite database. Use it to shortlist high-relevance macro/news clues before concluding from headlines. If empty, report a data gap rather than inventing items. After analysis, score used items via jin10_attention [{id, score 0.0-1.0}].".to_string(),
+        description: "Read the preflight Jin10 CSV feed (stable id/time/content) before it is admitted to the run SQLite database. Use it to shortlist high-relevance macro/news clues before concluding from headlines. If empty, report a data gap rather than inventing items. After analysis, score used items via jin10_attention [{id, score 0.0-1.0}]; only scored items are persisted to SQLite.".to_string(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -33,34 +33,31 @@ pub struct Args {
 pub fn execute(args: Value, config: &ExternalToolConfig) -> Result<Value> {
     let tool_args =
         serde_json::from_value::<Args>(args).context("invalid read_jin10_context arguments")?;
-    let db_path = config
-        .db_path
-        .as_ref()
-        .context("read_jin10_context requires the run SQLite path")?;
-    let conn = orchestrator_sql::connect(db_path)?;
-    let mut stmt = if tool_args.date.is_some() {
-        conn.prepare(
-            "SELECT content_json FROM jin10_items WHERE substr(json_extract(content_json, '$.time_raw'), 1, 10) = ?1 ORDER BY item_time DESC LIMIT 500",
-        )?
-    } else {
-        conn.prepare("SELECT content_json FROM jin10_items ORDER BY item_time DESC LIMIT 500")?
-    };
+    let csv_dir = config
+        .project_root
+        .join(orchestrator_core::DEFAULT_JIN10_CSV_DIR);
     let rows = if let Some(date) = tool_args.date.as_deref() {
-        stmt.query_map([date], |row| row.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?
+        orchestrator_core::read_jin10_csv(&orchestrator_core::jin10_csv_path(&csv_dir, date))?
     } else {
-        stmt.query_map([], |row| row.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?
+        orchestrator_core::load_jin10_csv_recent_from_dir(&csv_dir, 3)
     };
     let items = rows
         .into_iter()
-        .map(|raw| serde_json::from_str::<Value>(&raw))
-        .collect::<serde_json::Result<Vec<_>>>()?;
+        .take(500)
+        .map(|row| {
+            json!({
+                "id": row.id,
+                "time": row.time,
+                "time_raw": row.time,
+                "content": row.content,
+            })
+        })
+        .collect::<Vec<_>>();
     let result = if items.is_empty() {
-        json!({"error": "no Jin10 data in run SQLite", "hint": "news preflight may not have completed"})
+        json!({"error": "no preflight Jin10 CSV data", "hint": "news preflight may not have completed"})
     } else {
         json!({
-            "source": "sqlite.jin10_items",
+            "source": "csv.jin10",
             "items": items,
             "attention_note": "After analysis, return jin10_attention: [{id, score}] with score 0.0-1.0 for items that influenced your analysis. Only scored items will be persisted."
         })
@@ -74,24 +71,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reads_only_from_configured_sqlite_database() {
+    fn reads_preflight_csv_without_a_database() {
         let temp = tempfile::tempdir().unwrap();
-        let db_path = temp.path().join("run.sqlite");
-        let mut conn = orchestrator_sql::connect(&db_path).unwrap();
-        orchestrator_sql::import_jin10_payload(
-            &mut conn,
-            &json!({"items": [{"time": "2026-07-21 12:00:00", "content": "macro event"}]}),
+        let csv_dir = temp.path().join(orchestrator_core::DEFAULT_JIN10_CSV_DIR);
+        let path = orchestrator_core::jin10_csv_path(&csv_dir, "2026-07-21");
+        orchestrator_core::write_jin10_csv(
+            &path,
+            &[orchestrator_core::Jin10CsvRow {
+                id: "event-1".to_string(),
+                time: "2026-07-21 12:00:00".to_string(),
+                content: "macro event".to_string(),
+            }],
         )
         .unwrap();
-        drop(conn);
         let config = ExternalToolConfig {
-            db_path: Some(db_path),
+            project_root: temp.path().to_path_buf(),
             ..Default::default()
         };
 
         let result = execute(json!({}), &config).unwrap();
 
-        assert_eq!(result["source"], "sqlite.jin10_items");
+        assert_eq!(result["source"], "csv.jin10");
         assert_eq!(result["items"].as_array().unwrap().len(), 1);
         assert_eq!(result["items"][0]["content"], "macro event");
     }

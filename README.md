@@ -99,13 +99,12 @@ Ingest Jin10:
 
 ```bash
 rtk cargo run -p orchestrator-cli --bin orchestrator-ingest -- \
-  --db-path outputs/orchestrator.sqlite \
   jin10-flash --pages 2 --lookback-hours 24 --timeout 20
 ```
 
-CSV is an ingestion interchange only. With `--db-path`, the CLI atomically replaces one compact `technical_series` row per ticker/interval and imports Jin10 into `jin10_items`. Live agents read only SQLite through `read_technical_context` and `read_jin10_context`; Allocation, Reflection, and outcome scoring use the same database.
+Technical CSV is an ingestion interchange only. With `--db-path`, the CLI atomically replaces one compact `technical_series` row per ticker/interval. Jin10 always writes its raw preflight feed to `outputs/jin10/YYYY-MM-DD.csv`; `read_jin10_context` reads that CSV, and only items that the news analyst assigns a Jin10 attention score are persisted to `jin10_items`.
 
-The workflow can refresh and import these sources during Phase 1. Use `--tech-refresh-enabled=false` only when all required ticker/interval CSVs already exist for preflight import. Jin10 lookback is controlled by `--jin10-refresh-lookback-hours`.
+The workflow refreshes both sources during Phase 1. Use `--tech-refresh-enabled=false` only when all required ticker/interval CSVs already exist for preflight import. Jin10 lookback is controlled by `--jin10-refresh-lookback-hours`; its SQLite import remains deferred until the news analyst scores an item.
 
 ## Run the workflow
 
@@ -133,7 +132,7 @@ Useful options:
 - Manager output cannot replace missing evidence with a default 0.5 result.
 - Responses streams require `response.completed`; Chat Completions streams require a terminal `finish_reason`.
 - Tool calls require a non-empty `call_id`, name, and valid accumulated JSON arguments.
-- Live tools and downstream phases never read source CSV/JSON directly; preflight imports Yahoo/Jin10 into the run SQLite database first.
+- Technical tools and downstream phases read SQLite only. The news analyst reads its preflight Jin10 CSV; only attention-scored Jin10 items enter SQLite.
 - Tool payload history is bounded to 16,000 characters by default.
 - Allocation excludes VIX, rejects missing per-ticker research, enforces non-negative finite weights, per-asset caps, cash constraints, and a total weight of 1.0.
 - Reflection/outcome promotion is outside the decision-critical research path; only validated outcomes are admitted to durable memory.

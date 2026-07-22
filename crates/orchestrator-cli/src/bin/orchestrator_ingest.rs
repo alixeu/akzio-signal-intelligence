@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 #[derive(Parser)]
 #[command(name = "orchestrator-ingest", about = "Unified data ingestion CLI")]
 struct Cli {
-    /// Also import successful source data into the run SQLite database.
+    /// Import technical source data into the run SQLite database. Jin10 is deferred until scored.
     #[arg(long, global = true)]
     db_path: Option<PathBuf>,
     #[command(subcommand)]
@@ -36,10 +36,12 @@ async fn main() -> Result<()> {
         IngestCommand::Jin10Flash { args } => {
             let pretty = args.pretty;
             let mut result = jin10::run(args).await?;
-            if let Some(db_path) = &cli.db_path {
-                let mut conn = orchestrator_sql::connect(db_path)?;
-                let rows = orchestrator_sql::import_jin10_payload(&mut conn, &result)?;
-                result["sqlite"] = json!({"table": "jin10_items", "rows": rows});
+            if cli.db_path.is_some() {
+                result["sqlite"] = json!({
+                    "table": "jin10_items",
+                    "rows": 0,
+                    "persistence": "deferred_until_attention_scored"
+                });
             }
             if pretty {
                 println!("{}", serde_json::to_string_pretty(&result)?);
