@@ -107,7 +107,7 @@ async fn mock_exec_phase7_writes_portfolio_allocation() {
     );
     assert_eq!(
         result["portfolio_allocation"]["allocation_method"],
-        "rust_inverse_vol_guardrails"
+        "rust_portfolio_gate"
     );
     assert!(result["portfolio_allocation"]["weights"]
         .get("QQQ")
@@ -132,7 +132,7 @@ async fn mock_exec_phase7_writes_portfolio_allocation() {
             .as_array()
             .unwrap()
             .len(),
-        1
+        3
     );
     assert_eq!(state["portfolio_allocation"]["total_equity_exposure"], 0.0);
     assert_market_truth_ok(state);
@@ -221,45 +221,38 @@ async fn debug_exec_records_local_reducers_without_changing_workflow_policy() {
         .iter()
         .any(|record| record["phase"] == 4 && record["role"] == "trader"));
 
-    // Debug jsonl keeps only the latest record per role (final LLM turn already has full context).
-    let phase2_summary = orchestrator_core::default_project_root()
-        .join("outputs/debug/phase02/phase2_summary.jsonl");
+    // Local reducer debug artifacts keep the latest JSON record per role.
+    let phase2_summary =
+        orchestrator_core::default_project_root().join("outputs/debug/phase02/phase2_summary.json");
     let summary_contents = fs::read_to_string(&phase2_summary).unwrap();
-    let summary_lines: Vec<_> = summary_contents
-        .lines()
-        .filter(|line| !line.is_empty())
-        .collect();
-    assert_eq!(
-        summary_lines.len(),
-        1,
-        "phase2_summary.jsonl should keep only the latest debug record"
-    );
-    assert!(summary_lines[0].contains("\"role\":\"phase2.summary\""));
+    assert!(summary_contents.contains("\"role\":\"phase2.summary\""));
 
     let root = orchestrator_core::default_project_root();
-    let time_path = root.join("outputs/debug/time.jsonl");
-    let token_path = root.join("outputs/debug/token.jsonl");
-    let time_contents = fs::read_to_string(&time_path).unwrap();
+    let time_path = root.join("outputs/debug/time.json");
+    let token_path = root.join("outputs/debug/token.json");
+    let time: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&time_path).unwrap()).unwrap();
+    let time_entries = time.as_array().unwrap();
     assert!(
-        time_contents
-            .lines()
-            .any(|line| line.contains("\"kind\":\"phase\"")),
-        "time.jsonl should record phase timings"
+        time_entries.iter().any(|entry| entry["kind"] == "phase"),
+        "time.json should record phase timings"
     );
     assert!(
-        time_contents
-            .lines()
-            .any(|line| line.contains("\"kind\":\"role_job\"")
-                || line.contains("\"kind\":\"function\"")),
-        "time.jsonl should record role or function timings"
+        time_entries
+            .iter()
+            .any(|entry| entry["kind"] == "role_job" || entry["kind"] == "function"),
+        "time.json should record role or function timings"
     );
     // Mock roles still write token rows (usually zeros) for each role job.
-    let token_contents = fs::read_to_string(&token_path).unwrap();
+    let token: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&token_path).unwrap()).unwrap();
     assert!(
-        token_contents
-            .lines()
-            .any(|line| line.contains("\"kind\":\"role_job\"")),
-        "token.jsonl should record per-role token usage"
+        token
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["kind"] == "role_job"),
+        "token.json should record per-role token usage"
     );
 }
 
@@ -339,7 +332,7 @@ async fn selective_policy_derives_trader_runs_triggered_risk_and_allocates() {
             .as_array()
             .unwrap()
             .len(),
-        1
+        3
     );
     assert_eq!(state["final_trade_decision"]["status"], "derived");
     assert_eq!(state["portfolio_allocation"]["total_equity_exposure"], 0.0);
@@ -729,9 +722,9 @@ fn assert_market_truth_ok(state: &serde_json::Value) {
         serde_json::json!([])
     );
     let checks = state["market_truth_checks"].as_array().unwrap();
-    assert_eq!(checks.len(), 4);
+    assert_eq!(checks.len(), 6);
     assert!(checks.iter().all(|check| check["status"] == "ok"));
-    assert_eq!(state["workflow_metrics"]["market_truth_check_count"], 4);
+    assert_eq!(state["workflow_metrics"]["market_truth_check_count"], 6);
     assert_eq!(state["workflow_metrics"]["market_truth_violation_count"], 0);
 }
 

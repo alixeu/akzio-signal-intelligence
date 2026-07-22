@@ -120,7 +120,9 @@ fn prompt_version_for_role(state: &Value, role: &str) -> Option<String> {
         "mediator.topic_controller" => "orchestrator.prompts.mediator.topic_controller",
         "manager.research" => "orchestrator.prompts.manager.research",
         "trader" => "orchestrator.prompts.trader",
-        "risk.conservative" => "orchestrator.prompts.risk.conservative",
+        "risk.aggressive" | "risk.neutral" | "risk.conservative" => {
+            "orchestrator.prompts.risk.conservative"
+        }
         "portfolio.manager" => "orchestrator.prompts.portfolio.manager",
         _ => return None,
     };

@@ -92,6 +92,21 @@ pub fn read_run_context(conn: &mut Connection, request: &RunContextReadRequest) 
         }
         _ => {}
     }
+    let phase_summary_access = matches!(
+        kind,
+        "phase_summaries" | "prior_phase_summaries" | "phase_summary_details"
+    );
+    if phase_summary_access
+        && request
+            .run_id
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+    {
+        anyhow::bail!("run_id is required for phase summary access");
+    }
+    if phase_summary_access && request.phase.is_none_or(|phase| phase <= 0) {
+        anyhow::bail!("current phase must be greater than zero for phase summary access");
+    }
     let run_id = request
         .run_id
         .as_deref()
@@ -131,12 +146,10 @@ pub fn read_run_context(conn: &mut Connection, request: &RunContextReadRequest) 
         "agent_accuracy" => agent_accuracy_context(conn),
         "compose_context" => compose_context(conn, request, &ctx),
         "phase_summaries" | "prior_phase_summaries" => {
-            // If caller sets phase=N, return summaries for phases < N (prior only).
-            let max_source_phase = request.phase.filter(|p| *p > 0).map(|p| p - 1);
             crate::phase_index::list_phase_summaries(
                 conn,
                 &ctx.run_id,
-                max_source_phase,
+                ctx.phase,
                 request.ticker.as_deref().filter(|t| !t.is_empty()),
             )
         }
@@ -146,14 +159,18 @@ pub fn read_run_context(conn: &mut Connection, request: &RunContextReadRequest) 
                 .topic_id
                 .as_deref()
                 .filter(|s| !s.is_empty())
-                .or_else(|| request.turn_id.as_deref().filter(|s| !s.is_empty()))
                 .unwrap_or_default();
             if summary_id.is_empty() {
                 anyhow::bail!(
                     "phase_summary_details requires topic_id set to the phase_summaries.id"
                 );
             }
-            crate::phase_index::list_phase_summary_details(conn, summary_id)
+            crate::phase_index::list_phase_summary_details(
+                conn,
+                &ctx.run_id,
+                ctx.phase,
+                summary_id,
+            )
         }
         "attention" => crate::phase_index::list_attention(
             conn,

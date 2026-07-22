@@ -251,7 +251,7 @@ pub fn check_duplicate_content(files: &[(PathBuf, String)], issues: &mut Vec<Lin
     }
 }
 
-/// Check 7: verify anti-injection guidance reaches roles using read_run_context.
+/// Check 7: verify anti-injection guidance reaches roles using phase-summary tools.
 pub fn check_anti_injection(
     file_path: &Path,
     content: &str,
@@ -266,7 +266,14 @@ pub fn check_anti_injection(
         orchestrator_core::config_get(config, &format!("orchestrator.llm.roles.{role}.tools"))
             .and_then(Value::as_array);
     let has_read_context = tools
-        .map(|t| t.iter().any(|v| v.as_str() == Some("read_run_context")))
+        .map(|tools| {
+            tools.iter().any(|value| {
+                matches!(
+                    value.as_str(),
+                    Some("read_phase_summaries" | "read_phase_summary_details")
+                )
+            })
+        })
         .unwrap_or(false);
     if !has_read_context {
         return;
@@ -283,7 +290,7 @@ pub fn check_anti_injection(
             severity: "info".to_string(),
             check: "anti_injection_presence".to_string(),
             message: format!(
-                "Role {role} uses read_run_context but prompt does not include {{anti_injection}}"
+                "Role {role} uses phase-summary tools but prompt does not include {{anti_injection}}"
             ),
         });
     }
@@ -318,12 +325,9 @@ fn render_for_lint(
         .filter(|value| !value.is_empty())
         .or_else(|| tickers.first().map(String::as_str))
         .unwrap_or("");
-    let template = if let Some(path) = prompt_path {
-        std::fs::read_to_string(path)
-            .with_context(|| format!("failed to read prompt template {}", path.display()))?
-    } else {
-        "Return only artifact JSON for role {role}, kind {kind}, phase {phase}, and tickers {tickers}. Include per_ticker for every ticker.".to_string()
-    };
+    let path = prompt_path.context("missing prompt path for lint rendering")?;
+    let template = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read prompt template {}", path.display()))?;
     let current_topic_state = topic_id
         .and_then(|id| topic_state(state, id))
         .unwrap_or(Value::Null);
@@ -410,10 +414,6 @@ fn render_for_lint(
         "portfolio_decision": serde_json::to_string_pretty(&state.get("final_trade_decision").cloned().unwrap_or(Value::Null))?,
         "allocation_context": serde_json::to_string_pretty(&state.get("allocation_context").cloned().unwrap_or(Value::Null))?,
         "phase3_context": "{}",
-        "phase1_index": serde_json::to_string_pretty(&state.get("phase1_index").cloned().unwrap_or_else(|| json!({})))?,
-        "phase00_context": serde_json::to_string_pretty(&state.get("phase00_tables").cloned().unwrap_or_else(|| json!({})))?,
-        "prior_phase_summaries": "{}",
-        "common_ground": serde_json::to_string_pretty(&state.get("common_ground").cloned().unwrap_or_else(|| json!({})))?,
         "risk_context": "{}",
         "portfolio_context": "{}",
         "workflow_pattern": "Workflow -> Stage/Sub-workflow -> Agent workers -> Reducer -> state artifact"

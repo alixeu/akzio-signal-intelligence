@@ -316,6 +316,19 @@ pub(crate) fn derive_guarded_allocation(
     config: &AllocationConfig,
 ) -> Result<Value> {
     validate_allocation_research_input(state, context)?;
+    if let Some(status @ ("wait" | "downgrade")) = state
+        .get("final_trade_decision")
+        .and_then(|decision| decision.get("execution_status"))
+        .and_then(Value::as_str)
+    {
+        let mut allocation = cash_only_allocation(
+            context,
+            &format!("Portfolio Manager execution_status={status}"),
+        );
+        allocation["allocation_method"] = json!("rust_portfolio_gate");
+        validate_allocation_output(&allocation, context, config)?;
+        return Ok(allocation);
+    }
     let mut allocation = normalize_allocation(&json!({"weights": {}}), context, config);
     allocation["allocation_method"] = json!("rust_inverse_vol_guardrails");
     validate_allocation_output(&allocation, context, config)?;
@@ -1303,6 +1316,26 @@ mod tests {
             .map(|entry| entry["weight"].as_f64().unwrap())
             .sum::<f64>();
         assert!((total - 1.0).abs() <= 0.001);
+    }
+
+    #[test]
+    fn portfolio_wait_forces_cash_only_allocation() {
+        let state = json!({
+            "research_plan": {
+                "per_ticker": {
+                    "QQQ": {"long_probability": 0.61},
+                    "SOXX": {"long_probability": 0.58}
+                }
+            },
+            "final_trade_decision": {"execution_status": "wait"}
+        });
+
+        let allocation =
+            derive_guarded_allocation(&state, &test_context(), &test_config()).unwrap();
+
+        assert_eq!(allocation["allocation_method"], "rust_portfolio_gate");
+        assert_eq!(allocation["total_equity_exposure"], 0.0);
+        assert_eq!(allocation["weights"]["cash_hedge"]["weight"], 1.0);
     }
 
     #[test]

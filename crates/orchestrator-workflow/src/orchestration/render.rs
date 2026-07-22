@@ -53,201 +53,18 @@ fn common_component(prompt_path: Option<&std::path::Path>, file_name: &str) -> R
     }
 }
 
-fn compact_evidence(value: &Value) -> Value {
-    const FIELDS: &[&str] = &[
-        "claim",
-        "evidence_type",
-        "source",
-        "timestamp",
-        "source_tier",
-        "first_source",
-        "is_derivative_repost",
-        "evidence_age",
-        "source_confidence",
-    ];
-    let Some(object) = value.as_object() else {
-        return Value::Null;
-    };
-    Value::Object(
-        FIELDS
-            .iter()
-            .filter_map(|field| {
-                object
-                    .get(*field)
-                    .map(|value| ((*field).to_string(), value.clone()))
-            })
-            .collect(),
-    )
-}
-
-fn compact_role_summary(value: &Value) -> Value {
-    let evidence = value
-        .get("key_evidence")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .take(3)
-        .map(compact_evidence)
-        .collect::<Vec<_>>();
-    json!({
-        "role": value.get("role").cloned().unwrap_or(Value::Null),
-        "status": value.get("status").cloned().unwrap_or(Value::Null),
-        "stance": value.get("stance").cloned().unwrap_or(Value::Null),
-        "confidence": value.get("confidence").cloned().unwrap_or(Value::Null),
-        "key_evidence": evidence,
-        "evidence_type_summary": value.get("evidence_type_summary").cloned().unwrap_or(Value::Null),
-        "weaknesses": value.get("weaknesses").cloned().unwrap_or_else(|| json!([])),
-        "source_node_ids": value.get("source_node_ids").cloned().unwrap_or_else(|| json!([]))
-    })
-}
-
-fn compact_phase1_ticker(value: &Value) -> Value {
-    let role_summaries = value
-        .get("role_summaries")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .map(compact_role_summary)
-        .collect::<Vec<_>>();
-    // No weighted_probability_base here — weighting is phase 2/3, not phase1 index.
-    json!({
-        "evidence_quality": value.get("evidence_quality").cloned().unwrap_or(Value::Null),
-        "role_summaries": role_summaries,
-        "cross_analyst_conflicts": value.get("cross_analyst_conflicts").cloned().unwrap_or_else(|| json!([])),
-        "decision_hinges": value.get("decision_hinges").cloned().unwrap_or_else(|| json!([])),
-        "missing_evidence": value.get("missing_evidence").cloned().unwrap_or_else(|| json!([])),
-        "independent_signals": value.get("independent_signals").cloned().unwrap_or_else(|| json!([])),
-        "duplicate_signals": value.get("duplicate_signals").cloned().unwrap_or_else(|| json!([])),
-        "state_summary": value.get("state_summary").cloned().unwrap_or(Value::Null)
-    })
-}
-
-fn compact_phase1_per_ticker(phase1: &Value) -> Value {
-    Value::Object(
-        phase1
-            .get("per_ticker")
-            .and_then(Value::as_object)
-            .into_iter()
-            .flatten()
-            .map(|(ticker, value)| (ticker.clone(), compact_phase1_ticker(value)))
-            .collect(),
-    )
-}
-
-/// Phase 1 materialised index fork for Phase 2/3 prompts.
-fn phase1_index_fork(state: &Value) -> Value {
-    let from_index = state
-        .get("phase00_tables")
-        .and_then(|tables| tables.get("1"))
-        .filter(|value| !value.is_null());
-    let phase1 = state.get("phase1_index").cloned().unwrap_or(Value::Null);
-    let source = if phase1.get("status").is_some() {
-        "phase1_index"
-    } else if from_index.is_some() {
-        "phase00_tables.1"
-    } else {
-        "missing"
-    };
-    json!({
-        "source": source,
-        "artifact_type": phase1.get("artifact_type").cloned().unwrap_or(Value::Null),
-        "status": phase1.get("status").cloned().unwrap_or(Value::Null),
-        "evidence_quality": phase1.get("evidence_quality").cloned().unwrap_or(Value::Null),
-        "weighted_probability_base": state
-            .get("weighted_probability_base")
-            .cloned()
-            .unwrap_or(Value::Null),
-        "topic_candidates": phase1.get("topic_candidates").cloned().unwrap_or_else(|| json!([])),
-        "cross_analyst_conflicts_summary": phase1
-            .get("cross_analyst_conflicts_summary")
-            .cloned()
-            .unwrap_or_else(|| json!([])),
-        "per_ticker": compact_phase1_per_ticker(&phase1),
-        "brief_md": state.get("phase1_brief_md").cloned().unwrap_or(Value::Null),
-        "index_checks": phase1
-            .get("index_checks")
-            .or_else(|| phase1.get("reducer_checks"))
-            .cloned()
-            .unwrap_or_else(|| json!({})),
-        "phase00_table": from_index.cloned().unwrap_or(Value::Null),
-        "note": "Phase 1 index organizes evidence only. weighted_probability_base is filled at phase 2/3."
-    })
-}
-
-/// Prior phase compressor summaries for any downstream role.
-fn prior_phase_summaries(state: &Value, current_phase: i64) -> Value {
-    let compress = state.get("phase_compress").cloned().unwrap_or(Value::Null);
-    let phase1 = phase1_index_fork(state);
-    let mut phases = Vec::new();
-    if phase1.get("status").is_some() || phase1.get("brief_md").is_some() {
-        phases.push(json!({
-            "source_phase": 1,
-            "recency_weight": 1.0 + 0.15 * 1.0,
-            "payload": phase1
-        }));
-    }
-    if current_phase > 2 {
-        if let Some(debate) = state.get("debate_state_artifact") {
-            phases.push(json!({
-                "source_phase": 2,
-                "recency_weight": 1.0 + 0.15 * 2.0,
-                "payload": {
-                    "status": debate.get("status"),
-                    "convergence_status": debate.get("convergence_status"),
-                    "topic_briefs": debate.get("topic_briefs").cloned().unwrap_or_else(|| json!([])),
-                    "brief_md": state.get("debate_brief_md"),
-                }
-            }));
-        }
-    }
-    json!({
-        "current_phase": current_phase,
-        "attention_rule": "Prefer higher recency_weight (more recent source_phase). Expand details via read_run_context(kind=phase_summary_details, topic_id=<id>).",
-        "phases": phases,
-        "phase_compress_status": compress,
-    })
-}
-
 fn phase3_context(state: &Value) -> Value {
-    let phase1 = state.get("phase1_index").cloned().unwrap_or(Value::Null);
-    let debate = state
-        .get("debate_state_artifact")
-        .cloned()
-        .unwrap_or(Value::Null);
-    let phase00_tables = state
-        .get("phase00_tables")
-        .cloned()
-        .unwrap_or_else(|| json!({}));
     let input_tickers = tickers_from_state(state);
     let primary_ticker = input_tickers.first().cloned();
 
     json!({
         "input_tickers": input_tickers,
         "primary_ticker": primary_ticker,
-        "phase1": {
-            "status": phase1.get("status").cloned().unwrap_or(Value::Null),
-            "evidence_quality": phase1.get("evidence_quality").cloned().unwrap_or(Value::Null),
-            "per_ticker": compact_phase1_per_ticker(&phase1),
-            "index_checks": phase1
-                .get("index_checks")
-                .or_else(|| phase1.get("reducer_checks"))
-                .cloned()
-                .unwrap_or_else(|| json!({}))
-        },
         "weighted_probability_base": state
             .get("weighted_probability_base")
             .cloned()
             .unwrap_or(Value::Null),
         "analyst_weights": state.get("analyst_weights").cloned().unwrap_or(Value::Null),
-        "phase2_5": {
-            "status": debate.get("status").cloned().unwrap_or(Value::Null),
-            "convergence_status": debate.get("convergence_status").cloned().unwrap_or(Value::Null),
-            "reason": debate.get("reason").cloned().unwrap_or(Value::Null),
-            "topic_briefs": debate.get("topic_briefs").cloned().unwrap_or_else(|| json!([])),
-            "per_ticker": debate.get("per_ticker").cloned().unwrap_or_else(|| json!({})),
-            "reducer_checks": debate.get("reducer_checks").cloned().unwrap_or_else(|| json!({}))
-        },
-        "phase00_tables": phase00_tables,
         "prior_memory": state.get("prior_memory").cloned().unwrap_or(Value::Null),
         "track_record": state.get("track_record").cloned().unwrap_or(Value::Null),
         "agent_accuracy": state.get("agent_accuracy").cloned().unwrap_or(Value::Null)
@@ -431,12 +248,9 @@ pub(crate) fn render_prompt_with_plugins(
         .filter(|value| !value.is_empty())
         .or_else(|| tickers.first().map(String::as_str))
         .unwrap_or("");
-    let template = if let Some(path) = prompt_path {
-        std::fs::read_to_string(path)
-            .with_context(|| format!("failed to read prompt template {}", path.display()))?
-    } else {
-        "Return only artifact JSON for role {role}, kind {kind}, phase {phase}, and tickers {tickers}. Include per_ticker for every ticker.".to_string()
-    };
+    let path = prompt_path.with_context(|| format!("missing prompt path for role {role}"))?;
+    let template = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read prompt template {}", path.display()))?;
     let current_topic_state = topic_id
         .and_then(|id| topic_state(state, id))
         .unwrap_or(Value::Null);
@@ -481,11 +295,7 @@ pub(crate) fn render_prompt_with_plugins(
     };
     let analyst_output_structure =
         replace_placeholders(&analyst_output_structure_template, &component_values);
-    let stance_role_label = if role == "risk.conservative" {
-        "conservative"
-    } else {
-        ""
-    };
+    let stance_role_label = role.strip_prefix("risk.").unwrap_or("");
     let static_values = json!({
         "ticker": ticker,
         "tickers": tickers.join(","),
@@ -534,16 +344,6 @@ pub(crate) fn render_prompt_with_plugins(
         "risk_context": serde_json::to_string_pretty(&risk_context(state))?,
         "portfolio_context": serde_json::to_string_pretty(&portfolio_context(state))?,
         "phase3_context": serde_json::to_string_pretty(&phase3_context(state))?,
-        "phase1_index": serde_json::to_string_pretty(&phase1_index_fork(state))?,
-        "phase00_context": serde_json::to_string_pretty(&state.get("phase00_tables").cloned().unwrap_or(serde_json::json!({})))?,
-        "common_ground": serde_json::to_string_pretty(
-            &state
-                .get("common_ground")
-                .or_else(|| state.get("topic_generation_artifact").and_then(|a| a.get("common_ground")))
-                .cloned()
-                .unwrap_or(serde_json::Value::Null),
-        )?,
-        "prior_phase_summaries": serde_json::to_string_pretty(&prior_phase_summaries(state, phase))?,
     });
     let mut values = static_values;
     if let (Some(static_map), Some(dynamic_map)) =
@@ -992,8 +792,11 @@ required_variables = ["ticker", "tickers"]
     }
 
     #[test]
-    fn phase3_context_preserves_canonical_inputs_without_turn_history() {
+    fn phase3_context_only_injects_deterministic_inputs() {
         let context = phase3_context(&json!({
+            "tickers": ["QQQ"],
+            "weighted_probability_base": {"QQQ": {"long_probability": 0.5}},
+            "analyst_weights": {"analyst.technical": 0.5, "analyst.news_macro": 0.5},
             "phase1_index": {
                 "status": "insufficient",
                 "weighted_probability_base": {"QQQ": {"long_probability": 0.5}},
@@ -1024,17 +827,11 @@ required_variables = ["ticker", "tickers"]
             "agent_accuracy": {"analyst.technical": 0.7}
         }));
 
-        assert_eq!(context["phase1"]["status"], "insufficient");
-        assert_eq!(
-            context["phase2_5"]["topic_briefs"][0]["topic_id"],
-            "QQQ-gap"
-        );
-        assert!(context["phase2_5"].get("debate_turns").is_none());
+        assert!(context.get("phase1").is_none());
+        assert!(context.get("phase2_5").is_none());
+        assert!(context.get("phase00_tables").is_none());
+        assert_eq!(context["weighted_probability_base"]["QQQ"]["long_probability"], 0.5);
         assert_eq!(context["track_record"]["sample_size"], 2);
-        let role = &context["phase1"]["per_ticker"]["QQQ"]["role_summaries"][0];
-        assert!(role.get("summary").is_none());
-        assert_eq!(role["key_evidence"].as_array().unwrap().len(), 3);
-        assert!(role["key_evidence"][0].get("report").is_none());
     }
 
     #[test]
@@ -1169,22 +966,22 @@ required_variables = ["ticker", "tickers"]
             ("analyst.news_macro", "analysts/news_macro.md", "artifact"),
             (
                 "researcher.bull.initial",
-                "researchers/debate.md",
+                "researchers/bull.md",
                 "bull_seed",
             ),
             (
                 "researcher.bear.initial",
-                "researchers/debate.md",
+                "researchers/bear.md",
                 "bear_seed",
             ),
             (
                 "researcher.bull.interaction",
-                "researchers/debate.md",
+                "researchers/bull.md",
                 "bull_packet",
             ),
             (
                 "researcher.bear.interaction",
-                "researchers/debate.md",
+                "researchers/bear.md",
                 "bear_packet",
             ),
             (
@@ -1198,6 +995,8 @@ required_variables = ["ticker", "tickers"]
                 "artifact",
             ),
             ("trader", "traders/trader.md", "artifact"),
+            ("risk.aggressive", "risk/conservative.md", "risk_argument"),
+            ("risk.neutral", "risk/conservative.md", "risk_argument"),
             ("risk.conservative", "risk/conservative.md", "risk_argument"),
             (
                 "portfolio.manager",
@@ -1346,24 +1145,23 @@ required_variables = ["ticker", "tickers"]
         )
         .unwrap();
         assert!(trader.contains("research_plan` / Phase 3 是唯一市场结论"));
-        assert!(trader.contains("phase00_context` 仅用于证据血缘和审计"));
 
-        let risk = render_prompt(
-            &golden_mock_state(),
-            "risk.conservative",
-            5,
-            "risk_argument",
-            Some(1),
-            None,
-            Some(&prompts.join("risk/conservative.md")),
-            None,
-        )
-        .unwrap();
-        for obsolete_role in ["Aggressive", "Neutral", "Conservative"] {
-            assert!(!risk.contains(obsolete_role));
+        for role in ["risk.aggressive", "risk.neutral", "risk.conservative"] {
+            let risk = render_prompt(
+                &golden_mock_state(),
+                role,
+                5,
+                "risk_argument",
+                Some(1),
+                None,
+                Some(&prompts.join("risk/conservative.md")),
+                None,
+            )
+            .unwrap();
+            assert!(risk.contains(role.strip_prefix("risk.").unwrap()));
+            assert!(risk.contains("风险委员会"));
+            assert!(risk.contains("overnight_gap_scenario"));
         }
-        assert!(risk.contains("Integrated Risk Reviewer"));
-        assert!(risk.contains("overnight_gap_scenario"));
     }
 
     #[test]
@@ -1385,7 +1183,8 @@ required_variables = ["ticker", "tickers"]
             "analysts/news_macro.md",
             "common/analyst_output_contract.md",
             "managers/research_manager.md",
-            "researchers/debate.md",
+            "researchers/bull.md",
+            "researchers/bear.md",
         ] {
             let content = std::fs::read_to_string(prompts.join(relative)).unwrap();
             for removed in ["YouTube", "Reddit", "Twitter"] {

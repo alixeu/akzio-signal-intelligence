@@ -181,6 +181,32 @@ pub struct SteerLoopInput<'a> {
     pub steer: Option<String>,
 }
 
+impl SteerLoopInput<'_> {
+    fn steer_value(&self) -> Option<Value> {
+        self.steer
+            .as_deref()
+            .and_then(|steer| serde_json::from_str(steer).ok())
+    }
+
+    fn fork_from_turn_id(&self) -> Option<String> {
+        self.steer_value()?
+            .get("fork_from_turn_id")?
+            .as_str()
+            .map(str::trim)
+            .filter(|turn_id| !turn_id.is_empty())
+            .map(ToString::to_string)
+    }
+
+    fn allows_ready_ack(&self) -> bool {
+        self.steer_value()
+            .as_ref()
+            .and_then(|value| value.get("payload"))
+            .and_then(|payload| payload.get("allow_ready"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AgentLoopOutput {
     pub artifact: Value,
@@ -300,7 +326,23 @@ pub async fn run_agent_steer_loop_with_metrics(
     // Scope resume detection to this turn_id. Using run_id-latest history made
     // later phase-2 roles see sibling turns as "existing history" and drop their
     // own role prompt (live debate mass max_agent_loops / empty context).
-    let prior_history = orchestrator_sql::turn_history_items(&conn, &input.turn_id)?;
+    let allow_ready_ack = input.allows_ready_ack();
+    let target_history = orchestrator_sql::turn_history_items(&conn, &input.turn_id)?;
+    let fork_from_turn_id = input.fork_from_turn_id();
+    let fork_history = if target_history.is_empty() {
+        if let Some(source_turn_id) = fork_from_turn_id.as_deref() {
+            let history = orchestrator_sql::turn_history_items(&conn, source_turn_id)?;
+            if history.is_empty() {
+                bail!("fork source turn {source_turn_id:?} has no persisted history");
+            }
+            history
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+    let prior_history = select_fork_history(target_history, fork_history);
     let has_existing_history = !prior_history.is_empty();
     let user_input = if has_existing_history {
         String::new()
@@ -329,11 +371,12 @@ pub async fn run_agent_steer_loop_with_metrics(
     turn.phase = settings.phase;
     turn.tools_disabled = role_disables_tools(&settings.role);
     turn.model_context = format!(
-        "role={}\noutput_mode={:?}\ntickers={}\navailable_tools={}",
+        "role={}\noutput_mode={:?}\ntickers={}\navailable_tools={}\nhistory_fork={}",
         settings.role,
         settings.output_mode,
         settings.tickers.join(","),
-        serde_json::to_string(&configured_tool_names(settings))?
+        serde_json::to_string(&configured_tool_names(settings))?,
+        fork_from_turn_id.is_some()
     );
     if let Some(steer) = input.steer {
         turn.push_pending_input(steer);
@@ -372,7 +415,15 @@ pub async fn run_agent_steer_loop_with_metrics(
             }
         })
         .context("agent loop finished without assistant message")?;
-    let artifact = parse_final_output(settings, &final_text)?;
+    let artifact = if allow_ready_ack && final_text.trim() == "准备完毕" {
+        json!({
+            "status": "ready",
+            "response": "准备完毕",
+            "role": settings.role,
+        })
+    } else {
+        parse_final_output(settings, &final_text)?
+    };
     record_jin10_usage_from_artifact(settings, &conn, &turn.turn_id, &artifact)?;
     Ok(AgentLoopOutput {
         artifact,
@@ -380,6 +431,14 @@ pub async fn run_agent_steer_loop_with_metrics(
         turn_id: turn.turn_id,
         session_id: turn.session_id,
     })
+}
+
+fn select_fork_history(target_history: Vec<Value>, fork_history: Vec<Value>) -> Vec<Value> {
+    if target_history.is_empty() {
+        fork_history
+    } else {
+        target_history
+    }
 }
 
 fn record_jin10_usage_from_artifact(
@@ -1970,6 +2029,8 @@ fn requires_structured_final_artifact(role: &str) -> bool {
                 | "researcher.bear.interaction"
                 | "mediator.topic_controller"
                 | "trader"
+                | "risk.aggressive"
+                | "risk.neutral"
                 | "risk.conservative"
         )
 }
@@ -1987,7 +2048,9 @@ fn validate_json_artifact_contract(settings: &AgentSettings, artifact: &Value) -
         }
         "mediator.topic_controller" => validate_controller_packet_contract(settings, artifact),
         "trader" => validate_trade_intent_contract(settings, artifact),
-        "risk.conservative" => validate_risk_constraints_contract(settings, artifact),
+        "risk.aggressive" | "risk.neutral" | "risk.conservative" => {
+            validate_risk_constraints_contract(settings, artifact)
+        }
         _ => Ok(()),
     }
 }
@@ -2641,7 +2704,7 @@ pub fn mock_role_artifact(role: &str, tickers: &[String]) -> Value {
     match role {
         "manager.research" => orchestrator_sql::write::mock_research_artifact(tickers),
         "trader" => mock_trader_artifact(),
-        "risk.conservative" => mock_risk_artifact(role),
+        "risk.aggressive" | "risk.neutral" | "risk.conservative" => mock_risk_artifact(role),
         "portfolio.manager" => mock_portfolio_artifact(),
         _ => {
             let per_ticker = tickers
@@ -2792,7 +2855,8 @@ mod tests {
         assert_eq!(
             tools::tool_names(),
             vec![
-                "read_run_context",
+                "read_phase_summaries",
+                "read_phase_summary_details",
                 "read_technical_context",
                 "read_jin10_context",
             ]
@@ -3683,5 +3747,16 @@ mod tests {
 
         assert!(!super::configured_tool_names(&settings).contains(&tools::WEB_RUN_TOOL_NAME));
         assert!(super::web_run_runtime_for_settings(&settings).is_none());
+    }
+
+    #[test]
+    fn fork_history_is_used_only_for_a_new_target_turn() {
+        let target = vec![json!({"id": "target"})];
+        let source = vec![json!({"id": "source"})];
+        assert_eq!(
+            super::select_fork_history(target.clone(), source.clone()),
+            target
+        );
+        assert_eq!(super::select_fork_history(Vec::new(), source.clone()), source);
     }
 }

@@ -5,6 +5,7 @@
 //! here until the relevant job(s) complete, then reads the updated memory index.
 
 use crate::phase_index::{Phase00MemoryIndex, Phase00PhaseBatch};
+use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::Duration;
@@ -111,19 +112,46 @@ impl Phase00Gate {
     ///
     /// Used by tools that need the phase00 index while the next business phase is running.
     pub fn wait_until_ready(&self, max_source_phase: Option<i64>, timeout: Duration) -> bool {
+        self.wait_until_ready_checked(max_source_phase, timeout)
+            .is_ok()
+    }
+
+    /// Wait for relevant compressor jobs and propagate compressor errors or timeout.
+    pub fn wait_until_ready_checked(
+        &self,
+        max_source_phase: Option<i64>,
+        timeout: Duration,
+    ) -> Result<()> {
         let mut st = self.status.lock().unwrap_or_else(|e| e.into_inner());
         let deadline = std::time::Instant::now() + timeout;
         loop {
+            let mut errors: Vec<_> = st
+                .errors
+                .iter()
+                .filter(|(phase, _)| max_source_phase.is_none_or(|max| **phase <= max))
+                .map(|(phase, error)| (*phase, error.clone()))
+                .collect();
+            errors.sort_by_key(|(phase, _)| *phase);
+            if let Some((phase, error)) = errors.into_iter().next() {
+                anyhow::bail!("phase00 compressor failed for source_phase {phase}: {error}");
+            }
             let busy = st.inflight.iter().any(|&p| match max_source_phase {
                 Some(max) => p <= max,
                 None => true,
             });
             if !busy {
-                return true;
+                return Ok(());
             }
             let now = std::time::Instant::now();
             if now >= deadline {
-                return false;
+                let mut phases: Vec<_> = st
+                    .inflight
+                    .iter()
+                    .filter(|phase| max_source_phase.is_none_or(|max| **phase <= max))
+                    .copied()
+                    .collect();
+                phases.sort_unstable();
+                anyhow::bail!("timed out waiting for phase00 source phases {phases:?}");
             }
             let wait = deadline.saturating_duration_since(now);
             let (guard, timeout_result) = self
@@ -204,5 +232,17 @@ mod tests {
         assert!(gate.wait_until_ready(Some(1), Duration::from_secs(2)));
         assert_eq!(gate.snapshot().phases.len(), 1);
         h.join().unwrap();
+    }
+
+    #[test]
+    fn checked_wait_propagates_compressor_error() {
+        let gate = Phase00Gate::new("run-error");
+        gate.mark_inflight(1);
+        gate.fail(1, "invalid summary bundle");
+
+        let error = gate
+            .wait_until_ready_checked(Some(1), Duration::from_secs(1))
+            .unwrap_err();
+        assert!(error.to_string().contains("invalid summary bundle"));
     }
 }

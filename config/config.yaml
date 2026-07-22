@@ -4,7 +4,7 @@ orchestrator:
 
   runtime:
     lang: zh
-    # window_days: 数据检索窗口(read_run_context 返回的时间跨度)。
+    # window_days: 数据检索窗口（技术与新闻上下文工具返回的时间跨度）。
     # 与 technical.days 对齐;分析判断窗口(1-5 交易日)由各 analyst prompt 内部定义。
     window_days: 60
     max_debate_rounds: 3
@@ -19,7 +19,17 @@ orchestrator:
       parallelism: 2
       critical_roles: [analyst.technical, analyst.news_macro]
     policy:
-      mode: selective
+      # Keep Trader -> Risk Committee -> Portfolio Manager as mandatory workflow stages.
+      mode: legacy
+
+  prompts:
+    compressor:
+      phase00: prompts/compressors/phase00.md
+    phase2:
+      bull_initial: prompts/researchers/bull.md
+      bull_interaction: prompts/researchers/bull.md
+      bear_initial: prompts/researchers/bear.md
+      bear_interaction: prompts/researchers/bear.md
 
   llm:
     gateway:
@@ -34,7 +44,7 @@ orchestrator:
       reasoning_effort: low
       reasoning_summary: auto
       preserve_reasoning_state: false
-      tools: read_run_context
+      tools: []
     judge:
       enabled: false
 

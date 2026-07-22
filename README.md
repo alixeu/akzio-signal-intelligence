@@ -29,18 +29,18 @@ flowchart TD
     B --> TC[Topic Controller]
     TC --> R[Rust reducer]
     R --> M
-    M --> TR[Rust probability-to-trade mapping]
-    TR --> G{Rust risk-policy gate}
-    G -->|low risk| P[Portfolio merge or Rust derivation]
-    G -->|triggered| RA[One integrated risk review]
-    RA --> P
+    M --> TR[Trader execution plan]
+    TR --> AG[Risk aggressive]
+    AG --> NE[Risk neutral]
+    NE --> CO[Risk conservative]
+    CO --> P[Portfolio Manager final decision]
     P --> A[Rust inverse-vol allocation guardrails]
     A --> O[Decision output]
     O --> REF[Post-decision archive and prediction record]
     REF --> MEM[Offline outcome validation and memory admission]
 ```
 
-The deterministic topic generator only schedules debate for medium/high `direction_conflict`, `confidence_divergence`, or `evidence_contradiction`. Evidence overlap is handled as duplicate evidence in Rust and does not trigger an LLM debate. Risk review is conditional and uses one LLM role. Allocation is always computed and validated in Rust.
+The deterministic topic generator only schedules debate for medium/high `direction_conflict`, `confidence_divergence`, or `evidence_contradiction`. Evidence overlap is handled as duplicate evidence in Rust and does not trigger an LLM debate. Trader, the three-perspective risk committee, and Portfolio Manager are mandatory stages. Allocation is always computed and validated in Rust, and Portfolio Manager `wait` or `downgrade` decisions force a cash-only allocation.
 
 ## Workspace crates
 

@@ -143,9 +143,9 @@ impl RuntimeConfig {
             "orchestrator.prompts.analyst.news_macro",
             "prompts/analysts/news_macro.md",
         )?;
-        // One long-session prompt per side (seed + debate + mediator revise).
-        const BULL_PROMPT: &str = "prompts/researchers/debate.md";
-        const BEAR_PROMPT: &str = "prompts/researchers/debate.md";
+        // One long-session prompt per side (warm-up + seed + debate + mediator revise).
+        const BULL_PROMPT: &str = "prompts/researchers/bull.md";
+        const BEAR_PROMPT: &str = "prompts/researchers/bear.md";
         insert_prompt_entry(
             config,
             &mut prompts,
@@ -186,6 +186,14 @@ impl RuntimeConfig {
             "orchestrator.prompts.mediator.topic_controller",
             "prompts/mediators/topic_controller.md",
         )?;
+        insert_prompt_entry(
+            config,
+            &mut prompts,
+            &mut versions,
+            "compressor.phase00",
+            "orchestrator.prompts.compressor.phase00",
+            "prompts/compressors/phase00.md",
+        )?;
         let (manager_research, manager_research_version) = prompt_entry(
             config,
             "orchestrator.prompts.manager.research",
@@ -203,7 +211,15 @@ impl RuntimeConfig {
             "orchestrator.prompts.risk.conservative",
             "prompts/risk/conservative.md",
         )?;
-        versions.insert("risk.conservative".to_string(), risk_conservative_version);
+        versions.insert(
+            "risk.conservative".to_string(),
+            risk_conservative_version.clone(),
+        );
+        versions.insert(
+            "risk.neutral".to_string(),
+            risk_conservative_version.clone(),
+        );
+        versions.insert("risk.aggressive".to_string(), risk_conservative_version);
         let (portfolio_manager, portfolio_manager_version) = prompt_entry(
             config,
             "orchestrator.prompts.portfolio.manager",
@@ -398,54 +414,63 @@ fn builtin_llm_role_values() -> BTreeMap<String, Value> {
             "analyst.technical",
             12,
             None,
-            vec!["read_run_context", "read_technical_context"],
+            vec!["read_technical_context"],
             false,
         ),
         (
             "analyst.news_macro",
             6,
             None,
-            vec!["read_run_context", "read_jin10_context"],
+            vec!["read_jin10_context"],
             true,
         ),
-        // Phase-2 roles expand prior summaries / attention (not raw jin10/technical).
+        // Phase-2 roles read the compact index, then expand selected summaries.
         (
             "researcher.bull.initial",
             10,
             None,
-            vec!["read_run_context"],
+            vec!["read_phase_summaries", "read_phase_summary_details"],
             false,
         ),
         (
             "researcher.bear.initial",
             10,
             None,
-            vec!["read_run_context"],
+            vec!["read_phase_summaries", "read_phase_summary_details"],
             false,
         ),
         (
             "researcher.bull.interaction",
             10,
             None,
-            vec!["read_run_context"],
+            vec!["read_phase_summary_details"],
             false,
         ),
         (
             "researcher.bear.interaction",
             10,
             None,
-            vec!["read_run_context"],
+            vec!["read_phase_summary_details"],
             false,
         ),
         (
             "mediator.topic_controller",
             10,
             Some("medium"),
-            vec!["read_run_context"],
+            vec!["read_phase_summaries", "read_phase_summary_details"],
             false,
         ),
-        ("manager.research", 6, Some("medium"), vec![], false),
+        (
+            "manager.research",
+            6,
+            Some("medium"),
+            vec!["read_phase_summaries", "read_phase_summary_details"],
+            false,
+        ),
+        ("compressor.phase00", 4, None, vec![], false),
         ("trader", 6, None, vec![], false),
+        ("risk.aggressive", 6, None, vec![], false),
+        ("risk.neutral", 6, None, vec![], false),
         ("risk.conservative", 6, None, vec![], false),
         ("portfolio.manager", 6, Some("medium"), vec![], false),
     ] {
@@ -596,6 +621,7 @@ pub(crate) fn required_llm_roles() -> Vec<String> {
         "researcher.bear.interaction",
         "mediator.topic_controller",
         "manager.research",
+        "compressor.phase00",
     ] {
         if !ids.contains(&id.to_string()) {
             ids.push(id.to_string());
@@ -945,24 +971,39 @@ mod tests {
     }
 
     #[test]
-    fn static_context_roles_do_not_inherit_read_run_context() {
+    fn role_tools_are_phase_scoped() {
         let roles = builtin_llm_role_values();
         for role in [
-            "manager.research",
             "trader",
+            "risk.aggressive",
+            "risk.neutral",
             "risk.conservative",
             "portfolio.manager",
+            "compressor.phase00",
         ] {
             assert_eq!(roles[role]["tools"], json!([]), "role={role}");
         }
+        for role in ["researcher.bull.initial", "researcher.bear.initial"] {
+            assert_eq!(
+                roles[role]["tools"],
+                json!(["read_phase_summaries", "read_phase_summary_details"]),
+                "role={role}"
+            );
+        }
         for role in [
-            "researcher.bull.initial",
-            "researcher.bear.initial",
-            "mediator.topic_controller",
+            "researcher.bull.interaction",
+            "researcher.bear.interaction",
         ] {
             assert_eq!(
                 roles[role]["tools"],
-                json!(["read_run_context"]),
+                json!(["read_phase_summary_details"]),
+                "role={role}"
+            );
+        }
+        for role in ["mediator.topic_controller", "manager.research"] {
+            assert_eq!(
+                roles[role]["tools"],
+                json!(["read_phase_summaries", "read_phase_summary_details"]),
                 "role={role}"
             );
         }

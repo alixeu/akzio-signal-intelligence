@@ -1,7 +1,8 @@
 //! Post-phase compressor index: summaries → details, and unified attention ledger.
 //!
 //! Runtime authority for phase00 rows is the in-memory [`Phase00MemoryIndex`].
-//! SQLite is filled by [`Phase00MemoryIndex::flush`] at run end (or tests).
+//! Completed phase batches can also be persisted immediately with
+//! [`persist_phase00_batch`].
 
 use crate::schema::{canonical_json, ensure_run_exists, now_ms, payload_hash};
 use anyhow::Result;
@@ -217,13 +218,20 @@ impl Phase00MemoryIndex {
         self.phases.insert(batch.source_phase, batch);
     }
 
+    /// Compatibility entry point. Missing visibility bounds fail closed.
     pub fn list_summaries(&self, max_source_phase: Option<i64>, ticker: Option<&str>) -> Value {
+        let Some(max_source_phase) = max_source_phase.filter(|phase| *phase >= 0) else {
+            return empty_phase_summaries("phase visibility requires current_phase > 0");
+        };
         let mut items = Vec::new();
         for (phase, batch) in &self.phases {
-            if max_source_phase.is_some_and(|max| *phase > max) {
+            if *phase > max_source_phase {
                 continue;
             }
             for row in &batch.summaries {
+                if row.run_id != self.run_id {
+                    continue;
+                }
                 if let Some(t) = ticker.filter(|t| !t.is_empty()) {
                     if row.ticker != t && !row.ticker.is_empty() && row.ticker != "__ALL__" {
                         continue;
@@ -237,27 +245,74 @@ impl Phase00MemoryIndex {
             "item_count": items.len(),
             "items": items,
             "source": "phase00_memory",
-            "note": "Newer source_phase has higher recency_weight; prefer recent summaries. Runtime reads memory until run-end SQLite flush."
+            "note": "Newer source_phase has higher recency_weight; prefer recent summaries."
         })
     }
 
+    /// Run- and phase-scoped summary index. Only phases before `current_phase` are visible.
+    pub fn list_visible_summaries(
+        &self,
+        run_id: &str,
+        current_phase: i64,
+        ticker: Option<&str>,
+    ) -> Result<Value> {
+        let max_source_phase = prior_phase_bound(run_id, current_phase)?;
+        if self.run_id != run_id {
+            return Ok(empty_phase_summaries("run not visible"));
+        }
+        Ok(self.list_summaries(Some(max_source_phase), ticker))
+    }
+
+    /// Compatibility entry point without a visibility scope. It intentionally returns no rows.
     pub fn list_details(&self, summary_id: &str) -> Value {
+        empty_phase_details(summary_id, "run_id and current_phase are required")
+    }
+
+    /// Run- and phase-scoped details. The parent summary must be visible first.
+    pub fn list_visible_details(
+        &self,
+        run_id: &str,
+        current_phase: i64,
+        summary_id: &str,
+    ) -> Result<Value> {
+        let max_source_phase = prior_phase_bound(run_id, current_phase)?;
+        if summary_id.trim().is_empty() {
+            anyhow::bail!("summary_id is required");
+        }
+        if self.run_id != run_id {
+            return Ok(empty_phase_details(summary_id, "summary not found or not visible"));
+        }
+        let parent_phase = self.phases.iter().find_map(|(phase, batch)| {
+            (*phase <= max_source_phase
+                && batch.summaries.iter().any(|row| {
+                    row.id == summary_id
+                        && row.run_id == run_id
+                        && row.source_phase == *phase
+                }))
+            .then_some(*phase)
+        });
+        let Some(parent_phase) = parent_phase else {
+            return Ok(empty_phase_details(summary_id, "summary not found or not visible"));
+        };
         let mut items = Vec::new();
-        for batch in self.phases.values() {
+        if let Some(batch) = self.phases.get(&parent_phase) {
             for row in &batch.details {
-                if row.summary_id == summary_id {
+                if row.summary_id == summary_id
+                    && row.run_id == run_id
+                    && row.source_phase == parent_phase
+                {
                     items.push(detail_row_to_value(row));
                 }
             }
         }
         items.sort_by_key(|item| item.get("sort_order").and_then(Value::as_i64).unwrap_or(0));
-        json!({
+        Ok(json!({
             "query": "phase_summary_details",
             "summary_id": summary_id,
             "item_count": items.len(),
             "items": items,
             "source": "phase00_memory"
-        })
+        }))
     }
 
     pub fn expand_summary(&self, id: &str) -> Option<Value> {
@@ -293,42 +348,42 @@ impl Phase00MemoryIndex {
         let tx = conn.unchecked_transaction()?;
         let mut total = 0usize;
         for batch in self.phases.values() {
-            clear_phase_compress(&tx, &self.run_id, batch.source_phase)?;
-            for row in &batch.summaries {
-                upsert_phase_summary(
-                    &tx,
-                    &PhaseSummaryInput {
-                        run_id: row.run_id.clone(),
-                        source_phase: row.source_phase,
-                        role: row.role.clone(),
-                        ticker: row.ticker.clone(),
-                        topic_id: row.topic_id.clone(),
-                        summary: row.summary.clone(),
-                        summary_json: row.summary_json.clone(),
-                        confidence: row.confidence,
-                    },
-                )?;
-                total += 1;
-            }
-            for row in &batch.details {
-                upsert_phase_summary_detail(
-                    &tx,
-                    &PhaseSummaryDetailInput {
-                        summary_id: row.summary_id.clone(),
-                        run_id: row.run_id.clone(),
-                        source_phase: row.source_phase,
-                        detail: row.detail.clone(),
-                        detail_json: row.detail_json.clone(),
-                        source_ref: row.source_ref.clone(),
-                        sort_order: row.sort_order,
-                    },
-                )?;
-                total += 1;
-            }
+            total += persist_phase00_batch_inner(&tx, &self.run_id, batch)?;
         }
         tx.commit()?;
         Ok(total)
     }
+}
+
+fn prior_phase_bound(run_id: &str, current_phase: i64) -> Result<i64> {
+    if run_id.trim().is_empty() {
+        anyhow::bail!("run_id is required for phase summary access");
+    }
+    if current_phase <= 0 {
+        anyhow::bail!("current_phase must be greater than zero");
+    }
+    Ok(current_phase - 1)
+}
+
+fn empty_phase_summaries(note: &str) -> Value {
+    json!({
+        "query": "phase_summaries",
+        "item_count": 0,
+        "items": [],
+        "source": "phase00_memory",
+        "note": note
+    })
+}
+
+fn empty_phase_details(summary_id: &str, note: &str) -> Value {
+    json!({
+        "query": "phase_summary_details",
+        "summary_id": summary_id,
+        "item_count": 0,
+        "items": [],
+        "source": "phase00_memory",
+        "note": note
+    })
 }
 
 fn summary_row_to_value(row: &PhaseSummaryRow) -> Value {
@@ -469,6 +524,84 @@ pub fn clear_phase_compress(conn: &Connection, run_id: &str, source_phase: i64) 
     Ok(())
 }
 
+/// Persist exactly one completed phase00 batch in one transaction.
+///
+/// Existing rows are cleared only for the same `(run_id, source_phase)` pair.
+pub fn persist_phase00_batch(
+    conn: &Connection,
+    run_id: &str,
+    batch: &Phase00PhaseBatch,
+) -> Result<usize> {
+    let tx = conn.unchecked_transaction()?;
+    let written = persist_phase00_batch_inner(&tx, run_id, batch)?;
+    tx.commit()?;
+    Ok(written)
+}
+
+fn persist_phase00_batch_inner(
+    conn: &Connection,
+    run_id: &str,
+    batch: &Phase00PhaseBatch,
+) -> Result<usize> {
+    if run_id.trim().is_empty() {
+        anyhow::bail!("run_id is required to persist a phase00 batch");
+    }
+    if batch.source_phase <= 0 {
+        anyhow::bail!("source_phase must be greater than zero");
+    }
+    if batch
+        .summaries
+        .iter()
+        .any(|row| row.run_id != run_id || row.source_phase != batch.source_phase)
+        || batch
+            .details
+            .iter()
+            .any(|row| row.run_id != run_id || row.source_phase != batch.source_phase)
+    {
+        anyhow::bail!("phase00 batch rows must match run_id and source_phase");
+    }
+    if batch.details.iter().any(|detail| {
+        !batch
+            .summaries
+            .iter()
+            .any(|summary| summary.id == detail.summary_id)
+    }) {
+        anyhow::bail!("phase00 detail must reference a summary in the same batch");
+    }
+
+    clear_phase_compress(conn, run_id, batch.source_phase)?;
+    for row in &batch.summaries {
+        upsert_phase_summary(
+            conn,
+            &PhaseSummaryInput {
+                run_id: row.run_id.clone(),
+                source_phase: row.source_phase,
+                role: row.role.clone(),
+                ticker: row.ticker.clone(),
+                topic_id: row.topic_id.clone(),
+                summary: row.summary.clone(),
+                summary_json: row.summary_json.clone(),
+                confidence: row.confidence,
+            },
+        )?;
+    }
+    for row in &batch.details {
+        upsert_phase_summary_detail(
+            conn,
+            &PhaseSummaryDetailInput {
+                summary_id: row.summary_id.clone(),
+                run_id: row.run_id.clone(),
+                source_phase: row.source_phase,
+                detail: row.detail.clone(),
+                detail_json: row.detail_json.clone(),
+                source_ref: row.source_ref.clone(),
+                sort_order: row.sort_order,
+            },
+        )?;
+    }
+    Ok(batch.written())
+}
+
 pub fn record_attention(conn: &Connection, event: &AttentionEvent) -> Result<String> {
     let tx = conn.unchecked_transaction()?;
     let id = record_attention_inner(&tx, event)?;
@@ -538,22 +671,19 @@ pub fn record_attention_batch(conn: &Connection, events: &[AttentionEvent]) -> R
 pub fn list_phase_summaries(
     conn: &Connection,
     run_id: &str,
-    max_source_phase: Option<i64>,
+    current_phase: i64,
     ticker: Option<&str>,
 ) -> Result<Value> {
+    prior_phase_bound(run_id, current_phase)?;
     let mut sql = String::from(
         r#"
         SELECT id, run_id, source_phase, role, ticker, topic_id, summary, summary_json,
                confidence, created_at
         FROM phase_summaries
-        WHERE run_id = ?1
+        WHERE run_id = ?1 AND source_phase < ?2
         "#,
     );
-    let mut params: Vec<Value> = vec![json!(run_id)];
-    if let Some(phase) = max_source_phase {
-        sql.push_str(" AND source_phase <= ?");
-        params.push(json!(phase));
-    }
+    let mut params: Vec<Value> = vec![json!(run_id), json!(current_phase)];
     if let Some(t) = ticker.filter(|t| !t.is_empty()) {
         sql.push_str(" AND (ticker = ? OR ticker = '' OR ticker = '__ALL__')");
         params.push(json!(t));
@@ -718,17 +848,33 @@ pub fn compressor_debug_snapshot(
     }))
 }
 
-pub fn list_phase_summary_details(conn: &Connection, summary_id: &str) -> Result<Value> {
+pub fn list_phase_summary_details(
+    conn: &Connection,
+    run_id: &str,
+    current_phase: i64,
+    summary_id: &str,
+) -> Result<Value> {
+    prior_phase_bound(run_id, current_phase)?;
+    if summary_id.trim().is_empty() {
+        anyhow::bail!("summary_id is required");
+    }
     let mut stmt = conn.prepare(
         r#"
-        SELECT id, summary_id, run_id, source_phase, detail, detail_json, source_ref, sort_order, created_at
-        FROM phase_summary_details
-        WHERE summary_id = ?1
-        ORDER BY sort_order ASC, created_at ASC
+        SELECT d.id, d.summary_id, d.run_id, d.source_phase, d.detail, d.detail_json,
+               d.source_ref, d.sort_order, d.created_at
+        FROM phase_summary_details d
+        JOIN phase_summaries s
+          ON s.id = d.summary_id
+         AND s.run_id = d.run_id
+         AND s.source_phase = d.source_phase
+        WHERE d.summary_id = ?1
+          AND d.run_id = ?2
+          AND d.source_phase < ?3
+        ORDER BY d.sort_order ASC, d.created_at ASC
         "#,
     )?;
     let rows = stmt
-        .query_map(params![summary_id], |row| {
+        .query_map(params![summary_id, run_id, current_phase], |row| {
             let detail_json: String = row.get("detail_json")?;
             Ok(json!({
                 "id": row.get::<_, String>("id")?,
@@ -1002,11 +1148,11 @@ mod tests {
         )
         .unwrap();
 
-        let summaries = list_phase_summaries(&conn, run_id, Some(1), Some("QQQ")).unwrap();
+        let summaries = list_phase_summaries(&conn, run_id, 2, Some("QQQ")).unwrap();
         assert_eq!(summaries["item_count"], 1);
         assert!(summaries["items"][0]["recency_weight"].as_f64().unwrap() > 1.0);
 
-        let details = list_phase_summary_details(&conn, &sid).unwrap();
+        let details = list_phase_summary_details(&conn, run_id, 2, &sid).unwrap();
         assert_eq!(details["item_count"], 1);
         assert_eq!(details["items"][0]["id"], did);
 

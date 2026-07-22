@@ -23,9 +23,14 @@ use crate::truncation::{truncate_semantic, TruncationConfig};
 use crate::AgentSettings;
 
 const DEFAULT_MAX_AGENT_LOOPS: usize = 8;
-const COMPACT_ANALYST_ARTIFACT_INSTRUCTION: &str = "For analyst artifacts, prioritize a complete, valid compact payload: use no more than two key_evidence items and keep each per-ticker report to 600 characters or fewer. Every per_ticker entry must itself contain report and key_evidence (with claim, evidence_type, source, timestamp, and source_confidence); top-level evidence does not satisfy this contract. The required minimal shape is {\"id\":\"<role>\",\"role\":\"<role>\",\"per_ticker\":{\"<ticker>\":{\"direction\":\"neutral\",\"confidence\":0.0,\"report\":\"...\",\"key_evidence\":[{\"claim\":\"...\",\"evidence_type\":\"fact\",\"source\":\"...\",\"timestamp\":\"...\",\"source_confidence\":0.0}]}}}.";
-const TRUNCATED_ANALYST_ARTIFACT_RETRY_INSTRUCTION: &str = "Your previous artifact was incomplete or invalid, likely because it exceeded the response limit. Emit a replacement JSON artifact now. For every ticker, include direction, confidence, a report of 250 characters or fewer, and exactly one key_evidence object with claim, evidence_type, source, timestamp, and source_confidence. Do not put key_evidence only at the top level or repeat the earlier prose.";
-const INVALID_ANALYST_ARTIFACT_RETRY_INSTRUCTION: &str = "Your last JSON is invalid for this analyst role. Emit one JSON object with id/role for this analyst and, for every per_ticker.<TICKER>, direction, confidence, report, and key_evidence:[{claim,evidence_type,source,timestamp,source_confidence}]. direction must be bullish|bearish|neutral|mixed|unobserved; confidence and source_confidence must be 0..1 numbers. Do not put evidence only at the top level or invent alternate schemas.";
+const SYSTEM_PROMPT_TEMPLATE: &str =
+    include_str!("../../../../prompts/system/agent_loop.md");
+const REQUEST_WRAPPER_TEMPLATE: &str =
+    include_str!("../../../../prompts/messages/request_wrapper.md");
+const ARTIFACT_RETRY_INSTRUCTION: &str =
+    include_str!("../../../../prompts/messages/artifact_retry.md");
+const FINALIZE_INSTRUCTION: &str =
+    include_str!("../../../../prompts/messages/finalize.md");
 
 pub struct AgentLoopModel {
     settings: AgentSettings,
@@ -196,7 +201,7 @@ where
             .iter()
             .any(|item| item.item_type == TurnItemType::ToolResult);
         if !already {
-            let preseed_calls = preseed_tool_calls(&turn.role, &turn_tickers(turn));
+            let preseed_calls = preseed_tool_calls(turn, &turn_tickers(turn));
             for call in preseed_calls {
                 turn.emitted_items.push(TurnItem::tool_call(&call));
                 let result = tools.execute(call).await;
@@ -347,22 +352,7 @@ where
             persist_turn(conn, turn, &config.truncation)?;
             if loop_index >= 3 {
                 turn.tools_disabled = true;
-                let hint = if turn.role.starts_with("analyst.") {
-                    "Emit one JSON object with id/role for this analyst, status=completed, and per_ticker.<TICKER>.{direction,confidence,report}. direction must be bullish|bearish|neutral|mixed|unobserved; confidence must be a 0..1 number."
-                } else if turn.role.contains("bear.initial") {
-                    "Emit bear_seed_packet JSON now: role=researcher.bear.initial, artifact_type=bear_seed_packet, topic_id, claims[], summary, reducer_checks. Do not call tools again."
-                } else if turn.role.contains("bull.initial") {
-                    "Emit bull_seed_packet JSON now: role=researcher.bull.initial, artifact_type=bull_seed_packet, topic_id, claims[], summary, reducer_checks. Do not call tools again."
-                } else if turn.role.contains("interaction") {
-                    "Emit the debate packet JSON required by the role prompt now. Do not call tools again."
-                } else if turn.role.starts_with("mediator.") {
-                    "Emit the mediator JSON artifact required by the role prompt now. Do not call tools again."
-                } else {
-                    "Emit the final JSON artifact required by the role prompt now. Tools are disabled for this turn."
-                };
-                turn.push_pending_input(format!(
-                    "Tool evidence is already available. Tools are now disabled. {hint}"
-                ));
+                turn.push_pending_input(FINALIZE_INSTRUCTION);
             }
             turn.needs_follow_up = true;
             persist_turn(conn, turn, &config.truncation)?;
@@ -386,21 +376,17 @@ where
                 && !analyst_final_artifact_looks_valid(&turn.role, &turn_tickers(turn), &text)
             {
                 turn.tools_disabled = true;
-                let retry_instruction = if extract_json_value(&text).is_err() {
-                    TRUNCATED_ANALYST_ARTIFACT_RETRY_INSTRUCTION
-                } else {
-                    INVALID_ANALYST_ARTIFACT_RETRY_INSTRUCTION
-                };
-                turn.push_pending_input(retry_instruction);
+                turn.push_pending_input(ARTIFACT_RETRY_INSTRUCTION);
                 turn.needs_follow_up = true;
                 persist_turn(conn, turn, &config.truncation)?;
                 continue;
             }
-            if seed_packet_role(&turn.role) && !seed_packet_looks_valid(&turn.role, &text) {
+            if seed_packet_role(&turn.role)
+                && text.trim() != "准备完毕"
+                && !seed_packet_looks_valid(&turn.role, &text)
+            {
                 turn.tools_disabled = true;
-                turn.push_pending_input(
-                    "Your last JSON is invalid for this seed role. Emit the required seed packet JSON with artifact_type, topic_id, claims[], summary, and reducer_checks. Do not call tools again.",
-                );
+                turn.push_pending_input(ARTIFACT_RETRY_INSTRUCTION);
                 turn.needs_follow_up = true;
                 persist_turn(conn, turn, &config.truncation)?;
                 continue;
@@ -409,27 +395,21 @@ where
                 && !research_artifact_looks_valid(&turn_tickers(turn), &text)
             {
                 turn.tools_disabled = true;
-                turn.push_pending_input(
-                    "Your last output is invalid for manager.research. Emit the ResearchArtifact required by the current role schema. Use a valid confidence_basis and, for Hold, the matching hold_reason. If probabilities live under per_ticker, also copy the primary ticker's rating/probabilities to the top level. Do not call tools again.",
-                );
+                turn.push_pending_input(ARTIFACT_RETRY_INSTRUCTION);
                 turn.needs_follow_up = true;
                 persist_turn(conn, turn, &config.truncation)?;
                 continue;
             }
             if turn.role == "trader" && !trade_intent_looks_valid(&text) {
                 turn.tools_disabled = true;
-                turn.push_pending_input(
-                    "Your last output is invalid for trader. Emit the TradeIntent required by the current role schema. Hold must use position_size=0%. Do not call tools again.",
-                );
+                turn.push_pending_input(ARTIFACT_RETRY_INSTRUCTION);
                 turn.needs_follow_up = true;
                 persist_turn(conn, turn, &config.truncation)?;
                 continue;
             }
             if turn.role.starts_with("risk.") && !risk_constraints_look_valid(&turn.role, &text) {
                 turn.tools_disabled = true;
-                turn.push_pending_input(
-                    "Your last output is invalid for this risk role. Emit the integrated RiskConstraints required by the current role schema, including stance, numeric caps, stop policy, triggers, review window, cash/hedge purpose, and confidence. Do not call tools again.",
-                );
+                turn.push_pending_input(ARTIFACT_RETRY_INSTRUCTION);
                 turn.needs_follow_up = true;
                 persist_turn(conn, turn, &config.truncation)?;
                 continue;
@@ -438,18 +418,14 @@ where
                 && !interaction_packet_looks_valid(&turn.role, &text)
             {
                 turn.tools_disabled = true;
-                turn.push_pending_input(
-                    "Your last JSON is invalid for this interaction role. Emit the exact role-specific debate packet with role, artifact_type, topic_id, reply_to_claim_id, steer_id, stance, claim, evidence_refs, confidence, send_to_mediator, blocked_ack, and steelman unless stance=no_new_info. Do not call tools again.",
-                );
+                turn.push_pending_input(ARTIFACT_RETRY_INSTRUCTION);
                 turn.needs_follow_up = true;
                 persist_turn(conn, turn, &config.truncation)?;
                 continue;
             }
             if turn.role == "mediator.topic_controller" && !controller_packet_looks_valid(&text) {
                 turn.tools_disabled = true;
-                turn.push_pending_input(
-                    "Your last JSON is invalid for mediator.topic_controller. Emit the topic_controller_packet required by the current role schema, including evidence-backed decision_hinges, agreed_facts, info_gain_score, and soft_control. Do not call tools again.",
-                );
+                turn.push_pending_input(ARTIFACT_RETRY_INSTRUCTION);
                 turn.needs_follow_up = true;
                 persist_turn(conn, turn, &config.truncation)?;
                 continue;
@@ -609,6 +585,10 @@ pub(super) fn persist_turn(
     turn: &Turn,
     truncation: &TruncationConfig,
 ) -> Result<()> {
+    let force_history_checkpoint = turn
+        .model_context
+        .lines()
+        .any(|line| line == "history_fork=true");
     let turn_number: i64 = conn
         .query_row(
             "SELECT COALESCE(turn_number, 0) FROM agent_events WHERE turn_id = ?",
@@ -650,10 +630,17 @@ pub(super) fn persist_turn(
             phase: turn.phase,
             turn_number,
             role: turn.role.clone(),
-            full_context_json: json!(full_context),
+            full_context_json: json!(full_context.clone()),
             summary,
         },
-    )
+    )?;
+    if force_history_checkpoint {
+        conn.execute(
+            "UPDATE agent_events SET full_context_json = ?1, context_delta_json = '[]' WHERE turn_id = ?2",
+            rusqlite::params![serde_json::to_string(&full_context)?, turn.turn_id],
+        )?;
+    }
+    Ok(())
 }
 
 pub(super) fn update_turn_item(
@@ -1203,9 +1190,9 @@ async fn mark_last_assistant_message_as_final<S: AgentEventSink>(
     Ok(())
 }
 
-fn preseed_tool_calls(role: &str, tickers: &[String]) -> Vec<ToolCallRequest> {
+fn preseed_tool_calls(turn: &Turn, tickers: &[String]) -> Vec<ToolCallRequest> {
     let mut calls = Vec::new();
-    match role {
+    match turn.role.as_str() {
         "analyst.technical" => {
             for ticker in tickers {
                 for interval in &["daily", "3h", "20min"] {
@@ -1224,9 +1211,37 @@ fn preseed_tool_calls(role: &str, tickers: &[String]) -> Vec<ToolCallRequest> {
                 arguments: json!({}),
             });
         }
+        "researcher.bull.initial" | "researcher.bear.initial" if turn_is_warmup(turn) => {
+            calls.push(ToolCallRequest {
+                call_id: format!(
+                    "preseed-phase-summaries-{}",
+                    turn.role.replace('.', "-")
+                ),
+                name: tools::READ_PHASE_SUMMARIES_TOOL_NAME.to_string(),
+                arguments: json!({}),
+            });
+        }
         _ => {}
     }
     calls
+}
+
+fn turn_is_warmup(turn: &Turn) -> bool {
+    fn warmup_steer(value: &str) -> bool {
+        let value = value.trim().strip_prefix("Steer:").unwrap_or(value.trim());
+        serde_json::from_str::<Value>(value)
+            .ok()
+            .and_then(|value| value.get("kind").and_then(Value::as_str).map(str::to_owned))
+            .is_some_and(|kind| kind == "warmup")
+    }
+
+    turn.pending_input.iter().any(|value| warmup_steer(value))
+        || turn
+            .emitted_items
+            .iter()
+            .skip(1)
+            .filter(|item| item.item_type == TurnItemType::UserMessage)
+            .any(|item| warmup_steer(&item.content_text))
 }
 
 /// Map plain assistant text (stream/text output) into a ModelResponse.
@@ -1553,6 +1568,9 @@ fn risk_constraints_look_valid(role: &str, text: &str) -> bool {
     let expected_stance = role.strip_prefix("risk.").unwrap_or_default();
     value.get("stance").and_then(Value::as_str) == Some(expected_stance)
         && non_empty_string_field(&value, "argument")
+        && (non_empty_string_field(&value, "unique_risk_contribution")
+            || value.get("no_new_information").and_then(Value::as_bool) == Some(true))
+        && non_empty_string_field(&value, "disagreement_with_prior")
         && non_empty_string_field(&value, "recommended_adjustment")
         && value
             .get("stop_type")
@@ -1628,6 +1646,9 @@ fn analyst_final_artifact_looks_valid(role: &str, expected_tickers: &[String], t
 }
 
 pub fn classify_assistant_message(text: &str, turn_status: TurnStatus) -> FollowUpDecision {
+    if text.trim() == "准备完毕" {
+        return FollowUpDecision::Final;
+    }
     let trimmed = text.trim();
 
     match turn_status {
@@ -1702,33 +1723,16 @@ pub fn model_system_instruction(
     executing_role: &str,
     tickers: &[String],
 ) -> String {
-    let tools_line = if available_tools.is_empty() {
-        "No tools are available for this turn. Emit the final JSON artifact required by the current role schema now.".to_string()
-    } else {
-        format!(
-            "Native function-calling tools are available (use the API tool channel, not invented JSON tool events): {}.\n\
-If evidence is missing, call the appropriate tool. When tool evidence is enough, stop calling tools and emit the final JSON artifact as plain assistant text (one JSON object, no markdown fences).",
-            serde_json::to_string(available_tools).unwrap_or_default()
+    SYSTEM_PROMPT_TEMPLATE
+        .replace("{executing_role}", executing_role)
+        .replace(
+            "{tickers}",
+            &serde_json::to_string(tickers).unwrap_or_default(),
         )
-    };
-    let analyst_compact_instruction = if executing_role.starts_with("analyst.") {
-        COMPACT_ANALYST_ARTIFACT_INSTRUCTION
-    } else {
-        ""
-    };
-    format!(
-        "You are running inside an agent loop powered by the OpenAI Responses API.\n\
-You are executing role `{executing_role}` for exactly these tickers: {}.\n\
-A final artifact's role must exactly equal `{executing_role}`. Analyst final artifacts must contain per_ticker entries for exactly this ticker set; do not substitute, rename, or omit tickers.\n\
-Protocol:\n\
-1) Use native function calls for tools. Do not invent custom event JSON lines.\n\
-2) Intermediate commentary may be plain text, but the turn must end with the complete artifact required by the current role schema as a single JSON object in assistant text.\n\
-3) Do not end with text saying you are about to retry, fetch, analyze, or wait for inputs; call the tool or produce the final artifact.\n\
-4) Do not wrap the artifact in id/role/status/report envelopes unless that role schema defines them.\n\
-{analyst_compact_instruction}\n\
-{tools_line}",
-        serde_json::to_string(tickers).unwrap_or_default(),
-    )
+        .replace(
+            "{available_tools}",
+            &serde_json::to_string(available_tools).unwrap_or_default(),
+        )
 }
 
 /// Backward-compatible alias.
@@ -1917,10 +1921,10 @@ pub fn model_prompt(input: &ModelInput) -> Result<String> {
 
     let static_context = serde_json::to_string_pretty(&static_items)?;
     let dynamic_context = serde_json::to_string_pretty(&dynamic_items)?;
-    Ok(format!(
-        "{system}\n\nStatic context:\n{static_context}\n\nDynamic context:\n{dynamic_context}\n\n\
-Respond with either a native tool call or the final JSON artifact as plain assistant text."
-    ))
+    Ok(REQUEST_WRAPPER_TEMPLATE
+        .replace("{system}", &system)
+        .replace("{static_context}", &static_context)
+        .replace("{dynamic_context}", &dynamic_context))
 }
 
 /// Backward-compatible alias.
@@ -2322,6 +2326,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn bull_bear_warmup_preseeds_summary_index_only_for_warmup() {
+        for role in ["researcher.bull.initial", "researcher.bear.initial"] {
+            let mut warmup = Turn::new("turn-warmup", "session", "run", role, "role prompt");
+            warmup.push_pending_input(r#"Steer: {"kind":"warmup"}"#);
+            let calls = preseed_tool_calls(&warmup, &["QQQ".to_string()]);
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].name, tools::READ_PHASE_SUMMARIES_TOOL_NAME);
+
+            let mut seed = Turn::new("turn-seed", "session", "run", role, "role prompt");
+            seed.push_pending_input(r#"Steer: {"kind":"topic_fork"}"#);
+            assert!(preseed_tool_calls(&seed, &["QQQ".to_string()]).is_empty());
+        }
+    }
+
+    #[test]
     fn turn_tickers_reads_generated_model_context() {
         let mut turn = Turn::new(
             "turn-1",
@@ -2692,15 +2711,15 @@ mod tests {
             item.item_type == TurnItemType::UserMessage
                 && item
                     .content_text
-                    .contains("likely because it exceeded the response limit")
+                    .contains("Previous output failed validation or was incomplete")
         }));
     }
 
     #[test]
-    fn analyst_system_instruction_requests_compact_artifact() {
+    fn analyst_system_instruction_requests_the_role_contract() {
         let instruction = model_system_instruction(&[], "analyst.news_macro", &["QQQ".to_string()]);
 
-        assert!(instruction.contains("keep each per-ticker report to 600 characters"));
+        assert!(instruction.contains("Follow the active role prompt and its output contract"));
     }
 
     #[test]
@@ -2711,7 +2730,7 @@ mod tests {
     }
 
     #[test]
-    fn integrated_risk_packet_allows_empty_legacy_debate_fields() {
+    fn risk_committee_packet_requires_debate_fields() {
         let base = json!({
             "stance": "conservative",
             "argument": "Balanced review.",
@@ -2725,7 +2744,7 @@ mod tests {
             "cash_hedge_recommendation": "Keep cash.",
             "constraint_confidence": 0.8
         });
-        assert!(risk_constraints_look_valid(
+        assert!(!risk_constraints_look_valid(
             "risk.conservative",
             &base.to_string()
         ));
@@ -3478,7 +3497,7 @@ mod tests {
         assert!(instruction.contains("analyst.technical"));
         assert!(instruction.contains("QQQ"));
         assert!(instruction.contains("SOXX"));
-        assert!(instruction.contains("artifact required by the current role schema"));
+        assert!(instruction.contains("Artifact role and ticker coverage must match the active role"));
         assert!(!instruction.contains("JSON with id, role, status, per_ticker"));
     }
 

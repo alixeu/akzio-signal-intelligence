@@ -3,12 +3,14 @@ use orchestrator_sql::{
     candidate::{insert_candidate_experience, pending_candidates, CandidateExperienceInput},
     connect, context_count, ensure_schema, handle_read_command, import_jin10_payload,
     import_technical_csv,
+    list_phase_summaries, list_phase_summary_details,
     memory::{promote_candidate_to_memory, PromoteMemoryInput},
     outcome::{upsert_outcome, OutcomeInput},
     prediction::{upsert_prediction, PredictionInput},
-    read_run_context, session_history_items, upsert_agent_turn, write_agent_message_scoped,
-    write_role_turn_summary, write_run_record, AgentMessageInput, AgentTurnInput,
-    RoleTurnSummaryInput, RunContextReadRequest, RunRecordInput, RuntimeContext,
+    persist_phase00_batch, read_run_context, session_history_items, upsert_agent_turn,
+    write_agent_message_scoped, write_role_turn_summary, write_run_record, AgentMessageInput,
+    AgentTurnInput, Phase00MemoryIndex, Phase00PhaseBatch, PhaseSummaryDetailInput,
+    PhaseSummaryInput, RoleTurnSummaryInput, RunContextReadRequest, RunRecordInput, RuntimeContext,
 };
 use serde_json::json;
 
@@ -915,4 +917,88 @@ fn jin10_context_returns_id_and_content_json_payload() {
         "jin10 id must be md5 hex"
     );
     assert_eq!(long_item["attention_score"], 0.0);
+}
+
+#[test]
+fn phase_summary_access_is_run_and_prior_phase_scoped() {
+    fn batch(run_id: &str, source_phase: i64, text: &str) -> (Phase00PhaseBatch, String) {
+        let mut batch = Phase00PhaseBatch {
+            source_phase,
+            ..Default::default()
+        };
+        let summary_id = batch.push_summary(&PhaseSummaryInput {
+            run_id: run_id.into(),
+            source_phase,
+            role: "compressor.phase00".into(),
+            ticker: "QQQ".into(),
+            topic_id: None,
+            summary: text.into(),
+            summary_json: json!({"text": text}),
+            confidence: 0.8,
+        });
+        batch.push_detail(&PhaseSummaryDetailInput {
+            summary_id: summary_id.clone(),
+            run_id: run_id.into(),
+            source_phase,
+            detail: format!("detail {text}"),
+            detail_json: json!({"text": text}),
+            source_ref: format!("phase:{source_phase}"),
+            sort_order: 0,
+        });
+        (batch, summary_id)
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let db_path = temp.path().join("phase00.sqlite");
+    let mut conn = connect(&db_path).unwrap();
+    let (phase1, phase1_id) = batch("run-a", 1, "phase one");
+    let (phase2, phase2_id) = batch("run-a", 2, "phase two");
+    let (other_run, other_id) = batch("run-b", 1, "other run");
+    persist_phase00_batch(&conn, "run-a", &phase1).unwrap();
+    persist_phase00_batch(&conn, "run-a", &phase2).unwrap();
+    persist_phase00_batch(&conn, "run-b", &other_run).unwrap();
+
+    let summaries = list_phase_summaries(&conn, "run-a", 2, None).unwrap();
+    assert_eq!(summaries["item_count"], 1);
+    assert_eq!(summaries["items"][0]["id"], phase1_id);
+    assert_eq!(
+        list_phase_summary_details(&conn, "run-a", 2, &phase1_id).unwrap()["item_count"],
+        1
+    );
+    assert_eq!(
+        list_phase_summary_details(&conn, "run-a", 2, &phase2_id).unwrap()["item_count"],
+        0
+    );
+    assert_eq!(
+        list_phase_summary_details(&conn, "run-a", 2, &other_id).unwrap()["item_count"],
+        0
+    );
+
+    let mut memory = Phase00MemoryIndex::new("run-a");
+    memory.merge(phase1);
+    memory.merge(phase2);
+    assert_eq!(
+        memory
+            .list_visible_details("run-a", 2, &phase1_id)
+            .unwrap()["item_count"],
+        1
+    );
+    assert_eq!(
+        memory
+            .list_visible_details("run-a", 2, &phase2_id)
+            .unwrap()["item_count"],
+        0
+    );
+
+    let error = read_run_context(
+        &mut conn,
+        &RunContextReadRequest {
+            kind: "phase_summaries".into(),
+            run_id: Some("run-a".into()),
+            phase: None,
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("current phase"));
 }

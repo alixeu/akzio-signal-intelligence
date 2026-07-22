@@ -1,4 +1,6 @@
 pub mod read_jin10_csv;
+pub mod read_phase_summaries;
+pub mod read_phase_summary_details;
 pub mod read_run_context;
 pub mod read_technical_csv;
 pub mod think;
@@ -15,6 +17,9 @@ pub use crate::web_search::{WebSearchConfig, WebSearchProvider};
 pub use web_run::Runtime as WebRunRuntime;
 
 pub const WEB_RUN_TOOL_NAME: &str = web_run::NAME;
+pub const READ_PHASE_SUMMARIES_TOOL_NAME: &str = read_phase_summaries::NAME;
+pub const READ_PHASE_SUMMARY_DETAILS_TOOL_NAME: &str = read_phase_summary_details::NAME;
+// Internal compatibility only. This tool is intentionally absent from REGISTRY.
 pub const READ_RUN_CONTEXT_TOOL_NAME: &str = read_run_context::NAME;
 
 #[derive(Debug, Clone)]
@@ -65,8 +70,12 @@ const REGISTRY: &[ToolEntry] = &[
         definition: think::definition,
     },
     ToolEntry {
-        name: read_run_context::NAME,
-        definition: read_run_context::definition,
+        name: read_phase_summaries::NAME,
+        definition: read_phase_summaries::definition,
+    },
+    ToolEntry {
+        name: read_phase_summary_details::NAME,
+        definition: read_phase_summary_details::definition,
     },
     ToolEntry {
         name: web_run::NAME,
@@ -86,7 +95,8 @@ pub fn tool_names() -> &'static [&'static str] {
     // Exclude think (always enabled via runtime, not listed in explicit names)
     // and web.run (conditionally added).
     &[
-        read_run_context::NAME,
+        read_phase_summaries::NAME,
+        read_phase_summary_details::NAME,
         read_technical_csv::NAME,
         read_jin10_csv::NAME,
     ]
@@ -198,6 +208,16 @@ pub async fn execute_named_tool(
         "named tool starting"
     );
     match name {
+        read_phase_summaries::NAME => {
+            let result = read_phase_summaries::execute(args, config, turn_context);
+            log_tool_result(name, &result);
+            result
+        }
+        read_phase_summary_details::NAME => {
+            let result = read_phase_summary_details::execute(args, config, turn_context);
+            log_tool_result(name, &result);
+            result
+        }
         read_run_context::NAME => {
             let result = read_run_context::execute(args, config, turn_context);
             log_tool_result(name, &result);
@@ -297,7 +317,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_run_context_rejects_raw_source_kinds() {
+    async fn legacy_read_run_context_is_not_model_registered() {
+        assert!(tool_definition(read_run_context::NAME).is_none());
         let error = execute_named_tool(
             read_run_context::NAME,
             json!({"kind": "technical"}),
@@ -314,17 +335,35 @@ mod tests {
     fn tool_definitions_map_web_run_api_name() {
         let names = [
             web_run::NAME.to_string(),
-            read_run_context::NAME.to_string(),
+            read_phase_summaries::NAME.to_string(),
+            read_phase_summary_details::NAME.to_string(),
         ];
         let defs: Vec<_> = names.iter().filter_map(|n| tool_definition(n)).collect();
-        assert_eq!(defs.len(), 2);
+        assert_eq!(defs.len(), 3);
         assert!(defs.iter().any(|tool| tool.name == "web_run"));
-        assert!(defs.iter().any(|tool| tool.name == "read_run_context"));
+        assert!(defs
+            .iter()
+            .any(|tool| tool.name == "read_phase_summaries"));
+        assert!(defs
+            .iter()
+            .any(|tool| tool.name == "read_phase_summary_details"));
         assert_eq!(resolve_tool_name("web_run"), web_run::NAME);
-        assert_eq!(
-            resolve_tool_name("read_run_context"),
-            read_run_context::NAME
-        );
+    }
+
+    #[tokio::test]
+    async fn phase_summary_tools_fail_closed_without_turn_context() {
+        for (name, args) in [
+            (read_phase_summaries::NAME, json!({})),
+            (
+                read_phase_summary_details::NAME,
+                json!({"summary_id": "summary-1"}),
+            ),
+        ] {
+            let error = execute_named_tool(name, args, &external_config(), None, None)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("turn context"));
+        }
     }
 
     #[tokio::test]

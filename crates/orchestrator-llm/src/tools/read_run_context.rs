@@ -2,31 +2,22 @@ use super::ToolDefinition;
 use anyhow::{bail, Result};
 use serde_json::{json, Value};
 
-use super::{api_tool_name, tool_connection, ExternalToolConfig};
+use super::{api_tool_name, ExternalToolConfig};
 use crate::agent_loop::ToolRuntimeTurnContext;
 
 pub const NAME: &str = "read_run_context";
 
+/// Compatibility definition for internal callers. This tool is not model-registered.
 pub fn definition() -> ToolDefinition {
     ToolDefinition {
         name: api_tool_name(NAME),
-        description: "Read phase00 organized summaries. Use kind=phase_summaries to list the summary index (optionally filtered by ticker); use kind=phase_summary_details with topic_id to retrieve one summary's full body.".to_string(),
+        description: "Deprecated compatibility wrapper for phase summary reads.".to_string(),
         parameters: json!({
             "type": "object",
             "properties": {
-                "kind": {
-                    "type": "string",
-                    "enum": ["phase_summaries", "phase_summary_details"],
-                    "description": "phase_summaries = list index; phase_summary_details = one summary body (requires topic_id)."
-                },
-                "ticker": {
-                    "type": "string",
-                    "description": "Optional ticker filter for phase_summaries."
-                },
-                "topic_id": {
-                    "type": "string",
-                    "description": "Required for phase_summary_details: the summary id to expand."
-                }
+                "kind": {"type": "string", "enum": ["phase_summaries", "phase_summary_details"]},
+                "ticker": {"type": "string"},
+                "topic_id": {"type": "string"}
             },
             "required": ["kind"],
             "additionalProperties": false
@@ -39,108 +30,64 @@ pub fn execute(
     config: &ExternalToolConfig,
     turn_context: Option<&ToolRuntimeTurnContext>,
 ) -> Result<Value> {
-    let kind = args
-        .get("kind")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    if !matches!(kind.as_str(), "phase_summaries" | "phase_summary_details") {
-        bail!(
-            "read_run_context only supports kinds phase_summaries|phase_summary_details; got {:?}",
-            kind
-        );
-    }
-
-    let ticker = args
-        .get("ticker")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    let topic_id = args
-        .get("topic_id")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-
-    let phase = turn_context.and_then(|ctx| ctx.phase);
-    let run_id = turn_context.map(|ctx| ctx.run_id.clone());
-
-    let request = orchestrator_sql::RunContextReadRequest {
-        kind: kind.clone(),
-        ticker: ticker.clone(),
-        topic_id: topic_id.clone(),
-        run_id,
-        role: turn_context.map(|ctx| ctx.role.clone()),
-        phase,
-        tickers: config.tickers.clone(),
-        turn_id: turn_context.map(|ctx| ctx.turn_id.clone()),
-        persist_context: false,
-        token_budget: None,
-    };
-
-    maybe_wait_phase00_gate(config, &request);
-
-    if let Some(from_mem) = try_read_phase00_from_memory(config, &request) {
-        return Ok(from_mem);
-    }
-    let mut conn = tool_connection(config)?;
-    orchestrator_sql::read_run_context(&mut conn, &request)
-}
-
-fn maybe_wait_phase00_gate(
-    config: &ExternalToolConfig,
-    request: &orchestrator_sql::RunContextReadRequest,
-) {
-    let gate = config.phase00_gate.clone().or_else(|| {
-        config
-            .run_id
-            .as_deref()
-            .and_then(orchestrator_sql::phase00_gate)
-    });
-    let Some(gate) = gate else {
-        return;
-    };
-    let max_prior = request.phase.filter(|p| *p > 0).map(|p| p - 1);
-    let _ = gate.wait_until_ready(max_prior, std::time::Duration::from_secs(600));
-}
-
-fn try_read_phase00_from_memory(
-    config: &ExternalToolConfig,
-    request: &orchestrator_sql::RunContextReadRequest,
-) -> Option<Value> {
-    let owned;
-    let index: &orchestrator_sql::Phase00MemoryIndex = if let Some(gate) =
-        config.phase00_gate.as_ref().cloned().or_else(|| {
-            config
-                .run_id
-                .as_deref()
-                .and_then(orchestrator_sql::phase00_gate)
-        }) {
-        owned = gate.snapshot();
-        &owned
-    } else if let Some(idx) = config.phase00_index.as_ref() {
-        idx.as_ref()
-    } else {
-        return None;
-    };
-
-    match request.kind.as_str() {
-        "phase_summaries" => {
-            let max_source_phase = request.phase.filter(|p| *p > 0).map(|p| p - 1);
-            Some(index.list_summaries(
-                max_source_phase,
-                request.ticker.as_deref().filter(|t| !t.is_empty()),
-            ))
+    match args.get("kind").and_then(Value::as_str) {
+        Some("phase_summaries") => {
+            super::read_phase_summaries::execute(json!({"ticker": args.get("ticker")}), config, turn_context)
         }
-        "phase_summary_details" => {
-            let summary_id = request
-                .topic_id
-                .as_deref()
-                .filter(|s| !s.is_empty())
+        Some("phase_summary_details") => {
+            let summary_id = args
+                .get("topic_id")
+                .and_then(Value::as_str)
                 .unwrap_or_default();
-            if summary_id.is_empty() {
-                return None;
-            }
-            Some(index.list_details(summary_id))
+            super::read_phase_summary_details::execute(
+                json!({"summary_id": summary_id}),
+                config,
+                turn_context,
+            )
         }
-        _ => None,
+        other => bail!(
+            "read_run_context only supports kinds phase_summaries|phase_summary_details; got {:?}",
+            other
+        ),
     }
+}
+
+pub(super) fn visible_scope(
+    turn_context: Option<&ToolRuntimeTurnContext>,
+) -> Result<(&str, i64)> {
+    let context = turn_context.ok_or_else(|| anyhow::anyhow!("phase summary tool requires turn context"))?;
+    if context.run_id.trim().is_empty() {
+        bail!("phase summary tool requires a non-empty run_id from turn context");
+    }
+    let current_phase = context
+        .phase
+        .filter(|phase| *phase > 0)
+        .ok_or_else(|| anyhow::anyhow!("phase summary tool requires phase > 0 from turn context"))?;
+    Ok((context.run_id.as_str(), current_phase))
+}
+
+pub(super) fn wait_for_phase00(
+    config: &ExternalToolConfig,
+    run_id: &str,
+    max_source_phase: i64,
+) -> Result<Option<orchestrator_sql::Phase00MemoryIndex>> {
+    let configured_gate = config
+        .phase00_gate
+        .as_ref()
+        .filter(|gate| gate.run_id() == run_id)
+        .cloned();
+    let gate = configured_gate.or_else(|| orchestrator_sql::phase00_gate(run_id));
+    let Some(gate) = gate else {
+        return Ok(None);
+    };
+    gate.wait_until_ready_checked(
+        Some(max_source_phase),
+        std::time::Duration::from_secs(600),
+    )
+    .map_err(|error| anyhow::anyhow!("phase00 summaries unavailable: {error}"))?;
+    let snapshot = gate.snapshot();
+    if snapshot.run_id != run_id {
+        bail!("phase00 memory belongs to a different run");
+    }
+    Ok(Some(snapshot))
 }

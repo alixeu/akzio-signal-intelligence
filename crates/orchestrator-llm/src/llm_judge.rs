@@ -7,19 +7,8 @@ pub const DEFAULT_JUDGE_MODEL: &str = "gpt-4o-mini";
 
 /// Classification prompt for the LLM judge.
 /// Kept minimal to reduce token usage (~100 input tokens + ~5 output tokens).
-pub const JUDGE_PROMPT_TEMPLATE: &str = "\
-You are a classifier. Given an assistant message from an AI agent loop, classify it as one of:
-
-- final: The message contains a complete JSON artifact (with fields like id, role, status, per_ticker, direction, confidence). It is the deliverable the agent was asked to produce.
-- stall: The message is intermediate commentary, planning, asking for inputs, or saying it will do something next. It is NOT the final deliverable.
-
-Respond with exactly one word: final or stall.
-
-Assistant message:
-\"\"\"
-{message}
-\"\"\"
-";
+pub const JUDGE_PROMPT_TEMPLATE: &str =
+    include_str!("../../../prompts/system/judge.md");
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JudgeConfig {

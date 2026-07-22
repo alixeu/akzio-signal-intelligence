@@ -54,6 +54,21 @@ pub use args::*;
 
 type TopicDebateResult = (String, Vec<Value>, Value, Value);
 
+const PHASE2_TOPIC_FORK_USER_PROMPT: &str =
+    include_str!("../../../../prompts/messages/phase2/topic_fork_user.md");
+const PHASE2_WARMUP_INSTRUCTION: &str =
+    include_str!("../../../../prompts/messages/phase2/warmup.md");
+const PHASE2_TOPIC_FORK_REQUIREMENT: &str =
+    include_str!("../../../../prompts/messages/phase2/topic_fork_requirement.md");
+const PHASE2_SEED_PACKAGING_REQUIREMENT: &str =
+    include_str!("../../../../prompts/messages/phase2/seed_packaging.md");
+const PHASE2_CROSS_EXAMINATION_REQUIREMENT: &str =
+    include_str!("../../../../prompts/messages/phase2/cross_examination.md");
+const PHASE2_POINT_DEBATE_REQUIREMENT: &str =
+    include_str!("../../../../prompts/messages/phase2/point_debate.md");
+const PHASE3_PROBABILITY_RETRY_REQUIREMENT: &str =
+    include_str!("../../../../prompts/messages/phase2/phase3_probability_retry.md");
+
 struct PhaseTimer {
     phase: i64,
     label: &'static str,
@@ -175,7 +190,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
 
     // Phase-00 compress jobs run overlapping the next stage.
     // Tools that need the index wait via Phase00Gate; do not block phase start.
-    let mut compress_jobs: Vec<(i64, tokio::task::JoinHandle<Result<CompressJobResult>>)> =
+    let mut compress_jobs: Vec<(i64, std::thread::JoinHandle<Result<CompressJobResult>>)> =
         Vec::new();
     let phase00_gate = std::sync::Arc::new(orchestrator_sql::Phase00Gate::new(&run_id));
     orchestrator_sql::register_phase00_gate(&run_id, phase00_gate.clone());
@@ -195,12 +210,22 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         .await?;
         set_phase_status(&mut state, 1, "done");
         record_phase_elapsed(&mut state, phase_timer);
-        compress_jobs.push((1, spawn_compress_job(phase00_gate.clone(), &state, 1)));
+        compress_jobs.push((
+            1,
+            spawn_compress_job(
+                phase00_gate.clone(),
+                &state,
+                1,
+                model_override.as_deref(),
+                reasoning_effort_override.as_deref(),
+                &runtime_config,
+            ),
+        ));
         debug!("phase 1 completed; phase00 compress(1) scheduled (concurrent with next phase)");
     }
     if args.from_phase <= 2 && args.to_phase >= 2 {
         // Do NOT await compress here — run phase 2 concurrently with phase00(1).
-        // Tools needing phase_summaries wait on Phase00Gate inside read_run_context.
+        // Summary tools wait on Phase00Gate while Phase 00 persists phase 1.
         // Weighting is phase 2/3 work, not phase1 organize.
         materialize_weighted_probability_base(&mut state);
         let max_debate_rounds = args
@@ -232,7 +257,17 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         set_phase_status(&mut state, PHASE2_REDUCER, phase2_status);
         record_phase2_summary_debug_artifact(&mut state, phase2_status)?;
         record_phase_elapsed(&mut state, phase_timer);
-        compress_jobs.push((2, spawn_compress_job(phase00_gate.clone(), &state, 2)));
+        compress_jobs.push((
+            2,
+            spawn_compress_job(
+                phase00_gate.clone(),
+                &state,
+                2,
+                model_override.as_deref(),
+                reasoning_effort_override.as_deref(),
+                &runtime_config,
+            ),
+        ));
         debug!("phase 2 completed; phase00 compress(2) scheduled");
     }
     if let Err(error) = inject_phase0_reflection(&conn, &mut state, &runtime_config) {
@@ -269,7 +304,17 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         .await?;
         set_phase_status(&mut state, 3, "done");
         record_phase_elapsed(&mut state, phase_timer);
-        compress_jobs.push((3, spawn_compress_job(phase00_gate.clone(), &state, 3)));
+        compress_jobs.push((
+            3,
+            spawn_compress_job(
+                phase00_gate.clone(),
+                &state,
+                3,
+                model_override.as_deref(),
+                reasoning_effort_override.as_deref(),
+                &runtime_config,
+            ),
+        ));
         debug!("phase 3 completed; phase00 compress(3) scheduled");
     }
     let policy = if state.get("research_plan").is_some() {
@@ -299,7 +344,17 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         set_phase_status(&mut state, 4, phase4_status);
         await_all_compress_jobs(&mut compress_jobs, &mut state).await?;
         record_phase_elapsed(&mut state, phase_timer);
-        compress_jobs.push((4, spawn_compress_job(phase00_gate.clone(), &state, 4)));
+        compress_jobs.push((
+            4,
+            spawn_compress_job(
+                phase00_gate.clone(),
+                &state,
+                4,
+                model_override.as_deref(),
+                reasoning_effort_override.as_deref(),
+                &runtime_config,
+            ),
+        ));
         debug!("phase 4 (trader) completed; phase00 compress(4) scheduled");
     }
     if args.from_phase <= 5 && args.to_phase >= 5 {
@@ -323,7 +378,17 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         set_phase_status(&mut state, 5, phase5_status);
         await_all_compress_jobs(&mut compress_jobs, &mut state).await?;
         record_phase_elapsed(&mut state, phase_timer);
-        compress_jobs.push((5, spawn_compress_job(phase00_gate.clone(), &state, 5)));
+        compress_jobs.push((
+            5,
+            spawn_compress_job(
+                phase00_gate.clone(),
+                &state,
+                5,
+                model_override.as_deref(),
+                reasoning_effort_override.as_deref(),
+                &runtime_config,
+            ),
+        ));
         debug!("phase 5 (risk debate) completed; phase00 compress(5) scheduled");
     }
     if args.from_phase <= 6 && args.to_phase >= 6 {
@@ -347,7 +412,17 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         set_phase_status(&mut state, 6, phase6_status);
         await_all_compress_jobs(&mut compress_jobs, &mut state).await?;
         record_phase_elapsed(&mut state, phase_timer);
-        compress_jobs.push((6, spawn_compress_job(phase00_gate.clone(), &state, 6)));
+        compress_jobs.push((
+            6,
+            spawn_compress_job(
+                phase00_gate.clone(),
+                &state,
+                6,
+                model_override.as_deref(),
+                reasoning_effort_override.as_deref(),
+                &runtime_config,
+            ),
+        ));
         debug!("phase 6 (portfolio manager) completed; phase00 compress(6) scheduled");
     }
     if args.from_phase <= 7 && args.to_phase >= 7 {
@@ -365,7 +440,17 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         set_phase_status(&mut state, 7, "done");
         await_all_compress_jobs(&mut compress_jobs, &mut state).await?;
         record_phase_elapsed(&mut state, phase_timer);
-        compress_jobs.push((7, spawn_compress_job(phase00_gate.clone(), &state, 7)));
+        compress_jobs.push((
+            7,
+            spawn_compress_job(
+                phase00_gate.clone(),
+                &state,
+                7,
+                model_override.as_deref(),
+                reasoning_effort_override.as_deref(),
+                &runtime_config,
+            ),
+        ));
         debug!("phase 7 (allocation) completed; phase00 compress(7) scheduled");
     }
     if args.from_phase <= 8 && args.to_phase >= 8 {
@@ -393,7 +478,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
     // Drain any compress still running when the pipeline ends early (e.g. to_phase < 8).
     await_all_compress_jobs(&mut compress_jobs, &mut state).await?;
 
-    // Phase00 summaries stay in memory during the run; materialize to SQLite once at the end.
+    // Idempotent insurance: each phase is already persisted before its gate completes.
     let phase00_flushed =
         crate::orchestration::compress::flush_phase00_to_sqlite(&conn, &mut state)?;
     orchestrator_sql::unregister_phase00_gate(&run_id);
@@ -880,7 +965,7 @@ fn phase3_probability_retry_state(state: &Value, violations: &[Value]) -> Value 
             "base_long_probability": violation.get("base_long_probability").cloned().unwrap_or(Value::Null),
             "proposed_long_probability": violation.get("proposed_long_probability").cloned().unwrap_or(Value::Null),
             "delta": violation.get("delta").cloned().unwrap_or(Value::Null),
-            "requirement": "Use zero debate adjustment unless an explicitly converged decision hinge has evidence references; valid increments remain bounded by the Rust absolute limit."
+            "requirement": PHASE3_PROBABILITY_RETRY_REQUIREMENT.trim()
         });
     }
     retry_state
@@ -1244,30 +1329,52 @@ async fn run_phase2(
     max_topics: i64,
     config: &RuntimeConfig,
 ) -> Result<rusqlite::Connection> {
-    let _mock = is_mock(state);
     let db_path = state
         .get("db_path")
         .and_then(Value::as_str)
         .map(|s| s.to_string())
         .context("db_path missing from state")?;
 
-    // Rust selects material cross-analyst conflicts. The former topic-generator
-    // and empty "ready" warm-up LLM calls added no evidence and are removed.
+    // Prewarm both side-specific long sessions while Rust selects material conflicts.
+    // Each topic then forks from the corresponding persisted warmup turn.
     let model_override_owned = model_override.map(|s| s.to_string());
     let reasoning_effort_override_owned = reasoning_effort_override.map(|s| s.to_string());
-    let topics = run_phase2_topic_generation(&mut conn, state)?;
+    let topic_db_path = db_path.clone();
+    let mut topic_state = state.clone();
+    let warmup_state = state.clone();
+    let (topics_result, warmup_result) = tokio::join!(
+        async move {
+            // Let both warmup futures reach their first LLM await before the
+            // short synchronous Rust conflict-selection pass runs.
+            tokio::task::yield_now().await;
+            let mut topic_conn = orchestrator_sql::connect(&topic_db_path)
+                .with_context(|| format!("topic-gen connect {topic_db_path}"))?;
+            let topics = run_phase2_topic_generation(&mut topic_conn, &mut topic_state)?;
+            Ok::<_, anyhow::Error>((topics, topic_state))
+        },
+        run_phase2_side_warmups(
+            warmup_state,
+            model_override,
+            reasoning_effort_override,
+            config,
+        )
+    );
+    let (topics, topic_state) = topics_result?;
+    let (warmup, warmup_metrics) = warmup_result?;
+    for key in ["topic_generation_artifact", "debate_topics"] {
+        if let Some(value) = topic_state.get(key) {
+            state[key] = value.clone();
+        }
+    }
+    state["phase2_warmup"] = warmup;
+    merge_role_job_metrics(state, &warmup_metrics);
     let topics = topics
         .into_iter()
         .take(max_topics.max(1) as usize)
         .collect::<Vec<_>>();
-    state["phase2_warmup"] = json!({
-        "status": "removed",
-        "reason": "no_information_increment",
-        "llm_calls": 0
-    });
     debug!(
         topic_count = topics.len(),
-        "phase 2 deterministic conflict topics ready"
+        "phase 2 deterministic conflict topics and side warmups ready"
     );
     state["debate_turns"] = json!([]);
 
@@ -1399,13 +1506,153 @@ fn topic_fork_user_message(topic: &Value, common_ground: &Value) -> String {
         .unwrap_or(title);
     let hinge = topic.get("decision_hinge").cloned().unwrap_or(Value::Null);
     let cg = serde_json::to_string(common_ground).unwrap_or_else(|_| "{}".into());
-    format!(
-        "请对「{title}」主题说明你的看法。\n\
-         topic_id: {topic_id}\n\
-         decision_hinge: {hinge}\n\
-         common_ground: {cg}\n\
-         （本消息为冲突主题的首条 user 输入。请输出 seed packet JSON。）"
+    PHASE2_TOPIC_FORK_USER_PROMPT
+        .replace("{{title}}", title)
+        .replace("{{topic_id}}", topic_id)
+        .replace("{{decision_hinge}}", &hinge.to_string())
+        .replace("{{common_ground}}", &cg)
+        .trim()
+        .to_string()
+}
+
+async fn run_phase2_side_warmups(
+    state: Value,
+    model_override: Option<&str>,
+    reasoning_effort_override: Option<&str>,
+    config: &RuntimeConfig,
+) -> Result<(Value, Value)> {
+    let run_id = state
+        .get("run_id")
+        .and_then(Value::as_str)
+        .unwrap_or("run")
+        .to_string();
+    if is_mock(&state) {
+        return Ok((
+            json!({
+                "ready": true,
+                "mode": "mock",
+                "llm_calls": 0,
+                "bull": warmup_metadata(&run_id, "bull"),
+                "bear": warmup_metadata(&run_id, "bear")
+            }),
+            json!([]),
+        ));
+    }
+
+    let (bull_result, bear_result) = tokio::join!(
+        run_phase2_side_warmup(
+            state.clone(),
+            "bull",
+            model_override,
+            reasoning_effort_override,
+            config,
+        ),
+        run_phase2_side_warmup(
+            state,
+            "bear",
+            model_override,
+            reasoning_effort_override,
+            config,
+        )
+    );
+    let (bull, bull_metrics) = bull_result?;
+    let (bear, bear_metrics) = bear_result?;
+    let mut metrics = Vec::new();
+    if let Some(items) = bull_metrics.as_array() {
+        metrics.extend(items.iter().cloned());
+    }
+    if let Some(items) = bear_metrics.as_array() {
+        metrics.extend(items.iter().cloned());
+    }
+    Ok((
+        json!({
+            "ready": true,
+            "mode": "live",
+            "llm_calls": 2,
+            "bull": bull,
+            "bear": bear
+        }),
+        Value::Array(metrics),
+    ))
+}
+
+async fn run_phase2_side_warmup(
+    mut state: Value,
+    side: &str,
+    model_override: Option<&str>,
+    reasoning_effort_override: Option<&str>,
+    config: &RuntimeConfig,
+) -> Result<(Value, Value)> {
+    let run_id = state
+        .get("run_id")
+        .and_then(Value::as_str)
+        .unwrap_or("run")
+        .to_string();
+    let role = format!("researcher.{side}.initial");
+    let metadata = warmup_metadata(&run_id, side);
+    let session_id = metadata["session_id"].as_str().unwrap_or_default().to_string();
+    let turn_id = metadata["turn_id"].as_str().unwrap_or_default().to_string();
+    let db_path = state
+        .get("db_path")
+        .and_then(Value::as_str)
+        .context("db_path missing for phase 2 warmup")?;
+    let conn = orchestrator_sql::connect(db_path)?;
+    let prompt_path = config
+        .prompts
+        .path_for(&role)
+        .with_context(|| format!("missing warmup prompt for {role}"))?
+        .clone();
+    let artifact = run_single_steer_role_job(
+        SteerRoleRun {
+            state: state.clone(),
+            role: &role,
+            phase: 2,
+            kind: "warmup",
+            round: Some(0),
+            topic_id: None,
+            mock: false,
+            model_override,
+            reasoning_effort_override,
+            config,
+            prompt_path: Some(prompt_path.as_path()),
+            session_id,
+            turn_id,
+            steer: Some(steer_payload(
+                "warmup",
+                &json!({
+                    "allow_ready": true,
+                    "instruction": PHASE2_WARMUP_INSTRUCTION.trim()
+                }),
+            )),
+        },
+        config.workflow.agent_timeout_sec,
+        config,
+        &mut state,
+        &conn,
     )
+    .await?;
+    if artifact.get("status").and_then(Value::as_str) != Some("ready")
+        || artifact.get("response").and_then(Value::as_str) != Some("准备完毕")
+    {
+        bail!("{side} warmup did not return the required 准备完毕 handshake");
+    }
+    Ok((
+        metadata,
+        state
+            .get("role_job_metrics")
+            .cloned()
+            .unwrap_or_else(|| json!([])),
+    ))
+}
+
+fn warmup_metadata(run_id: &str, side: &str) -> Value {
+    let id = format!("{run_id}:phase2:warmup:{side}");
+    json!({
+        "session_id": id.clone(),
+        "turn_id": id,
+        "ack": "准备完毕",
+        "status": "ready"
+    })
 }
 
 async fn run_one_topic_debate(
@@ -1435,7 +1682,11 @@ async fn run_one_topic_debate(
     let initial_topic_state = json!({
         "topic": topic.clone(),
         "mode": "steer_room_fork",
-        "warmup_removed": true,
+        "warmup_ready": local_state
+            .get("phase2_warmup")
+            .and_then(|warmup| warmup.get("ready"))
+            .cloned()
+            .unwrap_or(json!(false)),
         "fork_user_message": fork_msg,
         "turns": [],
         "controller_artifacts": [],
@@ -1450,7 +1701,7 @@ async fn run_one_topic_debate(
             "user_message": topic_fork_user_message(&topic, &common_ground),
             "common_ground": common_ground,
             "topic": topic,
-            "requirement": "This is the deterministic conflict topic user message; emit seed packet JSON only."
+            "requirement": PHASE2_TOPIC_FORK_REQUIREMENT.trim()
         }),
     ));
 
@@ -1506,7 +1757,7 @@ async fn run_one_topic_debate(
         Some(steer_payload(
             "seed_claims",
             &json!({
-                "requirement": "Package both sides into claim-level next_steers so each side must address the opponent's claim_ids.",
+                "requirement": PHASE2_SEED_PACKAGING_REQUIREMENT.trim(),
                 "bull_seed": compact_debate_turn(&latest_bull),
                 "bear_seed": compact_debate_turn(&latest_bear)
             }),
@@ -1587,7 +1838,7 @@ async fn run_one_topic_debate(
             Some(steer_payload(
                 "debater_packets",
                 &json!({
-                    "requirement": "Force claim-level cross-examination: each next_steers entry must list opponent claim_ids that side must accept/rebut.",
+                    "requirement": PHASE2_CROSS_EXAMINATION_REQUIREMENT.trim(),
                     "bull_packet": compact_debate_turn(&latest_bull),
                     "bear_packet": compact_debate_turn(&latest_bear)
                 }),
@@ -1677,6 +1928,37 @@ fn steer_turn_id_for_role(topic_id: &str, role: &str) -> String {
     }
 }
 
+fn fork_source_turn_id(state: &Value, topic_id: &str, role: &str) -> Option<String> {
+    if role.contains("bull.initial") || role.contains("bear.initial") {
+        let side = if role.contains("bull") { "bull" } else { "bear" };
+        return state
+            .get("phase2_warmup")?
+            .get(side)?
+            .get("turn_id")?
+            .as_str()
+            .map(ToString::to_string);
+    }
+    if role.contains("bull.interaction") {
+        return Some(format!("turn-{topic_id}-bull-initial"));
+    }
+    if role.contains("bear.interaction") {
+        return Some(format!("turn-{topic_id}-bear-initial"));
+    }
+    None
+}
+
+fn attach_fork_source(steer: Option<String>, source_turn_id: Option<String>) -> Option<String> {
+    let steer = steer?;
+    let Some(source_turn_id) = source_turn_id else {
+        return Some(steer);
+    };
+    let Ok(mut value) = serde_json::from_str::<Value>(&steer) else {
+        return Some(steer);
+    };
+    value["fork_from_turn_id"] = Value::String(source_turn_id);
+    Some(value.to_string())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_topic_steer_step(
     conn: &mut rusqlite::Connection,
@@ -1692,6 +1974,7 @@ async fn run_topic_steer_step(
     config: &RuntimeConfig,
     prompt_path: PathBuf,
 ) -> Result<Value> {
+    let steer = attach_fork_source(steer, fork_source_turn_id(state, topic_id, role));
     let session_key = if role.contains("bull") {
         "bull"
     } else if role.contains("bear") {
@@ -1787,7 +2070,7 @@ fn build_point_debate_steer(
     json!({
         "kind": "point_debate",
         "side": side,
-        "requirement": "Address exactly one routed decision hinge. Set reply_to_claim_id to the opponent claim_id, preserve steer_id, and choose stance accept|rebut|downgrade|needs_evidence|no_new_info.",
+        "requirement": PHASE2_POINT_DEBATE_REQUIREMENT.trim(),
         "mediator_instruction": mediator_instruction,
         "opponent_packet": opponent_packet,
         "opponent_claims_to_address": opponent_claims,
@@ -2002,29 +2285,119 @@ async fn run_phase2_final_reducer(
     Ok(())
 }
 
-/// Result of a background phase-00 compress job (memory only; SQLite flush at run end).
+/// Result of a background phase-00 LLM compress job, already persisted to SQLite.
 struct CompressJobResult {
     source_phase: i64,
     written: usize,
     batch: orchestrator_sql::Phase00PhaseBatch,
     debug_enabled: bool,
+    role_metrics: Value,
 }
 
-/// Build phase00 batch in memory (safe for spawn_blocking; no DB write).
-fn compress_phase_job(state: Value, source_phase: i64) -> Result<CompressJobResult> {
-    let batch = crate::orchestration::compress::build_phase_compress(&state, source_phase)?;
-    let written = batch.written();
+async fn compress_phase_job(
+    mut state: Value,
+    source_phase: i64,
+    model_override: Option<String>,
+    reasoning_effort_override: Option<String>,
+    config: RuntimeConfig,
+) -> Result<CompressJobResult> {
     let debug_enabled = state.get("debug").and_then(Value::as_bool) == Some(true);
+    let batch = if is_mock(&state) {
+        crate::orchestration::compress::build_phase_compress(&state, source_phase)?
+    } else {
+        let source_payload =
+            crate::orchestration::compress::phase00_source_payload(&state, source_phase)?;
+        let prompt_path = config
+            .prompts
+            .path_for("compressor.phase00")
+            .context("missing compressor.phase00 prompt path")?
+            .clone();
+        let mut job = prepare_role_job(RoleRun {
+            state: state.clone(),
+            role: "compressor.phase00",
+            phase: 0,
+            kind: "phase_summary",
+            round: Some(source_phase),
+            topic_id: None,
+            mock: false,
+            model_override: model_override.as_deref(),
+            reasoning_effort_override: reasoning_effort_override.as_deref(),
+            config: &config,
+            prompt_path: Some(prompt_path.as_path()),
+        })?;
+        if let Some(llm) = job.llm.as_mut() {
+            llm.tools.clear();
+        }
+        job.prompt.push_str("\n\n");
+        job.prompt.push_str(
+            &include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../prompts/messages/compressors/source_payload.md"
+            ))
+            .replace(
+                "{{source_payload}}",
+                &serde_json::to_string(&source_payload)?,
+            ),
+        );
+        let conn = orchestrator_sql::connect(
+            state
+                .get("db_path")
+                .and_then(Value::as_str)
+                .context("db_path missing for phase00 compressor")?,
+        )?;
+        let result = run_role_jobs(vec![job], 1, config.workflow.agent_timeout_sec)
+            .await
+            .into_iter()
+            .next()
+            .context("phase00 compressor returned no role result")?;
+        persist_prompt_metric(&conn, &result);
+        record_role_job_metrics(&mut state, &result);
+        if let Some(error) = result.error.as_deref() {
+            bail!("phase00 compressor failed for phase {source_phase}: {error}");
+        }
+        let artifact = result
+            .artifact
+            .as_ref()
+            .context("phase00 compressor returned no artifact")?;
+        crate::orchestration::compress::phase00_bundle_to_batch(
+            &state,
+            source_phase,
+            artifact,
+        )?
+    };
+    let written = batch.written();
+    let conn = orchestrator_sql::connect(
+        state
+            .get("db_path")
+            .and_then(Value::as_str)
+            .context("db_path missing for phase00 persistence")?,
+    )?;
+    let run_id = state
+        .get("run_id")
+        .and_then(Value::as_str)
+        .context("run_id missing for phase00 persistence")?;
+    orchestrator_sql::persist_phase00_batch(&conn, run_id, &batch)?;
+    let role_metrics = state
+        .get("role_job_metrics")
+        .and_then(Value::as_array)
+        .and_then(|items| items.last())
+        .cloned()
+        .map(|item| json!([item]))
+        .unwrap_or_else(|| json!([]));
     Ok(CompressJobResult {
         source_phase,
         written,
         batch,
         debug_enabled,
+        role_metrics,
     })
 }
 
 fn apply_compress_result(state: &mut Value, result: CompressJobResult) -> Result<()> {
+    merge_role_job_metrics(state, &result.role_metrics);
     let snapshot = crate::orchestration::compress::apply_phase00_batch(state, result.batch)?;
+    state["phase_compress"][result.source_phase.to_string()]["persisted"] = json!(true);
+    state["phase00_tables"][result.source_phase.to_string()]["persisted"] = json!(true);
     if result.debug_enabled {
         let role = format!("compressor.after_phase_{}", result.source_phase);
         record_local_debug_artifact(state, 0, &role, &snapshot)?;
@@ -2043,33 +2416,51 @@ fn spawn_compress_job(
     gate: std::sync::Arc<orchestrator_sql::Phase00Gate>,
     state: &Value,
     source_phase: i64,
-) -> tokio::task::JoinHandle<Result<CompressJobResult>> {
+    model_override: Option<&str>,
+    reasoning_effort_override: Option<&str>,
+    config: &RuntimeConfig,
+) -> std::thread::JoinHandle<Result<CompressJobResult>> {
     gate.mark_inflight(source_phase);
     let state_snapshot = state.clone();
     let gate_job = gate.clone();
-    tokio::task::spawn_blocking(move || {
-        let result = compress_phase_job(state_snapshot, source_phase);
-        match &result {
-            Ok(ok) => gate_job.complete(source_phase, ok.batch.clone()),
-            Err(err) => gate_job.fail(source_phase, err.to_string()),
-        }
-        result
+    let model_override = model_override.map(ToString::to_string);
+    let reasoning_effort_override = reasoning_effort_override.map(ToString::to_string);
+    let config = config.clone();
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(async move {
+                let result = compress_phase_job(
+                    state_snapshot,
+                    source_phase,
+                    model_override,
+                    reasoning_effort_override,
+                    config,
+                )
+                .await;
+                match &result {
+                    Ok(ok) => gate_job.complete(source_phase, ok.batch.clone()),
+                    Err(err) => gate_job.fail(source_phase, err.to_string()),
+                }
+                result
+            })
     })
 }
 
 async fn await_compress_job(
-    handle: tokio::task::JoinHandle<Result<CompressJobResult>>,
+    handle: std::thread::JoinHandle<Result<CompressJobResult>>,
     state: &mut Value,
 ) -> Result<()> {
     let result = handle
-        .await
-        .context("compress task join failed")?
+        .join()
+        .map_err(|_| anyhow::anyhow!("compress task panicked"))?
         .context("compress task failed")?;
     apply_compress_result(state, result)
 }
 
 async fn await_all_compress_jobs(
-    jobs: &mut Vec<(i64, tokio::task::JoinHandle<Result<CompressJobResult>>)>,
+    jobs: &mut Vec<(i64, std::thread::JoinHandle<Result<CompressJobResult>>)>,
     state: &mut Value,
 ) -> Result<()> {
     while let Some((_phase, handle)) = jobs.pop() {
@@ -2681,54 +3072,57 @@ async fn run_phase5(
     config: &RuntimeConfig,
 ) -> Result<()> {
     state["risk_debate_state"] = json!({"history": []});
-    // One integrated review evaluates survival/base/upside scenarios in one
-    // contract while Rust policy decides whether this phase runs at all.
-    let risk_role = "risk.conservative";
-    let round = 1;
-    let result = run_role_jobs(
-        vec![prepare_role_job(RoleRun {
-            state: state.clone(),
-            role: risk_role,
-            phase: 5,
-            kind: "risk_argument",
-            round: Some(round),
-            topic_id: None,
-            mock: is_mock(state),
-            model_override,
-            reasoning_effort_override,
-            config,
-            prompt_path: Some(config.prompts.risk_conservative.as_path()),
-        })?],
-        1,
-        config.workflow.agent_timeout_sec,
-    )
-    .await
-    .into_iter()
-    .next()
-    .context("integrated risk review returned no result")?;
-    persist_prompt_metric(conn, &result);
-    record_role_job_metrics(state, &result);
-    let mut artifact = role_artifact_or_degraded(state, config, result)?;
-    sanitize_downstream_constraints(state, risk_role, &mut artifact);
-    let turn = json!({
-        "role": risk_role,
-        "phase": 5,
-        "kind": "risk_argument",
-        "round": round,
-        "artifact": artifact
-    });
-    if let Some(history) = state["risk_debate_state"]["history"].as_array_mut() {
-        history.push(turn.clone());
+    // Sequential perspectives make each reviewer answer the prior argument.
+    for (index, risk_role) in ["risk.aggressive", "risk.neutral", "risk.conservative"]
+        .into_iter()
+        .enumerate()
+    {
+        let round = (index + 1) as i64;
+        let result = run_role_jobs(
+            vec![prepare_role_job(RoleRun {
+                state: state.clone(),
+                role: risk_role,
+                phase: 5,
+                kind: "risk_argument",
+                round: Some(round),
+                topic_id: None,
+                mock: is_mock(state),
+                model_override,
+                reasoning_effort_override,
+                config,
+                prompt_path: Some(config.prompts.risk_conservative.as_path()),
+            })?],
+            1,
+            config.workflow.agent_timeout_sec,
+        )
+        .await
+        .into_iter()
+        .next()
+        .context("risk committee member returned no result")?;
+        persist_prompt_metric(conn, &result);
+        record_role_job_metrics(state, &result);
+        let mut artifact = role_artifact_or_degraded(state, config, result)?;
+        sanitize_downstream_constraints(state, risk_role, &mut artifact);
+        let turn = json!({
+            "role": risk_role,
+            "phase": 5,
+            "kind": "risk_argument",
+            "round": round,
+            "artifact": artifact
+        });
+        if let Some(history) = state["risk_debate_state"]["history"].as_array_mut() {
+            history.push(turn.clone());
+        }
+        persist_message(
+            conn,
+            state,
+            5,
+            risk_role,
+            "risk_argument",
+            Some(round),
+            turn,
+        )?;
     }
-    persist_message(
-        conn,
-        state,
-        5,
-        risk_role,
-        "risk_argument",
-        Some(round),
-        turn,
-    )?;
     Ok(())
 }
 
@@ -3087,12 +3481,11 @@ mod tests {
         assert_eq!(settings.max_turns, Some(12));
         assert_eq!(settings.reasoning_effort.as_deref(), Some("medium"));
         assert!(settings.native_web_search);
-        assert!(settings.tools.contains(&"read_run_context".to_string()));
+        assert!(!settings.tools.contains(&"read_run_context".to_string()));
         assert!(settings
             .tools
             .contains(&"read_technical_context".to_string()));
         for role in [
-            "manager.research",
             "trader",
             "risk.conservative",
             "portfolio.manager",
@@ -3113,7 +3506,7 @@ mod tests {
                 "model": "role-model",
                 "max_turns": 4,
                 "reasoning_effort": "low",
-                "tools": ["read_run_context"]
+                "tools": ["read_phase_summaries", "read_phase_summary_details"]
             }),
         );
         let config = json!({
@@ -3140,7 +3533,13 @@ mod tests {
         assert_eq!(settings.model, "role-model");
         assert_eq!(settings.max_turns, Some(4));
         assert_eq!(settings.reasoning_effort.as_deref(), Some("low"));
-        assert_eq!(settings.tools, vec!["read_run_context".to_string()]);
+        assert_eq!(
+            settings.tools,
+            vec![
+                "read_phase_summaries".to_string(),
+                "read_phase_summary_details".to_string()
+            ]
+        );
     }
 
     #[test]

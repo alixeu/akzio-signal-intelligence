@@ -78,10 +78,6 @@ pub const VALID_PLACEHOLDERS: &[&str] = &[
     "phase3_context",
     "risk_context",
     "portfolio_context",
-    "phase1_index",
-    "phase00_context",
-    "prior_phase_summaries",
-    "common_ground",
     "workflow_pattern",
     "researcher_body",
     "risk_analyst_body",
@@ -123,7 +119,9 @@ pub fn run_all_checks(prompts_dir: &Path) -> Result<LintReport> {
     for (path, content) in &prompt_files {
         files_checked += 1;
         let role = infer_role_from_path(path, prompts_dir);
-        checks::check_placeholder_completeness(path, content, &component_registry, &mut issues);
+        if !is_runtime_prompt(path, prompts_dir) {
+            checks::check_placeholder_completeness(path, content, &component_registry, &mut issues);
+        }
         checks::check_schema_references(path, content, &mut issues);
         checks::check_common_components(
             path,
@@ -266,8 +264,17 @@ fn infer_role_from_path(path: &Path, prompts_dir: &Path) -> String {
             "topic_controller" => "mediator.topic_controller".to_string(),
             other => format!("mediator.{other}"),
         },
+        "compressors" => format!("compressor.{stem}"),
         "risk" => format!("risk.{stem}"),
         "traders" => "trader".to_string(),
         _ => String::new(),
     }
+}
+
+fn is_runtime_prompt(path: &Path, prompts_dir: &Path) -> bool {
+    path.strip_prefix(prompts_dir)
+        .ok()
+        .and_then(|relative| relative.components().next())
+        .and_then(|component| component.as_os_str().to_str())
+        == Some("runtime")
 }

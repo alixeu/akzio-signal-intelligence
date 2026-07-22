@@ -19,5 +19,5 @@ reference. Active role prompts live under:
 | File | Role |
 |------|------|
 | Rust conflict detector | deterministic topic generation and debate gate |
-| `researchers/debate.md` | researcher.{bull,bear}.{initial,interaction} 长会话 |
+| `researchers/bull.md` / `researchers/bear.md` | side-specific warmup, seed, interaction long sessions |
 | `mediators/topic_controller.md` | mediator.topic_controller |

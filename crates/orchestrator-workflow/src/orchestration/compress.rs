@@ -1,6 +1,6 @@
-//! Post-phase compressor: build summary → detail index in memory; SQLite flush at run end.
+//! Post-phase summary/detail conversion and deterministic mock compression.
 
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 use orchestrator_sql::{
     Phase00MemoryIndex, Phase00PhaseBatch, PhaseSummaryDetailInput, PhaseSummaryInput,
     AGGREGATE_TICKER,
@@ -10,6 +10,160 @@ use serde_json::{json, Value};
 use tracing::debug;
 
 use super::lifecycle::tickers_from_state;
+
+/// Build the only business payload visible to the live Phase-00 compressor.
+pub(crate) fn phase00_source_payload(state: &Value, source_phase: i64) -> Result<Value> {
+    let keys: &[&str] = match source_phase {
+        1 => &[
+            "phase1_index",
+            "phase1_brief_md",
+            "analyst_results",
+            "analyst_conflicts",
+            "weighted_probability_base",
+        ],
+        2 => &[
+            "topic_generation_artifact",
+            "debate_state_artifact",
+            "debate_brief_md",
+            "debate_turns",
+        ],
+        3 => &["research_plan"],
+        4 => &["trader_investment_plan"],
+        5 => &["risk_debate_state"],
+        6 => &["final_trade_decision"],
+        7 => &["allocation_result", "portfolio_allocation", "allocation"],
+        _ => bail!("unsupported phase00 source phase {source_phase}"),
+    };
+    let artifacts = keys.iter().fold(serde_json::Map::new(), |mut out, key| {
+        if let Some(value) = state.get(*key).filter(|value| !value.is_null()) {
+            out.insert((*key).to_string(), value.clone());
+        }
+        out
+    });
+    if artifacts.is_empty() {
+        bail!("phase00 source phase {source_phase} has no completed artifacts");
+    }
+    Ok(json!({
+        "source_phase": source_phase,
+        "current_date": state.get("current_date").cloned().unwrap_or(Value::Null),
+        "tickers": tickers_from_state(state),
+        "artifacts": artifacts
+    }))
+}
+
+/// Validate a live LLM bundle and convert it to the existing Rust-owned index rows.
+pub(crate) fn phase00_bundle_to_batch(
+    state: &Value,
+    source_phase: i64,
+    artifact: &Value,
+) -> Result<Phase00PhaseBatch> {
+    if artifact.get("artifact_type").and_then(Value::as_str)
+        != Some("phase00_summary_bundle")
+    {
+        bail!("phase00 artifact_type must be phase00_summary_bundle");
+    }
+    if artifact.get("source_phase").and_then(Value::as_i64) != Some(source_phase) {
+        bail!("phase00 source_phase does not match requested phase {source_phase}");
+    }
+    let checks = artifact
+        .get("checks")
+        .and_then(Value::as_object)
+        .context("phase00 checks must be an object")?;
+    for check in [
+        "source_only",
+        "no_external_facts",
+        "no_business_decision_change",
+    ] {
+        if checks.get(check).and_then(Value::as_bool) != Some(true) {
+            bail!("phase00 check {check} must be true");
+        }
+    }
+    let run_id = state
+        .get("run_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .context("run_id missing for phase00 conversion")?;
+    let summaries = artifact
+        .get("summaries")
+        .and_then(Value::as_array)
+        .filter(|items| !items.is_empty())
+        .context("phase00 summaries must be a non-empty array")?;
+    let mut batch = Phase00PhaseBatch {
+        source_phase,
+        ..Default::default()
+    };
+    for (summary_order, summary) in summaries.iter().enumerate() {
+        let role = required_string(summary, "role")?;
+        let ticker = required_string(summary, "ticker")?;
+        let text = required_string(summary, "summary")?;
+        let summary_json = summary
+            .get("summary_json")
+            .filter(|value| value.is_object())
+            .cloned()
+            .context("phase00 summary_json must be an object")?;
+        let confidence = summary
+            .get("confidence")
+            .and_then(Value::as_f64)
+            .filter(|value| (0.0..=1.0).contains(value))
+            .context("phase00 confidence must be between 0 and 1")?;
+        let topic_id = match summary.get("topic_id") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(
+                value
+                    .as_str()
+                    .filter(|text| !text.trim().is_empty())
+                    .context("phase00 topic_id must be null or a non-empty string")?
+                    .to_string(),
+            ),
+        };
+        let details = summary
+            .get("details")
+            .and_then(Value::as_array)
+            .filter(|items| !items.is_empty())
+            .context("each phase00 summary must have non-empty details")?;
+        let summary_id = batch.push_summary(&PhaseSummaryInput {
+            run_id: run_id.to_string(),
+            source_phase,
+            role: role.to_string(),
+            ticker: ticker.to_string(),
+            topic_id,
+            summary: text.to_string(),
+            summary_json,
+            confidence,
+        });
+        for (detail_order, detail) in details.iter().enumerate() {
+            let detail_text = required_string(detail, "detail")?;
+            let detail_json = detail
+                .get("detail_json")
+                .filter(|value| value.is_object())
+                .cloned()
+                .context("phase00 detail_json must be an object")?;
+            let source_ref = required_string(detail, "source_ref")?;
+            let sort_order = detail
+                .get("sort_order")
+                .and_then(Value::as_i64)
+                .unwrap_or((summary_order * 100 + detail_order) as i64);
+            batch.push_detail(&PhaseSummaryDetailInput {
+                summary_id: summary_id.clone(),
+                run_id: run_id.to_string(),
+                source_phase,
+                detail: detail_text.to_string(),
+                detail_json,
+                source_ref: source_ref.to_string(),
+                sort_order,
+            });
+        }
+    }
+    Ok(batch)
+}
+
+fn required_string<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|text| !text.trim().is_empty())
+        .with_context(|| format!("phase00 {field} must be a non-empty string"))
+}
 
 /// Build a deterministic phase00 batch from in-memory phase artifacts (no DB I/O).
 pub(crate) fn build_phase_compress(state: &Value, source_phase: i64) -> Result<Phase00PhaseBatch> {
@@ -652,5 +806,39 @@ mod tests {
             .unwrap();
         assert!(count >= 1);
         assert_eq!(state["phase_compress"]["1"]["persisted"], true);
+    }
+
+    #[test]
+    fn converts_valid_llm_bundle_to_rust_owned_batch() {
+        let state = json!({"run_id": "run-live"});
+        let artifact = json!({
+            "artifact_type": "phase00_summary_bundle",
+            "source_phase": 1,
+            "summaries": [{
+                "role": "analyst.aggregate",
+                "ticker": "QQQ",
+                "topic_id": null,
+                "summary": "Evidence is mixed.",
+                "summary_json": {"key_hinges": ["trend"]},
+                "confidence": 0.6,
+                "details": [{
+                    "detail": "Trend evidence remains contested.",
+                    "detail_json": {"status": "contested"},
+                    "source_ref": "phase1_index.per_ticker.QQQ",
+                    "sort_order": 0
+                }]
+            }],
+            "checks": {
+                "source_only": true,
+                "no_external_facts": true,
+                "no_business_decision_change": true
+            }
+        });
+        let batch = phase00_bundle_to_batch(&state, 1, &artifact).unwrap();
+        assert_eq!(batch.source_phase, 1);
+        assert_eq!(batch.summaries.len(), 1);
+        assert_eq!(batch.details.len(), 1);
+        assert_eq!(batch.details[0].summary_id, batch.summaries[0].id);
+        assert_eq!(batch.summaries[0].run_id, "run-live");
     }
 }

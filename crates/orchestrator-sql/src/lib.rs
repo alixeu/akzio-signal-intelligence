@@ -29,10 +29,10 @@ pub use phase00_gate::{phase00_gate, register_phase00_gate, unregister_phase00_g
 pub use phase_index::{
     clear_phase_compress, compressor_debug_snapshot, expand_attention_subjects, list_attention,
     list_phase_details_for_phase, list_phase_summaries, list_phase_summaries_for_phase,
-    list_phase_summary_details, phase_detail_id, phase_summary_id, record_attention,
-    record_attention_batch, upsert_phase_summary, upsert_phase_summary_detail, AttentionEvent,
-    Phase00MemoryIndex, Phase00PhaseBatch, PhaseSummaryDetailInput, PhaseSummaryDetailRow,
-    PhaseSummaryInput, PhaseSummaryRow,
+    list_phase_summary_details, persist_phase00_batch, phase_detail_id, phase_summary_id,
+    record_attention, record_attention_batch, upsert_phase_summary, upsert_phase_summary_detail,
+    AttentionEvent, Phase00MemoryIndex, Phase00PhaseBatch, PhaseSummaryDetailInput,
+    PhaseSummaryDetailRow, PhaseSummaryInput, PhaseSummaryRow,
 };
 pub use schema::{connect, ensure_schema, AGGREGATE_TICKER};
 pub use technical_store::{

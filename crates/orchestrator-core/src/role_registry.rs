@@ -139,7 +139,7 @@ impl AgentRegistry {
             phase: 1,
             prompt_path: "prompts/analysts/technical.md".into(),
             preflight_tool: Some("read_technical_context".into()),
-            default_tools: vec!["read_run_context".into()],
+            default_tools: vec![],
             default_weight: 50.0,
             is_critical: true,
         });
