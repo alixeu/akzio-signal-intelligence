@@ -3,6 +3,7 @@
 //! Runtime authority for phase00 rows is the in-memory [`Phase00MemoryIndex`].
 //! SQLite is filled by [`Phase00MemoryIndex::flush`] at run end (or tests).
 
+use crate::schema::{canonical_json, ensure_run_exists, now_ms, payload_hash};
 use anyhow::Result;
 use md5::{Digest, Md5};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -289,12 +290,13 @@ impl Phase00MemoryIndex {
 
     /// Persist all phases to SQLite (idempotent clear + upsert per phase).
     pub fn flush(&self, conn: &Connection) -> Result<usize> {
+        let tx = conn.unchecked_transaction()?;
         let mut total = 0usize;
         for batch in self.phases.values() {
-            clear_phase_compress(conn, &self.run_id, batch.source_phase)?;
+            clear_phase_compress(&tx, &self.run_id, batch.source_phase)?;
             for row in &batch.summaries {
                 upsert_phase_summary(
-                    conn,
+                    &tx,
                     &PhaseSummaryInput {
                         run_id: row.run_id.clone(),
                         source_phase: row.source_phase,
@@ -310,7 +312,7 @@ impl Phase00MemoryIndex {
             }
             for row in &batch.details {
                 upsert_phase_summary_detail(
-                    conn,
+                    &tx,
                     &PhaseSummaryDetailInput {
                         summary_id: row.summary_id.clone(),
                         run_id: row.run_id.clone(),
@@ -324,6 +326,7 @@ impl Phase00MemoryIndex {
                 total += 1;
             }
         }
+        tx.commit()?;
         Ok(total)
     }
 }
@@ -367,16 +370,27 @@ pub fn upsert_phase_summary(conn: &Connection, input: &PhaseSummaryInput) -> Res
         &input.ticker,
         &input.summary,
     );
-    let created_at = chrono::Utc::now().timestamp();
-    let summary_json = serde_json::to_string(&input.summary_json)?;
+    ensure_run_exists(
+        conn,
+        &input.run_id,
+        &chrono::Utc::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string(),
+    )?;
+    let created_at_ms = now_ms();
+    let summary_json = canonical_json(&input.summary_json)?;
+    let hash = payload_hash(&input.summary_json)?;
     conn.execute(
         r#"
         INSERT INTO phase_summaries
-            (id, run_id, source_phase, role, ticker, topic_id, summary, summary_json, confidence, created_at)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            (id,run_id,source_phase,role,ticker,topic_id,summary,summary_json,
+             payload_schema_version,payload_hash,confidence,created_at_ms)
+        VALUES (?1,?2,?3,?4,?5,?6,?7,?8,1,?9,?10,?11)
         ON CONFLICT(id) DO UPDATE SET
             summary = excluded.summary,
             summary_json = excluded.summary_json,
+            payload_hash = excluded.payload_hash,
             confidence = excluded.confidence,
             topic_id = excluded.topic_id
         "#,
@@ -387,10 +401,11 @@ pub fn upsert_phase_summary(conn: &Connection, input: &PhaseSummaryInput) -> Res
             input.role,
             input.ticker,
             input.topic_id,
-            input.summary,
+            input.summary.chars().take(2048).collect::<String>(),
             summary_json,
+            hash,
             input.confidence.clamp(0.0, 1.0),
-            created_at,
+            created_at_ms,
         ],
     )?;
     Ok(id)
@@ -401,16 +416,27 @@ pub fn upsert_phase_summary_detail(
     input: &PhaseSummaryDetailInput,
 ) -> Result<String> {
     let id = phase_detail_id(&input.summary_id, input.sort_order, &input.detail);
-    let created_at = chrono::Utc::now().timestamp();
-    let detail_json = serde_json::to_string(&input.detail_json)?;
+    ensure_run_exists(
+        conn,
+        &input.run_id,
+        &chrono::Utc::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string(),
+    )?;
+    let created_at_ms = now_ms();
+    let detail_json = canonical_json(&input.detail_json)?;
+    let hash = payload_hash(&input.detail_json)?;
     conn.execute(
         r#"
         INSERT INTO phase_summary_details
-            (id, summary_id, run_id, source_phase, detail, detail_json, source_ref, sort_order, created_at)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            (id,summary_id,run_id,source_phase,detail,detail_json,payload_schema_version,
+             payload_hash,source_ref,sort_order,created_at_ms)
+        VALUES (?1,?2,?3,?4,?5,?6,1,?7,?8,?9,?10)
         ON CONFLICT(id) DO UPDATE SET
             detail = excluded.detail,
             detail_json = excluded.detail_json,
+            payload_hash = excluded.payload_hash,
             source_ref = excluded.source_ref,
             sort_order = excluded.sort_order
         "#,
@@ -419,11 +445,12 @@ pub fn upsert_phase_summary_detail(
             input.summary_id,
             input.run_id,
             input.source_phase,
-            input.detail,
+            input.detail.chars().take(2048).collect::<String>(),
             detail_json,
+            hash,
             input.source_ref,
             input.sort_order,
-            created_at,
+            created_at_ms,
         ],
     )?;
     Ok(id)
@@ -443,14 +470,28 @@ pub fn clear_phase_compress(conn: &Connection, run_id: &str, source_phase: i64) 
 }
 
 pub fn record_attention(conn: &Connection, event: &AttentionEvent) -> Result<String> {
+    let tx = conn.unchecked_transaction()?;
+    let id = record_attention_inner(&tx, event)?;
+    tx.commit()?;
+    Ok(id)
+}
+
+fn record_attention_inner(conn: &Connection, event: &AttentionEvent) -> Result<String> {
+    ensure_run_exists(
+        conn,
+        &event.run_id,
+        &chrono::Utc::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string(),
+    )?;
     let id = Uuid::new_v4().to_string();
-    let created_at = chrono::Utc::now().timestamp();
     let score = event.score.clamp(0.0, 1.0);
     conn.execute(
         r#"
         INSERT INTO attention_ledger
-            (id, run_id, turn_id, role, subject_kind, subject_id, score, phase, created_at)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            (id,run_id,turn_id,role,subject_kind,subject_id,score,phase,created_at_ms)
+        VALUES (?1,?2,NULLIF(?3,''),?4,?5,?6,?7,?8,?9)
         "#,
         params![
             id,
@@ -461,28 +502,36 @@ pub fn record_attention(conn: &Connection, event: &AttentionEvent) -> Result<Str
             event.subject_id,
             score,
             event.phase,
-            created_at,
+            now_ms(),
         ],
     )?;
     // Cache latest score on jin10_items for convenience ordering.
     if event.subject_kind == "jin10" {
-        let _ = conn.execute(
-            "UPDATE jin10_items SET attention_score = ?1 WHERE id = ?2",
+        let updated = conn.execute(
+            "UPDATE jin10_items SET latest_attention_score=?1, legacy_attention=0 WHERE id=?2",
             params![score, event.subject_id],
-        );
+        )?;
+        if updated != 1 {
+            anyhow::bail!(
+                "cannot record attention for missing Jin10 item {}",
+                event.subject_id
+            );
+        }
     }
     Ok(id)
 }
 
 pub fn record_attention_batch(conn: &Connection, events: &[AttentionEvent]) -> Result<usize> {
+    let tx = conn.unchecked_transaction()?;
     let mut n = 0usize;
     for event in events {
         if event.subject_id.trim().is_empty() {
             continue;
         }
-        record_attention(conn, event)?;
+        record_attention_inner(&tx, event)?;
         n += 1;
     }
+    tx.commit()?;
     Ok(n)
 }
 

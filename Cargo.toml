@@ -24,7 +24,7 @@ html-escape = "0.2.13"
 regex = "1.11.1"
 reqwest = { version = "0.13.4", default-features = false, features = ["cookies", "json", "query", "rustls"] }
 async-openai = { version = "0.41.1", features = ["responses", "chat-completion"] }
-rusqlite = { version = "0.32.1", features = ["bundled", "chrono"] }
+rusqlite = { version = "0.32.1", features = ["bundled", "chrono", "backup"] }
 schemars = "1.0.4"
 serde = { version = "1.0.217", features = ["derive"] }
 serde_json = "1.0.135"

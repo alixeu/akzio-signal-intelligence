@@ -1,3 +1,4 @@
+use crate::schema::{ensure_run_exists, now_ms};
 use anyhow::Result;
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
@@ -29,18 +30,29 @@ pub struct ExpiredPrediction {
 }
 
 pub fn upsert_prediction(conn: &Connection, input: &PredictionInput) -> Result<i64> {
-    let now = chrono::Utc::now().timestamp();
+    if input.window_days <= 0 {
+        anyhow::bail!("prediction window_days must be positive");
+    }
+    let prediction_date = chrono::NaiveDate::parse_from_str(&input.prediction_date, "%Y-%m-%d")?;
+    let outcome_due_date = prediction_date
+        .checked_add_signed(chrono::Duration::days(input.window_days))
+        .ok_or_else(|| anyhow::anyhow!("prediction outcome due date overflow"))?
+        .format("%Y-%m-%d")
+        .to_string();
+    ensure_run_exists(conn, &input.run_id, &input.prediction_date)?;
     conn.execute(
         r#"
         INSERT INTO predictions
             (run_id, ticker, prediction_date, long_probability, short_probability, rating,
-             window_days, market_regime_json, agent_probabilities_json, weighted_base_probability, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             outcome_due_date, window_days, market_regime_json, agent_probabilities_json,
+             weighted_base_probability, created_at_ms)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(run_id, ticker) DO UPDATE SET
             prediction_date = excluded.prediction_date,
             long_probability = excluded.long_probability,
             short_probability = excluded.short_probability,
             rating = excluded.rating,
+            outcome_due_date = excluded.outcome_due_date,
             window_days = excluded.window_days,
             market_regime_json = excluded.market_regime_json,
             agent_probabilities_json = excluded.agent_probabilities_json,
@@ -53,11 +65,12 @@ pub fn upsert_prediction(conn: &Connection, input: &PredictionInput) -> Result<i
             input.long_probability,
             input.short_probability,
             input.rating,
+            outcome_due_date,
             input.window_days,
             serde_json::to_string(&input.market_regime_json)?,
             serde_json::to_string(&input.agent_probabilities_json)?,
             input.weighted_base_probability,
-            now,
+            now_ms(),
         ],
     )?;
     let pid = prediction_id(conn, &input.run_id, &input.ticker)?;
@@ -111,8 +124,8 @@ pub fn expired_unscored_predictions(
         FROM predictions p
         LEFT JOIN outcomes o ON o.prediction_id = p.id
         WHERE o.id IS NULL
-          AND date(p.prediction_date, '+' || p.window_days || ' days') <= date(?)
-        ORDER BY p.prediction_date ASC, p.id ASC
+          AND p.outcome_due_date <= ?
+        ORDER BY p.outcome_due_date ASC, p.id ASC
         LIMIT ?
         "#,
     )?;

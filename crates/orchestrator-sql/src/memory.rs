@@ -5,6 +5,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::schema::{now_ms, payload_hash};
 use crate::{candidate::CandidateExperience, AGGREGATE_TICKER};
 
 #[derive(Debug, Clone)]
@@ -38,8 +39,8 @@ pub fn log_memory_history(conn: &Connection, entry: &MemoryHistoryEntry<'_>) -> 
         r#"
         INSERT INTO memory_history
             (memory_id, action, version_id, old_status, new_status,
-             quality_score, reason, source_run_id, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             quality_score, reason, source_run_id, created_at_ms)
+        VALUES (?, ?, NULLIF(?,''), NULLIF(?,''), NULLIF(?,''), ?, NULLIF(?,''), NULLIF(?,''), ?)
         "#,
         params![
             entry.memory_id,
@@ -50,7 +51,7 @@ pub fn log_memory_history(conn: &Connection, entry: &MemoryHistoryEntry<'_>) -> 
             entry.quality_score,
             entry.reason,
             entry.source_run_id,
-            chrono::Utc::now().timestamp()
+            now_ms()
         ],
     )?;
     Ok(())
@@ -62,11 +63,14 @@ pub fn promote_candidate_to_memory(
 ) -> Result<String> {
     let memory_id = format!("mem-{}", Uuid::new_v4());
     let version_id = format!("memv-{}", Uuid::new_v4());
-    let now = chrono::Utc::now().timestamp();
-    let summary = format!(
+    let now = now_ms();
+    let summary: String = format!(
         "Finding: {}\nRecommendation: {}",
         input.candidate.finding, input.candidate.recommendation
-    );
+    )
+    .chars()
+    .take(2048)
+    .collect();
     let body = json!({
         "candidate_id": input.candidate.id,
         "finding": input.candidate.finding,
@@ -77,20 +81,20 @@ pub fn promote_candidate_to_memory(
     });
     let body_text = serde_json::to_string(&body)?;
     let content_hash = sha256_hex(&body_text);
-    conn.execute(
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
         r#"
         INSERT INTO memory_items
             (memory_id, ticker, scope, memory_type, status, current_version_id, confidence,
-             expires_at, created_at, updated_at, market_regime_json,
+             expires_at_ms, created_at_ms, updated_at_ms, market_regime_json,
              quality_score, sample_count, recent_success_rate, reflection_version, promoted_from)
-        VALUES (?, ?, ?, ?, 'active', ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, 'active', NULL, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
         params![
             memory_id,
             scope_value_as_ticker(&input.candidate),
             input.candidate.scope,
             input.candidate.experience_type,
-            version_id,
             input.candidate.confidence,
             now,
             now,
@@ -102,13 +106,13 @@ pub fn promote_candidate_to_memory(
             input.candidate.id,
         ],
     )?;
-    conn.execute(
+    tx.execute(
         r#"
         INSERT INTO memory_versions
             (version_id, memory_id, version_index, summary, body_json, evidence_refs_json,
              source_run_id, source_role,
-             source_date, observed_at, content_hash, created_at)
-        VALUES (?, ?, 1, ?, ?, ?, '', 'reflection', ?, ?, ?, ?)
+             payload_schema_version,payload_hash,source_date,observed_at_ms,content_hash,created_at_ms)
+        VALUES (?, ?, 1, ?, ?, ?, NULL, 'reflection', 1, ?, ?, ?, ?, ?)
         "#,
         params![
             version_id,
@@ -116,25 +120,38 @@ pub fn promote_candidate_to_memory(
             summary,
             body_text,
             serde_json::to_string(&input.candidate.evidence_json)?,
+            payload_hash(&body)?,
             input.candidate.source_window,
             now,
             content_hash,
             now,
         ],
     )?;
+    tx.execute(
+        "UPDATE memory_items SET current_version_id=?1 WHERE memory_id=?2",
+        params![version_id, memory_id],
+    )?;
     log_memory_history(
-        conn,
+        &tx,
         &MemoryHistoryEntry {
             memory_id: &memory_id,
             action: "created",
             version_id: &version_id,
-            old_status: "",
+            old_status: "pending",
             new_status: "active",
             quality_score: Some(input.quality_score),
             reason: &format!("promoted from candidate #{}", input.candidate.id),
             source_run_id: "",
         },
     )?;
+    tx.execute(
+        r#"UPDATE candidate_experiences
+           SET review_status='promoted', reviewed_at_ms=?1,
+               review_reason='promoted to long-term memory'
+           WHERE id=?2"#,
+        params![now, input.candidate.id],
+    )?;
+    tx.commit()?;
     Ok(memory_id)
 }
 
@@ -146,19 +163,20 @@ pub fn degrade_stale_memories(
     min_quality: f64,
     except_promoted_from: Option<i64>,
 ) -> Result<usize> {
-    let mut id_stmt = conn.prepare(
-        r#"
-        SELECT memory_id, quality_score FROM memory_items
-        WHERE scope = ?
-          AND (ticker = ? OR ? = '')
-          AND memory_type = ?
-          AND status = 'active'
-          AND quality_score < ?
-          AND (? IS NULL OR promoted_from IS NULL OR promoted_from != ?)
-        "#,
-    )?;
-    let ids: Vec<(String, f64)> = id_stmt
-        .query_map(
+    let tx = conn.unchecked_transaction()?;
+    let ids: Vec<(String, f64)> = {
+        let mut id_stmt = tx.prepare(
+            r#"
+            SELECT memory_id, quality_score FROM memory_items
+            WHERE scope = ?
+              AND (ticker = ? OR ? = '')
+              AND memory_type = ?
+              AND status = 'active'
+              AND quality_score < ?
+              AND (? IS NULL OR promoted_from IS NULL OR promoted_from != ?)
+            "#,
+        )?;
+        let rows = id_stmt.query_map(
             params![
                 scope,
                 scope_value,
@@ -169,12 +187,13 @@ pub fn degrade_stale_memories(
                 except_promoted_from,
             ],
             |row| Ok((row.get(0)?, row.get(1)?)),
-        )?
-        .collect::<rusqlite::Result<_>>()?;
-    let updated = conn.execute(
+        )?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    let updated = tx.execute(
         r#"
         UPDATE memory_items
-        SET status = 'inactive', updated_at = ?
+        SET status = 'inactive', updated_at_ms = ?
         WHERE scope = ?
           AND (ticker = ? OR ? = '')
           AND memory_type = ?
@@ -183,7 +202,7 @@ pub fn degrade_stale_memories(
           AND (? IS NULL OR promoted_from IS NULL OR promoted_from != ?)
         "#,
         params![
-            chrono::Utc::now().timestamp(),
+            now_ms(),
             scope,
             scope_value,
             scope_value,
@@ -194,8 +213,8 @@ pub fn degrade_stale_memories(
         ],
     )?;
     for (memory_id, quality) in &ids {
-        let _ = log_memory_history(
-            conn,
+        log_memory_history(
+            &tx,
             &MemoryHistoryEntry {
                 memory_id,
                 action: "degraded",
@@ -206,8 +225,9 @@ pub fn degrade_stale_memories(
                 reason: &format!("quality {quality:.2} below threshold {min_quality:.2}"),
                 source_run_id: "",
             },
-        );
+        )?;
     }
+    tx.commit()?;
     Ok(updated)
 }
 

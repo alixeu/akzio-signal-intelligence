@@ -184,7 +184,7 @@ const RESEARCH_FIELDS: &[&str] = &[
     "data_gaps",
     "risk_flags",
     "tail_risk_flag",
-    "missing_data_premium",
+    "missing_data_convergence",
     "per_ticker",
     "summary",
 ];

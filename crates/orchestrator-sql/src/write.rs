@@ -1,4 +1,4 @@
-use crate::schema::AGGREGATE_TICKER;
+use crate::schema::{canonical_json, ensure_run_exists, now_ms, payload_hash, AGGREGATE_TICKER};
 use anyhow::{bail, Result};
 use orchestrator_core::{display_ticker, parse_tickers};
 use rusqlite::{params, Connection};
@@ -114,31 +114,79 @@ pub fn clear_agent_loop_history(conn: &Connection, run_id: &str) -> Result<()> {
 pub fn write_run_record(conn: &mut Connection, input: &RunRecordInput) -> Result<()> {
     let tx = conn.transaction()?;
     tx.execute(
-        "INSERT OR REPLACE INTO runs (run_id, current_date, created_at, status) VALUES (?1, ?2, ?3, ?4)",
-        rusqlite::params![
-            input.run_id,
-            input.current_date,
-            chrono::Utc::now().timestamp(),
-            "running"
-        ],
+        r#"
+        INSERT INTO runs
+            (run_id,current_date,created_at_ms,status,current_phase,error_message,completed_at_ms,
+             run_dir,db_path,git_sha,config_hash,artifact_path,workflow_version,
+             prompt_versions_json,degraded,phase_count,total_elapsed_ms)
+        VALUES (?1,?2,?3,'running',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,'{}',0,0,0)
+        ON CONFLICT(run_id) DO UPDATE SET
+            current_date = excluded.current_date,
+            status = 'running',
+            current_phase = NULL,
+            error_message = NULL,
+            completed_at_ms = NULL
+        "#,
+        rusqlite::params![input.run_id, input.current_date, now_ms()],
     )?;
     tx.commit()?;
     Ok(())
 }
 
 pub fn upsert_agent_turn(conn: &Connection, input: &AgentTurnInput) -> Result<()> {
-    let now = chrono::Utc::now().timestamp();
+    ensure_run_exists(
+        conn,
+        &input.run_id,
+        &chrono::Utc::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string(),
+    )?;
+    let full_context = input
+        .full_context_json
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("agent full_context_json must be an array"))?;
+    let previous = crate::context::latest_role_history_items(
+        conn,
+        &input.run_id,
+        &input.role,
+        Some(&input.turn_id),
+    )?;
+    let debug_full = std::env::var("ORCHESTRATOR_SQL_DEBUG_FULL_CONTEXT")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let can_delta = !previous.is_empty()
+        && full_context.len() >= previous.len()
+        && full_context[..previous.len()] == previous;
+    let checkpoint = debug_full || !can_delta || input.turn_number % 10 == 0;
+    let checkpoint_json = checkpoint
+        .then(|| canonical_json(&input.full_context_json))
+        .transpose()?;
+    let delta = if checkpoint {
+        Value::Array(Vec::new())
+    } else {
+        Value::Array(full_context[previous.len()..].to_vec())
+    };
+    let delta_json = canonical_json(&delta)?;
+    let context_hash = payload_hash(&input.full_context_json)?;
     conn.execute(
         r#"
         INSERT INTO agent_events
-            (turn_id, run_id, phase, turn_number, role, created_at, full_context_json, summary)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            (turn_id,run_id,phase,turn_number,role,created_at_ms,full_context_json,
+             context_delta_json,context_hash,summary,model,input_tokens,output_tokens,
+             cached_tokens,reasoning_tokens,total_tokens,non_cached_input_tokens,
+             visible_output_tokens,cost_usd,context_warning,elapsed_ms)
+        VALUES (?,?,?,?,?,?,?,?,?,?,NULL,0,0,0,0,0,0,0,0.0,0,0)
         ON CONFLICT(turn_id) DO UPDATE SET
             run_id = excluded.run_id,
             phase = excluded.phase,
+            turn_number = excluded.turn_number,
             role = excluded.role,
             full_context_json = excluded.full_context_json,
-            summary = excluded.summary
+            context_delta_json = excluded.context_delta_json,
+            context_hash = excluded.context_hash,
+            summary = excluded.summary,
+            created_at_ms = excluded.created_at_ms
         "#,
         params![
             input.turn_id,
@@ -146,9 +194,11 @@ pub fn upsert_agent_turn(conn: &Connection, input: &AgentTurnInput) -> Result<()
             input.phase,
             input.turn_number,
             input.role,
-            now,
-            serde_json::to_string(&input.full_context_json)?,
-            input.summary,
+            now_ms(),
+            checkpoint_json,
+            delta_json,
+            context_hash,
+            truncate_summary(&input.summary),
         ],
     )?;
     Ok(())
@@ -161,13 +211,23 @@ pub fn write_role_turn_summary(conn: &Connection, input: &RoleTurnSummaryInput) 
             input.ticker
         );
     }
-    let now = chrono::Utc::now().timestamp();
+    ensure_run_exists(
+        conn,
+        &input.run_id,
+        &chrono::Utc::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string(),
+    )?;
+    let summary_json = canonical_json(&input.summary_json)?;
+    let hash = payload_hash(&input.summary_json)?;
     conn.execute(
         r#"
         INSERT INTO role_turn_summaries
-            (run_id, turn_id, role, phase, ticker, item_time, topic_id, debate_id,
-             summary_type, summary, summary_json, confidence, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (run_id,turn_id,role,phase,ticker,item_time_ms,topic_id,debate_id,
+             summary_type,summary,summary_json,payload_schema_version,payload_hash,
+             confidence,created_at_ms)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
         "#,
         params![
             input.run_id,
@@ -175,14 +235,15 @@ pub fn write_role_turn_summary(conn: &Connection, input: &RoleTurnSummaryInput) 
             input.role,
             input.phase,
             input.ticker,
-            input.item_time,
+            seconds_or_millis_to_millis(input.item_time),
             input.topic_id,
             input.debate_id,
             input.summary_type,
-            input.summary,
-            serde_json::to_string(&input.summary_json)?,
-            input.confidence,
-            now
+            truncate_summary(&input.summary),
+            summary_json,
+            hash,
+            input.confidence.clamp(0.0, 1.0),
+            now_ms()
         ],
     )?;
     let _id = conn.last_insert_rowid();
@@ -252,27 +313,37 @@ fn ticker_payloads(
     content: &Value,
     tickers: &[String],
     display_ticker_value: &str,
-    fan_out_without_per_ticker: bool,
+    _fan_out_without_per_ticker: bool,
 ) -> Result<Vec<(String, Scope, Value)>> {
     let Some(object) = content.as_object() else {
         bail!("agent message content must be a JSON object");
     };
     if let Some(Value::Object(per_ticker)) = object.get("per_ticker") {
-        let mut rows = Vec::new();
+        let mut payloads = Vec::new();
         for ticker in tickers {
-            let payload = per_ticker
-                .get(ticker)
-                .cloned()
-                .unwrap_or_else(|| content.clone());
-            rows.push((ticker.clone(), Scope::Ticker, payload));
+            let Some(payload) = per_ticker.get(ticker).cloned() else {
+                return Ok(vec![(
+                    AGGREGATE_TICKER.to_string(),
+                    Scope::Aggregate,
+                    content.clone(),
+                )]);
+            };
+            payloads.push((ticker.clone(), payload));
         }
-        return Ok(rows);
-    }
-
-    if tickers.len() > 1 && fan_out_without_per_ticker {
-        return Ok(tickers
+        let distinct_hashes = payloads
             .iter()
-            .map(|ticker| (ticker.clone(), Scope::Ticker, content.clone()))
+            .map(|(_, payload)| payload_hash(payload))
+            .collect::<Result<std::collections::BTreeSet<_>>>()?;
+        if payloads.len() > 1 && distinct_hashes.len() == 1 {
+            return Ok(vec![(
+                AGGREGATE_TICKER.to_string(),
+                Scope::Aggregate,
+                content.clone(),
+            )]);
+        }
+        return Ok(payloads
+            .into_iter()
+            .map(|(ticker, payload)| (ticker, Scope::Ticker, payload))
             .collect());
     }
 
@@ -296,7 +367,7 @@ fn ticker_payloads(
 
 fn summary_text(payload: &Value, last_md: &str) -> String {
     if !last_md.trim().is_empty() {
-        return last_md.trim().to_string();
+        return truncate_summary(last_md.trim());
     }
     for key in [
         "summary",
@@ -307,11 +378,23 @@ fn summary_text(payload: &Value, last_md: &str) -> String {
     ] {
         if let Some(value) = payload.get(key).and_then(Value::as_str) {
             if !value.trim().is_empty() {
-                return value.trim().to_string();
+                return truncate_summary(value.trim());
             }
         }
     }
-    payload.to_string()
+    truncate_summary(&payload.to_string())
+}
+
+fn truncate_summary(value: &str) -> String {
+    value.chars().take(2048).collect()
+}
+
+fn seconds_or_millis_to_millis(value: i64) -> i64 {
+    if value.abs() < 100_000_000_000 {
+        value.saturating_mul(1000)
+    } else {
+        value
+    }
 }
 
 fn confidence_score(payload: &Value) -> f64 {
@@ -376,13 +459,13 @@ pub fn update_run_status(
     status: &str,
     error_message: Option<&str>,
 ) -> Result<()> {
-    let now = chrono::Utc::now().timestamp();
+    let now = now_ms();
     conn.execute(
         r#"
         UPDATE runs
         SET status = ?1,
             error_message = COALESCE(?2, error_message),
-            completed_at = CASE WHEN ?1 IN ('completed','failed') THEN ?3 ELSE completed_at END
+            completed_at_ms = CASE WHEN ?1 IN ('completed','failed') THEN ?3 ELSE completed_at_ms END
         WHERE run_id = ?4
         "#,
         params![status, error_message, now, run_id],

@@ -23,6 +23,9 @@ use crate::truncation::{truncate_semantic, TruncationConfig};
 use crate::AgentSettings;
 
 const DEFAULT_MAX_AGENT_LOOPS: usize = 8;
+const COMPACT_ANALYST_ARTIFACT_INSTRUCTION: &str = "For analyst artifacts, prioritize a complete, valid compact payload: use no more than two key_evidence items and keep each per-ticker report to 600 characters or fewer. Every per_ticker entry must itself contain report and key_evidence (with claim, evidence_type, source, timestamp, and source_confidence); top-level evidence does not satisfy this contract. The required minimal shape is {\"id\":\"<role>\",\"role\":\"<role>\",\"per_ticker\":{\"<ticker>\":{\"direction\":\"neutral\",\"confidence\":0.0,\"report\":\"...\",\"key_evidence\":[{\"claim\":\"...\",\"evidence_type\":\"fact\",\"source\":\"...\",\"timestamp\":\"...\",\"source_confidence\":0.0}]}}}.";
+const TRUNCATED_ANALYST_ARTIFACT_RETRY_INSTRUCTION: &str = "Your previous artifact was incomplete or invalid, likely because it exceeded the response limit. Emit a replacement JSON artifact now. For every ticker, include direction, confidence, a report of 250 characters or fewer, and exactly one key_evidence object with claim, evidence_type, source, timestamp, and source_confidence. Do not put key_evidence only at the top level or repeat the earlier prose.";
+const INVALID_ANALYST_ARTIFACT_RETRY_INSTRUCTION: &str = "Your last JSON is invalid for this analyst role. Emit one JSON object with id/role for this analyst and, for every per_ticker.<TICKER>, direction, confidence, report, and key_evidence:[{claim,evidence_type,source,timestamp,source_confidence}]. direction must be bullish|bearish|neutral|mixed|unobserved; confidence and source_confidence must be 0..1 numbers. Do not put evidence only at the top level or invent alternate schemas.";
 
 pub struct AgentLoopModel {
     settings: AgentSettings,
@@ -383,9 +386,12 @@ where
                 && !analyst_final_artifact_looks_valid(&turn.role, &turn_tickers(turn), &text)
             {
                 turn.tools_disabled = true;
-                turn.push_pending_input(
-                    "Your last JSON is invalid for this analyst role. Emit one JSON object with id/role for this analyst, status=completed, and per_ticker.<TICKER>.{direction,confidence,report}. direction must be bullish|bearish|neutral|mixed|unobserved; confidence must be a 0..1 number. Do not invent alternate schemas (no stance-only payloads).",
-                );
+                let retry_instruction = if extract_json_value(&text).is_err() {
+                    TRUNCATED_ANALYST_ARTIFACT_RETRY_INSTRUCTION
+                } else {
+                    INVALID_ANALYST_ARTIFACT_RETRY_INSTRUCTION
+                };
+                turn.push_pending_input(retry_instruction);
                 turn.needs_follow_up = true;
                 persist_turn(conn, turn, &config.truncation)?;
                 continue;
@@ -422,7 +428,7 @@ where
             if turn.role.starts_with("risk.") && !risk_constraints_look_valid(&turn.role, &text) {
                 turn.tools_disabled = true;
                 turn.push_pending_input(
-                    "Your last output is invalid for this risk role. Emit the RiskConstraints required by the current role schema, including stance, unique_risk_contribution (or no_new_information=true), disagreement_with_prior, numeric caps, stop policy, triggers, review window, hedge recommendation, and confidence. Do not call tools again.",
+                    "Your last output is invalid for this risk role. Emit the integrated RiskConstraints required by the current role schema, including stance, numeric caps, stop policy, triggers, review window, cash/hedge purpose, and confidence. Do not call tools again.",
                 );
                 turn.needs_follow_up = true;
                 persist_turn(conn, turn, &config.truncation)?;
@@ -433,7 +439,7 @@ where
             {
                 turn.tools_disabled = true;
                 turn.push_pending_input(
-                    "Your last JSON is invalid for this interaction role. Emit the exact role-specific debate packet with role, artifact_type, topic_id, reply_to, stance, claim, evidence_refs, confidence, send_to_mediator, blocked_ack, and steelman unless stance=no_new_info. Do not call tools again.",
+                    "Your last JSON is invalid for this interaction role. Emit the exact role-specific debate packet with role, artifact_type, topic_id, reply_to_claim_id, steer_id, stance, claim, evidence_refs, confidence, send_to_mediator, blocked_ack, and steelman unless stance=no_new_info. Do not call tools again.",
                 );
                 turn.needs_follow_up = true;
                 persist_turn(conn, turn, &config.truncation)?;
@@ -1418,7 +1424,8 @@ fn interaction_packet_looks_valid(role: &str, text: &str) -> bool {
         && value.get("role").and_then(Value::as_str) == Some(role)
         && value.get("artifact_type").and_then(Value::as_str) == Some(expected_type)
         && non_empty_string_field(&value, "topic_id")
-        && non_empty_string_field(&value, "reply_to")
+        && non_empty_string_field(&value, "reply_to_claim_id")
+        && non_empty_string_field(&value, "steer_id")
         && value
             .get("stance")
             .and_then(Value::as_str)
@@ -1546,9 +1553,6 @@ fn risk_constraints_look_valid(role: &str, text: &str) -> bool {
     let expected_stance = role.strip_prefix("risk.").unwrap_or_default();
     value.get("stance").and_then(Value::as_str) == Some(expected_stance)
         && non_empty_string_field(&value, "argument")
-        && (non_empty_string_field(&value, "unique_risk_contribution")
-            || value.get("no_new_information").and_then(Value::as_bool) == Some(true))
-        && non_empty_string_field(&value, "disagreement_with_prior")
         && non_empty_string_field(&value, "recommended_adjustment")
         && value
             .get("stop_type")
@@ -1707,6 +1711,11 @@ If evidence is missing, call the appropriate tool. When tool evidence is enough,
             serde_json::to_string(available_tools).unwrap_or_default()
         )
     };
+    let analyst_compact_instruction = if executing_role.starts_with("analyst.") {
+        COMPACT_ANALYST_ARTIFACT_INSTRUCTION
+    } else {
+        ""
+    };
     format!(
         "You are running inside an agent loop powered by the OpenAI Responses API.\n\
 You are executing role `{executing_role}` for exactly these tickers: {}.\n\
@@ -1716,6 +1725,7 @@ Protocol:\n\
 2) Intermediate commentary may be plain text, but the turn must end with the complete artifact required by the current role schema as a single JSON object in assistant text.\n\
 3) Do not end with text saying you are about to retry, fetch, analyze, or wait for inputs; call the tool or produce the final artifact.\n\
 4) Do not wrap the artifact in id/role/status/report envelopes unless that role schema defines them.\n\
+{analyst_compact_instruction}\n\
 {tools_line}",
         serde_json::to_string(tickers).unwrap_or_default(),
     )
@@ -2327,7 +2337,7 @@ mod tests {
         assert_eq!(turn_tickers(&turn), vec!["QQQ", "SOXX"]);
     }
     use crate::web_search::{MockWebPage, MockWebSearchProvider, WebSearchConfig, WebSearchMode};
-    use orchestrator_sql::ensure_schema;
+    use orchestrator_sql::{ensure_schema, turn_history_items};
     use serde_json::json;
     use std::{path::PathBuf, sync::Arc};
 
@@ -2596,6 +2606,103 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn truncated_analyst_artifact_gets_compact_retry_instruction() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+        let valid_artifact = json!({
+            "id": "analyst.news_macro",
+            "role": "analyst.news_macro",
+            "per_ticker": {
+                "QQQ": {
+                    "direction": "neutral",
+                    "confidence": 0.4,
+                    "report": "Evidence is limited.",
+                    "key_evidence": [{
+                        "claim": "No decisive new macro catalyst was supplied.",
+                        "evidence_type": "fact",
+                        "source": "read_jin10_context",
+                        "timestamp": "2026-07-22",
+                        "source_confidence": 0.8
+                    }]
+                }
+            }
+        })
+        .to_string();
+        let mut model = FakeStreamModel::new(vec![
+            vec![
+                ModelStreamEvent::AssistantMessageStarted {
+                    item_id: "msg-truncated".to_string(),
+                },
+                ModelStreamEvent::AssistantTextDelta {
+                    item_id: "msg-truncated".to_string(),
+                    delta: format!("{{{}", "x".repeat(1_500)),
+                },
+                ModelStreamEvent::AssistantMessageCompleted {
+                    item_id: "msg-truncated".to_string(),
+                    turn_status: TurnStatus::Unknown,
+                },
+                ModelStreamEvent::ResponseCompleted {
+                    end_turn: true,
+                    raw: Value::Null,
+                },
+            ],
+            vec![
+                ModelStreamEvent::AssistantMessageStarted {
+                    item_id: "msg-valid".to_string(),
+                },
+                ModelStreamEvent::AssistantTextDelta {
+                    item_id: "msg-valid".to_string(),
+                    delta: valid_artifact,
+                },
+                ModelStreamEvent::AssistantMessageCompleted {
+                    item_id: "msg-valid".to_string(),
+                    turn_status: TurnStatus::Unknown,
+                },
+                ModelStreamEvent::ResponseCompleted {
+                    end_turn: true,
+                    raw: Value::Null,
+                },
+            ],
+        ]);
+        let mut tools = StaticToolRuntime::new();
+        let mut turn = Turn::new(
+            "turn-truncated",
+            "session-truncated",
+            "run-truncated",
+            "analyst.news_macro",
+            "prompt",
+        );
+        turn.model_context = "tickers=QQQ".to_string();
+
+        run_turn(
+            &conn,
+            &mut turn,
+            &mut model,
+            &mut tools,
+            AgentLoopConfig {
+                max_agent_loops: Some(2),
+                ..AgentLoopConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(model.seen_inputs[1].items.iter().any(|item| {
+            item.item_type == TurnItemType::UserMessage
+                && item
+                    .content_text
+                    .contains("likely because it exceeded the response limit")
+        }));
+    }
+
+    #[test]
+    fn analyst_system_instruction_requests_compact_artifact() {
+        let instruction = model_system_instruction(&[], "analyst.news_macro", &["QQQ".to_string()]);
+
+        assert!(instruction.contains("keep each per-ticker report to 600 characters"));
+    }
+
     #[test]
     fn controller_final_packet_rejects_incomplete_json() {
         assert!(!controller_packet_looks_valid(
@@ -2604,7 +2711,7 @@ mod tests {
     }
 
     #[test]
-    fn risk_packet_requires_explicit_information_gain() {
+    fn integrated_risk_packet_allows_empty_legacy_debate_fields() {
         let base = json!({
             "stance": "conservative",
             "argument": "Balanced review.",
@@ -2618,7 +2725,7 @@ mod tests {
             "cash_hedge_recommendation": "Keep cash.",
             "constraint_confidence": 0.8
         });
-        assert!(!risk_constraints_look_valid(
+        assert!(risk_constraints_look_valid(
             "risk.conservative",
             &base.to_string()
         ));
@@ -2744,23 +2851,19 @@ mod tests {
     }
 
     fn assistant_texts(conn: &rusqlite::Connection) -> Vec<String> {
-        let rows = conn
-            .prepare("SELECT full_context_json FROM agent_events ORDER BY turn_number")
-            .unwrap()
-            .query_map([], |row| row.get::<_, String>(0))
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
+        let turn_id: String = conn
+            .query_row(
+                "SELECT turn_id FROM agent_events ORDER BY turn_number DESC, id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
+        let rows = turn_history_items(conn, &turn_id).unwrap();
         let mut texts = Vec::new();
-        for json_str in &rows {
-            if let Ok(items) = serde_json::from_str::<Vec<Value>>(json_str) {
-                for item in items {
-                    if item.get("event_type").and_then(|v| v.as_str()) == Some("assistant_message")
-                    {
-                        if let Some(text) = item.get("content_text").and_then(|v| v.as_str()) {
-                            texts.push(text.to_string());
-                        }
-                    }
+        for item in rows {
+            if item.get("event_type").and_then(|v| v.as_str()) == Some("assistant_message") {
+                if let Some(text) = item.get("content_text").and_then(|v| v.as_str()) {
+                    texts.push(text.to_string());
                 }
             }
         }
@@ -3580,14 +3683,7 @@ mod tests {
             )
         }));
         assert_eq!(assistant_texts(&conn), vec!["live chunk".to_string()]);
-        let full_json: String = conn
-            .query_row(
-                "SELECT full_context_json FROM agent_events WHERE turn_id = ?",
-                ["turn-1"],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let events: Vec<Value> = serde_json::from_str(&full_json).unwrap_or_default();
+        let events = turn_history_items(&conn, "turn-1").unwrap();
         let content_json = events
             .iter()
             .find(|e| e.get("event_type").and_then(|v| v.as_str()) == Some("assistant_message"))
@@ -3742,14 +3838,7 @@ mod tests {
         let (has_summary, _summary) = turn_end_state(&conn, "turn-web");
         assert!(has_summary, "turn should have a non-empty summary");
 
-        let stored_json: String = conn
-            .query_row(
-                "SELECT full_context_json FROM agent_events WHERE turn_id = ?",
-                ["turn-web"],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let events: Vec<Value> = serde_json::from_str(&stored_json).unwrap_or_default();
+        let events = turn_history_items(&conn, "turn-web").unwrap();
         let stored_content = events
             .iter()
             .find(|item| {

@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use chrono::{Local, NaiveDate};
 use orchestrator_core::{
     config_int, config_str, config_strings, default_project_root, display_ticker, load_config,
-    parse_tickers, project_path, MarketRegime,
+    parse_tickers, project_path, research_rating_for_probability, MarketRegime,
 };
 use orchestrator_sql::{
     archive::{upsert_run_archive, RunArchiveInput},
@@ -713,7 +713,6 @@ fn should_run_portfolio_review(
         .unwrap_or_else(|| !is_selective_policy(config))
 }
 
-const PHASE3_PROBABILITY_DRIFT_LIMIT: f64 = 0.08;
 const PHASE3_PROBABILITY_DRIFT_CRITICAL: f64 = 0.15;
 
 fn phase3_probability_drift_violations(state: &Value, artifact: &Value) -> Vec<Value> {
@@ -773,8 +772,9 @@ fn phase3_probability_drift_violations(state: &Value, artifact: &Value) -> Vec<V
                 }));
             };
             let delta = (proposed_long - base_long).abs();
-            (delta > PHASE3_PROBABILITY_DRIFT_LIMIT
-                && !debate_justifies_probability_drift(state, ticker))
+            let has_valid_debate_increment = debate_justifies_probability_drift(state, ticker);
+            (delta > PHASE3_PROBABILITY_DRIFT_CRITICAL
+                || (!has_valid_debate_increment && delta > f64::EPSILON))
             .then(|| {
                 json!({
                     "ticker": ticker,
@@ -785,7 +785,11 @@ fn phase3_probability_drift_violations(state: &Value, artifact: &Value) -> Vec<V
                     "delta": delta,
                     "severity": if delta > PHASE3_PROBABILITY_DRIFT_CRITICAL { "critical" } else { "warning" },
                     "is_primary": is_primary,
-                    "reason": "probability drift exceeds 0.08 without a converged decision hinge and evidence references"
+                    "reason": if delta > PHASE3_PROBABILITY_DRIFT_CRITICAL {
+                        "probability drift exceeds the absolute Rust limit of 0.15"
+                    } else {
+                        "non-zero debate adjustment requires a converged decision hinge with evidence references"
+                    }
                 })
             })
         })
@@ -876,7 +880,7 @@ fn phase3_probability_retry_state(state: &Value, violations: &[Value]) -> Value 
             "base_long_probability": violation.get("base_long_probability").cloned().unwrap_or(Value::Null),
             "proposed_long_probability": violation.get("proposed_long_probability").cloned().unwrap_or(Value::Null),
             "delta": violation.get("delta").cloned().unwrap_or(Value::Null),
-            "requirement": "Keep abs(final-base) <= 0.08 unless an explicitly converged decision hinge has evidence references."
+            "requirement": "Use zero debate adjustment unless an explicitly converged decision hinge has evidence references; valid increments remain bounded by the Rust absolute limit."
         });
     }
     retry_state
@@ -904,13 +908,7 @@ fn apply_phase3_probability_fallback(mut artifact: Value, violations: &[Value]) 
             .get("base_confidence_basis")
             .and_then(Value::as_str)
             == Some("data_insufficient");
-        let rating = if base_is_insufficient || (base_long - 0.5).abs() <= 0.05 {
-            "Hold"
-        } else if base_long > 0.5 {
-            "Overweight"
-        } else {
-            "Underweight"
-        };
+        let rating = research_rating_for_probability(base_long);
         let confidence_basis = if base_is_insufficient {
             "data_insufficient"
         } else if rating == "Hold" {
@@ -1789,7 +1787,7 @@ fn build_point_debate_steer(
     json!({
         "kind": "point_debate",
         "side": side,
-        "requirement": "You MUST run claim-level cross-examination. For every item in opponent_claims_to_address and accepted_for_you, set reply_to to that claim_id and choose stance accept|rebut|downgrade|needs_evidence. Do not invent a parallel monologue that ignores opponent points.",
+        "requirement": "Address exactly one routed decision hinge. Set reply_to_claim_id to the opponent claim_id, preserve steer_id, and choose stance accept|rebut|downgrade|needs_evidence|no_new_info.",
         "mediator_instruction": mediator_instruction,
         "opponent_packet": opponent_packet,
         "opponent_claims_to_address": opponent_claims,
@@ -1853,7 +1851,7 @@ fn extract_addressable_claims(packet: &Value) -> Value {
     }
     if artifact.get("claim").is_some() {
         return json!([{
-            "claim_id": artifact.get("reply_to").cloned()
+            "claim_id": artifact.get("reply_to_claim_id").cloned()
                 .or_else(|| artifact.get("claim_id").cloned())
                 .unwrap_or(Value::Null),
             "claim": artifact.get("claim").cloned().unwrap_or(Value::Null),
@@ -1886,7 +1884,8 @@ fn compact_debate_artifact(artifact: &Value) -> Value {
         "claims",
         "summary",
         "reducer_checks",
-        "reply_to",
+        "reply_to_claim_id",
+        "steer_id",
         "stance",
         "claim",
         "evidence_refs",
@@ -2208,7 +2207,7 @@ async fn run_phase3(
 ) -> Result<()> {
     let mock = is_mock(state);
     debug!("manager research role starting");
-    let artifact = run_single_role_job(
+    let mut artifact = run_single_role_job(
         RoleRun {
             state: state.clone(),
             role: "manager.research",
@@ -2228,6 +2227,7 @@ async fn run_phase3(
         conn,
     )
     .await?;
+    enforce_phase3_deterministic_fields(state, &mut artifact);
     if artifact
         .get("degraded")
         .and_then(Value::as_bool)
@@ -2275,12 +2275,13 @@ async fn run_phase3(
         )
         .await;
         match retry_result {
-            Ok(retry_artifact)
+            Ok(mut retry_artifact)
                 if !retry_artifact
                     .get("degraded")
                     .and_then(Value::as_bool)
                     .unwrap_or(false) =>
             {
+                enforce_phase3_deterministic_fields(state, &mut retry_artifact);
                 let retry_violations = phase3_probability_drift_violations(state, &retry_artifact);
                 if retry_violations.is_empty() {
                     state["phase3_probability_guard"] = json!({
@@ -2323,14 +2324,14 @@ async fn run_phase3(
         }
     };
     let mut artifact = artifact;
-    apply_missing_data_premium(state, &mut artifact);
+    apply_missing_data_convergence(state, &mut artifact);
     persist_artifact(conn, state, 3, "manager.research", artifact.clone())?;
     state["research_plan"] = artifact;
     debug!("manager research role completed");
     Ok(())
 }
 
-fn apply_missing_data_premium(state: &Value, artifact: &mut Value) {
+fn apply_missing_data_convergence(state: &Value, artifact: &mut Value) {
     let tickers = tickers_from_state(state);
     for (index, ticker) in tickers.iter().enumerate() {
         let missing_items = missing_high_impact_items(state, ticker);
@@ -2357,8 +2358,8 @@ fn apply_missing_data_premium(state: &Value, artifact: &mut Value) {
             let applied = (adjusted - current).abs();
             set_research_probability(payload, adjusted);
             adjust_scenario_probabilities(payload, adjusted - current);
-            let premium = json!({
-                "reason_code": "missing_data_premium",
+            let convergence = json!({
+                "reason_code": "missing_data_convergence",
                 "item_count": missing_items.len(),
                 "items": missing_items,
                 "requested_convergence": requested,
@@ -2366,24 +2367,32 @@ fn apply_missing_data_premium(state: &Value, artifact: &mut Value) {
                 "from_probability": current,
                 "to_probability": adjusted
             });
-            payload["missing_data_premium"] = premium.clone();
+            payload["missing_data_convergence"] = convergence.clone();
+            if payload.get("rating").and_then(Value::as_str) == Some("Hold") {
+                payload["confidence_basis"] = json!("data_insufficient");
+                payload["hold_reason"] = json!("evidence_insufficient");
+            }
             append_adjustment_rationale(
                 payload,
                 &format!(
-                    "missing_data_premium: {} high-impact missing items; requested convergence {:.3}, applied {:.3}, final {:.3}.",
+                    "missing_data_convergence: {} high-impact missing items; requested convergence {:.3}, applied {:.3}, final {:.3}.",
                     missing_items.len(), requested, applied, adjusted
                 ),
             );
-            (current, adjusted, requested, applied, premium)
+            (current, adjusted, requested, applied, convergence)
         };
         if index == 0 {
             set_research_probability(artifact, adjusted);
             adjust_scenario_probabilities(artifact, adjusted - current);
-            artifact["missing_data_premium"] = premium;
+            artifact["missing_data_convergence"] = premium;
+            if artifact.get("rating").and_then(Value::as_str) == Some("Hold") {
+                artifact["confidence_basis"] = json!("data_insufficient");
+                artifact["hold_reason"] = json!("evidence_insufficient");
+            }
             append_adjustment_rationale(
                 artifact,
                 &format!(
-                    "missing_data_premium: {} high-impact missing items for {ticker}; requested convergence {:.3}, applied {:.3}, final {:.3}.",
+                    "missing_data_convergence: {} high-impact missing items for {ticker}; requested convergence {:.3}, applied {:.3}, final {:.3}.",
                     missing_items.len(),
                     requested,
                     applied,
@@ -2497,17 +2506,82 @@ fn converge_toward_neutral(probability: f64, amount: f64) -> f64 {
     }
 }
 
+fn enforce_phase3_deterministic_fields(state: &Value, artifact: &mut Value) {
+    let tickers = tickers_from_state(state);
+    let mut primary_payload = None;
+    for ticker in &tickers {
+        let Some(base_probability) = weighted_base_probability_for_ticker(state, ticker) else {
+            continue;
+        };
+        let Some(payload) = artifact
+            .get_mut("per_ticker")
+            .and_then(Value::as_object_mut)
+            .and_then(|items| items.get_mut(ticker))
+        else {
+            continue;
+        };
+        payload["base_probability"] = json!(base_probability);
+        if let Some(final_probability) = payload
+            .get("long_probability")
+            .and_then(Value::as_f64)
+            .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
+        {
+            set_research_probability(payload, final_probability);
+            payload["debate_adjustment"] = json!(final_probability - base_probability);
+        }
+        if primary_payload.is_none() {
+            primary_payload = Some(payload.clone());
+        }
+    }
+
+    if let Some(primary) = primary_payload {
+        for field in [
+            "rating",
+            "long_probability",
+            "short_probability",
+            "base_probability",
+            "debate_adjustment",
+            "final_probability",
+            "confidence_basis",
+            "hold_reason",
+        ] {
+            if let Some(value) = primary.get(field).cloned() {
+                artifact[field] = value;
+            } else if field == "hold_reason" {
+                if let Some(object) = artifact.as_object_mut() {
+                    object.remove(field);
+                }
+            }
+        }
+    }
+}
+
 fn set_research_probability(value: &mut Value, probability: f64) {
     value["long_probability"] = json!(probability);
-    value["short_probability"] = json!(1.0 - probability);
+    value["short_probability"] = json!(((1.0 - probability) * 10_000.0).round() / 10_000.0);
     value["final_probability"] = json!(probability);
-    if let Some(base) = value.get("base_probability").and_then(Value::as_f64) {
-        value["debate_adjustment"] = json!(probability - base);
-    }
-    if (probability - 0.5).abs() <= 0.05 {
-        value["rating"] = json!("Hold");
-        value["confidence_basis"] = json!("data_insufficient");
-        value["hold_reason"] = json!("evidence_insufficient");
+    let rating = research_rating_for_probability(probability);
+    value["rating"] = json!(rating);
+    if rating == "Hold" {
+        let confidence_basis = value
+            .get("confidence_basis")
+            .and_then(Value::as_str)
+            .filter(|basis| {
+                matches!(
+                    *basis,
+                    "evidence_balanced" | "data_insufficient" | "conflicting_evidence"
+                )
+            })
+            .unwrap_or("evidence_balanced");
+        let hold_reason = match confidence_basis {
+            "data_insufficient" => "evidence_insufficient",
+            "conflicting_evidence" => "conflicting_evidence",
+            _ => "evidence_balanced",
+        };
+        value["confidence_basis"] = json!(confidence_basis);
+        value["hold_reason"] = json!(hold_reason);
+    } else if let Some(object) = value.as_object_mut() {
+        object.remove("hold_reason");
     }
 }
 
@@ -2607,9 +2681,8 @@ async fn run_phase5(
     config: &RuntimeConfig,
 ) -> Result<()> {
     state["risk_debate_state"] = json!({"history": []});
-    // One integrated review replaces three perspective calls. The prompt
-    // evaluates conservative/base/aggressive scenarios in one contract while
-    // Rust policy decides whether this phase runs at all.
+    // One integrated review evaluates survival/base/upside scenarios in one
+    // contract while Rust policy decides whether this phase runs at all.
     let risk_role = "risk.conservative";
     let round = 1;
     let result = run_role_jobs(
@@ -2729,6 +2802,7 @@ fn run_phase6_derived(conn: &mut rusqlite::Connection, state: &mut Value) -> Res
         "status": "derived",
         "derived_from": ["research_plan", "trader_investment_plan", "workflow_policy"],
         "rating": research.get("rating").cloned().unwrap_or_else(|| json!("Hold")),
+        "execution_status": if trader.get("action").and_then(Value::as_str) == Some("Hold") { "wait" } else { "execute" },
         "execution_summary": "Portfolio review skipped by workflow policy; Phase 3 market view remains authoritative.",
         "investment_thesis": research.get("plan").cloned().unwrap_or_else(|| json!("")),
         "target_price": Value::Null,
@@ -3510,7 +3584,7 @@ mod tests {
     }
 
     #[test]
-    fn phase3_probability_adjustment_at_guardrail_limit_is_accepted() {
+    fn phase3_probability_adjustment_without_valid_debate_is_rejected() {
         let state = json!({
             "tickers": ["QQQ"],
             "weighted_probability_base": {
@@ -3530,11 +3604,16 @@ mod tests {
             }
         });
 
-        assert!(phase3_probability_drift_violations(&state, &artifact).is_empty());
+        let violations = phase3_probability_drift_violations(&state, &artifact);
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("requires a converged decision hinge"));
     }
 
     #[test]
-    fn missing_data_premium_is_enforced_from_itemized_and_critical_gaps() {
+    fn missing_data_convergence_is_enforced_from_itemized_and_critical_gaps() {
         let state = json!({
             "tickers": ["QQQ"],
             "phase1_index": {
@@ -3570,9 +3649,9 @@ mod tests {
             }}
         });
 
-        apply_missing_data_premium(&state, &mut artifact);
+        apply_missing_data_convergence(&state, &mut artifact);
 
-        let premium = &artifact["per_ticker"]["QQQ"]["missing_data_premium"];
+        let premium = &artifact["per_ticker"]["QQQ"]["missing_data_convergence"];
         assert_eq!(premium["item_count"], 2);
         assert!((premium["requested_convergence"].as_f64().unwrap() - 0.05).abs() < 1e-9);
         assert!(
@@ -3632,13 +3711,15 @@ mod tests {
         let violations = phase3_probability_drift_violations(&state, &artifact);
         let guarded = apply_phase3_probability_fallback(artifact, &violations);
 
-        assert_eq!(violations.len(), 1);
-        assert_eq!(violations[0]["ticker"], "SOXX");
-        assert_eq!(violations[0]["severity"], "critical");
+        assert_eq!(violations.len(), 2);
+        assert_eq!(violations[0]["ticker"], "QQQ");
+        assert_eq!(violations[0]["severity"], "warning");
+        assert_eq!(violations[1]["ticker"], "SOXX");
+        assert_eq!(violations[1]["severity"], "critical");
         assert_eq!(guarded["per_ticker"]["SOXX"]["long_probability"], 0.45);
         assert_eq!(guarded["per_ticker"]["SOXX"]["short_probability"], 0.55);
-        assert_eq!(guarded["per_ticker"]["QQQ"]["long_probability"], 0.57);
-        assert_eq!(guarded["long_probability"], 0.57);
+        assert_eq!(guarded["per_ticker"]["QQQ"]["long_probability"], 0.55);
+        assert_eq!(guarded["long_probability"], 0.55);
     }
 
     #[test]

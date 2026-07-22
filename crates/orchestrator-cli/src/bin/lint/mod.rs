@@ -69,8 +69,6 @@ pub const VALID_PLACEHOLDERS: &[&str] = &[
     "round",
     "topic_id",
     "topic",
-    "blocked_repeats",
-    "next_agenda",
     "analyst_reports",
     "research_plan",
     "trader_plan",

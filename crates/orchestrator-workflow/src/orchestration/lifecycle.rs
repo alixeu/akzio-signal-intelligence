@@ -461,6 +461,13 @@ fn validate_final_validation_payload(payload: &Value) -> Option<String> {
     serde_json::from_value::<FinalValidation>(payload.clone())
         .err()
         .map(|error| error.to_string())
+        .or_else(|| {
+            let status = payload.get("execution_status").and_then(Value::as_str);
+            (!matches!(status, Some("execute" | "wait" | "downgrade"))).then(|| {
+                "required contract field execution_status must be execute, wait, or downgrade"
+                    .to_string()
+            })
+        })
         .or_else(|| required_string_error(payload, "execution_summary"))
 }
 
@@ -491,13 +498,7 @@ pub(crate) fn research_plan_to_trade_intent(research_plan: &Value) -> Value {
         .get("rating")
         .and_then(Value::as_str)
         .unwrap_or("");
-    let long_probability = research_plan
-        .get("long_probability")
-        .and_then(Value::as_f64);
-    let short_probability = research_plan
-        .get("short_probability")
-        .and_then(Value::as_f64);
-    let action = trade_action(rating, long_probability, short_probability);
+    let action = trade_action(rating);
     json!({
         "action": action,
         "entry_price": null,
@@ -509,27 +510,11 @@ pub(crate) fn research_plan_to_trade_intent(research_plan: &Value) -> Value {
     })
 }
 
-fn trade_action(
-    rating: &str,
-    long_probability: Option<f64>,
-    short_probability: Option<f64>,
-) -> &'static str {
-    let rating = rating.to_ascii_lowercase();
-    if matches!(
-        rating.as_str(),
-        "buy" | "strong buy" | "long" | "bullish" | "overweight"
-    ) && long_probability.is_some_and(|probability| probability >= 0.60)
-    {
-        "Buy"
-    } else if matches!(
-        rating.as_str(),
-        "sell" | "strong sell" | "short" | "bearish" | "underweight"
-    ) && (short_probability.is_some_and(|probability| probability >= 0.60)
-        || long_probability.is_some_and(|probability| probability <= 0.40))
-    {
-        "Sell"
-    } else {
-        "Hold"
+fn trade_action(rating: &str) -> &'static str {
+    match rating {
+        "Buy" | "Overweight" => "Buy",
+        "Sell" | "Underweight" => "Sell",
+        _ => "Hold",
     }
 }
 
@@ -813,11 +798,11 @@ mod trade_intent_tests {
     }
 
     #[test]
-    fn holds_when_rating_or_probability_is_missing_or_neutral() {
+    fn holds_when_canonical_rating_is_missing_or_hold() {
         for research_plan in [
-            json!({"rating": "Buy", "long_probability": 0.59}),
             json!({"long_probability": 0.80, "short_probability": 0.20}),
             json!({"rating": "Hold", "long_probability": 0.80}),
+            json!({"rating": "Bullish", "long_probability": 0.80}),
             json!({}),
         ] {
             let intent = research_plan_to_trade_intent(&research_plan);
@@ -827,18 +812,18 @@ mod trade_intent_tests {
     }
 
     #[test]
-    fn maps_supported_sell_from_short_or_low_long_probability() {
-        let short_supported = research_plan_to_trade_intent(&json!({
+    fn maps_canonical_sell_and_underweight_to_sell() {
+        let sell = research_plan_to_trade_intent(&json!({
             "rating": "Sell",
             "long_probability": 0.45,
             "short_probability": 0.61
         }));
-        let low_long_supported = research_plan_to_trade_intent(&json!({
-            "rating": "Bearish",
+        let underweight = research_plan_to_trade_intent(&json!({
+            "rating": "Underweight",
             "long_probability": 0.39
         }));
 
-        assert_eq!(short_supported["action"], "Sell");
-        assert_eq!(low_long_supported["action"], "Sell");
+        assert_eq!(sell["action"], "Sell");
+        assert_eq!(underweight["action"], "Sell");
     }
 }

@@ -533,13 +533,13 @@ fn write_role_end_context(settings: &AgentSettings, turn: &Turn) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let mut lines = Vec::new();
+    let mut items = Vec::new();
     for item in &turn.emitted_items {
         if let Some(value) = end_context_item(item) {
-            lines.push(serde_json::to_string(&value)?);
+            items.push(value);
         }
     }
-    fs::write(path, lines.join("\n"))?;
+    fs::write(path, serde_json::to_string_pretty(&items)?)?;
     Ok(())
 }
 
@@ -550,7 +550,7 @@ fn role_end_context_path(settings: &AgentSettings, turn: &Turn) -> Option<PathBu
         .and_then(|tools| tools.run_dir.as_ref())?;
     let phase = settings.phase.unwrap_or_default();
     Some(run_dir.join(format!("phase{phase:02}")).join(format!(
-        "{}_{}_end_context.jsonl",
+        "{}_{}_end_context.json",
         safe_path_part(&settings.role),
         safe_path_part(&turn.turn_id)
     )))
@@ -575,10 +575,8 @@ pub fn append_debug_llm_record(settings: &AgentSettings, record: Value) -> Resul
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create debug dir {}", parent.display()))?;
     }
-    // JSONL requires exactly one JSON value per physical line.
-    let mut line = serde_json::to_string(&record)?;
-    line.push('\n');
-    fs::write(&path, line.as_bytes())
+    let pretty = serde_json::to_string_pretty(&record)?;
+    fs::write(&path, pretty)
         .with_context(|| format!("failed to write debug llm record {}", path.display()))?;
     Ok(())
 }
@@ -594,17 +592,17 @@ pub fn reset_debug_output_dir(project_root: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-/// Append one timing record to `outputs/debug/time.jsonl` (debug mode only callers).
+/// Append one timing record to the formatted `outputs/debug/time.json` array.
 pub fn append_debug_time_record(project_root: &std::path::Path, record: Value) -> Result<()> {
-    append_debug_jsonl_line(project_root, "outputs/debug/time.jsonl", record)
+    append_debug_json_record(project_root, "outputs/debug/time.json", record)
 }
 
-/// Append one token-usage record to `outputs/debug/token.jsonl` (debug mode only callers).
+/// Append one token-usage record to the formatted `outputs/debug/token.json` array.
 pub fn append_debug_token_record(project_root: &std::path::Path, record: Value) -> Result<()> {
-    append_debug_jsonl_line(project_root, "outputs/debug/token.jsonl", record)
+    append_debug_json_record(project_root, "outputs/debug/token.json", record)
 }
 
-fn append_debug_jsonl_line(
+fn append_debug_json_record(
     project_root: &std::path::Path,
     relative: &str,
     mut record: Value,
@@ -619,16 +617,17 @@ fn append_debug_jsonl_line(
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create debug dir {}", parent.display()))?;
     }
-    let mut line = serde_json::to_string(&record)?;
-    line.push('\n');
-    use std::io::Write;
-    fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .with_context(|| format!("failed to open debug metrics {}", path.display()))?
-        .write_all(line.as_bytes())
-        .with_context(|| format!("failed to append debug metrics {}", path.display()))?;
+    let mut records = if path.exists() {
+        let contents = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read debug metrics {}", path.display()))?;
+        serde_json::from_str::<Vec<Value>>(&contents)
+            .with_context(|| format!("debug metrics {} must be a JSON array", path.display()))?
+    } else {
+        Vec::new()
+    };
+    records.push(record);
+    fs::write(&path, serde_json::to_string_pretty(&records)?)
+        .with_context(|| format!("failed to write debug metrics {}", path.display()))?;
     Ok(())
 }
 
@@ -651,14 +650,14 @@ pub fn debug_project_root(settings: &AgentSettings) -> PathBuf {
 /// Best-effort time log; never fails the main workflow.
 pub fn debug_log_time(project_root: &std::path::Path, record: Value) {
     if let Err(error) = append_debug_time_record(project_root, record) {
-        tracing::warn!(error = %error, "failed to write debug time.jsonl");
+        tracing::warn!(error = %error, "failed to write debug time.json");
     }
 }
 
 /// Best-effort token log; never fails the main workflow.
 pub fn debug_log_token(project_root: &std::path::Path, record: Value) {
     if let Err(error) = append_debug_token_record(project_root, record) {
-        tracing::warn!(error = %error, "failed to write debug token.jsonl");
+        tracing::warn!(error = %error, "failed to write debug token.json");
     }
 }
 
@@ -676,7 +675,7 @@ pub fn debug_record_relative_path_with_topic(
         Some(topic) => format!("{role_part}__{}", safe_path_part(topic)),
         None => role_part,
     };
-    PathBuf::from(format!("outputs/debug/phase{phase:02}/{file_stem}.jsonl"))
+    PathBuf::from(format!("outputs/debug/phase{phase:02}/{file_stem}.json"))
 }
 
 fn end_context_item(item: &agent_loop::TurnItem) -> Option<Value> {
@@ -2058,7 +2057,7 @@ fn validate_seed_packet_contract(settings: &AgentSettings, artifact: &Value) -> 
         "bear_seed_packet"
     };
     require_exact_string(artifact, "artifact_type", expected_type)?;
-    require_non_empty_string(artifact, "topic_id")?;
+    let topic_id = require_non_empty_string(artifact, "topic_id")?;
     let claims = require_array(artifact, "claims")?;
     if claims.is_empty() {
         bail!("initial seed packet claims must not be empty");
@@ -2073,7 +2072,8 @@ fn validate_seed_packet_contract(settings: &AgentSettings, artifact: &Value) -> 
             .as_object()
             .with_context(|| format!("initial seed claim {index} must be an object"))?;
         let claim = Value::Object(claim.clone());
-        require_non_empty_string(&claim, "claim_id")?;
+        let claim_id = require_non_empty_string(&claim, "claim_id")?;
+        validate_seed_claim_id(settings, topic_id, claim_id)?;
         require_non_empty_string(&claim, "decision_hinge")?;
         require_non_empty_string(&claim, "claim")?;
         require_array(&claim, "evidence_refs")?;
@@ -2092,6 +2092,23 @@ fn validate_seed_packet_contract(settings: &AgentSettings, artifact: &Value) -> 
     Ok(())
 }
 
+fn validate_seed_claim_id(settings: &AgentSettings, topic_id: &str, claim_id: &str) -> Result<()> {
+    let side = if settings.role.contains("bull") {
+        "bull"
+    } else {
+        "bear"
+    };
+    let prefix = format!("{topic_id}:{side}:");
+    let sequence = claim_id
+        .strip_prefix(&prefix)
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0);
+    if sequence.is_none() {
+        bail!("seed claim_id must use <topic_id>:<side>:<sequence>; got {claim_id:?}");
+    }
+    Ok(())
+}
+
 fn validate_interaction_packet_contract(settings: &AgentSettings, artifact: &Value) -> Result<()> {
     require_exact_role(settings, artifact)?;
     let expected_type = if settings.role.contains("bull") {
@@ -2101,7 +2118,8 @@ fn validate_interaction_packet_contract(settings: &AgentSettings, artifact: &Val
     };
     require_exact_string(artifact, "artifact_type", expected_type)?;
     require_non_empty_string(artifact, "topic_id")?;
-    require_non_empty_string(artifact, "reply_to")?;
+    require_non_empty_string(artifact, "reply_to_claim_id")?;
+    require_non_empty_string(artifact, "steer_id")?;
     let stance = require_non_empty_string(artifact, "stance")?;
     if !matches!(
         stance,
@@ -2176,6 +2194,9 @@ fn validate_trade_intent_contract(settings: &AgentSettings, artifact: &Value) ->
 }
 
 fn validate_trade_intent_entry(entry: &Value) -> Result<()> {
+    if entry.get("derived_stop_reference").is_some() {
+        bail!("derived_stop_reference is not part of the TradeIntent schema; keep unavailable stop context in rationale");
+    }
     let action = require_non_empty_string(entry, "action")?;
     if !matches!(action, "Buy" | "Sell" | "Hold") {
         bail!("trade intent action must be Buy, Sell, or Hold");
@@ -2198,15 +2219,24 @@ fn validate_trade_intent_entry(entry: &Value) -> Result<()> {
 }
 
 fn parse_position_upper_bound(value: &str) -> Option<f64> {
-    value
-        .split(['-', '–', '—'])
-        .filter_map(|part| {
-            part.trim()
-                .strip_suffix('%')
-                .and_then(|percent| percent.trim().parse::<f64>().ok())
-                .map(|percent| (percent / 100.0).clamp(0.0, 1.0))
-        })
-        .max_by(f64::total_cmp)
+    fn percentage(part: &str) -> Option<f64> {
+        let value = part.trim().strip_suffix('%')?.trim().parse::<f64>().ok()?;
+        value
+            .is_finite()
+            .then_some(value)
+            .filter(|value| (0.0..=100.0).contains(value))
+    }
+
+    let parts = value.split(['-', '–', '—']).collect::<Vec<_>>();
+    match parts.as_slice() {
+        [single] => percentage(single).map(|value| value / 100.0),
+        [low, high] => {
+            let low = percentage(low)?;
+            let high = percentage(high)?;
+            (low <= high).then_some(high / 100.0)
+        }
+        _ => None,
+    }
 }
 
 fn validate_risk_constraints_contract(settings: &AgentSettings, artifact: &Value) -> Result<()> {
@@ -2681,6 +2711,7 @@ fn mock_portfolio_artifact() -> Value {
         "id": "portfolio.manager",
         "role": "portfolio.manager",
         "rating": "Hold",
+        "execution_status": "wait",
         "execution_summary": "Mock final portfolio decision.",
         "investment_thesis": "Mock probability analysis.",
         "target_price": null,
@@ -2699,7 +2730,7 @@ mod tests {
     };
     use crate::web_search::{WebSearchConfig, WebSearchMode};
     use anyhow::anyhow;
-    use serde_json::json;
+    use serde_json::{json, Value};
     use std::path::PathBuf;
 
     #[test]
@@ -2873,11 +2904,11 @@ mod tests {
         let second_path = super::role_end_context_path(&settings, &second).unwrap();
 
         assert_ne!(first_path, second_path);
-        assert!(first_path.ends_with("researcher_bull_interaction_turn_topic_a_end_context.jsonl"));
+        assert!(first_path.ends_with("researcher_bull_interaction_turn_topic_a_end_context.json"));
     }
 
     #[test]
-    fn append_debug_llm_record_writes_jsonl_under_outputs_debug() {
+    fn append_debug_llm_record_writes_formatted_json_under_outputs_debug() {
         let temp = tempfile::tempdir().unwrap();
         let mut settings = base_settings(LlmRoute::Responses);
         settings.debug = true;
@@ -2918,20 +2949,24 @@ mod tests {
 
         let path = temp
             .path()
-            .join("outputs/debug/phase01/analyst_technical.jsonl");
+            .join("outputs/debug/phase01/analyst_technical.json");
         let contents = std::fs::read_to_string(&path).unwrap();
-        let lines: Vec<_> = contents.lines().filter(|line| !line.is_empty()).collect();
         // Latest turn only — intermediate tool turns are overwritten.
-        assert_eq!(lines.len(), 1);
-        assert!(lines[0].contains("\"kind\":\"stream\""));
-        assert!(lines[0].contains("\"req\""));
-        assert!(lines[0].contains("\"resp\""));
-        assert!(lines[0].contains("\"elapsed_ms\""));
-        assert!(lines[0].contains("\"token\""));
+        let record: Value = serde_json::from_str(&contents).unwrap();
+        assert_eq!(record["kind"], "stream");
+        assert!(record.get("req").is_some());
+        assert!(record.get("resp").is_some());
+        assert!(record.get("elapsed_ms").is_some());
+        assert!(record.get("token").is_some());
+        assert!(contents.contains("\n  \"kind\": \"stream\""));
+        assert!(!temp
+            .path()
+            .join("outputs/debug/phase01/analyst_technical.jsonl")
+            .exists());
     }
 
     #[test]
-    fn append_debug_time_and_token_records_append_jsonl() {
+    fn append_debug_time_and_token_records_write_formatted_json_arrays() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
         super::append_debug_time_record(
@@ -2963,27 +2998,21 @@ mod tests {
         )
         .unwrap();
 
-        let time_path = root.join("outputs/debug/time.jsonl");
-        let token_path = root.join("outputs/debug/token.jsonl");
-        let time_contents = std::fs::read_to_string(&time_path).unwrap();
-        let time_lines: Vec<_> = time_contents
-            .lines()
-            .filter(|line| !line.is_empty())
-            .collect();
-        let token_contents = std::fs::read_to_string(&token_path).unwrap();
-        let token_lines: Vec<_> = token_contents
-            .lines()
-            .filter(|line| !line.is_empty())
-            .collect();
-        assert_eq!(time_lines.len(), 2);
-        assert!(time_lines[0].contains("role_job"));
-        assert!(time_lines[0].contains("\"llm_ms\":60"));
-        assert!(time_lines[0].contains("\"tool_ms\":25"));
-        assert!(time_lines[0].contains("\"wait_ms\":15"));
-        assert!(time_lines[1].contains("phase1"));
-        assert_eq!(token_lines.len(), 1);
-        assert!(token_lines[0].contains("\"total_tokens\":14"));
-        assert!(token_lines[0].contains("ts_ms"));
+        let time_path = root.join("outputs/debug/time.json");
+        let token_path = root.join("outputs/debug/token.json");
+        let time_records: Vec<Value> =
+            serde_json::from_str(&std::fs::read_to_string(&time_path).unwrap()).unwrap();
+        let token_records: Vec<Value> =
+            serde_json::from_str(&std::fs::read_to_string(&token_path).unwrap()).unwrap();
+        assert_eq!(time_records.len(), 2);
+        assert_eq!(time_records[0]["kind"], "role_job");
+        assert_eq!(time_records[0]["llm_ms"], 60);
+        assert_eq!(time_records[0]["tool_ms"], 25);
+        assert_eq!(time_records[0]["wait_ms"], 15);
+        assert_eq!(time_records[1]["name"], "phase1");
+        assert_eq!(token_records.len(), 1);
+        assert_eq!(token_records[0]["total_tokens"], 14);
+        assert!(token_records[0].get("ts_ms").is_some());
     }
 
     #[test]
@@ -2996,12 +3025,12 @@ mod tests {
         assert_eq!(
             path,
             PathBuf::from(
-                "outputs/debug/phase02/researcher_bull_initial__QQQ_rate_volatility_confirmation.jsonl"
+                "outputs/debug/phase02/researcher_bull_initial__QQQ_rate_volatility_confirmation.json"
             )
         );
         assert_eq!(
             super::debug_record_relative_path(1, "analyst.news_macro"),
-            PathBuf::from("outputs/debug/phase01/analyst_news_macro.jsonl")
+            PathBuf::from("outputs/debug/phase01/analyst_news_macro.json")
         );
     }
 
@@ -3092,6 +3121,41 @@ mod tests {
             error.to_string().contains("Hold"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn parse_final_output_rejects_schema_external_stop_reference() {
+        let mut settings = base_settings(LlmRoute::Responses);
+        settings.role = "trader".to_string();
+        settings.output_mode = OutputMode::JsonArtifact;
+
+        let text = r#"{
+            "action":"Buy",
+            "entry_price":null,
+            "stop_loss":null,
+            "position_size":"10%-20%",
+            "rationale":"Phase 3 candidate remains executable.",
+            "derived_stop_reference":"invented field"
+        }"#;
+        let error = super::parse_final_output(&settings, text).unwrap_err();
+        assert!(error.to_string().contains("derived_stop_reference"));
+    }
+
+    #[test]
+    fn parse_final_output_rejects_unstable_position_size_text() {
+        let mut settings = base_settings(LlmRoute::Responses);
+        settings.role = "trader".to_string();
+        settings.output_mode = OutputMode::JsonArtifact;
+
+        let text = r#"{
+            "action":"Buy",
+            "entry_price":null,
+            "stop_loss":null,
+            "position_size":"small observation position",
+            "rationale":"Not machine parseable."
+        }"#;
+        let error = super::parse_final_output(&settings, text).unwrap_err();
+        assert!(error.to_string().contains("percentage"));
     }
 
     #[test]
@@ -3220,12 +3284,17 @@ mod tests {
             let mut settings = base_settings(LlmRoute::Responses);
             settings.role = role.to_string();
             settings.output_mode = OutputMode::JsonArtifact;
+            let side = if role.contains("bull") {
+                "bull"
+            } else {
+                "bear"
+            };
             let packet = json!({
                 "role": role,
                 "artifact_type": artifact_type,
                 "topic_id": "qqq-trend",
                 "claims": [{
-                    "claim_id": "claim-1",
+                    "claim_id": format!("qqq-trend:{side}:1"),
                     "decision_hinge": "trend confirmation",
                     "claim": "directional claim",
                     "evidence_refs": ["phase1.5:qqq"],
@@ -3242,6 +3311,60 @@ mod tests {
             assert_eq!(artifact["role"], json!(role));
             assert_eq!(artifact["artifact_type"], json!(artifact_type));
         }
+    }
+
+    #[test]
+    fn parse_final_output_rejects_noncanonical_seed_claim_id() {
+        let mut settings = base_settings(LlmRoute::Responses);
+        settings.role = "researcher.bull.initial".to_string();
+        settings.output_mode = OutputMode::JsonArtifact;
+        let packet = json!({
+            "role": "researcher.bull.initial",
+            "artifact_type": "bull_seed_packet",
+            "topic_id": "qqq-trend",
+            "claims": [{
+                "claim_id": "free-form-id",
+                "decision_hinge": "trend confirmation",
+                "claim": "directional claim",
+                "evidence_refs": ["phase1:qqq"],
+                "confidence": 0.6,
+                "known_bear_constraint": "failed breakout",
+                "needs_mediator_check": true
+            }],
+            "summary": "one claim",
+            "reducer_checks": {}
+        });
+
+        let error = super::parse_final_output(&settings, &packet.to_string()).unwrap_err();
+        assert!(error.to_string().contains("<topic_id>:<side>:<sequence>"));
+    }
+
+    #[test]
+    fn interaction_packet_requires_split_reply_and_steer_ids() {
+        let mut settings = base_settings(LlmRoute::Responses);
+        settings.role = "researcher.bull.interaction".to_string();
+        settings.output_mode = OutputMode::JsonArtifact;
+        let packet = json!({
+            "role": "researcher.bull.interaction",
+            "artifact_type": "bull_debate_packet",
+            "topic_id": "qqq-trend",
+            "reply_to_claim_id": "qqq-trend:bear:1",
+            "steer_id": "qqq-trend:steer:2",
+            "stance": "rebut",
+            "claim": "The boundary is not met.",
+            "evidence_refs": ["phase1:qqq"],
+            "confidence": 0.6,
+            "send_to_mediator": "Validate the boundary.",
+            "blocked_ack": [],
+            "steelman": {"opponent_claim": "Breakdown", "why_plausible": "Weak breadth"}
+        });
+        super::parse_final_output(&settings, &packet.to_string()).unwrap();
+
+        let mut legacy = packet;
+        legacy.as_object_mut().unwrap().remove("reply_to_claim_id");
+        legacy["reply_to"] = json!("qqq-trend:bear:1");
+        let error = super::parse_final_output(&settings, &legacy.to_string()).unwrap_err();
+        assert!(error.to_string().contains("reply_to_claim_id"));
     }
 
     #[test]

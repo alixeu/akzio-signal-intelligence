@@ -4,9 +4,9 @@ use crate::{
     technical_store::{load_technical_series, technical_row_count},
     AGGREGATE_TICKER,
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use orchestrator_core::{latest_snapshot, MarketRegime, RetrievalBudget};
-use rusqlite::{params, params_from_iter, Connection, Row};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -621,7 +621,7 @@ fn collect_technical_blocks(
                 title: context_type.to_string(),
                 content,
                 weight: 1.5,
-                source_table: "technical_series".to_string(),
+                source_table: "technical_bars".to_string(),
                 item_json: snapshot,
             });
         }
@@ -692,7 +692,7 @@ fn date_str_to_timestamp(s: &str) -> i64 {
 
 fn latest_run_id(conn: &Connection) -> Result<String> {
     conn.query_row(
-        "SELECT run_id FROM runs ORDER BY current_date DESC, created_at DESC LIMIT 1",
+        "SELECT run_id FROM runs ORDER BY \"current_date\" DESC, created_at_ms DESC LIMIT 1",
         [],
         |row| row.get::<_, String>(0),
     )
@@ -774,18 +774,17 @@ pub fn messages_text(items: &[Value]) -> String {
 }
 
 pub fn session_history_items(conn: &Connection, run_id: &str, _limit: usize) -> Result<Vec<Value>> {
-    let full_context_json: String = conn
+    let turn_id = conn
         .query_row(
-            "SELECT full_context_json FROM agent_events WHERE run_id = ? ORDER BY turn_number DESC LIMIT 1",
+            "SELECT turn_id FROM agent_events WHERE run_id = ? ORDER BY turn_number DESC, id DESC LIMIT 1",
             params![run_id],
-            |row| row.get(0),
+            |row| row.get::<_, String>(0),
         )
-        .unwrap_or_default();
-    if full_context_json.is_empty() || full_context_json == "[]" {
-        return Ok(Vec::new());
+        .optional()?;
+    match turn_id {
+        Some(turn_id) => turn_history_items(conn, &turn_id),
+        None => Ok(Vec::new()),
     }
-    let messages: Vec<Value> = serde_json::from_str(&full_context_json).unwrap_or_default();
-    Ok(messages)
 }
 
 /// Load the full_context snapshot for a single agent-loop turn.
@@ -794,18 +793,83 @@ pub fn session_history_items(conn: &Connection, run_id: &str, _limit: usize) -> 
 /// sessions: multiple roles share one `run_id`, so run-scoped latest-row reload
 /// steals sibling history and drops role prompts / tool evidence.
 pub fn turn_history_items(conn: &Connection, turn_id: &str) -> Result<Vec<Value>> {
-    let full_context_json: String = conn
+    let target = conn
         .query_row(
-            "SELECT full_context_json FROM agent_events WHERE turn_id = ?",
+            "SELECT run_id, role, turn_number, id FROM agent_events WHERE turn_id = ?",
             params![turn_id],
-            |row| row.get(0),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
         )
-        .unwrap_or_default();
-    if full_context_json.is_empty() || full_context_json == "[]" {
+        .optional()?;
+    let Some((run_id, role, turn_number, id)) = target else {
         return Ok(Vec::new());
+    };
+    reconstruct_role_context(conn, &run_id, &role, turn_number, id)
+}
+
+pub(crate) fn latest_role_history_items(
+    conn: &Connection,
+    run_id: &str,
+    role: &str,
+    excluding_turn_id: Option<&str>,
+) -> Result<Vec<Value>> {
+    let target = conn
+        .query_row(
+            r#"
+            SELECT turn_number, id
+            FROM agent_events
+            WHERE run_id = ?1 AND role = ?2 AND (?3 IS NULL OR turn_id != ?3)
+            ORDER BY turn_number DESC, id DESC
+            LIMIT 1
+            "#,
+            params![run_id, role, excluding_turn_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()?;
+    match target {
+        Some((turn_number, id)) => reconstruct_role_context(conn, run_id, role, turn_number, id),
+        None => Ok(Vec::new()),
     }
-    let messages: Vec<Value> = serde_json::from_str(&full_context_json).unwrap_or_default();
-    Ok(messages)
+}
+
+fn reconstruct_role_context(
+    conn: &Connection,
+    run_id: &str,
+    role: &str,
+    target_turn_number: i64,
+    target_id: i64,
+) -> Result<Vec<Value>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT full_context_json, context_delta_json
+        FROM agent_events
+        WHERE run_id = ?1 AND role = ?2
+          AND (turn_number < ?3 OR (turn_number = ?3 AND id <= ?4))
+        ORDER BY turn_number ASC, id ASC
+        "#,
+    )?;
+    let rows = stmt.query_map(
+        params![run_id, role, target_turn_number, target_id],
+        |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?)),
+    )?;
+    let mut context = Vec::new();
+    for row in rows {
+        let (checkpoint, delta) = row?;
+        if let Some(checkpoint) = checkpoint {
+            context =
+                serde_json::from_str(&checkpoint).context("invalid agent context checkpoint")?;
+        }
+        let delta: Vec<Value> =
+            serde_json::from_str(&delta).context("invalid agent context delta")?;
+        context.extend(delta);
+    }
+    Ok(context)
 }
 
 pub fn handle_read_command(
@@ -949,7 +1013,7 @@ fn technical_context(conn: &Connection, tickers: &[String], ticker: Option<&str>
     let tickers = effective_technical_tickers(tickers, ticker);
     Ok(json!({
         "query": "get-technical-context",
-        "source": "sqlite.technical_series",
+        "source": "sqlite.technical_bars",
         "daily": technical_snapshots_from_db(conn, "daily", &tickers)?,
         "three_hour": technical_snapshots_from_db(conn, "3h", &tickers)?,
         "twenty_minute": technical_snapshots_from_db(conn, "20min", &tickers)?
@@ -965,7 +1029,7 @@ fn technical_interval_context(
     let tickers = effective_technical_tickers(tickers, ticker);
     Ok(json!({
         "query": interval,
-        "source": "sqlite.technical_series",
+        "source": "sqlite.technical_bars",
         "items": technical_snapshots_from_db(conn, interval, &tickers)?
     }))
 }

@@ -859,8 +859,8 @@ pub(crate) fn debate_topic_brief_from_state(
         if let Some(unverifiable) = controller_artifact.get("unverifiable_claims").cloned() {
             object.insert("unverifiable_claims".to_string(), unverifiable);
         }
-        if let Some(agenda) = controller_artifact.get("next_agenda").cloned() {
-            object.insert("next_agenda".to_string(), agenda);
+        if let Some(steers) = controller_artifact.get("next_steers").cloned() {
+            object.insert("next_steers".to_string(), steers);
         }
         object.insert("controller_artifact".to_string(), controller_artifact);
     }

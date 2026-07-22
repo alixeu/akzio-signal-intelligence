@@ -331,18 +331,6 @@ fn render_for_lint(
         .get("topic")
         .cloned()
         .unwrap_or(Value::Null);
-    let current_controller = current_topic_state
-        .get("controller_artifact")
-        .cloned()
-        .unwrap_or(Value::Null);
-    let blocked_repeats = current_controller
-        .get("blocked_repeats")
-        .cloned()
-        .unwrap_or_else(|| json!([]));
-    let next_agenda = current_controller
-        .get("next_agenda")
-        .cloned()
-        .unwrap_or_else(|| json!([]));
     let analyst_output_contract_template =
         common_component(prompt_path, "analyst_output_contract.md")?;
     let anti_injection_template = common_component(prompt_path, "anti_injection.md")?;
@@ -355,6 +343,7 @@ fn render_for_lint(
     let component_values = json!({
         "ticker": ticker,
         "tickers": tickers.join(","),
+        "role": role,
         "analyst_artifact_schema": analyst_artifact_schema(),
         "research_artifact_schema": research_artifact_schema(),
         "trade_intent_schema": trade_intent_schema(),
@@ -368,8 +357,11 @@ fn render_for_lint(
     let research_calibration =
         replace_placeholders(&research_calibration_template, &component_values);
     let research_drivers = replace_placeholders(&research_drivers_template, &component_values);
-    let leveraged_etf_rules =
-        replace_placeholders(&leveraged_etf_rules_template, &component_values);
+    let leveraged_etf_rules = if contains_leveraged_etf(&tickers) {
+        replace_placeholders(&leveraged_etf_rules_template, &component_values)
+    } else {
+        String::new()
+    };
     let analyst_output_structure =
         replace_placeholders(&analyst_output_structure_template, &component_values);
     let (side, side_label, opponent, opponent_label) = researcher_side_params(role);
@@ -411,8 +403,6 @@ fn render_for_lint(
         "round": round.unwrap_or_default(),
         "topic_id": topic_id.unwrap_or(""),
         "topic": serde_json::to_string_pretty(&current_topic)?,
-        "blocked_repeats": serde_json::to_string_pretty(&blocked_repeats)?,
-        "next_agenda": serde_json::to_string_pretty(&next_agenda)?,
         "analyst_reports": serde_json::to_string_pretty(&state.get("analyst_reports").cloned().unwrap_or(Value::Null))?,
         "research_plan": serde_json::to_string_pretty(&state.get("research_plan").cloned().unwrap_or(Value::Null))?,
         "trader_plan": serde_json::to_string_pretty(&state.get("trader_investment_plan").cloned().unwrap_or(Value::Null))?,
@@ -471,6 +461,15 @@ fn tickers_from_state(state: &Value) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn contains_leveraged_etf(tickers: &[String]) -> bool {
+    tickers.iter().any(|ticker| {
+        matches!(
+            ticker.trim().to_ascii_uppercase().as_str(),
+            "TQQQ" | "SQQQ" | "SOXL" | "SOXS" | "UPRO" | "SPXU"
+        )
+    })
 }
 
 fn topic_state(state: &Value, topic_id: &str) -> Option<Value> {

@@ -54,6 +54,42 @@ enum OpsCommand {
         #[arg(long, default_value_t = 0.6)]
         min_confidence: f64,
     },
+    /// Read-only SQLite health, density, integrity, and query-plan report
+    DbDoctor {
+        #[arg(long)]
+        db_path: Option<PathBuf>,
+    },
+    /// Apply or preview configurable SQLite retention policies
+    DbCleanup {
+        #[arg(long)]
+        db_path: Option<PathBuf>,
+        #[arg(long, default_value_t = true)]
+        dry_run: bool,
+        #[arg(long, default_value_t = 30)]
+        context_checkpoint_days: i64,
+        #[arg(long, default_value_t = 30)]
+        jin10_unreferenced_days: i64,
+        #[arg(long)]
+        attention_ledger_days: Option<i64>,
+        #[arg(long)]
+        debug_agent_events_days: Option<i64>,
+        #[arg(long, default_value_t = 90)]
+        technical_bar_days: i64,
+        #[arg(long)]
+        optimize: bool,
+    },
+    /// Explicitly checkpoint the SQLite WAL
+    DbCheckpoint {
+        #[arg(long)]
+        db_path: Option<PathBuf>,
+        #[arg(long)]
+        truncate: bool,
+    },
+    /// Explicitly rebuild the SQLite file with VACUUM
+    DbVacuum {
+        #[arg(long)]
+        db_path: Option<PathBuf>,
+    },
     /// Probe LLM gateway strict-schema support
     ProbeStrictSchema,
 }
@@ -122,6 +158,49 @@ async fn main() -> Result<()> {
                 },
             )?;
             println!("{}", serde_json::to_string_pretty(&summary)?);
+        }
+        OpsCommand::DbDoctor { db_path } => {
+            let db_path = resolve_db_path(db_path);
+            let conn = orchestrator_sql::open_read_only(&db_path)?;
+            let report = orchestrator_sql::database_doctor(&conn)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        OpsCommand::DbCleanup {
+            db_path,
+            dry_run,
+            context_checkpoint_days,
+            jin10_unreferenced_days,
+            attention_ledger_days,
+            debug_agent_events_days,
+            technical_bar_days,
+            optimize,
+        } => {
+            let db_path = resolve_db_path(db_path);
+            let conn = orchestrator_sql::connect(&db_path)?;
+            let policy = orchestrator_sql::RetentionPolicy {
+                context_checkpoint_days,
+                jin10_unreferenced_days,
+                attention_ledger_days,
+                debug_agent_events_days,
+                technical_bar_days,
+            };
+            let report = orchestrator_sql::cleanup_database(&conn, &policy, dry_run, optimize)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        OpsCommand::DbCheckpoint { db_path, truncate } => {
+            let db_path = resolve_db_path(db_path);
+            let conn = orchestrator_sql::connect(&db_path)?;
+            let report = orchestrator_sql::wal_checkpoint(&conn, truncate)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        OpsCommand::DbVacuum { db_path } => {
+            let db_path = resolve_db_path(db_path);
+            let conn = orchestrator_sql::connect(&db_path)?;
+            orchestrator_sql::vacuum(&conn)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({"vacuum": "completed"}))?
+            );
         }
         OpsCommand::ProbeStrictSchema => {
             run_probe_strict_schema().await?;

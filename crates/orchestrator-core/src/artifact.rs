@@ -132,6 +132,9 @@ pub struct RiskConstraints {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 pub struct FinalValidation {
     pub rating: String,
+    /// execute | wait | downgrade
+    #[serde(default)]
+    pub execution_status: String,
     #[serde(default)]
     pub execution_summary: String,
     #[serde(default)]
@@ -664,6 +667,61 @@ pub fn normalize_probability(value: &Value) -> Option<f64> {
     }
 }
 
+/// Deterministic five-level research rating derived from long probability.
+/// Prompt text may explain the semantics, but Rust owns this mapping.
+pub fn research_rating_for_probability(long_probability: f64) -> &'static str {
+    if long_probability >= 0.68 {
+        "Buy"
+    } else if long_probability >= 0.56 {
+        "Overweight"
+    } else if long_probability >= 0.45 {
+        "Hold"
+    } else if long_probability >= 0.33 {
+        "Underweight"
+    } else {
+        "Sell"
+    }
+}
+
+fn normalize_research_decision_fields(object: &mut Map<String, Value>) {
+    let Some(long_probability) = object
+        .get("long_probability")
+        .and_then(normalize_probability)
+    else {
+        return;
+    };
+    let rating = research_rating_for_probability(long_probability);
+    object.insert("long_probability".to_string(), json!(long_probability));
+    object.insert(
+        "short_probability".to_string(),
+        json!(((1.0 - long_probability) * 10_000.0).round() / 10_000.0),
+    );
+    object.insert("final_probability".to_string(), json!(long_probability));
+    object.insert("rating".to_string(), json!(rating));
+
+    if rating == "Hold" {
+        let confidence_basis = object
+            .get("confidence_basis")
+            .and_then(Value::as_str)
+            .filter(|value| {
+                matches!(
+                    *value,
+                    "evidence_balanced" | "data_insufficient" | "conflicting_evidence"
+                )
+            })
+            .unwrap_or("evidence_balanced");
+        let hold_reason = match confidence_basis {
+            "data_insufficient" => "evidence_insufficient",
+            "conflicting_evidence" => "conflicting_evidence",
+            _ => "evidence_balanced",
+        };
+        object.insert("confidence_basis".to_string(), json!(confidence_basis));
+        object.insert("hold_reason".to_string(), json!(hold_reason));
+    } else {
+        object.remove("hold_reason");
+    }
+}
+
 pub fn extract_json_artifact(text: &str) -> Result<Value> {
     const START: &str = "=== ARTIFACT_JSON_START ===";
     const END: &str = "=== ARTIFACT_JSON_END ===";
@@ -690,6 +748,19 @@ pub fn normalize_research_artifact_value(mut value: Value, tickers: &[String]) -
     let obj = value
         .as_object_mut()
         .ok_or_else(|| anyhow!("research artifact must be a JSON object"))?;
+
+    if let Some(per_ticker) = obj.get_mut("per_ticker").and_then(Value::as_object_mut) {
+        for payload in per_ticker.values_mut() {
+            if let Some(payload) = payload.as_object_mut() {
+                if let Some(plan) = payload.get("plan").cloned() {
+                    if let Some(text) = coerce_plan_to_string(&plan) {
+                        payload.insert("plan".to_string(), Value::String(text));
+                    }
+                }
+                normalize_research_decision_fields(payload);
+            }
+        }
+    }
 
     if let Some(plan) = obj.get("plan").cloned() {
         if let Some(text) = coerce_plan_to_string(&plan) {
@@ -817,6 +888,8 @@ pub fn normalize_research_artifact_value(mut value: Value, tickers: &[String]) -
         }
     }
 
+    normalize_research_decision_fields(obj);
+
     Ok(value)
 }
 
@@ -879,6 +952,13 @@ pub fn validate_research_artifact(
         return Err(ValidationError::InvalidConfidenceBasis(
             artifact.confidence_basis.clone(),
         ));
+    }
+    let expected_rating = research_rating_for_probability(artifact.long_probability);
+    if artifact.rating != expected_rating {
+        return Err(ValidationError::InvalidResearchField(format!(
+            "rating {:?} does not match Rust mapping {:?} for long_probability {}",
+            artifact.rating, expected_rating, artifact.long_probability
+        )));
     }
     if artifact.rating.eq_ignore_ascii_case("hold") {
         let expected_hold_reason = match artifact.confidence_basis.as_str() {
@@ -997,6 +1077,15 @@ pub fn validate_research_artifact(
                 ticker: ticker.clone(),
                 reason: "short_probability must be a number in 0..1".to_string(),
             })?;
+        let expected_rating = research_rating_for_probability(long);
+        if rating != expected_rating {
+            return Err(ValidationError::InvalidResearchTicker {
+                ticker: ticker.clone(),
+                reason: format!(
+                    "rating {rating:?} does not match Rust mapping {expected_rating:?} for long_probability {long}"
+                ),
+            });
+        }
         if (long + short - 1.0).abs() > 0.03 {
             return Err(ValidationError::InvalidResearchTicker {
                 ticker: ticker.clone(),
@@ -1510,11 +1599,11 @@ mod tests {
 
     fn research_artifact_with_scenarios(scenarios: Option<Scenarios>) -> ResearchArtifact {
         ResearchArtifact {
-            rating: "Hold".to_string(),
+            rating: "Overweight".to_string(),
             long_probability: 0.575,
             short_probability: 0.425,
-            confidence_basis: "evidence_balanced".to_string(),
-            hold_reason: Some("evidence_balanced".to_string()),
+            confidence_basis: "directional_evidence".to_string(),
+            hold_reason: None,
             plan: "Monitor validation triggers.".to_string(),
             probability_rationale: "Evidence is balanced near the base probability.".to_string(),
             scenarios,
@@ -1582,6 +1671,7 @@ mod tests {
     #[test]
     fn inconsistent_long_probability_is_rejected() {
         let artifact = ResearchArtifact {
+            rating: "Buy".to_string(),
             long_probability: 0.7,
             short_probability: 0.3,
             ..research_artifact_with_scenarios(Some(Scenarios {
@@ -1627,6 +1717,10 @@ mod tests {
     #[test]
     fn hold_research_artifact_requires_a_hold_reason() {
         let mut artifact = research_artifact_with_scenarios(None);
+        artifact.rating = "Hold".to_string();
+        artifact.long_probability = 0.5;
+        artifact.short_probability = 0.5;
+        artifact.confidence_basis = "evidence_balanced".to_string();
         artifact.hold_reason = None;
 
         assert!(matches!(
@@ -1798,6 +1892,50 @@ mod tests {
     }
 
     #[test]
+    fn rust_owns_research_rating_mapping_and_probability_complement() {
+        for (probability, rating) in [
+            (0.68, "Buy"),
+            (0.56, "Overweight"),
+            (0.50, "Hold"),
+            (0.33, "Underweight"),
+            (0.32, "Sell"),
+        ] {
+            assert_eq!(research_rating_for_probability(probability), rating);
+        }
+
+        let value = json!({
+            "rating": "Sell",
+            "long_probability": 0.61,
+            "short_probability": 0.61,
+            "confidence_basis": "directional_evidence",
+            "plan": "Watch the hinge.",
+            "probability_rationale": "Directional evidence remains.",
+            "per_ticker": {
+                "QQQ": {
+                    "rating": "Sell",
+                    "long_probability": 0.61,
+                    "short_probability": 0.61,
+                    "confidence_basis": "directional_evidence",
+                    "plan": "Watch the hinge.",
+                    "probability_rationale": "Directional evidence remains."
+                }
+            }
+        });
+        let normalized = normalize_research_artifact_value(value, &["QQQ".to_string()]).unwrap();
+        assert_eq!(normalized["rating"], "Overweight");
+        assert_eq!(normalized["per_ticker"]["QQQ"]["rating"], "Overweight");
+        assert!((normalized["short_probability"].as_f64().unwrap() - 0.39).abs() < 1e-9);
+        assert!(
+            (normalized["per_ticker"]["QQQ"]["short_probability"]
+                .as_f64()
+                .unwrap()
+                - 0.39)
+                .abs()
+                < 1e-9
+        );
+    }
+
+    #[test]
     fn downstream_contract_schemas_list_machine_fields() {
         for (schema, fields) in [
             (
@@ -1810,7 +1948,12 @@ mod tests {
             ),
             (
                 final_validation_schema(),
-                vec!["rating", "execution_summary", "risk_controls"],
+                vec![
+                    "rating",
+                    "execution_status",
+                    "execution_summary",
+                    "risk_controls",
+                ],
             ),
             (
                 portfolio_allocation_schema(),

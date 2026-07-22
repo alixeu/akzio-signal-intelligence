@@ -1,13 +1,18 @@
-use anyhow::Result;
+use crate::schema::{ensure_run_exists, now_ms};
+use anyhow::{bail, Result};
 use rusqlite::{params, Connection};
-use serde_json::{json, Value};
+use serde_json::Value;
+use uuid::Uuid;
+
+#[cfg(test)]
+use serde_json::json;
 
 /// Import Jin10 flash items into the dedicated `jin10_items` table.
 ///
 /// - `id` = md5(time + "\n" + content)
-/// - `content_json` = compact JSON payload passed to the LLM (`{id,time,content}`)
-/// - `attention_score` is preserved across re-imports (0.0-1.0 LLM attention)
-/// - `item_time` / `imported_at` are unix timestamps
+///
+/// Fixed fields are stored as columns; only non-fixed source fields are kept in
+/// `metadata_json`. The latest attention cache is preserved across re-imports.
 pub fn import_jin10_payload(conn: &mut Connection, payload: &Value) -> Result<usize> {
     let items = payload
         .get("items")
@@ -15,7 +20,21 @@ pub fn import_jin10_payload(conn: &mut Connection, payload: &Value) -> Result<us
         .cloned()
         .unwrap_or_default();
     let tx = conn.transaction()?;
-    let imported_at = chrono::Utc::now().timestamp();
+    let imported_at_ms = now_ms();
+    let mut insert = tx.prepare_cached(
+        r#"
+        INSERT INTO jin10_items
+            (id,content,time_raw,item_time_ms,latest_attention_score,imported_at_ms,
+             metadata_json,legacy_attention)
+        VALUES (?1,?2,?3,?4,0.0,?5,?6,0)
+        ON CONFLICT(id) DO UPDATE SET
+            content=excluded.content,
+            time_raw=excluded.time_raw,
+            item_time_ms=excluded.item_time_ms,
+            imported_at_ms=excluded.imported_at_ms,
+            metadata_json=excluded.metadata_json
+        "#,
+    )?;
     let mut count = 0;
     for item in items {
         let item_time_str = item.get("time").and_then(Value::as_str).unwrap_or_default();
@@ -26,27 +45,22 @@ pub fn import_jin10_payload(conn: &mut Connection, payload: &Value) -> Result<us
         if item_time_str.is_empty() || content.is_empty() {
             continue;
         }
-        let item_time = parse_jin10_time(item_time_str);
+        let item_time_ms = parse_jin10_time_ms(item_time_str);
         let id = jin10_item_id(item_time_str, content);
-        let content_json = serde_json::to_string(&json!({
-            "id": id,
-            "time": item_time,
-            "time_raw": item_time_str,
-            "content": content,
-        }))?;
-        tx.execute(
-            r#"
-            INSERT INTO jin10_items (id, content_json, attention_score, item_time, imported_at)
-            VALUES (?1, ?2, 0.0, ?3, ?4)
-            ON CONFLICT(id) DO UPDATE SET
-                content_json = excluded.content_json,
-                item_time = excluded.item_time,
-                imported_at = excluded.imported_at
-            "#,
-            params![id, content_json, item_time, imported_at],
-        )?;
+        let mut metadata = item.as_object().cloned().unwrap_or_default();
+        metadata.remove("time");
+        metadata.remove("content");
+        insert.execute(params![
+            id,
+            content,
+            item_time_str,
+            item_time_ms,
+            imported_at_ms,
+            serde_json::to_string(&metadata)?,
+        ])?;
         count += 1;
     }
+    drop(insert);
     tx.commit()?;
     Ok(count)
 }
@@ -57,29 +71,38 @@ pub fn import_scored_jin10_items(
     conn: &Connection,
     items: &[orchestrator_core::Jin10CsvRow],
 ) -> Result<usize> {
-    let imported_at = chrono::Utc::now().timestamp();
+    let tx = conn.unchecked_transaction()?;
+    let imported_at_ms = now_ms();
+    let mut insert = tx.prepare_cached(
+        r#"
+        INSERT INTO jin10_items
+            (id,content,time_raw,item_time_ms,latest_attention_score,imported_at_ms,
+             metadata_json,legacy_attention)
+        VALUES (?1,?2,?3,?4,0.0,?5,'{}',0)
+        ON CONFLICT(id) DO UPDATE SET
+            content=excluded.content,
+            time_raw=excluded.time_raw,
+            item_time_ms=excluded.item_time_ms,
+            imported_at_ms=excluded.imported_at_ms
+        "#,
+    )?;
     let mut count = 0;
     for item in items {
         if item.id.is_empty() || item.content.is_empty() {
             continue;
         }
-        let item_time = parse_jin10_time(&item.time);
-        let content_json = serde_json::to_string(&json!({
-            "id": item.id,
-            "time": item_time,
-            "time_raw": item.time,
-            "content": item.content,
-        }))?;
-        conn.execute(
-            r#"
-            INSERT INTO jin10_items (id, content_json, attention_score, item_time, imported_at)
-            VALUES (?1, ?2, 0.0, ?3, ?4)
-            ON CONFLICT(id) DO NOTHING
-            "#,
-            params![item.id, content_json, item_time, imported_at],
-        )?;
+        let item_time_ms = parse_jin10_time_ms(&item.time);
+        insert.execute(params![
+            item.id,
+            item.content,
+            item.time,
+            item_time_ms,
+            imported_at_ms
+        ])?;
         count += 1;
     }
+    drop(insert);
+    tx.commit()?;
     Ok(count)
 }
 
@@ -107,8 +130,26 @@ pub fn record_jin10_attention_for_turn(
     phase: Option<i64>,
     items: &[Jin10Attention],
 ) -> Result<usize> {
-    use crate::phase_index::{record_attention, AttentionEvent};
     let mut seen = std::collections::BTreeSet::new();
+    let tx = conn.unchecked_transaction()?;
+    if !run_id.is_empty() {
+        ensure_run_exists(
+            &tx,
+            run_id,
+            &chrono::Utc::now()
+                .date_naive()
+                .format("%Y-%m-%d")
+                .to_string(),
+        )?;
+    }
+    let mut insert_ledger = tx.prepare_cached(
+        r#"INSERT INTO attention_ledger
+           (id,run_id,turn_id,role,subject_kind,subject_id,score,phase,created_at_ms)
+           VALUES (?1,?2,NULLIF(?3,''),?4,'jin10',?5,?6,?7,?8)"#,
+    )?;
+    let mut update_cache = tx.prepare_cached(
+        "UPDATE jin10_items SET latest_attention_score=?1, legacy_attention=?2 WHERE id=?3",
+    )?;
     let mut updated = 0usize;
     for item in items {
         let id = item.id.trim();
@@ -117,26 +158,29 @@ pub fn record_jin10_attention_for_turn(
         }
         let score = item.score.clamp(0.0, 1.0);
         if !run_id.is_empty() {
-            record_attention(
-                conn,
-                &AttentionEvent {
-                    run_id: run_id.to_string(),
-                    turn_id: turn_id.to_string(),
-                    role: role.to_string(),
-                    subject_kind: "jin10".to_string(),
-                    subject_id: id.to_string(),
-                    score,
-                    phase,
-                },
-            )?;
+            if update_cache.execute(params![score, 0, id])? != 1 {
+                bail!("cannot record attention for missing Jin10 item {id}");
+            }
+            insert_ledger.execute(params![
+                Uuid::new_v4().to_string(),
+                run_id,
+                turn_id,
+                role,
+                id,
+                score,
+                phase,
+                now_ms(),
+            ])?;
         } else {
-            let _ = conn.execute(
-                "UPDATE jin10_items SET attention_score = ?1 WHERE id = ?2",
-                params![score, id],
-            )?;
+            if update_cache.execute(params![score, 1, id])? != 1 {
+                bail!("cannot record legacy attention for missing Jin10 item {id}");
+            }
         }
         updated += 1;
     }
+    drop(insert_ledger);
+    drop(update_cache);
+    tx.commit()?;
     Ok(updated)
 }
 
@@ -145,12 +189,12 @@ pub fn jin10_item_id(time_raw: &str, content: &str) -> String {
     orchestrator_core::jin10_item_id(time_raw, content)
 }
 
-fn parse_jin10_time(s: &str) -> i64 {
+fn parse_jin10_time_ms(s: &str) -> i64 {
     chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
         .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S"))
         .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f"))
         .ok()
-        .and_then(|dt| dt.and_utc().timestamp().into())
+        .map(|dt| dt.and_utc().timestamp_millis())
         .unwrap_or(0)
 }
 

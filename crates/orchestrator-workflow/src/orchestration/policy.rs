@@ -372,6 +372,7 @@ pub(crate) async fn run_technical_csv_preflight(
         intervals: String::new(),
         timeout: None,
         sleep: None,
+        parallelism: None,
     })
     .await
     .and_then(|ingest| {
@@ -407,7 +408,7 @@ fn import_technical_universe(conn: &mut rusqlite::Connection, state: &Value) -> 
         }
     }
     Ok(json!({
-        "table": "technical_series",
+        "table": "technical_bars",
         "series": series,
         "rows": rows
     }))

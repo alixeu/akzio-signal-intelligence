@@ -1322,6 +1322,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "futures",
  "orchestrator-core",
  "reqwest",
  "serde",

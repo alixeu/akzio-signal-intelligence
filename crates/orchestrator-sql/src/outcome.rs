@@ -1,5 +1,5 @@
+use crate::schema::now_ms;
 use anyhow::Result;
-use orchestrator_core::{close_on_or_after, close_on_or_before};
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 
@@ -19,23 +19,51 @@ pub struct OutcomeInput {
 }
 
 pub fn upsert_outcome(conn: &Connection, input: &OutcomeInput) -> Result<i64> {
-    let now = chrono::Utc::now().timestamp();
+    let prediction = conn.query_row(
+        "SELECT run_id,ticker,prediction_date,window_days FROM predictions WHERE id=?1",
+        params![input.prediction_id],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        },
+    )?;
+    if prediction
+        != (
+            input.run_id.clone(),
+            input.ticker.clone(),
+            input.prediction_date.clone(),
+            input.window_days,
+        )
+    {
+        anyhow::bail!(
+            "outcome audit snapshot does not match prediction {}",
+            input.prediction_id
+        );
+    }
     conn.execute(
         r#"
         INSERT INTO outcomes
-            (prediction_id, run_id, ticker, prediction_date, outcome_date, window_days,
+            (prediction_id, run_id_snapshot, ticker_snapshot, prediction_date_snapshot,
+             outcome_date, window_days_snapshot,
              baseline_close, outcome_close, actual_return, direction_correct, probability_error,
-             scored_at)
+             scored_at_ms)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(prediction_id) DO UPDATE SET
             outcome_date = excluded.outcome_date,
-            window_days = excluded.window_days,
+            run_id_snapshot = excluded.run_id_snapshot,
+            ticker_snapshot = excluded.ticker_snapshot,
+            prediction_date_snapshot = excluded.prediction_date_snapshot,
+            window_days_snapshot = excluded.window_days_snapshot,
             baseline_close = excluded.baseline_close,
             outcome_close = excluded.outcome_close,
             actual_return = excluded.actual_return,
             direction_correct = excluded.direction_correct,
             probability_error = excluded.probability_error,
-            scored_at = excluded.scored_at
+            scored_at_ms = excluded.scored_at_ms
         "#,
         params![
             input.prediction_id,
@@ -49,7 +77,7 @@ pub fn upsert_outcome(conn: &Connection, input: &OutcomeInput) -> Result<i64> {
             input.actual_return,
             input.direction_correct as i64,
             input.probability_error,
-            now,
+            now_ms(),
         ],
     )?;
     let outcome_id = conn.query_row(
@@ -65,7 +93,7 @@ pub fn track_record(conn: &Connection, ticker: Option<&str>) -> Result<Value> {
     let (sql, params): (&str, Vec<String>) = if let Some(ticker) = ticker.filter(|v| !v.is_empty())
     {
         (
-            "SELECT COUNT(*), COALESCE(AVG(direction_correct), 0), COALESCE(AVG(probability_error * probability_error), 0), COALESCE(AVG(probability_error), 0) FROM outcomes WHERE ticker = ?",
+            "SELECT COUNT(*), COALESCE(AVG(direction_correct), 0), COALESCE(AVG(probability_error * probability_error), 0), COALESCE(AVG(probability_error), 0) FROM outcomes WHERE ticker_snapshot = ?",
             vec![ticker.to_string()],
         )
     } else {
@@ -91,8 +119,7 @@ pub fn latest_close_on_or_before(
     date: &str,
     interval: &str,
 ) -> Result<Option<(String, f64)>> {
-    let rows = crate::technical_store::load_technical_series(conn, ticker, interval)?;
-    Ok(close_on_or_before(&rows, date))
+    crate::technical_store::close_on_or_before(conn, ticker, interval, date)
 }
 
 pub fn earliest_close_on_or_after(
@@ -101,8 +128,7 @@ pub fn earliest_close_on_or_after(
     date: &str,
     interval: &str,
 ) -> Result<Option<(String, f64)>> {
-    let rows = crate::technical_store::load_technical_series(conn, ticker, interval)?;
-    Ok(close_on_or_after(&rows, date))
+    crate::technical_store::close_on_or_after(conn, ticker, interval, date)
 }
 
 #[cfg(test)]

@@ -15,10 +15,11 @@ pub use artifact::{
     analyst_artifact_schema, evidence_item_from_value, extract_json_artifact,
     final_validation_schema, normalize_analyst_ticker_artifact, normalize_evidence_type,
     normalize_probability, normalize_research_artifact_value, portfolio_allocation_schema,
-    research_artifact_schema, risk_constraints_schema, schema_for, trade_intent_schema,
-    validate_analyst_ticker_artifact, validate_evidence_types, validate_research_artifact,
-    validate_risk_constraints, AnalystTickerArtifact, FinalValidation, PortfolioAllocation,
-    ResearchArtifact, RiskConstraints, TradeIntent, ValidationError, CANONICAL_EVIDENCE_TYPES,
+    research_artifact_schema, research_rating_for_probability, risk_constraints_schema, schema_for,
+    trade_intent_schema, validate_analyst_ticker_artifact, validate_evidence_types,
+    validate_research_artifact, validate_risk_constraints, AnalystTickerArtifact, FinalValidation,
+    PortfolioAllocation, ResearchArtifact, RiskConstraints, TradeIntent, ValidationError,
+    CANONICAL_EVIDENCE_TYPES,
 };
 pub use config::{
     config_bool, config_float, config_get, config_int, config_str, config_strings, deep_merge,

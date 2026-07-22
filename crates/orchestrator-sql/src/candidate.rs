@@ -1,3 +1,4 @@
+use crate::schema::now_ms;
 use anyhow::Result;
 use rusqlite::{params, Connection};
 use serde_json::Value;
@@ -48,14 +49,15 @@ pub fn insert_candidate_experience(
     conn: &Connection,
     input: &CandidateExperienceInput,
 ) -> Result<i64> {
-    let now = chrono::Utc::now().timestamp();
+    let now = now_ms();
     conn.execute(
         r#"
         INSERT INTO candidate_experiences
             (scope, scope_value, experience_type, market_regime_json, finding, recommendation,
              evidence_json, counter_evidence_json, metrics_json, sample_count, sample_run_ids_json,
-             confidence, effect_size, distiller_version, reflection_version, source_window, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             confidence, effect_size, distiller_version, reflection_version, source_window,
+             review_status,reviewed_at_ms,review_reason,created_at_ms)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending',NULL,NULL,?)
         "#,
         params![
             input.scope,
@@ -108,10 +110,10 @@ pub fn update_candidate_status(
     conn.execute(
         r#"
         UPDATE candidate_experiences
-        SET review_status = ?, reviewed_at = ?, review_reason = ?
+        SET review_status = ?, reviewed_at_ms = ?, review_reason = ?
         WHERE id = ?
         "#,
-        params![status, chrono::Utc::now().timestamp(), reason, id],
+        params![status, now_ms(), reason, id],
     )?;
     Ok(())
 }

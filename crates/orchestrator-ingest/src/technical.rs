@@ -1,6 +1,7 @@
 use anyhow::{bail, Context, Result};
 use chrono::{Datelike, Duration, NaiveDate, Utc, Weekday};
 use clap::Args;
+use futures::{stream, StreamExt};
 use orchestrator_core::{
     config_int, config_str, config_strings, default_technical_csv_dir, parse_tickers,
     read_technical_csv, technical_csv_path, write_technical_csv, TechnicalCsvRow,
@@ -9,7 +10,7 @@ use orchestrator_core::{
 use reqwest::header;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::{collections::HashMap, sync::Arc, time::Duration as StdDuration};
+use std::{collections::HashMap, path::Path, sync::Arc, time::Duration as StdDuration};
 use tokio::sync::Mutex;
 
 const EPS: f64 = 1e-12;
@@ -185,6 +186,9 @@ pub struct TechnicalArgs {
     pub timeout: Option<f64>,
     #[arg(long)]
     pub sleep: Option<f64>,
+    /// Maximum number of independent ticker/interval downloads in flight.
+    #[arg(long)]
+    pub parallelism: Option<usize>,
 }
 
 pub async fn run(args: TechnicalArgs) -> Result<Value> {
@@ -192,97 +196,74 @@ pub async fn run(args: TechnicalArgs) -> Result<Value> {
     let source = YahooDataSource::new(args.timeout)?;
     let csv_dir = default_technical_csv_dir();
     let mut results = Vec::new();
-    let mut failures = Vec::new();
+    let mut jobs = Vec::new();
+    let mut order = 0usize;
     for symbol in &args.symbols {
         for interval in &args.intervals {
+            let job_order = order;
+            order += 1;
             if has_fresh_csv(&csv_dir, symbol, interval, args.start, args.end) {
-                results.push(json!({
-                    "symbol": symbol,
-                    "interval": interval,
-                    "bars": 0,
-                    "feature_rows": 0,
-                    "skipped": "existing_csv"
-                }));
-                continue;
-            }
-            if !results.is_empty() && args.sleep > 0.0 {
-                tokio::time::sleep(StdDuration::from_secs_f64(args.sleep)).await;
-            }
-            let bars = match interval.as_str() {
-                "1d" => source.fetch_daily_bars(symbol, args.start, args.end).await,
-                "3h" => source
-                    .fetch_bars(symbol, args.start, args.end, "1h")
-                    .await
-                    .map(|bars| resample_bars(bars, "3h", 3)),
-                "20min" => source
-                    .fetch_bars(symbol, args.start, args.end, "5m")
-                    .await
-                    .map(|bars| resample_bars(bars, "20min", 4)),
-                other => Err(anyhow::anyhow!(
-                    "unsupported interval {other:?}; use 1d, 3h, 20min"
-                )),
-            };
-            let bars = match bars {
-                Ok(bars) => bars,
-                Err(error) => {
-                    failures.push(format!("{symbol}/{interval}: {error:#}"));
-                    results.push(json!({
+                results.push((
+                    job_order,
+                    json!({
                         "symbol": symbol,
                         "interval": interval,
                         "bars": 0,
                         "feature_rows": 0,
-                        "status": "error",
-                        "error": error.to_string(),
-                    }));
-                    continue;
-                }
-            };
-            let rows = feature_rows(interval, &bars);
-            let mut rows = rows;
-            let keep = DEFAULT_TECHNICAL_BARS;
-            if rows.len() > keep {
-                rows = rows.split_off(rows.len() - keep);
-            }
-            let csv_rows: Vec<TechnicalCsvRow> = rows
-                .iter()
-                .map(|row| TechnicalCsvRow {
-                    date: row.date.clone(),
-                    values: row
-                        .features
-                        .iter()
-                        .filter_map(|(k, v)| v.filter(|v| v.is_finite()).map(|v| (k.clone(), v)))
-                        .collect(),
-                })
-                .filter(|row| !row.values.is_empty())
-                .collect();
-            if csv_rows.is_empty() {
-                failures.push(format!(
-                    "{symbol}/{interval}: Yahoo returned no usable finite feature rows"
+                        "skipped": "existing_csv"
+                    }),
                 ));
-                results.push(json!({
-                    "symbol": symbol,
-                    "interval": interval,
-                    "bars": bars.len(),
-                    "feature_rows": 0,
-                    "status": "error",
-                    "error": "Yahoo returned no usable finite feature rows",
-                }));
-                continue;
+            } else {
+                jobs.push((job_order, symbol.clone(), interval.clone()));
             }
-            if let Some(csv_path) = technical_csv_path(&csv_dir, symbol, interval) {
-                write_technical_csv(&csv_path, &csv_rows).with_context(|| {
-                    format!(
-                        "failed to persist Yahoo technical data for {symbol}/{interval} to {}",
-                        csv_path.display()
-                    )
-                })?;
+        }
+    }
+
+    if jobs
+        .iter()
+        .any(|(_, _, interval)| matches!(interval.as_str(), "1d" | "3h" | "20min"))
+    {
+        // Prime the shared session once before concurrent chart requests so all
+        // jobs use the same cookie/crumb pair.
+        source.ensure_crumb().await?;
+    }
+    let mut failures = Vec::new();
+    for (batch_index, batch) in jobs.chunks(args.parallelism).enumerate() {
+        if batch_index > 0 && args.sleep > 0.0 {
+            tokio::time::sleep(StdDuration::from_secs_f64(args.sleep)).await;
+        }
+        let completed = stream::iter(batch.iter().cloned().map(|(job_order, symbol, interval)| {
+            let source = source.clone();
+            let csv_dir = csv_dir.clone();
+            async move {
+                let result = download_technical_csv(
+                    &source, &csv_dir, &symbol, &interval, args.start, args.end,
+                )
+                .await;
+                (job_order, symbol, interval, result)
             }
-            results.push(json!({
-                "symbol": symbol,
-                "interval": interval,
-                "bars": bars.len(),
-                "feature_rows": csv_rows.len(),
-            }));
+        }))
+        .buffer_unordered(args.parallelism)
+        .collect::<Vec<_>>()
+        .await;
+        for (job_order, symbol, interval, result) in completed {
+            match result {
+                Ok(result) => results.push((job_order, result)),
+                Err(error) => {
+                    failures.push(format!("{symbol}/{interval}: {error:#}"));
+                    results.push((
+                        job_order,
+                        json!({
+                            "symbol": symbol,
+                            "interval": interval,
+                            "bars": 0,
+                            "feature_rows": 0,
+                            "status": "error",
+                            "error": error.to_string(),
+                        }),
+                    ));
+                }
+            }
         }
     }
     if !failures.is_empty() {
@@ -291,6 +272,7 @@ pub async fn run(args: TechnicalArgs) -> Result<Value> {
             failures.join("; ")
         );
     }
+    results.sort_by_key(|(job_order, _)| *job_order);
     Ok(json!({
         "status": "success",
         "source": "Yahoo",
@@ -300,7 +282,66 @@ pub async fn run(args: TechnicalArgs) -> Result<Value> {
         "bars": DEFAULT_TECHNICAL_BARS,
         "symbols": args.symbols,
         "intervals": args.intervals,
-        "results": results
+        "results": results.into_iter().map(|(_, result)| result).collect::<Vec<_>>(),
+        "parallelism": args.parallelism
+    }))
+}
+
+async fn download_technical_csv(
+    source: &YahooDataSource,
+    csv_dir: &Path,
+    symbol: &str,
+    interval: &str,
+    start: NaiveDate,
+    end: NaiveDate,
+) -> Result<Value> {
+    let bars = match interval {
+        "1d" => source.fetch_daily_bars(symbol, start, end).await,
+        "3h" => source
+            .fetch_bars(symbol, start, end, "1h")
+            .await
+            .map(|bars| resample_bars(bars, "3h", 3)),
+        "20min" => source
+            .fetch_bars(symbol, start, end, "5m")
+            .await
+            .map(|bars| resample_bars(bars, "20min", 4)),
+        other => Err(anyhow::anyhow!(
+            "unsupported interval {other:?}; use 1d, 3h, 20min"
+        )),
+    }?;
+    let bars_len = bars.len();
+    let mut rows = feature_rows(interval, &bars);
+    if rows.len() > DEFAULT_TECHNICAL_BARS {
+        rows = rows.split_off(rows.len() - DEFAULT_TECHNICAL_BARS);
+    }
+    let csv_rows: Vec<TechnicalCsvRow> = rows
+        .iter()
+        .map(|row| TechnicalCsvRow {
+            date: row.date.clone(),
+            values: row
+                .features
+                .iter()
+                .filter_map(|(k, v)| v.filter(|v| v.is_finite()).map(|v| (k.clone(), v)))
+                .collect(),
+        })
+        .filter(|row| !row.values.is_empty())
+        .collect();
+    if csv_rows.is_empty() {
+        bail!("Yahoo returned no usable finite feature rows");
+    }
+    let csv_path = technical_csv_path(csv_dir, symbol, interval)
+        .ok_or_else(|| anyhow::anyhow!("unsupported interval {interval:?}"))?;
+    write_technical_csv(&csv_path, &csv_rows).with_context(|| {
+        format!(
+            "failed to persist Yahoo technical data for {symbol}/{interval} to {}",
+            csv_path.display()
+        )
+    })?;
+    Ok(json!({
+        "symbol": symbol,
+        "interval": interval,
+        "bars": bars_len,
+        "feature_rows": csv_rows.len(),
     }))
 }
 
@@ -312,6 +353,7 @@ struct ResolvedTechnicalArgs {
     intervals: Vec<String>,
     timeout: f64,
     sleep: f64,
+    parallelism: usize,
 }
 
 impl ResolvedTechnicalArgs {
@@ -349,6 +391,9 @@ impl ResolvedTechnicalArgs {
         if intervals.is_empty() {
             bail!("no intervals configured");
         }
+        if args.parallelism == Some(0) {
+            bail!("--parallelism must be at least 1");
+        }
         Self {
             symbols,
             start,
@@ -358,6 +403,9 @@ impl ResolvedTechnicalArgs {
             sleep: args
                 .sleep
                 .unwrap_or_else(|| config_int(&config, "technical.sleep_sec", 1) as f64),
+            parallelism: args.parallelism.unwrap_or_else(|| {
+                config_int(&config, "technical.parallelism", 10).max(1) as usize
+            }),
         }
         .validate()
     }
@@ -1072,6 +1120,7 @@ mod tests {
             intervals: "unsupported".to_string(),
             timeout: Some(1.0),
             sleep: Some(0.0),
+            parallelism: None,
         })
         .await
         .unwrap_err();

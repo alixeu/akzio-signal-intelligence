@@ -17,7 +17,7 @@ const TABLES: &[&str] = &[
     "agent_events",
     "role_turn_summaries",
     "jin10_items",
-    "technical_series",
+    "technical_bars",
     "phase_summaries",
     "phase_summary_details",
     "attention_ledger",
@@ -27,6 +27,7 @@ const TABLES: &[&str] = &[
     "predictions",
     "outcomes",
     "candidate_experiences",
+    "schema_archive",
 ];
 
 const REMOVED_TABLES: &[&str] = &[
@@ -143,7 +144,7 @@ fn ensure_schema_creates_only_current_tables_and_is_idempotent() {
 }
 
 #[test]
-fn ensure_schema_drops_legacy_system_metrics_table() {
+fn ensure_schema_archives_legacy_system_metrics_table_without_deleting_it() {
     let temp = tempfile::tempdir().unwrap();
     let db_path = temp.path().join("legacy.sqlite");
     let conn = rusqlite::Connection::open(&db_path).unwrap();
@@ -157,10 +158,13 @@ fn ensure_schema_drops_legacy_system_metrics_table() {
     assert_eq!(table_exists(&conn, "system_metrics"), 1);
 
     ensure_schema(&conn).unwrap();
+    assert_eq!(table_exists(&conn, "system_metrics"), 1);
     assert_eq!(
-        table_exists(&conn, "system_metrics"),
-        0,
-        "legacy system_metrics table should be dropped"
+        scalar(
+            &conn,
+            "SELECT COUNT(*) FROM schema_archive WHERE object_name='system_metrics'"
+        ),
+        1
     );
     assert_eq!(view_exists(&conn, "system_metrics"), 0);
 }
@@ -184,7 +188,7 @@ fn ensure_schema_adds_missing_runs_status_columns() {
     assert!(column_exists(&conn, "runs", "status"));
     assert!(column_exists(&conn, "runs", "current_phase"));
     assert!(column_exists(&conn, "runs", "error_message"));
-    assert!(column_exists(&conn, "runs", "completed_at"));
+    assert!(column_exists(&conn, "runs", "completed_at_ms"));
 }
 
 #[test]

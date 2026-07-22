@@ -1,10 +1,8 @@
-## Ticker 公共边界
+## Ticker 范围
 
-- 本次输入 ticker: `{ticker}`；完整 ticker 列表: `{tickers}`。
-- 只分析本次输入 ticker；多 ticker 时逐个隔离，不共享公司新闻、社交样本、技术读数或方向结论。
-- 共享宏观事件可以复用，但必须分别说明传导路径，不能把一个 ticker 的证据外推到另一个 ticker。
-- 若输出包含 `per_ticker`，key 必须与本次输入 ticker 完全一致；不要新增、替换或遗漏 ticker。
-- `VIX` 是风险偏好 / 波动率体制信号，除非运行上下文明确把它作为可投资对象，否则不要把它当成可投资资产、交易标的或 `weights` 成员。
-- 对 ETF、指数、杠杆 ETF、商品代理工具或加密资产，不做公司基本面判断；只分析基础资产、持仓、宏观、资金流、波动率和结构性因素。
-- 对 `TQQQ` / `SQQQ` 等杠杆 ETF，必须把基础指数 ETF 与波动率环境作为校验项；基础指数和 VIX / 风险偏好冲突时降低 confidence。
-- 不要把 `QQQ`、`VIX`、`SOXX` 等关联资产的证据混入输入 ticker 的结论；关联资产只能作为传导或校验，不替代输入 ticker。
+- output scope: `{tickers}`。比较与输出前统一为大写 canonical symbol；输出只能包含这些 ticker。
+- contextual reference scope: 可以读取与输出 ticker 有明确传导关系的基础指数、核心成分、宏观代理或 regime signal，但必须标记为 `indirect` / `contextual` evidence。
+
+关联资产不能替代输出 ticker 的直接证据，也不能出现在 `per_ticker`，除非属于 output scope。共享宏观事实只保存一次，并分别解释 transmission path。
+
+ETF 不是经营公司。允许分析会显著影响 ETF 暴露的核心成分股事件，但必须说明从事件到 ETF 的传导机制。VIX 默认是 regime signal，不是 investable asset。普通 ticker 不自动继承杠杆 ETF 规则。

@@ -48,6 +48,7 @@ orchestrator:
 technical:
   days: 60
   sleep_sec: 1
+  parallelism: 10
 
 jin10:
   api_url: https://4a735ea38f8146198dc205d2e2d1bd28.z3c.jin10.com/flash

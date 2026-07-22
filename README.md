@@ -102,7 +102,9 @@ rtk cargo run -p orchestrator-cli --bin orchestrator-ingest -- \
   jin10-flash --pages 2 --lookback-hours 24 --timeout 20
 ```
 
-Technical CSV is an ingestion interchange only. With `--db-path`, the CLI atomically replaces one compact `technical_series` row per ticker/interval. Jin10 always writes its raw preflight feed to `outputs/jin10/YYYY-MM-DD.csv`; `read_jin10_context` reads that CSV, and only items that the news analyst assigns a Jin10 attention score are persisted to `jin10_items`.
+Technical CSV is an ingestion interchange only. With `--db-path`, the CLI atomically replaces the configured ticker/interval window in `technical_bars`, one indexed row per bar. Jin10 always writes its raw preflight feed to `outputs/jin10/YYYY-MM-DD.csv`; `read_jin10_context` reads that CSV, and only items that the news analyst assigns a Jin10 attention score are persisted to `jin10_items`.
+
+Independent Yahoo ticker/interval CSV downloads run concurrently (default: 10). Set `--parallelism N` to adjust the batch size; `--sleep S` waits `S` seconds between batches to manage provider rate limits.
 
 The workflow refreshes both sources during Phase 1. Use `--tech-refresh-enabled=false` only when all required ticker/interval CSVs already exist for preflight import. Jin10 lookback is controlled by `--jin10-refresh-lookback-hours`; its SQLite import remains deferred until the news analyst scores an item.
 
@@ -118,7 +120,7 @@ Useful options:
 
 - `--db-path PATH`: override the SQLite database.
 - `--run-dir PATH`: emit `state.json` and a final summary for inspection.
-- `--debug`: write bounded per-role request/response and timing/token JSONL.
+- `--debug`: write formatted per-role request/response snapshots plus timing and token JSON arrays.
 - `--max-debate-rounds N`: cap conditional debate rounds.
 - `--max-topics-per-side N`: cap material conflict topics.
 
@@ -137,7 +139,25 @@ Useful options:
 - Allocation excludes VIX, rejects missing per-ticker research, enforces non-negative finite weights, per-asset caps, cash constraints, and a total weight of 1.0.
 - Reflection/outcome promotion is outside the decision-critical research path; only validated outcomes are admitted to durable memory.
 
-SQLite connections enable WAL and a busy timeout. Scoped agent messages carry run/turn/role identity; validated artifacts are written before final run archive state.
+SQLite connections use versioned, transactional migrations plus WAL, `synchronous=NORMAL`, foreign keys, and a busy timeout. Scoped agent messages carry run/turn/role identity; validated artifacts are written before final run archive state.
+
+Database maintenance is explicit and never runs `VACUUM` during workflow startup:
+
+```bash
+# Read-only integrity, density, schema, and query-plan report
+rtk cargo run -p orchestrator-cli --bin orchestrator-ops -- db-doctor \
+  --db-path outputs/orchestrator.sqlite
+
+# Preview retention changes; pass --dry-run=false to apply
+rtk cargo run -p orchestrator-cli --bin orchestrator-ops -- db-cleanup \
+  --db-path outputs/orchestrator.sqlite --dry-run=true
+
+# Explicit WAL and file maintenance
+rtk cargo run -p orchestrator-cli --bin orchestrator-ops -- db-checkpoint \
+  --db-path outputs/orchestrator.sqlite --truncate
+rtk cargo run -p orchestrator-cli --bin orchestrator-ops -- db-vacuum \
+  --db-path outputs/orchestrator.sqlite
+```
 
 ## Validation
 

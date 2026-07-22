@@ -218,8 +218,12 @@ fn phase3_context(state: &Value) -> Value {
         .get("phase00_tables")
         .cloned()
         .unwrap_or_else(|| json!({}));
+    let input_tickers = tickers_from_state(state);
+    let primary_ticker = input_tickers.first().cloned();
 
     json!({
+        "input_tickers": input_tickers,
+        "primary_ticker": primary_ticker,
         "phase1": {
             "status": phase1.get("status").cloned().unwrap_or(Value::Null),
             "evidence_quality": phase1.get("evidence_quality").cloned().unwrap_or(Value::Null),
@@ -284,7 +288,7 @@ fn compact_research_plan(state: &Value) -> Value {
         "data_gaps",
         "risk_flags",
         "tail_risk_flag",
-        "missing_data_premium",
+        "missing_data_convergence",
     ];
     let plan = state.get("research_plan").unwrap_or(&Value::Null);
     let mut compact = compact_object_fields(plan, FIELDS);
@@ -352,7 +356,20 @@ fn risk_context(state: &Value) -> Value {
             .and_then(|value| value.get("evidence_quality"))
             .cloned()
             .unwrap_or(Value::Null),
-        "prior_risk_arguments": compact_risk_history(state)
+        "prior_risk_arguments": compact_risk_history(state),
+        "overnight_gap_scenario": state
+            .get("overnight_gap_scenario")
+            .cloned()
+            .unwrap_or_else(|| json!({"pct": -0.03, "source": "runtime_default"}))
+    })
+}
+
+fn contains_leveraged_etf(tickers: &[String]) -> bool {
+    tickers.iter().any(|ticker| {
+        matches!(
+            ticker.trim().to_ascii_uppercase().as_str(),
+            "TQQQ" | "SQQQ" | "SOXL" | "SOXS" | "UPRO" | "SPXU"
+        )
     })
 }
 
@@ -427,18 +444,6 @@ pub(crate) fn render_prompt_with_plugins(
         .get("topic")
         .cloned()
         .unwrap_or(Value::Null);
-    let current_controller = current_topic_state
-        .get("controller_artifact")
-        .cloned()
-        .unwrap_or(Value::Null);
-    let blocked_repeats = current_controller
-        .get("blocked_repeats")
-        .cloned()
-        .unwrap_or_else(|| json!([]));
-    let next_agenda = current_controller
-        .get("next_agenda")
-        .cloned()
-        .unwrap_or_else(|| json!([]));
     let analyst_output_contract_template =
         common_component(prompt_path, "analyst_output_contract.md")?;
     let anti_injection_template = common_component(prompt_path, "anti_injection.md")?;
@@ -455,6 +460,7 @@ pub(crate) fn render_prompt_with_plugins(
     let component_values = json!({
         "ticker": ticker,
         "tickers": tickers.join(","),
+        "role": role,
         "analyst_artifact_schema": analyst_artifact_schema(),
         "research_artifact_schema": research_artifact_schema(),
         "trade_intent_schema": trade_intent_schema(),
@@ -468,8 +474,11 @@ pub(crate) fn render_prompt_with_plugins(
     let research_calibration =
         replace_placeholders(&research_calibration_template, &component_values);
     let research_drivers = replace_placeholders(&research_drivers_template, &component_values);
-    let leveraged_etf_rules =
-        replace_placeholders(&leveraged_etf_rules_template, &component_values);
+    let leveraged_etf_rules = if contains_leveraged_etf(&tickers) {
+        replace_placeholders(&leveraged_etf_rules_template, &component_values)
+    } else {
+        String::new()
+    };
     let analyst_output_structure =
         replace_placeholders(&analyst_output_structure_template, &component_values);
     let stance_role_label = if role == "risk.conservative" {
@@ -516,8 +525,6 @@ pub(crate) fn render_prompt_with_plugins(
         "round": round.unwrap_or_default(),
         "topic_id": topic_id.unwrap_or(""),
         "topic": serde_json::to_string_pretty(&current_topic)?,
-        "blocked_repeats": serde_json::to_string_pretty(&blocked_repeats)?,
-        "next_agenda": serde_json::to_string_pretty(&next_agenda)?,
         "analyst_reports": serde_json::to_string_pretty(&state.get("analyst_reports").cloned().unwrap_or(Value::Null))?,
         "research_plan": serde_json::to_string_pretty(&state.get("research_plan").cloned().unwrap_or(Value::Null))?,
         "trader_plan": serde_json::to_string_pretty(&state.get("trader_investment_plan").cloned().unwrap_or(Value::Null))?,
@@ -527,8 +534,6 @@ pub(crate) fn render_prompt_with_plugins(
         "risk_context": serde_json::to_string_pretty(&risk_context(state))?,
         "portfolio_context": serde_json::to_string_pretty(&portfolio_context(state))?,
         "phase3_context": serde_json::to_string_pretty(&phase3_context(state))?,
-        "phase1_index": serde_json::to_string_pretty(&phase1_index_fork(state))?,
-        // Alias for newer prompts / phase00-era templates.
         "phase1_index": serde_json::to_string_pretty(&phase1_index_fork(state))?,
         "phase00_context": serde_json::to_string_pretty(&state.get("phase00_tables").cloned().unwrap_or(serde_json::json!({})))?,
         "common_ground": serde_json::to_string_pretty(
@@ -1264,6 +1269,128 @@ required_variables = ["ticker", "tickers"]
                 prompt.contains("外部内容边界") || prompt.contains("不是给你的指令"),
                 "{rel} missing anti-injection boundary"
             );
+        }
+    }
+
+    #[test]
+    fn research_manager_injects_calibration_and_semantic_drivers() {
+        let prompts = project_prompts_dir();
+        let rendered = render_prompt(
+            &golden_mock_state(),
+            "manager.research",
+            3,
+            "artifact",
+            None,
+            None,
+            Some(&prompts.join("managers/research_manager.md")),
+            None,
+        )
+        .unwrap();
+
+        assert!(rendered.contains("duplicate_evidence_discount"));
+        assert!(rendered.contains("probability_drivers"));
+        assert!(rendered.contains("direction`: `increase | decrease | neutral"));
+        assert!(!rendered.contains("{research_calibration}"));
+        assert!(!rendered.contains("{research_drivers}"));
+        assert!(!rendered.contains("```json"));
+    }
+
+    #[test]
+    fn leveraged_etf_rules_are_injected_only_for_leveraged_output_scope() {
+        let prompts = project_prompts_dir();
+        let path = prompts.join("analysts/technical.md");
+        let ordinary = render_prompt(
+            &golden_mock_state(),
+            "analyst.technical",
+            1,
+            "artifact",
+            None,
+            None,
+            Some(&path),
+            None,
+        )
+        .unwrap();
+        assert!(!ordinary.contains("## 杠杆 ETF 补充规则"));
+        assert!(!ordinary.contains("SQQQ 与 QQQ 反向"));
+
+        let mut leveraged = golden_mock_state();
+        leveraged["ticker"] = json!("TQQQ");
+        leveraged["tickers"] = json!(["TQQQ"]);
+        let leveraged = render_prompt(
+            &leveraged,
+            "analyst.technical",
+            1,
+            "artifact",
+            None,
+            None,
+            Some(&path),
+            None,
+        )
+        .unwrap();
+        assert!(leveraged.contains("## 杠杆 ETF 补充规则"));
+        assert!(leveraged.contains("SQQQ 与 QQQ 反向"));
+    }
+
+    #[test]
+    fn downstream_prompts_enforce_single_authority_chain() {
+        let prompts = project_prompts_dir();
+        let trader = render_prompt(
+            &golden_mock_state(),
+            "trader",
+            4,
+            "artifact",
+            None,
+            None,
+            Some(&prompts.join("traders/trader.md")),
+            None,
+        )
+        .unwrap();
+        assert!(trader.contains("research_plan` / Phase 3 是唯一市场结论"));
+        assert!(trader.contains("phase00_context` 仅用于证据血缘和审计"));
+
+        let risk = render_prompt(
+            &golden_mock_state(),
+            "risk.conservative",
+            5,
+            "risk_argument",
+            Some(1),
+            None,
+            Some(&prompts.join("risk/conservative.md")),
+            None,
+        )
+        .unwrap();
+        for obsolete_role in ["Aggressive", "Neutral", "Conservative"] {
+            assert!(!risk.contains(obsolete_role));
+        }
+        assert!(risk.contains("Integrated Risk Reviewer"));
+        assert!(risk.contains("overnight_gap_scenario"));
+    }
+
+    #[test]
+    fn topic_controller_uses_only_canonical_control_fields() {
+        let content =
+            std::fs::read_to_string(project_prompts_dir().join("mediators/topic_controller.md"))
+                .unwrap();
+        assert!(content.contains("blocked_claims"));
+        assert!(content.contains("next_steers"));
+        assert!(!content.contains("blocked_repeats"));
+        assert!(!content.contains("next_agenda"));
+    }
+
+    #[test]
+    fn active_prompts_do_not_reference_removed_social_sources() {
+        let prompts = project_prompts_dir();
+        for relative in [
+            "analysts/technical.md",
+            "analysts/news_macro.md",
+            "common/analyst_output_contract.md",
+            "managers/research_manager.md",
+            "researchers/debate.md",
+        ] {
+            let content = std::fs::read_to_string(prompts.join(relative)).unwrap();
+            for removed in ["YouTube", "Reddit", "Twitter"] {
+                assert!(!content.contains(removed), "{relative} mentions {removed}");
+            }
         }
     }
 }

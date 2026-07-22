@@ -85,5 +85,5 @@ fn import_technical_result(conn: &mut rusqlite::Connection, result: &Value) -> R
             series += 1;
         }
     }
-    Ok(json!({"table": "technical_series", "series": series, "rows": rows}))
+    Ok(json!({"table": "technical_bars", "series": series, "rows": rows}))
 }

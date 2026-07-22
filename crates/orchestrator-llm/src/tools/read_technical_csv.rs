@@ -72,7 +72,7 @@ pub fn execute(args: Value, config: &ExternalToolConfig) -> Result<Value> {
                 Value::Object(obj)
             })
             .collect();
-        json!({"source": "sqlite.technical_series", "ticker": ticker, "interval": interval, "bars": rows.len(), "data": entries})
+        json!({"source": "sqlite.technical_bars", "ticker": ticker, "interval": interval, "bars": rows.len(), "data": entries})
     };
     log_tool_result(NAME, &Ok(result.clone()));
     Ok(result)
@@ -107,7 +107,7 @@ mod tests {
 
         let result = execute(json!({"ticker": "QQQ", "interval": "daily"}), &config).unwrap();
 
-        assert_eq!(result["source"], "sqlite.technical_series");
+        assert_eq!(result["source"], "sqlite.technical_bars");
         assert_eq!(result["bars"], 1);
         assert_eq!(result["data"][0]["Close"], 500.0);
     }

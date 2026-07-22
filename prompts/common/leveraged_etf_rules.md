@@ -1,13 +1,12 @@
-## 杠杆 ETF 通用规则
+## 杠杆 ETF 补充规则
 
-1. 只有当本次输入 ticker 包含 `TQQQ`、`SQQQ`、`UPRO`、`SOXL` 等杠杆 ETF 时，才执行本节规则；否则不要新增或替换 ticker。注意：当 CLI 传入 `TQQQ` 但 `analysis_universe` / `investable_assets` 仅含 `QQQ` 时，系统通过 QQQ 代理 + 杠杆规则覆盖 TQQQ 分析；此时 `per_ticker` 输出 `TQQQ`，但方向判断必须以 `QQQ` 价格结构为基础。
-2. 若 ticker 为杠杆 ETF，必须检查其对应基础指数 ETF 或行业 ETF 的价格结构 / 基本面是否同向。对应关系至少包括：
-   - `TQQQ` / `SQQQ` -> `QQQ`
-   - `UPRO` -> `SPY`
-   - `SOXL` -> `SOXX`
-3. 对 `TQQQ`，分析必须同时检查 `TQQQ`、`QQQ`、`VIX`，但只有本次输入包含 `TQQQ` 时，才在 `per_ticker` 中输出 `TQQQ`。
-4. 若杠杆 ETF 自身出现看多信号，但基础指数 ETF 价格结构偏空或动量恶化，必须明确降权，不得把杠杆 ETF 自身指标孤立解读为强看多。
-5. 若基础指数 ETF 上涨但 `VIX` 同时显著上行或维持异常强势，必须视为风险偏好异常或趋势质量下降的警报，而不是忽略。
-6. 若杠杆 ETF、基础指数 ETF 与 `VIX` 三者方向明显冲突，`confidence` 不得高于 `0.65`。
-7. 对 `TQQQ` / `SQQQ`，核心主线包括 `QQQ` / Nasdaq 100 / Mega Cap Tech / Fed / rates / `US10Y` / `VIX` / `DXY` / CPI / NFP。
-8. 若 `QQQ` 风险偏好与 `US10Y`、`DXY` 或 `VIX` 冲突，应下调 `confidence` 并说明冲突。
+本组件仅在输出范围包含杠杆或反向 ETF 时由运行时注入。
+
+- **输出 ticker**：本次输入中需要生成 `per_ticker` 的杠杆 ETF。
+- **参考 ticker**：用于传导检查的关联资产，只能提供 contextual / indirect evidence。
+- **基础指数**：杠杆 ETF 所跟踪方向的基准，例如 TQQQ/SQQQ 对应 QQQ，SOXL 对应 SOXX，UPRO 对应 SPY。
+- **regime signal**：例如 VIX、收益率或美元，仅用于判断波动率和风险偏好环境。
+
+不得把参考 ticker、基础指数或 regime signal 的读数伪装成输出 ticker 的直接读数，也不得把它们加入 `per_ticker`，除非它们本身属于输入 ticker。
+
+方向关系必须明确：TQQQ 与 QQQ 同向；SQQQ 与 QQQ 反向。先说明基础指数方向与波动率环境，再说明杠杆、反向和路径依赖如何影响输出 ticker 的证据质量。关联资产冲突只作为风险与不确定性，不由模型执行固定 confidence cap 或其他数值折扣。
