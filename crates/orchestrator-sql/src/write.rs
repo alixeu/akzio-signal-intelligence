@@ -318,7 +318,7 @@ fn confidence_score(payload: &Value) -> f64 {
     payload
         .get("confidence")
         .and_then(Value::as_f64)
-        .unwrap_or(0.5)
+        .unwrap_or(0.0)
         .clamp(0.0, 1.0)
 }
 

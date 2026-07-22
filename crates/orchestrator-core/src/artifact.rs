@@ -162,8 +162,8 @@ pub struct PortfolioAllocation {
     pub extra: Map<String, Value>,
 }
 
-/// Per-ticker payload every analyst (technical / news_macro / reddit / x /
-/// youtube) must emit. This is the single source of truth for the analyst
+/// Per-ticker payload every active analyst (technical / news_macro) must emit.
+/// This is the single source of truth for the analyst
 /// output contract: `prompts/common/analyst_output_contract.md` documents its
 /// behavioral rules, while `analyst_artifact_schema()` and runtime validation
 /// remain the sole source of structural truth.
@@ -268,7 +268,7 @@ pub struct EvidenceItem {
     #[serde(default)]
     pub timestamp: String,
     /// Source quality tier: official | major_media | professional_research |
-    /// longform_analysis | social_verified | social_unverified | unknown.
+    /// longform_analysis | unknown.
     #[serde(default)]
     pub source_tier: String,
     /// Earliest traceable origin of the information (attribution).
@@ -341,7 +341,7 @@ pub fn evidence_item_from_value(value: Value) -> Result<EvidenceItem, String> {
             let mut source_tier = first_nonempty_string(&obj, &["source_tier", "source_quality"]);
             source_tier = match source_tier.as_str() {
                 "industry_media" | "analyst_note" => "professional_research".to_string(),
-                "rumor" => "social_unverified".to_string(),
+                "rumor" => "unknown".to_string(),
                 other => other.to_string(),
             };
             let first_source = value_as_string(obj.get("first_source"));
@@ -432,8 +432,6 @@ pub fn validate_evidence_types(
         "major_media",
         "professional_research",
         "longform_analysis",
-        "social_verified",
-        "social_unverified",
         "unknown",
     ];
     for evidence in &artifact.key_evidence {
@@ -471,6 +469,57 @@ pub fn validate_evidence_types(
     Ok(())
 }
 
+/// Validate that analyst evidence is real, attributable, timely, and unique.
+/// Structural type checks live in [`validate_evidence_types`]; this function
+/// owns the stronger admission contract used by live workflow artifacts.
+pub fn validate_evidence_quality(
+    artifact: &AnalystTickerArtifact,
+) -> std::result::Result<(), String> {
+    if artifact.report.trim().is_empty() {
+        return Err("report must not be empty".to_string());
+    }
+    if artifact.key_evidence.is_empty() {
+        return Err("key_evidence must contain at least one source-backed item".to_string());
+    }
+
+    let mut seen = std::collections::BTreeSet::new();
+    for evidence in &artifact.key_evidence {
+        if evidence.claim.trim().is_empty() {
+            return Err("evidence claim must not be empty".to_string());
+        }
+        if evidence.source.trim().is_empty() {
+            return Err(format!(
+                "evidence '{}' must include a source",
+                evidence.claim
+            ));
+        }
+        if evidence.timestamp.trim().is_empty() {
+            return Err(format!(
+                "evidence '{}' must include an observation/publication timestamp",
+                evidence.claim
+            ));
+        }
+        if !evidence.source_confidence.is_finite()
+            || !(0.0..=1.0).contains(&evidence.source_confidence)
+        {
+            return Err(format!(
+                "source_confidence {} out of range for evidence '{}'; must be finite and in [0.0, 1.0]",
+                evidence.source_confidence, evidence.claim
+            ));
+        }
+        let dedupe_key = format!(
+            "{}\u{1f}{}\u{1f}{}",
+            evidence.claim.trim().to_lowercase(),
+            evidence.source.trim().to_lowercase(),
+            evidence.timestamp.trim()
+        );
+        if !seen.insert(dedupe_key) {
+            return Err(format!("duplicate evidence item: '{}'", evidence.claim));
+        }
+    }
+    Ok(())
+}
+
 /// Validate machine-read fields on an analyst per-ticker payload.
 ///
 /// Enforces the contract promised by `analyst_output_contract.md`:
@@ -493,7 +542,8 @@ pub fn validate_analyst_ticker_artifact(
             artifact.confidence
         ));
     }
-    validate_evidence_types(artifact)
+    validate_evidence_types(artifact)?;
+    validate_evidence_quality(artifact)
 }
 
 /// Validate a parsed `RiskConstraints` artifact for well-formed enum and
@@ -1028,6 +1078,60 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn valid_analyst_ticker_artifact() -> AnalystTickerArtifact {
+        AnalystTickerArtifact {
+            direction: "bullish".to_string(),
+            confidence: 0.7,
+            report: "QQQ remains above its 20-day average.".to_string(),
+            key_evidence: vec![EvidenceItem {
+                claim: "QQQ closed above its 20-day average.".to_string(),
+                evidence_type: "fact".to_string(),
+                source: "Yahoo Finance daily OHLCV".to_string(),
+                timestamp: "2026-07-22".to_string(),
+                source_tier: "official".to_string(),
+                first_source: "Yahoo Finance".to_string(),
+                is_derivative_repost: false,
+                evidence_age: "0-2d".to_string(),
+                source_confidence: 0.9,
+            }],
+            priced_in: "unclear".to_string(),
+            echo_chamber_risk: "low".to_string(),
+            crowded_consensus_risk: "low".to_string(),
+            validation_triggers: vec!["Close below the 20-day average".to_string()],
+            data_gaps: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn analyst_validation_rejects_empty_evidence() {
+        let mut artifact = valid_analyst_ticker_artifact();
+        artifact.key_evidence.clear();
+
+        let error = validate_analyst_ticker_artifact(&artifact).unwrap_err();
+
+        assert!(error.contains("key_evidence"));
+    }
+
+    #[test]
+    fn analyst_validation_rejects_unattributed_evidence() {
+        let mut artifact = valid_analyst_ticker_artifact();
+        artifact.key_evidence[0].source.clear();
+
+        let error = validate_analyst_ticker_artifact(&artifact).unwrap_err();
+
+        assert!(error.contains("source"));
+    }
+
+    #[test]
+    fn analyst_validation_rejects_duplicate_evidence() {
+        let mut artifact = valid_analyst_ticker_artifact();
+        artifact.key_evidence.push(artifact.key_evidence[0].clone());
+
+        let error = validate_analyst_ticker_artifact(&artifact).unwrap_err();
+
+        assert!(error.contains("duplicate evidence"));
+    }
+
     #[test]
     fn parses_marker_wrapped_json() {
         assert_eq!(
@@ -1112,7 +1216,7 @@ mod tests {
             "confidence": 0.5,
             "key_evidence": [
                 "legacy observation",
-                {"claim": "Options rumor", "evidence_type": "speculation", "source": "Reddit"}
+                {"claim": "Options rumor", "evidence_type": "speculation", "source": "unverified market report"}
             ]
         }"#;
         let artifact: AnalystTickerArtifact = serde_json::from_str(json).unwrap();
@@ -1161,6 +1265,8 @@ mod tests {
             "report": "short prose",
             "key_evidence": [{
                 "evidence_type": "fact",
+                "source": "Yahoo Finance",
+                "timestamp": "2026-07-22",
                 "source_tier": "major_media",
                 "evidence_age": "0-2d",
                 "catalyst_age": "0-2d",
@@ -1737,17 +1843,7 @@ mod tests {
 
     #[test]
     fn validate_analyst_ticker_artifact_accepts_valid_payload() {
-        let artifact = AnalystTickerArtifact {
-            direction: "bullish".to_string(),
-            confidence: 0.7,
-            report: "ok".to_string(),
-            key_evidence: Vec::new(),
-            priced_in: String::new(),
-            echo_chamber_risk: String::new(),
-            crowded_consensus_risk: String::new(),
-            validation_triggers: Vec::new(),
-            data_gaps: Vec::new(),
-        };
+        let artifact = valid_analyst_ticker_artifact();
         validate_analyst_ticker_artifact(&artifact).unwrap();
     }
 }

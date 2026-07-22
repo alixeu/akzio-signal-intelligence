@@ -1,7 +1,7 @@
 use anyhow::Result;
 use orchestrator_core::{latest_close, MarketRegime};
 use orchestrator_sql::{
-    load_technical_csv,
+    load_technical_series,
     memory::{read_prior_memory, PriorMemoryQuery},
     outcome::track_record,
 };
@@ -78,7 +78,7 @@ fn tickers_from_state(state: &Value) -> Vec<String> {
 }
 
 fn market_regime_from_state(
-    _conn: &Connection,
+    conn: &Connection,
     state: &Value,
     allocation: &AllocationConfig,
 ) -> MarketRegime {
@@ -103,9 +103,9 @@ fn market_regime_from_state(
         };
     }
 
-    // Fallback: query the latest VIX close from CSV
+    // Fallback: query the latest VIX close from the run database
     // and classify it using the allocation regime thresholds.
-    let volatility = query_latest_vix_close()
+    let volatility = query_latest_vix_close(conn)
         .map(|close| classify_vix_regime(close, allocation))
         .unwrap_or_default();
     MarketRegime {
@@ -114,8 +114,8 @@ fn market_regime_from_state(
     }
 }
 
-fn query_latest_vix_close() -> Option<f64> {
-    let rows = load_technical_csv("VIX", "1d");
+fn query_latest_vix_close(conn: &Connection) -> Option<f64> {
+    let rows = load_technical_series(conn, "VIX", "1d").ok()?;
     latest_close(&rows).map(|(_, close)| close)
 }
 

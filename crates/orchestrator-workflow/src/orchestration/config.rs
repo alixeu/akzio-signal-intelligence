@@ -76,12 +76,10 @@ pub(crate) struct WorkflowConfig {
     pub phase1_parallelism: usize,
     pub agent_timeout_sec: u64,
     pub reducer_timeout_sec: u64,
-    pub risk_rounds: i64,
     pub critical_roles: BTreeSet<String>,
     pub late_evidence_enabled: bool,
     pub policy_mode: WorkflowPolicyMode,
     pub policy_thresholds: WorkflowPolicyThresholds,
-    pub skip_zero_weight_analysts: bool,
     pub force_portfolio_review: bool,
 }
 
@@ -90,11 +88,8 @@ pub(crate) struct PromptConfig {
     pub prompts: BTreeMap<String, PathBuf>,
     pub manager_research: PathBuf,
     pub trader: PathBuf,
-    pub risk_aggressive: PathBuf,
     pub risk_conservative: PathBuf,
-    pub risk_neutral: PathBuf,
     pub portfolio_manager: PathBuf,
-    pub allocation_manager: PathBuf,
 }
 
 impl PluginConfig {
@@ -148,41 +143,9 @@ impl RuntimeConfig {
             "orchestrator.prompts.analyst.news_macro",
             "prompts/analysts/news_macro.md",
         )?;
-        insert_prompt_entry(
-            config,
-            &mut prompts,
-            &mut versions,
-            "analyst.youtube",
-            "orchestrator.prompts.analyst.youtube",
-            "prompts/analysts/youtube.md",
-        )?;
-        insert_prompt_entry(
-            config,
-            &mut prompts,
-            &mut versions,
-            "analyst.reddit",
-            "orchestrator.prompts.analyst.reddit",
-            "prompts/analysts/reddit.md",
-        )?;
-        insert_prompt_entry(
-            config,
-            &mut prompts,
-            &mut versions,
-            "analyst.x",
-            "orchestrator.prompts.analyst.x",
-            "prompts/analysts/x.md",
-        )?;
-        // One long-session prompt per side (warmup + seed + debate + mediator revise).
-        const BULL_PROMPT: &str = "prompts/researchers/bull.md";
-        const BEAR_PROMPT: &str = "prompts/researchers/bear.md";
-        insert_prompt_entry(
-            config,
-            &mut prompts,
-            &mut versions,
-            "researcher.bull.warmup",
-            "orchestrator.prompts.phase2.bull_warmup",
-            BULL_PROMPT,
-        )?;
+        // One long-session prompt per side (seed + debate + mediator revise).
+        const BULL_PROMPT: &str = "prompts/researchers/debate.md";
+        const BEAR_PROMPT: &str = "prompts/researchers/debate.md";
         insert_prompt_entry(
             config,
             &mut prompts,
@@ -198,14 +161,6 @@ impl RuntimeConfig {
             "researcher.bull.interaction",
             "orchestrator.prompts.phase2.bull_interaction",
             BULL_PROMPT,
-        )?;
-        insert_prompt_entry(
-            config,
-            &mut prompts,
-            &mut versions,
-            "researcher.bear.warmup",
-            "orchestrator.prompts.phase2.bear_warmup",
-            BEAR_PROMPT,
         )?;
         insert_prompt_entry(
             config,
@@ -227,14 +182,6 @@ impl RuntimeConfig {
             config,
             &mut prompts,
             &mut versions,
-            "mediator.topic",
-            "orchestrator.prompts.mediator.topic",
-            "prompts/mediators/topic_generation.md",
-        )?;
-        insert_prompt_entry(
-            config,
-            &mut prompts,
-            &mut versions,
             "mediator.topic_controller",
             "orchestrator.prompts.mediator.topic_controller",
             "prompts/mediators/topic_controller.md",
@@ -251,36 +198,18 @@ impl RuntimeConfig {
             "prompts/traders/trader.md",
         )?;
         versions.insert("trader".to_string(), trader_version);
-        let (risk_aggressive, risk_aggressive_version) = prompt_entry(
-            config,
-            "orchestrator.prompts.risk.aggressive",
-            "prompts/risk/aggressive.md",
-        )?;
-        versions.insert("risk.aggressive".to_string(), risk_aggressive_version);
         let (risk_conservative, risk_conservative_version) = prompt_entry(
             config,
             "orchestrator.prompts.risk.conservative",
             "prompts/risk/conservative.md",
         )?;
         versions.insert("risk.conservative".to_string(), risk_conservative_version);
-        let (risk_neutral, risk_neutral_version) = prompt_entry(
-            config,
-            "orchestrator.prompts.risk.neutral",
-            "prompts/risk/neutral.md",
-        )?;
-        versions.insert("risk.neutral".to_string(), risk_neutral_version);
         let (portfolio_manager, portfolio_manager_version) = prompt_entry(
             config,
             "orchestrator.prompts.portfolio.manager",
             "prompts/managers/portfolio_manager.md",
         )?;
         versions.insert("portfolio.manager".to_string(), portfolio_manager_version);
-        let (allocation_manager, allocation_manager_version) = prompt_entry(
-            config,
-            "orchestrator.prompts.allocation.manager",
-            "prompts/allocation/manager.md",
-        )?;
-        versions.insert("allocation.manager".to_string(), allocation_manager_version);
         let plugin_config = PluginConfig::from_value(config);
         let (component_plugins, role_plugins) = if plugin_config.enabled {
             let mut component_dirs = vec![plugin_config.components_dir.clone()];
@@ -308,11 +237,8 @@ impl RuntimeConfig {
             prompts,
             manager_research,
             trader,
-            risk_aggressive,
             risk_conservative,
-            risk_neutral,
             portfolio_manager,
-            allocation_manager,
         };
         let mut llm_roles = llm_roles_from_config(config)?;
         merge_plugin_llm_role_defaults(config, &mut llm_roles, &role_plugins)?;
@@ -362,7 +288,9 @@ fn truncation_config_from_value(config: &Value) -> TruncationConfig {
 
 fn judge_config_from_value(config: &Value) -> JudgeConfig {
     JudgeConfig {
-        enabled: config_bool(config, "orchestrator.llm.judge.enabled", true),
+        // Rust contracts are authoritative. The former default judge added one
+        // LLM request per turn without contributing market evidence.
+        enabled: config_bool(config, "orchestrator.llm.judge.enabled", false),
         model: config_str(
             config,
             "orchestrator.llm.judge.model",
@@ -470,56 +398,17 @@ fn builtin_llm_role_values() -> BTreeMap<String, Value> {
             "analyst.technical",
             12,
             None,
-            vec!["read_run_context", "read_technical_csv"],
+            vec!["read_run_context", "read_technical_context"],
             false,
         ),
         (
             "analyst.news_macro",
             6,
             None,
-            vec!["read_run_context", "read_jin10_csv"],
+            vec!["read_run_context", "read_jin10_context"],
             true,
         ),
-        (
-            "analyst.youtube",
-            3,
-            None,
-            vec![
-                "read_run_context",
-                "fetch_youtube_transcript",
-                "fetch_wayinvideo_transcript",
-            ],
-            false,
-        ),
-        (
-            "analyst.reddit",
-            3,
-            None,
-            vec!["read_run_context", "fetch_last30days_context"],
-            false,
-        ),
-        (
-            "analyst.x",
-            3,
-            None,
-            vec!["read_run_context", "fetch_last30days_context"],
-            false,
-        ),
         // Phase-2 roles expand prior summaries / attention (not raw jin10/technical).
-        (
-            "researcher.bull.warmup",
-            4,
-            None,
-            vec!["read_run_context"],
-            false,
-        ),
-        (
-            "researcher.bear.warmup",
-            4,
-            None,
-            vec!["read_run_context"],
-            false,
-        ),
         (
             "researcher.bull.initial",
             10,
@@ -548,7 +437,6 @@ fn builtin_llm_role_values() -> BTreeMap<String, Value> {
             vec!["read_run_context"],
             false,
         ),
-        ("mediator.topic", 8, None, vec!["read_run_context"], false),
         (
             "mediator.topic_controller",
             10,
@@ -558,11 +446,8 @@ fn builtin_llm_role_values() -> BTreeMap<String, Value> {
         ),
         ("manager.research", 6, Some("medium"), vec![], false),
         ("trader", 6, None, vec![], false),
-        ("risk.aggressive", 6, None, vec![], false),
         ("risk.conservative", 6, None, vec![], false),
-        ("risk.neutral", 6, None, vec![], false),
         ("portfolio.manager", 6, Some("medium"), vec![], false),
-        ("allocation.manager", 6, None, vec![], false),
     ] {
         let mut object = serde_json::Map::new();
         object.insert("max_turns".to_string(), Value::from(max_turns));
@@ -709,7 +594,6 @@ pub(crate) fn required_llm_roles() -> Vec<String> {
         "researcher.bear.initial",
         "researcher.bull.interaction",
         "researcher.bear.interaction",
-        "mediator.topic",
         "mediator.topic_controller",
         "manager.research",
     ] {
@@ -763,7 +647,6 @@ impl WorkflowConfig {
             config_int(config, "orchestrator.workflow.agent_timeout_sec", 300).max(1) as u64;
         let reducer_timeout_sec =
             config_int(config, "orchestrator.workflow.reducer_timeout_sec", 300).max(1) as u64;
-        let risk_rounds = config_int(config, "orchestrator.runtime.max_risk_rounds", 1).max(1);
         let mut registry = AgentRegistry::builtin();
         registry.extend_role_manifests(
             role_plugins
@@ -781,11 +664,6 @@ impl WorkflowConfig {
         .collect::<BTreeSet<_>>();
         let late_evidence_enabled =
             config_bool(config, "orchestrator.workflow.late_evidence.enabled", true);
-        let skip_zero_weight_analysts = config_bool(
-            config,
-            "orchestrator.workflow.phase1.skip_zero_weight",
-            true,
-        );
         let force_portfolio_review = config_bool(
             config,
             "orchestrator.workflow.policy.force_portfolio_review",
@@ -795,12 +673,10 @@ impl WorkflowConfig {
             phase1_parallelism,
             agent_timeout_sec,
             reducer_timeout_sec,
-            risk_rounds,
             critical_roles,
             late_evidence_enabled,
             policy_mode: policy_mode_from_config(config),
             policy_thresholds: policy_thresholds_from_config(config),
-            skip_zero_weight_analysts,
             force_portfolio_review,
         }
     }
@@ -958,23 +834,6 @@ pub(crate) fn prompt_path(config: &Value, key: &str, default: &str) -> Result<Pa
     Ok(path)
 }
 
-pub(crate) fn config_weight(config: &Value, name: &str, cli_value: Option<f64>) -> f64 {
-    if let Some(value) = cli_value {
-        return value;
-    }
-    let builtin_default = match name {
-        "technical" => 40.0,
-        "news_macro" => 35.0,
-        "youtube" => 8.0,
-        "reddit" => 9.0,
-        "x" => 8.0,
-        _ => 0.0,
-    };
-    config_get(config, &format!("orchestrator.analyst_weights.{name}"))
-        .and_then(|value| value.as_f64())
-        .unwrap_or(builtin_default)
-}
-
 pub(crate) fn validate_sqlite_context(
     conn: &rusqlite::Connection,
     config: &RuntimeConfig,
@@ -1035,7 +894,10 @@ mod tests {
 
     #[test]
     fn judge_config_defaults_when_missing() {
-        assert_eq!(judge_config_from_value(&json!({})), JudgeConfig::default());
+        let config = judge_config_from_value(&json!({}));
+        assert!(!config.enabled);
+        assert_eq!(config.model, JudgeConfig::default().model);
+        assert_eq!(config.max_messages_per_turn, 3);
     }
 
     #[test]
@@ -1088,18 +950,14 @@ mod tests {
         for role in [
             "manager.research",
             "trader",
-            "risk.aggressive",
             "risk.conservative",
-            "risk.neutral",
             "portfolio.manager",
-            "allocation.manager",
         ] {
             assert_eq!(roles[role]["tools"], json!([]), "role={role}");
         }
         for role in [
             "researcher.bull.initial",
             "researcher.bear.initial",
-            "mediator.topic",
             "mediator.topic_controller",
         ] {
             assert_eq!(

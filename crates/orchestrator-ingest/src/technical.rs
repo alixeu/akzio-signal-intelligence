@@ -192,6 +192,7 @@ pub async fn run(args: TechnicalArgs) -> Result<Value> {
     let source = YahooDataSource::new(args.timeout)?;
     let csv_dir = default_technical_csv_dir();
     let mut results = Vec::new();
+    let mut failures = Vec::new();
     for symbol in &args.symbols {
         for interval in &args.intervals {
             if has_fresh_csv(&csv_dir, symbol, interval, args.start, args.end) {
@@ -224,6 +225,7 @@ pub async fn run(args: TechnicalArgs) -> Result<Value> {
             let bars = match bars {
                 Ok(bars) => bars,
                 Err(error) => {
+                    failures.push(format!("{symbol}/{interval}: {error:#}"));
                     results.push(json!({
                         "symbol": symbol,
                         "interval": interval,
@@ -253,8 +255,27 @@ pub async fn run(args: TechnicalArgs) -> Result<Value> {
                 })
                 .filter(|row| !row.values.is_empty())
                 .collect();
+            if csv_rows.is_empty() {
+                failures.push(format!(
+                    "{symbol}/{interval}: Yahoo returned no usable finite feature rows"
+                ));
+                results.push(json!({
+                    "symbol": symbol,
+                    "interval": interval,
+                    "bars": bars.len(),
+                    "feature_rows": 0,
+                    "status": "error",
+                    "error": "Yahoo returned no usable finite feature rows",
+                }));
+                continue;
+            }
             if let Some(csv_path) = technical_csv_path(&csv_dir, symbol, interval) {
-                let _ = write_technical_csv(&csv_path, &csv_rows);
+                write_technical_csv(&csv_path, &csv_rows).with_context(|| {
+                    format!(
+                        "failed to persist Yahoo technical data for {symbol}/{interval} to {}",
+                        csv_path.display()
+                    )
+                })?;
             }
             results.push(json!({
                 "symbol": symbol,
@@ -263,6 +284,12 @@ pub async fn run(args: TechnicalArgs) -> Result<Value> {
                 "feature_rows": csv_rows.len(),
             }));
         }
+    }
+    if !failures.is_empty() {
+        bail!(
+            "Yahoo technical refresh incomplete; refusing success with missing coverage: {}",
+            failures.join("; ")
+        );
     }
     Ok(json!({
         "status": "success",
@@ -1034,6 +1061,24 @@ fn timestamp_to_date(timestamp: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn unsupported_interval_is_an_error_not_top_level_success() {
+        let error = run(TechnicalArgs {
+            symbols: Some("QQQ".to_string()),
+            start: Some("2026-07-01".to_string()),
+            end: Some("2026-07-02".to_string()),
+            days: None,
+            intervals: "unsupported".to_string(),
+            timeout: Some(1.0),
+            sleep: Some(0.0),
+        })
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("refusing success"));
+        assert!(error.to_string().contains("unsupported interval"));
+    }
 
     fn bar(i: usize, close: Option<f64>) -> Bar {
         Bar {

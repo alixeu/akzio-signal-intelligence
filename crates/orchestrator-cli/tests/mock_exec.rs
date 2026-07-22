@@ -13,7 +13,6 @@ async fn mock_exec_writes_state_and_final_summary() {
         lang: "zh".to_string(),
         mode: Mode::Probability,
         window_days: None,
-        phase1_agents: None,
         db_path: Some(db_path.clone()),
         run_dir: Some(run_dir.clone()),
         config: Some(config_path),
@@ -21,23 +20,10 @@ async fn mock_exec_writes_state_and_final_summary() {
         reasoning_effort: Some("low".to_string()),
         max_debate_rounds: None,
         max_topics_per_side: None,
-        technical_weight: None,
-        news_weight: None,
-        youtube_weight: None,
-        reddit_weight: None,
-        x_weight: None,
         from_phase: 1,
         to_phase: 3,
         tech_refresh_enabled: false,
-        tech_refresh_intervals: "1d,3h,20min".to_string(),
-        tech_refresh_save_bars: 120,
-        tech_refresh_script_path: None,
-        tech_refresh_timeout_sec: 900,
-        tech_refresh_python_bin: None,
-        jin10_refresh_enabled: false,
         jin10_refresh_lookback_hours: 24.0,
-        jin10_refresh_script_path: None,
-        jin10_refresh_timeout_sec: 120,
         mock: true,
         debug: false,
     })
@@ -48,14 +34,10 @@ async fn mock_exec_writes_state_and_final_summary() {
     let state = &result["run_state"];
     assert_eq!(
         state["phase1_agents"],
-        serde_json::json!([
-            "analyst.technical",
-            "analyst.news_macro",
-            "analyst.youtube",
-            "analyst.reddit",
-            "analyst.x"
-        ])
+        serde_json::json!(["analyst.technical", "analyst.news_macro"])
     );
+    assert_eq!(state["analyst_weights"]["analyst.technical"], 50.0);
+    assert_eq!(state["analyst_weights"]["analyst.news_macro"], 50.0);
     assert_role_metrics_ok(state);
     assert_phase_metrics_ok(state, 3);
 
@@ -125,7 +107,7 @@ async fn mock_exec_phase7_writes_portfolio_allocation() {
     );
     assert_eq!(
         result["portfolio_allocation"]["allocation_method"],
-        "fallback_cash"
+        "rust_inverse_vol_guardrails"
     );
     assert!(result["portfolio_allocation"]["weights"]
         .get("QQQ")
@@ -150,7 +132,7 @@ async fn mock_exec_phase7_writes_portfolio_allocation() {
             .as_array()
             .unwrap()
             .len(),
-        3
+        1
     );
     assert_eq!(state["portfolio_allocation"]["total_equity_exposure"], 0.0);
     assert_market_truth_ok(state);
@@ -192,8 +174,8 @@ async fn debug_exec_records_local_reducers_without_changing_workflow_policy() {
         state.get("phase1_index").is_some(),
         "phase1_index materialized"
     );
-    assert_eq!(state["phase_status"]["2"], "done");
-    assert_eq!(state["phase_status"]["25"], "done");
+    assert_eq!(state["phase_status"]["2"], "skipped");
+    assert_eq!(state["phase_status"]["25"], "skipped");
     assert!(matches!(
         state["phase_status"]["4"].as_str(),
         Some("done" | "derived")
@@ -213,7 +195,7 @@ async fn debug_exec_records_local_reducers_without_changing_workflow_policy() {
             }),
         "expected phase00 compressor_after_phase_1 debug record"
     );
-    assert!(state["role_job_metrics"]
+    assert!(!state["role_job_metrics"]
         .as_array()
         .unwrap()
         .iter()
@@ -357,7 +339,7 @@ async fn selective_policy_derives_trader_runs_triggered_risk_and_allocates() {
             .as_array()
             .unwrap()
             .len(),
-        3
+        1
     );
     assert_eq!(state["final_trade_decision"]["status"], "derived");
     assert_eq!(state["portfolio_allocation"]["total_equity_exposure"], 0.0);
@@ -388,7 +370,12 @@ async fn selective_policy_derives_trader_runs_triggered_risk_and_allocates() {
         .as_array()
         .unwrap()
         .iter()
-        .all(|item| item["role"] != "trader" && item["role"] != "portfolio.manager"));
+        .all(|item| item["role"] != "trader"));
+    assert!(state["role_job_metrics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|item| item["role"] != "portfolio.manager"));
 }
 
 #[tokio::test]
@@ -558,13 +545,7 @@ async fn explicit_partial_llm_roles_merge_with_builtin_defaults() {
 
     assert_eq!(
         output["phase1_agents"],
-        serde_json::json!([
-            "analyst.technical",
-            "analyst.news_macro",
-            "analyst.youtube",
-            "analyst.reddit",
-            "analyst.x"
-        ])
+        serde_json::json!(["analyst.technical", "analyst.news_macro"])
     );
 }
 
@@ -591,13 +572,7 @@ async fn llm_roles_map_defaults_when_omitted() {
 
     assert_eq!(
         output["phase1_agents"],
-        serde_json::json!([
-            "analyst.technical",
-            "analyst.news_macro",
-            "analyst.youtube",
-            "analyst.reddit",
-            "analyst.x"
-        ])
+        serde_json::json!(["analyst.technical", "analyst.news_macro"])
     );
 }
 
@@ -657,19 +632,19 @@ async fn mock_phase2_writes_initial_and_interaction_turns() {
     };
 
     assert!(rows.contains(&("mediator.topic".to_string(), "topic_final".to_string())));
-    assert!(rows.contains(&(
+    assert!(!rows.contains(&(
         "researcher.bull.initial".to_string(),
         "bull_seed".to_string(),
     )));
-    assert!(rows.contains(&(
+    assert!(!rows.contains(&(
         "researcher.bull.interaction".to_string(),
         "bull_packet".to_string(),
     )));
-    assert!(rows.contains(&(
+    assert!(!rows.contains(&(
         "researcher.bear.initial".to_string(),
         "bear_seed".to_string(),
     )));
-    assert!(rows.contains(&(
+    assert!(!rows.contains(&(
         "researcher.bear.interaction".to_string(),
         "bear_packet".to_string(),
     )));
@@ -681,7 +656,7 @@ async fn mock_phase2_writes_initial_and_interaction_turns() {
             |row| row.get(0),
         )
         .unwrap();
-    assert!(controller_count >= 2);
+    assert_eq!(controller_count, 0);
 }
 
 #[tokio::test]
@@ -754,9 +729,9 @@ fn assert_market_truth_ok(state: &serde_json::Value) {
         serde_json::json!([])
     );
     let checks = state["market_truth_checks"].as_array().unwrap();
-    assert_eq!(checks.len(), 6);
+    assert_eq!(checks.len(), 4);
     assert!(checks.iter().all(|check| check["status"] == "ok"));
-    assert_eq!(state["workflow_metrics"]["market_truth_check_count"], 6);
+    assert_eq!(state["workflow_metrics"]["market_truth_check_count"], 4);
     assert_eq!(state["workflow_metrics"]["market_truth_violation_count"], 0);
 }
 
@@ -788,7 +763,11 @@ fn assert_role_metrics_ok(state: &serde_json::Value) {
     let jobs = state["role_job_metrics"].as_array().unwrap();
     assert!(!jobs.is_empty());
     assert_eq!(state["workflow_metrics"]["role_job_count"], jobs.len());
-    assert_eq!(state["workflow_metrics"]["llm_call_count"], jobs.len());
+    let requests = jobs
+        .iter()
+        .filter_map(|job| job["turn_count"].as_u64())
+        .sum::<u64>();
+    assert_eq!(state["workflow_metrics"]["llm_call_count"], requests);
     assert_eq!(state["workflow_metrics"]["timed_out_role_count"], 0);
     assert!(jobs.iter().all(|job| job["status"] == "ok"));
 }
@@ -813,7 +792,6 @@ fn test_args(
         lang: "zh".to_string(),
         mode: Mode::Probability,
         window_days: None,
-        phase1_agents: None,
         db_path,
         run_dir,
         config,
@@ -821,23 +799,10 @@ fn test_args(
         reasoning_effort: Some("low".to_string()),
         max_debate_rounds: None,
         max_topics_per_side: None,
-        technical_weight: None,
-        news_weight: None,
-        youtube_weight: None,
-        reddit_weight: None,
-        x_weight: None,
         from_phase: 1,
         to_phase: 3,
         tech_refresh_enabled: false,
-        tech_refresh_intervals: "1d,3h,20min".to_string(),
-        tech_refresh_save_bars: 120,
-        tech_refresh_script_path: None,
-        tech_refresh_timeout_sec: 900,
-        tech_refresh_python_bin: None,
-        jin10_refresh_enabled: false,
         jin10_refresh_lookback_hours: 24.0,
-        jin10_refresh_script_path: None,
-        jin10_refresh_timeout_sec: 120,
         mock,
         debug: false,
     }
@@ -853,17 +818,11 @@ fn write_test_config(root: &std::path::Path) -> PathBuf {
         "bull_interaction.md",
         "bear_initial.md",
         "bear_interaction.md",
-        "reducer_evidence.md",
-        "reducer_debate_final.md",
-        "topic_generation.md",
         "topic_controller.md",
         "manager.md",
         "trader.md",
-        "risk_aggressive.md",
         "risk_conservative.md",
-        "risk_neutral.md",
         "portfolio_manager.md",
-        "allocation.md",
     ] {
         fs::write(prompt_dir.join(name), format!("{name} {{ticker}}")).unwrap();
     }
@@ -884,54 +843,36 @@ orchestrator:
     correlation_window_days: 60
     max_single_position: 0.70
     vol_indicator: STD20
-  runtime:
-    max_risk_rounds: 1
   prompts:
     analyst:
       technical: "{}"
       news_macro: "{}"
     phase2:
-      topic_generation: "{}"
       bull_initial: "{}"
       bull_interaction: "{}"
       bear_initial: "{}"
       bear_interaction: "{}"
     mediator:
-      topic: "{}"
       topic_controller: "{}"
-    reducers:
-      evidence: "{}"
-      debate_final: "{}"
     manager:
       research: "{}"
     trader: "{}"
     risk:
-      aggressive: "{}"
       conservative: "{}"
-      neutral: "{}"
     portfolio:
-      manager: "{}"
-    allocation:
       manager: "{}"
 "#,
         prompt_dir.join("analyst_technical.md").display(),
         prompt_dir.join("analyst_news.md").display(),
-        prompt_dir.join("topic_generation.md").display(),
         prompt_dir.join("bull_initial.md").display(),
         prompt_dir.join("bull_interaction.md").display(),
         prompt_dir.join("bear_initial.md").display(),
         prompt_dir.join("bear_interaction.md").display(),
-        prompt_dir.join("topic_generation.md").display(),
         prompt_dir.join("topic_controller.md").display(),
-        prompt_dir.join("reducer_evidence.md").display(),
-        prompt_dir.join("reducer_debate_final.md").display(),
         prompt_dir.join("manager.md").display(),
         prompt_dir.join("trader.md").display(),
-        prompt_dir.join("risk_aggressive.md").display(),
         prompt_dir.join("risk_conservative.md").display(),
-        prompt_dir.join("risk_neutral.md").display(),
         prompt_dir.join("portfolio_manager.md").display(),
-        prompt_dir.join("allocation.md").display(),
     );
     let mut config: serde_json::Value = serde_yaml::from_str(&config_text).unwrap();
     config["orchestrator"]["llm"]["defaults"] = serde_json::json!({
@@ -952,24 +893,15 @@ fn complete_llm_roles_config() -> serde_json::Value {
     for role in [
         "analyst.technical",
         "analyst.news_macro",
-        "analyst.youtube",
-        "analyst.reddit",
-        "analyst.x",
         "researcher.bull.initial",
         "researcher.bear.initial",
         "researcher.bull.interaction",
         "researcher.bear.interaction",
-        "reducer.evidence",
         "mediator.topic_controller",
-        "reducer.debate_final",
-        "mediator.topic",
         "manager.research",
         "trader",
-        "risk.aggressive",
         "risk.conservative",
-        "risk.neutral",
         "portfolio.manager",
-        "allocation.manager",
     ] {
         let is_phase1 = role.starts_with("analyst.");
         roles.insert(
@@ -994,24 +926,15 @@ fn openai_compatible_llm_roles_config() -> serde_json::Value {
     for role in [
         "analyst.technical",
         "analyst.news_macro",
-        "analyst.youtube",
-        "analyst.reddit",
-        "analyst.x",
         "researcher.bull.initial",
         "researcher.bear.initial",
         "researcher.bull.interaction",
         "researcher.bear.interaction",
-        "reducer.evidence",
         "mediator.topic_controller",
-        "reducer.debate_final",
-        "mediator.topic",
         "manager.research",
         "trader",
-        "risk.aggressive",
         "risk.conservative",
-        "risk.neutral",
         "portfolio.manager",
-        "allocation.manager",
     ] {
         let is_phase1 = role.starts_with("analyst.");
         roles.insert(

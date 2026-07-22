@@ -472,11 +472,10 @@ pub(crate) fn render_prompt_with_plugins(
         replace_placeholders(&leveraged_etf_rules_template, &component_values);
     let analyst_output_structure =
         replace_placeholders(&analyst_output_structure_template, &component_values);
-    let stance_role_label = match role {
-        "risk.aggressive" => "aggressive",
-        "risk.neutral" => "neutral",
-        "risk.conservative" => "conservative",
-        _ => "",
+    let stance_role_label = if role == "risk.conservative" {
+        "conservative"
+    } else {
+        ""
     };
     let static_values = json!({
         "ticker": ticker,
@@ -869,7 +868,7 @@ required_variables = ["ticker", "tickers"]
     }
 
     #[test]
-    fn risk_tiers_share_body_with_markdown_stance_content() {
+    fn integrated_risk_review_expands_shared_body() {
         let temp = TempDir::new().unwrap();
         let prompts = temp.path().join("prompts");
         std::fs::create_dir_all(prompts.join("common")).unwrap();
@@ -880,28 +879,12 @@ required_variables = ["ticker", "tickers"]
         )
         .unwrap();
         std::fs::write(
-            prompts.join("risk/aggressive.md"),
-            "激进风险分析师\n{risk_analyst_body}\n\"key_risks_accepted\": [\"接受的风险\"]",
-        )
-        .unwrap();
-        std::fs::write(
             prompts.join("risk/conservative.md"),
             "保守风险分析师\n{risk_analyst_body}\n\"key_risks\": [\"主要风险\"]",
         )
         .unwrap();
         let state = json!({"ticker": "QQQ", "tickers": ["QQQ"]});
 
-        let aggressive = render_prompt(
-            &state,
-            "risk.aggressive",
-            5,
-            "risk_argument",
-            None,
-            None,
-            Some(&prompts.join("risk/aggressive.md")),
-            None,
-        )
-        .unwrap();
         let conservative = render_prompt(
             &state,
             "risk.conservative",
@@ -914,16 +897,16 @@ required_variables = ["ticker", "tickers"]
         )
         .unwrap();
 
-        assert!(aggressive.contains("激进风险分析师"));
-        assert!(aggressive.contains("key_risks_accepted"));
         assert!(conservative.contains("保守风险分析师"));
         assert!(conservative.contains("\"key_risks\""));
-        for prompt in [&aggressive, &conservative] {
-            assert!(!prompt.contains("{risk_analyst_body}"));
-            assert!(!prompt.contains("{stance_label}"));
-            assert!(!prompt.contains("{stance_intro}"));
-            assert!(!prompt.contains("{stance_rules}"));
-            assert!(!prompt.contains("{stance_schema_extra}"));
+        for placeholder in [
+            "{risk_analyst_body}",
+            "{stance_label}",
+            "{stance_intro}",
+            "{stance_rules}",
+            "{stance_schema_extra}",
+        ] {
+            assert!(!conservative.contains(placeholder));
         }
     }
 
@@ -977,7 +960,9 @@ required_variables = ["ticker", "tickers"]
         "{allocation_context}",
         "{phase3_context}",
         "{phase1_index}",
+        "{phase00_context}",
         "{prior_phase_summaries}",
+        "{common_ground}",
     ];
 
     fn golden_mock_state() -> Value {
@@ -1177,43 +1162,25 @@ required_variables = ["ticker", "tickers"]
         let cases: &[(&str, &str, &str)] = &[
             ("analyst.technical", "analysts/technical.md", "artifact"),
             ("analyst.news_macro", "analysts/news_macro.md", "artifact"),
-            ("analyst.youtube", "analysts/youtube.md", "artifact"),
-            ("analyst.reddit", "analysts/reddit.md", "artifact"),
-            ("analyst.x", "analysts/x.md", "artifact"),
             (
                 "researcher.bull.initial",
-                "researchers/bull.md",
+                "researchers/debate.md",
                 "bull_seed",
             ),
             (
                 "researcher.bear.initial",
-                "researchers/bear.md",
+                "researchers/debate.md",
                 "bear_seed",
             ),
             (
                 "researcher.bull.interaction",
-                "researchers/bull.md",
+                "researchers/debate.md",
                 "bull_packet",
             ),
             (
                 "researcher.bear.interaction",
-                "researchers/bear.md",
+                "researchers/debate.md",
                 "bear_packet",
-            ),
-            (
-                "researcher.bull.warmup",
-                "researchers/bull.md",
-                "warmup_ack",
-            ),
-            (
-                "researcher.bear.warmup",
-                "researchers/bear.md",
-                "warmup_ack",
-            ),
-            (
-                "mediator.topic",
-                "mediators/topic_generation.md",
-                "topic_generation",
             ),
             (
                 "mediator.topic_controller",
@@ -1226,15 +1193,12 @@ required_variables = ["ticker", "tickers"]
                 "artifact",
             ),
             ("trader", "traders/trader.md", "artifact"),
-            ("risk.aggressive", "risk/aggressive.md", "risk_argument"),
-            ("risk.neutral", "risk/neutral.md", "risk_argument"),
             ("risk.conservative", "risk/conservative.md", "risk_argument"),
             (
                 "portfolio.manager",
                 "managers/portfolio_manager.md",
                 "artifact",
             ),
-            ("allocation.manager", "allocation/manager.md", "artifact"),
         ];
 
         for (role, rel, kind) in cases {
@@ -1272,13 +1236,7 @@ required_variables = ["ticker", "tickers"]
             return;
         }
         let state = golden_mock_state();
-        for rel in [
-            "analysts/technical.md",
-            "analysts/news_macro.md",
-            "analysts/reddit.md",
-            "analysts/x.md",
-            "analysts/youtube.md",
-        ] {
+        for rel in ["analysts/technical.md", "analysts/news_macro.md"] {
             let path = prompts.join(rel);
             let role = format!(
                 "analyst.{}",

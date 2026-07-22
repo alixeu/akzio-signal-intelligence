@@ -70,7 +70,7 @@ pub(crate) fn build_phase1_index(state: &Value, config: &RuntimeConfig) -> Value
                     json!({
                         "role": role,
                         "status": if missing_sources.contains(role) { "missing" } else { "ready" },
-                        "stance": payload.and_then(|value| value.get("direction")).and_then(Value::as_str).unwrap_or("neutral"),
+                        "stance": payload.and_then(|value| value.get("direction")).and_then(Value::as_str).unwrap_or("unobserved"),
                         "confidence": payload.and_then(|value| value.get("confidence")).cloned().unwrap_or(Value::Null),
                         "key_evidence": key_evidence,
                         "evidence_type_summary": payload
@@ -94,6 +94,20 @@ pub(crate) fn build_phase1_index(state: &Value, config: &RuntimeConfig) -> Value
                 .iter()
                 .map(|conflict| conflict.to_json())
                 .collect::<Vec<_>>();
+            let material_conflicts = conflict_values
+                .iter()
+                .filter(|conflict| conflict_requires_semantic_debate(conflict))
+                .cloned()
+                .collect::<Vec<_>>();
+            let topic_candidates = if ticker_is_actionable {
+                material_conflicts
+                    .iter()
+                    .enumerate()
+                    .map(|(index, conflict)| topic_from_conflict(ticker, index, conflict))
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
             (
                 ticker.clone(),
                 json!({
@@ -112,11 +126,8 @@ pub(crate) fn build_phase1_index(state: &Value, config: &RuntimeConfig) -> Value
                     "missing_evidence": degraded_noncritical_roles,
                     "decision_hinges": [],
                     "evidence_quality": ticker_evidence_quality,
-                    "topic_candidates": if ticker_is_actionable {
-                        json!([fallback_topic_for_ticker(ticker)])
-                    } else {
-                        json!([])
-                    },
+                    "material_conflicts": material_conflicts,
+                    "topic_candidates": topic_candidates,
                     "state_summary": format!("Phase 1 state for {ticker}: {}.", ticker_evidence_quality["status"].as_str().unwrap_or("unknown"))
                 }),
             )
@@ -336,11 +347,22 @@ fn summarize_evidence_types(payload: &Value) -> Value {
 
 pub(crate) fn build_topic_generation_artifact(state: &Value) -> Value {
     let tickers = tickers_from_state(state);
-    let actionable = phase1_evidence_is_actionable(state);
-    let topics = if actionable {
+    let evidence_actionable = phase1_evidence_is_actionable(state);
+    let topics = if evidence_actionable {
         phase1_topic_candidates(state)
     } else {
         Vec::new()
+    };
+    let debate_required = !topics.is_empty();
+    let material_conflict_count = topics.len();
+    let conflict_score =
+        (material_conflict_count as f64 / tickers.len().max(1) as f64).clamp(0.0, 1.0);
+    let skip_reason = if !evidence_actionable {
+        Some("phase1_evidence_insufficient")
+    } else if !debate_required {
+        Some("no_material_cross_analyst_conflict")
+    } else {
+        None
     };
     let common_ground = derive_common_ground_from_phase1(state);
     json!({
@@ -348,9 +370,17 @@ pub(crate) fn build_topic_generation_artifact(state: &Value) -> Value {
         "role": "mediator.topic",
         "artifact_type": "phase2_topic_generation_artifact",
         "phase": "phase2.topic_generation",
-        "status": if actionable { "ready" } else { "skipped_no_actionable_evidence" },
-        "actionable": actionable,
-        "skip_reason": if actionable { Value::Null } else { json!("phase1_evidence_insufficient") },
+        "status": if debate_required { "ready" } else { "skipped" },
+        "actionable": debate_required,
+        "debate_required": debate_required,
+        "evidence_actionable": evidence_actionable,
+        "skip_reason": skip_reason,
+        "conflict_score": conflict_score,
+        "material_conflict_count": material_conflict_count,
+        "evidence_quality": state.get("phase1_index")
+            .and_then(|value| value.get("evidence_quality"))
+            .cloned()
+            .unwrap_or(Value::Null),
         "generated_from": {
             "source_artifact": "phase1_index",
             "tickers": tickers
@@ -448,7 +478,7 @@ pub(crate) fn build_debate_state_artifact(state: &Value, config: &RuntimeConfig)
         .and_then(Value::as_array)
         .map(|items| !items.is_empty())
         .unwrap_or(false);
-    let skipped_for_insufficient_evidence = state
+    let debate_skipped = state
         .get("topic_generation_artifact")
         .and_then(|artifact| artifact.get("actionable"))
         .and_then(Value::as_bool)
@@ -457,7 +487,7 @@ pub(crate) fn build_debate_state_artifact(state: &Value, config: &RuntimeConfig)
     let has_controller_artifact = topic_states
         .values()
         .any(topic_state_has_controller_artifact);
-    let topic_briefs = if skipped_for_insufficient_evidence || topic_states.is_empty() {
+    let topic_briefs = if debate_skipped || topic_states.is_empty() {
         Vec::new()
     } else {
         topic_states
@@ -480,12 +510,23 @@ pub(crate) fn build_debate_state_artifact(state: &Value, config: &RuntimeConfig)
         && topic_briefs
             .iter()
             .all(|brief| brief.get("status").and_then(Value::as_str) == Some("converged"));
-    let (status, convergence_status, reason) = if skipped_for_insufficient_evidence {
-        (
-            "skipped_no_actionable_evidence",
-            "skipped",
-            "Phase 1 evidence was insufficient for an actionable debate.",
-        )
+    let generation_skip_reason = state
+        .get("topic_generation_artifact")
+        .and_then(|artifact| artifact.get("skip_reason"))
+        .and_then(Value::as_str);
+    let (status, convergence_status, reason) = if debate_skipped {
+        match generation_skip_reason {
+            Some("no_material_cross_analyst_conflict") => (
+                "skipped_no_material_conflict",
+                "skipped",
+                "Rust found no material cross-analyst conflict; semantic debate added no value.",
+            ),
+            _ => (
+                "skipped_no_actionable_evidence",
+                "skipped",
+                "Phase 1 evidence was insufficient for an actionable debate.",
+            ),
+        }
     } else if all_topics_converged {
         (
             "ready",
@@ -549,6 +590,8 @@ pub(crate) fn build_debate_state_artifact(state: &Value, config: &RuntimeConfig)
         "status": status,
         "convergence_status": convergence_status,
         "convergence_reason": reason,
+        "debate_skipped": debate_skipped,
+        "skip_reason": generation_skip_reason,
         "workflow_pattern": "Workflow -> Stage/Sub-workflow -> Agent workers -> Reducer -> state artifact",
         "generated_from": {
             "worker_roles": executed_phase2_worker_roles(state),
@@ -824,22 +867,36 @@ pub(crate) fn debate_topic_brief_from_state(
     brief
 }
 
-pub(crate) fn fallback_topics_for_tickers(tickers: &[String]) -> Vec<Value> {
-    tickers
-        .iter()
-        .map(|ticker| fallback_topic_for_ticker(ticker))
-        .collect()
-}
-
-fn fallback_topic_for_ticker(ticker: &str) -> Value {
+fn topic_from_conflict(ticker: &str, index: usize, conflict: &Value) -> Value {
+    let conflict_type = conflict
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("material_conflict");
+    let description = conflict
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or("Resolve the material evidence conflict.");
     json!({
-        "topic_id": format!("{ticker}-aggregate"),
-        "topic": format!("Highest-impact unresolved long/short evidence for {ticker}"),
+        "topic_id": format!("{ticker}-{conflict_type}-{}", index + 1),
+        "topic": description,
         "tickers": [ticker],
         "long_evidence_refs": [],
         "short_evidence_refs": [],
-        "why_debate": "Fallback topic generated from Phase 1 index."
+        "why_debate": format!("Rust detected a material {conflict_type}."),
+        "source_conflict": conflict
     })
+}
+
+fn conflict_requires_semantic_debate(conflict: &Value) -> bool {
+    let conflict_type = conflict.get("type").and_then(Value::as_str);
+    let severity = conflict.get("severity").and_then(Value::as_str);
+    matches!(
+        (conflict_type, severity),
+        (
+            Some("direction_conflict" | "confidence_divergence" | "evidence_contradiction"),
+            Some("medium" | "high")
+        )
+    )
 }
 
 pub(crate) fn phase1_topic_candidates(state: &Value) -> Vec<Value> {
@@ -848,8 +905,7 @@ pub(crate) fn phase1_topic_candidates(state: &Value) -> Vec<Value> {
         .and_then(|artifact| artifact.get("topic_candidates"))
         .and_then(Value::as_array)
         .cloned()
-        .filter(|items| !items.is_empty())
-        .unwrap_or_else(|| fallback_topics_for_tickers(&tickers_from_state(state)))
+        .unwrap_or_default()
 }
 
 pub(crate) fn phase1_evidence_is_actionable(state: &Value) -> bool {
@@ -907,7 +963,7 @@ pub(crate) fn topics_from_generation_artifact(artifact: &Value) -> Vec<Value> {
         return from_per_ticker;
     }
 
-    fallback_topics_for_tickers(&tickers_from_state(artifact))
+    Vec::new()
 }
 
 /// Recover topics when the model nested them under `per_ticker` instead of `topics[]`.
@@ -977,27 +1033,6 @@ pub(crate) fn topic_id_from_topic(topic: &Value) -> String {
         .filter(|value| !value.trim().is_empty())
         .map(ToString::to_string)
         .unwrap_or_else(|| "topic-aggregate".to_string())
-}
-
-pub(crate) fn merge_reducer_output(mut base: Value, reducer_output: Value) -> Value {
-    if let Some(object) = base.as_object_mut() {
-        object.insert("reducer_output".to_string(), reducer_output.clone());
-        if let Some(status) = reducer_output.get("status").cloned() {
-            object.insert("llm_reducer_status".to_string(), status);
-        }
-        if let Some(checks) = reducer_output.get("reducer_checks").cloned() {
-            object.insert("llm_reducer_checks".to_string(), checks);
-        }
-        if let Some(summary) = reducer_output
-            .get("state_summary")
-            .or_else(|| reducer_output.get("summary"))
-            .or_else(|| reducer_output.get("brief_markdown"))
-            .cloned()
-        {
-            object.insert("llm_brief".to_string(), summary);
-        }
-    }
-    base
 }
 
 pub(crate) fn reducer_brief_md(artifact: &Value) -> String {
@@ -1366,17 +1401,13 @@ mod tests {
                 manager_research: std::path::PathBuf::new(),
 
                 trader: std::path::PathBuf::new(),
-                risk_aggressive: std::path::PathBuf::new(),
                 risk_conservative: std::path::PathBuf::new(),
-                risk_neutral: std::path::PathBuf::new(),
                 portfolio_manager: std::path::PathBuf::new(),
-                allocation_manager: std::path::PathBuf::new(),
             },
             workflow: crate::orchestration::config::WorkflowConfig {
                 phase1_parallelism: 5,
                 agent_timeout_sec: 300,
                 reducer_timeout_sec: 300,
-                risk_rounds: 1,
                 critical_roles: ["analyst.technical", "analyst.news_macro"]
                     .into_iter()
                     .map(String::from)
@@ -1384,7 +1415,6 @@ mod tests {
                 late_evidence_enabled: true,
                 policy_mode: crate::orchestration::policy::WorkflowPolicyMode::Selective,
                 policy_thresholds: Default::default(),
-                skip_zero_weight_analysts: false,
                 force_portfolio_review: false,
             },
             allocation: crate::orchestration::config::AllocationConfig {
@@ -1486,7 +1516,7 @@ mod tests {
                             "key_evidence": [
                                 {"claim": "CPI 3.2%", "evidence_type": "fact", "source": "BLS"},
                                 {"claim": "Fed may cut", "evidence_type": "opinion", "source": "Fed funds futures"},
-                                {"claim": "Options whale rumored", "evidence_type": "speculation", "source": "Reddit"}
+                                {"claim": "Options whale rumored", "evidence_type": "speculation", "source": "unverified market report"}
                             ]
                         }
                     }
@@ -1804,12 +1834,37 @@ mod tests {
         let artifact = build_topic_generation_artifact(&state);
 
         assert_eq!(artifact["actionable"], false);
-        assert_eq!(artifact["status"], "skipped_no_actionable_evidence");
+        assert_eq!(artifact["status"], "skipped");
+        assert_eq!(artifact["skip_reason"], "phase1_evidence_insufficient");
         assert_eq!(artifact["topics"], json!([]));
         assert_eq!(
             topics_from_generation_artifact(&artifact),
             Vec::<Value>::new()
         );
+    }
+
+    #[test]
+    fn topic_generation_skips_when_actionable_evidence_has_no_material_conflict() {
+        let state = json!({
+            "tickers": ["QQQ"],
+            "phase1_index": {
+                "evidence_quality": {"status": "actionable"},
+                "topic_candidates": [],
+                "per_ticker": {
+                    "QQQ": {"evidence_quality": {"status": "actionable"}}
+                }
+            }
+        });
+
+        let artifact = build_topic_generation_artifact(&state);
+
+        assert_eq!(artifact["evidence_actionable"], true);
+        assert_eq!(artifact["debate_required"], false);
+        assert_eq!(
+            artifact["skip_reason"],
+            "no_material_cross_analyst_conflict"
+        );
+        assert_eq!(artifact["conflict_score"], 0.0);
     }
 
     #[test]
@@ -1948,8 +2003,8 @@ mod tests {
     #[test]
     fn artifact_identity_validation_does_not_mutate_mismatched_payload() {
         let artifact = json!({
-            "id": "youtube",
-            "role": "analyst.youtube",
+            "id": "analyst.news_macro",
+            "role": "analyst.news_macro",
             "per_ticker": {"QQQ": {}}
         });
         let original = artifact.clone();

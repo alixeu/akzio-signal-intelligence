@@ -91,32 +91,25 @@ mod tests {
     use super::*;
     use orchestrator_core::{technical_csv_path, write_technical_csv, TechnicalCsvRow};
     use orchestrator_sql::{
-        connect,
+        connect, import_technical_csv,
         prediction::{upsert_prediction, PredictionInput},
     };
     use serde_json::json;
     use std::collections::HashMap;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
     #[test]
     fn scores_upward_and_downward_predictions() {
-        let _lock = ENV_LOCK.lock().unwrap();
         let temp = tempfile::tempdir().unwrap();
-        let conn = connect(temp.path().join("score.sqlite")).unwrap();
-        std::env::set_var(
-            "ORCHESTRATOR_TECHNICAL_CSV_DIR",
-            temp.path().to_str().unwrap(),
-        );
+        let mut conn = connect(temp.path().join("score.sqlite")).unwrap();
         insert_prediction(&conn, "run-up", "QQQ", 0.7, 0.3);
         insert_prediction(&conn, "run-down", "SOXX", 0.2, 0.8);
         insert_close(
+            &mut conn,
             temp.path(),
             "QQQ",
             &[("2026-01-01", 100.0), ("2026-01-06", 105.0)],
         );
         insert_close(
+            &mut conn,
             temp.path(),
             "SOXX",
             &[("2026-01-01", 100.0), ("2026-01-06", 95.0)],
@@ -133,39 +126,28 @@ mod tests {
             })
             .unwrap();
         assert_eq!(accuracy, 1.0);
-        std::env::remove_var("ORCHESTRATOR_TECHNICAL_CSV_DIR");
     }
 
     #[test]
     fn skips_predictions_without_required_close_rows() {
-        let _lock = ENV_LOCK.lock().unwrap();
         let temp = tempfile::tempdir().unwrap();
-        let conn = connect(temp.path().join("missing.sqlite")).unwrap();
-        std::env::set_var(
-            "ORCHESTRATOR_TECHNICAL_CSV_DIR",
-            temp.path().to_str().unwrap(),
-        );
+        let mut conn = connect(temp.path().join("missing.sqlite")).unwrap();
         insert_prediction(&conn, "run-missing", "QQQ", 0.7, 0.3);
-        insert_close(temp.path(), "QQQ", &[("2026-01-01", 100.0)]);
+        insert_close(&mut conn, temp.path(), "QQQ", &[("2026-01-01", 100.0)]);
 
         let summary = score_predictions(&conn, &options()).unwrap();
         assert_eq!(summary.scored, 0);
         assert_eq!(summary.skipped, 1);
         assert_eq!(outcome_count(&conn), 0);
-        std::env::remove_var("ORCHESTRATOR_TECHNICAL_CSV_DIR");
     }
 
     #[test]
     fn repeated_scoring_is_idempotent() {
-        let _lock = ENV_LOCK.lock().unwrap();
         let temp = tempfile::tempdir().unwrap();
-        let conn = connect(temp.path().join("idem.sqlite")).unwrap();
-        std::env::set_var(
-            "ORCHESTRATOR_TECHNICAL_CSV_DIR",
-            temp.path().to_str().unwrap(),
-        );
+        let mut conn = connect(temp.path().join("idem.sqlite")).unwrap();
         insert_prediction(&conn, "run-idem", "QQQ", 0.7, 0.3);
         insert_close(
+            &mut conn,
             temp.path(),
             "QQQ",
             &[("2026-01-01", 100.0), ("2026-01-06", 105.0)],
@@ -174,7 +156,6 @@ mod tests {
         assert_eq!(score_predictions(&conn, &options()).unwrap().scored, 1);
         assert_eq!(score_predictions(&conn, &options()).unwrap().scored, 0);
         assert_eq!(outcome_count(&conn), 1);
-        std::env::remove_var("ORCHESTRATOR_TECHNICAL_CSV_DIR");
     }
 
     fn options() -> ScoreOptions {
@@ -210,7 +191,12 @@ mod tests {
         .unwrap();
     }
 
-    fn insert_close(dir: &std::path::Path, ticker: &str, entries: &[(&str, f64)]) {
+    fn insert_close(
+        conn: &mut Connection,
+        dir: &std::path::Path,
+        ticker: &str,
+        entries: &[(&str, f64)],
+    ) {
         let rows: Vec<TechnicalCsvRow> = entries
             .iter()
             .map(|(date, close)| TechnicalCsvRow {
@@ -220,6 +206,7 @@ mod tests {
             .collect();
         let path = technical_csv_path(dir, ticker, "1d").unwrap();
         write_technical_csv(&path, &rows).unwrap();
+        import_technical_csv(conn, ticker, "1d", &path).unwrap();
     }
 
     fn outcome_count(conn: &Connection) -> i64 {

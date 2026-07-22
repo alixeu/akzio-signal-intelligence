@@ -1,10 +1,15 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use orchestrator_cli::{init_tracing, jin10, social, technical, wayinvideo, youtube};
+use orchestrator_cli::{init_tracing, jin10, technical};
+use serde_json::{json, Value};
+use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
 #[command(name = "orchestrator-ingest", about = "Unified data ingestion CLI")]
 struct Cli {
+    /// Also import successful source data into the run SQLite database.
+    #[arg(long, global = true)]
+    db_path: Option<PathBuf>,
     #[command(subcommand)]
     command: IngestCommand,
 }
@@ -15,21 +20,6 @@ enum IngestCommand {
     Jin10Flash {
         #[command(flatten)]
         args: jin10::Jin10Args,
-    },
-    /// Fetch YouTube video transcript
-    YoutubeTranscript {
-        #[command(flatten)]
-        args: youtube::YoutubeArgs,
-    },
-    /// Fetch WayinVideo transcript
-    WayinvideoTranscript {
-        #[command(flatten)]
-        args: wayinvideo::WayinVideoArgs,
-    },
-    /// Fetch last 30 days social context
-    Last30daysContext {
-        #[command(flatten)]
-        args: social::SocialArgs,
     },
     /// Run technical indicators
     TechnicalIndicators {
@@ -45,29 +35,53 @@ async fn main() -> Result<()> {
     match cli.command {
         IngestCommand::Jin10Flash { args } => {
             let pretty = args.pretty;
-            let result = jin10::run(args).await?;
+            let mut result = jin10::run(args).await?;
+            if let Some(db_path) = &cli.db_path {
+                let mut conn = orchestrator_sql::connect(db_path)?;
+                let rows = orchestrator_sql::import_jin10_payload(&mut conn, &result)?;
+                result["sqlite"] = json!({"table": "jin10_items", "rows": rows});
+            }
             if pretty {
                 println!("{}", serde_json::to_string_pretty(&result)?);
             } else {
                 println!("{}", serde_json::to_string(&result)?);
             }
         }
-        IngestCommand::YoutubeTranscript { args } => {
-            let result = youtube::run(args).await?;
-            println!("{}", serde_json::to_string_pretty(&result)?);
-        }
-        IngestCommand::WayinvideoTranscript { args } => {
-            let result = wayinvideo::run(args).await?;
-            println!("{}", serde_json::to_string_pretty(&result)?);
-        }
-        IngestCommand::Last30daysContext { args } => {
-            let result = social::run(args).await?;
-            println!("{}", serde_json::to_string_pretty(&result)?);
-        }
         IngestCommand::TechnicalIndicators { args } => {
-            let result = technical::run(args).await?;
+            let mut result = technical::run(args).await?;
+            if let Some(db_path) = &cli.db_path {
+                let mut conn = orchestrator_sql::connect(db_path)?;
+                result["sqlite"] = import_technical_result(&mut conn, &result)?;
+            }
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
     }
     Ok(())
+}
+
+fn import_technical_result(conn: &mut rusqlite::Connection, result: &Value) -> Result<Value> {
+    let output_dir = result
+        .get("output_dir")
+        .and_then(Value::as_str)
+        .map(Path::new)
+        .ok_or_else(|| anyhow::anyhow!("technical ingest output_dir missing"))?;
+    let symbols = result
+        .get("symbols")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("technical ingest symbols missing"))?;
+    let intervals = result
+        .get("intervals")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("technical ingest intervals missing"))?;
+    let mut series = 0usize;
+    let mut rows = 0usize;
+    for symbol in symbols.iter().filter_map(Value::as_str) {
+        for interval in intervals.iter().filter_map(Value::as_str) {
+            let path = orchestrator_core::technical_csv_path(output_dir, symbol, interval)
+                .ok_or_else(|| anyhow::anyhow!("unsupported technical interval {interval}"))?;
+            rows += orchestrator_sql::import_technical_csv(conn, symbol, interval, &path)?;
+            series += 1;
+        }
+    }
+    Ok(json!({"table": "technical_series", "series": series, "rows": rows}))
 }

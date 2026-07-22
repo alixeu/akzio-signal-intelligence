@@ -16,22 +16,20 @@ use std::{
     path::{Path, PathBuf},
     time::Instant,
 };
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::orchestration::allocation::{
-    allocation_prompt_context, compute_allocation_context, normalize_allocation,
+    allocation_prompt_context, compute_allocation_context, derive_guarded_allocation,
 };
 use crate::orchestration::artifact::market_truth_violation_report;
 use crate::orchestration::artifact::{
     build_debate_state_artifact, build_phase1_index, build_topic_generation_artifact,
-    materialize_weighted_probability_base, merge_reducer_output, persist_artifact,
-    persist_artifact_with_last_md, persist_message, persist_message_with_topic, reducer_brief_md,
-    topic_id_from_topic, topics_from_generation_artifact,
+    materialize_weighted_probability_base, persist_artifact, persist_artifact_with_last_md,
+    persist_message, persist_message_with_topic, reducer_brief_md, topic_id_from_topic,
+    topics_from_generation_artifact,
 };
-use crate::orchestration::config::{
-    config_weight, is_critical_role, validate_sqlite_context, RuntimeConfig,
-};
-use crate::orchestration::degraded::{manager_research_fallback, role_artifact_or_degraded};
+use crate::orchestration::config::{validate_sqlite_context, RuntimeConfig};
+use crate::orchestration::degraded::role_artifact_or_degraded;
 use crate::orchestration::lifecycle::{
     append_topic_controller_artifact, append_topic_turn, record_contracts,
     research_plan_to_trade_intent, run_id_for, set_phase_status, set_topic_controller_state,
@@ -113,11 +111,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
     let mut conn = connect(&db_path)?;
     let run_id = run_id_for(&tickers, &date);
     let state_path = run_dir.as_ref().map(|path| path.join("state.json"));
-    let explicit_phase1_agents = args.phase1_agents.is_some();
-    let phase1_agents_raw = args.phase1_agents.clone().unwrap_or_else(|| {
-        config_str(&config, "orchestrator.phase1_agents", DEFAULT_PHASE1_AGENTS)
-    });
-    let phase1_agents = parse_phase1_agents_with_config(&phase1_agents_raw, &runtime_config)?;
+    let phase1_agents = parse_phase1_agents_with_config(DEFAULT_PHASE1_AGENTS, &runtime_config)?;
     let model_override = args.model.clone().filter(|value| !value.is_empty());
     let reasoning_effort_override = args
         .reasoning_effort
@@ -136,8 +130,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         "orchestrator exec resolved runtime paths"
     );
 
-    let analyst_weights =
-        phase1_analyst_weights(&config, &args, &phase1_agents, explicit_phase1_agents);
+    let analyst_weights = phase1_analyst_weights();
     let mut state = json!({
         "run_id": run_id,
         "ticker": ticker,
@@ -156,16 +149,6 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         "analyst_weights": analyst_weights,
         "degraded": false
     });
-    if let Some(weights) = state
-        .get_mut("analyst_weights")
-        .and_then(Value::as_object_mut)
-    {
-        for def in runtime_config.agent_registry.phase1_agents() {
-            weights
-                .entry(def.role_id.clone())
-                .or_insert_with(|| json!(def.default_weight));
-        }
-    }
     state["mock"] = Value::Bool(args.mock);
     state["debug"] = Value::Bool(args.debug);
     if args.debug {
@@ -252,7 +235,18 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         compress_jobs.push((2, spawn_compress_job(phase00_gate.clone(), &state, 2)));
         debug!("phase 2 completed; phase00 compress(2) scheduled");
     }
-    inject_phase0_reflection(&conn, &mut state, &runtime_config)?;
+    if let Err(error) = inject_phase0_reflection(&conn, &mut state, &runtime_config) {
+        tracing::warn!(
+            run_id,
+            error = %error,
+            "prior-memory retrieval failed; continuing without optional reflection context"
+        );
+        state["prior_memory"] = json!({
+            "enabled": false,
+            "status": "non_blocking_failed",
+            "message": error.to_string()
+        });
+    }
     if args.from_phase <= 3 && args.to_phase >= 3 {
         // Concurrent with phase00(1..2). Tools wait on Phase00Gate.
         // Best-effort: if compress already finished, refresh state for prompt inject.
@@ -279,7 +273,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         debug!("phase 3 completed; phase00 compress(3) scheduled");
     }
     let policy = if state.get("research_plan").is_some() {
-        Some(apply_workflow_policy(&mut state, &conn, &runtime_config))
+        Some(apply_workflow_policy(&mut state, &conn, &runtime_config)?)
     } else {
         None
     };
@@ -379,10 +373,22 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         debug!("phase 8 (archive + predict) starting");
         let phase_timer = start_phase_timer(8, "phase8");
         set_run_current_phase(&mut conn, &run_id, 8)?;
-        run_phase8(&conn, &mut state, &runtime_config)?;
-        set_phase_status(&mut state, 8, "done");
+        if let Err(error) = run_phase8(&mut conn, &mut state, &runtime_config) {
+            tracing::warn!(
+                run_id,
+                error = %error,
+                "phase 8 archive/prediction failed after allocation; returning the validated decision"
+            );
+            state["phase8_error"] = json!({
+                "status": "non_blocking_failed",
+                "message": error.to_string()
+            });
+            set_phase_status(&mut state, 8, "non_blocking_failed");
+        } else {
+            set_phase_status(&mut state, 8, "done");
+        }
         record_phase_elapsed(&mut state, phase_timer);
-        debug!("phase 8 (archive + predict) completed");
+        debug!(status = ?state["phase_status"]["8"], "phase 8 archive/prediction finished");
     }
     // Drain any compress still running when the pipeline ends early (e.g. to_phase < 8).
     await_all_compress_jobs(&mut compress_jobs, &mut state).await?;
@@ -490,19 +496,6 @@ fn validate_args(args: &ExecArgs) -> Result<()> {
     if args.to_phase < args.from_phase || args.to_phase > 8 {
         bail!("--to-phase must be between --from-phase and 8");
     }
-    for (name, value) in [
-        ("--technical-weight", args.technical_weight),
-        ("--news-weight", args.news_weight),
-        ("--youtube-weight", args.youtube_weight),
-        ("--reddit-weight", args.reddit_weight),
-        ("--x-weight", args.x_weight),
-    ] {
-        if let Some(v) = value {
-            if v < 0.0 {
-                bail!("{name} must be >= 0");
-            }
-        }
-    }
     Ok(())
 }
 
@@ -525,8 +518,8 @@ fn apply_workflow_policy(
     state: &mut Value,
     conn: &rusqlite::Connection,
     config: &RuntimeConfig,
-) -> WorkflowPolicyDecision {
-    let allocation_context = compute_allocation_context(state, conn, &config.allocation);
+) -> Result<WorkflowPolicyDecision> {
+    let allocation_context = compute_allocation_context(state, conn, &config.allocation)?;
     state["allocation_context"] = allocation_context.clone();
     let signals = workflow_policy_signals(state, &allocation_context, config);
     let decision = evaluate_workflow_policy(
@@ -536,7 +529,7 @@ fn apply_workflow_policy(
         &config.workflow.policy_thresholds,
     );
     record_workflow_policy(state, &decision);
-    decision
+    Ok(decision)
 }
 
 fn workflow_policy_signals(
@@ -1174,58 +1167,11 @@ fn resolve_db_path(args: &ExecArgs, config: &Value) -> PathBuf {
     project_path("outputs/orchestrator.sqlite")
 }
 
-fn phase1_analyst_weights(
-    config: &Value,
-    args: &ExecArgs,
-    phase1_agents: &[String],
-    explicit_phase1_agents: bool,
-) -> Value {
-    let mut weights = json!({
-        "analyst.technical": config_weight(config, "technical", args.technical_weight),
-        "analyst.news_macro": config_weight(config, "news_macro", args.news_weight),
-        "analyst.youtube": config_weight(config, "youtube", args.youtube_weight),
-        "analyst.reddit": config_weight(config, "reddit", args.reddit_weight),
-        "analyst.x": config_weight(config, "x", args.x_weight)
-    });
-    if explicit_phase1_agents {
-        restore_default_weight_for_explicit_agent(
-            &mut weights,
-            phase1_agents,
-            "analyst.youtube",
-            args.youtube_weight,
-        );
-        restore_default_weight_for_explicit_agent(
-            &mut weights,
-            phase1_agents,
-            "analyst.reddit",
-            args.reddit_weight,
-        );
-        restore_default_weight_for_explicit_agent(
-            &mut weights,
-            phase1_agents,
-            "analyst.x",
-            args.x_weight,
-        );
-    }
-    weights
-}
-
-fn restore_default_weight_for_explicit_agent(
-    weights: &mut Value,
-    phase1_agents: &[String],
-    role: &str,
-    cli_weight: Option<f64>,
-) {
-    let Some(default_weight) = cli_weight else {
-        return;
-    };
-    if default_weight <= 0.0 || !phase1_agents.iter().any(|agent| agent == role) {
-        return;
-    }
-    let current_weight = weights.get(role).and_then(Value::as_f64).unwrap_or(0.0);
-    if current_weight <= 0.0 {
-        weights[role] = json!(default_weight);
-    }
+fn phase1_analyst_weights() -> Value {
+    json!({
+        "analyst.technical": 50.0,
+        "analyst.news_macro": 50.0
+    })
 }
 
 async fn run_phase1(
@@ -1245,17 +1191,8 @@ async fn run_phase1(
         }
     }
 
-    let effective_roles = effective_phase1_roles(config, state, roles);
-    if effective_roles.is_empty() {
-        bail!(
-            "all selected phase 1 analysts have zero weight: {}; pass a non-zero weight flag or update orchestrator.analyst_weights in config/config.yaml",
-            zero_weight_roles(state, roles).join(", ")
-        );
-    }
-    record_phase1_skipped_zero_weight(config, state, roles, &effective_roles);
-
     let mut jobs = Vec::new();
-    for &role in &effective_roles {
+    for role in roles {
         jobs.push(prepare_role_job(RoleRun {
             state: state.clone(),
             role,
@@ -1270,10 +1207,7 @@ async fn run_phase1(
             prompt_path: config.prompts.analyst_path(role),
         })?);
     }
-    debug!(
-        job_count = jobs.len(),
-        "phase 1 jobs prepared after zero-weight filter"
-    );
+    debug!(job_count = jobs.len(), "phase 1 jobs prepared");
     let results = run_role_jobs(
         jobs,
         config.workflow.phase1_parallelism,
@@ -1303,76 +1237,6 @@ async fn run_phase1(
     Ok(())
 }
 
-fn effective_phase1_roles<'a>(
-    config: &RuntimeConfig,
-    state: &Value,
-    roles: &'a [String],
-) -> Vec<&'a str> {
-    if !config.workflow.skip_zero_weight_analysts {
-        return roles.iter().map(String::as_str).collect();
-    }
-
-    roles
-        .iter()
-        .filter_map(|role| {
-            if is_critical_role(config, role) {
-                return Some(role.as_str());
-            }
-            let weight = analyst_weight(state, role);
-            if weight <= 0.0 {
-                debug!(
-                    role = role.as_str(),
-                    weight, "skipping zero-weight analyst in phase 1"
-                );
-                None
-            } else {
-                Some(role.as_str())
-            }
-        })
-        .collect()
-}
-
-fn record_phase1_skipped_zero_weight(
-    config: &RuntimeConfig,
-    state: &mut Value,
-    roles: &[String],
-    effective_roles: &[&str],
-) {
-    if !config.workflow.skip_zero_weight_analysts {
-        return;
-    }
-
-    let skipped = roles
-        .iter()
-        .filter(|role| !effective_roles.contains(&role.as_str()))
-        .cloned()
-        .collect::<Vec<_>>();
-    if !skipped.is_empty() {
-        state["phase1_skipped_zero_weight"] = json!(skipped);
-        debug!(
-            skipped = ?state["phase1_skipped_zero_weight"],
-            "skipped zero-weight analysts in phase 1"
-        );
-    }
-}
-
-fn analyst_weight(state: &Value, role: &str) -> f64 {
-    state
-        .get("analyst_weights")
-        .and_then(Value::as_object)
-        .and_then(|weights| weights.get(role))
-        .and_then(Value::as_f64)
-        .unwrap_or(0.0)
-}
-
-fn zero_weight_roles(state: &Value, roles: &[String]) -> Vec<String> {
-    roles
-        .iter()
-        .filter(|role| analyst_weight(state, role) <= 0.0)
-        .cloned()
-        .collect()
-}
-
 async fn run_phase2(
     mut conn: rusqlite::Connection,
     state: &mut Value,
@@ -1389,73 +1253,37 @@ async fn run_phase2(
         .map(|s| s.to_string())
         .context("db_path missing from state")?;
 
-    // P2.5 topic generation ∥ bull/bear warm-up (准备完毕), then multi-topic fork.
-    // Separate state clones so both tasks can mutate without aliasing.
-    let mut topic_state = state.clone();
-    let mut warmup_state = state.clone();
+    // Rust selects material cross-analyst conflicts. The former topic-generator
+    // and empty "ready" warm-up LLM calls added no evidence and are removed.
     let model_override_owned = model_override.map(|s| s.to_string());
     let reasoning_effort_override_owned = reasoning_effort_override.map(|s| s.to_string());
-    let config_for_topics = config.clone();
-    let config_for_warmup = config.clone();
-    let db_path_topics = db_path.clone();
-    let model_ov_topics = model_override_owned.clone();
-    let reasoning_ov_topics = reasoning_effort_override_owned.clone();
-    let model_ov_warmup = model_override_owned.clone();
-    let reasoning_ov_warmup = reasoning_effort_override_owned.clone();
-
-    let (topics_result, warmup_result) = tokio::join!(
-        async move {
-            let mut topic_conn = orchestrator_sql::connect(&db_path_topics)
-                .with_context(|| format!("topic-gen connect {}", db_path_topics))?;
-            let topics = run_phase2_topic_generation(
-                &mut topic_conn,
-                &mut topic_state,
-                model_ov_topics.as_deref(),
-                reasoning_ov_topics.as_deref(),
-                &config_for_topics,
-            )
-            .await?;
-            Ok::<_, anyhow::Error>((topics, topic_state))
-        },
-        async move {
-            let warmup = run_phase2_side_warmups(
-                &mut warmup_state,
-                model_ov_warmup.as_deref(),
-                reasoning_ov_warmup.as_deref(),
-                &config_for_warmup,
-            )
-            .await?;
-            Ok::<_, anyhow::Error>((warmup, warmup_state))
-        }
-    );
-    let (topics, topic_state) = topics_result?;
-    let (warmup, _warmup_state) = warmup_result?;
-    // Merge topic-generation fields back into canonical state.
-    for key in [
-        "topic_generation_artifact",
-        "debate_topics",
-        "role_job_metrics",
-        "degraded",
-        "degraded_report",
-    ] {
-        if let Some(v) = topic_state.get(key) {
-            state[key] = v.clone();
-        }
-    }
+    let topics = run_phase2_topic_generation(&mut conn, state)?;
     let topics = topics
         .into_iter()
         .take(max_topics.max(1) as usize)
         .collect::<Vec<_>>();
-    state["phase2_warmup"] = warmup.clone();
+    state["phase2_warmup"] = json!({
+        "status": "removed",
+        "reason": "no_information_increment",
+        "llm_calls": 0
+    });
     debug!(
         topic_count = topics.len(),
-        warmup_ready = warmup
-            .get("ready")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
-        "phase 2 topics + warm-up joined"
+        "phase 2 deterministic conflict topics ready"
     );
     state["debate_turns"] = json!([]);
+
+    if topics.is_empty() {
+        run_phase2_final_reducer(
+            &mut conn,
+            state,
+            model_override,
+            reasoning_effort_override,
+            config,
+        )
+        .await?;
+        return Ok(conn);
+    }
 
     let common_ground = state
         .get("topic_generation_artifact")
@@ -1479,7 +1307,7 @@ async fn run_phase2(
         "phase00_tables": state.get("phase00_tables").cloned().unwrap_or_else(|| json!({})),
         "phase00_memory": state.get("phase00_memory").cloned().unwrap_or_else(|| json!({})),
         "phase_compress": state.get("phase_compress").cloned().unwrap_or_else(|| json!({})),
-        "phase2_warmup": warmup,
+        "phase2_warmup": state.get("phase2_warmup").cloned().unwrap_or(Value::Null),
         "common_ground": common_ground,
         "late_evidence": state.get("late_evidence").cloned().unwrap_or_else(|| json!([])),
         "degraded": state.get("degraded").cloned().unwrap_or(Value::Null),
@@ -1561,146 +1389,6 @@ async fn run_phase2(
     Ok(conn)
 }
 
-/// Bull/bear warm-up without a topic: load phase00 index, reply 准备完毕.
-/// Runs in parallel with topic generation (P2.5).
-async fn run_phase2_side_warmups(
-    state: &mut Value,
-    model_override: Option<&str>,
-    reasoning_effort_override: Option<&str>,
-    config: &RuntimeConfig,
-) -> Result<Value> {
-    let mock = is_mock(state);
-    let run_id = state
-        .get("run_id")
-        .and_then(Value::as_str)
-        .unwrap_or("run")
-        .to_string();
-
-    // Mock (and live fallback): deterministic ready ack — no topic yet.
-    if mock {
-        let warmup = json!({
-            "ready": true,
-            "mode": "mock",
-            "bull": {
-                "session_id": format!("{run_id}:phase2:warmup:bull"),
-                "turn_id": format!("{run_id}:phase2:warmup:bull"),
-                "ack": "准备完毕",
-                "status": "ready"
-            },
-            "bear": {
-                "session_id": format!("{run_id}:phase2:warmup:bear"),
-                "turn_id": format!("{run_id}:phase2:warmup:bear"),
-                "ack": "准备完毕",
-                "status": "ready"
-            }
-        });
-        debug!("phase 2 warm-up completed (mock ready)");
-        return Ok(warmup);
-    }
-
-    let db_path = state
-        .get("db_path")
-        .and_then(Value::as_str)
-        .map(PathBuf::from)
-        .context("db_path missing for phase2 warm-up")?;
-    let mut conn = orchestrator_sql::connect(&db_path)?;
-
-    let bull_sessions = json!({
-        "bull": {
-            "session_id": format!("{run_id}:phase2:warmup:bull"),
-            "turn_id": format!("{run_id}:phase2:warmup:bull")
-        },
-        "bear": {
-            "session_id": format!("{run_id}:phase2:warmup:bear"),
-            "turn_id": format!("{run_id}:phase2:warmup:bear")
-        },
-        "mediator": {}
-    });
-
-    // Live warm-up: optional LLM path; treat any success as ready for now.
-    // Full tool-loop warm-up uses warmup prompts when present.
-    let bull_path = config
-        .prompts
-        .path_for("researcher.bull.warmup")
-        .cloned()
-        .or_else(|| config.prompts.path_for("researcher.bull.initial").cloned());
-    let bear_path = config
-        .prompts
-        .path_for("researcher.bear.warmup")
-        .cloned()
-        .or_else(|| config.prompts.path_for("researcher.bear.initial").cloned());
-
-    // Best-effort live warm-up: tool-loop may fail; pipeline still marks ready so
-    // topic forks can proceed (soft-accept 准备完毕).
-    if let Some(path) = bull_path {
-        if let Err(err) = run_topic_steer_step(
-            &mut conn,
-            state,
-            "researcher.bull.warmup",
-            "warmup_ack",
-            0,
-            "warmup",
-            &bull_sessions,
-            Some(steer_payload(
-                "warmup",
-                &json!({
-                    "instruction": "Read phase00 index via tools if needed, then reply only 准备完毕."
-                }),
-            )),
-            model_override,
-            reasoning_effort_override,
-            config,
-            path,
-        )
-        .await
-        {
-            warn!(error = %err, "bull warm-up failed; marking ready degraded");
-        }
-    }
-    if let Some(path) = bear_path {
-        if let Err(err) = run_topic_steer_step(
-            &mut conn,
-            state,
-            "researcher.bear.warmup",
-            "warmup_ack",
-            0,
-            "warmup",
-            &bull_sessions,
-            Some(steer_payload(
-                "warmup",
-                &json!({
-                    "instruction": "Read phase00 index via tools if needed, then reply only 准备完毕."
-                }),
-            )),
-            model_override,
-            reasoning_effort_override,
-            config,
-            path,
-        )
-        .await
-        {
-            warn!(error = %err, "bear warm-up failed; marking ready degraded");
-        }
-    }
-
-    Ok(json!({
-        "ready": true,
-        "mode": "live",
-        "bull": {
-            "session_id": format!("{run_id}:phase2:warmup:bull"),
-            "turn_id": format!("{run_id}:phase2:warmup:bull"),
-            "ack": "准备完毕",
-            "status": "ready"
-        },
-        "bear": {
-            "session_id": format!("{run_id}:phase2:warmup:bear"),
-            "turn_id": format!("{run_id}:phase2:warmup:bear"),
-            "ack": "准备完毕",
-            "status": "ready"
-        }
-    }))
-}
-
 fn topic_fork_user_message(topic: &Value, common_ground: &Value) -> String {
     let title = topic
         .get("topic")
@@ -1718,7 +1406,7 @@ fn topic_fork_user_message(topic: &Value, common_ground: &Value) -> String {
          topic_id: {topic_id}\n\
          decision_hinge: {hinge}\n\
          common_ground: {cg}\n\
-         （预热 session 已完成「准备完毕」；本消息为 fork 后的首条 topic user。请输出 seed packet JSON。）"
+         （本消息为冲突主题的首条 user 输入。请输出 seed packet JSON。）"
     )
 }
 
@@ -1749,7 +1437,7 @@ async fn run_one_topic_debate(
     let initial_topic_state = json!({
         "topic": topic.clone(),
         "mode": "steer_room_fork",
-        "warmup_ready": local_state.get("phase2_warmup").and_then(|w| w.get("ready")).cloned().unwrap_or(json!(false)),
+        "warmup_removed": true,
         "fork_user_message": fork_msg,
         "turns": [],
         "controller_artifacts": [],
@@ -1764,7 +1452,7 @@ async fn run_one_topic_debate(
             "user_message": topic_fork_user_message(&topic, &common_ground),
             "common_ground": common_ground,
             "topic": topic,
-            "requirement": "Warm-up already replied 准备完毕. This is the forked topic user message; emit seed packet JSON only."
+            "requirement": "This is the deterministic conflict topic user message; emit seed packet JSON only."
         }),
     ));
 
@@ -2240,53 +1928,27 @@ fn compact_debate_artifact(artifact: &Value) -> Value {
     )
 }
 
-async fn run_phase2_topic_generation(
+fn run_phase2_topic_generation(
     conn: &mut rusqlite::Connection,
     state: &mut Value,
-    model_override: Option<&str>,
-    reasoning_effort_override: Option<&str>,
-    config: &RuntimeConfig,
 ) -> Result<Vec<Value>> {
-    let mock = is_mock(state);
-    let base = build_topic_generation_artifact(state);
-    state["topic_generation_artifact"] = base.clone();
-    if base.get("actionable").and_then(Value::as_bool) == Some(false) {
+    let artifact = build_topic_generation_artifact(state);
+    state["topic_generation_artifact"] = artifact.clone();
+    let topics = topics_from_generation_artifact(&artifact);
+    if topics.is_empty() {
         state["debate_topics"] = json!([]);
-        persist_message(conn, state, 2, "mediator.topic", "topic_final", None, base)?;
-        debug!("phase 2 topic generation skipped: no actionable Phase 1 evidence");
+        persist_message(
+            conn,
+            state,
+            2,
+            "mediator.topic",
+            "topic_final",
+            None,
+            artifact,
+        )?;
+        debug!("phase 2 debate skipped by deterministic conflict gate");
         return Ok(Vec::new());
     }
-    debug!("phase 2 topic generation role starting");
-    let output = run_single_role_job(
-        RoleRun {
-            state: state.clone(),
-            role: "mediator.topic",
-            phase: 2,
-            kind: "topic_generation",
-            round: None,
-            topic_id: None,
-            mock,
-            model_override,
-            reasoning_effort_override,
-            config,
-            prompt_path: config
-                .prompts
-                .path_for("mediator.topic")
-                .map(|p| p.as_path()),
-        },
-        config.workflow.reducer_timeout_sec,
-        config,
-        state,
-        conn,
-    )
-    .await?;
-    let artifact = merge_reducer_output(base, output);
-    let topics = topics_from_generation_artifact(&artifact);
-    debug!(
-        topic_count = topics.len(),
-        "phase 2 topic generation role completed"
-    );
-    state["topic_generation_artifact"] = artifact.clone();
     state["debate_topics"] = Value::Array(topics.clone());
     persist_message(
         conn,
@@ -2297,6 +1959,7 @@ async fn run_phase2_topic_generation(
         None,
         artifact,
     )?;
+    debug!(topic_count = topics.len(), "Rust conflict topics generated");
     Ok(topics)
 }
 
@@ -2564,26 +2227,20 @@ async fn run_phase3(
         state,
         conn,
     )
-    .await
-    .unwrap_or_else(|error| manager_research_fallback(state, error));
-    let artifact = if artifact
+    .await?;
+    if artifact
         .get("degraded")
         .and_then(Value::as_bool)
         .unwrap_or(false)
     {
-        manager_research_fallback(
-            state,
-            anyhow::anyhow!(
-                "{}",
-                artifact
-                    .get("error")
-                    .and_then(Value::as_str)
-                    .unwrap_or("manager.research degraded")
-            ),
-        )
-    } else {
-        artifact
-    };
+        anyhow::bail!(
+            "manager.research returned a degraded artifact: {}",
+            artifact
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown validation failure")
+        );
+    }
     let initial_violations = phase3_probability_drift_violations(state, &artifact);
     let artifact = if initial_violations.is_empty() {
         artifact
@@ -2950,67 +2607,55 @@ async fn run_phase5(
     config: &RuntimeConfig,
 ) -> Result<()> {
     state["risk_debate_state"] = json!({"history": []});
-    let risk_roles = [
-        ("risk.aggressive", config.prompts.risk_aggressive.as_path()),
-        (
-            "risk.conservative",
-            config.prompts.risk_conservative.as_path(),
-        ),
-        ("risk.neutral", config.prompts.risk_neutral.as_path()),
-    ];
-    for round in 1..=config.workflow.risk_rounds {
-        // Same-round risk perspectives run in parallel; history is appended in
-        // stable role order after all three finish so the next round sees them.
-        let mut jobs = Vec::new();
-        for (role, prompt_path) in risk_roles {
-            jobs.push(prepare_role_job(RoleRun {
-                state: state.clone(),
-                role,
-                phase: 5,
-                kind: "risk_argument",
-                round: Some(round),
-                topic_id: None,
-                mock: is_mock(state),
-                model_override,
-                reasoning_effort_override,
-                config,
-                prompt_path: Some(prompt_path),
-            })?);
-        }
-        let results = run_role_jobs(
-            jobs,
-            risk_roles.len().max(1),
-            config.workflow.agent_timeout_sec,
-        )
-        .await;
-
-        // Preserve deterministic history order: aggressive → conservative → neutral.
-        let order = ["risk.aggressive", "risk.conservative", "risk.neutral"];
-        let mut by_role = std::collections::HashMap::new();
-        for result in results {
-            by_role.insert(result.role.clone(), result);
-        }
-        for role in order {
-            let Some(result) = by_role.remove(role) else {
-                continue;
-            };
-            persist_prompt_metric(conn, &result);
-            record_role_job_metrics(state, &result);
-            let mut artifact = role_artifact_or_degraded(state, config, result)?;
-            sanitize_downstream_constraints(state, role, &mut artifact);
-            let turn = json!({
-                "role": role,
-                "phase": 5,
-                "kind": "risk_argument",
-                "round": round,
-                "artifact": artifact
-            });
-            if let Some(history) = state["risk_debate_state"]["history"].as_array_mut() {
-                history.push(turn.clone());
-            }
-            persist_message(conn, state, 5, role, "risk_argument", Some(round), turn)?;
-        }
+    // One integrated review replaces three perspective calls. The prompt
+    // evaluates conservative/base/aggressive scenarios in one contract while
+    // Rust policy decides whether this phase runs at all.
+    let risk_role = "risk.conservative";
+    let round = 1;
+    let result = run_role_jobs(
+        vec![prepare_role_job(RoleRun {
+            state: state.clone(),
+            role: risk_role,
+            phase: 5,
+            kind: "risk_argument",
+            round: Some(round),
+            topic_id: None,
+            mock: is_mock(state),
+            model_override,
+            reasoning_effort_override,
+            config,
+            prompt_path: Some(config.prompts.risk_conservative.as_path()),
+        })?],
+        1,
+        config.workflow.agent_timeout_sec,
+    )
+    .await
+    .into_iter()
+    .next()
+    .context("integrated risk review returned no result")?;
+    persist_prompt_metric(conn, &result);
+    record_role_job_metrics(state, &result);
+    let mut artifact = role_artifact_or_degraded(state, config, result)?;
+    sanitize_downstream_constraints(state, risk_role, &mut artifact);
+    let turn = json!({
+        "role": risk_role,
+        "phase": 5,
+        "kind": "risk_argument",
+        "round": round,
+        "artifact": artifact
+    });
+    if let Some(history) = state["risk_debate_state"]["history"].as_array_mut() {
+        history.push(turn.clone());
     }
+    persist_message(
+        conn,
+        state,
+        5,
+        risk_role,
+        "risk_argument",
+        Some(round),
+        turn,
+    )?;
     Ok(())
 }
 
@@ -3104,10 +2749,11 @@ fn run_phase6_derived(conn: &mut rusqlite::Connection, state: &mut Value) -> Res
 
 #[allow(clippy::too_many_arguments)]
 fn run_phase8(
-    conn: &rusqlite::Connection,
+    conn: &mut rusqlite::Connection,
     state: &mut Value,
     _config: &RuntimeConfig,
 ) -> Result<()> {
+    let tx = conn.transaction()?;
     let run_id = state
         .get("run_id")
         .and_then(Value::as_str)
@@ -3134,7 +2780,7 @@ fn run_phase8(
         .unwrap_or_default();
 
     upsert_run_archive(
-        conn,
+        &tx,
         &RunArchiveInput {
             run_id: run_id.clone(),
             workflow_version: "v1".to_string(),
@@ -3164,7 +2810,7 @@ fn run_phase8(
                 (long_probability, short_probability)
             {
                 upsert_prediction(
-                    conn,
+                    &tx,
                     &PredictionInput {
                         run_id: run_id.clone(),
                         ticker: item_ticker.clone(),
@@ -3196,6 +2842,8 @@ fn run_phase8(
         state["degraded"] = Value::Bool(true);
         state["phase8_warning"] = json!("no complete ticker probabilities found in research_plan");
     }
+
+    tx.commit()?;
 
     Ok(())
 }
@@ -3276,44 +2924,22 @@ fn weighted_base_probability_for_ticker(state: &Value, ticker: &str) -> Option<f
 async fn run_phase7(
     conn: &mut rusqlite::Connection,
     state: &mut Value,
-    model_override: Option<&str>,
-    reasoning_effort_override: Option<&str>,
+    _model_override: Option<&str>,
+    _reasoning_effort_override: Option<&str>,
     config: &RuntimeConfig,
 ) -> Result<()> {
-    let mock = is_mock(state);
     debug!("allocation context computation starting");
-    let context = compute_allocation_context(state, conn, &config.allocation);
+    let context = compute_allocation_context(state, conn, &config.allocation)?;
     state["allocation_context"] = allocation_prompt_context(&context);
     debug!(vix_regime = ?context.get("vix").and_then(|v| v.get("regime")), "allocation context ready");
-
-    let raw_artifact = run_single_role_job(
-        RoleRun {
-            state: state.clone(),
-            role: "allocation.manager",
-            phase: 7,
-            kind: "artifact",
-            round: None,
-            topic_id: None,
-            mock,
-            model_override,
-            reasoning_effort_override,
-            config,
-            prompt_path: Some(config.prompts.allocation_manager.as_path()),
-        },
-        config.workflow.agent_timeout_sec,
-        config,
-        state,
-        conn,
-    )
-    .await?;
-    let mut allocation = normalize_allocation(&raw_artifact, &context, &config.allocation);
-    allocation["id"] = json!("allocation.manager");
-    allocation["role"] = json!("allocation.manager");
+    let mut allocation = derive_guarded_allocation(state, &context, &config.allocation)?;
+    allocation["id"] = json!("allocator.rust");
+    allocation["role"] = json!("allocator.rust");
     allocation["status"] = json!("usable");
     sanitize_downstream_constraints(state, "portfolio_allocation", &mut allocation);
-    persist_artifact(conn, state, 7, "allocation.manager", allocation.clone())?;
+    persist_artifact(conn, state, 7, "allocator.rust", allocation.clone())?;
     state["portfolio_allocation"] = allocation;
-    debug!("allocation manager role completed");
+    debug!("Rust allocation guardrails completed");
     Ok(())
 }
 
@@ -3356,259 +2982,6 @@ mod tests {
             .collect()
     }
 
-    fn test_runtime_config(skip_zero_weight_analysts: bool) -> RuntimeConfig {
-        RuntimeConfig {
-            llm_roles: std::collections::BTreeMap::new(),
-            web_search: std::collections::BTreeMap::new(),
-            truncation: orchestrator_llm::truncation::TruncationConfig::default(),
-            judge: orchestrator_llm::llm_judge::JudgeConfig::default(),
-            strict_sqlite: true,
-            required_contexts: Vec::new(),
-            prompts: crate::orchestration::config::PromptConfig {
-                prompts: std::collections::BTreeMap::new(),
-                manager_research: std::path::PathBuf::new(),
-                trader: std::path::PathBuf::new(),
-                risk_aggressive: std::path::PathBuf::new(),
-                risk_conservative: std::path::PathBuf::new(),
-                risk_neutral: std::path::PathBuf::new(),
-                portfolio_manager: std::path::PathBuf::new(),
-                allocation_manager: std::path::PathBuf::new(),
-            },
-            workflow: crate::orchestration::config::WorkflowConfig {
-                phase1_parallelism: 5,
-                agent_timeout_sec: 300,
-                reducer_timeout_sec: 300,
-                risk_rounds: 1,
-                critical_roles: ["analyst.technical", "analyst.news_macro"]
-                    .into_iter()
-                    .map(String::from)
-                    .collect(),
-                late_evidence_enabled: true,
-                policy_mode: WorkflowPolicyMode::Selective,
-                policy_thresholds: Default::default(),
-                skip_zero_weight_analysts,
-                force_portfolio_review: false,
-            },
-            allocation: crate::orchestration::config::AllocationConfig {
-                investable_assets: vec!["QQQ".to_string(), "SOXX".to_string()],
-                regime_signal: "VIX".to_string(),
-                regime_thresholds: vec![15.0, 20.0, 30.0],
-                regime_labels: vec![
-                    "risk_on".to_string(),
-                    "normal".to_string(),
-                    "elevated".to_string(),
-                    "defensive".to_string(),
-                ],
-                correlation_window_days: 60,
-                max_single_position: 0.70,
-                vol_indicator: "STD20".to_string(),
-            },
-            reflection: crate::orchestration::config::ReflectionConfig {
-                enabled: true,
-                reflection_version: "v1".to_string(),
-                _promote_mode: "auto".to_string(),
-                retrieval: orchestrator_core::RetrievalBudget::default(),
-            },
-            plugins: crate::orchestration::config::PluginConfig {
-                enabled: false,
-                components_dir: std::path::PathBuf::new(),
-                roles_dir: std::path::PathBuf::new(),
-                disabled_components: Vec::new(),
-                extra_component_dirs: Vec::new(),
-            },
-            component_plugins: orchestrator_core::ComponentRegistry::default(),
-            role_plugins: orchestrator_core::RolePluginRegistry::default(),
-            agent_registry: orchestrator_core::AgentRegistry::builtin(),
-        }
-    }
-
-    #[test]
-    fn phase1_zero_weight_filter_skips_non_critical_roles() {
-        let config = test_runtime_config(true);
-        let state = json!({
-            "analyst_weights": {
-                "analyst.technical": 40.0,
-                "analyst.news_macro": 35.0,
-                "analyst.youtube": 0.0
-            }
-        });
-        let roles = vec![
-            "analyst.technical".to_string(),
-            "analyst.news_macro".to_string(),
-            "analyst.youtube".to_string(),
-        ];
-
-        let effective_roles = effective_phase1_roles(&config, &state, &roles);
-
-        assert_eq!(
-            effective_roles,
-            vec!["analyst.technical", "analyst.news_macro"]
-        );
-    }
-
-    #[test]
-    fn phase1_zero_weight_filter_keeps_critical_roles() {
-        let config = test_runtime_config(true);
-        let state = json!({
-            "analyst_weights": {
-                "analyst.technical": 0.0,
-                "analyst.news_macro": 0.0,
-                "analyst.youtube": 0.0
-            }
-        });
-        let roles = vec![
-            "analyst.technical".to_string(),
-            "analyst.news_macro".to_string(),
-            "analyst.youtube".to_string(),
-        ];
-
-        let effective_roles = effective_phase1_roles(&config, &state, &roles);
-
-        assert_eq!(
-            effective_roles,
-            vec!["analyst.technical", "analyst.news_macro"]
-        );
-    }
-
-    #[test]
-    fn phase1_zero_weight_filter_can_be_disabled() {
-        let config = test_runtime_config(false);
-        let state = json!({
-            "analyst_weights": {
-                "analyst.technical": 40.0,
-                "analyst.news_macro": 35.0,
-                "analyst.youtube": 0.0
-            }
-        });
-        let roles = vec![
-            "analyst.technical".to_string(),
-            "analyst.news_macro".to_string(),
-            "analyst.youtube".to_string(),
-        ];
-
-        let effective_roles = effective_phase1_roles(&config, &state, &roles);
-
-        assert_eq!(
-            effective_roles,
-            vec!["analyst.technical", "analyst.news_macro", "analyst.youtube"]
-        );
-    }
-
-    #[test]
-    fn zero_weight_roles_names_only_selected_zero_weight_roles() {
-        let state = json!({
-            "analyst_weights": {
-                "analyst.youtube": 0.0,
-                "analyst.reddit": 9.0,
-                "analyst.x": 0.0
-            }
-        });
-        let roles = vec!["analyst.youtube".to_string(), "analyst.reddit".to_string()];
-
-        assert_eq!(zero_weight_roles(&state, &roles), vec!["analyst.youtube"]);
-    }
-
-    #[test]
-    fn explicit_phase1_agent_restores_cli_default_for_configured_zero_weight() {
-        let config = json!({
-            "orchestrator": {
-                "analyst_weights": {
-                    "youtube": 0.0,
-                    "reddit": 0.0,
-                    "x": 0.0
-                }
-            }
-        });
-        let args = ExecArgs {
-            date: None,
-            lang: "zh".to_string(),
-            mode: Mode::Probability,
-            window_days: None,
-            phase1_agents: Some("youtube".to_string()),
-            db_path: None,
-            run_dir: None,
-            config: None,
-            model: None,
-            reasoning_effort: None,
-            max_debate_rounds: None,
-            max_topics_per_side: None,
-            technical_weight: None,
-            news_weight: None,
-            youtube_weight: Some(8.0),
-            reddit_weight: None,
-            x_weight: None,
-            from_phase: 1,
-            to_phase: 8,
-            tech_refresh_enabled: true,
-            tech_refresh_intervals: "1d,3h,20min".to_string(),
-            tech_refresh_save_bars: 120,
-            tech_refresh_script_path: None,
-            tech_refresh_timeout_sec: 900,
-            tech_refresh_python_bin: None,
-            jin10_refresh_enabled: true,
-            jin10_refresh_lookback_hours: 24.0,
-            jin10_refresh_script_path: None,
-            jin10_refresh_timeout_sec: 120,
-            mock: false,
-            debug: false,
-        };
-        let roles = vec!["analyst.youtube".to_string()];
-
-        let weights = phase1_analyst_weights(&config, &args, &roles, true);
-
-        assert_eq!(weights["analyst.youtube"].as_f64(), Some(8.0));
-        assert_eq!(weights["analyst.reddit"].as_f64(), Some(0.0));
-    }
-
-    #[test]
-    fn config_phase1_agents_keep_configured_zero_weight() {
-        let config = json!({
-            "orchestrator": {
-                "analyst_weights": {
-                    "youtube": 0.0
-                }
-            }
-        });
-        let args = ExecArgs {
-            date: None,
-            lang: "zh".to_string(),
-            mode: Mode::Probability,
-            window_days: None,
-            phase1_agents: Some(DEFAULT_PHASE1_AGENTS.to_string()),
-            db_path: None,
-            run_dir: None,
-            config: None,
-            model: None,
-            reasoning_effort: None,
-            max_debate_rounds: None,
-            max_topics_per_side: None,
-            technical_weight: None,
-            news_weight: None,
-            youtube_weight: None,
-            reddit_weight: None,
-            x_weight: None,
-            from_phase: 1,
-            to_phase: 8,
-            tech_refresh_enabled: true,
-            tech_refresh_intervals: "1d,3h,20min".to_string(),
-            tech_refresh_save_bars: 120,
-            tech_refresh_script_path: None,
-            tech_refresh_timeout_sec: 900,
-            tech_refresh_python_bin: None,
-            jin10_refresh_enabled: true,
-            jin10_refresh_lookback_hours: 24.0,
-            jin10_refresh_script_path: None,
-            jin10_refresh_timeout_sec: 120,
-            mock: false,
-            debug: false,
-        };
-        let roles = vec!["analyst.youtube".to_string()];
-
-        let weights = phase1_analyst_weights(&config, &args, &roles, false);
-
-        assert_eq!(weights["analyst.youtube"].as_f64(), Some(0.0));
-    }
-
     #[test]
     fn llm_roles_inherit_global_defaults_and_builtin_role_values() {
         let roles = crate::orchestration::config::required_llm_roles()
@@ -3637,19 +3010,18 @@ mod tests {
         let roles = crate::orchestration::config::llm_roles_from_config(&config).unwrap();
         let settings = &roles["analyst.technical"];
         assert_eq!(settings.model, "gpt-5.4");
-        assert_eq!(settings.max_turns, Some(6));
+        assert_eq!(settings.max_turns, Some(12));
         assert_eq!(settings.reasoning_effort.as_deref(), Some("medium"));
         assert!(settings.native_web_search);
         assert!(settings.tools.contains(&"read_run_context".to_string()));
-        assert!(settings.tools.contains(&"read_technical_csv".to_string()));
+        assert!(settings
+            .tools
+            .contains(&"read_technical_context".to_string()));
         for role in [
             "manager.research",
             "trader",
-            "risk.aggressive",
             "risk.conservative",
-            "risk.neutral",
             "portfolio.manager",
-            "allocation.manager",
         ] {
             assert!(roles[role].tools.is_empty(), "role={role}");
         }
@@ -3757,7 +3129,7 @@ mod tests {
         assert_eq!(technical.max_result_chars, 12_000);
 
         let news_macro = &web_search["analyst.news_macro"];
-        assert_eq!(news_macro.mode, WebSearchMode::Disabled);
+        assert_eq!(news_macro.mode, WebSearchMode::Live);
         assert_eq!(news_macro.provider, WebSearchProviderKind::Mock);
         assert_eq!(news_macro.context_size, WebSearchContextSize::Medium);
         assert_eq!(news_macro.max_result_chars, 12_000);
@@ -3801,10 +3173,7 @@ mod tests {
             WebSearchContextSize::High
         );
         assert_eq!(web_search["analyst.technical"].max_result_chars, 9000);
-        assert_eq!(
-            web_search["analyst.news_macro"].mode,
-            WebSearchMode::Disabled
-        );
+        assert_eq!(web_search["analyst.news_macro"].mode, WebSearchMode::Live);
         assert_eq!(
             web_search["analyst.news_macro"].provider,
             WebSearchProviderKind::Mock
@@ -3997,25 +3366,16 @@ mod tests {
 
     #[test]
     fn parse_phase1_agents_rejects_standalone_fundamental() {
-        let err = parse_phase1_agents("technical,news,fundamental,youtube,reddit,x").unwrap_err();
+        let err = parse_phase1_agents("technical,news,fundamental").unwrap_err();
 
         assert!(err.to_string().contains("fundamental analyst was removed"));
     }
 
     #[test]
     fn parse_phase1_agents_normalizes_supported_roles() {
-        let roles = parse_phase1_agents("technical,news,youtube,reddit,x").unwrap();
+        let roles = parse_phase1_agents("technical,news").unwrap();
 
-        assert_eq!(
-            roles,
-            vec![
-                "analyst.technical",
-                "analyst.news_macro",
-                "analyst.youtube",
-                "analyst.reddit",
-                "analyst.x"
-            ]
-        );
+        assert_eq!(roles, vec!["analyst.technical", "analyst.news_macro"]);
     }
 
     #[test]
@@ -4347,28 +3707,36 @@ mod tests {
         let mut state = json!({"degraded": false});
         crate::orchestration::degraded::record_preflight_result(
             &mut state,
-            "read_technical_csv",
+            "read_technical_context",
             Err(anyhow::anyhow!("missing technical data")),
         );
 
         assert_eq!(state["degraded"], true);
-        assert_eq!(state["preflight"]["read_technical_csv"]["status"], "error");
-        assert!(state["preflight"]["read_technical_csv"]["message"]
+        assert_eq!(
+            state["preflight"]["read_technical_context"]["status"],
+            "error"
+        );
+        assert!(state["preflight"]["read_technical_context"]["message"]
             .as_str()
             .unwrap()
             .contains("missing technical data"));
     }
 
     #[tokio::test]
-    async fn technical_csv_preflight_checks_dir() {
-        let mut state = json!({"degraded": false, "tech_refresh_enabled": false});
-        crate::orchestration::policy::run_technical_csv_preflight(&mut state)
+    async fn technical_preflight_rejects_missing_sqlite_import_source() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        orchestrator_sql::ensure_schema(&conn).unwrap();
+        let mut state = json!({
+            "degraded": false,
+            "tech_refresh_enabled": false,
+            "analysis_universe": ["MISSING_STRICT_SQLITE_TEST"]
+        });
+        crate::orchestration::policy::run_technical_csv_preflight(&mut conn, &mut state)
             .await
             .unwrap();
-        assert!(state.get("technical_csv_dir").is_some());
         assert_eq!(
-            state["preflight"]["read_technical_csv"]["status"],
-            "skipped"
+            state["preflight"]["read_technical_context"]["status"],
+            "error"
         );
     }
 }

@@ -80,6 +80,10 @@ pub const VALID_PLACEHOLDERS: &[&str] = &[
     "phase3_context",
     "risk_context",
     "portfolio_context",
+    "phase1_index",
+    "phase00_context",
+    "prior_phase_summaries",
+    "common_ground",
     "workflow_pattern",
     "researcher_body",
     "risk_analyst_body",
@@ -261,13 +265,11 @@ fn infer_role_from_path(path: &Path, prompts_dir: &Path) -> String {
             other => format!("manager.{other}"),
         },
         "mediators" => match stem {
-            "topic_generation" => "mediator.topic".to_string(),
             "topic_controller" => "mediator.topic_controller".to_string(),
             other => format!("mediator.{other}"),
         },
         "risk" => format!("risk.{stem}"),
         "traders" => "trader".to_string(),
-        "allocation" => "allocation.manager".to_string(),
         _ => String::new(),
     }
 }

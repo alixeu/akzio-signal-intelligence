@@ -1,5 +1,8 @@
-use orchestrator_core::{closes_for_correlation, config_get, latest_indicator};
-use orchestrator_sql::load_technical_csv;
+use anyhow::{bail, Result};
+use orchestrator_core::{
+    closes_for_correlation, config_get, latest_indicator, PortfolioAllocation,
+};
+use orchestrator_sql::load_technical_series;
 use rusqlite::Connection;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -10,7 +13,7 @@ pub(crate) fn compute_allocation_context(
     state: &Value,
     conn: &Connection,
     config: &AllocationConfig,
-) -> Value {
+) -> Result<Value> {
     let tickers = state
         .get("tickers")
         .and_then(Value::as_array)
@@ -39,53 +42,34 @@ pub(crate) fn compute_allocation_context(
         &config.regime_labels,
     );
 
+    let research_plan = state
+        .get("research_plan")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("allocation context requires a validated research_plan"))?;
+    let research_per_ticker = research_plan.get("per_ticker").and_then(Value::as_object);
     let per_ticker = investable
         .iter()
-        .map(|ticker| {
-            let research = state
-                .get("research_plan")
-                .and_then(|rp| rp.get("per_ticker"))
-                .and_then(|pt| pt.get(ticker))
-                .cloned()
-                .unwrap_or_else(|| {
-                    state
-                        .get("research_plan")
-                        .cloned()
-                        .unwrap_or_else(|| json!({}))
-                });
+        .map(|ticker| -> Result<(String, Value)> {
+            let research = research_per_ticker
+                .and_then(|items| items.get(ticker))
+                .or_else(|| state.get("research_plan").filter(|_| investable.len() == 1))
+                .ok_or_else(|| anyhow::anyhow!("research_plan missing ticker {ticker}"))?;
             let rating = research
                 .get("rating")
                 .and_then(Value::as_str)
-                .or_else(|| {
-                    state
-                        .get("research_plan")
-                        .and_then(|rp| rp.get("rating"))
-                        .and_then(Value::as_str)
-                })
-                .unwrap_or("Hold");
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| anyhow::anyhow!("research_plan rating missing for {ticker}"))?;
             let long_prob = research
                 .get("long_probability")
+                .or_else(|| research.get("final_probability"))
                 .and_then(Value::as_f64)
-                .or_else(|| {
-                    state
-                        .get("research_plan")
-                        .and_then(|rp| rp.get("long_probability"))
-                        .and_then(Value::as_f64)
-                })
-                .unwrap_or(0.5);
-            let vol_pct =
-                query_latest_indicator(conn, ticker, &config.vol_indicator).unwrap_or(0.0);
-            let thesis = research
-                .get("plan")
-                .and_then(Value::as_str)
-                .or_else(|| {
-                    state
-                        .get("research_plan")
-                        .and_then(|rp| rp.get("plan"))
-                        .and_then(Value::as_str)
-                })
-                .unwrap_or("");
-            (
+                .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
+                .ok_or_else(|| {
+                    anyhow::anyhow!("research_plan probability missing or invalid for {ticker}")
+                })?;
+            let vol_pct = query_latest_indicator(conn, ticker, &config.vol_indicator);
+            let thesis = research.get("plan").and_then(Value::as_str).unwrap_or("");
+            Ok((
                 ticker.clone(),
                 json!({
                     "rating": rating,
@@ -93,9 +77,9 @@ pub(crate) fn compute_allocation_context(
                     "vol_pct": vol_pct,
                     "thesis": thesis
                 }),
-            )
+            ))
         })
-        .collect::<serde_json::Map<_, _>>();
+        .collect::<Result<serde_json::Map<_, _>>>()?;
 
     let correlation_60d = if investable.len() >= 2 {
         query_correlation(
@@ -113,7 +97,7 @@ pub(crate) fn compute_allocation_context(
         None => "相关性数据不足",
     };
 
-    json!({
+    Ok(json!({
         "investable_assets": investable,
         "vix": vix_info,
         "per_ticker": per_ticker,
@@ -124,7 +108,7 @@ pub(crate) fn compute_allocation_context(
         "correlation_60d": correlation_60d,
         "correlation_warning": correlation_warning,
         "max_single_position": config.max_single_position
-    })
+    }))
 }
 
 pub(crate) fn allocation_prompt_context(context: &Value) -> Value {
@@ -321,6 +305,95 @@ pub(crate) fn normalize_allocation(
         "summary": allocation_payload.get("summary").and_then(Value::as_str).unwrap_or(""),
         "allocation_method": "llm"
     })
+}
+
+/// Build the final allocation without an LLM. Research owns probability;
+/// this function only applies volatility, regime, exposure and concentration
+/// constraints, then verifies the exact persisted payload.
+pub(crate) fn derive_guarded_allocation(
+    state: &Value,
+    context: &Value,
+    config: &AllocationConfig,
+) -> Result<Value> {
+    validate_allocation_research_input(state, context)?;
+    let mut allocation = normalize_allocation(&json!({"weights": {}}), context, config);
+    allocation["allocation_method"] = json!("rust_inverse_vol_guardrails");
+    validate_allocation_output(&allocation, context, config)?;
+    Ok(allocation)
+}
+
+fn validate_allocation_research_input(state: &Value, context: &Value) -> Result<()> {
+    let research_value = state
+        .get("research_plan")
+        .ok_or_else(|| anyhow::anyhow!("allocation requires a validated research_plan"))?;
+    let research = research_value
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("allocation requires a validated research_plan"))?;
+    let tickers = context
+        .get("investable_assets")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("allocation investable_assets missing"))?;
+    if tickers.is_empty() {
+        bail!("allocation requires at least one investable asset");
+    }
+    for ticker in tickers.iter().filter_map(Value::as_str) {
+        let payload = research
+            .get("per_ticker")
+            .and_then(Value::as_object)
+            .and_then(|items| items.get(ticker))
+            .or_else(|| (tickers.len() == 1).then_some(research_value))
+            .ok_or_else(|| anyhow::anyhow!("research_plan missing ticker {ticker}"))?;
+        let probability = payload
+            .get("final_probability")
+            .or_else(|| payload.get("long_probability"))
+            .and_then(Value::as_f64)
+            .ok_or_else(|| anyhow::anyhow!("research_plan probability missing for {ticker}"))?;
+        if !probability.is_finite() || !(0.0..=1.0).contains(&probability) {
+            bail!("research_plan probability invalid for {ticker}: {probability}");
+        }
+    }
+    Ok(())
+}
+
+fn validate_allocation_output(
+    allocation: &Value,
+    context: &Value,
+    config: &AllocationConfig,
+) -> Result<()> {
+    serde_json::from_value::<PortfolioAllocation>(allocation.clone())
+        .map_err(|error| anyhow::anyhow!("allocation contract invalid: {error}"))?;
+    let weights = allocation
+        .get("weights")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("allocation weights missing"))?;
+    let investable = context
+        .get("investable_assets")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    let mut total = 0.0;
+    for (asset, entry) in weights {
+        if asset != "cash_hedge" && !investable.contains(&asset.as_str()) {
+            bail!("allocation contains non-investable asset {asset}");
+        }
+        let weight = entry
+            .get("weight")
+            .and_then(Value::as_f64)
+            .ok_or_else(|| anyhow::anyhow!("allocation weight missing for {asset}"))?;
+        if !weight.is_finite() || weight < 0.0 {
+            bail!("allocation weight invalid for {asset}: {weight}");
+        }
+        if asset != "cash_hedge" && weight > effective_position_cap(context, config) + 0.0001 {
+            bail!("allocation weight exceeds cap for {asset}: {weight}");
+        }
+        total += weight;
+    }
+    if (total - 1.0).abs() > 0.001 {
+        bail!("allocation weights must sum to 1.0, got {total}");
+    }
+    Ok(())
 }
 
 fn allocation_payload(raw: &Value) -> Option<&Value> {
@@ -614,19 +687,19 @@ fn classify_regime(level: f64, thresholds: &[f64], labels: &[String]) -> (String
     (regime, budget.to_string())
 }
 
-fn query_latest_indicator(_conn: &Connection, ticker: &str, indicator: &str) -> Option<f64> {
-    let rows = load_technical_csv(ticker, "1d");
+fn query_latest_indicator(conn: &Connection, ticker: &str, indicator: &str) -> Option<f64> {
+    let rows = load_technical_series(conn, ticker, "1d").ok()?;
     latest_indicator(&rows, indicator)
 }
 
 fn query_correlation(
-    _conn: &Connection,
+    conn: &Connection,
     ticker_a: &str,
     ticker_b: &str,
     window: usize,
 ) -> Option<f64> {
-    let rows_a = load_technical_csv(ticker_a, "1d");
-    let rows_b = load_technical_csv(ticker_b, "1d");
+    let rows_a = load_technical_series(conn, ticker_a, "1d").ok()?;
+    let rows_b = load_technical_series(conn, ticker_b, "1d").ok()?;
 
     let closes_a = closes_for_correlation(&rows_a, window + 1);
     let closes_b = closes_for_correlation(&rows_b, window + 1);
@@ -1169,6 +1242,67 @@ mod tests {
         assert_eq!(allocation["weights"]["QQQ"]["weight"], json!(0.4));
         assert_eq!(allocation["weights"]["SOXX"]["weight"], json!(0.2));
         assert_eq!(allocation["weights"]["cash_hedge"]["weight"], json!(0.4));
+    }
+
+    #[test]
+    fn guarded_allocation_requires_probability_for_every_investable_ticker() {
+        let state = json!({
+            "research_plan": {
+                "per_ticker": {"QQQ": {"long_probability": 0.61}}
+            }
+        });
+
+        let error = derive_guarded_allocation(&state, &test_context(), &test_config()).unwrap_err();
+
+        assert!(error.to_string().contains("missing ticker SOXX"));
+    }
+
+    #[test]
+    fn allocation_context_rejects_missing_probability_instead_of_defaulting_to_neutral() {
+        let state = json!({
+            "tickers": ["QQQ", "SOXX", "VIX"],
+            "research_plan": {
+                "per_ticker": {
+                    "QQQ": {"rating": "Buy", "long_probability": 0.61},
+                    "SOXX": {"rating": "Hold"}
+                }
+            }
+        });
+        let conn = Connection::open_in_memory().unwrap();
+
+        let error = compute_allocation_context(&state, &conn, &test_config()).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("probability missing or invalid for SOXX"));
+    }
+
+    #[test]
+    fn guarded_allocation_is_finite_capped_and_excludes_regime_signal() {
+        let state = json!({
+            "research_plan": {
+                "per_ticker": {
+                    "QQQ": {"long_probability": 0.61},
+                    "SOXX": {"final_probability": 0.58}
+                }
+            }
+        });
+
+        let allocation =
+            derive_guarded_allocation(&state, &test_context(), &test_config()).unwrap();
+
+        assert_eq!(
+            allocation["allocation_method"],
+            "rust_inverse_vol_guardrails"
+        );
+        assert!(allocation["weights"].get("VIX").is_none());
+        let total = allocation["weights"]
+            .as_object()
+            .unwrap()
+            .values()
+            .map(|entry| entry["weight"].as_f64().unwrap())
+            .sum::<f64>();
+        assert!((total - 1.0).abs() <= 0.001);
     }
 
     #[test]

@@ -2,6 +2,7 @@ use orchestrator_core::{technical_csv_path, write_technical_csv, TechnicalCsvRow
 use orchestrator_sql::{
     candidate::{insert_candidate_experience, pending_candidates, CandidateExperienceInput},
     connect, context_count, ensure_schema, handle_read_command, import_jin10_payload,
+    import_technical_csv,
     memory::{promote_candidate_to_memory, PromoteMemoryInput},
     outcome::{upsert_outcome, OutcomeInput},
     prediction::{upsert_prediction, PredictionInput},
@@ -16,6 +17,7 @@ const TABLES: &[&str] = &[
     "agent_events",
     "role_turn_summaries",
     "jin10_items",
+    "technical_series",
     "phase_summaries",
     "phase_summary_details",
     "attention_ledger",
@@ -102,6 +104,22 @@ fn ensure_schema_creates_only_current_tables_and_is_idempotent() {
     let temp = tempfile::tempdir().unwrap();
     let db_path = temp.path().join("orchestrator.sqlite");
     let conn = connect(&db_path).unwrap();
+
+    assert_eq!(
+        conn.query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
+            .unwrap(),
+        "wal"
+    );
+    assert_eq!(
+        conn.query_row("PRAGMA busy_timeout", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        5_000
+    );
+    assert_eq!(
+        conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
 
     ensure_schema(&conn).unwrap();
     ensure_schema(&conn).unwrap();
@@ -289,12 +307,10 @@ fn technical_context_stays_within_tool_budget() {
 }
 
 #[test]
-fn technical_context_reads_csv_files() {
+fn technical_context_reads_sqlite_imports() {
     let temp = tempfile::tempdir().unwrap();
     let csv_dir = temp.path().join("technical");
     std::fs::create_dir_all(&csv_dir).unwrap();
-    std::env::set_var("ORCHESTRATOR_TECHNICAL_CSV_DIR", csv_dir.to_str().unwrap());
-
     let db_path = temp.path().join("orchestrator.sqlite");
     let mut conn = connect(&db_path).unwrap();
 
@@ -304,31 +320,25 @@ fn technical_context_reads_csv_files() {
         date: "2026-06-19".to_string(),
         values: HashMap::from([("Close".into(), 55.5), ("Return".into(), 0.01)]),
     }];
-    write_technical_csv(
-        &technical_csv_path(&csv_dir, "TQQQ", "1d").unwrap(),
-        &daily_rows,
-    )
-    .unwrap();
+    let daily_path = technical_csv_path(&csv_dir, "TQQQ", "1d").unwrap();
+    write_technical_csv(&daily_path, &daily_rows).unwrap();
+    import_technical_csv(&mut conn, "TQQQ", "1d", &daily_path).unwrap();
 
     let h3_rows = vec![TechnicalCsvRow {
         date: "2026-06-19T09:00:00Z".to_string(),
         values: HashMap::from([("Return".into(), 1.5)]),
     }];
-    write_technical_csv(
-        &technical_csv_path(&csv_dir, "TQQQ", "3h").unwrap(),
-        &h3_rows,
-    )
-    .unwrap();
+    let h3_path = technical_csv_path(&csv_dir, "TQQQ", "3h").unwrap();
+    write_technical_csv(&h3_path, &h3_rows).unwrap();
+    import_technical_csv(&mut conn, "TQQQ", "3h", &h3_path).unwrap();
 
     let min20_rows = vec![TechnicalCsvRow {
         date: "2026-06-19T09:20:00Z".to_string(),
         values: HashMap::from([("Gap".into(), 12.5)]),
     }];
-    write_technical_csv(
-        &technical_csv_path(&csv_dir, "TQQQ", "20min").unwrap(),
-        &min20_rows,
-    )
-    .unwrap();
+    let min20_path = technical_csv_path(&csv_dir, "TQQQ", "20min").unwrap();
+    write_technical_csv(&min20_path, &min20_rows).unwrap();
+    import_technical_csv(&mut conn, "TQQQ", "20min", &min20_path).unwrap();
 
     let grouped = read_run_context(
         &mut conn,
@@ -351,7 +361,6 @@ fn technical_context_reads_csv_files() {
     assert_eq!(grouped["three_hour"][0]["indicators"]["Return"], 1.5);
     assert_eq!(grouped["twenty_minute"][0]["indicators"]["Gap"], 12.5);
     assert_eq!(context_count(&conn, "technical").unwrap(), 3);
-    std::env::remove_var("ORCHESTRATOR_TECHNICAL_CSV_DIR");
 }
 
 #[test]
@@ -362,8 +371,6 @@ fn external_items_table_is_dropped() {
     ensure_schema(&conn).unwrap();
     assert_eq!(table_exists(&conn, "external_items"), 0);
     assert_eq!(table_exists(&conn, "jin10_items"), 1);
-    assert_eq!(context_count(&conn, "youtube").unwrap(), 0);
-    assert_eq!(context_count(&conn, "reddit").unwrap(), 0);
     assert_eq!(context_count(&conn, "x").unwrap(), 0);
 }
 
@@ -565,18 +572,15 @@ fn compose_context_scores_trims_and_audits_blocks() {
     .unwrap();
     let csv_dir = temp.path().join("technical");
     std::fs::create_dir_all(&csv_dir).unwrap();
-    std::env::set_var("ORCHESTRATOR_TECHNICAL_CSV_DIR", csv_dir.to_str().unwrap());
     {
         use std::collections::HashMap;
         let daily_rows = vec![TechnicalCsvRow {
             date: "2026-06-19".to_string(),
             values: HashMap::from([("Close".into(), 61.0)]),
         }];
-        write_technical_csv(
-            &technical_csv_path(&csv_dir, "TQQQ", "1d").unwrap(),
-            &daily_rows,
-        )
-        .unwrap();
+        let path = technical_csv_path(&csv_dir, "TQQQ", "1d").unwrap();
+        write_technical_csv(&path, &daily_rows).unwrap();
+        import_technical_csv(&mut conn, "TQQQ", "1d", &path).unwrap();
     }
     upsert_agent_turn(
         &conn,
@@ -618,13 +622,6 @@ fn compose_context_scores_trims_and_audits_blocks() {
         .iter()
         .any(|block| block["context_type"] == "technical_daily"));
     assert!(blocks.iter().any(|block| block["context_type"] == "jin10"));
-    assert!(
-        blocks.iter().all(|block| !matches!(
-            block["context_type"].as_str(),
-            Some("youtube" | "youtube_transcript" | "reddit" | "x")
-        )),
-        "social/video external blocks should not be present without external_items"
-    );
     assert_eq!(blocks[0]["content"], "same ticker same topic summary");
 
     let trimmed = read_run_context(
@@ -644,7 +641,6 @@ fn compose_context_scores_trims_and_audits_blocks() {
     )
     .unwrap();
     assert!(trimmed["blocks"].as_array().unwrap().len() < blocks.len());
-    std::env::remove_var("ORCHESTRATOR_TECHNICAL_CSV_DIR");
 }
 
 #[test]

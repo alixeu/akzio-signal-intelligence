@@ -112,25 +112,16 @@ fn prompt_version_for_role(state: &Value, role: &str) -> Option<String> {
     let prompt_key = match role {
         "analyst.technical" => "orchestrator.prompts.analyst.technical",
         "analyst.news_macro" => "orchestrator.prompts.analyst.news_macro",
-        "analyst.youtube" => "orchestrator.prompts.analyst.youtube",
-        "analyst.reddit" => "orchestrator.prompts.analyst.reddit",
-        "analyst.x" => "orchestrator.prompts.analyst.x",
         "compressor.phase00" => "orchestrator.prompts.compressor.phase00",
-        "researcher.bull.warmup" => "orchestrator.prompts.phase2.bull_warmup",
         "researcher.bull.initial" => "orchestrator.prompts.phase2.bull_initial",
         "researcher.bull.interaction" => "orchestrator.prompts.phase2.bull_interaction",
-        "researcher.bear.warmup" => "orchestrator.prompts.phase2.bear_warmup",
         "researcher.bear.initial" => "orchestrator.prompts.phase2.bear_initial",
         "researcher.bear.interaction" => "orchestrator.prompts.phase2.bear_interaction",
-        "mediator.topic" => "orchestrator.prompts.mediator.topic",
         "mediator.topic_controller" => "orchestrator.prompts.mediator.topic_controller",
         "manager.research" => "orchestrator.prompts.manager.research",
         "trader" => "orchestrator.prompts.trader",
-        "risk.aggressive" => "orchestrator.prompts.risk.aggressive",
         "risk.conservative" => "orchestrator.prompts.risk.conservative",
-        "risk.neutral" => "orchestrator.prompts.risk.neutral",
         "portfolio.manager" => "orchestrator.prompts.portfolio.manager",
-        "allocation.manager" => "orchestrator.prompts.allocation.manager",
         _ => return None,
     };
     Some(prompt_version(config, prompt_key))
@@ -435,12 +426,24 @@ fn refresh_role_job_metrics(state: &mut Value) {
         .iter()
         .filter(|job| job.get("timed_out").and_then(Value::as_bool) == Some(true))
         .count();
+    let sum = |field: &str| {
+        jobs.iter()
+            .filter_map(|job| job.get(field).and_then(Value::as_u64))
+            .sum::<u64>()
+    };
+    let llm_request_count = sum("turn_count");
+    let tool_call_count = sum("tool_call_count");
 
     if !state.get("workflow_metrics").is_some_and(Value::is_object) {
         state["workflow_metrics"] = json!({});
     }
     state["workflow_metrics"]["role_job_count"] = json!(jobs.len());
-    state["workflow_metrics"]["llm_call_count"] = json!(jobs.len());
+    state["workflow_metrics"]["llm_call_count"] = json!(llm_request_count);
+    state["workflow_metrics"]["llm_request_count"] = json!(llm_request_count);
+    state["workflow_metrics"]["tool_call_count"] = json!(tool_call_count);
+    state["workflow_metrics"]["input_tokens"] = json!(sum("input_tokens"));
+    state["workflow_metrics"]["output_tokens"] = json!(sum("output_tokens"));
+    state["workflow_metrics"]["total_tokens"] = json!(sum("total_tokens"));
     state["workflow_metrics"]["total_role_elapsed_ms"] = json!(total_elapsed_ms);
     state["workflow_metrics"]["timed_out_role_count"] = json!(timed_out_count);
 }
@@ -591,6 +594,14 @@ fn is_permanent_role_error_text(text: &str) -> bool {
                 || text.contains("token")))
 }
 
+fn role_retry_jitter_ms(role: &str, attempt: usize) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    role.hash(&mut hasher);
+    attempt.hash(&mut hasher);
+    hasher.finish() % 251
+}
+
 pub(crate) async fn run_role_job_with_timeout(job: RoleJob, timeout_sec: u64) -> RoleJobResult {
     let role = job.role.clone();
     let phase = job.phase;
@@ -623,7 +634,8 @@ pub(crate) async fn run_role_job_with_timeout(job: RoleJob, timeout_sec: u64) ->
                 // window full) are not masked by outer "LLM stream chunk failed".
                 let message = format!("{error:#}");
                 if attempt < MAX_ROLE_ATTEMPTS && is_transient_role_error(&message) {
-                    let backoff_ms = 1_000u64 * attempt as u64;
+                    let backoff_ms =
+                        1_000u64 * attempt as u64 + role_retry_jitter_ms(&role, attempt);
                     warn!(
                         role = role.as_str(),
                         phase,
@@ -641,7 +653,8 @@ pub(crate) async fn run_role_job_with_timeout(job: RoleJob, timeout_sec: u64) ->
             Err(_) => {
                 let message = format!("role execution timed out after {timeout_sec}s");
                 if attempt < MAX_ROLE_ATTEMPTS {
-                    let backoff_ms = 1_000u64 * attempt as u64;
+                    let backoff_ms =
+                        1_000u64 * attempt as u64 + role_retry_jitter_ms(&role, attempt);
                     warn!(
                         role = role.as_str(),
                         phase,
@@ -938,6 +951,10 @@ mod tests {
         assert_eq!(state["role_job_metrics"][0]["tool_call_count"], 3);
         assert_eq!(state["workflow_metrics"]["role_job_count"], 2);
         assert_eq!(state["workflow_metrics"]["llm_call_count"], 2);
+        assert_eq!(state["workflow_metrics"]["tool_call_count"], 6);
+        assert_eq!(state["workflow_metrics"]["input_tokens"], 20);
+        assert_eq!(state["workflow_metrics"]["output_tokens"], 8);
+        assert_eq!(state["workflow_metrics"]["total_tokens"], 28);
         assert_eq!(state["workflow_metrics"]["total_role_elapsed_ms"], 18);
         assert_eq!(state["workflow_metrics"]["timed_out_role_count"], 1);
     }

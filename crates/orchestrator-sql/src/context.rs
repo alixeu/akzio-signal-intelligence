@@ -1,13 +1,11 @@
 use crate::{
     memory::{read_prior_memory, PriorMemoryQuery},
     outcome::track_record,
+    technical_store::{load_technical_series, technical_row_count},
     AGGREGATE_TICKER,
 };
 use anyhow::Result;
-use orchestrator_core::{
-    default_technical_csv_dir, latest_snapshot, read_technical_csv, storage_interval,
-    technical_csv_path, MarketRegime, RetrievalBudget, TechnicalCsvRow,
-};
+use orchestrator_core::{latest_snapshot, MarketRegime, RetrievalBudget};
 use rusqlite::{params, params_from_iter, Connection, Row};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -588,7 +586,7 @@ fn collect_jin10_blocks(conn: &Connection, blocks: &mut Vec<ContextBlock>) -> Re
 }
 
 fn collect_technical_blocks(
-    _conn: &Connection,
+    conn: &Connection,
     ctx: &RuntimeContext,
     blocks: &mut Vec<ContextBlock>,
 ) -> Result<()> {
@@ -598,7 +596,7 @@ fn collect_technical_blocks(
         ("3h", "technical_3h"),
         ("20min", "technical_20min"),
     ] {
-        for snapshot in technical_snapshots_from_csv(interval, &tickers) {
+        for snapshot in technical_snapshots_from_db(conn, interval, &tickers)? {
             let ticker = snapshot
                 .get("ticker")
                 .and_then(Value::as_str)
@@ -623,7 +621,7 @@ fn collect_technical_blocks(
                 title: context_type.to_string(),
                 content,
                 weight: 1.5,
-                source_table: "technical_csv".to_string(),
+                source_table: "technical_series".to_string(),
                 item_json: snapshot,
             });
         }
@@ -864,8 +862,7 @@ pub fn sqlite_context(conn: &Connection, run_id: &str) -> Result<Value> {
         "analyst_messages": analyst_messages,
         "debate_messages": debate_messages,
         "technical": technical_context(conn, &[], None)?,
-        "jin10": jin10_context(conn)?,
-        "sources": json!({"query": "source-items", "items": [], "note": "external_items removed; youtube/reddit/x not persisted yet"})
+        "jin10": jin10_context(conn)?
     }))
 }
 
@@ -879,22 +876,18 @@ pub fn context_count(conn: &Connection, name: &str) -> Result<i64> {
     }
     let sql = match name {
         "technical" | "technical-context" | "technical_context" => {
-            return Ok(csv_row_count_all());
+            return technical_row_count(conn, None);
         }
         "technical_daily" => {
-            return Ok(csv_row_count("daily"));
+            return technical_row_count(conn, Some("daily"));
         }
         "technical_3h" => {
-            return Ok(csv_row_count("3h"));
+            return technical_row_count(conn, Some("3h"));
         }
         "technical_20min" => {
-            return Ok(csv_row_count("20min"));
+            return technical_row_count(conn, Some("20min"));
         }
         "jin10" | "jin10-context" => "SELECT COUNT(*) FROM jin10_items",
-        // Social/video sources temporarily unpersisted (external_items dropped).
-        "youtube" | "sources" | "youtube_transcripts" | "youtube_transcript" | "reddit" | "x" => {
-            return Ok(0);
-        }
         other => {
             // Only allow safe SQL identifiers so untrusted names cannot inject
             // via table interpolation. Existence is still checked separately.
@@ -952,23 +945,19 @@ fn jin10_context(conn: &Connection) -> Result<Value> {
     }))
 }
 
-fn technical_context(
-    _conn: &Connection,
-    tickers: &[String],
-    ticker: Option<&str>,
-) -> Result<Value> {
+fn technical_context(conn: &Connection, tickers: &[String], ticker: Option<&str>) -> Result<Value> {
     let tickers = effective_technical_tickers(tickers, ticker);
     Ok(json!({
         "query": "get-technical-context",
-        "source": "technical_csv",
-        "daily": technical_snapshots_from_csv("daily", &tickers),
-        "three_hour": technical_snapshots_from_csv("3h", &tickers),
-        "twenty_minute": technical_snapshots_from_csv("20min", &tickers)
+        "source": "sqlite.technical_series",
+        "daily": technical_snapshots_from_db(conn, "daily", &tickers)?,
+        "three_hour": technical_snapshots_from_db(conn, "3h", &tickers)?,
+        "twenty_minute": technical_snapshots_from_db(conn, "20min", &tickers)?
     }))
 }
 
 fn technical_interval_context(
-    _conn: &Connection,
+    conn: &Connection,
     interval: &str,
     tickers: &[String],
     ticker: Option<&str>,
@@ -976,8 +965,8 @@ fn technical_interval_context(
     let tickers = effective_technical_tickers(tickers, ticker);
     Ok(json!({
         "query": interval,
-        "source": "technical_csv",
-        "items": technical_snapshots_from_csv(interval, &tickers)
+        "source": "sqlite.technical_series",
+        "items": technical_snapshots_from_db(conn, interval, &tickers)?
     }))
 }
 
@@ -997,23 +986,20 @@ fn effective_technical_tickers(tickers: &[String], ticker: Option<&str>) -> Vec<
     out
 }
 
-/// Compact latest-per-ticker snapshots for one interval, read from CSV files.
-fn technical_snapshots_from_csv(interval: &str, tickers: &[String]) -> Vec<Value> {
-    let csv_dir = default_technical_csv_dir();
+/// Compact latest-per-ticker snapshots for one interval from the run database.
+fn technical_snapshots_from_db(
+    conn: &Connection,
+    interval: &str,
+    tickers: &[String],
+) -> Result<Vec<Value>> {
     let mut snapshots = Vec::new();
     for ticker in tickers {
-        let Some(path) = technical_csv_path(&csv_dir, ticker, interval) else {
-            continue;
-        };
-        let rows = match read_technical_csv(&path) {
-            Ok(rows) => rows,
-            Err(_) => continue,
-        };
+        let rows = load_technical_series(conn, ticker, interval)?;
         if let Some(snap) = latest_snapshot(ticker, interval, &rows, TECHNICAL_CONTEXT_KEYS) {
             snapshots.push(snap);
         }
     }
-    snapshots
+    Ok(snapshots)
 }
 
 const TECHNICAL_CONTEXT_KEYS: &[&str] = &[
@@ -1041,44 +1027,6 @@ const TECHNICAL_CONTEXT_KEYS: &[&str] = &[
     "IMIN5",
     "IMIN20",
 ];
-
-fn csv_row_count(interval: &str) -> i64 {
-    let csv_dir = default_technical_csv_dir();
-    let Ok(entries) = std::fs::read_dir(&csv_dir) else {
-        return 0;
-    };
-    let suffix = match storage_interval(interval) {
-        Some("daily") => "_day.csv",
-        Some("3h") => "_3h.csv",
-        Some("20min") => "_20min.csv",
-        _ => return 0,
-    };
-    let mut count: i64 = 0;
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if !name.ends_with(suffix) {
-            continue;
-        }
-        if let Ok(rows) = read_technical_csv(&entry.path()) {
-            count += rows.len() as i64;
-        }
-    }
-    count
-}
-
-fn csv_row_count_all() -> i64 {
-    csv_row_count("daily") + csv_row_count("3h") + csv_row_count("20min")
-}
-
-/// Load CSV rows for a ticker/interval from the default CSV directory.
-pub fn load_technical_csv(ticker: &str, interval: &str) -> Vec<TechnicalCsvRow> {
-    let csv_dir = default_technical_csv_dir();
-    let Some(path) = technical_csv_path(&csv_dir, ticker, interval) else {
-        return Vec::new();
-    };
-    read_technical_csv(&path).unwrap_or_default()
-}
 
 fn role_summaries_context(conn: &Connection, ctx: &RuntimeContext) -> Result<Value> {
     let mut sql = String::from("SELECT * FROM role_turn_summaries WHERE run_id = ?");

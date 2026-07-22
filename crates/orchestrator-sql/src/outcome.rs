@@ -1,8 +1,5 @@
 use anyhow::Result;
-use orchestrator_core::{
-    close_on_or_after, close_on_or_before, default_technical_csv_dir, read_technical_csv,
-    storage_interval, technical_csv_path,
-};
+use orchestrator_core::{close_on_or_after, close_on_or_before};
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 
@@ -89,32 +86,22 @@ pub fn track_record(conn: &Connection, ticker: Option<&str>) -> Result<Value> {
 }
 
 pub fn latest_close_on_or_before(
-    _conn: &Connection,
+    conn: &Connection,
     ticker: &str,
     date: &str,
     interval: &str,
 ) -> Result<Option<(String, f64)>> {
-    let csv_interval = storage_interval(interval).unwrap_or(interval);
-    let csv_dir = default_technical_csv_dir();
-    let Some(path) = technical_csv_path(&csv_dir, ticker, csv_interval) else {
-        return Ok(None);
-    };
-    let rows = read_technical_csv(&path).unwrap_or_default();
+    let rows = crate::technical_store::load_technical_series(conn, ticker, interval)?;
     Ok(close_on_or_before(&rows, date))
 }
 
 pub fn earliest_close_on_or_after(
-    _conn: &Connection,
+    conn: &Connection,
     ticker: &str,
     date: &str,
     interval: &str,
 ) -> Result<Option<(String, f64)>> {
-    let csv_interval = storage_interval(interval).unwrap_or(interval);
-    let csv_dir = default_technical_csv_dir();
-    let Some(path) = technical_csv_path(&csv_dir, ticker, csv_interval) else {
-        return Ok(None);
-    };
-    let rows = read_technical_csv(&path).unwrap_or_default();
+    let rows = crate::technical_store::load_technical_series(conn, ticker, interval)?;
     Ok(close_on_or_after(&rows, date))
 }
 

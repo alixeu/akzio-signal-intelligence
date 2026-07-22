@@ -1,6 +1,5 @@
 orchestrator:
   analysis_universe: [QQQ, SOXX, VIX]
-  phase1_agents: technical,news
   db_path: outputs/orchestrator.sqlite
 
   runtime:
@@ -16,12 +15,17 @@ orchestrator:
   workflow:
     agent_timeout_sec: 600
     reducer_timeout_sec: 600
+    phase1:
+      parallelism: 2
+      critical_roles: [analyst.technical, analyst.news_macro]
+    policy:
+      mode: selective
 
   llm:
     gateway:
       base_url: &llm_gateway_base_url ${LLM_GATEWAY_BASE_URL:-https://oneapi-comate.baidu-int.com/v1}
       # Require an env-provided key; never ship a real default secret in-repo.
-      api_key: &llm_gateway_api_key ${LLM_GATEWAY_API_KEY:-sk-GASkzZyd3qELeEcC35D239D73f3c49D784659995B3114a6a}
+      api_key: &llm_gateway_api_key ${LLM_GATEWAY_API_KEY}
     defaults:
       route: chat_completions
       model: deepseek-v4-flash
@@ -31,6 +35,8 @@ orchestrator:
       reasoning_summary: auto
       preserve_reasoning_state: false
       tools: read_run_context
+    judge:
+      enabled: false
 
   web_search:
     mode: live
@@ -38,10 +44,6 @@ orchestrator:
     base_url: https://mcp.exa.ai/mcp
     context_size: medium
     max_result_chars: 12000
-
-  analyst_weights:
-    technical: 50.0
-    news_macro: 50.0
 
 technical:
   days: 60
@@ -55,23 +57,6 @@ jin10:
   lookback_hours: 24.0
   pages: 200
   timeout: 15.0
-
-youtube:
-  default_channel: rhino
-  max_videos: 6
-  timeout_sec: 20
-  channels:
-    rhino:
-      handle: rhinofinance
-      display_name: Rhino Finance
-      source_url: https://youtube.com/@rhinofinance
-
-wayinvideo:
-  task: 视频逐字稿
-  existing_task_url: https://wayinvideo-api.wayin.ai/api/highlight_moment/task
-  timeout_sec: 60
-  username: ${WAYINVIDEO_USERNAME}
-  password: ${WAYINVIDEO_PASSWORD}
 
 report:
   mode: build-and-send

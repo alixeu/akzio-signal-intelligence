@@ -480,7 +480,7 @@ mod tests {
         let summaries = vec![
             json!({"role": "analyst.technical", "stance": "bullish", "confidence": 0.7}),
             json!({"role": "analyst.news_macro", "stance": "neutral", "confidence": 0.9}),
-            json!({"role": "analyst.reddit", "stance": "unobserved", "confidence": 0.0}),
+            json!({"role": "analyst.auxiliary", "stance": "unobserved", "confidence": 0.0}),
         ];
 
         let conflicts = detect_direction_conflicts("TQQQ", &summaries);
@@ -492,7 +492,7 @@ mod tests {
     fn detects_confidence_divergence() {
         let summaries = vec![
             json!({"role": "analyst.technical", "stance": "bullish", "confidence": 0.85}),
-            json!({"role": "analyst.x", "stance": "bullish", "confidence": 0.15}),
+            json!({"role": "analyst.auxiliary", "stance": "bullish", "confidence": 0.15}),
         ];
 
         let conflicts = detect_confidence_divergence("TQQQ", &summaries);
@@ -506,7 +506,7 @@ mod tests {
     fn confidence_delta_below_threshold_is_not_flagged() {
         let summaries = vec![
             json!({"role": "analyst.technical", "stance": "bullish", "confidence": 0.70}),
-            json!({"role": "analyst.x", "stance": "bullish", "confidence": 0.25}),
+            json!({"role": "analyst.auxiliary", "stance": "bullish", "confidence": 0.25}),
         ];
 
         let conflicts = detect_confidence_divergence("TQQQ", &summaries);
@@ -517,8 +517,8 @@ mod tests {
     #[test]
     fn detects_evidence_overlap() {
         let summaries = vec![
-            json!({"role": "analyst.youtube", "stance": "bullish", "confidence": 0.5, "key_evidence": ["Rhino Finance QQQ 500 target YouTube"]}),
-            json!({"role": "analyst.reddit", "stance": "bullish", "confidence": 0.5, "key_evidence": ["Reddit discusses Rhino QQQ 500 call"]}),
+            json!({"role": "analyst.technical", "stance": "bullish", "confidence": 0.5, "key_evidence": ["QQQ 500 technical target"]}),
+            json!({"role": "analyst.news_macro", "stance": "bullish", "confidence": 0.5, "key_evidence": ["Market report discusses QQQ 500 target"]}),
         ];
 
         let conflicts = detect_evidence_overlap("TQQQ", &summaries);
@@ -531,7 +531,7 @@ mod tests {
     fn detects_evidence_contradiction() {
         let summaries = vec![
             json!({"role": "analyst.news_macro", "stance": "bullish", "confidence": 0.7, "key_evidence": ["CPI came in at 3.2 percent"]}),
-            json!({"role": "analyst.reddit", "stance": "bearish", "confidence": 0.6, "key_evidence": ["CPI was 3.4 percent bearish"]}),
+            json!({"role": "analyst.technical", "stance": "bearish", "confidence": 0.6, "key_evidence": ["CPI was 3.4 percent bearish"]}),
         ];
 
         let conflicts = detect_evidence_contradiction("TQQQ", &summaries);
@@ -547,11 +547,11 @@ mod tests {
     #[test]
     fn detects_evidence_overlap_with_structured_objects() {
         let summaries = vec![
-            json!({"role": "analyst.youtube", "stance": "bullish", "confidence": 0.5, "key_evidence": [
-                {"claim": "Rhino Finance QQQ 500 target YouTube", "evidence_type": "opinion", "source": "YouTube"}
+            json!({"role": "analyst.technical", "stance": "bullish", "confidence": 0.5, "key_evidence": [
+                {"claim": "QQQ 500 technical target", "evidence_type": "opinion", "source": "Yahoo Finance"}
             ]}),
-            json!({"role": "analyst.reddit", "stance": "bullish", "confidence": 0.5, "key_evidence": [
-                {"claim": "Reddit discusses Rhino QQQ 500 call", "evidence_type": "opinion", "source": "Reddit"}
+            json!({"role": "analyst.news_macro", "stance": "bullish", "confidence": 0.5, "key_evidence": [
+                {"claim": "Market report discusses QQQ 500 target", "evidence_type": "opinion", "source": "Jin10"}
             ]}),
         ];
 
@@ -567,8 +567,8 @@ mod tests {
             json!({"role": "analyst.news_macro", "stance": "bullish", "confidence": 0.7, "key_evidence": [
                 {"claim": "CPI came in at 3.2 percent", "evidence_type": "fact", "source": "BLS"}
             ]}),
-            json!({"role": "analyst.reddit", "stance": "bearish", "confidence": 0.6, "key_evidence": [
-                {"claim": "CPI was 3.4 percent bearish", "evidence_type": "speculation", "source": "Reddit"}
+            json!({"role": "analyst.technical", "stance": "bearish", "confidence": 0.6, "key_evidence": [
+                {"claim": "CPI was 3.4 percent bearish", "evidence_type": "speculation", "source": "Yahoo Finance"}
             ]}),
         ];
 

@@ -340,12 +340,16 @@ fn validate_topic_plan_payload(payload: &Value) -> Option<String> {
     if !actionable && !topics.is_empty() {
         return Some("non-actionable topic plan must have topics=[]".to_string());
     }
-    if !actionable
-        && payload.get("status").and_then(Value::as_str) != Some("skipped_no_actionable_evidence")
-    {
-        return Some(
-            "non-actionable topic plan must be skipped_no_actionable_evidence".to_string(),
-        );
+    if !actionable {
+        if payload.get("status").and_then(Value::as_str) != Some("skipped") {
+            return Some("non-actionable topic plan must have status=skipped".to_string());
+        }
+        if !matches!(
+            payload.get("skip_reason").and_then(Value::as_str),
+            Some("phase1_evidence_insufficient" | "no_material_cross_analyst_conflict")
+        ) {
+            return Some("non-actionable topic plan requires a valid skip_reason".to_string());
+        }
     }
     if actionable && topics.is_empty() {
         return Some("actionable topic plan must contain at least one topic".to_string());
@@ -367,7 +371,10 @@ fn validate_debate_summary_payload(payload: &Value) -> Option<String> {
     };
     if !matches!(
         status,
-        "ready" | "not_converged" | "skipped_no_actionable_evidence"
+        "ready"
+            | "not_converged"
+            | "skipped_no_actionable_evidence"
+            | "skipped_no_material_conflict"
     ) {
         return Some(format!("debate status has invalid value {status}"));
     }
@@ -603,8 +610,9 @@ mod contract_tests {
             "phase_status": {"2": "done", "25": "done"},
             "topic_generation_artifact": {
                 "artifact_type": "phase2_topic_generation_artifact",
-                "status": "skipped_no_actionable_evidence",
+                "status": "skipped",
                 "actionable": false,
+                "skip_reason": "phase1_evidence_insufficient",
                 "topics": []
             },
             "debate_state_artifact": {

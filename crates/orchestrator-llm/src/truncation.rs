@@ -65,7 +65,9 @@ fn default_preserve_fields() -> Vec<String> {
 impl Default for TruncationConfig {
     fn default() -> Self {
         Self {
-            tool_result_chars: 200_000,
+            // Bound tool payloads before they enter turn history. The former
+            // 200k default duplicated large SQL/CSV results in prompts and DB.
+            tool_result_chars: 16_000,
             context_fragment_chars: 12_000,
             strategy: TruncationStrategy::Semantic,
             json: JsonTruncationConfig::default(),

@@ -8,7 +8,6 @@ publish.workspace = true
 [dependencies]
 anyhow.workspace = true
 orchestrator-core = { path = "../orchestrator-core" }
-orchestrator-ingest = { path = "../orchestrator-ingest" }
 orchestrator-sql = { path = "../orchestrator-sql" }
 futures.workspace = true
 async-openai.workspace = true

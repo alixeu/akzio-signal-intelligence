@@ -5,7 +5,6 @@ use serde_json::{json, Value};
 use tracing::warn;
 
 use super::config::{is_critical_role, RuntimeConfig};
-use super::lifecycle::tickers_from_state;
 use super::role_jobs::RoleJobResult;
 
 enum ConfidenceImpact {
@@ -239,6 +238,13 @@ pub(crate) fn role_artifact_or_degraded(
             Ok(()) => return Ok(artifact),
             Err(error) => {
                 let message = error.to_string();
+                if is_critical_role(config, &result.role) {
+                    anyhow::bail!(
+                        "critical role {} returned an invalid artifact: {}",
+                        result.role,
+                        message
+                    );
+                }
                 record_degraded_role(state, &result, &message);
                 state["degraded"] = Value::Bool(true);
                 return Ok(degraded_role_artifact(&result, &message));
@@ -258,8 +264,9 @@ pub(crate) fn role_artifact_or_degraded(
             timed_out = result.timed_out,
             elapsed_ms = result.elapsed_ms,
             message,
-            "CRITICAL_ROLE_DEGRADED: producing degraded artifact instead of aborting"
+            "CRITICAL_ROLE_FAILED: aborting before probability phases"
         );
+        anyhow::bail!("critical role {} failed: {}", result.role, message);
     } else {
         warn!(
             role = result.role,
@@ -321,22 +328,6 @@ pub(crate) fn record_preflight_result(state: &mut Value, name: &str, result: Res
     }
 }
 
-pub(crate) fn manager_research_fallback(state: &mut Value, error: anyhow::Error) -> Value {
-    let tickers = tickers_from_state(state);
-    let artifact = degraded_fallback("manager.research", &tickers, &error);
-    push_degraded_entry(
-        state,
-        DegradedEntry {
-            role: "manager.research".to_string(),
-            phase: 3,
-            error: error.to_string(),
-            used_fallback: true,
-            confidence_impact: ConfidenceImpact::Moderate,
-        },
-    );
-    artifact
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -353,7 +344,7 @@ mod tests {
 
     #[test]
     fn runtime_identity_rejects_explicit_role_mismatch() {
-        let mut artifact = json!({"role": "risk.aggressive"});
+        let mut artifact = json!({"role": "trader"});
 
         assert!(attach_runtime_role_identity(&mut artifact, "risk.conservative").is_err());
     }
@@ -372,7 +363,7 @@ mod tests {
     #[test]
     fn degraded_analyst_artifact_is_unobserved_not_mock_neutral() {
         let result = RoleJobResult {
-            role: "analyst.youtube".to_string(),
+            role: "analyst.plugin".to_string(),
             phase: 1,
             kind: "artifact".to_string(),
             round: None,

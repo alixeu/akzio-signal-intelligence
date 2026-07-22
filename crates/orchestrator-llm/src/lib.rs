@@ -575,7 +575,8 @@ pub fn append_debug_llm_record(settings: &AgentSettings, record: Value) -> Resul
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create debug dir {}", parent.display()))?;
     }
-    let mut line = serde_json::to_string_pretty(&record)?;
+    // JSONL requires exactly one JSON value per physical line.
+    let mut line = serde_json::to_string(&record)?;
     line.push('\n');
     fs::write(&path, line.as_bytes())
         .with_context(|| format!("failed to write debug llm record {}", path.display()))?;
@@ -770,9 +771,7 @@ pub async fn run_model_event_stream(
     handler: &mut dyn ModelEventHandler,
 ) -> Result<()> {
     match settings.llm.route {
-        LlmRoute::Responses => {
-            stream_responses_with_retry(settings, input, prompt, handler).await
-        }
+        LlmRoute::Responses => stream_responses_with_retry(settings, input, prompt, handler).await,
         LlmRoute::ChatCompletions => {
             stream_chat_completions_with_retry(settings, input, prompt, handler).await
         }
@@ -1255,7 +1254,8 @@ async fn stream_responses_with_retry(
             Err((error, made_progress))
                 if attempt < MAX_ATTEMPTS && !made_progress && is_transient_llm_error(&error) =>
             {
-                let backoff_ms = 1_000u64 * (1u64 << (attempt - 1)).min(8);
+                let backoff_ms = 1_000u64 * (1u64 << (attempt - 1)).min(8)
+                    + retry_jitter_ms(&settings.role, attempt);
                 tracing::warn!(
                     attempt,
                     backoff_ms,
@@ -1287,6 +1287,14 @@ fn is_transient_llm_error(error: &anyhow::Error) -> bool {
         || text.contains("temporarily unavailable")
         || text.contains("upstream_error")
         || text.contains("upstream request failed")
+}
+
+fn retry_jitter_ms(role: &str, attempt: usize) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    role.hash(&mut hasher);
+    attempt.hash(&mut hasher);
+    hasher.finish() % 251
 }
 
 fn is_permanent_llm_error_text(text: &str) -> bool {
@@ -1332,6 +1340,7 @@ async fn stream_responses_once(
     let mut made_progress = false;
     let mut reasoning_item_id: Option<String> = None;
     let mut event_count: u64 = 0;
+    let mut saw_response_completed = false;
     let mut function_call_meta: std::collections::HashMap<String, (String, String)> =
         std::collections::HashMap::new();
     let mut emitted_tool_calls: std::collections::HashSet<String> =
@@ -1436,67 +1445,105 @@ async fn stream_responses_once(
                         .map_err(|e| (e, made_progress))?;
                 }
             }
-            ResponseStreamEvent::ResponseOutputItemDone(ev) => {
-                match &ev.item {
-                    OutputItem::Reasoning(r) => {
-                        if let Ok(raw) = serde_json::to_value(r) {
-                            if let Some(encrypted) = extract_encrypted_reasoning(&raw) {
-                                let item_id =
-                                    r.id.clone()
-                                        .unwrap_or_else(|| format!("reasoning-{}", Uuid::new_v4()));
-                                made_progress = true;
-                                handler
-                                    .handle(ModelStreamEvent::ReasoningStateCompleted {
-                                        item_id,
-                                        encrypted_content: encrypted,
-                                    })
-                                    .await
-                                    .map_err(|e| (e, made_progress))?;
-                            }
-                        }
-                        reasoning_item_id = None;
-                    }
-                    OutputItem::FunctionCall(fc) => {
-                        let item_id = fc.id.as_deref().unwrap_or(&fc.call_id);
-                        if !emitted_tool_calls.contains(item_id) {
+            ResponseStreamEvent::ResponseOutputItemDone(ev) => match &ev.item {
+                OutputItem::Reasoning(r) => {
+                    if let Ok(raw) = serde_json::to_value(r) {
+                        if let Some(encrypted) = extract_encrypted_reasoning(&raw) {
+                            let item_id =
+                                r.id.clone()
+                                    .unwrap_or_else(|| format!("reasoning-{}", Uuid::new_v4()));
                             made_progress = true;
-                            saw_tool_call = true;
-                            let arguments: Value =
-                                serde_json::from_str(&fc.arguments).unwrap_or(Value::Null);
-                            let name = tools::resolve_tool_name(&fc.name);
-                            emitted_tool_calls.insert(item_id.to_string());
                             handler
-                                .handle(ModelStreamEvent::ToolCallCompleted {
-                                    tool_call: ToolCallRequest {
-                                        call_id: fc.call_id.clone(),
-                                        name,
-                                        arguments,
-                                    },
+                                .handle(ModelStreamEvent::ReasoningStateCompleted {
+                                    item_id,
+                                    encrypted_content: encrypted,
                                 })
                                 .await
                                 .map_err(|e| (e, made_progress))?;
                         }
                     }
-                    _ => {}
+                    reasoning_item_id = None;
                 }
-            }
+                OutputItem::FunctionCall(fc) => {
+                    let item_id = fc.id.as_deref().unwrap_or(&fc.call_id);
+                    if !emitted_tool_calls.contains(item_id) {
+                        if fc.call_id.trim().is_empty() || fc.name.trim().is_empty() {
+                            return Err((
+                                    anyhow::anyhow!(
+                                        "Responses tool call completed without call_id/name (item_id={item_id})"
+                                    ),
+                                    made_progress,
+                                ));
+                        }
+                        made_progress = true;
+                        saw_tool_call = true;
+                        let arguments: Value = serde_json::from_str(&fc.arguments).map_err(|error| {
+                                (
+                                    anyhow::anyhow!(error).context(format!(
+                                        "malformed Responses tool arguments for item_id={item_id}, call_id={}",
+                                        fc.call_id
+                                    )),
+                                    made_progress,
+                                )
+                            })?;
+                        let name = tools::resolve_tool_name(&fc.name);
+                        emitted_tool_calls.insert(item_id.to_string());
+                        handler
+                            .handle(ModelStreamEvent::ToolCallCompleted {
+                                tool_call: ToolCallRequest {
+                                    call_id: fc.call_id.clone(),
+                                    name,
+                                    arguments,
+                                },
+                            })
+                            .await
+                            .map_err(|e| (e, made_progress))?;
+                    }
+                }
+                _ => {}
+            },
             ResponseStreamEvent::ResponseFunctionCallArgumentsDone(ev) => {
+                if emitted_tool_calls.contains(&ev.item_id) {
+                    continue;
+                }
                 made_progress = true;
                 saw_tool_call = true;
-                let arguments: Value = serde_json::from_str(&ev.arguments).unwrap_or_else(|e| {
-                    tracing::warn!(item_id = ev.item_id, error = %e, raw = ev.arguments, "failed to parse function call arguments");
-                    Value::Null
-                });
+                let arguments: Value = serde_json::from_str(&ev.arguments).map_err(|error| {
+                    (
+                        anyhow::anyhow!(error).context(format!(
+                            "malformed Responses tool arguments for item_id={}",
+                            ev.item_id
+                        )),
+                        made_progress,
+                    )
+                })?;
                 let meta = function_call_meta.get(&ev.item_id);
                 let name = ev
                     .name
                     .as_deref()
                     .filter(|n| !n.is_empty() && *n != "unknown")
                     .or_else(|| meta.map(|(n, _)| n.as_str()))
-                    .unwrap_or("unknown");
+                    .ok_or_else(|| {
+                        (
+                            anyhow::anyhow!(
+                                "Responses tool arguments completed without a tool name (item_id={})",
+                                ev.item_id
+                            ),
+                            made_progress,
+                        )
+                    })?;
                 let call_id = meta
                     .map(|(_, cid)| cid.clone())
                     .unwrap_or_else(|| ev.item_id.clone());
+                if call_id.trim().is_empty() {
+                    return Err((
+                        anyhow::anyhow!(
+                            "Responses tool arguments completed without call_id (item_id={})",
+                            ev.item_id
+                        ),
+                        made_progress,
+                    ));
+                }
                 emitted_tool_calls.insert(ev.item_id);
                 handler
                     .handle(ModelStreamEvent::ToolCallCompleted {
@@ -1510,6 +1557,7 @@ async fn stream_responses_once(
                     .map_err(|e| (e, made_progress))?;
             }
             ResponseStreamEvent::ResponseCompleted(ev) => {
+                saw_response_completed = true;
                 final_raw = response_usage_to_raw(&ev.response);
             }
             _ => {}
@@ -1524,6 +1572,15 @@ async fn stream_responses_once(
         has_tool_call = saw_tool_call,
         "stream completed"
     );
+
+    if !saw_response_completed {
+        return Err((
+            anyhow::anyhow!(
+                "Responses stream ended without response.completed after {event_count} events"
+            ),
+            made_progress,
+        ));
+    }
 
     if text_started {
         if let Some(item_id) = text_item_id.clone() {
@@ -1563,7 +1620,8 @@ async fn stream_chat_completions_with_retry(
             Err((error, made_progress))
                 if attempt < MAX_ATTEMPTS && !made_progress && is_transient_llm_error(&error) =>
             {
-                let backoff_ms = 1_000u64 * (1u64 << (attempt - 1)).min(8);
+                let backoff_ms = 1_000u64 * (1u64 << (attempt - 1)).min(8)
+                    + retry_jitter_ms(&settings.role, attempt);
                 tracing::warn!(
                     attempt,
                     backoff_ms,
@@ -1591,11 +1649,12 @@ async fn stream_chat_completions_once(
     let request =
         build_chat_completions_request(settings, input, prompt, true).map_err(|e| (e, false))?;
     debug!(role = %settings.role, "opening streaming Chat Completions API connection");
-    let mut stream = client
-        .chat()
-        .create_stream(request)
-        .await
-        .map_err(|e| (anyhow::anyhow!("{e}").context("Chat Completions stream failed"), false))?;
+    let mut stream = client.chat().create_stream(request).await.map_err(|e| {
+        (
+            anyhow::anyhow!("{e}").context("Chat Completions stream failed"),
+            false,
+        )
+    })?;
     debug!(
         role = %settings.role,
         connect_ms = started.elapsed().as_millis() as u64,
@@ -1608,6 +1667,7 @@ async fn stream_chat_completions_once(
     let mut final_raw = Value::Null;
     let mut made_progress = false;
     let mut event_count: u64 = 0;
+    let mut saw_terminal_finish = false;
 
     struct PendingToolCall {
         id: String,
@@ -1683,13 +1743,14 @@ async fn stream_chat_completions_once(
             if let Some(tool_calls) = &delta.tool_calls {
                 for tc_chunk in tool_calls {
                     let idx = tc_chunk.index;
-                    let pending = pending_tool_calls.entry(idx).or_insert_with(|| {
-                        PendingToolCall {
-                            id: String::new(),
-                            name: String::new(),
-                            arguments: String::new(),
-                        }
-                    });
+                    let pending =
+                        pending_tool_calls
+                            .entry(idx)
+                            .or_insert_with(|| PendingToolCall {
+                                id: String::new(),
+                                name: String::new(),
+                                arguments: String::new(),
+                            });
                     if let Some(id) = &tc_chunk.id {
                         pending.id = id.clone();
                     }
@@ -1704,10 +1765,34 @@ async fn stream_chat_completions_once(
                 }
             }
 
-            if let Some(FinishReason::ToolCalls) = choice.finish_reason {
-                saw_tool_call = true;
+            if let Some(finish_reason) = choice.finish_reason {
+                let finish = format!("{finish_reason:?}");
+                if finish.eq_ignore_ascii_case("length")
+                    || finish.eq_ignore_ascii_case("contentfilter")
+                    || finish.eq_ignore_ascii_case("content_filter")
+                {
+                    return Err((
+                        anyhow::anyhow!(
+                            "Chat Completions stream terminated with non-recoverable finish_reason={finish}"
+                        ),
+                        made_progress,
+                    ));
+                }
+                if matches!(finish_reason, FinishReason::ToolCalls) {
+                    saw_tool_call = true;
+                }
+                saw_terminal_finish = true;
             }
         }
+    }
+
+    if !saw_terminal_finish {
+        return Err((
+            anyhow::anyhow!(
+                "Chat Completions stream ended without a terminal finish_reason after {event_count} chunks"
+            ),
+            made_progress,
+        ));
     }
 
     if text_started {
@@ -1726,10 +1811,23 @@ async fn stream_chat_completions_once(
     indices.sort();
     for idx in indices {
         if let Some(tc) = pending_tool_calls.remove(&idx) {
+            if tc.id.trim().is_empty() || tc.name.trim().is_empty() {
+                return Err((
+                    anyhow::anyhow!("Chat Completions tool call index {idx} ended without id/name"),
+                    made_progress,
+                ));
+            }
             made_progress = true;
             saw_tool_call = true;
-            let arguments: Value =
-                serde_json::from_str(&tc.arguments).unwrap_or(Value::Null);
+            let arguments: Value = serde_json::from_str(&tc.arguments).map_err(|error| {
+                (
+                    anyhow::anyhow!(error).context(format!(
+                        "malformed Chat Completions tool arguments for index={idx}, call_id={}",
+                        tc.id
+                    )),
+                    made_progress,
+                )
+            })?;
             let name = tools::resolve_tool_name(&tc.name);
             handler
                 .handle(ModelStreamEvent::ToolCallCompleted {
@@ -1871,13 +1969,9 @@ fn requires_structured_final_artifact(role: &str) -> bool {
                 | "researcher.bear.initial"
                 | "researcher.bull.interaction"
                 | "researcher.bear.interaction"
-                | "mediator.topic"
                 | "mediator.topic_controller"
                 | "trader"
-                | "risk.aggressive"
-                | "risk.neutral"
                 | "risk.conservative"
-                | "allocation.manager"
         )
 }
 
@@ -1893,12 +1987,8 @@ fn validate_json_artifact_contract(settings: &AgentSettings, artifact: &Value) -
             validate_interaction_packet_contract(settings, artifact)
         }
         "mediator.topic_controller" => validate_controller_packet_contract(settings, artifact),
-        "mediator.topic" => validate_topic_generation_contract(settings, artifact),
         "trader" => validate_trade_intent_contract(settings, artifact),
-        "risk.aggressive" | "risk.neutral" | "risk.conservative" => {
-            validate_risk_constraints_contract(settings, artifact)
-        }
-        "allocation.manager" => validate_allocation_artifact_contract(settings, artifact),
+        "risk.conservative" => validate_risk_constraints_contract(settings, artifact),
         _ => Ok(()),
     }
 }
@@ -2067,71 +2157,6 @@ fn validate_controller_packet_contract(settings: &AgentSettings, artifact: &Valu
         bail!("controller packet requires soft_control.stop_reason string");
     }
     require_object(artifact, "reducer_checks")?;
-    Ok(())
-}
-
-fn validate_topic_generation_contract(settings: &AgentSettings, artifact: &Value) -> Result<()> {
-    require_exact_role(settings, artifact)?;
-    require_exact_string(
-        artifact,
-        "artifact_type",
-        "phase2_topic_generation_artifact",
-    )?;
-    require_array(artifact, "topics")?;
-    require_non_empty_string(artifact, "summary")?;
-    require_object(artifact, "reducer_checks")?;
-    Ok(())
-}
-
-fn validate_allocation_artifact_contract(settings: &AgentSettings, artifact: &Value) -> Result<()> {
-    validate_optional_role(settings, artifact)?;
-    let weights = require_object(artifact, "weights")?;
-    if weights.is_empty() {
-        bail!("allocation artifact weights must not be empty");
-    }
-    let mut total_weight = 0.0;
-    let mut equity_weight = 0.0;
-    for (ticker, entry) in weights {
-        if ticker.eq_ignore_ascii_case("VIX") {
-            bail!("VIX is a regime signal and must not appear in allocation weights");
-        }
-        let weight = entry
-            .as_f64()
-            .or_else(|| entry.get("weight").and_then(Value::as_f64))
-            .with_context(|| format!("allocation weight for {ticker} must be numeric"))?;
-        if !(0.0..=1.0).contains(&weight) {
-            bail!("allocation weight for {ticker} must be in 0..1");
-        }
-        total_weight += weight;
-        if ticker != "cash_hedge" {
-            equity_weight += weight;
-        }
-    }
-    if artifact
-        .get("per_ticker")
-        .and_then(Value::as_object)
-        .is_some_and(|items| {
-            items
-                .keys()
-                .any(|ticker| ticker.eq_ignore_ascii_case("VIX"))
-        })
-    {
-        bail!("VIX is a regime signal and must not appear in allocation per_ticker");
-    }
-    if (total_weight - 1.0).abs() > 0.03 {
-        bail!("allocation weights must sum to approximately 1.0 (got {total_weight})");
-    }
-    if let Some(total_equity) = artifact
-        .get("total_equity_exposure")
-        .and_then(Value::as_f64)
-    {
-        if (total_equity - equity_weight).abs() > 0.03 {
-            bail!(
-                "total_equity_exposure {total_equity} does not match non-cash weights {equity_weight}"
-            );
-        }
-    }
-    require_non_empty_string(artifact, "correlation_note")?;
     Ok(())
 }
 
@@ -2524,8 +2549,7 @@ fn configured_tool_names(settings: &AgentSettings) -> Vec<&str> {
 fn role_disables_tools(role: &str) -> bool {
     // manager.research may call read_run_context for phase_summaries / attention.
     // Trader / risk / PM stay tool-free.
-    matches!(role, "trader" | "portfolio.manager" | "allocation.manager")
-        || role.starts_with("risk.")
+    matches!(role, "trader" | "portfolio.manager") || role.starts_with("risk.")
 }
 
 fn validate_tool_name(name: &str) -> Result<()> {
@@ -2587,9 +2611,8 @@ pub fn mock_role_artifact(role: &str, tickers: &[String]) -> Value {
     match role {
         "manager.research" => orchestrator_sql::write::mock_research_artifact(tickers),
         "trader" => mock_trader_artifact(),
-        "risk.aggressive" | "risk.conservative" | "risk.neutral" => mock_risk_artifact(role),
+        "risk.conservative" => mock_risk_artifact(role),
         "portfolio.manager" => mock_portfolio_artifact(),
-        "allocation.manager" => mock_allocation_artifact(tickers),
         _ => {
             let per_ticker = tickers
                 .iter()
@@ -2667,58 +2690,6 @@ fn mock_portfolio_artifact() -> Value {
     })
 }
 
-fn mock_allocation_artifact(tickers: &[String]) -> Value {
-    let investable: Vec<&String> = tickers.iter().filter(|t| t.as_str() != "VIX").collect();
-    if investable.is_empty() {
-        return serde_json::json!({
-            "id": "allocation.manager",
-            "role": "allocation.manager",
-            "weights": {
-                "cash_hedge": {
-                    "weight": 1.0,
-                    "rationale": "Mock cash allocation; no investable tickers"
-                }
-            },
-            "total_equity_exposure": 0.0,
-            "vix_regime": "normal",
-            "correlation_note": "Mock correlation note",
-            "summary": "Mock allocation artifact.",
-            "allocation_method": "mock"
-        });
-    }
-    let count = investable.len().max(1);
-    let equity = 0.6_f64;
-    let per = (equity / count as f64 * 10_000.0).round() / 10_000.0;
-    let cash = (1.0 - per * count as f64).max(0.0);
-    let mut weights = serde_json::Map::new();
-    for ticker in &investable {
-        weights.insert(
-            ticker.to_string(),
-            serde_json::json!({
-                "weight": per,
-                "rationale": format!("Mock allocation for {}", ticker)
-            }),
-        );
-    }
-    weights.insert(
-        "cash_hedge".to_string(),
-        serde_json::json!({
-            "weight": cash,
-            "rationale": "Mock cash hedge"
-        }),
-    );
-    serde_json::json!({
-        "id": "allocation.manager",
-        "role": "allocation.manager",
-        "weights": weights,
-        "total_equity_exposure": per * count as f64,
-        "vix_regime": "normal",
-        "correlation_note": "Mock correlation note",
-        "summary": "Mock allocation artifact.",
-        "allocation_method": "mock"
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -2791,13 +2762,8 @@ mod tests {
             tools::tool_names(),
             vec![
                 "read_run_context",
-                "fetch_jin10_flash",
-                "fetch_youtube_transcript",
-                "fetch_wayinvideo_transcript",
-                "run_technical_indicators",
-                "read_technical_csv",
-                "read_jin10_csv",
-                "fetch_last30days_context",
+                "read_technical_context",
+                "read_jin10_context",
             ]
         );
     }
@@ -3063,7 +3029,7 @@ mod tests {
             "unexpected error: {err}"
         );
 
-        let valid = r#"{"id":"analyst.technical","role":"analyst.technical","per_ticker":{"QQQ":{"direction":"bullish","confidence":0.7,"report":"ok"}}}"#;
+        let valid = r#"{"id":"analyst.technical","role":"analyst.technical","per_ticker":{"QQQ":{"direction":"bullish","confidence":0.7,"report":"ok","key_evidence":[{"claim":"QQQ closed above its 20-day average","evidence_type":"fact","source":"Yahoo Finance daily OHLCV","timestamp":"2026-07-22","source_confidence":0.9}]}}}"#;
         let artifact = super::parse_final_output(&settings, valid).unwrap();
         assert_eq!(artifact["per_ticker"]["QQQ"]["direction"], json!("bullish"));
     }
@@ -3075,7 +3041,7 @@ mod tests {
         settings.tickers = vec!["QQQ".to_string()];
         settings.output_mode = OutputMode::JsonArtifact;
 
-        let text = r#"{"id":"analyst.youtube","role":"analyst.youtube","per_ticker":{"QQQ":{"direction":"bullish","confidence":0.7,"report":"ok"}}}"#;
+        let text = r#"{"id":"analyst.news_macro","role":"analyst.news_macro","per_ticker":{"QQQ":{"direction":"bullish","confidence":0.7,"report":"ok"}}}"#;
         let error = super::parse_final_output(&settings, text).unwrap_err();
 
         assert!(
@@ -3103,91 +3069,6 @@ mod tests {
 
         assert!(
             error.to_string().contains("per_ticker keys mismatch"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn parse_final_output_rejects_non_json_allocation_artifact() {
-        let mut settings = base_settings(LlmRoute::Responses);
-        settings.role = "allocation.manager".to_string();
-        settings.tickers = vec!["QQQ".to_string()];
-        settings.output_mode = OutputMode::JsonArtifact;
-
-        let text = "The allocation review is complete, but this response deliberately contains no JSON artifact. It repeats enough prose to be treated as a terminal answer by the agent loop rather than a short action note. The runtime must reject this execution-critical response instead of converting it into a degraded text artifact that downstream allocation normalization could misinterpret.";
-        let error = super::parse_final_output(&settings, text).unwrap_err();
-
-        assert!(
-            error.to_string().contains("allocation.manager")
-                || error.to_string().contains("JSON artifact"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn parse_final_output_rejects_wrapped_allocation_artifact() {
-        let mut settings = base_settings(LlmRoute::Responses);
-        settings.role = "allocation.manager".to_string();
-        settings.tickers = vec!["QQQ".to_string()];
-        settings.output_mode = OutputMode::JsonArtifact;
-
-        let text = r#"{
-            "id":"allocation.manager",
-            "role":"allocation.manager",
-            "report":{
-                "weights":{"QQQ":{"weight":0.0},"cash_hedge":{"weight":1.0}},
-                "total_equity_exposure":0.0,
-                "vix_regime":"normal",
-                "correlation_note":"none",
-                "summary":"cash"
-            }
-        }"#;
-        let error = super::parse_final_output(&settings, text).unwrap_err();
-
-        assert!(
-            error.to_string().contains("weights"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn parse_final_output_accepts_direct_allocation_without_runtime_identity() {
-        let mut settings = base_settings(LlmRoute::Responses);
-        settings.role = "allocation.manager".to_string();
-        settings.tickers = vec!["QQQ".to_string()];
-        settings.output_mode = OutputMode::JsonArtifact;
-
-        let text = r#"{
-            "weights":{"QQQ":{"weight":0.0},"cash_hedge":{"weight":1.0}},
-            "total_equity_exposure":0.0,
-            "vix_regime":"normal",
-            "correlation_note":"none",
-            "summary":"cash"
-        }"#;
-        let artifact = super::parse_final_output(&settings, text).unwrap();
-
-        assert_eq!(artifact["total_equity_exposure"], 0.0);
-        assert!(artifact.get("role").is_none());
-    }
-
-    #[test]
-    fn parse_final_output_rejects_allocation_weight_sum_mismatch() {
-        let mut settings = base_settings(LlmRoute::Responses);
-        settings.role = "allocation.manager".to_string();
-        settings.tickers = vec!["QQQ".to_string()];
-        settings.output_mode = OutputMode::JsonArtifact;
-
-        let text = r#"{
-            "weights":{"QQQ":{"weight":0.10}},
-            "total_equity_exposure":0.10,
-            "vix_regime":"normal",
-            "correlation_note":"none",
-            "summary":"incomplete"
-        }"#;
-        let error = super::parse_final_output(&settings, text).unwrap_err();
-
-        assert!(
-            error.to_string().contains("sum"),
             "unexpected error: {error}"
         );
     }
@@ -3612,22 +3493,22 @@ mod tests {
         settings.role = "analyst.technical".to_string();
         settings.llm.base_url = Some("https://llm.example.com/v1".to_string());
         settings.llm.api_key = Some("test-key".to_string());
-        settings.llm.tools = vec!["run_technical_indicators".to_string()];
+        settings.llm.tools = vec!["read_technical_context".to_string()];
         assert_eq!(
             super::configured_tool_names(&settings),
-            vec!["think", "run_technical_indicators", "web.run"]
+            vec!["think", "read_technical_context", "web.run"]
         );
 
         settings.llm.think_tool = false;
         assert_eq!(
             super::configured_tool_names(&settings),
-            vec!["run_technical_indicators", "web.run"]
+            vec!["read_technical_context", "web.run"]
         );
     }
 
     #[test]
     fn execution_roles_disable_loop_and_native_tools() {
-        for role in ["trader", "allocation.manager"] {
+        for role in ["trader", "portfolio.manager"] {
             let mut settings = base_settings(LlmRoute::Responses);
             settings.role = role.to_string();
             settings.llm.base_url = Some("https://llm.example.com/v1".to_string());

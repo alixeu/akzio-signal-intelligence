@@ -140,15 +140,6 @@ mod tests {
     }
 
     #[test]
-    fn mock_allocation_produces_valid_artifact() {
-        let runner = EvalRunner::new();
-        let case = make_case("allocation.manager", &["TQQQ", "SOXX"]);
-        let result = runner.run_case(&case).unwrap();
-        assert!(result.artifact.is_object());
-        assert!(result.score.dimensions["json_validity"] == 100.0);
-    }
-
-    #[test]
     fn live_mode_returns_error() {
         let runner = EvalRunner::new();
         let mut case = make_case("analyst.technical", &["TQQQ"]);

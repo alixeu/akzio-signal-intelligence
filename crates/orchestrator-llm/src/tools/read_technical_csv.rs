@@ -3,14 +3,14 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::{api_tool_name, log_tool_result};
+use super::{api_tool_name, log_tool_result, ExternalToolConfig};
 
-pub const NAME: &str = "read_technical_csv";
+pub const NAME: &str = "read_technical_context";
 
 pub fn definition() -> ToolDefinition {
     ToolDefinition {
         name: api_tool_name(NAME),
-        description: "Retrieve precomputed technical bars and indicator features for a ticker at a given interval. You MUST call this tool once per ticker per interval (daily, 3h, 20min) BEFORE forming any technical conclusion. Always fetch all assigned tickers × all three intervals. Do not invent readings; do not use for news or social evidence.".to_string(),
+        description: "Retrieve preflight-imported technical bars and indicator features from the run SQLite database. You MUST call this tool once per ticker per interval (daily, 3h, 20min) BEFORE forming any technical conclusion. Always fetch all assigned tickers × all three intervals. Do not invent readings; do not use for news evidence.".to_string(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -46,18 +46,20 @@ fn default_interval() -> String {
     "daily".to_string()
 }
 
-pub fn execute(args: Value) -> Result<Value> {
+pub fn execute(args: Value, config: &ExternalToolConfig) -> Result<Value> {
     let tool_args =
-        serde_json::from_value::<Args>(args).context("invalid read_technical_csv arguments")?;
+        serde_json::from_value::<Args>(args).context("invalid read_technical_context arguments")?;
     let ticker = tool_args.ticker.trim().to_uppercase();
     let interval =
         orchestrator_core::technical_csv::storage_interval(&tool_args.interval).unwrap_or("daily");
-    let csv_dir = orchestrator_core::technical_csv::default_technical_csv_dir();
-    let rows = orchestrator_core::technical_csv::technical_csv_path(&csv_dir, &ticker, interval)
-        .and_then(|p| orchestrator_core::technical_csv::read_technical_csv(&p).ok())
-        .unwrap_or_default();
+    let db_path = config
+        .db_path
+        .as_ref()
+        .context("read_technical_context requires the run SQLite path")?;
+    let conn = orchestrator_sql::connect(db_path)?;
+    let rows = orchestrator_sql::load_technical_series(&conn, &ticker, interval)?;
     let result = if rows.is_empty() {
-        json!({"error": format!("no technical CSV data for {} @ {}", ticker, interval)})
+        json!({"error": format!("no SQLite technical data for {} @ {}", ticker, interval)})
     } else {
         let entries: Vec<Value> = rows
             .iter()
@@ -70,8 +72,43 @@ pub fn execute(args: Value) -> Result<Value> {
                 Value::Object(obj)
             })
             .collect();
-        json!({"ticker": ticker, "interval": interval, "bars": rows.len(), "data": entries})
+        json!({"source": "sqlite.technical_series", "ticker": ticker, "interval": interval, "bars": rows.len(), "data": entries})
     };
     log_tool_result(NAME, &Ok(result.clone()));
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use orchestrator_core::{write_technical_csv, TechnicalCsvRow};
+    use std::collections::HashMap;
+
+    #[test]
+    fn reads_only_from_configured_sqlite_database() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("run.sqlite");
+        let csv_path = temp.path().join("qqq_day.csv");
+        write_technical_csv(
+            &csv_path,
+            &[TechnicalCsvRow {
+                date: "2026-07-21".to_string(),
+                values: HashMap::from([("Close".to_string(), 500.0)]),
+            }],
+        )
+        .unwrap();
+        let mut conn = orchestrator_sql::connect(&db_path).unwrap();
+        orchestrator_sql::import_technical_csv(&mut conn, "QQQ", "daily", &csv_path).unwrap();
+        drop(conn);
+        let config = ExternalToolConfig {
+            db_path: Some(db_path),
+            ..Default::default()
+        };
+
+        let result = execute(json!({"ticker": "QQQ", "interval": "daily"}), &config).unwrap();
+
+        assert_eq!(result["source"], "sqlite.technical_series");
+        assert_eq!(result["bars"], 1);
+        assert_eq!(result["data"][0]["Close"], 500.0);
+    }
 }

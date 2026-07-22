@@ -138,9 +138,9 @@ impl AgentRegistry {
             short_name: "technical".into(),
             phase: 1,
             prompt_path: "prompts/analysts/technical.md".into(),
-            preflight_tool: Some("read_technical_csv".into()),
+            preflight_tool: Some("read_technical_context".into()),
             default_tools: vec!["read_run_context".into()],
-            default_weight: 40.0,
+            default_weight: 50.0,
             is_critical: true,
         });
         registry.register(AgentDefinition {
@@ -148,43 +148,13 @@ impl AgentRegistry {
             short_name: "news_macro".into(),
             phase: 1,
             prompt_path: "prompts/analysts/news_macro.md".into(),
-            preflight_tool: Some("read_jin10_csv".into()),
+            preflight_tool: Some("read_jin10_context".into()),
             default_tools: vec![],
-            default_weight: 35.0,
+            default_weight: 50.0,
             is_critical: true,
-        });
-        registry.register(AgentDefinition {
-            role_id: "analyst.youtube".into(),
-            short_name: "youtube".into(),
-            phase: 1,
-            prompt_path: "prompts/analysts/youtube.md".into(),
-            preflight_tool: None,
-            default_tools: vec![],
-            default_weight: 8.0,
-            is_critical: false,
-        });
-        registry.register(AgentDefinition {
-            role_id: "analyst.reddit".into(),
-            short_name: "reddit".into(),
-            phase: 1,
-            prompt_path: "prompts/analysts/reddit.md".into(),
-            preflight_tool: None,
-            default_tools: vec![],
-            default_weight: 9.0,
-            is_critical: false,
-        });
-        registry.register(AgentDefinition {
-            role_id: "analyst.x".into(),
-            short_name: "x".into(),
-            phase: 1,
-            prompt_path: "prompts/analysts/x.md".into(),
-            preflight_tool: None,
-            default_tools: vec![],
-            default_weight: 8.0,
-            is_critical: false,
         });
         registry
     }
 }
 
-pub const DEFAULT_PHASE1_AGENTS: &str = "technical,news,youtube,reddit,x";
+pub const DEFAULT_PHASE1_AGENTS: &str = "technical,news";

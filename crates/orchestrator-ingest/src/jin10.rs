@@ -75,7 +75,11 @@ pub async fn run(args: Jin10Args) -> Result<Value> {
             let content = item
                 .pointer("/data/content")
                 .and_then(Value::as_str)
-                .unwrap_or("");
+                .unwrap_or("")
+                .trim();
+            if content.is_empty() {
+                continue;
+            }
             if content.contains("VIP专享快讯，解锁直达") {
                 continue;
             }

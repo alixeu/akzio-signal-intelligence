@@ -8,12 +8,13 @@ pub mod phase00_gate;
 pub mod phase_index;
 pub mod prediction;
 pub mod schema;
+pub mod technical_store;
 pub mod write;
 
 pub use context::{
-    context_count, handle_read_command, load_technical_csv, messages_for_run, messages_text,
-    read_run_context, session_history_items, sqlite_context, turn_history_items,
-    RunContextReadRequest, RuntimeContext,
+    context_count, handle_read_command, messages_for_run, messages_text, read_run_context,
+    session_history_items, sqlite_context, turn_history_items, RunContextReadRequest,
+    RuntimeContext,
 };
 pub use importers::{
     import_jin10_payload, import_scored_jin10_items, jin10_item_id, record_jin10_attention,
@@ -29,6 +30,7 @@ pub use phase_index::{
     PhaseSummaryInput, PhaseSummaryRow,
 };
 pub use schema::{connect, ensure_schema, AGGREGATE_TICKER};
+pub use technical_store::{import_technical_csv, load_technical_series, technical_row_count};
 pub use write::{
     clear_agent_loop_history, set_run_current_phase, update_run_status, upsert_agent_turn,
     write_agent_message_scoped, write_role_turn_summary, write_run_record, AgentMessageInput,

@@ -22,11 +22,9 @@ dotenvy = "0.15.7"
 futures = "0.3.31"
 html-escape = "0.2.13"
 regex = "1.11.1"
-decrypt-cookies = { version = "0.11.1", features = ["Safari"] }
-reqwest = { version = "0.12.12", default-features = false, features = ["cookies", "json", "rustls-tls"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["cookies", "json", "rustls"] }
 async-openai = { version = "0.41.1", features = ["responses", "chat-completion"] }
 rusqlite = { version = "0.32.1", features = ["bundled", "chrono"] }
-scraper = "0.22.0"
 schemars = "1.0.4"
 serde = { version = "1.0.217", features = ["derive"] }
 serde_json = "1.0.135"
@@ -38,7 +36,5 @@ thiserror = "2.0.11"
 toml = "0.8"
 tokio = { version = "1.43.0", features = ["full"] }
 tracing = "0.1.41"
-twikit = { package = "twikit-rs", version = "0.1.0" }
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
-urlencoding = "2.1.3"
 uuid = { version = "1.12.0", features = ["v4", "serde"] }

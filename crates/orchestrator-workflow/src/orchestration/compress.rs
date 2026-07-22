@@ -58,7 +58,7 @@ pub(crate) fn build_phase_compress(state: &Value, source_phase: i64) -> Result<P
         7 => build_generic(
             &run_id,
             7,
-            "allocation.manager",
+            "allocator.rust",
             state
                 .get("allocation_result")
                 .or_else(|| state.get("portfolio_allocation"))
@@ -258,7 +258,7 @@ fn build_phase1(run_id: &str, state: &Value) -> Phase00PhaseBatch {
                     "partial" => 0.55,
                     _ => 0.35,
                 })
-                .unwrap_or(0.5),
+                .unwrap_or(0.0),
         });
         if let Some(eq) = phase1.get("evidence_quality") {
             batch.push_detail(&PhaseSummaryDetailInput {
@@ -318,12 +318,12 @@ fn build_phase1(run_id: &str, state: &Value) -> Phase00PhaseBatch {
                         .filter_map(|r| r.get("confidence").and_then(Value::as_f64))
                         .collect();
                     if confs.is_empty() {
-                        0.5
+                        0.0
                     } else {
                         confs.iter().sum::<f64>() / confs.len() as f64
                     }
                 })
-                .unwrap_or(0.5),
+                .unwrap_or(0.0),
         });
         let mut order = 0i64;
         if let Some(roles) = payload.get("role_summaries").and_then(Value::as_array) {
@@ -335,7 +335,7 @@ fn build_phase1(run_id: &str, state: &Value) -> Phase00PhaseBatch {
                 let stance = role_sum
                     .get("stance")
                     .and_then(Value::as_str)
-                    .unwrap_or("neutral");
+                    .unwrap_or("unobserved");
                 let text = role_sum
                     .get("summary")
                     .and_then(Value::as_str)
@@ -534,7 +534,7 @@ fn build_generic(
     let conf = artifact
         .get("confidence")
         .and_then(Value::as_f64)
-        .unwrap_or(0.5);
+        .unwrap_or(0.0);
     let compact = compact_fields(artifact, keep_fields);
     let sid = batch.push_summary(&PhaseSummaryInput {
         run_id: run_id.to_string(),

@@ -448,15 +448,6 @@ where
                 persist_turn(conn, turn, &config.truncation)?;
                 continue;
             }
-            if turn.role == "allocation.manager" && !allocation_artifact_looks_valid(&text) {
-                turn.tools_disabled = true;
-                turn.push_pending_input(
-                    "Your last JSON is invalid for allocation.manager. You MUST include ALL of these top-level fields: weights (object with numeric values summing to 1.0), total_equity_exposure (number 0-1 = sum of non-cash weights), vix_regime (string: risk_on/normal/elevated/defensive), correlation_note (string), summary (string). Do not wrap in id/role/status/report. Do not call tools again.",
-                );
-                turn.needs_follow_up = true;
-                persist_turn(conn, turn, &config.truncation)?;
-                continue;
-            }
         }
 
         if let Some(item_id) = stream_result.last_assistant_message_id.clone() {
@@ -1214,7 +1205,7 @@ fn preseed_tool_calls(role: &str, tickers: &[String]) -> Vec<ToolCallRequest> {
                 for interval in &["daily", "3h", "20min"] {
                     calls.push(ToolCallRequest {
                         call_id: format!("preseed-tech-{}-{}", ticker.to_lowercase(), interval),
-                        name: "read_technical_csv".to_string(),
+                        name: "read_technical_context".to_string(),
                         arguments: json!({ "ticker": ticker, "interval": *interval }),
                     });
                 }
@@ -1223,7 +1214,7 @@ fn preseed_tool_calls(role: &str, tickers: &[String]) -> Vec<ToolCallRequest> {
         "analyst.news_macro" => {
             calls.push(ToolCallRequest {
                 call_id: "preseed-jin10".to_string(),
-                name: "read_jin10_csv".to_string(),
+                name: "read_jin10_context".to_string(),
                 arguments: json!({}),
             });
         }
@@ -1504,42 +1495,6 @@ fn controller_packet_looks_valid(text: &str) -> bool {
             })
 }
 
-fn allocation_artifact_looks_valid(text: &str) -> bool {
-    let Ok(value) = extract_json_value(text) else {
-        return false;
-    };
-    let Some(weights) = value.get("weights").and_then(Value::as_object) else {
-        return false;
-    };
-    if weights.contains_key("VIX")
-        || value
-            .get("per_ticker")
-            .and_then(Value::as_object)
-            .and_then(|items| items.get("VIX"))
-            .is_some_and(|payload| payload.get("weight").is_some())
-    {
-        return false;
-    }
-    let parsed = weights
-        .iter()
-        .map(|(ticker, entry)| {
-            entry
-                .as_f64()
-                .or_else(|| entry.get("weight").and_then(Value::as_f64))
-                .filter(|weight| (0.0..=1.0).contains(weight))
-                .map(|weight| (ticker, weight))
-        })
-        .collect::<Option<Vec<_>>>();
-    let Some(parsed) = parsed.filter(|items| !items.is_empty()) else {
-        return false;
-    };
-    let total_weight = parsed.iter().map(|(_, weight)| *weight).sum::<f64>();
-    if assistant_message_needs_follow_up(text) || (total_weight - 1.0).abs() > 0.03 {
-        return false;
-    }
-    non_empty_string_field(&value, "correlation_note")
-}
-
 fn non_empty_string_field(value: &Value, field: &str) -> bool {
     value
         .get(field)
@@ -1660,17 +1615,11 @@ fn analyst_final_artifact_looks_valid(role: &str, expected_tickers: &[String], t
         return false;
     }
     per_ticker.values().all(|payload| {
-        let direction = payload
-            .get("direction")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        matches!(
-            direction,
-            "bullish" | "bearish" | "neutral" | "mixed" | "unobserved"
-        ) && payload
-            .get("confidence")
-            .and_then(Value::as_f64)
-            .is_some_and(|confidence| (0.0..=1.0).contains(&confidence))
+        serde_json::from_value::<orchestrator_core::AnalystTickerArtifact>(payload.clone())
+            .ok()
+            .is_some_and(|artifact| {
+                orchestrator_core::validate_analyst_ticker_artifact(&artifact).is_ok()
+            })
     })
 }
 
@@ -2607,7 +2556,7 @@ mod tests {
     fn analyst_final_packet_requires_exact_role_and_ticker_set() {
         let expected_tickers = vec!["QQQ".to_string(), "SOXX".to_string()];
         let wrong_role = r#"{
-            "role":"analyst.youtube",
+            "role":"analyst.news_macro",
             "per_ticker":{
                 "QQQ":{"direction":"bullish","confidence":0.7},
                 "SOXX":{"direction":"bearish","confidence":0.6}
@@ -2648,46 +2597,16 @@ mod tests {
     }
 
     #[test]
-    fn controller_and_allocation_final_packets_reject_incomplete_or_wrapped_json() {
+    fn controller_final_packet_rejects_incomplete_json() {
         assert!(!controller_packet_looks_valid(
             r#"{"role":"mediator.topic_controller","artifact_type":"topic_controller_packet","topic_id":"qqq"}"#
-        ));
-        assert!(!allocation_artifact_looks_valid(
-            r#"{
-                "role":"allocation.manager",
-                "report":{
-                    "weights":{"cash_hedge":{"weight":1.0}},
-                    "total_equity_exposure":0.0,
-                    "vix_regime":"normal",
-                    "correlation_note":"none",
-                    "summary":"cash"
-                }
-            }"#
-        ));
-        assert!(allocation_artifact_looks_valid(
-            r#"{
-                "weights":{"cash_hedge":{"weight":1.0}},
-                "total_equity_exposure":0.0,
-                "vix_regime":"normal",
-                "correlation_note":"none",
-                "summary":"cash"
-            }"#
-        ));
-        assert!(!allocation_artifact_looks_valid(
-            r#"{
-                "weights":{"VIX":{"weight":0.0},"cash_hedge":{"weight":1.0}},
-                "total_equity_exposure":0.0,
-                "vix_regime":"normal",
-                "correlation_note":"none",
-                "summary":"cash"
-            }"#
         ));
     }
 
     #[test]
     fn risk_packet_requires_explicit_information_gain() {
         let base = json!({
-            "stance": "neutral",
+            "stance": "conservative",
             "argument": "Balanced review.",
             "recommended_adjustment": "Keep the existing cap.",
             "stop_type": "event_based",
@@ -2700,7 +2619,7 @@ mod tests {
             "constraint_confidence": 0.8
         });
         assert!(!risk_constraints_look_valid(
-            "risk.neutral",
+            "risk.conservative",
             &base.to_string()
         ));
 
@@ -2712,7 +2631,7 @@ mod tests {
         );
         valid["no_new_information"] = json!(false);
         assert!(risk_constraints_look_valid(
-            "risk.neutral",
+            "risk.conservative",
             &valid.to_string()
         ));
     }
@@ -2897,12 +2816,12 @@ mod tests {
                 test_item(
                     TurnItemType::ToolResult,
                     "tool",
-                    format!("/tmp/large-{index}.rs {}", "x".repeat(8_000)),
+                    format!("/tmp/large-{index}.rs {}", "x".repeat(50_000)),
                 )
             })
             .collect::<Vec<_>>();
         let total_tokens = estimate_items_tokens(&items);
-        assert!(total_tokens > 9_600);
+        assert!(total_tokens > 96_000);
         assert!(items.len() < 120);
         append_history(&conn, &mut turn, items);
 
@@ -2919,7 +2838,7 @@ mod tests {
             input.items[0].content_json["estimated_tokens_before"]
                 .as_u64()
                 .unwrap()
-                > 9_600
+                > 96_000
         );
         assert!(input.items[0].content_text.contains("~"));
         assert!(input.items[0].content_text.contains("path: /tmp/large-"));

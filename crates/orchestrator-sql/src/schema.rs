@@ -45,15 +45,14 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
         DROP TABLE IF EXISTS agent_turns;
         DROP TABLE IF EXISTS agent_turn_items;
 
-        -- Legacy multi-source external_items removed. Jin10 uses jin10_items;
-        -- youtube/reddit/x will get dedicated tables when those paths are revived.
+        -- Legacy multi-source tables are permanently removed. Jin10 uses jin10_items.
         DROP TABLE IF EXISTS external_items;
         DROP TABLE IF EXISTS youtube_videos;
         DROP TABLE IF EXISTS youtube_transcripts;
         DROP TABLE IF EXISTS social_items;
         DROP TABLE IF EXISTS jin10_flash_items;
 
-        -- technical_features replaced by CSV files under outputs/technical.
+        -- Row-per-feature legacy storage is replaced by compact technical_series snapshots.
         DROP TABLE IF EXISTS technical_features;
 
         -- Phase 4 cleanup: dead indexes
@@ -106,7 +105,7 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
             summary_type TEXT NOT NULL DEFAULT '',
             summary TEXT NOT NULL,
             summary_json TEXT NOT NULL DEFAULT '{}',
-            confidence REAL NOT NULL DEFAULT 0.5,
+            confidence REAL NOT NULL DEFAULT 0.0,
             created_at INTEGER NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_role_turn_summaries_run_ticker_phase_role
@@ -120,7 +119,7 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
             memory_type TEXT NOT NULL DEFAULT '',
             status TEXT NOT NULL DEFAULT 'active',
             current_version_id TEXT NOT NULL DEFAULT '',
-            confidence REAL NOT NULL DEFAULT 0.5,
+            confidence REAL NOT NULL DEFAULT 0.0,
             expires_at INTEGER,
             created_at INTEGER NOT NULL,
             updated_at INTEGER NOT NULL
@@ -176,6 +175,19 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_jin10_items_attention
             ON jin10_items(attention_score DESC);
 
+        CREATE TABLE IF NOT EXISTS technical_series (
+            ticker TEXT NOT NULL,
+            interval TEXT NOT NULL,
+            as_of TEXT NOT NULL,
+            row_count INTEGER NOT NULL,
+            rows_json TEXT NOT NULL,
+            imported_at INTEGER NOT NULL,
+            PRIMARY KEY (ticker, interval),
+            CHECK (row_count > 0)
+        );
+        CREATE INDEX IF NOT EXISTS idx_technical_series_as_of
+            ON technical_series(interval, as_of DESC);
+
         -- Post-phase compressor: summary → detail index
         CREATE TABLE IF NOT EXISTS phase_summaries (
             id TEXT PRIMARY KEY,
@@ -186,7 +198,7 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
             topic_id TEXT,
             summary TEXT NOT NULL DEFAULT '',
             summary_json TEXT NOT NULL DEFAULT '{}',
-            confidence REAL NOT NULL DEFAULT 0.5,
+            confidence REAL NOT NULL DEFAULT 0.0,
             created_at INTEGER NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_phase_summaries_run_phase

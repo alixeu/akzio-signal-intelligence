@@ -420,6 +420,10 @@ fn render_for_lint(
         "portfolio_decision": serde_json::to_string_pretty(&state.get("final_trade_decision").cloned().unwrap_or(Value::Null))?,
         "allocation_context": serde_json::to_string_pretty(&state.get("allocation_context").cloned().unwrap_or(Value::Null))?,
         "phase3_context": "{}",
+        "phase1_index": serde_json::to_string_pretty(&state.get("phase1_index").cloned().unwrap_or_else(|| json!({})))?,
+        "phase00_context": serde_json::to_string_pretty(&state.get("phase00_tables").cloned().unwrap_or_else(|| json!({})))?,
+        "prior_phase_summaries": "{}",
+        "common_ground": serde_json::to_string_pretty(&state.get("common_ground").cloned().unwrap_or_else(|| json!({})))?,
         "risk_context": "{}",
         "portfolio_context": "{}",
         "workflow_pattern": "Workflow -> Stage/Sub-workflow -> Agent workers -> Reducer -> state artifact"
@@ -504,33 +508,20 @@ fn researcher_side_params(role: &str) -> (&'static str, &'static str, &'static s
 }
 
 fn risk_stance_label(role: &str) -> &'static str {
-    match role {
-        "risk.aggressive" => "aggressive",
-        "risk.conservative" => "conservative",
-        "risk.neutral" => "neutral",
-        _ => "",
+    if role == "risk.conservative" {
+        "conservative"
+    } else {
+        ""
     }
 }
 
 fn risk_stance_fragments(role: &str) -> (&'static str, &'static str, &'static str, &'static str) {
     match role {
-        "risk.aggressive" => (
-            "激进风险分析师",
-            "你的任务是为高回报路径辩护，指出保守和中性视角可能错失的机会，但不能无视已知风险或编造新催化。",
-            "2. 指出支持更高风险的 1-3 个最强依据，并说明它们是否已在 analyst_reports 中独立出现。\n3. 明确列出愿意接受的风险，不把风险淡化成机会；若 trader_plan 已很激进，优先建议保持而非继续加码。",
-            "\n  \"key_risks_accepted\": [\"接受的风险\"],",
-        ),
         "risk.conservative" => (
             "保守风险分析师",
             "你的任务是保护资产、降低波动，指出拟议方案中过度冒险的部分，但不能因为天然保守就否定所有机会。",
             "2. `key_risks` 只列 2-5 个真正会改变执行的风险，区分\u{201c}必须降风险\u{201d}与\u{201c}只需监控\u{201d}。\n3. 若 trader_plan 已经保守，指出无需进一步收缩，避免过度防御。",
             "\n  \"key_risks\": [\"主要风险\"],",
-        ),
-        "risk.neutral" => (
-            "中性风险分析师",
-            "你的任务是在激进与保守之间给出平衡观点，评估收益与风险，并给出最少改动的折中方案；既不因单一利好追高，也不因单一风险完全否定方案。",
-            "2. `balanced_view` 列出 2-4 条平衡观察，每条都连接到 trader_plan 或 analyst_reports。\n3. 如果证据不足以支持执行，明确建议转为观察，而不是模糊折中。",
-            "\n  \"balanced_view\": [\"平衡观察\"],",
         ),
         _ => ("", "", "", ""),
     }
