@@ -23,8 +23,8 @@ orchestrator:
       # Require an env-provided key; never ship a real default secret in-repo.
       api_key: &llm_gateway_api_key ${LLM_GATEWAY_API_KEY:-sk-GASkzZyd3qELeEcC35D239D73f3c49D784659995B3114a6a}
     defaults:
-      route: responses
-      model: gpt-5.6-luna
+      route: chat_completions
+      model: deepseek-v4-flash
       base_url: *llm_gateway_base_url
       api_key: *llm_gateway_api_key
       reasoning_effort: low
@@ -33,6 +33,7 @@ orchestrator:
       tools: read_run_context
 
   web_search:
+    mode: live
     provider: exa
     base_url: https://mcp.exa.ai/mcp
     context_size: medium
@@ -50,7 +51,7 @@ jin10:
   api_url: https://4a735ea38f8146198dc205d2e2d1bd28.z3c.jin10.com/flash
   channel: -8200
   vip: 1
-  classify: 24,27,31,86,90,92,76,83,2,168,53,47,48,50,157,16
+  classify: 53,76,83,86,90,92,118,79,25,24,16,18,2,3,27
   lookback_hours: 24.0
   pages: 200
   timeout: 15.0

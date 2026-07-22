@@ -1,5 +1,5 @@
+use super::ToolDefinition;
 use anyhow::{Context, Result};
-use rig_core::completion::ToolDefinition;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -48,6 +48,7 @@ pub fn definition() -> ToolDefinition {
                     "description": "Optional model/config tag for the compute job."
                 }
             },
+            "required": [],
             "additionalProperties": true
         }),
     }

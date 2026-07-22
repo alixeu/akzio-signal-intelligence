@@ -1,6 +1,6 @@
 use serde_json::Value;
 
-pub const MAX_PROMPT_TOKENS: usize = 12_000;
+pub const MAX_PROMPT_TOKENS: usize = 120_000;
 pub const MAX_COMPLETION_TOKENS: usize = 4_096;
 
 /// Per-model pricing in USD per million tokens.

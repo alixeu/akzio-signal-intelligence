@@ -1,5 +1,5 @@
+use super::ToolDefinition;
 use anyhow::{bail, Result};
-use rig_core::completion::ToolDefinition;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;

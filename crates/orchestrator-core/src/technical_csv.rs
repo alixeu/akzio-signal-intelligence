@@ -250,7 +250,7 @@ pub fn latest_snapshot(
 }
 
 /// Render CSV bodies as `<file id: name>` blocks for prompt injection.
-/// Rig OpenAI Responses maps non-PDF documents to text; this matches that shape.
+/// OpenAI Responses API maps non-PDF documents to text; this matches that shape.
 pub fn render_csv_file_blocks(
     dir: &Path,
     symbols: &[String],

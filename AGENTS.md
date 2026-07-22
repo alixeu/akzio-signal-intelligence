@@ -10,7 +10,7 @@ This repository is a Rust workspace for AI-assisted market-signal research and T
 - Workspace crates:
   - `orchestrator-core`: shared config, paths, ticker parsing, prompt helpers, and artifact validation.
   - `orchestrator-sql`: SQLite schema, imports, scoped messages, and read-context commands.
-  - `orchestrator-llm`: Rig/OpenAI execution and mock role artifacts.
+  - `orchestrator-llm`: OpenAI Responses API execution and mock role artifacts.
   - `orchestrator-cli`: CLI binaries and workflow orchestration.
 - Prompt templates live under `prompts/`.
 - Generated run outputs live under `outputs/` and should not be committed.

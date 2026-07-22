@@ -5,7 +5,7 @@ use std::pin::Pin;
 use std::time::Instant;
 
 use crate::tools;
-use crate::RigSettings;
+use crate::AgentSettings;
 
 use super::*;
 
@@ -21,11 +21,20 @@ pub(super) struct DebugLlmCapture<'a> {
 }
 
 impl<'a> DebugLlmCapture<'a> {
-    pub(super) fn new(inner: &'a mut dyn ModelEventHandler, input: &ModelInput) -> Self {
+    pub(super) fn new(
+        inner: &'a mut dyn ModelEventHandler,
+        input: &ModelInput,
+        configured_tools: &[String],
+    ) -> Self {
+        let tools = if input.available_tools.is_empty() && !configured_tools.is_empty() {
+            tools::tool_definitions_json(configured_tools)
+        } else {
+            tools::tool_definitions_json(&input.available_tools)
+        };
         Self {
             inner,
             req_messages: input_to_debug_messages(input),
-            req_tools: tools::tool_definitions_json(&input.available_tools),
+            req_tools: tools,
             assistant_text: String::new(),
             tool_calls: Vec::new(),
             raw: Value::Null,
@@ -34,7 +43,7 @@ impl<'a> DebugLlmCapture<'a> {
         }
     }
 
-    pub(super) fn into_record(self, settings: &RigSettings) -> Value {
+    pub(super) fn into_record(self, settings: &AgentSettings) -> Value {
         let end_turn = if self.tool_calls.is_empty() {
             self.end_turn
         } else {
@@ -42,6 +51,32 @@ impl<'a> DebugLlmCapture<'a> {
         };
         let elapsed_ms = self.started.elapsed().as_millis();
         let usage = extract_token_usage(&self.raw);
+
+        let mut output = Vec::new();
+        if !self.assistant_text.is_empty() {
+            output.push(json!({"type": "text", "text": self.assistant_text}));
+        }
+        for tc in &self.tool_calls {
+            output.push(json!({
+                "type": "function_call",
+                "call_id": tc.get("call_id"),
+                "name": tc.get("name"),
+                "arguments": tc.get("arguments"),
+            }));
+        }
+
+        let resp = json!({
+            "status": if end_turn == Some(true) { "completed" } else { "in_progress" },
+            "output": output,
+            "usage": {
+                "input_tokens": usage.input_tokens,
+                "output_tokens": usage.output_tokens,
+                "cached_tokens": usage.cached_tokens,
+                "reasoning_tokens": usage.reasoning_tokens,
+                "total_tokens": usage.total_tokens,
+            },
+        });
+
         json!({
             "kind": "stream",
             "role": settings.role,
@@ -52,7 +87,7 @@ impl<'a> DebugLlmCapture<'a> {
                 "messages": self.req_messages,
                 "tools": self.req_tools,
             },
-            "resp": self.raw,
+            "resp": resp,
             "elapsed_ms": elapsed_ms,
             "token": {
                 "input_tokens": usage.input_tokens,

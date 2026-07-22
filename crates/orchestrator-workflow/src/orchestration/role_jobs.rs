@@ -4,10 +4,10 @@ use orchestrator_core::default_project_root;
 use orchestrator_llm::{
     agent_loop::{ModelStreamResult, TokenUsage},
     llm_judge::JudgeConfig,
-    mock_role_artifact, run_rig_agent_loop_with_metrics, run_rig_agent_steer_loop_with_metrics,
+    mock_role_artifact, run_agent_loop_with_metrics, run_agent_steer_loop_with_metrics,
     tools::ExternalToolConfig,
     truncation::TruncationConfig,
-    AgentLoopOutput, OutputMode, RigSettings, RoleLlmSettings, SteerLoopInput,
+    AgentLoopOutput, AgentSettings, OutputMode, RoleLlmSettings, SteerLoopInput,
 };
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -759,7 +759,7 @@ async fn execute_role_job(job: RoleJob) -> Result<AgentLoopOutput> {
     let llm = job
         .llm
         .with_context(|| format!("missing prepared LLM config for role {:?}", job.role))?;
-    let settings = RigSettings {
+    let settings = AgentSettings {
         role: job.role,
         phase: Some(job.phase),
         topic_id: job.topic_id,
@@ -777,9 +777,9 @@ async fn execute_role_job(job: RoleJob) -> Result<AgentLoopOutput> {
         role = settings.role,
         model = settings.llm.model,
         prompt_chars = job.prompt.len(),
-        "calling rig agent loop"
+        "calling agent loop"
     );
-    run_rig_agent_loop_with_metrics(&settings, &job.prompt).await
+    run_agent_loop_with_metrics(&settings, &job.prompt).await
 }
 
 async fn execute_steer_role_job(
@@ -826,7 +826,7 @@ async fn execute_steer_role_job(
     let llm = job
         .llm
         .with_context(|| format!("missing prepared LLM config for role {:?}", job.role))?;
-    let settings = RigSettings {
+    let settings = AgentSettings {
         role: job.role,
         phase: Some(job.phase),
         topic_id: job.topic_id,
@@ -840,7 +840,7 @@ async fn execute_steer_role_job(
         judge: job.judge,
         debug: job.debug,
     };
-    run_rig_agent_steer_loop_with_metrics(
+    run_agent_steer_loop_with_metrics(
         &settings,
         SteerLoopInput {
             session_id,

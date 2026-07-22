@@ -1,9 +1,9 @@
-mod types;
 mod debug_capture;
 mod streaming;
+mod types;
 
-pub use types::*;
 pub use debug_capture::input_to_debug_messages;
+pub use types::*;
 
 use streaming::ModelStreamHandler;
 
@@ -11,12 +11,7 @@ use anyhow::{bail, Context, Result};
 use orchestrator_core;
 use orchestrator_sql::{turn_history_items, upsert_agent_turn, AgentTurnInput};
 use serde_json::{json, Value};
-use std::{
-    future::Future,
-    path::PathBuf,
-    pin::Pin,
-    time::Instant,
-};
+use std::{future::Future, path::PathBuf, pin::Pin, time::Instant};
 use tracing::{debug, warn};
 
 #[cfg(test)]
@@ -25,21 +20,21 @@ use std::collections::{BTreeMap, VecDeque};
 use crate::llm_judge::{judge_message_status, JudgeConfig};
 use crate::tools::{self, truncate_chars};
 use crate::truncation::{truncate_semantic, TruncationConfig};
-use crate::RigSettings;
+use crate::AgentSettings;
 
 const DEFAULT_MAX_AGENT_LOOPS: usize = 8;
 
-pub struct RigLoopModel {
-    settings: RigSettings,
+pub struct AgentLoopModel {
+    settings: AgentSettings,
 }
 
-impl RigLoopModel {
-    pub fn new(settings: RigSettings) -> Self {
+impl AgentLoopModel {
+    pub fn new(settings: AgentSettings) -> Self {
         Self { settings }
     }
 }
 
-impl LoopModel for RigLoopModel {
+impl LoopModel for AgentLoopModel {
     fn generate<'a>(
         &'a mut self,
         input: ModelInput,
@@ -81,7 +76,8 @@ impl LoopModel for RigLoopModel {
     ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
         Box::pin(async move {
             let prompt = model_role_prompt(&input)?;
-            let mut capture = debug_capture::DebugLlmCapture::new(handler, &input);
+            let mut capture =
+                debug_capture::DebugLlmCapture::new(handler, &input, &self.settings.llm.tools);
             let result =
                 crate::run_model_event_stream(&self.settings, &input, &prompt, &mut capture).await;
             if self.settings.debug {
@@ -192,21 +188,23 @@ where
     }
     // Preload role default evidence before the first LLM hop (jin10/technical/compose).
     if !turn.tools_disabled {
-        if let Some(kind) = preseed_context_kind(&turn.role) {
-            let already = turn
-                .emitted_items
-                .iter()
-                .any(|item| item.item_type == TurnItemType::ToolResult);
-            if !already {
-                let call = ToolCallRequest {
-                    call_id: "preseed-read_run_context".to_string(),
-                    name: "read_run_context".to_string(),
-                    arguments: json!({ "kind": kind }),
-                };
+        let already = turn
+            .emitted_items
+            .iter()
+            .any(|item| item.item_type == TurnItemType::ToolResult);
+        if !already {
+            let preseed_calls = preseed_tool_calls(&turn.role, &turn_tickers(turn));
+            for call in preseed_calls {
                 turn.emitted_items.push(TurnItem::tool_call(&call));
                 let result = tools.execute(call).await;
                 turn.emitted_items
                     .push(TurnItem::tool_result(&result, &config.truncation));
+            }
+            if turn
+                .emitted_items
+                .iter()
+                .any(|item| item.item_type == TurnItemType::ToolResult)
+            {
                 persist_turn(conn, turn, &config.truncation)?;
             }
         }
@@ -735,7 +733,11 @@ fn output_item_for(item: &TurnItem) -> Option<AgentOutputItem> {
     }
 }
 
-pub(super) async fn emit_started<S: AgentEventSink>(turn: &Turn, sink: &mut S, item: &TurnItem) -> Result<()> {
+pub(super) async fn emit_started<S: AgentEventSink>(
+    turn: &Turn,
+    sink: &mut S,
+    item: &TurnItem,
+) -> Result<()> {
     if let Some(output_item) = output_item_for(item) {
         sink.emit(AgentLoopEvent::TurnItemStarted {
             turn_id: turn.turn_id.clone(),
@@ -952,12 +954,30 @@ fn build_model_input(
                 tool_item
             })
             .collect();
+        let retained_call_ids: std::collections::HashSet<&str> = recent_tool_results
+            .iter()
+            .filter(|tr| !tr.tool_call_id.is_empty())
+            .map(|tr| tr.tool_call_id.as_str())
+            .collect();
+        let matching_tool_calls: std::collections::HashMap<String, TurnItem> = items
+            .iter()
+            .filter(|item| {
+                item.item_type == TurnItemType::ToolCall
+                    && retained_call_ids.contains(item.tool_call_id.as_str())
+            })
+            .map(|item| (item.tool_call_id.clone(), item.clone()))
+            .collect();
         items = Vec::new();
         if let Some(role_prompt) = role_prompt.clone() {
             items.push(role_prompt);
         }
         items.push(item);
-        items.extend(recent_tool_results);
+        for tr in &recent_tool_results {
+            if let Some(tc) = matching_tool_calls.get(&tr.tool_call_id) {
+                items.push(tc.clone());
+            }
+            items.push(tr.clone());
+        }
         if let Some(reasoning_state) = latest_reasoning_state.clone() {
             items.push(reasoning_state);
         }
@@ -1186,11 +1206,33 @@ async fn mark_last_assistant_message_as_final<S: AgentEventSink>(
     Ok(())
 }
 
-fn preseed_context_kind(_role: &str) -> Option<&'static str> {
-    None
+fn preseed_tool_calls(role: &str, tickers: &[String]) -> Vec<ToolCallRequest> {
+    let mut calls = Vec::new();
+    match role {
+        "analyst.technical" => {
+            for ticker in tickers {
+                for interval in &["daily", "3h", "20min"] {
+                    calls.push(ToolCallRequest {
+                        call_id: format!("preseed-tech-{}-{}", ticker.to_lowercase(), interval),
+                        name: "read_technical_csv".to_string(),
+                        arguments: json!({ "ticker": ticker, "interval": *interval }),
+                    });
+                }
+            }
+        }
+        "analyst.news_macro" => {
+            calls.push(ToolCallRequest {
+                call_id: "preseed-jin10".to_string(),
+                name: "read_jin10_csv".to_string(),
+                arguments: json!({}),
+            });
+        }
+        _ => {}
+    }
+    calls
 }
 
-/// Map plain assistant text (rig stream/text output) into a ModelResponse.
+/// Map plain assistant text (stream/text output) into a ModelResponse.
 /// Tool calls are expected via native function-calling on the stream path.
 pub fn model_response_from_assistant_text(text: &str) -> ModelResponse {
     let trimmed = text.trim();
@@ -1210,7 +1252,7 @@ pub fn model_response_from_assistant_text(text: &str) -> ModelResponse {
         reasoning_summary: None,
         tool_calls: Vec::new(),
         end_turn: true,
-        raw: json!({"source": "rig_text"}),
+        raw: json!({"source": "plain_text"}),
         turn_status: TurnStatus::Unknown,
     }
 }
@@ -1279,7 +1321,6 @@ fn parse_legacy_react_response(value: Value) -> Result<ModelResponse> {
         turn_status,
     })
 }
-
 
 /// Extract turn_status from the assistant_message_completed event metadata.
 /// The event may carry {"turn_status": "final" | "intermediate"} as an extra field.
@@ -1702,7 +1743,7 @@ pub(crate) fn assistant_message_needs_follow_up(text: &str) -> bool {
     )
 }
 
-/// System instruction for rig-native tool calling + plain-text final artifacts.
+/// System instruction for native tool calling + plain-text final artifacts.
 pub fn model_system_instruction(
     available_tools: &[String],
     executing_role: &str,
@@ -1718,7 +1759,7 @@ If evidence is missing, call the appropriate tool. When tool evidence is enough,
         )
     };
     format!(
-        "You are running inside an agent loop powered by the rig completion API.\n\
+        "You are running inside an agent loop powered by the OpenAI Responses API.\n\
 You are executing role `{executing_role}` for exactly these tickers: {}.\n\
 A final artifact's role must exactly equal `{executing_role}`. Analyst final artifacts must contain per_ticker entries for exactly this ticker set; do not substitute, rename, or omit tickers.\n\
 Protocol:\n\
@@ -1782,7 +1823,6 @@ fn turn_item_prompt_json(
     }
     value
 }
-
 
 fn log_debug_llm_iteration(
     config: &AgentLoopConfig,
@@ -1877,8 +1917,8 @@ pub fn extract_token_usage(raw: &Value) -> TokenUsage {
 }
 
 /// Extract the role prompt (first user message) for use as the main prompt
-/// in the rig completion request. History items (tool calls, tool results,
-/// steer messages) are handled separately via native multi-turn Messages.
+/// in the Responses API request. History items (tool calls, tool results,
+/// steer messages) are handled separately via native multi-turn messages.
 pub fn model_role_prompt(input: &ModelInput) -> Result<String> {
     let role_prompt = input
         .items
@@ -1892,7 +1932,7 @@ pub fn model_role_prompt(input: &ModelInput) -> Result<String> {
     Ok(role_prompt)
 }
 
-/// Build the user prompt for a rig completion request from turn items.
+/// Build the user prompt for a Responses API request from turn items.
 /// Used by the generate (non-streaming) path which sends a single text blob.
 pub fn model_prompt(input: &ModelInput) -> Result<String> {
     let system = input

@@ -1,4 +1,4 @@
-use rig_core::completion::ToolDefinition;
+use super::ToolDefinition;
 use serde_json::{json, Value};
 
 use super::api_tool_name;
@@ -14,6 +14,7 @@ pub fn definition() -> ToolDefinition {
             "properties": {
                 "note": {"type": "string", "description": "Brief planning note for this turn only"}
             },
+            "required": [],
             "additionalProperties": true
         }),
     }

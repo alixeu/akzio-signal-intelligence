@@ -22,6 +22,13 @@ pub use web_run::Runtime as WebRunRuntime;
 pub const WEB_RUN_TOOL_NAME: &str = web_run::NAME;
 pub const READ_RUN_CONTEXT_TOOL_NAME: &str = read_run_context::NAME;
 
+#[derive(Debug, Clone)]
+pub struct ToolDefinition {
+    pub name: String,
+    pub description: String,
+    pub parameters: Value,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ExternalToolConfig {
     pub project_root: PathBuf,
@@ -54,7 +61,7 @@ impl Default for ExternalToolConfig {
 
 struct ToolEntry {
     name: &'static str,
-    definition: fn() -> rig_core::completion::ToolDefinition,
+    definition: fn() -> ToolDefinition,
 }
 
 const REGISTRY: &[ToolEntry] = &[
@@ -123,43 +130,56 @@ pub fn enabled_tool_names(web_run: Option<&WebSearchConfig>) -> Vec<&'static str
     names
 }
 
-pub fn tool_definition(name: &str) -> Option<rig_core::completion::ToolDefinition> {
+pub fn tool_definition(name: &str) -> Option<ToolDefinition> {
     REGISTRY
         .iter()
         .find(|entry| entry.name == name)
         .map(|entry| (entry.definition)())
 }
 
-pub fn rig_tool_definitions(names: &[String]) -> Vec<rig_core::completion::ToolDefinition> {
-    names
-        .iter()
-        .filter_map(|name| tool_definition(name))
-        .collect()
-}
-
-pub fn responses_tool_definitions(
-    names: &[String],
-) -> Vec<rig_core::providers::openai::responses_api::ResponsesToolDefinition> {
+pub fn responses_tool_definitions(names: &[String]) -> Vec<async_openai::types::responses::Tool> {
     names
         .iter()
         .filter_map(|name| responses_tool_definition(name))
         .collect()
 }
 
-fn responses_tool_definition(
-    name: &str,
-) -> Option<rig_core::providers::openai::responses_api::ResponsesToolDefinition> {
+fn responses_tool_definition(name: &str) -> Option<async_openai::types::responses::Tool> {
     let core = tool_definition(name)?;
-    Some(
-        rig_core::providers::openai::responses_api::ResponsesToolDefinition {
-            kind: "function".to_string(),
-            name: core.name,
-            description: core.description,
-            parameters: core.parameters,
-            strict: false,
-            config: Default::default(),
+    Some(async_openai::types::responses::Tool::Function(
+        async_openai::types::responses::FunctionToolArgs::default()
+            .name(core.name)
+            .description(core.description)
+            .parameters(core.parameters)
+            .strict(false)
+            .build()
+            .expect("FunctionTool build"),
+    ))
+}
+
+pub fn chat_completions_tool_definitions(
+    names: &[String],
+) -> Vec<async_openai::types::chat::ChatCompletionTools> {
+    names
+        .iter()
+        .filter_map(|name| chat_completions_tool_definition(name))
+        .collect()
+}
+
+fn chat_completions_tool_definition(
+    name: &str,
+) -> Option<async_openai::types::chat::ChatCompletionTools> {
+    let core = tool_definition(name)?;
+    Some(async_openai::types::chat::ChatCompletionTools::Function(
+        async_openai::types::chat::ChatCompletionTool {
+            function: async_openai::types::chat::FunctionObject {
+                name: core.name,
+                description: Some(core.description),
+                parameters: Some(core.parameters),
+                strict: Some(false),
+            },
         },
-    )
+    ))
 }
 
 /// Build debug-friendly JSON array of tool definitions for the given names.
@@ -348,11 +368,12 @@ mod tests {
     }
 
     #[test]
-    fn rig_tool_definitions_map_web_run_api_name() {
-        let defs = rig_tool_definitions(&[
+    fn tool_definitions_map_web_run_api_name() {
+        let names = [
             web_run::NAME.to_string(),
             read_run_context::NAME.to_string(),
-        ]);
+        ];
+        let defs: Vec<_> = names.iter().filter_map(|n| tool_definition(n)).collect();
         assert_eq!(defs.len(), 2);
         assert!(defs.iter().any(|tool| tool.name == "web_run"));
         assert!(defs.iter().any(|tool| tool.name == "read_run_context"));

@@ -174,7 +174,7 @@ pub struct AnalystTickerArtifact {
     /// Evidence-consistency / clarity, 0.0-1.0 (NOT 0-100, NOT upside probability).
     pub confidence: f64,
     /// Full prose analysis for this ticker (may contain sections / Markdown tables).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_string_or_object")]
     pub report: String,
     /// The 2-3 most decisive evidence items.
     ///
@@ -193,10 +193,10 @@ pub struct AnalystTickerArtifact {
     #[serde(default)]
     pub crowded_consensus_risk: String,
     /// Observations that would strengthen or overturn the current call.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_string_vec_flexible")]
     pub validation_triggers: Vec<String>,
     /// Data gaps and uncertainties; empty array when none.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_string_vec_flexible")]
     pub data_gaps: Vec<String>,
 }
 
@@ -374,6 +374,36 @@ pub fn evidence_item_from_value(value: Value) -> Result<EvidenceItem, String> {
         }
         _ => Err("evidence item must be string or object".to_string()),
     }
+}
+
+/// Accept a string or an object (serialized to JSON string) for fields like `report`.
+fn deserialize_string_or_object<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    match value {
+        Value::String(s) => Ok(s),
+        Value::Null => Ok(String::new()),
+        other => Ok(other.to_string()),
+    }
+}
+
+/// Accept a vec of strings or objects (objects are serialized to JSON strings).
+fn deserialize_string_vec_flexible<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw: Vec<Value> = Vec::deserialize(deserializer)?;
+    Ok(raw
+        .into_iter()
+        .map(|v| match v {
+            Value::String(s) => s,
+            other => other.to_string(),
+        })
+        .collect())
 }
 
 /// Deserialize key_evidence accepting both structured objects and plain strings.

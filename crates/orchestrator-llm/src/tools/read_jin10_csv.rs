@@ -1,7 +1,8 @@
+use super::ToolDefinition;
 use anyhow::{Context, Result};
-use rig_core::completion::ToolDefinition;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::fs;
 
 use super::{api_tool_name, log_tool_result};
 
@@ -17,12 +18,9 @@ pub fn definition() -> ToolDefinition {
                 "date": {
                     "type": "string",
                     "description": "Calendar date of the preflight CSV when not using the latest available, e.g. 2026-07-20."
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": "Optional max items when only a shortlist is needed."
                 }
             },
+            "required": [],
             "additionalProperties": true
         }),
     }
@@ -32,40 +30,54 @@ pub fn definition() -> ToolDefinition {
 pub struct Args {
     #[serde(default)]
     pub date: Option<String>,
-    #[serde(default)]
-    pub limit: Option<usize>,
 }
 
 pub fn execute(args: Value) -> Result<Value> {
     let tool_args =
         serde_json::from_value::<Args>(args).context("invalid read_jin10_csv arguments")?;
-    let rows = if let Some(date) = &tool_args.date {
-        orchestrator_core::load_jin10_csv(date)
+    let csv_dir = orchestrator_core::default_jin10_csv_dir();
+    let raw_csv = if let Some(date) = &tool_args.date {
+        let path = orchestrator_core::jin10_csv_path(&csv_dir, date);
+        fs::read_to_string(&path).ok()
     } else {
-        orchestrator_core::load_jin10_csv_recent(3)
+        load_recent_raw_csv(&csv_dir, 3)
     };
-    let result = if rows.is_empty() {
-        json!({"error": "no jin10 CSV data available", "hint": "news data may not have been fetched yet"})
-    } else {
-        let items: Vec<Value> = match tool_args.limit {
-            Some(limit) if limit < rows.len() => &rows[..limit],
-            _ => &rows,
-        }
-        .iter()
-        .map(|row| {
+    let result = match raw_csv {
+        Some(csv) if !csv.trim().is_empty() => {
             json!({
-                "id": row.id,
-                "time": row.time,
-                "content": row.content
+                "csv": csv,
+                "attention_note": "After analysis, return jin10_attention: [{id, score}] with score 0.0-1.0 for items that influenced your analysis. Only scored items will be persisted."
             })
-        })
-        .collect();
-        json!({
-            "item_count": items.len(),
-            "items": items,
-            "attention_note": "After analysis, return jin10_attention: [{id, score}] with score 0.0-1.0 for items that influenced your analysis. Only scored items will be persisted."
-        })
+        }
+        _ => {
+            json!({"error": "no jin10 CSV data available", "hint": "news data may not have been fetched yet"})
+        }
     };
     log_tool_result(NAME, &Ok(result.clone()));
     Ok(result)
+}
+
+fn load_recent_raw_csv(csv_dir: &std::path::Path, max_files: usize) -> Option<String> {
+    let entries = fs::read_dir(csv_dir).ok()?;
+    let mut paths: Vec<std::path::PathBuf> = entries
+        .flatten()
+        .filter(|e| e.file_name().to_str().is_some_and(|n| n.ends_with(".csv")))
+        .map(|e| e.path())
+        .collect();
+    paths.sort();
+    paths.reverse();
+    paths.truncate(max_files);
+    if paths.is_empty() {
+        return None;
+    }
+    let mut combined = String::from("id,time,content\n");
+    for path in paths {
+        if let Ok(content) = fs::read_to_string(&path) {
+            for line in content.lines().skip(1).filter(|l| !l.trim().is_empty()) {
+                combined.push_str(line);
+                combined.push('\n');
+            }
+        }
+    }
+    Some(combined)
 }

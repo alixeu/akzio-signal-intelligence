@@ -324,7 +324,7 @@ Final Probability = Base Probability + Debate Adjustment + Evidence Modifier
 
 ### 设计原则
 
-每个 Agent 运行在 Rig 框架的 Agent Loop 中，具备：
+每个 Agent 运行在 Agent Loop 中（基于 async-openai + OpenAI Responses API），具备：
 
 - **作用域隔离的 SQLite 上下文** — `read_run_context` 工具提供时间窗口和 Ticker 过滤后的精确数据
 - **结构化输出契约** — Prompt 层 JSON Schema 强约束输出格式（通过 `common/` 共享组件标准化）
@@ -559,7 +559,7 @@ crates/
 │                           # 技术指标 CSV / Jin10 CSV 读写
 ├── orchestrator-sql        # SQLite Schema、数据访问、Context 检索、Memory 操作
 │                           # Phase 索引 / 注意力账本 / Phase00 Gate / Prediction & Outcome
-├── orchestrator-llm        # LLM 执行（Rig 框架）、Agent Loop、Web Search（Exa MCP）
+├── orchestrator-llm        # LLM 执行（async-openai）、Agent Loop、Web Search（Exa MCP）
 │                           # 截断引擎、LLM Judge 自动质量评估
 ├── orchestrator-ingest     # 数据采集：Yahoo Finance 技术指标、Jin10 快讯
 │                           # YouTube / WayinVideo 逐字稿、Reddit / X 社交媒体

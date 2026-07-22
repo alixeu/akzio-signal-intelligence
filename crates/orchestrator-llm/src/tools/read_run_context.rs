@@ -1,5 +1,5 @@
+use super::ToolDefinition;
 use anyhow::{bail, Result};
-use rig_core::completion::ToolDefinition;
 use serde_json::{json, Value};
 
 use super::{api_tool_name, tool_connection, ExternalToolConfig};
@@ -102,7 +102,6 @@ fn maybe_wait_phase00_gate(
     let _ = gate.wait_until_ready(max_prior, std::time::Duration::from_secs(600));
 }
 
-
 fn try_read_phase00_from_memory(
     config: &ExternalToolConfig,
     request: &orchestrator_sql::RunContextReadRequest,
@@ -145,4 +144,3 @@ fn try_read_phase00_from_memory(
         _ => None,
     }
 }
-

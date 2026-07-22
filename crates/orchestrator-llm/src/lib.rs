@@ -1,8 +1,9 @@
 use agent_loop::{
-    AgentLoopConfig, ModelEventHandler, ModelStreamEvent, ModelStreamResult, ProjectToolRuntime,
-    RigLoopModel, ToolCallRequest, Turn,
+    AgentLoopConfig, AgentLoopModel, ModelEventHandler, ModelStreamEvent, ModelStreamResult,
+    ProjectToolRuntime, ToolCallRequest, Turn,
 };
 use anyhow::{bail, Context, Result};
+use async_openai::{config::OpenAIConfig, Client as OpenAIClient};
 use futures::StreamExt;
 use llm_judge::JudgeConfig;
 use orchestrator_core::{
@@ -10,22 +11,11 @@ use orchestrator_core::{
     validate_analyst_ticker_artifact, validate_research_artifact, AnalystTickerArtifact,
     ResearchArtifact,
 };
-use rig_core::{
-    agent::AgentBuilder,
-    client::CompletionClient,
-    completion::{CompletionModel, GetTokenUsage, Prompt},
-    message::{
-        AssistantContent, Message, Reasoning, Text, ToolCall, ToolChoice, ToolFunction,
-        ToolResult as RigToolResult, ToolResultContent, UserContent,
-    },
-    providers::openai,
-    streaming::StreamedAssistantContent,
-    OneOrMany,
-};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{fs, path::PathBuf, sync::Arc};
+use tracing::debug;
 use truncation::TruncationConfig;
 use uuid::Uuid;
 use web_search::{validate_web_search_runtime_config, ExaWebSearchProvider, WebSearchConfig};
@@ -40,6 +30,7 @@ pub mod web_search;
 #[serde(rename_all = "snake_case")]
 pub enum LlmRoute {
     Responses,
+    ChatCompletions,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -123,7 +114,9 @@ impl RoleLlmSettings {
         }
         if let Some(verbosity) = &self.text_verbosity {
             validate_text_verbosity(verbosity)?;
-            bail!("text_verbosity is not supported by the current Rig Responses transport");
+            if self.route == LlmRoute::Responses {
+                bail!("text_verbosity is only supported by the chat_completions route");
+            }
         }
         Ok(())
     }
@@ -146,7 +139,7 @@ impl RoleLlmSettings {
 }
 
 #[derive(Debug, Clone)]
-pub struct RigSettings {
+pub struct AgentSettings {
     pub role: String,
     pub phase: Option<i64>,
     /// Optional debate topic id so phase-2 debug files do not clobber each other.
@@ -160,6 +153,24 @@ pub struct RigSettings {
     pub truncation: TruncationConfig,
     pub judge: JudgeConfig,
     pub debug: bool,
+}
+
+impl AgentSettings {
+    fn reasoning_summary_as_enum(
+        &self,
+    ) -> Option<async_openai::types::responses::ReasoningSummary> {
+        use async_openai::types::responses::ReasoningSummary;
+        self.llm
+            .reasoning_summary
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(|s| match s.to_ascii_lowercase().as_str() {
+                "concise" => ReasoningSummary::Concise,
+                "detailed" => ReasoningSummary::Detailed,
+                _ => ReasoningSummary::Auto,
+            })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -178,14 +189,14 @@ pub struct AgentLoopOutput {
     pub session_id: String,
 }
 
-pub async fn run_rig_agent_loop(settings: &RigSettings, prompt: &str) -> Result<Value> {
-    Ok(run_rig_agent_loop_with_metrics(settings, prompt)
+pub async fn run_agent_loop(settings: &AgentSettings, prompt: &str) -> Result<Value> {
+    Ok(run_agent_loop_with_metrics(settings, prompt)
         .await?
         .artifact)
 }
 
-pub async fn run_rig_agent_loop_with_metrics(
-    settings: &RigSettings,
+pub async fn run_agent_loop_with_metrics(
+    settings: &AgentSettings,
     prompt: &str,
 ) -> Result<AgentLoopOutput> {
     settings.llm.validate(&settings.role)?;
@@ -220,7 +231,7 @@ pub async fn run_rig_agent_loop_with_metrics(
     if let Some(web_run) = web_run_runtime_for_settings(settings) {
         tools = tools.with_web_run_runtime(web_run);
     }
-    let mut model = RigLoopModel::new(settings.clone());
+    let mut model = AgentLoopModel::new(settings.clone());
     let metrics = agent_loop::run_turn(
         &conn,
         &mut turn,
@@ -253,7 +264,7 @@ pub async fn run_rig_agent_loop_with_metrics(
     })
 }
 
-fn agent_loop_config_from_settings(settings: &RigSettings) -> AgentLoopConfig {
+fn agent_loop_config_from_settings(settings: &AgentSettings) -> AgentLoopConfig {
     AgentLoopConfig {
         max_agent_loops: settings.llm.max_turns,
         truncation: settings.truncation.clone(),
@@ -270,17 +281,17 @@ fn agent_loop_config_from_settings(settings: &RigSettings) -> AgentLoopConfig {
     }
 }
 
-pub async fn run_rig_agent_steer_loop(
-    settings: &RigSettings,
+pub async fn run_agent_steer_loop(
+    settings: &AgentSettings,
     input: SteerLoopInput<'_>,
 ) -> Result<Value> {
-    Ok(run_rig_agent_steer_loop_with_metrics(settings, input)
+    Ok(run_agent_steer_loop_with_metrics(settings, input)
         .await?
         .artifact)
 }
 
-pub async fn run_rig_agent_steer_loop_with_metrics(
-    settings: &RigSettings,
+pub async fn run_agent_steer_loop_with_metrics(
+    settings: &AgentSettings,
     input: SteerLoopInput<'_>,
 ) -> Result<AgentLoopOutput> {
     settings.llm.validate(&settings.role)?;
@@ -338,7 +349,7 @@ pub async fn run_rig_agent_steer_loop_with_metrics(
     if let Some(web_run) = web_run_runtime_for_settings(settings) {
         tools = tools.with_web_run_runtime(web_run);
     }
-    let mut model = RigLoopModel::new(settings.clone());
+    let mut model = AgentLoopModel::new(settings.clone());
     let metrics = agent_loop::run_turn(
         &conn,
         &mut turn,
@@ -372,7 +383,7 @@ pub async fn run_rig_agent_steer_loop_with_metrics(
 }
 
 fn record_jin10_usage_from_artifact(
-    settings: &RigSettings,
+    settings: &AgentSettings,
     conn: &rusqlite::Connection,
     turn_id: &str,
     artifact: &Value,
@@ -407,7 +418,7 @@ fn record_jin10_usage_from_artifact(
         settings.phase,
         &attention,
     )?;
-    tracing::debug!(
+    debug!(
         role = %settings.role,
         turn_id,
         scored = attention.len(),
@@ -515,7 +526,7 @@ fn extract_jin10_attention(artifact: &Value) -> Vec<orchestrator_sql::Jin10Atten
     out
 }
 
-fn write_role_end_context(settings: &RigSettings, turn: &Turn) -> Result<()> {
+fn write_role_end_context(settings: &AgentSettings, turn: &Turn) -> Result<()> {
     let Some(path) = role_end_context_path(settings, turn) else {
         return Ok(());
     };
@@ -532,7 +543,7 @@ fn write_role_end_context(settings: &RigSettings, turn: &Turn) -> Result<()> {
     Ok(())
 }
 
-fn role_end_context_path(settings: &RigSettings, turn: &Turn) -> Option<PathBuf> {
+fn role_end_context_path(settings: &AgentSettings, turn: &Turn) -> Option<PathBuf> {
     let run_dir = settings
         .tools
         .as_ref()
@@ -545,7 +556,7 @@ fn role_end_context_path(settings: &RigSettings, turn: &Turn) -> Option<PathBuf>
     )))
 }
 
-pub fn append_debug_llm_record(settings: &RigSettings, record: Value) -> Result<()> {
+pub fn append_debug_llm_record(settings: &AgentSettings, record: Value) -> Result<()> {
     if !settings.debug {
         return Ok(());
     }
@@ -564,8 +575,7 @@ pub fn append_debug_llm_record(settings: &RigSettings, record: Value) -> Result<
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create debug dir {}", parent.display()))?;
     }
-    // Keep only the latest LLM turn per role/topic (last prompt already includes prior tool context).
-    let mut line = serde_json::to_string(&record)?;
+    let mut line = serde_json::to_string_pretty(&record)?;
     line.push('\n');
     fs::write(&path, line.as_bytes())
         .with_context(|| format!("failed to write debug llm record {}", path.display()))?;
@@ -629,7 +639,7 @@ fn debug_now_ms() -> u128 {
 }
 
 /// Resolve project root used for debug artifacts from settings.
-pub fn debug_project_root(settings: &RigSettings) -> PathBuf {
+pub fn debug_project_root(settings: &AgentSettings) -> PathBuf {
     settings
         .tools
         .as_ref()
@@ -717,7 +727,7 @@ fn web_run_runtime(config: &WebSearchConfig) -> Option<tools::WebRunRuntime> {
     )
 }
 
-fn web_run_runtime_for_settings(settings: &RigSettings) -> Option<tools::WebRunRuntime> {
+fn web_run_runtime_for_settings(settings: &AgentSettings) -> Option<tools::WebRunRuntime> {
     if uses_web_run_fallback(settings) {
         web_run_runtime(&settings.web_search)
             .map(|runtime| runtime.with_truncation(settings.truncation.clone()))
@@ -726,15 +736,15 @@ fn web_run_runtime_for_settings(settings: &RigSettings) -> Option<tools::WebRunR
     }
 }
 
-fn uses_native_web_search(settings: &RigSettings) -> bool {
+fn uses_native_web_search(settings: &AgentSettings) -> bool {
     !role_disables_tools(&settings.role) && settings.llm.native_web_search
 }
 
-fn uses_web_run_fallback(settings: &RigSettings) -> bool {
+fn uses_web_run_fallback(settings: &AgentSettings) -> bool {
     !role_disables_tools(&settings.role) && !uses_native_web_search(settings)
 }
 
-fn validate_fallback_web_search_runtime_config(settings: &RigSettings) -> Result<()> {
+fn validate_fallback_web_search_runtime_config(settings: &AgentSettings) -> Result<()> {
     if uses_web_run_fallback(settings) {
         validate_web_search_runtime_config(&settings.web_search, &settings.role)
     } else {
@@ -743,203 +753,119 @@ fn validate_fallback_web_search_runtime_config(settings: &RigSettings) -> Result
 }
 
 async fn run_model_text_once(
-    settings: &RigSettings,
-    _input: &agent_loop::ModelInput,
+    settings: &AgentSettings,
+    input: &agent_loop::ModelInput,
     prompt: &str,
 ) -> Result<String> {
-    let client = openai_compatible_responses_client(&settings.llm)?;
-    let model = client.completion_model(&settings.llm.model);
-    let builder = AgentBuilder::new(model).default_max_turns(1);
-    let builder = apply_optional_preamble(builder, &settings.llm);
-    let builder = if let Some(params) = additional_params(settings) {
-        builder.additional_params(params)
-    } else {
-        builder
-    };
-    builder
-        .build()
-        .prompt(prompt)
-        .await
-        .context("OpenAI-compatible Responses prompt failed")
+    match settings.llm.route {
+        LlmRoute::Responses => run_responses_text_once(settings, input, prompt).await,
+        LlmRoute::ChatCompletions => run_chat_completions_text_once(settings, input, prompt).await,
+    }
 }
 
 pub async fn run_model_event_stream(
-    settings: &RigSettings,
+    settings: &AgentSettings,
     input: &agent_loop::ModelInput,
     prompt: &str,
     handler: &mut dyn ModelEventHandler,
 ) -> Result<()> {
-    let client = openai_compatible_responses_client(&settings.llm)?;
-    let tool_defs = tools::responses_tool_definitions(&input.available_tools);
-    let model = client
-        .completion_model(&settings.llm.model)
-        .with_tools(tool_defs);
-    match settings.llm.transport {
-        LlmTransport::Http | LlmTransport::Ws => {
-            stream_completion_model(settings, input, model, prompt, handler).await
+    match settings.llm.route {
+        LlmRoute::Responses => {
+            stream_responses_with_retry(settings, input, prompt, handler).await
+        }
+        LlmRoute::ChatCompletions => {
+            stream_chat_completions_with_retry(settings, input, prompt, handler).await
         }
     }
 }
 
-/// Tracks assistant text lifecycle while mapping rig stream chunks to agent events.
-struct AssistantTextAccumulator {
-    item_id: Option<String>,
-    started: bool,
-    completed: bool,
-}
-
-impl AssistantTextAccumulator {
-    fn new() -> Self {
-        Self {
-            item_id: None,
-            started: false,
-            completed: false,
-        }
-    }
-
-    fn ensure_item_id(&mut self, item_id: String) {
-        if self.item_id.is_none() {
-            self.item_id = Some(item_id);
-        }
-    }
-
-    async fn push_delta(
-        &mut self,
-        handler: &mut dyn ModelEventHandler,
-        fallback_item_id: String,
-        delta: String,
-    ) -> Result<()> {
-        self.ensure_item_id(fallback_item_id);
-        let item_id = self
-            .item_id
-            .clone()
-            .context("assistant text item id missing")?;
-        if !self.started {
-            handler
-                .handle(ModelStreamEvent::AssistantMessageStarted {
-                    item_id: item_id.clone(),
-                })
-                .await?;
-            self.started = true;
-        }
-        handler
-            .handle(ModelStreamEvent::AssistantTextDelta { item_id, delta })
-            .await?;
-        Ok(())
-    }
-
-    async fn complete(&mut self, handler: &mut dyn ModelEventHandler) -> Result<()> {
-        if self.completed || !self.started {
-            return Ok(());
-        }
-        let item_id = self
-            .item_id
-            .clone()
-            .context("assistant text item id missing")?;
-        handler
-            .handle(ModelStreamEvent::AssistantMessageCompleted {
-                item_id,
-                turn_status: agent_loop::TurnStatus::Unknown,
-            })
-            .await?;
-        self.completed = true;
-        Ok(())
-    }
-}
-
-fn token_usage_raw<R>(response: &R) -> Value
-where
-    R: GetTokenUsage,
-{
-    response
-        .token_usage()
-        .map(|usage| {
-            json!({
-                "usage": {
-                    "input_tokens": usage.input_tokens,
-                    "output_tokens": usage.output_tokens,
-                    "total_tokens": usage.total_tokens,
-                    "input_tokens_details": {
-                        "cached_tokens": usage.cached_input_tokens
-                    },
-                    "output_tokens_details": {
-                        "reasoning_tokens": usage.reasoning_tokens
-                    }
-                }
-            })
-        })
-        .unwrap_or(Value::Null)
-}
-
-fn completion_request_builder<M>(
-    settings: &RigSettings,
+async fn run_responses_text_once(
+    settings: &AgentSettings,
     input: &agent_loop::ModelInput,
-    model: M,
     prompt: &str,
-) -> rig_core::completion::CompletionRequestBuilder<M>
-where
-    M: CompletionModel,
-{
-    let mut builder = model.completion_request(Message::user(prompt.to_string()));
-    // System instruction (agent loop protocol) takes priority as preamble;
-    // fall back to the optional config-level preamble.
-    if let Some(system) = &input.system_instruction {
-        builder = builder.preamble(system.clone());
-    } else if let Some(preamble) = settings.llm.effective_preamble() {
-        builder = builder.preamble(preamble.to_string());
-    }
-    // Convert tool call / tool result history to native rig Messages so the
-    // API receives proper multi-turn structure instead of a text blob.
-    let history = turn_items_to_history_messages(input);
-    if !history.is_empty() {
-        builder = builder.messages(history);
-    }
-    if let Some(reasoning) = reasoning_history_message(&settings.llm, input) {
-        builder = builder.message(reasoning);
-    }
-    // Tool definitions live on the model (via with_tools) so they bypass rig's
-    // strict-mode schema normalization.  We only set tool_choice here.
-    let has_tools = input
-        .available_tools
-        .iter()
-        .any(|name| tools::tool_definition(name).is_some());
-    if has_tools {
-        builder = builder.tool_choice(ToolChoice::Auto);
-    }
-    if let Some(params) = additional_params(settings) {
-        builder = builder.additional_params(params);
-    }
-    builder
+) -> Result<String> {
+    let client = openai_compatible_responses_client(&settings.llm)?;
+    let request = build_responses_request(settings, input, prompt, false)?;
+    let started = std::time::Instant::now();
+    debug!(role = %settings.role, "sending non-streaming Responses API request");
+    let response = client
+        .responses()
+        .create(request)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .context("OpenAI-compatible Responses prompt failed")?;
+    let text = response.output_text().unwrap_or_default();
+    debug!(
+        role = %settings.role,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        response_len = text.len(),
+        "non-streaming Responses API completed"
+    );
+    Ok(text)
 }
 
-/// Convert TurnItems (tool calls, tool results, steer messages, assistant
-/// commentary) into native rig `Message` objects for proper multi-turn
-/// conversation structure. The first UserMessage (role prompt) is skipped
-/// because it is passed as the main prompt separately.
-fn turn_items_to_history_messages(input: &agent_loop::ModelInput) -> Vec<Message> {
-    let mut messages = Vec::new();
+async fn run_chat_completions_text_once(
+    settings: &AgentSettings,
+    input: &agent_loop::ModelInput,
+    prompt: &str,
+) -> Result<String> {
+    let client = openai_compatible_responses_client(&settings.llm)?;
+    let request = build_chat_completions_request(settings, input, prompt, false)?;
+    let started = std::time::Instant::now();
+    debug!(role = %settings.role, "sending non-streaming Chat Completions API request");
+    let response = client
+        .chat()
+        .create(request)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .context("OpenAI-compatible Chat Completions prompt failed")?;
+    let text = response
+        .choices
+        .first()
+        .and_then(|c| c.message.content.clone())
+        .unwrap_or_default();
+    debug!(
+        role = %settings.role,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        response_len = text.len(),
+        "non-streaming Chat Completions API completed"
+    );
+    Ok(text)
+}
+
+fn build_responses_request(
+    settings: &AgentSettings,
+    input: &agent_loop::ModelInput,
+    prompt: &str,
+    with_tools: bool,
+) -> Result<async_openai::types::responses::CreateResponse> {
+    use async_openai::types::responses::*;
+
+    let mut items: Vec<InputItem> = Vec::new();
     let mut seen_first_user = false;
 
     for item in &input.items {
-        if item.item_type == agent_loop::TurnItemType::ReasoningState {
-            continue;
-        }
         match item.item_type {
             agent_loop::TurnItemType::UserMessage => {
                 if !seen_first_user {
                     seen_first_user = true;
                     continue;
                 }
-                messages.push(Message::user(item.content_text.clone()));
+                let msg = EasyInputMessage {
+                    role: Role::User,
+                    content: EasyInputContent::Text(item.content_text.clone()),
+                    ..Default::default()
+                };
+                items.push(InputItem::EasyMessage(msg));
             }
             agent_loop::TurnItemType::AssistantMessage => {
                 if !item.content_text.is_empty() {
-                    messages.push(Message::Assistant {
-                        id: None,
-                        content: OneOrMany::one(AssistantContent::Text(Text::new(
-                            item.content_text.clone(),
-                        ))),
-                    });
+                    let msg = EasyInputMessage {
+                        role: Role::Assistant,
+                        content: EasyInputContent::Text(item.content_text.clone()),
+                        ..Default::default()
+                    };
+                    items.push(InputItem::EasyMessage(msg));
                 }
             }
             agent_loop::TurnItemType::ToolCall => {
@@ -954,16 +880,14 @@ fn turn_items_to_history_messages(input: &agent_loop::ModelInput) -> Vec<Message
                     .unwrap_or(&item.tool_name)
                     .to_string();
                 let call_id = item.tool_call_id.clone();
-                messages.push(Message::Assistant {
-                    id: None,
-                    content: OneOrMany::one(AssistantContent::ToolCall(ToolCall {
-                        id: call_id.clone(),
-                        call_id: Some(call_id),
-                        function: ToolFunction::new(name, arguments),
-                        signature: None,
-                        additional_params: None,
-                    })),
-                });
+                if let Ok(tc) = serde_json::from_value::<InputItem>(json!({
+                    "type": "function_call",
+                    "call_id": call_id,
+                    "name": name,
+                    "arguments": arguments.to_string()
+                })) {
+                    items.push(tc);
+                }
             }
             agent_loop::TurnItemType::ToolResult => {
                 let content_text = truncation::truncate_semantic(
@@ -971,76 +895,362 @@ fn turn_items_to_history_messages(input: &agent_loop::ModelInput) -> Vec<Message
                     input.truncation.tool_result_chars,
                     &input.truncation,
                 );
-                messages.push(Message::User {
-                    content: OneOrMany::one(UserContent::ToolResult(RigToolResult {
-                        id: item.tool_call_id.clone(),
-                        call_id: Some(item.tool_call_id.clone()),
-                        content: OneOrMany::one(ToolResultContent::Text(Text::new(content_text))),
-                    })),
-                });
+                if let Ok(tr) = serde_json::from_value::<InputItem>(json!({
+                    "type": "function_call_output",
+                    "call_id": item.tool_call_id,
+                    "output": content_text
+                })) {
+                    items.push(tr);
+                }
+            }
+            agent_loop::TurnItemType::ReasoningState => {
+                if settings.llm.preserve_reasoning_state {
+                    if let (Some(id), Some(encrypted)) = (
+                        item.content_json
+                            .get("output_item_id")
+                            .and_then(Value::as_str),
+                        item.content_json
+                            .get("encrypted_content")
+                            .and_then(Value::as_str),
+                    ) {
+                        if let Ok(ri) = serde_json::from_value::<InputItem>(json!({
+                            "type": "reasoning",
+                            "id": id,
+                            "encrypted_content": encrypted,
+                            "summary": []
+                        })) {
+                            items.push(ri);
+                        }
+                    }
+                }
             }
             agent_loop::TurnItemType::CompactSummary => {
-                messages.push(Message::user(format!(
-                    "[Compacted Context] {}",
-                    item.content_text
-                )));
+                let msg = EasyInputMessage {
+                    role: Role::User,
+                    content: EasyInputContent::Text(format!(
+                        "[Compacted Context] {}",
+                        item.content_text
+                    )),
+                    ..Default::default()
+                };
+                items.push(InputItem::EasyMessage(msg));
             }
             _ => {}
         }
     }
-    messages
+
+    let user_msg = EasyInputMessage {
+        role: Role::User,
+        content: EasyInputContent::Text(prompt.to_string()),
+        ..Default::default()
+    };
+    items.push(InputItem::EasyMessage(user_msg));
+
+    let item_count = items.len();
+    let model = settings.llm.model.clone();
+    let mut binding = CreateResponseArgs::default();
+    let mut builder = binding.model(&model).input(InputParam::Items(items));
+
+    let has_system = if let Some(system) = &input.system_instruction {
+        builder = builder.instructions(system.clone());
+        true
+    } else if let Some(preamble) = settings.llm.effective_preamble() {
+        builder = builder.instructions(preamble.to_string());
+        true
+    } else {
+        false
+    };
+
+    let mut tool_count = 0;
+    if with_tools {
+        let tool_defs = tools::responses_tool_definitions(&input.available_tools);
+        tool_count = tool_defs.len();
+        if !tool_defs.is_empty() {
+            builder = builder
+                .tools(tool_defs)
+                .tool_choice(ToolChoiceParam::Mode(ToolChoiceOptions::Auto));
+        }
+    }
+
+    let has_reasoning = if let Some(reasoning) = build_reasoning_param(settings) {
+        builder = builder.reasoning(reasoning);
+        true
+    } else {
+        false
+    };
+
+    if settings.llm.preserve_reasoning_state {
+        builder = builder.store(false);
+        builder = builder.include(vec![IncludeEnum::ReasoningEncryptedContent]);
+    }
+
+    if uses_native_web_search(settings) {
+        builder = builder.tools(vec![Tool::WebSearch(
+            WebSearchToolArgs::default().build().unwrap(),
+        )]);
+        tool_count += 1;
+    }
+
+    debug!(
+        model = %model,
+        input_items = item_count,
+        tools = tool_count,
+        has_system,
+        has_reasoning,
+        preserve_reasoning_state = settings.llm.preserve_reasoning_state,
+        streaming = with_tools,
+        "built Responses API request"
+    );
+
+    builder
+        .build()
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .context("failed to build response request")
 }
 
-fn reasoning_history_message(
-    settings: &RoleLlmSettings,
+fn build_chat_completions_request(
+    settings: &AgentSettings,
     input: &agent_loop::ModelInput,
-) -> Option<Message> {
-    if !settings.preserve_reasoning_state {
+    prompt: &str,
+    with_tools: bool,
+) -> Result<async_openai::types::chat::CreateChatCompletionRequest> {
+    use async_openai::types::chat::*;
+
+    let mut messages: Vec<ChatCompletionRequestMessage> = Vec::new();
+
+    if let Some(system) = &input.system_instruction {
+        messages.push(ChatCompletionRequestMessage::System(
+            ChatCompletionRequestSystemMessage {
+                content: ChatCompletionRequestSystemMessageContent::Text(system.clone()),
+                name: None,
+            },
+        ));
+    } else if let Some(preamble) = settings.llm.effective_preamble() {
+        messages.push(ChatCompletionRequestMessage::System(
+            ChatCompletionRequestSystemMessage {
+                content: ChatCompletionRequestSystemMessageContent::Text(preamble.to_string()),
+                name: None,
+            },
+        ));
+    }
+
+    let mut seen_first_user = false;
+    for item in &input.items {
+        match item.item_type {
+            agent_loop::TurnItemType::UserMessage => {
+                if !seen_first_user {
+                    seen_first_user = true;
+                    continue;
+                }
+                messages.push(ChatCompletionRequestMessage::User(
+                    ChatCompletionRequestUserMessage {
+                        content: ChatCompletionRequestUserMessageContent::Text(
+                            item.content_text.clone(),
+                        ),
+                        name: None,
+                    },
+                ));
+            }
+            agent_loop::TurnItemType::AssistantMessage => {
+                if !item.content_text.is_empty() {
+                    #[allow(deprecated)]
+                    messages.push(ChatCompletionRequestMessage::Assistant(
+                        ChatCompletionRequestAssistantMessage {
+                            content: Some(ChatCompletionRequestAssistantMessageContent::Text(
+                                item.content_text.clone(),
+                            )),
+                            refusal: None,
+                            name: None,
+                            audio: None,
+                            tool_calls: None,
+                            function_call: None,
+                        },
+                    ));
+                }
+            }
+            agent_loop::TurnItemType::ToolCall => {
+                let call = item.content_json.get("call");
+                let arguments = call
+                    .and_then(|c| c.get("arguments"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let name = call
+                    .and_then(|c| c.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or(&item.tool_name)
+                    .to_string();
+                let call_id = item.tool_call_id.clone();
+                #[allow(deprecated)]
+                messages.push(ChatCompletionRequestMessage::Assistant(
+                    ChatCompletionRequestAssistantMessage {
+                        content: None,
+                        refusal: None,
+                        name: None,
+                        audio: None,
+                        tool_calls: Some(vec![ChatCompletionMessageToolCalls::Function(
+                            ChatCompletionMessageToolCall {
+                                id: call_id,
+                                function: FunctionCall {
+                                    name,
+                                    arguments: arguments.to_string(),
+                                },
+                            },
+                        )]),
+                        function_call: None,
+                    },
+                ));
+            }
+            agent_loop::TurnItemType::ToolResult => {
+                let content_text = truncation::truncate_semantic(
+                    &item.content_text,
+                    input.truncation.tool_result_chars,
+                    &input.truncation,
+                );
+                messages.push(ChatCompletionRequestMessage::Tool(
+                    ChatCompletionRequestToolMessage {
+                        content: ChatCompletionRequestToolMessageContent::Text(content_text),
+                        tool_call_id: item.tool_call_id.clone(),
+                    },
+                ));
+            }
+            agent_loop::TurnItemType::CompactSummary => {
+                messages.push(ChatCompletionRequestMessage::User(
+                    ChatCompletionRequestUserMessage {
+                        content: ChatCompletionRequestUserMessageContent::Text(format!(
+                            "[Compacted Context] {}",
+                            item.content_text
+                        )),
+                        name: None,
+                    },
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    messages.push(ChatCompletionRequestMessage::User(
+        ChatCompletionRequestUserMessage {
+            content: ChatCompletionRequestUserMessageContent::Text(prompt.to_string()),
+            name: None,
+        },
+    ));
+
+    let msg_count = messages.len();
+    let model = settings.llm.model.clone();
+    let mut binding = CreateChatCompletionRequestArgs::default();
+    let mut builder = binding.model(&model).messages(messages);
+
+    let mut tool_count = 0;
+    if with_tools {
+        let tool_defs = tools::chat_completions_tool_definitions(&input.available_tools);
+        tool_count = tool_defs.len();
+        if !tool_defs.is_empty() {
+            builder = builder
+                .tools(tool_defs)
+                .tool_choice(ChatCompletionToolChoiceOption::Mode(
+                    ToolChoiceOptions::Auto,
+                ));
+        }
+    }
+
+    let has_reasoning = if let Some(effort) = build_chat_reasoning_effort(settings) {
+        builder = builder.reasoning_effort(effort);
+        true
+    } else {
+        false
+    };
+
+    if let Some(verbosity) = &settings.llm.text_verbosity {
+        let v = match verbosity.to_ascii_lowercase().as_str() {
+            "low" => Verbosity::Low,
+            "high" => Verbosity::High,
+            _ => Verbosity::Medium,
+        };
+        builder = builder.verbosity(v);
+    }
+
+    builder = builder.stream_options(ChatCompletionStreamOptions {
+        include_usage: Some(true),
+        include_obfuscation: None,
+    });
+
+    debug!(
+        model = %model,
+        messages = msg_count,
+        tools = tool_count,
+        has_reasoning,
+        streaming = with_tools,
+        "built Chat Completions API request"
+    );
+
+    builder
+        .build()
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .context("failed to build chat completion request")
+}
+
+fn build_chat_reasoning_effort(
+    settings: &AgentSettings,
+) -> Option<async_openai::types::chat::ReasoningEffort> {
+    use async_openai::types::chat::ReasoningEffort;
+
+    let effort = settings
+        .llm
+        .effective_reasoning_effort(settings.reasoning_effort_override.as_deref())?;
+    let trimmed = effort.trim();
+    if trimmed.is_empty() || is_zero_reasoning_effort(trimmed) {
         return None;
     }
-    input
-        .items
-        .iter()
-        .rev()
-        .find(|item| item.item_type == agent_loop::TurnItemType::ReasoningState)
-        .and_then(|item| {
-            let id = item
-                .content_json
-                .get("output_item_id")
-                .and_then(Value::as_str)
-                .filter(|value| !value.trim().is_empty())?;
-            let encrypted_content = item
-                .content_json
-                .get("encrypted_content")
-                .and_then(Value::as_str)
-                .filter(|value| !value.trim().is_empty())?;
-            Some(Message::Assistant {
-                id: None,
-                content: OneOrMany::one(AssistantContent::Reasoning(
-                    Reasoning::encrypted(encrypted_content.to_string()).with_id(id.to_string()),
-                )),
-            })
-        })
+    Some(match trimmed.to_ascii_lowercase().as_str() {
+        "low" => ReasoningEffort::Low,
+        "medium" => ReasoningEffort::Medium,
+        "high" => ReasoningEffort::High,
+        _ => ReasoningEffort::Medium,
+    })
 }
 
-async fn stream_completion_model<M>(
-    settings: &RigSettings,
+fn build_reasoning_param(
+    settings: &AgentSettings,
+) -> Option<async_openai::types::responses::Reasoning> {
+    use async_openai::types::responses::{Reasoning, ReasoningEffort};
+
+    let effort = settings
+        .llm
+        .effective_reasoning_effort(settings.reasoning_effort_override.as_deref());
+
+    let summary = settings.reasoning_summary_as_enum();
+
+    if effort.is_none() && summary.is_none() {
+        return None;
+    }
+
+    let effort_enum = effort
+        .map(str::trim)
+        .filter(|v| !v.is_empty() && !is_zero_reasoning_effort(v))
+        .map(|e| match e.to_ascii_lowercase().as_str() {
+            "low" => ReasoningEffort::Low,
+            "medium" => ReasoningEffort::Medium,
+            "high" => ReasoningEffort::High,
+            _ => ReasoningEffort::Medium,
+        });
+
+    Some(Reasoning {
+        effort: effort_enum,
+        summary,
+    })
+}
+
+async fn stream_responses_with_retry(
+    settings: &AgentSettings,
     input: &agent_loop::ModelInput,
-    model: M,
     prompt: &str,
     handler: &mut dyn ModelEventHandler,
-) -> Result<()>
-where
-    M: CompletionModel + Clone,
-    M::StreamingResponse: Clone + Unpin + GetTokenUsage,
-{
-    // Live gateway blips (502/503/429) are common. Retry only when the attempt
-    // made no observable progress, so we never double-emit partial stream events.
+) -> Result<()> {
     const MAX_ATTEMPTS: usize = 5;
     let mut attempt = 0usize;
     loop {
         attempt += 1;
-        match stream_completion_model_once(settings, input, model.clone(), prompt, handler).await {
+        match stream_responses_once(settings, input, prompt, handler).await {
             Ok(()) => return Ok(()),
             Err((error, made_progress))
                 if attempt < MAX_ATTEMPTS && !made_progress && is_transient_llm_error(&error) =>
@@ -1092,207 +1302,507 @@ fn is_permanent_llm_error_text(text: &str) -> bool {
                 || text.contains("token")))
 }
 
-async fn stream_completion_model_once<M>(
-    settings: &RigSettings,
+async fn stream_responses_once(
+    settings: &AgentSettings,
     input: &agent_loop::ModelInput,
-    model: M,
     prompt: &str,
     handler: &mut dyn ModelEventHandler,
-) -> std::result::Result<(), (anyhow::Error, bool)>
-where
-    M: CompletionModel,
-    M::StreamingResponse: Clone + Unpin + GetTokenUsage,
-{
-    // Map rig's StreamedAssistantContent directly — no custom event-JSON reparse.
+) -> std::result::Result<(), (anyhow::Error, bool)> {
+    use async_openai::types::responses::{OutputItem, ResponseStreamEvent};
+
     let started = std::time::Instant::now();
-    let builder = completion_request_builder(settings, input, model, prompt);
-    let mut stream = builder
-        .stream()
+    let client = openai_compatible_responses_client(&settings.llm).map_err(|e| (e, false))?;
+    let request = build_responses_request(settings, input, prompt, true).map_err(|e| (e, false))?;
+    debug!(role = %settings.role, "opening streaming Responses API connection");
+    let mut stream = client
+        .responses()
+        .create_stream(request)
         .await
-        .context("LLM stream failed")
-        .map_err(|error| (error, false))?;
-    let mut text_message = AssistantTextAccumulator::new();
+        .map_err(|e| (anyhow::anyhow!("{e}").context("LLM stream failed"), false))?;
+    debug!(
+        role = %settings.role,
+        connect_ms = started.elapsed().as_millis() as u64,
+        "stream connected, reading events"
+    );
+
+    let mut text_item_id: Option<String> = None;
+    let mut text_started = false;
     let mut saw_tool_call = false;
     let mut final_raw = Value::Null;
     let mut made_progress = false;
-    while let Some(chunk) = stream.next().await {
-        let chunk = match chunk.context("LLM stream chunk failed") {
-            Ok(chunk) => chunk,
-            Err(error) => return Err((error, made_progress)),
-        };
-        match chunk {
-            StreamedAssistantContent::Text(text) => {
-                made_progress = true;
-                text_message
-                    .push_delta(
-                        handler,
-                        format!("msg-{}", Uuid::new_v4()),
-                        text.text().to_string(),
-                    )
-                    .await
-                    .map_err(|error| (error, made_progress))?;
+    let mut reasoning_item_id: Option<String> = None;
+    let mut event_count: u64 = 0;
+    let mut function_call_meta: std::collections::HashMap<String, (String, String)> =
+        std::collections::HashMap::new();
+    let mut emitted_tool_calls: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+
+    while let Some(event) = stream.next().await {
+        event_count += 1;
+        let event = match event {
+            Ok(ev) => ev,
+            Err(e) => {
+                return Err((
+                    anyhow::anyhow!("{e}").context("LLM stream chunk failed"),
+                    made_progress,
+                ))
             }
-            StreamedAssistantContent::Reasoning(reasoning) => {
-                if let (Some(id), Some(encrypted_content)) =
-                    (reasoning.id.clone(), reasoning.encrypted_content())
-                {
-                    made_progress = true;
-                    handler
-                        .handle(ModelStreamEvent::ReasoningStateCompleted {
-                            item_id: id,
-                            encrypted_content: encrypted_content.to_string(),
-                        })
-                        .await
-                        .map_err(|error| (error, made_progress))?;
+        };
+        match event {
+            ResponseStreamEvent::ResponseOutputItemAdded(ev) => match &ev.item {
+                OutputItem::Message(msg) => {
+                    let item_id = msg.id.clone();
+                    text_item_id = Some(item_id.clone());
+                    if !text_started {
+                        handler
+                            .handle(ModelStreamEvent::AssistantMessageStarted {
+                                item_id: item_id.clone(),
+                            })
+                            .await
+                            .map_err(|e| (e, made_progress))?;
+                        text_started = true;
+                    }
                 }
-                let text = reasoning.display_text();
-                if !text.trim().is_empty() {
-                    made_progress = true;
-                    let item_id = reasoning
-                        .id
-                        .clone()
-                        .unwrap_or_else(|| format!("reasoning-{}", Uuid::new_v4()));
+                OutputItem::FunctionCall(fc) => {
+                    if let Some(id) = &fc.id {
+                        function_call_meta
+                            .insert(id.clone(), (fc.name.clone(), fc.call_id.clone()));
+                    }
+                }
+                OutputItem::Reasoning(r) => {
+                    reasoning_item_id =
+                        r.id.clone()
+                            .or_else(|| Some(format!("reasoning-{}", Uuid::new_v4())));
+                }
+                _ => {}
+            },
+            ResponseStreamEvent::ResponseOutputTextDelta(ev) => {
+                made_progress = true;
+                let item_id = text_item_id
+                    .clone()
+                    .unwrap_or_else(|| format!("msg-{}", Uuid::new_v4()));
+                if !text_started {
+                    text_item_id = Some(item_id.clone());
                     handler
-                        .handle(ModelStreamEvent::ReasoningSummaryDelta {
+                        .handle(ModelStreamEvent::AssistantMessageStarted {
                             item_id: item_id.clone(),
-                            delta: text,
                         })
                         .await
-                        .map_err(|error| (error, made_progress))?;
+                        .map_err(|e| (e, made_progress))?;
+                    text_started = true;
+                }
+                handler
+                    .handle(ModelStreamEvent::AssistantTextDelta {
+                        item_id,
+                        delta: ev.delta,
+                    })
+                    .await
+                    .map_err(|e| (e, made_progress))?;
+            }
+            ResponseStreamEvent::ResponseOutputTextDone(_ev) => {
+                if text_started {
+                    let item_id = text_item_id
+                        .clone()
+                        .unwrap_or_else(|| format!("msg-{}", Uuid::new_v4()));
+                    handler
+                        .handle(ModelStreamEvent::AssistantMessageCompleted {
+                            item_id,
+                            turn_status: agent_loop::TurnStatus::Unknown,
+                        })
+                        .await
+                        .map_err(|e| (e, made_progress))?;
+                    text_started = false;
+                    text_item_id = None;
+                }
+            }
+            ResponseStreamEvent::ResponseReasoningSummaryTextDelta(ev) => {
+                made_progress = true;
+                let item_id = reasoning_item_id
+                    .clone()
+                    .unwrap_or_else(|| format!("reasoning-{}", Uuid::new_v4()));
+                handler
+                    .handle(ModelStreamEvent::ReasoningSummaryDelta {
+                        item_id,
+                        delta: ev.delta,
+                    })
+                    .await
+                    .map_err(|e| (e, made_progress))?;
+            }
+            ResponseStreamEvent::ResponseReasoningSummaryTextDone(_ev) => {
+                if let Some(item_id) = reasoning_item_id.clone() {
                     handler
                         .handle(ModelStreamEvent::ReasoningSummaryCompleted { item_id })
                         .await
-                        .map_err(|error| (error, made_progress))?;
+                        .map_err(|e| (e, made_progress))?;
                 }
             }
-            StreamedAssistantContent::ReasoningDelta { id, reasoning } => {
-                if !reasoning.trim().is_empty() {
-                    made_progress = true;
-                    handler
-                        .handle(ModelStreamEvent::ReasoningSummaryDelta {
-                            item_id: id.unwrap_or_else(|| "reasoning-stream".to_string()),
-                            delta: reasoning,
-                        })
-                        .await
-                        .map_err(|error| (error, made_progress))?;
+            ResponseStreamEvent::ResponseOutputItemDone(ev) => {
+                match &ev.item {
+                    OutputItem::Reasoning(r) => {
+                        if let Ok(raw) = serde_json::to_value(r) {
+                            if let Some(encrypted) = extract_encrypted_reasoning(&raw) {
+                                let item_id =
+                                    r.id.clone()
+                                        .unwrap_or_else(|| format!("reasoning-{}", Uuid::new_v4()));
+                                made_progress = true;
+                                handler
+                                    .handle(ModelStreamEvent::ReasoningStateCompleted {
+                                        item_id,
+                                        encrypted_content: encrypted,
+                                    })
+                                    .await
+                                    .map_err(|e| (e, made_progress))?;
+                            }
+                        }
+                        reasoning_item_id = None;
+                    }
+                    OutputItem::FunctionCall(fc) => {
+                        let item_id = fc.id.as_deref().unwrap_or(&fc.call_id);
+                        if !emitted_tool_calls.contains(item_id) {
+                            made_progress = true;
+                            saw_tool_call = true;
+                            let arguments: Value =
+                                serde_json::from_str(&fc.arguments).unwrap_or(Value::Null);
+                            let name = tools::resolve_tool_name(&fc.name);
+                            emitted_tool_calls.insert(item_id.to_string());
+                            handler
+                                .handle(ModelStreamEvent::ToolCallCompleted {
+                                    tool_call: ToolCallRequest {
+                                        call_id: fc.call_id.clone(),
+                                        name,
+                                        arguments,
+                                    },
+                                })
+                                .await
+                                .map_err(|e| (e, made_progress))?;
+                        }
+                    }
+                    _ => {}
                 }
             }
-            StreamedAssistantContent::ToolCall { tool_call, .. } => {
+            ResponseStreamEvent::ResponseFunctionCallArgumentsDone(ev) => {
                 made_progress = true;
                 saw_tool_call = true;
+                let arguments: Value = serde_json::from_str(&ev.arguments).unwrap_or_else(|e| {
+                    tracing::warn!(item_id = ev.item_id, error = %e, raw = ev.arguments, "failed to parse function call arguments");
+                    Value::Null
+                });
+                let meta = function_call_meta.get(&ev.item_id);
+                let name = ev
+                    .name
+                    .as_deref()
+                    .filter(|n| !n.is_empty() && *n != "unknown")
+                    .or_else(|| meta.map(|(n, _)| n.as_str()))
+                    .unwrap_or("unknown");
+                let call_id = meta
+                    .map(|(_, cid)| cid.clone())
+                    .unwrap_or_else(|| ev.item_id.clone());
+                emitted_tool_calls.insert(ev.item_id);
                 handler
                     .handle(ModelStreamEvent::ToolCallCompleted {
                         tool_call: ToolCallRequest {
-                            call_id: tool_call.call_id.unwrap_or(tool_call.id),
-                            name: tools::resolve_tool_name(&tool_call.function.name),
-                            arguments: tool_call.function.arguments,
+                            call_id,
+                            name: tools::resolve_tool_name(name),
+                            arguments,
                         },
                     })
                     .await
-                    .map_err(|error| (error, made_progress))?;
+                    .map_err(|e| (e, made_progress))?;
             }
-            StreamedAssistantContent::ToolCallDelta { .. } => {}
-            StreamedAssistantContent::Final(response) => {
-                final_raw = token_usage_raw(&response);
+            ResponseStreamEvent::ResponseCompleted(ev) => {
+                final_raw = response_usage_to_raw(&ev.response);
             }
+            _ => {}
         }
     }
-    text_message
-        .complete(handler)
-        .await
-        .map_err(|error| (error, made_progress))?;
+
+    debug!(
+        role = %settings.role,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        event_count,
+        has_text = text_started,
+        has_tool_call = saw_tool_call,
+        "stream completed"
+    );
+
+    if text_started {
+        if let Some(item_id) = text_item_id.clone() {
+            handler
+                .handle(ModelStreamEvent::AssistantMessageCompleted {
+                    item_id,
+                    turn_status: agent_loop::TurnStatus::Unknown,
+                })
+                .await
+                .map_err(|e| (e, made_progress))?;
+        }
+    }
+
     handler
         .handle(ModelStreamEvent::ResponseCompleted {
             end_turn: !saw_tool_call,
-            raw: final_raw.clone(),
+            raw: final_raw,
         })
         .await
-        .map_err(|error| (error, made_progress))?;
-    if settings.debug {
-        let elapsed_ms = started.elapsed().as_millis();
-        let root = debug_project_root(settings);
-        let usage = agent_loop::extract_token_usage(&final_raw);
-        let req_messages = agent_loop::input_to_debug_messages(input);
-        debug_log_time(
-            &root,
-            json!({
-                "kind": "llm_stream",
-                "name": settings.role,
-                "role": settings.role,
-                "phase": settings.phase,
-                "topic_id": settings.topic_id,
-                "model": settings.llm.model,
-                "transport": "http",
-                "elapsed_ms": elapsed_ms,
-                "llm_ms": elapsed_ms,
-                "tool_ms": 0,
-                "wait_ms": 0,
-                "saw_tool_call": saw_tool_call,
-            }),
-        );
-        debug_log_token(
-            &root,
-            json!({
-                "kind": "llm_stream",
-                "role": settings.role,
-                "phase": settings.phase,
-                "topic_id": settings.topic_id,
-                "model": settings.llm.model,
-                "transport": "http",
-                "input_tokens": usage.input_tokens,
-                "output_tokens": usage.output_tokens,
-                "cached_tokens": usage.cached_tokens,
-                "reasoning_tokens": usage.reasoning_tokens,
-                "total_tokens": usage.total_tokens,
-                "elapsed_ms": elapsed_ms,
-                "llm_ms": elapsed_ms,
-                "tool_ms": 0,
-                "wait_ms": 0,
-                "saw_tool_call": saw_tool_call,
-            }),
-        );
-        if let Err(error) = append_debug_llm_record(
-            settings,
-            json!({
-                "kind": "llm_stream",
-                "role": settings.role,
-                "phase": settings.phase,
-                "topic_id": settings.topic_id,
-                "model": settings.llm.model,
-                "req": { "messages": req_messages },
-                "resp": final_raw,
-                "elapsed_ms": elapsed_ms,
-                "token": {
-                    "input_tokens": usage.input_tokens,
-                    "output_tokens": usage.output_tokens,
-                    "cached_tokens": usage.cached_tokens,
-                    "reasoning_tokens": usage.reasoning_tokens,
-                    "total_tokens": usage.total_tokens,
-                },
-            }),
-        ) {
-            tracing::warn!(error = %error, "failed to write debug llm record from stream");
-        }
-    }
+        .map_err(|e| (e, made_progress))?;
+
     Ok(())
 }
 
-fn apply_optional_preamble<M, P, ToolState>(
-    builder: AgentBuilder<M, P, ToolState>,
-    settings: &RoleLlmSettings,
-) -> AgentBuilder<M, P, ToolState>
-where
-    M: CompletionModel,
-    P: rig_core::agent::PromptHook<M>,
-{
-    if let Some(preamble) = settings.effective_preamble() {
-        builder.preamble(preamble)
-    } else {
-        builder
+async fn stream_chat_completions_with_retry(
+    settings: &AgentSettings,
+    input: &agent_loop::ModelInput,
+    prompt: &str,
+    handler: &mut dyn ModelEventHandler,
+) -> Result<()> {
+    const MAX_ATTEMPTS: usize = 5;
+    let mut attempt = 0usize;
+    loop {
+        attempt += 1;
+        match stream_chat_completions_once(settings, input, prompt, handler).await {
+            Ok(()) => return Ok(()),
+            Err((error, made_progress))
+                if attempt < MAX_ATTEMPTS && !made_progress && is_transient_llm_error(&error) =>
+            {
+                let backoff_ms = 1_000u64 * (1u64 << (attempt - 1)).min(8);
+                tracing::warn!(
+                    attempt,
+                    backoff_ms,
+                    error = %error,
+                    role = %settings.role,
+                    "retrying transient Chat Completions stream failure"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+            }
+            Err((error, _)) => return Err(error),
+        }
     }
 }
 
-fn parse_final_output(settings: &RigSettings, text: &str) -> Result<Value> {
+async fn stream_chat_completions_once(
+    settings: &AgentSettings,
+    input: &agent_loop::ModelInput,
+    prompt: &str,
+    handler: &mut dyn ModelEventHandler,
+) -> std::result::Result<(), (anyhow::Error, bool)> {
+    use async_openai::types::chat::FinishReason;
+
+    let started = std::time::Instant::now();
+    let client = openai_compatible_responses_client(&settings.llm).map_err(|e| (e, false))?;
+    let request =
+        build_chat_completions_request(settings, input, prompt, true).map_err(|e| (e, false))?;
+    debug!(role = %settings.role, "opening streaming Chat Completions API connection");
+    let mut stream = client
+        .chat()
+        .create_stream(request)
+        .await
+        .map_err(|e| (anyhow::anyhow!("{e}").context("Chat Completions stream failed"), false))?;
+    debug!(
+        role = %settings.role,
+        connect_ms = started.elapsed().as_millis() as u64,
+        "chat completions stream connected, reading events"
+    );
+
+    let mut text_item_id: Option<String> = None;
+    let mut text_started = false;
+    let mut saw_tool_call = false;
+    let mut final_raw = Value::Null;
+    let mut made_progress = false;
+    let mut event_count: u64 = 0;
+
+    struct PendingToolCall {
+        id: String,
+        name: String,
+        arguments: String,
+    }
+    let mut pending_tool_calls: std::collections::HashMap<u32, PendingToolCall> =
+        std::collections::HashMap::new();
+
+    while let Some(event) = stream.next().await {
+        event_count += 1;
+        let chunk = match event {
+            Ok(ev) => ev,
+            Err(e) => {
+                return Err((
+                    anyhow::anyhow!("{e}").context("Chat Completions stream chunk failed"),
+                    made_progress,
+                ))
+            }
+        };
+
+        if let Some(usage) = &chunk.usage {
+            let cached = usage
+                .prompt_tokens_details
+                .as_ref()
+                .map(|d| d.cached_tokens.unwrap_or(0))
+                .unwrap_or(0);
+            let reasoning = usage
+                .completion_tokens_details
+                .as_ref()
+                .and_then(|d| d.reasoning_tokens)
+                .unwrap_or(0);
+            final_raw = json!({
+                "usage": {
+                    "input_tokens": usage.prompt_tokens,
+                    "output_tokens": usage.completion_tokens,
+                    "total_tokens": usage.total_tokens,
+                    "input_tokens_details": { "cached_tokens": cached },
+                    "output_tokens_details": { "reasoning_tokens": reasoning }
+                }
+            });
+        }
+
+        for choice in &chunk.choices {
+            let delta = &choice.delta;
+
+            if let Some(content) = &delta.content {
+                if !content.is_empty() {
+                    made_progress = true;
+                    let item_id = text_item_id
+                        .clone()
+                        .unwrap_or_else(|| format!("msg-{}", Uuid::new_v4()));
+                    if !text_started {
+                        text_item_id = Some(item_id.clone());
+                        handler
+                            .handle(ModelStreamEvent::AssistantMessageStarted {
+                                item_id: item_id.clone(),
+                            })
+                            .await
+                            .map_err(|e| (e, made_progress))?;
+                        text_started = true;
+                    }
+                    handler
+                        .handle(ModelStreamEvent::AssistantTextDelta {
+                            item_id,
+                            delta: content.clone(),
+                        })
+                        .await
+                        .map_err(|e| (e, made_progress))?;
+                }
+            }
+
+            if let Some(tool_calls) = &delta.tool_calls {
+                for tc_chunk in tool_calls {
+                    let idx = tc_chunk.index;
+                    let pending = pending_tool_calls.entry(idx).or_insert_with(|| {
+                        PendingToolCall {
+                            id: String::new(),
+                            name: String::new(),
+                            arguments: String::new(),
+                        }
+                    });
+                    if let Some(id) = &tc_chunk.id {
+                        pending.id = id.clone();
+                    }
+                    if let Some(func) = &tc_chunk.function {
+                        if let Some(name) = &func.name {
+                            pending.name = name.clone();
+                        }
+                        if let Some(args) = &func.arguments {
+                            pending.arguments.push_str(args);
+                        }
+                    }
+                }
+            }
+
+            if let Some(FinishReason::ToolCalls) = choice.finish_reason {
+                saw_tool_call = true;
+            }
+        }
+    }
+
+    if text_started {
+        if let Some(item_id) = text_item_id.clone() {
+            handler
+                .handle(ModelStreamEvent::AssistantMessageCompleted {
+                    item_id,
+                    turn_status: agent_loop::TurnStatus::Unknown,
+                })
+                .await
+                .map_err(|e| (e, made_progress))?;
+        }
+    }
+
+    let mut indices: Vec<u32> = pending_tool_calls.keys().copied().collect();
+    indices.sort();
+    for idx in indices {
+        if let Some(tc) = pending_tool_calls.remove(&idx) {
+            made_progress = true;
+            saw_tool_call = true;
+            let arguments: Value =
+                serde_json::from_str(&tc.arguments).unwrap_or(Value::Null);
+            let name = tools::resolve_tool_name(&tc.name);
+            handler
+                .handle(ModelStreamEvent::ToolCallCompleted {
+                    tool_call: ToolCallRequest {
+                        call_id: tc.id,
+                        name,
+                        arguments,
+                    },
+                })
+                .await
+                .map_err(|e| (e, made_progress))?;
+        }
+    }
+
+    debug!(
+        role = %settings.role,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        event_count,
+        has_text = text_started,
+        has_tool_call = saw_tool_call,
+        "chat completions stream completed"
+    );
+
+    handler
+        .handle(ModelStreamEvent::ResponseCompleted {
+            end_turn: !saw_tool_call,
+            raw: final_raw,
+        })
+        .await
+        .map_err(|e| (e, made_progress))?;
+
+    Ok(())
+}
+
+fn response_usage_to_raw(response: &async_openai::types::responses::Response) -> Value {
+    match &response.usage {
+        Some(usage) => {
+            let cached = serde_json::to_value(&usage.input_tokens_details)
+                .ok()
+                .and_then(|v| v.get("cached_tokens").and_then(Value::as_u64))
+                .unwrap_or(0);
+            let reasoning = serde_json::to_value(&usage.output_tokens_details)
+                .ok()
+                .and_then(|v| v.get("reasoning_tokens").and_then(Value::as_u64))
+                .unwrap_or(0);
+            json!({
+                "usage": {
+                    "input_tokens": usage.input_tokens,
+                    "output_tokens": usage.output_tokens,
+                    "total_tokens": usage.total_tokens,
+                    "input_tokens_details": { "cached_tokens": cached },
+                    "output_tokens_details": { "reasoning_tokens": reasoning }
+                }
+            })
+        }
+        None => Value::Null,
+    }
+}
+
+fn extract_encrypted_reasoning(raw: &Value) -> Option<String> {
+    raw.get("content")
+        .and_then(Value::as_array)
+        .and_then(|arr| {
+            arr.iter().find_map(|c| {
+                c.get("encrypted_content")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(ToString::to_string)
+            })
+        })
+}
+
+fn parse_final_output(settings: &AgentSettings, text: &str) -> Result<Value> {
     match settings.output_mode {
         OutputMode::ResearchArtifact => {
             let value = extract_json_artifact(text)?;
@@ -1327,7 +1837,7 @@ fn parse_final_output(settings: &RigSettings, text: &str) -> Result<Value> {
     }
 }
 
-fn text_fallback_artifact(settings: &RigSettings, text: &str) -> Value {
+fn text_fallback_artifact(settings: &AgentSettings, text: &str) -> Value {
     let per_ticker = settings
         .tickers
         .iter()
@@ -1371,7 +1881,7 @@ fn requires_structured_final_artifact(role: &str) -> bool {
         )
 }
 
-fn validate_json_artifact_contract(settings: &RigSettings, artifact: &Value) -> Result<()> {
+fn validate_json_artifact_contract(settings: &AgentSettings, artifact: &Value) -> Result<()> {
     if settings.role.starts_with("analyst.") {
         return validate_analyst_artifact_contract(settings, artifact);
     }
@@ -1393,7 +1903,7 @@ fn validate_json_artifact_contract(settings: &RigSettings, artifact: &Value) -> 
     }
 }
 
-fn validate_analyst_artifact_contract(settings: &RigSettings, artifact: &Value) -> Result<()> {
+fn validate_analyst_artifact_contract(settings: &AgentSettings, artifact: &Value) -> Result<()> {
     let actual_role = artifact
         .get("role")
         .and_then(Value::as_str)
@@ -1414,8 +1924,8 @@ fn validate_analyst_artifact_contract(settings: &RigSettings, artifact: &Value) 
             }
         }
         if let Some(ids) = artifact.get("referenced_jin10_ids") {
-            if !ids.is_array() {
-                bail!("analyst.news_macro referenced_jin10_ids must be an array of jin10 ids");
+            if !ids.is_array() && !ids.is_object() {
+                bail!("analyst.news_macro referenced_jin10_ids must be an array of jin10 ids or a map id->score");
             }
         }
     }
@@ -1450,7 +1960,7 @@ fn validate_analyst_artifact_contract(settings: &RigSettings, artifact: &Value) 
     Ok(())
 }
 
-fn validate_seed_packet_contract(settings: &RigSettings, artifact: &Value) -> Result<()> {
+fn validate_seed_packet_contract(settings: &AgentSettings, artifact: &Value) -> Result<()> {
     require_exact_role(settings, artifact)?;
     let expected_type = if settings.role.contains("bull") {
         "bull_seed_packet"
@@ -1492,7 +2002,7 @@ fn validate_seed_packet_contract(settings: &RigSettings, artifact: &Value) -> Re
     Ok(())
 }
 
-fn validate_interaction_packet_contract(settings: &RigSettings, artifact: &Value) -> Result<()> {
+fn validate_interaction_packet_contract(settings: &AgentSettings, artifact: &Value) -> Result<()> {
     require_exact_role(settings, artifact)?;
     let expected_type = if settings.role.contains("bull") {
         "bull_debate_packet"
@@ -1520,7 +2030,7 @@ fn validate_interaction_packet_contract(settings: &RigSettings, artifact: &Value
     Ok(())
 }
 
-fn validate_controller_packet_contract(settings: &RigSettings, artifact: &Value) -> Result<()> {
+fn validate_controller_packet_contract(settings: &AgentSettings, artifact: &Value) -> Result<()> {
     require_exact_role(settings, artifact)?;
     require_exact_string(artifact, "artifact_type", "topic_controller_packet")?;
     require_non_empty_string(artifact, "topic_id")?;
@@ -1560,7 +2070,7 @@ fn validate_controller_packet_contract(settings: &RigSettings, artifact: &Value)
     Ok(())
 }
 
-fn validate_topic_generation_contract(settings: &RigSettings, artifact: &Value) -> Result<()> {
+fn validate_topic_generation_contract(settings: &AgentSettings, artifact: &Value) -> Result<()> {
     require_exact_role(settings, artifact)?;
     require_exact_string(
         artifact,
@@ -1573,7 +2083,7 @@ fn validate_topic_generation_contract(settings: &RigSettings, artifact: &Value) 
     Ok(())
 }
 
-fn validate_allocation_artifact_contract(settings: &RigSettings, artifact: &Value) -> Result<()> {
+fn validate_allocation_artifact_contract(settings: &AgentSettings, artifact: &Value) -> Result<()> {
     validate_optional_role(settings, artifact)?;
     let weights = require_object(artifact, "weights")?;
     if weights.is_empty() {
@@ -1625,7 +2135,7 @@ fn validate_allocation_artifact_contract(settings: &RigSettings, artifact: &Valu
     Ok(())
 }
 
-fn validate_trade_intent_contract(settings: &RigSettings, artifact: &Value) -> Result<()> {
+fn validate_trade_intent_contract(settings: &AgentSettings, artifact: &Value) -> Result<()> {
     validate_optional_role(settings, artifact)?;
     if artifact.get("action").and_then(Value::as_str).is_some() {
         return validate_trade_intent_entry(artifact);
@@ -1674,7 +2184,7 @@ fn parse_position_upper_bound(value: &str) -> Option<f64> {
         .max_by(f64::total_cmp)
 }
 
-fn validate_risk_constraints_contract(settings: &RigSettings, artifact: &Value) -> Result<()> {
+fn validate_risk_constraints_contract(settings: &AgentSettings, artifact: &Value) -> Result<()> {
     validate_optional_role(settings, artifact)?;
     let stance = require_non_empty_string(artifact, "stance")?;
     let expected_stance = settings.role.strip_prefix("risk.").unwrap_or_default();
@@ -1704,7 +2214,7 @@ fn validate_risk_constraints_contract(settings: &RigSettings, artifact: &Value) 
     Ok(())
 }
 
-fn validate_optional_role(settings: &RigSettings, artifact: &Value) -> Result<()> {
+fn validate_optional_role(settings: &AgentSettings, artifact: &Value) -> Result<()> {
     if let Some(role) = artifact.get("role") {
         let role = role
             .as_str()
@@ -1720,7 +2230,7 @@ fn validate_optional_role(settings: &RigSettings, artifact: &Value) -> Result<()
     Ok(())
 }
 
-fn require_exact_role<'a>(settings: &RigSettings, artifact: &'a Value) -> Result<&'a str> {
+fn require_exact_role<'a>(settings: &AgentSettings, artifact: &'a Value) -> Result<&'a str> {
     let role = artifact
         .get("role")
         .and_then(Value::as_str)
@@ -1857,7 +2367,7 @@ fn extract_embedded_json_object(text: &str) -> Result<Value> {
     serde_json::from_str(&text[start..end]).context("failed to parse embedded JSON object")
 }
 
-fn open_loop_connection(settings: &RigSettings) -> Result<Connection> {
+fn open_loop_connection(settings: &AgentSettings) -> Result<Connection> {
     let db_path = settings
         .tools
         .as_ref()
@@ -1866,12 +2376,12 @@ fn open_loop_connection(settings: &RigSettings) -> Result<Connection> {
     orchestrator_sql::connect(db_path)
 }
 
-fn loop_session_id(settings: &RigSettings) -> String {
+fn loop_session_id(settings: &AgentSettings) -> String {
     let run_id = loop_run_id(settings);
     format!("{run_id}:{}", settings.role)
 }
 
-fn loop_run_id(settings: &RigSettings) -> String {
+fn loop_run_id(settings: &AgentSettings) -> String {
     settings
         .tools
         .as_ref()
@@ -1915,17 +2425,23 @@ fn openai_compatible_base_url(settings: &RoleLlmSettings) -> Result<&str> {
         .context("base_url is required for OpenAI-compatible provider")
 }
 
-fn openai_compatible_responses_client(settings: &RoleLlmSettings) -> Result<openai::Client> {
+fn openai_compatible_responses_client(
+    settings: &RoleLlmSettings,
+) -> Result<OpenAIClient<OpenAIConfig>> {
     let api_key = openai_compatible_api_key(settings)?;
     let base_url = openai_compatible_base_url(settings)?;
-    openai::Client::builder()
-        .api_key(&api_key)
-        .base_url(base_url)
-        .build()
-        .context("failed to build OpenAI-compatible responses client")
+    debug!(
+        base_url = %base_url,
+        model = %settings.model,
+        "creating OpenAI-compatible responses client"
+    );
+    let config = OpenAIConfig::new()
+        .with_api_key(api_key)
+        .with_api_base(base_url);
+    Ok(OpenAIClient::with_config(config))
 }
 
-pub fn additional_params(settings: &RigSettings) -> Option<Value> {
+pub fn additional_params(settings: &AgentSettings) -> Option<Value> {
     let mut params = openai_responses_reasoning_params(
         &settings.llm,
         settings
@@ -1990,7 +2506,7 @@ fn add_openai_responses_native_web_search(params: Option<Value>) -> Value {
     Value::Object(object)
 }
 
-fn configured_tool_names(settings: &RigSettings) -> Vec<&str> {
+fn configured_tool_names(settings: &AgentSettings) -> Vec<&str> {
     if role_disables_tools(&settings.role) {
         return Vec::new();
     }
@@ -2013,7 +2529,7 @@ fn role_disables_tools(role: &str) -> bool {
 }
 
 fn validate_tool_name(name: &str) -> Result<()> {
-    if tools::tool_names().contains(&name) {
+    if tools::tool_names().contains(&name) || name == tools::WEB_RUN_TOOL_NAME {
         Ok(())
     } else {
         bail!("unknown tool name: {name}")
@@ -2207,13 +2723,13 @@ fn mock_allocation_artifact(tickers: &[String]) -> Value {
 mod tests {
     use super::{
         agent_loop, is_permanent_llm_error_text, is_transient_llm_error, llm_judge::JudgeConfig,
-        tools, LlmRoute, LlmTransport, OutputMode, RigSettings, RoleLlmSettings, TruncationConfig,
+        tools, AgentSettings, LlmRoute, LlmTransport, OutputMode, RoleLlmSettings,
+        TruncationConfig,
     };
     use crate::web_search::{WebSearchConfig, WebSearchMode};
-    use crate::{AssistantTextAccumulator, ModelEventHandler, ModelStreamEvent};
-    use anyhow::{anyhow, Result};
+    use anyhow::anyhow;
     use serde_json::json;
-    use std::{future::Future, path::PathBuf, pin::Pin};
+    use std::path::PathBuf;
 
     #[test]
     fn context_window_full_is_not_transient() {
@@ -2237,8 +2753,8 @@ mod tests {
         assert!(is_transient_llm_error(&err));
     }
 
-    fn base_settings(route: LlmRoute) -> RigSettings {
-        RigSettings {
+    fn base_settings(route: LlmRoute) -> AgentSettings {
+        AgentSettings {
             role: "manager.research".to_string(),
             phase: None,
             topic_id: None,
@@ -2292,7 +2808,10 @@ mod tests {
             serde_json::from_value::<LlmRoute>(json!("responses")).unwrap(),
             LlmRoute::Responses
         );
-        assert!(serde_json::from_value::<LlmRoute>(json!("chat_completions")).is_err());
+        assert_eq!(
+            serde_json::from_value::<LlmRoute>(json!("chat_completions")).unwrap(),
+            LlmRoute::ChatCompletions
+        );
         assert!(serde_json::from_value::<LlmRoute>(json!("deepseek")).is_err());
     }
 
@@ -2918,61 +3437,6 @@ mod tests {
             super::parse_json_object_artifact(text).unwrap(),
             json!({"id": "a", "status": "completed"})
         );
-    }
-
-    #[derive(Default)]
-    struct CollectEvents {
-        events: Vec<ModelStreamEvent>,
-    }
-
-    impl ModelEventHandler for CollectEvents {
-        fn handle<'a>(
-            &'a mut self,
-            event: ModelStreamEvent,
-        ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
-            self.events.push(event);
-            Box::pin(async { Ok(()) })
-        }
-    }
-
-    #[tokio::test]
-    async fn assistant_text_accumulator_emits_started_delta_completed() {
-        let mut text = AssistantTextAccumulator::new();
-        let mut handler = CollectEvents::default();
-
-        text.push_delta(&mut handler, "msg-1".to_string(), "hello".to_string())
-            .await
-            .unwrap();
-        text.push_delta(
-            &mut handler,
-            "msg-ignored".to_string(),
-            " world".to_string(),
-        )
-        .await
-        .unwrap();
-        text.complete(&mut handler).await.unwrap();
-        // complete is idempotent
-        text.complete(&mut handler).await.unwrap();
-
-        assert_eq!(handler.events.len(), 4);
-        assert!(matches!(
-            &handler.events[0],
-            ModelStreamEvent::AssistantMessageStarted { item_id } if item_id == "msg-1"
-        ));
-        assert!(matches!(
-            &handler.events[1],
-            ModelStreamEvent::AssistantTextDelta { item_id, delta }
-                if item_id == "msg-1" && delta == "hello"
-        ));
-        assert!(matches!(
-            &handler.events[2],
-            ModelStreamEvent::AssistantTextDelta { item_id, delta }
-                if item_id == "msg-1" && delta == " world"
-        ));
-        assert!(matches!(
-            &handler.events[3],
-            ModelStreamEvent::AssistantMessageCompleted { item_id, .. } if item_id == "msg-1"
-        ));
     }
 
     #[test]

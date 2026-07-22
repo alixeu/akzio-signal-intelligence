@@ -1,5 +1,5 @@
+use super::ToolDefinition;
 use anyhow::{Context, Result};
-use rig_core::completion::ToolDefinition;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -32,6 +32,7 @@ pub fn definition() -> ToolDefinition {
                     "description": "Optional max videos to fetch."
                 }
             },
+            "required": [],
             "additionalProperties": true
         }),
     }

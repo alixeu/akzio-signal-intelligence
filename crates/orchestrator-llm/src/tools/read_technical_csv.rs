@@ -1,5 +1,5 @@
+use super::ToolDefinition;
 use anyhow::{Context, Result};
-use rig_core::completion::ToolDefinition;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -10,7 +10,7 @@ pub const NAME: &str = "read_technical_csv";
 pub fn definition() -> ToolDefinition {
     ToolDefinition {
         name: api_tool_name(NAME),
-        description: "When you need precomputed technical bars and indicator features (price structure, returns, momentum, volatility, volume, correlations) for a ticker and interval before forming a technical conclusion. Intervals: daily/1d, 3h, 20min. Do not invent readings if empty; do not use for news or social evidence.".to_string(),
+        description: "Retrieve precomputed technical bars and indicator features for a ticker at a given interval. You MUST call this tool once per ticker per interval (daily, 3h, 20min) BEFORE forming any technical conclusion. Always fetch all assigned tickers × all three intervals. Do not invent readings; do not use for news or social evidence.".to_string(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -24,16 +24,12 @@ pub fn definition() -> ToolDefinition {
                 },
                 "interval": {
                     "type": "string",
-                    "description": "Bar interval for the situation: daily/1d, 3h, or 20min.",
-                    "default": "daily"
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": "Optional max recent bars when the full series is unnecessary."
+                    "description": "Bar interval: daily, 3h, or 20min. You must fetch all three intervals per ticker.",
+                    "enum": ["daily", "3h", "20min"]
                 }
             },
-            "required": ["ticker"],
-            "additionalProperties": true
+            "required": ["ticker", "interval"],
+            "additionalProperties": false
         }),
     }
 }
@@ -44,8 +40,6 @@ pub struct Args {
     pub ticker: String,
     #[serde(default = "default_interval")]
     pub interval: String,
-    #[serde(default)]
-    pub limit: Option<usize>,
 }
 
 fn default_interval() -> String {
@@ -65,10 +59,6 @@ pub fn execute(args: Value) -> Result<Value> {
     let result = if rows.is_empty() {
         json!({"error": format!("no technical CSV data for {} @ {}", ticker, interval)})
     } else {
-        let rows = match tool_args.limit {
-            Some(limit) if limit < rows.len() => &rows[rows.len() - limit..],
-            _ => &rows,
-        };
         let entries: Vec<Value> = rows
             .iter()
             .map(|row| {

@@ -468,7 +468,7 @@ fn builtin_llm_role_values() -> BTreeMap<String, Value> {
     for (role, max_turns, reasoning_effort, tools, web_search_live) in [
         (
             "analyst.technical",
-            6,
+            12,
             None,
             vec!["read_run_context", "read_technical_csv"],
             false,
@@ -478,7 +478,7 @@ fn builtin_llm_role_values() -> BTreeMap<String, Value> {
             6,
             None,
             vec!["read_run_context", "read_jin10_csv"],
-            false,
+            true,
         ),
         (
             "analyst.youtube",

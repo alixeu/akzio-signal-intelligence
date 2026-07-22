@@ -24,7 +24,7 @@ html-escape = "0.2.13"
 regex = "1.11.1"
 decrypt-cookies = { version = "0.11.1", features = ["Safari"] }
 reqwest = { version = "0.12.12", default-features = false, features = ["cookies", "json", "rustls-tls"] }
-rig-core = { version = "0.38.2", features = ["websocket"] }
+async-openai = { version = "0.41.1", features = ["responses", "chat-completion"] }
 rusqlite = { version = "0.32.1", features = ["bundled", "chrono"] }
 scraper = "0.22.0"
 schemars = "1.0.4"

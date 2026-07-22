@@ -65,7 +65,7 @@ fn default_preserve_fields() -> Vec<String> {
 impl Default for TruncationConfig {
     fn default() -> Self {
         Self {
-            tool_result_chars: 8_000,
+            tool_result_chars: 200_000,
             context_fragment_chars: 12_000,
             strategy: TruncationStrategy::Semantic,
             json: JsonTruncationConfig::default(),
