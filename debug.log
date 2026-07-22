@@ -1,0 +1,222 @@
+2026-07-22T12:09:33+08:00 | P0 | 配置/安全 | config/config.yaml
+复现命令: 检查默认配置的 LLM gateway api_key（输出已脱敏，密钥未写入本日志）
+实际现象: 仓库配置为 LLM API key 提供了非空默认值；当前进程环境未设置 LLM_GATEWAY_API_KEY。
+预期现象: 真实运行必须从环境获得凭据，仓库不得内置可用或疑似可用密钥。
+根因: 配置占位符包含了提交到仓库的 fallback 值。
+修改内容: 待本轮修复为必需环境变量并补充配置边界测试。
+删除内容: 待删除仓库内密钥默认值。
+验证命令: 待执行配置加载测试、无环境凭据的真实 CLI 失败诊断。
+验证结果: 未解决（已确认触发条件）。
+回归风险: 移除默认值后，无环境凭据的真实 LLM 运行会更早、明确失败；这是预期安全行为。
+
+2026-07-22T12:09:33+08:00 | P1 | 全局构建 | crates/orchestrator-llm/src/lib.rs
+复现命令: rtk cargo fmt --all -- --check
+实际现象: rustfmt 报告多处未格式化差异。
+预期现象: 工作区格式检查零差异。
+根因: 最近的流式响应改动未执行 rustfmt。
+修改内容: 待完成相关逻辑修复后统一格式化。
+删除内容: 无。
+验证命令: 待重新执行 rtk cargo fmt --all -- --check。
+验证结果: 未解决（稳定复现）。
+回归风险: 低。
+
+2026-07-22T13:38:00+08:00 | P1 | Reflection/Memory 非阻塞与原子归档 | crates/orchestrator-workflow/src/exec/mod.rs
+复现命令: 追踪 inject_phase0_reflection 与 run_phase8 的 `?` 传播、run archive/prediction 写入顺序。
+实际现象: 可选 prior-memory 读取失败会在 Phase 3 前终止主流程；Phase 8 archive/prediction 任一写入失败会使已验证 Allocation 无法返回，并可能留下部分 Phase 8 写入。
+预期现象: Memory/Reflection 不阻塞核心研究与 Allocation；Phase 8 内部写入要么全部提交、要么全部回滚，同时保留可观察错误状态。
+根因: 可选学习链路沿用了决策关键阶段的 fail-fast 传播，且 archive/predictions 未包在同一事务。
+修改内容: prior-memory 失败记录 non_blocking_failed 后继续；Phase 8 使用单事务写 archive+predictions，失败回滚并记录 phase8_error/phase status，继续返回 Allocation。
+删除内容: Reflection/Memory 错误终止核心决策的传播路径；Phase 8 半提交窗口。
+验证命令: fmt/check/clippy/tests/release/prompt lint 全量闭环。
+验证结果: 已解决；416 tests / 23 suites，Clippy/prompt lint 0 issue，release 成功。
+是否解决: 是。
+回归风险: 学习链故障不会再改变当次投资决策；错误仍在状态和 warning 中可观测。
+
+2026-07-22T13:10:30+08:00 | P0 | 配置/安全 | config/config.yaml, crates/orchestrator-workflow/src/orchestration/config.rs
+复现命令: rtk cargo run -q -p orchestrator-cli --bin orchestrator-exec -- --config config/config.yaml --db-path <isolated>/orchestrator.sqlite --run-dir <isolated>/run --tech-refresh-enabled false --to-phase 1
+实际现象: 修复前配置含提交到仓库的 key fallback；修复后在任何网络 LLM 请求、Phase 状态或 Artifact 写入前返回 `LLM config for role analyst.news_macro requires api_key`。
+预期现象: 只接受环境凭据，缺密钥明确失败，不能把占位符或默认值当真实密钥。
+根因: YAML 环境占位符曾包含非空 fallback。
+修改内容: 改为必须由 LLM_GATEWAY_API_KEY 提供，保留 provider/role 上下文错误。
+删除内容: 仓库内 LLM key fallback。
+验证命令: 上述真实非 mock CLI；rtk cargo test --workspace --all-features。
+验证结果: 已解决；CLI exit 1，未创建运行数据库，416 tests 通过。
+是否解决: 是。
+回归风险: 无密钥环境不再能误启动，这是预期行为。
+
+2026-07-22T13:10:30+08:00 | P0 | Artifact Integrity | crates/orchestrator-core/src/artifact.rs, crates/orchestrator-workflow/src/exec/mod.rs, crates/orchestrator-workflow/src/orchestration/{artifact,degraded,allocation}.rs
+复现命令: rtk cargo test --workspace --all-features；搜索 empty/usable/neutral/0.5/unwrap_or_default。
+实际现象: 原实现主要校验 JSON/角色外形；部分缺证据或缺概率路径可能生成 degraded/neutral/0.5，Allocation Context 也曾先填 0.5。
+预期现象: critical Analyst 缺失、空/重复/无来源/无时间证据、缺 ticker 概率均明确失败。
+根因: schema 验证与 evidence 语义验证分离，且下游存在便捷默认值。
+修改内容: 增加统一 Rust evidence quality 校验、ticker coverage、source/timestamp/finite/duplicate 检查；critical role 失败立即终止；Allocation Context 改为 Result 严格构造；未知摘要 confidence 使用 0.0、未知 stance 使用 unobserved。
+删除内容: 缺概率到 neutral 0.5 的 fallback、缺方向到 neutral 的 fallback、可继续消费的 degraded critical artifact。
+验证命令: rtk cargo test --workspace --all-features；新增 `allocation_context_rejects_missing_probability_instead_of_defaulting_to_neutral` 等回归测试。
+验证结果: 已解决；416 tests / 23 suites 通过。
+是否解决: 是。
+回归风险: 旧的空 Artifact 会从“看似成功”变为明确失败，符合契约。
+
+2026-07-22T13:10:30+08:00 | P0 | SSE/Tool Calling | crates/orchestrator-llm/src/agent_loop/mod.rs, crates/orchestrator-llm/src/lib.rs
+复现命令: rtk cargo test -p orchestrator-llm；覆盖跨 chunk arguments、重复事件、截断流、缺 call_id/name、malformed arguments。
+实际现象: 旧流解析可在缺 terminal completed/finish_reason 时接受累计文本，关键 tool 字段不完整时存在静默丢失风险。
+预期现象: 缓冲跨 chunk JSON；工具调用完整关联；截断和不可恢复 malformed event 使 iteration 失败。
+根因: 完成条件偏重是否有文本，未把 provider terminal event 与完整 tool envelope 当硬契约。
+修改内容: Responses 必须收到 response.completed；Chat 必须有非 length/content_filter finish_reason；累计并校验 call_id/name/JSON arguments；done event 去重；最终 analyst artifact 再经 Rust validator。
+删除内容: 对不完整 stream/tool event 的宽松成功路径。
+验证命令: rtk cargo test -p orchestrator-llm；全 workspace Clippy/tests。
+验证结果: 已解决；相关测试及全量门禁通过。
+是否解决: 是。
+回归风险: 非标准兼容网关若不发送终止事件将被正确识别为协议错误。
+
+2026-07-22T13:10:30+08:00 | P1 | 数据摄取 | crates/orchestrator-ingest/src/{technical,jin10}.rs
+复现命令: CODEX_PROJECT_ROOT=<isolated> rtk cargo run -q -p orchestrator-cli --bin orchestrator-ingest -- technical-indicators --symbols QQQ,SOXX,VIX --start 2026-05-01 --end 2026-07-22 --intervals 1d --sleep 0 --timeout 20；同 root 运行 jin10-flash --pages 2 --lookback-hours 24。
+实际现象: Technical 旧实现可能吞 CSV 写失败或以部分 symbol 成功返回；Jin10 会收集空 content。
+预期现象: 任一请求标的失败、零行或写盘失败则 ingest 失败；Jin10 空内容不入证据池。
+根因: 批量结果只看局部成功，文件写错误未传播，新闻只校验时间。
+修改内容: 聚合 symbol 错误并 fail；要求非零行；传播写错误；trim 并跳过空 Jin10 content。
+删除内容: 部分成功和空新闻的假成功路径。
+验证命令: 上述真实 Yahoo/Jin10 命令；jq/wc 落盘检查。
+验证结果: 已解决；Yahoo QQQ=55、SOXX=55、VIX=56 有效数据行；Jin10=92 条，空内容=0、缺时间=0、重复 pair=0。
+是否解决: 是。
+回归风险: 单标的上游故障现在会使整次严格 ingest 失败，符合输入完整性要求。
+
+2026-07-22T13:10:30+08:00 | P2 | 停用数据源与依赖 | crates/orchestrator-ingest, crates/orchestrator-llm/src/tools, prompts, Cargo.toml
+复现命令: 全仓库搜索 youtube/reddit/x/twitter/social/wayinvideo/last30days；rtk cargo tree -d；CLI help。
+实际现象: 停用源仍参与编译、CLI、Tool 注册、Prompt、角色、权重、依赖和 mock 契约。
+预期现象: Phase 1 仅 analyst.technical 与 analyst.news_macro，固定 50/50；停用源零调度、零 LLM、零 Artifact、零证据状态。
+根因: 业务停用未落实到编译和调度边界。
+修改内容: registry/CLI/config/contracts 固定两角色 50/50；SQLite 仅保留旧表 DROP 迁移以清理已有库。
+删除内容: social/wayinvideo/youtube ingest 模块；3 个外部抓取 tools；reddit/x/youtube prompts；相关环境检查、配置、测试和 decrypt-cookies/scraper/twikit/urlencoding 等依赖。
+验证命令: rtk rg 停用关键词；rtk cargo metadata；rtk cargo tree -d；全 workspace 门禁。
+验证结果: 已解决；运行代码零引用，唯一残留是 README 明确声明和 schema 的遗留表 DROP；直接依赖 28→24、依赖边 77→57。
+是否解决: 是。
+回归风险: 无；重新启用需作为独立明确功能重新引入。
+
+2026-07-22T13:10:30+08:00 | P2 | Agent/Phase 瘦身 | crates/orchestrator-workflow/src/exec/mod.rs, allocation.rs, policy.rs, role_jobs.rs, prompts
+复现命令: 追踪 phase role jobs、Artifact consumers、Prompt renderer 和 selective policy tests。
+实际现象: Topic Generator 只改写冲突，Bull/Bear 有 warmup，Reducer/Allocation 有重复 LLM 表达，Risk 有三角色，default Judge 为每个 turn 再调用一次模型，低冲突仍可生成 fallback topic。
+预期现象: Rust 完成确定性生成/校验；只有语义冲突、真实风险或跨 ticker 约束触发 LLM。
+根因: 阶段按角色拆分而非按信息增量拆分。
+修改内容: Rust topic generation/conflict gate/reducer/trader mapping/allocation guardrails；Debate、单一 Risk reviewer、Portfolio review 条件触发；Reflection 保持主决策后非 LLM 归档；Judge 默认关闭。
+删除内容: Topic Generator LLM、Bull/Bear warmup、Allocation LLM、risk aggressive/neutral、Reducer LLM 残留、无冲突 fallback topic、零权重插件 Analyst 兼容分支及无用 prompts。
+验证命令: rtk cargo test -p orchestrator-workflow；mock integration 仅验证分支结构；全量门禁。
+验证结果: 已解决；无冲突低风险结构最少 LLM 请求由原多阶段链降为 Technical + News + Research Manager 共 3 次；条件分支按信号增加请求。
+是否解决: 是。
+回归风险: Debate 触发阈值改变决策成本，已有 conflict/policy tests 锁定。
+
+2026-07-22T13:10:30+08:00 | P2 | Prompt/代码/二进制体积 | workspace
+复现命令: rg/wc 统计；orchestrator-prompt-lint --strict；rtk cargo build --release --workspace；ls -lh target/release。
+实际现象: 基线 Rust 101 文件/48,048 行、Prompt 124,228 字符、exec 22.8M、ingest 11.6M。
+预期现象: 删除重复规则和停用实现，同时保持 schema 与占位符完整。
+根因: 多版 debate prompts、重复 analyst 规则、两个不在 workspace 的孤儿 crate 和停用抓取依赖。
+修改内容: 合并 Bull/Bear 为单一参数化 debate prompt；重写 Technical/News/Research Manager prompt；统一 reqwest 0.13；修复 prompt lint placeholder map。
+删除内容: 14 个 Rust 文件（含孤儿 orchestrator-report/eval）、多版 researcher/risk/allocation/topic prompts及约 10k 净代码行。
+验证命令: prompt lint --strict；release build；全 workspace tests/clippy。
+验证结果: 已解决；Rust 87 文件/约42,781行；Prompt 43,849字符；exec 18.2M、ingest 8.5M；prompt lint 16 files, 0 error/0 warning。
+是否解决: 是。
+回归风险: Prompt 更短但契约占位符与严格 lint、测试均通过；真实模型质量仍需有密钥环境跑测。
+
+2026-07-22T13:10:30+08:00 | P1 | 最终外部阻塞 | real LLM end-to-end
+复现命令: 检查 LLM_GATEWAY_API_KEY/LLM_GATEWAY_BASE_URL/EXA_API_KEY 环境并运行真实非 mock orchestrator-exec。
+实际现象: 当前环境三个凭据变量均未设置；系统在 config boundary 明确失败。
+预期现象: 使用真实 provider 完成 Technical、News、条件 Debate/Risk、Research、Portfolio、Allocation、Reflection/Memory。
+根因: 外部授权条件缺失，不是代码降级可安全替代的问题。
+修改内容: 完成明确、早失败的诊断；真实 Yahoo/Jin10 与所有离线/确定性路径已验证。
+删除内容: 不使用 mock/fake/default probability 替代。
+验证命令: 真实非 mock orchestrator-exec（exit 1，requires api_key）。
+验证结果: 未完成真实 LLM 核心端到端；未宣称成功。
+是否解决: 否，受外部凭据阻塞。
+回归风险: 不影响数据摄取、编译、测试和确定性 guardrails；影响所有真实 LLM phases，因而阻止完整流程完成声明。
+
+2026-07-22T12:09:33+08:00 | P1 | Phase 4-7 条件策略 | crates/orchestrator-cli/tests/mock_exec.rs
+复现命令: rtk cargo test --workspace --all-features
+实际现象: 415 个测试中集成测试 2 个失败；实际策略在高相关/组合条件下执行 portfolio review，旧断言仍预期 derived/skip。
+预期现象: 测试契约应与条件策略的实际触发原因一致，并锁定跨 ticker 风险会触发 portfolio review。
+根因: 条件策略实现与集成测试期望漂移；单元策略测试已明确 HighCorrelation 会触发 portfolio review。
+修改内容: 待在完成当前架构精简后更新端到端契约断言，不以 mock 作为真实流程成功证据。
+删除内容: 无。
+验证命令: 待重新执行目标测试和完整测试。
+验证结果: 根因已定位，未修复。
+回归风险: 中；需保证只在跨 ticker/组合约束触发 Portfolio Manager。
+
+2026-07-22T12:09:33+08:00 | P2 | 停用数据源 | workspace/CLI/prompts/config
+复现命令: 全仓库搜索 youtube/reddit/x/social/wayinvideo，并运行 orchestrator-exec 与 orchestrator-ingest --help。
+实际现象: 停用源仍有 ingest 模块、LLM tools、Prompt、CLI 命令、Phase 1 权重参数、角色默认配置和依赖；默认 mock 测试甚至期望五个 Phase 1 Agent。
+预期现象: 主流程和编译边界只保留 Yahoo technical 与 Jin10 news_macro；停用源不产生状态、Prompt、Tool 或 LLM 调用。
+根因: 数据源仅在业务约定中停用，代码未完成删除。
+修改内容: 待在引用图核对后删除。
+删除内容: 待删除对应模块、工具、Prompt、配置、测试契约和只为停用源存在的依赖。
+验证命令: 待执行 rg 零引用检查、cargo tree、CLI help、完整测试和真实数据流程。
+验证结果: 未解决（已确认完整触发面）。
+回归风险: 中；需保留 Yahoo/Jin10 严格 SQLite 主路径。
+
+2026-07-22T12:09:33+08:00 | P2 | 基线指标 | workspace
+复现命令: cargo metadata、源文件/行数/Prompt 字符统计、cargo tree -d。
+实际现象: Rust 约 48,048 行；Prompt 124,228 字符；workspace 6 个 crate；直接外部依赖 28 个；测试 415 个。twikit/decrypt-cookies 引入 reqwest 多版本、SQLx/SeaORM/Boa 等大依赖树。
+预期现象: 删除停用源后依赖、源码、Prompt、二进制和编译负担显著下降。
+根因: X/浏览器 cookie/社交抓取仍参与正式依赖。
+修改内容: 待精简。
+删除内容: 待核对。
+验证命令: 待在修改后重复相同统计、release 构建和 cargo tree -d。
+验证结果: 已记录修改前基线。
+回归风险: 低。
+
+2026-07-22T13:15:00+08:00 | P1 | 最终验证闭环 | workspace, SQLite WAL
+复现命令: rtk cargo fmt --all -- --check；rtk cargo check --workspace --all-targets；rtk cargo clippy --workspace --all-targets --all-features -- -D warnings；rtk cargo test --workspace --all-features；prompt lint --strict；release build；隔离库 schema 查询。
+实际现象: 所有质量门禁通过；隔离 SQLite 为 WAL、13 张当前业务表，停用源表数量 0；busy_timeout 是 connection-local，新增同连接断言验证 5000ms 和 foreign_keys=ON。
+预期现象: 零格式差异、零编译/Clippy warning、全测试通过、Prompt 零告警、release 可构建、WAL/timeout/foreign keys 明确受测。
+根因: 最后一轮检查曾暴露不可达 helper warning，以及外部 sqlite3 新连接不会继承 connection-local busy_timeout，原测试未锁定 pragma。
+修改内容: 删除不可达 helper；增加同连接 WAL/busy_timeout/foreign_keys 回归断言；重跑全量闭环。
+删除内容: 最后一处零权重 Analyst 兼容分支和相应死测试。
+验证命令: 上述命令。
+验证结果: 416 tests / 23 suites；Clippy No issues；prompt lint 16 files, 0 errors/0 warnings；release 完成；exec 18.2M、ingest 8.5M。
+是否解决: 是（真实 LLM E2E 仍由上一条外部凭据阻塞说明约束）。
+回归风险: 低；所有本地可验证路径均已覆盖，未以 mock 声称真实流程成功。
+
+2026-07-22T13:33:57+08:00 | P0 | 严格 SQLite 输入边界 | crates/orchestrator-{workflow,llm,sql}/src, orchestrator-ingest CLI
+复现命令: 搜索 live 路径中的 read_technical_csv/read_jin10_csv/default_*_csv_dir；追踪 Phase 1 Tool、Allocation、Reflection 和 outcome 查询。
+实际现象: 名为 read_*_csv 的 LLM Tool、Allocation VIX/相关性、Memory regime 与 outcome scoring 确实直接读取 outputs CSV；Jin10 preflight 的 Connection 参数未使用。模型还可调用 fetch_jin10_flash/run_technical_indicators 绕过确定性 preflight。
+预期现象: CSV/网络仅作为 Rust ingestion 边界；live Agent 和所有下游阶段只读同一个 SQLite WAL run database。
+根因: 技术序列曾被从旧 row-per-feature 表迁到 CSV，但没有建立紧凑 SQLite snapshot；两套读取路径长期并存。
+修改内容: 新增 technical_series（每 ticker/interval 单行 rows_json）；Yahoo preflight/CLI 导入 9 个紧凑 series，Jin10 直接导入 jin10_items；Tool 改名 read_technical_context/read_jin10_context 并只接受 ExternalToolConfig.db_path；Allocation/Reflection/outcome/context 全部改读 SQLite；增加 Tool/pragma/import 回归测试。
+删除内容: LLM fetch_jin10_flash、run_technical_indicators Tool 及 orchestrator-llm→orchestrator-ingest 依赖；live Jin10 CSV 写读路径；下游 technical CSV fallback；旧 CSV Tool API 名。
+验证命令: 真实 Yahoo `orchestrator-ingest --db-path <isolated> technical-indicators --symbols QQQ,SOXX,VIX --intervals 1d,3h,20min`；真实 Jin10 同库导入；orchestrator-sql get-technical-context/get-jin10-context；SQLite 查询；全量 fmt/check/clippy/tests/prompt lint/release。
+验证结果: 已解决；真实 SQLite technical_series=9/477 rows，Jin10=92 rows，空内容=0；technical context 三个 interval 各覆盖 3 ticker；WAL；停用源表=0；416 tests，0 Clippy/prompt warning。
+是否解决: 是。
+回归风险: SQLite 每次技术导入仅 9 次 upsert 而非逐 bar 写 477 次；rows_json 受现有 60-bar ingest 上限约束。
+
+2026-07-22T13:33:57+08:00 | P2 | 最终瘦身指标修订 | workspace
+复现命令: rg/wc、cargo metadata、cargo tree -d、release build、git diff --shortstat。
+实际现象: 严格 SQLite 修复新增一个紧凑 store，但同时删除两个联网 LLM Tool 和两条读取体系。
+预期现象: 修复数据一致性后仍保持相对基线的净瘦身。
+根因: 早先指标记录发生在严格 SQLite 边界修复前。
+修改内容: 更新最终测量。
+删除内容: 见上一条及停用源/Agent 记录。
+验证命令: 同上。
+验证结果: Rust 101→86 文件、48,048→42,610 行；Prompt 31→17 文件、124,228→43,863 字符；外部直接依赖 28→24、依赖边 77→57；exec 22.8M→18.0M，ingest 11.6M→10.4M；diff 82 files, +1731/-12042。
+是否解决: 是。
+回归风险: 低。
+
+2026-07-22T13:39:00+08:00 | P3 | 日志收口 | debug.log
+复现命令: rtk tail debug.log；最终 git diff --check。
+实际现象: 所有问题记录、真实数据证据、外部 LLM 凭据阻塞和最终门禁结果均已写入；早期“待修复”基线记录保留，后续记录给出解决状态。
+预期现象: 不覆盖历史，保留完整 Inspect→Fix→Verify 轨迹且不含密钥/Authorization/Cookie。
+根因: 不适用。
+修改内容: 追加最终收口记录。
+删除内容: 无。
+验证命令: tail/rg/debug log 审阅。
+验证结果: 完成；无敏感凭据写入。
+是否解决: 是。
+回归风险: 无。
+
+2026-07-22T13:44:00+08:00 | P1 | 重试退避与最终门禁 | crates/orchestrator-llm/src/lib.rs, crates/orchestrator-workflow/src/orchestration/role_jobs.rs
+复现命令: 检查 stream/role retry 分类、上限、退避和可调用 Tool 副作用；运行最终全门禁。
+实际现象: stream 最多 5 次、role 最多 3 次且永久错误不重试，但退避无 jitter；旧联网/写入 Tool 删除后当前模型 Tool 全为只读。
+预期现象: 临时错误有限指数/线性退避并分散并发重试；永久错误立即失败；重试不重复副作用。
+根因: 退避实现缺少分散项。
+修改内容: 添加按 role+attempt 计算的 0-250ms jitter，不引入新依赖。
+删除内容: 无。
+验证命令: fmt/check/clippy --all-features -D warnings/test --all-features/prompt lint --strict/release build/git diff --check。
+验证结果: 416 tests / 23 suites；0 Clippy/prompt issue；release 成功；最终 Rust 86 文件/42,656 行，Prompt 43,863 字符，diff +1788/-12053。
+是否解决: 是。
+回归风险: 低。
