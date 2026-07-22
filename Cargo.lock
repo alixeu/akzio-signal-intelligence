@@ -1304,6 +1304,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "dotenvy",
+ "md-5",
  "regex",
  "schemars",
  "serde",

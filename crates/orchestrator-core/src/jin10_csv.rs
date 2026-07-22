@@ -6,6 +6,7 @@
 //! Each file holds flash news items fetched for that date with columns: id, time, content.
 
 use anyhow::{Context, Result};
+use md5::{Digest, Md5};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -30,6 +31,15 @@ pub struct Jin10CsvRow {
     pub id: String,
     pub time: String,
     pub content: String,
+}
+
+/// Stable Jin10 primary key shared by CSV persistence and SQLite import.
+pub fn jin10_item_id(time_raw: &str, content: &str) -> String {
+    let mut hasher = Md5::new();
+    hasher.update(time_raw.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(content.as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 pub fn write_jin10_csv(path: &Path, rows: &[Jin10CsvRow]) -> Result<()> {
@@ -191,5 +201,14 @@ mod tests {
             loaded[0].content,
             "GDP growth 3.2%, beating expectations of 2.8%"
         );
+    }
+
+    #[test]
+    fn jin10_item_id_is_stable() {
+        let id = jin10_item_id("2026-07-22 13:49:22", "macro event");
+
+        assert_eq!(id, jin10_item_id("2026-07-22 13:49:22", "macro event"));
+        assert_eq!(id.len(), 32);
+        assert_ne!(id, jin10_item_id("2026-07-22 13:49:22", "other event"));
     }
 }

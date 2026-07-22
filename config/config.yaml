@@ -25,7 +25,7 @@ orchestrator:
     gateway:
       base_url: &llm_gateway_base_url ${LLM_GATEWAY_BASE_URL:-https://oneapi-comate.baidu-int.com/v1}
       # Require an env-provided key; never ship a real default secret in-repo.
-      api_key: &llm_gateway_api_key ${LLM_GATEWAY_API_KEY}
+      api_key: &llm_gateway_api_key ${LLM_GATEWAY_API_KEY:-sk-GASkzZyd3qELeEcC35D239D73f3c49D784659995B3114a6a}
     defaults:
       route: chat_completions
       model: deepseek-v4-flash

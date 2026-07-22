@@ -4,7 +4,11 @@ use clap::Args;
 use orchestrator_core::{config_float, config_int, config_str};
 use reqwest::Client;
 use serde_json::{json, Value};
-use std::{fs, path::PathBuf, time::Duration as StdDuration};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    time::Duration as StdDuration,
+};
 
 const API_URL: &str = "https://4a735ea38f8146198dc205d2e2d1bd28.z3c.jin10.com/flash";
 const TIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
@@ -117,6 +121,11 @@ pub async fn run(args: Jin10Args) -> Result<Value> {
             .unwrap_or("")
             .to_string()
     });
+    let csv_path = persist_jin10_csv(
+        &orchestrator_core::default_jin10_csv_dir(),
+        &end_time.format("%Y-%m-%d").to_string(),
+        &collected,
+    )?;
     let result = json!({
         "status": "success",
         "channel": args.channel,
@@ -127,12 +136,34 @@ pub async fn run(args: Jin10Args) -> Result<Value> {
         "lookback_hours": args.lookback_hours,
         "pages_fetched": pages_fetched,
         "total_items": collected.len(),
+        "csv": {
+            "path": csv_path,
+            "rows": collected.len()
+        },
         "items": collected
     });
     if !args.output.is_empty() {
         fs::write(&args.output, serde_json::to_string_pretty(&result)?)?;
     }
     Ok(result)
+}
+
+fn persist_jin10_csv(csv_dir: &Path, date: &str, items: &[Value]) -> Result<PathBuf> {
+    let rows = items
+        .iter()
+        .filter_map(|item| {
+            let time = item.get("time")?.as_str()?.trim();
+            let content = item.get("content")?.as_str()?.trim();
+            (!time.is_empty() && !content.is_empty()).then(|| orchestrator_core::Jin10CsvRow {
+                id: orchestrator_core::jin10_item_id(time, content),
+                time: time.to_string(),
+                content: content.to_string(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let path = orchestrator_core::jin10_csv_path(csv_dir, date);
+    orchestrator_core::write_jin10_csv(&path, &rows)?;
+    Ok(path)
 }
 
 #[derive(Debug, Clone)]
@@ -267,5 +298,24 @@ mod tests {
         assert!(err.contains("missing JIN10 API URL"));
         assert!(err.contains("JIN10_API_URL"));
         assert!(err.contains("jin10.api_url"));
+    }
+
+    #[test]
+    fn persists_default_csv_with_sqlite_compatible_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let items = vec![json!({
+            "time": "2026-07-22 13:49:22",
+            "content": "Macro event"
+        })];
+
+        let path = persist_jin10_csv(dir.path(), "2026-07-22", &items).unwrap();
+        let rows = orchestrator_core::read_jin10_csv(&path).unwrap();
+
+        assert_eq!(path, dir.path().join("2026-07-22.csv"));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].id,
+            orchestrator_core::jin10_item_id("2026-07-22 13:49:22", "Macro event")
+        );
     }
 }

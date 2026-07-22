@@ -1,5 +1,4 @@
 use anyhow::Result;
-use md5::{Digest, Md5};
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 
@@ -143,11 +142,7 @@ pub fn record_jin10_attention_for_turn(
 
 /// Stable Jin10 primary key: md5(time_raw + "\\n" + content).
 pub fn jin10_item_id(time_raw: &str, content: &str) -> String {
-    let mut hasher = Md5::new();
-    hasher.update(time_raw.as_bytes());
-    hasher.update(b"\n");
-    hasher.update(content.as_bytes());
-    format!("{:x}", hasher.finalize())
+    orchestrator_core::jin10_item_id(time_raw, content)
 }
 
 fn parse_jin10_time(s: &str) -> i64 {
