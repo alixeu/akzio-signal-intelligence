@@ -1,1 +1,5 @@
-Previous output failed validation or was incomplete. Re-read the active role prompt and emit exactly one complete final response matching its contract. Do not call tools or add commentary.
+Previous output failed validation or was incomplete. Use the existing evidence to emit one repaired, complete final artifact. Do not call tools, alter valid source IDs, or add commentary.
+
+Expected role: {expected_role}
+Expected tickers: {expected_tickers}
+Validation errors: {validation_errors}

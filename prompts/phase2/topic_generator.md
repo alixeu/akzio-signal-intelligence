@@ -10,7 +10,7 @@
 
 ## 证据边界
 
-- `{phase1_index}` 是唯一事实入口，只能使用其中的 role summaries、冲突、证据质量和 Rust 合成的 `weighted_probability_base`。
+- `{phase1_index}` 是唯一事实入口，只包含 role summaries、证据质量、冲突、缺失证据和 topic candidates；它不包含最终概率，也不授权你形成概率判断。
 - `{prior_phase_summaries}` 只用于查看当前 run 的前序摘要索引。动态区已足够时不要重复调用工具；确需展开时，只能先用 `read_phase_summaries` 获取真实 summary id，再用 `read_phase_summary_details` 展开一条。
 - 禁止读取 raw Jin10、technical、compose_context、research_inputs、raw SQL，禁止补充外部事实。
 - 越新的 `source_phase` / 越高的 `recency_weight` 默认获得更高注意力。
@@ -37,9 +37,7 @@
 - 不输出胜负、概率、rating、交易动作、仓位或风控指令。
 - 没有可辩论 hinge 时允许 `topics=[]`，但仍输出 common ground 和原因摘要。
 
-## 输出契约
-
-只返回一个纯 JSON 对象，禁止 Markdown 围栏和外层 envelope：
+## Artifact 内容
 
 ## 输出大小
 
@@ -55,7 +53,6 @@
 - `summary`：非空字符串
 - `analysis_trace`：遵循公共可审计分析轨迹；即使 `topics=[]` 也必须记录实际证据缺口、替代解释与停止原因
 - `reducer_checks`：必须精确为 `{"from_phase1_index_only":true,"no_new_external_facts":true,"json_valid":true}`。三个值都是 JSON boolean，禁止使用字符串、说明文字或其他值。
-- 输出必须可被标准 JSON parser 直接解析：任何字符串值不得包含实际换行、制表符或其他控制字符；需要换行时写 JSON 转义 `\\n`，但优先保持单行短句。
 
 `actionable`、`status`、`skip_reason` 等运行时 envelope 字段由 Rust 合成，不要自行输出。
 

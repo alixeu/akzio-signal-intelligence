@@ -31,7 +31,7 @@ Rust 先生成候选映射：Buy/Overweight → candidate Buy；Sell/Underweight
 
 ## 输出契约
 
-只返回运行时 `TradeIntent` validator 接受的纯 JSON，并在同一对象顶层加入公共规范要求的 `analysis_trace`；不使用 Markdown 围栏或额外 envelope。
+Artifact 必须满足运行时 `TradeIntent` validator，并在同一对象顶层加入公共规范要求的 `analysis_trace`。
 
 <!-- DYNAMIC SUFFIX (changes every call) -->
 research_plan（唯一市场结论）：

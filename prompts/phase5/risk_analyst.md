@@ -23,4 +23,4 @@
 风险上下文：
 {risk_context}
 
-只返回纯 JSON，包含 `stance, argument, unique_risk_contribution, disagreement_with_prior, no_new_information, recommended_adjustment, stop_type, max_drawdown_pct, position_cap_pct, rebalance_trigger, risk_off_trigger, review_window, cash_hedge_recommendation, constraint_confidence, analysis_trace`。
+Artifact 包含 `stance, argument, unique_risk_contribution, disagreement_with_prior, no_new_information, recommended_adjustment, stop_type, max_drawdown_pct, position_cap_pct, rebalance_trigger, risk_off_trigger, review_window, cash_hedge_recommendation, constraint_confidence, analysis_trace`。

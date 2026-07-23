@@ -396,67 +396,56 @@ where
 
         if let Some(text) = last_assistant_message_text(turn) {
             if turn.role.starts_with("analyst.") {
-                let validation =
-                    analyst_final_artifact_validation_error(&turn.role, &turn_tickers(turn), &text);
-                if let Err(error) = validation {
+                if let Err(error) =
+                    analyst_final_artifact_validation_error(&turn.role, &turn_tickers(turn), &text)
+                {
                     warn!(role = turn.role, error = %error, "analyst final artifact rejected");
-                    turn.tools_disabled = true;
-                    turn.push_pending_input(format!(
-                        "{ARTIFACT_RETRY_INSTRUCTION}\nValidation error: {error}"
-                    ));
-                    turn.needs_follow_up = true;
+                    queue_artifact_retry(turn, &error);
                     persist_turn(conn, turn, &config.truncation)?;
                     continue;
                 }
             }
-            if seed_packet_role(&turn.role)
-                && text.trim() != "准备完毕"
-                && !seed_packet_looks_valid(&turn.role, &text)
-            {
-                turn.tools_disabled = true;
-                turn.push_pending_input(ARTIFACT_RETRY_INSTRUCTION);
-                turn.needs_follow_up = true;
-                persist_turn(conn, turn, &config.truncation)?;
-                continue;
+            if seed_packet_role(&turn.role) && text.trim() != "准备完毕" {
+                if let Err(error) = seed_packet_validation_error(&turn.role, &text) {
+                    queue_artifact_retry(turn, &error);
+                    persist_turn(conn, turn, &config.truncation)?;
+                    continue;
+                }
             }
-            if turn.role == "manager.research"
-                && !research_artifact_looks_valid(&turn_tickers(turn), &text)
-            {
-                turn.tools_disabled = true;
-                turn.push_pending_input(ARTIFACT_RETRY_INSTRUCTION);
-                turn.needs_follow_up = true;
-                persist_turn(conn, turn, &config.truncation)?;
-                continue;
+            if turn.role == "manager.research" {
+                if let Err(error) = research_artifact_validation_error(&turn_tickers(turn), &text) {
+                    queue_artifact_retry(turn, &error);
+                    persist_turn(conn, turn, &config.truncation)?;
+                    continue;
+                }
             }
-            if turn.role == "trader" && !trade_intent_looks_valid(&text) {
-                turn.tools_disabled = true;
-                turn.push_pending_input(ARTIFACT_RETRY_INSTRUCTION);
-                turn.needs_follow_up = true;
-                persist_turn(conn, turn, &config.truncation)?;
-                continue;
+            if turn.role == "trader" {
+                if let Err(error) = trade_intent_validation_error(&text) {
+                    queue_artifact_retry(turn, &error);
+                    persist_turn(conn, turn, &config.truncation)?;
+                    continue;
+                }
             }
-            if turn.role.starts_with("risk.") && !risk_constraints_look_valid(&turn.role, &text) {
-                turn.tools_disabled = true;
-                turn.push_pending_input(ARTIFACT_RETRY_INSTRUCTION);
-                turn.needs_follow_up = true;
-                persist_turn(conn, turn, &config.truncation)?;
-                continue;
+            if turn.role.starts_with("risk.") {
+                if let Err(error) = risk_constraints_validation_error(&turn.role, &text) {
+                    queue_artifact_retry(turn, &error);
+                    persist_turn(conn, turn, &config.truncation)?;
+                    continue;
+                }
             }
-            if interaction_packet_role(&turn.role)
-                && !interaction_packet_looks_valid(&turn.role, &text)
-            {
-                turn.tools_disabled = true;
-                turn.push_pending_input(ARTIFACT_RETRY_INSTRUCTION);
-                turn.needs_follow_up = true;
-                persist_turn(conn, turn, &config.truncation)?;
-                continue;
+            if interaction_packet_role(&turn.role) {
+                if let Err(error) = interaction_packet_validation_error(&turn.role, &text) {
+                    queue_artifact_retry(turn, &error);
+                    persist_turn(conn, turn, &config.truncation)?;
+                    continue;
+                }
             }
-            if turn.role == "mediator.topic_controller" && !controller_packet_looks_valid(&text) {
-                turn.tools_disabled = true;
-                turn.push_pending_input(ARTIFACT_RETRY_INSTRUCTION);
-                turn.needs_follow_up = true;
-                persist_turn(conn, turn, &config.truncation)?;
-                continue;
+            if turn.role == "mediator.topic_controller" {
+                if let Err(error) = controller_packet_validation_error(&text) {
+                    queue_artifact_retry(turn, &error);
+                    persist_turn(conn, turn, &config.truncation)?;
+                    continue;
+                }
             }
         }
 
@@ -1405,10 +1394,33 @@ fn seed_packet_role(role: &str) -> bool {
     matches!(role, "researcher.bull.initial" | "researcher.bear.initial")
 }
 
-fn seed_packet_looks_valid(role: &str, text: &str) -> bool {
-    let Ok(value) = extract_json_value(text) else {
-        return false;
+fn queue_artifact_retry(turn: &mut Turn, validation_error: &str) {
+    let tickers = turn_tickers(turn);
+    let expected_tickers = if tickers.is_empty() {
+        "[]".to_string()
+    } else {
+        tickers.join(", ")
     };
+    turn.tools_disabled = true;
+    turn.push_pending_input(
+        ARTIFACT_RETRY_INSTRUCTION
+            .replace("{expected_role}", &turn.role)
+            .replace("{expected_tickers}", &expected_tickers)
+            .replace(
+                "{validation_errors}",
+                &truncate_chars(validation_error, 2_000),
+            ),
+    );
+    turn.needs_follow_up = true;
+}
+
+#[cfg(test)]
+fn seed_packet_looks_valid(role: &str, text: &str) -> bool {
+    seed_packet_validation_error(role, text).is_ok()
+}
+
+fn seed_packet_validation_error(role: &str, text: &str) -> std::result::Result<(), String> {
+    let value = artifact_json(text)?;
     let expected = if role.contains("bear") {
         "bear_seed_packet"
     } else {
@@ -1419,138 +1431,215 @@ fn seed_packet_looks_valid(role: &str, text: &str) -> bool {
     } else {
         "known_bear_constraint"
     };
-    value.get("role").and_then(Value::as_str) == Some(role)
-        && value.get("artifact_type").and_then(Value::as_str) == Some(expected)
-        && value
-            .get("claims")
-            .and_then(Value::as_array)
-            .is_some_and(|claims| {
-                !claims.is_empty()
-                    && claims.iter().all(|claim| {
-                        non_empty_string_field(claim, "claim_id")
-                            && non_empty_string_field(claim, "decision_hinge")
-                            && non_empty_string_field(claim, "claim")
-                            && claim
-                                .get("evidence_refs")
-                                .and_then(Value::as_array)
-                                .is_some()
-                            && claim
-                                .get("confidence")
-                                .and_then(Value::as_f64)
-                                .is_some_and(|confidence| (0.0..=1.0).contains(&confidence))
-                            && non_empty_string_field(claim, constraint_field)
-                            && claim
-                                .get("needs_mediator_check")
-                                .and_then(Value::as_bool)
-                                .is_some()
-                    })
-            })
-        && value
-            .get("topic_id")
-            .and_then(Value::as_str)
-            .is_some_and(|topic| !topic.trim().is_empty())
-        && non_empty_string_field(&value, "summary")
-        && value
-            .get("reducer_checks")
-            .and_then(Value::as_object)
-            .is_some()
+    require_equal_string(&value, "role", role)?;
+    require_equal_string(&value, "artifact_type", expected)?;
+    require_non_empty_string(&value, "topic_id")?;
+    let claims = require_array(&value, "claims")?;
+    if !(1..=2).contains(&claims.len()) {
+        return Err("claims must contain 1-2 items".to_string());
+    }
+    for (index, claim) in claims.iter().enumerate() {
+        let path = format!("claims[{index}]");
+        require_non_empty_string_at(claim, &path, "claim_id")?;
+        require_non_empty_string_at(claim, &path, "decision_hinge")?;
+        require_non_empty_string_at(claim, &path, "claim")?;
+        require_array_at(claim, &path, "evidence_refs")?;
+        require_probability_at(claim, &path, "confidence")?;
+        require_non_empty_string_at(claim, &path, constraint_field)?;
+        if claim
+            .get("needs_mediator_check")
+            .and_then(Value::as_bool)
+            .is_none()
+        {
+            return Err(format!("{path}.needs_mediator_check must be boolean"));
+        }
+    }
+    require_non_empty_string(&value, "summary")?;
+    require_object(&value, "reducer_checks")?;
+    Ok(())
 }
 
 fn interaction_packet_role(role: &str) -> bool {
     role.contains(".interaction")
 }
 
+#[cfg(test)]
 fn interaction_packet_looks_valid(role: &str, text: &str) -> bool {
-    let Ok(value) = extract_json_value(text) else {
-        return false;
-    };
+    interaction_packet_validation_error(role, text).is_ok()
+}
+
+fn interaction_packet_validation_error(role: &str, text: &str) -> std::result::Result<(), String> {
+    let value = artifact_json(text)?;
     let expected_type = if role == "researcher.bull.interaction" {
         "bull_debate_packet"
     } else if role == "researcher.bear.interaction" {
         "bear_debate_packet"
     } else {
-        return false;
+        return Err(format!("unsupported interaction role {role}"));
     };
-    !assistant_message_needs_follow_up(text)
-        && value.get("role").and_then(Value::as_str) == Some(role)
-        && value.get("artifact_type").and_then(Value::as_str) == Some(expected_type)
-        && non_empty_string_field(&value, "topic_id")
-        && non_empty_string_field(&value, "reply_to_claim_id")
-        && non_empty_string_field(&value, "steer_id")
-        && value
-            .get("stance")
-            .and_then(Value::as_str)
-            .is_some_and(|stance| {
-                matches!(
-                    stance,
-                    "accept" | "rebut" | "downgrade" | "needs_evidence" | "no_new_info"
-                )
-            })
-        && non_empty_string_field(&value, "claim")
-        && value
-            .get("evidence_refs")
-            .and_then(Value::as_array)
-            .is_some()
-        && value
-            .get("confidence")
-            .and_then(Value::as_f64)
-            .is_some_and(|confidence| (0.0..=1.0).contains(&confidence))
-        && non_empty_string_field(&value, "send_to_mediator")
-        && value.get("blocked_ack").and_then(Value::as_array).is_some()
-        && (value.get("stance").and_then(Value::as_str) == Some("no_new_info")
-            || value.get("steelman").and_then(Value::as_object).is_some())
+    if assistant_message_needs_follow_up(text) {
+        return Err("response is still a planning or waiting message".to_string());
+    }
+    require_equal_string(&value, "role", role)?;
+    require_equal_string(&value, "artifact_type", expected_type)?;
+    for field in [
+        "topic_id",
+        "reply_to_claim_id",
+        "steer_id",
+        "claim",
+        "send_to_mediator",
+    ] {
+        require_non_empty_string(&value, field)?;
+    }
+    let stance = value
+        .get("stance")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "stance must be a string".to_string())?;
+    if !matches!(
+        stance,
+        "accept" | "rebut" | "downgrade" | "needs_evidence" | "no_new_info"
+    ) {
+        return Err(
+            "stance must be accept, rebut, downgrade, needs_evidence, or no_new_info".to_string(),
+        );
+    }
+    require_array(&value, "evidence_refs")?;
+    require_probability(&value, "confidence")?;
+    require_array(&value, "blocked_ack")?;
+    if stance != "no_new_info" {
+        require_object(&value, "steelman")?;
+    }
+    Ok(())
 }
 
+#[cfg(test)]
 fn controller_packet_looks_valid(text: &str) -> bool {
-    let Ok(value) = extract_json_value(text) else {
-        return false;
-    };
-    !assistant_message_needs_follow_up(text)
-        && value.get("role").and_then(Value::as_str) == Some("mediator.topic_controller")
-        && value.get("artifact_type").and_then(Value::as_str) == Some("topic_controller_packet")
-        && non_empty_string_field(&value, "topic_id")
-        && [
-            "claim_ledger",
-            "accepted_for_opponent",
-            "rejected_to_origin",
-            "blocked_claims",
-            "agreed_facts",
-            "decision_hinges",
-        ]
-        .iter()
-        .all(|field| value.get(*field).and_then(Value::as_array).is_some())
-        && ["next_steers", "topic_summary_delta", "reducer_checks"]
-            .iter()
-            .all(|field| value.get(*field).and_then(Value::as_object).is_some())
-        && value
-            .get("decision_hinges")
-            .and_then(Value::as_array)
-            .is_some_and(|hinges| {
-                hinges.iter().all(|hinge| {
-                    non_empty_string_field(hinge, "hinge")
-                        && hinge
-                            .get("evidence_refs")
-                            .and_then(Value::as_array)
-                            .is_some_and(|refs| !refs.is_empty())
-                })
-            })
-        && value
-            .get("info_gain_score")
-            .and_then(Value::as_f64)
-            .is_some_and(|score| (0.0..=1.0).contains(&score))
-        && value
-            .get("soft_control")
-            .and_then(Value::as_object)
-            .is_some_and(|soft_control| {
-                soft_control
-                    .get("should_continue")
-                    .and_then(Value::as_bool)
-                    .is_some()
-                    && soft_control
-                        .get("stop_reason")
-                        .and_then(Value::as_str)
-                        .is_some_and(|reason| !reason.trim().is_empty())
-            })
+    controller_packet_validation_error(text).is_ok()
+}
+
+fn controller_packet_validation_error(text: &str) -> std::result::Result<(), String> {
+    let value = artifact_json(text)?;
+    if assistant_message_needs_follow_up(text) {
+        return Err("response is still a planning or waiting message".to_string());
+    }
+    require_equal_string(&value, "role", "mediator.topic_controller")?;
+    require_equal_string(&value, "artifact_type", "topic_controller_packet")?;
+    require_non_empty_string(&value, "topic_id")?;
+    for field in [
+        "claim_ledger",
+        "accepted_for_opponent",
+        "rejected_to_origin",
+        "blocked_claims",
+        "agreed_facts",
+        "decision_hinges",
+    ] {
+        require_array(&value, field)?;
+    }
+    for field in ["next_steers", "topic_summary_delta", "reducer_checks"] {
+        require_object(&value, field)?;
+    }
+    for (index, hinge) in require_array(&value, "decision_hinges")?.iter().enumerate() {
+        let path = format!("decision_hinges[{index}]");
+        require_non_empty_string_at(hinge, &path, "hinge")?;
+        if require_array_at(hinge, &path, "evidence_refs")?.is_empty() {
+            return Err(format!("{path}.evidence_refs must not be empty"));
+        }
+    }
+    require_probability(&value, "info_gain_score")?;
+    let soft_control = value
+        .get("soft_control")
+        .ok_or_else(|| "soft_control must be an object".to_string())?;
+    if soft_control
+        .get("should_continue")
+        .and_then(Value::as_bool)
+        .is_none()
+    {
+        return Err("soft_control.should_continue must be boolean".to_string());
+    }
+    require_non_empty_string_at(soft_control, "soft_control", "stop_reason")?;
+    Ok(())
+}
+
+fn artifact_json(text: &str) -> std::result::Result<Value, String> {
+    extract_json_value(text).map_err(|error| format!("JSON artifact: {error:#}"))
+}
+
+fn require_equal_string(
+    value: &Value,
+    field: &str,
+    expected: &str,
+) -> std::result::Result<(), String> {
+    if value.get(field).and_then(Value::as_str) == Some(expected) {
+        Ok(())
+    } else {
+        Err(format!("{field} must equal {expected}"))
+    }
+}
+
+fn require_non_empty_string(value: &Value, field: &str) -> std::result::Result<(), String> {
+    require_non_empty_string_at(value, "", field)
+}
+
+fn require_non_empty_string_at(
+    value: &Value,
+    path: &str,
+    field: &str,
+) -> std::result::Result<(), String> {
+    if non_empty_string_field(value, field) {
+        Ok(())
+    } else if path.is_empty() {
+        Err(format!("{field} must be a non-empty string"))
+    } else {
+        Err(format!("{path}.{field} must be a non-empty string"))
+    }
+}
+
+fn require_array<'a>(value: &'a Value, field: &str) -> std::result::Result<&'a Vec<Value>, String> {
+    require_array_at(value, "", field)
+}
+
+fn require_array_at<'a>(
+    value: &'a Value,
+    path: &str,
+    field: &str,
+) -> std::result::Result<&'a Vec<Value>, String> {
+    value.get(field).and_then(Value::as_array).ok_or_else(|| {
+        if path.is_empty() {
+            format!("{field} must be an array")
+        } else {
+            format!("{path}.{field} must be an array")
+        }
+    })
+}
+
+fn require_object(value: &Value, field: &str) -> std::result::Result<(), String> {
+    value
+        .get(field)
+        .and_then(Value::as_object)
+        .map(|_| ())
+        .ok_or_else(|| format!("{field} must be an object"))
+}
+
+fn require_probability(value: &Value, field: &str) -> std::result::Result<(), String> {
+    require_probability_at(value, "", field)
+}
+
+fn require_probability_at(
+    value: &Value,
+    path: &str,
+    field: &str,
+) -> std::result::Result<(), String> {
+    if value
+        .get(field)
+        .and_then(Value::as_f64)
+        .is_some_and(|number| (0.0..=1.0).contains(&number))
+    {
+        Ok(())
+    } else if path.is_empty() {
+        Err(format!("{field} must be a number in [0, 1]"))
+    } else {
+        Err(format!("{path}.{field} must be a number in [0, 1]"))
+    }
 }
 
 fn non_empty_string_field(value: &Value, field: &str) -> bool {
@@ -1560,29 +1649,41 @@ fn non_empty_string_field(value: &Value, field: &str) -> bool {
         .is_some_and(|field| !field.trim().is_empty())
 }
 
-fn trade_intent_looks_valid(text: &str) -> bool {
-    let Ok(value) = extract_json_value(text) else {
-        return false;
-    };
-    if trade_intent_entry_valid(&value) {
-        return true;
+fn trade_intent_validation_error(text: &str) -> std::result::Result<(), String> {
+    let value = artifact_json(text)?;
+    if value.get("per_ticker").and_then(Value::as_object).is_some() {
+        let per_ticker = value["per_ticker"].as_object().expect("checked object");
+        let mut errors = Vec::new();
+        for (ticker, entry) in per_ticker {
+            match trade_intent_entry_validation_error(entry) {
+                Ok(()) => return Ok(()),
+                Err(error) => errors.push(format!("per_ticker.{ticker}: {error}")),
+            }
+        }
+        return Err(errors
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| "per_ticker must contain a trade intent".to_string()));
     }
-    if let Some(per_ticker) = value.get("per_ticker").and_then(Value::as_object) {
-        return per_ticker.values().any(trade_intent_entry_valid);
-    }
-    false
+    trade_intent_entry_validation_error(&value)
 }
 
-fn trade_intent_entry_valid(value: &Value) -> bool {
+fn trade_intent_entry_validation_error(value: &Value) -> std::result::Result<(), String> {
     let action = value.get("action").and_then(Value::as_str);
     let position_cap = value
         .get("position_size")
         .and_then(Value::as_str)
         .and_then(position_upper_bound);
-    matches!(action, Some("Buy" | "Sell" | "Hold"))
-        && position_cap.is_some()
-        && !(action == Some("Hold") && position_cap.is_some_and(|cap| cap > f64::EPSILON))
-        && non_empty_string_field(value, "rationale")
+    if !matches!(action, Some("Buy" | "Sell" | "Hold")) {
+        return Err("action must be Buy, Sell, or Hold".to_string());
+    }
+    if position_cap.is_none() {
+        return Err("position_size must contain a percentage range".to_string());
+    }
+    if action == Some("Hold") && position_cap.is_some_and(|cap| cap > f64::EPSILON) {
+        return Err("Hold requires a zero position_size".to_string());
+    }
+    require_non_empty_string(value, "rationale")
 }
 
 fn position_upper_bound(value: &str) -> Option<f64> {
@@ -1597,60 +1698,71 @@ fn position_upper_bound(value: &str) -> Option<f64> {
         .max_by(f64::total_cmp)
 }
 
+#[cfg(test)]
 fn risk_constraints_look_valid(role: &str, text: &str) -> bool {
-    let Ok(value) = extract_json_value(text) else {
-        return false;
-    };
-    let expected_stance = role.strip_prefix("risk.").unwrap_or_default();
-    value.get("stance").and_then(Value::as_str) == Some(expected_stance)
-        && non_empty_string_field(&value, "argument")
-        && (non_empty_string_field(&value, "unique_risk_contribution")
-            || value.get("no_new_information").and_then(Value::as_bool) == Some(true))
-        && non_empty_string_field(&value, "disagreement_with_prior")
-        && non_empty_string_field(&value, "recommended_adjustment")
-        && value
-            .get("stop_type")
-            .and_then(Value::as_str)
-            .is_some_and(|stop_type| {
-                matches!(
-                    stop_type,
-                    "none" | "tight" | "trailing" | "event_based" | "time_based"
-                )
-            })
-        && [
-            "max_drawdown_pct",
-            "position_cap_pct",
-            "constraint_confidence",
-        ]
-        .iter()
-        .all(|field| {
-            value
-                .get(*field)
-                .and_then(Value::as_f64)
-                .is_some_and(|number| (0.0..=1.0).contains(&number))
-        })
-        && [
-            "rebalance_trigger",
-            "risk_off_trigger",
-            "review_window",
-            "cash_hedge_recommendation",
-        ]
-        .iter()
-        .all(|field| non_empty_string_field(&value, field))
+    risk_constraints_validation_error(role, text).is_ok()
 }
 
+fn risk_constraints_validation_error(role: &str, text: &str) -> std::result::Result<(), String> {
+    let value = artifact_json(text)?;
+    let expected_stance = role.strip_prefix("risk.").unwrap_or_default();
+    require_equal_string(&value, "stance", expected_stance)?;
+    require_non_empty_string(&value, "argument")?;
+    if !non_empty_string_field(&value, "unique_risk_contribution")
+        && value.get("no_new_information").and_then(Value::as_bool) != Some(true)
+    {
+        return Err(
+            "unique_risk_contribution must be non-empty unless no_new_information is true"
+                .to_string(),
+        );
+    }
+    for field in ["disagreement_with_prior", "recommended_adjustment"] {
+        require_non_empty_string(&value, field)?;
+    }
+    let stop_type = value
+        .get("stop_type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "stop_type must be a string".to_string())?;
+    if !matches!(
+        stop_type,
+        "none" | "tight" | "trailing" | "event_based" | "time_based"
+    ) {
+        return Err("stop_type is not a supported value".to_string());
+    }
+    for field in [
+        "max_drawdown_pct",
+        "position_cap_pct",
+        "constraint_confidence",
+    ] {
+        require_probability(&value, field)?;
+    }
+    for field in [
+        "rebalance_trigger",
+        "risk_off_trigger",
+        "review_window",
+        "cash_hedge_recommendation",
+    ] {
+        require_non_empty_string(&value, field)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn research_artifact_looks_valid(tickers: &[String], text: &str) -> bool {
-    let Ok(value) = extract_json_value(text) else {
-        return false;
-    };
-    let Ok(normalized) = orchestrator_core::normalize_research_artifact_value(value, &[]) else {
-        return false;
-    };
-    let Ok(artifact) = serde_json::from_value::<orchestrator_core::ResearchArtifact>(normalized)
-    else {
-        return false;
-    };
-    orchestrator_core::validate_research_artifact(&artifact, tickers).is_ok()
+    research_artifact_validation_error(tickers, text).is_ok()
+}
+
+fn research_artifact_validation_error(
+    tickers: &[String],
+    text: &str,
+) -> std::result::Result<(), String> {
+    let value = artifact_json(text)?;
+    let normalized = orchestrator_core::normalize_research_artifact_value(value, &[])
+        .map_err(|error| format!("research artifact normalization: {error:#}"))?;
+    let artifact = serde_json::from_value::<orchestrator_core::ResearchArtifact>(normalized)
+        .map_err(|error| format!("research artifact schema: {error}"))?;
+    orchestrator_core::validate_research_artifact(&artifact, tickers)
+        .map_err(|error| format!("research artifact validation: {error:#}"))
 }
 
 #[cfg(test)]
@@ -2632,6 +2744,33 @@ mod tests {
     }
 
     #[test]
+    fn seed_packet_rejects_more_than_two_claims() {
+        let claim = json!({
+            "claim_id": "qqq-trend:bull:1",
+            "decision_hinge": "earnings",
+            "claim": "upside",
+            "evidence_refs": [],
+            "confidence": 0.6,
+            "known_bear_constraint": "valuation",
+            "needs_mediator_check": false
+        });
+        let text = json!({
+            "role": "researcher.bull.initial",
+            "artifact_type": "bull_seed_packet",
+            "topic_id": "qqq-trend",
+            "claims": [claim.clone(), claim.clone(), claim],
+            "summary": "three claims",
+            "reducer_checks": {}
+        })
+        .to_string();
+
+        assert_eq!(
+            seed_packet_validation_error("researcher.bull.initial", &text),
+            Err("claims must contain 1-2 items".to_string())
+        );
+    }
+
+    #[test]
     fn analyst_final_packet_requires_exact_role_and_ticker_set() {
         let expected_tickers = vec!["QQQ".to_string(), "SOXX".to_string()];
         let wrong_role = r#"{
@@ -2800,7 +2939,13 @@ mod tests {
                 && item
                     .content_text
                     .contains("Previous output failed validation or was incomplete")
+                && item
+                    .content_text
+                    .contains("Expected role: analyst.news_macro")
+                && item.content_text.contains("Expected tickers: QQQ")
+                && item.content_text.contains("Validation errors:")
         }));
+        assert!(model.seen_inputs[1].available_tools.is_empty());
     }
 
     #[test]

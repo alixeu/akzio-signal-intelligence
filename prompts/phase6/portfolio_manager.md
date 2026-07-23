@@ -36,7 +36,7 @@
 
 ## 输出契约
 
-输出继承的 rating、执行状态、binding risk controls 和一致性理由，并在同一对象顶层加入公共规范要求的 `analysis_trace`。额外写入 `trade_execution` 对象，至少包含 `status`（`submitted | skipped | disabled | error`）；提交时还包含工具实际返回的 `signal_id`、`symbol`、`action`、`quantity`，未提交时写清 `reason`。只返回运行时 `FinalValidation` schema 接受的纯 JSON，不使用 Markdown 围栏或额外 envelope。
+输出继承的 rating、执行状态、binding risk controls 和一致性理由，并在同一对象顶层加入公共规范要求的 `analysis_trace`。额外写入 `trade_execution` 对象，至少包含 `status`（`submitted | skipped | disabled | error`）；提交时还包含工具实际返回的 `signal_id`、`symbol`、`action`、`quantity`，未提交时写清 `reason`。Artifact 必须满足运行时 `FinalValidation` schema。
 
 <!-- DYNAMIC SUFFIX (changes every call) -->
 portfolio_context:

@@ -3,7 +3,7 @@
 - expected role: `{role}`
 - expected tickers: `{tickers}`
 
-只返回纯 JSON，不使用 Markdown 围栏，不添加额外 envelope。字段形状、类型和值域由运行时 schema 与 validator 决定。
+字段形状、类型和值域由运行时 schema 与 validator 决定。
 
 输出预算：每个 ticker 最多 3 条 `key_evidence`、2 条 `validation_triggers` 和 2 条 `data_gaps`；`report` 保持简洁，只解释机读字段，不重复证据全文。
 

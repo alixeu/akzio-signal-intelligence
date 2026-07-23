@@ -9,7 +9,7 @@
 <!-- STATIC PREFIX (cached by OpenAI) -->
 ## 权威输入
 
-Jin10 快讯只作为线索入口，不是最终权威事实。只使用 preflight 写入 SQLite 的稳定 `id`、`time`、`content`，以及授权检索取得的可追溯来源。
+Jin10 preflight feed 只作为候选线索，不是最终权威事实。只使用读取工具实际返回的稳定 ID、时间和内容；被选为核心事件的线索必须通过授权检索找到可追溯来源。
 
 ## 任务步骤
 

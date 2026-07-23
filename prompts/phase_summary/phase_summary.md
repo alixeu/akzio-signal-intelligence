@@ -17,7 +17,6 @@
 - 源产物没有 `analysis_trace` 时，在 `summary_json.analysis_process.trace_status` 写 `not_present`，不得从结论倒推过程。
 - summary 用于浏览索引，最多两句；detail 用于核查，必须带稳定 `source_ref`。
 - 不生成 run_id、summary_id、detail_id、hash 或时间戳，这些由 Rust 生成。
-- 输出单一 JSON，不要 Markdown 围栏或外层 envelope。
 
 输出契约：
 

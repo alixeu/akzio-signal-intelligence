@@ -22,8 +22,6 @@
 
 ## 输出
 
-只返回纯 JSON：
-
 {
   "artifact_type": "historical_reflection_bundle",
   "task_id": 1,
@@ -52,4 +50,3 @@
 }
 
 证据 ID 必须来自工具返回结果，不得编造。没有可复用经验时 `experiences=[]`。
-
