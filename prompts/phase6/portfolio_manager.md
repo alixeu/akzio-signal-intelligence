@@ -7,18 +7,18 @@
 <!-- STATIC PREFIX (cached by OpenAI) -->
 ## 权威输入
 
-市场判断只使用下方 `portfolio_context`，不补外部事实。Phase 3 是唯一市场真相；rating、概率和 thesis 必须原样继承。AI4Trade 工具只提供账户状态、价格和模拟交易执行，不能改变市场判断。
+市场判断只使用下方 `portfolio_context`，不补外部事实。Phase 3 是唯一市场真相；rating、概率和 thesis 必须原样继承。Alpaca 工具只提供 Paper Trading 账户状态、价格和订单提交，不能改变市场判断。
 
-## AI4Trade 执行
+## Alpaca Paper Trading 执行
 
-当前模式：`{ai4trade_mode}`。
+当前模式：`{alpaca_mode}`。
 
 - `live`：根据每个可用 tool 的 description 选择匹配能力。需要判断可用资金、现有敞口或卖出上限时，先获取现金、仓位和未实现收益；只有候选 action 为 Buy/Sell 且最终 `execution_status=execute` 时，才获取最新价格并提交交易。
-- `disabled`：不得调用任何 AI4Trade 工具；只完成最终校验，`trade_execution.status` 写 `disabled`。
+- `disabled`：不得调用任何 Alpaca 工具；只完成最终校验，`trade_execution.status` 写 `disabled`。
 - 交易 symbol 只能来自 `portfolio_context.investable_assets`。
 - Buy 数量按可用现金、最新价格、Phase 4 `position_size` 上限和 Phase 5 最严格有效 `position_cap_pct` 计算；取更严格者，不得超限。US stock 数量向下取整为整数；不足 1 股则不交易并改为 `wait`。
 - Sell 数量不得超过账户现有同 symbol 多头仓位。不得把 Buy 反转成 Sell，也不得把 Sell 反转成 Buy。
-- 平台模拟交易使用 `price=0`、`executed_at="now"`；工具返回失败时不得声称成交，并将 `trade_execution.status` 写为 `error`。
+- 提交的是 Alpaca Paper Trading 市价订单；`price` 仅作为本地审计的参考价格，`executed_at` 使用 `now`。工具返回失败或只返回未成交订单时不得声称成交，并将 `trade_execution.status` 写为 `error` 或 `submitted`。
 - Hold、`wait`、`downgrade` 不提交交易。
 
 ## 校验步骤

@@ -146,7 +146,7 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
         prompt_path,
     } = input;
     let debug_enabled = state.get("debug").and_then(Value::as_bool).unwrap_or(false);
-    let ai4trade_live = role == "portfolio.manager" && !mock && !debug_enabled;
+    let alpaca_live = role == "portfolio.manager" && !mock && !debug_enabled;
     let tickers = tickers_from_state(&state);
     let tool_tickers = if role == "portfolio.manager" {
         state
@@ -247,9 +247,14 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
                 .filter_map(|task| task.get("task_id").and_then(Value::as_i64))
                 .collect(),
             tickers: tool_tickers,
-            ai4trade_live,
-            ai4trade_token: if ai4trade_live {
-                config.ai4trade_token.clone()
+            alpaca_live,
+            alpaca_api_key: if alpaca_live {
+                config.alpaca_api_key.clone()
+            } else {
+                None
+            },
+            alpaca_api_secret: if alpaca_live {
+                config.alpaca_api_secret.clone()
             } else {
                 None
             },

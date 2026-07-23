@@ -27,8 +27,8 @@ const MANAGED_TABLES: &[&str] = &[
     "predictions",
     "outcomes",
     "candidate_experiences",
-    "ai4trade_executions",
-    "ai4trade_account_snapshots",
+    "ai4trade_executions", // Legacy table name retained to preserve existing local history.
+    "ai4trade_account_snapshots", // Legacy table name retained to preserve existing local history.
     "decision_snapshots",
     "decision_outcomes",
     "reflection_tasks",

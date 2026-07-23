@@ -36,7 +36,7 @@ graph TD
     end
 
     subgraph "Phase 0 — 历史复盘"
-        HIST[AI4Trade 收益/持仓历史]
+        HIST[Alpaca Paper 账户/成交历史]
         SCORE[3 个交易日结果评分<br/>常规/深度触发]
         EXP[按 Phase 原子经验]
     end
@@ -113,10 +113,10 @@ Trader, the three-perspective risk committee, and Portfolio Manager are
 mandatory in the default `legacy` policy. Allocation is always computed and
 validated in Rust, and Portfolio Manager `wait` or `downgrade` decisions force a
 cash-only allocation. In a non-mock, non-debug run, Phase 0 reads the
-project-only AI4Trade account, positions, and signal history. Phase 6 can read
-the simulated account and current prices, then submit a trade constrained
+project-only Alpaca Paper account, positions, and recent fills. Phase 6 can read
+the account and current prices, then submit a paper order constrained
 by the Phase 4 position size and the strictest Phase 5 position cap. `--mock`
-and `--debug` remove all AI4Trade tools from the model and make the tool runtime
+and `--debug` remove all Alpaca tools from the model and make the tool runtime
 reject direct calls.
 
 ## Workspace crates
@@ -138,7 +138,7 @@ There is no long-running service entry point. `orchestrator-exec` is the workflo
 - Network access to Yahoo Finance and Jin10
 - An OpenAI-compatible gateway key for non-mock workflow runs
 - `EXA_API_KEY` only when live Exa web search is enabled
-- `AI4TRADE_TOKEN` for Phase 0 history retrieval and Phase 6 simulated trade execution
+- `ALPACA_API_KEY` and `ALPACA_API_SECRET` for Phase 0 account/fill retrieval and Phase 6 Paper Trading execution
 
 Set secrets through the environment. The repository contains no key fallback:
 
@@ -146,11 +146,14 @@ Set secrets through the environment. The repository contains no key fallback:
 export LLM_GATEWAY_API_KEY='...'
 export LLM_GATEWAY_BASE_URL='https://your-gateway.example/v1'
 export EXA_API_KEY='...'
-export AI4TRADE_TOKEN='...'
+export ALPACA_API_KEY='...'
+export ALPACA_API_SECRET='...'
 ```
 
-`config/config.yaml` maps `orchestrator.ai4trade.token` to
-`${AI4TRADE_TOKEN}`; no registration or alternate-account flow is implemented.
+`config/config.yaml` maps `orchestrator.alpaca.api_key` and
+`orchestrator.alpaca.api_secret` to the two Alpaca environment variables. The
+integration intentionally uses `paper-api.alpaca.markets`; no live-brokerage
+endpoint, registration, or alternate-account flow is implemented.
 
 Report email credentials are only needed by `report-email`:
 
@@ -241,14 +244,14 @@ Useful options:
 `--mock` exists only for local tests and development. It is not evidence that the production workflow or external services work.
 
 `--from-phase` accepts `0-8` and defaults to `0`; `--to-phase 0` runs only
-historical reflection/retrieval. Mock runs skip AI4Trade and all learning writes.
+historical reflection/retrieval. Mock runs skip Alpaca and all learning writes.
 
 ## Learning loop
 
 A non-mock default run starts with Phase 0 and records the current decision in
 Phase 8:
 
-1. Phase 0 reads AI4Trade account/position/signal history and scores matured
+1. Phase 0 reads Alpaca Paper account, positions, and recent fills while scoring matured
    prior decisions on the third stored trading bar. This is an evaluation
    horizon, not a forced trade or forced close.
 2. Every matured outcome receives routine reflection. Loss, benchmark
@@ -263,9 +266,9 @@ Phase 8:
    ticker, including Hold/current-position decisions, without requiring an order.
 
 The current prediction never scores itself, mock runs never write learning
-memory, and repeated processing is idempotent. AI4Trade submissions persist the
-exact `signal_id` to `run_id`; legacy signals use the nearest same-ticker/action
-Phase 6 decision within four hours and receive lower attribution confidence.
+memory, and repeated processing is idempotent. Alpaca order IDs persist with the
+exact `run_id`; remote fills are observational only, so attribution remains
+limited to this project's locally recorded orders.
 Malformed experience writes fail closed, while reflection failure remains
 non-blocking for the investment decision. Set
 `orchestrator.reflection.enabled: false` to disable retrieval and learning, or

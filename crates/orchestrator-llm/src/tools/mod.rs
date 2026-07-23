@@ -1,4 +1,4 @@
-pub mod ai4trade;
+pub mod alpaca;
 pub mod read_experience;
 pub mod read_jin10_csv;
 pub mod read_phase_summaries;
@@ -26,10 +26,10 @@ pub const READ_EXPERIENCE_TOOL_NAME: &str = read_experience::NAME;
 pub const READ_REFLECTION_SOURCE_TOOL_NAME: &str = read_reflection_source::NAME;
 // Internal compatibility only. This tool is intentionally absent from REGISTRY.
 pub const READ_RUN_CONTEXT_TOOL_NAME: &str = read_run_context::NAME;
-pub const AI4TRADE_GET_PORTFOLIO_TOOL_NAME: &str = ai4trade::GET_PORTFOLIO_NAME;
-pub const AI4TRADE_GET_HISTORY_TOOL_NAME: &str = ai4trade::GET_HISTORY_NAME;
-pub const AI4TRADE_GET_PRICE_TOOL_NAME: &str = ai4trade::GET_PRICE_NAME;
-pub const AI4TRADE_SUBMIT_TRADE_TOOL_NAME: &str = ai4trade::SUBMIT_TRADE_NAME;
+pub const ALPACA_GET_PORTFOLIO_TOOL_NAME: &str = alpaca::GET_PORTFOLIO_NAME;
+pub const ALPACA_GET_HISTORY_TOOL_NAME: &str = alpaca::GET_HISTORY_NAME;
+pub const ALPACA_GET_PRICE_TOOL_NAME: &str = alpaca::GET_PRICE_NAME;
+pub const ALPACA_SUBMIT_TRADE_TOOL_NAME: &str = alpaca::SUBMIT_TRADE_NAME;
 
 #[derive(Debug, Clone)]
 pub struct ToolDefinition {
@@ -51,9 +51,11 @@ pub struct ExternalToolConfig {
     pub allowed_reflection_task_ids: Vec<i64>,
     pub tickers: Vec<String>,
     #[serde(default)]
-    pub ai4trade_live: bool,
+    pub alpaca_live: bool,
     #[serde(skip)]
-    pub ai4trade_token: Option<String>,
+    pub alpaca_api_key: Option<String>,
+    #[serde(skip)]
+    pub alpaca_api_secret: Option<String>,
     #[serde(skip)]
     pub phase_summary_index: Option<std::sync::Arc<orchestrator_sql::PhaseSummaryMemoryIndex>>,
     #[serde(skip)]
@@ -70,8 +72,9 @@ impl Default for ExternalToolConfig {
             phase: None,
             allowed_reflection_task_ids: Vec::new(),
             tickers: Vec::new(),
-            ai4trade_live: false,
-            ai4trade_token: None,
+            alpaca_live: false,
+            alpaca_api_key: None,
+            alpaca_api_secret: None,
             phase_summary_index: None,
             phase_summary_gate: None,
         }
@@ -119,20 +122,20 @@ const REGISTRY: &[ToolEntry] = &[
         definition: read_jin10_csv::definition,
     },
     ToolEntry {
-        name: ai4trade::GET_PORTFOLIO_NAME,
-        definition: ai4trade::get_portfolio_definition,
+        name: alpaca::GET_PORTFOLIO_NAME,
+        definition: alpaca::get_portfolio_definition,
     },
     ToolEntry {
-        name: ai4trade::GET_HISTORY_NAME,
-        definition: ai4trade::get_history_definition,
+        name: alpaca::GET_HISTORY_NAME,
+        definition: alpaca::get_history_definition,
     },
     ToolEntry {
-        name: ai4trade::GET_PRICE_NAME,
-        definition: ai4trade::get_price_definition,
+        name: alpaca::GET_PRICE_NAME,
+        definition: alpaca::get_price_definition,
     },
     ToolEntry {
-        name: ai4trade::SUBMIT_TRADE_NAME,
-        definition: ai4trade::submit_trade_definition,
+        name: alpaca::SUBMIT_TRADE_NAME,
+        definition: alpaca::submit_trade_definition,
     },
 ];
 
@@ -151,18 +154,18 @@ pub fn tool_names() -> &'static [&'static str] {
 
 pub fn enabled_tool_names(
     web_run: Option<&WebSearchConfig>,
-    ai4trade_live: bool,
+    alpaca_live: bool,
 ) -> Vec<&'static str> {
     let mut names = tool_names().to_vec();
     if web_run.is_some() {
         names.push(web_run::NAME);
     }
-    if ai4trade_live {
+    if alpaca_live {
         names.extend([
-            ai4trade::GET_PORTFOLIO_NAME,
-            ai4trade::GET_HISTORY_NAME,
-            ai4trade::GET_PRICE_NAME,
-            ai4trade::SUBMIT_TRADE_NAME,
+            alpaca::GET_PORTFOLIO_NAME,
+            alpaca::GET_HISTORY_NAME,
+            alpaca::GET_PRICE_NAME,
+            alpaca::SUBMIT_TRADE_NAME,
         ]);
     }
     names
@@ -304,10 +307,10 @@ pub async fn execute_named_tool(
         }
         read_technical_csv::NAME => read_technical_csv::execute(args, config),
         read_jin10_csv::NAME => read_jin10_csv::execute(args, config),
-        ai4trade::GET_PORTFOLIO_NAME => ai4trade::get_portfolio(config).await,
-        ai4trade::GET_HISTORY_NAME => ai4trade::get_history(config).await,
-        ai4trade::GET_PRICE_NAME => ai4trade::get_price(args, config).await,
-        ai4trade::SUBMIT_TRADE_NAME => ai4trade::submit_trade(args, config).await,
+        alpaca::GET_PORTFOLIO_NAME => alpaca::get_portfolio(config).await,
+        alpaca::GET_HISTORY_NAME => alpaca::get_history(config).await,
+        alpaca::GET_PRICE_NAME => alpaca::get_price(args, config).await,
+        alpaca::SUBMIT_TRADE_NAME => alpaca::submit_trade(args, config).await,
         other => bail!("unknown tool name: {other}"),
     }
 }
@@ -378,8 +381,9 @@ mod tests {
             phase: None,
             allowed_reflection_task_ids: Vec::new(),
             tickers: Vec::new(),
-            ai4trade_live: false,
-            ai4trade_token: None,
+            alpaca_live: false,
+            alpaca_api_key: None,
+            alpaca_api_secret: None,
             phase_summary_index: None,
             phase_summary_gate: None,
         }

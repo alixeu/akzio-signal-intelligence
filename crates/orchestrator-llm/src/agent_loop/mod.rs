@@ -2227,7 +2227,7 @@ impl LoopToolRuntime for ProjectToolRuntime {
             let web_run_config = web_run.as_ref().map(tools::WebRunRuntime::config);
             let configured = available_tools.iter().any(|name| name == &call.name);
             let enabled = call.name == "think"
-                || tools::enabled_tool_names(web_run_config, config.ai4trade_live)
+                || tools::enabled_tool_names(web_run_config, config.alpaca_live)
                     .contains(&call.name.as_str());
             if !configured || !enabled {
                 warn!(
@@ -3351,8 +3351,9 @@ mod tests {
                 phase: None,
                 allowed_reflection_task_ids: Vec::new(),
                 tickers: Vec::new(),
-                ai4trade_live: false,
-                ai4trade_token: None,
+                alpaca_live: false,
+                alpaca_api_key: None,
+                alpaca_api_secret: None,
                 phase_summary_index: None,
                 phase_summary_gate: None,
             },
@@ -3382,8 +3383,9 @@ mod tests {
                 phase: None,
                 allowed_reflection_task_ids: Vec::new(),
                 tickers: Vec::new(),
-                ai4trade_live: false,
-                ai4trade_token: None,
+                alpaca_live: false,
+                alpaca_api_key: None,
+                alpaca_api_secret: None,
                 phase_summary_index: None,
                 phase_summary_gate: None,
             },
@@ -3956,8 +3958,9 @@ mod tests {
                 phase: None,
                 allowed_reflection_task_ids: Vec::new(),
                 tickers: vec!["TQQQ".to_string()],
-                ai4trade_live: false,
-                ai4trade_token: None,
+                alpaca_live: false,
+                alpaca_api_key: None,
+                alpaca_api_secret: None,
                 phase_summary_index: None,
                 phase_summary_gate: None,
             },

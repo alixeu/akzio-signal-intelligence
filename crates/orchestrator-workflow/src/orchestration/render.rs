@@ -360,7 +360,7 @@ pub(crate) fn render_prompt_with_plugins(
         "allocation_context": serde_json::to_string_pretty(&state.get("allocation_context").cloned().unwrap_or(Value::Null))?,
         "risk_context": serde_json::to_string_pretty(&risk_context(state))?,
         "portfolio_context": serde_json::to_string_pretty(&portfolio_context(state))?,
-        "ai4trade_mode": if state.get("mock").and_then(Value::as_bool) == Some(true)
+        "alpaca_mode": if state.get("mock").and_then(Value::as_bool) == Some(true)
             || state.get("debug").and_then(Value::as_bool) == Some(true)
         {
             "disabled"

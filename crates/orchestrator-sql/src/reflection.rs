@@ -440,11 +440,11 @@ fn insert_decision_outcome(
                 "account_benchmark_ticker": "QQQ",
                 "account_benchmark_return": qqq_return,
                 "return_source": if execution.and_then(|value| value.platform_return).is_some() {
-                    "ai4trade"
+                    "alpaca"
                 } else {
                     "three_trading_day_decision_proxy"
                 },
-                "ai4trade_execution": execution.map(|value| value.raw.clone()),
+                "alpaca_execution": execution.map(|value| value.raw.clone()),
                 "trigger_reasons": triggers,
                 "observed_max_drawdown_note": "Observed from stored daily closes during the evaluation window; not intraday drawdown."
             }))?,

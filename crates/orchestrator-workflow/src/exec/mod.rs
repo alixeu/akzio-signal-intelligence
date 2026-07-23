@@ -197,7 +197,9 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             });
             set_phase_status(&mut state, 0, "skipped");
         } else {
-            let ai4trade_history = if runtime_config.ai4trade_token.is_some() {
+            let alpaca_history = if runtime_config.alpaca_api_key.is_some()
+                && runtime_config.alpaca_api_secret.is_some()
+            {
                 let tool_config = orchestrator_llm::tools::ExternalToolConfig {
                     project_root: default_project_root(),
                     db_path: Some(db_path.clone()),
@@ -206,27 +208,28 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
                     phase: Some(0),
                     allowed_reflection_task_ids: Vec::new(),
                     tickers: runtime_config.allocation.investable_assets.clone(),
-                    ai4trade_live: true,
-                    ai4trade_token: runtime_config.ai4trade_token.clone(),
+                    alpaca_live: true,
+                    alpaca_api_key: runtime_config.alpaca_api_key.clone(),
+                    alpaca_api_secret: runtime_config.alpaca_api_secret.clone(),
                     phase_summary_index: None,
                     phase_summary_gate: None,
                 };
-                match orchestrator_llm::tools::ai4trade::get_history(&tool_config).await {
+                match orchestrator_llm::tools::alpaca::get_history(&tool_config).await {
                     Ok(history) => json!({
                         "status": "completed",
                         "portfolio": history.get("portfolio").cloned().unwrap_or(Value::Null),
-                        "signal_count": history.get("signals").and_then(Value::as_array).map(Vec::len),
+                        "fill_count": history.get("fills").and_then(Value::as_array).map(Vec::len),
                         "locally_imported_execution_count": history.get("locally_imported_execution_count").cloned().unwrap_or(json!(0))
                     }),
                     Err(error) => {
-                        tracing::warn!(run_id, error = %error, "AI4Trade history unavailable in phase 0");
+                        tracing::warn!(run_id, error = %error, "Alpaca history unavailable in phase 0");
                         json!({"status": "non_blocking_failed", "message": error.to_string()})
                     }
                 }
             } else {
                 json!({
                     "status": "unconfigured",
-                    "reason": "AI4TRADE_TOKEN is not available; no registration or alternate account operation was attempted."
+                    "reason": "ALPACA_API_KEY and ALPACA_API_SECRET are required; no brokerage or alternate account operation was attempted."
                 })
             };
             match score_mature_predictions(
@@ -256,7 +259,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
                         "outcome_scoring": scoring,
                         "task_limit": runtime_config.reflection.task_limit,
                         "parallelism": runtime_config.reflection.parallelism,
-                        "ai4trade_history": ai4trade_history,
+                        "alpaca_history": alpaca_history,
                         "tasks": tasks,
                         "note": "All matured outcomes receive routine review; anomaly triggers upgrade a task to deep review."
                     });
@@ -3911,9 +3914,9 @@ mod tests {
             roles["portfolio.manager"].tools,
             vec![
                 "read_experience".to_string(),
-                "ai4trade_get_portfolio".to_string(),
-                "ai4trade_get_price".to_string(),
-                "ai4trade_submit_trade".to_string(),
+                "alpaca_get_portfolio".to_string(),
+                "alpaca_get_price".to_string(),
+                "alpaca_submit_trade".to_string(),
             ]
         );
     }

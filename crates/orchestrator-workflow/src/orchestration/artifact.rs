@@ -1431,7 +1431,8 @@ mod tests {
                 max_single_position: 0.70,
                 vol_indicator: "STD20".to_string(),
             },
-            ai4trade_token: None,
+            alpaca_api_key: None,
+            alpaca_api_secret: None,
             reflection: crate::orchestration::config::ReflectionConfig {
                 enabled: true,
                 reflection_version: "v1".to_string(),

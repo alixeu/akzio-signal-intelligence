@@ -1,4 +1,4 @@
-pub mod ai4trade;
+pub mod alpaca;
 pub mod archive;
 pub mod candidate;
 pub mod context;
@@ -14,7 +14,7 @@ pub mod schema;
 pub mod technical_store;
 pub mod write;
 
-pub use ai4trade::{
+pub use alpaca::{
     import_legacy_executions, record_account_snapshot, record_exact_execution, ExecutionRecord,
 };
 pub use context::{

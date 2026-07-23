@@ -58,16 +58,24 @@ pub struct ExecutionRecord<'a> {
 pub fn record_exact_execution(conn: &Connection, input: &ExecutionRecord<'_>) -> Result<i64> {
     let signal_id = input
         .response
-        .get("signal_id")
+        .get("id")
+        .or_else(|| input.response.get("signal_id"))
         .and_then(value_as_id)
-        .context("AI4Trade trade response is missing signal_id")?;
+        .context("trade response is missing an Alpaca order id or legacy signal_id")?;
     let executed_price = input
         .response
-        .get("price")
+        .get("filled_avg_price")
+        .or_else(|| input.response.get("price"))
         .or_else(|| input.response.get("executed_price"))
-        .and_then(Value::as_f64)
-        .or((input.requested_price > 0.0).then_some(input.requested_price));
-    let executed_at_ms = parse_time_ms(input.executed_at).unwrap_or_else(crate::schema::now_ms);
+        .and_then(value_as_f64);
+    let executed_at_ms = input
+        .response
+        .get("filled_at")
+        .or_else(|| input.response.get("submitted_at"))
+        .and_then(Value::as_str)
+        .and_then(parse_time_ms)
+        .or_else(|| parse_time_ms(input.executed_at))
+        .unwrap_or_else(crate::schema::now_ms);
     let raw = serde_json::to_string(input.response)?;
     let response_hash = format!("{:x}", Sha256::digest(raw.as_bytes()));
     conn.execute(
@@ -222,6 +230,10 @@ fn value_as_id(value: &Value) -> Option<String> {
         .as_str()
         .map(ToString::to_string)
         .or_else(|| value.as_i64().map(|value| value.to_string()))
+}
+
+fn value_as_f64(value: &Value) -> Option<f64> {
+    value.as_f64().or_else(|| value.as_str()?.parse().ok())
 }
 
 fn parse_time_ms(value: &str) -> Option<i64> {

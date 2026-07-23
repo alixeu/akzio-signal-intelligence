@@ -423,7 +423,7 @@ fn render_for_lint(
         "phase3_context": "{}",
         "risk_context": "{}",
         "portfolio_context": "{}",
-        "ai4trade_mode": "disabled",
+        "alpaca_mode": "disabled",
         "phase1_index": "{}",
         "prior_phase_summaries": "{\"items\":[]}",
         "common_ground": "{}",

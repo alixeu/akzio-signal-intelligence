@@ -79,7 +79,7 @@ pub const VALID_PLACEHOLDERS: &[&str] = &[
     "phase3_context",
     "risk_context",
     "portfolio_context",
-    "ai4trade_mode",
+    "alpaca_mode",
     "phase1_index",
     "prior_phase_summaries",
     "common_ground",

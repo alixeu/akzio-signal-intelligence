@@ -36,7 +36,8 @@ pub(crate) struct RuntimeConfig {
     pub prompts: PromptConfig,
     pub workflow: WorkflowConfig,
     pub allocation: AllocationConfig,
-    pub ai4trade_token: Option<String>,
+    pub alpaca_api_key: Option<String>,
+    pub alpaca_api_secret: Option<String>,
     pub reflection: ReflectionConfig,
     pub plugins: PluginConfig,
     pub component_plugins: ComponentRegistry,
@@ -288,10 +289,14 @@ impl RuntimeConfig {
                 .values()
                 .map(|plugin| (&plugin.manifest, plugin.role_path())),
         );
-        let ai4trade_token = config_str(config, "orchestrator.ai4trade.token", "")
+        let alpaca_api_key = config_str(config, "orchestrator.alpaca.api_key", "")
             .trim()
             .to_string();
-        let ai4trade_token = (!ai4trade_token.is_empty()).then_some(ai4trade_token);
+        let alpaca_api_key = (!alpaca_api_key.is_empty()).then_some(alpaca_api_key);
+        let alpaca_api_secret = config_str(config, "orchestrator.alpaca.api_secret", "")
+            .trim()
+            .to_string();
+        let alpaca_api_secret = (!alpaca_api_secret.is_empty()).then_some(alpaca_api_secret);
         Ok(Self {
             llm_roles,
             web_search,
@@ -306,7 +311,8 @@ impl RuntimeConfig {
             prompts: prompts_config,
             workflow,
             allocation: AllocationConfig::from_value(config),
-            ai4trade_token,
+            alpaca_api_key,
+            alpaca_api_secret,
             reflection: ReflectionConfig::from_value(config),
             plugins: plugin_config,
             component_plugins,
@@ -533,9 +539,9 @@ fn builtin_llm_role_values() -> BTreeMap<String, Value> {
             Some("medium"),
             vec![
                 "read_experience",
-                "ai4trade_get_portfolio",
-                "ai4trade_get_price",
-                "ai4trade_submit_trade",
+                "alpaca_get_portfolio",
+                "alpaca_get_price",
+                "alpaca_submit_trade",
             ],
             false,
         ),
@@ -1100,9 +1106,9 @@ mod tests {
             roles["portfolio.manager"]["tools"],
             json!([
                 "read_experience",
-                "ai4trade_get_portfolio",
-                "ai4trade_get_price",
-                "ai4trade_submit_trade"
+                "alpaca_get_portfolio",
+                "alpaca_get_price",
+                "alpaca_submit_trade"
             ])
         );
         for role in ["researcher.bull.initial", "researcher.bear.initial"] {

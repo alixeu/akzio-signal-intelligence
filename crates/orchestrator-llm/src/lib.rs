@@ -2733,11 +2733,11 @@ fn configured_tool_names(settings: &AgentSettings) -> Vec<&str> {
             .iter()
             .map(String::as_str)
             .filter(|name| {
-                !is_ai4trade_tool(name)
+                !is_alpaca_tool(name)
                     || settings
                         .tools
                         .as_ref()
-                        .is_some_and(|config| config.ai4trade_live)
+                        .is_some_and(|config| config.alpaca_live)
             }),
     );
     if uses_web_run_fallback(settings) {
@@ -2763,13 +2763,13 @@ fn validate_tool_name(name: &str) -> Result<()> {
     }
 }
 
-fn is_ai4trade_tool(name: &str) -> bool {
+fn is_alpaca_tool(name: &str) -> bool {
     matches!(
         name,
-        tools::AI4TRADE_GET_PORTFOLIO_TOOL_NAME
-            | tools::AI4TRADE_GET_HISTORY_TOOL_NAME
-            | tools::AI4TRADE_GET_PRICE_TOOL_NAME
-            | tools::AI4TRADE_SUBMIT_TRADE_TOOL_NAME
+        tools::ALPACA_GET_PORTFOLIO_TOOL_NAME
+            | tools::ALPACA_GET_HISTORY_TOOL_NAME
+            | tools::ALPACA_GET_PRICE_TOOL_NAME
+            | tools::ALPACA_SUBMIT_TRADE_TOOL_NAME
     )
 }
 
@@ -2817,8 +2817,9 @@ fn default_tool_config() -> tools::ExternalToolConfig {
                     .collect()
             })
             .unwrap_or_default(),
-        ai4trade_live: false,
-        ai4trade_token: None,
+        alpaca_live: false,
+        alpaca_api_key: None,
+        alpaca_api_secret: None,
         phase_summary_index: None,
         phase_summary_gate: None,
     }
@@ -3075,8 +3076,9 @@ mod tests {
             phase: None,
             allowed_reflection_task_ids: Vec::new(),
             tickers: vec!["QQQ".to_string()],
-            ai4trade_live: false,
-            ai4trade_token: None,
+            alpaca_live: false,
+            alpaca_api_key: None,
+            alpaca_api_secret: None,
             phase_summary_index: None,
             phase_summary_gate: None,
         });
@@ -3117,8 +3119,9 @@ mod tests {
             phase: None,
             allowed_reflection_task_ids: Vec::new(),
             tickers: vec!["TQQQ".to_string()],
-            ai4trade_live: false,
-            ai4trade_token: None,
+            alpaca_live: false,
+            alpaca_api_key: None,
+            alpaca_api_secret: None,
             phase_summary_index: None,
             phase_summary_gate: None,
         });
@@ -3920,14 +3923,14 @@ mod tests {
     }
 
     #[test]
-    fn portfolio_manager_only_gets_ai4trade_tools_when_live_gate_is_open() {
+    fn portfolio_manager_only_gets_alpaca_tools_when_live_gate_is_open() {
         let mut settings = base_settings(LlmRoute::Responses);
         settings.role = "portfolio.manager".to_string();
         settings.llm.think_tool = false;
         settings.llm.tools = vec![
-            tools::AI4TRADE_GET_PORTFOLIO_TOOL_NAME.to_string(),
-            tools::AI4TRADE_GET_PRICE_TOOL_NAME.to_string(),
-            tools::AI4TRADE_SUBMIT_TRADE_TOOL_NAME.to_string(),
+            tools::ALPACA_GET_PORTFOLIO_TOOL_NAME.to_string(),
+            tools::ALPACA_GET_PRICE_TOOL_NAME.to_string(),
+            tools::ALPACA_SUBMIT_TRADE_TOOL_NAME.to_string(),
         ];
         settings.web_search.mode = WebSearchMode::Live;
         settings.tools = Some(tools::ExternalToolConfig::default());
@@ -3935,13 +3938,13 @@ mod tests {
         assert!(super::configured_tool_names(&settings).is_empty());
         assert!(super::web_run_runtime_for_settings(&settings).is_none());
 
-        settings.tools.as_mut().unwrap().ai4trade_live = true;
+        settings.tools.as_mut().unwrap().alpaca_live = true;
         assert_eq!(
             super::configured_tool_names(&settings),
             vec![
-                tools::AI4TRADE_GET_PORTFOLIO_TOOL_NAME,
-                tools::AI4TRADE_GET_PRICE_TOOL_NAME,
-                tools::AI4TRADE_SUBMIT_TRADE_TOOL_NAME,
+                tools::ALPACA_GET_PORTFOLIO_TOOL_NAME,
+                tools::ALPACA_GET_PRICE_TOOL_NAME,
+                tools::ALPACA_SUBMIT_TRADE_TOOL_NAME,
             ]
         );
     }

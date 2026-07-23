@@ -12,9 +12,11 @@ orchestrator:
   allocation:
     investable_assets: [QQQ, SOXX]
 
-  ai4trade:
-    # Loaded from .env or the process environment; never commit the real token.
-    token: ${AI4TRADE_TOKEN}
+  alpaca:
+    # Paper Trading credentials, loaded from .env or the process environment.
+    # Never commit real credentials. Production brokerage endpoints are not configured.
+    api_key: ${ALPACA_API_KEY}
+    api_secret: ${ALPACA_API_SECRET}
 
   reflection:
     enabled: true
