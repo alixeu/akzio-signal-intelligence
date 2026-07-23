@@ -156,9 +156,10 @@ impl RuntimeConfig {
             "orchestrator.prompts.analyst.news_macro",
             "prompts/phase1/news_macro.md",
         )?;
-        // One long-session prompt per side (warm-up + seed + debate + mediator revise).
-        const BULL_PROMPT: &str = "prompts/phase2/bull.md";
-        const BEAR_PROMPT: &str = "prompts/phase2/bear.md";
+        // Each Phase 2 turn receives only the instructions for its current kind.
+        const PHASE2_WARMUP_PROMPT: &str = "prompts/phase2/researcher/warmup.md";
+        const PHASE2_SEED_PROMPT: &str = "prompts/phase2/researcher/seed.md";
+        const PHASE2_DEBATE_PROMPT: &str = "prompts/phase2/researcher/debate.md";
         insert_prompt_entry(
             config,
             &mut prompts,
@@ -171,9 +172,17 @@ impl RuntimeConfig {
             config,
             &mut prompts,
             &mut versions,
+            "researcher.warmup",
+            "orchestrator.prompts.phase2.warmup",
+            PHASE2_WARMUP_PROMPT,
+        )?;
+        insert_prompt_entry(
+            config,
+            &mut prompts,
+            &mut versions,
             "researcher.bull.initial",
             "orchestrator.prompts.phase2.bull_initial",
-            BULL_PROMPT,
+            PHASE2_SEED_PROMPT,
         )?;
         insert_prompt_entry(
             config,
@@ -181,7 +190,7 @@ impl RuntimeConfig {
             &mut versions,
             "researcher.bull.interaction",
             "orchestrator.prompts.phase2.bull_interaction",
-            BULL_PROMPT,
+            PHASE2_DEBATE_PROMPT,
         )?;
         insert_prompt_entry(
             config,
@@ -189,7 +198,7 @@ impl RuntimeConfig {
             &mut versions,
             "researcher.bear.initial",
             "orchestrator.prompts.phase2.bear_initial",
-            BEAR_PROMPT,
+            PHASE2_SEED_PROMPT,
         )?;
         insert_prompt_entry(
             config,
@@ -197,7 +206,7 @@ impl RuntimeConfig {
             &mut versions,
             "researcher.bear.interaction",
             "orchestrator.prompts.phase2.bear_interaction",
-            BEAR_PROMPT,
+            PHASE2_DEBATE_PROMPT,
         )?;
         insert_prompt_entry(
             config,
@@ -463,58 +472,42 @@ fn builtin_llm_role_values() -> BTreeMap<String, Value> {
             "mediator.topic",
             6,
             Some("medium"),
-            vec![
-                "read_experience",
-                "read_phase_summaries",
-                "read_phase_summary_details",
-            ],
+            vec!["read_phase_summaries", "read_phase_summary_details"],
             false,
         ),
         (
             "researcher.bull.initial",
             10,
             None,
-            vec![
-                "read_experience",
-                "read_phase_summaries",
-                "read_phase_summary_details",
-            ],
+            vec!["read_phase_summaries", "read_phase_summary_details"],
             false,
         ),
         (
             "researcher.bear.initial",
             10,
             None,
-            vec![
-                "read_experience",
-                "read_phase_summaries",
-                "read_phase_summary_details",
-            ],
+            vec!["read_phase_summaries", "read_phase_summary_details"],
             false,
         ),
         (
             "researcher.bull.interaction",
             10,
             None,
-            vec!["read_experience", "read_phase_summary_details"],
+            vec!["read_phase_summary_details"],
             false,
         ),
         (
             "researcher.bear.interaction",
             10,
             None,
-            vec!["read_experience", "read_phase_summary_details"],
+            vec!["read_phase_summary_details"],
             false,
         ),
         (
             "mediator.topic_controller",
             10,
             Some("medium"),
-            vec![
-                "read_experience",
-                "read_phase_summaries",
-                "read_phase_summary_details",
-            ],
+            vec!["read_phase_summaries", "read_phase_summary_details"],
             false,
         ),
         (
@@ -529,16 +522,15 @@ fn builtin_llm_role_values() -> BTreeMap<String, Value> {
             false,
         ),
         ("compressor.phase_summary", 4, None, vec![], false),
-        ("trader", 6, None, vec!["read_experience"], false),
-        ("risk.aggressive", 6, None, vec!["read_experience"], false),
-        ("risk.neutral", 6, None, vec!["read_experience"], false),
-        ("risk.conservative", 6, None, vec!["read_experience"], false),
+        ("trader", 6, None, vec![], false),
+        ("risk.aggressive", 6, None, vec![], false),
+        ("risk.neutral", 6, None, vec![], false),
+        ("risk.conservative", 6, None, vec![], false),
         (
             "portfolio.manager",
             8,
             Some("medium"),
             vec![
-                "read_experience",
                 "alpaca_get_portfolio",
                 "alpaca_get_price",
                 "alpaca_submit_trade",
@@ -1096,16 +1088,11 @@ mod tests {
             "risk.neutral",
             "risk.conservative",
         ] {
-            assert_eq!(
-                roles[role]["tools"],
-                json!(["read_experience"]),
-                "role={role}"
-            );
+            assert_eq!(roles[role]["tools"], json!([]), "role={role}");
         }
         assert_eq!(
             roles["portfolio.manager"]["tools"],
             json!([
-                "read_experience",
                 "alpaca_get_portfolio",
                 "alpaca_get_price",
                 "alpaca_submit_trade"
@@ -1114,11 +1101,7 @@ mod tests {
         for role in ["researcher.bull.initial", "researcher.bear.initial"] {
             assert_eq!(
                 roles[role]["tools"],
-                json!([
-                    "read_experience",
-                    "read_phase_summaries",
-                    "read_phase_summary_details"
-                ]),
+                json!(["read_phase_summaries", "read_phase_summary_details"]),
                 "role={role}"
             );
             assert_eq!(roles[role]["web_search"]["mode"], "disabled");
@@ -1126,24 +1109,24 @@ mod tests {
         for role in ["researcher.bull.interaction", "researcher.bear.interaction"] {
             assert_eq!(
                 roles[role]["tools"],
-                json!(["read_experience", "read_phase_summary_details"]),
+                json!(["read_phase_summary_details"]),
                 "role={role}"
             );
         }
-        for role in [
-            "mediator.topic",
-            "mediator.topic_controller",
-            "manager.research",
-        ] {
+        for role in ["mediator.topic", "mediator.topic_controller"] {
             assert_eq!(
                 roles[role]["tools"],
-                json!([
-                    "read_experience",
-                    "read_phase_summaries",
-                    "read_phase_summary_details"
-                ]),
+                json!(["read_phase_summaries", "read_phase_summary_details"]),
                 "role={role}"
             );
         }
+        assert_eq!(
+            roles["manager.research"]["tools"],
+            json!([
+                "read_experience",
+                "read_phase_summaries",
+                "read_phase_summary_details"
+            ])
+        );
     }
 }

@@ -1822,7 +1822,7 @@ async fn run_phase2_side_warmup(
     let conn = orchestrator_sql::connect(db_path)?;
     let prompt_path = config
         .prompts
-        .path_for(&role)
+        .path_for("researcher.warmup")
         .with_context(|| format!("missing warmup prompt for {role}"))?
         .clone();
     for attempt in 1..=2 {
@@ -3908,12 +3908,11 @@ mod tests {
             .contains(&"read_technical_context".to_string()));
         assert!(settings.tools.contains(&"read_experience".to_string()));
         for role in ["trader", "risk.conservative"] {
-            assert_eq!(roles[role].tools, vec!["read_experience"], "role={role}");
+            assert!(roles[role].tools.is_empty(), "role={role}");
         }
         assert_eq!(
             roles["portfolio.manager"].tools,
             vec![
-                "read_experience".to_string(),
                 "alpaca_get_portfolio".to_string(),
                 "alpaca_get_price".to_string(),
                 "alpaca_submit_trade".to_string(),

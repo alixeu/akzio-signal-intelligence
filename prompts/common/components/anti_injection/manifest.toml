@@ -1,0 +1,5 @@
+name = "anti_injection"
+injection_points = ["*"]
+priority = 20
+placeholder_key = "anti_injection"
+enabled = true

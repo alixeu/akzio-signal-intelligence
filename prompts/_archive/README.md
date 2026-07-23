@@ -27,5 +27,5 @@ stages without active role prompt files.
 |------|------|
 | `phase2/topic_generator.md` | evidence-only topic generation |
 | Rust conflict detector | topic validation, fallback, and debate gate |
-| `phase2/bull.md` / `phase2/bear.md` | side-specific warmup, seed, interaction long sessions |
+| `phase2/researcher/warmup.md` / `seed.md` / `debate.md` | kind-specific Bull/Bear turns; `side_bull.md` and `side_bear.md` supply the strategy delta |
 | `phase2/topic_controller.md` | mediator.topic_controller |

@@ -2,11 +2,7 @@
 
 use super::{LintIssue, SCHEMA_PLACEHOLDERS, VALID_PLACEHOLDERS};
 use anyhow::{Context, Result};
-use orchestrator_core::{
-    analyst_artifact_schema, final_validation_schema, portfolio_allocation_schema,
-    replace_placeholders, research_artifact_schema, risk_constraints_schema, trade_intent_schema,
-    ComponentRegistry,
-};
+use orchestrator_core::ComponentRegistry;
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -92,10 +88,8 @@ pub fn check_common_components(
             "analyst_output_contract",
             &["common/analyst_output_contract.md"],
         ),
-        ("anti_injection", &["common/anti_injection.md"]),
         ("research_calibration", &["common/research_calibration.md"]),
         ("research_drivers", &["common/research_drivers.md"]),
-        ("analysis_trace_contract", &["common/analysis_trace.md"]),
         ("leveraged_etf_rules", &["common/leveraged_etf_rules.md"]),
         // researcher prompts are standalone; {researcher_body} is only a
         // compatibility placeholder and no longer expands a common component.
@@ -188,6 +182,18 @@ pub fn check_orphan_placeholders(
                     });
                 }
             }
+            let token_estimate = orchestrator_core::token::estimate_tokens(&rendered);
+            if token_estimate > 2000 {
+                issues.push(LintIssue {
+                    file: file_path.display().to_string(),
+                    line: None,
+                    severity: "warning".to_string(),
+                    check: "rendered_prompt_size".to_string(),
+                    message: format!(
+                        "Rendered {role} prompt is ~{token_estimate} tokens, exceeds recommended 2000 token limit"
+                    ),
+                });
+            }
         }
         Err(e) => {
             issues.push(LintIssue {
@@ -201,7 +207,8 @@ pub fn check_orphan_placeholders(
     }
 }
 
-/// Check 5: warn when a prompt file exceeds the recommended token budget.
+/// Check 5: retain source-file diagnostics for unusually large templates.
+/// The actionable prompt budget is checked after full production rendering.
 pub fn check_file_size(file_path: &Path, content: &str, issues: &mut Vec<LintIssue>) {
     let token_estimate = orchestrator_core::token::estimate_tokens(content);
     if token_estimate > 2000 {
@@ -211,7 +218,7 @@ pub fn check_file_size(file_path: &Path, content: &str, issues: &mut Vec<LintIss
             severity: "warning".to_string(),
             check: "file_size".to_string(),
             message: format!(
-                "Prompt file is ~{token_estimate} tokens, exceeds recommended 2000 token limit"
+                "Prompt source file is ~{token_estimate} tokens, exceeds recommended 2000 token limit; rendered prompt size is checked separately"
             ),
         });
     }
@@ -301,16 +308,10 @@ pub fn check_anti_injection(
 }
 
 // ===========================================================================
-// Render approximation
+// Production renderer bridge
 //
-// `render_prompt` in orchestrator-workflow is `pub(crate)` and therefore not
-// reachable from this crate. This function mirrors its two-pass replacement
-// pipeline using the public `replace_placeholders` helper and the public schema
-// functions so the orphan-placeholder check stays faithful to production
-// rendering. Keep this in sync with
-// `crates/orchestrator-workflow/src/orchestration/render.rs::render_prompt`.
-// ===========================================================================
-
+// Prompt lint uses the production rendering path so placeholder checks cannot
+// drift from runtime component composition.
 #[allow(clippy::too_many_arguments)]
 fn render_for_lint(
     state: &Value,
@@ -322,223 +323,17 @@ fn render_for_lint(
     prompt_path: Option<&Path>,
     component_registry: &ComponentRegistry,
 ) -> Result<String> {
-    let tickers = tickers_from_state(state);
-    let ticker = state
-        .get("ticker")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .or_else(|| tickers.first().map(String::as_str))
-        .unwrap_or("");
-    let path = prompt_path.context("missing prompt path for lint rendering")?;
-    let template = std::fs::read_to_string(path)
-        .with_context(|| format!("failed to read prompt template {}", path.display()))?;
-    let current_topic_state = topic_id
-        .and_then(|id| topic_state(state, id))
-        .unwrap_or(Value::Null);
-    let current_topic = current_topic_state
-        .get("topic")
-        .cloned()
-        .unwrap_or(Value::Null);
-    let analyst_output_contract_template =
-        prompt_component(prompt_path, "common/analyst_output_contract.md")?;
-    let anti_injection_template = prompt_component(prompt_path, "common/anti_injection.md")?;
-    let research_calibration_template =
-        prompt_component(prompt_path, "common/research_calibration.md")?;
-    let research_drivers_template = prompt_component(prompt_path, "common/research_drivers.md")?;
-    let analysis_trace_contract_template =
-        prompt_component(prompt_path, "common/analysis_trace.md")?;
-    let risk_analyst_template = prompt_component(prompt_path, "phase5/risk_analyst.md")?;
-    let leveraged_etf_rules_template =
-        prompt_component(prompt_path, "common/leveraged_etf_rules.md")?;
-    let component_values = json!({
-        "ticker": ticker,
-        "tickers": tickers.join(","),
-        "role": role,
-        "analyst_artifact_schema": analyst_artifact_schema(),
-        "research_artifact_schema": research_artifact_schema(),
-        "trade_intent_schema": trade_intent_schema(),
-        "risk_constraints_schema": risk_constraints_schema(),
-        "final_validation_schema": final_validation_schema(),
-        "portfolio_allocation_schema": portfolio_allocation_schema(),
-    });
-    let analyst_output_contract =
-        replace_placeholders(&analyst_output_contract_template, &component_values);
-    let anti_injection = replace_placeholders(&anti_injection_template, &component_values);
-    let research_calibration =
-        replace_placeholders(&research_calibration_template, &component_values);
-    let research_drivers = replace_placeholders(&research_drivers_template, &component_values);
-    let analysis_trace_contract =
-        replace_placeholders(&analysis_trace_contract_template, &component_values);
-    let leveraged_etf_rules = if contains_leveraged_etf(&tickers) {
-        replace_placeholders(&leveraged_etf_rules_template, &component_values)
-    } else {
-        String::new()
-    };
-    let (side, side_label, opponent, opponent_label) = researcher_side_params(role);
-    let stance_label = risk_stance_label(role);
-    let (stance_role_label, stance_intro, stance_rules, stance_schema_extra) =
-        risk_stance_fragments(role);
-    let mut values = json!({
-        "run_id": state.get("run_id").and_then(Value::as_str).unwrap_or(""),
-        "ticker": ticker,
-        "tickers": tickers.join(","),
-        "common_ticker_prompt": "",
-        "analyst_output_contract": analyst_output_contract,
-        "anti_injection": anti_injection,
-        "research_calibration": research_calibration,
-        "research_drivers": research_drivers,
-        "analysis_trace_contract": analysis_trace_contract,
-        "leveraged_etf_rules": leveraged_etf_rules,
-        "analyst_artifact_schema": analyst_artifact_schema(),
-        "research_artifact_schema": research_artifact_schema(),
-        "trade_intent_schema": trade_intent_schema(),
-        "risk_constraints_schema": risk_constraints_schema(),
-        "final_validation_schema": final_validation_schema(),
-        "portfolio_allocation_schema": portfolio_allocation_schema(),
-        "side": side,
-        "side_label": side_label,
-        "opponent": opponent,
-        "opponent_label": opponent_label,
-        "stance": stance_label,
-        "stance_label": stance_role_label,
-        "stance_intro": stance_intro,
-        "stance_rules": stance_rules,
-        "stance_schema_extra": stance_schema_extra,
-        "date": state.get("current_date").and_then(Value::as_str).unwrap_or(""),
-        "lang": state.get("lang").and_then(Value::as_str).unwrap_or("zh"),
-        "window_days": state.get("window_days").cloned().unwrap_or(Value::Null),
-        "role": role,
-        "phase": phase,
-        "kind": kind,
-        "round": round.unwrap_or_default(),
-        "topic_id": topic_id.unwrap_or(""),
-        "topic": serde_json::to_string_pretty(&current_topic)?,
-        "analyst_reports": serde_json::to_string_pretty(&state.get("analyst_reports").cloned().unwrap_or(Value::Null))?,
-        "research_plan": serde_json::to_string_pretty(&state.get("research_plan").cloned().unwrap_or(Value::Null))?,
-        "trader_plan": serde_json::to_string_pretty(&state.get("trader_investment_plan").cloned().unwrap_or(Value::Null))?,
-        "risk_history": serde_json::to_string_pretty(&state.get("risk_debate_state").and_then(|v| v.get("history")).cloned().unwrap_or_else(|| json!([])))?,
-        "portfolio_decision": serde_json::to_string_pretty(&state.get("final_trade_decision").cloned().unwrap_or(Value::Null))?,
-        "allocation_context": serde_json::to_string_pretty(&state.get("allocation_context").cloned().unwrap_or(Value::Null))?,
-        "reflection_task": serde_json::to_string_pretty(&state.get("reflection_task").cloned().unwrap_or(Value::Null))?,
-        "phase3_context": "{}",
-        "risk_context": "{}",
-        "portfolio_context": "{}",
-        "alpaca_mode": "disabled",
-        "phase1_index": "{}",
-        "prior_phase_summaries": "{\"items\":[]}",
-        "common_ground": "{}",
-        "workflow_pattern": "Workflow -> Stage/Sub-workflow -> Agent workers -> Reducer -> state artifact"
-    });
-    component_registry.render_for_role(role, &mut values)?;
-    if template.contains("{common_ticker_prompt}")
-        && values
-            .get("common_ticker_prompt")
-            .and_then(Value::as_str)
-            .is_none_or(str::is_empty)
-    {
-        let path = prompt_path
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "<inline prompt>".to_string());
-        anyhow::bail!(
-            "prompt {path} references {{common_ticker_prompt}} but no enabled ticker component injected it for role {role}"
-        );
-    }
-    // Researcher prompts are standalone markdown files; keep researcher_body
-    // empty for placeholder compatibility only.
-    let researcher_body = String::new();
-    let risk_analyst_body = replace_placeholders(&risk_analyst_template, &values);
-    if let Some(map) = values.as_object_mut() {
-        map.insert(
-            "researcher_body".to_string(),
-            Value::String(researcher_body),
-        );
-        map.insert(
-            "risk_analyst_body".to_string(),
-            Value::String(risk_analyst_body),
-        );
-    }
-    Ok(replace_placeholders(&template, &values))
-}
-
-fn tickers_from_state(state: &Value) -> Vec<String> {
-    state
-        .get("tickers")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(Value::as_str)
-                .map(ToString::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn contains_leveraged_etf(tickers: &[String]) -> bool {
-    tickers.iter().any(|ticker| {
-        matches!(
-            ticker.trim().to_ascii_uppercase().as_str(),
-            "TQQQ" | "SQQQ" | "SOXL" | "SOXS" | "UPRO" | "SPXU"
-        )
-    })
-}
-
-fn topic_state(state: &Value, topic_id: &str) -> Option<Value> {
-    state
-        .get("topic_debate_states")
-        .and_then(Value::as_object)
-        .and_then(|items| items.get(topic_id))
-        .cloned()
-}
-
-fn prompt_component(prompt_path: Option<&Path>, relative_path: &str) -> Result<String> {
-    let Some(path) = prompt_path else {
-        return Ok(String::new());
-    };
-    let Some(prompts_dir) = path.parent().and_then(|parent| parent.parent()) else {
-        return Ok(String::new());
-    };
-    let component_path = prompts_dir.join(relative_path);
-    if component_path.exists() {
-        std::fs::read_to_string(&component_path).with_context(|| {
-            format!(
-                "failed to read prompt template {}",
-                component_path.display()
-            )
-        })
-    } else {
-        Ok(String::new())
-    }
-}
-
-fn researcher_side_params(role: &str) -> (&'static str, &'static str, &'static str, &'static str) {
-    if role.starts_with("researcher.bull") {
-        ("bull", "看多", "bear", "看空")
-    } else if role.starts_with("researcher.bear") {
-        ("bear", "看空", "bull", "看多")
-    } else {
-        ("", "", "", "")
-    }
-}
-
-fn risk_stance_label(role: &str) -> &'static str {
-    if role == "risk.conservative" {
-        "conservative"
-    } else {
-        ""
-    }
-}
-
-fn risk_stance_fragments(role: &str) -> (&'static str, &'static str, &'static str, &'static str) {
-    match role {
-        "risk.conservative" => (
-            "保守风险分析师",
-            "你的任务是保护资产、降低波动，指出拟议方案中过度冒险的部分，但不能因为天然保守就否定所有机会。",
-            "2. `key_risks` 只列 2-5 个真正会改变执行的风险，区分\u{201c}必须降风险\u{201d}与\u{201c}只需监控\u{201d}。\n3. 若 trader_plan 已经保守，指出无需进一步收缩，避免过度防御。",
-            "\n  \"key_risks\": [\"主要风险\"],",
-        ),
-        _ => ("", "", "", ""),
-    }
+    let prompt_path = prompt_path.context("missing prompt path for lint rendering")?;
+    orchestrator_workflow::orchestration::render::render_prompt_for_lint(
+        state,
+        role,
+        phase,
+        kind,
+        round,
+        topic_id,
+        prompt_path,
+        component_registry,
+    )
 }
 
 /// Word-trigram Jaccard similarity in [0, 1].

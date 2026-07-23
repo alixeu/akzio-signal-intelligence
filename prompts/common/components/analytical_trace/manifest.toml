@@ -1,0 +1,5 @@
+name = "analytical_trace"
+injection_points = ["mediator.topic", "manager.research"]
+priority = 30
+placeholder_key = "analysis_trace_contract"
+enabled = true

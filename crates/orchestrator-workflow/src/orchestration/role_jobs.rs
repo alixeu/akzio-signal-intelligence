@@ -107,8 +107,11 @@ impl RoleJobResult {
     }
 }
 
-fn prompt_version_for_role(state: &Value, role: &str) -> Option<String> {
+fn prompt_version_for_role(state: &Value, role: &str, kind: &str) -> Option<String> {
     let config = state.get("config")?;
+    if matches!(role, "researcher.bull.initial" | "researcher.bear.initial") && kind == "warmup" {
+        return Some(prompt_version(config, "orchestrator.prompts.phase2.warmup"));
+    }
     let prompt_key = match role {
         "reflector.historical" => "orchestrator.prompts.reflection.historical",
         "analyst.technical" => "orchestrator.prompts.analyst.technical",
@@ -160,7 +163,7 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
     } else {
         tickers.clone()
     };
-    let prompt_version = prompt_version_for_role(&state, role);
+    let prompt_version = prompt_version_for_role(&state, role, kind);
     let prompt = if mock {
         String::new()
     } else {

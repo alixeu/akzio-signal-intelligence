@@ -8,6 +8,8 @@
 
 {analysis_trace_contract}
 
+{experience_contract}
+
 ## 权威输入
 
 `canonical_phase3_context` 只提供 Rust 确定性基线、权重和历史校准：

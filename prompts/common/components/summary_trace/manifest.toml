@@ -1,0 +1,5 @@
+name = "summary_trace"
+injection_points = ["compressor.phase_summary"]
+priority = 30
+placeholder_key = "analysis_trace_contract"
+enabled = true

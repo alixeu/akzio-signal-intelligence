@@ -56,10 +56,11 @@ orchestrator:
       phase_summary: prompts/phase_summary/phase_summary.md
     phase2:
       topic_generator: prompts/phase2/topic_generator.md
-      bull_initial: prompts/phase2/bull.md
-      bull_interaction: prompts/phase2/bull.md
-      bear_initial: prompts/phase2/bear.md
-      bear_interaction: prompts/phase2/bear.md
+      warmup: prompts/phase2/researcher/warmup.md
+      bull_initial: prompts/phase2/researcher/seed.md
+      bull_interaction: prompts/phase2/researcher/debate.md
+      bear_initial: prompts/phase2/researcher/seed.md
+      bear_interaction: prompts/phase2/researcher/debate.md
     mediator:
       topic_controller: prompts/phase2/topic_controller.md
     manager:
@@ -83,8 +84,8 @@ orchestrator:
       base_url: *llm_gateway_base_url
       api_key: *llm_gateway_api_key
       # The gateway's implicit cap truncates schema-valid multi-agent artifacts.
-      # Roles may lower this explicitly, but the workflow needs room for its
-      # mandatory analysis trace and structured evidence fields.
+      # Roles may lower this explicitly, but the workflow needs room for
+      # schema-valid multi-agent artifacts and bounded evidence fields.
       max_completion_tokens: 12288
       reasoning_effort: low
       reasoning_summary: auto

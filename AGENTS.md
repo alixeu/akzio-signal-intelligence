@@ -21,10 +21,10 @@ This repository is a Rust workspace for AI-assisted market-signal research and T
   - `phase5`: aggressive, neutral, and conservative risk reviewers.
   - `phase6`: Portfolio Manager final decision.
   - `common`: reusable contracts/components; `system`: agent-loop messages.
-- Phase 2-6 analytical role artifacts carry the shared
-  `prompts/common/analysis_trace.md` contract. Phase Summary preserves its
-  evidence, conflicts, assumptions, decision hinges, confidence limits, and
-  conclusion path under `summary_json.analysis_process`.
+- Prompt components are role-scoped. Topic Generator and Research Manager use
+  the analytical trace; Trader and Portfolio Manager use the execution trace;
+  Phase Summary uses the summary trace. Bull/Bear packets, Topic Controller,
+  and Phase 5 risk reviewers keep their compact packet/constraint audit data.
 - Phase 2 starts Topic Generator, Bull warm-up, and Bear warm-up concurrently.
   Each selected topic forks Bull/Bear from their warm-up turns and its Topic
   Controller from the Topic Generator turn. Debate reduction remains Rust-owned.

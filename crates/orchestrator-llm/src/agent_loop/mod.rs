@@ -199,7 +199,8 @@ where
             .iter()
             .any(|item| item.item_type == TurnItemType::ToolResult);
         if !already {
-            let preseed_calls = preseed_tool_calls(turn, &turn_tickers(turn));
+            let available_tools = turn_available_tools(turn);
+            let preseed_calls = preseed_tool_calls(turn, &turn_tickers(turn), &available_tools);
             for call in preseed_calls {
                 turn.emitted_items.push(TurnItem::tool_call(&call));
                 let result = tools.execute(call).await;
@@ -1207,9 +1208,15 @@ async fn mark_last_assistant_message_as_final<S: AgentEventSink>(
     Ok(())
 }
 
-fn preseed_tool_calls(turn: &Turn, tickers: &[String]) -> Vec<ToolCallRequest> {
+fn preseed_tool_calls(
+    turn: &Turn,
+    tickers: &[String],
+    available_tools: &[String],
+) -> Vec<ToolCallRequest> {
     let mut calls = Vec::new();
-    if turn.phase.is_some_and(|phase| (1..=6).contains(&phase))
+    let tool_enabled = |name: &str| available_tools.iter().any(|tool| tool == name);
+    if tool_enabled(tools::READ_EXPERIENCE_TOOL_NAME)
+        && turn.phase.is_some_and(|phase| (1..=6).contains(&phase))
         && turn.role != "compressor.phase_summary"
     {
         for ticker in tickers {
@@ -1221,7 +1228,7 @@ fn preseed_tool_calls(turn: &Turn, tickers: &[String]) -> Vec<ToolCallRequest> {
         }
     }
     match turn.role.as_str() {
-        "analyst.technical" => {
+        "analyst.technical" if tool_enabled("read_technical_context") => {
             for ticker in tickers {
                 for interval in &["daily", "3h", "20min"] {
                     calls.push(ToolCallRequest {
@@ -1232,14 +1239,16 @@ fn preseed_tool_calls(turn: &Turn, tickers: &[String]) -> Vec<ToolCallRequest> {
                 }
             }
         }
-        "analyst.news_macro" => {
+        "analyst.news_macro" if tool_enabled("read_jin10_context") => {
             calls.push(ToolCallRequest {
                 call_id: "preseed-jin10".to_string(),
                 name: "read_jin10_context".to_string(),
                 arguments: json!({}),
             });
         }
-        "researcher.bull.initial" | "researcher.bear.initial" if turn_is_warmup(turn) => {
+        "researcher.bull.initial" | "researcher.bear.initial"
+            if turn_is_warmup(turn) && tool_enabled(tools::READ_PHASE_SUMMARIES_TOOL_NAME) =>
+        {
             calls.push(ToolCallRequest {
                 call_id: format!("preseed-phase-summaries-{}", turn.role.replace('.', "-")),
                 name: tools::READ_PHASE_SUMMARIES_TOOL_NAME.to_string(),
@@ -2492,14 +2501,51 @@ mod tests {
         for role in ["researcher.bull.initial", "researcher.bear.initial"] {
             let mut warmup = Turn::new("turn-warmup", "session", "run", role, "role prompt");
             warmup.push_pending_input(r#"Steer: {"kind":"warmup"}"#);
-            let calls = preseed_tool_calls(&warmup, &["QQQ".to_string()]);
+            let calls = preseed_tool_calls(
+                &warmup,
+                &["QQQ".to_string()],
+                &[tools::READ_PHASE_SUMMARIES_TOOL_NAME.to_string()],
+            );
             assert_eq!(calls.len(), 1);
             assert_eq!(calls[0].name, tools::READ_PHASE_SUMMARIES_TOOL_NAME);
 
             let mut seed = Turn::new("turn-seed", "session", "run", role, "role prompt");
             seed.push_pending_input(r#"Steer: {"kind":"topic_fork"}"#);
-            assert!(preseed_tool_calls(&seed, &["QQQ".to_string()]).is_empty());
+            assert!(preseed_tool_calls(
+                &seed,
+                &["QQQ".to_string()],
+                &[tools::READ_PHASE_SUMMARIES_TOOL_NAME.to_string()],
+            )
+            .is_empty());
         }
+    }
+
+    #[test]
+    fn preseed_only_uses_tools_enabled_for_the_role() {
+        let mut analyst = Turn::new(
+            "turn-1",
+            "session",
+            "run",
+            "analyst.technical",
+            "role prompt",
+        );
+        analyst.phase = Some(1);
+        assert!(preseed_tool_calls(&analyst, &["QQQ".to_string()], &[]).is_empty());
+
+        let calls = preseed_tool_calls(
+            &analyst,
+            &["QQQ".to_string()],
+            &[
+                tools::READ_EXPERIENCE_TOOL_NAME.to_string(),
+                "read_technical_context".to_string(),
+            ],
+        );
+        assert_eq!(calls.len(), 4);
+        assert_eq!(calls[0].name, tools::READ_EXPERIENCE_TOOL_NAME);
+        assert!(calls
+            .iter()
+            .skip(1)
+            .all(|call| call.name == "read_technical_context"));
     }
 
     #[test]

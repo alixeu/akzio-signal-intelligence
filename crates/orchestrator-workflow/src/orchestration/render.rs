@@ -272,16 +272,12 @@ pub(crate) fn render_prompt_with_plugins(
         .unwrap_or(Value::Null);
     let analyst_output_contract_template =
         prompt_component(prompt_path, "common/analyst_output_contract.md")?;
-    let anti_injection_template = prompt_component(prompt_path, "common/anti_injection.md")?;
     let research_calibration_template =
         prompt_component(prompt_path, "common/research_calibration.md")?;
     let research_drivers_template = prompt_component(prompt_path, "common/research_drivers.md")?;
-    let analysis_trace_contract_template =
-        prompt_component(prompt_path, "common/analysis_trace.md")?;
     let risk_analyst_template = prompt_component(prompt_path, "phase5/risk_analyst.md")?;
     let leveraged_etf_rules_template =
         prompt_component(prompt_path, "common/leveraged_etf_rules.md")?;
-    let experience_contract_template = prompt_component(prompt_path, "common/experience.md")?;
     // Render components with the schema in scope so a `{analyst_artifact_schema}`
     // placeholder inside the contract is resolved before the component text is
     // spliced into the role prompt (the outer pass runs once, in key order, and
@@ -299,29 +295,49 @@ pub(crate) fn render_prompt_with_plugins(
     });
     let analyst_output_contract =
         replace_placeholders(&analyst_output_contract_template, &component_values);
-    let anti_injection = replace_placeholders(&anti_injection_template, &component_values);
     let research_calibration =
         replace_placeholders(&research_calibration_template, &component_values);
     let research_drivers = replace_placeholders(&research_drivers_template, &component_values);
-    let analysis_trace_contract =
-        replace_placeholders(&analysis_trace_contract_template, &component_values);
     let leveraged_etf_rules = if contains_leveraged_etf(&tickers) {
         replace_placeholders(&leveraged_etf_rules_template, &component_values)
     } else {
         String::new()
     };
-    let experience_contract =
-        replace_placeholders(&experience_contract_template, &component_values);
     let stance_role_label = role.strip_prefix("risk.").unwrap_or("");
+    let (side, side_label, opponent, opponent_label, side_strategy_path) =
+        if role.contains(".bull.") {
+            (
+                "bull",
+                "看多",
+                "bear",
+                "看空",
+                Some("phase2/researcher/side_bull.md"),
+            )
+        } else if role.contains(".bear.") {
+            (
+                "bear",
+                "看空",
+                "bull",
+                "看多",
+                Some("phase2/researcher/side_bear.md"),
+            )
+        } else {
+            ("", "", "", "", None)
+        };
+    let side_strategy = side_strategy_path
+        .map(|path| prompt_component(prompt_path, path))
+        .transpose()?
+        .unwrap_or_default();
     let static_values = json!({
         "ticker": ticker,
         "tickers": tickers.join(","),
         "common_ticker_prompt": "",
         "analyst_output_contract": analyst_output_contract,
-        "anti_injection": anti_injection,
+        "anti_injection": "",
         "research_calibration": research_calibration,
         "research_drivers": research_drivers,
-        "analysis_trace_contract": analysis_trace_contract,
+        "analysis_trace_contract": "",
+        "experience_contract": "",
         "leveraged_etf_rules": leveraged_etf_rules,
         "analyst_artifact_schema": analyst_artifact_schema(),
         "research_artifact_schema": research_artifact_schema(),
@@ -333,10 +349,11 @@ pub(crate) fn render_prompt_with_plugins(
         "phase": phase,
         "kind": kind,
         "lang": state.get("lang").and_then(Value::as_str).unwrap_or("zh"),
-        "side": "",
-        "side_label": "",
-        "opponent": "",
-        "opponent_label": "",
+        "side": side,
+        "side_label": side_label,
+        "opponent": opponent,
+        "opponent_label": opponent_label,
+        "side_strategy": side_strategy,
         "stance": stance_role_label,
         "stance_label": stance_role_label,
         "stance_intro": "",
@@ -406,12 +423,32 @@ pub(crate) fn render_prompt_with_plugins(
             Value::String(risk_analyst_body),
         );
     }
-    let rendered = replace_placeholders(&template, &values);
-    if (1..=6).contains(&phase) && !experience_contract.trim().is_empty() {
-        Ok(format!("{rendered}\n\n{experience_contract}"))
-    } else {
-        Ok(rendered)
-    }
+    Ok(replace_placeholders(&template, &values))
+}
+
+/// Public lint entry point. The CLI deliberately shares the production
+/// renderer so placeholder checks cannot drift from runtime composition.
+#[allow(clippy::too_many_arguments)]
+pub fn render_prompt_for_lint(
+    state: &Value,
+    role: &str,
+    phase: i64,
+    kind: &str,
+    round: Option<i64>,
+    topic_id: Option<&str>,
+    prompt_path: &std::path::Path,
+    component_registry: &ComponentRegistry,
+) -> Result<String> {
+    render_prompt_with_plugins(
+        state,
+        role,
+        phase,
+        kind,
+        round,
+        topic_id,
+        Some(prompt_path),
+        Some(component_registry),
+    )
 }
 
 #[cfg(test)]
@@ -435,6 +472,25 @@ required_variables = ["ticker", "tickers"]
         )
         .unwrap();
         std::fs::write(prompts.join("common/components/ticker/component.md"), body).unwrap();
+    }
+
+    fn write_component(
+        prompts: &std::path::Path,
+        name: &str,
+        injection_points: &str,
+        placeholder_key: &str,
+        body: &str,
+    ) {
+        let dir = prompts.join("common/components").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("manifest.toml"),
+            format!(
+                "name = \"{name}\"\ninjection_points = {injection_points}\nplaceholder_key = \"{placeholder_key}\"\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(dir.join("component.md"), body).unwrap();
     }
 
     #[test]
@@ -503,11 +559,13 @@ required_variables = ["ticker", "tickers"]
             "CONTRACT for {ticker}",
         )
         .unwrap();
-        std::fs::write(
-            prompts.join("common/anti_injection.md"),
+        write_component(
+            &prompts,
+            "anti_injection",
+            "[\"*\"]",
+            "anti_injection",
             "NO-INJECT boundary",
-        )
-        .unwrap();
+        );
         let prompt_path = prompts.join("phase1/technical.md");
         std::fs::write(
             &prompt_path,
@@ -776,6 +834,12 @@ required_variables = ["ticker", "tickers"]
         "{research_calibration}",
         "{research_drivers}",
         "{analysis_trace_contract}",
+        "{experience_contract}",
+        "{side}",
+        "{side_label}",
+        "{opponent}",
+        "{opponent_label}",
+        "{side_strategy}",
         "{leveraged_etf_rules}",
         "{analyst_artifact_schema}",
         "{research_artifact_schema}",
@@ -1006,16 +1070,24 @@ required_variables = ["ticker", "tickers"]
                 "phase2/topic_generator.md",
                 "topic_generation",
             ),
-            ("researcher.bull.initial", "phase2/bull.md", "bull_seed"),
-            ("researcher.bear.initial", "phase2/bear.md", "bear_seed"),
+            (
+                "researcher.bull.initial",
+                "phase2/researcher/seed.md",
+                "bull_seed",
+            ),
+            (
+                "researcher.bear.initial",
+                "phase2/researcher/seed.md",
+                "bear_seed",
+            ),
             (
                 "researcher.bull.interaction",
-                "phase2/bull.md",
+                "phase2/researcher/debate.md",
                 "bull_packet",
             ),
             (
                 "researcher.bear.interaction",
-                "phase2/bear.md",
+                "phase2/researcher/debate.md",
                 "bear_packet",
             ),
             (
@@ -1068,7 +1140,7 @@ required_variables = ["ticker", "tickers"]
     }
 
     #[test]
-    fn phase2_plus_and_summary_prompts_include_public_analysis_trace_contract() {
+    fn only_analytical_execution_and_summary_roles_receive_trace_components() {
         let prompts = project_prompts_dir();
         if !prompts.exists() {
             return;
@@ -1087,19 +1159,6 @@ required_variables = ["ticker", "tickers"]
                 "topic_generation",
                 "phase2/topic_generator.md",
             ),
-            ("researcher.bull.initial", 2, "bull_seed", "phase2/bull.md"),
-            (
-                "researcher.bear.interaction",
-                2,
-                "bear_packet",
-                "phase2/bear.md",
-            ),
-            (
-                "mediator.topic_controller",
-                2,
-                "controller_packet",
-                "phase2/topic_controller.md",
-            ),
             (
                 "manager.research",
                 3,
@@ -1107,19 +1166,6 @@ required_variables = ["ticker", "tickers"]
                 "phase3/research_manager.md",
             ),
             ("trader", 4, "artifact", "phase4/trader.md"),
-            (
-                "risk.aggressive",
-                5,
-                "risk_argument",
-                "phase5/aggressive.md",
-            ),
-            ("risk.neutral", 5, "risk_argument", "phase5/neutral.md"),
-            (
-                "risk.conservative",
-                5,
-                "risk_argument",
-                "phase5/conservative.md",
-            ),
             (
                 "portfolio.manager",
                 6,
@@ -1141,12 +1187,44 @@ required_variables = ["ticker", "tickers"]
             )
             .unwrap_or_else(|error| panic!("render failed for {role} ({relative}): {error}"));
             assert!(
-                prompt.contains("# 公共可审计分析轨迹"),
-                "{relative} did not receive the shared analysis trace contract"
+                prompt.contains("审计轨迹"),
+                "{relative} did not receive its role-specific trace component"
             );
             assert!(
                 !prompt.contains("{analysis_trace_contract}"),
                 "{relative} retained an unresolved analysis trace placeholder"
+            );
+        }
+
+        for (role, phase, kind, relative) in [
+            (
+                "researcher.bull.initial",
+                2,
+                "bull_seed",
+                "phase2/researcher/seed.md",
+            ),
+            (
+                "mediator.topic_controller",
+                2,
+                "controller_packet",
+                "phase2/topic_controller.md",
+            ),
+            ("risk.neutral", 5, "risk_argument", "phase5/neutral.md"),
+        ] {
+            let prompt = render_prompt(
+                &state,
+                role,
+                phase,
+                kind,
+                Some(1),
+                Some("QQQ-aggregate"),
+                Some(&prompts.join(relative)),
+                None,
+            )
+            .unwrap_or_else(|error| panic!("render failed for {role} ({relative}): {error}"));
+            assert!(
+                !prompt.contains("审计轨迹"),
+                "{relative} received an inapplicable trace component"
             );
         }
 
@@ -1333,8 +1411,11 @@ required_variables = ["ticker", "tickers"]
             "phase1/news_macro.md",
             "common/analyst_output_contract.md",
             "phase3/research_manager.md",
-            "phase2/bull.md",
-            "phase2/bear.md",
+            "phase2/researcher/warmup.md",
+            "phase2/researcher/seed.md",
+            "phase2/researcher/debate.md",
+            "phase2/researcher/side_bull.md",
+            "phase2/researcher/side_bear.md",
         ] {
             let content = std::fs::read_to_string(prompts.join(relative)).unwrap();
             for removed in ["YouTube", "Reddit", "Twitter"] {

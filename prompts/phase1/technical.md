@@ -6,6 +6,8 @@
 
 {analyst_output_contract}
 
+{experience_contract}
+
 <!-- STATIC PREFIX (cached by OpenAI) -->
 ## 权威输入
 

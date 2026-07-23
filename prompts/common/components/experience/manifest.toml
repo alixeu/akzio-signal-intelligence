@@ -1,0 +1,5 @@
+name = "experience"
+injection_points = ["analyst.technical", "analyst.news_macro", "manager.research"]
+priority = 30
+placeholder_key = "experience_contract"
+enabled = true

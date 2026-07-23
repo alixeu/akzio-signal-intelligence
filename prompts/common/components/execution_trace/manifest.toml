@@ -1,0 +1,5 @@
+name = "execution_trace"
+injection_points = ["trader", "portfolio.manager"]
+priority = 30
+placeholder_key = "analysis_trace_contract"
+enabled = true

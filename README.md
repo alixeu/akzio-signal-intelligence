@@ -210,16 +210,16 @@ Active prompts are owned by the phase that executes them:
 | `prompts/common/` | Shared prompt components and contracts |
 | `prompts/system/` | Agent-loop and runtime messages |
 
-`prompts/common/analysis_trace.md` is injected into every analytical Phase 2-6
-role and the Phase Summary compressor. It adds a top-level, auditable
-`analysis_trace` to role artifacts without exposing private chain-of-thought;
-the compressor condenses those traces into `summary_json.analysis_process` with
-stable source references.
+Prompt components under `prompts/common/components/` are injected by role. The
+analytical trace applies only to Topic Generator and Research Manager; Trader
+and Portfolio Manager receive the execution trace; the Phase Summary compressor
+receives the summary trace. Bull/Bear packets, Topic Controller, and Phase 5
+risk reviewers retain their own compact audit records instead of emitting a
+second generic trace.
 
-`prompts/common/experience.md` is injected into every Phase 1-6 role. The
-runtime preloads `read_experience` per ticker, and each role must trace which
-experience IDs it applied or rejected. Experience is advisory and cannot
-replace current evidence.
+Historical experience is preloaded only for the two Phase 1 analysts and the
+Research Manager. No matching experience is a valid empty result; experience is
+advisory and cannot replace current evidence.
 
 There is deliberately no `phase25` bucket. Phase 2 topic generation is an LLM
 role with a Rust-owned evidence gate and runtime envelope; final debate reduction

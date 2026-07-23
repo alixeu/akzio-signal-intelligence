@@ -44,6 +44,7 @@ pub const VALID_PLACEHOLDERS: &[&str] = &[
     "research_calibration",
     "research_drivers",
     "analysis_trace_contract",
+    "experience_contract",
     "leveraged_etf_rules",
     "analyst_artifact_schema",
     "research_artifact_schema",
@@ -53,6 +54,7 @@ pub const VALID_PLACEHOLDERS: &[&str] = &[
     "portfolio_allocation_schema",
     "side",
     "side_label",
+    "side_strategy",
     "opponent",
     "opponent_label",
     "stance",
@@ -101,12 +103,10 @@ pub const SCHEMA_PLACEHOLDERS: &[&str] = &[
 /// Shared component files under `prompts/common/`.
 #[allow(dead_code)]
 pub const COMMON_COMPONENTS: &[&str] = &[
-    "anti_injection.md",
     "analyst_output_contract.md",
     "leveraged_etf_rules.md",
     "research_calibration.md",
     "research_drivers.md",
-    "analysis_trace.md",
 ];
 
 pub fn run_all_checks(prompts_dir: &Path) -> Result<LintReport> {
@@ -253,6 +253,8 @@ fn infer_role_from_path(path: &Path, prompts_dir: &Path) -> String {
             "bull" | "bear" => format!("researcher.{stem}.initial"),
             "topic_generator" => "mediator.topic".to_string(),
             "topic_controller" => "mediator.topic_controller".to_string(),
+            "warmup" | "seed" => "researcher.bull.initial".to_string(),
+            "debate" => "researcher.bull.interaction".to_string(),
             _ => String::new(),
         },
         "phase3" if stem == "research_manager" => "manager.research".to_string(),

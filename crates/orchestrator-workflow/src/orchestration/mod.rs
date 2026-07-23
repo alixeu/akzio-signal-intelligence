@@ -6,7 +6,7 @@ pub(crate) mod conflict_detection;
 pub(crate) mod degraded;
 pub(crate) mod lifecycle;
 pub(crate) mod policy;
-pub(crate) mod render;
+pub mod render;
 pub(crate) mod retrieval;
 pub(crate) mod role_jobs;
 
