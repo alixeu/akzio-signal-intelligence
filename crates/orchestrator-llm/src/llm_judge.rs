@@ -7,8 +7,7 @@ pub const DEFAULT_JUDGE_MODEL: &str = "gpt-4o-mini";
 
 /// Classification prompt for the LLM judge.
 /// Kept minimal to reduce token usage (~100 input tokens + ~5 output tokens).
-pub const JUDGE_PROMPT_TEMPLATE: &str =
-    include_str!("../../../prompts/system/judge.md");
+pub const JUDGE_PROMPT_TEMPLATE: &str = include_str!("../../../prompts/system/judge.md");
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JudgeConfig {

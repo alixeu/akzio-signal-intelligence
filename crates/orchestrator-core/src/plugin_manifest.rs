@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Manifest for a prompt component plugin.
-/// Lives at `prompts/components/<name>/manifest.toml`.
+/// Lives at `prompts/common/components/<name>/manifest.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ComponentManifest {
     /// Unique component name (e.g., "ticker", "anti_injection").

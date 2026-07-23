@@ -79,9 +79,9 @@ pub struct RolePlugin {
 }
 
 impl ComponentRegistry {
-    /// Scan `prompts/components/` for subdirectories containing `manifest.toml`.
+    /// Scan `prompts/common/components/` for subdirectories containing `manifest.toml`.
     pub fn discover(prompts_dir: &Path) -> Result<Self> {
-        Self::discover_dir(&prompts_dir.join("components"))
+        Self::discover_dir(&prompts_dir.join("common/components"))
     }
 
     /// Scan one component plugin root directory.
@@ -414,7 +414,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn write_component(root: &Path, name: &str, injection_points: &str, priority: i32) {
-        let dir = root.join("components").join(name);
+        let dir = root.join("common/components").join(name);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("manifest.toml"),
@@ -468,7 +468,7 @@ required_variables = ["ticker"]
     fn renders_components_into_value_map() {
         let temp = TempDir::new().unwrap();
         let prompts = temp.path().join("prompts");
-        let dir = prompts.join("components/ticker");
+        let dir = prompts.join("common/components/ticker");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("manifest.toml"),

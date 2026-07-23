@@ -577,6 +577,8 @@ fn is_transient_role_error(message: &str) -> bool {
         || text.contains("timeout")
         || text.contains("timed out")
         || text.contains("connection reset")
+        || text.contains("transport error")
+        || text.contains("error decoding response body")
         || text.contains("temporarily unavailable")
         || text.contains("upstream_error")
         || text.contains("upstream request failed")
@@ -930,6 +932,13 @@ mod tests {
         let message = "LLM stream chunk failed: InvalidStatusCodeWithMessage(502, \
             \"{\\\"error\\\":{\\\"message\\\":\\\"Upstream request failed\\\",\\\"type\\\":\\\"upstream_error\\\"}}\")";
         assert!(is_transient_role_error(message));
+    }
+
+    #[test]
+    fn stream_transport_decode_error_is_transient_role_error() {
+        assert!(is_transient_role_error(
+            "Chat Completions stream chunk failed: stream failed: EventStream error: Transport error: error decoding response body"
+        ));
     }
 
     #[test]

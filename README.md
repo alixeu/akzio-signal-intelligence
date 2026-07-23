@@ -110,6 +110,12 @@ The workflow refreshes both sources during Phase 1. Use `--tech-refresh-enabled=
 
 ## Run the workflow
 
+Active prompts are organized by workflow scope: `prompts/common/` holds shared
+content, `prompts/system/` holds runtime messages, and phase-owned prompts live
+under `prompts/phase0/`, `prompts/phase1/`, and `prompts/phase25/`. After each
+business phase, the workflow completes its phase00 summary before starting the
+next phase.
+
 ```bash
 rtk cargo run -p orchestrator-cli --bin orchestrator-exec -- \
   --from-phase 1 \
@@ -120,7 +126,7 @@ Useful options:
 
 - `--db-path PATH`: override the SQLite database.
 - `--run-dir PATH`: emit `state.json` and a final summary for inspection.
-- `--debug`: write formatted per-role request/response snapshots plus timing and token JSON arrays.
+- `--debug`: print workflow and agent-loop debug logs to the console, and write per-role request/response snapshots plus timing and token JSON arrays.
 - `--max-debate-rounds N`: cap conditional debate rounds.
 - `--max-topics-per-side N`: cap material conflict topics.
 

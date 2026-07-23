@@ -252,6 +252,10 @@ pub fn normalize_evidence_type(raw: &str) -> String {
 pub fn normalize_analyst_ticker_artifact(artifact: &mut AnalystTickerArtifact) {
     for item in &mut artifact.key_evidence {
         item.evidence_type = normalize_evidence_type(&item.evidence_type);
+        item.source_tier = match item.source_tier.to_ascii_lowercase().as_str() {
+            "t1_reference" | "t2_reference" | "t3_reference" => "unknown".to_string(),
+            _ => item.source_tier.clone(),
+        };
     }
 }
 
@@ -1199,6 +1203,17 @@ mod tests {
         let error = validate_analyst_ticker_artifact(&artifact).unwrap_err();
 
         assert!(error.contains("key_evidence"));
+    }
+
+    #[test]
+    fn analyst_normalization_maps_legacy_reference_tier_to_unknown() {
+        let mut artifact = valid_analyst_ticker_artifact();
+        artifact.key_evidence[0].source_tier = "T1_reference".to_string();
+
+        normalize_analyst_ticker_artifact(&mut artifact);
+
+        assert_eq!(artifact.key_evidence[0].source_tier, "unknown");
+        validate_analyst_ticker_artifact(&artifact).unwrap();
     }
 
     #[test]

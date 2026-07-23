@@ -243,38 +243,34 @@ fn infer_role_from_path(path: &Path, prompts_dir: &Path) -> String {
         .unwrap_or("");
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
     match category {
-        "analysts" => format!("analyst.{stem}"),
-        "researchers" => {
-            let mut tokens: Vec<&str> = stem.split('_').collect();
-            if tokens.last() == Some(&"monitor") {
-                tokens.pop();
-            }
-            if tokens.len() >= 2 {
-                format!("researcher.{}.{}", tokens[0], tokens[1..].join("."))
-            } else {
-                format!("researcher.{stem}")
-            }
-        }
-        "managers" => match stem {
+        "phase0" => format!("compressor.{stem}"),
+        "phase1" => format!("analyst.{stem}"),
+        "phase25" if rel.components().nth(1).is_some() => String::new(),
+        "phase25" => match stem {
+            "bull" | "bear" => format!("researcher.{stem}.initial"),
+            "topic_controller" => "mediator.topic_controller".to_string(),
             "research_manager" => "manager.research".to_string(),
             "portfolio_manager" => "portfolio.manager".to_string(),
-            other => format!("manager.{other}"),
+            "trader" => "trader".to_string(),
+            "conservative" => "risk.conservative".to_string(),
+            _ => String::new(),
         },
-        "mediators" => match stem {
-            "topic_controller" => "mediator.topic_controller".to_string(),
-            other => format!("mediator.{other}"),
-        },
-        "compressors" => format!("compressor.{stem}"),
-        "risk" => format!("risk.{stem}"),
-        "traders" => "trader".to_string(),
         _ => String::new(),
     }
 }
 
 fn is_runtime_prompt(path: &Path, prompts_dir: &Path) -> bool {
-    path.strip_prefix(prompts_dir)
-        .ok()
-        .and_then(|relative| relative.components().next())
-        .and_then(|component| component.as_os_str().to_str())
-        == Some("runtime")
+    let Some(relative) = path.strip_prefix(prompts_dir).ok() else {
+        return false;
+    };
+    let mut components = relative.components();
+    let category = components
+        .next()
+        .and_then(|component| component.as_os_str().to_str());
+    matches!(category, Some("runtime" | "system"))
+        || (category == Some("phase25")
+            && components
+                .next()
+                .and_then(|component| component.as_os_str().to_str())
+                == Some("messages"))
 }

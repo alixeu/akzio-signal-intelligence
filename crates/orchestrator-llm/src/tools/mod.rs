@@ -341,9 +341,7 @@ mod tests {
         let defs: Vec<_> = names.iter().filter_map(|n| tool_definition(n)).collect();
         assert_eq!(defs.len(), 3);
         assert!(defs.iter().any(|tool| tool.name == "web_run"));
-        assert!(defs
-            .iter()
-            .any(|tool| tool.name == "read_phase_summaries"));
+        assert!(defs.iter().any(|tool| tool.name == "read_phase_summaries"));
         assert!(defs
             .iter()
             .any(|tool| tool.name == "read_phase_summary_details"));

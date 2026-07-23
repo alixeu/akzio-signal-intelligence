@@ -274,6 +274,11 @@ async fn mock_exec_phase8_writes_archive_predictions_and_system_metrics() {
 
     let state = &result["run_state"];
     assert_eq!(state["phase_status"]["8"], "done");
+    for phase in 1..=7 {
+        let phase = phase.to_string();
+        assert_eq!(state["phase_compress"][&phase]["status"], "done");
+        assert_eq!(state["phase_compress"][&phase]["persisted"], true);
+    }
 
     let conn = Connection::open(db_path).unwrap();
     let archive_count: i64 = conn

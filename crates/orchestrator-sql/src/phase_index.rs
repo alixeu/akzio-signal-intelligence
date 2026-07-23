@@ -280,19 +280,23 @@ impl Phase00MemoryIndex {
             anyhow::bail!("summary_id is required");
         }
         if self.run_id != run_id {
-            return Ok(empty_phase_details(summary_id, "summary not found or not visible"));
+            return Ok(empty_phase_details(
+                summary_id,
+                "summary not found or not visible",
+            ));
         }
         let parent_phase = self.phases.iter().find_map(|(phase, batch)| {
             (*phase <= max_source_phase
                 && batch.summaries.iter().any(|row| {
-                    row.id == summary_id
-                        && row.run_id == run_id
-                        && row.source_phase == *phase
+                    row.id == summary_id && row.run_id == run_id && row.source_phase == *phase
                 }))
             .then_some(*phase)
         });
         let Some(parent_phase) = parent_phase else {
-            return Ok(empty_phase_details(summary_id, "summary not found or not visible"));
+            return Ok(empty_phase_details(
+                summary_id,
+                "summary not found or not visible",
+            ));
         };
         let mut items = Vec::new();
         if let Some(batch) = self.phases.get(&parent_phase) {

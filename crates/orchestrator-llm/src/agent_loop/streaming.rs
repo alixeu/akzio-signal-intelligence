@@ -211,6 +211,7 @@ impl<'a, S: AgentEventSink> ModelStreamHandler<'a, S> {
                 );
                 self.result.usage += token_usage;
                 self.result.turn_count += 1;
+                self.result.end_turn = end_turn;
                 if !end_turn {
                     self.result.needs_follow_up = true;
                 }

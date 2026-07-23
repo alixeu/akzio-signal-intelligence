@@ -23,14 +23,12 @@ use crate::truncation::{truncate_semantic, TruncationConfig};
 use crate::AgentSettings;
 
 const DEFAULT_MAX_AGENT_LOOPS: usize = 8;
-const SYSTEM_PROMPT_TEMPLATE: &str =
-    include_str!("../../../../prompts/system/agent_loop.md");
+const SYSTEM_PROMPT_TEMPLATE: &str = include_str!("../../../../prompts/system/agent_loop.md");
 const REQUEST_WRAPPER_TEMPLATE: &str =
-    include_str!("../../../../prompts/messages/request_wrapper.md");
+    include_str!("../../../../prompts/system/messages/request_wrapper.md");
 const ARTIFACT_RETRY_INSTRUCTION: &str =
-    include_str!("../../../../prompts/messages/artifact_retry.md");
-const FINALIZE_INSTRUCTION: &str =
-    include_str!("../../../../prompts/messages/finalize.md");
+    include_str!("../../../../prompts/system/messages/artifact_retry.md");
+const FINALIZE_INSTRUCTION: &str = include_str!("../../../../prompts/system/messages/finalize.md");
 
 pub struct AgentLoopModel {
     settings: AgentSettings,
@@ -220,13 +218,27 @@ where
     let mut first_iteration = true;
     let max_loops = config.max_agent_loops.map(|value| value.max(1));
     let mut loop_index = 0usize;
+    let mut end_turn_count = 0usize;
     let mut aggregate_result = ModelStreamResult::default();
     let mut judge_call_count = 0usize;
     loop {
         if let Some(max_loops) = max_loops {
-            if loop_index >= max_loops {
+            if end_turn_count >= max_loops {
                 turn.end_reason = Some("max_loops".to_string());
-                bail!("agent loop reached max_agent_loops={}", max_loops);
+                warn!(
+                    turn_id = turn.turn_id,
+                    role = turn.role,
+                    phase = turn.phase,
+                    model_iterations = loop_index,
+                    completed_end_turns = end_turn_count,
+                    max_end_turns = max_loops,
+                    pending_input = turn.pending_input.len(),
+                    pending_tool_calls = turn.pending_tool_calls.len(),
+                    "agent loop exhausted its end-turn budget"
+                );
+                bail!(
+                    "agent loop reached max_agent_loops={max_loops} after end_turns={end_turn_count}"
+                );
             }
         }
         loop_index += 1;
@@ -276,6 +288,17 @@ where
             .tool_calls
             .extend(stream_result.tool_calls.iter().cloned());
         aggregate_result.needs_follow_up = stream_result.needs_follow_up;
+        if stream_result.end_turn {
+            end_turn_count += 1;
+            debug!(
+                turn_id = turn.turn_id,
+                role = turn.role,
+                loop_index,
+                end_turn_count,
+                max_end_turns = ?max_loops,
+                "agent loop recorded end_turn"
+            );
+        }
 
         if !turn.pending_tool_calls.is_empty() {
             let calls = std::mem::take(&mut turn.pending_tool_calls);
@@ -372,14 +395,19 @@ where
         }
 
         if let Some(text) = last_assistant_message_text(turn) {
-            if turn.role.starts_with("analyst.")
-                && !analyst_final_artifact_looks_valid(&turn.role, &turn_tickers(turn), &text)
-            {
-                turn.tools_disabled = true;
-                turn.push_pending_input(ARTIFACT_RETRY_INSTRUCTION);
-                turn.needs_follow_up = true;
-                persist_turn(conn, turn, &config.truncation)?;
-                continue;
+            if turn.role.starts_with("analyst.") {
+                let validation =
+                    analyst_final_artifact_validation_error(&turn.role, &turn_tickers(turn), &text);
+                if let Err(error) = validation {
+                    warn!(role = turn.role, error = %error, "analyst final artifact rejected");
+                    turn.tools_disabled = true;
+                    turn.push_pending_input(format!(
+                        "{ARTIFACT_RETRY_INSTRUCTION}\nValidation error: {error}"
+                    ));
+                    turn.needs_follow_up = true;
+                    persist_turn(conn, turn, &config.truncation)?;
+                    continue;
+                }
             }
             if seed_packet_role(&turn.role)
                 && text.trim() != "准备完毕"
@@ -1213,10 +1241,7 @@ fn preseed_tool_calls(turn: &Turn, tickers: &[String]) -> Vec<ToolCallRequest> {
         }
         "researcher.bull.initial" | "researcher.bear.initial" if turn_is_warmup(turn) => {
             calls.push(ToolCallRequest {
-                call_id: format!(
-                    "preseed-phase-summaries-{}",
-                    turn.role.replace('.', "-")
-                ),
+                call_id: format!("preseed-phase-summaries-{}", turn.role.replace('.', "-")),
                 name: tools::READ_PHASE_SUMMARIES_TOOL_NAME.to_string(),
                 arguments: json!({}),
             });
@@ -1617,32 +1642,45 @@ fn research_artifact_looks_valid(tickers: &[String], text: &str) -> bool {
     orchestrator_core::validate_research_artifact(&artifact, tickers).is_ok()
 }
 
+#[cfg(test)]
 fn analyst_final_artifact_looks_valid(role: &str, expected_tickers: &[String], text: &str) -> bool {
-    let Ok(value) = extract_json_value(text) else {
-        return false;
-    };
+    analyst_final_artifact_validation_error(role, expected_tickers, text).is_ok()
+}
+
+fn analyst_final_artifact_validation_error(
+    role: &str,
+    expected_tickers: &[String],
+    text: &str,
+) -> std::result::Result<(), String> {
+    let value = extract_json_value(text).map_err(|error| error.to_string())?;
+    let value =
+        crate::normalize_analyst_artifact_value(value).map_err(|error| format!("{error:#}"))?;
     if value.get("id").and_then(Value::as_str) != Some(role)
         || value.get("role").and_then(Value::as_str) != Some(role)
     {
-        return false;
+        return Err(format!("id and role must both equal {role}"));
     }
-    let Some(per_ticker) = value.get("per_ticker").and_then(Value::as_object) else {
-        return false;
-    };
+    let per_ticker = value
+        .get("per_ticker")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "per_ticker must be an object".to_string())?;
     let expected = expected_tickers
         .iter()
         .collect::<std::collections::BTreeSet<_>>();
     let actual = per_ticker.keys().collect::<std::collections::BTreeSet<_>>();
     if actual != expected {
-        return false;
+        return Err(format!(
+            "per_ticker keys must equal {expected:?}, got {actual:?}"
+        ));
     }
-    per_ticker.values().all(|payload| {
-        serde_json::from_value::<orchestrator_core::AnalystTickerArtifact>(payload.clone())
-            .ok()
-            .is_some_and(|artifact| {
-                orchestrator_core::validate_analyst_ticker_artifact(&artifact).is_ok()
-            })
-    })
+    for (ticker, payload) in per_ticker {
+        let payload =
+            serde_json::from_value::<orchestrator_core::AnalystTickerArtifact>(payload.clone())
+                .map_err(|error| format!("per_ticker.{ticker}: {error}"))?;
+        orchestrator_core::validate_analyst_ticker_artifact(&payload)
+            .map_err(|error| format!("per_ticker.{ticker}: {error}"))?;
+    }
+    Ok(())
 }
 
 pub fn classify_assistant_message(text: &str, turn_status: TurnStatus) -> FollowUpDecision {
@@ -2623,6 +2661,44 @@ mod tests {
             &expected_tickers,
             wrong_id
         ));
+
+        let legacy_source_tier = r#"{
+            "id":"analyst.technical",
+            "role":"analyst.technical",
+            "per_ticker":{
+                "QQQ":{
+                    "direction":"bullish",
+                    "confidence":0.7,
+                    "report":"QQQ remains above its 20-day average.",
+                    "key_evidence":[{
+                        "claim":"QQQ closed above its 20-day average.",
+                        "evidence_type":"fact",
+                        "source":"Yahoo Finance daily OHLCV",
+                        "timestamp":"2026-07-22",
+                        "source_tier":"T1_reference",
+                        "source_confidence":0.9
+                    }]
+                },
+                "SOXX":{
+                    "direction":"bearish",
+                    "confidence":0.6,
+                    "report":"SOXX remains below its 20-day average.",
+                    "key_evidence":[{
+                        "claim":"SOXX closed below its 20-day average.",
+                        "evidence_type":"fact",
+                        "source":"Yahoo Finance daily OHLCV",
+                        "timestamp":"2026-07-22",
+                        "source_tier":"T1_reference",
+                        "source_confidence":0.9
+                    }]
+                }
+            }
+        }"#;
+        assert!(analyst_final_artifact_looks_valid(
+            "analyst.technical",
+            &expected_tickers,
+            legacy_source_tier
+        ));
     }
 
     #[tokio::test]
@@ -3422,6 +3498,48 @@ mod tests {
         assert!(has_summary);
     }
 
+    #[tokio::test]
+    async fn max_agent_loops_counts_end_turns_not_model_iterations() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+        let mut responses = vec![
+            model_response(Some("Still gathering evidence."), false),
+            model_response(Some("Still gathering evidence."), false),
+            model_response(Some("Still gathering evidence."), false),
+            model_response(Some("Still gathering evidence."), false),
+            model_response(Some("Still gathering evidence."), false),
+            model_response(Some("Still gathering evidence."), false),
+        ];
+        responses.push(model_response(
+            Some("Final answer ready for downstream consumers after completing the requested analysis steps without further tool calls. detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail "),
+            true,
+        ));
+        let mut model = FakeModel::new(responses);
+        let mut tools = StaticToolRuntime::new();
+        let mut turn = Turn::new(
+            "turn-end-budget",
+            "session-1",
+            "run-1",
+            "loop.test",
+            "start",
+        );
+
+        run_turn(
+            &conn,
+            &mut turn,
+            &mut model,
+            &mut tools,
+            AgentLoopConfig {
+                max_agent_loops: Some(1),
+                ..AgentLoopConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(model.seen_inputs.len(), 7);
+    }
+
     #[test]
     fn react_prompt_splits_static_role_prompt_from_dynamic_turn_items() {
         let tool_result = ToolResultItem {
@@ -3497,7 +3615,9 @@ mod tests {
         assert!(instruction.contains("analyst.technical"));
         assert!(instruction.contains("QQQ"));
         assert!(instruction.contains("SOXX"));
-        assert!(instruction.contains("Artifact role and ticker coverage must match the active role"));
+        assert!(
+            instruction.contains("Artifact role and ticker coverage must match the active role")
+        );
         assert!(!instruction.contains("JSON with id, role, status, per_ticker"));
     }
 

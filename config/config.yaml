@@ -24,12 +24,12 @@ orchestrator:
 
   prompts:
     compressor:
-      phase00: prompts/compressors/phase00.md
+      phase00: prompts/phase0/phase00.md
     phase2:
-      bull_initial: prompts/researchers/bull.md
-      bull_interaction: prompts/researchers/bull.md
-      bear_initial: prompts/researchers/bear.md
-      bear_interaction: prompts/researchers/bear.md
+      bull_initial: prompts/phase25/bull.md
+      bull_interaction: prompts/phase25/bull.md
+      bear_initial: prompts/phase25/bear.md
+      bear_interaction: prompts/phase25/bear.md
 
   llm:
     gateway:

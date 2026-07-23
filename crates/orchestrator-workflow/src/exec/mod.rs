@@ -55,19 +55,19 @@ pub use args::*;
 type TopicDebateResult = (String, Vec<Value>, Value, Value);
 
 const PHASE2_TOPIC_FORK_USER_PROMPT: &str =
-    include_str!("../../../../prompts/messages/phase2/topic_fork_user.md");
+    include_str!("../../../../prompts/phase25/messages/topic_fork_user.md");
 const PHASE2_WARMUP_INSTRUCTION: &str =
-    include_str!("../../../../prompts/messages/phase2/warmup.md");
+    include_str!("../../../../prompts/phase25/messages/warmup.md");
 const PHASE2_TOPIC_FORK_REQUIREMENT: &str =
-    include_str!("../../../../prompts/messages/phase2/topic_fork_requirement.md");
+    include_str!("../../../../prompts/phase25/messages/topic_fork_requirement.md");
 const PHASE2_SEED_PACKAGING_REQUIREMENT: &str =
-    include_str!("../../../../prompts/messages/phase2/seed_packaging.md");
+    include_str!("../../../../prompts/phase25/messages/seed_packaging.md");
 const PHASE2_CROSS_EXAMINATION_REQUIREMENT: &str =
-    include_str!("../../../../prompts/messages/phase2/cross_examination.md");
+    include_str!("../../../../prompts/phase25/messages/cross_examination.md");
 const PHASE2_POINT_DEBATE_REQUIREMENT: &str =
-    include_str!("../../../../prompts/messages/phase2/point_debate.md");
+    include_str!("../../../../prompts/phase25/messages/point_debate.md");
 const PHASE3_PROBABILITY_RETRY_REQUIREMENT: &str =
-    include_str!("../../../../prompts/messages/phase2/phase3_probability_retry.md");
+    include_str!("../../../../prompts/phase25/messages/phase3_probability_retry.md");
 
 struct PhaseTimer {
     phase: i64,
@@ -188,8 +188,8 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         validate_sqlite_context(&conn, &runtime_config)?;
     }
 
-    // Phase-00 compress jobs run overlapping the next stage.
-    // Tools that need the index wait via Phase00Gate; do not block phase start.
+    // Each completed business phase is synchronously summarized by phase00 before
+    // the next phase starts, so downstream roles always see a complete index.
     let mut compress_jobs: Vec<(i64, std::thread::JoinHandle<Result<CompressJobResult>>)> =
         Vec::new();
     let phase00_gate = std::sync::Arc::new(orchestrator_sql::Phase00Gate::new(&run_id));
@@ -221,11 +221,10 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
                 &runtime_config,
             ),
         ));
-        debug!("phase 1 completed; phase00 compress(1) scheduled (concurrent with next phase)");
+        await_all_compress_jobs(&mut compress_jobs, &mut state).await?;
+        debug!("phase 1 completed; phase00 compress(1) finished");
     }
     if args.from_phase <= 2 && args.to_phase >= 2 {
-        // Do NOT await compress here — run phase 2 concurrently with phase00(1).
-        // Summary tools wait on Phase00Gate while Phase 00 persists phase 1.
         // Weighting is phase 2/3 work, not phase1 organize.
         materialize_weighted_probability_base(&mut state);
         let max_debate_rounds = args
@@ -268,7 +267,8 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
                 &runtime_config,
             ),
         ));
-        debug!("phase 2 completed; phase00 compress(2) scheduled");
+        await_all_compress_jobs(&mut compress_jobs, &mut state).await?;
+        debug!("phase 2 completed; phase00 compress(2) finished");
     }
     if let Err(error) = inject_phase0_reflection(&conn, &mut state, &runtime_config) {
         tracing::warn!(
@@ -283,8 +283,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         });
     }
     if args.from_phase <= 3 && args.to_phase >= 3 {
-        // Concurrent with phase00(1..2). Tools wait on Phase00Gate.
-        // Best-effort: if compress already finished, refresh state for prompt inject.
+        // Phase00 has already completed for every preceding selected phase.
         if let Some(g) = orchestrator_sql::phase00_gate(&run_id) {
             if !g.has_inflight() {
                 state["phase00_memory"] = g.snapshot().to_state_value();
@@ -315,7 +314,8 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
                 &runtime_config,
             ),
         ));
-        debug!("phase 3 completed; phase00 compress(3) scheduled");
+        await_all_compress_jobs(&mut compress_jobs, &mut state).await?;
+        debug!("phase 3 completed; phase00 compress(3) finished");
     }
     let policy = if state.get("research_plan").is_some() {
         Some(apply_workflow_policy(&mut state, &conn, &runtime_config)?)
@@ -323,7 +323,6 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         None
     };
     if args.from_phase <= 4 && args.to_phase >= 4 {
-        // Trader uses research_plan from state; compress(3) can finish in parallel.
         debug!("phase 4 (trader) starting");
         let phase_timer = start_phase_timer(4, "phase4");
         set_run_current_phase(&mut conn, &run_id, 4)?;
@@ -342,7 +341,6 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             "derived"
         };
         set_phase_status(&mut state, 4, phase4_status);
-        await_all_compress_jobs(&mut compress_jobs, &mut state).await?;
         record_phase_elapsed(&mut state, phase_timer);
         compress_jobs.push((
             4,
@@ -355,7 +353,8 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
                 &runtime_config,
             ),
         ));
-        debug!("phase 4 (trader) completed; phase00 compress(4) scheduled");
+        await_all_compress_jobs(&mut compress_jobs, &mut state).await?;
+        debug!("phase 4 (trader) completed; phase00 compress(4) finished");
     }
     if args.from_phase <= 5 && args.to_phase >= 5 {
         debug!("phase 5 (risk debate) starting");
@@ -376,7 +375,6 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             "skipped"
         };
         set_phase_status(&mut state, 5, phase5_status);
-        await_all_compress_jobs(&mut compress_jobs, &mut state).await?;
         record_phase_elapsed(&mut state, phase_timer);
         compress_jobs.push((
             5,
@@ -389,7 +387,8 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
                 &runtime_config,
             ),
         ));
-        debug!("phase 5 (risk debate) completed; phase00 compress(5) scheduled");
+        await_all_compress_jobs(&mut compress_jobs, &mut state).await?;
+        debug!("phase 5 (risk debate) completed; phase00 compress(5) finished");
     }
     if args.from_phase <= 6 && args.to_phase >= 6 {
         debug!("phase 6 (portfolio manager) starting");
@@ -410,7 +409,6 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             "derived"
         };
         set_phase_status(&mut state, 6, phase6_status);
-        await_all_compress_jobs(&mut compress_jobs, &mut state).await?;
         record_phase_elapsed(&mut state, phase_timer);
         compress_jobs.push((
             6,
@@ -423,7 +421,8 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
                 &runtime_config,
             ),
         ));
-        debug!("phase 6 (portfolio manager) completed; phase00 compress(6) scheduled");
+        await_all_compress_jobs(&mut compress_jobs, &mut state).await?;
+        debug!("phase 6 (portfolio manager) completed; phase00 compress(6) finished");
     }
     if args.from_phase <= 7 && args.to_phase >= 7 {
         debug!("phase 7 (allocation) starting");
@@ -438,7 +437,6 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         )
         .await?;
         set_phase_status(&mut state, 7, "done");
-        await_all_compress_jobs(&mut compress_jobs, &mut state).await?;
         record_phase_elapsed(&mut state, phase_timer);
         compress_jobs.push((
             7,
@@ -451,10 +449,10 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
                 &runtime_config,
             ),
         ));
-        debug!("phase 7 (allocation) completed; phase00 compress(7) scheduled");
+        await_all_compress_jobs(&mut compress_jobs, &mut state).await?;
+        debug!("phase 7 (allocation) completed; phase00 compress(7) finished");
     }
     if args.from_phase <= 8 && args.to_phase >= 8 {
-        await_all_compress_jobs(&mut compress_jobs, &mut state).await?;
         debug!("phase 8 (archive + predict) starting");
         let phase_timer = start_phase_timer(8, "phase8");
         set_run_current_phase(&mut conn, &run_id, 8)?;
@@ -1539,24 +1537,22 @@ async fn run_phase2_side_warmups(
         ));
     }
 
-    let (bull_result, bear_result) = tokio::join!(
-        run_phase2_side_warmup(
-            state.clone(),
-            "bull",
-            model_override,
-            reasoning_effort_override,
-            config,
-        ),
-        run_phase2_side_warmup(
-            state,
-            "bear",
-            model_override,
-            reasoning_effort_override,
-            config,
-        )
-    );
-    let (bull, bull_metrics) = bull_result?;
-    let (bear, bear_metrics) = bear_result?;
+    let (bull, bull_metrics) = run_phase2_side_warmup(
+        state.clone(),
+        "bull",
+        model_override,
+        reasoning_effort_override,
+        config,
+    )
+    .await?;
+    let (bear, bear_metrics) = run_phase2_side_warmup(
+        state,
+        "bear",
+        model_override,
+        reasoning_effort_override,
+        config,
+    )
+    .await?;
     let mut metrics = Vec::new();
     if let Some(items) = bull_metrics.as_array() {
         metrics.extend(items.iter().cloned());
@@ -1590,7 +1586,10 @@ async fn run_phase2_side_warmup(
         .to_string();
     let role = format!("researcher.{side}.initial");
     let metadata = warmup_metadata(&run_id, side);
-    let session_id = metadata["session_id"].as_str().unwrap_or_default().to_string();
+    let session_id = metadata["session_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
     let turn_id = metadata["turn_id"].as_str().unwrap_or_default().to_string();
     let db_path = state
         .get("db_path")
@@ -1602,47 +1601,52 @@ async fn run_phase2_side_warmup(
         .path_for(&role)
         .with_context(|| format!("missing warmup prompt for {role}"))?
         .clone();
-    let artifact = run_single_steer_role_job(
-        SteerRoleRun {
-            state: state.clone(),
-            role: &role,
-            phase: 2,
-            kind: "warmup",
-            round: Some(0),
-            topic_id: None,
-            mock: false,
-            model_override,
-            reasoning_effort_override,
+    for attempt in 1..=2 {
+        let artifact = run_single_steer_role_job(
+            SteerRoleRun {
+                state: state.clone(),
+                role: &role,
+                phase: 2,
+                kind: "warmup",
+                round: Some(0),
+                topic_id: None,
+                mock: false,
+                model_override,
+                reasoning_effort_override,
+                config,
+                prompt_path: Some(prompt_path.as_path()),
+                session_id: session_id.clone(),
+                turn_id: turn_id.clone(),
+                steer: Some(steer_payload(
+                    "warmup",
+                    &json!({
+                        "allow_ready": true,
+                        "instruction": PHASE2_WARMUP_INSTRUCTION.trim()
+                    }),
+                )),
+            },
+            config.workflow.agent_timeout_sec,
             config,
-            prompt_path: Some(prompt_path.as_path()),
-            session_id,
-            turn_id,
-            steer: Some(steer_payload(
-                "warmup",
-                &json!({
-                    "allow_ready": true,
-                    "instruction": PHASE2_WARMUP_INSTRUCTION.trim()
-                }),
-            )),
-        },
-        config.workflow.agent_timeout_sec,
-        config,
-        &mut state,
-        &conn,
-    )
-    .await?;
-    if artifact.get("status").and_then(Value::as_str) != Some("ready")
-        || artifact.get("response").and_then(Value::as_str) != Some("准备完毕")
-    {
-        bail!("{side} warmup did not return the required 准备完毕 handshake");
+            &mut state,
+            &conn,
+        )
+        .await?;
+        if artifact.get("status").and_then(Value::as_str) == Some("ready")
+            && artifact.get("response").and_then(Value::as_str) == Some("准备完毕")
+        {
+            return Ok((
+                metadata,
+                state
+                    .get("role_job_metrics")
+                    .cloned()
+                    .unwrap_or_else(|| json!([])),
+            ));
+        }
+        if attempt == 1 {
+            tracing::warn!(role, "phase 2 warmup handshake failed; retrying once");
+        }
     }
-    Ok((
-        metadata,
-        state
-            .get("role_job_metrics")
-            .cloned()
-            .unwrap_or_else(|| json!([])),
-    ))
+    bail!("{side} warmup did not return the required 准备完毕 handshake")
 }
 
 fn warmup_metadata(run_id: &str, side: &str) -> Value {
@@ -1930,7 +1934,11 @@ fn steer_turn_id_for_role(topic_id: &str, role: &str) -> String {
 
 fn fork_source_turn_id(state: &Value, topic_id: &str, role: &str) -> Option<String> {
     if role.contains("bull.initial") || role.contains("bear.initial") {
-        let side = if role.contains("bull") { "bull" } else { "bear" };
+        let side = if role.contains("bull") {
+            "bull"
+        } else {
+            "bear"
+        };
         return state
             .get("phase2_warmup")?
             .get(side)?
@@ -2332,7 +2340,7 @@ async fn compress_phase_job(
         job.prompt.push_str(
             &include_str!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/../../prompts/messages/compressors/source_payload.md"
+                "/../../prompts/system/messages/source_payload.md"
             ))
             .replace(
                 "{{source_payload}}",
@@ -2359,11 +2367,7 @@ async fn compress_phase_job(
             .artifact
             .as_ref()
             .context("phase00 compressor returned no artifact")?;
-        crate::orchestration::compress::phase00_bundle_to_batch(
-            &state,
-            source_phase,
-            artifact,
-        )?
+        crate::orchestration::compress::phase00_bundle_to_batch(&state, source_phase, artifact)?
     };
     let written = batch.written();
     let conn = orchestrator_sql::connect(
@@ -2410,8 +2414,8 @@ fn apply_compress_result(state: &mut Value, result: CompressJobResult) -> Result
     Ok(())
 }
 
-/// Spawn phase-00 after a business phase; runs concurrent with the next phase.
-/// Tools wait on `Phase00Gate` if they need the index before this job finishes.
+/// Spawn phase-00 after a business phase. The caller awaits the result before
+/// starting the next phase, while the gate remains available to role tools.
 fn spawn_compress_job(
     gate: std::sync::Arc<orchestrator_sql::Phase00Gate>,
     state: &Value,
@@ -3485,11 +3489,7 @@ mod tests {
         assert!(settings
             .tools
             .contains(&"read_technical_context".to_string()));
-        for role in [
-            "trader",
-            "risk.conservative",
-            "portfolio.manager",
-        ] {
+        for role in ["trader", "risk.conservative", "portfolio.manager"] {
             assert!(roles[role].tools.is_empty(), "role={role}");
         }
     }

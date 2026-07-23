@@ -97,7 +97,7 @@ impl PluginConfig {
         let components_dir = project_path(config_str(
             config,
             "orchestrator.plugins.components_dir",
-            "prompts/components",
+            "prompts/common/components",
         ));
         let roles_dir = project_path(config_str(
             config,
@@ -133,7 +133,7 @@ impl RuntimeConfig {
             &mut versions,
             "analyst.technical",
             "orchestrator.prompts.analyst.technical",
-            "prompts/analysts/technical.md",
+            "prompts/phase1/technical.md",
         )?;
         insert_prompt_entry(
             config,
@@ -141,11 +141,11 @@ impl RuntimeConfig {
             &mut versions,
             "analyst.news_macro",
             "orchestrator.prompts.analyst.news_macro",
-            "prompts/analysts/news_macro.md",
+            "prompts/phase1/news_macro.md",
         )?;
         // One long-session prompt per side (warm-up + seed + debate + mediator revise).
-        const BULL_PROMPT: &str = "prompts/researchers/bull.md";
-        const BEAR_PROMPT: &str = "prompts/researchers/bear.md";
+        const BULL_PROMPT: &str = "prompts/phase25/bull.md";
+        const BEAR_PROMPT: &str = "prompts/phase25/bear.md";
         insert_prompt_entry(
             config,
             &mut prompts,
@@ -184,7 +184,7 @@ impl RuntimeConfig {
             &mut versions,
             "mediator.topic_controller",
             "orchestrator.prompts.mediator.topic_controller",
-            "prompts/mediators/topic_controller.md",
+            "prompts/phase25/topic_controller.md",
         )?;
         insert_prompt_entry(
             config,
@@ -192,24 +192,24 @@ impl RuntimeConfig {
             &mut versions,
             "compressor.phase00",
             "orchestrator.prompts.compressor.phase00",
-            "prompts/compressors/phase00.md",
+            "prompts/phase0/phase00.md",
         )?;
         let (manager_research, manager_research_version) = prompt_entry(
             config,
             "orchestrator.prompts.manager.research",
-            "prompts/managers/research_manager.md",
+            "prompts/phase25/research_manager.md",
         )?;
         versions.insert("manager.research".to_string(), manager_research_version);
         let (trader, trader_version) = prompt_entry(
             config,
             "orchestrator.prompts.trader",
-            "prompts/traders/trader.md",
+            "prompts/phase25/trader.md",
         )?;
         versions.insert("trader".to_string(), trader_version);
         let (risk_conservative, risk_conservative_version) = prompt_entry(
             config,
             "orchestrator.prompts.risk.conservative",
-            "prompts/risk/conservative.md",
+            "prompts/phase25/conservative.md",
         )?;
         versions.insert(
             "risk.conservative".to_string(),
@@ -223,7 +223,7 @@ impl RuntimeConfig {
         let (portfolio_manager, portfolio_manager_version) = prompt_entry(
             config,
             "orchestrator.prompts.portfolio.manager",
-            "prompts/managers/portfolio_manager.md",
+            "prompts/phase25/portfolio_manager.md",
         )?;
         versions.insert("portfolio.manager".to_string(), portfolio_manager_version);
         let plugin_config = PluginConfig::from_value(config);
@@ -495,6 +495,18 @@ fn builtin_llm_role_values() -> BTreeMap<String, Value> {
             object.insert(
                 "web_search".to_string(),
                 serde_json::json!({ "mode": "live" }),
+            );
+        } else if matches!(
+            role,
+            "researcher.bull.initial"
+                | "researcher.bear.initial"
+                | "researcher.bull.interaction"
+                | "researcher.bear.interaction"
+                | "mediator.topic_controller"
+        ) {
+            object.insert(
+                "web_search".to_string(),
+                serde_json::json!({ "mode": "disabled" }),
             );
         }
         roles.insert(role.to_string(), Value::Object(object));
@@ -989,11 +1001,9 @@ mod tests {
                 json!(["read_phase_summaries", "read_phase_summary_details"]),
                 "role={role}"
             );
+            assert_eq!(roles[role]["web_search"]["mode"], "disabled");
         }
-        for role in [
-            "researcher.bull.interaction",
-            "researcher.bear.interaction",
-        ] {
+        for role in ["researcher.bull.interaction", "researcher.bear.interaction"] {
             assert_eq!(
                 roles[role]["tools"],
                 json!(["read_phase_summary_details"]),

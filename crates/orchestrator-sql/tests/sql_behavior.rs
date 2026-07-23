@@ -2,15 +2,15 @@ use orchestrator_core::{technical_csv_path, write_technical_csv, TechnicalCsvRow
 use orchestrator_sql::{
     candidate::{insert_candidate_experience, pending_candidates, CandidateExperienceInput},
     connect, context_count, ensure_schema, handle_read_command, import_jin10_payload,
-    import_technical_csv,
-    list_phase_summaries, list_phase_summary_details,
+    import_technical_csv, list_phase_summaries, list_phase_summary_details,
     memory::{promote_candidate_to_memory, PromoteMemoryInput},
     outcome::{upsert_outcome, OutcomeInput},
+    persist_phase00_batch,
     prediction::{upsert_prediction, PredictionInput},
-    persist_phase00_batch, read_run_context, session_history_items, upsert_agent_turn,
-    write_agent_message_scoped, write_role_turn_summary, write_run_record, AgentMessageInput,
-    AgentTurnInput, Phase00MemoryIndex, Phase00PhaseBatch, PhaseSummaryDetailInput,
-    PhaseSummaryInput, RoleTurnSummaryInput, RunContextReadRequest, RunRecordInput, RuntimeContext,
+    read_run_context, session_history_items, upsert_agent_turn, write_agent_message_scoped,
+    write_role_turn_summary, write_run_record, AgentMessageInput, AgentTurnInput,
+    Phase00MemoryIndex, Phase00PhaseBatch, PhaseSummaryDetailInput, PhaseSummaryInput,
+    RoleTurnSummaryInput, RunContextReadRequest, RunRecordInput, RuntimeContext,
 };
 use serde_json::json;
 
@@ -978,15 +978,11 @@ fn phase_summary_access_is_run_and_prior_phase_scoped() {
     memory.merge(phase1);
     memory.merge(phase2);
     assert_eq!(
-        memory
-            .list_visible_details("run-a", 2, &phase1_id)
-            .unwrap()["item_count"],
+        memory.list_visible_details("run-a", 2, &phase1_id).unwrap()["item_count"],
         1
     );
     assert_eq!(
-        memory
-            .list_visible_details("run-a", 2, &phase2_id)
-            .unwrap()["item_count"],
+        memory.list_visible_details("run-a", 2, &phase2_id).unwrap()["item_count"],
         0
     );
 

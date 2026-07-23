@@ -7,9 +7,9 @@ use async_openai::{config::OpenAIConfig, Client as OpenAIClient};
 use futures::StreamExt;
 use llm_judge::JudgeConfig;
 use orchestrator_core::{
-    default_project_root, extract_json_artifact, normalize_research_artifact_value,
-    validate_analyst_ticker_artifact, validate_research_artifact, AnalystTickerArtifact,
-    ResearchArtifact,
+    default_project_root, extract_json_artifact, normalize_analyst_ticker_artifact,
+    normalize_research_artifact_value, validate_analyst_ticker_artifact,
+    validate_research_artifact, AnalystTickerArtifact, ResearchArtifact,
 };
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -18,7 +18,9 @@ use std::{fs, path::PathBuf, sync::Arc};
 use tracing::debug;
 use truncation::TruncationConfig;
 use uuid::Uuid;
-use web_search::{validate_web_search_runtime_config, ExaWebSearchProvider, WebSearchConfig};
+use web_search::{
+    validate_web_search_runtime_config, ExaWebSearchProvider, WebSearchConfig, WebSearchMode,
+};
 
 pub mod agent_loop;
 pub mod llm_judge;
@@ -800,7 +802,9 @@ fn uses_native_web_search(settings: &AgentSettings) -> bool {
 }
 
 fn uses_web_run_fallback(settings: &AgentSettings) -> bool {
-    !role_disables_tools(&settings.role) && !uses_native_web_search(settings)
+    !role_disables_tools(&settings.role)
+        && !uses_native_web_search(settings)
+        && settings.web_search.mode != WebSearchMode::Disabled
 }
 
 fn validate_fallback_web_search_runtime_config(settings: &AgentSettings) -> Result<()> {
@@ -1342,6 +1346,8 @@ fn is_transient_llm_error(error: &anyhow::Error) -> bool {
         || text.contains("timeout")
         || text.contains("timed out")
         || text.contains("connection reset")
+        || text.contains("transport error")
+        || text.contains("error decoding response body")
         || text.contains("temporarily unavailable")
         || text.contains("upstream_error")
         || text.contains("upstream request failed")
@@ -1709,7 +1715,7 @@ async fn stream_chat_completions_once(
     debug!(role = %settings.role, "opening streaming Chat Completions API connection");
     let mut stream = client.chat().create_stream(request).await.map_err(|e| {
         (
-            anyhow::anyhow!("{e}").context("Chat Completions stream failed"),
+            anyhow::anyhow!("{e:?}").context("Chat Completions stream failed"),
             false,
         )
     })?;
@@ -1977,6 +1983,11 @@ fn parse_final_output(settings: &AgentSettings, text: &str) -> Result<Value> {
             }
             match parse_json_object_artifact(text) {
                 Ok(artifact) => {
+                    let artifact = if settings.role.starts_with("analyst.") {
+                        normalize_analyst_artifact_value(artifact)?
+                    } else {
+                        artifact
+                    };
                     validate_json_artifact_contract(settings, &artifact)?;
                     Ok(artifact)
                 }
@@ -1991,6 +2002,21 @@ fn parse_final_output(settings: &AgentSettings, text: &str) -> Result<Value> {
             }
         }
     }
+}
+
+pub(crate) fn normalize_analyst_artifact_value(mut artifact: Value) -> Result<Value> {
+    let per_ticker = artifact
+        .get_mut("per_ticker")
+        .and_then(Value::as_object_mut)
+        .context("analyst artifact requires per_ticker object")?;
+    for (ticker, payload_value) in per_ticker {
+        let mut payload: AnalystTickerArtifact = serde_json::from_value(payload_value.clone())
+            .with_context(|| format!("invalid analyst per_ticker.{ticker} payload"))?;
+        normalize_analyst_ticker_artifact(&mut payload);
+        *payload_value = serde_json::to_value(payload)
+            .with_context(|| format!("failed to serialize analyst per_ticker.{ticker}"))?;
+    }
+    Ok(artifact)
 }
 
 fn text_fallback_artifact(settings: &AgentSettings, text: &str) -> Value {
@@ -3128,6 +3154,22 @@ mod tests {
     }
 
     #[test]
+    fn parse_final_output_normalizes_legacy_analyst_source_tier() {
+        let mut settings = base_settings(LlmRoute::Responses);
+        settings.role = "analyst.technical".to_string();
+        settings.tickers = vec!["QQQ".to_string()];
+        settings.output_mode = OutputMode::JsonArtifact;
+
+        let text = r#"{"id":"analyst.technical","role":"analyst.technical","per_ticker":{"QQQ":{"direction":"bullish","confidence":0.7,"report":"ok","key_evidence":[{"claim":"QQQ closed above its 20-day average","evidence_type":"fact","source":"Yahoo Finance daily OHLCV","timestamp":"2026-07-22","source_tier":"T1_reference","source_confidence":0.9}]}}}"#;
+        let artifact = super::parse_final_output(&settings, text).unwrap();
+
+        assert_eq!(
+            artifact["per_ticker"]["QQQ"]["key_evidence"][0]["source_tier"],
+            json!("unknown")
+        );
+    }
+
+    #[test]
     fn parse_final_output_rejects_analyst_role_mismatch() {
         let mut settings = base_settings(LlmRoute::Responses);
         settings.role = "analyst.technical".to_string();
@@ -3681,6 +3723,7 @@ mod tests {
         settings.llm.base_url = Some("https://llm.example.com/v1".to_string());
         settings.llm.api_key = Some("test-key".to_string());
         settings.llm.tools = vec!["read_technical_context".to_string()];
+        settings.web_search.mode = WebSearchMode::Live;
         assert_eq!(
             super::configured_tool_names(&settings),
             vec!["think", "read_technical_context", "web.run"]
@@ -3712,23 +3755,27 @@ mod tests {
             assert!(super::web_run_runtime_for_settings(&settings).is_none());
         }
 
-        // manager.research is NOT tool-disabled, so it gets web.run
+        // manager.research is not tool-disabled, so live search enables web.run.
         let mut settings = base_settings(LlmRoute::Responses);
         settings.role = "manager.research".to_string();
         settings.llm.base_url = Some("https://llm.example.com/v1".to_string());
         settings.llm.api_key = Some("test-key".to_string());
         settings.llm.tools = vec!["read_run_context".to_string()];
+        settings.web_search.mode = WebSearchMode::Live;
         assert!(super::configured_tool_names(&settings).contains(&tools::WEB_RUN_TOOL_NAME));
     }
 
     #[test]
-    fn web_run_tool_always_injected_for_non_disabled_roles() {
+    fn web_run_tool_requires_enabled_search() {
         let mut settings = base_settings(LlmRoute::Responses);
         settings.role = "analyst.news_macro".to_string();
         settings.llm.base_url = Some("https://llm.example.com/v1".to_string());
         settings.llm.api_key = Some("test-key".to_string());
         settings.llm.think_tool = false;
 
+        assert!(!super::configured_tool_names(&settings).contains(&tools::WEB_RUN_TOOL_NAME));
+
+        settings.web_search.mode = WebSearchMode::Live;
         assert!(super::configured_tool_names(&settings).contains(&tools::WEB_RUN_TOOL_NAME));
 
         settings.role = "trader".to_string();
@@ -3757,6 +3804,9 @@ mod tests {
             super::select_fork_history(target.clone(), source.clone()),
             target
         );
-        assert_eq!(super::select_fork_history(Vec::new(), source.clone()), source);
+        assert_eq!(
+            super::select_fork_history(Vec::new(), source.clone()),
+            source
+        );
     }
 }

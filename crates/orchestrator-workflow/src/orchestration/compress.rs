@@ -57,9 +57,7 @@ pub(crate) fn phase00_bundle_to_batch(
     source_phase: i64,
     artifact: &Value,
 ) -> Result<Phase00PhaseBatch> {
-    if artifact.get("artifact_type").and_then(Value::as_str)
-        != Some("phase00_summary_bundle")
-    {
+    if artifact.get("artifact_type").and_then(Value::as_str) != Some("phase00_summary_bundle") {
         bail!("phase00 artifact_type must be phase00_summary_bundle");
     }
     if artifact.get("source_phase").and_then(Value::as_i64) != Some(source_phase) {

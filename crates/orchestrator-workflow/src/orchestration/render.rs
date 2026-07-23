@@ -30,10 +30,7 @@ pub(crate) fn mode_prompt_path(base: &std::path::Path, state: &Value) -> PathBuf
 fn prompts_dir_from_prompt_path(prompt_path: Option<&std::path::Path>) -> Option<PathBuf> {
     let path = prompt_path?;
     for ancestor in path.ancestors() {
-        if ancestor.join("common").is_dir()
-            || ancestor.join("components").is_dir()
-            || ancestor.join("roles").is_dir()
-        {
+        if ancestor.join("common").is_dir() || ancestor.join("roles").is_dir() {
             return Some(ancestor.to_path_buf());
         }
     }
@@ -390,9 +387,9 @@ mod tests {
     use tempfile::TempDir;
 
     fn write_ticker_component(prompts: &std::path::Path, body: &str) {
-        std::fs::create_dir_all(prompts.join("components/ticker")).unwrap();
+        std::fs::create_dir_all(prompts.join("common/components/ticker")).unwrap();
         std::fs::write(
-            prompts.join("components/ticker/manifest.toml"),
+            prompts.join("common/components/ticker/manifest.toml"),
             r#"name = "ticker"
 injection_points = ["*"]
 priority = 10
@@ -401,16 +398,16 @@ required_variables = ["ticker", "tickers"]
 "#,
         )
         .unwrap();
-        std::fs::write(prompts.join("components/ticker/component.md"), body).unwrap();
+        std::fs::write(prompts.join("common/components/ticker/component.md"), body).unwrap();
     }
 
     #[test]
     fn render_prompt_injects_common_ticker_prompt() {
         let temp = TempDir::new().unwrap();
         let prompts = temp.path().join("prompts");
-        std::fs::create_dir_all(prompts.join("analysts")).unwrap();
+        std::fs::create_dir_all(prompts.join("phase1")).unwrap();
         write_ticker_component(&prompts, "Ticker boundary: {ticker}; all: {tickers}");
-        let prompt_path = prompts.join("analysts/test.md");
+        let prompt_path = prompts.join("phase1/test.md");
         std::fs::write(&prompt_path, "Role prompt\n{common_ticker_prompt}").unwrap();
         let state = json!({"ticker": "TQQQ", "tickers": ["TQQQ", "VIX"]});
 
@@ -434,10 +431,10 @@ required_variables = ["ticker", "tickers"]
         let temp = TempDir::new().unwrap();
         let prompts = temp.path().join("prompts");
         std::fs::create_dir_all(prompts.join("common")).unwrap();
-        std::fs::create_dir_all(prompts.join("analysts")).unwrap();
+        std::fs::create_dir_all(prompts.join("phase1")).unwrap();
         std::fs::write(prompts.join("common/ticker.md"), "LEGACY {ticker}").unwrap();
         write_ticker_component(&prompts, "PLUGIN {ticker}");
-        let prompt_path = prompts.join("analysts/technical.md");
+        let prompt_path = prompts.join("phase1/technical.md");
         std::fs::write(&prompt_path, "{common_ticker_prompt}").unwrap();
         let state = json!({"ticker": "QQQ", "tickers": ["QQQ"]});
         let registry = ComponentRegistry::discover(&prompts).unwrap();
@@ -463,7 +460,7 @@ required_variables = ["ticker", "tickers"]
         let temp = TempDir::new().unwrap();
         let prompts = temp.path().join("prompts");
         std::fs::create_dir_all(prompts.join("common")).unwrap();
-        std::fs::create_dir_all(prompts.join("analysts")).unwrap();
+        std::fs::create_dir_all(prompts.join("phase1")).unwrap();
         write_ticker_component(&prompts, "TICK {ticker}");
         std::fs::write(
             prompts.join("common/analyst_output_contract.md"),
@@ -475,7 +472,7 @@ required_variables = ["ticker", "tickers"]
             "NO-INJECT boundary",
         )
         .unwrap();
-        let prompt_path = prompts.join("analysts/technical.md");
+        let prompt_path = prompts.join("phase1/technical.md");
         std::fs::write(
             &prompt_path,
             "{common_ticker_prompt}\n{anti_injection}\n{analyst_output_contract}",
@@ -505,13 +502,13 @@ required_variables = ["ticker", "tickers"]
         let temp = TempDir::new().unwrap();
         let prompts = temp.path().join("prompts");
         std::fs::create_dir_all(prompts.join("common")).unwrap();
-        std::fs::create_dir_all(prompts.join("analysts")).unwrap();
+        std::fs::create_dir_all(prompts.join("phase1")).unwrap();
         std::fs::write(
             prompts.join("common/analyst_output_contract.md"),
             "schema:\n{analyst_artifact_schema}",
         )
         .unwrap();
-        let prompt_path = prompts.join("analysts/technical.md");
+        let prompt_path = prompts.join("phase1/technical.md");
         std::fs::write(&prompt_path, "{analyst_output_contract}").unwrap();
         let state = json!({"ticker": "QQQ", "tickers": ["QQQ"]});
 
@@ -538,9 +535,9 @@ required_variables = ["ticker", "tickers"]
         let temp = TempDir::new().unwrap();
         let prompts = temp.path().join("prompts");
         std::fs::create_dir_all(prompts.join("common")).unwrap();
-        std::fs::create_dir_all(prompts.join("analysts")).unwrap();
+        std::fs::create_dir_all(prompts.join("phase1")).unwrap();
         // No analyst_output_contract.md / anti_injection.md on disk.
-        let prompt_path = prompts.join("analysts/technical.md");
+        let prompt_path = prompts.join("phase1/technical.md");
         std::fs::write(
             &prompt_path,
             "start\n{anti_injection}\n{analyst_output_contract}\nend",
@@ -571,7 +568,7 @@ required_variables = ["ticker", "tickers"]
         let temp = TempDir::new().unwrap();
         let prompts = temp.path().join("prompts");
         std::fs::create_dir_all(prompts.join("common")).unwrap();
-        std::fs::create_dir_all(prompts.join("researchers")).unwrap();
+        std::fs::create_dir_all(prompts.join("phase25")).unwrap();
         write_ticker_component(&prompts, "TICK {ticker}");
         std::fs::write(
             prompts.join("common/researcher_seed.md"),
@@ -579,12 +576,12 @@ required_variables = ["ticker", "tickers"]
         )
         .unwrap();
         std::fs::write(
-            prompts.join("researchers/bull_initial.md"),
+            prompts.join("phase25/bull_initial.md"),
             "看多研究员\n{common_ticker_prompt}\nrole=researcher.bull.initial artifact=bull_seed_packet field=known_bear_constraint",
         )
         .unwrap();
         std::fs::write(
-            prompts.join("researchers/bear_initial.md"),
+            prompts.join("phase25/bear_initial.md"),
             "看空研究员\n{common_ticker_prompt}\nrole=researcher.bear.initial artifact=bear_seed_packet field=known_bull_constraint",
         )
         .unwrap();
@@ -597,7 +594,7 @@ required_variables = ["ticker", "tickers"]
             "bull_seed",
             None,
             None,
-            Some(&prompts.join("researchers/bull_initial.md")),
+            Some(&prompts.join("phase25/bull_initial.md")),
             None,
         )
         .unwrap();
@@ -608,7 +605,7 @@ required_variables = ["ticker", "tickers"]
             "bear_seed",
             None,
             None,
-            Some(&prompts.join("researchers/bear_initial.md")),
+            Some(&prompts.join("phase25/bear_initial.md")),
             None,
         )
         .unwrap();
@@ -634,7 +631,7 @@ required_variables = ["ticker", "tickers"]
         let temp = TempDir::new().unwrap();
         let prompts = temp.path().join("prompts");
         std::fs::create_dir_all(prompts.join("common")).unwrap();
-        std::fs::create_dir_all(prompts.join("researchers")).unwrap();
+        std::fs::create_dir_all(prompts.join("phase25")).unwrap();
         write_ticker_component(&prompts, "TICK {ticker}");
         std::fs::write(prompts.join("common/researcher_seed.md"), "SEED {side}").unwrap();
         std::fs::write(
@@ -643,7 +640,7 @@ required_variables = ["ticker", "tickers"]
         )
         .unwrap();
         std::fs::write(
-            prompts.join("researchers/bull_interaction.md"),
+            prompts.join("phase25/bull_interaction.md"),
             "看多研究员\n{common_ticker_prompt}\nrole=researcher.bull.interaction artifact=bull_debate_packet target=看空 claim",
         )
         .unwrap();
@@ -656,7 +653,7 @@ required_variables = ["ticker", "tickers"]
             "bull_packet",
             Some(2),
             None,
-            Some(&prompts.join("researchers/bull_interaction.md")),
+            Some(&prompts.join("phase25/bull_interaction.md")),
             None,
         )
         .unwrap();
@@ -677,14 +674,14 @@ required_variables = ["ticker", "tickers"]
         let temp = TempDir::new().unwrap();
         let prompts = temp.path().join("prompts");
         std::fs::create_dir_all(prompts.join("common")).unwrap();
-        std::fs::create_dir_all(prompts.join("risk")).unwrap();
+        std::fs::create_dir_all(prompts.join("phase25")).unwrap();
         std::fs::write(
             prompts.join("common/risk_analyst.md"),
             "shared body {trader_plan} {analyst_reports} {risk_history}",
         )
         .unwrap();
         std::fs::write(
-            prompts.join("risk/conservative.md"),
+            prompts.join("phase25/conservative.md"),
             "保守风险分析师\n{risk_analyst_body}\n\"key_risks\": [\"主要风险\"]",
         )
         .unwrap();
@@ -697,7 +694,7 @@ required_variables = ["ticker", "tickers"]
             "risk_argument",
             None,
             None,
-            Some(&prompts.join("risk/conservative.md")),
+            Some(&prompts.join("phase25/conservative.md")),
             None,
         )
         .unwrap();
@@ -830,7 +827,10 @@ required_variables = ["ticker", "tickers"]
         assert!(context.get("phase1").is_none());
         assert!(context.get("phase2_5").is_none());
         assert!(context.get("phase00_tables").is_none());
-        assert_eq!(context["weighted_probability_base"]["QQQ"]["long_probability"], 0.5);
+        assert_eq!(
+            context["weighted_probability_base"]["QQQ"]["long_probability"],
+            0.5
+        );
         assert_eq!(context["track_record"]["sample_size"], 2);
     }
 
@@ -880,7 +880,7 @@ required_variables = ["ticker", "tickers"]
         assert!(contract.contains("运行时 schema"));
         assert!(!contract.contains("{analyst_artifact_schema}"));
         assert!(!contract.contains("顶层结构"));
-        assert!(!contract.contains("```json"));
+        assert!(contract.contains("每个 `per_ticker.<TICKER>` 必须使用以下字段与类型"));
     }
 
     #[test]
@@ -889,7 +889,7 @@ required_variables = ["ticker", "tickers"]
         if !prompts.exists() {
             return;
         }
-        let path = prompts.join("analysts/technical.md");
+        let path = prompts.join("phase1/technical.md");
         let prompt_a = render_prompt(
             &golden_mock_state_with_date("2026-07-01"),
             "analyst.technical",
@@ -925,7 +925,7 @@ required_variables = ["ticker", "tickers"]
     #[test]
     fn versioned_prompt_path_resolves_correctly() {
         let temp = TempDir::new().unwrap();
-        let prompts = temp.path().join("prompts/analysts");
+        let prompts = temp.path().join("prompts/phase1");
         std::fs::create_dir_all(&prompts).unwrap();
         std::fs::write(prompts.join("technical.md"), "v1 content").unwrap();
         std::fs::write(prompts.join("technical_v2.md"), "v2 content").unwrap();
@@ -962,45 +962,45 @@ required_variables = ["ticker", "tickers"]
         );
         // (role, relative prompt path, kind)
         let cases: &[(&str, &str, &str)] = &[
-            ("analyst.technical", "analysts/technical.md", "artifact"),
-            ("analyst.news_macro", "analysts/news_macro.md", "artifact"),
-            (
-                "researcher.bull.initial",
-                "researchers/bull.md",
-                "bull_seed",
-            ),
-            (
-                "researcher.bear.initial",
-                "researchers/bear.md",
-                "bear_seed",
-            ),
+            ("analyst.technical", "phase1/technical.md", "artifact"),
+            ("analyst.news_macro", "phase1/news_macro.md", "artifact"),
+            ("researcher.bull.initial", "phase25/bull.md", "bull_seed"),
+            ("researcher.bear.initial", "phase25/bear.md", "bear_seed"),
             (
                 "researcher.bull.interaction",
-                "researchers/bull.md",
+                "phase25/bull.md",
                 "bull_packet",
             ),
             (
                 "researcher.bear.interaction",
-                "researchers/bear.md",
+                "phase25/bear.md",
                 "bear_packet",
             ),
             (
                 "mediator.topic_controller",
-                "mediators/topic_controller.md",
+                "phase25/topic_controller.md",
                 "controller_packet",
             ),
             (
                 "manager.research",
-                "managers/research_manager.md",
+                "phase25/research_manager.md",
                 "artifact",
             ),
-            ("trader", "traders/trader.md", "artifact"),
-            ("risk.aggressive", "risk/conservative.md", "risk_argument"),
-            ("risk.neutral", "risk/conservative.md", "risk_argument"),
-            ("risk.conservative", "risk/conservative.md", "risk_argument"),
+            ("trader", "phase25/trader.md", "artifact"),
+            (
+                "risk.aggressive",
+                "phase25/conservative.md",
+                "risk_argument",
+            ),
+            ("risk.neutral", "phase25/conservative.md", "risk_argument"),
+            (
+                "risk.conservative",
+                "phase25/conservative.md",
+                "risk_argument",
+            ),
             (
                 "portfolio.manager",
-                "managers/portfolio_manager.md",
+                "phase25/portfolio_manager.md",
                 "artifact",
             ),
         ];
@@ -1040,11 +1040,11 @@ required_variables = ["ticker", "tickers"]
             return;
         }
         let state = golden_mock_state();
-        for rel in ["analysts/technical.md", "analysts/news_macro.md"] {
+        for rel in ["phase1/technical.md", "phase1/news_macro.md"] {
             let path = prompts.join(rel);
             let role = format!(
                 "analyst.{}",
-                rel.trim_start_matches("analysts/").trim_end_matches(".md")
+                rel.trim_start_matches("phase1/").trim_end_matches(".md")
             );
             let prompt =
                 render_prompt(&state, &role, 1, "artifact", None, None, Some(&path), None).unwrap();
@@ -1081,7 +1081,7 @@ required_variables = ["ticker", "tickers"]
             "artifact",
             None,
             None,
-            Some(&prompts.join("managers/research_manager.md")),
+            Some(&prompts.join("phase25/research_manager.md")),
             None,
         )
         .unwrap();
@@ -1097,7 +1097,7 @@ required_variables = ["ticker", "tickers"]
     #[test]
     fn leveraged_etf_rules_are_injected_only_for_leveraged_output_scope() {
         let prompts = project_prompts_dir();
-        let path = prompts.join("analysts/technical.md");
+        let path = prompts.join("phase1/technical.md");
         let ordinary = render_prompt(
             &golden_mock_state(),
             "analyst.technical",
@@ -1131,6 +1131,31 @@ required_variables = ["ticker", "tickers"]
     }
 
     #[test]
+    fn technical_prompt_lists_the_runtime_direction_and_source_tier_enums() {
+        let prompts = project_prompts_dir();
+        let prompt = render_prompt(
+            &golden_mock_state(),
+            "analyst.technical",
+            1,
+            "artifact",
+            None,
+            None,
+            Some(&prompts.join("phase1/technical.md")),
+            None,
+        )
+        .unwrap();
+
+        assert!(prompt.contains("`bullish`、`bearish`、`neutral`、`mixed` 或 `unobserved`"));
+        assert!(prompt.contains("不得输出组合标签（例如 `neutral_bullish`）"));
+        assert!(prompt.contains("一律填写 `unknown`"));
+        assert!(prompt.contains("绝不填写 `T1_reference`"));
+        assert!(
+            prompt.contains("`priced_in` 只能为文本 `already_priced`、`under_priced` 或 `unclear`")
+        );
+        assert!(prompt.contains("\"claim\": \"可核验事实或明确观点\""));
+    }
+
+    #[test]
     fn downstream_prompts_enforce_single_authority_chain() {
         let prompts = project_prompts_dir();
         let trader = render_prompt(
@@ -1140,7 +1165,7 @@ required_variables = ["ticker", "tickers"]
             "artifact",
             None,
             None,
-            Some(&prompts.join("traders/trader.md")),
+            Some(&prompts.join("phase25/trader.md")),
             None,
         )
         .unwrap();
@@ -1154,7 +1179,7 @@ required_variables = ["ticker", "tickers"]
                 "risk_argument",
                 Some(1),
                 None,
-                Some(&prompts.join("risk/conservative.md")),
+                Some(&prompts.join("phase25/conservative.md")),
                 None,
             )
             .unwrap();
@@ -1167,7 +1192,7 @@ required_variables = ["ticker", "tickers"]
     #[test]
     fn topic_controller_uses_only_canonical_control_fields() {
         let content =
-            std::fs::read_to_string(project_prompts_dir().join("mediators/topic_controller.md"))
+            std::fs::read_to_string(project_prompts_dir().join("phase25/topic_controller.md"))
                 .unwrap();
         assert!(content.contains("blocked_claims"));
         assert!(content.contains("next_steers"));
@@ -1179,12 +1204,12 @@ required_variables = ["ticker", "tickers"]
     fn active_prompts_do_not_reference_removed_social_sources() {
         let prompts = project_prompts_dir();
         for relative in [
-            "analysts/technical.md",
-            "analysts/news_macro.md",
+            "phase1/technical.md",
+            "phase1/news_macro.md",
             "common/analyst_output_contract.md",
-            "managers/research_manager.md",
-            "researchers/bull.md",
-            "researchers/bear.md",
+            "phase25/research_manager.md",
+            "phase25/bull.md",
+            "phase25/bear.md",
         ] {
             let content = std::fs::read_to_string(prompts.join(relative)).unwrap();
             for removed in ["YouTube", "Reddit", "Twitter"] {

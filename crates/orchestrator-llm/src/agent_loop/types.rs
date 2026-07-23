@@ -492,6 +492,8 @@ pub enum ModelStreamEvent {
 
 #[derive(Debug, Clone, Default)]
 pub struct ModelStreamResult {
+    /// Whether this model response explicitly ended the turn.
+    pub end_turn: bool,
     pub needs_follow_up: bool,
     pub last_assistant_message_id: Option<String>,
     pub tool_calls: Vec<ToolCallRequest>,
