@@ -77,9 +77,13 @@ Debate canonical contract：
 - 非 `no_new_info` 必须含 `steelman{core_premise, holds_when, attacks}`。
 - `send_to_mediator` 说明回应了哪个 claim、执行了哪些整改；可附 `unresolved` 和 `downside_asymmetry`。
 
+# 紧凑输出约束
+
+所有 seed 与 debate packet 必须在单次响应内完整闭合，不能为展示细节复制输入、证据正文或上游摘要。保留所有 canonical 字段和 `analysis_trace` 子字段，但每个列表最多 2 项（`claims` 最多 2 项、每条 `evidence_refs` 最多 3 个）；每个文字字段不超过 180 个中文字符。引用只写稳定 ID 或简短字段路径，`reducer_checks` 只写 required 的布尔结果。信息不足时使用空数组、`unknown` 或简短的限制说明，禁止补写推导性长文。
+
 # 输出纪律
 
-除阶段 A 外，只返回对应 packet 的单一纯 JSON；禁止 Markdown 围栏、外层 envelope 和 schema 外字段。
+除阶段 A 外，只返回对应 packet 的单一纯 JSON。机器会直接解析完整响应：第一个字符必须是 `{`，最后一个字符必须是 `}`；绝对不要输出 `````、`json` 标签、Markdown、前言、结语或 JSON 对象外的任何字符。
 
 <!-- DYNAMIC SUFFIX (changes every call) -->
 

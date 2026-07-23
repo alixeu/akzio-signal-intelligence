@@ -58,6 +58,8 @@ pub struct RoleLlmSettings {
     #[serde(default)]
     pub max_turns: Option<usize>,
     #[serde(default)]
+    pub max_completion_tokens: Option<u32>,
+    #[serde(default)]
     pub reasoning_effort: Option<String>,
     #[serde(default)]
     pub reasoning_summary: Option<String>,
@@ -1209,6 +1211,16 @@ fn build_chat_completions_request(
     let model = settings.llm.model.clone();
     let mut binding = CreateChatCompletionRequestArgs::default();
     let mut builder = binding.model(&model).messages(messages);
+
+    if let Some(max_completion_tokens) = settings.llm.max_completion_tokens {
+        // DeepSeek-compatible Chat Completions gateways use the legacy field.
+        // The Responses route has its own request builder, so keep this
+        // compatibility detail local to Chat Completions.
+        #[allow(deprecated)]
+        {
+            builder = builder.max_tokens(max_completion_tokens);
+        }
+    }
 
     let mut tool_count = 0;
     if with_tools {
@@ -2942,6 +2954,7 @@ mod tests {
                 model: "gpt-5.4".to_string(),
                 preamble: None,
                 max_turns: Some(6),
+                max_completion_tokens: None,
                 reasoning_effort: Some("low".to_string()),
                 reasoning_summary: None,
                 preserve_reasoning_state: false,
@@ -3692,6 +3705,7 @@ mod tests {
             model: "gpt-5.4".to_string(),
             preamble: None,
             max_turns: Some(4),
+            max_completion_tokens: None,
             reasoning_effort: None,
             reasoning_summary: None,
             preserve_reasoning_state: false,
@@ -3736,6 +3750,7 @@ mod tests {
             model: "third-party-model".to_string(),
             preamble: None,
             max_turns: Some(4),
+            max_completion_tokens: None,
             reasoning_effort: None,
             reasoning_summary: None,
             preserve_reasoning_state: false,

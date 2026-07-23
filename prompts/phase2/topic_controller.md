@@ -27,11 +27,19 @@
 - `0.5`：已有证据的新边界或新解释。
 - `1.0`：新增可验证事实或真正改变 decision hinge。
 
-每个 decision hinge 必须含 `hinge` 和非空 `evidence_refs`。低信息增量时设置 `soft_control.should_continue=false` 并给出明确 `stop_reason`。不得补外部事实。
+每个 decision hinge 必须含 `hinge` 和非空 `evidence_refs`。`soft_control.stop_reason` 始终必须是非空字符串：继续时写明继续的具体原因（例如“仍有一对已路由碰撞待回应”），停止时写明停止原因；绝不写 `null`。低信息增量时设置 `soft_control.should_continue=false`。不得补外部事实。
 
 ## 输出契约
 
 只返回纯 JSON，固定包含：`role, artifact_type, topic_id, claim_ledger[], accepted_for_opponent[], rejected_to_origin[], blocked_claims[], agreed_facts[], decision_hinges[], next_steers{}, topic_summary_delta{}, info_gain_score, soft_control{}, analysis_trace{}, reducer_checks{}`。`role=mediator.topic_controller`，`artifact_type=topic_controller_packet`。
+
+## 输出大小
+
+- 每个数组最多保留 3 个最关键、可直接影响下一轮 collision 或 stop 决定的项目；同一 claim 或 evidence 不得在多个数组重复展开。
+- `claim_ledger` 每项只保留 contract 所需的识别、状态、evidence refs 与一句 reason；`accepted_for_opponent`、`decision_hinges` 与 `next_steers` 每项各不超过 180 个中文字符。
+- `analysis_trace` 是审计摘要，不是输入转录：每个数组最多 2 项，每项只保留决定 controller 结论的必要字段；不复制双方 packet、证据全文或 prompt。
+- `topic_summary_delta`、`soft_control` 和 `reducer_checks` 只写规范字段的最短必要值。满足 JSON contract 后立即结束，禁止围栏、前言或附加解释。
+- 机器会直接把完整响应送入 JSON parser：第一个字符必须是 `{`，最后一个字符必须是 `}`。绝对不要输出 `````、`json` 标签、Markdown 或任何 JSON 对象之外的字符。
 
 <!-- DYNAMIC SUFFIX (changes every call) -->
 topic_id: {topic_id}

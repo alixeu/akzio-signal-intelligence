@@ -2216,7 +2216,15 @@ async fn run_topic_steer_step(
     let steer = attach_fork_source(
         steer,
         fork_source_turn_id(state, topic_id, role),
-        role == "mediator.topic_controller",
+        // Forked turns inherit prior dynamic prompts.  Always inject the
+        // current role prompt as well, otherwise an initial warm-up suffix
+        // can make a seed or interaction repeat the ready handshake instead
+        // of emitting its required packet.
+        role == "mediator.topic_controller"
+            || role == "researcher.bull.initial"
+            || role == "researcher.bear.initial"
+            || role == "researcher.bull.interaction"
+            || role == "researcher.bear.interaction",
     );
     let session_key = if role.contains("bull") {
         "bull"
@@ -3834,6 +3842,7 @@ mod tests {
             model: "gpt-5.4".to_string(),
             preamble: None,
             max_turns: Some(4),
+            max_completion_tokens: None,
             reasoning_effort: None,
             reasoning_summary: None,
             preserve_reasoning_state: false,
@@ -4727,4 +4736,28 @@ fn topic_controller_forks_from_topic_generation_with_its_own_prompt() {
 
     assert_eq!(steer["fork_from_turn_id"], "turn-topic-root");
     assert_eq!(steer["include_prompt_on_fork"], true);
+}
+
+#[test]
+fn interaction_forks_include_the_current_role_prompt() {
+    let state = json!({});
+    for role in ["researcher.bull.interaction", "researcher.bear.interaction"] {
+        let source = fork_source_turn_id(&state, "QQQ-volatility", role);
+        let include_prompt = role == "mediator.topic_controller"
+            || role == "researcher.bull.initial"
+            || role == "researcher.bear.initial"
+            || role == "researcher.bull.interaction"
+            || role == "researcher.bear.interaction";
+        let steer: Value = serde_json::from_str(
+            &attach_fork_source(
+                Some(steer_payload("point_debate", &json!({}))),
+                source,
+                include_prompt,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(steer["include_prompt_on_fork"], true, "{role}");
+    }
 }

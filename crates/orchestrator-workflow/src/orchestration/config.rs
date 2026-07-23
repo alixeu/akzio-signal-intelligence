@@ -542,6 +542,11 @@ fn builtin_llm_role_values() -> BTreeMap<String, Value> {
     ] {
         let mut object = serde_json::Map::new();
         object.insert("max_turns".to_string(), Value::from(max_turns));
+        if role == "mediator.topic" {
+            // The topic artifact carries the shared analysis trace after three
+            // evidence lookups, which exceeds the gateway's short default cap.
+            object.insert("max_completion_tokens".to_string(), Value::from(8_192));
+        }
         object.insert(
             "tools".to_string(),
             Value::Array(

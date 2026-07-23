@@ -41,13 +41,21 @@
 
 只返回一个纯 JSON 对象，禁止 Markdown 围栏和外层 envelope：
 
+## 输出大小
+
+- 最多保留 2 个 topics；每个 topic 的 `bull_seed_request`、`bear_seed_request`、`why_debate` 各不超过 180 个中文字符。
+- `common_ground` 的每个数组最多 3 项；`summary` 不超过 240 个中文字符。
+- `analysis_trace` 只记录本次议题生成所必需的审计摘要：每个数组最多 2 项，每项只保留决定 topic 选择或排除的字段和值；不要复制 Phase 1 report、evidence claim 或输入全文。
+- `reducer_checks` 仅写 3 个要求字段。满足 schema 后立即结束 JSON，不要补充解释。
+
 - `role`：固定为 `mediator.topic`
 - `artifact_type`：固定为 `phase2_topic_generation_artifact`
 - `common_ground`：包含 `agreed_facts[]`, `shared_constraints[]`, `non_debated_assumptions[]`, `evidence_refs[]`
 - `topics`：数组；每项包含 `topic_id`, `topic`, `tickers[]`, `meta_factor`, `decision_hinge`, `ttl`, `bull_seed_request`, `bear_seed_request`, `why_debate`
 - `summary`：非空字符串
 - `analysis_trace`：遵循公共可审计分析轨迹；即使 `topics=[]` 也必须记录实际证据缺口、替代解释与停止原因
-- `reducer_checks`：对象，至少包含 `from_phase1_index_only`, `no_new_external_facts`, `json_valid`
+- `reducer_checks`：必须精确为 `{"from_phase1_index_only":true,"no_new_external_facts":true,"json_valid":true}`。三个值都是 JSON boolean，禁止使用字符串、说明文字或其他值。
+- 输出必须可被标准 JSON parser 直接解析：任何字符串值不得包含实际换行、制表符或其他控制字符；需要换行时写 JSON 转义 `\\n`，但优先保持单行短句。
 
 `actionable`、`status`、`skip_reason` 等运行时 envelope 字段由 Rust 合成，不要自行输出。
 

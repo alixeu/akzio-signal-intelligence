@@ -80,6 +80,10 @@ orchestrator:
       model: deepseek-v4-flash
       base_url: *llm_gateway_base_url
       api_key: *llm_gateway_api_key
+      # The gateway's implicit cap truncates schema-valid multi-agent artifacts.
+      # Roles may lower this explicitly, but the workflow needs room for its
+      # mandatory analysis trace and structured evidence fields.
+      max_completion_tokens: 12288
       reasoning_effort: low
       reasoning_summary: auto
       preserve_reasoning_state: false
