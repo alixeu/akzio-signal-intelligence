@@ -18,6 +18,7 @@ pub fn get_portfolio_definition() -> ToolDefinition {
         parameters: json!({
             "type": "object",
             "properties": {},
+            "required": [],
             "additionalProperties": false
         }),
     }
@@ -30,6 +31,7 @@ pub fn get_history_definition() -> ToolDefinition {
         parameters: json!({
             "type": "object",
             "properties": {},
+            "required": [],
             "additionalProperties": false
         }),
     }

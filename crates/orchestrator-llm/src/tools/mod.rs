@@ -424,6 +424,21 @@ mod tests {
         assert_eq!(resolve_tool_name("web_run"), web_run::NAME);
     }
 
+    #[test]
+    fn every_registered_tool_declares_required_as_an_array() {
+        for entry in REGISTRY {
+            let definition = (entry.definition)();
+            assert!(
+                definition
+                    .parameters
+                    .get("required")
+                    .is_some_and(Value::is_array),
+                "tool {} must provide a JSON Schema required array",
+                entry.name
+            );
+        }
+    }
+
     #[tokio::test]
     async fn phase_summary_tools_fail_closed_without_turn_context() {
         for (name, args) in [

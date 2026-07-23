@@ -18,6 +18,7 @@ pub fn definition() -> ToolDefinition {
                     "description": "Optional ticker filter. Run and phase visibility are fixed by the current turn."
                 }
             },
+            "required": [],
             "additionalProperties": false
         }),
     }
