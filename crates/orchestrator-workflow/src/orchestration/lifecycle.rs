@@ -399,7 +399,7 @@ fn validate_trade_intent_payload(payload: &Value) -> Option<String> {
     serde_json::from_value::<TradeIntent>(payload.clone())
         .err()
         .map(|error| error.to_string())
-        .or_else(|| required_string_error(payload, "position_size"))
+        .or_else(|| required_number_error(payload, "position_size_pct_max"))
 }
 
 fn validate_risk_constraints_payload(payload: &Value) -> Option<String> {
@@ -491,6 +491,15 @@ fn required_string_error(payload: &Value, field: &str) -> Option<String> {
     }
 }
 
+fn required_number_error(payload: &Value, field: &str) -> Option<String> {
+    payload
+        .get(field)
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
+        .is_none()
+        .then(|| format!("required contract field {field} must be a 0.0-1.0 number"))
+}
+
 // --- trade intent mapping ---
 
 pub(crate) fn research_plan_to_trade_intent(research_plan: &Value) -> Value {
@@ -501,9 +510,12 @@ pub(crate) fn research_plan_to_trade_intent(research_plan: &Value) -> Value {
     let action = trade_action(rating);
     json!({
         "action": action,
+        "candidate_action": action,
+        "execution_decision": if action == "Hold" { "hold" } else { "execute_candidate" },
         "entry_price": null,
         "stop_loss": null,
-        "position_size": position_size(action),
+        "position_size_pct_max": position_size_pct_max(action),
+        "blockers": [],
         "rationale": rationale(action, research_plan),
         "method": "conservative_research_plan_mapping",
         "source": "research_plan"
@@ -518,10 +530,10 @@ fn trade_action(rating: &str) -> &'static str {
     }
 }
 
-fn position_size(action: &str) -> &'static str {
+fn position_size_pct_max(action: &str) -> f64 {
     match action {
-        "Buy" | "Sell" => "0%-30%",
-        _ => "0%",
+        "Buy" | "Sell" => 0.30,
+        _ => 0.0,
     }
 }
 
@@ -790,7 +802,9 @@ mod trade_intent_tests {
         assert_eq!(intent["action"], "Buy");
         assert_eq!(intent["entry_price"], Value::Null);
         assert_eq!(intent["stop_loss"], Value::Null);
-        assert_eq!(intent["position_size"], "0%-30%");
+        assert_eq!(intent["candidate_action"], "Buy");
+        assert_eq!(intent["execution_decision"], "execute_candidate");
+        assert_eq!(intent["position_size_pct_max"], 0.3);
         assert!(intent.get("rating").is_none());
         assert!(intent.get("long_probability").is_none());
         assert!(intent.get("short_probability").is_none());
@@ -807,7 +821,7 @@ mod trade_intent_tests {
         ] {
             let intent = research_plan_to_trade_intent(&research_plan);
             assert_eq!(intent["action"], "Hold");
-            assert_eq!(intent["position_size"], "0%");
+            assert_eq!(intent["position_size_pct_max"], 0.0);
         }
     }
 

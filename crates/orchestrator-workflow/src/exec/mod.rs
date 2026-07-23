@@ -864,14 +864,16 @@ fn proposed_position_signal(state: &Value, research: &Value) -> Option<f64> {
         return Some(value.clamp(0.0, 1.0));
     }
 
-    if let Some(size) = state
-        .get("trader_investment_plan")
-        .and_then(|plan| plan.get("position_size"))
-        .and_then(Value::as_str)
-    {
-        if let Some(parsed) = parse_position_size_pct(size) {
-            return Some(parsed);
-        }
+    if let Some(size) = state.get("trader_investment_plan").and_then(|plan| {
+        plan.get("position_size_pct_max")
+            .and_then(Value::as_f64)
+            .or_else(|| {
+                plan.get("position_size")
+                    .and_then(Value::as_str)
+                    .and_then(parse_position_size_pct)
+            })
+    }) {
+        return Some(size.clamp(0.0, 1.0));
     }
 
     research
@@ -3397,12 +3399,44 @@ async fn run_phase4(
     )
     .await?;
     sanitize_downstream_constraints(state, "trader_investment_plan", &mut artifact);
+    enforce_trade_candidate(state, &mut artifact);
     persist_artifact(conn, state, 4, "trader", artifact.clone())?;
     // LLM path already wrote outputs/debug/phase04/trader.jsonl with req/resp.
     // Merge final artifact only if that file exists; never replace with a bare stub.
     record_local_debug_artifact(state, 4, "trader", &artifact)?;
     state["trader_investment_plan"] = artifact;
     Ok(())
+}
+
+fn enforce_trade_candidate(state: &Value, artifact: &mut Value) {
+    let candidate = match state
+        .get("research_plan")
+        .and_then(|plan| plan.get("rating"))
+        .and_then(Value::as_str)
+    {
+        Some("Buy" | "Overweight") => "Buy",
+        Some("Sell" | "Underweight") => "Sell",
+        _ => "Hold",
+    };
+    artifact["candidate_action"] = json!(candidate);
+    let executes_candidate = artifact.get("execution_decision").and_then(Value::as_str)
+        == Some("execute_candidate")
+        && artifact.get("action").and_then(Value::as_str) == Some(candidate)
+        && candidate != "Hold";
+    if executes_candidate {
+        return;
+    }
+    artifact["action"] = json!("Hold");
+    artifact["execution_decision"] = json!("hold");
+    artifact["position_size_pct_max"] = json!(0.0);
+    if let Some(blockers) = artifact.get_mut("blockers").and_then(Value::as_array_mut) {
+        if !blockers
+            .iter()
+            .any(|item| item == "runtime_candidate_mismatch")
+        {
+            blockers.push(json!("runtime_candidate_mismatch"));
+        }
+    }
 }
 
 fn run_phase4_rust_rule(conn: &mut rusqlite::Connection, state: &mut Value) -> Result<()> {
@@ -4762,4 +4796,31 @@ fn interaction_forks_include_the_current_role_prompt() {
 
         assert_eq!(steer["include_prompt_on_fork"], true, "{role}");
     }
+}
+
+#[test]
+fn phase4_runtime_keeps_only_the_research_candidate_or_hold() {
+    let state = json!({"research_plan": {"rating": "Buy"}});
+    let mut reversed = json!({
+        "action": "Sell",
+        "candidate_action": "Sell",
+        "execution_decision": "execute_candidate",
+        "position_size_pct_max": 0.25,
+        "blockers": []
+    });
+    enforce_trade_candidate(&state, &mut reversed);
+    assert_eq!(reversed["candidate_action"], "Buy");
+    assert_eq!(reversed["action"], "Hold");
+    assert_eq!(reversed["execution_decision"], "hold");
+    assert_eq!(reversed["position_size_pct_max"], 0.0);
+
+    let mut valid = json!({
+        "action": "Buy",
+        "execution_decision": "execute_candidate",
+        "position_size_pct_max": 0.15,
+        "blockers": []
+    });
+    enforce_trade_candidate(&state, &mut valid);
+    assert_eq!(valid["action"], "Buy");
+    assert_eq!(valid["position_size_pct_max"], 0.15);
 }

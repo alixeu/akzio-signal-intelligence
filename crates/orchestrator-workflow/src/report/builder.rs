@@ -519,9 +519,16 @@ fn trade_plan(trader: &Value, final_decision: &Value) -> String {
         .or_else(|| final_decision.get("rating").and_then(Value::as_str))
         .unwrap_or("N/A");
     let position_size = trader
-        .get("position_size")
-        .and_then(Value::as_str)
-        .unwrap_or("N/A");
+        .get("position_size_pct_max")
+        .and_then(Value::as_f64)
+        .map(|value| format!("{:.0}%", value * 100.0))
+        .or_else(|| {
+            trader
+                .get("position_size")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| "N/A".to_string());
     // TradeIntent exposes `entry_price` / `stop_loss`; accept `entry` / `stop`
     // aliases for forward compatibility with the plan template.
     let entry = trader

@@ -2358,11 +2358,18 @@ fn validate_trade_intent_entry(entry: &Value) -> Result<()> {
     if !matches!(action, "Buy" | "Sell" | "Hold") {
         bail!("trade intent action must be Buy, Sell, or Hold");
     }
-    let position_size = require_non_empty_string(entry, "position_size")?;
-    let position_cap = parse_position_upper_bound(position_size)
-        .context("trade intent position_size must be a percentage or percentage range")?;
-    if action == "Hold" && position_cap > f64::EPSILON {
-        bail!("Hold trade intent must use position_size=0%");
+    let candidate_action = require_non_empty_string(entry, "candidate_action")?;
+    if !matches!(candidate_action, "Buy" | "Sell" | "Hold") {
+        bail!("trade intent candidate_action must be Buy, Sell, or Hold");
+    }
+    let execution_decision = require_non_empty_string(entry, "execution_decision")?;
+    if !matches!(execution_decision, "execute_candidate" | "hold") {
+        bail!("trade intent execution_decision must be execute_candidate or hold");
+    }
+    let position_cap = require_number_in_range(entry, "position_size_pct_max", 0.0, 1.0)?;
+    require_array(entry, "blockers")?;
+    if (action == "Hold" || execution_decision == "hold") && position_cap > f64::EPSILON {
+        bail!("held trade intent must use position_size_pct_max=0");
     }
     require_non_empty_string(entry, "rationale")?;
     for field in ["entry_price", "stop_loss"] {
@@ -2373,27 +2380,6 @@ fn validate_trade_intent_entry(entry: &Value) -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn parse_position_upper_bound(value: &str) -> Option<f64> {
-    fn percentage(part: &str) -> Option<f64> {
-        let value = part.trim().strip_suffix('%')?.trim().parse::<f64>().ok()?;
-        value
-            .is_finite()
-            .then_some(value)
-            .filter(|value| (0.0..=100.0).contains(value))
-    }
-
-    let parts = value.split(['-', '–', '—']).collect::<Vec<_>>();
-    match parts.as_slice() {
-        [single] => percentage(single).map(|value| value / 100.0),
-        [low, high] => {
-            let low = percentage(low)?;
-            let high = percentage(high)?;
-            (low <= high).then_some(high / 100.0)
-        }
-        _ => None,
-    }
 }
 
 fn validate_risk_constraints_contract(settings: &AgentSettings, artifact: &Value) -> Result<()> {
@@ -2862,7 +2848,10 @@ fn mock_trader_artifact() -> Value {
         "action": "Hold",
         "entry_price": null,
         "stop_loss": null,
-        "position_size": "0%",
+        "candidate_action": "Hold",
+        "execution_decision": "hold",
+        "position_size_pct_max": 0.0,
+        "blockers": [],
         "rationale": "Mock trader plan based on neutral research."
     })
 }
@@ -3368,15 +3357,18 @@ mod tests {
 
         let text = r#"{
             "action":"Hold",
+            "candidate_action":"Hold",
+            "execution_decision":"hold",
             "entry_price":null,
             "stop_loss":null,
-            "position_size":"0%-30%",
+            "position_size_pct_max":0.3,
+            "blockers":[],
             "rationale":"observe"
         }"#;
         let error = super::parse_final_output(&settings, text).unwrap_err();
 
         assert!(
-            error.to_string().contains("Hold"),
+            error.to_string().contains("held"),
             "unexpected error: {error}"
         );
     }
@@ -3389,9 +3381,12 @@ mod tests {
 
         let text = r#"{
             "action":"Buy",
+            "candidate_action":"Buy",
+            "execution_decision":"execute_candidate",
             "entry_price":null,
             "stop_loss":null,
-            "position_size":"10%-20%",
+            "position_size_pct_max":0.2,
+            "blockers":[],
             "rationale":"Phase 3 candidate remains executable.",
             "derived_stop_reference":"invented field"
         }"#;
@@ -3407,13 +3402,16 @@ mod tests {
 
         let text = r#"{
             "action":"Buy",
+            "candidate_action":"Buy",
+            "execution_decision":"execute_candidate",
             "entry_price":null,
             "stop_loss":null,
-            "position_size":"small observation position",
+            "position_size_pct_max":"small observation position",
+            "blockers":[],
             "rationale":"Not machine parseable."
         }"#;
         let error = super::parse_final_output(&settings, text).unwrap_err();
-        assert!(error.to_string().contains("percentage"));
+        assert!(error.to_string().contains("position_size_pct_max"));
     }
 
     #[test]

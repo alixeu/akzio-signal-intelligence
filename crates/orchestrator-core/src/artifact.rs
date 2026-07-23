@@ -72,12 +72,23 @@ pub struct Scenarios {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 pub struct TradeIntent {
     pub action: String,
+    /// Rust-owned rating mapping before the Trader applies semantic blockers.
+    #[serde(default)]
+    pub candidate_action: String,
+    /// execute_candidate | hold
+    #[serde(default)]
+    pub execution_decision: String,
     #[serde(default)]
     pub entry_price: Option<String>,
     #[serde(default)]
     pub stop_loss: Option<String>,
     #[serde(default)]
     pub position_size: String,
+    /// Numeric maximum portfolio fraction. Replaces free-form percentage text.
+    #[serde(default)]
+    pub position_size_pct_max: f64,
+    #[serde(default)]
+    pub blockers: Vec<String>,
     #[serde(default)]
     pub rationale: String,
     #[serde(flatten)]

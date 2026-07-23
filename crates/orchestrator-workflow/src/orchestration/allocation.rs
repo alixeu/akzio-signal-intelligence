@@ -570,7 +570,8 @@ fn trader_plan_position_cap(context: &Value) -> Option<f64> {
             if action.eq_ignore_ascii_case("buy") || action.eq_ignore_ascii_case("sell") =>
         {
             Some(
-                plan.get("position_size")
+                plan.get("position_size_pct_max")
+                    .or_else(|| plan.get("position_size"))
                     .and_then(position_fraction)
                     .unwrap_or(0.0),
             )
