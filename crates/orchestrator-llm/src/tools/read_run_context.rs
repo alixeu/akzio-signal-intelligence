@@ -66,25 +66,25 @@ pub(super) fn visible_scope(turn_context: Option<&ToolRuntimeTurnContext>) -> Re
     Ok((context.run_id.as_str(), current_phase))
 }
 
-pub(super) fn wait_for_phase00(
+pub(super) fn wait_for_phase_summary(
     config: &ExternalToolConfig,
     run_id: &str,
     max_source_phase: i64,
-) -> Result<Option<orchestrator_sql::Phase00MemoryIndex>> {
+) -> Result<Option<orchestrator_sql::PhaseSummaryMemoryIndex>> {
     let configured_gate = config
-        .phase00_gate
+        .phase_summary_gate
         .as_ref()
         .filter(|gate| gate.run_id() == run_id)
         .cloned();
-    let gate = configured_gate.or_else(|| orchestrator_sql::phase00_gate(run_id));
+    let gate = configured_gate.or_else(|| orchestrator_sql::phase_summary_gate(run_id));
     let Some(gate) = gate else {
         return Ok(None);
     };
     gate.wait_until_ready_checked(Some(max_source_phase), std::time::Duration::from_secs(600))
-        .map_err(|error| anyhow::anyhow!("phase00 summaries unavailable: {error}"))?;
+        .map_err(|error| anyhow::anyhow!("phase_summary summaries unavailable: {error}"))?;
     let snapshot = gate.snapshot();
     if snapshot.run_id != run_id {
-        bail!("phase00 memory belongs to a different run");
+        bail!("phase_summary memory belongs to a different run");
     }
     Ok(Some(snapshot))
 }

@@ -1220,6 +1220,17 @@ async fn mark_last_assistant_message_as_final<S: AgentEventSink>(
 
 fn preseed_tool_calls(turn: &Turn, tickers: &[String]) -> Vec<ToolCallRequest> {
     let mut calls = Vec::new();
+    if turn.phase.is_some_and(|phase| (1..=6).contains(&phase))
+        && turn.role != "compressor.phase_summary"
+    {
+        for ticker in tickers {
+            calls.push(ToolCallRequest {
+                call_id: format!("preseed-experience-{}", ticker.to_lowercase()),
+                name: tools::READ_EXPERIENCE_TOOL_NAME.to_string(),
+                arguments: json!({ "ticker": ticker }),
+            });
+        }
+    }
     match turn.role.as_str() {
         "analyst.technical" => {
             for ticker in tickers {
@@ -2216,7 +2227,8 @@ impl LoopToolRuntime for ProjectToolRuntime {
             let web_run_config = web_run.as_ref().map(tools::WebRunRuntime::config);
             let configured = available_tools.iter().any(|name| name == &call.name);
             let enabled = call.name == "think"
-                || tools::enabled_tool_names(web_run_config).contains(&call.name.as_str());
+                || tools::enabled_tool_names(web_run_config, config.ai4trade_live)
+                    .contains(&call.name.as_str());
             if !configured || !enabled {
                 warn!(
                     call_id = call.call_id,
@@ -3336,9 +3348,13 @@ mod tests {
                 db_path: None,
                 run_dir: None,
                 run_id: None,
+                phase: None,
+                allowed_reflection_task_ids: Vec::new(),
                 tickers: Vec::new(),
-                phase00_index: None,
-                phase00_gate: None,
+                ai4trade_live: false,
+                ai4trade_token: None,
+                phase_summary_index: None,
+                phase_summary_gate: None,
             },
             vec![tools::READ_RUN_CONTEXT_TOOL_NAME.to_string()],
         );
@@ -3363,9 +3379,13 @@ mod tests {
                 db_path: None,
                 run_dir: None,
                 run_id: None,
+                phase: None,
+                allowed_reflection_task_ids: Vec::new(),
                 tickers: Vec::new(),
-                phase00_index: None,
-                phase00_gate: None,
+                ai4trade_live: false,
+                ai4trade_token: None,
+                phase_summary_index: None,
+                phase_summary_gate: None,
             },
             Vec::new(),
         );
@@ -3933,9 +3953,13 @@ mod tests {
                 db_path: None,
                 run_dir: None,
                 run_id: None,
+                phase: None,
+                allowed_reflection_task_ids: Vec::new(),
                 tickers: vec!["TQQQ".to_string()],
-                phase00_index: None,
-                phase00_gate: None,
+                ai4trade_live: false,
+                ai4trade_token: None,
+                phase_summary_index: None,
+                phase_summary_gate: None,
             },
             vec![tools::WEB_RUN_TOOL_NAME.to_string()],
         )

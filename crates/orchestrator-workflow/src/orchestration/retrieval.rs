@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 
 use crate::orchestration::config::{AllocationConfig, RuntimeConfig};
 
-pub(crate) fn inject_phase0_reflection(
+pub(crate) fn inject_phase_summary_reflection(
     conn: &Connection,
     state: &mut Value,
     config: &RuntimeConfig,
@@ -39,6 +39,7 @@ pub(crate) fn inject_phase0_reflection(
     state["prior_memory"] = json!({
         "enabled": true,
         "reflection_version": config.reflection.reflection_version,
+        "promote_mode": config.reflection.promote_mode,
         "budget": {
             "token_budget": config.reflection.retrieval.token_budget,
             "max_items": config.reflection.retrieval.max_items,
@@ -267,9 +268,9 @@ mod tests {
     #[test]
     fn injects_empty_structures_when_enabled_without_data() {
         let temp = tempfile::tempdir().unwrap();
-        let conn = connect(temp.path().join("phase0-empty.sqlite")).unwrap();
+        let conn = connect(temp.path().join("phase_summary-empty.sqlite")).unwrap();
         let mut state = json!({"ticker":"QQQ", "tickers":["QQQ"]});
-        inject_phase0_reflection(
+        inject_phase_summary_reflection(
             &conn,
             &mut state,
             &test_runtime_config(true, RetrievalBudget::default()),
@@ -291,9 +292,9 @@ mod tests {
     #[test]
     fn disabled_config_does_not_inject_reflection_state() {
         let temp = tempfile::tempdir().unwrap();
-        let conn = connect(temp.path().join("phase0-disabled.sqlite")).unwrap();
+        let conn = connect(temp.path().join("phase_summary-disabled.sqlite")).unwrap();
         let mut state = json!({"ticker":"QQQ", "tickers":["QQQ"]});
-        inject_phase0_reflection(
+        inject_phase_summary_reflection(
             &conn,
             &mut state,
             &test_runtime_config(false, RetrievalBudget::default()),
@@ -308,11 +309,11 @@ mod tests {
     #[test]
     fn retrieval_budget_caps_injected_prior_memory() {
         let temp = tempfile::tempdir().unwrap();
-        let conn = connect(temp.path().join("phase0-budget.sqlite")).unwrap();
+        let conn = connect(temp.path().join("phase_summary-budget.sqlite")).unwrap();
         seed_memory(&conn, "run-1", 0.9);
         seed_memory(&conn, "run-2", 0.8);
         let mut state = json!({"ticker":"QQQ", "tickers":["QQQ"]});
-        inject_phase0_reflection(
+        inject_phase_summary_reflection(
             &conn,
             &mut state,
             &test_runtime_config(
@@ -335,7 +336,7 @@ mod tests {
     #[test]
     fn injects_track_record_and_agent_accuracy() {
         let temp = tempfile::tempdir().unwrap();
-        let conn = connect(temp.path().join("phase0-accuracy.sqlite")).unwrap();
+        let conn = connect(temp.path().join("phase_summary-accuracy.sqlite")).unwrap();
         let prediction_id = upsert_prediction(
             &conn,
             &PredictionInput {
@@ -370,7 +371,7 @@ mod tests {
         )
         .unwrap();
         let mut state = json!({"ticker":"QQQ", "tickers":["QQQ"]});
-        inject_phase0_reflection(
+        inject_phase_summary_reflection(
             &conn,
             &mut state,
             &test_runtime_config(true, RetrievalBudget::default()),

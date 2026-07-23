@@ -124,8 +124,8 @@ pub fn expired_unscored_predictions(
         FROM predictions p
         LEFT JOIN outcomes o ON o.prediction_id = p.id
         WHERE o.id IS NULL
-          AND p.outcome_due_date <= ?
-        ORDER BY p.outcome_due_date ASC, p.id ASC
+          AND p.prediction_date < ?
+        ORDER BY p.prediction_date ASC, p.id ASC
         LIMIT ?
         "#,
     )?;

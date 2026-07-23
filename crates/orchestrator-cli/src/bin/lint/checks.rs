@@ -88,21 +88,24 @@ pub fn check_common_components(
     issues: &mut Vec<LintIssue>,
 ) {
     let checks: &[(&str, &[&str])] = &[
-        ("analyst_output_contract", &["analyst_output_contract.md"]),
-        ("anti_injection", &["anti_injection.md"]),
-        ("research_calibration", &["research_calibration.md"]),
-        ("research_drivers", &["research_drivers.md"]),
-        ("leveraged_etf_rules", &["leveraged_etf_rules.md"]),
-        ("analyst_output_structure", &["analyst_output_structure.md"]),
+        (
+            "analyst_output_contract",
+            &["common/analyst_output_contract.md"],
+        ),
+        ("anti_injection", &["common/anti_injection.md"]),
+        ("research_calibration", &["common/research_calibration.md"]),
+        ("research_drivers", &["common/research_drivers.md"]),
+        ("analysis_trace_contract", &["common/analysis_trace.md"]),
+        ("leveraged_etf_rules", &["common/leveraged_etf_rules.md"]),
         // researcher prompts are standalone; {researcher_body} is only a
         // compatibility placeholder and no longer expands a common component.
-        ("risk_analyst_body", &["risk_analyst.md"]),
+        ("risk_analyst_body", &["phase5/risk_analyst.md"]),
     ];
     for (placeholder, files) in checks {
         let token = format!("{{{placeholder}}}");
         if content.contains(&token) {
             for component_file in *files {
-                let component_path = prompts_dir.join("common").join(component_file);
+                let component_path = prompts_dir.join(component_file);
                 if !component_path.exists() {
                     issues.push(LintIssue {
                         file: file_path.display().to_string(),
@@ -157,6 +160,7 @@ pub fn check_orphan_placeholders(
         "risk_debate_state": {"history": []},
         "final_trade_decision": {"rating": "Hold"},
         "allocation_context": {"investable_assets": ["QQQ", "SOXX"]},
+        "reflection_task": {"task_id": 1},
     });
     match render_for_lint(
         &state,
@@ -336,14 +340,16 @@ fn render_for_lint(
         .cloned()
         .unwrap_or(Value::Null);
     let analyst_output_contract_template =
-        common_component(prompt_path, "analyst_output_contract.md")?;
-    let anti_injection_template = common_component(prompt_path, "anti_injection.md")?;
-    let research_calibration_template = common_component(prompt_path, "research_calibration.md")?;
-    let research_drivers_template = common_component(prompt_path, "research_drivers.md")?;
-    let risk_analyst_template = common_component(prompt_path, "risk_analyst.md")?;
-    let leveraged_etf_rules_template = common_component(prompt_path, "leveraged_etf_rules.md")?;
-    let analyst_output_structure_template =
-        common_component(prompt_path, "analyst_output_structure.md")?;
+        prompt_component(prompt_path, "common/analyst_output_contract.md")?;
+    let anti_injection_template = prompt_component(prompt_path, "common/anti_injection.md")?;
+    let research_calibration_template =
+        prompt_component(prompt_path, "common/research_calibration.md")?;
+    let research_drivers_template = prompt_component(prompt_path, "common/research_drivers.md")?;
+    let analysis_trace_contract_template =
+        prompt_component(prompt_path, "common/analysis_trace.md")?;
+    let risk_analyst_template = prompt_component(prompt_path, "phase5/risk_analyst.md")?;
+    let leveraged_etf_rules_template =
+        prompt_component(prompt_path, "common/leveraged_etf_rules.md")?;
     let component_values = json!({
         "ticker": ticker,
         "tickers": tickers.join(","),
@@ -361,13 +367,13 @@ fn render_for_lint(
     let research_calibration =
         replace_placeholders(&research_calibration_template, &component_values);
     let research_drivers = replace_placeholders(&research_drivers_template, &component_values);
+    let analysis_trace_contract =
+        replace_placeholders(&analysis_trace_contract_template, &component_values);
     let leveraged_etf_rules = if contains_leveraged_etf(&tickers) {
         replace_placeholders(&leveraged_etf_rules_template, &component_values)
     } else {
         String::new()
     };
-    let analyst_output_structure =
-        replace_placeholders(&analyst_output_structure_template, &component_values);
     let (side, side_label, opponent, opponent_label) = researcher_side_params(role);
     let stance_label = risk_stance_label(role);
     let (stance_role_label, stance_intro, stance_rules, stance_schema_extra) =
@@ -381,8 +387,8 @@ fn render_for_lint(
         "anti_injection": anti_injection,
         "research_calibration": research_calibration,
         "research_drivers": research_drivers,
+        "analysis_trace_contract": analysis_trace_contract,
         "leveraged_etf_rules": leveraged_etf_rules,
-        "analyst_output_structure": analyst_output_structure,
         "analyst_artifact_schema": analyst_artifact_schema(),
         "research_artifact_schema": research_artifact_schema(),
         "trade_intent_schema": trade_intent_schema(),
@@ -413,9 +419,14 @@ fn render_for_lint(
         "risk_history": serde_json::to_string_pretty(&state.get("risk_debate_state").and_then(|v| v.get("history")).cloned().unwrap_or_else(|| json!([])))?,
         "portfolio_decision": serde_json::to_string_pretty(&state.get("final_trade_decision").cloned().unwrap_or(Value::Null))?,
         "allocation_context": serde_json::to_string_pretty(&state.get("allocation_context").cloned().unwrap_or(Value::Null))?,
+        "reflection_task": serde_json::to_string_pretty(&state.get("reflection_task").cloned().unwrap_or(Value::Null))?,
         "phase3_context": "{}",
         "risk_context": "{}",
         "portfolio_context": "{}",
+        "ai4trade_mode": "disabled",
+        "phase1_index": "{}",
+        "prior_phase_summaries": "{\"items\":[]}",
+        "common_ground": "{}",
         "workflow_pattern": "Workflow -> Stage/Sub-workflow -> Agent workers -> Reducer -> state artifact"
     });
     component_registry.render_for_role(role, &mut values)?;
@@ -480,17 +491,21 @@ fn topic_state(state: &Value, topic_id: &str) -> Option<Value> {
         .cloned()
 }
 
-fn common_component(prompt_path: Option<&Path>, file_name: &str) -> Result<String> {
+fn prompt_component(prompt_path: Option<&Path>, relative_path: &str) -> Result<String> {
     let Some(path) = prompt_path else {
         return Ok(String::new());
     };
     let Some(prompts_dir) = path.parent().and_then(|parent| parent.parent()) else {
         return Ok(String::new());
     };
-    let common_path = prompts_dir.join("common").join(file_name);
-    if common_path.exists() {
-        std::fs::read_to_string(&common_path)
-            .with_context(|| format!("failed to read prompt template {}", common_path.display()))
+    let component_path = prompts_dir.join(relative_path);
+    if component_path.exists() {
+        std::fs::read_to_string(&component_path).with_context(|| {
+            format!(
+                "failed to read prompt template {}",
+                component_path.display()
+            )
+        })
     } else {
         Ok(String::new())
     }

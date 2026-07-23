@@ -1,8 +1,8 @@
 //! Post-phase compressor index: summaries → details, and unified attention ledger.
 //!
-//! Runtime authority for phase00 rows is the in-memory [`Phase00MemoryIndex`].
+//! Runtime authority for phase_summary rows is the in-memory [`PhaseSummaryMemoryIndex`].
 //! Completed phase batches can also be persisted immediately with
-//! [`persist_phase00_batch`].
+//! [`persist_phase_summary_batch`].
 
 use crate::schema::{canonical_json, ensure_run_exists, now_ms, payload_hash};
 use anyhow::Result;
@@ -78,7 +78,7 @@ pub fn phase_detail_id(summary_id: &str, sort_order: i64, detail: &str) -> Strin
     format!("{:x}", hasher.finalize())
 }
 
-/// In-memory phase00 summary row (same shape as SQLite / tool JSON).
+/// In-memory phase summary row (same shape as SQLite / tool JSON).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PhaseSummaryRow {
     pub id: String,
@@ -93,7 +93,7 @@ pub struct PhaseSummaryRow {
     pub created_at: i64,
 }
 
-/// In-memory phase00 detail row.
+/// In-memory phase_summary detail row.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PhaseSummaryDetailRow {
     pub id: String,
@@ -109,13 +109,13 @@ pub struct PhaseSummaryDetailRow {
 
 /// One phase's compressor batch before SQLite flush.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct Phase00PhaseBatch {
+pub struct PhaseSummaryPhaseBatch {
     pub source_phase: i64,
     pub summaries: Vec<PhaseSummaryRow>,
     pub details: Vec<PhaseSummaryDetailRow>,
 }
 
-impl Phase00PhaseBatch {
+impl PhaseSummaryPhaseBatch {
     pub fn written(&self) -> usize {
         self.summaries.len() + self.details.len()
     }
@@ -181,19 +181,19 @@ impl Phase00PhaseBatch {
             "detail_count": self.details.len(),
             "attention_count": 0,
             "persisted": false,
-            "note": "In-memory phase00 batch; SQLite flush happens at run end."
+            "note": "In-memory phase_summary batch; SQLite flush happens at run end."
         })
     }
 }
 
-/// Run-scoped phase00 memory index (authoritative during the run).
+/// Run-scoped phase_summary memory index (authoritative during the run).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct Phase00MemoryIndex {
+pub struct PhaseSummaryMemoryIndex {
     pub run_id: String,
-    pub phases: BTreeMap<i64, Phase00PhaseBatch>,
+    pub phases: BTreeMap<i64, PhaseSummaryPhaseBatch>,
 }
 
-impl Phase00MemoryIndex {
+impl PhaseSummaryMemoryIndex {
     pub fn new(run_id: impl Into<String>) -> Self {
         Self {
             run_id: run_id.into(),
@@ -209,7 +209,7 @@ impl Phase00MemoryIndex {
         serde_json::to_value(self).unwrap_or(json!({}))
     }
 
-    pub fn merge(&mut self, batch: Phase00PhaseBatch) {
+    pub fn merge(&mut self, batch: PhaseSummaryPhaseBatch) {
         if self.run_id.is_empty() {
             if let Some(first) = batch.summaries.first() {
                 self.run_id = first.run_id.clone();
@@ -244,7 +244,7 @@ impl Phase00MemoryIndex {
             "query": "phase_summaries",
             "item_count": items.len(),
             "items": items,
-            "source": "phase00_memory",
+            "source": "phase_summary_memory",
             "note": "Newer source_phase has higher recency_weight; prefer recent summaries."
         })
     }
@@ -315,7 +315,7 @@ impl Phase00MemoryIndex {
             "summary_id": summary_id,
             "item_count": items.len(),
             "items": items,
-            "source": "phase00_memory"
+            "source": "phase_summary_memory"
         }))
     }
 
@@ -352,7 +352,7 @@ impl Phase00MemoryIndex {
         let tx = conn.unchecked_transaction()?;
         let mut total = 0usize;
         for batch in self.phases.values() {
-            total += persist_phase00_batch_inner(&tx, &self.run_id, batch)?;
+            total += persist_phase_summary_batch_inner(&tx, &self.run_id, batch)?;
         }
         tx.commit()?;
         Ok(total)
@@ -374,7 +374,7 @@ fn empty_phase_summaries(note: &str) -> Value {
         "query": "phase_summaries",
         "item_count": 0,
         "items": [],
-        "source": "phase00_memory",
+        "source": "phase_summary_memory",
         "note": note
     })
 }
@@ -385,7 +385,7 @@ fn empty_phase_details(summary_id: &str, note: &str) -> Value {
         "summary_id": summary_id,
         "item_count": 0,
         "items": [],
-        "source": "phase00_memory",
+        "source": "phase_summary_memory",
         "note": note
     })
 }
@@ -528,27 +528,27 @@ pub fn clear_phase_compress(conn: &Connection, run_id: &str, source_phase: i64) 
     Ok(())
 }
 
-/// Persist exactly one completed phase00 batch in one transaction.
+/// Persist exactly one completed phase_summary batch in one transaction.
 ///
 /// Existing rows are cleared only for the same `(run_id, source_phase)` pair.
-pub fn persist_phase00_batch(
+pub fn persist_phase_summary_batch(
     conn: &Connection,
     run_id: &str,
-    batch: &Phase00PhaseBatch,
+    batch: &PhaseSummaryPhaseBatch,
 ) -> Result<usize> {
     let tx = conn.unchecked_transaction()?;
-    let written = persist_phase00_batch_inner(&tx, run_id, batch)?;
+    let written = persist_phase_summary_batch_inner(&tx, run_id, batch)?;
     tx.commit()?;
     Ok(written)
 }
 
-fn persist_phase00_batch_inner(
+fn persist_phase_summary_batch_inner(
     conn: &Connection,
     run_id: &str,
-    batch: &Phase00PhaseBatch,
+    batch: &PhaseSummaryPhaseBatch,
 ) -> Result<usize> {
     if run_id.trim().is_empty() {
-        anyhow::bail!("run_id is required to persist a phase00 batch");
+        anyhow::bail!("run_id is required to persist a phase_summary batch");
     }
     if batch.source_phase <= 0 {
         anyhow::bail!("source_phase must be greater than zero");
@@ -562,7 +562,7 @@ fn persist_phase00_batch_inner(
             .iter()
             .any(|row| row.run_id != run_id || row.source_phase != batch.source_phase)
     {
-        anyhow::bail!("phase00 batch rows must match run_id and source_phase");
+        anyhow::bail!("phase_summary batch rows must match run_id and source_phase");
     }
     if batch.details.iter().any(|detail| {
         !batch
@@ -570,7 +570,7 @@ fn persist_phase00_batch_inner(
             .iter()
             .any(|summary| summary.id == detail.summary_id)
     }) {
-        anyhow::bail!("phase00 detail must reference a summary in the same batch");
+        anyhow::bail!("phase_summary detail must reference a summary in the same batch");
     }
 
     clear_phase_compress(conn, run_id, batch.source_phase)?;

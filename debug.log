@@ -1,0 +1,41 @@
+# Workflow debug log
+
+## 2026-07-22 — phase 1 live debug
+
+- Command: `cargo run -p orchestrator-cli --bin orchestrator-exec -- --debug --from-phase 1 --to-phase 1`
+- Result: completed successfully; phase00 summary was produced and persisted.
+- Observation: the first `analyst.technical` artifact omitted the required `id` and `role` fields. Runtime validation rejected it and the built-in artifact retry produced a valid final artifact.
+- Status: recovered by the existing retry path; retained as a model-output contract observation for subsequent full-pipeline verification.
+
+## 2026-07-22 — workflow sequencing fix
+
+- Finding: phase00 compression previously ran concurrently with the next business phase, so downstream input could race the summary index.
+- Fix: await phase00 immediately after each completed business phase (1 through 7) before the following phase begins. Phase 8 is terminal archival/prediction work and has no downstream consumer or phase00 source payload.
+
+## 2026-07-22 — phases 1-8 mock debug
+
+- Command: `cargo run -p orchestrator-cli --bin orchestrator-exec -- --mock --debug --from-phase 1 --to-phase 8`
+- Result: completed successfully with no warnings, errors, rejected artifacts, or timeouts in the debug records.
+- Phase00 verification: summaries were written for source phases 1 through 7; phase 8 remains terminal archival/prediction work.
+
+## 2026-07-22 — full test-suite debug
+
+- Finding: `shipped_analyst_contract_delegates_shape_to_runtime_validation` rejected the intentional JSON example for `per_ticker` in the shared output contract.
+- Fix: retain the assertion that the runtime owns the top-level schema, while asserting the documented per-ticker field contract instead.
+
+## 2026-07-22 — live full-pipeline debug
+
+- Command: `cargo run -p orchestrator-cli --bin orchestrator-exec -- --debug --from-phase 1 --to-phase 8`
+- Phase 1 completed and phase00 persisted successfully. The technical role had one contract retry; the news/macro role had one parser retry, both recovered.
+- Finding: both phase-2 warmup stream requests failed, then their degraded placeholders failed the mandatory `准备完毕` handshake and aborted the run.
+- Fix: retry the mandatory warmup handshake once before aborting. This is scoped to the transient-failure boundary; ordinary role degradation remains unchanged.
+- Finding: phase-2 prompts prohibit external search, but the global live-search configuration still registered `web.run` for their requests.
+- Fix: phase-2 roles now explicitly override the global search mode to `disabled`, and the runtime omits `web.run` whenever that effective mode is disabled.
+- Finding: a phase-1 Chat Completions SSE transport/decode failure was treated as non-transient after partial stream progress, aborting the critical news role.
+- Fix: classify transport/decode failures as transient at both stream and whole-role retry layers; an interrupted role can now restart from a fresh turn.
+- Finding: the technical analyst's final response reached the gateway completion limit (`finish_reason=Length`), producing no valid artifact.
+- Fix: limit each analyst ticker payload to 3 evidence rows, 2 triggers, 2 data gaps, and a 150-220 Chinese-character report.
+- Finding: phase 2 reached its warmup handshake but both concurrent steer streams failed within about one second, even after removing external search from their requests.
+- Fix: run the two mandatory warmups sequentially to avoid concurrent steer-stream pressure on the gateway.
+- Verification: the sequential Bull warmup still failed twice within about one second with `Chat Completions stream failed`. The live gateway rejects steer-loop requests independently of concurrency, prompt size, phase00 ordering, and external search; the mock full pipeline remains successful.
+- Verification: after all fixes, `cargo run -p orchestrator-cli --bin orchestrator-exec -- --mock --debug --from-phase 1 --to-phase 8` completed successfully; phase00 records exist for source phases 1 through 7.

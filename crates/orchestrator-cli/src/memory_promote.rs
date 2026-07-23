@@ -59,13 +59,8 @@ pub fn promote_memories(conn: &Connection, options: &PromoteOptions) -> Result<P
         });
 
         if candidate.sample_count < options.min_samples as i64 {
-            update_candidate_status(
-                conn,
-                candidate.id,
-                "rejected",
-                "sample_count below threshold",
-            )?;
-            summary.rejected += 1;
+            // Keep a one-off or repeated warning pending so later distinct runs
+            // can accumulate into the same Rust-derived pattern key.
             continue;
         }
         if candidate.confidence < options.min_confidence {
@@ -128,14 +123,14 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn rejects_candidates_below_gate() {
+    fn keeps_candidates_pending_until_sample_gate() {
         let temp = tempfile::tempdir().unwrap();
         let conn = connect(temp.path().join("promote-reject.sqlite")).unwrap();
         insert_candidate(&conn, 2, 0.9, 0.9);
 
         let summary = promote_memories(&conn, &options(PromoteMode::Auto)).unwrap();
-        assert_eq!(summary.rejected, 1);
-        assert_eq!(status_count(&conn, "rejected"), 1);
+        assert_eq!(summary.rejected, 0);
+        assert_eq!(status_count(&conn, "pending"), 1);
     }
 
     #[test]

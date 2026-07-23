@@ -9,7 +9,7 @@ pub const NAME: &str = "read_phase_summaries";
 pub fn definition() -> ToolDefinition {
     ToolDefinition {
         name: api_tool_name(NAME),
-        description: "List compact Phase 00 summary indexes from earlier phases in the current run. Use the returned summary id with read_phase_summary_details when evidence must be expanded.".to_string(),
+        description: "List compact phase-summary indexes from earlier phases in the current run. Use the returned summary id with read_phase_summary_details when evidence must be expanded.".to_string(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -38,12 +38,12 @@ pub fn execute(
     };
 
     if let Some(index) =
-        super::read_run_context::wait_for_phase00(config, run_id, max_source_phase)?
+        super::read_run_context::wait_for_phase_summary(config, run_id, max_source_phase)?
     {
         return index.list_visible_summaries(run_id, current_phase, ticker);
     }
     if let Some(index) = config
-        .phase00_index
+        .phase_summary_index
         .as_ref()
         .filter(|index| index.run_id == run_id)
     {

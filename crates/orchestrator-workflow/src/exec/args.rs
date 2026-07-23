@@ -42,7 +42,7 @@ pub struct ExecArgs {
     pub max_debate_rounds: Option<i64>,
     #[arg(long)]
     pub max_topics_per_side: Option<i64>,
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, default_value_t = 0)]
     pub from_phase: i64,
     #[arg(long, default_value_t = 8)]
     pub to_phase: i64,

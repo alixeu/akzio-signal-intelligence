@@ -1,33 +1,33 @@
-//! Shared phase00 compress gate: background jobs + sync wait for tool readers.
+//! Shared phase_summary compress gate: background jobs + sync wait for tool readers.
 //!
 //! After each business phase, compress runs concurrently with the next phase.
-//! When a tool needs the phase00 index while compress is still in flight, it waits
+//! When a tool needs the phase_summary index while compress is still in flight, it waits
 //! here until the relevant job(s) complete, then reads the updated memory index.
 
-use crate::phase_index::{Phase00MemoryIndex, Phase00PhaseBatch};
+use crate::phase_index::{PhaseSummaryMemoryIndex, PhaseSummaryPhaseBatch};
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::Duration;
 
 /// Process-wide registry so tool runtime can find the gate by `run_id`.
-static REGISTRY: Mutex<Option<HashMap<String, Arc<Phase00Gate>>>> = Mutex::new(None);
+static REGISTRY: Mutex<Option<HashMap<String, Arc<PhaseSummaryGate>>>> = Mutex::new(None);
 
-fn registry() -> std::sync::MutexGuard<'static, Option<HashMap<String, Arc<Phase00Gate>>>> {
+fn registry() -> std::sync::MutexGuard<'static, Option<HashMap<String, Arc<PhaseSummaryGate>>>> {
     REGISTRY.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-pub fn register_phase00_gate(run_id: &str, gate: Arc<Phase00Gate>) {
+pub fn register_phase_summary_gate(run_id: &str, gate: Arc<PhaseSummaryGate>) {
     let mut reg = registry();
     let map = reg.get_or_insert_with(HashMap::new);
     map.insert(run_id.to_string(), gate);
 }
 
-pub fn phase00_gate(run_id: &str) -> Option<Arc<Phase00Gate>> {
+pub fn phase_summary_gate(run_id: &str) -> Option<Arc<PhaseSummaryGate>> {
     registry().as_ref().and_then(|m| m.get(run_id).cloned())
 }
 
-pub fn unregister_phase00_gate(run_id: &str) {
+pub fn unregister_phase_summary_gate(run_id: &str) {
     if let Some(map) = registry().as_mut() {
         map.remove(run_id);
     }
@@ -41,28 +41,28 @@ struct GateStatus {
     errors: HashMap<i64, String>,
 }
 
-/// Concurrent phase00 compress coordination for one run.
-pub struct Phase00Gate {
+/// Concurrent phase_summary compress coordination for one run.
+pub struct PhaseSummaryGate {
     run_id: String,
-    memory: RwLock<Phase00MemoryIndex>,
+    memory: RwLock<PhaseSummaryMemoryIndex>,
     status: Mutex<GateStatus>,
     cvar: Condvar,
 }
 
-impl std::fmt::Debug for Phase00Gate {
+impl std::fmt::Debug for PhaseSummaryGate {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Phase00Gate")
+        f.debug_struct("PhaseSummaryGate")
             .field("run_id", &self.run_id)
             .field("inflight", &self.inflight_phases())
             .finish()
     }
 }
 
-impl Phase00Gate {
+impl PhaseSummaryGate {
     pub fn new(run_id: impl Into<String>) -> Self {
         let run_id = run_id.into();
         Self {
-            memory: RwLock::new(Phase00MemoryIndex::new(run_id.clone())),
+            memory: RwLock::new(PhaseSummaryMemoryIndex::new(run_id.clone())),
             run_id,
             status: Mutex::new(GateStatus::default()),
             cvar: Condvar::new(),
@@ -81,7 +81,7 @@ impl Phase00Gate {
     }
 
     /// Merge finished batch into memory and wake waiters.
-    pub fn complete(&self, source_phase: i64, batch: Phase00PhaseBatch) {
+    pub fn complete(&self, source_phase: i64, batch: PhaseSummaryPhaseBatch) {
         {
             let mut mem = self.memory.write().unwrap_or_else(|e| e.into_inner());
             if mem.run_id.is_empty() {
@@ -110,7 +110,7 @@ impl Phase00Gate {
 
     /// Wait until compress jobs for phases `<= max_source_phase` (or all if None) are done.
     ///
-    /// Used by tools that need the phase00 index while the next business phase is running.
+    /// Used by tools that need the phase_summary index while the next business phase is running.
     pub fn wait_until_ready(&self, max_source_phase: Option<i64>, timeout: Duration) -> bool {
         self.wait_until_ready_checked(max_source_phase, timeout)
             .is_ok()
@@ -133,7 +133,7 @@ impl Phase00Gate {
                 .collect();
             errors.sort_by_key(|(phase, _)| *phase);
             if let Some((phase, error)) = errors.into_iter().next() {
-                anyhow::bail!("phase00 compressor failed for source_phase {phase}: {error}");
+                anyhow::bail!("phase_summary compressor failed for source_phase {phase}: {error}");
             }
             let busy = st.inflight.iter().any(|&p| match max_source_phase {
                 Some(max) => p <= max,
@@ -151,7 +151,7 @@ impl Phase00Gate {
                     .copied()
                     .collect();
                 phases.sort_unstable();
-                anyhow::bail!("timed out waiting for phase00 source phases {phases:?}");
+                anyhow::bail!("timed out waiting for phase_summary source phases {phases:?}");
             }
             let wait = deadline.saturating_duration_since(now);
             let (guard, timeout_result) = self
@@ -167,7 +167,7 @@ impl Phase00Gate {
     }
 
     /// Snapshot current memory index (call after wait_until_ready when possible).
-    pub fn snapshot(&self) -> Phase00MemoryIndex {
+    pub fn snapshot(&self) -> PhaseSummaryMemoryIndex {
         self.memory
             .read()
             .unwrap_or_else(|e| e.into_inner())
@@ -208,12 +208,12 @@ mod tests {
 
     #[test]
     fn wait_blocks_until_complete() {
-        let gate = Arc::new(Phase00Gate::new("run-wait"));
+        let gate = Arc::new(PhaseSummaryGate::new("run-wait"));
         gate.mark_inflight(1);
         let g2 = gate.clone();
         let h = thread::spawn(move || {
             thread::sleep(Duration::from_millis(50));
-            let mut batch = Phase00PhaseBatch {
+            let mut batch = PhaseSummaryPhaseBatch {
                 source_phase: 1,
                 ..Default::default()
             };
@@ -236,7 +236,7 @@ mod tests {
 
     #[test]
     fn checked_wait_propagates_compressor_error() {
-        let gate = Phase00Gate::new("run-error");
+        let gate = PhaseSummaryGate::new("run-error");
         gate.mark_inflight(1);
         gate.fail(1, "invalid summary bundle");
 

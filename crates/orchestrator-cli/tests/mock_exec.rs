@@ -181,7 +181,7 @@ async fn debug_exec_records_local_reducers_without_changing_workflow_policy() {
         Some("done" | "derived")
     ));
     assert_eq!(state["workflow_policy"]["mode"], "selective");
-    // Phase1 index is in-process; phase00 compressor records land as phase=0 debug rows.
+    // Phase1 index is in-process; phase_summary compressor records land as phase=0 debug rows.
     assert!(
         state["debug_phase_records"]
             .as_array()
@@ -193,7 +193,7 @@ async fn debug_exec_records_local_reducers_without_changing_workflow_policy() {
                         .as_str()
                         .is_some_and(|role| role.contains("compressor.after_phase_1"))
             }),
-        "expected phase00 compressor_after_phase_1 debug record"
+        "expected phase_summary compressor_after_phase_1 debug record"
     );
     assert!(!state["role_job_metrics"]
         .as_array()
@@ -257,7 +257,7 @@ async fn debug_exec_records_local_reducers_without_changing_workflow_policy() {
 }
 
 #[tokio::test]
-async fn mock_exec_phase8_writes_archive_predictions_and_system_metrics() {
+async fn mock_exec_phase8_archives_without_writing_learning_predictions() {
     let temp = tempfile::tempdir().unwrap();
     let config_path = write_test_config(temp.path());
     let run_dir = temp.path().join("phase8-run");
@@ -292,7 +292,8 @@ async fn mock_exec_phase8_writes_archive_predictions_and_system_metrics() {
         .query_row("SELECT COUNT(*) FROM predictions", [], |row| row.get(0))
         .unwrap();
     assert_eq!(archive_count, 1);
-    assert!(prediction_count >= 1);
+    assert_eq!(prediction_count, 0);
+    assert_eq!(state["phase8_learning_eligible"], false);
 }
 
 #[tokio::test]
@@ -709,7 +710,7 @@ async fn mock_exec_writes_reducer_turn_summaries() {
             .filter(|(_, role, _)| role == "reducer.evidence")
             .count(),
         0,
-        "phase-15 evidence reducer removed under phase00-era pipeline"
+        "phase-15 evidence reducer removed under phase_summary-era pipeline"
     );
 
     let event_rows: i64 = conn

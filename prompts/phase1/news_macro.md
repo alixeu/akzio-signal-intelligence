@@ -32,8 +32,6 @@ Jin10 快讯只作为线索入口，不是最终权威事实。只使用 preflig
 
 {leveraged_etf_rules}
 
-{analyst_output_structure}
-
 <!-- DYNAMIC SUFFIX (changes every call) -->
 上下文：
 - date: {date}

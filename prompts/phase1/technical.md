@@ -33,8 +33,6 @@
 
 {leveraged_etf_rules}
 
-{analyst_output_structure}
-
 <!-- DYNAMIC SUFFIX (changes every call) -->
 上下文：
 - date: {date}

@@ -131,6 +131,23 @@ pub fn promote_candidate_to_memory(
         "UPDATE memory_items SET current_version_id=?1 WHERE memory_id=?2",
         params![version_id, memory_id],
     )?;
+    tx.execute(
+        r#"
+        UPDATE memory_items
+        SET source_phase=COALESCE(
+                (SELECT source_phase FROM candidate_experiences WHERE id=?1),0
+            ),
+            applies_to_phases_json=COALESCE(
+                (SELECT applies_to_phases_json FROM candidate_experiences WHERE id=?1),'[]'
+            ),
+            pattern_key=COALESCE(
+                (SELECT pattern_key FROM candidate_experiences WHERE id=?1),''
+            ),
+            experience_level='active_policy'
+        WHERE memory_id=?2
+        "#,
+        params![input.candidate.id, memory_id],
+    )?;
     log_memory_history(
         &tx,
         &MemoryHistoryEntry {

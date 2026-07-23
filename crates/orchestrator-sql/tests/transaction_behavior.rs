@@ -4,8 +4,8 @@ use orchestrator_sql::{
     connect, import_jin10_payload, import_technical_csv,
     memory::{promote_candidate_to_memory, PromoteMemoryInput},
     record_attention_batch, turn_history_items, upsert_agent_turn, write_agent_message_scoped,
-    AgentMessageInput, AgentTurnInput, AttentionEvent, Phase00MemoryIndex, Phase00PhaseBatch,
-    PhaseSummaryDetailInput, PhaseSummaryInput,
+    AgentMessageInput, AgentTurnInput, AttentionEvent, PhaseSummaryDetailInput, PhaseSummaryInput,
+    PhaseSummaryMemoryIndex, PhaseSummaryPhaseBatch,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -71,11 +71,11 @@ fn candidate_promotion_rolls_back_all_four_writes() {
 }
 
 #[test]
-fn phase00_flush_rolls_back_clear_and_reinsert() {
+fn phase_summary_flush_rolls_back_clear_and_reinsert() {
     let temp = tempfile::tempdir().unwrap();
     let conn = connect(temp.path().join("phase.sqlite")).unwrap();
-    let mut first = Phase00MemoryIndex::new("run-phase");
-    let mut first_batch = Phase00PhaseBatch {
+    let mut first = PhaseSummaryMemoryIndex::new("run-phase");
+    let mut first_batch = PhaseSummaryPhaseBatch {
         source_phase: 1,
         ..Default::default()
     };
@@ -92,8 +92,8 @@ fn phase00_flush_rolls_back_clear_and_reinsert() {
     first.merge(first_batch);
     first.flush(&conn).unwrap();
 
-    let mut replacement = Phase00MemoryIndex::new("run-phase");
-    let mut batch = Phase00PhaseBatch {
+    let mut replacement = PhaseSummaryMemoryIndex::new("run-phase");
+    let mut batch = PhaseSummaryPhaseBatch {
         source_phase: 1,
         ..Default::default()
     };

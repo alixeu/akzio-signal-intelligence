@@ -11,36 +11,113 @@ Active Phase 1 analysts are fixed to:
 | `analyst.technical` | Yahoo OHLCV and precomputed indicators | 50% | yes |
 | `analyst.news_macro` | Jin10 flash news and macro events | 50% | yes |
 
-YouTube, Reddit, X/Twitter, video analysis, and social sentiment are not compiled, scheduled, prompted, persisted, or counted as evidence. A failed critical analyst aborts the run before probability and allocation phases; it is never converted into a neutral 0.5 vote.
+YouTube and Reddit/X remain explicit extension points, but their ingestion, SQLite
+contexts, and Phase 1 roles are currently unconfigured; they are not scheduled or
+counted as evidence. A failed critical analyst aborts the run before probability
+and allocation phases; it is never converted into a neutral 0.5 vote.
 
 ## Workflow
 
 ```mermaid
-flowchart TD
-    Y[Yahoo Finance OHLCV] --> DB[(SQLite WAL)]
-    J[Jin10 flash feed] --> DB
-    DB --> T[Technical analyst]
-    DB --> N[News / macro analyst]
-    T --> I[Rust evidence validation and 50/50 index]
-    N --> I
-    I --> C{Rust material-conflict gate}
-    C -->|no conflict| M[Research Manager]
-    C -->|material conflict| B[Bull and Bear debate]
-    B --> TC[Topic Controller]
-    TC --> R[Rust reducer]
-    R --> M
-    M --> TR[Trader execution plan]
-    TR --> AG[Risk aggressive]
-    AG --> NE[Risk neutral]
-    NE --> CO[Risk conservative]
-    CO --> P[Portfolio Manager final decision]
-    P --> A[Rust inverse-vol allocation guardrails]
-    A --> O[Decision output]
-    O --> REF[Post-decision archive and prediction record]
-    REF --> MEM[Offline outcome validation and memory admission]
+graph TD
+    subgraph "数据层 Data Layer"
+        YAHOO[Yahoo Finance<br/>OHLCV + 技术指标]
+        JIN10[Jin10 金融快讯]
+        YT[YouTube 分析师<br/>未配置]
+        SOCIAL[Reddit · X<br/>未配置]
+        SQL[(SQLite WAL<br/>统一状态存储)]
+    end
+
+    subgraph "Phase 1 — 多源研究"
+        TA[技术分析 Agent<br/>权重 50%]
+        NA[新闻/宏观 Agent<br/>权重 50%]
+        YA[视频分析 Agent<br/>未配置]
+        SA[社交情绪 Agent<br/>未配置]
+    end
+
+    subgraph "Phase 0 — 历史复盘"
+        HIST[AI4Trade 收益/持仓历史]
+        SCORE[3 个交易日结果评分<br/>常规/深度触发]
+        EXP[按 Phase 原子经验]
+    end
+
+    subgraph "Phase 2 — 对抗辩论"
+        TG[Topic Generator<br/>中立议题整理]
+        BW[Bull Warm-up<br/>预热长会话]
+        BEW[Bear Warm-up<br/>预热长会话]
+        BULL[Bull Researcher<br/>寻找上涨逻辑]
+        BEAR[Bear Researcher<br/>寻找下跌风险]
+        TC[每题独立 Topic Controller<br/>主题控制]
+        RED[证据压缩器<br/>Rust Reducer]
+    end
+
+    subgraph "Phase 3 — 概率裁决"
+        RM[Research Manager<br/>Bayesian Updater]
+    end
+
+    subgraph "Phase 4-6 — 执行链路"
+        TR[Trader Agent<br/>交易转换]
+        RISK[风险委员会<br/>保守 · 中性 · 激进]
+        PM[Portfolio Manager<br/>最终决策]
+    end
+
+    subgraph "Phase 7-8 — 输出"
+        ALLOC[配置引擎<br/>Rust 硬约束]
+        REF[决策快照与归档]
+    end
+
+    subgraph "记忆层 Memory Layer"
+        MEM[经验记忆<br/>质量评分 · Regime 感知]
+        CAND[候选经验池]
+        OUT[预测 vs 结果]
+    end
+
+    YAHOO --> SQL
+    JIN10 --> SQL
+    SQL --> SCORE
+    HIST --> SCORE
+    SCORE --> EXP
+    EXP --> MEM
+    YT -. 待配置 .-> SQL
+    SOCIAL -. 待配置 .-> SQL
+    SQL --> TA & NA
+    SQL -. 待配置 .-> YA & SA
+    TA & NA --> TG & BW & BEW
+    YA & SA -. 配置后参与 .-> TG & BW & BEW
+    BW -->|会话 fork| BULL
+    BEW -->|会话 fork| BEAR
+    TG -->|topic fork| BULL & BEAR & TC
+    BULL & BEAR --> TC
+    TC --> RED
+    RED --> RM
+    RM --> TR
+    TR --> RISK
+    RISK --> PM
+    PM --> ALLOC
+    ALLOC --> REF
+    OUT --> CAND
+    CAND --> MEM
+    MEM --> SQL
 ```
 
-The deterministic topic generator only schedules debate for medium/high `direction_conflict`, `confidence_divergence`, or `evidence_contradiction`. Evidence overlap is handled as duplicate evidence in Rust and does not trigger an LLM debate. Trader, the three-perspective risk committee, and Portfolio Manager are mandatory stages. Allocation is always computed and validated in Rust, and Portfolio Manager `wait` or `downgrade` decisions force a cash-only allocation.
+Phase 2 begins with three concurrent LLM calls: the neutral Topic Generator,
+Bull warm-up, and Bear warm-up. The Topic Generator uses only the forked Phase 1
+index and prior phase summaries; Rust rejects external-fact or schema-breaking
+output and retains a deterministic conflict fallback. Each selected topic then
+forks Bull and Bear from their warm-up turns and starts its own Topic Controller
+from the Topic Generator turn. Topics run concurrently, while turns inside one
+topic remain controller-routed. When no material hinge exists, Phase 2 records a
+no-debate artifact and still advances to Phase 3.
+
+Trader, the three-perspective risk committee, and Portfolio Manager are
+mandatory in the default `legacy` policy. Allocation is always computed and
+validated in Rust, and Portfolio Manager `wait` or `downgrade` decisions force a
+cash-only allocation. In a non-mock, non-debug run, Phase 0 reads the
+project-only AI4Trade account, positions, and signal history. Phase 6 can read
+the simulated account and current prices, then submit a trade constrained
+by the Phase 4 position size and the strictest Phase 5 position cap. `--mock`
+and `--debug` remove all AI4Trade tools from the model and make the tool runtime
+reject direct calls.
 
 ## Workspace crates
 
@@ -61,6 +138,7 @@ There is no long-running service entry point. `orchestrator-exec` is the workflo
 - Network access to Yahoo Finance and Jin10
 - An OpenAI-compatible gateway key for non-mock workflow runs
 - `EXA_API_KEY` only when live Exa web search is enabled
+- `AI4TRADE_TOKEN` for Phase 0 history retrieval and Phase 6 simulated trade execution
 
 Set secrets through the environment. The repository contains no key fallback:
 
@@ -68,7 +146,11 @@ Set secrets through the environment. The repository contains no key fallback:
 export LLM_GATEWAY_API_KEY='...'
 export LLM_GATEWAY_BASE_URL='https://your-gateway.example/v1'
 export EXA_API_KEY='...'
+export AI4TRADE_TOKEN='...'
 ```
+
+`config/config.yaml` maps `orchestrator.ai4trade.token` to
+`${AI4TRADE_TOKEN}`; no registration or alternate-account flow is implemented.
 
 Report email credentials are only needed by `report-email`:
 
@@ -110,15 +192,41 @@ The workflow refreshes both sources during Phase 1. Use `--tech-refresh-enabled=
 
 ## Run the workflow
 
-Active prompts are organized by workflow scope: `prompts/common/` holds shared
-content, `prompts/system/` holds runtime messages, and phase-owned prompts live
-under `prompts/phase0/`, `prompts/phase1/`, and `prompts/phase25/`. After each
-business phase, the workflow completes its phase00 summary before starting the
-next phase.
+Active prompts are owned by the phase that executes them:
+
+| Directory | Runtime owner |
+|---|---|
+| `prompts/phase0/` | Historical outcome reflection |
+| `prompts/phase_summary/` | Completed-phase summary compressor |
+| `prompts/phase1/` | Technical and news/macro analysts |
+| `prompts/phase2/` | Topic Generator, Bull, Bear, Topic Controller, and the topic-fork message |
+| `prompts/phase3/` | Research Manager |
+| `prompts/phase4/` | Trader |
+| `prompts/phase5/` | Aggressive, neutral, and conservative risk reviewers |
+| `prompts/phase6/` | Portfolio Manager |
+| `prompts/common/` | Shared prompt components and contracts |
+| `prompts/system/` | Agent-loop and runtime messages |
+
+`prompts/common/analysis_trace.md` is injected into every analytical Phase 2-6
+role and the Phase Summary compressor. It adds a top-level, auditable
+`analysis_trace` to role artifacts without exposing private chain-of-thought;
+the compressor condenses those traces into `summary_json.analysis_process` with
+stable source references.
+
+`prompts/common/experience.md` is injected into every Phase 1-6 role. The
+runtime preloads `read_experience` per ticker, and each role must trace which
+experience IDs it applied or rejected. Experience is advisory and cannot
+replace current evidence.
+
+There is deliberately no `phase25` bucket. Phase 2 topic generation is an LLM
+role with a Rust-owned evidence gate and runtime envelope; final debate reduction
+remains Rust-owned. Phase 7 allocation and Phase 8 decision snapshot/archive are
+also Rust-owned stages. After each business phase, the workflow runs the Phase Summary
+compressor before starting the next phase.
 
 ```bash
 rtk cargo run -p orchestrator-cli --bin orchestrator-exec -- \
-  --from-phase 1 \
+  --from-phase 0 \
   --to-phase 8
 ```
 
@@ -132,6 +240,40 @@ Useful options:
 
 `--mock` exists only for local tests and development. It is not evidence that the production workflow or external services work.
 
+`--from-phase` accepts `0-8` and defaults to `0`; `--to-phase 0` runs only
+historical reflection/retrieval. Mock runs skip AI4Trade and all learning writes.
+
+## Learning loop
+
+A non-mock default run starts with Phase 0 and records the current decision in
+Phase 8:
+
+1. Phase 0 reads AI4Trade account/position/signal history and scores matured
+   prior decisions on the third stored trading bar. This is an evaluation
+   horizon, not a forced trade or forced close.
+2. Every matured outcome receives routine reflection. Loss, benchmark
+   underperformance, wrong direction, confidence mismatch, risk violation, or a
+   repeated error upgrades it to deep reflection.
+3. The reflector reads only the allowlisted prior run's phase-summary indexes
+   and details. Rust validates evidence IDs, taxonomy, phase scope, and the
+   deterministic pattern key before saving atomic experience.
+4. One case remains a low-weight recent episode; two distinct matching runs
+   create a repeated warning; three qualify the pattern for active memory.
+5. Phase 8 records a three-trading-day decision snapshot for each analyzed
+   ticker, including Hold/current-position decisions, without requiring an order.
+
+The current prediction never scores itself, mock runs never write learning
+memory, and repeated processing is idempotent. AI4Trade submissions persist the
+exact `signal_id` to `run_id`; legacy signals use the nearest same-ticker/action
+Phase 6 decision within four hours and receive lower attribution confidence.
+Malformed experience writes fail closed, while reflection failure remains
+non-blocking for the investment decision. Set
+`orchestrator.reflection.enabled: false` to disable retrieval and learning, or
+use `promote_mode: review` for manual review.
+
+The `orchestrator-ops` reflection commands remain available for inspection and
+explicit reruns of scoring, distillation, or promotion.
+
 ## Reliability contracts
 
 - Both Phase 1 roles must cover every requested ticker with non-empty, attributed, timestamped, non-duplicate evidence.
@@ -143,7 +285,7 @@ Useful options:
 - Technical tools and downstream phases read SQLite only. The news analyst reads its preflight Jin10 CSV; only attention-scored Jin10 items enter SQLite.
 - Tool payload history is bounded to 16,000 characters by default.
 - Allocation excludes VIX, rejects missing per-ticker research, enforces non-negative finite weights, per-asset caps, cash constraints, and a total weight of 1.0.
-- Reflection/outcome promotion is outside the decision-critical research path; only validated outcomes are admitted to durable memory.
+- Post-run learning is outcome-backed, idempotent, and outside the decision-critical research path; only qualified, non-mock experience is admitted to durable memory for a later run.
 
 SQLite connections use versioned, transactional migrations plus WAL, `synchronous=NORMAL`, foreign keys, and a busy timeout. Scoped agent messages carry run/turn/role identity; validated artifacts are written before final run archive state.
 

@@ -2,7 +2,7 @@
 
 use anyhow::{bail, Context, Result};
 use orchestrator_sql::{
-    Phase00MemoryIndex, Phase00PhaseBatch, PhaseSummaryDetailInput, PhaseSummaryInput,
+    PhaseSummaryDetailInput, PhaseSummaryInput, PhaseSummaryMemoryIndex, PhaseSummaryPhaseBatch,
     AGGREGATE_TICKER,
 };
 use rusqlite::Connection;
@@ -12,7 +12,7 @@ use tracing::debug;
 use super::lifecycle::tickers_from_state;
 
 /// Build the only business payload visible to the live Phase-00 compressor.
-pub(crate) fn phase00_source_payload(state: &Value, source_phase: i64) -> Result<Value> {
+pub(crate) fn phase_summary_source_payload(state: &Value, source_phase: i64) -> Result<Value> {
     let keys: &[&str] = match source_phase {
         1 => &[
             "phase1_index",
@@ -32,7 +32,7 @@ pub(crate) fn phase00_source_payload(state: &Value, source_phase: i64) -> Result
         5 => &["risk_debate_state"],
         6 => &["final_trade_decision"],
         7 => &["allocation_result", "portfolio_allocation", "allocation"],
-        _ => bail!("unsupported phase00 source phase {source_phase}"),
+        _ => bail!("unsupported phase_summary source phase {source_phase}"),
     };
     let artifacts = keys.iter().fold(serde_json::Map::new(), |mut out, key| {
         if let Some(value) = state.get(*key).filter(|value| !value.is_null()) {
@@ -41,7 +41,7 @@ pub(crate) fn phase00_source_payload(state: &Value, source_phase: i64) -> Result
         out
     });
     if artifacts.is_empty() {
-        bail!("phase00 source phase {source_phase} has no completed artifacts");
+        bail!("phase_summary source phase {source_phase} has no completed artifacts");
     }
     Ok(json!({
         "source_phase": source_phase,
@@ -52,41 +52,41 @@ pub(crate) fn phase00_source_payload(state: &Value, source_phase: i64) -> Result
 }
 
 /// Validate a live LLM bundle and convert it to the existing Rust-owned index rows.
-pub(crate) fn phase00_bundle_to_batch(
+pub(crate) fn phase_summary_bundle_to_batch(
     state: &Value,
     source_phase: i64,
     artifact: &Value,
-) -> Result<Phase00PhaseBatch> {
-    if artifact.get("artifact_type").and_then(Value::as_str) != Some("phase00_summary_bundle") {
-        bail!("phase00 artifact_type must be phase00_summary_bundle");
+) -> Result<PhaseSummaryPhaseBatch> {
+    if artifact.get("artifact_type").and_then(Value::as_str) != Some("phase_summary_bundle") {
+        bail!("phase_summary artifact_type must be phase_summary_bundle");
     }
     if artifact.get("source_phase").and_then(Value::as_i64) != Some(source_phase) {
-        bail!("phase00 source_phase does not match requested phase {source_phase}");
+        bail!("phase_summary source_phase does not match requested phase {source_phase}");
     }
     let checks = artifact
         .get("checks")
         .and_then(Value::as_object)
-        .context("phase00 checks must be an object")?;
+        .context("phase_summary checks must be an object")?;
     for check in [
         "source_only",
         "no_external_facts",
         "no_business_decision_change",
     ] {
         if checks.get(check).and_then(Value::as_bool) != Some(true) {
-            bail!("phase00 check {check} must be true");
+            bail!("phase_summary check {check} must be true");
         }
     }
     let run_id = state
         .get("run_id")
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
-        .context("run_id missing for phase00 conversion")?;
+        .context("run_id missing for phase_summary conversion")?;
     let summaries = artifact
         .get("summaries")
         .and_then(Value::as_array)
         .filter(|items| !items.is_empty())
-        .context("phase00 summaries must be a non-empty array")?;
-    let mut batch = Phase00PhaseBatch {
+        .context("phase_summary summaries must be a non-empty array")?;
+    let mut batch = PhaseSummaryPhaseBatch {
         source_phase,
         ..Default::default()
     };
@@ -98,19 +98,19 @@ pub(crate) fn phase00_bundle_to_batch(
             .get("summary_json")
             .filter(|value| value.is_object())
             .cloned()
-            .context("phase00 summary_json must be an object")?;
+            .context("phase-summary summary_json must be an object")?;
         let confidence = summary
             .get("confidence")
             .and_then(Value::as_f64)
             .filter(|value| (0.0..=1.0).contains(value))
-            .context("phase00 confidence must be between 0 and 1")?;
+            .context("phase_summary confidence must be between 0 and 1")?;
         let topic_id = match summary.get("topic_id") {
             None | Some(Value::Null) => None,
             Some(value) => Some(
                 value
                     .as_str()
                     .filter(|text| !text.trim().is_empty())
-                    .context("phase00 topic_id must be null or a non-empty string")?
+                    .context("phase_summary topic_id must be null or a non-empty string")?
                     .to_string(),
             ),
         };
@@ -118,7 +118,7 @@ pub(crate) fn phase00_bundle_to_batch(
             .get("details")
             .and_then(Value::as_array)
             .filter(|items| !items.is_empty())
-            .context("each phase00 summary must have non-empty details")?;
+            .context("each phase-summary summary must have non-empty details")?;
         let summary_id = batch.push_summary(&PhaseSummaryInput {
             run_id: run_id.to_string(),
             source_phase,
@@ -135,7 +135,7 @@ pub(crate) fn phase00_bundle_to_batch(
                 .get("detail_json")
                 .filter(|value| value.is_object())
                 .cloned()
-                .context("phase00 detail_json must be an object")?;
+                .context("phase_summary detail_json must be an object")?;
             let source_ref = required_string(detail, "source_ref")?;
             let sort_order = detail
                 .get("sort_order")
@@ -160,18 +160,21 @@ fn required_string<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
         .get(field)
         .and_then(Value::as_str)
         .filter(|text| !text.trim().is_empty())
-        .with_context(|| format!("phase00 {field} must be a non-empty string"))
+        .with_context(|| format!("phase_summary {field} must be a non-empty string"))
 }
 
-/// Build a deterministic phase00 batch from in-memory phase artifacts (no DB I/O).
-pub(crate) fn build_phase_compress(state: &Value, source_phase: i64) -> Result<Phase00PhaseBatch> {
+/// Build a deterministic phase_summary batch from in-memory phase artifacts (no DB I/O).
+pub(crate) fn build_phase_compress(
+    state: &Value,
+    source_phase: i64,
+) -> Result<PhaseSummaryPhaseBatch> {
     let run_id = state
         .get("run_id")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
     if run_id.is_empty() {
-        return Ok(Phase00PhaseBatch {
+        return Ok(PhaseSummaryPhaseBatch {
             source_phase,
             ..Default::default()
         });
@@ -217,7 +220,7 @@ pub(crate) fn build_phase_compress(state: &Value, source_phase: i64) -> Result<P
                 .or_else(|| state.get("allocation")),
             ALLOCATION_FIELDS,
         ),
-        _ => Phase00PhaseBatch {
+        _ => PhaseSummaryPhaseBatch {
             source_phase,
             ..Default::default()
         },
@@ -225,22 +228,25 @@ pub(crate) fn build_phase_compress(state: &Value, source_phase: i64) -> Result<P
     debug!(
         source_phase,
         written = batch.written(),
-        "phase00 compress built in memory"
+        "phase_summary compress built in memory"
     );
     Ok(batch)
 }
 
-/// Merge a built batch into `state.phase00_memory` / `phase00_tables` / `phase_compress`.
-pub(crate) fn apply_phase00_batch(state: &mut Value, batch: Phase00PhaseBatch) -> Result<Value> {
+/// Merge a built batch into `state.phase_summary_memory` / `phase_summary_tables` / `phase_compress`.
+pub(crate) fn apply_phase_summary_batch(
+    state: &mut Value,
+    batch: PhaseSummaryPhaseBatch,
+) -> Result<Value> {
     let source_phase = batch.source_phase;
     let written = batch.written();
     let snapshot = batch.debug_snapshot();
 
     let mut index = state
-        .get("phase00_memory")
-        .map(Phase00MemoryIndex::from_state_value)
+        .get("phase_summary_memory")
+        .map(PhaseSummaryMemoryIndex::from_state_value)
         .unwrap_or_else(|| {
-            Phase00MemoryIndex::new(
+            PhaseSummaryMemoryIndex::new(
                 state
                     .get("run_id")
                     .and_then(Value::as_str)
@@ -248,7 +254,7 @@ pub(crate) fn apply_phase00_batch(state: &mut Value, batch: Phase00PhaseBatch) -
             )
         });
     index.merge(batch);
-    state["phase00_memory"] = index.to_state_value();
+    state["phase_summary_memory"] = index.to_state_value();
 
     if !state.get("phase_compress").is_some_and(Value::is_object) {
         state["phase_compress"] = json!({});
@@ -259,21 +265,24 @@ pub(crate) fn apply_phase00_batch(state: &mut Value, batch: Phase00PhaseBatch) -
             json!({ "written": written, "status": "done", "persisted": false }),
         );
     }
-    if !state.get("phase00_tables").is_some_and(Value::is_object) {
-        state["phase00_tables"] = json!({});
+    if !state
+        .get("phase_summary_tables")
+        .is_some_and(Value::is_object)
+    {
+        state["phase_summary_tables"] = json!({});
     }
-    if let Some(map) = state["phase00_tables"].as_object_mut() {
+    if let Some(map) = state["phase_summary_tables"].as_object_mut() {
         map.insert(source_phase.to_string(), snapshot.clone());
     }
     Ok(snapshot)
 }
 
-/// Flush the full in-memory phase00 index to SQLite (run end).
-pub(crate) fn flush_phase00_to_sqlite(conn: &Connection, state: &mut Value) -> Result<usize> {
-    let Some(raw) = state.get("phase00_memory") else {
+/// Flush the full in-memory phase_summary index to SQLite (run end).
+pub(crate) fn flush_phase_summary_to_sqlite(conn: &Connection, state: &mut Value) -> Result<usize> {
+    let Some(raw) = state.get("phase_summary_memory") else {
         return Ok(0);
     };
-    let index = Phase00MemoryIndex::from_state_value(raw);
+    let index = PhaseSummaryMemoryIndex::from_state_value(raw);
     if index.phases.is_empty() {
         return Ok(0);
     }
@@ -291,7 +300,7 @@ pub(crate) fn flush_phase00_to_sqlite(conn: &Connection, state: &mut Value) -> R
     }
     // Mark snapshots as persisted.
     if let Some(tables) = state
-        .get_mut("phase00_tables")
+        .get_mut("phase_summary_tables")
         .and_then(Value::as_object_mut)
     {
         for (_k, snap) in tables.iter_mut() {
@@ -300,11 +309,11 @@ pub(crate) fn flush_phase00_to_sqlite(conn: &Connection, state: &mut Value) -> R
             }
         }
     }
-    debug!(written, "phase00 memory flushed to sqlite");
+    debug!(written, "phase_summary memory flushed to sqlite");
     Ok(written)
 }
 
-/// Legacy helper: build + apply only (no DB). Prefer `build_phase_compress` + `apply_phase00_batch`.
+/// Legacy helper: build + apply only (no DB). Prefer `build_phase_compress` + `apply_phase_summary_batch`.
 #[allow(dead_code)]
 pub(crate) fn compress_phase_in_memory(
     state: &mut Value,
@@ -312,7 +321,7 @@ pub(crate) fn compress_phase_in_memory(
 ) -> Result<(usize, Value)> {
     let batch = build_phase_compress(state, source_phase)?;
     let written = batch.written();
-    let snapshot = apply_phase00_batch(state, batch)?;
+    let snapshot = apply_phase_summary_batch(state, batch)?;
     Ok((written, snapshot))
 }
 
@@ -378,8 +387,8 @@ const ALLOCATION_FIELDS: &[&str] = &[
     "correlation_note",
 ];
 
-fn build_phase1(run_id: &str, state: &Value) -> Phase00PhaseBatch {
-    let mut batch = Phase00PhaseBatch {
+fn build_phase1(run_id: &str, state: &Value) -> PhaseSummaryPhaseBatch {
+    let mut batch = PhaseSummaryPhaseBatch {
         source_phase: 1,
         ..Default::default()
     };
@@ -537,8 +546,8 @@ fn build_phase1(run_id: &str, state: &Value) -> Phase00PhaseBatch {
     batch
 }
 
-fn build_phase2(run_id: &str, state: &Value) -> Phase00PhaseBatch {
-    let mut batch = Phase00PhaseBatch {
+fn build_phase2(run_id: &str, state: &Value) -> PhaseSummaryPhaseBatch {
+    let mut batch = PhaseSummaryPhaseBatch {
         source_phase: 2,
         ..Default::default()
     };
@@ -664,8 +673,8 @@ fn build_generic(
     role: &str,
     artifact: Option<&Value>,
     keep_fields: &[&str],
-) -> Phase00PhaseBatch {
-    let mut batch = Phase00PhaseBatch {
+) -> PhaseSummaryPhaseBatch {
+    let mut batch = PhaseSummaryPhaseBatch {
         source_phase,
         ..Default::default()
     };
@@ -793,11 +802,11 @@ mod tests {
         assert_eq!(count, 0);
 
         let mut state = state;
-        apply_phase00_batch(&mut state, batch).unwrap();
-        assert!(state.get("phase00_memory").is_some());
+        apply_phase_summary_batch(&mut state, batch).unwrap();
+        assert!(state.get("phase_summary_memory").is_some());
         assert_eq!(state["phase_compress"]["1"]["persisted"], false);
 
-        let flushed = flush_phase00_to_sqlite(&conn, &mut state).unwrap();
+        let flushed = flush_phase_summary_to_sqlite(&conn, &mut state).unwrap();
         assert!(flushed >= 1);
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM phase_summaries", [], |r| r.get(0))
@@ -810,7 +819,7 @@ mod tests {
     fn converts_valid_llm_bundle_to_rust_owned_batch() {
         let state = json!({"run_id": "run-live"});
         let artifact = json!({
-            "artifact_type": "phase00_summary_bundle",
+            "artifact_type": "phase_summary_bundle",
             "source_phase": 1,
             "summaries": [{
                 "role": "analyst.aggregate",
@@ -832,7 +841,7 @@ mod tests {
                 "no_business_decision_change": true
             }
         });
-        let batch = phase00_bundle_to_batch(&state, 1, &artifact).unwrap();
+        let batch = phase_summary_bundle_to_batch(&state, 1, &artifact).unwrap();
         assert_eq!(batch.source_phase, 1);
         assert_eq!(batch.summaries.len(), 1);
         assert_eq!(batch.details.len(), 1);

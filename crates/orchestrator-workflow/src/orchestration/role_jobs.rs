@@ -110,9 +110,11 @@ impl RoleJobResult {
 fn prompt_version_for_role(state: &Value, role: &str) -> Option<String> {
     let config = state.get("config")?;
     let prompt_key = match role {
+        "reflector.historical" => "orchestrator.prompts.reflection.historical",
         "analyst.technical" => "orchestrator.prompts.analyst.technical",
         "analyst.news_macro" => "orchestrator.prompts.analyst.news_macro",
-        "compressor.phase00" => "orchestrator.prompts.compressor.phase00",
+        "compressor.phase_summary" => "orchestrator.prompts.compressor.phase_summary",
+        "mediator.topic" => "orchestrator.prompts.phase2.topic_generator",
         "researcher.bull.initial" => "orchestrator.prompts.phase2.bull_initial",
         "researcher.bull.interaction" => "orchestrator.prompts.phase2.bull_interaction",
         "researcher.bear.initial" => "orchestrator.prompts.phase2.bear_initial",
@@ -120,9 +122,9 @@ fn prompt_version_for_role(state: &Value, role: &str) -> Option<String> {
         "mediator.topic_controller" => "orchestrator.prompts.mediator.topic_controller",
         "manager.research" => "orchestrator.prompts.manager.research",
         "trader" => "orchestrator.prompts.trader",
-        "risk.aggressive" | "risk.neutral" | "risk.conservative" => {
-            "orchestrator.prompts.risk.conservative"
-        }
+        "risk.aggressive" => "orchestrator.prompts.risk.aggressive",
+        "risk.neutral" => "orchestrator.prompts.risk.neutral",
+        "risk.conservative" => "orchestrator.prompts.risk.conservative",
         "portfolio.manager" => "orchestrator.prompts.portfolio.manager",
         _ => return None,
     };
@@ -144,7 +146,20 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
         prompt_path,
     } = input;
     let debug_enabled = state.get("debug").and_then(Value::as_bool).unwrap_or(false);
+    let ai4trade_live = role == "portfolio.manager" && !mock && !debug_enabled;
     let tickers = tickers_from_state(&state);
+    let tool_tickers = if role == "portfolio.manager" {
+        state
+            .get("investable_assets")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(ToString::to_string)
+            .collect()
+    } else {
+        tickers.clone()
+    };
     let prompt_version = prompt_version_for_role(&state, role);
     let prompt = if mock {
         String::new()
@@ -167,8 +182,8 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
             .llm_roles
             .get(role)
             .or_else(|| {
-                // Live phase00 compressor reuses research-manager LLM defaults when not configured.
-                if role == "compressor.phase00" {
+                // Live phase_summary compressor reuses research-manager LLM defaults when not configured.
+                if role == "compressor.phase_summary" {
                     config.llm_roles.get("manager.research")
                 } else {
                     None
@@ -223,14 +238,30 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
                 .get("run_id")
                 .and_then(Value::as_str)
                 .map(ToString::to_string),
-            tickers,
-            phase00_index: state.get("phase00_memory").map(|raw| {
-                std::sync::Arc::new(orchestrator_sql::Phase00MemoryIndex::from_state_value(raw))
+            phase: Some(phase),
+            allowed_reflection_task_ids: state
+                .pointer("/phase0/tasks")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|task| task.get("task_id").and_then(Value::as_i64))
+                .collect(),
+            tickers: tool_tickers,
+            ai4trade_live,
+            ai4trade_token: if ai4trade_live {
+                config.ai4trade_token.clone()
+            } else {
+                None
+            },
+            phase_summary_index: state.get("phase_summary_memory").map(|raw| {
+                std::sync::Arc::new(orchestrator_sql::PhaseSummaryMemoryIndex::from_state_value(
+                    raw,
+                ))
             }),
-            phase00_gate: state
+            phase_summary_gate: state
                 .get("run_id")
                 .and_then(Value::as_str)
-                .and_then(orchestrator_sql::phase00_gate),
+                .and_then(orchestrator_sql::phase_summary_gate),
         },
         web_search: config.web_search.get(role).cloned().unwrap_or_default(),
         truncation: config.truncation.clone(),

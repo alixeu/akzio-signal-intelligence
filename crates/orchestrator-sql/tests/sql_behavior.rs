@@ -5,11 +5,11 @@ use orchestrator_sql::{
     import_technical_csv, list_phase_summaries, list_phase_summary_details,
     memory::{promote_candidate_to_memory, PromoteMemoryInput},
     outcome::{upsert_outcome, OutcomeInput},
-    persist_phase00_batch,
+    persist_phase_summary_batch,
     prediction::{upsert_prediction, PredictionInput},
     read_run_context, session_history_items, upsert_agent_turn, write_agent_message_scoped,
     write_role_turn_summary, write_run_record, AgentMessageInput, AgentTurnInput,
-    Phase00MemoryIndex, Phase00PhaseBatch, PhaseSummaryDetailInput, PhaseSummaryInput,
+    PhaseSummaryDetailInput, PhaseSummaryInput, PhaseSummaryMemoryIndex, PhaseSummaryPhaseBatch,
     RoleTurnSummaryInput, RunContextReadRequest, RunRecordInput, RuntimeContext,
 };
 use serde_json::json;
@@ -921,15 +921,15 @@ fn jin10_context_returns_id_and_content_json_payload() {
 
 #[test]
 fn phase_summary_access_is_run_and_prior_phase_scoped() {
-    fn batch(run_id: &str, source_phase: i64, text: &str) -> (Phase00PhaseBatch, String) {
-        let mut batch = Phase00PhaseBatch {
+    fn batch(run_id: &str, source_phase: i64, text: &str) -> (PhaseSummaryPhaseBatch, String) {
+        let mut batch = PhaseSummaryPhaseBatch {
             source_phase,
             ..Default::default()
         };
         let summary_id = batch.push_summary(&PhaseSummaryInput {
             run_id: run_id.into(),
             source_phase,
-            role: "compressor.phase00".into(),
+            role: "compressor.phase_summary".into(),
             ticker: "QQQ".into(),
             topic_id: None,
             summary: text.into(),
@@ -949,14 +949,14 @@ fn phase_summary_access_is_run_and_prior_phase_scoped() {
     }
 
     let temp = tempfile::tempdir().unwrap();
-    let db_path = temp.path().join("phase00.sqlite");
+    let db_path = temp.path().join("phase_summary.sqlite");
     let mut conn = connect(&db_path).unwrap();
     let (phase1, phase1_id) = batch("run-a", 1, "phase one");
     let (phase2, phase2_id) = batch("run-a", 2, "phase two");
     let (other_run, other_id) = batch("run-b", 1, "other run");
-    persist_phase00_batch(&conn, "run-a", &phase1).unwrap();
-    persist_phase00_batch(&conn, "run-a", &phase2).unwrap();
-    persist_phase00_batch(&conn, "run-b", &other_run).unwrap();
+    persist_phase_summary_batch(&conn, "run-a", &phase1).unwrap();
+    persist_phase_summary_batch(&conn, "run-a", &phase2).unwrap();
+    persist_phase_summary_batch(&conn, "run-b", &other_run).unwrap();
 
     let summaries = list_phase_summaries(&conn, "run-a", 2, None).unwrap();
     assert_eq!(summaries["item_count"], 1);
@@ -974,7 +974,7 @@ fn phase_summary_access_is_run_and_prior_phase_scoped() {
         0
     );
 
-    let mut memory = Phase00MemoryIndex::new("run-a");
+    let mut memory = PhaseSummaryMemoryIndex::new("run-a");
     memory.merge(phase1);
     memory.merge(phase2);
     assert_eq!(

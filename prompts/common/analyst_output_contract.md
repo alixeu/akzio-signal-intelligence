@@ -7,6 +7,8 @@
 
 输出预算：每个 ticker 最多 3 条 `key_evidence`、2 条 `validation_triggers` 和 2 条 `data_gaps`；`report` 保持简洁，只解释机读字段，不重复证据全文。
 
+`report` 固定按“结论、核心证据簇、反方或冲突证据、已计价判断、验证与证伪条件、数据缺口”的顺序组织。正文不复制完整机读数组；`direction`、`confidence`、`priced_in`、`validation_triggers`、`data_gaps` 以机读字段为准。杠杆 ETF 还需检查基础指数与波动率联动。
+
 硬性规则：
 - `id` 与 `role` 必须等于 expected role。
 - `per_ticker` 必须完整且只能覆盖 expected tickers；key 使用大写 canonical symbol，不新增、不替换、不遗漏。

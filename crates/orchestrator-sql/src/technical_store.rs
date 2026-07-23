@@ -163,6 +163,70 @@ pub fn close_on_or_after(
     close_near_date(conn, ticker, interval, date, false)
 }
 
+/// Return the close on the Nth stored trading bar strictly after `date`.
+///
+/// `trading_days=1` means the next available daily bar. The optional `as_of`
+/// bound prevents a prediction from maturing against future data.
+pub fn close_after_trading_days(
+    conn: &Connection,
+    ticker: &str,
+    interval: &str,
+    date: &str,
+    trading_days: i64,
+    as_of: Option<&str>,
+) -> Result<Option<(String, f64)>> {
+    if trading_days <= 0 {
+        bail!("trading_days must be positive");
+    }
+    let interval = storage_interval(interval)
+        .ok_or_else(|| anyhow::anyhow!("unsupported technical interval {interval}"))?;
+    Ok(conn
+        .query_row(
+            r#"
+            SELECT bar_time, close
+            FROM technical_bars
+            WHERE ticker=?1
+              AND interval=?2
+              AND bar_time > ?3
+              AND (?4 IS NULL OR bar_time <= ?4)
+              AND close IS NOT NULL
+            ORDER BY bar_time ASC
+            LIMIT 1 OFFSET ?5
+            "#,
+            params![
+                ticker.trim().to_ascii_uppercase(),
+                interval,
+                date,
+                as_of,
+                trading_days - 1
+            ],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?)),
+        )
+        .optional()?)
+}
+
+pub fn minimum_close_between(
+    conn: &Connection,
+    ticker: &str,
+    interval: &str,
+    after: &str,
+    through: &str,
+) -> Result<Option<f64>> {
+    let interval = storage_interval(interval)
+        .ok_or_else(|| anyhow::anyhow!("unsupported technical interval {interval}"))?;
+    Ok(conn.query_row(
+        r#"
+        SELECT MIN(close)
+        FROM technical_bars
+        WHERE ticker=?1 AND interval=?2
+          AND bar_time > ?3 AND bar_time <= ?4
+          AND close IS NOT NULL
+        "#,
+        params![ticker.trim().to_ascii_uppercase(), interval, after, through],
+        |row| row.get(0),
+    )?)
+}
+
 fn close_near_date(
     conn: &Connection,
     ticker: &str,

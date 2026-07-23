@@ -1,4 +1,4 @@
-请对「{{title}}」主题说明你的看法。
+请对 Phase 2 议题「{{title}}」说明你的看法。
 topic_id: {{topic_id}}
 decision_hinge: {{decision_hinge}}
 common_ground: {{common_ground}}

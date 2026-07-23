@@ -1,6 +1,9 @@
+pub mod ai4trade;
+pub mod read_experience;
 pub mod read_jin10_csv;
 pub mod read_phase_summaries;
 pub mod read_phase_summary_details;
+pub mod read_reflection_source;
 pub mod read_run_context;
 pub mod read_technical_csv;
 pub mod think;
@@ -19,8 +22,14 @@ pub use web_run::Runtime as WebRunRuntime;
 pub const WEB_RUN_TOOL_NAME: &str = web_run::NAME;
 pub const READ_PHASE_SUMMARIES_TOOL_NAME: &str = read_phase_summaries::NAME;
 pub const READ_PHASE_SUMMARY_DETAILS_TOOL_NAME: &str = read_phase_summary_details::NAME;
+pub const READ_EXPERIENCE_TOOL_NAME: &str = read_experience::NAME;
+pub const READ_REFLECTION_SOURCE_TOOL_NAME: &str = read_reflection_source::NAME;
 // Internal compatibility only. This tool is intentionally absent from REGISTRY.
 pub const READ_RUN_CONTEXT_TOOL_NAME: &str = read_run_context::NAME;
+pub const AI4TRADE_GET_PORTFOLIO_TOOL_NAME: &str = ai4trade::GET_PORTFOLIO_NAME;
+pub const AI4TRADE_GET_HISTORY_TOOL_NAME: &str = ai4trade::GET_HISTORY_NAME;
+pub const AI4TRADE_GET_PRICE_TOOL_NAME: &str = ai4trade::GET_PRICE_NAME;
+pub const AI4TRADE_SUBMIT_TRADE_TOOL_NAME: &str = ai4trade::SUBMIT_TRADE_NAME;
 
 #[derive(Debug, Clone)]
 pub struct ToolDefinition {
@@ -36,11 +45,19 @@ pub struct ExternalToolConfig {
     pub run_dir: Option<PathBuf>,
     #[serde(default)]
     pub run_id: Option<String>,
+    #[serde(default)]
+    pub phase: Option<i64>,
+    #[serde(default)]
+    pub allowed_reflection_task_ids: Vec<i64>,
     pub tickers: Vec<String>,
+    #[serde(default)]
+    pub ai4trade_live: bool,
     #[serde(skip)]
-    pub phase00_index: Option<std::sync::Arc<orchestrator_sql::Phase00MemoryIndex>>,
+    pub ai4trade_token: Option<String>,
     #[serde(skip)]
-    pub phase00_gate: Option<std::sync::Arc<orchestrator_sql::Phase00Gate>>,
+    pub phase_summary_index: Option<std::sync::Arc<orchestrator_sql::PhaseSummaryMemoryIndex>>,
+    #[serde(skip)]
+    pub phase_summary_gate: Option<std::sync::Arc<orchestrator_sql::PhaseSummaryGate>>,
 }
 
 impl Default for ExternalToolConfig {
@@ -50,9 +67,13 @@ impl Default for ExternalToolConfig {
             db_path: None,
             run_dir: None,
             run_id: None,
+            phase: None,
+            allowed_reflection_task_ids: Vec::new(),
             tickers: Vec::new(),
-            phase00_index: None,
-            phase00_gate: None,
+            ai4trade_live: false,
+            ai4trade_token: None,
+            phase_summary_index: None,
+            phase_summary_gate: None,
         }
     }
 }
@@ -78,6 +99,14 @@ const REGISTRY: &[ToolEntry] = &[
         definition: read_phase_summary_details::definition,
     },
     ToolEntry {
+        name: read_experience::NAME,
+        definition: read_experience::definition,
+    },
+    ToolEntry {
+        name: read_reflection_source::NAME,
+        definition: read_reflection_source::definition,
+    },
+    ToolEntry {
         name: web_run::NAME,
         definition: web_run::definition,
     },
@@ -89,6 +118,22 @@ const REGISTRY: &[ToolEntry] = &[
         name: read_jin10_csv::NAME,
         definition: read_jin10_csv::definition,
     },
+    ToolEntry {
+        name: ai4trade::GET_PORTFOLIO_NAME,
+        definition: ai4trade::get_portfolio_definition,
+    },
+    ToolEntry {
+        name: ai4trade::GET_HISTORY_NAME,
+        definition: ai4trade::get_history_definition,
+    },
+    ToolEntry {
+        name: ai4trade::GET_PRICE_NAME,
+        definition: ai4trade::get_price_definition,
+    },
+    ToolEntry {
+        name: ai4trade::SUBMIT_TRADE_NAME,
+        definition: ai4trade::submit_trade_definition,
+    },
 ];
 
 pub fn tool_names() -> &'static [&'static str] {
@@ -97,15 +142,28 @@ pub fn tool_names() -> &'static [&'static str] {
     &[
         read_phase_summaries::NAME,
         read_phase_summary_details::NAME,
+        read_experience::NAME,
+        read_reflection_source::NAME,
         read_technical_csv::NAME,
         read_jin10_csv::NAME,
     ]
 }
 
-pub fn enabled_tool_names(web_run: Option<&WebSearchConfig>) -> Vec<&'static str> {
+pub fn enabled_tool_names(
+    web_run: Option<&WebSearchConfig>,
+    ai4trade_live: bool,
+) -> Vec<&'static str> {
     let mut names = tool_names().to_vec();
     if web_run.is_some() {
         names.push(web_run::NAME);
+    }
+    if ai4trade_live {
+        names.extend([
+            ai4trade::GET_PORTFOLIO_NAME,
+            ai4trade::GET_HISTORY_NAME,
+            ai4trade::GET_PRICE_NAME,
+            ai4trade::SUBMIT_TRADE_NAME,
+        ]);
     }
     names
 }
@@ -218,6 +276,16 @@ pub async fn execute_named_tool(
             log_tool_result(name, &result);
             result
         }
+        read_experience::NAME => {
+            let result = read_experience::execute(args, config, turn_context);
+            log_tool_result(name, &result);
+            result
+        }
+        read_reflection_source::NAME => {
+            let result = read_reflection_source::execute(args, config, turn_context);
+            log_tool_result(name, &result);
+            result
+        }
         read_run_context::NAME => {
             let result = read_run_context::execute(args, config, turn_context);
             log_tool_result(name, &result);
@@ -236,6 +304,10 @@ pub async fn execute_named_tool(
         }
         read_technical_csv::NAME => read_technical_csv::execute(args, config),
         read_jin10_csv::NAME => read_jin10_csv::execute(args, config),
+        ai4trade::GET_PORTFOLIO_NAME => ai4trade::get_portfolio(config).await,
+        ai4trade::GET_HISTORY_NAME => ai4trade::get_history(config).await,
+        ai4trade::GET_PRICE_NAME => ai4trade::get_price(args, config).await,
+        ai4trade::SUBMIT_TRADE_NAME => ai4trade::submit_trade(args, config).await,
         other => bail!("unknown tool name: {other}"),
     }
 }
@@ -303,9 +375,13 @@ mod tests {
             db_path: None,
             run_dir: None,
             run_id: None,
+            phase: None,
+            allowed_reflection_task_ids: Vec::new(),
             tickers: Vec::new(),
-            phase00_index: None,
-            phase00_gate: None,
+            ai4trade_live: false,
+            ai4trade_token: None,
+            phase_summary_index: None,
+            phase_summary_gate: None,
         }
     }
 

@@ -387,6 +387,11 @@ pub(crate) fn build_topic_generation_artifact(state: &Value) -> Value {
         },
         "common_ground": common_ground,
         "topics": topics,
+        "summary": if debate_required {
+            format!("{material_conflict_count} material debate topic(s) selected")
+        } else {
+            skip_reason.unwrap_or("no debate topic").to_string()
+        },
         "reducer_checks": {
             "json_valid": true,
             "from_phase1_index_only": true,
@@ -439,14 +444,14 @@ fn derive_common_ground_from_phase1(state: &Value) -> Value {
     }
     if agreed_facts.is_empty() {
         agreed_facts.push(json!(
-            "Only phase00 / phase1 index summaries are admissible; no raw market re-fetch."
+            "Only phase_summary / phase1 index summaries are admissible; no raw market re-fetch."
         ));
     }
     json!({
         "agreed_facts": agreed_facts,
         "shared_constraints": shared_constraints,
         "non_debated_assumptions": [
-            "Do not invent external facts beyond phase00 index."
+            "Do not invent external facts beyond phase_summary index."
         ],
         "evidence_refs": evidence_refs
     })
@@ -1398,11 +1403,6 @@ mod tests {
             required_contexts: Vec::new(),
             prompts: crate::orchestration::config::PromptConfig {
                 prompts: std::collections::BTreeMap::new(),
-                manager_research: std::path::PathBuf::new(),
-
-                trader: std::path::PathBuf::new(),
-                risk_conservative: std::path::PathBuf::new(),
-                portfolio_manager: std::path::PathBuf::new(),
             },
             workflow: crate::orchestration::config::WorkflowConfig {
                 phase1_parallelism: 5,
@@ -1431,10 +1431,18 @@ mod tests {
                 max_single_position: 0.70,
                 vol_indicator: "STD20".to_string(),
             },
+            ai4trade_token: None,
             reflection: crate::orchestration::config::ReflectionConfig {
                 enabled: true,
                 reflection_version: "v1".to_string(),
-                _promote_mode: "auto".to_string(),
+                promote_mode: "auto".to_string(),
+                task_limit: 10,
+                parallelism: 2,
+                loss_return: -0.02,
+                excess_return: -0.015,
+                high_confidence: 0.70,
+                calibration_error: 0.40,
+                repeated_error_count: 2,
                 retrieval: orchestrator_core::RetrievalBudget::default(),
             },
             plugins: crate::orchestration::config::PluginConfig {

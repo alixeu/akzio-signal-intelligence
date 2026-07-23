@@ -690,7 +690,7 @@ fn rerunning_a_run_preserves_archived_fields() {
 
     let row = conn
         .query_row(
-            r#"SELECT current_date,created_at_ms,status,current_phase,error_message,completed_at_ms,
+            r#"SELECT "current_date",created_at_ms,status,current_phase,error_message,completed_at_ms,
                       run_dir,db_path,git_sha,config_hash,artifact_path,workflow_version,
                       prompt_versions_json,degraded,phase_count,total_elapsed_ms
                FROM runs WHERE run_id='rerun-1'"#,

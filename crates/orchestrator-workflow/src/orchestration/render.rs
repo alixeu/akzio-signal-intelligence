@@ -37,14 +37,18 @@ fn prompts_dir_from_prompt_path(prompt_path: Option<&std::path::Path>) -> Option
     path.parent()?.parent().map(PathBuf::from)
 }
 
-fn common_component(prompt_path: Option<&std::path::Path>, file_name: &str) -> Result<String> {
+fn prompt_component(prompt_path: Option<&std::path::Path>, relative_path: &str) -> Result<String> {
     let Some(prompts_dir) = prompts_dir_from_prompt_path(prompt_path) else {
         return Ok(String::new());
     };
-    let common_path = prompts_dir.join("common").join(file_name);
-    if common_path.exists() {
-        std::fs::read_to_string(&common_path)
-            .with_context(|| format!("failed to read prompt template {}", common_path.display()))
+    let component_path = prompts_dir.join(relative_path);
+    if component_path.exists() {
+        std::fs::read_to_string(&component_path).with_context(|| {
+            format!(
+                "failed to read prompt template {}",
+                component_path.display()
+            )
+        })
     } else {
         Ok(String::new())
     }
@@ -191,8 +195,19 @@ fn portfolio_context(state: &Value) -> Value {
     json!({
         "research_plan": compact_research_plan(state),
         "trader_plan": compact_trader_plan(state),
-        "risk_history": compact_risk_history(state)
+        "risk_history": compact_risk_history(state),
+        "investable_assets": state.get("investable_assets").cloned().unwrap_or_else(|| json!([]))
     })
+}
+
+fn prior_phase_summaries(state: &Value, current_phase: i64) -> Value {
+    let Some(raw) = state.get("phase_summary_memory") else {
+        return json!({"query": "phase_summaries", "item_count": 0, "items": []});
+    };
+    let run_id = state.get("run_id").and_then(Value::as_str).unwrap_or("");
+    orchestrator_sql::PhaseSummaryMemoryIndex::from_state_value(raw)
+        .list_visible_summaries(run_id, current_phase, None)
+        .unwrap_or_else(|_| json!({"query": "phase_summaries", "item_count": 0, "items": []}))
 }
 
 #[cfg(test)]
@@ -256,14 +271,17 @@ pub(crate) fn render_prompt_with_plugins(
         .cloned()
         .unwrap_or(Value::Null);
     let analyst_output_contract_template =
-        common_component(prompt_path, "analyst_output_contract.md")?;
-    let anti_injection_template = common_component(prompt_path, "anti_injection.md")?;
-    let research_calibration_template = common_component(prompt_path, "research_calibration.md")?;
-    let research_drivers_template = common_component(prompt_path, "research_drivers.md")?;
-    let risk_analyst_template = common_component(prompt_path, "risk_analyst.md")?;
-    let leveraged_etf_rules_template = common_component(prompt_path, "leveraged_etf_rules.md")?;
-    let analyst_output_structure_template =
-        common_component(prompt_path, "analyst_output_structure.md")?;
+        prompt_component(prompt_path, "common/analyst_output_contract.md")?;
+    let anti_injection_template = prompt_component(prompt_path, "common/anti_injection.md")?;
+    let research_calibration_template =
+        prompt_component(prompt_path, "common/research_calibration.md")?;
+    let research_drivers_template = prompt_component(prompt_path, "common/research_drivers.md")?;
+    let analysis_trace_contract_template =
+        prompt_component(prompt_path, "common/analysis_trace.md")?;
+    let risk_analyst_template = prompt_component(prompt_path, "phase5/risk_analyst.md")?;
+    let leveraged_etf_rules_template =
+        prompt_component(prompt_path, "common/leveraged_etf_rules.md")?;
+    let experience_contract_template = prompt_component(prompt_path, "common/experience.md")?;
     // Render components with the schema in scope so a `{analyst_artifact_schema}`
     // placeholder inside the contract is resolved before the component text is
     // spliced into the role prompt (the outer pass runs once, in key order, and
@@ -285,13 +303,15 @@ pub(crate) fn render_prompt_with_plugins(
     let research_calibration =
         replace_placeholders(&research_calibration_template, &component_values);
     let research_drivers = replace_placeholders(&research_drivers_template, &component_values);
+    let analysis_trace_contract =
+        replace_placeholders(&analysis_trace_contract_template, &component_values);
     let leveraged_etf_rules = if contains_leveraged_etf(&tickers) {
         replace_placeholders(&leveraged_etf_rules_template, &component_values)
     } else {
         String::new()
     };
-    let analyst_output_structure =
-        replace_placeholders(&analyst_output_structure_template, &component_values);
+    let experience_contract =
+        replace_placeholders(&experience_contract_template, &component_values);
     let stance_role_label = role.strip_prefix("risk.").unwrap_or("");
     let static_values = json!({
         "ticker": ticker,
@@ -301,8 +321,8 @@ pub(crate) fn render_prompt_with_plugins(
         "anti_injection": anti_injection,
         "research_calibration": research_calibration,
         "research_drivers": research_drivers,
+        "analysis_trace_contract": analysis_trace_contract,
         "leveraged_etf_rules": leveraged_etf_rules,
-        "analyst_output_structure": analyst_output_structure,
         "analyst_artifact_schema": analyst_artifact_schema(),
         "research_artifact_schema": research_artifact_schema(),
         "trade_intent_schema": trade_intent_schema(),
@@ -340,7 +360,18 @@ pub(crate) fn render_prompt_with_plugins(
         "allocation_context": serde_json::to_string_pretty(&state.get("allocation_context").cloned().unwrap_or(Value::Null))?,
         "risk_context": serde_json::to_string_pretty(&risk_context(state))?,
         "portfolio_context": serde_json::to_string_pretty(&portfolio_context(state))?,
+        "ai4trade_mode": if state.get("mock").and_then(Value::as_bool) == Some(true)
+            || state.get("debug").and_then(Value::as_bool) == Some(true)
+        {
+            "disabled"
+        } else {
+            "live"
+        },
         "phase3_context": serde_json::to_string_pretty(&phase3_context(state))?,
+        "phase1_index": serde_json::to_string_pretty(&state.get("phase1_index").cloned().unwrap_or(Value::Null))?,
+        "prior_phase_summaries": serde_json::to_string_pretty(&prior_phase_summaries(state, phase))?,
+        "common_ground": serde_json::to_string_pretty(&state.get("common_ground").cloned().unwrap_or(Value::Null))?,
+        "reflection_task": serde_json::to_string_pretty(&state.get("reflection_task").cloned().unwrap_or(Value::Null))?,
     });
     let mut values = static_values;
     if let (Some(static_map), Some(dynamic_map)) =
@@ -375,7 +406,12 @@ pub(crate) fn render_prompt_with_plugins(
             Value::String(risk_analyst_body),
         );
     }
-    Ok(replace_placeholders(&template, &values))
+    let rendered = replace_placeholders(&template, &values);
+    if (1..=6).contains(&phase) && !experience_contract.trim().is_empty() {
+        Ok(format!("{rendered}\n\n{experience_contract}"))
+    } else {
+        Ok(rendered)
+    }
 }
 
 #[cfg(test)]
@@ -568,7 +604,7 @@ required_variables = ["ticker", "tickers"]
         let temp = TempDir::new().unwrap();
         let prompts = temp.path().join("prompts");
         std::fs::create_dir_all(prompts.join("common")).unwrap();
-        std::fs::create_dir_all(prompts.join("phase25")).unwrap();
+        std::fs::create_dir_all(prompts.join("phase2")).unwrap();
         write_ticker_component(&prompts, "TICK {ticker}");
         std::fs::write(
             prompts.join("common/researcher_seed.md"),
@@ -576,12 +612,12 @@ required_variables = ["ticker", "tickers"]
         )
         .unwrap();
         std::fs::write(
-            prompts.join("phase25/bull_initial.md"),
+            prompts.join("phase2/bull_initial.md"),
             "看多研究员\n{common_ticker_prompt}\nrole=researcher.bull.initial artifact=bull_seed_packet field=known_bear_constraint",
         )
         .unwrap();
         std::fs::write(
-            prompts.join("phase25/bear_initial.md"),
+            prompts.join("phase2/bear_initial.md"),
             "看空研究员\n{common_ticker_prompt}\nrole=researcher.bear.initial artifact=bear_seed_packet field=known_bull_constraint",
         )
         .unwrap();
@@ -594,7 +630,7 @@ required_variables = ["ticker", "tickers"]
             "bull_seed",
             None,
             None,
-            Some(&prompts.join("phase25/bull_initial.md")),
+            Some(&prompts.join("phase2/bull_initial.md")),
             None,
         )
         .unwrap();
@@ -605,7 +641,7 @@ required_variables = ["ticker", "tickers"]
             "bear_seed",
             None,
             None,
-            Some(&prompts.join("phase25/bear_initial.md")),
+            Some(&prompts.join("phase2/bear_initial.md")),
             None,
         )
         .unwrap();
@@ -631,7 +667,7 @@ required_variables = ["ticker", "tickers"]
         let temp = TempDir::new().unwrap();
         let prompts = temp.path().join("prompts");
         std::fs::create_dir_all(prompts.join("common")).unwrap();
-        std::fs::create_dir_all(prompts.join("phase25")).unwrap();
+        std::fs::create_dir_all(prompts.join("phase2")).unwrap();
         write_ticker_component(&prompts, "TICK {ticker}");
         std::fs::write(prompts.join("common/researcher_seed.md"), "SEED {side}").unwrap();
         std::fs::write(
@@ -640,7 +676,7 @@ required_variables = ["ticker", "tickers"]
         )
         .unwrap();
         std::fs::write(
-            prompts.join("phase25/bull_interaction.md"),
+            prompts.join("phase2/bull_interaction.md"),
             "看多研究员\n{common_ticker_prompt}\nrole=researcher.bull.interaction artifact=bull_debate_packet target=看空 claim",
         )
         .unwrap();
@@ -653,7 +689,7 @@ required_variables = ["ticker", "tickers"]
             "bull_packet",
             Some(2),
             None,
-            Some(&prompts.join("phase25/bull_interaction.md")),
+            Some(&prompts.join("phase2/bull_interaction.md")),
             None,
         )
         .unwrap();
@@ -674,14 +710,14 @@ required_variables = ["ticker", "tickers"]
         let temp = TempDir::new().unwrap();
         let prompts = temp.path().join("prompts");
         std::fs::create_dir_all(prompts.join("common")).unwrap();
-        std::fs::create_dir_all(prompts.join("phase25")).unwrap();
+        std::fs::create_dir_all(prompts.join("phase5")).unwrap();
         std::fs::write(
-            prompts.join("common/risk_analyst.md"),
+            prompts.join("phase5/risk_analyst.md"),
             "shared body {trader_plan} {analyst_reports} {risk_history}",
         )
         .unwrap();
         std::fs::write(
-            prompts.join("phase25/conservative.md"),
+            prompts.join("phase5/conservative.md"),
             "保守风险分析师\n{risk_analyst_body}\n\"key_risks\": [\"主要风险\"]",
         )
         .unwrap();
@@ -694,7 +730,7 @@ required_variables = ["ticker", "tickers"]
             "risk_argument",
             None,
             None,
-            Some(&prompts.join("phase25/conservative.md")),
+            Some(&prompts.join("phase5/conservative.md")),
             None,
         )
         .unwrap();
@@ -739,8 +775,8 @@ required_variables = ["ticker", "tickers"]
         "{anti_injection}",
         "{research_calibration}",
         "{research_drivers}",
+        "{analysis_trace_contract}",
         "{leveraged_etf_rules}",
-        "{analyst_output_structure}",
         "{analyst_artifact_schema}",
         "{research_artifact_schema}",
         "{trade_intent_schema}",
@@ -760,9 +796,10 @@ required_variables = ["ticker", "tickers"]
         "{risk_context}",
         "{portfolio_context}",
         "{allocation_context}",
+        "{reflection_task}",
         "{phase3_context}",
         "{phase1_index}",
-        "{phase00_context}",
+        "{phase_summary_context}",
         "{prior_phase_summaries}",
         "{common_ground}",
     ];
@@ -826,7 +863,7 @@ required_variables = ["ticker", "tickers"]
 
         assert!(context.get("phase1").is_none());
         assert!(context.get("phase2_5").is_none());
-        assert!(context.get("phase00_tables").is_none());
+        assert!(context.get("phase_summary_tables").is_none());
         assert_eq!(
             context["weighted_probability_base"]["QQQ"]["long_probability"],
             0.5
@@ -964,43 +1001,40 @@ required_variables = ["ticker", "tickers"]
         let cases: &[(&str, &str, &str)] = &[
             ("analyst.technical", "phase1/technical.md", "artifact"),
             ("analyst.news_macro", "phase1/news_macro.md", "artifact"),
-            ("researcher.bull.initial", "phase25/bull.md", "bull_seed"),
-            ("researcher.bear.initial", "phase25/bear.md", "bear_seed"),
+            (
+                "mediator.topic",
+                "phase2/topic_generator.md",
+                "topic_generation",
+            ),
+            ("researcher.bull.initial", "phase2/bull.md", "bull_seed"),
+            ("researcher.bear.initial", "phase2/bear.md", "bear_seed"),
             (
                 "researcher.bull.interaction",
-                "phase25/bull.md",
+                "phase2/bull.md",
                 "bull_packet",
             ),
             (
                 "researcher.bear.interaction",
-                "phase25/bear.md",
+                "phase2/bear.md",
                 "bear_packet",
             ),
             (
                 "mediator.topic_controller",
-                "phase25/topic_controller.md",
+                "phase2/topic_controller.md",
                 "controller_packet",
             ),
-            (
-                "manager.research",
-                "phase25/research_manager.md",
-                "artifact",
-            ),
-            ("trader", "phase25/trader.md", "artifact"),
-            (
-                "risk.aggressive",
-                "phase25/conservative.md",
-                "risk_argument",
-            ),
-            ("risk.neutral", "phase25/conservative.md", "risk_argument"),
+            ("manager.research", "phase3/research_manager.md", "artifact"),
+            ("trader", "phase4/trader.md", "artifact"),
+            ("risk.aggressive", "phase5/aggressive.md", "risk_argument"),
+            ("risk.neutral", "phase5/neutral.md", "risk_argument"),
             (
                 "risk.conservative",
-                "phase25/conservative.md",
+                "phase5/conservative.md",
                 "risk_argument",
             ),
             (
                 "portfolio.manager",
-                "phase25/portfolio_manager.md",
+                "phase6/portfolio_manager.md",
                 "artifact",
             ),
         ];
@@ -1031,6 +1065,96 @@ required_variables = ["ticker", "tickers"]
                 );
             }
         }
+    }
+
+    #[test]
+    fn phase2_plus_and_summary_prompts_include_public_analysis_trace_contract() {
+        let prompts = project_prompts_dir();
+        if !prompts.exists() {
+            return;
+        }
+        let state = golden_mock_state();
+        let cases: &[(&str, i64, &str, &str)] = &[
+            (
+                "compressor.phase_summary",
+                0,
+                "phase_summary",
+                "phase_summary/phase_summary.md",
+            ),
+            (
+                "mediator.topic",
+                2,
+                "topic_generation",
+                "phase2/topic_generator.md",
+            ),
+            ("researcher.bull.initial", 2, "bull_seed", "phase2/bull.md"),
+            (
+                "researcher.bear.interaction",
+                2,
+                "bear_packet",
+                "phase2/bear.md",
+            ),
+            (
+                "mediator.topic_controller",
+                2,
+                "controller_packet",
+                "phase2/topic_controller.md",
+            ),
+            (
+                "manager.research",
+                3,
+                "artifact",
+                "phase3/research_manager.md",
+            ),
+            ("trader", 4, "artifact", "phase4/trader.md"),
+            (
+                "risk.aggressive",
+                5,
+                "risk_argument",
+                "phase5/aggressive.md",
+            ),
+            ("risk.neutral", 5, "risk_argument", "phase5/neutral.md"),
+            (
+                "risk.conservative",
+                5,
+                "risk_argument",
+                "phase5/conservative.md",
+            ),
+            (
+                "portfolio.manager",
+                6,
+                "artifact",
+                "phase6/portfolio_manager.md",
+            ),
+        ];
+
+        for (role, phase, kind, relative) in cases {
+            let prompt = render_prompt(
+                &state,
+                role,
+                *phase,
+                kind,
+                Some(1),
+                Some("QQQ-aggregate"),
+                Some(&prompts.join(relative)),
+                None,
+            )
+            .unwrap_or_else(|error| panic!("render failed for {role} ({relative}): {error}"));
+            assert!(
+                prompt.contains("# 公共可审计分析轨迹"),
+                "{relative} did not receive the shared analysis trace contract"
+            );
+            assert!(
+                !prompt.contains("{analysis_trace_contract}"),
+                "{relative} retained an unresolved analysis trace placeholder"
+            );
+        }
+
+        let summary =
+            std::fs::read_to_string(prompts.join("phase_summary/phase_summary.md")).unwrap();
+        assert!(summary.contains("summary_json.analysis_process.trace_status"));
+        assert!(summary.contains("\"analysis_process\""));
+        assert!(summary.contains("source_phase >= 2"));
     }
 
     #[test]
@@ -1081,7 +1205,7 @@ required_variables = ["ticker", "tickers"]
             "artifact",
             None,
             None,
-            Some(&prompts.join("phase25/research_manager.md")),
+            Some(&prompts.join("phase3/research_manager.md")),
             None,
         )
         .unwrap();
@@ -1165,13 +1289,14 @@ required_variables = ["ticker", "tickers"]
             "artifact",
             None,
             None,
-            Some(&prompts.join("phase25/trader.md")),
+            Some(&prompts.join("phase4/trader.md")),
             None,
         )
         .unwrap();
         assert!(trader.contains("research_plan` / Phase 3 是唯一市场结论"));
 
         for role in ["risk.aggressive", "risk.neutral", "risk.conservative"] {
+            let stance = role.strip_prefix("risk.").unwrap();
             let risk = render_prompt(
                 &golden_mock_state(),
                 role,
@@ -1179,11 +1304,11 @@ required_variables = ["ticker", "tickers"]
                 "risk_argument",
                 Some(1),
                 None,
-                Some(&prompts.join("phase25/conservative.md")),
+                Some(&prompts.join(format!("phase5/{stance}.md"))),
                 None,
             )
             .unwrap();
-            assert!(risk.contains(role.strip_prefix("risk.").unwrap()));
+            assert!(risk.contains(stance));
             assert!(risk.contains("风险委员会"));
             assert!(risk.contains("overnight_gap_scenario"));
         }
@@ -1192,7 +1317,7 @@ required_variables = ["ticker", "tickers"]
     #[test]
     fn topic_controller_uses_only_canonical_control_fields() {
         let content =
-            std::fs::read_to_string(project_prompts_dir().join("phase25/topic_controller.md"))
+            std::fs::read_to_string(project_prompts_dir().join("phase2/topic_controller.md"))
                 .unwrap();
         assert!(content.contains("blocked_claims"));
         assert!(content.contains("next_steers"));
@@ -1207,9 +1332,9 @@ required_variables = ["ticker", "tickers"]
             "phase1/technical.md",
             "phase1/news_macro.md",
             "common/analyst_output_contract.md",
-            "phase25/research_manager.md",
-            "phase25/bull.md",
-            "phase25/bear.md",
+            "phase3/research_manager.md",
+            "phase2/bull.md",
+            "phase2/bear.md",
         ] {
             let content = std::fs::read_to_string(prompts.join(relative)).unwrap();
             for removed in ["YouTube", "Reddit", "Twitter"] {

@@ -43,8 +43,8 @@ pub const VALID_PLACEHOLDERS: &[&str] = &[
     "anti_injection",
     "research_calibration",
     "research_drivers",
+    "analysis_trace_contract",
     "leveraged_etf_rules",
-    "analyst_output_structure",
     "analyst_artifact_schema",
     "research_artifact_schema",
     "trade_intent_schema",
@@ -75,9 +75,14 @@ pub const VALID_PLACEHOLDERS: &[&str] = &[
     "risk_history",
     "portfolio_decision",
     "allocation_context",
+    "reflection_task",
     "phase3_context",
     "risk_context",
     "portfolio_context",
+    "ai4trade_mode",
+    "phase1_index",
+    "prior_phase_summaries",
+    "common_ground",
     "workflow_pattern",
     "researcher_body",
     "risk_analyst_body",
@@ -99,10 +104,9 @@ pub const COMMON_COMPONENTS: &[&str] = &[
     "anti_injection.md",
     "analyst_output_contract.md",
     "leveraged_etf_rules.md",
-    "analyst_output_structure.md",
     "research_calibration.md",
     "research_drivers.md",
-    "risk_analyst.md",
+    "analysis_trace.md",
 ];
 
 pub fn run_all_checks(prompts_dir: &Path) -> Result<LintReport> {
@@ -243,18 +247,20 @@ fn infer_role_from_path(path: &Path, prompts_dir: &Path) -> String {
         .unwrap_or("");
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
     match category {
-        "phase0" => format!("compressor.{stem}"),
+        "phase_summary" => format!("compressor.{stem}"),
         "phase1" => format!("analyst.{stem}"),
-        "phase25" if rel.components().nth(1).is_some() => String::new(),
-        "phase25" => match stem {
+        "phase2" => match stem {
             "bull" | "bear" => format!("researcher.{stem}.initial"),
+            "topic_generator" => "mediator.topic".to_string(),
             "topic_controller" => "mediator.topic_controller".to_string(),
-            "research_manager" => "manager.research".to_string(),
-            "portfolio_manager" => "portfolio.manager".to_string(),
-            "trader" => "trader".to_string(),
-            "conservative" => "risk.conservative".to_string(),
             _ => String::new(),
         },
+        "phase3" if stem == "research_manager" => "manager.research".to_string(),
+        "phase4" if stem == "trader" => "trader".to_string(),
+        "phase5" if matches!(stem, "aggressive" | "neutral" | "conservative") => {
+            format!("risk.{stem}")
+        }
+        "phase6" if stem == "portfolio_manager" => "portfolio.manager".to_string(),
         _ => String::new(),
     }
 }
@@ -268,7 +274,7 @@ fn is_runtime_prompt(path: &Path, prompts_dir: &Path) -> bool {
         .next()
         .and_then(|component| component.as_os_str().to_str());
     matches!(category, Some("runtime" | "system"))
-        || (category == Some("phase25")
+        || (category == Some("phase2")
             && components
                 .next()
                 .and_then(|component| component.as_os_str().to_str())

@@ -207,6 +207,14 @@ impl SteerLoopInput<'_> {
             .and_then(Value::as_bool)
             .unwrap_or(false)
     }
+
+    fn includes_prompt_on_fork(&self) -> bool {
+        self.steer_value()
+            .as_ref()
+            .and_then(|value| value.get("include_prompt_on_fork"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -344,9 +352,10 @@ pub async fn run_agent_steer_loop_with_metrics(
     } else {
         Vec::new()
     };
+    let is_new_fork = target_history.is_empty() && !fork_history.is_empty();
     let prior_history = select_fork_history(target_history, fork_history);
     let has_existing_history = !prior_history.is_empty();
-    let user_input = if has_existing_history {
+    let user_input = if has_existing_history && !(is_new_fork && input.includes_prompt_on_fork()) {
         String::new()
     } else {
         input.prompt.to_string()
@@ -798,11 +807,11 @@ fn web_run_runtime_for_settings(settings: &AgentSettings) -> Option<tools::WebRu
 }
 
 fn uses_native_web_search(settings: &AgentSettings) -> bool {
-    !role_disables_tools(&settings.role) && settings.llm.native_web_search
+    !role_disables_web_search(&settings.role) && settings.llm.native_web_search
 }
 
 fn uses_web_run_fallback(settings: &AgentSettings) -> bool {
-    !role_disables_tools(&settings.role)
+    !role_disables_web_search(&settings.role)
         && !uses_native_web_search(settings)
         && settings.web_search.mode != WebSearchMode::Disabled
 }
@@ -2053,6 +2062,7 @@ fn requires_structured_final_artifact(role: &str) -> bool {
                 | "researcher.bear.initial"
                 | "researcher.bull.interaction"
                 | "researcher.bear.interaction"
+                | "mediator.topic"
                 | "mediator.topic_controller"
                 | "trader"
                 | "risk.aggressive"
@@ -2072,6 +2082,7 @@ fn validate_json_artifact_contract(settings: &AgentSettings, artifact: &Value) -
         "researcher.bull.interaction" | "researcher.bear.interaction" => {
             validate_interaction_packet_contract(settings, artifact)
         }
+        "mediator.topic" => validate_topic_generation_contract(settings, artifact),
         "mediator.topic_controller" => validate_controller_packet_contract(settings, artifact),
         "trader" => validate_trade_intent_contract(settings, artifact),
         "risk.aggressive" | "risk.neutral" | "risk.conservative" => {
@@ -2178,6 +2189,51 @@ fn validate_seed_packet_contract(settings: &AgentSettings, artifact: &Value) -> 
     }
     require_non_empty_string(artifact, "summary")?;
     require_object(artifact, "reducer_checks")?;
+    Ok(())
+}
+
+fn validate_topic_generation_contract(settings: &AgentSettings, artifact: &Value) -> Result<()> {
+    require_exact_role(settings, artifact)?;
+    require_exact_string(
+        artifact,
+        "artifact_type",
+        "phase2_topic_generation_artifact",
+    )?;
+    let common_ground = require_object(artifact, "common_ground")?;
+    for field in [
+        "agreed_facts",
+        "shared_constraints",
+        "non_debated_assumptions",
+        "evidence_refs",
+    ] {
+        require_array(&Value::Object(common_ground.clone()), field)?;
+    }
+    for (index, topic) in require_array(artifact, "topics")?.iter().enumerate() {
+        require_non_empty_string(topic, "topic_id")
+            .with_context(|| format!("topics[{index}] is invalid"))?;
+        require_non_empty_string(topic, "topic")?;
+        require_array(topic, "tickers")?;
+        require_non_empty_string(topic, "meta_factor")?;
+        require_non_empty_string(topic, "decision_hinge")?;
+        let ttl = require_non_empty_string(topic, "ttl")?;
+        if !matches!(ttl, "intraday" | "1-3d" | "1-2w") {
+            bail!("topics[{index}].ttl is invalid: {ttl:?}");
+        }
+        require_non_empty_string(topic, "bull_seed_request")?;
+        require_non_empty_string(topic, "bear_seed_request")?;
+        require_non_empty_string(topic, "why_debate")?;
+    }
+    require_non_empty_string(artifact, "summary")?;
+    let reducer_checks = require_object(artifact, "reducer_checks")?;
+    for field in [
+        "from_phase1_index_only",
+        "no_new_external_facts",
+        "json_valid",
+    ] {
+        if reducer_checks.get(field).and_then(Value::as_bool) != Some(true) {
+            bail!("topic generation reducer_checks.{field} must be true");
+        }
+    }
     Ok(())
 }
 
@@ -2658,7 +2714,20 @@ fn configured_tool_names(settings: &AgentSettings) -> Vec<&str> {
     if settings.llm.think_tool {
         names.push("think");
     }
-    names.extend(settings.llm.tools.iter().map(String::as_str));
+    names.extend(
+        settings
+            .llm
+            .tools
+            .iter()
+            .map(String::as_str)
+            .filter(|name| {
+                !is_ai4trade_tool(name)
+                    || settings
+                        .tools
+                        .as_ref()
+                        .is_some_and(|config| config.ai4trade_live)
+            }),
+    );
     if uses_web_run_fallback(settings) {
         names.push(tools::WEB_RUN_TOOL_NAME);
     }
@@ -2666,17 +2735,30 @@ fn configured_tool_names(settings: &AgentSettings) -> Vec<&str> {
 }
 
 fn role_disables_tools(role: &str) -> bool {
-    // manager.research may call read_run_context for phase_summaries / attention.
-    // Trader / risk / PM stay tool-free.
-    matches!(role, "trader" | "portfolio.manager") || role.starts_with("risk.")
+    let _ = role;
+    false
+}
+
+fn role_disables_web_search(role: &str) -> bool {
+    role == "trader" || role.starts_with("risk.") || role == "portfolio.manager"
 }
 
 fn validate_tool_name(name: &str) -> Result<()> {
-    if tools::tool_names().contains(&name) || name == tools::WEB_RUN_TOOL_NAME {
+    if tools::tool_definition(name).is_some() {
         Ok(())
     } else {
         bail!("unknown tool name: {name}")
     }
+}
+
+fn is_ai4trade_tool(name: &str) -> bool {
+    matches!(
+        name,
+        tools::AI4TRADE_GET_PORTFOLIO_TOOL_NAME
+            | tools::AI4TRADE_GET_HISTORY_TOOL_NAME
+            | tools::AI4TRADE_GET_PRICE_TOOL_NAME
+            | tools::AI4TRADE_SUBMIT_TRADE_TOOL_NAME
+    )
 }
 
 fn validate_reasoning_effort(value: &str) -> Result<()> {
@@ -2710,6 +2792,8 @@ fn default_tool_config() -> tools::ExternalToolConfig {
         db_path: std::env::var_os("ORCH_DB_PATH").map(PathBuf::from),
         run_dir: None,
         run_id: None,
+        phase: None,
+        allowed_reflection_task_ids: Vec::new(),
         tickers: std::env::var("ORCH_TICKERS")
             .ok()
             .map(|value| {
@@ -2721,8 +2805,10 @@ fn default_tool_config() -> tools::ExternalToolConfig {
                     .collect()
             })
             .unwrap_or_default(),
-        phase00_index: None,
-        phase00_gate: None,
+        ai4trade_live: false,
+        ai4trade_token: None,
+        phase_summary_index: None,
+        phase_summary_gate: None,
     }
 }
 
@@ -2883,6 +2969,8 @@ mod tests {
             vec![
                 "read_phase_summaries",
                 "read_phase_summary_details",
+                "read_experience",
+                "read_reflection_source",
                 "read_technical_context",
                 "read_jin10_context",
             ]
@@ -2971,9 +3059,13 @@ mod tests {
             db_path: None,
             run_dir: Some(temp.path().to_path_buf()),
             run_id: None,
+            phase: None,
+            allowed_reflection_task_ids: Vec::new(),
             tickers: vec!["QQQ".to_string()],
-            phase00_index: None,
-            phase00_gate: None,
+            ai4trade_live: false,
+            ai4trade_token: None,
+            phase_summary_index: None,
+            phase_summary_gate: None,
         });
         let first = agent_loop::Turn::new(
             "turn-topic-a",
@@ -3009,9 +3101,13 @@ mod tests {
             db_path: None,
             run_dir: None,
             run_id: None,
+            phase: None,
+            allowed_reflection_task_ids: Vec::new(),
             tickers: vec!["TQQQ".to_string()],
-            phase00_index: None,
-            phase00_gate: None,
+            ai4trade_live: false,
+            ai4trade_token: None,
+            phase_summary_index: None,
+            phase_summary_gate: None,
         });
 
         super::append_debug_llm_record(
@@ -3132,6 +3228,46 @@ mod tests {
         );
         let err = super::parse_json_object_artifact("[{\"ok\":true}]").unwrap_err();
         assert!(err.to_string().contains("must be an object"));
+    }
+
+    #[test]
+    fn parse_final_output_validates_topic_generation_contract() {
+        let mut settings = base_settings(LlmRoute::Responses);
+        settings.role = "mediator.topic".to_string();
+        settings.output_mode = OutputMode::JsonArtifact;
+        let valid = r#"{
+            "role":"mediator.topic",
+            "artifact_type":"phase2_topic_generation_artifact",
+            "common_ground":{
+                "agreed_facts":[],
+                "shared_constraints":[],
+                "non_debated_assumptions":[],
+                "evidence_refs":["role:analyst.technical"]
+            },
+            "topics":[{
+                "topic_id":"QQQ-volatility",
+                "topic":"波动率是否低估了短期下行风险？",
+                "tickers":["QQQ"],
+                "meta_factor":"volatility",
+                "decision_hinge":"VIX regime persistence",
+                "ttl":"1-3d",
+                "bull_seed_request":"检验风险是否已计价",
+                "bear_seed_request":"检验波动是否继续扩张",
+                "why_debate":"公共事实之上仍需判断波动持续性"
+            }],
+            "summary":"one topic",
+            "reducer_checks":{
+                "from_phase1_index_only":true,
+                "no_new_external_facts":true,
+                "json_valid":true
+            }
+        }"#;
+
+        let artifact = super::parse_final_output(&settings, valid).unwrap();
+        assert_eq!(artifact["topics"][0]["ttl"], "1-3d");
+
+        let invalid = valid.replace("\"1-3d\"", "\"monthly\"");
+        assert!(super::parse_final_output(&settings, &invalid).is_err());
     }
 
     #[test]
@@ -3737,8 +3873,8 @@ mod tests {
     }
 
     #[test]
-    fn execution_roles_disable_loop_and_native_tools() {
-        for role in ["trader", "portfolio.manager"] {
+    fn execution_roles_keep_scoped_tools_but_disable_web_search() {
+        for role in ["trader", "risk.neutral"] {
             let mut settings = base_settings(LlmRoute::Responses);
             settings.role = role.to_string();
             settings.llm.base_url = Some("https://llm.example.com/v1".to_string());
@@ -3747,7 +3883,10 @@ mod tests {
             settings.llm.native_web_search = true;
             settings.web_search.mode = WebSearchMode::Live;
 
-            assert!(super::configured_tool_names(&settings).is_empty());
+            assert_eq!(
+                super::configured_tool_names(&settings),
+                vec!["think", "read_run_context"]
+            );
             assert_eq!(
                 super::additional_params(&settings),
                 Some(json!({"reasoning": {"effort": "low"}}))
@@ -3763,6 +3902,33 @@ mod tests {
         settings.llm.tools = vec!["read_run_context".to_string()];
         settings.web_search.mode = WebSearchMode::Live;
         assert!(super::configured_tool_names(&settings).contains(&tools::WEB_RUN_TOOL_NAME));
+    }
+
+    #[test]
+    fn portfolio_manager_only_gets_ai4trade_tools_when_live_gate_is_open() {
+        let mut settings = base_settings(LlmRoute::Responses);
+        settings.role = "portfolio.manager".to_string();
+        settings.llm.think_tool = false;
+        settings.llm.tools = vec![
+            tools::AI4TRADE_GET_PORTFOLIO_TOOL_NAME.to_string(),
+            tools::AI4TRADE_GET_PRICE_TOOL_NAME.to_string(),
+            tools::AI4TRADE_SUBMIT_TRADE_TOOL_NAME.to_string(),
+        ];
+        settings.web_search.mode = WebSearchMode::Live;
+        settings.tools = Some(tools::ExternalToolConfig::default());
+
+        assert!(super::configured_tool_names(&settings).is_empty());
+        assert!(super::web_run_runtime_for_settings(&settings).is_none());
+
+        settings.tools.as_mut().unwrap().ai4trade_live = true;
+        assert_eq!(
+            super::configured_tool_names(&settings),
+            vec![
+                tools::AI4TRADE_GET_PORTFOLIO_TOOL_NAME,
+                tools::AI4TRADE_GET_PRICE_TOOL_NAME,
+                tools::AI4TRADE_SUBMIT_TRADE_TOOL_NAME,
+            ]
+        );
     }
 
     #[test]

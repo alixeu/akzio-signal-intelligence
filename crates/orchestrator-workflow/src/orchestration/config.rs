@@ -36,6 +36,7 @@ pub(crate) struct RuntimeConfig {
     pub prompts: PromptConfig,
     pub workflow: WorkflowConfig,
     pub allocation: AllocationConfig,
+    pub ai4trade_token: Option<String>,
     pub reflection: ReflectionConfig,
     pub plugins: PluginConfig,
     pub component_plugins: ComponentRegistry,
@@ -67,8 +68,15 @@ pub(crate) struct AllocationConfig {
 pub(crate) struct ReflectionConfig {
     pub enabled: bool,
     pub reflection_version: String,
-    pub _promote_mode: String,
+    pub promote_mode: String,
     pub retrieval: RetrievalBudget,
+    pub task_limit: usize,
+    pub parallelism: usize,
+    pub loss_return: f64,
+    pub excess_return: f64,
+    pub high_confidence: f64,
+    pub calibration_error: f64,
+    pub repeated_error_count: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -86,10 +94,6 @@ pub(crate) struct WorkflowConfig {
 #[derive(Debug, Clone)]
 pub(crate) struct PromptConfig {
     pub prompts: BTreeMap<String, PathBuf>,
-    pub manager_research: PathBuf,
-    pub trader: PathBuf,
-    pub risk_conservative: PathBuf,
-    pub portfolio_manager: PathBuf,
 }
 
 impl PluginConfig {
@@ -131,6 +135,14 @@ impl RuntimeConfig {
             config,
             &mut prompts,
             &mut versions,
+            "reflector.historical",
+            "orchestrator.prompts.reflection.historical",
+            "prompts/phase0/historical_reflection.md",
+        )?;
+        insert_prompt_entry(
+            config,
+            &mut prompts,
+            &mut versions,
             "analyst.technical",
             "orchestrator.prompts.analyst.technical",
             "prompts/phase1/technical.md",
@@ -144,8 +156,16 @@ impl RuntimeConfig {
             "prompts/phase1/news_macro.md",
         )?;
         // One long-session prompt per side (warm-up + seed + debate + mediator revise).
-        const BULL_PROMPT: &str = "prompts/phase25/bull.md";
-        const BEAR_PROMPT: &str = "prompts/phase25/bear.md";
+        const BULL_PROMPT: &str = "prompts/phase2/bull.md";
+        const BEAR_PROMPT: &str = "prompts/phase2/bear.md";
+        insert_prompt_entry(
+            config,
+            &mut prompts,
+            &mut versions,
+            "mediator.topic",
+            "orchestrator.prompts.phase2.topic_generator",
+            "prompts/phase2/topic_generator.md",
+        )?;
         insert_prompt_entry(
             config,
             &mut prompts,
@@ -184,48 +204,50 @@ impl RuntimeConfig {
             &mut versions,
             "mediator.topic_controller",
             "orchestrator.prompts.mediator.topic_controller",
-            "prompts/phase25/topic_controller.md",
+            "prompts/phase2/topic_controller.md",
         )?;
         insert_prompt_entry(
             config,
             &mut prompts,
             &mut versions,
-            "compressor.phase00",
-            "orchestrator.prompts.compressor.phase00",
-            "prompts/phase0/phase00.md",
+            "compressor.phase_summary",
+            "orchestrator.prompts.compressor.phase_summary",
+            "prompts/phase_summary/phase_summary.md",
         )?;
-        let (manager_research, manager_research_version) = prompt_entry(
+        insert_prompt_entry(
             config,
+            &mut prompts,
+            &mut versions,
+            "manager.research",
             "orchestrator.prompts.manager.research",
-            "prompts/phase25/research_manager.md",
+            "prompts/phase3/research_manager.md",
         )?;
-        versions.insert("manager.research".to_string(), manager_research_version);
-        let (trader, trader_version) = prompt_entry(
+        insert_prompt_entry(
             config,
+            &mut prompts,
+            &mut versions,
+            "trader",
             "orchestrator.prompts.trader",
-            "prompts/phase25/trader.md",
+            "prompts/phase4/trader.md",
         )?;
-        versions.insert("trader".to_string(), trader_version);
-        let (risk_conservative, risk_conservative_version) = prompt_entry(
+        for stance in ["aggressive", "neutral", "conservative"] {
+            insert_prompt_entry(
+                config,
+                &mut prompts,
+                &mut versions,
+                &format!("risk.{stance}"),
+                &format!("orchestrator.prompts.risk.{stance}"),
+                &format!("prompts/phase5/{stance}.md"),
+            )?;
+        }
+        insert_prompt_entry(
             config,
-            "orchestrator.prompts.risk.conservative",
-            "prompts/phase25/conservative.md",
-        )?;
-        versions.insert(
-            "risk.conservative".to_string(),
-            risk_conservative_version.clone(),
-        );
-        versions.insert(
-            "risk.neutral".to_string(),
-            risk_conservative_version.clone(),
-        );
-        versions.insert("risk.aggressive".to_string(), risk_conservative_version);
-        let (portfolio_manager, portfolio_manager_version) = prompt_entry(
-            config,
+            &mut prompts,
+            &mut versions,
+            "portfolio.manager",
             "orchestrator.prompts.portfolio.manager",
-            "prompts/phase25/portfolio_manager.md",
+            "prompts/phase6/portfolio_manager.md",
         )?;
-        versions.insert("portfolio.manager".to_string(), portfolio_manager_version);
         let plugin_config = PluginConfig::from_value(config);
         let (component_plugins, role_plugins) = if plugin_config.enabled {
             let mut component_dirs = vec![plugin_config.components_dir.clone()];
@@ -249,13 +271,7 @@ impl RuntimeConfig {
                 .entry(plugin.manifest.role_id.clone())
                 .or_insert_with(|| "v1".to_string());
         }
-        let prompts_config = PromptConfig {
-            prompts,
-            manager_research,
-            trader,
-            risk_conservative,
-            portfolio_manager,
-        };
+        let prompts_config = PromptConfig { prompts };
         let mut llm_roles = llm_roles_from_config(config)?;
         merge_plugin_llm_role_defaults(config, &mut llm_roles, &role_plugins)?;
         let truncation = truncation_config_from_value(config);
@@ -272,6 +288,10 @@ impl RuntimeConfig {
                 .values()
                 .map(|plugin| (&plugin.manifest, plugin.role_path())),
         );
+        let ai4trade_token = config_str(config, "orchestrator.ai4trade.token", "")
+            .trim()
+            .to_string();
+        let ai4trade_token = (!ai4trade_token.is_empty()).then_some(ai4trade_token);
         Ok(Self {
             llm_roles,
             web_search,
@@ -286,6 +306,7 @@ impl RuntimeConfig {
             prompts: prompts_config,
             workflow,
             allocation: AllocationConfig::from_value(config),
+            ai4trade_token,
             reflection: ReflectionConfig::from_value(config),
             plugins: plugin_config,
             component_plugins,
@@ -411,68 +432,113 @@ fn builtin_llm_role_values() -> BTreeMap<String, Value> {
     let mut roles = BTreeMap::new();
     for (role, max_turns, reasoning_effort, tools, web_search_live) in [
         (
+            "reflector.historical",
+            6,
+            Some("medium"),
+            vec!["read_reflection_source"],
+            false,
+        ),
+        (
             "analyst.technical",
             12,
             None,
-            vec!["read_technical_context"],
+            vec!["read_experience", "read_technical_context"],
             false,
         ),
         (
             "analyst.news_macro",
             6,
             None,
-            vec!["read_jin10_context"],
+            vec!["read_experience", "read_jin10_context"],
             true,
         ),
         // Phase-2 roles read the compact index, then expand selected summaries.
         (
+            "mediator.topic",
+            6,
+            Some("medium"),
+            vec![
+                "read_experience",
+                "read_phase_summaries",
+                "read_phase_summary_details",
+            ],
+            false,
+        ),
+        (
             "researcher.bull.initial",
             10,
             None,
-            vec!["read_phase_summaries", "read_phase_summary_details"],
+            vec![
+                "read_experience",
+                "read_phase_summaries",
+                "read_phase_summary_details",
+            ],
             false,
         ),
         (
             "researcher.bear.initial",
             10,
             None,
-            vec!["read_phase_summaries", "read_phase_summary_details"],
+            vec![
+                "read_experience",
+                "read_phase_summaries",
+                "read_phase_summary_details",
+            ],
             false,
         ),
         (
             "researcher.bull.interaction",
             10,
             None,
-            vec!["read_phase_summary_details"],
+            vec!["read_experience", "read_phase_summary_details"],
             false,
         ),
         (
             "researcher.bear.interaction",
             10,
             None,
-            vec!["read_phase_summary_details"],
+            vec!["read_experience", "read_phase_summary_details"],
             false,
         ),
         (
             "mediator.topic_controller",
             10,
             Some("medium"),
-            vec!["read_phase_summaries", "read_phase_summary_details"],
+            vec![
+                "read_experience",
+                "read_phase_summaries",
+                "read_phase_summary_details",
+            ],
             false,
         ),
         (
             "manager.research",
             6,
             Some("medium"),
-            vec!["read_phase_summaries", "read_phase_summary_details"],
+            vec![
+                "read_experience",
+                "read_phase_summaries",
+                "read_phase_summary_details",
+            ],
             false,
         ),
-        ("compressor.phase00", 4, None, vec![], false),
-        ("trader", 6, None, vec![], false),
-        ("risk.aggressive", 6, None, vec![], false),
-        ("risk.neutral", 6, None, vec![], false),
-        ("risk.conservative", 6, None, vec![], false),
-        ("portfolio.manager", 6, Some("medium"), vec![], false),
+        ("compressor.phase_summary", 4, None, vec![], false),
+        ("trader", 6, None, vec!["read_experience"], false),
+        ("risk.aggressive", 6, None, vec!["read_experience"], false),
+        ("risk.neutral", 6, None, vec!["read_experience"], false),
+        ("risk.conservative", 6, None, vec!["read_experience"], false),
+        (
+            "portfolio.manager",
+            8,
+            Some("medium"),
+            vec![
+                "read_experience",
+                "ai4trade_get_portfolio",
+                "ai4trade_get_price",
+                "ai4trade_submit_trade",
+            ],
+            false,
+        ),
     ] {
         let mut object = serde_json::Map::new();
         object.insert("max_turns".to_string(), Value::from(max_turns));
@@ -502,6 +568,7 @@ fn builtin_llm_role_values() -> BTreeMap<String, Value> {
                 | "researcher.bear.initial"
                 | "researcher.bull.interaction"
                 | "researcher.bear.interaction"
+                | "mediator.topic"
                 | "mediator.topic_controller"
         ) {
             object.insert(
@@ -627,13 +694,15 @@ pub(crate) fn required_llm_roles() -> Vec<String> {
     let registry = orchestrator_core::role_registry::AgentRegistry::builtin();
     let mut ids = registry.all_role_ids();
     for id in [
+        "reflector.historical",
+        "mediator.topic",
         "researcher.bull.initial",
         "researcher.bear.initial",
         "researcher.bull.interaction",
         "researcher.bear.interaction",
         "mediator.topic_controller",
         "manager.research",
-        "compressor.phase00",
+        "compressor.phase_summary",
     ] {
         if !ids.contains(&id.to_string()) {
             ids.push(id.to_string());
@@ -652,7 +721,31 @@ impl ReflectionConfig {
                 "orchestrator.reflection.reflection_version",
                 "v1",
             ),
-            _promote_mode: config_str(config, "orchestrator.reflection.promote_mode", "auto"),
+            promote_mode: config_str(config, "orchestrator.reflection.promote_mode", "auto"),
+            task_limit: config_int(config, "orchestrator.reflection.task_limit", 10).max(1)
+                as usize,
+            parallelism: config_int(config, "orchestrator.reflection.parallelism", 2).max(1)
+                as usize,
+            loss_return: config_f64(config, "orchestrator.reflection.deep.loss_return", -0.02),
+            excess_return: config_f64(config, "orchestrator.reflection.deep.excess_return", -0.015),
+            high_confidence: config_f64(
+                config,
+                "orchestrator.reflection.deep.high_confidence",
+                0.70,
+            )
+            .clamp(0.0, 1.0),
+            calibration_error: config_f64(
+                config,
+                "orchestrator.reflection.deep.calibration_error",
+                0.40,
+            )
+            .clamp(0.0, 1.0),
+            repeated_error_count: config_int(
+                config,
+                "orchestrator.reflection.deep.repeated_error_count",
+                2,
+            )
+            .max(2),
             retrieval: RetrievalBudget {
                 token_budget: config_int(
                     config,
@@ -985,20 +1078,36 @@ mod tests {
     #[test]
     fn role_tools_are_phase_scoped() {
         let roles = builtin_llm_role_values();
+        assert_eq!(roles["compressor.phase_summary"]["tools"], json!([]));
         for role in [
             "trader",
             "risk.aggressive",
             "risk.neutral",
             "risk.conservative",
-            "portfolio.manager",
-            "compressor.phase00",
         ] {
-            assert_eq!(roles[role]["tools"], json!([]), "role={role}");
+            assert_eq!(
+                roles[role]["tools"],
+                json!(["read_experience"]),
+                "role={role}"
+            );
         }
+        assert_eq!(
+            roles["portfolio.manager"]["tools"],
+            json!([
+                "read_experience",
+                "ai4trade_get_portfolio",
+                "ai4trade_get_price",
+                "ai4trade_submit_trade"
+            ])
+        );
         for role in ["researcher.bull.initial", "researcher.bear.initial"] {
             assert_eq!(
                 roles[role]["tools"],
-                json!(["read_phase_summaries", "read_phase_summary_details"]),
+                json!([
+                    "read_experience",
+                    "read_phase_summaries",
+                    "read_phase_summary_details"
+                ]),
                 "role={role}"
             );
             assert_eq!(roles[role]["web_search"]["mode"], "disabled");
@@ -1006,14 +1115,22 @@ mod tests {
         for role in ["researcher.bull.interaction", "researcher.bear.interaction"] {
             assert_eq!(
                 roles[role]["tools"],
-                json!(["read_phase_summary_details"]),
+                json!(["read_experience", "read_phase_summary_details"]),
                 "role={role}"
             );
         }
-        for role in ["mediator.topic_controller", "manager.research"] {
+        for role in [
+            "mediator.topic",
+            "mediator.topic_controller",
+            "manager.research",
+        ] {
             assert_eq!(
                 roles[role]["tools"],
-                json!(["read_phase_summaries", "read_phase_summary_details"]),
+                json!([
+                    "read_experience",
+                    "read_phase_summaries",
+                    "read_phase_summary_details"
+                ]),
                 "role={role}"
             );
         }

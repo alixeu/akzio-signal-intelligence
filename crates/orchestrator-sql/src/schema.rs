@@ -9,7 +9,7 @@ use std::{
 
 pub const AGGREGATE_TICKER: &str = "__ALL__";
 pub const APPLICATION_ID: i64 = 0x415A_5349; // ASCII "AZSI"
-pub const CURRENT_SCHEMA_VERSION: i64 = 3;
+pub const CURRENT_SCHEMA_VERSION: i64 = 4;
 
 const MANAGED_TABLES: &[&str] = &[
     "runs",
@@ -27,10 +27,22 @@ const MANAGED_TABLES: &[&str] = &[
     "predictions",
     "outcomes",
     "candidate_experiences",
+    "ai4trade_executions",
+    "ai4trade_account_snapshots",
+    "decision_snapshots",
+    "decision_outcomes",
+    "reflection_tasks",
+    "reflection_episodes",
 ];
 
 const DROP_LEGACY_ORDER: &[&str] = &[
     "outcomes",
+    "reflection_episodes",
+    "reflection_tasks",
+    "decision_outcomes",
+    "decision_snapshots",
+    "ai4trade_account_snapshots",
+    "ai4trade_executions",
     "attention_ledger",
     "phase_summary_details",
     "phase_summaries",
@@ -186,6 +198,13 @@ fn migrate_schema(conn: &Connection) -> Result<()> {
         archive_unmanaged_legacy_tables(&tx)?;
         set_user_version(&tx, 3)?;
         tx.commit()?;
+        version = 3;
+    }
+    if version == 3 {
+        let tx = conn.unchecked_transaction()?;
+        migrate_v3_to_v4(&tx)?;
+        set_user_version(&tx, 4)?;
+        tx.commit()?;
     }
     Ok(())
 }
@@ -339,7 +358,12 @@ fn create_tables(conn: &Connection) -> Result<()> {
             sample_count INTEGER NOT NULL CHECK(sample_count >= 0),
             recent_success_rate REAL NOT NULL CHECK(recent_success_rate BETWEEN 0.0 AND 1.0),
             reflection_version TEXT NOT NULL,
-            promoted_from INTEGER
+            promoted_from INTEGER,
+            source_phase INTEGER NOT NULL DEFAULT 0 CHECK(source_phase BETWEEN 0 AND 8),
+            applies_to_phases_json TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(applies_to_phases_json)),
+            pattern_key TEXT NOT NULL DEFAULT '',
+            experience_level TEXT NOT NULL DEFAULT 'active_policy'
+                CHECK(experience_level IN ('recent_episode','repeated_warning','active_policy'))
         );
 
         CREATE TABLE memory_versions (
@@ -515,7 +539,142 @@ fn create_tables(conn: &Connection) -> Result<()> {
             reviewed_at INTEGER GENERATED ALWAYS AS (reviewed_at_ms / 1000) VIRTUAL,
             review_reason TEXT,
             created_at_ms INTEGER NOT NULL CHECK(created_at_ms >= 0),
-            created_at INTEGER GENERATED ALWAYS AS (created_at_ms / 1000) VIRTUAL
+            created_at INTEGER GENERATED ALWAYS AS (created_at_ms / 1000) VIRTUAL,
+            source_phase INTEGER NOT NULL DEFAULT 0 CHECK(source_phase BETWEEN 0 AND 8),
+            applies_to_phases_json TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(applies_to_phases_json)),
+            propagation_path_json TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(propagation_path_json)),
+            pattern_key TEXT NOT NULL DEFAULT '',
+            experience_level TEXT NOT NULL DEFAULT 'recent_episode'
+                CHECK(experience_level IN ('recent_episode','repeated_warning','validated')),
+            attribution_confidence REAL NOT NULL DEFAULT 1.0
+                CHECK(attribution_confidence BETWEEN 0.0 AND 1.0)
+        );
+
+        CREATE TABLE ai4trade_executions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            signal_id TEXT UNIQUE,
+            run_id TEXT,
+            ticker TEXT NOT NULL CHECK(length(trim(ticker)) > 0),
+            source_phase INTEGER NOT NULL DEFAULT 6 CHECK(source_phase BETWEEN 0 AND 8),
+            action TEXT NOT NULL CHECK(action IN ('buy','sell','short','cover')),
+            quantity REAL NOT NULL CHECK(quantity > 0.0),
+            requested_price REAL,
+            executed_price REAL,
+            executed_at_ms INTEGER NOT NULL CHECK(executed_at_ms >= 0),
+            executed_at INTEGER GENERATED ALWAYS AS (executed_at_ms / 1000) VIRTUAL,
+            attribution_method TEXT NOT NULL
+                CHECK(attribution_method IN ('exact_signal','time_window','legacy_unattributed')),
+            attribution_confidence REAL NOT NULL CHECK(attribution_confidence BETWEEN 0.0 AND 1.0),
+            response_hash TEXT NOT NULL,
+            raw_json TEXT NOT NULL CHECK(json_valid(raw_json)),
+            created_at_ms INTEGER NOT NULL CHECK(created_at_ms >= 0),
+            created_at INTEGER GENERATED ALWAYS AS (created_at_ms / 1000) VIRTUAL,
+            FOREIGN KEY(run_id) REFERENCES runs(run_id) ON DELETE SET NULL
+        );
+
+        CREATE TABLE ai4trade_account_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT,
+            phase INTEGER NOT NULL CHECK(phase BETWEEN 0 AND 8),
+            captured_at_ms INTEGER NOT NULL CHECK(captured_at_ms >= 0),
+            captured_at INTEGER GENERATED ALWAYS AS (captured_at_ms / 1000) VIRTUAL,
+            cash REAL,
+            points REAL,
+            unrealized_pnl REAL,
+            observed_equity REAL,
+            positions_json TEXT NOT NULL CHECK(json_valid(positions_json)),
+            source_json TEXT NOT NULL CHECK(json_valid(source_json)),
+            FOREIGN KEY(run_id) REFERENCES runs(run_id) ON DELETE SET NULL
+        );
+
+        CREATE TABLE decision_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT NOT NULL,
+            ticker TEXT NOT NULL CHECK(length(trim(ticker)) > 0),
+            decision_date TEXT NOT NULL
+                CHECK(length(decision_date) = 10 AND strftime('%Y-%m-%d', decision_date) = decision_date),
+            source_phase INTEGER NOT NULL DEFAULT 6 CHECK(source_phase BETWEEN 0 AND 8),
+            action TEXT NOT NULL,
+            position_id TEXT,
+            prediction_horizon_trading_days INTEGER NOT NULL
+                CHECK(prediction_horizon_trading_days > 0),
+            long_probability REAL CHECK(long_probability BETWEEN 0.0 AND 1.0),
+            short_probability REAL CHECK(short_probability BETWEEN 0.0 AND 1.0),
+            decision_json TEXT NOT NULL CHECK(json_valid(decision_json)),
+            created_at_ms INTEGER NOT NULL CHECK(created_at_ms >= 0),
+            created_at INTEGER GENERATED ALWAYS AS (created_at_ms / 1000) VIRTUAL,
+            UNIQUE(run_id, ticker),
+            FOREIGN KEY(run_id) REFERENCES runs(run_id) ON DELETE RESTRICT
+        );
+
+        CREATE TABLE decision_outcomes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            decision_snapshot_id INTEGER NOT NULL UNIQUE,
+            prediction_id INTEGER,
+            source_run_id TEXT NOT NULL,
+            ticker TEXT NOT NULL,
+            outcome_date TEXT NOT NULL,
+            actual_return REAL NOT NULL,
+            counterfactual_return REAL,
+            benchmark_return REAL,
+            excess_return REAL,
+            direction_correct INTEGER NOT NULL CHECK(direction_correct IN (0, 1)),
+            calibration_error REAL NOT NULL,
+            observed_max_drawdown REAL,
+            attribution_method TEXT NOT NULL,
+            attribution_confidence REAL NOT NULL CHECK(attribution_confidence BETWEEN 0.0 AND 1.0),
+            metrics_json TEXT NOT NULL CHECK(json_valid(metrics_json)),
+            created_at_ms INTEGER NOT NULL CHECK(created_at_ms >= 0),
+            created_at INTEGER GENERATED ALWAYS AS (created_at_ms / 1000) VIRTUAL,
+            FOREIGN KEY(decision_snapshot_id) REFERENCES decision_snapshots(id) ON DELETE CASCADE,
+            FOREIGN KEY(prediction_id) REFERENCES predictions(id) ON DELETE SET NULL,
+            FOREIGN KEY(source_run_id) REFERENCES runs(run_id) ON DELETE RESTRICT
+        );
+
+        CREATE TABLE reflection_tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            decision_outcome_id INTEGER NOT NULL,
+            current_run_id TEXT NOT NULL,
+            reflection_version TEXT NOT NULL,
+            reflection_level TEXT NOT NULL CHECK(reflection_level IN ('routine','deep')),
+            priority INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL CHECK(status IN ('pending','running','completed','failed')),
+            attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+            last_error TEXT,
+            created_at_ms INTEGER NOT NULL CHECK(created_at_ms >= 0),
+            updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= 0),
+            UNIQUE(decision_outcome_id, reflection_version),
+            FOREIGN KEY(decision_outcome_id) REFERENCES decision_outcomes(id) ON DELETE CASCADE,
+            FOREIGN KEY(current_run_id) REFERENCES runs(run_id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE reflection_episodes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id INTEGER NOT NULL,
+            reflection_id TEXT NOT NULL,
+            source_run_id TEXT NOT NULL,
+            ticker TEXT NOT NULL,
+            source_phase INTEGER NOT NULL CHECK(source_phase BETWEEN 0 AND 8),
+            applies_to_phases_json TEXT NOT NULL CHECK(json_valid(applies_to_phases_json)),
+            propagation_path_json TEXT NOT NULL CHECK(json_valid(propagation_path_json)),
+            experience_type TEXT NOT NULL,
+            failure_mode TEXT NOT NULL,
+            recommendation_class TEXT NOT NULL,
+            pattern_key TEXT NOT NULL,
+            finding TEXT NOT NULL,
+            recommendation TEXT NOT NULL,
+            evidence_summary_ids_json TEXT NOT NULL CHECK(json_valid(evidence_summary_ids_json)),
+            evidence_detail_ids_json TEXT NOT NULL CHECK(json_valid(evidence_detail_ids_json)),
+            counter_evidence_json TEXT NOT NULL CHECK(json_valid(counter_evidence_json)),
+            confidence REAL NOT NULL CHECK(confidence BETWEEN 0.0 AND 1.0),
+            attribution_confidence REAL NOT NULL CHECK(attribution_confidence BETWEEN 0.0 AND 1.0),
+            reusable INTEGER NOT NULL CHECK(reusable IN (0, 1)),
+            artifact_json TEXT NOT NULL CHECK(json_valid(artifact_json)),
+            created_at_ms INTEGER NOT NULL CHECK(created_at_ms >= 0),
+            created_at INTEGER GENERATED ALWAYS AS (created_at_ms / 1000) VIRTUAL,
+            UNIQUE(task_id, source_phase, pattern_key),
+            FOREIGN KEY(task_id) REFERENCES reflection_tasks(id) ON DELETE CASCADE,
+            FOREIGN KEY(source_run_id) REFERENCES runs(run_id) ON DELETE RESTRICT
         );
 
         CREATE TABLE schema_archive (
@@ -580,6 +739,192 @@ fn create_indexes(conn: &Connection) -> Result<()> {
             ON candidate_experiences(review_status, id);
         CREATE INDEX IF NOT EXISTS idx_candidate_exp_scope_type
             ON candidate_experiences(scope, scope_value, experience_type);
+        CREATE INDEX IF NOT EXISTS idx_candidate_pattern
+            ON candidate_experiences(pattern_key, review_status);
+        CREATE INDEX IF NOT EXISTS idx_memory_phase_pattern
+            ON memory_items(status, source_phase, pattern_key);
+        CREATE INDEX IF NOT EXISTS idx_ai4trade_executions_run_time
+            ON ai4trade_executions(run_id, executed_at_ms);
+        CREATE INDEX IF NOT EXISTS idx_ai4trade_executions_ticker_time
+            ON ai4trade_executions(ticker, executed_at_ms);
+        CREATE INDEX IF NOT EXISTS idx_ai4trade_snapshots_run_time
+            ON ai4trade_account_snapshots(run_id, captured_at_ms);
+        CREATE INDEX IF NOT EXISTS idx_decision_outcomes_run_ticker
+            ON decision_outcomes(source_run_id, ticker);
+        CREATE INDEX IF NOT EXISTS idx_reflection_tasks_status_priority
+            ON reflection_tasks(status, priority DESC, created_at_ms);
+        CREATE INDEX IF NOT EXISTS idx_reflection_episodes_phase_pattern
+            ON reflection_episodes(source_phase, pattern_key, created_at_ms DESC);
+        "#,
+    )?;
+    Ok(())
+}
+
+fn migrate_v3_to_v4(conn: &Connection) -> Result<()> {
+    if !columns(conn, "memory_items")?.contains("source_phase") {
+        conn.execute_batch(
+            r#"
+            ALTER TABLE memory_items ADD COLUMN source_phase INTEGER NOT NULL DEFAULT 0
+                CHECK(source_phase BETWEEN 0 AND 8);
+            ALTER TABLE memory_items ADD COLUMN applies_to_phases_json TEXT NOT NULL DEFAULT '[]'
+                CHECK(json_valid(applies_to_phases_json));
+            ALTER TABLE memory_items ADD COLUMN pattern_key TEXT NOT NULL DEFAULT '';
+            ALTER TABLE memory_items ADD COLUMN experience_level TEXT NOT NULL DEFAULT 'active_policy'
+                CHECK(experience_level IN ('recent_episode','repeated_warning','active_policy'));
+            "#,
+        )?;
+    }
+    if !columns(conn, "candidate_experiences")?.contains("source_phase") {
+        conn.execute_batch(
+            r#"
+            ALTER TABLE candidate_experiences ADD COLUMN source_phase INTEGER NOT NULL DEFAULT 0
+                CHECK(source_phase BETWEEN 0 AND 8);
+            ALTER TABLE candidate_experiences ADD COLUMN applies_to_phases_json TEXT NOT NULL DEFAULT '[]'
+                CHECK(json_valid(applies_to_phases_json));
+            ALTER TABLE candidate_experiences ADD COLUMN propagation_path_json TEXT NOT NULL DEFAULT '[]'
+                CHECK(json_valid(propagation_path_json));
+            ALTER TABLE candidate_experiences ADD COLUMN pattern_key TEXT NOT NULL DEFAULT '';
+            ALTER TABLE candidate_experiences ADD COLUMN experience_level TEXT NOT NULL DEFAULT 'recent_episode'
+                CHECK(experience_level IN ('recent_episode','repeated_warning','validated'));
+            ALTER TABLE candidate_experiences ADD COLUMN attribution_confidence REAL NOT NULL DEFAULT 1.0
+                CHECK(attribution_confidence BETWEEN 0.0 AND 1.0);
+            "#,
+        )?;
+    }
+    create_reflection_tables(conn)?;
+    create_indexes(conn)?;
+    Ok(())
+}
+
+fn create_reflection_tables(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS ai4trade_executions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            signal_id TEXT UNIQUE,
+            run_id TEXT,
+            ticker TEXT NOT NULL CHECK(length(trim(ticker)) > 0),
+            source_phase INTEGER NOT NULL DEFAULT 6 CHECK(source_phase BETWEEN 0 AND 8),
+            action TEXT NOT NULL CHECK(action IN ('buy','sell','short','cover')),
+            quantity REAL NOT NULL CHECK(quantity > 0.0),
+            requested_price REAL,
+            executed_price REAL,
+            executed_at_ms INTEGER NOT NULL CHECK(executed_at_ms >= 0),
+            executed_at INTEGER GENERATED ALWAYS AS (executed_at_ms / 1000) VIRTUAL,
+            attribution_method TEXT NOT NULL
+                CHECK(attribution_method IN ('exact_signal','time_window','legacy_unattributed')),
+            attribution_confidence REAL NOT NULL CHECK(attribution_confidence BETWEEN 0.0 AND 1.0),
+            response_hash TEXT NOT NULL,
+            raw_json TEXT NOT NULL CHECK(json_valid(raw_json)),
+            created_at_ms INTEGER NOT NULL CHECK(created_at_ms >= 0),
+            created_at INTEGER GENERATED ALWAYS AS (created_at_ms / 1000) VIRTUAL,
+            FOREIGN KEY(run_id) REFERENCES runs(run_id) ON DELETE SET NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS ai4trade_account_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT,
+            phase INTEGER NOT NULL CHECK(phase BETWEEN 0 AND 8),
+            captured_at_ms INTEGER NOT NULL CHECK(captured_at_ms >= 0),
+            captured_at INTEGER GENERATED ALWAYS AS (captured_at_ms / 1000) VIRTUAL,
+            cash REAL,
+            points REAL,
+            unrealized_pnl REAL,
+            observed_equity REAL,
+            positions_json TEXT NOT NULL CHECK(json_valid(positions_json)),
+            source_json TEXT NOT NULL CHECK(json_valid(source_json)),
+            FOREIGN KEY(run_id) REFERENCES runs(run_id) ON DELETE SET NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS decision_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT NOT NULL,
+            ticker TEXT NOT NULL CHECK(length(trim(ticker)) > 0),
+            decision_date TEXT NOT NULL
+                CHECK(length(decision_date) = 10 AND strftime('%Y-%m-%d', decision_date) = decision_date),
+            source_phase INTEGER NOT NULL DEFAULT 6 CHECK(source_phase BETWEEN 0 AND 8),
+            action TEXT NOT NULL,
+            position_id TEXT,
+            prediction_horizon_trading_days INTEGER NOT NULL
+                CHECK(prediction_horizon_trading_days > 0),
+            long_probability REAL CHECK(long_probability BETWEEN 0.0 AND 1.0),
+            short_probability REAL CHECK(short_probability BETWEEN 0.0 AND 1.0),
+            decision_json TEXT NOT NULL CHECK(json_valid(decision_json)),
+            created_at_ms INTEGER NOT NULL CHECK(created_at_ms >= 0),
+            created_at INTEGER GENERATED ALWAYS AS (created_at_ms / 1000) VIRTUAL,
+            UNIQUE(run_id, ticker),
+            FOREIGN KEY(run_id) REFERENCES runs(run_id) ON DELETE RESTRICT
+        );
+
+        CREATE TABLE IF NOT EXISTS decision_outcomes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            decision_snapshot_id INTEGER NOT NULL UNIQUE,
+            prediction_id INTEGER,
+            source_run_id TEXT NOT NULL,
+            ticker TEXT NOT NULL,
+            outcome_date TEXT NOT NULL,
+            actual_return REAL NOT NULL,
+            counterfactual_return REAL,
+            benchmark_return REAL,
+            excess_return REAL,
+            direction_correct INTEGER NOT NULL CHECK(direction_correct IN (0, 1)),
+            calibration_error REAL NOT NULL,
+            observed_max_drawdown REAL,
+            attribution_method TEXT NOT NULL,
+            attribution_confidence REAL NOT NULL CHECK(attribution_confidence BETWEEN 0.0 AND 1.0),
+            metrics_json TEXT NOT NULL CHECK(json_valid(metrics_json)),
+            created_at_ms INTEGER NOT NULL CHECK(created_at_ms >= 0),
+            created_at INTEGER GENERATED ALWAYS AS (created_at_ms / 1000) VIRTUAL,
+            FOREIGN KEY(decision_snapshot_id) REFERENCES decision_snapshots(id) ON DELETE CASCADE,
+            FOREIGN KEY(prediction_id) REFERENCES predictions(id) ON DELETE SET NULL,
+            FOREIGN KEY(source_run_id) REFERENCES runs(run_id) ON DELETE RESTRICT
+        );
+
+        CREATE TABLE IF NOT EXISTS reflection_tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            decision_outcome_id INTEGER NOT NULL,
+            current_run_id TEXT NOT NULL,
+            reflection_version TEXT NOT NULL,
+            reflection_level TEXT NOT NULL CHECK(reflection_level IN ('routine','deep')),
+            priority INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL CHECK(status IN ('pending','running','completed','failed')),
+            attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+            last_error TEXT,
+            created_at_ms INTEGER NOT NULL CHECK(created_at_ms >= 0),
+            updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= 0),
+            UNIQUE(decision_outcome_id, reflection_version),
+            FOREIGN KEY(decision_outcome_id) REFERENCES decision_outcomes(id) ON DELETE CASCADE,
+            FOREIGN KEY(current_run_id) REFERENCES runs(run_id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS reflection_episodes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id INTEGER NOT NULL,
+            reflection_id TEXT NOT NULL,
+            source_run_id TEXT NOT NULL,
+            ticker TEXT NOT NULL,
+            source_phase INTEGER NOT NULL CHECK(source_phase BETWEEN 0 AND 8),
+            applies_to_phases_json TEXT NOT NULL CHECK(json_valid(applies_to_phases_json)),
+            propagation_path_json TEXT NOT NULL CHECK(json_valid(propagation_path_json)),
+            experience_type TEXT NOT NULL,
+            failure_mode TEXT NOT NULL,
+            recommendation_class TEXT NOT NULL,
+            pattern_key TEXT NOT NULL,
+            finding TEXT NOT NULL,
+            recommendation TEXT NOT NULL,
+            evidence_summary_ids_json TEXT NOT NULL CHECK(json_valid(evidence_summary_ids_json)),
+            evidence_detail_ids_json TEXT NOT NULL CHECK(json_valid(evidence_detail_ids_json)),
+            counter_evidence_json TEXT NOT NULL CHECK(json_valid(counter_evidence_json)),
+            confidence REAL NOT NULL CHECK(confidence BETWEEN 0.0 AND 1.0),
+            attribution_confidence REAL NOT NULL CHECK(attribution_confidence BETWEEN 0.0 AND 1.0),
+            reusable INTEGER NOT NULL CHECK(reusable IN (0, 1)),
+            artifact_json TEXT NOT NULL CHECK(json_valid(artifact_json)),
+            created_at_ms INTEGER NOT NULL CHECK(created_at_ms >= 0),
+            created_at INTEGER GENERATED ALWAYS AS (created_at_ms / 1000) VIRTUAL,
+            UNIQUE(task_id, source_phase, pattern_key),
+            FOREIGN KEY(task_id) REFERENCES reflection_tasks(id) ON DELETE CASCADE,
+            FOREIGN KEY(source_run_id) REFERENCES runs(run_id) ON DELETE RESTRICT
+        );
         "#,
     )?;
     Ok(())

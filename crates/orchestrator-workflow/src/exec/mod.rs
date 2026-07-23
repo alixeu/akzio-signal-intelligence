@@ -6,9 +6,11 @@ use orchestrator_core::{
 };
 use orchestrator_sql::{
     archive::{upsert_run_archive, RunArchiveInput},
-    clear_agent_loop_history, connect,
+    clear_agent_loop_history, connect, pending_reflection_tasks, persist_reflection_artifact,
     prediction::{upsert_prediction, PredictionInput},
-    set_run_current_phase, update_run_status, write_run_record, RunRecordInput,
+    score_mature_predictions, set_reflection_task_status, set_run_current_phase, update_run_status,
+    upsert_decision_snapshot, write_run_record, DecisionSnapshotInput, ReflectionThresholds,
+    RunRecordInput,
 };
 use serde_json::{json, Value};
 use std::{
@@ -41,7 +43,7 @@ use crate::orchestration::policy::{
     WorkflowPolicySignals,
 };
 use crate::orchestration::render::mode_prompt_path;
-use crate::orchestration::retrieval::inject_phase0_reflection;
+use crate::orchestration::retrieval::inject_phase_summary_reflection;
 use crate::orchestration::role_jobs::{
     merge_role_job_metrics, persist_prompt_metric, prepare_role_job, record_role_job_metrics,
     run_role_jobs, run_single_role_job, run_single_steer_role_job, RoleRun, SteerRoleRun,
@@ -55,19 +57,7 @@ pub use args::*;
 type TopicDebateResult = (String, Vec<Value>, Value, Value);
 
 const PHASE2_TOPIC_FORK_USER_PROMPT: &str =
-    include_str!("../../../../prompts/phase25/messages/topic_fork_user.md");
-const PHASE2_WARMUP_INSTRUCTION: &str =
-    include_str!("../../../../prompts/phase25/messages/warmup.md");
-const PHASE2_TOPIC_FORK_REQUIREMENT: &str =
-    include_str!("../../../../prompts/phase25/messages/topic_fork_requirement.md");
-const PHASE2_SEED_PACKAGING_REQUIREMENT: &str =
-    include_str!("../../../../prompts/phase25/messages/seed_packaging.md");
-const PHASE2_CROSS_EXAMINATION_REQUIREMENT: &str =
-    include_str!("../../../../prompts/phase25/messages/cross_examination.md");
-const PHASE2_POINT_DEBATE_REQUIREMENT: &str =
-    include_str!("../../../../prompts/phase25/messages/point_debate.md");
-const PHASE3_PROBABILITY_RETRY_REQUIREMENT: &str =
-    include_str!("../../../../prompts/phase25/messages/phase3_probability_retry.md");
+    include_str!("../../../../prompts/phase2/messages/topic_fork_user.md");
 
 struct PhaseTimer {
     phase: i64,
@@ -151,6 +141,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         "ticker": ticker,
         "tickers": tickers,
         "analysis_universe": analysis_universe,
+        "investable_assets": runtime_config.allocation.investable_assets,
         "current_date": date,
         "lang": if args.lang == "zh" { config_str(&config, "orchestrator.runtime.lang", "zh") } else { args.lang.clone() },
         "mode": args.mode.as_str(),
@@ -180,7 +171,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             current_date: &date,
         },
     )?;
-    if !args.mock && runtime_config.strict_sqlite {
+    if !args.mock && runtime_config.strict_sqlite && args.to_phase >= 1 {
         debug!(
             required_contexts = ?runtime_config.required_contexts,
             "validating strict sqlite contexts"
@@ -188,12 +179,132 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         validate_sqlite_context(&conn, &runtime_config)?;
     }
 
-    // Each completed business phase is synchronously summarized by phase00 before
+    // Each completed business phase is synchronously summarized by phase_summary before
     // the next phase starts, so downstream roles always see a complete index.
     let mut compress_jobs: Vec<(i64, std::thread::JoinHandle<Result<CompressJobResult>>)> =
         Vec::new();
-    let phase00_gate = std::sync::Arc::new(orchestrator_sql::Phase00Gate::new(&run_id));
-    orchestrator_sql::register_phase00_gate(&run_id, phase00_gate.clone());
+    let phase_summary_gate = std::sync::Arc::new(orchestrator_sql::PhaseSummaryGate::new(&run_id));
+    orchestrator_sql::register_phase_summary_gate(&run_id, phase_summary_gate.clone());
+
+    if args.from_phase <= 0 && args.to_phase >= 0 {
+        debug!("phase 0 (historical reflection and experience retrieval) starting");
+        let phase_timer = start_phase_timer(0, "phase0");
+        set_run_current_phase(&mut conn, &run_id, 0)?;
+        if args.mock || !runtime_config.reflection.enabled {
+            state["phase0"] = json!({
+                "status": "skipped",
+                "reason": if args.mock { "mock_runs_never_learn" } else { "reflection_disabled" }
+            });
+            set_phase_status(&mut state, 0, "skipped");
+        } else {
+            let ai4trade_history = if runtime_config.ai4trade_token.is_some() {
+                let tool_config = orchestrator_llm::tools::ExternalToolConfig {
+                    project_root: default_project_root(),
+                    db_path: Some(db_path.clone()),
+                    run_dir: run_dir.clone(),
+                    run_id: Some(run_id.clone()),
+                    phase: Some(0),
+                    allowed_reflection_task_ids: Vec::new(),
+                    tickers: runtime_config.allocation.investable_assets.clone(),
+                    ai4trade_live: true,
+                    ai4trade_token: runtime_config.ai4trade_token.clone(),
+                    phase_summary_index: None,
+                    phase_summary_gate: None,
+                };
+                match orchestrator_llm::tools::ai4trade::get_history(&tool_config).await {
+                    Ok(history) => json!({
+                        "status": "completed",
+                        "portfolio": history.get("portfolio").cloned().unwrap_or(Value::Null),
+                        "signal_count": history.get("signals").and_then(Value::as_array).map(Vec::len),
+                        "locally_imported_execution_count": history.get("locally_imported_execution_count").cloned().unwrap_or(json!(0))
+                    }),
+                    Err(error) => {
+                        tracing::warn!(run_id, error = %error, "AI4Trade history unavailable in phase 0");
+                        json!({"status": "non_blocking_failed", "message": error.to_string()})
+                    }
+                }
+            } else {
+                json!({
+                    "status": "unconfigured",
+                    "reason": "AI4TRADE_TOKEN is not available; no registration or alternate account operation was attempted."
+                })
+            };
+            match score_mature_predictions(
+                &conn,
+                &date,
+                "1d",
+                500,
+                ReflectionThresholds {
+                    loss_return: runtime_config.reflection.loss_return,
+                    excess_return: runtime_config.reflection.excess_return,
+                    high_confidence: runtime_config.reflection.high_confidence,
+                    calibration_error: runtime_config.reflection.calibration_error,
+                    repeated_error_count: runtime_config.reflection.repeated_error_count,
+                },
+                Some(&run_id),
+                &runtime_config.reflection.reflection_version,
+                runtime_config.reflection.task_limit,
+            ) {
+                Ok(scoring) => {
+                    let tasks = pending_reflection_tasks(
+                        &conn,
+                        &run_id,
+                        runtime_config.reflection.task_limit,
+                    )?;
+                    state["phase0"] = json!({
+                        "status": "completed",
+                        "outcome_scoring": scoring,
+                        "task_limit": runtime_config.reflection.task_limit,
+                        "parallelism": runtime_config.reflection.parallelism,
+                        "ai4trade_history": ai4trade_history,
+                        "tasks": tasks,
+                        "note": "All matured outcomes receive routine review; anomaly triggers upgrade a task to deep review."
+                    });
+                    match run_phase0_reflections(
+                        &mut conn,
+                        &mut state,
+                        model_override.as_deref(),
+                        reasoning_effort_override.as_deref(),
+                        &runtime_config,
+                    )
+                    .await
+                    {
+                        Ok(result) => state["phase0"]["reflection_execution"] = result,
+                        Err(error) => {
+                            tracing::warn!(run_id, error = %error, "phase 0 reflection execution failed");
+                            state["phase0"]["reflection_execution"] = json!({
+                                "status": "non_blocking_failed",
+                                "message": error.to_string()
+                            });
+                        }
+                    }
+                    set_phase_status(&mut state, 0, "done");
+                }
+                Err(error) => {
+                    tracing::warn!(run_id, error = %error, "phase 0 scoring failed; continuing");
+                    state["phase0"] = json!({
+                        "status": "non_blocking_failed",
+                        "message": error.to_string()
+                    });
+                    set_phase_status(&mut state, 0, "non_blocking_failed");
+                }
+            }
+        }
+        record_phase_elapsed(&mut state, phase_timer);
+        debug!(status = ?state["phase_status"]["0"], "phase 0 fact collection finished");
+    }
+    if let Err(error) = inject_phase_summary_reflection(&conn, &mut state, &runtime_config) {
+        tracing::warn!(
+            run_id,
+            error = %error,
+            "experience retrieval failed; continuing without optional reflection context"
+        );
+        state["prior_memory"] = json!({
+            "enabled": false,
+            "status": "non_blocking_failed",
+            "message": error.to_string()
+        });
+    }
 
     if args.from_phase <= 1 && args.to_phase >= 1 {
         debug!(roles = ?phase1_agents, "phase 1 starting");
@@ -213,7 +324,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         compress_jobs.push((
             1,
             spawn_compress_job(
-                phase00_gate.clone(),
+                phase_summary_gate.clone(),
                 &state,
                 1,
                 model_override.as_deref(),
@@ -222,7 +333,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             ),
         ));
         await_all_compress_jobs(&mut compress_jobs, &mut state).await?;
-        debug!("phase 1 completed; phase00 compress(1) finished");
+        debug!("phase 1 completed; phase_summary compress(1) finished");
     }
     if args.from_phase <= 2 && args.to_phase >= 2 {
         // Weighting is phase 2/3 work, not phase1 organize.
@@ -259,7 +370,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         compress_jobs.push((
             2,
             spawn_compress_job(
-                phase00_gate.clone(),
+                phase_summary_gate.clone(),
                 &state,
                 2,
                 model_override.as_deref(),
@@ -268,25 +379,13 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             ),
         ));
         await_all_compress_jobs(&mut compress_jobs, &mut state).await?;
-        debug!("phase 2 completed; phase00 compress(2) finished");
-    }
-    if let Err(error) = inject_phase0_reflection(&conn, &mut state, &runtime_config) {
-        tracing::warn!(
-            run_id,
-            error = %error,
-            "prior-memory retrieval failed; continuing without optional reflection context"
-        );
-        state["prior_memory"] = json!({
-            "enabled": false,
-            "status": "non_blocking_failed",
-            "message": error.to_string()
-        });
+        debug!("phase 2 completed; phase_summary compress(2) finished");
     }
     if args.from_phase <= 3 && args.to_phase >= 3 {
-        // Phase00 has already completed for every preceding selected phase.
-        if let Some(g) = orchestrator_sql::phase00_gate(&run_id) {
+        // PhaseSummary has already completed for every preceding selected phase.
+        if let Some(g) = orchestrator_sql::phase_summary_gate(&run_id) {
             if !g.has_inflight() {
-                state["phase00_memory"] = g.snapshot().to_state_value();
+                state["phase_summary_memory"] = g.snapshot().to_state_value();
             }
         }
         materialize_weighted_probability_base(&mut state);
@@ -306,7 +405,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         compress_jobs.push((
             3,
             spawn_compress_job(
-                phase00_gate.clone(),
+                phase_summary_gate.clone(),
                 &state,
                 3,
                 model_override.as_deref(),
@@ -315,7 +414,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             ),
         ));
         await_all_compress_jobs(&mut compress_jobs, &mut state).await?;
-        debug!("phase 3 completed; phase00 compress(3) finished");
+        debug!("phase 3 completed; phase_summary compress(3) finished");
     }
     let policy = if state.get("research_plan").is_some() {
         Some(apply_workflow_policy(&mut state, &conn, &runtime_config)?)
@@ -345,7 +444,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         compress_jobs.push((
             4,
             spawn_compress_job(
-                phase00_gate.clone(),
+                phase_summary_gate.clone(),
                 &state,
                 4,
                 model_override.as_deref(),
@@ -354,7 +453,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             ),
         ));
         await_all_compress_jobs(&mut compress_jobs, &mut state).await?;
-        debug!("phase 4 (trader) completed; phase00 compress(4) finished");
+        debug!("phase 4 (trader) completed; phase_summary compress(4) finished");
     }
     if args.from_phase <= 5 && args.to_phase >= 5 {
         debug!("phase 5 (risk debate) starting");
@@ -379,7 +478,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         compress_jobs.push((
             5,
             spawn_compress_job(
-                phase00_gate.clone(),
+                phase_summary_gate.clone(),
                 &state,
                 5,
                 model_override.as_deref(),
@@ -388,7 +487,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             ),
         ));
         await_all_compress_jobs(&mut compress_jobs, &mut state).await?;
-        debug!("phase 5 (risk debate) completed; phase00 compress(5) finished");
+        debug!("phase 5 (risk debate) completed; phase_summary compress(5) finished");
     }
     if args.from_phase <= 6 && args.to_phase >= 6 {
         debug!("phase 6 (portfolio manager) starting");
@@ -413,7 +512,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         compress_jobs.push((
             6,
             spawn_compress_job(
-                phase00_gate.clone(),
+                phase_summary_gate.clone(),
                 &state,
                 6,
                 model_override.as_deref(),
@@ -422,7 +521,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             ),
         ));
         await_all_compress_jobs(&mut compress_jobs, &mut state).await?;
-        debug!("phase 6 (portfolio manager) completed; phase00 compress(6) finished");
+        debug!("phase 6 (portfolio manager) completed; phase_summary compress(6) finished");
     }
     if args.from_phase <= 7 && args.to_phase >= 7 {
         debug!("phase 7 (allocation) starting");
@@ -441,7 +540,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         compress_jobs.push((
             7,
             spawn_compress_job(
-                phase00_gate.clone(),
+                phase_summary_gate.clone(),
                 &state,
                 7,
                 model_override.as_deref(),
@@ -450,7 +549,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             ),
         ));
         await_all_compress_jobs(&mut compress_jobs, &mut state).await?;
-        debug!("phase 7 (allocation) completed; phase00 compress(7) finished");
+        debug!("phase 7 (allocation) completed; phase_summary compress(7) finished");
     }
     if args.from_phase <= 8 && args.to_phase >= 8 {
         debug!("phase 8 (archive + predict) starting");
@@ -477,12 +576,12 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
     await_all_compress_jobs(&mut compress_jobs, &mut state).await?;
 
     // Idempotent insurance: each phase is already persisted before its gate completes.
-    let phase00_flushed =
-        crate::orchestration::compress::flush_phase00_to_sqlite(&conn, &mut state)?;
-    orchestrator_sql::unregister_phase00_gate(&run_id);
+    let phase_summary_flushed =
+        crate::orchestration::compress::flush_phase_summary_to_sqlite(&conn, &mut state)?;
+    orchestrator_sql::unregister_phase_summary_gate(&run_id);
     debug!(
-        phase00_flushed,
-        "phase00 memory flushed to sqlite at run end"
+        phase_summary_flushed,
+        "phase_summary memory flushed to sqlite at run end"
     );
 
     update_run_status(&mut conn, &run_id, "completed", None)?;
@@ -547,6 +646,110 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
     Ok(result)
 }
 
+async fn run_phase0_reflections(
+    conn: &mut rusqlite::Connection,
+    state: &mut Value,
+    model_override: Option<&str>,
+    reasoning_effort_override: Option<&str>,
+    config: &RuntimeConfig,
+) -> Result<Value> {
+    let tasks = state
+        .pointer("/phase0/tasks")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if tasks.is_empty() {
+        return Ok(json!({"status": "completed", "processed": 0, "failed": 0}));
+    }
+    let prompt_path = config
+        .prompts
+        .path_for("reflector.historical")
+        .context("missing prompt path for reflector.historical")?;
+    let mut jobs = Vec::new();
+    for task in &tasks {
+        let task_id = task
+            .get("task_id")
+            .and_then(Value::as_i64)
+            .context("phase0 task_id is required")?;
+        set_reflection_task_status(conn, task_id, "running", None)?;
+        let mut task_state = state.clone();
+        task_state["reflection_task"] = task.clone();
+        task_state["phase0"]["tasks"] = json!([task]);
+        jobs.push(prepare_role_job(RoleRun {
+            state: task_state,
+            role: "reflector.historical",
+            phase: 0,
+            kind: "historical_reflection",
+            round: None,
+            topic_id: Some(&task_id.to_string()),
+            mock: false,
+            model_override,
+            reasoning_effort_override,
+            config,
+            prompt_path: Some(prompt_path),
+        })?);
+    }
+    let results = run_role_jobs(
+        jobs,
+        config.reflection.parallelism,
+        config.workflow.agent_timeout_sec,
+    )
+    .await;
+    let mut processed = 0;
+    let mut failed = 0;
+    let mut audit = Vec::new();
+    for result in results {
+        let task_id = result
+            .topic_id
+            .as_deref()
+            .and_then(|value| value.parse::<i64>().ok())
+            .context("reflector result is missing task id")?;
+        if let Some(artifact) = result.artifact {
+            match persist_reflection_artifact(
+                conn,
+                task_id,
+                &config.reflection.reflection_version,
+                &artifact,
+            ) {
+                Ok(experience_count) => {
+                    processed += 1;
+                    audit.push(json!({
+                        "task_id": task_id,
+                        "status": "completed",
+                        "experience_count": experience_count
+                    }));
+                }
+                Err(error) => {
+                    failed += 1;
+                    set_reflection_task_status(conn, task_id, "failed", Some(&error.to_string()))?;
+                    audit.push(json!({
+                        "task_id": task_id,
+                        "status": "failed_validation",
+                        "message": error.to_string()
+                    }));
+                }
+            }
+        } else {
+            failed += 1;
+            let message = result
+                .error
+                .unwrap_or_else(|| "reflector returned no artifact".to_string());
+            set_reflection_task_status(conn, task_id, "failed", Some(&message))?;
+            audit.push(json!({
+                "task_id": task_id,
+                "status": "failed",
+                "message": message
+            }));
+        }
+    }
+    Ok(json!({
+        "status": if failed == 0 { "completed" } else { "completed_with_failures" },
+        "processed": processed,
+        "failed": failed,
+        "tasks": audit
+    }))
+}
+
 fn persist_run_outputs(run_dir: &Path, state_path: &Path, state: &Value) -> Result<()> {
     fs::create_dir_all(run_dir)
         .with_context(|| format!("failed to create run dir {}", run_dir.display()))?;
@@ -573,8 +776,8 @@ fn validate_args(args: &ExecArgs) -> Result<()> {
             bail!("--max-topics-per-side must be >= 1");
         }
     }
-    if args.from_phase < 1 || args.from_phase > 8 {
-        bail!("--from-phase must be 1-8");
+    if args.from_phase < 0 || args.from_phase > 8 {
+        bail!("--from-phase must be 0-8");
     }
     if args.to_phase < args.from_phase || args.to_phase > 8 {
         bail!("--to-phase must be between --from-phase and 8");
@@ -962,8 +1165,7 @@ fn phase3_probability_retry_state(state: &Value, violations: &[Value]) -> Value 
             "status": "previous_manager_probability_rejected",
             "base_long_probability": violation.get("base_long_probability").cloned().unwrap_or(Value::Null),
             "proposed_long_probability": violation.get("proposed_long_probability").cloned().unwrap_or(Value::Null),
-            "delta": violation.get("delta").cloned().unwrap_or(Value::Null),
-            "requirement": PHASE3_PROBABILITY_RETRY_REQUIREMENT.trim()
+            "delta": violation.get("delta").cloned().unwrap_or(Value::Null)
         });
     }
     retry_state
@@ -1333,21 +1535,30 @@ async fn run_phase2(
         .map(|s| s.to_string())
         .context("db_path missing from state")?;
 
-    // Prewarm both side-specific long sessions while Rust selects material conflicts.
-    // Each topic then forks from the corresponding persisted warmup turn.
+    // Start topic generation and both side-specific warmups together. Each topic
+    // later forks Bull/Bear from its side warmup and Controller from topic generation.
     let model_override_owned = model_override.map(|s| s.to_string());
     let reasoning_effort_override_owned = reasoning_effort_override.map(|s| s.to_string());
     let topic_db_path = db_path.clone();
     let mut topic_state = state.clone();
-    let warmup_state = state.clone();
+    topic_state["role_job_metrics"] = json!([]);
+    let mut warmup_state = state.clone();
+    warmup_state["role_job_metrics"] = json!([]);
+    let topic_config = config.clone();
+    let topic_model_override = model_override_owned.clone();
+    let topic_reasoning_override = reasoning_effort_override_owned.clone();
     let (topics_result, warmup_result) = tokio::join!(
         async move {
-            // Let both warmup futures reach their first LLM await before the
-            // short synchronous Rust conflict-selection pass runs.
-            tokio::task::yield_now().await;
             let mut topic_conn = orchestrator_sql::connect(&topic_db_path)
                 .with_context(|| format!("topic-gen connect {topic_db_path}"))?;
-            let topics = run_phase2_topic_generation(&mut topic_conn, &mut topic_state)?;
+            let topics = run_phase2_topic_generation(
+                &mut topic_conn,
+                &mut topic_state,
+                topic_model_override.as_deref(),
+                topic_reasoning_override.as_deref(),
+                &topic_config,
+            )
+            .await?;
             Ok::<_, anyhow::Error>((topics, topic_state))
         },
         run_phase2_side_warmups(
@@ -1359,10 +1570,17 @@ async fn run_phase2(
     );
     let (topics, topic_state) = topics_result?;
     let (warmup, warmup_metrics) = warmup_result?;
-    for key in ["topic_generation_artifact", "debate_topics"] {
+    for key in [
+        "topic_generation_artifact",
+        "topic_generation_turn_id",
+        "debate_topics",
+    ] {
         if let Some(value) = topic_state.get(key) {
             state[key] = value.clone();
         }
+    }
+    if let Some(metrics) = topic_state.get("role_job_metrics") {
+        merge_role_job_metrics(state, metrics);
     }
     state["phase2_warmup"] = warmup;
     merge_role_job_metrics(state, &warmup_metrics);
@@ -1372,7 +1590,7 @@ async fn run_phase2(
         .collect::<Vec<_>>();
     debug!(
         topic_count = topics.len(),
-        "phase 2 deterministic conflict topics and side warmups ready"
+        "phase 2 topic generation and side warmups ready"
     );
     state["debate_turns"] = json!([]);
 
@@ -1407,10 +1625,11 @@ async fn run_phase2(
         "run_dir": state.get("run_dir").cloned().unwrap_or(Value::Null),
         "phase1_index": state.get("phase1_index").cloned().unwrap_or(Value::Null),
         "phase1_brief_md": state.get("phase1_brief_md").cloned().unwrap_or(Value::Null),
-        "phase00_tables": state.get("phase00_tables").cloned().unwrap_or_else(|| json!({})),
-        "phase00_memory": state.get("phase00_memory").cloned().unwrap_or_else(|| json!({})),
+        "phase_summary_tables": state.get("phase_summary_tables").cloned().unwrap_or_else(|| json!({})),
+        "phase_summary_memory": state.get("phase_summary_memory").cloned().unwrap_or_else(|| json!({})),
         "phase_compress": state.get("phase_compress").cloned().unwrap_or_else(|| json!({})),
         "phase2_warmup": state.get("phase2_warmup").cloned().unwrap_or(Value::Null),
+        "topic_generation_turn_id": state.get("topic_generation_turn_id").cloned().unwrap_or(Value::Null),
         "common_ground": common_ground,
         "late_evidence": state.get("late_evidence").cloned().unwrap_or_else(|| json!([])),
         "degraded": state.get("degraded").cloned().unwrap_or(Value::Null),
@@ -1537,22 +1756,24 @@ async fn run_phase2_side_warmups(
         ));
     }
 
-    let (bull, bull_metrics) = run_phase2_side_warmup(
-        state.clone(),
-        "bull",
-        model_override,
-        reasoning_effort_override,
-        config,
-    )
-    .await?;
-    let (bear, bear_metrics) = run_phase2_side_warmup(
-        state,
-        "bear",
-        model_override,
-        reasoning_effort_override,
-        config,
-    )
-    .await?;
+    let (bull_result, bear_result) = tokio::join!(
+        run_phase2_side_warmup(
+            state.clone(),
+            "bull",
+            model_override,
+            reasoning_effort_override,
+            config,
+        ),
+        run_phase2_side_warmup(
+            state,
+            "bear",
+            model_override,
+            reasoning_effort_override,
+            config,
+        )
+    );
+    let (bull, bull_metrics) = bull_result?;
+    let (bear, bear_metrics) = bear_result?;
     let mut metrics = Vec::new();
     if let Some(items) = bull_metrics.as_array() {
         metrics.extend(items.iter().cloned());
@@ -1620,8 +1841,7 @@ async fn run_phase2_side_warmup(
                 steer: Some(steer_payload(
                     "warmup",
                     &json!({
-                        "allow_ready": true,
-                        "instruction": PHASE2_WARMUP_INSTRUCTION.trim()
+                        "allow_ready": true
                     }),
                 )),
             },
@@ -1704,8 +1924,7 @@ async fn run_one_topic_debate(
         &json!({
             "user_message": topic_fork_user_message(&topic, &common_ground),
             "common_ground": common_ground,
-            "topic": topic,
-            "requirement": PHASE2_TOPIC_FORK_REQUIREMENT.trim()
+            "topic": topic
         }),
     ));
 
@@ -1761,7 +1980,6 @@ async fn run_one_topic_debate(
         Some(steer_payload(
             "seed_claims",
             &json!({
-                "requirement": PHASE2_SEED_PACKAGING_REQUIREMENT.trim(),
                 "bull_seed": compact_debate_turn(&latest_bull),
                 "bear_seed": compact_debate_turn(&latest_bear)
             }),
@@ -1842,7 +2060,6 @@ async fn run_one_topic_debate(
             Some(steer_payload(
                 "debater_packets",
                 &json!({
-                    "requirement": PHASE2_CROSS_EXAMINATION_REQUIREMENT.trim(),
                     "bull_packet": compact_debate_turn(&latest_bull),
                     "bear_packet": compact_debate_turn(&latest_bear)
                 }),
@@ -1952,10 +2169,21 @@ fn fork_source_turn_id(state: &Value, topic_id: &str, role: &str) -> Option<Stri
     if role.contains("bear.interaction") {
         return Some(format!("turn-{topic_id}-bear-initial"));
     }
+    if role == "mediator.topic_controller" {
+        return state
+            .get("topic_generation_turn_id")?
+            .as_str()
+            .filter(|turn_id| !turn_id.is_empty())
+            .map(ToString::to_string);
+    }
     None
 }
 
-fn attach_fork_source(steer: Option<String>, source_turn_id: Option<String>) -> Option<String> {
+fn attach_fork_source(
+    steer: Option<String>,
+    source_turn_id: Option<String>,
+    include_prompt_on_fork: bool,
+) -> Option<String> {
     let steer = steer?;
     let Some(source_turn_id) = source_turn_id else {
         return Some(steer);
@@ -1964,6 +2192,9 @@ fn attach_fork_source(steer: Option<String>, source_turn_id: Option<String>) -> 
         return Some(steer);
     };
     value["fork_from_turn_id"] = Value::String(source_turn_id);
+    if include_prompt_on_fork {
+        value["include_prompt_on_fork"] = Value::Bool(true);
+    }
     Some(value.to_string())
 }
 
@@ -1982,7 +2213,11 @@ async fn run_topic_steer_step(
     config: &RuntimeConfig,
     prompt_path: PathBuf,
 ) -> Result<Value> {
-    let steer = attach_fork_source(steer, fork_source_turn_id(state, topic_id, role));
+    let steer = attach_fork_source(
+        steer,
+        fork_source_turn_id(state, topic_id, role),
+        role == "mediator.topic_controller",
+    );
     let session_key = if role.contains("bull") {
         "bull"
     } else if role.contains("bear") {
@@ -2078,7 +2313,6 @@ fn build_point_debate_steer(
     json!({
         "kind": "point_debate",
         "side": side,
-        "requirement": PHASE2_POINT_DEBATE_REQUIREMENT.trim(),
         "mediator_instruction": mediator_instruction,
         "opponent_packet": opponent_packet,
         "opponent_claims_to_address": opponent_claims,
@@ -2218,11 +2452,54 @@ fn compact_debate_artifact(artifact: &Value) -> Value {
     )
 }
 
-fn run_phase2_topic_generation(
+async fn run_phase2_topic_generation(
     conn: &mut rusqlite::Connection,
     state: &mut Value,
+    model_override: Option<&str>,
+    reasoning_effort_override: Option<&str>,
+    config: &RuntimeConfig,
 ) -> Result<Vec<Value>> {
-    let artifact = build_topic_generation_artifact(state);
+    let baseline = build_topic_generation_artifact(state);
+    let mut artifact = baseline.clone();
+    if !is_mock(state) {
+        let prompt_path = config
+            .prompts
+            .path_for("mediator.topic")
+            .context("missing mediator.topic prompt path")?
+            .clone();
+        let job = prepare_role_job(RoleRun {
+            state: state.clone(),
+            role: "mediator.topic",
+            phase: 2,
+            kind: "topic_generation",
+            round: None,
+            topic_id: None,
+            mock: false,
+            model_override,
+            reasoning_effort_override,
+            config,
+            prompt_path: Some(prompt_path.as_path()),
+        })?;
+        let result = run_role_jobs(vec![job], 1, config.workflow.reducer_timeout_sec)
+            .await
+            .into_iter()
+            .next()
+            .context("mediator.topic returned no role result")?;
+        let turn_id = result.turn_id.clone();
+        persist_prompt_metric(conn, &result);
+        record_role_job_metrics(state, &result);
+        let generated = role_artifact_or_degraded(state, config, result)?;
+        if generated.get("artifact_type").and_then(Value::as_str)
+            == Some("phase2_topic_generation_artifact")
+        {
+            artifact = merge_topic_generation_output(&baseline, &generated);
+            if !turn_id.is_empty() {
+                state["topic_generation_turn_id"] = Value::String(turn_id);
+            }
+        } else {
+            tracing::warn!("mediator.topic degraded; using deterministic topic fallback");
+        }
+    }
     state["topic_generation_artifact"] = artifact.clone();
     let topics = topics_from_generation_artifact(&artifact);
     if topics.is_empty() {
@@ -2236,7 +2513,7 @@ fn run_phase2_topic_generation(
             None,
             artifact,
         )?;
-        debug!("phase 2 debate skipped by deterministic conflict gate");
+        debug!("phase 2 debate skipped by topic-generation gate");
         return Ok(Vec::new());
     }
     state["debate_topics"] = Value::Array(topics.clone());
@@ -2249,8 +2526,54 @@ fn run_phase2_topic_generation(
         None,
         artifact,
     )?;
-    debug!(topic_count = topics.len(), "Rust conflict topics generated");
+    debug!(topic_count = topics.len(), "phase 2 topics generated");
     Ok(topics)
+}
+
+fn merge_topic_generation_output(baseline: &Value, generated: &Value) -> Value {
+    let mut artifact = baseline.clone();
+    for field in ["common_ground", "summary", "reducer_checks"] {
+        if let Some(value) = generated.get(field) {
+            artifact[field] = value.clone();
+        }
+    }
+    if baseline.get("evidence_actionable").and_then(Value::as_bool) == Some(true) {
+        artifact["topics"] = generated
+            .get("topics")
+            .cloned()
+            .unwrap_or_else(|| json!([]));
+    }
+    let topic_count = artifact
+        .get("topics")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or_default();
+    let ticker_count = artifact
+        .get("generated_from")
+        .and_then(|value| value.get("tickers"))
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(1)
+        .max(1);
+    let evidence_actionable =
+        baseline.get("evidence_actionable").and_then(Value::as_bool) == Some(true);
+    let actionable = topic_count > 0;
+    artifact["status"] = json!(if actionable { "ready" } else { "skipped" });
+    artifact["actionable"] = json!(actionable);
+    artifact["debate_required"] = json!(actionable);
+    artifact["skip_reason"] = if actionable {
+        Value::Null
+    } else if !evidence_actionable {
+        baseline
+            .get("skip_reason")
+            .cloned()
+            .unwrap_or_else(|| json!("phase1_evidence_insufficient"))
+    } else {
+        json!("no_material_cross_analyst_conflict")
+    };
+    artifact["material_conflict_count"] = json!(topic_count);
+    artifact["conflict_score"] = json!((topic_count as f64 / ticker_count as f64).clamp(0.0, 1.0));
+    artifact
 }
 
 /// Deterministic Phase 1 index: weighted base, conflicts, evidence_quality.
@@ -2297,7 +2620,7 @@ async fn run_phase2_final_reducer(
 struct CompressJobResult {
     source_phase: i64,
     written: usize,
-    batch: orchestrator_sql::Phase00PhaseBatch,
+    batch: orchestrator_sql::PhaseSummaryPhaseBatch,
     debug_enabled: bool,
     role_metrics: Value,
 }
@@ -2314,15 +2637,15 @@ async fn compress_phase_job(
         crate::orchestration::compress::build_phase_compress(&state, source_phase)?
     } else {
         let source_payload =
-            crate::orchestration::compress::phase00_source_payload(&state, source_phase)?;
+            crate::orchestration::compress::phase_summary_source_payload(&state, source_phase)?;
         let prompt_path = config
             .prompts
-            .path_for("compressor.phase00")
-            .context("missing compressor.phase00 prompt path")?
+            .path_for("compressor.phase_summary")
+            .context("missing compressor.phase_summary prompt path")?
             .clone();
         let mut job = prepare_role_job(RoleRun {
             state: state.clone(),
-            role: "compressor.phase00",
+            role: "compressor.phase_summary",
             phase: 0,
             kind: "phase_summary",
             round: Some(source_phase),
@@ -2351,36 +2674,40 @@ async fn compress_phase_job(
             state
                 .get("db_path")
                 .and_then(Value::as_str)
-                .context("db_path missing for phase00 compressor")?,
+                .context("db_path missing for phase_summary compressor")?,
         )?;
         let result = run_role_jobs(vec![job], 1, config.workflow.agent_timeout_sec)
             .await
             .into_iter()
             .next()
-            .context("phase00 compressor returned no role result")?;
+            .context("phase_summary compressor returned no role result")?;
         persist_prompt_metric(&conn, &result);
         record_role_job_metrics(&mut state, &result);
         if let Some(error) = result.error.as_deref() {
-            bail!("phase00 compressor failed for phase {source_phase}: {error}");
+            bail!("phase_summary compressor failed for phase {source_phase}: {error}");
         }
         let artifact = result
             .artifact
             .as_ref()
-            .context("phase00 compressor returned no artifact")?;
-        crate::orchestration::compress::phase00_bundle_to_batch(&state, source_phase, artifact)?
+            .context("phase_summary compressor returned no artifact")?;
+        crate::orchestration::compress::phase_summary_bundle_to_batch(
+            &state,
+            source_phase,
+            artifact,
+        )?
     };
     let written = batch.written();
     let conn = orchestrator_sql::connect(
         state
             .get("db_path")
             .and_then(Value::as_str)
-            .context("db_path missing for phase00 persistence")?,
+            .context("db_path missing for phase_summary persistence")?,
     )?;
     let run_id = state
         .get("run_id")
         .and_then(Value::as_str)
-        .context("run_id missing for phase00 persistence")?;
-    orchestrator_sql::persist_phase00_batch(&conn, run_id, &batch)?;
+        .context("run_id missing for phase_summary persistence")?;
+    orchestrator_sql::persist_phase_summary_batch(&conn, run_id, &batch)?;
     let role_metrics = state
         .get("role_job_metrics")
         .and_then(Value::as_array)
@@ -2399,9 +2726,9 @@ async fn compress_phase_job(
 
 fn apply_compress_result(state: &mut Value, result: CompressJobResult) -> Result<()> {
     merge_role_job_metrics(state, &result.role_metrics);
-    let snapshot = crate::orchestration::compress::apply_phase00_batch(state, result.batch)?;
+    let snapshot = crate::orchestration::compress::apply_phase_summary_batch(state, result.batch)?;
     state["phase_compress"][result.source_phase.to_string()]["persisted"] = json!(true);
-    state["phase00_tables"][result.source_phase.to_string()]["persisted"] = json!(true);
+    state["phase_summary_tables"][result.source_phase.to_string()]["persisted"] = json!(true);
     if result.debug_enabled {
         let role = format!("compressor.after_phase_{}", result.source_phase);
         record_local_debug_artifact(state, 0, &role, &snapshot)?;
@@ -2409,7 +2736,7 @@ fn apply_compress_result(state: &mut Value, result: CompressJobResult) -> Result
     debug!(
         source_phase = result.source_phase,
         written = result.written,
-        "phase00 compress applied to memory state"
+        "phase_summary compress applied to memory state"
     );
     Ok(())
 }
@@ -2417,7 +2744,7 @@ fn apply_compress_result(state: &mut Value, result: CompressJobResult) -> Result
 /// Spawn phase-00 after a business phase. The caller awaits the result before
 /// starting the next phase, while the gate remains available to role tools.
 fn spawn_compress_job(
-    gate: std::sync::Arc<orchestrator_sql::Phase00Gate>,
+    gate: std::sync::Arc<orchestrator_sql::PhaseSummaryGate>,
     state: &Value,
     source_phase: i64,
     model_override: Option<&str>,
@@ -2614,7 +2941,12 @@ async fn run_phase3(
             model_override,
             reasoning_effort_override,
             config,
-            prompt_path: Some(config.prompts.manager_research.as_path()),
+            prompt_path: Some(
+                config
+                    .prompts
+                    .path_for("manager.research")
+                    .context("missing prompt path for manager.research")?,
+            ),
         },
         config.workflow.agent_timeout_sec,
         config,
@@ -2661,7 +2993,12 @@ async fn run_phase3(
                 model_override,
                 reasoning_effort_override,
                 config,
-                prompt_path: Some(config.prompts.manager_research.as_path()),
+                prompt_path: Some(
+                    config
+                        .prompts
+                        .path_for("manager.research")
+                        .context("missing prompt path for manager.research")?,
+                ),
             },
             config.workflow.agent_timeout_sec,
             config,
@@ -3035,7 +3372,12 @@ async fn run_phase4(
             model_override,
             reasoning_effort_override,
             config,
-            prompt_path: Some(config.prompts.trader.as_path()),
+            prompt_path: Some(
+                config
+                    .prompts
+                    .path_for("trader")
+                    .context("missing prompt path for trader")?,
+            ),
         },
         config.workflow.agent_timeout_sec,
         config,
@@ -3094,7 +3436,12 @@ async fn run_phase5(
                 model_override,
                 reasoning_effort_override,
                 config,
-                prompt_path: Some(config.prompts.risk_conservative.as_path()),
+                prompt_path: Some(
+                    config
+                        .prompts
+                        .path_for(risk_role)
+                        .with_context(|| format!("missing prompt path for {risk_role}"))?,
+                ),
             })?],
             1,
             config.workflow.agent_timeout_sec,
@@ -3174,7 +3521,12 @@ async fn run_phase6(
             model_override,
             reasoning_effort_override,
             config,
-            prompt_path: Some(config.prompts.portfolio_manager.as_path()),
+            prompt_path: Some(
+                config
+                    .prompts
+                    .path_for("portfolio.manager")
+                    .context("missing prompt path for portfolio.manager")?,
+            ),
         },
         config.workflow.agent_timeout_sec,
         config,
@@ -3269,48 +3621,101 @@ fn run_phase8(
         },
     )?;
 
+    let learning_eligible = !is_mock(state);
+    state["phase8_learning_eligible"] = Value::Bool(learning_eligible);
     let mut written_predictions = 0usize;
-    let window_days = state
-        .get("window_days")
-        .and_then(Value::as_i64)
-        .unwrap_or(5);
-    for item_ticker in tickers_from_state(state) {
-        if let Some(decision) = research_decision_for_ticker(&research_plan, &item_ticker) {
-            let long_probability = decision.get("long_probability").and_then(Value::as_f64);
-            let short_probability = decision.get("short_probability").and_then(Value::as_f64);
-            if let (Some(long_probability), Some(short_probability)) =
-                (long_probability, short_probability)
-            {
-                upsert_prediction(
-                    &tx,
-                    &PredictionInput {
-                        run_id: run_id.clone(),
-                        ticker: item_ticker.clone(),
-                        prediction_date: prediction_date.clone(),
-                        long_probability,
-                        short_probability,
-                        rating: decision
-                            .get("rating")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string(),
-                        window_days,
-                        market_regime_json: market_regime_json.clone(),
-                        agent_probabilities_json: agent_probabilities_for_ticker(
-                            state,
-                            &item_ticker,
-                        ),
-                        weighted_base_probability: weighted_base_probability_for_ticker(
-                            state,
-                            &item_ticker,
-                        ),
-                    },
-                )?;
-                written_predictions += 1;
+    // Prediction maturity is fixed in trading bars and is intentionally
+    // independent from the market-data retrieval window.
+    let window_days = 3;
+    if learning_eligible {
+        for item_ticker in tickers_from_state(state) {
+            if let Some(decision) = research_decision_for_ticker(&research_plan, &item_ticker) {
+                let long_probability = decision.get("long_probability").and_then(Value::as_f64);
+                let short_probability = decision.get("short_probability").and_then(Value::as_f64);
+                if let (Some(long_probability), Some(short_probability)) =
+                    (long_probability, short_probability)
+                {
+                    upsert_prediction(
+                        &tx,
+                        &PredictionInput {
+                            run_id: run_id.clone(),
+                            ticker: item_ticker.clone(),
+                            prediction_date: prediction_date.clone(),
+                            long_probability,
+                            short_probability,
+                            rating: decision
+                                .get("rating")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string(),
+                            window_days,
+                            market_regime_json: market_regime_json.clone(),
+                            agent_probabilities_json: agent_probabilities_for_ticker(
+                                state,
+                                &item_ticker,
+                            ),
+                            weighted_base_probability: weighted_base_probability_for_ticker(
+                                state,
+                                &item_ticker,
+                            ),
+                        },
+                    )?;
+                    let final_decision = state
+                        .get("final_trade_decision")
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    let trader_action = state
+                        .get("trader_investment_plan")
+                        .and_then(|value| value.get("action"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("Hold");
+                    let linked_signal_id = final_decision
+                        .get("signal_id")
+                        .and_then(Value::as_i64)
+                        .map(|value| value.to_string())
+                        .or_else(|| {
+                            final_decision
+                                .get("signal_id")
+                                .and_then(Value::as_str)
+                                .map(str::to_string)
+                        })
+                        .or_else(|| {
+                            tx.query_row(
+                                r#"
+                                SELECT signal_id FROM ai4trade_executions
+                                WHERE run_id=?1 AND ticker=?2 AND signal_id IS NOT NULL
+                                ORDER BY executed_at_ms DESC LIMIT 1
+                                "#,
+                                rusqlite::params![run_id, item_ticker],
+                                |row| row.get::<_, String>(0),
+                            )
+                            .ok()
+                        });
+                    upsert_decision_snapshot(
+                        &tx,
+                        &DecisionSnapshotInput {
+                            run_id: run_id.clone(),
+                            ticker: item_ticker.clone(),
+                            action: trader_action.to_string(),
+                            decision_date: prediction_date.clone(),
+                            position_id: linked_signal_id,
+                            long_probability: Some(long_probability),
+                            short_probability: Some(short_probability),
+                            decision_json: json!({
+                                "research_decision": decision,
+                                "trader_action": trader_action,
+                                "final_trade_decision": final_decision,
+                                "counterfactual": trader_action.eq_ignore_ascii_case("hold"),
+                                "note": "A three-trading-day decision snapshot; it does not force a trade or close an existing position."
+                            }),
+                        },
+                    )?;
+                    written_predictions += 1;
+                }
             }
         }
     }
-    if written_predictions == 0 {
+    if learning_eligible && written_predictions == 0 {
         state["degraded"] = Value::Bool(true);
         state["phase8_warning"] = json!("no complete ticker probabilities found in research_plan");
     }
@@ -3489,9 +3894,19 @@ mod tests {
         assert!(settings
             .tools
             .contains(&"read_technical_context".to_string()));
-        for role in ["trader", "risk.conservative", "portfolio.manager"] {
-            assert!(roles[role].tools.is_empty(), "role={role}");
+        assert!(settings.tools.contains(&"read_experience".to_string()));
+        for role in ["trader", "risk.conservative"] {
+            assert_eq!(roles[role].tools, vec!["read_experience"], "role={role}");
         }
+        assert_eq!(
+            roles["portfolio.manager"].tools,
+            vec![
+                "read_experience".to_string(),
+                "ai4trade_get_portfolio".to_string(),
+                "ai4trade_get_price".to_string(),
+                "ai4trade_submit_trade".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -4299,4 +4714,17 @@ fn point_debate_steer_embeds_opponent_claims() {
         .and_then(Value::as_str)
         .unwrap_or("")
         .contains("rebut"));
+}
+
+#[test]
+fn topic_controller_forks_from_topic_generation_with_its_own_prompt() {
+    let state = json!({"topic_generation_turn_id": "turn-topic-root"});
+    let source = fork_source_turn_id(&state, "QQQ-volatility", "mediator.topic_controller");
+    let steer: Value = serde_json::from_str(
+        &attach_fork_source(Some(steer_payload("seed_claims", &json!({}))), source, true).unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(steer["fork_from_turn_id"], "turn-topic-root");
+    assert_eq!(steer["include_prompt_on_fork"], true);
 }

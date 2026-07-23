@@ -1,13 +1,6 @@
-use anyhow::{Context, Result};
-use chrono::{Duration, NaiveDate};
-use orchestrator_sql::{
-    outcome::{
-        earliest_close_on_or_after, latest_close_on_or_before, upsert_outcome, OutcomeInput,
-    },
-    prediction::expired_unscored_predictions,
-};
+use anyhow::Result;
+use orchestrator_sql::{score_mature_predictions, ReflectionScoreSummary, ReflectionThresholds};
 use rusqlite::Connection;
-use serde::Serialize;
 
 #[derive(Debug, Clone)]
 pub struct ScoreOptions {
@@ -16,74 +9,19 @@ pub struct ScoreOptions {
     pub interval: String,
 }
 
-#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
-pub struct ScoreSummary {
-    pub scored: usize,
-    pub skipped: usize,
-    pub errors: usize,
-}
+pub type ScoreSummary = ReflectionScoreSummary;
 
 pub fn score_predictions(conn: &Connection, options: &ScoreOptions) -> Result<ScoreSummary> {
-    let predictions = expired_unscored_predictions(conn, &options.as_of, options.limit)?;
-    let mut summary = ScoreSummary::default();
-
-    for prediction in predictions {
-        let target_date = match add_days(&prediction.prediction_date, prediction.window_days) {
-            Ok(date) => date,
-            Err(_) => {
-                summary.errors += 1;
-                continue;
-            }
-        };
-        let Some((_, baseline_close)) = latest_close_on_or_before(
-            conn,
-            &prediction.ticker,
-            &prediction.prediction_date,
-            &options.interval,
-        )?
-        else {
-            summary.skipped += 1;
-            continue;
-        };
-        let Some((outcome_date, outcome_close)) =
-            earliest_close_on_or_after(conn, &prediction.ticker, &target_date, &options.interval)?
-        else {
-            summary.skipped += 1;
-            continue;
-        };
-
-        let actual_return = (outcome_close - baseline_close) / baseline_close;
-        let predicted_long = prediction.long_probability >= prediction.short_probability;
-        let actual_long = actual_return >= 0.0;
-        let probability_error = prediction.long_probability - if actual_long { 1.0 } else { 0.0 };
-
-        upsert_outcome(
-            conn,
-            &OutcomeInput {
-                prediction_id: prediction.id,
-                run_id: prediction.run_id,
-                ticker: prediction.ticker,
-                prediction_date: prediction.prediction_date,
-                outcome_date,
-                window_days: prediction.window_days,
-                baseline_close,
-                outcome_close,
-                actual_return,
-                direction_correct: predicted_long == actual_long,
-                probability_error,
-            },
-        )?;
-        summary.scored += 1;
-    }
-
-    Ok(summary)
-}
-
-fn add_days(date: &str, days: i64) -> Result<String> {
-    let date = date.get(..10).unwrap_or(date);
-    let parsed = NaiveDate::parse_from_str(date, "%Y-%m-%d")
-        .with_context(|| format!("invalid prediction date {date}"))?;
-    Ok((parsed + Duration::days(days)).to_string())
+    score_mature_predictions(
+        conn,
+        &options.as_of,
+        &options.interval,
+        options.limit,
+        ReflectionThresholds::default(),
+        None,
+        "v1",
+        10,
+    )
 }
 
 #[cfg(test)]
@@ -106,13 +44,23 @@ mod tests {
             &mut conn,
             temp.path(),
             "QQQ",
-            &[("2026-01-01", 100.0), ("2026-01-06", 105.0)],
+            &[
+                ("2026-01-01", 100.0),
+                ("2026-01-02", 101.0),
+                ("2026-01-05", 102.0),
+                ("2026-01-06", 105.0),
+            ],
         );
         insert_close(
             &mut conn,
             temp.path(),
             "SOXX",
-            &[("2026-01-01", 100.0), ("2026-01-06", 95.0)],
+            &[
+                ("2026-01-01", 100.0),
+                ("2026-01-02", 99.0),
+                ("2026-01-05", 97.0),
+                ("2026-01-06", 95.0),
+            ],
         );
 
         let summary = score_predictions(&conn, &options()).unwrap();
@@ -150,7 +98,12 @@ mod tests {
             &mut conn,
             temp.path(),
             "QQQ",
-            &[("2026-01-01", 100.0), ("2026-01-06", 105.0)],
+            &[
+                ("2026-01-01", 100.0),
+                ("2026-01-02", 101.0),
+                ("2026-01-05", 103.0),
+                ("2026-01-06", 105.0),
+            ],
         );
 
         assert_eq!(score_predictions(&conn, &options()).unwrap().scored, 1);
@@ -182,7 +135,7 @@ mod tests {
                 long_probability,
                 short_probability,
                 rating: "test".to_string(),
-                window_days: 5,
+                window_days: 3,
                 market_regime_json: json!({}),
                 agent_probabilities_json: json!({}),
                 weighted_base_probability: None,

@@ -9,7 +9,7 @@ pub const NAME: &str = "read_phase_summary_details";
 pub fn definition() -> ToolDefinition {
     ToolDefinition {
         name: api_tool_name(NAME),
-        description: "Expand one Phase 00 summary by id. The summary must belong to the current run and an earlier phase; inaccessible ids are reported as not visible.".to_string(),
+        description: "Expand one phase summary by id. The summary must belong to the current run and an earlier phase; inaccessible ids are reported as not visible.".to_string(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -39,12 +39,12 @@ pub fn execute(
     let max_source_phase = current_phase - 1;
 
     if let Some(index) =
-        super::read_run_context::wait_for_phase00(config, run_id, max_source_phase)?
+        super::read_run_context::wait_for_phase_summary(config, run_id, max_source_phase)?
     {
         return index.list_visible_details(run_id, current_phase, summary_id);
     }
     if let Some(index) = config
-        .phase00_index
+        .phase_summary_index
         .as_ref()
         .filter(|index| index.run_id == run_id)
     {

@@ -74,6 +74,16 @@ pub fn distill_weekly(conn: &Connection, options: &DistillOptions) -> Result<Dis
             "Discount similar future probabilities unless current evidence clearly improves the setup."
         };
         let run_ids = sample_run_ids(group);
+        if candidate_exists(
+            conn,
+            &group.ticker,
+            experience_type,
+            &group.market_regime_json,
+            &run_ids,
+        )? {
+            summary.skipped += 1;
+            continue;
+        }
         let evidence = evidence_rows(group, true);
         let counter_evidence = evidence_rows(group, false);
         insert_candidate_experience(
@@ -101,6 +111,32 @@ pub fn distill_weekly(conn: &Connection, options: &DistillOptions) -> Result<Dis
     }
 
     Ok(summary)
+}
+
+fn candidate_exists(
+    conn: &Connection,
+    ticker: &str,
+    experience_type: &str,
+    market_regime: &Value,
+    run_ids: &[String],
+) -> Result<bool> {
+    Ok(conn.query_row(
+        r#"
+        SELECT EXISTS(
+            SELECT 1 FROM candidate_experiences
+            WHERE scope='ticker' AND scope_value=?1 AND experience_type=?2
+              AND market_regime_json=?3 AND sample_run_ids_json=?4
+              AND reflection_version='v1'
+        )
+        "#,
+        params![
+            ticker,
+            experience_type,
+            serde_json::to_string(market_regime)?,
+            serde_json::to_string(run_ids)?,
+        ],
+        |row| row.get(0),
+    )?)
 }
 
 fn outcome_samples(conn: &Connection, since: &str, until: &str) -> Result<Vec<OutcomeSample>> {
@@ -259,6 +295,24 @@ mod tests {
         let summary = distill_weekly(&conn, &options(3)).unwrap();
         assert_eq!(summary.generated, 1);
         assert_candidate(&conn, "calibration_strength", 3);
+    }
+
+    #[test]
+    fn repeated_distillation_does_not_duplicate_the_same_experience() {
+        let temp = tempfile::tempdir().unwrap();
+        let conn = connect(temp.path().join("distill-idempotent.sqlite")).unwrap();
+        insert_outcome(&conn, "run-1", "QQQ", true, 0.1);
+        insert_outcome(&conn, "run-2", "QQQ", true, -0.1);
+        insert_outcome(&conn, "run-3", "QQQ", true, 0.2);
+
+        assert_eq!(distill_weekly(&conn, &options(3)).unwrap().generated, 1);
+        assert_eq!(distill_weekly(&conn, &options(3)).unwrap().generated, 0);
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM candidate_experiences", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     fn options(min_samples: usize) -> DistillOptions {

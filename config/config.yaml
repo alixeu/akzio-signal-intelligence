@@ -12,6 +12,28 @@ orchestrator:
   allocation:
     investable_assets: [QQQ, SOXX]
 
+  ai4trade:
+    # Loaded from .env or the process environment; never commit the real token.
+    token: ${AI4TRADE_TOKEN}
+
+  reflection:
+    enabled: true
+    reflection_version: v1
+    promote_mode: auto
+    task_limit: 10
+    parallelism: 2
+    prediction_horizon_trading_days: 3
+    deep:
+      loss_return: -0.02
+      excess_return: -0.015
+      high_confidence: 0.70
+      calibration_error: 0.40
+      repeated_error_count: 2
+    retrieval:
+      token_budget: 4000
+      max_items: 20
+      min_quality: 0.6
+
   workflow:
     agent_timeout_sec: 600
     reducer_timeout_sec: 600
@@ -23,13 +45,30 @@ orchestrator:
       mode: legacy
 
   prompts:
+    reflection:
+      historical: prompts/phase0/historical_reflection.md
+    analyst:
+      technical: prompts/phase1/technical.md
+      news_macro: prompts/phase1/news_macro.md
     compressor:
-      phase00: prompts/phase0/phase00.md
+      phase_summary: prompts/phase_summary/phase_summary.md
     phase2:
-      bull_initial: prompts/phase25/bull.md
-      bull_interaction: prompts/phase25/bull.md
-      bear_initial: prompts/phase25/bear.md
-      bear_interaction: prompts/phase25/bear.md
+      topic_generator: prompts/phase2/topic_generator.md
+      bull_initial: prompts/phase2/bull.md
+      bull_interaction: prompts/phase2/bull.md
+      bear_initial: prompts/phase2/bear.md
+      bear_interaction: prompts/phase2/bear.md
+    mediator:
+      topic_controller: prompts/phase2/topic_controller.md
+    manager:
+      research: prompts/phase3/research_manager.md
+    trader: prompts/phase4/trader.md
+    risk:
+      aggressive: prompts/phase5/aggressive.md
+      neutral: prompts/phase5/neutral.md
+      conservative: prompts/phase5/conservative.md
+    portfolio:
+      manager: prompts/phase6/portfolio_manager.md
 
   llm:
     gateway:

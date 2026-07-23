@@ -15,7 +15,6 @@ pub const KNOWN_RENDER_VARIABLES: &[&str] = &[
     "research_calibration",
     "research_drivers",
     "leveraged_etf_rules",
-    "analyst_output_structure",
     "analyst_artifact_schema",
     "research_artifact_schema",
     "trade_intent_schema",
