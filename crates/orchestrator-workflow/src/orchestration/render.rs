@@ -1423,4 +1423,23 @@ required_variables = ["ticker", "tickers"]
             }
         }
     }
+
+    #[test]
+    fn phase2_kind_templates_keep_the_researcher_audit_boundaries() {
+        let prompts = project_prompts_dir();
+        let warmup = std::fs::read_to_string(prompts.join("phase2/researcher/warmup.md")).unwrap();
+        let seed = std::fs::read_to_string(prompts.join("phase2/researcher/seed.md")).unwrap();
+        let debate = std::fs::read_to_string(prompts.join("phase2/researcher/debate.md")).unwrap();
+
+        assert!(warmup.contains("read_phase_summaries"));
+        assert!(warmup.contains("不得调用 `read_phase_summary_details`"));
+        assert!(seed.contains("raw Jin10"));
+        assert!(seed.contains("known_{opponent}_constraint"));
+        assert!(seed.contains("reducer_checks"));
+        assert!(debate.contains("next_steers"));
+        assert!(debate.contains("blocked_claims"));
+        assert!(debate.contains("reply_to_claim_id"));
+        assert!(debate.contains("no_new_info"));
+        assert!(debate.contains("steelman"));
+    }
 }
