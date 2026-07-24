@@ -2719,11 +2719,18 @@ fn configured_tool_names(settings: &AgentSettings) -> Vec<&str> {
             .iter()
             .map(String::as_str)
             .filter(|name| {
-                !is_alpaca_tool(name)
-                    || settings
+                if *name == tools::ALPACA_GET_NEWS_TOOL_NAME {
+                    settings
                         .tools
                         .as_ref()
-                        .is_some_and(|config| config.alpaca_live)
+                        .is_some_and(|config| config.alpaca_market_data)
+                } else {
+                    !is_alpaca_tool(name)
+                        || settings
+                            .tools
+                            .as_ref()
+                            .is_some_and(|config| config.alpaca_live)
+                }
             }),
     );
     if uses_web_run_fallback(settings) {
@@ -2755,6 +2762,7 @@ fn is_alpaca_tool(name: &str) -> bool {
         tools::ALPACA_GET_PORTFOLIO_TOOL_NAME
             | tools::ALPACA_GET_HISTORY_TOOL_NAME
             | tools::ALPACA_GET_PRICE_TOOL_NAME
+            | tools::ALPACA_GET_NEWS_TOOL_NAME
             | tools::ALPACA_SUBMIT_TRADE_TOOL_NAME
     )
 }
@@ -2804,6 +2812,7 @@ fn default_tool_config() -> tools::ExternalToolConfig {
             })
             .unwrap_or_default(),
         alpaca_live: false,
+        alpaca_market_data: false,
         alpaca_api_key: None,
         alpaca_api_secret: None,
         phase_summary_index: None,
@@ -2976,6 +2985,7 @@ mod tests {
                 "read_reflection_source",
                 "read_technical_context",
                 "read_jin10_context",
+                "alpaca_get_news",
             ]
         );
     }
@@ -3066,6 +3076,7 @@ mod tests {
             allowed_reflection_task_ids: Vec::new(),
             tickers: vec!["QQQ".to_string()],
             alpaca_live: false,
+            alpaca_market_data: false,
             alpaca_api_key: None,
             alpaca_api_secret: None,
             phase_summary_index: None,
@@ -3109,6 +3120,7 @@ mod tests {
             allowed_reflection_task_ids: Vec::new(),
             tickers: vec!["TQQQ".to_string()],
             alpaca_live: false,
+            alpaca_market_data: false,
             alpaca_api_key: None,
             alpaca_api_secret: None,
             phase_summary_index: None,
@@ -3944,6 +3956,22 @@ mod tests {
                 tools::ALPACA_GET_PRICE_TOOL_NAME,
                 tools::ALPACA_SUBMIT_TRADE_TOOL_NAME,
             ]
+        );
+    }
+
+    #[test]
+    fn news_analyst_only_gets_alpaca_news_when_market_data_gate_is_open() {
+        let mut settings = base_settings(LlmRoute::Responses);
+        settings.role = "analyst.news_macro".to_string();
+        settings.llm.think_tool = false;
+        settings.llm.tools = vec![tools::ALPACA_GET_NEWS_TOOL_NAME.to_string()];
+        settings.tools = Some(tools::ExternalToolConfig::default());
+
+        assert!(super::configured_tool_names(&settings).is_empty());
+        settings.tools.as_mut().unwrap().alpaca_market_data = true;
+        assert_eq!(
+            super::configured_tool_names(&settings),
+            vec![tools::ALPACA_GET_NEWS_TOOL_NAME]
         );
     }
 

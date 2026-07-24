@@ -3,7 +3,7 @@ use chrono::{Datelike, Duration, NaiveDate, Utc, Weekday};
 use clap::Args;
 use futures::{stream, StreamExt};
 use orchestrator_core::{
-    config_int, config_str, config_strings, default_technical_csv_dir, parse_tickers,
+    config_bool, config_int, config_str, config_strings, default_technical_csv_dir, parse_tickers,
     read_technical_csv, technical_csv_path, write_technical_csv, TechnicalCsvRow,
     DEFAULT_TECHNICAL_BARS,
 };
@@ -14,6 +14,7 @@ use std::{collections::HashMap, path::Path, sync::Arc, time::Duration as StdDura
 use tokio::sync::Mutex;
 
 const EPS: f64 = 1e-12;
+const ALPACA_BARS_BASE_URL: &str = "https://data.alpaca.markets/v2/stocks";
 const YAHOO_CHART_BASE_URL: &str = "https://query1.finance.yahoo.com/v8/finance/chart";
 const YAHOO_CRUMB_URL: &str = "https://query1.finance.yahoo.com/v1/test/getcrumb";
 const YAHOO_COOKIE_URL: &str = "https://fc.yahoo.com/";
@@ -170,8 +171,108 @@ fn provider_symbol(symbol: &str) -> String {
     }
 }
 
+#[derive(Clone)]
+struct AlpacaDataSource {
+    client: reqwest::Client,
+    api_key: String,
+    api_secret: String,
+    feed: String,
+}
+
+impl AlpacaDataSource {
+    fn new(timeout_sec: f64, api_key: String, api_secret: String, feed: String) -> Result<Self> {
+        if api_key.trim().is_empty() || api_secret.trim().is_empty() {
+            bail!("Alpaca technical source requires ALPACA_API_KEY and ALPACA_API_SECRET");
+        }
+        if !matches!(feed.as_str(), "iex" | "sip" | "boats" | "otc") {
+            bail!("unsupported Alpaca stock feed {feed:?}; use iex, sip, boats, or otc");
+        }
+        Ok(Self {
+            client: reqwest::Client::builder()
+                .timeout(StdDuration::from_secs_f64(timeout_sec))
+                .build()?,
+            api_key,
+            api_secret,
+            feed,
+        })
+    }
+
+    async fn fetch_bars(
+        &self,
+        symbol: &str,
+        start: NaiveDate,
+        end: NaiveDate,
+        timeframe: &str,
+    ) -> Result<Vec<Bar>> {
+        let mut bars = Vec::new();
+        let mut page_token: Option<String> = None;
+        loop {
+            let mut query = vec![
+                ("timeframe", timeframe.to_string()),
+                ("start", format!("{start}T00:00:00Z")),
+                ("end", format!("{}T00:00:00Z", end + Duration::days(1))),
+                ("limit", "10000".to_string()),
+                ("adjustment", "all".to_string()),
+                ("feed", self.feed.clone()),
+                ("sort", "asc".to_string()),
+            ];
+            if let Some(token) = page_token.as_ref() {
+                query.push(("page_token", token.clone()));
+            }
+            let response = self
+                .client
+                .get(format!("{ALPACA_BARS_BASE_URL}/{symbol}/bars"))
+                .header("APCA-API-KEY-ID", &self.api_key)
+                .header("APCA-API-SECRET-KEY", &self.api_secret)
+                .query(&query)
+                .send()
+                .await
+                .with_context(|| format!("failed to fetch Alpaca bars for {symbol}"))?;
+            let status = response.status();
+            let text = response
+                .text()
+                .await
+                .with_context(|| format!("failed to read Alpaca bars response for {symbol}"))?;
+            if !status.is_success() {
+                bail!(
+                    "Alpaca bars HTTP {status} for {symbol}: {}",
+                    text.chars().take(500).collect::<String>()
+                );
+            }
+            let page: AlpacaBarsResponse = serde_json::from_str(&text)
+                .with_context(|| format!("invalid Alpaca bars response for {symbol}"))?;
+            bars.extend(parse_alpaca_bars(symbol, page.bars.unwrap_or_default()));
+            page_token = page.next_page_token.filter(|token| !token.is_empty());
+            if page_token.is_none() {
+                break;
+            }
+        }
+        Ok(bars)
+    }
+}
+
+#[derive(Clone)]
+struct TechnicalSources {
+    default: String,
+    alpaca: Option<AlpacaDataSource>,
+    yahoo: YahooDataSource,
+    yahoo_fallback_symbols: Vec<String>,
+}
+
+impl TechnicalSources {
+    fn uses_yahoo(&self, symbol: &str) -> bool {
+        self.default == "yahoo"
+            || self
+                .yahoo_fallback_symbols
+                .iter()
+                .any(|fallback| fallback.eq_ignore_ascii_case(symbol))
+    }
+}
+
 #[derive(Debug, Clone, Args, Default)]
 pub struct TechnicalArgs {
+    #[arg(long)]
+    pub source: Option<String>,
     #[arg(long)]
     pub symbols: Option<String>,
     #[arg(long)]
@@ -193,7 +294,22 @@ pub struct TechnicalArgs {
 
 pub async fn run(args: TechnicalArgs) -> Result<Value> {
     let args = ResolvedTechnicalArgs::from_args(args)?;
-    let source = YahooDataSource::new(args.timeout)?;
+    let yahoo = YahooDataSource::new(args.timeout)?;
+    let alpaca = (args.source == "alpaca").then(|| {
+        AlpacaDataSource::new(
+            args.timeout,
+            args.alpaca_api_key.clone(),
+            args.alpaca_api_secret.clone(),
+            args.alpaca_feed.clone(),
+        )
+    });
+    let alpaca = alpaca.transpose()?;
+    let sources = TechnicalSources {
+        default: args.source.clone(),
+        alpaca,
+        yahoo,
+        yahoo_fallback_symbols: args.yahoo_fallback_symbols.clone(),
+    };
     let csv_dir = default_technical_csv_dir();
     let mut results = Vec::new();
     let mut jobs = Vec::new();
@@ -202,7 +318,9 @@ pub async fn run(args: TechnicalArgs) -> Result<Value> {
         for interval in &args.intervals {
             let job_order = order;
             order += 1;
-            if has_fresh_csv(&csv_dir, symbol, interval, args.start, args.end) {
+            if args.source == "yahoo"
+                && has_fresh_csv(&csv_dir, symbol, interval, args.start, args.end)
+            {
                 results.push((
                     job_order,
                     json!({
@@ -219,25 +337,17 @@ pub async fn run(args: TechnicalArgs) -> Result<Value> {
         }
     }
 
-    if jobs
-        .iter()
-        .any(|(_, _, interval)| matches!(interval.as_str(), "1d" | "3h" | "20min"))
-    {
-        // Prime the shared session once before concurrent chart requests so all
-        // jobs use the same cookie/crumb pair.
-        source.ensure_crumb().await?;
-    }
     let mut failures = Vec::new();
     for (batch_index, batch) in jobs.chunks(args.parallelism).enumerate() {
         if batch_index > 0 && args.sleep > 0.0 {
             tokio::time::sleep(StdDuration::from_secs_f64(args.sleep)).await;
         }
         let completed = stream::iter(batch.iter().cloned().map(|(job_order, symbol, interval)| {
-            let source = source.clone();
+            let sources = sources.clone();
             let csv_dir = csv_dir.clone();
             async move {
                 let result = download_technical_csv(
-                    &source, &csv_dir, &symbol, &interval, args.start, args.end,
+                    &sources, &csv_dir, &symbol, &interval, args.start, args.end,
                 )
                 .await;
                 (job_order, symbol, interval, result)
@@ -250,32 +360,54 @@ pub async fn run(args: TechnicalArgs) -> Result<Value> {
             match result {
                 Ok(result) => results.push((job_order, result)),
                 Err(error) => {
-                    failures.push(format!("{symbol}/{interval}: {error:#}"));
-                    results.push((
-                        job_order,
-                        json!({
-                            "symbol": symbol,
-                            "interval": interval,
-                            "bars": 0,
-                            "feature_rows": 0,
-                            "status": "error",
+                    if let Some((rows, csv_path)) =
+                        cached_technical_rows(&csv_dir, &symbol, &interval)
+                    {
+                        results.push((
+                            job_order,
+                            json!({
+                                "symbol": symbol,
+                                "interval": interval,
+                                "source": "cached_csv",
+                            "bars": rows,
+                            "feature_rows": rows,
+                            "status": "fallback",
+                            "cache_path": csv_path.display().to_string(),
                             "error": error.to_string(),
                         }),
                     ));
+                    } else {
+                        failures.push(format!("{symbol}/{interval}: {error:#}"));
+                        results.push((
+                            job_order,
+                            json!({
+                                "symbol": symbol,
+                                "interval": interval,
+                                "bars": 0,
+                                "feature_rows": 0,
+                                "status": "error",
+                                "error": error.to_string(),
+                            }),
+                        ));
+                    }
                 }
             }
         }
     }
     if !failures.is_empty() {
         bail!(
-            "Yahoo technical refresh incomplete; refusing success with missing coverage: {}",
+            "{} technical refresh incomplete; refusing success with missing coverage: {}",
+            args.source,
             failures.join("; ")
         );
     }
     results.sort_by_key(|(job_order, _)| *job_order);
     Ok(json!({
         "status": "success",
-        "source": "Yahoo",
+        "source": args.source,
+        "alpaca_feed": (args.source == "alpaca").then_some(args.alpaca_feed),
+        "extended_hours": (args.source == "alpaca").then_some(args.extended_hours),
+        "yahoo_fallback_symbols": args.yahoo_fallback_symbols,
         "start": args.start.to_string(),
         "end": args.end.to_string(),
         "output_dir": csv_dir.display().to_string(),
@@ -288,27 +420,49 @@ pub async fn run(args: TechnicalArgs) -> Result<Value> {
 }
 
 async fn download_technical_csv(
-    source: &YahooDataSource,
+    sources: &TechnicalSources,
     csv_dir: &Path,
     symbol: &str,
     interval: &str,
     start: NaiveDate,
     end: NaiveDate,
 ) -> Result<Value> {
-    let bars = match interval {
-        "1d" => source.fetch_daily_bars(symbol, start, end).await,
-        "3h" => source
-            .fetch_bars(symbol, start, end, "1h")
-            .await
-            .map(|bars| resample_bars(bars, "3h", 3)),
-        "20min" => source
-            .fetch_bars(symbol, start, end, "5m")
-            .await
-            .map(|bars| resample_bars(bars, "20min", 4)),
-        other => Err(anyhow::anyhow!(
-            "unsupported interval {other:?}; use 1d, 3h, 20min"
-        )),
-    }?;
+    let (bars, provider) = if sources.uses_yahoo(symbol) {
+        let bars = match interval {
+            "1d" => sources.yahoo.fetch_daily_bars(symbol, start, end).await,
+            "3h" => sources
+                .yahoo
+                .fetch_bars(symbol, start, end, "1h")
+                .await
+                .map(|bars| resample_bars(bars, "3h", 3)),
+            "20min" => sources
+                .yahoo
+                .fetch_bars(symbol, start, end, "5m")
+                .await
+                .map(|bars| resample_bars(bars, "20min", 4)),
+            other => Err(anyhow::anyhow!(
+                "unsupported interval {other:?}; use 1d, 3h, 20min"
+            )),
+        }?;
+        (bars, "yahoo")
+    } else {
+        let alpaca = sources
+            .alpaca
+            .as_ref()
+            .context("Alpaca technical source is not configured")?;
+        let timeframe = match interval {
+            "1d" => "1Day",
+            "3h" => "3Hour",
+            "20min" => "20Min",
+            other => {
+                bail!("unsupported interval {other:?}; use 1d, 3h, 20min");
+            }
+        };
+        (
+            alpaca.fetch_bars(symbol, start, end, timeframe).await?,
+            "alpaca",
+        )
+    };
     let bars_len = bars.len();
     let mut rows = feature_rows(interval, &bars);
     if rows.len() > DEFAULT_TECHNICAL_BARS {
@@ -327,19 +481,20 @@ async fn download_technical_csv(
         .filter(|row| !row.values.is_empty())
         .collect();
     if csv_rows.is_empty() {
-        bail!("Yahoo returned no usable finite feature rows");
+        bail!("{provider} returned no usable finite feature rows");
     }
     let csv_path = technical_csv_path(csv_dir, symbol, interval)
         .ok_or_else(|| anyhow::anyhow!("unsupported interval {interval:?}"))?;
     write_technical_csv(&csv_path, &csv_rows).with_context(|| {
         format!(
-            "failed to persist Yahoo technical data for {symbol}/{interval} to {}",
+            "failed to persist {provider} technical data for {symbol}/{interval} to {}",
             csv_path.display()
         )
     })?;
     Ok(json!({
         "symbol": symbol,
         "interval": interval,
+        "source": provider,
         "bars": bars_len,
         "feature_rows": csv_rows.len(),
     }))
@@ -347,6 +502,7 @@ async fn download_technical_csv(
 
 #[derive(Debug, Clone)]
 struct ResolvedTechnicalArgs {
+    source: String,
     symbols: Vec<String>,
     start: NaiveDate,
     end: NaiveDate,
@@ -354,11 +510,21 @@ struct ResolvedTechnicalArgs {
     timeout: f64,
     sleep: f64,
     parallelism: usize,
+    alpaca_api_key: String,
+    alpaca_api_secret: String,
+    alpaca_feed: String,
+    extended_hours: bool,
+    yahoo_fallback_symbols: Vec<String>,
 }
 
 impl ResolvedTechnicalArgs {
     fn from_args(args: TechnicalArgs) -> Result<Self> {
         let config = crate::config::load_default_config();
+        let source = args
+            .source
+            .unwrap_or_else(|| config_str(&config, "technical.source", "alpaca"))
+            .trim()
+            .to_ascii_lowercase();
         let end = match args.end {
             Some(value) => NaiveDate::parse_from_str(&value, "%Y-%m-%d")
                 .with_context(|| format!("invalid --end date {value:?}"))?,
@@ -395,6 +561,7 @@ impl ResolvedTechnicalArgs {
             bail!("--parallelism must be at least 1");
         }
         Self {
+            source,
             symbols,
             start,
             end,
@@ -406,11 +573,31 @@ impl ResolvedTechnicalArgs {
             parallelism: args.parallelism.unwrap_or_else(|| {
                 config_int(&config, "technical.parallelism", 10).max(1) as usize
             }),
+            alpaca_api_key: config_str(&config, "orchestrator.alpaca.api_key", ""),
+            alpaca_api_secret: config_str(&config, "orchestrator.alpaca.api_secret", ""),
+            alpaca_feed: config_str(&config, "technical.alpaca.feed", "iex")
+                .trim()
+                .to_ascii_lowercase(),
+            extended_hours: config_bool(&config, "technical.alpaca.extended_hours", true),
+            yahoo_fallback_symbols: config_strings(
+                &config,
+                "technical.yahoo_fallback_symbols",
+                &["VIX"],
+            ),
         }
         .validate()
     }
 
     fn validate(self) -> Result<Self> {
+        if !matches!(self.source.as_str(), "alpaca" | "yahoo") {
+            bail!(
+                "unsupported technical source {:?}; use alpaca or yahoo",
+                self.source
+            );
+        }
+        if self.source == "alpaca" && !self.extended_hours {
+            bail!("technical.alpaca.extended_hours must be true for this workflow");
+        }
         Ok(self)
     }
 }
@@ -1002,6 +1189,54 @@ fn has_fresh_csv(
     latest_date >= required_end
 }
 
+fn cached_technical_rows(
+    csv_dir: &std::path::Path,
+    symbol: &str,
+    interval: &str,
+) -> Option<(usize, std::path::PathBuf)> {
+    let path = technical_csv_path(csv_dir, symbol, interval)?;
+    match read_technical_csv(&path) {
+        Ok(rows) if !rows.is_empty() => Some((rows.len(), path)),
+        Ok(_) => None,
+        Err(_) => None,
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct AlpacaBarsResponse {
+    bars: Option<Vec<AlpacaBar>>,
+    next_page_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AlpacaBar {
+    t: String,
+    o: Option<f64>,
+    h: Option<f64>,
+    l: Option<f64>,
+    c: Option<f64>,
+    v: Option<f64>,
+    vw: Option<f64>,
+}
+
+fn parse_alpaca_bars(symbol: &str, bars: Vec<AlpacaBar>) -> Vec<Bar> {
+    bars.into_iter()
+        .map(|bar| Bar {
+            symbol: symbol.to_string(),
+            date: bar.t,
+            open: bar.o,
+            high: bar.h,
+            low: bar.l,
+            close: bar.c,
+            volume: bar.v,
+            adj_close: bar.c,
+            amount: None,
+            turnover: None,
+            vwap: bar.vw,
+        })
+        .collect()
+}
+
 #[derive(Debug, Deserialize)]
 struct YahooChartResponse {
     chart: YahooChart,
@@ -1113,6 +1348,7 @@ mod tests {
     #[tokio::test]
     async fn unsupported_interval_is_an_error_not_top_level_success() {
         let error = run(TechnicalArgs {
+            source: Some("yahoo".to_string()),
             symbols: Some("QQQ".to_string()),
             start: Some("2026-07-01".to_string()),
             end: Some("2026-07-02".to_string()),
@@ -1178,6 +1414,23 @@ mod tests {
         assert_eq!(bars[0].volume, None);
         assert_eq!(bars[1].close, Some(2.5));
         assert_eq!(bars[1].adj_close, Some(2.4));
+    }
+
+    #[test]
+    fn parses_alpaca_extended_hours_bars() {
+        let response: AlpacaBarsResponse = serde_json::from_value(json!({
+            "bars": [
+                {"t": "2026-07-22T08:00:00Z", "o": 1.0, "h": 2.0, "l": 0.5, "c": 1.5, "v": 10.0, "vw": 1.2},
+                {"t": "2026-07-22T21:00:00Z", "o": 1.5, "h": 2.5, "l": 1.0, "c": 2.0, "v": 20.0, "vw": 1.8}
+            ],
+            "next_page_token": null
+        }))
+        .unwrap();
+        let bars = parse_alpaca_bars("QQQ", response.bars.unwrap());
+        assert_eq!(bars.len(), 2);
+        assert_eq!(bars[0].date, "2026-07-22T08:00:00Z");
+        assert_eq!(bars[1].date, "2026-07-22T21:00:00Z");
+        assert_eq!(bars[1].vwap, Some(1.8));
     }
 
     #[test]

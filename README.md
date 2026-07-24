@@ -1,6 +1,6 @@
 # Akzio Signal Intelligence
 
-Rust-native market-signal research workflow for a small ETF universe. The production path uses Yahoo Finance, Jin10, SQLite WAL, and an OpenAI-compatible LLM gateway. VIX is a regime signal, not an investable asset.
+Rust-native market-signal research workflow for a small ETF universe. The production path uses Alpaca Market Data, a Yahoo VIX fallback, Jin10, SQLite WAL, and an OpenAI-compatible LLM gateway. VIX is a regime signal, not an investable asset.
 
 ## Current scope
 
@@ -8,8 +8,8 @@ Active Phase 1 analysts are fixed to:
 
 | Role | Source | Weight | Critical |
 |---|---|---:|---|
-| `analyst.technical` | Yahoo OHLCV and precomputed indicators | 50% | yes |
-| `analyst.news_macro` | Jin10 flash news and macro events | 50% | yes |
+| `analyst.technical` | Alpaca OHLCV (Yahoo for VIX) and precomputed indicators | 50% | yes |
+| `analyst.news_macro` | Jin10, Alpaca News, and verified macro/event sources | 50% | yes |
 
 YouTube and Reddit/X remain explicit extension points, but their ingestion, SQLite
 contexts, and Phase 1 roles are currently unconfigured; they are not scheduled or
@@ -21,7 +21,7 @@ and allocation phases; it is never converted into a neutral 0.5 vote.
 ```mermaid
 graph TD
     subgraph "数据层 Data Layer"
-        YAHOO[Yahoo Finance<br/>OHLCV + 技术指标]
+        MARKET[Alpaca OHLCV<br/>VIX 使用 Yahoo 回退]
         JIN10[Jin10 金融快讯]
         YT[YouTube 分析师<br/>未配置]
         SOCIAL[Reddit · X<br/>未配置]
@@ -72,7 +72,7 @@ graph TD
         OUT[预测 vs 结果]
     end
 
-    YAHOO --> SQL
+    MARKET --> SQL
     JIN10 --> SQL
     SQL --> SCORE
     HIST --> SCORE
@@ -126,7 +126,7 @@ reject direct calls.
 | `orchestrator-core` | Config paths, role registry, ticker parsing, canonical schemas and validators |
 | `orchestrator-sql` | WAL schema, ingestion imports, scoped messages, phase summaries and memory storage |
 | `orchestrator-llm` | Responses/Chat Completions streaming, bounded agent loop, tool execution and structured-output parsing |
-| `orchestrator-ingest` | Yahoo technical ingestion and Jin10 ingestion |
+| `orchestrator-ingest` | Alpaca/Yahoo technical ingestion and Jin10 ingestion |
 | `orchestrator-workflow` | Phase orchestration, policy gates, reducers, probability and allocation guards |
 | `orchestrator-cli` | CLI binaries, reporting, operations, metrics and prompt linting |
 
@@ -135,10 +135,10 @@ There is no long-running service entry point. `orchestrator-exec` is the workflo
 ## Requirements
 
 - Rust stable, edition 2021
-- Network access to Yahoo Finance and Jin10
+- Network access to Alpaca Market Data, Yahoo Finance, and Jin10
 - An OpenAI-compatible gateway key for non-mock workflow runs
 - `EXA_API_KEY` only when live Exa web search is enabled
-- `ALPACA_API_KEY` and `ALPACA_API_SECRET` for Phase 0 account/fill retrieval and Phase 6 Paper Trading execution
+- `ALPACA_API_KEY` and `ALPACA_API_SECRET` for technical bars, Alpaca News, Phase 0 account/fill retrieval, and Phase 6 Paper Trading execution
 
 Set secrets through the environment. The repository contains no key fallback:
 
@@ -151,9 +151,10 @@ export ALPACA_API_SECRET='...'
 ```
 
 `config/config.yaml` maps `orchestrator.alpaca.api_key` and
-`orchestrator.alpaca.api_secret` to the two Alpaca environment variables. The
-integration intentionally uses `paper-api.alpaca.markets`; no live-brokerage
-endpoint, registration, or alternate-account flow is implemented.
+`orchestrator.alpaca.api_secret` to the two Alpaca environment variables.
+Market data and news use `data.alpaca.markets`; brokerage actions intentionally
+use `paper-api.alpaca.markets`. No live-brokerage endpoint, registration, or
+alternate-account flow is implemented.
 
 Report email credentials are only needed by `report-email`:
 
@@ -166,7 +167,11 @@ export REPORT_SMTP_TO='...'
 
 ## Ingestion
 
-Ingest real Yahoo data for the configured research universe:
+Ingest real technical data for the configured research universe. Alpaca/IEX is
+the default; its intraday `3h` and `20min` bars retain pre-market and after-hours
+trades. Alpaca daily bars remain regular-session daily bars. VIX automatically
+uses the configured Yahoo fallback because Alpaca stock bars do not provide VIX
+OHLC:
 
 ```bash
 rtk cargo run -p orchestrator-cli --bin orchestrator-ingest -- \
@@ -189,7 +194,10 @@ rtk cargo run -p orchestrator-cli --bin orchestrator-ingest -- \
 
 Technical CSV is an ingestion interchange only. With `--db-path`, the CLI atomically replaces the configured ticker/interval window in `technical_bars`, one indexed row per bar. Jin10 always writes its raw preflight feed to `outputs/jin10/YYYY-MM-DD.csv`; `read_jin10_context` reads that CSV, and only items that the news analyst assigns a Jin10 attention score are persisted to `jin10_items`.
 
-Independent Yahoo ticker/interval CSV downloads run concurrently (default: 10). Set `--parallelism N` to adjust the batch size; `--sleep S` waits `S` seconds between batches to manage provider rate limits.
+Independent ticker/interval downloads run concurrently (default: 10). Set
+`technical.source: yahoo` or pass `--source yahoo` for a full Yahoo run.
+`technical.alpaca.feed` selects `iex`, `sip`, `boats`, or `otc`; the checked-in
+default is free-tier-compatible `iex`.
 
 The workflow refreshes both sources during Phase 1. Use `--tech-refresh-enabled=false` only when all required ticker/interval CSVs already exist for preflight import. Jin10 lookback is controlled by `--jin10-refresh-lookback-hours`; its SQLite import remains deferred until the news analyst scores an item.
 
@@ -285,7 +293,7 @@ explicit reruns of scoring, distillation, or promotion.
 - Manager output cannot replace missing evidence with a default 0.5 result.
 - Responses streams require `response.completed`; Chat Completions streams require a terminal `finish_reason`.
 - Tool calls require a non-empty `call_id`, name, and valid accumulated JSON arguments.
-- Technical tools and downstream phases read SQLite only. The news analyst reads its preflight Jin10 CSV; only attention-scored Jin10 items enter SQLite.
+- Technical tools and downstream phases read SQLite only. The news analyst reads its preflight Jin10 CSV and may call Alpaca News; only attention-scored Jin10 items enter SQLite.
 - Tool payload history is bounded to 16,000 characters by default.
 - Allocation excludes VIX, rejects missing per-ticker research, enforces non-negative finite weights, per-asset caps, cash constraints, and a total weight of 1.0.
 - Post-run learning is outcome-backed, idempotent, and outside the decision-critical research path; only qualified, non-mock experience is admitted to durable memory for a later run.

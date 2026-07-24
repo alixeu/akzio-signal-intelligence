@@ -102,9 +102,16 @@ orchestrator:
     max_result_chars: 12000
 
 technical:
+  source: alpaca
   days: 60
   sleep_sec: 1
   parallelism: 10
+  alpaca:
+    # IEX is available on Alpaca Basic. Intraday bars include pre-market and after-hours trades.
+    feed: iex
+    extended_hours: true
+  # Alpaca stock bars do not provide VIX OHLC.
+  yahoo_fallback_symbols: [VIX]
 
 jin10:
   api_url: https://4a735ea38f8146198dc205d2e2d1bd28.z3c.jin10.com/flash

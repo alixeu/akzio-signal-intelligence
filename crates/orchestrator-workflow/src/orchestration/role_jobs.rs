@@ -150,6 +150,7 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
     } = input;
     let debug_enabled = state.get("debug").and_then(Value::as_bool).unwrap_or(false);
     let alpaca_live = role == "portfolio.manager" && !mock && !debug_enabled;
+    let alpaca_market_data = role == "analyst.news_macro" && !mock && !debug_enabled;
     let tickers = tickers_from_state(&state);
     let tool_tickers = if role == "portfolio.manager" {
         state
@@ -251,12 +252,13 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
                 .collect(),
             tickers: tool_tickers,
             alpaca_live,
-            alpaca_api_key: if alpaca_live {
+            alpaca_market_data,
+            alpaca_api_key: if alpaca_live || alpaca_market_data {
                 config.alpaca_api_key.clone()
             } else {
                 None
             },
-            alpaca_api_secret: if alpaca_live {
+            alpaca_api_secret: if alpaca_live || alpaca_market_data {
                 config.alpaca_api_secret.clone()
             } else {
                 None

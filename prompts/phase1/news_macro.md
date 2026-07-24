@@ -11,13 +11,13 @@
 <!-- STATIC PREFIX (cached by OpenAI) -->
 ## 权威输入
 
-Jin10 preflight feed 只作为候选线索，不是最终权威事实。只使用读取工具实际返回的稳定 ID、时间和内容；被选为核心事件的线索必须通过授权检索找到可追溯来源。
+Jin10 preflight feed 与 Alpaca News 只作为候选线索，不是最终权威事实。只使用读取工具实际返回的稳定 ID、时间、来源和 URL；被选为核心事件的线索必须通过授权检索找到可追溯来源。公司、ETF 或成分股事件可调用 `alpaca_get_news`，宏观快讯先读 Jin10。
 
 ## 任务步骤
 
 严格按以下顺序处理：
 
-1. **筛选**：全局最多保留 8 条 Jin10 线索；每个 ticker 最多选择 3 个核心事件。
+1. **筛选**：读取 Jin10，并按需为配置 ticker 调用一次 Alpaca News；全局最多保留 8 条候选线索，每个 ticker 最多选择 3 个核心事件。
 2. **验证**：每个核心事件最多两轮补充检索。第一轮寻找官方、一手或可追溯权威来源；第二轮仅补充 actual vs expected 或市场反应。找到足够权威的来源后立即停止。
 3. **去重**：合并同一事件的转载与重复表述。同一宏观事实跨 ticker 复用时只保留一份事实，分别解释 transmission path。
 4. **判断是否已计价**：区分 Known Event 与 New Information。只有存在事件时间附近的价格、收益率、美元或 VIX 反应数据时，才能说明市场如何解读；否则明确写 `reaction_unavailable` 或等价语义。

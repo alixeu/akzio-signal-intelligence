@@ -2348,8 +2348,12 @@ impl LoopToolRuntime for ProjectToolRuntime {
             let web_run_config = web_run.as_ref().map(tools::WebRunRuntime::config);
             let configured = available_tools.iter().any(|name| name == &call.name);
             let enabled = call.name == "think"
-                || tools::enabled_tool_names(web_run_config, config.alpaca_live)
-                    .contains(&call.name.as_str());
+                || tools::enabled_tool_names(
+                    web_run_config,
+                    config.alpaca_live,
+                    config.alpaca_market_data,
+                )
+                .contains(&call.name.as_str());
             if !configured || !enabled {
                 warn!(
                     call_id = call.call_id,
@@ -3543,6 +3547,7 @@ mod tests {
                 allowed_reflection_task_ids: Vec::new(),
                 tickers: Vec::new(),
                 alpaca_live: false,
+                alpaca_market_data: false,
                 alpaca_api_key: None,
                 alpaca_api_secret: None,
                 phase_summary_index: None,
@@ -3575,6 +3580,7 @@ mod tests {
                 allowed_reflection_task_ids: Vec::new(),
                 tickers: Vec::new(),
                 alpaca_live: false,
+                alpaca_market_data: false,
                 alpaca_api_key: None,
                 alpaca_api_secret: None,
                 phase_summary_index: None,
@@ -4150,6 +4156,7 @@ mod tests {
                 allowed_reflection_task_ids: Vec::new(),
                 tickers: vec!["TQQQ".to_string()],
                 alpaca_live: false,
+                alpaca_market_data: false,
                 alpaca_api_key: None,
                 alpaca_api_secret: None,
                 phase_summary_index: None,

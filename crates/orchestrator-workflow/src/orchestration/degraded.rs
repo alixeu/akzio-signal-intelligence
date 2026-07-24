@@ -235,7 +235,19 @@ pub(crate) fn role_artifact_or_degraded(
 ) -> Result<Value> {
     if let Some(mut artifact) = result.artifact.clone() {
         match attach_runtime_role_identity(&mut artifact, &result.role) {
-            Ok(()) => return Ok(artifact),
+            Ok(()) => {
+                if is_cached_artifact_fallback(&artifact) {
+                    let message = artifact
+                        .get("degraded_reason")
+                        .or_else(|| artifact.get("error"))
+                        .or_else(|| artifact.get("report"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("cached artifact fallback");
+                    record_degraded_role(state, &result, message);
+                    return Ok(artifact);
+                }
+                return Ok(artifact);
+            }
             Err(error) => {
                 let message = error.to_string();
                 if is_critical_role(config, &result.role) {
@@ -281,6 +293,13 @@ pub(crate) fn role_artifact_or_degraded(
     record_degraded_role(state, &result, &message);
     state["degraded"] = Value::Bool(true);
     Ok(degraded_role_artifact(&result, &message))
+}
+
+fn is_cached_artifact_fallback(artifact: &Value) -> bool {
+    artifact
+        .get("fallback")
+        .and_then(Value::as_str)
+        .is_some_and(|value| value == "cached_db_artifact")
 }
 
 fn attach_runtime_role_identity(artifact: &mut Value, expected_role: &str) -> Result<()> {

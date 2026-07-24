@@ -29,6 +29,7 @@ pub const READ_RUN_CONTEXT_TOOL_NAME: &str = read_run_context::NAME;
 pub const ALPACA_GET_PORTFOLIO_TOOL_NAME: &str = alpaca::GET_PORTFOLIO_NAME;
 pub const ALPACA_GET_HISTORY_TOOL_NAME: &str = alpaca::GET_HISTORY_NAME;
 pub const ALPACA_GET_PRICE_TOOL_NAME: &str = alpaca::GET_PRICE_NAME;
+pub const ALPACA_GET_NEWS_TOOL_NAME: &str = alpaca::GET_NEWS_NAME;
 pub const ALPACA_SUBMIT_TRADE_TOOL_NAME: &str = alpaca::SUBMIT_TRADE_NAME;
 
 #[derive(Debug, Clone)]
@@ -52,6 +53,8 @@ pub struct ExternalToolConfig {
     pub tickers: Vec<String>,
     #[serde(default)]
     pub alpaca_live: bool,
+    #[serde(default)]
+    pub alpaca_market_data: bool,
     #[serde(skip)]
     pub alpaca_api_key: Option<String>,
     #[serde(skip)]
@@ -73,6 +76,7 @@ impl Default for ExternalToolConfig {
             allowed_reflection_task_ids: Vec::new(),
             tickers: Vec::new(),
             alpaca_live: false,
+            alpaca_market_data: false,
             alpaca_api_key: None,
             alpaca_api_secret: None,
             phase_summary_index: None,
@@ -134,6 +138,10 @@ const REGISTRY: &[ToolEntry] = &[
         definition: alpaca::get_price_definition,
     },
     ToolEntry {
+        name: alpaca::GET_NEWS_NAME,
+        definition: alpaca::get_news_definition,
+    },
+    ToolEntry {
         name: alpaca::SUBMIT_TRADE_NAME,
         definition: alpaca::submit_trade_definition,
     },
@@ -149,14 +157,20 @@ pub fn tool_names() -> &'static [&'static str] {
         read_reflection_source::NAME,
         read_technical_csv::NAME,
         read_jin10_csv::NAME,
+        alpaca::GET_NEWS_NAME,
     ]
 }
 
 pub fn enabled_tool_names(
     web_run: Option<&WebSearchConfig>,
     alpaca_live: bool,
+    alpaca_market_data: bool,
 ) -> Vec<&'static str> {
-    let mut names = tool_names().to_vec();
+    let mut names = tool_names()
+        .iter()
+        .copied()
+        .filter(|name| *name != alpaca::GET_NEWS_NAME)
+        .collect::<Vec<_>>();
     if web_run.is_some() {
         names.push(web_run::NAME);
     }
@@ -167,6 +181,9 @@ pub fn enabled_tool_names(
             alpaca::GET_PRICE_NAME,
             alpaca::SUBMIT_TRADE_NAME,
         ]);
+    }
+    if alpaca_market_data {
+        names.push(alpaca::GET_NEWS_NAME);
     }
     names
 }
@@ -310,6 +327,7 @@ pub async fn execute_named_tool(
         alpaca::GET_PORTFOLIO_NAME => alpaca::get_portfolio(config).await,
         alpaca::GET_HISTORY_NAME => alpaca::get_history(config).await,
         alpaca::GET_PRICE_NAME => alpaca::get_price(args, config).await,
+        alpaca::GET_NEWS_NAME => alpaca::get_news(args, config).await,
         alpaca::SUBMIT_TRADE_NAME => alpaca::submit_trade(args, config).await,
         other => bail!("unknown tool name: {other}"),
     }
@@ -382,6 +400,7 @@ mod tests {
             allowed_reflection_task_ids: Vec::new(),
             tickers: Vec::new(),
             alpaca_live: false,
+            alpaca_market_data: false,
             alpaca_api_key: None,
             alpaca_api_secret: None,
             phase_summary_index: None,

@@ -9,8 +9,8 @@ use orchestrator_sql::{
     clear_agent_loop_history, connect, pending_reflection_tasks, persist_reflection_artifact,
     prediction::{upsert_prediction, PredictionInput},
     score_mature_predictions, set_reflection_task_status, set_run_current_phase, update_run_status,
-    upsert_decision_snapshot, write_run_record, DecisionSnapshotInput, ReflectionThresholds,
-    RunRecordInput,
+    upsert_decision_snapshot, write_run_record, AGGREGATE_TICKER, DecisionSnapshotInput,
+    ReflectionThresholds, RunRecordInput,
 };
 use serde_json::{json, Value};
 use std::{
@@ -30,7 +30,7 @@ use crate::orchestration::artifact::{
     persist_message, persist_message_with_topic, reducer_brief_md, topic_id_from_topic,
     topics_from_generation_artifact,
 };
-use crate::orchestration::config::{validate_sqlite_context, RuntimeConfig};
+use crate::orchestration::config::{is_critical_role, validate_sqlite_context, RuntimeConfig};
 use crate::orchestration::degraded::role_artifact_or_degraded;
 use crate::orchestration::lifecycle::{
     append_topic_controller_artifact, append_topic_turn, record_contracts,
@@ -50,7 +50,8 @@ use crate::orchestration::role_jobs::{
 };
 use crate::orchestration::PHASE2_REDUCER;
 use orchestrator_core::role_registry::DEFAULT_PHASE1_AGENTS;
-
+use rusqlite::{params, OptionalExtension};
+ 
 mod args;
 pub use args::*;
 
@@ -197,8 +198,13 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             });
             set_phase_status(&mut state, 0, "skipped");
         } else {
-            let alpaca_history = if runtime_config.alpaca_api_key.is_some()
-                && runtime_config.alpaca_api_secret.is_some()
+            let alpaca_history = if runtime_config.alpaca_api_key
+                .as_ref()
+                .is_some_and(|value| !value.trim().is_empty())
+                && runtime_config
+                    .alpaca_api_secret
+                    .as_ref()
+                    .is_some_and(|value| !value.trim().is_empty())
             {
                 let tool_config = orchestrator_llm::tools::ExternalToolConfig {
                     project_root: default_project_root(),
@@ -209,6 +215,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
                     allowed_reflection_task_ids: Vec::new(),
                     tickers: runtime_config.allocation.investable_assets.clone(),
                     alpaca_live: true,
+                    alpaca_market_data: false,
                     alpaca_api_key: runtime_config.alpaca_api_key.clone(),
                     alpaca_api_secret: runtime_config.alpaca_api_secret.clone(),
                     phase_summary_index: None,
@@ -1504,8 +1511,28 @@ async fn run_phase1(
     .await;
 
     let mut reports = serde_json::Map::new();
+    let current_run_id = state
+        .get("run_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
     for result in results {
         let role = result.role.clone();
+        let mut result = result;
+        if result.artifact.is_none()
+            && is_critical_role(config, &result.role)
+            && !current_run_id.is_empty()
+        {
+            if let Some(artifact) = phase1_cached_analyst_artifact_fallback(
+                conn,
+                &current_run_id,
+                &result.role,
+                &result.tickers,
+            )? {
+                debug!(role = result.role, "using cached phase1 artifact fallback");
+                result.artifact = Some(artifact);
+            }
+        }
         debug!(
             role,
             elapsed_ms = result.elapsed_ms,
@@ -1523,6 +1550,99 @@ async fn run_phase1(
     // Materialize phase1_index in-process (no separate phase 1.5 / phase 15).
     materialize_phase1_index(conn, state, config)?;
     Ok(())
+}
+
+fn phase1_cached_analyst_artifact_fallback(
+    conn: &rusqlite::Connection,
+    current_run_id: &str,
+    role: &str,
+    tickers: &[String],
+) -> Result<Option<Value>> {
+    if tickers.is_empty() {
+        return Ok(None);
+    }
+    let mut per_ticker = serde_json::Map::new();
+    let mut template = None;
+
+    if let Some(aggregate) =
+        query_latest_phase1_artifact(conn, current_run_id, role, AGGREGATE_TICKER)?
+    {
+        if let Some(values) = aggregate.get("per_ticker").and_then(Value::as_object) {
+            for ticker in tickers {
+                if let Some(payload) = values.get(ticker) {
+                    per_ticker.insert(ticker.clone(), payload.clone());
+                }
+            }
+            template = Some(aggregate);
+        }
+    }
+
+    for ticker in tickers {
+        if per_ticker.contains_key(ticker) {
+            continue;
+        }
+        if let Some(artifact) =
+            query_latest_phase1_artifact(conn, current_run_id, role, ticker.as_str())?
+        {
+            let payload = artifact
+                .get("per_ticker")
+                .and_then(Value::as_object)
+                .and_then(|values| values.get(ticker).cloned())
+                .unwrap_or_else(|| artifact.clone());
+            per_ticker.insert(ticker.clone(), payload);
+            if template.is_none() {
+                template = Some(artifact);
+            }
+        }
+    }
+
+    if per_ticker.is_empty() {
+        return Ok(None);
+    }
+
+    let mut artifact = template.unwrap_or_else(|| json!({ "id": role, "role": role }));
+    if let Some(object) = artifact.as_object_mut() {
+        object.insert("status".to_string(), Value::String("degraded".to_string()));
+        object.insert("degraded".to_string(), Value::Bool(true));
+        object.insert("usable".to_string(), Value::Bool(false));
+        object.insert("fallback".to_string(), json!("cached_db_artifact"));
+        object.insert(
+            "degraded_reason".to_string(),
+            json!("using cached phase1 artifact fallback"),
+        );
+        object.insert(
+            "report".to_string(),
+            json!("phase1 artifact reused from cache due to live LLM gateway failure"),
+        );
+        object.insert(
+            "probability_rationale".to_string(),
+            json!("phase1 artifact reused from cache due to live LLM gateway failure"),
+        );
+        object.insert("per_ticker".to_string(), Value::Object(per_ticker));
+    } else {
+        return Ok(None);
+    }
+
+    Ok(Some(artifact))
+}
+
+fn query_latest_phase1_artifact(
+    conn: &rusqlite::Connection,
+    _current_run_id: &str,
+    role: &str,
+    ticker: &str,
+) -> Result<Option<Value>> {
+    let raw_json: Option<String> = conn
+        .query_row(
+            "SELECT summary_json FROM role_turn_summaries \
+             WHERE role = ?1 AND phase = 1 AND summary_type = 'artifact' \
+             AND ticker = ?2 \
+             ORDER BY created_at_ms DESC LIMIT 1",
+            params![role, ticker],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(raw_json.and_then(|raw| serde_json::from_str(&raw).ok()))
 }
 
 async fn run_phase2(
@@ -1587,7 +1707,14 @@ async fn run_phase2(
     if let Some(metrics) = topic_state.get("role_job_metrics") {
         merge_role_job_metrics(state, metrics);
     }
+    let warmup_degraded = warmup
+        .get("degraded")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     state["phase2_warmup"] = warmup;
+    if warmup_degraded {
+        state["degraded"] = json!(true);
+    }
     merge_role_job_metrics(state, &warmup_metrics);
     let topics = topics
         .into_iter()
@@ -1749,13 +1876,20 @@ async fn run_phase2_side_warmups(
         .unwrap_or("run")
         .to_string();
     if is_mock(&state) {
+        let mut bull = warmup_metadata(&run_id, "bull");
+        let mut bear = warmup_metadata(&run_id, "bear");
+        bull["warmup_ready"] = json!(true);
+        bull["degraded"] = json!(false);
+        bear["warmup_ready"] = json!(true);
+        bear["degraded"] = json!(false);
         return Ok((
             json!({
                 "ready": true,
                 "mode": "mock",
                 "llm_calls": 0,
-                "bull": warmup_metadata(&run_id, "bull"),
-                "bear": warmup_metadata(&run_id, "bear")
+                "degraded": false,
+                "bull": bull,
+                "bear": bear
             }),
             json!([]),
         ));
@@ -1786,11 +1920,28 @@ async fn run_phase2_side_warmups(
     if let Some(items) = bear_metrics.as_array() {
         metrics.extend(items.iter().cloned());
     }
+    let warmup_ready = bull
+        .get("warmup_ready")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        && bear
+            .get("warmup_ready")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+    let degraded = bull
+        .get("degraded")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || bear
+            .get("degraded")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
     Ok((
         json!({
-            "ready": true,
+            "ready": warmup_ready,
             "mode": "live",
             "llm_calls": 2,
+            "degraded": degraded,
             "bull": bull,
             "bear": bear
         }),
@@ -1827,8 +1978,10 @@ async fn run_phase2_side_warmup(
         .path_for("researcher.warmup")
         .with_context(|| format!("missing warmup prompt for {role}"))?
         .clone();
+    let mut last_error: Option<String> = None;
+    let mut status = String::new();
     for attempt in 1..=2 {
-        let artifact = run_single_steer_role_job(
+        let artifact = match run_single_steer_role_job(
             SteerRoleRun {
                 state: state.clone(),
                 role: &role,
@@ -1855,23 +2008,85 @@ async fn run_phase2_side_warmup(
             &mut state,
             &conn,
         )
-        .await?;
+        .await
+        {
+            Ok(artifact) => artifact,
+            Err(error) => {
+                last_error = Some(error.to_string());
+                if attempt == 1 {
+                    tracing::warn!(role, attempt, "phase 2 warmup call failed; retrying once");
+                }
+                continue;
+            }
+        };
+
+        status = artifact
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
         if artifact.get("status").and_then(Value::as_str) == Some("ready")
             && artifact.get("response").and_then(Value::as_str) == Some("准备完毕")
         {
+            let mut ready_metadata = metadata.clone();
+            ready_metadata["status"] = json!("ready");
+            ready_metadata["response"] = json!("准备完毕");
+            ready_metadata["warmup_ready"] = json!(true);
+            ready_metadata["degraded"] = json!(false);
+            ready_metadata["artifact_status"] = artifact.get("status").cloned().unwrap_or(Value::Null);
+            ready_metadata["artifact_response"] = artifact.get("response").cloned().unwrap_or(Value::Null);
             return Ok((
-                metadata,
+                ready_metadata,
                 state
                     .get("role_job_metrics")
                     .cloned()
                     .unwrap_or_else(|| json!([])),
             ));
         }
+        last_error = Some(format!(
+            "unexpected artifact response (status={:?}, response={:?})",
+            artifact.get("status"), artifact.get("response")
+        ));
         if attempt == 1 {
             tracing::warn!(role, "phase 2 warmup handshake failed; retrying once");
         }
     }
-    bail!("{side} warmup did not return the required 准备完毕 handshake")
+    tracing::warn!(
+        side = side,
+        ready = false,
+        status = status,
+        error = last_error.as_deref().unwrap_or("phase2 side warmup did not return the required 准备完毕 handshake"),
+        "phase 2 warmup handshake fallback applied"
+    );
+    state["degraded"] = json!(true);
+    if !state.get("degraded_report").is_some_and(Value::is_object) {
+        state["degraded_report"] = json!({"is_degraded": true, "roles": []});
+    }
+    if let Some(roles) = state
+        .get_mut("degraded_report")
+        .and_then(|report| report.get_mut("roles"))
+        .and_then(Value::as_array_mut)
+    {
+        roles.push(json!({
+            "role": role,
+            "phase": 2,
+            "kind": "warmup",
+            "error": last_error.clone().unwrap_or_else(|| "warmup failure".to_string()),
+            "message": format!("{side} warmup did not return the required 准备完毕 handshake")
+        }));
+    }
+    let mut fallback = metadata;
+    fallback["status"] = json!("degraded");
+    fallback["response"] = json!("准备完毕");
+    fallback["warmup_ready"] = json!(false);
+    fallback["degraded"] = json!(true);
+    fallback["degraded_reason"] = Value::String(
+        last_error.unwrap_or_else(|| "phase2 warmup failed".to_string()),
+    );
+    Ok((
+        fallback,
+        state.get("role_job_metrics").cloned().unwrap_or_else(|| json!([])),
+    ))
 }
 
 fn warmup_metadata(run_id: &str, side: &str) -> Value {
@@ -1880,6 +2095,8 @@ fn warmup_metadata(run_id: &str, side: &str) -> Value {
         "session_id": id.clone(),
         "turn_id": id,
         "ack": "准备完毕",
+        "response": "准备完毕",
+        "warmup_ready": false,
         "status": "ready"
     })
 }
@@ -2646,8 +2863,20 @@ async fn compress_phase_job(
     config: RuntimeConfig,
 ) -> Result<CompressJobResult> {
     let debug_enabled = state.get("debug").and_then(Value::as_bool) == Some(true);
-    let batch = if is_mock(&state) {
-        crate::orchestration::compress::build_phase_compress(&state, source_phase)?
+    let (batch, role_metrics) = if is_mock(&state) {
+        (
+            crate::orchestration::compress::build_phase_compress(&state, source_phase)?,
+            Value::Array(vec![]),
+        )
+    } else if source_phase == 1 && phase1_cached_artifact_fallback_active(&state) {
+        tracing::warn!(
+            source_phase,
+            "compressor.phase_summary falling back to deterministic in-memory summary due cached phase1 artifacts"
+        );
+        (
+            crate::orchestration::compress::build_phase_compress(&state, source_phase)?,
+            Value::Array(vec![]),
+        )
     } else {
         let source_payload =
             crate::orchestration::compress::phase_summary_source_payload(&state, source_phase)?;
@@ -2697,17 +2926,60 @@ async fn compress_phase_job(
         persist_prompt_metric(&conn, &result);
         record_role_job_metrics(&mut state, &result);
         if let Some(error) = result.error.as_deref() {
-            bail!("phase_summary compressor failed for phase {source_phase}: {error}");
+            tracing::warn!(
+                source_phase,
+                error = %error,
+                "phase_summary compressor role failed; falling back to deterministic in-memory summary"
+            );
+            state["degraded"] = json!(true);
+            if !state.get("degraded_report").is_some_and(Value::is_object) {
+                state["degraded_report"] = json!({"is_degraded": true, "roles": []});
+            }
+            if let Some(roles) = state
+                .get_mut("degraded_report")
+                .and_then(|report| report.get_mut("roles"))
+                .and_then(Value::as_array_mut)
+            {
+                roles.push(json!({
+                    "role": "compressor.phase_summary",
+                    "phase": source_phase,
+                    "kind": "phase_summary",
+                    "error": error,
+                    "message": format!("phase_summary compressor failed for phase {source_phase}")
+                }));
+            }
+            let role_metrics = state
+                .get("role_job_metrics")
+                .and_then(Value::as_array)
+                .and_then(|items| items.last())
+                .cloned()
+                .map(|item| json!([item]))
+                .unwrap_or_else(|| json!([]));
+            return Ok(CompressJobResult {
+                source_phase,
+                written: 0,
+                batch: crate::orchestration::compress::build_phase_compress(&state, source_phase)?,
+                debug_enabled,
+                role_metrics,
+            });
         }
         let artifact = result
             .artifact
             .as_ref()
             .context("phase_summary compressor returned no artifact")?;
-        crate::orchestration::compress::phase_summary_bundle_to_batch(
+        let batch = crate::orchestration::compress::phase_summary_bundle_to_batch(
             &state,
             source_phase,
             artifact,
-        )?
+        )?;
+        let current = state
+            .get("role_job_metrics")
+            .and_then(Value::as_array)
+            .and_then(|items| items.last())
+            .cloned()
+            .map(|item| json!([item]))
+            .unwrap_or_else(|| json!([]));
+        (batch, current)
     };
     let written = batch.written();
     let conn = orchestrator_sql::connect(
@@ -2721,13 +2993,6 @@ async fn compress_phase_job(
         .and_then(Value::as_str)
         .context("run_id missing for phase_summary persistence")?;
     orchestrator_sql::persist_phase_summary_batch(&conn, run_id, &batch)?;
-    let role_metrics = state
-        .get("role_job_metrics")
-        .and_then(Value::as_array)
-        .and_then(|items| items.last())
-        .cloned()
-        .map(|item| json!([item]))
-        .unwrap_or_else(|| json!([]));
     Ok(CompressJobResult {
         source_phase,
         written,
@@ -2752,6 +3017,20 @@ fn apply_compress_result(state: &mut Value, result: CompressJobResult) -> Result
         "phase_summary compress applied to memory state"
     );
     Ok(())
+}
+
+fn phase1_cached_artifact_fallback_active(state: &Value) -> bool {
+    state
+        .get("analyst_reports")
+        .and_then(Value::as_object)
+        .is_some_and(|reports| {
+            reports.values().any(|artifact| {
+                artifact
+                    .get("fallback")
+                    .and_then(Value::as_str)
+                    == Some("cached_db_artifact")
+            })
+        })
 }
 
 /// Spawn phase-00 after a business phase. The caller awaits the result before
@@ -2968,21 +3247,21 @@ async fn run_phase3(
     )
     .await?;
     enforce_phase3_deterministic_fields(state, &mut artifact);
-    if artifact
+    let artifact_is_degraded = artifact
         .get("degraded")
         .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        anyhow::bail!(
-            "manager.research returned a degraded artifact: {}",
-            artifact
-                .get("error")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown validation failure")
-        );
-    }
+        .unwrap_or(false);
     let initial_violations = phase3_probability_drift_violations(state, &artifact);
-    let artifact = if initial_violations.is_empty() {
+    let artifact = if artifact_is_degraded {
+        state["degraded"] = Value::Bool(true);
+        state["phase3_probability_guard"] = json!({
+            "status": "clamped_to_phase1_base",
+            "retry_attempted": false,
+            "retry_error": artifact.get("error").cloned().unwrap_or_else(|| json!("manager.research degraded")),
+            "violations": initial_violations
+        });
+        apply_phase3_probability_fallback(artifact, &initial_violations)
+    } else if initial_violations.is_empty() {
         artifact
     } else if mock {
         state["degraded"] = Value::Bool(true);

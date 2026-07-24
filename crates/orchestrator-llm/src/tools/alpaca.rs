@@ -8,6 +8,7 @@ use std::time::Duration;
 pub const GET_PORTFOLIO_NAME: &str = "alpaca_get_portfolio";
 pub const GET_HISTORY_NAME: &str = "alpaca_get_history";
 pub const GET_PRICE_NAME: &str = "alpaca_get_price";
+pub const GET_NEWS_NAME: &str = "alpaca_get_news";
 pub const SUBMIT_TRADE_NAME: &str = "alpaca_submit_trade";
 
 const TRADING_BASE_URL: &str = "https://paper-api.alpaca.markets/v2";
@@ -55,6 +56,44 @@ pub fn get_price_definition() -> ToolDefinition {
                 }
             },
             "required": ["symbol", "market"],
+            "additionalProperties": false
+        }),
+    }
+}
+
+pub fn get_news_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: api_tool_name(GET_NEWS_NAME),
+        description: "Read authenticated Alpaca news for configured research symbols. Returns timestamped headlines, summaries, sources, URLs, and optional article content. Use it as a market-news source and verify material claims against primary sources when available.".to_string(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "symbols": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                    "description": "One or more configured research symbols, e.g. [\"QQQ\", \"SOXX\"]."
+                },
+                "start": {
+                    "type": "string",
+                    "description": "Optional inclusive RFC-3339 or YYYY-MM-DD start."
+                },
+                "end": {
+                    "type": "string",
+                    "description": "Optional inclusive RFC-3339 or YYYY-MM-DD end."
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 50,
+                    "default": 10
+                },
+                "include_content": {
+                    "type": "boolean",
+                    "default": false
+                }
+            },
+            "required": ["symbols"],
             "additionalProperties": false
         }),
     }
@@ -108,6 +147,20 @@ pub fn submit_trade_definition() -> ToolDefinition {
 struct PriceArgs {
     symbol: String,
     market: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NewsArgs {
+    symbols: Vec<String>,
+    #[serde(default)]
+    start: Option<String>,
+    #[serde(default)]
+    end: Option<String>,
+    #[serde(default = "default_news_limit")]
+    limit: u8,
+    #[serde(default)]
+    include_content: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -168,6 +221,24 @@ pub async fn get_portfolio(config: &ExternalToolConfig) -> Result<Value> {
 
 pub async fn get_history(config: &ExternalToolConfig) -> Result<Value> {
     let (client, credentials) = live_client(config)?;
+    let portfolio = match get_portfolio(config).await {
+        Ok(portfolio) => portfolio,
+        Err(error) => {
+            return Ok(json!({
+                "status": "unavailable",
+                "source": "alpaca",
+                "message": error.to_string(),
+                "portfolio": json!({
+                    "status": "unavailable",
+                    "source": "alpaca",
+                    "message": "Account endpoint unavailable with current credentials"
+                }),
+                "fills": [],
+                "locally_imported_execution_count": 0,
+                "attribution_note": "Alpaca account access is unavailable; phase 0 attribution is skipped."
+            }));
+        }
+    };
     let fills = response_json(
         authenticated(
             client
@@ -183,8 +254,8 @@ pub async fn get_history(config: &ExternalToolConfig) -> Result<Value> {
         .await
         .context("Alpaca account activities request failed")?,
     )
-    .await?;
-    let portfolio = get_portfolio(config).await?;
+    .await
+    .unwrap_or_else(|_| Value::Array(Vec::new()));
     Ok(json!({
         "status": "success",
         "source": "alpaca",
@@ -256,6 +327,62 @@ pub async fn get_price(args: Value, config: &ExternalToolConfig) -> Result<Value
         "market": args.market,
         "price": price,
         "timestamp": trade.get("t").or_else(|| trade.get("timestamp")).cloned().unwrap_or(Value::Null)
+    }))
+}
+
+pub async fn get_news(args: Value, config: &ExternalToolConfig) -> Result<Value> {
+    let args =
+        serde_json::from_value::<NewsArgs>(args).context("invalid alpaca_get_news arguments")?;
+    if args.symbols.is_empty() || args.limit == 0 || args.limit > 50 {
+        bail!("Alpaca news requires 1-50 results and at least one symbol");
+    }
+    let symbols = args
+        .symbols
+        .iter()
+        .map(|symbol| normalized_symbol(symbol))
+        .collect::<Result<Vec<_>>>()?;
+    for symbol in &symbols {
+        validate_allowed_symbol(symbol, config)?;
+    }
+    for (name, value) in [
+        ("start", args.start.as_deref()),
+        ("end", args.end.as_deref()),
+    ] {
+        if value.is_some_and(|value| value.trim().is_empty() || value.len() > 64) {
+            bail!("Alpaca news {name} must be RFC-3339 or YYYY-MM-DD");
+        }
+    }
+    let (client, credentials) = market_data_client(config)?;
+    let mut query = vec![
+        ("symbols", symbols.join(",")),
+        ("limit", args.limit.to_string()),
+        ("sort", "desc".to_string()),
+        ("include_content", args.include_content.to_string()),
+    ];
+    if let Some(start) = args.start {
+        query.push(("start", start));
+    }
+    if let Some(end) = args.end {
+        query.push(("end", end));
+    }
+    let response = response_json(
+        authenticated(
+            client
+                .get(format!("{MARKET_DATA_BASE_URL}/v1beta1/news"))
+                .query(&query),
+            &credentials,
+        )
+        .send()
+        .await
+        .context("Alpaca news request failed")?,
+    )
+    .await?;
+    Ok(json!({
+        "status": "success",
+        "source": "alpaca_news",
+        "symbols": symbols,
+        "news": response.get("news").cloned().unwrap_or_else(|| json!([])),
+        "next_page_token": response.get("next_page_token").cloned().unwrap_or(Value::Null)
     }))
 }
 
@@ -331,6 +458,17 @@ fn live_client(config: &ExternalToolConfig) -> Result<(Client, Credentials)> {
     if !config.alpaca_live {
         bail!("Alpaca tools are disabled for mock or debug execution");
     }
+    authenticated_client(config)
+}
+
+fn market_data_client(config: &ExternalToolConfig) -> Result<(Client, Credentials)> {
+    if !config.alpaca_market_data {
+        bail!("Alpaca market-data tools are disabled for mock or debug execution");
+    }
+    authenticated_client(config)
+}
+
+fn authenticated_client(config: &ExternalToolConfig) -> Result<(Client, Credentials)> {
     let api_key = config
         .alpaca_api_key
         .clone()
@@ -363,6 +501,10 @@ fn authenticated(
         .header("APCA-API-SECRET-KEY", &credentials.api_secret)
 }
 
+const fn default_news_limit() -> u8 {
+    10
+}
+
 fn normalized_symbol(symbol: &str) -> Result<String> {
     let symbol = symbol.trim().to_ascii_uppercase();
     if symbol.is_empty()
@@ -384,7 +526,7 @@ fn validate_allowed_symbol(symbol: &str, config: &ExternalToolConfig) -> Result<
     {
         Ok(())
     } else {
-        bail!("Alpaca symbol {symbol} is not in the configured investable assets")
+        bail!("Alpaca symbol {symbol} is not in this role's configured symbol universe")
     }
 }
 
@@ -474,6 +616,18 @@ mod tests {
     #[tokio::test]
     async fn live_gate_blocks_network_and_credentials() {
         let error = get_portfolio(&ExternalToolConfig::default())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("mock or debug"));
+    }
+
+    #[tokio::test]
+    async fn market_data_gate_blocks_news_network_and_credentials() {
+        let config = ExternalToolConfig {
+            tickers: vec!["QQQ".to_string()],
+            ..Default::default()
+        };
+        let error = get_news(json!({"symbols": ["QQQ"]}), &config)
             .await
             .unwrap_err();
         assert!(error.to_string().contains("mock or debug"));

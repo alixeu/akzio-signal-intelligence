@@ -464,7 +464,7 @@ fn builtin_llm_role_values() -> BTreeMap<String, Value> {
             "analyst.news_macro",
             6,
             None,
-            vec!["read_experience", "read_jin10_context"],
+            vec!["read_experience", "read_jin10_context", "alpaca_get_news"],
             true,
         ),
         // Phase-2 roles read the compact index, then expand selected summaries.
@@ -1090,6 +1090,10 @@ mod tests {
         ] {
             assert_eq!(roles[role]["tools"], json!([]), "role={role}");
         }
+        assert_eq!(
+            roles["analyst.news_macro"]["tools"],
+            json!(["read_experience", "read_jin10_context", "alpaca_get_news"])
+        );
         assert_eq!(
             roles["portfolio.manager"]["tools"],
             json!([

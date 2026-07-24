@@ -365,6 +365,7 @@ pub(crate) async fn run_technical_csv_preflight(
         .map(str::to_string);
 
     let result = technical::run(technical::TechnicalArgs {
+        source: None,
         symbols,
         start: None,
         end,
@@ -426,7 +427,7 @@ pub(crate) async fn run_jin10_preflight(
         .get("jin10_lookback_hours")
         .and_then(Value::as_f64)
         .unwrap_or(24.0);
-    let result = jin10::run(jin10::Jin10Args {
+    let result = match jin10::run(jin10::Jin10Args {
         channel: None,
         vip: None,
         classify: None,
@@ -439,6 +440,13 @@ pub(crate) async fn run_jin10_preflight(
         pretty: false,
     })
     .await
+    {
+        Ok(payload) => Ok(payload),
+        Err(error) => {
+            run_jin10_fallback(lookback_hours, error.to_string())
+                .map_err(|fallback_error| fallback_error.context(format!("jin10 preflight request failed: {error}")))
+        }
+    }
     .and_then(|payload| {
         let csv = payload.get("csv").cloned().unwrap_or(Value::Null);
         let rows = csv.get("rows").and_then(Value::as_u64).unwrap_or_default();
@@ -454,6 +462,34 @@ pub(crate) async fn run_jin10_preflight(
     });
     record_preflight_result(state, tool, result);
     Ok(())
+}
+
+fn run_jin10_fallback(
+    lookback_hours: f64,
+    error_message: String,
+) -> Result<Value> {
+    let rows = orchestrator_core::load_jin10_csv_recent(1);
+    if rows.is_empty() {
+        bail!("Jin10 fallback cache missing: {error_message}");
+    }
+    let items = rows
+        .iter()
+        .map(|row| json!({"time": row.time, "content": row.content}))
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "status": "success",
+        "csv": {
+            "path": orchestrator_core::default_jin10_csv_dir().display().to_string(),
+            "rows": items.len(),
+            "fallback": "local_cache"
+        },
+        "sqlite_rows": 0,
+        "persistence": "deferred_until_attention_scored",
+        "items": items,
+        "lookback_hours": lookback_hours,
+        "source": "local_jin10_cache",
+        "fallback_error": error_message
+    }))
 }
 
 fn preflight_status<'a>(state: &'a Value, name: &str) -> Option<&'a Value> {
