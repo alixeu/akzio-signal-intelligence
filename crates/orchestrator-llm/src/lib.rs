@@ -1988,7 +1988,7 @@ fn extract_encrypted_reasoning(raw: &Value) -> Option<String> {
 fn parse_final_output(settings: &AgentSettings, text: &str) -> Result<Value> {
     match settings.output_mode {
         OutputMode::ResearchArtifact => {
-            let value = extract_json_artifact(text)?;
+            let value = parse_json_object_artifact(text)?;
             let value = normalize_research_artifact_value(value, &settings.tickers)
                 .context("failed to normalize research artifact JSON")?;
             validate_optional_role(settings, &value)?;

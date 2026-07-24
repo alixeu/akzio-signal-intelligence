@@ -8,6 +8,9 @@
 
 硬性规则：
 - 运行时写入 `id`、`role` 和 artifact envelope；只输出本角色的分析内容。
+- `id` 必须与 `role` 完全一致（例如 `analyst.technical`、`analyst.news_macro`），不要添加前缀、后缀或时间戳。
+- 输出必须是单个 JSON 对象，不允许用 `type` / `content` 包装层。`per_ticker` 必须位于对象顶层，且禁止在输出中返回任何与 schema 无关的顶层封装字段。
+- `per_ticker` 下每个 ticker 必须包含且完整输出：`direction`、`confidence`、`report`、`key_evidence`、`priced_in`、`validation_triggers`、`data_gaps`。`report` 为中文非空段落，不得省略。
 - `per_ticker` 必须完整且只能覆盖运行时给定的 ticker；key 使用大写 canonical symbol，不新增、不替换、不遗漏。
 - 机读字段是权威结果。`report` 只解释同一结论，不另建一套方向、冲突或概率判断。
 - `direction` 只能为 `bullish`、`bearish`、`neutral`、`mixed` 或 `unobserved`；不得输出组合标签（例如 `neutral_bullish`）。无可用样本时使用 `direction="unobserved"`、`confidence=0.0`。`unobserved` 仅用于诊断，不代表 neutral，不得参与概率合成。
