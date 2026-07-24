@@ -4442,6 +4442,7 @@ mod tests {
             think_tool: false,
             tools: Vec::new(),
             native_web_search,
+            free_opencode: false,
         }
     }
 

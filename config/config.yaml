@@ -79,6 +79,11 @@ orchestrator:
       # Require an env-provided key; never ship a real default secret in-repo.
       api_key: &llm_gateway_api_key ${LLM_GATEWAY_API_KEY}
     defaults:
+      # free_opencode: 开启后直接无视上面的 gateway.base_url / gateway.api_key 以及下面的
+      #   model，固定以 chat_completions 模式调用 opencode 免费网关
+      #   (https://opencode.ai/zen/v1) 的 deepseek-v4-flash-free 模型，并自动附带
+      #   opencode 所需的全部请求头。设为 false 时回退到常规 gateway 配置。
+      free_opencode: true
       route: chat_completions
       model: deepseek-v4-flash
       base_url: *llm_gateway_base_url

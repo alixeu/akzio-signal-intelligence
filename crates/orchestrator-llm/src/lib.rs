@@ -53,6 +53,13 @@ pub enum OutputMode {
     ResearchArtifact,
 }
 
+/// Fixed endpoint, credentials, and model for the free opencode Zen gateway.
+/// When a role sets `free_opencode`, the configured gateway base_url / api_key
+/// and model are ignored in favor of these values (chat_completions only).
+const FREE_OPENCODE_BASE_URL: &str = "https://opencode.ai/zen/v1";
+const FREE_OPENCODE_API_KEY: &str = "public";
+const FREE_OPENCODE_MODEL: &str = "deepseek-v4-flash-free";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoleLlmSettings {
     pub route: LlmRoute,
@@ -83,22 +90,30 @@ pub struct RoleLlmSettings {
     pub tools: Vec<String>,
     #[serde(default)]
     pub native_web_search: bool,
+    /// When true, ignore the configured gateway base_url / api_key and model,
+    /// and route every call through the free opencode Zen gateway using the
+    /// chat_completions API with the model pinned to `deepseek-v4-flash-free`.
+    #[serde(default, alias = "free-opencode")]
+    pub free_opencode: bool,
 }
 
 impl RoleLlmSettings {
     pub fn validate(&self, role: &str) -> Result<()> {
-        if self.model.trim().is_empty() {
+        if !self.free_opencode && self.model.trim().is_empty() {
             bail!("LLM config for role {role:?} requires model");
         }
         if self.max_turns == Some(0) {
             bail!("LLM config for role {role:?} requires max_turns >= 1");
         }
-        if self
-            .base_url
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .is_none()
+        // free_opencode pins base_url / api_key to the opencode Zen gateway, so
+        // the configured OpenAI-compatible endpoint credentials are not required.
+        if !self.free_opencode
+            && self
+                .base_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_none()
         {
             bail!("LLM config for role {role:?} requires base_url for openai_compatible");
         }
@@ -107,7 +122,7 @@ impl RoleLlmSettings {
             .as_deref()
             .map(str::trim)
             .is_some_and(|value| !value.is_empty());
-        if !has_api_key {
+        if !self.free_opencode && !has_api_key {
             bail!("LLM config for role {role:?} requires api_key for openai_compatible");
         }
         for tool in &self.tools {
@@ -143,6 +158,26 @@ impl RoleLlmSettings {
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
+    }
+
+    /// The route actually used for requests. free_opencode always calls the
+    /// chat_completions API regardless of the configured route.
+    pub fn effective_route(&self) -> LlmRoute {
+        if self.free_opencode {
+            LlmRoute::ChatCompletions
+        } else {
+            self.route
+        }
+    }
+
+    /// The model actually sent to the provider. free_opencode pins the model to
+    /// the free opencode model regardless of the configured value.
+    pub fn effective_model(&self) -> &str {
+        if self.free_opencode {
+            FREE_OPENCODE_MODEL
+        } else {
+            self.model.as_str()
+        }
     }
 }
 
@@ -323,7 +358,7 @@ fn agent_loop_config_from_settings(settings: &AgentSettings) -> AgentLoopConfig 
         project_root: Some(debug_project_root(settings)),
         role: settings.role.clone(),
         phase: settings.phase,
-        model: settings.llm.model.clone(),
+        model: settings.llm.effective_model().to_string(),
         topic_id: settings.topic_id.clone(),
         ..AgentLoopConfig::default()
     }
@@ -491,6 +526,36 @@ fn record_jin10_usage_from_artifact(
         }
     }
 
+    // The news analyst sometimes references jin10 ids that are truncated or
+    // hallucinated and thus absent from jin10_items. Attention is auxiliary
+    // bookkeeping, so drop unknown ids here instead of letting the authoritative
+    // writer abort this critical role.
+    let candidate_ids: Vec<String> = attention.iter().map(|a| a.id.clone()).collect();
+    let present = orchestrator_sql::existing_jin10_ids(conn, &candidate_ids)?;
+    let mut dropped_ids: Vec<String> = Vec::new();
+    let recorded: Vec<orchestrator_sql::Jin10Attention> = attention
+        .into_iter()
+        .filter(|a| {
+            if present.contains(a.id.trim()) {
+                true
+            } else {
+                dropped_ids.push(a.id.clone());
+                false
+            }
+        })
+        .collect();
+    if !dropped_ids.is_empty() {
+        tracing::warn!(
+            role = %settings.role,
+            turn_id,
+            dropped = ?dropped_ids,
+            "skipping jin10 attention for ids missing from jin10_items"
+        );
+    }
+    if recorded.is_empty() {
+        return Ok(());
+    }
+
     let run_id = loop_run_id(settings);
     let updated = orchestrator_sql::record_jin10_attention_for_turn(
         conn,
@@ -498,12 +563,12 @@ fn record_jin10_usage_from_artifact(
         turn_id,
         &settings.role,
         settings.phase,
-        &attention,
+        &recorded,
     )?;
     debug!(
         role = %settings.role,
         turn_id,
-        scored = attention.len(),
+        scored = recorded.len(),
         updated,
         "recorded jin10 attention scores to ledger"
     );
@@ -959,7 +1024,7 @@ async fn run_model_text_once(
     input: &agent_loop::ModelInput,
     prompt: &str,
 ) -> Result<String> {
-    match settings.llm.route {
+    match settings.llm.effective_route() {
         LlmRoute::Responses => run_responses_text_once(settings, input, prompt).await,
         LlmRoute::ChatCompletions => run_chat_completions_text_once(settings, input, prompt).await,
     }
@@ -971,7 +1036,7 @@ pub async fn run_model_event_stream(
     prompt: &str,
     handler: &mut dyn ModelEventHandler,
 ) -> Result<()> {
-    match settings.llm.route {
+    match settings.llm.effective_route() {
         LlmRoute::Responses => stream_responses_with_retry(settings, input, prompt, handler).await,
         LlmRoute::ChatCompletions => {
             stream_chat_completions_with_retry(settings, input, prompt, handler).await
@@ -1336,7 +1401,7 @@ fn build_chat_completions_request(
     ));
 
     let msg_count = messages.len();
-    let model = settings.llm.model.clone();
+    let model = settings.llm.effective_model().to_string();
     let mut binding = CreateChatCompletionRequestArgs::default();
     let mut builder = binding.model(&model).messages(messages);
 
@@ -2805,6 +2870,9 @@ fn openai_compatible_base_url(settings: &RoleLlmSettings) -> Result<&str> {
 fn openai_compatible_responses_client(
     settings: &RoleLlmSettings,
 ) -> Result<OpenAIClient<OpenAIConfig>> {
+    if settings.free_opencode {
+        return free_opencode_client();
+    }
     let api_key = openai_compatible_api_key(settings)?;
     let base_url = openai_compatible_base_url(settings)?;
     debug!(
@@ -2815,6 +2883,31 @@ fn openai_compatible_responses_client(
     let config = OpenAIConfig::new()
         .with_api_key(api_key)
         .with_api_base(base_url);
+    Ok(OpenAIClient::with_config(config))
+}
+
+/// Build a client for the free opencode Zen gateway. Every documented header
+/// must be present or the gateway rejects the request: Authorization comes from
+/// the fixed public api key, Content-Type is added per JSON request by the
+/// client, and the remaining opencode headers are attached here.
+fn free_opencode_client() -> Result<OpenAIClient<OpenAIConfig>> {
+    let session = format!("sess_{}", Uuid::new_v4().simple());
+    let request_id = format!("msg_{}", Uuid::new_v4().simple());
+    debug!(
+        base_url = %FREE_OPENCODE_BASE_URL,
+        model = %FREE_OPENCODE_MODEL,
+        "creating free opencode Zen chat completions client"
+    );
+    let config = OpenAIConfig::new()
+        .with_api_base(FREE_OPENCODE_BASE_URL)
+        .with_api_key(FREE_OPENCODE_API_KEY)
+        .with_header("x-opencode-project", "proj_akzio_signal")
+        .and_then(|config| config.with_header("x-opencode-session", session.as_str()))
+        .and_then(|config| config.with_header("x-opencode-request", request_id.as_str()))
+        .and_then(|config| config.with_header("x-opencode-client", "cli"))
+        .and_then(|config| config.with_header("Accept", "text/event-stream"))
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .context("failed to set free opencode gateway headers")?;
     Ok(OpenAIClient::with_config(config))
 }
 
@@ -3153,6 +3246,7 @@ mod tests {
                 think_tool: true,
                 tools: Vec::new(),
                 native_web_search: false,
+                free_opencode: false,
             },
             reasoning_effort_override: None,
             tools: None,
@@ -3958,6 +4052,7 @@ mod tests {
             think_tool: false,
             tools: vec!["missing_tool".to_string()],
             native_web_search: false,
+            free_opencode: false,
         };
         let err = settings.validate("analyst.technical").unwrap_err();
         assert!(err.to_string().contains("unknown tool name"));
@@ -4003,6 +4098,7 @@ mod tests {
             think_tool: false,
             tools: Vec::new(),
             native_web_search: false,
+            free_opencode: false,
         };
         settings.validate("manager.research").unwrap();
 
@@ -4032,6 +4128,23 @@ mod tests {
             ..settings
         };
         settings.validate("manager.research").unwrap();
+    }
+
+    #[test]
+    fn free_opencode_forces_chat_route_and_relaxes_validation() {
+        let value = json!({
+            "route": "responses",
+            "model": "",
+            "max_turns": 4,
+            "tools": [],
+            "free-opencode": true
+        });
+        let settings: RoleLlmSettings = serde_json::from_value(value).unwrap();
+        assert!(settings.free_opencode);
+        // Missing model / base_url / api_key are tolerated when free_opencode is on.
+        settings.validate("manager.research").unwrap();
+        assert_eq!(settings.effective_route(), LlmRoute::ChatCompletions);
+        assert_eq!(settings.effective_model(), "deepseek-v4-flash-free");
     }
 
     #[test]

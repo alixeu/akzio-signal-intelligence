@@ -23,8 +23,8 @@ pub use context::{
     RuntimeContext,
 };
 pub use importers::{
-    import_jin10_payload, import_scored_jin10_items, jin10_item_id, record_jin10_attention,
-    record_jin10_attention_for_turn, Jin10Attention,
+    existing_jin10_ids, import_jin10_payload, import_scored_jin10_items, jin10_item_id,
+    record_jin10_attention, record_jin10_attention_for_turn, Jin10Attention,
 };
 pub use maintenance::{
     cleanup_database, core_query_plans, database_doctor, open_read_only, vacuum, wal_checkpoint,

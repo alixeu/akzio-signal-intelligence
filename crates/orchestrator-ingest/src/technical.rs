@@ -366,16 +366,16 @@ pub async fn run(args: TechnicalArgs) -> Result<Value> {
                         results.push((
                             job_order,
                             json!({
-                                "symbol": symbol,
-                                "interval": interval,
-                                "source": "cached_csv",
-                            "bars": rows,
-                            "feature_rows": rows,
-                            "status": "fallback",
-                            "cache_path": csv_path.display().to_string(),
-                            "error": error.to_string(),
-                        }),
-                    ));
+                                    "symbol": symbol,
+                                    "interval": interval,
+                                    "source": "cached_csv",
+                                "bars": rows,
+                                "feature_rows": rows,
+                                "status": "fallback",
+                                "cache_path": csv_path.display().to_string(),
+                                "error": error.to_string(),
+                            }),
+                        ));
                     } else {
                         failures.push(format!("{symbol}/{interval}: {error:#}"));
                         results.push((

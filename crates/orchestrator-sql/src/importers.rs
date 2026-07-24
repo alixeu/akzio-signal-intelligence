@@ -106,6 +106,29 @@ pub fn import_scored_jin10_items(
     Ok(count)
 }
 
+/// Return the subset of `ids` that currently exist in `jin10_items`.
+///
+/// The news analyst occasionally references jin10 ids that are truncated or
+/// hallucinated. Callers use this to validate LLM-provided ids before the
+/// authoritative attention write, which requires every target row to exist.
+pub fn existing_jin10_ids(
+    conn: &Connection,
+    ids: &[String],
+) -> Result<std::collections::BTreeSet<String>> {
+    let mut stmt = conn.prepare_cached("SELECT 1 FROM jin10_items WHERE id = ?1")?;
+    let mut present = std::collections::BTreeSet::new();
+    for id in ids {
+        let id = id.trim();
+        if id.is_empty() || present.contains(id) {
+            continue;
+        }
+        if stmt.exists(params![id])? {
+            present.insert(id.to_string());
+        }
+    }
+    Ok(present)
+}
+
 /// A single Jin10 attention assignment from the news analyst.
 #[derive(Debug, Clone)]
 pub struct Jin10Attention {
@@ -277,5 +300,27 @@ mod tests {
             .unwrap(),
             0.35
         );
+    }
+
+    #[test]
+    fn existing_jin10_ids_filters_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut conn = connect(temp.path().join("existing.sqlite")).unwrap();
+        ensure_schema(&conn).unwrap();
+        let payload = json!({
+            "items": [
+                {"time": "2026-06-19 09:00:00", "content": "rate cut odds move"}
+            ]
+        });
+        assert_eq!(import_jin10_payload(&mut conn, &payload).unwrap(), 1);
+        let real = jin10_item_id("2026-06-19 09:00:00", "rate cut odds move");
+        let present = existing_jin10_ids(
+            &conn,
+            &[real.clone(), "13b67309".to_string(), "  ".to_string()],
+        )
+        .unwrap();
+        assert!(present.contains(&real));
+        assert!(!present.contains("13b67309"));
+        assert_eq!(present.len(), 1);
     }
 }
