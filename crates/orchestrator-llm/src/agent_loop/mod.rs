@@ -49,7 +49,7 @@ impl LoopModel for AgentLoopModel {
             let started = Instant::now();
             let req_messages = input_to_debug_messages(&input);
             let prompt = model_prompt(&input)?;
-            let text = crate::run_model_text_once(&self.settings, &input, &prompt).await?;
+            let result = crate::run_model_text_once(&self.settings, &input, &prompt).await;
             if self.settings.debug {
                 let elapsed_ms = started.elapsed().as_millis();
                 crate::append_debug_llm_record(
@@ -59,18 +59,21 @@ impl LoopModel for AgentLoopModel {
                         "role": self.settings.role,
                         "phase": self.settings.phase,
                         "topic_id": self.settings.topic_id,
+                        "round": self.settings.debug_round,
                         "model": self.settings.llm.model,
                         "req": { "messages": req_messages },
                         "resp": {
-                            "status": "completed",
-                            "output": [{"type": "output_text", "text": &text}],
+                            "status": if result.is_ok() { "completed" } else { "error" },
+                            "output": result.as_ref().ok().map(|text| json!([{"type": "output_text", "text": text}])).unwrap_or_else(|| json!([])),
+                            "error": result.as_ref().err().map(ToString::to_string),
                         },
                         "elapsed_ms": elapsed_ms,
                         "token": null,
-                        "response_text": text,
+                        "response_text": result.as_ref().ok(),
                     }),
                 )?;
             }
+            let text = result?;
             Ok(model_response_from_assistant_text(&text))
         })
     }
@@ -89,7 +92,7 @@ impl LoopModel for AgentLoopModel {
             if self.settings.debug {
                 crate::append_debug_llm_record(
                     &self.settings,
-                    capture.into_record(&self.settings),
+                    capture.into_record(&self.settings, result.as_ref().err()),
                 )?;
             }
             result

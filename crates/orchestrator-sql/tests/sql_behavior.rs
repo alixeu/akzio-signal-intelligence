@@ -447,6 +447,45 @@ fn summaries_are_written_and_read_from_role_turn_summaries() {
 }
 
 #[test]
+fn debate_context_reads_only_phase2_rows() {
+    let temp = tempfile::tempdir().unwrap();
+    let db_path = temp.path().join("orchestrator.sqlite");
+    let conn = connect(&db_path).unwrap();
+    for (turn_id, phase) in [("phase2", 2), ("legacy-phase25", 25)] {
+        write_role_turn_summary(
+            &conn,
+            &RoleTurnSummaryInput {
+                run_id: "run-1".to_string(),
+                turn_id: turn_id.to_string(),
+                role: "mediator.topic_controller".to_string(),
+                phase: Some(phase),
+                ticker: "QQQ".to_string(),
+                item_time: ts("2026-06-19T03:00:00Z"),
+                topic_id: Some("topic-1".to_string()),
+                debate_id: None,
+                summary_type: "topic_final".to_string(),
+                summary: turn_id.to_string(),
+                summary_json: json!({"summary": turn_id}),
+                confidence: 0.8,
+            },
+        )
+        .unwrap();
+    }
+
+    let ctx = RuntimeContext {
+        run_id: "run-1".to_string(),
+        ticker: "QQQ".to_string(),
+        tickers: vec!["QQQ".to_string()],
+        phase: 3,
+        role: "manager.research".to_string(),
+    };
+    let result = handle_read_command(&conn, "get-debate-history", &ctx, None).unwrap();
+
+    assert_eq!(result["items"].as_array().unwrap().len(), 1);
+    assert_eq!(result["items"][0]["phase"], 2);
+}
+
+#[test]
 fn turn_tables_persist_items_and_history() {
     let temp = tempfile::tempdir().unwrap();
     let db_path = temp.path().join("orchestrator.sqlite");
@@ -539,7 +578,7 @@ fn compose_context_scores_trims_and_audits_blocks() {
             run_id: "run-1".to_string(),
             turn_id: "summary-1".to_string(),
             role: "mediator.topic_controller".to_string(),
-            phase: Some(25),
+            phase: Some(2),
             ticker: "TQQQ".to_string(),
             item_time: ts("2026-06-19T12:00:00Z"),
             topic_id: Some("topic-1".to_string()),

@@ -43,7 +43,11 @@ impl<'a> DebugLlmCapture<'a> {
         }
     }
 
-    pub(super) fn into_record(self, settings: &AgentSettings) -> Value {
+    pub(super) fn into_record(
+        self,
+        settings: &AgentSettings,
+        error: Option<&anyhow::Error>,
+    ) -> Value {
         let end_turn = if self.tool_calls.is_empty() {
             self.end_turn
         } else {
@@ -66,8 +70,15 @@ impl<'a> DebugLlmCapture<'a> {
         }
 
         let resp = json!({
-            "status": if end_turn == Some(true) { "completed" } else { "in_progress" },
+            "status": if error.is_some() {
+                "error"
+            } else if end_turn == Some(true) {
+                "completed"
+            } else {
+                "in_progress"
+            },
             "output": output,
+            "error": error.map(ToString::to_string),
             "usage": {
                 "input_tokens": usage.input_tokens,
                 "output_tokens": usage.output_tokens,
@@ -82,6 +93,7 @@ impl<'a> DebugLlmCapture<'a> {
             "role": settings.role,
             "phase": settings.phase,
             "topic_id": settings.topic_id,
+            "round": settings.debug_round,
             "model": settings.llm.model,
             "req": {
                 "messages": self.req_messages,

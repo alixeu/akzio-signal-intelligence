@@ -14,7 +14,11 @@ use orchestrator_core::{
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{fs, path::PathBuf, sync::Arc};
+use std::{
+    fs,
+    path::{Component, Path, PathBuf},
+    sync::{Arc, Mutex, OnceLock},
+};
 use tracing::debug;
 use truncation::TruncationConfig;
 use uuid::Uuid;
@@ -146,8 +150,14 @@ impl RoleLlmSettings {
 pub struct AgentSettings {
     pub role: String,
     pub phase: Option<i64>,
-    /// Optional debate topic id so phase-2 debug files do not clobber each other.
+    /// Optional topic identifier retained on every debug record.
     pub topic_id: Option<String>,
+    /// Prompt source path relative to the project root, used to mirror debug output.
+    pub debug_prompt_path: Option<PathBuf>,
+    /// Optional debug output path relative to the project root for non-standard layouts.
+    pub debug_output_path: Option<PathBuf>,
+    /// Optional role-specific round number retained on every debug record.
+    pub debug_round: Option<usize>,
     pub tickers: Vec<String>,
     pub output_mode: OutputMode,
     pub llm: RoleLlmSettings,
@@ -632,25 +642,38 @@ pub fn append_debug_llm_record(settings: &AgentSettings, record: Value) -> Resul
     if !settings.debug {
         return Ok(());
     }
-    let phase = settings.phase.unwrap_or_default();
     let root = settings
         .tools
         .as_ref()
         .map(|tools| tools.project_root.clone())
         .unwrap_or_else(default_project_root);
-    let path = root.join(debug_record_relative_path_with_topic(
-        phase,
-        &settings.role,
-        settings.topic_id.as_deref(),
-    ));
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create debug dir {}", parent.display()))?;
+    let prompt_path = settings.debug_prompt_path.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "debug LLM record for role {:?} requires debug_prompt_path",
+            settings.role
+        )
+    })?;
+    let output_path = settings
+        .debug_output_path
+        .as_deref()
+        .map(validate_debug_output_relative_path)
+        .transpose()?
+        .unwrap_or(debug_record_relative_path_from_prompt(prompt_path)?);
+
+    let mut record = record;
+    if let Some(object) = record.as_object_mut() {
+        object.entry("role").or_insert_with(|| json!(settings.role));
+        object
+            .entry("phase")
+            .or_insert_with(|| json!(settings.phase));
+        object
+            .entry("topic_id")
+            .or_insert_with(|| json!(settings.topic_id));
+        object
+            .entry("round")
+            .or_insert_with(|| json!(settings.debug_round));
     }
-    let pretty = serde_json::to_string_pretty(&record)?;
-    fs::write(&path, pretty)
-        .with_context(|| format!("failed to write debug llm record {}", path.display()))?;
-    Ok(())
+    append_debug_output_record(&root, &output_path, &prompt_path.to_string_lossy(), record)
 }
 
 pub fn reset_debug_output_dir(project_root: &std::path::Path) -> Result<()> {
@@ -679,28 +702,29 @@ fn append_debug_json_record(
     relative: &str,
     mut record: Value,
 ) -> Result<()> {
-    if let Some(object) = record.as_object_mut() {
-        object
-            .entry("ts_ms".to_string())
-            .or_insert_with(|| json!(debug_now_ms()));
-    }
     let path = project_root.join(relative);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create debug dir {}", parent.display()))?;
-    }
-    let mut records = if path.exists() {
-        let contents = fs::read_to_string(&path)
-            .with_context(|| format!("failed to read debug metrics {}", path.display()))?;
-        serde_json::from_str::<Vec<Value>>(&contents)
-            .with_context(|| format!("debug metrics {} must be a JSON array", path.display()))?
-    } else {
-        Vec::new()
-    };
-    records.push(record);
-    fs::write(&path, serde_json::to_string_pretty(&records)?)
-        .with_context(|| format!("failed to write debug metrics {}", path.display()))?;
-    Ok(())
+    with_debug_output_lock(|| {
+        if let Some(object) = record.as_object_mut() {
+            object
+                .entry("ts_ms".to_string())
+                .or_insert_with(|| json!(debug_now_ms()));
+        }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create debug dir {}", parent.display()))?;
+        }
+        let mut records = if path.exists() {
+            let contents = fs::read_to_string(&path)
+                .with_context(|| format!("failed to read debug metrics {}", path.display()))?;
+            serde_json::from_str::<Vec<Value>>(&contents)
+                .with_context(|| format!("debug metrics {} must be a JSON array", path.display()))?
+        } else {
+            Vec::new()
+        };
+        records.push(record);
+        fs::write(&path, serde_json::to_string_pretty(&records)?)
+            .with_context(|| format!("failed to write debug metrics {}", path.display()))
+    })
 }
 
 fn debug_now_ms() -> u128 {
@@ -733,21 +757,125 @@ pub fn debug_log_token(project_root: &std::path::Path, record: Value) {
     }
 }
 
-pub fn debug_record_relative_path(phase: i64, role: &str) -> PathBuf {
-    debug_record_relative_path_with_topic(phase, role, None)
+static DEBUG_OUTPUT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn with_debug_output_lock<T>(write: impl FnOnce() -> Result<T>) -> Result<T> {
+    let lock = DEBUG_OUTPUT_LOCK.get_or_init(|| Mutex::new(()));
+    let _guard = lock
+        .lock()
+        .map_err(|_| anyhow::anyhow!("debug output lock was poisoned"))?;
+    write()
 }
 
-pub fn debug_record_relative_path_with_topic(
-    phase: i64,
-    role: &str,
-    topic_id: Option<&str>,
-) -> PathBuf {
-    let role_part = safe_path_part(role);
-    let file_stem = match topic_id.map(str::trim).filter(|value| !value.is_empty()) {
-        Some(topic) => format!("{role_part}__{}", safe_path_part(topic)),
-        None => role_part,
-    };
-    PathBuf::from(format!("outputs/debug/phase{phase:02}/{file_stem}.json"))
+/// Resolve the prompt-mirrored JSON debug output path.
+///
+/// `prompts/phase1/news_macro.md` becomes `outputs/debug/phase1/news_macro.json`.
+pub fn debug_record_relative_path_from_prompt(prompt_path: &Path) -> Result<PathBuf> {
+    let mut components = prompt_path.components();
+    if components.next() != Some(Component::Normal("prompts".as_ref()))
+        || components.clone().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        bail!(
+            "debug prompt path must be a relative path under prompts/: {}",
+            prompt_path.display()
+        );
+    }
+    if prompt_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        != Some("md")
+    {
+        bail!(
+            "debug prompt path must name a .md file: {}",
+            prompt_path.display()
+        );
+    }
+    let relative = prompt_path
+        .strip_prefix("prompts")
+        .expect("checked prompts path prefix");
+    Ok(PathBuf::from("outputs/debug")
+        .join(relative)
+        .with_extension("json"))
+}
+
+fn validate_debug_output_relative_path(path: &Path) -> Result<PathBuf> {
+    if path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        bail!(
+            "debug output path must be relative to the project root: {}",
+            path.display()
+        );
+    }
+    Ok(path.to_path_buf())
+}
+
+/// Append a workflow-local or runtime debug record to the same prompt-record envelope.
+///
+/// `relative_output_path` is relative to the project root, typically below
+/// `outputs/debug/`; `source_label` identifies a non-prompt producer such as `runtime`.
+pub fn append_debug_output_record(
+    project_root: &Path,
+    relative_output_path: &Path,
+    source_label: &str,
+    record: Value,
+) -> Result<()> {
+    let relative_output_path = validate_debug_output_relative_path(relative_output_path)?;
+    let source_label = source_label.trim();
+    if source_label.is_empty() {
+        bail!("debug source label must not be empty");
+    }
+    let path = project_root.join(relative_output_path);
+    with_debug_output_lock(|| {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create debug dir {}", parent.display()))?;
+        }
+        let mut output = if path.exists() {
+            let contents = fs::read_to_string(&path)
+                .with_context(|| format!("failed to read debug record {}", path.display()))?;
+            serde_json::from_str::<Value>(&contents)
+                .with_context(|| format!("debug record {} must be JSON", path.display()))?
+        } else {
+            json!({"prompt_path": source_label, "records": []})
+        };
+        let object = output.as_object_mut().ok_or_else(|| {
+            anyhow::anyhow!("debug record {} must be a JSON object", path.display())
+        })?;
+        let existing_prompt_path = object
+            .entry("prompt_path")
+            .or_insert_with(|| json!(source_label));
+        if existing_prompt_path.as_str() != Some(source_label) {
+            bail!(
+                "debug record {} has prompt_path {:?}, expected {:?}",
+                path.display(),
+                existing_prompt_path,
+                source_label
+            );
+        }
+        let records = object
+            .get_mut("records")
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "debug record {} must contain a records array",
+                    path.display()
+                )
+            })?;
+        records.push(record);
+        fs::write(&path, serde_json::to_string_pretty(&output)?)
+            .with_context(|| format!("failed to write debug record {}", path.display()))
+    })
 }
 
 fn end_context_item(item: &agent_loop::TurnItem) -> Option<Value> {
@@ -2975,7 +3103,7 @@ mod tests {
     use crate::web_search::{WebSearchConfig, WebSearchMode};
     use anyhow::anyhow;
     use serde_json::{json, Value};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn context_window_full_is_not_transient() {
@@ -3004,6 +3132,9 @@ mod tests {
             role: "manager.research".to_string(),
             phase: None,
             topic_id: None,
+            debug_prompt_path: None,
+            debug_output_path: None,
+            debug_round: None,
             tickers: vec!["TQQQ".to_string()],
             output_mode: OutputMode::ResearchArtifact,
             llm: RoleLlmSettings {
@@ -3165,12 +3296,13 @@ mod tests {
     }
 
     #[test]
-    fn append_debug_llm_record_writes_formatted_json_under_outputs_debug() {
+    fn append_debug_llm_record_mirrors_prompt_path_and_appends_records() {
         let temp = tempfile::tempdir().unwrap();
         let mut settings = base_settings(LlmRoute::Responses);
         settings.debug = true;
         settings.phase = Some(1);
         settings.role = "analyst.technical".to_string();
+        settings.debug_prompt_path = Some(PathBuf::from("prompts/phase1/technical.md"));
         settings.tools = Some(tools::ExternalToolConfig {
             project_root: temp.path().to_path_buf(),
             db_path: None,
@@ -3210,22 +3342,51 @@ mod tests {
         )
         .unwrap();
 
-        let path = temp
-            .path()
-            .join("outputs/debug/phase01/analyst_technical.json");
+        let path = temp.path().join("outputs/debug/phase1/technical.json");
         let contents = std::fs::read_to_string(&path).unwrap();
-        // Latest turn only — intermediate tool turns are overwritten.
-        let record: Value = serde_json::from_str(&contents).unwrap();
-        assert_eq!(record["kind"], "stream");
-        assert!(record.get("req").is_some());
-        assert!(record.get("resp").is_some());
-        assert!(record.get("elapsed_ms").is_some());
-        assert!(record.get("token").is_some());
-        assert!(contents.contains("\n  \"kind\": \"stream\""));
+        let output: Value = serde_json::from_str(&contents).unwrap();
+        assert_eq!(output["prompt_path"], "prompts/phase1/technical.md");
+        let records = output["records"].as_array().unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[1]["kind"], "stream");
+        assert!(records[1].get("req").is_some());
+        assert!(records[1].get("resp").is_some());
+        assert!(records[1].get("elapsed_ms").is_some());
+        assert!(records[1].get("token").is_some());
+        assert!(contents.contains("\n  \"records\":"));
         assert!(!temp
             .path()
-            .join("outputs/debug/phase01/analyst_technical.jsonl")
+            .join("outputs/debug/phase1/technical.jsonl")
             .exists());
+    }
+
+    #[test]
+    fn append_debug_output_record_serializes_concurrent_appends() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let mut tasks = Vec::new();
+        for id in 0..8 {
+            let root = root.clone();
+            tasks.push(std::thread::spawn(move || {
+                super::append_debug_output_record(
+                    &root,
+                    Path::new("outputs/debug/phase0/runtime.json"),
+                    "runtime",
+                    json!({"req": {"id": id}, "resp": {"status": "derived"}}),
+                )
+            }));
+        }
+        for task in tasks {
+            task.join().unwrap().unwrap();
+        }
+
+        let output: Value = serde_json::from_str(
+            &std::fs::read_to_string(temp.path().join("outputs/debug/phase0/runtime.json"))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(output["prompt_path"], "runtime");
+        assert_eq!(output["records"].as_array().unwrap().len(), 8);
     }
 
     #[test]
@@ -3279,21 +3440,29 @@ mod tests {
     }
 
     #[test]
-    fn debug_record_path_includes_topic_id_for_phase2_roles() {
-        let path = super::debug_record_relative_path_with_topic(
-            2,
-            "researcher.bull.initial",
-            Some("QQQ-rate-volatility-confirmation"),
-        );
+    fn debug_record_path_mirrors_prompt_hierarchy() {
+        let path = super::debug_record_relative_path_from_prompt(Path::new(
+            "prompts/phase2/researcher/debate.md",
+        ))
+        .unwrap();
         assert_eq!(
             path,
-            PathBuf::from(
-                "outputs/debug/phase02/researcher_bull_initial__QQQ_rate_volatility_confirmation.json"
-            )
+            PathBuf::from("outputs/debug/phase2/researcher/debate.json")
         );
         assert_eq!(
-            super::debug_record_relative_path(1, "analyst.news_macro"),
-            PathBuf::from("outputs/debug/phase01/analyst_news_macro.json")
+            super::debug_record_relative_path_from_prompt(Path::new(
+                "prompts/phase1/news_macro.md"
+            ))
+            .unwrap(),
+            PathBuf::from("outputs/debug/phase1/news_macro.json")
+        );
+        assert!(
+            super::debug_record_relative_path_from_prompt(Path::new("phase1/news_macro.md"))
+                .is_err()
+        );
+        assert!(
+            super::debug_record_relative_path_from_prompt(Path::new("prompts/../outside.md"))
+                .is_err()
         );
     }
 

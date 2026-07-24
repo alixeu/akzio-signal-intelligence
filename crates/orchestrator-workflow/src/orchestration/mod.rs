@@ -9,5 +9,3 @@ pub(crate) mod policy;
 pub mod render;
 pub(crate) mod retrieval;
 pub(crate) mod role_jobs;
-
-pub(crate) const PHASE2_REDUCER: i64 = 25;

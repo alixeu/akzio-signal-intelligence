@@ -151,7 +151,7 @@ const CONTRACTS: &[PhaseContract] = &[
         responsibility: "select debate topics from EvidenceState",
     },
     PhaseContract {
-        phase: 25,
+        phase: 2,
         name: "DebateSummary",
         state_field: "debate_state_artifact",
         responsibility: "compress structured debate",
@@ -358,10 +358,9 @@ fn validate_topic_plan_payload(payload: &Value) -> Option<String> {
 }
 
 fn validate_debate_summary_payload(payload: &Value) -> Option<String> {
-    if payload.get("artifact_type").and_then(Value::as_str)
-        != Some("phase2_5_debate_state_artifact")
+    if payload.get("artifact_type").and_then(Value::as_str) != Some("phase2_debate_state_artifact")
     {
-        return Some("artifact_type must be phase2_5_debate_state_artifact".to_string());
+        return Some("artifact_type must be phase2_debate_state_artifact".to_string());
     }
     let Some(status) = payload.get("status").and_then(Value::as_str) else {
         return Some("debate status is missing".to_string());
@@ -649,7 +648,7 @@ mod contract_tests {
     #[test]
     fn accepts_explicit_no_evidence_topic_and_debate_skips() {
         let mut state = json!({
-            "phase_status": {"2": "done", "25": "done"},
+            "phase_status": {"2": "done"},
             "topic_generation_artifact": {
                 "artifact_type": "phase2_topic_generation_artifact",
                 "status": "skipped",
@@ -658,7 +657,7 @@ mod contract_tests {
                 "topics": []
             },
             "debate_state_artifact": {
-                "artifact_type": "phase2_5_debate_state_artifact",
+                "artifact_type": "phase2_debate_state_artifact",
                 "status": "skipped_no_actionable_evidence",
                 "convergence_status": "skipped",
                 "topic_briefs": []
@@ -673,9 +672,16 @@ mod contract_tests {
     #[test]
     fn rejects_ready_debate_summary_without_convergence_status() {
         let mut state = json!({
-            "phase_status": {"25": "done"},
+            "phase_status": {"2": "done"},
+            "topic_generation_artifact": {
+                "artifact_type": "phase2_topic_generation_artifact",
+                "status": "skipped",
+                "actionable": false,
+                "skip_reason": "phase1_evidence_insufficient",
+                "topics": []
+            },
             "debate_state_artifact": {
-                "artifact_type": "phase2_5_debate_state_artifact",
+                "artifact_type": "phase2_debate_state_artifact",
                 "status": "ready",
                 "topic_briefs": []
             }
@@ -683,7 +689,7 @@ mod contract_tests {
 
         record_contracts(&mut state);
 
-        assert_eq!(state["contract_violations"][0]["phase"], 25);
+        assert_eq!(state["contract_violations"][0]["phase"], 2);
         assert!(state["contract_violations"][0]["message"]
             .as_str()
             .unwrap()

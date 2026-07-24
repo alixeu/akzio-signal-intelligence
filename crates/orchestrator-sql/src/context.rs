@@ -892,7 +892,7 @@ pub fn handle_read_command(
     let (phases, kinds): (Vec<i64>, Vec<&str>) = match command {
         "get-analyst-reports" => (vec![1], vec!["artifact", "artifact_ticker"]),
         "get-debate-history" => (
-            vec![2, 25],
+            vec![2],
             vec![
                 "artifact",
                 "artifact_ticker",
@@ -900,7 +900,7 @@ pub fn handle_read_command(
                 "topic_final_ticker",
             ],
         ),
-        "get-research-inputs" | "get-run-inputs" => (vec![1, 2, 25, 3], vec![]),
+        "get-research-inputs" | "get-run-inputs" => (vec![1, 2, 3], vec![]),
         "get-jin10-context" => return jin10_context(conn),
         "get-technical-context" => {
             return technical_context(conn, &ctx.tickers, Some(ctx.ticker.as_str()))
@@ -914,7 +914,7 @@ pub fn handle_read_command(
         | "get-live-thread"
         | "get-unread-events"
         | "get-latest-checkpoint"
-        | "get-topic-finals" => (vec![2, 25], vec![]),
+        | "get-topic-finals" => (vec![2], vec![]),
         _ => anyhow::bail!("unsupported read command: {command}"),
     };
     let items = messages_for_run(conn, &ctx.run_id, &phases, &kinds)?;
@@ -930,7 +930,7 @@ pub fn handle_read_command(
 
 pub fn sqlite_context(conn: &Connection, run_id: &str) -> Result<Value> {
     let analyst_messages = messages_for_run(conn, run_id, &[1], &["artifact", "artifact_ticker"])?;
-    let debate_messages = messages_for_run(conn, run_id, &[2, 25], &[])?;
+    let debate_messages = messages_for_run(conn, run_id, &[2], &[])?;
     Ok(json!({
         "run_id": run_id,
         "analyst_messages": analyst_messages,

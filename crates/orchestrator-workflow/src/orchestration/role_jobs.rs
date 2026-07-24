@@ -62,6 +62,7 @@ pub(crate) struct RoleJob {
     pub debug: bool,
     pub prompt: String,
     pub prompt_path: Option<String>,
+    pub debug_output_path: Option<PathBuf>,
     pub prompt_version: Option<String>,
     pub tickers: Vec<String>,
     pub output_mode: OutputMode,
@@ -225,6 +226,7 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
         debug: debug_enabled,
         prompt,
         prompt_path: prompt_path.map(|path| path.display().to_string()),
+        debug_output_path: None,
         prompt_version,
         tickers: tickers.clone(),
         output_mode: output_mode_for_role(role),
@@ -455,6 +457,21 @@ pub(crate) fn merge_role_job_metrics(state: &mut Value, metrics: &Value) {
         items.extend(incoming.iter().cloned());
     }
     refresh_role_job_metrics(state);
+}
+
+fn debug_prompt_path_from_runtime_path(path: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(path);
+    let project_root = default_project_root();
+    path.strip_prefix(&project_root)
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| {
+            path.to_str().and_then(|value| {
+                value
+                    .find("prompts/")
+                    .map(|index| PathBuf::from(&value[index..]))
+            })
+        })
 }
 
 fn refresh_role_job_metrics(state: &mut Value) {
@@ -819,10 +836,18 @@ async fn execute_role_job(job: RoleJob) -> Result<AgentLoopOutput> {
     let llm = job
         .llm
         .with_context(|| format!("missing prepared LLM config for role {:?}", job.role))?;
+    let debug_prompt_path = job
+        .prompt_path
+        .as_deref()
+        .and_then(debug_prompt_path_from_runtime_path);
+    let debug_round = job.round.and_then(|round| usize::try_from(round).ok());
     let settings = AgentSettings {
         role: job.role,
         phase: Some(job.phase),
         topic_id: job.topic_id,
+        debug_prompt_path,
+        debug_output_path: job.debug_output_path,
+        debug_round,
         tickers: job.tickers,
         output_mode: job.output_mode,
         llm,
@@ -886,10 +911,18 @@ async fn execute_steer_role_job(
     let llm = job
         .llm
         .with_context(|| format!("missing prepared LLM config for role {:?}", job.role))?;
+    let debug_prompt_path = job
+        .prompt_path
+        .as_deref()
+        .and_then(debug_prompt_path_from_runtime_path);
+    let debug_round = job.round.and_then(|round| usize::try_from(round).ok());
     let settings = AgentSettings {
         role: job.role,
         phase: Some(job.phase),
         topic_id: job.topic_id,
+        debug_prompt_path,
+        debug_output_path: job.debug_output_path,
+        debug_round,
         tickers: job.tickers,
         output_mode: job.output_mode,
         llm,

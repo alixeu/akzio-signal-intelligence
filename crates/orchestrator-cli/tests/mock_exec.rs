@@ -166,31 +166,32 @@ async fn debug_exec_records_local_reducers_without_changing_workflow_policy() {
         true,
     );
     args.debug = true;
+    args.from_phase = 0;
     args.to_phase = 4;
 
     let result = exec::run(args).await.unwrap();
     let state = &result["run_state"];
 
     assert_eq!(state["phase_status"]["1"], "done");
+    assert_eq!(state["phase_status"]["0"], "skipped");
     assert!(
         state.get("phase1_index").is_some(),
         "phase1_index materialized"
     );
     assert_eq!(state["phase_status"]["2"], "skipped");
-    assert_eq!(state["phase_status"]["25"], "skipped");
+    assert!(state["phase_status"].get("25").is_none());
     assert!(matches!(
         state["phase_status"]["4"].as_str(),
         Some("done" | "derived")
     ));
     assert_eq!(state["workflow_policy"]["mode"], "selective");
-    // Phase1 index is in-process; phase_summary compressor records land as phase=0 debug rows.
     assert!(
         state["debug_phase_records"]
             .as_array()
             .unwrap()
             .iter()
             .any(|record| {
-                record["phase"] == 0
+                record["phase"] == 1
                     && record["role"]
                         .as_str()
                         .is_some_and(|role| role.contains("compressor.after_phase_1"))
@@ -205,7 +206,7 @@ async fn debug_exec_records_local_reducers_without_changing_workflow_policy() {
     let conn = Connection::open(db_path).unwrap();
     let phase2_debate_rows: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM role_turn_summaries WHERE phase IN (2, 25) AND role != 'reducer.debate_final'",
+            "SELECT COUNT(*) FROM role_turn_summaries WHERE phase = 2 AND role != 'reducer.debate_final'",
             [],
             |row| row.get(0),
         )
@@ -216,18 +217,20 @@ async fn debug_exec_records_local_reducers_without_changing_workflow_policy() {
         .as_array()
         .unwrap()
         .iter()
-        .any(|record| record["phase"] == 2 && record["role"] == "phase2.summary"));
-    assert!(state["debug_phase_records"]
-        .as_array()
-        .unwrap()
-        .iter()
         .any(|record| record["phase"] == 4 && record["role"] == "trader"));
 
-    // Local reducer debug artifacts keep the latest JSON record per role.
-    let phase2_summary =
-        orchestrator_core::default_project_root().join("outputs/debug/phase02/phase2_summary.json");
+    let phase2_summary = orchestrator_core::default_project_root()
+        .join("outputs/debug/phase2/summary/phase2_summary.json");
     let summary_contents = fs::read_to_string(&phase2_summary).unwrap();
-    assert!(summary_contents.contains("\"role\":\"phase2.summary\""));
+    assert!(summary_contents.contains("\"compressor.after_phase_2\""));
+    assert!(summary_contents.contains("\"req\""));
+    assert!(summary_contents.contains("\"resp\""));
+
+    let phase0_runtime =
+        orchestrator_core::default_project_root().join("outputs/debug/phase0/runtime.json");
+    let phase0_contents = fs::read_to_string(&phase0_runtime).unwrap();
+    assert!(phase0_contents.contains("\"req\""));
+    assert!(phase0_contents.contains("\"resp\""));
 
     let root = orchestrator_core::default_project_root();
     let time_path = root.join("outputs/debug/time.json");
@@ -654,7 +657,7 @@ async fn mock_phase2_writes_initial_and_interaction_turns() {
 
     let controller_count: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM role_turn_summaries WHERE phase = 25 AND role = 'mediator.topic_controller'",
+            "SELECT COUNT(*) FROM role_turn_summaries WHERE phase = 2 AND role = 'mediator.topic_controller'",
             [],
             |row| row.get(0),
         )
@@ -697,7 +700,7 @@ async fn mock_exec_writes_reducer_turn_summaries() {
     // Phase1 index is in-process (no reducer.evidence phase-15 rows); debate final still persists.
     assert!(
         rows.iter().any(|(phase, role, summary_json)| {
-            *phase == 25
+            *phase == 2
                 && role == "reducer.debate_final"
                 && summary_json.contains("reducer.debate_final")
         }),

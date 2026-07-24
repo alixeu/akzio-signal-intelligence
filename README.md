@@ -103,11 +103,14 @@ graph TD
 Phase 2 begins with three concurrent LLM calls: the neutral Topic Generator,
 Bull warm-up, and Bear warm-up. The Topic Generator uses only the forked Phase 1
 index and prior phase summaries; Rust rejects external-fact or schema-breaking
-output and retains a deterministic conflict fallback. Each selected topic then
-forks Bull and Bear from their warm-up turns and starts its own Topic Controller
-from the Topic Generator turn. Topics run concurrently, while turns inside one
-topic remain controller-routed. When no material hinge exists, Phase 2 records a
-no-debate artifact and still advances to Phase 3.
+output and retains a deterministic conflict fallback. A successful Bull/Bear
+warm-up ends at the `准备完毕` checkpoint. Each selected topic forks a new Bull or
+Bear conversation from that side's checkpoint, while its Topic Controller forks
+from the completed Topic Generator conversation. These forks continue the saved
+conversation rather than being reconstructed from a summary; warm-up itself never
+runs Phase Summary. Topics run concurrently, while turns inside one topic remain
+controller-routed. When no material hinge exists, Phase 2 records a no-debate
+artifact and still advances to Phase 3.
 
 Trader, the three-perspective risk committee, and Portfolio Manager are
 mandatory in the default `legacy` policy. Phase 6 emits only per-asset semantic
@@ -228,11 +231,12 @@ Historical experience is preloaded only for the two Phase 1 analysts and the
 Research Manager. No matching experience is a valid empty result; experience is
 advisory and cannot replace current evidence.
 
-There is deliberately no `phase25` bucket. Phase 2 topic generation is an LLM
-role with a Rust-owned evidence gate and runtime envelope; final debate reduction
-remains Rust-owned. Phase 7 allocation and Phase 8 decision snapshot/archive are
-also Rust-owned stages. After each business phase, the workflow runs the Phase Summary
-compressor before starting the next phase.
+There is deliberately no runtime `phase25` bucket. Phase 2 topic generation is
+an LLM role with a Rust-owned evidence gate and runtime envelope; final debate
+reduction remains Rust-owned and belongs to Phase 2. Phase 7 allocation and
+Phase 8 decision snapshot/archive are also Rust-owned stages. Phase Summary runs
+after a completed source phase 1 through 7; it does not run for Phase 0, Phase 8,
+or the Phase 2 warm-up checkpoint.
 
 ```bash
 rtk cargo run -p orchestrator-cli --bin orchestrator-exec -- \
@@ -244,7 +248,8 @@ Useful options:
 
 - `--db-path PATH`: override the SQLite database.
 - `--run-dir PATH`: emit `state.json` and a final summary for inspection.
-- `--debug`: print workflow and agent-loop debug logs to the console, and write per-role request/response snapshots plus timing and token JSON arrays.
+- `--debug`: print workflow and agent-loop debug logs to the console, and write
+  request/response records, timing, and token JSON under `outputs/debug/`.
 - `--max-debate-rounds N`: cap conditional debate rounds.
 - `--max-topics-per-side N`: cap material conflict topics.
 
@@ -252,6 +257,22 @@ Useful options:
 
 `--from-phase` accepts `0-8` and defaults to `0`; `--to-phase 0` runs only
 historical reflection/retrieval. Mock runs skip Alpaca and all learning writes.
+
+### Debug artifacts
+
+`outputs/debug/` mirrors the runtime prompt path beneath `prompts/`: replace a
+prompt's `.md` suffix with `.json`. For example,
+`prompts/phase1/news_macro.md` writes
+`outputs/debug/phase1/news_macro.json`; shared prompts append their exchanges to
+the same file. Each such JSON file contains a `records` array, with one entry per
+exchange and its `req` and `resp` (including error or fallback responses).
+
+Phase Summary is stored with the phase it summarized, rather than under
+`prompts/phase_summary/`: after a completed Phase `N` from 1 through 7, its
+record is `outputs/debug/phaseN/summary/phaseN_summary.json`. Rust-only Phase 0,
+Phase 7, and Phase 8 each write `runtime.json` in their own phase directory.
+`time.json` and `token.json` remain top-level debug metrics. No debug path or
+record uses `phase25`.
 
 ## Learning loop
 

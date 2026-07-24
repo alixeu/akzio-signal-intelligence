@@ -48,7 +48,6 @@ use crate::orchestration::role_jobs::{
     merge_role_job_metrics, persist_prompt_metric, prepare_role_job, record_role_job_metrics,
     run_role_jobs, run_single_role_job, run_single_steer_role_job, RoleRun, SteerRoleRun,
 };
-use crate::orchestration::PHASE2_REDUCER;
 use orchestrator_core::role_registry::DEFAULT_PHASE1_AGENTS;
 use rusqlite::{params, OptionalExtension};
 
@@ -302,6 +301,8 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             }
         }
         record_phase_elapsed(&mut state, phase_timer);
+        let phase0 = state.get("phase0").cloned().unwrap_or(Value::Null);
+        record_runtime_debug_artifact(&mut state, 0, &phase0)?;
         debug!(status = ?state["phase_status"]["0"], "phase 0 fact collection finished");
     }
     if let Err(error) = inject_phase_summary_reflection(&conn, &mut state, &runtime_config) {
@@ -375,8 +376,6 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             != Some(false);
         let phase2_status = if phase2_actionable { "done" } else { "skipped" };
         set_phase_status(&mut state, 2, phase2_status);
-        set_phase_status(&mut state, PHASE2_REDUCER, phase2_status);
-        record_phase2_summary_debug_artifact(&mut state, phase2_status)?;
         record_phase_elapsed(&mut state, phase_timer);
         compress_jobs.push((
             2,
@@ -447,7 +446,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             .await?;
             "done"
         } else {
-            run_phase4_rust_rule(&mut conn, &mut state)?;
+            run_phase4_rust_rule(&mut conn, &mut state, &runtime_config)?;
             "derived"
         };
         set_phase_status(&mut state, 4, phase4_status);
@@ -548,6 +547,11 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         .await?;
         set_phase_status(&mut state, 7, "done");
         record_phase_elapsed(&mut state, phase_timer);
+        let allocation = state
+            .get("portfolio_allocation")
+            .cloned()
+            .unwrap_or(Value::Null);
+        record_runtime_debug_artifact(&mut state, 7, &allocation)?;
         compress_jobs.push((
             7,
             spawn_compress_job(
@@ -581,6 +585,11 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             set_phase_status(&mut state, 8, "done");
         }
         record_phase_elapsed(&mut state, phase_timer);
+        let archive = json!({
+            "status": state["phase_status"]["8"],
+            "error": state.get("phase8_error").cloned().unwrap_or(Value::Null)
+        });
+        record_runtime_debug_artifact(&mut state, 8, &archive)?;
         debug!(status = ?state["phase_status"]["8"], "phase 8 archive/prediction finished");
     }
     // Drain any compress still running when the pipeline ends early (e.g. to_phase < 8).
@@ -2471,11 +2480,7 @@ async fn run_topic_steer_step(
         SteerRoleRun {
             state: state.clone(),
             role,
-            phase: if role == "mediator.topic_controller" {
-                PHASE2_REDUCER
-            } else {
-                2
-            },
+            phase: 2,
             kind,
             round: Some(round),
             topic_id: Some(topic_id),
@@ -2505,11 +2510,7 @@ async fn run_topic_steer_step(
     persist_message_with_topic(
         conn,
         state,
-        if role == "mediator.topic_controller" {
-            PHASE2_REDUCER
-        } else {
-            2
-        },
+        2,
         role,
         kind,
         Some(round),
@@ -2518,7 +2519,7 @@ async fn run_topic_steer_step(
     )?;
     let turn = json!({
         "role": role,
-        "phase": if role == "mediator.topic_controller" { PHASE2_REDUCER } else { 2 },
+        "phase": 2,
         "kind": kind,
         "round": round,
         "topic_id": topic_id,
@@ -2843,13 +2844,19 @@ async fn run_phase2_final_reducer(
     persist_artifact_with_last_md(
         conn,
         state,
-        PHASE2_REDUCER,
+        2,
         "reducer.debate_final",
         artifact.clone(),
         brief,
     )?;
-    record_local_debug_artifact(state, PHASE2_REDUCER, "reducer.debate_final", &artifact)?;
-    set_phase_status(state, PHASE2_REDUCER, "done");
+    record_local_debug_artifact(
+        state,
+        2,
+        "reducer.debate_final",
+        PathBuf::from("outputs/debug/phase2/debate_final.json"),
+        "runtime",
+        &artifact,
+    )?;
     // Compression is scheduled by the main pipeline so it can overlap later work.
     Ok(())
 }
@@ -2860,6 +2867,8 @@ struct CompressJobResult {
     written: usize,
     batch: orchestrator_sql::PhaseSummaryPhaseBatch,
     debug_enabled: bool,
+    debug_output_path: PathBuf,
+    debug_source_label: String,
     role_metrics: Value,
 }
 
@@ -2871,6 +2880,15 @@ async fn compress_phase_job(
     config: RuntimeConfig,
 ) -> Result<CompressJobResult> {
     let debug_enabled = state.get("debug").and_then(Value::as_bool) == Some(true);
+    let prompt_path = config
+        .prompts
+        .path_for("compressor.phase_summary")
+        .context("missing compressor.phase_summary prompt path")?
+        .clone();
+    let debug_source_label = debug_prompt_source_label(&prompt_path)?;
+    let debug_output_path = PathBuf::from(format!(
+        "outputs/debug/phase{source_phase}/summary/phase{source_phase}_summary.json"
+    ));
     let (batch, role_metrics) = if is_mock(&state) {
         (
             crate::orchestration::compress::build_phase_compress(&state, source_phase)?,
@@ -2888,15 +2906,10 @@ async fn compress_phase_job(
     } else {
         let source_payload =
             crate::orchestration::compress::phase_summary_source_payload(&state, source_phase)?;
-        let prompt_path = config
-            .prompts
-            .path_for("compressor.phase_summary")
-            .context("missing compressor.phase_summary prompt path")?
-            .clone();
         let mut job = prepare_role_job(RoleRun {
             state: state.clone(),
             role: "compressor.phase_summary",
-            phase: 0,
+            phase: source_phase,
             kind: "phase_summary",
             round: Some(source_phase),
             topic_id: None,
@@ -2906,6 +2919,7 @@ async fn compress_phase_job(
             config: &config,
             prompt_path: Some(prompt_path.as_path()),
         })?;
+        job.debug_output_path = Some(debug_output_path.clone());
         if let Some(llm) = job.llm.as_mut() {
             llm.tools.clear();
         }
@@ -2968,6 +2982,8 @@ async fn compress_phase_job(
                 written: 0,
                 batch: crate::orchestration::compress::build_phase_compress(&state, source_phase)?,
                 debug_enabled,
+                debug_output_path,
+                debug_source_label,
                 role_metrics,
             });
         }
@@ -3006,21 +3022,39 @@ async fn compress_phase_job(
         written,
         batch,
         debug_enabled,
+        debug_output_path,
+        debug_source_label,
         role_metrics,
     })
 }
 
 fn apply_compress_result(state: &mut Value, result: CompressJobResult) -> Result<()> {
-    merge_role_job_metrics(state, &result.role_metrics);
-    let snapshot = crate::orchestration::compress::apply_phase_summary_batch(state, result.batch)?;
-    state["phase_compress"][result.source_phase.to_string()]["persisted"] = json!(true);
-    state["phase_summary_tables"][result.source_phase.to_string()]["persisted"] = json!(true);
-    if result.debug_enabled {
-        let role = format!("compressor.after_phase_{}", result.source_phase);
-        record_local_debug_artifact(state, 0, &role, &snapshot)?;
+    let CompressJobResult {
+        source_phase,
+        batch,
+        debug_enabled,
+        debug_output_path,
+        debug_source_label,
+        role_metrics,
+        ..
+    } = result;
+    merge_role_job_metrics(state, &role_metrics);
+    let snapshot = crate::orchestration::compress::apply_phase_summary_batch(state, batch)?;
+    state["phase_compress"][source_phase.to_string()]["persisted"] = json!(true);
+    state["phase_summary_tables"][source_phase.to_string()]["persisted"] = json!(true);
+    if debug_enabled {
+        let role = format!("compressor.after_phase_{source_phase}");
+        record_local_debug_artifact(
+            state,
+            source_phase,
+            &role,
+            debug_output_path,
+            &debug_source_label,
+            &snapshot,
+        )?;
     }
     debug!(
-        source_phase = result.source_phase,
+        source_phase,
         written = result.written,
         "phase_summary compress applied to memory state"
     );
@@ -3101,6 +3135,8 @@ fn record_local_debug_artifact(
     state: &mut Value,
     phase: i64,
     role: &str,
+    relative_path: PathBuf,
+    source_label: &str,
     artifact: &Value,
 ) -> Result<()> {
     if state.get("debug").and_then(Value::as_bool) != Some(true) {
@@ -3108,70 +3144,29 @@ fn record_local_debug_artifact(
     }
 
     let started = Instant::now();
-    let relative_path = orchestrator_llm::debug_record_relative_path(phase, role);
-    let path = default_project_root().join(&relative_path);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create debug dir {}", parent.display()))?;
-    }
-
-    // Never clobber an existing LLM req/resp debug file with a local stub.
-    // Instead attach the final artifact onto the last exchange when possible.
-    if path.exists() {
-        if let Ok(existing) = fs::read_to_string(&path) {
-            if let Some(line) = existing.lines().find(|line| !line.trim().is_empty()) {
-                if let Ok(mut value) = serde_json::from_str::<Value>(line) {
-                    let has_req_resp = value.get("req").is_some() || value.get("resp").is_some();
-                    if has_req_resp {
-                        if let Some(object) = value.as_object_mut() {
-                            object.insert("final_artifact".to_string(), artifact.clone());
-                        }
-                        let mut merged = serde_json::to_string(&value)?;
-                        merged.push('\n');
-                        fs::write(&path, merged.as_bytes()).with_context(|| {
-                            format!("failed to merge debug workflow record {}", path.display())
-                        })?;
-                        if let Some(records) = state
-                            .get_mut("debug_phase_records")
-                            .and_then(Value::as_array_mut)
-                        {
-                            records.push(json!({
-                                "kind": "llm_with_final_artifact",
-                                "phase": phase,
-                                "role": role,
-                                "path": relative_path
-                            }));
-                        }
-                        orchestrator_llm::debug_log_time(
-                            &default_project_root(),
-                            json!({
-                                "kind": "function",
-                                "name": format!("record_local_debug_artifact_merge:{role}"),
-                                "phase": phase,
-                                "role": role,
-                                "elapsed_ms": started.elapsed().as_millis(),
-                            }),
-                        );
-                        return Ok(());
-                    }
-                }
-            }
-        }
-    }
-
-    // Shared envelope with LLM debug records: req/resp present (null for local).
+    let status = artifact
+        .get("status")
+        .cloned()
+        .or_else(|| state.pointer(&format!("/phase_status/{phase}")).cloned())
+        .unwrap_or_else(|| json!("derived"));
     let record = json!({
-        "kind": "local_reducer",
+        "kind": "runtime",
         "phase": phase,
         "role": role,
-        "req": Value::Null,
-        "resp": Value::Null,
-        "artifact": artifact
+        "req": {
+            "phase_status": state.pointer(&format!("/phase_status/{phase}")).cloned().unwrap_or(Value::Null)
+        },
+        "resp": {
+            "status": status,
+            "artifact": artifact
+        }
     });
-    let mut line = serde_json::to_string(&record)?;
-    line.push('\n');
-    fs::write(&path, line.as_bytes())
-        .with_context(|| format!("failed to write debug workflow record {}", path.display()))?;
+    orchestrator_llm::append_debug_output_record(
+        &default_project_root(),
+        &relative_path,
+        source_label,
+        record,
+    )?;
 
     if !state
         .get("debug_phase_records")
@@ -3184,7 +3179,7 @@ fn record_local_debug_artifact(
             "kind": "local_reducer",
             "phase": phase,
             "role": role,
-            "path": relative_path
+            "path": relative_path,
         }));
     }
     orchestrator_llm::debug_log_time(
@@ -3200,21 +3195,48 @@ fn record_local_debug_artifact(
     Ok(())
 }
 
-fn record_phase2_summary_debug_artifact(state: &mut Value, status: &str) -> Result<()> {
-    let artifact = json!({
-        "id": "phase2.summary",
-        "role": "phase2.summary",
-        "phase": 2,
-        "status": status,
-        "reason": state
-            .get("topic_generation_artifact")
-            .and_then(|artifact| artifact.get("reason"))
-            .cloned()
-            .unwrap_or(Value::Null),
-        "topic_generation": state.get("topic_generation_artifact").cloned().unwrap_or(Value::Null),
-        "debate_turn_count": state.get("debate_turns").and_then(Value::as_array).map(Vec::len).unwrap_or_default()
-    });
-    record_local_debug_artifact(state, 2, "phase2.summary", &artifact)
+fn record_runtime_debug_artifact(state: &mut Value, phase: i64, artifact: &Value) -> Result<()> {
+    record_local_debug_artifact(
+        state,
+        phase,
+        "runtime",
+        PathBuf::from(format!("outputs/debug/phase{phase}/runtime.json")),
+        "runtime",
+        artifact,
+    )
+}
+
+fn debug_prompt_source_label(prompt_path: &Path) -> Result<String> {
+    let project_root = default_project_root();
+    if let Ok(relative) = prompt_path.strip_prefix(&project_root) {
+        return Ok(relative.display().to_string());
+    }
+    prompt_path
+        .to_str()
+        .and_then(|value| {
+            value
+                .find("prompts/")
+                .map(|index| value[index..].to_string())
+        })
+        .with_context(|| {
+            format!(
+                "debug prompt path must contain prompts/: {}",
+                prompt_path.display()
+            )
+        })
+}
+
+fn record_prompt_runtime_debug_artifact(
+    state: &mut Value,
+    phase: i64,
+    role: &str,
+    prompt_path: &Path,
+    artifact: &Value,
+) -> Result<()> {
+    let source_label = debug_prompt_source_label(prompt_path)?;
+    let relative_path =
+        orchestrator_llm::debug_record_relative_path_from_prompt(Path::new(&source_label))?;
+    record_local_debug_artifact(state, phase, role, relative_path, &source_label, artifact)
 }
 
 async fn run_phase3(
@@ -3657,6 +3679,10 @@ async fn run_phase4(
     reasoning_effort_override: Option<&str>,
     config: &RuntimeConfig,
 ) -> Result<()> {
+    let prompt_path = config
+        .prompts
+        .path_for("trader")
+        .context("missing prompt path for trader")?;
     let mut artifact = run_single_role_job(
         RoleRun {
             state: state.clone(),
@@ -3669,12 +3695,7 @@ async fn run_phase4(
             model_override,
             reasoning_effort_override,
             config,
-            prompt_path: Some(
-                config
-                    .prompts
-                    .path_for("trader")
-                    .context("missing prompt path for trader")?,
-            ),
+            prompt_path: Some(prompt_path),
         },
         config.workflow.agent_timeout_sec,
         config,
@@ -3685,9 +3706,7 @@ async fn run_phase4(
     sanitize_downstream_constraints(state, "trader_investment_plan", &mut artifact);
     enforce_trade_candidate(state, &mut artifact);
     persist_artifact(conn, state, 4, "trader", artifact.clone())?;
-    // LLM path already wrote outputs/debug/phase04/trader.jsonl with req/resp.
-    // Merge final artifact only if that file exists; never replace with a bare stub.
-    record_local_debug_artifact(state, 4, "trader", &artifact)?;
+    record_prompt_runtime_debug_artifact(state, 4, "trader", prompt_path, &artifact)?;
     state["trader_investment_plan"] = artifact;
     Ok(())
 }
@@ -3723,7 +3742,11 @@ fn enforce_trade_candidate(state: &Value, artifact: &mut Value) {
     }
 }
 
-fn run_phase4_rust_rule(conn: &mut rusqlite::Connection, state: &mut Value) -> Result<()> {
+fn run_phase4_rust_rule(
+    conn: &mut rusqlite::Connection,
+    state: &mut Value,
+    config: &RuntimeConfig,
+) -> Result<()> {
     let mut artifact =
         research_plan_to_trade_intent(state.get("research_plan").unwrap_or(&Value::Null));
     artifact["id"] = json!("trader");
@@ -3734,7 +3757,11 @@ fn run_phase4_rust_rule(conn: &mut rusqlite::Connection, state: &mut Value) -> R
     artifact["derived_from"] = json!("research_plan");
     sanitize_downstream_constraints(state, "trader_investment_plan", &mut artifact);
     persist_artifact(conn, state, 4, "trader", artifact.clone())?;
-    record_local_debug_artifact(state, 4, "trader", &artifact)?;
+    let prompt_path = config
+        .prompts
+        .path_for("trader")
+        .context("missing prompt path for trader")?;
+    record_prompt_runtime_debug_artifact(state, 4, "trader", prompt_path, &artifact)?;
     state["trader_investment_plan"] = artifact;
     Ok(())
 }
@@ -5329,6 +5356,25 @@ fn topic_controller_forks_from_topic_generation_with_its_own_prompt() {
 
     assert_eq!(steer["fork_from_turn_id"], "turn-topic-root");
     assert_eq!(steer["include_prompt_on_fork"], true);
+}
+
+#[test]
+fn initial_researchers_fork_from_their_ready_checkpoints() {
+    let state = json!({
+        "phase2_warmup": {
+            "bull": {"turn_id": "warmup-bull-ready"},
+            "bear": {"turn_id": "warmup-bear-ready"}
+        }
+    });
+
+    assert_eq!(
+        fork_source_turn_id(&state, "QQQ-volatility", "researcher.bull.initial"),
+        Some("warmup-bull-ready".to_string())
+    );
+    assert_eq!(
+        fork_source_turn_id(&state, "QQQ-volatility", "researcher.bear.initial"),
+        Some("warmup-bear-ready".to_string())
+    );
 }
 
 #[test]

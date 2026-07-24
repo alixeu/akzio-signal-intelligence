@@ -571,7 +571,7 @@ pub(crate) fn build_debate_state_artifact(state: &Value, config: &RuntimeConfig)
                 json!({
                     "id": "reducer.debate_final",
                     "role": "reducer.debate_final",
-                    "artifact_type": "phase2_5_debate_state_artifact",
+                    "artifact_type": "phase2_debate_state_artifact",
                     "status": status,
                     "convergence_status": if ticker_converged { "converged" } else { convergence_status },
                     "turn_count": turns.len(),
@@ -590,8 +590,8 @@ pub(crate) fn build_debate_state_artifact(state: &Value, config: &RuntimeConfig)
     json!({
         "id": "reducer.debate_final",
         "role": "reducer.debate_final",
-        "artifact_type": "phase2_5_debate_state_artifact",
-        "phase": "phase2.5b",
+        "artifact_type": "phase2_debate_state_artifact",
+        "phase": "phase2.debate_final",
         "status": status,
         "convergence_status": convergence_status,
         "convergence_reason": reason,
