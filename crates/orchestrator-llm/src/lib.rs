@@ -1548,11 +1548,10 @@ async fn stream_responses_with_retry(
 
 fn is_transient_llm_error(error: &anyhow::Error) -> bool {
     let text = format!("{error:#}").to_ascii_lowercase();
-    // Permanent request/context errors must not burn stream retries.
-    if is_permanent_llm_error_text(&text) {
-        return false;
-    }
-    text.contains("503")
+    // Some gateways (e.g. the opencode free tier) wrap transient upstream
+    // failures in a 400 invalid_request_error envelope. Evaluate explicit
+    // transient signals first so they win over the permanent-error heuristic.
+    let has_transient_signal = text.contains("503")
         || text.contains("502")
         || text.contains("429")
         || text.contains("bad_response_status_code")
@@ -1564,7 +1563,12 @@ fn is_transient_llm_error(error: &anyhow::Error) -> bool {
         || text.contains("error decoding response body")
         || text.contains("temporarily unavailable")
         || text.contains("upstream_error")
-        || text.contains("upstream request failed")
+        || text.contains("upstream request failed");
+    if has_transient_signal {
+        return true;
+    }
+    // Permanent request/context errors must not burn stream retries.
+    !is_permanent_llm_error_text(&text)
 }
 
 fn retry_jitter_ms(role: &str, attempt: usize) -> u64 {
@@ -1959,6 +1963,20 @@ async fn stream_chat_completions_once(
         event_count += 1;
         let chunk = match event {
             Ok(ev) => ev,
+            Err(async_openai::error::OpenAIError::JSONDeserialize(err, _))
+                if settings.llm.free_opencode =>
+            {
+                // The opencode Zen gateway interleaves non-standard SSE events
+                // (e.g. `x-opencode-type: inference-cost`) that are not valid
+                // OpenAI chunks. async-openai keeps the stream alive after a
+                // per-event decode error, so skip what we cannot parse.
+                debug!(
+                    role = %settings.role,
+                    error = %err,
+                    "skipping unparsable free opencode stream event"
+                );
+                continue;
+            }
             Err(e) => {
                 return Err((
                     anyhow::anyhow!("{e}").context("Chat Completions stream chunk failed"),
@@ -2064,7 +2082,7 @@ async fn stream_chat_completions_once(
         }
     }
 
-    if !saw_terminal_finish {
+    if !(saw_terminal_finish || (settings.llm.free_opencode && made_progress)) {
         return Err((
             anyhow::anyhow!(
                 "Chat Completions stream ended without a terminal finish_reason after {event_count} chunks"
@@ -3216,6 +3234,18 @@ mod tests {
         let err = anyhow!(
             "LLM stream chunk failed: InvalidStatusCodeWithMessage(502, \
              \"{{\\\"error\\\":{{\\\"message\\\":\\\"Upstream request failed\\\",\\\"type\\\":\\\"upstream_error\\\"}}}}\")"
+        );
+        assert!(is_transient_llm_error(&err));
+    }
+
+    #[test]
+    fn opencode_400_upstream_request_failed_is_transient() {
+        // The opencode free tier wraps transient upstream failures in a 400
+        // invalid_request_error envelope; it must still be retried.
+        let err = anyhow!(
+            "Chat Completions stream failed: ApiError(ApiErrorResponse {{ status_code: 400, \
+             api_error: ApiError {{ message: \"Error from provider (Console): Upstream request failed\", \
+             type: Some(\"invalid_request_error\"), param: None, code: Some(\"invalid_request_error\") }} }})"
         );
         assert!(is_transient_llm_error(&err));
     }
