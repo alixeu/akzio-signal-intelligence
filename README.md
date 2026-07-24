@@ -110,14 +110,13 @@ topic remain controller-routed. When no material hinge exists, Phase 2 records a
 no-debate artifact and still advances to Phase 3.
 
 Trader, the three-perspective risk committee, and Portfolio Manager are
-mandatory in the default `legacy` policy. Allocation is always computed and
-validated in Rust, and Portfolio Manager `wait` or `downgrade` decisions force a
-cash-only allocation. In a non-mock, non-debug run, Phase 0 reads the
-project-only Alpaca Paper account, positions, and recent fills. Phase 6 can read
-the account and current prices, then submit a paper order constrained
-by the Phase 4 position size and the strictest Phase 5 position cap. `--mock`
-and `--debug` remove all Alpaca tools from the model and make the tool runtime
-reject direct calls.
+mandatory in the default `legacy` policy. Phase 6 emits only per-asset semantic
+constraints; it cannot read accounts, calculate quantities, or submit orders.
+Phase 7 computes and validates target weights in Rust, projects those weights
+through the Phase 6 direction/cap/delta constraints, and refreshes current
+weights from the project-only Alpaca Paper account when credentials are present
+in a non-mock, non-debug run. `--mock` and `--debug` remove all account and
+order tools from the model and make the tool runtime reject direct calls.
 
 ## Workspace crates
 
@@ -138,7 +137,7 @@ There is no long-running service entry point. `orchestrator-exec` is the workflo
 - Network access to Alpaca Market Data, Yahoo Finance, and Jin10
 - An OpenAI-compatible gateway key for non-mock workflow runs
 - `EXA_API_KEY` only when live Exa web search is enabled
-- `ALPACA_API_KEY` and `ALPACA_API_SECRET` for technical bars, Alpaca News, Phase 0 account/fill retrieval, and Phase 6 Paper Trading execution
+- `ALPACA_API_KEY` and `ALPACA_API_SECRET` for technical bars, Alpaca News, Phase 0 account/fill retrieval, and the optional Phase 7 account-weight refresh
 
 Set secrets through the environment. The repository contains no key fallback:
 
@@ -192,7 +191,7 @@ rtk cargo run -p orchestrator-cli --bin orchestrator-ingest -- \
   jin10-flash --pages 2 --lookback-hours 24 --timeout 20
 ```
 
-Technical CSV is an ingestion interchange only. With `--db-path`, the CLI atomically replaces the configured ticker/interval window in `technical_bars`, one indexed row per bar. Jin10 always writes its raw preflight feed to `outputs/jin10/YYYY-MM-DD.csv`; `read_jin10_context` reads that CSV, and only items that the news analyst assigns a Jin10 attention score are persisted to `jin10_items`.
+Technical CSV is an ingestion interchange only. With `--db-path`, the CLI atomically replaces the configured ticker/interval window in `technical_bars`, one indexed row per bar. Jin10 always writes its raw preflight feed to `outputs/jin10/YYYY-MM-DD.csv`; `read_jin10_candidates` returns a bounded candidate set from that feed, and only items that the news analyst assigns a Jin10 attention score are persisted to `jin10_items`.
 
 Independent ticker/interval downloads run concurrently (default: 10). Set
 `technical.source: yahoo` or pass `--source yahoo` for a full Yahoo run.

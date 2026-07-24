@@ -88,6 +88,7 @@ pub fn check_common_components(
             "analyst_output_contract",
             &["common/analyst_output_contract.md"],
         ),
+        ("retrieval_policy", &["common/retrieval_policy.md"]),
         ("research_calibration", &["common/research_calibration.md"]),
         ("research_drivers", &["common/research_drivers.md"]),
         ("leveraged_etf_rules", &["common/leveraged_etf_rules.md"]),

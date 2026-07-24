@@ -304,8 +304,8 @@ fn preflight_tool_from_registry(
         .get(role)
         .and_then(|def| def.preflight_tool.as_deref())
     {
-        Some("read_technical_context") => Some("read_technical_context"),
-        Some("read_jin10_context") => Some("read_jin10_context"),
+        Some("read_technical_snapshot") => Some("read_technical_snapshot"),
+        Some("read_jin10_candidates") => Some("read_jin10_candidates"),
         _ => None,
     }
 }
@@ -317,8 +317,8 @@ pub(crate) async fn run_phase1_preflight(
     #[allow(unused_variables)] config: &RuntimeConfig,
 ) -> Result<()> {
     match preflight_tool_for_role_with_config(role, config) {
-        Some("read_technical_context") => run_technical_csv_preflight(conn, state).await,
-        Some("read_jin10_context") => run_jin10_preflight(conn, state).await,
+        Some("read_technical_snapshot") => run_technical_csv_preflight(conn, state).await,
+        Some("read_jin10_candidates") => run_jin10_preflight(conn, state).await,
         _ => Ok(()),
     }
 }
@@ -327,7 +327,7 @@ pub(crate) async fn run_technical_csv_preflight(
     conn: &mut rusqlite::Connection,
     state: &mut Value,
 ) -> Result<()> {
-    let tool = "read_technical_context";
+    let tool = "read_technical_snapshot";
     if preflight_status(state, tool).is_some() {
         return Ok(());
     }
@@ -419,7 +419,7 @@ pub(crate) async fn run_jin10_preflight(
     _conn: &mut rusqlite::Connection,
     state: &mut Value,
 ) -> Result<()> {
-    let tool = "read_jin10_context";
+    let tool = "read_jin10_candidates";
     if preflight_status(state, tool).is_some() {
         return Ok(());
     }
@@ -443,8 +443,9 @@ pub(crate) async fn run_jin10_preflight(
     {
         Ok(payload) => Ok(payload),
         Err(error) => {
-            run_jin10_fallback(lookback_hours, error.to_string())
-                .map_err(|fallback_error| fallback_error.context(format!("jin10 preflight request failed: {error}")))
+            run_jin10_fallback(lookback_hours, error.to_string()).map_err(|fallback_error| {
+                fallback_error.context(format!("jin10 preflight request failed: {error}"))
+            })
         }
     }
     .and_then(|payload| {
@@ -464,10 +465,7 @@ pub(crate) async fn run_jin10_preflight(
     Ok(())
 }
 
-fn run_jin10_fallback(
-    lookback_hours: f64,
-    error_message: String,
-) -> Result<Value> {
+fn run_jin10_fallback(lookback_hours: f64, error_message: String) -> Result<Value> {
     let rows = orchestrator_core::load_jin10_csv_recent(1);
     if rows.is_empty() {
         bail!("Jin10 fallback cache missing: {error_message}");

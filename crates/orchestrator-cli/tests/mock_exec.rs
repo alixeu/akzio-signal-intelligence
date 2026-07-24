@@ -107,14 +107,16 @@ async fn mock_exec_phase7_writes_portfolio_allocation() {
     );
     assert_eq!(
         result["portfolio_allocation"]["allocation_method"],
-        "rust_portfolio_gate"
+        "rust_inverse_vol_guardrails"
     );
-    assert!(result["portfolio_allocation"]["weights"]
-        .get("QQQ")
-        .is_none());
-    assert!(result["portfolio_allocation"]["weights"]
-        .get("SOXX")
-        .is_none());
+    assert_eq!(
+        result["portfolio_allocation"]["weights"]["QQQ"]["weight"],
+        0.0
+    );
+    assert_eq!(
+        result["portfolio_allocation"]["weights"]["SOXX"]["weight"],
+        0.0
+    );
     assert!(result["portfolio_allocation"]["weights"]
         .get("VIX")
         .is_none());
@@ -346,12 +348,14 @@ async fn selective_policy_derives_trader_runs_triggered_risk_and_allocates() {
         state["portfolio_allocation"]["weights"]["cash_hedge"]["weight"],
         1.0
     );
-    assert!(state["portfolio_allocation"]["weights"]
-        .get("QQQ")
-        .is_none());
-    assert!(state["portfolio_allocation"]["weights"]
-        .get("SOXX")
-        .is_none());
+    assert_eq!(
+        state["portfolio_allocation"]["weights"]["QQQ"]["weight"],
+        0.0
+    );
+    assert_eq!(
+        state["portfolio_allocation"]["weights"]["SOXX"]["weight"],
+        0.0
+    );
     assert_eq!(
         result["long_probability"],
         state["research_plan"]["long_probability"]

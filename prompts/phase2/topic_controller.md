@@ -29,15 +29,15 @@
 
 ## 输出契约
 
-Artifact 固定包含：`role, artifact_type, topic_id, claim_ledger[], accepted_for_opponent[], rejected_to_origin[], blocked_claims[], agreed_facts[], decision_hinges[], next_steers{}, topic_summary_delta{}, info_gain_score, soft_control{}, reducer_checks{}`。`role=mediator.topic_controller`，`artifact_type=topic_controller_packet`。
+Artifact 包含：`topic_id, claim_ledger[], accepted_for_opponent[], rejected_to_origin[], blocked_claims[], agreed_facts[], decision_hinges[], next_steers{}, topic_summary_delta{}, info_gain_score, soft_control{}`。`id`、`role`、`artifact_type` 与 `reducer_checks` 由 Rust 合成。
 
-`next_steers` 是对象，绝不是数组。需要继续时只使用键 `to_bull` 和/或 `to_bear`；每个键对应一个对象，至少含 `must_address`（对手 claim ID 数组）和 `instruction`（具体碰撞指令）。示例：`{"to_bull":{"must_address":["<topic_id>:bear:1"],"instruction":"回应该 bear claim 的同一 decision hinge"},"to_bear":{"must_address":["<topic_id>:bull:1"],"instruction":"回应该 bull claim 的同一 decision hinge"}}`。无需路由时输出空对象 `{}`；不得输出 `next_steers:[...]`。
+`next_steers` 是对象，绝不是数组。需要继续时只使用键 `to_bull` 和/或 `to_bear`；每个键对应一个对象，至少含 `must_address`（对手 claim ID 数组）和 `instruction`（具体碰撞指令）。无需路由时输出空对象；不得输出数组。
 
 ## 输出大小
 
 - 每个数组最多保留 3 个最关键、可直接影响下一轮 collision 或 stop 决定的项目；同一 claim 或 evidence 不得在多个数组重复展开。
 - `claim_ledger` 每项只保留 contract 所需的识别、状态、evidence refs 与一句 reason；`accepted_for_opponent`、`decision_hinges` 与 `next_steers` 每项各不超过 180 个中文字符。
-- `topic_summary_delta`、`soft_control` 和 `reducer_checks` 只写规范字段的最短必要值。
+- `topic_summary_delta` 和 `soft_control` 只写规范字段的最短必要值。
 
 <!-- DYNAMIC SUFFIX (changes every call) -->
 topic_id: {topic_id}

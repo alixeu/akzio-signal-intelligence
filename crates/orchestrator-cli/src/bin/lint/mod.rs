@@ -40,6 +40,7 @@ pub const VALID_PLACEHOLDERS: &[&str] = &[
     "tickers",
     "common_ticker_prompt",
     "analyst_output_contract",
+    "retrieval_policy",
     "anti_injection",
     "research_calibration",
     "research_drivers",
@@ -104,6 +105,7 @@ pub const SCHEMA_PLACEHOLDERS: &[&str] = &[
 #[allow(dead_code)]
 pub const COMMON_COMPONENTS: &[&str] = &[
     "analyst_output_contract.md",
+    "retrieval_policy.md",
     "leveraged_etf_rules.md",
     "research_calibration.md",
     "research_drivers.md",

@@ -1,12 +1,14 @@
 pub mod alpaca;
 pub mod read_experience;
-pub mod read_jin10_csv;
+pub mod read_jin10_candidates;
 pub mod read_phase_summaries;
 pub mod read_phase_summary_details;
 pub mod read_reflection_source;
 pub mod read_run_context;
-pub mod read_technical_csv;
+pub mod read_technical_detail;
+pub mod read_technical_snapshot;
 pub mod think;
+pub mod verify_event;
 pub mod web_run;
 
 use anyhow::{bail, Context, Result};
@@ -118,24 +120,20 @@ const REGISTRY: &[ToolEntry] = &[
         definition: web_run::definition,
     },
     ToolEntry {
-        name: read_technical_csv::NAME,
-        definition: read_technical_csv::definition,
+        name: read_technical_snapshot::NAME,
+        definition: read_technical_snapshot::definition,
     },
     ToolEntry {
-        name: read_jin10_csv::NAME,
-        definition: read_jin10_csv::definition,
+        name: read_technical_detail::NAME,
+        definition: read_technical_detail::definition,
     },
     ToolEntry {
-        name: alpaca::GET_PORTFOLIO_NAME,
-        definition: alpaca::get_portfolio_definition,
+        name: read_jin10_candidates::NAME,
+        definition: read_jin10_candidates::definition,
     },
     ToolEntry {
-        name: alpaca::GET_HISTORY_NAME,
-        definition: alpaca::get_history_definition,
-    },
-    ToolEntry {
-        name: alpaca::GET_PRICE_NAME,
-        definition: alpaca::get_price_definition,
+        name: verify_event::NAME,
+        definition: verify_event::definition,
     },
     ToolEntry {
         name: alpaca::GET_NEWS_NAME,
@@ -155,8 +153,10 @@ pub fn tool_names() -> &'static [&'static str] {
         read_phase_summary_details::NAME,
         read_experience::NAME,
         read_reflection_source::NAME,
-        read_technical_csv::NAME,
-        read_jin10_csv::NAME,
+        read_technical_snapshot::NAME,
+        read_technical_detail::NAME,
+        read_jin10_candidates::NAME,
+        verify_event::NAME,
         alpaca::GET_NEWS_NAME,
     ]
 }
@@ -174,14 +174,7 @@ pub fn enabled_tool_names(
     if web_run.is_some() {
         names.push(web_run::NAME);
     }
-    if alpaca_live {
-        names.extend([
-            alpaca::GET_PORTFOLIO_NAME,
-            alpaca::GET_HISTORY_NAME,
-            alpaca::GET_PRICE_NAME,
-            alpaca::SUBMIT_TRADE_NAME,
-        ]);
-    }
+    let _ = alpaca_live;
     if alpaca_market_data {
         names.push(alpaca::GET_NEWS_NAME);
     }
@@ -322,13 +315,17 @@ pub async fn execute_named_tool(
                 result
             }
         }
-        read_technical_csv::NAME => read_technical_csv::execute(args, config),
-        read_jin10_csv::NAME => read_jin10_csv::execute(args, config),
+        read_technical_snapshot::NAME => read_technical_snapshot::execute(args, config),
+        read_technical_detail::NAME => read_technical_detail::execute(args, config),
+        read_jin10_candidates::NAME => read_jin10_candidates::execute(args, config),
+        verify_event::NAME => verify_event::execute(args, config, web_run).await,
         alpaca::GET_PORTFOLIO_NAME => alpaca::get_portfolio(config).await,
         alpaca::GET_HISTORY_NAME => alpaca::get_history(config).await,
         alpaca::GET_PRICE_NAME => alpaca::get_price(args, config).await,
         alpaca::GET_NEWS_NAME => alpaca::get_news(args, config).await,
-        alpaca::SUBMIT_TRADE_NAME => alpaca::submit_trade(args, config).await,
+        alpaca::SUBMIT_TRADE_NAME => {
+            bail!("alpaca_submit_trade is runtime-only and unavailable to LLM tool dispatch")
+        }
         other => bail!("unknown tool name: {other}"),
     }
 }

@@ -1228,22 +1228,18 @@ fn preseed_tool_calls(
         }
     }
     match turn.role.as_str() {
-        "analyst.technical" if tool_enabled("read_technical_context") => {
-            for ticker in tickers {
-                for interval in &["daily", "3h", "20min"] {
-                    calls.push(ToolCallRequest {
-                        call_id: format!("preseed-tech-{}-{}", ticker.to_lowercase(), interval),
-                        name: "read_technical_context".to_string(),
-                        arguments: json!({ "ticker": ticker, "interval": *interval }),
-                    });
-                }
-            }
-        }
-        "analyst.news_macro" if tool_enabled("read_jin10_context") => {
+        "analyst.technical" if tool_enabled("read_technical_snapshot") => {
             calls.push(ToolCallRequest {
-                call_id: "preseed-jin10".to_string(),
-                name: "read_jin10_context".to_string(),
-                arguments: json!({}),
+                call_id: "preseed-technical-snapshot".to_string(),
+                name: "read_technical_snapshot".to_string(),
+                arguments: json!({ "tickers": tickers, "intervals": ["daily", "3h", "20min"] }),
+            });
+        }
+        "analyst.news_macro" if tool_enabled("read_jin10_candidates") => {
+            calls.push(ToolCallRequest {
+                call_id: "preseed-jin10-candidates".to_string(),
+                name: "read_jin10_candidates".to_string(),
+                arguments: json!({ "tickers": tickers }),
             });
         }
         "researcher.bull.initial" | "researcher.bear.initial"
@@ -2541,15 +2537,15 @@ mod tests {
             &["QQQ".to_string()],
             &[
                 tools::READ_EXPERIENCE_TOOL_NAME.to_string(),
-                "read_technical_context".to_string(),
+                "read_technical_snapshot".to_string(),
             ],
         );
-        assert_eq!(calls.len(), 4);
+        assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].name, tools::READ_EXPERIENCE_TOOL_NAME);
         assert!(calls
             .iter()
             .skip(1)
-            .all(|call| call.name == "read_technical_context"));
+            .all(|call| call.name == "read_technical_snapshot"));
     }
 
     #[test]
@@ -2917,7 +2913,7 @@ mod tests {
                     "key_evidence": [{
                         "claim": "No decisive new macro catalyst was supplied.",
                         "evidence_type": "fact",
-                        "source": "read_jin10_context",
+                        "source": "read_jin10_candidates",
                         "timestamp": "2026-07-22",
                         "source_confidence": 0.8
                     }]

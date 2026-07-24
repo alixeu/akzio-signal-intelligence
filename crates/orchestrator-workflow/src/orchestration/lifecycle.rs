@@ -468,7 +468,52 @@ fn validate_final_validation_payload(payload: &Value) -> Option<String> {
                     .to_string()
             })
         })
+        .or_else(|| validate_asset_execution_constraints(payload))
         .or_else(|| required_string_error(payload, "execution_summary"))
+}
+
+fn validate_asset_execution_constraints(payload: &Value) -> Option<String> {
+    let Some(per_asset) = payload.get("per_asset") else {
+        // Legacy stored runs remain readable; Phase 6 stamps this field before
+        // persisting all new artifacts.
+        return None;
+    };
+    let per_asset = per_asset
+        .as_object()
+        .ok_or_else(|| "per_asset must be an object".to_string())
+        .ok()?;
+    for (ticker, constraint) in per_asset {
+        let direction = constraint
+            .get("direction_constraint")
+            .and_then(Value::as_str);
+        if !matches!(
+            direction,
+            Some("increase_only" | "decrease_only" | "unchanged")
+        ) {
+            return Some(format!(
+                "per_asset.{ticker}.direction_constraint is invalid"
+            ));
+        }
+        let status = constraint.get("execution_status").and_then(Value::as_str);
+        if !matches!(status, Some("execute" | "wait" | "downgrade")) {
+            return Some(format!("per_asset.{ticker}.execution_status is invalid"));
+        }
+        for field in ["current_weight", "max_target_weight", "max_weight_delta"] {
+            let value = constraint.get(field).and_then(Value::as_f64);
+            if !value.is_some_and(|value| value.is_finite() && (0.0..=1.0).contains(&value)) {
+                return Some(format!("per_asset.{ticker}.{field} must be 0.0-1.0"));
+            }
+        }
+        if !constraint
+            .get("binding_risk_controls")
+            .is_some_and(Value::is_array)
+        {
+            return Some(format!(
+                "per_asset.{ticker}.binding_risk_controls must be an array"
+            ));
+        }
+    }
+    None
 }
 
 fn validate_portfolio_allocation_payload(payload: &Value) -> Option<String> {

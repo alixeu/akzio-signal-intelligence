@@ -457,14 +457,23 @@ fn builtin_llm_role_values() -> BTreeMap<String, Value> {
             "analyst.technical",
             12,
             None,
-            vec!["read_experience", "read_technical_context"],
+            vec![
+                "read_experience",
+                "read_technical_snapshot",
+                "read_technical_detail",
+            ],
             false,
         ),
         (
             "analyst.news_macro",
             6,
             None,
-            vec!["read_experience", "read_jin10_context", "alpaca_get_news"],
+            vec![
+                "read_experience",
+                "read_jin10_candidates",
+                "verify_event",
+                "alpaca_get_news",
+            ],
             true,
         ),
         // Phase-2 roles read the compact index, then expand selected summaries.
@@ -526,17 +535,7 @@ fn builtin_llm_role_values() -> BTreeMap<String, Value> {
         ("risk.aggressive", 6, None, vec![], false),
         ("risk.neutral", 6, None, vec![], false),
         ("risk.conservative", 6, None, vec![], false),
-        (
-            "portfolio.manager",
-            8,
-            Some("medium"),
-            vec![
-                "alpaca_get_portfolio",
-                "alpaca_get_price",
-                "alpaca_submit_trade",
-            ],
-            false,
-        ),
+        ("portfolio.manager", 8, Some("medium"), vec![], false),
     ] {
         let mut object = serde_json::Map::new();
         object.insert("max_turns".to_string(), Value::from(max_turns));
@@ -1092,16 +1091,14 @@ mod tests {
         }
         assert_eq!(
             roles["analyst.news_macro"]["tools"],
-            json!(["read_experience", "read_jin10_context", "alpaca_get_news"])
-        );
-        assert_eq!(
-            roles["portfolio.manager"]["tools"],
             json!([
-                "alpaca_get_portfolio",
-                "alpaca_get_price",
-                "alpaca_submit_trade"
+                "read_experience",
+                "read_jin10_candidates",
+                "verify_event",
+                "alpaca_get_news"
             ])
         );
+        assert_eq!(roles["portfolio.manager"]["tools"], json!([]));
         for role in ["researcher.bull.initial", "researcher.bear.initial"] {
             assert_eq!(
                 roles[role]["tools"],

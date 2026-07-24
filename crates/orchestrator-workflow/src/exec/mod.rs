@@ -9,8 +9,8 @@ use orchestrator_sql::{
     clear_agent_loop_history, connect, pending_reflection_tasks, persist_reflection_artifact,
     prediction::{upsert_prediction, PredictionInput},
     score_mature_predictions, set_reflection_task_status, set_run_current_phase, update_run_status,
-    upsert_decision_snapshot, write_run_record, AGGREGATE_TICKER, DecisionSnapshotInput,
-    ReflectionThresholds, RunRecordInput,
+    upsert_decision_snapshot, write_run_record, DecisionSnapshotInput, ReflectionThresholds,
+    RunRecordInput, AGGREGATE_TICKER,
 };
 use serde_json::{json, Value};
 use std::{
@@ -51,7 +51,7 @@ use crate::orchestration::role_jobs::{
 use crate::orchestration::PHASE2_REDUCER;
 use orchestrator_core::role_registry::DEFAULT_PHASE1_AGENTS;
 use rusqlite::{params, OptionalExtension};
- 
+
 mod args;
 pub use args::*;
 
@@ -198,7 +198,8 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             });
             set_phase_status(&mut state, 0, "skipped");
         } else {
-            let alpaca_history = if runtime_config.alpaca_api_key
+            let alpaca_history = if runtime_config
+                .alpaca_api_key
                 .as_ref()
                 .is_some_and(|value| !value.trim().is_empty())
                 && runtime_config
@@ -2033,8 +2034,10 @@ async fn run_phase2_side_warmup(
             ready_metadata["response"] = json!("准备完毕");
             ready_metadata["warmup_ready"] = json!(true);
             ready_metadata["degraded"] = json!(false);
-            ready_metadata["artifact_status"] = artifact.get("status").cloned().unwrap_or(Value::Null);
-            ready_metadata["artifact_response"] = artifact.get("response").cloned().unwrap_or(Value::Null);
+            ready_metadata["artifact_status"] =
+                artifact.get("status").cloned().unwrap_or(Value::Null);
+            ready_metadata["artifact_response"] =
+                artifact.get("response").cloned().unwrap_or(Value::Null);
             return Ok((
                 ready_metadata,
                 state
@@ -2045,7 +2048,8 @@ async fn run_phase2_side_warmup(
         }
         last_error = Some(format!(
             "unexpected artifact response (status={:?}, response={:?})",
-            artifact.get("status"), artifact.get("response")
+            artifact.get("status"),
+            artifact.get("response")
         ));
         if attempt == 1 {
             tracing::warn!(role, "phase 2 warmup handshake failed; retrying once");
@@ -2055,7 +2059,9 @@ async fn run_phase2_side_warmup(
         side = side,
         ready = false,
         status = status,
-        error = last_error.as_deref().unwrap_or("phase2 side warmup did not return the required 准备完毕 handshake"),
+        error = last_error
+            .as_deref()
+            .unwrap_or("phase2 side warmup did not return the required 准备完毕 handshake"),
         "phase 2 warmup handshake fallback applied"
     );
     state["degraded"] = json!(true);
@@ -2080,12 +2086,14 @@ async fn run_phase2_side_warmup(
     fallback["response"] = json!("准备完毕");
     fallback["warmup_ready"] = json!(false);
     fallback["degraded"] = json!(true);
-    fallback["degraded_reason"] = Value::String(
-        last_error.unwrap_or_else(|| "phase2 warmup failed".to_string()),
-    );
+    fallback["degraded_reason"] =
+        Value::String(last_error.unwrap_or_else(|| "phase2 warmup failed".to_string()));
     Ok((
         fallback,
-        state.get("role_job_metrics").cloned().unwrap_or_else(|| json!([])),
+        state
+            .get("role_job_metrics")
+            .cloned()
+            .unwrap_or_else(|| json!([])),
     ))
 }
 
@@ -2762,7 +2770,7 @@ async fn run_phase2_topic_generation(
 
 fn merge_topic_generation_output(baseline: &Value, generated: &Value) -> Value {
     let mut artifact = baseline.clone();
-    for field in ["common_ground", "summary", "reducer_checks"] {
+    for field in ["common_ground", "summary"] {
         if let Some(value) = generated.get(field) {
             artifact[field] = value.clone();
         }
@@ -3025,10 +3033,7 @@ fn phase1_cached_artifact_fallback_active(state: &Value) -> bool {
         .and_then(Value::as_object)
         .is_some_and(|reports| {
             reports.values().any(|artifact| {
-                artifact
-                    .get("fallback")
-                    .and_then(Value::as_str)
-                    == Some("cached_db_artifact")
+                artifact.get("fallback").and_then(Value::as_str) == Some("cached_db_artifact")
             })
         })
 }
@@ -3860,6 +3865,7 @@ async fn run_phase6(
     .await?;
     record_market_truth_check(state, "final_trade_decision", &artifact);
     enforce_phase3_market_truth(state, &mut artifact);
+    stamp_phase6_execution_constraints(state, &mut artifact);
     persist_artifact(conn, state, 6, "portfolio.manager", artifact.clone())?;
     state["final_trade_decision"] = artifact;
     Ok(())
@@ -3890,9 +3896,158 @@ fn run_phase6_derived(conn: &mut rusqlite::Connection, state: &mut Value) -> Res
     let mut artifact = artifact;
     record_market_truth_check(state, "final_trade_decision", &artifact);
     enforce_phase3_market_truth(state, &mut artifact);
+    stamp_phase6_execution_constraints(state, &mut artifact);
     persist_artifact(conn, state, 6, "portfolio.manager", artifact.clone())?;
     state["final_trade_decision"] = artifact;
     Ok(())
+}
+
+/// Phase 6 owns semantic limits, not account mechanics.  Runtime supplies the
+/// current weight and fills any omitted asset with the least permissive
+/// constraint compatible with the Trader direction.
+fn stamp_phase6_execution_constraints(state: &Value, artifact: &mut Value) {
+    let assets = state
+        .get("investable_assets")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let assets = if assets.is_empty() {
+        tickers_from_state(state)
+    } else {
+        assets
+    };
+    let top_status = artifact
+        .get("execution_status")
+        .and_then(Value::as_str)
+        .filter(|status| matches!(*status, "execute" | "wait" | "downgrade"))
+        .unwrap_or("wait");
+    let top_controls = artifact
+        .get("risk_controls")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let supplied = artifact
+        .get("per_asset")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let constraints = assets
+        .iter()
+        .map(|ticker| {
+            let raw = supplied.get(ticker).unwrap_or(&Value::Null);
+            let current_weight = runtime_current_weight(state, ticker);
+            let trader_direction = trader_direction_constraint(state, ticker);
+            let direction = raw
+                .get("direction_constraint")
+                .and_then(Value::as_str)
+                .filter(|direction| {
+                    matches!(*direction, "increase_only" | "decrease_only" | "unchanged")
+                })
+                .filter(|direction| {
+                    trader_direction == "unchanged"
+                        || *direction == trader_direction
+                        || *direction == "unchanged"
+                })
+                .unwrap_or(trader_direction);
+            let status = raw
+                .get("execution_status")
+                .and_then(Value::as_str)
+                .filter(|status| matches!(*status, "execute" | "wait" | "downgrade"))
+                .unwrap_or(top_status);
+            let trader_cap = trader_position_cap(state, ticker);
+            let mut max_target_weight = raw
+                .get("max_target_weight")
+                .and_then(Value::as_f64)
+                .filter(|weight| weight.is_finite())
+                .unwrap_or(trader_cap)
+                .clamp(0.0, trader_cap);
+            let mut max_weight_delta = raw
+                .get("max_weight_delta")
+                .and_then(Value::as_f64)
+                .filter(|weight| weight.is_finite())
+                .unwrap_or((max_target_weight - current_weight).abs())
+                .clamp(0.0, 1.0);
+            if status == "wait" || direction == "unchanged" {
+                max_target_weight = current_weight;
+                max_weight_delta = 0.0;
+            } else if status == "downgrade" {
+                max_target_weight = max_target_weight.min(current_weight);
+                max_weight_delta = max_weight_delta.min(current_weight - max_target_weight);
+            }
+            let controls = raw
+                .get("binding_risk_controls")
+                .and_then(Value::as_array)
+                .map(|controls| {
+                    controls
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .filter(|controls| !controls.is_empty())
+                .unwrap_or_else(|| top_controls.clone());
+            (
+                ticker.clone(),
+                json!({
+                    "direction_constraint": direction,
+                    "execution_status": status,
+                    "current_weight": current_weight,
+                    "max_target_weight": max_target_weight,
+                    "max_weight_delta": max_weight_delta,
+                    "binding_risk_controls": controls
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    artifact["per_asset"] = Value::Object(constraints);
+}
+
+fn runtime_current_weight(state: &Value, ticker: &str) -> f64 {
+    state
+        .get("current_portfolio_weights")
+        .and_then(Value::as_object)
+        .and_then(|weights| weights.get(ticker))
+        .and_then(Value::as_f64)
+        .filter(|weight| weight.is_finite())
+        .unwrap_or(0.0)
+        .clamp(0.0, 1.0)
+}
+
+fn trader_direction_constraint(state: &Value, ticker: &str) -> &'static str {
+    let plan = state
+        .get("trader_investment_plan")
+        .and_then(|plan| plan.get("per_ticker"))
+        .and_then(Value::as_object)
+        .and_then(|plans| plans.get(ticker))
+        .or_else(|| state.get("trader_investment_plan"));
+    match plan
+        .and_then(|plan| plan.get("candidate_action").or_else(|| plan.get("action")))
+        .and_then(Value::as_str)
+    {
+        Some("Buy") => "increase_only",
+        Some("Sell") => "decrease_only",
+        _ => "unchanged",
+    }
+}
+
+fn trader_position_cap(state: &Value, ticker: &str) -> f64 {
+    let plan = state
+        .get("trader_investment_plan")
+        .and_then(|plan| plan.get("per_ticker"))
+        .and_then(Value::as_object)
+        .and_then(|plans| plans.get(ticker))
+        .or_else(|| state.get("trader_investment_plan"));
+    plan.and_then(|plan| plan.get("position_size_pct_max"))
+        .and_then(Value::as_f64)
+        .filter(|weight| weight.is_finite())
+        .unwrap_or(0.0)
+        .clamp(0.0, 1.0)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4130,6 +4285,12 @@ async fn run_phase7(
     config: &RuntimeConfig,
 ) -> Result<()> {
     debug!("allocation context computation starting");
+    load_phase7_account_weights(state, config).await;
+    if let Some(decision) = state.get("final_trade_decision").cloned() {
+        let mut decision = decision;
+        stamp_phase6_execution_constraints(state, &mut decision);
+        state["final_trade_decision"] = decision;
+    }
     let context = compute_allocation_context(state, conn, &config.allocation)?;
     state["allocation_context"] = allocation_prompt_context(&context);
     debug!(vix_regime = ?context.get("vix").and_then(|v| v.get("regime")), "allocation context ready");
@@ -4142,6 +4303,91 @@ async fn run_phase7(
     state["portfolio_allocation"] = allocation;
     debug!("Rust allocation guardrails completed");
     Ok(())
+}
+
+/// Account state is a runtime input, never an LLM assertion.  It is optional
+/// for a plan-only run, but a successful read refreshes current weights before
+/// Phase 7 projects Phase 6's semantic constraints.
+async fn load_phase7_account_weights(state: &mut Value, config: &RuntimeConfig) {
+    let disabled_reason = if is_mock(state) {
+        Some("mock runs never read trading accounts")
+    } else if state.get("debug").and_then(Value::as_bool) == Some(true) {
+        Some("debug runs do not change execution semantics")
+    } else if config
+        .alpaca_api_key
+        .as_deref()
+        .is_none_or(|value| value.trim().is_empty())
+        || config
+            .alpaca_api_secret
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+    {
+        Some("Paper Trading credentials are unavailable")
+    } else {
+        None
+    };
+    if let Some(reason) = disabled_reason {
+        state["phase7_account_snapshot"] = json!({"status": "data_gap", "reason": reason});
+        return;
+    }
+    let tickers = state
+        .get("investable_assets")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let tool_config = orchestrator_llm::tools::ExternalToolConfig {
+        project_root: orchestrator_core::default_project_root(),
+        db_path: state
+            .get("db_path")
+            .and_then(Value::as_str)
+            .filter(|path| !path.trim().is_empty())
+            .map(std::path::PathBuf::from),
+        run_id: state
+            .get("run_id")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        phase: Some(7),
+        tickers,
+        alpaca_live: true,
+        alpaca_api_key: config.alpaca_api_key.clone(),
+        alpaca_api_secret: config.alpaca_api_secret.clone(),
+        ..Default::default()
+    };
+    match orchestrator_llm::tools::alpaca::get_portfolio(&tool_config).await {
+        Ok(snapshot) => {
+            let equity = snapshot
+                .get("equity")
+                .and_then(Value::as_f64)
+                .filter(|value| *value > 0.0 && value.is_finite());
+            let weights = equity
+                .map(|equity| {
+                    snapshot
+                        .get("positions")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|position| {
+                            let ticker = position.get("symbol")?.as_str()?.to_string();
+                            let market_value = position.get("market_value")?.as_f64()?;
+                            Some((ticker, json!((market_value / equity).clamp(0.0, 1.0))))
+                        })
+                        .collect::<serde_json::Map<_, _>>()
+                })
+                .unwrap_or_default();
+            state["current_portfolio_weights"] = Value::Object(weights);
+            state["phase7_account_snapshot"] = snapshot;
+        }
+        Err(error) => {
+            state["phase7_account_snapshot"] = json!({
+                "status": "data_gap",
+                "reason": "account snapshot unavailable",
+                "error": error.to_string()
+            });
+        }
+    }
 }
 
 #[cfg(test)]
@@ -4218,19 +4464,12 @@ mod tests {
         assert!(!settings.tools.contains(&"read_run_context".to_string()));
         assert!(settings
             .tools
-            .contains(&"read_technical_context".to_string()));
+            .contains(&"read_technical_snapshot".to_string()));
         assert!(settings.tools.contains(&"read_experience".to_string()));
         for role in ["trader", "risk.conservative"] {
             assert!(roles[role].tools.is_empty(), "role={role}");
         }
-        assert_eq!(
-            roles["portfolio.manager"].tools,
-            vec![
-                "alpaca_get_portfolio".to_string(),
-                "alpaca_get_price".to_string(),
-                "alpaca_submit_trade".to_string(),
-            ]
-        );
+        assert!(roles["portfolio.manager"].tools.is_empty());
     }
 
     #[test]
@@ -4926,19 +5165,58 @@ mod tests {
         let mut state = json!({"degraded": false});
         crate::orchestration::degraded::record_preflight_result(
             &mut state,
-            "read_technical_context",
+            "read_technical_snapshot",
             Err(anyhow::anyhow!("missing technical data")),
         );
 
         assert_eq!(state["degraded"], true);
         assert_eq!(
-            state["preflight"]["read_technical_context"]["status"],
+            state["preflight"]["read_technical_snapshot"]["status"],
             "error"
         );
-        assert!(state["preflight"]["read_technical_context"]["message"]
+        assert!(state["preflight"]["read_technical_snapshot"]["message"]
             .as_str()
             .unwrap()
             .contains("missing technical data"));
+    }
+
+    #[test]
+    fn phase6_constraints_use_runtime_weight_and_cannot_reverse_trader() {
+        let state = json!({
+            "investable_assets": ["QQQ"],
+            "current_portfolio_weights": {"QQQ": 0.25},
+            "trader_investment_plan": {
+                "candidate_action": "Buy",
+                "position_size_pct_max": 0.4
+            }
+        });
+        let mut artifact = json!({
+            "execution_status": "execute",
+            "risk_controls": ["cap concentration"],
+            "per_asset": {
+                "QQQ": {
+                    "direction_constraint": "decrease_only",
+                    "execution_status": "execute",
+                    "current_weight": 0.99,
+                    "max_target_weight": 0.8,
+                    "max_weight_delta": 0.8,
+                    "binding_risk_controls": []
+                }
+            }
+        });
+
+        stamp_phase6_execution_constraints(&state, &mut artifact);
+
+        assert_eq!(
+            artifact["per_asset"]["QQQ"]["direction_constraint"],
+            "increase_only"
+        );
+        assert_eq!(artifact["per_asset"]["QQQ"]["current_weight"], 0.25);
+        assert_eq!(artifact["per_asset"]["QQQ"]["max_target_weight"], 0.4);
+        assert_eq!(
+            artifact["per_asset"]["QQQ"]["binding_risk_controls"],
+            json!(["cap concentration"])
+        );
     }
 
     #[tokio::test]
@@ -4954,7 +5232,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            state["preflight"]["read_technical_context"]["status"],
+            state["preflight"]["read_technical_snapshot"]["status"],
             "error"
         );
     }

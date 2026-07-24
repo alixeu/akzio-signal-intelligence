@@ -141,6 +141,27 @@ pub struct RiskConstraints {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct AssetExecutionConstraint {
+    /// increase_only | decrease_only | unchanged
+    #[serde(default)]
+    pub direction_constraint: String,
+    /// execute | wait | downgrade
+    #[serde(default)]
+    pub execution_status: String,
+    /// Runtime-sourced current portfolio weight, 0.0-1.0.
+    #[serde(default)]
+    pub current_weight: f64,
+    /// Hard ceiling for the Phase 7 target weight, 0.0-1.0.
+    #[serde(default)]
+    pub max_target_weight: f64,
+    /// Largest absolute Phase 7 move from current_weight, 0.0-1.0.
+    #[serde(default)]
+    pub max_weight_delta: f64,
+    #[serde(default)]
+    pub binding_risk_controls: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 pub struct FinalValidation {
     pub rating: String,
     /// execute | wait | downgrade
@@ -158,6 +179,9 @@ pub struct FinalValidation {
     pub risk_controls: Vec<String>,
     #[serde(default)]
     pub rationale: String,
+    /// Per-asset semantic constraints for Rust-owned allocation and execution.
+    #[serde(default)]
+    pub per_asset: BTreeMap<String, AssetExecutionConstraint>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }

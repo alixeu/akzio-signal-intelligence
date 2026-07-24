@@ -144,7 +144,8 @@ pub(crate) fn allocation_prompt_context(context: &Value) -> Value {
         "final_trade_decision": context.get("final_trade_decision").map(|decision| json!({
             "rating": decision.get("rating").cloned().unwrap_or(Value::Null),
             "execution_summary": decision.get("execution_summary").cloned().unwrap_or(Value::Null),
-            "risk_controls": decision.get("risk_controls").cloned().unwrap_or_else(|| json!([]))
+            "risk_controls": decision.get("risk_controls").cloned().unwrap_or_else(|| json!([])),
+            "per_asset": decision.get("per_asset").cloned().unwrap_or_else(|| json!({}))
         })).unwrap_or(Value::Null),
         "correlation_60d": context.get("correlation_60d").cloned().unwrap_or(Value::Null),
         "correlation_warning": context.get("correlation_warning").cloned().unwrap_or(Value::Null),
@@ -316,22 +317,103 @@ pub(crate) fn derive_guarded_allocation(
     config: &AllocationConfig,
 ) -> Result<Value> {
     validate_allocation_research_input(state, context)?;
-    if let Some(status @ ("wait" | "downgrade")) = state
-        .get("final_trade_decision")
-        .and_then(|decision| decision.get("execution_status"))
-        .and_then(Value::as_str)
-    {
-        let mut allocation = cash_only_allocation(
-            context,
-            &format!("Portfolio Manager execution_status={status}"),
-        );
-        allocation["allocation_method"] = json!("rust_portfolio_gate");
-        validate_allocation_output(&allocation, context, config)?;
-        return Ok(allocation);
-    }
     let mut allocation = normalize_allocation(&json!({"weights": {}}), context, config);
+    allocation = apply_phase6_execution_constraints(allocation, context, config)?;
     allocation["allocation_method"] = json!("rust_inverse_vol_guardrails");
     validate_allocation_output(&allocation, context, config)?;
+    Ok(allocation)
+}
+
+fn apply_phase6_execution_constraints(
+    mut allocation: Value,
+    context: &Value,
+    config: &AllocationConfig,
+) -> Result<Value> {
+    let Some(constraints) = context
+        .get("final_trade_decision")
+        .and_then(|decision| decision.get("per_asset"))
+        .and_then(Value::as_object)
+    else {
+        return Ok(allocation);
+    };
+    let investable = context
+        .get("investable_assets")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    let weights = allocation
+        .get_mut("weights")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| anyhow::anyhow!("allocation weights missing"))?;
+    let mut equity_total: f64 = 0.0;
+    for ticker in investable {
+        let Some(constraint) = constraints.get(ticker) else {
+            continue;
+        };
+        let current = constraint
+            .get("current_weight")
+            .and_then(Value::as_f64)
+            .filter(|weight| weight.is_finite())
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0);
+        let cap = constraint
+            .get("max_target_weight")
+            .and_then(Value::as_f64)
+            .filter(|weight| weight.is_finite())
+            .unwrap_or(current)
+            .clamp(0.0, effective_position_cap(context, config));
+        let delta = constraint
+            .get("max_weight_delta")
+            .and_then(Value::as_f64)
+            .filter(|weight| weight.is_finite())
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0);
+        let status = constraint
+            .get("execution_status")
+            .and_then(Value::as_str)
+            .unwrap_or("wait");
+        let direction = constraint
+            .get("direction_constraint")
+            .and_then(Value::as_str)
+            .unwrap_or("unchanged");
+        let desired = weights
+            .get(ticker)
+            .and_then(|entry| entry.get("weight"))
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        let mut target = desired.min(cap).clamp(current - delta, current + delta);
+        if status == "wait" || direction == "unchanged" {
+            target = current;
+        } else if direction == "increase_only" {
+            target = target.max(current);
+        } else if direction == "decrease_only" || status == "downgrade" {
+            target = target.min(current);
+        }
+        target = target.clamp(0.0, cap.max(current));
+        equity_total += target;
+        weights.insert(
+            ticker.to_string(),
+            json!({
+                "weight": (target * 10_000.0).round() / 10_000.0,
+                "rationale": "Phase 7 projection of Phase 6 semantic execution constraints."
+            }),
+        );
+    }
+    if equity_total > 1.0 + 0.001 {
+        bail!("Phase 6 current-weight constraints exceed total portfolio capacity");
+    }
+    weights.insert(
+        "cash_hedge".to_string(),
+        json!({
+            "weight": ((1.0 - equity_total) * 10_000.0).round() / 10_000.0,
+            "rationale": "Residual cash after Phase 6 execution constraints."
+        }),
+    );
+    allocation["total_equity_exposure"] = json!((equity_total * 10_000.0).round() / 10_000.0);
+    allocation["summary"] =
+        json!("Rust allocation projected through Phase 6 per-asset constraints.");
     Ok(allocation)
 }
 
@@ -1302,8 +1384,9 @@ mod tests {
             }
         });
 
-        let allocation =
-            derive_guarded_allocation(&state, &test_context(), &test_config()).unwrap();
+        let mut context = test_context();
+        context["final_trade_decision"] = state["final_trade_decision"].clone();
+        let allocation = derive_guarded_allocation(&state, &context, &test_config()).unwrap();
 
         assert_eq!(
             allocation["allocation_method"],
@@ -1320,7 +1403,7 @@ mod tests {
     }
 
     #[test]
-    fn portfolio_wait_forces_cash_only_allocation() {
+    fn phase6_wait_constraints_preserve_current_weight() {
         let state = json!({
             "research_plan": {
                 "per_ticker": {
@@ -1328,13 +1411,23 @@ mod tests {
                     "SOXX": {"long_probability": 0.58}
                 }
             },
-            "final_trade_decision": {"execution_status": "wait"}
+            "final_trade_decision": {
+                "execution_status": "wait",
+                "per_asset": {
+                    "QQQ": {"direction_constraint": "unchanged", "execution_status": "wait", "current_weight": 0.0, "max_target_weight": 0.0, "max_weight_delta": 0.0, "binding_risk_controls": []},
+                    "SOXX": {"direction_constraint": "unchanged", "execution_status": "wait", "current_weight": 0.0, "max_target_weight": 0.0, "max_weight_delta": 0.0, "binding_risk_controls": []}
+                }
+            }
         });
 
-        let allocation =
-            derive_guarded_allocation(&state, &test_context(), &test_config()).unwrap();
+        let mut context = test_context();
+        context["final_trade_decision"] = state["final_trade_decision"].clone();
+        let allocation = derive_guarded_allocation(&state, &context, &test_config()).unwrap();
 
-        assert_eq!(allocation["allocation_method"], "rust_portfolio_gate");
+        assert_eq!(
+            allocation["allocation_method"],
+            "rust_inverse_vol_guardrails"
+        );
         assert_eq!(allocation["total_equity_exposure"], 0.0);
         assert_eq!(allocation["weights"]["cash_hedge"]["weight"], 1.0);
     }

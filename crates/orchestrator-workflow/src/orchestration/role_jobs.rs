@@ -149,7 +149,9 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
         prompt_path,
     } = input;
     let debug_enabled = state.get("debug").and_then(Value::as_bool).unwrap_or(false);
-    let alpaca_live = role == "portfolio.manager" && !mock && !debug_enabled;
+    // LLM roles never receive account or order submission tools. Runtime-owned
+    // Phase 7 execution uses a separate, fail-closed gate after allocation.
+    let alpaca_live = false;
     let alpaca_market_data = role == "analyst.news_macro" && !mock && !debug_enabled;
     let tickers = tickers_from_state(&state);
     let tool_tickers = if role == "portfolio.manager" {

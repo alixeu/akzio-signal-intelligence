@@ -17,9 +17,9 @@ pub use artifact::{
     normalize_probability, normalize_research_artifact_value, portfolio_allocation_schema,
     research_artifact_schema, research_rating_for_probability, risk_constraints_schema, schema_for,
     trade_intent_schema, validate_analyst_ticker_artifact, validate_evidence_types,
-    validate_research_artifact, validate_risk_constraints, AnalystTickerArtifact, FinalValidation,
-    PortfolioAllocation, ResearchArtifact, RiskConstraints, TradeIntent, ValidationError,
-    CANONICAL_EVIDENCE_TYPES,
+    validate_research_artifact, validate_risk_constraints, AnalystTickerArtifact,
+    AssetExecutionConstraint, FinalValidation, PortfolioAllocation, ResearchArtifact,
+    RiskConstraints, TradeIntent, ValidationError, CANONICAL_EVIDENCE_TYPES,
 };
 pub use config::{
     config_bool, config_float, config_get, config_int, config_str, config_strings, deep_merge,

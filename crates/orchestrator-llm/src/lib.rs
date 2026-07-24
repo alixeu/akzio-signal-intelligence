@@ -2004,6 +2004,7 @@ fn parse_final_output(settings: &AgentSettings, text: &str) -> Result<Value> {
             }
             match parse_json_object_artifact(text) {
                 Ok(artifact) => {
+                    let artifact = stamp_runtime_artifact_envelope(settings, artifact)?;
                     let artifact = if settings.role.starts_with("analyst.") {
                         normalize_analyst_artifact_value(artifact)?
                     } else {
@@ -2023,6 +2024,65 @@ fn parse_final_output(settings: &AgentSettings, text: &str) -> Result<Value> {
             }
         }
     }
+}
+
+/// Envelope identity and reducer attestations are runtime facts.  Stamp them
+/// after parsing so the model can focus on substantive analysis and cannot
+/// self-certify JSON validity or source isolation.
+fn stamp_runtime_artifact_envelope(settings: &AgentSettings, mut artifact: Value) -> Result<Value> {
+    let object = artifact
+        .as_object_mut()
+        .context("JSON artifact must be an object")?;
+    object
+        .entry("id".to_string())
+        .or_insert_with(|| json!(settings.role));
+    object
+        .entry("role".to_string())
+        .or_insert_with(|| json!(settings.role));
+
+    match settings.role.as_str() {
+        "mediator.topic" => {
+            object
+                .entry("artifact_type".to_string())
+                .or_insert_with(|| json!("phase2_topic_generation_artifact"));
+            object.insert(
+                "reducer_checks".to_string(),
+                json!({
+                    "from_phase1_index_only": true,
+                    "no_new_external_facts": true,
+                    "json_valid": true
+                }),
+            );
+        }
+        "mediator.topic_controller" => {
+            object
+                .entry("artifact_type".to_string())
+                .or_insert_with(|| json!("topic_controller_packet"));
+            object.insert("reducer_checks".to_string(), json!({}));
+        }
+        "researcher.bull.initial" => {
+            object
+                .entry("artifact_type".to_string())
+                .or_insert_with(|| json!("bull_seed_packet"));
+        }
+        "researcher.bear.initial" => {
+            object
+                .entry("artifact_type".to_string())
+                .or_insert_with(|| json!("bear_seed_packet"));
+        }
+        "researcher.bull.interaction" => {
+            object
+                .entry("artifact_type".to_string())
+                .or_insert_with(|| json!("bull_debate_packet"));
+        }
+        "researcher.bear.interaction" => {
+            object
+                .entry("artifact_type".to_string())
+                .or_insert_with(|| json!("bear_debate_packet"));
+        }
+        _ => {}
+    }
+    Ok(artifact)
 }
 
 pub(crate) fn normalize_analyst_artifact_value(mut artifact: Value) -> Result<Value> {
@@ -2236,16 +2296,7 @@ fn validate_topic_generation_contract(settings: &AgentSettings, artifact: &Value
         require_non_empty_string(topic, "why_debate")?;
     }
     require_non_empty_string(artifact, "summary")?;
-    let reducer_checks = require_object(artifact, "reducer_checks")?;
-    for field in [
-        "from_phase1_index_only",
-        "no_new_external_facts",
-        "json_valid",
-    ] {
-        if reducer_checks.get(field).and_then(Value::as_bool) != Some(true) {
-            bail!("topic generation reducer_checks.{field} must be true");
-        }
-    }
+    require_object(artifact, "reducer_checks")?;
     Ok(())
 }
 
@@ -2719,6 +2770,13 @@ fn configured_tool_names(settings: &AgentSettings) -> Vec<&str> {
             .iter()
             .map(String::as_str)
             .filter(|name| {
+                if *name == tools::ALPACA_SUBMIT_TRADE_TOOL_NAME
+                    || *name == tools::ALPACA_GET_PORTFOLIO_TOOL_NAME
+                    || *name == tools::ALPACA_GET_HISTORY_TOOL_NAME
+                    || *name == tools::ALPACA_GET_PRICE_TOOL_NAME
+                {
+                    return false;
+                }
                 if *name == tools::ALPACA_GET_NEWS_TOOL_NAME {
                     settings
                         .tools
@@ -2983,8 +3041,10 @@ mod tests {
                 "read_phase_summary_details",
                 "read_experience",
                 "read_reflection_source",
-                "read_technical_context",
-                "read_jin10_context",
+                "read_technical_snapshot",
+                "read_technical_detail",
+                "read_jin10_candidates",
+                "verify_event",
                 "alpaca_get_news",
             ]
         );
@@ -3886,17 +3946,17 @@ mod tests {
         settings.role = "analyst.technical".to_string();
         settings.llm.base_url = Some("https://llm.example.com/v1".to_string());
         settings.llm.api_key = Some("test-key".to_string());
-        settings.llm.tools = vec!["read_technical_context".to_string()];
+        settings.llm.tools = vec!["read_technical_snapshot".to_string()];
         settings.web_search.mode = WebSearchMode::Live;
         assert_eq!(
             super::configured_tool_names(&settings),
-            vec!["think", "read_technical_context", "web.run"]
+            vec!["think", "read_technical_snapshot", "web.run"]
         );
 
         settings.llm.think_tool = false;
         assert_eq!(
             super::configured_tool_names(&settings),
-            vec!["read_technical_context", "web.run"]
+            vec!["read_technical_snapshot", "web.run"]
         );
     }
 
@@ -3933,7 +3993,7 @@ mod tests {
     }
 
     #[test]
-    fn portfolio_manager_only_gets_alpaca_tools_when_live_gate_is_open() {
+    fn portfolio_manager_never_gets_runtime_execution_tools() {
         let mut settings = base_settings(LlmRoute::Responses);
         settings.role = "portfolio.manager".to_string();
         settings.llm.think_tool = false;
@@ -3949,14 +4009,7 @@ mod tests {
         assert!(super::web_run_runtime_for_settings(&settings).is_none());
 
         settings.tools.as_mut().unwrap().alpaca_live = true;
-        assert_eq!(
-            super::configured_tool_names(&settings),
-            vec![
-                tools::ALPACA_GET_PORTFOLIO_TOOL_NAME,
-                tools::ALPACA_GET_PRICE_TOOL_NAME,
-                tools::ALPACA_SUBMIT_TRADE_TOOL_NAME,
-            ]
-        );
+        assert!(super::configured_tool_names(&settings).is_empty());
     }
 
     #[test]

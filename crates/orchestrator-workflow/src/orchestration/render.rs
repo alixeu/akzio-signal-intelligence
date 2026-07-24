@@ -272,6 +272,7 @@ pub(crate) fn render_prompt_with_plugins(
         .unwrap_or(Value::Null);
     let analyst_output_contract_template =
         prompt_component(prompt_path, "common/analyst_output_contract.md")?;
+    let retrieval_policy_template = prompt_component(prompt_path, "common/retrieval_policy.md")?;
     let research_calibration_template =
         prompt_component(prompt_path, "common/research_calibration.md")?;
     let research_drivers_template = prompt_component(prompt_path, "common/research_drivers.md")?;
@@ -295,6 +296,7 @@ pub(crate) fn render_prompt_with_plugins(
     });
     let analyst_output_contract =
         replace_placeholders(&analyst_output_contract_template, &component_values);
+    let retrieval_policy = replace_placeholders(&retrieval_policy_template, &component_values);
     let research_calibration =
         replace_placeholders(&research_calibration_template, &component_values);
     let research_drivers = replace_placeholders(&research_drivers_template, &component_values);
@@ -333,6 +335,7 @@ pub(crate) fn render_prompt_with_plugins(
         "tickers": tickers.join(","),
         "common_ticker_prompt": "",
         "analyst_output_contract": analyst_output_contract,
+        "retrieval_policy": retrieval_policy,
         "anti_injection": "",
         "research_calibration": research_calibration,
         "research_drivers": research_drivers,
@@ -423,7 +426,48 @@ pub(crate) fn render_prompt_with_plugins(
             Value::String(risk_analyst_body),
         );
     }
-    Ok(replace_placeholders(&template, &values))
+    let rendered = replace_placeholders(&template, &values);
+    let unresolved = unresolved_placeholders(&rendered);
+    if !unresolved.is_empty() {
+        bail!(
+            "prompt {} retained unresolved placeholders: {}",
+            prompt_path
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "<inline prompt>".to_string()),
+            unresolved.join(", ")
+        );
+    }
+    Ok(rendered)
+}
+
+/// Reject template variables that survived the single, non-recursive render
+/// pass. JSON braces and prose are ignored; only `{lower_snake_case}` tokens
+/// are treated as placeholders.
+fn unresolved_placeholders(text: &str) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let mut placeholders = std::collections::BTreeSet::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'{' {
+            index += 1;
+            continue;
+        }
+        let start = index + 1;
+        let Some(end_offset) = bytes[start..].iter().position(|byte| *byte == b'}') else {
+            break;
+        };
+        let end = start + end_offset;
+        let name = &text[start..end];
+        if !name.is_empty()
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+        {
+            placeholders.insert(name.to_string());
+        }
+        index = end + 1;
+    }
+    placeholders.into_iter().collect()
 }
 
 /// Public lint entry point. The CLI deliberately shares the production
@@ -516,6 +560,28 @@ required_variables = ["ticker", "tickers"]
         .unwrap();
 
         assert!(prompt.contains("Ticker boundary: TQQQ; all: TQQQ,VIX"));
+    }
+
+    #[test]
+    fn render_prompt_rejects_unresolved_placeholder() {
+        let temp = TempDir::new().unwrap();
+        let prompts = temp.path().join("prompts");
+        std::fs::create_dir_all(prompts.join("phase1")).unwrap();
+        let prompt_path = prompts.join("phase1/test.md");
+        std::fs::write(&prompt_path, "Role prompt {missing_variable}").unwrap();
+
+        let error = render_prompt(
+            &json!({"ticker": "QQQ", "tickers": ["QQQ"]}),
+            "analyst.test",
+            1,
+            "artifact",
+            None,
+            None,
+            Some(&prompt_path),
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("missing_variable"));
     }
 
     #[test]
@@ -981,7 +1047,8 @@ required_variables = ["ticker", "tickers"]
         assert!(contract.contains("运行时 schema"));
         assert!(!contract.contains("{analyst_artifact_schema}"));
         assert!(!contract.contains("顶层结构"));
-        assert!(contract.contains("每个 `per_ticker.<TICKER>` 必须使用以下字段与类型"));
+        assert!(contract.contains("运行时写入 `id`、`role` 和 artifact envelope"));
+        assert!(!contract.contains("```json"));
     }
 
     #[test]
@@ -1354,7 +1421,7 @@ required_variables = ["ticker", "tickers"]
         assert!(
             prompt.contains("`priced_in` 只能为文本 `already_priced`、`under_priced` 或 `unclear`")
         );
-        assert!(prompt.contains("\"claim\": \"可核验事实或明确观点\""));
+        assert!(prompt.contains("`key_evidence` 中的 `claim`、`source` 与 `timestamp` 均为必填"));
     }
 
     #[test]
@@ -1431,7 +1498,7 @@ required_variables = ["ticker", "tickers"]
         let seed = std::fs::read_to_string(prompts.join("phase2/researcher/seed.md")).unwrap();
         let debate = std::fs::read_to_string(prompts.join("phase2/researcher/debate.md")).unwrap();
 
-        assert!(warmup.contains("read_phase_summaries"));
+        assert!(warmup.contains("运行时已预载前序 Phase 摘要索引"));
         assert!(warmup.contains("不得调用 `read_phase_summary_details`"));
         assert!(seed.contains("raw Jin10"));
         assert!(seed.contains("known_{opponent}_constraint"));

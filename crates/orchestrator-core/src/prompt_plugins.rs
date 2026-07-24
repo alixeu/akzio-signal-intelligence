@@ -11,6 +11,7 @@ pub const KNOWN_RENDER_VARIABLES: &[&str] = &[
     "tickers",
     "common_ticker_prompt",
     "analyst_output_contract",
+    "retrieval_policy",
     "anti_injection",
     "research_calibration",
     "research_drivers",
