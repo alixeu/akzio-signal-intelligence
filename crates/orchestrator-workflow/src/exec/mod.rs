@@ -407,10 +407,10 @@ async fn summarize(
         completed.push(artifact);
     }
     state["phase_summary_live"][phase.to_string()] = Value::Array(completed);
-    state.as_object_mut().map(|object| {
+    if let Some(object) = state.as_object_mut() {
         object.remove("_summary_unit");
         object.remove("_summary_source_payload");
-    });
+    }
     Ok(())
 }
 
