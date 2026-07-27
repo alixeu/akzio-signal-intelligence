@@ -99,6 +99,8 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
     }
     if args.from_phase <= 2 && args.to_phase >= 2 {
         run_phase2(
+            &store,
+            &location,
             &mut state,
             &runtime,
             args.model.as_deref(),
@@ -313,6 +315,8 @@ async fn run_phase1(
 }
 
 async fn run_phase2(
+    store: &FileStore,
+    location: &RunLocation,
     state: &mut Value,
     runtime: &RuntimeConfig,
     model: Option<&str>,
@@ -331,6 +335,7 @@ async fn run_phase2(
         reasoning,
     )
     .await?;
+    record_phase2_session(state, "mediator.topic", "warmup", None, None, Some(0));
     state["phase2_warmup"] = warmup;
     let generated = run_unit(
         state,
@@ -345,13 +350,126 @@ async fn run_phase2(
         reasoning,
     )
     .await?;
+    record_phase2_session(
+        state,
+        "mediator.topic",
+        "topic_generation",
+        None,
+        None,
+        None,
+    );
     let topics = generated
-        .get("topics")
+        .pointer("/payload/topics")
+        .or_else(|| generated.get("topics"))
         .cloned()
         .unwrap_or_else(|| json!([]));
+    let topic_generation_session =
+        runtime_session_for(state, "mediator.topic", "topic_generation", None, None);
+    state["topic_generation_session_id"] = topic_generation_session["session_id"].clone();
+    state["topic_generation_turn_id"] = topic_generation_session["turn_id"].clone();
+    let actionable = topics.as_array().is_some_and(|items| !items.is_empty());
     state["topic_generation_artifact"] =
-        json!({"artifact": generated, "topics": topics, "actionable": true});
-    state["debate_state_artifact"] = json!({"status": "completed", "topic_briefs": state["topic_generation_artifact"]["topics"], "authority": "file_store"});
+        json!({"artifact": generated, "topics": topics, "actionable": actionable});
+
+    let mut controllers = serde_json::Map::new();
+    for topic in topics.as_array().into_iter().flatten() {
+        let topic_id = topic
+            .get("topic_id")
+            .and_then(Value::as_str)
+            .context("Phase 2 topic generation returned a topic without topic_id")?
+            .to_owned();
+        state["topic_debate_states"][&topic_id] = json!({"topic": topic, "turns": []});
+        for (role, kind, side) in [
+            ("researcher.bull.initial", "bull_seed", "bull"),
+            ("researcher.bear.initial", "bear_seed", "bear"),
+        ] {
+            let seed = run_unit(
+                state,
+                runtime,
+                role,
+                2,
+                kind,
+                Some(0),
+                Some(&topic_id),
+                None,
+                model,
+                reasoning,
+            )
+            .await?;
+            record_phase2_session(state, role, kind, Some(&topic_id), Some(side), Some(0));
+            state["topic_debate_states"][&topic_id]["turns"]
+                .as_array_mut()
+                .expect("topic turns initialized")
+                .push(json!({"role":role, "artifact": seed}));
+        }
+        for (role, side) in [
+            ("researcher.bull.interaction", "bull"),
+            ("researcher.bear.interaction", "bear"),
+        ] {
+            let response = run_unit(
+                state,
+                runtime,
+                role,
+                2,
+                "interaction",
+                Some(1),
+                Some(&topic_id),
+                None,
+                model,
+                reasoning,
+            )
+            .await?;
+            record_phase2_session(
+                state,
+                role,
+                "interaction",
+                Some(&topic_id),
+                Some(side),
+                Some(1),
+            );
+            state["topic_debate_states"][&topic_id]["turns"]
+                .as_array_mut()
+                .expect("topic turns initialized")
+                .push(json!({"role":role, "artifact": response}));
+        }
+        let controller = run_unit(
+            state,
+            runtime,
+            "mediator.topic_controller",
+            2,
+            "topic_control",
+            Some(1),
+            Some(&topic_id),
+            None,
+            model,
+            reasoning,
+        )
+        .await?;
+        state["topic_debate_states"][&topic_id]["controller_artifact"] = controller.clone();
+        controllers.insert(topic_id, controller);
+    }
+    let reducer = json!({
+        "schema_version": 1,
+        "artifact_id": format!("phase2-final-reducer-{}", &content_hash(&Value::Object(controllers.clone()))?[7..31]),
+        "run_id": state["run_id"],
+        "phase": 2,
+        "role": "rust.phase2_final_reducer",
+        "controllers": controllers,
+        "created_at": Utc::now().to_rfc3339(),
+        "content_hash": "",
+    });
+    let mut reducer = reducer;
+    reducer["content_hash"] = json!(content_hash(&reducer)?);
+    store.write_json_value(
+        &location.child_relative(Path::new("artifacts/phase2/final-reducer.json"))?,
+        &reducer,
+    )?;
+    state["debate_state_artifact"] = json!({
+        "status": "completed",
+        "topic_briefs": state["topic_generation_artifact"]["topics"],
+        "final_reducer": reducer,
+        "authority": "file_store"
+    });
     Ok(())
 }
 
@@ -554,12 +672,94 @@ async fn run_unit(
         .next()
         .context("ToolManaged role produced no result")?;
     record_role_job_metrics(state, &result);
-    result.artifact.with_context(|| {
+    let artifact = result.artifact.with_context(|| {
         format!(
             "ToolManaged role {role} ended without terminal finalize: {}",
             result.error.unwrap_or_else(|| "unknown error".to_owned())
         )
-    })
+    })?;
+    let session_id = if result.session_id.is_empty() {
+        format!(
+            "{}:p{}:{}:{}:{}:{}",
+            state["run_id"].as_str().unwrap_or_default(),
+            phase,
+            role,
+            phase2_profile_name(role, kind),
+            topic_id.unwrap_or("aggregate"),
+            round.unwrap_or(0)
+        )
+    } else {
+        result.session_id
+    };
+    let turn_id = if result.turn_id.is_empty() {
+        "mock-finalize".to_owned()
+    } else {
+        result.turn_id
+    };
+    state["_runtime_sessions"][runtime_session_key(role, kind, topic_id, round)] =
+        json!({"session_id": session_id, "turn_id": turn_id});
+    Ok(artifact)
+}
+
+fn runtime_session_key(
+    role: &str,
+    kind: &str,
+    topic_id: Option<&str>,
+    round: Option<i64>,
+) -> String {
+    format!(
+        "{role}:{kind}:{}:{}",
+        topic_id.unwrap_or("aggregate"),
+        round.unwrap_or(0)
+    )
+}
+
+fn runtime_session_for(
+    state: &Value,
+    role: &str,
+    kind: &str,
+    topic_id: Option<&str>,
+    round: Option<i64>,
+) -> Value {
+    state["_runtime_sessions"]
+        .get(runtime_session_key(role, kind, topic_id, round))
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+fn phase2_profile_name(role: &str, kind: &str) -> &'static str {
+    match (role, kind) {
+        ("mediator.topic", "warmup") => "researcher_warmup",
+        ("mediator.topic", "topic_generation") => "topic_generation",
+        ("researcher.bull.initial" | "researcher.bear.initial", _) => "debate_seed",
+        ("researcher.bull.interaction" | "researcher.bear.interaction", _) => "debate_response",
+        ("mediator.topic_controller", _) => "topic_control",
+        ("manager.research", _) => "research_decision",
+        ("trader", _) => "trade_intent",
+        ("risk.aggressive" | "risk.neutral" | "risk.conservative", _) => "risk_review",
+        ("portfolio.manager", _) => "portfolio_decision",
+        _ => "analyst_report",
+    }
+}
+
+fn record_phase2_session(
+    state: &mut Value,
+    role: &str,
+    kind: &str,
+    topic_id: Option<&str>,
+    side: Option<&str>,
+    round: Option<i64>,
+) {
+    let session = runtime_session_for(state, role, kind, topic_id, round);
+    if kind == "warmup" {
+        state["phase2_warmup"]["session_id"] = session["session_id"].clone();
+        state["phase2_warmup"]["turn_id"] = session["turn_id"].clone();
+        return;
+    }
+    let (Some(topic_id), Some(side)) = (topic_id, side) else {
+        return;
+    };
+    state["phase2_file_store_sessions"][topic_id][side] = session;
 }
 
 fn phase1_index(state: &Value) -> serde_json::Map<String, Value> {

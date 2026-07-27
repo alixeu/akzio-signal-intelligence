@@ -24,6 +24,17 @@ async fn mock_exec_writes_file_store_manifest_and_indexes() {
     assert_eq!(state["phase_status"]["3"], "done");
     assert!(state["analyst_reports"]["analyst.technical"].is_object());
     assert!(state["analyst_reports"]["analyst.news_macro"].is_object());
+    assert_eq!(
+        state["debate_state_artifact"]["final_reducer"]["controllers"]
+            .as_object()
+            .map(|items| items.len()),
+        Some(1)
+    );
+    assert!(has_file_named(&store_root.join("runs"), "bull-seed.json"));
+    assert!(has_file_named(
+        &store_root.join("runs"),
+        "bear-response-round-1.json"
+    ));
 }
 
 #[tokio::test]

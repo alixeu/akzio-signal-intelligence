@@ -1391,10 +1391,11 @@ required_variables = ["ticker", "tickers"]
         )
         .unwrap();
 
-        assert!(contract.contains("运行时 schema"));
+        assert!(contract.contains("Rust finalizer"));
         assert!(!contract.contains("{analyst_artifact_schema}"));
         assert!(!contract.contains("顶层结构"));
-        assert!(contract.contains("运行时写入 `id`、`role` 和 artifact envelope"));
+        assert!(contract.contains("finalize_analyst_report"));
+        assert!(!contract.contains("输出必须是单个 JSON 对象"));
         assert!(!contract.contains("```json"));
     }
 
