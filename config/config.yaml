@@ -1,9 +1,5 @@
 orchestrator:
   analysis_universe: [QQQ, SOXX, VIX]
-  db_path: outputs/orchestrator.sqlite
-
-  # FileStore configuration is parsed from PR 1 onward. Legacy profiles still
-  # use SQLite until their authority-registry entry is migrated.
   store:
     root: outputs/store
     schema_version: 1

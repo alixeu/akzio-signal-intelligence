@@ -10,13 +10,10 @@ anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
 regex.workspace = true
-rusqlite.workspace = true
 orchestrator-core = { path = "../orchestrator-core" }
 orchestrator-llm = { path = "../orchestrator-llm" }
-orchestrator-sql = { path = "../orchestrator-sql" }
 orchestrator-ingest = { path = "../orchestrator-ingest" }
 orchestrator-workflow = { path = "../orchestrator-workflow" }
-reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
@@ -25,6 +22,8 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 html-escape.workspace = true
+# Transitional integration assertions still inspect the legacy workflow until
+# the remaining FileStore-only execution tests replace them.
 rusqlite.workspace = true
 serde_yaml.workspace = true
 tempfile.workspace = true
@@ -32,10 +31,6 @@ tempfile.workspace = true
 [[bin]]
 name = "orchestrator-exec"
 path = "src/bin/orchestrator_exec.rs"
-
-[[bin]]
-name = "orchestrator-sql"
-path = "src/bin/orchestrator_sql.rs"
 
 [[bin]]
 name = "report-email"
@@ -46,17 +41,9 @@ name = "orchestrator-ingest"
 path = "src/bin/orchestrator_ingest.rs"
 
 [[bin]]
-name = "orchestrator-ops"
-path = "src/bin/orchestrator_ops.rs"
-
-[[bin]]
 name = "orchestrator-eval"
 path = "src/bin/orchestrator_eval.rs"
 
 [[bin]]
 name = "orchestrator-prompt-lint"
 path = "src/bin/orchestrator_prompt_lint.rs"
-
-[[bin]]
-name = "orchestrator-metrics"
-path = "src/bin/orchestrator_metrics.rs"
