@@ -9,7 +9,7 @@ use crate::truncation::TruncationConfig;
 use super::*;
 
 pub(super) struct ModelStreamHandler<'a, S: AgentEventSink> {
-    conn: &'a rusqlite::Connection,
+    session: &'a FileStoreSessionRuntime,
     turn: &'a mut Turn,
     sink: &'a mut S,
     result: ModelStreamResult,
@@ -20,13 +20,13 @@ pub(super) struct ModelStreamHandler<'a, S: AgentEventSink> {
 
 impl<'a, S: AgentEventSink> ModelStreamHandler<'a, S> {
     pub(super) fn new(
-        conn: &'a rusqlite::Connection,
+        session: &'a FileStoreSessionRuntime,
         turn: &'a mut Turn,
         sink: &'a mut S,
         truncation: TruncationConfig,
     ) -> Self {
         Self {
-            conn,
+            session,
             turn,
             sink,
             result: ModelStreamResult::default(),
@@ -58,7 +58,6 @@ impl<'a, S: AgentEventSink> ModelStreamHandler<'a, S> {
                 let buffer = self.assistant_buffers.entry(item_id.clone()).or_default();
                 buffer.push_str(&delta);
                 let _ = update_turn_item(
-                    self.conn,
                     self.turn,
                     &item_id,
                     buffer.clone(),
@@ -93,7 +92,6 @@ impl<'a, S: AgentEventSink> ModelStreamHandler<'a, S> {
                         decision,
                     });
                 if let Some(item) = update_turn_item(
-                    self.conn,
                     self.turn,
                     &item_id,
                     text,
@@ -119,7 +117,6 @@ impl<'a, S: AgentEventSink> ModelStreamHandler<'a, S> {
                 let buffer = self.reasoning_buffers.entry(item_id.clone()).or_default();
                 buffer.push_str(&delta);
                 let _ = update_turn_item(
-                    self.conn,
                     self.turn,
                     &item_id,
                     buffer.clone(),
@@ -138,7 +135,6 @@ impl<'a, S: AgentEventSink> ModelStreamHandler<'a, S> {
                     "model stream reasoning summary completed"
                 );
                 if let Some(item) = update_turn_item(
-                    self.conn,
                     self.turn,
                     &item_id,
                     text,
@@ -230,7 +226,7 @@ impl<'a, S: AgentEventSink> ModelStreamHandler<'a, S> {
             || !self.turn.pending_tool_calls.is_empty()
             || !self.turn.pending_input.is_empty();
         self.turn.needs_follow_up = self.result.needs_follow_up;
-        persist_turn(self.conn, self.turn, &self.truncation)?;
+        persist_turn(self.session, self.turn, &self.truncation)?;
         Ok(self.result)
     }
 }

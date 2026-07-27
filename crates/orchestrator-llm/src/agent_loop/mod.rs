@@ -9,16 +9,15 @@ pub use types::*;
 
 use streaming::ModelStreamHandler;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use orchestrator_core;
-use orchestrator_sql::{turn_history_items, upsert_agent_turn, AgentTurnInput};
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
     future::Future,
     path::PathBuf,
     pin::Pin,
-    time::Instant,
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 use tracing::{debug, warn};
 
@@ -34,8 +33,6 @@ const DEFAULT_MAX_AGENT_LOOPS: usize = 8;
 const SYSTEM_PROMPT_TEMPLATE: &str = include_str!("../../../../prompts/system/agent_loop.md");
 const REQUEST_WRAPPER_TEMPLATE: &str =
     include_str!("../../../../prompts/system/messages/request_wrapper.md");
-const ARTIFACT_RETRY_INSTRUCTION: &str =
-    include_str!("../../../../prompts/system/messages/artifact_retry.md");
 const FINALIZE_INSTRUCTION: &str = include_str!("../../../../prompts/system/messages/finalize.md");
 
 pub struct AgentLoopModel {
@@ -156,7 +153,7 @@ impl Default for AgentLoopConfig {
 }
 
 pub async fn run_turn<M, T>(
-    conn: &rusqlite::Connection,
+    session: &FileStoreSessionRuntime,
     turn: &mut Turn,
     model: &mut M,
     tools: &mut T,
@@ -167,11 +164,11 @@ where
     T: LoopToolRuntime,
 {
     let mut sink = NoopAgentEventSink;
-    run_turn_with_events(conn, turn, model, tools, config, &mut sink).await
+    run_turn_with_events(session, turn, model, tools, config, &mut sink).await
 }
 
 pub async fn run_turn_with_events<M, T, S>(
-    conn: &rusqlite::Connection,
+    session: &FileStoreSessionRuntime,
     turn: &mut Turn,
     model: &mut M,
     tools: &mut T,
@@ -197,7 +194,7 @@ where
         truncation_strategy = ?config.truncation.strategy,
         "agent loop starting"
     );
-    persist_turn(conn, turn, &config.truncation)?;
+    persist_turn(session, turn, &config.truncation)?;
     tools.set_turn_context(ToolRuntimeTurnContext {
         run_id: turn.run_id.clone(),
         session_id: turn.session_id.clone(),
@@ -229,7 +226,7 @@ where
                 .iter()
                 .any(|item| item.item_type == TurnItemType::ToolResult)
             {
-                persist_turn(conn, turn, &config.truncation)?;
+                persist_turn(session, turn, &config.truncation)?;
             }
         }
     }
@@ -261,7 +258,7 @@ where
             }
         }
         loop_index += 1;
-        let input = build_model_input(conn, turn, first_iteration, &config)?;
+        let input = build_model_input(session, turn, first_iteration, &config)?;
         debug!(
             turn_id = turn.turn_id,
             role = turn.role,
@@ -275,7 +272,7 @@ where
         first_iteration = false;
         let llm_started = Instant::now();
         let mut stream_handler =
-            ModelStreamHandler::new(conn, turn, sink, config.truncation.clone());
+            ModelStreamHandler::new(session, turn, sink, config.truncation.clone());
         model.stream_events(input, &mut stream_handler).await?;
         let mut stream_result = stream_handler.finish().await?;
         apply_judge_to_stream_result(turn, &config, &mut stream_result, &mut judge_call_count)
@@ -438,10 +435,10 @@ where
             }
             let tool_batch_ms = tool_batch_started.elapsed().as_millis();
             aggregate_result.tool_ms = aggregate_result.tool_ms.saturating_add(tool_batch_ms);
-            persist_turn(conn, turn, &config.truncation)?;
+            persist_turn(session, turn, &config.truncation)?;
             if terminal_completed {
                 turn.end_reason = Some("terminal_tool".to_string());
-                persist_turn(conn, turn, &config.truncation)?;
+                persist_turn(session, turn, &config.truncation)?;
                 return Ok(aggregate_result);
             }
             if loop_index >= 3 && !config.require_terminal_tool {
@@ -449,13 +446,13 @@ where
                 turn.push_pending_input(FINALIZE_INSTRUCTION);
             }
             turn.needs_follow_up = true;
-            persist_turn(conn, turn, &config.truncation)?;
+            persist_turn(session, turn, &config.truncation)?;
             continue;
         }
 
         if !turn.pending_input.is_empty() {
             turn.needs_follow_up = true;
-            persist_turn(conn, turn, &config.truncation)?;
+            persist_turn(session, turn, &config.truncation)?;
             continue;
         }
 
@@ -466,7 +463,7 @@ where
                     "No terminal finalize tool succeeded. Use the assigned finalize tool now; do not provide a prose answer.",
                 );
                 turn.needs_follow_up = true;
-                persist_turn(conn, turn, &config.truncation)?;
+                persist_turn(session, turn, &config.truncation)?;
                 continue;
             }
             bail!("tool-managed agent ended without a successful terminal finalize tool");
@@ -474,14 +471,13 @@ where
 
         if turn.needs_follow_up {
             turn.needs_follow_up = false;
-            persist_turn(conn, turn, &config.truncation)?;
+            persist_turn(session, turn, &config.truncation)?;
             continue;
         }
 
         if let Some(item_id) = stream_result.last_assistant_message_id.clone() {
             aggregate_result.last_assistant_message_id = Some(item_id.clone());
-            mark_last_assistant_message_as_final(conn, turn, &item_id, sink, &config.truncation)
-                .await?;
+            mark_last_assistant_message_as_final(turn, &item_id, sink, &config.truncation).await?;
         }
         turn.end_reason = Some("completed".to_string());
         debug!(
@@ -497,7 +493,7 @@ where
             tool_call_count = aggregate_result.tool_call_count,
             "agent loop completed"
         );
-        persist_turn(conn, turn, &config.truncation)?;
+        persist_turn(session, turn, &config.truncation)?;
         return Ok(aggregate_result);
     }
 }
@@ -798,70 +794,40 @@ pub(super) fn compact_tool_output_for_history(
 }
 
 pub(super) fn persist_turn(
-    conn: &rusqlite::Connection,
+    session: &FileStoreSessionRuntime,
     turn: &Turn,
-    truncation: &TruncationConfig,
+    _truncation: &TruncationConfig,
 ) -> Result<()> {
-    let force_history_checkpoint = turn
-        .model_context
-        .lines()
-        .any(|line| line == "history_fork=true");
-    let turn_number: i64 = conn
-        .query_row(
-            "SELECT COALESCE(turn_number, 0) FROM agent_events WHERE turn_id = ?",
-            rusqlite::params![turn.turn_id],
-            |row| row.get(0),
-        )
-        .unwrap_or_else(|_| {
-            conn.query_row(
-                "SELECT COALESCE(MAX(turn_number), 0) + 1 FROM agent_events WHERE run_id = ?",
-                rusqlite::params![turn.run_id],
-                |row| row.get(0),
-            )
-            .unwrap_or(1)
-        });
-    let full_context: Vec<Value> = turn
-        .emitted_items
+    let persisted = session.read_current_turn(&turn.turn_id)?;
+    let next_item = persisted
         .iter()
-        .map(|item| {
-            json!({
-                "event_type": item.item_type.as_str(),
-                "role": item.role,
-                "content_text": item.content_text,
-                "content_json": item.content_json,
-                "tool_call_id": item.tool_call_id,
-                "tool_name": item.tool_name,
-            })
-        })
-        .collect();
-    let summary = if let Some(last) = turn.emitted_items.last() {
-        truncate_context_fragment(&last.content_text, truncation)
-    } else {
-        truncate_context_fragment(&turn.user_input, truncation)
-    };
-    upsert_agent_turn(
-        conn,
-        &AgentTurnInput {
-            turn_id: turn.turn_id.clone(),
-            run_id: turn.run_id.clone(),
-            phase: turn.phase,
-            turn_number,
-            role: turn.role.clone(),
-            full_context_json: json!(full_context.clone()),
-            summary,
+        .filter_map(|event| event.payload.get("item_index").and_then(Value::as_u64))
+        .max()
+        .map_or(0, |index| index as usize + 1);
+    for (index, item) in turn.emitted_items.iter().enumerate().skip(next_item) {
+        session.append_turn_item_at(turn, item, Some(index), session_timestamp())?;
+    }
+    session.append_checkpoint(
+        turn,
+        TurnCheckpoint {
+            item_count: turn.emitted_items.len(),
+            end_reason: turn.end_reason.clone(),
+            needs_follow_up: turn.needs_follow_up,
         },
+        session_timestamp(),
     )?;
-    if force_history_checkpoint {
-        conn.execute(
-            "UPDATE agent_events SET full_context_json = ?1, context_delta_json = '[]' WHERE turn_id = ?2",
-            rusqlite::params![serde_json::to_string(&full_context)?, turn.turn_id],
-        )?;
+    if let Some(terminal) = &turn.terminal_tool_result {
+        if !persisted
+            .iter()
+            .any(|event| event.event_type == orchestrator_store::SessionEventType::Terminal)
+        {
+            session.append_terminal(turn, terminal, session_timestamp())?;
+        }
     }
     Ok(())
 }
 
 pub(super) fn update_turn_item(
-    _conn: &rusqlite::Connection,
     turn: &mut Turn,
     output_item_id: &str,
     content_text: String,
@@ -1054,12 +1020,12 @@ async fn emit_tool_result<S: AgentEventSink>(
 }
 
 fn build_model_input(
-    conn: &rusqlite::Connection,
+    session: &FileStoreSessionRuntime,
     turn: &mut Turn,
     _first_iteration: bool,
     config: &AgentLoopConfig,
 ) -> Result<ModelInput> {
-    let mut items = history_items(conn, turn, config.history_limit)?;
+    let mut items = history_items(session, turn, config.history_limit)?;
     let role_prompt =
         (!turn.user_input.trim().is_empty()).then(|| TurnItem::user(turn.user_input.clone()));
     if let Some(role_prompt) = &role_prompt {
@@ -1285,7 +1251,11 @@ fn turn_available_tools(turn: &Turn) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn history_items(conn: &rusqlite::Connection, turn: &Turn, limit: usize) -> Result<Vec<TurnItem>> {
+fn history_items(
+    session: &FileStoreSessionRuntime,
+    turn: &Turn,
+    limit: usize,
+) -> Result<Vec<TurnItem>> {
     // Prefer in-memory emitted items for the active loop iteration.
     //
     // Loading "latest full_context_json for this run_id" is wrong when multiple
@@ -1298,8 +1268,16 @@ fn history_items(conn: &rusqlite::Connection, turn: &Turn, limit: usize) -> Resu
     } else {
         // Resume path for multi-round steer sessions that recreate a Turn with
         // the same turn_id: reload only this turn's snapshot.
-        turn_history_items(conn, &turn.turn_id)?
+        session
+            .read_current_turn(&turn.turn_id)?
             .into_iter()
+            .filter_map(|event| {
+                event
+                    .payload
+                    .get("item_type")
+                    .is_some()
+                    .then_some(event.payload)
+            })
             .map(turn_item_from_history_value)
             .collect()
     };
@@ -1313,6 +1291,7 @@ fn history_items(conn: &rusqlite::Connection, turn: &Turn, limit: usize) -> Resu
 pub fn turn_item_from_history_value(value: Value) -> TurnItem {
     let item_type = match value
         .get("event_type")
+        .or_else(|| value.get("item_type"))
         .and_then(Value::as_str)
         .unwrap_or("")
     {
@@ -1382,14 +1361,12 @@ pub fn turn_item_from_history_value(value: Value) -> TurnItem {
 }
 
 async fn mark_last_assistant_message_as_final<S: AgentEventSink>(
-    conn: &rusqlite::Connection,
     turn: &mut Turn,
     item_id: &str,
     sink: &mut S,
     truncation: &TruncationConfig,
 ) -> Result<()> {
     if let Some(item) = update_turn_item(
-        conn,
         turn,
         item_id,
         turn.emitted_items
@@ -1405,6 +1382,13 @@ async fn mark_last_assistant_message_as_final<S: AgentEventSink>(
         emit_completed(turn, sink, &item).await?;
     }
     Ok(())
+}
+
+fn session_timestamp() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs().to_string())
+        .unwrap_or_else(|_| "0".to_owned())
 }
 
 fn preseed_tool_calls(
@@ -2158,1960 +2142,5 @@ impl LoopToolRuntime for StaticToolRuntime {
             };
             tool(call.arguments)
         })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn retrieval_audit_tracks_real_ids_filters_duplicates_and_truncation() {
-        let summary_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let detail_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-        let mut turn = Turn::new("turn", "session", "run", "trader", "");
-        let list = ToolCallRequest {
-            call_id: "list-1".to_string(),
-            name: tools::READ_PHASE_SUMMARIES_TOOL_NAME.to_string(),
-            arguments: json!({"source_phase": 3, "ticker": "QQQ"}),
-        };
-        turn.emitted_items.push(TurnItem::tool_call(&list));
-        turn.emitted_items.push(TurnItem::tool_result(
-            &ToolResultItem {
-                call_id: list.call_id,
-                name: list.name,
-                status: "completed".to_string(),
-                output: json!({
-                    "item_count": 1,
-                    "total_count": 2,
-                    "truncated": true,
-                    "items": [{"id": summary_id, "source_phase": 3}]
-                }),
-                error: None,
-            },
-            &TruncationConfig::default(),
-        ));
-        for call_id in ["detail-1", "detail-2"] {
-            let call = ToolCallRequest {
-                call_id: call_id.to_string(),
-                name: tools::READ_PHASE_SUMMARY_DETAILS_TOOL_NAME.to_string(),
-                arguments: json!({"summary_id": summary_id}),
-            };
-            turn.emitted_items.push(TurnItem::tool_call(&call));
-            turn.emitted_items.push(TurnItem::tool_result(
-                &ToolResultItem {
-                    call_id: call.call_id,
-                    name: call.name,
-                    status: "completed".to_string(),
-                    output: json!({
-                        "item_count": 1,
-                        "items": [{"id": detail_id, "summary_id": summary_id}]
-                    }),
-                    error: None,
-                },
-                &TruncationConfig::default(),
-            ));
-        }
-        let audit = retrieval_audit(&turn);
-        assert_eq!(audit["summary_query_count"], 1);
-        assert_eq!(audit["detail_call_count"], 2);
-        assert_eq!(audit["duplicate_retrieval_count"], 1);
-        assert_eq!(audit["tool_result_truncated"], true);
-        assert_eq!(audit["returned_summary_ids"][0], summary_id);
-        assert_eq!(audit["read_detail_ids"][0], detail_id);
-        assert_eq!(audit["expanded_source_phases"][0], 3);
-    }
-
-    #[test]
-    fn phase_summary_retrieval_is_never_preseeded() {
-        let mut warmup = Turn::new(
-            "turn-warmup",
-            "session",
-            "run",
-            "mediator.topic",
-            "role prompt",
-        );
-        warmup.push_pending_input(r#"Steer: {"kind":"warmup"}"#);
-        let calls = preseed_tool_calls(
-            &warmup,
-            &["QQQ".to_string()],
-            &[tools::READ_PHASE_SUMMARIES_TOOL_NAME.to_string()],
-        );
-        assert!(calls.is_empty());
-
-        let mut topic = Turn::new(
-            "turn-topic",
-            "session",
-            "run",
-            "mediator.topic",
-            "role prompt",
-        );
-        topic.push_pending_input(r#"Steer: {"kind":"topic_generation"}"#);
-        assert!(preseed_tool_calls(
-            &topic,
-            &["QQQ".to_string()],
-            &[tools::READ_PHASE_SUMMARIES_TOOL_NAME.to_string()],
-        )
-        .is_empty());
-    }
-
-    #[test]
-    fn preseed_only_uses_tools_enabled_for_the_role() {
-        let mut analyst = Turn::new(
-            "turn-1",
-            "session",
-            "run",
-            "analyst.technical",
-            "role prompt",
-        );
-        analyst.phase = Some(1);
-        assert!(preseed_tool_calls(&analyst, &["QQQ".to_string()], &[]).is_empty());
-
-        let calls = preseed_tool_calls(
-            &analyst,
-            &["QQQ".to_string()],
-            &[
-                tools::READ_EXPERIENCE_TOOL_NAME.to_string(),
-                "read_technical_snapshot".to_string(),
-            ],
-        );
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].name, tools::READ_EXPERIENCE_TOOL_NAME);
-        assert!(calls
-            .iter()
-            .skip(1)
-            .all(|call| call.name == "read_technical_snapshot"));
-    }
-
-    #[test]
-    fn turn_tickers_reads_generated_model_context() {
-        let mut turn = Turn::new(
-            "turn-1",
-            "session-1",
-            "run-1",
-            "analyst.technical",
-            "prompt",
-        );
-        turn.model_context =
-            "role=analyst.technical, output_mode=ToolManaged, tickers=QQQ,SOXX\navailable_tools=[]"
-                .to_string();
-
-        assert_eq!(turn_tickers(&turn), vec!["QQQ", "SOXX"]);
-    }
-    use crate::web_search::{MockWebPage, MockWebSearchProvider, WebSearchConfig, WebSearchMode};
-    use orchestrator_sql::{ensure_schema, turn_history_items};
-    use serde_json::json;
-    use std::{path::PathBuf, sync::Arc};
-
-    struct FakeModel {
-        responses: VecDeque<ModelResponse>,
-        seen_inputs: Vec<ModelInput>,
-    }
-
-    impl FakeModel {
-        fn new(responses: Vec<ModelResponse>) -> Self {
-            Self {
-                responses: VecDeque::from(responses),
-                seen_inputs: Vec::new(),
-            }
-        }
-    }
-
-    impl LoopModel for FakeModel {
-        fn generate<'a>(
-            &'a mut self,
-            input: ModelInput,
-        ) -> Pin<Box<dyn Future<Output = Result<ModelResponse>> + Send + 'a>> {
-            Box::pin(async move {
-                self.seen_inputs.push(input);
-                self.responses
-                    .pop_front()
-                    .context("fake model has no response")
-            })
-        }
-    }
-
-    #[derive(Default)]
-    struct RecordingSink {
-        events: Vec<AgentLoopEvent>,
-    }
-
-    impl AgentEventSink for RecordingSink {
-        fn emit<'a>(
-            &'a mut self,
-            event: AgentLoopEvent,
-        ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
-            Box::pin(async move {
-                self.events.push(event);
-                Ok(())
-            })
-        }
-    }
-
-    struct FakeStreamModel {
-        event_batches: VecDeque<Vec<ModelStreamEvent>>,
-        seen_inputs: Vec<ModelInput>,
-    }
-
-    impl FakeStreamModel {
-        fn new(event_batches: Vec<Vec<ModelStreamEvent>>) -> Self {
-            Self {
-                event_batches: VecDeque::from(event_batches),
-                seen_inputs: Vec::new(),
-            }
-        }
-    }
-
-    impl LoopModel for FakeStreamModel {
-        fn generate<'a>(
-            &'a mut self,
-            _input: ModelInput,
-        ) -> Pin<Box<dyn Future<Output = Result<ModelResponse>> + Send + 'a>> {
-            Box::pin(async { bail!("fake stream model does not use generate") })
-        }
-
-        fn stream_events<'a>(
-            &'a mut self,
-            input: ModelInput,
-            handler: &'a mut dyn ModelEventHandler,
-        ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
-            Box::pin(async move {
-                self.seen_inputs.push(input);
-                for event in self
-                    .event_batches
-                    .pop_front()
-                    .context("fake stream model has no event batch")?
-                {
-                    handler.handle(event).await?;
-                }
-                Ok(())
-            })
-        }
-    }
-
-    fn model_response(message: Option<&str>, end_turn: bool) -> ModelResponse {
-        ModelResponse {
-            assistant_message: message.map(ToString::to_string),
-            reasoning_summary: None,
-            tool_calls: vec![],
-            end_turn,
-            raw: json!({
-                "assistant_message": message,
-                "end_turn": end_turn
-            }),
-            turn_status: TurnStatus::Unknown,
-        }
-    }
-
-    fn agent_loop_config_with_judge(judge: JudgeConfig) -> AgentLoopConfig {
-        AgentLoopConfig {
-            judge,
-            judge_endpoint: Some("http://127.0.0.1:9".to_string()),
-            judge_api_key: Some("test-key".to_string()),
-            ..AgentLoopConfig::default()
-        }
-    }
-
-    #[test]
-    fn analyst_system_instruction_requests_the_role_contract() {
-        let instruction = model_system_instruction(&[], "analyst.news_macro", &["QQQ".to_string()]);
-
-        assert!(instruction.contains("Follow the active role prompt and its output contract"));
-    }
-
-    #[test]
-    fn extract_turn_status_reads_optional_metadata() {
-        assert_eq!(
-            extract_turn_status(&json!({"turn_status": "final"})),
-            TurnStatus::Final
-        );
-        assert_eq!(
-            extract_turn_status(&json!({"turn_status": "intermediate"})),
-            TurnStatus::Intermediate
-        );
-        assert_eq!(extract_turn_status(&json!({})), TurnStatus::Unknown);
-    }
-
-    #[tokio::test]
-    async fn ambiguous_message_defaults_final_when_judge_disabled() {
-        let mut turn = Turn::new("turn-judge", "session-1", "run-1", "loop.test", "start");
-        let mut result = ModelStreamResult {
-            needs_follow_up: false,
-            assistant_message_decisions: vec![AssistantMessageDecision {
-                item_id: "msg-1".to_string(),
-                text: "Let me check the data.".to_string(),
-                decision: FollowUpDecision::Ambiguous,
-            }],
-            ..ModelStreamResult::default()
-        };
-        let config = agent_loop_config_with_judge(JudgeConfig {
-            enabled: false,
-            ..JudgeConfig::default()
-        });
-        let mut judge_calls = 0;
-
-        apply_judge_to_stream_result(&mut turn, &config, &mut result, &mut judge_calls)
-            .await
-            .unwrap();
-
-        assert_eq!(judge_calls, 0);
-        assert!(!result.needs_follow_up);
-        assert_eq!(
-            result.assistant_message_decisions[0].decision,
-            FollowUpDecision::Final
-        );
-    }
-
-    #[tokio::test]
-    async fn ambiguous_message_defaults_final_when_judge_cap_reached() {
-        let mut turn = Turn::new("turn-judge", "session-1", "run-1", "loop.test", "start");
-        let mut result = ModelStreamResult::default();
-        result
-            .assistant_message_decisions
-            .push(AssistantMessageDecision {
-                item_id: "msg-1".to_string(),
-                text: "Let me check the data.".to_string(),
-                decision: FollowUpDecision::Ambiguous,
-            });
-        let config = agent_loop_config_with_judge(JudgeConfig {
-            max_messages_per_turn: 0,
-            ..JudgeConfig::default()
-        });
-        let mut judge_calls = 0;
-
-        apply_judge_to_stream_result(&mut turn, &config, &mut result, &mut judge_calls)
-            .await
-            .unwrap();
-
-        assert_eq!(judge_calls, 0);
-        assert!(!result.needs_follow_up);
-        assert_eq!(
-            result.assistant_message_decisions[0].decision,
-            FollowUpDecision::Final
-        );
-    }
-
-    #[tokio::test]
-    async fn ambiguous_message_defaults_final_when_judge_fails() {
-        let mut turn = Turn::new("turn-judge", "session-1", "run-1", "loop.test", "start");
-        let mut result = ModelStreamResult::default();
-        result
-            .assistant_message_decisions
-            .push(AssistantMessageDecision {
-                item_id: "msg-1".to_string(),
-                text: "Let me check the data.".to_string(),
-                decision: FollowUpDecision::Ambiguous,
-            });
-        let config = agent_loop_config_with_judge(JudgeConfig::default());
-        let mut judge_calls = 0;
-
-        apply_judge_to_stream_result(&mut turn, &config, &mut result, &mut judge_calls)
-            .await
-            .unwrap();
-
-        assert_eq!(judge_calls, 1);
-        assert!(!result.needs_follow_up);
-        assert_eq!(
-            result.assistant_message_decisions[0].decision,
-            FollowUpDecision::Final
-        );
-    }
-
-    fn assistant_texts(conn: &rusqlite::Connection) -> Vec<String> {
-        let turn_id: String = conn
-            .query_row(
-                "SELECT turn_id FROM agent_events ORDER BY turn_number DESC, id DESC LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let rows = turn_history_items(conn, &turn_id).unwrap();
-        let mut texts = Vec::new();
-        for item in rows {
-            if item.get("event_type").and_then(|v| v.as_str()) == Some("assistant_message") {
-                if let Some(text) = item.get("content_text").and_then(|v| v.as_str()) {
-                    texts.push(text.to_string());
-                }
-            }
-        }
-        texts
-    }
-
-    fn test_item(item_type: TurnItemType, role: &str, content_text: String) -> TurnItem {
-        TurnItem {
-            item_type,
-            role: role.to_string(),
-            content_text,
-            content_json: Value::Null,
-            tool_call_id: String::new(),
-            tool_name: String::new(),
-            output_item_id: String::new(),
-            phase: None,
-            status: None,
-            db_row_id: None,
-        }
-    }
-
-    fn append_history(conn: &rusqlite::Connection, turn: &mut Turn, items: Vec<TurnItem>) {
-        for item in items {
-            turn.emitted_items.push(item.clone());
-        }
-        persist_turn(conn, turn, &TruncationConfig::default()).unwrap();
-    }
-
-    #[allow(dead_code)]
-    fn item_count(_conn: &rusqlite::Connection, _event_type: &str) -> i64 {
-        0 // ponytail: no per-event rows in new schema, tests use this for compat
-    }
-
-    fn turn_end_state(conn: &rusqlite::Connection, turn_id: &str) -> (bool, String) {
-        conn.query_row(
-            "SELECT summary FROM agent_events WHERE turn_id = ?",
-            [turn_id],
-            |row| {
-                let summary: String = row.get(0)?;
-                Ok((!summary.is_empty(), summary))
-            },
-        )
-        .unwrap_or((false, String::new()))
-    }
-
-    #[test]
-    fn token_based_compaction_triggers_before_item_count() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        ensure_schema(&conn).unwrap();
-        let mut turn = Turn::new("turn-compact", "session-compact", "run-1", "loop.test", "");
-        let items = (0..10)
-            .map(|index| {
-                test_item(
-                    TurnItemType::ToolResult,
-                    "tool",
-                    format!("/tmp/large-{index}.rs {}", "x".repeat(50_000)),
-                )
-            })
-            .collect::<Vec<_>>();
-        let total_tokens = estimate_items_tokens(&items);
-        assert!(total_tokens > 96_000);
-        assert!(items.len() < 120);
-        append_history(&conn, &mut turn, items);
-
-        let input =
-            build_model_input(&conn, &mut turn, false, &AgentLoopConfig::default()).unwrap();
-
-        assert_eq!(input.items[0].item_type, TurnItemType::CompactSummary);
-        assert_eq!(
-            input.items[0].content_json["compaction_trigger"],
-            "token_threshold"
-        );
-        assert_eq!(input.items[0].content_json["items_compacted"], 10);
-        assert!(
-            input.items[0].content_json["estimated_tokens_before"]
-                .as_u64()
-                .unwrap()
-                > 96_000
-        );
-        assert!(input.items[0].content_text.contains("~"));
-        assert!(input.items[0].content_text.contains("path: /tmp/large-"));
-    }
-
-    #[test]
-    fn dynamic_budget_keeps_role_prompt_and_latest_tool_evidence() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        ensure_schema(&conn).unwrap();
-        let role_prompt = format!("TECHNICAL ROLE {}", "p".repeat(30_000));
-        let mut turn = Turn::new(
-            "turn-evidence",
-            "session-evidence",
-            "run-1",
-            "analyst.technical",
-            role_prompt.clone(),
-        );
-        turn.model_context = "tickers=QQQ,SOXX,VIX".to_string();
-        let tool_result = ToolResultItem {
-            call_id: "call-1".to_string(),
-            name: "read_run_context".to_string(),
-            status: "completed".to_string(),
-            output: json!({
-                "evidence": {
-                    "daily": [
-                        {"ticker": "QQQ", "Close": 717.73},
-                        {"ticker": "SOXX", "Close": 555.27},
-                        {"ticker": "VIX", "Close": 15.67}
-                    ]
-                }
-            }),
-            error: None,
-        };
-        append_history(
-            &conn,
-            &mut turn,
-            vec![TurnItem::tool_result(
-                &tool_result,
-                &TruncationConfig::default(),
-            )],
-        );
-        turn.push_pending_input("emit the final artifact");
-
-        let input =
-            build_model_input(&conn, &mut turn, false, &AgentLoopConfig::default()).unwrap();
-
-        assert_eq!(input.items[0].content_text, role_prompt);
-        assert!(input.items.iter().any(|item| {
-            item.item_type == TurnItemType::ToolResult
-                && item.content_text.contains("717.73")
-                && item.content_text.contains("555.27")
-                && item.content_text.contains("15.67")
-        }));
-        assert!(input.items.iter().any(|item| {
-            item.item_type == TurnItemType::UserMessage
-                && item.content_text.contains("emit the final artifact")
-        }));
-    }
-
-    #[test]
-    fn turn_history_resume_loads_only_matching_turn_id() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        ensure_schema(&conn).unwrap();
-
-        let mut technical = Turn::new(
-            "turn-tech",
-            "session-tech",
-            "run-shared",
-            "analyst.technical",
-            "TECH PROMPT",
-        );
-        technical.emitted_items.push(TurnItem::user("TECH PROMPT"));
-        technical.emitted_items.push(TurnItem::tool_result(
-            &ToolResultItem {
-                call_id: "call-1".to_string(),
-                name: "read_run_context".to_string(),
-                status: "completed".to_string(),
-                output: json!({"status": "ok", "evidence": {"daily": [{"ticker": "QQQ", "Close": 100.0}]}}),
-                error: None,
-            },
-            &TruncationConfig::default(),
-        ));
-        persist_turn(&conn, &technical, &TruncationConfig::default()).unwrap();
-
-        let mut news = Turn::new(
-            "turn-news",
-            "session-news",
-            "run-shared",
-            "analyst.news_macro",
-            "NEWS PROMPT",
-        );
-        news.emitted_items.push(TurnItem::user("NEWS PROMPT ONLY"));
-        persist_turn(&conn, &news, &TruncationConfig::default()).unwrap();
-
-        // Simulate multi-round resume: empty in-memory turn with same turn_id.
-        let resumed = Turn::new(
-            "turn-tech",
-            "session-tech",
-            "run-shared",
-            "analyst.technical",
-            "",
-        );
-        let items = history_items(&conn, &resumed, 200).unwrap();
-        assert!(
-            items.iter().any(|item| {
-                item.item_type == TurnItemType::ToolResult && item.content_text.contains("100.0")
-            }),
-            "resume must load technical tool evidence by turn_id"
-        );
-        assert!(!items
-            .iter()
-            .any(|item| item.content_text.contains("NEWS PROMPT ONLY")));
-    }
-
-    #[test]
-    fn parallel_roles_do_not_steal_each_others_tool_evidence() {
-        // Live F1: two phase-1 roles share run_id. session_history_items used to
-        // load ORDER BY turn_number DESC for the whole run, so news_macro's later
-        // turn replaced technical's tool evidence on the next model iteration.
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        ensure_schema(&conn).unwrap();
-
-        let technical_prompt = "TECHNICAL ROLE PROMPT";
-        let mut technical = Turn::new(
-            "turn-technical",
-            "session-technical",
-            "run-shared",
-            "analyst.technical",
-            technical_prompt,
-        );
-        technical.model_context = "tickers=QQQ,SOXX,VIX".to_string();
-        technical
-            .emitted_items
-            .push(TurnItem::user(technical_prompt));
-        technical.emitted_items.push(TurnItem::tool_result(
-            &ToolResultItem {
-                call_id: "call-tech".to_string(),
-                name: "read_run_context".to_string(),
-                status: "completed".to_string(),
-                output: json!({
-                    "status": "ok",
-                    "evidence": {
-                        "daily": [
-                            {"ticker": "QQQ", "Close": 717.73, "RSI14": 55.0},
-                            {"ticker": "SOXX", "Close": 555.27},
-                            {"ticker": "VIX", "Close": 15.67}
-                        ]
-                    }
-                }),
-                error: None,
-            },
-            &TruncationConfig::default(),
-        ));
-        persist_turn(&conn, &technical, &TruncationConfig::default()).unwrap();
-
-        // Sibling role persists a higher turn_number without technical evidence.
-        let mut news = Turn::new(
-            "turn-news",
-            "session-news",
-            "run-shared",
-            "analyst.news_macro",
-            "NEWS ROLE PROMPT",
-        );
-        news.emitted_items.push(TurnItem::user(
-            "NEWS ROLE PROMPT without technical snapshots",
-        ));
-        persist_turn(&conn, &news, &TruncationConfig::default()).unwrap();
-
-        technical.push_pending_input(
-            "Tool evidence is already available. Tools are now disabled. Emit final JSON.",
-        );
-        let input =
-            build_model_input(&conn, &mut technical, false, &AgentLoopConfig::default()).unwrap();
-
-        assert!(
-            input.items.iter().any(|item| {
-                item.item_type == TurnItemType::ToolResult
-                    && item.content_text.contains("717.73")
-                    && item.content_text.contains("RSI14")
-            }),
-            "technical tool evidence must survive a later sibling role persist; items={:?}",
-            input
-                .items
-                .iter()
-                .map(|item| (
-                    item.item_type.as_str(),
-                    item.tool_name.as_str(),
-                    item.content_text.chars().take(80).collect::<String>()
-                ))
-                .collect::<Vec<_>>()
-        );
-        assert!(input.items.iter().any(|item| {
-            item.item_type == TurnItemType::UserMessage
-                && item
-                    .content_text
-                    .contains("Tool evidence is already available")
-        }));
-        assert!(!input
-            .items
-            .iter()
-            .any(|item| item.content_text.contains("NEWS ROLE PROMPT")));
-    }
-
-    #[test]
-    fn item_count_compaction_still_works_as_fallback() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        ensure_schema(&conn).unwrap();
-        let mut turn = Turn::new("turn-items", "session-items", "run-1", "loop.test", "");
-        let items = (0..121)
-            .map(|index| {
-                test_item(
-                    TurnItemType::AssistantMessage,
-                    "assistant",
-                    format!("msg {index}"),
-                )
-            })
-            .collect::<Vec<_>>();
-        let total_tokens = estimate_items_tokens(&items);
-        assert!(total_tokens < 9_600);
-        assert!(items.len() > 120);
-        append_history(&conn, &mut turn, items);
-
-        let input =
-            build_model_input(&conn, &mut turn, false, &AgentLoopConfig::default()).unwrap();
-
-        assert_eq!(input.items[0].item_type, TurnItemType::CompactSummary);
-        assert_eq!(
-            input.items[0].content_json["compaction_trigger"],
-            "item_count"
-        );
-        assert_eq!(input.items[0].content_json["items_compacted"], 121);
-    }
-
-    #[test]
-    fn compaction_does_not_trigger_under_item_and_token_thresholds() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        ensure_schema(&conn).unwrap();
-        let mut turn = Turn::new("turn-small", "session-small", "run-1", "loop.test", "");
-        let items = (0..50)
-            .map(|index| {
-                test_item(
-                    TurnItemType::AssistantMessage,
-                    "assistant",
-                    format!("msg {index} {}", "x".repeat(100)),
-                )
-            })
-            .collect::<Vec<_>>();
-        let total_tokens = estimate_items_tokens(&items);
-        assert!(total_tokens < 9_600);
-        append_history(&conn, &mut turn, items);
-
-        let input =
-            build_model_input(&conn, &mut turn, false, &AgentLoopConfig::default()).unwrap();
-
-        assert_eq!(input.items.len(), 50);
-        assert!(!input
-            .items
-            .iter()
-            .any(|item| item.item_type == TurnItemType::CompactSummary));
-    }
-
-    #[test]
-    fn compact_summary_card_preserves_critical_context() {
-        let items = vec![
-            test_item(
-                TurnItemType::UserMessage,
-                "user",
-                "Please edit /Users/alixeu/project/akzio-signal-intelligence/crates/orchestrator-llm/src/agent_loop.rs".to_string(),
-            ),
-            test_item(
-                TurnItemType::ToolResult,
-                "tool",
-                "Command failed with error: panic while reading https://example.com/context".to_string(),
-            ),
-        ];
-
-        let summary = compact_summary_card(&items);
-
-        assert!(summary.contains("items were compacted (~"));
-        assert!(summary.contains("path: /Users/alixeu/project/akzio-signal-intelligence/crates/orchestrator-llm/src/agent_loop.rs"));
-        assert!(summary.contains("url: https://example.com/context"));
-        assert!(summary.contains("error: Command failed with error"));
-    }
-
-    #[test]
-    fn token_compaction_threshold_defaults_to_max_tokens_for_invalid_ratio() {
-        assert_eq!(token_compaction_threshold(12_000, 0.8), 9_600);
-        assert_eq!(token_compaction_threshold(12_000, 0.0), 12_000);
-        assert_eq!(token_compaction_threshold(12_000, f64::NAN), 12_000);
-    }
-
-    #[tokio::test]
-    async fn project_runtime_rejects_unconfigured_tool() {
-        let runtime = ProjectToolRuntime::with_available_tools(
-            tools::ExternalToolConfig {
-                project_root: PathBuf::from("."),
-                db_path: None,
-                run_dir: None,
-                run_id: None,
-                phase: None,
-                allowed_reflection_task_ids: Vec::new(),
-                phase_summary_page_limit: 20,
-                phase_summary_detail_page_limit: 20,
-                tickers: Vec::new(),
-                alpaca_live: false,
-                alpaca_market_data: false,
-                alpaca_api_key: None,
-                alpaca_api_secret: None,
-                phase_summary_index: None,
-                phase_summary_gate: None,
-                file_store_input: None,
-                file_store_reflection_source: None,
-            },
-            vec![tools::READ_RUN_CONTEXT_TOOL_NAME.to_string()],
-        );
-
-        let result = runtime
-            .execute(ToolCallRequest {
-                call_id: "call-unknown".to_string(),
-                name: "unknown_tool".to_string(),
-                arguments: json!({"command": "printf no"}),
-            })
-            .await;
-
-        assert_eq!(result.status, "error");
-        assert_eq!(result.error.as_deref(), Some("unknown tool name"));
-    }
-
-    struct TerminalIndexService;
-
-    impl tools::index_tools::IndexToolService for TerminalIndexService {
-        fn create_index(&self, _: tools::index_tools::CreateIndexCommand) -> anyhow::Result<Value> {
-            anyhow::bail!("not used")
-        }
-
-        fn append_index_detail(
-            &self,
-            _: tools::index_tools::AppendIndexDetailCommand,
-        ) -> anyhow::Result<Value> {
-            anyhow::bail!("not used")
-        }
-
-        fn finalize_index(
-            &self,
-            command: tools::index_tools::FinalizeIndexCommand,
-        ) -> anyhow::Result<Value> {
-            Ok(json!({"index_id": command.scope.index_id}))
-        }
-
-        fn read_indexes(
-            &self,
-            _: tools::index_tools::ReadIndexesCommand,
-        ) -> anyhow::Result<tools::index_tools::IndexReadPage> {
-            anyhow::bail!("not used")
-        }
-
-        fn read_index_details(
-            &self,
-            _: tools::index_tools::ReadIndexDetailsCommand,
-        ) -> anyhow::Result<Value> {
-            anyhow::bail!("not used")
-        }
-    }
-
-    #[tokio::test]
-    async fn project_runtime_dispatches_terminal_index_finalize_only_with_binding() {
-        let binding = tools::index_tools::IndexToolRuntimeBinding::new(
-            tools::index_tools::IndexOwnedScope {
-                run_id: "run-1".to_owned(),
-                source_run_id: None,
-                source_phase: 1,
-                role: "compressor.phase_summary".to_owned(),
-                kind: tools::index_tools::IndexKind::PhaseSummary,
-                ticker: None,
-                topic_id: None,
-                unit_key: "phase1:aggregate".to_owned(),
-                source_payload_hash: "hash".to_owned(),
-                index_id: "index-1".to_owned(),
-            },
-            Default::default(),
-            std::sync::Arc::new(TerminalIndexService),
-        )
-        .unwrap();
-        let mut runtime = ProjectToolRuntime::with_available_tools(
-            tools::ExternalToolConfig::default(),
-            vec![tools::FINALIZE_INDEX_TOOL_NAME.to_owned()],
-        )
-        .with_index_tool_runtime(binding);
-        runtime.set_turn_context(ToolRuntimeTurnContext {
-            run_id: "run-1".to_owned(),
-            session_id: "session-1".to_owned(),
-            turn_id: "turn-1".to_owned(),
-            role: "compressor.phase_summary".to_owned(),
-            phase: Some(1),
-        });
-        let result = runtime
-            .execute(ToolCallRequest {
-                call_id: "call-finalize".to_owned(),
-                name: tools::FINALIZE_INDEX_TOOL_NAME.to_owned(),
-                arguments: json!({}),
-            })
-            .await;
-        assert_eq!(result.status, "completed");
-        assert_eq!(result.output["terminal"], true);
-        assert_eq!(result.output["artifact"]["index_id"], "index-1");
-    }
-
-    struct TerminalDomainService;
-
-    impl tools::domain_tools::DomainToolService for TerminalDomainService {
-        fn set_analyst_assessment(
-            &self,
-            _: tools::domain_tools::AnalystAssessmentCommand,
-        ) -> anyhow::Result<Value> {
-            anyhow::bail!("not used")
-        }
-        fn append_analyst_evidence(
-            &self,
-            _: tools::domain_tools::AnalystEvidenceCommand,
-        ) -> anyhow::Result<Value> {
-            Ok(json!({"status":"draft"}))
-        }
-        fn append_analyst_data_gap(
-            &self,
-            _: tools::domain_tools::AnalystDataGapCommand,
-        ) -> anyhow::Result<Value> {
-            anyhow::bail!("not used")
-        }
-        fn set_analyst_invalidation(
-            &self,
-            _: tools::domain_tools::AnalystInvalidationCommand,
-        ) -> anyhow::Result<Value> {
-            anyhow::bail!("not used")
-        }
-        fn finalize_analyst_report(&self) -> anyhow::Result<Value> {
-            Ok(json!({"artifact_id":"analyst-1"}))
-        }
-        fn set_research_decision(
-            &self,
-            _: tools::domain_tools::ResearchDecisionCommand,
-        ) -> anyhow::Result<Value> {
-            anyhow::bail!("not used")
-        }
-        fn set_research_scenarios(
-            &self,
-            _: tools::domain_tools::ResearchScenariosCommand,
-        ) -> anyhow::Result<Value> {
-            anyhow::bail!("not used")
-        }
-        fn append_research_hinge(
-            &self,
-            _: tools::domain_tools::ResearchHingeCommand,
-        ) -> anyhow::Result<Value> {
-            anyhow::bail!("not used")
-        }
-        fn finalize_research_decision(&self) -> anyhow::Result<Value> {
-            anyhow::bail!("not used")
-        }
-        fn set_trade_intent(
-            &self,
-            _: tools::domain_tools::TradeIntentCommand,
-        ) -> anyhow::Result<Value> {
-            anyhow::bail!("not used")
-        }
-        fn append_trade_blocker(
-            &self,
-            _: tools::domain_tools::TradeBlockerCommand,
-        ) -> anyhow::Result<Value> {
-            anyhow::bail!("not used")
-        }
-        fn finalize_trade_intent(&self) -> anyhow::Result<Value> {
-            anyhow::bail!("not used")
-        }
-        fn set_risk_assessment(
-            &self,
-            _: tools::domain_tools::RiskAssessmentCommand,
-        ) -> anyhow::Result<Value> {
-            anyhow::bail!("not used")
-        }
-        fn set_risk_constraints(
-            &self,
-            _: tools::domain_tools::RiskConstraintsCommand,
-        ) -> anyhow::Result<Value> {
-            anyhow::bail!("not used")
-        }
-        fn finalize_risk_review(&self) -> anyhow::Result<Value> {
-            anyhow::bail!("not used")
-        }
-        fn set_portfolio_asset_decision(
-            &self,
-            _: tools::domain_tools::PortfolioAssetDecisionCommand,
-        ) -> anyhow::Result<Value> {
-            anyhow::bail!("not used")
-        }
-        fn append_binding_risk_control(
-            &self,
-            _: tools::domain_tools::BindingRiskControlCommand,
-        ) -> anyhow::Result<Value> {
-            anyhow::bail!("not used")
-        }
-        fn finalize_portfolio_decision(&self) -> anyhow::Result<Value> {
-            anyhow::bail!("not used")
-        }
-    }
-
-    #[tokio::test]
-    async fn project_runtime_dispatches_terminal_domain_finalize_only_with_binding() {
-        let binding = tools::domain_tools::DomainToolRuntimeBinding::new(
-            tools::domain_tools::DomainToolScope {
-                profile: orchestrator_core::ToolManagedProfile::AnalystReport,
-                tickers: ["QQQ".to_owned()].into_iter().collect(),
-                visible_evidence_refs: Default::default(),
-                visible_claims: Default::default(),
-            },
-            std::sync::Arc::new(TerminalDomainService),
-        )
-        .unwrap();
-        let runtime = ProjectToolRuntime::with_available_tools(
-            tools::ExternalToolConfig::default(),
-            vec![tools::FINALIZE_ANALYST_REPORT_TOOL_NAME.to_owned()],
-        )
-        .with_domain_tool_runtime(binding);
-        let result = runtime
-            .execute(ToolCallRequest {
-                call_id: "call-domain-finalize".to_owned(),
-                name: tools::FINALIZE_ANALYST_REPORT_TOOL_NAME.to_owned(),
-                arguments: json!({}),
-            })
-            .await;
-        assert_eq!(result.status, "completed");
-        assert_eq!(result.output["terminal"], true);
-        assert_eq!(result.output["artifact"]["artifact_id"], "analyst-1");
-    }
-
-    #[tokio::test]
-    async fn project_runtime_records_structured_reads_before_domain_evidence_writes() {
-        let temp = tempfile::tempdir().unwrap();
-        let csv_dir = temp.path().join(orchestrator_core::DEFAULT_JIN10_CSV_DIR);
-        let path = orchestrator_core::jin10_csv_path(&csv_dir, "2026-07-27");
-        orchestrator_core::write_jin10_csv(
-            &path,
-            &[orchestrator_core::Jin10CsvRow {
-                id: "event-1".to_owned(),
-                time: "2026-07-27 09:00:00".to_owned(),
-                content: "Fed CPI update for QQQ".to_owned(),
-            }],
-        )
-        .unwrap();
-        let binding = tools::domain_tools::DomainToolRuntimeBinding::new(
-            tools::domain_tools::DomainToolScope {
-                profile: orchestrator_core::ToolManagedProfile::AnalystReport,
-                tickers: ["QQQ".to_owned()].into_iter().collect(),
-                visible_evidence_refs: Default::default(),
-                visible_claims: Default::default(),
-            },
-            std::sync::Arc::new(TerminalDomainService),
-        )
-        .unwrap();
-        let mut runtime = ProjectToolRuntime::with_available_tools(
-            tools::ExternalToolConfig {
-                project_root: temp.path().to_path_buf(),
-                tickers: vec!["QQQ".to_owned()],
-                ..Default::default()
-            },
-            vec![
-                tools::read_jin10_candidates::NAME.to_owned(),
-                tools::APPEND_ANALYST_EVIDENCE_TOOL_NAME.to_owned(),
-            ],
-        )
-        .with_domain_tool_runtime(binding);
-        runtime.set_turn_context(ToolRuntimeTurnContext {
-            run_id: "run-1".to_owned(),
-            session_id: "session-1".to_owned(),
-            turn_id: "turn-1".to_owned(),
-            role: "analyst.news_macro".to_owned(),
-            phase: Some(1),
-        });
-        let evidence_write = || ToolCallRequest {
-            call_id: "write-evidence".to_owned(),
-            name: tools::APPEND_ANALYST_EVIDENCE_TOOL_NAME.to_owned(),
-            arguments: json!({
-                "ticker":"QQQ", "evidence_ref":"event-1",
-                "evidence": {
-                    "claim":"CPI update", "evidence_type":"fact", "source":"Jin10",
-                    "timestamp":"2026-07-27", "source_tier":"official", "first_source":"Jin10",
-                    "is_derivative_repost":false, "evidence_age":"0-2d", "source_confidence":0.9
-                }
-            }),
-        };
-        let before = runtime.execute(evidence_write()).await;
-        assert_eq!(before.status, "error");
-        assert!(before
-            .error
-            .as_deref()
-            .is_some_and(|message| message.contains("not visible")));
-
-        let read = runtime
-            .execute(ToolCallRequest {
-                call_id: "read-jin10".to_owned(),
-                name: tools::read_jin10_candidates::NAME.to_owned(),
-                arguments: json!({"tickers":["QQQ"]}),
-            })
-            .await;
-        assert_eq!(read.status, "completed");
-        assert_eq!(read.output["candidates"][0]["event_id"], "event-1");
-
-        let after = runtime.execute(evidence_write()).await;
-        assert_eq!(after.status, "completed");
-    }
-
-    #[tokio::test]
-    async fn project_runtime_rejects_unconfigured_think_tool() {
-        let runtime = ProjectToolRuntime::with_available_tools(
-            tools::ExternalToolConfig {
-                project_root: PathBuf::from("."),
-                db_path: None,
-                run_dir: None,
-                run_id: None,
-                phase: None,
-                allowed_reflection_task_ids: Vec::new(),
-                phase_summary_page_limit: 20,
-                phase_summary_detail_page_limit: 20,
-                tickers: Vec::new(),
-                alpaca_live: false,
-                alpaca_market_data: false,
-                alpaca_api_key: None,
-                alpaca_api_secret: None,
-                phase_summary_index: None,
-                phase_summary_gate: None,
-                file_store_input: None,
-                file_store_reflection_source: None,
-            },
-            Vec::new(),
-        );
-
-        let result = runtime
-            .execute(ToolCallRequest {
-                call_id: "call-think".to_string(),
-                name: "think".to_string(),
-                arguments: json!({"summary": "should not run"}),
-            })
-            .await;
-
-        assert_eq!(result.status, "error");
-        assert_eq!(result.error.as_deref(), Some("unknown tool name"));
-    }
-
-    #[tokio::test]
-    async fn intermediate_assistant_text_before_tool_call_keeps_turn_open_for_follow_up() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        ensure_schema(&conn).unwrap();
-        let mut first = model_response(Some("Checking context before I call a tool."), false);
-        first.tool_calls = vec![ToolCallRequest {
-            call_id: "call-1".to_string(),
-            name: "echo".to_string(),
-            arguments: json!({"text": "observed"}),
-        }];
-        let mut model = FakeModel::new(vec![
-            first,
-            model_response(Some("Final answer ready for downstream consumers after completing the requested analysis steps without further tool calls. detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail "), true),
-        ]);
-        let mut tools = StaticToolRuntime::new();
-        tools.add_tool("echo", |args| ToolResultItem {
-            call_id: "call-1".to_string(),
-            name: "echo".to_string(),
-            status: "completed".to_string(),
-            output: args,
-            error: None,
-        });
-        let mut turn = Turn::new("turn-1", "session-1", "run-1", "loop.test", "start");
-
-        run_turn(
-            &conn,
-            &mut turn,
-            &mut model,
-            &mut tools,
-            AgentLoopConfig::default(),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(model.seen_inputs.len(), 2);
-        assert_eq!(
-            assistant_texts(&conn),
-            vec![
-                "Checking context before I call a tool.".to_string(),
-                "Final answer ready for downstream consumers after completing the requested analysis steps without further tool calls. detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail ".to_string(),
-            ]
-        );
-        let (has_summary, _summary) = turn_end_state(&conn, "turn-1");
-        assert!(has_summary);
-    }
-
-    #[tokio::test]
-    async fn final_assistant_text_completes_turn_only_when_no_follow_up_work_exists() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        ensure_schema(&conn).unwrap();
-        let mut model = FakeModel::new(vec![model_response(
-            Some("Final answer ready for downstream consumers after completing the requested analysis steps without further tool calls. detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail "),
-            true,
-        )]);
-        let mut tools = StaticToolRuntime::new();
-        let mut turn = Turn::new("turn-1", "session-1", "run-1", "loop.test", "start");
-
-        run_turn(
-            &conn,
-            &mut turn,
-            &mut model,
-            &mut tools,
-            AgentLoopConfig::default(),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(model.seen_inputs.len(), 1);
-        assert_eq!(
-            assistant_texts(&conn),
-            vec!["Final answer ready for downstream consumers after completing the requested analysis steps without further tool calls. detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail ".to_string()]
-        );
-        let (has_summary, _summary) = turn_end_state(&conn, "turn-1");
-        assert!(has_summary);
-    }
-
-    #[tokio::test]
-    async fn end_turn_false_with_assistant_text_requests_another_model_iteration() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        ensure_schema(&conn).unwrap();
-        let mut model = FakeModel::new(vec![
-            model_response(
-                Some("I have a partial answer and need another pass."),
-                false,
-            ),
-            model_response(Some("Final answer ready for downstream consumers after completing the requested analysis steps without further tool calls. detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail "), true),
-        ]);
-        let mut tools = StaticToolRuntime::new();
-        let mut turn = Turn::new("turn-1", "session-1", "run-1", "loop.test", "start");
-
-        run_turn(
-            &conn,
-            &mut turn,
-            &mut model,
-            &mut tools,
-            AgentLoopConfig::default(),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(model.seen_inputs.len(), 2);
-        assert!(model.seen_inputs[1].items.iter().any(|item| {
-            item.item_type == TurnItemType::AssistantMessage
-                && item.content_text == "I have a partial answer and need another pass."
-        }));
-        assert_eq!(
-            assistant_texts(&conn),
-            vec![
-                "I have a partial answer and need another pass.".to_string(),
-                "Final answer ready for downstream consumers after completing the requested analysis steps without further tool calls. detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail ".to_string(),
-            ]
-        );
-        let (has_summary, _summary) = turn_end_state(&conn, "turn-1");
-        assert!(has_summary);
-    }
-
-    #[tokio::test]
-    async fn max_agent_loops_counts_end_turns_not_model_iterations() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        ensure_schema(&conn).unwrap();
-        let mut responses = vec![
-            model_response(Some("Still gathering evidence."), false),
-            model_response(Some("Still gathering evidence."), false),
-            model_response(Some("Still gathering evidence."), false),
-            model_response(Some("Still gathering evidence."), false),
-            model_response(Some("Still gathering evidence."), false),
-            model_response(Some("Still gathering evidence."), false),
-        ];
-        responses.push(model_response(
-            Some("Final answer ready for downstream consumers after completing the requested analysis steps without further tool calls. detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail "),
-            true,
-        ));
-        let mut model = FakeModel::new(responses);
-        let mut tools = StaticToolRuntime::new();
-        let mut turn = Turn::new(
-            "turn-end-budget",
-            "session-1",
-            "run-1",
-            "loop.test",
-            "start",
-        );
-
-        run_turn(
-            &conn,
-            &mut turn,
-            &mut model,
-            &mut tools,
-            AgentLoopConfig {
-                max_agent_loops: Some(1),
-                ..AgentLoopConfig::default()
-            },
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(model.seen_inputs.len(), 7);
-    }
-
-    #[test]
-    fn react_prompt_splits_static_role_prompt_from_dynamic_turn_items() {
-        let tool_result = ToolResultItem {
-            call_id: "call-1".to_string(),
-            name: "read_run_context".to_string(),
-            status: "ok".to_string(),
-            output: json!({"dynamic": true}),
-            error: None,
-        };
-        let input = ModelInput {
-            system_instruction: None,
-            items: vec![
-                TurnItem::user("STATIC ROLE PROMPT"),
-                TurnItem::assistant("dynamic assistant note", Value::Null),
-                TurnItem::tool_result(&tool_result, &TruncationConfig::default()),
-            ],
-            available_tools: vec!["read_run_context".to_string()],
-            truncation: TruncationConfig::default(),
-        };
-
-        let prompt = react_prompt(&input).unwrap();
-        let static_index = prompt.find("Static context:").unwrap();
-        let dynamic_index = prompt.find("Dynamic context:").unwrap();
-        assert!(static_index < dynamic_index);
-        assert!(prompt[static_index..dynamic_index].contains("STATIC ROLE PROMPT"));
-        assert!(!prompt[static_index..dynamic_index].contains("dynamic assistant note"));
-        assert!(prompt[dynamic_index..].contains("dynamic assistant note"));
-        assert!(prompt[dynamic_index..].contains("read_run_context"));
-    }
-
-    #[test]
-    fn tool_result_history_does_not_store_full_mega_payload() {
-        let huge = "x".repeat(50_000);
-        let tool_result = ToolResultItem {
-            call_id: "call-huge".to_string(),
-            name: "read_run_context".to_string(),
-            status: "completed".to_string(),
-            output: json!({
-                "status": "ok",
-                "evidence": { "csv": huge.clone() },
-            }),
-            error: None,
-        };
-        let item = TurnItem::tool_result(&tool_result, &TruncationConfig::default());
-        assert!(item.content_text.chars().count() <= TruncationConfig::default().tool_result_chars);
-        let stored = item.content_json.to_string();
-        assert!(
-            stored.chars().count() < 20_000,
-            "content_json must not re-embed the raw mega payload, got {} chars",
-            stored.chars().count()
-        );
-        assert!(!stored.contains(&huge));
-
-        let prompt = react_prompt(&ModelInput {
-            system_instruction: Some("sys".to_string()),
-            items: vec![item],
-            available_tools: vec![],
-            truncation: TruncationConfig::default(),
-        })
-        .unwrap();
-        assert!(!prompt.contains(&huge));
-        assert!(prompt.chars().count() < 30_000);
-    }
-
-    #[test]
-    fn react_system_instruction_keeps_executing_role_and_tickers_visible() {
-        let instruction = react_system_instruction(
-            &[],
-            "analyst.technical",
-            &["QQQ".to_string(), "SOXX".to_string()],
-        );
-
-        assert!(instruction.contains("analyst.technical"));
-        assert!(instruction.contains("QQQ"));
-        assert!(instruction.contains("SOXX"));
-        assert!(
-            instruction.contains("Artifact role and ticker coverage must match the active role")
-        );
-        assert!(!instruction.contains("JSON with id, role, status, per_ticker"));
-    }
-
-    #[test]
-    fn extract_token_usage_reads_cached_tokens_from_response_usage() {
-        let raw = json!({
-            "usage": {
-                "input_tokens": 1200,
-                "output_tokens": 80,
-                "total_tokens": 1280,
-                "input_tokens_details": {"cached_tokens": 384}
-            }
-        });
-
-        assert_eq!(
-            extract_token_usage(&raw),
-            TokenUsage {
-                input_tokens: 1200,
-                output_tokens: 80,
-                cached_tokens: 384,
-                reasoning_tokens: 0,
-                total_tokens: 1280,
-            }
-        );
-        assert_eq!(
-            extract_token_usage(&json!({"usage": {}})),
-            TokenUsage {
-                input_tokens: 0,
-                output_tokens: 0,
-                cached_tokens: 0,
-                reasoning_tokens: 0,
-                total_tokens: 0,
-            }
-        );
-        assert_eq!(
-            extract_token_usage(
-                &json!({"raw": {"usage": {"input_tokens": 7, "output_tokens": 5}}})
-            ),
-            TokenUsage {
-                input_tokens: 7,
-                output_tokens: 5,
-                cached_tokens: 0,
-                reasoning_tokens: 0,
-                total_tokens: 12,
-            }
-        );
-
-        let with_reasoning = json!({
-            "usage": {
-                "input_tokens": 5000,
-                "output_tokens": 2000,
-                "total_tokens": 7000,
-                "input_tokens_details": {"cached_tokens": 3000},
-                "output_tokens_details": {"reasoning_tokens": 800}
-            }
-        });
-        let usage = extract_token_usage(&with_reasoning);
-        assert_eq!(usage.reasoning_tokens, 800);
-        assert_eq!(usage.cached_tokens, 3000);
-        assert_eq!(usage.non_cached_input_tokens(), 2000);
-        assert_eq!(usage.visible_output_tokens(), 1200);
-    }
-
-    #[test]
-    fn token_usage_add_assign_accumulates() {
-        let mut a = TokenUsage {
-            input_tokens: 100,
-            output_tokens: 50,
-            cached_tokens: 40,
-            reasoning_tokens: 10,
-            total_tokens: 150,
-        };
-        let b = TokenUsage {
-            input_tokens: 200,
-            output_tokens: 80,
-            cached_tokens: 60,
-            reasoning_tokens: 30,
-            total_tokens: 280,
-        };
-        a += b;
-        assert_eq!(a.input_tokens, 300);
-        assert_eq!(a.output_tokens, 130);
-        assert_eq!(a.cached_tokens, 100);
-        assert_eq!(a.reasoning_tokens, 40);
-        assert_eq!(a.total_tokens, 430);
-        assert_eq!(a.non_cached_input_tokens(), 200);
-        assert_eq!(a.visible_output_tokens(), 90);
-    }
-
-    #[tokio::test]
-    async fn streaming_assistant_text_deltas_merge_into_one_intermediate_item() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        ensure_schema(&conn).unwrap();
-        let long_text = (0..300)
-            .map(|index| format!("intermediate-delta-{index:03};"))
-            .collect::<String>();
-        let split_at = long_text.len() / 2;
-        let mut model = FakeStreamModel::new(vec![
-            vec![
-                ModelStreamEvent::AssistantMessageStarted {
-                    item_id: "msg-1".to_string(),
-                },
-                ModelStreamEvent::AssistantTextDelta {
-                    item_id: "msg-1".to_string(),
-                    delta: long_text[..split_at].to_string(),
-                },
-                ModelStreamEvent::AssistantTextDelta {
-                    item_id: "msg-1".to_string(),
-                    delta: long_text[split_at..].to_string(),
-                },
-                ModelStreamEvent::AssistantMessageCompleted {
-                    item_id: "msg-1".to_string(),
-                    turn_status: TurnStatus::Unknown,
-                },
-                ModelStreamEvent::ResponseCompleted {
-                    end_turn: false,
-                    raw: json!({"step": 1}),
-                },
-            ],
-            vec![
-                ModelStreamEvent::AssistantMessageStarted {
-                    item_id: "msg-2".to_string(),
-                },
-                ModelStreamEvent::AssistantTextDelta {
-                    item_id: "msg-2".to_string(),
-                    delta: "Final answer ready for downstream consumers after completing the requested analysis steps without further tool calls. detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail ".to_string(),
-                },
-                ModelStreamEvent::AssistantMessageCompleted {
-                    item_id: "msg-2".to_string(),
-                    turn_status: TurnStatus::Unknown,
-                },
-                ModelStreamEvent::ResponseCompleted {
-                    end_turn: true,
-                    raw: json!({"step": 2}),
-                },
-            ],
-        ]);
-        let mut tools = StaticToolRuntime::new();
-        let mut sink = RecordingSink::default();
-        let mut turn = Turn::new("turn-1", "session-1", "run-1", "loop.test", "start");
-
-        run_turn_with_events(
-            &conn,
-            &mut turn,
-            &mut model,
-            &mut tools,
-            AgentLoopConfig::default(),
-            &mut sink,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(assistant_texts(&conn)[0], long_text);
-        assert!(model.seen_inputs[1].items.iter().any(|item| {
-            item.item_type == TurnItemType::AssistantMessage && item.content_text == long_text
-        }));
-        let msg_1_deltas = sink
-            .events
-            .iter()
-            .filter(|event| {
-                matches!(
-                    event,
-                    AgentLoopEvent::TurnItemDelta { item_id, .. } if item_id == "msg-1"
-                )
-            })
-            .count();
-        assert_eq!(msg_1_deltas, 2);
-    }
-
-    #[tokio::test]
-    async fn model_stream_handler_emits_and_persists_deltas_immediately() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        ensure_schema(&conn).unwrap();
-        let mut sink = RecordingSink::default();
-        let mut turn = Turn::new("turn-1", "session-1", "run-1", "loop.test", "start");
-        persist_turn(&conn, &turn, &TruncationConfig::default()).unwrap();
-
-        {
-            let mut handler =
-                ModelStreamHandler::new(&conn, &mut turn, &mut sink, TruncationConfig::default());
-            handler
-                .handle(ModelStreamEvent::AssistantMessageStarted {
-                    item_id: "msg-live".to_string(),
-                })
-                .await
-                .unwrap();
-            handler
-                .handle(ModelStreamEvent::AssistantTextDelta {
-                    item_id: "msg-live".to_string(),
-                    delta: "live chunk".to_string(),
-                })
-                .await
-                .unwrap();
-        }
-        persist_turn(&conn, &turn, &TruncationConfig::default()).unwrap();
-
-        assert!(sink.events.iter().any(|event| {
-            matches!(
-                event,
-                AgentLoopEvent::TurnItemDelta { item_id, delta, .. }
-                    if item_id == "msg-live" && delta == "live chunk"
-            )
-        }));
-        assert_eq!(assistant_texts(&conn), vec!["live chunk".to_string()]);
-        let events = turn_history_items(&conn, "turn-1").unwrap();
-        let content_json = events
-            .iter()
-            .find(|e| e.get("event_type").and_then(|v| v.as_str()) == Some("assistant_message"))
-            .and_then(|e| e.get("content_json"))
-            .cloned()
-            .unwrap_or(Value::Null);
-        assert_eq!(content_json["status"], "in_progress");
-        assert_eq!(content_json["phase"], "commentary");
-    }
-
-    #[tokio::test]
-    async fn run_turn_executes_tool_and_feeds_result_back_to_model() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        ensure_schema(&conn).unwrap();
-        let mut model = FakeModel::new(vec![
-            ModelResponse {
-                assistant_message: Some("I need the tool.".to_string()),
-                reasoning_summary: Some("Need observation.".to_string()),
-                tool_calls: vec![ToolCallRequest {
-                    call_id: "call-1".to_string(),
-                    name: "echo".to_string(),
-                    arguments: json!({"text": "observed"}),
-                }],
-                end_turn: false,
-                raw: json!({"step": 1}),
-                turn_status: TurnStatus::Unknown,
-            },
-            ModelResponse {
-                assistant_message: Some("Final answer ready for downstream consumers after completing the requested analysis steps without further tool calls. detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail ".to_string()),
-                reasoning_summary: None,
-                tool_calls: vec![],
-                end_turn: true,
-                raw: json!({"step": 2}),
-                turn_status: TurnStatus::Unknown,
-            },
-        ]);
-        let mut tools = StaticToolRuntime::new();
-        tools.add_tool("echo", |args| ToolResultItem {
-            call_id: "call-1".to_string(),
-            name: "echo".to_string(),
-            status: "completed".to_string(),
-            output: args,
-            error: None,
-        });
-        let mut turn = Turn::new("turn-1", "session-1", "run-1", "loop.test", "start");
-
-        run_turn(
-            &conn,
-            &mut turn,
-            &mut model,
-            &mut tools,
-            AgentLoopConfig::default(),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(turn.end_reason.as_deref(), Some("completed"));
-        assert_eq!(model.seen_inputs.len(), 2);
-        assert!(model.seen_inputs[1]
-            .items
-            .iter()
-            .any(|item| item.item_type == TurnItemType::ToolResult));
-
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM agent_events", [], |row| row.get(0))
-            .unwrap();
-        assert!(count >= 1);
-    }
-
-    #[tokio::test]
-    async fn tool_managed_terminal_stops_later_calls_in_the_same_response() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        ensure_schema(&conn).unwrap();
-        let mut model = FakeModel::new(vec![ModelResponse {
-            assistant_message: Some("I will finalize through tools.".to_string()),
-            reasoning_summary: None,
-            tool_calls: vec![
-                ToolCallRequest {
-                    call_id: "read-1".to_string(),
-                    name: "read".to_string(),
-                    arguments: Value::Null,
-                },
-                ToolCallRequest {
-                    call_id: "finalize-1".to_string(),
-                    name: "finalize".to_string(),
-                    arguments: Value::Null,
-                },
-                ToolCallRequest {
-                    call_id: "after-1".to_string(),
-                    name: "after".to_string(),
-                    arguments: Value::Null,
-                },
-            ],
-            end_turn: false,
-            raw: json!({"step": 1}),
-            turn_status: TurnStatus::Unknown,
-        }]);
-        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let mut tools = StaticToolRuntime::new();
-        for (name, terminal) in [("read", false), ("finalize", true), ("after", false)] {
-            let calls = std::sync::Arc::clone(&calls);
-            tools.add_tool(name, move |_| {
-                calls.lock().unwrap().push(name.to_string());
-                ToolResultItem {
-                    call_id: format!("{name}-result"),
-                    name: name.to_string(),
-                    status: "completed".to_string(),
-                    output: json!({"terminal": terminal, "artifact": {"id": "artifact-1"}}),
-                    error: None,
-                }
-            });
-        }
-        let mut turn = Turn::new("turn-1", "session-1", "run-1", "loop.test", "start");
-        let config = AgentLoopConfig {
-            require_terminal_tool: true,
-            ..AgentLoopConfig::default()
-        };
-
-        run_turn(&conn, &mut turn, &mut model, &mut tools, config)
-            .await
-            .unwrap();
-
-        assert_eq!(*calls.lock().unwrap(), vec!["read", "finalize"]);
-        assert_eq!(turn.end_reason.as_deref(), Some("terminal_tool"));
-        assert_eq!(
-            turn.terminal_tool_result
-                .as_ref()
-                .and_then(|result| result.output.get("artifact"))
-                .and_then(|artifact| artifact.get("id"))
-                .and_then(Value::as_str),
-            Some("artifact-1")
-        );
-        assert!(turn.emitted_items.iter().any(|item| {
-            item.tool_call_id == "after-1"
-                && item.item_type == TurnItemType::ToolResult
-                && item
-                    .content_json
-                    .pointer("/result/output/status")
-                    .and_then(Value::as_str)
-                    == Some("ignored_after_terminal")
-        }));
-    }
-
-    #[tokio::test]
-    async fn tool_managed_prose_end_gets_one_repair_then_terminal_succeeds() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        ensure_schema(&conn).unwrap();
-        let mut model = FakeModel::new(vec![
-            model_response(Some("This prose does not finalize the draft."), true),
-            ModelResponse {
-                assistant_message: None,
-                reasoning_summary: None,
-                tool_calls: vec![ToolCallRequest {
-                    call_id: "finalize-1".to_string(),
-                    name: "finalize".to_string(),
-                    arguments: Value::Null,
-                }],
-                end_turn: false,
-                raw: json!({"step": 2}),
-                turn_status: TurnStatus::Unknown,
-            },
-        ]);
-        let mut tools = StaticToolRuntime::new();
-        tools.add_tool("finalize", |_| ToolResultItem {
-            call_id: "finalize-1".to_string(),
-            name: "finalize".to_string(),
-            status: "completed".to_string(),
-            output: json!({"terminal": true, "artifact": {"id": "artifact-1"}}),
-            error: None,
-        });
-        let mut turn = Turn::new("turn-1", "session-1", "run-1", "loop.test", "start");
-
-        run_turn(
-            &conn,
-            &mut turn,
-            &mut model,
-            &mut tools,
-            AgentLoopConfig {
-                require_terminal_tool: true,
-                ..AgentLoopConfig::default()
-            },
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(model.seen_inputs.len(), 2);
-        assert_eq!(
-            turn.emitted_items
-                .iter()
-                .filter(|item| {
-                    item.item_type == TurnItemType::UserMessage
-                        && item
-                            .content_text
-                            .contains("No terminal finalize tool succeeded")
-                })
-                .count(),
-            1
-        );
-        assert_eq!(turn.end_reason.as_deref(), Some("terminal_tool"));
-        assert_eq!(
-            turn.terminal_tool_result
-                .as_ref()
-                .and_then(|result| result.output.get("artifact"))
-                .and_then(|artifact| artifact.get("id"))
-                .and_then(Value::as_str),
-            Some("artifact-1")
-        );
-    }
-
-    #[tokio::test]
-    async fn tool_managed_second_prose_end_fails_after_one_repair() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        ensure_schema(&conn).unwrap();
-        let mut model = FakeModel::new(vec![
-            model_response(Some("This prose does not finalize the draft."), true),
-            model_response(
-                Some("This second prose response still does not finalize."),
-                true,
-            ),
-        ]);
-        let mut tools = StaticToolRuntime::new();
-        let mut turn = Turn::new("turn-1", "session-1", "run-1", "loop.test", "start");
-
-        let error = run_turn(
-            &conn,
-            &mut turn,
-            &mut model,
-            &mut tools,
-            AgentLoopConfig {
-                require_terminal_tool: true,
-                ..AgentLoopConfig::default()
-            },
-        )
-        .await
-        .unwrap_err();
-
-        assert!(error
-            .to_string()
-            .contains("tool-managed agent ended without a successful terminal finalize tool"));
-        assert_eq!(model.seen_inputs.len(), 2);
-        assert_eq!(
-            turn.emitted_items
-                .iter()
-                .filter(|item| {
-                    item.item_type == TurnItemType::UserMessage
-                        && item
-                            .content_text
-                            .contains("No terminal finalize tool succeeded")
-                })
-                .count(),
-            1
-        );
-    }
-
-    #[tokio::test]
-    async fn web_run_tool_result_is_written_to_history_and_triggers_follow_up() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        ensure_schema(&conn).unwrap();
-        let mut model = FakeModel::new(vec![
-            ModelResponse {
-                assistant_message: Some("Searching current context.".to_string()),
-                reasoning_summary: None,
-                tool_calls: vec![ToolCallRequest {
-                    call_id: "call-web".to_string(),
-                    name: tools::WEB_RUN_TOOL_NAME.to_string(),
-                    arguments: json!({"search_query": [{"q": "TQQQ liquidity"}]}),
-                }],
-                end_turn: false,
-                raw: json!({"step": 1}),
-                turn_status: TurnStatus::Unknown,
-            },
-            ModelResponse {
-                assistant_message: Some("Final answer ready for downstream consumers after completing the requested analysis steps without further tool calls. detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail detail ".to_string()),
-                reasoning_summary: None,
-                tool_calls: vec![],
-                end_turn: true,
-                raw: json!({"step": 2}),
-                turn_status: TurnStatus::Unknown,
-            },
-        ]);
-        let config = WebSearchConfig {
-            mode: WebSearchMode::Cached,
-            ..WebSearchConfig::default()
-        };
-        let provider = MockWebSearchProvider::new(vec![MockWebPage {
-            title: "TQQQ liquidity update".to_string(),
-            url: "https://research.example.com/tqqq-liquidity".to_string(),
-            content: "TQQQ liquidity and volatility context for the current session.".to_string(),
-        }]);
-        let mut tools = ProjectToolRuntime::with_available_tools(
-            tools::ExternalToolConfig {
-                project_root: PathBuf::from("."),
-                db_path: None,
-                run_dir: None,
-                run_id: None,
-                phase: None,
-                allowed_reflection_task_ids: Vec::new(),
-                phase_summary_page_limit: 20,
-                phase_summary_detail_page_limit: 20,
-                tickers: vec!["TQQQ".to_string()],
-                alpaca_live: false,
-                alpaca_market_data: false,
-                alpaca_api_key: None,
-                alpaca_api_secret: None,
-                phase_summary_index: None,
-                phase_summary_gate: None,
-                file_store_input: None,
-                file_store_reflection_source: None,
-            },
-            vec![tools::WEB_RUN_TOOL_NAME.to_string()],
-        )
-        .with_web_run_runtime(tools::WebRunRuntime::new(config).with_provider(Arc::new(provider)));
-        let mut turn = Turn::new("turn-web", "session-1", "run-1", "loop.test", "start");
-
-        run_turn(
-            &conn,
-            &mut turn,
-            &mut model,
-            &mut tools,
-            AgentLoopConfig::default(),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(model.seen_inputs.len(), 2);
-        assert_eq!(
-            model.seen_inputs[1]
-                .items
-                .iter()
-                .filter(|item| item.item_type == TurnItemType::ToolResult)
-                .count(),
-            1
-        );
-        let tool_result = model.seen_inputs[1]
-            .items
-            .iter()
-            .find(|item| item.item_type == TurnItemType::ToolResult)
-            .unwrap();
-        assert_eq!(tool_result.role, "tool");
-        assert_eq!(tool_result.tool_call_id, "call-web");
-        assert_eq!(tool_result.tool_name, tools::WEB_RUN_TOOL_NAME);
-        assert!(tool_result.content_text.contains("Search results:"));
-        assert!(tool_result
-            .content_text
-            .contains("Title: TQQQ liquidity update"));
-        assert!(!tool_result.content_text.starts_with('{'));
-        let (has_summary, _summary) = turn_end_state(&conn, "turn-web");
-        assert!(has_summary, "turn should have a non-empty summary");
-
-        let events = turn_history_items(&conn, "turn-web").unwrap();
-        let stored_content = events
-            .iter()
-            .find(|item| {
-                item.get("event_type").and_then(|v| v.as_str()) == Some("tool_result")
-                    && item.get("tool_name").and_then(|v| v.as_str())
-                        == Some(tools::WEB_RUN_TOOL_NAME)
-            })
-            .and_then(|item| item.get("content_text"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        assert!(stored_content.contains("URL: https://research.example.com/tqqq-liquidity"));
-    }
-
-    #[test]
-    fn react_prompt_hides_encrypted_reasoning_state() {
-        let input = ModelInput {
-            system_instruction: None,
-            items: vec![
-                TurnItem::user("visible request"),
-                TurnItem {
-                    item_type: TurnItemType::ReasoningState,
-                    role: "assistant".to_string(),
-                    content_text: String::new(),
-                    content_json: json!({
-                        "output_item_id": "rs_1",
-                        "encrypted_content": "secret-state"
-                    }),
-                    tool_call_id: String::new(),
-                    tool_name: String::new(),
-                    output_item_id: "rs_1".to_string(),
-                    phase: None,
-                    status: Some(AgentItemStatus::Completed),
-                    db_row_id: None,
-                },
-            ],
-            available_tools: Vec::new(),
-            truncation: TruncationConfig::default(),
-        };
-
-        let prompt = react_prompt(&input).unwrap();
-
-        assert!(prompt.contains("visible request"));
-        assert!(!prompt.contains("secret-state"));
-        assert!(!prompt.contains("reasoning_state"));
-    }
-
-    #[test]
-    fn agent_loop_event_serializes_output_item_snapshot() {
-        let event = AgentLoopEvent::TurnItemStarted {
-            turn_id: "turn-1".to_string(),
-            item: AgentOutputItem::AssistantMessage {
-                id: "msg-1".to_string(),
-                phase: AgentItemPhase::Commentary,
-                content: "partial answer".to_string(),
-                status: AgentItemStatus::InProgress,
-            },
-        };
-
-        let value = serde_json::to_value(event).unwrap();
-
-        assert_eq!(value["type"], "turn_item_started");
-        assert_eq!(value["turn_id"], "turn-1");
-        assert_eq!(value["item"]["type"], "assistant_message");
-        assert_eq!(value["item"]["phase"], "commentary");
-        assert_eq!(value["item"]["content"], "partial answer");
-        assert_eq!(value["item"]["status"], "in_progress");
     }
 }

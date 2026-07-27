@@ -115,6 +115,18 @@ impl FileStoreSessionRuntime {
         item: &TurnItem,
         created_at: impl Into<String>,
     ) -> Result<SessionEvent> {
+        self.append_turn_item_at(turn, item, None, created_at)
+    }
+
+    /// Append an item with its Rust-owned ordinal. The ordinal makes recovery
+    /// idempotent without treating a human/model field as an event identity.
+    pub fn append_turn_item_at(
+        &self,
+        turn: &Turn,
+        item: &TurnItem,
+        item_index: Option<usize>,
+        created_at: impl Into<String>,
+    ) -> Result<SessionEvent> {
         self.validate_turn(turn)?;
         let event_type = match item.item_type {
             TurnItemType::UserMessage => SessionEventType::User,
@@ -142,6 +154,7 @@ impl FileStoreSessionRuntime {
                 "output_item_id": item.output_item_id,
                 "phase": item.phase.as_ref().map(|phase| phase.as_str()),
                 "status": item.status.as_ref().map(|status| status.as_str()),
+                "item_index": item_index,
             }),
             created_at,
         )

@@ -7,7 +7,6 @@ use async_openai::{config::OpenAIConfig, Client as OpenAIClient};
 use futures::StreamExt;
 use llm_judge::JudgeConfig;
 use orchestrator_core::{default_project_root, ToolManagedProfile};
-use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -193,6 +192,8 @@ pub struct AgentSettings {
     /// Required only when `output_mode` is ToolManaged. The profile selects a
     /// Rust-owned draft/builder contract; assistant prose is never an artifact.
     pub tool_managed_profile: Option<ToolManagedProfile>,
+    /// Concrete FileStore authority for this ToolManaged agent session.
+    pub session_runtime: Option<agent_loop::FileStoreSessionRuntime>,
     /// Present only for a migrated Index/Detail unit. Legacy settings must
     /// leave this absent; there is no legacy-to-FileStore fallback.
     pub index_tool_runtime: Option<tools::index_tools::IndexToolRuntimeBinding>,
@@ -229,7 +230,8 @@ impl AgentSettings {
             }
         }
         match self.tool_managed_profile {
-            Some(_) => Ok(()),
+            Some(_) if self.session_runtime.is_some() => Ok(()),
+            Some(_) => bail!("tool-managed output mode requires a FileStore session runtime"),
             None => bail!("tool-managed output mode requires a ToolManagedProfile"),
         }
     }
@@ -317,13 +319,16 @@ pub async fn run_agent_loop_with_metrics(
     settings.llm.validate(&settings.role)?;
     settings.validate_output_mode()?;
     validate_fallback_web_search_runtime_config(settings)?;
-    let conn = open_loop_connection(settings)?;
-    let session_id = loop_session_id(settings);
+    let session = settings
+        .session_runtime
+        .as_ref()
+        .context("tool-managed output mode requires a FileStore session runtime")?;
+    let session_id = session.manifest().session_id.clone();
     let turn_id = format!("turn-{}", Uuid::new_v4());
     let mut turn = Turn::new(
         turn_id,
         session_id,
-        loop_run_id(settings),
+        session.manifest().run_id.clone(),
         settings.role.clone(),
         prompt.to_string(),
     );
@@ -355,7 +360,7 @@ pub async fn run_agent_loop_with_metrics(
     }
     let mut model = AgentLoopModel::new(settings.clone());
     let metrics = agent_loop::run_turn(
-        &conn,
+        session,
         &mut turn,
         &mut model,
         &mut tools,
@@ -409,17 +414,23 @@ pub async fn run_agent_steer_loop_with_metrics(
     settings.llm.validate(&settings.role)?;
     settings.validate_output_mode()?;
     validate_fallback_web_search_runtime_config(settings)?;
-    let conn = open_loop_connection(settings)?;
+    let session = settings
+        .session_runtime
+        .as_ref()
+        .context("tool-managed output mode requires a FileStore session runtime")?;
     // Scope resume detection to this turn_id. Using run_id-latest history made
     // later phase-2 roles see sibling turns as "existing history" and drop their
     // own role prompt (live debate mass max_agent_loops / empty context).
-    let target_history = orchestrator_sql::turn_history_items(&conn, &input.turn_id)?;
+    if session.manifest().session_id != input.session_id {
+        bail!("steer input session does not match FileStore session authority");
+    }
+    let target_history = session_history_values(session.read_current_turn(&input.turn_id)?);
     let fork_from_turn_id = input.fork_from_turn_id();
     let fork_history = if target_history.is_empty() {
-        if let Some(source_turn_id) = fork_from_turn_id.as_deref() {
-            let history = orchestrator_sql::turn_history_items(&conn, source_turn_id)?;
+        if fork_from_turn_id.is_some() {
+            let history = session_history_values(session.read_fork_turn()?);
             if history.is_empty() {
-                bail!("fork source turn {source_turn_id:?} has no persisted history");
+                bail!("FileStore fork source turn has no persisted history");
             }
             history
         } else {
@@ -442,7 +453,7 @@ pub async fn run_agent_steer_loop_with_metrics(
     let mut turn = Turn::new(
         input.turn_id.clone(),
         input.session_id.clone(),
-        loop_run_id(settings),
+        session.manifest().run_id.clone(),
         settings.role.clone(),
         user_input,
     );
@@ -494,7 +505,7 @@ pub async fn run_agent_steer_loop_with_metrics(
     }
     let mut model = AgentLoopModel::new(settings.clone());
     let metrics = agent_loop::run_turn(
-        &conn,
+        session,
         &mut turn,
         &mut model,
         &mut tools,
@@ -532,6 +543,19 @@ fn select_fork_history(target_history: Vec<Value>, fork_history: Vec<Value>) -> 
     } else {
         target_history
     }
+}
+
+fn session_history_values(events: Vec<orchestrator_store::SessionEvent>) -> Vec<Value> {
+    events
+        .into_iter()
+        .filter_map(|event| {
+            event
+                .payload
+                .get("item_type")
+                .is_some()
+                .then_some(event.payload)
+        })
+        .collect()
 }
 
 fn prepare_steer_turn_inputs(
@@ -2260,29 +2284,6 @@ fn extract_encrypted_reasoning(raw: &Value) -> Option<String> {
         })
 }
 
-fn open_loop_connection(settings: &AgentSettings) -> Result<Connection> {
-    // ToolManaged roles persist their recoverable session/event history to
-    // FileStore through the runtime binding.  The legacy agent-loop tables
-    // must never become a second on-disk authority or cache for those roles.
-    // The loop still uses its transient SQL-shaped turn machinery until its
-    // in-memory event representation is removed, so use SQLite's process-
-    // local `:memory:` database rather than creating `outputs/agent_loop.sqlite`.
-    if settings.output_mode == OutputMode::ToolManaged {
-        return orchestrator_sql::connect(":memory:");
-    }
-    let db_path = settings
-        .tools
-        .as_ref()
-        .and_then(|tools| tools.db_path.clone())
-        .unwrap_or_else(|| default_project_root().join("outputs/agent_loop.sqlite"));
-    orchestrator_sql::connect(db_path)
-}
-
-fn loop_session_id(settings: &AgentSettings) -> String {
-    let run_id = loop_run_id(settings);
-    format!("{run_id}:{}", settings.role)
-}
-
 fn loop_run_id(settings: &AgentSettings) -> String {
     settings
         .tools
@@ -2673,6 +2674,7 @@ mod tests {
     };
     use crate::web_search::{WebSearchConfig, WebSearchMode};
     use anyhow::{anyhow, Result};
+    use orchestrator_store::{FileStore, FileStoreOptions, RunLocation};
     use serde_json::{json, Value};
     use std::{
         path::{Path, PathBuf},
@@ -2783,6 +2785,7 @@ mod tests {
             tickers: vec!["TQQQ".to_string()],
             output_mode: OutputMode::ToolManaged,
             tool_managed_profile: Some(ToolManagedProfile::ResearchDecision),
+            session_runtime: None,
             index_tool_runtime: None,
             domain_tool_runtime: None,
             llm: RoleLlmSettings {
@@ -2813,6 +2816,23 @@ mod tests {
         }
     }
 
+    fn test_session_runtime() -> agent_loop::FileStoreSessionRuntime {
+        let temp = tempfile::tempdir().unwrap();
+        agent_loop::FileStoreSessionRuntime::create_or_load(
+            FileStore::open(temp.path(), FileStoreOptions::default()).unwrap(),
+            agent_loop::SessionRuntimeSpec {
+                run: RunLocation::new("2026-07-27", "run-test").unwrap(),
+                session_id: "session-test".to_owned(),
+                role: "manager.research".to_owned(),
+                phase: 3,
+                profile: "research_decision".to_owned(),
+                fork: None,
+                created_at: "2026-07-27T00:00:00Z".to_owned(),
+            },
+        )
+        .unwrap()
+    }
+
     #[test]
     fn tool_managed_output_requires_a_profile() {
         let mut settings = base_settings(LlmRoute::Responses);
@@ -2821,6 +2841,8 @@ mod tests {
         assert!(settings.validate_output_mode().is_err());
 
         settings.tool_managed_profile = Some(ToolManagedProfile::ResearchDecision);
+        assert!(settings.validate_output_mode().is_err());
+        settings.session_runtime = Some(test_session_runtime());
         assert!(settings.validate_output_mode().is_ok());
 
         settings.tool_managed_profile = None;
