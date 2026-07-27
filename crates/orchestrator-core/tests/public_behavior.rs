@@ -1,6 +1,5 @@
 use orchestrator_core::{
-    default_project_root, extract_json_artifact, normalize_probability, parse_tickers,
-    replace_placeholders, run_slug,
+    default_project_root, normalize_probability, parse_tickers, replace_placeholders, run_slug,
 };
 use serde_json::json;
 
@@ -13,10 +12,6 @@ fn core_public_helpers_match_python_compatibility_expectations() {
     assert_eq!(
         replace_placeholders("{ticker}:{lang}", &json!({"ticker": "QQQ", "lang": "zh"})),
         "QQQ:zh"
-    );
-    assert_eq!(
-        extract_json_artifact("{\"ok\":true}").unwrap(),
-        json!({"ok": true})
     );
 }
 

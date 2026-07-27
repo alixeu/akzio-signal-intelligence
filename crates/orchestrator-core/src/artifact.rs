@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -669,21 +669,6 @@ fn normalize_research_decision_fields(object: &mut Map<String, Value>) {
     }
 }
 
-pub fn extract_json_artifact(text: &str) -> Result<Value> {
-    const START: &str = "=== ARTIFACT_JSON_START ===";
-    const END: &str = "=== ARTIFACT_JSON_END ===";
-    let candidate = if let Some(start) = text.find(START) {
-        let after = &text[start + START.len()..];
-        let end = after
-            .find(END)
-            .ok_or_else(|| anyhow!("artifact end marker missing"))?;
-        &after[..end]
-    } else {
-        text
-    };
-    serde_json::from_str(candidate.trim()).context("failed to parse artifact JSON")
-}
-
 /// Normalize multi-ticker research envelopes before deserializing into
 /// [`ResearchArtifact`].
 ///
@@ -1174,17 +1159,6 @@ mod tests {
         let error = validate_analyst_ticker_artifact(&artifact).unwrap_err();
 
         assert!(error.contains("duplicate evidence"));
-    }
-
-    #[test]
-    fn parses_marker_wrapped_json() {
-        assert_eq!(
-            extract_json_artifact(
-                "x\n=== ARTIFACT_JSON_START ===\n{\"ok\":true}\n=== ARTIFACT_JSON_END ==="
-            )
-            .unwrap(),
-            json!({"ok": true})
-        );
     }
 
     #[test]

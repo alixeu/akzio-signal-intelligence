@@ -555,7 +555,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         record_runtime_debug_artifact(&mut state, 0, &phase0)?;
         debug!(status = ?state["phase_status"]["0"], "phase 0 fact collection finished");
     }
-    if let Err(error) = inject_phase_summary_reflection(&conn, &mut state, &runtime_config) {
+    if let Err(error) = inject_phase_summary_reflection(&mut state, &runtime_config) {
         tracing::warn!(
             run_id,
             error = %error,
@@ -6190,10 +6190,14 @@ mod tests {
         );
         let store = FileStore::open(directory.path(), FileStoreOptions::default()).unwrap();
         let location = RunLocation::new("2026-07-27", "reflection-current").unwrap();
-        let record = read_learning_record(&store, &location, LearningKind::Reflection, "QQQ").unwrap();
+        let record =
+            read_learning_record(&store, &location, LearningKind::Reflection, "QQQ").unwrap();
         assert_eq!(record.payload["task_id"], 41);
         assert_eq!(record.payload["experience_index_id"], "experience-index");
-        assert!(phase0_reflection_is_completed_in_file_store(&state, &state["reflection_task"]).unwrap());
+        assert!(
+            phase0_reflection_is_completed_in_file_store(&state, &state["reflection_task"])
+                .unwrap()
+        );
     }
 
     #[test]

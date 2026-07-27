@@ -1349,12 +1349,8 @@ pub(crate) fn validate_sqlite_context(
     Ok(())
 }
 
-pub(crate) fn output_mode_for_role(role: &str) -> OutputMode {
-    if role == "manager.research" {
-        OutputMode::ResearchArtifact
-    } else {
-        OutputMode::JsonArtifact
-    }
+pub(crate) fn output_mode_for_role(_role: &str) -> OutputMode {
+    OutputMode::ToolManaged
 }
 
 pub(crate) fn is_critical_role(config: &RuntimeConfig, role: &str) -> bool {

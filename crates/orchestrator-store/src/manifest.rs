@@ -433,8 +433,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        find_run_location, read_run_manifest, write_run_manifest, FinalizedArtifactRef, RunLocation, RunManifest,
-        RunManifestInit,
+        find_run_location, read_run_manifest, write_run_manifest, FinalizedArtifactRef,
+        RunLocation, RunManifest, RunManifestInit,
     };
     use crate::{FileStore, FileStoreOptions};
 

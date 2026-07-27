@@ -1,18 +1,13 @@
 use anyhow::Result;
-use orchestrator_core::{latest_close, MarketRegime};
-use orchestrator_sql::{
-    load_technical_series,
-    memory::{read_prior_memory, PriorMemoryQuery},
-    outcome::track_record,
+use orchestrator_core::MarketRegime;
+use orchestrator_store::{
+    experience_level, read_indexes, FileStore, FileStoreOptions, IndexKind, IndexQuery, IndexScope,
 };
-use rusqlite::Connection;
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
 
 use crate::orchestration::config::{AllocationConfig, RuntimeConfig};
 
 pub(crate) fn inject_phase_summary_reflection(
-    conn: &Connection,
     state: &mut Value,
     config: &RuntimeConfig,
 ) -> Result<()> {
@@ -21,38 +16,81 @@ pub(crate) fn inject_phase_summary_reflection(
     }
 
     let tickers = tickers_from_state(state);
-    let market_regime = market_regime_from_state(conn, state, &config.allocation);
+    let market_regime = market_regime_from_state(state);
+    let store_root = state
+        .get("store_root")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("FileStore experience retrieval requires store_root"))?;
+    let store = FileStore::open(store_root, FileStoreOptions::default())?;
     let mut items_by_ticker = serde_json::Map::new();
     for ticker in &tickers {
-        let result = read_prior_memory(
-            conn,
-            &PriorMemoryQuery {
+        let page = read_indexes(
+            &store,
+            None,
+            &IndexQuery {
+                kind: Some(IndexKind::Experience),
                 ticker: Some(ticker.clone()),
-                market_regime: market_regime.clone(),
-                budget: config.reflection.retrieval,
-                include_body: false,
+                limit: 100,
+                ..Default::default()
             },
         )?;
-        items_by_ticker.insert(ticker.clone(), result);
+        let mut remaining_chars = config.reflection.retrieval.token_budget.saturating_mul(4);
+        let mut items = Vec::new();
+        for index in page.indexes {
+            if index.confidence < config.reflection.retrieval.min_quality
+                || items.len() >= config.reflection.retrieval.max_items
+                || index.summary.len() > remaining_chars
+            {
+                continue;
+            }
+            let scope = IndexScope {
+                kind: index.kind,
+                location: None,
+                index_id: index.index_id.clone(),
+                run_id: index.run_id.clone(),
+                source_run_id: index.source_run_id.clone(),
+                source_phase: index.source_phase,
+                role: index.role.clone(),
+                ticker: index.ticker.clone(),
+                topic_id: index.topic_id.clone(),
+                source_payload_hash: index.source_payload_hash.clone(),
+                authoritative_fields: index.authoritative_fields.clone(),
+                created_at: index.created_at.clone(),
+            };
+            let level = experience_level(&store, &scope)?;
+            remaining_chars = remaining_chars.saturating_sub(index.summary.len());
+            items.push(json!({
+                "index_id": index.index_id,
+                "pattern_key": index.pattern_key,
+                "summary": index.summary,
+                "confidence": index.confidence,
+                "source_phase": index.source_phase,
+                "applies_to_phases": index.applies_to_phases,
+                "experience_level": level,
+                "detail_count": index.detail_count,
+            }));
+        }
+        items_by_ticker.insert(ticker.clone(), json!({"items": items}));
     }
 
-    state["prior_memory"] = json!({
+    state["prior_experience"] = json!({
         "enabled": true,
-        "reflection_version": config.reflection.reflection_version,
-        "promote_mode": config.reflection.promote_mode,
         "budget": {
             "token_budget": config.reflection.retrieval.token_budget,
             "max_items": config.reflection.retrieval.max_items,
             "min_quality": config.reflection.retrieval.min_quality,
         },
         "market_regime": market_regime,
-        "items_by_ticker": items_by_ticker,
+        "indexes_by_ticker": items_by_ticker,
     });
+    // Decision/outcome records are per-run immutable files.  Aggregate score
+    // cataloguing is intentionally not a second mutable authority; callers
+    // can build it through Store Doctor when they need a report.
     state["track_record"] = json!({
-        "aggregate": track_record(conn, None).unwrap_or_else(|_| empty_track_record()),
-        "by_ticker": track_record_by_ticker(conn, &tickers),
+        "aggregate": empty_track_record(),
+        "by_ticker": tickers.into_iter().map(|ticker| (ticker, empty_track_record())).collect::<serde_json::Map<_, _>>(),
     });
-    state["agent_accuracy"] = agent_accuracy(conn).unwrap_or_else(|_| json!({}));
+    state["agent_accuracy"] = json!({});
     Ok(())
 }
 
@@ -78,11 +116,7 @@ fn tickers_from_state(state: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn market_regime_from_state(
-    conn: &Connection,
-    state: &Value,
-    allocation: &AllocationConfig,
-) -> MarketRegime {
+fn market_regime_from_state(state: &Value) -> MarketRegime {
     // Prefer regime already computed downstream (available after phase 3).
     if let Some(regime) = state
         .get("allocation_context")
@@ -104,51 +138,7 @@ fn market_regime_from_state(
         };
     }
 
-    // Fallback: query the latest VIX close from the run database
-    // and classify it using the allocation regime thresholds.
-    let volatility = query_latest_vix_close(conn)
-        .map(|close| classify_vix_regime(close, allocation))
-        .unwrap_or_default();
-    MarketRegime {
-        volatility,
-        ..Default::default()
-    }
-}
-
-fn query_latest_vix_close(conn: &Connection) -> Option<f64> {
-    let rows = load_technical_series(conn, "VIX", "1d").ok()?;
-    latest_close(&rows).map(|(_, close)| close)
-}
-
-/// Classify a VIX close into a regime label using the configured thresholds.
-fn classify_vix_regime(vix_close: f64, allocation: &AllocationConfig) -> String {
-    let labels = &allocation.regime_labels;
-    let thresholds = &allocation.regime_thresholds;
-    if labels.is_empty() {
-        return String::new();
-    }
-    // thresholds divide the range into labels.len() buckets.
-    // e.g. thresholds [15, 20, 30] + labels [risk_on, normal, elevated, defensive]
-    //      vix < 15 -> risk_on, < 20 -> normal, < 30 -> elevated, >= 30 -> defensive
-    let bucket = thresholds
-        .iter()
-        .position(|&threshold| vix_close < threshold)
-        .unwrap_or(labels.len() - 1)
-        .min(labels.len() - 1);
-    labels[bucket].clone()
-}
-
-fn track_record_by_ticker(conn: &Connection, tickers: &[String]) -> Value {
-    Value::Object(
-        tickers
-            .iter()
-            .map(|ticker| {
-                let value =
-                    track_record(conn, Some(ticker)).unwrap_or_else(|_| empty_track_record());
-                (ticker.clone(), value)
-            })
-            .collect(),
-    )
+    MarketRegime::default()
 }
 
 fn empty_track_record() -> Value {
@@ -160,128 +150,36 @@ fn empty_track_record() -> Value {
     })
 }
 
-fn agent_accuracy(conn: &Connection) -> Result<Value> {
-    orchestrator_sql::ensure_schema(conn)?;
-    let mut stmt = conn.prepare(
-        r#"
-        SELECT p.agent_probabilities_json, o.direction_correct, o.probability_error
-        FROM outcomes o
-        JOIN predictions p ON p.id = o.prediction_id
-        ORDER BY o.scored_at DESC
-        LIMIT 500
-        "#,
-    )?;
-    let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, i64>(1)? != 0,
-            row.get::<_, f64>(2)?,
-        ))
-    })?;
-
-    let mut stats: BTreeMap<String, RoleAccuracy> = BTreeMap::new();
-    for row in rows {
-        let (raw, direction_correct, probability_error) = row?;
-        for role in roles_from_agent_probabilities(&raw) {
-            stats
-                .entry(role)
-                .or_default()
-                .record(direction_correct, probability_error);
-        }
-    }
-
-    Ok(Value::Object(
-        stats
-            .into_iter()
-            .map(|(role, stat)| (role, stat.value()))
-            .collect(),
-    ))
-}
-
-fn roles_from_agent_probabilities(raw: &str) -> Vec<String> {
-    match serde_json::from_str::<Value>(raw).unwrap_or(Value::Null) {
-        Value::Object(map) => map.keys().cloned().collect(),
-        Value::Array(items) => items
-            .iter()
-            .filter_map(|item| {
-                item.get("role")
-                    .or_else(|| item.get("agent"))
-                    .and_then(Value::as_str)
-                    .map(ToString::to_string)
-            })
-            .collect(),
-        _ => Vec::new(),
-    }
-}
-
-#[derive(Debug, Default)]
-struct RoleAccuracy {
-    total: usize,
-    correct: usize,
-    probability_error_sum: f64,
-    brier_sum: f64,
-}
-
-impl RoleAccuracy {
-    fn record(&mut self, direction_correct: bool, probability_error: f64) {
-        self.total += 1;
-        if direction_correct {
-            self.correct += 1;
-        }
-        self.probability_error_sum += probability_error;
-        self.brier_sum += probability_error * probability_error;
-    }
-
-    fn value(self) -> Value {
-        if self.total == 0 {
-            return json!({
-                "total_predictions": 0,
-                "direction_accuracy": 0.0,
-                "mean_probability_error": 0.0,
-                "mean_brier_score": 0.0,
-            });
-        }
-        let total = self.total as f64;
-        json!({
-            "total_predictions": self.total,
-            "direction_accuracy": self.correct as f64 / total,
-            "mean_probability_error": self.probability_error_sum / total,
-            "mean_brier_score": self.brier_sum / total,
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::orchestration::config::RuntimeConfig;
     use orchestrator_core::RetrievalBudget;
-    use orchestrator_sql::{
-        candidate::{insert_candidate_experience, pending_candidates, CandidateExperienceInput},
-        connect,
-        memory::{promote_candidate_to_memory, PromoteMemoryInput},
-        outcome::{upsert_outcome, OutcomeInput},
-        prediction::{upsert_prediction, PredictionInput},
+    use orchestrator_store::{
+        deterministic_experience_index_id, record_experience_case, FileStore, FileStoreOptions,
+        IndexKind, IndexScope, RecordExperienceCaseInput,
     };
     use serde_json::json;
 
     #[test]
     fn injects_empty_structures_when_enabled_without_data() {
         let temp = tempfile::tempdir().unwrap();
-        let conn = connect(temp.path().join("phase_summary-empty.sqlite")).unwrap();
-        let mut state = json!({"ticker":"QQQ", "tickers":["QQQ"]});
+        let mut state = json!({
+            "ticker":"QQQ",
+            "tickers":["QQQ"],
+            "store_root": temp.path(),
+        });
         inject_phase_summary_reflection(
-            &conn,
             &mut state,
             &test_runtime_config(true, RetrievalBudget::default()),
         )
         .unwrap();
 
-        assert!(state.get("prior_memory").is_some());
+        assert!(state.get("prior_experience").is_some());
         assert!(state.get("track_record").is_some());
         assert!(state.get("agent_accuracy").is_some());
         assert_eq!(
-            state["prior_memory"]["items_by_ticker"]["QQQ"]["items"]
+            state["prior_experience"]["indexes_by_ticker"]["QQQ"]["items"]
                 .as_array()
                 .unwrap()
                 .len(),
@@ -292,16 +190,14 @@ mod tests {
     #[test]
     fn disabled_config_does_not_inject_reflection_state() {
         let temp = tempfile::tempdir().unwrap();
-        let conn = connect(temp.path().join("phase_summary-disabled.sqlite")).unwrap();
-        let mut state = json!({"ticker":"QQQ", "tickers":["QQQ"]});
+        let mut state = json!({"ticker":"QQQ", "tickers":["QQQ"], "store_root": temp.path()});
         inject_phase_summary_reflection(
-            &conn,
             &mut state,
             &test_runtime_config(false, RetrievalBudget::default()),
         )
         .unwrap();
 
-        assert!(state.get("prior_memory").is_none());
+        assert!(state.get("prior_experience").is_none());
         assert!(state.get("track_record").is_none());
         assert!(state.get("agent_accuracy").is_none());
     }
@@ -309,12 +205,11 @@ mod tests {
     #[test]
     fn retrieval_budget_caps_injected_prior_memory() {
         let temp = tempfile::tempdir().unwrap();
-        let conn = connect(temp.path().join("phase_summary-budget.sqlite")).unwrap();
-        seed_memory(&conn, "run-1", 0.9);
-        seed_memory(&conn, "run-2", 0.8);
-        let mut state = json!({"ticker":"QQQ", "tickers":["QQQ"]});
+        let store = FileStore::open(temp.path(), FileStoreOptions::default()).unwrap();
+        seed_experience(&store, "run-1", "pattern-one", 0.9);
+        seed_experience(&store, "run-2", "pattern-two", 0.8);
+        let mut state = json!({"ticker":"QQQ", "tickers":["QQQ"], "store_root": temp.path()});
         inject_phase_summary_reflection(
-            &conn,
             &mut state,
             &test_runtime_config(
                 true,
@@ -327,97 +222,57 @@ mod tests {
         )
         .unwrap();
 
-        let items = state["prior_memory"]["items_by_ticker"]["QQQ"]["items"]
+        let items = state["prior_experience"]["indexes_by_ticker"]["QQQ"]["items"]
             .as_array()
             .unwrap();
         assert_eq!(items.len(), 1);
     }
 
     #[test]
-    fn injects_track_record_and_agent_accuracy() {
+    fn source_regime_is_reused_without_database_read() {
         let temp = tempfile::tempdir().unwrap();
-        let conn = connect(temp.path().join("phase_summary-accuracy.sqlite")).unwrap();
-        let prediction_id = upsert_prediction(
-            &conn,
-            &PredictionInput {
-                run_id: "run-1".to_string(),
-                ticker: "QQQ".to_string(),
-                prediction_date: "2026-01-01".to_string(),
-                long_probability: 0.7,
-                short_probability: 0.3,
-                rating: "long".to_string(),
-                window_days: 5,
-                market_regime_json: json!({}),
-                agent_probabilities_json: json!({"analyst.technical":{"long_probability":0.7}}),
-                weighted_base_probability: None,
-            },
-        )
-        .unwrap();
-        upsert_outcome(
-            &conn,
-            &OutcomeInput {
-                prediction_id,
-                run_id: "run-1".to_string(),
-                ticker: "QQQ".to_string(),
-                prediction_date: "2026-01-01".to_string(),
-                outcome_date: "2026-01-06".to_string(),
-                window_days: 5,
-                baseline_close: 100.0,
-                outcome_close: 110.0,
-                actual_return: 0.1,
-                direction_correct: true,
-                probability_error: -0.3,
-            },
-        )
-        .unwrap();
-        let mut state = json!({"ticker":"QQQ", "tickers":["QQQ"]});
+        let mut state = json!({
+            "ticker":"QQQ",
+            "tickers":["QQQ"],
+            "store_root": temp.path(),
+            "allocation_context":{"vix":{"regime":"defensive"}},
+        });
         inject_phase_summary_reflection(
-            &conn,
             &mut state,
             &test_runtime_config(true, RetrievalBudget::default()),
         )
         .unwrap();
-
         assert_eq!(
-            state["track_record"]["by_ticker"]["QQQ"]["total_predictions"],
-            1
-        );
-        assert_eq!(
-            state["agent_accuracy"]["analyst.technical"]["total_predictions"],
-            1
+            state["prior_experience"]["market_regime"]["volatility"],
+            "defensive"
         );
     }
 
-    fn seed_memory(conn: &Connection, run_id: &str, quality_score: f64) {
-        insert_candidate_experience(
-            conn,
-            &CandidateExperienceInput {
-                scope: "ticker".to_string(),
-                scope_value: "QQQ".to_string(),
-                experience_type: "calibration".to_string(),
-                market_regime_json: json!({}),
-                finding: format!("pattern {run_id}"),
-                recommendation: "adjust".to_string(),
-                evidence_json: json!([]),
-                counter_evidence_json: json!([]),
-                metrics_json: json!({}),
-                sample_count: 8,
-                sample_run_ids_json: json!([run_id]),
-                confidence: 0.8,
-                effect_size: 0.2,
-                distiller_version: "v1".to_string(),
-                reflection_version: "v1".to_string(),
-                source_window: run_id.to_string(),
-            },
-        )
-        .unwrap();
-        let candidate = pending_candidates(conn).unwrap().pop().unwrap();
-        promote_candidate_to_memory(
-            conn,
-            &PromoteMemoryInput {
-                candidate,
-                quality_score,
-                recent_success_rate: 0.8,
+    fn seed_experience(store: &FileStore, run_id: &str, pattern_key: &str, confidence: f64) {
+        let scope = IndexScope {
+            kind: IndexKind::Experience,
+            location: None,
+            index_id: deterministic_experience_index_id(pattern_key, Some("QQQ"), 0).unwrap(),
+            run_id: "reflection-run".to_owned(),
+            source_run_id: Some(run_id.to_owned()),
+            source_phase: 0,
+            role: "reflector.historical".to_owned(),
+            ticker: Some("QQQ".to_owned()),
+            topic_id: None,
+            source_payload_hash: format!("payload-{run_id}"),
+            authoritative_fields: Default::default(),
+            created_at: "2026-07-27T00:00:00Z".to_owned(),
+        };
+        record_experience_case(
+            store,
+            RecordExperienceCaseInput {
+                scope,
+                pattern_key: pattern_key.to_owned(),
+                summary: format!("summary {pattern_key}"),
+                confidence,
+                applies_to_phases: vec![1],
+                detail: format!("case {run_id}"),
+                source_refs: vec![],
             },
         )
         .unwrap();

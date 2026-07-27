@@ -476,70 +476,6 @@ where
             continue;
         }
 
-        if let Some(text) = last_assistant_message_text(turn) {
-            if let Err(error) = validate_retrieval_policy(turn, &config.retrieval_policy, &text) {
-                if !retrieval_retry_queued {
-                    retrieval_retry_queued = true;
-                    queue_artifact_retry(turn, &format!("retrieval policy: {error}"));
-                    persist_turn(conn, turn, &config.truncation)?;
-                    continue;
-                }
-                bail!("retrieval policy remained invalid after one repair retry: {error}");
-            }
-            if turn.role.starts_with("analyst.") {
-                if let Err(error) =
-                    analyst_final_artifact_validation_error(&turn.role, &turn_tickers(turn), &text)
-                {
-                    warn!(role = turn.role, error = %error, "analyst final artifact rejected");
-                    queue_artifact_retry(turn, &error);
-                    persist_turn(conn, turn, &config.truncation)?;
-                    continue;
-                }
-            }
-            if seed_packet_role(&turn.role) && text.trim() != "准备完毕" {
-                if let Err(error) = seed_packet_validation_error(&turn.role, &text) {
-                    queue_artifact_retry(turn, &error);
-                    persist_turn(conn, turn, &config.truncation)?;
-                    continue;
-                }
-            }
-            if turn.role == "manager.research" {
-                if let Err(error) = research_artifact_validation_error(&turn_tickers(turn), &text) {
-                    queue_artifact_retry(turn, &error);
-                    persist_turn(conn, turn, &config.truncation)?;
-                    continue;
-                }
-            }
-            if turn.role == "trader" {
-                if let Err(error) = trade_intent_validation_error(&text) {
-                    queue_artifact_retry(turn, &error);
-                    persist_turn(conn, turn, &config.truncation)?;
-                    continue;
-                }
-            }
-            if turn.role.starts_with("risk.") {
-                if let Err(error) = risk_constraints_validation_error(&turn.role, &text) {
-                    queue_artifact_retry(turn, &error);
-                    persist_turn(conn, turn, &config.truncation)?;
-                    continue;
-                }
-            }
-            if interaction_packet_role(&turn.role) {
-                if let Err(error) = interaction_packet_validation_error(&turn.role, &text) {
-                    queue_artifact_retry(turn, &error);
-                    persist_turn(conn, turn, &config.truncation)?;
-                    continue;
-                }
-            }
-            if turn.role == "mediator.topic_controller" {
-                if let Err(error) = controller_packet_validation_error(&text) {
-                    queue_artifact_retry(turn, &error);
-                    persist_turn(conn, turn, &config.truncation)?;
-                    continue;
-                }
-            }
-        }
-
         if let Some(item_id) = stream_result.last_assistant_message_id.clone() {
             aggregate_result.last_assistant_message_id = Some(item_id.clone());
             mark_last_assistant_message_as_final(conn, turn, &item_id, sink, &config.truncation)
@@ -2187,8 +2123,6 @@ fn analyst_final_artifact_validation_error(
     text: &str,
 ) -> std::result::Result<(), String> {
     let value = extract_json_value(text).map_err(|error| error.to_string())?;
-    let value =
-        crate::normalize_analyst_artifact_value(value).map_err(|error| format!("{error:#}"))?;
     if value.get("id").and_then(Value::as_str) != Some(role)
         || value.get("role").and_then(Value::as_str) != Some(role)
     {
@@ -3696,18 +3630,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(model.seen_inputs[1].items.iter().any(|item| {
-            item.item_type == TurnItemType::UserMessage
-                && item
-                    .content_text
-                    .contains("Previous output failed validation or was incomplete")
-                && item
-                    .content_text
-                    .contains("Expected role: analyst.news_macro")
-                && item.content_text.contains("Expected tickers: QQQ")
-                && item.content_text.contains("Validation errors:")
-        }));
-        assert!(model.seen_inputs[1].available_tools.is_empty());
+        assert_eq!(model.seen_inputs.len(), 1);
     }
 
     #[test]
