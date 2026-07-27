@@ -1,5 +1,4 @@
-//! The explicit source-of-truth registry used while workflow roles migrate
-//! from legacy persistence to the file store.
+//! The explicit source-of-truth registry for FileStore ToolManaged roles.
 //!
 //! A role/profile pair has exactly one [`ArtifactAuthority`]. Callers must
 //! resolve the pair before reading or writing an artifact; they must never
@@ -50,13 +49,10 @@ impl ToolManagedProfile {
     }
 }
 
-/// The one and only persistence authority for a role/profile pair during the
-/// staged migration. `Legacy` is intentionally transitional and will be
-/// removed with the SQLite implementation.
+/// The one and only persistence authority for every role/profile pair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ArtifactAuthority {
-    Legacy,
     FileStore,
 }
 
@@ -249,7 +245,7 @@ impl AuthorityRegistry {
         })
     }
 
-    pub fn builtin_legacy() -> Self {
+    pub fn builtin() -> Self {
         let registrations = vec![
             registration(
                 "reflector.historical",
@@ -529,24 +525,6 @@ impl AuthorityRegistry {
         Ok(self.registration(role_id, profile)?.allows_tool(tool_name))
     }
 
-    /// The only supported transition. A migrated role can never silently move
-    /// back to legacy persistence in a later process.
-    pub fn migrate_to_file_store(
-        &mut self,
-        role_id: &str,
-        profile: ToolManagedProfile,
-    ) -> Result<(), AuthorityRegistryError> {
-        let registration = self
-            .registrations
-            .get_mut(&RoleProfileKey::new(role_id, profile))
-            .ok_or_else(|| AuthorityRegistryError::MissingRegistration {
-                role_id: role_id.to_string(),
-                profile,
-            })?;
-        registration.authority = ArtifactAuthority::FileStore;
-        Ok(())
-    }
-
     pub fn registrations(&self) -> impl Iterator<Item = &AuthorityRegistration> {
         self.registrations.values()
     }
@@ -584,7 +562,7 @@ fn registration(
     AuthorityRegistration::new(
         role_id,
         profile,
-        ArtifactAuthority::Legacy,
+        ArtifactAuthority::FileStore,
         1,
         1,
         unit_planner,
@@ -712,19 +690,19 @@ mod tests {
 
     #[test]
     fn builtin_registry_covers_each_current_agent_role_profile_exactly_once() {
-        let registry = AuthorityRegistry::builtin_legacy();
+        let registry = AuthorityRegistry::builtin();
         assert_eq!(registry.registrations().count(), 17);
         assert_eq!(
             registry
                 .authority_for("analyst.technical", ToolManagedProfile::AnalystReport)
                 .unwrap(),
-            ArtifactAuthority::Legacy
+            ArtifactAuthority::FileStore
         );
         assert_eq!(
             registry
                 .authority_for("mediator.topic", ToolManagedProfile::ResearcherWarmup)
                 .unwrap(),
-            ArtifactAuthority::Legacy
+            ArtifactAuthority::FileStore
         );
         assert!(registry
             .registration("researcher.bull.initial", ToolManagedProfile::DebateSeed)
@@ -738,32 +716,11 @@ mod tests {
     }
 
     #[test]
-    fn migration_is_exact_and_never_changes_a_sibling_profile() {
-        let mut registry = AuthorityRegistry::builtin_legacy();
-        registry
-            .migrate_to_file_store("mediator.topic", ToolManagedProfile::TopicGeneration)
-            .unwrap();
-
-        assert_eq!(
-            registry
-                .authority_for("mediator.topic", ToolManagedProfile::TopicGeneration)
-                .unwrap(),
-            ArtifactAuthority::FileStore
-        );
-        assert_eq!(
-            registry
-                .authority_for("mediator.topic", ToolManagedProfile::ResearcherWarmup)
-                .unwrap(),
-            ArtifactAuthority::Legacy
-        );
-    }
-
-    #[test]
     fn registry_rejects_duplicate_exact_mapping() {
         let registration = AuthorityRegistration::new(
             "analyst.test",
             ToolManagedProfile::AnalystReport,
-            ArtifactAuthority::Legacy,
+            ArtifactAuthority::FileStore,
             1,
             1,
             UnitPlanner::AnalystTicker,
@@ -783,7 +740,7 @@ mod tests {
         let err = AuthorityRegistration::new(
             "analyst.test",
             ToolManagedProfile::AnalystReport,
-            ArtifactAuthority::Legacy,
+            ArtifactAuthority::FileStore,
             1,
             1,
             UnitPlanner::AnalystTicker,
@@ -795,7 +752,7 @@ mod tests {
         let err = AuthorityRegistration::new(
             "analyst.test",
             ToolManagedProfile::AnalystReport,
-            ArtifactAuthority::Legacy,
+            ArtifactAuthority::FileStore,
             1,
             1,
             UnitPlanner::AnalystTicker,
@@ -813,7 +770,7 @@ mod tests {
         let registration = AuthorityRegistration {
             role_id: "analyst.test".to_string(),
             profile: ToolManagedProfile::AnalystReport,
-            authority: ArtifactAuthority::Legacy,
+            authority: ArtifactAuthority::FileStore,
             profile_version: 1,
             builder_version: 1,
             unit_planner: UnitPlanner::AnalystTicker,
@@ -831,7 +788,7 @@ mod tests {
 
     #[test]
     fn snapshot_is_stable_and_verifies_after_round_trip() {
-        let registry = AuthorityRegistry::builtin_legacy();
+        let registry = AuthorityRegistry::builtin();
         let first = registry.snapshot();
         let encoded = serde_json::to_string(&first).unwrap();
         let decoded: AuthorityRegistrySnapshot = serde_json::from_str(&encoded).unwrap();
@@ -847,8 +804,8 @@ mod tests {
 
     #[test]
     fn snapshot_hash_detects_authority_drift() {
-        let mut snapshot = AuthorityRegistry::builtin_legacy().snapshot();
-        snapshot.registrations[0].authority = ArtifactAuthority::FileStore;
+        let mut snapshot = AuthorityRegistry::builtin().snapshot();
+        snapshot.registrations[0].profile_version = 2;
         let err = snapshot.verify().unwrap_err();
         assert!(matches!(
             err,
@@ -858,7 +815,7 @@ mod tests {
 
     #[test]
     fn tool_permission_is_exact() {
-        let registry = AuthorityRegistry::builtin_legacy();
+        let registry = AuthorityRegistry::builtin();
         assert!(registry
             .tool_is_allowed(
                 "trader",

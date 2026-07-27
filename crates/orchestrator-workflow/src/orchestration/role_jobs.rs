@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use futures::{stream, StreamExt};
-use orchestrator_core::{default_project_root, ArtifactAuthority, ToolManagedProfile};
+use orchestrator_core::{default_project_root, ToolManagedProfile};
 use orchestrator_llm::{
     agent_loop::{
         FileStoreSessionRuntime, ModelStreamResult, RetrievalPolicy, SessionRuntimeSpec, TokenUsage,
@@ -21,8 +21,7 @@ use std::{
 use tokio::time;
 use tracing::{debug, warn};
 
-use super::config::{output_mode_for_role, prompt_version, RetrievalConfig, RuntimeConfig};
-use super::degraded::role_artifact_or_degraded;
+use super::config::{prompt_version, RetrievalConfig, RuntimeConfig};
 use super::domain_runtime::{file_store_domain_runtime, FileStoreDomainRuntimePlan};
 use super::index_runtime::{file_store_index_tool_runtime, FileStoreIndexRuntimePlan};
 use super::lifecycle::tickers_from_state;
@@ -294,78 +293,69 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
         index_tool_runtime,
         domain_tool_runtime,
         file_store_input,
-    ) = if let Some(profile) = candidate_tool_managed_profile {
-        match config.authority_registry.authority_for(role, profile)? {
-            // A legacy role must not carry any ToolManaged profile into the
-            // LLM settings: that would create an invalid mixed authority
-            // contract even before its first tool call.
-            ArtifactAuthority::Legacy => (output_mode_for_role(role), None, None, None, None),
-            ArtifactAuthority::FileStore => {
-                let registration = config.authority_registry.registration(role, profile)?;
-                let store_root = state
-                    .get("store_root")
-                    .and_then(Value::as_str)
-                    .context("store_root missing for migrated ToolManaged domain role")?;
-                let visible = visible_domain_evidence_refs(&state, role, &tickers, mock);
-                if profile == ToolManagedProfile::HistoricalReflection {
-                    let binding = file_store_historical_reflection_index_runtime(
-                        Path::new(store_root),
-                        &state,
-                        registration.profile_version,
-                        registration.builder_version,
-                    )?;
-                    (
-                        OutputMode::ToolManaged,
-                        Some(profile),
-                        Some(binding),
-                        None,
-                        None,
-                    )
-                } else {
-                    let binding = file_store_domain_runtime(
-                        Path::new(store_root),
-                        &state,
-                        FileStoreDomainRuntimePlan {
-                            role: role.to_owned(),
-                            phase,
-                            profile,
-                            profile_version: registration.profile_version,
-                            builder_version: registration.builder_version,
-                            tickers: tickers.clone(),
-                            visible_evidence_refs: visible,
-                            topic_id: topic_id.map(ToOwned::to_owned),
-                            side: phase2_side_for_role(role).map(ToOwned::to_owned),
-                            round: round.and_then(|value| u32::try_from(value).ok()),
-                            visible_claims: visible_phase2_claims(&state, topic_id),
-                            fork: phase2_fork_reference(&state, role, topic_id),
-                            trade_candidate_action: trade_candidate_action(&state, &tickers),
-                            portfolio_rating: portfolio_rating(&state, &tickers),
-                            portfolio_current_weight: portfolio_current_weight(&state, &tickers),
-                        },
-                    )?;
-                    let input = if profile == ToolManagedProfile::AnalystReport && !mock {
-                        Some(file_store_input_from_state(&state)?)
-                    } else {
-                        None
-                    };
-                    (
-                        OutputMode::ToolManaged,
-                        Some(profile),
-                        None,
-                        Some(binding),
-                        input,
-                    )
-                }
-            }
+    ) = {
+        let profile = candidate_tool_managed_profile
+            .with_context(|| format!("missing ToolManaged profile for role={role} kind={kind}"))?;
+        let registration = config.authority_registry.registration(role, profile)?;
+        let store_root = state
+            .get("store_root")
+            .and_then(Value::as_str)
+            .context("store_root missing for migrated ToolManaged domain role")?;
+        let visible = visible_domain_evidence_refs(&state, role, &tickers, mock);
+        if profile == ToolManagedProfile::HistoricalReflection {
+            let binding = file_store_historical_reflection_index_runtime(
+                Path::new(store_root),
+                &state,
+                registration.profile_version,
+                registration.builder_version,
+            )?;
+            (
+                OutputMode::ToolManaged,
+                Some(profile),
+                Some(binding),
+                None,
+                None,
+            )
+        } else {
+            let binding = file_store_domain_runtime(
+                Path::new(store_root),
+                &state,
+                FileStoreDomainRuntimePlan {
+                    role: role.to_owned(),
+                    phase,
+                    profile,
+                    profile_version: registration.profile_version,
+                    builder_version: registration.builder_version,
+                    tickers: tickers.clone(),
+                    visible_evidence_refs: visible,
+                    topic_id: topic_id.map(ToOwned::to_owned),
+                    side: phase2_side_for_role(role).map(ToOwned::to_owned),
+                    round: round.and_then(|value| u32::try_from(value).ok()),
+                    visible_claims: visible_phase2_claims(&state, topic_id),
+                    fork: phase2_fork_reference(&state, role, topic_id),
+                    trade_candidate_action: trade_candidate_action(&state, &tickers),
+                    portfolio_rating: portfolio_rating(&state, &tickers),
+                    portfolio_current_weight: portfolio_current_weight(&state, &tickers),
+                },
+            )?;
+            let input = if profile == ToolManagedProfile::AnalystReport && !mock {
+                Some(file_store_input_from_state(&state)?)
+            } else {
+                None
+            };
+            (
+                OutputMode::ToolManaged,
+                Some(profile),
+                None,
+                Some(binding),
+                input,
+            )
         }
-    } else {
-        (output_mode_for_role(role), None, None, None, None)
     };
     // A migrated role may read only its Rust-projected FileStore indexes and
     // snapshots.  Clearing the legacy connection here turns a missing
     // FileStore projection into a hard tool error instead of an accidental
     // SQLite fallback.
-    let file_store_authoritative = tool_managed_profile.is_some();
     let session_runtime = tool_managed_profile
         .map(|profile| {
             file_store_session_runtime(
@@ -402,14 +392,6 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
         reasoning_effort_override: reasoning_effort_override.map(ToString::to_string),
         tools: ExternalToolConfig {
             project_root: default_project_root(),
-            db_path: (!file_store_authoritative)
-                .then(|| {
-                    state
-                        .get("db_path")
-                        .and_then(Value::as_str)
-                        .map(PathBuf::from)
-                })
-                .flatten(),
             run_dir: state
                 .get("run_dir")
                 .and_then(Value::as_str)
@@ -441,15 +423,6 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
             } else {
                 None
             },
-            phase_summary_index: state.get("phase_summary_memory").map(|raw| {
-                std::sync::Arc::new(orchestrator_sql::PhaseSummaryMemoryIndex::from_state_value(
-                    raw,
-                ))
-            }),
-            phase_summary_gate: state
-                .get("run_id")
-                .and_then(Value::as_str)
-                .and_then(orchestrator_sql::phase_summary_gate),
             file_store_input,
             file_store_reflection_source: file_store_reflection_source(
                 &state,
@@ -907,12 +880,17 @@ pub(crate) async fn run_role_jobs(
 pub(crate) async fn run_single_role_job(
     input: RoleRun<'_>,
     timeout_sec: u64,
-    config: &RuntimeConfig,
+    _config: &RuntimeConfig,
     state_for_degraded: &mut Value,
-    conn: &rusqlite::Connection,
+    _conn: &rusqlite::Connection,
 ) -> Result<Value> {
-    let result = run_single_role_job_result(input, timeout_sec, state_for_degraded, conn).await?;
-    role_artifact_or_degraded(state_for_degraded, config, result)
+    let result = run_single_role_job_result(input, timeout_sec, state_for_degraded, _conn).await?;
+    result.artifact.with_context(|| {
+        format!(
+            "ToolManaged role ended without terminal finalize: {}",
+            result.error.as_deref().unwrap_or("unknown role failure")
+        )
+    })
 }
 
 /// Execute one role and preserve the raw result for a FileStore-authoritative
@@ -923,16 +901,10 @@ pub(crate) async fn run_single_role_job_result(
     input: RoleRun<'_>,
     timeout_sec: u64,
     state_for_metrics: &mut Value,
-    conn: &rusqlite::Connection,
+    _conn: &rusqlite::Connection,
 ) -> Result<RoleJobResult> {
     let job = prepare_role_job(input)?;
-    let file_store_authoritative = job.tool_managed_profile.is_some();
     let result = run_role_job_with_timeout(job, timeout_sec).await;
-    // This is currently a no-op, but keep it structurally impossible for a
-    // migrated role to acquire an SQLite side effect when metrics return.
-    if !file_store_authoritative {
-        persist_prompt_metric(conn, &result);
-    }
     record_role_job_metrics(state_for_metrics, &result);
     Ok(result)
 }
@@ -940,9 +912,9 @@ pub(crate) async fn run_single_role_job_result(
 pub(crate) async fn run_single_steer_role_job(
     input: SteerRoleRun<'_>,
     timeout_sec: u64,
-    config: &RuntimeConfig,
+    _config: &RuntimeConfig,
     state_for_degraded: &mut Value,
-    conn: &rusqlite::Connection,
+    _conn: &rusqlite::Connection,
 ) -> Result<Value> {
     let job = prepare_role_job(RoleRun {
         state: input.state,
@@ -957,7 +929,6 @@ pub(crate) async fn run_single_steer_role_job(
         config: input.config,
         prompt_path: input.prompt_path,
     })?;
-    let file_store_authoritative = job.tool_managed_profile.is_some();
     let result = run_steer_role_job_with_timeout(
         job,
         input.session_id,
@@ -966,22 +937,16 @@ pub(crate) async fn run_single_steer_role_job(
         timeout_sec,
     )
     .await;
-    if !file_store_authoritative {
-        persist_prompt_metric(conn, &result);
-    }
     record_role_job_metrics(state_for_degraded, &result);
     // A migrated Phase 2 unit has exactly one authority: its terminal typed
     // FileStore artifact.  Never route a missing terminal through the legacy
     // JSON degraded helper, which would create a second persistence path.
-    if file_store_authoritative {
-        return result.artifact.with_context(|| {
-            format!(
-                "FileStore-authoritative steer role ended without terminal finalize: {}",
-                result.error.as_deref().unwrap_or("unknown role failure")
-            )
-        });
-    }
-    role_artifact_or_degraded(state_for_degraded, config, result)
+    result.artifact.with_context(|| {
+        format!(
+            "ToolManaged steer role ended without terminal finalize: {}",
+            result.error.as_deref().unwrap_or("unknown role failure")
+        )
+    })
 }
 
 pub(crate) fn record_role_job_metrics(state: &mut Value, result: &RoleJobResult) {

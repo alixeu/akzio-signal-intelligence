@@ -7,11 +7,11 @@ use orchestrator_core::{
 };
 use orchestrator_sql::{
     archive::{upsert_run_archive, RunArchiveInput},
-    clear_agent_loop_history, connect, pending_reflection_tasks, persist_reflection_artifact,
+    clear_agent_loop_history, connect, pending_reflection_tasks,
     prediction::{upsert_prediction, PredictionInput},
-    score_mature_predictions, set_reflection_task_status, set_run_current_phase, update_run_status,
-    upsert_decision_snapshot, write_run_record, DecisionSnapshotInput, ReflectionThresholds,
-    RunRecordInput, AGGREGATE_TICKER,
+    score_mature_predictions, set_run_current_phase, update_run_status, upsert_decision_snapshot,
+    write_run_record, DecisionSnapshotInput, ReflectionThresholds, RunRecordInput,
+    AGGREGATE_TICKER,
 };
 use orchestrator_store::{
     content_hash, read_learning_record, read_run_manifest, write_learning_record,
@@ -37,7 +37,7 @@ use crate::orchestration::artifact::{
     persist_message, persist_message_with_topic, reducer_brief_md, topic_id_from_topic,
     topics_from_generation_artifact,
 };
-use crate::orchestration::config::{is_critical_role, validate_sqlite_context, RuntimeConfig};
+use crate::orchestration::config::{is_critical_role, RuntimeConfig};
 use crate::orchestration::degraded::{record_degraded_role, role_artifact_or_degraded};
 use crate::orchestration::domain_runtime::{
     finalize_degraded_analyst_report, finalize_degraded_portfolio_decision,
@@ -417,14 +417,6 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             current_date: &date,
         },
     )?;
-    if !args.mock && runtime_config.strict_sqlite && args.to_phase >= 1 {
-        debug!(
-            required_contexts = ?runtime_config.required_contexts,
-            "validating strict sqlite contexts"
-        );
-        validate_sqlite_context(&conn, &runtime_config)?;
-    }
-
     // Each completed business phase is synchronously summarized by phase_summary before
     // the next phase starts, so downstream roles always see a complete index.
     let mut compress_jobs: Vec<(i64, std::thread::JoinHandle<Result<CompressJobResult>>)> =
@@ -454,7 +446,6 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             {
                 let tool_config = orchestrator_llm::tools::ExternalToolConfig {
                     project_root: default_project_root(),
-                    db_path: Some(db_path.clone()),
                     run_dir: run_dir.clone(),
                     run_id: Some(run_id.clone()),
                     phase: Some(0),
@@ -466,8 +457,6 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
                     alpaca_market_data: false,
                     alpaca_api_key: runtime_config.alpaca_api_key.clone(),
                     alpaca_api_secret: runtime_config.alpaca_api_secret.clone(),
-                    phase_summary_index: None,
-                    phase_summary_gate: None,
                     file_store_input: None,
                     file_store_reflection_source: None,
                 };
@@ -929,10 +918,6 @@ async fn run_phase0_reflections(
     reasoning_effort_override: Option<&str>,
     config: &RuntimeConfig,
 ) -> Result<Value> {
-    let reflection_authority = config.authority_registry.authority_for(
-        "reflector.historical",
-        ToolManagedProfile::HistoricalReflection,
-    )?;
     let tasks = state
         .pointer("/phase0/tasks")
         .and_then(Value::as_array)
@@ -951,9 +936,7 @@ async fn run_phase0_reflections(
             .get("task_id")
             .and_then(Value::as_i64)
             .context("phase0 task_id is required")?;
-        if reflection_authority == ArtifactAuthority::Legacy {
-            set_reflection_task_status(conn, task_id, "running", None)?;
-        } else if phase0_reflection_is_completed_in_file_store(state, task)? {
+        if phase0_reflection_is_completed_in_file_store(state, task)? {
             continue;
         }
         let mut task_state = state.clone();
@@ -989,18 +972,8 @@ async fn run_phase0_reflections(
             .and_then(|value| value.parse::<i64>().ok())
             .context("reflector result is missing task id")?;
         if let Some(artifact) = result.artifact {
-            let persisted = if reflection_authority == ArtifactAuthority::FileStore {
-                persist_file_store_reflection_record(state, task_id, &artifact)
-                    .map(|count| json!({"experience_count": count, "persistence": "file_store"}))
-            } else {
-                persist_reflection_artifact(
-                    conn,
-                    task_id,
-                    &config.reflection.reflection_version,
-                    &artifact,
-                )
-                .map(|count| json!({"experience_count": count, "persistence": "legacy"}))
-            };
+            let persisted = persist_file_store_reflection_record(state, task_id, &artifact)
+                .map(|count| json!({"experience_count": count, "persistence": "file_store"}));
             match persisted {
                 Ok(summary) => {
                     processed += 1;
@@ -1013,14 +986,6 @@ async fn run_phase0_reflections(
                 }
                 Err(error) => {
                     failed += 1;
-                    if reflection_authority == ArtifactAuthority::Legacy {
-                        set_reflection_task_status(
-                            conn,
-                            task_id,
-                            "failed",
-                            Some(&error.to_string()),
-                        )?;
-                    }
                     audit.push(json!({
                         "task_id": task_id,
                         "status": "failed_validation",
@@ -1033,9 +998,6 @@ async fn run_phase0_reflections(
             let message = result
                 .error
                 .unwrap_or_else(|| "reflector returned no artifact".to_string());
-            if reflection_authority == ArtifactAuthority::Legacy {
-                set_reflection_task_status(conn, task_id, "failed", Some(&message))?;
-            }
             audit.push(json!({
                 "task_id": task_id,
                 "status": "failed",
@@ -6025,11 +5987,6 @@ async fn load_phase7_account_weights(state: &mut Value, config: &RuntimeConfig) 
         .collect::<Vec<_>>();
     let tool_config = orchestrator_llm::tools::ExternalToolConfig {
         project_root: orchestrator_core::default_project_root(),
-        db_path: state
-            .get("db_path")
-            .and_then(Value::as_str)
-            .filter(|path| !path.trim().is_empty())
-            .map(std::path::PathBuf::from),
         run_id: state
             .get("run_id")
             .and_then(Value::as_str)

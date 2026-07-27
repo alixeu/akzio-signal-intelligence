@@ -1,15 +1,14 @@
 use anyhow::{bail, Context, Result};
 use orchestrator_core::{
     config_bool, config_get, config_int, config_str, config_strings, project_path, AgentRegistry,
-    AuthorityRegistry, RetrievalBudget, ToolManagedProfile,
+    AuthorityRegistry, RetrievalBudget,
 };
 use orchestrator_llm::{
     llm_judge::JudgeConfig,
     truncation::TruncationConfig,
     web_search::{validate_web_search_runtime_config, WebSearchConfig, WebSearchConfigOverride},
-    OutputMode, RoleLlmSettings,
+    RoleLlmSettings,
 };
-use orchestrator_sql::context_count;
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -31,8 +30,6 @@ pub(crate) struct RuntimeConfig {
     pub web_search: BTreeMap<String, WebSearchConfig>,
     pub truncation: TruncationConfig,
     pub judge: JudgeConfig,
-    pub strict_sqlite: bool,
-    pub required_contexts: Vec<String>,
     pub prompts: PromptConfig,
     pub workflow: WorkflowConfig,
     pub allocation: AllocationConfig,
@@ -130,7 +127,6 @@ pub(crate) struct AllocationConfig {
 pub(crate) struct ReflectionConfig {
     pub enabled: bool,
     pub reflection_version: String,
-    pub promote_mode: String,
     pub retrieval: RetrievalBudget,
     pub task_limit: usize,
     pub parallelism: usize,
@@ -557,72 +553,7 @@ impl RuntimeConfig {
                 .values()
                 .map(|plugin| (&plugin.manifest, plugin.role_path())),
         );
-        // The registry is the sole authority switch: once FileStore is
-        // selected, callers must not fall back to the former SQLite path.
-        // Phase 1 captures the Technical/Jin10 inputs into the run-local
-        // FileStore snapshot before either analyst starts; Phase 3 consumes
-        // only finalized upstream projections.  Those profiles are therefore
-        // ready to be FileStore-authoritative by default.
-        let mut authority_registry = AuthorityRegistry::builtin_legacy();
-        // Historical reflection writes only unified Experience Index/Detail
-        // plus its run-local learning marker.  It never persists a JSON
-        // bundle, candidate, promotion, or memory row after this boundary.
-        authority_registry
-            .migrate_to_file_store(
-                "reflector.historical",
-                ToolManagedProfile::HistoricalReflection,
-            )
-            .expect("builtin HistoricalReflection registration must exist");
-        authority_registry
-            .migrate_to_file_store("compressor.phase_summary", ToolManagedProfile::PhaseSummary)
-            .expect("builtin Phase Summary registration must exist");
-        for role in ["analyst.technical", "analyst.news_macro"] {
-            authority_registry
-                .migrate_to_file_store(role, ToolManagedProfile::AnalystReport)
-                .expect("builtin AnalystReport registration must exist");
-        }
-        authority_registry
-            .migrate_to_file_store("manager.research", ToolManagedProfile::ResearchDecision)
-            .expect("builtin ResearchDecision registration must exist");
-        // Phase 2 is a closed ToolManaged sub-workflow: warm-up, topic
-        // generation, debate packets, and controller packets all finalize to
-        // FileStore before the Rust reducer consumes their projections.
-        for (role, profile) in [
-            ("mediator.topic", ToolManagedProfile::ResearcherWarmup),
-            ("mediator.topic", ToolManagedProfile::TopicGeneration),
-            ("researcher.bull.initial", ToolManagedProfile::DebateSeed),
-            ("researcher.bear.initial", ToolManagedProfile::DebateSeed),
-            (
-                "researcher.bull.interaction",
-                ToolManagedProfile::DebateResponse,
-            ),
-            (
-                "researcher.bear.interaction",
-                ToolManagedProfile::DebateResponse,
-            ),
-            (
-                "mediator.topic_controller",
-                ToolManagedProfile::TopicControl,
-            ),
-        ] {
-            authority_registry
-                .migrate_to_file_store(role, profile)
-                .expect("builtin Phase 2 ToolManaged registration must exist");
-        }
-        // Phase 4--6 are also one-way FileStore authority boundaries.  Their
-        // callers build one ticker-scoped unit at a time, so the portfolio
-        // manager can never accidentally obtain a multi-ticker Draft.
-        for (role, profile) in [
-            ("trader", ToolManagedProfile::TradeIntent),
-            ("risk.aggressive", ToolManagedProfile::RiskReview),
-            ("risk.neutral", ToolManagedProfile::RiskReview),
-            ("risk.conservative", ToolManagedProfile::RiskReview),
-            ("portfolio.manager", ToolManagedProfile::PortfolioDecision),
-        ] {
-            authority_registry
-                .migrate_to_file_store(role, profile)
-                .expect("builtin Phase 4--6 ToolManaged registration must exist");
-        }
+        let authority_registry = AuthorityRegistry::builtin();
         let alpaca_api_key = config_str(config, "orchestrator.alpaca.api_key", "")
             .trim()
             .to_string();
@@ -636,12 +567,6 @@ impl RuntimeConfig {
             web_search,
             truncation,
             judge,
-            strict_sqlite: config_bool(config, "orchestrator.data_source.strict_sqlite", true),
-            required_contexts: config_strings(
-                config,
-                "orchestrator.data_source.required_contexts",
-                &["technical"],
-            ),
             prompts: prompts_config,
             workflow,
             allocation: AllocationConfig::from_value(config),
@@ -1086,7 +1011,6 @@ impl ReflectionConfig {
                 "orchestrator.reflection.reflection_version",
                 "v1",
             ),
-            promote_mode: config_str(config, "orchestrator.reflection.promote_mode", "auto"),
             task_limit: config_int(config, "orchestrator.reflection.task_limit", 10).max(1)
                 as usize,
             parallelism: config_int(config, "orchestrator.reflection.parallelism", 2).max(1)
@@ -1328,29 +1252,6 @@ pub(crate) fn prompt_path(config: &Value, key: &str, default: &str) -> Result<Pa
         );
     }
     Ok(path)
-}
-
-pub(crate) fn validate_sqlite_context(
-    conn: &rusqlite::Connection,
-    config: &RuntimeConfig,
-) -> Result<()> {
-    for context in &config.required_contexts {
-        if matches!(
-            context.as_str(),
-            "technical" | "technical-context" | "technical_context" | "jin10" | "jin10-context"
-        ) {
-            continue;
-        }
-        let count = context_count(conn, context)?;
-        if count == 0 {
-            bail!("strict SQLite data source requires context {context:?} before live run");
-        }
-    }
-    Ok(())
-}
-
-pub(crate) fn output_mode_for_role(_role: &str) -> OutputMode {
-    OutputMode::ToolManaged
 }
 
 pub(crate) fn is_critical_role(config: &RuntimeConfig, role: &str) -> bool {
