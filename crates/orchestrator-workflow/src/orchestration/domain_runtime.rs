@@ -396,6 +396,63 @@ pub(crate) fn finalize_degraded_risk_review(
         .context("degraded FileStore risk finalizer did not return an artifact")
 }
 
+/// Typed degraded output for a migrated Portfolio Manager.  The failure is
+/// still a completed canonical unit, with a hard wait and a traceable runtime
+/// control; it must not manufacture a legacy Phase 6 JSON artifact.
+pub(crate) fn finalize_degraded_portfolio_decision(
+    store_root: &Path,
+    state: &Value,
+    mut plan: FileStoreDomainRuntimePlan,
+    failure: &str,
+) -> Result<Value> {
+    if plan.profile != ToolManagedProfile::PortfolioDecision || plan.tickers.len() != 1 {
+        bail!("degraded FileStore portfolio writer requires one PortfolioDecision ticker unit")
+    }
+    let ticker = plan.tickers[0].clone();
+    let evidence_ref = format!("runtime:degraded:portfolio:{ticker}");
+    plan.visible_evidence_refs.insert(evidence_ref.clone());
+    let current_weight = plan
+        .portfolio_current_weight
+        .context("degraded FileStore portfolio writer requires current weight")?;
+    // Phase 6 may not replace the Phase 3 thesis, even while degraded.
+    let investment_thesis = state
+        .get("research_plan")
+        .and_then(|plan| plan.get("per_ticker"))
+        .and_then(Value::as_object)
+        .and_then(|items| items.get(&ticker))
+        .and_then(|item| item.get("plan"))
+        .or_else(|| state.get("research_plan").and_then(|plan| plan.get("plan")))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("Phase 3 thesis unavailable during degraded portfolio review.");
+    let binding = file_store_domain_runtime(store_root, state, plan)?;
+    binding.execute(
+        "set_portfolio_asset_decision",
+        json!({
+            "direction_constraint":"unchanged", "execution_status":"wait",
+            "max_target_weight":current_weight, "max_weight_delta":0.0,
+            "execution_summary":format!("Portfolio review degraded: {failure}"),
+            "investment_thesis":investment_thesis,
+            "target_price":null, "horizon":"immediate",
+            "rationale":format!("Portfolio Manager failed before terminal finalize: {failure}")
+        }),
+    )?;
+    binding.execute(
+        "append_binding_risk_control",
+        json!({
+            "control":{
+                "control":"Do not change the position until portfolio review is completed.",
+                "source_refs":[evidence_ref]
+            }
+        }),
+    )?;
+    binding
+        .execute("finalize_portfolio_decision", json!({}))?
+        .get("artifact")
+        .cloned()
+        .context("degraded FileStore portfolio finalizer did not return an artifact")
+}
+
 /// FileStore-backed evidence visibility.  The model cannot call this type:
 /// `ProjectToolRuntime` records a read only after the reader returns a
 /// structured result, and domain writers query the same session immediately.

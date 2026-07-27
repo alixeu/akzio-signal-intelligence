@@ -14,8 +14,9 @@ use orchestrator_sql::{
     RunRecordInput, AGGREGATE_TICKER,
 };
 use orchestrator_store::{
-    content_hash, read_run_manifest, write_run_manifest, FileStore, FileStoreOptions, RunLocation,
-    RunManifest, RunManifestInit,
+    content_hash, read_learning_record, read_run_manifest, write_learning_record,
+    write_run_manifest, FileStore, FileStoreOptions, LearningKind, LearningRecord, RunLocation,
+    RunManifest, RunManifestInit, LEARNING_RECORD_SCHEMA_VERSION,
 };
 use serde_json::{json, Value};
 use std::{
@@ -39,8 +40,9 @@ use crate::orchestration::artifact::{
 use crate::orchestration::config::{is_critical_role, validate_sqlite_context, RuntimeConfig};
 use crate::orchestration::degraded::{record_degraded_role, role_artifact_or_degraded};
 use crate::orchestration::domain_runtime::{
-    finalize_degraded_analyst_report, finalize_degraded_research_decision,
-    finalize_degraded_risk_review, finalize_degraded_trade_intent, FileStoreDomainRuntimePlan,
+    finalize_degraded_analyst_report, finalize_degraded_portfolio_decision,
+    finalize_degraded_research_decision, finalize_degraded_risk_review,
+    finalize_degraded_trade_intent, FileStoreDomainRuntimePlan,
 };
 use crate::orchestration::input_snapshot_runtime::{
     capture_phase1_file_store_inputs, phase1_input_sources,
@@ -467,6 +469,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
                     phase_summary_index: None,
                     phase_summary_gate: None,
                     file_store_input: None,
+                    file_store_reflection_source: None,
                 };
                 match orchestrator_llm::tools::alpaca::get_history(&tool_config).await {
                     Ok(history) => json!({
@@ -727,7 +730,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             .await?;
             "done"
         } else {
-            run_phase5_skipped(&mut conn, &mut state)?;
+            run_phase5_skipped(&mut conn, &mut state, &runtime_config)?;
             "skipped"
         };
         set_phase_status(&mut state, 5, phase5_status);
@@ -761,7 +764,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             .await?;
             "done"
         } else {
-            run_phase6_derived(&mut conn, &mut state)?;
+            run_phase6_derived(&mut conn, &mut state, &runtime_config)?;
             "derived"
         };
         set_phase_status(&mut state, 6, phase6_status);
@@ -926,6 +929,10 @@ async fn run_phase0_reflections(
     reasoning_effort_override: Option<&str>,
     config: &RuntimeConfig,
 ) -> Result<Value> {
+    let reflection_authority = config.authority_registry.authority_for(
+        "reflector.historical",
+        ToolManagedProfile::HistoricalReflection,
+    )?;
     let tasks = state
         .pointer("/phase0/tasks")
         .and_then(Value::as_array)
@@ -944,7 +951,11 @@ async fn run_phase0_reflections(
             .get("task_id")
             .and_then(Value::as_i64)
             .context("phase0 task_id is required")?;
-        set_reflection_task_status(conn, task_id, "running", None)?;
+        if reflection_authority == ArtifactAuthority::Legacy {
+            set_reflection_task_status(conn, task_id, "running", None)?;
+        } else if phase0_reflection_is_completed_in_file_store(state, task)? {
+            continue;
+        }
         let mut task_state = state.clone();
         task_state["reflection_task"] = task.clone();
         task_state["phase0"]["tasks"] = json!([task]);
@@ -978,23 +989,38 @@ async fn run_phase0_reflections(
             .and_then(|value| value.parse::<i64>().ok())
             .context("reflector result is missing task id")?;
         if let Some(artifact) = result.artifact {
-            match persist_reflection_artifact(
-                conn,
-                task_id,
-                &config.reflection.reflection_version,
-                &artifact,
-            ) {
-                Ok(experience_count) => {
+            let persisted = if reflection_authority == ArtifactAuthority::FileStore {
+                persist_file_store_reflection_record(state, task_id, &artifact)
+                    .map(|count| json!({"experience_count": count, "persistence": "file_store"}))
+            } else {
+                persist_reflection_artifact(
+                    conn,
+                    task_id,
+                    &config.reflection.reflection_version,
+                    &artifact,
+                )
+                .map(|count| json!({"experience_count": count, "persistence": "legacy"}))
+            };
+            match persisted {
+                Ok(summary) => {
                     processed += 1;
                     audit.push(json!({
                         "task_id": task_id,
                         "status": "completed",
-                        "experience_count": experience_count
+                        "experience_count": summary["experience_count"],
+                        "persistence": summary["persistence"]
                     }));
                 }
                 Err(error) => {
                     failed += 1;
-                    set_reflection_task_status(conn, task_id, "failed", Some(&error.to_string()))?;
+                    if reflection_authority == ArtifactAuthority::Legacy {
+                        set_reflection_task_status(
+                            conn,
+                            task_id,
+                            "failed",
+                            Some(&error.to_string()),
+                        )?;
+                    }
                     audit.push(json!({
                         "task_id": task_id,
                         "status": "failed_validation",
@@ -1007,7 +1033,9 @@ async fn run_phase0_reflections(
             let message = result
                 .error
                 .unwrap_or_else(|| "reflector returned no artifact".to_string());
-            set_reflection_task_status(conn, task_id, "failed", Some(&message))?;
+            if reflection_authority == ArtifactAuthority::Legacy {
+                set_reflection_task_status(conn, task_id, "failed", Some(&message))?;
+            }
             audit.push(json!({
                 "task_id": task_id,
                 "status": "failed",
@@ -1021,6 +1049,101 @@ async fn run_phase0_reflections(
         "failed": failed,
         "tasks": audit
     }))
+}
+
+fn phase0_reflection_is_completed_in_file_store(state: &Value, task: &Value) -> Result<bool> {
+    let task_id = task
+        .get("task_id")
+        .and_then(Value::as_i64)
+        .context("phase0 task_id is required")?;
+    let ticker = task
+        .get("ticker")
+        .and_then(Value::as_str)
+        .context("phase0 task ticker is required")?;
+    let store_root = state
+        .get("store_root")
+        .and_then(Value::as_str)
+        .context("store_root is required for FileStore reflection")?;
+    let location = RunLocation::new(
+        state
+            .get("current_date")
+            .and_then(Value::as_str)
+            .context("current_date is required for FileStore reflection")?,
+        state
+            .get("run_id")
+            .and_then(Value::as_str)
+            .context("run_id is required for FileStore reflection")?,
+    )?;
+    let store = FileStore::open(store_root, FileStoreOptions::default())?;
+    match read_learning_record(&store, &location, LearningKind::Reflection, ticker) {
+        Ok(record) => Ok(record.payload.get("task_id").and_then(Value::as_i64) == Some(task_id)),
+        Err(orchestrator_store::StoreError::Io { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn persist_file_store_reflection_record(
+    state: &Value,
+    task_id: i64,
+    artifact: &Value,
+) -> Result<usize> {
+    let task = state
+        .get("reflection_task")
+        .and_then(Value::as_object)
+        .context("FileStore reflection task missing from state")?;
+    let source_run_id = task
+        .get("source_run_id")
+        .and_then(Value::as_str)
+        .context("FileStore reflection source_run_id is required")?;
+    let ticker = task
+        .get("ticker")
+        .and_then(Value::as_str)
+        .context("FileStore reflection ticker is required")?;
+    if artifact.get("kind").and_then(Value::as_str) != Some("experience")
+        || artifact.get("role").and_then(Value::as_str) != Some("reflector.historical")
+        || artifact.get("source_run_id").and_then(Value::as_str) != Some(source_run_id)
+        || artifact.get("ticker").and_then(Value::as_str) != Some(ticker)
+    {
+        bail!("terminal HistoricalReflection artifact does not match Rust-owned task scope");
+    }
+    let store_root = state
+        .get("store_root")
+        .and_then(Value::as_str)
+        .context("store_root is required for FileStore reflection")?;
+    let location = RunLocation::new(
+        state
+            .get("current_date")
+            .and_then(Value::as_str)
+            .context("current_date is required for FileStore reflection")?,
+        state
+            .get("run_id")
+            .and_then(Value::as_str)
+            .context("run_id is required for FileStore reflection")?,
+    )?;
+    let store = FileStore::open(store_root, FileStoreOptions::default())?;
+    let record = LearningRecord {
+        schema_version: LEARNING_RECORD_SCHEMA_VERSION,
+        kind: LearningKind::Reflection,
+        run_id: location.run_id.clone(),
+        ticker: ticker.to_owned(),
+        source_run_id: Some(source_run_id.to_owned()),
+        payload: json!({
+            "task_id": task_id,
+            "source_run_id": source_run_id,
+            "reflection_task": task,
+            "experience_index_id": artifact.get("index_id").cloned().unwrap_or(Value::Null),
+            "experience_level": "derived_from_historical_case_count",
+            "artifact": artifact,
+        }),
+        created_at: Utc::now().to_rfc3339(),
+        content_hash: String::new(),
+    };
+    write_learning_record(&store, &location, LearningKind::Reflection, record)?;
+    Ok(1)
 }
 
 fn persist_run_outputs(run_dir: &Path, state_path: &Path, state: &Value) -> Result<()> {
@@ -4692,6 +4815,19 @@ async fn run_file_store_phase4(
             .get("intent")
             .cloned()
             .context("FileStore trade artifact missing intent")?;
+        // Debug retention is a local append-only diagnostic artifact, not a
+        // second business authority.  The canonical unit above is already
+        // finalized atomically before this optional record is written.
+        record_prompt_runtime_debug_artifact(
+            state,
+            4,
+            "trader",
+            config
+                .prompts
+                .path_for("trader")
+                .context("missing prompt path for trader")?,
+            &artifact,
+        )?;
         projected.insert(ticker, intent);
     }
     let first = projected.values().next().cloned().unwrap_or_else(|| {
@@ -4702,7 +4838,7 @@ async fn run_file_store_phase4(
     });
     let mut state_projection = first;
     state_projection["per_ticker"] = Value::Object(projected);
-    state_projection["authority"] = json!("file_store");
+    state["phase4_authority"] = json!("file_store");
     state["trader_investment_plan"] = state_projection;
     Ok(())
 }
@@ -4820,6 +4956,16 @@ fn run_file_store_phase4_derived(state: &mut Value, config: &RuntimeConfig) -> R
             },
             "workflow_policy_not_triggered",
         )?;
+        record_prompt_runtime_debug_artifact(
+            state,
+            4,
+            "trader",
+            config
+                .prompts
+                .path_for("trader")
+                .context("missing prompt path for trader")?,
+            &artifact,
+        )?;
         projected.insert(ticker, artifact["intent"].clone());
     }
     let mut projection = projected
@@ -4828,7 +4974,7 @@ fn run_file_store_phase4_derived(state: &mut Value, config: &RuntimeConfig) -> R
         .cloned()
         .unwrap_or_else(|| json!({"action":"Hold","position_size_pct_max":0.0}));
     projection["per_ticker"] = Value::Object(projected);
-    projection["authority"] = json!("file_store");
+    state["phase4_authority"] = json!("file_store");
     state["trader_investment_plan"] = projection;
     Ok(())
 }
@@ -4840,12 +4986,7 @@ async fn run_phase5(
     reasoning_effort_override: Option<&str>,
     config: &RuntimeConfig,
 ) -> Result<()> {
-    if ["risk.aggressive", "risk.neutral", "risk.conservative"]
-        .into_iter()
-        .all(|role| {
-            profile_uses_file_store(config, role, ToolManagedProfile::RiskReview).unwrap_or(false)
-        })
-    {
+    if phase5_uses_file_store(config)? {
         return run_file_store_phase5(
             state,
             model_override,
@@ -4911,6 +5052,24 @@ async fn run_phase5(
         )?;
     }
     Ok(())
+}
+
+/// Phase 5 is one logical risk review.  A partial authority migration would
+/// let a FileStore reviewer and a SQLite reviewer influence the same reducer,
+/// which is a dual-authority fallback in disguise.  Reject it instead.
+fn phase5_uses_file_store(config: &RuntimeConfig) -> Result<bool> {
+    let roles = ["risk.aggressive", "risk.neutral", "risk.conservative"];
+    let migrated = roles
+        .into_iter()
+        .map(|role| profile_uses_file_store(config, role, ToolManagedProfile::RiskReview))
+        .collect::<Result<Vec<_>>>()?;
+    if migrated.iter().all(|value| *value) {
+        Ok(true)
+    } else if migrated.iter().all(|value| !*value) {
+        Ok(false)
+    } else {
+        bail!("Phase 5 RiskReview authority must be all FileStore or all Legacy")
+    }
 }
 
 async fn run_file_store_phase5(
@@ -5003,7 +5162,14 @@ async fn run_file_store_phase5(
     Ok(())
 }
 
-fn run_phase5_skipped(conn: &mut rusqlite::Connection, state: &mut Value) -> Result<()> {
+fn run_phase5_skipped(
+    conn: &mut rusqlite::Connection,
+    state: &mut Value,
+    config: &RuntimeConfig,
+) -> Result<()> {
+    if phase5_uses_file_store(config)? {
+        return run_file_store_phase5_skipped(state, config);
+    }
     let mut artifact = json!({
         "id": "risk.review",
         "role": "risk.review",
@@ -5028,6 +5194,63 @@ fn run_phase5_skipped(conn: &mut rusqlite::Connection, state: &mut Value) -> Res
     Ok(())
 }
 
+/// A policy-skipped FileStore phase is still represented by terminal typed
+/// RiskReview artifacts.  This gives downstream Phase 6 an honest hard-zero
+/// constraint and avoids reviving the former SQLite skipped-message path.
+fn run_file_store_phase5_skipped(state: &mut Value, config: &RuntimeConfig) -> Result<()> {
+    let store_root = state
+        .get("store_root")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .context("store_root missing for migrated Phase 5 RiskReview")?;
+    let mut history = Vec::new();
+    for (round, role) in ["risk.aggressive", "risk.neutral", "risk.conservative"]
+        .into_iter()
+        .enumerate()
+    {
+        let registration = config
+            .authority_registry
+            .registration(role, ToolManagedProfile::RiskReview)?;
+        for ticker in tickers_from_state(state) {
+            let mut ticker_state = state.clone();
+            ticker_state["ticker"] = json!(ticker);
+            ticker_state["tickers"] = json!([ticker]);
+            let artifact = finalize_degraded_risk_review(
+                &store_root,
+                &ticker_state,
+                FileStoreDomainRuntimePlan {
+                    role: role.to_owned(),
+                    phase: 5,
+                    profile: ToolManagedProfile::RiskReview,
+                    profile_version: registration.profile_version,
+                    builder_version: registration.builder_version,
+                    tickers: vec![ticker.clone()],
+                    visible_evidence_refs: BTreeSet::new(),
+                    topic_id: None,
+                    side: None,
+                    round: Some((round + 1) as u32),
+                    visible_claims: BTreeSet::new(),
+                    fork: None,
+                    trade_candidate_action: None,
+                    portfolio_rating: None,
+                    portfolio_current_weight: None,
+                },
+                "workflow_policy_not_triggered",
+            )?;
+            history.push(json!({
+                "role":role, "phase":5, "kind":"risk_argument", "round":round + 1,
+                "ticker":ticker, "artifact":artifact["constraints"],
+                "artifact_ref":artifact.get("artifact_id"), "status":"skipped"
+            }));
+        }
+    }
+    state["risk_debate_state"] = json!({
+        "history":history, "authority":"file_store", "status":"skipped",
+        "reason":"workflow_policy_not_triggered"
+    });
+    Ok(())
+}
+
 async fn run_phase6(
     conn: &mut rusqlite::Connection,
     state: &mut Value,
@@ -5035,6 +5258,20 @@ async fn run_phase6(
     reasoning_effort_override: Option<&str>,
     config: &RuntimeConfig,
 ) -> Result<()> {
+    if profile_uses_file_store(
+        config,
+        "portfolio.manager",
+        ToolManagedProfile::PortfolioDecision,
+    )? {
+        return run_file_store_phase6(
+            state,
+            model_override,
+            reasoning_effort_override,
+            config,
+            conn,
+        )
+        .await;
+    }
     let mut artifact = run_single_role_job(
         RoleRun {
             state: state.clone(),
@@ -5068,7 +5305,18 @@ async fn run_phase6(
     Ok(())
 }
 
-fn run_phase6_derived(conn: &mut rusqlite::Connection, state: &mut Value) -> Result<()> {
+fn run_phase6_derived(
+    conn: &mut rusqlite::Connection,
+    state: &mut Value,
+    config: &RuntimeConfig,
+) -> Result<()> {
+    if profile_uses_file_store(
+        config,
+        "portfolio.manager",
+        ToolManagedProfile::PortfolioDecision,
+    )? {
+        return run_file_store_phase6_derived(state, config);
+    }
     let research = state.get("research_plan").unwrap_or(&Value::Null);
     let trader = state.get("trader_investment_plan").unwrap_or(&Value::Null);
     let artifact = json!({
@@ -5097,6 +5345,197 @@ fn run_phase6_derived(conn: &mut rusqlite::Connection, state: &mut Value) -> Res
     persist_artifact(conn, state, 6, "portfolio.manager", artifact.clone())?;
     state["final_trade_decision"] = artifact;
     Ok(())
+}
+
+/// Phase 6 has one strictly ticker-scoped FileStore unit per investable asset.
+/// The aggregate below is only a transient Rust projection for allocation and
+/// reports; canonical PortfolioDecision artifacts remain the authority.
+async fn run_file_store_phase6(
+    state: &mut Value,
+    model_override: Option<&str>,
+    reasoning_effort_override: Option<&str>,
+    config: &RuntimeConfig,
+    conn: &rusqlite::Connection,
+) -> Result<()> {
+    let registration = config
+        .authority_registry
+        .registration("portfolio.manager", ToolManagedProfile::PortfolioDecision)?;
+    let store_root = state
+        .get("store_root")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .context("store_root missing for migrated Phase 6 PortfolioDecision")?;
+    let mut artifacts = Vec::new();
+    for ticker in portfolio_assets_from_state(state) {
+        let mut ticker_state = state.clone();
+        ticker_state["ticker"] = json!(ticker);
+        ticker_state["tickers"] = json!([ticker]);
+        let result = run_single_role_job_result(
+            RoleRun {
+                state: ticker_state.clone(),
+                role: "portfolio.manager",
+                phase: 6,
+                kind: "artifact",
+                round: None,
+                topic_id: None,
+                mock: is_mock(state),
+                model_override,
+                reasoning_effort_override,
+                config,
+                prompt_path: Some(
+                    config
+                        .prompts
+                        .path_for("portfolio.manager")
+                        .context("missing prompt path for portfolio.manager")?,
+                ),
+            },
+            config.workflow.agent_timeout_sec,
+            state,
+            conn,
+        )
+        .await?;
+        let plan = FileStoreDomainRuntimePlan {
+            role: "portfolio.manager".to_owned(),
+            phase: 6,
+            profile: ToolManagedProfile::PortfolioDecision,
+            profile_version: registration.profile_version,
+            builder_version: registration.builder_version,
+            tickers: vec![ticker.clone()],
+            visible_evidence_refs: BTreeSet::new(),
+            topic_id: None,
+            side: None,
+            round: None,
+            visible_claims: BTreeSet::new(),
+            fork: None,
+            trade_candidate_action: None,
+            portfolio_rating: portfolio_rating_for_ticker(state, &ticker),
+            portfolio_current_weight: Some(runtime_current_weight(state, &ticker)),
+        };
+        let artifact = match result.artifact {
+            Some(artifact) => artifact,
+            None => {
+                let failure = result
+                    .error
+                    .as_deref()
+                    .unwrap_or("portfolio manager failed before terminal finalize");
+                record_degraded_role(state, &result, failure);
+                finalize_degraded_portfolio_decision(&store_root, &ticker_state, plan, failure)?
+            }
+        };
+        artifacts.push(artifact);
+    }
+    let projection = project_file_store_portfolio_decisions(artifacts)?;
+    record_market_truth_check(state, "final_trade_decision", &projection);
+    state["final_trade_decision"] = projection;
+    state["phase6_authority"] = json!("file_store");
+    Ok(())
+}
+
+fn run_file_store_phase6_derived(state: &mut Value, config: &RuntimeConfig) -> Result<()> {
+    let registration = config
+        .authority_registry
+        .registration("portfolio.manager", ToolManagedProfile::PortfolioDecision)?;
+    let store_root = state
+        .get("store_root")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .context("store_root missing for migrated Phase 6 PortfolioDecision")?;
+    let mut artifacts = Vec::new();
+    for ticker in portfolio_assets_from_state(state) {
+        let mut ticker_state = state.clone();
+        ticker_state["ticker"] = json!(ticker);
+        ticker_state["tickers"] = json!([ticker]);
+        artifacts.push(finalize_degraded_portfolio_decision(
+            &store_root,
+            &ticker_state,
+            FileStoreDomainRuntimePlan {
+                role: "portfolio.manager".to_owned(),
+                phase: 6,
+                profile: ToolManagedProfile::PortfolioDecision,
+                profile_version: registration.profile_version,
+                builder_version: registration.builder_version,
+                tickers: vec![ticker.clone()],
+                visible_evidence_refs: BTreeSet::new(),
+                topic_id: None,
+                side: None,
+                round: None,
+                visible_claims: BTreeSet::new(),
+                fork: None,
+                trade_candidate_action: None,
+                portfolio_rating: portfolio_rating_for_ticker(state, &ticker),
+                portfolio_current_weight: Some(runtime_current_weight(state, &ticker)),
+            },
+            "workflow_policy_not_triggered",
+        )?);
+    }
+    let projection = project_file_store_portfolio_decisions(artifacts)?;
+    record_market_truth_check(state, "final_trade_decision", &projection);
+    state["final_trade_decision"] = projection;
+    state["phase6_authority"] = json!("file_store");
+    Ok(())
+}
+
+fn portfolio_assets_from_state(state: &Value) -> Vec<String> {
+    let assets = state
+        .get("investable_assets")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|ticker| !ticker.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    if assets.is_empty() {
+        tickers_from_state(state)
+    } else {
+        assets
+    }
+}
+
+fn portfolio_rating_for_ticker(state: &Value, ticker: &str) -> Option<String> {
+    state
+        .get("research_plan")
+        .and_then(|plan| plan.get("per_ticker"))
+        .and_then(Value::as_object)
+        .and_then(|items| items.get(ticker))
+        .and_then(|item| item.get("rating"))
+        .or_else(|| {
+            state
+                .get("research_plan")
+                .and_then(|plan| plan.get("rating"))
+        })
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+fn project_file_store_portfolio_decisions(artifacts: Vec<Value>) -> Result<Value> {
+    let mut aggregate: Option<Value> = None;
+    let mut per_asset = serde_json::Map::new();
+    for artifact in artifacts {
+        let ticker = artifact
+            .get("ticker")
+            .and_then(Value::as_str)
+            .context("FileStore PortfolioDecision artifact missing ticker")?;
+        let decision = artifact
+            .get("decision")
+            .cloned()
+            .context("FileStore PortfolioDecision artifact missing decision")?;
+        let constraint = decision
+            .get("per_asset")
+            .and_then(Value::as_object)
+            .and_then(|assets| assets.get(ticker))
+            .cloned()
+            .context("FileStore PortfolioDecision missing its ticker constraint")?;
+        if aggregate.is_none() {
+            aggregate = Some(decision);
+        }
+        per_asset.insert(ticker.to_owned(), constraint);
+    }
+    let mut aggregate =
+        aggregate.context("Phase 6 has no FileStore PortfolioDecision artifacts")?;
+    aggregate["per_asset"] = Value::Object(per_asset);
+    Ok(aggregate)
 }
 
 /// Phase 6 owns semantic limits, not account mechanics.  Runtime supplies the
@@ -5182,27 +5621,45 @@ fn stamp_phase6_execution_constraints(state: &Value, artifact: &mut Value) {
                 max_target_weight = max_target_weight.min(current_weight);
                 max_weight_delta = max_weight_delta.min(current_weight - max_target_weight);
             }
-            let control_names = raw
+            let supplied_controls = raw
                 .get("binding_risk_controls")
                 .and_then(Value::as_array)
                 .map(|controls| {
                     controls
                         .iter()
-                        .filter_map(Value::as_str)
-                        .map(ToString::to_string)
+                        .filter_map(|control| {
+                            if let Some(name) = control.as_str() {
+                                Some(json!({
+                                    "control": name,
+                                    "source_refs": default_control_refs.clone(),
+                                }))
+                            } else {
+                                let name = control.get("control")?.as_str()?.trim();
+                                let refs = control
+                                    .get("source_refs")?
+                                    .as_array()?
+                                    .iter()
+                                    .filter_map(Value::as_str)
+                                    .map(ToOwned::to_owned)
+                                    .collect::<Vec<_>>();
+                                (!name.is_empty() && !refs.is_empty())
+                                    .then(|| json!({"control":name, "source_refs":refs}))
+                            }
+                        })
                         .collect::<Vec<_>>()
                 })
                 .filter(|controls| !controls.is_empty())
-                .unwrap_or_else(|| top_controls.clone());
-            let controls = control_names
-                .into_iter()
-                .map(|control| {
-                    json!({
-                        "control": control,
-                        "source_refs": default_control_refs.clone(),
-                    })
-                })
-                .collect::<Vec<_>>();
+                .unwrap_or_else(|| {
+                    top_controls
+                        .iter()
+                        .map(|control| {
+                            json!({
+                                "control": control,
+                                "source_refs": default_control_refs.clone(),
+                            })
+                        })
+                        .collect()
+                });
             (
                 ticker.clone(),
                 json!({
@@ -5211,7 +5668,7 @@ fn stamp_phase6_execution_constraints(state: &Value, artifact: &mut Value) {
                     "current_weight": current_weight,
                     "max_target_weight": max_target_weight,
                     "max_weight_delta": max_weight_delta,
-                    "binding_risk_controls": controls
+                    "binding_risk_controls": supplied_controls
                 }),
             )
         })
@@ -5706,6 +6163,40 @@ mod tests {
     }
 
     #[test]
+    fn migrated_reflection_persists_only_file_store_completion_record() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = json!({
+            "store_root": directory.path(),
+            "current_date": "2026-07-27",
+            "run_id": "reflection-current",
+            "reflection_task": {
+                "task_id": 41,
+                "source_run_id": "historical-run",
+                "ticker": "QQQ",
+                "decision": {"action":"Hold"},
+                "outcome": {"actual_return": -0.03}
+            }
+        });
+        let artifact = json!({
+            "kind": "experience",
+            "role": "reflector.historical",
+            "source_run_id": "historical-run",
+            "ticker": "QQQ",
+            "index_id": "experience-index"
+        });
+        assert_eq!(
+            persist_file_store_reflection_record(&state, 41, &artifact).unwrap(),
+            1
+        );
+        let store = FileStore::open(directory.path(), FileStoreOptions::default()).unwrap();
+        let location = RunLocation::new("2026-07-27", "reflection-current").unwrap();
+        let record = read_learning_record(&store, &location, LearningKind::Reflection, "QQQ").unwrap();
+        assert_eq!(record.payload["task_id"], 41);
+        assert_eq!(record.payload["experience_index_id"], "experience-index");
+        assert!(phase0_reflection_is_completed_in_file_store(&state, &state["reflection_task"]).unwrap());
+    }
+
+    #[test]
     fn migrated_phase_summary_never_flushes_the_legacy_database_projection() {
         let directory = tempfile::tempdir().unwrap();
         let (_config, runtime) = manifest_runtime_config(directory.path());
@@ -5884,10 +6375,10 @@ mod tests {
         .unwrap();
 
         let mut changed_runtime = runtime.clone();
-        changed_runtime
-            .authority_registry
-            .migrate_to_file_store("trader", orchestrator_core::ToolManagedProfile::TradeIntent)
-            .unwrap();
+        // All builtin profiles are FileStore-authoritative now; use the
+        // explicit legacy registry to simulate opening a manifest with a
+        // materially different authority snapshot.
+        changed_runtime.authority_registry = orchestrator_core::AuthorityRegistry::builtin_legacy();
         let error = prepare_file_store_run_manifest(
             directory.path(),
             &changed_runtime,

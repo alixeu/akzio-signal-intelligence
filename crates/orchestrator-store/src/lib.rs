@@ -13,6 +13,7 @@ mod index;
 mod input;
 mod json;
 mod jsonl;
+mod learning;
 mod manifest;
 mod paths;
 mod phase2;
@@ -75,9 +76,13 @@ pub use json::{
     validate_content_hash, validate_content_hash_at, ContentHashDocument,
 };
 pub use jsonl::{append_jsonl_locked, read_jsonl_recover_tail, JsonlEvent, JsonlRecord};
+pub use learning::{
+    learning_record_relative, read_learning_record, write_learning_record, LearningKind,
+    LearningRecord, LEARNING_RECORD_SCHEMA_VERSION,
+};
 pub use manifest::{
-    read_run_manifest, write_run_manifest, FinalizedArtifactRef, ManifestError, PhaseStatus,
-    RunLocation, RunManifest, RunManifestInit, RunStatus, RUN_MANIFEST_SCHEMA_VERSION,
+    find_run_location, read_run_manifest, write_run_manifest, FinalizedArtifactRef, ManifestError,
+    PhaseStatus, RunLocation, RunManifest, RunManifestInit, RunStatus, RUN_MANIFEST_SCHEMA_VERSION,
 };
 pub use paths::{validate_relative_path, SafeSlug};
 pub use phase2::{

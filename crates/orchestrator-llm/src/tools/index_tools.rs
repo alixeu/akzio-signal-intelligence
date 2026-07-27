@@ -209,6 +209,11 @@ pub struct IndexToolRuntimeContext {
     owned: IndexOwnedScope,
     visibility: IndexReadVisibility,
     visible_index_ids: Mutex<BTreeSet<String>>,
+    /// Phase summaries have an index ID planned before the model starts.
+    /// Experiences are different: the model supplies the reusable
+    /// `pattern_key`, while Rust derives the ID from it.  Keep the resolved
+    /// scope in the runtime rather than accepting an ID from the model.
+    resolved_write_scope: Mutex<Option<IndexOwnedScope>>,
 }
 
 impl IndexToolRuntimeContext {
@@ -229,6 +234,7 @@ impl IndexToolRuntimeContext {
             owned,
             visibility,
             visible_index_ids: Mutex::new(BTreeSet::new()),
+            resolved_write_scope: Mutex::new(None),
         })
     }
 
@@ -272,6 +278,41 @@ impl IndexToolRuntimeContext {
             (None, 0) => bail!("read_index_details requires a preceding read_indexes result"),
             (None, _) => bail!("index_id is required when multiple visible Indexes are available"),
         }
+    }
+
+    fn scope_for_create(&self, pattern_key: Option<&str>) -> Result<IndexOwnedScope> {
+        let mut scope = self.owned.clone();
+        if scope.kind == IndexKind::Experience {
+            let pattern_key = pattern_key.context("experience Indexes require pattern_key")?;
+            scope.index_id = orchestrator_store::deterministic_experience_index_id(
+                pattern_key,
+                scope.ticker.as_deref(),
+                scope.source_phase,
+            )?;
+        }
+        let mut resolved = self
+            .resolved_write_scope
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Index write scope lock poisoned"))?;
+        if let Some(existing) = resolved.as_ref() {
+            if existing != &scope {
+                bail!("create_index cannot change the already resolved Index identity")
+            }
+        } else {
+            *resolved = Some(scope.clone());
+        }
+        Ok(scope)
+    }
+
+    fn scope_for_followup(&self) -> Result<IndexOwnedScope> {
+        if self.owned.kind == IndexKind::PhaseSummary {
+            return Ok(self.owned.clone());
+        }
+        self.resolved_write_scope
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Index write scope lock poisoned"))?
+            .clone()
+            .context("experience append/finalize requires create_index in this turn")
     }
 }
 
@@ -617,7 +658,7 @@ fn parse_create(args: Value, context: &IndexToolRuntimeContext) -> Result<Create
         &context.visibility.applies_to_phases,
     )?;
     Ok(CreateIndexCommand {
-        scope: context.owned.clone(),
+        scope: context.scope_for_create(pattern_key.as_deref())?,
         summary,
         confidence,
         pattern_key,
@@ -644,7 +685,7 @@ fn parse_append(
         }
     }
     Ok(AppendIndexDetailCommand {
-        scope: context.owned.clone(),
+        scope: context.scope_for_followup()?,
         section,
         detail,
         source_refs,
@@ -654,7 +695,7 @@ fn parse_append(
 fn parse_finalize(args: Value, context: &IndexToolRuntimeContext) -> Result<FinalizeIndexCommand> {
     checked_object(&args, FINALIZE_INDEX_NAME, &[])?;
     Ok(FinalizeIndexCommand {
-        scope: context.owned.clone(),
+        scope: context.scope_for_followup()?,
     })
 }
 
@@ -1109,6 +1150,41 @@ mod tests {
             panic!("expected create command");
         };
         assert_eq!(command.scope.source_phase, 2);
+        assert_eq!(
+            command.scope.index_id,
+            orchestrator_store::deterministic_experience_index_id(
+                "volatility-breakout",
+                command.scope.ticker.as_deref(),
+                2,
+            )
+            .unwrap()
+        );
+        let append = prepare_command(
+            APPEND_INDEX_DETAIL_NAME,
+            json!({
+                "section": "historical_case",
+                "detail": "The decision relied on a stale breakout signal.",
+                "source_refs": []
+            }),
+            &context,
+        )
+        .unwrap();
+        let IndexToolCommand::Append(append) = append else {
+            panic!("expected append command");
+        };
+        assert_eq!(append.scope.index_id, command.scope.index_id);
+        let error = prepare_command(
+            CREATE_INDEX_NAME,
+            json!({
+                "summary": "A different experience.",
+                "confidence": 0.6,
+                "pattern_key": "other-pattern",
+                "applies_to_phases": [3]
+            }),
+            &context,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("cannot change"));
         assert_eq!(context.turn_context().phase, Some(0));
     }
 }

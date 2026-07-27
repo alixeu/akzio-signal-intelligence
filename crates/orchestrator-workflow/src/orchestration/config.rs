@@ -564,6 +564,15 @@ impl RuntimeConfig {
         // only finalized upstream projections.  Those profiles are therefore
         // ready to be FileStore-authoritative by default.
         let mut authority_registry = AuthorityRegistry::builtin_legacy();
+        // Historical reflection writes only unified Experience Index/Detail
+        // plus its run-local learning marker.  It never persists a JSON
+        // bundle, candidate, promotion, or memory row after this boundary.
+        authority_registry
+            .migrate_to_file_store(
+                "reflector.historical",
+                ToolManagedProfile::HistoricalReflection,
+            )
+            .expect("builtin HistoricalReflection registration must exist");
         authority_registry
             .migrate_to_file_store("compressor.phase_summary", ToolManagedProfile::PhaseSummary)
             .expect("builtin Phase Summary registration must exist");
@@ -599,6 +608,20 @@ impl RuntimeConfig {
             authority_registry
                 .migrate_to_file_store(role, profile)
                 .expect("builtin Phase 2 ToolManaged registration must exist");
+        }
+        // Phase 4--6 are also one-way FileStore authority boundaries.  Their
+        // callers build one ticker-scoped unit at a time, so the portfolio
+        // manager can never accidentally obtain a multi-ticker Draft.
+        for (role, profile) in [
+            ("trader", ToolManagedProfile::TradeIntent),
+            ("risk.aggressive", ToolManagedProfile::RiskReview),
+            ("risk.neutral", ToolManagedProfile::RiskReview),
+            ("risk.conservative", ToolManagedProfile::RiskReview),
+            ("portfolio.manager", ToolManagedProfile::PortfolioDecision),
+        ] {
+            authority_registry
+                .migrate_to_file_store(role, profile)
+                .expect("builtin Phase 4--6 ToolManaged registration must exist");
         }
         let alpaca_api_key = config_str(config, "orchestrator.alpaca.api_key", "")
             .trim()

@@ -339,6 +339,83 @@ pub fn read_run_manifest(store: &FileStore, location: &RunLocation) -> Result<Ru
     Ok(manifest)
 }
 
+/// Locate a FileStore run by its authoritative `run_id`. Run IDs are never
+/// path components, so callers must not reconstruct a slug from untrusted
+/// input. Duplicate IDs indicate corruption and fail closed.
+pub fn find_run_location(store: &FileStore, run_id: &str) -> Result<Option<RunLocation>> {
+    if run_id.trim().is_empty() {
+        return Err(StoreError::InvalidDocument {
+            kind: "run location",
+            message: "run_id must not be empty".to_owned(),
+        });
+    }
+    let runs = store.root().join("runs");
+    if !runs.exists() {
+        return Ok(None);
+    }
+    let mut found = None;
+    for date in std::fs::read_dir(&runs).map_err(|source| StoreError::Io {
+        path: runs.clone(),
+        source,
+    })? {
+        let date = date.map_err(|source| StoreError::Io {
+            path: runs.clone(),
+            source,
+        })?;
+        let date_path = date.path();
+        let metadata = std::fs::symlink_metadata(&date_path).map_err(|source| StoreError::Io {
+            path: date_path.clone(),
+            source,
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(StoreError::SymlinkPath { path: date_path });
+        }
+        if !metadata.is_dir() || !is_workflow_date(&date.file_name().to_string_lossy()) {
+            continue;
+        }
+        for entry in std::fs::read_dir(&date_path).map_err(|source| StoreError::Io {
+            path: date_path.clone(),
+            source,
+        })? {
+            let entry = entry.map_err(|source| StoreError::Io {
+                path: date_path.clone(),
+                source,
+            })?;
+            let path = entry.path();
+            let metadata = std::fs::symlink_metadata(&path).map_err(|source| StoreError::Io {
+                path: path.clone(),
+                source,
+            })?;
+            if metadata.file_type().is_symlink() {
+                return Err(StoreError::SymlinkPath { path });
+            }
+            if !metadata.is_dir() {
+                continue;
+            }
+            let relative = PathBuf::from("runs")
+                .join(date.file_name())
+                .join(entry.file_name())
+                .join("manifest.json");
+            if !store.exists(&relative)? {
+                continue;
+            }
+            let manifest: RunManifest =
+                store.read_versioned_json(&relative, FileSchemaKind::RunManifest)?;
+            if manifest.run_id != run_id {
+                continue;
+            }
+            let location = RunLocation::new(manifest.current_date, manifest.run_id)?;
+            if found.replace(location).is_some() {
+                return Err(StoreError::InvalidDocument {
+                    kind: "run location",
+                    message: format!("duplicate FileStore manifests for run_id {run_id}"),
+                });
+            }
+        }
+    }
+    Ok(found)
+}
+
 fn is_workflow_date(value: &str) -> bool {
     value.len() == 10
         && value.as_bytes()[4] == b'-'
@@ -356,7 +433,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        read_run_manifest, write_run_manifest, FinalizedArtifactRef, RunLocation, RunManifest,
+        find_run_location, read_run_manifest, write_run_manifest, FinalizedArtifactRef, RunLocation, RunManifest,
         RunManifestInit,
     };
     use crate::{FileStore, FileStoreOptions};
@@ -390,6 +467,19 @@ mod tests {
             .contains("run-run-with-special-"));
         assert!(!written.content_hash.is_empty());
         assert_eq!(read_run_manifest(&store, &location).unwrap(), written);
+    }
+
+    #[test]
+    fn finds_historical_run_by_manifest_identity_not_path_component() {
+        let directory = tempdir().unwrap();
+        let store = FileStore::open(directory.path(), FileStoreOptions::default()).unwrap();
+        let location = location();
+        write_run_manifest(&store, &location, manifest(location.clone())).unwrap();
+        assert_eq!(
+            find_run_location(&store, "run/with special characters").unwrap(),
+            Some(location)
+        );
+        assert_eq!(find_run_location(&store, "missing").unwrap(), None);
     }
 
     #[test]

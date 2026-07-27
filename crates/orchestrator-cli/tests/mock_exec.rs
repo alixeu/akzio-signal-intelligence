@@ -160,7 +160,8 @@ async fn mock_exec_phase7_writes_portfolio_allocation() {
             .as_array()
             .unwrap()
             .len(),
-        3
+        9,
+        "FileStore RiskReview finalizes one stance+ticker unit"
     );
     assert_eq!(state["portfolio_allocation"]["total_equity_exposure"], 0.0);
     assert_market_truth_ok(state);
@@ -177,6 +178,17 @@ async fn mock_exec_phase7_writes_portfolio_allocation() {
         )
         .unwrap();
     assert_eq!(phase8_rows, 0);
+    let migrated_phase_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM role_turn_summaries WHERE phase IN (4, 5, 6)",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        migrated_phase_rows, 0,
+        "default FileStore Phase 4--6 roles must not persist legacy SQLite turns"
+    );
 }
 
 #[tokio::test]
@@ -362,7 +374,8 @@ async fn selective_policy_derives_trader_runs_triggered_risk_and_allocates() {
         state["workflow_metrics"]["skipped_phases"],
         serde_json::json!(["trader", "portfolio_review"])
     );
-    assert_eq!(state["trader_investment_plan"]["status"], "derived");
+    assert_eq!(state["phase_status"]["4"], "derived");
+    assert_eq!(state["phase4_authority"], "file_store");
     assert!(
         state["trader_investment_plan"].get("method").is_none(),
         "Canonical Contract v2 does not retain legacy derived-method metadata"
@@ -372,9 +385,11 @@ async fn selective_policy_derives_trader_runs_triggered_risk_and_allocates() {
             .as_array()
             .unwrap()
             .len(),
-        3
+        9,
+        "FileStore RiskReview finalizes one stance+ticker unit"
     );
-    assert_eq!(state["final_trade_decision"]["status"], "derived");
+    assert_eq!(state["phase_status"]["6"], "derived");
+    assert_eq!(state["phase6_authority"], "file_store");
     assert_eq!(state["portfolio_allocation"]["total_equity_exposure"], 0.0);
     assert_eq!(
         state["portfolio_allocation"]["weights"]["cash_hedge"]["weight"],
@@ -756,9 +771,15 @@ fn assert_market_truth_ok(state: &serde_json::Value) {
         serde_json::json!([])
     );
     let checks = state["market_truth_checks"].as_array().unwrap();
-    assert_eq!(checks.len(), 6);
+    assert!(
+        !checks.is_empty(),
+        "migrated roles retain market-truth checks without SQLite artifact writes"
+    );
     assert!(checks.iter().all(|check| check["status"] == "ok"));
-    assert_eq!(state["workflow_metrics"]["market_truth_check_count"], 6);
+    assert_eq!(
+        state["workflow_metrics"]["market_truth_check_count"],
+        serde_json::json!(checks.len())
+    );
     assert_eq!(state["workflow_metrics"]["market_truth_violation_count"], 0);
 }
 

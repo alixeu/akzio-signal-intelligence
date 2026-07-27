@@ -99,7 +99,15 @@ struct FileStoreIndexToolService {
 
 impl FileStoreIndexToolService {
     fn write_scope(&self, owned: &IndexOwnedScope) -> Result<IndexScope> {
-        if owned != &self.owned {
+        // An Experience index ID is derived only after the model supplies a
+        // pattern key to `create_index`.  The runtime context owns every
+        // other field; accepting that one derived value is not a second
+        // authority or a model-selected path.
+        if owned != &self.owned
+            && !(owned.kind == ToolIndexKind::Experience
+                && self.owned.kind == ToolIndexKind::Experience
+                && same_experience_scope_except_index(owned, &self.owned))
+        {
             bail!("Index command scope differs from the Rust-planned unit")
         }
         self.plan.validate_for(owned)?;
@@ -149,6 +157,18 @@ impl FileStoreIndexToolService {
         }
         Ok(())
     }
+}
+
+fn same_experience_scope_except_index(left: &IndexOwnedScope, right: &IndexOwnedScope) -> bool {
+    left.run_id == right.run_id
+        && left.source_run_id == right.source_run_id
+        && left.source_phase == right.source_phase
+        && left.role == right.role
+        && left.kind == right.kind
+        && left.ticker == right.ticker
+        && left.topic_id == right.topic_id
+        && left.unit_key == right.unit_key
+        && left.source_payload_hash == right.source_payload_hash
 }
 
 impl IndexToolService for FileStoreIndexToolService {

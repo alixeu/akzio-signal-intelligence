@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use chrono::Utc;
 use futures::{stream, StreamExt};
 use orchestrator_core::{default_project_root, ArtifactAuthority, ToolManagedProfile};
 use orchestrator_llm::{
@@ -21,6 +22,7 @@ use tracing::{debug, warn};
 use super::config::{output_mode_for_role, prompt_version, RetrievalConfig, RuntimeConfig};
 use super::degraded::role_artifact_or_degraded;
 use super::domain_runtime::{file_store_domain_runtime, FileStoreDomainRuntimePlan};
+use super::index_runtime::{file_store_index_tool_runtime, FileStoreIndexRuntimePlan};
 use super::lifecycle::tickers_from_state;
 use super::render::{direct_context_manifest, render_prompt_with_plugins};
 
@@ -71,6 +73,7 @@ pub(crate) struct RoleJob {
     pub tickers: Vec<String>,
     pub output_mode: OutputMode,
     pub tool_managed_profile: Option<ToolManagedProfile>,
+    pub index_tool_runtime: Option<orchestrator_llm::tools::index_tools::IndexToolRuntimeBinding>,
     pub domain_tool_runtime:
         Option<orchestrator_llm::tools::domain_tools::DomainToolRuntimeBinding>,
     pub llm: Option<RoleLlmSettings>,
@@ -282,20 +285,40 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
         "prepared role job"
     );
     let candidate_tool_managed_profile = tool_managed_profile_for_role_kind(role, kind);
-    let (output_mode, tool_managed_profile, domain_tool_runtime, file_store_input) =
-        if let Some(profile) = candidate_tool_managed_profile {
-            match config.authority_registry.authority_for(role, profile)? {
-                // A legacy role must not carry any ToolManaged profile into the
-                // LLM settings: that would create an invalid mixed authority
-                // contract even before its first tool call.
-                ArtifactAuthority::Legacy => (output_mode_for_role(role), None, None, None),
-                ArtifactAuthority::FileStore => {
-                    let registration = config.authority_registry.registration(role, profile)?;
-                    let store_root = state
-                        .get("store_root")
-                        .and_then(Value::as_str)
-                        .context("store_root missing for migrated ToolManaged domain role")?;
-                    let visible = visible_domain_evidence_refs(&state, role, &tickers, mock);
+    let (
+        output_mode,
+        tool_managed_profile,
+        index_tool_runtime,
+        domain_tool_runtime,
+        file_store_input,
+    ) = if let Some(profile) = candidate_tool_managed_profile {
+        match config.authority_registry.authority_for(role, profile)? {
+            // A legacy role must not carry any ToolManaged profile into the
+            // LLM settings: that would create an invalid mixed authority
+            // contract even before its first tool call.
+            ArtifactAuthority::Legacy => (output_mode_for_role(role), None, None, None, None),
+            ArtifactAuthority::FileStore => {
+                let registration = config.authority_registry.registration(role, profile)?;
+                let store_root = state
+                    .get("store_root")
+                    .and_then(Value::as_str)
+                    .context("store_root missing for migrated ToolManaged domain role")?;
+                let visible = visible_domain_evidence_refs(&state, role, &tickers, mock);
+                if profile == ToolManagedProfile::HistoricalReflection {
+                    let binding = file_store_historical_reflection_index_runtime(
+                        Path::new(store_root),
+                        &state,
+                        registration.profile_version,
+                        registration.builder_version,
+                    )?;
+                    (
+                        OutputMode::ToolManaged,
+                        Some(profile),
+                        Some(binding),
+                        None,
+                        None,
+                    )
+                } else {
                     let binding = file_store_domain_runtime(
                         Path::new(store_root),
                         &state,
@@ -313,7 +336,7 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
                             visible_claims: visible_phase2_claims(&state, topic_id),
                             fork: phase2_fork_reference(&state, role, topic_id),
                             trade_candidate_action: trade_candidate_action(&state, &tickers),
-                            portfolio_rating: portfolio_rating(&state),
+                            portfolio_rating: portfolio_rating(&state, &tickers),
                             portfolio_current_weight: portfolio_current_weight(&state, &tickers),
                         },
                     )?;
@@ -322,12 +345,24 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
                     } else {
                         None
                     };
-                    (OutputMode::ToolManaged, Some(profile), Some(binding), input)
+                    (
+                        OutputMode::ToolManaged,
+                        Some(profile),
+                        None,
+                        Some(binding),
+                        input,
+                    )
                 }
             }
-        } else {
-            (output_mode_for_role(role), None, None, None)
-        };
+        }
+    } else {
+        (output_mode_for_role(role), None, None, None, None)
+    };
+    // A migrated role may read only its Rust-projected FileStore indexes and
+    // snapshots.  Clearing the legacy connection here turns a missing
+    // FileStore projection into a hard tool error instead of an accidental
+    // SQLite fallback.
+    let file_store_authoritative = tool_managed_profile.is_some();
 
     Ok(RoleJob {
         role: role.to_string(),
@@ -344,15 +379,20 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
         tickers: tickers.clone(),
         output_mode,
         tool_managed_profile,
+        index_tool_runtime,
         domain_tool_runtime,
         llm,
         reasoning_effort_override: reasoning_effort_override.map(ToString::to_string),
         tools: ExternalToolConfig {
             project_root: default_project_root(),
-            db_path: state
-                .get("db_path")
-                .and_then(Value::as_str)
-                .map(PathBuf::from),
+            db_path: (!file_store_authoritative)
+                .then(|| {
+                    state
+                        .get("db_path")
+                        .and_then(Value::as_str)
+                        .map(PathBuf::from)
+                })
+                .flatten(),
             run_dir: state
                 .get("run_dir")
                 .and_then(Value::as_str)
@@ -394,6 +434,10 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
                 .and_then(Value::as_str)
                 .and_then(orchestrator_sql::phase_summary_gate),
             file_store_input,
+            file_store_reflection_source: file_store_reflection_source(
+                &state,
+                tool_managed_profile,
+            ),
         },
         web_search: config.web_search.get(role).cloned().unwrap_or_default(),
         truncation: config.truncation.clone(),
@@ -426,10 +470,19 @@ fn trade_candidate_action(state: &Value, tickers: &[String]) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn portfolio_rating(state: &Value) -> Option<String> {
+fn portfolio_rating(state: &Value, tickers: &[String]) -> Option<String> {
+    let ticker = tickers.first()?;
     state
         .get("research_plan")
-        .and_then(|plan| plan.get("rating"))
+        .and_then(|plan| plan.get("per_ticker"))
+        .and_then(Value::as_object)
+        .and_then(|items| items.get(ticker))
+        .and_then(|item| item.get("rating"))
+        .or_else(|| {
+            state
+                .get("research_plan")
+                .and_then(|plan| plan.get("rating"))
+        })
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
 }
@@ -442,6 +495,13 @@ fn portfolio_current_weight(state: &Value, tickers: &[String]) -> Option<f64> {
         .and_then(|positions| positions.get(ticker))
         .and_then(|position| position.get("weight"))
         .and_then(Value::as_f64)
+        .or_else(|| {
+            state
+                .get("current_portfolio_weights")
+                .and_then(Value::as_object)
+                .and_then(|weights| weights.get(ticker))
+                .and_then(Value::as_f64)
+        })
         .or(Some(0.0))
 }
 
@@ -537,6 +597,136 @@ fn file_store_input_from_state(state: &Value) -> Result<FileStoreInputSnapshot> 
         run_id: required("run_id")?,
         current_date: required("current_date")?,
     })
+}
+
+/// Construct the sole Phase 0 writer: a task-scoped Experience Index.  The
+/// source run is found by its manifest rather than a caller-provided path;
+/// absence is a hard error, never a fallback to legacy phase-summary tables.
+fn file_store_historical_reflection_index_runtime(
+    store_root: &Path,
+    state: &Value,
+    profile_version: u32,
+    builder_version: u32,
+) -> Result<orchestrator_llm::tools::index_tools::IndexToolRuntimeBinding> {
+    use orchestrator_llm::tools::index_tools::{IndexKind, IndexOwnedScope, IndexReadVisibility};
+    use orchestrator_store::{
+        content_hash, find_run_location, read_indexes, FileStore, FileStoreOptions,
+        IndexKind as StoreIndexKind, IndexQuery,
+    };
+
+    let task = state
+        .get("reflection_task")
+        .and_then(Value::as_object)
+        .context("HistoricalReflection FileStore runtime requires reflection_task")?;
+    let task_id = task
+        .get("task_id")
+        .and_then(Value::as_i64)
+        .context("reflection_task.task_id is required")?;
+    let source_run_id = task
+        .get("source_run_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .context("reflection_task.source_run_id is required")?
+        .to_owned();
+    let ticker = task
+        .get("ticker")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .context("reflection_task.ticker is required")?
+        .to_owned();
+    let run_id = state
+        .get("run_id")
+        .and_then(Value::as_str)
+        .context("run_id is required")?
+        .to_owned();
+    let store = FileStore::open(store_root, FileStoreOptions::default())?;
+    let source_location = find_run_location(&store, &source_run_id)?.with_context(|| {
+        format!("HistoricalReflection source run {source_run_id} is not available in FileStore")
+    })?;
+    let source_indexes = read_indexes(
+        &store,
+        Some(&source_location),
+        &IndexQuery {
+            kind: Some(StoreIndexKind::PhaseSummary),
+            ticker: Some(ticker.clone()),
+            limit: 100,
+            ..Default::default()
+        },
+    )?
+    .indexes;
+    let source_phase = source_indexes
+        .iter()
+        .map(|index| index.source_phase)
+        .min()
+        .context(
+            "HistoricalReflection source run has no ticker-scoped completed Phase Summary Index",
+        )?;
+    let source_index_ids = source_indexes
+        .iter()
+        .map(|index| index.index_id.clone())
+        .collect::<BTreeSet<_>>();
+    let source_phases = source_indexes
+        .iter()
+        .map(|index| index.source_phase)
+        .collect::<BTreeSet<_>>();
+    let source_payload_hash = content_hash(&json!({
+        "task": task,
+        "source_indexes": source_index_ids,
+        "profile_version": profile_version,
+        "builder_version": builder_version,
+    }))?;
+    let owned = IndexOwnedScope {
+        run_id,
+        source_run_id: Some(source_run_id),
+        source_phase,
+        role: "reflector.historical".to_owned(),
+        kind: IndexKind::Experience,
+        ticker: Some(ticker.clone()),
+        topic_id: None,
+        unit_key: format!("phase0:reflection-task:{task_id}"),
+        source_payload_hash,
+        // This placeholder is never persisted: `create_index` replaces it
+        // with hash(kind, pattern_key, ticker, source_phase).
+        index_id: format!("experience-pending-task-{task_id}"),
+    };
+    file_store_index_tool_runtime(
+        store,
+        owned,
+        IndexReadVisibility {
+            kinds: BTreeSet::from([IndexKind::PhaseSummary]),
+            tickers: BTreeSet::from([ticker]),
+            source_phases,
+            applies_to_phases: BTreeSet::from([1, 2, 3, 4, 5, 6]),
+            roles: BTreeSet::new(),
+            topic_ids: BTreeSet::new(),
+            pattern_keys: BTreeSet::new(),
+            source_refs: source_index_ids,
+            evidence_ids: BTreeSet::new(),
+            max_page_size: 20,
+        },
+        FileStoreIndexRuntimePlan::for_experience(vec![source_location], Utc::now().to_rfc3339()),
+    )
+}
+
+fn file_store_reflection_source(
+    state: &Value,
+    profile: Option<ToolManagedProfile>,
+) -> Option<Value> {
+    if profile != Some(ToolManagedProfile::HistoricalReflection) {
+        return None;
+    }
+    let task = state.get("reflection_task")?.clone();
+    Some(json!({
+        "status": "available",
+        "task": task,
+        "decision": task.get("decision").cloned().unwrap_or(Value::Null),
+        "outcome": task.get("outcome").cloned().unwrap_or(Value::Null),
+        "source_run_metadata": {
+            "source_run_id": task.get("source_run_id").cloned().unwrap_or(Value::Null),
+            "data_complete": true,
+            "source_policy": "task_allowlisted_historical_run_only"
+        }
+    }))
 }
 
 fn retrieval_policy_for_role(role: &str, kind: &str, config: &RetrievalConfig) -> RetrievalPolicy {
@@ -1185,6 +1375,9 @@ pub(crate) async fn run_role_job_with_timeout(job: RoleJob, timeout_sec: u64) ->
 
 async fn execute_role_job(job: RoleJob) -> Result<AgentLoopOutput> {
     if job.mock {
+        if let Some(binding) = job.index_tool_runtime.clone() {
+            return mock_index_tool_managed_output(job, binding);
+        }
         if let Some(binding) = job.domain_tool_runtime.clone() {
             return mock_domain_tool_managed_output(job, binding);
         }
@@ -1242,7 +1435,7 @@ async fn execute_role_job(job: RoleJob) -> Result<AgentLoopOutput> {
         tickers: job.tickers,
         output_mode: job.output_mode,
         tool_managed_profile: job.tool_managed_profile,
-        index_tool_runtime: None,
+        index_tool_runtime: job.index_tool_runtime.clone(),
         domain_tool_runtime: job.domain_tool_runtime.clone(),
         llm,
         reasoning_effort_override: job.reasoning_effort_override,
@@ -1262,6 +1455,66 @@ async fn execute_role_job(job: RoleJob) -> Result<AgentLoopOutput> {
     let mut output = run_agent_loop_with_metrics(&settings, &job.prompt).await?;
     output.artifact["context_manifest"] = job.context_manifest;
     Ok(output)
+}
+
+fn mock_index_tool_managed_output(
+    job: RoleJob,
+    binding: orchestrator_llm::tools::index_tools::IndexToolRuntimeBinding,
+) -> Result<AgentLoopOutput> {
+    use orchestrator_llm::{
+        agent_loop::{ToolResultItem, ToolRuntimeTurnContext},
+        tools::index_tools::{APPEND_INDEX_DETAIL_NAME, CREATE_INDEX_NAME, FINALIZE_INDEX_NAME},
+    };
+
+    let task = job
+        .tools
+        .file_store_reflection_source
+        .as_ref()
+        .and_then(|source| source.get("task"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let runtime = binding.build(ToolRuntimeTurnContext {
+        run_id: job.tools.run_id.clone().unwrap_or_default(),
+        phase: Some(job.phase),
+        role: job.role.clone(),
+        session_id: format!("{}:mock", job.role),
+        turn_id: "mock-reflection-finalize".to_owned(),
+    })?;
+    runtime.execute(
+        CREATE_INDEX_NAME,
+        json!({
+            "summary": "Verify historical evidence freshness before repeating this decision.",
+            "confidence": 0.5,
+            "pattern_key": "mock-historical-reflection",
+            "applies_to_phases": [1, 2, 3]
+        }),
+    )?;
+    runtime.execute(
+        APPEND_INDEX_DETAIL_NAME,
+        json!({
+            "section": "historical_case",
+            "detail": format!("Mock reflection for historical task {}.", task.get("task_id").and_then(Value::as_i64).unwrap_or_default()),
+            "source_refs": []
+        }),
+    )?;
+    let terminal = runtime.execute(FINALIZE_INDEX_NAME, json!({}))?;
+    let artifact = terminal
+        .get("artifact")
+        .cloned()
+        .context("mock Index finalizer did not return an artifact")?;
+    Ok(AgentLoopOutput {
+        artifact: artifact.clone(),
+        terminal_tool_result: Some(ToolResultItem {
+            call_id: "mock-finalize-index".to_owned(),
+            name: FINALIZE_INDEX_NAME.to_owned(),
+            status: "completed".to_owned(),
+            output: terminal,
+            error: None,
+        }),
+        metrics: ModelStreamResult::default(),
+        turn_id: "mock-reflection-finalize".to_owned(),
+        session_id: format!("{}:mock", job.role),
+    })
 }
 
 fn mock_domain_tool_managed_output(
@@ -1397,7 +1650,7 @@ fn mock_domain_tool_managed_output(
                 }),
             )?;
             binding.execute(APPEND_BINDING_RISK_CONTROL, json!({
-                "control":{"control":"Mock risk cap.","source_refs":["mock:portfolio.manager:control"]}
+                "control":{"control":"Mock risk cap.","source_refs":[format!("mock:portfolio.manager:{}", job.tickers.first().context("mock portfolio ticker missing")?)]}
             }))?;
             binding.execute(FINALIZE_PORTFOLIO_DECISION, json!({}))?
         }
@@ -1568,7 +1821,7 @@ async fn execute_steer_role_job(
         tickers: job.tickers,
         output_mode: job.output_mode,
         tool_managed_profile: job.tool_managed_profile,
-        index_tool_runtime: None,
+        index_tool_runtime: job.index_tool_runtime.clone(),
         domain_tool_runtime: job.domain_tool_runtime.clone(),
         llm,
         reasoning_effort_override: job.reasoning_effort_override,

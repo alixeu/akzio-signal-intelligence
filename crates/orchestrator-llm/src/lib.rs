@@ -2948,6 +2948,15 @@ fn extract_embedded_json_object(text: &str) -> Result<Value> {
 }
 
 fn open_loop_connection(settings: &AgentSettings) -> Result<Connection> {
+    // ToolManaged roles persist their recoverable session/event history to
+    // FileStore through the runtime binding.  The legacy agent-loop tables
+    // must never become a second on-disk authority or cache for those roles.
+    // The loop still uses its transient SQL-shaped turn machinery until its
+    // in-memory event representation is removed, so use SQLite's process-
+    // local `:memory:` database rather than creating `outputs/agent_loop.sqlite`.
+    if settings.output_mode == OutputMode::ToolManaged {
+        return orchestrator_sql::connect(":memory:");
+    }
     let db_path = settings
         .tools
         .as_ref()
@@ -3251,6 +3260,7 @@ fn default_tool_config() -> tools::ExternalToolConfig {
         phase_summary_index: None,
         phase_summary_gate: None,
         file_store_input: None,
+        file_store_reflection_source: None,
     }
 }
 
@@ -3740,6 +3750,7 @@ mod tests {
             phase_summary_index: None,
             phase_summary_gate: None,
             file_store_input: None,
+            file_store_reflection_source: None,
         });
         let first = agent_loop::Turn::new(
             "turn-topic-a",
@@ -3788,6 +3799,7 @@ mod tests {
             phase_summary_index: None,
             phase_summary_gate: None,
             file_store_input: None,
+            file_store_reflection_source: None,
         });
 
         super::append_debug_llm_record(

@@ -9,7 +9,7 @@ pub const NAME: &str = "read_reflection_source";
 pub fn definition() -> ToolDefinition {
     ToolDefinition {
         name: api_tool_name(NAME),
-        description: "Phase 0 only: read bootstrap metadata, decision, outcome, and summary availability for one allowlisted reflection task. Use read_phase_summaries and read_phase_summary_details for evidence.".to_string(),
+        description: "Phase 0 only: read bootstrap metadata, decision, outcome, and FileStore Index availability for one allowlisted reflection task. Use read_indexes and read_index_details for evidence.".to_string(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -35,6 +35,12 @@ pub fn execute(
         .ok_or_else(|| anyhow::anyhow!("read_reflection_source.task_id is required"))?;
     if !config.allowed_reflection_task_ids.contains(&task_id) {
         bail!("reflection task {task_id} is not allowlisted for this turn");
+    }
+    if let Some(source) = &config.file_store_reflection_source {
+        if source.pointer("/task/task_id").and_then(Value::as_i64) != Some(task_id) {
+            bail!("FileStore reflection source does not match task {task_id}");
+        }
+        return Ok(source.clone());
     }
     let conn = tool_connection(config)?;
     orchestrator_sql::reflection_source_context(&conn, task_id)

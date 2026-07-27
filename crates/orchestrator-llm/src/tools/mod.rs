@@ -114,6 +114,11 @@ pub struct ExternalToolConfig {
     /// copies for this run without accepting a model-provided path.
     #[serde(skip)]
     pub file_store_input: Option<FileStoreInputSnapshot>,
+    /// Rust-owned historical task bootstrap for the migrated Phase 0
+    /// reflector.  When present, `read_reflection_source` must not open the
+    /// legacy database.
+    #[serde(skip)]
+    pub file_store_reflection_source: Option<Value>,
 }
 
 /// Identity of immutable Technical/Jin10 inputs captured for one FileStore
@@ -158,6 +163,7 @@ impl Default for ExternalToolConfig {
             phase_summary_index: None,
             phase_summary_gate: None,
             file_store_input: None,
+            file_store_reflection_source: None,
         }
     }
 }
@@ -983,6 +989,7 @@ mod tests {
             phase_summary_index: None,
             phase_summary_gate: None,
             file_store_input: None,
+            file_store_reflection_source: None,
         }
     }
 

@@ -395,6 +395,21 @@ fn validate_debate_summary_payload(payload: &Value) -> Option<String> {
 }
 
 fn validate_trade_intent_payload(payload: &Value) -> Option<String> {
+    if let Some(per_ticker) = payload.get("per_ticker").and_then(Value::as_object) {
+        if per_ticker.is_empty() {
+            return Some("per_ticker must contain at least one FileStore TradeIntent".to_string());
+        }
+        for (ticker, intent) in per_ticker {
+            if let Some(error) = serde_json::from_value::<TradeIntent>(domain_payload(intent))
+                .err()
+                .map(|error| error.to_string())
+                .or_else(|| required_number_error(intent, "position_size_pct_max"))
+            {
+                return Some(format!("per_ticker.{ticker}: {error}"));
+            }
+        }
+        return None;
+    }
     serde_json::from_value::<TradeIntent>(domain_payload(payload))
         .err()
         .map(|error| error.to_string())

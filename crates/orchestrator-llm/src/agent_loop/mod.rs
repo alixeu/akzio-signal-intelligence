@@ -4267,6 +4267,7 @@ mod tests {
                 phase_summary_index: None,
                 phase_summary_gate: None,
                 file_store_input: None,
+                file_store_reflection_source: None,
             },
             vec![tools::READ_RUN_CONTEXT_TOOL_NAME.to_string()],
         );
@@ -4585,6 +4586,7 @@ mod tests {
                 phase_summary_index: None,
                 phase_summary_gate: None,
                 file_store_input: None,
+                file_store_reflection_source: None,
             },
             Vec::new(),
         );
@@ -5349,6 +5351,7 @@ mod tests {
                 phase_summary_index: None,
                 phase_summary_gate: None,
                 file_store_input: None,
+                file_store_reflection_source: None,
             },
             vec![tools::WEB_RUN_TOOL_NAME.to_string()],
         )
