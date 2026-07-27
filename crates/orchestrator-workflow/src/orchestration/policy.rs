@@ -318,9 +318,86 @@ pub(crate) async fn run_phase1_preflight(
 ) -> Result<()> {
     match preflight_tool_for_role_with_config(role, config) {
         Some("read_technical_snapshot") => run_technical_csv_preflight(conn, state).await,
-        Some("read_jin10_candidates") => run_jin10_preflight(conn, state).await,
+        Some("read_jin10_candidates") => run_jin10_preflight(state).await,
         _ => Ok(()),
     }
+}
+
+/// FileStore Phase 1 roles refresh the same mutable CSV feeds as before, but
+/// never import them into SQLite.  The caller immediately captures the files
+/// into an immutable run snapshot; there is intentionally no fallback from
+/// this authority to a database reader.
+pub(crate) async fn run_file_store_phase1_preflight(
+    state: &mut Value,
+    role: &str,
+    config: &RuntimeConfig,
+) -> Result<()> {
+    match preflight_tool_for_role_with_config(role, config) {
+        Some("read_technical_snapshot") => run_technical_csv_file_store_preflight(state).await,
+        Some("read_jin10_candidates") => run_jin10_preflight(state).await,
+        _ => Ok(()),
+    }
+}
+
+async fn run_technical_csv_file_store_preflight(state: &mut Value) -> Result<()> {
+    let tool = "read_technical_snapshot";
+    if preflight_status(state, tool).is_some() {
+        return Ok(());
+    }
+    if state
+        .get("tech_refresh_enabled")
+        .and_then(Value::as_bool)
+        .is_some_and(|enabled| !enabled)
+    {
+        record_preflight_result(
+            state,
+            tool,
+            Ok(json!({
+                "status": "success",
+                "refresh": "skipped",
+                "source": "existing_ingest_files",
+                "persistence": "filestore_snapshot_pending"
+            })),
+        );
+        return Ok(());
+    }
+
+    let symbols = state
+        .get("analysis_universe")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .filter(|value| !value.is_empty());
+    let end = state
+        .get("current_date")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let result = technical::run(technical::TechnicalArgs {
+        source: None,
+        symbols,
+        start: None,
+        end,
+        days: None,
+        intervals: String::new(),
+        timeout: None,
+        sleep: None,
+        parallelism: None,
+    })
+    .await
+    .map(|ingest| {
+        json!({
+            "status": "success",
+            "ingest": ingest,
+            "persistence": "filestore_snapshot_pending"
+        })
+    });
+    record_preflight_result(state, tool, result);
+    Ok(())
 }
 
 pub(crate) async fn run_technical_csv_preflight(
@@ -415,10 +492,7 @@ fn import_technical_universe(conn: &mut rusqlite::Connection, state: &Value) -> 
     }))
 }
 
-pub(crate) async fn run_jin10_preflight(
-    _conn: &mut rusqlite::Connection,
-    state: &mut Value,
-) -> Result<()> {
+pub(crate) async fn run_jin10_preflight(state: &mut Value) -> Result<()> {
     let tool = "read_jin10_candidates";
     if preflight_status(state, tool).is_some() {
         return Ok(());

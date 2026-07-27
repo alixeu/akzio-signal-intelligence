@@ -5,7 +5,7 @@ use orchestrator_llm::{
     agent_loop::{ModelStreamResult, RetrievalPolicy, TokenUsage},
     llm_judge::JudgeConfig,
     mock_role_artifact, run_agent_loop_with_metrics, run_agent_steer_loop_with_metrics,
-    tools::ExternalToolConfig,
+    tools::{ExternalToolConfig, FileStoreInputSnapshot},
     truncation::TruncationConfig,
     AgentLoopOutput, AgentSettings, OutputMode, RoleLlmSettings, SteerLoopInput,
 };
@@ -276,13 +276,13 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
         "prepared role job"
     );
     let candidate_tool_managed_profile = tool_managed_profile_for_role_kind(role, kind);
-    let (output_mode, tool_managed_profile, domain_tool_runtime) =
+    let (output_mode, tool_managed_profile, domain_tool_runtime, file_store_input) =
         if let Some(profile) = candidate_tool_managed_profile {
             match config.authority_registry.authority_for(role, profile)? {
                 // A legacy role must not carry any ToolManaged profile into the
                 // LLM settings: that would create an invalid mixed authority
                 // contract even before its first tool call.
-                ArtifactAuthority::Legacy => (output_mode_for_role(role), None, None),
+                ArtifactAuthority::Legacy => (output_mode_for_role(role), None, None, None),
                 ArtifactAuthority::FileStore => {
                     let registration = config.authority_registry.registration(role, profile)?;
                     let store_root = state
@@ -301,13 +301,23 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
                             builder_version: registration.builder_version,
                             tickers: tickers.clone(),
                             visible_evidence_refs: visible,
+                            topic_id: topic_id.map(ToOwned::to_owned),
+                            side: phase2_side_for_role(role).map(ToOwned::to_owned),
+                            round: round.and_then(|value| u32::try_from(value).ok()),
+                            visible_claims: visible_phase2_claims(&state, topic_id),
+                            fork: phase2_fork_reference(&state, role, topic_id),
                         },
                     )?;
-                    (OutputMode::ToolManaged, Some(profile), Some(binding))
+                    let input = if profile == ToolManagedProfile::AnalystReport && !mock {
+                        Some(file_store_input_from_state(&state)?)
+                    } else {
+                        None
+                    };
+                    (OutputMode::ToolManaged, Some(profile), Some(binding), input)
                 }
             }
         } else {
-            (output_mode_for_role(role), None, None)
+            (output_mode_for_role(role), None, None, None)
         };
 
     Ok(RoleJob {
@@ -374,12 +384,95 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
                 .get("run_id")
                 .and_then(Value::as_str)
                 .and_then(orchestrator_sql::phase_summary_gate),
+            file_store_input,
         },
         web_search: config.web_search.get(role).cloned().unwrap_or_default(),
         truncation: config.truncation.clone(),
         judge: config.judge.clone(),
         retrieval_policy: retrieval_policy_for_role(role, kind, &config.retrieval),
         context_manifest: direct_context_manifest(&state, phase),
+    })
+}
+
+fn phase2_side_for_role(role: &str) -> Option<&'static str> {
+    if role.contains(".bull.") {
+        Some("bull")
+    } else if role.contains(".bear.") {
+        Some("bear")
+    } else {
+        None
+    }
+}
+
+fn visible_phase2_claims(state: &Value, topic_id: Option<&str>) -> BTreeSet<String> {
+    let Some(topic_id) = topic_id else {
+        return BTreeSet::new();
+    };
+    state
+        .pointer(&format!("/topic_debate_states/{topic_id}/turns"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .flat_map(|turn| {
+            turn.pointer("/artifact/payload/claims")
+                .or_else(|| turn.pointer("/artifact/claims"))
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .filter_map(|claim| claim.get("claim_id").and_then(Value::as_str))
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn phase2_fork_reference(
+    state: &Value,
+    role: &str,
+    topic_id: Option<&str>,
+) -> Option<orchestrator_store::ForkReference> {
+    let (session_id, turn_id) = if role == "mediator.topic_controller" {
+        let _ = topic_id?;
+        (
+            state
+                .get("topic_generation_session_id")?
+                .as_str()?
+                .to_owned(),
+            state.get("topic_generation_turn_id")?.as_str()?.to_owned(),
+        )
+    } else if matches!(role, "researcher.bull.initial" | "researcher.bear.initial") {
+        let _ = topic_id?;
+        let warmup = state.get("phase2_warmup")?;
+        (
+            warmup.get("session_id")?.as_str()?.to_owned(),
+            warmup.get("turn_id")?.as_str()?.to_owned(),
+        )
+    } else {
+        return None;
+    };
+    Some(orchestrator_store::ForkReference {
+        fork_from_session_id: session_id,
+        fork_from_turn_id: turn_id,
+    })
+}
+
+fn file_store_input_from_state(state: &Value) -> Result<FileStoreInputSnapshot> {
+    let input = state
+        .get("file_store_input")
+        .and_then(Value::as_object)
+        .context("migrated Phase 1 role requires a captured FileStore input manifest")?;
+    let required = |field: &str| {
+        input
+            .get(field)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .with_context(|| format!("file_store_input.{field} is required"))
+    };
+    Ok(FileStoreInputSnapshot {
+        store_root: PathBuf::from(required("store_root")?),
+        run_id: required("run_id")?,
+        current_date: required("current_date")?,
     })
 }
 
@@ -1081,9 +1174,12 @@ fn mock_domain_tool_managed_output(
 ) -> Result<AgentLoopOutput> {
     use orchestrator_llm::agent_loop::ToolResultItem;
     use orchestrator_llm::tools::domain_tools::{
-        APPEND_ANALYST_EVIDENCE, FINALIZE_ANALYST_REPORT, FINALIZE_RESEARCH_DECISION,
-        SET_ANALYST_ASSESSMENT, SET_ANALYST_INVALIDATION, SET_RESEARCH_DECISION,
-        SET_RESEARCH_SCENARIOS,
+        ADD_AGREED_FACT, APPEND_ANALYST_EVIDENCE, CREATE_DEBATE_CLAIM, CREATE_PHASE2_TOPIC,
+        FINALIZE_ANALYST_REPORT, FINALIZE_DEBATE_RESPONSE, FINALIZE_DEBATE_SEED,
+        FINALIZE_RESEARCHER_WARMUP, FINALIZE_RESEARCH_DECISION, FINALIZE_TOPIC_CONTROL,
+        FINALIZE_TOPIC_GENERATION, RESPOND_TO_DEBATE_CLAIM, SET_ANALYST_ASSESSMENT,
+        SET_ANALYST_INVALIDATION, SET_DECISION_HINGE, SET_PHASE2_COMMON_GROUND,
+        SET_RESEARCH_DECISION, SET_RESEARCH_SCENARIOS, SET_TOPIC_SOFT_CONTROL,
     };
 
     let profile = binding.scope().profile;
@@ -1157,6 +1253,56 @@ fn mock_domain_tool_managed_output(
             }
             binding.execute(FINALIZE_RESEARCH_DECISION, json!({}))?
         }
+        ToolManagedProfile::ResearcherWarmup => {
+            binding.execute(FINALIZE_RESEARCHER_WARMUP, json!({}))?
+        }
+        ToolManagedProfile::TopicGeneration => {
+            binding.execute(
+                SET_PHASE2_COMMON_GROUND,
+                json!({"common_ground":"Mock Phase 2 common ground."}),
+            )?;
+            binding.execute(
+                CREATE_PHASE2_TOPIC,
+                json!({
+                    "topic":"Mock decision hinge", "decision_hinge":"Mock confirmation",
+                    "evidence_refs": ["mock:mediator.topic:QQQ"]
+                }),
+            )?;
+            binding.execute(FINALIZE_TOPIC_GENERATION, json!({}))?
+        }
+        ToolManagedProfile::DebateSeed => {
+            binding.execute(
+                CREATE_DEBATE_CLAIM,
+                json!({
+                    "claim": format!("Mock {} seed claim.", job.role), "confidence":0.5,
+                    "evidence_refs": [format!("mock:{}:QQQ", job.role)]
+                }),
+            )?;
+            binding.execute(FINALIZE_DEBATE_SEED, json!({}))?
+        }
+        ToolManagedProfile::DebateResponse => {
+            let claim_id = binding
+                .scope()
+                .visible_evidence_refs
+                .iter()
+                .find(|value| value.starts_with("claim-"))
+                .cloned()
+                .context("mock debate response requires a visible claim")?;
+            binding.execute(
+                RESPOND_TO_DEBATE_CLAIM,
+                json!({
+                    "reply_to_claim_id":claim_id, "response":"Mock counterpoint.",
+                    "evidence_refs": [format!("mock:{}:QQQ", job.role)]
+                }),
+            )?;
+            binding.execute(FINALIZE_DEBATE_RESPONSE, json!({}))?
+        }
+        ToolManagedProfile::TopicControl => {
+            binding.execute(ADD_AGREED_FACT, json!({"value":"Mock topic fact."}))?;
+            binding.execute(SET_DECISION_HINGE, json!({"value":"Mock topic hinge."}))?;
+            binding.execute(SET_TOPIC_SOFT_CONTROL, json!({"should_continue":false}))?;
+            binding.execute(FINALIZE_TOPIC_CONTROL, json!({}))?
+        }
         _ => anyhow::bail!(
             "mock domain runtime profile {} is not wired",
             profile.as_str()
@@ -1173,6 +1319,11 @@ fn mock_domain_tool_managed_output(
             name: match profile {
                 ToolManagedProfile::AnalystReport => FINALIZE_ANALYST_REPORT,
                 ToolManagedProfile::ResearchDecision => FINALIZE_RESEARCH_DECISION,
+                ToolManagedProfile::ResearcherWarmup => FINALIZE_RESEARCHER_WARMUP,
+                ToolManagedProfile::TopicGeneration => FINALIZE_TOPIC_GENERATION,
+                ToolManagedProfile::DebateSeed => FINALIZE_DEBATE_SEED,
+                ToolManagedProfile::DebateResponse => FINALIZE_DEBATE_RESPONSE,
+                ToolManagedProfile::TopicControl => FINALIZE_TOPIC_CONTROL,
                 _ => unreachable!(),
             }
             .to_owned(),

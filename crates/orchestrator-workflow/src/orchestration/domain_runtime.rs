@@ -15,21 +15,22 @@ use chrono::Utc;
 use orchestrator_core::ToolManagedProfile;
 use orchestrator_llm::tools::domain_tools::{
     AnalystAssessmentCommand, AnalystDataGapCommand, AnalystEvidenceCommand,
-    AnalystInvalidationCommand, BindingRiskControlCommand, DomainToolRuntimeBinding,
-    DomainToolScope, DomainToolService, EvidenceReadRecord, EvidenceVisibility,
-    PortfolioAssetDecisionCommand, ResearchDecisionCommand, ResearchHingeCommand,
-    ResearchScenariosCommand, RiskAssessmentCommand, RiskConstraintsCommand, TradeBlockerCommand,
-    TradeIntentCommand,
+    AnalystInvalidationCommand, BindingRiskControlCommand, ClaimStatusCommand, DebateClaimCommand,
+    DebateResponseCommand, DebateSteerCommand, DomainToolRuntimeBinding, DomainToolScope,
+    DomainToolService, EvidenceReadRecord, EvidenceVisibility, Phase2CommonGroundCommand,
+    Phase2TopicCommand, PortfolioAssetDecisionCommand, ResearchDecisionCommand,
+    ResearchHingeCommand, ResearchScenariosCommand, RiskAssessmentCommand, RiskConstraintsCommand,
+    TextCommand, TopicSoftControlCommand, TradeBlockerCommand, TradeIntentCommand,
 };
 use orchestrator_store::{
     append_analyst_data_gap, append_analyst_evidence, append_research_hinge, append_session_event,
     content_hash, finalize_analyst_report, finalize_research_decision, read_session_events,
     read_session_manifest, set_analyst_assessment, set_analyst_invalidation, set_research_decision,
     set_research_scenarios, write_session_manifest, AnalystAssessmentInput, AnalystEvidenceInput,
-    ArtifactScope, DomainFinalizeOutcome, DraftAppendOutcome, DraftProfile, EvidenceReadEvent,
-    FileStore, FileStoreOptions, FinalizeDraftOutcome, ResearchDecisionInput,
-    ResearchScenarioInput, RunLocation, SessionEventInput, SessionEventType, SessionLocation,
-    SessionManifest, VisibleEvidenceSet,
+    ArtifactScope, ClaimStatus, DomainFinalizeOutcome, DraftAppendOutcome, DraftProfile,
+    EvidenceReadEvent, FileStore, FileStoreOptions, FinalizeDraftOutcome, ForkReference,
+    Phase2DraftService, ResearchDecisionInput, ResearchScenarioInput, RunLocation,
+    SessionEventInput, SessionEventType, SessionLocation, SessionManifest, VisibleEvidenceSet,
 };
 use serde_json::{json, Value};
 
@@ -45,6 +46,11 @@ pub(crate) struct FileStoreDomainRuntimePlan {
     pub builder_version: u32,
     pub tickers: Vec<String>,
     pub visible_evidence_refs: BTreeSet<String>,
+    pub topic_id: Option<String>,
+    pub side: Option<String>,
+    pub round: Option<u32>,
+    pub visible_claims: BTreeSet<String>,
+    pub fork: Option<ForkReference>,
 }
 
 pub(crate) fn file_store_domain_runtime(
@@ -54,6 +60,11 @@ pub(crate) fn file_store_domain_runtime(
 ) -> Result<DomainToolRuntimeBinding> {
     let draft_profile = match plan.profile {
         ToolManagedProfile::AnalystReport => DraftProfile::AnalystReport,
+        ToolManagedProfile::ResearcherWarmup => DraftProfile::ResearcherWarmup,
+        ToolManagedProfile::TopicGeneration => DraftProfile::TopicGeneration,
+        ToolManagedProfile::DebateSeed => DraftProfile::DebateSeed,
+        ToolManagedProfile::DebateResponse => DraftProfile::DebateResponse,
+        ToolManagedProfile::TopicControl => DraftProfile::TopicControl,
         ToolManagedProfile::ResearchDecision => DraftProfile::ResearchDecision,
         _ => bail!(
             "no FileStore domain adapter exists for {}",
@@ -63,7 +74,16 @@ pub(crate) fn file_store_domain_runtime(
     let phase_u8 = u8::try_from(plan.phase).context("domain tool phase must fit in u8")?;
     let run_id = required_string(state, "run_id")?;
     let current_date = required_string(state, "current_date")?;
-    if plan.tickers.is_empty() {
+    if plan.tickers.is_empty()
+        && !matches!(
+            plan.profile,
+            ToolManagedProfile::ResearcherWarmup
+                | ToolManagedProfile::TopicGeneration
+                | ToolManagedProfile::DebateSeed
+                | ToolManagedProfile::DebateResponse
+                | ToolManagedProfile::TopicControl
+        )
+    {
         bail!("FileStore domain runtime requires at least one ticker")
     }
     if plan.profile == ToolManagedProfile::AnalystReport && plan.tickers.len() != 1 {
@@ -75,6 +95,9 @@ pub(crate) fn file_store_domain_runtime(
         "role": plan.role,
         "profile": plan.profile.as_str(),
         "tickers": plan.tickers,
+        "topic_id": plan.topic_id,
+        "side": plan.side,
+        "round": plan.round,
         "source": source_payload_for(state, phase_u8, plan.profile),
     }))?;
     let unit_key = if plan.profile == ToolManagedProfile::AnalystReport {
@@ -84,6 +107,17 @@ pub(crate) fn file_store_domain_runtime(
             plan.tickers
                 .first()
                 .expect("checked AnalystReport ticker unit")
+        )
+    } else if matches!(
+        plan.profile,
+        ToolManagedProfile::ResearcherWarmup | ToolManagedProfile::TopicGeneration
+    ) {
+        format!("phase{phase_u8}:{}:{}", plan.role, plan.profile.as_str())
+    } else if let Some(topic_id) = plan.topic_id.as_deref() {
+        format!(
+            "phase{phase_u8}:{}:topic:{topic_id}:round:{}",
+            plan.role,
+            plan.round.unwrap_or(0)
         )
     } else {
         format!("phase{phase_u8}:{}:aggregate", plan.role)
@@ -100,10 +134,10 @@ pub(crate) fn file_store_domain_runtime(
         source_payload_hash,
         ticker: (plan.profile == ToolManagedProfile::AnalystReport)
             .then(|| plan.tickers[0].clone()),
-        topic_id: None,
-        side: None,
+        topic_id: plan.topic_id.clone(),
+        side: plan.side.clone(),
         stance: None,
-        round: None,
+        round: plan.round,
         reflection_task: None,
     };
     let store = FileStore::open(store_root, FileStoreOptions::default())?;
@@ -115,6 +149,7 @@ pub(crate) fn file_store_domain_runtime(
         phase_u8,
         plan.profile.as_str().to_owned(),
         plan.tickers.clone().into_iter().collect(),
+        plan.fork.clone(),
     ));
     let service = FileStoreDomainToolService {
         store,
@@ -122,6 +157,8 @@ pub(crate) fn file_store_domain_runtime(
         scope,
         expected_tickers: plan.tickers.clone(),
         created_at: Utc::now().to_rfc3339(),
+        visible_claims: plan.visible_claims.clone(),
+        visible_evidence_refs: plan.visible_evidence_refs.clone(),
     };
     DomainToolRuntimeBinding::new_with_evidence_visibility(
         DomainToolScope {
@@ -215,6 +252,7 @@ struct FileStoreEvidenceVisibility {
     phase: u8,
     profile: String,
     expected_tickers: BTreeSet<String>,
+    fork: Option<ForkReference>,
     current_session_id: Mutex<Option<String>>,
 }
 
@@ -226,6 +264,7 @@ impl FileStoreEvidenceVisibility {
         phase: u8,
         profile: String,
         expected_tickers: BTreeSet<String>,
+        fork: Option<ForkReference>,
     ) -> Self {
         Self {
             store,
@@ -234,6 +273,7 @@ impl FileStoreEvidenceVisibility {
             phase,
             profile,
             expected_tickers,
+            fork,
             current_session_id: Mutex::new(None),
         }
     }
@@ -263,7 +303,7 @@ impl FileStoreEvidenceVisibility {
             self.role.clone(),
             self.phase,
             self.profile.clone(),
-            None,
+            self.fork.clone(),
             Utc::now().to_rfc3339(),
         )?;
         Ok(write_session_manifest(&self.store, location, manifest)?)
@@ -407,6 +447,25 @@ fn source_payload_for(state: &Value, phase: u8, profile: ToolManagedProfile) -> 
             "debate_state_artifact": state.get("debate_state_artifact"),
             "phase2": state.get("phase2"),
         }),
+        (2, ToolManagedProfile::ResearcherWarmup) => json!({
+            "phase1_index": state.get("phase1_index"),
+            "phase_summaries": state.get("phase_summary_memory"),
+        }),
+        (2, ToolManagedProfile::TopicGeneration) => json!({
+            "phase1_index": state.get("phase1_index"),
+            "phase_summaries": state.get("phase_summary_memory"),
+        }),
+        (
+            2,
+            ToolManagedProfile::DebateSeed
+            | ToolManagedProfile::DebateResponse
+            | ToolManagedProfile::TopicControl,
+        ) => json!({
+            "topic": state.get("topic"),
+            "phase2_warmup": state.get("phase2_warmup"),
+            "topic_generation": state.get("topic_generation_artifact"),
+            "topic_state": state.get("topic_debate_states"),
+        }),
         _ => Value::Null,
     }
 }
@@ -418,6 +477,8 @@ struct FileStoreDomainToolService {
     scope: ArtifactScope,
     expected_tickers: Vec<String>,
     created_at: String,
+    visible_claims: BTreeSet<String>,
+    visible_evidence_refs: BTreeSet<String>,
 }
 
 impl FileStoreDomainToolService {
@@ -469,6 +530,18 @@ impl FileStoreDomainToolService {
                 .read_json_value(&self.location.child_relative(&artifact.relative_path())?)
                 .context("read recovered finalized FileStore artifact"),
         }
+    }
+
+    fn phase2(&self) -> Result<Phase2DraftService> {
+        Phase2DraftService::new(
+            self.store.clone(),
+            self.location.clone(),
+            self.scope.clone(),
+            self.created_at.clone(),
+            self.visible_evidence_refs.iter().cloned(),
+            self.visible_claims.iter().cloned(),
+        )
+        .map_err(Into::into)
     }
 }
 
@@ -629,14 +702,133 @@ impl DomainToolService for FileStoreDomainToolService {
     fn finalize_portfolio_decision(&self) -> Result<Value> {
         bail!("portfolio domain runtime is not wired")
     }
+
+    fn set_phase2_common_ground(&self, command: Phase2CommonGroundCommand) -> Result<Value> {
+        self.require(DraftProfile::TopicGeneration)?;
+        Ok(Self::append(
+            self.phase2()?
+                .set_phase2_common_ground(command.common_ground)?,
+        ))
+    }
+
+    fn create_phase2_topic(&self, command: Phase2TopicCommand) -> Result<Value> {
+        self.require(DraftProfile::TopicGeneration)?;
+        let (topic_id, outcome) = self.phase2()?.create_phase2_topic(
+            command.topic,
+            command.decision_hinge,
+            command.evidence_refs,
+        )?;
+        let mut value = Self::append(outcome);
+        value["topic_id"] = json!(topic_id);
+        Ok(value)
+    }
+
+    fn finalize_researcher_warmup(&self) -> Result<Value> {
+        self.require(DraftProfile::ResearcherWarmup)?;
+        Ok(Self::append(self.phase2()?.finalize_researcher_warmup()?))
+    }
+
+    fn finalize_topic_generation(&self) -> Result<Value> {
+        self.require(DraftProfile::TopicGeneration)?;
+        serde_json::to_value(self.phase2()?.finalize_topic_generation()?)
+            .context("serialize phase2 topic generation artifact")
+    }
+
+    fn create_debate_claim(&self, command: DebateClaimCommand) -> Result<Value> {
+        self.require(DraftProfile::DebateSeed)?;
+        let (claim_id, outcome) = self.phase2()?.create_debate_claim(
+            command.claim,
+            command.confidence,
+            command.evidence_refs,
+        )?;
+        let mut value = Self::append(outcome);
+        value["claim_id"] = json!(claim_id);
+        Ok(value)
+    }
+
+    fn finalize_debate_seed(&self) -> Result<Value> {
+        self.require(DraftProfile::DebateSeed)?;
+        serde_json::to_value(self.phase2()?.finalize_debate_seed()?)
+            .context("serialize phase2 debate seed artifact")
+    }
+
+    fn respond_to_debate_claim(&self, command: DebateResponseCommand) -> Result<Value> {
+        self.require(DraftProfile::DebateResponse)?;
+        let (response_id, outcome) = self.phase2()?.respond_to_debate_claim(
+            command.reply_to_claim_id,
+            command.response,
+            command.evidence_refs,
+        )?;
+        let mut value = Self::append(outcome);
+        value["response_id"] = json!(response_id);
+        Ok(value)
+    }
+
+    fn finalize_debate_response(&self) -> Result<Value> {
+        self.require(DraftProfile::DebateResponse)?;
+        serde_json::to_value(self.phase2()?.finalize_debate_response()?)
+            .context("serialize phase2 debate response artifact")
+    }
+
+    fn set_claim_status(&self, command: ClaimStatusCommand) -> Result<Value> {
+        self.require(DraftProfile::TopicControl)?;
+        let status = match command.status.as_str() {
+            "accepted" => ClaimStatus::Accepted,
+            "rejected" => ClaimStatus::Rejected,
+            "unresolved" => ClaimStatus::Unresolved,
+            "blocked" => ClaimStatus::Blocked,
+            _ => bail!("invalid Phase 2 claim status"),
+        };
+        Ok(Self::append(
+            self.phase2()?.set_claim_status(command.claim_id, status)?,
+        ))
+    }
+
+    fn add_agreed_fact(&self, command: TextCommand) -> Result<Value> {
+        self.require(DraftProfile::TopicControl)?;
+        Ok(Self::append(self.phase2()?.add_agreed_fact(command.value)?))
+    }
+
+    fn set_decision_hinge(&self, command: TextCommand) -> Result<Value> {
+        self.require(DraftProfile::TopicControl)?;
+        Ok(Self::append(
+            self.phase2()?.set_decision_hinge(command.value)?,
+        ))
+    }
+
+    fn route_debate_steer(&self, command: DebateSteerCommand) -> Result<Value> {
+        self.require(DraftProfile::TopicControl)?;
+        Ok(Self::append(
+            self.phase2()?
+                .route_debate_steer(command.target, command.instruction)?,
+        ))
+    }
+
+    fn set_topic_soft_control(&self, command: TopicSoftControlCommand) -> Result<Value> {
+        self.require(DraftProfile::TopicControl)?;
+        Ok(Self::append(
+            self.phase2()?
+                .set_topic_soft_control(command.should_continue)?,
+        ))
+    }
+
+    fn finalize_topic_control(&self) -> Result<Value> {
+        self.require(DraftProfile::TopicControl)?;
+        serde_json::to_value(self.phase2()?.finalize_topic_control()?)
+            .context("serialize phase2 topic control artifact")
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use orchestrator_llm::tools::domain_tools::{
-        EvidenceReadRecord, APPEND_ANALYST_EVIDENCE, FINALIZE_ANALYST_REPORT,
-        SET_ANALYST_ASSESSMENT, SET_ANALYST_INVALIDATION,
+        EvidenceReadRecord, ADD_AGREED_FACT, APPEND_ANALYST_EVIDENCE, CREATE_DEBATE_CLAIM,
+        CREATE_PHASE2_TOPIC, FINALIZE_ANALYST_REPORT, FINALIZE_DEBATE_RESPONSE,
+        FINALIZE_DEBATE_SEED, FINALIZE_RESEARCHER_WARMUP, FINALIZE_TOPIC_CONTROL,
+        FINALIZE_TOPIC_GENERATION, RESPOND_TO_DEBATE_CLAIM, SET_ANALYST_ASSESSMENT,
+        SET_ANALYST_INVALIDATION, SET_CLAIM_STATUS, SET_DECISION_HINGE, SET_PHASE2_COMMON_GROUND,
+        SET_TOPIC_SOFT_CONTROL,
     };
 
     fn state() -> Value {
@@ -662,6 +854,11 @@ mod tests {
                 builder_version: 1,
                 tickers: vec![ticker],
                 visible_evidence_refs: ["evidence:test:QQQ".to_owned()].into_iter().collect(),
+                topic_id: None,
+                side: None,
+                round: None,
+                visible_claims: Default::default(),
+                fork: None,
             },
         )
         .unwrap();
@@ -730,6 +927,11 @@ mod tests {
                 builder_version: 1,
                 tickers: vec!["QQQ".to_owned()],
                 visible_evidence_refs: Default::default(),
+                topic_id: None,
+                side: None,
+                round: None,
+                visible_claims: Default::default(),
+                fork: None,
             },
         )
         .unwrap();
@@ -787,5 +989,158 @@ mod tests {
         let events = read_session_events(&store, &session).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, SessionEventType::EvidenceRead);
+    }
+
+    fn phase2_plan(
+        role: &str,
+        profile: ToolManagedProfile,
+        topic_id: Option<&str>,
+        side: Option<&str>,
+        round: Option<u32>,
+        visible_claims: BTreeSet<String>,
+    ) -> FileStoreDomainRuntimePlan {
+        FileStoreDomainRuntimePlan {
+            role: role.to_owned(),
+            phase: 2,
+            profile,
+            profile_version: 1,
+            builder_version: 1,
+            tickers: vec![],
+            visible_evidence_refs: ["evidence:phase1".to_owned()].into_iter().collect(),
+            topic_id: topic_id.map(ToOwned::to_owned),
+            side: side.map(ToOwned::to_owned),
+            round,
+            visible_claims,
+            fork: None,
+        }
+    }
+
+    #[test]
+    fn phase2_bindings_finalize_typed_artifacts_without_legacy_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = state();
+        state["phase1_index"] = json!({"evidence":"phase1"});
+        let topic = file_store_domain_runtime(
+            temp.path(),
+            &state,
+            phase2_plan(
+                "mediator.topic",
+                ToolManagedProfile::TopicGeneration,
+                None,
+                None,
+                None,
+                Default::default(),
+            ),
+        )
+        .unwrap();
+        topic
+            .execute(
+                SET_PHASE2_COMMON_GROUND,
+                json!({"common_ground":"rates remain uncertain"}),
+            )
+            .unwrap();
+        let topic_create = topic.execute(CREATE_PHASE2_TOPIC, json!({"topic":"duration risk","decision_hinge":"real yields","evidence_refs":["evidence:phase1"]})).unwrap();
+        let topic_id = topic_create["topic_id"].as_str().unwrap().to_owned();
+        let topic_final = topic.execute(FINALIZE_TOPIC_GENERATION, json!({})).unwrap();
+        assert_eq!(topic_final["terminal"], true);
+
+        let seed = file_store_domain_runtime(
+            temp.path(),
+            &state,
+            phase2_plan(
+                "researcher.bull.initial",
+                ToolManagedProfile::DebateSeed,
+                Some(&topic_id),
+                Some("bull"),
+                Some(1),
+                Default::default(),
+            ),
+        )
+        .unwrap();
+        let claim = seed.execute(CREATE_DEBATE_CLAIM, json!({"claim":"duration pressure eases","confidence":0.65,"evidence_refs":["evidence:phase1"]})).unwrap();
+        let claim_id = claim["claim_id"].as_str().unwrap().to_owned();
+        assert_eq!(
+            seed.execute(FINALIZE_DEBATE_SEED, json!({})).unwrap()["terminal"],
+            true
+        );
+
+        let response = file_store_domain_runtime(
+            temp.path(),
+            &state,
+            phase2_plan(
+                "researcher.bear.interaction",
+                ToolManagedProfile::DebateResponse,
+                Some(&topic_id),
+                Some("bear"),
+                Some(2),
+                [claim_id.clone()].into_iter().collect(),
+            ),
+        )
+        .unwrap();
+        response.execute(RESPOND_TO_DEBATE_CLAIM, json!({"reply_to_claim_id":claim_id,"response":"inflation can reaccelerate","evidence_refs":["evidence:phase1"]})).unwrap();
+        assert_eq!(
+            response
+                .execute(FINALIZE_DEBATE_RESPONSE, json!({}))
+                .unwrap()["terminal"],
+            true
+        );
+
+        let controller = file_store_domain_runtime(
+            temp.path(),
+            &state,
+            phase2_plan(
+                "mediator.topic_controller",
+                ToolManagedProfile::TopicControl,
+                Some(&topic_id),
+                None,
+                Some(2),
+                Default::default(),
+            ),
+        )
+        .unwrap();
+        controller
+            .execute(SET_DECISION_HINGE, json!({"value":"real yields"}))
+            .unwrap();
+        controller
+            .execute(
+                ADD_AGREED_FACT,
+                json!({"value":"policy sensitivity remains elevated"}),
+            )
+            .unwrap();
+        controller
+            .execute(
+                SET_CLAIM_STATUS,
+                json!({"claim_id":claim_id,"status":"unresolved"}),
+            )
+            .unwrap_err();
+        controller
+            .execute(SET_TOPIC_SOFT_CONTROL, json!({"should_continue":false}))
+            .unwrap();
+        assert_eq!(
+            controller
+                .execute(FINALIZE_TOPIC_CONTROL, json!({}))
+                .unwrap()["terminal"],
+            true
+        );
+
+        let warmup = file_store_domain_runtime(
+            temp.path(),
+            &state,
+            phase2_plan(
+                "mediator.topic",
+                ToolManagedProfile::ResearcherWarmup,
+                None,
+                None,
+                Some(0),
+                Default::default(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            warmup
+                .execute(FINALIZE_RESEARCHER_WARMUP, json!({}))
+                .unwrap()["terminal"],
+            true
+        );
     }
 }

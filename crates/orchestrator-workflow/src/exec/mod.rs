@@ -41,12 +41,17 @@ use crate::orchestration::degraded::{record_degraded_role, role_artifact_or_degr
 use crate::orchestration::domain_runtime::{
     finalize_degraded_analyst_report, FileStoreDomainRuntimePlan,
 };
+use crate::orchestration::input_snapshot_runtime::{
+    capture_phase1_file_store_inputs, phase1_input_sources,
+};
 use crate::orchestration::lifecycle::{
     append_topic_controller_artifact, append_topic_turn, record_contracts,
     research_plan_to_trade_intent, run_id_for, set_phase_status, set_topic_controller_state,
     tickers_from_state, upsert_topic_debate_state,
 };
-use crate::orchestration::policy::{enforce_preflight_policy, run_phase1_preflight};
+use crate::orchestration::policy::{
+    enforce_preflight_policy, run_file_store_phase1_preflight, run_phase1_preflight,
+};
 use crate::orchestration::policy::{
     evaluate_workflow_policy, record_workflow_policy, WorkflowPolicyDecision, WorkflowPolicyMode,
     WorkflowPolicySignals,
@@ -398,6 +403,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
                     alpaca_api_secret: runtime_config.alpaca_api_secret.clone(),
                     phase_summary_index: None,
                     phase_summary_gate: None,
+                    file_store_input: None,
                 };
                 match orchestrator_llm::tools::alpaca::get_history(&tool_config).await {
                     Ok(history) => json!({
@@ -1677,9 +1683,47 @@ async fn run_phase1(
         // FileStore Analyst units obtain their evidence through the
         // ToolManaged runtime and snapshots.  Do not run the old SQLite import
         // preflight for a migrated authority.
-        if !mock && !analyst_uses_file_store(config, role)? {
-            run_phase1_preflight(conn, state, role, config).await?;
+        if !mock {
+            if analyst_uses_file_store(config, role)? {
+                run_file_store_phase1_preflight(state, role, config).await?;
+            } else {
+                run_phase1_preflight(conn, state, role, config).await?;
+            }
             enforce_preflight_policy(state, role, config)?;
+        }
+    }
+
+    // Capture every input required by a migrated role before any Phase 1
+    // Agent Loop begins.  Role jobs receive only this context, never the
+    // mutable CSV paths or SQLite fallback.  Recovery reuses the same sealed
+    // manifest and skips this mutable-file read entirely.
+    if !mock {
+        let mut needs_technical = false;
+        let mut needs_jin10 = false;
+        for role in roles {
+            if !analyst_uses_file_store(config, role)? {
+                continue;
+            }
+            needs_technical |= role == "analyst.technical";
+            needs_jin10 |= role == "analyst.news_macro";
+        }
+        if needs_technical || needs_jin10 {
+            let current_date = state
+                .get("current_date")
+                .and_then(Value::as_str)
+                .context("state.current_date missing for FileStore input capture")?;
+            let sources = phase1_input_sources(
+                current_date,
+                needs_technical,
+                needs_jin10,
+                &tickers_from_state(state),
+            )?;
+            let binding = capture_phase1_file_store_inputs(state, config, &sources)?;
+            state["file_store_input"] = json!({
+                "store_root": binding.store_root,
+                "run_id": binding.run_id,
+                "current_date": binding.current_date,
+            });
         }
     }
 
@@ -1772,6 +1816,11 @@ async fn run_phase1(
                     builder_version: registration.builder_version,
                     tickers: result.tickers.clone(),
                     visible_evidence_refs: BTreeSet::new(),
+                    topic_id: None,
+                    side: None,
+                    round: None,
+                    visible_claims: BTreeSet::new(),
+                    fork: None,
                 },
                 &failure,
             )?;
@@ -2939,7 +2988,7 @@ async fn run_phase2_topic_generation(
                 reasoning_effort_override,
                 config,
                 prompt_path: Some(prompt_path.as_path()),
-                session_id,
+                session_id: session_id.clone(),
                 turn_id: turn_id.clone(),
                 steer: topic_generation_steer(),
             },
@@ -2953,6 +3002,7 @@ async fn run_phase2_topic_generation(
         // even when its artifact falls back to Rust. Bull/Bear use the separate
         // shared warmup checkpoint.
         state["topic_generation_turn_id"] = Value::String(turn_id);
+        state["topic_generation_session_id"] = Value::String(session_id);
         if generated.get("artifact_type").and_then(Value::as_str)
             == Some("phase2_topic_generation_artifact")
         {

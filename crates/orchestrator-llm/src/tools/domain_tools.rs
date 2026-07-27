@@ -36,6 +36,20 @@ pub const FINALIZE_RISK_REVIEW: &str = "finalize_risk_review";
 pub const SET_PORTFOLIO_ASSET_DECISION: &str = "set_portfolio_asset_decision";
 pub const APPEND_BINDING_RISK_CONTROL: &str = "append_binding_risk_control";
 pub const FINALIZE_PORTFOLIO_DECISION: &str = "finalize_portfolio_decision";
+pub const SET_PHASE2_COMMON_GROUND: &str = "set_phase2_common_ground";
+pub const CREATE_PHASE2_TOPIC: &str = "create_phase2_topic";
+pub const FINALIZE_RESEARCHER_WARMUP: &str = "finalize_researcher_warmup";
+pub const FINALIZE_TOPIC_GENERATION: &str = "finalize_topic_generation";
+pub const CREATE_DEBATE_CLAIM: &str = "create_debate_claim";
+pub const FINALIZE_DEBATE_SEED: &str = "finalize_debate_seed";
+pub const RESPOND_TO_DEBATE_CLAIM: &str = "respond_to_debate_claim";
+pub const FINALIZE_DEBATE_RESPONSE: &str = "finalize_debate_response";
+pub const SET_CLAIM_STATUS: &str = "set_claim_status";
+pub const ADD_AGREED_FACT: &str = "add_agreed_fact";
+pub const SET_DECISION_HINGE: &str = "set_decision_hinge";
+pub const ROUTE_DEBATE_STEER: &str = "route_debate_steer";
+pub const SET_TOPIC_SOFT_CONTROL: &str = "set_topic_soft_control";
+pub const FINALIZE_TOPIC_CONTROL: &str = "finalize_topic_control";
 
 const RUST_OWNED_FIELDS: &[&str] = &[
     "store_root",
@@ -175,6 +189,54 @@ pub struct BindingRiskControlCommand {
     pub control: BindingRiskControl,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Phase2CommonGroundCommand {
+    pub common_ground: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Phase2TopicCommand {
+    pub topic: String,
+    pub decision_hinge: String,
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DebateClaimCommand {
+    pub claim: String,
+    pub confidence: f64,
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DebateResponseCommand {
+    pub reply_to_claim_id: String,
+    pub response: String,
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimStatusCommand {
+    pub claim_id: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TextCommand {
+    pub value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DebateSteerCommand {
+    pub target: String,
+    pub instruction: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TopicSoftControlCommand {
+    pub should_continue: bool,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum DomainToolCommand {
     SetAnalystAssessment(AnalystAssessmentCommand),
@@ -195,6 +257,20 @@ pub enum DomainToolCommand {
     SetPortfolioAssetDecision(PortfolioAssetDecisionCommand),
     AppendBindingRiskControl(BindingRiskControlCommand),
     FinalizePortfolio,
+    SetPhase2CommonGround(Phase2CommonGroundCommand),
+    CreatePhase2Topic(Phase2TopicCommand),
+    FinalizeResearcherWarmup,
+    FinalizeTopicGeneration,
+    CreateDebateClaim(DebateClaimCommand),
+    FinalizeDebateSeed,
+    RespondToDebateClaim(DebateResponseCommand),
+    FinalizeDebateResponse,
+    SetClaimStatus(ClaimStatusCommand),
+    AddAgreedFact(TextCommand),
+    SetDecisionHinge(TextCommand),
+    RouteDebateSteer(DebateSteerCommand),
+    SetTopicSoftControl(TopicSoftControlCommand),
+    FinalizeTopicControl,
 }
 
 /// Typed bridge implemented only by a FileStore phase runtime.  It exposes no
@@ -219,6 +295,48 @@ pub trait DomainToolService: Send + Sync {
         -> Result<Value>;
     fn append_binding_risk_control(&self, command: BindingRiskControlCommand) -> Result<Value>;
     fn finalize_portfolio_decision(&self) -> Result<Value>;
+    fn set_phase2_common_ground(&self, _: Phase2CommonGroundCommand) -> Result<Value> {
+        bail!("Phase 2 domain runtime is not wired")
+    }
+    fn create_phase2_topic(&self, _: Phase2TopicCommand) -> Result<Value> {
+        bail!("Phase 2 domain runtime is not wired")
+    }
+    fn finalize_researcher_warmup(&self) -> Result<Value> {
+        bail!("Phase 2 domain runtime is not wired")
+    }
+    fn finalize_topic_generation(&self) -> Result<Value> {
+        bail!("Phase 2 domain runtime is not wired")
+    }
+    fn create_debate_claim(&self, _: DebateClaimCommand) -> Result<Value> {
+        bail!("Phase 2 domain runtime is not wired")
+    }
+    fn finalize_debate_seed(&self) -> Result<Value> {
+        bail!("Phase 2 domain runtime is not wired")
+    }
+    fn respond_to_debate_claim(&self, _: DebateResponseCommand) -> Result<Value> {
+        bail!("Phase 2 domain runtime is not wired")
+    }
+    fn finalize_debate_response(&self) -> Result<Value> {
+        bail!("Phase 2 domain runtime is not wired")
+    }
+    fn set_claim_status(&self, _: ClaimStatusCommand) -> Result<Value> {
+        bail!("Phase 2 domain runtime is not wired")
+    }
+    fn add_agreed_fact(&self, _: TextCommand) -> Result<Value> {
+        bail!("Phase 2 domain runtime is not wired")
+    }
+    fn set_decision_hinge(&self, _: TextCommand) -> Result<Value> {
+        bail!("Phase 2 domain runtime is not wired")
+    }
+    fn route_debate_steer(&self, _: DebateSteerCommand) -> Result<Value> {
+        bail!("Phase 2 domain runtime is not wired")
+    }
+    fn set_topic_soft_control(&self, _: TopicSoftControlCommand) -> Result<Value> {
+        bail!("Phase 2 domain runtime is not wired")
+    }
+    fn finalize_topic_control(&self) -> Result<Value> {
+        bail!("Phase 2 domain runtime is not wired")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -309,6 +427,11 @@ impl DomainToolScope {
         if !matches!(
             self.profile,
             ToolManagedProfile::AnalystReport
+                | ToolManagedProfile::ResearcherWarmup
+                | ToolManagedProfile::TopicGeneration
+                | ToolManagedProfile::DebateSeed
+                | ToolManagedProfile::DebateResponse
+                | ToolManagedProfile::TopicControl
                 | ToolManagedProfile::ResearchDecision
                 | ToolManagedProfile::TradeIntent
                 | ToolManagedProfile::RiskReview
@@ -316,7 +439,16 @@ impl DomainToolScope {
         ) {
             bail!("domain runtime only supports analyst_report or research_decision")
         }
-        if self.tickers.is_empty() {
+        if self.tickers.is_empty()
+            && !matches!(
+                self.profile,
+                ToolManagedProfile::ResearcherWarmup
+                    | ToolManagedProfile::TopicGeneration
+                    | ToolManagedProfile::DebateSeed
+                    | ToolManagedProfile::DebateResponse
+                    | ToolManagedProfile::TopicControl
+            )
+        {
             bail!("domain runtime requires a Rust-owned ticker allowlist")
         }
         if matches!(
@@ -443,6 +575,47 @@ impl DomainToolRuntimeBinding {
             DomainToolCommand::FinalizePortfolio => Ok(
                 json!({"status":"completed","terminal":true,"artifact":self.service.finalize_portfolio_decision()?}),
             ),
+            DomainToolCommand::SetPhase2CommonGround(command) => {
+                self.service.set_phase2_common_ground(command)
+            }
+            DomainToolCommand::CreatePhase2Topic(command) => {
+                self.service.create_phase2_topic(command)
+            }
+            DomainToolCommand::FinalizeResearcherWarmup => Ok(json!({
+                "status":"completed",
+                "terminal":true,
+                "warmup":self.service.finalize_researcher_warmup()?,
+                "artifact":{"status":"ready","response":"准备完毕","kind":"researcher_warmup"}
+            })),
+            DomainToolCommand::FinalizeTopicGeneration => Ok(
+                json!({"status":"completed","terminal":true,"artifact":self.service.finalize_topic_generation()?}),
+            ),
+            DomainToolCommand::CreateDebateClaim(command) => {
+                self.service.create_debate_claim(command)
+            }
+            DomainToolCommand::FinalizeDebateSeed => Ok(
+                json!({"status":"completed","terminal":true,"artifact":self.service.finalize_debate_seed()?}),
+            ),
+            DomainToolCommand::RespondToDebateClaim(command) => {
+                self.service.respond_to_debate_claim(command)
+            }
+            DomainToolCommand::FinalizeDebateResponse => Ok(
+                json!({"status":"completed","terminal":true,"artifact":self.service.finalize_debate_response()?}),
+            ),
+            DomainToolCommand::SetClaimStatus(command) => self.service.set_claim_status(command),
+            DomainToolCommand::AddAgreedFact(command) => self.service.add_agreed_fact(command),
+            DomainToolCommand::SetDecisionHinge(command) => {
+                self.service.set_decision_hinge(command)
+            }
+            DomainToolCommand::RouteDebateSteer(command) => {
+                self.service.route_debate_steer(command)
+            }
+            DomainToolCommand::SetTopicSoftControl(command) => {
+                self.service.set_topic_soft_control(command)
+            }
+            DomainToolCommand::FinalizeTopicControl => Ok(
+                json!({"status":"completed","terminal":true,"artifact":self.service.finalize_topic_control()?}),
+            ),
         }
     }
 }
@@ -468,6 +641,20 @@ pub fn is_domain_tool(name: &str) -> bool {
             | SET_PORTFOLIO_ASSET_DECISION
             | APPEND_BINDING_RISK_CONTROL
             | FINALIZE_PORTFOLIO_DECISION
+            | SET_PHASE2_COMMON_GROUND
+            | CREATE_PHASE2_TOPIC
+            | FINALIZE_RESEARCHER_WARMUP
+            | FINALIZE_TOPIC_GENERATION
+            | CREATE_DEBATE_CLAIM
+            | FINALIZE_DEBATE_SEED
+            | RESPOND_TO_DEBATE_CLAIM
+            | FINALIZE_DEBATE_RESPONSE
+            | SET_CLAIM_STATUS
+            | ADD_AGREED_FACT
+            | SET_DECISION_HINGE
+            | ROUTE_DEBATE_STEER
+            | SET_TOPIC_SOFT_CONTROL
+            | FINALIZE_TOPIC_CONTROL
     )
 }
 
@@ -503,6 +690,22 @@ pub fn tool_names_for_profile(profile: ToolManagedProfile) -> &'static [&'static
             SET_PORTFOLIO_ASSET_DECISION,
             APPEND_BINDING_RISK_CONTROL,
             FINALIZE_PORTFOLIO_DECISION,
+        ],
+        ToolManagedProfile::ResearcherWarmup => &[FINALIZE_RESEARCHER_WARMUP],
+        ToolManagedProfile::TopicGeneration => &[
+            SET_PHASE2_COMMON_GROUND,
+            CREATE_PHASE2_TOPIC,
+            FINALIZE_TOPIC_GENERATION,
+        ],
+        ToolManagedProfile::DebateSeed => &[CREATE_DEBATE_CLAIM, FINALIZE_DEBATE_SEED],
+        ToolManagedProfile::DebateResponse => &[RESPOND_TO_DEBATE_CLAIM, FINALIZE_DEBATE_RESPONSE],
+        ToolManagedProfile::TopicControl => &[
+            SET_CLAIM_STATUS,
+            ADD_AGREED_FACT,
+            SET_DECISION_HINGE,
+            ROUTE_DEBATE_STEER,
+            SET_TOPIC_SOFT_CONTROL,
+            FINALIZE_TOPIC_CONTROL,
         ],
         _ => &[],
     }
@@ -617,6 +820,76 @@ pub fn definition(name: &str) -> Option<ToolDefinition> {
             json!({}),
             json!([]),
         ),
+        SET_PHASE2_COMMON_GROUND => (
+            "Set the shared Phase 2 common ground. Topic identity and scope stay Rust-owned.",
+            json!({"common_ground":{"type":"string","minLength":1}}),
+            json!(["common_ground"]),
+        ),
+        CREATE_PHASE2_TOPIC => (
+            "Create one bounded debate topic. Rust derives the topic ID; every evidence reference must already be visible.",
+            json!({"topic":{"type":"string","minLength":1},"decision_hinge":{"type":"string","minLength":1},"evidence_refs":{"type":"array","minItems":1,"items":{"type":"string","minLength":1}}}),
+            json!(["topic", "decision_hinge", "evidence_refs"]),
+        ),
+        FINALIZE_RESEARCHER_WARMUP => (
+            "Terminally finish warmup after the required structured evidence reads. It writes no business artifact.",
+            json!({}),
+            json!([]),
+        ),
+        FINALIZE_TOPIC_GENERATION => (
+            "Terminally validate and atomically finalize the planned topic generation artifact.",
+            json!({}),
+            json!([]),
+        ),
+        CREATE_DEBATE_CLAIM => (
+            "Create one claim for the Rust-bound topic and side. Rust derives claim ID; cite visible evidence only.",
+            json!({"claim":{"type":"string","minLength":1},"confidence":{"type":"number","minimum":0.0,"maximum":1.0},"evidence_refs":{"type":"array","minItems":1,"items":{"type":"string","minLength":1}}}),
+            json!(["claim", "confidence", "evidence_refs"]),
+        ),
+        FINALIZE_DEBATE_SEED => (
+            "Terminally validate and atomically finalize the bound debate seed.",
+            json!({}),
+            json!([]),
+        ),
+        RESPOND_TO_DEBATE_CLAIM => (
+            "Respond to one visible claim in the Rust-bound topic. The claim ID must be inherited or read, and evidence must be visible.",
+            json!({"reply_to_claim_id":{"type":"string","minLength":1},"response":{"type":"string","minLength":1},"evidence_refs":{"type":"array","minItems":1,"items":{"type":"string","minLength":1}}}),
+            json!(["reply_to_claim_id", "response", "evidence_refs"]),
+        ),
+        FINALIZE_DEBATE_RESPONSE => (
+            "Terminally validate and atomically finalize the bound debate response.",
+            json!({}),
+            json!([]),
+        ),
+        SET_CLAIM_STATUS => (
+            "Set the disposition of one visible claim for this topic controller.",
+            json!({"claim_id":{"type":"string","minLength":1},"status":{"type":"string","enum":["accepted","rejected","unresolved","blocked"]}}),
+            json!(["claim_id", "status"]),
+        ),
+        ADD_AGREED_FACT => (
+            "Append one concise agreed fact to the bound topic controller draft.",
+            json!({"value":{"type":"string","minLength":1}}),
+            json!(["value"]),
+        ),
+        SET_DECISION_HINGE => (
+            "Append one decision hinge to the bound topic controller draft.",
+            json!({"value":{"type":"string","minLength":1}}),
+            json!(["value"]),
+        ),
+        ROUTE_DEBATE_STEER => (
+            "Route one concise Rust-bound follow-up steer to bull or bear.",
+            json!({"target":{"type":"string","enum":["bull","bear"]},"instruction":{"type":"string","minLength":1}}),
+            json!(["target", "instruction"]),
+        ),
+        SET_TOPIC_SOFT_CONTROL => (
+            "Set whether this topic should continue. This does not bypass the Rust maximum-round control.",
+            json!({"should_continue":{"type":"boolean"}}),
+            json!(["should_continue"]),
+        ),
+        FINALIZE_TOPIC_CONTROL => (
+            "Terminally validate and atomically finalize the bound topic controller artifact.",
+            json!({}),
+            json!([]),
+        ),
         _ => return None,
     };
     Some(ToolDefinition {
@@ -675,6 +948,26 @@ where
             SET_PORTFOLIO_ASSET_DECISION
                 | APPEND_BINDING_RISK_CONTROL
                 | FINALIZE_PORTFOLIO_DECISION
+        ),
+        ToolManagedProfile::ResearcherWarmup => name == FINALIZE_RESEARCHER_WARMUP,
+        ToolManagedProfile::TopicGeneration => matches!(
+            name,
+            SET_PHASE2_COMMON_GROUND | CREATE_PHASE2_TOPIC | FINALIZE_TOPIC_GENERATION
+        ),
+        ToolManagedProfile::DebateSeed => {
+            matches!(name, CREATE_DEBATE_CLAIM | FINALIZE_DEBATE_SEED)
+        }
+        ToolManagedProfile::DebateResponse => {
+            matches!(name, RESPOND_TO_DEBATE_CLAIM | FINALIZE_DEBATE_RESPONSE)
+        }
+        ToolManagedProfile::TopicControl => matches!(
+            name,
+            SET_CLAIM_STATUS
+                | ADD_AGREED_FACT
+                | SET_DECISION_HINGE
+                | ROUTE_DEBATE_STEER
+                | SET_TOPIC_SOFT_CONTROL
+                | FINALIZE_TOPIC_CONTROL
         ),
         _ => false,
     };
@@ -742,6 +1035,53 @@ where
             empty(object, name)?;
             DomainToolCommand::FinalizePortfolio
         }
+        SET_PHASE2_COMMON_GROUND => DomainToolCommand::SetPhase2CommonGround(parse(arguments)?),
+        CREATE_PHASE2_TOPIC => {
+            let command: Phase2TopicCommand = parse(arguments)?;
+            for reference in &command.evidence_refs {
+                require_visible(reference, &mut is_visible)?;
+            }
+            DomainToolCommand::CreatePhase2Topic(command)
+        }
+        FINALIZE_RESEARCHER_WARMUP => {
+            empty(object, name)?;
+            DomainToolCommand::FinalizeResearcherWarmup
+        }
+        FINALIZE_TOPIC_GENERATION => {
+            empty(object, name)?;
+            DomainToolCommand::FinalizeTopicGeneration
+        }
+        CREATE_DEBATE_CLAIM => {
+            let command: DebateClaimCommand = parse(arguments)?;
+            for reference in &command.evidence_refs {
+                require_visible(reference, &mut is_visible)?;
+            }
+            DomainToolCommand::CreateDebateClaim(command)
+        }
+        FINALIZE_DEBATE_SEED => {
+            empty(object, name)?;
+            DomainToolCommand::FinalizeDebateSeed
+        }
+        RESPOND_TO_DEBATE_CLAIM => {
+            let command: DebateResponseCommand = parse(arguments)?;
+            for reference in &command.evidence_refs {
+                require_visible(reference, &mut is_visible)?;
+            }
+            DomainToolCommand::RespondToDebateClaim(command)
+        }
+        FINALIZE_DEBATE_RESPONSE => {
+            empty(object, name)?;
+            DomainToolCommand::FinalizeDebateResponse
+        }
+        SET_CLAIM_STATUS => DomainToolCommand::SetClaimStatus(parse(arguments)?),
+        ADD_AGREED_FACT => DomainToolCommand::AddAgreedFact(parse(arguments)?),
+        SET_DECISION_HINGE => DomainToolCommand::SetDecisionHinge(parse(arguments)?),
+        ROUTE_DEBATE_STEER => DomainToolCommand::RouteDebateSteer(parse(arguments)?),
+        SET_TOPIC_SOFT_CONTROL => DomainToolCommand::SetTopicSoftControl(parse(arguments)?),
+        FINALIZE_TOPIC_CONTROL => {
+            empty(object, name)?;
+            DomainToolCommand::FinalizeTopicControl
+        }
         _ => bail!("unknown domain tool {name}"),
     };
     match &command {
@@ -775,7 +1115,12 @@ fn model_owned_fields(name: &str) -> &'static [&'static str] {
         | FINALIZE_RESEARCH_DECISION
         | FINALIZE_TRADE_INTENT
         | FINALIZE_RISK_REVIEW
-        | FINALIZE_PORTFOLIO_DECISION => &[],
+        | FINALIZE_PORTFOLIO_DECISION
+        | FINALIZE_RESEARCHER_WARMUP
+        | FINALIZE_TOPIC_GENERATION
+        | FINALIZE_DEBATE_SEED
+        | FINALIZE_DEBATE_RESPONSE
+        | FINALIZE_TOPIC_CONTROL => &[],
         SET_RESEARCH_DECISION => &[
             "ticker",
             "rating",
@@ -826,6 +1171,14 @@ fn model_owned_fields(name: &str) -> &'static [&'static str] {
             "rationale",
         ],
         APPEND_BINDING_RISK_CONTROL => &["control"],
+        SET_PHASE2_COMMON_GROUND => &["common_ground"],
+        CREATE_PHASE2_TOPIC => &["topic", "decision_hinge", "evidence_refs"],
+        CREATE_DEBATE_CLAIM => &["claim", "confidence", "evidence_refs"],
+        RESPOND_TO_DEBATE_CLAIM => &["reply_to_claim_id", "response", "evidence_refs"],
+        SET_CLAIM_STATUS => &["claim_id", "status"],
+        ADD_AGREED_FACT | SET_DECISION_HINGE => &["value"],
+        ROUTE_DEBATE_STEER => &["target", "instruction"],
+        SET_TOPIC_SOFT_CONTROL => &["should_continue"],
         _ => &[],
     }
 }

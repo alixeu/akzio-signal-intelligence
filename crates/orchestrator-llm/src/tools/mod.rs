@@ -52,6 +52,20 @@ pub const FINALIZE_RISK_REVIEW_TOOL_NAME: &str = domain_tools::FINALIZE_RISK_REV
 pub const SET_PORTFOLIO_ASSET_DECISION_TOOL_NAME: &str = domain_tools::SET_PORTFOLIO_ASSET_DECISION;
 pub const APPEND_BINDING_RISK_CONTROL_TOOL_NAME: &str = domain_tools::APPEND_BINDING_RISK_CONTROL;
 pub const FINALIZE_PORTFOLIO_DECISION_TOOL_NAME: &str = domain_tools::FINALIZE_PORTFOLIO_DECISION;
+pub const SET_PHASE2_COMMON_GROUND_TOOL_NAME: &str = domain_tools::SET_PHASE2_COMMON_GROUND;
+pub const CREATE_PHASE2_TOPIC_TOOL_NAME: &str = domain_tools::CREATE_PHASE2_TOPIC;
+pub const FINALIZE_RESEARCHER_WARMUP_TOOL_NAME: &str = domain_tools::FINALIZE_RESEARCHER_WARMUP;
+pub const FINALIZE_TOPIC_GENERATION_TOOL_NAME: &str = domain_tools::FINALIZE_TOPIC_GENERATION;
+pub const CREATE_DEBATE_CLAIM_TOOL_NAME: &str = domain_tools::CREATE_DEBATE_CLAIM;
+pub const FINALIZE_DEBATE_SEED_TOOL_NAME: &str = domain_tools::FINALIZE_DEBATE_SEED;
+pub const RESPOND_TO_DEBATE_CLAIM_TOOL_NAME: &str = domain_tools::RESPOND_TO_DEBATE_CLAIM;
+pub const FINALIZE_DEBATE_RESPONSE_TOOL_NAME: &str = domain_tools::FINALIZE_DEBATE_RESPONSE;
+pub const SET_CLAIM_STATUS_TOOL_NAME: &str = domain_tools::SET_CLAIM_STATUS;
+pub const ADD_AGREED_FACT_TOOL_NAME: &str = domain_tools::ADD_AGREED_FACT;
+pub const SET_DECISION_HINGE_TOOL_NAME: &str = domain_tools::SET_DECISION_HINGE;
+pub const ROUTE_DEBATE_STEER_TOOL_NAME: &str = domain_tools::ROUTE_DEBATE_STEER;
+pub const SET_TOPIC_SOFT_CONTROL_TOOL_NAME: &str = domain_tools::SET_TOPIC_SOFT_CONTROL;
+pub const FINALIZE_TOPIC_CONTROL_TOOL_NAME: &str = domain_tools::FINALIZE_TOPIC_CONTROL;
 // Internal compatibility only. This tool is intentionally absent from REGISTRY.
 pub const READ_RUN_CONTEXT_TOOL_NAME: &str = read_run_context::NAME;
 pub const ALPACA_GET_PORTFOLIO_TOOL_NAME: &str = alpaca::GET_PORTFOLIO_NAME;
@@ -95,6 +109,34 @@ pub struct ExternalToolConfig {
     pub phase_summary_index: Option<std::sync::Arc<orchestrator_sql::PhaseSummaryMemoryIndex>>,
     #[serde(skip)]
     pub phase_summary_gate: Option<std::sync::Arc<orchestrator_sql::PhaseSummaryGate>>,
+    /// Present only for an explicitly migrated FileStore unit.  The typed
+    /// context is Rust-owned and lets read tools access the immutable input
+    /// copies for this run without accepting a model-provided path.
+    #[serde(skip)]
+    pub file_store_input: Option<FileStoreInputSnapshot>,
+}
+
+/// Identity of immutable Technical/Jin10 inputs captured for one FileStore
+/// run.  This is deliberately not a general filesystem capability: readers
+/// derive every source path from `InputSource` and only read a hash-sealed
+/// run-local copy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileStoreInputSnapshot {
+    pub store_root: PathBuf,
+    pub run_id: String,
+    pub current_date: String,
+}
+
+impl FileStoreInputSnapshot {
+    pub fn read(&self, source: &orchestrator_store::InputSource) -> Result<Vec<u8>> {
+        let store = orchestrator_store::FileStore::open(
+            &self.store_root,
+            orchestrator_store::FileStoreOptions::default(),
+        )?;
+        let location =
+            orchestrator_store::RunLocation::new(self.current_date.clone(), self.run_id.clone())?;
+        orchestrator_store::read_snapshotted_input(&store, &location, source).map_err(Into::into)
+    }
 }
 
 impl Default for ExternalToolConfig {
@@ -115,6 +157,7 @@ impl Default for ExternalToolConfig {
             alpaca_api_secret: None,
             phase_summary_index: None,
             phase_summary_gate: None,
+            file_store_input: None,
         }
     }
 }
@@ -254,6 +297,103 @@ const REGISTRY: &[ToolEntry] = &[
         name: domain_tools::FINALIZE_PORTFOLIO_DECISION,
         definition: || {
             domain_tools::definition(domain_tools::FINALIZE_PORTFOLIO_DECISION)
+                .expect("registered domain tool")
+        },
+    },
+    ToolEntry {
+        name: domain_tools::SET_PHASE2_COMMON_GROUND,
+        definition: || {
+            domain_tools::definition(domain_tools::SET_PHASE2_COMMON_GROUND)
+                .expect("registered domain tool")
+        },
+    },
+    ToolEntry {
+        name: domain_tools::CREATE_PHASE2_TOPIC,
+        definition: || {
+            domain_tools::definition(domain_tools::CREATE_PHASE2_TOPIC)
+                .expect("registered domain tool")
+        },
+    },
+    ToolEntry {
+        name: domain_tools::FINALIZE_RESEARCHER_WARMUP,
+        definition: || {
+            domain_tools::definition(domain_tools::FINALIZE_RESEARCHER_WARMUP)
+                .expect("registered domain tool")
+        },
+    },
+    ToolEntry {
+        name: domain_tools::FINALIZE_TOPIC_GENERATION,
+        definition: || {
+            domain_tools::definition(domain_tools::FINALIZE_TOPIC_GENERATION)
+                .expect("registered domain tool")
+        },
+    },
+    ToolEntry {
+        name: domain_tools::CREATE_DEBATE_CLAIM,
+        definition: || {
+            domain_tools::definition(domain_tools::CREATE_DEBATE_CLAIM)
+                .expect("registered domain tool")
+        },
+    },
+    ToolEntry {
+        name: domain_tools::FINALIZE_DEBATE_SEED,
+        definition: || {
+            domain_tools::definition(domain_tools::FINALIZE_DEBATE_SEED)
+                .expect("registered domain tool")
+        },
+    },
+    ToolEntry {
+        name: domain_tools::RESPOND_TO_DEBATE_CLAIM,
+        definition: || {
+            domain_tools::definition(domain_tools::RESPOND_TO_DEBATE_CLAIM)
+                .expect("registered domain tool")
+        },
+    },
+    ToolEntry {
+        name: domain_tools::FINALIZE_DEBATE_RESPONSE,
+        definition: || {
+            domain_tools::definition(domain_tools::FINALIZE_DEBATE_RESPONSE)
+                .expect("registered domain tool")
+        },
+    },
+    ToolEntry {
+        name: domain_tools::SET_CLAIM_STATUS,
+        definition: || {
+            domain_tools::definition(domain_tools::SET_CLAIM_STATUS)
+                .expect("registered domain tool")
+        },
+    },
+    ToolEntry {
+        name: domain_tools::ADD_AGREED_FACT,
+        definition: || {
+            domain_tools::definition(domain_tools::ADD_AGREED_FACT).expect("registered domain tool")
+        },
+    },
+    ToolEntry {
+        name: domain_tools::SET_DECISION_HINGE,
+        definition: || {
+            domain_tools::definition(domain_tools::SET_DECISION_HINGE)
+                .expect("registered domain tool")
+        },
+    },
+    ToolEntry {
+        name: domain_tools::ROUTE_DEBATE_STEER,
+        definition: || {
+            domain_tools::definition(domain_tools::ROUTE_DEBATE_STEER)
+                .expect("registered domain tool")
+        },
+    },
+    ToolEntry {
+        name: domain_tools::SET_TOPIC_SOFT_CONTROL,
+        definition: || {
+            domain_tools::definition(domain_tools::SET_TOPIC_SOFT_CONTROL)
+                .expect("registered domain tool")
+        },
+    },
+    ToolEntry {
+        name: domain_tools::FINALIZE_TOPIC_CONTROL,
+        definition: || {
+            domain_tools::definition(domain_tools::FINALIZE_TOPIC_CONTROL)
                 .expect("registered domain tool")
         },
     },
@@ -842,6 +982,7 @@ mod tests {
             alpaca_api_secret: None,
             phase_summary_index: None,
             phase_summary_gate: None,
+            file_store_input: None,
         }
     }
 

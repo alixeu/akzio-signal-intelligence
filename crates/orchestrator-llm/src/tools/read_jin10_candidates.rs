@@ -1,5 +1,6 @@
 use super::{api_tool_name, log_tool_result, ExternalToolConfig, ToolDefinition};
 use anyhow::{Context, Result};
+use orchestrator_store::{InputSource, Jin10Format};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -44,12 +45,20 @@ pub fn execute(args: Value, config: &ExternalToolConfig) -> Result<Value> {
     } else {
         args.tickers
     };
-    let rows = orchestrator_core::load_jin10_csv_recent_from_dir(
-        &config
-            .project_root
-            .join(orchestrator_core::DEFAULT_JIN10_CSV_DIR),
-        3,
-    );
+    let rows = if let Some(snapshot) = &config.file_store_input {
+        let source = InputSource::jin10(snapshot.current_date.clone(), Jin10Format::Csv)?;
+        let payload = snapshot.read(&source)?;
+        let raw =
+            std::str::from_utf8(&payload).context("snapshotted Jin10 CSV is not valid UTF-8")?;
+        orchestrator_core::parse_jin10_csv(raw)?
+    } else {
+        orchestrator_core::load_jin10_csv_recent_from_dir(
+            &config
+                .project_root
+                .join(orchestrator_core::DEFAULT_JIN10_CSV_DIR),
+            3,
+        )
+    };
     let mut candidates = rows
         .into_iter()
         .map(|row| {
@@ -77,7 +86,11 @@ pub fn execute(args: Value, config: &ExternalToolConfig) -> Result<Value> {
     let result = if events.is_empty() {
         json!({"status": "data_gap", "data_gap": "no preflight Jin10 candidate data"})
     } else {
-        json!({"status": "ok", "source": "csv.jin10", "candidates": events})
+        json!({
+            "status": "ok",
+            "source": if config.file_store_input.is_some() { "filestore.run_input.jin10" } else { "csv.jin10" },
+            "candidates": events
+        })
     };
     log_tool_result(NAME, &Ok(result.clone()));
     Ok(result)
@@ -120,6 +133,7 @@ fn candidate_priority(content: &str, tickers: &[String]) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use orchestrator_store::{capture_run_inputs, write_input_payload, FileStore, RunLocation};
 
     #[test]
     fn bounds_candidates_and_preserves_stable_event_ids() {
@@ -144,5 +158,49 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result["candidates"][0]["event_id"], "event-1");
+    }
+
+    #[test]
+    fn file_store_reader_keeps_captured_jin10_after_mutable_input_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = FileStore::open(temp.path(), Default::default()).unwrap();
+        let source = InputSource::jin10("2026-07-27", Jin10Format::Csv).unwrap();
+        write_input_payload(
+            &store,
+            source.clone(),
+            b"id,time,content\nevent-old,2026-07-27 09:00:00,Fed CPI update\n",
+            "2026-07-27T00:00:00Z",
+        )
+        .unwrap();
+        let location = RunLocation::new("2026-07-27", "run-jin10-test").unwrap();
+        capture_run_inputs(
+            &store,
+            &location,
+            std::slice::from_ref(&source),
+            "2026-07-27T00:00:00Z",
+        )
+        .unwrap();
+        write_input_payload(
+            &store,
+            source,
+            b"id,time,content\nevent-new,2026-07-27 10:00:00,unrelated refresh\n",
+            "2026-07-27T00:01:00Z",
+        )
+        .unwrap();
+
+        let result = execute(
+            json!({"tickers": ["QQQ"]}),
+            &ExternalToolConfig {
+                file_store_input: Some(super::super::FileStoreInputSnapshot {
+                    store_root: temp.path().to_path_buf(),
+                    run_id: "run-jin10-test".to_owned(),
+                    current_date: "2026-07-27".to_owned(),
+                }),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(result["source"], "filestore.run_input.jin10");
+        assert_eq!(result["candidates"][0]["event_id"], "event-old");
     }
 }

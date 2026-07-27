@@ -1,6 +1,8 @@
 use super::{api_tool_name, log_tool_result, ExternalToolConfig, ToolDefinition};
 use anyhow::{bail, Context, Result};
+use orchestrator_core::parse_technical_csv;
 use orchestrator_core::technical_csv::storage_interval;
+use orchestrator_store::InputSource;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -10,7 +12,7 @@ const MAX_DETAIL_ROWS: usize = 120;
 pub fn definition() -> ToolDefinition {
     ToolDefinition {
         name: api_tool_name(NAME),
-        description: "Expand raw SQLite technical bars for a specific ticker/interval and bounded date range after a snapshot signal requires verification. This read-only tool returns only stored bars.".to_string(),
+        description: "Expand raw technical bars from the Rust-owned run input for a specific ticker/interval and bounded date range after a snapshot signal requires verification.".to_string(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -47,6 +49,9 @@ pub fn execute(args: Value, config: &ExternalToolConfig) -> Result<Value> {
     let ticker = args.ticker.trim().to_ascii_uppercase();
     let interval = storage_interval(&args.interval)
         .ok_or_else(|| anyhow::anyhow!("unsupported technical interval {:?}", args.interval))?;
+    if let Some(snapshot) = &config.file_store_input {
+        return execute_file_store_detail(args, ticker, interval, snapshot);
+    }
     let db_path = config
         .db_path
         .as_ref()
@@ -77,6 +82,51 @@ pub fn execute(args: Value, config: &ExternalToolConfig) -> Result<Value> {
         json!({"status": "data_gap", "ticker": ticker, "interval": interval, "data_gap": "no matching SQLite technical bars"})
     } else {
         json!({"status": "ok", "source": "sqlite.technical_bars", "ticker": ticker, "interval": interval, "signal_id": args.signal_id, "data": data})
+    };
+    log_tool_result(NAME, &Ok(result.clone()));
+    Ok(result)
+}
+
+fn execute_file_store_detail(
+    args: Args,
+    ticker: String,
+    interval: &str,
+    snapshot: &super::FileStoreInputSnapshot,
+) -> Result<Value> {
+    let source = InputSource::technical(&ticker, interval)?;
+    let payload = snapshot.read(&source)?;
+    let raw =
+        std::str::from_utf8(&payload).context("snapshotted technical CSV is not valid UTF-8")?;
+    let mut rows = parse_technical_csv(raw)?
+        .into_iter()
+        .filter(|row| {
+            args.start
+                .as_deref()
+                .is_none_or(|start| row.date.as_str() >= start)
+                && args
+                    .end
+                    .as_deref()
+                    .is_none_or(|end| row.date.as_str() <= end)
+        })
+        .collect::<Vec<_>>();
+    if rows.len() > MAX_DETAIL_ROWS {
+        rows = rows.split_off(rows.len() - MAX_DETAIL_ROWS);
+    }
+    let data = rows
+        .into_iter()
+        .map(|row| {
+            let mut value = serde_json::Map::new();
+            value.insert("date".into(), json!(row.date));
+            for (key, number) in row.values {
+                value.insert(key, json!(number));
+            }
+            Value::Object(value)
+        })
+        .collect::<Vec<_>>();
+    let result = if data.is_empty() {
+        json!({"status": "data_gap", "ticker": ticker, "interval": interval, "data_gap": "no matching run-local technical bars"})
+    } else {
+        json!({"status": "ok", "source": "filestore.run_input.technical", "ticker": ticker, "interval": interval, "signal_id": args.signal_id, "data": data})
     };
     log_tool_result(NAME, &Ok(result.clone()));
     Ok(result)

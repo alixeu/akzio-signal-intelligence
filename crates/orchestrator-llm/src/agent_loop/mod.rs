@@ -4266,6 +4266,7 @@ mod tests {
                 alpaca_api_secret: None,
                 phase_summary_index: None,
                 phase_summary_gate: None,
+                file_store_input: None,
             },
             vec![tools::READ_RUN_CONTEXT_TOOL_NAME.to_string()],
         );
@@ -4581,6 +4582,7 @@ mod tests {
                 alpaca_api_secret: None,
                 phase_summary_index: None,
                 phase_summary_gate: None,
+                file_store_input: None,
             },
             Vec::new(),
         );
@@ -5344,6 +5346,7 @@ mod tests {
                 alpaca_api_secret: None,
                 phase_summary_index: None,
                 phase_summary_gate: None,
+                file_store_input: None,
             },
             vec![tools::WEB_RUN_TOOL_NAME.to_string()],
         )

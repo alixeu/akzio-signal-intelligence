@@ -3250,6 +3250,7 @@ fn default_tool_config() -> tools::ExternalToolConfig {
         alpaca_api_secret: None,
         phase_summary_index: None,
         phase_summary_gate: None,
+        file_store_input: None,
     }
 }
 
@@ -3738,6 +3739,7 @@ mod tests {
             alpaca_api_secret: None,
             phase_summary_index: None,
             phase_summary_gate: None,
+            file_store_input: None,
         });
         let first = agent_loop::Turn::new(
             "turn-topic-a",
@@ -3785,6 +3787,7 @@ mod tests {
             alpaca_api_secret: None,
             phase_summary_index: None,
             phase_summary_gate: None,
+            file_store_input: None,
         });
 
         super::append_debug_llm_record(

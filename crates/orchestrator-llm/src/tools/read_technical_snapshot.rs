@@ -1,6 +1,7 @@
 use super::{api_tool_name, log_tool_result, ExternalToolConfig, ToolDefinition};
 use anyhow::{bail, Context, Result};
-use orchestrator_core::technical_csv::{storage_interval, TechnicalCsvRow};
+use orchestrator_core::technical_csv::{parse_technical_csv, storage_interval, TechnicalCsvRow};
+use orchestrator_store::InputSource;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
@@ -11,7 +12,7 @@ const DEFAULT_INTERVALS: [&str; 3] = ["daily", "3h", "20min"];
 pub fn definition() -> ToolDefinition {
     ToolDefinition {
         name: api_tool_name(NAME),
-        description: "Read compact, deterministic technical signals for one or more tickers from preflight-imported SQLite data. Returns structure, momentum, volatility, coverage and stable signal IDs; use read_technical_detail only when a returned signal needs raw-bar verification.".to_string(),
+        description: "Read compact, deterministic technical signals for one or more tickers from the Rust-owned run input. Returns structure, momentum, volatility, coverage and stable signal IDs; use read_technical_detail only when a returned signal needs raw-bar verification.".to_string(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -45,6 +46,9 @@ pub fn execute(args: Value, config: &ExternalToolConfig) -> Result<Value> {
         serde_json::from_value(args).context("invalid read_technical_snapshot arguments")?;
     let tickers = canonical_tickers(args.tickers)?;
     let intervals = canonical_intervals(args.intervals)?;
+    if let Some(snapshot) = &config.file_store_input {
+        return execute_file_store_snapshot(tickers, intervals, snapshot);
+    }
     let db_path = config
         .db_path
         .as_ref()
@@ -65,6 +69,37 @@ pub fn execute(args: Value, config: &ExternalToolConfig) -> Result<Value> {
         .collect::<Result<Vec<_>>>()?;
     let result = json!({
         "source": "sqlite.technical_bars",
+        "snapshots": snapshots,
+        "raw_bars_available_via": "read_technical_detail"
+    });
+    log_tool_result(NAME, &Ok(result.clone()));
+    Ok(result)
+}
+
+fn execute_file_store_snapshot(
+    tickers: Vec<String>,
+    intervals: Vec<String>,
+    snapshot: &super::FileStoreInputSnapshot,
+) -> Result<Value> {
+    let snapshots = tickers
+        .iter()
+        .map(|ticker| {
+            let intervals = intervals
+                .iter()
+                .map(|interval| {
+                    let source = InputSource::technical(ticker, interval)?;
+                    let payload = snapshot.read(&source)?;
+                    let raw = std::str::from_utf8(&payload)
+                        .context("snapshotted technical CSV is not valid UTF-8")?;
+                    let rows = parse_technical_csv(raw)?;
+                    Ok(snapshot_for(ticker, interval, &rows))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(json!({"ticker": ticker, "intervals": intervals}))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let result = json!({
+        "source": "filestore.run_input.technical",
         "snapshots": snapshots,
         "raw_bars_available_via": "read_technical_detail"
     });
@@ -225,6 +260,7 @@ fn volatility_label(value: f64) -> &'static str {
 mod tests {
     use super::*;
     use orchestrator_core::{write_technical_csv, TechnicalCsvRow};
+    use orchestrator_store::{capture_run_inputs, write_input_payload, FileStore, RunLocation};
     use std::collections::HashMap;
 
     #[test]
@@ -262,5 +298,49 @@ mod tests {
             "breakout"
         );
         assert!(result.to_string().contains("raw_bars_available_via"));
+    }
+
+    #[test]
+    fn file_store_reader_keeps_captured_bytes_after_mutable_input_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = FileStore::open(temp.path(), Default::default()).unwrap();
+        let source = InputSource::technical("QQQ", "daily").unwrap();
+        let before = b"date,Close\n2026-07-20,100\n2026-07-21,104\n";
+        write_input_payload(&store, source.clone(), before, "2026-07-27T00:00:00Z").unwrap();
+        let location = RunLocation::new("2026-07-27", "run-input-test").unwrap();
+        capture_run_inputs(
+            &store,
+            &location,
+            std::slice::from_ref(&source),
+            "2026-07-27T00:00:00Z",
+        )
+        .unwrap();
+
+        // Simulate a subsequent atomic mutable-source refresh. The run reader
+        // must continue returning the sealed copy, not this replacement.
+        write_input_payload(
+            &store,
+            source,
+            b"date,Close\n2026-07-20,1\n2026-07-21,2\n",
+            "2026-07-27T00:01:00Z",
+        )
+        .unwrap();
+        let result = execute(
+            json!({"tickers": ["QQQ"], "intervals": ["daily"]}),
+            &ExternalToolConfig {
+                file_store_input: Some(super::super::FileStoreInputSnapshot {
+                    store_root: temp.path().to_path_buf(),
+                    run_id: "run-input-test".to_owned(),
+                    current_date: "2026-07-27".to_owned(),
+                }),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(result["source"], "filestore.run_input.technical");
+        assert_eq!(
+            result["snapshots"][0]["intervals"][0]["latest"]["close"],
+            104.0
+        );
     }
 }
