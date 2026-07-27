@@ -302,6 +302,9 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
     manifest.artifacts = rebuilt.artifacts;
     manifest.status = RunStatus::Completed;
     sync_manifest_health(&mut manifest, &state);
+    if let Some(phase) = highest_completed_phase(&manifest) {
+        manifest.current_phase = phase;
+    }
     manifest.completed_at = Some(Utc::now().to_rfc3339());
     write_run_manifest(&store, &location, manifest)?;
     seal_state(&mut state)?;
@@ -452,6 +455,21 @@ fn sync_manifest_health(manifest: &mut RunManifest, state: &Value) {
             created_at: Utc::now().to_rfc3339(),
         })
         .collect();
+}
+
+fn highest_completed_phase(manifest: &RunManifest) -> Option<u8> {
+    manifest
+        .phase_status
+        .iter()
+        .filter(|(_, status)| {
+            matches!(
+                status,
+                orchestrator_store::PhaseStatus::Completed
+                    | orchestrator_store::PhaseStatus::Degraded
+            )
+        })
+        .filter_map(|(phase, _)| phase.parse::<u8>().ok())
+        .max()
 }
 
 fn phase_completed(manifest: &RunManifest, phase: u8) -> bool {
@@ -1691,11 +1709,12 @@ fn seal_state(state: &mut Value) -> Result<()> {
 
 #[cfg(test)]
 mod phase2_session_tests {
-    use orchestrator_store::{RunLocation, RunManifest, RunManifestInit};
+    use orchestrator_store::{PhaseStatus, RunLocation, RunManifest, RunManifestInit};
     use serde_json::json;
 
     use super::{
-        phase2_fork_reference, record_phase2_session, runtime_session_key, sync_manifest_health,
+        highest_completed_phase, phase2_fork_reference, record_phase2_session, runtime_session_key,
+        sync_manifest_health,
     };
 
     #[test]
@@ -1756,5 +1775,30 @@ mod phase2_session_tests {
         assert_eq!(manifest.errors.len(), 1);
         assert_eq!(manifest.errors[0].phase, Some(3));
         assert_eq!(manifest.errors[0].code, "artifact");
+    }
+
+    #[test]
+    fn completed_run_projection_uses_the_highest_completed_phase() {
+        let mut manifest = RunManifest::new(RunManifestInit {
+            location: RunLocation::new("2026-07-27", "run-phase-test").unwrap(),
+            workflow_version: "test".to_owned(),
+            prompt_versions: Default::default(),
+            git_sha: "test".to_owned(),
+            config_hash: "test".to_owned(),
+            authority_registry_hash: "test".to_owned(),
+            created_at: "2026-07-27T00:00:00Z".to_owned(),
+        })
+        .unwrap();
+        manifest
+            .phase_status
+            .insert("2".to_owned(), PhaseStatus::Completed);
+        manifest
+            .phase_status
+            .insert("7".to_owned(), PhaseStatus::Degraded);
+        manifest
+            .phase_status
+            .insert("8".to_owned(), PhaseStatus::Completed);
+
+        assert_eq!(highest_completed_phase(&manifest), Some(8));
     }
 }
