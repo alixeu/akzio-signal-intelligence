@@ -231,29 +231,24 @@ where
     let mut first_iteration = true;
     let max_loops = config.max_agent_loops.map(|value| value.max(1));
     let mut loop_index = 0usize;
-    let mut end_turn_count = 0usize;
     let mut aggregate_result = ModelStreamResult::default();
     let mut judge_call_count = 0usize;
     let mut retrieval_retry_queued = false;
     let mut terminal_finalize_failures = 0usize;
     loop {
         if let Some(max_loops) = max_loops {
-            if end_turn_count >= max_loops {
+            if loop_index >= max_loops {
                 turn.end_reason = Some("max_loops".to_string());
                 warn!(
                     turn_id = turn.turn_id,
                     role = turn.role,
                     phase = turn.phase,
                     model_iterations = loop_index,
-                    completed_end_turns = end_turn_count,
-                    max_end_turns = max_loops,
                     pending_input = turn.pending_input.len(),
                     pending_tool_calls = turn.pending_tool_calls.len(),
-                    "agent loop exhausted its end-turn budget"
+                    "agent loop exhausted its model-iteration budget"
                 );
-                bail!(
-                    "agent loop reached max_agent_loops={max_loops} after end_turns={end_turn_count}"
-                );
+                bail!("agent loop reached max_agent_loops={max_loops}");
             }
         }
         loop_index += 1;
@@ -303,17 +298,6 @@ where
             .tool_calls
             .extend(stream_result.tool_calls.iter().cloned());
         aggregate_result.needs_follow_up = stream_result.needs_follow_up;
-        if stream_result.end_turn {
-            end_turn_count += 1;
-            debug!(
-                turn_id = turn.turn_id,
-                role = turn.role,
-                loop_index,
-                end_turn_count,
-                max_end_turns = ?max_loops,
-                "agent loop recorded end_turn"
-            );
-        }
 
         if !turn.pending_tool_calls.is_empty() {
             let calls = std::mem::take(&mut turn.pending_tool_calls);
@@ -2196,9 +2180,46 @@ impl LoopToolRuntime for StaticToolRuntime {
 
 #[cfg(test)]
 mod terminal_finalize_tests {
+    use anyhow::Result;
+    use orchestrator_store::{FileStore, FileStoreOptions, RunLocation};
     use serde_json::{json, Value};
+    use std::{future::Future, pin::Pin};
+    use tempfile::tempdir;
 
-    use super::{is_terminal_finalize_attempt, is_terminal_tool_result, ToolResultItem};
+    use super::{
+        is_terminal_finalize_attempt, is_terminal_tool_result, run_turn, AgentLoopConfig,
+        FileStoreSessionRuntime, LoopModel, ModelInput, ModelResponse, SessionRuntimeSpec,
+        StaticToolRuntime, ToolCallRequest, ToolResultItem, Turn, TurnStatus,
+    };
+
+    struct RepeatingToolModel {
+        calls: usize,
+    }
+
+    impl LoopModel for RepeatingToolModel {
+        fn generate<'a>(
+            &'a mut self,
+            _: ModelInput,
+        ) -> Pin<Box<dyn Future<Output = Result<ModelResponse>> + Send + 'a>> {
+            self.calls += 1;
+            Box::pin(async move {
+                Ok(ModelResponse {
+                    assistant_message: None,
+                    reasoning_summary: None,
+                    tool_calls: vec![ToolCallRequest {
+                        call_id: format!("read-{}", self.calls),
+                        name: "read".to_owned(),
+                        arguments: json!({}),
+                    }],
+                    // Tool responses from the gateway commonly use false here.
+                    // The loop limit must still count the model response.
+                    end_turn: false,
+                    raw: Value::Null,
+                    turn_status: TurnStatus::Unknown,
+                })
+            })
+        }
+    }
 
     #[test]
     fn only_unsuccessful_finalize_calls_consume_the_repair_budget() {
@@ -2220,5 +2241,51 @@ mod terminal_finalize_tests {
         };
         assert!(is_terminal_tool_result(&succeeded));
         assert!(!is_terminal_finalize_attempt(&succeeded));
+    }
+
+    #[tokio::test]
+    async fn model_iteration_limit_applies_when_tool_responses_do_not_end_the_turn() {
+        let temp = tempdir().unwrap();
+        let session = FileStoreSessionRuntime::create_or_load(
+            FileStore::open(temp.path(), FileStoreOptions::default()).unwrap(),
+            SessionRuntimeSpec {
+                run: RunLocation::new("2026-07-27", "run-a").unwrap(),
+                session_id: "session-a".to_owned(),
+                role: "analyst.technical".to_owned(),
+                phase: 1,
+                profile: "analyst_report".to_owned(),
+                fork: None,
+                created_at: "2026-07-27T00:00:00Z".to_owned(),
+            },
+        )
+        .unwrap();
+        let mut turn = Turn::new(
+            "turn-a",
+            "session-a",
+            "run-a",
+            "analyst.technical",
+            "prompt",
+        );
+        turn.phase = Some(1);
+        let mut model = RepeatingToolModel { calls: 0 };
+        let mut tools = StaticToolRuntime::new();
+        tools.add_tool("read", |_| ToolResultItem {
+            call_id: "result".to_owned(),
+            name: "read".to_owned(),
+            status: "completed".to_owned(),
+            output: json!({}),
+            error: None,
+        });
+        let config = AgentLoopConfig {
+            max_agent_loops: Some(2),
+            ..Default::default()
+        };
+
+        let error = run_turn(&session, &mut turn, &mut model, &mut tools, config)
+            .await
+            .unwrap_err();
+        assert_eq!(model.calls, 2);
+        assert!(error.to_string().contains("max_agent_loops=2"));
+        assert_eq!(turn.end_reason.as_deref(), Some("max_loops"));
     }
 }
