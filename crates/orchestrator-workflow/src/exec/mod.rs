@@ -104,7 +104,10 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         .await?;
         finish_phase(&store, &location, &mut manifest, &mut state, 0, "done")?;
     }
-    if args.from_phase <= 1 && args.to_phase >= 1 && !phase_completed(&manifest, 1) {
+    if args.from_phase <= 1
+        && args.to_phase >= 1
+        && (!phase_completed(&manifest, 1) || !has_phase_summary(&store, &location, 1)?)
+    {
         run_phase1(
             &mut state,
             &runtime,
@@ -112,7 +115,6 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             args.reasoning_effort.as_deref(),
         )
         .await?;
-        finish_phase(&store, &location, &mut manifest, &mut state, 1, "done")?;
         summarize(
             &store_root,
             &mut state,
@@ -122,8 +124,12 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             args.reasoning_effort.as_deref(),
         )
         .await?;
+        finish_phase(&store, &location, &mut manifest, &mut state, 1, "done")?;
     }
-    if args.from_phase <= 2 && args.to_phase >= 2 && !phase_completed(&manifest, 2) {
+    if args.from_phase <= 2
+        && args.to_phase >= 2
+        && (!phase_completed(&manifest, 2) || !has_phase_summary(&store, &location, 2)?)
+    {
         run_phase2(
             &store,
             &location,
@@ -133,7 +139,6 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             args.reasoning_effort.as_deref(),
         )
         .await?;
-        finish_phase(&store, &location, &mut manifest, &mut state, 2, "done")?;
         summarize(
             &store_root,
             &mut state,
@@ -143,8 +148,12 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             args.reasoning_effort.as_deref(),
         )
         .await?;
+        finish_phase(&store, &location, &mut manifest, &mut state, 2, "done")?;
     }
-    if args.from_phase <= 3 && args.to_phase >= 3 && !phase_completed(&manifest, 3) {
+    if args.from_phase <= 3
+        && args.to_phase >= 3
+        && (!phase_completed(&manifest, 3) || !has_phase_summary(&store, &location, 3)?)
+    {
         run_phase3(
             &mut state,
             &runtime,
@@ -152,7 +161,6 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             args.reasoning_effort.as_deref(),
         )
         .await?;
-        finish_phase(&store, &location, &mut manifest, &mut state, 3, "done")?;
         summarize(
             &store_root,
             &mut state,
@@ -162,8 +170,12 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             args.reasoning_effort.as_deref(),
         )
         .await?;
+        finish_phase(&store, &location, &mut manifest, &mut state, 3, "done")?;
     }
-    if args.from_phase <= 4 && args.to_phase >= 4 && !phase_completed(&manifest, 4) {
+    if args.from_phase <= 4
+        && args.to_phase >= 4
+        && (!phase_completed(&manifest, 4) || !has_phase_summary(&store, &location, 4)?)
+    {
         run_phase4(
             &mut state,
             &runtime,
@@ -171,7 +183,6 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             args.reasoning_effort.as_deref(),
         )
         .await?;
-        finish_phase(&store, &location, &mut manifest, &mut state, 4, "done")?;
         summarize(
             &store_root,
             &mut state,
@@ -181,8 +192,12 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             args.reasoning_effort.as_deref(),
         )
         .await?;
+        finish_phase(&store, &location, &mut manifest, &mut state, 4, "done")?;
     }
-    if args.from_phase <= 5 && args.to_phase >= 5 && !phase_completed(&manifest, 5) {
+    if args.from_phase <= 5
+        && args.to_phase >= 5
+        && (!phase_completed(&manifest, 5) || !has_phase_summary(&store, &location, 5)?)
+    {
         run_phase5(
             &mut state,
             &runtime,
@@ -190,7 +205,6 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             args.reasoning_effort.as_deref(),
         )
         .await?;
-        finish_phase(&store, &location, &mut manifest, &mut state, 5, "done")?;
         summarize(
             &store_root,
             &mut state,
@@ -200,8 +214,12 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             args.reasoning_effort.as_deref(),
         )
         .await?;
+        finish_phase(&store, &location, &mut manifest, &mut state, 5, "done")?;
     }
-    if args.from_phase <= 6 && args.to_phase >= 6 && !phase_completed(&manifest, 6) {
+    if args.from_phase <= 6
+        && args.to_phase >= 6
+        && (!phase_completed(&manifest, 6) || !has_phase_summary(&store, &location, 6)?)
+    {
         run_phase6(
             &mut state,
             &runtime,
@@ -209,7 +227,6 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             args.reasoning_effort.as_deref(),
         )
         .await?;
-        finish_phase(&store, &location, &mut manifest, &mut state, 6, "done")?;
         summarize(
             &store_root,
             &mut state,
@@ -219,15 +236,18 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             args.reasoning_effort.as_deref(),
         )
         .await?;
+        finish_phase(&store, &location, &mut manifest, &mut state, 6, "done")?;
     }
-    if args.from_phase <= 7 && args.to_phase >= 7 && !phase_completed(&manifest, 7) {
+    if args.from_phase <= 7
+        && args.to_phase >= 7
+        && (!phase_completed(&manifest, 7) || !has_phase_summary(&store, &location, 7)?)
+    {
         let allocation_artifact = run_phase7(&store, &location, &mut state, &runtime)?;
         record_manifest_artifact(
             &mut manifest,
             &allocation_artifact,
             Path::new("artifacts/phase7/allocation.json"),
         )?;
-        finish_phase(&store, &location, &mut manifest, &mut state, 7, "done")?;
         summarize(
             &store_root,
             &mut state,
@@ -237,6 +257,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             args.reasoning_effort.as_deref(),
         )
         .await?;
+        finish_phase(&store, &location, &mut manifest, &mut state, 7, "done")?;
     }
     if args.from_phase <= 8 && args.to_phase >= 8 && !phase_completed(&manifest, 8) {
         run_phase8(&store, &location, &mut state)?;
@@ -393,6 +414,21 @@ fn finish_phase(
 fn phase_completed(manifest: &RunManifest, phase: u8) -> bool {
     manifest.phase_status.get(&phase.to_string())
         == Some(&orchestrator_store::PhaseStatus::Completed)
+}
+
+fn has_phase_summary(store: &FileStore, location: &RunLocation, phase: u8) -> Result<bool> {
+    Ok(!read_indexes(
+        store,
+        Some(location),
+        &IndexQuery {
+            kind: Some(IndexKind::PhaseSummary),
+            source_phase: Some(phase),
+            limit: 1,
+            ..Default::default()
+        },
+    )?
+    .indexes
+    .is_empty())
 }
 
 async fn summarize(
