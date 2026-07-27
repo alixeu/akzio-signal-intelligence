@@ -42,6 +42,15 @@ pub const SET_RESEARCH_DECISION_TOOL_NAME: &str = domain_tools::SET_RESEARCH_DEC
 pub const SET_RESEARCH_SCENARIOS_TOOL_NAME: &str = domain_tools::SET_RESEARCH_SCENARIOS;
 pub const APPEND_RESEARCH_HINGE_TOOL_NAME: &str = domain_tools::APPEND_RESEARCH_HINGE;
 pub const FINALIZE_RESEARCH_DECISION_TOOL_NAME: &str = domain_tools::FINALIZE_RESEARCH_DECISION;
+pub const SET_TRADE_INTENT_TOOL_NAME: &str = domain_tools::SET_TRADE_INTENT;
+pub const APPEND_TRADE_BLOCKER_TOOL_NAME: &str = domain_tools::APPEND_TRADE_BLOCKER;
+pub const FINALIZE_TRADE_INTENT_TOOL_NAME: &str = domain_tools::FINALIZE_TRADE_INTENT;
+pub const SET_RISK_ASSESSMENT_TOOL_NAME: &str = domain_tools::SET_RISK_ASSESSMENT;
+pub const SET_RISK_CONSTRAINTS_TOOL_NAME: &str = domain_tools::SET_RISK_CONSTRAINTS;
+pub const FINALIZE_RISK_REVIEW_TOOL_NAME: &str = domain_tools::FINALIZE_RISK_REVIEW;
+pub const SET_PORTFOLIO_ASSET_DECISION_TOOL_NAME: &str = domain_tools::SET_PORTFOLIO_ASSET_DECISION;
+pub const APPEND_BINDING_RISK_CONTROL_TOOL_NAME: &str = domain_tools::APPEND_BINDING_RISK_CONTROL;
+pub const FINALIZE_PORTFOLIO_DECISION_TOOL_NAME: &str = domain_tools::FINALIZE_PORTFOLIO_DECISION;
 // Internal compatibility only. This tool is intentionally absent from REGISTRY.
 pub const READ_RUN_CONTEXT_TOOL_NAME: &str = read_run_context::NAME;
 pub const ALPACA_GET_PORTFOLIO_TOOL_NAME: &str = alpaca::GET_PORTFOLIO_NAME;
@@ -181,6 +190,69 @@ const REGISTRY: &[ToolEntry] = &[
         name: domain_tools::FINALIZE_RESEARCH_DECISION,
         definition: || {
             domain_tools::definition(domain_tools::FINALIZE_RESEARCH_DECISION)
+                .expect("registered domain tool")
+        },
+    },
+    ToolEntry {
+        name: domain_tools::SET_TRADE_INTENT,
+        definition: || {
+            domain_tools::definition(domain_tools::SET_TRADE_INTENT)
+                .expect("registered domain tool")
+        },
+    },
+    ToolEntry {
+        name: domain_tools::APPEND_TRADE_BLOCKER,
+        definition: || {
+            domain_tools::definition(domain_tools::APPEND_TRADE_BLOCKER)
+                .expect("registered domain tool")
+        },
+    },
+    ToolEntry {
+        name: domain_tools::FINALIZE_TRADE_INTENT,
+        definition: || {
+            domain_tools::definition(domain_tools::FINALIZE_TRADE_INTENT)
+                .expect("registered domain tool")
+        },
+    },
+    ToolEntry {
+        name: domain_tools::SET_RISK_ASSESSMENT,
+        definition: || {
+            domain_tools::definition(domain_tools::SET_RISK_ASSESSMENT)
+                .expect("registered domain tool")
+        },
+    },
+    ToolEntry {
+        name: domain_tools::SET_RISK_CONSTRAINTS,
+        definition: || {
+            domain_tools::definition(domain_tools::SET_RISK_CONSTRAINTS)
+                .expect("registered domain tool")
+        },
+    },
+    ToolEntry {
+        name: domain_tools::FINALIZE_RISK_REVIEW,
+        definition: || {
+            domain_tools::definition(domain_tools::FINALIZE_RISK_REVIEW)
+                .expect("registered domain tool")
+        },
+    },
+    ToolEntry {
+        name: domain_tools::SET_PORTFOLIO_ASSET_DECISION,
+        definition: || {
+            domain_tools::definition(domain_tools::SET_PORTFOLIO_ASSET_DECISION)
+                .expect("registered domain tool")
+        },
+    },
+    ToolEntry {
+        name: domain_tools::APPEND_BINDING_RISK_CONTROL,
+        definition: || {
+            domain_tools::definition(domain_tools::APPEND_BINDING_RISK_CONTROL)
+                .expect("registered domain tool")
+        },
+    },
+    ToolEntry {
+        name: domain_tools::FINALIZE_PORTFOLIO_DECISION,
+        definition: || {
+            domain_tools::definition(domain_tools::FINALIZE_PORTFOLIO_DECISION)
                 .expect("registered domain tool")
         },
     },

@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use orchestrator_core::artifact::{Scenario, Scenarios};
+use orchestrator_core::artifact::{BindingRiskControl, Scenario, Scenarios, StopType};
 use orchestrator_core::EvidenceItem;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -297,9 +297,77 @@ impl ResearchDecisionDraftEntry {
         self.scenarios = Some(Scenarios { bull, base, bear });
     }
 }
-typed_profile_draft!(TradeIntentDraft);
-typed_profile_draft!(RiskReviewDraft);
-typed_profile_draft!(PortfolioDecisionDraft);
+/// Mutable fields accepted from the Phase 4 Trader. `candidate_action` is
+/// deliberately absent: it is derived by Rust from the finalized Phase 3
+/// decision when the canonical artifact is built.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct TradeIntentDraft {
+    pub metadata: ProfileDraftMetadata,
+    pub intent: Option<TradeIntentDraftEntry>,
+    pub blockers: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TradeIntentDraftEntry {
+    pub action: String,
+    pub execution_decision: String,
+    pub entry_price: Option<String>,
+    pub stop_loss: Option<String>,
+    pub position_size_pct_max: f64,
+    pub rationale: String,
+}
+
+/// Phase 5 assessment fields, independent from the binding constraint values.
+/// The role's stance is Rust-owned by `ArtifactScope` and cannot appear here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RiskAssessmentDraft {
+    pub argument: String,
+    pub unique_risk_contribution: String,
+    pub disagreement_with_prior: String,
+    pub no_new_information: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RiskConstraintDraft {
+    pub recommended_adjustment: String,
+    pub stop_type: StopType,
+    pub max_drawdown_pct: f64,
+    pub position_cap_pct: f64,
+    pub rebalance_trigger: String,
+    pub risk_off_trigger: String,
+    pub review_window: String,
+    pub cash_hedge_recommendation: String,
+    pub constraint_confidence: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct RiskReviewDraft {
+    pub metadata: ProfileDraftMetadata,
+    pub assessment: Option<RiskAssessmentDraft>,
+    pub constraints: Option<RiskConstraintDraft>,
+}
+
+/// One per-asset Phase 6 decision. Current weight and rating are excluded
+/// because they are authoritative runtime inputs, not model selections.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PortfolioAssetDecisionDraft {
+    pub direction_constraint: String,
+    pub execution_status: String,
+    pub max_target_weight: f64,
+    pub max_weight_delta: f64,
+    pub execution_summary: String,
+    pub investment_thesis: String,
+    pub target_price: Option<String>,
+    pub horizon: String,
+    pub rationale: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct PortfolioDecisionDraft {
+    pub metadata: ProfileDraftMetadata,
+    pub decision: Option<PortfolioAssetDecisionDraft>,
+    pub binding_risk_controls: Vec<BindingRiskControl>,
+}
 typed_profile_draft!(PhaseSummaryDraft);
 
 /// Typed profile state prevents a tool runtime from performing arbitrary JSON

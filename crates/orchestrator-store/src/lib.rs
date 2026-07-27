@@ -25,11 +25,17 @@ pub use atomic::{
     AtomicWriteOptions,
 };
 pub use domain::{
-    append_analyst_data_gap, append_analyst_evidence, append_research_hinge,
-    finalize_analyst_report, finalize_research_decision, set_analyst_assessment,
-    set_analyst_invalidation, set_research_decision, set_research_scenarios, AnalystArtifact,
-    AnalystAssessmentInput, AnalystEvidenceInput, DomainFinalizeOutcome, ResearchArtifact,
-    ResearchDecisionInput, ResearchScenarioInput,
+    append_analyst_data_gap, append_analyst_evidence, append_binding_risk_control,
+    append_research_hinge, append_trade_blocker, finalize_analyst_report,
+    finalize_portfolio_decision, finalize_research_decision, finalize_risk_review,
+    finalize_trade_intent, set_analyst_assessment, set_analyst_invalidation,
+    set_portfolio_asset_decision, set_research_decision, set_research_scenarios,
+    set_risk_assessment, set_risk_constraints, set_trade_intent, AnalystArtifact,
+    AnalystAssessmentInput, AnalystEvidenceInput, DomainFinalizeOutcome,
+    PortfolioAssetDecisionInput, PortfolioDecisionArtifact, PortfolioDecisionFinalizePolicy,
+    ResearchArtifact, ResearchDecisionInput, ResearchScenarioInput, RiskAssessmentInput,
+    RiskConstraintsInput, RiskReviewArtifact, TradeIntentArtifact, TradeIntentFinalizePolicy,
+    TradeIntentInput,
 };
 pub use draft::{
     append_draft_receipt, apply_typed_draft_command, create_or_recover_draft, draft_relative,
@@ -38,15 +44,18 @@ pub use draft::{
     DebateResponseDraft, DebateResponseDraftEntry, DebateSeedDraft, DraftAppendOutcome,
     DraftFailure, DraftIdempotencyKey, DraftLifecycle, DraftProfile, DraftWriteReceipt,
     FinalizableArtifact, FinalizeDraftOutcome, HistoricalReflectionDraft, Phase2TopicDraft,
-    PhaseSummaryDraft, PortfolioDecisionDraft, ProfileDraftMetadata, ResearchDecisionDraft,
-    ResearchDecisionDraftEntry, ResearcherWarmupDraft, RiskReviewDraft, TopicControlDraft,
-    TopicGenerationDraft, TradeIntentDraft,
+    PhaseSummaryDraft, PortfolioAssetDecisionDraft, PortfolioDecisionDraft, ProfileDraftMetadata,
+    ResearchDecisionDraft, ResearchDecisionDraftEntry, ResearcherWarmupDraft, RiskAssessmentDraft,
+    RiskConstraintDraft, RiskReviewDraft, TopicControlDraft, TopicGenerationDraft,
+    TradeIntentDraft, TradeIntentDraftEntry,
 };
 pub use error::{Result, StoreError};
 pub use index::{
-    append_index_detail, create_index, deterministic_experience_index_id, finalize_index,
-    read_index_details, read_indexes, AppendIndexDetailInput, CreateIndexInput, DetailPage,
-    DetailQuery, DetailSection, Index, IndexDetail, IndexKind, IndexPage, IndexQuery, IndexScope,
+    append_index_detail, create_index, deterministic_experience_index_id, experience_level,
+    finalize_index, read_index_details, read_indexes, record_experience_case,
+    AppendIndexDetailInput, CreateIndexInput, DetailPage, DetailQuery, DetailSection,
+    ExperienceCaseDisposition, ExperienceLevel, Index, IndexDetail, IndexKind, IndexPage,
+    IndexQuery, IndexScope, RecordExperienceCaseInput, RecordExperienceCaseOutcome,
     INDEX_DETAIL_SCHEMA_VERSION, INDEX_SCHEMA_VERSION,
 };
 pub use input::{

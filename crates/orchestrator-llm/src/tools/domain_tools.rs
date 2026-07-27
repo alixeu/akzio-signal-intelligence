@@ -7,7 +7,7 @@
 use std::{collections::BTreeSet, fmt, sync::Arc};
 
 use anyhow::{bail, Context, Result};
-use orchestrator_core::artifact::Scenario;
+use orchestrator_core::artifact::{BindingRiskControl, Scenario, StopType};
 use orchestrator_core::{EvidenceItem, ToolManagedProfile};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -23,6 +23,15 @@ pub const SET_RESEARCH_DECISION: &str = "set_research_decision";
 pub const SET_RESEARCH_SCENARIOS: &str = "set_research_scenarios";
 pub const APPEND_RESEARCH_HINGE: &str = "append_research_hinge";
 pub const FINALIZE_RESEARCH_DECISION: &str = "finalize_research_decision";
+pub const SET_TRADE_INTENT: &str = "set_trade_intent";
+pub const APPEND_TRADE_BLOCKER: &str = "append_trade_blocker";
+pub const FINALIZE_TRADE_INTENT: &str = "finalize_trade_intent";
+pub const SET_RISK_ASSESSMENT: &str = "set_risk_assessment";
+pub const SET_RISK_CONSTRAINTS: &str = "set_risk_constraints";
+pub const FINALIZE_RISK_REVIEW: &str = "finalize_risk_review";
+pub const SET_PORTFOLIO_ASSET_DECISION: &str = "set_portfolio_asset_decision";
+pub const APPEND_BINDING_RISK_CONTROL: &str = "append_binding_risk_control";
+pub const FINALIZE_PORTFOLIO_DECISION: &str = "finalize_portfolio_decision";
 
 const RUST_OWNED_FIELDS: &[&str] = &[
     "store_root",
@@ -108,6 +117,60 @@ pub struct ResearchHingeCommand {
     pub evidence_ref: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TradeIntentCommand {
+    pub action: String,
+    pub execution_decision: String,
+    pub entry_price: Option<String>,
+    pub stop_loss: Option<String>,
+    pub position_size_pct_max: f64,
+    pub rationale: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TradeBlockerCommand {
+    pub blocker: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RiskAssessmentCommand {
+    pub argument: String,
+    pub unique_risk_contribution: String,
+    pub disagreement_with_prior: String,
+    pub no_new_information: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RiskConstraintsCommand {
+    pub recommended_adjustment: String,
+    pub stop_type: StopType,
+    pub max_drawdown_pct: f64,
+    pub position_cap_pct: f64,
+    pub rebalance_trigger: String,
+    pub risk_off_trigger: String,
+    pub review_window: String,
+    pub cash_hedge_recommendation: String,
+    pub constraint_confidence: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PortfolioAssetDecisionCommand {
+    pub direction_constraint: String,
+    pub execution_status: String,
+    pub max_target_weight: f64,
+    pub max_weight_delta: f64,
+    pub execution_summary: String,
+    pub investment_thesis: String,
+    pub target_price: Option<String>,
+    pub horizon: String,
+    pub rationale: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BindingRiskControlCommand {
+    pub control: BindingRiskControl,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum DomainToolCommand {
     SetAnalystAssessment(AnalystAssessmentCommand),
@@ -119,6 +182,15 @@ pub enum DomainToolCommand {
     SetResearchScenarios(ResearchScenariosCommand),
     AppendResearchHinge(ResearchHingeCommand),
     FinalizeResearch,
+    SetTradeIntent(TradeIntentCommand),
+    AppendTradeBlocker(TradeBlockerCommand),
+    FinalizeTrade,
+    SetRiskAssessment(RiskAssessmentCommand),
+    SetRiskConstraints(RiskConstraintsCommand),
+    FinalizeRisk,
+    SetPortfolioAssetDecision(PortfolioAssetDecisionCommand),
+    AppendBindingRiskControl(BindingRiskControlCommand),
+    FinalizePortfolio,
 }
 
 /// Typed bridge implemented only by a FileStore phase runtime.  It exposes no
@@ -133,6 +205,16 @@ pub trait DomainToolService: Send + Sync {
     fn set_research_scenarios(&self, command: ResearchScenariosCommand) -> Result<Value>;
     fn append_research_hinge(&self, command: ResearchHingeCommand) -> Result<Value>;
     fn finalize_research_decision(&self) -> Result<Value>;
+    fn set_trade_intent(&self, command: TradeIntentCommand) -> Result<Value>;
+    fn append_trade_blocker(&self, command: TradeBlockerCommand) -> Result<Value>;
+    fn finalize_trade_intent(&self) -> Result<Value>;
+    fn set_risk_assessment(&self, command: RiskAssessmentCommand) -> Result<Value>;
+    fn set_risk_constraints(&self, command: RiskConstraintsCommand) -> Result<Value>;
+    fn finalize_risk_review(&self) -> Result<Value>;
+    fn set_portfolio_asset_decision(&self, command: PortfolioAssetDecisionCommand)
+        -> Result<Value>;
+    fn append_binding_risk_control(&self, command: BindingRiskControlCommand) -> Result<Value>;
+    fn finalize_portfolio_decision(&self) -> Result<Value>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,12 +228,25 @@ impl DomainToolScope {
     pub fn validate(&self) -> Result<()> {
         if !matches!(
             self.profile,
-            ToolManagedProfile::AnalystReport | ToolManagedProfile::ResearchDecision
+            ToolManagedProfile::AnalystReport
+                | ToolManagedProfile::ResearchDecision
+                | ToolManagedProfile::TradeIntent
+                | ToolManagedProfile::RiskReview
+                | ToolManagedProfile::PortfolioDecision
         ) {
             bail!("domain runtime only supports analyst_report or research_decision")
         }
         if self.tickers.is_empty() {
             bail!("domain runtime requires a Rust-owned ticker allowlist")
+        }
+        if matches!(
+            self.profile,
+            ToolManagedProfile::TradeIntent
+                | ToolManagedProfile::RiskReview
+                | ToolManagedProfile::PortfolioDecision
+        ) && self.tickers.len() != 1
+        {
+            bail!("this profile requires one Rust-owned ticker scope")
         }
         Ok(())
     }
@@ -206,6 +301,31 @@ impl DomainToolRuntimeBinding {
             DomainToolCommand::FinalizeResearch => Ok(
                 json!({"status":"completed","terminal":true,"artifact":self.service.finalize_research_decision()?}),
             ),
+            DomainToolCommand::SetTradeIntent(command) => self.service.set_trade_intent(command),
+            DomainToolCommand::AppendTradeBlocker(command) => {
+                self.service.append_trade_blocker(command)
+            }
+            DomainToolCommand::FinalizeTrade => Ok(
+                json!({"status":"completed","terminal":true,"artifact":self.service.finalize_trade_intent()?}),
+            ),
+            DomainToolCommand::SetRiskAssessment(command) => {
+                self.service.set_risk_assessment(command)
+            }
+            DomainToolCommand::SetRiskConstraints(command) => {
+                self.service.set_risk_constraints(command)
+            }
+            DomainToolCommand::FinalizeRisk => Ok(
+                json!({"status":"completed","terminal":true,"artifact":self.service.finalize_risk_review()?}),
+            ),
+            DomainToolCommand::SetPortfolioAssetDecision(command) => {
+                self.service.set_portfolio_asset_decision(command)
+            }
+            DomainToolCommand::AppendBindingRiskControl(command) => {
+                self.service.append_binding_risk_control(command)
+            }
+            DomainToolCommand::FinalizePortfolio => Ok(
+                json!({"status":"completed","terminal":true,"artifact":self.service.finalize_portfolio_decision()?}),
+            ),
         }
     }
 }
@@ -222,6 +342,15 @@ pub fn is_domain_tool(name: &str) -> bool {
             | SET_RESEARCH_SCENARIOS
             | APPEND_RESEARCH_HINGE
             | FINALIZE_RESEARCH_DECISION
+            | SET_TRADE_INTENT
+            | APPEND_TRADE_BLOCKER
+            | FINALIZE_TRADE_INTENT
+            | SET_RISK_ASSESSMENT
+            | SET_RISK_CONSTRAINTS
+            | FINALIZE_RISK_REVIEW
+            | SET_PORTFOLIO_ASSET_DECISION
+            | APPEND_BINDING_RISK_CONTROL
+            | FINALIZE_PORTFOLIO_DECISION
     )
 }
 
@@ -289,6 +418,51 @@ pub fn definition(name: &str) -> Option<ToolDefinition> {
             json!({}),
             json!([]),
         ),
+        SET_TRADE_INTENT => (
+            "Set the Phase 4 intent for the single Rust-scoped ticker. Candidate action is derived by Rust and cannot be supplied.",
+            json!({"action":{"type":"string","enum":["Buy","Sell","Hold"]},"execution_decision":{"type":"string","enum":["execute_candidate","hold"]},"entry_price":{"type":["string","null"]},"stop_loss":{"type":["string","null"]},"position_size_pct_max":{"type":"number","minimum":0.0,"maximum":1.0},"rationale":{"type":"string","minLength":1}}),
+            json!(["action", "execution_decision", "entry_price", "stop_loss", "position_size_pct_max", "rationale"]),
+        ),
+        APPEND_TRADE_BLOCKER => (
+            "Append one concrete blocker for the scoped trade intent.",
+            json!({"blocker":{"type":"string","minLength":1}}),
+            json!(["blocker"]),
+        ),
+        FINALIZE_TRADE_INTENT => (
+            "Terminally validate candidate-action and numeric-cap semantics, then atomically finalize the scoped trade intent.",
+            json!({}),
+            json!([]),
+        ),
+        SET_RISK_ASSESSMENT => (
+            "Set the Phase 5 assessment for the Rust-scoped ticker and role stance.",
+            json!({"argument":{"type":"string"},"unique_risk_contribution":{"type":"string"},"disagreement_with_prior":{"type":"string"},"no_new_information":{"type":"boolean"}}),
+            json!(["argument", "unique_risk_contribution", "disagreement_with_prior", "no_new_information"]),
+        ),
+        SET_RISK_CONSTRAINTS => (
+            "Set numeric risk constraints. Stance is Rust-owned; stop_type is one of hard, soft, none.",
+            json!({"recommended_adjustment":{"type":"string"},"stop_type":{"type":"string","enum":["hard","soft","none"]},"max_drawdown_pct":{"type":"number","minimum":0.0,"maximum":1.0},"position_cap_pct":{"type":"number","minimum":0.0,"maximum":1.0},"rebalance_trigger":{"type":"string"},"risk_off_trigger":{"type":"string"},"review_window":{"type":"string"},"cash_hedge_recommendation":{"type":"string"},"constraint_confidence":{"type":"number","minimum":0.0,"maximum":1.0}}),
+            json!(["recommended_adjustment", "stop_type", "max_drawdown_pct", "position_cap_pct", "rebalance_trigger", "risk_off_trigger", "review_window", "cash_hedge_recommendation", "constraint_confidence"]),
+        ),
+        FINALIZE_RISK_REVIEW => (
+            "Terminally validate and atomically finalize the scoped risk review.",
+            json!({}),
+            json!([]),
+        ),
+        SET_PORTFOLIO_ASSET_DECISION => (
+            "Set the Phase 6 decision for the single Rust-scoped asset. Ticker, rating, and current weight are Rust-owned.",
+            json!({"direction_constraint":{"type":"string","enum":["increase_only","decrease_only","unchanged"]},"execution_status":{"type":"string","enum":["execute","wait","downgrade"]},"max_target_weight":{"type":"number","minimum":0.0,"maximum":1.0},"max_weight_delta":{"type":"number","minimum":0.0,"maximum":1.0},"execution_summary":{"type":"string","minLength":1},"investment_thesis":{"type":"string"},"target_price":{"type":["string","null"]},"horizon":{"type":"string"},"rationale":{"type":"string"}}),
+            json!(["direction_constraint", "execution_status", "max_target_weight", "max_weight_delta", "execution_summary", "investment_thesis", "target_price", "horizon", "rationale"]),
+        ),
+        APPEND_BINDING_RISK_CONTROL => (
+            "Append one traceable Phase 5 binding control. Every source_ref must have been read in this session.",
+            json!({"control":{"type":"object","properties":{"control":{"type":"string","minLength":1},"source_refs":{"type":"array","minItems":1,"items":{"type":"string","minLength":1}}},"required":["control","source_refs"],"additionalProperties":false}}),
+            json!(["control"]),
+        ),
+        FINALIZE_PORTFOLIO_DECISION => (
+            "Terminally validate direction/wait/downgrade constraints and atomically finalize the scoped portfolio decision.",
+            json!({}),
+            json!([]),
+        ),
         _ => return None,
     };
     Some(ToolDefinition {
@@ -320,6 +494,20 @@ pub fn prepare_command(
                 | APPEND_RESEARCH_HINGE
                 | FINALIZE_RESEARCH_DECISION
         ),
+        ToolManagedProfile::TradeIntent => matches!(
+            name,
+            SET_TRADE_INTENT | APPEND_TRADE_BLOCKER | FINALIZE_TRADE_INTENT
+        ),
+        ToolManagedProfile::RiskReview => matches!(
+            name,
+            SET_RISK_ASSESSMENT | SET_RISK_CONSTRAINTS | FINALIZE_RISK_REVIEW
+        ),
+        ToolManagedProfile::PortfolioDecision => matches!(
+            name,
+            SET_PORTFOLIO_ASSET_DECISION
+                | APPEND_BINDING_RISK_CONTROL
+                | FINALIZE_PORTFOLIO_DECISION
+        ),
         _ => false,
     };
     if !expected {
@@ -331,6 +519,9 @@ pub fn prepare_command(
     for key in object.keys() {
         if RUST_OWNED_FIELDS.contains(&key.as_str()) {
             bail!("{name}.{key} is Rust-owned and must not be supplied by the model")
+        }
+        if !model_owned_fields(name).contains(&key.as_str()) {
+            bail!("{name}.{key} is not a declared model-owned field")
         }
     }
     let command = match name {
@@ -357,6 +548,32 @@ pub fn prepare_command(
             empty(object, name)?;
             DomainToolCommand::FinalizeResearch
         }
+        SET_TRADE_INTENT => DomainToolCommand::SetTradeIntent(parse(arguments)?),
+        APPEND_TRADE_BLOCKER => DomainToolCommand::AppendTradeBlocker(parse(arguments)?),
+        FINALIZE_TRADE_INTENT => {
+            empty(object, name)?;
+            DomainToolCommand::FinalizeTrade
+        }
+        SET_RISK_ASSESSMENT => DomainToolCommand::SetRiskAssessment(parse(arguments)?),
+        SET_RISK_CONSTRAINTS => DomainToolCommand::SetRiskConstraints(parse(arguments)?),
+        FINALIZE_RISK_REVIEW => {
+            empty(object, name)?;
+            DomainToolCommand::FinalizeRisk
+        }
+        SET_PORTFOLIO_ASSET_DECISION => {
+            DomainToolCommand::SetPortfolioAssetDecision(parse(arguments)?)
+        }
+        APPEND_BINDING_RISK_CONTROL => {
+            let command: BindingRiskControlCommand = parse(arguments)?;
+            for reference in &command.control.source_refs {
+                require_visible(scope, reference)?;
+            }
+            DomainToolCommand::AppendBindingRiskControl(command)
+        }
+        FINALIZE_PORTFOLIO_DECISION => {
+            empty(object, name)?;
+            DomainToolCommand::FinalizePortfolio
+        }
         _ => bail!("unknown domain tool {name}"),
     };
     match &command {
@@ -370,6 +587,79 @@ pub fn prepare_command(
         _ => {}
     }
     Ok(command)
+}
+
+fn model_owned_fields(name: &str) -> &'static [&'static str] {
+    match name {
+        SET_ANALYST_ASSESSMENT => &[
+            "ticker",
+            "direction",
+            "confidence",
+            "report",
+            "priced_in",
+            "echo_chamber_risk",
+            "crowded_consensus_risk",
+        ],
+        APPEND_ANALYST_EVIDENCE => &["ticker", "evidence", "evidence_ref"],
+        APPEND_ANALYST_DATA_GAP => &["ticker", "data_gap"],
+        SET_ANALYST_INVALIDATION => &["ticker", "validation_triggers"],
+        FINALIZE_ANALYST_REPORT
+        | FINALIZE_RESEARCH_DECISION
+        | FINALIZE_TRADE_INTENT
+        | FINALIZE_RISK_REVIEW
+        | FINALIZE_PORTFOLIO_DECISION => &[],
+        SET_RESEARCH_DECISION => &[
+            "ticker",
+            "rating",
+            "long_probability",
+            "short_probability",
+            "confidence_basis",
+            "hold_reason",
+            "plan",
+            "probability_rationale",
+        ],
+        SET_RESEARCH_SCENARIOS => &["ticker", "bull", "base", "bear"],
+        APPEND_RESEARCH_HINGE => &["ticker", "hinge", "evidence_ref"],
+        SET_TRADE_INTENT => &[
+            "action",
+            "execution_decision",
+            "entry_price",
+            "stop_loss",
+            "position_size_pct_max",
+            "rationale",
+        ],
+        APPEND_TRADE_BLOCKER => &["blocker"],
+        SET_RISK_ASSESSMENT => &[
+            "argument",
+            "unique_risk_contribution",
+            "disagreement_with_prior",
+            "no_new_information",
+        ],
+        SET_RISK_CONSTRAINTS => &[
+            "recommended_adjustment",
+            "stop_type",
+            "max_drawdown_pct",
+            "position_cap_pct",
+            "rebalance_trigger",
+            "risk_off_trigger",
+            "review_window",
+            "cash_hedge_recommendation",
+            "constraint_confidence",
+        ],
+        SET_PORTFOLIO_ASSET_DECISION => &[
+            "direction_constraint",
+            "execution_status",
+            "max_target_weight",
+            "max_weight_delta",
+            "execution_summary",
+            "investment_thesis",
+            "target_price",
+            "horizon",
+            "rationale",
+        ],
+        APPEND_BINDING_RISK_CONTROL => &["control"],
+        _ => &[],
+    }
 }
 
 fn parse<T: for<'de> Deserialize<'de>>(value: Value) -> Result<T> {
@@ -407,6 +697,14 @@ mod tests {
         }
     }
 
+    fn scoped_profile(profile: ToolManagedProfile) -> DomainToolScope {
+        DomainToolScope {
+            profile,
+            tickers: ["QQQ".to_owned()].into_iter().collect(),
+            visible_evidence_refs: ["phase5:neutral:QQQ".to_owned()].into_iter().collect(),
+        }
+    }
+
     #[test]
     fn analyst_evidence_requires_a_visible_reference() {
         let arguments = json!({
@@ -433,5 +731,82 @@ mod tests {
             &analyst_scope()
         )
         .is_err());
+    }
+
+    #[test]
+    fn trade_contract_rejects_rust_owned_candidate_and_ticker() {
+        let scope = scoped_profile(ToolManagedProfile::TradeIntent);
+        assert!(prepare_command(
+            SET_TRADE_INTENT,
+            json!({
+                "action":"Buy", "execution_decision":"execute_candidate",
+                "entry_price":null, "stop_loss":null, "position_size_pct_max":0.2,
+                "rationale":"confirmed", "candidate_action":"Buy"
+            }),
+            &scope,
+        )
+        .is_err());
+        assert!(prepare_command(
+            SET_TRADE_INTENT,
+            json!({
+                "action":"Buy", "execution_decision":"execute_candidate",
+                "entry_price":null, "stop_loss":null, "position_size_pct_max":0.2,
+                "rationale":"confirmed", "ticker":"QQQ"
+            }),
+            &scope,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn risk_contract_only_allows_v2_stop_types() {
+        let scope = scoped_profile(ToolManagedProfile::RiskReview);
+        assert!(prepare_command(
+            SET_RISK_CONSTRAINTS,
+            json!({
+                "recommended_adjustment":"cap", "stop_type":"event_based",
+                "max_drawdown_pct":0.05, "position_cap_pct":0.2,
+                "rebalance_trigger":"weekly", "risk_off_trigger":"breakdown",
+                "review_window":"one day", "cash_hedge_recommendation":"cash",
+                "constraint_confidence":0.6
+            }),
+            &scope,
+        )
+        .is_err());
+        assert!(matches!(
+            prepare_command(
+                SET_RISK_CONSTRAINTS,
+                json!({
+                    "recommended_adjustment":"cap", "stop_type":"hard",
+                    "max_drawdown_pct":0.05, "position_cap_pct":0.2,
+                    "rebalance_trigger":"weekly", "risk_off_trigger":"breakdown",
+                    "review_window":"one day", "cash_hedge_recommendation":"cash",
+                    "constraint_confidence":0.6
+                }),
+                &scope,
+            )
+            .unwrap(),
+            DomainToolCommand::SetRiskConstraints(_)
+        ));
+    }
+
+    #[test]
+    fn portfolio_binding_controls_require_visible_sources() {
+        let scope = scoped_profile(ToolManagedProfile::PortfolioDecision);
+        assert!(prepare_command(
+            APPEND_BINDING_RISK_CONTROL,
+            json!({"control":{"control":"cap exposure","source_refs":["not-visible"]}}),
+            &scope,
+        )
+        .is_err());
+        assert!(matches!(
+            prepare_command(
+                APPEND_BINDING_RISK_CONTROL,
+                json!({"control":{"control":"cap exposure","source_refs":["phase5:neutral:QQQ"]}}),
+                &scope,
+            )
+            .unwrap(),
+            DomainToolCommand::AppendBindingRiskControl(_)
+        ));
     }
 }
