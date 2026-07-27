@@ -10,13 +10,17 @@ use orchestrator_llm::{
     AgentLoopOutput, AgentSettings, OutputMode, RoleLlmSettings, SteerLoopInput,
 };
 use serde_json::{json, Value};
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
+use std::{
+    collections::BTreeSet,
+    path::{Path, PathBuf},
+};
 use tokio::time;
 use tracing::{debug, warn};
 
 use super::config::{output_mode_for_role, prompt_version, RetrievalConfig, RuntimeConfig};
 use super::degraded::role_artifact_or_degraded;
+use super::domain_runtime::{file_store_domain_runtime, FileStoreDomainRuntimePlan};
 use super::lifecycle::tickers_from_state;
 use super::render::{direct_context_manifest, render_prompt_with_plugins};
 
@@ -67,6 +71,8 @@ pub(crate) struct RoleJob {
     pub tickers: Vec<String>,
     pub output_mode: OutputMode,
     pub tool_managed_profile: Option<ToolManagedProfile>,
+    pub domain_tool_runtime:
+        Option<orchestrator_llm::tools::domain_tools::DomainToolRuntimeBinding>,
     pub llm: Option<RoleLlmSettings>,
     pub reasoning_effort_override: Option<String>,
     pub tools: ExternalToolConfig,
@@ -162,6 +168,32 @@ fn tool_managed_profile_for_role_kind(role: &str, kind: &str) -> Option<ToolMana
     }
 }
 
+/// Only structured evidence IDs may cross into a DomainTool scope.  Until the
+/// FileStore Session adapter records an `evidence_read` event, live roles get
+/// an empty set and a write that cites an invented ID fails closed.  Mock uses
+/// deterministic IDs so it can exercise the same Draft/finalize path.
+fn visible_domain_evidence_refs(
+    state: &Value,
+    role: &str,
+    tickers: &[String],
+    mock: bool,
+) -> BTreeSet<String> {
+    let mut visible = state
+        .get("visible_evidence_refs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|reference| !reference.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<BTreeSet<_>>();
+    if mock {
+        visible.extend(tickers.iter().map(|ticker| format!("mock:{role}:{ticker}")));
+    }
+    visible
+}
+
 pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
     let RoleRun {
         state,
@@ -244,18 +276,39 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
         "prepared role job"
     );
     let candidate_tool_managed_profile = tool_managed_profile_for_role_kind(role, kind);
-    let (output_mode, tool_managed_profile) = if let Some(profile) = candidate_tool_managed_profile
-    {
-        match config.authority_registry.authority_for(role, profile)? {
-            // A legacy role must not carry any ToolManaged profile into the
-            // LLM settings: that would create an invalid mixed authority
-            // contract even before its first tool call.
-            ArtifactAuthority::Legacy => (output_mode_for_role(role), None),
-            ArtifactAuthority::FileStore => (OutputMode::ToolManaged, Some(profile)),
-        }
-    } else {
-        (output_mode_for_role(role), None)
-    };
+    let (output_mode, tool_managed_profile, domain_tool_runtime) =
+        if let Some(profile) = candidate_tool_managed_profile {
+            match config.authority_registry.authority_for(role, profile)? {
+                // A legacy role must not carry any ToolManaged profile into the
+                // LLM settings: that would create an invalid mixed authority
+                // contract even before its first tool call.
+                ArtifactAuthority::Legacy => (output_mode_for_role(role), None, None),
+                ArtifactAuthority::FileStore => {
+                    let registration = config.authority_registry.registration(role, profile)?;
+                    let store_root = state
+                        .get("store_root")
+                        .and_then(Value::as_str)
+                        .context("store_root missing for migrated ToolManaged domain role")?;
+                    let visible = visible_domain_evidence_refs(&state, role, &tickers, mock);
+                    let binding = file_store_domain_runtime(
+                        Path::new(store_root),
+                        &state,
+                        FileStoreDomainRuntimePlan {
+                            role: role.to_owned(),
+                            phase,
+                            profile,
+                            profile_version: registration.profile_version,
+                            builder_version: registration.builder_version,
+                            tickers: tickers.clone(),
+                            visible_evidence_refs: visible,
+                        },
+                    )?;
+                    (OutputMode::ToolManaged, Some(profile), Some(binding))
+                }
+            }
+        } else {
+            (output_mode_for_role(role), None, None)
+        };
 
     Ok(RoleJob {
         role: role.to_string(),
@@ -272,6 +325,7 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
         tickers: tickers.clone(),
         output_mode,
         tool_managed_profile,
+        domain_tool_runtime,
         llm,
         reasoning_effort_override: reasoning_effort_override.map(ToString::to_string),
         tools: ExternalToolConfig {
@@ -942,6 +996,9 @@ pub(crate) async fn run_role_job_with_timeout(job: RoleJob, timeout_sec: u64) ->
 
 async fn execute_role_job(job: RoleJob) -> Result<AgentLoopOutput> {
     if job.mock {
+        if let Some(binding) = job.domain_tool_runtime.clone() {
+            return mock_domain_tool_managed_output(job, binding);
+        }
         debug!(
             role = job.role,
             phase = job.phase,
@@ -997,6 +1054,7 @@ async fn execute_role_job(job: RoleJob) -> Result<AgentLoopOutput> {
         output_mode: job.output_mode,
         tool_managed_profile: job.tool_managed_profile,
         index_tool_runtime: None,
+        domain_tool_runtime: job.domain_tool_runtime.clone(),
         llm,
         reasoning_effort_override: job.reasoning_effort_override,
         tools: Some(job.tools),
@@ -1015,6 +1073,117 @@ async fn execute_role_job(job: RoleJob) -> Result<AgentLoopOutput> {
     let mut output = run_agent_loop_with_metrics(&settings, &job.prompt).await?;
     output.artifact["context_manifest"] = job.context_manifest;
     Ok(output)
+}
+
+fn mock_domain_tool_managed_output(
+    job: RoleJob,
+    binding: orchestrator_llm::tools::domain_tools::DomainToolRuntimeBinding,
+) -> Result<AgentLoopOutput> {
+    use orchestrator_llm::agent_loop::ToolResultItem;
+    use orchestrator_llm::tools::domain_tools::{
+        APPEND_ANALYST_EVIDENCE, FINALIZE_ANALYST_REPORT, FINALIZE_RESEARCH_DECISION,
+        SET_ANALYST_ASSESSMENT, SET_ANALYST_INVALIDATION, SET_RESEARCH_DECISION,
+        SET_RESEARCH_SCENARIOS,
+    };
+
+    let profile = binding.scope().profile;
+    let artifact = match profile {
+        ToolManagedProfile::AnalystReport => {
+            for ticker in &job.tickers {
+                binding.execute(
+                    SET_ANALYST_ASSESSMENT,
+                    json!({
+                        "ticker": ticker,
+                        "direction": "neutral",
+                        "confidence": 0.5,
+                        "report": format!("Mock FileStore report for {ticker} from {}.", job.role),
+                        "priced_in": "unclear",
+                        "echo_chamber_risk": "low",
+                        "crowded_consensus_risk": "low",
+                    }),
+                )?;
+                binding.execute(
+                    APPEND_ANALYST_EVIDENCE,
+                    json!({
+                        "ticker": ticker,
+                        "evidence_ref": format!("mock:{}:{ticker}", job.role),
+                        "evidence": {
+                            "claim": format!("Mock evidence for {ticker}."),
+                            "evidence_type": "fact",
+                            "source": "mock runtime",
+                            "timestamp": job.context_manifest.get("current_date").and_then(Value::as_str).unwrap_or("2026-01-01"),
+                            "source_tier": "official",
+                            "first_source": "mock runtime",
+                            "is_derivative_repost": false,
+                            "evidence_age": "0-2d",
+                            "source_confidence": 0.9,
+                        }
+                    }),
+                )?;
+                binding.execute(
+                    SET_ANALYST_INVALIDATION,
+                    json!({
+                        "ticker": ticker,
+                        "validation_triggers": [format!("Mock invalidation for {ticker}.")],
+                    }),
+                )?;
+            }
+            binding.execute(FINALIZE_ANALYST_REPORT, json!({}))?
+        }
+        ToolManagedProfile::ResearchDecision => {
+            for ticker in &job.tickers {
+                binding.execute(
+                    SET_RESEARCH_DECISION,
+                    json!({
+                        "ticker": ticker,
+                        "rating": "Hold",
+                        "long_probability": 0.5,
+                        "short_probability": 0.5,
+                        "confidence_basis": "evidence_balanced",
+                        "hold_reason": "evidence_balanced",
+                        "plan": format!("Mock FileStore research plan for {ticker}."),
+                        "probability_rationale": "Mock evidence is balanced.",
+                    }),
+                )?;
+                binding.execute(
+                    SET_RESEARCH_SCENARIOS,
+                    json!({
+                        "ticker": ticker,
+                        "bull": {"probability": 0.25, "drivers": ["mock upside"], "triggers": ["mock confirmation"], "confirmation": "mock"},
+                        "base": {"probability": 0.50, "drivers": ["mock balance"], "triggers": ["mock confirmation"], "confirmation": "mock"},
+                        "bear": {"probability": 0.25, "drivers": ["mock downside"], "triggers": ["mock confirmation"], "confirmation": "mock"},
+                    }),
+                )?;
+            }
+            binding.execute(FINALIZE_RESEARCH_DECISION, json!({}))?
+        }
+        _ => anyhow::bail!(
+            "mock domain runtime profile {} is not wired",
+            profile.as_str()
+        ),
+    };
+    let artifact = artifact
+        .get("artifact")
+        .cloned()
+        .context("mock domain finalizer did not return a canonical artifact")?;
+    Ok(AgentLoopOutput {
+        artifact: artifact.clone(),
+        terminal_tool_result: Some(ToolResultItem {
+            call_id: "mock-finalize".to_owned(),
+            name: match profile {
+                ToolManagedProfile::AnalystReport => FINALIZE_ANALYST_REPORT,
+                ToolManagedProfile::ResearchDecision => FINALIZE_RESEARCH_DECISION,
+                _ => unreachable!(),
+            }
+            .to_owned(),
+            status: "completed".to_owned(),
+            output: json!({"terminal": true, "artifact": artifact}),
+            error: None,
+        }),
+        metrics: ModelStreamResult::default(),
+        turn_id: String::new(),
+        session_id: String::new(),
+    })
 }
 
 async fn execute_steer_role_job(
@@ -1085,6 +1254,7 @@ async fn execute_steer_role_job(
         output_mode: job.output_mode,
         tool_managed_profile: job.tool_managed_profile,
         index_tool_runtime: None,
+        domain_tool_runtime: job.domain_tool_runtime.clone(),
         llm,
         reasoning_effort_override: job.reasoning_effort_override,
         tools: Some(job.tools),

@@ -354,6 +354,43 @@ pub fn is_domain_tool(name: &str) -> bool {
     )
 }
 
+/// The exact domain tools exposed for one ToolManaged profile.  The caller
+/// supplies the profile from its Rust-owned authority binding; model text
+/// never selects this allowlist.
+pub fn tool_names_for_profile(profile: ToolManagedProfile) -> &'static [&'static str] {
+    match profile {
+        ToolManagedProfile::AnalystReport => &[
+            SET_ANALYST_ASSESSMENT,
+            APPEND_ANALYST_EVIDENCE,
+            APPEND_ANALYST_DATA_GAP,
+            SET_ANALYST_INVALIDATION,
+            FINALIZE_ANALYST_REPORT,
+        ],
+        ToolManagedProfile::ResearchDecision => &[
+            SET_RESEARCH_DECISION,
+            SET_RESEARCH_SCENARIOS,
+            APPEND_RESEARCH_HINGE,
+            FINALIZE_RESEARCH_DECISION,
+        ],
+        ToolManagedProfile::TradeIntent => &[
+            SET_TRADE_INTENT,
+            APPEND_TRADE_BLOCKER,
+            FINALIZE_TRADE_INTENT,
+        ],
+        ToolManagedProfile::RiskReview => &[
+            SET_RISK_ASSESSMENT,
+            SET_RISK_CONSTRAINTS,
+            FINALIZE_RISK_REVIEW,
+        ],
+        ToolManagedProfile::PortfolioDecision => &[
+            SET_PORTFOLIO_ASSET_DECISION,
+            APPEND_BINDING_RISK_CONTROL,
+            FINALIZE_PORTFOLIO_DECISION,
+        ],
+        _ => &[],
+    }
+}
+
 pub fn definition(name: &str) -> Option<ToolDefinition> {
     let (description, properties, required) = match name {
         SET_ANALYST_ASSESSMENT => (

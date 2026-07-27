@@ -202,6 +202,9 @@ pub struct AgentSettings {
     /// Present only for a migrated Index/Detail unit. Legacy settings must
     /// leave this absent; there is no legacy-to-FileStore fallback.
     pub index_tool_runtime: Option<tools::index_tools::IndexToolRuntimeBinding>,
+    /// Present only for a migrated business unit.  It is a typed, scoped
+    /// FileStore service; legacy roles never receive a domain write path.
+    pub domain_tool_runtime: Option<tools::domain_tools::DomainToolRuntimeBinding>,
     pub llm: RoleLlmSettings,
     pub reasoning_effort_override: Option<String>,
     pub tools: Option<tools::ExternalToolConfig>,
@@ -216,6 +219,20 @@ impl AgentSettings {
     fn validate_output_mode(&self) -> Result<()> {
         if self.index_tool_runtime.is_some() && self.output_mode != OutputMode::ToolManaged {
             bail!("IndexToolRuntime is available only to a ToolManaged agent");
+        }
+        if self.domain_tool_runtime.is_some() && self.output_mode != OutputMode::ToolManaged {
+            bail!("DomainToolRuntime is available only to a ToolManaged agent");
+        }
+        if let (Some(profile), Some(binding)) =
+            (self.tool_managed_profile, self.domain_tool_runtime.as_ref())
+        {
+            if binding.scope().profile != profile {
+                bail!(
+                    "DomainToolRuntime profile {} differs from AgentSettings profile {}",
+                    binding.scope().profile.as_str(),
+                    profile.as_str()
+                );
+            }
         }
         match (self.output_mode, self.tool_managed_profile) {
             (OutputMode::ToolManaged, Some(_)) => Ok(()),
@@ -342,6 +359,9 @@ pub async fn run_agent_loop_with_metrics(
     );
     if let Some(binding) = settings.index_tool_runtime.clone() {
         tools = tools.with_index_tool_runtime(binding);
+    }
+    if let Some(binding) = settings.domain_tool_runtime.clone() {
+        tools = tools.with_domain_tool_runtime(binding);
     }
     if let Some(web_run) = web_run_runtime_for_settings(settings) {
         tools = tools.with_web_run_runtime(web_run);
@@ -485,6 +505,9 @@ pub async fn run_agent_steer_loop_with_metrics(
     );
     if let Some(binding) = settings.index_tool_runtime.clone() {
         tools = tools.with_index_tool_runtime(binding);
+    }
+    if let Some(binding) = settings.domain_tool_runtime.clone() {
+        tools = tools.with_domain_tool_runtime(binding);
     }
     if let Some(web_run) = web_run_runtime_for_settings(settings) {
         tools = tools.with_web_run_runtime(web_run);
@@ -3139,6 +3162,11 @@ fn configured_tool_names(settings: &AgentSettings) -> Vec<&str> {
             tools::READ_INDEX_DETAILS_TOOL_NAME,
         ]);
     }
+    if let Some(binding) = &settings.domain_tool_runtime {
+        names.extend(tools::domain_tools::tool_names_for_profile(
+            binding.scope().profile,
+        ));
+    }
     names
 }
 
@@ -3432,6 +3460,7 @@ mod tests {
             output_mode: OutputMode::ResearchArtifact,
             tool_managed_profile: None,
             index_tool_runtime: None,
+            domain_tool_runtime: None,
             llm: RoleLlmSettings {
                 route,
                 model: "gpt-5.4".to_string(),

@@ -2697,6 +2697,7 @@ pub struct ProjectToolRuntime {
         >,
     >,
     index_runtime_error: Option<String>,
+    domain_binding: Option<tools::domain_tools::DomainToolRuntimeBinding>,
 }
 
 impl ProjectToolRuntime {
@@ -2722,6 +2723,7 @@ impl ProjectToolRuntime {
             index_binding: None,
             index_runtime: None,
             index_runtime_error: None,
+            domain_binding: None,
         }
     }
 
@@ -2738,6 +2740,17 @@ impl ProjectToolRuntime {
         binding: tools::index_tools::IndexToolRuntimeBinding,
     ) -> Self {
         self.index_binding = Some(binding);
+        self
+    }
+
+    /// Attach the one typed FileStore business-domain runtime for a migrated
+    /// unit.  Absence is intentional: legacy jobs can never invoke a domain
+    /// writer as an implicit fallback.
+    pub fn with_domain_tool_runtime(
+        mut self,
+        binding: tools::domain_tools::DomainToolRuntimeBinding,
+    ) -> Self {
+        self.domain_binding = Some(binding);
         self
     }
 }
@@ -2772,6 +2785,7 @@ impl LoopToolRuntime for ProjectToolRuntime {
         let turn_context = self.turn_context.clone();
         let index_runtime = self.index_runtime.as_ref();
         let index_runtime_error = self.index_runtime_error.as_deref();
+        let domain_binding = self.domain_binding.as_ref();
         Box::pin(async move {
             debug!(
                 call_id = call.call_id,
@@ -2788,6 +2802,7 @@ impl LoopToolRuntime for ProjectToolRuntime {
                     | tools::READ_INDEXES_TOOL_NAME
                     | tools::READ_INDEX_DETAILS_TOOL_NAME
             );
+            let is_domain_tool = tools::domain_tools::is_domain_tool(&call.name);
             let enabled = call.name == "think"
                 || tools::enabled_tool_names(
                     web_run_config,
@@ -2795,7 +2810,8 @@ impl LoopToolRuntime for ProjectToolRuntime {
                     config.alpaca_market_data,
                 )
                 .contains(&call.name.as_str())
-                || (is_index_tool && index_runtime.is_some());
+                || (is_index_tool && index_runtime.is_some())
+                || (is_domain_tool && domain_binding.is_some());
             if !configured || !enabled {
                 warn!(
                     call_id = call.call_id,
@@ -2830,6 +2846,30 @@ impl LoopToolRuntime for ProjectToolRuntime {
                     (None, Some(error)) => Err(anyhow::anyhow!(error.to_owned())),
                     (None, None) => Err(anyhow::anyhow!(
                         "Index tools require a migrated FileStore runtime binding"
+                    )),
+                };
+                return match output {
+                    Ok(output) => ToolResultItem {
+                        call_id,
+                        name,
+                        status: "completed".to_owned(),
+                        output,
+                        error: None,
+                    },
+                    Err(error) => ToolResultItem {
+                        call_id,
+                        name,
+                        status: "error".to_owned(),
+                        output: Value::Null,
+                        error: Some(error.to_string()),
+                    },
+                };
+            }
+            if is_domain_tool {
+                let output = match domain_binding {
+                    Some(binding) => binding.execute(&name, call.arguments),
+                    None => Err(anyhow::anyhow!(
+                        "domain tools require a migrated FileStore runtime binding"
                     )),
                 };
                 return match output {
@@ -4288,6 +4328,132 @@ mod tests {
         assert_eq!(result.status, "completed");
         assert_eq!(result.output["terminal"], true);
         assert_eq!(result.output["artifact"]["index_id"], "index-1");
+    }
+
+    struct TerminalDomainService;
+
+    impl tools::domain_tools::DomainToolService for TerminalDomainService {
+        fn set_analyst_assessment(
+            &self,
+            _: tools::domain_tools::AnalystAssessmentCommand,
+        ) -> anyhow::Result<Value> {
+            anyhow::bail!("not used")
+        }
+        fn append_analyst_evidence(
+            &self,
+            _: tools::domain_tools::AnalystEvidenceCommand,
+        ) -> anyhow::Result<Value> {
+            anyhow::bail!("not used")
+        }
+        fn append_analyst_data_gap(
+            &self,
+            _: tools::domain_tools::AnalystDataGapCommand,
+        ) -> anyhow::Result<Value> {
+            anyhow::bail!("not used")
+        }
+        fn set_analyst_invalidation(
+            &self,
+            _: tools::domain_tools::AnalystInvalidationCommand,
+        ) -> anyhow::Result<Value> {
+            anyhow::bail!("not used")
+        }
+        fn finalize_analyst_report(&self) -> anyhow::Result<Value> {
+            Ok(json!({"artifact_id":"analyst-1"}))
+        }
+        fn set_research_decision(
+            &self,
+            _: tools::domain_tools::ResearchDecisionCommand,
+        ) -> anyhow::Result<Value> {
+            anyhow::bail!("not used")
+        }
+        fn set_research_scenarios(
+            &self,
+            _: tools::domain_tools::ResearchScenariosCommand,
+        ) -> anyhow::Result<Value> {
+            anyhow::bail!("not used")
+        }
+        fn append_research_hinge(
+            &self,
+            _: tools::domain_tools::ResearchHingeCommand,
+        ) -> anyhow::Result<Value> {
+            anyhow::bail!("not used")
+        }
+        fn finalize_research_decision(&self) -> anyhow::Result<Value> {
+            anyhow::bail!("not used")
+        }
+        fn set_trade_intent(
+            &self,
+            _: tools::domain_tools::TradeIntentCommand,
+        ) -> anyhow::Result<Value> {
+            anyhow::bail!("not used")
+        }
+        fn append_trade_blocker(
+            &self,
+            _: tools::domain_tools::TradeBlockerCommand,
+        ) -> anyhow::Result<Value> {
+            anyhow::bail!("not used")
+        }
+        fn finalize_trade_intent(&self) -> anyhow::Result<Value> {
+            anyhow::bail!("not used")
+        }
+        fn set_risk_assessment(
+            &self,
+            _: tools::domain_tools::RiskAssessmentCommand,
+        ) -> anyhow::Result<Value> {
+            anyhow::bail!("not used")
+        }
+        fn set_risk_constraints(
+            &self,
+            _: tools::domain_tools::RiskConstraintsCommand,
+        ) -> anyhow::Result<Value> {
+            anyhow::bail!("not used")
+        }
+        fn finalize_risk_review(&self) -> anyhow::Result<Value> {
+            anyhow::bail!("not used")
+        }
+        fn set_portfolio_asset_decision(
+            &self,
+            _: tools::domain_tools::PortfolioAssetDecisionCommand,
+        ) -> anyhow::Result<Value> {
+            anyhow::bail!("not used")
+        }
+        fn append_binding_risk_control(
+            &self,
+            _: tools::domain_tools::BindingRiskControlCommand,
+        ) -> anyhow::Result<Value> {
+            anyhow::bail!("not used")
+        }
+        fn finalize_portfolio_decision(&self) -> anyhow::Result<Value> {
+            anyhow::bail!("not used")
+        }
+    }
+
+    #[tokio::test]
+    async fn project_runtime_dispatches_terminal_domain_finalize_only_with_binding() {
+        let binding = tools::domain_tools::DomainToolRuntimeBinding::new(
+            tools::domain_tools::DomainToolScope {
+                profile: orchestrator_core::ToolManagedProfile::AnalystReport,
+                tickers: ["QQQ".to_owned()].into_iter().collect(),
+                visible_evidence_refs: Default::default(),
+            },
+            std::sync::Arc::new(TerminalDomainService),
+        )
+        .unwrap();
+        let runtime = ProjectToolRuntime::with_available_tools(
+            tools::ExternalToolConfig::default(),
+            vec![tools::FINALIZE_ANALYST_REPORT_TOOL_NAME.to_owned()],
+        )
+        .with_domain_tool_runtime(binding);
+        let result = runtime
+            .execute(ToolCallRequest {
+                call_id: "call-domain-finalize".to_owned(),
+                name: tools::FINALIZE_ANALYST_REPORT_TOOL_NAME.to_owned(),
+                arguments: json!({}),
+            })
+            .await;
+        assert_eq!(result.status, "completed");
+        assert_eq!(result.output["terminal"], true);
+        assert_eq!(result.output["artifact"]["artifact_id"], "analyst-1");
     }
 
     #[tokio::test]
