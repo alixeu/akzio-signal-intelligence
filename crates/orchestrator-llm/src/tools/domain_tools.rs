@@ -344,6 +344,9 @@ pub struct DomainToolScope {
     pub profile: ToolManagedProfile,
     pub tickers: BTreeSet<String>,
     pub visible_evidence_refs: BTreeSet<String>,
+    /// Rust-derived Phase 2 claim IDs visible to this turn.  This is an
+    /// allowlist, never a model-provided routing field.
+    pub visible_claims: BTreeSet<String>,
 }
 
 /// A provenance-bearing read that the Rust tool runtime, rather than the
@@ -1218,6 +1221,7 @@ mod tests {
             profile: ToolManagedProfile::AnalystReport,
             tickers: ["QQQ".to_owned()].into_iter().collect(),
             visible_evidence_refs: ["evidence:technical:QQQ".to_owned()].into_iter().collect(),
+            visible_claims: Default::default(),
         }
     }
 
@@ -1226,6 +1230,7 @@ mod tests {
             profile,
             tickers: ["QQQ".to_owned()].into_iter().collect(),
             visible_evidence_refs: ["phase5:neutral:QQQ".to_owned()].into_iter().collect(),
+            visible_claims: Default::default(),
         }
     }
 

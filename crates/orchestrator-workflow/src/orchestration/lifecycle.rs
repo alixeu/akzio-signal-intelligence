@@ -379,7 +379,7 @@ fn validate_debate_summary_payload(payload: &Value) -> Option<String> {
     }
     if !matches!(
         convergence_status,
-        "converged_or_pending_review" | "not_converged" | "skipped"
+        "converged" | "converged_or_pending_review" | "not_converged" | "skipped"
     ) {
         return Some(format!(
             "convergence_status has invalid value {convergence_status}"

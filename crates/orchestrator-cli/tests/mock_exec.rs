@@ -204,7 +204,7 @@ async fn debug_exec_records_local_reducers_without_changing_workflow_policy() {
         state.get("phase1_index").is_some(),
         "phase1_index materialized"
     );
-    assert_eq!(state["phase_status"]["2"], "skipped");
+    assert_eq!(state["phase_status"]["2"], "done");
     assert!(state["phase_status"].get("25").is_none());
     assert!(matches!(
         state["phase_status"]["4"].as_str(),
@@ -224,7 +224,7 @@ async fn debug_exec_records_local_reducers_without_changing_workflow_policy() {
             }),
         "expected phase_summary compressor_after_phase_1 debug record"
     );
-    assert!(!state["role_job_metrics"]
+    assert!(state["role_job_metrics"]
         .as_array()
         .unwrap()
         .iter()
@@ -237,7 +237,10 @@ async fn debug_exec_records_local_reducers_without_changing_workflow_policy() {
             |row| row.get(0),
         )
         .unwrap();
-    assert!(phase2_debate_rows > 0);
+    assert_eq!(
+        phase2_debate_rows, 0,
+        "migrated Phase 2 must not persist SQLite turns"
+    );
 
     assert!(state["debug_phase_records"]
         .as_array()
@@ -663,7 +666,10 @@ async fn mock_phase2_writes_initial_and_interaction_turns() {
             .unwrap()
     };
 
-    assert!(rows.contains(&("mediator.topic".to_string(), "topic_final".to_string())));
+    assert!(
+        rows.is_empty(),
+        "migrated Phase 2 must not persist SQLite turns: {rows:?}"
+    );
     assert!(!rows.contains(&(
         "researcher.bull.initial".to_string(),
         "bull_seed".to_string(),
@@ -723,20 +729,9 @@ async fn mock_exec_writes_reducer_turn_summaries() {
             .unwrap()
     };
 
-    // Phase1 index is in-process (no reducer.evidence phase-15 rows); debate final still persists.
     assert!(
-        rows.iter().any(|(phase, role, summary_json)| {
-            *phase == 2
-                && role == "reducer.debate_final"
-                && summary_json.contains("reducer.debate_final")
-        }),
-        "expected reducer.debate_final rows, got {rows:?}"
-    );
-    assert!(
-        rows.iter()
-            .filter(|(_, role, _)| role == "reducer.debate_final")
-            .count()
-            >= 1
+        rows.is_empty(),
+        "migrated reducer must not persist SQLite rows: {rows:?}"
     );
     assert_eq!(
         rows.iter()

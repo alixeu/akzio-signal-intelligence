@@ -23,14 +23,19 @@ use orchestrator_llm::tools::domain_tools::{
     TextCommand, TopicSoftControlCommand, TradeBlockerCommand, TradeIntentCommand,
 };
 use orchestrator_store::{
-    append_analyst_data_gap, append_analyst_evidence, append_research_hinge, append_session_event,
-    content_hash, finalize_analyst_report, finalize_research_decision, read_session_events,
-    read_session_manifest, set_analyst_assessment, set_analyst_invalidation, set_research_decision,
-    set_research_scenarios, write_session_manifest, AnalystAssessmentInput, AnalystEvidenceInput,
+    append_analyst_data_gap, append_analyst_evidence, append_binding_risk_control,
+    append_research_hinge, append_session_event, append_trade_blocker, content_hash,
+    finalize_analyst_report, finalize_portfolio_decision, finalize_research_decision,
+    finalize_risk_review, finalize_trade_intent, read_session_events, read_session_manifest,
+    set_analyst_assessment, set_analyst_invalidation, set_portfolio_asset_decision,
+    set_research_decision, set_research_scenarios, set_risk_assessment, set_risk_constraints,
+    set_trade_intent, write_session_manifest, AnalystAssessmentInput, AnalystEvidenceInput,
     ArtifactScope, ClaimStatus, DomainFinalizeOutcome, DraftAppendOutcome, DraftProfile,
     EvidenceReadEvent, FileStore, FileStoreOptions, FinalizeDraftOutcome, ForkReference,
-    Phase2DraftService, ResearchDecisionInput, ResearchScenarioInput, RunLocation,
-    SessionEventInput, SessionEventType, SessionLocation, SessionManifest, VisibleEvidenceSet,
+    Phase2DraftService, PortfolioAssetDecisionInput, PortfolioDecisionFinalizePolicy,
+    ResearchDecisionInput, ResearchScenarioInput, RiskAssessmentInput, RiskConstraintsInput,
+    RunLocation, SessionEventInput, SessionEventType, SessionLocation, SessionManifest,
+    TradeIntentFinalizePolicy, TradeIntentInput, VisibleEvidenceSet,
 };
 use serde_json::{json, Value};
 
@@ -51,6 +56,11 @@ pub(crate) struct FileStoreDomainRuntimePlan {
     pub round: Option<u32>,
     pub visible_claims: BTreeSet<String>,
     pub fork: Option<ForkReference>,
+    /// Rust-owned Phase 4 policy, never model input.
+    pub trade_candidate_action: Option<String>,
+    /// Rust-owned Phase 6 policy, never model input.
+    pub portfolio_rating: Option<String>,
+    pub portfolio_current_weight: Option<f64>,
 }
 
 pub(crate) fn file_store_domain_runtime(
@@ -66,6 +76,9 @@ pub(crate) fn file_store_domain_runtime(
         ToolManagedProfile::DebateResponse => DraftProfile::DebateResponse,
         ToolManagedProfile::TopicControl => DraftProfile::TopicControl,
         ToolManagedProfile::ResearchDecision => DraftProfile::ResearchDecision,
+        ToolManagedProfile::TradeIntent => DraftProfile::TradeIntent,
+        ToolManagedProfile::RiskReview => DraftProfile::RiskReview,
+        ToolManagedProfile::PortfolioDecision => DraftProfile::PortfolioDecision,
         _ => bail!(
             "no FileStore domain adapter exists for {}",
             plan.profile.as_str()
@@ -86,8 +99,18 @@ pub(crate) fn file_store_domain_runtime(
     {
         bail!("FileStore domain runtime requires at least one ticker")
     }
-    if plan.profile == ToolManagedProfile::AnalystReport && plan.tickers.len() != 1 {
-        bail!("FileStore AnalystReport runtime requires exactly one Rust-planned ticker unit")
+    if matches!(
+        plan.profile,
+        ToolManagedProfile::AnalystReport
+            | ToolManagedProfile::TradeIntent
+            | ToolManagedProfile::RiskReview
+            | ToolManagedProfile::PortfolioDecision
+    ) && plan.tickers.len() != 1
+    {
+        bail!(
+            "FileStore {} runtime requires exactly one Rust-planned ticker unit",
+            plan.profile.as_str()
+        )
     }
     let source_payload_hash = content_hash(&json!({
         "run_id": run_id,
@@ -100,7 +123,13 @@ pub(crate) fn file_store_domain_runtime(
         "round": plan.round,
         "source": source_payload_for(state, phase_u8, plan.profile),
     }))?;
-    let unit_key = if plan.profile == ToolManagedProfile::AnalystReport {
+    let unit_key = if matches!(
+        plan.profile,
+        ToolManagedProfile::AnalystReport
+            | ToolManagedProfile::TradeIntent
+            | ToolManagedProfile::RiskReview
+            | ToolManagedProfile::PortfolioDecision
+    ) {
         format!(
             "phase{phase_u8}:{}:ticker:{}",
             plan.role,
@@ -122,6 +151,12 @@ pub(crate) fn file_store_domain_runtime(
     } else {
         format!("phase{phase_u8}:{}:aggregate", plan.role)
     };
+    let stance = (plan.profile == ToolManagedProfile::RiskReview).then(|| {
+        plan.role
+            .strip_prefix("risk.")
+            .unwrap_or_default()
+            .to_owned()
+    });
     let scope = ArtifactScope {
         run_id: run_id.clone(),
         current_date: current_date.clone(),
@@ -132,11 +167,17 @@ pub(crate) fn file_store_domain_runtime(
         builder_version: plan.builder_version,
         unit_key,
         source_payload_hash,
-        ticker: (plan.profile == ToolManagedProfile::AnalystReport)
-            .then(|| plan.tickers[0].clone()),
+        ticker: matches!(
+            plan.profile,
+            ToolManagedProfile::AnalystReport
+                | ToolManagedProfile::TradeIntent
+                | ToolManagedProfile::RiskReview
+                | ToolManagedProfile::PortfolioDecision
+        )
+        .then(|| plan.tickers[0].clone()),
         topic_id: plan.topic_id.clone(),
         side: plan.side.clone(),
-        stance: None,
+        stance,
         round: plan.round,
         reflection_task: None,
     };
@@ -159,12 +200,16 @@ pub(crate) fn file_store_domain_runtime(
         created_at: Utc::now().to_rfc3339(),
         visible_claims: plan.visible_claims.clone(),
         visible_evidence_refs: plan.visible_evidence_refs.clone(),
+        trade_candidate_action: plan.trade_candidate_action.clone(),
+        portfolio_rating: plan.portfolio_rating.clone(),
+        portfolio_current_weight: plan.portfolio_current_weight,
     };
     DomainToolRuntimeBinding::new_with_evidence_visibility(
         DomainToolScope {
             profile: plan.profile,
             tickers: plan.tickers.into_iter().collect(),
             visible_evidence_refs: plan.visible_evidence_refs,
+            visible_claims: plan.visible_claims,
         },
         Arc::new(service),
         evidence_visibility,
@@ -293,6 +338,62 @@ pub(crate) fn finalize_degraded_research_decision(
         .get("artifact")
         .cloned()
         .context("degraded FileStore research finalizer did not return an artifact")
+}
+
+/// Typed degraded output for a migrated Trader. It remains a terminal Draft
+/// finalization and deliberately cannot fall back to a legacy JSON artifact.
+pub(crate) fn finalize_degraded_trade_intent(
+    store_root: &Path,
+    state: &Value,
+    plan: FileStoreDomainRuntimePlan,
+    failure: &str,
+) -> Result<Value> {
+    let binding = file_store_domain_runtime(store_root, state, plan)?;
+    binding.execute(
+        "set_trade_intent",
+        json!({
+            "action":"Hold", "execution_decision":"hold", "entry_price":null,
+            "stop_loss":null, "position_size_pct_max":0.0,
+            "rationale":format!("Trader degraded before terminal finalize: {failure}")
+        }),
+    )?;
+    binding
+        .execute("finalize_trade_intent", json!({}))?
+        .get("artifact")
+        .cloned()
+        .context("degraded FileStore trade finalizer did not return an artifact")
+}
+
+/// Typed degraded output for a migrated Risk Reviewer.
+pub(crate) fn finalize_degraded_risk_review(
+    store_root: &Path,
+    state: &Value,
+    plan: FileStoreDomainRuntimePlan,
+    failure: &str,
+) -> Result<Value> {
+    let binding = file_store_domain_runtime(store_root, state, plan)?;
+    binding.execute(
+        "set_risk_assessment",
+        json!({
+            "argument":format!("Risk review degraded: {failure}"),
+            "unique_risk_contribution":"runtime_degraded", "disagreement_with_prior":"unknown",
+            "no_new_information":false
+        }),
+    )?;
+    binding.execute(
+        "set_risk_constraints",
+        json!({
+            "recommended_adjustment":"hold", "stop_type":"none", "max_drawdown_pct":0.0,
+            "position_cap_pct":0.0, "rebalance_trigger":"Obtain a completed risk review.",
+            "risk_off_trigger":"Obtain a completed risk review.", "review_window":"immediate",
+            "cash_hedge_recommendation":"hold cash", "constraint_confidence":0.0
+        }),
+    )?;
+    binding
+        .execute("finalize_risk_review", json!({}))?
+        .get("artifact")
+        .cloned()
+        .context("degraded FileStore risk finalizer did not return an artifact")
 }
 
 /// FileStore-backed evidence visibility.  The model cannot call this type:
@@ -501,6 +602,21 @@ fn source_payload_for(state: &Value, phase: u8, profile: ToolManagedProfile) -> 
             "debate_state_artifact": state.get("debate_state_artifact"),
             "phase2": state.get("phase2"),
         }),
+        (4, ToolManagedProfile::TradeIntent) => json!({
+            "research_plan": state.get("research_plan"),
+            "phase3": state.get("phase3"),
+        }),
+        (5, ToolManagedProfile::RiskReview) => json!({
+            "research_plan": state.get("research_plan"),
+            "trader_investment_plan": state.get("trader_investment_plan"),
+            "phase4": state.get("phase4"),
+        }),
+        (6, ToolManagedProfile::PortfolioDecision) => json!({
+            "research_plan": state.get("research_plan"),
+            "trader_investment_plan": state.get("trader_investment_plan"),
+            "risk_debate_state": state.get("risk_debate_state"),
+            "account": state.get("account"),
+        }),
         (2, ToolManagedProfile::ResearcherWarmup) => json!({
             "phase1_index": state.get("phase1_index"),
             "phase_summaries": state.get("phase_summary_memory"),
@@ -533,6 +649,9 @@ struct FileStoreDomainToolService {
     created_at: String,
     visible_claims: BTreeSet<String>,
     visible_evidence_refs: BTreeSet<String>,
+    trade_candidate_action: Option<String>,
+    portfolio_rating: Option<String>,
+    portfolio_current_weight: Option<f64>,
 }
 
 impl FileStoreDomainToolService {
@@ -567,7 +686,9 @@ impl FileStoreDomainToolService {
         match outcome {
             DomainFinalizeOutcome::Analyst(outcome) => self.finalized_value(*outcome),
             DomainFinalizeOutcome::Research(outcome) => self.finalized_value(*outcome),
-            _ => bail!("unexpected FileStore domain finalizer outcome"),
+            DomainFinalizeOutcome::Trade(outcome) => self.finalized_value(*outcome),
+            DomainFinalizeOutcome::Risk(outcome) => self.finalized_value(*outcome),
+            DomainFinalizeOutcome::Portfolio(outcome) => self.finalized_value(*outcome),
         }
     }
 
@@ -729,32 +850,148 @@ impl DomainToolService for FileStoreDomainToolService {
         )?)
     }
 
-    fn set_trade_intent(&self, _: TradeIntentCommand) -> Result<Value> {
-        bail!("trade domain runtime is not wired")
+    fn set_trade_intent(&self, command: TradeIntentCommand) -> Result<Value> {
+        self.require(DraftProfile::TradeIntent)?;
+        Ok(Self::append(set_trade_intent(
+            &self.store,
+            &self.location,
+            &self.scope,
+            TradeIntentInput {
+                action: command.action,
+                execution_decision: command.execution_decision,
+                entry_price: command.entry_price,
+                stop_loss: command.stop_loss,
+                position_size_pct_max: command.position_size_pct_max,
+                rationale: command.rationale,
+            },
+            &self.created_at,
+        )?))
     }
-    fn append_trade_blocker(&self, _: TradeBlockerCommand) -> Result<Value> {
-        bail!("trade domain runtime is not wired")
+    fn append_trade_blocker(&self, command: TradeBlockerCommand) -> Result<Value> {
+        self.require(DraftProfile::TradeIntent)?;
+        Ok(Self::append(append_trade_blocker(
+            &self.store,
+            &self.location,
+            &self.scope,
+            command.blocker,
+            &self.created_at,
+        )?))
     }
     fn finalize_trade_intent(&self) -> Result<Value> {
-        bail!("trade domain runtime is not wired")
+        self.require(DraftProfile::TradeIntent)?;
+        let candidate_action = self
+            .trade_candidate_action
+            .as_deref()
+            .context("Rust-owned trade candidate action missing from FileStore runtime")?
+            .to_owned();
+        self.finalized(finalize_trade_intent(
+            &self.store,
+            &self.location,
+            &self.scope,
+            &TradeIntentFinalizePolicy { candidate_action },
+            &self.created_at,
+        )?)
     }
-    fn set_risk_assessment(&self, _: RiskAssessmentCommand) -> Result<Value> {
-        bail!("risk domain runtime is not wired")
+    fn set_risk_assessment(&self, command: RiskAssessmentCommand) -> Result<Value> {
+        self.require(DraftProfile::RiskReview)?;
+        Ok(Self::append(set_risk_assessment(
+            &self.store,
+            &self.location,
+            &self.scope,
+            RiskAssessmentInput {
+                argument: command.argument,
+                unique_risk_contribution: command.unique_risk_contribution,
+                disagreement_with_prior: command.disagreement_with_prior,
+                no_new_information: command.no_new_information,
+            },
+            &self.created_at,
+        )?))
     }
-    fn set_risk_constraints(&self, _: RiskConstraintsCommand) -> Result<Value> {
-        bail!("risk domain runtime is not wired")
+    fn set_risk_constraints(&self, command: RiskConstraintsCommand) -> Result<Value> {
+        self.require(DraftProfile::RiskReview)?;
+        Ok(Self::append(set_risk_constraints(
+            &self.store,
+            &self.location,
+            &self.scope,
+            RiskConstraintsInput {
+                recommended_adjustment: command.recommended_adjustment,
+                stop_type: command.stop_type,
+                max_drawdown_pct: command.max_drawdown_pct,
+                position_cap_pct: command.position_cap_pct,
+                rebalance_trigger: command.rebalance_trigger,
+                risk_off_trigger: command.risk_off_trigger,
+                review_window: command.review_window,
+                cash_hedge_recommendation: command.cash_hedge_recommendation,
+                constraint_confidence: command.constraint_confidence,
+            },
+            &self.created_at,
+        )?))
     }
     fn finalize_risk_review(&self) -> Result<Value> {
-        bail!("risk domain runtime is not wired")
+        self.require(DraftProfile::RiskReview)?;
+        self.finalized(finalize_risk_review(
+            &self.store,
+            &self.location,
+            &self.scope,
+            &self.created_at,
+        )?)
     }
-    fn set_portfolio_asset_decision(&self, _: PortfolioAssetDecisionCommand) -> Result<Value> {
-        bail!("portfolio domain runtime is not wired")
+    fn set_portfolio_asset_decision(
+        &self,
+        command: PortfolioAssetDecisionCommand,
+    ) -> Result<Value> {
+        self.require(DraftProfile::PortfolioDecision)?;
+        Ok(Self::append(set_portfolio_asset_decision(
+            &self.store,
+            &self.location,
+            &self.scope,
+            PortfolioAssetDecisionInput {
+                direction_constraint: command.direction_constraint,
+                execution_status: command.execution_status,
+                max_target_weight: command.max_target_weight,
+                max_weight_delta: command.max_weight_delta,
+                execution_summary: command.execution_summary,
+                investment_thesis: command.investment_thesis,
+                target_price: command.target_price,
+                horizon: command.horizon,
+                rationale: command.rationale,
+            },
+            &self.created_at,
+        )?))
     }
-    fn append_binding_risk_control(&self, _: BindingRiskControlCommand) -> Result<Value> {
-        bail!("portfolio domain runtime is not wired")
+    fn append_binding_risk_control(&self, command: BindingRiskControlCommand) -> Result<Value> {
+        self.require(DraftProfile::PortfolioDecision)?;
+        Ok(Self::append(append_binding_risk_control(
+            &self.store,
+            &self.location,
+            &self.scope,
+            command.control,
+            &self.created_at,
+        )?))
     }
     fn finalize_portfolio_decision(&self) -> Result<Value> {
-        bail!("portfolio domain runtime is not wired")
+        self.require(DraftProfile::PortfolioDecision)?;
+        let ticker = self
+            .scope
+            .ticker
+            .clone()
+            .context("portfolio scope ticker missing")?;
+        self.finalized(finalize_portfolio_decision(
+            &self.store,
+            &self.location,
+            &self.scope,
+            &PortfolioDecisionFinalizePolicy {
+                ticker,
+                rating: self
+                    .portfolio_rating
+                    .clone()
+                    .context("Rust-owned portfolio rating missing from FileStore runtime")?,
+                current_weight: self.portfolio_current_weight.context(
+                    "Rust-owned portfolio current weight missing from FileStore runtime",
+                )?,
+            },
+            &self.created_at,
+        )?)
     }
 
     fn set_phase2_common_ground(&self, command: Phase2CommonGroundCommand) -> Result<Value> {
@@ -913,6 +1150,9 @@ mod tests {
                 round: None,
                 visible_claims: Default::default(),
                 fork: None,
+                trade_candidate_action: None,
+                portfolio_rating: None,
+                portfolio_current_weight: None,
             },
         )
         .unwrap();
@@ -986,6 +1226,9 @@ mod tests {
                 round: None,
                 visible_claims: Default::default(),
                 fork: None,
+                trade_candidate_action: None,
+                portfolio_rating: None,
+                portfolio_current_weight: None,
             },
         )
         .unwrap();
@@ -1066,6 +1309,9 @@ mod tests {
             round,
             visible_claims,
             fork: None,
+            trade_candidate_action: None,
+            portfolio_rating: None,
+            portfolio_current_weight: None,
         }
     }
 

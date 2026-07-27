@@ -40,7 +40,7 @@ use crate::orchestration::config::{is_critical_role, validate_sqlite_context, Ru
 use crate::orchestration::degraded::{record_degraded_role, role_artifact_or_degraded};
 use crate::orchestration::domain_runtime::{
     finalize_degraded_analyst_report, finalize_degraded_research_decision,
-    FileStoreDomainRuntimePlan,
+    finalize_degraded_risk_review, finalize_degraded_trade_intent, FileStoreDomainRuntimePlan,
 };
 use crate::orchestration::input_snapshot_runtime::{
     capture_phase1_file_store_inputs, phase1_input_sources,
@@ -129,6 +129,57 @@ fn research_uses_file_store(runtime_config: &RuntimeConfig) -> Result<bool> {
         .authority_registry
         .authority_for("manager.research", ToolManagedProfile::ResearchDecision)?
         == ArtifactAuthority::FileStore)
+}
+
+fn profile_uses_file_store(
+    runtime_config: &RuntimeConfig,
+    role: &str,
+    profile: ToolManagedProfile,
+) -> Result<bool> {
+    Ok(runtime_config
+        .authority_registry
+        .authority_for(role, profile)?
+        == ArtifactAuthority::FileStore)
+}
+
+/// Phase 2 is all-or-nothing.  Mixed authority would let a controller read a
+/// SQLite packet emitted by a FileStore seed (or vice versa), so reject a
+/// partial registry rather than falling back across stores.
+fn phase2_uses_file_store(runtime_config: &RuntimeConfig) -> Result<bool> {
+    let registrations = [
+        ("mediator.topic", ToolManagedProfile::ResearcherWarmup),
+        ("mediator.topic", ToolManagedProfile::TopicGeneration),
+        ("researcher.bull.initial", ToolManagedProfile::DebateSeed),
+        ("researcher.bear.initial", ToolManagedProfile::DebateSeed),
+        (
+            "researcher.bull.interaction",
+            ToolManagedProfile::DebateResponse,
+        ),
+        (
+            "researcher.bear.interaction",
+            ToolManagedProfile::DebateResponse,
+        ),
+        (
+            "mediator.topic_controller",
+            ToolManagedProfile::TopicControl,
+        ),
+    ];
+    let mut values = registrations
+        .into_iter()
+        .map(|(role, profile)| {
+            runtime_config
+                .authority_registry
+                .authority_for(role, profile)
+                .map_err(anyhow::Error::from)
+        })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .map(|authority| authority == ArtifactAuthority::FileStore);
+    let first = values.next().unwrap_or(false);
+    if values.any(|value| value != first) {
+        bail!("Phase 2 authority registry must migrate every Phase 2 profile together")
+    }
+    Ok(first)
 }
 
 /// The manifest is part of the FileStore authority, not a second run ledger
@@ -1833,6 +1884,9 @@ async fn run_phase1(
                     round: None,
                     visible_claims: BTreeSet::new(),
                     fork: None,
+                    trade_candidate_action: None,
+                    portfolio_rating: None,
+                    portfolio_current_weight: None,
                 },
                 &failure,
             )?;
@@ -2041,6 +2095,19 @@ async fn run_phase2(
     max_topics: i64,
     config: &RuntimeConfig,
 ) -> Result<rusqlite::Connection> {
+    if phase2_uses_file_store(config)? {
+        run_phase2_file_store(
+            &conn,
+            state,
+            model_override,
+            reasoning_effort_override,
+            max_debate_rounds,
+            max_topics,
+            config,
+        )
+        .await?;
+        return Ok(conn);
+    }
     let db_path = state
         .get("db_path")
         .and_then(Value::as_str)
@@ -2201,6 +2268,435 @@ async fn run_phase2(
     )
     .await?;
     Ok(conn)
+}
+
+/// FileStore-authoritative Phase 2.  Every model role enters through the
+/// typed domain binding; this function only creates an in-memory projection
+/// for the existing Rust reducer.  It deliberately does not call any SQLite
+/// message/session/artifact writer.
+#[allow(clippy::too_many_arguments)]
+async fn run_phase2_file_store(
+    conn: &rusqlite::Connection,
+    state: &mut Value,
+    model_override: Option<&str>,
+    reasoning_effort_override: Option<&str>,
+    max_debate_rounds: i64,
+    max_topics: i64,
+    config: &RuntimeConfig,
+) -> Result<()> {
+    let run_id = state
+        .get("run_id")
+        .and_then(Value::as_str)
+        .context("run_id missing for FileStore Phase 2")?
+        .to_owned();
+    let warmup_session = format!("{run_id}:phase2:warmup:shared");
+    let warmup_turn = warmup_session.clone();
+    let _warmup = run_file_store_phase2_role(
+        conn,
+        state,
+        "mediator.topic",
+        "warmup",
+        Some(0),
+        None,
+        warmup_turn.clone(),
+        warmup_session.clone(),
+        Some(steer_payload("warmup", &json!({"allow_ready": true}))),
+        model_override,
+        reasoning_effort_override,
+        config,
+    )
+    .await?;
+    state["phase2_warmup"] = json!({
+        "session_id": warmup_session,
+        "turn_id": warmup_turn,
+        "ready": true,
+        "warmup_ready": true,
+        "status": "ready",
+        "response": "准备完毕",
+        "authority": "file_store"
+    });
+
+    let baseline = build_topic_generation_artifact(state);
+    let topic_session = format!("{run_id}:phase2:topic-generator");
+    let topic_turn = topic_session.clone();
+    let generated = run_file_store_phase2_role(
+        conn,
+        state,
+        "mediator.topic",
+        "topic_generation",
+        None,
+        None,
+        topic_turn.clone(),
+        topic_session.clone(),
+        topic_generation_steer(),
+        model_override,
+        reasoning_effort_override,
+        config,
+    )
+    .await?;
+    state["topic_generation_session_id"] = json!(topic_session);
+    state["topic_generation_turn_id"] = json!(topic_turn);
+    let topic_generation = project_file_store_topic_generation(&baseline, &generated, state)?;
+    state["topic_generation_artifact"] = topic_generation.clone();
+    let topics = topics_from_generation_artifact(&topic_generation)
+        .into_iter()
+        .take(max_topics.max(1) as usize)
+        .collect::<Vec<_>>();
+    state["debate_topics"] = json!(topics);
+    state["debate_turns"] = json!([]);
+    state["topic_debate_states"] = json!({});
+    state["phase2_file_store_sessions"] = json!({});
+
+    for topic in topics {
+        run_one_file_store_topic_debate(
+            conn,
+            state,
+            topic,
+            model_override,
+            reasoning_effort_override,
+            max_debate_rounds,
+            config,
+        )
+        .await?;
+    }
+    let artifact = build_debate_state_artifact(state, config);
+    state["debate_state_artifact"] = artifact.clone();
+    state["debate_brief_md"] = Value::String(reducer_brief_md(&artifact));
+    state["phase2_authority"] = json!("file_store");
+    record_local_debug_artifact(
+        state,
+        2,
+        "reducer.debate_final",
+        PathBuf::from("outputs/debug/phase2/debate_final.json"),
+        "runtime",
+        &artifact,
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_file_store_phase2_role(
+    conn: &rusqlite::Connection,
+    state: &mut Value,
+    role: &str,
+    kind: &str,
+    round: Option<i64>,
+    topic_id: Option<&str>,
+    session_id: String,
+    turn_id: String,
+    steer: Option<String>,
+    model_override: Option<&str>,
+    reasoning_effort_override: Option<&str>,
+    config: &RuntimeConfig,
+) -> Result<Value> {
+    let prompt_path = match role {
+        "mediator.topic" if kind == "warmup" => config.prompts.path_for("researcher.warmup"),
+        "mediator.topic" => config.prompts.path_for("mediator.topic"),
+        _ => config.prompts.path_for(role),
+    }
+    .with_context(|| format!("missing FileStore Phase 2 prompt for {role}/{kind}"))?;
+    run_single_steer_role_job(
+        SteerRoleRun {
+            state: state.clone(),
+            role,
+            phase: 2,
+            kind,
+            round,
+            topic_id,
+            mock: is_mock(state),
+            model_override,
+            reasoning_effort_override,
+            config,
+            prompt_path: Some(prompt_path.as_path()),
+            session_id,
+            turn_id,
+            steer,
+        },
+        if role == "mediator.topic_controller" {
+            config.workflow.reducer_timeout_sec
+        } else {
+            config.workflow.agent_timeout_sec
+        },
+        config,
+        state,
+        conn,
+    )
+    .await
+}
+
+fn project_file_store_topic_generation(
+    baseline: &Value,
+    canonical: &Value,
+    state: &Value,
+) -> Result<Value> {
+    let payload = canonical
+        .get("payload")
+        .context("FileStore topic generation artifact missing payload")?;
+    let topics = payload
+        .get("topics")
+        .and_then(Value::as_array)
+        .context("FileStore topic generation artifact missing topics")?
+        .iter()
+        .map(|topic| {
+            json!({
+                "topic_id": topic.get("topic_id").cloned().unwrap_or(Value::Null),
+                "topic": topic.get("topic").cloned().unwrap_or(Value::Null),
+                "decision_hinge": topic.get("decision_hinge").cloned().unwrap_or(Value::Null),
+                "evidence_refs": topic.get("evidence_refs").cloned().unwrap_or_else(|| json!([])),
+                "tickers": tickers_from_state(state),
+                "why_debate": "ToolManaged Topic Generator selected this Rust-scoped topic."
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut projection = baseline.clone();
+    projection["common_ground"] = payload
+        .get("common_ground")
+        .cloned()
+        .unwrap_or_else(|| json!(""));
+    // Rust owns the Phase 1 actionability gate.  A mock/live Topic Generator
+    // cannot manufacture a debate unit when the upstream evidence boundary
+    // is closed.
+    projection["topics"] =
+        if baseline.get("evidence_actionable").and_then(Value::as_bool) == Some(true) {
+            json!(topics)
+        } else {
+            json!([])
+        };
+    let actionable = projection["topics"]
+        .as_array()
+        .is_some_and(|items| !items.is_empty());
+    projection["actionable"] = json!(actionable);
+    projection["debate_required"] = json!(actionable);
+    projection["status"] = json!(if actionable { "ready" } else { "skipped" });
+    projection["material_conflict_count"] =
+        json!(projection["topics"].as_array().map(Vec::len).unwrap_or(0));
+    Ok(projection)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_one_file_store_topic_debate(
+    conn: &rusqlite::Connection,
+    state: &mut Value,
+    topic: Value,
+    model_override: Option<&str>,
+    reasoning_effort_override: Option<&str>,
+    max_debate_rounds: i64,
+    config: &RuntimeConfig,
+) -> Result<()> {
+    let topic_id = topic_id_from_topic(&topic);
+    let run_id = state
+        .get("run_id")
+        .and_then(Value::as_str)
+        .unwrap_or("run")
+        .to_owned();
+    let topic_state = json!({"topic": topic.clone(), "turns": [], "controller_artifacts": []});
+    upsert_topic_debate_state(state, &topic_id, topic_state);
+    let common_ground = state
+        .pointer("/topic_generation_artifact/common_ground")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let fork = Some(steer_payload(
+        "topic_fork",
+        &json!({"user_message": topic_fork_user_message(&topic, &common_ground), "topic": topic}),
+    ));
+    let mut seed_artifacts = Vec::new();
+    for (side, role) in [
+        ("bull", "researcher.bull.initial"),
+        ("bear", "researcher.bear.initial"),
+    ] {
+        let session = format!("{run_id}:phase2:{topic_id}:{side}:seed");
+        let turn = format!("{topic_id}:{side}:seed");
+        let artifact = run_file_store_phase2_role(
+            conn,
+            state,
+            role,
+            "bull_seed",
+            Some(1),
+            Some(&topic_id),
+            session.clone(),
+            turn.clone(),
+            fork.clone(),
+            model_override,
+            reasoning_effort_override,
+            config,
+        )
+        .await?;
+        remember_file_store_phase2_session(state, &topic_id, side, &session, &turn);
+        append_file_store_phase2_turn(state, &topic_id, role, "seed", 1, artifact.clone());
+        seed_artifacts.push((side, artifact));
+    }
+    let mut controller = run_file_store_phase2_role(
+        conn,
+        state,
+        "mediator.topic_controller",
+        "controller_packet",
+        Some(1),
+        Some(&topic_id),
+        format!("{run_id}:phase2:{topic_id}:controller:1"),
+        format!("{topic_id}:controller:1"),
+        Some(steer_payload(
+            "seed_claims",
+            &json!({"bull_seed": seed_artifacts[0].1, "bear_seed": seed_artifacts[1].1}),
+        )),
+        model_override,
+        reasoning_effort_override,
+        config,
+    )
+    .await?;
+    let mut controller_projection = project_file_store_controller(&controller, state, &topic_id);
+    append_file_store_phase2_turn(
+        state,
+        &topic_id,
+        "mediator.topic_controller",
+        "controller",
+        1,
+        controller.clone(),
+    );
+    set_topic_controller_state(state, &topic_id, controller_projection.clone());
+    append_topic_controller_artifact(state, &topic_id, controller_projection.clone());
+
+    for round in 2..=max_debate_rounds.max(2) {
+        let mut responses = Vec::new();
+        for (side, role) in [
+            ("bull", "researcher.bull.interaction"),
+            ("bear", "researcher.bear.interaction"),
+        ] {
+            let session = format!("{run_id}:phase2:{topic_id}:{side}:response:{round}");
+            let turn = format!("{topic_id}:{side}:response:{round}");
+            let artifact = run_file_store_phase2_role(
+                conn,
+                state,
+                role,
+                "response",
+                Some(round),
+                Some(&topic_id),
+                session.clone(),
+                turn.clone(),
+                Some(steer_payload(
+                    "point_debate",
+                    &json!({"controller": controller, "side": side}),
+                )),
+                model_override,
+                reasoning_effort_override,
+                config,
+            )
+            .await?;
+            remember_file_store_phase2_session(state, &topic_id, side, &session, &turn);
+            append_file_store_phase2_turn(
+                state,
+                &topic_id,
+                role,
+                "response",
+                round,
+                artifact.clone(),
+            );
+            responses.push((side, artifact));
+        }
+        controller = run_file_store_phase2_role(
+            conn,
+            state,
+            "mediator.topic_controller",
+            "controller_packet",
+            Some(round),
+            Some(&topic_id),
+            format!("{run_id}:phase2:{topic_id}:controller:{round}"),
+            format!("{topic_id}:controller:{round}"),
+            Some(steer_payload(
+                "debater_packets",
+                &json!({"bull_packet": responses[0].1, "bear_packet": responses[1].1}),
+            )),
+            model_override,
+            reasoning_effort_override,
+            config,
+        )
+        .await?;
+        controller_projection = project_file_store_controller(&controller, state, &topic_id);
+        append_file_store_phase2_turn(
+            state,
+            &topic_id,
+            "mediator.topic_controller",
+            "controller",
+            round,
+            controller.clone(),
+        );
+        set_topic_controller_state(state, &topic_id, controller_projection.clone());
+        append_topic_controller_artifact(state, &topic_id, controller_projection.clone());
+        if controller_projection
+            .pointer("/soft_control/should_continue")
+            .and_then(Value::as_bool)
+            == Some(false)
+        {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn remember_file_store_phase2_session(
+    state: &mut Value,
+    topic_id: &str,
+    side: &str,
+    session_id: &str,
+    turn_id: &str,
+) {
+    if !state
+        .get("phase2_file_store_sessions")
+        .is_some_and(Value::is_object)
+    {
+        state["phase2_file_store_sessions"] = json!({});
+    }
+    state["phase2_file_store_sessions"][topic_id][side] =
+        json!({"session_id": session_id, "turn_id": turn_id});
+}
+
+fn append_file_store_phase2_turn(
+    state: &mut Value,
+    topic_id: &str,
+    role: &str,
+    kind: &str,
+    round: i64,
+    artifact: Value,
+) {
+    let turn = json!({"role": role, "kind": kind, "round": round, "topic_id": topic_id, "artifact": artifact});
+    append_topic_turn(state, topic_id, turn.clone());
+    if let Some(turns) = state.get_mut("debate_turns").and_then(Value::as_array_mut) {
+        turns.push(turn);
+    }
+}
+
+fn project_file_store_controller(canonical: &Value, state: &Value, topic_id: &str) -> Value {
+    let payload = canonical.get("payload").unwrap_or(&Value::Null);
+    let refs = state
+        .pointer(&format!("/topic_debate_states/{topic_id}/turns"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .flat_map(|turn| {
+            turn.pointer("/artifact/evidence_refs")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let hinges = payload
+        .get("decision_hinges")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|hinge| json!({"hinge": hinge, "evidence_refs": refs}))
+        .collect::<Vec<_>>();
+    json!({
+        "role": "mediator.topic_controller",
+        "artifact_type": "phase2_controller_artifact",
+        "topic_id": topic_id,
+        "agreed_facts": payload.get("agreed_facts").cloned().unwrap_or_else(|| json!([])),
+        "decision_hinges": hinges,
+        "claim_ledger": payload.get("claim_statuses").cloned().unwrap_or_else(|| json!([])),
+        "next_steers": payload.get("routes").cloned().unwrap_or_else(|| json!([])),
+        "soft_control": {"should_continue": payload.get("should_continue").and_then(Value::as_bool).unwrap_or(false)}
+    })
 }
 
 fn topic_fork_user_message(topic: &Value, common_ground: &Value) -> String {
@@ -3597,6 +4093,9 @@ async fn run_file_store_research_job(
             round: None,
             visible_claims: BTreeSet::new(),
             fork: None,
+            trade_candidate_action: None,
+            portfolio_rating: None,
+            portfolio_current_weight: None,
         },
         &failure,
     )
@@ -4071,6 +4570,16 @@ async fn run_phase4(
     reasoning_effort_override: Option<&str>,
     config: &RuntimeConfig,
 ) -> Result<()> {
+    if profile_uses_file_store(config, "trader", ToolManagedProfile::TradeIntent)? {
+        return run_file_store_phase4(
+            state,
+            model_override,
+            reasoning_effort_override,
+            config,
+            conn,
+        )
+        .await;
+    }
     let prompt_path = config
         .prompts
         .path_for("trader")
@@ -4101,6 +4610,120 @@ async fn run_phase4(
     record_prompt_runtime_debug_artifact(state, 4, "trader", prompt_path, &artifact)?;
     state["trader_investment_plan"] = artifact;
     Ok(())
+}
+
+/// FileStore Trader units are one per ticker. The legacy state projection is
+/// strictly derived from finalized canonical artifacts for downstream Rust
+/// allocation only; it is never written to SQLite.
+async fn run_file_store_phase4(
+    state: &mut Value,
+    model_override: Option<&str>,
+    reasoning_effort_override: Option<&str>,
+    config: &RuntimeConfig,
+    conn: &rusqlite::Connection,
+) -> Result<()> {
+    let registration = config
+        .authority_registry
+        .registration("trader", ToolManagedProfile::TradeIntent)?;
+    let store_root = state
+        .get("store_root")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .context("store_root missing for migrated Phase 4 Trader")?;
+    let mut projected = serde_json::Map::new();
+    for ticker in tickers_from_state(state) {
+        let mut ticker_state = state.clone();
+        ticker_state["ticker"] = json!(ticker);
+        ticker_state["tickers"] = json!([ticker]);
+        let result = run_single_role_job_result(
+            RoleRun {
+                state: ticker_state.clone(),
+                role: "trader",
+                phase: 4,
+                kind: "artifact",
+                round: None,
+                topic_id: None,
+                mock: is_mock(state),
+                model_override,
+                reasoning_effort_override,
+                config,
+                prompt_path: Some(
+                    config
+                        .prompts
+                        .path_for("trader")
+                        .context("missing prompt path for trader")?,
+                ),
+            },
+            config.workflow.agent_timeout_sec,
+            state,
+            conn,
+        )
+        .await?;
+        let candidate_action = research_candidate_for_ticker(state, &ticker);
+        let plan = FileStoreDomainRuntimePlan {
+            role: "trader".to_owned(),
+            phase: 4,
+            profile: ToolManagedProfile::TradeIntent,
+            profile_version: registration.profile_version,
+            builder_version: registration.builder_version,
+            tickers: vec![ticker.clone()],
+            visible_evidence_refs: BTreeSet::new(),
+            topic_id: None,
+            side: None,
+            round: None,
+            visible_claims: BTreeSet::new(),
+            fork: None,
+            trade_candidate_action: Some(candidate_action),
+            portfolio_rating: None,
+            portfolio_current_weight: None,
+        };
+        let artifact = match result.artifact {
+            Some(artifact) => artifact,
+            None => {
+                let failure = result
+                    .error
+                    .as_deref()
+                    .unwrap_or("trader failed before terminal finalize");
+                record_degraded_role(state, &result, failure);
+                finalize_degraded_trade_intent(&store_root, &ticker_state, plan, failure)?
+            }
+        };
+        let intent = artifact
+            .get("intent")
+            .cloned()
+            .context("FileStore trade artifact missing intent")?;
+        projected.insert(ticker, intent);
+    }
+    let first = projected.values().next().cloned().unwrap_or_else(|| {
+        json!({
+            "action":"Hold", "candidate_action":"Hold", "execution_decision":"hold",
+            "position_size_pct_max":0.0, "blockers":["no_ticker"]
+        })
+    });
+    let mut state_projection = first;
+    state_projection["per_ticker"] = Value::Object(projected);
+    state_projection["authority"] = json!("file_store");
+    state["trader_investment_plan"] = state_projection;
+    Ok(())
+}
+
+fn research_candidate_for_ticker(state: &Value, ticker: &str) -> String {
+    let rating = state
+        .get("research_plan")
+        .and_then(|value| value.get("per_ticker"))
+        .and_then(|items| items.get(ticker))
+        .and_then(|item| item.get("rating"))
+        .or_else(|| {
+            state
+                .get("research_plan")
+                .and_then(|value| value.get("rating"))
+        })
+        .and_then(Value::as_str);
+    match rating {
+        Some("Buy" | "Overweight") => "Buy".to_owned(),
+        Some("Sell" | "Underweight") => "Sell".to_owned(),
+        _ => "Hold".to_owned(),
+    }
 }
 
 fn enforce_trade_candidate(state: &Value, artifact: &mut Value) {
@@ -4139,6 +4762,9 @@ fn run_phase4_rust_rule(
     state: &mut Value,
     config: &RuntimeConfig,
 ) -> Result<()> {
+    if profile_uses_file_store(config, "trader", ToolManagedProfile::TradeIntent)? {
+        return run_file_store_phase4_derived(state, config);
+    }
     let mut artifact =
         research_plan_to_trade_intent(state.get("research_plan").unwrap_or(&Value::Null));
     artifact["id"] = json!("trader");
@@ -4158,6 +4784,55 @@ fn run_phase4_rust_rule(
     Ok(())
 }
 
+fn run_file_store_phase4_derived(state: &mut Value, config: &RuntimeConfig) -> Result<()> {
+    let registration = config
+        .authority_registry
+        .registration("trader", ToolManagedProfile::TradeIntent)?;
+    let store_root = state
+        .get("store_root")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .context("store_root missing for migrated Phase 4 Trader")?;
+    let mut projected = serde_json::Map::new();
+    for ticker in tickers_from_state(state) {
+        let mut ticker_state = state.clone();
+        ticker_state["ticker"] = json!(ticker);
+        ticker_state["tickers"] = json!([ticker]);
+        let artifact = finalize_degraded_trade_intent(
+            &store_root,
+            &ticker_state,
+            FileStoreDomainRuntimePlan {
+                role: "trader".to_owned(),
+                phase: 4,
+                profile: ToolManagedProfile::TradeIntent,
+                profile_version: registration.profile_version,
+                builder_version: registration.builder_version,
+                tickers: vec![ticker.clone()],
+                visible_evidence_refs: BTreeSet::new(),
+                topic_id: None,
+                side: None,
+                round: None,
+                visible_claims: BTreeSet::new(),
+                fork: None,
+                trade_candidate_action: Some("Hold".to_owned()),
+                portfolio_rating: None,
+                portfolio_current_weight: None,
+            },
+            "workflow_policy_not_triggered",
+        )?;
+        projected.insert(ticker, artifact["intent"].clone());
+    }
+    let mut projection = projected
+        .values()
+        .next()
+        .cloned()
+        .unwrap_or_else(|| json!({"action":"Hold","position_size_pct_max":0.0}));
+    projection["per_ticker"] = Value::Object(projected);
+    projection["authority"] = json!("file_store");
+    state["trader_investment_plan"] = projection;
+    Ok(())
+}
+
 async fn run_phase5(
     conn: &mut rusqlite::Connection,
     state: &mut Value,
@@ -4165,6 +4840,21 @@ async fn run_phase5(
     reasoning_effort_override: Option<&str>,
     config: &RuntimeConfig,
 ) -> Result<()> {
+    if ["risk.aggressive", "risk.neutral", "risk.conservative"]
+        .into_iter()
+        .all(|role| {
+            profile_uses_file_store(config, role, ToolManagedProfile::RiskReview).unwrap_or(false)
+        })
+    {
+        return run_file_store_phase5(
+            state,
+            model_override,
+            reasoning_effort_override,
+            config,
+            conn,
+        )
+        .await;
+    }
     state["risk_debate_state"] = json!({"history": []});
     let roles = ["risk.aggressive", "risk.neutral", "risk.conservative"];
     let jobs = roles
@@ -4220,6 +4910,96 @@ async fn run_phase5(
             turn,
         )?;
     }
+    Ok(())
+}
+
+async fn run_file_store_phase5(
+    state: &mut Value,
+    model_override: Option<&str>,
+    reasoning_effort_override: Option<&str>,
+    config: &RuntimeConfig,
+    conn: &rusqlite::Connection,
+) -> Result<()> {
+    let store_root = state
+        .get("store_root")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .context("store_root missing for migrated Phase 5 RiskReview")?;
+    let mut history = Vec::new();
+    for (round, role) in ["risk.aggressive", "risk.neutral", "risk.conservative"]
+        .into_iter()
+        .enumerate()
+    {
+        let registration = config
+            .authority_registry
+            .registration(role, ToolManagedProfile::RiskReview)?;
+        for ticker in tickers_from_state(state) {
+            let mut ticker_state = state.clone();
+            ticker_state["ticker"] = json!(ticker);
+            ticker_state["tickers"] = json!([ticker]);
+            let result = run_single_role_job_result(
+                RoleRun {
+                    state: ticker_state.clone(),
+                    role,
+                    phase: 5,
+                    kind: "risk_argument",
+                    round: Some((round + 1) as i64),
+                    topic_id: None,
+                    mock: is_mock(state),
+                    model_override,
+                    reasoning_effort_override,
+                    config,
+                    prompt_path: Some(
+                        config
+                            .prompts
+                            .path_for(role)
+                            .with_context(|| format!("missing prompt path for {role}"))?,
+                    ),
+                },
+                config.workflow.agent_timeout_sec,
+                state,
+                conn,
+            )
+            .await?;
+            let plan = FileStoreDomainRuntimePlan {
+                role: role.to_owned(),
+                phase: 5,
+                profile: ToolManagedProfile::RiskReview,
+                profile_version: registration.profile_version,
+                builder_version: registration.builder_version,
+                tickers: vec![ticker.clone()],
+                visible_evidence_refs: BTreeSet::new(),
+                topic_id: None,
+                side: None,
+                round: Some((round + 1) as u32),
+                visible_claims: BTreeSet::new(),
+                fork: None,
+                trade_candidate_action: None,
+                portfolio_rating: None,
+                portfolio_current_weight: None,
+            };
+            let artifact = match result.artifact {
+                Some(artifact) => artifact,
+                None => {
+                    let failure = result
+                        .error
+                        .as_deref()
+                        .unwrap_or("risk review failed before terminal finalize");
+                    record_degraded_role(state, &result, failure);
+                    finalize_degraded_risk_review(&store_root, &ticker_state, plan, failure)?
+                }
+            };
+            let constraints = artifact
+                .get("constraints")
+                .cloned()
+                .context("FileStore risk artifact missing constraints")?;
+            history.push(json!({
+                "role":role, "phase":5, "kind":"risk_argument", "round":round + 1,
+                "ticker":ticker, "artifact":constraints, "artifact_ref":artifact.get("artifact_id")
+            }));
+        }
+    }
+    state["risk_debate_state"] = json!({"history":history, "authority":"file_store"});
     Ok(())
 }
 

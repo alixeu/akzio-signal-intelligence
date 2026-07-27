@@ -190,6 +190,12 @@ fn visible_domain_evidence_refs(
         .collect::<BTreeSet<_>>();
     if mock {
         visible.extend(tickers.iter().map(|ticker| format!("mock:{role}:{ticker}")));
+        // Phase 2 aggregate units intentionally have no ticker scope, but
+        // their typed tools still need a structured, Rust-owned mock evidence
+        // reference to exercise the same finalize invariants as live runs.
+        if tickers.is_empty() && phase2_side_for_role(role).is_some() || role == "mediator.topic" {
+            visible.insert("mock:phase2:shared".to_owned());
+        }
     }
     visible
 }
@@ -306,6 +312,9 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
                             round: round.and_then(|value| u32::try_from(value).ok()),
                             visible_claims: visible_phase2_claims(&state, topic_id),
                             fork: phase2_fork_reference(&state, role, topic_id),
+                            trade_candidate_action: trade_candidate_action(&state, &tickers),
+                            portfolio_rating: portfolio_rating(&state),
+                            portfolio_current_weight: portfolio_current_weight(&state, &tickers),
                         },
                     )?;
                     let input = if profile == ToolManagedProfile::AnalystReport && !mock {
@@ -394,6 +403,48 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
     })
 }
 
+/// These values are intentionally projected before constructing the domain
+/// binding.  The model never receives either as a writable parameter.
+fn trade_candidate_action(state: &Value, tickers: &[String]) -> Option<String> {
+    let ticker = tickers.first()?;
+    state
+        .get("research_plan")
+        .and_then(|plan| plan.get("per_ticker"))
+        .and_then(|items| items.get(ticker))
+        .and_then(|item| item.get("rating"))
+        .or_else(|| {
+            state
+                .get("research_plan")
+                .and_then(|plan| plan.get("rating"))
+        })
+        .and_then(Value::as_str)
+        .map(|rating| match rating {
+            "Buy" | "Overweight" => "Buy",
+            "Sell" | "Underweight" => "Sell",
+            _ => "Hold",
+        })
+        .map(ToOwned::to_owned)
+}
+
+fn portfolio_rating(state: &Value) -> Option<String> {
+    state
+        .get("research_plan")
+        .and_then(|plan| plan.get("rating"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+fn portfolio_current_weight(state: &Value, tickers: &[String]) -> Option<f64> {
+    let ticker = tickers.first()?;
+    state
+        .get("account")
+        .and_then(|account| account.get("positions"))
+        .and_then(|positions| positions.get(ticker))
+        .and_then(|position| position.get("weight"))
+        .and_then(Value::as_f64)
+        .or(Some(0.0))
+}
+
 fn phase2_side_for_role(role: &str) -> Option<&'static str> {
     if role.contains(".bull.") {
         Some("bull")
@@ -445,6 +496,18 @@ fn phase2_fork_reference(
         (
             warmup.get("session_id")?.as_str()?.to_owned(),
             warmup.get("turn_id")?.as_str()?.to_owned(),
+        )
+    } else if role == "researcher.bull.interaction" || role == "researcher.bear.interaction" {
+        let topic_id = topic_id?;
+        let side = if role.contains("bull") {
+            "bull"
+        } else {
+            "bear"
+        };
+        let source = state.pointer(&format!("/phase2_file_store_sessions/{topic_id}/{side}"))?;
+        (
+            source.get("session_id")?.as_str()?.to_owned(),
+            source.get("turn_id")?.as_str()?.to_owned(),
         )
     } else {
         return None;
@@ -635,6 +698,7 @@ pub(crate) async fn run_single_steer_role_job(
         config: input.config,
         prompt_path: input.prompt_path,
     })?;
+    let file_store_authoritative = job.tool_managed_profile.is_some();
     let result = run_steer_role_job_with_timeout(
         job,
         input.session_id,
@@ -643,8 +707,21 @@ pub(crate) async fn run_single_steer_role_job(
         timeout_sec,
     )
     .await;
-    persist_prompt_metric(conn, &result);
+    if !file_store_authoritative {
+        persist_prompt_metric(conn, &result);
+    }
     record_role_job_metrics(state_for_degraded, &result);
+    // A migrated Phase 2 unit has exactly one authority: its terminal typed
+    // FileStore artifact.  Never route a missing terminal through the legacy
+    // JSON degraded helper, which would create a second persistence path.
+    if file_store_authoritative {
+        return result.artifact.with_context(|| {
+            format!(
+                "FileStore-authoritative steer role ended without terminal finalize: {}",
+                result.error.as_deref().unwrap_or("unknown role failure")
+            )
+        });
+    }
     role_artifact_or_degraded(state_for_degraded, config, result)
 }
 
@@ -1193,12 +1270,15 @@ fn mock_domain_tool_managed_output(
 ) -> Result<AgentLoopOutput> {
     use orchestrator_llm::agent_loop::ToolResultItem;
     use orchestrator_llm::tools::domain_tools::{
-        ADD_AGREED_FACT, APPEND_ANALYST_EVIDENCE, CREATE_DEBATE_CLAIM, CREATE_PHASE2_TOPIC,
-        FINALIZE_ANALYST_REPORT, FINALIZE_DEBATE_RESPONSE, FINALIZE_DEBATE_SEED,
-        FINALIZE_RESEARCHER_WARMUP, FINALIZE_RESEARCH_DECISION, FINALIZE_TOPIC_CONTROL,
-        FINALIZE_TOPIC_GENERATION, RESPOND_TO_DEBATE_CLAIM, SET_ANALYST_ASSESSMENT,
-        SET_ANALYST_INVALIDATION, SET_DECISION_HINGE, SET_PHASE2_COMMON_GROUND,
-        SET_RESEARCH_DECISION, SET_RESEARCH_SCENARIOS, SET_TOPIC_SOFT_CONTROL,
+        ADD_AGREED_FACT, APPEND_ANALYST_EVIDENCE, APPEND_BINDING_RISK_CONTROL, CREATE_DEBATE_CLAIM,
+        CREATE_PHASE2_TOPIC, FINALIZE_ANALYST_REPORT, FINALIZE_DEBATE_RESPONSE,
+        FINALIZE_DEBATE_SEED, FINALIZE_PORTFOLIO_DECISION, FINALIZE_RESEARCHER_WARMUP,
+        FINALIZE_RESEARCH_DECISION, FINALIZE_RISK_REVIEW, FINALIZE_TOPIC_CONTROL,
+        FINALIZE_TOPIC_GENERATION, FINALIZE_TRADE_INTENT, RESPOND_TO_DEBATE_CLAIM,
+        SET_ANALYST_ASSESSMENT, SET_ANALYST_INVALIDATION, SET_DECISION_HINGE,
+        SET_PHASE2_COMMON_GROUND, SET_PORTFOLIO_ASSET_DECISION, SET_RESEARCH_DECISION,
+        SET_RESEARCH_SCENARIOS, SET_RISK_ASSESSMENT, SET_RISK_CONSTRAINTS, SET_TOPIC_SOFT_CONTROL,
+        SET_TRADE_INTENT,
     };
 
     let profile = binding.scope().profile;
@@ -1272,6 +1352,55 @@ fn mock_domain_tool_managed_output(
             }
             binding.execute(FINALIZE_RESEARCH_DECISION, json!({}))?
         }
+        ToolManagedProfile::TradeIntent => {
+            binding.execute(
+                SET_TRADE_INTENT,
+                json!({
+                    "action":"Hold", "execution_decision":"hold",
+                    "entry_price":null, "stop_loss":null, "position_size_pct_max":0.0,
+                    "rationale":"Mock FileStore trader preserves the Rust-owned Hold candidate."
+                }),
+            )?;
+            binding.execute(FINALIZE_TRADE_INTENT, json!({}))?
+        }
+        ToolManagedProfile::RiskReview => {
+            binding.execute(
+                SET_RISK_ASSESSMENT,
+                json!({
+                    "argument":"Mock risk assessment.",
+                    "unique_risk_contribution":"Mock stance-specific constraint.",
+                    "disagreement_with_prior":"none", "no_new_information":false
+                }),
+            )?;
+            binding.execute(
+                SET_RISK_CONSTRAINTS,
+                json!({
+                    "recommended_adjustment":"hold", "stop_type":"soft",
+                    "max_drawdown_pct":0.10, "position_cap_pct":0.0,
+                    "rebalance_trigger":"Mock rebalance trigger.",
+                    "risk_off_trigger":"Mock risk-off trigger.",
+                    "review_window":"daily", "cash_hedge_recommendation":"hold cash",
+                    "constraint_confidence":0.5
+                }),
+            )?;
+            binding.execute(FINALIZE_RISK_REVIEW, json!({}))?
+        }
+        ToolManagedProfile::PortfolioDecision => {
+            binding.execute(
+                SET_PORTFOLIO_ASSET_DECISION,
+                json!({
+                    "direction_constraint":"unchanged", "execution_status":"wait",
+                    "max_target_weight":0.0, "max_weight_delta":0.0,
+                    "execution_summary":"Mock portfolio decision waits.",
+                    "investment_thesis":"Mock Phase 3 is neutral.", "target_price":null,
+                    "horizon":"Mock horizon", "rationale":"Mock portfolio wait."
+                }),
+            )?;
+            binding.execute(APPEND_BINDING_RISK_CONTROL, json!({
+                "control":{"control":"Mock risk cap.","source_refs":["mock:portfolio.manager:control"]}
+            }))?;
+            binding.execute(FINALIZE_PORTFOLIO_DECISION, json!({}))?
+        }
         ToolManagedProfile::ResearcherWarmup => {
             binding.execute(FINALIZE_RESEARCHER_WARMUP, json!({}))?
         }
@@ -1302,9 +1431,9 @@ fn mock_domain_tool_managed_output(
         ToolManagedProfile::DebateResponse => {
             let claim_id = binding
                 .scope()
-                .visible_evidence_refs
+                .visible_claims
                 .iter()
-                .find(|value| value.starts_with("claim-"))
+                .next()
                 .cloned()
                 .context("mock debate response requires a visible claim")?;
             binding.execute(
@@ -1338,6 +1467,9 @@ fn mock_domain_tool_managed_output(
             name: match profile {
                 ToolManagedProfile::AnalystReport => FINALIZE_ANALYST_REPORT,
                 ToolManagedProfile::ResearchDecision => FINALIZE_RESEARCH_DECISION,
+                ToolManagedProfile::TradeIntent => FINALIZE_TRADE_INTENT,
+                ToolManagedProfile::RiskReview => FINALIZE_RISK_REVIEW,
+                ToolManagedProfile::PortfolioDecision => FINALIZE_PORTFOLIO_DECISION,
                 ToolManagedProfile::ResearcherWarmup => FINALIZE_RESEARCHER_WARMUP,
                 ToolManagedProfile::TopicGeneration => FINALIZE_TOPIC_GENERATION,
                 ToolManagedProfile::DebateSeed => FINALIZE_DEBATE_SEED,
@@ -1363,6 +1495,19 @@ async fn execute_steer_role_job(
     steer: Option<String>,
 ) -> Result<AgentLoopOutput> {
     if job.mock {
+        if let Some(binding) = job.domain_tool_runtime.clone() {
+            binding.set_turn_context(&orchestrator_llm::agent_loop::ToolRuntimeTurnContext {
+                run_id: job.tools.run_id.clone().unwrap_or_default(),
+                phase: Some(job.phase),
+                role: job.role.clone(),
+                session_id: session_id.clone(),
+                turn_id: turn_id.clone(),
+            })?;
+            let mut output = mock_domain_tool_managed_output(job, binding)?;
+            output.session_id = session_id;
+            output.turn_id = turn_id;
+            return Ok(output);
+        }
         let mut artifact = mock_role_artifact(&job.role, &job.tickers);
         artifact["retrieval_audit"] = json!({
             "status": "not_applicable",

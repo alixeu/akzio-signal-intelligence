@@ -575,6 +575,31 @@ impl RuntimeConfig {
         authority_registry
             .migrate_to_file_store("manager.research", ToolManagedProfile::ResearchDecision)
             .expect("builtin ResearchDecision registration must exist");
+        // Phase 2 is a closed ToolManaged sub-workflow: warm-up, topic
+        // generation, debate packets, and controller packets all finalize to
+        // FileStore before the Rust reducer consumes their projections.
+        for (role, profile) in [
+            ("mediator.topic", ToolManagedProfile::ResearcherWarmup),
+            ("mediator.topic", ToolManagedProfile::TopicGeneration),
+            ("researcher.bull.initial", ToolManagedProfile::DebateSeed),
+            ("researcher.bear.initial", ToolManagedProfile::DebateSeed),
+            (
+                "researcher.bull.interaction",
+                ToolManagedProfile::DebateResponse,
+            ),
+            (
+                "researcher.bear.interaction",
+                ToolManagedProfile::DebateResponse,
+            ),
+            (
+                "mediator.topic_controller",
+                ToolManagedProfile::TopicControl,
+            ),
+        ] {
+            authority_registry
+                .migrate_to_file_store(role, profile)
+                .expect("builtin Phase 2 ToolManaged registration must exist");
+        }
         let alpaca_api_key = config_str(config, "orchestrator.alpaca.api_key", "")
             .trim()
             .to_string();

@@ -4467,6 +4467,7 @@ mod tests {
                 profile: orchestrator_core::ToolManagedProfile::AnalystReport,
                 tickers: ["QQQ".to_owned()].into_iter().collect(),
                 visible_evidence_refs: Default::default(),
+                visible_claims: Default::default(),
             },
             std::sync::Arc::new(TerminalDomainService),
         )
@@ -4507,6 +4508,7 @@ mod tests {
                 profile: orchestrator_core::ToolManagedProfile::AnalystReport,
                 tickers: ["QQQ".to_owned()].into_iter().collect(),
                 visible_evidence_refs: Default::default(),
+                visible_claims: Default::default(),
             },
             std::sync::Arc::new(TerminalDomainService),
         )
