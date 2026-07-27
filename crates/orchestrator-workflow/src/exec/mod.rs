@@ -10,8 +10,8 @@ use orchestrator_llm::agent_loop::{
 use orchestrator_store::{
     content_hash, list_run_locations, read_indexes, read_learning_record, read_run_manifest,
     rebuild_run_manifest, write_learning_record, write_run_manifest, FileStore, FileStoreOptions,
-    FinalizedArtifactRef, IndexKind, IndexQuery, LearningKind, LearningRecord, RunLocation,
-    RunManifest, RunManifestInit, RunStatus,
+    FinalizedArtifactRef, IndexKind, IndexQuery, LearningKind, LearningRecord, ManifestError,
+    RunLocation, RunManifest, RunManifestInit, RunStatus,
 };
 use serde_json::{json, Value};
 use std::{
@@ -301,7 +301,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
     )?;
     manifest.artifacts = rebuilt.artifacts;
     manifest.status = RunStatus::Completed;
-    manifest.degraded = state["degraded"].as_bool().unwrap_or(false);
+    sync_manifest_health(&mut manifest, &state);
     manifest.completed_at = Some(Utc::now().to_rfc3339());
     write_run_manifest(&store, &location, manifest)?;
     seal_state(&mut state)?;
@@ -419,6 +419,7 @@ fn finish_phase(
 ) -> Result<()> {
     set_phase_status(state, i64::from(phase), status);
     manifest.current_phase = phase;
+    sync_manifest_health(manifest, state);
     manifest.phase_status.insert(
         phase.to_string(),
         if status == "done" {
@@ -429,6 +430,28 @@ fn finish_phase(
     );
     write_run_manifest(store, location, manifest.clone())?;
     Ok(())
+}
+
+fn sync_manifest_health(manifest: &mut RunManifest, state: &Value) {
+    manifest.degraded = state["degraded"].as_bool().unwrap_or(false);
+    manifest.errors = state["errors"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|entry| ManifestError {
+            phase: entry
+                .get("phase")
+                .and_then(Value::as_u64)
+                .and_then(|value| u8::try_from(value).ok()),
+            code: entry
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("workflow_error")
+                .to_owned(),
+            message: entry.to_string(),
+            created_at: Utc::now().to_rfc3339(),
+        })
+        .collect();
 }
 
 fn phase_completed(manifest: &RunManifest, phase: u8) -> bool {
@@ -1668,9 +1691,12 @@ fn seal_state(state: &mut Value) -> Result<()> {
 
 #[cfg(test)]
 mod phase2_session_tests {
+    use orchestrator_store::{RunLocation, RunManifest, RunManifestInit};
     use serde_json::json;
 
-    use super::{phase2_fork_reference, record_phase2_session, runtime_session_key};
+    use super::{
+        phase2_fork_reference, record_phase2_session, runtime_session_key, sync_manifest_health,
+    };
 
     #[test]
     fn warmup_artifact_retains_the_fork_identity_after_assignment() {
@@ -1704,5 +1730,31 @@ mod phase2_session_tests {
 
         assert_eq!(fork.fork_from_session_id, "warmup-session");
         assert_eq!(fork.fork_from_turn_id, "warmup-turn");
+    }
+
+    #[test]
+    fn manifest_projects_degraded_state_on_each_completed_phase() {
+        let mut manifest = RunManifest::new(RunManifestInit {
+            location: RunLocation::new("2026-07-27", "run-health-test").unwrap(),
+            workflow_version: "test".to_owned(),
+            prompt_versions: Default::default(),
+            git_sha: "test".to_owned(),
+            config_hash: "test".to_owned(),
+            authority_registry_hash: "test".to_owned(),
+            created_at: "2026-07-27T00:00:00Z".to_owned(),
+        })
+        .unwrap();
+        sync_manifest_health(
+            &mut manifest,
+            &json!({
+                "degraded": true,
+                "errors": [{"phase": 3, "kind": "artifact", "failure": "terminal missing"}]
+            }),
+        );
+
+        assert!(manifest.degraded);
+        assert_eq!(manifest.errors.len(), 1);
+        assert_eq!(manifest.errors[0].phase, Some(3));
+        assert_eq!(manifest.errors[0].code, "artifact");
     }
 }
