@@ -10,6 +10,7 @@ use orchestrator_core::{default_project_root, ToolManagedProfile};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
+    collections::BTreeSet,
     fs,
     path::{Component, Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
@@ -2225,6 +2226,11 @@ fn configured_tool_names(settings: &AgentSettings) -> Vec<&str> {
             binding.scope().profile,
         ));
     }
+    // LLM role configuration can name the same read tool that a typed
+    // runtime injects. The gateway rejects duplicate schemas, so normalize
+    // the final Rust-owned allowlist before it is rendered or registered.
+    let mut seen = BTreeSet::new();
+    names.retain(|name| seen.insert(*name));
     names
 }
 
