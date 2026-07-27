@@ -34,6 +34,10 @@ name = "report-email"
 path = "src/bin/report_email.rs"
 
 [[bin]]
+name = "run-daily-tqqq-report"
+path = "src/bin/run_daily_tqqq_report.rs"
+
+[[bin]]
 name = "orchestrator-ingest"
 path = "src/bin/orchestrator_ingest.rs"
 
