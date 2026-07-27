@@ -39,7 +39,8 @@ use crate::orchestration::artifact::{
 use crate::orchestration::config::{is_critical_role, validate_sqlite_context, RuntimeConfig};
 use crate::orchestration::degraded::{record_degraded_role, role_artifact_or_degraded};
 use crate::orchestration::domain_runtime::{
-    finalize_degraded_analyst_report, FileStoreDomainRuntimePlan,
+    finalize_degraded_analyst_report, finalize_degraded_research_decision,
+    FileStoreDomainRuntimePlan,
 };
 use crate::orchestration::input_snapshot_runtime::{
     capture_phase1_file_store_inputs, phase1_input_sources,
@@ -60,7 +61,8 @@ use crate::orchestration::render::mode_prompt_path;
 use crate::orchestration::retrieval::inject_phase_summary_reflection;
 use crate::orchestration::role_jobs::{
     merge_role_job_metrics, persist_prompt_metric, prepare_role_job, record_role_job_metrics,
-    run_role_jobs, run_single_role_job, run_single_steer_role_job, RoleRun, SteerRoleRun,
+    run_role_jobs, run_single_role_job, run_single_role_job_result, run_single_steer_role_job,
+    RoleRun, SteerRoleRun,
 };
 use crate::orchestration::summary_store::write_deterministic_phase_summary;
 use orchestrator_core::role_registry::DEFAULT_PHASE1_AGENTS;
@@ -117,6 +119,16 @@ fn phase1_has_file_store_analyst(runtime_config: &RuntimeConfig, roles: &[String
         .try_fold(false, |found, migrated| {
             migrated.map(|migrated| found || migrated)
         })
+}
+
+/// A migrated Phase 3 manager is FileStore-only.  Its failure path therefore
+/// finalizes a typed degraded Draft rather than producing a legacy JSON
+/// fallback or touching the SQLite role-artifact cache.
+fn research_uses_file_store(runtime_config: &RuntimeConfig) -> Result<bool> {
+    Ok(runtime_config
+        .authority_registry
+        .authority_for("manager.research", ToolManagedProfile::ResearchDecision)?
+        == ArtifactAuthority::FileStore)
 }
 
 /// The manifest is part of the FileStore authority, not a second run ledger
@@ -3539,6 +3551,57 @@ fn debug_prompt_source_label(prompt_path: &Path) -> Result<String> {
         })
 }
 
+/// FileStore-only Phase 3 execution.  The generic role helper intentionally
+/// remains legacy-compatible for unmigrated phases, so it cannot be used for
+/// a migrated manager failure: it would synthesize the old JSON artifact.
+async fn run_file_store_research_job(
+    input: RoleRun<'_>,
+    timeout_sec: u64,
+    config: &RuntimeConfig,
+    state: &mut Value,
+    conn: &rusqlite::Connection,
+) -> Result<Value> {
+    let result = run_single_role_job_result(input, timeout_sec, state, conn).await?;
+    if let Some(artifact) = result.artifact {
+        return Ok(artifact);
+    }
+
+    let failure = result
+        .error
+        .as_deref()
+        .unwrap_or("manager.research failed before terminal finalize")
+        .to_owned();
+    let registration = config
+        .authority_registry
+        .registration("manager.research", ToolManagedProfile::ResearchDecision)?;
+    let store_root = state
+        .get("store_root")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .context("store_root missing for migrated Phase 3 ResearchDecision")?;
+    let tickers = tickers_from_state(state);
+    record_degraded_role(state, &result, &failure);
+    finalize_degraded_research_decision(
+        &store_root,
+        state,
+        FileStoreDomainRuntimePlan {
+            role: "manager.research".to_owned(),
+            phase: 3,
+            profile: ToolManagedProfile::ResearchDecision,
+            profile_version: registration.profile_version,
+            builder_version: registration.builder_version,
+            tickers,
+            visible_evidence_refs: BTreeSet::new(),
+            topic_id: None,
+            side: None,
+            round: None,
+            visible_claims: BTreeSet::new(),
+            fork: None,
+        },
+        &failure,
+    )
+}
+
 fn record_prompt_runtime_debug_artifact(
     state: &mut Value,
     phase: i64,
@@ -3561,31 +3624,31 @@ async fn run_phase3(
 ) -> Result<()> {
     let mock = is_mock(state);
     debug!("manager research role starting");
-    let mut artifact = run_single_role_job(
-        RoleRun {
-            state: state.clone(),
-            role: "manager.research",
-            phase: 3,
-            kind: "artifact",
-            round: None,
-            topic_id: None,
-            mock,
-            model_override,
-            reasoning_effort_override,
-            config,
-            prompt_path: Some(
-                config
-                    .prompts
-                    .path_for("manager.research")
-                    .context("missing prompt path for manager.research")?,
-            ),
-        },
-        config.workflow.agent_timeout_sec,
+    let run = RoleRun {
+        state: state.clone(),
+        role: "manager.research",
+        phase: 3,
+        kind: "artifact",
+        round: None,
+        topic_id: None,
+        mock,
+        model_override,
+        reasoning_effort_override,
         config,
-        state,
-        conn,
-    )
-    .await?;
+        prompt_path: Some(
+            config
+                .prompts
+                .path_for("manager.research")
+                .context("missing prompt path for manager.research")?,
+        ),
+    };
+    let file_store_authoritative = research_uses_file_store(config)?;
+    let mut artifact = if file_store_authoritative {
+        run_file_store_research_job(run, config.workflow.agent_timeout_sec, config, state, conn)
+            .await?
+    } else {
+        run_single_role_job(run, config.workflow.agent_timeout_sec, config, state, conn).await?
+    };
     enforce_phase3_deterministic_fields(state, &mut artifact);
     let artifact_is_degraded = artifact
         .get("degraded")
@@ -3613,31 +3676,43 @@ async fn run_phase3(
         apply_phase3_probability_fallback(artifact, &initial_violations)
     } else {
         let retry_state = phase3_probability_retry_state(state, &initial_violations);
-        let retry_result = run_single_role_job(
-            RoleRun {
-                state: retry_state,
-                role: "manager.research",
-                phase: 3,
-                kind: "artifact",
-                round: None,
-                topic_id: None,
-                mock: false,
-                model_override,
-                reasoning_effort_override,
-                config,
-                prompt_path: Some(
-                    config
-                        .prompts
-                        .path_for("manager.research")
-                        .context("missing prompt path for manager.research")?,
-                ),
-            },
-            config.workflow.agent_timeout_sec,
+        let retry_run = RoleRun {
+            state: retry_state,
+            role: "manager.research",
+            phase: 3,
+            kind: "artifact",
+            round: None,
+            topic_id: None,
+            mock: false,
+            model_override,
+            reasoning_effort_override,
             config,
-            state,
-            conn,
-        )
-        .await;
+            prompt_path: Some(
+                config
+                    .prompts
+                    .path_for("manager.research")
+                    .context("missing prompt path for manager.research")?,
+            ),
+        };
+        let retry_result = if file_store_authoritative {
+            run_file_store_research_job(
+                retry_run,
+                config.workflow.agent_timeout_sec,
+                config,
+                state,
+                conn,
+            )
+            .await
+        } else {
+            run_single_role_job(
+                retry_run,
+                config.workflow.agent_timeout_sec,
+                config,
+                state,
+                conn,
+            )
+            .await
+        };
         match retry_result {
             Ok(mut retry_artifact)
                 if !retry_artifact
@@ -3689,7 +3764,11 @@ async fn run_phase3(
     };
     let mut artifact = artifact;
     apply_missing_data_convergence(state, &mut artifact);
-    persist_artifact(conn, state, 3, "manager.research", artifact.clone())?;
+    if !file_store_authoritative {
+        persist_artifact(conn, state, 3, "manager.research", artifact.clone())?;
+    } else {
+        state["research_plan_authority"] = json!("file_store");
+    }
     state["research_plan"] = artifact;
     debug!("manager research role completed");
     Ok(())
@@ -4940,6 +5019,49 @@ mod tests {
             .all(|index| index.kind == orchestrator_store::IndexKind::PhaseSummary));
     }
 
+    #[tokio::test]
+    async fn default_phase3_file_store_authority_never_persists_a_sqlite_artifact() {
+        let directory = tempfile::tempdir().unwrap();
+        let (_config, runtime) = manifest_runtime_config(directory.path());
+        assert!(research_uses_file_store(&runtime).unwrap());
+        let mut state = json!({
+            "run_id": "phase3-file-store-test",
+            "current_date": "2026-07-27",
+            "ticker": "QQQ",
+            "tickers": ["QQQ"],
+            "analysis_universe": ["QQQ"],
+            "store_root": directory.path(),
+            "mock": true,
+            "debug": false,
+            "phase_status": {},
+            "phase1_index": {"per_ticker": {"QQQ": {"evidence_quality": {"confidence_basis": "evidence_available"}}}},
+            "weighted_probability_base": {"QQQ": {"long_probability": 0.5, "short_probability": 0.5}},
+        });
+        let db = directory.path().join("legacy.sqlite");
+        let mut conn = connect(&db).unwrap();
+
+        run_phase3(&mut conn, &mut state, None, None, &runtime)
+            .await
+            .unwrap();
+
+        assert_eq!(state["research_plan_authority"], "file_store");
+        let legacy_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM role_turn_summaries WHERE phase = 3 AND role = 'manager.research'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_rows, 0);
+        let artifact = directory.path().join(
+            RunLocation::new("2026-07-27", "phase3-file-store-test")
+                .unwrap()
+                .child_relative(Path::new("artifacts/phase3/research-decision.json"))
+                .unwrap(),
+        );
+        assert!(artifact.exists());
+    }
+
     #[test]
     fn file_store_manifest_is_created_then_recovered_without_legacy_artifacts() {
         let directory = tempfile::tempdir().unwrap();
@@ -4984,10 +5106,7 @@ mod tests {
         let mut changed_runtime = runtime.clone();
         changed_runtime
             .authority_registry
-            .migrate_to_file_store(
-                "manager.research",
-                orchestrator_core::ToolManagedProfile::ResearchDecision,
-            )
+            .migrate_to_file_store("trader", orchestrator_core::ToolManagedProfile::TradeIntent)
             .unwrap();
         let error = prepare_file_store_run_manifest(
             directory.path(),

@@ -241,6 +241,60 @@ pub(crate) fn finalize_degraded_analyst_report(
         .context("degraded FileStore analyst finalizer did not return an artifact")
 }
 
+/// Typed degraded policy for a migrated Phase 3 unit.  This deliberately
+/// finalizes the same Draft that a successful Research Manager would use; it
+/// must never fall through to the legacy JSON/SQLite degraded artifact.
+pub(crate) fn finalize_degraded_research_decision(
+    store_root: &Path,
+    state: &Value,
+    mut plan: FileStoreDomainRuntimePlan,
+    failure: &str,
+) -> Result<Value> {
+    if plan.profile != ToolManagedProfile::ResearchDecision || plan.tickers.is_empty() {
+        bail!("degraded FileStore writer requires a ResearchDecision ticker unit")
+    }
+    let evidence_ref = format!("runtime:degraded:{}", plan.role);
+    plan.visible_evidence_refs.insert(evidence_ref.clone());
+    let binding = file_store_domain_runtime(store_root, state, plan.clone())?;
+    for ticker in &plan.tickers {
+        binding.execute(
+            "set_research_decision",
+            json!({
+                "ticker": ticker,
+                "rating": "Hold",
+                "long_probability": 0.5,
+                "short_probability": 0.5,
+                "confidence_basis": "runtime_degraded",
+                "hold_reason": "runtime_degraded",
+                "plan": format!("{} did not produce a usable research decision: {failure}", plan.role),
+                "probability_rationale": "Runtime failure; probabilities are neutral placeholders and must not be treated as evidence.",
+            }),
+        )?;
+        binding.execute(
+            "set_research_scenarios",
+            json!({
+                "ticker": ticker,
+                "bull": {"probability": 0.25, "drivers": ["No usable model output."], "triggers": ["Obtain a completed source-backed research decision."], "confirmation": "unavailable"},
+                "base": {"probability": 0.50, "drivers": ["Runtime degraded."], "triggers": ["Obtain a completed source-backed research decision."], "confirmation": "unavailable"},
+                "bear": {"probability": 0.25, "drivers": ["No usable model output."], "triggers": ["Obtain a completed source-backed research decision."], "confirmation": "unavailable"},
+            }),
+        )?;
+        binding.execute(
+            "append_research_hinge",
+            json!({
+                "ticker": ticker,
+                "hinge": format!("{} degraded before a usable decision: {failure}", plan.role),
+                "evidence_ref": evidence_ref,
+            }),
+        )?;
+    }
+    binding
+        .execute("finalize_research_decision", json!({}))?
+        .get("artifact")
+        .cloned()
+        .context("degraded FileStore research finalizer did not return an artifact")
+}
+
 /// FileStore-backed evidence visibility.  The model cannot call this type:
 /// `ProjectToolRuntime` records a read only after the reader returns a
 /// structured result, and domain writers query the same session immediately.

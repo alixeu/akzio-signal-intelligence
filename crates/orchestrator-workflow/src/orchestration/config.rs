@@ -559,14 +559,22 @@ impl RuntimeConfig {
         );
         // The registry is the sole authority switch: once FileStore is
         // selected, callers must not fall back to the former SQLite path.
-        // Phase 1 remains Legacy by default until its FileStore input snapshot
-        // readers replace the SQLite technical/Jin10 readers in live runs.
-        // Tests and a later rollout may inject its explicit FileStore
-        // authority without creating a mixed fallback path.
+        // Phase 1 captures the Technical/Jin10 inputs into the run-local
+        // FileStore snapshot before either analyst starts; Phase 3 consumes
+        // only finalized upstream projections.  Those profiles are therefore
+        // ready to be FileStore-authoritative by default.
         let mut authority_registry = AuthorityRegistry::builtin_legacy();
         authority_registry
             .migrate_to_file_store("compressor.phase_summary", ToolManagedProfile::PhaseSummary)
             .expect("builtin Phase Summary registration must exist");
+        for role in ["analyst.technical", "analyst.news_macro"] {
+            authority_registry
+                .migrate_to_file_store(role, ToolManagedProfile::AnalystReport)
+                .expect("builtin AnalystReport registration must exist");
+        }
+        authority_registry
+            .migrate_to_file_store("manager.research", ToolManagedProfile::ResearchDecision)
+            .expect("builtin ResearchDecision registration must exist");
         let alpaca_api_key = config_str(config, "orchestrator.alpaca.api_key", "")
             .trim()
             .to_string();

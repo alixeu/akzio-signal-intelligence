@@ -589,11 +589,30 @@ pub(crate) async fn run_single_role_job(
     state_for_degraded: &mut Value,
     conn: &rusqlite::Connection,
 ) -> Result<Value> {
-    let job = prepare_role_job(input)?;
-    let result = run_role_job_with_timeout(job, timeout_sec).await;
-    persist_prompt_metric(conn, &result);
-    record_role_job_metrics(state_for_degraded, &result);
+    let result = run_single_role_job_result(input, timeout_sec, state_for_degraded, conn).await?;
     role_artifact_or_degraded(state_for_degraded, config, result)
+}
+
+/// Execute one role and preserve the raw result for a FileStore-authoritative
+/// caller.  Such a caller must choose its typed degraded finalizer itself;
+/// routing it through `role_artifact_or_degraded` would manufacture a legacy
+/// JSON artifact after a terminal-tool failure and create a second authority.
+pub(crate) async fn run_single_role_job_result(
+    input: RoleRun<'_>,
+    timeout_sec: u64,
+    state_for_metrics: &mut Value,
+    conn: &rusqlite::Connection,
+) -> Result<RoleJobResult> {
+    let job = prepare_role_job(input)?;
+    let file_store_authoritative = job.tool_managed_profile.is_some();
+    let result = run_role_job_with_timeout(job, timeout_sec).await;
+    // This is currently a no-op, but keep it structurally impossible for a
+    // migrated role to acquire an SQLite side effect when metrics return.
+    if !file_store_authoritative {
+        persist_prompt_metric(conn, &result);
+    }
+    record_role_job_metrics(state_for_metrics, &result);
+    Ok(result)
 }
 
 pub(crate) async fn run_single_steer_role_job(
