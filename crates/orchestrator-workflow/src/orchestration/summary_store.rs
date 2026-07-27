@@ -182,9 +182,8 @@ fn write_unit(
 }
 
 /// Detail references are authoritative IDs from the finalized payload, never
-/// a reconstructed logical name.  The latter looked useful in legacy SQLite
-/// rows but cannot be resolved after a restart and would create a second
-/// authority beside the canonical Artifact file.
+/// a reconstructed logical name, which cannot be resolved after a restart
+/// and would create a second authority beside the canonical Artifact file.
 fn canonical_source_refs(value: &Value) -> Vec<String> {
     let mut refs = BTreeSet::new();
     collect_canonical_source_refs(value, &mut refs);

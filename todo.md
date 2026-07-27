@@ -25,10 +25,10 @@
 - [ ] 为工作流增加统一失败边界：写入失败状态和错误摘要后，Web 服务继续运行。
 - [ ] 更新 README 中的启动、前端开发、端口和退出方式。
 
-## 2. SQLite 监控事件
+## 2. FileStore 监控事件
 
-- [ ] 将数据库 schema 升级到 v4，并保留现有迁移备份与事务约束。
-- [ ] 新增追加式 `monitor_events` 表，至少保存：
+- [ ] 为追加式 `monitor_events` JSONL 定义显式文件 schema 升级，并保留离线迁移说明。
+- [ ] 新增追加式 `monitor_events` JSONL 事件，至少保存：
   - `id`
   - `run_id`
   - `occurred_at_ms`
@@ -37,7 +37,7 @@
   - `role`
   - `status`
   - `payload_json`
-- [ ] 为 run/event 顺序和 run/role/时间建立索引，run 删除时级联清理事件。
+- [ ] 用 run 分区和 sequence 保证 run/event 顺序与按角色、时间的读取。
 - [ ] 事件载荷统一记录：ticker 列表、任务、topic、round、LLM/Tool/总耗时、重试数、错误摘要、Artifact 状态、输入/输出证据数。
 - [ ] 未知数据保存为 `null`，不能用 `0` 或模拟值冒充真实指标。
 - [ ] 不把 Prompt、推理文本、密钥、完整 Tool 参数或完整 Tool 输出写入监控事件。
@@ -57,7 +57,7 @@
 
 ## 3. 工作流埋点
 
-- [ ] 在 Yahoo、Jin10 和 SQLite 预检/导入边界记录数据源事件。
+- [ ] 在 Yahoo、Jin10 和 FileStore 输入快照边界记录数据源事件。
 - [ ] 在每个 Phase 开始、完成、跳过和降级处记录事件。
 - [ ] 在每个 Role job 的尝试、重试、超时、失败和完成处记录事件。
 - [ ] 扩展现有 Agent event sink，记录 LLM iteration 耗时和 Tool 起止事件；不保存流式文本 delta。
@@ -92,7 +92,7 @@
 
 ## 6. 3D 城市与建筑映射
 
-- [ ] 数据装卸港：Yahoo 技术数据、Jin10 新闻和 SQLite 中央仓库。
+- [ ] 数据装卸港：Yahoo 技术数据、Jin10 新闻和 FileStore 时间分区仓库。
 - [ ] 技术分析工厂：`analyst.technical`，展示趋势、支撑、阻力和技术置信度。
 - [ ] 新闻宏观研究院：`analyst.news_macro`，展示电报纸带、新闻分类和事件警钟。
 - [ ] 市场情绪广播塔：第一版显示 `unconfigured/degraded`，不得伪造 Reddit/X/YouTube 数据。
@@ -149,7 +149,7 @@
 
 ## 11. 测试与验收
 
-- [ ] Rust：v3→v4 迁移、幂等性、外键、索引和旧数据库备份。
+- [ ] Rust：文件 schema 显式迁移、幂等性、Index/Detail 引用和历史导出。
 - [ ] Rust：事件顺序、敏感数据过滤、重试、Tool 耗时、失败 run 和 degraded 监控。
 - [ ] Rust：CLI 参数、端口冲突、REST API、SSE 续传和旧 run 降级读取。
 - [ ] 前端：BFS、高度限制、坡道、旋转连接、无路线和事件 reducer。
@@ -161,7 +161,7 @@
 
 ## 12. 前端详细数据字段清单
 
-> 本节合并前端详细 TODO。所有字段必须来自 SQLite、运行事件或已校验
+> 本节合并前端详细 TODO。所有字段必须来自 FileStore、运行事件或已校验
 > Artifact；当前后端没有的数据在接口中返回 `null`，不得由前端猜测。
 
 ### 12.1 全局运行信息
@@ -248,15 +248,14 @@ interface WorkflowRun {
 - [ ] 新闻总数、ticker 相关新闻数和宏观新闻数。
 - [ ] 高影响事件数和新闻时间范围。
 - [ ] 去重前后数量和无效新闻数。
-- [ ] 进入 SQLite 的 attention-scored 新闻数量。
+- [ ] 当前 run Artifact 或 tool audit 保留的 attention-scored 新闻数量。
 
-#### SQLite
+#### FileStore
 
-- [ ] 连接、WAL 和 schema 版本状态。
-- [ ] 当前数据库、WAL 文件大小。
-- [ ] 本次读写条数和最近写入时间。
-- [ ] 查询、写入和锁等待耗时。
-- [ ] 数据库安全错误摘要。
+- [ ] 根目录、文件 schema 版本和 input snapshot 状态。
+- [ ] 本次原子写入、JSONL lock 和最近写入时间。
+- [ ] Index/Detail 读取、写入和锁等待耗时。
+- [ ] FileStore 安全错误摘要。
 
 #### Reddit / X / YouTube（future-only）
 
@@ -552,7 +551,7 @@ interface WorkflowEdge {
 - [ ] 当前 Agent、ticker、任务和输出摘要。
 - [ ] LLM 指标、Tool 列表和 Artifact 链路。
 - [ ] 错误、重试、输入/输出证据。
-- [ ] 数据源和 SQLite 状态。
+- [ ] 数据源和 FileStore 状态。
 
 ### 16.3 底部时间线
 
@@ -593,7 +592,7 @@ interface WorkflowEvent<T = unknown> {
 }
 ```
 
-- [ ] `eventId/sequence` 与 SQLite 自增 ID 保持一致。
+- [ ] `eventId/sequence` 与 JSONL sequence 保持一致。
 - [ ] 客户端按 `(runId, sequence)` 幂等应用事件。
 - [ ] reconnect 从最后确认的 sequence 继续。
 - [ ] 事件乱序、重复或间断时显示连接 degraded，并通过 REST 补齐。
