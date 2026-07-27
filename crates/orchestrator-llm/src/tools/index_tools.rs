@@ -703,20 +703,32 @@ fn parse_create(args: Value, context: &IndexToolRuntimeContext) -> Result<Create
         .and_then(Value::as_f64)
         .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
         .context("create_index.confidence must be a finite number in 0..=1")?;
-    let pattern_key = optional_string(object, "pattern_key")?;
-    match (context.owned.kind, pattern_key.as_ref()) {
-        (IndexKind::Experience, None) => bail!("experience Indexes require pattern_key"),
-        (IndexKind::PhaseSummary, Some(_)) => {
-            bail!("phase_summary Indexes must not provide pattern_key")
+    let supplied_pattern_key = optional_string(object, "pattern_key")?;
+    let supplied_applies_to_phases = phase_array(object, "applies_to_phases")?;
+    let (pattern_key, applies_to_phases) = match context.owned.kind {
+        // Summary ownership is fully planned before the writer starts. Some
+        // gateways serialize optional generic schema fields anyway; never let
+        // those values alter (or block) the canonical planned Index.
+        IndexKind::PhaseSummary => (
+            None,
+            context
+                .visibility
+                .applies_to_phases
+                .iter()
+                .copied()
+                .collect(),
+        ),
+        IndexKind::Experience => {
+            let pattern_key =
+                supplied_pattern_key.context("experience Indexes require pattern_key")?;
+            ensure_subset(
+                "applies_to_phases",
+                &supplied_applies_to_phases,
+                &context.visibility.applies_to_phases,
+            )?;
+            (Some(pattern_key), supplied_applies_to_phases)
         }
-        _ => {}
-    }
-    let applies_to_phases = phase_array(object, "applies_to_phases")?;
-    ensure_subset(
-        "applies_to_phases",
-        &applies_to_phases,
-        &context.visibility.applies_to_phases,
-    )?;
+    };
     Ok(CreateIndexCommand {
         scope: context.scope_for_create(pattern_key.as_deref())?,
         summary,
@@ -1086,7 +1098,7 @@ mod tests {
     }
 
     #[test]
-    fn create_index_derives_scope_and_rejects_pattern_key_for_summary() {
+    fn create_index_derives_summary_scope_and_discards_generic_model_fields() {
         let command = prepare_command(
             CREATE_INDEX_NAME,
             json!({"summary": "topic conflict", "confidence": 0.7, "applies_to_phases": [3]}),
@@ -1098,13 +1110,17 @@ mod tests {
         };
         assert_eq!(command.scope.run_id, "run-1");
         assert_eq!(command.scope.index_id, "index-1");
-        let error = prepare_command(
+        let command = prepare_command(
             CREATE_INDEX_NAME,
             json!({"summary": "topic conflict", "confidence": 0.7, "pattern_key": "x", "applies_to_phases": [3]}),
             &context(),
         )
-        .unwrap_err();
-        assert!(error.to_string().contains("must not provide pattern_key"));
+        .unwrap();
+        let IndexToolCommand::Create(command) = command else {
+            panic!("expected create command");
+        };
+        assert_eq!(command.pattern_key, None);
+        assert_eq!(command.applies_to_phases, vec![3, 4]);
     }
 
     #[test]
