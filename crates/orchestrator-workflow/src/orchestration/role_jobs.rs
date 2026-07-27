@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use futures::{stream, StreamExt};
-use orchestrator_core::default_project_root;
+use orchestrator_core::{default_project_root, ArtifactAuthority, ToolManagedProfile};
 use orchestrator_llm::{
     agent_loop::{ModelStreamResult, RetrievalPolicy, TokenUsage},
     llm_judge::JudgeConfig,
@@ -66,6 +66,7 @@ pub(crate) struct RoleJob {
     pub prompt_version: Option<String>,
     pub tickers: Vec<String>,
     pub output_mode: OutputMode,
+    pub tool_managed_profile: Option<ToolManagedProfile>,
     pub llm: Option<RoleLlmSettings>,
     pub reasoning_effort_override: Option<String>,
     pub tools: ExternalToolConfig,
@@ -135,6 +136,30 @@ fn prompt_version_for_role(state: &Value, role: &str, kind: &str) -> Option<Stri
         _ => return None,
     };
     Some(prompt_version(config, prompt_key))
+}
+
+fn tool_managed_profile_for_role_kind(role: &str, kind: &str) -> Option<ToolManagedProfile> {
+    match role {
+        "reflector.historical" => Some(ToolManagedProfile::HistoricalReflection),
+        "analyst.technical" | "analyst.news_macro" => Some(ToolManagedProfile::AnalystReport),
+        "mediator.topic" if kind == "warmup" => Some(ToolManagedProfile::ResearcherWarmup),
+        "mediator.topic" => Some(ToolManagedProfile::TopicGeneration),
+        "researcher.bull.initial" | "researcher.bear.initial" => {
+            Some(ToolManagedProfile::DebateSeed)
+        }
+        "researcher.bull.interaction" | "researcher.bear.interaction" => {
+            Some(ToolManagedProfile::DebateResponse)
+        }
+        "mediator.topic_controller" => Some(ToolManagedProfile::TopicControl),
+        "manager.research" => Some(ToolManagedProfile::ResearchDecision),
+        "trader" => Some(ToolManagedProfile::TradeIntent),
+        "risk.aggressive" | "risk.neutral" | "risk.conservative" => {
+            Some(ToolManagedProfile::RiskReview)
+        }
+        "portfolio.manager" => Some(ToolManagedProfile::PortfolioDecision),
+        "compressor.phase_summary" => Some(ToolManagedProfile::PhaseSummary),
+        _ => None,
+    }
 }
 
 pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
@@ -218,6 +243,16 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
         prompt_chars = prompt.len(),
         "prepared role job"
     );
+    let tool_managed_profile = tool_managed_profile_for_role_kind(role, kind);
+    let output_mode = if let Some(profile) = tool_managed_profile {
+        match config.authority_registry.authority_for(role, profile)? {
+            ArtifactAuthority::Legacy => output_mode_for_role(role),
+            ArtifactAuthority::FileStore => OutputMode::ToolManaged,
+        }
+    } else {
+        output_mode_for_role(role)
+    };
+
     Ok(RoleJob {
         role: role.to_string(),
         phase,
@@ -231,7 +266,8 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
         debug_output_path: phase2_debug_output_path(phase, role, kind, topic_id),
         prompt_version,
         tickers: tickers.clone(),
-        output_mode: output_mode_for_role(role),
+        output_mode,
+        tool_managed_profile,
         llm,
         reasoning_effort_override: reasoning_effort_override.map(ToString::to_string),
         tools: ExternalToolConfig {
@@ -932,6 +968,7 @@ async fn execute_role_job(job: RoleJob) -> Result<AgentLoopOutput> {
         }
         return Ok(AgentLoopOutput {
             artifact,
+            terminal_tool_result: None,
             metrics: ModelStreamResult::default(),
             turn_id: String::new(),
             session_id: String::new(),
@@ -954,6 +991,7 @@ async fn execute_role_job(job: RoleJob) -> Result<AgentLoopOutput> {
         debug_round,
         tickers: job.tickers,
         output_mode: job.output_mode,
+        tool_managed_profile: job.tool_managed_profile,
         llm,
         reasoning_effort_override: job.reasoning_effort_override,
         tools: Some(job.tools),
@@ -1017,6 +1055,7 @@ async fn execute_steer_role_job(
         artifact["turn_id"] = Value::String(turn_id.clone());
         return Ok(AgentLoopOutput {
             artifact,
+            terminal_tool_result: None,
             metrics: ModelStreamResult::default(),
             turn_id,
             session_id,
@@ -1039,6 +1078,7 @@ async fn execute_steer_role_job(
         debug_round,
         tickers: job.tickers,
         output_mode: job.output_mode,
+        tool_managed_profile: job.tool_managed_profile,
         llm,
         reasoning_effort_override: job.reasoning_effort_override,
         tools: Some(job.tools),

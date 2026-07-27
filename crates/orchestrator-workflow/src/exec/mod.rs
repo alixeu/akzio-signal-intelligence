@@ -1,8 +1,8 @@
 use anyhow::{bail, Context, Result};
-use chrono::{Local, NaiveDate};
+use chrono::{Local, NaiveDate, Utc};
 use orchestrator_core::{
     config_int, config_str, config_strings, default_project_root, display_ticker, load_config,
-    parse_tickers, project_path, research_rating_for_probability, MarketRegime,
+    parse_tickers, project_path, research_rating_for_probability, ArtifactAuthority, MarketRegime,
 };
 use orchestrator_sql::{
     archive::{upsert_run_archive, RunArchiveInput},
@@ -12,11 +12,15 @@ use orchestrator_sql::{
     upsert_decision_snapshot, write_run_record, DecisionSnapshotInput, ReflectionThresholds,
     RunRecordInput, AGGREGATE_TICKER,
 };
+use orchestrator_store::{
+    content_hash, read_run_manifest, write_run_manifest, FileStore, FileStoreOptions, RunLocation,
+    RunManifest, RunManifestInit,
+};
 use serde_json::{json, Value};
 use std::{
     fs,
     path::{Path, PathBuf},
-    time::Instant,
+    time::{Duration, Instant},
 };
 use tracing::debug;
 
@@ -69,6 +73,123 @@ fn is_mock(state: &Value) -> bool {
     state.get("mock").and_then(Value::as_bool).unwrap_or(false)
 }
 
+fn has_file_store_authority(runtime_config: &RuntimeConfig) -> bool {
+    runtime_config
+        .authority_registry
+        .registrations()
+        .any(|registration| registration.authority == ArtifactAuthority::FileStore)
+}
+
+/// The manifest is part of the FileStore authority, not a second run ledger
+/// for legacy-only execution. Until a profile migrates, the legacy path stays
+/// the sole persistence authority and this function must not touch the store
+/// root at all.
+fn prepare_file_store_run_manifest_if_migrated(
+    store_root: &Path,
+    runtime_config: &RuntimeConfig,
+    config: &Value,
+    current_date: &str,
+    run_id: &str,
+) -> Result<Option<RunManifest>> {
+    if !has_file_store_authority(runtime_config) {
+        return Ok(None);
+    }
+    prepare_file_store_run_manifest(store_root, runtime_config, config, current_date, run_id)
+        .map(Some)
+}
+
+/// Prepare the one FileStore-owned run manifest before any legacy workflow
+/// write, once at least one profile has explicitly migrated. It records no
+/// Artifacts itself, so it never creates a second persistence path for a role.
+fn prepare_file_store_run_manifest(
+    store_root: &Path,
+    runtime_config: &RuntimeConfig,
+    config: &Value,
+    current_date: &str,
+    run_id: &str,
+) -> Result<RunManifest> {
+    let location = RunLocation::new(current_date, run_id)?;
+    let authority_snapshot = runtime_config.authority_registry.snapshot();
+    authority_snapshot.verify()?;
+    let manifest_init = RunManifestInit {
+        location: location.clone(),
+        workflow_version: format!("orchestrator-workflow-v{}", env!("CARGO_PKG_VERSION")),
+        prompt_versions: runtime_config.prompts.versions.clone(),
+        git_sha: workflow_git_sha(),
+        config_hash: content_hash(config)?,
+        authority_registry_hash: authority_snapshot.content_hash,
+        created_at: Utc::now().to_rfc3339(),
+    };
+    let store = FileStore::open(
+        store_root,
+        FileStoreOptions {
+            atomic_fsync: runtime_config.store.atomic_fsync,
+            stale_temp_age: Some(Duration::from_secs(runtime_config.store.stale_temp_age_sec)),
+        },
+    )?;
+
+    // Re-check inside a lock so two invocations for the same deterministic run
+    // ID cannot race and silently select different authority/config snapshots.
+    let manifest =
+        store.with_exclusive_lock(&location.relative_root().join(".manifest.lock"), || {
+            if store.exists(&location.manifest_relative())? {
+                return read_run_manifest(&store, &location);
+            }
+            write_run_manifest(&store, &location, RunManifest::new(manifest_init.clone())?)
+        })?;
+    validate_recovered_manifest(&manifest, &manifest_init)?;
+    Ok(manifest)
+}
+
+fn validate_recovered_manifest(manifest: &RunManifest, expected: &RunManifestInit) -> Result<()> {
+    // `read_run_manifest` has already rejected malformed JSON, unsupported or
+    // old schemas, content-hash mismatches, and location mismatches. These
+    // comparisons reject a resumed run whose process contract changed.
+    for (field, found, current) in [
+        (
+            "workflow_version",
+            manifest.workflow_version.as_str(),
+            expected.workflow_version.as_str(),
+        ),
+        (
+            "config_hash",
+            manifest.config_hash.as_str(),
+            expected.config_hash.as_str(),
+        ),
+        (
+            "authority_registry_hash",
+            manifest.authority_registry_hash.as_str(),
+            expected.authority_registry_hash.as_str(),
+        ),
+        (
+            "git_sha",
+            manifest.git_sha.as_str(),
+            expected.git_sha.as_str(),
+        ),
+    ] {
+        if found != current {
+            bail!(
+                "FileStore run manifest recovery rejected: {field} differs (stored `{found}`, current `{current}`)"
+            );
+        }
+    }
+    if manifest.prompt_versions != expected.prompt_versions {
+        bail!(
+            "FileStore run manifest recovery rejected: prompt_versions differ; create a new run instead of reusing this manifest"
+        );
+    }
+    Ok(())
+}
+
+fn workflow_git_sha() -> String {
+    option_env!("AKZIO_GIT_SHA")
+        .or(option_env!("GIT_SHA"))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("unavailable")
+        .to_owned()
+}
+
 pub async fn run(args: ExecArgs) -> Result<Value> {
     validate_args(&args)?;
     debug!(
@@ -105,16 +226,36 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
     let ticker = display_ticker(&tickers);
     let analysis_universe = tickers.clone();
     let runtime_config = RuntimeConfig::from_value(&config)?;
+    // Parse one canonical store root now so CLI/config errors fail before any
+    // legacy side effect. The run manifest is always FileStore-owned; business
+    // Artifacts remain exclusively owned by the authority registry.
+    let store_root = runtime_config
+        .store
+        .resolve_root(args.store_root.as_deref())?;
     debug!(
         plugins_enabled = runtime_config.plugins.enabled,
         component_plugins = runtime_config.component_plugins.components.len(),
         role_plugins = runtime_config.role_plugins.roles.len(),
+        store_root = %store_root.display(),
         "prompt plugin runtime config loaded"
     );
     let run_dir = resolve_run_dir(&args);
     let db_path = resolve_db_path(&args, &config);
-    let mut conn = connect(&db_path)?;
     let run_id = run_id_for(&tickers, &date);
+    if let Some(store_manifest) = prepare_file_store_run_manifest_if_migrated(
+        &store_root,
+        &runtime_config,
+        &config,
+        &date,
+        &run_id,
+    )? {
+        debug!(
+            store_manifest = %store_manifest.location()?.manifest_relative().display(),
+            authority_registry_hash = %store_manifest.authority_registry_hash,
+            "FileStore run manifest ready"
+        );
+    }
+    let mut conn = connect(&db_path)?;
     let state_path = run_dir.as_ref().map(|path| path.join("state.json"));
     let phase1_agents = parse_phase1_agents_with_config(DEFAULT_PHASE1_AGENTS, &runtime_config)?;
     let model_override = args.model.clone().filter(|value| !value.is_empty());
@@ -4330,6 +4471,246 @@ mod tests {
         WebSearchContextSize, WebSearchMode, WebSearchProviderKind,
     };
     use orchestrator_llm::LlmRoute;
+
+    fn manifest_runtime_config(store_root: &Path) -> (Value, RuntimeConfig) {
+        let config = json!({
+            "orchestrator": {
+                "plugins": {"enabled": false},
+                "llm": {
+                    "defaults": {
+                        "route": "responses",
+                        "model": "test-model",
+                        "base_url": "https://llm.example.com/v1",
+                        "api_key": "test-key",
+                        "max_turns": null,
+                        "reasoning_effort": null,
+                        "native_web_search": false,
+                        "think_tool": false,
+                        "tools": "all"
+                    }
+                },
+                "store": {
+                    "root": store_root.to_string_lossy(),
+                    "schema_version": 1,
+                    "retain_turn_history": false,
+                    "retain_debug_history": true,
+                    "atomic_fsync": false,
+                    "stale_temp_age_sec": 3600
+                }
+            }
+        });
+        let mut runtime = RuntimeConfig::from_value(&config).unwrap();
+        runtime
+            .authority_registry
+            .migrate_to_file_store(
+                "analyst.technical",
+                orchestrator_core::ToolManagedProfile::AnalystReport,
+            )
+            .unwrap();
+        (config, runtime)
+    }
+
+    #[test]
+    fn legacy_only_authority_does_not_open_or_read_the_file_store() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = json!({
+            "orchestrator": {
+                "plugins": {"enabled": false},
+                "llm": {
+                    "defaults": {
+                        "route": "responses",
+                        "model": "test-model",
+                        "base_url": "https://llm.example.com/v1",
+                        "api_key": "test-key",
+                        "max_turns": null,
+                        "reasoning_effort": null,
+                        "native_web_search": false,
+                        "think_tool": false,
+                        "tools": "all"
+                    }
+                },
+                "store": {
+                    "root": directory.path().to_string_lossy(),
+                    "atomic_fsync": false
+                }
+            }
+        });
+        let runtime = RuntimeConfig::from_value(&config).unwrap();
+        assert!(!has_file_store_authority(&runtime));
+
+        let missing_root = directory.path().join("not-created");
+        assert!(prepare_file_store_run_manifest_if_migrated(
+            &missing_root,
+            &runtime,
+            &config,
+            "2026-07-27",
+            "legacy-only",
+        )
+        .unwrap()
+        .is_none());
+        assert!(!missing_root.exists());
+    }
+
+    #[test]
+    fn file_store_manifest_is_created_then_recovered_without_legacy_artifacts() {
+        let directory = tempfile::tempdir().unwrap();
+        let (config, runtime) = manifest_runtime_config(directory.path());
+        let location = RunLocation::new("2026-07-27", "manifest-recovery").unwrap();
+
+        let created = prepare_file_store_run_manifest(
+            directory.path(),
+            &runtime,
+            &config,
+            "2026-07-27",
+            "manifest-recovery",
+        )
+        .unwrap();
+        assert!(directory.path().join(location.manifest_relative()).exists());
+        assert!(created.artifacts.is_empty());
+
+        let recovered = prepare_file_store_run_manifest(
+            directory.path(),
+            &runtime,
+            &config,
+            "2026-07-27",
+            "manifest-recovery",
+        )
+        .unwrap();
+        assert_eq!(recovered, created);
+    }
+
+    #[test]
+    fn file_store_manifest_recovery_rejects_changed_authority_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let (config, runtime) = manifest_runtime_config(directory.path());
+        prepare_file_store_run_manifest(
+            directory.path(),
+            &runtime,
+            &config,
+            "2026-07-27",
+            "authority-mismatch",
+        )
+        .unwrap();
+
+        let mut changed_runtime = runtime.clone();
+        changed_runtime
+            .authority_registry
+            .migrate_to_file_store(
+                "analyst.news_macro",
+                orchestrator_core::ToolManagedProfile::AnalystReport,
+            )
+            .unwrap();
+        let error = prepare_file_store_run_manifest(
+            directory.path(),
+            &changed_runtime,
+            &config,
+            "2026-07-27",
+            "authority-mismatch",
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("authority_registry_hash differs"));
+    }
+
+    #[test]
+    fn file_store_manifest_recovery_rejects_a_tampered_content_hash() {
+        let directory = tempfile::tempdir().unwrap();
+        let (config, runtime) = manifest_runtime_config(directory.path());
+        let location = RunLocation::new("2026-07-27", "tampered-manifest").unwrap();
+        prepare_file_store_run_manifest(
+            directory.path(),
+            &runtime,
+            &config,
+            "2026-07-27",
+            "tampered-manifest",
+        )
+        .unwrap();
+
+        let path = directory.path().join(location.manifest_relative());
+        let original = fs::read_to_string(&path).unwrap();
+        assert!(original.contains("\"status\":\"running\""));
+        fs::write(
+            &path,
+            original.replacen("\"status\":\"running\"", "\"status\":\"completed\"", 1),
+        )
+        .unwrap();
+
+        let error = prepare_file_store_run_manifest(
+            directory.path(),
+            &runtime,
+            &config,
+            "2026-07-27",
+            "tampered-manifest",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("content hash mismatch"));
+    }
+
+    #[test]
+    fn file_store_manifest_recovery_rejects_a_valid_manifest_at_the_wrong_location() {
+        let directory = tempfile::tempdir().unwrap();
+        let (config, runtime) = manifest_runtime_config(directory.path());
+        let source_location = RunLocation::new("2026-07-27", "source-run").unwrap();
+        let target_location = RunLocation::new("2026-07-27", "other-run").unwrap();
+        prepare_file_store_run_manifest(
+            directory.path(),
+            &runtime,
+            &config,
+            "2026-07-27",
+            "source-run",
+        )
+        .unwrap();
+
+        let source = directory.path().join(source_location.manifest_relative());
+        let target = directory.path().join(target_location.manifest_relative());
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::copy(source, target).unwrap();
+
+        let error = prepare_file_store_run_manifest(
+            directory.path(),
+            &runtime,
+            &config,
+            "2026-07-27",
+            "other-run",
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("manifest run identity differs from requested store location"));
+    }
+
+    #[test]
+    fn file_store_run_manifests_are_isolated_by_store_root() {
+        let directory = tempfile::tempdir().unwrap();
+        let first_root = directory.path().join("first");
+        let second_root = directory.path().join("second");
+        let (first_config, first_runtime) = manifest_runtime_config(&first_root);
+        let (second_config, second_runtime) = manifest_runtime_config(&second_root);
+        let location = RunLocation::new("2026-07-27", "isolated-run").unwrap();
+
+        prepare_file_store_run_manifest(
+            &first_root,
+            &first_runtime,
+            &first_config,
+            "2026-07-27",
+            "isolated-run",
+        )
+        .unwrap();
+        assert!(first_root.join(location.manifest_relative()).exists());
+        assert!(!second_root.join(location.manifest_relative()).exists());
+
+        prepare_file_store_run_manifest(
+            &second_root,
+            &second_runtime,
+            &second_config,
+            "2026-07-27",
+            "isolated-run",
+        )
+        .unwrap();
+        assert!(second_root.join(location.manifest_relative()).exists());
+    }
 
     fn test_llm_settings(native_web_search: bool) -> orchestrator_llm::RoleLlmSettings {
         orchestrator_llm::RoleLlmSettings {

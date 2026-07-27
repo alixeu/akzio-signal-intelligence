@@ -376,6 +376,10 @@ pub struct Turn {
     pub cancellation_state: String,
     pub needs_follow_up: bool,
     pub end_reason: Option<String>,
+    /// Successful terminal tool result for ToolManaged roles. This is kept
+    /// outside assistant text so a finalized artifact never depends on a
+    /// natural-language response.
+    pub terminal_tool_result: Option<ToolResultItem>,
     /// When true, subsequent model iterations get no tools and must emit the artifact.
     pub tools_disabled: bool,
 }
@@ -402,6 +406,7 @@ impl Turn {
             cancellation_state: "none".to_string(),
             needs_follow_up: false,
             end_reason: None,
+            terminal_tool_result: None,
             tools_disabled: false,
         }
     }

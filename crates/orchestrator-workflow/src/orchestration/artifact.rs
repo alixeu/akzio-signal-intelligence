@@ -1403,6 +1403,7 @@ mod tests {
             required_contexts: Vec::new(),
             prompts: crate::orchestration::config::PromptConfig {
                 prompts: std::collections::BTreeMap::new(),
+                versions: std::collections::BTreeMap::new(),
             },
             workflow: crate::orchestration::config::WorkflowConfig {
                 phase1_parallelism: 5,
@@ -1456,6 +1457,9 @@ mod tests {
                 phase6_max_details: 8,
                 reflection_max_details: 8,
             },
+            store: crate::orchestration::config::StoreConfig::from_value(&json!({})).unwrap(),
+            tool_managed: crate::orchestration::config::ToolManagedConfig::from_value(&json!({}))
+                .unwrap(),
             plugins: crate::orchestration::config::PluginConfig {
                 enabled: false,
                 components_dir: std::path::PathBuf::new(),
@@ -1466,6 +1470,7 @@ mod tests {
             component_plugins: orchestrator_core::ComponentRegistry::default(),
             role_plugins: orchestrator_core::RolePluginRegistry::default(),
             agent_registry: orchestrator_core::AgentRegistry::builtin(),
+            authority_registry: orchestrator_core::AuthorityRegistry::builtin_legacy(),
         }
     }
 

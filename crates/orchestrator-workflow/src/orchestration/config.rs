@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use orchestrator_core::{
     config_bool, config_get, config_int, config_str, config_strings, project_path, AgentRegistry,
-    RetrievalBudget,
+    AuthorityRegistry, RetrievalBudget,
 };
 use orchestrator_llm::{
     llm_judge::JudgeConfig,
@@ -10,7 +10,7 @@ use orchestrator_llm::{
     OutputMode, RoleLlmSettings,
 };
 use orchestrator_sql::context_count;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use tracing::warn;
@@ -40,10 +40,42 @@ pub(crate) struct RuntimeConfig {
     pub alpaca_api_secret: Option<String>,
     pub reflection: ReflectionConfig,
     pub retrieval: RetrievalConfig,
+    pub store: StoreConfig,
+    #[allow(dead_code)] // consumed by ToolManaged runtime once a profile migrates
+    pub tool_managed: ToolManagedConfig,
     pub plugins: PluginConfig,
     pub component_plugins: ComponentRegistry,
     pub role_plugins: RolePluginRegistry,
     pub agent_registry: AgentRegistry,
+    /// Exact legacy/FileStore ownership during the staged migration. It is
+    /// immutable for a process and captured in each run manifest by the
+    /// FileStore path before recovery is permitted.
+    pub authority_registry: AuthorityRegistry,
+}
+
+pub(crate) const STORE_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // PR1 plumbing; FileStore consumes these fields after migration.
+pub(crate) struct StoreConfig {
+    /// Canonical absolute root derived from `orchestrator.store.root`.
+    pub root: PathBuf,
+    pub schema_version: u32,
+    pub retain_turn_history: bool,
+    pub retain_debug_history: bool,
+    pub atomic_fsync: bool,
+    pub stale_temp_age_sec: u64,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // PR1 plumbing; ToolManaged runtime consumes these fields after migration.
+pub(crate) struct ToolManagedConfig {
+    pub max_write_calls_per_role: usize,
+    /// This is intentionally fixed at two: initial attempt plus one repair.
+    pub max_finalize_attempts: usize,
+    pub max_draft_chars: usize,
+    pub summary_parallelism: usize,
+    pub max_summary_units_per_phase: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -124,6 +156,9 @@ pub(crate) struct WorkflowConfig {
 #[derive(Debug, Clone)]
 pub(crate) struct PromptConfig {
     pub prompts: BTreeMap<String, PathBuf>,
+    /// The configured revision for each registered prompt. This is captured in
+    /// FileStore run manifests without eagerly reading template bodies.
+    pub versions: BTreeMap<String, String>,
 }
 
 impl PluginConfig {
@@ -155,6 +190,201 @@ impl PluginConfig {
             extra_component_dirs,
         }
     }
+}
+
+impl StoreConfig {
+    pub fn from_value(config: &Value) -> Result<Self> {
+        const PATH: &str = "orchestrator.store";
+        let object = strict_optional_object(config, PATH)?;
+        if let Some(object) = object {
+            validate_known_fields(
+                object,
+                PATH,
+                [
+                    "root",
+                    "schema_version",
+                    "retain_turn_history",
+                    "retain_debug_history",
+                    "atomic_fsync",
+                    "stale_temp_age_sec",
+                ],
+            )?;
+        }
+        let root = strict_string_or_default(object, PATH, "root", "outputs/store")?;
+        let schema_version =
+            strict_u64_or_default(object, PATH, "schema_version", STORE_SCHEMA_VERSION as u64)?;
+        if schema_version != STORE_SCHEMA_VERSION as u64 {
+            bail!(
+                "{PATH}.schema_version must be exactly {STORE_SCHEMA_VERSION}; got {schema_version}"
+            );
+        }
+        Ok(Self {
+            root: resolve_store_root_path(Path::new(&root))?,
+            schema_version: STORE_SCHEMA_VERSION,
+            retain_turn_history: strict_bool_or_default(
+                object,
+                PATH,
+                "retain_turn_history",
+                false,
+            )?,
+            retain_debug_history: strict_bool_or_default(
+                object,
+                PATH,
+                "retain_debug_history",
+                true,
+            )?,
+            atomic_fsync: strict_bool_or_default(object, PATH, "atomic_fsync", true)?,
+            stale_temp_age_sec: strict_u64_or_default(object, PATH, "stale_temp_age_sec", 3600)?,
+        })
+        .and_then(|config| {
+            if config.stale_temp_age_sec == 0 {
+                bail!("{PATH}.stale_temp_age_sec must be at least 1");
+            }
+            Ok(config)
+        })
+    }
+
+    /// Resolve the one canonical store root for a run. This does not create or
+    /// read the directory; PR1's FileStore runtime owns that side effect.
+    pub fn resolve_root(&self, cli_override: Option<&Path>) -> Result<PathBuf> {
+        match cli_override {
+            Some(path) => resolve_store_root_path(path),
+            None => Ok(self.root.clone()),
+        }
+    }
+}
+
+impl ToolManagedConfig {
+    pub fn from_value(config: &Value) -> Result<Self> {
+        const PATH: &str = "orchestrator.tool_managed";
+        let object = strict_optional_object(config, PATH)?;
+        if let Some(object) = object {
+            validate_known_fields(
+                object,
+                PATH,
+                [
+                    "max_write_calls_per_role",
+                    "max_finalize_attempts",
+                    "max_draft_chars",
+                    "summary_parallelism",
+                    "max_summary_units_per_phase",
+                ],
+            )?;
+        }
+        let max_write_calls_per_role =
+            strict_bounded_usize(object, PATH, "max_write_calls_per_role", 20, 1, 1_000)?;
+        let max_finalize_attempts =
+            strict_bounded_usize(object, PATH, "max_finalize_attempts", 2, 2, 2)?;
+        let max_draft_chars =
+            strict_bounded_usize(object, PATH, "max_draft_chars", 64_000, 1, 1_048_576)?;
+        let summary_parallelism =
+            strict_bounded_usize(object, PATH, "summary_parallelism", 4, 1, 64)?;
+        let max_summary_units_per_phase =
+            strict_bounded_usize(object, PATH, "max_summary_units_per_phase", 32, 1, 256)?;
+        Ok(Self {
+            max_write_calls_per_role,
+            max_finalize_attempts,
+            max_draft_chars,
+            summary_parallelism,
+            max_summary_units_per_phase,
+        })
+    }
+}
+
+fn strict_optional_object<'a>(
+    config: &'a Value,
+    path: &str,
+) -> Result<Option<&'a Map<String, Value>>> {
+    match config_get(config, path) {
+        None => Ok(None),
+        Some(Value::Object(object)) => Ok(Some(object)),
+        Some(_) => bail!("{path} must be an object"),
+    }
+}
+
+fn validate_known_fields(
+    object: &Map<String, Value>,
+    path: &str,
+    allowed: impl IntoIterator<Item = &'static str>,
+) -> Result<()> {
+    let allowed = allowed.into_iter().collect::<BTreeSet<_>>();
+    for key in object.keys() {
+        if !allowed.contains(key.as_str()) {
+            bail!("{path}.{key} is not a supported setting");
+        }
+    }
+    Ok(())
+}
+
+fn strict_string_or_default(
+    object: Option<&Map<String, Value>>,
+    path: &str,
+    field: &str,
+    default: &str,
+) -> Result<String> {
+    let Some(value) = object.and_then(|object| object.get(field)) else {
+        return Ok(default.to_string());
+    };
+    let value = value
+        .as_str()
+        .with_context(|| format!("{path}.{field} must be a string"))?;
+    if value.is_empty() || value != value.trim() || value.contains('\0') {
+        bail!("{path}.{field} must be a non-empty, trimmed path");
+    }
+    Ok(value.to_string())
+}
+
+fn strict_bool_or_default(
+    object: Option<&Map<String, Value>>,
+    path: &str,
+    field: &str,
+    default: bool,
+) -> Result<bool> {
+    let Some(value) = object.and_then(|object| object.get(field)) else {
+        return Ok(default);
+    };
+    value
+        .as_bool()
+        .with_context(|| format!("{path}.{field} must be a boolean"))
+}
+
+fn strict_u64_or_default(
+    object: Option<&Map<String, Value>>,
+    path: &str,
+    field: &str,
+    default: u64,
+) -> Result<u64> {
+    let Some(value) = object.and_then(|object| object.get(field)) else {
+        return Ok(default);
+    };
+    value
+        .as_u64()
+        .with_context(|| format!("{path}.{field} must be an unsigned integer"))
+}
+
+fn strict_bounded_usize(
+    object: Option<&Map<String, Value>>,
+    path: &str,
+    field: &str,
+    default: usize,
+    min: usize,
+    max: usize,
+) -> Result<usize> {
+    let value = strict_u64_or_default(object, path, field, default as u64)?;
+    let value: usize = value
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("{path}.{field} is too large"))?;
+    if !(min..=max).contains(&value) {
+        bail!("{path}.{field} must be between {min} and {max}; got {value}");
+    }
+    Ok(value)
+}
+
+fn resolve_store_root_path(path: &Path) -> Result<PathBuf> {
+    if path.as_os_str().is_empty() {
+        bail!("--store-root must be a non-empty path");
+    }
+    Ok(project_path(path))
 }
 
 impl RuntimeConfig {
@@ -310,7 +540,7 @@ impl RuntimeConfig {
                 .entry(plugin.manifest.role_id.clone())
                 .or_insert_with(|| "v1".to_string());
         }
-        let prompts_config = PromptConfig { prompts };
+        let prompts_config = PromptConfig { prompts, versions };
         let mut llm_roles = llm_roles_from_config(config)?;
         merge_plugin_llm_role_defaults(config, &mut llm_roles, &role_plugins)?;
         let truncation = truncation_config_from_value(config);
@@ -327,6 +557,7 @@ impl RuntimeConfig {
                 .values()
                 .map(|plugin| (&plugin.manifest, plugin.role_path())),
         );
+        let authority_registry = AuthorityRegistry::builtin_legacy();
         let alpaca_api_key = config_str(config, "orchestrator.alpaca.api_key", "")
             .trim()
             .to_string();
@@ -353,10 +584,13 @@ impl RuntimeConfig {
             alpaca_api_secret,
             reflection: ReflectionConfig::from_value(config),
             retrieval: RetrievalConfig::from_value(config),
+            store: StoreConfig::from_value(config)?,
+            tool_managed: ToolManagedConfig::from_value(config)?,
             plugins: plugin_config,
             component_plugins,
             role_plugins,
             agent_registry,
+            authority_registry,
         })
     }
 }
@@ -1067,6 +1301,80 @@ mod tests {
     use super::*;
     use orchestrator_llm::truncation::TruncationStrategy;
     use serde_json::json;
+
+    #[test]
+    fn store_config_defaults_to_the_canonical_root_and_safe_retention() {
+        let store = StoreConfig::from_value(&json!({})).unwrap();
+        assert_eq!(store.root, project_path("outputs/store"));
+        assert_eq!(store.schema_version, STORE_SCHEMA_VERSION);
+        assert!(!store.retain_turn_history);
+        assert!(store.retain_debug_history);
+        assert!(store.atomic_fsync);
+        assert_eq!(store.stale_temp_age_sec, 3600);
+    }
+
+    #[test]
+    fn store_config_is_strict_and_cli_root_is_the_only_override() {
+        let root = std::env::temp_dir().join("akzio-store-config-test");
+        let store = StoreConfig::from_value(&json!({
+            "orchestrator": {
+                "store": {
+                    "root": "outputs/isolated-store",
+                    "schema_version": 1,
+                    "retain_turn_history": true,
+                    "retain_debug_history": false,
+                    "atomic_fsync": false,
+                    "stale_temp_age_sec": 42
+                }
+            }
+        }))
+        .unwrap();
+        assert_eq!(store.root, project_path("outputs/isolated-store"));
+        assert!(store.retain_turn_history);
+        assert!(!store.retain_debug_history);
+        assert!(!store.atomic_fsync);
+        assert_eq!(store.stale_temp_age_sec, 42);
+        assert_eq!(store.resolve_root(Some(&root)).unwrap(), root);
+    }
+
+    #[test]
+    fn store_config_rejects_unknown_invalid_and_future_fields() {
+        for store in [
+            json!({"root": "outputs/store", "unknown": true}),
+            json!({"root": " outputs/store"}),
+            json!({"schema_version": 2}),
+            json!({"retain_turn_history": "false"}),
+            json!({"stale_temp_age_sec": 0}),
+        ] {
+            let error =
+                StoreConfig::from_value(&json!({"orchestrator": {"store": store}})).unwrap_err();
+            assert!(error.to_string().contains("orchestrator.store"));
+        }
+    }
+
+    #[test]
+    fn tool_managed_config_defaults_and_enforces_bounded_repair_policy() {
+        let defaults = ToolManagedConfig::from_value(&json!({})).unwrap();
+        assert_eq!(defaults.max_write_calls_per_role, 20);
+        assert_eq!(defaults.max_finalize_attempts, 2);
+        assert_eq!(defaults.max_draft_chars, 64_000);
+        assert_eq!(defaults.summary_parallelism, 4);
+        assert_eq!(defaults.max_summary_units_per_phase, 32);
+
+        for tool_managed in [
+            json!({"max_finalize_attempts": 1}),
+            json!({"max_finalize_attempts": 3}),
+            json!({"max_draft_chars": 0}),
+            json!({"summary_parallelism": 65}),
+            json!({"unknown": 1}),
+        ] {
+            let error = ToolManagedConfig::from_value(&json!({
+                "orchestrator": {"tool_managed": tool_managed}
+            }))
+            .unwrap_err();
+            assert!(error.to_string().contains("orchestrator.tool_managed"));
+        }
+    }
 
     #[test]
     fn judge_config_parses_from_runtime_config_value() {

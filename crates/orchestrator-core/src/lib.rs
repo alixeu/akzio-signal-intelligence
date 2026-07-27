@@ -1,4 +1,5 @@
 pub mod artifact;
+pub mod authority;
 pub mod config;
 pub mod jin10_csv;
 pub mod paths;
@@ -20,6 +21,11 @@ pub use artifact::{
     validate_research_artifact, validate_risk_constraints, AnalystTickerArtifact,
     AssetExecutionConstraint, FinalValidation, PortfolioAllocation, ResearchArtifact,
     RiskConstraints, TradeIntent, ValidationError, CANONICAL_EVIDENCE_TYPES,
+};
+pub use authority::{
+    ArtifactAuthority, AuthorityRegistration, AuthorityRegistry, AuthorityRegistryError,
+    AuthorityRegistrySnapshot, RoleProfileKey, ToolManagedProfile, UnitPlanner,
+    AUTHORITY_REGISTRY_SCHEMA_VERSION, BUILTIN_AUTHORITY_REGISTRY_VERSION,
 };
 pub use config::{
     config_bool, config_float, config_get, config_int, config_str, config_strings, deep_merge,

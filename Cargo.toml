@@ -6,6 +6,7 @@ members = [
     "crates/orchestrator-cli",
     "crates/orchestrator-workflow",
     "crates/orchestrator-ingest",
+    "crates/orchestrator-store",
 ]
 resolver = "2"
 

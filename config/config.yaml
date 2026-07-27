@@ -2,6 +2,23 @@ orchestrator:
   analysis_universe: [QQQ, SOXX, VIX]
   db_path: outputs/orchestrator.sqlite
 
+  # FileStore configuration is parsed from PR 1 onward. Legacy profiles still
+  # use SQLite until their authority-registry entry is migrated.
+  store:
+    root: outputs/store
+    schema_version: 1
+    retain_turn_history: false
+    retain_debug_history: true
+    atomic_fsync: true
+    stale_temp_age_sec: 3600
+
+  tool_managed:
+    max_write_calls_per_role: 20
+    max_finalize_attempts: 2
+    max_draft_chars: 64000
+    summary_parallelism: 4
+    max_summary_units_per_phase: 32
+
   runtime:
     lang: zh
     # window_days: 数据检索窗口（技术与新闻上下文工具返回的时间跨度）。

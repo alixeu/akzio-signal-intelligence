@@ -1,9 +1,10 @@
 use anyhow::{bail, Context, Result};
 use orchestrator_core::{
     analyst_artifact_schema, final_validation_schema, portfolio_allocation_schema, render_template,
-    research_artifact_schema, risk_constraints_schema, trade_intent_schema,
+    research_artifact_schema, risk_constraints_schema, trade_intent_schema, ComponentPlugin,
 };
 use serde_json::{json, Value};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use super::lifecycle::{research_plan_to_trade_intent, tickers_from_state, topic_state};
@@ -52,6 +53,87 @@ fn prompt_component(prompt_path: Option<&std::path::Path>, relative_path: &str) 
     } else {
         Ok(String::new())
     }
+}
+
+/// Return lower-snake-case placeholders from the original template only.
+///
+/// This intentionally mirrors `render_template`: JSON braces and replacement
+/// text are not placeholders. The renderer uses this before materialising
+/// values so unused context and components are never loaded or serialised.
+pub(crate) fn raw_template_placeholders(template: &str) -> BTreeSet<String> {
+    let bytes = template.as_bytes();
+    let mut placeholders = BTreeSet::new();
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+        if bytes[cursor] != b'{' {
+            cursor += 1;
+            continue;
+        }
+        let start = cursor + 1;
+        let Some(end_offset) = bytes[start..].iter().position(|byte| *byte == b'}') else {
+            break;
+        };
+        let end = start + end_offset;
+        let name = &template[start..end];
+        if !name.is_empty()
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        {
+            placeholders.insert(name.to_string());
+        }
+        cursor = end + 1;
+    }
+    placeholders
+}
+
+fn add_template_placeholders(placeholders: &mut BTreeSet<String>, template: &str) {
+    placeholders.extend(raw_template_placeholders(template));
+}
+
+fn referenced_components<'a>(
+    component_registry: Option<&'a ComponentRegistry>,
+    role: &str,
+    placeholders: &mut BTreeSet<String>,
+) -> Vec<&'a ComponentPlugin> {
+    let Some(registry) = component_registry else {
+        return Vec::new();
+    };
+    let candidates = registry.for_role(role);
+    let mut selected = Vec::new();
+    loop {
+        let mut changed = false;
+        for plugin in &candidates {
+            if !placeholders.contains(&plugin.manifest.placeholder_key)
+                || selected.iter().any(|selected: &&ComponentPlugin| {
+                    selected.manifest.name == plugin.manifest.name
+                })
+            {
+                continue;
+            }
+            selected.push(*plugin);
+            placeholders.extend(plugin.manifest.required_variables.iter().cloned());
+            placeholders.extend(plugin.manifest.schema_dependencies.iter().cloned());
+            add_template_placeholders(placeholders, &plugin.template);
+            changed = true;
+        }
+        if !changed {
+            break;
+        }
+    }
+    selected
+}
+
+fn insert_if_referenced(
+    values: &mut serde_json::Map<String, Value>,
+    placeholders: &BTreeSet<String>,
+    key: &str,
+    value: impl FnOnce() -> Result<Value>,
+) -> Result<()> {
+    if placeholders.contains(key) {
+        values.insert(key.to_string(), value()?);
+    }
+    Ok(())
 }
 
 fn phase3_context(state: &Value) -> Value {
@@ -292,51 +374,12 @@ pub(crate) fn render_prompt_with_plugins(
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
         .or_else(|| tickers.first().map(String::as_str))
-        .unwrap_or("");
+        .unwrap_or("")
+        .to_string();
     let path = prompt_path.with_context(|| format!("missing prompt path for role {role}"))?;
     let template = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read prompt template {}", path.display()))?;
-    let current_topic_state = topic_id
-        .and_then(|id| topic_state(state, id))
-        .unwrap_or(Value::Null);
-    let current_topic = current_topic_state
-        .get("topic")
-        .cloned()
-        .unwrap_or(Value::Null);
-    let analyst_output_contract_template =
-        prompt_component(prompt_path, "common/analyst_output_contract.md")?;
-    let retrieval_policy_template = prompt_component(prompt_path, "common/retrieval_policy.md")?;
-    let research_calibration_template =
-        prompt_component(prompt_path, "common/research_calibration.md")?;
-    let research_drivers_template = prompt_component(prompt_path, "common/research_drivers.md")?;
-    let risk_analyst_template = prompt_component(prompt_path, "phase5/risk_analyst.md")?;
-    let leveraged_etf_rules_template =
-        prompt_component(prompt_path, "common/leveraged_etf_rules.md")?;
-    // Render components with the schema in scope so a `{analyst_artifact_schema}`
-    // placeholder inside the contract is resolved before the component text is
-    // spliced into the role prompt (the outer pass runs once, in key order, and
-    // would otherwise leave the nested placeholder untouched).
-    let component_values = json!({
-        "ticker": ticker,
-        "tickers": tickers.join(","),
-        "role": role,
-        "analyst_artifact_schema": analyst_artifact_schema(),
-        "research_artifact_schema": research_artifact_schema(),
-        "trade_intent_schema": trade_intent_schema(),
-        "risk_constraints_schema": risk_constraints_schema(),
-        "final_validation_schema": final_validation_schema(),
-        "portfolio_allocation_schema": portfolio_allocation_schema(),
-    });
-    let analyst_output_contract =
-        render_template(&analyst_output_contract_template, &component_values)?;
-    let retrieval_policy = render_template(&retrieval_policy_template, &component_values)?;
-    let research_calibration = render_template(&research_calibration_template, &component_values)?;
-    let research_drivers = render_template(&research_drivers_template, &component_values)?;
-    let leveraged_etf_rules = if contains_leveraged_etf(&tickers) {
-        render_template(&leveraged_etf_rules_template, &component_values)?
-    } else {
-        String::new()
-    };
+    let mut placeholders = raw_template_placeholders(&template);
     let stance_role_label = role.strip_prefix("risk.").unwrap_or("");
     let (side, side_label, opponent, opponent_label, side_strategy_path) =
         if role.contains(".bull.") {
@@ -358,85 +401,304 @@ pub(crate) fn render_prompt_with_plugins(
         } else {
             ("", "", "", "", None)
         };
-    let side_strategy = side_strategy_path
-        .map(|path| prompt_component(prompt_path, path))
-        .transpose()?
-        .unwrap_or_default();
-    let static_values = json!({
-        "ticker": ticker,
-        "tickers": tickers.join(","),
-        "common_ticker_prompt": "",
-        "analyst_output_contract": analyst_output_contract,
-        "retrieval_policy": retrieval_policy,
-        "anti_injection": "",
-        "research_calibration": research_calibration,
-        "research_drivers": research_drivers,
-        "analysis_trace_contract": "",
-        "experience_contract": "",
-        "leveraged_etf_rules": leveraged_etf_rules,
-        "analyst_artifact_schema": analyst_artifact_schema(),
-        "research_artifact_schema": research_artifact_schema(),
-        "trade_intent_schema": trade_intent_schema(),
-        "risk_constraints_schema": risk_constraints_schema(),
-        "final_validation_schema": final_validation_schema(),
-        "portfolio_allocation_schema": portfolio_allocation_schema(),
-        "role": role,
-        "phase": phase,
-        "kind": kind,
-        "lang": state.get("lang").and_then(Value::as_str).unwrap_or("zh"),
-        "side": side,
-        "side_label": side_label,
-        "opponent": opponent,
-        "opponent_label": opponent_label,
-        "side_strategy": side_strategy,
-        "stance": stance_role_label,
-        "stance_label": stance_role_label,
-        "stance_intro": "",
-        "stance_rules": "",
-        "stance_schema_extra": "",
-        "researcher_body": "",
-        "retrieval_bootstrap": "",
-        "phase4_control_context": "",
-        "phase5_control_context": "",
-        "phase6_control_context": "",
-        "workflow_pattern": "Workflow -> Stage/Sub-workflow -> Agent workers -> Reducer -> state artifact"
-    });
-    let dynamic_values = json!({
-        "run_id": state.get("run_id").and_then(Value::as_str).unwrap_or(""),
-        "date": state.get("current_date").and_then(Value::as_str).unwrap_or(""),
-        "window_days": state.get("window_days").cloned().unwrap_or(Value::Null),
-        "round": round.unwrap_or_default(),
-        "topic_id": topic_id.unwrap_or(""),
-        "topic": serde_json::to_string_pretty(&current_topic)?,
-        "portfolio_decision": serde_json::to_string_pretty(&state.get("final_trade_decision").cloned().unwrap_or(Value::Null))?,
-        "allocation_context": serde_json::to_string_pretty(&state.get("allocation_context").cloned().unwrap_or(Value::Null))?,
-        "alpaca_mode": if state.get("mock").and_then(Value::as_bool) == Some(true)
-            || state.get("debug").and_then(Value::as_bool) == Some(true)
+    let mut component_templates = BTreeMap::new();
+    let mut risk_analyst_template = None;
+    let mut side_strategy = None;
+    let mut selected_components = Vec::new();
+    loop {
+        let mut changed = false;
+        for (key, relative_path) in [
+            (
+                "analyst_output_contract",
+                "common/analyst_output_contract.md",
+            ),
+            ("retrieval_policy", "common/retrieval_policy.md"),
+            ("research_calibration", "common/research_calibration.md"),
+            ("research_drivers", "common/research_drivers.md"),
+        ] {
+            if placeholders.contains(key) && !component_templates.contains_key(key) {
+                let component = prompt_component(prompt_path, relative_path)?;
+                add_template_placeholders(&mut placeholders, &component);
+                component_templates.insert(key, component);
+                changed = true;
+            }
+        }
+        if placeholders.contains("leveraged_etf_rules")
+            && contains_leveraged_etf(&tickers)
+            && !component_templates.contains_key("leveraged_etf_rules")
         {
-            "disabled"
-        } else {
-            "live"
-        },
-        "phase3_context": serde_json::to_string_pretty(&phase3_context(state))?,
-        "retrieval_bootstrap": serde_json::to_string_pretty(&retrieval_bootstrap(state, phase))?,
-        "phase4_control_context": serde_json::to_string_pretty(&phase4_control_context(state))?,
-        "phase5_control_context": serde_json::to_string_pretty(&phase5_control_context(state))?,
-        "phase6_control_context": serde_json::to_string_pretty(&phase6_control_context(state))?,
-        "common_ground": serde_json::to_string_pretty(&state.get("common_ground").cloned().unwrap_or(Value::Null))?,
-        "reflection_task": serde_json::to_string_pretty(&state.get("reflection_task").cloned().unwrap_or(Value::Null))?,
-    });
-    let mut values = static_values;
-    if let (Some(static_map), Some(dynamic_map)) =
-        (values.as_object_mut(), dynamic_values.as_object())
-    {
-        for (key, value) in dynamic_map {
-            static_map.insert(key.clone(), value.clone());
+            let component = prompt_component(prompt_path, "common/leveraged_etf_rules.md")?;
+            add_template_placeholders(&mut placeholders, &component);
+            component_templates.insert("leveraged_etf_rules", component);
+            changed = true;
+        }
+        if placeholders.contains("risk_analyst_body") && risk_analyst_template.is_none() {
+            let component = prompt_component(prompt_path, "phase5/risk_analyst.md")?;
+            add_template_placeholders(&mut placeholders, &component);
+            risk_analyst_template = Some(component);
+            changed = true;
+        }
+        if placeholders.contains("side_strategy") && side_strategy.is_none() {
+            side_strategy = Some(
+                side_strategy_path
+                    .map(|path| prompt_component(prompt_path, path))
+                    .transpose()?
+                    .unwrap_or_default(),
+            );
+            changed = true;
+        }
+        let referenced = referenced_components(component_registry, role, &mut placeholders);
+        if referenced.len() != selected_components.len() {
+            selected_components = referenced;
+            changed = true;
+        }
+        if !changed {
+            break;
         }
     }
-    if let Some(registry) = component_registry {
-        registry.render_for_role(role, &mut values)?;
+
+    let mut values = serde_json::Map::new();
+    insert_if_referenced(&mut values, &placeholders, "ticker", || {
+        Ok(Value::String(ticker.clone()))
+    })?;
+    insert_if_referenced(&mut values, &placeholders, "tickers", || {
+        Ok(Value::String(tickers.join(",")))
+    })?;
+    insert_if_referenced(
+        &mut values,
+        &placeholders,
+        "analyst_artifact_schema",
+        || Ok(Value::String(analyst_artifact_schema())),
+    )?;
+    insert_if_referenced(
+        &mut values,
+        &placeholders,
+        "research_artifact_schema",
+        || Ok(Value::String(research_artifact_schema())),
+    )?;
+    insert_if_referenced(&mut values, &placeholders, "trade_intent_schema", || {
+        Ok(Value::String(trade_intent_schema()))
+    })?;
+    insert_if_referenced(
+        &mut values,
+        &placeholders,
+        "risk_constraints_schema",
+        || Ok(Value::String(risk_constraints_schema())),
+    )?;
+    insert_if_referenced(
+        &mut values,
+        &placeholders,
+        "final_validation_schema",
+        || Ok(Value::String(final_validation_schema())),
+    )?;
+    insert_if_referenced(
+        &mut values,
+        &placeholders,
+        "portfolio_allocation_schema",
+        || Ok(Value::String(portfolio_allocation_schema())),
+    )?;
+    insert_if_referenced(&mut values, &placeholders, "role", || {
+        Ok(Value::String(role.to_string()))
+    })?;
+    insert_if_referenced(&mut values, &placeholders, "phase", || Ok(json!(phase)))?;
+    insert_if_referenced(&mut values, &placeholders, "kind", || {
+        Ok(Value::String(kind.to_string()))
+    })?;
+    insert_if_referenced(&mut values, &placeholders, "lang", || {
+        Ok(Value::String(
+            state
+                .get("lang")
+                .and_then(Value::as_str)
+                .unwrap_or("zh")
+                .to_string(),
+        ))
+    })?;
+    insert_if_referenced(&mut values, &placeholders, "side", || {
+        Ok(Value::String(side.to_string()))
+    })?;
+    insert_if_referenced(&mut values, &placeholders, "side_label", || {
+        Ok(Value::String(side_label.to_string()))
+    })?;
+    insert_if_referenced(&mut values, &placeholders, "opponent", || {
+        Ok(Value::String(opponent.to_string()))
+    })?;
+    insert_if_referenced(&mut values, &placeholders, "opponent_label", || {
+        Ok(Value::String(opponent_label.to_string()))
+    })?;
+    insert_if_referenced(&mut values, &placeholders, "stance", || {
+        Ok(Value::String(stance_role_label.to_string()))
+    })?;
+    insert_if_referenced(&mut values, &placeholders, "stance_label", || {
+        Ok(Value::String(stance_role_label.to_string()))
+    })?;
+    insert_if_referenced(&mut values, &placeholders, "workflow_pattern", || {
+        Ok(Value::String(
+            "Workflow -> Stage/Sub-workflow -> Agent workers -> Reducer -> state artifact"
+                .to_string(),
+        ))
+    })?;
+    insert_if_referenced(&mut values, &placeholders, "run_id", || {
+        Ok(Value::String(
+            state
+                .get("run_id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        ))
+    })?;
+    insert_if_referenced(&mut values, &placeholders, "date", || {
+        Ok(Value::String(
+            state
+                .get("current_date")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        ))
+    })?;
+    insert_if_referenced(&mut values, &placeholders, "window_days", || {
+        Ok(state.get("window_days").cloned().unwrap_or(Value::Null))
+    })?;
+    insert_if_referenced(&mut values, &placeholders, "round", || {
+        Ok(json!(round.unwrap_or_default()))
+    })?;
+    insert_if_referenced(&mut values, &placeholders, "topic_id", || {
+        Ok(Value::String(topic_id.unwrap_or("").to_string()))
+    })?;
+    insert_if_referenced(&mut values, &placeholders, "topic", || {
+        let current_topic = topic_id
+            .and_then(|id| topic_state(state, id))
+            .and_then(|topic| topic.get("topic").cloned())
+            .unwrap_or(Value::Null);
+        Ok(Value::String(serde_json::to_string_pretty(&current_topic)?))
+    })?;
+    insert_if_referenced(&mut values, &placeholders, "portfolio_decision", || {
+        Ok(Value::String(serde_json::to_string_pretty(
+            &state
+                .get("final_trade_decision")
+                .cloned()
+                .unwrap_or(Value::Null),
+        )?))
+    })?;
+    insert_if_referenced(&mut values, &placeholders, "allocation_context", || {
+        Ok(Value::String(serde_json::to_string_pretty(
+            &state
+                .get("allocation_context")
+                .cloned()
+                .unwrap_or(Value::Null),
+        )?))
+    })?;
+    insert_if_referenced(&mut values, &placeholders, "alpaca_mode", || {
+        Ok(Value::String(
+            if state.get("mock").and_then(Value::as_bool) == Some(true)
+                || state.get("debug").and_then(Value::as_bool) == Some(true)
+            {
+                "disabled"
+            } else {
+                "live"
+            }
+            .to_string(),
+        ))
+    })?;
+    insert_if_referenced(&mut values, &placeholders, "phase3_context", || {
+        Ok(Value::String(serde_json::to_string_pretty(
+            &phase3_context(state),
+        )?))
+    })?;
+    insert_if_referenced(&mut values, &placeholders, "retrieval_bootstrap", || {
+        Ok(Value::String(serde_json::to_string_pretty(
+            &retrieval_bootstrap(state, phase),
+        )?))
+    })?;
+    insert_if_referenced(&mut values, &placeholders, "phase4_control_context", || {
+        Ok(Value::String(serde_json::to_string_pretty(
+            &phase4_control_context(state),
+        )?))
+    })?;
+    insert_if_referenced(&mut values, &placeholders, "phase5_control_context", || {
+        Ok(Value::String(serde_json::to_string_pretty(
+            &phase5_control_context(state),
+        )?))
+    })?;
+    insert_if_referenced(&mut values, &placeholders, "phase6_control_context", || {
+        Ok(Value::String(serde_json::to_string_pretty(
+            &phase6_control_context(state),
+        )?))
+    })?;
+    insert_if_referenced(&mut values, &placeholders, "common_ground", || {
+        Ok(Value::String(serde_json::to_string_pretty(
+            &state.get("common_ground").cloned().unwrap_or(Value::Null),
+        )?))
+    })?;
+    insert_if_referenced(&mut values, &placeholders, "reflection_task", || {
+        Ok(Value::String(serde_json::to_string_pretty(
+            &state.get("reflection_task").cloned().unwrap_or(Value::Null),
+        )?))
+    })?;
+
+    let mut values = Value::Object(values);
+    let rendered_components = component_templates
+        .iter()
+        .map(|(key, component)| Ok((*key, render_template(component, &values)?)))
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    let values_map = values
+        .as_object_mut()
+        .expect("renderer values are constructed as an object");
+    for (key, component) in rendered_components {
+        values_map.insert(key.to_string(), Value::String(component));
     }
-    if template.contains("{common_ticker_prompt}")
+    for key in [
+        "common_ticker_prompt",
+        "analyst_output_contract",
+        "retrieval_policy",
+        "anti_injection",
+        "research_calibration",
+        "research_drivers",
+        "analysis_trace_contract",
+        "experience_contract",
+        "leveraged_etf_rules",
+        "risk_analyst_body",
+        "side_strategy",
+        "stance_intro",
+        "stance_rules",
+        "stance_schema_extra",
+        "researcher_body",
+    ] {
+        if placeholders.contains(key) {
+            values_map
+                .entry(key.to_string())
+                .or_insert_with(|| Value::String(String::new()));
+        }
+    }
+    if let Some(side_strategy) = side_strategy {
+        values_map.insert("side_strategy".to_string(), Value::String(side_strategy));
+    }
+    for plugin in selected_components {
+        let rendered = render_template(&plugin.template, &values).with_context(|| {
+            format!(
+                "failed to render component plugin {} at {}",
+                plugin.manifest.name,
+                plugin.path.display()
+            )
+        })?;
+        values
+            .as_object_mut()
+            .expect("renderer values are constructed as an object")
+            .insert(
+                plugin.manifest.placeholder_key.clone(),
+                Value::String(rendered),
+            );
+    }
+    if let Some(risk_analyst_template) = risk_analyst_template {
+        let risk_analyst_body = render_template(&risk_analyst_template, &values)?;
+        values
+            .as_object_mut()
+            .expect("renderer values are constructed as an object")
+            .insert(
+                "risk_analyst_body".to_string(),
+                Value::String(risk_analyst_body),
+            );
+    }
+    if placeholders.contains("common_ticker_prompt")
         && values
             .get("common_ticker_prompt")
             .and_then(Value::as_str)
@@ -447,15 +709,6 @@ pub(crate) fn render_prompt_with_plugins(
             .unwrap_or_else(|| "<inline prompt>".to_string());
         bail!(
             "prompt {path} references {{common_ticker_prompt}} but no enabled ticker component injected it for role {role}"
-        );
-    }
-    // Risk-tier prompts use a shared component. Render it against the value set,
-    // then expose the result so role files can include it via one placeholder.
-    let risk_analyst_body = render_template(&risk_analyst_template, &values)?;
-    if let Some(map) = values.as_object_mut() {
-        map.insert(
-            "risk_analyst_body".to_string(),
-            Value::String(risk_analyst_body),
         );
     }
     render_template(&template, &values).map_err(|error| {
@@ -580,6 +833,74 @@ required_variables = ["ticker", "tickers"]
         )
         .unwrap_err();
         assert!(error.to_string().contains("missing_variable"));
+    }
+
+    #[test]
+    fn raw_template_placeholder_discovery_ignores_json_and_unclosed_braces() {
+        assert_eq!(
+            raw_template_placeholders("{ticker} {not-a-placeholder} {} {\"ticker\": 1} {later"),
+            std::collections::BTreeSet::from(["ticker".to_string()])
+        );
+    }
+
+    #[test]
+    fn unused_shared_component_is_not_loaded_or_rendered() {
+        let temp = TempDir::new().unwrap();
+        let prompts = temp.path().join("prompts");
+        std::fs::create_dir_all(prompts.join("common")).unwrap();
+        std::fs::create_dir_all(prompts.join("phase1")).unwrap();
+        std::fs::write(
+            prompts.join("common/retrieval_policy.md"),
+            "unused {missing_variable}",
+        )
+        .unwrap();
+        let prompt_path = prompts.join("phase1/technical.md");
+        std::fs::write(&prompt_path, "ticker={ticker}").unwrap();
+
+        let rendered = render_prompt(
+            &json!({"ticker": "QQQ", "tickers": ["QQQ"]}),
+            "analyst.technical",
+            1,
+            "artifact",
+            None,
+            None,
+            Some(&prompt_path),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(rendered, "ticker=QQQ");
+    }
+
+    #[test]
+    fn unused_plugin_component_is_not_rendered() {
+        let temp = TempDir::new().unwrap();
+        let prompts = temp.path().join("prompts");
+        std::fs::create_dir_all(prompts.join("phase1")).unwrap();
+        write_component(
+            &prompts,
+            "unused",
+            "[\"analyst.technical\"]",
+            "unused_component",
+            "unused {missing_variable}",
+        );
+        let prompt_path = prompts.join("phase1/technical.md");
+        std::fs::write(&prompt_path, "ticker={ticker}").unwrap();
+        let registry = ComponentRegistry::discover(&prompts).unwrap();
+
+        let rendered = render_prompt_with_plugins(
+            &json!({"ticker": "QQQ", "tickers": ["QQQ"]}),
+            "analyst.technical",
+            1,
+            "artifact",
+            None,
+            None,
+            Some(&prompt_path),
+            Some(&registry),
+        )
+        .unwrap();
+
+        assert_eq!(rendered, "ticker=QQQ");
     }
 
     #[test]

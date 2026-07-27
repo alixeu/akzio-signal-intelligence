@@ -9,7 +9,7 @@ use llm_judge::JudgeConfig;
 use orchestrator_core::{
     default_project_root, extract_json_artifact, normalize_analyst_ticker_artifact,
     normalize_research_artifact_value, validate_analyst_ticker_artifact,
-    validate_research_artifact, AnalystTickerArtifact, ResearchArtifact,
+    validate_research_artifact, AnalystTickerArtifact, ResearchArtifact, ToolManagedProfile,
 };
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -51,6 +51,7 @@ pub enum LlmTransport {
 pub enum OutputMode {
     JsonArtifact,
     ResearchArtifact,
+    ToolManaged,
 }
 
 /// Fixed endpoint, credentials, and model for the free opencode Zen gateway.
@@ -195,6 +196,9 @@ pub struct AgentSettings {
     pub debug_round: Option<usize>,
     pub tickers: Vec<String>,
     pub output_mode: OutputMode,
+    /// Required only when `output_mode` is ToolManaged. The profile selects a
+    /// Rust-owned draft/builder contract; assistant prose is never an artifact.
+    pub tool_managed_profile: Option<ToolManagedProfile>,
     pub llm: RoleLlmSettings,
     pub reasoning_effort_override: Option<String>,
     pub tools: Option<tools::ExternalToolConfig>,
@@ -206,6 +210,20 @@ pub struct AgentSettings {
 }
 
 impl AgentSettings {
+    fn validate_output_mode(&self) -> Result<()> {
+        match (self.output_mode, self.tool_managed_profile) {
+            (OutputMode::ToolManaged, Some(_)) => Ok(()),
+            (OutputMode::ToolManaged, None) => {
+                bail!("tool-managed output mode requires a ToolManagedProfile")
+            }
+            (_, Some(profile)) => bail!(
+                "legacy output mode cannot carry tool-managed profile {}",
+                profile.as_str()
+            ),
+            (_, None) => Ok(()),
+        }
+    }
+
     fn reasoning_summary_as_enum(
         &self,
     ) -> Option<async_openai::types::responses::ReasoningSummary> {
@@ -268,6 +286,9 @@ impl SteerLoopInput<'_> {
 #[derive(Debug, Clone)]
 pub struct AgentLoopOutput {
     pub artifact: Value,
+    /// Full Rust-owned terminal result. Legacy roles leave it empty until
+    /// migrated to ToolManaged.
+    pub terminal_tool_result: Option<agent_loop::ToolResultItem>,
     pub metrics: ModelStreamResult,
     pub turn_id: String,
     pub session_id: String,
@@ -284,6 +305,7 @@ pub async fn run_agent_loop_with_metrics(
     prompt: &str,
 ) -> Result<AgentLoopOutput> {
     settings.llm.validate(&settings.role)?;
+    settings.validate_output_mode()?;
     validate_fallback_web_search_runtime_config(settings)?;
     let conn = open_loop_connection(settings)?;
     let session_id = loop_session_id(settings);
@@ -325,27 +347,17 @@ pub async fn run_agent_loop_with_metrics(
     )
     .await?;
     write_role_end_context(settings, &turn)?;
-    let final_text = turn
-        .emitted_items
-        .iter()
-        .rev()
-        .find(|item| item.item_type == agent_loop::TurnItemType::AssistantMessage)
-        .map(|item| {
-            if !item.content_text.trim().is_empty() {
-                item.content_text.clone()
-            } else {
-                item.content_json.to_string()
-            }
-        })
-        .context("agent loop finished without assistant message")?;
-    let artifact = parse_final_output(settings, &final_text)?;
-    let mut artifact = artifact;
-    let mut retrieval_audit = agent_loop::retrieval_audit(&turn);
-    retrieval_audit["policy"] = serde_json::to_value(&settings.retrieval_policy)?;
-    artifact["retrieval_audit"] = retrieval_audit;
-    record_jin10_usage_from_artifact(settings, &conn, &turn.turn_id, &artifact)?;
+    let terminal_tool_result = turn.terminal_tool_result.clone();
+    let mut artifact = completed_turn_artifact(settings, &turn, false)?;
+    if settings.output_mode != OutputMode::ToolManaged {
+        let mut retrieval_audit = agent_loop::retrieval_audit(&turn);
+        retrieval_audit["policy"] = serde_json::to_value(&settings.retrieval_policy)?;
+        artifact["retrieval_audit"] = retrieval_audit;
+        record_jin10_usage_from_artifact(settings, &conn, &turn.turn_id, &artifact)?;
+    }
     Ok(AgentLoopOutput {
         artifact,
+        terminal_tool_result,
         metrics,
         turn_id: turn.turn_id,
         session_id: turn.session_id,
@@ -366,6 +378,7 @@ fn agent_loop_config_from_settings(settings: &AgentSettings) -> AgentLoopConfig 
         model: settings.llm.effective_model().to_string(),
         topic_id: settings.topic_id.clone(),
         retrieval_policy: settings.retrieval_policy.clone(),
+        require_terminal_tool: settings.output_mode == OutputMode::ToolManaged,
         ..AgentLoopConfig::default()
     }
 }
@@ -384,6 +397,7 @@ pub async fn run_agent_steer_loop_with_metrics(
     input: SteerLoopInput<'_>,
 ) -> Result<AgentLoopOutput> {
     settings.llm.validate(&settings.role)?;
+    settings.validate_output_mode()?;
     validate_fallback_web_search_runtime_config(settings)?;
     let conn = open_loop_connection(settings)?;
     // Scope resume detection to this turn_id. Using run_id-latest history made
@@ -473,6 +487,42 @@ pub async fn run_agent_steer_loop_with_metrics(
     )
     .await?;
     write_role_end_context(settings, &turn)?;
+    let terminal_tool_result = turn.terminal_tool_result.clone();
+    let mut artifact = completed_turn_artifact(settings, &turn, allow_ready_ack)?;
+    if settings.output_mode != OutputMode::ToolManaged {
+        let mut retrieval_audit = agent_loop::retrieval_audit(&turn);
+        retrieval_audit["policy"] = serde_json::to_value(&settings.retrieval_policy)?;
+        artifact["retrieval_audit"] = retrieval_audit;
+        record_jin10_usage_from_artifact(settings, &conn, &turn.turn_id, &artifact)?;
+    }
+    Ok(AgentLoopOutput {
+        artifact,
+        terminal_tool_result,
+        metrics,
+        turn_id: turn.turn_id,
+        session_id: turn.session_id,
+    })
+}
+
+/// ToolManaged completion is terminal-tool-owned. In particular, this branch
+/// must not inspect an assistant message or route through `parse_final_output`.
+fn completed_turn_artifact(
+    settings: &AgentSettings,
+    turn: &Turn,
+    allow_ready_ack: bool,
+) -> Result<Value> {
+    if settings.output_mode == OutputMode::ToolManaged {
+        let terminal = turn
+            .terminal_tool_result
+            .as_ref()
+            .context("tool-managed agent loop finished without terminal tool result")?;
+        return Ok(terminal
+            .output
+            .get("artifact")
+            .cloned()
+            .unwrap_or(Value::Null));
+    }
+
     let final_text = turn
         .emitted_items
         .iter()
@@ -486,25 +536,14 @@ pub async fn run_agent_steer_loop_with_metrics(
             }
         })
         .context("agent loop finished without assistant message")?;
-    let mut artifact = if allow_ready_ack && final_text.trim() == "准备完毕" {
-        json!({
+    if allow_ready_ack && final_text.trim() == "准备完毕" {
+        return Ok(json!({
             "status": "ready",
             "response": "准备完毕",
             "role": settings.role,
-        })
-    } else {
-        parse_final_output(settings, &final_text)?
-    };
-    let mut retrieval_audit = agent_loop::retrieval_audit(&turn);
-    retrieval_audit["policy"] = serde_json::to_value(&settings.retrieval_policy)?;
-    artifact["retrieval_audit"] = retrieval_audit;
-    record_jin10_usage_from_artifact(settings, &conn, &turn.turn_id, &artifact)?;
-    Ok(AgentLoopOutput {
-        artifact,
-        metrics,
-        turn_id: turn.turn_id,
-        session_id: turn.session_id,
-    })
+        }));
+    }
+    parse_final_output(settings, &final_text)
 }
 
 fn select_fork_history(target_history: Vec<Value>, fork_history: Vec<Value>) -> Vec<Value> {
@@ -2243,6 +2282,10 @@ fn extract_encrypted_reasoning(raw: &Value) -> Option<String> {
 
 fn parse_final_output(settings: &AgentSettings, text: &str) -> Result<Value> {
     match settings.output_mode {
+        OutputMode::ToolManaged => {
+            let _ = text;
+            bail!("tool-managed roles must finalize through a terminal tool")
+        }
         OutputMode::ResearchArtifact => {
             let value = parse_json_object_artifact(text)?;
             let value = normalize_research_artifact_value(value, &settings.tickers)
@@ -3256,7 +3299,7 @@ mod tests {
     use super::{
         agent_loop, is_permanent_llm_error_text, is_transient_llm_error, llm_judge::JudgeConfig,
         tools, AgentSettings, LlmRoute, LlmTransport, OutputMode, RoleLlmSettings,
-        TruncationConfig,
+        ToolManagedProfile, TruncationConfig,
     };
     use crate::web_search::{WebSearchConfig, WebSearchMode};
     use anyhow::anyhow;
@@ -3317,6 +3360,7 @@ mod tests {
             debug_round: None,
             tickers: vec!["TQQQ".to_string()],
             output_mode: OutputMode::ResearchArtifact,
+            tool_managed_profile: None,
             llm: RoleLlmSettings {
                 route,
                 model: "gpt-5.4".to_string(),
@@ -3343,6 +3387,80 @@ mod tests {
             debug: false,
             retrieval_policy: agent_loop::RetrievalPolicy::default(),
         }
+    }
+
+    #[test]
+    fn tool_managed_output_requires_a_profile_and_legacy_modes_reject_one() {
+        let mut settings = base_settings(LlmRoute::Responses);
+        settings.output_mode = OutputMode::ToolManaged;
+        assert!(settings.validate_output_mode().is_err());
+
+        settings.tool_managed_profile = Some(ToolManagedProfile::ResearchDecision);
+        assert!(settings.validate_output_mode().is_ok());
+
+        settings.output_mode = OutputMode::JsonArtifact;
+        assert!(settings.validate_output_mode().is_err());
+    }
+
+    #[test]
+    fn tool_managed_completion_needs_no_assistant_message() {
+        let mut settings = base_settings(LlmRoute::Responses);
+        settings.output_mode = OutputMode::ToolManaged;
+        settings.tool_managed_profile = Some(ToolManagedProfile::ResearchDecision);
+        let mut turn =
+            agent_loop::Turn::new("turn-1", "session-1", "run-1", "manager.research", "");
+        turn.terminal_tool_result = Some(agent_loop::ToolResultItem {
+            call_id: "finalize-1".to_string(),
+            name: "finalize_research_decision".to_string(),
+            status: "completed".to_string(),
+            output: json!({"terminal": true, "artifact": {"source": "terminal"}}),
+            error: None,
+        });
+
+        assert_eq!(
+            super::completed_turn_artifact(&settings, &turn, false).unwrap(),
+            json!({"source": "terminal"})
+        );
+    }
+
+    #[test]
+    fn tool_managed_completion_ignores_assistant_text() {
+        let mut settings = base_settings(LlmRoute::Responses);
+        settings.output_mode = OutputMode::ToolManaged;
+        settings.tool_managed_profile = Some(ToolManagedProfile::ResearchDecision);
+        let mut turn =
+            agent_loop::Turn::new("turn-1", "session-1", "run-1", "manager.research", "");
+        turn.emitted_items.push(agent_loop::TurnItem::assistant(
+            "this prose is deliberately not JSON",
+            Value::Null,
+        ));
+        turn.terminal_tool_result = Some(agent_loop::ToolResultItem {
+            call_id: "finalize-1".to_string(),
+            name: "finalize_research_decision".to_string(),
+            status: "completed".to_string(),
+            output: json!({"terminal": true, "artifact": {"source": "terminal"}}),
+            error: None,
+        });
+
+        assert_eq!(
+            super::completed_turn_artifact(&settings, &turn, false).unwrap(),
+            json!({"source": "terminal"})
+        );
+    }
+
+    #[test]
+    fn legacy_json_artifact_still_reads_the_final_assistant_message() {
+        let mut settings = base_settings(LlmRoute::Responses);
+        settings.role = "custom.legacy".to_string();
+        settings.output_mode = OutputMode::JsonArtifact;
+        let mut turn = agent_loop::Turn::new("turn-1", "session-1", "run-1", "custom.legacy", "");
+        let prose = "Completed market assessment with no machine-readable artifact. ".repeat(4);
+        turn.emitted_items
+            .push(agent_loop::TurnItem::assistant(prose.clone(), Value::Null));
+
+        let artifact = super::completed_turn_artifact(&settings, &turn, false).unwrap();
+        assert_eq!(artifact["status"], "degraded");
+        assert_eq!(artifact["report"], prose);
     }
 
     #[test]

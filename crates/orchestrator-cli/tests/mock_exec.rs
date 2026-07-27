@@ -8,6 +8,7 @@ async fn mock_exec_writes_state_and_final_summary() {
     let config_path = write_test_config(temp.path());
     let run_dir = temp.path().join("run");
     let db_path = temp.path().join("orchestrator.sqlite");
+    let store_root = temp.path().join("unused-file-store");
     let result = exec::run(ExecArgs {
         date: Some("2026-06-15".to_string()),
         lang: "zh".to_string(),
@@ -15,6 +16,7 @@ async fn mock_exec_writes_state_and_final_summary() {
         window_days: None,
         db_path: Some(db_path.clone()),
         run_dir: Some(run_dir.clone()),
+        store_root: Some(store_root.clone()),
         config: Some(config_path),
         model: Some("gpt-5.4".to_string()),
         reasoning_effort: Some("low".to_string()),
@@ -30,6 +32,10 @@ async fn mock_exec_writes_state_and_final_summary() {
     .await
     .unwrap();
     assert_eq!(result["long_probability"], 0.5);
+    assert!(
+        !store_root.exists(),
+        "a Legacy-only run must not initialize FileStore"
+    );
 
     let state = &result["run_state"];
     assert_eq!(
@@ -800,6 +806,7 @@ fn test_args(
         window_days: None,
         db_path,
         run_dir,
+        store_root: None,
         config,
         model: Some("gpt-5.4".to_string()),
         reasoning_effort: Some("low".to_string()),

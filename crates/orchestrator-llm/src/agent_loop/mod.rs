@@ -124,6 +124,9 @@ pub struct AgentLoopConfig {
     pub model: String,
     pub topic_id: Option<String>,
     pub retrieval_policy: RetrievalPolicy,
+    /// Tool-managed roles must finish through a successful terminal tool,
+    /// rather than an assistant-message artifact.
+    pub require_terminal_tool: bool,
 }
 
 impl Default for AgentLoopConfig {
@@ -145,6 +148,7 @@ impl Default for AgentLoopConfig {
             model: String::new(),
             topic_id: None,
             retrieval_policy: RetrievalPolicy::default(),
+            require_terminal_tool: false,
         }
     }
 }
@@ -316,12 +320,9 @@ where
         if !turn.pending_tool_calls.is_empty() {
             let calls = std::mem::take(&mut turn.pending_tool_calls);
 
-            // Emit "running" status for all tools (sequentially, fast)
-            for call in &calls {
-                emit_tool_call_status(turn, sink, call, AgentItemStatus::Running).await?;
-            }
-
-            // Execute all tools concurrently
+            // Tool calls are intentionally sequential. A later write in the
+            // same model response may cite evidence returned by an earlier
+            // read, and a terminal tool must stop subsequent calls.
             let debug_metrics = config.debug;
             let debug_root = config.project_root.clone();
             let debug_role = turn.role.clone();
@@ -330,92 +331,118 @@ where
             let debug_loop = loop_index;
             let visible_summary_ids = visible_summary_ids_from_history(turn);
             let tool_batch_started = Instant::now();
-            let futures: Vec<_> = calls
-                .into_iter()
-                .map(|call| async {
-                    let call_id = call.call_id.clone();
-                    let name = call.name.clone();
-                    if name == tools::READ_PHASE_SUMMARY_DETAILS_TOOL_NAME {
-                        let summary_id = call
-                            .arguments
-                            .get("summary_id")
-                            .and_then(Value::as_str)
-                            .unwrap_or("");
-                        if !visible_summary_ids.contains(summary_id) {
-                            return (
-                                ToolResultItem {
-                                    call_id: call.call_id,
-                                    name,
-                                    status: "error".to_string(),
-                                    output: json!({
-                                        "status": "not_visible",
-                                        "item_count": 0,
-                                        "items": [],
-                                        "source_policy": "list_before_detail_required"
-                                    }),
-                                    error: Some(
-                                        "summary is not visible in a prior read_phase_summaries result"
-                                            .to_string(),
-                                    ),
-                                },
-                                call_id,
-                                tools::READ_PHASE_SUMMARY_DETAILS_TOOL_NAME.to_string(),
-                            );
+            let mut terminal_completed = false;
+            let mut calls = calls.into_iter();
+            while let Some(call) = calls.next() {
+                emit_tool_call_status(turn, sink, &call, AgentItemStatus::Running).await?;
+                let call_id = call.call_id.clone();
+                let name = call.name.clone();
+                let tool_started = Instant::now();
+                let result = if name == tools::READ_PHASE_SUMMARY_DETAILS_TOOL_NAME {
+                    let summary_id = call
+                        .arguments
+                        .get("summary_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    if !visible_summary_ids.contains(summary_id) {
+                        ToolResultItem {
+                            call_id: call.call_id,
+                            name,
+                            status: "error".to_string(),
+                            output: json!({
+                                "status": "not_visible",
+                                "item_count": 0,
+                                "items": [],
+                                "source_policy": "list_before_detail_required"
+                            }),
+                            error: Some(
+                                "summary is not visible in a prior read_phase_summaries result"
+                                    .to_string(),
+                            ),
                         }
+                    } else {
+                        debug!(
+                            call_id = call_id,
+                            tool = name,
+                            "agent loop tool call starting"
+                        );
+                        tools.execute(call).await
                     }
+                } else {
                     debug!(
                         call_id = call_id,
                         tool = name,
                         "agent loop tool call starting"
                     );
-                    let tool_started = Instant::now();
-                    let result = tools.execute(call).await;
-                    let tool_elapsed_ms = tool_started.elapsed().as_millis();
-                    if debug_metrics {
-                        if let Some(root) = debug_root.as_ref() {
-                            crate::debug_log_time(
-                                root,
-                                json!({
-                                    "kind": "tool",
-                                    "name": result.name,
-                                    "role": debug_role,
-                                    "phase": debug_phase,
-                                    "topic_id": debug_topic,
-                                    "loop_index": debug_loop,
-                                    "call_id": result.call_id,
-                                    "status": result.status,
-                                    "elapsed_ms": tool_elapsed_ms,
-                                    "llm_ms": 0,
-                                    "tool_ms": tool_elapsed_ms,
-                                    "wait_ms": 0,
-                                }),
-                            );
-                        }
+                    tools.execute(call).await
+                };
+                let tool_elapsed_ms = tool_started.elapsed().as_millis();
+                if debug_metrics {
+                    if let Some(root) = debug_root.as_ref() {
+                        crate::debug_log_time(
+                            root,
+                            json!({
+                                "kind": "tool",
+                                "name": result.name,
+                                "role": debug_role,
+                                "phase": debug_phase,
+                                "topic_id": debug_topic,
+                                "loop_index": debug_loop,
+                                "call_id": result.call_id,
+                                "status": result.status,
+                                "elapsed_ms": tool_elapsed_ms,
+                                "llm_ms": 0,
+                                "tool_ms": tool_elapsed_ms,
+                                "wait_ms": 0,
+                            }),
+                        );
                     }
-                    debug!(
-                        call_id = result.call_id,
-                        tool = result.name,
-                        status = result.status,
-                        error = result.error,
-                        elapsed_ms = tool_elapsed_ms,
-                        "agent loop tool call completed"
-                    );
-                    (result, call_id, name)
-                })
-                .collect();
-
-            let results = futures::future::join_all(futures).await;
-            // Concurrent tools share wall time; charge the batch duration once.
-            let tool_batch_ms = tool_batch_started.elapsed().as_millis();
-            aggregate_result.tool_ms = aggregate_result.tool_ms.saturating_add(tool_batch_ms);
-            // Emit results and append to DB (sequentially, in completion order)
-            for (result, _call_id, _name) in results {
+                }
+                debug!(
+                    call_id = result.call_id,
+                    tool = result.name,
+                    status = result.status,
+                    error = result.error,
+                    elapsed_ms = tool_elapsed_ms,
+                    "agent loop tool call completed"
+                );
                 emit_tool_result(turn, sink, &result).await?;
                 turn.emitted_items
                     .push(TurnItem::tool_result(&result, &config.truncation));
+                if is_terminal_tool_result(&result) {
+                    turn.terminal_tool_result = Some(result);
+                    terminal_completed = true;
+                    for ignored in calls {
+                        let ignored_result = ToolResultItem {
+                            call_id: ignored.call_id,
+                            name: ignored.name,
+                            status: "ignored".to_string(),
+                            output: json!({
+                                "status": "ignored_after_terminal",
+                                "item_count": 0,
+                                "items": []
+                            }),
+                            error: Some(
+                                "tool call was ignored because a prior terminal finalize succeeded"
+                                    .to_string(),
+                            ),
+                        };
+                        emit_tool_result(turn, sink, &ignored_result).await?;
+                        turn.emitted_items
+                            .push(TurnItem::tool_result(&ignored_result, &config.truncation));
+                    }
+                    break;
+                }
             }
+            let tool_batch_ms = tool_batch_started.elapsed().as_millis();
+            aggregate_result.tool_ms = aggregate_result.tool_ms.saturating_add(tool_batch_ms);
             persist_turn(conn, turn, &config.truncation)?;
-            if loop_index >= 3 {
+            if terminal_completed {
+                turn.end_reason = Some("terminal_tool".to_string());
+                persist_turn(conn, turn, &config.truncation)?;
+                return Ok(aggregate_result);
+            }
+            if loop_index >= 3 && !config.require_terminal_tool {
                 turn.tools_disabled = true;
                 turn.push_pending_input(FINALIZE_INSTRUCTION);
             }
@@ -428,6 +455,19 @@ where
             turn.needs_follow_up = true;
             persist_turn(conn, turn, &config.truncation)?;
             continue;
+        }
+
+        if config.require_terminal_tool {
+            if !retrieval_retry_queued {
+                retrieval_retry_queued = true;
+                turn.push_pending_input(
+                    "No terminal finalize tool succeeded. Use the assigned finalize tool now; do not provide a prose answer.",
+                );
+                turn.needs_follow_up = true;
+                persist_turn(conn, turn, &config.truncation)?;
+                continue;
+            }
+            bail!("tool-managed agent ended without a successful terminal finalize tool");
         }
 
         if turn.needs_follow_up {
@@ -1751,6 +1791,17 @@ fn last_assistant_message_text(turn: &Turn) -> Option<String> {
                 item.content_json.to_string()
             }
         })
+}
+
+/// A terminal tool result is a Rust-owned completion signal. ToolManaged
+/// profiles never infer completion from assistant prose.
+pub fn is_terminal_tool_result(result: &ToolResultItem) -> bool {
+    result.status == "completed"
+        && result
+            .output
+            .get("terminal")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
 }
 
 fn seed_packet_role(role: &str) -> bool {
@@ -4641,6 +4692,191 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM agent_events", [], |row| row.get(0))
             .unwrap();
         assert!(count >= 1);
+    }
+
+    #[tokio::test]
+    async fn tool_managed_terminal_stops_later_calls_in_the_same_response() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+        let mut model = FakeModel::new(vec![ModelResponse {
+            assistant_message: Some("I will finalize through tools.".to_string()),
+            reasoning_summary: None,
+            tool_calls: vec![
+                ToolCallRequest {
+                    call_id: "read-1".to_string(),
+                    name: "read".to_string(),
+                    arguments: Value::Null,
+                },
+                ToolCallRequest {
+                    call_id: "finalize-1".to_string(),
+                    name: "finalize".to_string(),
+                    arguments: Value::Null,
+                },
+                ToolCallRequest {
+                    call_id: "after-1".to_string(),
+                    name: "after".to_string(),
+                    arguments: Value::Null,
+                },
+            ],
+            end_turn: false,
+            raw: json!({"step": 1}),
+            turn_status: TurnStatus::Unknown,
+        }]);
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut tools = StaticToolRuntime::new();
+        for (name, terminal) in [("read", false), ("finalize", true), ("after", false)] {
+            let calls = std::sync::Arc::clone(&calls);
+            tools.add_tool(name, move |_| {
+                calls.lock().unwrap().push(name.to_string());
+                ToolResultItem {
+                    call_id: format!("{name}-result"),
+                    name: name.to_string(),
+                    status: "completed".to_string(),
+                    output: json!({"terminal": terminal, "artifact": {"id": "artifact-1"}}),
+                    error: None,
+                }
+            });
+        }
+        let mut turn = Turn::new("turn-1", "session-1", "run-1", "loop.test", "start");
+        let config = AgentLoopConfig {
+            require_terminal_tool: true,
+            ..AgentLoopConfig::default()
+        };
+
+        run_turn(&conn, &mut turn, &mut model, &mut tools, config)
+            .await
+            .unwrap();
+
+        assert_eq!(*calls.lock().unwrap(), vec!["read", "finalize"]);
+        assert_eq!(turn.end_reason.as_deref(), Some("terminal_tool"));
+        assert_eq!(
+            turn.terminal_tool_result
+                .as_ref()
+                .and_then(|result| result.output.get("artifact"))
+                .and_then(|artifact| artifact.get("id"))
+                .and_then(Value::as_str),
+            Some("artifact-1")
+        );
+        assert!(turn.emitted_items.iter().any(|item| {
+            item.tool_call_id == "after-1"
+                && item.item_type == TurnItemType::ToolResult
+                && item
+                    .content_json
+                    .pointer("/result/output/status")
+                    .and_then(Value::as_str)
+                    == Some("ignored_after_terminal")
+        }));
+    }
+
+    #[tokio::test]
+    async fn tool_managed_prose_end_gets_one_repair_then_terminal_succeeds() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+        let mut model = FakeModel::new(vec![
+            model_response(Some("This prose does not finalize the draft."), true),
+            ModelResponse {
+                assistant_message: None,
+                reasoning_summary: None,
+                tool_calls: vec![ToolCallRequest {
+                    call_id: "finalize-1".to_string(),
+                    name: "finalize".to_string(),
+                    arguments: Value::Null,
+                }],
+                end_turn: false,
+                raw: json!({"step": 2}),
+                turn_status: TurnStatus::Unknown,
+            },
+        ]);
+        let mut tools = StaticToolRuntime::new();
+        tools.add_tool("finalize", |_| ToolResultItem {
+            call_id: "finalize-1".to_string(),
+            name: "finalize".to_string(),
+            status: "completed".to_string(),
+            output: json!({"terminal": true, "artifact": {"id": "artifact-1"}}),
+            error: None,
+        });
+        let mut turn = Turn::new("turn-1", "session-1", "run-1", "loop.test", "start");
+
+        run_turn(
+            &conn,
+            &mut turn,
+            &mut model,
+            &mut tools,
+            AgentLoopConfig {
+                require_terminal_tool: true,
+                ..AgentLoopConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(model.seen_inputs.len(), 2);
+        assert_eq!(
+            turn.emitted_items
+                .iter()
+                .filter(|item| {
+                    item.item_type == TurnItemType::UserMessage
+                        && item
+                            .content_text
+                            .contains("No terminal finalize tool succeeded")
+                })
+                .count(),
+            1
+        );
+        assert_eq!(turn.end_reason.as_deref(), Some("terminal_tool"));
+        assert_eq!(
+            turn.terminal_tool_result
+                .as_ref()
+                .and_then(|result| result.output.get("artifact"))
+                .and_then(|artifact| artifact.get("id"))
+                .and_then(Value::as_str),
+            Some("artifact-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_managed_second_prose_end_fails_after_one_repair() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+        let mut model = FakeModel::new(vec![
+            model_response(Some("This prose does not finalize the draft."), true),
+            model_response(
+                Some("This second prose response still does not finalize."),
+                true,
+            ),
+        ]);
+        let mut tools = StaticToolRuntime::new();
+        let mut turn = Turn::new("turn-1", "session-1", "run-1", "loop.test", "start");
+
+        let error = run_turn(
+            &conn,
+            &mut turn,
+            &mut model,
+            &mut tools,
+            AgentLoopConfig {
+                require_terminal_tool: true,
+                ..AgentLoopConfig::default()
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("tool-managed agent ended without a successful terminal finalize tool"));
+        assert_eq!(model.seen_inputs.len(), 2);
+        assert_eq!(
+            turn.emitted_items
+                .iter()
+                .filter(|item| {
+                    item.item_type == TurnItemType::UserMessage
+                        && item
+                            .content_text
+                            .contains("No terminal finalize tool succeeded")
+                })
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
