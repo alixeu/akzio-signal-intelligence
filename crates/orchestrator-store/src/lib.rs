@@ -88,8 +88,9 @@ pub use learning::{
     LearningRecord, LEARNING_RECORD_SCHEMA_VERSION,
 };
 pub use manifest::{
-    find_run_location, read_run_manifest, write_run_manifest, FinalizedArtifactRef, ManifestError,
-    PhaseStatus, RunLocation, RunManifest, RunManifestInit, RunStatus, RUN_MANIFEST_SCHEMA_VERSION,
+    find_run_location, list_run_locations, read_run_manifest, write_run_manifest,
+    FinalizedArtifactRef, ManifestError, PhaseStatus, RunLocation, RunManifest, RunManifestInit,
+    RunStatus, RUN_MANIFEST_SCHEMA_VERSION,
 };
 pub use paths::{validate_relative_path, SafeSlug};
 pub use phase2::{

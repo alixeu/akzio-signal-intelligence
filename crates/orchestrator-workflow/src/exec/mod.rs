@@ -5,9 +5,9 @@ use orchestrator_core::{
     project_path,
 };
 use orchestrator_store::{
-    content_hash, read_run_manifest, write_learning_record, write_run_manifest, FileStore,
-    FileStoreOptions, LearningKind, LearningRecord, RunLocation, RunManifest, RunManifestInit,
-    RunStatus,
+    content_hash, list_run_locations, read_indexes, read_learning_record, read_run_manifest,
+    write_learning_record, write_run_manifest, FileStore, FileStoreOptions, IndexKind, IndexQuery,
+    LearningKind, LearningRecord, RunLocation, RunManifest, RunManifestInit, RunStatus,
 };
 use serde_json::{json, Value};
 use std::{path::Path, time::Duration};
@@ -84,7 +84,15 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
     let mut state = load_or_initialize_state(&store, &location, initial_state)?;
 
     if args.from_phase <= 0 && args.to_phase >= 0 && !phase_completed(&manifest, 0) {
-        run_phase0(&mut state, &runtime)?;
+        run_phase0(
+            &store,
+            &location,
+            &mut state,
+            &runtime,
+            args.model.as_deref(),
+            args.reasoning_effort.as_deref(),
+        )
+        .await?;
         finish_phase(&store, &location, &mut manifest, &mut state, 0, "done")?;
     }
     if args.from_phase <= 1 && args.to_phase >= 1 && !phase_completed(&manifest, 1) {
@@ -406,13 +414,140 @@ async fn summarize(
     Ok(())
 }
 
-fn run_phase0(state: &mut Value, runtime: &RuntimeConfig) -> Result<()> {
+async fn run_phase0(
+    store: &FileStore,
+    location: &RunLocation,
+    state: &mut Value,
+    runtime: &RuntimeConfig,
+    model: Option<&str>,
+    reasoning: Option<&str>,
+) -> Result<()> {
     inject_phase_summary_reflection(state, runtime)?;
+    let tasks = reflection_tasks(store, location, state, runtime.reflection.task_limit)?;
+    let planned_tasks = tasks.clone();
+    let mut completed = Vec::new();
+    for task in tasks {
+        if state["mock"].as_bool().unwrap_or(false) {
+            completed.push(json!({
+                "status": "skipped_mock",
+                "ticker": task.get("ticker"),
+                "source_run_id": task.get("source_run_id"),
+            }));
+            continue;
+        }
+        state["reflection_task"] = task.clone();
+        state["phase0"]["tasks"] = json!([task]);
+        let artifact = run_unit(
+            state,
+            runtime,
+            "reflector.historical",
+            0,
+            "historical_reflection",
+            None,
+            None,
+            task.get("ticker").and_then(Value::as_str),
+            model,
+            reasoning,
+        )
+        .await?;
+        let ticker = task["ticker"]
+            .as_str()
+            .expect("planned reflection ticker")
+            .to_owned();
+        let source_run_id = task["source_run_id"]
+            .as_str()
+            .expect("planned reflection source run")
+            .to_owned();
+        write_learning_record(
+            store,
+            location,
+            LearningKind::Reflection,
+            LearningRecord {
+                schema_version: orchestrator_store::LEARNING_RECORD_SCHEMA_VERSION,
+                kind: LearningKind::Reflection,
+                run_id: location.run_id.clone(),
+                ticker,
+                source_run_id: Some(source_run_id),
+                payload: json!({"experience_index": artifact}),
+                created_at: Utc::now().to_rfc3339(),
+                content_hash: String::new(),
+            },
+        )?;
+        completed.push(artifact);
+    }
     state["phase0"] = json!({
         "status": "completed",
-        "reflection": "no eligible historical task was planned for this run",
+        "tasks": planned_tasks,
+        "reflections": completed,
     });
+    state
+        .as_object_mut()
+        .map(|object| object.remove("reflection_task"));
     Ok(())
+}
+
+fn reflection_tasks(
+    store: &FileStore,
+    current: &RunLocation,
+    state: &Value,
+    limit: usize,
+) -> Result<Vec<Value>> {
+    let mut tasks = Vec::new();
+    for location in list_run_locations(store)? {
+        if location == *current {
+            continue;
+        }
+        for ticker in tickers_from_state(state) {
+            let Ok(outcome) =
+                read_learning_record(store, &location, LearningKind::Outcome, &ticker)
+            else {
+                continue;
+            };
+            let source_run_id = outcome
+                .source_run_id
+                .clone()
+                .unwrap_or_else(|| location.run_id.clone());
+            if source_run_id == current.run_id {
+                continue;
+            }
+            let source = orchestrator_store::find_run_location(store, &source_run_id)?;
+            if source.is_none() {
+                continue;
+            }
+            let source_location = source.expect("checked Some");
+            if read_indexes(
+                store,
+                Some(&source_location),
+                &IndexQuery {
+                    kind: Some(IndexKind::PhaseSummary),
+                    ticker: Some(ticker.clone()),
+                    limit: 1,
+                    ..Default::default()
+                },
+            )?
+            .indexes
+            .is_empty()
+            {
+                continue;
+            }
+            let decision =
+                read_learning_record(store, &source_location, LearningKind::Decision, &ticker)
+                    .ok()
+                    .map(|record| record.payload)
+                    .unwrap_or_else(|| json!({"status":"unavailable"}));
+            tasks.push(json!({
+                "task_id": tasks.len() as i64 + 1,
+                "ticker": ticker,
+                "source_run_id": source_run_id,
+                "outcome": outcome.payload,
+                "decision": decision,
+            }));
+            if tasks.len() >= limit.max(1) {
+                return Ok(tasks);
+            }
+        }
+    }
+    Ok(tasks)
 }
 
 async fn run_phase1(

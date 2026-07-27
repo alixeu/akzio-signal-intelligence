@@ -416,6 +416,74 @@ pub fn find_run_location(store: &FileStore, run_id: &str) -> Result<Option<RunLo
     Ok(found)
 }
 
+/// Return every valid FileStore run location in deterministic chronological
+/// order. Callers still read each manifest/record explicitly; this is only a
+/// safe discovery primitive for Rust-owned recovery and reflection planning.
+pub fn list_run_locations(store: &FileStore) -> Result<Vec<RunLocation>> {
+    let runs = store.root().join("runs");
+    if !runs.exists() {
+        return Ok(Vec::new());
+    }
+    let mut locations = Vec::new();
+    for date in std::fs::read_dir(&runs).map_err(|source| StoreError::Io {
+        path: runs.clone(),
+        source,
+    })? {
+        let date = date.map_err(|source| StoreError::Io {
+            path: runs.clone(),
+            source,
+        })?;
+        let date_path = date.path();
+        let metadata = std::fs::symlink_metadata(&date_path).map_err(|source| StoreError::Io {
+            path: date_path.clone(),
+            source,
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(StoreError::SymlinkPath { path: date_path });
+        }
+        if !metadata.is_dir() || !is_workflow_date(&date.file_name().to_string_lossy()) {
+            continue;
+        }
+        for entry in std::fs::read_dir(&date_path).map_err(|source| StoreError::Io {
+            path: date_path.clone(),
+            source,
+        })? {
+            let entry = entry.map_err(|source| StoreError::Io {
+                path: date_path.clone(),
+                source,
+            })?;
+            let path = entry.path();
+            let metadata = std::fs::symlink_metadata(&path).map_err(|source| StoreError::Io {
+                path: path.clone(),
+                source,
+            })?;
+            if metadata.file_type().is_symlink() {
+                return Err(StoreError::SymlinkPath { path });
+            }
+            if !metadata.is_dir() {
+                continue;
+            }
+            let relative = PathBuf::from("runs")
+                .join(date.file_name())
+                .join(entry.file_name())
+                .join("manifest.json");
+            if !store.exists(&relative)? {
+                continue;
+            }
+            let manifest: RunManifest =
+                store.read_versioned_json(&relative, FileSchemaKind::RunManifest)?;
+            locations.push(RunLocation::new(manifest.current_date, manifest.run_id)?);
+        }
+    }
+    locations.sort_by(|left, right| {
+        left.current_date
+            .cmp(&right.current_date)
+            .then(left.run_id.cmp(&right.run_id))
+    });
+    locations.dedup();
+    Ok(locations)
+}
+
 fn is_workflow_date(value: &str) -> bool {
     value.len() == 10
         && value.as_bytes()[4] == b'-'
