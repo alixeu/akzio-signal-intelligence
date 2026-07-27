@@ -47,12 +47,6 @@ pub const VALID_PLACEHOLDERS: &[&str] = &[
     "analysis_trace_contract",
     "experience_contract",
     "leveraged_etf_rules",
-    "analyst_artifact_schema",
-    "research_artifact_schema",
-    "trade_intent_schema",
-    "risk_constraints_schema",
-    "final_validation_schema",
-    "portfolio_allocation_schema",
     "side",
     "side_label",
     "side_strategy",
@@ -87,16 +81,6 @@ pub const VALID_PLACEHOLDERS: &[&str] = &[
     "risk_analyst_body",
 ];
 
-/// Schema placeholders backed by a schema function in `orchestrator-core::artifact`.
-pub const SCHEMA_PLACEHOLDERS: &[&str] = &[
-    "analyst_artifact_schema",
-    "research_artifact_schema",
-    "trade_intent_schema",
-    "risk_constraints_schema",
-    "final_validation_schema",
-    "portfolio_allocation_schema",
-];
-
 /// Shared component files under `prompts/common/`.
 #[allow(dead_code)]
 pub const COMMON_COMPONENTS: &[&str] = &[
@@ -124,7 +108,6 @@ pub fn run_all_checks(prompts_dir: &Path) -> Result<LintReport> {
         if !is_runtime_prompt(path, prompts_dir) {
             checks::check_placeholder_completeness(path, content, &component_registry, &mut issues);
         }
-        checks::check_schema_references(path, content, &mut issues);
         checks::check_common_components(
             path,
             content,

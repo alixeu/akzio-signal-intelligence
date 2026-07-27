@@ -1,6 +1,6 @@
 //! Individual lint checks for prompt template files.
 
-use super::{LintIssue, SCHEMA_PLACEHOLDERS, VALID_PLACEHOLDERS};
+use super::{LintIssue, VALID_PLACEHOLDERS};
 use anyhow::{Context, Result};
 use orchestrator_core::ComponentRegistry;
 use serde_json::{json, Value};
@@ -54,28 +54,7 @@ pub fn check_placeholder_completeness(
     }
 }
 
-/// Check 2: `{..._schema}` placeholders reference known schema functions.
-pub fn check_schema_references(file_path: &Path, content: &str, issues: &mut Vec<LintIssue>) {
-    let re = placeholder_regex();
-    for (line_num, line) in content.lines().enumerate() {
-        for cap in re.captures_iter(line) {
-            let placeholder = cap.get(1).unwrap().as_str();
-            if placeholder.ends_with("_schema") && !SCHEMA_PLACEHOLDERS.contains(&placeholder) {
-                issues.push(LintIssue {
-                    file: file_path.display().to_string(),
-                    line: Some(line_num + 1),
-                    severity: "error".to_string(),
-                    check: "schema_reference".to_string(),
-                    message: format!(
-                        "Placeholder {{{placeholder}}} resembles a schema reference but is not a known schema function"
-                    ),
-                });
-            }
-        }
-    }
-}
-
-/// Check 3: common component includes resolve to existing files.
+/// Check 2: common component includes resolve to existing files.
 pub fn check_common_components(
     file_path: &Path,
     content: &str,

@@ -1,8 +1,5 @@
 use anyhow::{bail, Context, Result};
-use orchestrator_core::{
-    analyst_artifact_schema, final_validation_schema, portfolio_allocation_schema, render_template,
-    research_artifact_schema, risk_constraints_schema, trade_intent_schema, ComponentPlugin,
-};
+use orchestrator_core::{render_template, ComponentPlugin};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -113,7 +110,6 @@ fn referenced_components<'a>(
             }
             selected.push(*plugin);
             placeholders.extend(plugin.manifest.required_variables.iter().cloned());
-            placeholders.extend(plugin.manifest.schema_dependencies.iter().cloned());
             add_template_placeholders(placeholders, &plugin.template);
             changed = true;
         }
@@ -166,17 +162,22 @@ fn contains_leveraged_etf(tickers: &[String]) -> bool {
 
 fn retrieval_bootstrap(state: &Value, current_phase: i64) -> Value {
     let mut counts = serde_json::Map::new();
-    let mut roles = std::collections::BTreeSet::new();
     let mut total = 0usize;
-    if let Some(raw) = state.get("phase_summary_memory") {
-        let index = orchestrator_sql::PhaseSummaryMemoryIndex::from_state_value(raw);
-        for (phase, batch) in index.phases {
+    if let Some(completed) = state.get("phase_compress").and_then(Value::as_object) {
+        for (phase, summary) in completed {
+            let Ok(phase) = phase.parse::<i64>() else {
+                continue;
+            };
             if phase >= current_phase {
                 continue;
             }
-            counts.insert(phase.to_string(), json!(batch.summaries.len()));
-            total += batch.summaries.len();
-            roles.extend(batch.summaries.into_iter().map(|summary| summary.role));
+            let count = summary
+                .get("index_ids")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or_default();
+            counts.insert(phase.to_string(), json!(count));
+            total += count;
         }
     }
     let conflict_count = state
@@ -198,10 +199,10 @@ fn retrieval_bootstrap(state: &Value, current_phase: i64) -> Value {
         "status": if total == 0 { "empty" } else { "available" },
         "item_count": total,
         "source_phase_counts": counts,
-        "source_roles_present": roles,
+        "source_roles_present": Vec::<String>::new(),
         "phase1_completed": state.get("phase1_index").is_some_and(|value| !value.is_null()),
         "direction_or_evidence_conflict_count": conflict_count,
-        "source": "phase_summary_memory_metadata",
+        "source": "file_store_index_metadata",
         "directly_injected": true,
         "semantic_content_included": false,
         "retrievable_via_tools": true
@@ -464,39 +465,6 @@ pub(crate) fn render_prompt_with_plugins(
     insert_if_referenced(&mut values, &placeholders, "tickers", || {
         Ok(Value::String(tickers.join(",")))
     })?;
-    insert_if_referenced(
-        &mut values,
-        &placeholders,
-        "analyst_artifact_schema",
-        || Ok(Value::String(analyst_artifact_schema())),
-    )?;
-    insert_if_referenced(
-        &mut values,
-        &placeholders,
-        "research_artifact_schema",
-        || Ok(Value::String(research_artifact_schema())),
-    )?;
-    insert_if_referenced(&mut values, &placeholders, "trade_intent_schema", || {
-        Ok(Value::String(trade_intent_schema()))
-    })?;
-    insert_if_referenced(
-        &mut values,
-        &placeholders,
-        "risk_constraints_schema",
-        || Ok(Value::String(risk_constraints_schema())),
-    )?;
-    insert_if_referenced(
-        &mut values,
-        &placeholders,
-        "final_validation_schema",
-        || Ok(Value::String(final_validation_schema())),
-    )?;
-    insert_if_referenced(
-        &mut values,
-        &placeholders,
-        "portfolio_allocation_schema",
-        || Ok(Value::String(portfolio_allocation_schema())),
-    )?;
     insert_if_referenced(&mut values, &placeholders, "role", || {
         Ok(Value::String(role.to_string()))
     })?;
@@ -977,39 +945,6 @@ required_variables = ["ticker", "tickers"]
     }
 
     #[test]
-    fn schema_placeholder_resolves_inside_component() {
-        let temp = TempDir::new().unwrap();
-        let prompts = temp.path().join("prompts");
-        std::fs::create_dir_all(prompts.join("common")).unwrap();
-        std::fs::create_dir_all(prompts.join("phase1")).unwrap();
-        std::fs::write(
-            prompts.join("common/analyst_output_contract.md"),
-            "schema:\n{analyst_artifact_schema}",
-        )
-        .unwrap();
-        let prompt_path = prompts.join("phase1/technical.md");
-        std::fs::write(&prompt_path, "{analyst_output_contract}").unwrap();
-        let state = json!({"ticker": "QQQ", "tickers": ["QQQ"]});
-
-        let prompt = render_prompt(
-            &state,
-            "analyst.technical",
-            1,
-            "analysis",
-            None,
-            None,
-            Some(&prompt_path),
-            None,
-        )
-        .unwrap();
-
-        // The nested schema placeholder must be expanded, not left literal.
-        assert!(!prompt.contains("{analyst_artifact_schema}"));
-        assert!(prompt.contains("direction"));
-        assert!(prompt.contains("confidence"));
-    }
-
-    #[test]
     fn missing_component_expands_to_empty() {
         let temp = TempDir::new().unwrap();
         let prompts = temp.path().join("prompts");
@@ -1226,12 +1161,6 @@ required_variables = ["ticker", "tickers"]
         "{opponent_label}",
         "{side_strategy}",
         "{leveraged_etf_rules}",
-        "{analyst_artifact_schema}",
-        "{research_artifact_schema}",
-        "{trade_intent_schema}",
-        "{risk_constraints_schema}",
-        "{final_validation_schema}",
-        "{portfolio_allocation_schema}",
         "{risk_analyst_body}",
         "{date}",
         "{window_days}",

@@ -78,15 +78,13 @@ impl AgentRegistry {
             if text.is_empty() {
                 continue;
             }
-            // Legacy alias: "news" -> "news_macro"
-            let lookup = if text == "news" { "news_macro" } else { text };
-            let role_id = if self.agents.contains_key(lookup) {
-                lookup.to_string()
-            } else if let Some(id) = self.role_id_from_short(lookup) {
+            let role_id = if self.agents.contains_key(text) {
+                text.to_string()
+            } else if let Some(id) = self.role_id_from_short(text) {
                 id
             } else if text == "fundamental" {
                 return Err(
-                    "standalone fundamental analyst was removed; use news/news_macro".into(),
+                    "standalone fundamental analyst was removed; use analyst.news_macro".into(),
                 );
             } else {
                 return Err(format!("unsupported phase1 agent {text:?}"));
@@ -102,13 +100,7 @@ impl AgentRegistry {
         if let Some(def) = self.get(trimmed) {
             return def.role_id.clone();
         }
-        // Legacy alias: "news" -> "news_macro"
-        let lookup = if trimmed == "news" {
-            "news_macro"
-        } else {
-            trimmed
-        };
-        self.role_id_from_short(lookup)
+        self.role_id_from_short(trimmed)
             .unwrap_or_else(|| trimmed.to_string())
     }
 
@@ -157,4 +149,4 @@ impl AgentRegistry {
     }
 }
 
-pub const DEFAULT_PHASE1_AGENTS: &str = "technical,news";
+pub const DEFAULT_PHASE1_AGENTS: &str = "technical,news_macro";

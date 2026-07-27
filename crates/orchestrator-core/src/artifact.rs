@@ -1,24 +1,16 @@
-use anyhow::{anyhow, Result};
-use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 use thiserror::Error;
 
+/// Canonical Phase 3 decision fields validated by Store finalizers.
+///
+/// This is deliberately not an artifact envelope and has no LLM JSON
+/// normalization path. File metadata and per-ticker aggregation belong to
+/// `orchestrator-store`'s persisted canonical artifact.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ArtifactEnvelope {
-    pub id: String,
-    pub role: String,
-    #[serde(default)]
-    pub report: String,
-    #[serde(default)]
-    pub per_ticker: BTreeMap<String, Value>,
-    #[serde(flatten)]
-    pub extra: Map<String, Value>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
-pub struct ResearchArtifact {
+#[serde(deny_unknown_fields)]
+pub struct ResearchDecision {
     pub rating: String,
     pub long_probability: f64,
     pub short_probability: f64,
@@ -34,19 +26,14 @@ pub struct ResearchArtifact {
     pub plan: String,
     #[serde(default)]
     pub probability_rationale: String,
-    /// Three-scenario analysis: bull, base, bear. Optional for backward
-    /// compatibility with legacy research artifacts.
+    /// Three-scenario analysis: bull, base, bear.
     #[serde(default)]
     pub scenarios: Option<Scenarios>,
-    #[serde(default)]
-    pub per_ticker: BTreeMap<String, Value>,
-    #[serde(flatten)]
-    pub extra: Map<String, Value>,
 }
 
 /// A single scenario (bull, base, or bear) in the research manager's
 /// scenario analysis output.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Scenario {
     /// Probability of this scenario (0.0-1.0). All scenarios must sum to 1.0.
     pub probability: f64,
@@ -62,14 +49,14 @@ pub struct Scenario {
 }
 
 /// Container for the three scenarios.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Scenarios {
     pub bull: Scenario,
     pub base: Scenario,
     pub bear: Scenario,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct TradeIntent {
     pub action: String,
@@ -95,7 +82,7 @@ pub struct TradeIntent {
 }
 
 /// The only stop semantics persisted by Canonical Contract v2.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum StopType {
     Hard,
@@ -104,7 +91,7 @@ pub enum StopType {
 }
 
 /// The only evidence classifications persisted by Canonical Contract v2.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum EvidenceType {
     Fact,
@@ -112,7 +99,7 @@ pub enum EvidenceType {
     Inference,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RiskConstraints {
     pub stance: String,
@@ -156,14 +143,14 @@ pub struct RiskConstraints {
 }
 
 /// A Phase 5 control that is binding on a Phase 6 per-asset decision.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct BindingRiskControl {
     pub control: String,
     pub source_refs: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AssetExecutionConstraint {
     /// increase_only | decrease_only | unchanged
@@ -185,7 +172,7 @@ pub struct AssetExecutionConstraint {
     pub binding_risk_controls: Vec<BindingRiskControl>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FinalValidation {
     pub rating: String,
     /// execute | wait | downgrade
@@ -210,7 +197,7 @@ pub struct FinalValidation {
     pub extra: Map<String, Value>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PortfolioAllocation {
     pub weights: BTreeMap<String, Value>,
     pub total_equity_exposure: f64,
@@ -224,12 +211,8 @@ pub struct PortfolioAllocation {
     pub extra: Map<String, Value>,
 }
 
-/// Per-ticker payload every active analyst (technical / news_macro) must emit.
-/// This is the single source of truth for the analyst
-/// output contract: `prompts/common/analyst_output_contract.md` documents its
-/// behavioral rules, while `analyst_artifact_schema()` and runtime validation
-/// remain the sole source of structural truth.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+/// Per-ticker evidence assessment used by the AnalystReport Store builder.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AnalystTickerArtifact {
     /// bullish | bearish | neutral | mixed | unobserved
     pub direction: String,
@@ -263,14 +246,8 @@ pub struct AnalystTickerArtifact {
 /// Canonical evidence-type tokens accepted by runtime validators and reducers.
 pub const CANONICAL_EVIDENCE_TYPES: &[&str] = &["fact", "opinion", "inference"];
 
-/// Transitional call-site seam retained while the legacy LLM adapter migrates.
-///
-/// Contract v2 has no normalization path: deserialization already rejects
-/// non-canonical evidence. The function intentionally performs no mutation.
-pub fn normalize_analyst_ticker_artifact(_artifact: &mut AnalystTickerArtifact) {}
-
 /// A single piece of evidence with type classification.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct EvidenceItem {
     /// The evidence claim in 1-2 sentences.
@@ -537,43 +514,8 @@ pub fn validate_final_validation(artifact: &FinalValidation) -> std::result::Res
     Ok(())
 }
 
-/// Compact JSON Schema (no `$schema`/metadata noise) for a schemars type,
-/// suitable for injecting into a prompt. Returns a pretty-printed string.
-pub fn schema_for<T: JsonSchema>() -> String {
-    let schema = schemars::schema_for!(T);
-    serde_json::to_string_pretty(&schema).unwrap_or_else(|_| "{}".to_string())
-}
-
-/// Schema string for a single analyst per-ticker payload.
-pub fn analyst_artifact_schema() -> String {
-    schema_for::<AnalystTickerArtifact>()
-}
-
-/// Schema string for the research manager artifact.
-pub fn research_artifact_schema() -> String {
-    schema_for::<ResearchArtifact>()
-}
-
-pub fn trade_intent_schema() -> String {
-    schema_for::<TradeIntent>()
-}
-
-pub fn risk_constraints_schema() -> String {
-    schema_for::<RiskConstraints>()
-}
-
-pub fn final_validation_schema() -> String {
-    schema_for::<FinalValidation>()
-}
-
-pub fn portfolio_allocation_schema() -> String {
-    schema_for::<PortfolioAllocation>()
-}
-
 #[derive(Debug, Error, PartialEq)]
 pub enum ValidationError {
-    #[error("missing per_ticker payload for {0}")]
-    MissingTicker(String),
     #[error("probability field {0} is invalid")]
     InvalidProbability(String),
     #[error("long_probability + short_probability must be approximately 1.0")]
@@ -586,9 +528,7 @@ pub enum ValidationError {
     InvalidConfidenceBasis(String),
     #[error("hold_reason is invalid: {0}")]
     InvalidHoldReason(String),
-    #[error("research ticker {ticker} is invalid: {reason}")]
-    InvalidResearchTicker { ticker: String, reason: String },
-    #[error("research artifact field is invalid: {0}")]
+    #[error("research decision field is invalid: {0}")]
     InvalidResearchField(String),
 }
 
@@ -630,249 +570,8 @@ pub fn research_rating_for_probability(long_probability: f64) -> &'static str {
     }
 }
 
-fn normalize_research_decision_fields(object: &mut Map<String, Value>) {
-    let Some(long_probability) = object
-        .get("long_probability")
-        .and_then(normalize_probability)
-    else {
-        return;
-    };
-    let rating = research_rating_for_probability(long_probability);
-    object.insert("long_probability".to_string(), json!(long_probability));
-    object.insert(
-        "short_probability".to_string(),
-        json!(((1.0 - long_probability) * 10_000.0).round() / 10_000.0),
-    );
-    object.insert("final_probability".to_string(), json!(long_probability));
-    object.insert("rating".to_string(), json!(rating));
-
-    if rating == "Hold" {
-        let confidence_basis = object
-            .get("confidence_basis")
-            .and_then(Value::as_str)
-            .filter(|value| {
-                matches!(
-                    *value,
-                    "evidence_balanced" | "data_insufficient" | "conflicting_evidence"
-                )
-            })
-            .unwrap_or("evidence_balanced");
-        let hold_reason = match confidence_basis {
-            "data_insufficient" => "evidence_insufficient",
-            "conflicting_evidence" => "conflicting_evidence",
-            _ => "evidence_balanced",
-        };
-        object.insert("confidence_basis".to_string(), json!(confidence_basis));
-        object.insert("hold_reason".to_string(), json!(hold_reason));
-    } else {
-        object.remove("hold_reason");
-    }
-}
-
-/// Normalize multi-ticker research envelopes before deserializing into
-/// [`ResearchArtifact`].
-///
-/// Models often emit rating/probabilities only under `per_ticker` (and may
-/// emit `plan` as a string array). Downstream still expects top-level
-/// `rating` / probabilities / confidence basis for single-ticker consumers
-/// such as trader mapping and report builders.
-pub fn normalize_research_artifact_value(mut value: Value, tickers: &[String]) -> Result<Value> {
-    let obj = value
-        .as_object_mut()
-        .ok_or_else(|| anyhow!("research artifact must be a JSON object"))?;
-
-    if let Some(per_ticker) = obj.get_mut("per_ticker").and_then(Value::as_object_mut) {
-        for payload in per_ticker.values_mut() {
-            if let Some(payload) = payload.as_object_mut() {
-                if let Some(plan) = payload.get("plan").cloned() {
-                    if let Some(text) = coerce_plan_to_string(&plan) {
-                        payload.insert("plan".to_string(), Value::String(text));
-                    }
-                }
-                normalize_research_decision_fields(payload);
-            }
-        }
-    }
-
-    if let Some(plan) = obj.get("plan").cloned() {
-        if let Some(text) = coerce_plan_to_string(&plan) {
-            obj.insert("plan".to_string(), Value::String(text));
-        }
-    }
-
-    let needs_rating = obj
-        .get("rating")
-        .and_then(Value::as_str)
-        .is_none_or(|value| value.trim().is_empty());
-    let needs_long = obj
-        .get("long_probability")
-        .and_then(normalize_probability)
-        .is_none();
-    let needs_short = obj
-        .get("short_probability")
-        .and_then(normalize_probability)
-        .is_none();
-    let needs_plan = obj
-        .get("plan")
-        .and_then(Value::as_str)
-        .map(|value| value.trim().is_empty())
-        .unwrap_or(true);
-    let needs_rationale = obj
-        .get("probability_rationale")
-        .and_then(Value::as_str)
-        .map(|value| value.trim().is_empty())
-        .unwrap_or(true);
-    let needs_confidence_basis = obj
-        .get("confidence_basis")
-        .and_then(Value::as_str)
-        .is_none_or(|value| value.trim().is_empty());
-    let needs_hold_reason = obj
-        .get("hold_reason")
-        .and_then(Value::as_str)
-        .is_none_or(|value| value.trim().is_empty());
-
-    if needs_rating
-        || needs_long
-        || needs_short
-        || needs_plan
-        || needs_rationale
-        || needs_confidence_basis
-        || needs_hold_reason
-    {
-        if let Some(primary) = select_primary_research_ticker(obj, tickers) {
-            let payload = obj
-                .get("per_ticker")
-                .and_then(Value::as_object)
-                .and_then(|items| items.get(&primary))
-                .cloned()
-                .unwrap_or(Value::Null);
-
-            if needs_rating {
-                if let Some(rating) = payload
-                    .get("rating")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                {
-                    obj.insert("rating".to_string(), Value::String(rating.to_string()));
-                }
-            }
-            if needs_long {
-                if let Some(probability) = payload
-                    .get("long_probability")
-                    .and_then(normalize_probability)
-                {
-                    obj.insert("long_probability".to_string(), json!(probability));
-                }
-            }
-            if needs_short {
-                if let Some(probability) = payload
-                    .get("short_probability")
-                    .and_then(normalize_probability)
-                {
-                    obj.insert("short_probability".to_string(), json!(probability));
-                }
-            }
-            if needs_plan {
-                if let Some(plan) = payload.get("plan").and_then(coerce_plan_to_string) {
-                    obj.insert("plan".to_string(), Value::String(plan));
-                }
-            }
-            if needs_rationale {
-                if let Some(rationale) = payload
-                    .get("probability_rationale")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                {
-                    obj.insert(
-                        "probability_rationale".to_string(),
-                        Value::String(rationale.to_string()),
-                    );
-                }
-            }
-            if needs_confidence_basis {
-                if let Some(confidence_basis) = payload
-                    .get("confidence_basis")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                {
-                    obj.insert(
-                        "confidence_basis".to_string(),
-                        Value::String(confidence_basis.to_string()),
-                    );
-                }
-            }
-            if needs_hold_reason {
-                if let Some(hold_reason) = payload
-                    .get("hold_reason")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                {
-                    obj.insert(
-                        "hold_reason".to_string(),
-                        Value::String(hold_reason.to_string()),
-                    );
-                }
-            }
-        }
-    }
-
-    normalize_research_decision_fields(obj);
-
-    Ok(value)
-}
-
-fn select_primary_research_ticker(obj: &Map<String, Value>, tickers: &[String]) -> Option<String> {
-    let per_ticker = obj.get("per_ticker")?.as_object()?;
-    if per_ticker.is_empty() {
-        return None;
-    }
-    for ticker in tickers {
-        if per_ticker.contains_key(ticker) {
-            return Some(ticker.clone());
-        }
-    }
-    per_ticker.keys().next().cloned()
-}
-
-fn coerce_plan_to_string(value: &Value) -> Option<String> {
-    match value {
-        Value::String(text) => {
-            let trimmed = text.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_string())
-            }
-        }
-        Value::Array(items) => {
-            let parts = items
-                .iter()
-                .filter_map(|item| match item {
-                    Value::String(text) => {
-                        let trimmed = text.trim();
-                        (!trimmed.is_empty()).then(|| trimmed.to_string())
-                    }
-                    Value::Number(number) => Some(number.to_string()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-            if parts.is_empty() {
-                None
-            } else {
-                Some(parts.join("; "))
-            }
-        }
-        _ => None,
-    }
-}
-
-pub fn validate_research_artifact(
-    artifact: &ResearchArtifact,
-    tickers: &[String],
+pub fn validate_research_decision(
+    artifact: &ResearchDecision,
 ) -> std::result::Result<(), ValidationError> {
     let valid_confidence_basis = [
         "evidence_balanced",
@@ -979,102 +678,6 @@ pub fn validate_research_artifact(
             }
         }
     }
-    for ticker in tickers {
-        let payload = artifact
-            .per_ticker
-            .get(ticker)
-            .ok_or_else(|| ValidationError::MissingTicker(ticker.clone()))?;
-        let rating = payload
-            .get("rating")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| ValidationError::InvalidResearchTicker {
-                ticker: ticker.clone(),
-                reason: "rating is missing or empty".to_string(),
-            })?;
-        let long = payload
-            .get("long_probability")
-            .and_then(Value::as_f64)
-            .filter(|value| (0.0..=1.0).contains(value))
-            .ok_or_else(|| ValidationError::InvalidResearchTicker {
-                ticker: ticker.clone(),
-                reason: "long_probability must be a number in 0..1".to_string(),
-            })?;
-        let short = payload
-            .get("short_probability")
-            .and_then(Value::as_f64)
-            .filter(|value| (0.0..=1.0).contains(value))
-            .ok_or_else(|| ValidationError::InvalidResearchTicker {
-                ticker: ticker.clone(),
-                reason: "short_probability must be a number in 0..1".to_string(),
-            })?;
-        let expected_rating = research_rating_for_probability(long);
-        if rating != expected_rating {
-            return Err(ValidationError::InvalidResearchTicker {
-                ticker: ticker.clone(),
-                reason: format!(
-                    "rating {rating:?} does not match Rust mapping {expected_rating:?} for long_probability {long}"
-                ),
-            });
-        }
-        if (long + short - 1.0).abs() > 0.03 {
-            return Err(ValidationError::InvalidResearchTicker {
-                ticker: ticker.clone(),
-                reason: "long_probability + short_probability must be approximately 1.0"
-                    .to_string(),
-            });
-        }
-        let confidence_basis = payload
-            .get("confidence_basis")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        if !valid_confidence_basis.contains(&confidence_basis) {
-            return Err(ValidationError::InvalidResearchTicker {
-                ticker: ticker.clone(),
-                reason: format!("invalid confidence_basis {confidence_basis:?}"),
-            });
-        }
-        if rating.eq_ignore_ascii_case("hold") {
-            let expected = match confidence_basis {
-                "evidence_balanced" => "evidence_balanced",
-                "data_insufficient" => "evidence_insufficient",
-                "conflicting_evidence" => "conflicting_evidence",
-                other => {
-                    return Err(ValidationError::InvalidResearchTicker {
-                        ticker: ticker.clone(),
-                        reason: format!("Hold cannot use confidence_basis={other}"),
-                    })
-                }
-            };
-            if payload.get("hold_reason").and_then(Value::as_str) != Some(expected) {
-                return Err(ValidationError::InvalidResearchTicker {
-                    ticker: ticker.clone(),
-                    reason: format!("Hold requires hold_reason={expected}"),
-                });
-            }
-        }
-        if payload
-            .get("plan")
-            .and_then(coerce_plan_to_string)
-            .is_none_or(|value| value.trim().is_empty())
-        {
-            return Err(ValidationError::InvalidResearchTicker {
-                ticker: ticker.clone(),
-                reason: "plan must not be empty".to_string(),
-            });
-        }
-        if payload
-            .get("probability_rationale")
-            .and_then(Value::as_str)
-            .is_none_or(|value| value.trim().is_empty())
-        {
-            return Err(ValidationError::InvalidResearchTicker {
-                ticker: ticker.clone(),
-                reason: "probability_rationale must not be empty".to_string(),
-            });
-        }
-    }
     Ok(())
 }
 
@@ -1169,23 +772,6 @@ mod tests {
     }
 
     #[test]
-    fn analyst_schema_lists_machine_fields() {
-        let schema = analyst_artifact_schema();
-        for field in [
-            "direction",
-            "confidence",
-            "report",
-            "data_gaps",
-            "key_evidence",
-            "evidence_type",
-        ] {
-            assert!(schema.contains(field), "schema missing field {field}");
-        }
-        // Must be valid JSON.
-        serde_json::from_str::<Value>(&schema).expect("analyst schema is valid JSON");
-    }
-
-    #[test]
     fn evidence_item_deserializes_structured() {
         let json = r#"{
             "claim": "CPI came in at 3.2%",
@@ -1267,47 +853,6 @@ mod tests {
             }]
         }"#;
         assert!(serde_json::from_str::<AnalystTickerArtifact>(json).is_err());
-    }
-
-    #[test]
-    fn analyst_schema_lists_new_quality_fields() {
-        let schema = analyst_artifact_schema();
-        for field in [
-            "source_tier",
-            "first_source",
-            "is_derivative_repost",
-            "evidence_age",
-            "source_confidence",
-            "echo_chamber_risk",
-            "crowded_consensus_risk",
-        ] {
-            assert!(
-                schema.contains(field),
-                "analyst schema missing field {field}"
-            );
-        }
-        serde_json::from_str::<Value>(&schema).expect("analyst schema is valid JSON");
-    }
-
-    #[test]
-    fn risk_constraints_schema_lists_new_structured_fields() {
-        let schema = risk_constraints_schema();
-        for field in [
-            "unique_risk_contribution",
-            "disagreement_with_prior",
-            "no_new_information",
-            "stop_type",
-            "max_drawdown_pct",
-            "position_cap_pct",
-            "rebalance_trigger",
-            "risk_off_trigger",
-            "review_window",
-            "cash_hedge_recommendation",
-            "constraint_confidence",
-        ] {
-            assert!(schema.contains(field), "risk schema missing field {field}");
-        }
-        serde_json::from_str::<Value>(&schema).expect("risk schema is valid JSON");
     }
 
     #[test]
@@ -1555,8 +1100,8 @@ mod tests {
         }
     }
 
-    fn research_artifact_with_scenarios(scenarios: Option<Scenarios>) -> ResearchArtifact {
-        ResearchArtifact {
+    fn research_decision_with_scenarios(scenarios: Option<Scenarios>) -> ResearchDecision {
+        ResearchDecision {
             rating: "Overweight".to_string(),
             long_probability: 0.575,
             short_probability: 0.425,
@@ -1565,41 +1110,18 @@ mod tests {
             plan: "Monitor validation triggers.".to_string(),
             probability_rationale: "Evidence is balanced near the base probability.".to_string(),
             scenarios,
-            per_ticker: BTreeMap::new(),
-            extra: Map::new(),
         }
     }
 
     #[test]
-    fn research_schema_lists_probability_fields() {
-        let schema = research_artifact_schema();
-        for field in [
-            "rating",
-            "long_probability",
-            "short_probability",
-            "confidence_basis",
-            "hold_reason",
-            "scenarios",
-            "Scenario",
-            "Scenarios",
-            "drivers",
-            "triggers",
-            "confirmation",
-        ] {
-            assert!(schema.contains(field), "schema missing field {field}");
-        }
-        serde_json::from_str::<Value>(&schema).expect("research schema is valid JSON");
-    }
-
-    #[test]
-    fn research_artifact_with_scenarios_validates() {
-        let artifact = research_artifact_with_scenarios(Some(valid_scenarios()));
-        assert!(validate_research_artifact(&artifact, &[]).is_ok());
+    fn research_decision_with_scenarios_validates() {
+        let artifact = research_decision_with_scenarios(Some(valid_scenarios()));
+        assert!(validate_research_decision(&artifact).is_ok());
     }
 
     #[test]
     fn scenario_probabilities_must_sum_to_one() {
-        let artifact = research_artifact_with_scenarios(Some(Scenarios {
+        let artifact = research_decision_with_scenarios(Some(Scenarios {
             bull: Scenario {
                 probability: 0.4,
                 drivers: vec!["x".into()],
@@ -1621,18 +1143,18 @@ mod tests {
         }));
 
         assert!(matches!(
-            validate_research_artifact(&artifact, &[]),
+            validate_research_decision(&artifact),
             Err(ValidationError::ScenarioProbabilitySum(sum)) if (sum - 1.2).abs() < 0.001
         ));
     }
 
     #[test]
     fn inconsistent_long_probability_is_rejected() {
-        let artifact = ResearchArtifact {
+        let artifact = ResearchDecision {
             rating: "Buy".to_string(),
             long_probability: 0.7,
             short_probability: 0.3,
-            ..research_artifact_with_scenarios(Some(Scenarios {
+            ..research_decision_with_scenarios(Some(Scenarios {
                 bull: Scenario {
                     probability: 0.2,
                     drivers: vec!["x".into()],
@@ -1655,26 +1177,26 @@ mod tests {
         };
 
         assert!(matches!(
-            validate_research_artifact(&artifact, &[]),
+            validate_research_decision(&artifact),
             Err(ValidationError::InconsistentLongProbability { long, expected })
                 if (long - 0.7).abs() < 0.001 && (expected - 0.45).abs() < 0.001
         ));
     }
 
     #[test]
-    fn research_artifact_requires_a_confidence_basis() {
-        let mut artifact = research_artifact_with_scenarios(None);
+    fn research_decision_requires_a_confidence_basis() {
+        let mut artifact = research_decision_with_scenarios(None);
         artifact.confidence_basis.clear();
 
         assert!(matches!(
-            validate_research_artifact(&artifact, &["QQQ".to_string()]),
+            validate_research_decision(&artifact),
             Err(ValidationError::InvalidConfidenceBasis(_))
         ));
     }
 
     #[test]
-    fn hold_research_artifact_requires_a_hold_reason() {
-        let mut artifact = research_artifact_with_scenarios(None);
+    fn hold_research_decision_requires_a_hold_reason() {
+        let mut artifact = research_decision_with_scenarios(None);
         artifact.rating = "Hold".to_string();
         artifact.long_probability = 0.5;
         artifact.short_probability = 0.5;
@@ -1682,19 +1204,8 @@ mod tests {
         artifact.hold_reason = None;
 
         assert!(matches!(
-            validate_research_artifact(&artifact, &["QQQ".to_string()]),
+            validate_research_decision(&artifact),
             Err(ValidationError::InvalidHoldReason(_))
-        ));
-    }
-
-    #[test]
-    fn research_artifact_rejects_empty_per_ticker_decision() {
-        let mut artifact = research_artifact_with_scenarios(None);
-        artifact.per_ticker.insert("QQQ".to_string(), json!({}));
-
-        assert!(matches!(
-            validate_research_artifact(&artifact, &["QQQ".to_string()]),
-            Err(ValidationError::InvalidResearchTicker { ticker, .. }) if ticker == "QQQ"
         ));
     }
 
@@ -1702,10 +1213,10 @@ mod tests {
     fn scenario_drivers_are_required() {
         let mut scenarios = valid_scenarios();
         scenarios.bull.drivers.clear();
-        let artifact = research_artifact_with_scenarios(Some(scenarios));
+        let artifact = research_decision_with_scenarios(Some(scenarios));
 
         assert!(matches!(
-            validate_research_artifact(&artifact, &[]),
+            validate_research_decision(&artifact),
             Err(ValidationError::InvalidProbability(message))
                 if message == "scenario bull must have at least 1 driver"
         ));
@@ -1715,10 +1226,10 @@ mod tests {
     fn scenario_drivers_reject_missing_evidence_as_a_causal_factor() {
         let mut scenarios = valid_scenarios();
         scenarios.bull.drivers = vec!["No actionable bullish evidence is available".into()];
-        let artifact = research_artifact_with_scenarios(Some(scenarios));
+        let artifact = research_decision_with_scenarios(Some(scenarios));
 
         assert!(matches!(
-            validate_research_artifact(&artifact, &[]),
+            validate_research_decision(&artifact),
             Err(ValidationError::InvalidProbability(message))
                 if message.contains("causal market factors")
         ));
@@ -1728,23 +1239,23 @@ mod tests {
     fn scenario_triggers_are_required() {
         let mut scenarios = valid_scenarios();
         scenarios.bear.triggers.clear();
-        let artifact = research_artifact_with_scenarios(Some(scenarios));
+        let artifact = research_decision_with_scenarios(Some(scenarios));
 
         assert!(matches!(
-            validate_research_artifact(&artifact, &[]),
+            validate_research_decision(&artifact),
             Err(ValidationError::InvalidProbability(message))
                 if message == "scenario bear must have at least 1 trigger"
         ));
     }
 
     #[test]
-    fn research_artifact_without_scenarios_still_validates() {
-        let artifact = research_artifact_with_scenarios(None);
-        assert!(validate_research_artifact(&artifact, &[]).is_ok());
+    fn research_decision_without_scenarios_still_validates() {
+        let artifact = research_decision_with_scenarios(None);
+        assert!(validate_research_decision(&artifact).is_ok());
     }
 
     #[test]
-    fn research_artifact_without_scenarios_deserializes() {
+    fn research_decision_without_scenarios_deserializes() {
         let json = r#"{
             "rating": "Hold",
             "long_probability": 0.55,
@@ -1754,103 +1265,13 @@ mod tests {
             "plan": "Monitor validation triggers.",
             "probability_rationale": "Evidence is balanced."
         }"#;
-        let artifact: ResearchArtifact = serde_json::from_str(json).unwrap();
+        let artifact: ResearchDecision = serde_json::from_str(json).unwrap();
         assert_eq!(artifact.scenarios, None);
-        assert!(validate_research_artifact(&artifact, &[]).is_ok());
+        assert!(validate_research_decision(&artifact).is_ok());
     }
 
     #[test]
-    fn normalize_lifts_per_ticker_fields_to_top_level() {
-        let value = json!({
-            "id": "research-manager",
-            "role": "research_manager",
-            "status": "completed",
-            "report": "compressed evidence only",
-            "per_ticker": {
-                "QQQ": {
-                    "rating": "Overweight",
-                    "long_probability": 0.57,
-                    "short_probability": 0.43,
-                    "confidence_basis": "directional_evidence",
-                    "plan": [
-                        "Verify volume confirmation",
-                        "Watch short-horizon break"
-                    ],
-                    "probability_rationale": "Near base after duplicate discount."
-                },
-                "SOXX": {
-                    "rating": "Hold",
-                    "long_probability": 0.51,
-                    "short_probability": 0.49,
-                    "confidence_basis": "data_insufficient",
-                    "hold_reason": "evidence_insufficient",
-                    "plan": "Wait for SOXX-specific confirmation",
-                    "probability_rationale": "Insufficient SOXX-specific evidence."
-                }
-            }
-        });
-
-        let normalized =
-            normalize_research_artifact_value(value, &["QQQ".to_string(), "SOXX".to_string()])
-                .unwrap();
-        let artifact: ResearchArtifact = serde_json::from_value(normalized).unwrap();
-        assert_eq!(artifact.rating, "Overweight");
-        assert!((artifact.long_probability - 0.57).abs() < 1e-9);
-        assert!((artifact.short_probability - 0.43).abs() < 1e-9);
-        assert_eq!(artifact.confidence_basis, "directional_evidence");
-        assert_eq!(artifact.hold_reason, None);
-        assert!(artifact.plan.contains("Verify volume confirmation"));
-        assert!(artifact
-            .probability_rationale
-            .contains("duplicate discount"));
-        assert!(artifact.per_ticker.contains_key("QQQ"));
-        assert!(artifact.per_ticker.contains_key("SOXX"));
-        assert!(
-            validate_research_artifact(&artifact, &["QQQ".to_string(), "SOXX".to_string()]).is_ok()
-        );
-    }
-
-    #[test]
-    fn normalize_preserves_existing_top_level_fields() {
-        let value = json!({
-            "rating": "Hold",
-            "long_probability": 0.52,
-            "short_probability": 0.48,
-            "plan": "Keep existing plan",
-            "probability_rationale": "Top-level rationale",
-            "per_ticker": {
-                "QQQ": {
-                    "rating": "Buy",
-                    "long_probability": 0.7,
-                    "short_probability": 0.3,
-                    "plan": "Should not replace top-level",
-                    "probability_rationale": "Nested rationale"
-                }
-            }
-        });
-        let normalized = normalize_research_artifact_value(value, &["QQQ".to_string()]).unwrap();
-        let artifact: ResearchArtifact = serde_json::from_value(normalized).unwrap();
-        assert_eq!(artifact.rating, "Hold");
-        assert!((artifact.long_probability - 0.52).abs() < 1e-9);
-        assert_eq!(artifact.plan, "Keep existing plan");
-        assert_eq!(artifact.probability_rationale, "Top-level rationale");
-    }
-
-    #[test]
-    fn normalize_coerces_top_level_plan_array() {
-        let value = json!({
-            "rating": "Hold",
-            "long_probability": 0.5,
-            "short_probability": 0.5,
-            "plan": ["Watch VIX", "Reassess breadth"]
-        });
-        let normalized = normalize_research_artifact_value(value, &[]).unwrap();
-        let artifact: ResearchArtifact = serde_json::from_value(normalized).unwrap();
-        assert_eq!(artifact.plan, "Watch VIX; Reassess breadth");
-    }
-
-    #[test]
-    fn rust_owns_research_rating_mapping_and_probability_complement() {
+    fn rust_owns_research_rating_mapping() {
         for (probability, rating) in [
             (0.68, "Buy"),
             (0.56, "Overweight"),
@@ -1860,88 +1281,6 @@ mod tests {
         ] {
             assert_eq!(research_rating_for_probability(probability), rating);
         }
-
-        let value = json!({
-            "rating": "Sell",
-            "long_probability": 0.61,
-            "short_probability": 0.61,
-            "confidence_basis": "directional_evidence",
-            "plan": "Watch the hinge.",
-            "probability_rationale": "Directional evidence remains.",
-            "per_ticker": {
-                "QQQ": {
-                    "rating": "Sell",
-                    "long_probability": 0.61,
-                    "short_probability": 0.61,
-                    "confidence_basis": "directional_evidence",
-                    "plan": "Watch the hinge.",
-                    "probability_rationale": "Directional evidence remains."
-                }
-            }
-        });
-        let normalized = normalize_research_artifact_value(value, &["QQQ".to_string()]).unwrap();
-        assert_eq!(normalized["rating"], "Overweight");
-        assert_eq!(normalized["per_ticker"]["QQQ"]["rating"], "Overweight");
-        assert!((normalized["short_probability"].as_f64().unwrap() - 0.39).abs() < 1e-9);
-        assert!(
-            (normalized["per_ticker"]["QQQ"]["short_probability"]
-                .as_f64()
-                .unwrap()
-                - 0.39)
-                .abs()
-                < 1e-9
-        );
-    }
-
-    #[test]
-    fn downstream_contract_schemas_list_machine_fields() {
-        for (schema, fields) in [
-            (
-                trade_intent_schema(),
-                vec!["action", "entry_price", "position_size_pct_max"],
-            ),
-            (
-                risk_constraints_schema(),
-                vec!["stance", "argument", "recommended_adjustment"],
-            ),
-            (
-                final_validation_schema(),
-                vec![
-                    "rating",
-                    "execution_status",
-                    "execution_summary",
-                    "risk_controls",
-                ],
-            ),
-            (
-                portfolio_allocation_schema(),
-                vec!["weights", "total_equity_exposure", "vix_regime"],
-            ),
-        ] {
-            serde_json::from_str::<Value>(&schema).expect("contract schema is valid JSON");
-            for field in fields {
-                assert!(schema.contains(field), "schema missing field {field}");
-            }
-        }
-    }
-
-    #[test]
-    fn canonical_contract_v2_schemas_exclude_removed_fields() {
-        let trade = trade_intent_schema();
-        assert!(trade.contains("position_size_pct_max"));
-        assert!(!trade.contains("\"position_size\""));
-
-        let risk = risk_constraints_schema();
-        for stop_type in ["hard", "soft", "none"] {
-            assert!(risk.contains(stop_type));
-        }
-        for removed in ["tight", "trailing", "event_based", "time_based"] {
-            assert!(!risk.contains(removed));
-        }
-
-        let final_validation = final_validation_schema();
-        assert!(final_validation.contains("binding_risk_controls"));
-        assert!(final_validation.contains("source_refs"));
     }
 
     #[test]

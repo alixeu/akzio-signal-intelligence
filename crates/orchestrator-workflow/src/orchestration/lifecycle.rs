@@ -1,7 +1,6 @@
 use orchestrator_core::{
-    final_validation_schema, portfolio_allocation_schema, risk_constraints_schema, run_slug,
-    trade_intent_schema, validate_risk_constraints, FinalValidation, PortfolioAllocation,
-    RiskConstraints, TradeIntent,
+    run_slug, validate_risk_constraints, FinalValidation, PortfolioAllocation, RiskConstraints,
+    TradeIntent,
 };
 use serde_json::{json, Value};
 
@@ -192,15 +191,12 @@ pub(crate) fn record_contracts(state: &mut Value) {
     let contracts = CONTRACTS
         .iter()
         .map(|contract| {
-            let mut value = json!({
+            let value = json!({
                 "phase": contract.phase,
                 "name": contract.name,
                 "state_field": contract.state_field,
                 "responsibility": contract.responsibility,
             });
-            if let Some(schema) = contract_schema(contract.name) {
-                value["schema"] = Value::String(schema);
-            }
             value
         })
         .collect::<Vec<_>>();
@@ -236,16 +232,6 @@ fn contract_violations(state: &Value, contract: &PhaseContract) -> Vec<Value> {
             })]
         })
         .unwrap_or_default()
-}
-
-fn contract_schema(name: &str) -> Option<String> {
-    match name {
-        "TradeIntent" => Some(trade_intent_schema()),
-        "RiskConstraints" => Some(risk_constraints_schema()),
-        "FinalValidation" => Some(final_validation_schema()),
-        "PortfolioAllocation" => Some(portfolio_allocation_schema()),
-        _ => None,
-    }
 }
 
 fn phase_done(state: &Value, phase: i64) -> bool {
@@ -739,7 +725,7 @@ mod contract_tests {
     }
 
     #[test]
-    fn downstream_contracts_include_machine_schema() {
+    fn downstream_contracts_do_not_embed_legacy_json_schemas() {
         let mut state = json!({});
 
         record_contracts(&mut state);
@@ -755,7 +741,7 @@ mod contract_tests {
                 .iter()
                 .find(|contract| contract["name"] == name)
                 .unwrap();
-            assert!(item["schema"].as_str().unwrap().contains("properties"));
+            assert!(item.get("schema").is_none());
         }
         let evidence = contracts
             .iter()

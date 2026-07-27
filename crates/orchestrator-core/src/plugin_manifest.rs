@@ -20,9 +20,6 @@ pub struct ComponentManifest {
     /// These must be present in the render values map.
     #[serde(default)]
     pub required_variables: Vec<String>,
-    /// Optional schema placeholder keys this component depends on.
-    #[serde(default)]
-    pub schema_dependencies: Vec<String>,
     /// Whether this component is enabled. Can be overridden by config.
     #[serde(default = "default_enabled")]
     pub enabled: bool,
@@ -61,16 +58,9 @@ pub struct RoleManifest {
     /// Whether this role is critical (blocks workflow if missing).
     #[serde(default)]
     pub is_critical: bool,
-    /// Output schema type for validation.
-    #[serde(default = "default_output_schema")]
-    pub output_schema: String,
     /// Whether this role supports a `_monitor` variant.
     #[serde(default)]
     pub supports_monitor_mode: bool,
-}
-
-fn default_output_schema() -> String {
-    "json_artifact".to_string()
 }
 
 #[cfg(test)]
@@ -92,7 +82,6 @@ placeholder_key = "common_ticker_prompt"
         assert_eq!(manifest.priority, 100);
         assert!(manifest.enabled);
         assert!(manifest.required_variables.is_empty());
-        assert!(manifest.schema_dependencies.is_empty());
     }
 
     #[test]
@@ -107,7 +96,6 @@ phase = 1
         .unwrap();
 
         assert_eq!(manifest.role_id, "analyst.test");
-        assert_eq!(manifest.output_schema, "json_artifact");
         assert!(manifest.components.is_empty());
         assert!(manifest.tools.is_empty());
         assert!(!manifest.is_critical);

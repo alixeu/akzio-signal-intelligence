@@ -18,12 +18,6 @@ pub const KNOWN_RENDER_VARIABLES: &[&str] = &[
     "analysis_trace_contract",
     "experience_contract",
     "leveraged_etf_rules",
-    "analyst_artifact_schema",
-    "research_artifact_schema",
-    "trade_intent_schema",
-    "risk_constraints_schema",
-    "final_validation_schema",
-    "portfolio_allocation_schema",
     "risk_analyst_body",
     "role",
     "phase",
@@ -218,12 +212,7 @@ impl ComponentRegistry {
             .collect::<BTreeSet<_>>();
         for plugin in self.components.values() {
             validate_component_manifest(&plugin.manifest, &plugin.path)?;
-            for variable in plugin
-                .manifest
-                .required_variables
-                .iter()
-                .chain(plugin.manifest.schema_dependencies.iter())
-            {
+            for variable in plugin.manifest.required_variables.iter() {
                 if !known.contains(variable.as_str())
                     && !plugin_placeholders.contains(variable.as_str())
                 {

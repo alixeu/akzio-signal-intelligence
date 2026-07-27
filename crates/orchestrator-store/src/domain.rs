@@ -6,9 +6,9 @@
 
 use std::{collections::BTreeMap, path::PathBuf};
 
-use orchestrator_core::artifact::{Scenario, Scenarios};
+use orchestrator_core::artifact::{ResearchDecision, Scenario, Scenarios};
 use orchestrator_core::{
-    validate_analyst_ticker_artifact, validate_final_validation, validate_research_artifact,
+    validate_analyst_ticker_artifact, validate_final_validation, validate_research_decision,
     validate_risk_constraints, validate_trade_intent, AnalystTickerArtifact,
     AssetExecutionConstraint, BindingRiskControl, EvidenceItem, FinalValidation, RiskConstraints,
     StopType, TradeIntent,
@@ -680,9 +680,9 @@ pub fn finalize_research_decision(
     let mut hinges = BTreeMap::new();
     for (ticker, entry) in &state.decisions {
         let per = research_value(entry)?;
-        let core: orchestrator_core::ResearchArtifact = serde_json::from_value(per.clone())
+        let decision: ResearchDecision = serde_json::from_value(per.clone())
             .map_err(|source| StoreError::JsonSerialize { source })?;
-        validate_research_artifact(&core, &[]).map_err(|error| StoreError::InvalidDocument {
+        validate_research_decision(&decision).map_err(|error| StoreError::InvalidDocument {
             kind: "research finalizer",
             message: format!("{ticker}: {error}"),
         })?;
