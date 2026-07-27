@@ -417,12 +417,10 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             current_date: &date,
         },
     )?;
-    // Each completed business phase is synchronously summarized by phase_summary before
-    // the next phase starts, so downstream roles always see a complete index.
+    // Each completed business phase is synchronously summarized before the
+    // next phase starts, so downstream roles read completed FileStore Indexes.
     let mut compress_jobs: Vec<(i64, std::thread::JoinHandle<Result<CompressJobResult>>)> =
         Vec::new();
-    let phase_summary_gate = std::sync::Arc::new(orchestrator_sql::PhaseSummaryGate::new(&run_id));
-    orchestrator_sql::register_phase_summary_gate(&run_id, phase_summary_gate.clone());
 
     if args.from_phase <= 0 && args.to_phase >= 0 {
         debug!("phase 0 (historical reflection and experience retrieval) starting");
@@ -575,7 +573,6 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         compress_jobs.push((
             1,
             spawn_compress_job(
-                phase_summary_gate.clone(),
                 &state,
                 1,
                 model_override.as_deref(),
@@ -619,7 +616,6 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         compress_jobs.push((
             2,
             spawn_compress_job(
-                phase_summary_gate.clone(),
                 &state,
                 2,
                 model_override.as_deref(),
@@ -631,12 +627,6 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         debug!("phase 2 completed; phase_summary compress(2) finished");
     }
     if args.from_phase <= 3 && args.to_phase >= 3 {
-        // PhaseSummary has already completed for every preceding selected phase.
-        if let Some(g) = orchestrator_sql::phase_summary_gate(&run_id) {
-            if !g.has_inflight() {
-                state["phase_summary_memory"] = g.snapshot().to_state_value();
-            }
-        }
         materialize_weighted_probability_base(&mut state);
         debug!("phase 3 starting");
         let phase_timer = start_phase_timer(3, "phase3");
@@ -654,7 +644,6 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         compress_jobs.push((
             3,
             spawn_compress_job(
-                phase_summary_gate.clone(),
                 &state,
                 3,
                 model_override.as_deref(),
@@ -693,7 +682,6 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         compress_jobs.push((
             4,
             spawn_compress_job(
-                phase_summary_gate.clone(),
                 &state,
                 4,
                 model_override.as_deref(),
@@ -727,7 +715,6 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         compress_jobs.push((
             5,
             spawn_compress_job(
-                phase_summary_gate.clone(),
                 &state,
                 5,
                 model_override.as_deref(),
@@ -761,7 +748,6 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         compress_jobs.push((
             6,
             spawn_compress_job(
-                phase_summary_gate.clone(),
                 &state,
                 6,
                 model_override.as_deref(),
@@ -794,7 +780,6 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         compress_jobs.push((
             7,
             spawn_compress_job(
-                phase_summary_gate.clone(),
                 &state,
                 7,
                 model_override.as_deref(),
@@ -833,21 +818,6 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
     }
     // Drain any compress still running when the pipeline ends early (e.g. to_phase < 8).
     await_all_compress_jobs(&mut compress_jobs, &mut state).await?;
-
-    // Idempotent insurance for the legacy profile only.  Once Summary is
-    // FileStore-authoritative, every unit was finalized atomically before its
-    // gate completed; writing the compatibility projection below would create
-    // a forbidden second authority.
-    let phase_summary_flushed = if !phase_summary_uses_file_store(&runtime_config)? {
-        crate::orchestration::compress::flush_phase_summary_to_sqlite(&conn, &mut state)?
-    } else {
-        0
-    };
-    orchestrator_sql::unregister_phase_summary_gate(&run_id);
-    debug!(
-        phase_summary_flushed,
-        "phase_summary memory flushed to sqlite at run end"
-    );
 
     update_run_status(&mut conn, &run_id, "completed", None)?;
     record_contracts(&mut state);
@@ -3731,15 +3701,11 @@ async fn run_phase2_final_reducer(
     Ok(())
 }
 
-/// Result of a background phase-00 LLM compress job, already persisted to SQLite.
+/// Result of a background phase-summary write. The completed Index directories
+/// are authoritative; this result is only a run-local read projection.
 struct CompressJobResult {
     source_phase: i64,
-    written: usize,
-    batch: orchestrator_sql::PhaseSummaryPhaseBatch,
-    /// True only when the completed Index directories are the persistence
-    /// authority. The batch then exists solely as an in-process compatibility
-    /// projection for not-yet-migrated readers and is never flushed to SQLite.
-    file_store_authoritative: bool,
+    index_ids: Vec<String>,
     debug_enabled: bool,
     debug_output_path: PathBuf,
     debug_source_label: String,
@@ -3754,184 +3720,38 @@ async fn compress_phase_job(
     config: RuntimeConfig,
 ) -> Result<CompressJobResult> {
     let debug_enabled = state.get("debug").and_then(Value::as_bool) == Some(true);
-    let prompt_path = config
-        .prompts
-        .path_for("compressor.phase_summary")
-        .context("missing compressor.phase_summary prompt path")?
-        .clone();
-    let debug_source_label = debug_prompt_source_label(&prompt_path)?;
+    let debug_source_label = "file_store_summary".to_owned();
     let debug_output_path = PathBuf::from(format!(
         "outputs/debug/phase{source_phase}/summary/phase{source_phase}_summary.json"
     ));
-    if phase_summary_uses_file_store(&config)? {
-        let store_root = state
-            .get("store_root")
-            .and_then(Value::as_str)
-            .context("store_root missing for FileStore phase_summary")?;
-        let file_store = write_deterministic_phase_summary(
-            Path::new(store_root),
-            &state,
-            source_phase,
-            config.tool_managed.max_summary_units_per_phase,
-        )?;
-        let batch = crate::orchestration::compress::build_phase_compress(&state, source_phase)?;
-        return Ok(CompressJobResult {
-            source_phase,
-            written: file_store.indexes.len(),
-            batch,
-            file_store_authoritative: true,
-            debug_enabled,
-            debug_output_path,
-            debug_source_label,
-            role_metrics: Value::Array(vec![]),
-        });
-    }
-    let (batch, role_metrics) = if is_mock(&state) {
-        (
-            crate::orchestration::compress::build_phase_compress(&state, source_phase)?,
-            Value::Array(vec![]),
-        )
-    } else if source_phase == 1 && phase1_cached_artifact_fallback_active(&state) {
-        tracing::warn!(
-            source_phase,
-            "compressor.phase_summary falling back to deterministic in-memory summary due cached phase1 artifacts"
-        );
-        (
-            crate::orchestration::compress::build_phase_compress(&state, source_phase)?,
-            Value::Array(vec![]),
-        )
-    } else {
-        let source_payload =
-            crate::orchestration::compress::phase_summary_source_payload(&state, source_phase)?;
-        let mut job = prepare_role_job(RoleRun {
-            state: state.clone(),
-            role: "compressor.phase_summary",
-            phase: source_phase,
-            kind: "phase_summary",
-            round: Some(source_phase),
-            topic_id: None,
-            mock: false,
-            model_override: model_override.as_deref(),
-            reasoning_effort_override: reasoning_effort_override.as_deref(),
-            config: &config,
-            prompt_path: Some(prompt_path.as_path()),
-        })?;
-        job.debug_output_path = Some(debug_output_path.clone());
-        if let Some(llm) = job.llm.as_mut() {
-            llm.tools.clear();
-        }
-        job.prompt.push_str("\n\n");
-        job.prompt.push_str(
-            &include_str!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../prompts/system/messages/source_payload.md"
-            ))
-            .replace(
-                "{{source_payload}}",
-                &serde_json::to_string(&source_payload)?,
-            ),
-        );
-        let conn = orchestrator_sql::connect(
-            state
-                .get("db_path")
-                .and_then(Value::as_str)
-                .context("db_path missing for phase_summary compressor")?,
-        )?;
-        let result = run_role_jobs(vec![job], 1, config.workflow.agent_timeout_sec)
-            .await
-            .into_iter()
-            .next()
-            .context("phase_summary compressor returned no role result")?;
-        persist_prompt_metric(&conn, &result);
-        record_role_job_metrics(&mut state, &result);
-        if let Some(error) = result.error.as_deref() {
-            tracing::warn!(
-                source_phase,
-                error = %error,
-                "phase_summary compressor role failed; falling back to deterministic in-memory summary"
-            );
-            state["degraded"] = json!(true);
-            if !state.get("degraded_report").is_some_and(Value::is_object) {
-                state["degraded_report"] = json!({"is_degraded": true, "roles": []});
-            }
-            if let Some(roles) = state
-                .get_mut("degraded_report")
-                .and_then(|report| report.get_mut("roles"))
-                .and_then(Value::as_array_mut)
-            {
-                roles.push(json!({
-                    "role": "compressor.phase_summary",
-                    "phase": source_phase,
-                    "kind": "phase_summary",
-                    "error": error,
-                    "message": format!("phase_summary compressor failed for phase {source_phase}")
-                }));
-            }
-            let role_metrics = state
-                .get("role_job_metrics")
-                .and_then(Value::as_array)
-                .and_then(|items| items.last())
-                .cloned()
-                .map(|item| json!([item]))
-                .unwrap_or_else(|| json!([]));
-            return Ok(CompressJobResult {
-                source_phase,
-                written: 0,
-                batch: crate::orchestration::compress::build_phase_compress(&state, source_phase)?,
-                file_store_authoritative: false,
-                debug_enabled,
-                debug_output_path,
-                debug_source_label,
-                role_metrics,
-            });
-        }
-        let artifact = result
-            .artifact
-            .as_ref()
-            .context("phase_summary compressor returned no artifact")?;
-        let batch = crate::orchestration::compress::phase_summary_bundle_to_batch(
-            &state,
-            source_phase,
-            artifact,
-        )?;
-        let current = state
-            .get("role_job_metrics")
-            .and_then(Value::as_array)
-            .and_then(|items| items.last())
-            .cloned()
-            .map(|item| json!([item]))
-            .unwrap_or_else(|| json!([]));
-        (batch, current)
-    };
-    let written = batch.written();
-    let conn = orchestrator_sql::connect(
-        state
-            .get("db_path")
-            .and_then(Value::as_str)
-            .context("db_path missing for phase_summary persistence")?,
-    )?;
-    let run_id = state
-        .get("run_id")
+    let store_root = state
+        .get("store_root")
         .and_then(Value::as_str)
-        .context("run_id missing for phase_summary persistence")?;
-    orchestrator_sql::persist_phase_summary_batch(&conn, run_id, &batch)?;
+        .context("store_root missing for FileStore phase_summary")?;
+    let file_store = write_deterministic_phase_summary(
+        Path::new(store_root),
+        &state,
+        source_phase,
+        config.tool_managed.max_summary_units_per_phase,
+    )?;
     Ok(CompressJobResult {
         source_phase,
-        written,
-        batch,
-        file_store_authoritative: false,
+        index_ids: file_store
+            .indexes
+            .into_iter()
+            .map(|index| index.index_id)
+            .collect(),
         debug_enabled,
         debug_output_path,
         debug_source_label,
-        role_metrics,
+        role_metrics: Value::Array(vec![]),
     })
 }
 
 fn apply_compress_result(state: &mut Value, result: CompressJobResult) -> Result<()> {
     let CompressJobResult {
         source_phase,
-        batch,
-        file_store_authoritative,
+        index_ids,
         debug_enabled,
         debug_output_path,
         debug_source_label,
@@ -3939,15 +3759,8 @@ fn apply_compress_result(state: &mut Value, result: CompressJobResult) -> Result
         ..
     } = result;
     merge_role_job_metrics(state, &role_metrics);
-    let snapshot = crate::orchestration::compress::apply_phase_summary_batch(state, batch)?;
-    state["phase_compress"][source_phase.to_string()]["persisted"] = json!(true);
-    state["phase_compress"][source_phase.to_string()]["authority"] =
-        json!(if file_store_authoritative {
-            "file_store"
-        } else {
-            "legacy"
-        });
-    state["phase_summary_tables"][source_phase.to_string()]["persisted"] = json!(true);
+    let snapshot = json!({"index_ids": index_ids, "authority": "file_store"});
+    state["phase_compress"][source_phase.to_string()] = snapshot.clone();
     if debug_enabled {
         let role = format!("compressor.after_phase_{source_phase}");
         record_local_debug_artifact(
@@ -3961,36 +3774,22 @@ fn apply_compress_result(state: &mut Value, result: CompressJobResult) -> Result
     }
     debug!(
         source_phase,
-        written = result.written,
+        written = index_ids.len(),
         "phase_summary compress applied to memory state"
     );
     Ok(())
 }
 
-fn phase1_cached_artifact_fallback_active(state: &Value) -> bool {
-    state
-        .get("analyst_reports")
-        .and_then(Value::as_object)
-        .is_some_and(|reports| {
-            reports.values().any(|artifact| {
-                artifact.get("fallback").and_then(Value::as_str) == Some("cached_db_artifact")
-            })
-        })
-}
-
 /// Spawn phase-00 after a business phase. The caller awaits the result before
 /// starting the next phase, while the gate remains available to role tools.
 fn spawn_compress_job(
-    gate: std::sync::Arc<orchestrator_sql::PhaseSummaryGate>,
     state: &Value,
     source_phase: i64,
     model_override: Option<&str>,
     reasoning_effort_override: Option<&str>,
     config: &RuntimeConfig,
 ) -> std::thread::JoinHandle<Result<CompressJobResult>> {
-    gate.mark_inflight(source_phase);
     let state_snapshot = state.clone();
-    let gate_job = gate.clone();
     let model_override = model_override.map(ToString::to_string);
     let reasoning_effort_override = reasoning_effort_override.map(ToString::to_string);
     let config = config.clone();
@@ -3999,19 +3798,14 @@ fn spawn_compress_job(
             .enable_all()
             .build()?
             .block_on(async move {
-                let result = compress_phase_job(
+                compress_phase_job(
                     state_snapshot,
                     source_phase,
                     model_override,
                     reasoning_effort_override,
                     config,
                 )
-                .await;
-                match &result {
-                    Ok(ok) => gate_job.complete(source_phase, ok.batch.clone()),
-                    Err(err) => gate_job.fail(source_phase, err.to_string()),
-                }
-                result
+                .await
             })
     })
 }
