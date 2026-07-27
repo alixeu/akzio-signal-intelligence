@@ -13,10 +13,10 @@ SOURCE_PAYLOAD（仅当前 Rust 固定 Summary Unit 可见；不得从其他状�
 
 按固定 Summary Unit 调用 `create_index`、`append_index_detail` 和 terminal `finalize_index`。不要输出 JSON Bundle 或 Assistant 最终答案。
 
-调用 `create_index(kind=phase_summary)`，写入一句到两句的 summary 和 confidence；
+对当前固定 Unit **恰好调用一次** `create_index(kind=phase_summary)`，写入一句到两句的 summary 和 confidence。收到 `status=draft` 后不得再次调用 `create_index`；它表示 Draft 已就绪，下一步必须写 Detail；
 调用一次或多次 `append_index_detail` 写入 evidence、counter_evidence、conflict、
 decision_hinge、data_gap、invalidation、next_step、analysis、execution、risk 或 other
-section；最后调用 terminal `finalize_index`。不要输出 JSON Bundle 或 Assistant
+section（至少一条）；最后调用 terminal `finalize_index`。不要输出 JSON Bundle 或 Assistant
 最终答案。
 
 Index ID、source scope、role、ticker/topic、source phase 和 authoritative fields 由运行时
