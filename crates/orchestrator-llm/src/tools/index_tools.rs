@@ -222,8 +222,21 @@ impl IndexToolRuntimeContext {
         owned: IndexOwnedScope,
         visibility: IndexReadVisibility,
     ) -> Result<Self> {
+        Self::new_with_writer_role(turn, owned, visibility, None)
+    }
+
+    /// The writer may be a Rust-owned summary compressor while `owned.role`
+    /// remains the source role represented by the Index. This is deliberately
+    /// an explicit binding parameter, never a model argument.
+    pub fn new_with_writer_role(
+        turn: ToolRuntimeTurnContext,
+        owned: IndexOwnedScope,
+        visibility: IndexReadVisibility,
+        writer_role: Option<&str>,
+    ) -> Result<Self> {
         owned.validate()?;
-        if turn.run_id != owned.run_id || turn.role != owned.role {
+        let expected_writer_role = writer_role.unwrap_or(&owned.role);
+        if turn.run_id != owned.run_id || turn.role != expected_writer_role {
             bail!("Index tool turn context does not match the Rust-owned unit scope");
         }
         if turn.phase.is_none() {
@@ -412,6 +425,7 @@ pub struct IndexToolRuntimeBinding {
     owned: IndexOwnedScope,
     visibility: IndexReadVisibility,
     service: Arc<dyn IndexToolService>,
+    writer_role: Option<String>,
 }
 
 impl fmt::Debug for IndexToolRuntimeBinding {
@@ -436,7 +450,20 @@ impl IndexToolRuntimeBinding {
             owned,
             visibility,
             service,
+            writer_role: None,
         })
+    }
+
+    /// Restrict this binding to a Rust-designated writer role. The Index's
+    /// persisted `role` is unchanged and continues to describe its source
+    /// unit, not the compressor process that writes it.
+    pub fn with_writer_role(mut self, role: impl Into<String>) -> Result<Self> {
+        let role = role.into();
+        if role.trim().is_empty() {
+            bail!("Index tool writer role must not be empty")
+        }
+        self.writer_role = Some(role);
+        Ok(self)
     }
 
     pub fn owned_scope(&self) -> &IndexOwnedScope {
@@ -448,7 +475,12 @@ impl IndexToolRuntimeBinding {
         turn: ToolRuntimeTurnContext,
     ) -> Result<IndexToolRuntime<Arc<dyn IndexToolService>>> {
         Ok(IndexToolRuntime::new(
-            IndexToolRuntimeContext::new(turn, self.owned.clone(), self.visibility.clone())?,
+            IndexToolRuntimeContext::new_with_writer_role(
+                turn,
+                self.owned.clone(),
+                self.visibility.clone(),
+                self.writer_role.as_deref(),
+            )?,
             Arc::clone(&self.service),
         ))
     }

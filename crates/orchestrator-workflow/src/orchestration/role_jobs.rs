@@ -830,7 +830,8 @@ fn file_store_phase_summary_index_runtime(
             RunLocation::new(current_date, state["run_id"].as_str().unwrap_or_default())?,
             Utc::now().to_rfc3339(),
         ),
-    )
+    )?
+    .with_writer_role("compressor.phase_summary")
 }
 
 fn file_store_reflection_source(
