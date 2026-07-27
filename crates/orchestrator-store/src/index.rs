@@ -634,55 +634,60 @@ pub fn append_index_detail(
     input: AppendIndexDetailInput,
 ) -> Result<IndexDetail> {
     let directory = draft_dir(&input.scope)?;
-    let index: Index =
-        store.read_versioned_json(&index_path(&directory), crate::FileSchemaKind::Index)?;
-    if index.index_id != input.scope.index_id || input.detail.trim().is_empty() {
-        return Err(StoreError::InvalidDocument {
-            kind: "index detail",
-            message: "draft missing or detail is empty".to_owned(),
-        });
-    }
-    let source_refs = input
-        .source_refs
-        .into_iter()
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    let source_run_id = input
-        .scope
-        .source_run_id
-        .clone()
-        .unwrap_or_else(|| input.scope.run_id.clone());
-    let detail_id = content_hash_bytes(
-        format!(
-            "{}\x1f{}\x1f{}\x1f{}\x1f{}",
-            index.index_id,
-            input.section as u8,
-            source_run_id,
-            input.detail.trim(),
-            source_refs.join("\x1e")
+    let lock = directory.join("details.lock");
+    store.with_exclusive_lock(&lock, || {
+        let index: Index =
+            store.read_versioned_json(&index_path(&directory), crate::FileSchemaKind::Index)?;
+        if index.index_id != input.scope.index_id || input.detail.trim().is_empty() {
+            return Err(StoreError::InvalidDocument {
+                kind: "index detail",
+                message: "draft missing or detail is empty".to_owned(),
+            });
+        }
+        let source_refs = input
+            .source_refs
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let source_run_id = input
+            .scope
+            .source_run_id
+            .clone()
+            .unwrap_or_else(|| input.scope.run_id.clone());
+        let detail_id = content_hash_bytes(
+            format!(
+                "{}\x1f{}\x1f{}\x1f{}\x1f{}",
+                index.index_id,
+                input.section as u8,
+                source_run_id,
+                input.detail.trim(),
+                source_refs.join("\x1e")
+            )
+            .as_bytes(),
+        );
+        let path = detail_path(&directory, &detail_id)?;
+        if store.exists(&path)? {
+            return store.read_versioned_json(&path, crate::FileSchemaKind::Detail);
+        }
+        let details_dir = directory.join("details");
+        let sort_order = count_details(store, &details_dir)? + 1;
+        store.write_authoritative_json(
+            &path,
+            IndexDetail {
+                schema_version: INDEX_DETAIL_SCHEMA_VERSION,
+                detail_id,
+                index_id: index.index_id,
+                section: input.section,
+                detail: input.detail,
+                source_run_id,
+                source_refs,
+                sort_order,
+                created_at: input.scope.created_at,
+                content_hash: String::new(),
+            },
         )
-        .as_bytes(),
-    );
-    let path = detail_path(&directory, &detail_id)?;
-    if store.exists(&path)? {
-        return store.read_versioned_json(&path, crate::FileSchemaKind::Detail);
-    }
-    store.write_authoritative_json(
-        &path,
-        IndexDetail {
-            schema_version: INDEX_DETAIL_SCHEMA_VERSION,
-            detail_id,
-            index_id: index.index_id,
-            section: input.section,
-            detail: input.detail,
-            source_run_id,
-            source_refs,
-            sort_order: index.detail_count + 1,
-            created_at: input.scope.created_at,
-            content_hash: String::new(),
-        },
-    )
+    })
 }
 
 pub fn finalize_index(store: &FileStore, scope: &IndexScope) -> Result<Index> {
@@ -694,26 +699,69 @@ pub fn finalize_index(store: &FileStore, scope: &IndexScope) -> Result<Index> {
     let mut index: Index =
         store.read_versioned_json(&index_path(&draft), crate::FileSchemaKind::Index)?;
     let details_dir = draft.join("details");
-    let count = if store.exists(&details_dir)? {
-        fs::read_dir(store.root().join(&details_dir))
-            .map_err(|source| StoreError::Io {
-                path: store.root().join(&details_dir),
-                source,
-            })?
-            .count()
-    } else {
-        0
-    };
+    let count = count_details(store, &details_dir)?;
     if count == 0 {
         return Err(StoreError::InvalidDocument {
             kind: "index",
             message: "finalize requires at least one Detail".to_owned(),
         });
     }
+    let mut sort_orders = fs::read_dir(store.root().join(&details_dir))
+        .map_err(|source| StoreError::Io {
+            path: store.root().join(&details_dir),
+            source,
+        })?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .map(|entry| {
+            let relative = details_dir.join(entry.file_name());
+            let detail: IndexDetail =
+                store.read_versioned_json(&relative, crate::FileSchemaKind::Detail)?;
+            if detail.index_id != index.index_id {
+                return Err(StoreError::InvalidDocument {
+                    kind: "index detail",
+                    message: "detail index_id does not match its Index".to_owned(),
+                });
+            }
+            Ok(detail.sort_order)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    sort_orders.sort_unstable();
+    if sort_orders != (1..=count).collect::<Vec<_>>() {
+        return Err(StoreError::InvalidDocument {
+            kind: "index",
+            message: "Detail sort_order values must be contiguous and unique".to_owned(),
+        });
+    }
     index.detail_count = count;
     store.write_authoritative_json(&index_path(&draft), index.clone())?;
     rename_dir_atomic(store.root(), &draft, &final_dir)?;
     store.read_versioned_json(&index_path(&final_dir), crate::FileSchemaKind::Index)
+}
+
+fn count_details(store: &FileStore, details_dir: &Path) -> Result<usize> {
+    if !store.exists(details_dir)? {
+        return Ok(0);
+    }
+    let count = fs::read_dir(store.root().join(details_dir))
+        .map_err(|source| StoreError::Io {
+            path: store.root().join(details_dir),
+            source,
+        })?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .count();
+    Ok(count)
 }
 
 pub fn read_indexes(
@@ -928,6 +976,53 @@ mod tests {
         .unwrap()
         .indexes
         .is_empty());
+    }
+
+    #[test]
+    fn detail_append_assigns_contiguous_sort_order_before_finalize() {
+        let temp = tempdir().unwrap();
+        let store = FileStore::open(temp.path(), Default::default()).unwrap();
+        let scope = scope(RunLocation::new("2026-07-27", "run").unwrap());
+        create_index(
+            &store,
+            CreateIndexInput {
+                scope: scope.clone(),
+                summary: "summary".to_owned(),
+                confidence: 0.7,
+                pattern_key: None,
+                applies_to_phases: vec![3],
+            },
+        )
+        .unwrap();
+        for detail in ["first", "second", "third"] {
+            append_index_detail(
+                &store,
+                AppendIndexDetailInput {
+                    scope: scope.clone(),
+                    section: DetailSection::Evidence,
+                    detail: detail.to_owned(),
+                    source_refs: vec![detail.to_owned()],
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(finalize_index(&store, &scope).unwrap().detail_count, 3);
+        assert_eq!(
+            read_index_details(
+                &store,
+                &scope,
+                &DetailQuery {
+                    limit: 3,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .details
+            .iter()
+            .map(|detail| detail.sort_order)
+            .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
     }
 
     fn experience_scope(source_run_id: &str) -> IndexScope {
