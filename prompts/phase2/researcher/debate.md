@@ -32,7 +32,7 @@
 - 被标记不可核验或 `soft_control` 禁止的本方 claim 必须撤回或降级。
 - 信息增量不足时使用 `stance=no_new_info`，但仍须填写回应对象和非空 `steer_id`。
 
-用 `respond_to_debate_claim` 写入对可见 claim 的回应；reply target 必须来自已读取/继承的可见 claim。完成后调用 `finalize_debate_response`。不要输出 packet JSON；Rust finalizer 负责 ID、topic、side、round、可见性和值域。
+最多展开 1–2 个直接影响回应的 Detail；已有可见 claim 与证据后不得继续检索。用 `respond_to_debate_claim` 写入对可见 claim 的回应；reply target 必须来自已读取/继承的可见 claim。随后立刻调用 terminal `finalize_debate_response`，不要输出 packet JSON 或自然语言最终答案；Rust finalizer 负责 ID、topic、side、round、可见性和值域。
 
 # 紧凑审计预算
 
