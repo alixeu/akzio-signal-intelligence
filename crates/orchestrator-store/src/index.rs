@@ -598,6 +598,24 @@ pub fn create_index(store: &FileStore, input: CreateIndexInput) -> Result<Index>
     if let Some(pattern_key) = input.pattern_key.as_deref() {
         validate_experience_identity(&input.scope, pattern_key, true)?;
     }
+    // A finalized Index is authoritative over any stale Draft left behind by
+    // a prior interrupted attempt.  Repeated create/finalize calls must
+    // recover the canonical result rather than reopen or mutate that Draft.
+    let final_directory = final_dir(&input.scope)?;
+    let final_index_path = index_path(&final_directory);
+    if store.exists(&final_index_path)? {
+        let completed: Index =
+            store.read_versioned_json(&final_index_path, crate::FileSchemaKind::Index)?;
+        if completed.index_id != input.scope.index_id
+            || completed.source_payload_hash != input.scope.source_payload_hash
+        {
+            return Err(StoreError::InvalidDocument {
+                kind: "index",
+                message: "completed Index identity differs from the requested scope".to_owned(),
+            });
+        }
+        return Ok(completed);
+    }
     let directory = draft_dir(&input.scope)?;
     if store.exists(&index_path(&directory))? {
         let existing: Index =
@@ -991,6 +1009,49 @@ mod tests {
         .unwrap()
         .indexes
         .is_empty());
+    }
+
+    #[test]
+    fn create_after_finalize_returns_the_canonical_index() {
+        let temp = tempdir().unwrap();
+        let store = FileStore::open(temp.path(), Default::default()).unwrap();
+        let scope = scope(RunLocation::new("2026-07-27", "run").unwrap());
+        create_index(
+            &store,
+            CreateIndexInput {
+                scope: scope.clone(),
+                summary: "canonical summary".to_owned(),
+                confidence: 0.7,
+                pattern_key: None,
+                applies_to_phases: vec![3],
+            },
+        )
+        .unwrap();
+        append_index_detail(
+            &store,
+            AppendIndexDetailInput {
+                scope: scope.clone(),
+                section: DetailSection::Evidence,
+                detail: "canonical evidence".to_owned(),
+                source_refs: vec!["a".to_owned()],
+            },
+        )
+        .unwrap();
+        let completed = finalize_index(&store, &scope).unwrap();
+        let recovered = create_index(
+            &store,
+            CreateIndexInput {
+                scope,
+                summary: "must not replace canonical summary".to_owned(),
+                confidence: 0.1,
+                pattern_key: None,
+                applies_to_phases: vec![3],
+            },
+        )
+        .unwrap();
+        assert_eq!(recovered.index_id, completed.index_id);
+        assert_eq!(recovered.summary, "canonical summary");
+        assert_eq!(recovered.detail_count, 1);
     }
 
     #[test]
