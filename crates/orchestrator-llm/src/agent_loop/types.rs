@@ -617,6 +617,12 @@ pub(crate) fn response_to_stream_events(response: ModelResponse) -> Result<Vec<M
 pub trait LoopToolRuntime: Send + Sync {
     fn set_turn_context(&mut self, _context: ToolRuntimeTurnContext) {}
 
+    /// A runtime may stop the current loop after returning an audited tool
+    /// result, for example when a Rust-owned write budget is exhausted.
+    fn abort_reason(&self) -> Option<String> {
+        None
+    }
+
     fn execute<'a>(
         &'a self,
         call: ToolCallRequest,

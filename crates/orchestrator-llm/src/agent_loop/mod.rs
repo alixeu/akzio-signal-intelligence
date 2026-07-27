@@ -17,6 +17,7 @@ use std::{
     future::Future,
     path::PathBuf,
     pin::Pin,
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 use tracing::{debug, warn};
@@ -377,6 +378,11 @@ where
                 emit_tool_result(turn, sink, &result).await?;
                 turn.emitted_items
                     .push(TurnItem::tool_result(&result, &config.truncation));
+                if let Some(reason) = tools.abort_reason() {
+                    turn.end_reason = Some("tool_runtime_budget_exhausted".to_owned());
+                    persist_turn(session, turn, &config.truncation)?;
+                    bail!(reason);
+                }
                 if is_terminal_tool_result(&result) {
                     turn.terminal_tool_result = Some(result);
                     terminal_completed = true;
@@ -1776,6 +1782,9 @@ pub struct ProjectToolRuntime {
     index_write_allowed: bool,
     domain_binding: Option<tools::domain_tools::DomainToolRuntimeBinding>,
     domain_runtime_error: Option<String>,
+    max_write_calls: Option<usize>,
+    write_call_count: AtomicUsize,
+    write_budget_exhausted: AtomicBool,
 }
 
 impl ProjectToolRuntime {
@@ -1804,6 +1813,9 @@ impl ProjectToolRuntime {
             index_write_allowed: false,
             domain_binding: None,
             domain_runtime_error: None,
+            max_write_calls: None,
+            write_call_count: AtomicUsize::new(0),
+            write_budget_exhausted: AtomicBool::new(false),
         }
     }
 
@@ -1834,6 +1846,13 @@ impl ProjectToolRuntime {
         self.domain_binding = Some(binding);
         self
     }
+
+    /// Bound only typed FileStore writes; arbitrary natural-language output,
+    /// read tools, and `think` cannot consume or evade this Rust-owned limit.
+    pub fn with_max_write_calls(mut self, max_write_calls: Option<usize>) -> Self {
+        self.max_write_calls = max_write_calls;
+        self
+    }
 }
 
 impl LoopToolRuntime for ProjectToolRuntime {
@@ -1848,6 +1867,8 @@ impl LoopToolRuntime for ProjectToolRuntime {
         self.index_runtime = None;
         self.index_runtime_error = None;
         self.domain_runtime_error = None;
+        self.write_call_count.store(0, Ordering::Release);
+        self.write_budget_exhausted.store(false, Ordering::Release);
         if let Some(binding) = &self.index_binding {
             match binding.build(context.clone()) {
                 Ok(runtime) => self.index_runtime = Some(runtime),
@@ -1860,6 +1881,17 @@ impl LoopToolRuntime for ProjectToolRuntime {
             }
         }
         self.turn_context = Some(context);
+    }
+
+    fn abort_reason(&self) -> Option<String> {
+        self.write_budget_exhausted
+            .load(Ordering::Acquire)
+            .then(|| {
+                format!(
+                    "ToolManaged write-call budget exhausted after {} attempts",
+                    self.write_call_count.load(Ordering::Acquire)
+                )
+            })
     }
 
     fn execute<'a>(
@@ -1922,6 +1954,23 @@ impl LoopToolRuntime for ProjectToolRuntime {
                     output: Value::Null,
                     error: Some("unknown tool name".to_string()),
                 };
+            }
+            if index_write_tool || is_domain_tool {
+                if let Some(limit) = self.max_write_calls {
+                    let previous = self.write_call_count.fetch_add(1, Ordering::AcqRel);
+                    if previous >= limit {
+                        self.write_budget_exhausted.store(true, Ordering::Release);
+                        return ToolResultItem {
+                            call_id: call.call_id,
+                            name: call.name,
+                            status: "error".to_string(),
+                            output: Value::Null,
+                            error: Some(format!(
+                                "ToolManaged write-call budget of {limit} is exhausted"
+                            )),
+                        };
+                    }
+                }
             }
             if call.name == "think" {
                 return ToolResultItem {

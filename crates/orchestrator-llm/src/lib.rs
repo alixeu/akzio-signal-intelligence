@@ -201,6 +201,9 @@ pub struct AgentSettings {
     /// Present only for a migrated business unit.  It is a typed, scoped
     /// FileStore service; legacy roles never receive a domain write path.
     pub domain_tool_runtime: Option<tools::domain_tools::DomainToolRuntimeBinding>,
+    /// Upper bound for typed Draft/Index write attempts in one agent turn.
+    /// Reads and `think` do not consume this budget.
+    pub max_write_calls: Option<usize>,
     pub llm: RoleLlmSettings,
     pub reasoning_effort_override: Option<String>,
     pub tools: Option<tools::ExternalToolConfig>,
@@ -341,6 +344,7 @@ pub async fn run_agent_loop_with_metrics(
             .map(ToString::to_string)
             .collect(),
     );
+    tools = tools.with_max_write_calls(settings.max_write_calls);
     if let Some(binding) = settings.index_tool_runtime.clone() {
         tools = tools.with_index_tool_runtime(binding);
     }
@@ -485,6 +489,7 @@ pub async fn run_agent_steer_loop_with_metrics(
             .map(ToString::to_string)
             .collect(),
     );
+    tools = tools.with_max_write_calls(settings.max_write_calls);
     if let Some(binding) = settings.index_tool_runtime.clone() {
         tools = tools.with_index_tool_runtime(binding);
     }
@@ -2545,6 +2550,7 @@ mod tests {
             session_runtime: None,
             index_tool_runtime: None,
             domain_tool_runtime: None,
+            max_write_calls: None,
             llm: RoleLlmSettings {
                 route,
                 model: "gpt-5.4".to_string(),

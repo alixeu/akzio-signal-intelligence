@@ -81,6 +81,8 @@ pub(crate) struct RoleJob {
     pub domain_tool_runtime:
         Option<orchestrator_llm::tools::domain_tools::DomainToolRuntimeBinding>,
     pub session_runtime: Option<FileStoreSessionRuntime>,
+    /// Per-role typed Draft/Index write-attempt budget from runtime config.
+    pub max_write_calls: Option<usize>,
     pub llm: Option<RoleLlmSettings>,
     pub reasoning_effort_override: Option<String>,
     pub tools: ExternalToolConfig,
@@ -411,6 +413,7 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
         index_tool_runtime,
         domain_tool_runtime,
         session_runtime,
+        max_write_calls: Some(config.tool_managed.max_write_calls_per_role),
         llm,
         reasoning_effort_override: reasoning_effort_override.map(ToString::to_string),
         tools: ExternalToolConfig {
@@ -1613,6 +1616,7 @@ async fn execute_role_job(job: RoleJob) -> Result<AgentLoopOutput> {
         index_tool_runtime: job.index_tool_runtime.clone(),
         domain_tool_runtime: job.domain_tool_runtime.clone(),
         session_runtime: job.session_runtime.clone(),
+        max_write_calls: job.max_write_calls,
         llm,
         reasoning_effort_override: job.reasoning_effort_override,
         tools: Some(job.tools),
@@ -2032,6 +2036,7 @@ async fn execute_steer_role_job(
         index_tool_runtime: job.index_tool_runtime.clone(),
         domain_tool_runtime: job.domain_tool_runtime.clone(),
         session_runtime: job.session_runtime.clone(),
+        max_write_calls: job.max_write_calls,
         llm,
         reasoning_effort_override: job.reasoning_effort_override,
         tools: Some(job.tools),
