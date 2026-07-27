@@ -730,8 +730,27 @@ pub fn definition(name: &str) -> Option<ToolDefinition> {
             ]),
         ),
         APPEND_ANALYST_EVIDENCE => (
-            "Append one source-backed evidence item for an assessed ticker.",
-            json!({"ticker":{"type":"string"},"evidence":{"type":"object"},"evidence_ref":{"type":"string","minLength":1}}),
+            "Append one Canonical Contract v2 source-backed evidence item for an assessed ticker. evidence_type is required; do not use a legacy `type` field.",
+            json!({
+                "ticker":{"type":"string"},
+                "evidence":{
+                    "type":"object",
+                    "properties":{
+                        "claim":{"type":"string","minLength":1},
+                        "evidence_type":{"type":"string","enum":["fact","opinion","inference"]},
+                        "source":{"type":"string","minLength":1},
+                        "timestamp":{"type":"string","minLength":1},
+                        "source_tier":{"type":"string","enum":["official","major_media","professional_research","longform_analysis","unknown"]},
+                        "first_source":{"type":"string"},
+                        "is_derivative_repost":{"type":"boolean"},
+                        "evidence_age":{"type":"string"},
+                        "source_confidence":{"type":"number","minimum":0.0,"maximum":1.0}
+                    },
+                    "required":["claim","evidence_type","source","timestamp","source_tier","source_confidence"],
+                    "additionalProperties":false
+                },
+                "evidence_ref":{"type":"string","minLength":1}
+            }),
             json!(["ticker", "evidence", "evidence_ref"]),
         ),
         APPEND_ANALYST_DATA_GAP => (
@@ -1245,6 +1264,18 @@ mod tests {
             }
         });
         assert!(prepare_command(APPEND_ANALYST_EVIDENCE, arguments, &analyst_scope()).is_err());
+    }
+
+    #[test]
+    fn analyst_evidence_schema_exposes_only_canonical_v2_fields() {
+        let definition = definition(APPEND_ANALYST_EVIDENCE).unwrap();
+        let evidence = &definition.parameters["properties"]["evidence"];
+        assert_eq!(
+            evidence["properties"]["evidence_type"]["enum"],
+            json!(["fact", "opinion", "inference"])
+        );
+        assert_eq!(evidence["additionalProperties"], json!(false));
+        assert!(evidence["properties"].get("type").is_none());
     }
 
     #[test]
