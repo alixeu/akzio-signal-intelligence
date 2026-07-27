@@ -1,8 +1,10 @@
 mod debug_capture;
+mod session_store;
 mod streaming;
 mod types;
 
 pub use debug_capture::input_to_debug_messages;
+pub use session_store::{FileStoreSessionRuntime, SessionRuntimeSpec, TurnCheckpoint};
 pub use types::*;
 
 use streaming::ModelStreamHandler;
