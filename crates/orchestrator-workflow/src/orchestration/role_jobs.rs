@@ -3,7 +3,9 @@ use chrono::Utc;
 use futures::{stream, StreamExt};
 use orchestrator_core::{default_project_root, ArtifactAuthority, ToolManagedProfile};
 use orchestrator_llm::{
-    agent_loop::{ModelStreamResult, RetrievalPolicy, TokenUsage},
+    agent_loop::{
+        FileStoreSessionRuntime, ModelStreamResult, RetrievalPolicy, SessionRuntimeSpec, TokenUsage,
+    },
     llm_judge::JudgeConfig,
     mock_role_artifact, run_agent_loop_with_metrics, run_agent_steer_loop_with_metrics,
     tools::{ExternalToolConfig, FileStoreInputSnapshot},
@@ -76,6 +78,7 @@ pub(crate) struct RoleJob {
     pub index_tool_runtime: Option<orchestrator_llm::tools::index_tools::IndexToolRuntimeBinding>,
     pub domain_tool_runtime:
         Option<orchestrator_llm::tools::domain_tools::DomainToolRuntimeBinding>,
+    pub session_runtime: Option<FileStoreSessionRuntime>,
     pub llm: Option<RoleLlmSettings>,
     pub reasoning_effort_override: Option<String>,
     pub tools: ExternalToolConfig,
@@ -363,6 +366,19 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
     // FileStore projection into a hard tool error instead of an accidental
     // SQLite fallback.
     let file_store_authoritative = tool_managed_profile.is_some();
+    let session_runtime = tool_managed_profile
+        .map(|profile| {
+            file_store_session_runtime(
+                &state,
+                role,
+                phase,
+                topic_id,
+                round,
+                profile,
+                phase2_fork_reference(&state, role, topic_id),
+            )
+        })
+        .transpose()?;
 
     Ok(RoleJob {
         role: role.to_string(),
@@ -381,6 +397,7 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
         tool_managed_profile,
         index_tool_runtime,
         domain_tool_runtime,
+        session_runtime,
         llm,
         reasoning_effort_override: reasoning_effort_override.map(ToString::to_string),
         tools: ExternalToolConfig {
@@ -597,6 +614,57 @@ fn file_store_input_from_state(state: &Value) -> Result<FileStoreInputSnapshot> 
         run_id: required("run_id")?,
         current_date: required("current_date")?,
     })
+}
+
+/// Construct the sole Agent Loop history authority for a migrated unit.  The
+/// unit identity is Rust-owned and stable across a restart; the model has no
+/// way to select a session, run, path, or fork parent.
+fn file_store_session_runtime(
+    state: &Value,
+    role: &str,
+    phase: i64,
+    topic_id: Option<&str>,
+    round: Option<i64>,
+    profile: ToolManagedProfile,
+    fork: Option<orchestrator_store::ForkReference>,
+) -> Result<FileStoreSessionRuntime> {
+    let store_root = state
+        .get("store_root")
+        .and_then(Value::as_str)
+        .context("migrated role requires FileStore root")?;
+    let current_date = state
+        .get("current_date")
+        .and_then(Value::as_str)
+        .context("migrated role requires current_date")?;
+    let run_id = state
+        .get("run_id")
+        .and_then(Value::as_str)
+        .context("migrated role requires run_id")?;
+    let phase = u8::try_from(phase).context("session phase must fit in u8")?;
+    let session_id = format!(
+        "{}:p{}:{}:{}:{}",
+        run_id,
+        phase,
+        role,
+        topic_id.unwrap_or("aggregate"),
+        round.unwrap_or(0)
+    );
+    let store = orchestrator_store::FileStore::open(
+        store_root,
+        orchestrator_store::FileStoreOptions::default(),
+    )?;
+    FileStoreSessionRuntime::create_or_load(
+        store,
+        SessionRuntimeSpec {
+            run: orchestrator_store::RunLocation::new(current_date, run_id)?,
+            session_id,
+            role: role.to_owned(),
+            phase,
+            profile: profile.as_str().to_owned(),
+            fork,
+            created_at: Utc::now().to_rfc3339(),
+        },
+    )
 }
 
 /// Construct the sole Phase 0 writer: a task-scoped Experience Index.  The
@@ -1437,6 +1505,7 @@ async fn execute_role_job(job: RoleJob) -> Result<AgentLoopOutput> {
         tool_managed_profile: job.tool_managed_profile,
         index_tool_runtime: job.index_tool_runtime.clone(),
         domain_tool_runtime: job.domain_tool_runtime.clone(),
+        session_runtime: job.session_runtime.clone(),
         llm,
         reasoning_effort_override: job.reasoning_effort_override,
         tools: Some(job.tools),
@@ -1823,6 +1892,7 @@ async fn execute_steer_role_job(
         tool_managed_profile: job.tool_managed_profile,
         index_tool_runtime: job.index_tool_runtime.clone(),
         domain_tool_runtime: job.domain_tool_runtime.clone(),
+        session_runtime: job.session_runtime.clone(),
         llm,
         reasoning_effort_override: job.reasoning_effort_override,
         tools: Some(job.tools),
