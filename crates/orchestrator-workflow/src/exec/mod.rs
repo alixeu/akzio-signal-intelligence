@@ -63,7 +63,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
     )?;
     let mut manifest = prepare_manifest(&store, &location, &runtime, &config)?;
 
-    let mut state = json!({
+    let initial_state = json!({
         "schema_version": STATE_SCHEMA_VERSION,
         "run_id": run_id,
         "current_date": current_date,
@@ -81,12 +81,13 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         "phase_status": {},
         "degraded": false,
     });
+    let mut state = load_or_initialize_state(&store, &location, initial_state)?;
 
-    if args.from_phase <= 0 && args.to_phase >= 0 {
+    if args.from_phase <= 0 && args.to_phase >= 0 && !phase_completed(&manifest, 0) {
         run_phase0(&mut state, &runtime)?;
         finish_phase(&store, &location, &mut manifest, &mut state, 0, "done")?;
     }
-    if args.from_phase <= 1 && args.to_phase >= 1 {
+    if args.from_phase <= 1 && args.to_phase >= 1 && !phase_completed(&manifest, 1) {
         run_phase1(
             &mut state,
             &runtime,
@@ -105,7 +106,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         )
         .await?;
     }
-    if args.from_phase <= 2 && args.to_phase >= 2 {
+    if args.from_phase <= 2 && args.to_phase >= 2 && !phase_completed(&manifest, 2) {
         run_phase2(
             &store,
             &location,
@@ -126,7 +127,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         )
         .await?;
     }
-    if args.from_phase <= 3 && args.to_phase >= 3 {
+    if args.from_phase <= 3 && args.to_phase >= 3 && !phase_completed(&manifest, 3) {
         run_phase3(
             &mut state,
             &runtime,
@@ -145,7 +146,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         )
         .await?;
     }
-    if args.from_phase <= 4 && args.to_phase >= 4 {
+    if args.from_phase <= 4 && args.to_phase >= 4 && !phase_completed(&manifest, 4) {
         run_phase4(
             &mut state,
             &runtime,
@@ -164,7 +165,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         )
         .await?;
     }
-    if args.from_phase <= 5 && args.to_phase >= 5 {
+    if args.from_phase <= 5 && args.to_phase >= 5 && !phase_completed(&manifest, 5) {
         run_phase5(
             &mut state,
             &runtime,
@@ -183,7 +184,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         )
         .await?;
     }
-    if args.from_phase <= 6 && args.to_phase >= 6 {
+    if args.from_phase <= 6 && args.to_phase >= 6 && !phase_completed(&manifest, 6) {
         run_phase6(
             &mut state,
             &runtime,
@@ -202,7 +203,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         )
         .await?;
     }
-    if args.from_phase <= 7 && args.to_phase >= 7 {
+    if args.from_phase <= 7 && args.to_phase >= 7 && !phase_completed(&manifest, 7) {
         run_phase7(&store, &location, &mut state, &runtime)?;
         finish_phase(&store, &location, &mut manifest, &mut state, 7, "done")?;
         summarize(
@@ -215,7 +216,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         )
         .await?;
     }
-    if args.from_phase <= 8 && args.to_phase >= 8 {
+    if args.from_phase <= 8 && args.to_phase >= 8 && !phase_completed(&manifest, 8) {
         run_phase8(&store, &location, &mut state)?;
         finish_phase(&store, &location, &mut manifest, &mut state, 8, "done")?;
     }
@@ -254,7 +255,17 @@ fn prepare_manifest(
     config: &Value,
 ) -> Result<RunManifest> {
     if store.exists(&location.manifest_relative())? {
-        return read_run_manifest(store, location).map_err(Into::into);
+        let manifest = read_run_manifest(store, location)?;
+        let current_config_hash = content_hash(config)?;
+        if manifest.config_hash != current_config_hash {
+            bail!(
+                "run {} was created with config hash {}; current config hash is {}; start a new run instead of silently reusing artifacts",
+                manifest.run_id,
+                manifest.config_hash,
+                current_config_hash
+            );
+        }
+        return Ok(manifest);
     }
     let snapshot = runtime.authority_registry.snapshot();
     write_run_manifest(
@@ -271,6 +282,52 @@ fn prepare_manifest(
         })?,
     )
     .map_err(Into::into)
+}
+
+fn load_or_initialize_state(
+    store: &FileStore,
+    location: &RunLocation,
+    initial_state: Value,
+) -> Result<Value> {
+    let relative = location.child_relative(Path::new("state.json"))?;
+    if !store.exists(&relative)? {
+        return Ok(initial_state);
+    }
+    let mut state = store.read_json_value(&relative)?;
+    let version = state
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .context("run state schema_version is required")?;
+    if version > STATE_SCHEMA_VERSION {
+        bail!("run state schema version {version} is newer than supported {STATE_SCHEMA_VERSION}");
+    }
+    if version < STATE_SCHEMA_VERSION {
+        bail!(
+            "run state schema version {version} requires an explicit migration to {STATE_SCHEMA_VERSION}"
+        );
+    }
+    let stored_hash = state
+        .get("content_hash")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .context("run state content_hash is required")?
+        .to_owned();
+    state["content_hash"] = Value::String(String::new());
+    let expected_hash = content_hash(&state)?;
+    if stored_hash != expected_hash {
+        bail!(
+            "run state content_hash mismatch at {}: expected {expected_hash}, found {stored_hash}",
+            store.root().join(relative).display()
+        );
+    }
+    state["content_hash"] = Value::String(stored_hash);
+    for field in ["run_id", "current_date", "ticker", "tickers", "config"] {
+        if state.get(field) != initial_state.get(field) {
+            bail!("existing run state field {field} differs from requested run; start a new run");
+        }
+    }
+    Ok(state)
 }
 
 fn finish_phase(
@@ -293,6 +350,11 @@ fn finish_phase(
     );
     write_run_manifest(store, location, manifest.clone())?;
     Ok(())
+}
+
+fn phase_completed(manifest: &RunManifest, phase: u8) -> bool {
+    manifest.phase_status.get(&phase.to_string())
+        == Some(&orchestrator_store::PhaseStatus::Completed)
 }
 
 async fn summarize(
