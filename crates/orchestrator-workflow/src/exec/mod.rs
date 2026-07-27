@@ -506,7 +506,7 @@ async fn summarize(
     for unit in units {
         state["_summary_unit"] = serde_json::to_value(&unit)?;
         state["_summary_source_payload"] = source_payload.clone();
-        let artifact = run_unit(
+        let artifact = match run_unit(
             state,
             runtime,
             "compressor.phase_summary",
@@ -518,7 +518,38 @@ async fn summarize(
             model,
             reasoning,
         )
-        .await?;
+        .await
+        {
+            Ok(artifact) => artifact,
+            Err(error) => {
+                // A summary cannot block the workflow merely because its
+                // compressor did not reach terminal finalize.  The fixed
+                // Rust plan writes the same Index/Detail schema through the
+                // same create/append/finalize service; it never revives a
+                // legacy summary bundle or a second persistence path.
+                state["degraded"] = Value::Bool(true);
+                if let Some(errors) = state["errors"].as_array_mut() {
+                    errors.push(json!({
+                        "phase": phase,
+                        "role": "compressor.phase_summary",
+                        "unit_key": unit.unit_key,
+                        "error": error.to_string(),
+                        "fallback": "deterministic_index_finalize",
+                    }));
+                }
+                write_deterministic_phase_summary(
+                    store_root,
+                    state,
+                    phase,
+                    runtime.tool_managed.max_summary_units_per_phase,
+                )?;
+                if let Some(object) = state.as_object_mut() {
+                    object.remove("_summary_unit");
+                    object.remove("_summary_source_payload");
+                }
+                return Ok(summary_units);
+            }
+        };
         completed.push(artifact);
     }
     state["phase_summary_live"][phase.to_string()] = Value::Array(completed);
