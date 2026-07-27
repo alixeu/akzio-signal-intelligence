@@ -320,8 +320,17 @@ impl IndexToolService for FileStoreIndexToolService {
                 cursor: command.cursor,
             },
         )?;
+        // Keep the parent Index provenance at the response root.  The
+        // evidence-read recorder recursively visits `index_id` on this
+        // wrapper and each Detail; without these fields it would incorrectly
+        // attribute the completed Phase Summary to the reader's current
+        // phase, producing a false conflicting-provenance failure.
         Ok(json!({
             "index_id": command.index_id,
+            "source_run_id": scope.source_run_id.as_deref().unwrap_or(&scope.run_id),
+            "source_phase": scope.source_phase,
+            "ticker": scope.ticker,
+            "topic_id": scope.topic_id,
             "details": page.details,
             "next_cursor": page.next_cursor,
         }))

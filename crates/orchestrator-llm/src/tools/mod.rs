@@ -838,3 +838,45 @@ pub(crate) fn log_tool_result(name: &str, result: &Result<Value>) {
         Err(error) => warn!(tool = name, error = %error, "named tool failed"),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn turn() -> ToolRuntimeTurnContext {
+        ToolRuntimeTurnContext {
+            run_id: "current-run".to_owned(),
+            session_id: "session-1".to_owned(),
+            turn_id: "turn-1".to_owned(),
+            role: "mediator.topic".to_owned(),
+            phase: Some(2),
+        }
+    }
+
+    #[test]
+    fn index_detail_reads_inherit_parent_index_provenance() {
+        let records = evidence_reads_from_tool_output(
+            index_tools::READ_INDEX_DETAILS_NAME,
+            &json!({
+                "index_id": "index-1",
+                "source_run_id": "source-run",
+                "source_phase": 1,
+                "ticker": "QQQ",
+                "topic_id": null,
+                "details": [{
+                    "detail_id": "detail-1",
+                    "index_id": "index-1",
+                    "source_run_id": "source-run"
+                }]
+            }),
+            &turn(),
+        )
+        .unwrap();
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().all(|record| {
+            record.source_run_id == "source-run"
+                && record.source_phase == 1
+                && record.ticker.as_deref() == Some("QQQ")
+        }));
+    }
+}
