@@ -9,7 +9,7 @@
 
 ## 统一输出约束
 
-最终输出必须是单一 JSON 对象，不允许 markdown、代码块、注释、前后文本说明、多个对象或列表包装。
+按固定 Summary Unit 调用 `create_index`、`append_index_detail` 和 terminal `finalize_index`。不要输出 JSON Bundle 或 Assistant 最终答案。
 
 每个 `summaries` 项必须满足：
 - `role`、`ticker`、`summary`、`summary_json`、`confidence`、`details` 均不能为空。
@@ -17,7 +17,7 @@
 - `details` 不能为空数组，且每一项必须有 `detail`、`detail_json`、`source_ref`。
 - `summary_json` 不得省略 `analysis_process.trace_status`。
 
-JSON 的第一字符必须是 `{`，最后字符必须是 `}`；第一轮与第二轮产物都按当前轮 `SOURCE_PAYLOAD` 完整生成，不得添加 markdown 包装文本。
+Index ID、source scope 和 authoritative fields 由运行时绑定；只写入本 Unit 的 summary 和 detail。
 
 硬性边界：
 
