@@ -301,7 +301,7 @@ mod tests {
     }
 
     #[test]
-    fn persists_default_csv_with_sqlite_compatible_ids() {
+    fn persists_default_csv_with_stable_ids() {
         let dir = tempfile::tempdir().unwrap();
         let items = vec![json!({
             "time": "2026-07-22 13:49:22",
