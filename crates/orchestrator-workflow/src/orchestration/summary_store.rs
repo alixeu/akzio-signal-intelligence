@@ -169,6 +169,15 @@ fn write_unit(
             applies_to_phases: applies_to_phases(unit.source_phase),
         },
     )?;
+    // A live Summary Agent may have completed this fixed unit immediately
+    // before its enclosing phase failed.  `create_index` correctly returns
+    // that canonical Index, but a deterministic fallback must not recreate a
+    // draft directory merely to append another Detail.  Ask the same
+    // finalizer first: success proves the completed directory is authoritative
+    // and makes the fallback idempotent.
+    if let Ok(completed) = finalize_index(store, &scope) {
+        return Ok(completed);
+    }
     append_index_detail(
         store,
         AppendIndexDetailInput {
@@ -373,6 +382,9 @@ mod tests {
         let result = write_deterministic_phase_summary(temp.path(), &state, 3, 32).unwrap();
         assert_eq!(result.indexes.len(), 1);
         assert_eq!(result.indexes[0].ticker.as_deref(), Some("QQQ"));
+        let recovered = write_deterministic_phase_summary(temp.path(), &state, 3, 32).unwrap();
+        assert_eq!(recovered.indexes.len(), 1);
+        assert_eq!(recovered.indexes[0].index_id, result.indexes[0].index_id);
         let store = FileStore::open(temp.path(), Default::default()).unwrap();
         let page = orchestrator_store::read_indexes(
             &store,
