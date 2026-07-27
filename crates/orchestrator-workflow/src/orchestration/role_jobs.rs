@@ -869,11 +869,21 @@ fn file_store_phase_summary_index_runtime(
         .and_then(Value::as_u64)
         .and_then(|value| u8::try_from(value).ok())
         .context("_summary_unit.source_phase is required")?;
-    let source_refs = canonical_source_refs(
+    let mut source_refs = canonical_source_refs(
         state
             .get("_summary_source_payload")
             .context("PhaseSummary role requires Rust-planned _summary_source_payload")?,
     );
+    if source_refs.is_empty() {
+        source_refs = state
+            .get("_completed_units")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flat_map(|units| units.values())
+            .filter(|artifact| artifact.get("phase").and_then(Value::as_i64) == Some(i64::from(source_phase)))
+            .flat_map(canonical_source_refs)
+            .collect();
+    }
     if source_refs.is_empty() {
         bail!("PhaseSummary source payload contains no canonical Artifact or Index ID")
     }
