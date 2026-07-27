@@ -694,16 +694,34 @@ pub fn finalize_index(store: &FileStore, scope: &IndexScope) -> Result<Index> {
     let draft = draft_dir(scope)?;
     let final_dir = final_dir(scope)?;
     if store.exists(&index_path(&final_dir))? {
-        return store.read_versioned_json(&index_path(&final_dir), crate::FileSchemaKind::Index);
+        let completed =
+            store.read_versioned_json(&index_path(&final_dir), crate::FileSchemaKind::Index)?;
+        validate_detail_layout(store, &final_dir, &completed)?;
+        return Ok(completed);
     }
     let mut index: Index =
         store.read_versioned_json(&index_path(&draft), crate::FileSchemaKind::Index)?;
-    let details_dir = draft.join("details");
+    validate_detail_layout(store, &draft, &index)?;
+    let count = count_details(store, &draft.join("details"))?;
+    index.detail_count = count;
+    store.write_authoritative_json(&index_path(&draft), index.clone())?;
+    rename_dir_atomic(store.root(), &draft, &final_dir)?;
+    store.read_versioned_json(&index_path(&final_dir), crate::FileSchemaKind::Index)
+}
+
+fn validate_detail_layout(store: &FileStore, directory: &Path, index: &Index) -> Result<()> {
+    let details_dir = directory.join("details");
     let count = count_details(store, &details_dir)?;
     if count == 0 {
         return Err(StoreError::InvalidDocument {
             kind: "index",
             message: "finalize requires at least one Detail".to_owned(),
+        });
+    }
+    if index.detail_count != 0 && index.detail_count != count {
+        return Err(StoreError::InvalidDocument {
+            kind: "index",
+            message: "Index detail_count does not match Detail files".to_owned(),
         });
     }
     let mut sort_orders = fs::read_dir(store.root().join(&details_dir))
@@ -738,10 +756,7 @@ pub fn finalize_index(store: &FileStore, scope: &IndexScope) -> Result<Index> {
             message: "Detail sort_order values must be contiguous and unique".to_owned(),
         });
     }
-    index.detail_count = count;
-    store.write_authoritative_json(&index_path(&draft), index.clone())?;
-    rename_dir_atomic(store.root(), &draft, &final_dir)?;
-    store.read_versioned_json(&index_path(&final_dir), crate::FileSchemaKind::Index)
+    Ok(())
 }
 
 fn count_details(store: &FileStore, details_dir: &Path) -> Result<usize> {
