@@ -361,8 +361,10 @@ impl VisibleEvidenceSet {
 }
 
 fn same_evidence_provenance(left: &EvidenceReadEvent, right: &EvidenceReadEvent) -> bool {
-    left.tool_name == right.tool_name
-        && left.subject_kind == right.subject_kind
+    // A snapshot reader and a detail reader may legitimately expose the same
+    // immutable source object.  The subject identity and its source scope are
+    // authoritative; the reader name is audit metadata, not provenance.
+    left.subject_kind == right.subject_kind
         && left.subject_id == right.subject_id
         && left.source_run_id == right.source_run_id
         && left.source_phase == right.source_phase
@@ -474,8 +476,8 @@ mod tests {
 
     use super::{
         append_session_event, read_session_events, write_session_manifest, EvidenceReadEvent,
-        ForkReference, SessionEventInput, SessionEventType, SessionLocation, SessionManifest,
-        VisibleEvidenceSet,
+        ForkReference, SessionEvent, SessionEventInput, SessionEventType, SessionLocation,
+        SessionManifest, VisibleEvidenceSet,
     };
     use crate::{FileStore, FileStoreOptions, RunLocation};
 
@@ -602,5 +604,47 @@ mod tests {
             VisibleEvidenceSet::from_events(read_session_events(&store, &location).unwrap())
                 .is_err()
         );
+    }
+
+    #[test]
+    fn same_subject_from_snapshot_and_detail_is_one_visible_evidence_item() {
+        let location = location();
+        let session = SessionManifest::new(
+            &location,
+            "analyst.technical",
+            1,
+            "analyst_report",
+            None,
+            "2026-07-27T00:00:00Z",
+        )
+        .unwrap();
+        let event = |sequence: u64, tool_name: &str| {
+            SessionEvent::new(
+                sequence,
+                &session,
+                SessionEventInput {
+                    event_type: SessionEventType::EvidenceRead,
+                    turn_id: "turn-1".to_owned(),
+                    payload: json!(EvidenceReadEvent {
+                        tool_name: tool_name.to_owned(),
+                        subject_kind: "technical_signal".to_owned(),
+                        subject_id: "QQQ:daily:structure:2026-07-27".to_owned(),
+                        source_run_id: "run-one".to_owned(),
+                        source_phase: 1,
+                        ticker: Some("QQQ".to_owned()),
+                        topic_id: None,
+                        turn_id: "turn-1".to_owned(),
+                        session_id: location.session_id.clone(),
+                    }),
+                    created_at: "2026-07-27T00:00:00Z".to_owned(),
+                },
+            )
+            .unwrap()
+        };
+        let snapshot = event(1, "read_technical_snapshot");
+        let detail = event(2, "read_technical_detail");
+        let visible = VisibleEvidenceSet::from_events([snapshot, detail]).unwrap();
+        assert!(visible.contains("QQQ:daily:structure:2026-07-27"));
+        assert_eq!(visible.len(), 1);
     }
 }
