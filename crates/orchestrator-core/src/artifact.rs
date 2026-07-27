@@ -70,6 +70,7 @@ pub struct Scenarios {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct TradeIntent {
     pub action: String,
     /// Rust-owned rating mapping before the Trader applies semantic blockers.
@@ -82,20 +83,37 @@ pub struct TradeIntent {
     pub entry_price: Option<String>,
     #[serde(default)]
     pub stop_loss: Option<String>,
-    #[serde(default)]
-    pub position_size: String,
-    /// Numeric maximum portfolio fraction. Replaces free-form percentage text.
-    #[serde(default)]
+    /// Numeric maximum portfolio fraction in [0.0, 1.0].
+    ///
+    /// Canonical Contract v2 deliberately has no free-form `position_size`
+    /// field: callers must supply this machine-readable cap directly.
     pub position_size_pct_max: f64,
     #[serde(default)]
     pub blockers: Vec<String>,
     #[serde(default)]
     pub rationale: String,
-    #[serde(flatten)]
-    pub extra: Map<String, Value>,
+}
+
+/// The only stop semantics persisted by Canonical Contract v2.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StopType {
+    Hard,
+    Soft,
+    None,
+}
+
+/// The only evidence classifications persisted by Canonical Contract v2.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceType {
+    Fact,
+    Opinion,
+    Inference,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct RiskConstraints {
     pub stance: String,
     #[serde(default)]
@@ -112,9 +130,8 @@ pub struct RiskConstraints {
     pub no_new_information: bool,
     #[serde(default)]
     pub recommended_adjustment: String,
-    /// none | tight | trailing | event_based | time_based
-    #[serde(default)]
-    pub stop_type: String,
+    /// hard | soft | none
+    pub stop_type: StopType,
     /// 0.0-1.0 fraction of capital at risk before stopping.
     #[serde(default)]
     pub max_drawdown_pct: f64,
@@ -136,11 +153,18 @@ pub struct RiskConstraints {
     /// 0.0-1.0 confidence in the constraints themselves.
     #[serde(default)]
     pub constraint_confidence: f64,
-    #[serde(flatten)]
-    pub extra: Map<String, Value>,
+}
+
+/// A Phase 5 control that is binding on a Phase 6 per-asset decision.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BindingRiskControl {
+    pub control: String,
+    pub source_refs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct AssetExecutionConstraint {
     /// increase_only | decrease_only | unchanged
     #[serde(default)]
@@ -158,7 +182,7 @@ pub struct AssetExecutionConstraint {
     #[serde(default)]
     pub max_weight_delta: f64,
     #[serde(default)]
-    pub binding_risk_controls: Vec<String>,
+    pub binding_risk_controls: Vec<BindingRiskControl>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
@@ -212,14 +236,12 @@ pub struct AnalystTickerArtifact {
     /// Evidence-consistency / clarity, 0.0-1.0 (NOT 0-100, NOT upside probability).
     pub confidence: f64,
     /// Full prose analysis for this ticker (may contain sections / Markdown tables).
-    #[serde(default, deserialize_with = "deserialize_string_or_object")]
+    #[serde(default)]
     pub report: String,
     /// The 2-3 most decisive evidence items.
     ///
-    /// Structured `EvidenceItem` objects are preferred. Legacy plain-string
-    /// entries are accepted during deserialization and normalized to
-    /// `evidence_type = "unclassified"`.
-    #[serde(default, deserialize_with = "deserialize_key_evidence")]
+    /// Structured source-backed evidence; the evidence type is always explicit.
+    #[serde(default)]
     pub key_evidence: Vec<EvidenceItem>,
     /// already_priced | under_priced | unclear
     #[serde(default)]
@@ -231,78 +253,30 @@ pub struct AnalystTickerArtifact {
     #[serde(default)]
     pub crowded_consensus_risk: String,
     /// Observations that would strengthen or overturn the current call.
-    #[serde(default, deserialize_with = "deserialize_string_vec_flexible")]
+    #[serde(default)]
     pub validation_triggers: Vec<String>,
     /// Data gaps and uncertainties; empty array when none.
-    #[serde(default, deserialize_with = "deserialize_string_vec_flexible")]
+    #[serde(default)]
     pub data_gaps: Vec<String>,
 }
 
 /// Canonical evidence-type tokens accepted by runtime validators and reducers.
-pub const CANONICAL_EVIDENCE_TYPES: &[&str] = &["fact", "opinion", "speculation", "unclassified"];
+pub const CANONICAL_EVIDENCE_TYPES: &[&str] = &["fact", "opinion", "inference"];
 
-/// Normalize model-invented / legacy evidence-type labels onto the canonical set.
-pub fn normalize_evidence_type(raw: &str) -> String {
-    let normalized = raw
-        .trim()
-        .to_ascii_lowercase()
-        .chars()
-        .map(|ch| match ch {
-            '-' | ' ' => '_',
-            other => other,
-        })
-        .collect::<String>();
-    match normalized.as_str() {
-        "fact" | "opinion" | "speculation" | "unclassified" => normalized,
-        "fact_provider_standardized"
-        | "fact_source_reported"
-        | "fact_source"
-        | "standardized_fact"
-        | "provider_fact"
-        | "provider_standardized"
-        | "data"
-        | "observation"
-        | "official_fact"
-        | "reported_fact" => "fact".to_string(),
-        "derived_calculation"
-        | "analyst_interpretation"
-        | "interpretation"
-        | "analysis"
-        | "market_commentary"
-        | "issuer_management_claim"
-        | "management_claim"
-        | "retail_sentiment_sample"
-        | "calculation"
-        | "derived"
-        | "commentary" => "opinion".to_string(),
-        "rumor" | "hearsay" | "unverified" | "speculation_only" | "speculative" => {
-            "speculation".to_string()
-        }
-        "" => "unclassified".to_string(),
-        _ => "unclassified".to_string(),
-    }
-}
-
-/// Rewrite `key_evidence[].evidence_type` onto canonical tokens in place.
-pub fn normalize_analyst_ticker_artifact(artifact: &mut AnalystTickerArtifact) {
-    for item in &mut artifact.key_evidence {
-        item.evidence_type = normalize_evidence_type(&item.evidence_type);
-        item.source_tier = match item.source_tier.to_ascii_lowercase().as_str() {
-            "t1_reference" | "t2_reference" | "t3_reference" => "unknown".to_string(),
-            _ => item.source_tier.clone(),
-        };
-    }
-}
+/// Transitional call-site seam retained while the legacy LLM adapter migrates.
+///
+/// Contract v2 has no normalization path: deserialization already rejects
+/// non-canonical evidence. The function intentionally performs no mutation.
+pub fn normalize_analyst_ticker_artifact(_artifact: &mut AnalystTickerArtifact) {}
 
 /// A single piece of evidence with type classification.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct EvidenceItem {
     /// The evidence claim in 1-2 sentences.
-    #[serde(default, alias = "summary", alias = "event", alias = "description")]
     pub claim: String,
-    /// Evidence type: "fact" | "opinion" | "speculation" | "unclassified".
-    #[serde(default, alias = "classification", alias = "type")]
-    pub evidence_type: String,
+    /// Evidence type: fact | opinion | inference.
+    pub evidence_type: EvidenceType,
     /// Where the evidence came from (tool name, data source, URL description).
     #[serde(default)]
     pub source: String,
@@ -327,145 +301,6 @@ pub struct EvidenceItem {
     pub source_confidence: f64,
 }
 
-fn value_as_string(value: Option<&Value>) -> String {
-    match value {
-        Some(Value::String(text)) => text.trim().to_string(),
-        Some(Value::Number(number)) => number.to_string(),
-        Some(Value::Bool(flag)) => flag.to_string(),
-        Some(Value::Null) | None => String::new(),
-        Some(other) => other.to_string(),
-    }
-}
-
-fn first_nonempty_string(obj: &Map<String, Value>, keys: &[&str]) -> String {
-    for key in keys {
-        let text = value_as_string(obj.get(*key));
-        if !text.is_empty() {
-            return text;
-        }
-    }
-    String::new()
-}
-
-/// Normalize a free-form evidence object into [`EvidenceItem`].
-/// Handles model drift: both evidence_age+catalyst_age, claim under assessment, source_quality.
-pub fn evidence_item_from_value(value: Value) -> Result<EvidenceItem, String> {
-    match value {
-        Value::String(text) => Ok(EvidenceItem {
-            claim: text,
-            evidence_type: "unclassified".to_string(),
-            source: String::new(),
-            timestamp: String::new(),
-            source_tier: String::new(),
-            first_source: String::new(),
-            is_derivative_repost: false,
-            evidence_age: String::new(),
-            source_confidence: 0.0,
-        }),
-        Value::Object(obj) => {
-            let claim = first_nonempty_string(
-                &obj,
-                &[
-                    "claim",
-                    "summary",
-                    "event",
-                    "description",
-                    "assessment",
-                    "actual",
-                ],
-            );
-            let evidence_type = normalize_evidence_type(&first_nonempty_string(
-                &obj,
-                &["evidence_type", "classification", "type"],
-            ));
-            let source = value_as_string(obj.get("source"));
-            let timestamp = value_as_string(obj.get("timestamp"));
-            let mut source_tier = first_nonempty_string(&obj, &["source_tier", "source_quality"]);
-            source_tier = match source_tier.as_str() {
-                "industry_media" | "analyst_note" => "professional_research".to_string(),
-                "rumor" => "unknown".to_string(),
-                other => other.to_string(),
-            };
-            let first_source = value_as_string(obj.get("first_source"));
-            let is_derivative_repost = match obj.get("is_derivative_repost") {
-                Some(Value::Bool(flag)) => *flag,
-                Some(Value::String(text)) => matches!(
-                    text.trim().to_ascii_lowercase().as_str(),
-                    "true" | "1" | "yes"
-                ),
-                _ => false,
-            };
-            let evidence_age =
-                first_nonempty_string(&obj, &["evidence_age", "catalyst_age", "age"]);
-            let source_confidence = match obj.get("source_confidence") {
-                Some(Value::Number(number)) => number.as_f64().unwrap_or(0.0),
-                Some(Value::String(text)) => text.parse().unwrap_or(0.0),
-                _ => 0.0,
-            };
-            Ok(EvidenceItem {
-                claim,
-                evidence_type,
-                source,
-                timestamp,
-                source_tier,
-                first_source,
-                is_derivative_repost,
-                evidence_age,
-                source_confidence,
-            })
-        }
-        _ => Err("evidence item must be string or object".to_string()),
-    }
-}
-
-/// Accept a string or an object (serialized to JSON string) for fields like `report`.
-fn deserialize_string_or_object<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = Value::deserialize(deserializer)?;
-    match value {
-        Value::String(s) => Ok(s),
-        Value::Null => Ok(String::new()),
-        other => Ok(other.to_string()),
-    }
-}
-
-/// Accept a vec of strings or objects (objects are serialized to JSON strings).
-fn deserialize_string_vec_flexible<'de, D>(
-    deserializer: D,
-) -> std::result::Result<Vec<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let raw: Vec<Value> = Vec::deserialize(deserializer)?;
-    Ok(raw
-        .into_iter()
-        .map(|v| match v {
-            Value::String(s) => s,
-            other => other.to_string(),
-        })
-        .collect())
-}
-
-/// Deserialize key_evidence accepting both structured objects and plain strings.
-fn deserialize_key_evidence<'de, D>(
-    deserializer: D,
-) -> std::result::Result<Vec<EvidenceItem>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::de::Error;
-
-    let raw: Vec<Value> = Vec::deserialize(deserializer)?;
-    raw.into_iter()
-        .map(|value| {
-            evidence_item_from_value(value)
-                .map_err(|error| Error::custom(format!("invalid evidence item: {error}")))
-        })
-        .collect()
-}
-
 pub fn validate_evidence_types(
     artifact: &AnalystTickerArtifact,
 ) -> std::result::Result<(), String> {
@@ -477,13 +312,6 @@ pub fn validate_evidence_types(
         "unknown",
     ];
     for evidence in &artifact.key_evidence {
-        let canonical = normalize_evidence_type(&evidence.evidence_type);
-        if !CANONICAL_EVIDENCE_TYPES.contains(&canonical.as_str()) {
-            return Err(format!(
-                "invalid evidence_type '{}' in evidence '{}'; must be fact, opinion, or speculation",
-                evidence.evidence_type, evidence.claim
-            ));
-        }
         if !evidence.source_tier.is_empty()
             && !ALLOWED_SOURCE_TIERS.contains(&evidence.source_tier.as_str())
         {
@@ -588,24 +416,8 @@ pub fn validate_analyst_ticker_artifact(
     validate_evidence_quality(artifact)
 }
 
-/// Validate a parsed `RiskConstraints` artifact for well-formed enum and
-/// range values. Tolerant of empty / zero (unspecified) fields so legacy
-/// artifacts continue to deserialize.
+/// Validate a parsed Canonical Contract v2 `RiskConstraints` artifact.
 pub fn validate_risk_constraints(artifact: &RiskConstraints) -> std::result::Result<(), String> {
-    const ALLOWED_STOP_TYPES: &[&str] =
-        &["none", "tight", "trailing", "event_based", "time_based", ""];
-    if !ALLOWED_STOP_TYPES.contains(&artifact.stop_type.as_str()) {
-        return Err(format!(
-            "invalid stop_type '{}'; must be one of: {}",
-            artifact.stop_type,
-            ALLOWED_STOP_TYPES
-                .iter()
-                .filter(|s| !s.is_empty())
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
-    }
     if artifact.max_drawdown_pct != 0.0 && !(0.0..=1.0).contains(&artifact.max_drawdown_pct) {
         return Err(format!(
             "max_drawdown_pct {} out of range; must be in [0.0, 1.0] when specified",
@@ -625,6 +437,102 @@ pub fn validate_risk_constraints(artifact: &RiskConstraints) -> std::result::Res
             "constraint_confidence {} out of range; must be in [0.0, 1.0] when specified",
             artifact.constraint_confidence
         ));
+    }
+    Ok(())
+}
+
+/// Validate the machine-readable sizing and hold semantics of a v2 trade intent.
+pub fn validate_trade_intent(artifact: &TradeIntent) -> std::result::Result<(), String> {
+    if !matches!(artifact.action.as_str(), "Buy" | "Sell" | "Hold") {
+        return Err("trade intent action must be Buy, Sell, or Hold".to_string());
+    }
+    if !matches!(artifact.candidate_action.as_str(), "Buy" | "Sell" | "Hold") {
+        return Err("trade intent candidate_action must be Buy, Sell, or Hold".to_string());
+    }
+    if !matches!(
+        artifact.execution_decision.as_str(),
+        "execute_candidate" | "hold"
+    ) {
+        return Err(
+            "trade intent execution_decision must be execute_candidate or hold".to_string(),
+        );
+    }
+    if !artifact.position_size_pct_max.is_finite()
+        || !(0.0..=1.0).contains(&artifact.position_size_pct_max)
+    {
+        return Err("position_size_pct_max must be finite and in [0.0, 1.0]".to_string());
+    }
+    if (artifact.action == "Hold" || artifact.execution_decision == "hold")
+        && artifact.position_size_pct_max > f64::EPSILON
+    {
+        return Err("held trade intent must use position_size_pct_max=0".to_string());
+    }
+    if artifact.rationale.trim().is_empty() {
+        return Err("trade intent rationale must not be empty".to_string());
+    }
+    Ok(())
+}
+
+/// Validate Phase 6 constraints consumed by the Rust-owned allocation engine.
+pub fn validate_asset_execution_constraint(
+    artifact: &AssetExecutionConstraint,
+) -> std::result::Result<(), String> {
+    if !matches!(
+        artifact.direction_constraint.as_str(),
+        "increase_only" | "decrease_only" | "unchanged"
+    ) {
+        return Err(
+            "direction_constraint must be increase_only, decrease_only, or unchanged".to_string(),
+        );
+    }
+    if !matches!(
+        artifact.execution_status.as_str(),
+        "execute" | "wait" | "downgrade"
+    ) {
+        return Err("execution_status must be execute, wait, or downgrade".to_string());
+    }
+    for (field, value) in [
+        ("current_weight", artifact.current_weight),
+        ("max_target_weight", artifact.max_target_weight),
+        ("max_weight_delta", artifact.max_weight_delta),
+    ] {
+        if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+            return Err(format!("{field} must be finite and in [0.0, 1.0]"));
+        }
+    }
+    for control in &artifact.binding_risk_controls {
+        if control.control.trim().is_empty() {
+            return Err("binding risk control must not be empty".to_string());
+        }
+        if control.source_refs.is_empty()
+            || control
+                .source_refs
+                .iter()
+                .any(|reference| reference.trim().is_empty())
+        {
+            return Err(
+                "binding risk control source_refs must contain non-empty source references"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Validate a Phase 6 v2 artifact, including every per-asset constraint.
+pub fn validate_final_validation(artifact: &FinalValidation) -> std::result::Result<(), String> {
+    if !matches!(
+        artifact.execution_status.as_str(),
+        "execute" | "wait" | "downgrade"
+    ) {
+        return Err("execution_status must be execute, wait, or downgrade".to_string());
+    }
+    if artifact.execution_summary.trim().is_empty() {
+        return Err("execution_summary must not be empty".to_string());
+    }
+    for (ticker, constraint) in &artifact.per_asset {
+        validate_asset_execution_constraint(constraint)
+            .map_err(|error| format!("per_asset.{ticker}: {error}"))?;
     }
     Ok(())
 }
@@ -1213,7 +1121,7 @@ mod tests {
             report: "QQQ remains above its 20-day average.".to_string(),
             key_evidence: vec![EvidenceItem {
                 claim: "QQQ closed above its 20-day average.".to_string(),
-                evidence_type: "fact".to_string(),
+                evidence_type: EvidenceType::Fact,
                 source: "Yahoo Finance daily OHLCV".to_string(),
                 timestamp: "2026-07-22".to_string(),
                 source_tier: "official".to_string(),
@@ -1241,14 +1149,11 @@ mod tests {
     }
 
     #[test]
-    fn analyst_normalization_maps_legacy_reference_tier_to_unknown() {
+    fn analyst_rejects_legacy_evidence_source_tier() {
         let mut artifact = valid_analyst_ticker_artifact();
         artifact.key_evidence[0].source_tier = "T1_reference".to_string();
 
-        normalize_analyst_ticker_artifact(&mut artifact);
-
-        assert_eq!(artifact.key_evidence[0].source_tier, "unknown");
-        validate_analyst_ticker_artifact(&artifact).unwrap();
+        assert!(validate_analyst_ticker_artifact(&artifact).is_err());
     }
 
     #[test]
@@ -1316,22 +1221,19 @@ mod tests {
         }"#;
         let item: EvidenceItem = serde_json::from_str(json).unwrap();
         assert_eq!(item.claim, "CPI came in at 3.2%");
-        assert_eq!(item.evidence_type, "fact");
+        assert_eq!(item.evidence_type, EvidenceType::Fact);
         assert_eq!(item.source, "BLS via Jin10");
         assert_eq!(item.timestamp, "2026-07-06");
     }
 
     #[test]
-    fn analyst_artifact_accepts_legacy_string_evidence() {
+    fn analyst_artifact_rejects_legacy_string_evidence() {
         let json = r#"{
             "direction": "bullish",
             "confidence": 0.7,
             "key_evidence": ["simple string evidence"]
         }"#;
-        let artifact: AnalystTickerArtifact = serde_json::from_str(json).unwrap();
-        assert_eq!(artifact.key_evidence.len(), 1);
-        assert_eq!(artifact.key_evidence[0].claim, "simple string evidence");
-        assert_eq!(artifact.key_evidence[0].evidence_type, "unclassified");
+        assert!(serde_json::from_str::<AnalystTickerArtifact>(json).is_err());
     }
 
     #[test]
@@ -1345,58 +1247,35 @@ mod tests {
         }"#;
         let artifact: AnalystTickerArtifact = serde_json::from_str(json).unwrap();
         assert_eq!(artifact.key_evidence[0].claim, "CPI 3.2%");
-        assert_eq!(artifact.key_evidence[0].evidence_type, "fact");
+        assert_eq!(artifact.key_evidence[0].evidence_type, EvidenceType::Fact);
     }
 
     #[test]
-    fn analyst_artifact_accepts_mixed_evidence_formats() {
+    fn analyst_artifact_rejects_legacy_evidence_types() {
         let json = r#"{
             "direction": "mixed",
             "confidence": 0.5,
             "key_evidence": [
-                "legacy observation",
                 {"claim": "Options rumor", "evidence_type": "speculation", "source": "unverified market report"}
             ]
         }"#;
-        let artifact: AnalystTickerArtifact = serde_json::from_str(json).unwrap();
-        assert_eq!(artifact.key_evidence.len(), 2);
-        assert_eq!(artifact.key_evidence[0].evidence_type, "unclassified");
-        assert_eq!(artifact.key_evidence[1].evidence_type, "speculation");
-        assert_eq!(artifact.key_evidence[1].timestamp, "");
+        assert!(serde_json::from_str::<AnalystTickerArtifact>(json).is_err());
     }
 
     #[test]
-    fn normalize_evidence_type_maps_legacy_labels() {
-        assert_eq!(normalize_evidence_type("rumor"), "speculation");
-        assert_eq!(normalize_evidence_type("analyst_interpretation"), "opinion");
-        let mut artifact = AnalystTickerArtifact {
-            direction: "bullish".to_string(),
-            confidence: 0.7,
-            report: String::new(),
-            key_evidence: vec![EvidenceItem {
-                claim: "ambiguous claim".to_string(),
-                evidence_type: "rumor".to_string(),
-                source: String::new(),
-                timestamp: String::new(),
-                source_tier: String::new(),
-                first_source: String::new(),
-                is_derivative_repost: false,
-                evidence_age: String::new(),
-                source_confidence: 0.0,
-            }],
-            priced_in: String::new(),
-            echo_chamber_risk: String::new(),
-            crowded_consensus_risk: String::new(),
-            validation_triggers: Vec::new(),
-            data_gaps: Vec::new(),
-        };
-        normalize_analyst_ticker_artifact(&mut artifact);
-        assert_eq!(artifact.key_evidence[0].evidence_type, "speculation");
-        validate_evidence_types(&artifact).unwrap();
+    fn evidence_type_is_closed_to_v2_variants() {
+        for value in ["fact", "opinion", "inference"] {
+            let json = format!("{{\"claim\":\"x\",\"evidence_type\":\"{value}\"}}");
+            serde_json::from_str::<EvidenceItem>(&json).unwrap();
+        }
+        assert!(serde_json::from_str::<EvidenceItem>(
+            r#"{"claim":"x","evidence_type":"speculation"}"#
+        )
+        .is_err());
     }
 
     #[test]
-    fn analyst_artifact_accepts_duplicate_age_aliases_and_assessment_claim() {
+    fn analyst_artifact_rejects_legacy_aliases_and_duplicate_fields() {
         let json = r#"{
             "direction": "bearish",
             "confidence": 0.62,
@@ -1413,10 +1292,7 @@ mod tests {
                 "source_confidence": 0.72
             }]
         }"#;
-        let artifact: AnalystTickerArtifact = serde_json::from_str(json).unwrap();
-        assert_eq!(artifact.key_evidence[0].claim, "半导体权重同步走弱");
-        assert_eq!(artifact.key_evidence[0].evidence_age, "0-2d");
-        validate_analyst_ticker_artifact(&artifact).unwrap();
+        assert!(serde_json::from_str::<AnalystTickerArtifact>(json).is_err());
     }
 
     #[test]
@@ -1468,7 +1344,7 @@ mod tests {
             report: String::new(),
             key_evidence: vec![EvidenceItem {
                 claim: "a claim".to_string(),
-                evidence_type: "fact".to_string(),
+                evidence_type: EvidenceType::Fact,
                 source: String::new(),
                 timestamp: String::new(),
                 source_tier: "garbage".to_string(),
@@ -1495,7 +1371,7 @@ mod tests {
             report: String::new(),
             key_evidence: vec![EvidenceItem {
                 claim: "a claim".to_string(),
-                evidence_type: "fact".to_string(),
+                evidence_type: EvidenceType::Fact,
                 source: String::new(),
                 timestamp: String::new(),
                 source_tier: String::new(),
@@ -1523,7 +1399,7 @@ mod tests {
             disagreement_with_prior: String::new(),
             no_new_information: false,
             recommended_adjustment: String::new(),
-            stop_type: String::new(),
+            stop_type: StopType::None,
             max_drawdown_pct: 1.5,
             position_cap_pct: 0.0,
             rebalance_trigger: String::new(),
@@ -1531,33 +1407,18 @@ mod tests {
             review_window: String::new(),
             cash_hedge_recommendation: String::new(),
             constraint_confidence: 0.0,
-            extra: Map::new(),
         };
         let error = validate_risk_constraints(&artifact).unwrap_err();
         assert!(error.contains("max_drawdown_pct 1.5 out of range"));
     }
 
     #[test]
-    fn validate_risk_constraints_rejects_invalid_stop_type() {
-        let artifact = RiskConstraints {
-            stance: "neutral".to_string(),
-            argument: String::new(),
-            unique_risk_contribution: String::new(),
-            disagreement_with_prior: String::new(),
-            no_new_information: false,
-            recommended_adjustment: String::new(),
-            stop_type: "weird".to_string(),
-            max_drawdown_pct: 0.0,
-            position_cap_pct: 0.0,
-            rebalance_trigger: String::new(),
-            risk_off_trigger: String::new(),
-            review_window: String::new(),
-            cash_hedge_recommendation: String::new(),
-            constraint_confidence: 0.0,
-            extra: Map::new(),
-        };
-        let error = validate_risk_constraints(&artifact).unwrap_err();
-        assert!(error.contains("invalid stop_type 'weird'"));
+    fn risk_constraints_reject_legacy_stop_type() {
+        let error = serde_json::from_str::<RiskConstraints>(
+            r#"{"stance":"neutral","stop_type":"trailing"}"#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("trailing"));
     }
 
     #[test]
@@ -1603,7 +1464,7 @@ mod tests {
         let json = r#"{
             "stance": "conservative",
             "recommended_adjustment": "Cap exposure at 50%.",
-            "stop_type": "trailing",
+            "stop_type": "soft",
             "max_drawdown_pct": 0.15,
             "position_cap_pct": 0.5,
             "rebalance_trigger": "VIX > 25",
@@ -1613,7 +1474,7 @@ mod tests {
             "constraint_confidence": 0.8
         }"#;
         let artifact: RiskConstraints = serde_json::from_str(json).unwrap();
-        assert_eq!(artifact.stop_type, "trailing");
+        assert_eq!(artifact.stop_type, StopType::Soft);
         assert!((artifact.max_drawdown_pct - 0.15).abs() < f64::EPSILON);
         assert!((artifact.position_cap_pct - 0.5).abs() < f64::EPSILON);
         assert_eq!(artifact.rebalance_trigger, "VIX > 25");
@@ -1622,6 +1483,79 @@ mod tests {
         assert_eq!(artifact.cash_hedge_recommendation, "Hold 20% cash.");
         assert!((artifact.constraint_confidence - 0.8).abs() < f64::EPSILON);
         assert!(validate_risk_constraints(&artifact).is_ok());
+    }
+
+    #[test]
+    fn trade_intent_v2_requires_numeric_cap_and_rejects_legacy_size() {
+        let valid: TradeIntent = serde_json::from_str(
+            r#"{
+                "action":"Buy",
+                "candidate_action":"Buy",
+                "execution_decision":"execute_candidate",
+                "position_size_pct_max":0.25,
+                "blockers":[],
+                "rationale":"The evidence supports a bounded entry."
+            }"#,
+        )
+        .unwrap();
+        validate_trade_intent(&valid).unwrap();
+
+        let legacy = r#"{
+            "action":"Buy",
+            "candidate_action":"Buy",
+            "execution_decision":"execute_candidate",
+            "position_size":"25%",
+            "position_size_pct_max":0.25,
+            "blockers":[],
+            "rationale":"The evidence supports a bounded entry."
+        }"#;
+        assert!(serde_json::from_str::<TradeIntent>(legacy).is_err());
+    }
+
+    #[test]
+    fn trade_intent_v2_enforces_hold_zero_cap() {
+        let artifact = TradeIntent {
+            action: "Hold".to_string(),
+            candidate_action: "Hold".to_string(),
+            execution_decision: "hold".to_string(),
+            entry_price: None,
+            stop_loss: None,
+            position_size_pct_max: 0.1,
+            blockers: Vec::new(),
+            rationale: "No executable edge exists.".to_string(),
+        };
+        assert!(validate_trade_intent(&artifact)
+            .unwrap_err()
+            .contains("position_size_pct_max=0"));
+    }
+
+    #[test]
+    fn asset_execution_constraint_v2_requires_structured_binding_refs() {
+        let constraint: AssetExecutionConstraint = serde_json::from_str(
+            r#"{
+                "direction_constraint":"increase_only",
+                "execution_status":"execute",
+                "current_weight":0.1,
+                "max_target_weight":0.25,
+                "max_weight_delta":0.15,
+                "binding_risk_controls":[{
+                    "control":"Cap exposure during elevated volatility.",
+                    "source_refs":["idx-risk-qqq", "detail-risk-qqq-1"]
+                }]
+            }"#,
+        )
+        .unwrap();
+        validate_asset_execution_constraint(&constraint).unwrap();
+
+        let legacy = r#"{
+            "direction_constraint":"increase_only",
+            "execution_status":"execute",
+            "current_weight":0.1,
+            "max_target_weight":0.25,
+            "max_weight_delta":0.15,
+            "binding_risk_controls":["Cap exposure"]
+        }"#;
+        assert!(serde_json::from_str::<AssetExecutionConstraint>(legacy).is_err());
     }
 
     fn valid_scenarios() -> Scenarios {
@@ -1990,7 +1924,7 @@ mod tests {
         for (schema, fields) in [
             (
                 trade_intent_schema(),
-                vec!["action", "entry_price", "position_size"],
+                vec!["action", "entry_price", "position_size_pct_max"],
             ),
             (
                 risk_constraints_schema(),
@@ -2015,6 +1949,25 @@ mod tests {
                 assert!(schema.contains(field), "schema missing field {field}");
             }
         }
+    }
+
+    #[test]
+    fn canonical_contract_v2_schemas_exclude_removed_fields() {
+        let trade = trade_intent_schema();
+        assert!(trade.contains("position_size_pct_max"));
+        assert!(!trade.contains("\"position_size\""));
+
+        let risk = risk_constraints_schema();
+        for stop_type in ["hard", "soft", "none"] {
+            assert!(risk.contains(stop_type));
+        }
+        for removed in ["tight", "trailing", "event_based", "time_based"] {
+            assert!(!risk.contains(removed));
+        }
+
+        let final_validation = final_validation_schema();
+        assert!(final_validation.contains("binding_risk_controls"));
+        assert!(final_validation.contains("source_refs"));
     }
 
     #[test]

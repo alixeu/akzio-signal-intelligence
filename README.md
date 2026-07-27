@@ -122,6 +122,24 @@ weights from the project-only Alpaca Paper account when credentials are present
 in a non-mock, non-debug run. `--mock` and `--debug` remove all account and
 order tools from the model and make the tool runtime reject direct calls.
 
+## Canonical Contract v2 (Phase 4–6)
+
+The file-backed ToolManaged path writes Canonical Contract v2. These changes are
+intentional breaking changes: a v2 reader does not silently default, normalize,
+or reinterpret a removed field. Older persisted files require an explicit
+migration before they can become v2 artifacts.
+
+| Area | Removed | v2 field / allowed values | Defaults and validation | Downstream consumer | Fallback |
+|---|---|---|---|---|---|
+| Phase 4 `TradeIntent` | `position_size` free-form string | required numeric `position_size_pct_max` in `[0, 1]` | no implicit cap; Hold / `execution_decision=hold` requires `0` | Rust Phase 7 allocation and execution | reject invalid or legacy payload; degrade through the workflow policy, never parse percentage prose |
+| Phase 5 `RiskConstraints` | `tight`, `trailing`, `event_based`, `time_based`, and empty `stop_type` | required `stop_type`: `hard`, `soft`, or `none` | no implicit stop type | Phase 6 portfolio constraint builder and report renderer | reject at deserialization; no enum remapping |
+| Phase 6 binding controls | `binding_risk_controls: ["free-form text"]` | `binding_risk_controls: [{"control":"…","source_refs":["…"]}]` | control and each source reference are non-empty; the control array itself defaults only to `[]` | Rust allocation projection, audit, and report detail | reject string controls or untraceable bindings |
+| Phase 1 evidence | `speculation`, `unclassified`, aliases, and string evidence | required `evidence_type`: `fact`, `opinion`, or `inference` | no type inference or alias normalization | evidence reducers and conflict analysis | reject non-v2 evidence; the role may use its normal degraded policy |
+
+Contract validation lives in `orchestrator-core` so builders, finalizers, and
+future consumers use the same pure checks. The contract does not retain a
+dual-write field or a reader fallback to the legacy representation.
+
 ## Workspace crates
 
 | Crate | Responsibility |
