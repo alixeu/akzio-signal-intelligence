@@ -2,7 +2,10 @@ use anyhow::{bail, Context, Result};
 use chrono::{Local, NaiveDate, Utc};
 use orchestrator_core::{
     config_int, config_str, config_strings, display_ticker, load_config, parse_tickers,
-    project_path,
+    project_path, ToolManagedProfile,
+};
+use orchestrator_llm::agent_loop::{
+    FileStoreSessionRuntime, SessionRuntimeSpec, ToolResultItem, Turn,
 };
 use orchestrator_store::{
     content_hash, list_run_locations, read_indexes, read_learning_record, read_run_manifest,
@@ -16,6 +19,11 @@ use std::{path::Path, time::Duration};
 use crate::orchestration::{
     allocation::{compute_allocation_context, derive_guarded_allocation},
     config::RuntimeConfig,
+    domain_runtime::{
+        finalize_degraded_analyst_report, finalize_degraded_portfolio_decision,
+        finalize_degraded_research_decision, finalize_degraded_risk_review,
+        finalize_degraded_trade_intent, FileStoreDomainRuntimePlan,
+    },
     input_snapshot_runtime::{capture_phase1_file_store_inputs, phase1_input_sources},
     lifecycle::{run_id_for, set_phase_status, tickers_from_state},
     retrieval::inject_phase_summary_reflection,
@@ -1053,12 +1061,12 @@ async fn run_unit(
         .next()
         .context("ToolManaged role produced no result")?;
     record_role_job_metrics(state, &result);
-    let artifact = result.artifact.with_context(|| {
-        format!(
-            "ToolManaged role {role} ended without terminal finalize: {}",
-            result.error.unwrap_or_else(|| "unknown error".to_owned())
-        )
-    })?;
+    let artifact = match result.artifact.clone() {
+        Some(artifact) => artifact,
+        None => finalize_degraded_tool_managed_unit(
+            state, runtime, role, phase, kind, round, topic_id, ticker, &result,
+        )?,
+    };
     let session_id = if result.session_id.is_empty() {
         format!(
             "{}:p{}:{}:{}:{}:{}",
@@ -1082,6 +1090,184 @@ async fn run_unit(
     state["_completed_units"][completed_key] = artifact.clone();
     checkpoint_state(state)?;
     Ok(artifact)
+}
+
+/// A terminal ToolManaged failure is not permission to revive an old storage
+/// path.  It is finalized through the same FileStore Draft/Builder service as
+/// an ordinary role, marked degraded, and recorded as a terminal session
+/// event so recovery and Store Doctor see one authority.
+#[allow(clippy::too_many_arguments)]
+fn finalize_degraded_tool_managed_unit(
+    state: &mut Value,
+    runtime: &RuntimeConfig,
+    role: &str,
+    phase: i64,
+    kind: &str,
+    round: Option<i64>,
+    topic_id: Option<&str>,
+    ticker: Option<&str>,
+    result: &crate::orchestration::role_jobs::RoleJobResult,
+) -> Result<Value> {
+    let failure = result
+        .error
+        .as_deref()
+        .unwrap_or("ToolManaged role ended without terminal finalize");
+    let profile = match (phase, role) {
+        (1, "analyst.technical" | "analyst.news_macro") => ToolManagedProfile::AnalystReport,
+        (3, "manager.research") => ToolManagedProfile::ResearchDecision,
+        (4, "trader") => ToolManagedProfile::TradeIntent,
+        (5, "risk.aggressive" | "risk.neutral" | "risk.conservative") => {
+            ToolManagedProfile::RiskReview
+        }
+        (6, "portfolio.manager") => ToolManagedProfile::PortfolioDecision,
+        _ => {
+            bail!(
+                "ToolManaged role {role} ended without terminal finalize: {failure}; no Rust degraded policy is registered for phase={phase} kind={kind}"
+            )
+        }
+    };
+    let registration = runtime.authority_registry.registration(role, profile)?;
+    let tickers = ticker
+        .map(|ticker| vec![ticker.to_owned()])
+        .unwrap_or_else(|| tickers_from_state(state));
+    let trade_candidate_action = tickers.first().and_then(|ticker| {
+        state
+            .pointer(&format!("/research_plan/per_ticker/{ticker}/rating"))
+            .or_else(|| state.pointer("/research_plan/rating"))
+            .and_then(Value::as_str)
+            .map(|rating| match rating {
+                "Buy" | "Overweight" => "Buy",
+                "Sell" | "Underweight" => "Sell",
+                _ => "Hold",
+            })
+            .map(ToOwned::to_owned)
+    });
+    let portfolio_rating = tickers.first().and_then(|ticker| {
+        state
+            .pointer(&format!("/research_plan/per_ticker/{ticker}/rating"))
+            .or_else(|| state.pointer("/research_plan/rating"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+    });
+    let portfolio_current_weight = tickers
+        .first()
+        .and_then(|ticker| {
+            state
+                .pointer(&format!("/account/positions/{ticker}/weight"))
+                .or_else(|| state.pointer(&format!("/current_portfolio_weights/{ticker}")))
+                .and_then(Value::as_f64)
+        })
+        .or(Some(0.0));
+    let plan = FileStoreDomainRuntimePlan {
+        role: role.to_owned(),
+        phase,
+        profile,
+        profile_version: registration.profile_version,
+        builder_version: registration.builder_version,
+        tickers,
+        visible_evidence_refs: Default::default(),
+        topic_id: topic_id.map(ToOwned::to_owned),
+        side: None,
+        round: round.and_then(|round| u32::try_from(round).ok()),
+        visible_claims: Default::default(),
+        fork: None,
+        trade_candidate_action,
+        portfolio_rating,
+        portfolio_current_weight,
+    };
+    let store_root = state
+        .get("store_root")
+        .and_then(Value::as_str)
+        .context("degraded ToolManaged fallback requires store_root")?;
+    let artifact = match profile {
+        ToolManagedProfile::AnalystReport => {
+            finalize_degraded_analyst_report(Path::new(store_root), state, plan, failure)?
+        }
+        ToolManagedProfile::ResearchDecision => {
+            finalize_degraded_research_decision(Path::new(store_root), state, plan, failure)?
+        }
+        ToolManagedProfile::TradeIntent => {
+            finalize_degraded_trade_intent(Path::new(store_root), state, plan, failure)?
+        }
+        ToolManagedProfile::RiskReview => {
+            finalize_degraded_risk_review(Path::new(store_root), state, plan, failure)?
+        }
+        ToolManagedProfile::PortfolioDecision => {
+            finalize_degraded_portfolio_decision(Path::new(store_root), state, plan, failure)?
+        }
+        _ => unreachable!("only profiles with a Rust degraded policy reach this branch"),
+    };
+    persist_degraded_terminal(
+        state,
+        role,
+        phase,
+        profile,
+        &result.session_id,
+        &result.turn_id,
+        &artifact,
+    )?;
+    state["degraded"] = Value::Bool(true);
+    if !state["errors"].is_array() {
+        state["errors"] = json!([]);
+    }
+    state["errors"]
+        .as_array_mut()
+        .expect("errors is an array after initialization")
+        .push(json!({"role": role, "phase": phase, "kind": kind, "failure": failure}));
+    Ok(artifact)
+}
+
+fn persist_degraded_terminal(
+    state: &Value,
+    role: &str,
+    phase: i64,
+    profile: ToolManagedProfile,
+    session_id: &str,
+    turn_id: &str,
+    artifact: &Value,
+) -> Result<()> {
+    let run_id = state["run_id"]
+        .as_str()
+        .context("degraded terminal requires run_id")?;
+    let date = state["current_date"]
+        .as_str()
+        .context("degraded terminal requires current_date")?;
+    let store_root = state["store_root"]
+        .as_str()
+        .context("degraded terminal requires store_root")?;
+    let session_id = if session_id.is_empty() {
+        format!("{run_id}:p{phase}:{role}:{}:degraded", profile.as_str())
+    } else {
+        session_id.to_owned()
+    };
+    let turn_id = if turn_id.is_empty() {
+        "rust-degraded-finalize".to_owned()
+    } else {
+        format!("{turn_id}:rust-degraded-finalize")
+    };
+    let session = FileStoreSessionRuntime::create_or_load(
+        FileStore::open(store_root, FileStoreOptions::default())?,
+        SessionRuntimeSpec {
+            run: RunLocation::new(date, run_id)?,
+            session_id: session_id.clone(),
+            role: role.to_owned(),
+            phase: u8::try_from(phase).context("degraded terminal phase must fit u8")?,
+            profile: profile.as_str().to_owned(),
+            fork: None,
+            created_at: Utc::now().to_rfc3339(),
+        },
+    )?;
+    let mut turn = Turn::new(&turn_id, &session_id, run_id, role, "");
+    turn.phase = Some(phase);
+    let terminal = ToolResultItem {
+        call_id: "rust-degraded-finalize".to_owned(),
+        name: format!("finalize_degraded_{}", profile.as_str()),
+        status: "completed".to_owned(),
+        output: json!({"artifact": artifact, "status": "completed", "terminal": true, "degraded": true}),
+        error: None,
+    };
+    session.append_terminal(&turn, &terminal, Utc::now().to_rfc3339())?;
+    Ok(())
 }
 
 fn completed_unit_key(
