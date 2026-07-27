@@ -120,6 +120,48 @@ pub struct ExecutionEvent {
     pub content_hash: String,
 }
 
+/// Minimal Rust-owned broker boundary for a Phase 7 submission. The workflow
+/// supplies an Alpaca adapter; the Store owns the crash-recovery ordering.
+/// The model is never given this interface.
+pub trait OrderGateway {
+    /// Return the remote broker order id for a stable client order id, if it
+    /// already exists. This lookup must happen before any new submission.
+    fn find_by_client_order_id(&self, client_order_id: &str) -> Result<Option<String>>;
+    /// Submit the exact persisted payload and return the remote broker id.
+    fn submit(&self, intent: &SubmissionIntent) -> Result<String>;
+}
+
+/// Execute a submission exactly once across process crashes:
+///
+/// 1. atomically persist the submission intent;
+/// 2. query the broker by client order id;
+/// 3. only submit when the broker confirms no prior order;
+/// 4. persist the remote id and completion marker.
+///
+/// A missing local remote receipt is therefore never evidence that it is safe
+/// to create another remote order.
+pub fn submit_or_recover<G: OrderGateway>(
+    store: &FileStore,
+    location: &RunLocation,
+    intent: SubmissionIntent,
+    gateway: &G,
+    completed_at: String,
+) -> Result<SubmissionIntent> {
+    let persisted = record_submission_intent(store, location, intent)?;
+    if persisted.status == SubmissionStatus::Completed {
+        return Ok(persisted);
+    }
+    let remote_order_id = if let Some(remote) = persisted.remote_order_id.clone() {
+        remote
+    } else if let Some(remote) = gateway.find_by_client_order_id(&persisted.client_order_id)? {
+        remote
+    } else {
+        gateway.submit(&persisted)?
+    };
+    record_remote_order(store, location, &persisted.submission_id, remote_order_id)?;
+    complete_submission(store, location, &persisted.submission_id, completed_at)
+}
+
 impl JsonlRecord for ExecutionEvent {
     const SCHEMA_VERSION: u32 = EXECUTION_EVENT_SCHEMA_VERSION;
     fn schema_version(&self) -> u32 {
@@ -324,6 +366,48 @@ mod tests {
             "2026-07-27T00:01:00Z".to_owned(),
         )
         .unwrap();
+        assert_eq!(completed.status, SubmissionStatus::Completed);
+    }
+
+    #[derive(Default)]
+    struct FakeGateway {
+        existing: Option<String>,
+        submits: std::cell::Cell<u32>,
+    }
+
+    impl OrderGateway for FakeGateway {
+        fn find_by_client_order_id(&self, _client_order_id: &str) -> Result<Option<String>> {
+            Ok(self.existing.clone())
+        }
+
+        fn submit(&self, _intent: &SubmissionIntent) -> Result<String> {
+            self.submits.set(self.submits.get() + 1);
+            Ok("submitted-remote-id".to_owned())
+        }
+    }
+
+    #[test]
+    fn recovery_queries_remote_before_submitting_again() {
+        let directory = tempdir().unwrap();
+        let store = FileStore::open(directory.path(), Default::default()).unwrap();
+        let location = RunLocation::new("2026-07-27", "run-1").unwrap();
+        let gateway = FakeGateway {
+            existing: Some("remote-before-restart".to_owned()),
+            ..Default::default()
+        };
+        let completed = submit_or_recover(
+            &store,
+            &location,
+            intent(),
+            &gateway,
+            "2026-07-27T00:01:00Z".to_owned(),
+        )
+        .unwrap();
+        assert_eq!(
+            completed.remote_order_id.as_deref(),
+            Some("remote-before-restart")
+        );
+        assert_eq!(gateway.submits.get(), 0);
         assert_eq!(completed.status, SubmissionStatus::Completed);
     }
 

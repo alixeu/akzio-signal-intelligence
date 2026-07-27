@@ -60,9 +60,9 @@ pub use draft::{
 pub use error::{Result, StoreError};
 pub use execution::{
     append_execution_event, complete_submission, record_remote_order, record_submission_intent,
-    write_account_snapshot, AccountSnapshot, ExecutionEvent, SubmissionIntent, SubmissionStatus,
-    ACCOUNT_SNAPSHOT_SCHEMA_VERSION, EXECUTION_EVENT_SCHEMA_VERSION,
-    SUBMISSION_INTENT_SCHEMA_VERSION,
+    submit_or_recover, write_account_snapshot, AccountSnapshot, ExecutionEvent, OrderGateway,
+    SubmissionIntent, SubmissionStatus, ACCOUNT_SNAPSHOT_SCHEMA_VERSION,
+    EXECUTION_EVENT_SCHEMA_VERSION, SUBMISSION_INTENT_SCHEMA_VERSION,
 };
 pub use index::{
     append_index_detail, create_index, deterministic_experience_index_id, experience_level,
