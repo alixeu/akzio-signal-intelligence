@@ -205,6 +205,7 @@ pub(crate) fn file_store_domain_runtime(
         trade_candidate_action: plan.trade_candidate_action.clone(),
         portfolio_rating: plan.portfolio_rating.clone(),
         portfolio_current_weight: plan.portfolio_current_weight,
+        evidence_visibility: Arc::clone(&evidence_visibility),
     };
     DomainToolRuntimeBinding::new_with_evidence_visibility(
         DomainToolScope {
@@ -639,6 +640,26 @@ impl EvidenceVisibility for FileStoreEvidenceVisibility {
     }
 }
 
+impl FileStoreEvidenceVisibility {
+    fn visible_ids(&self) -> Result<BTreeSet<String>> {
+        let Some(session_id) = self
+            .current_session_id
+            .lock()
+            .map_err(|_| anyhow::anyhow!("FileStore evidence visibility lock poisoned"))?
+            .clone()
+        else {
+            // Direct deterministic finalizer tests have no Agent Loop turn;
+            // their Rust-owned initial set remains authoritative there.
+            return Ok(BTreeSet::new());
+        };
+        Ok(self
+            .visible_for(&self.location(&session_id)?)?
+            .ids()
+            .map(ToOwned::to_owned)
+            .collect())
+    }
+}
+
 fn required_string(state: &Value, key: &str) -> Result<String> {
     state
         .get(key)
@@ -711,6 +732,7 @@ struct FileStoreDomainToolService {
     trade_candidate_action: Option<String>,
     portfolio_rating: Option<String>,
     portfolio_current_weight: Option<f64>,
+    evidence_visibility: Arc<FileStoreEvidenceVisibility>,
 }
 
 impl FileStoreDomainToolService {
@@ -767,12 +789,14 @@ impl FileStoreDomainToolService {
     }
 
     fn phase2(&self) -> Result<Phase2DraftService> {
+        let mut visible_evidence = self.visible_evidence_refs.clone();
+        visible_evidence.extend(self.evidence_visibility.visible_ids()?);
         Phase2DraftService::new(
             self.store.clone(),
             self.location.clone(),
             self.scope.clone(),
             self.created_at.clone(),
-            self.visible_evidence_refs.iter().cloned(),
+            visible_evidence,
             self.visible_claims.iter().cloned(),
         )
         .map_err(Into::into)

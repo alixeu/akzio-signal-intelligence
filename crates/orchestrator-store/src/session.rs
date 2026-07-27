@@ -358,6 +358,12 @@ impl VisibleEvidenceSet {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+
+    /// Rust services may project the IDs that were actually read into a typed
+    /// finalizer. Callers never receive mutable access to the provenance map.
+    pub fn ids(&self) -> impl Iterator<Item = &str> {
+        self.entries.keys().map(String::as_str)
+    }
 }
 
 fn same_evidence_provenance(left: &EvidenceReadEvent, right: &EvidenceReadEvent) -> bool {

@@ -1946,13 +1946,36 @@ impl LoopToolRuntime for ProjectToolRuntime {
                     )),
                 };
                 return match output {
-                    Ok(output) => ToolResultItem {
-                        call_id,
-                        name,
-                        status: "completed".to_owned(),
-                        output,
-                        error: None,
-                    },
+                    Ok(output) => {
+                        if let (Some(binding), Some(context)) =
+                            (domain_binding, turn_context.as_ref())
+                        {
+                            if let Err(error) =
+                                tools::evidence_reads_from_tool_output(&name, &output, context)
+                                    .and_then(|reads| {
+                                        for read in reads {
+                                            binding.record_evidence_read(read)?;
+                                        }
+                                        Ok(())
+                                    })
+                            {
+                                return ToolResultItem {
+                                    call_id,
+                                    name,
+                                    status: "error".to_owned(),
+                                    output: Value::Null,
+                                    error: Some(error.to_string()),
+                                };
+                            }
+                        }
+                        ToolResultItem {
+                            call_id,
+                            name,
+                            status: "completed".to_owned(),
+                            output,
+                            error: None,
+                        }
+                    }
                     Err(error) => ToolResultItem {
                         call_id,
                         name,
