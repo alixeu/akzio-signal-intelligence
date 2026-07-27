@@ -642,10 +642,11 @@ fn file_store_session_runtime(
         .context("migrated role requires run_id")?;
     let phase = u8::try_from(phase).context("session phase must fit in u8")?;
     let session_id = format!(
-        "{}:p{}:{}:{}:{}",
+        "{}:p{}:{}:{}:{}:{}",
         run_id,
         phase,
         role,
+        profile.as_str(),
         topic_id.unwrap_or("aggregate"),
         round.unwrap_or(0)
     );
