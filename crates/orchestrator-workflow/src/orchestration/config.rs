@@ -557,9 +557,12 @@ impl RuntimeConfig {
                 .values()
                 .map(|plugin| (&plugin.manifest, plugin.role_path())),
         );
-        // PR2: Phase Summary is the first migrated profile.  The registry is
-        // the sole authority switch: once FileStore is selected, callers must
-        // not fall back to the former SQLite bundle path.
+        // The registry is the sole authority switch: once FileStore is
+        // selected, callers must not fall back to the former SQLite path.
+        // Phase 1 remains Legacy by default until its FileStore input snapshot
+        // readers replace the SQLite technical/Jin10 readers in live runs.
+        // Tests and a later rollout may inject its explicit FileStore
+        // authority without creating a mixed fallback path.
         let mut authority_registry = AuthorityRegistry::builtin_legacy();
         authority_registry
             .migrate_to_file_store("compressor.phase_summary", ToolManagedProfile::PhaseSummary)

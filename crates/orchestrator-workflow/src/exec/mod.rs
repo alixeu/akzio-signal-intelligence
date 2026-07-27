@@ -19,6 +19,7 @@ use orchestrator_store::{
 };
 use serde_json::{json, Value};
 use std::{
+    collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -36,7 +37,10 @@ use crate::orchestration::artifact::{
     topics_from_generation_artifact,
 };
 use crate::orchestration::config::{is_critical_role, validate_sqlite_context, RuntimeConfig};
-use crate::orchestration::degraded::role_artifact_or_degraded;
+use crate::orchestration::degraded::{record_degraded_role, role_artifact_or_degraded};
+use crate::orchestration::domain_runtime::{
+    finalize_degraded_analyst_report, FileStoreDomainRuntimePlan,
+};
 use crate::orchestration::lifecycle::{
     append_topic_controller_artifact, append_topic_turn, record_contracts,
     research_plan_to_trade_intent, run_id_for, set_phase_status, set_topic_controller_state,
@@ -89,6 +93,25 @@ fn phase_summary_uses_file_store(runtime_config: &RuntimeConfig) -> Result<bool>
         .authority_registry
         .authority_for("compressor.phase_summary", ToolManagedProfile::PhaseSummary)?
         == ArtifactAuthority::FileStore)
+}
+
+/// Phase 1 has a per-role/per-ticker authority boundary.  This lookup is the
+/// only place the workflow decides whether an Analyst unit may touch legacy
+/// persistence; a failed FileStore unit must never query or reuse SQLite.
+fn analyst_uses_file_store(runtime_config: &RuntimeConfig, role: &str) -> Result<bool> {
+    Ok(runtime_config
+        .authority_registry
+        .authority_for(role, ToolManagedProfile::AnalystReport)?
+        == ArtifactAuthority::FileStore)
+}
+
+fn phase1_has_file_store_analyst(runtime_config: &RuntimeConfig, roles: &[String]) -> Result<bool> {
+    roles
+        .iter()
+        .map(|role| analyst_uses_file_store(runtime_config, role))
+        .try_fold(false, |found, migrated| {
+            migrated.map(|migrated| found || migrated)
+        })
 }
 
 /// The manifest is part of the FileStore authority, not a second run ledger
@@ -1651,7 +1674,10 @@ async fn run_phase1(
     let mock = is_mock(state);
     debug!(roles = ?roles, mock, "phase 1 preflight starting");
     for role in roles {
-        if !mock {
+        // FileStore Analyst units obtain their evidence through the
+        // ToolManaged runtime and snapshots.  Do not run the old SQLite import
+        // preflight for a migrated authority.
+        if !mock && !analyst_uses_file_store(config, role)? {
             run_phase1_preflight(conn, state, role, config).await?;
             enforce_preflight_policy(state, role, config)?;
         }
@@ -1659,19 +1685,42 @@ async fn run_phase1(
 
     let mut jobs = Vec::new();
     for role in roles {
-        jobs.push(prepare_role_job(RoleRun {
-            state: state.clone(),
-            role,
-            phase: 1,
-            kind: "artifact",
-            round: None,
-            topic_id: None,
-            mock,
-            model_override,
-            reasoning_effort_override,
-            config,
-            prompt_path: config.prompts.analyst_path(role),
-        })?);
+        if analyst_uses_file_store(config, role)? {
+            // One FileStore artifact and Draft lifecycle per analyst+ticker.
+            // The role cannot write, read, or finalize another ticker's unit.
+            for ticker in tickers_from_state(state) {
+                let mut ticker_state = state.clone();
+                ticker_state["ticker"] = Value::String(ticker.clone());
+                ticker_state["tickers"] = json!([ticker]);
+                jobs.push(prepare_role_job(RoleRun {
+                    state: ticker_state,
+                    role,
+                    phase: 1,
+                    kind: "artifact",
+                    round: None,
+                    topic_id: None,
+                    mock,
+                    model_override,
+                    reasoning_effort_override,
+                    config,
+                    prompt_path: config.prompts.analyst_path(role),
+                })?);
+            }
+        } else {
+            jobs.push(prepare_role_job(RoleRun {
+                state: state.clone(),
+                role,
+                phase: 1,
+                kind: "artifact",
+                round: None,
+                topic_id: None,
+                mock,
+                model_override,
+                reasoning_effort_override,
+                config,
+                prompt_path: config.prompts.analyst_path(role),
+            })?);
+        }
     }
     debug!(job_count = jobs.len(), "phase 1 jobs prepared");
     let results = run_role_jobs(
@@ -1690,7 +1739,46 @@ async fn run_phase1(
     for result in results {
         let role = result.role.clone();
         let mut result = result;
-        if result.artifact.is_none()
+        let file_store_authoritative = analyst_uses_file_store(config, &role)?;
+        if file_store_authoritative && result.artifact.is_none() {
+            let failure = result
+                .error
+                .as_deref()
+                .unwrap_or("role execution failed before terminal finalize")
+                .to_owned();
+            let registration = config
+                .authority_registry
+                .registration(&role, ToolManagedProfile::AnalystReport)?;
+            let store_root = state
+                .get("store_root")
+                .and_then(Value::as_str)
+                .context("store_root missing for migrated Phase 1 Analyst")?;
+            let ticker = result
+                .tickers
+                .first()
+                .cloned()
+                .context("migrated Phase 1 Analyst result has no ticker")?;
+            let mut ticker_state = state.clone();
+            ticker_state["ticker"] = Value::String(ticker.clone());
+            ticker_state["tickers"] = json!([ticker]);
+            let fallback = finalize_degraded_analyst_report(
+                Path::new(store_root),
+                &ticker_state,
+                FileStoreDomainRuntimePlan {
+                    role: role.clone(),
+                    phase: 1,
+                    profile: ToolManagedProfile::AnalystReport,
+                    profile_version: registration.profile_version,
+                    builder_version: registration.builder_version,
+                    tickers: result.tickers.clone(),
+                    visible_evidence_refs: BTreeSet::new(),
+                },
+                &failure,
+            )?;
+            record_degraded_role(state, &result, &failure);
+            result.artifact = Some(fallback);
+        } else if !file_store_authoritative
+            && result.artifact.is_none()
             && is_critical_role(config, &result.role)
             && !current_run_id.is_empty()
         {
@@ -1711,15 +1799,82 @@ async fn run_phase1(
             ok = result.artifact.is_some(),
             "phase 1 role finished"
         );
-        persist_prompt_metric(conn, &result);
+        // Prompt metrics are currently a no-op, but keep this call exclusive
+        // to legacy ownership so it cannot become an accidental FileStore
+        // profile SQLite write in a future change.
+        if !file_store_authoritative {
+            persist_prompt_metric(conn, &result);
+        }
         record_role_job_metrics(state, &result);
-        let artifact = role_artifact_or_degraded(state, config, result)?;
-        persist_artifact(conn, state, 1, &role, artifact.clone())?;
-        reports.insert(role.clone(), artifact);
+        if file_store_authoritative {
+            let artifact = result
+                .artifact
+                .clone()
+                .context("FileStore Analyst must return a terminal canonical artifact")?;
+            merge_file_store_phase1_artifact(&mut reports, &role, artifact)?;
+        } else {
+            let artifact = role_artifact_or_degraded(state, config, result)?;
+            persist_artifact(conn, state, 1, &role, artifact.clone())?;
+            reports.insert(role.clone(), artifact);
+        }
     }
     state["analyst_reports"] = Value::Object(reports);
     // Materialize phase1_index in-process (no separate phase 1.5 / phase 15).
-    materialize_phase1_index(conn, state, config)?;
+    materialize_phase1_index(
+        conn,
+        state,
+        config,
+        !phase1_has_file_store_analyst(config, roles)?,
+    )?;
+    Ok(())
+}
+
+/// The in-memory Phase 1 reducer is a read model for immediate downstream
+/// scheduling only.  It is assembled from finalized FileStore artifacts and
+/// is never a second persisted source of truth.
+fn merge_file_store_phase1_artifact(
+    reports: &mut serde_json::Map<String, Value>,
+    role: &str,
+    artifact: Value,
+) -> Result<()> {
+    if artifact.get("role").and_then(Value::as_str) != Some(role) {
+        bail!("FileStore analyst artifact role differs from its planned role")
+    }
+    let per_ticker = artifact
+        .get("per_ticker")
+        .and_then(Value::as_object)
+        .context("FileStore analyst artifact is missing per_ticker")?;
+    if per_ticker.len() != 1 {
+        bail!("FileStore analyst ticker unit must contain exactly one per_ticker entry")
+    }
+    let entry = reports.entry(role.to_owned()).or_insert_with(|| {
+        json!({
+            "id": role,
+            "role": role,
+            "profile": "analyst_report",
+            "authority": "file_store",
+            "per_ticker": {},
+            "artifact_refs": [],
+        })
+    });
+    let target = entry
+        .get_mut("per_ticker")
+        .and_then(Value::as_object_mut)
+        .context("FileStore analyst state projection is malformed")?;
+    for (ticker, payload) in per_ticker {
+        if target.insert(ticker.clone(), payload.clone()).is_some() {
+            bail!("duplicate FileStore Phase 1 analyst ticker unit for {role}/{ticker}")
+        }
+    }
+    let refs = entry
+        .get_mut("artifact_refs")
+        .and_then(Value::as_array_mut)
+        .context("FileStore analyst state projection artifact_refs is malformed")?;
+    refs.push(json!({
+        "artifact_id": artifact.get("artifact_id"),
+        "content_hash": artifact.get("content_hash"),
+        "source_payload_hash": artifact.get("source_payload_hash"),
+    }));
     Ok(())
 }
 
@@ -2888,12 +3043,17 @@ fn materialize_phase1_index(
     conn: &mut rusqlite::Connection,
     state: &mut Value,
     config: &RuntimeConfig,
+    persist_legacy_projection: bool,
 ) -> Result<()> {
     let artifact = build_phase1_index(state, config);
     let brief = reducer_brief_md(&artifact);
     state["phase1_index"] = artifact.clone();
     state["phase1_brief_md"] = Value::String(brief.clone());
-    persist_artifact_with_last_md(conn, state, 1, "phase1.index", artifact, brief)?;
+    if persist_legacy_projection {
+        persist_artifact_with_last_md(conn, state, 1, "phase1.index", artifact, brief)?;
+    } else {
+        state["phase1_index_authority"] = json!("file_store_derived");
+    }
     Ok(())
 }
 
@@ -4643,6 +4803,93 @@ mod tests {
         assert!(phase_summary_uses_file_store(&runtime).unwrap());
     }
 
+    #[tokio::test]
+    async fn injected_phase1_file_store_authority_writes_canonical_ticker_units_without_sqlite_projection(
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let (_config, mut runtime) = manifest_runtime_config(directory.path());
+        runtime
+            .authority_registry
+            .migrate_to_file_store(
+                "analyst.news_macro",
+                orchestrator_core::ToolManagedProfile::AnalystReport,
+            )
+            .unwrap();
+        let mut state = json!({
+            "run_id": "phase1-file-store-test",
+            "current_date": "2026-07-27",
+            "ticker": "QQQ,SOXX",
+            "tickers": ["QQQ", "SOXX"],
+            "analysis_universe": ["QQQ", "SOXX"],
+            "store_root": directory.path(),
+            "mock": true,
+            "debug": false,
+            "phase1_agents": ["analyst.technical", "analyst.news_macro"],
+            "phase_status": {},
+        });
+        let db = directory.path().join("legacy.sqlite");
+        let mut conn = connect(&db).unwrap();
+        let roles = vec![
+            "analyst.technical".to_owned(),
+            "analyst.news_macro".to_owned(),
+        ];
+
+        run_phase1(&mut conn, &mut state, &roles, None, None, &runtime)
+            .await
+            .unwrap();
+
+        assert_eq!(state["phase1_index_authority"], "file_store_derived");
+        for role in &roles {
+            assert_eq!(state["analyst_reports"][role]["authority"], "file_store");
+            assert_eq!(
+                state["analyst_reports"][role]["per_ticker"]
+                    .as_object()
+                    .unwrap()
+                    .len(),
+                2
+            );
+        }
+        let legacy_phase1_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM role_turn_summaries \
+                 WHERE phase = 1 AND (role LIKE 'analyst.%' OR role = 'phase1.index')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_phase1_rows, 0);
+
+        let artifacts_root = directory.path().join("runs");
+        let artifact_count = fs::read_dir(artifacts_root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|date| fs::read_dir(date.path()).ok())
+            .flatten()
+            .filter_map(Result::ok)
+            .filter_map(|run| fs::read_dir(run.path().join("artifacts/phase1")).ok())
+            .flatten()
+            .filter_map(Result::ok)
+            .filter_map(|role| fs::read_dir(role.path()).ok())
+            .flatten()
+            .filter_map(Result::ok)
+            .filter(|artifact| artifact.path().extension().is_some_and(|ext| ext == "json"))
+            .count();
+        assert_eq!(artifact_count, 4);
+
+        let summaries = write_deterministic_phase_summary(
+            directory.path(),
+            &state,
+            1,
+            runtime.tool_managed.max_summary_units_per_phase,
+        )
+        .unwrap();
+        assert_eq!(summaries.indexes.len(), 4);
+        assert!(summaries
+            .indexes
+            .iter()
+            .all(|index| index.kind == orchestrator_store::IndexKind::PhaseSummary));
+    }
+
     #[test]
     fn file_store_manifest_is_created_then_recovered_without_legacy_artifacts() {
         let directory = tempfile::tempdir().unwrap();
@@ -4688,8 +4935,8 @@ mod tests {
         changed_runtime
             .authority_registry
             .migrate_to_file_store(
-                "analyst.news_macro",
-                orchestrator_core::ToolManagedProfile::AnalystReport,
+                "manager.research",
+                orchestrator_core::ToolManagedProfile::ResearchDecision,
             )
             .unwrap();
         let error = prepare_file_store_run_manifest(

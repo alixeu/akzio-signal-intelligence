@@ -66,6 +66,9 @@ pub(crate) fn file_store_domain_runtime(
     if plan.tickers.is_empty() {
         bail!("FileStore domain runtime requires at least one ticker")
     }
+    if plan.profile == ToolManagedProfile::AnalystReport && plan.tickers.len() != 1 {
+        bail!("FileStore AnalystReport runtime requires exactly one Rust-planned ticker unit")
+    }
     let source_payload_hash = content_hash(&json!({
         "run_id": run_id,
         "phase": phase_u8,
@@ -74,7 +77,17 @@ pub(crate) fn file_store_domain_runtime(
         "tickers": plan.tickers,
         "source": source_payload_for(state, phase_u8, plan.profile),
     }))?;
-    let unit_key = format!("phase{phase_u8}:{}:aggregate", plan.role);
+    let unit_key = if plan.profile == ToolManagedProfile::AnalystReport {
+        format!(
+            "phase{phase_u8}:{}:ticker:{}",
+            plan.role,
+            plan.tickers
+                .first()
+                .expect("checked AnalystReport ticker unit")
+        )
+    } else {
+        format!("phase{phase_u8}:{}:aggregate", plan.role)
+    };
     let scope = ArtifactScope {
         run_id: run_id.clone(),
         current_date: current_date.clone(),
@@ -85,7 +98,8 @@ pub(crate) fn file_store_domain_runtime(
         builder_version: plan.builder_version,
         unit_key,
         source_payload_hash,
-        ticker: None,
+        ticker: (plan.profile == ToolManagedProfile::AnalystReport)
+            .then(|| plan.tickers[0].clone()),
         topic_id: None,
         side: None,
         stance: None,
@@ -118,6 +132,76 @@ pub(crate) fn file_store_domain_runtime(
         Arc::new(service),
         evidence_visibility,
     )
+}
+
+/// Rust-owned degraded policy for a migrated Phase 1 unit.  It deliberately
+/// follows the same typed Draft and terminal finalizer path as a successful
+/// ToolManaged role; it is not a legacy JSON/SQLite fallback.  The synthetic
+/// evidence is explicitly marked as a runtime failure record so downstream
+/// reducers retain an honest zero-confidence, unobserved assessment.
+pub(crate) fn finalize_degraded_analyst_report(
+    store_root: &Path,
+    state: &Value,
+    mut plan: FileStoreDomainRuntimePlan,
+    failure: &str,
+) -> Result<Value> {
+    if plan.profile != ToolManagedProfile::AnalystReport || plan.tickers.len() != 1 {
+        bail!("degraded FileStore writer only supports one AnalystReport ticker unit")
+    }
+    let ticker = plan.tickers[0].clone();
+    let evidence_ref = format!("runtime:degraded:{}:{ticker}", plan.role);
+    plan.visible_evidence_refs.insert(evidence_ref.clone());
+    let binding = file_store_domain_runtime(store_root, state, plan.clone())?;
+    let current_date = required_string(state, "current_date")?;
+    binding.execute(
+        "set_analyst_assessment",
+        json!({
+            "ticker": ticker,
+            "direction": "unobserved",
+            "confidence": 0.0,
+            "report": format!("{} did not produce usable evidence: {failure}", plan.role),
+            "priced_in": "unclear",
+            "echo_chamber_risk": "low",
+            "crowded_consensus_risk": "low",
+        }),
+    )?;
+    binding.execute(
+        "append_analyst_evidence",
+        json!({
+            "ticker": ticker,
+            "evidence_ref": evidence_ref,
+            "evidence": {
+                "claim": format!("{} failed before producing a usable assessment.", plan.role),
+                "evidence_type": "inference",
+                "source": "orchestrator runtime degraded policy",
+                "timestamp": current_date,
+                "source_tier": "unknown",
+                "first_source": "orchestrator runtime degraded policy",
+                "is_derivative_repost": false,
+                "evidence_age": "unknown",
+                "source_confidence": 0.0,
+            }
+        }),
+    )?;
+    binding.execute(
+        "append_analyst_data_gap",
+        json!({
+            "ticker": ticker,
+            "data_gap": format!("{} degraded: {failure}", plan.role),
+        }),
+    )?;
+    binding.execute(
+        "set_analyst_invalidation",
+        json!({
+            "ticker": ticker,
+            "validation_triggers": ["Obtain a completed source-backed analyst assessment."],
+        }),
+    )?;
+    binding
+        .execute("finalize_analyst_report", json!({}))?
+        .get("artifact")
+        .cloned()
+        .context("degraded FileStore analyst finalizer did not return an artifact")
 }
 
 /// FileStore-backed evidence visibility.  The model cannot call this type:

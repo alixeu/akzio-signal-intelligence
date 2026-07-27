@@ -632,10 +632,27 @@ pub fn finalize_analyst_report(
         created_at: created_at.to_owned(),
         content_hash: String::new(),
     };
-    let relative = PathBuf::from("artifacts").join("phase1").join(format!(
-        "{}.json",
-        SafeSlug::new("role", &scope.role)?.as_str()
-    ));
+    let ticker = scope
+        .ticker
+        .as_deref()
+        .ok_or_else(|| StoreError::InvalidDocument {
+            kind: "analyst finalizer",
+            message: "analyst artifact scope requires one Rust-owned ticker".to_owned(),
+        })?;
+    if expected_tickers != [ticker.to_owned()] {
+        return Err(StoreError::InvalidDocument {
+            kind: "analyst finalizer",
+            message: "analyst artifact scope ticker differs from its expected ticker unit"
+                .to_owned(),
+        });
+    }
+    let relative = PathBuf::from("artifacts")
+        .join("phase1")
+        .join(SafeSlug::new("role", &scope.role)?.as_str())
+        .join(format!(
+            "{}.json",
+            SafeSlug::new("ticker", ticker)?.as_str()
+        ));
     Ok(DomainFinalizeOutcome::Analyst(Box::new(
         finalize_draft_atomic(store, location, scope, &relative, artifact, created_at)?,
     )))
@@ -1372,7 +1389,7 @@ mod tests {
         let temp = tempdir().unwrap();
         let store = FileStore::open(temp.path(), FileStoreOptions::default()).unwrap();
         let location = RunLocation::new("2026-07-27", "r1").unwrap();
-        let scope = scope(DraftProfile::AnalystReport, 1, "analyst.technical");
+        let scope = single_ticker_scope(DraftProfile::AnalystReport, 1, "analyst.technical", None);
         let now = "2026-07-27T00:00:00Z";
         set_analyst_assessment(
             &store,
