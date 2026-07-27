@@ -807,8 +807,11 @@ async fn run_phase2(
         reasoning,
     )
     .await?;
-    record_phase2_session(state, "mediator.topic", "warmup", None, None, Some(0));
     state["phase2_warmup"] = warmup;
+    // Preserve the completed Warmup artifact first, then attach its Rust-owned
+    // session identity. Reversing this order silently erased the fork source
+    // and let Bull/Bear seeds start without their required parent evidence.
+    record_phase2_session(state, "mediator.topic", "warmup", None, None, Some(0));
     let generated = run_unit(
         state,
         runtime,
@@ -1557,4 +1560,29 @@ fn seal_state(state: &mut Value) -> Result<()> {
     state["content_hash"] = Value::String(String::new());
     state["content_hash"] = Value::String(content_hash(state)?);
     Ok(())
+}
+
+#[cfg(test)]
+mod phase2_session_tests {
+    use serde_json::json;
+
+    use super::{record_phase2_session, runtime_session_key};
+
+    #[test]
+    fn warmup_artifact_retains_the_fork_identity_after_assignment() {
+        let mut state = json!({
+            "phase2_warmup": {"status": "completed"},
+            "_runtime_sessions": {
+                runtime_session_key("mediator.topic", "warmup", None, Some(0)): {
+                    "session_id": "warmup-session",
+                    "turn_id": "warmup-turn"
+                }
+            }
+        });
+
+        record_phase2_session(&mut state, "mediator.topic", "warmup", None, None, Some(0));
+
+        assert_eq!(state["phase2_warmup"]["session_id"], "warmup-session");
+        assert_eq!(state["phase2_warmup"]["turn_id"], "warmup-turn");
+    }
 }
