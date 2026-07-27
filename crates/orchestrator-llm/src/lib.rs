@@ -358,7 +358,6 @@ pub async fn run_agent_loop_with_metrics(
         agent_loop_config_from_settings(settings),
     )
     .await?;
-    write_role_end_context(settings, &turn)?;
     let terminal_tool_result = turn.terminal_tool_result.clone();
     let artifact = completed_turn_artifact(&turn)?;
     Ok(AgentLoopOutput {
@@ -503,7 +502,6 @@ pub async fn run_agent_steer_loop_with_metrics(
         agent_loop_config_from_settings(settings),
     )
     .await?;
-    write_role_end_context(settings, &turn)?;
     let terminal_tool_result = turn.terminal_tool_result.clone();
     let artifact = completed_turn_artifact(&turn)?;
     Ok(AgentLoopOutput {
@@ -569,36 +567,6 @@ fn prepare_steer_turn_inputs(
         prompt.to_string()
     };
     (user_input, None, steer)
-}
-
-fn write_role_end_context(settings: &AgentSettings, turn: &Turn) -> Result<()> {
-    let Some(path) = role_end_context_path(settings, turn) else {
-        return Ok(());
-    };
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let mut items = Vec::new();
-    for item in &turn.emitted_items {
-        if let Some(value) = end_context_item(item) {
-            items.push(value);
-        }
-    }
-    fs::write(path, serde_json::to_string_pretty(&items)?)?;
-    Ok(())
-}
-
-fn role_end_context_path(settings: &AgentSettings, turn: &Turn) -> Option<PathBuf> {
-    let run_dir = settings
-        .tools
-        .as_ref()
-        .and_then(|tools| tools.run_dir.as_ref())?;
-    let phase = settings.phase.unwrap_or_default();
-    Some(run_dir.join(format!("phase{phase:02}")).join(format!(
-        "{}_{}_end_context.json",
-        safe_path_part(&settings.role),
-        safe_path_part(&turn.turn_id)
-    )))
 }
 
 pub fn append_debug_llm_record(settings: &AgentSettings, record: Value) -> Result<()> {
@@ -2343,7 +2311,6 @@ fn validate_text_verbosity(value: &str) -> Result<()> {
 fn default_tool_config() -> tools::ExternalToolConfig {
     tools::ExternalToolConfig {
         project_root: default_project_root(),
-        run_dir: None,
         run_id: None,
         phase: None,
         allowed_reflection_task_ids: Vec::new(),
@@ -2863,50 +2830,6 @@ mod tests {
     }
 
     #[test]
-    fn role_end_context_paths_do_not_collide_for_parallel_turns() {
-        let temp = tempfile::tempdir().unwrap();
-        let mut settings = base_settings(LlmRoute::Responses);
-        settings.phase = Some(25);
-        settings.role = "researcher.bull.interaction".to_string();
-        settings.tools = Some(tools::ExternalToolConfig {
-            project_root: temp.path().to_path_buf(),
-            run_dir: Some(temp.path().to_path_buf()),
-            run_id: None,
-            phase: None,
-            allowed_reflection_task_ids: Vec::new(),
-            phase_summary_page_limit: 20,
-            phase_summary_detail_page_limit: 20,
-            tickers: vec!["QQQ".to_string()],
-            alpaca_live: false,
-            alpaca_market_data: false,
-            alpaca_api_key: None,
-            alpaca_api_secret: None,
-            file_store_input: None,
-            file_store_reflection_source: None,
-        });
-        let first = agent_loop::Turn::new(
-            "turn-topic-a",
-            "run:topic-a",
-            "run",
-            "researcher.bull.interaction",
-            "",
-        );
-        let second = agent_loop::Turn::new(
-            "turn-topic-b",
-            "run:topic-b",
-            "run",
-            "researcher.bull.interaction",
-            "",
-        );
-
-        let first_path = super::role_end_context_path(&settings, &first).unwrap();
-        let second_path = super::role_end_context_path(&settings, &second).unwrap();
-
-        assert_ne!(first_path, second_path);
-        assert!(first_path.ends_with("researcher_bull_interaction_turn_topic_a_end_context.json"));
-    }
-
-    #[test]
     fn append_debug_llm_record_keeps_only_the_latest_request_and_response() {
         let temp = tempfile::tempdir().unwrap();
         let mut settings = base_settings(LlmRoute::Responses);
@@ -2916,7 +2839,6 @@ mod tests {
         settings.debug_prompt_path = Some(PathBuf::from("prompts/phase1/technical.md"));
         settings.tools = Some(tools::ExternalToolConfig {
             project_root: temp.path().to_path_buf(),
-            run_dir: None,
             run_id: None,
             phase: None,
             allowed_reflection_task_ids: Vec::new(),

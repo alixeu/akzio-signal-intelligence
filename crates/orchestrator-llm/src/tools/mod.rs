@@ -75,7 +75,6 @@ pub struct ToolDefinition {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ExternalToolConfig {
     pub project_root: PathBuf,
-    pub run_dir: Option<PathBuf>,
     #[serde(default)]
     pub run_id: Option<String>,
     #[serde(default)]
@@ -134,7 +133,6 @@ impl Default for ExternalToolConfig {
     fn default() -> Self {
         Self {
             project_root: PathBuf::from("."),
-            run_dir: None,
             run_id: None,
             phase: None,
             allowed_reflection_task_ids: Vec::new(),

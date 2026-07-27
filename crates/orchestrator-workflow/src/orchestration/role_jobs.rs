@@ -408,10 +408,6 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
         reasoning_effort_override: reasoning_effort_override.map(ToString::to_string),
         tools: ExternalToolConfig {
             project_root: default_project_root(),
-            run_dir: state
-                .get("run_dir")
-                .and_then(Value::as_str)
-                .map(PathBuf::from),
             run_id: state
                 .get("run_id")
                 .and_then(Value::as_str)
