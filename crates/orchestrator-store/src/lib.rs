@@ -5,6 +5,7 @@
 //! atomic replacement, and JSONL recovery in one place.
 
 mod atomic;
+mod doctor;
 mod domain;
 mod draft;
 mod error;
@@ -23,6 +24,11 @@ mod store;
 pub use atomic::{
     rename_dir_atomic, write_bytes_atomic, write_bytes_atomic_with_options, write_json_atomic,
     AtomicWriteOptions,
+};
+pub use doctor::{
+    inspect_store, rebuild_experience_stats, rebuild_index_catalog, rebuild_run_manifest,
+    DoctorIssue, ExperienceStat, ExperienceStats, IndexCatalog, IndexCatalogEntry,
+    StoreDoctorReport, EXPERIENCE_STATS_SCHEMA_VERSION, INDEX_CATALOG_SCHEMA_VERSION,
 };
 pub use domain::{
     append_analyst_data_gap, append_analyst_evidence, append_binding_risk_control,
