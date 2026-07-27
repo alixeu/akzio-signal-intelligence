@@ -318,17 +318,31 @@ pub fn set_analyst_assessment(
             let ArtifactDraftState::AnalystReport(draft) = state else {
                 return profile_state_error("analyst_report");
             };
-            draft.assessments.insert(
-                input.ticker.clone(),
-                AnalystAssessmentDraft::empty(
-                    input.direction.clone(),
-                    input.confidence,
-                    input.report.clone(),
-                    input.priced_in.clone(),
-                    input.echo_chamber_risk.clone(),
-                    input.crowded_consensus_risk.clone(),
-                ),
-            );
+            // Assessment updates are revisions of the scalar judgement, not a
+            // replacement of evidence, gaps, or invalidation work appended by
+            // earlier tool calls.  A model commonly refines its assessment
+            // after reading additional evidence; replacing the entire draft
+            // here would silently discard that evidence and make finalize
+            // impossible.
+            let assessment = draft
+                .assessments
+                .entry(input.ticker.clone())
+                .or_insert_with(|| {
+                    AnalystAssessmentDraft::empty(
+                        input.direction.clone(),
+                        input.confidence,
+                        input.report.clone(),
+                        input.priced_in.clone(),
+                        input.echo_chamber_risk.clone(),
+                        input.crowded_consensus_risk.clone(),
+                    )
+                });
+            assessment.direction = input.direction.clone();
+            assessment.confidence = input.confidence;
+            assessment.report = input.report.clone();
+            assessment.priced_in = input.priced_in.clone();
+            assessment.echo_chamber_risk = input.echo_chamber_risk.clone();
+            assessment.crowded_consensus_risk = input.crowded_consensus_risk.clone();
             Ok(())
         },
     )
@@ -1415,6 +1429,24 @@ mod tests {
                 ticker: "QQQ".into(),
                 evidence: evidence(),
                 evidence_ref: "e1".into(),
+            },
+            now,
+        )
+        .unwrap();
+        // A later assessment revision must not erase already appended
+        // source-backed evidence.
+        set_analyst_assessment(
+            &store,
+            &location,
+            &scope,
+            AnalystAssessmentInput {
+                ticker: "QQQ".into(),
+                direction: "bearish".into(),
+                confidence: 0.8,
+                report: "revised report".into(),
+                priced_in: "under_priced".into(),
+                echo_chamber_risk: "medium".into(),
+                crowded_consensus_risk: "medium".into(),
             },
             now,
         )
