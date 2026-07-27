@@ -46,34 +46,11 @@ pub fn execute(args: Value, config: &ExternalToolConfig) -> Result<Value> {
         serde_json::from_value(args).context("invalid read_technical_snapshot arguments")?;
     let tickers = canonical_tickers(args.tickers)?;
     let intervals = canonical_intervals(args.intervals)?;
-    if let Some(snapshot) = &config.file_store_input {
-        return execute_file_store_snapshot(tickers, intervals, snapshot);
-    }
-    let db_path = config
-        .db_path
+    let snapshot = config
+        .file_store_input
         .as_ref()
-        .context("read_technical_snapshot requires the run SQLite path")?;
-    let conn = orchestrator_sql::connect(db_path)?;
-    let snapshots = tickers
-        .iter()
-        .map(|ticker| {
-            let intervals = intervals
-                .iter()
-                .map(|interval| {
-                    let rows = orchestrator_sql::load_technical_series(&conn, ticker, interval)?;
-                    Ok(snapshot_for(ticker, interval, &rows))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            Ok(json!({"ticker": ticker, "intervals": intervals}))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let result = json!({
-        "source": "sqlite.technical_bars",
-        "snapshots": snapshots,
-        "raw_bars_available_via": "read_technical_detail"
-    });
-    log_tool_result(NAME, &Ok(result.clone()));
-    Ok(result)
+        .context("read_technical_snapshot requires a sealed FileStore input snapshot")?;
+    execute_file_store_snapshot(tickers, intervals, snapshot)
 }
 
 fn execute_file_store_snapshot(
@@ -259,46 +236,7 @@ fn volatility_label(value: f64) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use orchestrator_core::{write_technical_csv, TechnicalCsvRow};
     use orchestrator_store::{capture_run_inputs, write_input_payload, FileStore, RunLocation};
-    use std::collections::HashMap;
-
-    #[test]
-    fn returns_compact_signals_for_multiple_intervals() {
-        let temp = tempfile::tempdir().unwrap();
-        let db_path = temp.path().join("run.sqlite");
-        let csv_path = temp.path().join("qqq_day.csv");
-        write_technical_csv(
-            &csv_path,
-            &[
-                TechnicalCsvRow {
-                    date: "2026-07-20".into(),
-                    values: HashMap::from([("Close".into(), 100.0)]),
-                },
-                TechnicalCsvRow {
-                    date: "2026-07-21".into(),
-                    values: HashMap::from([("Close".into(), 104.0)]),
-                },
-            ],
-        )
-        .unwrap();
-        let mut conn = orchestrator_sql::connect(&db_path).unwrap();
-        orchestrator_sql::import_technical_csv(&mut conn, "QQQ", "daily", &csv_path).unwrap();
-        drop(conn);
-        let result = execute(
-            json!({"tickers": ["QQQ"], "intervals": ["daily"]}),
-            &ExternalToolConfig {
-                db_path: Some(db_path),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            result["snapshots"][0]["intervals"][0]["signals"][0]["label"],
-            "breakout"
-        );
-        assert!(result.to_string().contains("raw_bars_available_via"));
-    }
 
     #[test]
     fn file_store_reader_keeps_captured_bytes_after_mutable_input_changes() {

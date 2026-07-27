@@ -21,9 +21,6 @@ use std::{
 };
 use tracing::{debug, warn};
 
-#[cfg(test)]
-use std::collections::VecDeque;
-
 use crate::llm_judge::{judge_message_status, JudgeConfig};
 use crate::tools::{self, truncate_chars};
 use crate::truncation::{truncate_semantic, TruncationConfig};
@@ -328,7 +325,6 @@ where
             let debug_phase = turn.phase;
             let debug_topic = config.topic_id.clone();
             let debug_loop = loop_index;
-            let visible_summary_ids = visible_summary_ids_from_history(turn);
             let tool_batch_started = Instant::now();
             let mut terminal_completed = false;
             let mut calls = calls.into_iter();
@@ -337,44 +333,15 @@ where
                 let call_id = call.call_id.clone();
                 let name = call.name.clone();
                 let tool_started = Instant::now();
-                let result = if name == tools::READ_PHASE_SUMMARY_DETAILS_TOOL_NAME {
-                    let summary_id = call
-                        .arguments
-                        .get("summary_id")
-                        .and_then(Value::as_str)
-                        .unwrap_or("");
-                    if !visible_summary_ids.contains(summary_id) {
-                        ToolResultItem {
-                            call_id: call.call_id,
-                            name,
-                            status: "error".to_string(),
-                            output: json!({
-                                "status": "not_visible",
-                                "item_count": 0,
-                                "items": [],
-                                "source_policy": "list_before_detail_required"
-                            }),
-                            error: Some(
-                                "summary is not visible in a prior read_phase_summaries result"
-                                    .to_string(),
-                            ),
-                        }
-                    } else {
-                        debug!(
-                            call_id = call_id,
-                            tool = name,
-                            "agent loop tool call starting"
-                        );
-                        tools.execute(call).await
-                    }
-                } else {
-                    debug!(
-                        call_id = call_id,
-                        tool = name,
-                        "agent loop tool call starting"
-                    );
-                    tools.execute(call).await
-                };
+                // The typed FileStore Index runtime owns list-before-detail
+                // visibility.  It tracks IDs returned by read_indexes and
+                // rejects any unlisted read_index_details request.
+                debug!(
+                    call_id = call_id,
+                    tool = name,
+                    "agent loop tool call starting"
+                );
+                let result = tools.execute(call).await;
                 let tool_elapsed_ms = tool_started.elapsed().as_millis();
                 if debug_metrics {
                     if let Some(root) = debug_root.as_ref() {
@@ -498,25 +465,6 @@ where
     }
 }
 
-fn visible_summary_ids_from_history(turn: &Turn) -> BTreeSet<String> {
-    turn.emitted_items
-        .iter()
-        .filter(|item| {
-            item.item_type == TurnItemType::ToolResult
-                && item.tool_name == tools::READ_PHASE_SUMMARIES_TOOL_NAME
-        })
-        .filter_map(tool_result_output)
-        .filter_map(|output| output.get("items").and_then(Value::as_array).cloned())
-        .flatten()
-        .filter_map(|summary| {
-            summary
-                .get("id")
-                .and_then(Value::as_str)
-                .map(ToString::to_string)
-        })
-        .collect()
-}
-
 pub fn retrieval_audit(turn: &Turn) -> Value {
     let mut calls = Vec::new();
     let mut call_args = BTreeMap::<String, Value>::new();
@@ -542,8 +490,8 @@ pub fn retrieval_audit(turn: &Turn) -> Value {
             TurnItemType::ToolCall
                 if matches!(
                     item.tool_name.as_str(),
-                    tools::READ_PHASE_SUMMARIES_TOOL_NAME
-                        | tools::READ_PHASE_SUMMARY_DETAILS_TOOL_NAME
+                    tools::READ_INDEXES_TOOL_NAME
+                        | tools::READ_INDEX_DETAILS_TOOL_NAME
                         | tools::READ_REFLECTION_SOURCE_TOOL_NAME
                 ) =>
             {
@@ -554,12 +502,12 @@ pub fn retrieval_audit(turn: &Turn) -> Value {
                     .unwrap_or(Value::Null);
                 let signature = format!("{}:{}", item.tool_name, canonical_value(&arguments));
                 *signatures.entry(signature).or_default() += 1;
-                if item.tool_name == tools::READ_PHASE_SUMMARIES_TOOL_NAME {
+                if item.tool_name == tools::READ_INDEXES_TOOL_NAME {
                     summary_query_count += 1;
                     summary_filters.push(arguments.clone());
-                } else if item.tool_name == tools::READ_PHASE_SUMMARY_DETAILS_TOOL_NAME {
+                } else if item.tool_name == tools::READ_INDEX_DETAILS_TOOL_NAME {
                     detail_call_count += 1;
-                    if let Some(summary_id) = arguments.get("summary_id").and_then(Value::as_str) {
+                    if let Some(summary_id) = arguments.get("index_id").and_then(Value::as_str) {
                         expanded_summary_ids.push(summary_id.to_string());
                         if let Some(source_phase) = summary_source_phases.get(summary_id) {
                             expanded_source_phases.insert(*source_phase);
@@ -580,7 +528,7 @@ pub fn retrieval_audit(turn: &Turn) -> Value {
                 let Some(output) = tool_result_output(item) else {
                     continue;
                 };
-                if item.tool_name == tools::READ_PHASE_SUMMARIES_TOOL_NAME {
+                if item.tool_name == tools::READ_INDEXES_TOOL_NAME {
                     if item.status == Some(AgentItemStatus::Completed) {
                         successful_summary_query_count += 1;
                         if let Some(arguments) = call_args.get(&item.tool_call_id) {
@@ -599,7 +547,7 @@ pub fn retrieval_audit(turn: &Turn) -> Value {
                         .unwrap_or(false);
                     if let Some(items) = output.get("items").and_then(Value::as_array) {
                         for summary in items {
-                            if let Some(id) = summary.get("id").and_then(Value::as_str) {
+                            if let Some(id) = summary.get("index_id").and_then(Value::as_str) {
                                 summary_ids.insert(id.to_string());
                                 listed_before_detail.insert(id.to_string());
                                 if let Some(source_phase) =
@@ -611,14 +559,14 @@ pub fn retrieval_audit(turn: &Turn) -> Value {
                             }
                         }
                     }
-                } else if item.tool_name == tools::READ_PHASE_SUMMARY_DETAILS_TOOL_NAME {
+                } else if item.tool_name == tools::READ_INDEX_DETAILS_TOOL_NAME {
                     any_truncated |= output
                         .get("truncated")
                         .and_then(Value::as_bool)
                         .unwrap_or(false);
                     if let Some(items) = output.get("items").and_then(Value::as_array) {
                         for detail in items {
-                            if let Some(id) = detail.get("id").and_then(Value::as_str) {
+                            if let Some(id) = detail.get("detail_id").and_then(Value::as_str) {
                                 detail_ids.insert(id.to_string());
                             }
                         }
@@ -1398,18 +1346,6 @@ fn preseed_tool_calls(
 ) -> Vec<ToolCallRequest> {
     let mut calls = Vec::new();
     let tool_enabled = |name: &str| available_tools.iter().any(|tool| tool == name);
-    if tool_enabled(tools::READ_EXPERIENCE_TOOL_NAME)
-        && turn.phase.is_some_and(|phase| (1..=6).contains(&phase))
-        && turn.role != "compressor.phase_summary"
-    {
-        for ticker in tickers {
-            calls.push(ToolCallRequest {
-                call_id: format!("preseed-experience-{}", ticker.to_lowercase()),
-                name: tools::READ_EXPERIENCE_TOOL_NAME.to_string(),
-                arguments: json!({ "ticker": ticker }),
-            });
-        }
-    }
     match turn.role.as_str() {
         "analyst.technical" if tool_enabled("read_technical_snapshot") => {
             calls.push(ToolCallRequest {

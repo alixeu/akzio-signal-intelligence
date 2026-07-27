@@ -49,42 +49,11 @@ pub fn execute(args: Value, config: &ExternalToolConfig) -> Result<Value> {
     let ticker = args.ticker.trim().to_ascii_uppercase();
     let interval = storage_interval(&args.interval)
         .ok_or_else(|| anyhow::anyhow!("unsupported technical interval {:?}", args.interval))?;
-    if let Some(snapshot) = &config.file_store_input {
-        return execute_file_store_detail(args, ticker, interval, snapshot);
-    }
-    let db_path = config
-        .db_path
+    let snapshot = config
+        .file_store_input
         .as_ref()
-        .context("read_technical_detail requires the run SQLite path")?;
-    let conn = orchestrator_sql::connect(db_path)?;
-    let mut rows = orchestrator_sql::load_technical_range(
-        &conn,
-        &ticker,
-        interval,
-        args.start.as_deref(),
-        args.end.as_deref(),
-    )?;
-    if rows.len() > MAX_DETAIL_ROWS {
-        rows = rows.split_off(rows.len() - MAX_DETAIL_ROWS);
-    }
-    let data = rows
-        .into_iter()
-        .map(|row| {
-            let mut value = serde_json::Map::new();
-            value.insert("date".into(), json!(row.date));
-            for (key, number) in row.values {
-                value.insert(key, json!(number));
-            }
-            Value::Object(value)
-        })
-        .collect::<Vec<_>>();
-    let result = if data.is_empty() {
-        json!({"status": "data_gap", "ticker": ticker, "interval": interval, "data_gap": "no matching SQLite technical bars"})
-    } else {
-        json!({"status": "ok", "source": "sqlite.technical_bars", "ticker": ticker, "interval": interval, "signal_id": args.signal_id, "data": data})
-    };
-    log_tool_result(NAME, &Ok(result.clone()));
-    Ok(result)
+        .context("read_technical_detail requires a sealed FileStore input snapshot")?;
+    execute_file_store_detail(args, ticker, interval, snapshot)
 }
 
 fn execute_file_store_detail(

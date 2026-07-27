@@ -410,21 +410,6 @@ pub async fn submit_trade(args: Value, config: &ExternalToolConfig) -> Result<Va
         .context("Alpaca paper order request failed")?,
     )
     .await?;
-    if let Some(path) = config.db_path.as_deref() {
-        let conn = orchestrator_sql::connect(path)?;
-        orchestrator_sql::record_exact_execution(
-            &conn,
-            &orchestrator_sql::ExecutionRecord {
-                run_id: config.run_id.as_deref(),
-                ticker: &args.symbol,
-                action: &args.action,
-                quantity: args.quantity,
-                requested_price: args.price,
-                executed_at: &args.executed_at,
-                response: &response,
-            },
-        )?;
-    }
     Ok(json!({
         "status": "submitted",
         "source": "alpaca",
@@ -434,17 +419,10 @@ pub async fn submit_trade(args: Value, config: &ExternalToolConfig) -> Result<Va
     }))
 }
 
-fn persist_account_snapshot(config: &ExternalToolConfig, payload: &Value) -> Result<()> {
-    let Some(path) = config.db_path.as_deref() else {
-        return Ok(());
-    };
-    let conn = orchestrator_sql::connect(path)?;
-    orchestrator_sql::record_account_snapshot(
-        &conn,
-        config.run_id.as_deref(),
-        config.phase.unwrap_or(0),
-        payload,
-    )?;
+fn persist_account_snapshot(_config: &ExternalToolConfig, _payload: &Value) -> Result<()> {
+    // Account snapshots are persisted by the FileStore execution service,
+    // outside the model tool runtime. This compatibility hook intentionally
+    // performs no side effect.
     Ok(())
 }
 

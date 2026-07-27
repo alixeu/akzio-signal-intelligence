@@ -1,7 +1,7 @@
 use anyhow::{bail, Result};
 use serde_json::{json, Value};
 
-use super::{api_tool_name, tool_connection, ExternalToolConfig, ToolDefinition};
+use super::{api_tool_name, ExternalToolConfig, ToolDefinition};
 use crate::agent_loop::ToolRuntimeTurnContext;
 
 pub const NAME: &str = "read_reflection_source";
@@ -42,6 +42,5 @@ pub fn execute(
         }
         return Ok(source.clone());
     }
-    let conn = tool_connection(config)?;
-    orchestrator_sql::reflection_source_context(&conn, task_id)
+    bail!("read_reflection_source requires a Rust-owned FileStore reflection source")
 }

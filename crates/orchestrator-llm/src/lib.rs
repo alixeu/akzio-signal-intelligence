@@ -580,180 +580,6 @@ fn prepare_steer_turn_inputs(
     (user_input, None, steer)
 }
 
-fn record_jin10_usage_from_artifact(
-    settings: &AgentSettings,
-    conn: &rusqlite::Connection,
-    turn_id: &str,
-    artifact: &Value,
-) -> Result<()> {
-    if settings.role != "analyst.news_macro" {
-        return Ok(());
-    }
-    let attention = extract_jin10_attention(artifact);
-    if attention.is_empty() {
-        return Ok(());
-    }
-    // Only scored items get persisted to the database.
-    let scored_ids: std::collections::BTreeSet<&str> =
-        attention.iter().map(|a| a.id.as_str()).collect();
-    let csv_rows = orchestrator_core::load_jin10_csv_recent(3);
-    let scored_rows: Vec<orchestrator_core::Jin10CsvRow> = csv_rows
-        .into_iter()
-        .filter(|row| scored_ids.contains(row.id.as_str()))
-        .collect();
-    if !scored_rows.is_empty() {
-        if let Err(e) = orchestrator_sql::import_scored_jin10_items(conn, &scored_rows) {
-            tracing::warn!("failed to import scored jin10 items: {e}");
-        }
-    }
-
-    // The news analyst sometimes references jin10 ids that are truncated or
-    // hallucinated and thus absent from jin10_items. Attention is auxiliary
-    // bookkeeping, so drop unknown ids here instead of letting the authoritative
-    // writer abort this critical role.
-    let candidate_ids: Vec<String> = attention.iter().map(|a| a.id.clone()).collect();
-    let present = orchestrator_sql::existing_jin10_ids(conn, &candidate_ids)?;
-    let mut dropped_ids: Vec<String> = Vec::new();
-    let recorded: Vec<orchestrator_sql::Jin10Attention> = attention
-        .into_iter()
-        .filter(|a| {
-            if present.contains(a.id.trim()) {
-                true
-            } else {
-                dropped_ids.push(a.id.clone());
-                false
-            }
-        })
-        .collect();
-    if !dropped_ids.is_empty() {
-        tracing::warn!(
-            role = %settings.role,
-            turn_id,
-            dropped = ?dropped_ids,
-            "skipping jin10 attention for ids missing from jin10_items"
-        );
-    }
-    if recorded.is_empty() {
-        return Ok(());
-    }
-
-    let run_id = loop_run_id(settings);
-    let updated = orchestrator_sql::record_jin10_attention_for_turn(
-        conn,
-        &run_id,
-        turn_id,
-        &settings.role,
-        settings.phase,
-        &recorded,
-    )?;
-    debug!(
-        role = %settings.role,
-        turn_id,
-        scored = recorded.len(),
-        updated,
-        "recorded jin10 attention scores to ledger"
-    );
-    Ok(())
-}
-
-fn extract_jin10_attention(artifact: &Value) -> Vec<orchestrator_sql::Jin10Attention> {
-    use orchestrator_sql::Jin10Attention;
-    let mut out: Vec<Jin10Attention> = Vec::new();
-    let mut push = |id: &str, score: f64| {
-        let id = id.trim();
-        if id.is_empty() {
-            return;
-        }
-        if let Some(existing) = out.iter_mut().find(|item| item.id == id) {
-            existing.score = existing.score.max(score.clamp(0.0, 1.0));
-        } else {
-            out.push(Jin10Attention {
-                id: id.to_string(),
-                score: score.clamp(0.0, 1.0),
-            });
-        }
-    };
-
-    // Preferred: jin10_attention: [{id, score}, ...] or {id: score}
-    if let Some(items) = artifact.get("jin10_attention").and_then(Value::as_array) {
-        for item in items {
-            if let Some(id) = item.get("id").and_then(Value::as_str) {
-                let score = item
-                    .get("score")
-                    .or_else(|| item.get("attention_score"))
-                    .and_then(Value::as_f64)
-                    .unwrap_or(0.5);
-                push(id, score);
-            }
-        }
-    } else if let Some(object) = artifact.get("jin10_attention").and_then(Value::as_object) {
-        for (id, score) in object {
-            if let Some(score) = score.as_f64() {
-                push(id, score);
-            }
-        }
-    }
-
-    // Backward-compatible: bare id lists default to mid attention 0.5
-    if let Some(items) = artifact
-        .get("referenced_jin10_ids")
-        .and_then(Value::as_array)
-    {
-        for item in items {
-            if let Some(id) = item.as_str() {
-                push(id, 0.5);
-            }
-        }
-    }
-
-    if let Some(per_ticker) = artifact.get("per_ticker").and_then(Value::as_object) {
-        for payload in per_ticker.values() {
-            if let Some(items) = payload.get("jin10_attention").and_then(Value::as_array) {
-                for item in items {
-                    if let Some(id) = item.get("id").and_then(Value::as_str) {
-                        let score = item
-                            .get("score")
-                            .or_else(|| item.get("attention_score"))
-                            .and_then(Value::as_f64)
-                            .unwrap_or(0.5);
-                        push(id, score);
-                    }
-                }
-            }
-            if let Some(items) = payload
-                .get("referenced_jin10_ids")
-                .and_then(Value::as_array)
-            {
-                for item in items {
-                    if let Some(id) = item.as_str() {
-                        push(id, 0.5);
-                    }
-                }
-            }
-            if let Some(items) = payload.get("key_evidence").and_then(Value::as_array) {
-                for evidence in items {
-                    if let Some(id) = evidence
-                        .get("jin10_id")
-                        .and_then(Value::as_str)
-                        .or_else(|| evidence.get("id").and_then(Value::as_str))
-                    {
-                        let trimmed = id.trim();
-                        if trimmed.len() == 32 && trimmed.chars().all(|ch| ch.is_ascii_hexdigit()) {
-                            let score = evidence
-                                .get("attention_score")
-                                .or_else(|| evidence.get("score"))
-                                .and_then(Value::as_f64)
-                                .unwrap_or(0.55);
-                            push(trimmed, score);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    out
-}
-
 fn write_role_end_context(settings: &AgentSettings, turn: &Turn) -> Result<()> {
     let Some(path) = role_end_context_path(settings, turn) else {
         return Ok(());
@@ -2549,7 +2375,6 @@ fn validate_text_verbosity(value: &str) -> Result<()> {
 fn default_tool_config() -> tools::ExternalToolConfig {
     tools::ExternalToolConfig {
         project_root: default_project_root(),
-        db_path: std::env::var_os("ORCH_DB_PATH").map(PathBuf::from),
         run_dir: None,
         run_id: None,
         phase: None,
@@ -2571,8 +2396,6 @@ fn default_tool_config() -> tools::ExternalToolConfig {
         alpaca_market_data: false,
         alpaca_api_key: None,
         alpaca_api_secret: None,
-        phase_summary_index: None,
-        phase_summary_gate: None,
         file_store_input: None,
         file_store_reflection_source: None,
     }
@@ -2580,7 +2403,7 @@ fn default_tool_config() -> tools::ExternalToolConfig {
 
 pub fn mock_role_artifact(role: &str, tickers: &[String]) -> Value {
     match role {
-        "manager.research" => orchestrator_sql::write::mock_research_artifact(tickers),
+        "manager.research" => mock_research_artifact(tickers),
         "trader" => mock_trader_artifact(),
         "risk.aggressive" | "risk.neutral" | "risk.conservative" => mock_risk_artifact(role),
         "portfolio.manager" => mock_portfolio_artifact(),
@@ -2606,6 +2429,25 @@ pub fn mock_role_artifact(role: &str, tickers: &[String]) -> Value {
             })
         }
     }
+}
+
+fn mock_research_artifact(tickers: &[String]) -> Value {
+    let per_ticker = tickers
+        .iter()
+        .map(|ticker| {
+            (
+                ticker.clone(),
+                json!({
+                    "rating": "hold",
+                    "bull_probability": 0.5,
+                    "bear_probability": 0.5,
+                    "scenarios": [{"name": "base", "probability": 1.0}],
+                    "decision_hinges": [],
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    json!({"id": "manager.research", "role": "manager.research", "per_ticker": per_ticker})
 }
 
 fn mock_trader_artifact() -> Value {
@@ -2911,9 +2753,6 @@ mod tests {
         assert_eq!(
             tools::tool_names(),
             vec![
-                "read_phase_summaries",
-                "read_phase_summary_details",
-                "read_experience",
                 "read_reflection_source",
                 "read_technical_snapshot",
                 "read_technical_detail",
@@ -3000,26 +2839,26 @@ mod tests {
         let calls = [
             agent_loop::ToolCallRequest {
                 call_id: "call-summary".to_string(),
-                name: "read_phase_summaries".to_string(),
-                arguments: json!({"source_phases": [3, 4, 5]}),
+                name: "read_indexes".to_string(),
+                arguments: json!({"source_phase": 3}),
             },
             agent_loop::ToolCallRequest {
                 call_id: "call-details".to_string(),
-                name: "read_phase_summary_details".to_string(),
-                arguments: json!({"artifact_ids": ["abc"]}),
+                name: "read_index_details".to_string(),
+                arguments: json!({"index_id": "abc"}),
             },
         ];
         let results = [
             agent_loop::ToolResultItem {
                 call_id: "call-summary".to_string(),
-                name: "read_phase_summaries".to_string(),
+                name: "read_indexes".to_string(),
                 status: "completed".to_string(),
                 output: json!({"items": []}),
                 error: None,
             },
             agent_loop::ToolResultItem {
                 call_id: "call-details".to_string(),
-                name: "read_phase_summary_details".to_string(),
+                name: "read_index_details".to_string(),
                 status: "completed".to_string(),
                 output: json!({"items": []}),
                 error: None,
@@ -3063,7 +2902,6 @@ mod tests {
         settings.role = "researcher.bull.interaction".to_string();
         settings.tools = Some(tools::ExternalToolConfig {
             project_root: temp.path().to_path_buf(),
-            db_path: None,
             run_dir: Some(temp.path().to_path_buf()),
             run_id: None,
             phase: None,
@@ -3075,8 +2913,6 @@ mod tests {
             alpaca_market_data: false,
             alpaca_api_key: None,
             alpaca_api_secret: None,
-            phase_summary_index: None,
-            phase_summary_gate: None,
             file_store_input: None,
             file_store_reflection_source: None,
         });
@@ -3112,7 +2948,6 @@ mod tests {
         settings.debug_prompt_path = Some(PathBuf::from("prompts/phase1/technical.md"));
         settings.tools = Some(tools::ExternalToolConfig {
             project_root: temp.path().to_path_buf(),
-            db_path: None,
             run_dir: None,
             run_id: None,
             phase: None,
@@ -3124,8 +2959,6 @@ mod tests {
             alpaca_market_data: false,
             alpaca_api_key: None,
             alpaca_api_secret: None,
-            phase_summary_index: None,
-            phase_summary_gate: None,
             file_store_input: None,
             file_store_reflection_source: None,
         });
@@ -3492,13 +3325,13 @@ mod tests {
             settings.role = role.to_string();
             settings.llm.base_url = Some("https://llm.example.com/v1".to_string());
             settings.llm.api_key = Some("test-key".to_string());
-            settings.llm.tools = vec!["read_run_context".to_string()];
+            settings.llm.tools = vec![tools::READ_INDEXES_TOOL_NAME.to_string()];
             settings.llm.native_web_search = true;
             settings.web_search.mode = WebSearchMode::Live;
 
             assert_eq!(
                 super::configured_tool_names(&settings),
-                vec!["think", "read_run_context"]
+                vec!["think", tools::READ_INDEXES_TOOL_NAME]
             );
             assert_eq!(
                 super::additional_params(&settings),
@@ -3512,7 +3345,7 @@ mod tests {
         settings.role = "manager.research".to_string();
         settings.llm.base_url = Some("https://llm.example.com/v1".to_string());
         settings.llm.api_key = Some("test-key".to_string());
-        settings.llm.tools = vec!["read_run_context".to_string()];
+        settings.llm.tools = vec![tools::READ_INDEXES_TOOL_NAME.to_string()];
         settings.web_search.mode = WebSearchMode::Live;
         assert!(super::configured_tool_names(&settings).contains(&tools::WEB_RUN_TOOL_NAME));
     }
