@@ -637,7 +637,7 @@ pub fn finalize_index_definition() -> ToolDefinition {
 pub fn read_indexes_definition() -> ToolDefinition {
     ToolDefinition {
         name: api_tool_name(READ_INDEXES_NAME),
-        description: "List completed, visibility-authorized Index records. The runtime restricts every supplied filter to the current role's allowed scope.".to_owned(),
+        description: "List completed, visibility-authorized Index records. Omit Rust-owned singleton phase, ticker, role, and topic filters; use {} or kind only unless the runtime has explicitly offered multiple allowed values.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
