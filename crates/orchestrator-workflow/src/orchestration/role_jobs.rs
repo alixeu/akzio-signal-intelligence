@@ -371,7 +371,7 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
     // A migrated role may read only its Rust-projected FileStore indexes and
     // snapshots. Clearing every alternate persistence handle here turns a missing
     // FileStore projection into a hard tool error instead of an accidental
-    // SQLite fallback.
+    // alternate persistence fallback.
     let session_runtime = tool_managed_profile
         .map(|profile| {
             file_store_session_runtime(

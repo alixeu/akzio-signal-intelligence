@@ -1295,7 +1295,7 @@ required_variables = ["ticker", "tickers"]
                     "report": "DROP_TICKER_REPORT"
                 }}
             },
-            "trader_investment_plan": {"action": "Hold", "position_size": "0%"},
+            "trader_investment_plan": {"action": "Hold", "position_size_pct_max": 0.0},
             "analyst_reports": {"analyst.technical": {"report": "DROP_ANALYST_REPORT"}},
             "risk_debate_state": {"history": [{"artifact": {
                 "role": "risk.aggressive",

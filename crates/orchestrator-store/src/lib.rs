@@ -41,7 +41,7 @@ pub use domain::{
     set_risk_assessment, set_risk_constraints, set_trade_intent, AnalystArtifact,
     AnalystAssessmentInput, AnalystEvidenceInput, DomainFinalizeOutcome,
     PortfolioAssetDecisionInput, PortfolioDecisionArtifact, PortfolioDecisionFinalizePolicy,
-    ResearchArtifact, ResearchDecisionInput, ResearchScenarioInput, RiskAssessmentInput,
+    ResearchDecisionArtifact, ResearchDecisionInput, ResearchScenarioInput, RiskAssessmentInput,
     RiskConstraintsInput, RiskReviewArtifact, TradeIntentArtifact, TradeIntentFinalizePolicy,
     TradeIntentInput,
 };

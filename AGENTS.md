@@ -98,13 +98,13 @@ Prefer `codegraph_context` first for architecture, feature, or bug-context quest
 - Keep the three Phase 5 reviewers on distinct prompt paths. Shared constraints
   belong in `prompts/phase5/risk_analyst.md`, while stance-specific behavior
   remains in `prompts/phase5/{aggressive,neutral,conservative}.md`.
-- Do not describe YouTube or Reddit/X as active inputs until ingestion, SQLite
+- Do not describe YouTube or Reddit/X as active inputs until ingestion, FileStore
   context readers, role registration, prompts, and scheduling are all configured.
 - Keep reflection outcome-backed and historical: never learn from mock runs,
   unscored predictions, or the current prediction. Candidate distillation must
   remain idempotent, and reflection failures must not invalidate a completed
   investment decision.
-- Avoid committing local config, SQLite databases, build output, or report artifacts.
+- Avoid committing local config, FileStore data, build output, or report artifacts.
 
 ## Documentation Rules
 

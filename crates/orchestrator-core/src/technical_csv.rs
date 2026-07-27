@@ -1,4 +1,4 @@
-//! Technical indicator CSV snapshots (Yahoo-derived, not SQLite).
+//! Technical indicator CSV snapshots stored beneath the FileStore data root.
 //!
 //! File naming: `{symbol_lower}_{interval_label}.csv`
 //! e.g. `qqq_day.csv`, `qqq_3h.csv`, `vix_20min.csv`.

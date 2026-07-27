@@ -522,12 +522,6 @@ fn trade_plan(trader: &Value, final_decision: &Value) -> String {
         .get("position_size_pct_max")
         .and_then(Value::as_f64)
         .map(|value| format!("{:.0}%", value * 100.0))
-        .or_else(|| {
-            trader
-                .get("position_size")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
         .unwrap_or_else(|| "N/A".to_string());
     // TradeIntent exposes `entry_price` / `stop_loss`; accept `entry` / `stop`
     // aliases for forward compatibility with the plan template.
@@ -744,7 +738,7 @@ mod tests {
                 "action": "Buy",
                 "entry_price": "$45.00",
                 "stop_loss": "$42.50",
-                "position_size": "30%-50%",
+                "position_size_pct_max": 0.5,
                 "rationale": "Risk-on with tight stop."
             },
             "risk_debate_state": {

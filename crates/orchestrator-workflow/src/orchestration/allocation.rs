@@ -127,7 +127,7 @@ pub(crate) fn allocation_prompt_context(context: &Value) -> Value {
         "per_ticker": context.get("per_ticker").cloned().unwrap_or_else(|| json!({})),
         "trader_plan": context.get("trader_plan").map(|plan| json!({
             "action": plan.get("action").cloned().unwrap_or(Value::Null),
-            "position_size": plan.get("position_size").cloned().unwrap_or(Value::Null),
+            "position_size_pct_max": plan.get("position_size_pct_max").cloned().unwrap_or(Value::Null),
             "rationale": plan.get("rationale").cloned().unwrap_or(Value::Null)
         })).unwrap_or(Value::Null),
         "risk_constraints": risk_constraints,
@@ -626,7 +626,6 @@ fn trader_plan_position_cap(context: &Value) -> Option<f64> {
         {
             Some(
                 plan.get("position_size_pct_max")
-                    .or_else(|| plan.get("position_size"))
                     .and_then(position_fraction)
                     .unwrap_or(0.0),
             )
@@ -637,28 +636,9 @@ fn trader_plan_position_cap(context: &Value) -> Option<f64> {
 
 fn position_fraction(value: &Value) -> Option<f64> {
     match value {
-        Value::Number(number) => number.as_f64().map(|position| position.clamp(0.0, 1.0)),
-        Value::String(position) => {
-            let trimmed = position.trim();
-            if let Some(percent) = trimmed.strip_suffix('%') {
-                if let Ok(value) = percent.trim().parse::<f64>() {
-                    return Some((value / 100.0).clamp(0.0, 1.0));
-                }
-            }
-            if let Ok(value) = trimmed.parse::<f64>() {
-                return Some(value.clamp(0.0, 1.0));
-            }
-
-            let uses_percent = trimmed.contains('%');
-            trimmed
-                .split(|character: char| {
-                    character == '-' || character == '/' || character.is_whitespace()
-                })
-                .filter_map(|part| part.trim().trim_end_matches('%').parse::<f64>().ok())
-                .map(|value| if uses_percent { value / 100.0 } else { value })
-                .map(|value| value.clamp(0.0, 1.0))
-                .max_by(f64::total_cmp)
-        }
+        Value::Number(number) => number
+            .as_f64()
+            .filter(|position| position.is_finite() && (0.0..=1.0).contains(position)),
         _ => None,
     }
 }
@@ -880,7 +860,7 @@ mod tests {
     #[test]
     fn empty_llm_weights_respect_zero_percent_trader_position() {
         let mut context = test_context();
-        context["trader_plan"] = json!({"action": "Hold", "position_size": "0%"});
+        context["trader_plan"] = json!({"action": "Hold", "position_size_pct_max": 0.0});
 
         let allocation = normalize_allocation(&json!({"weights": {}}), &context, &test_config());
 
@@ -894,7 +874,7 @@ mod tests {
     #[test]
     fn empty_llm_weights_keep_inverse_vol_fallback_for_positive_trader_position() {
         let mut context = test_context();
-        context["trader_plan"] = json!({"action": "Buy", "position_size": "25%"});
+        context["trader_plan"] = json!({"action": "Buy", "position_size_pct_max": 0.25});
 
         let allocation = normalize_allocation(&json!({"weights": {}}), &context, &test_config());
 
@@ -909,7 +889,7 @@ mod tests {
     #[test]
     fn valid_llm_weights_cannot_override_zero_percent_trader_position() {
         let mut context = test_context();
-        context["trader_plan"] = json!({"action": "Hold", "position_size": "0%"});
+        context["trader_plan"] = json!({"action": "Hold", "position_size_pct_max": 0.0});
 
         let allocation = normalize_allocation(
             &json!({
@@ -931,7 +911,7 @@ mod tests {
     #[test]
     fn valid_llm_weights_are_scaled_to_explicit_trader_position_cap() {
         let mut context = test_context();
-        context["trader_plan"] = json!({"action": "Buy", "position_size": "10%"});
+        context["trader_plan"] = json!({"action": "Buy", "position_size_pct_max": 0.1});
 
         let allocation = normalize_allocation(
             &json!({
@@ -952,9 +932,9 @@ mod tests {
     }
 
     #[test]
-    fn trader_position_range_uses_its_upper_bound_as_total_exposure_cap() {
+    fn trader_numeric_position_cap_limits_total_exposure() {
         let mut context = test_context();
-        context["trader_plan"] = json!({"action": "Buy", "position_size": "10%-25%"});
+        context["trader_plan"] = json!({"action": "Buy", "position_size_pct_max": 0.25});
 
         let allocation = normalize_allocation(
             &json!({
@@ -975,9 +955,9 @@ mod tests {
     }
 
     #[test]
-    fn hold_action_forces_cash_even_when_position_range_is_positive() {
+    fn hold_action_forces_cash_even_when_numeric_cap_is_positive() {
         let mut context = test_context();
-        context["trader_plan"] = json!({"action": "Hold", "position_size": "0%-30%"});
+        context["trader_plan"] = json!({"action": "Hold", "position_size_pct_max": 0.3});
 
         let allocation = normalize_allocation(
             &json!({

@@ -32,7 +32,7 @@
 
 - `key_evidence` 必须包含可核对的 ticker、字段/数值或结构变化、来源、时间和解释；重复读数只保留一条。
 - 原始标准化读数使用 `evidence_type="fact"`；组合解释使用 `opinion`。
-- SQLite 技术序列没有外部发布者分层；其 `key_evidence[].source_tier` 一律填写 `unknown`，绝不填写 `T1_reference`、`T2_reference` 或 `T3_reference`。
+- FileStore 技术快照没有外部发布者分层；其 `key_evidence[].source_tier` 一律填写 `unknown`，绝不填写 `T1_reference`、`T2_reference` 或 `T3_reference`。
 - `confidence` 表示证据独立性、完整性、时效与冲突程度，不是上涨概率。
 
 {leveraged_etf_rules}

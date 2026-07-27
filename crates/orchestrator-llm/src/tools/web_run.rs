@@ -19,7 +19,7 @@ const MAX_QUERY_CHARS: usize = 512;
 pub fn definition() -> ToolDefinition {
     ToolDefinition {
         name: api_tool_name(NAME),
-        description: "When a thin headline or flash item is directionally material and you need actual-vs-expected numbers, cross-source confirmation, official wording, or market reaction (yields, FedWatch, VIX, USD, index). Prefer focused English queries and domain filters. Do not use for general browsing, to invent missing CSV/SQLite evidence, or when the imported feed already contains enough detail.".to_string(),
+        description: "When a thin headline or flash item is directionally material and you need actual-vs-expected numbers, cross-source confirmation, official wording, or market reaction (yields, FedWatch, VIX, USD, index). Prefer focused English queries and domain filters. Do not use for general browsing, to invent missing CSV/FileStore evidence, or when the imported feed already contains enough detail.".to_string(),
         parameters: json!({
             "type": "object",
             "properties": {

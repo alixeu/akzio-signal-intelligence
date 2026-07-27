@@ -143,7 +143,7 @@ pub struct AnalystArtifact {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ResearchArtifact {
+pub struct ResearchDecisionArtifact {
     pub schema_version: u32,
     pub artifact_id: String,
     pub run_id: String,
@@ -228,7 +228,7 @@ impl ContentHashDocument for AnalystArtifact {
     }
 }
 
-impl ContentHashDocument for ResearchArtifact {
+impl ContentHashDocument for ResearchDecisionArtifact {
     fn content_hash(&self) -> &str {
         &self.content_hash
     }
@@ -262,7 +262,7 @@ impl FinalizableArtifact for AnalystArtifact {
     }
 }
 
-impl FinalizableArtifact for ResearchArtifact {
+impl FinalizableArtifact for ResearchDecisionArtifact {
     fn artifact_id(&self) -> &str {
         &self.artifact_id
     }
@@ -290,7 +290,7 @@ finalizable_artifact!(PortfolioDecisionArtifact);
 #[derive(Debug, Clone, PartialEq)]
 pub enum DomainFinalizeOutcome {
     Analyst(Box<FinalizeDraftOutcome<AnalystArtifact>>),
-    Research(Box<FinalizeDraftOutcome<ResearchArtifact>>),
+    Research(Box<FinalizeDraftOutcome<ResearchDecisionArtifact>>),
     Trade(Box<FinalizeDraftOutcome<TradeIntentArtifact>>),
     Risk(Box<FinalizeDraftOutcome<RiskReviewArtifact>>),
     Portfolio(Box<FinalizeDraftOutcome<PortfolioDecisionArtifact>>),
@@ -697,7 +697,7 @@ pub fn finalize_research_decision(
             kind: "research finalizer",
             message: "at least one ticker is required".to_owned(),
         })?;
-    let artifact = ResearchArtifact {
+    let artifact = ResearchDecisionArtifact {
         schema_version: DOMAIN_ARTIFACT_SCHEMA_VERSION,
         artifact_id: artifact_id(scope, "research")?,
         run_id: scope.run_id.clone(),

@@ -1,6 +1,6 @@
 # Akzio Signal Intelligence
 
-Rust-native market-signal research workflow for a small ETF universe. The production path uses Alpaca Market Data, a Yahoo VIX fallback, Jin10, SQLite WAL, and an OpenAI-compatible LLM gateway. VIX is a regime signal, not an investable asset.
+Rust-native market-signal research workflow for a small ETF universe. The production path uses Alpaca Market Data, a Yahoo VIX fallback, Jin10, time-partitioned FileStore data, and an OpenAI-compatible LLM gateway. VIX is a regime signal, not an investable asset.
 
 ## Current scope
 
@@ -11,8 +11,8 @@ Active Phase 1 analysts are fixed to:
 | `analyst.technical` | Alpaca OHLCV (Yahoo for VIX) and precomputed indicators | 50% | yes |
 | `analyst.news_macro` | Jin10, Alpaca News, and verified macro/event sources | 50% | yes |
 
-YouTube and Reddit/X remain explicit extension points, but their ingestion, SQLite
-contexts, and Phase 1 roles are currently unconfigured; they are not scheduled or
+YouTube and Reddit/X remain explicit extension points, but their ingestion,
+FileStore readers, and Phase 1 roles are currently unconfigured; they are not scheduled or
 counted as evidence. A failed critical analyst aborts the run before probability
 and allocation phases; it is never converted into a neutral 0.5 vote.
 
@@ -25,7 +25,7 @@ graph TD
         JIN10[Jin10 金融快讯]
         YT[YouTube 分析师<br/>未配置]
         SOCIAL[Reddit · X<br/>未配置]
-        SQL[(SQLite WAL<br/>统一状态存储)]
+        STORE[(FileStore<br/>时间分区权威存储)]
     end
 
     subgraph "Phase 1 — 多源研究"
@@ -65,22 +65,22 @@ graph TD
         REF[决策快照与归档]
     end
 
-    subgraph "记忆层 Memory Layer"
-        MEM[经验记忆<br/>质量评分 · Regime 感知]
-        CAND[候选经验池]
-        OUT[预测 vs 结果]
+    subgraph "知识层 Index + Detail"
+        SUM[Phase Summary<br/>Index + Detail]
+        EXP[Experience<br/>Index + Historical Case Detail]
+        OUT[Decision / Outcome / Reflection]
     end
 
-    MARKET --> SQL
-    JIN10 --> SQL
-    SQL --> SCORE
+    MARKET --> STORE
+    JIN10 --> STORE
+    STORE --> SCORE
     HIST --> SCORE
     SCORE --> EXP
-    EXP --> MEM
-    YT -. 待配置 .-> SQL
-    SOCIAL -. 待配置 .-> SQL
-    SQL --> TA & NA
-    SQL -. 待配置 .-> YA & SA
+    SCORE --> EXP
+    YT -. 待配置 .-> STORE
+    SOCIAL -. 待配置 .-> STORE
+    STORE --> TA & NA
+    STORE -. 待配置 .-> YA & SA
     TA & NA --> TG & WARM
     YA & SA -. 配置后参与 .-> TG & WARM
     WARM -->|共享预热 fork| BULL & BEAR
@@ -93,9 +93,8 @@ graph TD
     RISK --> PM
     PM --> ALLOC
     ALLOC --> REF
-    OUT --> CAND
-    CAND --> MEM
-    MEM --> SQL
+    OUT --> EXP
+    SUM --> EXP
 ```
 
 Phase 2 begins with one shared Bull/Bear warm-up and an independent neutral

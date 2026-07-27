@@ -1019,16 +1019,10 @@ mod tests {
         .unwrap();
         validate_trade_intent(&valid).unwrap();
 
-        let legacy = r#"{
-            "action":"Buy",
-            "candidate_action":"Buy",
-            "execution_decision":"execute_candidate",
-            "position_size":"25%",
-            "position_size_pct_max":0.25,
-            "blockers":[],
-            "rationale":"The evidence supports a bounded entry."
-        }"#;
-        assert!(serde_json::from_str::<TradeIntent>(legacy).is_err());
+        assert!(serde_json::from_str::<TradeIntent>(
+            r#"{"action":"Buy","candidate_action":"Buy","execution_decision":"execute_candidate","blockers":[],"rationale":"missing cap"}"#
+        )
+        .is_err());
     }
 
     #[test]
