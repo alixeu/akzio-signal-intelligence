@@ -8,7 +8,7 @@ async fn mock_exec_writes_state_and_final_summary() {
     let config_path = write_test_config(temp.path());
     let run_dir = temp.path().join("run");
     let db_path = temp.path().join("orchestrator.sqlite");
-    let store_root = temp.path().join("unused-file-store");
+    let store_root = temp.path().join("file-store");
     let result = exec::run(ExecArgs {
         date: Some("2026-06-15".to_string()),
         lang: "zh".to_string(),
@@ -33,8 +33,21 @@ async fn mock_exec_writes_state_and_final_summary() {
     .unwrap();
     assert_eq!(result["long_probability"], 0.5);
     assert!(
-        !store_root.exists(),
-        "a Legacy-only run must not initialize FileStore"
+        store_root.exists(),
+        "migrated phase_summary must initialize FileStore"
+    );
+    // Store paths are deliberately safe-slugged, so assertions must not
+    // reconstruct raw run IDs as paths.
+    let summary_index_exists = fs::read_dir(store_root.join("runs"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter_map(|date| fs::read_dir(date.path()).ok())
+        .flatten()
+        .filter_map(Result::ok)
+        .any(|run| run.path().join("index").is_dir());
+    assert!(
+        summary_index_exists,
+        "each completed phase must publish completed FileStore Summary Indexes"
     );
 
     let state = &result["run_state"];
@@ -56,6 +69,13 @@ async fn mock_exec_writes_state_and_final_summary() {
         )
         .unwrap();
     assert_eq!(summary_comma_rows, 0);
+    let persisted_phase_summaries: i64 = conn
+        .query_row("SELECT COUNT(*) FROM phase_summaries", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        persisted_phase_summaries, 0,
+        "migrated phase_summary must not write the legacy SQLite table"
+    );
 }
 
 #[tokio::test]
@@ -340,9 +360,9 @@ async fn selective_policy_derives_trader_runs_triggered_risk_and_allocates() {
         serde_json::json!(["trader", "portfolio_review"])
     );
     assert_eq!(state["trader_investment_plan"]["status"], "derived");
-    assert_eq!(
-        state["trader_investment_plan"]["method"],
-        "conservative_research_plan_mapping"
+    assert!(
+        state["trader_investment_plan"].get("method").is_none(),
+        "Canonical Contract v2 does not retain legacy derived-method metadata"
     );
     assert_eq!(
         state["risk_debate_state"]["history"]
@@ -848,6 +868,8 @@ orchestrator:
     strict_sqlite: true
     required_contexts:
       - technical
+  store:
+    root: "{}"
   allocation:
     investable_assets: [QQQ, SOXX]
     regime_signal: VIX
@@ -875,6 +897,7 @@ orchestrator:
     portfolio:
       manager: "{}"
 "#,
+        root.join("store").display(),
         prompt_dir.join("analyst_technical.md").display(),
         prompt_dir.join("analyst_news.md").display(),
         prompt_dir.join("bull_initial.md").display(),

@@ -199,6 +199,9 @@ pub struct AgentSettings {
     /// Required only when `output_mode` is ToolManaged. The profile selects a
     /// Rust-owned draft/builder contract; assistant prose is never an artifact.
     pub tool_managed_profile: Option<ToolManagedProfile>,
+    /// Present only for a migrated Index/Detail unit. Legacy settings must
+    /// leave this absent; there is no legacy-to-FileStore fallback.
+    pub index_tool_runtime: Option<tools::index_tools::IndexToolRuntimeBinding>,
     pub llm: RoleLlmSettings,
     pub reasoning_effort_override: Option<String>,
     pub tools: Option<tools::ExternalToolConfig>,
@@ -211,6 +214,9 @@ pub struct AgentSettings {
 
 impl AgentSettings {
     fn validate_output_mode(&self) -> Result<()> {
+        if self.index_tool_runtime.is_some() && self.output_mode != OutputMode::ToolManaged {
+            bail!("IndexToolRuntime is available only to a ToolManaged agent");
+        }
         match (self.output_mode, self.tool_managed_profile) {
             (OutputMode::ToolManaged, Some(_)) => Ok(()),
             (OutputMode::ToolManaged, None) => {
@@ -334,6 +340,9 @@ pub async fn run_agent_loop_with_metrics(
             .map(ToString::to_string)
             .collect(),
     );
+    if let Some(binding) = settings.index_tool_runtime.clone() {
+        tools = tools.with_index_tool_runtime(binding);
+    }
     if let Some(web_run) = web_run_runtime_for_settings(settings) {
         tools = tools.with_web_run_runtime(web_run);
     }
@@ -474,6 +483,9 @@ pub async fn run_agent_steer_loop_with_metrics(
             .map(ToString::to_string)
             .collect(),
     );
+    if let Some(binding) = settings.index_tool_runtime.clone() {
+        tools = tools.with_index_tool_runtime(binding);
+    }
     if let Some(web_run) = web_run_runtime_for_settings(settings) {
         tools = tools.with_web_run_runtime(web_run);
     }
@@ -2742,10 +2754,7 @@ fn validate_risk_constraints_contract(settings: &AgentSettings, artifact: &Value
     require_non_empty_string(artifact, "argument")?;
     require_non_empty_string(artifact, "recommended_adjustment")?;
     let stop_type = require_non_empty_string(artifact, "stop_type")?;
-    if !matches!(
-        stop_type,
-        "none" | "tight" | "trailing" | "event_based" | "time_based"
-    ) {
+    if !matches!(stop_type, "none" | "soft" | "hard") {
         bail!("risk stop_type is invalid: {stop_type:?}");
     }
     require_number_in_range(artifact, "max_drawdown_pct", 0.0, 1.0)?;
@@ -3121,6 +3130,15 @@ fn configured_tool_names(settings: &AgentSettings) -> Vec<&str> {
     if uses_web_run_fallback(settings) {
         names.push(tools::WEB_RUN_TOOL_NAME);
     }
+    if settings.index_tool_runtime.is_some() {
+        names.extend([
+            tools::CREATE_INDEX_TOOL_NAME,
+            tools::APPEND_INDEX_DETAIL_TOOL_NAME,
+            tools::FINALIZE_INDEX_TOOL_NAME,
+            tools::READ_INDEXES_TOOL_NAME,
+            tools::READ_INDEX_DETAILS_TOOL_NAME,
+        ]);
+    }
     names
 }
 
@@ -3268,7 +3286,7 @@ fn mock_risk_artifact(role: &str) -> Value {
         "disagreement_with_prior": "Mock review records whether prior constraints require a stance-specific change.",
         "no_new_information": false,
         "recommended_adjustment": "No change in mock mode.",
-        "stop_type": "event_based",
+        "stop_type": "soft",
         "max_drawdown_pct": 0.1,
         "position_cap_pct": position_cap_pct,
         "rebalance_trigger": "Mock rebalance trigger.",
@@ -3302,9 +3320,61 @@ mod tests {
         ToolManagedProfile, TruncationConfig,
     };
     use crate::web_search::{WebSearchConfig, WebSearchMode};
-    use anyhow::anyhow;
+    use anyhow::{anyhow, Result};
     use serde_json::{json, Value};
-    use std::path::{Path, PathBuf};
+    use std::{
+        path::{Path, PathBuf},
+        sync::Arc,
+    };
+
+    struct RejectingIndexService;
+
+    impl tools::index_tools::IndexToolService for RejectingIndexService {
+        fn create_index(&self, _: tools::index_tools::CreateIndexCommand) -> Result<Value> {
+            anyhow::bail!("not used by validation test")
+        }
+        fn append_index_detail(
+            &self,
+            _: tools::index_tools::AppendIndexDetailCommand,
+        ) -> Result<Value> {
+            anyhow::bail!("not used by validation test")
+        }
+        fn finalize_index(&self, _: tools::index_tools::FinalizeIndexCommand) -> Result<Value> {
+            anyhow::bail!("not used by validation test")
+        }
+        fn read_indexes(
+            &self,
+            _: tools::index_tools::ReadIndexesCommand,
+        ) -> Result<tools::index_tools::IndexReadPage> {
+            anyhow::bail!("not used by validation test")
+        }
+        fn read_index_details(
+            &self,
+            _: tools::index_tools::ReadIndexDetailsCommand,
+        ) -> Result<Value> {
+            anyhow::bail!("not used by validation test")
+        }
+    }
+
+    fn test_index_runtime_binding() -> tools::index_tools::IndexToolRuntimeBinding {
+        tools::index_tools::IndexToolRuntimeBinding::new(
+            tools::index_tools::IndexOwnedScope {
+                run_id: "run-1".to_owned(),
+                source_run_id: None,
+                source_phase: 1,
+                role: "compressor.phase_summary".to_owned(),
+                kind: tools::index_tools::IndexKind::PhaseSummary,
+                ticker: None,
+                topic_id: None,
+                unit_key: "unit".to_owned(),
+                source_payload_hash: "hash".to_owned(),
+                index_id: "index".to_owned(),
+            },
+            Default::default(),
+            Arc::new(RejectingIndexService),
+        )
+        .unwrap()
+    }
 
     #[test]
     fn context_window_full_is_not_transient() {
@@ -3361,6 +3431,7 @@ mod tests {
             tickers: vec!["TQQQ".to_string()],
             output_mode: OutputMode::ResearchArtifact,
             tool_managed_profile: None,
+            index_tool_runtime: None,
             llm: RoleLlmSettings {
                 route,
                 model: "gpt-5.4".to_string(),
@@ -3399,6 +3470,10 @@ mod tests {
         assert!(settings.validate_output_mode().is_ok());
 
         settings.output_mode = OutputMode::JsonArtifact;
+        assert!(settings.validate_output_mode().is_err());
+
+        settings.tool_managed_profile = None;
+        settings.index_tool_runtime = Some(test_index_runtime_binding());
         assert!(settings.validate_output_mode().is_err());
     }
 
@@ -3900,19 +3975,14 @@ mod tests {
     }
 
     #[test]
-    fn parse_final_output_normalizes_legacy_analyst_source_tier() {
+    fn parse_final_output_rejects_legacy_analyst_source_tier() {
         let mut settings = base_settings(LlmRoute::Responses);
         settings.role = "analyst.technical".to_string();
         settings.tickers = vec!["QQQ".to_string()];
         settings.output_mode = OutputMode::JsonArtifact;
 
         let text = r#"{"id":"analyst.technical","role":"analyst.technical","per_ticker":{"QQQ":{"direction":"bullish","confidence":0.7,"report":"ok","key_evidence":[{"claim":"QQQ closed above its 20-day average","evidence_type":"fact","source":"Yahoo Finance daily OHLCV","timestamp":"2026-07-22","source_tier":"T1_reference","source_confidence":0.9}]}}}"#;
-        let artifact = super::parse_final_output(&settings, text).unwrap();
-
-        assert_eq!(
-            artifact["per_ticker"]["QQQ"]["key_evidence"][0]["source_tier"],
-            json!("unknown")
-        );
+        assert!(super::parse_final_output(&settings, text).is_err());
     }
 
     #[test]

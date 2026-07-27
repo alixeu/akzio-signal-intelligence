@@ -7,6 +7,7 @@
 mod atomic;
 mod draft;
 mod error;
+mod index;
 mod input;
 mod json;
 mod jsonl;
@@ -31,6 +32,12 @@ pub use draft::{
     TopicGenerationDraft, TradeIntentDraft,
 };
 pub use error::{Result, StoreError};
+pub use index::{
+    append_index_detail, create_index, deterministic_experience_index_id, finalize_index,
+    read_index_details, read_indexes, AppendIndexDetailInput, CreateIndexInput, DetailPage,
+    DetailQuery, DetailSection, Index, IndexDetail, IndexKind, IndexPage, IndexQuery, IndexScope,
+    INDEX_DETAIL_SCHEMA_VERSION, INDEX_SCHEMA_VERSION,
+};
 pub use input::{
     capture_run_inputs, read_input_metadata, read_input_payload, read_input_snapshot_manifest,
     read_snapshotted_input, write_input_payload, DataFileMetadata, InputKind, InputSnapshot,

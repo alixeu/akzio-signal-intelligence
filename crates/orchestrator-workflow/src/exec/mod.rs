@@ -3,6 +3,7 @@ use chrono::{Local, NaiveDate, Utc};
 use orchestrator_core::{
     config_int, config_str, config_strings, default_project_root, display_ticker, load_config,
     parse_tickers, project_path, research_rating_for_probability, ArtifactAuthority, MarketRegime,
+    ToolManagedProfile,
 };
 use orchestrator_sql::{
     archive::{upsert_run_archive, RunArchiveInput},
@@ -52,6 +53,7 @@ use crate::orchestration::role_jobs::{
     merge_role_job_metrics, persist_prompt_metric, prepare_role_job, record_role_job_metrics,
     run_role_jobs, run_single_role_job, run_single_steer_role_job, RoleRun, SteerRoleRun,
 };
+use crate::orchestration::summary_store::write_deterministic_phase_summary;
 use orchestrator_core::role_registry::DEFAULT_PHASE1_AGENTS;
 use rusqlite::{params, OptionalExtension};
 
@@ -78,6 +80,15 @@ fn has_file_store_authority(runtime_config: &RuntimeConfig) -> bool {
         .authority_registry
         .registrations()
         .any(|registration| registration.authority == ArtifactAuthority::FileStore)
+}
+
+/// The registry, rather than a best-effort write result, is the source of
+/// truth for whether the legacy phase-summary database may be touched.
+fn phase_summary_uses_file_store(runtime_config: &RuntimeConfig) -> Result<bool> {
+    Ok(runtime_config
+        .authority_registry
+        .authority_for("compressor.phase_summary", ToolManagedProfile::PhaseSummary)?
+        == ArtifactAuthority::FileStore)
 }
 
 /// The manifest is part of the FileStore authority, not a second run ledger
@@ -289,6 +300,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         "window_days": window_days,
         "run_dir": run_dir,
         "db_path": db_path,
+        "store_root": store_root,
         "phase_status": {},
         "phase1_agents": phase1_agents,
         "tech_refresh_enabled": args.tech_refresh_enabled,
@@ -738,9 +750,15 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
     // Drain any compress still running when the pipeline ends early (e.g. to_phase < 8).
     await_all_compress_jobs(&mut compress_jobs, &mut state).await?;
 
-    // Idempotent insurance: each phase is already persisted before its gate completes.
-    let phase_summary_flushed =
-        crate::orchestration::compress::flush_phase_summary_to_sqlite(&conn, &mut state)?;
+    // Idempotent insurance for the legacy profile only.  Once Summary is
+    // FileStore-authoritative, every unit was finalized atomically before its
+    // gate completed; writing the compatibility projection below would create
+    // a forbidden second authority.
+    let phase_summary_flushed = if !phase_summary_uses_file_store(&runtime_config)? {
+        crate::orchestration::compress::flush_phase_summary_to_sqlite(&conn, &mut state)?
+    } else {
+        0
+    };
     orchestrator_sql::unregister_phase_summary_gate(&run_id);
     debug!(
         phase_summary_flushed,
@@ -2915,6 +2933,10 @@ struct CompressJobResult {
     source_phase: i64,
     written: usize,
     batch: orchestrator_sql::PhaseSummaryPhaseBatch,
+    /// True only when the completed Index directories are the persistence
+    /// authority. The batch then exists solely as an in-process compatibility
+    /// projection for not-yet-migrated readers and is never flushed to SQLite.
+    file_store_authoritative: bool,
     debug_enabled: bool,
     debug_output_path: PathBuf,
     debug_source_label: String,
@@ -2938,6 +2960,29 @@ async fn compress_phase_job(
     let debug_output_path = PathBuf::from(format!(
         "outputs/debug/phase{source_phase}/summary/phase{source_phase}_summary.json"
     ));
+    if phase_summary_uses_file_store(&config)? {
+        let store_root = state
+            .get("store_root")
+            .and_then(Value::as_str)
+            .context("store_root missing for FileStore phase_summary")?;
+        let file_store = write_deterministic_phase_summary(
+            Path::new(store_root),
+            &state,
+            source_phase,
+            config.tool_managed.max_summary_units_per_phase,
+        )?;
+        let batch = crate::orchestration::compress::build_phase_compress(&state, source_phase)?;
+        return Ok(CompressJobResult {
+            source_phase,
+            written: file_store.indexes.len(),
+            batch,
+            file_store_authoritative: true,
+            debug_enabled,
+            debug_output_path,
+            debug_source_label,
+            role_metrics: Value::Array(vec![]),
+        });
+    }
     let (batch, role_metrics) = if is_mock(&state) {
         (
             crate::orchestration::compress::build_phase_compress(&state, source_phase)?,
@@ -3030,6 +3075,7 @@ async fn compress_phase_job(
                 source_phase,
                 written: 0,
                 batch: crate::orchestration::compress::build_phase_compress(&state, source_phase)?,
+                file_store_authoritative: false,
                 debug_enabled,
                 debug_output_path,
                 debug_source_label,
@@ -3070,6 +3116,7 @@ async fn compress_phase_job(
         source_phase,
         written,
         batch,
+        file_store_authoritative: false,
         debug_enabled,
         debug_output_path,
         debug_source_label,
@@ -3081,6 +3128,7 @@ fn apply_compress_result(state: &mut Value, result: CompressJobResult) -> Result
     let CompressJobResult {
         source_phase,
         batch,
+        file_store_authoritative,
         debug_enabled,
         debug_output_path,
         debug_source_label,
@@ -3090,6 +3138,12 @@ fn apply_compress_result(state: &mut Value, result: CompressJobResult) -> Result
     merge_role_job_metrics(state, &role_metrics);
     let snapshot = crate::orchestration::compress::apply_phase_summary_batch(state, batch)?;
     state["phase_compress"][source_phase.to_string()]["persisted"] = json!(true);
+    state["phase_compress"][source_phase.to_string()]["authority"] =
+        json!(if file_store_authoritative {
+            "file_store"
+        } else {
+            "legacy"
+        });
     state["phase_summary_tables"][source_phase.to_string()]["persisted"] = json!(true);
     if debug_enabled {
         let role = format!("compressor.after_phase_{source_phase}");
@@ -4006,6 +4060,11 @@ fn stamp_phase6_execution_constraints(state: &Value, artifact: &mut Value) {
         .filter_map(Value::as_str)
         .map(ToString::to_string)
         .collect::<Vec<_>>();
+    // Legacy portfolio artifacts expressed controls as bare strings.  Phase 6
+    // is the last Rust-owned boundary before the canonical v2 artifact, so it
+    // attaches the Phase 5 reviews that supplied those controls here instead
+    // of weakening the canonical `BindingRiskControl` contract.
+    let default_control_refs = phase5_control_source_refs(state);
     let supplied = artifact
         .get("per_asset")
         .and_then(Value::as_object)
@@ -4054,7 +4113,7 @@ fn stamp_phase6_execution_constraints(state: &Value, artifact: &mut Value) {
                 max_target_weight = max_target_weight.min(current_weight);
                 max_weight_delta = max_weight_delta.min(current_weight - max_target_weight);
             }
-            let controls = raw
+            let control_names = raw
                 .get("binding_risk_controls")
                 .and_then(Value::as_array)
                 .map(|controls| {
@@ -4066,6 +4125,15 @@ fn stamp_phase6_execution_constraints(state: &Value, artifact: &mut Value) {
                 })
                 .filter(|controls| !controls.is_empty())
                 .unwrap_or_else(|| top_controls.clone());
+            let controls = control_names
+                .into_iter()
+                .map(|control| {
+                    json!({
+                        "control": control,
+                        "source_refs": default_control_refs.clone(),
+                    })
+                })
+                .collect::<Vec<_>>();
             (
                 ticker.clone(),
                 json!({
@@ -4080,6 +4148,23 @@ fn stamp_phase6_execution_constraints(state: &Value, artifact: &mut Value) {
         })
         .collect::<serde_json::Map<_, _>>();
     artifact["per_asset"] = Value::Object(constraints);
+}
+
+fn phase5_control_source_refs(state: &Value) -> Vec<String> {
+    let refs = state
+        .get("risk_debate_state")
+        .and_then(|value| value.get("history"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|turn| turn.get("role").and_then(Value::as_str))
+        .map(|role| format!("phase5:{role}"))
+        .collect::<Vec<_>>();
+    if refs.is_empty() {
+        vec!["phase5:workflow_policy".to_string()]
+    } else {
+        refs
+    }
 }
 
 fn runtime_current_weight(state: &Value, ticker: &str) -> f64 {
@@ -4511,7 +4596,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_only_authority_does_not_open_or_read_the_file_store() {
+    fn phase_summary_authority_prepares_the_file_store_manifest() {
         let directory = tempfile::tempdir().unwrap();
         let config = json!({
             "orchestrator": {
@@ -4536,7 +4621,7 @@ mod tests {
             }
         });
         let runtime = RuntimeConfig::from_value(&config).unwrap();
-        assert!(!has_file_store_authority(&runtime));
+        assert!(has_file_store_authority(&runtime));
 
         let missing_root = directory.path().join("not-created");
         assert!(prepare_file_store_run_manifest_if_migrated(
@@ -4544,11 +4629,18 @@ mod tests {
             &runtime,
             &config,
             "2026-07-27",
-            "legacy-only",
+            "phase-summary-file-store",
         )
         .unwrap()
-        .is_none());
-        assert!(!missing_root.exists());
+        .is_some());
+        assert!(missing_root.exists());
+    }
+
+    #[test]
+    fn migrated_phase_summary_never_flushes_the_legacy_database_projection() {
+        let directory = tempfile::tempdir().unwrap();
+        let (_config, runtime) = manifest_runtime_config(directory.path());
+        assert!(phase_summary_uses_file_store(&runtime).unwrap());
     }
 
     #[test]
@@ -5533,7 +5625,10 @@ mod tests {
         assert_eq!(artifact["per_asset"]["QQQ"]["max_target_weight"], 0.4);
         assert_eq!(
             artifact["per_asset"]["QQQ"]["binding_risk_controls"],
-            json!(["cap concentration"])
+            json!([{
+                "control": "cap concentration",
+                "source_refs": ["phase5:workflow_policy"]
+            }])
         );
     }
 

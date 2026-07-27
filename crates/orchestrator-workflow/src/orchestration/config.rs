@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use orchestrator_core::{
     config_bool, config_get, config_int, config_str, config_strings, project_path, AgentRegistry,
-    AuthorityRegistry, RetrievalBudget,
+    AuthorityRegistry, RetrievalBudget, ToolManagedProfile,
 };
 use orchestrator_llm::{
     llm_judge::JudgeConfig,
@@ -557,7 +557,13 @@ impl RuntimeConfig {
                 .values()
                 .map(|plugin| (&plugin.manifest, plugin.role_path())),
         );
-        let authority_registry = AuthorityRegistry::builtin_legacy();
+        // PR2: Phase Summary is the first migrated profile.  The registry is
+        // the sole authority switch: once FileStore is selected, callers must
+        // not fall back to the former SQLite bundle path.
+        let mut authority_registry = AuthorityRegistry::builtin_legacy();
+        authority_registry
+            .migrate_to_file_store("compressor.phase_summary", ToolManagedProfile::PhaseSummary)
+            .expect("builtin Phase Summary registration must exist");
         let alpaca_api_key = config_str(config, "orchestrator.alpaca.api_key", "")
             .trim()
             .to_string();

@@ -1,4 +1,5 @@
 pub mod alpaca;
+pub mod index_tools;
 pub mod read_experience;
 pub mod read_jin10_candidates;
 pub mod read_phase_summaries;
@@ -26,6 +27,11 @@ pub const READ_PHASE_SUMMARIES_TOOL_NAME: &str = read_phase_summaries::NAME;
 pub const READ_PHASE_SUMMARY_DETAILS_TOOL_NAME: &str = read_phase_summary_details::NAME;
 pub const READ_EXPERIENCE_TOOL_NAME: &str = read_experience::NAME;
 pub const READ_REFLECTION_SOURCE_TOOL_NAME: &str = read_reflection_source::NAME;
+pub const CREATE_INDEX_TOOL_NAME: &str = index_tools::CREATE_INDEX_NAME;
+pub const APPEND_INDEX_DETAIL_TOOL_NAME: &str = index_tools::APPEND_INDEX_DETAIL_NAME;
+pub const FINALIZE_INDEX_TOOL_NAME: &str = index_tools::FINALIZE_INDEX_NAME;
+pub const READ_INDEXES_TOOL_NAME: &str = index_tools::READ_INDEXES_NAME;
+pub const READ_INDEX_DETAILS_TOOL_NAME: &str = index_tools::READ_INDEX_DETAILS_NAME;
 // Internal compatibility only. This tool is intentionally absent from REGISTRY.
 pub const READ_RUN_CONTEXT_TOOL_NAME: &str = read_run_context::NAME;
 pub const ALPACA_GET_PORTFOLIO_TOOL_NAME: &str = alpaca::GET_PORTFOLIO_NAME;
@@ -124,6 +130,30 @@ const REGISTRY: &[ToolEntry] = &[
     ToolEntry {
         name: read_reflection_source::NAME,
         definition: read_reflection_source::definition,
+    },
+    // FileStore Index tools are discoverable by a migrated ToolManaged
+    // profile, but are deliberately absent from `tool_names()` until the
+    // workflow injects an IndexToolRuntimeContext. Legacy runtime paths must
+    // never fall back to this store.
+    ToolEntry {
+        name: index_tools::CREATE_INDEX_NAME,
+        definition: index_tools::create_index_definition,
+    },
+    ToolEntry {
+        name: index_tools::APPEND_INDEX_DETAIL_NAME,
+        definition: index_tools::append_index_detail_definition,
+    },
+    ToolEntry {
+        name: index_tools::FINALIZE_INDEX_NAME,
+        definition: index_tools::finalize_index_definition,
+    },
+    ToolEntry {
+        name: index_tools::READ_INDEXES_NAME,
+        definition: index_tools::read_indexes_definition,
+    },
+    ToolEntry {
+        name: index_tools::READ_INDEX_DETAILS_NAME,
+        definition: index_tools::read_index_details_definition,
     },
     ToolEntry {
         name: web_run::NAME,
@@ -335,6 +365,13 @@ pub async fn execute_named_tool(
         alpaca::GET_NEWS_NAME => alpaca::get_news(args, config).await,
         alpaca::SUBMIT_TRADE_NAME => {
             bail!("alpaca_submit_trade is runtime-only and unavailable to LLM tool dispatch")
+        }
+        index_tools::CREATE_INDEX_NAME
+        | index_tools::APPEND_INDEX_DETAIL_NAME
+        | index_tools::FINALIZE_INDEX_NAME
+        | index_tools::READ_INDEXES_NAME
+        | index_tools::READ_INDEX_DETAILS_NAME => {
+            bail!("{name} requires a FileStore IndexToolRuntimeContext and is unavailable to the legacy runtime")
         }
         other => bail!("unknown tool name: {other}"),
     }

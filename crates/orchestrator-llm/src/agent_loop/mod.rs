@@ -2137,10 +2137,7 @@ fn risk_constraints_validation_error(role: &str, text: &str) -> std::result::Res
         .get("stop_type")
         .and_then(Value::as_str)
         .ok_or_else(|| "stop_type must be a string".to_string())?;
-    if !matches!(
-        stop_type,
-        "none" | "tight" | "trailing" | "event_based" | "time_based"
-    ) {
+    if !matches!(stop_type, "none" | "soft" | "hard") {
         return Err("stop_type is not a supported value".to_string());
     }
     for field in [
@@ -2693,6 +2690,13 @@ pub struct ProjectToolRuntime {
     available_tools: Vec<String>,
     web_run: Option<tools::WebRunRuntime>,
     turn_context: Option<ToolRuntimeTurnContext>,
+    index_binding: Option<tools::index_tools::IndexToolRuntimeBinding>,
+    index_runtime: Option<
+        tools::index_tools::IndexToolRuntime<
+            std::sync::Arc<dyn tools::index_tools::IndexToolService>,
+        >,
+    >,
+    index_runtime_error: Option<String>,
 }
 
 impl ProjectToolRuntime {
@@ -2715,11 +2719,25 @@ impl ProjectToolRuntime {
             available_tools,
             web_run: None,
             turn_context: None,
+            index_binding: None,
+            index_runtime: None,
+            index_runtime_error: None,
         }
     }
 
     pub fn with_web_run_runtime(mut self, web_run: tools::WebRunRuntime) -> Self {
         self.web_run = Some(web_run);
+        self
+    }
+
+    /// Attach the one typed FileStore Index domain runtime for a migrated
+    /// unit. Absence is intentional: legacy roles never gain a fallback path
+    /// to Index persistence.
+    pub fn with_index_tool_runtime(
+        mut self,
+        binding: tools::index_tools::IndexToolRuntimeBinding,
+    ) -> Self {
+        self.index_binding = Some(binding);
         self
     }
 }
@@ -2733,6 +2751,14 @@ impl LoopToolRuntime for ProjectToolRuntime {
             role = context.role,
             "project tool runtime context set"
         );
+        self.index_runtime = None;
+        self.index_runtime_error = None;
+        if let Some(binding) = &self.index_binding {
+            match binding.build(context.clone()) {
+                Ok(runtime) => self.index_runtime = Some(runtime),
+                Err(error) => self.index_runtime_error = Some(error.to_string()),
+            }
+        }
         self.turn_context = Some(context);
     }
 
@@ -2744,6 +2770,8 @@ impl LoopToolRuntime for ProjectToolRuntime {
         let available_tools = self.available_tools.clone();
         let web_run = self.web_run.clone();
         let turn_context = self.turn_context.clone();
+        let index_runtime = self.index_runtime.as_ref();
+        let index_runtime_error = self.index_runtime_error.as_deref();
         Box::pin(async move {
             debug!(
                 call_id = call.call_id,
@@ -2752,13 +2780,22 @@ impl LoopToolRuntime for ProjectToolRuntime {
             );
             let web_run_config = web_run.as_ref().map(tools::WebRunRuntime::config);
             let configured = available_tools.iter().any(|name| name == &call.name);
+            let is_index_tool = matches!(
+                call.name.as_str(),
+                tools::CREATE_INDEX_TOOL_NAME
+                    | tools::APPEND_INDEX_DETAIL_TOOL_NAME
+                    | tools::FINALIZE_INDEX_TOOL_NAME
+                    | tools::READ_INDEXES_TOOL_NAME
+                    | tools::READ_INDEX_DETAILS_TOOL_NAME
+            );
             let enabled = call.name == "think"
                 || tools::enabled_tool_names(
                     web_run_config,
                     config.alpaca_live,
                     config.alpaca_market_data,
                 )
-                .contains(&call.name.as_str());
+                .contains(&call.name.as_str())
+                || (is_index_tool && index_runtime.is_some());
             if !configured || !enabled {
                 warn!(
                     call_id = call.call_id,
@@ -2787,6 +2824,31 @@ impl LoopToolRuntime for ProjectToolRuntime {
             }
             let call_id = call.call_id;
             let name = call.name;
+            if is_index_tool {
+                let output = match (index_runtime, index_runtime_error) {
+                    (Some(runtime), _) => runtime.execute(&name, call.arguments),
+                    (None, Some(error)) => Err(anyhow::anyhow!(error.to_owned())),
+                    (None, None) => Err(anyhow::anyhow!(
+                        "Index tools require a migrated FileStore runtime binding"
+                    )),
+                };
+                return match output {
+                    Ok(output) => ToolResultItem {
+                        call_id,
+                        name,
+                        status: "completed".to_owned(),
+                        output,
+                        error: None,
+                    },
+                    Err(error) => ToolResultItem {
+                        call_id,
+                        name,
+                        status: "error".to_owned(),
+                        output: Value::Null,
+                        error: Some(error.to_string()),
+                    },
+                };
+            }
             if name == tools::WEB_RUN_TOOL_NAME {
                 let output = if let Some(web_run) = &web_run {
                     web_run.execute(call.arguments).await
@@ -3442,7 +3504,7 @@ mod tests {
             wrong_id
         ));
 
-        let legacy_source_tier = r#"{
+        let canonical_source_tier = r#"{
             "id":"analyst.technical",
             "role":"analyst.technical",
             "per_ticker":{
@@ -3455,7 +3517,7 @@ mod tests {
                         "evidence_type":"fact",
                         "source":"Yahoo Finance daily OHLCV",
                         "timestamp":"2026-07-22",
-                        "source_tier":"T1_reference",
+                        "source_tier":"official",
                         "source_confidence":0.9
                     }]
                 },
@@ -3468,7 +3530,7 @@ mod tests {
                         "evidence_type":"fact",
                         "source":"Yahoo Finance daily OHLCV",
                         "timestamp":"2026-07-22",
-                        "source_tier":"T1_reference",
+                        "source_tier":"official",
                         "source_confidence":0.9
                     }]
                 }
@@ -3477,7 +3539,7 @@ mod tests {
         assert!(analyst_final_artifact_looks_valid(
             "analyst.technical",
             &expected_tickers,
-            legacy_source_tier
+            canonical_source_tier
         ));
     }
 
@@ -3597,7 +3659,7 @@ mod tests {
             "stance": "conservative",
             "argument": "Balanced review.",
             "recommended_adjustment": "Keep the existing cap.",
-            "stop_type": "event_based",
+            "stop_type": "soft",
             "max_drawdown_pct": 0.04,
             "position_cap_pct": 0.10,
             "rebalance_trigger": "Review on confirmation.",
@@ -4147,6 +4209,85 @@ mod tests {
 
         assert_eq!(result.status, "error");
         assert_eq!(result.error.as_deref(), Some("unknown tool name"));
+    }
+
+    struct TerminalIndexService;
+
+    impl tools::index_tools::IndexToolService for TerminalIndexService {
+        fn create_index(&self, _: tools::index_tools::CreateIndexCommand) -> anyhow::Result<Value> {
+            anyhow::bail!("not used")
+        }
+
+        fn append_index_detail(
+            &self,
+            _: tools::index_tools::AppendIndexDetailCommand,
+        ) -> anyhow::Result<Value> {
+            anyhow::bail!("not used")
+        }
+
+        fn finalize_index(
+            &self,
+            command: tools::index_tools::FinalizeIndexCommand,
+        ) -> anyhow::Result<Value> {
+            Ok(json!({"index_id": command.scope.index_id}))
+        }
+
+        fn read_indexes(
+            &self,
+            _: tools::index_tools::ReadIndexesCommand,
+        ) -> anyhow::Result<tools::index_tools::IndexReadPage> {
+            anyhow::bail!("not used")
+        }
+
+        fn read_index_details(
+            &self,
+            _: tools::index_tools::ReadIndexDetailsCommand,
+        ) -> anyhow::Result<Value> {
+            anyhow::bail!("not used")
+        }
+    }
+
+    #[tokio::test]
+    async fn project_runtime_dispatches_terminal_index_finalize_only_with_binding() {
+        let binding = tools::index_tools::IndexToolRuntimeBinding::new(
+            tools::index_tools::IndexOwnedScope {
+                run_id: "run-1".to_owned(),
+                source_run_id: None,
+                source_phase: 1,
+                role: "compressor.phase_summary".to_owned(),
+                kind: tools::index_tools::IndexKind::PhaseSummary,
+                ticker: None,
+                topic_id: None,
+                unit_key: "phase1:aggregate".to_owned(),
+                source_payload_hash: "hash".to_owned(),
+                index_id: "index-1".to_owned(),
+            },
+            Default::default(),
+            std::sync::Arc::new(TerminalIndexService),
+        )
+        .unwrap();
+        let mut runtime = ProjectToolRuntime::with_available_tools(
+            tools::ExternalToolConfig::default(),
+            vec![tools::FINALIZE_INDEX_TOOL_NAME.to_owned()],
+        )
+        .with_index_tool_runtime(binding);
+        runtime.set_turn_context(ToolRuntimeTurnContext {
+            run_id: "run-1".to_owned(),
+            session_id: "session-1".to_owned(),
+            turn_id: "turn-1".to_owned(),
+            role: "compressor.phase_summary".to_owned(),
+            phase: Some(1),
+        });
+        let result = runtime
+            .execute(ToolCallRequest {
+                call_id: "call-finalize".to_owned(),
+                name: tools::FINALIZE_INDEX_TOOL_NAME.to_owned(),
+                arguments: json!({}),
+            })
+            .await;
+        assert_eq!(result.status, "completed");
+        assert_eq!(result.output["terminal"], true);
+        assert_eq!(result.output["artifact"]["index_id"], "index-1");
     }
 
     #[tokio::test]

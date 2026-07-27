@@ -395,10 +395,39 @@ fn validate_debate_summary_payload(payload: &Value) -> Option<String> {
 }
 
 fn validate_trade_intent_payload(payload: &Value) -> Option<String> {
-    serde_json::from_value::<TradeIntent>(payload.clone())
+    serde_json::from_value::<TradeIntent>(domain_payload(payload))
         .err()
         .map(|error| error.to_string())
         .or_else(|| required_number_error(payload, "position_size_pct_max"))
+}
+
+/// Workflow state still carries provenance beside its domain payload while the
+/// legacy artifact writer is being removed.  Domain validators must never
+/// relax their schema to accommodate that runtime envelope: only the exact
+/// Rust-owned envelope keys are projected out before validating the v2 body.
+/// Any model-owned unknown field (including the removed `position_size`) is
+/// left intact and therefore rejected by the strict domain type.
+fn domain_payload(payload: &Value) -> Value {
+    let mut body = payload.clone();
+    if let Some(object) = body.as_object_mut() {
+        for key in [
+            "id",
+            "role",
+            "phase",
+            "kind",
+            "status",
+            "derived_from",
+            "context_manifest",
+            "retrieval_audit",
+            "round",
+            "topic_id",
+            "prompt_path",
+            "prompt_version",
+        ] {
+            object.remove(key);
+        }
+    }
+    body
 }
 
 fn validate_risk_constraints_payload(payload: &Value) -> Option<String> {
@@ -407,7 +436,7 @@ fn validate_risk_constraints_payload(payload: &Value) -> Option<String> {
     {
         return None;
     }
-    if let Ok(parsed) = serde_json::from_value::<RiskConstraints>(payload.clone()) {
+    if let Ok(parsed) = serde_json::from_value::<RiskConstraints>(domain_payload(payload)) {
         let combined = validate_risk_constraints(&parsed)
             .err()
             .or_else(|| required_string_error(payload, "recommended_adjustment"));
@@ -418,7 +447,7 @@ fn validate_risk_constraints_payload(payload: &Value) -> Option<String> {
     }
 
     let Some(history) = payload.get("history").and_then(Value::as_array) else {
-        return serde_json::from_value::<RiskConstraints>(payload.clone())
+        return serde_json::from_value::<RiskConstraints>(domain_payload(payload))
             .err()
             .map(|error| error.to_string());
     };
@@ -429,7 +458,7 @@ fn validate_risk_constraints_payload(payload: &Value) -> Option<String> {
         if risk_constraints_are_degraded(artifact) {
             continue;
         }
-        match serde_json::from_value::<RiskConstraints>(artifact.clone()) {
+        match serde_json::from_value::<RiskConstraints>(domain_payload(artifact)) {
             Ok(parsed) => {
                 let combined = validate_risk_constraints(&parsed)
                     .err()
@@ -560,9 +589,7 @@ pub(crate) fn research_plan_to_trade_intent(research_plan: &Value) -> Value {
         "stop_loss": null,
         "position_size_pct_max": position_size_pct_max(action),
         "blockers": [],
-        "rationale": rationale(action, research_plan),
-        "method": "conservative_research_plan_mapping",
-        "source": "research_plan"
+        "rationale": rationale(action, research_plan)
     })
 }
 
@@ -753,6 +780,7 @@ mod contract_tests {
                         "artifact": {
                             "stance": "neutral",
                             "argument": "No additional constraint.",
+                            "stop_type": "none",
                             "recommended_adjustment": "none"
                         }
                     }
@@ -801,6 +829,7 @@ mod contract_tests {
                         "artifact": {
                             "stance": "neutral",
                             "argument": "No additional constraint.",
+                            "stop_type": "none",
                             "recommended_adjustment": "none",
                             "position_cap_pct": 0.4
                         }
@@ -820,7 +849,8 @@ mod contract_tests {
             "phase_status": {"5": "done"},
             "risk_debate_state": {
                 "stance": "neutral",
-                "argument": "Risk review ran but did not state constraints."
+                "argument": "Risk review ran but did not state constraints.",
+                "stop_type": "none"
             }
         });
 

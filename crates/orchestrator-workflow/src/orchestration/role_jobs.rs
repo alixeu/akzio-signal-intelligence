@@ -243,14 +243,18 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
         prompt_chars = prompt.len(),
         "prepared role job"
     );
-    let tool_managed_profile = tool_managed_profile_for_role_kind(role, kind);
-    let output_mode = if let Some(profile) = tool_managed_profile {
+    let candidate_tool_managed_profile = tool_managed_profile_for_role_kind(role, kind);
+    let (output_mode, tool_managed_profile) = if let Some(profile) = candidate_tool_managed_profile
+    {
         match config.authority_registry.authority_for(role, profile)? {
-            ArtifactAuthority::Legacy => output_mode_for_role(role),
-            ArtifactAuthority::FileStore => OutputMode::ToolManaged,
+            // A legacy role must not carry any ToolManaged profile into the
+            // LLM settings: that would create an invalid mixed authority
+            // contract even before its first tool call.
+            ArtifactAuthority::Legacy => (output_mode_for_role(role), None),
+            ArtifactAuthority::FileStore => (OutputMode::ToolManaged, Some(profile)),
         }
     } else {
-        output_mode_for_role(role)
+        (output_mode_for_role(role), None)
     };
 
     Ok(RoleJob {
@@ -992,6 +996,7 @@ async fn execute_role_job(job: RoleJob) -> Result<AgentLoopOutput> {
         tickers: job.tickers,
         output_mode: job.output_mode,
         tool_managed_profile: job.tool_managed_profile,
+        index_tool_runtime: None,
         llm,
         reasoning_effort_override: job.reasoning_effort_override,
         tools: Some(job.tools),
@@ -1079,6 +1084,7 @@ async fn execute_steer_role_job(
         tickers: job.tickers,
         output_mode: job.output_mode,
         tool_managed_profile: job.tool_managed_profile,
+        index_tool_runtime: None,
         llm,
         reasoning_effort_override: job.reasoning_effort_override,
         tools: Some(job.tools),
