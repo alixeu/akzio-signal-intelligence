@@ -4,7 +4,11 @@
 //! timestamps, and final Artifact construction remain in the FileStore
 //! service supplied by the workflow.
 
-use std::{collections::BTreeSet, fmt, sync::Arc};
+use std::{
+    collections::BTreeSet,
+    fmt,
+    sync::{Arc, Mutex},
+};
 
 use anyhow::{bail, Context, Result};
 use orchestrator_core::artifact::{BindingRiskControl, Scenario, StopType};
@@ -224,6 +228,82 @@ pub struct DomainToolScope {
     pub visible_evidence_refs: BTreeSet<String>,
 }
 
+/// A provenance-bearing read that the Rust tool runtime, rather than the
+/// assistant, observed.  Domain writers may cite only `subject_id`s recorded
+/// through this interface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvidenceReadRecord {
+    pub tool_name: String,
+    pub subject_kind: String,
+    pub subject_id: String,
+    pub source_run_id: String,
+    pub source_phase: u8,
+    pub ticker: Option<String>,
+    pub topic_id: Option<String>,
+    pub turn_id: String,
+    pub session_id: String,
+}
+
+impl EvidenceReadRecord {
+    pub fn validate(&self) -> Result<()> {
+        if self.tool_name.trim().is_empty()
+            || self.subject_kind.trim().is_empty()
+            || self.subject_id.trim().is_empty()
+            || self.source_run_id.trim().is_empty()
+            || self.turn_id.trim().is_empty()
+            || self.session_id.trim().is_empty()
+        {
+            bail!("evidence_read record has an empty required field")
+        }
+        Ok(())
+    }
+}
+
+/// Dynamic evidence visibility for one ToolManaged runtime.  Implementations
+/// may persist reads in the FileStore session log and inherit a fork's
+/// immutable reads.  It intentionally exposes no model-controlled mutation.
+pub trait EvidenceVisibility: Send + Sync {
+    fn set_turn_context(&self, _context: &crate::agent_loop::ToolRuntimeTurnContext) -> Result<()> {
+        Ok(())
+    }
+    fn record_evidence_read(&self, read: EvidenceReadRecord) -> Result<()>;
+    fn contains(&self, reference: &str) -> Result<bool>;
+}
+
+/// Small in-memory implementation used by direct bindings and tests.  The
+/// production workflow supplies a FileStore-backed implementation.
+#[derive(Debug, Default)]
+pub struct InMemoryEvidenceVisibility {
+    references: Mutex<BTreeSet<String>>,
+}
+
+impl InMemoryEvidenceVisibility {
+    pub fn seeded(references: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            references: Mutex::new(references.into_iter().collect()),
+        }
+    }
+}
+
+impl EvidenceVisibility for InMemoryEvidenceVisibility {
+    fn record_evidence_read(&self, read: EvidenceReadRecord) -> Result<()> {
+        read.validate()?;
+        self.references
+            .lock()
+            .map_err(|_| anyhow::anyhow!("evidence visibility lock poisoned"))?
+            .insert(read.subject_id);
+        Ok(())
+    }
+
+    fn contains(&self, reference: &str) -> Result<bool> {
+        Ok(self
+            .references
+            .lock()
+            .map_err(|_| anyhow::anyhow!("evidence visibility lock poisoned"))?
+            .contains(reference))
+    }
+}
+
 impl DomainToolScope {
     pub fn validate(&self) -> Result<()> {
         if !matches!(
@@ -256,6 +336,7 @@ impl DomainToolScope {
 pub struct DomainToolRuntimeBinding {
     scope: DomainToolScope,
     service: Arc<dyn DomainToolService>,
+    evidence_visibility: Arc<dyn EvidenceVisibility>,
 }
 impl fmt::Debug for DomainToolRuntimeBinding {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -266,14 +347,50 @@ impl fmt::Debug for DomainToolRuntimeBinding {
 }
 impl DomainToolRuntimeBinding {
     pub fn new(scope: DomainToolScope, service: Arc<dyn DomainToolService>) -> Result<Self> {
+        let visibility = Arc::new(InMemoryEvidenceVisibility::seeded(
+            scope.visible_evidence_refs.iter().cloned(),
+        ));
+        Self::new_with_evidence_visibility(scope, service, visibility)
+    }
+
+    pub fn new_with_evidence_visibility(
+        scope: DomainToolScope,
+        service: Arc<dyn DomainToolService>,
+        evidence_visibility: Arc<dyn EvidenceVisibility>,
+    ) -> Result<Self> {
         scope.validate()?;
-        Ok(Self { scope, service })
+        Ok(Self {
+            scope,
+            service,
+            evidence_visibility,
+        })
     }
     pub fn scope(&self) -> &DomainToolScope {
         &self.scope
     }
+
+    /// Called solely by the tool runtime after a successful structured read.
+    /// Assistant text, tool arguments, and failed reads never reach this
+    /// method.
+    pub fn record_evidence_read(&self, read: EvidenceReadRecord) -> Result<()> {
+        self.evidence_visibility.record_evidence_read(read)
+    }
+
+    pub fn set_turn_context(
+        &self,
+        context: &crate::agent_loop::ToolRuntimeTurnContext,
+    ) -> Result<()> {
+        self.evidence_visibility.set_turn_context(context)
+    }
+
     pub fn execute(&self, name: &str, arguments: Value) -> Result<Value> {
-        match prepare_command(name, arguments, &self.scope)? {
+        match prepare_command_with_visibility(name, arguments, &self.scope, |reference| {
+            if self.scope.visible_evidence_refs.contains(reference) {
+                Ok(true)
+            } else {
+                self.evidence_visibility.contains(reference)
+            }
+        })? {
             DomainToolCommand::SetAnalystAssessment(command) => {
                 self.service.set_analyst_assessment(command)
             }
@@ -514,6 +631,20 @@ pub fn prepare_command(
     arguments: Value,
     scope: &DomainToolScope,
 ) -> Result<DomainToolCommand> {
+    prepare_command_with_visibility(name, arguments, scope, |reference| {
+        Ok(scope.visible_evidence_refs.contains(reference))
+    })
+}
+
+fn prepare_command_with_visibility<F>(
+    name: &str,
+    arguments: Value,
+    scope: &DomainToolScope,
+    mut is_visible: F,
+) -> Result<DomainToolCommand>
+where
+    F: FnMut(&str) -> Result<bool>,
+{
     scope.validate()?;
     let expected = match scope.profile {
         ToolManagedProfile::AnalystReport => matches!(
@@ -565,7 +696,7 @@ pub fn prepare_command(
         SET_ANALYST_ASSESSMENT => DomainToolCommand::SetAnalystAssessment(parse(arguments)?),
         APPEND_ANALYST_EVIDENCE => {
             let command: AnalystEvidenceCommand = parse(arguments)?;
-            require_visible(scope, &command.evidence_ref)?;
+            require_visible(&command.evidence_ref, &mut is_visible)?;
             DomainToolCommand::AppendAnalystEvidence(command)
         }
         APPEND_ANALYST_DATA_GAP => DomainToolCommand::AppendAnalystDataGap(parse(arguments)?),
@@ -578,7 +709,7 @@ pub fn prepare_command(
         SET_RESEARCH_SCENARIOS => DomainToolCommand::SetResearchScenarios(parse(arguments)?),
         APPEND_RESEARCH_HINGE => {
             let command: ResearchHingeCommand = parse(arguments)?;
-            require_visible(scope, &command.evidence_ref)?;
+            require_visible(&command.evidence_ref, &mut is_visible)?;
             DomainToolCommand::AppendResearchHinge(command)
         }
         FINALIZE_RESEARCH_DECISION => {
@@ -603,7 +734,7 @@ pub fn prepare_command(
         APPEND_BINDING_RISK_CONTROL => {
             let command: BindingRiskControlCommand = parse(arguments)?;
             for reference in &command.control.source_refs {
-                require_visible(scope, reference)?;
+                require_visible(reference, &mut is_visible)?;
             }
             DomainToolCommand::AppendBindingRiskControl(command)
         }
@@ -708,8 +839,11 @@ fn ticker(scope: &DomainToolScope, value: &str) -> Result<()> {
     }
     Ok(())
 }
-fn require_visible(scope: &DomainToolScope, reference: &str) -> Result<()> {
-    if !scope.visible_evidence_refs.contains(reference) {
+fn require_visible<F>(reference: &str, is_visible: &mut F) -> Result<()>
+where
+    F: FnMut(&str) -> Result<bool>,
+{
+    if !is_visible(reference)? {
         bail!("evidence_ref is not visible in this turn")
     }
     Ok(())

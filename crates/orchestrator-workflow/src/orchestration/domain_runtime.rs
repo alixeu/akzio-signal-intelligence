@@ -4,7 +4,11 @@
 //! FileStore builder are constructible here.  No SQL service, arbitrary file
 //! operation, or legacy fallback is exposed to the LLM runtime.
 
-use std::{collections::BTreeSet, path::Path, sync::Arc};
+use std::{
+    collections::BTreeSet,
+    path::Path,
+    sync::{Arc, Mutex},
+};
 
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
@@ -12,17 +16,20 @@ use orchestrator_core::ToolManagedProfile;
 use orchestrator_llm::tools::domain_tools::{
     AnalystAssessmentCommand, AnalystDataGapCommand, AnalystEvidenceCommand,
     AnalystInvalidationCommand, BindingRiskControlCommand, DomainToolRuntimeBinding,
-    DomainToolScope, DomainToolService, PortfolioAssetDecisionCommand, ResearchDecisionCommand,
-    ResearchHingeCommand, ResearchScenariosCommand, RiskAssessmentCommand, RiskConstraintsCommand,
-    TradeBlockerCommand, TradeIntentCommand,
+    DomainToolScope, DomainToolService, EvidenceReadRecord, EvidenceVisibility,
+    PortfolioAssetDecisionCommand, ResearchDecisionCommand, ResearchHingeCommand,
+    ResearchScenariosCommand, RiskAssessmentCommand, RiskConstraintsCommand, TradeBlockerCommand,
+    TradeIntentCommand,
 };
 use orchestrator_store::{
-    append_analyst_data_gap, append_analyst_evidence, append_research_hinge, content_hash,
-    finalize_analyst_report, finalize_research_decision, set_analyst_assessment,
-    set_analyst_invalidation, set_research_decision, set_research_scenarios,
-    AnalystAssessmentInput, AnalystEvidenceInput, ArtifactScope, DomainFinalizeOutcome,
-    DraftAppendOutcome, DraftProfile, FileStore, FileStoreOptions, FinalizeDraftOutcome,
-    ResearchDecisionInput, ResearchScenarioInput, RunLocation,
+    append_analyst_data_gap, append_analyst_evidence, append_research_hinge, append_session_event,
+    content_hash, finalize_analyst_report, finalize_research_decision, read_session_events,
+    read_session_manifest, set_analyst_assessment, set_analyst_invalidation, set_research_decision,
+    set_research_scenarios, write_session_manifest, AnalystAssessmentInput, AnalystEvidenceInput,
+    ArtifactScope, DomainFinalizeOutcome, DraftAppendOutcome, DraftProfile, EvidenceReadEvent,
+    FileStore, FileStoreOptions, FinalizeDraftOutcome, ResearchDecisionInput,
+    ResearchScenarioInput, RunLocation, SessionEventInput, SessionEventType, SessionLocation,
+    SessionManifest, VisibleEvidenceSet,
 };
 use serde_json::{json, Value};
 
@@ -85,21 +92,213 @@ pub(crate) fn file_store_domain_runtime(
         round: None,
         reflection_task: None,
     };
+    let store = FileStore::open(store_root, FileStoreOptions::default())?;
+    let location = RunLocation::new(current_date, run_id)?;
+    let evidence_visibility = Arc::new(FileStoreEvidenceVisibility::new(
+        store.clone(),
+        location.clone(),
+        scope.role.clone(),
+        phase_u8,
+        plan.profile.as_str().to_owned(),
+        plan.tickers.clone().into_iter().collect(),
+    ));
     let service = FileStoreDomainToolService {
-        store: FileStore::open(store_root, FileStoreOptions::default())?,
-        location: RunLocation::new(current_date, run_id)?,
+        store,
+        location,
         scope,
         expected_tickers: plan.tickers.clone(),
         created_at: Utc::now().to_rfc3339(),
     };
-    DomainToolRuntimeBinding::new(
+    DomainToolRuntimeBinding::new_with_evidence_visibility(
         DomainToolScope {
             profile: plan.profile,
             tickers: plan.tickers.into_iter().collect(),
             visible_evidence_refs: plan.visible_evidence_refs,
         },
         Arc::new(service),
+        evidence_visibility,
     )
+}
+
+/// FileStore-backed evidence visibility.  The model cannot call this type:
+/// `ProjectToolRuntime` records a read only after the reader returns a
+/// structured result, and domain writers query the same session immediately.
+#[derive(Debug)]
+struct FileStoreEvidenceVisibility {
+    store: FileStore,
+    run: RunLocation,
+    role: String,
+    phase: u8,
+    profile: String,
+    expected_tickers: BTreeSet<String>,
+    current_session_id: Mutex<Option<String>>,
+}
+
+impl FileStoreEvidenceVisibility {
+    fn new(
+        store: FileStore,
+        run: RunLocation,
+        role: String,
+        phase: u8,
+        profile: String,
+        expected_tickers: BTreeSet<String>,
+    ) -> Self {
+        Self {
+            store,
+            run,
+            role,
+            phase,
+            profile,
+            expected_tickers,
+            current_session_id: Mutex::new(None),
+        }
+    }
+
+    fn location(&self, session_id: &str) -> Result<SessionLocation> {
+        SessionLocation::new(self.run.clone(), session_id).map_err(anyhow::Error::from)
+    }
+
+    fn ensure_session(&self, location: &SessionLocation) -> Result<SessionManifest> {
+        if self
+            .store
+            .root()
+            .join(location.manifest_relative())
+            .exists()
+        {
+            let manifest = read_session_manifest(&self.store, location)?;
+            if manifest.role != self.role
+                || manifest.phase != self.phase
+                || manifest.profile != self.profile
+            {
+                bail!("FileStore session manifest differs from DomainTool scope")
+            }
+            return Ok(manifest);
+        }
+        let manifest = SessionManifest::new(
+            location,
+            self.role.clone(),
+            self.phase,
+            self.profile.clone(),
+            None,
+            Utc::now().to_rfc3339(),
+        )?;
+        Ok(write_session_manifest(&self.store, location, manifest)?)
+    }
+
+    fn visible_for(&self, location: &SessionLocation) -> Result<VisibleEvidenceSet> {
+        let manifest = self.ensure_session(location)?;
+        let inherited = if let Some(fork) = manifest.fork.as_ref() {
+            let parent = self.location(&fork.fork_from_session_id)?;
+            let parent_events = read_session_events(&self.store, &parent)?;
+            let cutoff = parent_events
+                .iter()
+                .filter(|event| event.turn_id == fork.fork_from_turn_id)
+                .map(|event| event.created_at.as_str())
+                .max()
+                .with_context(|| {
+                    format!(
+                        "fork parent turn `{}` has no persisted session events",
+                        fork.fork_from_turn_id
+                    )
+                })?
+                .to_owned();
+            VisibleEvidenceSet::from_events(
+                parent_events
+                    .into_iter()
+                    .filter(|event| event.created_at.as_str() <= cutoff.as_str()),
+            )?
+        } else {
+            VisibleEvidenceSet::default()
+        };
+        VisibleEvidenceSet::from_parent_and_events(
+            inherited,
+            read_session_events(&self.store, location)?,
+        )
+        .map_err(anyhow::Error::from)
+    }
+}
+
+impl EvidenceVisibility for FileStoreEvidenceVisibility {
+    fn set_turn_context(
+        &self,
+        context: &orchestrator_llm::agent_loop::ToolRuntimeTurnContext,
+    ) -> Result<()> {
+        if context.run_id != self.run.run_id
+            || context.role != self.role
+            || context.phase != Some(i64::from(self.phase))
+        {
+            bail!("turn context does not match FileStore DomainTool scope")
+        }
+        let location = self.location(&context.session_id)?;
+        self.ensure_session(&location)?;
+        *self
+            .current_session_id
+            .lock()
+            .map_err(|_| anyhow::anyhow!("FileStore evidence visibility lock poisoned"))? =
+            Some(context.session_id.clone());
+        Ok(())
+    }
+
+    fn record_evidence_read(&self, read: EvidenceReadRecord) -> Result<()> {
+        read.validate()?;
+        if read.source_run_id != self.run.run_id {
+            bail!("evidence_read cannot reference a different run")
+        }
+        if read.source_phase > self.phase {
+            bail!("evidence_read cannot reference a future phase")
+        }
+        if let Some(ticker) = read.ticker.as_deref() {
+            if !self.expected_tickers.contains(ticker) {
+                bail!("evidence_read ticker is outside the Rust-owned scope")
+            }
+        }
+        let active_session = self
+            .current_session_id
+            .lock()
+            .map_err(|_| anyhow::anyhow!("FileStore evidence visibility lock poisoned"))?
+            .clone()
+            .context("evidence_read arrived before turn context")?;
+        if active_session != read.session_id {
+            bail!("evidence_read session differs from the active turn")
+        }
+        let location = self.location(&read.session_id)?;
+        let manifest = self.ensure_session(&location)?;
+        let payload = serde_json::to_value(EvidenceReadEvent {
+            tool_name: read.tool_name,
+            subject_kind: read.subject_kind,
+            subject_id: read.subject_id,
+            source_run_id: read.source_run_id,
+            source_phase: read.source_phase,
+            ticker: read.ticker,
+            topic_id: read.topic_id,
+            turn_id: read.turn_id.clone(),
+            session_id: read.session_id,
+        })?;
+        append_session_event(
+            &self.store,
+            &location,
+            &manifest,
+            SessionEventInput {
+                event_type: SessionEventType::EvidenceRead,
+                turn_id: read.turn_id,
+                payload,
+                created_at: Utc::now().to_rfc3339(),
+            },
+        )?;
+        Ok(())
+    }
+
+    fn contains(&self, reference: &str) -> Result<bool> {
+        let session_id = self
+            .current_session_id
+            .lock()
+            .map_err(|_| anyhow::anyhow!("FileStore evidence visibility lock poisoned"))?
+            .clone()
+            .context("domain evidence check arrived before turn context")?;
+        Ok(self
+            .visible_for(&self.location(&session_id)?)?
+            .contains(reference))
+    }
 }
 
 fn required_string(state: &Value, key: &str) -> Result<String> {
@@ -352,8 +551,8 @@ impl DomainToolService for FileStoreDomainToolService {
 mod tests {
     use super::*;
     use orchestrator_llm::tools::domain_tools::{
-        APPEND_ANALYST_EVIDENCE, FINALIZE_ANALYST_REPORT, SET_ANALYST_ASSESSMENT,
-        SET_ANALYST_INVALIDATION,
+        EvidenceReadRecord, APPEND_ANALYST_EVIDENCE, FINALIZE_ANALYST_REPORT,
+        SET_ANALYST_ASSESSMENT, SET_ANALYST_INVALIDATION,
     };
 
     fn state() -> Value {
@@ -431,5 +630,78 @@ mod tests {
             .path()
             .join("artifacts/phase1");
         assert!(artifacts.is_dir());
+    }
+
+    #[test]
+    fn file_store_visibility_persists_successful_reads_and_unlocks_same_turn_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let binding = file_store_domain_runtime(
+            temp.path(),
+            &state(),
+            FileStoreDomainRuntimePlan {
+                role: "analyst.technical".to_owned(),
+                phase: 1,
+                profile: ToolManagedProfile::AnalystReport,
+                profile_version: 1,
+                builder_version: 1,
+                tickers: vec!["QQQ".to_owned()],
+                visible_evidence_refs: Default::default(),
+            },
+        )
+        .unwrap();
+        binding
+            .set_turn_context(&orchestrator_llm::agent_loop::ToolRuntimeTurnContext {
+                run_id: "run-domain-test".to_owned(),
+                session_id: "session-domain-test".to_owned(),
+                turn_id: "turn-domain-test".to_owned(),
+                role: "analyst.technical".to_owned(),
+                phase: Some(1),
+            })
+            .unwrap();
+        let command = || {
+            json!({
+                "ticker":"QQQ", "evidence_ref":"technical:QQQ:daily",
+                "evidence": {
+                    "claim":"support held", "evidence_type":"fact", "source":"technical",
+                    "timestamp":"2026-07-27", "source_tier":"official", "first_source":"technical",
+                    "is_derivative_repost":false, "evidence_age":"0-2d", "source_confidence":0.9
+                }
+            })
+        };
+        assert!(binding.execute(APPEND_ANALYST_EVIDENCE, command()).is_err());
+        binding
+            .execute(
+                SET_ANALYST_ASSESSMENT,
+                json!({
+                    "ticker":"QQQ", "direction":"neutral", "confidence":0.5,
+                    "report":"test report", "priced_in":"unclear",
+                    "echo_chamber_risk":"low", "crowded_consensus_risk":"low"
+                }),
+            )
+            .unwrap();
+        binding
+            .record_evidence_read(EvidenceReadRecord {
+                tool_name: "read_technical_snapshot".to_owned(),
+                subject_kind: "technical_signal".to_owned(),
+                subject_id: "technical:QQQ:daily".to_owned(),
+                source_run_id: "run-domain-test".to_owned(),
+                source_phase: 1,
+                ticker: Some("QQQ".to_owned()),
+                topic_id: None,
+                turn_id: "turn-domain-test".to_owned(),
+                session_id: "session-domain-test".to_owned(),
+            })
+            .unwrap();
+        binding.execute(APPEND_ANALYST_EVIDENCE, command()).unwrap();
+
+        let store = FileStore::open(temp.path(), FileStoreOptions::default()).unwrap();
+        let session = SessionLocation::new(
+            RunLocation::new("2026-07-27", "run-domain-test").unwrap(),
+            "session-domain-test",
+        )
+        .unwrap();
+        let events = read_session_events(&store, &session).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, SessionEventType::EvidenceRead);
     }
 }

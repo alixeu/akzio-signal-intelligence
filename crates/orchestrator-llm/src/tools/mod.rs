@@ -20,6 +20,7 @@ use std::path::PathBuf;
 use tracing::{debug, warn};
 
 use crate::agent_loop::ToolRuntimeTurnContext;
+use crate::tools::domain_tools::EvidenceReadRecord;
 pub use crate::web_search::{WebSearchConfig, WebSearchProvider};
 pub use web_run::Runtime as WebRunRuntime;
 
@@ -520,6 +521,219 @@ pub async fn execute_named_tool(
         }
         other => bail!("unknown tool name: {other}"),
     }
+}
+
+/// Convert only successful, structured read-tool output into evidence
+/// visibility records.  This intentionally never examines assistant text or
+/// tool arguments: a model can cite an ID only after a Rust read tool actually
+/// returned that ID in the same session.
+pub fn evidence_reads_from_tool_output(
+    tool_name: &str,
+    output: &Value,
+    turn: &ToolRuntimeTurnContext,
+) -> Result<Vec<EvidenceReadRecord>> {
+    if !is_evidence_read_tool(tool_name) {
+        return Ok(Vec::new());
+    }
+    let source_phase = turn
+        .phase
+        .and_then(|phase| u8::try_from(phase).ok())
+        .context("evidence read requires a u8 current phase")?;
+    let default_kind = match tool_name {
+        read_technical_snapshot::NAME | read_technical_detail::NAME => "technical_signal",
+        read_jin10_candidates::NAME => "jin10_event",
+        read_phase_summaries::NAME | index_tools::READ_INDEXES_NAME => "index",
+        read_phase_summary_details::NAME | index_tools::READ_INDEX_DETAILS_NAME => "detail",
+        read_experience::NAME => "experience",
+        read_reflection_source::NAME => "reflection_source",
+        verify_event::NAME => "verified_event",
+        _ => return Ok(Vec::new()),
+    };
+    let mut records = std::collections::BTreeMap::new();
+    collect_evidence_records(
+        output,
+        default_kind,
+        &turn.run_id,
+        source_phase,
+        None,
+        None,
+        tool_name,
+        turn,
+        &mut records,
+    )?;
+    Ok(records.into_values().collect())
+}
+
+fn is_evidence_read_tool(name: &str) -> bool {
+    matches!(
+        name,
+        read_technical_snapshot::NAME
+            | read_technical_detail::NAME
+            | read_jin10_candidates::NAME
+            | read_phase_summaries::NAME
+            | read_phase_summary_details::NAME
+            | read_experience::NAME
+            | read_reflection_source::NAME
+            | verify_event::NAME
+            | index_tools::READ_INDEXES_NAME
+            | index_tools::READ_INDEX_DETAILS_NAME
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_evidence_records(
+    value: &Value,
+    default_kind: &str,
+    inherited_run_id: &str,
+    inherited_phase: u8,
+    inherited_ticker: Option<&str>,
+    inherited_topic_id: Option<&str>,
+    tool_name: &str,
+    turn: &ToolRuntimeTurnContext,
+    records: &mut std::collections::BTreeMap<String, EvidenceReadRecord>,
+) -> Result<()> {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                collect_evidence_records(
+                    value,
+                    default_kind,
+                    inherited_run_id,
+                    inherited_phase,
+                    inherited_ticker,
+                    inherited_topic_id,
+                    tool_name,
+                    turn,
+                    records,
+                )?;
+            }
+        }
+        Value::Object(object) => {
+            let source_run_id = object
+                .get("source_run_id")
+                .or_else(|| object.get("run_id"))
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or(inherited_run_id);
+            let source_phase = object
+                .get("source_phase")
+                .and_then(Value::as_u64)
+                .map(u8::try_from)
+                .transpose()
+                .context("evidence read source_phase must fit in u8")?
+                .unwrap_or(inherited_phase);
+            let ticker = object
+                .get("ticker")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .or(inherited_ticker);
+            let topic_id = object
+                .get("topic_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .or(inherited_topic_id);
+            for field in [
+                ("signal_id", "technical_signal"),
+                ("event_id", "jin10_event"),
+                ("summary_id", "index"),
+                ("index_id", "index"),
+                ("detail_id", "detail"),
+                ("experience_id", "experience"),
+                ("reflection_id", "reflection_source"),
+            ] {
+                if let Some(subject_id) = object
+                    .get(field.0)
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                {
+                    insert_evidence_record(
+                        records,
+                        EvidenceReadRecord {
+                            tool_name: tool_name.to_owned(),
+                            subject_kind: field.1.to_owned(),
+                            subject_id: subject_id.to_owned(),
+                            source_run_id: source_run_id.to_owned(),
+                            source_phase,
+                            ticker: ticker.map(ToOwned::to_owned),
+                            topic_id: topic_id.map(ToOwned::to_owned),
+                            turn_id: turn.turn_id.clone(),
+                            session_id: turn.session_id.clone(),
+                        },
+                    )?;
+                }
+            }
+            // Phase-summary SQL uses generic `id`; FileStore Index/Detail
+            // readers use typed IDs.  Keep this fallback bounded to their
+            // known reader tools rather than recursively accepting arbitrary
+            // JSON as evidence.
+            if matches!(
+                tool_name,
+                read_phase_summaries::NAME | read_phase_summary_details::NAME
+            ) {
+                if let Some(subject_id) = object
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                {
+                    insert_evidence_record(
+                        records,
+                        EvidenceReadRecord {
+                            tool_name: tool_name.to_owned(),
+                            subject_kind: default_kind.to_owned(),
+                            subject_id: subject_id.to_owned(),
+                            source_run_id: source_run_id.to_owned(),
+                            source_phase,
+                            ticker: ticker.map(ToOwned::to_owned),
+                            topic_id: topic_id.map(ToOwned::to_owned),
+                            turn_id: turn.turn_id.clone(),
+                            session_id: turn.session_id.clone(),
+                        },
+                    )?;
+                }
+            }
+            for nested in object.values() {
+                collect_evidence_records(
+                    nested,
+                    default_kind,
+                    source_run_id,
+                    source_phase,
+                    ticker,
+                    topic_id,
+                    tool_name,
+                    turn,
+                    records,
+                )?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn insert_evidence_record(
+    records: &mut std::collections::BTreeMap<String, EvidenceReadRecord>,
+    record: EvidenceReadRecord,
+) -> Result<()> {
+    record.validate()?;
+    match records.get(&record.subject_id) {
+        Some(existing)
+            if existing.subject_kind != record.subject_kind
+                || existing.source_run_id != record.source_run_id
+                || existing.source_phase != record.source_phase
+                || existing.ticker != record.ticker
+                || existing.topic_id != record.topic_id =>
+        {
+            bail!(
+                "read tool returned evidence ID `{}` with conflicting provenance",
+                record.subject_id
+            )
+        }
+        Some(_) => {}
+        None => {
+            records.insert(record.subject_id.clone(), record);
+        }
+    }
+    Ok(())
 }
 
 // --- Shared helpers ---

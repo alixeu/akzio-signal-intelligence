@@ -2698,6 +2698,7 @@ pub struct ProjectToolRuntime {
     >,
     index_runtime_error: Option<String>,
     domain_binding: Option<tools::domain_tools::DomainToolRuntimeBinding>,
+    domain_runtime_error: Option<String>,
 }
 
 impl ProjectToolRuntime {
@@ -2724,6 +2725,7 @@ impl ProjectToolRuntime {
             index_runtime: None,
             index_runtime_error: None,
             domain_binding: None,
+            domain_runtime_error: None,
         }
     }
 
@@ -2766,10 +2768,16 @@ impl LoopToolRuntime for ProjectToolRuntime {
         );
         self.index_runtime = None;
         self.index_runtime_error = None;
+        self.domain_runtime_error = None;
         if let Some(binding) = &self.index_binding {
             match binding.build(context.clone()) {
                 Ok(runtime) => self.index_runtime = Some(runtime),
                 Err(error) => self.index_runtime_error = Some(error.to_string()),
+            }
+        }
+        if let Some(binding) = &self.domain_binding {
+            if let Err(error) = binding.set_turn_context(&context) {
+                self.domain_runtime_error = Some(error.to_string());
             }
         }
         self.turn_context = Some(context);
@@ -2786,6 +2794,7 @@ impl LoopToolRuntime for ProjectToolRuntime {
         let index_runtime = self.index_runtime.as_ref();
         let index_runtime_error = self.index_runtime_error.as_deref();
         let domain_binding = self.domain_binding.as_ref();
+        let domain_runtime_error = self.domain_runtime_error.as_deref();
         Box::pin(async move {
             debug!(
                 call_id = call.call_id,
@@ -2866,9 +2875,10 @@ impl LoopToolRuntime for ProjectToolRuntime {
                 };
             }
             if is_domain_tool {
-                let output = match domain_binding {
-                    Some(binding) => binding.execute(&name, call.arguments),
-                    None => Err(anyhow::anyhow!(
+                let output = match (domain_binding, domain_runtime_error) {
+                    (_, Some(error)) => Err(anyhow::anyhow!(error.to_owned())),
+                    (Some(binding), None) => binding.execute(&name, call.arguments),
+                    (None, None) => Err(anyhow::anyhow!(
                         "domain tools require a migrated FileStore runtime binding"
                     )),
                 };
@@ -2935,6 +2945,27 @@ impl LoopToolRuntime for ProjectToolRuntime {
             .await
             {
                 Ok(output) => {
+                    if let (Some(binding), Some(context)) = (domain_binding, turn_context.as_ref())
+                    {
+                        if let Err(error) =
+                            tools::evidence_reads_from_tool_output(&name, &output, context)
+                                .and_then(|reads| {
+                                    for read in reads {
+                                        binding.record_evidence_read(read)?;
+                                    }
+                                    Ok(())
+                                })
+                        {
+                            warn!(call_id, tool = name, error = %error, "project evidence read persistence failed");
+                            return ToolResultItem {
+                                call_id,
+                                name,
+                                status: "error".to_string(),
+                                output: Value::Null,
+                                error: Some(error.to_string()),
+                            };
+                        }
+                    }
                     debug!(call_id, tool = name, "project tool completed");
                     ToolResultItem {
                         call_id,
@@ -4343,7 +4374,7 @@ mod tests {
             &self,
             _: tools::domain_tools::AnalystEvidenceCommand,
         ) -> anyhow::Result<Value> {
-            anyhow::bail!("not used")
+            Ok(json!({"status":"draft"}))
         }
         fn append_analyst_data_gap(
             &self,
@@ -4454,6 +4485,81 @@ mod tests {
         assert_eq!(result.status, "completed");
         assert_eq!(result.output["terminal"], true);
         assert_eq!(result.output["artifact"]["artifact_id"], "analyst-1");
+    }
+
+    #[tokio::test]
+    async fn project_runtime_records_structured_reads_before_domain_evidence_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let csv_dir = temp.path().join(orchestrator_core::DEFAULT_JIN10_CSV_DIR);
+        let path = orchestrator_core::jin10_csv_path(&csv_dir, "2026-07-27");
+        orchestrator_core::write_jin10_csv(
+            &path,
+            &[orchestrator_core::Jin10CsvRow {
+                id: "event-1".to_owned(),
+                time: "2026-07-27 09:00:00".to_owned(),
+                content: "Fed CPI update for QQQ".to_owned(),
+            }],
+        )
+        .unwrap();
+        let binding = tools::domain_tools::DomainToolRuntimeBinding::new(
+            tools::domain_tools::DomainToolScope {
+                profile: orchestrator_core::ToolManagedProfile::AnalystReport,
+                tickers: ["QQQ".to_owned()].into_iter().collect(),
+                visible_evidence_refs: Default::default(),
+            },
+            std::sync::Arc::new(TerminalDomainService),
+        )
+        .unwrap();
+        let mut runtime = ProjectToolRuntime::with_available_tools(
+            tools::ExternalToolConfig {
+                project_root: temp.path().to_path_buf(),
+                tickers: vec!["QQQ".to_owned()],
+                ..Default::default()
+            },
+            vec![
+                tools::read_jin10_candidates::NAME.to_owned(),
+                tools::APPEND_ANALYST_EVIDENCE_TOOL_NAME.to_owned(),
+            ],
+        )
+        .with_domain_tool_runtime(binding);
+        runtime.set_turn_context(ToolRuntimeTurnContext {
+            run_id: "run-1".to_owned(),
+            session_id: "session-1".to_owned(),
+            turn_id: "turn-1".to_owned(),
+            role: "analyst.news_macro".to_owned(),
+            phase: Some(1),
+        });
+        let evidence_write = || ToolCallRequest {
+            call_id: "write-evidence".to_owned(),
+            name: tools::APPEND_ANALYST_EVIDENCE_TOOL_NAME.to_owned(),
+            arguments: json!({
+                "ticker":"QQQ", "evidence_ref":"event-1",
+                "evidence": {
+                    "claim":"CPI update", "evidence_type":"fact", "source":"Jin10",
+                    "timestamp":"2026-07-27", "source_tier":"official", "first_source":"Jin10",
+                    "is_derivative_repost":false, "evidence_age":"0-2d", "source_confidence":0.9
+                }
+            }),
+        };
+        let before = runtime.execute(evidence_write()).await;
+        assert_eq!(before.status, "error");
+        assert!(before
+            .error
+            .as_deref()
+            .is_some_and(|message| message.contains("not visible")));
+
+        let read = runtime
+            .execute(ToolCallRequest {
+                call_id: "read-jin10".to_owned(),
+                name: tools::read_jin10_candidates::NAME.to_owned(),
+                arguments: json!({"tickers":["QQQ"]}),
+            })
+            .await;
+        assert_eq!(read.status, "completed");
+        assert_eq!(read.output["candidates"][0]["event_id"], "event-1");
+
+        let after = runtime.execute(evidence_write()).await;
+        assert_eq!(after.status, "completed");
     }
 
     #[tokio::test]

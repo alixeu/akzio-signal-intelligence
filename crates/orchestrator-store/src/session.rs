@@ -311,7 +311,7 @@ impl VisibleEvidenceSet {
                 });
             }
             match parent.entries.get(&evidence.subject_id) {
-                Some(existing) if existing != &evidence => {
+                Some(existing) if !same_evidence_provenance(existing, &evidence) => {
                     return Err(StoreError::InvalidDocument {
                         kind: "visible evidence set",
                         message: format!(
@@ -344,6 +344,16 @@ impl VisibleEvidenceSet {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+}
+
+fn same_evidence_provenance(left: &EvidenceReadEvent, right: &EvidenceReadEvent) -> bool {
+    left.tool_name == right.tool_name
+        && left.subject_kind == right.subject_kind
+        && left.subject_id == right.subject_id
+        && left.source_run_id == right.source_run_id
+        && left.source_phase == right.source_phase
+        && left.ticker == right.ticker
+        && left.topic_id == right.topic_id
 }
 
 pub fn write_session_manifest(
