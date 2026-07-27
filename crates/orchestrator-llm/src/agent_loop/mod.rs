@@ -1711,11 +1711,9 @@ fn trim_context_token(token: &str) -> &str {
 }
 
 fn has_important_path_extension(path: &str) -> bool {
-    [
-        ".rs", ".md", ".json", ".yaml", ".yml", ".sqlite", ".db", ".txt",
-    ]
-    .iter()
-    .any(|extension| path.ends_with(extension))
+    [".rs", ".md", ".json", ".yaml", ".yml", ".txt"]
+        .iter()
+        .any(|extension| path.ends_with(extension))
 }
 
 fn contains_error_signal(text: &str) -> bool {

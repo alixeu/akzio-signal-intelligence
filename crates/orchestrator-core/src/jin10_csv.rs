@@ -8,9 +8,10 @@
 use anyhow::{Context, Result};
 use md5::{Digest, Md5};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
-pub const DEFAULT_JIN10_CSV_DIR: &str = "outputs/jin10";
+pub const DEFAULT_JIN10_CSV_DIR: &str = "outputs/store/data/jin10";
 
 pub fn default_jin10_csv_dir() -> PathBuf {
     if let Ok(path) = std::env::var("ORCHESTRATOR_JIN10_CSV_DIR") {
@@ -33,7 +34,7 @@ pub struct Jin10CsvRow {
     pub content: String,
 }
 
-/// Stable Jin10 primary key shared by CSV persistence and SQLite import.
+/// Stable Jin10 primary key shared by CSV persistence and FileStore lookup.
 pub fn jin10_item_id(time_raw: &str, content: &str) -> String {
     let mut hasher = Md5::new();
     hasher.update(time_raw.as_bytes());
@@ -57,9 +58,34 @@ pub fn write_jin10_csv(path: &Path, rows: &[Jin10CsvRow]) -> Result<()> {
             csv_escape(&row.content)
         ));
     }
-    fs::write(path, lines.join("\n"))
+    write_text_atomic(path, &lines.join("\n"))
         .with_context(|| format!("failed to write jin10 csv {}", path.display()))?;
     Ok(())
+}
+
+fn write_text_atomic(path: &Path, contents: &str) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("jin10 csv path must have a parent directory")?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("jin10 csv path must have a UTF-8 file name")?;
+    let temp = parent.join(format!(".{file_name}.tmp-{}", std::process::id()));
+    let result = (|| -> Result<()> {
+        let mut file = fs::File::create(&temp)
+            .with_context(|| format!("failed to create temporary jin10 csv {}", temp.display()))?;
+        file.write_all(contents.as_bytes())?;
+        file.flush()?;
+        file.sync_all()?;
+        fs::rename(&temp, path)?;
+        fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
 }
 
 pub fn read_jin10_csv(path: &Path) -> Result<Vec<Jin10CsvRow>> {

@@ -355,7 +355,7 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
         }
     };
     // A migrated role may read only its Rust-projected FileStore indexes and
-    // snapshots.  Clearing the legacy connection here turns a missing
+    // snapshots. Clearing every alternate persistence handle here turns a missing
     // FileStore projection into a hard tool error instead of an accidental
     // SQLite fallback.
     let session_runtime = tool_managed_profile
@@ -645,7 +645,7 @@ fn file_store_session_runtime(
 
 /// Construct the sole Phase 0 writer: a task-scoped Experience Index.  The
 /// source run is found by its manifest rather than a caller-provided path;
-/// absence is a hard error, never a fallback to legacy phase-summary tables.
+/// absence is a hard error, never a fallback to another summary storage path.
 fn file_store_historical_reflection_index_runtime(
     store_root: &Path,
     state: &Value,

@@ -45,9 +45,8 @@ pub(crate) struct RuntimeConfig {
     pub component_plugins: ComponentRegistry,
     pub role_plugins: RolePluginRegistry,
     pub agent_registry: AgentRegistry,
-    /// Exact legacy/FileStore ownership during the staged migration. It is
-    /// immutable for a process and captured in each run manifest by the
-    /// FileStore path before recovery is permitted.
+    /// Immutable FileStore ownership for every role/profile, captured in the
+    /// run manifest before recovery is permitted.
     pub authority_registry: AuthorityRegistry,
 }
 

@@ -19,9 +19,7 @@
 
 # 首轮立论：`Steer.kind=topic_fork`
 
-当最新 `Steer.kind=topic_fork` 时，围绕当前 topic 的单一 decision hinge 输出 1-2 条最强、可证伪 claim，不新增事实，也不写成 `{opponent_label}` 的镜像句。每条须说明最强 `{opponent_label}`约束；信息不足时降低 confidence 或请求 mediator 核验。
-
-输出一个完整 `{side}_seed_packet`：`role` 必须为 `{role}`，`artifact_type` 必须为 `{side}_seed_packet`。顶层保留 `topic_id, claims, summary, reducer_checks`；每个 claim 必须有 `claim_id`（`<topic_id>:{side}:<positive_sequence>`）、`decision_hinge, claim, evidence_refs, confidence, known_{opponent}_constraint, needs_mediator_check`。`confidence` 为 0.0-1.0；`claims` 最多 2 项，每条 `evidence_refs` 最多 3 个稳定 ID；`reducer_checks` 只写 required 的布尔结果。
+当最新 `Steer.kind=topic_fork` 时，围绕当前 topic 的单一 decision hinge 创建 1-2 条最强、可证伪 claim，不新增事实，也不写成 `{opponent_label}` 的镜像句。每条用 `create_debate_claim` 写入，证据必须是已读取 ID；claim ID、topic、side 与 round 由 Rust 绑定。完成后调用 `finalize_debate_seed`。
 
 # 后续对辩：`Steer.kind=point_debate`
 
@@ -34,7 +32,7 @@
 - 被标记不可核验或 `soft_control` 禁止的本方 claim 必须撤回或降级。
 - 信息增量不足时使用 `stance=no_new_info`，但仍须填写回应对象和非空 `steer_id`。
 
-输出一个完整 `{side}_debate_packet`：`role` 必须为 `{role}`，`artifact_type` 必须为 `{side}_debate_packet`；含 `topic_id, reply_to_claim_id, steer_id, stance, claim, evidence_refs, confidence, send_to_mediator, blocked_ack`。禁止使用 `reply_to`；除 `no_new_info` 外必须含 `steelman`（`core_premise, holds_when, attacks`）。`send_to_mediator` 说明回应对象和执行的整改，可附尚未解决的问题与本方非对称性判断；字段形状和值域以运行时 schema 与 validator 为准。
+用 `respond_to_debate_claim` 写入对可见 claim 的回应；reply target 必须来自已读取/继承的可见 claim。完成后调用 `finalize_debate_response`。不要输出 packet JSON；Rust finalizer 负责 ID、topic、side、round、可见性和值域。
 
 # 紧凑审计预算
 

@@ -44,7 +44,6 @@ orchestrator:
   reflection:
     enabled: true
     reflection_version: v1
-    promote_mode: auto
     task_limit: 10
     parallelism: 2
     prediction_horizon_trading_days: 3
@@ -65,9 +64,6 @@ orchestrator:
     phase1:
       parallelism: 2
       critical_roles: [analyst.technical, analyst.news_macro]
-    policy:
-      # Keep Trader -> Risk Committee -> Portfolio Manager as mandatory workflow stages.
-      mode: legacy
 
   prompts:
     reflection:

@@ -31,11 +31,9 @@
 
 每个 decision hinge 必须含 `hinge` 和非空 `evidence_refs`。`soft_control.stop_reason` 始终必须是非空字符串：继续时写明继续的具体原因（例如“仍有一对已路由碰撞待回应”），停止时写明停止原因；绝不写 `null`。低信息增量时设置 `soft_control.should_continue=false`。不得补外部事实。
 
-## 输出契约
+## Tool contract
 
-Artifact 包含：`topic_id, claim_ledger[], accepted_for_opponent[], rejected_to_origin[], blocked_claims[], agreed_facts[], decision_hinges[], next_steers{}, topic_summary_delta{}, info_gain_score, soft_control{}`。`id`、`role`、`artifact_type` 与 `reducer_checks` 由 Rust 合成。
-
-`next_steers` 是对象，绝不是数组。需要继续时只使用键 `to_bull` 和/或 `to_bear`；每个键对应一个对象，至少含 `must_address`（对手 claim ID 数组）和 `instruction`（具体碰撞指令）。无需路由时输出空对象；不得输出数组。
+使用 `set_claim_status`、`add_agreed_fact`、`set_decision_hinge`、`route_debate_steer` 和 `set_topic_soft_control` 写入本 topic Draft，随后调用 `finalize_topic_control`。claim/topic/steer ID 和路由可见性均由 Rust 绑定；不要输出 controller JSON 或 Assistant 最终答案。
 
 ## 输出大小
 

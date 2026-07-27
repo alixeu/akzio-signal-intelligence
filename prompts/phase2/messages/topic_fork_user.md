@@ -2,4 +2,4 @@
 topic_id: {{topic_id}}
 decision_hinge: {{decision_hinge}}
 common_ground: {{common_ground}}
-（预热已完成；本消息是 fork 后的首条 topic user 输入。请输出 seed packet JSON。）
+（预热已完成；本消息是 fork 后的首条 topic user 输入。请通过领域工具创建 seed claim 并 terminal finalize。）

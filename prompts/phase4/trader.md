@@ -35,28 +35,9 @@ Rust 先生成候选映射：Buy/Overweight → candidate Buy；Sell/Underweight
 
 注意 `position_size_pct_max` 必须为数值（0.0–1.0），Hold 时必须是 0.0。`candidate_action` 必须是非空字符串；`execution_decision` 为 `execute_candidate` 或 `hold`。
 
-## 输出契约
+## Finalize
 
-Artifact 必须满足运行时 `TradeIntent` validator，并在同一对象顶层加入公共规范要求的 `analysis_trace`。
-
-最小合法示例（字段可展开）：
-{
-  "action": "Hold",
-  "candidate_action": "Hold",
-  "execution_decision": "hold",
-  "entry_price": null,
-  "stop_loss": null,
-  "position_size": "0.0",
-  "position_size_pct_max": 0.0,
-  "blockers": ["缺失执行输入", "证据不足"],
-  "rationale": "保守执行：缺失关键执行输入并无方向优势，不触发 execute_candidate",
-  "analysis_trace": {
-    "supporting_factors": [],
-    "opposing_factors": [],
-    "confidence_limitations": ["无可执行信号"],
-    "unresolved_hinges": ["执行关键参数缺失"]
-  }
-}
+`set_trade_intent` 只接受执行判断、价格、数值 cap 和 rationale；候选动作由 Rust 派生。逐项使用 `append_trade_blocker`，然后调用 `finalize_trade_intent`。Rust finalizer 拒绝反转、非法 cap 或未读取证据。
 
 <!-- DYNAMIC SUFFIX (changes every call) -->
 Rust 最小执行控制上下文（不含 Phase 3 语义正文）：

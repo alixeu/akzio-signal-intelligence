@@ -1645,8 +1645,9 @@ required_variables = ["ticker", "tickers"]
 
         let summary =
             std::fs::read_to_string(prompts.join("phase_summary/phase_summary.md")).unwrap();
-        assert!(summary.contains("summary_json.analysis_process.trace_status"));
-        assert!(summary.contains("\"analysis_process\""));
+        assert!(summary.contains("create_index(kind=phase_summary)"));
+        assert!(summary.contains("append_index_detail"));
+        assert!(summary.contains("finalize_index"));
         assert!(summary.contains("source_phase >= 2"));
     }
 
@@ -1812,8 +1813,8 @@ required_variables = ["ticker", "tickers"]
         let content =
             std::fs::read_to_string(project_prompts_dir().join("phase2/topic_controller.md"))
                 .unwrap();
-        assert!(content.contains("blocked_claims"));
-        assert!(content.contains("next_steers"));
+        assert!(content.contains("set_claim_status"));
+        assert!(content.contains("route_debate_steer"));
         assert!(!content.contains("blocked_repeats"));
         assert!(!content.contains("next_agenda"));
     }
@@ -1848,8 +1849,8 @@ required_variables = ["ticker", "tickers"]
         assert!(warmup.contains("必须真实调用 `read_phase_summaries(source_phase=1)`"));
         assert!(warmup.contains("1-2 个 summary"));
         assert!(debate.contains("raw Jin10"));
-        assert!(debate.contains("known_{opponent}_constraint"));
-        assert!(debate.contains("reducer_checks"));
+        assert!(debate.contains("create_debate_claim"));
+        assert!(debate.contains("respond_to_debate_claim"));
         assert!(debate.contains("next_steers"));
         assert!(debate.contains("blocked_claims"));
         assert!(debate.contains("reply_to_claim_id"));

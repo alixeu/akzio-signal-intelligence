@@ -4,7 +4,7 @@
 //!
 //! This is deliberately a narrow bridge: only profiles with a completed
 //! FileStore builder are constructible here.  No SQL service, arbitrary file
-//! operation, or legacy fallback is exposed to the LLM runtime.
+//! operation is exposed to the LLM runtime.
 
 use std::{
     collections::BTreeSet,
@@ -220,7 +220,7 @@ pub(crate) fn file_store_domain_runtime(
 
 /// Rust-owned degraded policy for a migrated Phase 1 unit.  It deliberately
 /// follows the same typed Draft and terminal finalizer path as a successful
-/// ToolManaged role; it is not a legacy JSON/SQLite fallback.  The synthetic
+/// ToolManaged role. The synthetic
 /// evidence is explicitly marked as a runtime failure record so downstream
 /// reducers retain an honest zero-confidence, unobserved assessment.
 pub(crate) fn finalize_degraded_analyst_report(
@@ -290,7 +290,7 @@ pub(crate) fn finalize_degraded_analyst_report(
 
 /// Typed degraded policy for a migrated Phase 3 unit.  This deliberately
 /// finalizes the same Draft that a successful Research Manager would use; it
-/// must never fall through to the legacy JSON/SQLite degraded artifact.
+/// must never fall through to a second persistence authority.
 pub(crate) fn finalize_degraded_research_decision(
     store_root: &Path,
     state: &Value,
@@ -343,7 +343,7 @@ pub(crate) fn finalize_degraded_research_decision(
 }
 
 /// Typed degraded output for a migrated Trader. It remains a terminal Draft
-/// finalization and deliberately cannot fall back to a legacy JSON artifact.
+/// finalization and deliberately cannot fall back to another artifact format.
 pub(crate) fn finalize_degraded_trade_intent(
     store_root: &Path,
     state: &Value,
@@ -400,7 +400,7 @@ pub(crate) fn finalize_degraded_risk_review(
 
 /// Typed degraded output for a migrated Portfolio Manager.  The failure is
 /// still a completed canonical unit, with a hard wait and a traceable runtime
-/// control; it must not manufacture a legacy Phase 6 JSON artifact.
+/// control; it must not manufacture a second Phase 6 artifact format.
 pub(crate) fn finalize_degraded_portfolio_decision(
     store_root: &Path,
     state: &Value,

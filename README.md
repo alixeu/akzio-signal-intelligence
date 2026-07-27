@@ -196,7 +196,6 @@ OHLC:
 
 ```bash
 rtk cargo run -p orchestrator-cli --bin orchestrator-ingest -- \
-  --db-path outputs/orchestrator.sqlite \
   technical-indicators \
   --symbols QQQ,SOXX,VIX \
   --start 2026-05-01 \
@@ -213,14 +212,18 @@ rtk cargo run -p orchestrator-cli --bin orchestrator-ingest -- \
   jin10-flash --pages 2 --lookback-hours 24 --timeout 20
 ```
 
-Technical CSV is an ingestion interchange only. With `--db-path`, the CLI atomically replaces the configured ticker/interval window in `technical_bars`, one indexed row per bar. Jin10 always writes its raw preflight feed to `outputs/jin10/YYYY-MM-DD.csv`; `read_jin10_candidates` returns a bounded candidate set from that feed, and only items that the news analyst assigns a Jin10 attention score are persisted to `jin10_items`.
+Technical input is stored as atomically replaced CSV snapshots under
+`outputs/store/data/technical/<ticker>/<interval>.csv`. Jin10 is stored as an
+atomically replaced date CSV or JSONL snapshot under `outputs/store/data/jin10/`.
+At run start, the manifest records each selected input's content hash; tools read
+that snapshot for the entire run and fail if it changes.
 
 Independent ticker/interval downloads run concurrently (default: 10). Set
 `technical.source: yahoo` or pass `--source yahoo` for a full Yahoo run.
 `technical.alpaca.feed` selects `iex`, `sip`, `boats`, or `otc`; the checked-in
 default is free-tier-compatible `iex`.
 
-The workflow refreshes both sources during Phase 1. Use `--tech-refresh-enabled=false` only when all required ticker/interval CSVs already exist for preflight import. Jin10 lookback is controlled by `--jin10-refresh-lookback-hours`; its SQLite import remains deferred until the news analyst scores an item.
+The workflow refreshes both sources before Phase 1. Use `--tech-refresh-enabled=false` only when all required ticker/interval CSVs already exist. Jin10 lookback is controlled by `--jin10-refresh-lookback-hours`.
 
 ## Run the workflow
 
@@ -275,14 +278,13 @@ retrievable through tools.
 
 ```bash
 rtk cargo run -p orchestrator-cli --bin orchestrator-exec -- \
-  --from-phase 0 \
+  --store-root outputs/store \
   --to-phase 8
 ```
 
 Useful options:
 
-- `--db-path PATH`: override the SQLite database.
-- `--run-dir PATH`: emit `state.json` and a final summary for inspection.
+- `--store-root PATH`: root of the time-partitioned FileStore (default `outputs/store`).
 - `--debug`: print workflow and agent-loop debug logs to the console, and write
   request/response records, timing, and token JSON under `outputs/debug/`.
 - `--max-debate-rounds N`: cap conditional debate rounds.
@@ -293,30 +295,18 @@ Useful options:
 `--from-phase` accepts `0-8` and defaults to `0`; `--to-phase 0` runs only
 historical reflection/retrieval. Mock runs skip Alpaca and all learning writes.
 
-### Debug artifacts
+### FileStore layout
 
-`outputs/debug/` mirrors the runtime prompt path beneath `prompts/`: replace a
-prompt's `.md` suffix with `.json`. For example,
-`prompts/phase1/news_macro.md` writes
-`outputs/debug/phase1/news_macro.json`. Each debug file keeps only the latest exchange at the top level,
-including its `req` and `resp` (including an error or fallback response). The
-latest request messages already contain the accumulated tool and checkpoint
-history needed to reproduce that model call.
-
-Phase 2 mirrors its checkpoint/fork topology instead of its prompt paths:
-`phase2-warmup-shared.json` and `topic-generator.json` sit directly under
-`outputs/debug/phase2/`; each `topic-{id}/` contains `topic-controller.json`,
-`debate-bull.json`, and `debate-bear.json`. These files retain the structured
-top-level `prompt_path` / `req` / `resp` record. A later rebuttal
-replaces the side-specific file because its request already contains the prior
-debate history.
-
-Phase Summary is stored with the phase it summarized, rather than under
-`prompts/phase_summary/`: after a completed Phase `N` from 1 through 7, its
-record is `outputs/debug/phaseN/summary/phaseN_summary.json`. Rust-only Phase 0,
-Phase 7, and Phase 8 each write `runtime.json` in their own phase directory.
-`time.json` and `token.json` remain top-level debug metrics. No debug path or
-record uses `phase25`.
+Each run is isolated under `outputs/store/runs/<workflow_date>/<run_id>/`.
+`manifest.json` and `state.json` record recovery state; independently finalized
+business units are stored below `artifacts/`; append-only session turns are
+below `sessions/`; incomplete writes are below `drafts/`; phase summaries live
+below `index/`; and learning and execution data use their own directories.
+Canonical files contain a schema version and content hash. Temporary files live
+beside their destination, are flushed and fsynced, and are atomically renamed.
+Store Doctor checks malformed content, hashes, path escape, orphan details,
+incomplete Drafts and manifest/file drift; its catalog and experience-level
+outputs are rebuildable caches.
 
 ## Learning loop
 
@@ -332,55 +322,32 @@ Phase 8:
 3. The reflector reads only the allowlisted prior run's phase-summary indexes
    and details. Rust validates evidence IDs, taxonomy, phase scope, and the
    deterministic pattern key before saving atomic experience.
-4. One case remains a low-weight recent episode; two distinct matching runs
-   create a repeated warning; three qualify the pattern for active memory.
+4. One source run is a `recent_episode`; two matching source runs are a
+   `repeated_warning`; three are an `active_policy`. The level is computed from
+   Experience Details and is never separately promoted or versioned.
 5. Phase 8 records a three-trading-day decision snapshot for each analyzed
    ticker, including Hold/current-position decisions, without requiring an order.
 
-The current prediction never scores itself, mock runs never write learning
-memory, and repeated processing is idempotent. Alpaca order IDs persist with the
-exact `run_id`; remote fills are observational only, so attribution remains
-limited to this project's locally recorded orders.
+The current prediction never scores itself, mock runs never write experience,
+and repeated processing is idempotent. Before an Alpaca submission, the workflow
+persists an intent; after a restart it queries the remote order before attempting
+any submission, so a missing local receipt cannot duplicate an order.
 Malformed experience writes fail closed, while reflection failure remains
 non-blocking for the investment decision. Set
-`orchestrator.reflection.enabled: false` to disable retrieval and learning, or
-use `promote_mode: review` for manual review.
-
-The `orchestrator-ops` reflection commands remain available for inspection and
-explicit reruns of scoring, distillation, or promotion.
+`orchestrator.reflection.enabled: false` to disable retrieval and learning.
 
 ## Reliability contracts
 
 - Both Phase 1 roles must cover every requested ticker with non-empty, attributed, timestamped, non-duplicate evidence.
-- JSON validity alone never makes an analyst artifact usable.
+- An Artifact exists only after a terminal domain finalizer passes semantic validation.
 - Probabilities must be finite, inside `[0,1]`, and long/short must be coherent.
 - Manager output cannot replace missing evidence with a default 0.5 result.
 - Responses streams require `response.completed`; Chat Completions streams require a terminal `finish_reason`.
 - Tool calls require a non-empty `call_id`, name, and valid accumulated JSON arguments.
-- Technical tools and downstream phases read SQLite only. The news analyst reads its preflight Jin10 CSV and may call Alpaca News; only attention-scored Jin10 items enter SQLite.
+- Technical/Jin10 tools read the run's hash-pinned FileStore input snapshots. The news analyst may call Alpaca News; evidence selection is retained in its current-run Artifact and tool audit.
 - Tool payload history is bounded to 16,000 characters by default.
 - Allocation excludes VIX, rejects missing per-ticker research, enforces non-negative finite weights, per-asset caps, cash constraints, and a total weight of 1.0.
-- Post-run learning is outcome-backed, idempotent, and outside the decision-critical research path; only qualified, non-mock experience is admitted to durable memory for a later run.
-
-SQLite connections use versioned, transactional migrations plus WAL, `synchronous=NORMAL`, foreign keys, and a busy timeout. Scoped agent messages carry run/turn/role identity; validated artifacts are written before final run archive state.
-
-Database maintenance is explicit and never runs `VACUUM` during workflow startup:
-
-```bash
-# Read-only integrity, density, schema, and query-plan report
-rtk cargo run -p orchestrator-cli --bin orchestrator-ops -- db-doctor \
-  --db-path outputs/orchestrator.sqlite
-
-# Preview retention changes; pass --dry-run=false to apply
-rtk cargo run -p orchestrator-cli --bin orchestrator-ops -- db-cleanup \
-  --db-path outputs/orchestrator.sqlite --dry-run=true
-
-# Explicit WAL and file maintenance
-rtk cargo run -p orchestrator-cli --bin orchestrator-ops -- db-checkpoint \
-  --db-path outputs/orchestrator.sqlite --truncate
-rtk cargo run -p orchestrator-cli --bin orchestrator-ops -- db-vacuum \
-  --db-path outputs/orchestrator.sqlite
-```
+- Post-run learning is outcome-backed, idempotent, and outside the decision-critical research path; only qualified, non-mock Experience Index/Detail entries are reusable later.
 
 ## Validation
 
@@ -400,4 +367,4 @@ Prompt lint:
 rtk cargo run -p orchestrator-cli --bin orchestrator-prompt-lint
 ```
 
-Generated SQLite files, `outputs/`, debug logs, release artifacts, and credentials must not be committed.
+Generated FileStore data, `outputs/`, debug logs, release artifacts, and credentials must not be committed.

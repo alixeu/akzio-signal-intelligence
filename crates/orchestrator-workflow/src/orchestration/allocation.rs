@@ -165,10 +165,9 @@ pub(crate) fn normalize_allocation(
         .chain(std::iter::once("cash_hedge"))
         .collect();
 
-    let allocation_payload = allocation_payload(raw).unwrap_or(raw);
-    let raw_weights = allocation_payload
+    let raw_weights = raw
         .get("weights")
-        .or_else(|| allocation_payload.get("allocation"))
+        .or_else(|| raw.get("allocation"))
         .cloned()
         .unwrap_or_else(|| json!({}));
 
@@ -286,14 +285,14 @@ pub(crate) fn normalize_allocation(
     json!({
         "weights": weights_json,
         "total_equity_exposure": (total_equity * 10_000.0).round() / 10_000.0,
-        "vix_regime": allocation_payload.get("vix_regime").cloned()
+        "vix_regime": raw.get("vix_regime").cloned()
             .or_else(|| context.get("vix").and_then(|v| v.get("regime")).cloned())
             .unwrap_or_else(|| json!("unknown")),
-        "correlation_note": allocation_payload.get("correlation_note").cloned()
+        "correlation_note": raw.get("correlation_note").cloned()
             .or_else(|| context.get("correlation_warning").cloned())
             .unwrap_or_else(|| json!("")),
         "equity_budget_deviation": equity_budget_deviation(context, total_equity),
-        "summary": allocation_payload.get("summary").and_then(Value::as_str).unwrap_or(""),
+        "summary": raw.get("summary").and_then(Value::as_str).unwrap_or(""),
         "allocation_method": "llm"
     })
 }
@@ -479,22 +478,6 @@ fn validate_allocation_output(
         bail!("allocation weights must sum to 1.0, got {total}");
     }
     Ok(())
-}
-
-fn allocation_payload(raw: &Value) -> Option<&Value> {
-    if has_allocation_weights(raw) {
-        return Some(raw);
-    }
-
-    raw.get("report")
-        .filter(|report| has_allocation_weights(report))
-}
-
-fn has_allocation_weights(value: &Value) -> bool {
-    value
-        .get("weights")
-        .or_else(|| value.get("allocation"))
-        .is_some_and(Value::is_object)
 }
 
 fn fallback_inverse_vol(context: &Value, config: &AllocationConfig, reason: &str) -> Value {
@@ -892,47 +875,6 @@ mod tests {
             .sum::<f64>();
         assert!((sum - 1.0).abs() < 0.0001, "sum={sum}");
         assert!(weights["cash_hedge"]["weight"].as_f64().unwrap() > 0.0);
-    }
-
-    #[test]
-    fn normalize_allocation_accepts_one_legacy_report_wrapper() {
-        let allocation = normalize_allocation(
-            &json!({
-                "report": {
-                    "weights": {
-                        "QQQ": {"weight": 0.7, "rationale": "legacy wrapper"},
-                        "cash_hedge": {"weight": 0.3, "rationale": "cash"}
-                    }
-                }
-            }),
-            &test_context(),
-            &test_config(),
-        );
-
-        assert_eq!(allocation["allocation_method"], json!("llm"));
-        assert_eq!(allocation["weights"]["QQQ"]["weight"], json!(0.7));
-        assert_eq!(allocation["weights"]["cash_hedge"]["weight"], json!(0.3));
-    }
-
-    #[test]
-    fn normalize_allocation_does_not_recursively_unwrap_legacy_reports() {
-        let allocation = normalize_allocation(
-            &json!({
-                "report": {
-                    "report": {
-                        "weights": {"QQQ": {"weight": 1.0}}
-                    }
-                }
-            }),
-            &test_context(),
-            &test_config(),
-        );
-
-        assert_eq!(
-            allocation["allocation_method"],
-            json!("fallback_inverse_vol")
-        );
-        assert_ne!(allocation["weights"]["QQQ"]["weight"], json!(0.7));
     }
 
     #[test]

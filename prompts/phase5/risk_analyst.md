@@ -28,4 +28,7 @@ Rust 风险控制上下文（不含 ResearchDecision、TradeIntent 或风险历�
 摘要可用性 bootstrap（不含分析正文）：
 {retrieval_bootstrap}
 
-Artifact 包含 `stance, argument, unique_risk_contribution, disagreement_with_prior, no_new_information, recommended_adjustment, stop_type, max_drawdown_pct, position_cap_pct, rebalance_trigger, risk_off_trigger, review_window, cash_hedge_recommendation, constraint_confidence`。
+通过领域工具完成本角色的 Draft：调用 `set_risk_assessment` 和
+`set_risk_constraints`，然后调用 terminal `finalize_risk_review`。不要输出 JSON
+Artifact 或 Assistant 最终答案。Rust Builder 从已写入字段生成 canonical Artifact；
+`stance`、ticker、角色和作用域由运行时绑定，不能自行指定或覆盖。

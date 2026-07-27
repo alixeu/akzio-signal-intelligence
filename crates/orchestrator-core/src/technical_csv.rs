@@ -8,9 +8,10 @@
 use anyhow::{bail, Context, Result};
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
-pub const DEFAULT_TECHNICAL_CSV_DIR: &str = "outputs/technical";
+pub const DEFAULT_TECHNICAL_CSV_DIR: &str = "outputs/store/data/technical";
 pub const DEFAULT_TECHNICAL_BARS: usize = 60;
 
 /// Canonical storage/query interval names used in code and CSV metadata.
@@ -43,7 +44,9 @@ pub fn technical_csv_filename(symbol: &str, interval: &str) -> Option<String> {
 }
 
 pub fn technical_csv_path(dir: &Path, symbol: &str, interval: &str) -> Option<PathBuf> {
-    technical_csv_filename(symbol, interval).map(|name| dir.join(name))
+    let label = interval_file_label(interval)?;
+    let ticker = safe_ticker_component(symbol);
+    Some(dir.join(ticker).join(format!("{label}.csv")))
 }
 
 pub fn default_technical_csv_dir() -> PathBuf {
@@ -108,9 +111,55 @@ pub fn write_technical_csv(path: &Path, rows: &[TechnicalCsvRow]) -> Result<()> 
         }
         out.push('\n');
     }
-    fs::write(path, out)
+    write_text_atomic(path, &out)
         .with_context(|| format!("failed to write technical csv {}", path.display()))?;
     Ok(())
+}
+
+fn safe_ticker_component(symbol: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    let readable = crate::slug_ticker(symbol);
+    let digest = Sha256::digest(symbol.as_bytes());
+    let hash = digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let prefix = if readable.is_empty() {
+        "ticker"
+    } else {
+        &readable
+    };
+    format!("{}-{hash}", &prefix[..prefix.len().min(48)])
+}
+
+fn write_text_atomic(path: &Path, contents: &str) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("technical csv path must have a parent directory")?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("technical csv path must have a UTF-8 file name")?;
+    let temp = parent.join(format!(".{file_name}.tmp-{}", std::process::id()));
+    let result = (|| -> Result<()> {
+        let mut file = fs::File::create(&temp).with_context(|| {
+            format!(
+                "failed to create temporary technical csv {}",
+                temp.display()
+            )
+        })?;
+        file.write_all(contents.as_bytes())?;
+        file.flush()?;
+        file.sync_all()?;
+        fs::rename(&temp, path)?;
+        fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
 }
 
 pub fn read_technical_csv(path: &Path) -> Result<Vec<TechnicalCsvRow>> {
@@ -332,6 +381,17 @@ mod tests {
             technical_csv_filename("SOXX", "3h").as_deref(),
             Some("soxx_3h.csv")
         );
+    }
+
+    #[test]
+    fn path_uses_safe_ticker_directory_and_interval_file() {
+        let path = technical_csv_path(Path::new("root"), "QQQ/../../x", "1d").unwrap();
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("day.csv")
+        );
+        assert!(path.to_string_lossy().starts_with("root/QQQ_X-"));
+        assert!(!path.to_string_lossy().contains(".."));
     }
 
     #[test]

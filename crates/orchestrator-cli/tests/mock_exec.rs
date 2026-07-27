@@ -16,7 +16,6 @@ async fn mock_exec_writes_file_store_manifest_and_indexes() {
     );
     assert!(has_file_named(&store_root.join("runs"), "manifest.json"));
     assert!(has_directory_named(&store_root.join("runs"), "index"));
-    assert_no_database_files(&store_root);
 
     let state = &result["run_state"];
     assert_eq!(state["phase_status"]["1"], "done");
@@ -60,7 +59,6 @@ async fn mock_exec_phase7_writes_file_store_allocation() {
         1.0
     );
     assert!(has_file_named(&store_root.join("runs"), "allocation.json"));
-    assert_no_database_files(&store_root);
 
     let state = &result["run_state"];
     assert_eq!(state["phase_status"]["7"], "done");
@@ -86,7 +84,6 @@ async fn mock_exec_phase8_archives_to_file_store() {
     assert_eq!(result["run_state"]["phase_status"]["8"], "done");
     assert!(has_file_named(&store_root.join("runs"), "manifest.json"));
     assert!(has_file_named(&store_root.join("runs"), "allocation.json"));
-    assert_no_database_files(&store_root);
 }
 
 fn test_args(config_root: &Path, store_root: std::path::PathBuf, to_phase: i64) -> ExecArgs {
@@ -199,22 +196,6 @@ fn has_directory_named(root: &Path, name: &str) -> bool {
     walk(root)
         .iter()
         .any(|path| path.is_dir() && path.file_name().is_some_and(|directory| directory == name))
-}
-
-fn assert_no_database_files(root: &Path) {
-    let databases = walk(root)
-        .into_iter()
-        .filter(|path| path.is_file())
-        .filter(|path| {
-            path.extension()
-                .and_then(|extension| extension.to_str())
-                .is_some_and(|extension| matches!(extension, "sqlite" | "db"))
-        })
-        .collect::<Vec<_>>();
-    assert!(
-        databases.is_empty(),
-        "unexpected database files: {databases:?}"
-    );
 }
 
 fn walk(root: &Path) -> Vec<std::path::PathBuf> {
