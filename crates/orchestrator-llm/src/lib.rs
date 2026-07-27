@@ -793,47 +793,6 @@ pub fn append_debug_output_record(
     })
 }
 
-fn end_context_item(item: &agent_loop::TurnItem) -> Option<Value> {
-    match item.item_type {
-        agent_loop::TurnItemType::UserMessage => Some(json!({
-            "role": "user",
-            "content": item.content_text
-        })),
-        agent_loop::TurnItemType::AssistantMessage => Some(json!({
-            "role": "assistant",
-            "content": item.content_text
-        })),
-        agent_loop::TurnItemType::ToolCall => {
-            let call = item.content_json.get("call")?;
-            let arguments = call.get("arguments").cloned().unwrap_or(Value::Null);
-            Some(json!({
-                "role": "assistant",
-                "tool_calls": [{
-                    "id": call.get("call_id").and_then(Value::as_str).unwrap_or(&item.tool_call_id),
-                    "type": "function",
-                    "function": {
-                        "name": call.get("name").and_then(Value::as_str).unwrap_or(&item.tool_name),
-                        "arguments": serde_json::to_string(&arguments).unwrap_or_else(|_| "null".to_string())
-                    }
-                }]
-            }))
-        }
-        agent_loop::TurnItemType::ToolResult => Some(json!({
-            "role": "tool",
-            "tool_call_id": item.tool_call_id,
-            "content": item.content_text
-        })),
-        _ => None,
-    }
-}
-
-fn safe_path_part(value: &str) -> String {
-    value
-        .chars()
-        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
-        .collect()
-}
-
 fn web_run_runtime(config: &WebSearchConfig) -> Option<tools::WebRunRuntime> {
     Some(
         tools::WebRunRuntime::new(config.clone())
@@ -2720,53 +2679,6 @@ mod tests {
             ..base_settings(LlmRoute::Responses).llm
         };
         responses.validate("manager.research").unwrap();
-    }
-
-    #[test]
-    fn end_context_item_matches_provider_message_shape() {
-        let call = agent_loop::ToolCallRequest {
-            call_id: "call_file_001".to_string(),
-            name: "read_file".to_string(),
-            arguments: json!({"path": "README.md"}),
-        };
-        let tool_result = agent_loop::ToolResultItem {
-            call_id: "call_file_001".to_string(),
-            name: "read_file".to_string(),
-            status: "completed".to_string(),
-            output: json!({"content": "# My Project"}),
-            error: None,
-        };
-
-        assert_eq!(
-            super::end_context_item(&agent_loop::TurnItem::user("帮我查看 README.md")).unwrap(),
-            json!({"role": "user", "content": "帮我查看 README.md"})
-        );
-        assert_eq!(
-            super::end_context_item(&agent_loop::TurnItem::tool_call(&call)).unwrap(),
-            json!({
-                "role": "assistant",
-                "tool_calls": [{
-                    "id": "call_file_001",
-                    "type": "function",
-                    "function": {
-                        "name": "read_file",
-                        "arguments": "{\"path\":\"README.md\"}"
-                    }
-                }]
-            })
-        );
-        assert_eq!(
-            super::end_context_item(&agent_loop::TurnItem::tool_result(
-                &tool_result,
-                &TruncationConfig::default(),
-            ))
-            .unwrap(),
-            json!({"role": "tool", "tool_call_id": "call_file_001", "content": "# My Project"})
-        );
-        assert_eq!(
-            super::safe_path_part("analyst.news_macro"),
-            "analyst_news_macro"
-        );
     }
 
     #[test]

@@ -2,7 +2,10 @@ use anyhow::{bail, Context, Result};
 use chrono::Local;
 use clap::{Args, ValueEnum};
 use html_escape::encode_text;
-use orchestrator_core::{config_float, config_str, config_strings, display_ticker, run_slug};
+use orchestrator_core::{
+    config_float, config_str, config_strings, display_ticker, project_path, run_slug,
+};
+use orchestrator_store::{FileStore, FileStoreOptions, RunLocation};
 use serde_json::{json, Value};
 use std::{fs, path::PathBuf, process::Command};
 
@@ -17,6 +20,9 @@ pub enum ReportMode {
 pub struct ReportArgs {
     #[arg(long, value_enum, default_value_t = ReportMode::BuildAndSend)]
     pub mode: ReportMode,
+    /// The same FileStore root used by orchestrator-exec; never a bare run directory.
+    #[arg(long)]
+    pub store_root: Option<PathBuf>,
 }
 
 pub fn run(args: ReportArgs) -> Result<Value> {
@@ -28,7 +34,7 @@ pub fn run(args: ReportArgs) -> Result<Value> {
         run_slug(&tickers)
     };
     let today = Local::now().date_naive().to_string();
-    let payload = build_payload(&today, &slug, &tickers)?;
+    let payload = build_payload(&config, args.store_root.as_deref(), &today, &slug, &tickers)?;
     let mut result = json!({
         "subject": payload.get("subject").and_then(Value::as_str).unwrap_or("Daily TQQQ Strategy Report"),
         "orchestrator_status": payload.get("orchestrator_status").and_then(Value::as_str).unwrap_or("unknown")
@@ -42,32 +48,42 @@ pub fn run(args: ReportArgs) -> Result<Value> {
     Ok(result)
 }
 
-fn build_payload(today: &str, slug: &str, tickers: &[String]) -> Result<Value> {
-    let run_dir = if let Ok(value) = std::env::var("CODEX_ORCH_RUN_DIR") {
-        PathBuf::from(value)
-    } else {
-        super::config::project_path_from_config(format!("outputs/{}/{}_exec", slug, today))
-    };
-    let state_path = run_dir.join("state.json");
-    let final_summary_path = run_dir.join("final_summary.md");
-    let state = if state_path.exists() {
-        serde_json::from_str(&fs::read_to_string(&state_path)?)?
+fn build_payload(
+    config: &Value,
+    store_root: Option<&std::path::Path>,
+    today: &str,
+    _slug: &str,
+    tickers: &[String],
+) -> Result<Value> {
+    let root = store_root.map(ToOwned::to_owned).unwrap_or_else(|| {
+        project_path(config_str(
+            config,
+            "orchestrator.store.root",
+            "outputs/store",
+        ))
+    });
+    let run_id = crate::orchestration::lifecycle::run_id_for(tickers, today);
+    let location = RunLocation::new(today, run_id)?;
+    let store = FileStore::open(&root, FileStoreOptions::default())?;
+    let state_relative = location.child_relative(std::path::Path::new("state.json"))?;
+    let state = if store.exists(&state_relative)? {
+        store.read_json_value(&state_relative)?
     } else {
         json!({})
     };
     let report_markdown = super::builder::build_human_readable_report(&state);
     let report_html = super::builder::report_to_html(&report_markdown);
-    let final_summary = fs::read_to_string(&final_summary_path).unwrap_or_default();
 
     Ok(json!({
         "subject": format!("{} strategy report {}", display_ticker(tickers), today),
         "today": today,
-        "orchestrator_status": if state_path.exists() { "complete" } else { "missing" },
-        "run_dir": run_dir,
+        "orchestrator_status": if store.exists(&state_relative)? { "complete" } else { "missing" },
+        "store_root": root,
+        "run_id": location.run_id,
         "orchestrator_state": state,
         "report_markdown": report_markdown,
         "report_html": report_html,
-        "final_summary": final_summary
+        "final_summary": ""
     }))
 }
 
@@ -302,14 +318,24 @@ mod tests {
     }
 
     #[test]
-    fn build_payload_reads_state_from_run_dir() {
+    fn build_payload_reads_state_from_file_store() {
         let temp = tempfile::tempdir().unwrap();
-        let run_dir = temp.path().join("run-dir");
-        fs::create_dir_all(&run_dir).unwrap();
-        fs::write(run_dir.join("state.json"), "{}").unwrap();
-        std::env::set_var("CODEX_ORCH_RUN_DIR", &run_dir);
-        let payload = build_payload("2026-06-19", "TQQQ", &[]).unwrap();
-        std::env::remove_var("CODEX_ORCH_RUN_DIR");
+        let config = json!({"orchestrator":{"store":{"root":temp.path()}}});
+        let store = FileStore::open(temp.path(), FileStoreOptions::default()).unwrap();
+        let location = RunLocation::new(
+            "2026-06-19",
+            crate::orchestration::lifecycle::run_id_for(&[], "2026-06-19"),
+        )
+        .unwrap();
+        store
+            .write_json_value(
+                &location
+                    .child_relative(std::path::Path::new("state.json"))
+                    .unwrap(),
+                &json!({}),
+            )
+            .unwrap();
+        let payload = build_payload(&config, Some(temp.path()), "2026-06-19", "TQQQ", &[]).unwrap();
         assert_eq!(payload["orchestrator_status"], "complete");
     }
 
