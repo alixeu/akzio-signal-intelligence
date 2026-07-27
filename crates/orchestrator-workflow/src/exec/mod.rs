@@ -1218,29 +1218,37 @@ async fn run_unit(
         .next()
         .context("ToolManaged role produced no result")?;
     record_role_job_metrics(state, &result);
-    let artifact = match result.artifact.clone() {
-        Some(artifact) => artifact,
-        None => finalize_degraded_tool_managed_unit(
-            state, runtime, role, phase, kind, round, topic_id, ticker, &result,
-        )?,
+    let (artifact, degraded_terminal) = match result.artifact.clone() {
+        Some(artifact) => (artifact, None),
+        None => {
+            let (artifact, session_id, turn_id) = finalize_degraded_tool_managed_unit(
+                state, runtime, role, phase, kind, round, topic_id, ticker, &result,
+            )?;
+            (artifact, Some((session_id, turn_id)))
+        }
     };
-    let session_id = if result.session_id.is_empty() {
-        format!(
-            "{}:p{}:{}:{}:{}:{}",
-            state["run_id"].as_str().unwrap_or_default(),
-            phase,
-            role,
-            phase2_profile_name(role, kind),
-            topic_id.unwrap_or("aggregate"),
-            round.unwrap_or(0)
-        )
+    let (session_id, turn_id) = if let Some(identity) = degraded_terminal {
+        identity
     } else {
-        result.session_id
-    };
-    let turn_id = if result.turn_id.is_empty() {
-        "mock-finalize".to_owned()
-    } else {
-        result.turn_id
+        let session_id = if result.session_id.is_empty() {
+            format!(
+                "{}:p{}:{}:{}:{}:{}",
+                state["run_id"].as_str().unwrap_or_default(),
+                phase,
+                role,
+                phase2_profile_name(role, kind),
+                topic_id.unwrap_or("aggregate"),
+                round.unwrap_or(0)
+            )
+        } else {
+            result.session_id
+        };
+        let turn_id = if result.turn_id.is_empty() {
+            "mock-finalize".to_owned()
+        } else {
+            result.turn_id
+        };
+        (session_id, turn_id)
     };
     state["_runtime_sessions"][runtime_session_key(role, kind, topic_id, round)] =
         json!({"session_id": session_id, "turn_id": turn_id});
@@ -1264,7 +1272,7 @@ fn finalize_degraded_tool_managed_unit(
     topic_id: Option<&str>,
     ticker: Option<&str>,
     result: &crate::orchestration::role_jobs::RoleJobResult,
-) -> Result<Value> {
+) -> Result<(Value, String, String)> {
     let failure = result
         .error
         .as_deref()
@@ -1371,7 +1379,7 @@ fn finalize_degraded_tool_managed_unit(
         }
         _ => unreachable!("only profiles with a Rust degraded policy reach this branch"),
     };
-    persist_degraded_terminal(
+    let (terminal_session_id, terminal_turn_id) = persist_degraded_terminal(
         state,
         role,
         phase,
@@ -1389,7 +1397,7 @@ fn finalize_degraded_tool_managed_unit(
         .as_array_mut()
         .expect("errors is an array after initialization")
         .push(json!({"role": role, "phase": phase, "kind": kind, "failure": failure}));
-    Ok(artifact)
+    Ok((artifact, terminal_session_id, terminal_turn_id))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1402,7 +1410,7 @@ fn persist_degraded_terminal(
     turn_id: &str,
     fork: Option<orchestrator_store::ForkReference>,
     artifact: &Value,
-) -> Result<()> {
+) -> Result<(String, String)> {
     let run_id = state["run_id"]
         .as_str()
         .context("degraded terminal requires run_id")?;
@@ -1444,7 +1452,7 @@ fn persist_degraded_terminal(
         error: None,
     };
     session.append_terminal(&turn, &terminal, Utc::now().to_rfc3339())?;
-    Ok(())
+    Ok((session_id, turn_id))
 }
 
 fn completed_unit_key(
