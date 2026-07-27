@@ -4,8 +4,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    content_hash, error::io_error, read_jsonl_recover_tail, ContentHashDocument, FileSchemaKind,
-    FileStore, JsonlRecord, Result, RunLocation, SafeSlug, StoreError, Versioned,
+    canonical_json_bytes, content_hash, error::io_error, read_jsonl_recover_tail,
+    ContentHashDocument, FileSchemaKind, FileStore, JsonlRecord, Result, RunLocation, SafeSlug,
+    StoreError, Versioned,
 };
 
 pub const SESSION_MANIFEST_SCHEMA_VERSION: u32 = 1;
@@ -203,9 +204,7 @@ impl SessionEvent {
             content_hash: String::new(),
         };
         event.validate_shape()?;
-        event.content_hash = content_hash(
-            &serde_json::to_value(&event).map_err(|source| StoreError::JsonSerialize { source })?,
-        )?;
+        event.content_hash = event_hash(&event)?;
         Ok(event)
     }
 
@@ -239,8 +238,7 @@ impl JsonlRecord for SessionEvent {
 
     fn validate_record(&self) -> std::result::Result<(), String> {
         self.validate_shape().map_err(|error| error.to_string())?;
-        let value = serde_json::to_value(self).map_err(|error| error.to_string())?;
-        let expected = content_hash(&value).map_err(|error| error.to_string())?;
+        let expected = event_hash(self).map_err(|error| error.to_string())?;
         if self.content_hash != expected {
             return Err(format!(
                 "expected content hash {expected}, found {}",
@@ -249,6 +247,22 @@ impl JsonlRecord for SessionEvent {
         }
         Ok(())
     }
+}
+
+/// The self-describing hash field is excluded from its own canonical digest.
+/// Readers use the same projection, so a JSONL event written before a crash is
+/// verifiable without silently weakening event integrity.
+fn event_hash(event: &SessionEvent) -> Result<String> {
+    let mut value =
+        serde_json::to_value(event).map_err(|source| StoreError::JsonSerialize { source })?;
+    value["content_hash"] = Value::String(String::new());
+    // JSON numbers originating in tool output can be represented as native
+    // f64 values. Hash the canonical bytes after one JSON parse round-trip so
+    // write-time and recovery-time representations are identical.
+    let bytes = canonical_json_bytes(&value)?;
+    let normalized =
+        serde_json::from_slice(&bytes).map_err(|source| StoreError::JsonSerialize { source })?;
+    content_hash(&normalized)
 }
 
 /// The only typed source allowed to add an item to VisibleEvidenceSet.
