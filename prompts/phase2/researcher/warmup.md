@@ -6,7 +6,7 @@
 
 {retrieval_policy}
 
-本轮是没有具体 topic、没有最终结论的共享准备回合。必须真实调用 `read_phase_summaries(source_phase=1)` 建立 Phase 1 证据目录；不得依赖 Prompt 预注入索引。完成后的 checkpoint 会继续生成 topics，再由 topic 的 Bull、Bear 与 Controller fork。
+本轮是没有具体 topic、没有最终结论的共享准备回合。必须真实调用 `read_phase_summaries(source_phase=1)` 建立 Phase 1 证据目录；不得依赖 Prompt 预注入索引。Topic Generator 独立运行；完成后的 checkpoint 只供各 topic 的 Bull 与 Bear fork。
 
 - 同时识别最强上行依据、最强下行依据与双方各自的反方约束，禁止只索引单边有利证据。
 - 只对最可能改变后续辩论边界的 1-2 个 summary 调用 `read_phase_summary_details`；同一 summary 不重复展开。

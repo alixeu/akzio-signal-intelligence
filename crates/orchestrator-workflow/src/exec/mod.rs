@@ -1672,8 +1672,8 @@ async fn run_phase2(
         .map(|s| s.to_string())
         .context("db_path missing from state")?;
 
-    // Build one shared checkpoint, continue it through topic generation, then fork
-    // every topic-local Bull/Bear/Controller conversation from that completed turn.
+    // Build the shared Bull/Bear warmup checkpoint, then run Topic Generator
+    // independently. Topic roles fork from the checkpoint appropriate to the role.
     let model_override_owned = model_override.map(|s| s.to_string());
     let reasoning_effort_override_owned = reasoning_effort_override.map(|s| s.to_string());
     let mut warmup_state = state.clone();
@@ -2035,10 +2035,7 @@ async fn run_one_topic_debate(
     config: &RuntimeConfig,
 ) -> Result<TopicDebateResult> {
     let topic_id = topic_id_from_topic(&topic);
-    debug!(
-        topic_id,
-        "phase 2 steer-room topic debate starting (forked from shared topic checkpoint)"
-    );
+    debug!(topic_id, "phase 2 steer-room topic debate starting");
 
     let model_override_ref = model_override.as_deref();
     let reasoning_effort_ref = reasoning_effort_override.as_deref();
@@ -2296,12 +2293,17 @@ fn steer_turn_id_for_role(topic_id: &str, role: &str) -> String {
 }
 
 fn fork_source_turn_id(state: &Value, topic_id: &str, role: &str) -> Option<String> {
-    if role.contains("bull.initial")
-        || role.contains("bear.initial")
-        || role == "mediator.topic_controller"
-    {
+    if role == "mediator.topic_controller" {
         return state
             .get("topic_generation_turn_id")?
+            .as_str()
+            .filter(|turn_id| !turn_id.is_empty())
+            .map(ToString::to_string);
+    }
+    if role.contains("bull.initial") || role.contains("bear.initial") {
+        return state
+            .get("phase2_warmup")?
+            .get("turn_id")?
             .as_str()
             .filter(|turn_id| !turn_id.is_empty())
             .map(ToString::to_string);
@@ -2332,6 +2334,10 @@ fn attach_fork_source(
         value["include_prompt_on_fork"] = Value::Bool(true);
     }
     Some(value.to_string())
+}
+
+fn topic_generation_steer() -> Option<String> {
+    Some(steer_payload("topic_generation", &json!({})))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2601,11 +2607,6 @@ async fn run_phase2_topic_generation(
         let run_id = state.get("run_id").and_then(Value::as_str).unwrap_or("run");
         let session_id = format!("{run_id}:phase2:topic-generator");
         let turn_id = session_id.clone();
-        let warmup_turn_id = state
-            .get("phase2_warmup")
-            .and_then(|warmup| warmup.get("turn_id"))
-            .and_then(Value::as_str)
-            .map(ToString::to_string);
         let prompt_path = config
             .prompts
             .path_for("mediator.topic")
@@ -2626,11 +2627,7 @@ async fn run_phase2_topic_generation(
                 prompt_path: Some(prompt_path.as_path()),
                 session_id,
                 turn_id: turn_id.clone(),
-                steer: attach_fork_source(
-                    Some(steer_payload("topic_generation", &json!({}))),
-                    warmup_turn_id,
-                    true,
-                ),
+                steer: topic_generation_steer(),
             },
             config.workflow.reducer_timeout_sec,
             config,
@@ -2638,11 +2635,14 @@ async fn run_phase2_topic_generation(
             conn,
         )
         .await?;
+        // The independent Topic Generator turn is the controller checkpoint,
+        // even when its artifact falls back to Rust. Bull/Bear use the separate
+        // shared warmup checkpoint.
+        state["topic_generation_turn_id"] = Value::String(turn_id);
         if generated.get("artifact_type").and_then(Value::as_str)
             == Some("phase2_topic_generation_artifact")
         {
             artifact = merge_topic_generation_output(&baseline, &generated);
-            state["topic_generation_turn_id"] = Value::String(turn_id);
         } else {
             tracing::warn!("mediator.topic degraded; using deterministic topic fallback");
         }
@@ -5257,7 +5257,10 @@ fn point_debate_steer_embeds_opponent_claims() {
 
 #[test]
 fn topic_controller_forks_from_topic_generation_with_its_own_prompt() {
-    let state = json!({"topic_generation_turn_id": "turn-topic-root"});
+    let state = json!({
+        "phase2_warmup": {"turn_id": "warmup-shared-ready"},
+        "topic_generation_turn_id": "turn-topic-root"
+    });
     let source = fork_source_turn_id(&state, "QQQ-volatility", "mediator.topic_controller");
     let steer: Value = serde_json::from_str(
         &attach_fork_source(Some(steer_payload("seed_claims", &json!({}))), source, true).unwrap(),
@@ -5269,7 +5272,15 @@ fn topic_controller_forks_from_topic_generation_with_its_own_prompt() {
 }
 
 #[test]
-fn phase2_initial_researchers_fork_from_the_shared_topic_checkpoint() {
+fn topic_generator_starts_without_the_warmup_checkpoint() {
+    let steer: Value = serde_json::from_str(&topic_generation_steer().unwrap()).unwrap();
+
+    assert!(steer.get("fork_from_turn_id").is_none());
+    assert!(steer.get("include_prompt_on_fork").is_none());
+}
+
+#[test]
+fn phase2_initial_researchers_fork_from_the_shared_warmup_checkpoint() {
     let state = json!({
         "phase2_warmup": {"turn_id": "warmup-shared-ready"},
         "topic_generation_turn_id": "turn-topic-root"
@@ -5277,11 +5288,19 @@ fn phase2_initial_researchers_fork_from_the_shared_topic_checkpoint() {
 
     assert_eq!(
         fork_source_turn_id(&state, "QQQ-volatility", "researcher.bull.initial"),
-        Some("turn-topic-root".to_string())
+        Some("warmup-shared-ready".to_string())
     );
     assert_eq!(
         fork_source_turn_id(&state, "QQQ-volatility", "researcher.bear.initial"),
-        Some("turn-topic-root".to_string())
+        Some("warmup-shared-ready".to_string())
+    );
+    assert_eq!(
+        fork_source_turn_id(
+            &json!({"topic_generation_turn_id": "turn-topic-root"}),
+            "QQQ-volatility",
+            "researcher.bull.initial"
+        ),
+        None
     );
 }
 

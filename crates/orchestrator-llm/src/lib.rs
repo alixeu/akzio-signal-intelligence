@@ -408,11 +408,14 @@ pub async fn run_agent_steer_loop_with_metrics(
     let is_new_fork = target_history.is_empty() && !fork_history.is_empty();
     let prior_history = select_fork_history(target_history, fork_history);
     let has_existing_history = !prior_history.is_empty();
-    let user_input = if has_existing_history && !(is_new_fork && input.includes_prompt_on_fork()) {
-        String::new()
-    } else {
-        input.prompt.to_string()
-    };
+    let include_prompt_on_fork = input.includes_prompt_on_fork();
+    let (user_input, fork_input, pending_steer) = prepare_steer_turn_inputs(
+        input.prompt,
+        input.steer,
+        has_existing_history,
+        is_new_fork,
+        include_prompt_on_fork,
+    );
     let mut turn = Turn::new(
         input.turn_id.clone(),
         input.session_id.clone(),
@@ -432,6 +435,10 @@ pub async fn run_agent_steer_loop_with_metrics(
             })
             .collect();
     }
+    if let Some(fork_input) = fork_input {
+        turn.emitted_items
+            .push(agent_loop::TurnItem::user(fork_input));
+    }
     turn.phase = settings.phase;
     turn.tools_disabled = role_disables_tools(&settings.role);
     turn.model_context = format!(
@@ -442,7 +449,7 @@ pub async fn run_agent_steer_loop_with_metrics(
         serde_json::to_string(&configured_tool_names(settings))?,
         fork_from_turn_id.is_some()
     );
-    if let Some(steer) = input.steer {
+    if let Some(steer) = pending_steer {
         turn.push_pending_input(steer);
     }
     let tool_config = settings.tools.clone().unwrap_or_else(default_tool_config);
@@ -506,6 +513,28 @@ fn select_fork_history(target_history: Vec<Value>, fork_history: Vec<Value>) -> 
     } else {
         target_history
     }
+}
+
+fn prepare_steer_turn_inputs(
+    prompt: &str,
+    steer: Option<String>,
+    has_existing_history: bool,
+    is_new_fork: bool,
+    include_prompt_on_fork: bool,
+) -> (String, Option<String>, Option<String>) {
+    if is_new_fork && include_prompt_on_fork {
+        let fork_input = match steer {
+            Some(steer) => format!("{prompt}\n\nSteer: {steer}"),
+            None => prompt.to_string(),
+        };
+        return (String::new(), Some(fork_input), None);
+    }
+    let user_input = if has_existing_history && !(is_new_fork && include_prompt_on_fork) {
+        String::new()
+    } else {
+        prompt.to_string()
+    };
+    (user_input, None, steer)
 }
 
 fn record_jin10_usage_from_artifact(
@@ -894,7 +923,7 @@ fn validate_debug_output_relative_path(path: &Path) -> Result<PathBuf> {
     Ok(path.to_path_buf())
 }
 
-/// Append a workflow-local or runtime debug record to the same prompt-record envelope.
+/// Write the latest workflow-local or runtime debug request/response record.
 ///
 /// `relative_output_path` is relative to the project root, typically below
 /// `outputs/debug/`; `source_label` identifies a non-prompt producer such as `runtime`.
@@ -915,38 +944,22 @@ pub fn append_debug_output_record(
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create debug dir {}", parent.display()))?;
         }
-        let mut output = if path.exists() {
-            let contents = fs::read_to_string(&path)
-                .with_context(|| format!("failed to read debug record {}", path.display()))?;
-            serde_json::from_str::<Value>(&contents)
-                .with_context(|| format!("debug record {} must be JSON", path.display()))?
-        } else {
-            json!({"prompt_path": source_label, "records": []})
-        };
+        let mut output = record;
         let object = output.as_object_mut().ok_or_else(|| {
             anyhow::anyhow!("debug record {} must be a JSON object", path.display())
         })?;
-        let existing_prompt_path = object
-            .entry("prompt_path")
-            .or_insert_with(|| json!(source_label));
-        if existing_prompt_path.as_str() != Some(source_label) {
+        if object
+            .get("prompt_path")
+            .is_some_and(|value| value.as_str() != Some(source_label))
+        {
             bail!(
                 "debug record {} has prompt_path {:?}, expected {:?}",
                 path.display(),
-                existing_prompt_path,
+                object.get("prompt_path"),
                 source_label
             );
         }
-        let records = object
-            .get_mut("records")
-            .and_then(Value::as_array_mut)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "debug record {} must contain a records array",
-                    path.display()
-                )
-            })?;
-        records.push(record);
+        object.insert("prompt_path".to_string(), json!(source_label));
         fs::write(&path, serde_json::to_string_pretty(&output)?)
             .with_context(|| format!("failed to write debug record {}", path.display()))
     })
@@ -1309,7 +1322,29 @@ fn build_chat_completions_request(
     }
 
     let mut seen_first_user = false;
+    let mut pending_tool_calls = Vec::new();
+    let flush_tool_calls =
+        |messages: &mut Vec<ChatCompletionRequestMessage>,
+         tool_calls: &mut Vec<ChatCompletionMessageToolCalls>| {
+            if tool_calls.is_empty() {
+                return;
+            }
+            #[allow(deprecated)]
+            messages.push(ChatCompletionRequestMessage::Assistant(
+                ChatCompletionRequestAssistantMessage {
+                    content: None,
+                    refusal: None,
+                    name: None,
+                    audio: None,
+                    tool_calls: Some(std::mem::take(tool_calls)),
+                    function_call: None,
+                },
+            ));
+        };
     for item in &input.items {
+        if item.item_type != agent_loop::TurnItemType::ToolCall {
+            flush_tool_calls(&mut messages, &mut pending_tool_calls);
+        }
         match item.item_type {
             agent_loop::TurnItemType::UserMessage => {
                 if !seen_first_user {
@@ -1354,23 +1389,13 @@ fn build_chat_completions_request(
                     .unwrap_or(&item.tool_name)
                     .to_string();
                 let call_id = item.tool_call_id.clone();
-                #[allow(deprecated)]
-                messages.push(ChatCompletionRequestMessage::Assistant(
-                    ChatCompletionRequestAssistantMessage {
-                        content: None,
-                        refusal: None,
-                        name: None,
-                        audio: None,
-                        tool_calls: Some(vec![ChatCompletionMessageToolCalls::Function(
-                            ChatCompletionMessageToolCall {
-                                id: call_id,
-                                function: FunctionCall {
-                                    name,
-                                    arguments: arguments.to_string(),
-                                },
-                            },
-                        )]),
-                        function_call: None,
+                pending_tool_calls.push(ChatCompletionMessageToolCalls::Function(
+                    ChatCompletionMessageToolCall {
+                        id: call_id,
+                        function: FunctionCall {
+                            name,
+                            arguments: arguments.to_string(),
+                        },
                     },
                 ));
             }
@@ -1401,6 +1426,7 @@ fn build_chat_completions_request(
             _ => {}
         }
     }
+    flush_tool_calls(&mut messages, &mut pending_tool_calls);
 
     messages.push(ChatCompletionRequestMessage::User(
         ChatCompletionRequestUserMessage {
@@ -1558,6 +1584,12 @@ async fn stream_responses_with_retry(
 
 fn is_transient_llm_error(error: &anyhow::Error) -> bool {
     let text = format!("{error:#}").to_ascii_lowercase();
+    // Provider request IDs are numeric and can accidentally contain "502" or
+    // "503". Quota exhaustion is unambiguously permanent, so reject it before
+    // scanning the free-form error text for transient status fragments.
+    if text.contains("insufficient_user_quota") || text.contains("额度已用完") {
+        return false;
+    }
     // Some gateways (e.g. the opencode free tier) wrap transient upstream
     // failures in a 400 invalid_request_error envelope. Evaluate explicit
     // transient signals first so they win over the permanent-error heuristic.
@@ -3269,7 +3301,7 @@ mod tests {
     fn insufficient_user_quota_is_not_transient() {
         let err = anyhow!(
             "Chat Completions stream failed: ApiError(ApiErrorResponse {{ status_code: 403, \
-             api_error: ApiError {{ message: \"quota exhausted\", type: Some(\"one_api_error\"), \
+             api_error: ApiError {{ message: \"quota exhausted (request id: 2026072711094651059170850217812)\", type: Some(\"one_api_error\"), \
              param: Some(\"\"), code: Some(\"insufficient_user_quota\") }} }})"
         );
         assert!(!is_transient_llm_error(&err));
@@ -3403,6 +3435,66 @@ mod tests {
     }
 
     #[test]
+    fn chat_completions_groups_consecutive_tool_calls_before_results() {
+        let calls = [
+            agent_loop::ToolCallRequest {
+                call_id: "call-summary".to_string(),
+                name: "read_phase_summaries".to_string(),
+                arguments: json!({"source_phases": [3, 4, 5]}),
+            },
+            agent_loop::ToolCallRequest {
+                call_id: "call-details".to_string(),
+                name: "read_phase_summary_details".to_string(),
+                arguments: json!({"artifact_ids": ["abc"]}),
+            },
+        ];
+        let results = [
+            agent_loop::ToolResultItem {
+                call_id: "call-summary".to_string(),
+                name: "read_phase_summaries".to_string(),
+                status: "completed".to_string(),
+                output: json!({"items": []}),
+                error: None,
+            },
+            agent_loop::ToolResultItem {
+                call_id: "call-details".to_string(),
+                name: "read_phase_summary_details".to_string(),
+                status: "completed".to_string(),
+                output: json!({"items": []}),
+                error: None,
+            },
+        ];
+        let input = agent_loop::ModelInput {
+            system_instruction: None,
+            items: vec![
+                agent_loop::TurnItem::user("portfolio role prompt"),
+                agent_loop::TurnItem::tool_call(&calls[0]),
+                agent_loop::TurnItem::tool_call(&calls[1]),
+                agent_loop::TurnItem::tool_result(&results[0], &TruncationConfig::default()),
+                agent_loop::TurnItem::tool_result(&results[1], &TruncationConfig::default()),
+            ],
+            available_tools: Vec::new(),
+            truncation: TruncationConfig::default(),
+        };
+
+        let request = super::build_chat_completions_request(
+            &base_settings(LlmRoute::ChatCompletions),
+            &input,
+            "produce final portfolio artifact",
+            false,
+        )
+        .unwrap();
+        let messages = serde_json::to_value(request).unwrap()["messages"].clone();
+
+        assert_eq!(messages[0]["role"], "assistant");
+        assert_eq!(messages[0]["tool_calls"].as_array().unwrap().len(), 2);
+        assert_eq!(messages[1]["role"], "tool");
+        assert_eq!(messages[1]["tool_call_id"], "call-summary");
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["tool_call_id"], "call-details");
+    }
+
+    #[test]
     fn role_end_context_paths_do_not_collide_for_parallel_turns() {
         let temp = tempfile::tempdir().unwrap();
         let mut settings = base_settings(LlmRoute::Responses);
@@ -3448,7 +3540,7 @@ mod tests {
     }
 
     #[test]
-    fn append_debug_llm_record_mirrors_prompt_path_and_appends_records() {
+    fn append_debug_llm_record_keeps_only_the_latest_request_and_response() {
         let temp = tempfile::tempdir().unwrap();
         let mut settings = base_settings(LlmRoute::Responses);
         settings.debug = true;
@@ -3500,14 +3592,12 @@ mod tests {
         let contents = std::fs::read_to_string(&path).unwrap();
         let output: Value = serde_json::from_str(&contents).unwrap();
         assert_eq!(output["prompt_path"], "prompts/phase1/technical.md");
-        let records = output["records"].as_array().unwrap();
-        assert_eq!(records.len(), 2);
-        assert_eq!(records[1]["kind"], "stream");
-        assert!(records[1].get("req").is_some());
-        assert!(records[1].get("resp").is_some());
-        assert!(records[1].get("elapsed_ms").is_some());
-        assert!(records[1].get("token").is_some());
-        assert!(contents.contains("\n  \"records\":"));
+        assert_eq!(output["kind"], "stream");
+        assert_eq!(output["req"]["messages"][0]["content"], "again");
+        assert_eq!(output["resp"]["id"], "resp_1");
+        assert!(output.get("elapsed_ms").is_some());
+        assert!(output.get("token").is_some());
+        assert!(output.get("records").is_none());
         assert!(!temp
             .path()
             .join("outputs/debug/phase1/technical.jsonl")
@@ -3515,7 +3605,7 @@ mod tests {
     }
 
     #[test]
-    fn append_debug_output_record_serializes_concurrent_appends() {
+    fn append_debug_output_record_serializes_concurrent_latest_writes() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().to_path_buf();
         let mut tasks = Vec::new();
@@ -3540,7 +3630,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(output["prompt_path"], "runtime");
-        assert_eq!(output["records"].as_array().unwrap().len(), 8);
+        assert!(output["req"]["id"].as_u64().is_some_and(|id| id < 8));
+        assert_eq!(output["resp"]["status"], "derived");
+        assert!(output.get("records").is_none());
     }
 
     #[test]
@@ -4413,5 +4505,24 @@ mod tests {
             super::select_fork_history(Vec::new(), source.clone()),
             source
         );
+    }
+
+    #[test]
+    fn new_fork_appends_one_topic_instruction_after_checkpoint_history() {
+        let steer = r#"{"kind":"seed_claims","topic_id":"topic-a"}"#.to_string();
+        let (user_input, fork_input, pending_steer) = super::prepare_steer_turn_inputs(
+            "BULL ROLE PROMPT",
+            Some(steer.clone()),
+            true,
+            true,
+            true,
+        );
+
+        assert!(user_input.is_empty());
+        assert_eq!(
+            fork_input,
+            Some(format!("BULL ROLE PROMPT\n\nSteer: {steer}"))
+        );
+        assert!(pending_steer.is_none());
     }
 }

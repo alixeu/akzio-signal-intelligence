@@ -1137,6 +1137,37 @@ mod tests {
     }
 
     #[test]
+    fn phase2_json_debug_files_retain_structured_messages() {
+        let temp = tempfile::tempdir().unwrap();
+        let path =
+            phase2_debug_output_path(2, "researcher.bull.initial", "bull_seed", Some("topic-a"))
+                .unwrap();
+        orchestrator_llm::append_debug_output_record(
+            temp.path(),
+            &path,
+            "prompts/phase2/researcher/debate.md",
+            json!({
+                "kind": "stream",
+                "req": {
+                    "messages": [
+                        {"role": "assistant", "content": "准备完毕"},
+                        {"role": "user", "content": "BULL ROLE PROMPT\n\nSteer: topic-a"}
+                    ]
+                },
+                "resp": {"status": "completed"}
+            }),
+        )
+        .unwrap();
+
+        let output: Value =
+            serde_json::from_str(&std::fs::read_to_string(temp.path().join(path)).unwrap())
+                .unwrap();
+        assert_eq!(output["req"]["messages"][0]["content"], "准备完毕");
+        assert_eq!(output["req"]["messages"][1]["role"], "user");
+        assert!(output.get("records").is_none());
+    }
+
+    #[test]
     fn context_window_full_is_not_transient_role_error() {
         let message = "LLM stream chunk failed: InvalidStatusCodeWithMessage(400, \
             \"{\\\"error\\\":{\\\"message\\\":\\\"Context window is full — reduce conversation history\\\",\\\"type\\\":\\\"invalid_request_error\\\"}}\")";

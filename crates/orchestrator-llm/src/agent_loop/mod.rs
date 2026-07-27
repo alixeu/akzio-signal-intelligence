@@ -787,6 +787,9 @@ fn validate_retrieval_policy(
             ));
         }
     }
+    if final_text.trim() == "准备完毕" {
+        return Ok(());
+    }
     let artifact = extract_json_value(final_text).map_err(|error| error.to_string())?;
     let mut referenced = BTreeSet::new();
     collect_evidence_ids(&artifact, &mut referenced);
@@ -2940,6 +2943,35 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("not read"));
+    }
+
+    #[test]
+    fn retrieval_policy_accepts_warmup_ready_after_required_query() {
+        let mut turn = Turn::new("turn", "session", "run", "mediator.topic", "");
+        let list = ToolCallRequest {
+            call_id: "list".to_string(),
+            name: tools::READ_PHASE_SUMMARIES_TOOL_NAME.to_string(),
+            arguments: json!({"source_phase": 1}),
+        };
+        turn.emitted_items.push(TurnItem::tool_call(&list));
+        turn.emitted_items.push(TurnItem::tool_result(
+            &ToolResultItem {
+                call_id: list.call_id,
+                name: list.name,
+                status: "completed".to_string(),
+                output: json!({"item_count": 0, "items": []}),
+                error: None,
+            },
+            &TruncationConfig::default(),
+        ));
+        let policy = RetrievalPolicy {
+            mandatory_summary_query: true,
+            required_source_phases: vec![1],
+            allow_empty_when_no_visible_summary: true,
+            ..Default::default()
+        };
+
+        assert!(validate_retrieval_policy(&turn, &policy, "准备完毕").is_ok());
     }
 
     #[test]

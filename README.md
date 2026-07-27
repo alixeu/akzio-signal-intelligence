@@ -43,8 +43,7 @@ graph TD
 
     subgraph "Phase 2 — 对抗辩论"
         TG[Topic Generator<br/>中立议题整理]
-        BW[Bull Warm-up<br/>预热长会话]
-        BEW[Bear Warm-up<br/>预热长会话]
+        WARM[共享 Warm-up<br/>多空预热长会话]
         BULL[Bull Researcher<br/>寻找上涨逻辑]
         BEAR[Bear Researcher<br/>寻找下跌风险]
         TC[每题独立 Topic Controller<br/>主题控制]
@@ -82,11 +81,10 @@ graph TD
     SOCIAL -. 待配置 .-> SQL
     SQL --> TA & NA
     SQL -. 待配置 .-> YA & SA
-    TA & NA --> TG & BW & BEW
-    YA & SA -. 配置后参与 .-> TG & BW & BEW
-    BW -->|会话 fork| BULL
-    BEW -->|会话 fork| BEAR
-    TG -->|topic fork| BULL & BEAR & TC
+    TA & NA --> TG & WARM
+    YA & SA -. 配置后参与 .-> TG & WARM
+    WARM -->|共享预热 fork| BULL & BEAR
+    TG -->|议题生成 fork| TC
     BULL & BEAR --> TC
     TC --> RED
     RED --> RM
@@ -100,15 +98,17 @@ graph TD
     MEM --> SQL
 ```
 
-Phase 2 begins with one shared Bull/Bear warm-up. Its `准备完毕` checkpoint
-continues into the neutral Topic Generator, which uses only the forked Phase 1
-summary index through `read_phase_summaries` and expands selected evidence with
-`read_phase_summary_details`; no Phase 1 artifact is embedded in its prompt.
+Phase 2 begins with one shared Bull/Bear warm-up and an independent neutral
+Topic Generator. The generator uses the Phase 1 summary index through
+`read_phase_summaries` and expands selected evidence with
+`read_phase_summary_details`; no warm-up history or Phase 1 artifact is embedded
+in its prompt.
 Rust rejects external-fact or schema-breaking output and retains a deterministic
-conflict fallback. Each selected topic then
-forks Bull, Bear, and Topic Controller conversations from the completed Topic
-Generator checkpoint. These forks continue the saved conversation rather than
-being reconstructed from a summary; warm-up itself never runs Phase Summary.
+conflict fallback. For each selected topic, Topic Controller forks from the
+completed Topic Generator turn, while Bull and Bear each fork from the shared
+`准备完毕` warm-up checkpoint and receive the full topic in their new user
+instruction. These forks continue saved conversations rather than being
+reconstructed from summaries; warm-up itself never runs Phase Summary.
 Topics run concurrently, while turns inside one topic remain controller-routed.
 When no material hinge exists, Phase 2 records a no-debate artifact and still
 advances to Phase 3.
@@ -280,15 +280,18 @@ historical reflection/retrieval. Mock runs skip Alpaca and all learning writes.
 `outputs/debug/` mirrors the runtime prompt path beneath `prompts/`: replace a
 prompt's `.md` suffix with `.json`. For example,
 `prompts/phase1/news_macro.md` writes
-`outputs/debug/phase1/news_macro.json`; shared prompts append their exchanges to
-the same file. Each such JSON file contains a `records` array, with one entry per
-exchange and its `req` and `resp` (including error or fallback responses).
+`outputs/debug/phase1/news_macro.json`. Each debug file keeps only the latest exchange at the top level,
+including its `req` and `resp` (including an error or fallback response). The
+latest request messages already contain the accumulated tool and checkpoint
+history needed to reproduce that model call.
 
 Phase 2 mirrors its checkpoint/fork topology instead of its prompt paths:
 `phase2-warmup-shared.json` and `topic-generator.json` sit directly under
 `outputs/debug/phase2/`; each `topic-{id}/` contains `topic-controller.json`,
-`debate-bull.json`, and `debate-bear.json`. Initial claims and later rebuttals
-append to the same side-specific debate file.
+`debate-bull.json`, and `debate-bear.json`. These files retain the structured
+top-level `prompt_path` / `req` / `resp` record. A later rebuttal
+replaces the side-specific file because its request already contains the prior
+debate history.
 
 Phase Summary is stored with the phase it summarized, rather than under
 `prompts/phase_summary/`: after a completed Phase `N` from 1 through 7, its

@@ -52,7 +52,7 @@ pub struct ExecArgs {
     pub jin10_refresh_lookback_hours: f64,
     #[arg(long)]
     pub mock: bool,
-    /// Write LLM/local reducer records to outputs/debug/phaseXX/{role}.jsonl.
+    /// Write inspectable LLM and local reducer records below outputs/debug/.
     #[arg(long)]
     pub debug: bool,
 }
