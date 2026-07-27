@@ -488,6 +488,40 @@ async fn summarize(
         .iter()
         .map(|unit| (unit.unit_key.clone(), unit.index_id.clone()))
         .collect::<BTreeMap<_, _>>();
+    // `run_phase*` may have just rehydrated its state projection from
+    // canonical Artifacts after a process crash.  Do not re-invoke a Summary
+    // Agent merely because that mutable projection was absent when the outer
+    // phase gate ran: completed Indexes are authoritative and already cover
+    // these fixed Rust-planned units.
+    let store = FileStore::open(store_root, FileStoreOptions::default())?;
+    let location = RunLocation::new(
+        state["current_date"]
+            .as_str()
+            .context("summary recovery requires current_date")?,
+        state["run_id"]
+            .as_str()
+            .context("summary recovery requires run_id")?,
+    )?;
+    let completed_ids = read_indexes(
+        &store,
+        Some(&location),
+        &IndexQuery {
+            kind: Some(IndexKind::PhaseSummary),
+            source_phase: Some(u8::try_from(phase).context("summary phase must fit u8")?),
+            limit: runtime.tool_managed.max_summary_units_per_phase,
+            ..Default::default()
+        },
+    )?
+    .indexes
+    .into_iter()
+    .map(|index| index.index_id)
+    .collect::<std::collections::BTreeSet<_>>();
+    if units
+        .iter()
+        .all(|unit| completed_ids.contains(&unit.index_id))
+    {
+        return Ok(summary_units);
+    }
     if state["mock"].as_bool().unwrap_or(false) {
         write_deterministic_phase_summary(
             store_root,
