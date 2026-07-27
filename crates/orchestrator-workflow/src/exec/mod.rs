@@ -804,6 +804,14 @@ async fn run_unit(
     model: Option<&str>,
     reasoning: Option<&str>,
 ) -> Result<Value> {
+    let completed_key = completed_unit_key(role, phase, kind, round, topic_id, ticker);
+    if let Some(artifact) = state
+        .get("_completed_units")
+        .and_then(|units| units.get(&completed_key))
+        .cloned()
+    {
+        return Ok(artifact);
+    }
     let mut scoped = state.clone();
     if let Some(ticker) = ticker {
         scoped["ticker"] = json!(ticker);
@@ -855,7 +863,48 @@ async fn run_unit(
     };
     state["_runtime_sessions"][runtime_session_key(role, kind, topic_id, round)] =
         json!({"session_id": session_id, "turn_id": turn_id});
+    state["_completed_units"][completed_key] = artifact.clone();
+    checkpoint_state(state)?;
     Ok(artifact)
+}
+
+fn completed_unit_key(
+    role: &str,
+    phase: i64,
+    kind: &str,
+    round: Option<i64>,
+    topic_id: Option<&str>,
+    ticker: Option<&str>,
+) -> String {
+    format!(
+        "p{phase}:{role}:{kind}:{}:{}:{}",
+        ticker.unwrap_or("aggregate"),
+        topic_id.unwrap_or("none"),
+        round.unwrap_or(0)
+    )
+}
+
+fn checkpoint_state(state: &mut Value) -> Result<()> {
+    let store_root = state
+        .get("store_root")
+        .and_then(Value::as_str)
+        .context("store_root is required for FileStore state checkpoint")?
+        .to_owned();
+    let current_date = state
+        .get("current_date")
+        .and_then(Value::as_str)
+        .context("current_date is required for FileStore state checkpoint")?
+        .to_owned();
+    let run_id = state
+        .get("run_id")
+        .and_then(Value::as_str)
+        .context("run_id is required for FileStore state checkpoint")?
+        .to_owned();
+    let location = RunLocation::new(current_date, run_id)?;
+    seal_state(state)?;
+    FileStore::open(store_root, FileStoreOptions::default())?
+        .write_json_value(&location.child_relative(Path::new("state.json"))?, state)?;
+    Ok(())
 }
 
 fn runtime_session_key(
