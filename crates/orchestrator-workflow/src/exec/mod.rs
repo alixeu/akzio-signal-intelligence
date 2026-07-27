@@ -14,7 +14,7 @@ use orchestrator_store::{
     RunManifest, RunManifestInit, RunStatus,
 };
 use serde_json::{json, Value};
-use std::{path::Path, time::Duration};
+use std::{collections::BTreeMap, path::Path, time::Duration};
 
 use crate::orchestration::{
     allocation::{compute_allocation_context, derive_guarded_allocation},
@@ -106,7 +106,8 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
     }
     if args.from_phase <= 1
         && args.to_phase >= 1
-        && (!phase_completed(&manifest, 1) || !has_phase_summary(&store, &location, 1)?)
+        && (!phase_completed(&manifest, 1)
+            || !has_required_phase_summaries(&store, &location, &state, &runtime, 1)?)
     {
         run_phase1(
             &mut state,
@@ -115,7 +116,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             args.reasoning_effort.as_deref(),
         )
         .await?;
-        summarize(
+        let summary_units = summarize(
             &store_root,
             &mut state,
             &runtime,
@@ -124,11 +125,13 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             args.reasoning_effort.as_deref(),
         )
         .await?;
+        manifest.summary_units.extend(summary_units);
         finish_phase(&store, &location, &mut manifest, &mut state, 1, "done")?;
     }
     if args.from_phase <= 2
         && args.to_phase >= 2
-        && (!phase_completed(&manifest, 2) || !has_phase_summary(&store, &location, 2)?)
+        && (!phase_completed(&manifest, 2)
+            || !has_required_phase_summaries(&store, &location, &state, &runtime, 2)?)
     {
         run_phase2(
             &store,
@@ -139,7 +142,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             args.reasoning_effort.as_deref(),
         )
         .await?;
-        summarize(
+        let summary_units = summarize(
             &store_root,
             &mut state,
             &runtime,
@@ -148,11 +151,13 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             args.reasoning_effort.as_deref(),
         )
         .await?;
+        manifest.summary_units.extend(summary_units);
         finish_phase(&store, &location, &mut manifest, &mut state, 2, "done")?;
     }
     if args.from_phase <= 3
         && args.to_phase >= 3
-        && (!phase_completed(&manifest, 3) || !has_phase_summary(&store, &location, 3)?)
+        && (!phase_completed(&manifest, 3)
+            || !has_required_phase_summaries(&store, &location, &state, &runtime, 3)?)
     {
         run_phase3(
             &mut state,
@@ -161,7 +166,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             args.reasoning_effort.as_deref(),
         )
         .await?;
-        summarize(
+        let summary_units = summarize(
             &store_root,
             &mut state,
             &runtime,
@@ -170,11 +175,13 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             args.reasoning_effort.as_deref(),
         )
         .await?;
+        manifest.summary_units.extend(summary_units);
         finish_phase(&store, &location, &mut manifest, &mut state, 3, "done")?;
     }
     if args.from_phase <= 4
         && args.to_phase >= 4
-        && (!phase_completed(&manifest, 4) || !has_phase_summary(&store, &location, 4)?)
+        && (!phase_completed(&manifest, 4)
+            || !has_required_phase_summaries(&store, &location, &state, &runtime, 4)?)
     {
         run_phase4(
             &mut state,
@@ -183,7 +190,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             args.reasoning_effort.as_deref(),
         )
         .await?;
-        summarize(
+        let summary_units = summarize(
             &store_root,
             &mut state,
             &runtime,
@@ -192,11 +199,13 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             args.reasoning_effort.as_deref(),
         )
         .await?;
+        manifest.summary_units.extend(summary_units);
         finish_phase(&store, &location, &mut manifest, &mut state, 4, "done")?;
     }
     if args.from_phase <= 5
         && args.to_phase >= 5
-        && (!phase_completed(&manifest, 5) || !has_phase_summary(&store, &location, 5)?)
+        && (!phase_completed(&manifest, 5)
+            || !has_required_phase_summaries(&store, &location, &state, &runtime, 5)?)
     {
         run_phase5(
             &mut state,
@@ -205,7 +214,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             args.reasoning_effort.as_deref(),
         )
         .await?;
-        summarize(
+        let summary_units = summarize(
             &store_root,
             &mut state,
             &runtime,
@@ -214,11 +223,13 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             args.reasoning_effort.as_deref(),
         )
         .await?;
+        manifest.summary_units.extend(summary_units);
         finish_phase(&store, &location, &mut manifest, &mut state, 5, "done")?;
     }
     if args.from_phase <= 6
         && args.to_phase >= 6
-        && (!phase_completed(&manifest, 6) || !has_phase_summary(&store, &location, 6)?)
+        && (!phase_completed(&manifest, 6)
+            || !has_required_phase_summaries(&store, &location, &state, &runtime, 6)?)
     {
         run_phase6(
             &mut state,
@@ -227,7 +238,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             args.reasoning_effort.as_deref(),
         )
         .await?;
-        summarize(
+        let summary_units = summarize(
             &store_root,
             &mut state,
             &runtime,
@@ -236,11 +247,13 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             args.reasoning_effort.as_deref(),
         )
         .await?;
+        manifest.summary_units.extend(summary_units);
         finish_phase(&store, &location, &mut manifest, &mut state, 6, "done")?;
     }
     if args.from_phase <= 7
         && args.to_phase >= 7
-        && (!phase_completed(&manifest, 7) || !has_phase_summary(&store, &location, 7)?)
+        && (!phase_completed(&manifest, 7)
+            || !has_required_phase_summaries(&store, &location, &state, &runtime, 7)?)
     {
         let allocation_artifact = run_phase7(&store, &location, &mut state, &runtime)?;
         record_manifest_artifact(
@@ -248,7 +261,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             &allocation_artifact,
             Path::new("artifacts/phase7/allocation.json"),
         )?;
-        summarize(
+        let summary_units = summarize(
             &store_root,
             &mut state,
             &runtime,
@@ -257,6 +270,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             args.reasoning_effort.as_deref(),
         )
         .await?;
+        manifest.summary_units.extend(summary_units);
         finish_phase(&store, &location, &mut manifest, &mut state, 7, "done")?;
     }
     if args.from_phase <= 8 && args.to_phase >= 8 && !phase_completed(&manifest, 8) {
@@ -416,19 +430,33 @@ fn phase_completed(manifest: &RunManifest, phase: u8) -> bool {
         == Some(&orchestrator_store::PhaseStatus::Completed)
 }
 
-fn has_phase_summary(store: &FileStore, location: &RunLocation, phase: u8) -> Result<bool> {
-    Ok(!read_indexes(
+fn has_required_phase_summaries(
+    store: &FileStore,
+    location: &RunLocation,
+    state: &Value,
+    runtime: &RuntimeConfig,
+    phase: u8,
+) -> Result<bool> {
+    let (_, units) = planned_summary_units(
+        state,
+        i64::from(phase),
+        runtime.tool_managed.max_summary_units_per_phase,
+    )?;
+    let completed = read_indexes(
         store,
         Some(location),
         &IndexQuery {
             kind: Some(IndexKind::PhaseSummary),
             source_phase: Some(phase),
-            limit: 1,
+            limit: runtime.tool_managed.max_summary_units_per_phase,
             ..Default::default()
         },
     )?
     .indexes
-    .is_empty())
+    .into_iter()
+    .map(|index| index.index_id)
+    .collect::<std::collections::BTreeSet<_>>();
+    Ok(units.iter().all(|unit| completed.contains(&unit.index_id)))
 }
 
 async fn summarize(
@@ -438,7 +466,16 @@ async fn summarize(
     phase: i64,
     model: Option<&str>,
     reasoning: Option<&str>,
-) -> Result<()> {
+) -> Result<BTreeMap<String, String>> {
+    let (_, units) = planned_summary_units(
+        state,
+        phase,
+        runtime.tool_managed.max_summary_units_per_phase,
+    )?;
+    let summary_units = units
+        .iter()
+        .map(|unit| (unit.unit_key.clone(), unit.index_id.clone()))
+        .collect::<BTreeMap<_, _>>();
     if state["mock"].as_bool().unwrap_or(false) {
         write_deterministic_phase_summary(
             store_root,
@@ -446,7 +483,7 @@ async fn summarize(
             phase,
             runtime.tool_managed.max_summary_units_per_phase,
         )?;
-        return Ok(());
+        return Ok(summary_units);
     }
     let (source_payload, units) = planned_summary_units(
         state,
@@ -477,7 +514,7 @@ async fn summarize(
         object.remove("_summary_unit");
         object.remove("_summary_source_payload");
     }
-    Ok(())
+    Ok(summary_units)
 }
 
 async fn run_phase0(

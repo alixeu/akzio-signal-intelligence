@@ -13,11 +13,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    read_jsonl_recover_tail, rebuild_manifest_from_finalized_artifacts, validate_content_hash_at,
-    validate_relative_path, ArtifactDraft, ContentHashDocument, DetailSection, FileSchemaKind,
-    FileStore, FinalizedArtifactRef, Index, IndexDetail, IndexKind, JsonlEvent, Result,
-    RunLocation, RunManifest, RunManifestInit, SafeSlug, SessionEvent, SessionEventType,
-    StoreError,
+    read_indexes, read_jsonl_recover_tail, rebuild_manifest_from_finalized_artifacts,
+    validate_content_hash_at, validate_relative_path, write_run_manifest, ArtifactDraft,
+    ContentHashDocument, DetailSection, FileSchemaKind, FileStore, FinalizedArtifactRef, Index,
+    IndexDetail, IndexKind, IndexQuery, JsonlEvent, Result, RunLocation, RunManifest,
+    RunManifestInit, SafeSlug, SessionEvent, SessionEventType, StoreError,
 };
 
 pub const INDEX_CATALOG_SCHEMA_VERSION: u32 = 1;
@@ -835,7 +835,35 @@ pub fn rebuild_run_manifest(store: &FileStore, init: RunManifestInit) -> Result<
         )?;
         references.insert(reference.artifact_id.clone(), reference);
     }
-    rebuild_manifest_from_finalized_artifacts(store, init, references.into_values())
+    let mut manifest =
+        rebuild_manifest_from_finalized_artifacts(store, init, references.into_values())?;
+    // `summary_units` is a convenience projection, never an authority.  The
+    // completed Index remains canonical; its Rust-owned unit key lets a
+    // missing manifest recover the exact fixed planner unit without asking a
+    // model or reconstructing identity from prose.
+    for index in read_indexes(
+        store,
+        Some(&location),
+        &IndexQuery {
+            kind: Some(IndexKind::PhaseSummary),
+            limit: 256,
+            ..Default::default()
+        },
+    )?
+    .indexes
+    {
+        if let Some(unit_key) = index
+            .authoritative_fields
+            .get("unit_key")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            manifest
+                .summary_units
+                .insert(unit_key.to_owned(), index.index_id);
+        }
+    }
+    write_run_manifest(store, &location, manifest)
 }
 
 /// Rebuild a derived Index catalog.  The returned document is also atomically

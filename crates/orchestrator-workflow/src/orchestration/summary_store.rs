@@ -141,7 +141,10 @@ fn write_unit(
         unit.source_phase, unit.unit_key
     );
     let confidence = 0.0;
-    let authoritative_fields = Map::from_iter([("source".to_owned(), fallback.clone())]);
+    let authoritative_fields = Map::from_iter([
+        ("source".to_owned(), fallback.clone()),
+        ("unit_key".to_owned(), Value::String(unit.unit_key.clone())),
+    ]);
     let scope = IndexScope {
         kind: IndexKind::PhaseSummary,
         location: Some(location.clone()),

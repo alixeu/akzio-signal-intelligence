@@ -880,7 +880,9 @@ fn file_store_phase_summary_index_runtime(
             .and_then(Value::as_object)
             .into_iter()
             .flat_map(|units| units.values())
-            .filter(|artifact| artifact.get("phase").and_then(Value::as_i64) == Some(i64::from(source_phase)))
+            .filter(|artifact| {
+                artifact.get("phase").and_then(Value::as_i64) == Some(i64::from(source_phase))
+            })
             .flat_map(canonical_source_refs)
             .collect();
     }

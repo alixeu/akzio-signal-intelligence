@@ -20,7 +20,7 @@ use orchestrator_store::{
     AppendIndexDetailInput, CreateIndexInput, DetailQuery, DetailSection, FileStore, Index,
     IndexKind, IndexQuery, IndexScope, RunLocation,
 };
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 /// Workflow-owned runtime plan for one Index tool unit. `created_at` is
 /// captured before the loop begins and therefore remains stable across repair
@@ -149,7 +149,10 @@ impl FileStoreIndexToolService {
             ticker: owned.ticker.clone(),
             topic_id: owned.topic_id.clone(),
             source_payload_hash: owned.source_payload_hash.clone(),
-            authoritative_fields: Default::default(),
+            authoritative_fields: Map::from_iter([(
+                "unit_key".to_owned(),
+                Value::String(owned.unit_key.clone()),
+            )]),
             created_at: self.plan.created_at.clone(),
         })
     }
