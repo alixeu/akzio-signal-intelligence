@@ -2479,6 +2479,7 @@ mod tests {
                 unit_key: "unit".to_owned(),
                 source_payload_hash: "hash".to_owned(),
                 index_id: "index".to_owned(),
+                authoritative_fields: Default::default(),
             },
             Default::default(),
             Arc::new(RejectingIndexService),

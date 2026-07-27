@@ -15,7 +15,7 @@ use orchestrator_llm::{
     truncation::TruncationConfig,
     AgentLoopOutput, AgentSettings, OutputMode, RoleLlmSettings, SteerLoopInput,
 };
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::time::{Duration, Instant};
 use std::{
     collections::BTreeSet,
@@ -496,6 +496,7 @@ fn file_store_domain_index_read_runtime(
         unit_key: format!("read-indexes:phase{phase}:{role}"),
         source_payload_hash,
         index_id: format!("read-only:phase{phase}:{role}"),
+        authoritative_fields: Map::new(),
     };
     let visibility = IndexReadVisibility {
         kinds: BTreeSet::from([IndexKind::PhaseSummary, IndexKind::Experience]),
@@ -809,6 +810,10 @@ fn file_store_historical_reflection_index_runtime(
         // This placeholder is never persisted: `create_index` replaces it
         // with hash(kind, pattern_key, ticker, source_phase).
         index_id: format!("experience-pending-task-{task_id}"),
+        authoritative_fields: Map::from_iter([(
+            "reflection_task".to_owned(),
+            Value::Object(task.clone()),
+        )]),
     };
     file_store_index_tool_runtime(
         store,
@@ -889,6 +894,18 @@ fn file_store_phase_summary_index_runtime(
     if source_refs.is_empty() {
         bail!("PhaseSummary source payload contains no canonical Artifact or Index ID")
     }
+    let unit_key = required("unit_key")?;
+    let source_payload_hash = required("source_payload_hash")?;
+    let authoritative_fields = Map::from_iter([
+        ("unit_key".to_owned(), Value::String(unit_key.clone())),
+        (
+            "source_payload".to_owned(),
+            state
+                .get("_summary_source_payload")
+                .cloned()
+                .context("PhaseSummary role requires Rust-planned _summary_source_payload")?,
+        ),
+    ]);
     let owned = IndexOwnedScope {
         run_id,
         source_run_id: None,
@@ -903,9 +920,10 @@ fn file_store_phase_summary_index_runtime(
             .get("topic_id")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned),
-        unit_key: required("unit_key")?,
-        source_payload_hash: required("source_payload_hash")?,
+        unit_key,
+        source_payload_hash,
         index_id: required("index_id")?,
+        authoritative_fields,
     };
     let store = FileStore::open(store_root, FileStoreOptions::default())?;
     file_store_index_tool_runtime(

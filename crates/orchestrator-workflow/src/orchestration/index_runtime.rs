@@ -20,7 +20,7 @@ use orchestrator_store::{
     AppendIndexDetailInput, CreateIndexInput, DetailQuery, DetailSection, FileStore, Index,
     IndexKind, IndexQuery, IndexScope, RunLocation,
 };
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 
 /// Workflow-owned runtime plan for one Index tool unit. `created_at` is
 /// captured before the loop begins and therefore remains stable across repair
@@ -138,6 +138,8 @@ impl FileStoreIndexToolService {
             bail!("Index command scope differs from the Rust-planned unit")
         }
         self.plan.validate_for(owned)?;
+        let mut authoritative_fields = owned.authoritative_fields.clone();
+        authoritative_fields.insert("unit_key".to_owned(), Value::String(owned.unit_key.clone()));
         Ok(IndexScope {
             kind: store_kind(owned.kind),
             location: self.plan.write_location.clone(),
@@ -149,10 +151,7 @@ impl FileStoreIndexToolService {
             ticker: owned.ticker.clone(),
             topic_id: owned.topic_id.clone(),
             source_payload_hash: owned.source_payload_hash.clone(),
-            authoritative_fields: Map::from_iter([(
-                "unit_key".to_owned(),
-                Value::String(owned.unit_key.clone()),
-            )]),
+            authoritative_fields,
             created_at: self.plan.created_at.clone(),
         })
     }
@@ -199,6 +198,7 @@ fn same_experience_scope_except_index(left: &IndexOwnedScope, right: &IndexOwned
         && left.topic_id == right.topic_id
         && left.unit_key == right.unit_key
         && left.source_payload_hash == right.source_payload_hash
+        && left.authoritative_fields == right.authoritative_fields
 }
 
 impl IndexToolService for FileStoreIndexToolService {
@@ -373,6 +373,7 @@ mod tests {
             unit_key: "phase1:technical:QQQ".to_owned(),
             source_payload_hash: "sha256:source".to_owned(),
             index_id: "index-1".to_owned(),
+            authoritative_fields: Default::default(),
         }
     }
 

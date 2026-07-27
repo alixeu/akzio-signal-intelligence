@@ -13,7 +13,7 @@ use std::{
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 use super::{api_tool_name, ToolDefinition};
 use crate::agent_loop::ToolRuntimeTurnContext;
@@ -147,6 +147,9 @@ pub struct IndexOwnedScope {
     pub topic_id: Option<String>,
     pub unit_key: String,
     pub source_payload_hash: String,
+    /// Rust-selected source facts copied into the finalized Index header.
+    /// Model tool arguments can never replace this provenance.
+    pub authoritative_fields: Map<String, Value>,
     /// The deterministic Index id assigned by Rust for this one Summary Unit,
     /// or by the Experience key rule. It is intentionally not a tool argument.
     pub index_id: String,
@@ -1040,6 +1043,7 @@ mod tests {
             unit_key: "phase2-final".to_owned(),
             source_payload_hash: "source-hash".to_owned(),
             index_id: "index-1".to_owned(),
+            authoritative_fields: Default::default(),
         }
     }
 
