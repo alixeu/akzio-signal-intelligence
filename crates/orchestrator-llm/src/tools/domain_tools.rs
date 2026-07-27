@@ -730,7 +730,7 @@ pub fn definition(name: &str) -> Option<ToolDefinition> {
             ]),
         ),
         APPEND_ANALYST_EVIDENCE => (
-            "Append one Canonical Contract v2 source-backed evidence item for an assessed ticker. evidence_type is required; do not use a legacy `type` field.",
+            "Append one Canonical Contract v2 source-backed evidence item for an assessed ticker. `evidence` MUST be a JSON object matching this schema, never a serialized JSON string. evidence_type is required; do not use a legacy `type` field.",
             json!({
                 "ticker":{"type":"string"},
                 "evidence":{

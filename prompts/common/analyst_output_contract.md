@@ -10,6 +10,7 @@
 - 对每个允许的 ticker 调用 `set_analyst_assessment`；用 `append_analyst_evidence`、`append_analyst_data_gap` 和 `set_analyst_invalidation` 补充依据，最后调用 `finalize_analyst_report`。这是唯一的产物写入路径。
 - `id`、`role`、Artifact envelope、ticker scope 与证据可见性全部由运行时管理，绝不在工具参数或自然语言中覆盖。
 - 每次 `append_analyst_evidence` 的 `evidence_ref` 必须逐字引用本轮已完成读取工具返回的 `subject_id`；不得自造、改写或概括证据 ID。
+- `append_analyst_evidence.evidence` 必须直接传对象（例如 `{"claim":"…","evidence_type":"fact",…}`），绝不能把该对象再编码成 JSON 字符串。
 - 每个 ticker 必须有 assessment；`report` 为中文非空段落，且只解释通过工具写入的结论。
 - 一旦 finalize 成功立即停止；不要输出 JSON、代码块或最终 Assistant 文本。
 - `direction` 只能为 `bullish`、`bearish`、`neutral`、`mixed` 或 `unobserved`；不得输出组合标签（例如 `neutral_bullish`）。无可用样本时使用 `direction="unobserved"`、`confidence=0.0`。`unobserved` 仅用于诊断，不代表 neutral，不得参与概率合成。
