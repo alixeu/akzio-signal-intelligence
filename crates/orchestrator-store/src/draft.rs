@@ -515,14 +515,21 @@ impl ArtifactDraft {
                 }
             }
             DraftLifecycle::Completed => {
-                if self.finalized_artifact.is_none()
+                let warmup_completed_without_artifact = matches!(
+                    &self.state,
+                    ArtifactDraftState::ResearcherWarmup(ResearcherWarmupDraft {
+                        finalized: true,
+                        ..
+                    })
+                ) && self.finalized_artifact.is_none();
+                if (!warmup_completed_without_artifact && self.finalized_artifact.is_none())
                     || self.pending_artifact.is_some()
                     || self.failure.is_some()
                     || self.superseded_by.is_some()
                 {
                     return Err(StoreError::InvalidDocument {
                         kind: "artifact draft",
-                        message: "completed lifecycle requires exactly a finalized artifact"
+                        message: "completed lifecycle requires a finalized artifact, except a terminal researcher warmup"
                             .to_owned(),
                     });
                 }
@@ -806,6 +813,73 @@ pub fn apply_typed_draft_command<T: Serialize>(
         draft.updated_at = created_at;
         let draft = write_draft(store, location, &relative, draft)?;
         Ok(DraftAppendOutcome::Appended { draft, receipt })
+    })
+}
+
+/// Apply the one terminal command whose successful outcome deliberately has
+/// no business Artifact: Phase 2 researcher warmup. It preserves the normal
+/// receipt/idempotency and single-lock guarantees while allowing Rust to mark
+/// the Draft lifecycle completed in the same atomic write.
+#[allow(clippy::too_many_arguments)]
+pub fn complete_terminal_draft_without_artifact<T: Serialize>(
+    store: &FileStore,
+    location: &RunLocation,
+    scope: &ArtifactScope,
+    tool_name: impl Into<String>,
+    normalized_parameters: &T,
+    result_id: impl Into<String>,
+    created_at: impl Into<String>,
+    mutate: impl FnOnce(&mut ArtifactDraftState) -> Result<()>,
+) -> Result<DraftAppendOutcome> {
+    if scope.profile != DraftProfile::ResearcherWarmup {
+        return Err(StoreError::InvalidDocument {
+            kind: "terminal draft",
+            message: "only researcher_warmup may complete without an artifact".to_owned(),
+        });
+    }
+    let tool_name = tool_name.into();
+    let result_id = result_id.into();
+    let created_at = created_at.into();
+    if tool_name.is_empty() || result_id.is_empty() || created_at.is_empty() {
+        return Err(StoreError::InvalidDocument {
+            kind: "terminal draft",
+            message: "tool_name, result_id, and created_at must not be empty".to_owned(),
+        });
+    }
+    let parameters = serde_json::to_value(normalized_parameters)
+        .map_err(|source| StoreError::JsonSerialize { source })?;
+    let key = receipt_hash(&tool_name, &parameters)?;
+    let relative = draft_relative(location, scope)?;
+    let lock_relative = draft_unit_relative(location, scope)?.join("lifecycle.lock");
+    store.with_exclusive_lock(&lock_relative, || {
+        let mut draft = read_draft(store, location, &relative, scope.profile)?;
+        match draft.lifecycle {
+            DraftLifecycle::Completed => {
+                let receipt = draft.write_receipts.get(&key).cloned().ok_or_else(|| {
+                    StoreError::InvalidDocument {
+                        kind: "terminal draft",
+                        message: "completed researcher warmup has no matching terminal receipt"
+                            .to_owned(),
+                    }
+                })?;
+                return Ok(DraftAppendOutcome::AlreadyApplied { draft, receipt });
+            }
+            DraftLifecycle::Draft => {}
+            other => return Err(invalid_transition(other, DraftLifecycle::Completed)),
+        }
+        mutate(&mut draft.state)?;
+        let receipt = DraftWriteReceipt {
+            normalized_parameters_hash: key.clone(),
+            tool_name,
+            result_id,
+            created_at: created_at.clone(),
+        };
+        draft.write_receipts.insert(key.clone(), receipt.clone());
+        draft.lifecycle = DraftLifecycle::Completed;
+        draft.revision += 1;
+        draft.updated_at = created_at;
+        let draft = write_draft(store, location, &relative, draft)?;
+        Ok(DraftAppendOutcome::Appended { receipt, draft })
     })
 }
 

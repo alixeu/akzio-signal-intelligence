@@ -6,8 +6,9 @@ use orchestrator_core::{
 };
 use orchestrator_store::{
     content_hash, list_run_locations, read_indexes, read_learning_record, read_run_manifest,
-    write_learning_record, write_run_manifest, FileStore, FileStoreOptions, IndexKind, IndexQuery,
-    LearningKind, LearningRecord, RunLocation, RunManifest, RunManifestInit, RunStatus,
+    rebuild_run_manifest, write_learning_record, write_run_manifest, FileStore, FileStoreOptions,
+    FinalizedArtifactRef, IndexKind, IndexQuery, LearningKind, LearningRecord, RunLocation,
+    RunManifest, RunManifestInit, RunStatus,
 };
 use serde_json::{json, Value};
 use std::{path::Path, time::Duration};
@@ -212,7 +213,12 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         .await?;
     }
     if args.from_phase <= 7 && args.to_phase >= 7 && !phase_completed(&manifest, 7) {
-        run_phase7(&store, &location, &mut state, &runtime)?;
+        let allocation_artifact = run_phase7(&store, &location, &mut state, &runtime)?;
+        record_manifest_artifact(
+            &mut manifest,
+            &allocation_artifact,
+            Path::new("artifacts/phase7/allocation.json"),
+        )?;
         finish_phase(&store, &location, &mut manifest, &mut state, 7, "done")?;
         summarize(
             &store_root,
@@ -229,6 +235,22 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         finish_phase(&store, &location, &mut manifest, &mut state, 8, "done")?;
     }
 
+    // Artifact files are the recovery authority. At successful run completion
+    // project every finalized file back into the lightweight manifest without
+    // treating state or sessions as proof of completion.
+    let rebuilt = rebuild_run_manifest(
+        &store,
+        RunManifestInit {
+            location: location.clone(),
+            workflow_version: manifest.workflow_version.clone(),
+            prompt_versions: manifest.prompt_versions.clone(),
+            git_sha: manifest.git_sha.clone(),
+            config_hash: manifest.config_hash.clone(),
+            authority_registry_hash: manifest.authority_registry_hash.clone(),
+            created_at: manifest.created_at.clone(),
+        },
+    )?;
+    manifest.artifacts = rebuilt.artifacts;
     manifest.status = RunStatus::Completed;
     manifest.degraded = state["degraded"].as_bool().unwrap_or(false);
     manifest.completed_at = Some(Utc::now().to_rfc3339());
@@ -740,12 +762,17 @@ async fn run_phase2(
         state["topic_debate_states"][&topic_id]["controller_artifact"] = controller.clone();
         controllers.insert(topic_id, controller);
     }
+    let source_payload_hash = content_hash(&Value::Object(controllers.clone()))?;
     let reducer = json!({
         "schema_version": 1,
-        "artifact_id": format!("phase2-final-reducer-{}", &content_hash(&Value::Object(controllers.clone()))?[7..31]),
+        "artifact_id": format!("artifact-sha256:{}", &source_payload_hash[7..31]),
         "run_id": state["run_id"],
         "phase": 2,
         "role": "rust.phase2_final_reducer",
+        "profile": "rust_phase2_final_reducer",
+        "unit_key": "phase2:final-reducer:aggregate",
+        "source_payload_hash": source_payload_hash,
+        "evidence_refs": [],
         "controllers": controllers,
         "created_at": Utc::now().to_rfc3339(),
         "content_hash": "",
@@ -882,7 +909,7 @@ fn run_phase7(
     location: &RunLocation,
     state: &mut Value,
     runtime: &RuntimeConfig,
-) -> Result<()> {
+) -> Result<Value> {
     let context = compute_allocation_context(state, &runtime.allocation)?;
     let allocation = derive_guarded_allocation(state, &context, &runtime.allocation)
         .unwrap_or_else(|error| {
@@ -894,17 +921,71 @@ fn run_phase7(
         });
     state["allocation_context"] = context;
     state["portfolio_allocation"] = allocation.clone();
+    let source_payload_hash = content_hash(&json!({
+        "allocation_context": state["allocation_context"],
+        "portfolio_allocation": allocation,
+    }))?;
+    let artifact_id = format!(
+        "artifact-sha256:{}",
+        source_payload_hash
+            .strip_prefix("sha256:")
+            .unwrap_or(&source_payload_hash)
+            .chars()
+            .take(24)
+            .collect::<String>()
+    );
+    let mut artifact = json!({
+        "schema_version": 1,
+        "artifact_id": artifact_id,
+        "run_id": state["run_id"],
+        "phase": 7,
+        "role": "rust.allocation",
+        "profile": "rust_allocation",
+        "unit_key": "phase7:allocation:aggregate",
+        "source_payload_hash": source_payload_hash,
+        "evidence_refs": [],
+        "allocation": allocation,
+        "created_at": Utc::now().to_rfc3339(),
+        "content_hash": "",
+    });
+    let hash = content_hash(&artifact)?;
+    artifact["content_hash"] = Value::String(hash);
     store.write_json_value(
         &location.child_relative(Path::new("artifacts/phase7/allocation.json"))?,
-        &json!({
-            "schema_version": 1,
-            "run_id": state["run_id"],
-            "phase": 7,
-            "role": "rust.allocation",
-            "allocation": allocation,
-            "created_at": Utc::now().to_rfc3339(),
-        }),
+        &artifact,
     )?;
+    state["allocation_artifact"] = artifact.clone();
+    state["allocation_result"] = artifact.clone();
+    Ok(artifact)
+}
+
+fn record_manifest_artifact(
+    manifest: &mut RunManifest,
+    artifact: &Value,
+    relative_path: &Path,
+) -> Result<()> {
+    let required = |field: &str| {
+        artifact
+            .get(field)
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .with_context(|| format!("canonical artifact {field} is required"))
+    };
+    let phase = artifact
+        .get("phase")
+        .and_then(Value::as_u64)
+        .and_then(|value| u8::try_from(value).ok())
+        .context("canonical artifact phase is required")?;
+    manifest.record_finalized_artifact(FinalizedArtifactRef::new(
+        required("artifact_id")?,
+        relative_path,
+        phase,
+        required("role")?,
+        required("profile")?,
+        required("unit_key")?,
+        required("source_payload_hash")?,
+        required("created_at")?,
+    )?)?;
     Ok(())
 }
 

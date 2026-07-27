@@ -9,10 +9,11 @@ use std::{collections::BTreeSet, path::PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    apply_typed_draft_command, content_hash, create_or_recover_draft, finalize_draft_atomic,
-    read_draft_for_scope, ArtifactDraftState, ArtifactScope, ContentHashDocument, DebateClaimDraft,
-    DebateResponseDraftEntry, DraftAppendOutcome, DraftProfile, FileStore, FinalizableArtifact,
-    FinalizeDraftOutcome, Phase2TopicDraft, Result, RunLocation, SafeSlug, StoreError, Versioned,
+    apply_typed_draft_command, complete_terminal_draft_without_artifact, content_hash,
+    create_or_recover_draft, finalize_draft_atomic, read_draft_for_scope, ArtifactDraftState,
+    ArtifactScope, ContentHashDocument, DebateClaimDraft, DebateResponseDraftEntry,
+    DraftAppendOutcome, DraftProfile, FileStore, FinalizableArtifact, FinalizeDraftOutcome,
+    Phase2TopicDraft, Result, RunLocation, SafeSlug, StoreError, Versioned,
 };
 
 pub const PHASE2_ARTIFACT_SCHEMA_VERSION: u32 = 1;
@@ -241,10 +242,14 @@ impl Phase2DraftService {
                 message: "warmup requires at least one completed evidence read".to_owned(),
             });
         }
-        self.apply(
+        complete_terminal_draft_without_artifact(
+            &self.store,
+            &self.location,
+            &self.scope,
             "finalize_researcher_warmup",
             &WarmupCommand {},
             "warmup-terminal",
+            self.created_at.clone(),
             |state| {
                 let ArtifactDraftState::ResearcherWarmup(draft) = state else {
                     return profile_state_error("researcher_warmup");
@@ -858,7 +863,7 @@ struct SoftControlCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DraftProfile, FileStoreOptions};
+    use crate::{DraftLifecycle, DraftProfile, FileStoreOptions};
     use tempfile::TempDir;
 
     fn service(
@@ -951,7 +956,14 @@ mod tests {
     #[test]
     fn warmup_has_terminal_marker_but_no_business_artifact() {
         let (_temp, service) = service(DraftProfile::ResearcherWarmup, None, None, Some(0));
-        service.finalize_researcher_warmup().unwrap();
+        let first = service.finalize_researcher_warmup().unwrap();
+        assert!(matches!(first, DraftAppendOutcome::Appended { .. }));
+        let second = service.finalize_researcher_warmup().unwrap();
+        assert!(matches!(second, DraftAppendOutcome::AlreadyApplied { .. }));
+        let draft =
+            read_draft_for_scope(&service.store, &service.location, &service.scope).unwrap();
+        assert_eq!(draft.lifecycle, DraftLifecycle::Completed);
+        assert!(draft.finalized_artifact.is_none());
         assert!(service.finalize().is_err());
     }
 }

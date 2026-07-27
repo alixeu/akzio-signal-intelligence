@@ -6,7 +6,8 @@ use futures::{stream, StreamExt};
 use orchestrator_core::{default_project_root, ToolManagedProfile};
 use orchestrator_llm::{
     agent_loop::{
-        FileStoreSessionRuntime, ModelStreamResult, RetrievalPolicy, SessionRuntimeSpec, TokenUsage,
+        FileStoreSessionRuntime, ModelStreamResult, RetrievalPolicy, SessionRuntimeSpec,
+        TokenUsage, ToolResultItem, Turn,
     },
     llm_judge::JudgeConfig,
     mock_role_artifact, run_agent_loop_with_metrics, run_agent_steer_loop_with_metrics,
@@ -1503,7 +1504,7 @@ fn mock_index_tool_managed_output(
     binding: orchestrator_llm::tools::index_tools::IndexToolRuntimeBinding,
 ) -> Result<AgentLoopOutput> {
     use orchestrator_llm::{
-        agent_loop::{ToolResultItem, ToolRuntimeTurnContext},
+        agent_loop::ToolRuntimeTurnContext,
         tools::index_tools::{APPEND_INDEX_DETAIL_NAME, CREATE_INDEX_NAME, FINALIZE_INDEX_NAME},
     };
 
@@ -1543,18 +1544,20 @@ fn mock_index_tool_managed_output(
         .get("artifact")
         .cloned()
         .context("mock Index finalizer did not return an artifact")?;
+    let terminal_result = ToolResultItem {
+        call_id: "mock-finalize-index".to_owned(),
+        name: FINALIZE_INDEX_NAME.to_owned(),
+        status: "completed".to_owned(),
+        output: terminal,
+        error: None,
+    };
+    let (session_id, turn_id) = persist_mock_terminal(&job, &terminal_result)?;
     Ok(AgentLoopOutput {
         artifact: artifact.clone(),
-        terminal_tool_result: Some(ToolResultItem {
-            call_id: "mock-finalize-index".to_owned(),
-            name: FINALIZE_INDEX_NAME.to_owned(),
-            status: "completed".to_owned(),
-            output: terminal,
-            error: None,
-        }),
+        terminal_tool_result: Some(terminal_result),
         metrics: ModelStreamResult::default(),
-        turn_id: "mock-reflection-finalize".to_owned(),
-        session_id: format!("{}:mock", job.role),
+        turn_id,
+        session_id,
     })
 }
 
@@ -1562,7 +1565,6 @@ fn mock_domain_tool_managed_output(
     job: RoleJob,
     binding: orchestrator_llm::tools::domain_tools::DomainToolRuntimeBinding,
 ) -> Result<AgentLoopOutput> {
-    use orchestrator_llm::agent_loop::ToolResultItem;
     use orchestrator_llm::tools::domain_tools::{
         ADD_AGREED_FACT, APPEND_ANALYST_EVIDENCE, APPEND_BINDING_RISK_CONTROL, CREATE_DEBATE_CLAIM,
         CREATE_PHASE2_TOPIC, FINALIZE_ANALYST_REPORT, FINALIZE_DEBATE_RESPONSE,
@@ -1754,32 +1756,63 @@ fn mock_domain_tool_managed_output(
         .get("artifact")
         .cloned()
         .context("mock domain finalizer did not return a canonical artifact")?;
+    let terminal_result = ToolResultItem {
+        call_id: "mock-finalize".to_owned(),
+        name: match profile {
+            ToolManagedProfile::AnalystReport => FINALIZE_ANALYST_REPORT,
+            ToolManagedProfile::ResearchDecision => FINALIZE_RESEARCH_DECISION,
+            ToolManagedProfile::TradeIntent => FINALIZE_TRADE_INTENT,
+            ToolManagedProfile::RiskReview => FINALIZE_RISK_REVIEW,
+            ToolManagedProfile::PortfolioDecision => FINALIZE_PORTFOLIO_DECISION,
+            ToolManagedProfile::ResearcherWarmup => FINALIZE_RESEARCHER_WARMUP,
+            ToolManagedProfile::TopicGeneration => FINALIZE_TOPIC_GENERATION,
+            ToolManagedProfile::DebateSeed => FINALIZE_DEBATE_SEED,
+            ToolManagedProfile::DebateResponse => FINALIZE_DEBATE_RESPONSE,
+            ToolManagedProfile::TopicControl => FINALIZE_TOPIC_CONTROL,
+            _ => unreachable!(),
+        }
+        .to_owned(),
+        status: "completed".to_owned(),
+        output: json!({"terminal": true, "artifact": artifact.clone()}),
+        error: None,
+    };
+    let (session_id, turn_id) = persist_mock_terminal(&job, &terminal_result)?;
     Ok(AgentLoopOutput {
         artifact: artifact.clone(),
-        terminal_tool_result: Some(ToolResultItem {
-            call_id: "mock-finalize".to_owned(),
-            name: match profile {
-                ToolManagedProfile::AnalystReport => FINALIZE_ANALYST_REPORT,
-                ToolManagedProfile::ResearchDecision => FINALIZE_RESEARCH_DECISION,
-                ToolManagedProfile::TradeIntent => FINALIZE_TRADE_INTENT,
-                ToolManagedProfile::RiskReview => FINALIZE_RISK_REVIEW,
-                ToolManagedProfile::PortfolioDecision => FINALIZE_PORTFOLIO_DECISION,
-                ToolManagedProfile::ResearcherWarmup => FINALIZE_RESEARCHER_WARMUP,
-                ToolManagedProfile::TopicGeneration => FINALIZE_TOPIC_GENERATION,
-                ToolManagedProfile::DebateSeed => FINALIZE_DEBATE_SEED,
-                ToolManagedProfile::DebateResponse => FINALIZE_DEBATE_RESPONSE,
-                ToolManagedProfile::TopicControl => FINALIZE_TOPIC_CONTROL,
-                _ => unreachable!(),
-            }
-            .to_owned(),
-            status: "completed".to_owned(),
-            output: json!({"terminal": true, "artifact": artifact}),
-            error: None,
-        }),
+        terminal_tool_result: Some(terminal_result),
         metrics: ModelStreamResult::default(),
-        turn_id: String::new(),
-        session_id: String::new(),
+        turn_id,
+        session_id,
     })
+}
+
+/// Mock finalizers use the same FileStore session record as live finalizers.
+/// This prevents deterministic test artifacts from looking like unaudited
+/// direct writes to Store Doctor or fork recovery.
+fn persist_mock_terminal(job: &RoleJob, terminal: &ToolResultItem) -> Result<(String, String)> {
+    let session = job
+        .session_runtime
+        .as_ref()
+        .context("ToolManaged mock role is missing its FileStore session runtime")?;
+    let session_id = session.manifest().session_id.clone();
+    let turn_id = format!(
+        "mock-finalize:{}:{}:{}:{}",
+        job.kind,
+        job.tickers.join(","),
+        job.topic_id.as_deref().unwrap_or("aggregate"),
+        job.round.unwrap_or(0),
+    );
+    let mut turn = Turn::new(
+        &turn_id,
+        &session_id,
+        job.tools.run_id.as_deref().unwrap_or_default(),
+        &job.role,
+        "",
+    );
+    turn.phase = Some(job.phase);
+    turn.terminal_tool_result = Some(terminal.clone());
+    session.append_terminal(&turn, terminal, Utc::now().to_rfc3339())?;
+    Ok((session_id, turn_id))
 }
 
 async fn execute_steer_role_job(

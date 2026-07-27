@@ -508,9 +508,29 @@ fn terminal_ids_for_run(
                     .into_iter()
                     .filter(|event| event.event_type == SessionEventType::Terminal)
                 {
-                    for key in ["artifact_id", "index_id"] {
-                        if let Some(value) = event.payload.get(key).and_then(Value::as_str) {
-                            ids.insert(value.to_owned());
+                    // A terminal event persists the complete Rust-owned
+                    // ToolResultItem.  Its canonical result lives under
+                    // output.artifact (domain) or output.index (Index), not
+                    // at the event payload's top level.
+                    for result in [
+                        Some(&event.payload),
+                        event.payload.get("output"),
+                        event
+                            .payload
+                            .get("output")
+                            .and_then(|output| output.get("artifact")),
+                        event
+                            .payload
+                            .get("output")
+                            .and_then(|output| output.get("index")),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    {
+                        for key in ["artifact_id", "index_id"] {
+                            if let Some(value) = result.get(key).and_then(Value::as_str) {
+                                ids.insert(value.to_owned());
+                            }
                         }
                     }
                 }
@@ -753,6 +773,7 @@ fn resolve_source_refs(store: &FileStore, files: &[PathBuf], report: &mut StoreD
 pub fn rebuild_run_manifest(store: &FileStore, init: RunManifestInit) -> Result<RunManifest> {
     let location = init.location.clone();
     let draft_root = location.relative_root().join("drafts");
+    let artifact_root = location.relative_root().join("artifacts");
     let files = collect_files(store.root())?;
     let mut references = BTreeMap::<String, FinalizedArtifactRef>::new();
     for relative in files.iter().filter(|path| {
@@ -767,6 +788,52 @@ pub fn rebuild_run_manifest(store: &FileStore, init: RunManifestInit) -> Result<
         if let Some(reference) = draft.finalized_artifact {
             references.insert(reference.artifact_id.clone(), reference);
         }
+    }
+    // Rust-owned phases (notably allocation) do not have a Draft. Their
+    // finalized canonical files are still more authoritative than a stale
+    // manifest, so rebuild them from the same required envelope fields.
+    for relative in files.iter().filter(|path| {
+        path.starts_with(&artifact_root)
+            && path
+                .extension()
+                .is_some_and(|extension| extension == "json")
+    }) {
+        let value = store.read_json_value(relative)?;
+        let artifact_relative = relative
+            .strip_prefix(location.relative_root())
+            .map_err(|_| StoreError::InvalidDocument {
+                kind: "artifact path",
+                message: format!("artifact is outside run root: {}", relative.display()),
+            })?;
+        let required = |field: &str| {
+            value
+                .get(field)
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| StoreError::InvalidDocument {
+                    kind: "canonical artifact",
+                    message: format!("{} is required at {}", field, relative.display()),
+                })
+        };
+        let phase = value
+            .get("phase")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u8::try_from(value).ok())
+            .ok_or_else(|| StoreError::InvalidDocument {
+                kind: "canonical artifact",
+                message: format!("phase is required at {}", relative.display()),
+            })?;
+        let reference = FinalizedArtifactRef::new(
+            required("artifact_id")?,
+            artifact_relative,
+            phase,
+            required("role")?,
+            required("profile")?,
+            required("unit_key")?,
+            required("source_payload_hash")?,
+            required("created_at")?,
+        )?;
+        references.insert(reference.artifact_id.clone(), reference);
     }
     rebuild_manifest_from_finalized_artifacts(store, init, references.into_values())
 }
@@ -950,6 +1017,7 @@ mod tests {
         profile: String,
         unit_key: String,
         source_payload_hash: String,
+        created_at: String,
         content_hash: String,
     }
 
@@ -1085,6 +1153,7 @@ mod tests {
                 profile: "analyst_report".to_owned(),
                 unit_key: "QQQ".to_owned(),
                 source_payload_hash: "source".to_owned(),
+                created_at: "2026-07-27T00:01:00Z".to_owned(),
                 content_hash: String::new(),
             },
             "2026-07-27T00:01:00Z",

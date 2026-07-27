@@ -14,7 +14,7 @@ use orchestrator_store::{
     RunLocation,
 };
 use serde_json::{json, Map, Value};
-use std::path::Path;
+use std::{collections::BTreeSet, path::Path};
 
 use super::{
     lifecycle::tickers_from_state,
@@ -172,13 +172,41 @@ fn write_unit(
             scope: scope.clone(),
             section: DetailSection::Analysis,
             detail: compact_detail(&fallback),
-            source_refs: vec![format!(
-                "artifact:phase{}:{}",
-                unit.source_phase, unit.unit_key
-            )],
+            source_refs: canonical_source_refs(&fallback),
         },
     )?;
     finalize_index(store, &scope).map_err(Into::into)
+}
+
+/// Detail references are authoritative IDs from the finalized payload, never
+/// a reconstructed logical name.  The latter looked useful in legacy SQLite
+/// rows but cannot be resolved after a restart and would create a second
+/// authority beside the canonical Artifact file.
+fn canonical_source_refs(value: &Value) -> Vec<String> {
+    let mut refs = BTreeSet::new();
+    collect_canonical_source_refs(value, &mut refs);
+    refs.into_iter().collect()
+}
+
+fn collect_canonical_source_refs(value: &Value, refs: &mut BTreeSet<String>) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                collect_canonical_source_refs(value, refs);
+            }
+        }
+        Value::Object(values) => {
+            for (key, value) in values {
+                if matches!(key.as_str(), "artifact_id" | "index_id") {
+                    if let Some(id) = value.as_str().filter(|id| !id.trim().is_empty()) {
+                        refs.insert(id.to_owned());
+                    }
+                }
+                collect_canonical_source_refs(value, refs);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn applies_to_phases(source_phase: u8) -> Vec<u8> {
