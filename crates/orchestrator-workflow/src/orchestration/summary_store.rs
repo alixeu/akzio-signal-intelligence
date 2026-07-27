@@ -1,10 +1,8 @@
 //! Deterministic FileStore writer for the fixed Phase Summary unit plan.
 //!
-//! This is intentionally separate from the legacy SQLite batch writer.  A
-//! migrated `compressor.phase_summary` has exactly one authority: completed
-//! Index directories produced here.  The deterministic writer is used for
-//! mock, derived, and degraded paths; live ToolManaged jobs use the same
-//! `create_index` / `append_index_detail` / `finalize_index` service.
+//! Completed Index directories produced here are the only phase-summary
+//! authority. Rust uses this deterministic writer for mock, derived, and
+//! degraded units; the live tool runtime uses the same Index service.
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -17,7 +15,6 @@ use serde_json::{json, Map, Value};
 use std::path::Path;
 
 use super::{
-    compress::{build_phase_compress, phase_summary_source_payload},
     lifecycle::tickers_from_state,
     summary_units::{SummaryUnit, SummaryUnitPlanRequest, SummaryUnitPlanner, SummaryUnitScope},
 };
@@ -27,6 +24,48 @@ use super::{
 #[derive(Debug, Clone)]
 pub(crate) struct FileStoreSummaryResult {
     pub indexes: Vec<Index>,
+}
+
+/// The bounded, completed-artifact payload that may be summarized for one
+/// phase. It is intentionally built from state projections only; no reader
+/// may reach into mutable market data or a former database at this boundary.
+pub(crate) fn phase_summary_source_payload(state: &Value, source_phase: i64) -> Result<Value> {
+    let keys: &[&str] = match source_phase {
+        1 => &[
+            "phase1_index",
+            "phase1_brief_md",
+            "analyst_results",
+            "analyst_conflicts",
+            "weighted_probability_base",
+        ],
+        2 => &[
+            "topic_generation_artifact",
+            "debate_state_artifact",
+            "debate_brief_md",
+            "debate_turns",
+        ],
+        3 => &["research_plan"],
+        4 => &["trader_investment_plan"],
+        5 => &["risk_debate_state"],
+        6 => &["final_trade_decision"],
+        7 => &["allocation_result", "portfolio_allocation", "allocation"],
+        _ => anyhow::bail!("unsupported phase_summary source phase {source_phase}"),
+    };
+    let artifacts = keys.iter().fold(Map::new(), |mut out, key| {
+        if let Some(value) = state.get(*key).filter(|value| !value.is_null()) {
+            out.insert((*key).to_string(), value.clone());
+        }
+        out
+    });
+    if artifacts.is_empty() {
+        anyhow::bail!("phase_summary source phase {source_phase} has no completed artifacts");
+    }
+    Ok(json!({
+        "source_phase": source_phase,
+        "current_date": state.get("current_date").cloned().unwrap_or(Value::Null),
+        "tickers": tickers_from_state(state),
+        "artifacts": artifacts,
+    }))
 }
 
 pub(crate) fn write_deterministic_phase_summary(
@@ -48,7 +87,6 @@ pub(crate) fn write_deterministic_phase_summary(
         max_units,
         scope: summary_scope(state, source_phase_u8)?,
     })?;
-    let batch = build_phase_compress(state, source_phase)?;
     let created_at = Utc::now().to_rfc3339();
     let store = FileStore::open(store_root, FileStoreOptions::default())?;
     let mut indexes = Vec::with_capacity(units.len());
@@ -58,7 +96,6 @@ pub(crate) fn write_deterministic_phase_summary(
             &location,
             &run_id,
             unit,
-            &batch,
             &source_payload,
             &created_at,
         )?);
@@ -71,44 +108,16 @@ fn write_unit(
     location: &RunLocation,
     run_id: &str,
     unit: &SummaryUnit,
-    batch: &orchestrator_sql::PhaseSummaryPhaseBatch,
     source_payload: &Value,
     created_at: &str,
 ) -> Result<Index> {
-    let summary_row = batch
-        .summaries
-        .iter()
-        .find(|row| summary_matches_unit(row, unit));
     let fallback = source_for_unit(source_payload, unit);
-    let (summary, confidence, authoritative_fields, details) = match summary_row {
-        Some(row) => {
-            let fields = row.summary_json.as_object().cloned().unwrap_or_else(|| {
-                Map::from_iter([("source".to_owned(), row.summary_json.clone())])
-            });
-            let details = batch
-                .details
-                .iter()
-                .filter(|detail| detail.summary_id == row.id)
-                .map(|detail| {
-                    (
-                        detail.detail.clone(),
-                        detail.source_ref.clone(),
-                        detail.detail_json.clone(),
-                    )
-                })
-                .collect::<Vec<_>>();
-            (row.summary.clone(), row.confidence, fields, details)
-        }
-        None => (
-            format!(
-                "Phase {} {} deterministic summary",
-                unit.source_phase, unit.unit_key
-            ),
-            0.0,
-            Map::from_iter([("source".to_owned(), fallback.clone())]),
-            Vec::new(),
-        ),
-    };
+    let summary = format!(
+        "Phase {} {} deterministic summary",
+        unit.source_phase, unit.unit_key
+    );
+    let confidence = 0.0;
+    let authoritative_fields = Map::from_iter([("source".to_owned(), fallback.clone())]);
     let scope = IndexScope {
         kind: IndexKind::PhaseSummary,
         location: Some(location.clone()),
@@ -133,43 +142,19 @@ fn write_unit(
             applies_to_phases: applies_to_phases(unit.source_phase),
         },
     )?;
-    if details.is_empty() {
-        append_index_detail(
-            store,
-            AppendIndexDetailInput {
-                scope: scope.clone(),
-                section: DetailSection::Analysis,
-                detail: compact_detail(&fallback),
-                source_refs: vec![format!(
-                    "artifact:phase{}:{}",
-                    unit.source_phase, unit.unit_key
-                )],
-            },
-        )?;
-    } else {
-        for (detail, source_ref, detail_json) in details {
-            append_index_detail(
-                store,
-                AppendIndexDetailInput {
-                    scope: scope.clone(),
-                    section: detail_section(&detail),
-                    detail: format!("{}\n\nBasis: {}", detail, compact_detail(&detail_json)),
-                    source_refs: vec![source_ref],
-                },
-            )?;
-        }
-    }
+    append_index_detail(
+        store,
+        AppendIndexDetailInput {
+            scope: scope.clone(),
+            section: DetailSection::Analysis,
+            detail: compact_detail(&fallback),
+            source_refs: vec![format!(
+                "artifact:phase{}:{}",
+                unit.source_phase, unit.unit_key
+            )],
+        },
+    )?;
     finalize_index(store, &scope).map_err(Into::into)
-}
-
-fn summary_matches_unit(row: &orchestrator_sql::PhaseSummaryRow, unit: &SummaryUnit) -> bool {
-    if row.role != unit.role || row.topic_id != unit.topic_id {
-        return false;
-    }
-    match unit.ticker.as_deref() {
-        Some(ticker) => row.ticker == ticker,
-        None => row.ticker == orchestrator_sql::AGGREGATE_TICKER || row.ticker.is_empty(),
-    }
 }
 
 fn applies_to_phases(source_phase: u8) -> Vec<u8> {

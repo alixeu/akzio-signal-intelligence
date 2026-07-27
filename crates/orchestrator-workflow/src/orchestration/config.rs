@@ -706,8 +706,8 @@ fn builtin_llm_role_values() -> BTreeMap<String, Value> {
             Some("medium"),
             vec![
                 "read_reflection_source",
-                "read_phase_summaries",
-                "read_phase_summary_details",
+                "read_indexes",
+                "read_index_details",
             ],
             false,
         ),
@@ -715,23 +715,14 @@ fn builtin_llm_role_values() -> BTreeMap<String, Value> {
             "analyst.technical",
             12,
             None,
-            vec![
-                "read_experience",
-                "read_technical_snapshot",
-                "read_technical_detail",
-            ],
+            vec!["read_technical_snapshot", "read_technical_detail"],
             false,
         ),
         (
             "analyst.news_macro",
             6,
             None,
-            vec![
-                "read_experience",
-                "read_jin10_candidates",
-                "verify_event",
-                "alpaca_get_news",
-            ],
+            vec!["read_jin10_candidates", "verify_event", "alpaca_get_news"],
             true,
         ),
         // Phase-2 roles read the compact index, then expand selected summaries.
@@ -739,53 +730,49 @@ fn builtin_llm_role_values() -> BTreeMap<String, Value> {
             "mediator.topic",
             6,
             Some("medium"),
-            vec!["read_phase_summaries", "read_phase_summary_details"],
+            vec!["read_indexes", "read_index_details"],
             false,
         ),
         (
             "researcher.bull.initial",
             10,
             None,
-            vec!["read_phase_summaries", "read_phase_summary_details"],
+            vec!["read_indexes", "read_index_details"],
             false,
         ),
         (
             "researcher.bear.initial",
             10,
             None,
-            vec!["read_phase_summaries", "read_phase_summary_details"],
+            vec!["read_indexes", "read_index_details"],
             false,
         ),
         (
             "researcher.bull.interaction",
             10,
             None,
-            vec!["read_phase_summaries", "read_phase_summary_details"],
+            vec!["read_indexes", "read_index_details"],
             false,
         ),
         (
             "researcher.bear.interaction",
             10,
             None,
-            vec!["read_phase_summaries", "read_phase_summary_details"],
+            vec!["read_indexes", "read_index_details"],
             false,
         ),
         (
             "mediator.topic_controller",
             10,
             Some("medium"),
-            vec!["read_phase_summaries", "read_phase_summary_details"],
+            vec!["read_indexes", "read_index_details"],
             false,
         ),
         (
             "manager.research",
             6,
             Some("medium"),
-            vec![
-                "read_experience",
-                "read_phase_summaries",
-                "read_phase_summary_details",
-            ],
+            vec!["read_indexes", "read_index_details"],
             false,
         ),
         ("compressor.phase_summary", 4, None, vec![], false),
@@ -793,35 +780,35 @@ fn builtin_llm_role_values() -> BTreeMap<String, Value> {
             "trader",
             6,
             None,
-            vec!["read_phase_summaries", "read_phase_summary_details"],
+            vec!["read_indexes", "read_index_details"],
             false,
         ),
         (
             "risk.aggressive",
             6,
             None,
-            vec!["read_phase_summaries", "read_phase_summary_details"],
+            vec!["read_indexes", "read_index_details"],
             false,
         ),
         (
             "risk.neutral",
             6,
             None,
-            vec!["read_phase_summaries", "read_phase_summary_details"],
+            vec!["read_indexes", "read_index_details"],
             false,
         ),
         (
             "risk.conservative",
             6,
             None,
-            vec!["read_phase_summaries", "read_phase_summary_details"],
+            vec!["read_indexes", "read_index_details"],
             false,
         ),
         (
             "portfolio.manager",
             8,
             Some("medium"),
-            vec!["read_phase_summaries", "read_phase_summary_details"],
+            vec!["read_indexes", "read_index_details"],
             false,
         ),
     ] {
@@ -1424,23 +1411,18 @@ mod tests {
         ] {
             assert_eq!(
                 roles[role]["tools"],
-                json!(["read_phase_summaries", "read_phase_summary_details"]),
+                json!(["read_indexes", "read_index_details"]),
                 "role={role}"
             );
         }
         assert_eq!(
             roles["analyst.news_macro"]["tools"],
-            json!([
-                "read_experience",
-                "read_jin10_candidates",
-                "verify_event",
-                "alpaca_get_news"
-            ])
+            json!(["read_jin10_candidates", "verify_event", "alpaca_get_news"])
         );
         for role in ["researcher.bull.initial", "researcher.bear.initial"] {
             assert_eq!(
                 roles[role]["tools"],
-                json!(["read_phase_summaries", "read_phase_summary_details"]),
+                json!(["read_indexes", "read_index_details"]),
                 "role={role}"
             );
             assert_eq!(roles[role]["web_search"]["mode"], "disabled");
@@ -1448,7 +1430,7 @@ mod tests {
         for role in ["researcher.bull.interaction", "researcher.bear.interaction"] {
             assert_eq!(
                 roles[role]["tools"],
-                json!(["read_phase_summaries", "read_phase_summary_details"]),
+                json!(["read_indexes", "read_index_details"]),
                 "role={role}"
             );
         }
@@ -1456,24 +1438,20 @@ mod tests {
             roles["reflector.historical"]["tools"],
             json!([
                 "read_reflection_source",
-                "read_phase_summaries",
-                "read_phase_summary_details"
+                "read_indexes",
+                "read_index_details"
             ])
         );
         for role in ["mediator.topic", "mediator.topic_controller"] {
             assert_eq!(
                 roles[role]["tools"],
-                json!(["read_phase_summaries", "read_phase_summary_details"]),
+                json!(["read_indexes", "read_index_details"]),
                 "role={role}"
             );
         }
         assert_eq!(
             roles["manager.research"]["tools"],
-            json!([
-                "read_experience",
-                "read_phase_summaries",
-                "read_phase_summary_details"
-            ])
+            json!(["read_indexes", "read_index_details"])
         );
     }
 }

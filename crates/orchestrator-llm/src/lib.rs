@@ -277,15 +277,6 @@ impl SteerLoopInput<'_> {
             .map(ToString::to_string)
     }
 
-    fn allows_ready_ack(&self) -> bool {
-        self.steer_value()
-            .as_ref()
-            .and_then(|value| value.get("payload"))
-            .and_then(|payload| payload.get("allow_ready"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-    }
-
     fn includes_prompt_on_fork(&self) -> bool {
         self.steer_value()
             .as_ref()
@@ -2108,29 +2099,6 @@ fn extract_encrypted_reasoning(raw: &Value) -> Option<String> {
                     .map(ToString::to_string)
             })
         })
-}
-
-fn loop_run_id(settings: &AgentSettings) -> String {
-    settings
-        .tools
-        .as_ref()
-        .and_then(|tools| {
-            tools
-                .run_id
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(ToString::to_string)
-                .or_else(|| {
-                    tools
-                        .run_dir
-                        .as_ref()
-                        .and_then(|path| path.file_name())
-                        .and_then(|name| name.to_str())
-                        .map(ToString::to_string)
-                })
-        })
-        .unwrap_or_else(|| "agent-loop".to_string())
 }
 
 fn openai_compatible_api_key(settings: &RoleLlmSettings) -> Result<String> {

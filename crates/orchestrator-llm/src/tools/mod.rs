@@ -823,38 +823,6 @@ pub fn truncate_chars(value: &str, max_chars: usize) -> String {
     output
 }
 
-pub(crate) fn optional_string_arg<'a>(args: &'a Value, field: &str) -> Result<Option<&'a str>> {
-    match args.get(field) {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::String(value)) if value.trim().is_empty() => Ok(None),
-        Some(Value::String(value)) => Ok(Some(value.trim())),
-        Some(_) => bail!("{field} must be a string"),
-    }
-}
-
-pub(crate) fn pagination_args(args: &Value, maximum: usize) -> Result<(usize, usize)> {
-    let maximum = maximum.clamp(1, 100);
-    let limit = match args.get("limit") {
-        None | Some(Value::Null) => 20.min(maximum),
-        Some(value) => value
-            .as_u64()
-            .filter(|value| *value > 0)
-            .map(|value| value as usize)
-            .context("limit must be a positive integer")?,
-    };
-    if limit > maximum {
-        bail!("limit exceeds configured maximum {maximum}");
-    }
-    let offset = match args.get("cursor") {
-        None | Some(Value::Null) => 0,
-        Some(Value::String(value)) => value
-            .parse::<usize>()
-            .context("cursor must be a pagination token returned by the prior call")?,
-        Some(_) => bail!("cursor must be a string or null"),
-    };
-    Ok((limit, offset))
-}
-
 pub(crate) fn log_tool_result(name: &str, result: &Result<Value>) {
     match result {
         Ok(value) => {

@@ -1399,8 +1399,6 @@ mod tests {
             web_search: std::collections::BTreeMap::new(),
             truncation: orchestrator_llm::truncation::TruncationConfig::default(),
             judge: orchestrator_llm::llm_judge::JudgeConfig::default(),
-            strict_sqlite: true,
-            required_contexts: Vec::new(),
             prompts: crate::orchestration::config::PromptConfig {
                 prompts: std::collections::BTreeMap::new(),
                 versions: std::collections::BTreeMap::new(),
@@ -1437,7 +1435,6 @@ mod tests {
             reflection: crate::orchestration::config::ReflectionConfig {
                 enabled: true,
                 reflection_version: "v1".to_string(),
-                promote_mode: "auto".to_string(),
                 task_limit: 10,
                 parallelism: 2,
                 loss_return: -0.02,
@@ -1470,7 +1467,7 @@ mod tests {
             component_plugins: orchestrator_core::ComponentRegistry::default(),
             role_plugins: orchestrator_core::RolePluginRegistry::default(),
             agent_registry: orchestrator_core::AgentRegistry::builtin(),
-            authority_registry: orchestrator_core::AuthorityRegistry::builtin_legacy(),
+            authority_registry: orchestrator_core::AuthorityRegistry::builtin(),
         }
     }
 

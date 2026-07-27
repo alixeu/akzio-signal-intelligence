@@ -1163,7 +1163,7 @@ fn apply_workflow_policy(
     conn: &rusqlite::Connection,
     config: &RuntimeConfig,
 ) -> Result<WorkflowPolicyDecision> {
-    let allocation_context = compute_allocation_context(state, conn, &config.allocation)?;
+    let allocation_context = compute_allocation_context(state, &config.allocation)?;
     state["allocation_context"] = allocation_context.clone();
     let signals = workflow_policy_signals(state, &allocation_context, config);
     let decision = evaluate_workflow_policy(
@@ -5938,7 +5938,7 @@ async fn run_phase7(
         stamp_phase6_execution_constraints(state, &mut decision);
         state["final_trade_decision"] = decision;
     }
-    let context = compute_allocation_context(state, conn, &config.allocation)?;
+    let context = compute_allocation_context(state, &config.allocation)?;
     state["allocation_context"] = allocation_prompt_context(&context);
     debug!(vix_regime = ?context.get("vix").and_then(|v| v.get("regime")), "allocation context ready");
     let mut allocation = derive_guarded_allocation(state, &context, &config.allocation)?;
@@ -6067,14 +6067,7 @@ mod tests {
                 }
             }
         });
-        let mut runtime = RuntimeConfig::from_value(&config).unwrap();
-        runtime
-            .authority_registry
-            .migrate_to_file_store(
-                "analyst.technical",
-                orchestrator_core::ToolManagedProfile::AnalystReport,
-            )
-            .unwrap();
+        let runtime = RuntimeConfig::from_value(&config).unwrap();
         (config, runtime)
     }
 
@@ -6168,14 +6161,7 @@ mod tests {
     async fn injected_phase1_file_store_authority_writes_canonical_ticker_units_without_sqlite_projection(
     ) {
         let directory = tempfile::tempdir().unwrap();
-        let (_config, mut runtime) = manifest_runtime_config(directory.path());
-        runtime
-            .authority_registry
-            .migrate_to_file_store(
-                "analyst.news_macro",
-                orchestrator_core::ToolManagedProfile::AnalystReport,
-            )
-            .unwrap();
+        let (_config, runtime) = manifest_runtime_config(directory.path());
         let mut state = json!({
             "run_id": "phase1-file-store-test",
             "current_date": "2026-07-27",
@@ -6336,10 +6322,7 @@ mod tests {
         .unwrap();
 
         let mut changed_runtime = runtime.clone();
-        // All builtin profiles are FileStore-authoritative now; use the
-        // explicit legacy registry to simulate opening a manifest with a
-        // materially different authority snapshot.
-        changed_runtime.authority_registry = orchestrator_core::AuthorityRegistry::builtin_legacy();
+        changed_runtime.authority_registry = orchestrator_core::AuthorityRegistry::new(2).unwrap();
         let error = prepare_file_store_run_manifest(
             directory.path(),
             &changed_runtime,
@@ -6520,11 +6503,10 @@ mod tests {
         assert!(settings
             .tools
             .contains(&"read_technical_snapshot".to_string()));
-        assert!(settings.tools.contains(&"read_experience".to_string()));
         for role in ["trader", "risk.conservative", "portfolio.manager"] {
             assert_eq!(
                 roles[role].tools,
-                vec!["read_phase_summaries", "read_phase_summary_details"],
+                vec!["read_indexes", "read_index_details"],
                 "role={role}"
             );
         }
@@ -6542,7 +6524,7 @@ mod tests {
                 "model": "role-model",
                 "max_turns": 4,
                 "reasoning_effort": "low",
-                "tools": ["read_phase_summaries", "read_phase_summary_details"]
+                "tools": ["read_indexes", "read_index_details"]
             }),
         );
         let config = json!({
@@ -6571,10 +6553,7 @@ mod tests {
         assert_eq!(settings.reasoning_effort.as_deref(), Some("low"));
         assert_eq!(
             settings.tools,
-            vec![
-                "read_phase_summaries".to_string(),
-                "read_phase_summary_details".to_string()
-            ]
+            vec!["read_indexes".to_string(), "read_index_details".to_string()]
         );
     }
 

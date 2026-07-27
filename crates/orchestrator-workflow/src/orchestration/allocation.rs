@@ -1,9 +1,5 @@
 use anyhow::{bail, Result};
-use orchestrator_core::{
-    closes_for_correlation, config_get, latest_indicator, PortfolioAllocation,
-};
-use orchestrator_sql::load_technical_series;
-use rusqlite::Connection;
+use orchestrator_core::{config_get, PortfolioAllocation};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
@@ -11,7 +7,6 @@ use super::config::AllocationConfig;
 
 pub(crate) fn compute_allocation_context(
     state: &Value,
-    conn: &Connection,
     config: &AllocationConfig,
 ) -> Result<Value> {
     let tickers = state
@@ -35,12 +30,10 @@ pub(crate) fn compute_allocation_context(
         config.investable_assets.clone()
     };
 
-    let vix_info = query_vix_regime(
-        conn,
-        &config.regime_signal,
-        &config.regime_thresholds,
-        &config.regime_labels,
-    );
+    let vix_info = state
+        .pointer("/market_snapshot/vix")
+        .cloned()
+        .unwrap_or_else(|| unavailable_vix(config));
 
     let research_plan = state
         .get("research_plan")
@@ -67,7 +60,9 @@ pub(crate) fn compute_allocation_context(
                 .ok_or_else(|| {
                     anyhow::anyhow!("research_plan probability missing or invalid for {ticker}")
                 })?;
-            let vol_pct = query_latest_indicator(conn, ticker, &config.vol_indicator);
+            let vol_pct = state
+                .pointer(&format!("/market_snapshot/per_ticker/{ticker}/vol_pct"))
+                .and_then(Value::as_f64);
             let thesis = research.get("plan").and_then(Value::as_str).unwrap_or("");
             Ok((
                 ticker.clone(),
@@ -81,16 +76,9 @@ pub(crate) fn compute_allocation_context(
         })
         .collect::<Result<serde_json::Map<_, _>>>()?;
 
-    let correlation_60d = if investable.len() >= 2 {
-        query_correlation(
-            conn,
-            &investable[0],
-            &investable[1],
-            config.correlation_window_days,
-        )
-    } else {
-        None
-    };
+    let correlation_60d = state
+        .pointer("/market_snapshot/correlation_60d")
+        .and_then(Value::as_f64);
     let correlation_warning = match correlation_60d {
         Some(corr) if corr > 0.85 => "高度相关, 需控制集中度",
         Some(_) => "相关性适中",
@@ -749,18 +737,15 @@ fn equity_budget_deviation(context: &Value, actual: f64) -> Value {
     })
 }
 
-fn query_vix_regime(
-    conn: &Connection,
-    signal: &str,
-    thresholds: &[f64],
-    labels: &[String],
-) -> Value {
-    let level = query_latest_indicator(conn, signal, "Close").unwrap_or(0.0);
-    let (regime, budget_hint) = classify_regime(level, thresholds, labels);
+fn unavailable_vix(config: &AllocationConfig) -> Value {
+    let (regime, budget_hint) =
+        classify_regime(0.0, &config.regime_thresholds, &config.regime_labels);
     json!({
-        "level": level,
+        "level": null,
         "regime": regime,
-        "equity_budget_hint": budget_hint
+        "equity_budget_hint": budget_hint,
+        "status": "data_gap",
+        "reason": "run-local technical snapshot has no VIX projection"
     })
 }
 
@@ -781,83 +766,6 @@ fn classify_regime(level: f64, thresholds: &[f64], labels: &[String]) -> (String
         _ => "0.40-0.80",
     };
     (regime, budget.to_string())
-}
-
-fn query_latest_indicator(conn: &Connection, ticker: &str, indicator: &str) -> Option<f64> {
-    let rows = load_technical_series(conn, ticker, "1d").ok()?;
-    latest_indicator(&rows, indicator)
-}
-
-fn query_correlation(
-    conn: &Connection,
-    ticker_a: &str,
-    ticker_b: &str,
-    window: usize,
-) -> Option<f64> {
-    let rows_a = load_technical_series(conn, ticker_a, "1d").ok()?;
-    let rows_b = load_technical_series(conn, ticker_b, "1d").ok()?;
-
-    let closes_a = closes_for_correlation(&rows_a, window + 1);
-    let closes_b = closes_for_correlation(&rows_b, window + 1);
-
-    // Align by date
-    let dates_b: std::collections::HashMap<&str, f64> = closes_b
-        .iter()
-        .map(|(d, c)| (d.get(..10).unwrap_or(d.as_str()), *c))
-        .collect();
-
-    let mut aligned_a = Vec::new();
-    let mut aligned_b = Vec::new();
-    for (date, close_a) in &closes_a {
-        let day = date.get(..10).unwrap_or(date.as_str());
-        if let Some(&close_b) = dates_b.get(day) {
-            aligned_a.push(*close_a);
-            aligned_b.push(close_b);
-        }
-    }
-
-    if aligned_a.len() < 10 {
-        return None;
-    }
-
-    let rets_a = log_returns(&aligned_a);
-    let rets_b = log_returns(&aligned_b);
-    pearson_correlation(&rets_a, &rets_b)
-}
-
-fn log_returns(prices: &[f64]) -> Vec<f64> {
-    prices
-        .windows(2)
-        .filter_map(|w| {
-            if w[0] > 0.0 && w[1] > 0.0 {
-                Some((w[1] / w[0]).ln())
-            } else {
-                None
-            }
-        })
-        .collect()
-}
-
-fn pearson_correlation(a: &[f64], b: &[f64]) -> Option<f64> {
-    let n = a.len().min(b.len()) as f64;
-    if n < 3.0 {
-        return None;
-    }
-    let mean_a = a.iter().sum::<f64>() / n;
-    let mean_b = b.iter().sum::<f64>() / n;
-    let cov = a
-        .iter()
-        .zip(b.iter())
-        .map(|(x, y)| (x - mean_a) * (y - mean_b))
-        .sum::<f64>()
-        / n;
-    let std_a = (a.iter().map(|x| (x - mean_a).powi(2)).sum::<f64>() / n).sqrt();
-    let std_b = (b.iter().map(|y| (y - mean_b).powi(2)).sum::<f64>() / n).sqrt();
-    if std_a > 0.0 && std_b > 0.0 {
-        Some((cov / (std_a * std_b) * 10_000.0).round() / 10_000.0)
-    } else {
-        None
-    }
 }
 
 impl AllocationConfig {
@@ -1364,9 +1272,7 @@ mod tests {
                 }
             }
         });
-        let conn = Connection::open_in_memory().unwrap();
-
-        let error = compute_allocation_context(&state, &conn, &test_config()).unwrap_err();
+        let error = compute_allocation_context(&state, &test_config()).unwrap_err();
 
         assert!(error
             .to_string()
@@ -1430,13 +1336,5 @@ mod tests {
         );
         assert_eq!(allocation["total_equity_exposure"], 0.0);
         assert_eq!(allocation["weights"]["cash_hedge"]["weight"], 1.0);
-    }
-
-    #[test]
-    fn pearson_correlation_uses_log_returns() {
-        let a = log_returns(&[100.0, 101.0, 102.0, 103.0, 104.0]);
-        let b = log_returns(&[50.0, 50.5, 51.0, 51.5, 52.0]);
-        let corr = pearson_correlation(&a, &b).unwrap();
-        assert!(corr > 0.99, "corr={corr}");
     }
 }
