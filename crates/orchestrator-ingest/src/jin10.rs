@@ -6,12 +6,15 @@ use reqwest::Client;
 use serde_json::{json, Value};
 use std::{
     fs,
+    io::Write,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     time::Duration as StdDuration,
 };
 
 const API_URL: &str = "https://4a735ea38f8146198dc205d2e2d1bd28.z3c.jin10.com/flash";
 const TIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
+static OUTPUT_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Args, Default)]
 pub struct Jin10Args {
@@ -51,12 +54,7 @@ pub async fn run(args: Jin10Args) -> Result<Value> {
     let mut seen = std::collections::BTreeSet::new();
     let mut collected = Vec::new();
     let jsonl_path = (!args.jsonl.is_empty()).then(|| PathBuf::from(&args.jsonl));
-    if let Some(path) = &jsonl_path {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(path, "")?;
-    }
+    let mut jsonl_lines = Vec::new();
     let mut pages_fetched = 0;
     for page_index in 0..args.pages {
         let items = fetch_page(&client, &args, &classify, &cursor).await?;
@@ -94,10 +92,8 @@ pub async fn run(args: Jin10Args) -> Result<Value> {
             if seen.insert(key) {
                 let compact =
                     json!({"time": item_time.format(TIME_FORMAT).to_string(), "content": content});
-                if let Some(path) = &jsonl_path {
-                    use std::io::Write;
-                    let mut file = fs::OpenOptions::new().append(true).open(path)?;
-                    writeln!(file, "{}", serde_json::to_string(&compact)?)?;
+                if jsonl_path.is_some() {
+                    jsonl_lines.push(serde_json::to_string(&compact)?);
                 }
                 collected.push(compact);
             }
@@ -142,10 +138,79 @@ pub async fn run(args: Jin10Args) -> Result<Value> {
         },
         "items": collected
     });
+    if let Some(path) = jsonl_path.as_deref() {
+        let mut contents = jsonl_lines.join("\n");
+        if !contents.is_empty() {
+            contents.push('\n');
+        }
+        write_text_atomic(path, &contents)?;
+    }
     if !args.output.is_empty() {
-        fs::write(&args.output, serde_json::to_string_pretty(&result)?)?;
+        write_text_atomic(
+            Path::new(&args.output),
+            &serde_json::to_string_pretty(&result)?,
+        )?;
     }
     Ok(result)
+}
+
+/// A Jin10 fetch either publishes its whole snapshot or leaves the prior one
+/// untouched. The temporary file is adjacent to the target, so rename never
+/// crosses filesystems and readers never observe a partially fetched feed.
+fn write_text_atomic(path: &Path, contents: &str) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "failed to create Jin10 output directory {}",
+            parent.display()
+        )
+    })?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .context("Jin10 output path must have a UTF-8 file name")?;
+    for _ in 0..32 {
+        let counter = OUTPUT_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temp = parent.join(format!(".{file_name}.tmp-{}-{counter}", std::process::id()));
+        let result = (|| -> Result<()> {
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp)
+                .with_context(|| {
+                    format!("failed to create temporary Jin10 output {}", temp.display())
+                })?;
+            file.write_all(contents.as_bytes())?;
+            file.flush()?;
+            file.sync_all()?;
+            drop(file);
+            fs::rename(&temp, path)?;
+            fs::File::open(parent)?.sync_all()?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::AlreadyExists) =>
+            {
+                continue
+            }
+            Err(error) => {
+                let _ = fs::remove_file(&temp);
+                return Err(error);
+            }
+        }
+    }
+    bail!(
+        "failed to allocate an adjacent temporary Jin10 output for {}",
+        path.display()
+    )
 }
 
 fn persist_jin10_csv(csv_dir: &Path, date: &str, items: &[Value]) -> Result<PathBuf> {
@@ -317,5 +382,26 @@ mod tests {
             rows[0].id,
             orchestrator_core::jin10_item_id("2026-07-22 13:49:22", "Macro event")
         );
+    }
+
+    #[test]
+    fn optional_jin10_exports_publish_complete_replacements() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("snapshot.jsonl");
+        std::fs::write(&path, "old\n").unwrap();
+
+        write_text_atomic(&path, "new-one\nnew-two\n").unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "new-one\nnew-two\n"
+        );
+        let temporary = directory
+            .path()
+            .read_dir()
+            .unwrap()
+            .flatten()
+            .any(|entry| entry.file_name().to_string_lossy().contains(".tmp-"));
+        assert!(!temporary);
     }
 }
