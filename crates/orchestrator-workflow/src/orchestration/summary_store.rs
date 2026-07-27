@@ -105,6 +105,28 @@ pub(crate) fn write_deterministic_phase_summary(
     Ok(FileStoreSummaryResult { indexes })
 }
 
+/// Plan the fixed, Rust-owned Summary Units for a completed source phase.
+/// Both the live compressor and deterministic/mock writer use this exact
+/// planner, so a model never chooses Index count or ownership.
+pub(crate) fn planned_summary_units(
+    state: &Value,
+    source_phase: i64,
+    max_units: usize,
+) -> Result<(Value, Vec<SummaryUnit>)> {
+    let source_phase_u8 =
+        u8::try_from(source_phase).context("phase summary source phase must fit in a u8")?;
+    let source_payload = phase_summary_source_payload(state, source_phase)?;
+    let source_payload_hash = content_hash(&source_payload)?;
+    let run_id = required_state_string(state, "run_id")?;
+    let units = SummaryUnitPlanner::plan(SummaryUnitPlanRequest {
+        run_id,
+        source_payload_hash,
+        max_units,
+        scope: summary_scope(state, source_phase_u8)?,
+    })?;
+    Ok((source_payload, units))
+}
+
 fn write_unit(
     store: &FileStore,
     location: &RunLocation,

@@ -135,6 +135,7 @@ pub fn check_orphan_placeholders(
         "final_trade_decision": {"rating": "Hold"},
         "allocation_context": {"investable_assets": ["QQQ", "SOXX"]},
         "reflection_task": {"task_id": 1},
+        "_summary_source_payload": {"source_phase": 1, "artifacts": {}},
     });
     match render_for_lint(
         &state,

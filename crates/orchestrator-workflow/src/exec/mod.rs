@@ -19,7 +19,7 @@ use crate::orchestration::{
     lifecycle::{run_id_for, set_phase_status, tickers_from_state},
     retrieval::inject_phase_summary_reflection,
     role_jobs::{prepare_role_job, record_role_job_metrics, run_role_jobs, RoleRun},
-    summary_store::write_deterministic_phase_summary,
+    summary_store::{planned_summary_units, write_deterministic_phase_summary},
 };
 
 mod args;
@@ -95,7 +95,15 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         )
         .await?;
         finish_phase(&store, &location, &mut manifest, &mut state, 1, "done")?;
-        summarize(&store_root, &state, &runtime, 1)?;
+        summarize(
+            &store_root,
+            &mut state,
+            &runtime,
+            1,
+            args.model.as_deref(),
+            args.reasoning_effort.as_deref(),
+        )
+        .await?;
     }
     if args.from_phase <= 2 && args.to_phase >= 2 {
         run_phase2(
@@ -108,7 +116,15 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         )
         .await?;
         finish_phase(&store, &location, &mut manifest, &mut state, 2, "done")?;
-        summarize(&store_root, &state, &runtime, 2)?;
+        summarize(
+            &store_root,
+            &mut state,
+            &runtime,
+            2,
+            args.model.as_deref(),
+            args.reasoning_effort.as_deref(),
+        )
+        .await?;
     }
     if args.from_phase <= 3 && args.to_phase >= 3 {
         run_phase3(
@@ -119,7 +135,15 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         )
         .await?;
         finish_phase(&store, &location, &mut manifest, &mut state, 3, "done")?;
-        summarize(&store_root, &state, &runtime, 3)?;
+        summarize(
+            &store_root,
+            &mut state,
+            &runtime,
+            3,
+            args.model.as_deref(),
+            args.reasoning_effort.as_deref(),
+        )
+        .await?;
     }
     if args.from_phase <= 4 && args.to_phase >= 4 {
         run_phase4(
@@ -130,7 +154,15 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         )
         .await?;
         finish_phase(&store, &location, &mut manifest, &mut state, 4, "done")?;
-        summarize(&store_root, &state, &runtime, 4)?;
+        summarize(
+            &store_root,
+            &mut state,
+            &runtime,
+            4,
+            args.model.as_deref(),
+            args.reasoning_effort.as_deref(),
+        )
+        .await?;
     }
     if args.from_phase <= 5 && args.to_phase >= 5 {
         run_phase5(
@@ -141,7 +173,15 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         )
         .await?;
         finish_phase(&store, &location, &mut manifest, &mut state, 5, "done")?;
-        summarize(&store_root, &state, &runtime, 5)?;
+        summarize(
+            &store_root,
+            &mut state,
+            &runtime,
+            5,
+            args.model.as_deref(),
+            args.reasoning_effort.as_deref(),
+        )
+        .await?;
     }
     if args.from_phase <= 6 && args.to_phase >= 6 {
         run_phase6(
@@ -152,12 +192,28 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         )
         .await?;
         finish_phase(&store, &location, &mut manifest, &mut state, 6, "done")?;
-        summarize(&store_root, &state, &runtime, 6)?;
+        summarize(
+            &store_root,
+            &mut state,
+            &runtime,
+            6,
+            args.model.as_deref(),
+            args.reasoning_effort.as_deref(),
+        )
+        .await?;
     }
     if args.from_phase <= 7 && args.to_phase >= 7 {
         run_phase7(&store, &location, &mut state, &runtime)?;
         finish_phase(&store, &location, &mut manifest, &mut state, 7, "done")?;
-        summarize(&store_root, &state, &runtime, 7)?;
+        summarize(
+            &store_root,
+            &mut state,
+            &runtime,
+            7,
+            args.model.as_deref(),
+            args.reasoning_effort.as_deref(),
+        )
+        .await?;
     }
     if args.from_phase <= 8 && args.to_phase >= 8 {
         run_phase8(&store, &location, &mut state)?;
@@ -239,13 +295,52 @@ fn finish_phase(
     Ok(())
 }
 
-fn summarize(store_root: &Path, state: &Value, runtime: &RuntimeConfig, phase: i64) -> Result<()> {
-    write_deterministic_phase_summary(
-        store_root,
+async fn summarize(
+    store_root: &Path,
+    state: &mut Value,
+    runtime: &RuntimeConfig,
+    phase: i64,
+    model: Option<&str>,
+    reasoning: Option<&str>,
+) -> Result<()> {
+    if state["mock"].as_bool().unwrap_or(false) {
+        write_deterministic_phase_summary(
+            store_root,
+            state,
+            phase,
+            runtime.tool_managed.max_summary_units_per_phase,
+        )?;
+        return Ok(());
+    }
+    let (source_payload, units) = planned_summary_units(
         state,
         phase,
         runtime.tool_managed.max_summary_units_per_phase,
     )?;
+    let mut completed = Vec::with_capacity(units.len());
+    for unit in units {
+        state["_summary_unit"] = serde_json::to_value(&unit)?;
+        state["_summary_source_payload"] = source_payload.clone();
+        let artifact = run_unit(
+            state,
+            runtime,
+            "compressor.phase_summary",
+            phase,
+            "phase_summary",
+            None,
+            unit.topic_id.as_deref(),
+            unit.ticker.as_deref(),
+            model,
+            reasoning,
+        )
+        .await?;
+        completed.push(artifact);
+    }
+    state["phase_summary_live"][phase.to_string()] = Value::Array(completed);
+    state.as_object_mut().map(|object| {
+        object.remove("_summary_unit");
+        object.remove("_summary_source_payload");
+    });
     Ok(())
 }
 

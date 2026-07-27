@@ -5,6 +5,10 @@
 
 {analysis_trace_contract}
 
+SOURCE_PAYLOAD（仅当前 Rust 固定 Summary Unit 可见；不得从其他状态补充内容）：
+
+{summary_source_payload}
+
 ## 统一输出约束
 
 按固定 Summary Unit 调用 `create_index`、`append_index_detail` 和 terminal `finalize_index`。不要输出 JSON Bundle 或 Assistant 最终答案。

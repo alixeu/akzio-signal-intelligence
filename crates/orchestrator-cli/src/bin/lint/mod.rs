@@ -73,6 +73,7 @@ pub const VALID_PLACEHOLDERS: &[&str] = &[
     "portfolio_decision",
     "allocation_context",
     "reflection_task",
+    "summary_source_payload",
     "phase3_context",
     "alpaca_mode",
     "common_ground",

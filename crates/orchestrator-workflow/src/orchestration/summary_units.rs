@@ -66,7 +66,7 @@ pub struct SummaryUnitPlanRequest {
 
 /// A fixed summary/index creation unit.  `index_id` is independent of any
 /// text later produced by an LLM.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct SummaryUnit {
     pub source_phase: u8,
     pub role: String,

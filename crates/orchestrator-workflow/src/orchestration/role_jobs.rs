@@ -318,6 +318,20 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
                 None,
                 None,
             )
+        } else if profile == ToolManagedProfile::PhaseSummary {
+            let binding = file_store_phase_summary_index_runtime(
+                Path::new(store_root),
+                &state,
+                registration.profile_version,
+                registration.builder_version,
+            )?;
+            (
+                OutputMode::ToolManaged,
+                Some(profile),
+                Some(binding),
+                None,
+                None,
+            )
         } else {
             let binding = file_store_domain_runtime(
                 Path::new(store_root),
@@ -749,6 +763,76 @@ fn file_store_historical_reflection_index_runtime(
             max_page_size: 20,
         },
         FileStoreIndexRuntimePlan::for_experience(vec![source_location], Utc::now().to_rfc3339()),
+    )
+}
+
+/// Construct the sole live Phase Summary writer for one Rust-planned unit.
+/// The unit is copied into the role state by the executor and is never a tool
+/// argument. The model can only supply prose, confidence and Detail sections.
+fn file_store_phase_summary_index_runtime(
+    store_root: &Path,
+    state: &Value,
+    _profile_version: u32,
+    _builder_version: u32,
+) -> Result<orchestrator_llm::tools::index_tools::IndexToolRuntimeBinding> {
+    use orchestrator_llm::tools::index_tools::{IndexKind, IndexOwnedScope, IndexReadVisibility};
+    use orchestrator_store::{FileStore, FileStoreOptions, RunLocation};
+
+    let unit = state
+        .get("_summary_unit")
+        .and_then(Value::as_object)
+        .context("PhaseSummary role requires Rust-planned _summary_unit")?;
+    let required = |key: &str| -> Result<String> {
+        unit.get(key)
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(ToOwned::to_owned)
+            .with_context(|| format!("_summary_unit.{key} is required"))
+    };
+    let run_id = state
+        .get("run_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .context("run_id is required for PhaseSummary runtime")?
+        .to_owned();
+    let current_date = state
+        .get("current_date")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .context("current_date is required for PhaseSummary runtime")?
+        .to_owned();
+    let source_phase = unit
+        .get("source_phase")
+        .and_then(Value::as_u64)
+        .and_then(|value| u8::try_from(value).ok())
+        .context("_summary_unit.source_phase is required")?;
+    let owned = IndexOwnedScope {
+        run_id,
+        source_run_id: None,
+        source_phase,
+        role: required("role")?,
+        kind: IndexKind::PhaseSummary,
+        ticker: unit
+            .get("ticker")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        topic_id: unit
+            .get("topic_id")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        unit_key: required("unit_key")?,
+        source_payload_hash: required("source_payload_hash")?,
+        index_id: required("index_id")?,
+    };
+    let store = FileStore::open(store_root, FileStoreOptions::default())?;
+    file_store_index_tool_runtime(
+        store,
+        owned,
+        IndexReadVisibility::default().with_default_page_size(20),
+        FileStoreIndexRuntimePlan::for_phase_summary(
+            RunLocation::new(current_date, state["run_id"].as_str().unwrap_or_default())?,
+            Utc::now().to_rfc3339(),
+        ),
     )
 }
 

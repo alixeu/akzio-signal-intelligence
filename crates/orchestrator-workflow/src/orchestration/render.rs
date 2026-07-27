@@ -604,6 +604,14 @@ pub(crate) fn render_prompt_with_plugins(
             &state.get("reflection_task").cloned().unwrap_or(Value::Null),
         )?))
     })?;
+    insert_if_referenced(&mut values, &placeholders, "summary_source_payload", || {
+        Ok(Value::String(serde_json::to_string_pretty(
+            &state
+                .get("_summary_source_payload")
+                .cloned()
+                .unwrap_or(Value::Null),
+        )?))
+    })?;
 
     let mut values = Value::Object(values);
     let rendered_components = component_templates
@@ -1175,6 +1183,7 @@ required_variables = ["ticker", "tickers"]
         "{phase6_control_context}",
         "{allocation_context}",
         "{reflection_task}",
+        "{summary_source_payload}",
         "{phase3_context}",
         "{common_ground}",
     ];
