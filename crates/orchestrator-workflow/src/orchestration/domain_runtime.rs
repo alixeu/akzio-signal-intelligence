@@ -422,8 +422,8 @@ pub(crate) fn finalize_degraded_research_decision(
                 "rating": "Hold",
                 "long_probability": 0.5,
                 "short_probability": 0.5,
-                "confidence_basis": "runtime_degraded",
-                "hold_reason": "runtime_degraded",
+                "confidence_basis": "data_insufficient",
+                "hold_reason": "evidence_insufficient",
                 "plan": format!("{} did not produce a usable research decision: {failure}", plan.role),
                 "probability_rationale": "Runtime failure; probabilities are neutral placeholders and must not be treated as evidence.",
             }),
@@ -1506,6 +1506,39 @@ mod tests {
             portfolio_rating: None,
             portfolio_current_weight: None,
         }
+    }
+
+    #[test]
+    fn degraded_research_decision_uses_the_canonical_hold_enum_values() {
+        let temp = tempfile::tempdir().unwrap();
+        let artifact = finalize_degraded_research_decision(
+            temp.path(),
+            &state(),
+            FileStoreDomainRuntimePlan {
+                role: "manager.research".to_owned(),
+                phase: 3,
+                profile: ToolManagedProfile::ResearchDecision,
+                profile_version: 1,
+                builder_version: 1,
+                tickers: vec!["QQQ".to_owned()],
+                visible_evidence_refs: Default::default(),
+                topic_id: None,
+                side: None,
+                round: None,
+                visible_claims: Default::default(),
+                fork: None,
+                trade_candidate_action: None,
+                portfolio_rating: None,
+                portfolio_current_weight: None,
+            },
+            "gateway unavailable",
+        )
+        .unwrap();
+
+        let decision = &artifact["per_ticker"]["QQQ"];
+        assert_eq!(decision["rating"], "Hold");
+        assert_eq!(decision["confidence_basis"], "data_insufficient");
+        assert_eq!(decision["hold_reason"], "evidence_insufficient");
     }
 
     #[test]
