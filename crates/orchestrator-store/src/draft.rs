@@ -4,6 +4,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use orchestrator_core::artifact::{Scenario, Scenarios};
+use orchestrator_core::EvidenceItem;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -139,13 +141,162 @@ macro_rules! typed_profile_draft {
 }
 
 typed_profile_draft!(HistoricalReflectionDraft);
-typed_profile_draft!(AnalystReportDraft);
-typed_profile_draft!(TopicGenerationDraft);
-typed_profile_draft!(ResearcherWarmupDraft);
-typed_profile_draft!(DebateSeedDraft);
-typed_profile_draft!(DebateResponseDraft);
-typed_profile_draft!(TopicControlDraft);
-typed_profile_draft!(ResearchDecisionDraft);
+/// Explicit mutable state for Phase 1.  The model can only change this through
+/// the analyst domain tools; there is deliberately no `serde_json::Value`
+/// scratch pad or JSON-path mutation API.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct AnalystReportDraft {
+    pub metadata: ProfileDraftMetadata,
+    pub assessments: BTreeMap<String, AnalystAssessmentDraft>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AnalystAssessmentDraft {
+    pub direction: String,
+    pub confidence: f64,
+    pub report: String,
+    pub priced_in: String,
+    pub echo_chamber_risk: String,
+    pub crowded_consensus_risk: String,
+    pub key_evidence: Vec<EvidenceItem>,
+    pub data_gaps: Vec<String>,
+    pub validation_triggers: Vec<String>,
+}
+
+impl AnalystAssessmentDraft {
+    pub fn empty(
+        direction: String,
+        confidence: f64,
+        report: String,
+        priced_in: String,
+        echo_chamber_risk: String,
+        crowded_consensus_risk: String,
+    ) -> Self {
+        Self {
+            direction,
+            confidence,
+            report,
+            priced_in,
+            echo_chamber_risk,
+            crowded_consensus_risk,
+            key_evidence: Vec::new(),
+            data_gaps: Vec::new(),
+            validation_triggers: Vec::new(),
+        }
+    }
+}
+
+/// Rust-owned topic identity and fields captured by `create_phase2_topic`.
+/// The model may describe a topic but never supplies this identifier.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Phase2TopicDraft {
+    pub topic_id: String,
+    pub topic: String,
+    pub decision_hinge: String,
+    pub evidence_refs: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct TopicGenerationDraft {
+    pub metadata: ProfileDraftMetadata,
+    pub common_ground: Option<String>,
+    pub topics: BTreeMap<String, Phase2TopicDraft>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ResearcherWarmupDraft {
+    pub metadata: ProfileDraftMetadata,
+    /// A warm-up only records that its terminal preconditions were met. It
+    /// deliberately has no claim or business artifact payload.
+    pub finalized: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DebateClaimDraft {
+    pub claim_id: String,
+    pub claim: String,
+    pub confidence_bps: u16,
+    pub evidence_refs: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct DebateSeedDraft {
+    pub metadata: ProfileDraftMetadata,
+    pub claims: BTreeMap<String, DebateClaimDraft>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DebateResponseDraftEntry {
+    pub response_id: String,
+    pub reply_to_claim_id: String,
+    pub response: String,
+    pub evidence_refs: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct DebateResponseDraft {
+    pub metadata: ProfileDraftMetadata,
+    pub responses: BTreeMap<String, DebateResponseDraftEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct TopicControlDraft {
+    pub metadata: ProfileDraftMetadata,
+    pub claim_statuses: BTreeMap<String, String>,
+    pub agreed_facts: Vec<String>,
+    pub decision_hinges: Vec<String>,
+    pub routes: BTreeMap<String, String>,
+    pub should_continue: Option<bool>,
+}
+/// Explicit mutable state for Phase 3.  A decision is stored per planned
+/// ticker so the same finalizer can enforce full ticker coverage.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct ResearchDecisionDraft {
+    pub metadata: ProfileDraftMetadata,
+    pub decisions: BTreeMap<String, ResearchDecisionDraftEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResearchDecisionDraftEntry {
+    pub rating: String,
+    pub long_probability: f64,
+    pub short_probability: f64,
+    pub confidence_basis: String,
+    pub hold_reason: Option<String>,
+    pub plan: String,
+    pub probability_rationale: String,
+    pub scenarios: Option<Scenarios>,
+    pub decision_hinges: Vec<String>,
+}
+
+impl ResearchDecisionDraftEntry {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        rating: String,
+        long_probability: f64,
+        short_probability: f64,
+        confidence_basis: String,
+        hold_reason: Option<String>,
+        plan: String,
+        probability_rationale: String,
+    ) -> Self {
+        Self {
+            rating,
+            long_probability,
+            short_probability,
+            confidence_basis,
+            hold_reason,
+            plan,
+            probability_rationale,
+            scenarios: None,
+            decision_hinges: Vec::new(),
+        }
+    }
+
+    pub fn set_scenarios(&mut self, bull: Scenario, base: Scenario, bear: Scenario) {
+        self.scenarios = Some(Scenarios { bull, base, bear });
+    }
+}
 typed_profile_draft!(TradeIntentDraft);
 typed_profile_draft!(RiskReviewDraft);
 typed_profile_draft!(PortfolioDecisionDraft);
@@ -154,7 +305,7 @@ typed_profile_draft!(PhaseSummaryDraft);
 /// Typed profile state prevents a tool runtime from performing arbitrary JSON
 /// path mutation. Each profile grows explicit fields as its domain tools are
 /// migrated, while lifecycle ownership remains shared here.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ArtifactDraftState {
     HistoricalReflection(HistoricalReflectionDraft),
@@ -222,7 +373,7 @@ pub struct DraftFailure {
     pub failed_at: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ArtifactDraft {
     pub schema_version: u32,
     pub draft_id: String,
@@ -355,7 +506,7 @@ impl ContentHashDocument for ArtifactDraft {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum DraftAppendOutcome {
     Appended {
         draft: ArtifactDraft,
@@ -372,7 +523,7 @@ pub trait FinalizableArtifact: ContentHashDocument {
     fn source_payload_hash(&self) -> &str;
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum FinalizeDraftOutcome<T> {
     Completed {
         draft: ArtifactDraft,
@@ -477,6 +628,128 @@ pub fn append_draft_receipt<T: Serialize>(
         let draft = write_draft(store, location, &relative, draft)?;
         Ok(DraftAppendOutcome::Appended { draft, receipt })
     })
+}
+
+/// Atomically apply one explicit domain mutation and its idempotency receipt.
+/// Keeping the state change and receipt beneath the same unit lock prevents a
+/// crash from recording a successful tool call without its typed Draft change.
+#[allow(clippy::too_many_arguments)] // the lifecycle boundary is explicit at every call site
+pub(crate) fn mutate_draft<T: Serialize, F>(
+    store: &FileStore,
+    location: &RunLocation,
+    scope: &ArtifactScope,
+    tool_name: impl Into<String>,
+    normalized_parameters: &T,
+    result_id: impl Into<String>,
+    created_at: impl Into<String>,
+    mutate: F,
+) -> Result<DraftAppendOutcome>
+where
+    F: FnOnce(&mut ArtifactDraftState) -> Result<()>,
+{
+    let tool_name = tool_name.into();
+    let result_id = result_id.into();
+    let created_at = created_at.into();
+    if tool_name.is_empty() || result_id.is_empty() || created_at.is_empty() {
+        return Err(StoreError::InvalidDocument {
+            kind: "draft write receipt",
+            message: "tool_name, result_id, and created_at must not be empty".to_owned(),
+        });
+    }
+    let parameters = serde_json::to_value(normalized_parameters)
+        .map_err(|source| StoreError::JsonSerialize { source })?;
+    let key = receipt_hash(&tool_name, &parameters)?;
+    let relative = draft_relative(location, scope)?;
+    let lock_relative = draft_unit_relative(location, scope)?.join("lifecycle.lock");
+    store.with_exclusive_lock(&lock_relative, || {
+        let mut draft = read_draft(store, location, &relative, scope.profile)?;
+        ensure_draft_lifecycle(&draft, DraftLifecycle::Draft)?;
+        if let Some(existing) = draft.write_receipts.get(&key).cloned() {
+            return Ok(DraftAppendOutcome::AlreadyApplied {
+                draft,
+                receipt: existing,
+            });
+        }
+        mutate(&mut draft.state)?;
+        let receipt = DraftWriteReceipt {
+            normalized_parameters_hash: key.clone(),
+            tool_name,
+            result_id,
+            created_at: created_at.clone(),
+        };
+        draft.write_receipts.insert(key, receipt.clone());
+        draft.revision += 1;
+        draft.updated_at = created_at;
+        let draft = write_draft(store, location, &relative, draft)?;
+        Ok(DraftAppendOutcome::Appended { draft, receipt })
+    })
+}
+
+/// Apply one explicit typed domain command to a live draft.  This is the
+/// mutation seam used by domain services; it intentionally accepts an
+/// `ArtifactDraftState`, never a JSON path or arbitrary document value.
+///
+/// The normalized command hash is recorded in the same lock-protected write
+/// as the state change, so a provider retry cannot append a duplicate claim,
+/// response, or controller instruction.
+#[allow(clippy::too_many_arguments)] // profile commands need full Rust-owned lifecycle scope
+pub fn apply_typed_draft_command<T: Serialize>(
+    store: &FileStore,
+    location: &RunLocation,
+    scope: &ArtifactScope,
+    tool_name: impl Into<String>,
+    normalized_parameters: &T,
+    result_id: impl Into<String>,
+    created_at: impl Into<String>,
+    mutate: impl FnOnce(&mut ArtifactDraftState) -> Result<()>,
+) -> Result<DraftAppendOutcome> {
+    let tool_name = tool_name.into();
+    let result_id = result_id.into();
+    let created_at = created_at.into();
+    if tool_name.is_empty() || result_id.is_empty() || created_at.is_empty() {
+        return Err(StoreError::InvalidDocument {
+            kind: "draft command",
+            message: "tool_name, result_id, and created_at must not be empty".to_owned(),
+        });
+    }
+    let parameters = serde_json::to_value(normalized_parameters)
+        .map_err(|source| StoreError::JsonSerialize { source })?;
+    let key = receipt_hash(&tool_name, &parameters)?;
+    let relative = draft_relative(location, scope)?;
+    let lock_relative = draft_unit_relative(location, scope)?.join("lifecycle.lock");
+    store.with_exclusive_lock(&lock_relative, || {
+        let mut draft = read_draft(store, location, &relative, scope.profile)?;
+        ensure_draft_lifecycle(&draft, DraftLifecycle::Draft)?;
+        if let Some(existing) = draft.write_receipts.get(&key).cloned() {
+            return Ok(DraftAppendOutcome::AlreadyApplied {
+                draft,
+                receipt: existing,
+            });
+        }
+        mutate(&mut draft.state)?;
+        let receipt = DraftWriteReceipt {
+            normalized_parameters_hash: key.clone(),
+            tool_name,
+            result_id,
+            created_at: created_at.clone(),
+        };
+        draft.write_receipts.insert(key, receipt.clone());
+        draft.revision += 1;
+        draft.updated_at = created_at;
+        let draft = write_draft(store, location, &relative, draft)?;
+        Ok(DraftAppendOutcome::Appended { draft, receipt })
+    })
+}
+
+/// Read the exact typed draft for a known scope.  Domain finalizers use this
+/// after acquiring their lifecycle lock through `finalize_draft_atomic`.
+pub fn read_draft_for_scope(
+    store: &FileStore,
+    location: &RunLocation,
+    scope: &ArtifactScope,
+) -> Result<ArtifactDraft> {
+    let relative = draft_relative(location, scope)?;
+    read_draft(store, location, &relative, scope.profile)
 }
 
 pub fn fail_draft(

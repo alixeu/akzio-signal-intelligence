@@ -1371,6 +1371,7 @@ dependencies = [
 name = "orchestrator-store"
 version = "0.1.0"
 dependencies = [
+ "orchestrator-core",
  "serde",
  "serde_json",
  "sha2",

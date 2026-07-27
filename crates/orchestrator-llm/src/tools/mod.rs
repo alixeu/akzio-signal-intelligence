@@ -1,4 +1,5 @@
 pub mod alpaca;
+pub mod domain_tools;
 pub mod index_tools;
 pub mod read_experience;
 pub mod read_jin10_candidates;
@@ -32,6 +33,15 @@ pub const APPEND_INDEX_DETAIL_TOOL_NAME: &str = index_tools::APPEND_INDEX_DETAIL
 pub const FINALIZE_INDEX_TOOL_NAME: &str = index_tools::FINALIZE_INDEX_NAME;
 pub const READ_INDEXES_TOOL_NAME: &str = index_tools::READ_INDEXES_NAME;
 pub const READ_INDEX_DETAILS_TOOL_NAME: &str = index_tools::READ_INDEX_DETAILS_NAME;
+pub const SET_ANALYST_ASSESSMENT_TOOL_NAME: &str = domain_tools::SET_ANALYST_ASSESSMENT;
+pub const APPEND_ANALYST_EVIDENCE_TOOL_NAME: &str = domain_tools::APPEND_ANALYST_EVIDENCE;
+pub const APPEND_ANALYST_DATA_GAP_TOOL_NAME: &str = domain_tools::APPEND_ANALYST_DATA_GAP;
+pub const SET_ANALYST_INVALIDATION_TOOL_NAME: &str = domain_tools::SET_ANALYST_INVALIDATION;
+pub const FINALIZE_ANALYST_REPORT_TOOL_NAME: &str = domain_tools::FINALIZE_ANALYST_REPORT;
+pub const SET_RESEARCH_DECISION_TOOL_NAME: &str = domain_tools::SET_RESEARCH_DECISION;
+pub const SET_RESEARCH_SCENARIOS_TOOL_NAME: &str = domain_tools::SET_RESEARCH_SCENARIOS;
+pub const APPEND_RESEARCH_HINGE_TOOL_NAME: &str = domain_tools::APPEND_RESEARCH_HINGE;
+pub const FINALIZE_RESEARCH_DECISION_TOOL_NAME: &str = domain_tools::FINALIZE_RESEARCH_DECISION;
 // Internal compatibility only. This tool is intentionally absent from REGISTRY.
 pub const READ_RUN_CONTEXT_TOOL_NAME: &str = read_run_context::NAME;
 pub const ALPACA_GET_PORTFOLIO_TOOL_NAME: &str = alpaca::GET_PORTFOLIO_NAME;
@@ -111,6 +121,69 @@ struct ToolEntry {
 }
 
 const REGISTRY: &[ToolEntry] = &[
+    ToolEntry {
+        name: domain_tools::SET_ANALYST_ASSESSMENT,
+        definition: || {
+            domain_tools::definition(domain_tools::SET_ANALYST_ASSESSMENT)
+                .expect("registered domain tool")
+        },
+    },
+    ToolEntry {
+        name: domain_tools::APPEND_ANALYST_EVIDENCE,
+        definition: || {
+            domain_tools::definition(domain_tools::APPEND_ANALYST_EVIDENCE)
+                .expect("registered domain tool")
+        },
+    },
+    ToolEntry {
+        name: domain_tools::APPEND_ANALYST_DATA_GAP,
+        definition: || {
+            domain_tools::definition(domain_tools::APPEND_ANALYST_DATA_GAP)
+                .expect("registered domain tool")
+        },
+    },
+    ToolEntry {
+        name: domain_tools::SET_ANALYST_INVALIDATION,
+        definition: || {
+            domain_tools::definition(domain_tools::SET_ANALYST_INVALIDATION)
+                .expect("registered domain tool")
+        },
+    },
+    ToolEntry {
+        name: domain_tools::FINALIZE_ANALYST_REPORT,
+        definition: || {
+            domain_tools::definition(domain_tools::FINALIZE_ANALYST_REPORT)
+                .expect("registered domain tool")
+        },
+    },
+    ToolEntry {
+        name: domain_tools::SET_RESEARCH_DECISION,
+        definition: || {
+            domain_tools::definition(domain_tools::SET_RESEARCH_DECISION)
+                .expect("registered domain tool")
+        },
+    },
+    ToolEntry {
+        name: domain_tools::SET_RESEARCH_SCENARIOS,
+        definition: || {
+            domain_tools::definition(domain_tools::SET_RESEARCH_SCENARIOS)
+                .expect("registered domain tool")
+        },
+    },
+    ToolEntry {
+        name: domain_tools::APPEND_RESEARCH_HINGE,
+        definition: || {
+            domain_tools::definition(domain_tools::APPEND_RESEARCH_HINGE)
+                .expect("registered domain tool")
+        },
+    },
+    ToolEntry {
+        name: domain_tools::FINALIZE_RESEARCH_DECISION,
+        definition: || {
+            domain_tools::definition(domain_tools::FINALIZE_RESEARCH_DECISION)
+                .expect("registered domain tool")
+        },
+    },
     ToolEntry {
         name: think::NAME,
         definition: think::definition,

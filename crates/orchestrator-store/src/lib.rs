@@ -5,6 +5,7 @@
 //! atomic replacement, and JSONL recovery in one place.
 
 mod atomic;
+mod domain;
 mod draft;
 mod error;
 mod index;
@@ -13,6 +14,7 @@ mod json;
 mod jsonl;
 mod manifest;
 mod paths;
+mod phase2;
 mod recovery;
 mod schema;
 mod session;
@@ -22,13 +24,22 @@ pub use atomic::{
     rename_dir_atomic, write_bytes_atomic, write_bytes_atomic_with_options, write_json_atomic,
     AtomicWriteOptions,
 };
+pub use domain::{
+    append_analyst_data_gap, append_analyst_evidence, append_research_hinge,
+    finalize_analyst_report, finalize_research_decision, set_analyst_assessment,
+    set_analyst_invalidation, set_research_decision, set_research_scenarios, AnalystArtifact,
+    AnalystAssessmentInput, AnalystEvidenceInput, DomainFinalizeOutcome, ResearchArtifact,
+    ResearchDecisionInput, ResearchScenarioInput,
+};
 pub use draft::{
-    append_draft_receipt, create_or_recover_draft, draft_relative, fail_draft,
-    finalize_draft_atomic, AnalystReportDraft, ArtifactDraft, ArtifactDraftState, ArtifactScope,
-    DebateResponseDraft, DebateSeedDraft, DraftAppendOutcome, DraftFailure, DraftIdempotencyKey,
-    DraftLifecycle, DraftProfile, DraftWriteReceipt, FinalizableArtifact, FinalizeDraftOutcome,
-    HistoricalReflectionDraft, PhaseSummaryDraft, PortfolioDecisionDraft, ProfileDraftMetadata,
-    ResearchDecisionDraft, ResearcherWarmupDraft, RiskReviewDraft, TopicControlDraft,
+    append_draft_receipt, apply_typed_draft_command, create_or_recover_draft, draft_relative,
+    fail_draft, finalize_draft_atomic, read_draft_for_scope, AnalystAssessmentDraft,
+    AnalystReportDraft, ArtifactDraft, ArtifactDraftState, ArtifactScope, DebateClaimDraft,
+    DebateResponseDraft, DebateResponseDraftEntry, DebateSeedDraft, DraftAppendOutcome,
+    DraftFailure, DraftIdempotencyKey, DraftLifecycle, DraftProfile, DraftWriteReceipt,
+    FinalizableArtifact, FinalizeDraftOutcome, HistoricalReflectionDraft, Phase2TopicDraft,
+    PhaseSummaryDraft, PortfolioDecisionDraft, ProfileDraftMetadata, ResearchDecisionDraft,
+    ResearchDecisionDraftEntry, ResearcherWarmupDraft, RiskReviewDraft, TopicControlDraft,
     TopicGenerationDraft, TradeIntentDraft,
 };
 pub use error::{Result, StoreError};
@@ -54,6 +65,10 @@ pub use manifest::{
     RunLocation, RunManifest, RunManifestInit, RunStatus, RUN_MANIFEST_SCHEMA_VERSION,
 };
 pub use paths::{validate_relative_path, SafeSlug};
+pub use phase2::{
+    ClaimStatus, ClaimStatusEntry, Phase2Artifact, Phase2ArtifactPayload, Phase2DraftService,
+    SteerRoute, PHASE2_ARTIFACT_SCHEMA_VERSION,
+};
 pub use recovery::{rebuild_manifest_from_finalized_artifacts, recover_pending_finalization};
 pub use schema::{FileSchemaKind, Versioned};
 pub use session::{
