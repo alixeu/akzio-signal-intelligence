@@ -749,13 +749,21 @@ fn parse_append(
     )?;
     let section = DetailSection::parse(required_string(object, "section")?.as_str())?;
     let detail = required_string(object, "detail")?;
-    let source_refs = string_array(object, "source_refs")?;
-    let allowed = context.visibility.allowed_source_refs();
-    for source_ref in &source_refs {
-        if !allowed.contains(source_ref) {
-            bail!("source_ref {source_ref:?} is not visible in this Index tool scope");
+    let supplied_source_refs = string_array(object, "source_refs")?;
+    let source_refs = if context.owned.kind == IndexKind::PhaseSummary {
+        // A Summary Unit's provenance is fixed by the Rust-selected source
+        // payload. Models may describe the evidence but never select or
+        // replace canonical references with a human source label.
+        context.visibility.source_refs.iter().cloned().collect()
+    } else {
+        let allowed = context.visibility.allowed_source_refs();
+        for source_ref in &supplied_source_refs {
+            if !allowed.contains(source_ref) {
+                bail!("source_ref {source_ref:?} is not visible in this Index tool scope");
+            }
         }
-    }
+        supplied_source_refs
+    };
     Ok(AppendIndexDetailCommand {
         scope: context.scope_for_followup()?,
         section,
@@ -1124,21 +1132,27 @@ mod tests {
     }
 
     #[test]
-    fn append_only_accepts_visible_source_refs_or_evidence_ids() {
+    fn summary_append_derives_canonical_source_refs() {
         let command = prepare_command(
             APPEND_INDEX_DETAIL_NAME,
             json!({"section": "evidence", "detail": "source", "source_refs": ["evidence:1", "artifact:phase2"]}),
             &context(),
         )
         .unwrap();
-        assert!(matches!(command, IndexToolCommand::Append(_)));
-        let error = prepare_command(
+        let IndexToolCommand::Append(command) = command else {
+            panic!("expected append command");
+        };
+        assert_eq!(command.source_refs, vec!["artifact:phase2"]);
+        let command = prepare_command(
             APPEND_INDEX_DETAIL_NAME,
             json!({"section": "evidence", "detail": "source", "source_refs": ["unread"]}),
             &context(),
         )
-        .unwrap_err();
-        assert!(error.to_string().contains("not visible"));
+        .unwrap();
+        let IndexToolCommand::Append(command) = command else {
+            panic!("expected append command");
+        };
+        assert_eq!(command.source_refs, vec!["artifact:phase2"]);
     }
 
     #[test]

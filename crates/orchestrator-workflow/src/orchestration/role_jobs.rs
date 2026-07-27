@@ -1,6 +1,6 @@
 #![allow(dead_code)] // Phase 2 fork/steer runtime is invoked by its topic planner.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use futures::{stream, StreamExt};
 use orchestrator_core::{default_project_root, ToolManagedProfile};
@@ -869,6 +869,14 @@ fn file_store_phase_summary_index_runtime(
         .and_then(Value::as_u64)
         .and_then(|value| u8::try_from(value).ok())
         .context("_summary_unit.source_phase is required")?;
+    let source_refs = canonical_source_refs(
+        state
+            .get("_summary_source_payload")
+            .context("PhaseSummary role requires Rust-planned _summary_source_payload")?,
+    );
+    if source_refs.is_empty() {
+        bail!("PhaseSummary source payload contains no canonical Artifact or Index ID")
+    }
     let owned = IndexOwnedScope {
         run_id,
         source_run_id: None,
@@ -891,13 +899,42 @@ fn file_store_phase_summary_index_runtime(
     file_store_index_tool_runtime(
         store,
         owned,
-        IndexReadVisibility::default().with_default_page_size(20),
+        IndexReadVisibility {
+            source_refs,
+            applies_to_phases: (source_phase < 7)
+                .then_some(source_phase + 1)
+                .into_iter()
+                .collect(),
+            ..IndexReadVisibility::default().with_default_page_size(20)
+        },
         FileStoreIndexRuntimePlan::for_phase_summary(
             RunLocation::new(current_date, state["run_id"].as_str().unwrap_or_default())?,
             Utc::now().to_rfc3339(),
         ),
     )?
     .with_writer_role("compressor.phase_summary")
+}
+
+fn canonical_source_refs(value: &Value) -> BTreeSet<String> {
+    fn collect(value: &Value, refs: &mut BTreeSet<String>) {
+        match value {
+            Value::Array(values) => values.iter().for_each(|value| collect(value, refs)),
+            Value::Object(values) => {
+                for (key, value) in values {
+                    if matches!(key.as_str(), "artifact_id" | "index_id") {
+                        if let Some(id) = value.as_str().filter(|id| !id.trim().is_empty()) {
+                            refs.insert(id.to_owned());
+                        }
+                    }
+                    collect(value, refs);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut refs = BTreeSet::new();
+    collect(value, &mut refs);
+    refs
 }
 
 fn file_store_reflection_source(
