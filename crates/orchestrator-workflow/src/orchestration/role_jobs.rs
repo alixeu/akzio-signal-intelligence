@@ -363,7 +363,13 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
             (
                 OutputMode::ToolManaged,
                 Some(profile),
-                None,
+                Some(file_store_domain_index_read_runtime(
+                    Path::new(store_root),
+                    &state,
+                    role,
+                    phase,
+                    &tickers,
+                )?),
                 Some(binding),
                 input,
             )
@@ -448,6 +454,66 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
         retrieval_policy: retrieval_policy_for_role(role, kind, &config.retrieval),
         context_manifest: direct_context_manifest(&state, phase),
     })
+}
+
+/// One read-only Index/Detail binding for a business role. The unit scope,
+/// allowed phases and ticker set are all Rust-owned; this intentionally does
+/// not expose create/append/finalize to analysts, debaters, risk, or portfolio
+/// roles.
+fn file_store_domain_index_read_runtime(
+    store_root: &Path,
+    state: &Value,
+    role: &str,
+    phase: i64,
+    tickers: &[String],
+) -> Result<orchestrator_llm::tools::index_tools::IndexToolRuntimeBinding> {
+    use orchestrator_llm::tools::index_tools::{IndexKind, IndexOwnedScope, IndexReadVisibility};
+    use orchestrator_store::{content_hash, FileStore, FileStoreOptions, RunLocation};
+
+    let run_id = state
+        .get("run_id")
+        .and_then(Value::as_str)
+        .context("domain Index reader requires run_id")?;
+    let current_date = state
+        .get("current_date")
+        .and_then(Value::as_str)
+        .context("domain Index reader requires current_date")?;
+    let phase_u8 = u8::try_from(phase).context("domain Index reader phase must fit u8")?;
+    let source_payload_hash = content_hash(&json!({
+        "reader_role": role,
+        "phase": phase,
+        "tickers": tickers,
+        "run_id": run_id,
+    }))?;
+    let owned = IndexOwnedScope {
+        run_id: run_id.to_owned(),
+        source_run_id: None,
+        source_phase: phase_u8,
+        role: role.to_owned(),
+        kind: IndexKind::PhaseSummary,
+        ticker: None,
+        topic_id: None,
+        unit_key: format!("read-indexes:phase{phase}:{role}"),
+        source_payload_hash,
+        index_id: format!("read-only:phase{phase}:{role}"),
+    };
+    let visibility = IndexReadVisibility {
+        kinds: BTreeSet::from([IndexKind::PhaseSummary, IndexKind::Experience]),
+        tickers: tickers.iter().cloned().collect(),
+        source_phases: (0..phase_u8).collect(),
+        applies_to_phases: BTreeSet::from([phase_u8]),
+        max_page_size: 20,
+        ..Default::default()
+    };
+    file_store_index_tool_runtime(
+        FileStore::open(store_root, FileStoreOptions::default())?,
+        owned,
+        visibility,
+        FileStoreIndexRuntimePlan::read_only(
+            vec![RunLocation::new(current_date, run_id)?],
+            Utc::now().to_rfc3339(),
+        ),
+    )
 }
 
 /// These values are intentionally projected before constructing the domain
@@ -1417,11 +1483,11 @@ pub(crate) async fn run_role_job_with_timeout(job: RoleJob, timeout_sec: u64) ->
 
 async fn execute_role_job(job: RoleJob) -> Result<AgentLoopOutput> {
     if job.mock {
-        if let Some(binding) = job.index_tool_runtime.clone() {
-            return mock_index_tool_managed_output(job, binding);
-        }
         if let Some(binding) = job.domain_tool_runtime.clone() {
             return mock_domain_tool_managed_output(job, binding);
+        }
+        if let Some(binding) = job.index_tool_runtime.clone() {
+            return mock_index_tool_managed_output(job, binding);
         }
         debug!(
             role = job.role,

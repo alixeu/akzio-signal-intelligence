@@ -30,6 +30,7 @@ pub struct FileStoreIndexRuntimePlan {
     pub write_location: Option<RunLocation>,
     pub read_phase_summary_locations: Vec<RunLocation>,
     pub created_at: String,
+    pub read_only: bool,
 }
 
 impl FileStoreIndexRuntimePlan {
@@ -38,6 +39,7 @@ impl FileStoreIndexRuntimePlan {
             write_location: Some(location.clone()),
             read_phase_summary_locations: vec![location],
             created_at,
+            read_only: false,
         }
     }
 
@@ -49,12 +51,31 @@ impl FileStoreIndexRuntimePlan {
             write_location: None,
             read_phase_summary_locations,
             created_at,
+            read_only: false,
+        }
+    }
+
+    /// Domain agents may consume completed knowledge, but never create a
+    /// summary/experience Index. This uses the same reader implementation and
+    /// visibility checks without granting a second writer authority.
+    pub fn read_only(read_phase_summary_locations: Vec<RunLocation>, created_at: String) -> Self {
+        Self {
+            write_location: None,
+            read_phase_summary_locations,
+            created_at,
+            read_only: true,
         }
     }
 
     fn validate_for(&self, owned: &IndexOwnedScope) -> Result<()> {
         if self.created_at.trim().is_empty() {
             bail!("FileStore Index runtime requires a Rust-owned created_at");
+        }
+        if self.read_only {
+            if self.write_location.is_some() {
+                bail!("read-only Index runtime must not carry a write location")
+            }
+            return Ok(());
         }
         match (owned.kind, self.write_location.is_some()) {
             (ToolIndexKind::PhaseSummary, true) | (ToolIndexKind::Experience, false) => Ok(()),
@@ -78,13 +99,19 @@ pub fn file_store_index_tool_runtime(
     plan: FileStoreIndexRuntimePlan,
 ) -> Result<IndexToolRuntimeBinding> {
     plan.validate_for(&owned)?;
+    let read_only = plan.read_only;
     let service = FileStoreIndexToolService {
         store,
         owned: owned.clone(),
         plan,
         read_scopes: Mutex::new(BTreeMap::new()),
     };
-    IndexToolRuntimeBinding::new(owned, visibility, Arc::new(service))
+    let binding = IndexToolRuntimeBinding::new(owned, visibility, Arc::new(service))?;
+    Ok(if read_only {
+        binding.read_only()
+    } else {
+        binding
+    })
 }
 
 #[derive(Debug)]

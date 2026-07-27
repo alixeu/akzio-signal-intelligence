@@ -1773,6 +1773,7 @@ pub struct ProjectToolRuntime {
         >,
     >,
     index_runtime_error: Option<String>,
+    index_write_allowed: bool,
     domain_binding: Option<tools::domain_tools::DomainToolRuntimeBinding>,
     domain_runtime_error: Option<String>,
 }
@@ -1800,6 +1801,7 @@ impl ProjectToolRuntime {
             index_binding: None,
             index_runtime: None,
             index_runtime_error: None,
+            index_write_allowed: false,
             domain_binding: None,
             domain_runtime_error: None,
         }
@@ -1817,6 +1819,7 @@ impl ProjectToolRuntime {
         mut self,
         binding: tools::index_tools::IndexToolRuntimeBinding,
     ) -> Self {
+        self.index_write_allowed = binding.allows_write();
         self.index_binding = Some(binding);
         self
     }
@@ -1869,6 +1872,7 @@ impl LoopToolRuntime for ProjectToolRuntime {
         let turn_context = self.turn_context.clone();
         let index_runtime = self.index_runtime.as_ref();
         let index_runtime_error = self.index_runtime_error.as_deref();
+        let index_write_allowed = self.index_write_allowed;
         let domain_binding = self.domain_binding.as_ref();
         let domain_runtime_error = self.domain_runtime_error.as_deref();
         Box::pin(async move {
@@ -1888,6 +1892,12 @@ impl LoopToolRuntime for ProjectToolRuntime {
                     | tools::READ_INDEX_DETAILS_TOOL_NAME
             );
             let is_domain_tool = tools::domain_tools::is_domain_tool(&call.name);
+            let index_write_tool = matches!(
+                call.name.as_str(),
+                tools::CREATE_INDEX_TOOL_NAME
+                    | tools::APPEND_INDEX_DETAIL_TOOL_NAME
+                    | tools::FINALIZE_INDEX_TOOL_NAME
+            );
             let enabled = call.name == "think"
                 || tools::enabled_tool_names(
                     web_run_config,
@@ -1895,7 +1905,9 @@ impl LoopToolRuntime for ProjectToolRuntime {
                     config.alpaca_market_data,
                 )
                 .contains(&call.name.as_str())
-                || (is_index_tool && index_runtime.is_some())
+                || (is_index_tool
+                    && index_runtime.is_some()
+                    && (!index_write_tool || index_write_allowed))
                 || (is_domain_tool && domain_binding.is_some());
             if !configured || !enabled {
                 warn!(

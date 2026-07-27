@@ -2197,14 +2197,28 @@ fn configured_tool_names(settings: &AgentSettings) -> Vec<&str> {
     if uses_web_run_fallback(settings) {
         names.push(tools::WEB_RUN_TOOL_NAME);
     }
-    if settings.index_tool_runtime.is_some() {
+    if let Some(binding) = &settings.index_tool_runtime {
+        if binding.allows_write() {
+            names.extend([
+                tools::CREATE_INDEX_TOOL_NAME,
+                tools::APPEND_INDEX_DETAIL_TOOL_NAME,
+                tools::FINALIZE_INDEX_TOOL_NAME,
+            ]);
+        }
         names.extend([
-            tools::CREATE_INDEX_TOOL_NAME,
-            tools::APPEND_INDEX_DETAIL_TOOL_NAME,
-            tools::FINALIZE_INDEX_TOOL_NAME,
             tools::READ_INDEXES_TOOL_NAME,
             tools::READ_INDEX_DETAILS_TOOL_NAME,
         ]);
+        if !binding.allows_write() {
+            names.retain(|name| {
+                !matches!(
+                    *name,
+                    tools::CREATE_INDEX_TOOL_NAME
+                        | tools::APPEND_INDEX_DETAIL_TOOL_NAME
+                        | tools::FINALIZE_INDEX_TOOL_NAME
+                )
+            });
+        }
     }
     if let Some(binding) = &settings.domain_tool_runtime {
         names.extend(tools::domain_tools::tool_names_for_profile(

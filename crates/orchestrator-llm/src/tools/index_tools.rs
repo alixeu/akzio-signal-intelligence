@@ -426,6 +426,7 @@ pub struct IndexToolRuntimeBinding {
     visibility: IndexReadVisibility,
     service: Arc<dyn IndexToolService>,
     writer_role: Option<String>,
+    allow_write: bool,
 }
 
 impl fmt::Debug for IndexToolRuntimeBinding {
@@ -451,6 +452,7 @@ impl IndexToolRuntimeBinding {
             visibility,
             service,
             writer_role: None,
+            allow_write: true,
         })
     }
 
@@ -464,6 +466,18 @@ impl IndexToolRuntimeBinding {
         }
         self.writer_role = Some(role);
         Ok(self)
+    }
+
+    /// Give a business role only retrieval capability.  The Index scope is
+    /// still Rust-owned, but create/append/finalize are not even advertised
+    /// or executable through this binding.
+    pub fn read_only(mut self) -> Self {
+        self.allow_write = false;
+        self
+    }
+
+    pub const fn allows_write(&self) -> bool {
+        self.allow_write
     }
 
     pub fn owned_scope(&self) -> &IndexOwnedScope {
@@ -482,6 +496,7 @@ impl IndexToolRuntimeBinding {
                 self.writer_role.as_deref(),
             )?,
             Arc::clone(&self.service),
+            self.allow_write,
         ))
     }
 }
@@ -501,14 +516,19 @@ pub struct IndexReadPage {
 pub struct IndexToolRuntime<S> {
     context: IndexToolRuntimeContext,
     service: S,
+    allow_write: bool,
 }
 
 impl<S> IndexToolRuntime<S>
 where
     S: IndexToolService,
 {
-    pub fn new(context: IndexToolRuntimeContext, service: S) -> Self {
-        Self { context, service }
+    pub fn new(context: IndexToolRuntimeContext, service: S, allow_write: bool) -> Self {
+        Self {
+            context,
+            service,
+            allow_write,
+        }
     }
 
     pub fn context(&self) -> &IndexToolRuntimeContext {
@@ -516,6 +536,14 @@ where
     }
 
     pub fn execute(&self, name: &str, args: Value) -> Result<Value> {
+        if !self.allow_write
+            && matches!(
+                name,
+                CREATE_INDEX_NAME | APPEND_INDEX_DETAIL_NAME | FINALIZE_INDEX_NAME
+            )
+        {
+            bail!("this Index binding is read-only")
+        }
         match prepare_command(name, args, &self.context)? {
             IndexToolCommand::Create(command) => self.service.create_index(command),
             IndexToolCommand::Append(command) => self.service.append_index_detail(command),
