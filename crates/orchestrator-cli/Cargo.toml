@@ -13,6 +13,7 @@ regex.workspace = true
 orchestrator-core = { path = "../orchestrator-core" }
 orchestrator-llm = { path = "../orchestrator-llm" }
 orchestrator-ingest = { path = "../orchestrator-ingest" }
+orchestrator-store = { path = "../orchestrator-store" }
 orchestrator-workflow = { path = "../orchestrator-workflow" }
 serde.workspace = true
 serde_json.workspace = true
@@ -43,3 +44,7 @@ path = "src/bin/orchestrator_eval.rs"
 [[bin]]
 name = "orchestrator-prompt-lint"
 path = "src/bin/orchestrator_prompt_lint.rs"
+
+[[bin]]
+name = "orchestrator-store-doctor"
+path = "src/bin/orchestrator_store_doctor.rs"
