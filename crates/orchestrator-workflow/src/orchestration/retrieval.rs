@@ -205,7 +205,7 @@ mod tests {
     }
 
     #[test]
-    fn retrieval_budget_caps_injected_prior_memory() {
+    fn retrieval_budget_caps_injected_experience_indexes() {
         let temp = tempfile::tempdir().unwrap();
         let store = FileStore::open(temp.path(), FileStoreOptions::default()).unwrap();
         seed_experience(&store, "run-1", "pattern-one", 0.9);

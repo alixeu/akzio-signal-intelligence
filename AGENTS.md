@@ -101,7 +101,7 @@ Prefer `codegraph_context` first for architecture, feature, or bug-context quest
 - Do not describe YouTube or Reddit/X as active inputs until ingestion, FileStore
   context readers, role registration, prompts, and scheduling are all configured.
 - Keep reflection outcome-backed and historical: never learn from mock runs,
-  unscored predictions, or the current prediction. Candidate distillation must
+  unscored predictions, or the current prediction. Experience Index writes must
   remain idempotent, and reflection failures must not invalidate a completed
   investment decision.
 - Avoid committing local config, FileStore data, build output, or report artifacts.

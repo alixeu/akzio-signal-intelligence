@@ -290,7 +290,7 @@ pub(crate) fn direct_context_manifest(state: &Value, phase: i64) -> Value {
         contexts.push(context_manifest_item(
             "retrieval_bootstrap",
             retrieval_bootstrap(state, phase),
-            "phase_summary_memory_metadata",
+            "phase_summary_index_metadata",
             true,
         ));
     }
@@ -1240,7 +1240,7 @@ required_variables = ["ticker", "tickers"]
                 "topic_briefs": [{"topic_id": "QQQ-gap"}],
                 "debate_turns": [{"should_not": "be forwarded"}]
             },
-            "prior_memory": {"items": []},
+            "prior_experience": {"items": []},
             "track_record": {"sample_size": 2},
             "agent_accuracy": {"analyst.technical": 0.7}
         }));
@@ -1252,7 +1252,7 @@ required_variables = ["ticker", "tickers"]
             context["weighted_probability_base"]["QQQ"]["long_probability"],
             0.5
         );
-        assert!(context.get("prior_memory").is_none());
+        assert!(context.get("prior_experience").is_none());
         assert!(context.get("track_record").is_none());
         assert!(context.get("agent_accuracy").is_none());
     }
@@ -1261,7 +1261,7 @@ required_variables = ["ticker", "tickers"]
     fn context_manifest_records_source_size_and_visibility() {
         let manifest = direct_context_manifest(
             &json!({
-                "phase_summary_memory": {
+                "phase_summary_indexes": {
                     "phases": {
                         "3": {"summaries": [{"role": "manager.research"}], "details": []}
                     }
@@ -1377,7 +1377,7 @@ required_variables = ["ticker", "tickers"]
             "phase1_index": {"report": large},
             "research_plan": {"report": large},
             "risk_debate_state": {"history": [{"artifact": {"argument": large}}]},
-            "phase_summary_memory": {
+            "phase_summary_indexes": {
                 "run_id": "run",
                 "phases": {}
             }

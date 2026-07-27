@@ -678,11 +678,11 @@ fn source_payload_for(state: &Value, phase: u8, profile: ToolManagedProfile) -> 
         }),
         (2, ToolManagedProfile::ResearcherWarmup) => json!({
             "phase1_index": state.get("phase1_index"),
-            "phase_summaries": state.get("phase_summary_memory"),
+            "phase_summaries": state.get("phase_summary_indexes"),
         }),
         (2, ToolManagedProfile::TopicGeneration) => json!({
             "phase1_index": state.get("phase1_index"),
-            "phase_summaries": state.get("phase_summary_memory"),
+            "phase_summaries": state.get("phase_summary_indexes"),
         }),
         (
             2,
