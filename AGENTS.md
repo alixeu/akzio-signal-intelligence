@@ -9,7 +9,7 @@ This repository is a Rust workspace for AI-assisted market-signal research and T
 - Language: Rust 2021.
 - Workspace crates:
   - `orchestrator-core`: shared config, paths, ticker parsing, prompt helpers, and artifact validation.
-  - `orchestrator-sql`: SQLite schema, imports, scoped messages, and read-context commands.
+  - `orchestrator-store`: atomic FileStore persistence, manifests, sessions, drafts, indexes, and execution recovery.
   - `orchestrator-llm`: OpenAI Responses API execution and mock role artifacts.
   - `orchestrator-cli`: CLI binaries and workflow orchestration.
 - Prompt templates live under `prompts/` and are owned by their runtime phase:
@@ -32,8 +32,8 @@ This repository is a Rust workspace for AI-assisted market-signal research and T
 - Phase 0 historical scoring/task selection, Phase 7 allocation, and Phase 8
   decision snapshot/archive are Rust-owned stages. Phase 0 uses a dedicated
   historical-reflector prompt for causal analysis.
-- A non-mock workflow scores predictions after three stored trading bars and
-  promotes qualified historical experience for retrieval on later runs.
+- A non-mock workflow records outcome-backed historical cases as Experience
+  Index/Detail entries for later retrieval.
 - Phase Summary is the only cross-phase semantic interface for model roles in
   Phases 2–6. Roles list summaries before expanding details; Rust enforces
   role-specific source-phase, pagination, detail-budget, and evidence-ID policy.
@@ -41,7 +41,7 @@ This repository is a Rust workspace for AI-assisted market-signal research and T
   their separately compressed Phase 5 summaries.
 - Generated run outputs live under `outputs/` and should not be committed.
 - Runtime defaults live in `config/config.yaml`.
-- Live agent runs use strict SQLite input by default.
+- Live agent runs use run-sealed FileStore input snapshots by default.
 
 ## Commands
 
@@ -57,7 +57,7 @@ Common local runs:
 
 ```bash
 rtk cargo run -p orchestrator-cli --bin orchestrator-exec -- --mock
-rtk cargo run -p orchestrator-cli --bin run-daily-tqqq-report -- --mock --skip-send
+rtk cargo run -p orchestrator-cli --bin report-email -- --help
 ```
 
 ## CodeGraph
@@ -83,11 +83,11 @@ Prefer `codegraph_context` first for architecture, feature, or bug-context quest
 ## Coding Rules
 
 - Keep changes scoped and aligned with the existing crate boundaries.
-- Prefer existing helpers in `orchestrator-core` and `orchestrator-sql` before adding new utilities.
+- Prefer existing helpers in `orchestrator-core` and `orchestrator-store` before adding new utilities.
 - Validate inputs at CLI and system boundaries.
 - Do not hardcode secrets; use environment variables.
 - Preserve mock paths for local development without `LLM_GATEWAY_API_KEY`.
-- Do not make live `orchestrator-exec` read network, CSV, or external JSON directly. Import those sources into SQLite first.
+- Do not let live `orchestrator-exec` consume mutable market inputs directly; seal atomic Technical/Jin10 input snapshots in the run FileStore first.
 - Keep prompt paths configured under `orchestrator.prompts` and fail early if a configured prompt file is missing.
 - Keep `mediator.topic` evidence-only: it may use the Phase 1 index and prior
   phase summaries, while Rust owns the topic artifact runtime envelope and

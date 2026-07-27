@@ -10,7 +10,10 @@ async fn mock_exec_writes_file_store_manifest_and_indexes() {
         .await
         .unwrap();
 
-    assert_eq!(result["long_probability"], 0.5);
+    assert_eq!(
+        result["run_state"]["research_plan"]["per_ticker"]["QQQ"]["long_probability"],
+        0.5
+    );
     assert!(has_file_named(&store_root.join("runs"), "manifest.json"));
     assert!(has_directory_named(&store_root.join("runs"), "index"));
     assert_no_database_files(&store_root);
@@ -19,10 +22,8 @@ async fn mock_exec_writes_file_store_manifest_and_indexes() {
     assert_eq!(state["phase_status"]["1"], "done");
     assert_eq!(state["phase_status"]["2"], "done");
     assert_eq!(state["phase_status"]["3"], "done");
-    assert_eq!(
-        state["phase1_agents"],
-        serde_json::json!(["analyst.technical", "analyst.news_macro"])
-    );
+    assert!(state["analyst_reports"]["analyst.technical"].is_object());
+    assert!(state["analyst_reports"]["analyst.news_macro"].is_object());
 }
 
 #[tokio::test]
@@ -34,8 +35,14 @@ async fn mock_exec_phase7_writes_file_store_allocation() {
         .await
         .unwrap();
 
-    assert_eq!(result["action"], "Hold");
-    assert_eq!(result["final_trade_decision"]["rating"], "Hold");
+    assert_eq!(
+        result["run_state"]["trader_investment_plan"]["per_ticker"]["QQQ"]["intent"]["action"],
+        "Hold"
+    );
+    assert_eq!(
+        result["run_state"]["final_trade_decision"]["per_asset"]["QQQ"]["decision"]["rating"],
+        "Hold"
+    );
     assert_eq!(result["portfolio_allocation"]["total_equity_exposure"], 0.0);
     assert_eq!(
         result["portfolio_allocation"]["weights"]["cash_hedge"]["weight"],
@@ -46,8 +53,14 @@ async fn mock_exec_phase7_writes_file_store_allocation() {
 
     let state = &result["run_state"];
     assert_eq!(state["phase_status"]["7"], "done");
-    assert_eq!(state["phase4_authority"], "file_store");
-    assert_eq!(state["phase6_authority"], "file_store");
+    assert_eq!(
+        state["trader_investment_plan"]["per_ticker"]["QQQ"]["profile"],
+        "trade_intent"
+    );
+    assert_eq!(
+        state["final_trade_decision"]["per_asset"]["QQQ"]["profile"],
+        "portfolio_decision"
+    );
 }
 
 #[tokio::test]

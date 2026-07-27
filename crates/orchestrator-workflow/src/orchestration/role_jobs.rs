@@ -1,3 +1,5 @@
+#![allow(dead_code)] // Phase 2 fork/steer runtime is invoked by its topic planner.
+
 use anyhow::{Context, Result};
 use chrono::Utc;
 use futures::{stream, StreamExt};
@@ -877,78 +879,6 @@ pub(crate) async fn run_role_jobs(
         .await
 }
 
-pub(crate) async fn run_single_role_job(
-    input: RoleRun<'_>,
-    timeout_sec: u64,
-    _config: &RuntimeConfig,
-    state_for_degraded: &mut Value,
-    _conn: &rusqlite::Connection,
-) -> Result<Value> {
-    let result = run_single_role_job_result(input, timeout_sec, state_for_degraded, _conn).await?;
-    result.artifact.with_context(|| {
-        format!(
-            "ToolManaged role ended without terminal finalize: {}",
-            result.error.as_deref().unwrap_or("unknown role failure")
-        )
-    })
-}
-
-/// Execute one role and preserve the raw result for a FileStore-authoritative
-/// caller.  Such a caller must choose its typed degraded finalizer itself;
-/// routing it through `role_artifact_or_degraded` would manufacture a legacy
-/// JSON artifact after a terminal-tool failure and create a second authority.
-pub(crate) async fn run_single_role_job_result(
-    input: RoleRun<'_>,
-    timeout_sec: u64,
-    state_for_metrics: &mut Value,
-    _conn: &rusqlite::Connection,
-) -> Result<RoleJobResult> {
-    let job = prepare_role_job(input)?;
-    let result = run_role_job_with_timeout(job, timeout_sec).await;
-    record_role_job_metrics(state_for_metrics, &result);
-    Ok(result)
-}
-
-pub(crate) async fn run_single_steer_role_job(
-    input: SteerRoleRun<'_>,
-    timeout_sec: u64,
-    _config: &RuntimeConfig,
-    state_for_degraded: &mut Value,
-    _conn: &rusqlite::Connection,
-) -> Result<Value> {
-    let job = prepare_role_job(RoleRun {
-        state: input.state,
-        role: input.role,
-        phase: input.phase,
-        kind: input.kind,
-        round: input.round,
-        topic_id: input.topic_id,
-        mock: input.mock,
-        model_override: input.model_override,
-        reasoning_effort_override: input.reasoning_effort_override,
-        config: input.config,
-        prompt_path: input.prompt_path,
-    })?;
-    let result = run_steer_role_job_with_timeout(
-        job,
-        input.session_id,
-        input.turn_id,
-        input.steer,
-        timeout_sec,
-    )
-    .await;
-    record_role_job_metrics(state_for_degraded, &result);
-    // A migrated Phase 2 unit has exactly one authority: its terminal typed
-    // FileStore artifact.  Never route a missing terminal through the legacy
-    // JSON degraded helper, which would create a second persistence path.
-    result.artifact.with_context(|| {
-        format!(
-            "ToolManaged steer role ended without terminal finalize: {}",
-            result.error.as_deref().unwrap_or("unknown role failure")
-        )
-    })
-}
-
 pub(crate) fn record_role_job_metrics(state: &mut Value, result: &RoleJobResult) {
     let status = if result.artifact.is_some() {
         "ok"
@@ -1041,10 +971,6 @@ pub(crate) fn record_role_job_metrics(state: &mut Value, result: &RoleJobResult)
             }),
         );
     }
-}
-
-pub(crate) fn persist_prompt_metric(_conn: &rusqlite::Connection, _result: &RoleJobResult) {
-    // ponytail: agent_events restructured — prompt metrics deferred
 }
 
 pub(crate) fn merge_role_job_metrics(state: &mut Value, metrics: &Value) {

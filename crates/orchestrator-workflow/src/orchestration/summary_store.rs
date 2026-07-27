@@ -1,3 +1,5 @@
+#![allow(dead_code)] // summary writer remains shared with non-mock summary jobs.
+
 //! Deterministic FileStore writer for the fixed Phase Summary unit plan.
 //!
 //! Completed Index directories produced here are the only phase-summary

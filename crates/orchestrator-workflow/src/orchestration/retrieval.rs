@@ -1,3 +1,5 @@
+#![allow(dead_code)] // retrieval helpers are used by profile-specific prompt contexts.
+
 use anyhow::Result;
 use orchestrator_core::MarketRegime;
 use orchestrator_store::{
@@ -5,7 +7,7 @@ use orchestrator_store::{
 };
 use serde_json::{json, Value};
 
-use crate::orchestration::config::{AllocationConfig, RuntimeConfig};
+use crate::orchestration::config::RuntimeConfig;
 
 pub(crate) fn inject_phase_summary_reflection(
     state: &mut Value,

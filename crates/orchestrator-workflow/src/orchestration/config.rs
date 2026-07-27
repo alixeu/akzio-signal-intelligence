@@ -1,3 +1,5 @@
+#![allow(dead_code)] // configuration remains shared by optional ToolManaged profiles.
+
 use anyhow::{bail, Context, Result};
 use orchestrator_core::{
     config_bool, config_get, config_int, config_str, config_strings, project_path, AgentRegistry,
@@ -14,7 +16,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use tracing::warn;
 
-use super::policy::{WorkflowPolicyMode, WorkflowPolicyThresholds};
 use orchestrator_core::{validate_plugins, ComponentRegistry, RolePluginRegistry};
 
 // Prompt versioning convention:
@@ -144,9 +145,6 @@ pub(crate) struct WorkflowConfig {
     pub reducer_timeout_sec: u64,
     pub critical_roles: BTreeSet<String>,
     pub late_evidence_enabled: bool,
-    pub policy_mode: WorkflowPolicyMode,
-    pub policy_thresholds: WorkflowPolicyThresholds,
-    pub force_portfolio_review: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1071,63 +1069,13 @@ impl WorkflowConfig {
         .collect::<BTreeSet<_>>();
         let late_evidence_enabled =
             config_bool(config, "orchestrator.workflow.late_evidence.enabled", true);
-        let force_portfolio_review = config_bool(
-            config,
-            "orchestrator.workflow.policy.force_portfolio_review",
-            false,
-        );
         Self {
             phase1_parallelism,
             agent_timeout_sec,
             reducer_timeout_sec,
             critical_roles,
             late_evidence_enabled,
-            policy_mode: policy_mode_from_config(config),
-            policy_thresholds: policy_thresholds_from_config(config),
-            force_portfolio_review,
         }
-    }
-}
-
-fn policy_mode_from_config(config: &Value) -> WorkflowPolicyMode {
-    match config_str(config, "orchestrator.workflow.policy.mode", "selective")
-        .trim()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "selective" | "gated" => WorkflowPolicyMode::Selective,
-        _ => WorkflowPolicyMode::Legacy,
-    }
-}
-
-fn policy_thresholds_from_config(config: &Value) -> WorkflowPolicyThresholds {
-    let defaults = WorkflowPolicyThresholds::default();
-    WorkflowPolicyThresholds {
-        min_confidence: config_f64(
-            config,
-            "orchestrator.workflow.policy.min_confidence",
-            defaults.min_confidence,
-        ),
-        neutral_probability_band: config_f64(
-            config,
-            "orchestrator.workflow.policy.neutral_probability_band",
-            defaults.neutral_probability_band,
-        ),
-        max_volatility: config_f64(
-            config,
-            "orchestrator.workflow.policy.max_volatility",
-            defaults.max_volatility,
-        ),
-        max_correlation: config_f64(
-            config,
-            "orchestrator.workflow.policy.max_correlation",
-            defaults.max_correlation,
-        ),
-        max_position: config_f64(
-            config,
-            "orchestrator.workflow.policy.max_position",
-            defaults.max_position,
-        ),
     }
 }
 

@@ -145,13 +145,13 @@ dual-write field or a reader fallback to the legacy representation.
 | Crate | Responsibility |
 |---|---|
 | `orchestrator-core` | Config paths, role registry, ticker parsing, canonical schemas and validators |
-| `orchestrator-sql` | WAL schema, ingestion imports, scoped messages, phase summaries and memory storage |
-| `orchestrator-llm` | Responses/Chat Completions streaming, bounded agent loop, tool execution and structured-output parsing |
+| `orchestrator-store` | Atomic FileStore persistence for manifests, sessions, typed drafts, canonical artifacts, Index/Detail knowledge, and execution recovery |
+| `orchestrator-llm` | Responses/Chat Completions streaming, bounded agent loop, and domain-tool execution |
 | `orchestrator-ingest` | Alpaca/Yahoo technical ingestion and Jin10 ingestion |
 | `orchestrator-workflow` | Phase orchestration, policy gates, reducers, probability and allocation guards |
 | `orchestrator-cli` | CLI binaries, reporting, operations, metrics and prompt linting |
 
-There is no long-running service entry point. `orchestrator-exec` is the workflow entry point and opens SQLite through `orchestrator-sql`.
+There is no long-running service entry point. `orchestrator-exec` is the workflow entry point and persists only under the configured FileStore root (`outputs/store` by default).
 
 ## Requirements
 

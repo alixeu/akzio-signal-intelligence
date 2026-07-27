@@ -670,7 +670,7 @@ fn is_evidence_read_tool(name: &str) -> bool {
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::only_used_in_recursion)]
 fn collect_evidence_records(
     value: &Value,
     default_kind: &str,

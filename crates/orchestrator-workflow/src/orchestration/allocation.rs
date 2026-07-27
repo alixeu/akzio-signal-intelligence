@@ -1,3 +1,5 @@
+#![allow(dead_code)] // allocation prompt projection is used by the allocation report entrypoint.
+
 use anyhow::{bail, Result};
 use orchestrator_core::{config_get, PortfolioAllocation};
 use serde_json::{json, Value};

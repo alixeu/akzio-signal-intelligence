@@ -1,3 +1,5 @@
+#![allow(dead_code)] // monitor prompt selection remains a supported renderer mode.
+
 use anyhow::{bail, Context, Result};
 use orchestrator_core::{render_template, ComponentPlugin};
 use serde_json::{json, Value};

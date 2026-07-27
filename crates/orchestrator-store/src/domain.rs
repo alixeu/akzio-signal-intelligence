@@ -1208,7 +1208,7 @@ fn research_value(entry: &ResearchDecisionDraftEntry) -> Result<Value> {
     serde_json::to_value(json!({
         "rating": entry.rating, "long_probability": entry.long_probability, "short_probability": entry.short_probability,
         "confidence_basis": entry.confidence_basis, "hold_reason": entry.hold_reason, "plan": entry.plan,
-        "probability_rationale": entry.probability_rationale, "scenarios": entry.scenarios, "per_ticker": {}
+        "probability_rationale": entry.probability_rationale, "scenarios": entry.scenarios
     })).map_err(|source| StoreError::JsonSerialize { source })
 }
 
