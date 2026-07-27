@@ -234,6 +234,7 @@ where
     let mut aggregate_result = ModelStreamResult::default();
     let mut judge_call_count = 0usize;
     let mut retrieval_retry_queued = false;
+    let mut terminal_finalize_failures = 0usize;
     loop {
         if let Some(max_loops) = max_loops {
             if end_turn_count >= max_loops {
@@ -327,6 +328,7 @@ where
             let debug_loop = loop_index;
             let tool_batch_started = Instant::now();
             let mut terminal_completed = false;
+            let mut terminal_finalize_exhausted = false;
             let mut calls = calls.into_iter();
             while let Some(call) = calls.next() {
                 emit_tool_call_status(turn, sink, &call, AgentItemStatus::Running).await?;
@@ -399,6 +401,19 @@ where
                     }
                     break;
                 }
+                if config.require_terminal_tool && is_terminal_finalize_attempt(&result) {
+                    terminal_finalize_failures += 1;
+                    if terminal_finalize_failures >= MAX_FINALIZE_ATTEMPTS {
+                        terminal_finalize_exhausted = true;
+                        break;
+                    }
+                    turn.push_pending_input(
+                        "The terminal finalize tool was rejected. Repair the Draft using the reported validation error, then call the assigned finalize tool exactly once more. Do not provide prose.",
+                    );
+                    // Do not execute further calls from the invalid response:
+                    // repair must be an explicit, auditable next model turn.
+                    break;
+                }
             }
             let tool_batch_ms = tool_batch_started.elapsed().as_millis();
             aggregate_result.tool_ms = aggregate_result.tool_ms.saturating_add(tool_batch_ms);
@@ -407,6 +422,13 @@ where
                 turn.end_reason = Some("terminal_tool".to_string());
                 persist_turn(session, turn, &config.truncation)?;
                 return Ok(aggregate_result);
+            }
+            if terminal_finalize_exhausted {
+                turn.end_reason = Some("terminal_finalize_failed".to_string());
+                persist_turn(session, turn, &config.truncation)?;
+                bail!(
+                    "tool-managed terminal finalize failed after {MAX_FINALIZE_ATTEMPTS} attempts"
+                );
             }
             if loop_index >= 3 && !config.require_terminal_tool {
                 turn.tools_disabled = true;
@@ -1404,6 +1426,15 @@ pub fn is_terminal_tool_result(result: &ToolResultItem) -> bool {
             .unwrap_or(false)
 }
 
+/// ToolManaged profiles get one repair turn after a failed terminal finalizer.
+/// A second failed finalizer is handed to the workflow's existing degraded
+/// policy rather than allowing an unbounded model retry loop.
+pub const MAX_FINALIZE_ATTEMPTS: usize = 2;
+
+fn is_terminal_finalize_attempt(result: &ToolResultItem) -> bool {
+    result.name.starts_with("finalize_") && !is_terminal_tool_result(result)
+}
+
 pub fn classify_assistant_message(_text: &str, turn_status: TurnStatus) -> FollowUpDecision {
     match turn_status {
         TurnStatus::Intermediate => FollowUpDecision::NeedsFollowUp,
@@ -2076,5 +2107,34 @@ impl LoopToolRuntime for StaticToolRuntime {
             };
             tool(call.arguments)
         })
+    }
+}
+
+#[cfg(test)]
+mod terminal_finalize_tests {
+    use serde_json::{json, Value};
+
+    use super::{is_terminal_finalize_attempt, is_terminal_tool_result, ToolResultItem};
+
+    #[test]
+    fn only_unsuccessful_finalize_calls_consume_the_repair_budget() {
+        let failed = ToolResultItem {
+            call_id: "call-1".to_owned(),
+            name: "finalize_analyst_report".to_owned(),
+            status: "error".to_owned(),
+            output: Value::Null,
+            error: Some("missing evidence".to_owned()),
+        };
+        assert!(is_terminal_finalize_attempt(&failed));
+
+        let succeeded = ToolResultItem {
+            call_id: "call-2".to_owned(),
+            name: "finalize_analyst_report".to_owned(),
+            status: "completed".to_owned(),
+            output: json!({"terminal": true, "artifact": {}}),
+            error: None,
+        };
+        assert!(is_terminal_tool_result(&succeeded));
+        assert!(!is_terminal_finalize_attempt(&succeeded));
     }
 }
