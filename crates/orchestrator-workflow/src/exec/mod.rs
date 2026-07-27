@@ -14,15 +14,19 @@ use orchestrator_store::{
     RunManifest, RunManifestInit, RunStatus,
 };
 use serde_json::{json, Value};
-use std::{collections::BTreeMap, path::Path, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+    time::Duration,
+};
 
 use crate::orchestration::{
     allocation::{compute_allocation_context, derive_guarded_allocation},
     config::RuntimeConfig,
     domain_runtime::{
-        finalize_degraded_analyst_report, finalize_degraded_portfolio_decision,
-        finalize_degraded_research_decision, finalize_degraded_risk_review,
-        finalize_degraded_trade_intent, FileStoreDomainRuntimePlan,
+        finalize_degraded_analyst_report, finalize_degraded_phase2,
+        finalize_degraded_portfolio_decision, finalize_degraded_research_decision,
+        finalize_degraded_risk_review, finalize_degraded_trade_intent, FileStoreDomainRuntimePlan,
     },
     input_snapshot_runtime::{capture_phase1_file_store_inputs, phase1_input_sources},
     lifecycle::{run_id_for, set_phase_status, tickers_from_state},
@@ -1267,6 +1271,15 @@ fn finalize_degraded_tool_managed_unit(
         .unwrap_or("ToolManaged role ended without terminal finalize");
     let profile = match (phase, role) {
         (1, "analyst.technical" | "analyst.news_macro") => ToolManagedProfile::AnalystReport,
+        (2, "mediator.topic") if kind == "warmup" => ToolManagedProfile::ResearcherWarmup,
+        (2, "mediator.topic") if kind == "topic_generation" => ToolManagedProfile::TopicGeneration,
+        (2, "researcher.bull.initial" | "researcher.bear.initial") => {
+            ToolManagedProfile::DebateSeed
+        }
+        (2, "researcher.bull.interaction" | "researcher.bear.interaction") => {
+            ToolManagedProfile::DebateResponse
+        }
+        (2, "mediator.topic_controller") => ToolManagedProfile::TopicControl,
         (3, "manager.research") => ToolManagedProfile::ResearchDecision,
         (4, "trader") => ToolManagedProfile::TradeIntent,
         (5, "risk.aggressive" | "risk.neutral" | "risk.conservative") => {
@@ -1320,10 +1333,10 @@ fn finalize_degraded_tool_managed_unit(
         tickers,
         visible_evidence_refs: Default::default(),
         topic_id: topic_id.map(ToOwned::to_owned),
-        side: None,
+        side: phase2_side_for_role(role).map(ToOwned::to_owned),
         round: round.and_then(|round| u32::try_from(round).ok()),
-        visible_claims: Default::default(),
-        fork: None,
+        visible_claims: visible_phase2_claims(state, topic_id),
+        fork: phase2_fork_reference(state, role, topic_id),
         trade_candidate_action,
         portfolio_rating,
         portfolio_current_weight,
@@ -1332,7 +1345,15 @@ fn finalize_degraded_tool_managed_unit(
         .get("store_root")
         .and_then(Value::as_str)
         .context("degraded ToolManaged fallback requires store_root")?;
+    let fallback_fork = plan.fork.clone();
     let artifact = match profile {
+        ToolManagedProfile::ResearcherWarmup
+        | ToolManagedProfile::TopicGeneration
+        | ToolManagedProfile::DebateSeed
+        | ToolManagedProfile::DebateResponse
+        | ToolManagedProfile::TopicControl => {
+            finalize_degraded_phase2(Path::new(store_root), state, plan, failure)?
+        }
         ToolManagedProfile::AnalystReport => {
             finalize_degraded_analyst_report(Path::new(store_root), state, plan, failure)?
         }
@@ -1357,6 +1378,7 @@ fn finalize_degraded_tool_managed_unit(
         profile,
         &result.session_id,
         &result.turn_id,
+        fallback_fork,
         &artifact,
     )?;
     state["degraded"] = Value::Bool(true);
@@ -1370,6 +1392,7 @@ fn finalize_degraded_tool_managed_unit(
     Ok(artifact)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn persist_degraded_terminal(
     state: &Value,
     role: &str,
@@ -1377,6 +1400,7 @@ fn persist_degraded_terminal(
     profile: ToolManagedProfile,
     session_id: &str,
     turn_id: &str,
+    fork: Option<orchestrator_store::ForkReference>,
     artifact: &Value,
 ) -> Result<()> {
     let run_id = state["run_id"]
@@ -1406,7 +1430,7 @@ fn persist_degraded_terminal(
             role: role.to_owned(),
             phase: u8::try_from(phase).context("degraded terminal phase must fit u8")?,
             profile: profile.as_str().to_owned(),
-            fork: None,
+            fork,
             created_at: Utc::now().to_rfc3339(),
         },
     )?;
@@ -1503,6 +1527,78 @@ fn phase2_profile_name(role: &str, kind: &str) -> &'static str {
     }
 }
 
+fn phase2_side_for_role(role: &str) -> Option<&'static str> {
+    if role.contains(".bull.") {
+        Some("bull")
+    } else if role.contains(".bear.") {
+        Some("bear")
+    } else {
+        None
+    }
+}
+
+fn visible_phase2_claims(state: &Value, topic_id: Option<&str>) -> BTreeSet<String> {
+    let Some(topic_id) = topic_id else {
+        return BTreeSet::new();
+    };
+    state
+        .pointer(&format!("/topic_debate_states/{topic_id}/turns"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .flat_map(|turn| {
+            turn.pointer("/artifact/payload/claims")
+                .or_else(|| turn.pointer("/artifact/claims"))
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .filter_map(|claim| claim.get("claim_id").and_then(Value::as_str))
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn phase2_fork_reference(
+    state: &Value,
+    role: &str,
+    topic_id: Option<&str>,
+) -> Option<orchestrator_store::ForkReference> {
+    let (fork_from_session_id, fork_from_turn_id) = if role == "mediator.topic_controller" {
+        let _ = topic_id?;
+        (
+            state
+                .get("topic_generation_session_id")?
+                .as_str()?
+                .to_owned(),
+            state.get("topic_generation_turn_id")?.as_str()?.to_owned(),
+        )
+    } else if matches!(role, "researcher.bull.initial" | "researcher.bear.initial") {
+        let _ = topic_id?;
+        let warmup = state.get("phase2_warmup")?;
+        (
+            warmup.get("session_id")?.as_str()?.to_owned(),
+            warmup.get("turn_id")?.as_str()?.to_owned(),
+        )
+    } else if matches!(
+        role,
+        "researcher.bull.interaction" | "researcher.bear.interaction"
+    ) {
+        let topic_id = topic_id?;
+        let side = phase2_side_for_role(role)?;
+        let source = state.pointer(&format!("/phase2_file_store_sessions/{topic_id}/{side}"))?;
+        (
+            source.get("session_id")?.as_str()?.to_owned(),
+            source.get("turn_id")?.as_str()?.to_owned(),
+        )
+    } else {
+        return None;
+    };
+    Some(orchestrator_store::ForkReference {
+        fork_from_session_id,
+        fork_from_turn_id,
+    })
+}
+
 fn record_phase2_session(
     state: &mut Value,
     role: &str,
@@ -1566,7 +1662,7 @@ fn seal_state(state: &mut Value) -> Result<()> {
 mod phase2_session_tests {
     use serde_json::json;
 
-    use super::{record_phase2_session, runtime_session_key};
+    use super::{phase2_fork_reference, record_phase2_session, runtime_session_key};
 
     #[test]
     fn warmup_artifact_retains_the_fork_identity_after_assignment() {
@@ -1584,5 +1680,21 @@ mod phase2_session_tests {
 
         assert_eq!(state["phase2_warmup"]["session_id"], "warmup-session");
         assert_eq!(state["phase2_warmup"]["turn_id"], "warmup-turn");
+    }
+
+    #[test]
+    fn degraded_phase2_seed_uses_the_same_immutable_warmup_fork() {
+        let state = json!({
+            "phase2_warmup": {
+                "session_id": "warmup-session",
+                "turn_id": "warmup-turn"
+            }
+        });
+
+        let fork = phase2_fork_reference(&state, "researcher.bull.initial", Some("topic-1"))
+            .expect("seed requires the completed warmup fork");
+
+        assert_eq!(fork.fork_from_session_id, "warmup-session");
+        assert_eq!(fork.fork_from_turn_id, "warmup-turn");
     }
 }

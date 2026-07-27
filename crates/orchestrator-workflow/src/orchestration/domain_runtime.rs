@@ -289,6 +289,116 @@ pub(crate) fn finalize_degraded_analyst_report(
         .context("degraded FileStore analyst finalizer did not return an artifact")
 }
 
+/// Rust-owned degraded policy for every Phase 2 ToolManaged profile.  It uses
+/// the same typed Draft commands and terminal builders as a successful agent;
+/// it never synthesizes an alternate packet or returns to a legacy store.
+pub(crate) fn finalize_degraded_phase2(
+    store_root: &Path,
+    state: &Value,
+    mut plan: FileStoreDomainRuntimePlan,
+    failure: &str,
+) -> Result<Value> {
+    if !matches!(
+        plan.profile,
+        ToolManagedProfile::ResearcherWarmup
+            | ToolManagedProfile::TopicGeneration
+            | ToolManagedProfile::DebateSeed
+            | ToolManagedProfile::DebateResponse
+            | ToolManagedProfile::TopicControl
+    ) {
+        bail!("Phase 2 degraded writer received non-Phase-2 profile")
+    }
+    let terminal_tool = match plan.profile {
+        ToolManagedProfile::ResearcherWarmup => "finalize_researcher_warmup",
+        ToolManagedProfile::TopicGeneration => "finalize_topic_generation",
+        ToolManagedProfile::DebateSeed => "finalize_debate_seed",
+        ToolManagedProfile::DebateResponse => "finalize_debate_response",
+        ToolManagedProfile::TopicControl => "finalize_topic_control",
+        _ => unreachable!("checked Phase 2 profile"),
+    };
+
+    // A previous model turn may have completed a valid Draft but failed to
+    // surface its terminal result. Finalize it before adding the explicit
+    // degraded record, preserving the canonical Artifact verbatim.
+    let binding = file_store_domain_runtime(store_root, state, plan.clone())?;
+    if let Ok(output) = binding.execute(terminal_tool, json!({})) {
+        if let Some(artifact) = output.get("artifact").cloned() {
+            return Ok(artifact);
+        }
+    }
+
+    // The fallback has no license to invent market evidence. Its sole input is
+    // a Rust-owned failure record, declared in the canonical artifact so every
+    // downstream consumer treats it as degraded rather than source-backed.
+    let fallback_ref = format!(
+        "runtime:degraded:phase2:{}:{}",
+        plan.role,
+        plan.topic_id.as_deref().unwrap_or("aggregate")
+    );
+    plan.visible_evidence_refs.insert(fallback_ref.clone());
+    let binding = file_store_domain_runtime(store_root, state, plan.clone())?;
+    match plan.profile {
+        ToolManagedProfile::ResearcherWarmup => {}
+        ToolManagedProfile::TopicGeneration => {
+            binding.execute(
+                "set_phase2_common_ground",
+                json!({"common_ground": format!("Runtime degraded before topic generation: {failure}")}),
+            )?;
+            binding.execute(
+                "create_phase2_topic",
+                json!({
+                    "topic": "Runtime-degraded Phase 2 topic",
+                    "decision_hinge": "Obtain a completed evidence-backed topic generation before acting.",
+                    "evidence_refs": [fallback_ref],
+                }),
+            )?;
+        }
+        ToolManagedProfile::DebateSeed => {
+            binding.execute(
+                "create_debate_claim",
+                json!({
+                    "claim": format!("{} unavailable because the debate seed degraded: {failure}", plan.role),
+                    "confidence": 0.0,
+                    "evidence_refs": [fallback_ref],
+                }),
+            )?;
+        }
+        ToolManagedProfile::DebateResponse => {
+            let claim_id = plan
+                .visible_claims
+                .iter()
+                .next()
+                .cloned()
+                .context("degraded debate response requires a Rust-visible claim")?;
+            binding.execute(
+                "respond_to_debate_claim",
+                json!({
+                    "reply_to_claim_id": claim_id,
+                    "response": format!("No new information: {} degraded before a substantiated response ({failure}).", plan.role),
+                    "evidence_refs": [fallback_ref],
+                }),
+            )?;
+        }
+        ToolManagedProfile::TopicControl => {
+            binding.execute(
+                "add_agreed_fact",
+                json!({"value": format!("Controller degraded: {failure}")}),
+            )?;
+            binding.execute(
+                "set_decision_hinge",
+                json!({"value": "Obtain completed evidence-backed debate artifacts before any research decision."}),
+            )?;
+            binding.execute("set_topic_soft_control", json!({"should_continue": false}))?;
+        }
+        _ => unreachable!("checked Phase 2 profile"),
+    }
+    binding
+        .execute(terminal_tool, json!({}))?
+        .get("artifact")
+        .cloned()
+        .context("degraded Phase 2 terminal finalizer did not return an artifact")
+}
+
 /// Typed degraded policy for a migrated Phase 3 unit.  This deliberately
 /// finalizes the same Draft that a successful Research Manager would use; it
 /// must never fall through to a second persistence authority.
@@ -1525,5 +1635,95 @@ mod tests {
                 .unwrap()["terminal"],
             true
         );
+    }
+
+    #[test]
+    fn degraded_phase2_profiles_finalize_through_the_typed_builder() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = state();
+        state["phase1_index"] = json!({"evidence":"phase1"});
+
+        let mut warmup = phase2_plan(
+            "mediator.topic",
+            ToolManagedProfile::ResearcherWarmup,
+            None,
+            None,
+            Some(0),
+            Default::default(),
+        );
+        warmup.visible_evidence_refs.clear();
+        let warmup_artifact =
+            finalize_degraded_phase2(temp.path(), &state, warmup, "gateway unavailable").unwrap();
+        assert_eq!(warmup_artifact["kind"], "researcher_warmup");
+
+        let topic_artifact = finalize_degraded_phase2(
+            temp.path(),
+            &state,
+            phase2_plan(
+                "mediator.topic",
+                ToolManagedProfile::TopicGeneration,
+                None,
+                None,
+                None,
+                Default::default(),
+            ),
+            "gateway unavailable",
+        )
+        .unwrap();
+        let topic_id = topic_artifact["payload"]["topics"][0]["topic_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let seed_artifact = finalize_degraded_phase2(
+            temp.path(),
+            &state,
+            phase2_plan(
+                "researcher.bull.initial",
+                ToolManagedProfile::DebateSeed,
+                Some(&topic_id),
+                Some("bull"),
+                Some(0),
+                Default::default(),
+            ),
+            "gateway unavailable",
+        )
+        .unwrap();
+        let claim_id = seed_artifact["payload"]["claims"][0]["claim_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let response_artifact = finalize_degraded_phase2(
+            temp.path(),
+            &state,
+            phase2_plan(
+                "researcher.bear.interaction",
+                ToolManagedProfile::DebateResponse,
+                Some(&topic_id),
+                Some("bear"),
+                Some(1),
+                [claim_id].into_iter().collect(),
+            ),
+            "gateway unavailable",
+        )
+        .unwrap();
+        assert_eq!(response_artifact["profile"], "debate_response");
+
+        let control_artifact = finalize_degraded_phase2(
+            temp.path(),
+            &state,
+            phase2_plan(
+                "mediator.topic_controller",
+                ToolManagedProfile::TopicControl,
+                Some(&topic_id),
+                None,
+                Some(1),
+                Default::default(),
+            ),
+            "gateway unavailable",
+        )
+        .unwrap();
+        assert_eq!(control_artifact["profile"], "topic_control");
     }
 }
