@@ -21,10 +21,6 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
-html-escape.workspace = true
-# Transitional integration assertions still inspect the legacy workflow until
-# the remaining FileStore-only execution tests replace them.
-rusqlite.workspace = true
 serde_yaml.workspace = true
 tempfile.workspace = true
 

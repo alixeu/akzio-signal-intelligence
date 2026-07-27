@@ -317,7 +317,6 @@ mod tests {
                 ticker: "TQQQ".to_string(),
                 tickers: vec!["TQQQ".to_string()],
                 date: "2026-07-06".to_string(),
-                mock_db_path: None,
                 state_overrides: json!({}),
             },
             expected,

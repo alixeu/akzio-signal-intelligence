@@ -103,7 +103,6 @@ mod tests {
                 ticker: tickers[0].to_string(),
                 tickers: tickers.iter().map(|t| t.to_string()).collect(),
                 date: "2026-07-06".to_string(),
-                mock_db_path: None,
                 state_overrides: json!({}),
             },
             expected: EvalExpected {

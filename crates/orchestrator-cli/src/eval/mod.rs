@@ -31,8 +31,6 @@ pub struct EvalInput {
     pub tickers: Vec<String>,
     pub date: String,
     #[serde(default)]
-    pub mock_db_path: Option<String>,
-    #[serde(default)]
     pub state_overrides: Value,
 }
 

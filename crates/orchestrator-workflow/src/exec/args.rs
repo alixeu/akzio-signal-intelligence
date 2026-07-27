@@ -26,17 +26,7 @@ pub struct ExecArgs {
     pub mode: Mode,
     #[arg(long)]
     pub window_days: Option<i64>,
-    #[arg(long)]
-    pub db_path: Option<PathBuf>,
-    /// Optional debug dump directory for state.json / final_summary.md / end_context.
-    /// Omitted by default; run state is persisted to SQLite only.
-    #[arg(long)]
-    pub run_dir: Option<PathBuf>,
-    /// Canonical FileStore root for run metadata and migrated ToolManaged profiles.
-    ///
-    /// Runs with a migrated profile record their FileStore manifest here.
-    /// Artifact ownership follows the authority registry; legacy profiles do
-    /// not touch this root or fall back across stores.
+    /// Canonical FileStore root for all run metadata and artifacts.
     #[arg(long, value_name = "PATH")]
     pub store_root: Option<PathBuf>,
     #[arg(long)]
