@@ -34,9 +34,10 @@ pub use phase_index::{
     clear_phase_compress, compressor_debug_snapshot, expand_attention_subjects, list_attention,
     list_phase_details_for_phase, list_phase_summaries, list_phase_summaries_for_phase,
     list_phase_summary_details, persist_phase_summary_batch, phase_detail_id, phase_summary_id,
-    record_attention, record_attention_batch, upsert_phase_summary, upsert_phase_summary_detail,
-    AttentionEvent, PhaseSummaryDetailInput, PhaseSummaryDetailRow, PhaseSummaryInput,
-    PhaseSummaryMemoryIndex, PhaseSummaryPhaseBatch, PhaseSummaryRow,
+    query_phase_summaries, query_phase_summary_details, record_attention, record_attention_batch,
+    upsert_phase_summary, upsert_phase_summary_detail, AttentionEvent, PhaseSummaryDetailInput,
+    PhaseSummaryDetailQuery, PhaseSummaryDetailRow, PhaseSummaryInput, PhaseSummaryMemoryIndex,
+    PhaseSummaryPhaseBatch, PhaseSummaryQuery, PhaseSummaryRow, DEFAULT_PHASE_SUMMARY_LIMIT,
 };
 pub use phase_summary_gate::{
     phase_summary_gate, register_phase_summary_gate, unregister_phase_summary_gate,
@@ -44,9 +45,10 @@ pub use phase_summary_gate::{
 };
 pub use reflection::{
     pending_reflection_tasks, persist_reflection_artifact, read_experience,
-    reflection_source_context, score_mature_predictions, set_reflection_task_status,
-    upsert_decision_snapshot, DecisionSnapshotInput, PendingReflectionTask, ReflectionScoreSummary,
-    ReflectionThresholds, PREDICTION_HORIZON_TRADING_DAYS,
+    reflection_source_context, reflection_task_source_run, score_mature_predictions,
+    set_reflection_task_status, upsert_decision_snapshot, DecisionSnapshotInput,
+    PendingReflectionTask, ReflectionScoreSummary, ReflectionThresholds,
+    PREDICTION_HORIZON_TRADING_DAYS,
 };
 pub use schema::{connect, ensure_schema, AGGREGATE_TICKER};
 pub use technical_store::{

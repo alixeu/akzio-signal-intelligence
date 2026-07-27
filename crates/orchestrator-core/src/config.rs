@@ -38,6 +38,15 @@ pub fn load_config(path: Option<&Path>) -> Result<Value> {
     Ok(value)
 }
 
+pub fn load_project_env() -> Result<()> {
+    let dotenv_path = crate::project_path(".env");
+    if !dotenv_path.exists() {
+        return Ok(());
+    }
+    dotenvy::from_path(&dotenv_path)
+        .with_context(|| format!("failed to load env file {}", dotenv_path.display()))
+}
+
 fn load_dotenv_for_config(path: &Path) -> Result<()> {
     for dotenv_path in dotenv_candidates(path) {
         if dotenv_path.exists() {

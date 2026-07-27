@@ -9,6 +9,16 @@ orchestrator:
     window_days: 60
     max_debate_rounds: 3
 
+  retrieval:
+    summary_page_limit: 20
+    detail_page_limit: 20
+    phase2_max_details: 4
+    phase3_max_details: 6
+    phase4_max_details: 6
+    phase5_max_details: 4
+    phase6_max_details: 8
+    reflection_max_details: 8
+
   allocation:
     investable_assets: [QQQ, SOXX]
 
@@ -57,9 +67,9 @@ orchestrator:
     phase2:
       topic_generator: prompts/phase2/topic_generator.md
       warmup: prompts/phase2/researcher/warmup.md
-      bull_initial: prompts/phase2/researcher/seed.md
+      bull_initial: prompts/phase2/researcher/debate.md
       bull_interaction: prompts/phase2/researcher/debate.md
-      bear_initial: prompts/phase2/researcher/seed.md
+      bear_initial: prompts/phase2/researcher/debate.md
       bear_interaction: prompts/phase2/researcher/debate.md
     mediator:
       topic_controller: prompts/phase2/topic_controller.md
@@ -83,7 +93,7 @@ orchestrator:
       #   model，固定以 chat_completions 模式调用 opencode 免费网关
       #   (https://opencode.ai/zen/v1) 的 deepseek-v4-flash-free 模型，并自动附带
       #   opencode 所需的全部请求头。设为 false 时回退到常规 gateway 配置。
-      free_opencode: true
+      free_opencode: false
       route: chat_completions
       model: deepseek-v4-flash
       base_url: *llm_gateway_base_url

@@ -213,6 +213,8 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
                     run_id: Some(run_id.clone()),
                     phase: Some(0),
                     allowed_reflection_task_ids: Vec::new(),
+                    phase_summary_page_limit: runtime_config.retrieval.summary_page_limit,
+                    phase_summary_detail_page_limit: runtime_config.retrieval.detail_page_limit,
                     tickers: runtime_config.allocation.investable_assets.clone(),
                     alpaca_live: true,
                     alpaca_market_data: false,
@@ -1670,53 +1672,19 @@ async fn run_phase2(
         .map(|s| s.to_string())
         .context("db_path missing from state")?;
 
-    // Start topic generation and both side-specific warmups together. Each topic
-    // later forks Bull/Bear from its side warmup and Controller from topic generation.
+    // Build one shared checkpoint, continue it through topic generation, then fork
+    // every topic-local Bull/Bear/Controller conversation from that completed turn.
     let model_override_owned = model_override.map(|s| s.to_string());
     let reasoning_effort_override_owned = reasoning_effort_override.map(|s| s.to_string());
-    let topic_db_path = db_path.clone();
-    let mut topic_state = state.clone();
-    topic_state["role_job_metrics"] = json!([]);
     let mut warmup_state = state.clone();
     warmup_state["role_job_metrics"] = json!([]);
-    let topic_config = config.clone();
-    let topic_model_override = model_override_owned.clone();
-    let topic_reasoning_override = reasoning_effort_override_owned.clone();
-    let (topics_result, warmup_result) = tokio::join!(
-        async move {
-            let mut topic_conn = orchestrator_sql::connect(&topic_db_path)
-                .with_context(|| format!("topic-gen connect {topic_db_path}"))?;
-            let topics = run_phase2_topic_generation(
-                &mut topic_conn,
-                &mut topic_state,
-                topic_model_override.as_deref(),
-                topic_reasoning_override.as_deref(),
-                &topic_config,
-            )
-            .await?;
-            Ok::<_, anyhow::Error>((topics, topic_state))
-        },
-        run_phase2_side_warmups(
-            warmup_state,
-            model_override,
-            reasoning_effort_override,
-            config,
-        )
-    );
-    let (topics, topic_state) = topics_result?;
-    let (warmup, warmup_metrics) = warmup_result?;
-    for key in [
-        "topic_generation_artifact",
-        "topic_generation_turn_id",
-        "debate_topics",
-    ] {
-        if let Some(value) = topic_state.get(key) {
-            state[key] = value.clone();
-        }
-    }
-    if let Some(metrics) = topic_state.get("role_job_metrics") {
-        merge_role_job_metrics(state, metrics);
-    }
+    let (warmup, warmup_metrics) = run_phase2_shared_warmup(
+        warmup_state,
+        model_override,
+        reasoning_effort_override,
+        config,
+    )
+    .await?;
     let warmup_degraded = warmup
         .get("degraded")
         .and_then(Value::as_bool)
@@ -1726,13 +1694,20 @@ async fn run_phase2(
         state["degraded"] = json!(true);
     }
     merge_role_job_metrics(state, &warmup_metrics);
-    let topics = topics
-        .into_iter()
-        .take(max_topics.max(1) as usize)
-        .collect::<Vec<_>>();
+    let topics = run_phase2_topic_generation(
+        &mut conn,
+        state,
+        model_override,
+        reasoning_effort_override,
+        config,
+    )
+    .await?
+    .into_iter()
+    .take(max_topics.max(1) as usize)
+    .collect::<Vec<_>>();
     debug!(
         topic_count = topics.len(),
-        "phase 2 topic generation and side warmups ready"
+        "phase 2 shared warmup and topic generation ready"
     );
     state["debate_turns"] = json!([]);
 
@@ -1874,94 +1849,8 @@ fn topic_fork_user_message(topic: &Value, common_ground: &Value) -> String {
         .to_string()
 }
 
-async fn run_phase2_side_warmups(
-    state: Value,
-    model_override: Option<&str>,
-    reasoning_effort_override: Option<&str>,
-    config: &RuntimeConfig,
-) -> Result<(Value, Value)> {
-    let run_id = state
-        .get("run_id")
-        .and_then(Value::as_str)
-        .unwrap_or("run")
-        .to_string();
-    if is_mock(&state) {
-        let mut bull = warmup_metadata(&run_id, "bull");
-        let mut bear = warmup_metadata(&run_id, "bear");
-        bull["warmup_ready"] = json!(true);
-        bull["degraded"] = json!(false);
-        bear["warmup_ready"] = json!(true);
-        bear["degraded"] = json!(false);
-        return Ok((
-            json!({
-                "ready": true,
-                "mode": "mock",
-                "llm_calls": 0,
-                "degraded": false,
-                "bull": bull,
-                "bear": bear
-            }),
-            json!([]),
-        ));
-    }
-
-    let (bull_result, bear_result) = tokio::join!(
-        run_phase2_side_warmup(
-            state.clone(),
-            "bull",
-            model_override,
-            reasoning_effort_override,
-            config,
-        ),
-        run_phase2_side_warmup(
-            state,
-            "bear",
-            model_override,
-            reasoning_effort_override,
-            config,
-        )
-    );
-    let (bull, bull_metrics) = bull_result?;
-    let (bear, bear_metrics) = bear_result?;
-    let mut metrics = Vec::new();
-    if let Some(items) = bull_metrics.as_array() {
-        metrics.extend(items.iter().cloned());
-    }
-    if let Some(items) = bear_metrics.as_array() {
-        metrics.extend(items.iter().cloned());
-    }
-    let warmup_ready = bull
-        .get("warmup_ready")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-        && bear
-            .get("warmup_ready")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-    let degraded = bull
-        .get("degraded")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-        || bear
-            .get("degraded")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-    Ok((
-        json!({
-            "ready": warmup_ready,
-            "mode": "live",
-            "llm_calls": 2,
-            "degraded": degraded,
-            "bull": bull,
-            "bear": bear
-        }),
-        Value::Array(metrics),
-    ))
-}
-
-async fn run_phase2_side_warmup(
+async fn run_phase2_shared_warmup(
     mut state: Value,
-    side: &str,
     model_override: Option<&str>,
     reasoning_effort_override: Option<&str>,
     config: &RuntimeConfig,
@@ -1971,8 +1860,18 @@ async fn run_phase2_side_warmup(
         .and_then(Value::as_str)
         .unwrap_or("run")
         .to_string();
-    let role = format!("researcher.{side}.initial");
-    let metadata = warmup_metadata(&run_id, side);
+    let metadata = shared_warmup_metadata(&run_id);
+    if is_mock(&state) {
+        let mut ready = metadata;
+        ready["ready"] = json!(true);
+        ready["warmup_ready"] = json!(true);
+        ready["mode"] = json!("mock");
+        ready["llm_calls"] = json!(0);
+        ready["degraded"] = json!(false);
+        return Ok((ready, json!([])));
+    }
+
+    let role = "mediator.topic";
     let session_id = metadata["session_id"]
         .as_str()
         .unwrap_or_default()
@@ -1986,7 +1885,7 @@ async fn run_phase2_side_warmup(
     let prompt_path = config
         .prompts
         .path_for("researcher.warmup")
-        .with_context(|| format!("missing warmup prompt for {role}"))?
+        .context("missing shared Phase 2 warmup prompt")?
         .clone();
     let mut last_error: Option<String> = None;
     let mut status = String::new();
@@ -1994,7 +1893,7 @@ async fn run_phase2_side_warmup(
         let artifact = match run_single_steer_role_job(
             SteerRoleRun {
                 state: state.clone(),
-                role: &role,
+                role,
                 phase: 2,
                 kind: "warmup",
                 round: Some(0),
@@ -2024,7 +1923,7 @@ async fn run_phase2_side_warmup(
             Err(error) => {
                 last_error = Some(error.to_string());
                 if attempt == 1 {
-                    tracing::warn!(role, attempt, "phase 2 warmup call failed; retrying once");
+                    tracing::warn!(role, attempt, "shared Phase 2 warmup failed; retrying once");
                 }
                 continue;
             }
@@ -2039,6 +1938,9 @@ async fn run_phase2_side_warmup(
             && artifact.get("response").and_then(Value::as_str) == Some("准备完毕")
         {
             let mut ready_metadata = metadata.clone();
+            ready_metadata["ready"] = json!(true);
+            ready_metadata["mode"] = json!("live");
+            ready_metadata["llm_calls"] = json!(1);
             ready_metadata["status"] = json!("ready");
             ready_metadata["response"] = json!("准备完毕");
             ready_metadata["warmup_ready"] = json!(true);
@@ -2061,17 +1963,19 @@ async fn run_phase2_side_warmup(
             artifact.get("response")
         ));
         if attempt == 1 {
-            tracing::warn!(role, "phase 2 warmup handshake failed; retrying once");
+            tracing::warn!(
+                role,
+                "shared Phase 2 warmup handshake failed; retrying once"
+            );
         }
     }
     tracing::warn!(
-        side = side,
         ready = false,
         status = status,
         error = last_error
             .as_deref()
-            .unwrap_or("phase2 side warmup did not return the required 准备完毕 handshake"),
-        "phase 2 warmup handshake fallback applied"
+            .unwrap_or("shared Phase 2 warmup did not return the required 准备完毕 handshake"),
+        "shared Phase 2 warmup handshake fallback applied"
     );
     state["degraded"] = json!(true);
     if !state.get("degraded_report").is_some_and(Value::is_object) {
@@ -2087,10 +1991,13 @@ async fn run_phase2_side_warmup(
             "phase": 2,
             "kind": "warmup",
             "error": last_error.clone().unwrap_or_else(|| "warmup failure".to_string()),
-            "message": format!("{side} warmup did not return the required 准备完毕 handshake")
+            "message": "shared Phase 2 warmup did not return the required 准备完毕 handshake"
         }));
     }
     let mut fallback = metadata;
+    fallback["ready"] = json!(false);
+    fallback["mode"] = json!("live");
+    fallback["llm_calls"] = json!(1);
     fallback["status"] = json!("degraded");
     fallback["response"] = json!("准备完毕");
     fallback["warmup_ready"] = json!(false);
@@ -2106,8 +2013,8 @@ async fn run_phase2_side_warmup(
     ))
 }
 
-fn warmup_metadata(run_id: &str, side: &str) -> Value {
-    let id = format!("{run_id}:phase2:warmup:{side}");
+fn shared_warmup_metadata(run_id: &str) -> Value {
+    let id = format!("{run_id}:phase2:warmup:shared");
     json!({
         "session_id": id.clone(),
         "turn_id": id,
@@ -2130,7 +2037,7 @@ async fn run_one_topic_debate(
     let topic_id = topic_id_from_topic(&topic);
     debug!(
         topic_id,
-        "phase 2 steer-room topic debate starting (forked after warm-up)"
+        "phase 2 steer-room topic debate starting (forked from shared topic checkpoint)"
     );
 
     let model_override_ref = model_override.as_deref();
@@ -2389,17 +2296,14 @@ fn steer_turn_id_for_role(topic_id: &str, role: &str) -> String {
 }
 
 fn fork_source_turn_id(state: &Value, topic_id: &str, role: &str) -> Option<String> {
-    if role.contains("bull.initial") || role.contains("bear.initial") {
-        let side = if role.contains("bull") {
-            "bull"
-        } else {
-            "bear"
-        };
+    if role.contains("bull.initial")
+        || role.contains("bear.initial")
+        || role == "mediator.topic_controller"
+    {
         return state
-            .get("phase2_warmup")?
-            .get(side)?
-            .get("turn_id")?
+            .get("topic_generation_turn_id")?
             .as_str()
+            .filter(|turn_id| !turn_id.is_empty())
             .map(ToString::to_string);
     }
     if role.contains("bull.interaction") {
@@ -2407,13 +2311,6 @@ fn fork_source_turn_id(state: &Value, topic_id: &str, role: &str) -> Option<Stri
     }
     if role.contains("bear.interaction") {
         return Some(format!("turn-{topic_id}-bear-initial"));
-    }
-    if role == "mediator.topic_controller" {
-        return state
-            .get("topic_generation_turn_id")?
-            .as_str()
-            .filter(|turn_id| !turn_id.is_empty())
-            .map(ToString::to_string);
     }
     None
 }
@@ -2701,40 +2598,51 @@ async fn run_phase2_topic_generation(
     let baseline = build_topic_generation_artifact(state);
     let mut artifact = baseline.clone();
     if !is_mock(state) {
+        let run_id = state.get("run_id").and_then(Value::as_str).unwrap_or("run");
+        let session_id = format!("{run_id}:phase2:topic-generator");
+        let turn_id = session_id.clone();
+        let warmup_turn_id = state
+            .get("phase2_warmup")
+            .and_then(|warmup| warmup.get("turn_id"))
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
         let prompt_path = config
             .prompts
             .path_for("mediator.topic")
             .context("missing mediator.topic prompt path")?
             .clone();
-        let job = prepare_role_job(RoleRun {
-            state: state.clone(),
-            role: "mediator.topic",
-            phase: 2,
-            kind: "topic_generation",
-            round: None,
-            topic_id: None,
-            mock: false,
-            model_override,
-            reasoning_effort_override,
+        let generated = run_single_steer_role_job(
+            SteerRoleRun {
+                state: state.clone(),
+                role: "mediator.topic",
+                phase: 2,
+                kind: "topic_generation",
+                round: None,
+                topic_id: None,
+                mock: false,
+                model_override,
+                reasoning_effort_override,
+                config,
+                prompt_path: Some(prompt_path.as_path()),
+                session_id,
+                turn_id: turn_id.clone(),
+                steer: attach_fork_source(
+                    Some(steer_payload("topic_generation", &json!({}))),
+                    warmup_turn_id,
+                    true,
+                ),
+            },
+            config.workflow.reducer_timeout_sec,
             config,
-            prompt_path: Some(prompt_path.as_path()),
-        })?;
-        let result = run_role_jobs(vec![job], 1, config.workflow.reducer_timeout_sec)
-            .await
-            .into_iter()
-            .next()
-            .context("mediator.topic returned no role result")?;
-        let turn_id = result.turn_id.clone();
-        persist_prompt_metric(conn, &result);
-        record_role_job_metrics(state, &result);
-        let generated = role_artifact_or_degraded(state, config, result)?;
+            state,
+            conn,
+        )
+        .await?;
         if generated.get("artifact_type").and_then(Value::as_str)
             == Some("phase2_topic_generation_artifact")
         {
             artifact = merge_topic_generation_output(&baseline, &generated);
-            if !turn_id.is_empty() {
-                state["topic_generation_turn_id"] = Value::String(turn_id);
-            }
+            state["topic_generation_turn_id"] = Value::String(turn_id);
         } else {
             tracing::warn!("mediator.topic degraded; using deterministic topic fallback");
         }
@@ -3774,19 +3682,17 @@ async fn run_phase5(
     config: &RuntimeConfig,
 ) -> Result<()> {
     state["risk_debate_state"] = json!({"history": []});
-    // Sequential perspectives make each reviewer answer the prior argument.
-    for (index, risk_role) in ["risk.aggressive", "risk.neutral", "risk.conservative"]
+    let roles = ["risk.aggressive", "risk.neutral", "risk.conservative"];
+    let jobs = roles
         .into_iter()
         .enumerate()
-    {
-        let round = (index + 1) as i64;
-        let result = run_role_jobs(
-            vec![prepare_role_job(RoleRun {
+        .map(|(index, risk_role)| {
+            prepare_role_job(RoleRun {
                 state: state.clone(),
                 role: risk_role,
                 phase: 5,
                 kind: "risk_argument",
-                round: Some(round),
+                round: Some((index + 1) as i64),
                 topic_id: None,
                 mock: is_mock(state),
                 model_override,
@@ -3798,18 +3704,18 @@ async fn run_phase5(
                         .path_for(risk_role)
                         .with_context(|| format!("missing prompt path for {risk_role}"))?,
                 ),
-            })?],
-            1,
-            config.workflow.agent_timeout_sec,
-        )
-        .await
-        .into_iter()
-        .next()
-        .context("risk committee member returned no result")?;
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut results = run_role_jobs(jobs, roles.len(), config.workflow.agent_timeout_sec).await;
+    results.sort_by_key(|result| result.round.unwrap_or_default());
+    for result in results {
+        let risk_role = result.role.clone();
+        let round = result.round.unwrap_or_default();
         persist_prompt_metric(conn, &result);
         record_role_job_metrics(state, &result);
         let mut artifact = role_artifact_or_degraded(state, config, result)?;
-        sanitize_downstream_constraints(state, risk_role, &mut artifact);
+        sanitize_downstream_constraints(state, &risk_role, &mut artifact);
         let turn = json!({
             "role": risk_role,
             "phase": 5,
@@ -3824,7 +3730,7 @@ async fn run_phase5(
             conn,
             state,
             5,
-            risk_role,
+            &risk_role,
             "risk_argument",
             Some(round),
             turn,
@@ -4494,10 +4400,13 @@ mod tests {
             .tools
             .contains(&"read_technical_snapshot".to_string()));
         assert!(settings.tools.contains(&"read_experience".to_string()));
-        for role in ["trader", "risk.conservative"] {
-            assert!(roles[role].tools.is_empty(), "role={role}");
+        for role in ["trader", "risk.conservative", "portfolio.manager"] {
+            assert_eq!(
+                roles[role].tools,
+                vec!["read_phase_summaries", "read_phase_summary_details"],
+                "role={role}"
+            );
         }
-        assert!(roles["portfolio.manager"].tools.is_empty());
     }
 
     #[test]
@@ -5360,21 +5269,19 @@ fn topic_controller_forks_from_topic_generation_with_its_own_prompt() {
 }
 
 #[test]
-fn initial_researchers_fork_from_their_ready_checkpoints() {
+fn phase2_initial_researchers_fork_from_the_shared_topic_checkpoint() {
     let state = json!({
-        "phase2_warmup": {
-            "bull": {"turn_id": "warmup-bull-ready"},
-            "bear": {"turn_id": "warmup-bear-ready"}
-        }
+        "phase2_warmup": {"turn_id": "warmup-shared-ready"},
+        "topic_generation_turn_id": "turn-topic-root"
     });
 
     assert_eq!(
         fork_source_turn_id(&state, "QQQ-volatility", "researcher.bull.initial"),
-        Some("warmup-bull-ready".to_string())
+        Some("turn-topic-root".to_string())
     );
     assert_eq!(
         fork_source_turn_id(&state, "QQQ-volatility", "researcher.bear.initial"),
-        Some("warmup-bear-ready".to_string())
+        Some("turn-topic-root".to_string())
     );
 }
 

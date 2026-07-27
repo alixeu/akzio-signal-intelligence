@@ -113,6 +113,7 @@ fn persist_updated_state(result: &Value) {
 }
 
 pub fn init_tracing() {
+    let _ = orchestrator_core::load_project_env();
     init_tracing_with_debug(false);
 }
 

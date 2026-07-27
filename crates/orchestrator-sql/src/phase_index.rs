@@ -13,6 +13,46 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
+pub const DEFAULT_PHASE_SUMMARY_LIMIT: usize = 20;
+
+#[derive(Debug, Clone)]
+pub struct PhaseSummaryQuery<'a> {
+    pub ticker: Option<&'a str>,
+    pub source_phase: Option<i64>,
+    pub role: Option<&'a str>,
+    pub topic_id: Option<&'a str>,
+    pub limit: usize,
+    pub offset: usize,
+}
+
+impl Default for PhaseSummaryQuery<'_> {
+    fn default() -> Self {
+        Self {
+            ticker: None,
+            source_phase: None,
+            role: None,
+            topic_id: None,
+            limit: DEFAULT_PHASE_SUMMARY_LIMIT,
+            offset: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PhaseSummaryDetailQuery {
+    pub limit: usize,
+    pub offset: usize,
+}
+
+impl Default for PhaseSummaryDetailQuery {
+    fn default() -> Self {
+        Self {
+            limit: DEFAULT_PHASE_SUMMARY_LIMIT,
+            offset: 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PhaseSummaryInput {
     pub run_id: String,
@@ -166,7 +206,18 @@ impl PhaseSummaryPhaseBatch {
     /// Debug / prompt snapshot for one phase (no DB).
     pub fn debug_snapshot(&self) -> Value {
         let written = self.written();
-        let summary_items: Vec<Value> = self.summaries.iter().map(summary_row_to_value).collect();
+        let summary_items: Vec<Value> = self
+            .summaries
+            .iter()
+            .map(|row| {
+                let detail_count = self
+                    .details
+                    .iter()
+                    .filter(|detail| detail.summary_id == row.id)
+                    .count();
+                summary_row_to_value(row, detail_count)
+            })
+            .collect();
         let detail_items: Vec<Value> = self.details.iter().map(detail_row_to_value).collect();
         json!({
             "role": "compressor",
@@ -237,7 +288,12 @@ impl PhaseSummaryMemoryIndex {
                         continue;
                     }
                 }
-                items.push(summary_row_to_value(row));
+                let detail_count = batch
+                    .details
+                    .iter()
+                    .filter(|detail| detail.summary_id == row.id)
+                    .count();
+                items.push(summary_row_to_value(row, detail_count));
             }
         }
         json!({
@@ -256,11 +312,87 @@ impl PhaseSummaryMemoryIndex {
         current_phase: i64,
         ticker: Option<&str>,
     ) -> Result<Value> {
+        self.query_visible_summaries(
+            run_id,
+            current_phase,
+            &PhaseSummaryQuery {
+                ticker,
+                ..Default::default()
+            },
+        )
+    }
+
+    pub fn query_visible_summaries(
+        &self,
+        run_id: &str,
+        current_phase: i64,
+        query: &PhaseSummaryQuery<'_>,
+    ) -> Result<Value> {
         let max_source_phase = prior_phase_bound(run_id, current_phase)?;
         if self.run_id != run_id {
             return Ok(empty_phase_summaries("run not visible"));
         }
-        Ok(self.list_summaries(Some(max_source_phase), ticker))
+        let mut items = self
+            .phases
+            .iter()
+            .filter(|(phase, _)| **phase <= max_source_phase)
+            .flat_map(|(_, batch)| batch.summaries.iter())
+            .filter(|row| row.run_id == run_id)
+            .filter(|row| {
+                query
+                    .source_phase
+                    .is_none_or(|phase| row.source_phase == phase)
+            })
+            .filter(|row| {
+                query
+                    .ticker
+                    .filter(|value| !value.is_empty())
+                    .is_none_or(|ticker| {
+                        row.ticker == ticker || row.ticker.is_empty() || row.ticker == "__ALL__"
+                    })
+            })
+            .filter(|row| {
+                query
+                    .role
+                    .filter(|value| !value.is_empty())
+                    .is_none_or(|role| row.role == role)
+            })
+            .filter(|row| {
+                query
+                    .topic_id
+                    .filter(|value| !value.is_empty())
+                    .is_none_or(|topic_id| row.topic_id.as_deref() == Some(topic_id))
+            })
+            .collect::<Vec<_>>();
+        items.sort_by_key(|row| (row.source_phase, row.created_at, row.id.clone()));
+        let total_count = items.len();
+        let limit = query.limit.clamp(1, 100);
+        let rows = items
+            .into_iter()
+            .skip(query.offset)
+            .take(limit)
+            .map(|row| {
+                let detail_count = self
+                    .phases
+                    .get(&row.source_phase)
+                    .map(|batch| {
+                        batch
+                            .details
+                            .iter()
+                            .filter(|detail| detail.summary_id == row.id)
+                            .count()
+                    })
+                    .unwrap_or(0);
+                summary_row_to_value(row, detail_count)
+            })
+            .collect::<Vec<_>>();
+        Ok(summary_query_response(
+            rows,
+            total_count,
+            query,
+            current_phase,
+            "phase_summary_memory",
+        ))
     }
 
     /// Compatibility entry point without a visibility scope. It intentionally returns no rows.
@@ -274,6 +406,21 @@ impl PhaseSummaryMemoryIndex {
         run_id: &str,
         current_phase: i64,
         summary_id: &str,
+    ) -> Result<Value> {
+        self.query_visible_details(
+            run_id,
+            current_phase,
+            summary_id,
+            PhaseSummaryDetailQuery::default(),
+        )
+    }
+
+    pub fn query_visible_details(
+        &self,
+        run_id: &str,
+        current_phase: i64,
+        summary_id: &str,
+        query: PhaseSummaryDetailQuery,
     ) -> Result<Value> {
         let max_source_phase = prior_phase_bound(run_id, current_phase)?;
         if summary_id.trim().is_empty() {
@@ -310,19 +457,43 @@ impl PhaseSummaryMemoryIndex {
             }
         }
         items.sort_by_key(|item| item.get("sort_order").and_then(Value::as_i64).unwrap_or(0));
+        let total_count = items.len();
+        let limit = query.limit.clamp(1, 100);
+        let items = items
+            .into_iter()
+            .skip(query.offset)
+            .take(limit)
+            .collect::<Vec<_>>();
+        let next_offset = query.offset.saturating_add(items.len());
         Ok(json!({
             "query": "phase_summary_details",
             "summary_id": summary_id,
             "item_count": items.len(),
+            "total_count": total_count,
+            "truncated": next_offset < total_count,
+            "next_cursor": (next_offset < total_count).then(|| next_offset.to_string()),
             "items": items,
-            "source": "phase_summary_memory"
+            "source": "phase_summary_memory",
+            "source_policy": "current_run_prior_phases_only",
+            "status": if total_count == 0 { "empty" } else { "available" }
         }))
     }
 
     pub fn expand_summary(&self, id: &str) -> Option<Value> {
         for batch in self.phases.values() {
             if let Some(row) = batch.summaries.iter().find(|r| r.id == id) {
-                let mut v = summary_row_to_value(row);
+                let detail_count = self
+                    .phases
+                    .get(&row.source_phase)
+                    .map(|batch| {
+                        batch
+                            .details
+                            .iter()
+                            .filter(|detail| detail.summary_id == row.id)
+                            .count()
+                    })
+                    .unwrap_or(0);
+                let mut v = summary_row_to_value(row, detail_count);
                 if let Some(obj) = v.as_object_mut() {
                     obj.insert("subject_kind".into(), json!("summary"));
                     obj.insert("subject_id".into(), json!(id));
@@ -373,8 +544,15 @@ fn empty_phase_summaries(note: &str) -> Value {
     json!({
         "query": "phase_summaries",
         "item_count": 0,
+        "total_count": 0,
+        "truncated": false,
+        "next_cursor": Value::Null,
+        "applied_filters": {},
+        "visible_phase_range": Value::Null,
+        "source_policy": "current_run_prior_phases_only",
         "items": [],
         "source": "phase_summary_memory",
+        "status": "empty",
         "note": note
     })
 }
@@ -384,13 +562,18 @@ fn empty_phase_details(summary_id: &str, note: &str) -> Value {
         "query": "phase_summary_details",
         "summary_id": summary_id,
         "item_count": 0,
+        "total_count": 0,
+        "truncated": false,
+        "next_cursor": Value::Null,
         "items": [],
         "source": "phase_summary_memory",
+        "source_policy": "current_run_prior_phases_only",
+        "status": "not_visible",
         "note": note
     })
 }
 
-fn summary_row_to_value(row: &PhaseSummaryRow) -> Value {
+fn summary_row_to_value(row: &PhaseSummaryRow, detail_count: usize) -> Value {
     let recency_weight = 1.0 + 0.15 * (row.source_phase as f64);
     json!({
         "id": row.id,
@@ -402,8 +585,42 @@ fn summary_row_to_value(row: &PhaseSummaryRow) -> Value {
         "summary": row.summary,
         "summary_json": row.summary_json,
         "confidence": row.confidence,
+        "detail_count": detail_count,
         "created_at": row.created_at,
         "recency_weight": recency_weight,
+    })
+}
+
+fn summary_query_response(
+    rows: Vec<Value>,
+    total_count: usize,
+    query: &PhaseSummaryQuery<'_>,
+    current_phase: i64,
+    source: &str,
+) -> Value {
+    let next_offset = query.offset.saturating_add(rows.len());
+    json!({
+        "query": "phase_summaries",
+        "item_count": rows.len(),
+        "total_count": total_count,
+        "truncated": next_offset < total_count,
+        "next_cursor": (next_offset < total_count).then(|| next_offset.to_string()),
+        "applied_filters": {
+            "ticker": query.ticker,
+            "source_phase": query.source_phase,
+            "role": query.role,
+            "topic_id": query.topic_id,
+            "limit": query.limit.clamp(1, 100),
+            "cursor": query.offset.to_string()
+        },
+        "visible_phase_range": {
+            "minimum": 1,
+            "maximum": current_phase - 1
+        },
+        "source_policy": "current_run_prior_phases_only",
+        "items": rows,
+        "source": source,
+        "status": if total_count == 0 { "empty" } else { "available" }
     })
 }
 
@@ -678,70 +895,108 @@ pub fn list_phase_summaries(
     current_phase: i64,
     ticker: Option<&str>,
 ) -> Result<Value> {
+    query_phase_summaries(
+        conn,
+        run_id,
+        current_phase,
+        &PhaseSummaryQuery {
+            ticker,
+            ..Default::default()
+        },
+    )
+}
+
+pub fn query_phase_summaries(
+    conn: &Connection,
+    run_id: &str,
+    current_phase: i64,
+    query: &PhaseSummaryQuery<'_>,
+) -> Result<Value> {
     prior_phase_bound(run_id, current_phase)?;
-    let mut sql = String::from(
+    let ticker = query.ticker.filter(|value| !value.trim().is_empty());
+    let role = query.role.filter(|value| !value.trim().is_empty());
+    let topic_id = query.topic_id.filter(|value| !value.trim().is_empty());
+    let limit = query.limit.clamp(1, 100) as i64;
+    let offset = query.offset as i64;
+    let total_count: i64 = conn.query_row(
         r#"
-        SELECT id, run_id, source_phase, role, ticker, topic_id, summary, summary_json,
-               confidence, created_at
+        SELECT COUNT(*)
         FROM phase_summaries
         WHERE run_id = ?1 AND source_phase < ?2
+          AND (?3 IS NULL OR source_phase = ?3)
+          AND (?4 IS NULL OR ticker = ?4 OR ticker = '' OR ticker = '__ALL__')
+          AND (?5 IS NULL OR role = ?5)
+          AND (?6 IS NULL OR topic_id = ?6)
         "#,
-    );
-    let mut params: Vec<Value> = vec![json!(run_id), json!(current_phase)];
-    if let Some(t) = ticker.filter(|t| !t.is_empty()) {
-        sql.push_str(" AND (ticker = ? OR ticker = '' OR ticker = '__ALL__')");
-        params.push(json!(t));
-    }
-    sql.push_str(" ORDER BY source_phase ASC, created_at ASC");
-
-    let mut stmt = conn.prepare(&sql)?;
-    let bind: Vec<Box<dyn rusqlite::types::ToSql>> = params
-        .iter()
-        .map(|v| -> Box<dyn rusqlite::types::ToSql> {
-            match v {
-                Value::String(s) => Box::new(s.clone()),
-                Value::Number(n) => {
-                    if let Some(i) = n.as_i64() {
-                        Box::new(i)
-                    } else {
-                        Box::new(n.as_f64().unwrap_or(0.0))
-                    }
-                }
-                _ => Box::new(v.to_string()),
-            }
-        })
-        .collect();
-    let bind_refs: Vec<&dyn rusqlite::types::ToSql> = bind.iter().map(|b| b.as_ref()).collect();
-
+        params![
+            run_id,
+            current_phase,
+            query.source_phase,
+            ticker,
+            role,
+            topic_id
+        ],
+        |row| row.get(0),
+    )?;
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT s.id, s.run_id, s.source_phase, s.role, s.ticker, s.topic_id,
+               s.summary, s.summary_json, s.confidence, s.created_at,
+               (SELECT COUNT(*) FROM phase_summary_details d
+                WHERE d.summary_id=s.id AND d.run_id=s.run_id
+                  AND d.source_phase=s.source_phase) AS detail_count
+        FROM phase_summaries s
+        WHERE s.run_id = ?1 AND s.source_phase < ?2
+          AND (?3 IS NULL OR s.source_phase = ?3)
+          AND (?4 IS NULL OR s.ticker = ?4 OR s.ticker = '' OR s.ticker = '__ALL__')
+          AND (?5 IS NULL OR s.role = ?5)
+          AND (?6 IS NULL OR s.topic_id = ?6)
+        ORDER BY s.source_phase ASC, s.created_at ASC, s.id ASC
+        LIMIT ?7 OFFSET ?8
+        "#,
+    )?;
     let rows = stmt
-        .query_map(bind_refs.as_slice(), |row| {
-            let summary_json: String = row.get("summary_json")?;
-            let source_phase: i64 = row.get("source_phase")?;
-            // Recency weight: newer source_phase → higher attention prior.
-            let recency_weight = 1.0 + 0.15 * (source_phase as f64);
-            Ok(json!({
-                "id": row.get::<_, String>("id")?,
-                "run_id": row.get::<_, String>("run_id")?,
-                "source_phase": source_phase,
-                "role": row.get::<_, String>("role")?,
-                "ticker": row.get::<_, String>("ticker")?,
-                "topic_id": row.get::<_, Option<String>>("topic_id")?,
-                "summary": row.get::<_, String>("summary")?,
-                "summary_json": serde_json::from_str::<Value>(&summary_json)
-                    .unwrap_or(Value::String(summary_json)),
-                "confidence": row.get::<_, f64>("confidence")?,
-                "created_at": row.get::<_, i64>("created_at")?,
-                "recency_weight": recency_weight,
-            }))
-        })?
+        .query_map(
+            params![
+                run_id,
+                current_phase,
+                query.source_phase,
+                ticker,
+                role,
+                topic_id,
+                limit,
+                offset
+            ],
+            |row| {
+                let summary_json: String = row.get("summary_json")?;
+                let source_phase: i64 = row.get("source_phase")?;
+                let recency_weight = 1.0 + 0.15 * (source_phase as f64);
+                Ok(json!({
+                    "id": row.get::<_, String>("id")?,
+                    "run_id": row.get::<_, String>("run_id")?,
+                    "source_phase": source_phase,
+                    "role": row.get::<_, String>("role")?,
+                    "ticker": row.get::<_, String>("ticker")?,
+                    "topic_id": row.get::<_, Option<String>>("topic_id")?,
+                    "summary": row.get::<_, String>("summary")?,
+                    "summary_json": serde_json::from_str::<Value>(&summary_json)
+                        .unwrap_or(Value::String(summary_json)),
+                    "confidence": row.get::<_, f64>("confidence")?,
+                    "detail_count": row.get::<_, i64>("detail_count")?,
+                    "created_at": row.get::<_, i64>("created_at")?,
+                    "recency_weight": recency_weight,
+                }))
+            },
+        )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
-    Ok(json!({
-        "query": "phase_summaries",
-        "item_count": rows.len(),
-        "items": rows,
-        "note": "Newer source_phase has higher recency_weight; prefer recent summaries."
-    }))
+    Ok(summary_query_response(
+        rows,
+        total_count.max(0) as usize,
+        query,
+        current_phase,
+        "sqlite",
+    ))
 }
 
 /// Summaries for one exact `source_phase` (post-compress snapshot).
@@ -858,10 +1113,56 @@ pub fn list_phase_summary_details(
     current_phase: i64,
     summary_id: &str,
 ) -> Result<Value> {
+    query_phase_summary_details(
+        conn,
+        run_id,
+        current_phase,
+        summary_id,
+        PhaseSummaryDetailQuery::default(),
+    )
+}
+
+pub fn query_phase_summary_details(
+    conn: &Connection,
+    run_id: &str,
+    current_phase: i64,
+    summary_id: &str,
+    query: PhaseSummaryDetailQuery,
+) -> Result<Value> {
     prior_phase_bound(run_id, current_phase)?;
     if summary_id.trim().is_empty() {
         anyhow::bail!("summary_id is required");
     }
+    let parent_visible = conn
+        .query_row(
+            r#"
+            SELECT 1 FROM phase_summaries
+            WHERE id=?1 AND run_id=?2 AND source_phase < ?3
+            "#,
+            params![summary_id, run_id, current_phase],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !parent_visible {
+        return Ok(empty_phase_details(
+            summary_id,
+            "summary not found or not visible",
+        ));
+    }
+    let total_count: i64 = conn.query_row(
+        r#"
+        SELECT COUNT(*)
+        FROM phase_summary_details d
+        JOIN phase_summaries s
+          ON s.id=d.summary_id AND s.run_id=d.run_id AND s.source_phase=d.source_phase
+        WHERE d.summary_id=?1 AND d.run_id=?2 AND d.source_phase < ?3
+        "#,
+        params![summary_id, run_id, current_phase],
+        |row| row.get(0),
+    )?;
+    let limit = query.limit.clamp(1, 100) as i64;
+    let offset = query.offset as i64;
     let mut stmt = conn.prepare(
         r#"
         SELECT d.id, d.summary_id, d.run_id, d.source_phase, d.detail, d.detail_json,
@@ -874,31 +1175,43 @@ pub fn list_phase_summary_details(
         WHERE d.summary_id = ?1
           AND d.run_id = ?2
           AND d.source_phase < ?3
-        ORDER BY d.sort_order ASC, d.created_at ASC
+        ORDER BY d.sort_order ASC, d.created_at ASC, d.id ASC
+        LIMIT ?4 OFFSET ?5
         "#,
     )?;
     let rows = stmt
-        .query_map(params![summary_id, run_id, current_phase], |row| {
-            let detail_json: String = row.get("detail_json")?;
-            Ok(json!({
-                "id": row.get::<_, String>("id")?,
-                "summary_id": row.get::<_, String>("summary_id")?,
-                "run_id": row.get::<_, String>("run_id")?,
-                "source_phase": row.get::<_, i64>("source_phase")?,
-                "detail": row.get::<_, String>("detail")?,
-                "detail_json": serde_json::from_str::<Value>(&detail_json)
-                    .unwrap_or(Value::String(detail_json)),
-                "source_ref": row.get::<_, String>("source_ref")?,
-                "sort_order": row.get::<_, i64>("sort_order")?,
-                "created_at": row.get::<_, i64>("created_at")?,
-            }))
-        })?
+        .query_map(
+            params![summary_id, run_id, current_phase, limit, offset],
+            |row| {
+                let detail_json: String = row.get("detail_json")?;
+                Ok(json!({
+                    "id": row.get::<_, String>("id")?,
+                    "summary_id": row.get::<_, String>("summary_id")?,
+                    "run_id": row.get::<_, String>("run_id")?,
+                    "source_phase": row.get::<_, i64>("source_phase")?,
+                    "detail": row.get::<_, String>("detail")?,
+                    "detail_json": serde_json::from_str::<Value>(&detail_json)
+                        .unwrap_or(Value::String(detail_json)),
+                    "source_ref": row.get::<_, String>("source_ref")?,
+                    "sort_order": row.get::<_, i64>("sort_order")?,
+                    "created_at": row.get::<_, i64>("created_at")?,
+                }))
+            },
+        )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    let total_count = total_count.max(0) as usize;
+    let next_offset = query.offset.saturating_add(rows.len());
     Ok(json!({
         "query": "phase_summary_details",
         "summary_id": summary_id,
         "item_count": rows.len(),
-        "items": rows
+        "total_count": total_count,
+        "truncated": next_offset < total_count,
+        "next_cursor": (next_offset < total_count).then(|| next_offset.to_string()),
+        "items": rows,
+        "source": "sqlite",
+        "source_policy": "current_run_prior_phases_only",
+        "status": if total_count == 0 { "empty" } else { "available" }
     }))
 }
 
@@ -1176,5 +1489,98 @@ mod tests {
         assert_eq!(snap["summary_count"], 1);
         assert_eq!(snap["detail_count"], 1);
         assert!(snap["summaries"].as_array().unwrap().len() == 1);
+    }
+
+    #[test]
+    fn summary_queries_filter_paginate_and_hide_future_or_other_runs() {
+        let temp = tempfile::tempdir().unwrap();
+        let conn = connect(temp.path().join("filtered.sqlite")).unwrap();
+        ensure_schema(&conn).unwrap();
+        for (run_id, phase, role, ticker, topic) in [
+            ("run-a", 1, "analyst.technical", "QQQ", None),
+            ("run-a", 1, "analyst.news_macro", "QQQ", None),
+            ("run-a", 2, "mediator.topic", "QQQ", Some("topic-1")),
+            ("run-a", 3, "manager.research", "QQQ", None),
+            ("run-b", 1, "analyst.technical", "QQQ", None),
+        ] {
+            upsert_phase_summary(
+                &conn,
+                &PhaseSummaryInput {
+                    run_id: run_id.to_string(),
+                    source_phase: phase,
+                    role: role.to_string(),
+                    ticker: ticker.to_string(),
+                    topic_id: topic.map(ToString::to_string),
+                    summary: format!("{run_id}-{phase}-{role}"),
+                    summary_json: json!({}),
+                    confidence: 0.5,
+                },
+            )
+            .unwrap();
+        }
+        let first = query_phase_summaries(
+            &conn,
+            "run-a",
+            3,
+            &PhaseSummaryQuery {
+                ticker: Some("QQQ"),
+                source_phase: Some(1),
+                limit: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(first["item_count"], 1);
+        assert_eq!(first["total_count"], 2);
+        assert_eq!(first["truncated"], true);
+        assert_eq!(first["visible_phase_range"]["maximum"], 2);
+        let cursor = first["next_cursor"].as_str().unwrap().parse().unwrap();
+        let second = query_phase_summaries(
+            &conn,
+            "run-a",
+            3,
+            &PhaseSummaryQuery {
+                ticker: Some("QQQ"),
+                source_phase: Some(1),
+                limit: 1,
+                offset: cursor,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(second["item_count"], 1);
+        assert_eq!(second["truncated"], false);
+        assert!(first["items"][0]["id"] != second["items"][0]["id"]);
+        assert!(first["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["source_phase"] == 1 && item["run_id"] == "run-a"));
+    }
+
+    #[test]
+    fn invisible_detail_parent_returns_generic_not_visible() {
+        let temp = tempfile::tempdir().unwrap();
+        let conn = connect(temp.path().join("hidden.sqlite")).unwrap();
+        ensure_schema(&conn).unwrap();
+        let id = upsert_phase_summary(
+            &conn,
+            &PhaseSummaryInput {
+                run_id: "other-run".to_string(),
+                source_phase: 1,
+                role: "analyst.technical".to_string(),
+                ticker: "QQQ".to_string(),
+                topic_id: None,
+                summary: "hidden".to_string(),
+                summary_json: json!({}),
+                confidence: 0.5,
+            },
+        )
+        .unwrap();
+        let output =
+            query_phase_summary_details(&conn, "run-a", 3, &id, Default::default()).unwrap();
+        assert_eq!(output["status"], "not_visible");
+        assert_eq!(output["item_count"], 0);
+        assert!(!output.to_string().contains("other-run"));
     }
 }

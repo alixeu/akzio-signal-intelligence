@@ -61,6 +61,31 @@ pub struct ToolResultItem {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RetrievalPolicy {
+    pub mandatory_summary_query: bool,
+    #[serde(default)]
+    pub required_source_phases: Vec<i64>,
+    #[serde(default)]
+    pub required_detail_source_phases: Vec<i64>,
+    #[serde(default)]
+    pub minimum_detail_expansions: usize,
+    #[serde(default)]
+    pub maximum_detail_expansions: usize,
+    #[serde(default = "default_retrieval_page_limit")]
+    pub summary_page_limit: usize,
+    #[serde(default = "default_retrieval_page_limit")]
+    pub detail_page_limit: usize,
+    #[serde(default)]
+    pub allow_empty_when_no_visible_summary: bool,
+    #[serde(default)]
+    pub allowed_direct_contexts: Vec<String>,
+}
+
+fn default_retrieval_page_limit() -> usize {
+    20
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentItemPhase {

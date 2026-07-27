@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use futures::{stream, StreamExt};
 use orchestrator_core::default_project_root;
 use orchestrator_llm::{
-    agent_loop::{ModelStreamResult, TokenUsage},
+    agent_loop::{ModelStreamResult, RetrievalPolicy, TokenUsage},
     llm_judge::JudgeConfig,
     mock_role_artifact, run_agent_loop_with_metrics, run_agent_steer_loop_with_metrics,
     tools::ExternalToolConfig,
@@ -15,10 +15,10 @@ use std::time::{Duration, Instant};
 use tokio::time;
 use tracing::{debug, warn};
 
-use super::config::{output_mode_for_role, prompt_version, RuntimeConfig};
+use super::config::{output_mode_for_role, prompt_version, RetrievalConfig, RuntimeConfig};
 use super::degraded::role_artifact_or_degraded;
 use super::lifecycle::tickers_from_state;
-use super::render::render_prompt_with_plugins;
+use super::render::{direct_context_manifest, render_prompt_with_plugins};
 
 pub(crate) struct RoleRun<'a> {
     pub state: Value,
@@ -72,6 +72,8 @@ pub(crate) struct RoleJob {
     pub web_search: orchestrator_llm::web_search::WebSearchConfig,
     pub truncation: TruncationConfig,
     pub judge: JudgeConfig,
+    pub retrieval_policy: RetrievalPolicy,
+    pub context_manifest: Value,
 }
 
 #[derive(Debug)]
@@ -110,7 +112,7 @@ impl RoleJobResult {
 
 fn prompt_version_for_role(state: &Value, role: &str, kind: &str) -> Option<String> {
     let config = state.get("config")?;
-    if matches!(role, "researcher.bull.initial" | "researcher.bear.initial") && kind == "warmup" {
+    if role == "mediator.topic" && kind == "warmup" {
         return Some(prompt_version(config, "orchestrator.prompts.phase2.warmup"));
     }
     let prompt_key = match role {
@@ -226,7 +228,7 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
         debug: debug_enabled,
         prompt,
         prompt_path: prompt_path.map(|path| path.display().to_string()),
-        debug_output_path: None,
+        debug_output_path: phase2_debug_output_path(phase, role, kind, topic_id),
         prompt_version,
         tickers: tickers.clone(),
         output_mode: output_mode_for_role(role),
@@ -254,6 +256,8 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
                 .flatten()
                 .filter_map(|task| task.get("task_id").and_then(Value::as_i64))
                 .collect(),
+            phase_summary_page_limit: config.retrieval.summary_page_limit,
+            phase_summary_detail_page_limit: config.retrieval.detail_page_limit,
             tickers: tool_tickers,
             alpaca_live,
             alpaca_market_data,
@@ -280,7 +284,97 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
         web_search: config.web_search.get(role).cloned().unwrap_or_default(),
         truncation: config.truncation.clone(),
         judge: config.judge.clone(),
+        retrieval_policy: retrieval_policy_for_role(role, kind, &config.retrieval),
+        context_manifest: direct_context_manifest(&state, phase),
     })
+}
+
+fn retrieval_policy_for_role(role: &str, kind: &str, config: &RetrievalConfig) -> RetrievalPolicy {
+    let policy = |required_source_phases: &[i64],
+                  required_detail_source_phases: &[i64],
+                  minimum: usize,
+                  maximum: usize| RetrievalPolicy {
+        mandatory_summary_query: true,
+        required_source_phases: required_source_phases.to_vec(),
+        required_detail_source_phases: required_detail_source_phases.to_vec(),
+        minimum_detail_expansions: minimum,
+        maximum_detail_expansions: maximum,
+        summary_page_limit: config.summary_page_limit,
+        detail_page_limit: config.detail_page_limit,
+        allow_empty_when_no_visible_summary: true,
+        allowed_direct_contexts: vec![
+            "rust_control_plane".to_string(),
+            "current_phase_packet".to_string(),
+            "current_task".to_string(),
+        ],
+    };
+    match (role, kind) {
+        ("reflector.historical", _) => policy(&[], &[], 1, config.reflection_max_details),
+        ("mediator.topic", "warmup") => policy(&[1], &[], 0, 2),
+        ("mediator.topic", _) => policy(&[1], &[], 0, config.phase2_max_details),
+        ("researcher.bull.initial" | "researcher.bear.initial", _) => {
+            policy(&[1], &[], 0, config.phase2_max_details)
+        }
+        ("researcher.bull.interaction" | "researcher.bear.interaction", _) => {
+            policy(&[1], &[], 0, config.phase2_max_details)
+        }
+        ("mediator.topic_controller", _) => policy(&[1], &[], 0, config.phase2_max_details),
+        ("manager.research", _) => policy(&[1, 2], &[], 1, config.phase3_max_details),
+        ("trader", _) => policy(&[3], &[3], 1, config.phase4_max_details),
+        ("risk.aggressive" | "risk.neutral" | "risk.conservative", _) => {
+            policy(&[3, 4], &[3, 4], 2, config.phase5_max_details)
+        }
+        ("portfolio.manager", _) => policy(&[3, 4, 5], &[3, 4, 5], 3, config.phase6_max_details),
+        _ => RetrievalPolicy::default(),
+    }
+}
+
+fn phase2_debug_output_path(
+    phase: i64,
+    role: &str,
+    kind: &str,
+    topic_id: Option<&str>,
+) -> Option<PathBuf> {
+    if phase != 2 {
+        return None;
+    }
+    if role == "mediator.topic" {
+        return Some(PathBuf::from(if kind == "warmup" {
+            "outputs/debug/phase2/phase2-warmup-shared.json"
+        } else {
+            "outputs/debug/phase2/topic-generator.json"
+        }));
+    }
+    let topic_id = topic_id?;
+    let safe_topic_id: String = topic_id
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let topic_dir = if safe_topic_id.starts_with("topic-") || safe_topic_id.starts_with("topic_") {
+        safe_topic_id
+    } else {
+        format!("topic-{safe_topic_id}")
+    };
+    let file = if role == "mediator.topic_controller" {
+        "topic-controller.json"
+    } else if role.contains(".bull.") {
+        "debate-bull.json"
+    } else if role.contains(".bear.") {
+        "debate-bear.json"
+    } else {
+        return None;
+    };
+    Some(
+        PathBuf::from("outputs/debug/phase2")
+            .join(topic_dir)
+            .join(file),
+    )
 }
 
 pub(crate) async fn run_role_jobs(
@@ -382,6 +476,9 @@ pub(crate) fn record_role_job_metrics(state: &mut Value, result: &RoleJobResult)
             "visible_output_tokens": result.usage.visible_output_tokens(),
             "turn_count": result.turn_count,
             "tool_call_count": result.tool_call_count
+            ,"retrieval_audit": result.artifact.as_ref()
+                .and_then(|artifact| artifact.get("retrieval_audit"))
+                .cloned().unwrap_or(Value::Null)
         }));
     }
     refresh_role_job_metrics(state);
@@ -812,6 +909,13 @@ async fn execute_role_job(job: RoleJob) -> Result<AgentLoopOutput> {
             "using mock artifact"
         );
         let mut artifact = mock_role_artifact(&job.role, &job.tickers);
+        artifact["retrieval_audit"] = json!({
+            "status": "not_applicable",
+            "source": "mock_runtime",
+            "summary_query_count": 0,
+            "detail_call_count": 0
+        });
+        artifact["context_manifest"] = job.context_manifest;
         artifact["phase"] = Value::Number(job.phase.into());
         artifact["kind"] = Value::String(job.kind);
         if let Some(round) = job.round {
@@ -857,6 +961,7 @@ async fn execute_role_job(job: RoleJob) -> Result<AgentLoopOutput> {
         truncation: job.truncation,
         judge: job.judge,
         debug: job.debug,
+        retrieval_policy: job.retrieval_policy,
     };
     debug!(
         role = settings.role,
@@ -864,7 +969,9 @@ async fn execute_role_job(job: RoleJob) -> Result<AgentLoopOutput> {
         prompt_chars = job.prompt.len(),
         "calling agent loop"
     );
-    run_agent_loop_with_metrics(&settings, &job.prompt).await
+    let mut output = run_agent_loop_with_metrics(&settings, &job.prompt).await?;
+    output.artifact["context_manifest"] = job.context_manifest;
+    Ok(output)
 }
 
 async fn execute_steer_role_job(
@@ -875,6 +982,13 @@ async fn execute_steer_role_job(
 ) -> Result<AgentLoopOutput> {
     if job.mock {
         let mut artifact = mock_role_artifact(&job.role, &job.tickers);
+        artifact["retrieval_audit"] = json!({
+            "status": "not_applicable",
+            "source": "mock_runtime",
+            "summary_query_count": 0,
+            "detail_call_count": 0
+        });
+        artifact["context_manifest"] = job.context_manifest;
         artifact["phase"] = Value::Number(job.phase.into());
         artifact["kind"] = Value::String(job.kind);
         if let Some(round) = job.round {
@@ -932,8 +1046,9 @@ async fn execute_steer_role_job(
         truncation: job.truncation,
         judge: job.judge,
         debug: job.debug,
+        retrieval_policy: job.retrieval_policy,
     };
-    run_agent_steer_loop_with_metrics(
+    let mut output = run_agent_steer_loop_with_metrics(
         &settings,
         SteerLoopInput {
             session_id,
@@ -942,7 +1057,9 @@ async fn execute_steer_role_job(
             steer,
         },
     )
-    .await
+    .await?;
+    output.artifact["context_manifest"] = job.context_manifest;
+    Ok(output)
 }
 
 #[cfg(test)]
@@ -987,6 +1104,36 @@ mod tests {
         assert_eq!(job.llm_ms, 50);
         assert_eq!(job.tool_ms, 25);
         assert_eq!(job.wait_ms(), 25);
+    }
+
+    #[test]
+    fn phase2_debug_paths_follow_the_checkpoint_and_topic_tree() {
+        assert_eq!(
+            phase2_debug_output_path(2, "mediator.topic", "warmup", None),
+            Some(PathBuf::from(
+                "outputs/debug/phase2/phase2-warmup-shared.json"
+            ))
+        );
+        assert_eq!(
+            phase2_debug_output_path(2, "mediator.topic", "topic_generation", None),
+            Some(PathBuf::from("outputs/debug/phase2/topic-generator.json"))
+        );
+        for (role, file) in [
+            ("researcher.bull.initial", "debate-bull.json"),
+            ("researcher.bear.interaction", "debate-bear.json"),
+            ("mediator.topic_controller", "topic-controller.json"),
+        ] {
+            assert_eq!(
+                phase2_debug_output_path(2, role, "debate", Some("QQQ/risk")),
+                Some(PathBuf::from("outputs/debug/phase2/topic-QQQ_risk").join(file))
+            );
+        }
+        assert_eq!(
+            phase2_debug_output_path(2, "researcher.bull.initial", "bull_seed", Some("topic_vix")),
+            Some(PathBuf::from(
+                "outputs/debug/phase2/topic_vix/debate-bull.json"
+            ))
+        );
     }
 
     #[test]

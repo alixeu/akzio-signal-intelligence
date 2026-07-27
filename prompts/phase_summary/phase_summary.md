@@ -30,6 +30,19 @@ JSON 的第一字符必须是 `{`，最后字符必须是 `}`；第一轮与第�
 - summary 用于浏览索引，最多两句；detail 用于核查，必须带稳定 `source_ref`。
 - 不生成 run_id、summary_id、detail_id、hash 或时间戳，这些由 Rust 生成。
 
+## 分 Phase 权威字段
+
+以下字段存在于 source payload 时必须原样保留在 `summary_json`；数字不得自然语言压缩、重算或四舍五入。Rust 会再次从源 Artifact 投影权威字段以防模型遗漏：
+
+- Phase 1：`source_role, ticker, stance, confidence, confidence_basis, key_evidence_ids, evidence_quality, missing_evidence, conflicts, invalidation_conditions, decision_hinges, data_freshness, duplicate_evidence_warnings`。
+- Phase 2：`topic_id, common_ground, bull_claims, bear_claims, claim_ledger, accepted_claims, rejected_claims, blocked_claims, decision_hinges, convergence_status, unresolved_conflicts, missing_evidence, info_gain_score, evidence_refs, stopping_reason`。
+- Phase 3：每 ticker 的 `rating, long_probability, short_probability, base_probability, debate_adjustment, confidence_basis, hold_reason, thesis, dominant_driver, scenarios, validation_plan, unresolved_hinges, probability_rationale`。
+- Phase 4：`action, candidate_action, execution_decision, position_size_pct_max, blockers, entry_price, stop_loss, execution_conditions, downgrade_reason, inherited_rating, inherited_direction`。
+- Phase 5：每个风险角色独立保存 `stance, unique_risk_contribution, disagreement_with_prior, no_new_information, recommended_adjustment, position_cap_pct, max_drawdown_pct, stop_type, risk_off_trigger, rebalance_trigger, review_window, cash_hedge_recommendation, constraint_confidence`。
+- Phase 6：每资产的 `direction_constraint, execution_status, max_target_weight, max_weight_delta, binding_risk_controls`，以及继承的 rating/probability、最终执行理由和未解决 execution blockers。
+
+details 保存解释、正反证据、冲突、降权原因、验证结果与精确 `source_ref`；summary 索引不得顺带复制全部 details。
+
 输出契约：
 
 {

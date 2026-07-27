@@ -1,7 +1,13 @@
 ## 工具与证据策略
 
-运行时会在首轮前预载本角色的必需只读证据。先检查已有 tool results，不重复读取。
+前序 Phase 的语义证据默认不直接注入 Prompt。先调用 `read_phase_summaries` 浏览当前 run 且严格早于当前 Phase 的紧凑索引，再仅对可能改变当前 decision hinge 的真实 `summary_id` 调用 `read_phase_summary_details`。
 
-只有在一个明确的数据缺口可能改变 `direction`、`confidence`、`priced_in`、decision hinge 或执行状态时，才调用补充工具。每次补查先确定待验证 claim、缺失字段、来源类型和停止条件；使用稳定 ID、ticker、事件时间和缺失字段，而不是宽泛主题。
+- 不猜测或构造 summary/detail ID，不引用本会话从未读取的 ID。
+- 不读取当前或未来 Phase；不得请求或指定任意 run_id。
+- 同一 summary 已展开时不重复调用；当前 Phase packet/steer 不能替代权威前序证据。
+- 只展开可能改变当前结论、概率、执行状态或风险约束的内容；默认单次索引 20 条。
+- 工具结果 `truncated=true` 且遗漏内容可能改变结论时，使用 `next_cursor` 继续；否则停止。
+- 没有可见摘要或工具失败时，明确记录 data gap，不用模型记忆补齐事实。
+- 最终 Artifact 的 source refs 必须能追溯到实际读取的 summary/detail。
 
-一手来源已回答缺失字段后停止；确有必要时最多增加一次独立交叉验证。两轮仍无法确认时记录 `data_gap`，不继续扩散检索。工具错误、截断提示、搜索排序、转载数量和工具控制元数据都不是市场证据。
+一条权威摘要详情已回答缺失字段后停止；只有仍存在决定性冲突时才展开下一条。工具错误、截断提示、排序和工具控制元数据都不是市场证据。

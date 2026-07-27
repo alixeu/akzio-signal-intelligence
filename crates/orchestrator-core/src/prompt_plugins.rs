@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use crate::plugin_manifest::{ComponentManifest, RoleManifest};
-use crate::prompt::replace_placeholders;
+use crate::prompt::render_template;
 
 pub const KNOWN_RENDER_VARIABLES: &[&str] = &[
     "ticker",
@@ -47,10 +47,10 @@ pub const KNOWN_RENDER_VARIABLES: &[&str] = &[
     "round",
     "topic_id",
     "topic",
-    "analyst_reports",
-    "research_plan",
-    "trader_plan",
-    "risk_history",
+    "retrieval_bootstrap",
+    "phase4_control_context",
+    "phase5_control_context",
+    "phase6_control_context",
     "portfolio_decision",
     "allocation_context",
 ];
@@ -189,7 +189,13 @@ impl ComponentRegistry {
             bail!("component render values must be a JSON object");
         }
         for plugin in self.for_role(role_id) {
-            let rendered = replace_placeholders(&plugin.template, values);
+            let rendered = render_template(&plugin.template, values).with_context(|| {
+                format!(
+                    "failed to render component plugin {} at {}",
+                    plugin.manifest.name,
+                    plugin.path.display()
+                )
+            })?;
             if let Some(map) = values.as_object_mut() {
                 map.insert(
                     plugin.manifest.placeholder_key.clone(),

@@ -23,7 +23,7 @@ pub use artifact::{
 };
 pub use config::{
     config_bool, config_float, config_get, config_int, config_str, config_strings, deep_merge,
-    expand_env_placeholders, load_config,
+    expand_env_placeholders, load_config, load_project_env,
 };
 pub use jin10_csv::{
     default_jin10_csv_dir, jin10_csv_path, jin10_item_id, load_jin10_csv, load_jin10_csv_recent,
@@ -31,7 +31,7 @@ pub use jin10_csv::{
     DEFAULT_JIN10_CSV_DIR,
 };
 pub use paths::{default_project_root, project_path};
-pub use prompt::replace_placeholders;
+pub use prompt::{render_template, replace_placeholders};
 pub use prompt_plugins::{
     validate_plugins, ComponentPlugin, ComponentRegistry, RolePlugin, RolePluginRegistry,
     KNOWN_RENDER_VARIABLES,

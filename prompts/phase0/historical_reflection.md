@@ -4,13 +4,17 @@
 
 {reflection_task}
 
+{retrieval_policy}
+
 ## 必须执行
 
-1. 首先调用 `read_reflection_source`，参数为当前 `task_id`。只允许读取该工具返回的 allowlisted `source_run_id` 的 `phase_summaries` 与 `phase_summary_details`。
-2. 将当时核心判断、证据、冲突、预测、失效条件和决策变化与实际结果逐项比较。
-3. 区分正确判断且正确结果、错误判断但幸运盈利、正确逻辑但时机/执行/仓位错误、错误判断且亏损，以及暂时不能验证。
-4. 找出第一个发生问题的 Phase，并描述向后传播路径。每条经验只能有一个 `source_phase` 和一个原子根因；不同 Phase 的问题必须拆成不同经验。
-5. 每次都完成复盘，但只有跨任务可复用的结论才设置 `reusable=true`。单次偶然收益不得包装为永久规则。
+1. 首先调用 `read_reflection_source(task_id)`，只取得 task、decision、outcome、来源 run 元数据与摘要数量；bootstrap 不含 summary/detail 正文。
+2. 调用 `read_phase_summaries(task_id, source_phase/role/ticker)` 建立逐 Phase 时间线；只对根因、传播节点、反证或执行结果真正相关的 summary 调用 `read_phase_summary_details(task_id, summary_id)`。
+3. 将当时核心判断、证据、冲突、预测、失效条件和决策变化与实际结果逐项比较。
+4. 区分正确判断且正确结果、错误判断但幸运盈利、正确逻辑但时机错误、正确逻辑但仓位错误、错误执行、错误判断且亏损，以及暂时不能验证。
+5. 找出最早根因和向后传播路径；每条经验只能有一个 `source_phase` 和一个原子根因，不同 Phase 的问题拆分。
+6. Deep reflection 必须覆盖逐 Phase 时间线、counter evidence、counterfactual 和 unverifiable points；Routine 仍需完成根因与传播分析，但只展开决策相关详情。
+7. 每次都完成复盘，但只有跨任务可复用的结论才设置 `reusable=true`。单次偶然收益不得包装为永久规则。
 
 ## 受控分类
 
@@ -28,7 +32,19 @@
   "assessment": {
     "decision_quality": "correct|incorrect|mixed|unverifiable",
     "result_quality": "profit|loss|flat",
-    "summary": "简洁复盘"
+    "summary": "简洁复盘",
+    "timeline": [],
+    "earliest_root_cause": "",
+    "propagation_path": [],
+    "correct_judgments": [],
+    "incorrect_judgments": [],
+    "lucky_profit": false,
+    "correct_logic_bad_timing": false,
+    "correct_logic_bad_sizing": false,
+    "bad_execution": false,
+    "counter_evidence": [],
+    "counterfactual": [],
+    "unverifiable_points": []
   },
   "experiences": [
     {

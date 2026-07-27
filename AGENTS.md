@@ -25,14 +25,19 @@ This repository is a Rust workspace for AI-assisted market-signal research and T
   the analytical trace; Trader and Portfolio Manager use the execution trace;
   Phase Summary uses the summary trace. Bull/Bear packets, Topic Controller,
   and Phase 5 risk reviewers keep their compact packet/constraint audit data.
-- Phase 2 starts Topic Generator, Bull warm-up, and Bear warm-up concurrently.
-  Each selected topic forks Bull/Bear from their warm-up turns and its Topic
-  Controller from the Topic Generator turn. Debate reduction remains Rust-owned.
+- Phase 2 builds one shared Bull/Bear warm-up checkpoint, continues it through
+  Topic Generator, then forks Bull, Bear, and Topic Controller for each topic
+  from that completed topic turn. Debate reduction remains Rust-owned.
 - Phase 0 historical scoring/task selection, Phase 7 allocation, and Phase 8
   decision snapshot/archive are Rust-owned stages. Phase 0 uses a dedicated
   historical-reflector prompt for causal analysis.
 - A non-mock workflow scores predictions after three stored trading bars and
   promotes qualified historical experience for retrieval on later runs.
+- Phase Summary is the only cross-phase semantic interface for model roles in
+  Phases 2–6. Roles list summaries before expanding details; Rust enforces
+  role-specific source-phase, pagination, detail-budget, and evidence-ID policy.
+- Phase 5 reviewers run independently in parallel. Portfolio Manager combines
+  their separately compressed Phase 5 summaries.
 - Generated run outputs live under `outputs/` and should not be committed.
 - Runtime defaults live in `config/config.yaml`.
 - Live agent runs use strict SQLite input by default.

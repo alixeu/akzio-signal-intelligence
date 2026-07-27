@@ -11,11 +11,17 @@ use anyhow::{bail, Context, Result};
 use orchestrator_core;
 use orchestrator_sql::{turn_history_items, upsert_agent_turn, AgentTurnInput};
 use serde_json::{json, Value};
-use std::{future::Future, path::PathBuf, pin::Pin, time::Instant};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    future::Future,
+    path::PathBuf,
+    pin::Pin,
+    time::Instant,
+};
 use tracing::{debug, warn};
 
 #[cfg(test)]
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 
 use crate::llm_judge::{judge_message_status, JudgeConfig};
 use crate::tools::{self, truncate_chars};
@@ -117,6 +123,7 @@ pub struct AgentLoopConfig {
     pub phase: Option<i64>,
     pub model: String,
     pub topic_id: Option<String>,
+    pub retrieval_policy: RetrievalPolicy,
 }
 
 impl Default for AgentLoopConfig {
@@ -137,6 +144,7 @@ impl Default for AgentLoopConfig {
             phase: None,
             model: String::new(),
             topic_id: None,
+            retrieval_policy: RetrievalPolicy::default(),
         }
     }
 }
@@ -225,6 +233,7 @@ where
     let mut end_turn_count = 0usize;
     let mut aggregate_result = ModelStreamResult::default();
     let mut judge_call_count = 0usize;
+    let mut retrieval_retry_queued = false;
     loop {
         if let Some(max_loops) = max_loops {
             if end_turn_count >= max_loops {
@@ -319,12 +328,41 @@ where
             let debug_phase = turn.phase;
             let debug_topic = config.topic_id.clone();
             let debug_loop = loop_index;
+            let visible_summary_ids = visible_summary_ids_from_history(turn);
             let tool_batch_started = Instant::now();
             let futures: Vec<_> = calls
                 .into_iter()
                 .map(|call| async {
                     let call_id = call.call_id.clone();
                     let name = call.name.clone();
+                    if name == tools::READ_PHASE_SUMMARY_DETAILS_TOOL_NAME {
+                        let summary_id = call
+                            .arguments
+                            .get("summary_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        if !visible_summary_ids.contains(summary_id) {
+                            return (
+                                ToolResultItem {
+                                    call_id: call.call_id,
+                                    name,
+                                    status: "error".to_string(),
+                                    output: json!({
+                                        "status": "not_visible",
+                                        "item_count": 0,
+                                        "items": [],
+                                        "source_policy": "list_before_detail_required"
+                                    }),
+                                    error: Some(
+                                        "summary is not visible in a prior read_phase_summaries result"
+                                            .to_string(),
+                                    ),
+                                },
+                                call_id,
+                                tools::READ_PHASE_SUMMARY_DETAILS_TOOL_NAME.to_string(),
+                            );
+                        }
+                    }
                     debug!(
                         call_id = call_id,
                         tool = name,
@@ -399,6 +437,15 @@ where
         }
 
         if let Some(text) = last_assistant_message_text(turn) {
+            if let Err(error) = validate_retrieval_policy(turn, &config.retrieval_policy, &text) {
+                if !retrieval_retry_queued {
+                    retrieval_retry_queued = true;
+                    queue_artifact_retry(turn, &format!("retrieval policy: {error}"));
+                    persist_turn(conn, turn, &config.truncation)?;
+                    continue;
+                }
+                bail!("retrieval policy remained invalid after one repair retry: {error}");
+            }
             if turn.role.starts_with("analyst.") {
                 if let Err(error) =
                     analyst_final_artifact_validation_error(&turn.role, &turn_tickers(turn), &text)
@@ -474,6 +521,338 @@ where
         );
         persist_turn(conn, turn, &config.truncation)?;
         return Ok(aggregate_result);
+    }
+}
+
+fn visible_summary_ids_from_history(turn: &Turn) -> BTreeSet<String> {
+    turn.emitted_items
+        .iter()
+        .filter(|item| {
+            item.item_type == TurnItemType::ToolResult
+                && item.tool_name == tools::READ_PHASE_SUMMARIES_TOOL_NAME
+        })
+        .filter_map(tool_result_output)
+        .filter_map(|output| output.get("items").and_then(Value::as_array).cloned())
+        .flatten()
+        .filter_map(|summary| {
+            summary
+                .get("id")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
+        .collect()
+}
+
+pub fn retrieval_audit(turn: &Turn) -> Value {
+    let mut calls = Vec::new();
+    let mut call_args = BTreeMap::<String, Value>::new();
+    let mut summary_ids = BTreeSet::new();
+    let mut detail_ids = BTreeSet::new();
+    let mut expanded_summary_ids = Vec::new();
+    let mut summary_source_phases = BTreeMap::<String, i64>::new();
+    let mut visible_source_phases = BTreeSet::new();
+    let mut expanded_source_phases = BTreeSet::new();
+    let mut listed_before_detail = BTreeSet::new();
+    let mut detail_before_list = BTreeSet::new();
+    let mut signatures = BTreeMap::<String, usize>::new();
+    let mut summary_query_count = 0usize;
+    let mut successful_summary_query_count = 0usize;
+    let mut detail_call_count = 0usize;
+    let mut visible_summary_count = 0usize;
+    let mut any_truncated = false;
+    let mut summary_filters = Vec::new();
+    let mut successful_summary_filters = Vec::new();
+
+    for item in &turn.emitted_items {
+        match item.item_type {
+            TurnItemType::ToolCall
+                if matches!(
+                    item.tool_name.as_str(),
+                    tools::READ_PHASE_SUMMARIES_TOOL_NAME
+                        | tools::READ_PHASE_SUMMARY_DETAILS_TOOL_NAME
+                        | tools::READ_REFLECTION_SOURCE_TOOL_NAME
+                ) =>
+            {
+                let arguments = item
+                    .content_json
+                    .pointer("/call/arguments")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let signature = format!("{}:{}", item.tool_name, canonical_value(&arguments));
+                *signatures.entry(signature).or_default() += 1;
+                if item.tool_name == tools::READ_PHASE_SUMMARIES_TOOL_NAME {
+                    summary_query_count += 1;
+                    summary_filters.push(arguments.clone());
+                } else if item.tool_name == tools::READ_PHASE_SUMMARY_DETAILS_TOOL_NAME {
+                    detail_call_count += 1;
+                    if let Some(summary_id) = arguments.get("summary_id").and_then(Value::as_str) {
+                        expanded_summary_ids.push(summary_id.to_string());
+                        if let Some(source_phase) = summary_source_phases.get(summary_id) {
+                            expanded_source_phases.insert(*source_phase);
+                        }
+                        if !listed_before_detail.contains(summary_id) {
+                            detail_before_list.insert(summary_id.to_string());
+                        }
+                    }
+                }
+                call_args.insert(item.tool_call_id.clone(), arguments.clone());
+                calls.push(json!({
+                    "call_id": item.tool_call_id,
+                    "tool": item.tool_name,
+                    "arguments": arguments
+                }));
+            }
+            TurnItemType::ToolResult => {
+                let Some(output) = tool_result_output(item) else {
+                    continue;
+                };
+                if item.tool_name == tools::READ_PHASE_SUMMARIES_TOOL_NAME {
+                    if item.status == Some(AgentItemStatus::Completed) {
+                        successful_summary_query_count += 1;
+                        if let Some(arguments) = call_args.get(&item.tool_call_id) {
+                            successful_summary_filters.push(arguments.clone());
+                        }
+                    }
+                    visible_summary_count = visible_summary_count.saturating_add(
+                        output
+                            .get("item_count")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0) as usize,
+                    );
+                    any_truncated |= output
+                        .get("truncated")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    if let Some(items) = output.get("items").and_then(Value::as_array) {
+                        for summary in items {
+                            if let Some(id) = summary.get("id").and_then(Value::as_str) {
+                                summary_ids.insert(id.to_string());
+                                listed_before_detail.insert(id.to_string());
+                                if let Some(source_phase) =
+                                    summary.get("source_phase").and_then(Value::as_i64)
+                                {
+                                    summary_source_phases.insert(id.to_string(), source_phase);
+                                    visible_source_phases.insert(source_phase);
+                                }
+                            }
+                        }
+                    }
+                } else if item.tool_name == tools::READ_PHASE_SUMMARY_DETAILS_TOOL_NAME {
+                    any_truncated |= output
+                        .get("truncated")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    if let Some(items) = output.get("items").and_then(Value::as_array) {
+                        for detail in items {
+                            if let Some(id) = detail.get("id").and_then(Value::as_str) {
+                                detail_ids.insert(id.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let duplicate_retrievals = signatures
+        .values()
+        .map(|count| count.saturating_sub(1))
+        .sum::<usize>();
+    let unique_expanded = expanded_summary_ids
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    json!({
+        "source": "rust_turn_history",
+        "status": "available",
+        "summary_query_count": summary_query_count,
+        "successful_summary_query_count": successful_summary_query_count,
+        "detail_call_count": detail_call_count,
+        "visible_summary_count": visible_summary_count,
+        "summary_filters": summary_filters,
+        "successful_summary_filters": successful_summary_filters,
+        "returned_summary_ids": summary_ids,
+        "visible_source_phases": visible_source_phases,
+        "expanded_summary_ids": unique_expanded,
+        "expanded_source_phases": expanded_source_phases,
+        "read_detail_ids": detail_ids,
+        "duplicate_retrieval_count": duplicate_retrievals,
+        "detail_requested_before_visible_index": detail_before_list,
+        "tool_result_truncated": any_truncated,
+        "calls": calls,
+        "call_argument_count": call_args.len()
+    })
+}
+
+fn validate_retrieval_policy(
+    turn: &Turn,
+    policy: &RetrievalPolicy,
+    final_text: &str,
+) -> std::result::Result<(), String> {
+    if !policy.mandatory_summary_query
+        && policy.required_source_phases.is_empty()
+        && policy.maximum_detail_expansions == 0
+    {
+        return Ok(());
+    }
+    let audit = retrieval_audit(turn);
+    let summary_query_count = audit["successful_summary_query_count"]
+        .as_u64()
+        .unwrap_or(0) as usize;
+    let visible_summary_count = audit["visible_summary_count"].as_u64().unwrap_or(0) as usize;
+    if policy.mandatory_summary_query && summary_query_count == 0 {
+        return Err("read_phase_summaries was not called".to_string());
+    }
+    let filters = audit["successful_summary_filters"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    for phase in &policy.required_source_phases {
+        let queried = filters
+            .iter()
+            .any(|args| args.get("source_phase").and_then(Value::as_i64) == Some(*phase));
+        if !queried {
+            return Err(format!(
+                "read_phase_summaries(source_phase={phase}) is required"
+            ));
+        }
+    }
+    let expanded_source_phases = audit["expanded_source_phases"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_i64)
+        .collect::<BTreeSet<_>>();
+    let visible_source_phases = audit["visible_source_phases"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_i64)
+        .collect::<BTreeSet<_>>();
+    for phase in &policy.required_detail_source_phases {
+        if visible_source_phases.contains(phase) && !expanded_source_phases.contains(phase) {
+            return Err(format!(
+                "at least one detail from source_phase={phase} is required when summaries are visible"
+            ));
+        }
+    }
+    for args in &filters {
+        let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(20) as usize;
+        if policy.summary_page_limit > 0 && limit > policy.summary_page_limit {
+            return Err(format!(
+                "summary page limit exceeded: maximum {}, got {limit}",
+                policy.summary_page_limit
+            ));
+        }
+    }
+    let largest_detail_limit = audit["calls"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|call| {
+            call.get("tool").and_then(Value::as_str)
+                == Some(tools::READ_PHASE_SUMMARY_DETAILS_TOOL_NAME)
+        })
+        .filter_map(|call| call.pointer("/arguments/limit").and_then(Value::as_u64))
+        .max();
+    if let Some(limit) = largest_detail_limit {
+        if policy.detail_page_limit > 0 && limit as usize > policy.detail_page_limit {
+            return Err(format!(
+                "detail page limit exceeded: maximum {}, got {limit}",
+                policy.detail_page_limit
+            ));
+        }
+    }
+    let expanded = audit["expanded_summary_ids"]
+        .as_array()
+        .map(Vec::len)
+        .unwrap_or(0);
+    if visible_summary_count > 0 && expanded < policy.minimum_detail_expansions {
+        return Err(format!(
+            "at least {} relevant summary detail expansions are required when summaries are visible; got {expanded}",
+            policy.minimum_detail_expansions
+        ));
+    }
+    if policy.maximum_detail_expansions > 0 && expanded > policy.maximum_detail_expansions {
+        return Err(format!(
+            "detail expansion budget exceeded: maximum {}, got {expanded}",
+            policy.maximum_detail_expansions
+        ));
+    }
+    if let Some(ids) = audit["detail_requested_before_visible_index"].as_array() {
+        if !ids.is_empty() {
+            return Err(format!(
+                "summary details were requested before their ids appeared in a visible summary index: {}",
+                Value::Array(ids.clone())
+            ));
+        }
+    }
+    let artifact = extract_json_value(final_text).map_err(|error| error.to_string())?;
+    let mut referenced = BTreeSet::new();
+    collect_evidence_ids(&artifact, &mut referenced);
+    let readable = audit["returned_summary_ids"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .chain(audit["read_detail_ids"].as_array().into_iter().flatten())
+        .filter_map(Value::as_str)
+        .collect::<BTreeSet<_>>();
+    let unread = referenced
+        .iter()
+        .filter(|id| !readable.contains(id.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !unread.is_empty() {
+        return Err(format!(
+            "artifact references summary/detail ids not read in this session: {}",
+            unread.join(", ")
+        ));
+    }
+    if turn.role == "mediator.topic"
+        && visible_summary_count > 0
+        && artifact
+            .get("topics")
+            .and_then(Value::as_array)
+            .is_some_and(|topics| !topics.is_empty())
+        && expanded == 0
+    {
+        return Err(
+            "topic generation with visible summaries requires one relevant detail expansion"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn tool_result_output(item: &TurnItem) -> Option<Value> {
+    item.content_json
+        .pointer("/result/output")
+        .cloned()
+        .or_else(|| serde_json::from_str(&item.content_text).ok())
+}
+
+fn canonical_value(value: &Value) -> String {
+    serde_json::to_string(value).unwrap_or_default()
+}
+
+fn collect_evidence_ids(value: &Value, ids: &mut BTreeSet<String>) {
+    match value {
+        Value::String(text)
+            if text.len() == 32 && text.bytes().all(|byte| byte.is_ascii_hexdigit()) =>
+        {
+            ids.insert(text.to_ascii_lowercase());
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_evidence_ids(item, ids);
+            }
+        }
+        Value::Object(map) => {
+            for value in map.values() {
+                collect_evidence_ids(value, ids);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1245,36 +1624,9 @@ fn preseed_tool_calls(
                 arguments: json!({ "tickers": tickers }),
             });
         }
-        "researcher.bull.initial" | "researcher.bear.initial"
-            if turn_is_warmup(turn) && tool_enabled(tools::READ_PHASE_SUMMARIES_TOOL_NAME) =>
-        {
-            calls.push(ToolCallRequest {
-                call_id: format!("preseed-phase-summaries-{}", turn.role.replace('.', "-")),
-                name: tools::READ_PHASE_SUMMARIES_TOOL_NAME.to_string(),
-                arguments: json!({}),
-            });
-        }
         _ => {}
     }
     calls
-}
-
-fn turn_is_warmup(turn: &Turn) -> bool {
-    fn warmup_steer(value: &str) -> bool {
-        let value = value.trim().strip_prefix("Steer:").unwrap_or(value.trim());
-        serde_json::from_str::<Value>(value)
-            .ok()
-            .and_then(|value| value.get("kind").and_then(Value::as_str).map(str::to_owned))
-            .is_some_and(|kind| kind == "warmup")
-    }
-
-    turn.pending_input.iter().any(|value| warmup_steer(value))
-        || turn
-            .emitted_items
-            .iter()
-            .skip(1)
-            .filter(|item| item.item_type == TurnItemType::UserMessage)
-            .any(|item| warmup_steer(&item.content_text))
 }
 
 /// Map plain assistant text (stream/text output) into a ModelResponse.
@@ -2500,27 +2852,172 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bull_bear_warmup_preseeds_summary_index_only_for_warmup() {
-        for role in ["researcher.bull.initial", "researcher.bear.initial"] {
-            let mut warmup = Turn::new("turn-warmup", "session", "run", role, "role prompt");
-            warmup.push_pending_input(r#"Steer: {"kind":"warmup"}"#);
-            let calls = preseed_tool_calls(
-                &warmup,
-                &["QQQ".to_string()],
-                &[tools::READ_PHASE_SUMMARIES_TOOL_NAME.to_string()],
-            );
-            assert_eq!(calls.len(), 1);
-            assert_eq!(calls[0].name, tools::READ_PHASE_SUMMARIES_TOOL_NAME);
-
-            let mut seed = Turn::new("turn-seed", "session", "run", role, "role prompt");
-            seed.push_pending_input(r#"Steer: {"kind":"topic_fork"}"#);
-            assert!(preseed_tool_calls(
-                &seed,
-                &["QQQ".to_string()],
-                &[tools::READ_PHASE_SUMMARIES_TOOL_NAME.to_string()],
-            )
-            .is_empty());
+    fn retrieval_audit_tracks_real_ids_filters_duplicates_and_truncation() {
+        let summary_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let detail_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let mut turn = Turn::new("turn", "session", "run", "trader", "");
+        let list = ToolCallRequest {
+            call_id: "list-1".to_string(),
+            name: tools::READ_PHASE_SUMMARIES_TOOL_NAME.to_string(),
+            arguments: json!({"source_phase": 3, "ticker": "QQQ"}),
+        };
+        turn.emitted_items.push(TurnItem::tool_call(&list));
+        turn.emitted_items.push(TurnItem::tool_result(
+            &ToolResultItem {
+                call_id: list.call_id,
+                name: list.name,
+                status: "completed".to_string(),
+                output: json!({
+                    "item_count": 1,
+                    "total_count": 2,
+                    "truncated": true,
+                    "items": [{"id": summary_id, "source_phase": 3}]
+                }),
+                error: None,
+            },
+            &TruncationConfig::default(),
+        ));
+        for call_id in ["detail-1", "detail-2"] {
+            let call = ToolCallRequest {
+                call_id: call_id.to_string(),
+                name: tools::READ_PHASE_SUMMARY_DETAILS_TOOL_NAME.to_string(),
+                arguments: json!({"summary_id": summary_id}),
+            };
+            turn.emitted_items.push(TurnItem::tool_call(&call));
+            turn.emitted_items.push(TurnItem::tool_result(
+                &ToolResultItem {
+                    call_id: call.call_id,
+                    name: call.name,
+                    status: "completed".to_string(),
+                    output: json!({
+                        "item_count": 1,
+                        "items": [{"id": detail_id, "summary_id": summary_id}]
+                    }),
+                    error: None,
+                },
+                &TruncationConfig::default(),
+            ));
         }
+        let audit = retrieval_audit(&turn);
+        assert_eq!(audit["summary_query_count"], 1);
+        assert_eq!(audit["detail_call_count"], 2);
+        assert_eq!(audit["duplicate_retrieval_count"], 1);
+        assert_eq!(audit["tool_result_truncated"], true);
+        assert_eq!(audit["returned_summary_ids"][0], summary_id);
+        assert_eq!(audit["read_detail_ids"][0], detail_id);
+        assert_eq!(audit["expanded_source_phases"][0], 3);
+    }
+
+    #[test]
+    fn retrieval_policy_rejects_unread_artifact_ids() {
+        let mut turn = Turn::new("turn", "session", "run", "trader", "");
+        let list = ToolCallRequest {
+            call_id: "list".to_string(),
+            name: tools::READ_PHASE_SUMMARIES_TOOL_NAME.to_string(),
+            arguments: json!({"source_phase": 3}),
+        };
+        turn.emitted_items.push(TurnItem::tool_call(&list));
+        turn.emitted_items.push(TurnItem::tool_result(
+            &ToolResultItem {
+                call_id: list.call_id,
+                name: list.name,
+                status: "completed".to_string(),
+                output: json!({"item_count": 0, "items": []}),
+                error: None,
+            },
+            &TruncationConfig::default(),
+        ));
+        let policy = RetrievalPolicy {
+            mandatory_summary_query: true,
+            required_source_phases: vec![3],
+            allow_empty_when_no_visible_summary: true,
+            ..Default::default()
+        };
+        let error = validate_retrieval_policy(
+            &turn,
+            &policy,
+            r#"{"evidence_refs":["cccccccccccccccccccccccccccccccc"]}"#,
+        )
+        .unwrap_err();
+        assert!(error.contains("not read"));
+    }
+
+    #[test]
+    fn retrieval_policy_requires_details_from_each_visible_required_phase() {
+        let summary_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let mut turn = Turn::new("turn", "session", "run", "risk.neutral", "");
+        for (call_id, source_phase) in [("list-3", 3), ("list-4", 4)] {
+            let call = ToolCallRequest {
+                call_id: call_id.to_string(),
+                name: tools::READ_PHASE_SUMMARIES_TOOL_NAME.to_string(),
+                arguments: json!({"source_phase": source_phase}),
+            };
+            turn.emitted_items.push(TurnItem::tool_call(&call));
+            turn.emitted_items.push(TurnItem::tool_result(
+                &ToolResultItem {
+                    call_id: call.call_id,
+                    name: call.name,
+                    status: "completed".to_string(),
+                    output: json!({
+                        "item_count": 1,
+                        "items": [{"id": format!("{summary_id}{source_phase}"), "source_phase": source_phase}]
+                    }),
+                    error: None,
+                },
+                &TruncationConfig::default(),
+            ));
+        }
+        let phase3_id = format!("{summary_id}3");
+        let detail = ToolCallRequest {
+            call_id: "detail-3".to_string(),
+            name: tools::READ_PHASE_SUMMARY_DETAILS_TOOL_NAME.to_string(),
+            arguments: json!({"summary_id": phase3_id}),
+        };
+        turn.emitted_items.push(TurnItem::tool_call(&detail));
+        let policy = RetrievalPolicy {
+            mandatory_summary_query: true,
+            required_source_phases: vec![3, 4],
+            required_detail_source_phases: vec![3, 4],
+            minimum_detail_expansions: 2,
+            maximum_detail_expansions: 4,
+            ..Default::default()
+        };
+
+        let error = validate_retrieval_policy(&turn, &policy, "{}").unwrap_err();
+        assert!(error.contains("source_phase=4"));
+    }
+
+    #[test]
+    fn phase_summary_retrieval_is_never_preseeded() {
+        let mut warmup = Turn::new(
+            "turn-warmup",
+            "session",
+            "run",
+            "mediator.topic",
+            "role prompt",
+        );
+        warmup.push_pending_input(r#"Steer: {"kind":"warmup"}"#);
+        let calls = preseed_tool_calls(
+            &warmup,
+            &["QQQ".to_string()],
+            &[tools::READ_PHASE_SUMMARIES_TOOL_NAME.to_string()],
+        );
+        assert!(calls.is_empty());
+
+        let mut topic = Turn::new(
+            "turn-topic",
+            "session",
+            "run",
+            "mediator.topic",
+            "role prompt",
+        );
+        topic.push_pending_input(r#"Steer: {"kind":"topic_generation"}"#);
+        assert!(preseed_tool_calls(
+            &topic,
+            &["QQQ".to_string()],
+            &[tools::READ_PHASE_SUMMARIES_TOOL_NAME.to_string()],
+        )
+        .is_empty());
     }
 
     #[test]
@@ -3544,6 +4041,8 @@ mod tests {
                 run_id: None,
                 phase: None,
                 allowed_reflection_task_ids: Vec::new(),
+                phase_summary_page_limit: 20,
+                phase_summary_detail_page_limit: 20,
                 tickers: Vec::new(),
                 alpaca_live: false,
                 alpaca_market_data: false,
@@ -3577,6 +4076,8 @@ mod tests {
                 run_id: None,
                 phase: None,
                 allowed_reflection_task_ids: Vec::new(),
+                phase_summary_page_limit: 20,
+                phase_summary_detail_page_limit: 20,
                 tickers: Vec::new(),
                 alpaca_live: false,
                 alpaca_market_data: false,
@@ -4153,6 +4654,8 @@ mod tests {
                 run_id: None,
                 phase: None,
                 allowed_reflection_task_ids: Vec::new(),
+                phase_summary_page_limit: 20,
+                phase_summary_detail_page_limit: 20,
                 tickers: vec!["TQQQ".to_string()],
                 alpaca_live: false,
                 alpaca_market_data: false,

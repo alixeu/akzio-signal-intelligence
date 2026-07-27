@@ -1,6 +1,6 @@
 use agent_loop::{
     AgentLoopConfig, AgentLoopModel, ModelEventHandler, ModelStreamEvent, ModelStreamResult,
-    ProjectToolRuntime, ToolCallRequest, Turn,
+    ProjectToolRuntime, RetrievalPolicy, ToolCallRequest, Turn,
 };
 use anyhow::{bail, Context, Result};
 use async_openai::{config::OpenAIConfig, Client as OpenAIClient};
@@ -202,6 +202,7 @@ pub struct AgentSettings {
     pub truncation: TruncationConfig,
     pub judge: JudgeConfig,
     pub debug: bool,
+    pub retrieval_policy: RetrievalPolicy,
 }
 
 impl AgentSettings {
@@ -338,6 +339,10 @@ pub async fn run_agent_loop_with_metrics(
         })
         .context("agent loop finished without assistant message")?;
     let artifact = parse_final_output(settings, &final_text)?;
+    let mut artifact = artifact;
+    let mut retrieval_audit = agent_loop::retrieval_audit(&turn);
+    retrieval_audit["policy"] = serde_json::to_value(&settings.retrieval_policy)?;
+    artifact["retrieval_audit"] = retrieval_audit;
     record_jin10_usage_from_artifact(settings, &conn, &turn.turn_id, &artifact)?;
     Ok(AgentLoopOutput {
         artifact,
@@ -360,6 +365,7 @@ fn agent_loop_config_from_settings(settings: &AgentSettings) -> AgentLoopConfig 
         phase: settings.phase,
         model: settings.llm.effective_model().to_string(),
         topic_id: settings.topic_id.clone(),
+        retrieval_policy: settings.retrieval_policy.clone(),
         ..AgentLoopConfig::default()
     }
 }
@@ -473,7 +479,7 @@ pub async fn run_agent_steer_loop_with_metrics(
             }
         })
         .context("agent loop finished without assistant message")?;
-    let artifact = if allow_ready_ack && final_text.trim() == "准备完毕" {
+    let mut artifact = if allow_ready_ack && final_text.trim() == "准备完毕" {
         json!({
             "status": "ready",
             "response": "准备完毕",
@@ -482,6 +488,9 @@ pub async fn run_agent_steer_loop_with_metrics(
     } else {
         parse_final_output(settings, &final_text)?
     };
+    let mut retrieval_audit = agent_loop::retrieval_audit(&turn);
+    retrieval_audit["policy"] = serde_json::to_value(&settings.retrieval_policy)?;
+    artifact["retrieval_audit"] = retrieval_audit;
     record_jin10_usage_from_artifact(settings, &conn, &turn.turn_id, &artifact)?;
     Ok(AgentLoopOutput {
         artifact,
@@ -1536,6 +1545,7 @@ async fn stream_responses_with_retry(
                     attempt,
                     backoff_ms,
                     error = %error,
+                    error_chain = %format!("{error:#}"),
                     role = %settings.role,
                     "retrying transient LLM stream failure"
                 );
@@ -1580,7 +1590,9 @@ fn retry_jitter_ms(role: &str, attempt: usize) -> u64 {
 }
 
 fn is_permanent_llm_error_text(text: &str) -> bool {
-    text.contains("context window is full")
+    text.contains("insufficient_user_quota")
+        || text.contains("额度已用完")
+        || text.contains("context window is full")
         || text.contains("reduce conversation history")
         || text.contains("invalid_request_error")
         || text.contains("请精简对话历史")
@@ -1908,6 +1920,7 @@ async fn stream_chat_completions_with_retry(
                     attempt,
                     backoff_ms,
                     error = %error,
+                    error_chain = %format!("{error:#}"),
                     role = %settings.role,
                     "retrying transient Chat Completions stream failure"
                 );
@@ -3097,6 +3110,8 @@ fn default_tool_config() -> tools::ExternalToolConfig {
         run_id: None,
         phase: None,
         allowed_reflection_task_ids: Vec::new(),
+        phase_summary_page_limit: 20,
+        phase_summary_detail_page_limit: 20,
         tickers: std::env::var("ORCH_TICKERS")
             .ok()
             .map(|value| {
@@ -3250,6 +3265,16 @@ mod tests {
         assert!(is_transient_llm_error(&err));
     }
 
+    #[test]
+    fn insufficient_user_quota_is_not_transient() {
+        let err = anyhow!(
+            "Chat Completions stream failed: ApiError(ApiErrorResponse {{ status_code: 403, \
+             api_error: ApiError {{ message: \"quota exhausted\", type: Some(\"one_api_error\"), \
+             param: Some(\"\"), code: Some(\"insufficient_user_quota\") }} }})"
+        );
+        assert!(!is_transient_llm_error(&err));
+    }
+
     fn base_settings(route: LlmRoute) -> AgentSettings {
         AgentSettings {
             role: "manager.research".to_string(),
@@ -3284,6 +3309,7 @@ mod tests {
             truncation: TruncationConfig::default(),
             judge: JudgeConfig::default(),
             debug: false,
+            retrieval_policy: agent_loop::RetrievalPolicy::default(),
         }
     }
 
@@ -3389,6 +3415,8 @@ mod tests {
             run_id: None,
             phase: None,
             allowed_reflection_task_ids: Vec::new(),
+            phase_summary_page_limit: 20,
+            phase_summary_detail_page_limit: 20,
             tickers: vec!["QQQ".to_string()],
             alpaca_live: false,
             alpaca_market_data: false,
@@ -3434,6 +3462,8 @@ mod tests {
             run_id: None,
             phase: None,
             allowed_reflection_task_ids: Vec::new(),
+            phase_summary_page_limit: 20,
+            phase_summary_detail_page_limit: 20,
             tickers: vec!["TQQQ".to_string()],
             alpaca_live: false,
             alpaca_market_data: false,

@@ -1,12 +1,12 @@
 use anyhow::{bail, Context, Result};
 use orchestrator_core::{
-    analyst_artifact_schema, final_validation_schema, portfolio_allocation_schema,
-    replace_placeholders, research_artifact_schema, risk_constraints_schema, trade_intent_schema,
+    analyst_artifact_schema, final_validation_schema, portfolio_allocation_schema, render_template,
+    research_artifact_schema, risk_constraints_schema, trade_intent_schema,
 };
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
-use super::lifecycle::{tickers_from_state, topic_state};
+use super::lifecycle::{research_plan_to_trade_intent, tickers_from_state, topic_state};
 use orchestrator_core::ComponentRegistry;
 
 pub(crate) fn mode_prompt_path(base: &std::path::Path, state: &Value) -> PathBuf {
@@ -57,128 +57,19 @@ fn prompt_component(prompt_path: Option<&std::path::Path>, relative_path: &str) 
 fn phase3_context(state: &Value) -> Value {
     let input_tickers = tickers_from_state(state);
     let primary_ticker = input_tickers.first().cloned();
+    let probability_base = state
+        .get("weighted_probability_base")
+        .filter(|value| !value.is_null())
+        .cloned();
 
     json!({
+        "status": if probability_base.is_some() { "available" } else { "not_loaded" },
+        "item_count": probability_base.as_ref().and_then(Value::as_object).map(|items| items.len()).unwrap_or(0),
+        "source": "rust_deterministic_probability_baseline",
         "input_tickers": input_tickers,
         "primary_ticker": primary_ticker,
-        "weighted_probability_base": state
-            .get("weighted_probability_base")
-            .cloned()
-            .unwrap_or(Value::Null),
-        "analyst_weights": state.get("analyst_weights").cloned().unwrap_or(Value::Null),
-        "prior_memory": state.get("prior_memory").cloned().unwrap_or(Value::Null),
-        "track_record": state.get("track_record").cloned().unwrap_or(Value::Null),
-        "agent_accuracy": state.get("agent_accuracy").cloned().unwrap_or(Value::Null)
-    })
-}
-
-fn compact_object_fields(value: &Value, fields: &[&str]) -> Value {
-    Value::Object(
-        fields
-            .iter()
-            .filter_map(|field| {
-                value
-                    .get(*field)
-                    .map(|item| ((*field).to_string(), item.clone()))
-            })
-            .collect(),
-    )
-}
-
-fn compact_research_plan(state: &Value) -> Value {
-    const FIELDS: &[&str] = &[
-        "rating",
-        "long_probability",
-        "short_probability",
-        "confidence",
-        "confidence_basis",
-        "hold_reason",
-        "base_probability",
-        "debate_adjustment",
-        "final_probability",
-        "dominant_driver",
-        "why_now",
-        "why_not_already_priced",
-        "probability_rationale",
-        "adjustment_rationale",
-        "scenarios",
-        "plan",
-        "data_gaps",
-        "risk_flags",
-        "tail_risk_flag",
-        "missing_data_convergence",
-    ];
-    let plan = state.get("research_plan").unwrap_or(&Value::Null);
-    let mut compact = compact_object_fields(plan, FIELDS);
-    compact["per_ticker"] = Value::Object(
-        plan.get("per_ticker")
-            .and_then(Value::as_object)
-            .into_iter()
-            .flatten()
-            .map(|(ticker, payload)| (ticker.clone(), compact_object_fields(payload, FIELDS)))
-            .collect(),
-    );
-    compact
-}
-
-fn compact_risk_history(state: &Value) -> Value {
-    const FIELDS: &[&str] = &[
-        "role",
-        "stance",
-        "argument",
-        "recommended_adjustment",
-        "unique_risk_contribution",
-        "disagreement_with_prior",
-        "no_new_information",
-        "stop_type",
-        "max_drawdown_pct",
-        "position_cap_pct",
-        "rebalance_trigger",
-        "risk_off_trigger",
-        "review_window",
-        "cash_hedge_recommendation",
-        "constraint_confidence",
-    ];
-    Value::Array(
-        state
-            .get("risk_debate_state")
-            .and_then(|value| value.get("history"))
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .map(|turn| compact_object_fields(turn.get("artifact").unwrap_or(turn), FIELDS))
-            .collect(),
-    )
-}
-
-fn compact_trader_plan(state: &Value) -> Value {
-    compact_object_fields(
-        state.get("trader_investment_plan").unwrap_or(&Value::Null),
-        &[
-            "action",
-            "position_size",
-            "entry_price",
-            "stop_loss",
-            "rationale",
-            "status",
-        ],
-    )
-}
-
-fn risk_context(state: &Value) -> Value {
-    json!({
-        "research_plan": compact_research_plan(state),
-        "trader_plan": compact_trader_plan(state),
-        "phase1_evidence_quality": state
-            .get("phase1_index")
-            .and_then(|value| value.get("evidence_quality"))
-            .cloned()
-            .unwrap_or(Value::Null),
-        "prior_risk_arguments": compact_risk_history(state),
-        "overnight_gap_scenario": state
-            .get("overnight_gap_scenario")
-            .cloned()
-            .unwrap_or_else(|| json!({"pct": -0.03, "source": "runtime_default"}))
+        "weighted_probability_base": probability_base.unwrap_or(Value::Null),
+        "analyst_weights": state.get("analyst_weights").cloned().unwrap_or(Value::Null)
     })
 }
 
@@ -191,23 +82,165 @@ fn contains_leveraged_etf(tickers: &[String]) -> bool {
     })
 }
 
-fn portfolio_context(state: &Value) -> Value {
+fn retrieval_bootstrap(state: &Value, current_phase: i64) -> Value {
+    let mut counts = serde_json::Map::new();
+    let mut roles = std::collections::BTreeSet::new();
+    let mut total = 0usize;
+    if let Some(raw) = state.get("phase_summary_memory") {
+        let index = orchestrator_sql::PhaseSummaryMemoryIndex::from_state_value(raw);
+        for (phase, batch) in index.phases {
+            if phase >= current_phase {
+                continue;
+            }
+            counts.insert(phase.to_string(), json!(batch.summaries.len()));
+            total += batch.summaries.len();
+            roles.extend(batch.summaries.into_iter().map(|summary| summary.role));
+        }
+    }
+    let conflict_count = state
+        .get("phase1_index")
+        .and_then(|value| value.get("per_ticker"))
+        .and_then(Value::as_object)
+        .map(|items| {
+            items
+                .values()
+                .filter_map(|item| {
+                    item.get("cross_analyst_conflicts")
+                        .and_then(Value::as_array)
+                })
+                .map(Vec::len)
+                .sum::<usize>()
+        })
+        .unwrap_or(0);
     json!({
-        "research_plan": compact_research_plan(state),
-        "trader_plan": compact_trader_plan(state),
-        "risk_history": compact_risk_history(state),
-        "investable_assets": state.get("investable_assets").cloned().unwrap_or_else(|| json!([]))
+        "status": if total == 0 { "empty" } else { "available" },
+        "item_count": total,
+        "source_phase_counts": counts,
+        "source_roles_present": roles,
+        "phase1_completed": state.get("phase1_index").is_some_and(|value| !value.is_null()),
+        "direction_or_evidence_conflict_count": conflict_count,
+        "source": "phase_summary_memory_metadata",
+        "directly_injected": true,
+        "semantic_content_included": false,
+        "retrievable_via_tools": true
     })
 }
 
-fn prior_phase_summaries(state: &Value, current_phase: i64) -> Value {
-    let Some(raw) = state.get("phase_summary_memory") else {
-        return json!({"query": "phase_summaries", "item_count": 0, "items": []});
-    };
-    let run_id = state.get("run_id").and_then(Value::as_str).unwrap_or("");
-    orchestrator_sql::PhaseSummaryMemoryIndex::from_state_value(raw)
-        .list_visible_summaries(run_id, current_phase, None)
-        .unwrap_or_else(|_| json!({"query": "phase_summaries", "item_count": 0, "items": []}))
+fn phase4_control_context(state: &Value) -> Value {
+    let research_plan = state.get("research_plan").filter(|value| !value.is_null());
+    let candidate = research_plan
+        .map(research_plan_to_trade_intent)
+        .unwrap_or(Value::Null);
+    json!({
+        "status": if research_plan.is_some() { "available" } else { "not_loaded" },
+        "item_count": usize::from(research_plan.is_some()),
+        "candidate_action": candidate.get("candidate_action"),
+        "allowed_direction": candidate.get("candidate_action"),
+        "semantic_source": "rust_deterministic_rating_mapping",
+        "phase3_semantics_included": false
+    })
+}
+
+fn phase5_control_context(state: &Value) -> Value {
+    let scenario = state.get("overnight_gap_scenario");
+    json!({
+        "status": "available",
+        "overnight_gap_scenario": {
+            "status": if scenario.is_some() { "available" } else { "not_loaded" },
+            "item_count": usize::from(scenario.is_some()),
+            "data": scenario.cloned().unwrap_or(Value::Null),
+            "source": if scenario.is_some() { "runtime" } else { "none" }
+        },
+        "hard_position_cap": state.pointer("/allocation_context/max_single_position")
+            .cloned().unwrap_or(Value::Null),
+        "prior_phase_semantics_included": false
+    })
+}
+
+fn phase6_control_context(state: &Value) -> Value {
+    let weights = state
+        .get("current_portfolio_weights")
+        .cloned()
+        .unwrap_or(Value::Null);
+    json!({
+        "status": "available",
+        "investable_assets": state.get("investable_assets").cloned().unwrap_or_else(|| json!([])),
+        "current_weights": {
+            "status": if weights.is_null() { "not_loaded" } else { "available" },
+            "item_count": weights.as_object().map(|items| items.len()).unwrap_or(0),
+            "data": weights,
+            "source": "rust_runtime"
+        },
+        "hard_position_cap": state.pointer("/allocation_context/max_single_position")
+            .cloned().unwrap_or(Value::Null),
+        "allowed_execution_status": ["execute", "wait", "downgrade"],
+        "prior_phase_semantics_included": false
+    })
+}
+
+fn context_manifest_item(name: &str, value: Value, source: &str, retrievable: bool) -> Value {
+    let item_count = value
+        .get("item_count")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| {
+            value
+                .as_object()
+                .map(|items| items.len() as u64)
+                .unwrap_or(u64::from(!value.is_null()))
+        });
+    json!({
+        "name": name,
+        "status": value.get("status").and_then(Value::as_str).unwrap_or(if value.is_null() { "not_loaded" } else { "available" }),
+        "item_count": item_count,
+        "character_count": serde_json::to_string(&value).map(|text| text.chars().count()).unwrap_or(0),
+        "source": source,
+        "directly_injected": true,
+        "retrievable_via_tools": retrievable
+    })
+}
+
+pub(crate) fn direct_context_manifest(state: &Value, phase: i64) -> Value {
+    let mut contexts = Vec::new();
+    if phase == 0 || (2..=6).contains(&phase) {
+        contexts.push(context_manifest_item(
+            "retrieval_bootstrap",
+            retrieval_bootstrap(state, phase),
+            "phase_summary_memory_metadata",
+            true,
+        ));
+    }
+    match phase {
+        3 => contexts.push(context_manifest_item(
+            "phase3_context",
+            phase3_context(state),
+            "rust_deterministic_probability_baseline",
+            false,
+        )),
+        4 => contexts.push(context_manifest_item(
+            "phase4_control_context",
+            phase4_control_context(state),
+            "rust_deterministic_rating_mapping",
+            false,
+        )),
+        5 => contexts.push(context_manifest_item(
+            "phase5_control_context",
+            phase5_control_context(state),
+            "rust_runtime_constraints",
+            false,
+        )),
+        6 => contexts.push(context_manifest_item(
+            "phase6_control_context",
+            phase6_control_context(state),
+            "rust_runtime_constraints",
+            false,
+        )),
+        _ => {}
+    }
+    json!({
+        "status": if contexts.is_empty() { "not_applicable" } else { "available" },
+        "context_count": contexts.len(),
+        "contexts": contexts
+    })
 }
 
 #[cfg(test)]
@@ -295,13 +328,12 @@ pub(crate) fn render_prompt_with_plugins(
         "portfolio_allocation_schema": portfolio_allocation_schema(),
     });
     let analyst_output_contract =
-        replace_placeholders(&analyst_output_contract_template, &component_values);
-    let retrieval_policy = replace_placeholders(&retrieval_policy_template, &component_values);
-    let research_calibration =
-        replace_placeholders(&research_calibration_template, &component_values);
-    let research_drivers = replace_placeholders(&research_drivers_template, &component_values);
+        render_template(&analyst_output_contract_template, &component_values)?;
+    let retrieval_policy = render_template(&retrieval_policy_template, &component_values)?;
+    let research_calibration = render_template(&research_calibration_template, &component_values)?;
+    let research_drivers = render_template(&research_drivers_template, &component_values)?;
     let leveraged_etf_rules = if contains_leveraged_etf(&tickers) {
-        replace_placeholders(&leveraged_etf_rules_template, &component_values)
+        render_template(&leveraged_etf_rules_template, &component_values)?
     } else {
         String::new()
     };
@@ -363,6 +395,10 @@ pub(crate) fn render_prompt_with_plugins(
         "stance_rules": "",
         "stance_schema_extra": "",
         "researcher_body": "",
+        "retrieval_bootstrap": "",
+        "phase4_control_context": "",
+        "phase5_control_context": "",
+        "phase6_control_context": "",
         "workflow_pattern": "Workflow -> Stage/Sub-workflow -> Agent workers -> Reducer -> state artifact"
     });
     let dynamic_values = json!({
@@ -372,14 +408,8 @@ pub(crate) fn render_prompt_with_plugins(
         "round": round.unwrap_or_default(),
         "topic_id": topic_id.unwrap_or(""),
         "topic": serde_json::to_string_pretty(&current_topic)?,
-        "analyst_reports": serde_json::to_string_pretty(&state.get("analyst_reports").cloned().unwrap_or(Value::Null))?,
-        "research_plan": serde_json::to_string_pretty(&state.get("research_plan").cloned().unwrap_or(Value::Null))?,
-        "trader_plan": serde_json::to_string_pretty(&state.get("trader_investment_plan").cloned().unwrap_or(Value::Null))?,
-        "risk_history": serde_json::to_string_pretty(&state.get("risk_debate_state").and_then(|v| v.get("history")).cloned().unwrap_or_else(|| json!([])))?,
         "portfolio_decision": serde_json::to_string_pretty(&state.get("final_trade_decision").cloned().unwrap_or(Value::Null))?,
         "allocation_context": serde_json::to_string_pretty(&state.get("allocation_context").cloned().unwrap_or(Value::Null))?,
-        "risk_context": serde_json::to_string_pretty(&risk_context(state))?,
-        "portfolio_context": serde_json::to_string_pretty(&portfolio_context(state))?,
         "alpaca_mode": if state.get("mock").and_then(Value::as_bool) == Some(true)
             || state.get("debug").and_then(Value::as_bool) == Some(true)
         {
@@ -388,8 +418,10 @@ pub(crate) fn render_prompt_with_plugins(
             "live"
         },
         "phase3_context": serde_json::to_string_pretty(&phase3_context(state))?,
-        "phase1_index": serde_json::to_string_pretty(&state.get("phase1_index").cloned().unwrap_or(Value::Null))?,
-        "prior_phase_summaries": serde_json::to_string_pretty(&prior_phase_summaries(state, phase))?,
+        "retrieval_bootstrap": serde_json::to_string_pretty(&retrieval_bootstrap(state, phase))?,
+        "phase4_control_context": serde_json::to_string_pretty(&phase4_control_context(state))?,
+        "phase5_control_context": serde_json::to_string_pretty(&phase5_control_context(state))?,
+        "phase6_control_context": serde_json::to_string_pretty(&phase6_control_context(state))?,
         "common_ground": serde_json::to_string_pretty(&state.get("common_ground").cloned().unwrap_or(Value::Null))?,
         "reflection_task": serde_json::to_string_pretty(&state.get("reflection_task").cloned().unwrap_or(Value::Null))?,
     });
@@ -419,55 +451,21 @@ pub(crate) fn render_prompt_with_plugins(
     }
     // Risk-tier prompts use a shared component. Render it against the value set,
     // then expose the result so role files can include it via one placeholder.
-    let risk_analyst_body = replace_placeholders(&risk_analyst_template, &values);
+    let risk_analyst_body = render_template(&risk_analyst_template, &values)?;
     if let Some(map) = values.as_object_mut() {
         map.insert(
             "risk_analyst_body".to_string(),
             Value::String(risk_analyst_body),
         );
     }
-    let rendered = replace_placeholders(&template, &values);
-    let unresolved = unresolved_placeholders(&rendered);
-    if !unresolved.is_empty() {
-        bail!(
-            "prompt {} retained unresolved placeholders: {}",
+    render_template(&template, &values).map_err(|error| {
+        anyhow::anyhow!(
+            "failed to render prompt {}: {error}",
             prompt_path
                 .map(|path| path.display().to_string())
-                .unwrap_or_else(|| "<inline prompt>".to_string()),
-            unresolved.join(", ")
-        );
-    }
-    Ok(rendered)
-}
-
-/// Reject template variables that survived the single, non-recursive render
-/// pass. JSON braces and prose are ignored; only `{lower_snake_case}` tokens
-/// are treated as placeholders.
-fn unresolved_placeholders(text: &str) -> Vec<String> {
-    let bytes = text.as_bytes();
-    let mut placeholders = std::collections::BTreeSet::new();
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] != b'{' {
-            index += 1;
-            continue;
-        }
-        let start = index + 1;
-        let Some(end_offset) = bytes[start..].iter().position(|byte| *byte == b'}') else {
-            break;
-        };
-        let end = start + end_offset;
-        let name = &text[start..end];
-        if !name.is_empty()
-            && name
-                .bytes()
-                .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
-        {
-            placeholders.insert(name.to_string());
-        }
-        index = end + 1;
-    }
-    placeholders.into_iter().collect()
+                .unwrap_or_else(|| "<inline prompt>".to_string())
+        )
+    })
 }
 
 /// Public lint entry point. The CLI deliberately shares the production
@@ -837,7 +835,7 @@ required_variables = ["ticker", "tickers"]
         std::fs::create_dir_all(prompts.join("phase5")).unwrap();
         std::fs::write(
             prompts.join("phase5/risk_analyst.md"),
-            "shared body {trader_plan} {analyst_reports} {risk_history}",
+            "shared body {phase5_control_context} {retrieval_bootstrap}",
         )
         .unwrap();
         std::fs::write(
@@ -919,18 +917,13 @@ required_variables = ["ticker", "tickers"]
         "{topic_id}",
         "{topic}",
         "{round}",
-        "{trader_plan}",
-        "{research_plan}",
-        "{analyst_reports}",
-        "{risk_history}",
-        "{risk_context}",
-        "{portfolio_context}",
+        "{retrieval_bootstrap}",
+        "{phase4_control_context}",
+        "{phase5_control_context}",
+        "{phase6_control_context}",
         "{allocation_context}",
         "{reflection_task}",
         "{phase3_context}",
-        "{phase1_index}",
-        "{phase_summary_context}",
-        "{prior_phase_summaries}",
         "{common_ground}",
     ];
 
@@ -998,11 +991,36 @@ required_variables = ["ticker", "tickers"]
             context["weighted_probability_base"]["QQQ"]["long_probability"],
             0.5
         );
-        assert_eq!(context["track_record"]["sample_size"], 2);
+        assert!(context.get("prior_memory").is_none());
+        assert!(context.get("track_record").is_none());
+        assert!(context.get("agent_accuracy").is_none());
     }
 
     #[test]
-    fn downstream_contexts_drop_full_analyst_and_risk_payloads() {
+    fn context_manifest_records_source_size_and_visibility() {
+        let manifest = direct_context_manifest(
+            &json!({
+                "phase_summary_memory": {
+                    "phases": {
+                        "3": {"summaries": [{"role": "manager.research"}], "details": []}
+                    }
+                },
+                "research_plan": {"rating": "Buy"}
+            }),
+            4,
+        );
+        assert_eq!(manifest["context_count"], 2);
+        assert_eq!(manifest["contexts"][0]["name"], "retrieval_bootstrap");
+        assert_eq!(manifest["contexts"][0]["retrievable_via_tools"], true);
+        assert_eq!(
+            manifest["contexts"][1]["source"],
+            "rust_deterministic_rating_mapping"
+        );
+        assert!(manifest["contexts"][1]["character_count"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
+    fn downstream_control_contexts_exclude_prior_phase_semantics() {
         let state = json!({
             "research_plan": {
                 "rating": "Hold",
@@ -1026,15 +1044,92 @@ required_variables = ["ticker", "tickers"]
             }}]}
         });
 
-        let risk = serde_json::to_string(&risk_context(&state)).unwrap();
-        let portfolio = serde_json::to_string(&portfolio_context(&state)).unwrap();
-        for context in [&risk, &portfolio] {
+        let trader = serde_json::to_string(&phase4_control_context(&state)).unwrap();
+        let risk = serde_json::to_string(&phase5_control_context(&state)).unwrap();
+        let portfolio = serde_json::to_string(&phase6_control_context(&state)).unwrap();
+        for context in [&trader, &risk, &portfolio] {
             assert!(!context.contains("DROP_FULL_RESEARCH_REPORT"));
             assert!(!context.contains("DROP_TICKER_REPORT"));
             assert!(!context.contains("DROP_ANALYST_REPORT"));
             assert!(!context.contains("DROP_RISK_CONTEXT"));
-            assert!(context.contains("compact argument"));
         }
+    }
+
+    #[test]
+    fn retrieval_first_prompts_do_not_embed_prior_phase_payloads() {
+        let prompts = project_prompts_dir();
+        let state = json!({
+            "ticker": "QQQ",
+            "tickers": ["QQQ"],
+            "run_id": "retrieval-first",
+            "current_date": "2026-07-24",
+            "window_days": 60,
+            "phase1_index": {"report": "FULL_PHASE1_SENTINEL"},
+            "research_plan": {
+                "rating": "Hold",
+                "report": "FULL_RESEARCH_SENTINEL"
+            },
+            "trader_investment_plan": {
+                "action": "Hold",
+                "report": "FULL_TRADER_SENTINEL"
+            },
+            "risk_debate_state": {
+                "history": [{"artifact": {"argument": "FULL_RISK_SENTINEL"}}]
+            },
+            "investable_assets": ["QQQ"]
+        });
+        for (role, phase, relative) in [
+            ("mediator.topic", 2, "phase2/topic_generator.md"),
+            ("mediator.topic", 2, "phase2/researcher/warmup.md"),
+            ("trader", 4, "phase4/trader.md"),
+            ("risk.aggressive", 5, "phase5/aggressive.md"),
+            ("portfolio.manager", 6, "phase6/portfolio_manager.md"),
+        ] {
+            let rendered = render_prompt(
+                &state,
+                role,
+                phase,
+                "artifact",
+                None,
+                None,
+                Some(&prompts.join(relative)),
+                None,
+            )
+            .unwrap();
+            for sentinel in [
+                "FULL_PHASE1_SENTINEL",
+                "FULL_RESEARCH_SENTINEL",
+                "FULL_TRADER_SENTINEL",
+                "FULL_RISK_SENTINEL",
+            ] {
+                assert!(!rendered.contains(sentinel), "{relative} leaked {sentinel}");
+            }
+        }
+    }
+
+    #[test]
+    fn bootstrap_is_materially_smaller_than_direct_semantic_context() {
+        let large = "x".repeat(20_000);
+        let state = json!({
+            "ticker": "QQQ",
+            "tickers": ["QQQ"],
+            "phase1_index": {"report": large},
+            "research_plan": {"report": large},
+            "risk_debate_state": {"history": [{"artifact": {"argument": large}}]},
+            "phase_summary_memory": {
+                "run_id": "run",
+                "phases": {}
+            }
+        });
+        let direct_chars = state["phase1_index"].to_string().len()
+            + state["research_plan"].to_string().len()
+            + state["risk_debate_state"].to_string().len();
+        let bootstrap_chars = retrieval_bootstrap(&state, 6).to_string().len()
+            + phase6_control_context(&state).to_string().len();
+        assert!(
+            bootstrap_chars * 20 < direct_chars,
+            "bootstrap={bootstrap_chars}, direct={direct_chars}"
+        );
     }
 
     #[test]
@@ -1139,12 +1234,12 @@ required_variables = ["ticker", "tickers"]
             ),
             (
                 "researcher.bull.initial",
-                "phase2/researcher/seed.md",
+                "phase2/researcher/debate.md",
                 "bull_seed",
             ),
             (
                 "researcher.bear.initial",
-                "phase2/researcher/seed.md",
+                "phase2/researcher/debate.md",
                 "bear_seed",
             ),
             (
@@ -1268,7 +1363,7 @@ required_variables = ["ticker", "tickers"]
                 "researcher.bull.initial",
                 2,
                 "bull_seed",
-                "phase2/researcher/seed.md",
+                "phase2/researcher/debate.md",
             ),
             (
                 "mediator.topic_controller",
@@ -1438,7 +1533,7 @@ required_variables = ["ticker", "tickers"]
             None,
         )
         .unwrap();
-        assert!(trader.contains("research_plan` / Phase 3 是唯一市场结论"));
+        assert!(trader.contains("Phase 3 Summary 是唯一市场结论"));
 
         for role in ["risk.aggressive", "risk.neutral", "risk.conservative"] {
             let stance = role.strip_prefix("risk.").unwrap();
@@ -1479,7 +1574,6 @@ required_variables = ["ticker", "tickers"]
             "common/analyst_output_contract.md",
             "phase3/research_manager.md",
             "phase2/researcher/warmup.md",
-            "phase2/researcher/seed.md",
             "phase2/researcher/debate.md",
             "phase2/researcher/side_bull.md",
             "phase2/researcher/side_bear.md",
@@ -1495,14 +1589,14 @@ required_variables = ["ticker", "tickers"]
     fn phase2_kind_templates_keep_the_researcher_audit_boundaries() {
         let prompts = project_prompts_dir();
         let warmup = std::fs::read_to_string(prompts.join("phase2/researcher/warmup.md")).unwrap();
-        let seed = std::fs::read_to_string(prompts.join("phase2/researcher/seed.md")).unwrap();
         let debate = std::fs::read_to_string(prompts.join("phase2/researcher/debate.md")).unwrap();
 
-        assert!(warmup.contains("运行时已预载前序 Phase 摘要索引"));
-        assert!(warmup.contains("不得调用 `read_phase_summary_details`"));
-        assert!(seed.contains("raw Jin10"));
-        assert!(seed.contains("known_{opponent}_constraint"));
-        assert!(seed.contains("reducer_checks"));
+        assert!(warmup.contains("多空双方研究员共用的预热模式"));
+        assert!(warmup.contains("必须真实调用 `read_phase_summaries(source_phase=1)`"));
+        assert!(warmup.contains("1-2 个 summary"));
+        assert!(debate.contains("raw Jin10"));
+        assert!(debate.contains("known_{opponent}_constraint"));
+        assert!(debate.contains("reducer_checks"));
         assert!(debate.contains("next_steers"));
         assert!(debate.contains("blocked_claims"));
         assert!(debate.contains("reply_to_claim_id"));

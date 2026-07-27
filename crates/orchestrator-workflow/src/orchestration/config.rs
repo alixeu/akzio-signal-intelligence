@@ -39,10 +39,39 @@ pub(crate) struct RuntimeConfig {
     pub alpaca_api_key: Option<String>,
     pub alpaca_api_secret: Option<String>,
     pub reflection: ReflectionConfig,
+    pub retrieval: RetrievalConfig,
     pub plugins: PluginConfig,
     pub component_plugins: ComponentRegistry,
     pub role_plugins: RolePluginRegistry,
     pub agent_registry: AgentRegistry,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RetrievalConfig {
+    pub summary_page_limit: usize,
+    pub detail_page_limit: usize,
+    pub phase2_max_details: usize,
+    pub phase3_max_details: usize,
+    pub phase4_max_details: usize,
+    pub phase5_max_details: usize,
+    pub phase6_max_details: usize,
+    pub reflection_max_details: usize,
+}
+
+impl RetrievalConfig {
+    fn from_value(config: &Value) -> Self {
+        let bounded = |key: &str, default| config_int(config, key, default).clamp(1, 100) as usize;
+        Self {
+            summary_page_limit: bounded("orchestrator.retrieval.summary_page_limit", 20),
+            detail_page_limit: bounded("orchestrator.retrieval.detail_page_limit", 20),
+            phase2_max_details: bounded("orchestrator.retrieval.phase2_max_details", 4),
+            phase3_max_details: bounded("orchestrator.retrieval.phase3_max_details", 6),
+            phase4_max_details: bounded("orchestrator.retrieval.phase4_max_details", 6),
+            phase5_max_details: bounded("orchestrator.retrieval.phase5_max_details", 4),
+            phase6_max_details: bounded("orchestrator.retrieval.phase6_max_details", 8),
+            reflection_max_details: bounded("orchestrator.retrieval.reflection_max_details", 8),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -156,9 +185,9 @@ impl RuntimeConfig {
             "orchestrator.prompts.analyst.news_macro",
             "prompts/phase1/news_macro.md",
         )?;
-        // Each Phase 2 turn receives only the instructions for its current kind.
+        // Phase 2 researchers share one debate template; runtime kind selects
+        // the initial claim packet or a routed point-debate packet.
         const PHASE2_WARMUP_PROMPT: &str = "prompts/phase2/researcher/warmup.md";
-        const PHASE2_SEED_PROMPT: &str = "prompts/phase2/researcher/seed.md";
         const PHASE2_DEBATE_PROMPT: &str = "prompts/phase2/researcher/debate.md";
         insert_prompt_entry(
             config,
@@ -182,7 +211,7 @@ impl RuntimeConfig {
             &mut versions,
             "researcher.bull.initial",
             "orchestrator.prompts.phase2.bull_initial",
-            PHASE2_SEED_PROMPT,
+            PHASE2_DEBATE_PROMPT,
         )?;
         insert_prompt_entry(
             config,
@@ -198,7 +227,7 @@ impl RuntimeConfig {
             &mut versions,
             "researcher.bear.initial",
             "orchestrator.prompts.phase2.bear_initial",
-            PHASE2_SEED_PROMPT,
+            PHASE2_DEBATE_PROMPT,
         )?;
         insert_prompt_entry(
             config,
@@ -323,6 +352,7 @@ impl RuntimeConfig {
             alpaca_api_key,
             alpaca_api_secret,
             reflection: ReflectionConfig::from_value(config),
+            retrieval: RetrievalConfig::from_value(config),
             plugins: plugin_config,
             component_plugins,
             role_plugins,
@@ -450,7 +480,11 @@ fn builtin_llm_role_values() -> BTreeMap<String, Value> {
             "reflector.historical",
             6,
             Some("medium"),
-            vec!["read_reflection_source"],
+            vec![
+                "read_reflection_source",
+                "read_phase_summaries",
+                "read_phase_summary_details",
+            ],
             false,
         ),
         (
@@ -502,14 +536,14 @@ fn builtin_llm_role_values() -> BTreeMap<String, Value> {
             "researcher.bull.interaction",
             10,
             None,
-            vec!["read_phase_summary_details"],
+            vec!["read_phase_summaries", "read_phase_summary_details"],
             false,
         ),
         (
             "researcher.bear.interaction",
             10,
             None,
-            vec!["read_phase_summary_details"],
+            vec!["read_phase_summaries", "read_phase_summary_details"],
             false,
         ),
         (
@@ -531,11 +565,41 @@ fn builtin_llm_role_values() -> BTreeMap<String, Value> {
             false,
         ),
         ("compressor.phase_summary", 4, None, vec![], false),
-        ("trader", 6, None, vec![], false),
-        ("risk.aggressive", 6, None, vec![], false),
-        ("risk.neutral", 6, None, vec![], false),
-        ("risk.conservative", 6, None, vec![], false),
-        ("portfolio.manager", 8, Some("medium"), vec![], false),
+        (
+            "trader",
+            6,
+            None,
+            vec!["read_phase_summaries", "read_phase_summary_details"],
+            false,
+        ),
+        (
+            "risk.aggressive",
+            6,
+            None,
+            vec!["read_phase_summaries", "read_phase_summary_details"],
+            false,
+        ),
+        (
+            "risk.neutral",
+            6,
+            None,
+            vec!["read_phase_summaries", "read_phase_summary_details"],
+            false,
+        ),
+        (
+            "risk.conservative",
+            6,
+            None,
+            vec!["read_phase_summaries", "read_phase_summary_details"],
+            false,
+        ),
+        (
+            "portfolio.manager",
+            8,
+            Some("medium"),
+            vec!["read_phase_summaries", "read_phase_summary_details"],
+            false,
+        ),
     ] {
         let mut object = serde_json::Map::new();
         object.insert("max_turns".to_string(), Value::from(max_turns));
@@ -1086,8 +1150,13 @@ mod tests {
             "risk.aggressive",
             "risk.neutral",
             "risk.conservative",
+            "portfolio.manager",
         ] {
-            assert_eq!(roles[role]["tools"], json!([]), "role={role}");
+            assert_eq!(
+                roles[role]["tools"],
+                json!(["read_phase_summaries", "read_phase_summary_details"]),
+                "role={role}"
+            );
         }
         assert_eq!(
             roles["analyst.news_macro"]["tools"],
@@ -1098,7 +1167,6 @@ mod tests {
                 "alpaca_get_news"
             ])
         );
-        assert_eq!(roles["portfolio.manager"]["tools"], json!([]));
         for role in ["researcher.bull.initial", "researcher.bear.initial"] {
             assert_eq!(
                 roles[role]["tools"],
@@ -1110,10 +1178,18 @@ mod tests {
         for role in ["researcher.bull.interaction", "researcher.bear.interaction"] {
             assert_eq!(
                 roles[role]["tools"],
-                json!(["read_phase_summary_details"]),
+                json!(["read_phase_summaries", "read_phase_summary_details"]),
                 "role={role}"
             );
         }
+        assert_eq!(
+            roles["reflector.historical"]["tools"],
+            json!([
+                "read_reflection_source",
+                "read_phase_summaries",
+                "read_phase_summary_details"
+            ])
+        );
         for role in ["mediator.topic", "mediator.topic_controller"] {
             assert_eq!(
                 roles[role]["tools"],

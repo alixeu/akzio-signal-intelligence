@@ -1446,6 +1446,16 @@ mod tests {
                 repeated_error_count: 2,
                 retrieval: orchestrator_core::RetrievalBudget::default(),
             },
+            retrieval: crate::orchestration::config::RetrievalConfig {
+                summary_page_limit: 20,
+                detail_page_limit: 20,
+                phase2_max_details: 4,
+                phase3_max_details: 6,
+                phase4_max_details: 6,
+                phase5_max_details: 4,
+                phase6_max_details: 8,
+                reflection_max_details: 8,
+            },
             plugins: crate::orchestration::config::PluginConfig {
                 enabled: false,
                 components_dir: std::path::PathBuf::new(),

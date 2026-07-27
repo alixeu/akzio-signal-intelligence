@@ -52,6 +52,10 @@ pub struct ExternalToolConfig {
     pub phase: Option<i64>,
     #[serde(default)]
     pub allowed_reflection_task_ids: Vec<i64>,
+    #[serde(default = "default_phase_summary_page_limit")]
+    pub phase_summary_page_limit: usize,
+    #[serde(default = "default_phase_summary_page_limit")]
+    pub phase_summary_detail_page_limit: usize,
     pub tickers: Vec<String>,
     #[serde(default)]
     pub alpaca_live: bool,
@@ -76,6 +80,8 @@ impl Default for ExternalToolConfig {
             run_id: None,
             phase: None,
             allowed_reflection_task_ids: Vec::new(),
+            phase_summary_page_limit: default_phase_summary_page_limit(),
+            phase_summary_detail_page_limit: default_phase_summary_page_limit(),
             tickers: Vec::new(),
             alpaca_live: false,
             alpaca_market_data: false,
@@ -85,6 +91,10 @@ impl Default for ExternalToolConfig {
             phase_summary_gate: None,
         }
     }
+}
+
+fn default_phase_summary_page_limit() -> usize {
+    orchestrator_sql::DEFAULT_PHASE_SUMMARY_LIMIT
 }
 
 // --- Registry ---
@@ -352,6 +362,38 @@ pub fn truncate_chars(value: &str, max_chars: usize) -> String {
     output
 }
 
+pub(crate) fn optional_string_arg<'a>(args: &'a Value, field: &str) -> Result<Option<&'a str>> {
+    match args.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) if value.trim().is_empty() => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.trim())),
+        Some(_) => bail!("{field} must be a string"),
+    }
+}
+
+pub(crate) fn pagination_args(args: &Value, maximum: usize) -> Result<(usize, usize)> {
+    let maximum = maximum.clamp(1, 100);
+    let limit = match args.get("limit") {
+        None | Some(Value::Null) => orchestrator_sql::DEFAULT_PHASE_SUMMARY_LIMIT.min(maximum),
+        Some(value) => value
+            .as_u64()
+            .filter(|value| *value > 0)
+            .map(|value| value as usize)
+            .context("limit must be a positive integer")?,
+    };
+    if limit > maximum {
+        bail!("limit exceeds configured maximum {maximum}");
+    }
+    let offset = match args.get("cursor") {
+        None | Some(Value::Null) => 0,
+        Some(Value::String(value)) => value
+            .parse::<usize>()
+            .context("cursor must be a pagination token returned by the prior call")?,
+        Some(_) => bail!("cursor must be a string or null"),
+    };
+    Ok((limit, offset))
+}
+
 pub(crate) fn log_tool_result(name: &str, result: &Result<Value>) {
     match result {
         Ok(value) => {
@@ -395,6 +437,8 @@ mod tests {
             run_id: None,
             phase: None,
             allowed_reflection_task_ids: Vec::new(),
+            phase_summary_page_limit: 20,
+            phase_summary_detail_page_limit: 20,
             tickers: Vec::new(),
             alpaca_live: false,
             alpaca_market_data: false,
@@ -473,6 +517,38 @@ mod tests {
                 .unwrap_err();
             assert!(error.to_string().contains("turn context"));
         }
+    }
+
+    #[tokio::test]
+    async fn phase0_summary_tools_reject_non_allowlisted_tasks_before_database_access() {
+        let context = ToolRuntimeTurnContext {
+            run_id: "current-run".to_string(),
+            session_id: "session".to_string(),
+            turn_id: "turn".to_string(),
+            role: "reflector.historical".to_string(),
+            phase: Some(0),
+        };
+        for (name, args) in [
+            (read_phase_summaries::NAME, json!({"task_id": 99})),
+            (
+                read_phase_summary_details::NAME,
+                json!({"task_id": 99, "summary_id": "summary-1"}),
+            ),
+        ] {
+            let error = execute_named_tool(name, args, &external_config(), Some(&context), None)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("not allowlisted"));
+        }
+    }
+
+    #[test]
+    fn pagination_respects_configured_page_limit() {
+        assert_eq!(pagination_args(&json!({}), 5).unwrap(), (5, 0));
+        assert!(pagination_args(&json!({"limit": 6}), 5)
+            .unwrap_err()
+            .to_string()
+            .contains("configured maximum 5"));
     }
 
     #[tokio::test]

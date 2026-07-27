@@ -9,7 +9,7 @@ pub const NAME: &str = "read_reflection_source";
 pub fn definition() -> ToolDefinition {
     ToolDefinition {
         name: api_tool_name(NAME),
-        description: "Phase 0 only: read the allowlisted prior run's phase-summary indexes and detailed reasoning for one reflection task. Raw chat logs and other runs are not exposed.".to_string(),
+        description: "Phase 0 only: read bootstrap metadata, decision, outcome, and summary availability for one allowlisted reflection task. Use read_phase_summaries and read_phase_summary_details for evidence.".to_string(),
         parameters: json!({
             "type": "object",
             "properties": {

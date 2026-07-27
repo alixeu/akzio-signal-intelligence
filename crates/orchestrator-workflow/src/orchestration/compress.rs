@@ -94,16 +94,6 @@ pub(crate) fn phase_summary_bundle_to_batch(
         let role = required_string(summary, "role")?;
         let ticker = required_string(summary, "ticker")?;
         let text = required_string(summary, "summary")?;
-        let summary_json = summary
-            .get("summary_json")
-            .filter(|value| value.is_object())
-            .cloned()
-            .context("phase-summary summary_json must be an object")?;
-        let confidence = summary
-            .get("confidence")
-            .and_then(Value::as_f64)
-            .filter(|value| (0.0..=1.0).contains(value))
-            .context("phase_summary confidence must be between 0 and 1")?;
         let topic_id = match summary.get("topic_id") {
             None | Some(Value::Null) => None,
             Some(value) => Some(
@@ -114,6 +104,25 @@ pub(crate) fn phase_summary_bundle_to_batch(
                     .to_string(),
             ),
         };
+        let mut summary_json = summary
+            .get("summary_json")
+            .filter(|value| value.is_object())
+            .cloned()
+            .context("phase-summary summary_json must be an object")?;
+        project_authoritative_summary_fields(
+            state,
+            source_phase,
+            ticker,
+            role,
+            topic_id.as_deref(),
+            &mut summary_json,
+        );
+        let authoritative_summary_json = summary_json.clone();
+        let confidence = summary
+            .get("confidence")
+            .and_then(Value::as_f64)
+            .filter(|value| (0.0..=1.0).contains(value))
+            .context("phase_summary confidence must be between 0 and 1")?;
         let details = summary
             .get("details")
             .and_then(Value::as_array)
@@ -131,11 +140,14 @@ pub(crate) fn phase_summary_bundle_to_batch(
         });
         for (detail_order, detail) in details.iter().enumerate() {
             let detail_text = required_string(detail, "detail")?;
-            let detail_json = detail
+            let mut detail_json = detail
                 .get("detail_json")
                 .filter(|value| value.is_object())
                 .cloned()
                 .context("phase_summary detail_json must be an object")?;
+            if detail_order == 0 {
+                merge_object(&mut detail_json, &authoritative_summary_json);
+            }
             let source_ref = required_string(detail, "source_ref")?;
             let sort_order = detail
                 .get("sort_order")
@@ -153,6 +165,173 @@ pub(crate) fn phase_summary_bundle_to_batch(
         }
     }
     Ok(batch)
+}
+
+fn project_authoritative_summary_fields(
+    state: &Value,
+    source_phase: i64,
+    ticker: &str,
+    role: &str,
+    topic_id: Option<&str>,
+    summary_json: &mut Value,
+) {
+    let mut sources = Vec::new();
+    match source_phase {
+        1 => {
+            if let Some(payload) = state
+                .pointer(&format!("/phase1_index/per_ticker/{ticker}"))
+                .cloned()
+            {
+                if let Some(role_summary) = payload
+                    .get("role_summaries")
+                    .and_then(Value::as_array)
+                    .and_then(|items| {
+                        items
+                            .iter()
+                            .find(|item| item.get("role").and_then(Value::as_str) == Some(role))
+                    })
+                    .cloned()
+                {
+                    sources.push(role_summary);
+                }
+                sources.push(payload);
+            }
+        }
+        2 => {
+            if let Some(topic) = state
+                .pointer("/debate_state_artifact/topic_briefs")
+                .and_then(Value::as_array)
+                .and_then(|items| {
+                    items
+                        .iter()
+                        .find(|item| item.get("topic_id").and_then(Value::as_str) == topic_id)
+                })
+                .cloned()
+            {
+                sources.push(topic);
+            }
+            if let Some(debate) = state.get("debate_state_artifact").cloned() {
+                sources.push(debate);
+            }
+        }
+        3 => {
+            if let Some(research) = state.get("research_plan") {
+                sources.push(research.clone());
+                if let Some(entry) = research
+                    .get("per_ticker")
+                    .and_then(Value::as_object)
+                    .and_then(|items| items.get(ticker))
+                {
+                    sources.push(entry.clone());
+                }
+            }
+        }
+        4 => {
+            if let Some(trader) = state.get("trader_investment_plan") {
+                sources.push(trader.clone());
+                if let Some(entry) = trader
+                    .get("per_ticker")
+                    .and_then(Value::as_object)
+                    .and_then(|items| items.get(ticker))
+                {
+                    sources.push(entry.clone());
+                }
+            }
+        }
+        5 => {
+            if let Some(artifact) = state
+                .pointer("/risk_debate_state/history")
+                .and_then(Value::as_array)
+                .and_then(|items| {
+                    items.iter().find_map(|turn| {
+                        let artifact = turn.get("artifact").unwrap_or(turn);
+                        (artifact.get("role").and_then(Value::as_str) == Some(role))
+                            .then_some(artifact)
+                    })
+                })
+            {
+                sources.push(artifact.clone());
+            }
+        }
+        6 => {
+            if let Some(portfolio) = state.get("final_trade_decision") {
+                sources.push(portfolio.clone());
+                if let Some(entry) = portfolio
+                    .get("per_asset")
+                    .and_then(Value::as_object)
+                    .and_then(|items| items.get(ticker))
+                {
+                    sources.push(entry.clone());
+                }
+            }
+        }
+        _ => {}
+    }
+    let fields = match source_phase {
+        1 => &[
+            "source_role",
+            "ticker",
+            "stance",
+            "confidence",
+            "confidence_basis",
+            "key_evidence_ids",
+            "evidence_quality",
+            "missing_evidence",
+            "conflicts",
+            "invalidation_conditions",
+            "decision_hinges",
+            "data_freshness",
+            "duplicate_evidence_warnings",
+        ][..],
+        2 => &[
+            "topic_id",
+            "common_ground",
+            "bull_claims",
+            "bear_claims",
+            "claim_ledger",
+            "accepted_claims",
+            "rejected_claims",
+            "blocked_claims",
+            "decision_hinges",
+            "convergence_status",
+            "unresolved_conflicts",
+            "missing_evidence",
+            "info_gain_score",
+            "evidence_refs",
+            "stopping_reason",
+        ],
+        3 => RESEARCH_FIELDS,
+        4 => TRADER_FIELDS,
+        5 => RISK_FIELDS,
+        6 => PORTFOLIO_FIELDS,
+        _ => &[],
+    };
+    for source in sources {
+        merge_selected_fields(summary_json, &source, fields);
+    }
+}
+
+fn merge_selected_fields(target: &mut Value, source: &Value, fields: &[&str]) {
+    let Some(target) = target.as_object_mut() else {
+        return;
+    };
+    let Some(source) = source.as_object() else {
+        return;
+    };
+    for field in fields {
+        if let Some(value) = source.get(*field) {
+            target.insert((*field).to_string(), value.clone());
+        }
+    }
+}
+
+fn merge_object(target: &mut Value, source: &Value) {
+    let (Some(target), Some(source)) = (target.as_object_mut(), source.as_object()) else {
+        return;
+    };
+    for (field, value) in source {
+        target.insert(field.clone(), value.clone());
+    }
 }
 
 fn required_string<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
@@ -196,13 +375,7 @@ pub(crate) fn build_phase_compress(
             state.get("trader_investment_plan"),
             TRADER_FIELDS,
         ),
-        5 => build_generic(
-            &run_id,
-            5,
-            "risk",
-            state.get("risk_debate_state"),
-            RISK_FIELDS,
-        ),
+        5 => build_phase5(&run_id, state),
         6 => build_generic(
             &run_id,
             6,
@@ -336,12 +509,15 @@ const RESEARCH_FIELDS: &[&str] = &[
     "debate_adjustment",
     "final_probability",
     "dominant_driver",
+    "thesis",
     "why_now",
     "why_not_already_priced",
     "probability_rationale",
     "adjustment_rationale",
     "scenarios",
     "plan",
+    "validation_plan",
+    "unresolved_hinges",
     "data_gaps",
     "risk_flags",
     "tail_risk_flag",
@@ -352,15 +528,38 @@ const RESEARCH_FIELDS: &[&str] = &[
 
 const TRADER_FIELDS: &[&str] = &[
     "action",
+    "candidate_action",
+    "execution_decision",
     "position_size",
+    "position_size_pct_max",
+    "blockers",
     "entry_price",
     "stop_loss",
+    "execution_conditions",
+    "downgrade_reason",
+    "inherited_rating",
+    "inherited_direction",
     "rationale",
     "status",
     "summary",
 ];
 
 const RISK_FIELDS: &[&str] = &[
+    "role",
+    "stance",
+    "argument",
+    "unique_risk_contribution",
+    "disagreement_with_prior",
+    "no_new_information",
+    "recommended_adjustment",
+    "position_cap_pct",
+    "max_drawdown_pct",
+    "stop_type",
+    "risk_off_trigger",
+    "rebalance_trigger",
+    "review_window",
+    "cash_hedge_recommendation",
+    "constraint_confidence",
     "history",
     "status",
     "summary",
@@ -375,6 +574,16 @@ const PORTFOLIO_FIELDS: &[&str] = &[
     "risk_controls",
     "rationale",
     "action",
+    "per_asset",
+    "direction_constraint",
+    "execution_status",
+    "max_target_weight",
+    "max_weight_delta",
+    "binding_risk_controls",
+    "inherited_rating",
+    "inherited_long_probability",
+    "inherited_short_probability",
+    "unresolved_execution_blockers",
     "summary",
 ];
 
@@ -510,10 +719,52 @@ fn build_phase1(run_id: &str, state: &Value) -> PhaseSummaryPhaseBatch {
                     summary_id: sid.clone(),
                     run_id: run_id.to_string(),
                     source_phase: 1,
-                    detail,
+                    detail: detail.clone(),
                     detail_json: role_sum.clone(),
                     source_ref: role.to_string(),
                     sort_order: order,
+                });
+                let role_sid = batch.push_summary(&PhaseSummaryInput {
+                    run_id: run_id.to_string(),
+                    source_phase: 1,
+                    role: role.to_string(),
+                    ticker: ticker.clone(),
+                    topic_id: None,
+                    summary: if text.is_empty() {
+                        format!("{role}: stance={stance}")
+                    } else {
+                        truncate(text, 500)
+                    },
+                    summary_json: json!({
+                        "source_role": role,
+                        "ticker": ticker,
+                        "stance": stance,
+                        "confidence": role_sum.get("confidence"),
+                        "confidence_basis": role_sum.get("confidence_basis"),
+                        "key_evidence_ids": role_sum.get("key_evidence_ids")
+                            .or_else(|| role_sum.get("evidence_refs")),
+                        "evidence_quality": role_sum.get("evidence_quality"),
+                        "missing_evidence": role_sum.get("missing_evidence")
+                            .or_else(|| role_sum.get("data_gaps")),
+                        "conflicts": role_sum.get("conflicts"),
+                        "invalidation_conditions": role_sum.get("invalidation_conditions"),
+                        "decision_hinges": role_sum.get("decision_hinges"),
+                        "data_freshness": role_sum.get("data_freshness"),
+                        "duplicate_evidence_warnings": role_sum.get("duplicate_evidence_warnings"),
+                    }),
+                    confidence: role_sum
+                        .get("confidence")
+                        .and_then(Value::as_f64)
+                        .unwrap_or(0.0),
+                });
+                batch.push_detail(&PhaseSummaryDetailInput {
+                    summary_id: role_sid,
+                    run_id: run_id.to_string(),
+                    source_phase: 1,
+                    detail: detail.clone(),
+                    detail_json: role_sum.clone(),
+                    source_ref: format!("phase1_index.per_ticker.{ticker}.role_summaries.{role}"),
+                    sort_order: 0,
                 });
                 order += 1;
             }
@@ -734,6 +985,103 @@ fn build_generic(
             }
         }
     }
+    if let Some(per_ticker) = artifact.get("per_ticker").and_then(Value::as_object) {
+        for (ticker, entry) in per_ticker {
+            let entry_summary = entry
+                .get("summary")
+                .or_else(|| entry.get("plan"))
+                .or_else(|| entry.get("rationale"))
+                .and_then(Value::as_str)
+                .map(|text| truncate(text, 500))
+                .unwrap_or_else(|| format!("{role} {ticker} authoritative decision"));
+            let entry_sid = batch.push_summary(&PhaseSummaryInput {
+                run_id: run_id.to_string(),
+                source_phase,
+                role: role.to_string(),
+                ticker: ticker.clone(),
+                topic_id: None,
+                summary: entry_summary,
+                summary_json: compact_fields(entry, keep_fields),
+                confidence: entry
+                    .get("confidence")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(conf),
+            });
+            batch.push_detail(&PhaseSummaryDetailInput {
+                summary_id: entry_sid,
+                run_id: run_id.to_string(),
+                source_phase,
+                detail: format!("{role} authoritative payload for {ticker}"),
+                detail_json: entry.clone(),
+                source_ref: format!("phase{source_phase}.per_ticker.{ticker}"),
+                sort_order: 0,
+            });
+        }
+    }
+    batch
+}
+
+fn build_phase5(run_id: &str, state: &Value) -> PhaseSummaryPhaseBatch {
+    let mut batch = PhaseSummaryPhaseBatch {
+        source_phase: 5,
+        ..Default::default()
+    };
+    let Some(risk) = state.get("risk_debate_state") else {
+        return batch;
+    };
+    let history = risk
+        .get("history")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for (index, turn) in history.iter().enumerate() {
+        let artifact = turn.get("artifact").unwrap_or(turn);
+        let stance = artifact
+            .get("stance")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let role = artifact
+            .get("role")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+            .unwrap_or_else(|| format!("risk.{stance}"));
+        let ticker = artifact
+            .get("ticker")
+            .and_then(Value::as_str)
+            .unwrap_or(AGGREGATE_TICKER);
+        let summary = artifact
+            .get("argument")
+            .or_else(|| artifact.get("summary"))
+            .and_then(Value::as_str)
+            .map(|text| truncate(text, 500))
+            .unwrap_or_else(|| format!("{role} risk constraints"));
+        let confidence = artifact
+            .get("constraint_confidence")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        let sid = batch.push_summary(&PhaseSummaryInput {
+            run_id: run_id.to_string(),
+            source_phase: 5,
+            role: role.clone(),
+            ticker: ticker.to_string(),
+            topic_id: None,
+            summary,
+            summary_json: compact_fields(artifact, RISK_FIELDS),
+            confidence,
+        });
+        batch.push_detail(&PhaseSummaryDetailInput {
+            summary_id: sid,
+            run_id: run_id.to_string(),
+            source_phase: 5,
+            detail: format!("{role} risk review"),
+            detail_json: artifact.clone(),
+            source_ref: format!("risk_debate_state.history.{index}.artifact"),
+            sort_order: 0,
+        });
+    }
+    if batch.summaries.is_empty() && !risk.is_null() {
+        return build_generic(run_id, 5, "risk", Some(risk), RISK_FIELDS);
+    }
     batch
 }
 
@@ -847,5 +1195,85 @@ mod tests {
         assert_eq!(batch.details.len(), 1);
         assert_eq!(batch.details[0].summary_id, batch.summaries[0].id);
         assert_eq!(batch.summaries[0].run_id, "run-live");
+    }
+
+    #[test]
+    fn live_summary_projection_preserves_authoritative_probability_precision() {
+        let state = json!({
+            "run_id": "run-live",
+            "research_plan": {
+                "per_ticker": {
+                    "QQQ": {
+                        "final_probability": 0.6137,
+                        "long_probability": 0.6137,
+                        "short_probability": 0.3863,
+                        "confidence": 0.7425
+                    }
+                }
+            }
+        });
+        let artifact = json!({
+            "artifact_type": "phase_summary_bundle",
+            "source_phase": 3,
+            "summaries": [{
+                "role": "manager.research",
+                "ticker": "QQQ",
+                "topic_id": null,
+                "summary": "QQQ decision.",
+                "summary_json": {
+                    "final_probability": 0.61,
+                    "long_probability": 0.61,
+                    "short_probability": 0.39,
+                    "confidence": 0.74
+                },
+                "confidence": 0.74,
+                "details": [{
+                    "detail": "Authoritative decision fields.",
+                    "detail_json": {"status": "ready"},
+                    "source_ref": "research_plan.per_ticker.QQQ"
+                }]
+            }],
+            "checks": {
+                "source_only": true,
+                "no_external_facts": true,
+                "no_business_decision_change": true
+            }
+        });
+
+        let batch = phase_summary_bundle_to_batch(&state, 3, &artifact).unwrap();
+        assert_eq!(batch.summaries[0].summary_json["final_probability"], 0.6137);
+        assert_eq!(batch.summaries[0].summary_json["long_probability"], 0.6137);
+        assert_eq!(batch.summaries[0].summary_json["short_probability"], 0.3863);
+        assert_eq!(batch.summaries[0].summary_json["confidence"], 0.7425);
+        assert_eq!(batch.details[0].detail_json["final_probability"], 0.6137);
+        assert_eq!(batch.details[0].detail_json["confidence"], 0.7425);
+    }
+
+    #[test]
+    fn phase5_emits_one_summary_per_parallel_reviewer() {
+        let state = json!({
+            "run_id": "run-risk",
+            "risk_debate_state": {
+                "history": [
+                    {"artifact": {"role": "risk.aggressive", "stance": "aggressive", "argument": "take risk", "position_cap_pct": 60.0}},
+                    {"artifact": {"role": "risk.neutral", "stance": "neutral", "argument": "balance risk", "position_cap_pct": 40.0}},
+                    {"artifact": {"role": "risk.conservative", "stance": "conservative", "argument": "limit risk", "position_cap_pct": 20.0}}
+                ]
+            }
+        });
+
+        let batch = build_phase_compress(&state, 5).unwrap();
+        let roles = batch
+            .summaries
+            .iter()
+            .map(|summary| summary.role.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            roles,
+            ["risk.aggressive", "risk.conservative", "risk.neutral"]
+                .into_iter()
+                .collect()
+        );
+        assert_eq!(batch.summaries.len(), 3);
     }
 }

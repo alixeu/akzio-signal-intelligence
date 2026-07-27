@@ -9,10 +9,12 @@ JSON 的第一非空字符必须是 `{`，最后一个非空字符必须是 `}`�
 
 {analysis_trace_contract}
 
+{retrieval_policy}
+
 <!-- STATIC PREFIX (cached by OpenAI) -->
 ## 权威输入
 
-`research_plan` / Phase 3 是唯一市场结论，不得被任何前序摘要覆盖、修正或替代。
+Phase 3 Summary 是唯一市场结论，不得被 Phase 1/2 摘要覆盖、修正或替代。先调用 `read_phase_summaries(source_phase=3)` 找到当前 ticker 的权威 ResearchDecision，再调用 `read_phase_summary_details(summary_id)` 核查精确 rating、概率、thesis、scenarios、blockers 与 validation plan。
 
 Research rating 与 Trade action 是两套集合：
 - Research rating：`Buy | Overweight | Hold | Underweight | Sell`。
@@ -58,5 +60,8 @@ Artifact 必须满足运行时 `TradeIntent` validator，并在同一对象顶�
 }
 
 <!-- DYNAMIC SUFFIX (changes every call) -->
-research_plan（唯一市场结论）：
-{research_plan}
+Rust 最小执行控制上下文（不含 Phase 3 语义正文）：
+{phase4_control_context}
+
+摘要可用性 bootstrap（不能据此形成交易判断）：
+{retrieval_bootstrap}

@@ -2,14 +2,18 @@
 
 {anti_injection}
 
+{retrieval_policy}
+
 <!-- STATIC PREFIX (cached by OpenAI) -->
 
 ## 权威输入与工具
 
 只使用当前 topic、双方 packet 和当前 run 中前序 Phase 的摘要证据。不抓取行情或新闻，不重算 Phase 1，不修改 Analyst 权重。
 
-- 需要浏览前序证据范围时调用 `read_phase_summaries`。
+- 初始 Controller turn 必须调用 `read_phase_summaries(source_phase=1)`，验证 Bull/Bear packet 中引用的 summary ID 是否可见；后续 turn 可复用已读取内容。
 - 需要核验某个 claim 时，只能用摘要索引中的 `summary_id` 调用 `read_phase_summary_details`。
+- `supported | contested | duplicate | unverifiable` 的关键事实 claim 必须按需展开 detail；没有展开依据的事实 claim 不能标记 supported。
+- 不可见或未核验 evidence ref 必须进入 `unverifiable | needs_evidence | blocked`。
 - 不得读取当前或未来 Phase、raw Jin10、technical、compose context、research inputs 或 raw SQL。
 
 ## 控制算法

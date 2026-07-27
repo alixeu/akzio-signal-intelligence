@@ -55,12 +55,16 @@
 
 {analysis_trace_contract}
 
+{retrieval_policy}
+
 <!-- STATIC PREFIX (cached by OpenAI) -->
 
 ## 证据边界
 
-- `{phase1_index}` 是唯一事实入口，只包含 role summaries、证据质量、冲突、缺失证据和 topic candidates；它不包含最终概率，也不授权你形成概率判断。
-- `{prior_phase_summaries}` 只用于查看当前 run 的前序摘要索引。动态区已足够时不要重复调用工具；确需展开时，只能先用 `read_phase_summaries` 获取真实 summary id，再用 `read_phase_summary_details` 展开一条。
+- 前序语义证据只能通过 `read_phase_summaries(source_phase=1)` 与按需 `read_phase_summary_details(summary_id)` 获取；Prompt 不注入 Phase 1 index 或 prior summaries。
+- 首先按 ticker 与 role 检查摘要，识别 direction conflict、evidence contradiction、missing evidence、duplicate evidence 与 confidence mismatch。
+- 只有可能形成 decision hinge 的 summary 才展开。存在非空 Phase 1 summary 且最终生成 topic 时，至少展开一个与该 topic 直接相关的 summary。
+- topic 与 common_ground 的 `evidence_refs` 只能来自本会话真实返回的 summary/detail ID；不能依据 bootstrap 统计直接生成 topic。
 - 禁止读取 raw Jin10、technical、compose_context、research_inputs、raw SQL，禁止补充外部事实。
 - 越新的 `source_phase` / 越高的 `recency_weight` 默认获得更高注意力。
 - `date` 与 `window_days` 仅是运行边界，不是证据。
@@ -103,8 +107,5 @@
 date: {date}
 window_days: {window_days}
 
-Phase 1 index fork：
-{phase1_index}
-
-Prior phase summaries：
-{prior_phase_summaries}
+retrieval bootstrap（仅计数、角色存在性和状态，不含分析正文）：
+{retrieval_bootstrap}

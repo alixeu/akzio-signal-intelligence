@@ -100,19 +100,20 @@ graph TD
     MEM --> SQL
 ```
 
-Phase 2 begins with three concurrent LLM calls: the neutral Topic Generator,
-Bull warm-up, and Bear warm-up. The Topic Generator uses only the forked Phase 1
-index and prior phase summaries; Rust rejects external-fact or schema-breaking
-output and retains a deterministic conflict fallback. A successful Bull/Bear
-warm-up ends at the `准备完毕` checkpoint. Each selected topic forks a new Bull or
-Bear conversation from that side's checkpoint, while its Topic Controller forks
-from the completed Topic Generator conversation. These forks continue the saved
-conversation rather than being reconstructed from a summary; warm-up itself never
-runs Phase Summary. Topics run concurrently, while turns inside one topic remain
-controller-routed. When no material hinge exists, Phase 2 records a no-debate
-artifact and still advances to Phase 3.
+Phase 2 begins with one shared Bull/Bear warm-up. Its `准备完毕` checkpoint
+continues into the neutral Topic Generator, which uses only the forked Phase 1
+summary index through `read_phase_summaries` and expands selected evidence with
+`read_phase_summary_details`; no Phase 1 artifact is embedded in its prompt.
+Rust rejects external-fact or schema-breaking output and retains a deterministic
+conflict fallback. Each selected topic then
+forks Bull, Bear, and Topic Controller conversations from the completed Topic
+Generator checkpoint. These forks continue the saved conversation rather than
+being reconstructed from a summary; warm-up itself never runs Phase Summary.
+Topics run concurrently, while turns inside one topic remain controller-routed.
+When no material hinge exists, Phase 2 records a no-debate artifact and still
+advances to Phase 3.
 
-Trader, the three-perspective risk committee, and Portfolio Manager are
+Trader, the three parallel risk reviewers, and Portfolio Manager are
 mandatory in the default `legacy` policy. Phase 6 emits only per-asset semantic
 constraints; it cannot read accounts, calculate quantities, or submit orders.
 Phase 7 computes and validates target weights in Rust, projects those weights
@@ -238,6 +239,22 @@ Phase 8 decision snapshot/archive are also Rust-owned stages. Phase Summary runs
 after a completed source phase 1 through 7; it does not run for Phase 0, Phase 8,
 or the Phase 2 warm-up checkpoint.
 
+For Phases 2–6, Phase Summary is the only cross-phase semantic interface.
+Prompts receive only current-task packets, Rust-owned deterministic controls,
+and a small metadata-only retrieval bootstrap. Each role must list visible
+summaries before expanding details; role-specific policies enforce required
+source phases, detail budgets, pagination limits, and evidence references to IDs
+actually returned in that conversation. One policy failure gets a repair turn;
+a second failure produces a degraded artifact. Phase 0 uses the same tools, but
+Rust resolves an allowlisted reflection `task_id` to its historical source run,
+so the model cannot choose an arbitrary run.
+
+Retrieval limits are configured under `orchestrator.retrieval` in
+`config/config.yaml`. Role artifacts record both a `retrieval_audit` and a
+`context_manifest`; the latter reports each directly injected context's status,
+item count, character count, source, and whether the semantic payload is
+retrievable through tools.
+
 ```bash
 rtk cargo run -p orchestrator-cli --bin orchestrator-exec -- \
   --from-phase 0 \
@@ -266,6 +283,12 @@ prompt's `.md` suffix with `.json`. For example,
 `outputs/debug/phase1/news_macro.json`; shared prompts append their exchanges to
 the same file. Each such JSON file contains a `records` array, with one entry per
 exchange and its `req` and `resp` (including error or fallback responses).
+
+Phase 2 mirrors its checkpoint/fork topology instead of its prompt paths:
+`phase2-warmup-shared.json` and `topic-generator.json` sit directly under
+`outputs/debug/phase2/`; each `topic-{id}/` contains `topic-controller.json`,
+`debate-bull.json`, and `debate-bear.json`. Initial claims and later rebuttals
+append to the same side-specific debate file.
 
 Phase Summary is stored with the phase it summarized, rather than under
 `prompts/phase_summary/`: after a completed Phase `N` from 1 through 7, its

@@ -695,16 +695,58 @@ pub fn reflection_source_context(conn: &Connection, task_id: i64) -> Result<Valu
         .into_iter()
         .find(|task| task.task_id == task_id)
         .with_context(|| format!("pending reflection task {task_id} not found"))?;
-    let summaries = crate::list_phase_summaries(conn, &row.1, 8, None)?;
-    let details = (1..=7)
-        .map(|phase| crate::list_phase_details_for_phase(conn, &row.1, phase))
-        .collect::<Result<Vec<_>>>()?;
+    let (summary_count, detail_count, minimum_phase, maximum_phase): (
+        i64,
+        i64,
+        Option<i64>,
+        Option<i64>,
+    ) = conn.query_row(
+        r#"
+        SELECT
+          (SELECT COUNT(*) FROM phase_summaries WHERE run_id=?1),
+          (SELECT COUNT(*) FROM phase_summary_details WHERE run_id=?1),
+          (SELECT MIN(source_phase) FROM phase_summaries WHERE run_id=?1),
+          (SELECT MAX(source_phase) FROM phase_summaries WHERE run_id=?1)
+        "#,
+        [&row.1],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
     Ok(json!({
-        "task": task,
-        "phase_summaries": summaries,
-        "phase_summary_details_by_phase": details,
-        "source_policy": "Only this task's source_run_id is readable."
+        "status": if summary_count == 0 { "empty" } else { "available" },
+        "task": {
+            "task_id": task.task_id,
+            "ticker": task.ticker,
+            "reflection_level": task.reflection_level,
+        },
+        "decision": task.decision,
+        "outcome": task.outcome,
+        "source_run_metadata": {
+            "source_run_id": task.source_run_id,
+            "visible_phase_range": {
+                "minimum": minimum_phase,
+                "maximum": maximum_phase
+            },
+            "summary_count": summary_count,
+            "detail_count": detail_count,
+            "data_complete": summary_count > 0 && detail_count > 0
+        },
+        "source_policy": "task_allowlisted_historical_run_only"
     }))
+}
+
+pub fn reflection_task_source_run(conn: &Connection, task_id: i64) -> Result<String> {
+    conn.query_row(
+        r#"
+        SELECT o.source_run_id
+        FROM reflection_tasks t
+        JOIN decision_outcomes o ON o.id=t.decision_outcome_id
+        WHERE t.id=?1
+        "#,
+        [task_id],
+        |row| row.get(0),
+    )
+    .optional()?
+    .with_context(|| format!("reflection task {task_id} not found"))
 }
 
 pub fn read_experience(
