@@ -464,7 +464,7 @@ async fn download_technical_csv(
         )
     };
     let bars_len = bars.len();
-    let mut rows = feature_rows(interval, &bars);
+    let mut rows = feature_rows(&bars);
     if rows.len() > DEFAULT_TECHNICAL_BARS {
         rows = rows.split_off(rows.len() - DEFAULT_TECHNICAL_BARS);
     }
@@ -605,15 +605,11 @@ impl ResolvedTechnicalArgs {
 
 #[derive(Debug, Clone)]
 struct FeatureRow {
-    #[allow(dead_code)]
-    symbol: String,
     date: String,
-    #[allow(dead_code)]
-    interval: String,
     features: HashMap<String, Option<f64>>,
 }
 
-fn feature_rows(interval: &str, bars: &[Bar]) -> Vec<FeatureRow> {
+fn feature_rows(bars: &[Bar]) -> Vec<FeatureRow> {
     let mut bars = bars.to_vec();
     bars.sort_by(|a, b| a.symbol.cmp(&b.symbol).then(a.date.cmp(&b.date)));
     let mut out = Vec::new();
@@ -625,13 +621,13 @@ fn feature_rows(interval: &str, bars: &[Bar]) -> Vec<FeatureRow> {
             .position(|bar| bar.symbol != symbol)
             .map(|index| start + index)
             .unwrap_or(bars.len());
-        out.extend(feature_rows_for_symbol(interval, &bars[start..end]));
+        out.extend(feature_rows_for_symbol(&bars[start..end]));
         start = end;
     }
     out
 }
 
-fn feature_rows_for_symbol(interval: &str, bars: &[Bar]) -> Vec<FeatureRow> {
+fn feature_rows_for_symbol(bars: &[Bar]) -> Vec<FeatureRow> {
     let open = bars
         .iter()
         .map(|bar| adjusted_price(bar.open, bar.close, bar.adj_close))
@@ -725,9 +721,7 @@ fn feature_rows_for_symbol(interval: &str, bars: &[Bar]) -> Vec<FeatureRow> {
             );
         }
         rows.push(FeatureRow {
-            symbol: bars[i].symbol.clone(),
             date: bars[i].date.clone(),
-            interval: interval.to_string(),
             features,
         });
     }
@@ -1439,7 +1433,7 @@ mod tests {
         let bars = (1..=6)
             .map(|i| bar(i, if i == 3 { None } else { Some(i as f64) }))
             .collect::<Vec<_>>();
-        let rows = feature_rows_for_symbol("1d", &bars);
+        let rows = feature_rows_for_symbol(&bars);
         assert_eq!(rows[3].features["MA5"], None);
         assert!(rows[5].features["Return"].is_some());
     }

@@ -2,8 +2,7 @@
 //!
 //! Summary agents never choose how many indexes to create.  The workflow
 //! derives the complete set from finalized source artifacts, then gives each
-//! agent exactly one [`SummaryUnit`].  This module deliberately does not read
-//! or write a store; PR2 will connect these plans to the Index/Detail writer.
+//! agent exactly one [`SummaryUnit`]. This module does not read or write a store.
 
 use anyhow::{bail, ensure, Result};
 use sha2::{Digest, Sha256};

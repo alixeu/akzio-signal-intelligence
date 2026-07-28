@@ -1188,7 +1188,6 @@ pub fn finalize_portfolio_decision(
         risk_controls: Vec::new(),
         rationale: decision.rationale,
         per_asset,
-        extra: Default::default(),
     };
     validate_final_validation(&validation).map_err(|message| StoreError::InvalidDocument {
         kind: "portfolio finalizer",

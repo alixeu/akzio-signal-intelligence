@@ -72,14 +72,12 @@ pub(crate) struct RoleJob {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)]
 pub(crate) struct RoleJobResult {
     pub role: String,
     pub phase: i64,
     pub kind: String,
     pub round: Option<i64>,
     pub topic_id: Option<String>,
-    pub tickers: Vec<String>,
     pub prompt_version: Option<String>,
     pub model: String,
     pub turn_id: String,
@@ -1232,7 +1230,6 @@ pub(crate) async fn run_role_job_with_timeout(job: RoleJob, timeout_sec: u64) ->
     let kind = job.kind.clone();
     let round = job.round;
     let topic_id = job.topic_id.clone();
-    let tickers = job.tickers.clone();
     let prompt_version = job.prompt_version.clone();
     let started_at = Instant::now();
     debug!(
@@ -1306,7 +1303,6 @@ pub(crate) async fn run_role_job_with_timeout(job: RoleJob, timeout_sec: u64) ->
                 kind,
                 round,
                 topic_id,
-                tickers,
                 prompt_version,
                 model: output
                     .artifact
@@ -1344,7 +1340,6 @@ pub(crate) async fn run_role_job_with_timeout(job: RoleJob, timeout_sec: u64) ->
                 kind,
                 round,
                 topic_id,
-                tickers,
                 prompt_version,
                 model: String::new(),
                 turn_id: String::new(),
@@ -1773,7 +1768,6 @@ mod tests {
             kind: "artifact".to_string(),
             round: None,
             topic_id: None,
-            tickers: vec!["QQQ".to_string()],
             prompt_version: Some("v1".to_string()),
             model: "test-model".to_string(),
             turn_id: "turn-1".to_string(),

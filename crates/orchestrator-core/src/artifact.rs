@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::Value;
 use std::collections::BTreeMap;
 use thiserror::Error;
 
@@ -193,8 +193,6 @@ pub struct FinalValidation {
     /// Per-asset semantic constraints for Rust-owned allocation and execution.
     #[serde(default)]
     pub per_asset: BTreeMap<String, AssetExecutionConstraint>,
-    #[serde(flatten)]
-    pub extra: Map<String, Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -207,8 +205,6 @@ pub struct PortfolioAllocation {
     pub correlation_note: String,
     #[serde(default)]
     pub summary: String,
-    #[serde(flatten)]
-    pub extra: Map<String, Value>,
 }
 
 /// Per-ticker evidence assessment used by the AnalystReport Store builder.

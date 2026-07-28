@@ -42,9 +42,9 @@ pub fn publish_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let file_name = path
         .file_name()
         .ok_or_else(|| StoreError::InvalidDocument {
-        kind: "atomic publication path",
-        message: "path must name a file".to_owned(),
-    })?;
+            kind: "atomic publication path",
+            message: "path must name a file".to_owned(),
+        })?;
     fs::create_dir_all(parent).map_err(|source| io_error(parent, source))?;
     write_bytes_atomic(parent, Path::new(file_name), bytes)
 }

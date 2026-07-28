@@ -166,7 +166,7 @@ impl StoreConfig {
     }
 
     /// Resolve the one canonical store root for a run. This does not create or
-    /// read the directory; PR1's FileStore runtime owns that side effect.
+    /// read the directory; FileStore runtime owns that side effect.
     pub fn resolve_root(&self, cli_override: Option<&Path>) -> Result<PathBuf> {
         match cli_override {
             Some(path) => resolve_store_root_path(path),

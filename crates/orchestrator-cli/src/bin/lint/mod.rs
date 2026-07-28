@@ -82,16 +82,6 @@ pub const VALID_PLACEHOLDERS: &[&str] = &[
     "risk_analyst_body",
 ];
 
-/// Shared component files under `prompts/common/`.
-#[allow(dead_code)]
-pub const COMMON_COMPONENTS: &[&str] = &[
-    "analyst_output_contract.md",
-    "retrieval_policy.md",
-    "leveraged_etf_rules.md",
-    "research_calibration.md",
-    "research_drivers.md",
-];
-
 pub fn run_all_checks(prompts_dir: &Path) -> Result<LintReport> {
     let config = orchestrator_cli::cli_config::load_default_config()
         .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
