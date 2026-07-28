@@ -6,7 +6,6 @@ use orchestrator_core::{
     AuthorityRegistry, RetrievalBudget,
 };
 use orchestrator_llm::{
-    llm_judge::JudgeConfig,
     truncation::TruncationConfig,
     web_search::{validate_web_search_runtime_config, WebSearchConfig, WebSearchConfigOverride},
     RoleLlmSettings,
@@ -30,7 +29,6 @@ pub(crate) struct RuntimeConfig {
     pub llm_roles: BTreeMap<String, RoleLlmSettings>,
     pub web_search: BTreeMap<String, WebSearchConfig>,
     pub truncation: TruncationConfig,
-    pub judge: JudgeConfig,
     pub prompts: PromptConfig,
     pub workflow: WorkflowConfig,
     pub allocation: AllocationConfig,
@@ -537,7 +535,6 @@ impl RuntimeConfig {
         let mut llm_roles = llm_roles_from_config(config)?;
         merge_plugin_llm_role_defaults(config, &mut llm_roles, &role_plugins)?;
         let truncation = truncation_config_from_value(config);
-        let judge = judge_config_from_value(config);
         let mut web_search = web_search_by_role_from_config(config, llm_roles.iter())?;
         for config in web_search.values_mut() {
             config.truncation = truncation.clone();
@@ -563,7 +560,6 @@ impl RuntimeConfig {
             llm_roles,
             web_search,
             truncation,
-            judge,
             prompts: prompts_config,
             workflow,
             allocation: AllocationConfig::from_value(config),
@@ -587,21 +583,6 @@ fn truncation_config_from_value(config: &Value) -> TruncationConfig {
         .map_or_else(TruncationConfig::default, |value| {
             serde_json::from_value::<TruncationConfig>(value.clone()).unwrap_or_default()
         })
-}
-
-fn judge_config_from_value(config: &Value) -> JudgeConfig {
-    JudgeConfig {
-        // Rust contracts are authoritative. The former default judge added one
-        // LLM request per turn without contributing market evidence.
-        enabled: config_bool(config, "orchestrator.llm.judge.enabled", false),
-        model: config_str(
-            config,
-            "orchestrator.llm.judge.model",
-            orchestrator_llm::llm_judge::DEFAULT_JUDGE_MODEL,
-        ),
-        max_messages_per_turn: config_int(config, "orchestrator.llm.judge.max_messages_per_turn", 3)
-            .max(0) as usize,
-    }
 }
 
 fn merge_plugin_llm_role_defaults(
@@ -1270,35 +1251,6 @@ mod tests {
             .unwrap_err();
             assert!(error.to_string().contains("orchestrator.tool_managed"));
         }
-    }
-
-    #[test]
-    fn judge_config_parses_from_runtime_config_value() {
-        let value = json!({
-            "orchestrator": {
-                "llm": {
-                    "judge": {
-                        "enabled": false,
-                        "model": "judge-model",
-                        "max_messages_per_turn": 7
-                    }
-                }
-            }
-        });
-
-        let config = judge_config_from_value(&value);
-
-        assert!(!config.enabled);
-        assert_eq!(config.model, "judge-model");
-        assert_eq!(config.max_messages_per_turn, 7);
-    }
-
-    #[test]
-    fn judge_config_defaults_when_missing() {
-        let config = judge_config_from_value(&json!({}));
-        assert!(!config.enabled);
-        assert_eq!(config.model, JudgeConfig::default().model);
-        assert_eq!(config.max_messages_per_turn, 3);
     }
 
     #[test]

@@ -22,7 +22,6 @@ use std::{
 };
 use tracing::{debug, warn};
 
-use crate::llm_judge::{judge_message_status, JudgeConfig};
 use crate::tools::{self, truncate_chars};
 use crate::truncation::{truncate_semantic, TruncationConfig};
 use crate::AgentSettings;
@@ -110,9 +109,6 @@ pub struct AgentLoopConfig {
     pub max_context_tokens: Option<usize>,
     pub compact_at_token_ratio: f64,
     pub truncation: TruncationConfig,
-    pub judge: JudgeConfig,
-    pub judge_endpoint: Option<String>,
-    pub judge_api_key: Option<String>,
     /// When true, write per-iteration timing/token rows under outputs/debug/.
     pub debug: bool,
     pub project_root: Option<PathBuf>,
@@ -135,9 +131,6 @@ impl Default for AgentLoopConfig {
             max_context_tokens: Some(orchestrator_core::token::MAX_PROMPT_TOKENS),
             compact_at_token_ratio: 0.8,
             truncation: TruncationConfig::default(),
-            judge: JudgeConfig::default(),
-            judge_endpoint: None,
-            judge_api_key: None,
             debug: false,
             project_root: None,
             role: String::new(),
@@ -232,7 +225,6 @@ where
     let max_loops = config.max_agent_loops.map(|value| value.max(1));
     let mut loop_index = 0usize;
     let mut aggregate_result = ModelStreamResult::default();
-    let mut judge_call_count = 0usize;
     let mut retrieval_retry_queued = false;
     let mut terminal_finalize_failures = 0usize;
     loop {
@@ -268,9 +260,7 @@ where
         let mut stream_handler =
             ModelStreamHandler::new(session, turn, sink, config.truncation.clone());
         model.stream_events(input, &mut stream_handler).await?;
-        let mut stream_result = stream_handler.finish().await?;
-        apply_judge_to_stream_result(turn, &config, &mut stream_result, &mut judge_call_count)
-            .await?;
+        let stream_result = stream_handler.finish().await?;
         let llm_elapsed_ms = llm_started.elapsed().as_millis();
         debug!(
             turn_id = turn.turn_id,
@@ -627,102 +617,6 @@ fn tool_result_output(item: &TurnItem) -> Option<Value> {
 
 fn canonical_value(value: &Value) -> String {
     serde_json::to_string(value).unwrap_or_default()
-}
-
-async fn apply_judge_to_stream_result(
-    turn: &mut Turn,
-    config: &AgentLoopConfig,
-    stream_result: &mut ModelStreamResult,
-    judge_call_count: &mut usize,
-) -> Result<()> {
-    for item in &mut stream_result.assistant_message_decisions {
-        if !matches!(item.decision, FollowUpDecision::Ambiguous) {
-            continue;
-        }
-        if !config.judge.enabled {
-            debug!(
-                turn_id = turn.turn_id,
-                item_id = item.item_id,
-                "LLM judge disabled, defaulting ambiguous assistant message to Final"
-            );
-            item.decision = FollowUpDecision::Final;
-            continue;
-        }
-        if *judge_call_count >= config.judge.max_messages_per_turn {
-            warn!(
-                turn_id = turn.turn_id,
-                item_id = item.item_id,
-                count = *judge_call_count,
-                max = config.judge.max_messages_per_turn,
-                "LLM judge call limit reached, defaulting to Final"
-            );
-            item.decision = FollowUpDecision::Final;
-            continue;
-        }
-        let Some(endpoint) = config
-            .judge_endpoint
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        else {
-            warn!(
-                turn_id = turn.turn_id,
-                item_id = item.item_id,
-                "LLM judge endpoint missing, defaulting to Final"
-            );
-            item.decision = FollowUpDecision::Final;
-            continue;
-        };
-        let Some(api_key) = config
-            .judge_api_key
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        else {
-            warn!(
-                turn_id = turn.turn_id,
-                item_id = item.item_id,
-                "LLM judge API key missing, defaulting to Final"
-            );
-            item.decision = FollowUpDecision::Final;
-            continue;
-        };
-        *judge_call_count += 1;
-        match judge_message_status(&item.text, endpoint, api_key, &config.judge.model).await {
-            Ok(true) => {
-                debug!(
-                    turn_id = turn.turn_id,
-                    item_id = item.item_id,
-                    "LLM judge classified assistant message as stall"
-                );
-                item.decision = FollowUpDecision::NeedsFollowUp;
-            }
-            Ok(false) => {
-                debug!(
-                    turn_id = turn.turn_id,
-                    item_id = item.item_id,
-                    "LLM judge classified assistant message as final"
-                );
-                item.decision = FollowUpDecision::Final;
-            }
-            Err(error) => {
-                warn!(
-                    turn_id = turn.turn_id,
-                    item_id = item.item_id,
-                    error = %error,
-                    "LLM judge failed, defaulting to Final"
-                );
-                item.decision = FollowUpDecision::Final;
-            }
-        }
-    }
-    stream_result.needs_follow_up = stream_result.needs_follow_up
-        || stream_result
-            .assistant_message_decisions
-            .iter()
-            .any(|item| matches!(item.decision, FollowUpDecision::NeedsFollowUp));
-    turn.needs_follow_up = stream_result.needs_follow_up;
-    Ok(())
 }
 
 pub(super) fn truncate_tool_result(content: &str, truncation: &TruncationConfig) -> String {
@@ -1423,13 +1317,6 @@ pub const MAX_FINALIZE_ATTEMPTS: usize = 2;
 
 fn is_terminal_finalize_attempt(result: &ToolResultItem) -> bool {
     result.name.starts_with("finalize_") && !is_terminal_tool_result(result)
-}
-
-pub fn classify_assistant_message(_text: &str, turn_status: TurnStatus) -> FollowUpDecision {
-    match turn_status {
-        TurnStatus::Intermediate => FollowUpDecision::NeedsFollowUp,
-        TurnStatus::Final | TurnStatus::Unknown => FollowUpDecision::Final,
-    }
 }
 
 /// System instruction for native tool calling + plain-text final artifacts.

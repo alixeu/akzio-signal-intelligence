@@ -436,17 +436,6 @@ pub enum TurnStatus {
     Unknown,
 }
 
-/// Result of stall detection for an assistant message.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FollowUpDecision {
-    /// The message is a stall; the agent loop should continue.
-    NeedsFollowUp,
-    /// The message is final; the agent loop should end the turn.
-    Final,
-    /// The message is ambiguous; run the LLM judge to decide.
-    Ambiguous,
-}
-
 /// Token usage from a single OpenAI Responses API call.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TokenUsage {
@@ -534,7 +523,6 @@ pub struct ModelStreamResult {
     pub llm_ms: u128,
     /// Wall time spent executing tools (sum of concurrent batch wall times).
     pub tool_ms: u128,
-    pub(crate) assistant_message_decisions: Vec<AssistantMessageDecision>,
 }
 
 impl ModelStreamResult {
@@ -542,13 +530,6 @@ impl ModelStreamResult {
     pub fn wait_ms(&self, total_elapsed_ms: u128) -> u128 {
         total_elapsed_ms.saturating_sub(self.llm_ms.saturating_add(self.tool_ms))
     }
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct AssistantMessageDecision {
-    pub item_id: String,
-    pub text: String,
-    pub decision: FollowUpDecision,
 }
 
 pub trait LoopModel: Send {

@@ -115,9 +115,6 @@ orchestrator:
       reasoning_summary: auto
       preserve_reasoning_state: false
       tools: []
-    judge:
-      enabled: false
-
   web_search:
     mode: live
     provider: exa

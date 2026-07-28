@@ -5,7 +5,6 @@ use agent_loop::{
 use anyhow::{bail, Context, Result};
 use async_openai::{config::OpenAIConfig, Client as OpenAIClient};
 use futures::StreamExt;
-use llm_judge::JudgeConfig;
 use orchestrator_core::{default_project_root, ToolManagedProfile};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -23,7 +22,6 @@ use web_search::{
 };
 
 pub mod agent_loop;
-pub mod llm_judge;
 pub mod tools;
 pub mod truncation;
 pub mod web_search;
@@ -209,7 +207,6 @@ pub struct AgentSettings {
     pub tools: Option<tools::ExternalToolConfig>,
     pub web_search: WebSearchConfig,
     pub truncation: TruncationConfig,
-    pub judge: JudgeConfig,
     pub debug: bool,
     pub retrieval_policy: RetrievalPolicy,
 }
@@ -378,9 +375,6 @@ fn agent_loop_config_from_settings(settings: &AgentSettings) -> AgentLoopConfig 
     AgentLoopConfig {
         max_agent_loops: settings.llm.max_turns,
         truncation: settings.truncation.clone(),
-        judge: settings.judge.clone(),
-        judge_endpoint: settings.llm.base_url.clone(),
-        judge_api_key: settings.llm.api_key.clone(),
         debug: settings.debug,
         project_root: Some(debug_project_root(settings)),
         role: settings.role.clone(),
@@ -2429,9 +2423,8 @@ fn mock_portfolio_artifact() -> Value {
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_loop, is_permanent_llm_error_text, is_transient_llm_error, llm_judge::JudgeConfig,
-        tools, AgentSettings, LlmRoute, LlmTransport, OutputMode, RoleLlmSettings,
-        ToolManagedProfile, TruncationConfig,
+        agent_loop, is_permanent_llm_error_text, is_transient_llm_error, tools, AgentSettings,
+        LlmRoute, LlmTransport, OutputMode, RoleLlmSettings, ToolManagedProfile, TruncationConfig,
     };
     use crate::web_search::{WebSearchConfig, WebSearchMode};
     use anyhow::{anyhow, Result};
@@ -2573,7 +2566,6 @@ mod tests {
             tools: None,
             web_search: WebSearchConfig::default(),
             truncation: TruncationConfig::default(),
-            judge: JudgeConfig::default(),
             debug: false,
             retrieval_policy: agent_loop::RetrievalPolicy::default(),
         }

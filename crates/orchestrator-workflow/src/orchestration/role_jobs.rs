@@ -9,7 +9,6 @@ use orchestrator_llm::{
         FileStoreSessionRuntime, ModelStreamResult, RetrievalPolicy, SessionRuntimeSpec,
         TokenUsage, ToolResultItem, Turn,
     },
-    llm_judge::JudgeConfig,
     mock_role_artifact, run_agent_loop_with_metrics, run_agent_steer_loop_with_metrics,
     tools::{ExternalToolConfig, FileStoreInputSnapshot},
     truncation::TruncationConfig,
@@ -88,7 +87,6 @@ pub(crate) struct RoleJob {
     pub tools: ExternalToolConfig,
     pub web_search: orchestrator_llm::web_search::WebSearchConfig,
     pub truncation: TruncationConfig,
-    pub judge: JudgeConfig,
     pub retrieval_policy: RetrievalPolicy,
     pub context_manifest: Value,
 }
@@ -453,7 +451,6 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
         },
         web_search: config.web_search.get(role).cloned().unwrap_or_default(),
         truncation: config.truncation.clone(),
-        judge: config.judge.clone(),
         retrieval_policy: retrieval_policy_for_role(role, kind, &config.retrieval),
         context_manifest: direct_context_manifest(&state, phase),
     })
@@ -1622,7 +1619,6 @@ async fn execute_role_job(job: RoleJob) -> Result<AgentLoopOutput> {
         tools: Some(job.tools),
         web_search: job.web_search,
         truncation: job.truncation,
-        judge: job.judge,
         debug: job.debug,
         retrieval_policy: job.retrieval_policy,
     };
@@ -2042,7 +2038,6 @@ async fn execute_steer_role_job(
         tools: Some(job.tools),
         web_search: job.web_search,
         truncation: job.truncation,
-        judge: job.judge,
         debug: job.debug,
         retrieval_policy: job.retrieval_policy,
     };

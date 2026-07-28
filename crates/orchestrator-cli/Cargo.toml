@@ -42,10 +42,6 @@ name = "orchestrator-ingest"
 path = "src/bin/orchestrator_ingest.rs"
 
 [[bin]]
-name = "orchestrator-eval"
-path = "src/bin/orchestrator_eval.rs"
-
-[[bin]]
 name = "orchestrator-prompt-lint"
 path = "src/bin/orchestrator_prompt_lint.rs"
 

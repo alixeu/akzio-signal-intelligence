@@ -79,18 +79,6 @@ impl<'a, S: AgentEventSink> ModelStreamHandler<'a, S> {
                     turn_status = ?turn_status,
                     "model stream assistant message completed"
                 );
-                let decision = classify_assistant_message(&text, turn_status);
-                let needs_follow_up = matches!(decision, FollowUpDecision::NeedsFollowUp);
-                if needs_follow_up {
-                    self.result.needs_follow_up = true;
-                }
-                self.result
-                    .assistant_message_decisions
-                    .push(AssistantMessageDecision {
-                        item_id: item_id.clone(),
-                        text: text.clone(),
-                        decision,
-                    });
                 if let Some(item) = update_turn_item(
                     self.turn,
                     &item_id,
@@ -218,11 +206,6 @@ impl<'a, S: AgentEventSink> ModelStreamHandler<'a, S> {
 
     pub(super) async fn finish(mut self) -> Result<ModelStreamResult> {
         self.result.needs_follow_up = self.result.needs_follow_up
-            || self
-                .result
-                .assistant_message_decisions
-                .iter()
-                .any(|item| matches!(item.decision, FollowUpDecision::NeedsFollowUp))
             || !self.turn.pending_tool_calls.is_empty()
             || !self.turn.pending_input.is_empty();
         self.turn.needs_follow_up = self.result.needs_follow_up;

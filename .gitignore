@@ -12,9 +12,7 @@ __pycache__/
 /outputs/
 /config/local*.yaml
 /config/*.local.yaml
-*.sqlite
-*.sqlite-shm
-*.sqlite-wal
+*.log
 
 # Environment and secrets
 .env
