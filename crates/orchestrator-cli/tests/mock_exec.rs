@@ -46,11 +46,11 @@ async fn mock_exec_phase7_writes_file_store_allocation() {
         .unwrap();
 
     assert_eq!(
-        result["run_state"]["trader_investment_plan"]["per_ticker"]["QQQ"]["intent"]["action"],
+        result["run_state"]["trader_investment_plan"]["per_ticker"]["QQQ"]["payload"]["action"],
         "Hold"
     );
     assert_eq!(
-        result["run_state"]["final_trade_decision"]["per_asset"]["QQQ"]["decision"]["rating"],
+        result["run_state"]["final_trade_decision"]["per_asset"]["QQQ"]["payload"]["rating"],
         "Hold"
     );
     assert_eq!(result["portfolio_allocation"]["total_equity_exposure"], 0.0);
@@ -179,8 +179,7 @@ orchestrator:
         "base_url": "https://llm.example.com/v1",
         "api_key": "test-key",
         "reasoning_effort": "low",
-        "think_tool": false,
-        "tools": []
+        "think_tool": false
     });
     fs::write(&config_path, serde_yaml::to_string(&config).unwrap()).unwrap();
     config_path

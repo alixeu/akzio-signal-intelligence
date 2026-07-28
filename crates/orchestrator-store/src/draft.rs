@@ -1011,7 +1011,30 @@ pub(crate) fn validate_existing_artifact_ref(
             message: "artifact header differs from pending draft scope".to_owned(),
         });
     }
+    if is_domain_profile(&expected.profile)
+        && object.get("schema_version").and_then(Value::as_u64)
+            != Some(u64::from(crate::domain::DOMAIN_ARTIFACT_SCHEMA_VERSION))
+    {
+        return Err(StoreError::InvalidDocument {
+            kind: "finalized artifact",
+            message: format!(
+                "unsupported domain artifact schema for profile {}; create a fresh FileStore run instead of migrating this Store",
+                expected.profile
+            ),
+        });
+    }
     Ok(())
+}
+
+fn is_domain_profile(profile: &str) -> bool {
+    matches!(
+        profile,
+        "analyst_report"
+            | "research_decision"
+            | "trade_intent"
+            | "risk_review"
+            | "portfolio_decision"
+    )
 }
 
 pub(crate) fn read_draft(

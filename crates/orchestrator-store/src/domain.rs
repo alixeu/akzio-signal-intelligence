@@ -25,7 +25,7 @@ use crate::{
     TradeIntentDraftEntry,
 };
 
-pub const DOMAIN_ARTIFACT_SCHEMA_VERSION: u32 = 1;
+pub const DOMAIN_ARTIFACT_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AnalystAssessmentInput {
@@ -166,55 +166,62 @@ pub struct ResearchDecisionArtifact {
     pub content_hash: String,
 }
 
+/// The one persisted envelope shared by all typed ToolManaged payloads.
+/// Profile-specific fields live exclusively in `payload`; there is no
+/// flattened compatibility layout or second identity implementation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct TradeIntentArtifact {
+pub struct CanonicalArtifact<T> {
     pub schema_version: u32,
     pub artifact_id: String,
     pub run_id: String,
     pub phase: u8,
     pub role: String,
-    pub ticker: String,
-    pub profile: String,
+    pub profile: ToolManagedProfile,
     pub unit_key: String,
+    pub ticker: Option<String>,
+    pub topic_id: Option<String>,
+    pub side: Option<String>,
+    pub stance: Option<String>,
+    pub round: Option<u32>,
     pub source_payload_hash: String,
-    pub intent: TradeIntent,
     pub evidence_refs: Vec<String>,
+    pub payload: T,
     pub created_at: String,
     pub content_hash: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RiskReviewArtifact {
-    pub schema_version: u32,
-    pub artifact_id: String,
-    pub run_id: String,
-    pub phase: u8,
-    pub role: String,
-    pub ticker: String,
-    pub profile: String,
-    pub unit_key: String,
-    pub source_payload_hash: String,
-    pub constraints: RiskConstraints,
-    pub evidence_refs: Vec<String>,
-    pub created_at: String,
-    pub content_hash: String,
-}
+pub type TradeIntentArtifact = CanonicalArtifact<TradeIntent>;
+pub type RiskReviewArtifact = CanonicalArtifact<RiskConstraints>;
+pub type PortfolioDecisionArtifact = CanonicalArtifact<FinalValidation>;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PortfolioDecisionArtifact {
-    pub schema_version: u32,
-    pub artifact_id: String,
-    pub run_id: String,
-    pub phase: u8,
-    pub role: String,
-    pub ticker: String,
-    pub profile: String,
-    pub unit_key: String,
-    pub source_payload_hash: String,
-    pub decision: FinalValidation,
-    pub evidence_refs: Vec<String>,
-    pub created_at: String,
-    pub content_hash: String,
+impl<T> CanonicalArtifact<T> {
+    fn new(
+        scope: &ArtifactScope,
+        artifact_id: String,
+        payload: T,
+        evidence_refs: Vec<String>,
+        created_at: &str,
+    ) -> Self {
+        Self {
+            schema_version: DOMAIN_ARTIFACT_SCHEMA_VERSION,
+            artifact_id,
+            run_id: scope.run_id.clone(),
+            phase: scope.phase,
+            role: scope.role.clone(),
+            profile: scope.profile,
+            unit_key: scope.unit_key.clone(),
+            ticker: scope.ticker.clone(),
+            topic_id: scope.topic_id.clone(),
+            side: scope.side.clone(),
+            stance: scope.stance.clone(),
+            round: scope.round,
+            source_payload_hash: scope.source_payload_hash.clone(),
+            evidence_refs,
+            payload,
+            created_at: created_at.to_owned(),
+            content_hash: String::new(),
+        }
+    }
 }
 
 impl ContentHashDocument for AnalystArtifact {
@@ -235,21 +242,15 @@ impl ContentHashDocument for ResearchDecisionArtifact {
     }
 }
 
-macro_rules! content_hash_document {
-    ($type:ty) => {
-        impl ContentHashDocument for $type {
-            fn content_hash(&self) -> &str {
-                &self.content_hash
-            }
-            fn set_content_hash(&mut self, hash: String) {
-                self.content_hash = hash;
-            }
-        }
-    };
+impl<T: Serialize> ContentHashDocument for CanonicalArtifact<T> {
+    fn content_hash(&self) -> &str {
+        &self.content_hash
+    }
+
+    fn set_content_hash(&mut self, hash: String) {
+        self.content_hash = hash;
+    }
 }
-content_hash_document!(TradeIntentArtifact);
-content_hash_document!(RiskReviewArtifact);
-content_hash_document!(PortfolioDecisionArtifact);
 
 impl FinalizableArtifact for AnalystArtifact {
     fn artifact_id(&self) -> &str {
@@ -269,21 +270,15 @@ impl FinalizableArtifact for ResearchDecisionArtifact {
     }
 }
 
-macro_rules! finalizable_artifact {
-    ($type:ty) => {
-        impl FinalizableArtifact for $type {
-            fn artifact_id(&self) -> &str {
-                &self.artifact_id
-            }
-            fn source_payload_hash(&self) -> &str {
-                &self.source_payload_hash
-            }
-        }
-    };
+impl<T: Serialize> FinalizableArtifact for CanonicalArtifact<T> {
+    fn artifact_id(&self) -> &str {
+        &self.artifact_id
+    }
+
+    fn source_payload_hash(&self) -> &str {
+        &self.source_payload_hash
+    }
 }
-finalizable_artifact!(TradeIntentArtifact);
-finalizable_artifact!(RiskReviewArtifact);
-finalizable_artifact!(PortfolioDecisionArtifact);
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum DomainFinalizeOutcome {
@@ -864,21 +859,13 @@ pub fn finalize_trade_intent(
         kind: "trade finalizer",
         message,
     })?;
-    let artifact = TradeIntentArtifact {
-        schema_version: DOMAIN_ARTIFACT_SCHEMA_VERSION,
-        artifact_id: artifact_id(scope, "trade-intent")?,
-        run_id: scope.run_id.clone(),
-        phase: scope.phase,
-        role: scope.role.clone(),
-        ticker: ticker.clone(),
-        profile: scope.profile.as_str().to_owned(),
-        unit_key: scope.unit_key.clone(),
-        source_payload_hash: scope.source_payload_hash.clone(),
+    let artifact = CanonicalArtifact::new(
+        scope,
+        artifact_id(scope, "trade-intent")?,
         intent,
-        evidence_refs: state.metadata.evidence_refs.into_iter().collect(),
-        created_at: created_at.to_owned(),
-        content_hash: String::new(),
-    };
+        state.metadata.evidence_refs.into_iter().collect(),
+        created_at,
+    );
     let relative = PathBuf::from("artifacts").join("phase4").join(format!(
         "{}.json",
         SafeSlug::new("ticker", &ticker)?.as_str()
@@ -1016,21 +1003,13 @@ pub fn finalize_risk_review(
         kind: "risk finalizer",
         message,
     })?;
-    let artifact = RiskReviewArtifact {
-        schema_version: DOMAIN_ARTIFACT_SCHEMA_VERSION,
-        artifact_id: artifact_id(scope, "risk-review")?,
-        run_id: scope.run_id.clone(),
-        phase: scope.phase,
-        role: scope.role.clone(),
-        ticker: ticker.clone(),
-        profile: scope.profile.as_str().to_owned(),
-        unit_key: scope.unit_key.clone(),
-        source_payload_hash: scope.source_payload_hash.clone(),
+    let artifact = CanonicalArtifact::new(
+        scope,
+        artifact_id(scope, "risk-review")?,
         constraints,
-        evidence_refs: state.metadata.evidence_refs.into_iter().collect(),
-        created_at: created_at.to_owned(),
-        content_hash: String::new(),
-    };
+        state.metadata.evidence_refs.into_iter().collect(),
+        created_at,
+    );
     let relative = PathBuf::from("artifacts")
         .join("phase5")
         .join(SafeSlug::new("role", &scope.role)?.as_str())
@@ -1188,21 +1167,13 @@ pub fn finalize_portfolio_decision(
         kind: "portfolio finalizer",
         message,
     })?;
-    let artifact = PortfolioDecisionArtifact {
-        schema_version: DOMAIN_ARTIFACT_SCHEMA_VERSION,
-        artifact_id: artifact_id(scope, "portfolio-decision")?,
-        run_id: scope.run_id.clone(),
-        phase: scope.phase,
-        role: scope.role.clone(),
-        ticker: ticker.clone(),
-        profile: scope.profile.as_str().to_owned(),
-        unit_key: scope.unit_key.clone(),
-        source_payload_hash: scope.source_payload_hash.clone(),
-        decision: validation,
-        evidence_refs: state.metadata.evidence_refs.into_iter().collect(),
-        created_at: created_at.to_owned(),
-        content_hash: String::new(),
-    };
+    let artifact = CanonicalArtifact::new(
+        scope,
+        artifact_id(scope, "portfolio-decision")?,
+        validation,
+        state.metadata.evidence_refs.into_iter().collect(),
+        created_at,
+    );
     let relative = PathBuf::from("artifacts").join("phase6").join(format!(
         "{}.json",
         SafeSlug::new("ticker", &ticker)?.as_str()
@@ -1584,8 +1555,8 @@ mod tests {
         let FinalizeDraftOutcome::Completed { artifact, .. } = *outcome else {
             panic!("expected new artifact");
         };
-        assert_eq!(artifact.constraints.stance, "neutral");
-        assert_eq!(artifact.constraints.stop_type, StopType::Hard);
+        assert_eq!(artifact.payload.stance, "neutral");
+        assert_eq!(artifact.payload.stop_type, StopType::Hard);
     }
 
     #[test]

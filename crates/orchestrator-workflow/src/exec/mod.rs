@@ -323,7 +323,13 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         "debate_mode": "file_store",
         "degraded": state["degraded"],
         "rating": state.pointer("/research_plan/rating").cloned().unwrap_or(Value::Null),
-        "action": state.pointer("/trader_investment_plan/intent/action").cloned().unwrap_or(Value::Null),
+        "action": tickers_from_state(&state)
+            .first()
+            .and_then(|ticker| {
+                state.pointer(&format!("/trader_investment_plan/per_ticker/{ticker}/payload/action"))
+            })
+            .cloned()
+            .unwrap_or(Value::Null),
         "portfolio_allocation": state.get("portfolio_allocation").cloned().unwrap_or(Value::Null),
         "run_state": state,
     }))

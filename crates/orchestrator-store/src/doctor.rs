@@ -1174,7 +1174,7 @@ mod tests {
             &scope,
             Path::new("artifacts/phase1/QQQ.json"),
             TestArtifact {
-                schema_version: 1,
+                schema_version: crate::domain::DOMAIN_ARTIFACT_SCHEMA_VERSION,
                 artifact_id: "artifact-QQQ".to_owned(),
                 phase: 1,
                 role: "analyst.technical".to_owned(),

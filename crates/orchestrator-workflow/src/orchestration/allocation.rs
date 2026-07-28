@@ -84,13 +84,22 @@ pub(crate) fn compute_allocation_context(
         Some(_) => "相关性适中",
         None => "相关性数据不足",
     };
+    let trader_plan = investable
+        .first()
+        .and_then(|ticker| {
+            state.pointer(&format!(
+                "/trader_investment_plan/per_ticker/{ticker}/payload"
+            ))
+        })
+        .cloned()
+        .unwrap_or(Value::Null);
 
     Ok(json!({
         "investable_assets": investable,
         "vix": vix_info,
         "per_ticker": per_ticker,
         "research_plan": state.get("research_plan").cloned().unwrap_or(Value::Null),
-        "trader_plan": state.get("trader_investment_plan").cloned().unwrap_or(Value::Null),
+        "trader_plan": trader_plan,
         "risk_debate_state": state.get("risk_debate_state").cloned().unwrap_or(Value::Null),
         "final_trade_decision": state.get("final_trade_decision").cloned().unwrap_or(Value::Null),
         "correlation_60d": correlation_60d,
@@ -559,7 +568,8 @@ fn active_risk_position_cap(context: &Value) -> Option<f64> {
         .chain(history)
         .chain(constraints)
         .filter(|artifact| !risk_artifact_is_degraded(artifact))
-        .filter_map(|artifact| artifact.get("position_cap_pct"))
+        .filter_map(|artifact| artifact.get("payload"))
+        .filter_map(|payload| payload.get("position_cap_pct"))
         .filter_map(position_fraction)
         .min_by(f64::total_cmp)
 }
@@ -963,9 +973,11 @@ mod tests {
                     "role": "risk.conservative",
                     "artifact": {
                         "status": "completed",
+                        "payload": {
                         "stance": "conditional",
                         "recommended_adjustment": "cap each position",
                         "position_cap_pct": 0.25
+                        }
                     }
                 }
             ]
@@ -996,9 +1008,11 @@ mod tests {
                 {
                     "artifact": {
                         "status": "completed",
+                        "payload": {
                         "stance": "conditional",
                         "recommended_adjustment": "cap each position",
                         "position_cap_pct": 0.15
+                        }
                     }
                 }
             ]
@@ -1021,8 +1035,10 @@ mod tests {
         context["risk_debate_state"] = json!({
             "history": [{"artifact": {
                 "status": "completed",
+                "payload": {
                 "stance": "conservative",
                 "position_cap_pct": 0.0
+                }
             }}]
         });
 
@@ -1055,8 +1071,10 @@ mod tests {
         context["risk_debate_state"] = json!({
             "history": [{"artifact": {
                 "status": "completed",
+                "payload": {
                 "stance": "conservative",
                 "position_cap_pct": 0.0
+                }
             }}]
         });
 
