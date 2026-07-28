@@ -460,17 +460,6 @@ fn risk_assessment(risk_state: &Value, allocation: &Value) -> String {
             }
         }
     }
-    // FinalValidation.risk_controls is a Vec<String> of risk controls.
-    if risks.is_empty() {
-        if let Some(controls) = risk_state.get("risk_controls").and_then(Value::as_array) {
-            for control in controls {
-                if let Some(text) = control.as_str() {
-                    risks.push(text.to_string());
-                }
-            }
-        }
-    }
-
     if risks.is_empty() {
         section.push_str("- No specific risks identified.\n");
     } else {
@@ -757,8 +746,7 @@ mod tests {
                 "rating": "Buy",
                 "horizon": "1-5 trading days",
                 "investment_thesis": "Bullish momentum with controlled risk.",
-                "execution_summary": "Buy 30%-50% with stop at 42.50.",
-                "risk_controls": ["Stop at 42.50", "Max 60% equity exposure"]
+                "execution_summary": "Buy 30%-50% with stop at 42.50."
             },
             "portfolio_allocation": {
                 "weights": {

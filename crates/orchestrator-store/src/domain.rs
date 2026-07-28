@@ -1181,7 +1181,6 @@ pub fn finalize_portfolio_decision(
         investment_thesis: decision.investment_thesis,
         target_price: decision.target_price,
         horizon: decision.horizon,
-        risk_controls: Vec::new(),
         rationale: decision.rationale,
         per_asset,
     };

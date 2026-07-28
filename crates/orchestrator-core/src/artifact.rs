@@ -187,8 +187,6 @@ pub struct FinalValidation {
     #[serde(default)]
     pub horizon: String,
     #[serde(default)]
-    pub risk_controls: Vec<String>,
-    #[serde(default)]
     pub rationale: String,
     /// Per-asset semantic constraints for Rust-owned allocation and execution.
     #[serde(default)]
