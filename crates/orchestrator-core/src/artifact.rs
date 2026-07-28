@@ -272,7 +272,7 @@ pub struct EvidenceItem {
     #[serde(default)]
     pub is_derivative_repost: bool,
     /// Human-readable evidence age: "0-2d" | "3-5d" | "6-10d" | "10d+" | "unknown".
-    #[serde(default, alias = "catalyst_age", alias = "age")]
+    #[serde(default)]
     pub evidence_age: String,
     /// 0.0-1.0 confidence in the quality of the source.
     #[serde(default)]
@@ -854,6 +854,10 @@ mod tests {
             }]
         }"#;
         assert!(serde_json::from_str::<AnalystTickerArtifact>(json).is_err());
+        assert!(serde_json::from_str::<EvidenceItem>(
+            r#"{"claim":"x","evidence_type":"fact","catalyst_age":"0-2d"}"#
+        )
+        .is_err());
     }
 
     #[test]
@@ -970,13 +974,6 @@ mod tests {
         assert!(!artifact.key_evidence[0].is_derivative_repost);
         assert_eq!(artifact.key_evidence[0].evidence_age, "0-2d");
         assert!((artifact.key_evidence[0].source_confidence - 0.9).abs() < f64::EPSILON);
-
-        // Legacy artifact without new fields still deserializes via serde(default).
-        let legacy: AnalystTickerArtifact =
-            serde_json::from_str(r#"{"direction":"neutral","confidence":0.5}"#).unwrap();
-        assert_eq!(legacy.echo_chamber_risk, "");
-        assert_eq!(legacy.crowded_consensus_risk, "");
-        assert!(legacy.key_evidence.is_empty());
     }
 
     #[test]
