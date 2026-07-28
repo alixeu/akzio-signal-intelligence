@@ -7,8 +7,8 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use thiserror::Error;
 
-pub const AUTHORITY_REGISTRY_SCHEMA_VERSION: u32 = 1;
-pub const BUILTIN_AUTHORITY_REGISTRY_VERSION: u32 = 1;
+pub const ROLE_PROFILE_REGISTRY_SCHEMA_VERSION: u32 = 1;
+pub const BUILTIN_ROLE_PROFILE_REGISTRY_VERSION: u32 = 1;
 
 /// The typed output contract a role is being migrated to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -87,7 +87,7 @@ impl RoleProfileKey {
 /// `tool_allowlist` is sorted and duplicate-free by construction; this makes
 /// its serialized form stable for run-manifest snapshots and hashes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AuthorityRegistration {
+pub struct RoleProfileRegistration {
     pub role_id: String,
     pub profile: ToolManagedProfile,
     pub profile_version: u32,
@@ -96,7 +96,7 @@ pub struct AuthorityRegistration {
     pub tool_allowlist: Vec<String>,
 }
 
-impl AuthorityRegistration {
+impl RoleProfileRegistration {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         role_id: impl Into<String>,
@@ -105,7 +105,7 @@ impl AuthorityRegistration {
         builder_version: u32,
         unit_planner: UnitPlanner,
         tool_allowlist: impl IntoIterator<Item = impl Into<String>>,
-    ) -> Result<Self, AuthorityRegistryError> {
+    ) -> Result<Self, RoleProfileRegistryError> {
         let role_id = role_id.into();
         let mut tool_allowlist = tool_allowlist
             .into_iter()
@@ -113,7 +113,7 @@ impl AuthorityRegistration {
             .collect::<Vec<String>>();
         tool_allowlist.sort();
         if tool_allowlist.windows(2).any(|pair| pair[0] == pair[1]) {
-            return Err(AuthorityRegistryError::DuplicateTool {
+            return Err(RoleProfileRegistryError::DuplicateTool {
                 role_id: role_id.clone(),
                 profile,
                 tool: tool_allowlist
@@ -146,22 +146,22 @@ impl AuthorityRegistration {
             .is_ok()
     }
 
-    pub fn validate(&self) -> Result<(), AuthorityRegistryError> {
+    pub fn validate(&self) -> Result<(), RoleProfileRegistryError> {
         validate_role_id(&self.role_id)?;
         if self.profile_version == 0 {
-            return Err(AuthorityRegistryError::ZeroProfileVersion {
+            return Err(RoleProfileRegistryError::ZeroProfileVersion {
                 role_id: self.role_id.clone(),
                 profile: self.profile,
             });
         }
         if self.builder_version == 0 {
-            return Err(AuthorityRegistryError::ZeroBuilderVersion {
+            return Err(RoleProfileRegistryError::ZeroBuilderVersion {
                 role_id: self.role_id.clone(),
                 profile: self.profile,
             });
         }
         if self.tool_allowlist.is_empty() {
-            return Err(AuthorityRegistryError::EmptyToolAllowlist {
+            return Err(RoleProfileRegistryError::EmptyToolAllowlist {
                 role_id: self.role_id.clone(),
                 profile: self.profile,
             });
@@ -171,7 +171,7 @@ impl AuthorityRegistration {
         }
         for pair in self.tool_allowlist.windows(2) {
             if pair[0] >= pair[1] {
-                return Err(AuthorityRegistryError::NonCanonicalToolAllowlist {
+                return Err(RoleProfileRegistryError::NonCanonicalToolAllowlist {
                     role_id: self.role_id.clone(),
                     profile: self.profile,
                 });
@@ -183,28 +183,28 @@ impl AuthorityRegistration {
 
 /// Persistable, deterministic role-profile snapshot for a run manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AuthorityRegistrySnapshot {
+pub struct RoleProfileRegistrySnapshot {
     pub schema_version: u32,
     pub registry_version: u32,
-    pub registrations: Vec<AuthorityRegistration>,
+    pub registrations: Vec<RoleProfileRegistration>,
     pub content_hash: String,
 }
 
-impl AuthorityRegistrySnapshot {
-    pub fn verify(&self) -> Result<(), AuthorityRegistryError> {
-        if self.schema_version != AUTHORITY_REGISTRY_SCHEMA_VERSION {
-            return Err(AuthorityRegistryError::UnsupportedSnapshotSchema {
+impl RoleProfileRegistrySnapshot {
+    pub fn verify(&self) -> Result<(), RoleProfileRegistryError> {
+        if self.schema_version != ROLE_PROFILE_REGISTRY_SCHEMA_VERSION {
+            return Err(RoleProfileRegistryError::UnsupportedSnapshotSchema {
                 found: self.schema_version,
-                supported: AUTHORITY_REGISTRY_SCHEMA_VERSION,
+                supported: ROLE_PROFILE_REGISTRY_SCHEMA_VERSION,
             });
         }
-        let registry = AuthorityRegistry::from_registrations(
+        let registry = RoleProfileRegistry::from_registrations(
             self.registry_version,
             self.registrations.clone(),
         )?;
         let expected = registry.snapshot().content_hash;
         if self.content_hash != expected {
-            return Err(AuthorityRegistryError::SnapshotHashMismatch {
+            return Err(RoleProfileRegistryError::SnapshotHashMismatch {
                 expected,
                 found: self.content_hash.clone(),
             });
@@ -216,15 +216,15 @@ impl AuthorityRegistrySnapshot {
 /// A deterministic map of exact role/profile mappings. The registry exposes
 /// no fallback resolution API by design.
 #[derive(Debug, Clone)]
-pub struct AuthorityRegistry {
+pub struct RoleProfileRegistry {
     registry_version: u32,
-    registrations: BTreeMap<RoleProfileKey, AuthorityRegistration>,
+    registrations: BTreeMap<RoleProfileKey, RoleProfileRegistration>,
 }
 
-impl AuthorityRegistry {
-    pub fn new(registry_version: u32) -> Result<Self, AuthorityRegistryError> {
+impl RoleProfileRegistry {
+    pub fn new(registry_version: u32) -> Result<Self, RoleProfileRegistryError> {
         if registry_version == 0 {
-            return Err(AuthorityRegistryError::ZeroRegistryVersion);
+            return Err(RoleProfileRegistryError::ZeroRegistryVersion);
         }
         Ok(Self {
             registry_version,
@@ -440,21 +440,21 @@ impl AuthorityRegistry {
                 &["append_index_detail", "create_index", "finalize_index"],
             ),
         ];
-        Self::from_registrations(BUILTIN_AUTHORITY_REGISTRY_VERSION, registrations)
+        Self::from_registrations(BUILTIN_ROLE_PROFILE_REGISTRY_VERSION, registrations)
             .expect("builtin authority registry must be valid")
     }
 
     pub fn from_snapshot(
-        snapshot: AuthorityRegistrySnapshot,
-    ) -> Result<Self, AuthorityRegistryError> {
+        snapshot: RoleProfileRegistrySnapshot,
+    ) -> Result<Self, RoleProfileRegistryError> {
         snapshot.verify()?;
         Self::from_registrations(snapshot.registry_version, snapshot.registrations)
     }
 
     pub fn from_registrations(
         registry_version: u32,
-        registrations: impl IntoIterator<Item = AuthorityRegistration>,
-    ) -> Result<Self, AuthorityRegistryError> {
+        registrations: impl IntoIterator<Item = RoleProfileRegistration>,
+    ) -> Result<Self, RoleProfileRegistryError> {
         let mut registry = Self::new(registry_version)?;
         for registration in registrations {
             registry.register(registration)?;
@@ -468,12 +468,12 @@ impl AuthorityRegistry {
 
     pub fn register(
         &mut self,
-        registration: AuthorityRegistration,
-    ) -> Result<(), AuthorityRegistryError> {
+        registration: RoleProfileRegistration,
+    ) -> Result<(), RoleProfileRegistryError> {
         registration.validate()?;
         let key = registration.key();
         if self.registrations.contains_key(&key) {
-            return Err(AuthorityRegistryError::DuplicateRegistration {
+            return Err(RoleProfileRegistryError::DuplicateRegistration {
                 role_id: key.role_id,
                 profile: key.profile,
             });
@@ -486,10 +486,10 @@ impl AuthorityRegistry {
         &self,
         role_id: &str,
         profile: ToolManagedProfile,
-    ) -> Result<&AuthorityRegistration, AuthorityRegistryError> {
+    ) -> Result<&RoleProfileRegistration, RoleProfileRegistryError> {
         self.registrations
             .get(&RoleProfileKey::new(role_id, profile))
-            .ok_or_else(|| AuthorityRegistryError::MissingRegistration {
+            .ok_or_else(|| RoleProfileRegistryError::MissingRegistration {
                 role_id: role_id.to_string(),
                 profile,
             })
@@ -500,17 +500,17 @@ impl AuthorityRegistry {
         role_id: &str,
         profile: ToolManagedProfile,
         tool_name: &str,
-    ) -> Result<bool, AuthorityRegistryError> {
+    ) -> Result<bool, RoleProfileRegistryError> {
         Ok(self.registration(role_id, profile)?.allows_tool(tool_name))
     }
 
-    pub fn registrations(&self) -> impl Iterator<Item = &AuthorityRegistration> {
+    pub fn registrations(&self) -> impl Iterator<Item = &RoleProfileRegistration> {
         self.registrations.values()
     }
 
-    pub fn validate(&self) -> Result<(), AuthorityRegistryError> {
+    pub fn validate(&self) -> Result<(), RoleProfileRegistryError> {
         if self.registry_version == 0 {
-            return Err(AuthorityRegistryError::ZeroRegistryVersion);
+            return Err(RoleProfileRegistryError::ZeroRegistryVersion);
         }
         for registration in self.registrations.values() {
             registration.validate()?;
@@ -518,13 +518,13 @@ impl AuthorityRegistry {
         Ok(())
     }
 
-    pub fn snapshot(&self) -> AuthorityRegistrySnapshot {
+    pub fn snapshot(&self) -> RoleProfileRegistrySnapshot {
         self.validate()
             .expect("authority registry must be valid before snapshotting");
         let registrations = self.registrations.values().cloned().collect::<Vec<_>>();
         let content_hash = snapshot_content_hash(self.registry_version, &registrations);
-        AuthorityRegistrySnapshot {
-            schema_version: AUTHORITY_REGISTRY_SCHEMA_VERSION,
+        RoleProfileRegistrySnapshot {
+            schema_version: ROLE_PROFILE_REGISTRY_SCHEMA_VERSION,
             registry_version: self.registry_version,
             registrations,
             content_hash,
@@ -537,26 +537,26 @@ fn registration(
     profile: ToolManagedProfile,
     unit_planner: UnitPlanner,
     tools: &[&str],
-) -> AuthorityRegistration {
-    AuthorityRegistration::new(role_id, profile, 1, 1, unit_planner, tools.iter().copied())
+) -> RoleProfileRegistration {
+    RoleProfileRegistration::new(role_id, profile, 1, 1, unit_planner, tools.iter().copied())
         .expect("builtin authority registration must be valid")
 }
 
-fn validate_role_id(role_id: &str) -> Result<(), AuthorityRegistryError> {
+fn validate_role_id(role_id: &str) -> Result<(), RoleProfileRegistryError> {
     if role_id.is_empty() || role_id != role_id.trim() {
-        return Err(AuthorityRegistryError::InvalidRoleId {
+        return Err(RoleProfileRegistryError::InvalidRoleId {
             role_id: role_id.to_string(),
         });
     }
     if role_id.starts_with('.') || role_id.ends_with('.') || role_id.split('.').any(str::is_empty) {
-        return Err(AuthorityRegistryError::InvalidRoleId {
+        return Err(RoleProfileRegistryError::InvalidRoleId {
             role_id: role_id.to_string(),
         });
     }
     if !role_id.bytes().all(|byte| {
         byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
     }) {
-        return Err(AuthorityRegistryError::InvalidRoleId {
+        return Err(RoleProfileRegistryError::InvalidRoleId {
             role_id: role_id.to_string(),
         });
     }
@@ -567,13 +567,13 @@ fn validate_tool_name(
     tool_name: &str,
     role_id: &str,
     profile: ToolManagedProfile,
-) -> Result<(), AuthorityRegistryError> {
+) -> Result<(), RoleProfileRegistryError> {
     if tool_name.is_empty()
         || !tool_name
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
     {
-        return Err(AuthorityRegistryError::InvalidToolName {
+        return Err(RoleProfileRegistryError::InvalidToolName {
             role_id: role_id.to_string(),
             profile,
             tool_name: tool_name.to_string(),
@@ -582,16 +582,19 @@ fn validate_tool_name(
     Ok(())
 }
 
-fn snapshot_content_hash(registry_version: u32, registrations: &[AuthorityRegistration]) -> String {
+fn snapshot_content_hash(
+    registry_version: u32,
+    registrations: &[RoleProfileRegistration],
+) -> String {
     #[derive(Serialize)]
     struct SnapshotPayload<'a> {
         schema_version: u32,
         registry_version: u32,
-        registrations: &'a [AuthorityRegistration],
+        registrations: &'a [RoleProfileRegistration],
     }
 
     let bytes = serde_json::to_vec(&SnapshotPayload {
-        schema_version: AUTHORITY_REGISTRY_SCHEMA_VERSION,
+        schema_version: ROLE_PROFILE_REGISTRY_SCHEMA_VERSION,
         registry_version,
         registrations,
     })
@@ -600,7 +603,7 @@ fn snapshot_content_hash(registry_version: u32, registrations: &[AuthorityRegist
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
-pub enum AuthorityRegistryError {
+pub enum RoleProfileRegistryError {
     #[error("authority registry version must be positive")]
     ZeroRegistryVersion,
     #[error("invalid authority role id {role_id:?}")]
@@ -661,7 +664,7 @@ mod tests {
 
     #[test]
     fn builtin_registry_covers_each_current_agent_role_profile_exactly_once() {
-        let registry = AuthorityRegistry::builtin();
+        let registry = RoleProfileRegistry::builtin();
         assert_eq!(registry.registrations().count(), 17);
         assert!(registry
             .registration("researcher.bull.initial", ToolManagedProfile::DebateSeed)
@@ -676,7 +679,7 @@ mod tests {
 
     #[test]
     fn registry_rejects_duplicate_exact_mapping() {
-        let registration = AuthorityRegistration::new(
+        let registration = RoleProfileRegistration::new(
             "analyst.test",
             ToolManagedProfile::AnalystReport,
             1,
@@ -685,17 +688,17 @@ mod tests {
             ["finalize_analyst_report"],
         )
         .unwrap();
-        let err = AuthorityRegistry::from_registrations(1, [registration.clone(), registration])
+        let err = RoleProfileRegistry::from_registrations(1, [registration.clone(), registration])
             .unwrap_err();
         assert!(matches!(
             err,
-            AuthorityRegistryError::DuplicateRegistration { .. }
+            RoleProfileRegistryError::DuplicateRegistration { .. }
         ));
     }
 
     #[test]
     fn registration_rejects_duplicate_or_invalid_tools() {
-        let err = AuthorityRegistration::new(
+        let err = RoleProfileRegistration::new(
             "analyst.test",
             ToolManagedProfile::AnalystReport,
             1,
@@ -704,9 +707,12 @@ mod tests {
             ["set_analyst_assessment", "set_analyst_assessment"],
         )
         .unwrap_err();
-        assert!(matches!(err, AuthorityRegistryError::DuplicateTool { .. }));
+        assert!(matches!(
+            err,
+            RoleProfileRegistryError::DuplicateTool { .. }
+        ));
 
-        let err = AuthorityRegistration::new(
+        let err = RoleProfileRegistration::new(
             "analyst.test",
             ToolManagedProfile::AnalystReport,
             1,
@@ -717,13 +723,13 @@ mod tests {
         .unwrap_err();
         assert!(matches!(
             err,
-            AuthorityRegistryError::InvalidToolName { .. }
+            RoleProfileRegistryError::InvalidToolName { .. }
         ));
     }
 
     #[test]
     fn direct_deserialization_must_keep_tool_allowlist_canonical() {
-        let registration = AuthorityRegistration {
+        let registration = RoleProfileRegistration {
             role_id: "analyst.test".to_string(),
             profile: ToolManagedProfile::AnalystReport,
             profile_version: 1,
@@ -737,20 +743,20 @@ mod tests {
         let err = registration.validate().unwrap_err();
         assert!(matches!(
             err,
-            AuthorityRegistryError::NonCanonicalToolAllowlist { .. }
+            RoleProfileRegistryError::NonCanonicalToolAllowlist { .. }
         ));
     }
 
     #[test]
     fn snapshot_is_stable_and_verifies_after_round_trip() {
-        let registry = AuthorityRegistry::builtin();
+        let registry = RoleProfileRegistry::builtin();
         let first = registry.snapshot();
         let encoded = serde_json::to_string(&first).unwrap();
-        let decoded: AuthorityRegistrySnapshot = serde_json::from_str(&encoded).unwrap();
+        let decoded: RoleProfileRegistrySnapshot = serde_json::from_str(&encoded).unwrap();
         decoded.verify().unwrap();
         assert_eq!(first, registry.snapshot());
         assert_eq!(
-            AuthorityRegistry::from_snapshot(decoded)
+            RoleProfileRegistry::from_snapshot(decoded)
                 .unwrap()
                 .snapshot(),
             first
@@ -759,18 +765,18 @@ mod tests {
 
     #[test]
     fn snapshot_hash_detects_authority_drift() {
-        let mut snapshot = AuthorityRegistry::builtin().snapshot();
+        let mut snapshot = RoleProfileRegistry::builtin().snapshot();
         snapshot.registrations[0].profile_version = 2;
         let err = snapshot.verify().unwrap_err();
         assert!(matches!(
             err,
-            AuthorityRegistryError::SnapshotHashMismatch { .. }
+            RoleProfileRegistryError::SnapshotHashMismatch { .. }
         ));
     }
 
     #[test]
     fn tool_permission_is_exact() {
-        let registry = AuthorityRegistry::builtin();
+        let registry = RoleProfileRegistry::builtin();
         assert!(registry
             .tool_is_allowed(
                 "trader",

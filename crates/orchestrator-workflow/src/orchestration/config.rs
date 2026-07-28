@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use orchestrator_core::{
     config_bool, config_get, config_int, config_str, config_strings, project_path,
-    AuthorityRegistry,
+    RoleProfileRegistry,
 };
 use orchestrator_llm::{
     truncation::TruncationConfig,
@@ -39,7 +39,7 @@ pub(crate) struct RuntimeConfig {
     pub component_plugins: ComponentRegistry,
     /// Immutable FileStore ownership for every role/profile, captured in the
     /// run manifest before recovery is permitted.
-    pub authority_registry: AuthorityRegistry,
+    pub role_profile_registry: RoleProfileRegistry,
 }
 
 #[derive(Debug, Clone)]
@@ -446,7 +446,7 @@ impl RuntimeConfig {
             config.truncation = truncation.clone();
         }
         let workflow = WorkflowConfig::from_value(config);
-        let authority_registry = AuthorityRegistry::builtin();
+        let role_profile_registry = RoleProfileRegistry::builtin();
         let alpaca_api_key = config_str(config, "orchestrator.alpaca.api_key", "")
             .trim()
             .to_string();
@@ -469,7 +469,7 @@ impl RuntimeConfig {
             store: StoreConfig::from_value(config)?,
             tool_managed: ToolManagedConfig::from_value(config)?,
             component_plugins,
-            authority_registry,
+            role_profile_registry,
         })
     }
 }

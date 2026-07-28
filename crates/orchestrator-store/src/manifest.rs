@@ -196,7 +196,7 @@ pub struct RunManifestInit {
     pub prompt_versions: BTreeMap<String, String>,
     pub git_sha: String,
     pub config_hash: String,
-    pub authority_registry_hash: String,
+    pub role_profile_registry_hash: String,
     pub created_at: String,
 }
 
@@ -212,7 +212,7 @@ pub struct RunManifest {
     pub prompt_versions: BTreeMap<String, String>,
     pub git_sha: String,
     pub config_hash: String,
-    pub authority_registry_hash: String,
+    pub role_profile_registry_hash: String,
     pub degraded: bool,
     pub errors: Vec<ManifestError>,
     pub artifacts: BTreeMap<String, FinalizedArtifactRef>,
@@ -228,7 +228,10 @@ impl RunManifest {
             ("workflow_version", &init.workflow_version),
             ("git_sha", &init.git_sha),
             ("config_hash", &init.config_hash),
-            ("authority_registry_hash", &init.authority_registry_hash),
+            (
+                "role_profile_registry_hash",
+                &init.role_profile_registry_hash,
+            ),
             ("created_at", &init.created_at),
         ] {
             if value.is_empty() {
@@ -249,7 +252,7 @@ impl RunManifest {
             prompt_versions: init.prompt_versions,
             git_sha: init.git_sha,
             config_hash: init.config_hash,
-            authority_registry_hash: init.authority_registry_hash,
+            role_profile_registry_hash: init.role_profile_registry_hash,
             degraded: false,
             errors: Vec::new(),
             artifacts: BTreeMap::new(),
@@ -517,7 +520,7 @@ mod tests {
             prompt_versions: BTreeMap::new(),
             git_sha: "deadbeef".to_owned(),
             config_hash: "sha256:config".to_owned(),
-            authority_registry_hash: "sha256:authority".to_owned(),
+            role_profile_registry_hash: "sha256:authority".to_owned(),
             created_at: "2026-07-27T00:00:00Z".to_owned(),
         })
         .unwrap()

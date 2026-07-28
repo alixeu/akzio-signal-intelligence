@@ -42,7 +42,7 @@ enum Command {
         #[arg(long)]
         config_hash: String,
         #[arg(long)]
-        authority_registry_hash: String,
+        role_profile_registry_hash: String,
         #[arg(long)]
         created_at: String,
     },
@@ -83,7 +83,7 @@ fn main() -> Result<()> {
             workflow_version,
             git_sha,
             config_hash,
-            authority_registry_hash,
+            role_profile_registry_hash,
             created_at,
         } => {
             let location = RunLocation::new(workflow_date, run_id)?;
@@ -95,7 +95,7 @@ fn main() -> Result<()> {
                     prompt_versions: BTreeMap::new(),
                     git_sha,
                     config_hash,
-                    authority_registry_hash,
+                    role_profile_registry_hash,
                     created_at,
                 },
             )?)?

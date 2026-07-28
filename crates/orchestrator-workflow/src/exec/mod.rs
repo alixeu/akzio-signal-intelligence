@@ -294,7 +294,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             prompt_versions: manifest.prompt_versions.clone(),
             git_sha: manifest.git_sha.clone(),
             config_hash: manifest.config_hash.clone(),
-            authority_registry_hash: manifest.authority_registry_hash.clone(),
+            role_profile_registry_hash: manifest.role_profile_registry_hash.clone(),
             created_at: manifest.created_at.clone(),
         },
     )?;
@@ -348,7 +348,7 @@ fn prepare_manifest(
         }
         return Ok(manifest);
     }
-    let snapshot = runtime.authority_registry.snapshot();
+    let snapshot = runtime.role_profile_registry.snapshot();
     write_run_manifest(
         store,
         location,
@@ -358,7 +358,7 @@ fn prepare_manifest(
             prompt_versions: runtime.prompts.versions.clone(),
             git_sha: option_env!("GIT_SHA").unwrap_or("unavailable").to_owned(),
             config_hash: content_hash(config)?,
-            authority_registry_hash: snapshot.content_hash,
+            role_profile_registry_hash: snapshot.content_hash,
             created_at: Utc::now().to_rfc3339(),
         })?,
     )
@@ -1339,7 +1339,7 @@ fn finalize_degraded_tool_managed_unit(
             )
         }
     };
-    let registration = runtime.authority_registry.registration(role, profile)?;
+    let registration = runtime.role_profile_registry.registration(role, profile)?;
     let tickers = ticker
         .map(|ticker| vec![ticker.to_owned()])
         .unwrap_or_else(|| tickers_from_state(state));
@@ -1757,7 +1757,7 @@ mod phase2_session_tests {
             prompt_versions: Default::default(),
             git_sha: "test".to_owned(),
             config_hash: "test".to_owned(),
-            authority_registry_hash: "test".to_owned(),
+            role_profile_registry_hash: "test".to_owned(),
             created_at: "2026-07-27T00:00:00Z".to_owned(),
         })
         .unwrap();
@@ -1783,7 +1783,7 @@ mod phase2_session_tests {
             prompt_versions: Default::default(),
             git_sha: "test".to_owned(),
             config_hash: "test".to_owned(),
-            authority_registry_hash: "test".to_owned(),
+            role_profile_registry_hash: "test".to_owned(),
             created_at: "2026-07-27T00:00:00Z".to_owned(),
         })
         .unwrap();

@@ -190,7 +190,7 @@ mod tests {
             prompt_versions: BTreeMap::new(),
             git_sha: "deadbeef".to_owned(),
             config_hash: "sha256:config".to_owned(),
-            authority_registry_hash: "sha256:authority".to_owned(),
+            role_profile_registry_hash: "sha256:authority".to_owned(),
             created_at: "2026-07-27T00:00:00Z".to_owned(),
         };
         let reference = FinalizedArtifactRef::new(

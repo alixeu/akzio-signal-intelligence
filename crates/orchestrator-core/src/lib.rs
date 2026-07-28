@@ -20,9 +20,9 @@ pub use artifact::{
     StopType, TradeIntent, ValidationError, CANONICAL_EVIDENCE_TYPES,
 };
 pub use authority::{
-    AuthorityRegistration, AuthorityRegistry, AuthorityRegistryError, AuthorityRegistrySnapshot,
-    RoleProfileKey, ToolManagedProfile, UnitPlanner, AUTHORITY_REGISTRY_SCHEMA_VERSION,
-    BUILTIN_AUTHORITY_REGISTRY_VERSION,
+    RoleProfileKey, RoleProfileRegistration, RoleProfileRegistry, RoleProfileRegistryError,
+    RoleProfileRegistrySnapshot, ToolManagedProfile, UnitPlanner,
+    BUILTIN_ROLE_PROFILE_REGISTRY_VERSION, ROLE_PROFILE_REGISTRY_SCHEMA_VERSION,
 };
 pub use config::{
     config_bool, config_float, config_get, config_int, config_str, config_strings, deep_merge,

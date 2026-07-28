@@ -268,7 +268,7 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
     let (tool_managed_profile, index_tool_runtime, domain_tool_runtime, file_store_input) = {
         let profile = candidate_tool_managed_profile
             .with_context(|| format!("missing ToolManaged profile for role={role} kind={kind}"))?;
-        let registration = config.authority_registry.registration(role, profile)?;
+        let registration = config.role_profile_registry.registration(role, profile)?;
         let store_root = state
             .get("store_root")
             .and_then(Value::as_str)
