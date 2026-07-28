@@ -7,7 +7,7 @@ use orchestrator_llm::{
         FileStoreSessionRuntime, ModelStreamResult, RetrievalPolicy, SessionRuntimeSpec,
         TokenUsage, ToolResultItem, Turn,
     },
-    mock_role_artifact, run_agent_loop_with_metrics,
+    run_agent_loop_with_metrics,
     tools::{ExternalToolConfig, FileStoreInputSnapshot},
     truncation::TruncationConfig,
     AgentLoopOutput, AgentSettings, RoleLlmSettings,
@@ -1366,41 +1366,10 @@ async fn execute_role_job(job: RoleJob) -> Result<AgentLoopOutput> {
         if let Some(binding) = job.index_tool_runtime.clone() {
             return mock_index_tool_managed_output(job, binding);
         }
-        debug!(
-            role = job.role,
-            phase = job.phase,
-            kind = job.kind,
-            "using mock artifact"
+        bail!(
+            "mock ToolManaged role {} has no typed Index or Domain runtime binding",
+            job.role
         );
-        let mut artifact = mock_role_artifact(&job.role, &job.tickers);
-        artifact["retrieval_audit"] = json!({
-            "status": "not_applicable",
-            "source": "mock_runtime",
-            "summary_query_count": 0,
-            "detail_call_count": 0
-        });
-        artifact["context_manifest"] = job.context_manifest;
-        artifact["phase"] = Value::Number(job.phase.into());
-        artifact["kind"] = Value::String(job.kind);
-        if let Some(round) = job.round {
-            artifact["round"] = Value::Number(round.into());
-        }
-        if let Some(topic_id) = job.topic_id {
-            artifact["topic_id"] = Value::String(topic_id);
-        }
-        if let Some(path) = job.prompt_path {
-            artifact["prompt_path"] = Value::String(path);
-        }
-        if let Some(version) = job.prompt_version {
-            artifact["prompt_version"] = Value::String(version);
-        }
-        return Ok(AgentLoopOutput {
-            artifact,
-            terminal_tool_result: None,
-            metrics: ModelStreamResult::default(),
-            turn_id: String::new(),
-            session_id: String::new(),
-        });
     }
     let llm = job
         .llm
