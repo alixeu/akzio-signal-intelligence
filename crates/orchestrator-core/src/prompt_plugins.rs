@@ -3,7 +3,7 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use crate::plugin_manifest::{ComponentManifest, RoleManifest};
+use crate::plugin_manifest::ComponentManifest;
 use crate::prompt::render_template;
 
 pub const KNOWN_RENDER_VARIABLES: &[&str] = &[
@@ -58,19 +58,6 @@ pub struct ComponentRegistry {
 #[derive(Debug, Clone)]
 pub struct ComponentPlugin {
     pub manifest: ComponentManifest,
-    pub template: String,
-    pub path: PathBuf,
-}
-
-/// Discovered role plugins, keyed by role_id.
-#[derive(Debug, Clone, Default)]
-pub struct RolePluginRegistry {
-    pub roles: BTreeMap<String, RolePlugin>,
-}
-
-#[derive(Debug, Clone)]
-pub struct RolePlugin {
-    pub manifest: RoleManifest,
     pub template: String,
     pub path: PathBuf,
 }
@@ -225,82 +212,10 @@ impl ComponentRegistry {
         }
         Ok(())
     }
-
-    pub fn validate_role_dependencies(&self, roles: &RolePluginRegistry) -> Result<()> {
-        for role in roles.roles.values() {
-            role.validate_components(self)?;
-        }
-        Ok(())
-    }
 }
 
-impl RolePluginRegistry {
-    /// Scan `prompts/roles/` for subdirectories containing `manifest.toml`.
-    pub fn discover(prompts_dir: &Path) -> Result<Self> {
-        Self::discover_dir(&prompts_dir.join("roles"))
-    }
-
-    /// Scan one role plugin root directory.
-    pub fn discover_dir(roles_dir: &Path) -> Result<Self> {
-        let mut roles = BTreeMap::new();
-        if !roles_dir.exists() {
-            return Ok(Self { roles });
-        }
-        for entry in std::fs::read_dir(roles_dir)
-            .with_context(|| format!("failed to read roles dir {}", roles_dir.display()))?
-        {
-            let entry = entry?;
-            if !entry.file_type()?.is_dir() {
-                continue;
-            }
-            let dir = entry.path();
-            if !dir.join("manifest.toml").exists() {
-                continue;
-            }
-            let plugin = load_role_plugin(&dir)?;
-            if roles.contains_key(&plugin.manifest.role_id) {
-                bail!("duplicate role plugin id {:?}", plugin.manifest.role_id);
-            }
-            roles.insert(plugin.manifest.role_id.clone(), plugin);
-        }
-        Ok(Self { roles })
-    }
-
-    pub fn validate_components(&self, components: &ComponentRegistry) -> Result<()> {
-        for role in self.roles.values() {
-            validate_role_manifest(&role.manifest, &role.path)?;
-            role.validate_components(components)?;
-        }
-        Ok(())
-    }
-}
-
-impl RolePlugin {
-    pub fn role_path(&self) -> PathBuf {
-        self.path.join("role.md")
-    }
-
-    fn validate_components(&self, components: &ComponentRegistry) -> Result<()> {
-        for component_name in &self.manifest.components {
-            match components.components.get(component_name) {
-                Some(component) if component.manifest.enabled => {}
-                Some(_) => bail!(
-                    "role plugin {} references disabled component {component_name:?}",
-                    self.manifest.role_id
-                ),
-                None => bail!(
-                    "role plugin {} references missing component {component_name:?}",
-                    self.manifest.role_id
-                ),
-            }
-        }
-        Ok(())
-    }
-}
-
-pub fn validate_plugins(components: &ComponentRegistry, roles: &RolePluginRegistry) -> Result<()> {
+pub fn validate_plugins(components: &ComponentRegistry) -> Result<()> {
     components.validate_required_variables()?;
-    roles.validate_components(components)?;
     Ok(())
 }
 
@@ -345,32 +260,6 @@ fn load_component_plugin(dir: &Path) -> Result<ComponentPlugin> {
     })
 }
 
-fn load_role_plugin(dir: &Path) -> Result<RolePlugin> {
-    let manifest_path = dir.join("manifest.toml");
-    let template_path = dir.join("role.md");
-    if !manifest_path.exists() {
-        bail!(
-            "role plugin directory {} is missing manifest.toml",
-            dir.display()
-        );
-    }
-    if !template_path.exists() {
-        bail!("role plugin directory {} is missing role.md", dir.display());
-    }
-    let manifest_text = std::fs::read_to_string(&manifest_path)
-        .with_context(|| format!("failed to read role manifest {}", manifest_path.display()))?;
-    let manifest: RoleManifest = toml::from_str(&manifest_text)
-        .with_context(|| format!("failed to parse role manifest {}", manifest_path.display()))?;
-    let template = std::fs::read_to_string(&template_path)
-        .with_context(|| format!("failed to read role template {}", template_path.display()))?;
-    validate_role_manifest(&manifest, dir)?;
-    Ok(RolePlugin {
-        manifest,
-        template,
-        path: dir.to_path_buf(),
-    })
-}
-
 fn validate_component_manifest(manifest: &ComponentManifest, dir: &Path) -> Result<()> {
     if manifest.name.trim().is_empty() {
         bail!("component plugin {} has empty name", dir.display());
@@ -385,22 +274,6 @@ fn validate_component_manifest(manifest: &ComponentManifest, dir: &Path) -> Resu
         bail!(
             "component plugin {} must declare at least one injection point",
             manifest.name
-        );
-    }
-    Ok(())
-}
-
-fn validate_role_manifest(manifest: &RoleManifest, dir: &Path) -> Result<()> {
-    if manifest.role_id.trim().is_empty() {
-        bail!("role plugin {} has empty role_id", dir.display());
-    }
-    if manifest.short_name.trim().is_empty() {
-        bail!("role plugin {} has empty short_name", manifest.role_id);
-    }
-    if !(1..=7).contains(&manifest.phase) {
-        bail!(
-            "role plugin {} phase must be between 1 and 7",
-            manifest.role_id
         );
     }
     Ok(())
@@ -494,55 +367,6 @@ required_variables = ["ticker", "tickers"]
             values["common_ticker_prompt"].as_str(),
             Some("Ticker QQQ: QQQ,SOXX")
         );
-    }
-
-    #[test]
-    fn discovers_role_plugins() {
-        let temp = TempDir::new().unwrap();
-        let prompts = temp.path().join("prompts");
-        let dir = prompts.join("roles/analyst.test");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("manifest.toml"),
-            r#"role_id = "analyst.test"
-short_name = "test"
-phase = 1
-components = ["test_comp"]
-tools = ["read_run_context"]
-default_weight = 5.0
-"#,
-        )
-        .unwrap();
-        std::fs::write(dir.join("role.md"), "role template").unwrap();
-
-        let registry = RolePluginRegistry::discover(&prompts).unwrap();
-
-        assert_eq!(registry.roles.len(), 1);
-        assert_eq!(registry.roles["analyst.test"].template, "role template");
-    }
-
-    #[test]
-    fn validation_fails_for_missing_component_dependency() {
-        let temp = TempDir::new().unwrap();
-        let prompts = temp.path().join("prompts");
-        let dir = prompts.join("roles/analyst.test");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("manifest.toml"),
-            r#"role_id = "analyst.test"
-short_name = "test"
-phase = 1
-components = ["missing"]
-"#,
-        )
-        .unwrap();
-        std::fs::write(dir.join("role.md"), "role template").unwrap();
-        let components = ComponentRegistry::default();
-        let roles = RolePluginRegistry::discover(&prompts).unwrap();
-
-        let err = validate_plugins(&components, &roles).unwrap_err();
-
-        assert!(err.to_string().contains("missing component"));
     }
 
     #[test]

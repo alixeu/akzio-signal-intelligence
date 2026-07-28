@@ -53,11 +53,6 @@ orchestrator:
       high_confidence: 0.70
       calibration_error: 0.40
       repeated_error_count: 2
-    retrieval:
-      token_budget: 4000
-      max_items: 20
-      min_quality: 0.6
-
   workflow:
     agent_timeout_sec: 600
     reducer_timeout_sec: 600

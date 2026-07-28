@@ -19,9 +19,9 @@ use serde_json::{json, Value};
 use crate::{
     content_hash, create_or_recover_draft, draft::mutate_draft, draft::read_draft,
     finalize_draft_atomic, AnalystAssessmentDraft, ArtifactDraftState, ArtifactScope,
-    ContentHashDocument, DraftAppendOutcome, DraftProfile, FileStore, FinalizableArtifact,
-    FinalizeDraftOutcome, PortfolioAssetDecisionDraft, ResearchDecisionDraftEntry, Result,
-    RiskAssessmentDraft, RiskConstraintDraft, RunLocation, SafeSlug, StoreError,
+    ContentHashDocument, DraftAppendOutcome, FileStore, FinalizableArtifact, FinalizeDraftOutcome,
+    PortfolioAssetDecisionDraft, ResearchDecisionDraftEntry, Result, RiskAssessmentDraft,
+    RiskConstraintDraft, RunLocation, SafeSlug, StoreError, ToolManagedProfile,
     TradeIntentDraftEntry,
 };
 
@@ -303,7 +303,7 @@ pub fn set_analyst_assessment(
     input: AnalystAssessmentInput,
     created_at: &str,
 ) -> Result<DraftAppendOutcome> {
-    require_profile(scope, DraftProfile::AnalystReport)?;
+    require_profile(scope, ToolManagedProfile::AnalystReport)?;
     require_ticker(scope, &input.ticker)?;
     create_or_recover_draft(store, location, scope.clone(), created_at)?;
     mutate_draft(
@@ -355,7 +355,7 @@ pub fn append_analyst_evidence(
     input: AnalystEvidenceInput,
     created_at: &str,
 ) -> Result<DraftAppendOutcome> {
-    require_profile(scope, DraftProfile::AnalystReport)?;
+    require_profile(scope, ToolManagedProfile::AnalystReport)?;
     require_ticker(scope, &input.ticker)?;
     require_non_empty("evidence_ref", &input.evidence_ref)?;
     create_or_recover_draft(store, location, scope.clone(), created_at)?;
@@ -397,7 +397,7 @@ pub fn append_analyst_data_gap(
     data_gap: String,
     created_at: &str,
 ) -> Result<DraftAppendOutcome> {
-    require_profile(scope, DraftProfile::AnalystReport)?;
+    require_profile(scope, ToolManagedProfile::AnalystReport)?;
     require_ticker(scope, &ticker)?;
     require_non_empty("data_gap", &data_gap)?;
     create_or_recover_draft(store, location, scope.clone(), created_at)?;
@@ -437,7 +437,7 @@ pub fn set_analyst_invalidation(
     validation_triggers: Vec<String>,
     created_at: &str,
 ) -> Result<DraftAppendOutcome> {
-    require_profile(scope, DraftProfile::AnalystReport)?;
+    require_profile(scope, ToolManagedProfile::AnalystReport)?;
     require_ticker(scope, &ticker)?;
     if validation_triggers.is_empty()
         || validation_triggers
@@ -483,7 +483,7 @@ pub fn set_research_decision(
     input: ResearchDecisionInput,
     created_at: &str,
 ) -> Result<DraftAppendOutcome> {
-    require_profile(scope, DraftProfile::ResearchDecision)?;
+    require_profile(scope, ToolManagedProfile::ResearchDecision)?;
     require_ticker(scope, &input.ticker)?;
     create_or_recover_draft(store, location, scope.clone(), created_at)?;
     mutate_draft(
@@ -522,7 +522,7 @@ pub fn set_research_scenarios(
     input: ResearchScenarioInput,
     created_at: &str,
 ) -> Result<DraftAppendOutcome> {
-    require_profile(scope, DraftProfile::ResearchDecision)?;
+    require_profile(scope, ToolManagedProfile::ResearchDecision)?;
     require_ticker(scope, &input.ticker)?;
     create_or_recover_draft(store, location, scope.clone(), created_at)?;
     mutate_draft(
@@ -558,7 +558,7 @@ pub fn append_research_hinge(
     evidence_ref: String,
     created_at: &str,
 ) -> Result<DraftAppendOutcome> {
-    require_profile(scope, DraftProfile::ResearchDecision)?;
+    require_profile(scope, ToolManagedProfile::ResearchDecision)?;
     require_ticker(scope, &ticker)?;
     require_non_empty("hinge", &hinge)?;
     require_non_empty("evidence_ref", &evidence_ref)?;
@@ -599,12 +599,12 @@ pub fn finalize_analyst_report(
     expected_tickers: &[String],
     created_at: &str,
 ) -> Result<DomainFinalizeOutcome> {
-    require_profile(scope, DraftProfile::AnalystReport)?;
+    require_profile(scope, ToolManagedProfile::AnalystReport)?;
     let draft = read_draft(
         store,
         location,
         &crate::draft_relative(location, scope)?,
-        DraftProfile::AnalystReport,
+        ToolManagedProfile::AnalystReport,
     )?;
     let ArtifactDraftState::AnalystReport(state) = draft.state else {
         return Err(profile_state_error("analyst_report").unwrap_err());
@@ -679,12 +679,12 @@ pub fn finalize_research_decision(
     expected_tickers: &[String],
     created_at: &str,
 ) -> Result<DomainFinalizeOutcome> {
-    require_profile(scope, DraftProfile::ResearchDecision)?;
+    require_profile(scope, ToolManagedProfile::ResearchDecision)?;
     let draft = read_draft(
         store,
         location,
         &crate::draft_relative(location, scope)?,
-        DraftProfile::ResearchDecision,
+        ToolManagedProfile::ResearchDecision,
     )?;
     let ArtifactDraftState::ResearchDecision(state) = draft.state else {
         return Err(profile_state_error("research_decision").unwrap_err());
@@ -750,7 +750,7 @@ pub fn set_trade_intent(
     input: TradeIntentInput,
     created_at: &str,
 ) -> Result<DraftAppendOutcome> {
-    require_profile(scope, DraftProfile::TradeIntent)?;
+    require_profile(scope, ToolManagedProfile::TradeIntent)?;
     scoped_ticker(scope)?;
     require_non_empty("action", &input.action)?;
     require_non_empty("execution_decision", &input.execution_decision)?;
@@ -788,7 +788,7 @@ pub fn append_trade_blocker(
     blocker: String,
     created_at: &str,
 ) -> Result<DraftAppendOutcome> {
-    require_profile(scope, DraftProfile::TradeIntent)?;
+    require_profile(scope, ToolManagedProfile::TradeIntent)?;
     scoped_ticker(scope)?;
     require_non_empty("blocker", &blocker)?;
     create_or_recover_draft(store, location, scope.clone(), created_at)?;
@@ -819,14 +819,14 @@ pub fn finalize_trade_intent(
     policy: &TradeIntentFinalizePolicy,
     created_at: &str,
 ) -> Result<DomainFinalizeOutcome> {
-    require_profile(scope, DraftProfile::TradeIntent)?;
+    require_profile(scope, ToolManagedProfile::TradeIntent)?;
     let ticker = scoped_ticker(scope)?;
     let candidate_action = normalize_action("candidate_action", &policy.candidate_action)?;
     let draft = read_draft(
         store,
         location,
         &crate::draft_relative(location, scope)?,
-        DraftProfile::TradeIntent,
+        ToolManagedProfile::TradeIntent,
     )?;
     let ArtifactDraftState::TradeIntent(state) = draft.state else {
         return Err(profile_state_error("trade_intent").unwrap_err());
@@ -899,7 +899,7 @@ pub fn set_risk_assessment(
     input: RiskAssessmentInput,
     created_at: &str,
 ) -> Result<DraftAppendOutcome> {
-    require_profile(scope, DraftProfile::RiskReview)?;
+    require_profile(scope, ToolManagedProfile::RiskReview)?;
     scoped_ticker(scope)?;
     create_or_recover_draft(store, location, scope.clone(), created_at)?;
     mutate_draft(
@@ -932,7 +932,7 @@ pub fn set_risk_constraints(
     input: RiskConstraintsInput,
     created_at: &str,
 ) -> Result<DraftAppendOutcome> {
-    require_profile(scope, DraftProfile::RiskReview)?;
+    require_profile(scope, ToolManagedProfile::RiskReview)?;
     scoped_ticker(scope)?;
     create_or_recover_draft(store, location, scope.clone(), created_at)?;
     mutate_draft(
@@ -969,7 +969,7 @@ pub fn finalize_risk_review(
     scope: &ArtifactScope,
     created_at: &str,
 ) -> Result<DomainFinalizeOutcome> {
-    require_profile(scope, DraftProfile::RiskReview)?;
+    require_profile(scope, ToolManagedProfile::RiskReview)?;
     let ticker = scoped_ticker(scope)?;
     let stance = scope
         .stance
@@ -983,7 +983,7 @@ pub fn finalize_risk_review(
         store,
         location,
         &crate::draft_relative(location, scope)?,
-        DraftProfile::RiskReview,
+        ToolManagedProfile::RiskReview,
     )?;
     let ArtifactDraftState::RiskReview(state) = draft.state else {
         return Err(profile_state_error("risk_review").unwrap_err());
@@ -1054,7 +1054,7 @@ pub fn set_portfolio_asset_decision(
     input: PortfolioAssetDecisionInput,
     created_at: &str,
 ) -> Result<DraftAppendOutcome> {
-    require_profile(scope, DraftProfile::PortfolioDecision)?;
+    require_profile(scope, ToolManagedProfile::PortfolioDecision)?;
     scoped_ticker(scope)?;
     require_non_empty("execution_summary", &input.execution_summary)?;
     create_or_recover_draft(store, location, scope.clone(), created_at)?;
@@ -1093,7 +1093,7 @@ pub fn append_binding_risk_control(
     control: BindingRiskControl,
     created_at: &str,
 ) -> Result<DraftAppendOutcome> {
-    require_profile(scope, DraftProfile::PortfolioDecision)?;
+    require_profile(scope, ToolManagedProfile::PortfolioDecision)?;
     scoped_ticker(scope)?;
     if control.control.trim().is_empty()
         || control.source_refs.is_empty()
@@ -1138,7 +1138,7 @@ pub fn finalize_portfolio_decision(
     policy: &PortfolioDecisionFinalizePolicy,
     created_at: &str,
 ) -> Result<DomainFinalizeOutcome> {
-    require_profile(scope, DraftProfile::PortfolioDecision)?;
+    require_profile(scope, ToolManagedProfile::PortfolioDecision)?;
     let ticker = scoped_ticker(scope)?;
     if policy.ticker != ticker {
         return Err(StoreError::InvalidDocument {
@@ -1150,7 +1150,7 @@ pub fn finalize_portfolio_decision(
         store,
         location,
         &crate::draft_relative(location, scope)?,
-        DraftProfile::PortfolioDecision,
+        ToolManagedProfile::PortfolioDecision,
     )?;
     let ArtifactDraftState::PortfolioDecision(state) = draft.state else {
         return Err(profile_state_error("portfolio_decision").unwrap_err());
@@ -1232,7 +1232,7 @@ fn artifact_id(scope: &ArtifactScope, kind: &str) -> Result<String> {
         &content_hash(&serde_json::json!({"scope": scope, "kind": kind}))?[..32]
     ))
 }
-fn require_profile(scope: &ArtifactScope, profile: DraftProfile) -> Result<()> {
+fn require_profile(scope: &ArtifactScope, profile: ToolManagedProfile) -> Result<()> {
     if scope.profile == profile {
         Ok(())
     } else {
@@ -1353,7 +1353,7 @@ mod tests {
     use crate::{FileStoreOptions, RunLocation};
     use tempfile::tempdir;
 
-    fn scope(profile: DraftProfile, phase: u8, role: &str) -> ArtifactScope {
+    fn scope(profile: ToolManagedProfile, phase: u8, role: &str) -> ArtifactScope {
         ArtifactScope {
             run_id: "r1".into(),
             current_date: "2026-07-27".into(),
@@ -1387,7 +1387,7 @@ mod tests {
     }
 
     fn single_ticker_scope(
-        profile: DraftProfile,
+        profile: ToolManagedProfile,
         phase: u8,
         role: &str,
         stance: Option<&str>,
@@ -1403,7 +1403,12 @@ mod tests {
         let temp = tempdir().unwrap();
         let store = FileStore::open(temp.path(), FileStoreOptions::default()).unwrap();
         let location = RunLocation::new("2026-07-27", "r1").unwrap();
-        let scope = single_ticker_scope(DraftProfile::AnalystReport, 1, "analyst.technical", None);
+        let scope = single_ticker_scope(
+            ToolManagedProfile::AnalystReport,
+            1,
+            "analyst.technical",
+            None,
+        );
         let now = "2026-07-27T00:00:00Z";
         set_analyst_assessment(
             &store,
@@ -1475,7 +1480,7 @@ mod tests {
         let temp = tempdir().unwrap();
         let store = FileStore::open(temp.path(), FileStoreOptions::default()).unwrap();
         let location = RunLocation::new("2026-07-27", "r1").unwrap();
-        let scope = single_ticker_scope(DraftProfile::TradeIntent, 4, "trader", None);
+        let scope = single_ticker_scope(ToolManagedProfile::TradeIntent, 4, "trader", None);
         let now = "2026-07-27T00:00:00Z";
         set_trade_intent(
             &store,
@@ -1505,7 +1510,7 @@ mod tests {
         .unwrap();
         assert!(matches!(outcome, DomainFinalizeOutcome::Trade(_)));
 
-        let reverse_scope = single_ticker_scope(DraftProfile::TradeIntent, 4, "trader", None);
+        let reverse_scope = single_ticker_scope(ToolManagedProfile::TradeIntent, 4, "trader", None);
         let mut reverse_scope = reverse_scope;
         reverse_scope.unit_key = "reverse".into();
         set_trade_intent(
@@ -1540,8 +1545,12 @@ mod tests {
         let temp = tempdir().unwrap();
         let store = FileStore::open(temp.path(), FileStoreOptions::default()).unwrap();
         let location = RunLocation::new("2026-07-27", "r1").unwrap();
-        let scope =
-            single_ticker_scope(DraftProfile::RiskReview, 5, "risk.neutral", Some("neutral"));
+        let scope = single_ticker_scope(
+            ToolManagedProfile::RiskReview,
+            5,
+            "risk.neutral",
+            Some("neutral"),
+        );
         let now = "2026-07-27T00:00:00Z";
         set_risk_assessment(
             &store,
@@ -1591,7 +1600,7 @@ mod tests {
         let store = FileStore::open(temp.path(), FileStoreOptions::default()).unwrap();
         let location = RunLocation::new("2026-07-27", "r1").unwrap();
         let scope = single_ticker_scope(
-            DraftProfile::PortfolioDecision,
+            ToolManagedProfile::PortfolioDecision,
             6,
             "portfolio.manager",
             None,

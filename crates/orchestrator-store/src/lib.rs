@@ -23,6 +23,8 @@ mod schema;
 mod session;
 mod store;
 
+pub use orchestrator_core::ToolManagedProfile;
+
 pub use atomic::{
     rename_dir_atomic, write_bytes_atomic, write_bytes_atomic_with_options, write_json_atomic,
     AtomicWriteOptions,
@@ -51,7 +53,7 @@ pub use draft::{
     read_draft_for_scope, AnalystAssessmentDraft, AnalystReportDraft, ArtifactDraft,
     ArtifactDraftState, ArtifactScope, DebateClaimDraft, DebateResponseDraft,
     DebateResponseDraftEntry, DebateSeedDraft, DraftAppendOutcome, DraftFailure,
-    DraftIdempotencyKey, DraftLifecycle, DraftProfile, DraftWriteReceipt, FinalizableArtifact,
+    DraftIdempotencyKey, DraftLifecycle, DraftWriteReceipt, FinalizableArtifact,
     FinalizeDraftOutcome, HistoricalReflectionDraft, Phase2TopicDraft, PhaseSummaryDraft,
     PortfolioAssetDecisionDraft, PortfolioDecisionDraft, ProfileDraftMetadata,
     ResearchDecisionDraft, ResearchDecisionDraftEntry, ResearcherWarmupDraft, RiskAssessmentDraft,

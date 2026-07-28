@@ -30,7 +30,6 @@ use crate::orchestration::{
     },
     input_snapshot_runtime::{capture_phase1_file_store_inputs, phase1_input_sources},
     lifecycle::{run_id_for, set_phase_status, tickers_from_state},
-    retrieval::inject_phase_summary_reflection,
     role_jobs::{prepare_role_job, record_role_job_metrics, run_role_jobs, RoleRun},
     summary_store::{
         phase_summary_source_payload, planned_summary_units, write_deterministic_phase_summary,
@@ -647,7 +646,6 @@ async fn run_phase0(
     model: Option<&str>,
     reasoning: Option<&str>,
 ) -> Result<()> {
-    inject_phase_summary_reflection(state, runtime)?;
     let tasks = reflection_tasks(store, location, state, runtime.reflection.task_limit)?;
     let planned_tasks = tasks.clone();
     let mut completed = Vec::new();

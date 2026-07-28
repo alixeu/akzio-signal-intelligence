@@ -33,36 +33,6 @@ fn default_enabled() -> bool {
     true
 }
 
-/// Manifest for a role plugin.
-/// Lives at `prompts/roles/<name>/manifest.toml`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct RoleManifest {
-    /// Unique role ID (e.g., "analyst.technical", "manager.research").
-    pub role_id: String,
-    /// Short name for CLI usage (e.g., "technical").
-    pub short_name: String,
-    /// Workflow phase this role belongs to (1-7).
-    pub phase: i64,
-    /// Component names this role depends on.
-    #[serde(default)]
-    pub components: Vec<String>,
-    /// Tool names this role is allowed to use.
-    #[serde(default)]
-    pub tools: Vec<String>,
-    /// Preflight tool to run before the role.
-    #[serde(default)]
-    pub preflight_tool: Option<String>,
-    /// Default analyst weight (0.0-100.0). Only relevant for Phase 1 analysts.
-    #[serde(default)]
-    pub default_weight: f64,
-    /// Whether this role is critical (blocks workflow if missing).
-    #[serde(default)]
-    pub is_critical: bool,
-    /// Whether this role supports a `_monitor` variant.
-    #[serde(default)]
-    pub supports_monitor_mode: bool,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -82,24 +52,6 @@ placeholder_key = "common_ticker_prompt"
         assert_eq!(manifest.priority, 100);
         assert!(manifest.enabled);
         assert!(manifest.required_variables.is_empty());
-    }
-
-    #[test]
-    fn parses_role_manifest_defaults() {
-        let manifest: RoleManifest = toml::from_str(
-            r#"
-role_id = "analyst.test"
-short_name = "test"
-phase = 1
-"#,
-        )
-        .unwrap();
-
-        assert_eq!(manifest.role_id, "analyst.test");
-        assert!(manifest.components.is_empty());
-        assert!(manifest.tools.is_empty());
-        assert!(!manifest.is_critical);
-        assert!(!manifest.supports_monitor_mode);
     }
 
     #[test]

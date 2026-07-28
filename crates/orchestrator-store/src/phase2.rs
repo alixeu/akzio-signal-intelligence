@@ -12,8 +12,8 @@ use crate::{
     apply_typed_draft_command, complete_terminal_draft_without_artifact, content_hash,
     create_or_recover_draft, finalize_draft_atomic, read_draft_for_scope, ArtifactDraftState,
     ArtifactScope, ContentHashDocument, DebateClaimDraft, DebateResponseDraftEntry,
-    DraftAppendOutcome, DraftProfile, FileStore, FinalizableArtifact, FinalizeDraftOutcome,
-    Phase2TopicDraft, Result, RunLocation, SafeSlug, StoreError, Versioned,
+    DraftAppendOutcome, FileStore, FinalizableArtifact, FinalizeDraftOutcome, Phase2TopicDraft,
+    Result, RunLocation, SafeSlug, StoreError, ToolManagedProfile, Versioned,
 };
 
 pub const PHASE2_ARTIFACT_SCHEMA_VERSION: u32 = 1;
@@ -137,11 +137,11 @@ impl Phase2DraftService {
     ) -> Result<Self> {
         if !matches!(
             scope.profile,
-            DraftProfile::TopicGeneration
-                | DraftProfile::ResearcherWarmup
-                | DraftProfile::DebateSeed
-                | DraftProfile::DebateResponse
-                | DraftProfile::TopicControl
+            ToolManagedProfile::TopicGeneration
+                | ToolManagedProfile::ResearcherWarmup
+                | ToolManagedProfile::DebateSeed
+                | ToolManagedProfile::DebateResponse
+                | ToolManagedProfile::TopicControl
         ) {
             return Err(StoreError::InvalidDocument {
                 kind: "phase2 draft service",
@@ -167,7 +167,7 @@ impl Phase2DraftService {
     pub fn set_phase2_common_ground(&self, common_ground: String) -> Result<DraftAppendOutcome> {
         require_profile(
             &self.scope,
-            DraftProfile::TopicGeneration,
+            ToolManagedProfile::TopicGeneration,
             "set_phase2_common_ground",
         )?;
         require_text("common_ground", &common_ground)?;
@@ -196,7 +196,7 @@ impl Phase2DraftService {
     ) -> Result<(String, DraftAppendOutcome)> {
         require_profile(
             &self.scope,
-            DraftProfile::TopicGeneration,
+            ToolManagedProfile::TopicGeneration,
             "create_phase2_topic",
         )?;
         require_text("topic", &topic)?;
@@ -233,7 +233,7 @@ impl Phase2DraftService {
     pub fn finalize_researcher_warmup(&self) -> Result<DraftAppendOutcome> {
         require_profile(
             &self.scope,
-            DraftProfile::ResearcherWarmup,
+            ToolManagedProfile::ResearcherWarmup,
             "finalize_researcher_warmup",
         )?;
         if self.visible_evidence.is_empty() {
@@ -265,7 +265,7 @@ impl Phase2DraftService {
     pub fn finalize_topic_generation(&self) -> Result<Phase2Artifact> {
         require_profile(
             &self.scope,
-            DraftProfile::TopicGeneration,
+            ToolManagedProfile::TopicGeneration,
             "finalize_topic_generation",
         )?;
         self.finalize()
@@ -277,7 +277,11 @@ impl Phase2DraftService {
         confidence: f64,
         evidence_refs: Vec<String>,
     ) -> Result<(String, DraftAppendOutcome)> {
-        require_profile(&self.scope, DraftProfile::DebateSeed, "create_debate_claim")?;
+        require_profile(
+            &self.scope,
+            ToolManagedProfile::DebateSeed,
+            "create_debate_claim",
+        )?;
         require_text("claim", &claim)?;
         let confidence_bps = confidence_to_bps(confidence)?;
         let evidence_refs = self.checked_evidence_refs(evidence_refs)?;
@@ -311,7 +315,7 @@ impl Phase2DraftService {
     pub fn finalize_debate_seed(&self) -> Result<Phase2Artifact> {
         require_profile(
             &self.scope,
-            DraftProfile::DebateSeed,
+            ToolManagedProfile::DebateSeed,
             "finalize_debate_seed",
         )?;
         self.finalize()
@@ -325,7 +329,7 @@ impl Phase2DraftService {
     ) -> Result<(String, DraftAppendOutcome)> {
         require_profile(
             &self.scope,
-            DraftProfile::DebateResponse,
+            ToolManagedProfile::DebateResponse,
             "respond_to_debate_claim",
         )?;
         require_text("reply_to_claim_id", &reply_to_claim_id)?;
@@ -372,7 +376,7 @@ impl Phase2DraftService {
     pub fn finalize_debate_response(&self) -> Result<Phase2Artifact> {
         require_profile(
             &self.scope,
-            DraftProfile::DebateResponse,
+            ToolManagedProfile::DebateResponse,
             "finalize_debate_response",
         )?;
         self.finalize()
@@ -383,7 +387,11 @@ impl Phase2DraftService {
         claim_id: String,
         status: ClaimStatus,
     ) -> Result<DraftAppendOutcome> {
-        require_profile(&self.scope, DraftProfile::TopicControl, "set_claim_status")?;
+        require_profile(
+            &self.scope,
+            ToolManagedProfile::TopicControl,
+            "set_claim_status",
+        )?;
         if !self.visible_claims.contains(&claim_id) {
             return Err(StoreError::InvalidDocument {
                 kind: "topic control",
@@ -411,7 +419,11 @@ impl Phase2DraftService {
     }
 
     pub fn add_agreed_fact(&self, fact: String) -> Result<DraftAppendOutcome> {
-        require_profile(&self.scope, DraftProfile::TopicControl, "add_agreed_fact")?;
+        require_profile(
+            &self.scope,
+            ToolManagedProfile::TopicControl,
+            "add_agreed_fact",
+        )?;
         require_text("fact", &fact)?;
         self.apply(
             "add_agreed_fact",
@@ -434,7 +446,7 @@ impl Phase2DraftService {
     pub fn set_decision_hinge(&self, hinge: String) -> Result<DraftAppendOutcome> {
         require_profile(
             &self.scope,
-            DraftProfile::TopicControl,
+            ToolManagedProfile::TopicControl,
             "set_decision_hinge",
         )?;
         require_text("hinge", &hinge)?;
@@ -463,7 +475,7 @@ impl Phase2DraftService {
     ) -> Result<DraftAppendOutcome> {
         require_profile(
             &self.scope,
-            DraftProfile::TopicControl,
+            ToolManagedProfile::TopicControl,
             "route_debate_steer",
         )?;
         if !matches!(target.as_str(), "bull" | "bear") {
@@ -494,7 +506,7 @@ impl Phase2DraftService {
     pub fn set_topic_soft_control(&self, should_continue: bool) -> Result<DraftAppendOutcome> {
         require_profile(
             &self.scope,
-            DraftProfile::TopicControl,
+            ToolManagedProfile::TopicControl,
             "set_topic_soft_control",
         )?;
         self.apply(
@@ -517,7 +529,7 @@ impl Phase2DraftService {
     pub fn finalize_topic_control(&self) -> Result<Phase2Artifact> {
         require_profile(
             &self.scope,
-            DraftProfile::TopicControl,
+            ToolManagedProfile::TopicControl,
             "finalize_topic_control",
         )?;
         self.finalize()
@@ -721,12 +733,12 @@ fn build_payload(state: &ArtifactDraftState) -> Result<(Phase2ArtifactPayload, B
 fn artifact_relative(scope: &ArtifactScope) -> Result<PathBuf> {
     let base = PathBuf::from("artifacts/phase2");
     match scope.profile {
-        DraftProfile::TopicGeneration => Ok(base.join("topic-generation.json")),
-        DraftProfile::DebateSeed => topic_artifact_path(
+        ToolManagedProfile::TopicGeneration => Ok(base.join("topic-generation.json")),
+        ToolManagedProfile::DebateSeed => topic_artifact_path(
             scope,
             format!("{}-seed.json", required_scope(&scope.side, "side")?),
         ),
-        DraftProfile::DebateResponse => topic_artifact_path(
+        ToolManagedProfile::DebateResponse => topic_artifact_path(
             scope,
             format!(
                 "{}-response-round-{}.json",
@@ -737,7 +749,7 @@ fn artifact_relative(scope: &ArtifactScope) -> Result<PathBuf> {
                 })?
             ),
         ),
-        DraftProfile::TopicControl => topic_artifact_path(
+        ToolManagedProfile::TopicControl => topic_artifact_path(
             scope,
             format!(
                 "controller-round-{}.json",
@@ -758,7 +770,7 @@ fn topic_artifact_path(scope: &ArtifactScope, file: String) -> Result<PathBuf> {
         .join(file))
 }
 
-fn require_profile(scope: &ArtifactScope, expected: DraftProfile, tool: &str) -> Result<()> {
+fn require_profile(scope: &ArtifactScope, expected: ToolManagedProfile, tool: &str) -> Result<()> {
     if scope.profile != expected {
         return Err(StoreError::InvalidDocument {
             kind: "phase2 tool",
@@ -863,11 +875,11 @@ struct SoftControlCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DraftLifecycle, DraftProfile, FileStoreOptions};
+    use crate::{DraftLifecycle, FileStoreOptions, ToolManagedProfile};
     use tempfile::TempDir;
 
     fn service(
-        profile: DraftProfile,
+        profile: ToolManagedProfile,
         topic_id: Option<&str>,
         side: Option<&str>,
         round: Option<u32>,
@@ -906,7 +918,7 @@ mod tests {
 
     #[test]
     fn topic_generation_builds_one_atomic_canonical_artifact() {
-        let (_temp, service) = service(DraftProfile::TopicGeneration, None, None, None);
+        let (_temp, service) = service(ToolManagedProfile::TopicGeneration, None, None, None);
         service
             .set_phase2_common_ground("Rates remain uncertain".to_owned())
             .unwrap();
@@ -932,7 +944,7 @@ mod tests {
     #[test]
     fn response_rejects_invisible_claim_and_evidence() {
         let (_temp, service) = service(
-            DraftProfile::DebateResponse,
+            ToolManagedProfile::DebateResponse,
             Some("rates"),
             Some("bull"),
             Some(1),
@@ -955,7 +967,7 @@ mod tests {
 
     #[test]
     fn warmup_has_terminal_marker_but_no_business_artifact() {
-        let (_temp, service) = service(DraftProfile::ResearcherWarmup, None, None, Some(0));
+        let (_temp, service) = service(ToolManagedProfile::ResearcherWarmup, None, None, Some(0));
         let first = service.finalize_researcher_warmup().unwrap();
         assert!(matches!(first, DraftAppendOutcome::Appended { .. }));
         let second = service.finalize_researcher_warmup().unwrap();

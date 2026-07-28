@@ -81,8 +81,8 @@ mod tests {
     use super::{rebuild_manifest_from_finalized_artifacts, recover_pending_finalization};
     use crate::{
         create_or_recover_draft, draft_relative, ArtifactScope, ContentHashDocument,
-        DraftLifecycle, DraftProfile, FileStore, FileStoreOptions, FinalizedArtifactRef,
-        RunLocation, RunManifestInit,
+        DraftLifecycle, FileStore, FileStoreOptions, FinalizedArtifactRef, RunLocation,
+        RunManifestInit, ToolManagedProfile,
     };
 
     fn location() -> RunLocation {
@@ -95,7 +95,7 @@ mod tests {
             current_date: "2026-07-27".to_owned(),
             phase: 1,
             role: "analyst.technical".to_owned(),
-            profile: DraftProfile::AnalystReport,
+            profile: ToolManagedProfile::AnalystReport,
             profile_version: 1,
             builder_version: 1,
             unit_key: "QQQ".to_owned(),

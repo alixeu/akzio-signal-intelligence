@@ -7,7 +7,6 @@ pub mod plugin_manifest;
 pub mod prompt;
 pub mod prompt_plugins;
 pub mod reflection;
-pub mod role_registry;
 pub mod technical_csv;
 pub mod ticker;
 pub mod token;
@@ -21,9 +20,9 @@ pub use artifact::{
     StopType, TradeIntent, ValidationError, CANONICAL_EVIDENCE_TYPES,
 };
 pub use authority::{
-    ArtifactAuthority, AuthorityRegistration, AuthorityRegistry, AuthorityRegistryError,
-    AuthorityRegistrySnapshot, RoleProfileKey, ToolManagedProfile, UnitPlanner,
-    AUTHORITY_REGISTRY_SCHEMA_VERSION, BUILTIN_AUTHORITY_REGISTRY_VERSION,
+    AuthorityRegistration, AuthorityRegistry, AuthorityRegistryError, AuthorityRegistrySnapshot,
+    RoleProfileKey, ToolManagedProfile, UnitPlanner, AUTHORITY_REGISTRY_SCHEMA_VERSION,
+    BUILTIN_AUTHORITY_REGISTRY_VERSION,
 };
 pub use config::{
     config_bool, config_float, config_get, config_int, config_str, config_strings, deep_merge,
@@ -37,13 +36,9 @@ pub use jin10_csv::{
 pub use paths::{default_project_root, project_path};
 pub use prompt::{render_template, replace_placeholders};
 pub use prompt_plugins::{
-    validate_plugins, ComponentPlugin, ComponentRegistry, RolePlugin, RolePluginRegistry,
-    KNOWN_RENDER_VARIABLES,
+    validate_plugins, ComponentPlugin, ComponentRegistry, KNOWN_RENDER_VARIABLES,
 };
-pub use reflection::{
-    DefaultQualityScorer, MarketRegime, MemoryQualityInput, QualityScorer, RetrievalBudget, Scope,
-};
-pub use role_registry::{AgentDefinition, AgentRegistry, DEFAULT_PHASE1_AGENTS};
+pub use reflection::{MarketRegime, Scope};
 pub use technical_csv::{
     close_on_or_after, close_on_or_before, closes_for_correlation, default_technical_csv_dir,
     interval_file_label, latest_close, latest_indicator, latest_snapshot, parse_technical_csv,

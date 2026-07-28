@@ -1,8 +1,6 @@
 //! The explicit source-of-truth registry for FileStore ToolManaged roles.
 //!
-//! A role/profile pair has exactly one [`ArtifactAuthority`]. Callers must
-//! resolve the pair before reading or writing an artifact; they must never
-//! fall back from one authority to the other.
+//! A role/profile pair has one FileStore-backed typed artifact contract.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -49,13 +47,6 @@ impl ToolManagedProfile {
     }
 }
 
-/// The one and only persistence authority for every role/profile pair.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ArtifactAuthority {
-    FileStore,
-}
-
 /// Rust-owned unit planner identity. It is persisted in snapshots so a run is
 /// never resumed with a different unit boundary than the one that created it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,14 +83,13 @@ impl RoleProfileKey {
     }
 }
 
-/// The complete authority and tool contract for one exact role/profile pair.
+/// The complete tool and artifact contract for one exact role/profile pair.
 /// `tool_allowlist` is sorted and duplicate-free by construction; this makes
 /// its serialized form stable for run-manifest snapshots and hashes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthorityRegistration {
     pub role_id: String,
     pub profile: ToolManagedProfile,
-    pub authority: ArtifactAuthority,
     pub profile_version: u32,
     pub builder_version: u32,
     pub unit_planner: UnitPlanner,
@@ -111,7 +101,6 @@ impl AuthorityRegistration {
     pub fn new(
         role_id: impl Into<String>,
         profile: ToolManagedProfile,
-        authority: ArtifactAuthority,
         profile_version: u32,
         builder_version: u32,
         unit_planner: UnitPlanner,
@@ -138,7 +127,6 @@ impl AuthorityRegistration {
         let registration = Self {
             role_id,
             profile,
-            authority,
             profile_version,
             builder_version,
             unit_planner,
@@ -193,7 +181,7 @@ impl AuthorityRegistration {
     }
 }
 
-/// Persistable, deterministic authority snapshot for a run manifest.
+/// Persistable, deterministic role-profile snapshot for a run manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthorityRegistrySnapshot {
     pub schema_version: u32,
@@ -226,8 +214,7 @@ impl AuthorityRegistrySnapshot {
 }
 
 /// A deterministic map of exact role/profile mappings. The registry exposes
-/// no multi-source resolution API by design: a caller receives precisely one
-/// authority or an error.
+/// no fallback resolution API by design.
 #[derive(Debug, Clone)]
 pub struct AuthorityRegistry {
     registry_version: u32,
@@ -508,14 +495,6 @@ impl AuthorityRegistry {
             })
     }
 
-    pub fn authority_for(
-        &self,
-        role_id: &str,
-        profile: ToolManagedProfile,
-    ) -> Result<ArtifactAuthority, AuthorityRegistryError> {
-        Ok(self.registration(role_id, profile)?.authority)
-    }
-
     pub fn tool_is_allowed(
         &self,
         role_id: &str,
@@ -559,16 +538,8 @@ fn registration(
     unit_planner: UnitPlanner,
     tools: &[&str],
 ) -> AuthorityRegistration {
-    AuthorityRegistration::new(
-        role_id,
-        profile,
-        ArtifactAuthority::FileStore,
-        1,
-        1,
-        unit_planner,
-        tools.iter().copied(),
-    )
-    .expect("builtin authority registration must be valid")
+    AuthorityRegistration::new(role_id, profile, 1, 1, unit_planner, tools.iter().copied())
+        .expect("builtin authority registration must be valid")
 }
 
 fn validate_role_id(role_id: &str) -> Result<(), AuthorityRegistryError> {
@@ -692,18 +663,6 @@ mod tests {
     fn builtin_registry_covers_each_current_agent_role_profile_exactly_once() {
         let registry = AuthorityRegistry::builtin();
         assert_eq!(registry.registrations().count(), 17);
-        assert_eq!(
-            registry
-                .authority_for("analyst.technical", ToolManagedProfile::AnalystReport)
-                .unwrap(),
-            ArtifactAuthority::FileStore
-        );
-        assert_eq!(
-            registry
-                .authority_for("mediator.topic", ToolManagedProfile::ResearcherWarmup)
-                .unwrap(),
-            ArtifactAuthority::FileStore
-        );
         assert!(registry
             .registration("researcher.bull.initial", ToolManagedProfile::DebateSeed)
             .is_ok());
@@ -720,7 +679,6 @@ mod tests {
         let registration = AuthorityRegistration::new(
             "analyst.test",
             ToolManagedProfile::AnalystReport,
-            ArtifactAuthority::FileStore,
             1,
             1,
             UnitPlanner::AnalystTicker,
@@ -740,7 +698,6 @@ mod tests {
         let err = AuthorityRegistration::new(
             "analyst.test",
             ToolManagedProfile::AnalystReport,
-            ArtifactAuthority::FileStore,
             1,
             1,
             UnitPlanner::AnalystTicker,
@@ -752,7 +709,6 @@ mod tests {
         let err = AuthorityRegistration::new(
             "analyst.test",
             ToolManagedProfile::AnalystReport,
-            ArtifactAuthority::FileStore,
             1,
             1,
             UnitPlanner::AnalystTicker,
@@ -770,7 +726,6 @@ mod tests {
         let registration = AuthorityRegistration {
             role_id: "analyst.test".to_string(),
             profile: ToolManagedProfile::AnalystReport,
-            authority: ArtifactAuthority::FileStore,
             profile_version: 1,
             builder_version: 1,
             unit_planner: UnitPlanner::AnalystTicker,

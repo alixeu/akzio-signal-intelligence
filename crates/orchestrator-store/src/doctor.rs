@@ -1000,8 +1000,8 @@ mod tests {
     use crate::{
         append_index_detail, create_index, create_or_recover_draft, finalize_draft_atomic,
         finalize_index, write_run_manifest, AppendIndexDetailInput, ArtifactScope,
-        ContentHashDocument, CreateIndexInput, DetailSection, DraftProfile, FileStore,
-        FinalizableArtifact, IndexKind, IndexScope, RunLocation, RunManifest, RunManifestInit,
+        ContentHashDocument, CreateIndexInput, DetailSection, FileStore, FinalizableArtifact,
+        IndexKind, IndexScope, RunLocation, RunManifest, RunManifestInit, ToolManagedProfile,
     };
 
     fn location() -> RunLocation {
@@ -1075,7 +1075,7 @@ mod tests {
             current_date: "2026-07-27".to_owned(),
             phase: 1,
             role: "analyst.technical".to_owned(),
-            profile: DraftProfile::AnalystReport,
+            profile: ToolManagedProfile::AnalystReport,
             profile_version: 1,
             builder_version: 1,
             unit_key: "QQQ".to_owned(),

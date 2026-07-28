@@ -2,8 +2,8 @@
 
 use anyhow::{bail, Context, Result};
 use orchestrator_core::{
-    config_bool, config_get, config_int, config_str, config_strings, project_path, AgentRegistry,
-    AuthorityRegistry, RetrievalBudget,
+    config_bool, config_get, config_int, config_str, config_strings, project_path,
+    AuthorityRegistry,
 };
 use orchestrator_llm::{
     truncation::TruncationConfig,
@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use tracing::warn;
 
-use orchestrator_core::{validate_plugins, ComponentRegistry, RolePluginRegistry};
+use orchestrator_core::{validate_plugins, ComponentRegistry};
 
 // Prompt versioning convention:
 // - v1 is the current/base prompt path and keeps backward compatibility with flat string config.
@@ -41,8 +41,6 @@ pub(crate) struct RuntimeConfig {
     pub tool_managed: ToolManagedConfig,
     pub plugins: PluginConfig,
     pub component_plugins: ComponentRegistry,
-    pub role_plugins: RolePluginRegistry,
-    pub agent_registry: AgentRegistry,
     /// Immutable FileStore ownership for every role/profile, captured in the
     /// run manifest before recovery is permitted.
     pub authority_registry: AuthorityRegistry,
@@ -105,7 +103,6 @@ impl RetrievalConfig {
 pub(crate) struct PluginConfig {
     pub enabled: bool,
     pub components_dir: PathBuf,
-    pub roles_dir: PathBuf,
     pub disabled_components: Vec<String>,
     pub extra_component_dirs: Vec<PathBuf>,
 }
@@ -125,7 +122,6 @@ pub(crate) struct AllocationConfig {
 pub(crate) struct ReflectionConfig {
     pub enabled: bool,
     pub reflection_version: String,
-    pub retrieval: RetrievalBudget,
     pub task_limit: usize,
     pub parallelism: usize,
     pub loss_return: f64,
@@ -159,11 +155,6 @@ impl PluginConfig {
             "orchestrator.plugins.components_dir",
             "prompts/common/components",
         ));
-        let roles_dir = project_path(config_str(
-            config,
-            "orchestrator.plugins.roles_dir",
-            "prompts/roles",
-        ));
         let extra_component_dirs =
             config_strings(config, "orchestrator.plugins.extra_component_dirs", &[])
                 .into_iter()
@@ -172,7 +163,6 @@ impl PluginConfig {
         Self {
             enabled: config_bool(config, "orchestrator.plugins.enabled", true),
             components_dir,
-            roles_dir,
             disabled_components: config_strings(
                 config,
                 "orchestrator.plugins.disabled_components",
@@ -509,44 +499,28 @@ impl RuntimeConfig {
             "prompts/phase6/portfolio_manager.md",
         )?;
         let plugin_config = PluginConfig::from_value(config);
-        let (component_plugins, role_plugins) = if plugin_config.enabled {
+        let component_plugins = if plugin_config.enabled {
             let mut component_dirs = vec![plugin_config.components_dir.clone()];
             component_dirs.extend(plugin_config.extra_component_dirs.clone());
             let mut components = ComponentRegistry::discover_all(&component_dirs)?;
             components.disable_components(&plugin_config.disabled_components);
-            let roles = RolePluginRegistry::discover_dir(&plugin_config.roles_dir)?;
-            validate_plugins(&components, &roles)?;
+            validate_plugins(&components)?;
             tracing::info!(
                 component_plugins = components.components.len(),
-                role_plugins = roles.roles.len(),
                 "discovered prompt plugins"
             );
-            (components, roles)
+            components
         } else {
-            (ComponentRegistry::default(), RolePluginRegistry::default())
+            ComponentRegistry::default()
         };
-        for plugin in role_plugins.roles.values() {
-            prompts.insert(plugin.manifest.role_id.clone(), plugin.role_path());
-            versions
-                .entry(plugin.manifest.role_id.clone())
-                .or_insert_with(|| "v1".to_string());
-        }
         let prompts_config = PromptConfig { prompts, versions };
-        let mut llm_roles = llm_roles_from_config(config)?;
-        merge_plugin_llm_role_defaults(config, &mut llm_roles, &role_plugins)?;
+        let llm_roles = llm_roles_from_config(config)?;
         let truncation = truncation_config_from_value(config);
         let mut web_search = web_search_by_role_from_config(config, llm_roles.iter())?;
         for config in web_search.values_mut() {
             config.truncation = truncation.clone();
         }
-        let workflow = WorkflowConfig::from_value_with_registry(config, &role_plugins);
-        let mut agent_registry = AgentRegistry::builtin();
-        agent_registry.extend_role_manifests(
-            role_plugins
-                .roles
-                .values()
-                .map(|plugin| (&plugin.manifest, plugin.role_path())),
-        );
+        let workflow = WorkflowConfig::from_value(config);
         let authority_registry = AuthorityRegistry::builtin();
         let alpaca_api_key = config_str(config, "orchestrator.alpaca.api_key", "")
             .trim()
@@ -571,8 +545,6 @@ impl RuntimeConfig {
             tool_managed: ToolManagedConfig::from_value(config)?,
             plugins: plugin_config,
             component_plugins,
-            role_plugins,
-            agent_registry,
             authority_registry,
         })
     }
@@ -583,51 +555,6 @@ fn truncation_config_from_value(config: &Value) -> TruncationConfig {
         .map_or_else(TruncationConfig::default, |value| {
             serde_json::from_value::<TruncationConfig>(value.clone()).unwrap_or_default()
         })
-}
-
-fn merge_plugin_llm_role_defaults(
-    config: &Value,
-    roles: &mut BTreeMap<String, RoleLlmSettings>,
-    plugins: &RolePluginRegistry,
-) -> Result<()> {
-    let defaults = config_get(config, "orchestrator.llm.defaults")
-        .cloned()
-        .unwrap_or_else(|| Value::String(String::new()));
-    for plugin in plugins.roles.values() {
-        if let Some(settings) = roles.get_mut(&plugin.manifest.role_id) {
-            if settings.tools.is_empty() && !plugin.manifest.tools.is_empty() {
-                settings.tools = plugin.manifest.tools.clone();
-            }
-            continue;
-        }
-        if plugin.manifest.tools.is_empty() {
-            continue;
-        }
-        let mut effective = defaults.clone();
-        if let Some(object) = effective.as_object_mut() {
-            object.insert(
-                "tools".to_string(),
-                Value::Array(
-                    plugin
-                        .manifest
-                        .tools
-                        .iter()
-                        .map(|tool| Value::String(tool.clone()))
-                        .collect(),
-                ),
-            );
-        }
-        normalize_llm_role_tools(&mut effective, &plugin.manifest.role_id)?;
-        let settings: RoleLlmSettings = serde_json::from_value(effective).with_context(|| {
-            format!(
-                "invalid LLM defaults for plugin role {:?}",
-                plugin.manifest.role_id
-            )
-        })?;
-        settings.validate(&plugin.manifest.role_id)?;
-        roles.insert(plugin.manifest.role_id.clone(), settings);
-    }
-    Ok(())
 }
 
 pub(crate) fn llm_roles_from_config(config: &Value) -> Result<BTreeMap<String, RoleLlmSettings>> {
@@ -946,9 +873,9 @@ fn validate_web_search_enum_field(
 }
 
 pub(crate) fn required_llm_roles() -> Vec<String> {
-    let registry = orchestrator_core::role_registry::AgentRegistry::builtin();
-    let mut ids = registry.all_role_ids();
-    for id in [
+    [
+        "analyst.technical",
+        "analyst.news_macro",
         "reflector.historical",
         "mediator.topic",
         "researcher.bull.initial",
@@ -958,17 +885,14 @@ pub(crate) fn required_llm_roles() -> Vec<String> {
         "mediator.topic_controller",
         "manager.research",
         "compressor.phase_summary",
-    ] {
-        if !ids.contains(&id.to_string()) {
-            ids.push(id.to_string());
-        }
-    }
-    ids
+    ]
+    .into_iter()
+    .map(ToString::to_string)
+    .collect()
 }
 
 impl ReflectionConfig {
     pub fn from_value(config: &Value) -> Self {
-        let defaults = RetrievalBudget::default();
         Self {
             enabled: config_bool(config, "orchestrator.reflection.enabled", true),
             reflection_version: config_str(
@@ -1000,52 +924,29 @@ impl ReflectionConfig {
                 2,
             )
             .max(2),
-            retrieval: RetrievalBudget {
-                token_budget: config_int(
-                    config,
-                    "orchestrator.reflection.retrieval.token_budget",
-                    defaults.token_budget as i64,
-                )
-                .max(1) as usize,
-                max_items: config_int(
-                    config,
-                    "orchestrator.reflection.retrieval.max_items",
-                    defaults.max_items as i64,
-                )
-                .max(1) as usize,
-                min_quality: config_f64(
-                    config,
-                    "orchestrator.reflection.retrieval.min_quality",
-                    defaults.min_quality,
-                )
-                .clamp(0.0, 1.0),
-            },
         }
     }
 }
 
 impl WorkflowConfig {
-    pub fn from_value_with_registry(config: &Value, role_plugins: &RolePluginRegistry) -> Self {
+    pub fn from_value(config: &Value) -> Self {
         let phase1_parallelism =
             config_int(config, "orchestrator.workflow.phase1.parallelism", 5).max(1) as usize;
         let agent_timeout_sec =
             config_int(config, "orchestrator.workflow.agent_timeout_sec", 300).max(1) as u64;
         let reducer_timeout_sec =
             config_int(config, "orchestrator.workflow.reducer_timeout_sec", 300).max(1) as u64;
-        let mut registry = AgentRegistry::builtin();
-        registry.extend_role_manifests(
-            role_plugins
-                .roles
-                .values()
-                .map(|plugin| (&plugin.manifest, plugin.role_path())),
-        );
         let critical_roles = config_strings(
             config,
             "orchestrator.workflow.phase1.critical_roles",
             &["analyst.technical", "analyst.news_macro"],
         )
         .into_iter()
-        .map(|role| registry.normalize_role_name(&role))
+        .map(|role| match role.as_str() {
+            "technical" => "analyst.technical".to_owned(),
+            "news_macro" => "analyst.news_macro".to_owned(),
+            _ => role,
+        })
         .collect::<BTreeSet<_>>();
         let late_evidence_enabled =
             config_bool(config, "orchestrator.workflow.late_evidence.enabled", true);

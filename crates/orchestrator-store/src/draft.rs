@@ -4,8 +4,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use orchestrator_core::artifact::{BindingRiskControl, Scenario, Scenarios, StopType};
-use orchestrator_core::EvidenceItem;
+use orchestrator_core::{
+    artifact::{BindingRiskControl, Scenario, Scenarios, StopType},
+    EvidenceItem, ToolManagedProfile,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -17,49 +19,13 @@ use crate::{
 
 pub const DRAFT_SCHEMA_VERSION: u32 = 1;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DraftProfile {
-    HistoricalReflection,
-    AnalystReport,
-    TopicGeneration,
-    ResearcherWarmup,
-    DebateSeed,
-    DebateResponse,
-    TopicControl,
-    ResearchDecision,
-    TradeIntent,
-    RiskReview,
-    PortfolioDecision,
-    PhaseSummary,
-}
-
-impl DraftProfile {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::HistoricalReflection => "historical_reflection",
-            Self::AnalystReport => "analyst_report",
-            Self::TopicGeneration => "topic_generation",
-            Self::ResearcherWarmup => "researcher_warmup",
-            Self::DebateSeed => "debate_seed",
-            Self::DebateResponse => "debate_response",
-            Self::TopicControl => "topic_control",
-            Self::ResearchDecision => "research_decision",
-            Self::TradeIntent => "trade_intent",
-            Self::RiskReview => "risk_review",
-            Self::PortfolioDecision => "portfolio_decision",
-            Self::PhaseSummary => "phase_summary",
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactScope {
     pub run_id: String,
     pub current_date: String,
     pub phase: u8,
     pub role: String,
-    pub profile: DraftProfile,
+    pub profile: ToolManagedProfile,
     pub profile_version: u32,
     pub builder_version: u32,
     pub unit_key: String,
@@ -391,37 +357,39 @@ pub enum ArtifactDraftState {
 }
 
 impl ArtifactDraftState {
-    pub fn for_profile(profile: DraftProfile) -> Self {
+    pub fn for_profile(profile: ToolManagedProfile) -> Self {
         match profile {
-            DraftProfile::HistoricalReflection => Self::HistoricalReflection(Default::default()),
-            DraftProfile::AnalystReport => Self::AnalystReport(Default::default()),
-            DraftProfile::TopicGeneration => Self::TopicGeneration(Default::default()),
-            DraftProfile::ResearcherWarmup => Self::ResearcherWarmup(Default::default()),
-            DraftProfile::DebateSeed => Self::DebateSeed(Default::default()),
-            DraftProfile::DebateResponse => Self::DebateResponse(Default::default()),
-            DraftProfile::TopicControl => Self::TopicControl(Default::default()),
-            DraftProfile::ResearchDecision => Self::ResearchDecision(Default::default()),
-            DraftProfile::TradeIntent => Self::TradeIntent(Default::default()),
-            DraftProfile::RiskReview => Self::RiskReview(Default::default()),
-            DraftProfile::PortfolioDecision => Self::PortfolioDecision(Default::default()),
-            DraftProfile::PhaseSummary => Self::PhaseSummary(Default::default()),
+            ToolManagedProfile::HistoricalReflection => {
+                Self::HistoricalReflection(Default::default())
+            }
+            ToolManagedProfile::AnalystReport => Self::AnalystReport(Default::default()),
+            ToolManagedProfile::TopicGeneration => Self::TopicGeneration(Default::default()),
+            ToolManagedProfile::ResearcherWarmup => Self::ResearcherWarmup(Default::default()),
+            ToolManagedProfile::DebateSeed => Self::DebateSeed(Default::default()),
+            ToolManagedProfile::DebateResponse => Self::DebateResponse(Default::default()),
+            ToolManagedProfile::TopicControl => Self::TopicControl(Default::default()),
+            ToolManagedProfile::ResearchDecision => Self::ResearchDecision(Default::default()),
+            ToolManagedProfile::TradeIntent => Self::TradeIntent(Default::default()),
+            ToolManagedProfile::RiskReview => Self::RiskReview(Default::default()),
+            ToolManagedProfile::PortfolioDecision => Self::PortfolioDecision(Default::default()),
+            ToolManagedProfile::PhaseSummary => Self::PhaseSummary(Default::default()),
         }
     }
 
-    pub fn profile(&self) -> DraftProfile {
+    pub fn profile(&self) -> ToolManagedProfile {
         match self {
-            Self::HistoricalReflection(_) => DraftProfile::HistoricalReflection,
-            Self::AnalystReport(_) => DraftProfile::AnalystReport,
-            Self::TopicGeneration(_) => DraftProfile::TopicGeneration,
-            Self::ResearcherWarmup(_) => DraftProfile::ResearcherWarmup,
-            Self::DebateSeed(_) => DraftProfile::DebateSeed,
-            Self::DebateResponse(_) => DraftProfile::DebateResponse,
-            Self::TopicControl(_) => DraftProfile::TopicControl,
-            Self::ResearchDecision(_) => DraftProfile::ResearchDecision,
-            Self::TradeIntent(_) => DraftProfile::TradeIntent,
-            Self::RiskReview(_) => DraftProfile::RiskReview,
-            Self::PortfolioDecision(_) => DraftProfile::PortfolioDecision,
-            Self::PhaseSummary(_) => DraftProfile::PhaseSummary,
+            Self::HistoricalReflection(_) => ToolManagedProfile::HistoricalReflection,
+            Self::AnalystReport(_) => ToolManagedProfile::AnalystReport,
+            Self::TopicGeneration(_) => ToolManagedProfile::TopicGeneration,
+            Self::ResearcherWarmup(_) => ToolManagedProfile::ResearcherWarmup,
+            Self::DebateSeed(_) => ToolManagedProfile::DebateSeed,
+            Self::DebateResponse(_) => ToolManagedProfile::DebateResponse,
+            Self::TopicControl(_) => ToolManagedProfile::TopicControl,
+            Self::ResearchDecision(_) => ToolManagedProfile::ResearchDecision,
+            Self::TradeIntent(_) => ToolManagedProfile::TradeIntent,
+            Self::RiskReview(_) => ToolManagedProfile::RiskReview,
+            Self::PortfolioDecision(_) => ToolManagedProfile::PortfolioDecision,
+            Self::PhaseSummary(_) => ToolManagedProfile::PhaseSummary,
         }
     }
 }
@@ -831,7 +799,7 @@ pub fn complete_terminal_draft_without_artifact<T: Serialize>(
     created_at: impl Into<String>,
     mutate: impl FnOnce(&mut ArtifactDraftState) -> Result<()>,
 ) -> Result<DraftAppendOutcome> {
-    if scope.profile != DraftProfile::ResearcherWarmup {
+    if scope.profile != ToolManagedProfile::ResearcherWarmup {
         return Err(StoreError::InvalidDocument {
             kind: "terminal draft",
             message: "only researcher_warmup may complete without an artifact".to_owned(),
@@ -1050,7 +1018,7 @@ pub(crate) fn read_draft(
     store: &FileStore,
     location: &RunLocation,
     relative: &Path,
-    profile: DraftProfile,
+    profile: ToolManagedProfile,
 ) -> Result<ArtifactDraft> {
     let draft = store.read_versioned_json::<ArtifactDraft>(
         relative,
@@ -1167,7 +1135,7 @@ mod tests {
     use super::{
         append_draft_receipt, create_or_recover_draft, draft_relative, fail_draft,
         finalize_draft_atomic, ArtifactDraft, ArtifactScope, DraftAppendOutcome, DraftFailure,
-        DraftLifecycle, DraftProfile, FinalizableArtifact, FinalizeDraftOutcome,
+        DraftLifecycle, FinalizableArtifact, FinalizeDraftOutcome, ToolManagedProfile,
     };
     use crate::{ContentHashDocument, FileSchemaKind, FileStore, FileStoreOptions, RunLocation};
 
@@ -1181,7 +1149,7 @@ mod tests {
             current_date: "2026-07-27".to_owned(),
             phase: 3,
             role: "manager.research".to_owned(),
-            profile: DraftProfile::ResearchDecision,
+            profile: ToolManagedProfile::ResearchDecision,
             profile_version: 1,
             builder_version: 1,
             unit_key: "QQQ".to_owned(),

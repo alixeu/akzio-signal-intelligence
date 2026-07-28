@@ -12,7 +12,8 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
-use serde::{Deserialize, Serialize};
+pub use orchestrator_store::{DetailSection, IndexKind};
+use serde::Serialize;
 use serde_json::{json, Map, Value};
 
 use super::{api_tool_name, ToolDefinition};
@@ -55,84 +56,6 @@ const MODEL_OWNED_FIELD_NAMES: &[&str] = &[
     "ticker",
     "topic_id",
 ];
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum IndexKind {
-    PhaseSummary,
-    Experience,
-}
-
-impl IndexKind {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::PhaseSummary => "phase_summary",
-            Self::Experience => "experience",
-        }
-    }
-
-    fn parse(value: &str) -> Result<Self> {
-        match value {
-            "phase_summary" => Ok(Self::PhaseSummary),
-            "experience" => Ok(Self::Experience),
-            _ => bail!("kind must be phase_summary or experience"),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DetailSection {
-    Evidence,
-    CounterEvidence,
-    Conflict,
-    DecisionHinge,
-    DataGap,
-    Invalidation,
-    NextStep,
-    Analysis,
-    HistoricalCase,
-    Execution,
-    Risk,
-    Other,
-}
-
-impl DetailSection {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Evidence => "evidence",
-            Self::CounterEvidence => "counter_evidence",
-            Self::Conflict => "conflict",
-            Self::DecisionHinge => "decision_hinge",
-            Self::DataGap => "data_gap",
-            Self::Invalidation => "invalidation",
-            Self::NextStep => "next_step",
-            Self::Analysis => "analysis",
-            Self::HistoricalCase => "historical_case",
-            Self::Execution => "execution",
-            Self::Risk => "risk",
-            Self::Other => "other",
-        }
-    }
-
-    fn parse(value: &str) -> Result<Self> {
-        match value {
-            "evidence" => Ok(Self::Evidence),
-            "counter_evidence" => Ok(Self::CounterEvidence),
-            "conflict" => Ok(Self::Conflict),
-            "decision_hinge" => Ok(Self::DecisionHinge),
-            "data_gap" => Ok(Self::DataGap),
-            "invalidation" => Ok(Self::Invalidation),
-            "next_step" => Ok(Self::NextStep),
-            "analysis" => Ok(Self::Analysis),
-            "historical_case" => Ok(Self::HistoricalCase),
-            "execution" => Ok(Self::Execution),
-            "risk" => Ok(Self::Risk),
-            "other" => Ok(Self::Other),
-            _ => bail!("section is not an allowed Index Detail section"),
-        }
-    }
-}
 
 /// Immutable fields determined by the Rust Summary Unit planner or the
 /// historical-reflection task. None may be supplied by the model.
@@ -993,7 +916,7 @@ fn scoped_filter(
 
 fn scoped_value_filter<T>(field: &str, value: Option<T>, allowed: &BTreeSet<T>) -> Result<Option<T>>
 where
-    T: Ord + std::fmt::Display,
+    T: Ord + std::fmt::Debug,
 {
     match (value, allowed.len()) {
         (Some(_), 0) => bail!("{field} is not selectable in this scope"),
@@ -1006,10 +929,10 @@ where
 
 fn ensure_value_visible<T>(field: &str, value: T, allowed: &BTreeSet<T>) -> Result<()>
 where
-    T: Ord + std::fmt::Display,
+    T: Ord + std::fmt::Debug,
 {
     if !allowed.contains(&value) {
-        bail!("{field}={value} is not in this scope's allowlist");
+        bail!("{field}={value:?} is not in this scope's allowlist");
     }
     Ok(())
 }
@@ -1019,12 +942,6 @@ fn ensure_subset(field: &str, values: &[u8], allowed: &BTreeSet<u8>) -> Result<(
         ensure_value_visible(field, *value, allowed)?;
     }
     Ok(())
-}
-
-impl std::fmt::Display for IndexKind {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.as_str())
-    }
 }
 
 #[cfg(test)]

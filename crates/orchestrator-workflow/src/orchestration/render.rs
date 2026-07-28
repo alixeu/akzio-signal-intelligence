@@ -1239,10 +1239,7 @@ required_variables = ["ticker", "tickers"]
                 "status": "skipped_no_actionable_evidence",
                 "topic_briefs": [{"topic_id": "QQQ-gap"}],
                 "debate_turns": [{"should_not": "be forwarded"}]
-            },
-            "prior_experience": {"items": []},
-            "track_record": {"sample_size": 2},
-            "agent_accuracy": {"analyst.technical": 0.7}
+            }
         }));
 
         assert!(context.get("phase1").is_none());
@@ -1252,9 +1249,6 @@ required_variables = ["ticker", "tickers"]
             context["weighted_probability_base"]["QQQ"]["long_probability"],
             0.5
         );
-        assert!(context.get("prior_experience").is_none());
-        assert!(context.get("track_record").is_none());
-        assert!(context.get("agent_accuracy").is_none());
     }
 
     #[test]

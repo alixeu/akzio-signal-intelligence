@@ -5,7 +5,6 @@ pub mod index_runtime;
 pub(crate) mod input_snapshot_runtime;
 pub(crate) mod lifecycle;
 pub mod render;
-pub(crate) mod retrieval;
 pub(crate) mod role_jobs;
 pub(crate) mod summary_store;
 pub mod summary_units;

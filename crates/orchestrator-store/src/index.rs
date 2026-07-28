@@ -26,6 +26,26 @@ pub enum IndexKind {
     Experience,
 }
 
+impl IndexKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PhaseSummary => "phase_summary",
+            Self::Experience => "experience",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "phase_summary" => Ok(Self::PhaseSummary),
+            "experience" => Ok(Self::Experience),
+            _ => Err(StoreError::InvalidDocument {
+                kind: "index kind",
+                message: "kind must be phase_summary or experience".to_owned(),
+            }),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DetailSection {
@@ -41,6 +61,46 @@ pub enum DetailSection {
     Execution,
     Risk,
     Other,
+}
+
+impl DetailSection {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Evidence => "evidence",
+            Self::CounterEvidence => "counter_evidence",
+            Self::Conflict => "conflict",
+            Self::DecisionHinge => "decision_hinge",
+            Self::DataGap => "data_gap",
+            Self::Invalidation => "invalidation",
+            Self::NextStep => "next_step",
+            Self::Analysis => "analysis",
+            Self::HistoricalCase => "historical_case",
+            Self::Execution => "execution",
+            Self::Risk => "risk",
+            Self::Other => "other",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "evidence" => Ok(Self::Evidence),
+            "counter_evidence" => Ok(Self::CounterEvidence),
+            "conflict" => Ok(Self::Conflict),
+            "decision_hinge" => Ok(Self::DecisionHinge),
+            "data_gap" => Ok(Self::DataGap),
+            "invalidation" => Ok(Self::Invalidation),
+            "next_step" => Ok(Self::NextStep),
+            "analysis" => Ok(Self::Analysis),
+            "historical_case" => Ok(Self::HistoricalCase),
+            "execution" => Ok(Self::Execution),
+            "risk" => Ok(Self::Risk),
+            "other" => Ok(Self::Other),
+            _ => Err(StoreError::InvalidDocument {
+                kind: "index detail section",
+                message: "section is not an allowed Index Detail section".to_owned(),
+            }),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -32,11 +32,11 @@ use orchestrator_store::{
     set_analyst_assessment, set_analyst_invalidation, set_portfolio_asset_decision,
     set_research_decision, set_research_scenarios, set_risk_assessment, set_risk_constraints,
     set_trade_intent, write_session_manifest, AnalystAssessmentInput, AnalystEvidenceInput,
-    ArtifactScope, ClaimStatus, DomainFinalizeOutcome, DraftAppendOutcome, DraftProfile,
-    EvidenceReadEvent, FileStore, FileStoreOptions, FinalizeDraftOutcome, ForkReference,
-    Phase2DraftService, PortfolioAssetDecisionInput, PortfolioDecisionFinalizePolicy,
-    ResearchDecisionInput, ResearchScenarioInput, RiskAssessmentInput, RiskConstraintsInput,
-    RunLocation, SessionEventInput, SessionEventType, SessionLocation, SessionManifest,
+    ArtifactScope, ClaimStatus, DomainFinalizeOutcome, DraftAppendOutcome, EvidenceReadEvent,
+    FileStore, FileStoreOptions, FinalizeDraftOutcome, ForkReference, Phase2DraftService,
+    PortfolioAssetDecisionInput, PortfolioDecisionFinalizePolicy, ResearchDecisionInput,
+    ResearchScenarioInput, RiskAssessmentInput, RiskConstraintsInput, RunLocation,
+    SessionEventInput, SessionEventType, SessionLocation, SessionManifest,
     TradeIntentFinalizePolicy, TradeIntentInput, VisibleEvidenceSet,
 };
 use serde_json::{json, Value};
@@ -71,16 +71,16 @@ pub(crate) fn file_store_domain_runtime(
     plan: FileStoreDomainRuntimePlan,
 ) -> Result<DomainToolRuntimeBinding> {
     let draft_profile = match plan.profile {
-        ToolManagedProfile::AnalystReport => DraftProfile::AnalystReport,
-        ToolManagedProfile::ResearcherWarmup => DraftProfile::ResearcherWarmup,
-        ToolManagedProfile::TopicGeneration => DraftProfile::TopicGeneration,
-        ToolManagedProfile::DebateSeed => DraftProfile::DebateSeed,
-        ToolManagedProfile::DebateResponse => DraftProfile::DebateResponse,
-        ToolManagedProfile::TopicControl => DraftProfile::TopicControl,
-        ToolManagedProfile::ResearchDecision => DraftProfile::ResearchDecision,
-        ToolManagedProfile::TradeIntent => DraftProfile::TradeIntent,
-        ToolManagedProfile::RiskReview => DraftProfile::RiskReview,
-        ToolManagedProfile::PortfolioDecision => DraftProfile::PortfolioDecision,
+        ToolManagedProfile::AnalystReport => ToolManagedProfile::AnalystReport,
+        ToolManagedProfile::ResearcherWarmup => ToolManagedProfile::ResearcherWarmup,
+        ToolManagedProfile::TopicGeneration => ToolManagedProfile::TopicGeneration,
+        ToolManagedProfile::DebateSeed => ToolManagedProfile::DebateSeed,
+        ToolManagedProfile::DebateResponse => ToolManagedProfile::DebateResponse,
+        ToolManagedProfile::TopicControl => ToolManagedProfile::TopicControl,
+        ToolManagedProfile::ResearchDecision => ToolManagedProfile::ResearchDecision,
+        ToolManagedProfile::TradeIntent => ToolManagedProfile::TradeIntent,
+        ToolManagedProfile::RiskReview => ToolManagedProfile::RiskReview,
+        ToolManagedProfile::PortfolioDecision => ToolManagedProfile::PortfolioDecision,
         _ => bail!(
             "no FileStore domain adapter exists for {}",
             plan.profile.as_str()
@@ -846,7 +846,7 @@ struct FileStoreDomainToolService {
 }
 
 impl FileStoreDomainToolService {
-    fn require(&self, profile: DraftProfile) -> Result<()> {
+    fn require(&self, profile: ToolManagedProfile) -> Result<()> {
         if self.scope.profile == profile {
             Ok(())
         } else {
@@ -915,7 +915,7 @@ impl FileStoreDomainToolService {
 
 impl DomainToolService for FileStoreDomainToolService {
     fn set_analyst_assessment(&self, command: AnalystAssessmentCommand) -> Result<Value> {
-        self.require(DraftProfile::AnalystReport)?;
+        self.require(ToolManagedProfile::AnalystReport)?;
         Ok(Self::append(set_analyst_assessment(
             &self.store,
             &self.location,
@@ -934,7 +934,7 @@ impl DomainToolService for FileStoreDomainToolService {
     }
 
     fn append_analyst_evidence(&self, command: AnalystEvidenceCommand) -> Result<Value> {
-        self.require(DraftProfile::AnalystReport)?;
+        self.require(ToolManagedProfile::AnalystReport)?;
         Ok(Self::append(append_analyst_evidence(
             &self.store,
             &self.location,
@@ -949,7 +949,7 @@ impl DomainToolService for FileStoreDomainToolService {
     }
 
     fn append_analyst_data_gap(&self, command: AnalystDataGapCommand) -> Result<Value> {
-        self.require(DraftProfile::AnalystReport)?;
+        self.require(ToolManagedProfile::AnalystReport)?;
         Ok(Self::append(append_analyst_data_gap(
             &self.store,
             &self.location,
@@ -961,7 +961,7 @@ impl DomainToolService for FileStoreDomainToolService {
     }
 
     fn set_analyst_invalidation(&self, command: AnalystInvalidationCommand) -> Result<Value> {
-        self.require(DraftProfile::AnalystReport)?;
+        self.require(ToolManagedProfile::AnalystReport)?;
         Ok(Self::append(set_analyst_invalidation(
             &self.store,
             &self.location,
@@ -973,7 +973,7 @@ impl DomainToolService for FileStoreDomainToolService {
     }
 
     fn finalize_analyst_report(&self) -> Result<Value> {
-        self.require(DraftProfile::AnalystReport)?;
+        self.require(ToolManagedProfile::AnalystReport)?;
         self.finalized(finalize_analyst_report(
             &self.store,
             &self.location,
@@ -984,7 +984,7 @@ impl DomainToolService for FileStoreDomainToolService {
     }
 
     fn set_research_decision(&self, command: ResearchDecisionCommand) -> Result<Value> {
-        self.require(DraftProfile::ResearchDecision)?;
+        self.require(ToolManagedProfile::ResearchDecision)?;
         Ok(Self::append(set_research_decision(
             &self.store,
             &self.location,
@@ -1004,7 +1004,7 @@ impl DomainToolService for FileStoreDomainToolService {
     }
 
     fn set_research_scenarios(&self, command: ResearchScenariosCommand) -> Result<Value> {
-        self.require(DraftProfile::ResearchDecision)?;
+        self.require(ToolManagedProfile::ResearchDecision)?;
         Ok(Self::append(set_research_scenarios(
             &self.store,
             &self.location,
@@ -1020,7 +1020,7 @@ impl DomainToolService for FileStoreDomainToolService {
     }
 
     fn append_research_hinge(&self, command: ResearchHingeCommand) -> Result<Value> {
-        self.require(DraftProfile::ResearchDecision)?;
+        self.require(ToolManagedProfile::ResearchDecision)?;
         Ok(Self::append(append_research_hinge(
             &self.store,
             &self.location,
@@ -1033,7 +1033,7 @@ impl DomainToolService for FileStoreDomainToolService {
     }
 
     fn finalize_research_decision(&self) -> Result<Value> {
-        self.require(DraftProfile::ResearchDecision)?;
+        self.require(ToolManagedProfile::ResearchDecision)?;
         self.finalized(finalize_research_decision(
             &self.store,
             &self.location,
@@ -1044,7 +1044,7 @@ impl DomainToolService for FileStoreDomainToolService {
     }
 
     fn set_trade_intent(&self, command: TradeIntentCommand) -> Result<Value> {
-        self.require(DraftProfile::TradeIntent)?;
+        self.require(ToolManagedProfile::TradeIntent)?;
         Ok(Self::append(set_trade_intent(
             &self.store,
             &self.location,
@@ -1061,7 +1061,7 @@ impl DomainToolService for FileStoreDomainToolService {
         )?))
     }
     fn append_trade_blocker(&self, command: TradeBlockerCommand) -> Result<Value> {
-        self.require(DraftProfile::TradeIntent)?;
+        self.require(ToolManagedProfile::TradeIntent)?;
         Ok(Self::append(append_trade_blocker(
             &self.store,
             &self.location,
@@ -1071,7 +1071,7 @@ impl DomainToolService for FileStoreDomainToolService {
         )?))
     }
     fn finalize_trade_intent(&self) -> Result<Value> {
-        self.require(DraftProfile::TradeIntent)?;
+        self.require(ToolManagedProfile::TradeIntent)?;
         let candidate_action = self
             .trade_candidate_action
             .as_deref()
@@ -1086,7 +1086,7 @@ impl DomainToolService for FileStoreDomainToolService {
         )?)
     }
     fn set_risk_assessment(&self, command: RiskAssessmentCommand) -> Result<Value> {
-        self.require(DraftProfile::RiskReview)?;
+        self.require(ToolManagedProfile::RiskReview)?;
         Ok(Self::append(set_risk_assessment(
             &self.store,
             &self.location,
@@ -1101,7 +1101,7 @@ impl DomainToolService for FileStoreDomainToolService {
         )?))
     }
     fn set_risk_constraints(&self, command: RiskConstraintsCommand) -> Result<Value> {
-        self.require(DraftProfile::RiskReview)?;
+        self.require(ToolManagedProfile::RiskReview)?;
         Ok(Self::append(set_risk_constraints(
             &self.store,
             &self.location,
@@ -1121,7 +1121,7 @@ impl DomainToolService for FileStoreDomainToolService {
         )?))
     }
     fn finalize_risk_review(&self) -> Result<Value> {
-        self.require(DraftProfile::RiskReview)?;
+        self.require(ToolManagedProfile::RiskReview)?;
         self.finalized(finalize_risk_review(
             &self.store,
             &self.location,
@@ -1133,7 +1133,7 @@ impl DomainToolService for FileStoreDomainToolService {
         &self,
         command: PortfolioAssetDecisionCommand,
     ) -> Result<Value> {
-        self.require(DraftProfile::PortfolioDecision)?;
+        self.require(ToolManagedProfile::PortfolioDecision)?;
         Ok(Self::append(set_portfolio_asset_decision(
             &self.store,
             &self.location,
@@ -1153,7 +1153,7 @@ impl DomainToolService for FileStoreDomainToolService {
         )?))
     }
     fn append_binding_risk_control(&self, command: BindingRiskControlCommand) -> Result<Value> {
-        self.require(DraftProfile::PortfolioDecision)?;
+        self.require(ToolManagedProfile::PortfolioDecision)?;
         Ok(Self::append(append_binding_risk_control(
             &self.store,
             &self.location,
@@ -1163,7 +1163,7 @@ impl DomainToolService for FileStoreDomainToolService {
         )?))
     }
     fn finalize_portfolio_decision(&self) -> Result<Value> {
-        self.require(DraftProfile::PortfolioDecision)?;
+        self.require(ToolManagedProfile::PortfolioDecision)?;
         let ticker = self
             .scope
             .ticker
@@ -1188,7 +1188,7 @@ impl DomainToolService for FileStoreDomainToolService {
     }
 
     fn set_phase2_common_ground(&self, command: Phase2CommonGroundCommand) -> Result<Value> {
-        self.require(DraftProfile::TopicGeneration)?;
+        self.require(ToolManagedProfile::TopicGeneration)?;
         Ok(Self::append(
             self.phase2()?
                 .set_phase2_common_ground(command.common_ground)?,
@@ -1196,7 +1196,7 @@ impl DomainToolService for FileStoreDomainToolService {
     }
 
     fn create_phase2_topic(&self, command: Phase2TopicCommand) -> Result<Value> {
-        self.require(DraftProfile::TopicGeneration)?;
+        self.require(ToolManagedProfile::TopicGeneration)?;
         let (topic_id, outcome) = self.phase2()?.create_phase2_topic(
             command.topic,
             command.decision_hinge,
@@ -1208,18 +1208,18 @@ impl DomainToolService for FileStoreDomainToolService {
     }
 
     fn finalize_researcher_warmup(&self) -> Result<Value> {
-        self.require(DraftProfile::ResearcherWarmup)?;
+        self.require(ToolManagedProfile::ResearcherWarmup)?;
         Ok(Self::append(self.phase2()?.finalize_researcher_warmup()?))
     }
 
     fn finalize_topic_generation(&self) -> Result<Value> {
-        self.require(DraftProfile::TopicGeneration)?;
+        self.require(ToolManagedProfile::TopicGeneration)?;
         serde_json::to_value(self.phase2()?.finalize_topic_generation()?)
             .context("serialize phase2 topic generation artifact")
     }
 
     fn create_debate_claim(&self, command: DebateClaimCommand) -> Result<Value> {
-        self.require(DraftProfile::DebateSeed)?;
+        self.require(ToolManagedProfile::DebateSeed)?;
         let (claim_id, outcome) = self.phase2()?.create_debate_claim(
             command.claim,
             command.confidence,
@@ -1231,13 +1231,13 @@ impl DomainToolService for FileStoreDomainToolService {
     }
 
     fn finalize_debate_seed(&self) -> Result<Value> {
-        self.require(DraftProfile::DebateSeed)?;
+        self.require(ToolManagedProfile::DebateSeed)?;
         serde_json::to_value(self.phase2()?.finalize_debate_seed()?)
             .context("serialize phase2 debate seed artifact")
     }
 
     fn respond_to_debate_claim(&self, command: DebateResponseCommand) -> Result<Value> {
-        self.require(DraftProfile::DebateResponse)?;
+        self.require(ToolManagedProfile::DebateResponse)?;
         let (response_id, outcome) = self.phase2()?.respond_to_debate_claim(
             command.reply_to_claim_id,
             command.response,
@@ -1249,13 +1249,13 @@ impl DomainToolService for FileStoreDomainToolService {
     }
 
     fn finalize_debate_response(&self) -> Result<Value> {
-        self.require(DraftProfile::DebateResponse)?;
+        self.require(ToolManagedProfile::DebateResponse)?;
         serde_json::to_value(self.phase2()?.finalize_debate_response()?)
             .context("serialize phase2 debate response artifact")
     }
 
     fn set_claim_status(&self, command: ClaimStatusCommand) -> Result<Value> {
-        self.require(DraftProfile::TopicControl)?;
+        self.require(ToolManagedProfile::TopicControl)?;
         let status = match command.status.as_str() {
             "accepted" => ClaimStatus::Accepted,
             "rejected" => ClaimStatus::Rejected,
@@ -1269,19 +1269,19 @@ impl DomainToolService for FileStoreDomainToolService {
     }
 
     fn add_agreed_fact(&self, command: TextCommand) -> Result<Value> {
-        self.require(DraftProfile::TopicControl)?;
+        self.require(ToolManagedProfile::TopicControl)?;
         Ok(Self::append(self.phase2()?.add_agreed_fact(command.value)?))
     }
 
     fn set_decision_hinge(&self, command: TextCommand) -> Result<Value> {
-        self.require(DraftProfile::TopicControl)?;
+        self.require(ToolManagedProfile::TopicControl)?;
         Ok(Self::append(
             self.phase2()?.set_decision_hinge(command.value)?,
         ))
     }
 
     fn route_debate_steer(&self, command: DebateSteerCommand) -> Result<Value> {
-        self.require(DraftProfile::TopicControl)?;
+        self.require(ToolManagedProfile::TopicControl)?;
         Ok(Self::append(
             self.phase2()?
                 .route_debate_steer(command.target, command.instruction)?,
@@ -1289,7 +1289,7 @@ impl DomainToolService for FileStoreDomainToolService {
     }
 
     fn set_topic_soft_control(&self, command: TopicSoftControlCommand) -> Result<Value> {
-        self.require(DraftProfile::TopicControl)?;
+        self.require(ToolManagedProfile::TopicControl)?;
         Ok(Self::append(
             self.phase2()?
                 .set_topic_soft_control(command.should_continue)?,
@@ -1297,7 +1297,7 @@ impl DomainToolService for FileStoreDomainToolService {
     }
 
     fn finalize_topic_control(&self) -> Result<Value> {
-        self.require(DraftProfile::TopicControl)?;
+        self.require(ToolManagedProfile::TopicControl)?;
         serde_json::to_value(self.phase2()?.finalize_topic_control()?)
             .context("serialize phase2 topic control artifact")
     }
