@@ -7,56 +7,61 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use orchestrator_store::{
-    append_index_detail, content_hash, create_index, finalize_index, AppendIndexDetailInput,
-    CreateIndexInput, DetailSection, FileStore, FileStoreOptions, Index, IndexKind, IndexScope,
-    RunLocation,
+    append_index_detail, content_hash, create_index, finalize_index, read_run_manifest,
+    validate_content_hash_at, AppendIndexDetailInput, CreateIndexInput, DetailSection, FileStore,
+    FileStoreOptions, Index, IndexKind, IndexScope, RunLocation,
 };
 use serde_json::{json, Map, Value};
-use std::{collections::BTreeSet, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+};
 
-use super::{
-    lifecycle::tickers_from_state,
-    summary_units::{SummaryUnit, SummaryUnitPlanRequest, SummaryUnitPlanner, SummaryUnitScope},
+use super::summary_units::{
+    SummaryUnit, SummaryUnitPlanRequest, SummaryUnitPlanner, SummaryUnitScope,
 };
 
 /// The bounded, completed-artifact payload that may be summarized for one
-/// phase. It is intentionally built from state projections only; no reader
-/// may reach into mutable market data or a former database at this boundary.
-pub(crate) fn phase_summary_source_payload(state: &Value, source_phase: i64) -> Result<Value> {
-    let keys: &[&str] = match source_phase {
-        1 => &[
-            "phase1_index",
-            "phase1_brief_md",
-            "analyst_results",
-            "analyst_conflicts",
-            "weighted_probability_base",
-        ],
-        2 => &[
-            "topic_generation_artifact",
-            "debate_state_artifact",
-            "debate_brief_md",
-            "debate_turns",
-        ],
-        3 => &["research_plan"],
-        4 => &["trader_investment_plan"],
-        5 => &["risk_debate_state"],
-        6 => &["final_trade_decision"],
-        7 => &["allocation_result", "portfolio_allocation", "allocation"],
-        _ => anyhow::bail!("unsupported phase_summary source phase {source_phase}"),
-    };
-    let artifacts = keys.iter().fold(Map::new(), |mut out, key| {
-        if let Some(value) = state.get(*key).filter(|value| !value.is_null()) {
-            out.insert((*key).to_string(), value.clone());
-        }
-        out
-    });
-    if artifacts.is_empty() {
-        anyhow::bail!("phase_summary source phase {source_phase} has no completed artifacts");
+/// phase. The RunManifest is a reference-only catalog; each referenced,
+/// finalized Artifact is read and checked here. Mutable workflow state only
+/// supplies the run identity needed to locate that catalog.
+pub(crate) fn phase_summary_source_payload(
+    store_root: &Path,
+    state: &Value,
+    source_phase: i64,
+) -> Result<Value> {
+    let source_phase =
+        u8::try_from(source_phase).context("phase summary source phase must fit in a u8")?;
+    if !(1..=7).contains(&source_phase) {
+        anyhow::bail!("unsupported phase_summary source phase {source_phase}");
     }
+    let location = RunLocation::new(
+        required_state_string(state, "current_date")?,
+        required_state_string(state, "run_id")?,
+    )?;
+    let store = FileStore::open(store_root, FileStoreOptions::default())?;
+    let manifest = read_run_manifest(&store, &location)?;
+    let mut artifacts = BTreeMap::new();
+    for reference in manifest
+        .artifacts
+        .values()
+        .filter(|reference| reference.phase == source_phase)
+    {
+        let relative = location.child_relative(&reference.relative_path())?;
+        let artifact = store.read_json_value(&relative)?;
+        validate_content_hash_at(&artifact, &store.root().join(&relative))?;
+        validate_artifact_header(&artifact, reference)?;
+        artifacts.insert(reference.artifact_id.clone(), artifact);
+    }
+    if artifacts.is_empty() {
+        anyhow::bail!("phase_summary source phase {source_phase} has no finalized artifacts");
+    }
+    let tickers = artifact_tickers(artifacts.values());
     Ok(json!({
         "source_phase": source_phase,
-        "current_date": state.get("current_date").cloned().unwrap_or(Value::Null),
-        "tickers": tickers_from_state(state),
+        "current_date": manifest.current_date,
+        "run_id": manifest.run_id,
+        "tickers": tickers,
         "artifacts": artifacts,
     }))
 }
@@ -69,7 +74,7 @@ pub(crate) fn write_deterministic_phase_summary(
 ) -> Result<Vec<Index>> {
     let source_phase_u8 =
         u8::try_from(source_phase).context("phase summary source phase must fit in a u8")?;
-    let source_payload = phase_summary_source_payload(state, source_phase)?;
+    let source_payload = phase_summary_source_payload(store_root, state, source_phase)?;
     let source_payload_hash = content_hash(&source_payload)?;
     let run_id = required_state_string(state, "run_id")?;
     let date = required_state_string(state, "current_date")?;
@@ -78,7 +83,7 @@ pub(crate) fn write_deterministic_phase_summary(
         run_id: run_id.clone(),
         source_payload_hash: source_payload_hash.clone(),
         max_units,
-        scope: summary_scope(state, source_phase_u8)?,
+        scope: summary_scope(&source_payload, source_phase_u8)?,
     })?;
     let created_at = Utc::now().to_rfc3339();
     let store = FileStore::open(store_root, FileStoreOptions::default())?;
@@ -100,20 +105,21 @@ pub(crate) fn write_deterministic_phase_summary(
 /// Both the live compressor and deterministic/mock writer use this exact
 /// planner, so a model never chooses Index count or ownership.
 pub(crate) fn planned_summary_units(
+    store_root: &Path,
     state: &Value,
     source_phase: i64,
     max_units: usize,
 ) -> Result<(Value, Vec<SummaryUnit>)> {
     let source_phase_u8 =
         u8::try_from(source_phase).context("phase summary source phase must fit in a u8")?;
-    let source_payload = phase_summary_source_payload(state, source_phase)?;
+    let source_payload = phase_summary_source_payload(store_root, state, source_phase)?;
     let source_payload_hash = content_hash(&source_payload)?;
     let run_id = required_state_string(state, "run_id")?;
     let units = SummaryUnitPlanner::plan(SummaryUnitPlanRequest {
         run_id,
         source_payload_hash,
         max_units,
-        scope: summary_scope(state, source_phase_u8)?,
+        scope: summary_scope(&source_payload, source_phase_u8)?,
     })?;
     Ok((source_payload, units))
 }
@@ -254,87 +260,137 @@ fn required_state_string(state: &Value, key: &str) -> Result<String> {
         .with_context(|| format!("state.{key} is required for FileStore phase summary"))
 }
 
-fn summary_scope(state: &Value, source_phase: u8) -> Result<SummaryUnitScope> {
-    let tickers = tickers_from_state(state);
+fn validate_artifact_header(
+    artifact: &Value,
+    reference: &orchestrator_store::FinalizedArtifactRef,
+) -> Result<()> {
+    let field = |name: &str| artifact.get(name).and_then(Value::as_str);
+    if field("artifact_id") != Some(reference.artifact_id.as_str())
+        || field("role") != Some(reference.role.as_str())
+        || field("profile") != Some(reference.profile.as_str())
+        || field("unit_key") != Some(reference.unit_key.as_str())
+        || field("source_payload_hash") != Some(reference.source_payload_hash.as_str())
+        || artifact.get("phase").and_then(Value::as_u64) != Some(u64::from(reference.phase))
+    {
+        anyhow::bail!(
+            "finalized artifact {} does not match its RunManifest reference",
+            reference.artifact_id
+        );
+    }
+    Ok(())
+}
+
+fn artifact_tickers<'a>(artifacts: impl IntoIterator<Item = &'a Value>) -> Vec<String> {
+    let mut tickers = BTreeSet::new();
+    for artifact in artifacts {
+        collect_artifact_tickers(artifact, &mut tickers);
+    }
+    tickers.into_iter().collect()
+}
+
+fn collect_artifact_tickers(value: &Value, tickers: &mut BTreeSet<String>) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                collect_artifact_tickers(value, tickers);
+            }
+        }
+        Value::Object(object) => {
+            if let Some(ticker) = object.get("ticker").and_then(Value::as_str) {
+                if !ticker.trim().is_empty() {
+                    tickers.insert(ticker.to_owned());
+                }
+            }
+            for key in ["per_ticker", "per_asset"] {
+                if let Some(entries) = object.get(key).and_then(Value::as_object) {
+                    tickers.extend(entries.keys().cloned());
+                }
+            }
+            for value in object.values() {
+                collect_artifact_tickers(value, tickers);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn artifact_roles(source_payload: &Value, profile: &str) -> Vec<String> {
+    let mut roles = BTreeSet::new();
+    for artifact in source_payload
+        .get("artifacts")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|artifacts| artifacts.values())
+    {
+        if artifact.get("profile").and_then(Value::as_str) == Some(profile) {
+            if let Some(role) = artifact.get("role").and_then(Value::as_str) {
+                roles.insert(role.to_owned());
+            }
+        }
+    }
+    roles.into_iter().collect()
+}
+
+fn artifact_topic_ids(value: &Value) -> Vec<String> {
+    let mut topics = BTreeSet::new();
+    collect_topic_ids(value, &mut topics);
+    topics.into_iter().collect()
+}
+
+fn collect_topic_ids(value: &Value, topics: &mut BTreeSet<String>) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                collect_topic_ids(value, topics);
+            }
+        }
+        Value::Object(object) => {
+            if let Some(topic_id) = object.get("topic_id").and_then(Value::as_str) {
+                if !topic_id.trim().is_empty() {
+                    topics.insert(topic_id.to_owned());
+                }
+            }
+            for value in object.values() {
+                collect_topic_ids(value, topics);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn source_tickers(source_payload: &Value) -> Vec<String> {
+    source_payload
+        .get("tickers")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn summary_scope(source_payload: &Value, source_phase: u8) -> Result<SummaryUnitScope> {
+    let tickers = source_tickers(source_payload);
     Ok(match source_phase {
         1 => SummaryUnitScope::Phase1 {
-            analyst_roles: non_empty_or(
-                state
-                    .pointer("/phase1_index/per_ticker")
-                    .and_then(Value::as_object)
-                    .into_iter()
-                    .flat_map(|per_ticker| per_ticker.values())
-                    .filter_map(|value| value.get("role_summaries").and_then(Value::as_array))
-                    .flatten()
-                    .filter_map(|summary| summary.get("role").and_then(Value::as_str))
-                    .map(ToOwned::to_owned)
-                    .collect(),
-                vec![
-                    "analyst.technical".to_owned(),
-                    "analyst.news_macro".to_owned(),
-                ],
-            ),
+            analyst_roles: artifact_roles(source_payload, "analyst_report"),
             tickers,
         },
         2 => SummaryUnitScope::Phase2 {
-            final_controller_topic_ids: state
-                .pointer("/debate_state_artifact/topic_briefs")
-                .and_then(Value::as_array)
-                .or_else(|| {
-                    state
-                        .pointer("/topic_generation_artifact/topics")
-                        .and_then(Value::as_array)
-                })
-                .into_iter()
-                .flatten()
-                .filter_map(|topic| topic.get("topic_id").and_then(Value::as_str))
-                .map(ToOwned::to_owned)
-                .collect(),
+            final_controller_topic_ids: artifact_topic_ids(source_payload),
         },
         3 => SummaryUnitScope::Phase3 { tickers },
         4 => SummaryUnitScope::Phase4 { tickers },
         5 => SummaryUnitScope::Phase5 {
-            risk_roles: non_empty_or(
-                state
-                    .pointer("/risk_debate_state/history")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .map(|turn| turn.get("artifact").unwrap_or(turn))
-                    .filter_map(|artifact| artifact.get("role").and_then(Value::as_str))
-                    .map(ToOwned::to_owned)
-                    .collect(),
-                vec![
-                    "risk.aggressive".to_owned(),
-                    "risk.neutral".to_owned(),
-                    "risk.conservative".to_owned(),
-                ],
-            ),
+            risk_roles: artifact_roles(source_payload, "risk_review"),
             tickers,
         },
         6 => SummaryUnitScope::Phase6 {
-            investable_assets: state
-                .get("investable_assets")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(Value::as_str)
-                .map(ToOwned::to_owned)
-                .collect(),
+            investable_assets: tickers,
         },
         7 => SummaryUnitScope::Phase7,
         _ => anyhow::bail!("unsupported FileStore phase summary phase {source_phase}"),
     })
-}
-
-fn non_empty_or(mut values: Vec<String>, fallback: Vec<String>) -> Vec<String> {
-    values.sort();
-    values.dedup();
-    if values.is_empty() {
-        fallback
-    } else {
-        values
-    }
 }
 
 #[cfg(test)]
@@ -345,26 +401,82 @@ mod tests {
     #[test]
     fn deterministic_summary_writes_completed_fixed_units() {
         let temp = tempdir().unwrap();
+        let store = FileStore::open(temp.path(), Default::default()).unwrap();
+        let location = RunLocation::new("2026-07-27", "run-1").unwrap();
+        let source_hash = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let artifact_relative = Path::new("artifacts/phase3/research-decision.json");
+        let mut artifact = json!({
+            "schema_version": 1,
+            "artifact_id": "artifact-research-qqq",
+            "run_id": "run-1",
+            "phase": 3,
+            "role": "manager.research",
+            "profile": "research_decision",
+            "unit_key": "phase3:research-decision:ticker:QQQ",
+            "source_payload_hash": source_hash,
+            "per_ticker": {"QQQ": {"rating": "Hold"}},
+            "evidence_refs": [],
+            "created_at": "2026-07-27T00:00:00Z",
+            "content_hash": "",
+        });
+        artifact["content_hash"] = Value::String(content_hash(&artifact).unwrap());
+        store
+            .write_json_value(
+                &location.child_relative(artifact_relative).unwrap(),
+                &artifact,
+            )
+            .unwrap();
+        let mut manifest =
+            orchestrator_store::RunManifest::new(orchestrator_store::RunManifestInit {
+                location: location.clone(),
+                workflow_version: "test".to_owned(),
+                prompt_versions: Default::default(),
+                git_sha: "test".to_owned(),
+                config_hash: source_hash.to_owned(),
+                role_profile_registry_hash: source_hash.to_owned(),
+                created_at: "2026-07-27T00:00:00Z".to_owned(),
+            })
+            .unwrap();
+        manifest
+            .record_finalized_artifact(
+                orchestrator_store::FinalizedArtifactRef::new(
+                    "artifact-research-qqq",
+                    artifact_relative,
+                    3,
+                    "manager.research",
+                    "research_decision",
+                    "phase3:research-decision:ticker:QQQ",
+                    source_hash,
+                    "2026-07-27T00:00:00Z",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        orchestrator_store::write_run_manifest(&store, &location, manifest).unwrap();
         let state = json!({
             "run_id": "run-1",
             "current_date": "2026-07-27",
-            "tickers": ["QQQ"],
-            "investable_assets": ["QQQ"],
-            "research_plan": {
-                "summary": "Research decision",
-                "per_ticker": {"QQQ": {"summary": "QQQ decision", "confidence": 0.7}}
-            }
         });
+        let source = phase_summary_source_payload(temp.path(), &state, 3).unwrap();
+        let mutated_state = json!({
+            "run_id": "run-1",
+            "current_date": "2026-07-27",
+            "research_plan": {"per_ticker": {"NOT_AN_ARTIFACT": {"rating": "Buy"}}},
+            "risk_debate_state": {"untrusted": true},
+        });
+        assert_eq!(
+            source,
+            phase_summary_source_payload(temp.path(), &mutated_state, 3).unwrap()
+        );
         let result = write_deterministic_phase_summary(temp.path(), &state, 3, 32).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].ticker.as_deref(), Some("QQQ"));
         let recovered = write_deterministic_phase_summary(temp.path(), &state, 3, 32).unwrap();
         assert_eq!(recovered.len(), 1);
         assert_eq!(recovered[0].index_id, result[0].index_id);
-        let store = FileStore::open(temp.path(), Default::default()).unwrap();
         let page = orchestrator_store::read_indexes(
             &store,
-            Some(&RunLocation::new("2026-07-27", "run-1").unwrap()),
+            Some(&location),
             &orchestrator_store::IndexQuery {
                 limit: 10,
                 ..Default::default()

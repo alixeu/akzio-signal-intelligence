@@ -121,6 +121,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             args.reasoning_effort.as_deref(),
         )
         .await?;
+        refresh_finalized_artifacts(&store, &location, &mut manifest)?;
         let summary_units = summarize(
             &store_root,
             &mut state,
@@ -147,6 +148,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             args.reasoning_effort.as_deref(),
         )
         .await?;
+        refresh_finalized_artifacts(&store, &location, &mut manifest)?;
         let summary_units = summarize(
             &store_root,
             &mut state,
@@ -171,6 +173,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             args.reasoning_effort.as_deref(),
         )
         .await?;
+        refresh_finalized_artifacts(&store, &location, &mut manifest)?;
         let summary_units = summarize(
             &store_root,
             &mut state,
@@ -195,6 +198,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             args.reasoning_effort.as_deref(),
         )
         .await?;
+        refresh_finalized_artifacts(&store, &location, &mut manifest)?;
         let summary_units = summarize(
             &store_root,
             &mut state,
@@ -219,6 +223,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             args.reasoning_effort.as_deref(),
         )
         .await?;
+        refresh_finalized_artifacts(&store, &location, &mut manifest)?;
         let summary_units = summarize(
             &store_root,
             &mut state,
@@ -243,6 +248,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             args.reasoning_effort.as_deref(),
         )
         .await?;
+        refresh_finalized_artifacts(&store, &location, &mut manifest)?;
         let summary_units = summarize(
             &store_root,
             &mut state,
@@ -266,6 +272,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             &allocation_artifact,
             Path::new("artifacts/phase7/allocation.json"),
         )?;
+        refresh_finalized_artifacts(&store, &location, &mut manifest)?;
         let summary_units = summarize(
             &store_root,
             &mut state,
@@ -434,6 +441,30 @@ fn finish_phase(
     Ok(())
 }
 
+/// Refresh only the manifest's reference catalog before a Phase Summary is
+/// planned. The rebuild scans finalized Artifact files and their completed
+/// Draft references; it never reads the mutable workflow state.
+fn refresh_finalized_artifacts(
+    store: &FileStore,
+    location: &RunLocation,
+    manifest: &mut RunManifest,
+) -> Result<()> {
+    let rebuilt = rebuild_run_manifest(
+        store,
+        RunManifestInit {
+            location: location.clone(),
+            workflow_version: manifest.workflow_version.clone(),
+            prompt_versions: manifest.prompt_versions.clone(),
+            git_sha: manifest.git_sha.clone(),
+            config_hash: manifest.config_hash.clone(),
+            role_profile_registry_hash: manifest.role_profile_registry_hash.clone(),
+            created_at: manifest.created_at.clone(),
+        },
+    )?;
+    manifest.artifacts = rebuilt.artifacts;
+    Ok(())
+}
+
 fn sync_manifest_health(manifest: &mut RunManifest, state: &Value) {
     manifest.degraded = state["degraded"].as_bool().unwrap_or(false);
     manifest.errors = state["errors"]
@@ -490,10 +521,11 @@ fn has_required_phase_summaries(
     // Artifacts; `run_unit` returns those files without another LLM call.
     // A finalized Index is still the only proof that the summary itself is
     // complete.
-    if phase_summary_source_payload(state, i64::from(phase)).is_err() {
+    if phase_summary_source_payload(store.root(), state, i64::from(phase)).is_err() {
         return Ok(false);
     }
     let (_, units) = planned_summary_units(
+        store.root(),
         state,
         i64::from(phase),
         runtime.tool_managed.max_summary_units_per_phase,
@@ -524,6 +556,7 @@ async fn summarize(
     reasoning: Option<&str>,
 ) -> Result<BTreeMap<String, String>> {
     let (_, units) = planned_summary_units(
+        store_root,
         state,
         phase,
         runtime.tool_managed.max_summary_units_per_phase,
@@ -576,6 +609,7 @@ async fn summarize(
         return Ok(summary_units);
     }
     let (source_payload, units) = planned_summary_units(
+        store_root,
         state,
         phase,
         runtime.tool_managed.max_summary_units_per_phase,
