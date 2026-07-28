@@ -41,11 +41,6 @@ pub enum LlmTransport {
     Ws,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OutputMode {
-    ToolManaged,
-}
-
 /// Fixed endpoint, credentials, and model for the free opencode Zen gateway.
 /// When a role sets `free_opencode`, the configured gateway base_url / api_key
 /// and model are ignored in favor of these values (chat_completions only).
@@ -187,17 +182,13 @@ pub struct AgentSettings {
     /// Optional role-specific round number retained on every debug record.
     pub debug_round: Option<usize>,
     pub tickers: Vec<String>,
-    pub output_mode: OutputMode,
-    /// Required only when `output_mode` is ToolManaged. The profile selects a
     /// Rust-owned draft/builder contract; assistant prose is never an artifact.
-    pub tool_managed_profile: Option<ToolManagedProfile>,
-    /// Concrete FileStore authority for this ToolManaged agent session.
-    pub session_runtime: Option<agent_loop::FileStoreSessionRuntime>,
-    /// Present only for a migrated Index/Detail unit. Legacy settings must
-    /// leave this absent; there is no legacy-to-FileStore fallback.
+    pub tool_managed_profile: ToolManagedProfile,
+    /// Concrete FileStore authority for this agent session.
+    pub session_runtime: agent_loop::FileStoreSessionRuntime,
+    /// Present only for an Index/Detail unit.
     pub index_tool_runtime: Option<tools::index_tools::IndexToolRuntimeBinding>,
-    /// Present only for a migrated business unit.  It is a typed, scoped
-    /// FileStore service; legacy roles never receive a domain write path.
+    /// Present only for a business unit. It is a typed, scoped FileStore service.
     pub domain_tool_runtime: Option<tools::domain_tools::DomainToolRuntimeBinding>,
     /// Upper bound for typed Draft/Index write attempts in one agent turn.
     /// Reads and `think` do not consume this budget.
@@ -212,16 +203,9 @@ pub struct AgentSettings {
 }
 
 impl AgentSettings {
-    fn validate_output_mode(&self) -> Result<()> {
-        if self.index_tool_runtime.is_some() && self.output_mode != OutputMode::ToolManaged {
-            bail!("IndexToolRuntime is available only to a ToolManaged agent");
-        }
-        if self.domain_tool_runtime.is_some() && self.output_mode != OutputMode::ToolManaged {
-            bail!("DomainToolRuntime is available only to a ToolManaged agent");
-        }
-        if let (Some(profile), Some(binding)) =
-            (self.tool_managed_profile, self.domain_tool_runtime.as_ref())
-        {
+    fn validate_tool_managed(&self) -> Result<()> {
+        if let Some(binding) = self.domain_tool_runtime.as_ref() {
+            let profile = self.tool_managed_profile;
             if binding.scope().profile != profile {
                 bail!(
                     "DomainToolRuntime profile {} differs from AgentSettings profile {}",
@@ -230,11 +214,7 @@ impl AgentSettings {
                 );
             }
         }
-        match self.tool_managed_profile {
-            Some(_) if self.session_runtime.is_some() => Ok(()),
-            Some(_) => bail!("tool-managed output mode requires a FileStore session runtime"),
-            None => bail!("tool-managed output mode requires a ToolManagedProfile"),
-        }
+        Ok(())
     }
 
     fn reasoning_summary_as_enum(
@@ -309,12 +289,9 @@ pub async fn run_agent_loop_with_metrics(
     prompt: &str,
 ) -> Result<AgentLoopOutput> {
     settings.llm.validate(&settings.role)?;
-    settings.validate_output_mode()?;
+    settings.validate_tool_managed()?;
     validate_fallback_web_search_runtime_config(settings)?;
-    let session = settings
-        .session_runtime
-        .as_ref()
-        .context("tool-managed output mode requires a FileStore session runtime")?;
+    let session = &settings.session_runtime;
     let session_id = session.manifest().session_id.clone();
     let turn_id = format!("turn-{}", Uuid::new_v4());
     let mut turn = Turn::new(
@@ -327,9 +304,9 @@ pub async fn run_agent_loop_with_metrics(
     turn.phase = settings.phase;
     turn.tools_disabled = role_disables_tools(&settings.role);
     turn.model_context = format!(
-        "role={}\noutput_mode={:?}\ntickers={}\navailable_tools={}",
+        "role={}\nprofile={}\ntickers={}\navailable_tools={}",
         settings.role,
-        settings.output_mode,
+        settings.tool_managed_profile.as_str(),
         settings.tickers.join(","),
         serde_json::to_string(&configured_tool_names(settings))?
     );
@@ -382,7 +359,7 @@ fn agent_loop_config_from_settings(settings: &AgentSettings) -> AgentLoopConfig 
         model: settings.llm.effective_model().to_string(),
         topic_id: settings.topic_id.clone(),
         retrieval_policy: settings.retrieval_policy.clone(),
-        require_terminal_tool: settings.output_mode == OutputMode::ToolManaged,
+        require_terminal_tool: true,
         ..AgentLoopConfig::default()
     }
 }
@@ -401,12 +378,9 @@ pub async fn run_agent_steer_loop_with_metrics(
     input: SteerLoopInput<'_>,
 ) -> Result<AgentLoopOutput> {
     settings.llm.validate(&settings.role)?;
-    settings.validate_output_mode()?;
+    settings.validate_tool_managed()?;
     validate_fallback_web_search_runtime_config(settings)?;
-    let session = settings
-        .session_runtime
-        .as_ref()
-        .context("tool-managed output mode requires a FileStore session runtime")?;
+    let session = &settings.session_runtime;
     // Scope resume detection to this turn_id. Using run_id-latest history made
     // later phase-2 roles see sibling turns as "existing history" and drop their
     // own role prompt (live debate mass max_agent_loops / empty context).
@@ -465,9 +439,9 @@ pub async fn run_agent_steer_loop_with_metrics(
     turn.phase = settings.phase;
     turn.tools_disabled = role_disables_tools(&settings.role);
     turn.model_context = format!(
-        "role={}\noutput_mode={:?}\ntickers={}\navailable_tools={}\nhistory_fork={}",
+        "role={}\nprofile={}\ntickers={}\navailable_tools={}\nhistory_fork={}",
         settings.role,
-        settings.output_mode,
+        settings.tool_managed_profile.as_str(),
         settings.tickers.join(","),
         serde_json::to_string(&configured_tool_names(settings))?,
         fork_from_turn_id.is_some()
@@ -2424,66 +2398,13 @@ fn mock_portfolio_artifact() -> Value {
 mod tests {
     use super::{
         agent_loop, is_permanent_llm_error_text, is_transient_llm_error, tools, AgentSettings,
-        LlmRoute, LlmTransport, OutputMode, RoleLlmSettings, ToolManagedProfile, TruncationConfig,
+        LlmRoute, LlmTransport, RoleLlmSettings, ToolManagedProfile, TruncationConfig,
     };
     use crate::web_search::{WebSearchConfig, WebSearchMode};
-    use anyhow::{anyhow, Result};
+    use anyhow::anyhow;
     use orchestrator_store::{FileStore, FileStoreOptions, RunLocation};
     use serde_json::{json, Value};
-    use std::{
-        path::{Path, PathBuf},
-        sync::Arc,
-    };
-
-    struct RejectingIndexService;
-
-    impl tools::index_tools::IndexToolService for RejectingIndexService {
-        fn create_index(&self, _: tools::index_tools::CreateIndexCommand) -> Result<Value> {
-            anyhow::bail!("not used by validation test")
-        }
-        fn append_index_detail(
-            &self,
-            _: tools::index_tools::AppendIndexDetailCommand,
-        ) -> Result<Value> {
-            anyhow::bail!("not used by validation test")
-        }
-        fn finalize_index(&self, _: tools::index_tools::FinalizeIndexCommand) -> Result<Value> {
-            anyhow::bail!("not used by validation test")
-        }
-        fn read_indexes(
-            &self,
-            _: tools::index_tools::ReadIndexesCommand,
-        ) -> Result<tools::index_tools::IndexReadPage> {
-            anyhow::bail!("not used by validation test")
-        }
-        fn read_index_details(
-            &self,
-            _: tools::index_tools::ReadIndexDetailsCommand,
-        ) -> Result<Value> {
-            anyhow::bail!("not used by validation test")
-        }
-    }
-
-    fn test_index_runtime_binding() -> tools::index_tools::IndexToolRuntimeBinding {
-        tools::index_tools::IndexToolRuntimeBinding::new(
-            tools::index_tools::IndexOwnedScope {
-                run_id: "run-1".to_owned(),
-                source_run_id: None,
-                source_phase: 1,
-                role: "compressor.phase_summary".to_owned(),
-                kind: tools::index_tools::IndexKind::PhaseSummary,
-                ticker: None,
-                topic_id: None,
-                unit_key: "unit".to_owned(),
-                source_payload_hash: "hash".to_owned(),
-                index_id: "index".to_owned(),
-                authoritative_fields: Default::default(),
-            },
-            Default::default(),
-            Arc::new(RejectingIndexService),
-        )
-        .unwrap()
-    }
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn context_window_full_is_not_transient() {
@@ -2538,9 +2459,8 @@ mod tests {
             debug_output_path: None,
             debug_round: None,
             tickers: vec!["TQQQ".to_string()],
-            output_mode: OutputMode::ToolManaged,
-            tool_managed_profile: Some(ToolManagedProfile::ResearchDecision),
-            session_runtime: None,
+            tool_managed_profile: ToolManagedProfile::ResearchDecision,
+            session_runtime: test_session_runtime(),
             index_tool_runtime: None,
             domain_tool_runtime: None,
             max_write_calls: None,
@@ -2589,27 +2509,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_managed_output_requires_a_profile() {
-        let mut settings = base_settings(LlmRoute::Responses);
-        settings.output_mode = OutputMode::ToolManaged;
-        settings.tool_managed_profile = None;
-        assert!(settings.validate_output_mode().is_err());
-
-        settings.tool_managed_profile = Some(ToolManagedProfile::ResearchDecision);
-        assert!(settings.validate_output_mode().is_err());
-        settings.session_runtime = Some(test_session_runtime());
-        assert!(settings.validate_output_mode().is_ok());
-
-        settings.tool_managed_profile = None;
-        settings.index_tool_runtime = Some(test_index_runtime_binding());
-        assert!(settings.validate_output_mode().is_err());
-    }
-
-    #[test]
     fn tool_managed_completion_needs_no_assistant_message() {
-        let mut settings = base_settings(LlmRoute::Responses);
-        settings.output_mode = OutputMode::ToolManaged;
-        settings.tool_managed_profile = Some(ToolManagedProfile::ResearchDecision);
         let mut turn =
             agent_loop::Turn::new("turn-1", "session-1", "run-1", "manager.research", "");
         turn.terminal_tool_result = Some(agent_loop::ToolResultItem {
@@ -2628,9 +2528,6 @@ mod tests {
 
     #[test]
     fn tool_managed_completion_ignores_assistant_text() {
-        let mut settings = base_settings(LlmRoute::Responses);
-        settings.output_mode = OutputMode::ToolManaged;
-        settings.tool_managed_profile = Some(ToolManagedProfile::ResearchDecision);
         let mut turn =
             agent_loop::Turn::new("turn-1", "session-1", "run-1", "manager.research", "");
         turn.emitted_items.push(agent_loop::TurnItem::assistant(

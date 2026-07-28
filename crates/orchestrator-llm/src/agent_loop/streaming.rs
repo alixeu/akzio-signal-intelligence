@@ -69,14 +69,14 @@ impl<'a, S: AgentEventSink> ModelStreamHandler<'a, S> {
             }
             ModelStreamEvent::AssistantMessageCompleted {
                 item_id,
-                turn_status,
+                turn_status: _turn_status,
             } => {
                 let text = self.assistant_buffers.remove(&item_id).unwrap_or_default();
                 debug!(
                     turn_id = self.turn.turn_id,
                     item_id,
                     text_chars = text.len(),
-                    turn_status = ?turn_status,
+                    turn_status = ?_turn_status,
                     "model stream assistant message completed"
                 );
                 if let Some(item) = update_turn_item(

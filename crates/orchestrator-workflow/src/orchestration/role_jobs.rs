@@ -12,7 +12,7 @@ use orchestrator_llm::{
     mock_role_artifact, run_agent_loop_with_metrics, run_agent_steer_loop_with_metrics,
     tools::{ExternalToolConfig, FileStoreInputSnapshot},
     truncation::TruncationConfig,
-    AgentLoopOutput, AgentSettings, OutputMode, RoleLlmSettings, SteerLoopInput,
+    AgentLoopOutput, AgentSettings, RoleLlmSettings, SteerLoopInput,
 };
 use serde_json::{json, Map, Value};
 use std::time::{Duration, Instant};
@@ -74,12 +74,11 @@ pub(crate) struct RoleJob {
     pub debug_output_path: Option<PathBuf>,
     pub prompt_version: Option<String>,
     pub tickers: Vec<String>,
-    pub output_mode: OutputMode,
-    pub tool_managed_profile: Option<ToolManagedProfile>,
+    pub tool_managed_profile: ToolManagedProfile,
     pub index_tool_runtime: Option<orchestrator_llm::tools::index_tools::IndexToolRuntimeBinding>,
     pub domain_tool_runtime:
         Option<orchestrator_llm::tools::domain_tools::DomainToolRuntimeBinding>,
-    pub session_runtime: Option<FileStoreSessionRuntime>,
+    pub session_runtime: FileStoreSessionRuntime,
     /// Per-role typed Draft/Index write-attempt budget from runtime config.
     pub max_write_calls: Option<usize>,
     pub llm: Option<RoleLlmSettings>,
@@ -290,13 +289,7 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
         "prepared role job"
     );
     let candidate_tool_managed_profile = tool_managed_profile_for_role_kind(role, kind);
-    let (
-        output_mode,
-        tool_managed_profile,
-        index_tool_runtime,
-        domain_tool_runtime,
-        file_store_input,
-    ) = {
+    let (tool_managed_profile, index_tool_runtime, domain_tool_runtime, file_store_input) = {
         let profile = candidate_tool_managed_profile
             .with_context(|| format!("missing ToolManaged profile for role={role} kind={kind}"))?;
         let registration = config.authority_registry.registration(role, profile)?;
@@ -312,13 +305,7 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
                 registration.profile_version,
                 registration.builder_version,
             )?;
-            (
-                OutputMode::ToolManaged,
-                Some(profile),
-                Some(binding),
-                None,
-                None,
-            )
+            (profile, Some(binding), None, None)
         } else if profile == ToolManagedProfile::PhaseSummary {
             let binding = file_store_phase_summary_index_runtime(
                 Path::new(store_root),
@@ -326,13 +313,7 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
                 registration.profile_version,
                 registration.builder_version,
             )?;
-            (
-                OutputMode::ToolManaged,
-                Some(profile),
-                Some(binding),
-                None,
-                None,
-            )
+            (profile, Some(binding), None, None)
         } else {
             let binding = file_store_domain_runtime(
                 Path::new(store_root),
@@ -361,8 +342,7 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
                 None
             };
             (
-                OutputMode::ToolManaged,
-                Some(profile),
+                profile,
                 Some(file_store_domain_index_read_runtime(
                     Path::new(store_root),
                     &state,
@@ -379,19 +359,15 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
     // snapshots. Clearing every alternate persistence handle here turns a missing
     // FileStore projection into a hard tool error instead of an accidental
     // alternate persistence fallback.
-    let session_runtime = tool_managed_profile
-        .map(|profile| {
-            file_store_session_runtime(
-                &state,
-                role,
-                phase,
-                topic_id,
-                round,
-                profile,
-                phase2_fork_reference(&state, role, topic_id),
-            )
-        })
-        .transpose()?;
+    let session_runtime = file_store_session_runtime(
+        &state,
+        role,
+        phase,
+        topic_id,
+        round,
+        tool_managed_profile,
+        phase2_fork_reference(&state, role, topic_id),
+    )?;
 
     Ok(RoleJob {
         role: role.to_string(),
@@ -406,7 +382,6 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
         debug_output_path: phase2_debug_output_path(phase, role, kind, topic_id),
         prompt_version,
         tickers: tickers.clone(),
-        output_mode,
         tool_managed_profile,
         index_tool_runtime,
         domain_tool_runtime,
@@ -967,11 +942,8 @@ fn canonical_source_refs(value: &Value) -> BTreeSet<String> {
     refs
 }
 
-fn file_store_reflection_source(
-    state: &Value,
-    profile: Option<ToolManagedProfile>,
-) -> Option<Value> {
-    if profile != Some(ToolManagedProfile::HistoricalReflection) {
+fn file_store_reflection_source(state: &Value, profile: ToolManagedProfile) -> Option<Value> {
+    if profile != ToolManagedProfile::HistoricalReflection {
         return None;
     }
     let task = state.get("reflection_task")?.clone();
@@ -1608,7 +1580,6 @@ async fn execute_role_job(job: RoleJob) -> Result<AgentLoopOutput> {
         debug_output_path: job.debug_output_path,
         debug_round,
         tickers: job.tickers,
-        output_mode: job.output_mode,
         tool_managed_profile: job.tool_managed_profile,
         index_tool_runtime: job.index_tool_runtime.clone(),
         domain_tool_runtime: job.domain_tool_runtime.clone(),
@@ -1924,10 +1895,7 @@ fn mock_domain_tool_managed_output(
 /// This prevents deterministic test artifacts from looking like unaudited
 /// direct writes to Store Doctor or fork recovery.
 fn persist_mock_terminal(job: &RoleJob, terminal: &ToolResultItem) -> Result<(String, String)> {
-    let session = job
-        .session_runtime
-        .as_ref()
-        .context("ToolManaged mock role is missing its FileStore session runtime")?;
+    let session = &job.session_runtime;
     let session_id = session.manifest().session_id.clone();
     let turn_id = format!(
         "mock-finalize:{}:{}:{}:{}",
@@ -2027,7 +1995,6 @@ async fn execute_steer_role_job(
         debug_output_path: job.debug_output_path,
         debug_round,
         tickers: job.tickers,
-        output_mode: job.output_mode,
         tool_managed_profile: job.tool_managed_profile,
         index_tool_runtime: job.index_tool_runtime.clone(),
         domain_tool_runtime: job.domain_tool_runtime.clone(),

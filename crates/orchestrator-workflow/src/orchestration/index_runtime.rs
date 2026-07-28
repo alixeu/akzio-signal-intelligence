@@ -91,7 +91,7 @@ impl FileStoreIndexRuntimePlan {
 
 /// Construct the typed LLM runtime binding for a planned Index unit.
 /// Legacy jobs must not call this helper; the LLM layer independently rejects
-/// an Index binding unless `OutputMode::ToolManaged` is selected.
+/// an Index binding without a ToolManaged profile.
 pub fn file_store_index_tool_runtime(
     store: FileStore,
     owned: IndexOwnedScope,
