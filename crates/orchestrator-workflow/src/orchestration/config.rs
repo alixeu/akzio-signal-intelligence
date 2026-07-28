@@ -490,7 +490,11 @@ pub(crate) fn llm_roles_from_config(config: &Value) -> Result<BTreeMap<String, R
             .cloned()
             .unwrap_or_else(|| Value::String(String::new()));
         orchestrator_core::deep_merge(&mut effective, role_value);
-        normalize_llm_role_tools(&mut effective, &role)?;
+        if effective.get("tools").is_some() {
+            bail!(
+                "orchestrator.llm.roles.{role}.tools is unsupported; RoleProfileRegistry owns every model-visible tool"
+            );
+        }
         let settings: RoleLlmSettings = serde_json::from_value(effective)
             .with_context(|| format!("invalid LLM config for role {role:?}"))?;
         roles.insert(role, settings);
@@ -528,118 +532,24 @@ fn effective_llm_role_values(config: &Value) -> Result<BTreeMap<String, Value>> 
 
 fn builtin_llm_role_values() -> BTreeMap<String, Value> {
     let mut roles = BTreeMap::new();
-    for (role, max_turns, reasoning_effort, tools, web_search_live) in [
-        (
-            "reflector.historical",
-            6,
-            Some("medium"),
-            vec![
-                "read_reflection_source",
-                "read_indexes",
-                "read_index_details",
-            ],
-            false,
-        ),
-        (
-            "analyst.technical",
-            12,
-            None,
-            vec!["read_technical_snapshot", "read_technical_detail"],
-            false,
-        ),
-        (
-            "analyst.news_macro",
-            6,
-            None,
-            vec!["read_jin10_candidates", "verify_event", "alpaca_get_news"],
-            true,
-        ),
+    for (role, max_turns, reasoning_effort, web_search_live) in [
+        ("reflector.historical", 6, Some("medium"), false),
+        ("analyst.technical", 12, None, false),
+        ("analyst.news_macro", 6, None, true),
         // Phase-2 roles read the compact index, then expand selected summaries.
-        (
-            "mediator.topic",
-            6,
-            Some("medium"),
-            vec!["read_indexes", "read_index_details"],
-            false,
-        ),
-        (
-            "researcher.bull.initial",
-            10,
-            None,
-            vec!["read_indexes", "read_index_details"],
-            false,
-        ),
-        (
-            "researcher.bear.initial",
-            10,
-            None,
-            vec!["read_indexes", "read_index_details"],
-            false,
-        ),
-        (
-            "researcher.bull.interaction",
-            10,
-            None,
-            vec!["read_indexes", "read_index_details"],
-            false,
-        ),
-        (
-            "researcher.bear.interaction",
-            10,
-            None,
-            vec!["read_indexes", "read_index_details"],
-            false,
-        ),
-        (
-            "mediator.topic_controller",
-            10,
-            Some("medium"),
-            vec!["read_indexes", "read_index_details"],
-            false,
-        ),
-        (
-            "manager.research",
-            6,
-            Some("medium"),
-            vec!["read_indexes", "read_index_details"],
-            false,
-        ),
-        ("compressor.phase_summary", 4, None, vec![], false),
-        (
-            "trader",
-            6,
-            None,
-            vec!["read_indexes", "read_index_details"],
-            false,
-        ),
-        (
-            "risk.aggressive",
-            6,
-            None,
-            vec!["read_indexes", "read_index_details"],
-            false,
-        ),
-        (
-            "risk.neutral",
-            6,
-            None,
-            vec!["read_indexes", "read_index_details"],
-            false,
-        ),
-        (
-            "risk.conservative",
-            6,
-            None,
-            vec!["read_indexes", "read_index_details"],
-            false,
-        ),
-        (
-            "portfolio.manager",
-            8,
-            Some("medium"),
-            vec!["read_indexes", "read_index_details"],
-            false,
-        ),
+        ("mediator.topic", 6, Some("medium"), false),
+        ("researcher.bull.initial", 10, None, false),
+        ("researcher.bear.initial", 10, None, false),
+        ("researcher.bull.interaction", 10, None, false),
+        ("researcher.bear.interaction", 10, None, false),
+        ("mediator.topic_controller", 10, Some("medium"), false),
+        ("manager.research", 6, Some("medium"), false),
+        ("compressor.phase_summary", 4, None, false),
+        ("trader", 6, None, false),
+        ("risk.aggressive", 6, None, false),
+        ("risk.neutral", 6, None, false),
+        ("risk.conservative", 6, None, false),
+        ("portfolio.manager", 8, Some("medium"), false),
     ] {
         let mut object = serde_json::Map::new();
         object.insert("max_turns".to_string(), Value::from(max_turns));
@@ -648,15 +558,6 @@ fn builtin_llm_role_values() -> BTreeMap<String, Value> {
             // evidence lookups, which exceeds the gateway's short default cap.
             object.insert("max_completion_tokens".to_string(), Value::from(8_192));
         }
-        object.insert(
-            "tools".to_string(),
-            Value::Array(
-                tools
-                    .into_iter()
-                    .map(|tool| Value::String(tool.to_string()))
-                    .collect(),
-            ),
-        );
         if let Some(reasoning_effort) = reasoning_effort {
             object.insert(
                 "reasoning_effort".to_string(),
@@ -685,42 +586,6 @@ fn builtin_llm_role_values() -> BTreeMap<String, Value> {
         roles.insert(role.to_string(), Value::Object(object));
     }
     roles
-}
-
-pub(crate) fn normalize_llm_role_tools(value: &mut Value, role: &str) -> Result<()> {
-    let Some(object) = value.as_object_mut() else {
-        return Ok(());
-    };
-    let Some(tools_value) = object.get_mut("tools") else {
-        return Ok(());
-    };
-    match tools_value {
-        Value::String(text) if text.trim().eq_ignore_ascii_case("all") => {
-            *tools_value = Value::Array(
-                orchestrator_llm::tools::tool_names()
-                    .iter()
-                    .map(|name| Value::String((*name).to_string()))
-                    .collect(),
-            );
-            Ok(())
-        }
-        Value::String(text) => {
-            let tools = text
-                .split(',')
-                .map(str::trim)
-                .filter(|item| !item.is_empty())
-                .map(|item| Value::String(item.to_string()))
-                .collect::<Vec<_>>();
-            *tools_value = Value::Array(tools);
-            Ok(())
-        }
-        Value::Array(_) => Ok(()),
-        Value::Null => {
-            *tools_value = Value::Array(Vec::new());
-            Ok(())
-        }
-        _ => bail!("orchestrator.llm.roles.{role}.tools must be a list, comma string, or all"),
-    }
 }
 
 pub(crate) fn web_search_by_role_from_config<'a>(
@@ -1036,59 +901,27 @@ mod tests {
     }
 
     #[test]
-    fn role_tools_are_phase_scoped() {
+    fn role_tool_allowlists_are_not_configurable() {
         let roles = builtin_llm_role_values();
-        assert_eq!(roles["compressor.phase_summary"]["tools"], json!([]));
-        for role in [
-            "trader",
-            "risk.aggressive",
-            "risk.neutral",
-            "risk.conservative",
-            "portfolio.manager",
-        ] {
-            assert_eq!(
-                roles[role]["tools"],
-                json!(["read_indexes", "read_index_details"]),
-                "role={role}"
-            );
-        }
+        assert!(roles.values().all(|role| role.get("tools").is_none()));
+        let registry = RoleProfileRegistry::builtin();
+        assert!(registry
+            .registration(
+                "analyst.news_macro",
+                orchestrator_core::ToolManagedProfile::AnalystReport,
+            )
+            .unwrap()
+            .allows_tool("alpaca_get_news"));
+        assert!(registry
+            .registration(
+                "reflector.historical",
+                orchestrator_core::ToolManagedProfile::HistoricalReflection,
+            )
+            .unwrap()
+            .allows_tool("read_reflection_source"));
         assert_eq!(
-            roles["analyst.news_macro"]["tools"],
-            json!(["read_jin10_candidates", "verify_event", "alpaca_get_news"])
-        );
-        for role in ["researcher.bull.initial", "researcher.bear.initial"] {
-            assert_eq!(
-                roles[role]["tools"],
-                json!(["read_indexes", "read_index_details"]),
-                "role={role}"
-            );
-            assert_eq!(roles[role]["web_search"]["mode"], "disabled");
-        }
-        for role in ["researcher.bull.interaction", "researcher.bear.interaction"] {
-            assert_eq!(
-                roles[role]["tools"],
-                json!(["read_indexes", "read_index_details"]),
-                "role={role}"
-            );
-        }
-        assert_eq!(
-            roles["reflector.historical"]["tools"],
-            json!([
-                "read_reflection_source",
-                "read_indexes",
-                "read_index_details"
-            ])
-        );
-        for role in ["mediator.topic", "mediator.topic_controller"] {
-            assert_eq!(
-                roles[role]["tools"],
-                json!(["read_indexes", "read_index_details"]),
-                "role={role}"
-            );
-        }
-        assert_eq!(
-            roles["manager.research"]["tools"],
-            json!(["read_indexes", "read_index_details"])
+            roles["researcher.bull.initial"]["web_search"]["mode"],
+            "disabled"
         );
     }
 }

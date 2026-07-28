@@ -470,6 +470,13 @@ pub fn tool_definition(name: &str) -> Option<ToolDefinition> {
         .map(|entry| (entry.definition)())
 }
 
+/// All model-visible Tool IDs registered by this crate.  Role ownership is
+/// checked separately against the core RoleProfileRegistry so an orphaned
+/// definition cannot silently survive a profile migration.
+pub fn registered_tool_names() -> impl Iterator<Item = &'static str> {
+    REGISTRY.iter().map(|entry| entry.name)
+}
+
 pub fn responses_tool_definitions(names: &[String]) -> Vec<async_openai::types::responses::Tool> {
     names
         .iter()
@@ -820,6 +827,8 @@ pub(crate) fn log_tool_result(name: &str, result: &Result<Value>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use orchestrator_core::RoleProfileRegistry;
+    use std::collections::BTreeSet;
 
     fn turn() -> ToolRuntimeTurnContext {
         ToolRuntimeTurnContext {
@@ -856,5 +865,31 @@ mod tests {
                 && record.source_phase == 1
                 && record.ticker.as_deref() == Some("QQQ")
         }));
+    }
+
+    #[test]
+    fn every_registered_tool_has_a_profile_owner_or_runtime_only_path() {
+        let registry = RoleProfileRegistry::builtin();
+        let owned = registry
+            .registrations()
+            .flat_map(|registration| registration.tool_allowlist.iter())
+            .map(|tool| tool.as_str())
+            .collect::<BTreeSet<_>>();
+        for registration in registry.registrations() {
+            for tool in &registration.tool_allowlist {
+                assert!(
+                    tool_definition(tool.as_str()).is_some(),
+                    "{} is allowed for {} but has no registered definition",
+                    tool.as_str(),
+                    registration.role_id
+                );
+            }
+        }
+        for tool in registered_tool_names() {
+            assert!(
+                owned.contains(tool) || matches!(tool, think::NAME | web_run::NAME),
+                "registered tool {tool} has neither a Role/Profile owner nor an explicit runtime-only path"
+            );
+        }
     }
 }

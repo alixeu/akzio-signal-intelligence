@@ -94,7 +94,6 @@ orchestrator:
       reasoning_effort: low
       reasoning_summary: auto
       preserve_reasoning_state: false
-      tools: []
   web_search:
     mode: live
     provider: exa

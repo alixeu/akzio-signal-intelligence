@@ -661,59 +661,6 @@ pub fn is_domain_tool(name: &str) -> bool {
     )
 }
 
-/// The exact domain tools exposed for one ToolManaged profile.  The caller
-/// supplies the profile from its Rust-owned authority binding; model text
-/// never selects this allowlist.
-pub fn tool_names_for_profile(profile: ToolManagedProfile) -> &'static [&'static str] {
-    match profile {
-        ToolManagedProfile::AnalystReport => &[
-            SET_ANALYST_ASSESSMENT,
-            APPEND_ANALYST_EVIDENCE,
-            APPEND_ANALYST_DATA_GAP,
-            SET_ANALYST_INVALIDATION,
-            FINALIZE_ANALYST_REPORT,
-        ],
-        ToolManagedProfile::ResearchDecision => &[
-            SET_RESEARCH_DECISION,
-            SET_RESEARCH_SCENARIOS,
-            APPEND_RESEARCH_HINGE,
-            FINALIZE_RESEARCH_DECISION,
-        ],
-        ToolManagedProfile::TradeIntent => &[
-            SET_TRADE_INTENT,
-            APPEND_TRADE_BLOCKER,
-            FINALIZE_TRADE_INTENT,
-        ],
-        ToolManagedProfile::RiskReview => &[
-            SET_RISK_ASSESSMENT,
-            SET_RISK_CONSTRAINTS,
-            FINALIZE_RISK_REVIEW,
-        ],
-        ToolManagedProfile::PortfolioDecision => &[
-            SET_PORTFOLIO_ASSET_DECISION,
-            APPEND_BINDING_RISK_CONTROL,
-            FINALIZE_PORTFOLIO_DECISION,
-        ],
-        ToolManagedProfile::ResearcherWarmup => &[FINALIZE_RESEARCHER_WARMUP],
-        ToolManagedProfile::TopicGeneration => &[
-            SET_PHASE2_COMMON_GROUND,
-            CREATE_PHASE2_TOPIC,
-            FINALIZE_TOPIC_GENERATION,
-        ],
-        ToolManagedProfile::DebateSeed => &[CREATE_DEBATE_CLAIM, FINALIZE_DEBATE_SEED],
-        ToolManagedProfile::DebateResponse => &[RESPOND_TO_DEBATE_CLAIM, FINALIZE_DEBATE_RESPONSE],
-        ToolManagedProfile::TopicControl => &[
-            SET_CLAIM_STATUS,
-            ADD_AGREED_FACT,
-            SET_DECISION_HINGE,
-            ROUTE_DEBATE_STEER,
-            SET_TOPIC_SOFT_CONTROL,
-            FINALIZE_TOPIC_CONTROL,
-        ],
-        _ => &[],
-    }
-}
-
 pub fn definition(name: &str) -> Option<ToolDefinition> {
     let (description, properties, required) = match name {
         SET_ANALYST_ASSESSMENT => (

@@ -47,6 +47,85 @@ impl ToolManagedProfile {
     }
 }
 
+/// The only typed identity for a model-visible tool.  Its serialized form is
+/// the stable API name, so registry snapshots stay readable without carrying
+/// a second stringly-typed allowlist.
+macro_rules! define_tool_ids {
+    ($( $variant:ident => $name:literal, )+) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+        pub enum ToolId {
+            $( #[serde(rename = $name)] $variant, )+
+        }
+
+        impl ToolId {
+            pub const fn as_str(self) -> &'static str {
+                match self {
+                    $( Self::$variant => $name, )+
+                }
+            }
+        }
+
+        impl std::str::FromStr for ToolId {
+            type Err = ();
+
+            fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+                match value {
+                    $( $name => Ok(Self::$variant), )+
+                    _ => Err(()),
+                }
+            }
+        }
+    };
+}
+
+define_tool_ids! {
+    Think => "think",
+    WebRun => "web.run",
+    ReadReflectionSource => "read_reflection_source",
+    CreateIndex => "create_index",
+    AppendIndexDetail => "append_index_detail",
+    FinalizeIndex => "finalize_index",
+    ReadIndexes => "read_indexes",
+    ReadIndexDetails => "read_index_details",
+    ReadTechnicalSnapshot => "read_technical_snapshot",
+    ReadTechnicalDetail => "read_technical_detail",
+    ReadJin10Candidates => "read_jin10_candidates",
+    VerifyEvent => "verify_event",
+    AlpacaGetNews => "alpaca_get_news",
+    SetAnalystAssessment => "set_analyst_assessment",
+    AppendAnalystEvidence => "append_analyst_evidence",
+    AppendAnalystDataGap => "append_analyst_data_gap",
+    SetAnalystInvalidation => "set_analyst_invalidation",
+    FinalizeAnalystReport => "finalize_analyst_report",
+    SetResearchDecision => "set_research_decision",
+    SetResearchScenarios => "set_research_scenarios",
+    AppendResearchHinge => "append_research_hinge",
+    FinalizeResearchDecision => "finalize_research_decision",
+    SetTradeIntent => "set_trade_intent",
+    AppendTradeBlocker => "append_trade_blocker",
+    FinalizeTradeIntent => "finalize_trade_intent",
+    SetRiskAssessment => "set_risk_assessment",
+    SetRiskConstraints => "set_risk_constraints",
+    FinalizeRiskReview => "finalize_risk_review",
+    SetPortfolioAssetDecision => "set_portfolio_asset_decision",
+    AppendBindingRiskControl => "append_binding_risk_control",
+    FinalizePortfolioDecision => "finalize_portfolio_decision",
+    SetPhase2CommonGround => "set_phase2_common_ground",
+    CreatePhase2Topic => "create_phase2_topic",
+    FinalizeResearcherWarmup => "finalize_researcher_warmup",
+    FinalizeTopicGeneration => "finalize_topic_generation",
+    CreateDebateClaim => "create_debate_claim",
+    FinalizeDebateSeed => "finalize_debate_seed",
+    RespondToDebateClaim => "respond_to_debate_claim",
+    FinalizeDebateResponse => "finalize_debate_response",
+    SetClaimStatus => "set_claim_status",
+    AddAgreedFact => "add_agreed_fact",
+    SetDecisionHinge => "set_decision_hinge",
+    RouteDebateSteer => "route_debate_steer",
+    SetTopicSoftControl => "set_topic_soft_control",
+    FinalizeTopicControl => "finalize_topic_control",
+}
+
 /// Rust-owned unit planner identity. It is persisted in snapshots so a run is
 /// never resumed with a different unit boundary than the one that created it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,7 +172,7 @@ pub struct RoleProfileRegistration {
     pub profile_version: u32,
     pub builder_version: u32,
     pub unit_planner: UnitPlanner,
-    pub tool_allowlist: Vec<String>,
+    pub tool_allowlist: Vec<ToolId>,
 }
 
 impl RoleProfileRegistration {
@@ -104,14 +183,11 @@ impl RoleProfileRegistration {
         profile_version: u32,
         builder_version: u32,
         unit_planner: UnitPlanner,
-        tool_allowlist: impl IntoIterator<Item = impl Into<String>>,
+        tool_allowlist: impl IntoIterator<Item = ToolId>,
     ) -> Result<Self, RoleProfileRegistryError> {
         let role_id = role_id.into();
-        let mut tool_allowlist = tool_allowlist
-            .into_iter()
-            .map(Into::into)
-            .collect::<Vec<String>>();
-        tool_allowlist.sort();
+        let mut tool_allowlist = tool_allowlist.into_iter().collect::<Vec<ToolId>>();
+        tool_allowlist.sort_by_key(|tool| tool.as_str());
         if tool_allowlist.windows(2).any(|pair| pair[0] == pair[1]) {
             return Err(RoleProfileRegistryError::DuplicateTool {
                 role_id: role_id.clone(),
@@ -120,7 +196,8 @@ impl RoleProfileRegistration {
                     .windows(2)
                     .find(|pair| pair[0] == pair[1])
                     .expect("duplicate tool must exist")[0]
-                    .clone(),
+                    .as_str()
+                    .to_owned(),
             });
         }
 
@@ -142,8 +219,8 @@ impl RoleProfileRegistration {
 
     pub fn allows_tool(&self, tool_name: &str) -> bool {
         self.tool_allowlist
-            .binary_search_by(|candidate| candidate.as_str().cmp(tool_name))
-            .is_ok()
+            .iter()
+            .any(|candidate| candidate.as_str() == tool_name)
     }
 
     pub fn validate(&self) -> Result<(), RoleProfileRegistryError> {
@@ -166,11 +243,8 @@ impl RoleProfileRegistration {
                 profile: self.profile,
             });
         }
-        for tool in &self.tool_allowlist {
-            validate_tool_name(tool, &self.role_id, self.profile)?;
-        }
         for pair in self.tool_allowlist.windows(2) {
-            if pair[0] >= pair[1] {
+            if pair[0].as_str() >= pair[1].as_str() {
                 return Err(RoleProfileRegistryError::NonCanonicalToolAllowlist {
                     role_id: self.role_id.clone(),
                     profile: self.profile,
@@ -239,13 +313,12 @@ impl RoleProfileRegistry {
                 ToolManagedProfile::HistoricalReflection,
                 UnitPlanner::ReflectionTask,
                 &[
-                    "append_index_detail",
-                    "create_index",
-                    "finalize_historical_reflection",
-                    "finalize_index",
-                    "read_index_details",
-                    "read_indexes",
-                    "read_reflection_source",
+                    ToolId::AppendIndexDetail,
+                    ToolId::CreateIndex,
+                    ToolId::FinalizeIndex,
+                    ToolId::ReadIndexDetails,
+                    ToolId::ReadIndexes,
+                    ToolId::ReadReflectionSource,
                 ],
             ),
             registration(
@@ -253,14 +326,15 @@ impl RoleProfileRegistry {
                 ToolManagedProfile::AnalystReport,
                 UnitPlanner::AnalystTicker,
                 &[
-                    "append_analyst_data_gap",
-                    "append_analyst_evidence",
-                    "finalize_analyst_report",
-                    "read_index_details",
-                    "read_indexes",
-                    "read_technical_snapshot",
-                    "set_analyst_assessment",
-                    "set_analyst_invalidation",
+                    ToolId::AppendAnalystDataGap,
+                    ToolId::AppendAnalystEvidence,
+                    ToolId::FinalizeAnalystReport,
+                    ToolId::ReadIndexDetails,
+                    ToolId::ReadIndexes,
+                    ToolId::ReadTechnicalDetail,
+                    ToolId::ReadTechnicalSnapshot,
+                    ToolId::SetAnalystAssessment,
+                    ToolId::SetAnalystInvalidation,
                 ],
             ),
             registration(
@@ -268,15 +342,16 @@ impl RoleProfileRegistry {
                 ToolManagedProfile::AnalystReport,
                 UnitPlanner::AnalystTicker,
                 &[
-                    "append_analyst_data_gap",
-                    "append_analyst_evidence",
-                    "finalize_analyst_report",
-                    "read_index_details",
-                    "read_indexes",
-                    "read_jin10_candidates",
-                    "set_analyst_assessment",
-                    "set_analyst_invalidation",
-                    "verify_event",
+                    ToolId::AlpacaGetNews,
+                    ToolId::AppendAnalystDataGap,
+                    ToolId::AppendAnalystEvidence,
+                    ToolId::FinalizeAnalystReport,
+                    ToolId::ReadIndexDetails,
+                    ToolId::ReadIndexes,
+                    ToolId::ReadJin10Candidates,
+                    ToolId::SetAnalystAssessment,
+                    ToolId::SetAnalystInvalidation,
+                    ToolId::VerifyEvent,
                 ],
             ),
             registration(
@@ -284,11 +359,11 @@ impl RoleProfileRegistry {
                 ToolManagedProfile::TopicGeneration,
                 UnitPlanner::PhaseAggregate,
                 &[
-                    "create_phase2_topic",
-                    "finalize_topic_generation",
-                    "read_index_details",
-                    "read_indexes",
-                    "set_phase2_common_ground",
+                    ToolId::CreatePhase2Topic,
+                    ToolId::FinalizeTopicGeneration,
+                    ToolId::ReadIndexDetails,
+                    ToolId::ReadIndexes,
+                    ToolId::SetPhase2CommonGround,
                 ],
             ),
             registration(
@@ -296,9 +371,9 @@ impl RoleProfileRegistry {
                 ToolManagedProfile::ResearcherWarmup,
                 UnitPlanner::ResearcherWarmup,
                 &[
-                    "finalize_researcher_warmup",
-                    "read_index_details",
-                    "read_indexes",
+                    ToolId::FinalizeResearcherWarmup,
+                    ToolId::ReadIndexDetails,
+                    ToolId::ReadIndexes,
                 ],
             ),
             registration(
@@ -306,10 +381,10 @@ impl RoleProfileRegistry {
                 ToolManagedProfile::DebateSeed,
                 UnitPlanner::DebateSeed,
                 &[
-                    "create_debate_claim",
-                    "finalize_debate_seed",
-                    "read_index_details",
-                    "read_indexes",
+                    ToolId::CreateDebateClaim,
+                    ToolId::FinalizeDebateSeed,
+                    ToolId::ReadIndexDetails,
+                    ToolId::ReadIndexes,
                 ],
             ),
             registration(
@@ -317,10 +392,10 @@ impl RoleProfileRegistry {
                 ToolManagedProfile::DebateSeed,
                 UnitPlanner::DebateSeed,
                 &[
-                    "create_debate_claim",
-                    "finalize_debate_seed",
-                    "read_index_details",
-                    "read_indexes",
+                    ToolId::CreateDebateClaim,
+                    ToolId::FinalizeDebateSeed,
+                    ToolId::ReadIndexDetails,
+                    ToolId::ReadIndexes,
                 ],
             ),
             registration(
@@ -328,10 +403,10 @@ impl RoleProfileRegistry {
                 ToolManagedProfile::DebateResponse,
                 UnitPlanner::DebateResponse,
                 &[
-                    "finalize_debate_response",
-                    "read_index_details",
-                    "read_indexes",
-                    "respond_to_debate_claim",
+                    ToolId::FinalizeDebateResponse,
+                    ToolId::ReadIndexDetails,
+                    ToolId::ReadIndexes,
+                    ToolId::RespondToDebateClaim,
                 ],
             ),
             registration(
@@ -339,10 +414,10 @@ impl RoleProfileRegistry {
                 ToolManagedProfile::DebateResponse,
                 UnitPlanner::DebateResponse,
                 &[
-                    "finalize_debate_response",
-                    "read_index_details",
-                    "read_indexes",
-                    "respond_to_debate_claim",
+                    ToolId::FinalizeDebateResponse,
+                    ToolId::ReadIndexDetails,
+                    ToolId::ReadIndexes,
+                    ToolId::RespondToDebateClaim,
                 ],
             ),
             registration(
@@ -350,14 +425,14 @@ impl RoleProfileRegistry {
                 ToolManagedProfile::TopicControl,
                 UnitPlanner::TopicControlRound,
                 &[
-                    "add_agreed_fact",
-                    "finalize_topic_control",
-                    "read_index_details",
-                    "read_indexes",
-                    "route_debate_steer",
-                    "set_claim_status",
-                    "set_decision_hinge",
-                    "set_topic_soft_control",
+                    ToolId::AddAgreedFact,
+                    ToolId::FinalizeTopicControl,
+                    ToolId::ReadIndexDetails,
+                    ToolId::ReadIndexes,
+                    ToolId::RouteDebateSteer,
+                    ToolId::SetClaimStatus,
+                    ToolId::SetDecisionHinge,
+                    ToolId::SetTopicSoftControl,
                 ],
             ),
             registration(
@@ -365,12 +440,12 @@ impl RoleProfileRegistry {
                 ToolManagedProfile::ResearchDecision,
                 UnitPlanner::ResearchTicker,
                 &[
-                    "append_research_hinge",
-                    "finalize_research_decision",
-                    "read_index_details",
-                    "read_indexes",
-                    "set_research_decision",
-                    "set_research_scenarios",
+                    ToolId::AppendResearchHinge,
+                    ToolId::FinalizeResearchDecision,
+                    ToolId::ReadIndexDetails,
+                    ToolId::ReadIndexes,
+                    ToolId::SetResearchDecision,
+                    ToolId::SetResearchScenarios,
                 ],
             ),
             registration(
@@ -378,11 +453,11 @@ impl RoleProfileRegistry {
                 ToolManagedProfile::TradeIntent,
                 UnitPlanner::TradeTicker,
                 &[
-                    "append_trade_blocker",
-                    "finalize_trade_intent",
-                    "read_index_details",
-                    "read_indexes",
-                    "set_trade_intent",
+                    ToolId::AppendTradeBlocker,
+                    ToolId::FinalizeTradeIntent,
+                    ToolId::ReadIndexDetails,
+                    ToolId::ReadIndexes,
+                    ToolId::SetTradeIntent,
                 ],
             ),
             registration(
@@ -390,11 +465,11 @@ impl RoleProfileRegistry {
                 ToolManagedProfile::RiskReview,
                 UnitPlanner::RiskTicker,
                 &[
-                    "finalize_risk_review",
-                    "read_index_details",
-                    "read_indexes",
-                    "set_risk_assessment",
-                    "set_risk_constraints",
+                    ToolId::FinalizeRiskReview,
+                    ToolId::ReadIndexDetails,
+                    ToolId::ReadIndexes,
+                    ToolId::SetRiskAssessment,
+                    ToolId::SetRiskConstraints,
                 ],
             ),
             registration(
@@ -402,11 +477,11 @@ impl RoleProfileRegistry {
                 ToolManagedProfile::RiskReview,
                 UnitPlanner::RiskTicker,
                 &[
-                    "finalize_risk_review",
-                    "read_index_details",
-                    "read_indexes",
-                    "set_risk_assessment",
-                    "set_risk_constraints",
+                    ToolId::FinalizeRiskReview,
+                    ToolId::ReadIndexDetails,
+                    ToolId::ReadIndexes,
+                    ToolId::SetRiskAssessment,
+                    ToolId::SetRiskConstraints,
                 ],
             ),
             registration(
@@ -414,11 +489,11 @@ impl RoleProfileRegistry {
                 ToolManagedProfile::RiskReview,
                 UnitPlanner::RiskTicker,
                 &[
-                    "finalize_risk_review",
-                    "read_index_details",
-                    "read_indexes",
-                    "set_risk_assessment",
-                    "set_risk_constraints",
+                    ToolId::FinalizeRiskReview,
+                    ToolId::ReadIndexDetails,
+                    ToolId::ReadIndexes,
+                    ToolId::SetRiskAssessment,
+                    ToolId::SetRiskConstraints,
                 ],
             ),
             registration(
@@ -426,18 +501,22 @@ impl RoleProfileRegistry {
                 ToolManagedProfile::PortfolioDecision,
                 UnitPlanner::PortfolioAsset,
                 &[
-                    "append_binding_risk_control",
-                    "finalize_portfolio_decision",
-                    "read_index_details",
-                    "read_indexes",
-                    "set_portfolio_asset_decision",
+                    ToolId::AppendBindingRiskControl,
+                    ToolId::FinalizePortfolioDecision,
+                    ToolId::ReadIndexDetails,
+                    ToolId::ReadIndexes,
+                    ToolId::SetPortfolioAssetDecision,
                 ],
             ),
             registration(
                 "compressor.phase_summary",
                 ToolManagedProfile::PhaseSummary,
                 UnitPlanner::PhaseSummaryUnit,
-                &["append_index_detail", "create_index", "finalize_index"],
+                &[
+                    ToolId::AppendIndexDetail,
+                    ToolId::CreateIndex,
+                    ToolId::FinalizeIndex,
+                ],
             ),
         ];
         Self::from_registrations(BUILTIN_ROLE_PROFILE_REGISTRY_VERSION, registrations)
@@ -536,7 +615,7 @@ fn registration(
     role_id: &str,
     profile: ToolManagedProfile,
     unit_planner: UnitPlanner,
-    tools: &[&str],
+    tools: &[ToolId],
 ) -> RoleProfileRegistration {
     RoleProfileRegistration::new(role_id, profile, 1, 1, unit_planner, tools.iter().copied())
         .expect("builtin authority registration must be valid")
@@ -558,25 +637,6 @@ fn validate_role_id(role_id: &str) -> Result<(), RoleProfileRegistryError> {
     }) {
         return Err(RoleProfileRegistryError::InvalidRoleId {
             role_id: role_id.to_string(),
-        });
-    }
-    Ok(())
-}
-
-fn validate_tool_name(
-    tool_name: &str,
-    role_id: &str,
-    profile: ToolManagedProfile,
-) -> Result<(), RoleProfileRegistryError> {
-    if tool_name.is_empty()
-        || !tool_name
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
-    {
-        return Err(RoleProfileRegistryError::InvalidToolName {
-            role_id: role_id.to_string(),
-            profile,
-            tool_name: tool_name.to_string(),
         });
     }
     Ok(())
@@ -622,12 +682,6 @@ pub enum RoleProfileRegistryError {
     EmptyToolAllowlist {
         role_id: String,
         profile: ToolManagedProfile,
-    },
-    #[error("role {role_id:?} profile {profile:?} has invalid tool name {tool_name:?}")]
-    InvalidToolName {
-        role_id: String,
-        profile: ToolManagedProfile,
-        tool_name: String,
     },
     #[error("role {role_id:?} profile {profile:?} repeats tool {tool:?}")]
     DuplicateTool {
@@ -685,7 +739,7 @@ mod tests {
             1,
             1,
             UnitPlanner::AnalystTicker,
-            ["finalize_analyst_report"],
+            [ToolId::FinalizeAnalystReport],
         )
         .unwrap();
         let err = RoleProfileRegistry::from_registrations(1, [registration.clone(), registration])
@@ -697,14 +751,14 @@ mod tests {
     }
 
     #[test]
-    fn registration_rejects_duplicate_or_invalid_tools() {
+    fn registration_rejects_duplicate_tools_and_unknown_deserialization() {
         let err = RoleProfileRegistration::new(
             "analyst.test",
             ToolManagedProfile::AnalystReport,
             1,
             1,
             UnitPlanner::AnalystTicker,
-            ["set_analyst_assessment", "set_analyst_assessment"],
+            [ToolId::SetAnalystAssessment, ToolId::SetAnalystAssessment],
         )
         .unwrap_err();
         assert!(matches!(
@@ -712,19 +766,9 @@ mod tests {
             RoleProfileRegistryError::DuplicateTool { .. }
         ));
 
-        let err = RoleProfileRegistration::new(
-            "analyst.test",
-            ToolManagedProfile::AnalystReport,
-            1,
-            1,
-            UnitPlanner::AnalystTicker,
-            ["set analyst assessment"],
-        )
-        .unwrap_err();
-        assert!(matches!(
-            err,
-            RoleProfileRegistryError::InvalidToolName { .. }
-        ));
+        assert!(
+            serde_json::from_value::<ToolId>(serde_json::json!("set analyst assessment")).is_err()
+        );
     }
 
     #[test]
@@ -735,10 +779,7 @@ mod tests {
             profile_version: 1,
             builder_version: 1,
             unit_planner: UnitPlanner::AnalystTicker,
-            tool_allowlist: vec![
-                "set_analyst_assessment".to_string(),
-                "append_analyst_evidence".to_string(),
-            ],
+            tool_allowlist: vec![ToolId::SetAnalystAssessment, ToolId::AppendAnalystEvidence],
         };
         let err = registration.validate().unwrap_err();
         assert!(matches!(

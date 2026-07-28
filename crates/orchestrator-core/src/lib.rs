@@ -21,7 +21,7 @@ pub use artifact::{
 };
 pub use authority::{
     RoleProfileKey, RoleProfileRegistration, RoleProfileRegistry, RoleProfileRegistryError,
-    RoleProfileRegistrySnapshot, ToolManagedProfile, UnitPlanner,
+    RoleProfileRegistrySnapshot, ToolId, ToolManagedProfile, UnitPlanner,
     BUILTIN_ROLE_PROFILE_REGISTRY_VERSION, ROLE_PROFILE_REGISTRY_SCHEMA_VERSION,
 };
 pub use config::{

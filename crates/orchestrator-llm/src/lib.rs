@@ -2183,11 +2183,6 @@ fn configured_tool_names(settings: &AgentSettings) -> Vec<&str> {
             });
         }
     }
-    if let Some(binding) = &settings.domain_tool_runtime {
-        names.extend(tools::domain_tools::tool_names_for_profile(
-            binding.scope().profile,
-        ));
-    }
     // LLM role configuration can name the same read tool that a typed
     // runtime injects. The gateway rejects duplicate schemas, so normalize
     // the final Rust-owned allowlist before it is rendered or registered.

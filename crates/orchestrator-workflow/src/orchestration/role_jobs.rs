@@ -230,7 +230,7 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
             Some(&config.component_plugins),
         )?
     };
-    let llm = if mock {
+    let mut llm = if mock {
         None
     } else {
         let mut llm = config
@@ -265,7 +265,13 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
         "prepared role job"
     );
     let candidate_tool_managed_profile = tool_managed_profile_for_role_kind(role, kind);
-    let (tool_managed_profile, index_tool_runtime, domain_tool_runtime, file_store_input) = {
+    let (
+        tool_managed_profile,
+        index_tool_runtime,
+        domain_tool_runtime,
+        file_store_input,
+        tool_allowlist,
+    ) = {
         let profile = candidate_tool_managed_profile
             .with_context(|| format!("missing ToolManaged profile for role={role} kind={kind}"))?;
         let registration = config.role_profile_registry.registration(role, profile)?;
@@ -281,7 +287,13 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
                 registration.profile_version,
                 registration.builder_version,
             )?;
-            (profile, Some(binding), None, None)
+            (
+                profile,
+                Some(binding),
+                None,
+                None,
+                registration.tool_allowlist.clone(),
+            )
         } else if profile == ToolManagedProfile::PhaseSummary {
             let binding = file_store_phase_summary_index_runtime(
                 Path::new(store_root),
@@ -289,7 +301,13 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
                 registration.profile_version,
                 registration.builder_version,
             )?;
-            (profile, Some(binding), None, None)
+            (
+                profile,
+                Some(binding),
+                None,
+                None,
+                registration.tool_allowlist.clone(),
+            )
         } else {
             let binding = file_store_domain_runtime(
                 Path::new(store_root),
@@ -328,9 +346,19 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
                 )?),
                 Some(binding),
                 input,
+                registration.tool_allowlist.clone(),
             )
         }
     };
+    if let Some(llm) = llm.as_mut() {
+        // The built-in RoleProfileRegistry is the only profile allowlist.
+        // YAML may select models and transport settings, but cannot add a
+        // model-visible tool outside this typed Rust-owned contract.
+        llm.tools = tool_allowlist
+            .iter()
+            .map(|tool| tool.as_str().to_owned())
+            .collect();
+    }
     // A migrated role may read only its Rust-projected FileStore indexes and
     // snapshots. Clearing every alternate persistence handle here turns a missing
     // FileStore projection into a hard tool error instead of an accidental
