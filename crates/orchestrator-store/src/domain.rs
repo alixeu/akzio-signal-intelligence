@@ -163,7 +163,7 @@ pub type AnalystArtifact = CanonicalArtifact<AnalystTickerArtifact>;
 pub type ResearchDecisionArtifact = CanonicalArtifact<ResearchDecisionPayload>;
 
 impl<T> CanonicalArtifact<T> {
-    fn new(
+    pub(crate) fn new(
         scope: &ArtifactScope,
         artifact_id: String,
         payload: T,

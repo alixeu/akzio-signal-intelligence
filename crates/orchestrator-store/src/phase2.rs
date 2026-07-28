@@ -11,12 +11,12 @@ use serde::{Deserialize, Serialize};
 use crate::{
     apply_typed_draft_command, complete_terminal_draft_without_artifact, content_hash,
     create_or_recover_draft, finalize_draft_atomic, read_draft_for_scope, ArtifactDraftState,
-    ArtifactScope, ContentHashDocument, DebateClaimDraft, DebateResponseDraftEntry,
-    DraftAppendOutcome, FileStore, FinalizableArtifact, FinalizeDraftOutcome, Phase2TopicDraft,
-    Result, RunLocation, SafeSlug, StoreError, ToolManagedProfile, Versioned,
+    ArtifactScope, CanonicalArtifact, DebateClaimDraft, DebateResponseDraftEntry,
+    DraftAppendOutcome, FileStore, FinalizeDraftOutcome, Phase2TopicDraft, Result, RunLocation,
+    SafeSlug, StoreError, ToolManagedProfile, Versioned,
 };
 
-pub const PHASE2_ARTIFACT_SCHEMA_VERSION: u32 = 1;
+pub const PHASE2_ARTIFACT_SCHEMA_VERSION: u32 = crate::domain::DOMAIN_ARTIFACT_SCHEMA_VERSION;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -38,25 +38,7 @@ impl ClaimStatus {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Phase2Artifact {
-    pub schema_version: u32,
-    pub artifact_id: String,
-    pub run_id: String,
-    pub phase: u8,
-    pub role: String,
-    pub profile: String,
-    pub unit_key: String,
-    pub source_payload_hash: String,
-    pub ticker: Option<String>,
-    pub topic_id: Option<String>,
-    pub side: Option<String>,
-    pub round: Option<u32>,
-    pub payload: Phase2ArtifactPayload,
-    pub evidence_refs: BTreeSet<String>,
-    pub created_at: String,
-    pub content_hash: String,
-}
+pub type Phase2Artifact = CanonicalArtifact<Phase2ArtifactPayload>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
@@ -92,28 +74,8 @@ pub struct SteerRoute {
     pub instruction: String,
 }
 
-impl ContentHashDocument for Phase2Artifact {
-    fn content_hash(&self) -> &str {
-        &self.content_hash
-    }
-
-    fn set_content_hash(&mut self, hash: String) {
-        self.content_hash = hash;
-    }
-}
-
 impl Versioned for Phase2Artifact {
     const SCHEMA_VERSION: u32 = PHASE2_ARTIFACT_SCHEMA_VERSION;
-}
-
-impl FinalizableArtifact for Phase2Artifact {
-    fn artifact_id(&self) -> &str {
-        &self.artifact_id
-    }
-
-    fn source_payload_hash(&self) -> &str {
-        &self.source_payload_hash
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -539,24 +501,13 @@ impl Phase2DraftService {
         let draft = read_draft_for_scope(&self.store, &self.location, &self.scope)?;
         let (payload, evidence_refs) = build_payload(&draft.state)?;
         let artifact_relative = artifact_relative(&self.scope)?;
-        let artifact = Phase2Artifact {
-            schema_version: PHASE2_ARTIFACT_SCHEMA_VERSION,
-            artifact_id: stable_id("artifact", &self.scope)?,
-            run_id: self.scope.run_id.clone(),
-            phase: self.scope.phase,
-            role: self.scope.role.clone(),
-            profile: self.scope.profile.as_str().to_owned(),
-            unit_key: self.scope.unit_key.clone(),
-            source_payload_hash: self.scope.source_payload_hash.clone(),
-            ticker: self.scope.ticker.clone(),
-            topic_id: self.scope.topic_id.clone(),
-            side: self.scope.side.clone(),
-            round: self.scope.round,
+        let artifact = CanonicalArtifact::new(
+            &self.scope,
+            stable_id("artifact", &self.scope)?,
             payload,
-            evidence_refs,
-            created_at: self.created_at.clone(),
-            content_hash: String::new(),
-        };
+            evidence_refs.into_iter().collect(),
+            &self.created_at,
+        );
         match finalize_draft_atomic(
             &self.store,
             &self.location,
