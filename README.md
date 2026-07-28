@@ -289,7 +289,33 @@ Useful options:
 - `--max-debate-rounds N`: cap conditional debate rounds.
 - `--max-topics-per-side N`: cap material conflict topics.
 
-`--mock` exists only for local tests and development. It is not evidence that the production workflow or external services work.
+`--mock` exists only for local tests and development. It is not evidence that the production workflow or external services work. `--debug` resolves MemoryOS writes to `knowledge/debug/<run-id>/`; it never writes canonical Decision or Outcome data. Replay and migration fixtures use their own namespaces, and replay reads canonical Decisions only through a read-only reader while emitting only replay output.
+
+### Deterministic Outcome materialization
+
+Phase 8 can write a typed `DecisionSnapshotV2` when
+`orchestrator.evaluation.enabled` is set. Canonical Decision/Outcome writes
+require both Paper/Live purpose and
+`orchestrator.evaluation.canonical_memory_writes_enabled: true`; Debug uses an
+isolated namespace and Mock writes neither canonical Decision nor Outcome.
+
+Matured outcomes are materialized only from hash-pinned technical CSV exports
+under an explicit `Close` or `AdjustedClose` basis and an explicit per-ticker
+benchmark mapping. A missing mapping, insufficient sessions, unavailable
+market data, or unresolved corporate action produces an auditable gap and does
+not block the current investment workflow. The canonical outcome is global
+under `knowledge/evaluation/`; evaluation runs only own receipts and batch
+reports.
+
+```bash
+rtk cargo run -p orchestrator-cli --bin orchestrator-memory -- \
+  --evaluation-run-id catchup-2026-07-28 \
+  --evaluation-date 2026-07-28 \
+  --purpose paper
+```
+
+The command reads the same strict project configuration as the workflow. It
+cannot accept an arbitrary outcome ID, source run, benchmark, or output path.
 
 `--from-phase` accepts `0-8` and defaults to `0`; `--to-phase 0` runs only
 historical reflection/retrieval. Mock runs skip Alpaca and all learning writes.
@@ -307,33 +333,42 @@ Store Doctor checks malformed content, hashes, path escape, orphan details,
 incomplete Drafts and manifest/file drift; its catalog and experience-level
 outputs are rebuildable caches.
 
+Evaluation data is separate: immutable canonical outcomes, revision commits,
+heads, market-input manifests, and gaps live under
+`knowledge/evaluation/`; `runs/<date>/<evaluation-run>/receipts/materialization/`
+and `reports/materialization/` are non-authoritative execution evidence.
+
 ## Learning loop
 
-A non-mock default run starts with Phase 0 and records the current decision in
-Phase 8:
+The memory loop is deliberately outside the decision-critical path:
 
-1. Phase 0 reads Alpaca Paper account, positions, and recent fills while scoring matured
-   prior decisions on the third stored trading bar. This is an evaluation
-   horizon, not a forced trade or forced close.
-2. Every matured outcome receives routine reflection. Loss, benchmark
-   underperformance, wrong direction, confidence mismatch, risk violation, or a
-   repeated error upgrades it to deep reflection.
-3. The reflector reads only the allowlisted prior run's phase-summary indexes
-   and details. Rust validates evidence IDs, taxonomy, phase scope, and the
-   deterministic pattern key before saving atomic experience.
-4. One source run is a `recent_episode`; two matching source runs are a
-   `repeated_warning`; three are an `active_policy`. The level is computed from
-   Experience Details and is never separately promoted or versioned.
-5. Phase 8 records a three-trading-day decision snapshot for each analyzed
-   ticker, including Hold/current-position decisions, without requiring an order.
+1. Phase 8 records typed, sectioned `DecisionSnapshotV2` data. It never forces a
+   trade or manufactures missing thesis, execution, or allocation details.
+2. The deterministic materializer turns only matured, benchmark-configured
+   Decisions into global canonical Outcomes. Ordinary missing data becomes a
+   Materialization Gap; integrity/provenance failures fail closed for that
+   Decision without stopping other matured Decisions or the current workflow.
+3. Phase 0 schedules only current Outcome revisions. A Task Key binds the
+   source run, ticker, Outcome content hash, MemoryPolicy version, reflector
+   profile, and builder version. A newer Outcome supersedes unstarted or
+   claimed older tasks.
+4. The reflector can terminal as `learned`, `no_reusable_memory`, `deferred`,
+   or `contested`. `duplicate` is Rust-only idempotency state. Only `learned`
+   can append the legacy historical case and an `AddSupport` Experience Event;
+   later lifecycle policy may add verified contradictions to an existing
+   Pattern, never create a positive Pattern from `contested` alone.
+5. Experience Events are append-only authority. Experience Views are rebuilt
+   deterministically using independent date/regime clusters, support and
+   contradiction counts, utility EMA, and harmful-use rate. Retrieval treats
+   historical wording as untrusted data and logs actual search/expand access in
+   the current run's MemoryUsage ledger.
 
-The current prediction never scores itself, mock runs never write experience,
-and repeated processing is idempotent. Before an Alpaca submission, the workflow
-persists an intent; after a restart it queries the remote order before attempting
-any submission, so a missing local receipt cannot duplicate an order.
-Malformed experience writes fail closed, while reflection failure remains
-non-blocking for the investment decision. Set
-`orchestrator.reflection.enabled: false` to disable retrieval and learning.
+The current prediction never scores itself, mock runs never write formal
+Decision/Outcome data, and repeated processing is idempotent. Reflection
+failures become bounded retry events and remain non-blocking for the investment
+decision. Scheduler quotas are configured under `orchestrator.reflection`;
+the shipped 6/2/2 new/retry/backlog split is a policy default rather than a
+hard-coded invariant.
 
 ## Reliability contracts
 

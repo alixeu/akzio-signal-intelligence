@@ -8,8 +8,8 @@ use std::{collections::BTreeMap, path::PathBuf};
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use orchestrator_store::{
-    inspect_store, rebuild_experience_stats, rebuild_index_catalog, rebuild_run_manifest,
-    FileStore, FileStoreOptions, IndexKind, RunLocation, RunManifestInit,
+    inspect_store, rebuild_experience_stats, rebuild_experience_views, rebuild_index_catalog,
+    rebuild_run_manifest, FileStore, FileStoreOptions, IndexKind, RunLocation, RunManifestInit,
 };
 
 #[derive(Parser)]
@@ -61,6 +61,11 @@ enum Command {
     },
     /// Rebuild dynamic experience occurrence counts and levels.
     RebuildExperienceStats {
+        #[arg(long)]
+        generated_at: String,
+    },
+    /// Rebuild every derived Experience View from append-only Event files.
+    RebuildExperienceViews {
         #[arg(long)]
         generated_at: String,
     },
@@ -132,6 +137,9 @@ fn main() -> Result<()> {
         }
         Command::RebuildExperienceStats { generated_at } => {
             serde_json::to_value(rebuild_experience_stats(&store, generated_at)?)?
+        }
+        Command::RebuildExperienceViews { generated_at } => {
+            serde_json::to_value(rebuild_experience_views(&store, &generated_at)?)?
         }
     };
     println!("{}", serde_json::to_string_pretty(&output)?);

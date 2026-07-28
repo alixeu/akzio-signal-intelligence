@@ -5,6 +5,7 @@
 //!
 //! Each file holds the latest N bars (default 60) with feature columns.
 
+use crate::PriceBasis;
 use anyhow::{bail, Context, Result};
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
@@ -225,6 +226,76 @@ pub fn close_on_or_after(rows: &[TechnicalCsvRow], date: &str) -> Option<(String
                 .map(|close| (row.date.clone(), close))
         })
         .next()
+}
+
+/// Return one explicitly requested price basis.  Evaluation callers must use
+/// this API instead of the legacy `close_on_*` helpers: an `AdjustedClose`
+/// request never falls back to `Close`, which prevents silent basis changes
+/// across a prediction horizon.
+pub fn price_on_or_after(
+    rows: &[TechnicalCsvRow],
+    date: &str,
+    basis: PriceBasis,
+) -> Option<(String, f64)> {
+    price_on_or_bound(rows, date, basis, false)
+}
+
+pub fn price_on_or_before(
+    rows: &[TechnicalCsvRow],
+    date: &str,
+    basis: PriceBasis,
+) -> Option<(String, f64)> {
+    price_on_or_bound(rows, date, basis, true)
+}
+
+pub fn prices_between(
+    rows: &[TechnicalCsvRow],
+    start: &str,
+    end: &str,
+    basis: PriceBasis,
+) -> Vec<(String, f64)> {
+    let column = price_column(basis);
+    let start = start.get(..10).unwrap_or(start);
+    let end = end.get(..10).unwrap_or(end);
+    rows.iter()
+        .filter_map(|row| {
+            let day = row.date.get(..10).unwrap_or(row.date.as_str());
+            (day >= start && day <= end)
+                .then(|| row.values.get(column).copied())
+                .flatten()
+                .map(|price| (row.date.clone(), price))
+        })
+        .collect()
+}
+
+fn price_on_or_bound(
+    rows: &[TechnicalCsvRow],
+    date: &str,
+    basis: PriceBasis,
+    before: bool,
+) -> Option<(String, f64)> {
+    let target = date.get(..10).unwrap_or(date);
+    let column = price_column(basis);
+    let mut iterator: Box<dyn Iterator<Item = &TechnicalCsvRow>> = if before {
+        Box::new(rows.iter().rev())
+    } else {
+        Box::new(rows.iter())
+    };
+    iterator.find_map(|row| {
+        let day = row.date.get(..10).unwrap_or(row.date.as_str());
+        let matches = if before { day <= target } else { day >= target };
+        matches
+            .then(|| row.values.get(column).copied())
+            .flatten()
+            .map(|price| (row.date.clone(), price))
+    })
+}
+
+fn price_column(basis: PriceBasis) -> &'static str {
+    match basis {
+        PriceBasis::Close => "Close",
+        PriceBasis::AdjustedClose => "AdjustedClose",
+    }
 }
 
 /// Compact latest-bar snapshot for tool/context consumers.

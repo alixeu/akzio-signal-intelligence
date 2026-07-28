@@ -48,3 +48,7 @@ path = "src/bin/orchestrator_prompt_lint.rs"
 [[bin]]
 name = "orchestrator-store-doctor"
 path = "src/bin/orchestrator_store_doctor.rs"
+
+[[bin]]
+name = "orchestrator-memory"
+path = "src/bin/orchestrator_memory.rs"

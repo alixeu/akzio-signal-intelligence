@@ -188,6 +188,11 @@ pub struct AgentSettings {
     pub session_runtime: agent_loop::FileStoreSessionRuntime,
     /// Present only for an Index/Detail unit.
     pub index_tool_runtime: Option<tools::index_tools::IndexToolRuntimeBinding>,
+    /// Present only for the Phase 0 Historical Reflection terminal.
+    pub historical_reflection_terminal:
+        Option<tools::historical_reflection::HistoricalReflectionTerminalBinding>,
+    /// Read-only, Rust-scoped retrieval of historical Experience.
+    pub experience_retrieval: Option<tools::experience_tools::ExperienceRetrievalBinding>,
     /// Present only for a business unit. It is a typed, scoped FileStore service.
     pub domain_tool_runtime: Option<tools::domain_tools::DomainToolRuntimeBinding>,
     /// Upper bound for typed Draft/Index write attempts in one agent turn.
@@ -321,6 +326,12 @@ pub async fn run_agent_loop_with_metrics(
     tools = tools.with_max_write_calls(settings.max_write_calls);
     if let Some(binding) = settings.index_tool_runtime.clone() {
         tools = tools.with_index_tool_runtime(binding);
+    }
+    if let Some(binding) = settings.historical_reflection_terminal.clone() {
+        tools = tools.with_historical_reflection_terminal(binding);
+    }
+    if let Some(binding) = settings.experience_retrieval.clone() {
+        tools = tools.with_experience_retrieval(binding);
     }
     if let Some(binding) = settings.domain_tool_runtime.clone() {
         tools = tools.with_domain_tool_runtime(binding);
@@ -460,6 +471,12 @@ pub async fn run_agent_steer_loop_with_metrics(
     tools = tools.with_max_write_calls(settings.max_write_calls);
     if let Some(binding) = settings.index_tool_runtime.clone() {
         tools = tools.with_index_tool_runtime(binding);
+    }
+    if let Some(binding) = settings.historical_reflection_terminal.clone() {
+        tools = tools.with_historical_reflection_terminal(binding);
+    }
+    if let Some(binding) = settings.experience_retrieval.clone() {
+        tools = tools.with_experience_retrieval(binding);
     }
     if let Some(binding) = settings.domain_tool_runtime.clone() {
         tools = tools.with_domain_tool_runtime(binding);
@@ -2180,6 +2197,16 @@ fn configured_tool_names(settings: &AgentSettings) -> Vec<&str> {
             });
         }
     }
+    if settings.historical_reflection_terminal.is_some() {
+        names.push(tools::historical_reflection::FINALIZE_HISTORICAL_REFLECTION_NAME);
+    }
+    if settings.experience_retrieval.is_some() {
+        names.extend([
+            tools::experience_tools::SEARCH_EXPERIENCES_NAME,
+            tools::experience_tools::READ_EXPERIENCE_CASES_NAME,
+            tools::experience_tools::RECORD_MEMORY_APPLICATION_NAME,
+        ]);
+    }
     // LLM role configuration can name the same read tool that a typed
     // runtime injects. The gateway rejects duplicate schemas, so normalize
     // the final Rust-owned allowlist before it is rendered or registered.
@@ -2319,6 +2346,8 @@ mod tests {
             tool_managed_profile: ToolManagedProfile::ResearchDecision,
             session_runtime: test_session_runtime(),
             index_tool_runtime: None,
+            historical_reflection_terminal: None,
+            experience_retrieval: None,
             domain_tool_runtime: None,
             max_write_calls: None,
             llm: RoleLlmSettings {

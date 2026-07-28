@@ -22,6 +22,20 @@ pub enum FileSchemaKind {
     Outcome,
     Reflection,
     Allocation,
+    DecisionSnapshot,
+    OutcomeRecord,
+    OutcomeRevisionCommit,
+    OutcomeHead,
+    OutcomeWriteReceipt,
+    MaterializationGap,
+    MaterializationIntegrityIssue,
+    MaterializationBatchReport,
+    EvaluationInputManifest,
+    ReflectionTask,
+    HistoricalReflectionArtifact,
+    ExperienceView,
+    MemoryUsageReport,
+    MemoryAttribution,
 }
 
 impl fmt::Display for FileSchemaKind {
@@ -41,6 +55,20 @@ impl fmt::Display for FileSchemaKind {
             Self::Outcome => f.write_str("outcome"),
             Self::Reflection => f.write_str("reflection"),
             Self::Allocation => f.write_str("allocation"),
+            Self::DecisionSnapshot => f.write_str("decision snapshot"),
+            Self::OutcomeRecord => f.write_str("outcome record"),
+            Self::OutcomeRevisionCommit => f.write_str("outcome revision commit"),
+            Self::OutcomeHead => f.write_str("outcome head"),
+            Self::OutcomeWriteReceipt => f.write_str("outcome write receipt"),
+            Self::MaterializationGap => f.write_str("materialization gap"),
+            Self::MaterializationIntegrityIssue => f.write_str("materialization integrity issue"),
+            Self::MaterializationBatchReport => f.write_str("materialization batch report"),
+            Self::EvaluationInputManifest => f.write_str("evaluation input manifest"),
+            Self::ReflectionTask => f.write_str("reflection task"),
+            Self::HistoricalReflectionArtifact => f.write_str("historical reflection artifact"),
+            Self::ExperienceView => f.write_str("experience view"),
+            Self::MemoryUsageReport => f.write_str("memory usage report"),
+            Self::MemoryAttribution => f.write_str("memory attribution"),
         }
     }
 }

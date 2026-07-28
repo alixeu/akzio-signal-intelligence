@@ -12,11 +12,18 @@ use std::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use orchestrator_core::{
+    EvaluationInputManifestV1, MaterializationGapV1, MaterializationIntegrityIssueV1,
+    MemoryAttributionRecordV1, MemoryUsageEventV1, MemoryUsageReportV1, OutcomeHeadV1,
+    OutcomeRecordV1, OutcomeRevisionCommitV1, OutcomeStatus,
+};
+
 use crate::{
-    read_indexes, read_jsonl_recover_tail, rebuild_manifest_from_finalized_artifacts,
-    validate_content_hash_at, validate_relative_path, write_run_manifest, ArtifactDraft,
-    ContentHashDocument, DetailSection, FileSchemaKind, FileStore, FinalizedArtifactRef, Index,
-    IndexDetail, IndexKind, IndexQuery, JsonlEvent, Result, RunLocation, RunManifest,
+    content_hash_bytes, read_indexes, read_jsonl_recover_tail,
+    rebuild_manifest_from_finalized_artifacts, validate_content_hash_at, validate_relative_path,
+    write_run_manifest, ArtifactDraft, ContentHashDocument, DetailSection, ExperienceEventV1,
+    ExperienceViewV1, FileSchemaKind, FileStore, FinalizedArtifactRef, Index, IndexDetail,
+    IndexKind, IndexQuery, JsonlEvent, ReflectionTaskEventV1, Result, RunLocation, RunManifest,
     RunManifestInit, SafeSlug, SessionEvent, SessionEventType, StoreError,
 };
 
@@ -135,11 +142,23 @@ pub fn inspect_store(store: &FileStore) -> StoreDoctorReport {
     }
     inspect_runs(store, &files, &mut report);
     inspect_indexes(store, &files, &mut report);
+    inspect_evaluation(store, &files, &mut report);
+    inspect_experience_views(store, &files, &mut report);
+    inspect_memory_usage(store, &files, &mut report);
     resolve_source_refs(store, &files, &mut report);
     report
         .issues
         .sort_by(|a, b| (&a.path, &a.code, &a.message).cmp(&(&b.path, &b.code, &b.message)));
     report
+}
+
+/// Rebuild every non-authoritative Experience View from its append-only Event
+/// Ledger. This is intentionally separate from the legacy Index stats cache.
+pub fn rebuild_experience_views(
+    store: &FileStore,
+    rebuilt_at: &str,
+) -> Result<Vec<ExperienceViewV1>> {
+    crate::ExperienceLedger::new(store.clone()).rebuild_all_views(rebuilt_at)
 }
 
 fn collect_files(root: &Path) -> Result<Vec<PathBuf>> {
@@ -228,6 +247,21 @@ fn inspect_file_envelope(store: &FileStore, relative: &Path, report: &mut StoreD
             .any(|component| component.as_os_str() == "sessions")
         {
             read_jsonl_recover_tail::<SessionEvent>(store.root(), relative).map(|_| ())
+        } else if relative
+            .components()
+            .any(|component| component.as_os_str() == "reflection")
+        {
+            read_jsonl_recover_tail::<ReflectionTaskEventV1>(store.root(), relative).map(|_| ())
+        } else if relative
+            .components()
+            .any(|component| component.as_os_str() == "experiences")
+        {
+            read_jsonl_recover_tail::<ExperienceEventV1>(store.root(), relative).map(|_| ())
+        } else if relative
+            .components()
+            .any(|component| component.as_os_str() == "memory")
+        {
+            read_jsonl_recover_tail::<MemoryUsageEventV1>(store.root(), relative).map(|_| ())
         } else {
             read_jsonl_recover_tail::<JsonlEvent>(store.root(), relative).map(|_| ())
         };
@@ -265,7 +299,30 @@ fn validate_generic_document(value: &Value, path: &Path) -> Result<()> {
             kind: "authoritative file".to_owned(),
             path: path.to_path_buf(),
         })?;
+    // Run manifests own a strictly constrained v1→v2 reader migration. The
+    // generic envelope can validate their immutable hash but must not reject
+    // a known legacy version before `inspect_run` applies that migration.
+    if path.file_name().is_some_and(|name| name == "manifest.json")
+        && path
+            .components()
+            .any(|component| component.as_os_str() == "runs")
+    {
+        return validate_content_hash_at(value, path);
+    }
     let current = if path
+        .components()
+        .any(|component| component.as_os_str() == "learning")
+        && path
+            .components()
+            .any(|component| component.as_os_str() == "v2")
+        && path
+            .components()
+            .any(|component| component.as_os_str() == "decisions")
+    {
+        orchestrator_core::DECISION_SNAPSHOT_SCHEMA_VERSION
+    } else if path.starts_with("knowledge/evaluation") {
+        evaluation_schema_version_for_path(path)
+    } else if path
         .components()
         .any(|component| component.as_os_str() == "artifacts")
         && object
@@ -295,6 +352,42 @@ fn validate_generic_document(value: &Value, path: &Path) -> Result<()> {
         });
     }
     validate_content_hash_at(value, path)
+}
+
+fn evaluation_schema_version_for_path(path: &Path) -> u32 {
+    if path
+        .components()
+        .any(|component| component.as_os_str() == "outcomes")
+    {
+        orchestrator_core::OUTCOME_RECORD_SCHEMA_VERSION
+    } else if path
+        .components()
+        .any(|component| component.as_os_str() == "revisions")
+    {
+        orchestrator_core::OUTCOME_REVISION_COMMIT_SCHEMA_VERSION
+    } else if path
+        .components()
+        .any(|component| component.as_os_str() == "outcome_heads")
+    {
+        orchestrator_core::OUTCOME_HEAD_SCHEMA_VERSION
+    } else if path
+        .components()
+        .any(|component| component.as_os_str() == "manifests")
+    {
+        orchestrator_core::EVALUATION_INPUT_MANIFEST_SCHEMA_VERSION
+    } else if path
+        .components()
+        .any(|component| component.as_os_str() == "gaps")
+    {
+        orchestrator_core::MATERIALIZATION_GAP_SCHEMA_VERSION
+    } else if path
+        .components()
+        .any(|component| component.as_os_str() == "integrity")
+    {
+        orchestrator_core::MATERIALIZATION_INTEGRITY_ISSUE_SCHEMA_VERSION
+    } else {
+        1
+    }
 }
 
 fn inspect_runs(store: &FileStore, files: &[PathBuf], report: &mut StoreDoctorReport) {
@@ -331,9 +424,7 @@ fn inspect_run(
 ) {
     let manifest_relative = run_root.join("manifest.json");
     let manifest_path = store.root().join(&manifest_relative);
-    let location = match store
-        .read_versioned_json::<RunManifest>(&manifest_relative, FileSchemaKind::RunManifest)
-    {
+    let location = match crate::manifest::read_manifest_relative(store, &manifest_relative) {
         Ok(manifest) => match manifest.location() {
             Ok(location) => {
                 if location.relative_root() != run_root {
@@ -572,6 +663,193 @@ fn inspect_indexes(store: &FileStore, files: &[PathBuf], report: &mut StoreDocto
     }
     for base in bases {
         inspect_index_base(store, &base, files, report);
+    }
+}
+
+/// Validate the canonical evaluation ledger separately from generic envelope
+/// checks.  In particular, a head may only expose one current Outcome and an
+/// Outcome's decision/input references must stay inside FileStore.
+fn inspect_evaluation(store: &FileStore, files: &[PathBuf], report: &mut StoreDoctorReport) {
+    let root = Path::new("knowledge/evaluation");
+    for relative in files.iter().filter(|path| path.starts_with(root)) {
+        let path = relative.as_path();
+        if path.components().any(|part| part.as_os_str() == ".locks") {
+            continue;
+        }
+        let typed = if path.components().any(|part| part.as_os_str() == "outcomes") {
+            store
+                .read_versioned_json::<OutcomeRecordV1>(path, FileSchemaKind::OutcomeRecord)
+                .map(|outcome| {
+                    inspect_document_ref(store, path, &outcome.decision_ref, report);
+                    inspect_document_ref(
+                        store,
+                        path,
+                        &outcome.evaluation_input_manifest_ref,
+                        report,
+                    );
+                })
+        } else if path
+            .components()
+            .any(|part| part.as_os_str() == "attributions")
+        {
+            store
+                .read_versioned_json::<MemoryAttributionRecordV1>(
+                    path,
+                    FileSchemaKind::MemoryAttribution,
+                )
+                .map(|_| ())
+        } else if path
+            .components()
+            .any(|part| part.as_os_str() == "outcome_heads")
+        {
+            store
+                .read_versioned_json::<OutcomeHeadV1>(path, FileSchemaKind::OutcomeHead)
+                .and_then(|head| {
+                    inspect_outcome_head(&head).map_err(|message| StoreError::InvalidDocument {
+                        kind: "outcome head",
+                        message,
+                    })
+                })
+        } else if path
+            .components()
+            .any(|part| part.as_os_str() == "revisions")
+        {
+            store
+                .read_versioned_json::<OutcomeRevisionCommitV1>(
+                    path,
+                    FileSchemaKind::OutcomeRevisionCommit,
+                )
+                .map(|_| ())
+        } else if path
+            .components()
+            .any(|part| part.as_os_str() == "manifests")
+        {
+            store
+                .read_versioned_json::<EvaluationInputManifestV1>(
+                    path,
+                    FileSchemaKind::EvaluationInputManifest,
+                )
+                .map(|_| ())
+        } else if path.components().any(|part| part.as_os_str() == "gaps") {
+            store
+                .read_versioned_json::<MaterializationGapV1>(
+                    path,
+                    FileSchemaKind::MaterializationGap,
+                )
+                .map(|_| ())
+        } else if path
+            .components()
+            .any(|part| part.as_os_str() == "integrity")
+        {
+            store
+                .read_versioned_json::<MaterializationIntegrityIssueV1>(
+                    path,
+                    FileSchemaKind::MaterializationIntegrityIssue,
+                )
+                .map(|_| ())
+        } else {
+            // Receipts/reports are run-local; generic envelope checks above
+            // already cover them. Unknown canonical files remain visible as
+            // generic documents but do not become trusted typed ledger data.
+            continue;
+        };
+        if let Err(error) = typed {
+            report.issue("evaluation_ledger_invalid", path, error.to_string());
+        }
+    }
+}
+
+fn inspect_outcome_head(head: &OutcomeHeadV1) -> std::result::Result<(), String> {
+    let current = head
+        .statuses
+        .iter()
+        .filter(|(_, status)| **status == OutcomeStatus::Current)
+        .map(|(outcome_id, _)| outcome_id)
+        .collect::<Vec<_>>();
+    if current.len() > 1 {
+        return Err("more than one outcome is marked current".to_owned());
+    }
+    if head.current_outcome_id.as_deref()
+        != current
+            .first()
+            .copied()
+            .map(|outcome_id| outcome_id.as_str())
+    {
+        return Err("current_outcome_id disagrees with status map".to_owned());
+    }
+    Ok(())
+}
+
+/// Experience views are derived data, but a malformed view must still be
+/// visible to operators rather than silently being consumed by retrieval.
+/// The event ledger remains the rebuild authority.
+fn inspect_experience_views(store: &FileStore, files: &[PathBuf], report: &mut StoreDoctorReport) {
+    let root = Path::new("knowledge/experiences/views");
+    for relative in files.iter().filter(|path| path.starts_with(root)) {
+        if let Err(error) =
+            store.read_versioned_json::<ExperienceViewV1>(relative, FileSchemaKind::ExperienceView)
+        {
+            report.issue("experience_view_invalid", relative, error.to_string());
+        }
+    }
+}
+
+fn inspect_memory_usage(store: &FileStore, files: &[PathBuf], report: &mut StoreDoctorReport) {
+    for relative in files
+        .iter()
+        .filter(|path| path.ends_with("memory/usage/report.json"))
+    {
+        if let Err(error) = store
+            .read_versioned_json::<MemoryUsageReportV1>(relative, FileSchemaKind::MemoryUsageReport)
+        {
+            report.issue("memory_usage_report_invalid", relative, error.to_string());
+        }
+    }
+}
+
+fn inspect_document_ref(
+    store: &FileStore,
+    owner: &Path,
+    reference: &orchestrator_core::DocumentRef,
+    report: &mut StoreDoctorReport,
+) {
+    let relative = Path::new(&reference.relative_path);
+    if validate_relative_path(relative).is_err() || !store.exists(relative).unwrap_or(false) {
+        report.issue(
+            "evaluation_unresolved_provenance",
+            owner,
+            format!(
+                "reference {} does not resolve inside FileStore",
+                reference.document_id
+            ),
+        );
+        return;
+    }
+    let actual = if relative
+        .extension()
+        .is_some_and(|extension| extension == "json")
+    {
+        store.read_json_value(relative).ok().and_then(|value| {
+            value
+                .get("content_hash")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+    } else {
+        store
+            .read_bytes(relative)
+            .ok()
+            .map(|bytes| content_hash_bytes(&bytes))
+    };
+    if actual.as_deref() != Some(reference.content_hash.as_str()) {
+        report.issue(
+            "evaluation_provenance_hash_mismatch",
+            owner,
+            format!(
+                "reference {} hash does not match its target",
+                reference.document_id
+            ),
+        );
     }
 }
 

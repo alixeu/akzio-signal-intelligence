@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use orchestrator_core::{
     config_bool, config_get, config_int, config_str, config_strings, project_path,
-    RoleProfileRegistry,
+    AdjustmentPolicy, CorporateActionCapability, PriceBasis, RoleProfileRegistry, RunPurpose,
 };
 use orchestrator_llm::{
     truncation::TruncationConfig,
@@ -33,6 +33,7 @@ pub(crate) struct RuntimeConfig {
     pub alpaca_api_key: Option<String>,
     pub alpaca_api_secret: Option<String>,
     pub reflection: ReflectionConfig,
+    pub evaluation: EvaluationConfig,
     pub retrieval: RetrievalConfig,
     pub store: StoreConfig,
     pub tool_managed: ToolManagedConfig,
@@ -104,6 +105,35 @@ pub(crate) struct AllocationConfig {
 #[derive(Debug, Clone)]
 pub(crate) struct ReflectionConfig {
     pub task_limit: usize,
+    /// Bound retries so a permanently malformed historical artifact cannot
+    /// consume every future Phase 0 budget.
+    pub max_attempts: u32,
+    pub policy_version: u32,
+    pub new_outcome_quota: usize,
+    pub retry_quota: usize,
+    pub backlog_quota: usize,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct EvaluationConfig {
+    pub enabled: bool,
+    pub canonical_memory_writes_enabled: bool,
+    pub policy_version: u32,
+    pub default_run_purpose: RunPurpose,
+    pub evaluation_contract_id: String,
+    pub prediction_horizon_trading_days: u32,
+    pub price_basis: PriceBasis,
+    pub market_data_provider: String,
+    pub market_data_adjustment_policy: AdjustmentPolicy,
+    pub corporate_action_capability: CorporateActionCapability,
+    pub benchmarks: BTreeMap<String, BenchmarkConfig>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BenchmarkConfig {
+    pub ticker: String,
+    pub provider: String,
+    pub price_basis: PriceBasis,
 }
 
 #[derive(Debug, Clone)]
@@ -464,7 +494,8 @@ impl RuntimeConfig {
             allocation: AllocationConfig::from_value(config),
             alpaca_api_key,
             alpaca_api_secret,
-            reflection: ReflectionConfig::from_value(config),
+            reflection: ReflectionConfig::from_value(config)?,
+            evaluation: EvaluationConfig::from_value(config)?,
             retrieval: RetrievalConfig::from_value(config),
             store: StoreConfig::from_value(config)?,
             tool_managed: ToolManagedConfig::from_value(config)?,
@@ -681,12 +712,194 @@ pub(crate) fn required_llm_roles() -> Vec<String> {
 }
 
 impl ReflectionConfig {
-    pub fn from_value(config: &Value) -> Self {
-        Self {
-            task_limit: config_int(config, "orchestrator.reflection.task_limit", 10).max(1)
-                as usize,
+    pub fn from_value(config: &Value) -> Result<Self> {
+        let task_limit =
+            config_int(config, "orchestrator.reflection.task_limit", 10).max(1) as usize;
+        let new_outcome_quota = config_int(config, "orchestrator.reflection.new_outcome_quota", 6)
+            .clamp(0, 100) as usize;
+        let retry_quota =
+            config_int(config, "orchestrator.reflection.retry_quota", 2).clamp(0, 100) as usize;
+        let backlog_quota =
+            config_int(config, "orchestrator.reflection.backlog_quota", 2).clamp(0, 100) as usize;
+        if new_outcome_quota + retry_quota + backlog_quota > task_limit {
+            bail!(
+                "orchestrator.reflection new_outcome_quota + retry_quota + backlog_quota must not exceed task_limit"
+            );
+        }
+        Ok(Self {
+            task_limit,
+            max_attempts: config_int(config, "orchestrator.reflection.max_attempts", 3)
+                .clamp(1, 100) as u32,
+            policy_version: config_int(config, "orchestrator.reflection.policy_version", 1)
+                .clamp(1, i64::from(u32::MAX)) as u32,
+            new_outcome_quota,
+            retry_quota,
+            backlog_quota,
+        })
+    }
+}
+
+impl EvaluationConfig {
+    fn from_value(config: &Value) -> Result<Self> {
+        const PATH: &str = "orchestrator.evaluation";
+        let object = strict_optional_object(config, PATH)?;
+        if let Some(object) = object {
+            validate_known_fields(
+                object,
+                PATH,
+                [
+                    "enabled",
+                    "canonical_memory_writes_enabled",
+                    "policy_version",
+                    "default_run_purpose",
+                    "evaluation_contract_id",
+                    "prediction_horizon_trading_days",
+                    "price_basis",
+                    "market_data_provider",
+                    "market_data_adjustment_policy",
+                    "corporate_action_capability",
+                    "benchmarks",
+                ],
+            )?;
+        }
+        let enabled = strict_bool_or_default(object, PATH, "enabled", false)?;
+        let canonical_memory_writes_enabled =
+            strict_bool_or_default(object, PATH, "canonical_memory_writes_enabled", false)?;
+        let policy_version =
+            u32::try_from(strict_u64_or_default(object, PATH, "policy_version", 1)?)
+                .context("orchestrator.evaluation.policy_version is too large")?;
+        if policy_version == 0 {
+            bail!("orchestrator.evaluation.policy_version must be at least 1");
+        }
+        let default_run_purpose = match strict_string_or_default(
+            object,
+            PATH,
+            "default_run_purpose",
+            "paper",
+        )?
+        .as_str()
+        {
+            "paper" => RunPurpose::Paper,
+            "live" => RunPurpose::Live,
+            value => bail!("{PATH}.default_run_purpose must be paper or live; got {value:?}"),
+        };
+        let evaluation_contract_id =
+            strict_string_or_default(object, PATH, "evaluation_contract_id", "primary-three-day")?;
+        if evaluation_contract_id.trim().is_empty() {
+            bail!("{PATH}.evaluation_contract_id must not be empty");
+        }
+        let prediction_horizon_trading_days =
+            strict_u64_or_default(object, PATH, "prediction_horizon_trading_days", 3)?;
+        let prediction_horizon_trading_days = u32::try_from(prediction_horizon_trading_days)
+            .context("orchestrator.evaluation.prediction_horizon_trading_days is too large")?;
+        if prediction_horizon_trading_days == 0 {
+            bail!("{PATH}.prediction_horizon_trading_days must be at least 1");
+        }
+        let price_basis =
+            match strict_string_or_default(object, PATH, "price_basis", "close")?.as_str() {
+                "close" => PriceBasis::Close,
+                "adjusted_close" => PriceBasis::AdjustedClose,
+                value => bail!("{PATH}.price_basis must be close or adjusted_close; got {value:?}"),
+            };
+        let market_data_provider =
+            strict_string_or_default(object, PATH, "market_data_provider", "technical_csv")?;
+        let market_data_adjustment_policy = match strict_string_or_default(
+            object,
+            PATH,
+            "market_data_adjustment_policy",
+            "unknown",
+        )?
+        .as_str()
+        {
+            "none" => AdjustmentPolicy::None,
+            "splits" => AdjustmentPolicy::Splits,
+            "dividends" => AdjustmentPolicy::Dividends,
+            "all" => AdjustmentPolicy::All,
+            "unknown" => AdjustmentPolicy::Unknown,
+            value => bail!("{PATH}.market_data_adjustment_policy is invalid: {value:?}"),
+        };
+        let corporate_action_capability =
+            match strict_string_or_default(object, PATH, "corporate_action_capability", "unknown")?
+                .as_str()
+            {
+                "provider_adjusted" => CorporateActionCapability::ProviderAdjusted,
+                "external_metadata" => CorporateActionCapability::ExternalMetadata,
+                "unsupported" => CorporateActionCapability::Unsupported,
+                "unknown" => CorporateActionCapability::Unknown,
+                value => bail!("{PATH}.corporate_action_capability is invalid: {value:?}"),
+            };
+        let benchmarks = parse_benchmark_configs(object)?;
+        Ok(Self {
+            enabled,
+            canonical_memory_writes_enabled,
+            policy_version,
+            default_run_purpose,
+            evaluation_contract_id,
+            prediction_horizon_trading_days,
+            price_basis,
+            market_data_provider,
+            market_data_adjustment_policy,
+            corporate_action_capability,
+            benchmarks,
+        })
+    }
+}
+
+fn parse_benchmark_configs(
+    object: Option<&Map<String, Value>>,
+) -> Result<BTreeMap<String, BenchmarkConfig>> {
+    let Some(value) = object.and_then(|object| object.get("benchmarks")) else {
+        return Ok(BTreeMap::new());
+    };
+    let mappings = value
+        .as_object()
+        .context("orchestrator.evaluation.benchmarks must be an object")?;
+    let mut parsed = BTreeMap::new();
+    for (scope_ticker, value) in mappings {
+        if scope_ticker.trim().is_empty() || scope_ticker != scope_ticker.trim() {
+            bail!("orchestrator.evaluation.benchmarks keys must be non-empty trimmed tickers");
+        }
+        let binding = value.as_object().with_context(|| {
+            format!("orchestrator.evaluation.benchmarks.{scope_ticker} must be an object")
+        })?;
+        validate_known_fields(
+            binding,
+            "orchestrator.evaluation.benchmarks.<ticker>",
+            ["ticker", "provider", "price_basis"],
+        )?;
+        let required = |field: &str| -> Result<String> {
+            binding
+                .get(field)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .with_context(|| {
+                    format!("orchestrator.evaluation.benchmarks.{scope_ticker}.{field} is required")
+                })
+        };
+        let ticker = required("ticker")?;
+        let provider = required("provider")?;
+        let price_basis = match required("price_basis")?.as_str() {
+            "close" => PriceBasis::Close,
+            "adjusted_close" => PriceBasis::AdjustedClose,
+            value => bail!("benchmark {scope_ticker}.price_basis is invalid: {value:?}"),
+        };
+        if parsed
+            .insert(
+                scope_ticker.to_ascii_uppercase(),
+                BenchmarkConfig {
+                    ticker,
+                    provider,
+                    price_basis,
+                },
+            )
+            .is_some()
+        {
+            bail!("orchestrator.evaluation.benchmarks contains duplicate ticker {scope_ticker:?}");
         }
     }
+    Ok(parsed)
 }
 
 impl WorkflowConfig {

@@ -9,15 +9,19 @@ mod doctor;
 mod domain;
 mod draft;
 mod error;
+mod evaluation;
+mod experience_ledger;
 mod index;
 mod input;
 mod json;
 mod jsonl;
 mod learning;
 mod manifest;
+mod memory_usage;
 mod paths;
 mod phase2;
 mod recovery;
+mod reflection_task;
 mod schema;
 mod session;
 mod store;
@@ -29,9 +33,10 @@ pub use atomic::{
     write_json_atomic, AtomicWriteOptions,
 };
 pub use doctor::{
-    inspect_store, rebuild_experience_stats, rebuild_index_catalog, rebuild_run_manifest,
-    DoctorIssue, ExperienceStat, ExperienceStats, IndexCatalog, IndexCatalogEntry,
-    StoreDoctorReport, EXPERIENCE_STATS_SCHEMA_VERSION, INDEX_CATALOG_SCHEMA_VERSION,
+    inspect_store, rebuild_experience_stats, rebuild_experience_views, rebuild_index_catalog,
+    rebuild_run_manifest, DoctorIssue, ExperienceStat, ExperienceStats, IndexCatalog,
+    IndexCatalogEntry, StoreDoctorReport, EXPERIENCE_STATS_SCHEMA_VERSION,
+    INDEX_CATALOG_SCHEMA_VERSION,
 };
 pub use domain::{
     append_analyst_data_gap, append_analyst_evidence, append_binding_risk_control,
@@ -61,6 +66,11 @@ pub use draft::{
     TradeIntentDraft, TradeIntentDraftEntry,
 };
 pub use error::{Result, StoreError};
+pub use evaluation::EvaluationStore;
+pub use experience_ledger::{
+    ExperienceEventV1, ExperienceLedger, ExperienceViewV1, EXPERIENCE_EVENT_SCHEMA_VERSION,
+    EXPERIENCE_VIEW_SCHEMA_VERSION,
+};
 pub use index::{
     append_index_detail, create_index, deterministic_experience_index_id, experience_level,
     finalize_index, read_index_details, read_indexes, record_experience_case,
@@ -89,12 +99,14 @@ pub use manifest::{
     FinalizedArtifactRef, ManifestError, PhaseStatus, RunLocation, RunManifest, RunManifestInit,
     RunStatus, RUN_MANIFEST_SCHEMA_VERSION,
 };
+pub use memory_usage::MemoryUsageLedger;
 pub use paths::{validate_relative_path, SafeSlug};
 pub use phase2::{
     ClaimStatus, ClaimStatusEntry, Phase2Artifact, Phase2ArtifactPayload, Phase2DraftService,
     SteerRoute, PHASE2_ARTIFACT_SCHEMA_VERSION,
 };
 pub use recovery::{rebuild_manifest_from_finalized_artifacts, recover_pending_finalization};
+pub use reflection_task::{ReflectionTaskEventV1, ReflectionTaskLedger, ReflectionTaskV1};
 pub use schema::{FileSchemaKind, Versioned};
 pub use session::{
     append_session_event, read_session_events, read_session_manifest, write_session_manifest,

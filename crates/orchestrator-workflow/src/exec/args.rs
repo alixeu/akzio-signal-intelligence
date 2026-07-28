@@ -1,10 +1,37 @@
 use clap::{Args, ValueEnum};
+use orchestrator_core::RunPurpose;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, ValueEnum)]
 pub enum Mode {
     Probability,
     Monitor,
+}
+
+/// Persistence authority is intentionally separate from the analytical mode.
+/// `--debug` and `--mock` take precedence so diagnostics cannot accidentally
+/// write canonical MemoryOS records.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum RunPurposeArg {
+    Paper,
+    Live,
+    Debug,
+    Mock,
+    Replay,
+    MigrationFixture,
+}
+
+impl From<RunPurposeArg> for RunPurpose {
+    fn from(value: RunPurposeArg) -> Self {
+        match value {
+            RunPurposeArg::Paper => Self::Paper,
+            RunPurposeArg::Live => Self::Live,
+            RunPurposeArg::Debug => Self::Debug,
+            RunPurposeArg::Mock => Self::Mock,
+            RunPurposeArg::Replay => Self::Replay,
+            RunPurposeArg::MigrationFixture => Self::MigrationFixture,
+        }
+    }
 }
 
 impl Mode {
@@ -52,4 +79,8 @@ pub struct ExecArgs {
     /// Write inspectable LLM and local reducer records below outputs/debug/.
     #[arg(long)]
     pub debug: bool,
+    /// Persistence authority for MemoryOS records. `--debug` resolves to
+    /// debug and `--mock` resolves to mock regardless of this option.
+    #[arg(long, value_enum)]
+    pub run_purpose: Option<RunPurposeArg>,
 }

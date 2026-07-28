@@ -1,5 +1,5 @@
 name = "experience"
-injection_points = ["analyst.technical", "analyst.news_macro", "manager.research"]
+injection_points = ["analyst.technical", "analyst.news_macro", "mediator.topic", "manager.research", "trader", "risk.aggressive", "risk.neutral", "risk.conservative", "portfolio.manager"]
 priority = 30
 placeholder_key = "experience_contract"
 enabled = true

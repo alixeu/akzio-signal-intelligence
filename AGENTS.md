@@ -106,6 +106,11 @@ Prefer `codegraph_context` first for architecture, feature, or bug-context quest
   unscored predictions, or the current prediction. Experience Index writes must
   remain idempotent, and reflection failures must not invalidate a completed
   investment decision.
+- MemoryOS evaluation is FileStore-only: canonical Decision/Outcome writes are
+  allowed only for explicitly enabled Paper/Live contexts. Debug uses its own
+  namespace, Mock writes no formal Decision/Outcome, and replay must use a
+  separate root/namespace. Do not select benchmarks or price basis in code:
+  missing strict configuration is an auditable materialization gap.
 - Avoid committing local config, FileStore data, build output, or report artifacts.
 
 ## Documentation Rules

@@ -84,6 +84,14 @@ async fn mock_exec_phase8_archives_to_file_store() {
     assert_eq!(result["run_state"]["phase_status"]["8"], "done");
     assert!(has_file_named(&store_root.join("runs"), "manifest.json"));
     assert!(has_file_named(&store_root.join("runs"), "allocation.json"));
+    assert!(
+        !has_directory_named(&store_root.join("runs"), "decision"),
+        "mock must not publish legacy Decision records"
+    );
+    assert!(
+        !store_root.join("knowledge/evaluation").exists(),
+        "mock must not publish canonical evaluation data"
+    );
 }
 
 fn test_args(config_root: &Path, store_root: std::path::PathBuf, to_phase: i64) -> ExecArgs {
@@ -104,6 +112,7 @@ fn test_args(config_root: &Path, store_root: std::path::PathBuf, to_phase: i64) 
         jin10_refresh_lookback_hours: 24.0,
         mock: true,
         debug: false,
+        run_purpose: None,
     }
 }
 

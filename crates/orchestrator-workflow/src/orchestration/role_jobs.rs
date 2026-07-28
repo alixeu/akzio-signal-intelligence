@@ -1,7 +1,10 @@
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use futures::{stream, StreamExt};
-use orchestrator_core::{default_project_root, ToolManagedProfile};
+use orchestrator_core::{
+    default_project_root, HistoricalReflectionArtifactV1, ReflectionDisposition,
+    ToolManagedProfile, HISTORICAL_REFLECTION_ARTIFACT_SCHEMA_VERSION,
+};
 use orchestrator_llm::{
     agent_loop::{
         FileStoreSessionRuntime, ModelStreamResult, RetrievalPolicy, SessionRuntimeSpec,
@@ -15,8 +18,9 @@ use orchestrator_llm::{
 use serde_json::{json, Map, Value};
 use std::time::{Duration, Instant};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 use tokio::time;
 use tracing::{debug, warn};
@@ -26,6 +30,7 @@ use super::domain_runtime::{file_store_domain_runtime, FileStoreDomainRuntimePla
 use super::index_runtime::{file_store_index_tool_runtime, FileStoreIndexRuntimePlan};
 use super::lifecycle::tickers_from_state;
 use super::render::{direct_context_manifest, render_prompt_with_plugins};
+use crate::memory::{search_experiences, ExperienceSearchQuery};
 
 pub(crate) struct RoleRun<'a> {
     pub state: Value,
@@ -57,6 +62,10 @@ pub(crate) struct RoleJob {
     pub tickers: Vec<String>,
     pub tool_managed_profile: ToolManagedProfile,
     pub index_tool_runtime: Option<orchestrator_llm::tools::index_tools::IndexToolRuntimeBinding>,
+    pub historical_reflection_terminal:
+        Option<orchestrator_llm::tools::historical_reflection::HistoricalReflectionTerminalBinding>,
+    pub experience_retrieval:
+        Option<orchestrator_llm::tools::experience_tools::ExperienceRetrievalBinding>,
     pub domain_tool_runtime:
         Option<orchestrator_llm::tools::domain_tools::DomainToolRuntimeBinding>,
     pub session_runtime: FileStoreSessionRuntime,
@@ -268,6 +277,8 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
     let (
         tool_managed_profile,
         index_tool_runtime,
+        historical_reflection_terminal,
+        experience_retrieval,
         domain_tool_runtime,
         file_store_input,
         tool_allowlist,
@@ -287,9 +298,17 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
                 registration.profile_version,
                 registration.builder_version,
             )?;
+            let terminal = file_store_historical_reflection_terminal(
+                Path::new(store_root),
+                &state,
+                registration.profile_version,
+                registration.builder_version,
+            )?;
             (
                 profile,
                 Some(binding),
+                Some(terminal),
+                None,
                 None,
                 None,
                 registration.tool_allowlist.clone(),
@@ -304,6 +323,8 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
             (
                 profile,
                 Some(binding),
+                None,
+                None,
                 None,
                 None,
                 registration.tool_allowlist.clone(),
@@ -335,6 +356,14 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
             } else {
                 None
             };
+            let experiences = file_store_experience_retrieval(
+                Path::new(store_root),
+                &state,
+                role,
+                phase,
+                &tickers,
+                config.retrieval.reflection_max_details,
+            )?;
             (
                 profile,
                 Some(file_store_domain_index_read_runtime(
@@ -344,6 +373,8 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
                     phase,
                     &tickers,
                 )?),
+                None,
+                Some(experiences),
                 Some(binding),
                 input,
                 registration.tool_allowlist.clone(),
@@ -388,6 +419,8 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
         tickers: tickers.clone(),
         tool_managed_profile,
         index_tool_runtime,
+        historical_reflection_terminal,
+        experience_retrieval,
         domain_tool_runtime,
         session_runtime,
         max_write_calls: Some(config.tool_managed.max_write_calls_per_role),
@@ -692,9 +725,485 @@ fn file_store_session_runtime(
     )
 }
 
-/// Construct the sole Phase 0 writer: a task-scoped Experience Index.  The
-/// source run is found by its manifest rather than a caller-provided path;
-/// absence is a hard error, never a fallback to another summary storage path.
+/// Construct the one Phase 0 terminal writer. Generic Index tools remain a
+/// read-only evidence interface; this service owns every terminal state
+/// transition and is the only caller that may add an Experience support case.
+fn file_store_historical_reflection_terminal(
+    store_root: &Path,
+    state: &Value,
+    _profile_version: u32,
+    _builder_version: u32,
+) -> Result<orchestrator_llm::tools::historical_reflection::HistoricalReflectionTerminalBinding> {
+    use orchestrator_store::{
+        find_run_location, read_indexes, FileStore, FileStoreOptions, IndexKind, IndexQuery,
+        ReflectionTaskLedger,
+    };
+
+    let task_value = state
+        .get("reflection_task")
+        .and_then(Value::as_object)
+        .context("HistoricalReflection terminal requires reflection_task")?;
+    let task_id = task_value
+        .get("task_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .context("reflection_task.task_id is required")?;
+    let actor_run_id = state
+        .get("run_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .context("HistoricalReflection terminal requires current run_id")?;
+    let store = FileStore::open(store_root, FileStoreOptions::default())?;
+    let ledger = ReflectionTaskLedger::new(store.clone());
+    let task = ledger.read(task_id)?;
+    let source_location =
+        find_run_location(&store, &task.key.source_run_id)?.with_context(|| {
+            format!(
+                "HistoricalReflection source run {} is not available",
+                task.key.source_run_id
+            )
+        })?;
+    let source_indexes = read_indexes(
+        &store,
+        Some(&source_location),
+        &IndexQuery {
+            kind: Some(IndexKind::PhaseSummary),
+            ticker: Some(task.key.ticker.clone()),
+            limit: 100,
+            ..Default::default()
+        },
+    )?
+    .indexes;
+    let sources = source_indexes
+        .into_iter()
+        .map(|index| {
+            let relative_path = source_location
+                .relative_root()
+                .join("index")
+                .join(orchestrator_store::SafeSlug::new("index", &index.index_id)?.as_str())
+                .join("index.json");
+            Ok((
+                index.index_id.clone(),
+                (
+                    index.source_phase,
+                    index.role.clone(),
+                    orchestrator_core::DocumentRef {
+                        document_id: index.index_id,
+                        relative_path: relative_path.to_string_lossy().to_string(),
+                        content_hash: index.content_hash,
+                    },
+                ),
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    Ok(
+        orchestrator_llm::tools::historical_reflection::HistoricalReflectionTerminalBinding::new(
+            Arc::new(FileStoreHistoricalReflectionTerminal {
+                store,
+                ledger,
+                task,
+                actor_run_id: actor_run_id.to_owned(),
+                source_facts: sources,
+            }),
+        ),
+    )
+}
+
+struct FileStoreHistoricalReflectionTerminal {
+    store: orchestrator_store::FileStore,
+    ledger: orchestrator_store::ReflectionTaskLedger,
+    task: orchestrator_store::ReflectionTaskV1,
+    actor_run_id: String,
+    source_facts: BTreeMap<String, (u8, String, orchestrator_core::DocumentRef)>,
+}
+
+impl orchestrator_llm::tools::historical_reflection::HistoricalReflectionTerminalService
+    for FileStoreHistoricalReflectionTerminal
+{
+    fn finalize(
+        &self,
+        submission: orchestrator_llm::tools::historical_reflection::HistoricalReflectionSubmission,
+    ) -> Result<Value> {
+        if self.task.status != orchestrator_core::ReflectionTaskStatus::Claimed
+            || self.task.claimed_by_run_id.as_deref() != Some(self.actor_run_id.as_str())
+        {
+            bail!("reflection task is no longer claimed by this run");
+        }
+        let source_refs = submission
+            .source_refs
+            .iter()
+            .map(|reference| reference.trim().to_owned())
+            .collect::<BTreeSet<_>>();
+        if source_refs.len() != submission.source_refs.len()
+            || source_refs
+                .iter()
+                .any(|reference| !self.source_facts.contains_key(reference))
+        {
+            bail!("reflection source_refs must be unique, Rust-visible Phase Summary Index IDs");
+        }
+        if let Some(root_cause_phase) = submission.root_cause_phase {
+            let root_refs = source_refs
+                .iter()
+                .filter_map(|reference| self.source_facts.get(reference))
+                .filter(|(phase, _, _)| *phase == root_cause_phase)
+                .collect::<Vec<_>>();
+            if root_refs.is_empty() {
+                bail!("root_cause_phase requires a cited Phase Summary from that phase");
+            }
+            if let Some(pattern) = &submission.pattern_identity {
+                if !root_refs
+                    .iter()
+                    .any(|(_, role, _)| role == &pattern.source_role)
+                {
+                    bail!("PatternIdentity.source_role must be evidenced at root_cause_phase");
+                }
+            }
+        }
+        let now = Utc::now().to_rfc3339();
+        let source_documents = source_refs
+            .iter()
+            .map(|reference| self.source_facts[reference].2.clone())
+            .collect::<Vec<_>>();
+        let artifact_id = orchestrator_store::content_hash(&json!({
+            "task_id": self.task.task_id,
+            "submission": &submission,
+        }))?;
+        let artifact = HistoricalReflectionArtifactV1 {
+            schema_version: HISTORICAL_REFLECTION_ARTIFACT_SCHEMA_VERSION,
+            artifact_id,
+            task_id: self.task.task_id.clone(),
+            task_key: self.task.key.clone(),
+            disposition: submission.disposition,
+            outcome_ref: self.task.outcome_ref.clone(),
+            source_refs: source_documents.clone(),
+            summary: submission.summary.trim().to_owned(),
+            detail: submission.detail.trim().to_owned(),
+            root_cause_phase: submission.root_cause_phase,
+            propagation_phases: submission.propagation_phases.clone(),
+            pattern_identity: submission.pattern_identity.clone(),
+            rule_revision: submission.rule_revision(),
+            created_at: now.clone(),
+            content_hash: String::new(),
+        };
+        let artifact_ref = self.ledger.write_artifact(artifact)?;
+        if submission.disposition == ReflectionDisposition::Learned {
+            let pattern = submission
+                .pattern_identity
+                .as_ref()
+                .expect("validated Learned pattern");
+            let pattern_key = orchestrator_store::content_hash(&serde_json::to_value(pattern)?)?;
+            let scope = orchestrator_store::IndexScope {
+                kind: orchestrator_store::IndexKind::Experience,
+                location: None,
+                index_id: orchestrator_store::deterministic_experience_index_id(
+                    &pattern_key,
+                    Some(&self.task.key.ticker),
+                    pattern.root_cause_phase,
+                )?,
+                run_id: self.actor_run_id.clone(),
+                source_run_id: Some(self.task.key.source_run_id.clone()),
+                source_phase: pattern.root_cause_phase,
+                role: "reflector.historical".to_owned(),
+                ticker: Some(self.task.key.ticker.clone()),
+                topic_id: None,
+                source_payload_hash: self.task.key.outcome_content_hash.clone(),
+                authoritative_fields: serde_json::Map::new(),
+                created_at: now.clone(),
+            };
+            let input = orchestrator_store::RecordExperienceCaseInput {
+                scope,
+                pattern_key: pattern_key.clone(),
+                summary: submission.summary.trim().to_owned(),
+                confidence: submission.confidence.expect("validated Learned confidence"),
+                applies_to_phases: vec![pattern.root_cause_phase],
+                detail: submission.detail.trim().to_owned(),
+                source_refs: source_refs.into_iter().collect(),
+            };
+            let experience_ledger = orchestrator_store::ExperienceLedger::new(self.store.clone());
+            let event = orchestrator_store::ExperienceEventV1 {
+                schema_version: orchestrator_store::EXPERIENCE_EVENT_SCHEMA_VERSION,
+                sequence: 0,
+                event_id: String::new(),
+                pattern_id: pattern_key.clone(),
+                pattern_identity: Some(pattern.clone()),
+                rule_revision: submission.rule_revision(),
+                operation: orchestrator_core::ExperienceOperation::AddSupport,
+                source_run_id: Some(self.task.key.source_run_id.clone()),
+                outcome_id: Some(self.task.key.outcome_id.clone()),
+                source_refs: source_documents,
+                policy_ref: Some(self.task.key.policy_ref.clone()),
+                independent_date_cluster: None,
+                independent_regime: Some(orchestrator_store::content_hash(&serde_json::to_value(
+                    &pattern.regime,
+                )?)?),
+                utility_sample_micros: None,
+                harmful_usage: None,
+                created_at: now.clone(),
+                content_hash: String::new(),
+            };
+            self.ledger.complete_learned_with(
+                &self.task.task_id,
+                &self.actor_run_id,
+                artifact_ref.clone(),
+                &now,
+                || {
+                    let outcome = orchestrator_store::record_experience_case(&self.store, input)?;
+                    experience_ledger.append(event)?;
+                    experience_ledger.rebuild_view(&pattern_key, &now)?;
+                    Ok(outcome.disposition)
+                },
+            )?;
+        } else {
+            // A contested reflection can only demote an already-existing
+            // Pattern. The model provides structured identity, but Rust
+            // derives the key, verifies a prior support event, and writes the
+            // provenance-bound contradiction itself. It never invokes the
+            // positive legacy case finalizer on this path.
+            if submission.disposition == ReflectionDisposition::Contested {
+                if let Some(pattern) = submission.pattern_identity.as_ref() {
+                    let pattern_key =
+                        orchestrator_store::content_hash(&serde_json::to_value(pattern)?)?;
+                    let experience_ledger =
+                        orchestrator_store::ExperienceLedger::new(self.store.clone());
+                    let supported =
+                        experience_ledger
+                            .read_events(&pattern_key)?
+                            .iter()
+                            .any(|event| {
+                                event.operation
+                                    == orchestrator_core::ExperienceOperation::AddSupport
+                            });
+                    if supported {
+                        experience_ledger.append(orchestrator_store::ExperienceEventV1 {
+                            schema_version: orchestrator_store::EXPERIENCE_EVENT_SCHEMA_VERSION,
+                            sequence: 0,
+                            event_id: String::new(),
+                            pattern_id: pattern_key.clone(),
+                            pattern_identity: Some(pattern.clone()),
+                            rule_revision: None,
+                            operation: orchestrator_core::ExperienceOperation::AddContradiction,
+                            source_run_id: Some(self.task.key.source_run_id.clone()),
+                            outcome_id: Some(self.task.key.outcome_id.clone()),
+                            source_refs: source_documents.clone(),
+                            policy_ref: Some(self.task.key.policy_ref.clone()),
+                            independent_date_cluster: None,
+                            independent_regime: Some(orchestrator_store::content_hash(
+                                &serde_json::to_value(&pattern.regime)?,
+                            )?),
+                            utility_sample_micros: None,
+                            harmful_usage: None,
+                            created_at: now.clone(),
+                            content_hash: String::new(),
+                        })?;
+                        experience_ledger.rebuild_view(&pattern_key, &now)?;
+                    }
+                }
+            }
+            self.ledger.complete(
+                &self.task.task_id,
+                &self.actor_run_id,
+                submission.disposition,
+                artifact_ref.clone(),
+                None,
+                &now,
+            )?;
+        }
+        Ok(json!({"artifact_ref": artifact_ref, "disposition": submission.disposition}))
+    }
+}
+
+fn file_store_experience_retrieval(
+    store_root: &Path,
+    state: &Value,
+    role: &str,
+    phase: i64,
+    tickers: &[String],
+    max_results: usize,
+) -> Result<orchestrator_llm::tools::experience_tools::ExperienceRetrievalBinding> {
+    let store = orchestrator_store::FileStore::open(
+        store_root,
+        orchestrator_store::FileStoreOptions::default(),
+    )?;
+    let location = orchestrator_store::RunLocation::new(
+        state
+            .get("current_date")
+            .and_then(Value::as_str)
+            .context("Experience retrieval requires current_date")?,
+        state
+            .get("run_id")
+            .and_then(Value::as_str)
+            .context("Experience retrieval requires run_id")?,
+    )?;
+    let phase = u8::try_from(phase).context("Experience retrieval phase must fit u8")?;
+    let query = ExperienceSearchQuery {
+        phase,
+        role: role.to_owned(),
+        ticker: tickers.first().cloned(),
+        horizon_trading_days: None,
+        regime: orchestrator_core::MarketRegime::default(),
+        lexical_query: String::new(),
+        max_results: max_results.clamp(1, 20),
+    };
+    Ok(
+        orchestrator_llm::tools::experience_tools::ExperienceRetrievalBinding::new(Arc::new(
+            FileStoreExperienceRetrieval {
+                ledger: orchestrator_store::ExperienceLedger::new(store.clone()),
+                memory_usage: orchestrator_store::MemoryUsageLedger::new(store, location),
+                query,
+            },
+        )),
+    )
+}
+
+struct FileStoreExperienceRetrieval {
+    ledger: orchestrator_store::ExperienceLedger,
+    memory_usage: orchestrator_store::MemoryUsageLedger,
+    query: ExperienceSearchQuery,
+}
+
+struct MemoryUsageInput {
+    kind: orchestrator_core::MemoryUsageEventKind,
+    lexical_query: Option<String>,
+    retrieved_pattern_ids: Vec<String>,
+    expanded_pattern_id: Option<String>,
+    retrieval_stop_reason: Option<String>,
+    application_disposition: Option<orchestrator_core::MemoryApplicationDisposition>,
+    application_reason: Option<String>,
+}
+
+impl orchestrator_llm::tools::experience_tools::ExperienceRetrievalService
+    for FileStoreExperienceRetrieval
+{
+    fn search(&self, lexical_query: &str) -> Result<Value> {
+        let mut query = self.query.clone();
+        query.lexical_query = lexical_query.to_owned();
+        let result = search_experiences(&self.ledger, &query)?;
+        let stop_reason = retrieval_stop_reason_name(result.stop_reason);
+        let items = result
+            .items
+            .into_iter()
+            .map(|item| {
+                json!({
+                    "pattern_id": item.pattern_id,
+                    "score": item.score,
+                    "state": item.view.state,
+                    "support_count": item.view.support_count,
+                    "contradiction_count": item.view.contradiction_count,
+                    "utility_ema_micros": item.view.utility_ema_micros,
+                    "harmful_usage_rate_ppm": item.view.harmful_usage_rate_ppm,
+                })
+            })
+            .collect::<Vec<_>>();
+        self.record_usage(MemoryUsageInput {
+            kind: orchestrator_core::MemoryUsageEventKind::Search,
+            lexical_query: Some(lexical_query.to_owned()),
+            retrieved_pattern_ids: items
+                .iter()
+                .filter_map(|item| {
+                    item.get("pattern_id")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned)
+                })
+                .collect(),
+            expanded_pattern_id: None,
+            retrieval_stop_reason: Some(stop_reason.to_owned()),
+            application_disposition: None,
+            application_reason: None,
+        })?;
+        Ok(json!({"items": items, "stop_reason": stop_reason}))
+    }
+
+    fn read_cases(&self, pattern_id: &str) -> Result<Value> {
+        let events = self.ledger.read_events(pattern_id)?;
+        self.record_usage(MemoryUsageInput {
+            kind: orchestrator_core::MemoryUsageEventKind::Expand,
+            lexical_query: None,
+            retrieved_pattern_ids: Vec::new(),
+            expanded_pattern_id: Some(pattern_id.to_owned()),
+            retrieval_stop_reason: None,
+            application_disposition: None,
+            application_reason: None,
+        })?;
+        Ok(json!({
+            "pattern_id": pattern_id,
+            "untrusted_historical_data": events.into_iter().map(|event| json!({
+                "operation": event.operation,
+                "source_run_id": event.source_run_id,
+                "outcome_id": event.outcome_id,
+                "rule_revision": event.rule_revision,
+                "source_refs": event.source_refs,
+                "created_at": event.created_at,
+            })).collect::<Vec<_>>(),
+        }))
+    }
+
+    fn record_application(
+        &self,
+        pattern_id: &str,
+        disposition: orchestrator_core::MemoryApplicationDisposition,
+        reason: &str,
+    ) -> Result<Value> {
+        self.record_usage(MemoryUsageInput {
+            kind: orchestrator_core::MemoryUsageEventKind::Application,
+            lexical_query: None,
+            retrieved_pattern_ids: Vec::new(),
+            expanded_pattern_id: Some(pattern_id.to_owned()),
+            retrieval_stop_reason: None,
+            application_disposition: Some(disposition),
+            application_reason: Some(reason.to_owned()),
+        })?;
+        Ok(json!({
+            "pattern_id": pattern_id,
+            "disposition": disposition,
+            "recorded_by": "rust_observed_tool_event",
+        }))
+    }
+}
+
+impl FileStoreExperienceRetrieval {
+    fn record_usage(&self, input: MemoryUsageInput) -> Result<()> {
+        self.memory_usage
+            .append(orchestrator_core::MemoryUsageEventV1 {
+                schema_version: orchestrator_core::MEMORY_USAGE_EVENT_SCHEMA_VERSION,
+                sequence: 0,
+                event_id: String::new(),
+                kind: input.kind,
+                role: self.query.role.clone(),
+                phase: self.query.phase,
+                ticker: self.query.ticker.clone(),
+                unit_key: format!(
+                    "memory:p{}:{}:{}",
+                    self.query.phase,
+                    self.query.role,
+                    self.query.ticker.as_deref().unwrap_or("aggregate")
+                ),
+                lexical_query: input.lexical_query,
+                retrieved_pattern_ids: input.retrieved_pattern_ids,
+                expanded_pattern_id: input.expanded_pattern_id,
+                retrieval_stop_reason: input.retrieval_stop_reason,
+                application_disposition: input.application_disposition,
+                application_reason: input.application_reason,
+                created_at: Utc::now().to_rfc3339(),
+                content_hash: String::new(),
+            })?;
+        Ok(())
+    }
+}
+
+fn retrieval_stop_reason_name(reason: crate::memory::RetrievalStopReason) -> &'static str {
+    match reason {
+        crate::memory::RetrievalStopReason::Sufficient => "sufficient",
+        crate::memory::RetrievalStopReason::NoMarginalGain => "no_marginal_gain",
+        crate::memory::RetrievalStopReason::NoMatch => "no_match",
+        crate::memory::RetrievalStopReason::ConflictUnresolved => "conflict_unresolved",
+        crate::memory::RetrievalStopReason::BudgetExhausted => "budget_exhausted",
+    }
+}
+
+/// Construct the Phase 0 evidence reader. The source run is found by its
+/// manifest rather than a caller-provided path; absence is a hard error,
+/// never a fallback to another summary storage path. The dedicated terminal
+/// below is the sole writer.
 fn file_store_historical_reflection_index_runtime(
     store_root: &Path,
     state: &Value,
@@ -713,7 +1222,8 @@ fn file_store_historical_reflection_index_runtime(
         .context("HistoricalReflection FileStore runtime requires reflection_task")?;
     let task_id = task
         .get("task_id")
-        .and_then(Value::as_i64)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
         .context("reflection_task.task_id is required")?;
     let source_run_id = task
         .get("source_run_id")
@@ -747,13 +1257,9 @@ fn file_store_historical_reflection_index_runtime(
         },
     )?
     .indexes;
-    let source_phase = source_indexes
-        .iter()
-        .map(|index| index.source_phase)
-        .min()
-        .context(
-            "HistoricalReflection source run has no ticker-scoped completed Phase Summary Index",
-        )?;
+    if source_indexes.is_empty() {
+        bail!("HistoricalReflection source run has no ticker-scoped completed Phase Summary Index");
+    }
     let source_index_ids = source_indexes
         .iter()
         .map(|index| index.index_id.clone())
@@ -771,7 +1277,10 @@ fn file_store_historical_reflection_index_runtime(
     let owned = IndexOwnedScope {
         run_id,
         source_run_id: Some(source_run_id),
-        source_phase,
+        // This binding is now read-only. Root cause phase is selected only at
+        // the dedicated terminal and must be proven by cited Phase Summaries;
+        // the earliest available phase is not a root-cause proxy.
+        source_phase: 0,
         role: "reflector.historical".to_owned(),
         kind: IndexKind::Experience,
         ticker: Some(ticker.clone()),
@@ -801,7 +1310,7 @@ fn file_store_historical_reflection_index_runtime(
             evidence_ids: BTreeSet::new(),
             max_page_size: 20,
         },
-        FileStoreIndexRuntimePlan::for_experience(vec![source_location], Utc::now().to_rfc3339()),
+        FileStoreIndexRuntimePlan::read_only(vec![source_location], Utc::now().to_rfc3339()),
     )
 }
 
@@ -1417,6 +1926,8 @@ async fn execute_role_job(job: RoleJob) -> Result<AgentLoopOutput> {
         tickers: job.tickers,
         tool_managed_profile: job.tool_managed_profile,
         index_tool_runtime: job.index_tool_runtime.clone(),
+        historical_reflection_terminal: job.historical_reflection_terminal.clone(),
+        experience_retrieval: job.experience_retrieval.clone(),
         domain_tool_runtime: job.domain_tool_runtime.clone(),
         session_runtime: job.session_runtime.clone(),
         max_write_calls: job.max_write_calls,

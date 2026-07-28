@@ -1,5 +1,7 @@
 pub mod alpaca;
 pub mod domain_tools;
+pub mod experience_tools;
+pub mod historical_reflection;
 pub mod index_tools;
 pub mod read_jin10_candidates;
 pub mod read_reflection_source;
@@ -340,6 +342,31 @@ const REGISTRY: &[ToolEntry] = &[
     ToolEntry {
         name: read_reflection_source::NAME,
         definition: read_reflection_source::definition,
+    },
+    ToolEntry {
+        name: historical_reflection::FINALIZE_HISTORICAL_REFLECTION_NAME,
+        definition: historical_reflection::definition,
+    },
+    ToolEntry {
+        name: experience_tools::SEARCH_EXPERIENCES_NAME,
+        definition: || {
+            experience_tools::definition(experience_tools::SEARCH_EXPERIENCES_NAME)
+                .expect("registered Experience tool")
+        },
+    },
+    ToolEntry {
+        name: experience_tools::READ_EXPERIENCE_CASES_NAME,
+        definition: || {
+            experience_tools::definition(experience_tools::READ_EXPERIENCE_CASES_NAME)
+                .expect("registered Experience tool")
+        },
+    },
+    ToolEntry {
+        name: experience_tools::RECORD_MEMORY_APPLICATION_NAME,
+        definition: || {
+            experience_tools::definition(experience_tools::RECORD_MEMORY_APPLICATION_NAME)
+                .expect("registered Experience tool")
+        },
     },
     // FileStore Index tools are discoverable by a migrated ToolManaged
     // profile, but are deliberately absent from `tool_names()` until the

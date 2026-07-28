@@ -1,17 +1,20 @@
 use anyhow::{bail, Context, Result};
 use chrono::{Local, NaiveDate, Utc};
 use orchestrator_core::{
-    config_int, config_str, config_strings, display_ticker, load_config, parse_tickers,
-    project_path, ToolManagedProfile,
+    config_get, config_int, config_str, config_strings, display_ticker, load_config, parse_tickers,
+    project_path, BenchmarkBindingV1, BenchmarkSelectionV1, DecisionSection,
+    DecisionSectionUnavailableReason, DecisionSnapshotV2, EvaluationSpec, MemoryPolicyV1,
+    MemoryUsageReferenceStatus, PersistenceContextV1, PersistenceNamespace, PolicyRef,
+    ReflectionTaskStatus, RunPurpose, ToolManagedProfile, DECISION_SNAPSHOT_SCHEMA_VERSION,
 };
 use orchestrator_llm::agent_loop::{
     FileStoreSessionRuntime, SessionRuntimeSpec, ToolResultItem, Turn,
 };
 use orchestrator_store::{
-    content_hash, list_run_locations, read_indexes, read_learning_record, read_run_manifest,
-    rebuild_run_manifest, write_learning_record, write_run_manifest, FileStore, FileStoreOptions,
-    FinalizedArtifactRef, IndexKind, IndexQuery, LearningKind, LearningRecord, ManifestError,
-    RunLocation, RunManifest, RunManifestInit, RunStatus,
+    content_hash, read_indexes, read_run_manifest, rebuild_run_manifest, write_learning_record,
+    write_run_manifest, EvaluationStore, FileStore, FileStoreOptions, FinalizedArtifactRef,
+    IndexKind, IndexQuery, LearningKind, LearningRecord, ManifestError, RunLocation, RunManifest,
+    RunManifestInit, RunStatus,
 };
 use serde_json::{json, Value};
 use std::{
@@ -20,6 +23,7 @@ use std::{
     time::Duration,
 };
 
+use crate::evaluation::{materialize_pending, MarketInputConfigV1, MaterializerPolicyV1};
 use crate::orchestration::{
     allocation::{compute_allocation_context, derive_guarded_allocation},
     config::RuntimeConfig,
@@ -66,7 +70,24 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
     }
     let runtime = RuntimeConfig::from_value(&config)?;
     let store_root = runtime.store.resolve_root(args.store_root.as_deref())?;
-    let run_id = run_id_for(&tickers, &current_date);
+    let canonical_run_id = run_id_for(&tickers, &current_date);
+    // Paper/Live retain their stable identity so a configuration drift cannot
+    // accidentally resume or overwrite an investment run. Mock and Debug are
+    // diagnostic namespaces: include the config fingerprint in their run ID
+    // so an old local fixture never blocks an isolated verification run.
+    let run_id = if args.mock || args.debug {
+        let mode = if args.mock { "mock" } else { "debug" };
+        let config_hash = content_hash(&config)?;
+        let fingerprint = config_hash
+            .strip_prefix("sha256:")
+            .unwrap_or(&config_hash)
+            .chars()
+            .take(16)
+            .collect::<String>();
+        format!("{canonical_run_id}-{mode}-{fingerprint}")
+    } else {
+        canonical_run_id
+    };
     let location = RunLocation::new(current_date.clone(), run_id.clone())?;
     let store = FileStore::open(
         &store_root,
@@ -96,6 +117,32 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         "degraded": false,
     });
     let mut state = load_or_initialize_state(&store, &location, initial_state)?;
+
+    // Historical evaluation is strictly non-blocking for the current market
+    // workflow. Ordinary gaps become ledger records; an integrity failure is
+    // retained in run state and the investment phases still proceed.
+    if runtime.evaluation.enabled && !args.mock && !args.debug {
+        let context = evaluation_persistence_context(&runtime, &config, &args, &location)?;
+        if matches!(context.namespace, PersistenceNamespace::Canonical)
+            && context.canonical_memory_writes_enabled
+        {
+            let evaluation = EvaluationStore::open(store.clone(), context.clone())?;
+            let policy = MaterializerPolicyV1 {
+                materialization_policy_ref: context.config_ref,
+            };
+            let market = MarketInputConfigV1 {
+                interval: "daily".to_owned(),
+                provider: runtime.evaluation.market_data_provider.clone(),
+                price_basis: runtime.evaluation.price_basis,
+                adjustment_policy: runtime.evaluation.market_data_adjustment_policy,
+                corporate_action_capability: runtime.evaluation.corporate_action_capability.clone(),
+            };
+            match materialize_pending(&store, &evaluation, &location, &policy, &market) {
+                Ok(report) => state["evaluation_materialization"] = serde_json::to_value(report)?,
+                Err(error) => record_nonblocking_evaluation_failure(&mut state, &error),
+            }
+        }
+    }
 
     if args.from_phase <= 0 && args.to_phase >= 0 && !phase_completed(&manifest, 0) {
         run_phase0(
@@ -286,7 +333,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         finish_phase(&store, &location, &mut manifest, &mut state, 7, "done")?;
     }
     if args.from_phase <= 8 && args.to_phase >= 8 && !phase_completed(&manifest, 8) {
-        run_phase8(&store, &location, &mut state)?;
+        run_phase8(&store, &location, &mut state, &runtime, &config, &args)?;
         finish_phase(&store, &location, &mut manifest, &mut state, 8, "done")?;
     }
 
@@ -337,6 +384,24 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         "portfolio_allocation": state.get("portfolio_allocation").cloned().unwrap_or(Value::Null),
         "run_state": state,
     }))
+}
+
+fn record_nonblocking_evaluation_failure(state: &mut Value, error: &anyhow::Error) {
+    if !state["errors"].is_array() {
+        state["errors"] = json!([]);
+    }
+    state["errors"]
+        .as_array_mut()
+        .expect("errors set to array")
+        .push(json!({
+            "phase": "evaluation",
+            "kind": "non_blocking_materialization_failure",
+            "failure": error.to_string(),
+        }));
+    state["evaluation_materialization"] = json!({
+        "status": "failed_non_blocking",
+        "failure": error.to_string(),
+    });
 }
 
 fn validate_args(args: &ExecArgs) -> Result<()> {
@@ -690,9 +755,10 @@ async fn run_phase0(
     model: Option<&str>,
     reasoning: Option<&str>,
 ) -> Result<()> {
-    let tasks = reflection_tasks(store, location, state, runtime.reflection.task_limit)?;
+    let tasks = reflection_tasks(store, location, state, &runtime.reflection)?;
     let planned_tasks = tasks.clone();
     let mut completed = Vec::new();
+    let task_ledger = orchestrator_store::ReflectionTaskLedger::new(store.clone());
     for task in tasks {
         if state["mock"].as_bool().unwrap_or(false) {
             completed.push(json!({
@@ -704,6 +770,11 @@ async fn run_phase0(
         }
         state["reflection_task"] = task.clone();
         state["phase0"]["tasks"] = json!([task]);
+        let task_id = task
+            .get("task_id")
+            .and_then(Value::as_str)
+            .context("reflection scheduler returned a task without task_id")?
+            .to_owned();
         let artifact = run_unit(
             state,
             runtime,
@@ -711,36 +782,55 @@ async fn run_phase0(
             0,
             "historical_reflection",
             None,
-            None,
+            Some(&task_id),
             task.get("ticker").and_then(Value::as_str),
             model,
             reasoning,
         )
-        .await?;
-        let ticker = task["ticker"]
-            .as_str()
-            .expect("planned reflection ticker")
-            .to_owned();
-        let source_run_id = task["source_run_id"]
-            .as_str()
-            .expect("planned reflection source run")
-            .to_owned();
-        write_learning_record(
-            store,
-            location,
-            LearningKind::Reflection,
-            LearningRecord {
-                schema_version: orchestrator_store::LEARNING_RECORD_SCHEMA_VERSION,
-                kind: LearningKind::Reflection,
-                run_id: location.run_id.clone(),
-                ticker,
-                source_run_id: Some(source_run_id),
-                payload: json!({"experience_index": artifact}),
-                created_at: Utc::now().to_rfc3339(),
-                content_hash: String::new(),
-            },
-        )?;
-        completed.push(artifact);
+        .await;
+        // The dedicated terminal has already atomically written the immutable
+        // HistoricalReflectionArtifact and task receipt. Do not mirror it to
+        // the legacy LearningRecord path: that would create two authorities.
+        match artifact {
+            Ok(artifact) => completed.push(artifact),
+            Err(error) => {
+                let detail = error.to_string();
+                match task_ledger.mark_failed(
+                    &task_id,
+                    &location.run_id,
+                    detail.clone(),
+                    runtime.reflection.max_attempts,
+                    &Utc::now().to_rfc3339(),
+                ) {
+                    Ok(task) => completed.push(json!({
+                        "task_id": task.task_id,
+                        "status": task.status,
+                        "error": detail,
+                    })),
+                    Err(ledger_error) => {
+                        // The investment workflow remains non-blocking even
+                        // if persistence of diagnostic state itself fails;
+                        // retain both failures in its run state for Doctor.
+                        state["degraded"] = Value::Bool(true);
+                        if let Some(errors) = state["errors"].as_array_mut() {
+                            errors.push(json!({
+                                "phase": 0,
+                                "role": "reflector.historical",
+                                "task_id": task_id,
+                                "error": detail,
+                                "ledger_error": ledger_error.to_string(),
+                            }));
+                        }
+                        completed.push(json!({
+                            "task_id": task_id,
+                            "status": "failure_unrecorded",
+                            "error": detail,
+                            "ledger_error": ledger_error.to_string(),
+                        }));
+                    }
+                }
+            }
+        }
     }
     state["phase0"] = json!({
         "status": "completed",
@@ -757,64 +847,187 @@ fn reflection_tasks(
     store: &FileStore,
     current: &RunLocation,
     state: &Value,
-    limit: usize,
+    config: &crate::orchestration::config::ReflectionConfig,
 ) -> Result<Vec<Value>> {
-    let mut tasks = Vec::new();
-    for location in list_run_locations(store)? {
-        if location == *current {
+    canonical_reflection_tasks(store, current, state, config)
+}
+
+fn canonical_reflection_tasks(
+    store: &FileStore,
+    current: &RunLocation,
+    state: &Value,
+    config: &crate::orchestration::config::ReflectionConfig,
+) -> Result<Vec<Value>> {
+    let full_config = state.get("config").cloned().unwrap_or_else(|| json!({}));
+    let evaluation_config = config_get(&full_config, "orchestrator.evaluation")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let evaluation_policy = PolicyRef {
+        policy_id: "orchestrator.evaluation".to_owned(),
+        version: evaluation_config
+            .get("policy_version")
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .unwrap_or(1),
+        content_hash: content_hash(&evaluation_config)?,
+    };
+    let reflection_config = config_get(&full_config, "orchestrator.reflection")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let memory_policy = MemoryPolicyV1 {
+        policy_ref: PolicyRef {
+            policy_id: "memory.policy".to_owned(),
+            version: config.policy_version,
+            content_hash: content_hash(&reflection_config)?,
+        },
+        reflection_total_quota: config.task_limit as u32,
+        reflection_new_outcome_quota: config.new_outcome_quota as u32,
+        reflection_retry_quota: config.retry_quota as u32,
+        reflection_backlog_quota: config.backlog_quota as u32,
+        reflection_max_attempts: config.max_attempts,
+    };
+    if !memory_policy.is_valid() {
+        bail!("configured MemoryPolicyV1 is invalid");
+    }
+    let context = PersistenceContextV1 {
+        run_purpose: RunPurpose::Paper,
+        namespace: PersistenceNamespace::Canonical,
+        canonical_memory_writes_enabled: false,
+        invocation_id: current.run_id.clone(),
+        config_ref: evaluation_policy.clone(),
+        source_store_fingerprint: evaluation_policy.content_hash.clone(),
+    };
+    let evaluation = EvaluationStore::open(store.clone(), context)?;
+    let ledger = orchestrator_store::ReflectionTaskLedger::new(store.clone());
+    let current_outcomes = evaluation.list_current_outcomes()?;
+    let current_outcome_ids = current_outcomes
+        .iter()
+        .map(|outcome| outcome.outcome_id.clone())
+        .collect::<BTreeSet<_>>();
+    let now = Utc::now().to_rfc3339();
+    ledger.supersede_non_current_outcomes(&current_outcome_ids, &current.run_id, &now)?;
+    let mut render_by_task_id = BTreeMap::new();
+    for outcome in current_outcomes {
+        let decision: DecisionSnapshotV2 = store.read_versioned_json(
+            Path::new(&outcome.decision_ref.relative_path),
+            orchestrator_store::FileSchemaKind::DecisionSnapshot,
+        )?;
+        if decision.source_run_id == current.run_id {
             continue;
         }
-        for ticker in tickers_from_state(state) {
-            let Ok(outcome) =
-                read_learning_record(store, &location, LearningKind::Outcome, &ticker)
-            else {
-                continue;
-            };
-            let source_run_id = outcome
-                .source_run_id
-                .clone()
-                .unwrap_or_else(|| location.run_id.clone());
-            if source_run_id == current.run_id {
-                continue;
-            }
-            let source = orchestrator_store::find_run_location(store, &source_run_id)?;
-            if source.is_none() {
-                continue;
-            }
-            let source_location = source.expect("checked Some");
-            if read_indexes(
-                store,
-                Some(&source_location),
-                &IndexQuery {
-                    kind: Some(IndexKind::PhaseSummary),
-                    ticker: Some(ticker.clone()),
-                    limit: 1,
-                    ..Default::default()
-                },
-            )?
-            .indexes
-            .is_empty()
-            {
-                continue;
-            }
-            let decision =
-                read_learning_record(store, &source_location, LearningKind::Decision, &ticker)
-                    .ok()
-                    .map(|record| record.payload)
-                    .unwrap_or_else(|| json!({"status":"unavailable"}));
-            tasks.push(json!({
-                "task_id": tasks.len() as i64 + 1,
-                "ticker": ticker,
-                "source_run_id": source_run_id,
-                "outcome": outcome.payload,
+        let Some(source_location) =
+            orchestrator_store::find_run_location(store, &decision.source_run_id)?
+        else {
+            continue;
+        };
+        if read_indexes(
+            store,
+            Some(&source_location),
+            &IndexQuery {
+                kind: Some(IndexKind::PhaseSummary),
+                ticker: Some(decision.ticker.clone()),
+                limit: 1,
+                ..Default::default()
+            },
+        )?
+        .indexes
+        .is_empty()
+        {
+            continue;
+        }
+        let key = orchestrator_core::ReflectionTaskKeyV1 {
+            source_run_id: decision.source_run_id.clone(),
+            ticker: decision.ticker.clone(),
+            outcome_id: outcome.outcome_id.clone(),
+            outcome_content_hash: outcome.content_hash.clone(),
+            policy_ref: memory_policy.policy_ref.clone(),
+            profile_version: 3,
+            builder_version: 1,
+        };
+        let task = ledger.create_or_read(
+            key,
+            evaluation.outcome_reference(&outcome.outcome_id)?,
+            &now,
+        )?;
+        render_by_task_id.insert(
+            task.task_id.clone(),
+            json!({
+                "task_id": task.task_id,
+                "ticker": decision.ticker,
+                "source_run_id": decision.source_run_id,
+                "outcome": outcome,
                 "decision": decision,
-            }));
-            if tasks.len() >= limit.max(1) {
-                return Ok(tasks);
-            }
+            }),
+        );
+    }
+    let mut retries = Vec::new();
+    let mut fresh = Vec::new();
+    let mut backlog = Vec::new();
+    for task in ledger.list_tasks()? {
+        let Some(rendered) = render_by_task_id.get(&task.task_id).cloned() else {
+            continue;
+        };
+        match task.status {
+            ReflectionTaskStatus::FailedRetryable => retries.push((task, rendered)),
+            ReflectionTaskStatus::Pending if task.updated_at == now => fresh.push((task, rendered)),
+            ReflectionTaskStatus::Pending => backlog.push((task, rendered)),
+            _ => {}
+        }
+    }
+    let mut selected =
+        select_reflection_task_budget(&mut fresh, &mut retries, &mut backlog, &memory_policy);
+    let mut tasks = Vec::new();
+    for (task, rendered) in selected.drain(..) {
+        if ledger
+            .claim(&task.task_id, &current.run_id, &now)?
+            .is_some()
+        {
+            tasks.push(rendered);
         }
     }
     Ok(tasks)
+}
+
+fn select_reflection_task_budget<T>(
+    fresh: &mut Vec<T>,
+    retries: &mut Vec<T>,
+    backlog: &mut Vec<T>,
+    policy: &MemoryPolicyV1,
+) -> Vec<T> {
+    let limit = policy.reflection_total_quota as usize;
+    let mut selected = Vec::with_capacity(limit);
+    let retry_count = (policy.reflection_retry_quota as usize)
+        .min(limit.saturating_sub(selected.len()))
+        .min(retries.len());
+    selected.extend(retries.drain(..retry_count));
+    let fresh_count = (policy.reflection_new_outcome_quota as usize)
+        .min(limit.saturating_sub(selected.len()))
+        .min(fresh.len());
+    selected.extend(fresh.drain(..fresh_count));
+    let backlog_count = (policy.reflection_backlog_quota as usize)
+        .min(limit.saturating_sub(selected.len()))
+        .min(backlog.len());
+    selected.extend(backlog.drain(..backlog_count));
+    // A quota reserves capacity for a class but does not waste the total
+    // budget when that class is empty. Round-robin the remaining oldest tasks
+    // across classes, so retries cannot indefinitely starve fresh Outcomes
+    // and a sustained fresh stream cannot starve the backlog.
+    while selected.len() < limit {
+        let mut made_progress = false;
+        for bucket in [&mut *retries, &mut *fresh, &mut *backlog] {
+            if selected.len() == limit {
+                break;
+            }
+            if !bucket.is_empty() {
+                selected.push(bucket.remove(0));
+                made_progress = true;
+            }
+        }
+        if !made_progress {
+            break;
+        }
+    }
+    selected
 }
 
 async fn run_phase1(
@@ -1244,22 +1457,171 @@ fn record_manifest_artifact(
     Ok(())
 }
 
-fn run_phase8(store: &FileStore, location: &RunLocation, state: &mut Value) -> Result<()> {
-    for ticker in tickers_from_state(state) {
-        let record = LearningRecord {
-            schema_version: orchestrator_store::LEARNING_RECORD_SCHEMA_VERSION,
-            kind: LearningKind::Decision,
-            run_id: state["run_id"].as_str().unwrap_or_default().to_owned(),
-            ticker,
-            source_run_id: None,
-            payload: json!({"portfolio_allocation": state["portfolio_allocation"], "phase": 8}),
-            created_at: Utc::now().to_rfc3339(),
-            content_hash: String::new(),
-        };
-        write_learning_record(store, location, LearningKind::Decision, record)?;
+fn run_phase8(
+    store: &FileStore,
+    location: &RunLocation,
+    state: &mut Value,
+    runtime: &RuntimeConfig,
+    config: &Value,
+    args: &ExecArgs,
+) -> Result<()> {
+    // A mock run is a synthetic control path, never a source of a formal
+    // Decision (including the legacy per-run learning record).
+    if !args.mock {
+        for ticker in tickers_from_state(state) {
+            let record = LearningRecord {
+                schema_version: orchestrator_store::LEARNING_RECORD_SCHEMA_VERSION,
+                kind: LearningKind::Decision,
+                run_id: state["run_id"].as_str().unwrap_or_default().to_owned(),
+                ticker,
+                source_run_id: None,
+                payload: json!({"portfolio_allocation": state["portfolio_allocation"], "phase": 8}),
+                created_at: Utc::now().to_rfc3339(),
+                content_hash: String::new(),
+            };
+            write_learning_record(store, location, LearningKind::Decision, record)?;
+        }
+    }
+    if runtime.evaluation.enabled && !args.mock {
+        let context = evaluation_persistence_context(runtime, config, args, location)?;
+        if !matches!(context.namespace, PersistenceNamespace::Canonical)
+            || context.canonical_memory_writes_enabled
+        {
+            let evaluation = EvaluationStore::open(store.clone(), context.clone())?;
+            let usage_ledger =
+                orchestrator_store::MemoryUsageLedger::new(store.clone(), location.clone());
+            let memory_usage_ref = if usage_ledger.read_all()?.is_empty() {
+                MemoryUsageReferenceStatus::NotCaptured
+            } else {
+                usage_ledger.rebuild_report(&Utc::now().to_rfc3339())?;
+                MemoryUsageReferenceStatus::Available {
+                    document_ref: usage_ledger
+                        .report_reference()?
+                        .expect("rebuilt MemoryUsage report must resolve"),
+                }
+            };
+            for ticker in tickers_from_state(state) {
+                let decision = decision_snapshot(
+                    runtime,
+                    location,
+                    &ticker,
+                    &context,
+                    memory_usage_ref.clone(),
+                )?;
+                evaluation.write_decision(location, decision)?;
+            }
+        }
     }
     state["phase8"] = json!({"status": "completed", "archive": "file_store"});
     Ok(())
+}
+
+fn evaluation_persistence_context(
+    runtime: &RuntimeConfig,
+    config: &Value,
+    args: &ExecArgs,
+    location: &RunLocation,
+) -> Result<PersistenceContextV1> {
+    let run_purpose = if args.mock {
+        RunPurpose::Mock
+    } else if args.debug {
+        RunPurpose::Debug
+    } else {
+        args.run_purpose
+            .map(Into::into)
+            .unwrap_or(runtime.evaluation.default_run_purpose)
+    };
+    let namespace = match run_purpose {
+        RunPurpose::Live | RunPurpose::Paper => PersistenceNamespace::Canonical,
+        RunPurpose::Debug => PersistenceNamespace::Debug {
+            invocation_id: location.run_id.clone(),
+        },
+        RunPurpose::Mock => PersistenceNamespace::Disabled,
+        RunPurpose::Replay => PersistenceNamespace::Replay {
+            replay_id: location.run_id.clone(),
+        },
+        RunPurpose::MigrationFixture => PersistenceNamespace::MigrationFixture {
+            fixture_id: location.run_id.clone(),
+        },
+    };
+    let evaluation_config = config_get(config, "orchestrator.evaluation")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let config_hash = content_hash(&evaluation_config)?;
+    Ok(PersistenceContextV1 {
+        run_purpose,
+        namespace,
+        canonical_memory_writes_enabled: runtime.evaluation.canonical_memory_writes_enabled,
+        invocation_id: location.run_id.clone(),
+        config_ref: PolicyRef {
+            policy_id: "orchestrator.evaluation".to_owned(),
+            version: runtime.evaluation.policy_version,
+            content_hash: config_hash.clone(),
+        },
+        source_store_fingerprint: config_hash,
+    })
+}
+
+fn decision_snapshot(
+    runtime: &RuntimeConfig,
+    location: &RunLocation,
+    ticker: &str,
+    context: &PersistenceContextV1,
+    memory_usage_ref: MemoryUsageReferenceStatus,
+) -> Result<DecisionSnapshotV2> {
+    let policy = context.config_ref.clone();
+    let benchmark_selection = runtime
+        .evaluation
+        .benchmarks
+        .get(&ticker.to_ascii_uppercase())
+        .map(|binding| BenchmarkSelectionV1::Configured {
+            binding: BenchmarkBindingV1 {
+                benchmark_id: binding.ticker.clone(),
+                provider: binding.provider.clone(),
+                price_basis: binding.price_basis,
+                policy_ref: policy.clone(),
+            },
+        })
+        .unwrap_or_else(|| BenchmarkSelectionV1::Missing {
+            policy_ref: policy.clone(),
+        });
+    let decision_id = content_hash(&json!({
+        "source_run_id": location.run_id,
+        "ticker": ticker,
+        "evaluation_contract_id": runtime.evaluation.evaluation_contract_id,
+    }))?;
+    Ok(DecisionSnapshotV2 {
+        schema_version: DECISION_SNAPSHOT_SCHEMA_VERSION,
+        decision_id,
+        source_run_id: location.run_id.clone(),
+        ticker: ticker.to_owned(),
+        thesis: unavailable_decision_section(),
+        trade: unavailable_decision_section(),
+        risk: unavailable_decision_section(),
+        allocation: unavailable_decision_section(),
+        execution_plan: unavailable_decision_section(),
+        evaluation_spec: EvaluationSpec {
+            evaluation_contract_id: runtime.evaluation.evaluation_contract_id.clone(),
+            horizon_trading_days: runtime.evaluation.prediction_horizon_trading_days,
+            benchmark_policy_ref: policy.clone(),
+            benchmark_selection,
+            price_basis: runtime.evaluation.price_basis,
+            materialization_policy_ref: policy,
+        },
+        source_artifact_refs: Vec::new(),
+        source_input_refs: Vec::new(),
+        memory_usage_ref,
+        run_purpose: context.run_purpose,
+        decided_at: format!("{}T00:00:00Z", location.current_date),
+        content_hash: String::new(),
+    })
+}
+
+fn unavailable_decision_section<T>() -> DecisionSection<T> {
+    DecisionSection::Unavailable {
+        reason: DecisionSectionUnavailableReason::ArtifactMissing,
+        source_refs: Vec::new(),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1758,12 +2120,13 @@ fn seal_state(state: &mut Value) -> Result<()> {
 
 #[cfg(test)]
 mod phase2_session_tests {
+    use orchestrator_core::{MemoryPolicyV1, PolicyRef};
     use orchestrator_store::{PhaseStatus, RunLocation, RunManifest, RunManifestInit};
     use serde_json::json;
 
     use super::{
         highest_completed_phase, phase2_fork_reference, record_phase2_session, runtime_session_key,
-        sync_manifest_health,
+        select_reflection_task_budget, sync_manifest_health,
     };
 
     #[test]
@@ -1849,5 +2212,31 @@ mod phase2_session_tests {
             .insert("8".to_owned(), PhaseStatus::Completed);
 
         assert_eq!(highest_completed_phase(&manifest), Some(8));
+    }
+
+    #[test]
+    fn reflection_scheduler_uses_versioned_quotas_and_fills_without_starvation() {
+        let policy = MemoryPolicyV1 {
+            policy_ref: PolicyRef {
+                policy_id: "test-memory-policy".into(),
+                version: 7,
+                content_hash: "sha256:test".into(),
+            },
+            reflection_total_quota: 4,
+            reflection_new_outcome_quota: 1,
+            reflection_retry_quota: 1,
+            reflection_backlog_quota: 1,
+            reflection_max_attempts: 5,
+        };
+        let mut fresh = vec!["fresh-1", "fresh-2"];
+        let mut retries = vec!["retry-1", "retry-2"];
+        let mut backlog = vec!["backlog-1", "backlog-2"];
+        let selected =
+            select_reflection_task_budget(&mut fresh, &mut retries, &mut backlog, &policy);
+        assert_eq!(selected.len(), 4);
+        assert_eq!(&selected[..3], ["retry-1", "fresh-1", "backlog-1"]);
+        // The final spare slot is filled in round-robin order instead of
+        // repeatedly favoring a permanent retry stream.
+        assert_eq!(selected[3], "retry-2");
     }
 }

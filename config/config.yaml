@@ -37,7 +37,33 @@ orchestrator:
 
   reflection:
     task_limit: 10
+    # MemoryPolicyV1: quotas are intentionally configurable rather than
+    # hard-coded.  6/2/2 is the initial new/retry/backlog split.
+    policy_version: 1
+    new_outcome_quota: 6
+    retry_quota: 2
+    backlog_quota: 2
+    # A failed Historical Reflector remains non-blocking and retries only
+    # within this explicit bound; policy changes are recorded in Task Keys.
+    max_attempts: 3
     prediction_horizon_trading_days: 3
+  # Goal 1 ships disabled until the owner approves strict per-ticker benchmark
+  # mappings and provider/price-basis provenance. Missing mappings are a Gap,
+  # never a silent fallback.
+  evaluation:
+    enabled: false
+    canonical_memory_writes_enabled: false
+    policy_version: 1
+    default_run_purpose: paper
+    evaluation_contract_id: primary-three-day
+    prediction_horizon_trading_days: 3
+    # This is intentionally the literal existing `Close` column. Do not set
+    # adjusted_close until the provider export includes that distinct column.
+    price_basis: close
+    market_data_provider: technical_csv
+    market_data_adjustment_policy: unknown
+    corporate_action_capability: unknown
+    benchmarks: {}
   workflow:
     agent_timeout_sec: 600
     reducer_timeout_sec: 600

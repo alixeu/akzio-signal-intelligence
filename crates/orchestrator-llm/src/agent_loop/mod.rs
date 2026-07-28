@@ -1651,6 +1651,9 @@ pub struct ProjectToolRuntime {
     >,
     index_runtime_error: Option<String>,
     index_write_allowed: bool,
+    historical_reflection_binding:
+        Option<tools::historical_reflection::HistoricalReflectionTerminalBinding>,
+    experience_retrieval_binding: Option<tools::experience_tools::ExperienceRetrievalBinding>,
     domain_binding: Option<tools::domain_tools::DomainToolRuntimeBinding>,
     domain_runtime_error: Option<String>,
     max_write_calls: Option<usize>,
@@ -1682,6 +1685,8 @@ impl ProjectToolRuntime {
             index_runtime: None,
             index_runtime_error: None,
             index_write_allowed: false,
+            historical_reflection_binding: None,
+            experience_retrieval_binding: None,
             domain_binding: None,
             domain_runtime_error: None,
             max_write_calls: None,
@@ -1704,6 +1709,25 @@ impl ProjectToolRuntime {
     ) -> Self {
         self.index_write_allowed = binding.allows_write();
         self.index_binding = Some(binding);
+        self
+    }
+
+    /// Attach the sole Phase 0 terminal. This is intentionally independent
+    /// from generic Index writing so the model cannot create arbitrary
+    /// Experience records or select Duplicate.
+    pub fn with_historical_reflection_terminal(
+        mut self,
+        binding: tools::historical_reflection::HistoricalReflectionTerminalBinding,
+    ) -> Self {
+        self.historical_reflection_binding = Some(binding);
+        self
+    }
+
+    pub fn with_experience_retrieval(
+        mut self,
+        binding: tools::experience_tools::ExperienceRetrievalBinding,
+    ) -> Self {
+        self.experience_retrieval_binding = Some(binding);
         self
     }
 
@@ -1776,6 +1800,8 @@ impl LoopToolRuntime for ProjectToolRuntime {
         let index_runtime = self.index_runtime.as_ref();
         let index_runtime_error = self.index_runtime_error.as_deref();
         let index_write_allowed = self.index_write_allowed;
+        let historical_reflection_binding = self.historical_reflection_binding.as_ref();
+        let experience_retrieval_binding = self.experience_retrieval_binding.as_ref();
         let domain_binding = self.domain_binding.as_ref();
         let domain_runtime_error = self.domain_runtime_error.as_deref();
         Box::pin(async move {
@@ -1795,6 +1821,14 @@ impl LoopToolRuntime for ProjectToolRuntime {
                     | tools::index_tools::READ_INDEX_DETAILS_NAME
             );
             let is_domain_tool = tools::domain_tools::is_domain_tool(&call.name);
+            let is_historical_terminal =
+                call.name == tools::historical_reflection::FINALIZE_HISTORICAL_REFLECTION_NAME;
+            let is_experience_tool = matches!(
+                call.name.as_str(),
+                tools::experience_tools::SEARCH_EXPERIENCES_NAME
+                    | tools::experience_tools::READ_EXPERIENCE_CASES_NAME
+                    | tools::experience_tools::RECORD_MEMORY_APPLICATION_NAME
+            );
             let index_write_tool = matches!(
                 call.name.as_str(),
                 tools::index_tools::CREATE_INDEX_NAME
@@ -1807,7 +1841,9 @@ impl LoopToolRuntime for ProjectToolRuntime {
                 || (is_index_tool
                     && index_runtime.is_some()
                     && (!index_write_tool || index_write_allowed))
-                || (is_domain_tool && domain_binding.is_some());
+                || (is_domain_tool && domain_binding.is_some())
+                || (is_historical_terminal && historical_reflection_binding.is_some())
+                || (is_experience_tool && experience_retrieval_binding.is_some());
             if !configured || !enabled {
                 warn!(
                     call_id = call.call_id,
@@ -1822,7 +1858,7 @@ impl LoopToolRuntime for ProjectToolRuntime {
                     error: Some("unknown tool name".to_string()),
                 };
             }
-            if index_write_tool || is_domain_tool {
+            if index_write_tool || is_domain_tool || is_historical_terminal {
                 if let Some(limit) = self.max_write_calls {
                     let previous = self.write_call_count.fetch_add(1, Ordering::AcqRel);
                     if previous >= limit {
@@ -1892,6 +1928,48 @@ impl LoopToolRuntime for ProjectToolRuntime {
                             error: None,
                         }
                     }
+                    Err(error) => ToolResultItem {
+                        call_id,
+                        name,
+                        status: "error".to_owned(),
+                        output: Value::Null,
+                        error: Some(error.to_string()),
+                    },
+                };
+            }
+            if is_historical_terminal {
+                let output = historical_reflection_binding
+                    .expect("enabled terminal has a binding")
+                    .execute(call.arguments);
+                return match output {
+                    Ok(output) => ToolResultItem {
+                        call_id,
+                        name,
+                        status: "completed".to_owned(),
+                        output,
+                        error: None,
+                    },
+                    Err(error) => ToolResultItem {
+                        call_id,
+                        name,
+                        status: "error".to_owned(),
+                        output: Value::Null,
+                        error: Some(error.to_string()),
+                    },
+                };
+            }
+            if is_experience_tool {
+                let output = experience_retrieval_binding
+                    .expect("enabled experience tools have a binding")
+                    .execute(&name, call.arguments);
+                return match output {
+                    Ok(output) => ToolResultItem {
+                        call_id,
+                        name,
+                        status: "completed".to_owned(),
+                        output,
+                        error: None,
+                    },
                     Err(error) => ToolResultItem {
                         call_id,
                         name,

@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use thiserror::Error;
 
 pub const ROLE_PROFILE_REGISTRY_SCHEMA_VERSION: u32 = 1;
-pub const BUILTIN_ROLE_PROFILE_REGISTRY_VERSION: u32 = 1;
+pub const BUILTIN_ROLE_PROFILE_REGISTRY_VERSION: u32 = 3;
 
 /// The typed output contract a role is being migrated to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -82,6 +82,10 @@ define_tool_ids! {
     Think => "think",
     WebRun => "web.run",
     ReadReflectionSource => "read_reflection_source",
+    FinalizeHistoricalReflection => "finalize_historical_reflection",
+    SearchExperiences => "search_experiences",
+    ReadExperienceCases => "read_experience_cases",
+    RecordMemoryApplication => "record_memory_application",
     CreateIndex => "create_index",
     AppendIndexDetail => "append_index_detail",
     FinalizeIndex => "finalize_index",
@@ -313,9 +317,7 @@ impl RoleProfileRegistry {
                 ToolManagedProfile::HistoricalReflection,
                 UnitPlanner::ReflectionTask,
                 &[
-                    ToolId::AppendIndexDetail,
-                    ToolId::CreateIndex,
-                    ToolId::FinalizeIndex,
+                    ToolId::FinalizeHistoricalReflection,
                     ToolId::ReadIndexDetails,
                     ToolId::ReadIndexes,
                     ToolId::ReadReflectionSource,
@@ -617,7 +619,18 @@ fn registration(
     unit_planner: UnitPlanner,
     tools: &[ToolId],
 ) -> RoleProfileRegistration {
-    RoleProfileRegistration::new(role_id, profile, 1, 1, unit_planner, tools.iter().copied())
+    let mut tools = tools.to_vec();
+    if !matches!(
+        profile,
+        ToolManagedProfile::HistoricalReflection | ToolManagedProfile::PhaseSummary
+    ) {
+        tools.extend([
+            ToolId::SearchExperiences,
+            ToolId::ReadExperienceCases,
+            ToolId::RecordMemoryApplication,
+        ]);
+    }
+    RoleProfileRegistration::new(role_id, profile, 3, 1, unit_planner, tools)
         .expect("builtin authority registration must be valid")
 }
 
@@ -807,7 +820,7 @@ mod tests {
     #[test]
     fn snapshot_hash_detects_authority_drift() {
         let mut snapshot = RoleProfileRegistry::builtin().snapshot();
-        snapshot.registrations[0].profile_version = 2;
+        snapshot.registrations[0].profile_version = 4;
         let err = snapshot.verify().unwrap_err();
         assert!(matches!(
             err,
