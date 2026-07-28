@@ -135,7 +135,6 @@ pub struct AnalystArtifact {
     pub profile: String,
     pub unit_key: String,
     pub source_payload_hash: String,
-    pub id: String,
     pub per_ticker: BTreeMap<String, AnalystTickerArtifact>,
     pub evidence_refs: Vec<String>,
     pub created_at: String,
@@ -152,7 +151,6 @@ pub struct ResearchDecisionArtifact {
     pub profile: String,
     pub unit_key: String,
     pub source_payload_hash: String,
-    pub id: String,
     pub rating: String,
     pub long_probability: f64,
     pub short_probability: f64,
@@ -161,7 +159,7 @@ pub struct ResearchDecisionArtifact {
     pub plan: String,
     pub probability_rationale: String,
     pub scenarios: Option<Scenarios>,
-    pub per_ticker: BTreeMap<String, Value>,
+    pub per_ticker: BTreeMap<String, ResearchDecision>,
     pub decision_hinges: BTreeMap<String, Vec<String>>,
     pub evidence_refs: Vec<String>,
     pub created_at: String,
@@ -640,7 +638,6 @@ pub fn finalize_analyst_report(
         profile: scope.profile.as_str().to_owned(),
         unit_key: scope.unit_key.clone(),
         source_payload_hash: scope.source_payload_hash.clone(),
-        id: scope.role.clone(),
         per_ticker,
         evidence_refs: state.metadata.evidence_refs.into_iter().collect(),
         created_at: created_at.to_owned(),
@@ -700,7 +697,7 @@ pub fn finalize_research_decision(
             kind: "research finalizer",
             message: format!("{ticker}: {error}"),
         })?;
-        per_ticker.insert(ticker.clone(), per);
+        per_ticker.insert(ticker.clone(), decision);
         hinges.insert(ticker.clone(), entry.decision_hinges.clone());
     }
     let first = state
@@ -720,7 +717,6 @@ pub fn finalize_research_decision(
         profile: scope.profile.as_str().to_owned(),
         unit_key: scope.unit_key.clone(),
         source_payload_hash: scope.source_payload_hash.clone(),
-        id: scope.role.clone(),
         rating: first.rating.clone(),
         long_probability: first.long_probability,
         short_probability: first.short_probability,

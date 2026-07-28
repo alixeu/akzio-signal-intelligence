@@ -1,5 +1,5 @@
 use anyhow::{bail, Result};
-use orchestrator_core::{config_get, PortfolioAllocation};
+use orchestrator_core::{config_get, AllocationWeight, PortfolioAllocation};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
@@ -223,15 +223,15 @@ pub(crate) fn normalize_allocation(
         }
     }
 
-    let weights_json: BTreeMap<String, Value> = weights
+    let weights_json: BTreeMap<String, AllocationWeight> = weights
         .iter()
         .map(|(k, v)| {
             (
                 k.clone(),
-                json!({
-                    "weight": (*v * 10_000.0).round() / 10_000.0,
-                    "rationale": rationales.get(k).cloned().unwrap_or_default()
-                }),
+                AllocationWeight {
+                    weight: (*v * 10_000.0).round() / 10_000.0,
+                    rationale: rationales.get(k).cloned().unwrap_or_default(),
+                },
             )
         })
         .collect();

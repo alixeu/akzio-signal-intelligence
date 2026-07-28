@@ -196,8 +196,15 @@ pub struct FinalValidation {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AllocationWeight {
+    pub weight: f64,
+    #[serde(default)]
+    pub rationale: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PortfolioAllocation {
-    pub weights: BTreeMap<String, Value>,
+    pub weights: BTreeMap<String, AllocationWeight>,
     pub total_equity_exposure: f64,
     #[serde(default)]
     pub vix_regime: String,

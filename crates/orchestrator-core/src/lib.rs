@@ -14,7 +14,7 @@ pub mod token;
 pub use artifact::{
     normalize_probability, research_rating_for_probability, validate_analyst_ticker_artifact,
     validate_asset_execution_constraint, validate_evidence_types, validate_final_validation,
-    validate_research_decision, validate_risk_constraints, validate_trade_intent,
+    validate_research_decision, validate_risk_constraints, validate_trade_intent, AllocationWeight,
     AnalystTickerArtifact, AssetExecutionConstraint, BindingRiskControl, EvidenceItem,
     EvidenceType, FinalValidation, PortfolioAllocation, ResearchDecision, RiskConstraints,
     StopType, TradeIntent, ValidationError, CANONICAL_EVIDENCE_TYPES,
