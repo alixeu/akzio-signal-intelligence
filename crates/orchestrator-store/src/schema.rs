@@ -22,10 +22,6 @@ pub enum FileSchemaKind {
     Outcome,
     Reflection,
     Allocation,
-    OrderPlan,
-    SubmissionIntent,
-    AccountSnapshot,
-    ExecutionEvent,
 }
 
 impl fmt::Display for FileSchemaKind {
@@ -45,10 +41,6 @@ impl fmt::Display for FileSchemaKind {
             Self::Outcome => f.write_str("outcome"),
             Self::Reflection => f.write_str("reflection"),
             Self::Allocation => f.write_str("allocation"),
-            Self::OrderPlan => f.write_str("order plan"),
-            Self::SubmissionIntent => f.write_str("submission intent"),
-            Self::AccountSnapshot => f.write_str("account snapshot"),
-            Self::ExecutionEvent => f.write_str("execution event"),
         }
     }
 }

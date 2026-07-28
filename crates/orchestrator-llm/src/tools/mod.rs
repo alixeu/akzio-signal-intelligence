@@ -59,11 +59,7 @@ pub const SET_DECISION_HINGE_TOOL_NAME: &str = domain_tools::SET_DECISION_HINGE;
 pub const ROUTE_DEBATE_STEER_TOOL_NAME: &str = domain_tools::ROUTE_DEBATE_STEER;
 pub const SET_TOPIC_SOFT_CONTROL_TOOL_NAME: &str = domain_tools::SET_TOPIC_SOFT_CONTROL;
 pub const FINALIZE_TOPIC_CONTROL_TOOL_NAME: &str = domain_tools::FINALIZE_TOPIC_CONTROL;
-pub const ALPACA_GET_PORTFOLIO_TOOL_NAME: &str = alpaca::GET_PORTFOLIO_NAME;
-pub const ALPACA_GET_HISTORY_TOOL_NAME: &str = alpaca::GET_HISTORY_NAME;
-pub const ALPACA_GET_PRICE_TOOL_NAME: &str = alpaca::GET_PRICE_NAME;
 pub const ALPACA_GET_NEWS_TOOL_NAME: &str = alpaca::GET_NEWS_NAME;
-pub const ALPACA_SUBMIT_TRADE_TOOL_NAME: &str = alpaca::SUBMIT_TRADE_NAME;
 
 #[derive(Debug, Clone)]
 pub struct ToolDefinition {
@@ -79,15 +75,11 @@ pub struct ExternalToolConfig {
     pub run_id: Option<String>,
     #[serde(default)]
     pub phase: Option<i64>,
-    #[serde(default)]
-    pub allowed_reflection_task_ids: Vec<i64>,
     #[serde(default = "default_phase_summary_page_limit")]
     pub phase_summary_page_limit: usize,
     #[serde(default = "default_phase_summary_page_limit")]
     pub phase_summary_detail_page_limit: usize,
     pub tickers: Vec<String>,
-    #[serde(default)]
-    pub alpaca_live: bool,
     #[serde(default)]
     pub alpaca_market_data: bool,
     #[serde(skip)]
@@ -135,11 +127,9 @@ impl Default for ExternalToolConfig {
             project_root: PathBuf::from("."),
             run_id: None,
             phase: None,
-            allowed_reflection_task_ids: Vec::new(),
             phase_summary_page_limit: default_phase_summary_page_limit(),
             phase_summary_detail_page_limit: default_phase_summary_page_limit(),
             tickers: Vec::new(),
-            alpaca_live: false,
             alpaca_market_data: false,
             alpaca_api_key: None,
             alpaca_api_secret: None,
@@ -440,10 +430,6 @@ const REGISTRY: &[ToolEntry] = &[
         name: alpaca::GET_NEWS_NAME,
         definition: alpaca::get_news_definition,
     },
-    ToolEntry {
-        name: alpaca::SUBMIT_TRADE_NAME,
-        definition: alpaca::submit_trade_definition,
-    },
 ];
 
 pub fn tool_names() -> &'static [&'static str] {
@@ -461,7 +447,6 @@ pub fn tool_names() -> &'static [&'static str] {
 
 pub fn enabled_tool_names(
     web_run: Option<&WebSearchConfig>,
-    alpaca_live: bool,
     alpaca_market_data: bool,
 ) -> Vec<&'static str> {
     let mut names = tool_names()
@@ -472,7 +457,6 @@ pub fn enabled_tool_names(
     if web_run.is_some() {
         names.push(web_run::NAME);
     }
-    let _ = alpaca_live;
     if alpaca_market_data {
         names.push(alpaca::GET_NEWS_NAME);
     }
@@ -597,13 +581,7 @@ pub async fn execute_named_tool(
         read_technical_detail::NAME => read_technical_detail::execute(args, config),
         read_jin10_candidates::NAME => read_jin10_candidates::execute(args, config),
         verify_event::NAME => verify_event::execute(args, config, web_run).await,
-        alpaca::GET_PORTFOLIO_NAME => alpaca::get_portfolio(config).await,
-        alpaca::GET_HISTORY_NAME => alpaca::get_history(config).await,
-        alpaca::GET_PRICE_NAME => alpaca::get_price(args, config).await,
         alpaca::GET_NEWS_NAME => alpaca::get_news(args, config).await,
-        alpaca::SUBMIT_TRADE_NAME => {
-            bail!("alpaca_submit_trade is runtime-only and unavailable to LLM tool dispatch")
-        }
         index_tools::CREATE_INDEX_NAME
         | index_tools::APPEND_INDEX_DETAIL_NAME
         | index_tools::FINALIZE_INDEX_NAME

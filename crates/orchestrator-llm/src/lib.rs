@@ -2147,24 +2147,13 @@ fn configured_tool_names(settings: &AgentSettings) -> Vec<&str> {
             .iter()
             .map(String::as_str)
             .filter(|name| {
-                if *name == tools::ALPACA_SUBMIT_TRADE_TOOL_NAME
-                    || *name == tools::ALPACA_GET_PORTFOLIO_TOOL_NAME
-                    || *name == tools::ALPACA_GET_HISTORY_TOOL_NAME
-                    || *name == tools::ALPACA_GET_PRICE_TOOL_NAME
-                {
-                    return false;
-                }
                 if *name == tools::ALPACA_GET_NEWS_TOOL_NAME {
                     settings
                         .tools
                         .as_ref()
                         .is_some_and(|config| config.alpaca_market_data)
                 } else {
-                    !is_alpaca_tool(name)
-                        || settings
-                            .tools
-                            .as_ref()
-                            .is_some_and(|config| config.alpaca_live)
+                    true
                 }
             }),
     );
@@ -2224,17 +2213,6 @@ fn validate_tool_name(name: &str) -> Result<()> {
     }
 }
 
-fn is_alpaca_tool(name: &str) -> bool {
-    matches!(
-        name,
-        tools::ALPACA_GET_PORTFOLIO_TOOL_NAME
-            | tools::ALPACA_GET_HISTORY_TOOL_NAME
-            | tools::ALPACA_GET_PRICE_TOOL_NAME
-            | tools::ALPACA_GET_NEWS_TOOL_NAME
-            | tools::ALPACA_SUBMIT_TRADE_TOOL_NAME
-    )
-}
-
 fn validate_reasoning_effort(value: &str) -> Result<()> {
     match value.trim().to_ascii_lowercase().as_str() {
         "0" | "none" | "minimal" | "low" | "medium" | "high" | "xhigh" => Ok(()),
@@ -2265,7 +2243,6 @@ fn default_tool_config() -> tools::ExternalToolConfig {
         project_root: default_project_root(),
         run_id: None,
         phase: None,
-        allowed_reflection_task_ids: Vec::new(),
         phase_summary_page_limit: 20,
         phase_summary_detail_page_limit: 20,
         tickers: std::env::var("ORCH_TICKERS")
@@ -2279,7 +2256,6 @@ fn default_tool_config() -> tools::ExternalToolConfig {
                     .collect()
             })
             .unwrap_or_default(),
-        alpaca_live: false,
         alpaca_market_data: false,
         alpaca_api_key: None,
         alpaca_api_secret: None,
@@ -2669,11 +2645,9 @@ mod tests {
             project_root: temp.path().to_path_buf(),
             run_id: None,
             phase: None,
-            allowed_reflection_task_ids: Vec::new(),
             phase_summary_page_limit: 20,
             phase_summary_detail_page_limit: 20,
             tickers: vec!["TQQQ".to_string()],
-            alpaca_live: false,
             alpaca_market_data: false,
             alpaca_api_key: None,
             alpaca_api_secret: None,
@@ -3066,26 +3040,6 @@ mod tests {
         settings.llm.tools = vec![tools::READ_INDEXES_TOOL_NAME.to_string()];
         settings.web_search.mode = WebSearchMode::Live;
         assert!(super::configured_tool_names(&settings).contains(&tools::WEB_RUN_TOOL_NAME));
-    }
-
-    #[test]
-    fn portfolio_manager_never_gets_runtime_execution_tools() {
-        let mut settings = base_settings(LlmRoute::Responses);
-        settings.role = "portfolio.manager".to_string();
-        settings.llm.think_tool = false;
-        settings.llm.tools = vec![
-            tools::ALPACA_GET_PORTFOLIO_TOOL_NAME.to_string(),
-            tools::ALPACA_GET_PRICE_TOOL_NAME.to_string(),
-            tools::ALPACA_SUBMIT_TRADE_TOOL_NAME.to_string(),
-        ];
-        settings.web_search.mode = WebSearchMode::Live;
-        settings.tools = Some(tools::ExternalToolConfig::default());
-
-        assert!(super::configured_tool_names(&settings).is_empty());
-        assert!(super::web_run_runtime_for_settings(&settings).is_none());
-
-        settings.tools.as_mut().unwrap().alpaca_live = true;
-        assert!(super::configured_tool_names(&settings).is_empty());
     }
 
     #[test]

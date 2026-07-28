@@ -9,37 +9,25 @@ pub const NAME: &str = "read_reflection_source";
 pub fn definition() -> ToolDefinition {
     ToolDefinition {
         name: api_tool_name(NAME),
-        description: "Phase 0 only: read bootstrap metadata, decision, outcome, and FileStore Index availability for one allowlisted reflection task. Use read_indexes and read_index_details for evidence.".to_string(),
+        description: "Phase 0 only: read the Rust-owned bootstrap metadata, decision, outcome, and FileStore Index availability for this reflection unit. Use read_indexes and read_index_details for evidence.".to_string(),
         parameters: json!({
             "type": "object",
-            "properties": {
-                "task_id": {"type": "integer", "minimum": 1}
-            },
-            "required": ["task_id"],
+            "properties": {},
+            "required": [],
             "additionalProperties": false
         }),
     }
 }
 
 pub fn execute(
-    args: Value,
+    _args: Value,
     config: &ExternalToolConfig,
     turn_context: Option<&ToolRuntimeTurnContext>,
 ) -> Result<Value> {
     if turn_context.and_then(|context| context.phase) != Some(0) {
         bail!("read_reflection_source is only available in phase 0");
     }
-    let task_id = args
-        .get("task_id")
-        .and_then(Value::as_i64)
-        .ok_or_else(|| anyhow::anyhow!("read_reflection_source.task_id is required"))?;
-    if !config.allowed_reflection_task_ids.contains(&task_id) {
-        bail!("reflection task {task_id} is not allowlisted for this turn");
-    }
     if let Some(source) = &config.file_store_reflection_source {
-        if source.pointer("/task/task_id").and_then(Value::as_i64) != Some(task_id) {
-            bail!("FileStore reflection source does not match task {task_id}");
-        }
         return Ok(source.clone());
     }
     bail!("read_reflection_source requires a Rust-owned FileStore reflection source")

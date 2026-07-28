@@ -1802,12 +1802,8 @@ impl LoopToolRuntime for ProjectToolRuntime {
                     | tools::FINALIZE_INDEX_TOOL_NAME
             );
             let enabled = call.name == "think"
-                || tools::enabled_tool_names(
-                    web_run_config,
-                    config.alpaca_live,
-                    config.alpaca_market_data,
-                )
-                .contains(&call.name.as_str())
+                || tools::enabled_tool_names(web_run_config, config.alpaca_market_data)
+                    .contains(&call.name.as_str())
                 || (is_index_tool
                     && index_runtime.is_some()
                     && (!index_write_tool || index_write_allowed))

@@ -9,7 +9,6 @@ mod doctor;
 mod domain;
 mod draft;
 mod error;
-mod execution;
 mod index;
 mod input;
 mod json;
@@ -61,12 +60,6 @@ pub use draft::{
     TradeIntentDraft, TradeIntentDraftEntry,
 };
 pub use error::{Result, StoreError};
-pub use execution::{
-    append_execution_event, complete_submission, record_remote_order, record_submission_intent,
-    submit_or_recover, write_account_snapshot, AccountSnapshot, ExecutionEvent, OrderGateway,
-    SubmissionIntent, SubmissionStatus, ACCOUNT_SNAPSHOT_SCHEMA_VERSION,
-    EXECUTION_EVENT_SCHEMA_VERSION, SUBMISSION_INTENT_SCHEMA_VERSION,
-};
 pub use index::{
     append_index_detail, create_index, deterministic_experience_index_id, experience_level,
     finalize_index, read_index_details, read_indexes, record_experience_case,

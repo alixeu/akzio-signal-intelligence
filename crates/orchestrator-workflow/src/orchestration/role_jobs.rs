@@ -222,9 +222,6 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
         prompt_path,
     } = input;
     let debug_enabled = state.get("debug").and_then(Value::as_bool).unwrap_or(false);
-    // LLM roles never receive account or order submission tools. Runtime-owned
-    // Phase 7 execution uses a separate, fail-closed gate after allocation.
-    let alpaca_live = false;
     let alpaca_market_data = role == "analyst.news_macro" && !mock && !debug_enabled;
     let tickers = tickers_from_state(&state);
     let tool_tickers = if role == "portfolio.manager" {
@@ -396,24 +393,16 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
                 .and_then(Value::as_str)
                 .map(ToString::to_string),
             phase: Some(phase),
-            allowed_reflection_task_ids: state
-                .pointer("/phase0/tasks")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(|task| task.get("task_id").and_then(Value::as_i64))
-                .collect(),
             phase_summary_page_limit: config.retrieval.summary_page_limit,
             phase_summary_detail_page_limit: config.retrieval.detail_page_limit,
             tickers: tool_tickers,
-            alpaca_live,
             alpaca_market_data,
-            alpaca_api_key: if alpaca_live || alpaca_market_data {
+            alpaca_api_key: if alpaca_market_data {
                 config.alpaca_api_key.clone()
             } else {
                 None
             },
-            alpaca_api_secret: if alpaca_live || alpaca_market_data {
+            alpaca_api_secret: if alpaca_market_data {
                 config.alpaca_api_secret.clone()
             } else {
                 None
