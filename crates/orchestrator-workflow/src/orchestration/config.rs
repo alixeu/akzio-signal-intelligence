@@ -1,5 +1,3 @@
-#![allow(dead_code)] // configuration remains shared by optional ToolManaged profiles.
-
 use anyhow::{bail, Context, Result};
 use orchestrator_core::{
     config_bool, config_get, config_int, config_str, config_strings, project_path,
@@ -37,37 +35,24 @@ pub(crate) struct RuntimeConfig {
     pub reflection: ReflectionConfig,
     pub retrieval: RetrievalConfig,
     pub store: StoreConfig,
-    #[allow(dead_code)] // consumed by ToolManaged runtime once a profile migrates
     pub tool_managed: ToolManagedConfig,
-    pub plugins: PluginConfig,
     pub component_plugins: ComponentRegistry,
     /// Immutable FileStore ownership for every role/profile, captured in the
     /// run manifest before recovery is permitted.
     pub authority_registry: AuthorityRegistry,
 }
 
-pub(crate) const STORE_SCHEMA_VERSION: u32 = 1;
-
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // PR1 plumbing; FileStore consumes these fields after migration.
 pub(crate) struct StoreConfig {
     /// Canonical absolute root derived from `orchestrator.store.root`.
     pub root: PathBuf,
-    pub schema_version: u32,
-    pub retain_turn_history: bool,
-    pub retain_debug_history: bool,
     pub atomic_fsync: bool,
     pub stale_temp_age_sec: u64,
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // PR1 plumbing; ToolManaged runtime consumes these fields after migration.
 pub(crate) struct ToolManagedConfig {
     pub max_write_calls_per_role: usize,
-    /// This is intentionally fixed at two: initial attempt plus one repair.
-    pub max_finalize_attempts: usize,
-    pub max_draft_chars: usize,
-    pub summary_parallelism: usize,
     pub max_summary_units_per_phase: usize,
 }
 
@@ -113,31 +98,17 @@ pub(crate) struct AllocationConfig {
     pub regime_signal: String,
     pub regime_thresholds: Vec<f64>,
     pub regime_labels: Vec<String>,
-    pub correlation_window_days: usize,
     pub max_single_position: f64,
-    pub vol_indicator: String,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct ReflectionConfig {
-    pub enabled: bool,
-    pub reflection_version: String,
     pub task_limit: usize,
-    pub parallelism: usize,
-    pub loss_return: f64,
-    pub excess_return: f64,
-    pub high_confidence: f64,
-    pub calibration_error: f64,
-    pub repeated_error_count: i64,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct WorkflowConfig {
-    pub phase1_parallelism: usize,
     pub agent_timeout_sec: u64,
-    pub reducer_timeout_sec: u64,
-    pub critical_roles: BTreeSet<String>,
-    pub late_evidence_enabled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -178,42 +149,11 @@ impl StoreConfig {
         const PATH: &str = "orchestrator.store";
         let object = strict_optional_object(config, PATH)?;
         if let Some(object) = object {
-            validate_known_fields(
-                object,
-                PATH,
-                [
-                    "root",
-                    "schema_version",
-                    "retain_turn_history",
-                    "retain_debug_history",
-                    "atomic_fsync",
-                    "stale_temp_age_sec",
-                ],
-            )?;
+            validate_known_fields(object, PATH, ["root", "atomic_fsync", "stale_temp_age_sec"])?;
         }
         let root = strict_string_or_default(object, PATH, "root", "outputs/store")?;
-        let schema_version =
-            strict_u64_or_default(object, PATH, "schema_version", STORE_SCHEMA_VERSION as u64)?;
-        if schema_version != STORE_SCHEMA_VERSION as u64 {
-            bail!(
-                "{PATH}.schema_version must be exactly {STORE_SCHEMA_VERSION}; got {schema_version}"
-            );
-        }
         Ok(Self {
             root: resolve_store_root_path(Path::new(&root))?,
-            schema_version: STORE_SCHEMA_VERSION,
-            retain_turn_history: strict_bool_or_default(
-                object,
-                PATH,
-                "retain_turn_history",
-                false,
-            )?,
-            retain_debug_history: strict_bool_or_default(
-                object,
-                PATH,
-                "retain_debug_history",
-                true,
-            )?,
             atomic_fsync: strict_bool_or_default(object, PATH, "atomic_fsync", true)?,
             stale_temp_age_sec: strict_u64_or_default(object, PATH, "stale_temp_age_sec", 3600)?,
         })
@@ -243,30 +183,15 @@ impl ToolManagedConfig {
             validate_known_fields(
                 object,
                 PATH,
-                [
-                    "max_write_calls_per_role",
-                    "max_finalize_attempts",
-                    "max_draft_chars",
-                    "summary_parallelism",
-                    "max_summary_units_per_phase",
-                ],
+                ["max_write_calls_per_role", "max_summary_units_per_phase"],
             )?;
         }
         let max_write_calls_per_role =
             strict_bounded_usize(object, PATH, "max_write_calls_per_role", 20, 1, 1_000)?;
-        let max_finalize_attempts =
-            strict_bounded_usize(object, PATH, "max_finalize_attempts", 2, 2, 2)?;
-        let max_draft_chars =
-            strict_bounded_usize(object, PATH, "max_draft_chars", 64_000, 1, 1_048_576)?;
-        let summary_parallelism =
-            strict_bounded_usize(object, PATH, "summary_parallelism", 4, 1, 64)?;
         let max_summary_units_per_phase =
             strict_bounded_usize(object, PATH, "max_summary_units_per_phase", 32, 1, 256)?;
         Ok(Self {
             max_write_calls_per_role,
-            max_finalize_attempts,
-            max_draft_chars,
-            summary_parallelism,
             max_summary_units_per_phase,
         })
     }
@@ -543,7 +468,6 @@ impl RuntimeConfig {
             retrieval: RetrievalConfig::from_value(config),
             store: StoreConfig::from_value(config)?,
             tool_managed: ToolManagedConfig::from_value(config)?,
-            plugins: plugin_config,
             component_plugins,
             authority_registry,
         })
@@ -894,83 +818,21 @@ pub(crate) fn required_llm_roles() -> Vec<String> {
 impl ReflectionConfig {
     pub fn from_value(config: &Value) -> Self {
         Self {
-            enabled: config_bool(config, "orchestrator.reflection.enabled", true),
-            reflection_version: config_str(
-                config,
-                "orchestrator.reflection.reflection_version",
-                "v1",
-            ),
             task_limit: config_int(config, "orchestrator.reflection.task_limit", 10).max(1)
                 as usize,
-            parallelism: config_int(config, "orchestrator.reflection.parallelism", 2).max(1)
-                as usize,
-            loss_return: config_f64(config, "orchestrator.reflection.deep.loss_return", -0.02),
-            excess_return: config_f64(config, "orchestrator.reflection.deep.excess_return", -0.015),
-            high_confidence: config_f64(
-                config,
-                "orchestrator.reflection.deep.high_confidence",
-                0.70,
-            )
-            .clamp(0.0, 1.0),
-            calibration_error: config_f64(
-                config,
-                "orchestrator.reflection.deep.calibration_error",
-                0.40,
-            )
-            .clamp(0.0, 1.0),
-            repeated_error_count: config_int(
-                config,
-                "orchestrator.reflection.deep.repeated_error_count",
-                2,
-            )
-            .max(2),
         }
     }
 }
 
 impl WorkflowConfig {
     pub fn from_value(config: &Value) -> Self {
-        let phase1_parallelism =
-            config_int(config, "orchestrator.workflow.phase1.parallelism", 5).max(1) as usize;
         let agent_timeout_sec =
             config_int(config, "orchestrator.workflow.agent_timeout_sec", 300).max(1) as u64;
-        let reducer_timeout_sec =
-            config_int(config, "orchestrator.workflow.reducer_timeout_sec", 300).max(1) as u64;
-        let critical_roles = config_strings(
-            config,
-            "orchestrator.workflow.phase1.critical_roles",
-            &["analyst.technical", "analyst.news_macro"],
-        )
-        .into_iter()
-        .map(|role| match role.as_str() {
-            "technical" => "analyst.technical".to_owned(),
-            "news_macro" => "analyst.news_macro".to_owned(),
-            _ => role,
-        })
-        .collect::<BTreeSet<_>>();
-        let late_evidence_enabled =
-            config_bool(config, "orchestrator.workflow.late_evidence.enabled", true);
-        Self {
-            phase1_parallelism,
-            agent_timeout_sec,
-            reducer_timeout_sec,
-            critical_roles,
-            late_evidence_enabled,
-        }
+        Self { agent_timeout_sec }
     }
-}
-
-fn config_f64(config: &Value, path: &str, default: f64) -> f64 {
-    config_get(config, path)
-        .and_then(|value| value.as_f64().or_else(|| value.as_str()?.parse().ok()))
-        .unwrap_or(default)
 }
 
 impl PromptConfig {
-    pub fn analyst_path(&self, role: &str) -> Option<&std::path::Path> {
-        self.prompts.get(role).map(|p| p.as_path())
-    }
-
     pub fn path_for(&self, role: &str) -> Option<&PathBuf> {
         self.prompts.get(role)
     }
@@ -1070,10 +932,6 @@ pub(crate) fn prompt_path(config: &Value, key: &str, default: &str) -> Result<Pa
     Ok(path)
 }
 
-pub(crate) fn is_critical_role(config: &RuntimeConfig, role: &str) -> bool {
-    config.workflow.critical_roles.contains(role)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1084,9 +942,6 @@ mod tests {
     fn store_config_defaults_to_the_canonical_root_and_safe_retention() {
         let store = StoreConfig::from_value(&json!({})).unwrap();
         assert_eq!(store.root, project_path("outputs/store"));
-        assert_eq!(store.schema_version, STORE_SCHEMA_VERSION);
-        assert!(!store.retain_turn_history);
-        assert!(store.retain_debug_history);
         assert!(store.atomic_fsync);
         assert_eq!(store.stale_temp_age_sec, 3600);
     }
@@ -1098,9 +953,6 @@ mod tests {
             "orchestrator": {
                 "store": {
                     "root": "outputs/isolated-store",
-                    "schema_version": 1,
-                    "retain_turn_history": true,
-                    "retain_debug_history": false,
                     "atomic_fsync": false,
                     "stale_temp_age_sec": 42
                 }
@@ -1108,8 +960,6 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(store.root, project_path("outputs/isolated-store"));
-        assert!(store.retain_turn_history);
-        assert!(!store.retain_debug_history);
         assert!(!store.atomic_fsync);
         assert_eq!(store.stale_temp_age_sec, 42);
         assert_eq!(store.resolve_root(Some(&root)).unwrap(), root);
@@ -1120,8 +970,6 @@ mod tests {
         for store in [
             json!({"root": "outputs/store", "unknown": true}),
             json!({"root": " outputs/store"}),
-            json!({"schema_version": 2}),
-            json!({"retain_turn_history": "false"}),
             json!({"stale_temp_age_sec": 0}),
         ] {
             let error =
@@ -1134,24 +982,13 @@ mod tests {
     fn tool_managed_config_defaults_and_enforces_bounded_repair_policy() {
         let defaults = ToolManagedConfig::from_value(&json!({})).unwrap();
         assert_eq!(defaults.max_write_calls_per_role, 20);
-        assert_eq!(defaults.max_finalize_attempts, 2);
-        assert_eq!(defaults.max_draft_chars, 64_000);
-        assert_eq!(defaults.summary_parallelism, 4);
         assert_eq!(defaults.max_summary_units_per_phase, 32);
 
-        for tool_managed in [
-            json!({"max_finalize_attempts": 1}),
-            json!({"max_finalize_attempts": 3}),
-            json!({"max_draft_chars": 0}),
-            json!({"summary_parallelism": 65}),
-            json!({"unknown": 1}),
-        ] {
-            let error = ToolManagedConfig::from_value(&json!({
-                "orchestrator": {"tool_managed": tool_managed}
-            }))
-            .unwrap_err();
-            assert!(error.to_string().contains("orchestrator.tool_managed"));
-        }
+        let error = ToolManagedConfig::from_value(&json!({
+            "orchestrator": {"tool_managed": {"unknown": 1}}
+        }))
+        .unwrap_err();
+        assert!(error.to_string().contains("orchestrator.tool_managed"));
     }
 
     #[test]

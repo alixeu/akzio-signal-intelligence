@@ -6,9 +6,8 @@
 //! Each file holds flash news items fetched for that date with columns: id, time, content.
 
 use anyhow::{Context, Result};
-use md5::{Digest, Md5};
+use sha2::{Digest, Sha256};
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 pub const DEFAULT_JIN10_CSV_DIR: &str = "outputs/store/data/jin10";
@@ -36,18 +35,14 @@ pub struct Jin10CsvRow {
 
 /// Stable Jin10 primary key shared by CSV persistence and FileStore lookup.
 pub fn jin10_item_id(time_raw: &str, content: &str) -> String {
-    let mut hasher = Md5::new();
+    let mut hasher = Sha256::new();
     hasher.update(time_raw.as_bytes());
     hasher.update(b"\n");
     hasher.update(content.as_bytes());
     format!("{:x}", hasher.finalize())
 }
 
-pub fn write_jin10_csv(path: &Path, rows: &[Jin10CsvRow]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create jin10 csv dir {}", parent.display()))?;
-    }
+pub fn render_jin10_csv(rows: &[Jin10CsvRow]) -> String {
     let mut lines = Vec::with_capacity(rows.len() + 1);
     lines.push("id,time,content".to_string());
     for row in rows {
@@ -58,34 +53,7 @@ pub fn write_jin10_csv(path: &Path, rows: &[Jin10CsvRow]) -> Result<()> {
             csv_escape(&row.content)
         ));
     }
-    write_text_atomic(path, &lines.join("\n"))
-        .with_context(|| format!("failed to write jin10 csv {}", path.display()))?;
-    Ok(())
-}
-
-fn write_text_atomic(path: &Path, contents: &str) -> Result<()> {
-    let parent = path
-        .parent()
-        .context("jin10 csv path must have a parent directory")?;
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .context("jin10 csv path must have a UTF-8 file name")?;
-    let temp = parent.join(format!(".{file_name}.tmp-{}", std::process::id()));
-    let result = (|| -> Result<()> {
-        let mut file = fs::File::create(&temp)
-            .with_context(|| format!("failed to create temporary jin10 csv {}", temp.display()))?;
-        file.write_all(contents.as_bytes())?;
-        file.flush()?;
-        file.sync_all()?;
-        fs::rename(&temp, path)?;
-        fs::File::open(parent)?.sync_all()?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temp);
-    }
-    result
+    lines.join("\n")
 }
 
 pub fn read_jin10_csv(path: &Path) -> Result<Vec<Jin10CsvRow>> {
@@ -207,7 +175,7 @@ mod tests {
                 content: "Oil prices surge, OPEC cuts".into(),
             },
         ];
-        write_jin10_csv(&path, &rows).unwrap();
+        std::fs::write(&path, render_jin10_csv(&rows)).unwrap();
         let loaded = read_jin10_csv(&path).unwrap();
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded[0].id, "abc123");
@@ -224,7 +192,7 @@ mod tests {
             time: "2026-07-20 10:00:00".into(),
             content: "GDP growth 3.2%, beating expectations of 2.8%".into(),
         }];
-        write_jin10_csv(&path, &rows).unwrap();
+        std::fs::write(&path, render_jin10_csv(&rows)).unwrap();
         let loaded = read_jin10_csv(&path).unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(
@@ -238,7 +206,7 @@ mod tests {
         let id = jin10_item_id("2026-07-22 13:49:22", "macro event");
 
         assert_eq!(id, jin10_item_id("2026-07-22 13:49:22", "macro event"));
-        assert_eq!(id.len(), 32);
+        assert_eq!(id.len(), 64);
         assert_ne!(id, jin10_item_id("2026-07-22 13:49:22", "other event"));
     }
 }

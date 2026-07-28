@@ -31,6 +31,24 @@ pub fn write_bytes_atomic(root: &Path, relative: &Path, bytes: &[u8]) -> Result<
     write_bytes_atomic_with_options(root, relative, bytes, AtomicWriteOptions::default())
 }
 
+/// Atomically publish one explicit output path through the same FileStore
+/// implementation used by run artifacts. The caller owns path selection;
+/// this helper never accepts a directory traversal component as the filename.
+pub fn publish_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path.parent().ok_or_else(|| StoreError::InvalidDocument {
+        kind: "atomic publication path",
+        message: "path must have a parent directory".to_owned(),
+    })?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| StoreError::InvalidDocument {
+        kind: "atomic publication path",
+        message: "path must name a file".to_owned(),
+    })?;
+    fs::create_dir_all(parent).map_err(|source| io_error(parent, source))?;
+    write_bytes_atomic(parent, Path::new(file_name), bytes)
+}
+
 /// Serialize canonical JSON and atomically replace its target file.
 pub fn write_json_atomic<T: Serialize>(root: &Path, relative: &Path, value: &T) -> Result<()> {
     let value =

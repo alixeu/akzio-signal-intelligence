@@ -1,5 +1,3 @@
-#![allow(dead_code)] // deterministic degraded finalizers are selected by recovery policy.
-
 //! FileStore adapter for typed Phase 1 and Phase 3 domain tools.
 //!
 //! This is deliberately a narrow bridge: only profiles with a completed

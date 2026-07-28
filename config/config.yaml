@@ -2,17 +2,11 @@ orchestrator:
   analysis_universe: [QQQ, SOXX, VIX]
   store:
     root: outputs/store
-    schema_version: 1
-    retain_turn_history: false
-    retain_debug_history: true
     atomic_fsync: true
     stale_temp_age_sec: 3600
 
   tool_managed:
     max_write_calls_per_role: 20
-    max_finalize_attempts: 2
-    max_draft_chars: 64000
-    summary_parallelism: 4
     max_summary_units_per_phase: 32
 
   runtime:
@@ -42,17 +36,8 @@ orchestrator:
     api_secret: ${ALPACA_API_SECRET}
 
   reflection:
-    enabled: true
-    reflection_version: v1
     task_limit: 10
-    parallelism: 2
     prediction_horizon_trading_days: 3
-    deep:
-      loss_return: -0.02
-      excess_return: -0.015
-      high_confidence: 0.70
-      calibration_error: 0.40
-      repeated_error_count: 2
   workflow:
     agent_timeout_sec: 600
     reducer_timeout_sec: 600

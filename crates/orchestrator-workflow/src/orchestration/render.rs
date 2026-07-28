@@ -1,5 +1,3 @@
-#![allow(dead_code)] // monitor prompt selection remains a supported renderer mode.
-
 use anyhow::{bail, Context, Result};
 use orchestrator_core::{render_template, ComponentPlugin};
 use serde_json::{json, Value};
@@ -8,21 +6,6 @@ use std::path::PathBuf;
 
 use super::lifecycle::{research_plan_to_trade_intent, tickers_from_state, topic_state};
 use orchestrator_core::ComponentRegistry;
-
-pub(crate) fn mode_prompt_path(base: &std::path::Path, state: &Value) -> PathBuf {
-    if state.get("mode").and_then(Value::as_str) != Some("monitor") {
-        return base.to_path_buf();
-    }
-    let Some(stem) = base.file_stem().and_then(|value| value.to_str()) else {
-        return base.to_path_buf();
-    };
-    let candidate = base.with_file_name(format!("{stem}_monitor.md"));
-    if candidate.exists() {
-        candidate
-    } else {
-        base.to_path_buf()
-    }
-}
 
 /// Load a shared prompt component from `prompts/common/<file_name>` relative to
 /// the role prompt path. Missing components resolve to an empty string so a role

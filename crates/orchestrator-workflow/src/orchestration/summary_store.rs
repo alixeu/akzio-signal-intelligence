@@ -1,5 +1,3 @@
-#![allow(dead_code)] // summary writer remains shared with non-mock summary jobs.
-
 //! Deterministic FileStore writer for the fixed Phase Summary unit plan.
 //!
 //! Completed Index directories produced here are the only phase-summary
@@ -20,13 +18,6 @@ use super::{
     lifecycle::tickers_from_state,
     summary_units::{SummaryUnit, SummaryUnitPlanRequest, SummaryUnitPlanner, SummaryUnitScope},
 };
-
-/// Completed deterministic Indexes for one source phase.  The caller may use
-/// this only for diagnostics; the files are the authority.
-#[derive(Debug, Clone)]
-pub(crate) struct FileStoreSummaryResult {
-    pub indexes: Vec<Index>,
-}
 
 /// The bounded, completed-artifact payload that may be summarized for one
 /// phase. It is intentionally built from state projections only; no reader
@@ -75,7 +66,7 @@ pub(crate) fn write_deterministic_phase_summary(
     state: &Value,
     source_phase: i64,
     max_units: usize,
-) -> Result<FileStoreSummaryResult> {
+) -> Result<Vec<Index>> {
     let source_phase_u8 =
         u8::try_from(source_phase).context("phase summary source phase must fit in a u8")?;
     let source_payload = phase_summary_source_payload(state, source_phase)?;
@@ -102,7 +93,7 @@ pub(crate) fn write_deterministic_phase_summary(
             &created_at,
         )?);
     }
-    Ok(FileStoreSummaryResult { indexes })
+    Ok(indexes)
 }
 
 /// Plan the fixed, Rust-owned Summary Units for a completed source phase.
@@ -225,21 +216,6 @@ fn applies_to_phases(source_phase: u8) -> Vec<u8> {
         .then_some(source_phase + 1)
         .into_iter()
         .collect()
-}
-
-fn detail_section(detail: &str) -> DetailSection {
-    let lower = detail.to_ascii_lowercase();
-    if lower.contains("conflict") {
-        DetailSection::Conflict
-    } else if lower.contains("risk") || lower.contains("stop") {
-        DetailSection::Risk
-    } else if lower.contains("hinge") {
-        DetailSection::DecisionHinge
-    } else if lower.contains("gap") || lower.contains("missing") {
-        DetailSection::DataGap
-    } else {
-        DetailSection::Analysis
-    }
 }
 
 fn compact_detail(value: &Value) -> String {
@@ -380,11 +356,11 @@ mod tests {
             }
         });
         let result = write_deterministic_phase_summary(temp.path(), &state, 3, 32).unwrap();
-        assert_eq!(result.indexes.len(), 1);
-        assert_eq!(result.indexes[0].ticker.as_deref(), Some("QQQ"));
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].ticker.as_deref(), Some("QQQ"));
         let recovered = write_deterministic_phase_summary(temp.path(), &state, 3, 32).unwrap();
-        assert_eq!(recovered.indexes.len(), 1);
-        assert_eq!(recovered.indexes[0].index_id, result.indexes[0].index_id);
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].index_id, result[0].index_id);
         let store = FileStore::open(temp.path(), Default::default()).unwrap();
         let page = orchestrator_store::read_indexes(
             &store,

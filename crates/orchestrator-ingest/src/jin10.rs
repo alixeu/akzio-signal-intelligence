@@ -5,16 +5,12 @@ use orchestrator_core::{config_float, config_int, config_str};
 use reqwest::Client;
 use serde_json::{json, Value};
 use std::{
-    fs,
-    io::Write,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
     time::Duration as StdDuration,
 };
 
 const API_URL: &str = "https://4a735ea38f8146198dc205d2e2d1bd28.z3c.jin10.com/flash";
 const TIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
-static OUTPUT_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Args, Default)]
 pub struct Jin10Args {
@@ -143,74 +139,15 @@ pub async fn run(args: Jin10Args) -> Result<Value> {
         if !contents.is_empty() {
             contents.push('\n');
         }
-        write_text_atomic(path, &contents)?;
+        orchestrator_store::publish_bytes_atomic(path, contents.as_bytes())?;
     }
     if !args.output.is_empty() {
-        write_text_atomic(
+        orchestrator_store::publish_bytes_atomic(
             Path::new(&args.output),
-            &serde_json::to_string_pretty(&result)?,
+            serde_json::to_string_pretty(&result)?.as_bytes(),
         )?;
     }
     Ok(result)
-}
-
-/// A Jin10 fetch either publishes its whole snapshot or leaves the prior one
-/// untouched. The temporary file is adjacent to the target, so rename never
-/// crosses filesystems and readers never observe a partially fetched feed.
-fn write_text_atomic(path: &Path, contents: &str) -> Result<()> {
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent).with_context(|| {
-        format!(
-            "failed to create Jin10 output directory {}",
-            parent.display()
-        )
-    })?;
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty())
-        .context("Jin10 output path must have a UTF-8 file name")?;
-    for _ in 0..32 {
-        let counter = OUTPUT_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let temp = parent.join(format!(".{file_name}.tmp-{}-{counter}", std::process::id()));
-        let result = (|| -> Result<()> {
-            let mut file = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temp)
-                .with_context(|| {
-                    format!("failed to create temporary Jin10 output {}", temp.display())
-                })?;
-            file.write_all(contents.as_bytes())?;
-            file.flush()?;
-            file.sync_all()?;
-            drop(file);
-            fs::rename(&temp, path)?;
-            fs::File::open(parent)?.sync_all()?;
-            Ok(())
-        })();
-        match result {
-            Ok(()) => return Ok(()),
-            Err(error)
-                if error
-                    .downcast_ref::<std::io::Error>()
-                    .is_some_and(|io| io.kind() == std::io::ErrorKind::AlreadyExists) =>
-            {
-                continue
-            }
-            Err(error) => {
-                let _ = fs::remove_file(&temp);
-                return Err(error);
-            }
-        }
-    }
-    bail!(
-        "failed to allocate an adjacent temporary Jin10 output for {}",
-        path.display()
-    )
 }
 
 fn persist_jin10_csv(csv_dir: &Path, date: &str, items: &[Value]) -> Result<PathBuf> {
@@ -227,7 +164,10 @@ fn persist_jin10_csv(csv_dir: &Path, date: &str, items: &[Value]) -> Result<Path
         })
         .collect::<Vec<_>>();
     let path = orchestrator_core::jin10_csv_path(csv_dir, date);
-    orchestrator_core::write_jin10_csv(&path, &rows)?;
+    orchestrator_store::publish_bytes_atomic(
+        &path,
+        orchestrator_core::render_jin10_csv(&rows).as_bytes(),
+    )?;
     Ok(path)
 }
 
@@ -390,7 +330,7 @@ mod tests {
         let path = directory.path().join("snapshot.jsonl");
         std::fs::write(&path, "old\n").unwrap();
 
-        write_text_atomic(&path, "new-one\nnew-two\n").unwrap();
+        orchestrator_store::publish_bytes_atomic(&path, b"new-one\nnew-two\n").unwrap();
 
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),

@@ -30,7 +30,7 @@ pub use config::{
 };
 pub use jin10_csv::{
     default_jin10_csv_dir, jin10_csv_path, jin10_item_id, load_jin10_csv, load_jin10_csv_recent,
-    load_jin10_csv_recent_from_dir, parse_jin10_csv, read_jin10_csv, write_jin10_csv, Jin10CsvRow,
+    load_jin10_csv_recent_from_dir, parse_jin10_csv, read_jin10_csv, render_jin10_csv, Jin10CsvRow,
     DEFAULT_JIN10_CSV_DIR,
 };
 pub use paths::{default_project_root, project_path};
@@ -42,8 +42,8 @@ pub use reflection::{MarketRegime, Scope};
 pub use technical_csv::{
     close_on_or_after, close_on_or_before, closes_for_correlation, default_technical_csv_dir,
     interval_file_label, latest_close, latest_indicator, latest_snapshot, parse_technical_csv,
-    read_technical_csv, render_csv_file_blocks, storage_interval, technical_csv_filename,
-    technical_csv_path, write_technical_csv, TechnicalCsvRow, DEFAULT_TECHNICAL_BARS,
+    read_technical_csv, render_csv_file_blocks, render_technical_csv, storage_interval,
+    technical_csv_filename, technical_csv_path, TechnicalCsvRow, DEFAULT_TECHNICAL_BARS,
     DEFAULT_TECHNICAL_CSV_DIR,
 };
 pub use ticker::{display_ticker, parse_tickers, run_slug, slug_ticker};

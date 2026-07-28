@@ -140,13 +140,14 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let csv_dir = temp.path().join(orchestrator_core::DEFAULT_JIN10_CSV_DIR);
         let path = orchestrator_core::jin10_csv_path(&csv_dir, "2026-07-21");
-        orchestrator_core::write_jin10_csv(
+        orchestrator_store::publish_bytes_atomic(
             &path,
-            &[orchestrator_core::Jin10CsvRow {
+            orchestrator_core::render_jin10_csv(&[orchestrator_core::Jin10CsvRow {
                 id: "event-1".into(),
                 time: "2026-07-21 12:00:00".into(),
                 content: "Fed CPI update".into(),
-            }],
+            }])
+            .as_bytes(),
         )
         .unwrap();
         let result = execute(

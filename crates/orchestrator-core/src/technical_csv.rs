@@ -8,7 +8,6 @@
 use anyhow::{bail, Context, Result};
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 pub const DEFAULT_TECHNICAL_CSV_DIR: &str = "outputs/store/data/technical";
@@ -67,11 +66,7 @@ pub struct TechnicalCsvRow {
 
 /// Write feature rows as CSV. `rows` should already be trimmed to the keep window
 /// and ordered oldest → newest.
-pub fn write_technical_csv(path: &Path, rows: &[TechnicalCsvRow]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create technical csv dir {}", parent.display()))?;
-    }
+pub fn render_technical_csv(rows: &[TechnicalCsvRow]) -> String {
     let mut columns: BTreeSet<String> = BTreeSet::new();
     for row in rows {
         columns.extend(row.values.keys().cloned());
@@ -111,9 +106,7 @@ pub fn write_technical_csv(path: &Path, rows: &[TechnicalCsvRow]) -> Result<()> 
         }
         out.push('\n');
     }
-    write_text_atomic(path, &out)
-        .with_context(|| format!("failed to write technical csv {}", path.display()))?;
-    Ok(())
+    out
 }
 
 fn safe_ticker_component(symbol: &str) -> String {
@@ -131,35 +124,6 @@ fn safe_ticker_component(symbol: &str) -> String {
         &readable
     };
     format!("{}-{hash}", &prefix[..prefix.len().min(48)])
-}
-
-fn write_text_atomic(path: &Path, contents: &str) -> Result<()> {
-    let parent = path
-        .parent()
-        .context("technical csv path must have a parent directory")?;
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .context("technical csv path must have a UTF-8 file name")?;
-    let temp = parent.join(format!(".{file_name}.tmp-{}", std::process::id()));
-    let result = (|| -> Result<()> {
-        let mut file = fs::File::create(&temp).with_context(|| {
-            format!(
-                "failed to create temporary technical csv {}",
-                temp.display()
-            )
-        })?;
-        file.write_all(contents.as_bytes())?;
-        file.flush()?;
-        file.sync_all()?;
-        fs::rename(&temp, path)?;
-        fs::File::open(parent)?.sync_all()?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temp);
-    }
-    result
 }
 
 pub fn read_technical_csv(path: &Path) -> Result<Vec<TechnicalCsvRow>> {
@@ -408,7 +372,7 @@ mod tests {
                 values: HashMap::from([("Close".into(), 101.0), ("Return".into(), 0.01)]),
             },
         ];
-        write_technical_csv(&path, &rows).unwrap();
+        std::fs::write(&path, render_technical_csv(&rows)).unwrap();
         let loaded = read_technical_csv(&path).unwrap();
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded[1].date, "2026-01-02");

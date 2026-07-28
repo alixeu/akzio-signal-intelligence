@@ -1,5 +1,3 @@
-#![allow(dead_code)] // allocation prompt projection is used by the allocation report entrypoint.
-
 use anyhow::{bail, Result};
 use orchestrator_core::{config_get, PortfolioAllocation};
 use serde_json::{json, Value};
@@ -99,48 +97,6 @@ pub(crate) fn compute_allocation_context(
         "correlation_warning": correlation_warning,
         "max_single_position": config.max_single_position
     }))
-}
-
-pub(crate) fn allocation_prompt_context(context: &Value) -> Value {
-    let risk_constraints = context
-        .get("risk_debate_state")
-        .and_then(|value| value.get("history"))
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|turn| turn.get("artifact"))
-        .map(|artifact| {
-            json!({
-                "role": artifact.get("role").cloned().unwrap_or(Value::Null),
-                "stance": artifact.get("stance").cloned().unwrap_or(Value::Null),
-                "position_cap_pct": artifact.get("position_cap_pct").cloned().unwrap_or(Value::Null),
-                "max_drawdown_pct": artifact.get("max_drawdown_pct").cloned().unwrap_or(Value::Null),
-                "rebalance_trigger": artifact.get("rebalance_trigger").cloned().unwrap_or(Value::Null),
-                "risk_off_trigger": artifact.get("risk_off_trigger").cloned().unwrap_or(Value::Null),
-                "unique_risk_contribution": artifact.get("unique_risk_contribution").cloned().unwrap_or(Value::Null)
-            })
-        })
-        .collect::<Vec<_>>();
-    json!({
-        "investable_assets": context.get("investable_assets").cloned().unwrap_or_else(|| json!([])),
-        "vix": context.get("vix").cloned().unwrap_or(Value::Null),
-        "per_ticker": context.get("per_ticker").cloned().unwrap_or_else(|| json!({})),
-        "trader_plan": context.get("trader_plan").map(|plan| json!({
-            "action": plan.get("action").cloned().unwrap_or(Value::Null),
-            "position_size_pct_max": plan.get("position_size_pct_max").cloned().unwrap_or(Value::Null),
-            "rationale": plan.get("rationale").cloned().unwrap_or(Value::Null)
-        })).unwrap_or(Value::Null),
-        "risk_constraints": risk_constraints,
-        "final_trade_decision": context.get("final_trade_decision").map(|decision| json!({
-            "rating": decision.get("rating").cloned().unwrap_or(Value::Null),
-            "execution_summary": decision.get("execution_summary").cloned().unwrap_or(Value::Null),
-            "risk_controls": decision.get("risk_controls").cloned().unwrap_or_else(|| json!([])),
-            "per_asset": decision.get("per_asset").cloned().unwrap_or_else(|| json!({}))
-        })).unwrap_or(Value::Null),
-        "correlation_60d": context.get("correlation_60d").cloned().unwrap_or(Value::Null),
-        "correlation_warning": context.get("correlation_warning").cloned().unwrap_or(Value::Null),
-        "max_single_position": context.get("max_single_position").cloned().unwrap_or(Value::Null)
-    })
 }
 
 pub(crate) fn normalize_allocation(
@@ -773,25 +729,15 @@ impl AllocationConfig {
                     .map(|s| s.to_string())
                     .collect()
             });
-        let correlation_window =
-            config_get(config, "orchestrator.allocation.correlation_window_days")
-                .and_then(Value::as_i64)
-                .unwrap_or(60) as usize;
         let max_single = config_get(config, "orchestrator.allocation.max_single_position")
             .and_then(Value::as_f64)
             .unwrap_or(0.70);
-        let vol_indicator = config_get(config, "orchestrator.allocation.vol_indicator")
-            .and_then(Value::as_str)
-            .unwrap_or("STD20")
-            .to_string();
         Self {
             investable_assets: investable,
             regime_signal,
             regime_thresholds,
             regime_labels,
-            correlation_window_days: correlation_window,
             max_single_position: max_single,
-            vol_indicator,
         }
     }
 }
@@ -811,9 +757,7 @@ mod tests {
                 "elevated".to_string(),
                 "defensive".to_string(),
             ],
-            correlation_window_days: 60,
             max_single_position: 0.70,
-            vol_indicator: "STD20".to_string(),
         }
     }
 

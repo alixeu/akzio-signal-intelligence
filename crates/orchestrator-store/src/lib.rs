@@ -25,8 +25,8 @@ mod store;
 pub use orchestrator_core::ToolManagedProfile;
 
 pub use atomic::{
-    rename_dir_atomic, write_bytes_atomic, write_bytes_atomic_with_options, write_json_atomic,
-    AtomicWriteOptions,
+    publish_bytes_atomic, rename_dir_atomic, write_bytes_atomic, write_bytes_atomic_with_options,
+    write_json_atomic, AtomicWriteOptions,
 };
 pub use doctor::{
     inspect_store, rebuild_experience_stats, rebuild_index_catalog, rebuild_run_manifest,

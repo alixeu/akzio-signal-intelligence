@@ -4,7 +4,7 @@ use clap::Args;
 use futures::{stream, StreamExt};
 use orchestrator_core::{
     config_bool, config_int, config_str, config_strings, default_technical_csv_dir, parse_tickers,
-    read_technical_csv, technical_csv_path, write_technical_csv, TechnicalCsvRow,
+    read_technical_csv, render_technical_csv, technical_csv_path, TechnicalCsvRow,
     DEFAULT_TECHNICAL_BARS,
 };
 use reqwest::header;
@@ -485,12 +485,13 @@ async fn download_technical_csv(
     }
     let csv_path = technical_csv_path(csv_dir, symbol, interval)
         .ok_or_else(|| anyhow::anyhow!("unsupported interval {interval:?}"))?;
-    write_technical_csv(&csv_path, &csv_rows).with_context(|| {
-        format!(
-            "failed to persist {provider} technical data for {symbol}/{interval} to {}",
-            csv_path.display()
-        )
-    })?;
+    orchestrator_store::publish_bytes_atomic(&csv_path, render_technical_csv(&csv_rows).as_bytes())
+        .with_context(|| {
+            format!(
+                "failed to persist {provider} technical data for {symbol}/{interval} to {}",
+                csv_path.display()
+            )
+        })?;
     Ok(json!({
         "symbol": symbol,
         "interval": interval,
