@@ -11,7 +11,7 @@ async fn mock_exec_writes_file_store_manifest_and_indexes() {
         .unwrap();
 
     assert_eq!(
-        result["run_state"]["research_plan"]["payload"]["per_ticker"]["QQQ"]["long_probability"],
+        result["run_state"]["research_plan"]["per_ticker"]["QQQ"]["long_probability"],
         0.5
     );
     assert!(has_file_named(&store_root.join("runs"), "manifest.json"));

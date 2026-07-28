@@ -322,8 +322,9 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         "store_root": store.root(),
         "debate_mode": "file_store",
         "degraded": state["degraded"],
-        "rating": state
-            .pointer("/research_plan/payload/primary/rating")
+        "rating": tickers_from_state(&state)
+            .first()
+            .and_then(|ticker| state.pointer(&format!("/research_plan/per_ticker/{ticker}/rating")))
             .cloned()
             .unwrap_or(Value::Null),
         "action": tickers_from_state(&state)
@@ -1042,20 +1043,30 @@ async fn run_phase3(
     model: Option<&str>,
     reasoning: Option<&str>,
 ) -> Result<()> {
-    let artifact = run_unit(
-        state,
-        runtime,
-        "manager.research",
-        3,
-        "artifact",
-        None,
-        None,
-        None,
-        model,
-        reasoning,
-    )
-    .await?;
-    state["research_plan"] = artifact;
+    let mut per_ticker = serde_json::Map::new();
+    for ticker in tickers_from_state(state) {
+        let artifact = run_unit(
+            state,
+            runtime,
+            "manager.research",
+            3,
+            "artifact",
+            None,
+            None,
+            Some(&ticker),
+            model,
+            reasoning,
+        )
+        .await?;
+        let decision = artifact
+            .pointer("/payload/decision")
+            .cloned()
+            .context("finalized research artifact is missing its typed decision payload")?;
+        per_ticker.insert(ticker, decision);
+    }
+    // This is an in-memory Rust aggregate view for downstream phases. The
+    // per-ticker canonical Artifacts remain the only persisted authority.
+    state["research_plan"] = json!({"per_ticker": per_ticker, "authority": "file_store"});
     Ok(())
 }
 
@@ -1385,10 +1396,8 @@ fn finalize_degraded_tool_managed_unit(
         .unwrap_or_else(|| tickers_from_state(state));
     let trade_candidate_action = tickers.first().and_then(|ticker| {
         state
-            .pointer(&format!(
-                "/research_plan/payload/per_ticker/{ticker}/rating"
-            ))
-            .or_else(|| state.pointer("/research_plan/payload/primary/rating"))
+            .pointer(&format!("/research_plan/per_ticker/{ticker}/rating"))
+            .or_else(|| state.pointer("/research_plan/rating"))
             .and_then(Value::as_str)
             .map(|rating| match rating {
                 "Buy" | "Overweight" => "Buy",
@@ -1399,10 +1408,8 @@ fn finalize_degraded_tool_managed_unit(
     });
     let portfolio_rating = tickers.first().and_then(|ticker| {
         state
-            .pointer(&format!(
-                "/research_plan/payload/per_ticker/{ticker}/rating"
-            ))
-            .or_else(|| state.pointer("/research_plan/payload/primary/rating"))
+            .pointer(&format!("/research_plan/per_ticker/{ticker}/rating"))
+            .or_else(|| state.pointer("/research_plan/rating"))
             .and_then(Value::as_str)
             .map(ToOwned::to_owned)
     });

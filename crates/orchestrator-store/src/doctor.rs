@@ -265,20 +265,33 @@ fn validate_generic_document(value: &Value, path: &Path) -> Result<()> {
             kind: "authoritative file".to_owned(),
             path: path.to_path_buf(),
         })?;
-    if schema_version > 1 {
+    let current = if path
+        .components()
+        .any(|component| component.as_os_str() == "artifacts")
+        && object
+            .get("profile")
+            .cloned()
+            .and_then(|profile| serde_json::from_value::<crate::ToolManagedProfile>(profile).ok())
+            .is_some()
+    {
+        crate::domain::DOMAIN_ARTIFACT_SCHEMA_VERSION
+    } else {
+        1
+    };
+    if schema_version > current {
         return Err(StoreError::UnsupportedFutureSchema {
             kind: "authoritative file".to_owned(),
             path: path.to_path_buf(),
             found: schema_version,
-            current: 1,
+            current,
         });
     }
-    if schema_version < 1 {
+    if schema_version < current {
         return Err(StoreError::MigrationRequired {
             kind: "authoritative file".to_owned(),
             path: path.to_path_buf(),
             found: schema_version,
-            current: 1,
+            current,
         });
     }
     validate_content_hash_at(value, path)
@@ -1201,6 +1214,19 @@ mod tests {
         )
         .unwrap();
         assert!(rebuilt.artifacts.contains_key("artifact-QQQ"));
+    }
+
+    #[test]
+    fn doctor_accepts_the_current_domain_artifact_schema() {
+        let path = Path::new("runs/2026-07-27/run-x/artifacts/phase1/QQQ.json");
+        let value = crate::set_content_hash(&serde_json::json!({
+            "schema_version": crate::domain::DOMAIN_ARTIFACT_SCHEMA_VERSION,
+            "artifact_id": "artifact-QQQ",
+            "profile": "analyst_report"
+        }))
+        .unwrap();
+
+        super::validate_generic_document(&value, path).unwrap();
     }
 
     #[test]

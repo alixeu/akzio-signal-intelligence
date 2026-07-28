@@ -127,9 +127,8 @@ pub struct PortfolioDecisionFinalizePolicy {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResearchDecisionPayload {
-    pub primary: ResearchDecision,
-    pub per_ticker: BTreeMap<String, ResearchDecision>,
-    pub decision_hinges: BTreeMap<String, Vec<String>>,
+    pub decision: ResearchDecision,
+    pub decision_hinges: Vec<String>,
 }
 
 /// The one persisted envelope shared by all typed ToolManaged payloads.
@@ -608,51 +607,47 @@ pub fn finalize_research_decision(
         return Err(profile_state_error("research_decision").unwrap_err());
     };
     ensure_exact_tickers(&state.decisions, expected_tickers, "research decision")?;
-    let mut per_ticker = BTreeMap::new();
-    let mut hinges = BTreeMap::new();
-    for (ticker, entry) in &state.decisions {
-        let per = research_value(entry)?;
-        let decision: ResearchDecision = serde_json::from_value(per.clone())
-            .map_err(|source| StoreError::JsonSerialize { source })?;
-        validate_research_decision(&decision).map_err(|error| StoreError::InvalidDocument {
-            kind: "research finalizer",
-            message: format!("{ticker}: {error}"),
-        })?;
-        per_ticker.insert(ticker.clone(), decision);
-        hinges.insert(ticker.clone(), entry.decision_hinges.clone());
-    }
-    let first = state
-        .decisions
-        .values()
-        .next()
+    let ticker = scope
+        .ticker
+        .as_deref()
         .ok_or_else(|| StoreError::InvalidDocument {
             kind: "research finalizer",
-            message: "at least one ticker is required".to_owned(),
+            message: "research artifact scope requires one Rust-owned ticker".to_owned(),
         })?;
-    let primary = ResearchDecision {
-        rating: first.rating.clone(),
-        long_probability: first.long_probability,
-        short_probability: first.short_probability,
-        confidence_basis: first.confidence_basis.clone(),
-        hold_reason: first.hold_reason.clone(),
-        plan: first.plan.clone(),
-        probability_rationale: first.probability_rationale.clone(),
-        scenarios: first.scenarios.clone(),
-    };
+    if expected_tickers != [ticker.to_owned()] {
+        return Err(StoreError::InvalidDocument {
+            kind: "research finalizer",
+            message: "research artifact scope ticker differs from its expected ticker unit"
+                .to_owned(),
+        });
+    }
+    let entry = state
+        .decisions
+        .get(ticker)
+        .ok_or_else(|| StoreError::InvalidDocument {
+            kind: "research finalizer",
+            message: format!("research decision missing ticker {ticker}"),
+        })?;
+    let decision: ResearchDecision = serde_json::from_value(research_value(entry)?)
+        .map_err(|source| StoreError::JsonSerialize { source })?;
+    validate_research_decision(&decision).map_err(|error| StoreError::InvalidDocument {
+        kind: "research finalizer",
+        message: format!("{ticker}: {error}"),
+    })?;
     let artifact = CanonicalArtifact::new(
         scope,
         artifact_id(scope, "research")?,
         ResearchDecisionPayload {
-            primary,
-            per_ticker,
-            decision_hinges: hinges,
+            decision,
+            decision_hinges: entry.decision_hinges.clone(),
         },
         state.metadata.evidence_refs.into_iter().collect(),
         created_at,
     );
-    let relative = PathBuf::from("artifacts")
-        .join("phase3")
-        .join("research-decision.json");
+    let relative = PathBuf::from("artifacts").join("phase3").join(format!(
+        "{}.json",
+        SafeSlug::new("ticker", ticker)?.as_str()
+    ));
     Ok(DomainFinalizeOutcome::Research(Box::new(
         finalize_draft_atomic(store, location, scope, &relative, artifact, created_at)?,
     )))

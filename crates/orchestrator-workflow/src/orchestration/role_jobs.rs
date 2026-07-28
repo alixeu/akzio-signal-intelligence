@@ -494,13 +494,13 @@ fn trade_candidate_action(state: &Value, tickers: &[String]) -> Option<String> {
     let ticker = tickers.first()?;
     state
         .get("research_plan")
-        .and_then(|plan| plan.pointer("/payload/per_ticker"))
+        .and_then(|plan| plan.get("per_ticker"))
         .and_then(|items| items.get(ticker))
         .and_then(|item| item.get("rating"))
         .or_else(|| {
             state
                 .get("research_plan")
-                .and_then(|plan| plan.pointer("/payload/primary/rating"))
+                .and_then(|plan| plan.get("rating"))
         })
         .and_then(Value::as_str)
         .map(|rating| match rating {
@@ -515,14 +515,14 @@ fn portfolio_rating(state: &Value, tickers: &[String]) -> Option<String> {
     let ticker = tickers.first()?;
     state
         .get("research_plan")
-        .and_then(|plan| plan.pointer("/payload/per_ticker"))
+        .and_then(|plan| plan.get("per_ticker"))
         .and_then(Value::as_object)
         .and_then(|items| items.get(ticker))
         .and_then(|item| item.get("rating"))
         .or_else(|| {
             state
                 .get("research_plan")
-                .and_then(|plan| plan.pointer("/payload/primary/rating"))
+                .and_then(|plan| plan.get("rating"))
         })
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)

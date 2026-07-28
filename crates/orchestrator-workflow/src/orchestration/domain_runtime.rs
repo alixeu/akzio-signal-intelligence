@@ -102,6 +102,7 @@ pub(crate) fn file_store_domain_runtime(
     if matches!(
         plan.profile,
         ToolManagedProfile::AnalystReport
+            | ToolManagedProfile::ResearchDecision
             | ToolManagedProfile::TradeIntent
             | ToolManagedProfile::RiskReview
             | ToolManagedProfile::PortfolioDecision
@@ -126,6 +127,7 @@ pub(crate) fn file_store_domain_runtime(
     let unit_key = if matches!(
         plan.profile,
         ToolManagedProfile::AnalystReport
+            | ToolManagedProfile::ResearchDecision
             | ToolManagedProfile::TradeIntent
             | ToolManagedProfile::RiskReview
             | ToolManagedProfile::PortfolioDecision
@@ -170,6 +172,7 @@ pub(crate) fn file_store_domain_runtime(
         ticker: matches!(
             plan.profile,
             ToolManagedProfile::AnalystReport
+                | ToolManagedProfile::ResearchDecision
                 | ToolManagedProfile::TradeIntent
                 | ToolManagedProfile::RiskReview
                 | ToolManagedProfile::PortfolioDecision
@@ -1530,7 +1533,7 @@ mod tests {
         )
         .unwrap();
 
-        let decision = &artifact["payload"]["per_ticker"]["QQQ"];
+        let decision = &artifact["payload"]["decision"];
         assert_eq!(decision["rating"], "Hold");
         assert_eq!(decision["confidence_basis"], "data_insufficient");
         assert_eq!(decision["hold_reason"], "evidence_insufficient");
