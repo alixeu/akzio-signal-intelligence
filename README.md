@@ -113,7 +113,7 @@ When no material hinge exists, Phase 2 records a no-debate artifact and still
 advances to Phase 3.
 
 Trader, the three parallel risk reviewers, and Portfolio Manager are
-mandatory in the default `legacy` policy. Phase 6 emits only per-asset semantic
+mandatory in the default workflow policy. Phase 6 emits only per-asset semantic
 constraints; it cannot read accounts, calculate quantities, or submit orders.
 Phase 7 computes and validates target weights in Rust, projects those weights
 through the Phase 6 direction/cap/delta constraints, and refreshes current
@@ -132,7 +132,7 @@ migration before they can become v2 artifacts.
 |---|---|---|---|---|---|
 | Phase 4 `TradeIntent` | `position_size` free-form string | required numeric `position_size_pct_max` in `[0, 1]` | no implicit cap; Hold / `execution_decision=hold` requires `0` | Rust Phase 7 allocation and execution | reject invalid or legacy payload; degrade through the workflow policy, never parse percentage prose |
 | Phase 5 `RiskConstraints` | `tight`, `trailing`, `event_based`, `time_based`, and empty `stop_type` | required `stop_type`: `hard`, `soft`, or `none` | no implicit stop type | Phase 6 portfolio constraint builder and report renderer | reject at deserialization; no enum remapping |
-| Phase 6 binding controls | `binding_risk_controls: ["free-form text"]` | `binding_risk_controls: [{"control":"…","source_refs":["…"]}]` | control and each source reference are non-empty; the control array itself defaults only to `[]` | Rust allocation projection, audit, and report detail | reject string controls or untraceable bindings |
+| Phase 6 binding controls | `binding_risk_controls: ["free-form text"]` | `binding_risk_controls: [{"control":"…","source_refs":["…"]}]` | control and each source reference are non-empty; provide an explicit empty array when there are none | Rust allocation projection, audit, and report detail | reject string controls or untraceable bindings |
 | Phase 1 evidence | `speculation`, `unclassified`, aliases, and string evidence | required `evidence_type`: `fact`, `opinion`, or `inference` | no type inference or alias normalization | evidence reducers and conflict analysis | reject non-v2 evidence; the role may use its normal degraded policy |
 
 Contract validation lives in `orchestrator-core` so builders, finalizers, and

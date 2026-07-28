@@ -492,9 +492,9 @@ pub fn retrieval_audit(turn: &Turn) -> Value {
             TurnItemType::ToolCall
                 if matches!(
                     item.tool_name.as_str(),
-                    tools::READ_INDEXES_TOOL_NAME
-                        | tools::READ_INDEX_DETAILS_TOOL_NAME
-                        | tools::READ_REFLECTION_SOURCE_TOOL_NAME
+                    tools::index_tools::READ_INDEXES_NAME
+                        | tools::index_tools::READ_INDEX_DETAILS_NAME
+                        | tools::read_reflection_source::NAME
                 ) =>
             {
                 let arguments = item
@@ -504,10 +504,10 @@ pub fn retrieval_audit(turn: &Turn) -> Value {
                     .unwrap_or(Value::Null);
                 let signature = format!("{}:{}", item.tool_name, canonical_value(&arguments));
                 *signatures.entry(signature).or_default() += 1;
-                if item.tool_name == tools::READ_INDEXES_TOOL_NAME {
+                if item.tool_name == tools::index_tools::READ_INDEXES_NAME {
                     summary_query_count += 1;
                     summary_filters.push(arguments.clone());
-                } else if item.tool_name == tools::READ_INDEX_DETAILS_TOOL_NAME {
+                } else if item.tool_name == tools::index_tools::READ_INDEX_DETAILS_NAME {
                     detail_call_count += 1;
                     if let Some(summary_id) = arguments.get("index_id").and_then(Value::as_str) {
                         expanded_summary_ids.push(summary_id.to_string());
@@ -530,7 +530,7 @@ pub fn retrieval_audit(turn: &Turn) -> Value {
                 let Some(output) = tool_result_output(item) else {
                     continue;
                 };
-                if item.tool_name == tools::READ_INDEXES_TOOL_NAME {
+                if item.tool_name == tools::index_tools::READ_INDEXES_NAME {
                     if item.status == Some(AgentItemStatus::Completed) {
                         successful_summary_query_count += 1;
                         if let Some(arguments) = call_args.get(&item.tool_call_id) {
@@ -561,7 +561,7 @@ pub fn retrieval_audit(turn: &Turn) -> Value {
                             }
                         }
                     }
-                } else if item.tool_name == tools::READ_INDEX_DETAILS_TOOL_NAME {
+                } else if item.tool_name == tools::index_tools::READ_INDEX_DETAILS_NAME {
                     any_truncated |= output
                         .get("truncated")
                         .and_then(Value::as_bool)
@@ -1696,7 +1696,7 @@ impl ProjectToolRuntime {
     }
 
     /// Attach the one typed FileStore Index domain runtime for a migrated
-    /// unit. Absence is intentional: legacy roles never gain a fallback path
+    /// unit. Absence is intentional: profiles without an Index writer never gain a fallback path
     /// to Index persistence.
     pub fn with_index_tool_runtime(
         mut self,
@@ -1708,7 +1708,7 @@ impl ProjectToolRuntime {
     }
 
     /// Attach the one typed FileStore business-domain runtime for a migrated
-    /// unit.  Absence is intentional: legacy jobs can never invoke a domain
+    /// unit.  Absence is intentional: profiles without a domain writer can never invoke a domain
     /// writer as an implicit fallback.
     pub fn with_domain_tool_runtime(
         mut self,
@@ -1788,18 +1788,18 @@ impl LoopToolRuntime for ProjectToolRuntime {
             let configured = available_tools.iter().any(|name| name == &call.name);
             let is_index_tool = matches!(
                 call.name.as_str(),
-                tools::CREATE_INDEX_TOOL_NAME
-                    | tools::APPEND_INDEX_DETAIL_TOOL_NAME
-                    | tools::FINALIZE_INDEX_TOOL_NAME
-                    | tools::READ_INDEXES_TOOL_NAME
-                    | tools::READ_INDEX_DETAILS_TOOL_NAME
+                tools::index_tools::CREATE_INDEX_NAME
+                    | tools::index_tools::APPEND_INDEX_DETAIL_NAME
+                    | tools::index_tools::FINALIZE_INDEX_NAME
+                    | tools::index_tools::READ_INDEXES_NAME
+                    | tools::index_tools::READ_INDEX_DETAILS_NAME
             );
             let is_domain_tool = tools::domain_tools::is_domain_tool(&call.name);
             let index_write_tool = matches!(
                 call.name.as_str(),
-                tools::CREATE_INDEX_TOOL_NAME
-                    | tools::APPEND_INDEX_DETAIL_TOOL_NAME
-                    | tools::FINALIZE_INDEX_TOOL_NAME
+                tools::index_tools::CREATE_INDEX_NAME
+                    | tools::index_tools::APPEND_INDEX_DETAIL_NAME
+                    | tools::index_tools::FINALIZE_INDEX_NAME
             );
             let enabled = call.name == "think"
                 || tools::enabled_tool_names(web_run_config, config.alpaca_market_data)
@@ -1926,7 +1926,7 @@ impl LoopToolRuntime for ProjectToolRuntime {
                     },
                 };
             }
-            if name == tools::WEB_RUN_TOOL_NAME {
+            if name == tools::web_run::NAME {
                 let output = if let Some(web_run) = &web_run {
                     web_run.execute(call.arguments).await
                 } else {

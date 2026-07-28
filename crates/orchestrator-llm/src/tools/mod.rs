@@ -20,47 +20,6 @@ use crate::tools::domain_tools::EvidenceReadRecord;
 pub use crate::web_search::{WebSearchConfig, WebSearchProvider};
 pub use web_run::Runtime as WebRunRuntime;
 
-pub const WEB_RUN_TOOL_NAME: &str = web_run::NAME;
-pub const READ_REFLECTION_SOURCE_TOOL_NAME: &str = read_reflection_source::NAME;
-pub const CREATE_INDEX_TOOL_NAME: &str = index_tools::CREATE_INDEX_NAME;
-pub const APPEND_INDEX_DETAIL_TOOL_NAME: &str = index_tools::APPEND_INDEX_DETAIL_NAME;
-pub const FINALIZE_INDEX_TOOL_NAME: &str = index_tools::FINALIZE_INDEX_NAME;
-pub const READ_INDEXES_TOOL_NAME: &str = index_tools::READ_INDEXES_NAME;
-pub const READ_INDEX_DETAILS_TOOL_NAME: &str = index_tools::READ_INDEX_DETAILS_NAME;
-pub const SET_ANALYST_ASSESSMENT_TOOL_NAME: &str = domain_tools::SET_ANALYST_ASSESSMENT;
-pub const APPEND_ANALYST_EVIDENCE_TOOL_NAME: &str = domain_tools::APPEND_ANALYST_EVIDENCE;
-pub const APPEND_ANALYST_DATA_GAP_TOOL_NAME: &str = domain_tools::APPEND_ANALYST_DATA_GAP;
-pub const SET_ANALYST_INVALIDATION_TOOL_NAME: &str = domain_tools::SET_ANALYST_INVALIDATION;
-pub const FINALIZE_ANALYST_REPORT_TOOL_NAME: &str = domain_tools::FINALIZE_ANALYST_REPORT;
-pub const SET_RESEARCH_DECISION_TOOL_NAME: &str = domain_tools::SET_RESEARCH_DECISION;
-pub const SET_RESEARCH_SCENARIOS_TOOL_NAME: &str = domain_tools::SET_RESEARCH_SCENARIOS;
-pub const APPEND_RESEARCH_HINGE_TOOL_NAME: &str = domain_tools::APPEND_RESEARCH_HINGE;
-pub const FINALIZE_RESEARCH_DECISION_TOOL_NAME: &str = domain_tools::FINALIZE_RESEARCH_DECISION;
-pub const SET_TRADE_INTENT_TOOL_NAME: &str = domain_tools::SET_TRADE_INTENT;
-pub const APPEND_TRADE_BLOCKER_TOOL_NAME: &str = domain_tools::APPEND_TRADE_BLOCKER;
-pub const FINALIZE_TRADE_INTENT_TOOL_NAME: &str = domain_tools::FINALIZE_TRADE_INTENT;
-pub const SET_RISK_ASSESSMENT_TOOL_NAME: &str = domain_tools::SET_RISK_ASSESSMENT;
-pub const SET_RISK_CONSTRAINTS_TOOL_NAME: &str = domain_tools::SET_RISK_CONSTRAINTS;
-pub const FINALIZE_RISK_REVIEW_TOOL_NAME: &str = domain_tools::FINALIZE_RISK_REVIEW;
-pub const SET_PORTFOLIO_ASSET_DECISION_TOOL_NAME: &str = domain_tools::SET_PORTFOLIO_ASSET_DECISION;
-pub const APPEND_BINDING_RISK_CONTROL_TOOL_NAME: &str = domain_tools::APPEND_BINDING_RISK_CONTROL;
-pub const FINALIZE_PORTFOLIO_DECISION_TOOL_NAME: &str = domain_tools::FINALIZE_PORTFOLIO_DECISION;
-pub const SET_PHASE2_COMMON_GROUND_TOOL_NAME: &str = domain_tools::SET_PHASE2_COMMON_GROUND;
-pub const CREATE_PHASE2_TOPIC_TOOL_NAME: &str = domain_tools::CREATE_PHASE2_TOPIC;
-pub const FINALIZE_RESEARCHER_WARMUP_TOOL_NAME: &str = domain_tools::FINALIZE_RESEARCHER_WARMUP;
-pub const FINALIZE_TOPIC_GENERATION_TOOL_NAME: &str = domain_tools::FINALIZE_TOPIC_GENERATION;
-pub const CREATE_DEBATE_CLAIM_TOOL_NAME: &str = domain_tools::CREATE_DEBATE_CLAIM;
-pub const FINALIZE_DEBATE_SEED_TOOL_NAME: &str = domain_tools::FINALIZE_DEBATE_SEED;
-pub const RESPOND_TO_DEBATE_CLAIM_TOOL_NAME: &str = domain_tools::RESPOND_TO_DEBATE_CLAIM;
-pub const FINALIZE_DEBATE_RESPONSE_TOOL_NAME: &str = domain_tools::FINALIZE_DEBATE_RESPONSE;
-pub const SET_CLAIM_STATUS_TOOL_NAME: &str = domain_tools::SET_CLAIM_STATUS;
-pub const ADD_AGREED_FACT_TOOL_NAME: &str = domain_tools::ADD_AGREED_FACT;
-pub const SET_DECISION_HINGE_TOOL_NAME: &str = domain_tools::SET_DECISION_HINGE;
-pub const ROUTE_DEBATE_STEER_TOOL_NAME: &str = domain_tools::ROUTE_DEBATE_STEER;
-pub const SET_TOPIC_SOFT_CONTROL_TOOL_NAME: &str = domain_tools::SET_TOPIC_SOFT_CONTROL;
-pub const FINALIZE_TOPIC_CONTROL_TOOL_NAME: &str = domain_tools::FINALIZE_TOPIC_CONTROL;
-pub const ALPACA_GET_NEWS_TOOL_NAME: &str = alpaca::GET_NEWS_NAME;
-
 #[derive(Debug, Clone)]
 pub struct ToolDefinition {
     pub name: String,
@@ -93,7 +52,7 @@ pub struct ExternalToolConfig {
     pub file_store_input: Option<FileStoreInputSnapshot>,
     /// Rust-owned historical task bootstrap for the migrated Phase 0
     /// reflector.  When present, `read_reflection_source` must not open the
-    /// legacy database.
+    /// retired database implementation.
     #[serde(skip)]
     pub file_store_reflection_source: Option<Value>,
 }
@@ -384,7 +343,7 @@ const REGISTRY: &[ToolEntry] = &[
     },
     // FileStore Index tools are discoverable by a migrated ToolManaged
     // profile, but are deliberately absent from `tool_names()` until the
-    // workflow injects an IndexToolRuntimeContext. Legacy runtime paths must
+    // workflow injects an IndexToolRuntimeContext. Generic tool runtimes must
     // never fall back to this store.
     ToolEntry {
         name: index_tools::CREATE_INDEX_NAME,
@@ -594,7 +553,7 @@ pub async fn execute_named_tool(
         | index_tools::FINALIZE_INDEX_NAME
         | index_tools::READ_INDEXES_NAME
         | index_tools::READ_INDEX_DETAILS_NAME => {
-            bail!("{name} requires a FileStore IndexToolRuntimeContext and is unavailable to the legacy runtime")
+            bail!("{name} requires a FileStore IndexToolRuntimeContext and is unavailable without that typed binding")
         }
         other => bail!("unknown tool name: {other}"),
     }

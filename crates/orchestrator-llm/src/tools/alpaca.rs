@@ -1,11 +1,12 @@
 use super::{api_tool_name, ExternalToolConfig, ToolDefinition};
 use anyhow::{bail, Context, Result};
+use orchestrator_core::ToolId;
 use reqwest::{Client, Response};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::time::Duration;
 
-pub const GET_NEWS_NAME: &str = "alpaca_get_news";
+pub const GET_NEWS_NAME: &str = ToolId::AlpacaGetNews.as_str();
 
 const MARKET_DATA_BASE_URL: &str = "https://data.alpaca.markets";
 

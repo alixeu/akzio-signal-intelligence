@@ -1,9 +1,10 @@
 use super::ToolDefinition;
+use orchestrator_core::ToolId;
 use serde_json::{json, Value};
 
 use super::api_tool_name;
 
-pub const NAME: &str = "think";
+pub const NAME: &str = ToolId::Think.as_str();
 
 pub fn definition() -> ToolDefinition {
     ToolDefinition {

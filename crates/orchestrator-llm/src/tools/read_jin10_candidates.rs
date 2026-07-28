@@ -1,10 +1,11 @@
 use super::{api_tool_name, log_tool_result, ExternalToolConfig, ToolDefinition};
 use anyhow::{Context, Result};
+use orchestrator_core::ToolId;
 use orchestrator_store::{InputSource, Jin10Format};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-pub const NAME: &str = "read_jin10_candidates";
+pub const NAME: &str = ToolId::ReadJin10Candidates.as_str();
 const DEFAULT_LIMIT: usize = 30;
 const MAX_LIMIT: usize = 50;
 

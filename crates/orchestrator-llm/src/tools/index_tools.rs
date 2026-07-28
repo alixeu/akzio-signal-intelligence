@@ -12,6 +12,7 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
+use orchestrator_core::ToolId;
 pub use orchestrator_store::{DetailSection, IndexKind};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
@@ -19,11 +20,11 @@ use serde_json::{json, Map, Value};
 use super::{api_tool_name, ToolDefinition};
 use crate::agent_loop::ToolRuntimeTurnContext;
 
-pub const CREATE_INDEX_NAME: &str = "create_index";
-pub const APPEND_INDEX_DETAIL_NAME: &str = "append_index_detail";
-pub const FINALIZE_INDEX_NAME: &str = "finalize_index";
-pub const READ_INDEXES_NAME: &str = "read_indexes";
-pub const READ_INDEX_DETAILS_NAME: &str = "read_index_details";
+pub const CREATE_INDEX_NAME: &str = ToolId::CreateIndex.as_str();
+pub const APPEND_INDEX_DETAIL_NAME: &str = ToolId::AppendIndexDetail.as_str();
+pub const FINALIZE_INDEX_NAME: &str = ToolId::FinalizeIndex.as_str();
+pub const READ_INDEXES_NAME: &str = ToolId::ReadIndexes.as_str();
+pub const READ_INDEX_DETAILS_NAME: &str = ToolId::ReadIndexDetails.as_str();
 
 const MODEL_OWNED_FIELD_NAMES: &[&str] = &[
     "store_root",

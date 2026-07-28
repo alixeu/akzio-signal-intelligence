@@ -302,7 +302,7 @@ pub async fn run_agent_loop_with_metrics(
         prompt.to_string(),
     );
     turn.phase = settings.phase;
-    turn.tools_disabled = role_disables_tools(&settings.role);
+    turn.tools_disabled = false;
     turn.model_context = format!(
         "role={}\nprofile={}\ntickers={}\navailable_tools={}",
         settings.role,
@@ -437,7 +437,7 @@ pub async fn run_agent_steer_loop_with_metrics(
             .push(agent_loop::TurnItem::user(fork_input));
     }
     turn.phase = settings.phase;
-    turn.tools_disabled = role_disables_tools(&settings.role);
+    turn.tools_disabled = false;
     turn.model_context = format!(
         "role={}\nprofile={}\ntickers={}\navailable_tools={}\nhistory_fork={}",
         settings.role,
@@ -2133,9 +2133,6 @@ fn add_openai_responses_native_web_search(params: Option<Value>) -> Value {
 }
 
 fn configured_tool_names(settings: &AgentSettings) -> Vec<&str> {
-    if role_disables_tools(&settings.role) {
-        return Vec::new();
-    }
     let mut names = Vec::new();
     if settings.llm.think_tool {
         names.push("think");
@@ -2147,7 +2144,7 @@ fn configured_tool_names(settings: &AgentSettings) -> Vec<&str> {
             .iter()
             .map(String::as_str)
             .filter(|name| {
-                if *name == tools::ALPACA_GET_NEWS_TOOL_NAME {
+                if *name == tools::alpaca::GET_NEWS_NAME {
                     settings
                         .tools
                         .as_ref()
@@ -2158,27 +2155,27 @@ fn configured_tool_names(settings: &AgentSettings) -> Vec<&str> {
             }),
     );
     if uses_web_run_fallback(settings) {
-        names.push(tools::WEB_RUN_TOOL_NAME);
+        names.push(tools::web_run::NAME);
     }
     if let Some(binding) = &settings.index_tool_runtime {
         if binding.allows_write() {
             names.extend([
-                tools::CREATE_INDEX_TOOL_NAME,
-                tools::APPEND_INDEX_DETAIL_TOOL_NAME,
-                tools::FINALIZE_INDEX_TOOL_NAME,
+                tools::index_tools::CREATE_INDEX_NAME,
+                tools::index_tools::APPEND_INDEX_DETAIL_NAME,
+                tools::index_tools::FINALIZE_INDEX_NAME,
             ]);
         }
         names.extend([
-            tools::READ_INDEXES_TOOL_NAME,
-            tools::READ_INDEX_DETAILS_TOOL_NAME,
+            tools::index_tools::READ_INDEXES_NAME,
+            tools::index_tools::READ_INDEX_DETAILS_NAME,
         ]);
         if !binding.allows_write() {
             names.retain(|name| {
                 !matches!(
                     *name,
-                    tools::CREATE_INDEX_TOOL_NAME
-                        | tools::APPEND_INDEX_DETAIL_TOOL_NAME
-                        | tools::FINALIZE_INDEX_TOOL_NAME
+                    tools::index_tools::CREATE_INDEX_NAME
+                        | tools::index_tools::APPEND_INDEX_DETAIL_NAME
+                        | tools::index_tools::FINALIZE_INDEX_NAME
                 )
             });
         }
@@ -2189,11 +2186,6 @@ fn configured_tool_names(settings: &AgentSettings) -> Vec<&str> {
     let mut seen = BTreeSet::new();
     names.retain(|name| seen.insert(*name));
     names
-}
-
-fn role_disables_tools(role: &str) -> bool {
-    let _ = role;
-    false
 }
 
 fn role_disables_web_search(role: &str) -> bool {
@@ -2876,7 +2868,7 @@ mod tests {
                 "tools": [{"type": "web_search"}]
             }))
         );
-        assert!(!super::configured_tool_names(&settings).contains(&tools::WEB_RUN_TOOL_NAME));
+        assert!(!super::configured_tool_names(&settings).contains(&tools::web_run::NAME));
     }
 
     #[test]
@@ -2906,13 +2898,13 @@ mod tests {
             settings.role = role.to_string();
             settings.llm.base_url = Some("https://llm.example.com/v1".to_string());
             settings.llm.api_key = Some("test-key".to_string());
-            settings.llm.tools = vec![tools::READ_INDEXES_TOOL_NAME.to_string()];
+            settings.llm.tools = vec![tools::index_tools::READ_INDEXES_NAME.to_string()];
             settings.llm.native_web_search = true;
             settings.web_search.mode = WebSearchMode::Live;
 
             assert_eq!(
                 super::configured_tool_names(&settings),
-                vec!["think", tools::READ_INDEXES_TOOL_NAME]
+                vec!["think", tools::index_tools::READ_INDEXES_NAME]
             );
             assert_eq!(
                 super::additional_params(&settings),
@@ -2926,9 +2918,9 @@ mod tests {
         settings.role = "manager.research".to_string();
         settings.llm.base_url = Some("https://llm.example.com/v1".to_string());
         settings.llm.api_key = Some("test-key".to_string());
-        settings.llm.tools = vec![tools::READ_INDEXES_TOOL_NAME.to_string()];
+        settings.llm.tools = vec![tools::index_tools::READ_INDEXES_NAME.to_string()];
         settings.web_search.mode = WebSearchMode::Live;
-        assert!(super::configured_tool_names(&settings).contains(&tools::WEB_RUN_TOOL_NAME));
+        assert!(super::configured_tool_names(&settings).contains(&tools::web_run::NAME));
     }
 
     #[test]
@@ -2936,14 +2928,14 @@ mod tests {
         let mut settings = base_settings(LlmRoute::Responses);
         settings.role = "analyst.news_macro".to_string();
         settings.llm.think_tool = false;
-        settings.llm.tools = vec![tools::ALPACA_GET_NEWS_TOOL_NAME.to_string()];
+        settings.llm.tools = vec![tools::alpaca::GET_NEWS_NAME.to_string()];
         settings.tools = Some(tools::ExternalToolConfig::default());
 
         assert!(super::configured_tool_names(&settings).is_empty());
         settings.tools.as_mut().unwrap().alpaca_market_data = true;
         assert_eq!(
             super::configured_tool_names(&settings),
-            vec![tools::ALPACA_GET_NEWS_TOOL_NAME]
+            vec![tools::alpaca::GET_NEWS_NAME]
         );
     }
 
@@ -2955,13 +2947,13 @@ mod tests {
         settings.llm.api_key = Some("test-key".to_string());
         settings.llm.think_tool = false;
 
-        assert!(!super::configured_tool_names(&settings).contains(&tools::WEB_RUN_TOOL_NAME));
+        assert!(!super::configured_tool_names(&settings).contains(&tools::web_run::NAME));
 
         settings.web_search.mode = WebSearchMode::Live;
-        assert!(super::configured_tool_names(&settings).contains(&tools::WEB_RUN_TOOL_NAME));
+        assert!(super::configured_tool_names(&settings).contains(&tools::web_run::NAME));
 
         settings.role = "trader".to_string();
-        assert!(!super::configured_tool_names(&settings).contains(&tools::WEB_RUN_TOOL_NAME));
+        assert!(!super::configured_tool_names(&settings).contains(&tools::web_run::NAME));
     }
 
     #[test]
@@ -2974,7 +2966,7 @@ mod tests {
         settings.llm.native_web_search = true;
         settings.web_search.mode = WebSearchMode::Live;
 
-        assert!(!super::configured_tool_names(&settings).contains(&tools::WEB_RUN_TOOL_NAME));
+        assert!(!super::configured_tool_names(&settings).contains(&tools::web_run::NAME));
         assert!(super::web_run_runtime_for_settings(&settings).is_none());
     }
 

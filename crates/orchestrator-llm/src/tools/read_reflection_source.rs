@@ -1,10 +1,11 @@
 use anyhow::{bail, Result};
+use orchestrator_core::ToolId;
 use serde_json::{json, Value};
 
 use super::{api_tool_name, ExternalToolConfig, ToolDefinition};
 use crate::agent_loop::ToolRuntimeTurnContext;
 
-pub const NAME: &str = "read_reflection_source";
+pub const NAME: &str = ToolId::ReadReflectionSource.as_str();
 
 pub fn definition() -> ToolDefinition {
     ToolDefinition {

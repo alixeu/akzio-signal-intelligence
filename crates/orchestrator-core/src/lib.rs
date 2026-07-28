@@ -1,6 +1,7 @@
 pub mod artifact;
 pub mod authority;
 pub mod config;
+pub mod domain_command;
 pub mod jin10_csv;
 pub mod paths;
 pub mod plugin_manifest;
@@ -27,6 +28,14 @@ pub use authority::{
 pub use config::{
     config_bool, config_float, config_get, config_int, config_str, config_strings, deep_merge,
     expand_env_placeholders, load_config, load_project_env,
+};
+pub use domain_command::{
+    AnalystAssessmentCommand, AnalystDataGapCommand, AnalystEvidenceCommand,
+    AnalystInvalidationCommand, BindingRiskControlCommand, ClaimStatusCommand, DebateClaimCommand,
+    DebateResponseCommand, DebateSteerCommand, DomainCommand, Phase2CommonGroundCommand,
+    Phase2TopicCommand, PortfolioAssetDecisionCommand, ResearchDecisionCommand,
+    ResearchHingeCommand, ResearchScenariosCommand, RiskAssessmentCommand, RiskConstraintsCommand,
+    TextCommand, TopicSoftControlCommand, TradeBlockerCommand, TradeIntentCommand,
 };
 pub use jin10_csv::{
     default_jin10_csv_dir, jin10_csv_path, jin10_item_id, load_jin10_csv, load_jin10_csv_recent,

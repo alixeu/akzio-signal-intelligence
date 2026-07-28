@@ -12,15 +12,18 @@ use std::{
 
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
-use orchestrator_core::ToolManagedProfile;
-use orchestrator_llm::tools::domain_tools::{
+use orchestrator_core::{
     AnalystAssessmentCommand, AnalystDataGapCommand, AnalystEvidenceCommand,
     AnalystInvalidationCommand, BindingRiskControlCommand, ClaimStatusCommand, DebateClaimCommand,
-    DebateResponseCommand, DebateSteerCommand, DomainToolRuntimeBinding, DomainToolScope,
-    DomainToolService, EvidenceReadRecord, EvidenceVisibility, Phase2CommonGroundCommand,
+    DebateResponseCommand, DebateSteerCommand, DomainCommand, Phase2CommonGroundCommand,
     Phase2TopicCommand, PortfolioAssetDecisionCommand, ResearchDecisionCommand,
     ResearchHingeCommand, ResearchScenariosCommand, RiskAssessmentCommand, RiskConstraintsCommand,
-    TextCommand, TopicSoftControlCommand, TradeBlockerCommand, TradeIntentCommand,
+    TextCommand, ToolManagedProfile, TopicSoftControlCommand, TradeBlockerCommand,
+    TradeIntentCommand,
+};
+use orchestrator_llm::tools::domain_tools::{
+    DomainCommandExecutor, DomainToolRuntimeBinding, DomainToolScope, EvidenceReadRecord,
+    EvidenceVisibility,
 };
 use orchestrator_store::{
     append_analyst_data_gap, append_analyst_evidence, append_binding_risk_control,
@@ -292,7 +295,7 @@ pub(crate) fn finalize_degraded_analyst_report(
 
 /// Rust-owned degraded policy for every Phase 2 ToolManaged profile.  It uses
 /// the same typed Draft commands and terminal builders as a successful agent;
-/// it never synthesizes an alternate packet or returns to a legacy store.
+/// it never synthesizes an alternate packet or returns to another store.
 pub(crate) fn finalize_degraded_phase2(
     store_root: &Path,
     state: &Value,
@@ -914,7 +917,7 @@ impl FileStoreDomainToolService {
     }
 }
 
-impl DomainToolService for FileStoreDomainToolService {
+impl FileStoreDomainToolService {
     fn set_analyst_assessment(&self, command: AnalystAssessmentCommand) -> Result<Value> {
         self.require(ToolManagedProfile::AnalystReport)?;
         Ok(Self::append(set_analyst_assessment(
@@ -1301,6 +1304,51 @@ impl DomainToolService for FileStoreDomainToolService {
         self.require(ToolManagedProfile::TopicControl)?;
         serde_json::to_value(self.phase2()?.finalize_topic_control()?)
             .context("serialize phase2 topic control artifact")
+    }
+}
+
+impl DomainCommandExecutor for FileStoreDomainToolService {
+    fn execute(&self, command: DomainCommand) -> Result<Value> {
+        match command {
+            DomainCommand::SetAnalystAssessment(command) => self.set_analyst_assessment(command),
+            DomainCommand::AppendAnalystEvidence(command) => self.append_analyst_evidence(command),
+            DomainCommand::AppendAnalystDataGap(command) => self.append_analyst_data_gap(command),
+            DomainCommand::SetAnalystInvalidation(command) => {
+                self.set_analyst_invalidation(command)
+            }
+            DomainCommand::FinalizeAnalyst => self.finalize_analyst_report(),
+            DomainCommand::SetResearchDecision(command) => self.set_research_decision(command),
+            DomainCommand::SetResearchScenarios(command) => self.set_research_scenarios(command),
+            DomainCommand::AppendResearchHinge(command) => self.append_research_hinge(command),
+            DomainCommand::FinalizeResearch => self.finalize_research_decision(),
+            DomainCommand::SetTradeIntent(command) => self.set_trade_intent(command),
+            DomainCommand::AppendTradeBlocker(command) => self.append_trade_blocker(command),
+            DomainCommand::FinalizeTrade => self.finalize_trade_intent(),
+            DomainCommand::SetRiskAssessment(command) => self.set_risk_assessment(command),
+            DomainCommand::SetRiskConstraints(command) => self.set_risk_constraints(command),
+            DomainCommand::FinalizeRisk => self.finalize_risk_review(),
+            DomainCommand::SetPortfolioAssetDecision(command) => {
+                self.set_portfolio_asset_decision(command)
+            }
+            DomainCommand::AppendBindingRiskControl(command) => {
+                self.append_binding_risk_control(command)
+            }
+            DomainCommand::FinalizePortfolio => self.finalize_portfolio_decision(),
+            DomainCommand::SetPhase2CommonGround(command) => self.set_phase2_common_ground(command),
+            DomainCommand::CreatePhase2Topic(command) => self.create_phase2_topic(command),
+            DomainCommand::FinalizeResearcherWarmup => self.finalize_researcher_warmup(),
+            DomainCommand::FinalizeTopicGeneration => self.finalize_topic_generation(),
+            DomainCommand::CreateDebateClaim(command) => self.create_debate_claim(command),
+            DomainCommand::FinalizeDebateSeed => self.finalize_debate_seed(),
+            DomainCommand::RespondToDebateClaim(command) => self.respond_to_debate_claim(command),
+            DomainCommand::FinalizeDebateResponse => self.finalize_debate_response(),
+            DomainCommand::SetClaimStatus(command) => self.set_claim_status(command),
+            DomainCommand::AddAgreedFact(command) => self.add_agreed_fact(command),
+            DomainCommand::SetDecisionHinge(command) => self.set_decision_hinge(command),
+            DomainCommand::RouteDebateSteer(command) => self.route_debate_steer(command),
+            DomainCommand::SetTopicSoftControl(command) => self.set_topic_soft_control(command),
+            DomainCommand::FinalizeTopicControl => self.finalize_topic_control(),
+        }
     }
 }
 

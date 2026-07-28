@@ -16,18 +16,13 @@ pub struct ResearchDecision {
     pub short_probability: f64,
     /// Why the probability is confident or uncertain: evidence_balanced,
     /// data_insufficient, conflicting_evidence, or directional_evidence.
-    #[serde(default)]
     pub confidence_basis: String,
     /// Required for Hold: evidence_balanced, evidence_insufficient, or
     /// conflicting_evidence.
-    #[serde(default)]
     pub hold_reason: Option<String>,
-    #[serde(default)]
     pub plan: String,
-    #[serde(default)]
     pub probability_rationale: String,
     /// Three-scenario analysis: bull, base, bear.
-    #[serde(default)]
     pub scenarios: Option<Scenarios>,
 }
 
@@ -38,13 +33,10 @@ pub struct Scenario {
     /// Probability of this scenario (0.0-1.0). All scenarios must sum to 1.0.
     pub probability: f64,
     /// Key drivers that would cause this scenario to play out (1-3 items).
-    #[serde(default)]
     pub drivers: Vec<String>,
     /// Observable triggers that would shift probability toward this scenario (1-3 items).
-    #[serde(default)]
     pub triggers: Vec<String>,
     /// What would confirm this scenario is the active path.
-    #[serde(default)]
     pub confirmation: String,
 }
 
@@ -61,23 +53,17 @@ pub struct Scenarios {
 pub struct TradeIntent {
     pub action: String,
     /// Rust-owned rating mapping before the Trader applies semantic blockers.
-    #[serde(default)]
     pub candidate_action: String,
     /// execute_candidate | hold
-    #[serde(default)]
     pub execution_decision: String,
-    #[serde(default)]
     pub entry_price: Option<String>,
-    #[serde(default)]
     pub stop_loss: Option<String>,
     /// Numeric maximum portfolio fraction in [0.0, 1.0].
     ///
     /// Canonical Contract v2 deliberately has no free-form `position_size`
     /// field: callers must supply this machine-readable cap directly.
     pub position_size_pct_max: f64,
-    #[serde(default)]
     pub blockers: Vec<String>,
-    #[serde(default)]
     pub rationale: String,
 }
 
@@ -103,42 +89,30 @@ pub enum EvidenceType {
 #[serde(deny_unknown_fields)]
 pub struct RiskConstraints {
     pub stance: String,
-    #[serde(default)]
     pub argument: String,
     /// The stance-specific constraint or counterargument not already supplied
     /// by prior risk turns.
-    #[serde(default)]
     pub unique_risk_contribution: String,
     /// Explicit agreement/disagreement with the strongest prior constraint.
-    #[serde(default)]
     pub disagreement_with_prior: String,
     /// True only when the role found no genuine incremental constraint.
-    #[serde(default)]
     pub no_new_information: bool,
-    #[serde(default)]
     pub recommended_adjustment: String,
     /// hard | soft | none
     pub stop_type: StopType,
     /// 0.0-1.0 fraction of capital at risk before stopping.
-    #[serde(default)]
     pub max_drawdown_pct: f64,
     /// 0.0-1.0 maximum single-position weight cap.
-    #[serde(default)]
     pub position_cap_pct: f64,
     /// Condition that triggers a portfolio rebalance.
-    #[serde(default)]
     pub rebalance_trigger: String,
     /// Condition that forces a risk-off / de-risk event.
-    #[serde(default)]
     pub risk_off_trigger: String,
     /// How long until the risk view is revisited (human readable).
-    #[serde(default)]
     pub review_window: String,
     /// Cash-hedge recommendation (size / instrument / rationale).
-    #[serde(default)]
     pub cash_hedge_recommendation: String,
     /// 0.0-1.0 confidence in the constraints themselves.
-    #[serde(default)]
     pub constraint_confidence: f64,
 }
 
@@ -154,21 +128,15 @@ pub struct BindingRiskControl {
 #[serde(deny_unknown_fields)]
 pub struct AssetExecutionConstraint {
     /// increase_only | decrease_only | unchanged
-    #[serde(default)]
     pub direction_constraint: String,
     /// execute | wait | downgrade
-    #[serde(default)]
     pub execution_status: String,
     /// Runtime-sourced current portfolio weight, 0.0-1.0.
-    #[serde(default)]
     pub current_weight: f64,
     /// Hard ceiling for the Phase 7 target weight, 0.0-1.0.
-    #[serde(default)]
     pub max_target_weight: f64,
     /// Largest absolute Phase 7 move from current_weight, 0.0-1.0.
-    #[serde(default)]
     pub max_weight_delta: f64,
-    #[serde(default)]
     pub binding_risk_controls: Vec<BindingRiskControl>,
 }
 
@@ -176,27 +144,19 @@ pub struct AssetExecutionConstraint {
 pub struct FinalValidation {
     pub rating: String,
     /// execute | wait | downgrade
-    #[serde(default)]
     pub execution_status: String,
-    #[serde(default)]
     pub execution_summary: String,
-    #[serde(default)]
     pub investment_thesis: String,
-    #[serde(default)]
     pub target_price: Option<String>,
-    #[serde(default)]
     pub horizon: String,
-    #[serde(default)]
     pub rationale: String,
     /// Per-asset semantic constraints for Rust-owned allocation and execution.
-    #[serde(default)]
     pub per_asset: BTreeMap<String, AssetExecutionConstraint>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AllocationWeight {
     pub weight: f64,
-    #[serde(default)]
     pub rationale: String,
 }
 
@@ -204,11 +164,8 @@ pub struct AllocationWeight {
 pub struct PortfolioAllocation {
     pub weights: BTreeMap<String, AllocationWeight>,
     pub total_equity_exposure: f64,
-    #[serde(default)]
     pub vix_regime: String,
-    #[serde(default)]
     pub correlation_note: String,
-    #[serde(default)]
     pub summary: String,
 }
 
@@ -220,27 +177,20 @@ pub struct AnalystTickerArtifact {
     /// Evidence-consistency / clarity, 0.0-1.0 (NOT 0-100, NOT upside probability).
     pub confidence: f64,
     /// Full prose analysis for this ticker (may contain sections / Markdown tables).
-    #[serde(default)]
     pub report: String,
     /// The 2-3 most decisive evidence items.
     ///
     /// Structured source-backed evidence; the evidence type is always explicit.
-    #[serde(default)]
     pub key_evidence: Vec<EvidenceItem>,
     /// already_priced | under_priced | unclear
-    #[serde(default)]
     pub priced_in: String,
     /// low | medium | high
-    #[serde(default)]
     pub echo_chamber_risk: String,
     /// low | medium | high
-    #[serde(default)]
     pub crowded_consensus_risk: String,
     /// Observations that would strengthen or overturn the current call.
-    #[serde(default)]
     pub validation_triggers: Vec<String>,
     /// Data gaps and uncertainties; empty array when none.
-    #[serde(default)]
     pub data_gaps: Vec<String>,
 }
 
@@ -256,26 +206,19 @@ pub struct EvidenceItem {
     /// Evidence type: fact | opinion | inference.
     pub evidence_type: EvidenceType,
     /// Where the evidence came from (tool name, data source, URL description).
-    #[serde(default)]
     pub source: String,
     /// ISO date when the evidence was observed or published.
-    #[serde(default)]
     pub timestamp: String,
     /// Source quality tier: official | major_media | professional_research |
     /// longform_analysis | unknown.
-    #[serde(default)]
     pub source_tier: String,
     /// Earliest traceable origin of the information (attribution).
-    #[serde(default)]
     pub first_source: String,
     /// Whether this is a repost / derivative of earlier-reported information.
-    #[serde(default)]
     pub is_derivative_repost: bool,
     /// Human-readable evidence age: "0-2d" | "3-5d" | "6-10d" | "10d+" | "unknown".
-    #[serde(default)]
     pub evidence_age: String,
     /// 0.0-1.0 confidence in the quality of the source.
-    #[serde(default)]
     pub source_confidence: f64,
 }
 
@@ -778,7 +721,12 @@ mod tests {
             "claim": "CPI came in at 3.2%",
             "evidence_type": "fact",
             "source": "BLS via Jin10",
-            "timestamp": "2026-07-06"
+            "timestamp": "2026-07-06",
+            "source_tier": "official",
+            "first_source": "BLS release",
+            "is_derivative_repost": false,
+            "evidence_age": "0-2d",
+            "source_confidence": 0.9
         }"#;
         let item: EvidenceItem = serde_json::from_str(json).unwrap();
         assert_eq!(item.claim, "CPI came in at 3.2%");
@@ -802,9 +750,15 @@ mod tests {
         let json = r#"{
             "direction": "bullish",
             "confidence": 0.7,
+            "report": "CPI evidence supports the call.",
             "key_evidence": [
-                {"claim": "CPI 3.2%", "evidence_type": "fact", "source": "BLS", "timestamp": "2026-07-06"}
-            ]
+                {"claim": "CPI 3.2%", "evidence_type": "fact", "source": "BLS", "timestamp": "2026-07-06", "source_tier":"official", "first_source":"BLS", "is_derivative_repost":false, "evidence_age":"0-2d", "source_confidence":0.9}
+            ],
+            "priced_in": "unclear",
+            "echo_chamber_risk": "low",
+            "crowded_consensus_risk": "low",
+            "validation_triggers": [],
+            "data_gaps": []
         }"#;
         let artifact: AnalystTickerArtifact = serde_json::from_str(json).unwrap();
         assert_eq!(artifact.key_evidence[0].claim, "CPI 3.2%");
@@ -826,7 +780,7 @@ mod tests {
     #[test]
     fn evidence_type_is_closed_to_v2_variants() {
         for value in ["fact", "opinion", "inference"] {
-            let json = format!("{{\"claim\":\"x\",\"evidence_type\":\"{value}\"}}");
+            let json = format!("{{\"claim\":\"x\",\"evidence_type\":\"{value}\",\"source\":\"s\",\"timestamp\":\"2026-07-06\",\"source_tier\":\"official\",\"first_source\":\"s\",\"is_derivative_repost\":false,\"evidence_age\":\"0-2d\",\"source_confidence\":0.9}}");
             serde_json::from_str::<EvidenceItem>(&json).unwrap();
         }
         assert!(serde_json::from_str::<EvidenceItem>(
@@ -950,6 +904,7 @@ mod tests {
         let json = r#"{
             "direction": "bullish",
             "confidence": 0.7,
+            "report": "CPI evidence supports the call.",
             "echo_chamber_risk": "medium",
             "crowded_consensus_risk": "high",
             "key_evidence": [
@@ -964,7 +919,10 @@ mod tests {
                     "evidence_age": "0-2d",
                     "source_confidence": 0.9
                 }
-            ]
+            ],
+            "priced_in": "unclear",
+            "validation_triggers": [],
+            "data_gaps": []
         }"#;
         let artifact: AnalystTickerArtifact = serde_json::from_str(json).unwrap();
         assert_eq!(artifact.echo_chamber_risk, "medium");
@@ -980,6 +938,10 @@ mod tests {
     fn risk_constraints_with_new_fields_round_trips() {
         let json = r#"{
             "stance": "conservative",
+            "argument": "Volatility remains elevated.",
+            "unique_risk_contribution": "Gap risk is not covered by the base stop.",
+            "disagreement_with_prior": "none",
+            "no_new_information": false,
             "recommended_adjustment": "Cap exposure at 50%.",
             "stop_type": "soft",
             "max_drawdown_pct": 0.15,

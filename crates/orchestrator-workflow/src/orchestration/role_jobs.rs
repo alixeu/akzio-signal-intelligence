@@ -1687,10 +1687,12 @@ fn mock_domain_tool_managed_output(
             binding.execute(SET_TOPIC_SOFT_CONTROL, json!({"should_continue":false}))?;
             binding.execute(FINALIZE_TOPIC_CONTROL, json!({}))?
         }
-        _ => anyhow::bail!(
-            "mock domain runtime profile {} is not wired",
-            profile.as_str()
-        ),
+        ToolManagedProfile::HistoricalReflection | ToolManagedProfile::PhaseSummary => {
+            anyhow::bail!(
+                "{} is an Index runtime profile, not a domain runtime profile",
+                profile.as_str()
+            )
+        }
     };
     let artifact = artifact
         .get("artifact")

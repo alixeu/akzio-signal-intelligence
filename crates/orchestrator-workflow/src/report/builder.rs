@@ -269,9 +269,7 @@ fn bear_case(debate: &Value) -> String {
     section
 }
 
-/// Pull concise evidence strings from `debate_state_artifact.debate_turns`
-/// filtered by role side ("bull" or "bear"). Each turn's `artifact.report`
-/// (or `per_ticker[].key_evidence`) is mined for text.
+/// Pull concise claims from finalized Phase 2 turn payloads filtered by side.
 fn extract_debate_evidence(debate: &Value, side: &str) -> Vec<String> {
     let mut evidence: Vec<String> = Vec::new();
     let turns = debate.get("debate_turns").and_then(Value::as_array);
@@ -281,30 +279,20 @@ fn extract_debate_evidence(debate: &Value, side: &str) -> Vec<String> {
             if !role.to_ascii_lowercase().contains(side) {
                 continue;
             }
-            let artifact = turn.get("artifact").unwrap_or(&Value::Null);
-            // Prefer key_evidence arrays on per-ticker payloads.
-            if let Some(per_ticker) = artifact.get("per_ticker").and_then(Value::as_object) {
-                for data in per_ticker.values() {
-                    if let Some(items) = data.get("key_evidence").and_then(Value::as_array) {
-                        for item in items {
-                            if let Some(text) = item.as_str() {
-                                evidence.push(text.to_string());
-                            }
-                        }
-                    }
-                }
-            }
-            // Fall back to the report prose (first non-empty line).
-            if evidence.is_empty() {
-                if let Some(report) = artifact.get("report").and_then(Value::as_str) {
-                    let first_line = report
-                        .lines()
-                        .map(str::trim)
-                        .find(|line| !line.is_empty())
-                        .unwrap_or("");
-                    if !first_line.is_empty() {
-                        evidence.push(first_line.to_string());
-                    }
+            let payload = turn.pointer("/artifact/payload").unwrap_or(&Value::Null);
+            for item in payload
+                .get("claims")
+                .or_else(|| payload.get("responses"))
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if let Some(text) = item
+                    .get("claim")
+                    .or_else(|| item.get("response"))
+                    .and_then(Value::as_str)
+                {
+                    evidence.push(text.to_owned());
                 }
             }
             if evidence.len() >= 3 {
@@ -315,10 +303,7 @@ fn extract_debate_evidence(debate: &Value, side: &str) -> Vec<String> {
     evidence
 }
 
-/// Collect per-evidence source-quality and ticker-level consensus-risk
-/// metadata for one debate side ("bull" / "bear"). Returns a Markdown-ready
-/// string (empty when no structured quality data is present). Defensive:
-/// missing fields are skipped, plain-string evidence is ignored.
+/// Collect source reference provenance for one debate side.
 fn collect_evidence_quality(debate: &Value, side: &str) -> String {
     let mut lines: Vec<String> = Vec::new();
     if let Some(turns) = debate.get("debate_turns").and_then(Value::as_array) {
@@ -327,44 +312,17 @@ fn collect_evidence_quality(debate: &Value, side: &str) -> String {
             if !role.to_ascii_lowercase().contains(side) {
                 continue;
             }
-            let artifact = turn.get("artifact").unwrap_or(&Value::Null);
-            if let Some(per_ticker) = artifact.get("per_ticker").and_then(Value::as_object) {
-                for data in per_ticker.values() {
-                    for field in ["echo_chamber_risk", "crowded_consensus_risk"] {
-                        if let Some(value) = data.get(field).and_then(Value::as_str) {
-                            if !value.trim().is_empty() {
-                                lines.push(format!("- {}: {}", field.replace('_', " "), value));
-                            }
-                        }
-                    }
-                    if let Some(items) = data.get("key_evidence").and_then(Value::as_array) {
-                        for item in items {
-                            if let Some(obj) = item.as_object() {
-                                let tier =
-                                    obj.get("source_tier").and_then(Value::as_str).unwrap_or("");
-                                let first = obj
-                                    .get("first_source")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("");
-                                let mut bits: Vec<String> = Vec::new();
-                                if !tier.is_empty() {
-                                    bits.push(format!("source tier: {tier}"));
-                                }
-                                if !first.is_empty() {
-                                    bits.push(format!("first source: {first}"));
-                                }
-                                if let Some(true) =
-                                    obj.get("is_derivative_repost").and_then(Value::as_bool)
-                                {
-                                    bits.push("derivative repost".to_string());
-                                }
-                                if !bits.is_empty() {
-                                    let claim =
-                                        obj.get("claim").and_then(Value::as_str).unwrap_or("");
-                                    lines.push(format!("- {claim} ({})", bits.join(", ")));
-                                }
-                            }
-                        }
+            let payload = turn.pointer("/artifact/payload").unwrap_or(&Value::Null);
+            for item in payload
+                .get("claims")
+                .or_else(|| payload.get("responses"))
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if let Some(refs) = item.get("evidence_refs").and_then(Value::as_array) {
+                    for reference in refs.iter().filter_map(Value::as_str) {
+                        lines.push(format!("- evidence reference: {reference}"));
                     }
                 }
             }
@@ -512,17 +470,13 @@ fn trade_plan(trader: &Value, final_decision: &Value) -> String {
         .and_then(Value::as_f64)
         .map(|value| format!("{:.0}%", value * 100.0))
         .unwrap_or_else(|| "N/A".to_string());
-    // TradeIntent exposes `entry_price` / `stop_loss`; accept `entry` / `stop`
-    // aliases for forward compatibility with the plan template.
     let entry = trader
         .get("entry_price")
         .and_then(Value::as_str)
-        .or_else(|| trader.get("entry").and_then(Value::as_str))
         .unwrap_or("N/A");
     let stop = trader
         .get("stop_loss")
         .and_then(Value::as_str)
-        .or_else(|| trader.get("stop").and_then(Value::as_str))
         .unwrap_or("N/A");
     let horizon = final_decision
         .get("horizon")
@@ -763,19 +717,19 @@ mod tests {
                     {
                         "role": "researcher.bull.initial",
                         "artifact": {
-                            "report": "Bullish: earnings beat and guidance raised.",
-                            "per_ticker": {
-                                "TQQQ": { "key_evidence": ["Earnings beat", "Guidance raised", "20DMA holding"] }
-                            }
+                            "payload": {"claims": [
+                                {"claim": "Earnings beat", "evidence_refs": ["evidence:earnings"]},
+                                {"claim": "Guidance raised", "evidence_refs": ["evidence:guidance"]}
+                            ]}
                         }
                     },
                     {
                         "role": "researcher.bear.initial",
                         "artifact": {
-                            "report": "Bearish: RSI overbought and breadth narrowing.",
-                            "per_ticker": {
-                                "TQQQ": { "key_evidence": ["RSI overbought", "Breadth narrowing"] }
-                            }
+                            "payload": {"claims": [
+                                {"claim": "RSI overbought", "evidence_refs": ["evidence:rsi"]},
+                                {"claim": "Breadth narrowing", "evidence_refs": ["evidence:breadth"]}
+                            ]}
                         }
                     }
                 ]

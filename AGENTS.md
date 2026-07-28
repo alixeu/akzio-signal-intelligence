@@ -10,8 +10,10 @@ This repository is a Rust workspace for AI-assisted market-signal research and T
 - Workspace crates:
   - `orchestrator-core`: shared config, paths, ticker parsing, prompt helpers, and artifact validation.
   - `orchestrator-store`: atomic FileStore persistence, manifests, sessions, drafts, indexes, and execution recovery.
-  - `orchestrator-llm`: OpenAI Responses API execution and mock role artifacts.
-  - `orchestrator-cli`: CLI binaries and workflow orchestration.
+  - `orchestrator-llm`: OpenAI Responses/Chat Completions execution and typed ToolManaged dispatch.
+  - `orchestrator-ingest`: technical-market and Jin10 input ingestion.
+  - `orchestrator-workflow`: phase orchestration, summaries, allocation, reports, and FileStore runtime adapters.
+  - `orchestrator-cli`: CLI binaries, operations, and prompt linting.
 - Prompt templates live under `prompts/` and are owned by their runtime phase:
   - `phase_summary`: completed-phase compression.
   - `phase1`: technical and news/macro research.

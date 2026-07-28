@@ -1,12 +1,15 @@
 use super::{api_tool_name, log_tool_result, ExternalToolConfig, ToolDefinition};
 use anyhow::{bail, Context, Result};
-use orchestrator_core::technical_csv::{parse_technical_csv, storage_interval, TechnicalCsvRow};
+use orchestrator_core::{
+    technical_csv::{parse_technical_csv, storage_interval, TechnicalCsvRow},
+    ToolId,
+};
 use orchestrator_store::InputSource;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 
-pub const NAME: &str = "read_technical_snapshot";
+pub const NAME: &str = ToolId::ReadTechnicalSnapshot.as_str();
 const DEFAULT_INTERVALS: [&str; 3] = ["daily", "3h", "20min"];
 
 pub fn definition() -> ToolDefinition {

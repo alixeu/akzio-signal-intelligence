@@ -1,12 +1,12 @@
 use super::{api_tool_name, log_tool_result, ExternalToolConfig, ToolDefinition};
 use anyhow::{bail, Context, Result};
-use orchestrator_core::parse_technical_csv;
 use orchestrator_core::technical_csv::storage_interval;
+use orchestrator_core::{parse_technical_csv, ToolId};
 use orchestrator_store::InputSource;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-pub const NAME: &str = "read_technical_detail";
+pub const NAME: &str = ToolId::ReadTechnicalDetail.as_str();
 const MAX_DETAIL_ROWS: usize = 120;
 
 pub fn definition() -> ToolDefinition {

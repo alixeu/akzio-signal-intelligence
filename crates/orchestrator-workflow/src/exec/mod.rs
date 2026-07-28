@@ -32,7 +32,7 @@ use crate::orchestration::{
     lifecycle::{run_id_for, set_phase_status, tickers_from_state},
     role_jobs::{prepare_role_job, record_role_job_metrics, run_role_jobs, RoleRun},
     summary_store::{
-        phase_summary_source_payload, planned_summary_units, write_deterministic_phase_summary,
+        finalized_phase_artifact_catalog, planned_summary_units, write_deterministic_phase_summary,
     },
 };
 
@@ -531,7 +531,7 @@ fn has_required_phase_summaries(
     // Artifacts; `run_unit` returns those files without another LLM call.
     // A finalized Index is still the only proof that the summary itself is
     // complete.
-    if phase_summary_source_payload(store.root(), state, i64::from(phase)).is_err() {
+    if finalized_phase_artifact_catalog(store.root(), state, i64::from(phase)).is_err() {
         return Ok(false);
     }
     let (_, units) = planned_summary_units(

@@ -2,10 +2,11 @@ use super::{
     api_tool_name, log_tool_result, web_run, ExternalToolConfig, ToolDefinition, WebRunRuntime,
 };
 use anyhow::{bail, Context, Result};
+use orchestrator_core::ToolId;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-pub const NAME: &str = "verify_event";
+pub const NAME: &str = ToolId::VerifyEvent.as_str();
 const MAX_FIELDS: usize = 3;
 const MAX_SOURCES: usize = 2;
 

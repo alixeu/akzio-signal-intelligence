@@ -11,45 +11,47 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
-use orchestrator_core::artifact::{BindingRiskControl, Scenario, StopType};
-use orchestrator_core::{EvidenceItem, ToolManagedProfile};
-use serde::{Deserialize, Serialize};
+use orchestrator_core::{
+    AnalystEvidenceCommand, BindingRiskControlCommand, DebateClaimCommand, DebateResponseCommand,
+    DomainCommand, Phase2TopicCommand, ResearchHingeCommand, ToolId, ToolManagedProfile,
+};
+use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::{api_tool_name, ToolDefinition};
 
-pub const SET_ANALYST_ASSESSMENT: &str = "set_analyst_assessment";
-pub const APPEND_ANALYST_EVIDENCE: &str = "append_analyst_evidence";
-pub const APPEND_ANALYST_DATA_GAP: &str = "append_analyst_data_gap";
-pub const SET_ANALYST_INVALIDATION: &str = "set_analyst_invalidation";
-pub const FINALIZE_ANALYST_REPORT: &str = "finalize_analyst_report";
-pub const SET_RESEARCH_DECISION: &str = "set_research_decision";
-pub const SET_RESEARCH_SCENARIOS: &str = "set_research_scenarios";
-pub const APPEND_RESEARCH_HINGE: &str = "append_research_hinge";
-pub const FINALIZE_RESEARCH_DECISION: &str = "finalize_research_decision";
-pub const SET_TRADE_INTENT: &str = "set_trade_intent";
-pub const APPEND_TRADE_BLOCKER: &str = "append_trade_blocker";
-pub const FINALIZE_TRADE_INTENT: &str = "finalize_trade_intent";
-pub const SET_RISK_ASSESSMENT: &str = "set_risk_assessment";
-pub const SET_RISK_CONSTRAINTS: &str = "set_risk_constraints";
-pub const FINALIZE_RISK_REVIEW: &str = "finalize_risk_review";
-pub const SET_PORTFOLIO_ASSET_DECISION: &str = "set_portfolio_asset_decision";
-pub const APPEND_BINDING_RISK_CONTROL: &str = "append_binding_risk_control";
-pub const FINALIZE_PORTFOLIO_DECISION: &str = "finalize_portfolio_decision";
-pub const SET_PHASE2_COMMON_GROUND: &str = "set_phase2_common_ground";
-pub const CREATE_PHASE2_TOPIC: &str = "create_phase2_topic";
-pub const FINALIZE_RESEARCHER_WARMUP: &str = "finalize_researcher_warmup";
-pub const FINALIZE_TOPIC_GENERATION: &str = "finalize_topic_generation";
-pub const CREATE_DEBATE_CLAIM: &str = "create_debate_claim";
-pub const FINALIZE_DEBATE_SEED: &str = "finalize_debate_seed";
-pub const RESPOND_TO_DEBATE_CLAIM: &str = "respond_to_debate_claim";
-pub const FINALIZE_DEBATE_RESPONSE: &str = "finalize_debate_response";
-pub const SET_CLAIM_STATUS: &str = "set_claim_status";
-pub const ADD_AGREED_FACT: &str = "add_agreed_fact";
-pub const SET_DECISION_HINGE: &str = "set_decision_hinge";
-pub const ROUTE_DEBATE_STEER: &str = "route_debate_steer";
-pub const SET_TOPIC_SOFT_CONTROL: &str = "set_topic_soft_control";
-pub const FINALIZE_TOPIC_CONTROL: &str = "finalize_topic_control";
+pub const SET_ANALYST_ASSESSMENT: &str = ToolId::SetAnalystAssessment.as_str();
+pub const APPEND_ANALYST_EVIDENCE: &str = ToolId::AppendAnalystEvidence.as_str();
+pub const APPEND_ANALYST_DATA_GAP: &str = ToolId::AppendAnalystDataGap.as_str();
+pub const SET_ANALYST_INVALIDATION: &str = ToolId::SetAnalystInvalidation.as_str();
+pub const FINALIZE_ANALYST_REPORT: &str = ToolId::FinalizeAnalystReport.as_str();
+pub const SET_RESEARCH_DECISION: &str = ToolId::SetResearchDecision.as_str();
+pub const SET_RESEARCH_SCENARIOS: &str = ToolId::SetResearchScenarios.as_str();
+pub const APPEND_RESEARCH_HINGE: &str = ToolId::AppendResearchHinge.as_str();
+pub const FINALIZE_RESEARCH_DECISION: &str = ToolId::FinalizeResearchDecision.as_str();
+pub const SET_TRADE_INTENT: &str = ToolId::SetTradeIntent.as_str();
+pub const APPEND_TRADE_BLOCKER: &str = ToolId::AppendTradeBlocker.as_str();
+pub const FINALIZE_TRADE_INTENT: &str = ToolId::FinalizeTradeIntent.as_str();
+pub const SET_RISK_ASSESSMENT: &str = ToolId::SetRiskAssessment.as_str();
+pub const SET_RISK_CONSTRAINTS: &str = ToolId::SetRiskConstraints.as_str();
+pub const FINALIZE_RISK_REVIEW: &str = ToolId::FinalizeRiskReview.as_str();
+pub const SET_PORTFOLIO_ASSET_DECISION: &str = ToolId::SetPortfolioAssetDecision.as_str();
+pub const APPEND_BINDING_RISK_CONTROL: &str = ToolId::AppendBindingRiskControl.as_str();
+pub const FINALIZE_PORTFOLIO_DECISION: &str = ToolId::FinalizePortfolioDecision.as_str();
+pub const SET_PHASE2_COMMON_GROUND: &str = ToolId::SetPhase2CommonGround.as_str();
+pub const CREATE_PHASE2_TOPIC: &str = ToolId::CreatePhase2Topic.as_str();
+pub const FINALIZE_RESEARCHER_WARMUP: &str = ToolId::FinalizeResearcherWarmup.as_str();
+pub const FINALIZE_TOPIC_GENERATION: &str = ToolId::FinalizeTopicGeneration.as_str();
+pub const CREATE_DEBATE_CLAIM: &str = ToolId::CreateDebateClaim.as_str();
+pub const FINALIZE_DEBATE_SEED: &str = ToolId::FinalizeDebateSeed.as_str();
+pub const RESPOND_TO_DEBATE_CLAIM: &str = ToolId::RespondToDebateClaim.as_str();
+pub const FINALIZE_DEBATE_RESPONSE: &str = ToolId::FinalizeDebateResponse.as_str();
+pub const SET_CLAIM_STATUS: &str = ToolId::SetClaimStatus.as_str();
+pub const ADD_AGREED_FACT: &str = ToolId::AddAgreedFact.as_str();
+pub const SET_DECISION_HINGE: &str = ToolId::SetDecisionHinge.as_str();
+pub const ROUTE_DEBATE_STEER: &str = ToolId::RouteDebateSteer.as_str();
+pub const SET_TOPIC_SOFT_CONTROL: &str = ToolId::SetTopicSoftControl.as_str();
+pub const FINALIZE_TOPIC_CONTROL: &str = ToolId::FinalizeTopicControl.as_str();
 
 const RUST_OWNED_FIELDS: &[&str] = &[
     "store_root",
@@ -78,267 +80,6 @@ const RUST_OWNED_FIELDS: &[&str] = &[
     "stance",
 ];
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct AnalystAssessmentCommand {
-    pub ticker: String,
-    pub direction: String,
-    pub confidence: f64,
-    pub report: String,
-    pub priced_in: String,
-    pub echo_chamber_risk: String,
-    pub crowded_consensus_risk: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct AnalystEvidenceCommand {
-    pub ticker: String,
-    pub evidence: EvidenceItem,
-    pub evidence_ref: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct AnalystDataGapCommand {
-    pub ticker: String,
-    pub data_gap: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct AnalystInvalidationCommand {
-    pub ticker: String,
-    pub validation_triggers: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ResearchDecisionCommand {
-    pub ticker: String,
-    pub rating: String,
-    pub long_probability: f64,
-    pub short_probability: f64,
-    pub confidence_basis: String,
-    pub hold_reason: Option<String>,
-    pub plan: String,
-    pub probability_rationale: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ResearchScenariosCommand {
-    pub ticker: String,
-    pub bull: Scenario,
-    pub base: Scenario,
-    pub bear: Scenario,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ResearchHingeCommand {
-    pub ticker: String,
-    pub hinge: String,
-    pub evidence_ref: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct TradeIntentCommand {
-    pub action: String,
-    pub execution_decision: String,
-    pub entry_price: Option<String>,
-    pub stop_loss: Option<String>,
-    pub position_size_pct_max: f64,
-    pub rationale: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TradeBlockerCommand {
-    pub blocker: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RiskAssessmentCommand {
-    pub argument: String,
-    pub unique_risk_contribution: String,
-    pub disagreement_with_prior: String,
-    pub no_new_information: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RiskConstraintsCommand {
-    pub recommended_adjustment: String,
-    pub stop_type: StopType,
-    pub max_drawdown_pct: f64,
-    pub position_cap_pct: f64,
-    pub rebalance_trigger: String,
-    pub risk_off_trigger: String,
-    pub review_window: String,
-    pub cash_hedge_recommendation: String,
-    pub constraint_confidence: f64,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PortfolioAssetDecisionCommand {
-    pub direction_constraint: String,
-    pub execution_status: String,
-    pub max_target_weight: f64,
-    pub max_weight_delta: f64,
-    pub execution_summary: String,
-    pub investment_thesis: String,
-    pub target_price: Option<String>,
-    pub horizon: String,
-    pub rationale: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BindingRiskControlCommand {
-    pub control: BindingRiskControl,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Phase2CommonGroundCommand {
-    pub common_ground: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Phase2TopicCommand {
-    pub topic: String,
-    pub decision_hinge: String,
-    pub evidence_refs: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct DebateClaimCommand {
-    pub claim: String,
-    pub confidence: f64,
-    pub evidence_refs: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DebateResponseCommand {
-    pub reply_to_claim_id: String,
-    pub response: String,
-    pub evidence_refs: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ClaimStatusCommand {
-    pub claim_id: String,
-    pub status: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TextCommand {
-    pub value: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DebateSteerCommand {
-    pub target: String,
-    pub instruction: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TopicSoftControlCommand {
-    pub should_continue: bool,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum DomainToolCommand {
-    SetAnalystAssessment(AnalystAssessmentCommand),
-    AppendAnalystEvidence(AnalystEvidenceCommand),
-    AppendAnalystDataGap(AnalystDataGapCommand),
-    SetAnalystInvalidation(AnalystInvalidationCommand),
-    FinalizeAnalyst,
-    SetResearchDecision(ResearchDecisionCommand),
-    SetResearchScenarios(ResearchScenariosCommand),
-    AppendResearchHinge(ResearchHingeCommand),
-    FinalizeResearch,
-    SetTradeIntent(TradeIntentCommand),
-    AppendTradeBlocker(TradeBlockerCommand),
-    FinalizeTrade,
-    SetRiskAssessment(RiskAssessmentCommand),
-    SetRiskConstraints(RiskConstraintsCommand),
-    FinalizeRisk,
-    SetPortfolioAssetDecision(PortfolioAssetDecisionCommand),
-    AppendBindingRiskControl(BindingRiskControlCommand),
-    FinalizePortfolio,
-    SetPhase2CommonGround(Phase2CommonGroundCommand),
-    CreatePhase2Topic(Phase2TopicCommand),
-    FinalizeResearcherWarmup,
-    FinalizeTopicGeneration,
-    CreateDebateClaim(DebateClaimCommand),
-    FinalizeDebateSeed,
-    RespondToDebateClaim(DebateResponseCommand),
-    FinalizeDebateResponse,
-    SetClaimStatus(ClaimStatusCommand),
-    AddAgreedFact(TextCommand),
-    SetDecisionHinge(TextCommand),
-    RouteDebateSteer(DebateSteerCommand),
-    SetTopicSoftControl(TopicSoftControlCommand),
-    FinalizeTopicControl,
-}
-
-/// Typed bridge implemented only by a FileStore phase runtime.  It exposes no
-/// database, filesystem, JSON-path, or arbitrary-field operation.
-pub trait DomainToolService: Send + Sync {
-    fn set_analyst_assessment(&self, command: AnalystAssessmentCommand) -> Result<Value>;
-    fn append_analyst_evidence(&self, command: AnalystEvidenceCommand) -> Result<Value>;
-    fn append_analyst_data_gap(&self, command: AnalystDataGapCommand) -> Result<Value>;
-    fn set_analyst_invalidation(&self, command: AnalystInvalidationCommand) -> Result<Value>;
-    fn finalize_analyst_report(&self) -> Result<Value>;
-    fn set_research_decision(&self, command: ResearchDecisionCommand) -> Result<Value>;
-    fn set_research_scenarios(&self, command: ResearchScenariosCommand) -> Result<Value>;
-    fn append_research_hinge(&self, command: ResearchHingeCommand) -> Result<Value>;
-    fn finalize_research_decision(&self) -> Result<Value>;
-    fn set_trade_intent(&self, command: TradeIntentCommand) -> Result<Value>;
-    fn append_trade_blocker(&self, command: TradeBlockerCommand) -> Result<Value>;
-    fn finalize_trade_intent(&self) -> Result<Value>;
-    fn set_risk_assessment(&self, command: RiskAssessmentCommand) -> Result<Value>;
-    fn set_risk_constraints(&self, command: RiskConstraintsCommand) -> Result<Value>;
-    fn finalize_risk_review(&self) -> Result<Value>;
-    fn set_portfolio_asset_decision(&self, command: PortfolioAssetDecisionCommand)
-        -> Result<Value>;
-    fn append_binding_risk_control(&self, command: BindingRiskControlCommand) -> Result<Value>;
-    fn finalize_portfolio_decision(&self) -> Result<Value>;
-    fn set_phase2_common_ground(&self, _: Phase2CommonGroundCommand) -> Result<Value> {
-        bail!("Phase 2 domain runtime is not wired")
-    }
-    fn create_phase2_topic(&self, _: Phase2TopicCommand) -> Result<Value> {
-        bail!("Phase 2 domain runtime is not wired")
-    }
-    fn finalize_researcher_warmup(&self) -> Result<Value> {
-        bail!("Phase 2 domain runtime is not wired")
-    }
-    fn finalize_topic_generation(&self) -> Result<Value> {
-        bail!("Phase 2 domain runtime is not wired")
-    }
-    fn create_debate_claim(&self, _: DebateClaimCommand) -> Result<Value> {
-        bail!("Phase 2 domain runtime is not wired")
-    }
-    fn finalize_debate_seed(&self) -> Result<Value> {
-        bail!("Phase 2 domain runtime is not wired")
-    }
-    fn respond_to_debate_claim(&self, _: DebateResponseCommand) -> Result<Value> {
-        bail!("Phase 2 domain runtime is not wired")
-    }
-    fn finalize_debate_response(&self) -> Result<Value> {
-        bail!("Phase 2 domain runtime is not wired")
-    }
-    fn set_claim_status(&self, _: ClaimStatusCommand) -> Result<Value> {
-        bail!("Phase 2 domain runtime is not wired")
-    }
-    fn add_agreed_fact(&self, _: TextCommand) -> Result<Value> {
-        bail!("Phase 2 domain runtime is not wired")
-    }
-    fn set_decision_hinge(&self, _: TextCommand) -> Result<Value> {
-        bail!("Phase 2 domain runtime is not wired")
-    }
-    fn route_debate_steer(&self, _: DebateSteerCommand) -> Result<Value> {
-        bail!("Phase 2 domain runtime is not wired")
-    }
-    fn set_topic_soft_control(&self, _: TopicSoftControlCommand) -> Result<Value> {
-        bail!("Phase 2 domain runtime is not wired")
-    }
-    fn finalize_topic_control(&self) -> Result<Value> {
-        bail!("Phase 2 domain runtime is not wired")
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DomainToolScope {
     pub profile: ToolManagedProfile,
@@ -347,6 +88,12 @@ pub struct DomainToolScope {
     /// Rust-derived Phase 2 claim IDs visible to this turn.  This is an
     /// allowlist, never a model-provided routing field.
     pub visible_claims: BTreeSet<String>,
+}
+
+/// The one-method crate-boundary bridge required because `orchestrator-llm`
+/// cannot depend on the workflow's concrete FileStore runtime.
+pub trait DomainCommandExecutor: Send + Sync {
+    fn execute(&self, command: DomainCommand) -> Result<Value>;
 }
 
 /// A provenance-bearing read that the Rust tool runtime, rather than the
@@ -470,7 +217,7 @@ impl DomainToolScope {
 #[derive(Clone)]
 pub struct DomainToolRuntimeBinding {
     scope: DomainToolScope,
-    service: Arc<dyn DomainToolService>,
+    service: Arc<dyn DomainCommandExecutor>,
     evidence_visibility: Arc<dyn EvidenceVisibility>,
 }
 impl fmt::Debug for DomainToolRuntimeBinding {
@@ -481,7 +228,7 @@ impl fmt::Debug for DomainToolRuntimeBinding {
     }
 }
 impl DomainToolRuntimeBinding {
-    pub fn new(scope: DomainToolScope, service: Arc<dyn DomainToolService>) -> Result<Self> {
+    pub fn new(scope: DomainToolScope, service: Arc<dyn DomainCommandExecutor>) -> Result<Self> {
         let visibility = Arc::new(InMemoryEvidenceVisibility::seeded(
             scope.visible_evidence_refs.iter().cloned(),
         ));
@@ -490,7 +237,7 @@ impl DomainToolRuntimeBinding {
 
     pub fn new_with_evidence_visibility(
         scope: DomainToolScope,
-        service: Arc<dyn DomainToolService>,
+        service: Arc<dyn DomainCommandExecutor>,
         evidence_visibility: Arc<dyn EvidenceVisibility>,
     ) -> Result<Self> {
         scope.validate()?;
@@ -519,107 +266,26 @@ impl DomainToolRuntimeBinding {
     }
 
     pub fn execute(&self, name: &str, arguments: Value) -> Result<Value> {
-        match prepare_command_with_visibility(name, arguments, &self.scope, |reference| {
+        let command = prepare_command_with_visibility(name, arguments, &self.scope, |reference| {
             if self.scope.visible_evidence_refs.contains(reference) {
                 Ok(true)
             } else {
                 self.evidence_visibility.contains(reference)
             }
-        })? {
-            DomainToolCommand::SetAnalystAssessment(command) => {
-                self.service.set_analyst_assessment(command)
-            }
-            DomainToolCommand::AppendAnalystEvidence(command) => {
-                self.service.append_analyst_evidence(command)
-            }
-            DomainToolCommand::AppendAnalystDataGap(command) => {
-                self.service.append_analyst_data_gap(command)
-            }
-            DomainToolCommand::SetAnalystInvalidation(command) => {
-                self.service.set_analyst_invalidation(command)
-            }
-            DomainToolCommand::FinalizeAnalyst => Ok(
-                json!({"status":"completed","terminal":true,"artifact":self.service.finalize_analyst_report()?}),
-            ),
-            DomainToolCommand::SetResearchDecision(command) => {
-                self.service.set_research_decision(command)
-            }
-            DomainToolCommand::SetResearchScenarios(command) => {
-                self.service.set_research_scenarios(command)
-            }
-            DomainToolCommand::AppendResearchHinge(command) => {
-                self.service.append_research_hinge(command)
-            }
-            DomainToolCommand::FinalizeResearch => Ok(
-                json!({"status":"completed","terminal":true,"artifact":self.service.finalize_research_decision()?}),
-            ),
-            DomainToolCommand::SetTradeIntent(command) => self.service.set_trade_intent(command),
-            DomainToolCommand::AppendTradeBlocker(command) => {
-                self.service.append_trade_blocker(command)
-            }
-            DomainToolCommand::FinalizeTrade => Ok(
-                json!({"status":"completed","terminal":true,"artifact":self.service.finalize_trade_intent()?}),
-            ),
-            DomainToolCommand::SetRiskAssessment(command) => {
-                self.service.set_risk_assessment(command)
-            }
-            DomainToolCommand::SetRiskConstraints(command) => {
-                self.service.set_risk_constraints(command)
-            }
-            DomainToolCommand::FinalizeRisk => Ok(
-                json!({"status":"completed","terminal":true,"artifact":self.service.finalize_risk_review()?}),
-            ),
-            DomainToolCommand::SetPortfolioAssetDecision(command) => {
-                self.service.set_portfolio_asset_decision(command)
-            }
-            DomainToolCommand::AppendBindingRiskControl(command) => {
-                self.service.append_binding_risk_control(command)
-            }
-            DomainToolCommand::FinalizePortfolio => Ok(
-                json!({"status":"completed","terminal":true,"artifact":self.service.finalize_portfolio_decision()?}),
-            ),
-            DomainToolCommand::SetPhase2CommonGround(command) => {
-                self.service.set_phase2_common_ground(command)
-            }
-            DomainToolCommand::CreatePhase2Topic(command) => {
-                self.service.create_phase2_topic(command)
-            }
-            DomainToolCommand::FinalizeResearcherWarmup => Ok(json!({
-                "status":"completed",
-                "terminal":true,
-                "warmup":self.service.finalize_researcher_warmup()?,
-                "artifact":{"status":"ready","response":"准备完毕","kind":"researcher_warmup"}
-            })),
-            DomainToolCommand::FinalizeTopicGeneration => Ok(
-                json!({"status":"completed","terminal":true,"artifact":self.service.finalize_topic_generation()?}),
-            ),
-            DomainToolCommand::CreateDebateClaim(command) => {
-                self.service.create_debate_claim(command)
-            }
-            DomainToolCommand::FinalizeDebateSeed => Ok(
-                json!({"status":"completed","terminal":true,"artifact":self.service.finalize_debate_seed()?}),
-            ),
-            DomainToolCommand::RespondToDebateClaim(command) => {
-                self.service.respond_to_debate_claim(command)
-            }
-            DomainToolCommand::FinalizeDebateResponse => Ok(
-                json!({"status":"completed","terminal":true,"artifact":self.service.finalize_debate_response()?}),
-            ),
-            DomainToolCommand::SetClaimStatus(command) => self.service.set_claim_status(command),
-            DomainToolCommand::AddAgreedFact(command) => self.service.add_agreed_fact(command),
-            DomainToolCommand::SetDecisionHinge(command) => {
-                self.service.set_decision_hinge(command)
-            }
-            DomainToolCommand::RouteDebateSteer(command) => {
-                self.service.route_debate_steer(command)
-            }
-            DomainToolCommand::SetTopicSoftControl(command) => {
-                self.service.set_topic_soft_control(command)
-            }
-            DomainToolCommand::FinalizeTopicControl => Ok(
-                json!({"status":"completed","terminal":true,"artifact":self.service.finalize_topic_control()?}),
-            ),
+        })?;
+        let warmup = command.is_researcher_warmup();
+        let terminal = command.is_terminal();
+        let result = self.service.execute(command)?;
+        if !terminal {
+            return Ok(result);
         }
+        if warmup {
+            return Ok(json!({
+                "status":"completed", "terminal":true, "warmup":result,
+                "artifact":{"status":"ready","response":"准备完毕","kind":"researcher_warmup"}
+            }));
+        }
+        Ok(json!({"status":"completed","terminal":true,"artifact":result}))
     }
 }
 
@@ -872,7 +538,7 @@ pub fn prepare_command(
     name: &str,
     arguments: Value,
     scope: &DomainToolScope,
-) -> Result<DomainToolCommand> {
+) -> Result<DomainCommand> {
     prepare_command_with_visibility(name, arguments, scope, |reference| {
         Ok(scope.visible_evidence_refs.contains(reference))
     })
@@ -883,7 +549,7 @@ fn prepare_command_with_visibility<F>(
     arguments: Value,
     scope: &DomainToolScope,
     mut is_visible: F,
-) -> Result<DomainToolCommand>
+) -> Result<DomainCommand>
 where
     F: FnMut(&str) -> Result<bool>,
 {
@@ -955,112 +621,110 @@ where
         }
     }
     let command = match name {
-        SET_ANALYST_ASSESSMENT => DomainToolCommand::SetAnalystAssessment(parse(arguments)?),
+        SET_ANALYST_ASSESSMENT => DomainCommand::SetAnalystAssessment(parse(arguments)?),
         APPEND_ANALYST_EVIDENCE => {
             let command: AnalystEvidenceCommand = parse(arguments)?;
             require_visible(&command.evidence_ref, &mut is_visible)?;
-            DomainToolCommand::AppendAnalystEvidence(command)
+            DomainCommand::AppendAnalystEvidence(command)
         }
-        APPEND_ANALYST_DATA_GAP => DomainToolCommand::AppendAnalystDataGap(parse(arguments)?),
-        SET_ANALYST_INVALIDATION => DomainToolCommand::SetAnalystInvalidation(parse(arguments)?),
+        APPEND_ANALYST_DATA_GAP => DomainCommand::AppendAnalystDataGap(parse(arguments)?),
+        SET_ANALYST_INVALIDATION => DomainCommand::SetAnalystInvalidation(parse(arguments)?),
         FINALIZE_ANALYST_REPORT => {
             empty(object, name)?;
-            DomainToolCommand::FinalizeAnalyst
+            DomainCommand::FinalizeAnalyst
         }
-        SET_RESEARCH_DECISION => DomainToolCommand::SetResearchDecision(parse(arguments)?),
-        SET_RESEARCH_SCENARIOS => DomainToolCommand::SetResearchScenarios(parse(arguments)?),
+        SET_RESEARCH_DECISION => DomainCommand::SetResearchDecision(parse(arguments)?),
+        SET_RESEARCH_SCENARIOS => DomainCommand::SetResearchScenarios(parse(arguments)?),
         APPEND_RESEARCH_HINGE => {
             let command: ResearchHingeCommand = parse(arguments)?;
             require_visible(&command.evidence_ref, &mut is_visible)?;
-            DomainToolCommand::AppendResearchHinge(command)
+            DomainCommand::AppendResearchHinge(command)
         }
         FINALIZE_RESEARCH_DECISION => {
             empty(object, name)?;
-            DomainToolCommand::FinalizeResearch
+            DomainCommand::FinalizeResearch
         }
-        SET_TRADE_INTENT => DomainToolCommand::SetTradeIntent(parse(arguments)?),
-        APPEND_TRADE_BLOCKER => DomainToolCommand::AppendTradeBlocker(parse(arguments)?),
+        SET_TRADE_INTENT => DomainCommand::SetTradeIntent(parse(arguments)?),
+        APPEND_TRADE_BLOCKER => DomainCommand::AppendTradeBlocker(parse(arguments)?),
         FINALIZE_TRADE_INTENT => {
             empty(object, name)?;
-            DomainToolCommand::FinalizeTrade
+            DomainCommand::FinalizeTrade
         }
-        SET_RISK_ASSESSMENT => DomainToolCommand::SetRiskAssessment(parse(arguments)?),
-        SET_RISK_CONSTRAINTS => DomainToolCommand::SetRiskConstraints(parse(arguments)?),
+        SET_RISK_ASSESSMENT => DomainCommand::SetRiskAssessment(parse(arguments)?),
+        SET_RISK_CONSTRAINTS => DomainCommand::SetRiskConstraints(parse(arguments)?),
         FINALIZE_RISK_REVIEW => {
             empty(object, name)?;
-            DomainToolCommand::FinalizeRisk
+            DomainCommand::FinalizeRisk
         }
-        SET_PORTFOLIO_ASSET_DECISION => {
-            DomainToolCommand::SetPortfolioAssetDecision(parse(arguments)?)
-        }
+        SET_PORTFOLIO_ASSET_DECISION => DomainCommand::SetPortfolioAssetDecision(parse(arguments)?),
         APPEND_BINDING_RISK_CONTROL => {
             let command: BindingRiskControlCommand = parse(arguments)?;
             for reference in &command.control.source_refs {
                 require_visible(reference, &mut is_visible)?;
             }
-            DomainToolCommand::AppendBindingRiskControl(command)
+            DomainCommand::AppendBindingRiskControl(command)
         }
         FINALIZE_PORTFOLIO_DECISION => {
             empty(object, name)?;
-            DomainToolCommand::FinalizePortfolio
+            DomainCommand::FinalizePortfolio
         }
-        SET_PHASE2_COMMON_GROUND => DomainToolCommand::SetPhase2CommonGround(parse(arguments)?),
+        SET_PHASE2_COMMON_GROUND => DomainCommand::SetPhase2CommonGround(parse(arguments)?),
         CREATE_PHASE2_TOPIC => {
             let command: Phase2TopicCommand = parse(arguments)?;
             for reference in &command.evidence_refs {
                 require_visible(reference, &mut is_visible)?;
             }
-            DomainToolCommand::CreatePhase2Topic(command)
+            DomainCommand::CreatePhase2Topic(command)
         }
         FINALIZE_RESEARCHER_WARMUP => {
             empty(object, name)?;
-            DomainToolCommand::FinalizeResearcherWarmup
+            DomainCommand::FinalizeResearcherWarmup
         }
         FINALIZE_TOPIC_GENERATION => {
             empty(object, name)?;
-            DomainToolCommand::FinalizeTopicGeneration
+            DomainCommand::FinalizeTopicGeneration
         }
         CREATE_DEBATE_CLAIM => {
             let command: DebateClaimCommand = parse(arguments)?;
             for reference in &command.evidence_refs {
                 require_visible(reference, &mut is_visible)?;
             }
-            DomainToolCommand::CreateDebateClaim(command)
+            DomainCommand::CreateDebateClaim(command)
         }
         FINALIZE_DEBATE_SEED => {
             empty(object, name)?;
-            DomainToolCommand::FinalizeDebateSeed
+            DomainCommand::FinalizeDebateSeed
         }
         RESPOND_TO_DEBATE_CLAIM => {
             let command: DebateResponseCommand = parse(arguments)?;
             for reference in &command.evidence_refs {
                 require_visible(reference, &mut is_visible)?;
             }
-            DomainToolCommand::RespondToDebateClaim(command)
+            DomainCommand::RespondToDebateClaim(command)
         }
         FINALIZE_DEBATE_RESPONSE => {
             empty(object, name)?;
-            DomainToolCommand::FinalizeDebateResponse
+            DomainCommand::FinalizeDebateResponse
         }
-        SET_CLAIM_STATUS => DomainToolCommand::SetClaimStatus(parse(arguments)?),
-        ADD_AGREED_FACT => DomainToolCommand::AddAgreedFact(parse(arguments)?),
-        SET_DECISION_HINGE => DomainToolCommand::SetDecisionHinge(parse(arguments)?),
-        ROUTE_DEBATE_STEER => DomainToolCommand::RouteDebateSteer(parse(arguments)?),
-        SET_TOPIC_SOFT_CONTROL => DomainToolCommand::SetTopicSoftControl(parse(arguments)?),
+        SET_CLAIM_STATUS => DomainCommand::SetClaimStatus(parse(arguments)?),
+        ADD_AGREED_FACT => DomainCommand::AddAgreedFact(parse(arguments)?),
+        SET_DECISION_HINGE => DomainCommand::SetDecisionHinge(parse(arguments)?),
+        ROUTE_DEBATE_STEER => DomainCommand::RouteDebateSteer(parse(arguments)?),
+        SET_TOPIC_SOFT_CONTROL => DomainCommand::SetTopicSoftControl(parse(arguments)?),
         FINALIZE_TOPIC_CONTROL => {
             empty(object, name)?;
-            DomainToolCommand::FinalizeTopicControl
+            DomainCommand::FinalizeTopicControl
         }
         _ => bail!("unknown domain tool {name}"),
     };
     match &command {
-        DomainToolCommand::SetAnalystAssessment(c) => ticker(scope, &c.ticker)?,
-        DomainToolCommand::AppendAnalystEvidence(c) => ticker(scope, &c.ticker)?,
-        DomainToolCommand::AppendAnalystDataGap(c) => ticker(scope, &c.ticker)?,
-        DomainToolCommand::SetAnalystInvalidation(c) => ticker(scope, &c.ticker)?,
-        DomainToolCommand::SetResearchDecision(c) => ticker(scope, &c.ticker)?,
-        DomainToolCommand::SetResearchScenarios(c) => ticker(scope, &c.ticker)?,
-        DomainToolCommand::AppendResearchHinge(c) => ticker(scope, &c.ticker)?,
+        DomainCommand::SetAnalystAssessment(c) => ticker(scope, &c.ticker)?,
+        DomainCommand::AppendAnalystEvidence(c) => ticker(scope, &c.ticker)?,
+        DomainCommand::AppendAnalystDataGap(c) => ticker(scope, &c.ticker)?,
+        DomainCommand::SetAnalystInvalidation(c) => ticker(scope, &c.ticker)?,
+        DomainCommand::SetResearchDecision(c) => ticker(scope, &c.ticker)?,
+        DomainCommand::SetResearchScenarios(c) => ticker(scope, &c.ticker)?,
+        DomainCommand::AppendResearchHinge(c) => ticker(scope, &c.ticker)?,
         _ => {}
     }
     Ok(command)
@@ -1229,7 +893,7 @@ mod tests {
     fn terminal_tool_is_profile_bound_and_has_no_arguments() {
         assert!(matches!(
             prepare_command(FINALIZE_ANALYST_REPORT, json!({}), &analyst_scope()).unwrap(),
-            DomainToolCommand::FinalizeAnalyst
+            DomainCommand::FinalizeAnalyst
         ));
         assert!(prepare_command(FINALIZE_RESEARCH_DECISION, json!({}), &analyst_scope()).is_err());
         assert!(prepare_command(
@@ -1293,7 +957,7 @@ mod tests {
                 &scope,
             )
             .unwrap(),
-            DomainToolCommand::SetRiskConstraints(_)
+            DomainCommand::SetRiskConstraints(_)
         ));
     }
 
@@ -1313,7 +977,7 @@ mod tests {
                 &scope,
             )
             .unwrap(),
-            DomainToolCommand::AppendBindingRiskControl(_)
+            DomainCommand::AppendBindingRiskControl(_)
         ));
     }
 }

@@ -1,5 +1,6 @@
 use super::ToolDefinition;
 use anyhow::{bail, Result};
+use orchestrator_core::ToolId;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -12,7 +13,7 @@ use crate::web_search::{
     WebSearchOptions, WebSearchProvider,
 };
 
-pub const NAME: &str = "web.run";
+pub const NAME: &str = ToolId::WebRun.as_str();
 const MAX_SEARCH_QUERIES: usize = 4;
 const MAX_QUERY_CHARS: usize = 512;
 

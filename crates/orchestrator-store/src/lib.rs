@@ -45,6 +45,7 @@ pub use domain::{
     ResearchDecisionArtifact, ResearchDecisionInput, ResearchDecisionPayload,
     ResearchScenarioInput, RiskAssessmentInput, RiskConstraintsInput, RiskReviewArtifact,
     TradeIntentArtifact, TradeIntentFinalizePolicy, TradeIntentInput,
+    DOMAIN_ARTIFACT_SCHEMA_VERSION,
 };
 pub use draft::{
     append_draft_receipt, apply_typed_draft_command, complete_terminal_draft_without_artifact,

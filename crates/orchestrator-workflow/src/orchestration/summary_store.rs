@@ -25,7 +25,7 @@ use super::summary_units::{
 /// phase. The RunManifest is a reference-only catalog; each referenced,
 /// finalized Artifact is read and checked here. Mutable workflow state only
 /// supplies the run identity needed to locate that catalog.
-pub(crate) fn phase_summary_source_payload(
+pub(crate) fn finalized_phase_artifact_catalog(
     store_root: &Path,
     state: &Value,
     source_phase: i64,
@@ -74,7 +74,7 @@ pub(crate) fn write_deterministic_phase_summary(
 ) -> Result<Vec<Index>> {
     let source_phase_u8 =
         u8::try_from(source_phase).context("phase summary source phase must fit in a u8")?;
-    let source_payload = phase_summary_source_payload(store_root, state, source_phase)?;
+    let source_payload = finalized_phase_artifact_catalog(store_root, state, source_phase)?;
     let source_payload_hash = content_hash(&source_payload)?;
     let run_id = required_state_string(state, "run_id")?;
     let date = required_state_string(state, "current_date")?;
@@ -112,7 +112,7 @@ pub(crate) fn planned_summary_units(
 ) -> Result<(Value, Vec<SummaryUnit>)> {
     let source_phase_u8 =
         u8::try_from(source_phase).context("phase summary source phase must fit in a u8")?;
-    let source_payload = phase_summary_source_payload(store_root, state, source_phase)?;
+    let source_payload = finalized_phase_artifact_catalog(store_root, state, source_phase)?;
     let source_payload_hash = content_hash(&source_payload)?;
     let run_id = required_state_string(state, "run_id")?;
     let units = SummaryUnitPlanner::plan(SummaryUnitPlanRequest {
@@ -239,16 +239,58 @@ fn compact_detail(value: &Value) -> String {
 }
 
 fn source_for_unit(source_payload: &Value, unit: &SummaryUnit) -> Value {
-    // A fallback Detail must remain independently intelligible and cannot
-    // manufacture information.  It therefore stores the bounded, already
-    // Rust-selected phase payload plus explicit unit identity.
+    // A fallback Detail must remain independently intelligible without
+    // duplicating the phase catalog. Keep only the finalized artifacts that
+    // belong to this Unit and their typed payloads; the Artifact files remain
+    // the authority for every other field.
+    let mut authoritative_fields = Map::new();
+    let mut artifact_ids = Vec::new();
+    for artifact in source_payload
+        .get("artifacts")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|artifacts| artifacts.values())
+        .filter(|artifact| artifact_matches_unit(artifact, unit))
+    {
+        let Some(artifact_id) = artifact.get("artifact_id").and_then(Value::as_str) else {
+            continue;
+        };
+        artifact_ids.push(Value::String(artifact_id.to_owned()));
+        authoritative_fields.insert(
+            artifact_id.to_owned(),
+            json!({
+                "role": artifact.get("role"),
+                "profile": artifact.get("profile"),
+                "phase": artifact.get("phase"),
+                "unit_key": artifact.get("unit_key"),
+                "ticker": artifact.get("ticker"),
+                "topic_id": artifact.get("topic_id"),
+                "payload": artifact.get("payload"),
+            }),
+        );
+    }
     json!({
         "unit_key": unit.unit_key,
         "role": unit.role,
         "ticker": unit.ticker,
         "topic_id": unit.topic_id,
-        "source_payload": source_payload,
+        "finalized_artifact_ids": artifact_ids,
+        "authoritative_fields": authoritative_fields,
+        "degraded_reason": "deterministic phase summary; no model-generated summary was available",
     })
+}
+
+fn artifact_matches_unit(artifact: &Value, unit: &SummaryUnit) -> bool {
+    let role_matches = artifact.get("role").and_then(Value::as_str) == Some(unit.role.as_str());
+    let ticker_matches = unit
+        .ticker
+        .as_deref()
+        .is_none_or(|ticker| artifact.get("ticker").and_then(Value::as_str) == Some(ticker));
+    let topic_matches = unit
+        .topic_id
+        .as_deref()
+        .is_none_or(|topic_id| artifact.get("topic_id").and_then(Value::as_str) == Some(topic_id));
+    role_matches && ticker_matches && topic_matches
 }
 
 fn required_state_string(state: &Value, key: &str) -> Result<String> {
@@ -404,9 +446,9 @@ mod tests {
         let store = FileStore::open(temp.path(), Default::default()).unwrap();
         let location = RunLocation::new("2026-07-27", "run-1").unwrap();
         let source_hash = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let artifact_relative = Path::new("artifacts/phase3/research-decision.json");
+        let artifact_relative = Path::new("artifacts/phase3/QQQ.json");
         let mut artifact = json!({
-            "schema_version": 1,
+            "schema_version": orchestrator_store::DOMAIN_ARTIFACT_SCHEMA_VERSION,
             "artifact_id": "artifact-research-qqq",
             "run_id": "run-1",
             "phase": 3,
@@ -414,7 +456,12 @@ mod tests {
             "profile": "research_decision",
             "unit_key": "phase3:research-decision:ticker:QQQ",
             "source_payload_hash": source_hash,
-            "per_ticker": {"QQQ": {"rating": "Hold"}},
+            "ticker": "QQQ",
+            "topic_id": null,
+            "side": null,
+            "stance": null,
+            "round": null,
+            "payload": {"decision": {"rating": "Hold"}, "decision_hinges": []},
             "evidence_refs": [],
             "created_at": "2026-07-27T00:00:00Z",
             "content_hash": "",
@@ -457,7 +504,28 @@ mod tests {
             "run_id": "run-1",
             "current_date": "2026-07-27",
         });
-        let source = phase_summary_source_payload(temp.path(), &state, 3).unwrap();
+        let source = finalized_phase_artifact_catalog(temp.path(), &state, 3).unwrap();
+        let unit = SummaryUnit {
+            source_phase: 3,
+            role: "manager.research".to_owned(),
+            ticker: Some("QQQ".to_owned()),
+            topic_id: None,
+            unit_key: "phase3:research-decision:ticker:QQQ".to_owned(),
+            source_payload_hash: source_hash.to_owned(),
+            index_id: "idx-test".to_owned(),
+        };
+        let fallback = source_for_unit(&source, &unit);
+        assert!(fallback.get("source_payload").is_none());
+        assert_eq!(
+            fallback["finalized_artifact_ids"],
+            json!(["artifact-research-qqq"])
+        );
+        assert_eq!(
+            fallback["authoritative_fields"]["artifact-research-qqq"]["payload"]["decision"]
+                ["rating"],
+            json!("Hold")
+        );
+        assert!(fallback["degraded_reason"].is_string());
         let mutated_state = json!({
             "run_id": "run-1",
             "current_date": "2026-07-27",
@@ -466,7 +534,7 @@ mod tests {
         });
         assert_eq!(
             source,
-            phase_summary_source_payload(temp.path(), &mutated_state, 3).unwrap()
+            finalized_phase_artifact_catalog(temp.path(), &mutated_state, 3).unwrap()
         );
         let result = write_deterministic_phase_summary(temp.path(), &state, 3, 32).unwrap();
         assert_eq!(result.len(), 1);
