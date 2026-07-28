@@ -1379,10 +1379,7 @@ mod tests {
         let finalized = binding.execute(FINALIZE_ANALYST_REPORT, json!({})).unwrap();
         assert_eq!(finalized["terminal"], true);
         assert_eq!(finalized["artifact"]["role"], "analyst.technical");
-        assert_eq!(
-            finalized["artifact"]["payload"]["per_ticker"]["QQQ"]["report"],
-            "test report"
-        );
+        assert_eq!(finalized["artifact"]["payload"]["report"], "test report");
         let recovered = binding.execute(FINALIZE_ANALYST_REPORT, json!({})).unwrap();
         assert_eq!(recovered["artifact"], finalized["artifact"]);
         let artifacts = temp

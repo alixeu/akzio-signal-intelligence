@@ -126,11 +126,6 @@ pub struct PortfolioDecisionFinalizePolicy {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct AnalystReportPayload {
-    pub per_ticker: BTreeMap<String, AnalystTickerArtifact>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResearchDecisionPayload {
     pub primary: ResearchDecision,
     pub per_ticker: BTreeMap<String, ResearchDecision>,
@@ -164,7 +159,7 @@ pub struct CanonicalArtifact<T> {
 pub type TradeIntentArtifact = CanonicalArtifact<TradeIntent>;
 pub type RiskReviewArtifact = CanonicalArtifact<RiskConstraints>;
 pub type PortfolioDecisionArtifact = CanonicalArtifact<FinalValidation>;
-pub type AnalystArtifact = CanonicalArtifact<AnalystReportPayload>;
+pub type AnalystArtifact = CanonicalArtifact<AnalystTickerArtifact>;
 pub type ResearchDecisionArtifact = CanonicalArtifact<ResearchDecisionPayload>;
 
 impl<T> CanonicalArtifact<T> {
@@ -540,34 +535,6 @@ pub fn finalize_analyst_report(
         return Err(profile_state_error("analyst_report").unwrap_err());
     };
     ensure_exact_tickers(&state.assessments, expected_tickers, "analyst report")?;
-    let mut per_ticker = BTreeMap::new();
-    for (ticker, draft) in state.assessments {
-        let artifact = AnalystTickerArtifact {
-            direction: draft.direction,
-            confidence: draft.confidence,
-            report: draft.report,
-            key_evidence: draft.key_evidence,
-            priced_in: draft.priced_in,
-            echo_chamber_risk: draft.echo_chamber_risk,
-            crowded_consensus_risk: draft.crowded_consensus_risk,
-            validation_triggers: draft.validation_triggers,
-            data_gaps: draft.data_gaps,
-        };
-        validate_analyst_ticker_artifact(&artifact).map_err(|message| {
-            StoreError::InvalidDocument {
-                kind: "analyst finalizer",
-                message: format!("{ticker}: {message}"),
-            }
-        })?;
-        per_ticker.insert(ticker, artifact);
-    }
-    let artifact = CanonicalArtifact::new(
-        scope,
-        artifact_id(scope, "analyst")?,
-        AnalystReportPayload { per_ticker },
-        state.metadata.evidence_refs.into_iter().collect(),
-        created_at,
-    );
     let ticker = scope
         .ticker
         .as_deref()
@@ -582,6 +549,35 @@ pub fn finalize_analyst_report(
                 .to_owned(),
         });
     }
+    let draft = state
+        .assessments
+        .get(ticker)
+        .ok_or_else(|| StoreError::InvalidDocument {
+            kind: "analyst finalizer",
+            message: format!("analyst report missing assessment for {ticker}"),
+        })?;
+    let payload = AnalystTickerArtifact {
+        direction: draft.direction.clone(),
+        confidence: draft.confidence,
+        report: draft.report.clone(),
+        key_evidence: draft.key_evidence.clone(),
+        priced_in: draft.priced_in.clone(),
+        echo_chamber_risk: draft.echo_chamber_risk.clone(),
+        crowded_consensus_risk: draft.crowded_consensus_risk.clone(),
+        validation_triggers: draft.validation_triggers.clone(),
+        data_gaps: draft.data_gaps.clone(),
+    };
+    validate_analyst_ticker_artifact(&payload).map_err(|message| StoreError::InvalidDocument {
+        kind: "analyst finalizer",
+        message: format!("{ticker}: {message}"),
+    })?;
+    let artifact = CanonicalArtifact::new(
+        scope,
+        artifact_id(scope, "analyst")?,
+        payload,
+        state.metadata.evidence_refs.into_iter().collect(),
+        created_at,
+    );
     let relative = PathBuf::from("artifacts")
         .join("phase1")
         .join(SafeSlug::new("role", &scope.role)?.as_str())

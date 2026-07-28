@@ -859,11 +859,8 @@ async fn run_phase1(
             let entry = reports
                 .entry(role.to_owned())
                 .or_insert_with(|| json!({"role": role, "per_ticker": {}}));
-            entry["per_ticker"][ticker] = artifact
-                .get("per_ticker")
-                .and_then(|items| items.get(&ticker))
-                .cloned()
-                .unwrap_or(artifact.clone());
+            entry["per_ticker"][ticker] =
+                artifact.get("payload").cloned().unwrap_or(artifact.clone());
         }
     }
     state["analyst_reports"] = Value::Object(reports);
@@ -1724,7 +1721,7 @@ fn phase1_index(state: &Value) -> serde_json::Map<String, Value> {
                         .iter()
                         .filter_map(|(role, report)| {
                             report
-                                .pointer(&format!("/payload/per_ticker/{ticker}"))
+                                .pointer(&format!("/per_ticker/{ticker}"))
                                 .map(|value| json!({"role": role, "artifact": value}))
                         })
                         .collect::<Vec<_>>()
