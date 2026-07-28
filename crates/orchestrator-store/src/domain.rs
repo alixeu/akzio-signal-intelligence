@@ -6,7 +6,7 @@
 
 use std::{collections::BTreeMap, path::PathBuf};
 
-use orchestrator_core::artifact::{ResearchDecision, Scenario, Scenarios};
+use orchestrator_core::artifact::{ResearchDecision, Scenario};
 use orchestrator_core::{
     validate_analyst_ticker_artifact, validate_final_validation, validate_research_decision,
     validate_risk_constraints, validate_trade_intent, AnalystTickerArtifact,
@@ -126,44 +126,15 @@ pub struct PortfolioDecisionFinalizePolicy {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct AnalystArtifact {
-    pub schema_version: u32,
-    pub artifact_id: String,
-    pub run_id: String,
-    pub phase: u8,
-    pub role: String,
-    pub profile: String,
-    pub unit_key: String,
-    pub source_payload_hash: String,
+pub struct AnalystReportPayload {
     pub per_ticker: BTreeMap<String, AnalystTickerArtifact>,
-    pub evidence_refs: Vec<String>,
-    pub created_at: String,
-    pub content_hash: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ResearchDecisionArtifact {
-    pub schema_version: u32,
-    pub artifact_id: String,
-    pub run_id: String,
-    pub phase: u8,
-    pub role: String,
-    pub profile: String,
-    pub unit_key: String,
-    pub source_payload_hash: String,
-    pub rating: String,
-    pub long_probability: f64,
-    pub short_probability: f64,
-    pub confidence_basis: String,
-    pub hold_reason: Option<String>,
-    pub plan: String,
-    pub probability_rationale: String,
-    pub scenarios: Option<Scenarios>,
+pub struct ResearchDecisionPayload {
+    pub primary: ResearchDecision,
     pub per_ticker: BTreeMap<String, ResearchDecision>,
     pub decision_hinges: BTreeMap<String, Vec<String>>,
-    pub evidence_refs: Vec<String>,
-    pub created_at: String,
-    pub content_hash: String,
 }
 
 /// The one persisted envelope shared by all typed ToolManaged payloads.
@@ -193,6 +164,8 @@ pub struct CanonicalArtifact<T> {
 pub type TradeIntentArtifact = CanonicalArtifact<TradeIntent>;
 pub type RiskReviewArtifact = CanonicalArtifact<RiskConstraints>;
 pub type PortfolioDecisionArtifact = CanonicalArtifact<FinalValidation>;
+pub type AnalystArtifact = CanonicalArtifact<AnalystReportPayload>;
+pub type ResearchDecisionArtifact = CanonicalArtifact<ResearchDecisionPayload>;
 
 impl<T> CanonicalArtifact<T> {
     fn new(
@@ -224,24 +197,6 @@ impl<T> CanonicalArtifact<T> {
     }
 }
 
-impl ContentHashDocument for AnalystArtifact {
-    fn content_hash(&self) -> &str {
-        &self.content_hash
-    }
-    fn set_content_hash(&mut self, hash: String) {
-        self.content_hash = hash;
-    }
-}
-
-impl ContentHashDocument for ResearchDecisionArtifact {
-    fn content_hash(&self) -> &str {
-        &self.content_hash
-    }
-    fn set_content_hash(&mut self, hash: String) {
-        self.content_hash = hash;
-    }
-}
-
 impl<T: Serialize> ContentHashDocument for CanonicalArtifact<T> {
     fn content_hash(&self) -> &str {
         &self.content_hash
@@ -249,24 +204,6 @@ impl<T: Serialize> ContentHashDocument for CanonicalArtifact<T> {
 
     fn set_content_hash(&mut self, hash: String) {
         self.content_hash = hash;
-    }
-}
-
-impl FinalizableArtifact for AnalystArtifact {
-    fn artifact_id(&self) -> &str {
-        &self.artifact_id
-    }
-    fn source_payload_hash(&self) -> &str {
-        &self.source_payload_hash
-    }
-}
-
-impl FinalizableArtifact for ResearchDecisionArtifact {
-    fn artifact_id(&self) -> &str {
-        &self.artifact_id
-    }
-    fn source_payload_hash(&self) -> &str {
-        &self.source_payload_hash
     }
 }
 
@@ -624,20 +561,13 @@ pub fn finalize_analyst_report(
         })?;
         per_ticker.insert(ticker, artifact);
     }
-    let artifact = AnalystArtifact {
-        schema_version: DOMAIN_ARTIFACT_SCHEMA_VERSION,
-        artifact_id: artifact_id(scope, "analyst")?,
-        run_id: scope.run_id.clone(),
-        phase: scope.phase,
-        role: scope.role.clone(),
-        profile: scope.profile.as_str().to_owned(),
-        unit_key: scope.unit_key.clone(),
-        source_payload_hash: scope.source_payload_hash.clone(),
-        per_ticker,
-        evidence_refs: state.metadata.evidence_refs.into_iter().collect(),
-        created_at: created_at.to_owned(),
-        content_hash: String::new(),
-    };
+    let artifact = CanonicalArtifact::new(
+        scope,
+        artifact_id(scope, "analyst")?,
+        AnalystReportPayload { per_ticker },
+        state.metadata.evidence_refs.into_iter().collect(),
+        created_at,
+    );
     let ticker = scope
         .ticker
         .as_deref()
@@ -703,15 +633,7 @@ pub fn finalize_research_decision(
             kind: "research finalizer",
             message: "at least one ticker is required".to_owned(),
         })?;
-    let artifact = ResearchDecisionArtifact {
-        schema_version: DOMAIN_ARTIFACT_SCHEMA_VERSION,
-        artifact_id: artifact_id(scope, "research")?,
-        run_id: scope.run_id.clone(),
-        phase: scope.phase,
-        role: scope.role.clone(),
-        profile: scope.profile.as_str().to_owned(),
-        unit_key: scope.unit_key.clone(),
-        source_payload_hash: scope.source_payload_hash.clone(),
+    let primary = ResearchDecision {
         rating: first.rating.clone(),
         long_probability: first.long_probability,
         short_probability: first.short_probability,
@@ -720,12 +642,18 @@ pub fn finalize_research_decision(
         plan: first.plan.clone(),
         probability_rationale: first.probability_rationale.clone(),
         scenarios: first.scenarios.clone(),
-        per_ticker,
-        decision_hinges: hinges,
-        evidence_refs: state.metadata.evidence_refs.into_iter().collect(),
-        created_at: created_at.to_owned(),
-        content_hash: String::new(),
     };
+    let artifact = CanonicalArtifact::new(
+        scope,
+        artifact_id(scope, "research")?,
+        ResearchDecisionPayload {
+            primary,
+            per_ticker,
+            decision_hinges: hinges,
+        },
+        state.metadata.evidence_refs.into_iter().collect(),
+        created_at,
+    );
     let relative = PathBuf::from("artifacts")
         .join("phase3")
         .join("research-decision.json");

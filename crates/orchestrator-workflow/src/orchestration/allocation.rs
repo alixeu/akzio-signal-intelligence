@@ -39,13 +39,20 @@ pub(crate) fn compute_allocation_context(
         .get("research_plan")
         .and_then(Value::as_object)
         .ok_or_else(|| anyhow::anyhow!("allocation context requires a validated research_plan"))?;
-    let research_per_ticker = research_plan.get("per_ticker").and_then(Value::as_object);
+    let research_payload = research_plan.get("payload");
+    let research_per_ticker = research_payload
+        .and_then(|payload| payload.get("per_ticker"))
+        .and_then(Value::as_object);
     let per_ticker = investable
         .iter()
         .map(|ticker| -> Result<(String, Value)> {
             let research = research_per_ticker
                 .and_then(|items| items.get(ticker))
-                .or_else(|| state.get("research_plan").filter(|_| investable.len() == 1))
+                .or_else(|| {
+                    research_payload
+                        .and_then(|payload| payload.get("primary"))
+                        .filter(|_| investable.len() == 1)
+                })
                 .ok_or_else(|| anyhow::anyhow!("research_plan missing ticker {ticker}"))?;
             let rating = research
                 .get("rating")
@@ -378,6 +385,9 @@ fn validate_allocation_research_input(state: &Value, context: &Value) -> Result<
     let research = research_value
         .as_object()
         .ok_or_else(|| anyhow::anyhow!("allocation requires a validated research_plan"))?;
+    let research_payload = research
+        .get("payload")
+        .ok_or_else(|| anyhow::anyhow!("allocation requires a canonical research payload"))?;
     let tickers = context
         .get("investable_assets")
         .and_then(Value::as_array)
@@ -386,11 +396,15 @@ fn validate_allocation_research_input(state: &Value, context: &Value) -> Result<
         bail!("allocation requires at least one investable asset");
     }
     for ticker in tickers.iter().filter_map(Value::as_str) {
-        let payload = research
+        let payload = research_payload
             .get("per_ticker")
             .and_then(Value::as_object)
             .and_then(|items| items.get(ticker))
-            .or_else(|| (tickers.len() == 1).then_some(research_value))
+            .or_else(|| {
+                (tickers.len() == 1)
+                    .then(|| research_payload.get("primary"))
+                    .flatten()
+            })
             .ok_or_else(|| anyhow::anyhow!("research_plan missing ticker {ticker}"))?;
         let probability = payload
             .get("final_probability")
@@ -1138,7 +1152,7 @@ mod tests {
     fn guarded_allocation_requires_probability_for_every_investable_ticker() {
         let state = json!({
             "research_plan": {
-                "per_ticker": {"QQQ": {"long_probability": 0.61}}
+                "payload": {"per_ticker": {"QQQ": {"long_probability": 0.61}}}
             }
         });
 
@@ -1152,10 +1166,10 @@ mod tests {
         let state = json!({
             "tickers": ["QQQ", "SOXX", "VIX"],
             "research_plan": {
-                "per_ticker": {
+                "payload": {"per_ticker": {
                     "QQQ": {"rating": "Buy", "long_probability": 0.61},
                     "SOXX": {"rating": "Hold"}
-                }
+                }}
             }
         });
         let error = compute_allocation_context(&state, &test_config()).unwrap_err();
@@ -1169,10 +1183,10 @@ mod tests {
     fn guarded_allocation_is_finite_capped_and_excludes_regime_signal() {
         let state = json!({
             "research_plan": {
-                "per_ticker": {
+                "payload": {"per_ticker": {
                     "QQQ": {"long_probability": 0.61},
                     "SOXX": {"final_probability": 0.58}
-                }
+                }}
             }
         });
 
@@ -1198,10 +1212,10 @@ mod tests {
     fn phase6_wait_constraints_preserve_current_weight() {
         let state = json!({
             "research_plan": {
-                "per_ticker": {
+                "payload": {"per_ticker": {
                     "QQQ": {"long_probability": 0.61},
                     "SOXX": {"long_probability": 0.58}
-                }
+                }}
             },
             "final_trade_decision": {
                 "execution_status": "wait",

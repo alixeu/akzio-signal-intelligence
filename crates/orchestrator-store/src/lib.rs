@@ -40,11 +40,11 @@ pub use domain::{
     finalize_trade_intent, set_analyst_assessment, set_analyst_invalidation,
     set_portfolio_asset_decision, set_research_decision, set_research_scenarios,
     set_risk_assessment, set_risk_constraints, set_trade_intent, AnalystArtifact,
-    AnalystAssessmentInput, AnalystEvidenceInput, CanonicalArtifact, DomainFinalizeOutcome,
-    PortfolioAssetDecisionInput, PortfolioDecisionArtifact, PortfolioDecisionFinalizePolicy,
-    ResearchDecisionArtifact, ResearchDecisionInput, ResearchScenarioInput, RiskAssessmentInput,
-    RiskConstraintsInput, RiskReviewArtifact, TradeIntentArtifact, TradeIntentFinalizePolicy,
-    TradeIntentInput,
+    AnalystAssessmentInput, AnalystEvidenceInput, AnalystReportPayload, CanonicalArtifact,
+    DomainFinalizeOutcome, PortfolioAssetDecisionInput, PortfolioDecisionArtifact,
+    PortfolioDecisionFinalizePolicy, ResearchDecisionArtifact, ResearchDecisionInput,
+    ResearchDecisionPayload, ResearchScenarioInput, RiskAssessmentInput, RiskConstraintsInput,
+    RiskReviewArtifact, TradeIntentArtifact, TradeIntentFinalizePolicy, TradeIntentInput,
 };
 pub use draft::{
     append_draft_receipt, apply_typed_draft_command, complete_terminal_draft_without_artifact,

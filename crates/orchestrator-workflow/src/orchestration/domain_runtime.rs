@@ -1380,7 +1380,7 @@ mod tests {
         assert_eq!(finalized["terminal"], true);
         assert_eq!(finalized["artifact"]["role"], "analyst.technical");
         assert_eq!(
-            finalized["artifact"]["per_ticker"]["QQQ"]["report"],
+            finalized["artifact"]["payload"]["per_ticker"]["QQQ"]["report"],
             "test report"
         );
         let recovered = binding.execute(FINALIZE_ANALYST_REPORT, json!({})).unwrap();
@@ -1533,7 +1533,7 @@ mod tests {
         )
         .unwrap();
 
-        let decision = &artifact["per_ticker"]["QQQ"];
+        let decision = &artifact["payload"]["per_ticker"]["QQQ"];
         assert_eq!(decision["rating"], "Hold");
         assert_eq!(decision["confidence_basis"], "data_insufficient");
         assert_eq!(decision["hold_reason"], "evidence_insufficient");

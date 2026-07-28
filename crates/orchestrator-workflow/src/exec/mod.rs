@@ -322,7 +322,10 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         "store_root": store.root(),
         "debate_mode": "file_store",
         "degraded": state["degraded"],
-        "rating": state.pointer("/research_plan/rating").cloned().unwrap_or(Value::Null),
+        "rating": state
+            .pointer("/research_plan/payload/primary/rating")
+            .cloned()
+            .unwrap_or(Value::Null),
         "action": tickers_from_state(&state)
             .first()
             .and_then(|ticker| {
@@ -1385,8 +1388,10 @@ fn finalize_degraded_tool_managed_unit(
         .unwrap_or_else(|| tickers_from_state(state));
     let trade_candidate_action = tickers.first().and_then(|ticker| {
         state
-            .pointer(&format!("/research_plan/per_ticker/{ticker}/rating"))
-            .or_else(|| state.pointer("/research_plan/rating"))
+            .pointer(&format!(
+                "/research_plan/payload/per_ticker/{ticker}/rating"
+            ))
+            .or_else(|| state.pointer("/research_plan/payload/primary/rating"))
             .and_then(Value::as_str)
             .map(|rating| match rating {
                 "Buy" | "Overweight" => "Buy",
@@ -1397,8 +1402,10 @@ fn finalize_degraded_tool_managed_unit(
     });
     let portfolio_rating = tickers.first().and_then(|ticker| {
         state
-            .pointer(&format!("/research_plan/per_ticker/{ticker}/rating"))
-            .or_else(|| state.pointer("/research_plan/rating"))
+            .pointer(&format!(
+                "/research_plan/payload/per_ticker/{ticker}/rating"
+            ))
+            .or_else(|| state.pointer("/research_plan/payload/primary/rating"))
             .and_then(Value::as_str)
             .map(ToOwned::to_owned)
     });
@@ -1717,7 +1724,7 @@ fn phase1_index(state: &Value) -> serde_json::Map<String, Value> {
                         .iter()
                         .filter_map(|(role, report)| {
                             report
-                                .pointer(&format!("/per_ticker/{ticker}"))
+                                .pointer(&format!("/payload/per_ticker/{ticker}"))
                                 .map(|value| json!({"role": role, "artifact": value}))
                         })
                         .collect::<Vec<_>>()
