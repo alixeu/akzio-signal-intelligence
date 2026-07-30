@@ -9,8 +9,8 @@ use orchestrator_core::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    append_jsonl_locked, content_hash, ContentHashDocument, FileStore, JsonlRecord, Result,
-    SafeSlug, StoreError, Versioned,
+    append_jsonl, content_hash, ContentHashDocument, FileStore, JsonlRecord, Result, SafeSlug,
+    StoreError, Versioned,
 };
 
 pub const EXPERIENCE_EVENT_SCHEMA_VERSION: u32 = 3;
@@ -108,27 +108,28 @@ impl ExperienceLedger {
     pub fn append(&self, mut event: ExperienceEventV1) -> Result<ExperienceEventV1> {
         validate_event_fields(&event)?;
         let path = event_path(&event.pattern_id)?;
-        let lock = lock_path(&event.pattern_id)?;
-        self.store.with_exclusive_lock(&lock, || {
-            let existing = if self.store.exists(&path)? {
-                crate::read_jsonl_recover_tail::<ExperienceEventV1>(self.store.root(), &path)?
-            } else {
-                Vec::new()
-            };
-            if let Some(previous) = existing.iter().find(|previous| {
-                previous.operation == event.operation
-                    && previous.source_run_id == event.source_run_id
-                    && previous.outcome_id == event.outcome_id
-            }) {
-                return Ok(previous.clone());
-            }
-            let next = existing.last().map_or(1, |item| item.sequence + 1);
-            event.sequence = next;
-            event.event_id = content_hash(&serde_json::json!({"pattern": event.pattern_id, "sequence": next, "operation": event.operation, "source": event.source_run_id, "outcome": event.outcome_id}))?;
-            event.content_hash = content_hash(&serde_json::to_value(&event).map_err(|source| StoreError::JsonSerialize { source })?)?;
-            append_jsonl_locked(self.store.root(), &path, &event)?;
-            Ok(event.clone())
-        })
+        let existing = if self.store.exists(&path)? {
+            crate::read_jsonl_recover_tail::<ExperienceEventV1>(self.store.root(), &path)?
+        } else {
+            Vec::new()
+        };
+        if let Some(previous) = existing.iter().find(|previous| {
+            previous.operation == event.operation
+                && previous.source_run_id == event.source_run_id
+                && previous.outcome_id == event.outcome_id
+        }) {
+            return Ok(previous.clone());
+        }
+        let next = existing.last().map_or(1, |item| item.sequence + 1);
+        event.sequence = next;
+        event.event_id = content_hash(
+            &serde_json::json!({"pattern": event.pattern_id, "sequence": next, "operation": event.operation, "source": event.source_run_id, "outcome": event.outcome_id}),
+        )?;
+        event.content_hash = content_hash(
+            &serde_json::to_value(&event).map_err(|source| StoreError::JsonSerialize { source })?,
+        )?;
+        append_jsonl(self.store.root(), &path, &event)?;
+        Ok(event)
     }
 
     /// Read only the typed, rebuildable View documents. Retrieval must not
@@ -380,13 +381,6 @@ fn view_path(pattern_id: &str) -> Result<PathBuf> {
         SafeSlug::new("pattern", pattern_id)?.as_str()
     )))
 }
-fn lock_path(pattern_id: &str) -> Result<PathBuf> {
-    Ok(PathBuf::from("knowledge/experiences/.locks").join(format!(
-        "{}.lock",
-        SafeSlug::new("pattern", pattern_id)?.as_str()
-    )))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

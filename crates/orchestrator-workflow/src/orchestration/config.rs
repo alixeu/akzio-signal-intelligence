@@ -41,6 +41,9 @@ pub(crate) struct RuntimeConfig {
     /// Immutable FileStore ownership for every role/profile, captured in the
     /// run manifest before recovery is permitted.
     pub role_profile_registry: RoleProfileRegistry,
+    /// One in-memory budget/cache shared by every Phase 2 role job in this run.
+    pub evidence_research_coordinator:
+        orchestrator_llm::tools::research_evidence_gap::EvidenceResearchCoordinator,
 }
 
 #[derive(Debug, Clone)]
@@ -53,7 +56,6 @@ pub(crate) struct StoreConfig {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ToolManagedConfig {
-    pub max_write_calls_per_role: usize,
     pub max_summary_units_per_phase: usize,
 }
 
@@ -77,7 +79,7 @@ impl RetrievalConfig {
             detail_page_limit: bounded("orchestrator.retrieval.detail_page_limit", 20),
             phase2_max_details: bounded("orchestrator.retrieval.phase2_max_details", 4),
             phase3_max_details: bounded("orchestrator.retrieval.phase3_max_details", 6),
-            phase4_max_details: bounded("orchestrator.retrieval.phase4_max_details", 6),
+            phase4_max_details: bounded("orchestrator.retrieval.phase4_max_details", 2),
             phase5_max_details: bounded("orchestrator.retrieval.phase5_max_details", 4),
             phase6_max_details: bounded("orchestrator.retrieval.phase6_max_details", 8),
             reflection_max_details: bounded("orchestrator.retrieval.reflection_max_details", 8),
@@ -210,18 +212,11 @@ impl ToolManagedConfig {
         const PATH: &str = "orchestrator.tool_managed";
         let object = strict_optional_object(config, PATH)?;
         if let Some(object) = object {
-            validate_known_fields(
-                object,
-                PATH,
-                ["max_write_calls_per_role", "max_summary_units_per_phase"],
-            )?;
+            validate_known_fields(object, PATH, ["max_summary_units_per_phase"])?;
         }
-        let max_write_calls_per_role =
-            strict_bounded_usize(object, PATH, "max_write_calls_per_role", 20, 1, 1_000)?;
         let max_summary_units_per_phase =
             strict_bounded_usize(object, PATH, "max_summary_units_per_phase", 32, 1, 256)?;
         Ok(Self {
-            max_write_calls_per_role,
             max_summary_units_per_phase,
         })
     }
@@ -415,10 +410,20 @@ impl RuntimeConfig {
             config,
             &mut prompts,
             &mut versions,
-            "compressor.phase_summary",
-            "orchestrator.prompts.compressor.phase_summary",
-            "prompts/phase_summary/phase_summary.md",
+            "researcher.web_evidence",
+            "orchestrator.prompts.phase2.web_evidence",
+            "prompts/phase2/web_evidence_researcher.md",
         )?;
+        for phase in 0..=6 {
+            insert_prompt_entry(
+                config,
+                &mut prompts,
+                &mut versions,
+                &format!("compressor.phase{phase}"),
+                &format!("orchestrator.prompts.compressor.phase{phase}"),
+                &format!("prompts/phase{phase}/summary.md"),
+            )?;
+        }
         insert_prompt_entry(
             config,
             &mut prompts,
@@ -501,6 +506,7 @@ impl RuntimeConfig {
             tool_managed: ToolManagedConfig::from_value(config)?,
             component_plugins,
             role_profile_registry,
+            evidence_research_coordinator: Default::default(),
         })
     }
 }
@@ -566,7 +572,7 @@ fn builtin_llm_role_values() -> BTreeMap<String, Value> {
     for (role, max_turns, reasoning_effort, web_search_live) in [
         ("reflector.historical", 6, Some("medium"), false),
         ("analyst.technical", 12, None, false),
-        ("analyst.news_macro", 6, None, true),
+        ("analyst.news_macro", 10, None, true),
         // Phase-2 roles read the compact index, then expand selected summaries.
         ("mediator.topic", 6, Some("medium"), false),
         ("researcher.bull.initial", 10, None, false),
@@ -574,6 +580,7 @@ fn builtin_llm_role_values() -> BTreeMap<String, Value> {
         ("researcher.bull.interaction", 10, None, false),
         ("researcher.bear.interaction", 10, None, false),
         ("mediator.topic_controller", 10, Some("medium"), false),
+        ("researcher.web_evidence", 6, Some("medium"), true),
         ("manager.research", 6, Some("medium"), false),
         ("compressor.phase_summary", 4, None, false),
         ("trader", 6, None, false),
@@ -703,6 +710,7 @@ pub(crate) fn required_llm_roles() -> Vec<String> {
         "researcher.bull.interaction",
         "researcher.bear.interaction",
         "mediator.topic_controller",
+        "researcher.web_evidence",
         "manager.research",
         "compressor.phase_summary",
     ]
@@ -1059,7 +1067,6 @@ mod tests {
     #[test]
     fn tool_managed_config_defaults_and_enforces_bounded_repair_policy() {
         let defaults = ToolManagedConfig::from_value(&json!({})).unwrap();
-        assert_eq!(defaults.max_write_calls_per_role, 20);
         assert_eq!(defaults.max_summary_units_per_phase, 32);
 
         let error = ToolManagedConfig::from_value(&json!({
@@ -1117,6 +1124,7 @@ mod tests {
     fn role_tool_allowlists_are_not_configurable() {
         let roles = builtin_llm_role_values();
         assert!(roles.values().all(|role| role.get("tools").is_none()));
+        assert_eq!(roles["analyst.news_macro"]["max_turns"], 10);
         let registry = RoleProfileRegistry::builtin();
         assert!(registry
             .registration(

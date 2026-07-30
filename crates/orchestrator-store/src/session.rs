@@ -407,14 +407,11 @@ pub fn append_session_event(
 ) -> Result<SessionEvent> {
     session.validate_for_location(location)?;
     let events_relative = location.turn_events_relative(&input.turn_id)?;
-    let lock_relative = events_relative.with_extension("jsonl.append.lock");
-    store.with_exclusive_lock(&lock_relative, || {
-        let previous = read_jsonl_recover_tail::<SessionEvent>(store.root(), &events_relative)?;
-        let sequence = previous.last().map_or(1, |event| event.sequence + 1);
-        let event = SessionEvent::new(sequence, session, input)?;
-        store.append_jsonl_locked(&events_relative, &event)?;
-        Ok(event)
-    })
+    let previous = read_jsonl_recover_tail::<SessionEvent>(store.root(), &events_relative)?;
+    let sequence = previous.last().map_or(1, |event| event.sequence + 1);
+    let event = SessionEvent::new(sequence, session, input)?;
+    store.append_jsonl(&events_relative, &event)?;
+    Ok(event)
 }
 
 pub fn read_session_events(

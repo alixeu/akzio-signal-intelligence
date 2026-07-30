@@ -335,6 +335,7 @@ pub struct PortfolioDecisionDraft {
     pub binding_risk_controls: Vec<BindingRiskControl>,
 }
 typed_profile_draft!(PhaseSummaryDraft);
+typed_profile_draft!(EvidenceResearchDraft);
 
 /// Typed profile state prevents a tool runtime from performing arbitrary JSON
 /// path mutation. Each profile grows explicit fields as its domain tools are
@@ -348,6 +349,7 @@ pub enum ArtifactDraftState {
     ResearcherWarmup(ResearcherWarmupDraft),
     DebateSeed(DebateSeedDraft),
     DebateResponse(DebateResponseDraft),
+    EvidenceResearch(EvidenceResearchDraft),
     TopicControl(TopicControlDraft),
     ResearchDecision(ResearchDecisionDraft),
     TradeIntent(TradeIntentDraft),
@@ -367,6 +369,7 @@ impl ArtifactDraftState {
             ToolManagedProfile::ResearcherWarmup => Self::ResearcherWarmup(Default::default()),
             ToolManagedProfile::DebateSeed => Self::DebateSeed(Default::default()),
             ToolManagedProfile::DebateResponse => Self::DebateResponse(Default::default()),
+            ToolManagedProfile::EvidenceResearch => Self::EvidenceResearch(Default::default()),
             ToolManagedProfile::TopicControl => Self::TopicControl(Default::default()),
             ToolManagedProfile::ResearchDecision => Self::ResearchDecision(Default::default()),
             ToolManagedProfile::TradeIntent => Self::TradeIntent(Default::default()),
@@ -384,6 +387,7 @@ impl ArtifactDraftState {
             Self::ResearcherWarmup(_) => ToolManagedProfile::ResearcherWarmup,
             Self::DebateSeed(_) => ToolManagedProfile::DebateSeed,
             Self::DebateResponse(_) => ToolManagedProfile::DebateResponse,
+            Self::EvidenceResearch(_) => ToolManagedProfile::EvidenceResearch,
             Self::TopicControl(_) => ToolManagedProfile::TopicControl,
             Self::ResearchDecision(_) => ToolManagedProfile::ResearchDecision,
             Self::TradeIntent(_) => ToolManagedProfile::TradeIntent,
@@ -594,37 +598,34 @@ pub fn create_or_recover_draft(
     scope.validate_for_location(location)?;
     let created_at = created_at.into();
     let relative = draft_relative(location, &scope)?;
-    let lock_relative = draft_unit_relative(location, &scope)?.join("lifecycle.lock");
-    store.with_exclusive_lock(&lock_relative, || {
-        if store.exists(&relative)? {
-            let draft = read_draft(store, location, &relative, scope.profile)?;
-            if draft.scope != scope {
-                return Err(StoreError::InvalidDocument {
-                    kind: "artifact draft",
-                    message: "idempotency-key collision with a different scope".to_owned(),
-                });
-            }
-            return Ok(draft);
+    if store.exists(&relative)? {
+        let draft = read_draft(store, location, &relative, scope.profile)?;
+        if draft.scope != scope {
+            return Err(StoreError::InvalidDocument {
+                kind: "artifact draft",
+                message: "idempotency-key collision with a different scope".to_owned(),
+            });
         }
+        return Ok(draft);
+    }
 
-        let successor_id = DraftIdempotencyKey::from_scope(&scope)?.to_string();
-        for mut prior in read_unit_drafts(store, location, &scope)? {
-            if prior.lifecycle != DraftLifecycle::Superseded
-                && prior.scope.source_payload_hash != scope.source_payload_hash
-            {
-                prior.lifecycle = DraftLifecycle::Superseded;
-                prior.pending_artifact = None;
-                prior.superseded_by = Some(successor_id.clone());
-                prior.updated_at = created_at.clone();
-                prior.revision += 1;
-                let prior_relative = draft_relative(location, &prior.scope)?;
-                write_draft(store, location, &prior_relative, prior)?;
-            }
+    let successor_id = DraftIdempotencyKey::from_scope(&scope)?.to_string();
+    for mut prior in read_unit_drafts(store, location, &scope)? {
+        if prior.lifecycle != DraftLifecycle::Superseded
+            && prior.scope.source_payload_hash != scope.source_payload_hash
+        {
+            prior.lifecycle = DraftLifecycle::Superseded;
+            prior.pending_artifact = None;
+            prior.superseded_by = Some(successor_id.clone());
+            prior.updated_at = created_at.clone();
+            prior.revision += 1;
+            let prior_relative = draft_relative(location, &prior.scope)?;
+            write_draft(store, location, &prior_relative, prior)?;
         }
+    }
 
-        let draft = ArtifactDraft::new(scope, created_at)?;
-        write_draft(store, location, &relative, draft)
-    })
+    let draft = ArtifactDraft::new(scope, created_at)?;
+    write_draft(store, location, &relative, draft)
 }
 
 pub fn append_draft_receipt<T: Serialize>(
@@ -649,91 +650,33 @@ pub fn append_draft_receipt<T: Serialize>(
         .map_err(|source| StoreError::JsonSerialize { source })?;
     let key = receipt_hash(&tool_name, &parameters)?;
     let relative = draft_relative(location, scope)?;
-    let lock_relative = draft_unit_relative(location, scope)?.join("lifecycle.lock");
-    store.with_exclusive_lock(&lock_relative, || {
-        let mut draft = read_draft(store, location, &relative, scope.profile)?;
-        ensure_draft_lifecycle(&draft, DraftLifecycle::Draft)?;
-        if let Some(existing) = draft.write_receipts.get(&key).cloned() {
-            return Ok(DraftAppendOutcome::AlreadyApplied {
-                draft,
-                receipt: existing,
-            });
-        }
-        let receipt = DraftWriteReceipt {
-            normalized_parameters_hash: key.clone(),
-            tool_name,
-            result_id,
-            created_at: created_at.clone(),
-        };
-        draft.write_receipts.insert(key, receipt.clone());
-        draft.revision += 1;
-        draft.updated_at = created_at;
-        let draft = write_draft(store, location, &relative, draft)?;
-        Ok(DraftAppendOutcome::Appended { draft, receipt })
-    })
-}
-
-/// Atomically apply one explicit domain mutation and its idempotency receipt.
-/// Keeping the state change and receipt beneath the same unit lock prevents a
-/// crash from recording a successful tool call without its typed Draft change.
-#[allow(clippy::too_many_arguments)] // the lifecycle boundary is explicit at every call site
-pub(crate) fn mutate_draft<T: Serialize, F>(
-    store: &FileStore,
-    location: &RunLocation,
-    scope: &ArtifactScope,
-    tool_name: impl Into<String>,
-    normalized_parameters: &T,
-    result_id: impl Into<String>,
-    created_at: impl Into<String>,
-    mutate: F,
-) -> Result<DraftAppendOutcome>
-where
-    F: FnOnce(&mut ArtifactDraftState) -> Result<()>,
-{
-    let tool_name = tool_name.into();
-    let result_id = result_id.into();
-    let created_at = created_at.into();
-    if tool_name.is_empty() || result_id.is_empty() || created_at.is_empty() {
-        return Err(StoreError::InvalidDocument {
-            kind: "draft write receipt",
-            message: "tool_name, result_id, and created_at must not be empty".to_owned(),
+    let mut draft = read_draft(store, location, &relative, scope.profile)?;
+    ensure_draft_lifecycle(&draft, DraftLifecycle::Draft)?;
+    if let Some(existing) = draft.write_receipts.get(&key).cloned() {
+        return Ok(DraftAppendOutcome::AlreadyApplied {
+            draft,
+            receipt: existing,
         });
     }
-    let parameters = serde_json::to_value(normalized_parameters)
-        .map_err(|source| StoreError::JsonSerialize { source })?;
-    let key = receipt_hash(&tool_name, &parameters)?;
-    let relative = draft_relative(location, scope)?;
-    let lock_relative = draft_unit_relative(location, scope)?.join("lifecycle.lock");
-    store.with_exclusive_lock(&lock_relative, || {
-        let mut draft = read_draft(store, location, &relative, scope.profile)?;
-        ensure_draft_lifecycle(&draft, DraftLifecycle::Draft)?;
-        if let Some(existing) = draft.write_receipts.get(&key).cloned() {
-            return Ok(DraftAppendOutcome::AlreadyApplied {
-                draft,
-                receipt: existing,
-            });
-        }
-        mutate(&mut draft.state)?;
-        let receipt = DraftWriteReceipt {
-            normalized_parameters_hash: key.clone(),
-            tool_name,
-            result_id,
-            created_at: created_at.clone(),
-        };
-        draft.write_receipts.insert(key, receipt.clone());
-        draft.revision += 1;
-        draft.updated_at = created_at;
-        let draft = write_draft(store, location, &relative, draft)?;
-        Ok(DraftAppendOutcome::Appended { draft, receipt })
-    })
+    let receipt = DraftWriteReceipt {
+        normalized_parameters_hash: key.clone(),
+        tool_name,
+        result_id,
+        created_at: created_at.clone(),
+    };
+    draft.write_receipts.insert(key, receipt.clone());
+    draft.revision += 1;
+    draft.updated_at = created_at;
+    let draft = write_draft(store, location, &relative, draft)?;
+    Ok(DraftAppendOutcome::Appended { draft, receipt })
 }
 
 /// Apply one explicit typed domain command to a live draft.  This is the
 /// mutation seam used by domain services; it intentionally accepts an
 /// `ArtifactDraftState`, never a JSON path or arbitrary document value.
 ///
-/// The normalized command hash is recorded in the same lock-protected write
-/// as the state change, so a provider retry cannot append a duplicate claim,
+/// The normalized command hash is recorded in the same atomic write as the
+/// state change, so a provider retry cannot append a duplicate claim,
 /// response, or controller instruction.
 #[allow(clippy::too_many_arguments)] // profile commands need full Rust-owned lifecycle scope
 pub fn apply_typed_draft_command<T: Serialize>(
@@ -759,35 +702,32 @@ pub fn apply_typed_draft_command<T: Serialize>(
         .map_err(|source| StoreError::JsonSerialize { source })?;
     let key = receipt_hash(&tool_name, &parameters)?;
     let relative = draft_relative(location, scope)?;
-    let lock_relative = draft_unit_relative(location, scope)?.join("lifecycle.lock");
-    store.with_exclusive_lock(&lock_relative, || {
-        let mut draft = read_draft(store, location, &relative, scope.profile)?;
-        ensure_draft_lifecycle(&draft, DraftLifecycle::Draft)?;
-        if let Some(existing) = draft.write_receipts.get(&key).cloned() {
-            return Ok(DraftAppendOutcome::AlreadyApplied {
-                draft,
-                receipt: existing,
-            });
-        }
-        mutate(&mut draft.state)?;
-        let receipt = DraftWriteReceipt {
-            normalized_parameters_hash: key.clone(),
-            tool_name,
-            result_id,
-            created_at: created_at.clone(),
-        };
-        draft.write_receipts.insert(key, receipt.clone());
-        draft.revision += 1;
-        draft.updated_at = created_at;
-        let draft = write_draft(store, location, &relative, draft)?;
-        Ok(DraftAppendOutcome::Appended { draft, receipt })
-    })
+    let mut draft = read_draft(store, location, &relative, scope.profile)?;
+    ensure_draft_lifecycle(&draft, DraftLifecycle::Draft)?;
+    if let Some(existing) = draft.write_receipts.get(&key).cloned() {
+        return Ok(DraftAppendOutcome::AlreadyApplied {
+            draft,
+            receipt: existing,
+        });
+    }
+    mutate(&mut draft.state)?;
+    let receipt = DraftWriteReceipt {
+        normalized_parameters_hash: key.clone(),
+        tool_name,
+        result_id,
+        created_at: created_at.clone(),
+    };
+    draft.write_receipts.insert(key, receipt.clone());
+    draft.revision += 1;
+    draft.updated_at = created_at;
+    let draft = write_draft(store, location, &relative, draft)?;
+    Ok(DraftAppendOutcome::Appended { draft, receipt })
 }
 
 /// Apply the one terminal command whose successful outcome deliberately has
 /// no business Artifact: Phase 2 researcher warmup. It preserves the normal
-/// receipt/idempotency and single-lock guarantees while allowing Rust to mark
-/// the Draft lifecycle completed in the same atomic write.
+/// receipt/idempotency guarantees while allowing Rust to mark the Draft
+/// lifecycle completed in the same atomic write.
 #[allow(clippy::too_many_arguments)]
 pub fn complete_terminal_draft_without_artifact<T: Serialize>(
     store: &FileStore,
@@ -818,41 +758,37 @@ pub fn complete_terminal_draft_without_artifact<T: Serialize>(
         .map_err(|source| StoreError::JsonSerialize { source })?;
     let key = receipt_hash(&tool_name, &parameters)?;
     let relative = draft_relative(location, scope)?;
-    let lock_relative = draft_unit_relative(location, scope)?.join("lifecycle.lock");
-    store.with_exclusive_lock(&lock_relative, || {
-        let mut draft = read_draft(store, location, &relative, scope.profile)?;
-        match draft.lifecycle {
-            DraftLifecycle::Completed => {
-                let receipt = draft.write_receipts.get(&key).cloned().ok_or_else(|| {
-                    StoreError::InvalidDocument {
-                        kind: "terminal draft",
-                        message: "completed researcher warmup has no matching terminal receipt"
-                            .to_owned(),
-                    }
-                })?;
-                return Ok(DraftAppendOutcome::AlreadyApplied { draft, receipt });
-            }
-            DraftLifecycle::Draft => {}
-            other => return Err(invalid_transition(other, DraftLifecycle::Completed)),
+    let mut draft = read_draft(store, location, &relative, scope.profile)?;
+    match draft.lifecycle {
+        DraftLifecycle::Completed => {
+            let receipt = draft.write_receipts.get(&key).cloned().ok_or_else(|| {
+                StoreError::InvalidDocument {
+                    kind: "terminal draft",
+                    message: "completed researcher warmup has no matching terminal receipt"
+                        .to_owned(),
+                }
+            })?;
+            return Ok(DraftAppendOutcome::AlreadyApplied { draft, receipt });
         }
-        mutate(&mut draft.state)?;
-        let receipt = DraftWriteReceipt {
-            normalized_parameters_hash: key.clone(),
-            tool_name,
-            result_id,
-            created_at: created_at.clone(),
-        };
-        draft.write_receipts.insert(key.clone(), receipt.clone());
-        draft.lifecycle = DraftLifecycle::Completed;
-        draft.revision += 1;
-        draft.updated_at = created_at;
-        let draft = write_draft(store, location, &relative, draft)?;
-        Ok(DraftAppendOutcome::Appended { receipt, draft })
-    })
+        DraftLifecycle::Draft => {}
+        other => return Err(invalid_transition(other, DraftLifecycle::Completed)),
+    }
+    mutate(&mut draft.state)?;
+    let receipt = DraftWriteReceipt {
+        normalized_parameters_hash: key.clone(),
+        tool_name,
+        result_id,
+        created_at: created_at.clone(),
+    };
+    draft.write_receipts.insert(key.clone(), receipt.clone());
+    draft.lifecycle = DraftLifecycle::Completed;
+    draft.revision += 1;
+    draft.updated_at = created_at;
+    let draft = write_draft(store, location, &relative, draft)?;
+    Ok(DraftAppendOutcome::Appended { receipt, draft })
 }
 
-/// Read the exact typed draft for a known scope.  Domain finalizers use this
-/// after acquiring their lifecycle lock through `finalize_draft_atomic`.
+/// Read the exact typed draft for a known scope.
 pub fn read_draft_for_scope(
     store: &FileStore,
     location: &RunLocation,
@@ -875,16 +811,13 @@ pub fn fail_draft(
         });
     }
     let relative = draft_relative(location, scope)?;
-    let lock_relative = draft_unit_relative(location, scope)?.join("lifecycle.lock");
-    store.with_exclusive_lock(&lock_relative, || {
-        let mut draft = read_draft(store, location, &relative, scope.profile)?;
-        ensure_draft_lifecycle(&draft, DraftLifecycle::Draft)?;
-        draft.lifecycle = DraftLifecycle::Failed;
-        draft.failure = Some(failure.clone());
-        draft.updated_at = failure.failed_at;
-        draft.revision += 1;
-        write_draft(store, location, &relative, draft)
-    })
+    let mut draft = read_draft(store, location, &relative, scope.profile)?;
+    ensure_draft_lifecycle(&draft, DraftLifecycle::Draft)?;
+    draft.lifecycle = DraftLifecycle::Failed;
+    draft.failure = Some(failure.clone());
+    draft.updated_at = failure.failed_at;
+    draft.revision += 1;
+    write_draft(store, location, &relative, draft)
 }
 
 pub fn finalize_draft_atomic<T: FinalizableArtifact>(
@@ -921,62 +854,58 @@ pub fn finalize_draft_atomic<T: FinalizableArtifact>(
     )?;
     let draft_relative = draft_relative(location, scope)?;
     let artifact_store_relative = location.child_relative(artifact_relative)?;
-    let lock_relative = draft_unit_relative(location, scope)?.join("lifecycle.lock");
-    store.with_exclusive_lock(&lock_relative, || {
-        let mut draft = read_draft(store, location, &draft_relative, scope.profile)?;
-        match draft.lifecycle {
-            DraftLifecycle::Completed => {
-                let finalized = draft
-                    .finalized_artifact
-                    .clone()
-                    .expect("validated completed draft");
-                if !finalized.same_artifact_identity(&artifact_ref) {
-                    return Err(StoreError::InvalidDocument {
-                        kind: "draft finalize",
-                        message: "completed draft was finalized with a different artifact"
-                            .to_owned(),
-                    });
-                }
-                return Ok(FinalizeDraftOutcome::Recovered {
-                    draft,
-                    artifact: finalized,
+    let mut draft = read_draft(store, location, &draft_relative, scope.profile)?;
+    match draft.lifecycle {
+        DraftLifecycle::Completed => {
+            let finalized = draft
+                .finalized_artifact
+                .clone()
+                .expect("validated completed draft");
+            if !finalized.same_artifact_identity(&artifact_ref) {
+                return Err(StoreError::InvalidDocument {
+                    kind: "draft finalize",
+                    message: "completed draft was finalized with a different artifact".to_owned(),
                 });
             }
-            DraftLifecycle::Draft => {}
-            _ => {
-                return Err(invalid_transition(
-                    draft.lifecycle,
-                    DraftLifecycle::Completed,
-                ))
-            }
-        }
-
-        draft.pending_artifact = Some(artifact_ref.clone());
-        draft.updated_at = created_at.clone();
-        draft.revision += 1;
-        draft = write_draft(store, location, &draft_relative, draft)?;
-
-        let sealed_artifact = if store.exists(&artifact_store_relative)? {
-            validate_existing_artifact_ref(store, &artifact_store_relative, &artifact_ref)?;
-            None
-        } else {
-            Some(store.write_authoritative_json(&artifact_store_relative, artifact)?)
-        };
-
-        draft.lifecycle = DraftLifecycle::Completed;
-        draft.pending_artifact = None;
-        draft.finalized_artifact = Some(artifact_ref.clone());
-        draft.updated_at = created_at;
-        draft.revision += 1;
-        let draft = write_draft(store, location, &draft_relative, draft)?;
-        match sealed_artifact {
-            Some(artifact) => Ok(FinalizeDraftOutcome::Completed { draft, artifact }),
-            None => Ok(FinalizeDraftOutcome::Recovered {
+            return Ok(FinalizeDraftOutcome::Recovered {
                 draft,
-                artifact: artifact_ref,
-            }),
+                artifact: finalized,
+            });
         }
-    })
+        DraftLifecycle::Draft => {}
+        _ => {
+            return Err(invalid_transition(
+                draft.lifecycle,
+                DraftLifecycle::Completed,
+            ))
+        }
+    }
+
+    draft.pending_artifact = Some(artifact_ref.clone());
+    draft.updated_at = created_at.clone();
+    draft.revision += 1;
+    draft = write_draft(store, location, &draft_relative, draft)?;
+
+    let sealed_artifact = if store.exists(&artifact_store_relative)? {
+        validate_existing_artifact_ref(store, &artifact_store_relative, &artifact_ref)?;
+        None
+    } else {
+        Some(store.write_authoritative_json(&artifact_store_relative, artifact)?)
+    };
+
+    draft.lifecycle = DraftLifecycle::Completed;
+    draft.pending_artifact = None;
+    draft.finalized_artifact = Some(artifact_ref.clone());
+    draft.updated_at = created_at;
+    draft.revision += 1;
+    let draft = write_draft(store, location, &draft_relative, draft)?;
+    match sealed_artifact {
+        Some(artifact) => Ok(FinalizeDraftOutcome::Completed { draft, artifact }),
+        None => Ok(FinalizeDraftOutcome::Recovered {
+            draft,
+            artifact: artifact_ref,
+        }),
+    }
 }
 
 pub(crate) fn validate_existing_artifact_ref(
@@ -1012,8 +941,7 @@ pub(crate) fn validate_existing_artifact_ref(
         });
     }
     if is_domain_profile(&expected.profile)
-        && object.get("schema_version").and_then(Value::as_u64)
-            != Some(u64::from(crate::domain::DOMAIN_ARTIFACT_SCHEMA_VERSION))
+        && object.get("schema_version").and_then(Value::as_u64) != Some(2)
     {
         return Err(StoreError::InvalidDocument {
             kind: "finalized artifact",

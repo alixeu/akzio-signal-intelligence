@@ -433,7 +433,12 @@ fn format_results(results: &[SearchResult]) -> String {
             if index > 0 {
                 output.push('\n');
             }
-            output.push_str(&format!("[ref_id: search{index}]\n"));
+            let ref_id = if result.ref_id.is_empty() {
+                format!("search{index}")
+            } else {
+                result.ref_id.clone()
+            };
+            output.push_str(&format!("[evidence_ref: web.run:{ref_id}]\n"));
             output.push_str(&format!("Title: {}\n", result.title));
             output.push_str(&format!("URL: {}\n", result.url));
             output.push_str(&format!(
@@ -454,6 +459,7 @@ fn results_to_json(results: &[SearchResult]) -> Value {
             .map(|(index, result)| {
                 json!({
                     "ref_id": if result.ref_id.is_empty() { format!("search{index}") } else { result.ref_id.clone() },
+                    "subject_id": format!("web.run:{}", if result.ref_id.is_empty() { format!("search{index}") } else { result.ref_id.clone() }),
                     "title": result.title.clone(),
                     "url": result.url.clone(),
                     "published": result.published_at.clone(),

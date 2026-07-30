@@ -157,6 +157,7 @@ fn turn_item_to_debug_message(item: &TurnItem) -> Option<Value> {
             "role": "tool",
             "tool_call_id": item.tool_call_id,
             "content": item.content_text,
+            "error": item.content_json.pointer("/result/error").cloned(),
         })),
         _ => None,
     }
@@ -166,7 +167,7 @@ impl ModelEventHandler for DebugLlmCapture<'_> {
     fn handle<'a>(
         &'a mut self,
         event: ModelStreamEvent,
-    ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
             match &event {
                 ModelStreamEvent::AssistantTextDelta { delta, .. } => {

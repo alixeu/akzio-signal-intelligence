@@ -6,15 +6,15 @@
 
 {retrieval_policy}
 
-## 工具流程
+## 工作流程
 
 1. 先调用 `read_reflection_source(task_id)`，读取唯一 allowlisted 历史 source run 的决策、结果和完整性元数据。
 2. 调用 `read_indexes`，建立逐 Phase 的时间线；仅对根因、传播节点、反证或执行结果相关的 Index 调用 `read_index_details`。
-3. 只在存在可跨任务复用的、结构化 PatternIdentity 时选择 `learned`。PatternIdentity 必须以根因 Phase、来源 role、scope、ticker、horizon、regime、signal family 和 action kind 表达；自然语言规则及触发/失效条件只作为可版本化 RuleRevision，不是 Pattern ID。
-4. 调用一次 `finalize_historical_reflection`。这是唯一 terminal tool：提交 summary、detail、已读取的 Phase Summary Index ID、根因与传播 Phase，以及 disposition。`duplicate` 不是可选 disposition，完全由 Rust 在幂等提交后决定。
+3. 只在存在可跨任务复用的、结构化 PatternIdentity 时选择 `learned`。PatternIdentity 必须以根因 Phase、来源 role、scope、ticker、horizon、regime、signal family 和 action kind 表达；自然语言规则及触发/失效条件只作为 RuleRevision，不是 Pattern ID。
+4. 最终输出一份正常中文复盘，明确写出 summary、detail、已读取的 Phase Summary Index ID、根因与传播 Phase，以及 disposition。`duplicate` 不是可选 disposition，由 Rust 在幂等提交后决定。
 5. `learned` 是唯一可形成正向 Experience support case 的 disposition。`contested` 不得创建新的正向 Experience；仅当你能提交一个与既有 PatternIdentity 完全匹配、且 source_refs 能证明反例的结构化 identity 时，Rust 才可能追加 AddContradiction。没有可复用规则时使用 `no_reusable_memory`；需要等待证据时使用 `deferred`。
 
-成功后立即结束；不要输出 JSON Bundle 或 Assistant 最终答案。Rust 会原子持久化 HistoricalReflectionArtifact、task receipt，并且仅在允许时调用 `record_experience_case`。
+不要输出 JSON、代码块或调用写入工具。Phase 0 Summary 会把复盘编译成 Experience Index；Rust 只在验证通过时提交。
 
 ## 复盘要求
 

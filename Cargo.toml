@@ -21,6 +21,7 @@ clap = { version = "4.5.26", features = ["derive", "env"] }
 dotenvy = "0.15.7"
 futures = "0.3.31"
 html-escape = "0.2.13"
+md-5 = "0.10.6"
 regex = "1.11.1"
 reqwest = { version = "0.13.4", default-features = false, features = ["cookies", "json", "query", "rustls"] }
 async-openai = { version = "0.41.1", features = ["responses", "chat-completion"] }

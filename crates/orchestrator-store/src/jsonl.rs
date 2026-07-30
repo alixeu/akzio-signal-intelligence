@@ -90,10 +90,10 @@ impl JsonlRecord for JsonlEvent {
     }
 }
 
-/// Append exactly one checked record while holding an advisory exclusive lock.
-/// Existing records are validated first, which makes a corrupt middle line a
-/// hard failure instead of silently skipping history.
-pub fn append_jsonl_locked<R: JsonlRecord>(root: &Path, relative: &Path, record: &R) -> Result<()> {
+/// Append exactly one checked record. Existing records are validated first,
+/// which makes a corrupt middle line a hard failure instead of silently
+/// skipping history.
+pub fn append_jsonl<R: JsonlRecord>(root: &Path, relative: &Path, record: &R) -> Result<()> {
     let path = resolve_for_write(root, relative)?;
     let parent = path.parent().expect("resolved JSONL path has a parent");
     let mut file = OpenOptions::new()
@@ -103,8 +103,6 @@ pub fn append_jsonl_locked<R: JsonlRecord>(root: &Path, relative: &Path, record:
         .truncate(false)
         .open(&path)
         .map_err(|source| io_error(&path, source))?;
-    file.lock().map_err(|source| io_error(&path, source))?;
-
     let records = read_jsonl_from_locked_file::<R>(&mut file, &path, true)?;
     let expected = records.last().map_or(1, |last| last.sequence() + 1);
     if record.sequence() != expected {
@@ -142,7 +140,6 @@ pub fn read_jsonl_recover_tail<R: JsonlRecord>(root: &Path, relative: &Path) -> 
         .truncate(false)
         .open(&path)
         .map_err(|source| io_error(&path, source))?;
-    file.lock().map_err(|source| io_error(&path, source))?;
     let records = read_jsonl_from_locked_file::<R>(&mut file, &path, true)?;
     drop(file);
     Ok(records)
@@ -233,7 +230,7 @@ mod tests {
     use serde_json::json;
     use tempfile::tempdir;
 
-    use super::{append_jsonl_locked, read_jsonl_recover_tail, JsonlEvent};
+    use super::{append_jsonl, read_jsonl_recover_tail, JsonlEvent};
     use crate::StoreError;
 
     fn event(sequence: u64) -> JsonlEvent {
@@ -253,22 +250,22 @@ mod tests {
     fn append_and_read_validate_sequence_and_hash() {
         let directory = tempdir().unwrap();
         let path = Path::new("session/turn.jsonl");
-        append_jsonl_locked(directory.path(), path, &event(1)).unwrap();
-        append_jsonl_locked(directory.path(), path, &event(2)).unwrap();
+        append_jsonl(directory.path(), path, &event(1)).unwrap();
+        append_jsonl(directory.path(), path, &event(2)).unwrap();
         assert_eq!(
             read_jsonl_recover_tail::<JsonlEvent>(directory.path(), path)
                 .unwrap()
                 .len(),
             2
         );
-        assert!(append_jsonl_locked(directory.path(), path, &event(4)).is_err());
+        assert!(append_jsonl(directory.path(), path, &event(4)).is_err());
     }
 
     #[test]
     fn recovery_discards_only_unterminated_tail() {
         let directory = tempdir().unwrap();
         let path = Path::new("session/turn.jsonl");
-        append_jsonl_locked(directory.path(), path, &event(1)).unwrap();
+        append_jsonl(directory.path(), path, &event(1)).unwrap();
         let absolute = directory.path().join(path);
         fs::write(
             &absolute,
@@ -285,7 +282,7 @@ mod tests {
     fn malformed_middle_line_is_a_hard_failure() {
         let directory = tempdir().unwrap();
         let path = Path::new("session/turn.jsonl");
-        append_jsonl_locked(directory.path(), path, &event(1)).unwrap();
+        append_jsonl(directory.path(), path, &event(1)).unwrap();
         let absolute = directory.path().join(path);
         fs::write(
             &absolute,
@@ -299,7 +296,7 @@ mod tests {
     fn tampered_hash_is_a_hard_failure() {
         let directory = tempdir().unwrap();
         let path = Path::new("session/turn.jsonl");
-        append_jsonl_locked(directory.path(), path, &event(1)).unwrap();
+        append_jsonl(directory.path(), path, &event(1)).unwrap();
         let absolute = directory.path().join(path);
         let changed = fs::read_to_string(&absolute)
             .unwrap()
@@ -315,7 +312,7 @@ mod tests {
         let mut future = event(1);
         future.schema_version = 2;
         assert!(matches!(
-            append_jsonl_locked(directory.path(), path, &future),
+            append_jsonl(directory.path(), path, &future),
             Err(StoreError::JsonlFutureSchema {
                 found: 2,
                 current: 1,
@@ -326,7 +323,7 @@ mod tests {
         let mut old = event(1);
         old.schema_version = 0;
         assert!(matches!(
-            append_jsonl_locked(directory.path(), path, &old),
+            append_jsonl(directory.path(), path, &old),
             Err(StoreError::JsonlMigrationRequired {
                 found: 0,
                 current: 1,

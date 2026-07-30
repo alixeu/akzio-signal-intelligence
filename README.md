@@ -99,15 +99,29 @@ graph TD
 
 Phase 2 begins with one shared Bull/Bear warm-up and an independent neutral
 Topic Generator. The generator uses the Phase 1 summary index through
-`read_phase_summaries` and expands selected evidence with
-`read_phase_summary_details`; no warm-up history or Phase 1 artifact is embedded
+`read_indexes` and expands selected evidence with
+`read_index_details`; no warm-up history or Phase 1 artifact is embedded
 in its prompt.
+After at least one relevant Detail expansion, Topic Generator or Bull/Bear may
+delegate one explicit unresolved fact to `research_evidence_gap`. A neutral
+`researcher.web_evidence` worker receives only `web.run`; Topic Generator has
+two calls per run and Bull/Bear share two calls per topic across rounds.
+Rust deduplicates requests, validates and caps the returned source packet,
+assigns `web-<md5-3>` evidence IDs, and keeps that evidence in Phase 2 rather
+than rewriting Phase 1.
 Rust rejects external-fact or schema-breaking output and retains a deterministic
 conflict fallback. For each selected topic, Topic Controller forks from the
 completed Topic Generator turn, while Bull and Bear each fork from the shared
 `准备完毕` warm-up checkpoint and receive the full topic in their new user
 instruction. These forks continue saved conversations rather than being
 reconstructed from summaries; warm-up itself never runs Phase Summary.
+Rust pre-calls `record_phase2_steer` in every topic child turn, so the role,
+topic, fork parent, and both `round` and `round_num` are structured control data
+rather than fields inferred from free text. After the two seed turns, the Topic
+Controller decides whether another round is needed; each continued Bull/Bear
+turn receives the latest controller steer before the controller reviews that
+round. Debug records retain each turn separately as
+`debate-{bull,bear}-round-N.json` and `topic-controller-round-N.json`.
 Topics run concurrently, while turns inside one topic remain controller-routed.
 When no material hinge exists, Phase 2 records a no-debate artifact and still
 advances to Phase 3.
@@ -144,13 +158,98 @@ dual-write field or a reader fallback to the legacy representation.
 | Crate | Responsibility |
 |---|---|
 | `orchestrator-core` | Config paths, role registry, ticker parsing, canonical schemas and validators |
-| `orchestrator-store` | Atomic FileStore persistence for manifests, sessions, typed drafts, canonical artifacts, Index/Detail knowledge, and execution recovery |
-| `orchestrator-llm` | Responses/Chat Completions streaming, bounded agent loop, and domain-tool execution |
+| `orchestrator-store` | Atomic FileStore persistence for manifests, Index/Detail knowledge, direct market inputs, and execution recovery |
+| `orchestrator-llm` | Responses/Chat Completions streaming, bounded agent loop, and read-only evidence tools |
 | `orchestrator-ingest` | Alpaca/Yahoo technical ingestion and Jin10 ingestion |
 | `orchestrator-workflow` | Phase orchestration, policy gates, reducers, probability and allocation guards |
 | `orchestrator-cli` | CLI binaries, reporting, operations, metrics and prompt linting |
 
 There is no long-running service entry point. `orchestrator-exec` is the workflow entry point and persists only under the configured FileStore root (`outputs/store` by default).
+
+## Model output and tools
+
+Phase 0–6 business roles return one normal text response. They may use only
+their read-only evidence/input tools. Immediately after each response, the
+dedicated `prompts/phaseN/summary.md` compiler extracts the fixed fields; Rust
+validates identity, probability, position, and risk constraints and writes one
+canonical Index with its Detail. The Summary compiler has no filesystem or
+write tool. Phase 7 and Phase 8 are calculated and written directly by Rust.
+
+The completed run layout is:
+
+```text
+outputs/store/runs/YYYY-MM-DD/<tickers>-<md5-3>/
+├── manifest.json
+└── index/
+    ├── phase1/idx-<md5-3>.json
+    ├── phase2/idx-<md5-3>.json
+    └── phase8/idx-<md5-3>.json
+```
+
+Each `idx-*.json` archive contains both the Index and its Detail records.
+Sessions, temporary state, drafts, and debug files may exist while a run is in
+progress, but successful completion removes them.
+
+### Model-visible tools
+
+All active FileStore reads derive their scope from the run, role, phase, and
+typed runtime binding; the model cannot supply a filesystem path or choose an
+arbitrary source run. Business-role completion is the final assistant text, not
+a write-tool call. Phase Summary has no model tools; Rust validates its JSON and
+writes the Index directly.
+
+| Category | Tool ID | Purpose and boundary |
+|---|---|---|
+| Runtime | `think` | Records bounded private reasoning for the current turn; it does not read data or write an Artifact. Enabled only when the role's LLM setting enables it. |
+| Runtime | `web.run` | Performs an allowlisted Exa web search and returns citable evidence. It is exposed directly only to the bounded `researcher.web_evidence` worker; Phase 1 event verification uses the same search adapter behind `verify_event`. Its OpenAI-compatible function name is `web_run`. |
+| Phase 2 control | `record_phase2_steer` | Records the Rust-bound role, topic, fork parent, and round identity for each Bull/Bear or Topic Controller turn. It accepts no model-selected fields. |
+| Phase 2 evidence gap | `research_evidence_gap` | Delegates one explicit gap after a successful Phase 1 Detail expansion. Rust owns role/topic scope, shared call budget, deduplication, output validation, and evidence IDs. |
+| Historical reflection | `read_reflection_source` | Reads the Rust-selected historical reflection task source; a model cannot select a different run. |
+| Experience | `search_experiences` | Searches eligible historical Experience Index entries for the current role/task. |
+| Experience | `read_experience_cases` | Expands selected eligible historical Experience Detail entries. |
+| Experience | `record_memory_application` | Records whether and how retrieved experience was applied; it is audit data, not a mutation of the historical case. |
+| Knowledge Index + Detail | `read_indexes` | Lists role-visible Index/Phase Summary metadata with Rust-enforced source-phase and pagination rules. |
+| Knowledge Index + Detail | `read_index_details` | Expands only visible Index Details, subject to the role's detail budget and evidence policy. |
+| Current-run inputs | `read_technical_snapshot` | Reads batch technical data from the stable FileStore path and verifies the run-bound hash. |
+| Current-run inputs | `read_technical_detail` | Reads a bounded technical signal/range from the stable FileStore path and verifies the run-bound hash. |
+| Current-run inputs | `read_jin10_candidates` | Reads bounded Jin10 events from the stable FileStore path and verifies the run-bound hash. |
+| Current-run inputs | `verify_event` | Verifies an explicit news/macro event claim through the configured web-search runtime and reports missing fields. |
+| Current-run inputs | `alpaca_get_news` | Fetches Alpaca News for the scoped ticker/time request. It is exposed only when Alpaca market-data access is configured. |
+
+### Active role-scoped access
+
+The table below describes the static business-tool scope. Only the two Phase 1
+analysts and the Phase 3 Research Manager receive `search_experiences`,
+`read_experience_cases`, and `record_memory_application`. `think` is an optional
+runtime helper and is disabled by the checked-in defaults. Runtime bindings may
+remove unavailable tools, but never add business authority outside the profile
+allowlist.
+
+| Role / profile | Static tools in addition to experience retrieval |
+|---|---|
+| `reflector.historical` / Historical Reflection | `read_reflection_source`, `read_indexes`, `read_index_details`; Rust commits the validated Summary result |
+| `analyst.technical` / Analyst Report | `read_technical_snapshot`, `read_technical_detail`, and eligible Experience reads |
+| `analyst.news_macro` / Analyst Report | `read_jin10_candidates`, `verify_event`, optional `alpaca_get_news`, and eligible Experience reads |
+| Phase 2 Topic Generator and Bull/Bear | Phase 1-only `read_indexes` / `read_index_details`; Bull/Bear topic turns also receive Rust-bound `record_phase2_steer`; bounded `research_evidence_gap` after Detail |
+| Phase 2 warm-up and Topic Controller | Phase 1-only `read_indexes` / `read_index_details`; Controller turns also receive Rust-bound `record_phase2_steer`; no Web delegation |
+| `researcher.web_evidence` / Evidence Research | `web.run` only; no Index, Technical, Experience, trading, or write tools |
+| `manager.research` / Research Decision | Phase 1–2-only `read_indexes` / `read_index_details` and eligible Experience reads |
+| `trader` / Trade Intent | Phase 3-only `read_indexes` / `read_index_details` |
+| Phase 5 risk reviewers | Phase 3–4-only `read_indexes` / `read_index_details` |
+| `portfolio.manager` / Portfolio Decision | Phase 3–5-only `read_indexes` / `read_index_details` |
+| `compressor.phase_summary` / Phase Summary | No model-visible tools; Rust writes the parsed result |
+
+The Responses transport can use OpenAI's native `web_search` only when both
+`native_web_search` is enabled and the exact role profile explicitly authorizes
+`web.run`. Only the built-in Evidence Research profile currently does so. The
+provider-supplied native tool is intentionally separate from project function
+dispatch.
+
+The agent loop rejects identical repeated Index/Detail reads, enforces the
+profile's Detail expansion budget, and rejects terminal finalization until all
+required source phases and successful Detail expansions are present. The
+checked-in maximum Detail counts are: Historical Reflection 8, Phase 2 Warm-up
+2, other Phase 2 roles 4, Phase 3 6, Phase 4 2, Phase 5 4, and Phase 6 8.
 
 ## Requirements
 
@@ -211,11 +310,13 @@ rtk cargo run -p orchestrator-cli --bin orchestrator-ingest -- \
   jin10-flash --pages 2 --lookback-hours 24 --timeout 20
 ```
 
-Technical input is stored as atomically replaced CSV snapshots under
-`outputs/store/data/technical/<ticker>/<interval>.csv`. Jin10 is stored as an
-atomically replaced date CSV or JSONL snapshot under `outputs/store/data/jin10/`.
-At run start, the manifest records each selected input's content hash; tools read
-that snapshot for the entire run and fail if it changes.
+Technical input is stored directly under the readable lowercase paths
+`outputs/store/data/technical/<ticker>/{day,3h,20min}.csv`, for example
+`outputs/store/data/technical/qqq/day.csv`. Jin10 is stored as an atomically
+replaced date CSV or JSONL file under `outputs/store/data/jin10/`. At run start,
+the manifest records each selected input's content hash. Tools read the stable
+data path and fail if its content changes during that run; no second CSV copy is
+created under the run directory.
 
 Independent ticker/interval downloads run concurrently (default: 10). Set
 `technical.source: yahoo` or pass `--source yahoo` for a full Yahoo run.
@@ -230,14 +331,13 @@ Active prompts are owned by the phase that executes them:
 
 | Directory | Runtime owner |
 |---|---|
-| `prompts/phase0/` | Historical outcome reflection |
-| `prompts/phase_summary/` | Completed-phase summary compressor |
-| `prompts/phase1/` | Technical and news/macro analysts |
-| `prompts/phase2/` | Topic Generator, Bull, Bear, Topic Controller, and the topic-fork message |
-| `prompts/phase3/` | Research Manager |
-| `prompts/phase4/` | Trader |
-| `prompts/phase5/` | Aggressive, neutral, and conservative risk reviewers |
-| `prompts/phase6/` | Portfolio Manager |
+| `prompts/phase0/` | Historical outcome reflection and its Summary compiler |
+| `prompts/phase1/` | Technical/news analysts and their Summary compiler |
+| `prompts/phase2/` | Topic roles, bounded Web evidence researcher, topic-fork message, and Phase 2 Summary compiler |
+| `prompts/phase3/` | Research Manager and Phase 3 Summary compiler |
+| `prompts/phase4/` | Trader and Phase 4 Summary compiler |
+| `prompts/phase5/` | Risk reviewers and Phase 5 Summary compiler |
+| `prompts/phase6/` | Portfolio Manager and Phase 6 Summary compiler |
 | `prompts/common/` | Shared prompt components and contracts |
 | `prompts/system/` | Agent-loop and runtime messages |
 
@@ -256,8 +356,9 @@ There is deliberately no runtime `phase25` bucket. Phase 2 topic generation is
 an LLM role with a Rust-owned evidence gate and runtime envelope; final debate
 reduction remains Rust-owned and belongs to Phase 2. Phase 7 allocation and
 Phase 8 decision snapshot/archive are also Rust-owned stages. Phase Summary runs
-after a completed source phase 1 through 7; it does not run for Phase 0, Phase 8,
-or the Phase 2 warm-up checkpoint.
+after source phases 1 through 7. Phase 8 writes one Rust-owned final-decision
+Index per ticker; Phase 0 and the Phase 2 warm-up checkpoint do not produce an
+Index.
 
 For Phases 2–6, Phase Summary is the only cross-phase semantic interface.
 Prompts receive only current-task packets, Rust-owned deterministic controls,
@@ -293,7 +394,8 @@ Useful options:
 
 ### Deterministic Outcome materialization
 
-Phase 8 can write a typed `DecisionSnapshotV2` when
+Phase 8 can write a typed `DecisionSnapshotV2` under
+`knowledge/evaluation/decisions/` when
 `orchestrator.evaluation.enabled` is set. Canonical Decision/Outcome writes
 require both Paper/Live purpose and
 `orchestrator.evaluation.canonical_memory_writes_enabled: true`; Debug uses an
@@ -322,16 +424,46 @@ historical reflection/retrieval. Mock runs skip Alpaca and all learning writes.
 
 ### FileStore layout
 
-Each run is isolated under `outputs/store/runs/<workflow_date>/<run_id>/`.
-`manifest.json` and `state.json` record recovery state; independently finalized
-business units are stored below `artifacts/`; append-only session turns are
-below `sessions/`; incomplete writes are below `drafts/`; phase summaries live
-below `index/`; and learning and execution data use their own directories.
+Each run is isolated under `outputs/store/runs/<workflow_date>/<tickers>-<md5-3-bytes>/`;
+for example, `runs/2026-07-29/qqq-soxx-vix-a1b2c3/`. Phase Summary and
+Experience Index IDs use the same six-hex-character suffix as `idx-a1b2c3`
+and `exp-a1b2c3`.
+While a run is active, `manifest.json` and `state.json` record recovery state;
+independently finalized business units are stored below `artifacts/`;
+append-only session turns are below `sessions/`; incomplete writes are below
+`drafts/`; and phase summaries live below `index/`. These runtime projections
+are removed after a healthy non-debug run completes.
 Canonical files contain a schema version and content hash. Temporary files live
 beside their destination, are flushed and fsynced, and are atomically renamed.
 Store Doctor checks malformed content, hashes, path escape, orphan details,
 incomplete Drafts and manifest/file drift; its catalog and experience-level
 outputs are rebuildable caches.
+
+After Phase 8 finishes successfully, the run packs each finalized Index
+directory into one content-hashed archive, then deletes every other run-local
+file. The completed run retains only `manifest.json` and `index/*.json`; the
+Phase 8 Index contains the structured final decision and allocation. Canonical
+Decisions, MemoryUsage reports, Outcomes, and Experience remain under
+`knowledge/`. Partial, incomplete, or failed runs retain inputs, Artifacts,
+Sessions, Drafts, and state for recovery. Once Phase 8 completes, normal,
+degraded, and `--debug` runs are all compacted to the same final layout; degraded
+status and errors remain visible in `manifest.json`. The FileStore assumes one
+workflow writer and does not create filesystem lock files.
+
+Preview or apply the same completed-run compaction explicitly:
+
+```bash
+rtk cargo run -p orchestrator-cli --bin orchestrator-store-doctor -- \
+  --store-root outputs/store \
+  compact-run --workflow-date YYYY-MM-DD --run-id RUN_ID
+
+rtk cargo run -p orchestrator-cli --bin orchestrator-store-doctor -- \
+  --store-root outputs/store \
+  compact-run --workflow-date YYYY-MM-DD --run-id RUN_ID --apply
+```
+
+The first command is a dry run. `--apply` is accepted once Phase 8 and the run
+manifest are completed; debug and degraded runs use the same compact layout.
 
 Evaluation data is separate: immutable canonical outcomes, revision commits,
 heads, market-input manifests, and gaps live under
@@ -378,7 +510,7 @@ hard-coded invariant.
 - Manager output cannot replace missing evidence with a default 0.5 result.
 - Responses streams require `response.completed`; Chat Completions streams require a terminal `finish_reason`.
 - Tool calls require a non-empty `call_id`, name, and valid accumulated JSON arguments.
-- Technical/Jin10 tools read the run's hash-pinned FileStore input snapshots. The news analyst may call Alpaca News; evidence selection is retained in its current-run Artifact and tool audit.
+- Technical/Jin10 tools read stable FileStore data paths and verify the hashes pinned by the run. The news analyst may call Alpaca News; evidence selection is retained in its current-run Artifact and tool audit.
 - Tool payload history is bounded to 16,000 characters by default.
 - Allocation excludes VIX, rejects missing per-ticker research, enforces non-negative finite weights, per-asset caps, cash constraints, and a total weight of 1.0.
 - Post-run learning is outcome-backed, idempotent, and outside the decision-critical research path; only qualified, non-mock Experience Index/Detail entries are reusable later.

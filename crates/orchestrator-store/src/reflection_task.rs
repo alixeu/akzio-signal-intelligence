@@ -10,7 +10,7 @@ use orchestrator_core::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    append_jsonl_locked, content_hash, ContentHashDocument, FileSchemaKind, FileStore, JsonlRecord,
+    append_jsonl, content_hash, ContentHashDocument, FileSchemaKind, FileStore, JsonlRecord,
     Result, SafeSlug, StoreError, Versioned,
 };
 
@@ -113,31 +113,28 @@ impl ReflectionTaskLedger {
     ) -> Result<ReflectionTaskV1> {
         validate_key(&key, &outcome_ref)?;
         let task_id = content_hash(&serde_json::json!({"key": key}))?;
-        let lock = lock_path(&task_id)?;
-        self.store.with_exclusive_lock(&lock, || {
-            let path = task_path(&task_id)?;
-            if self.store.exists(&path)? {
-                return self
-                    .store
-                    .read_versioned_json(&path, FileSchemaKind::ReflectionTask);
-            }
-            let task = ReflectionTaskV1 {
-                schema_version: REFLECTION_TASK_SCHEMA_VERSION,
-                task_id: task_id.clone(),
-                key,
-                outcome_ref,
-                status: ReflectionTaskStatus::Pending,
-                attempt_count: 0,
-                claimed_by_run_id: None,
-                artifact_ref: None,
-                terminal_reason: None,
-                updated_at: now.to_owned(),
-                content_hash: String::new(),
-            };
-            let task = self.store.write_authoritative_json(&path, task)?;
-            self.append_event(&task, None, None, None, now)?;
-            Ok(task)
-        })
+        let path = task_path(&task_id)?;
+        if self.store.exists(&path)? {
+            return self
+                .store
+                .read_versioned_json(&path, FileSchemaKind::ReflectionTask);
+        }
+        let task = ReflectionTaskV1 {
+            schema_version: REFLECTION_TASK_SCHEMA_VERSION,
+            task_id: task_id.clone(),
+            key,
+            outcome_ref,
+            status: ReflectionTaskStatus::Pending,
+            attempt_count: 0,
+            claimed_by_run_id: None,
+            artifact_ref: None,
+            terminal_reason: None,
+            updated_at: now.to_owned(),
+            content_hash: String::new(),
+        };
+        let task = self.store.write_authoritative_json(&path, task)?;
+        self.append_event(&task, None, None, None, now)?;
+        Ok(task)
     }
 
     pub fn read(&self, task_id: &str) -> Result<ReflectionTaskV1> {
@@ -295,10 +292,8 @@ impl ReflectionTaskLedger {
         .ok_or_else(|| invalid("reflection task", "task failure transition was not applied"))
     }
 
-    /// Hold the task claim lock while the specialized Experience service
-    /// performs its own idempotent write. This closes the revision race where
-    /// a scheduler could supersede a claimed Outcome between an optimistic
-    /// check and `record_experience_case`.
+    /// Complete a claimed task after the specialized Experience service
+    /// performs its idempotent write.
     pub fn complete_learned_with(
         &self,
         task_id: &str,
@@ -307,35 +302,30 @@ impl ReflectionTaskLedger {
         now: &str,
         write_case: impl FnOnce() -> Result<crate::ExperienceCaseDisposition>,
     ) -> Result<ReflectionTaskV1> {
-        let lock = lock_path(task_id)?;
-        self.store.with_exclusive_lock(&lock, || {
-            let path = task_path(task_id)?;
-            let mut task: ReflectionTaskV1 = self
-                .store
-                .read_versioned_json(&path, FileSchemaKind::ReflectionTask)?;
-            if task.status != ReflectionTaskStatus::Claimed
-                || task.claimed_by_run_id.as_deref() != Some(actor_run_id)
-            {
-                return Err(invalid(
-                    "reflection task",
-                    "only this run's claimed task may write a learned case",
-                ));
-            }
-            let from = task.status;
-            let case = write_case()?;
-            task.status = match case {
-                crate::ExperienceCaseDisposition::DuplicateSourceRun => {
-                    ReflectionTaskStatus::Duplicate
-                }
-                crate::ExperienceCaseDisposition::Created
-                | crate::ExperienceCaseDisposition::Appended => ReflectionTaskStatus::Completed,
-            };
-            task.artifact_ref = Some(artifact_ref);
-            task.updated_at = now.to_owned();
-            let task = self.store.write_authoritative_json(&path, task)?;
-            self.append_event(&task, Some(from), Some(actor_run_id), None, now)?;
-            Ok(task)
-        })
+        let path = task_path(task_id)?;
+        let mut task: ReflectionTaskV1 = self
+            .store
+            .read_versioned_json(&path, FileSchemaKind::ReflectionTask)?;
+        if task.status != ReflectionTaskStatus::Claimed
+            || task.claimed_by_run_id.as_deref() != Some(actor_run_id)
+        {
+            return Err(invalid(
+                "reflection task",
+                "only this run's claimed task may write a learned case",
+            ));
+        }
+        let from = task.status;
+        let case = write_case()?;
+        task.status = match case {
+            crate::ExperienceCaseDisposition::DuplicateSourceRun => ReflectionTaskStatus::Duplicate,
+            crate::ExperienceCaseDisposition::Created
+            | crate::ExperienceCaseDisposition::Appended => ReflectionTaskStatus::Completed,
+        };
+        task.artifact_ref = Some(artifact_ref);
+        task.updated_at = now.to_owned();
+        let task = self.store.write_authoritative_json(&path, task)?;
+        self.append_event(&task, Some(from), Some(actor_run_id), None, now)?;
+        Ok(task)
     }
 
     /// Reconciliation is performed by the Rust scheduler before it claims
@@ -446,27 +436,24 @@ impl ReflectionTaskLedger {
         now: &str,
         apply: impl FnOnce(&mut ReflectionTaskV1) -> Result<bool>,
     ) -> Result<Option<ReflectionTaskV1>> {
-        let lock = lock_path(task_id)?;
-        self.store.with_exclusive_lock(&lock, || {
-            let path = task_path(task_id)?;
-            let mut task: ReflectionTaskV1 = self
-                .store
-                .read_versioned_json(&path, FileSchemaKind::ReflectionTask)?;
-            let from = task.status;
-            if !apply(&mut task)? {
-                return Ok(None);
-            }
-            task.updated_at = now.to_owned();
-            let task = self.store.write_authoritative_json(&path, task)?;
-            self.append_event(
-                &task,
-                Some(from),
-                Some(actor),
-                task.terminal_reason.clone(),
-                now,
-            )?;
-            Ok(Some(task))
-        })
+        let path = task_path(task_id)?;
+        let mut task: ReflectionTaskV1 = self
+            .store
+            .read_versioned_json(&path, FileSchemaKind::ReflectionTask)?;
+        let from = task.status;
+        if !apply(&mut task)? {
+            return Ok(None);
+        }
+        task.updated_at = now.to_owned();
+        let task = self.store.write_authoritative_json(&path, task)?;
+        self.append_event(
+            &task,
+            Some(from),
+            Some(actor),
+            task.terminal_reason.clone(),
+            now,
+        )?;
+        Ok(Some(task))
     }
 
     fn append_event(
@@ -499,7 +486,7 @@ impl ReflectionTaskLedger {
         event.content_hash = content_hash(
             &serde_json::to_value(&event).map_err(|source| StoreError::JsonSerialize { source })?,
         )?;
-        append_jsonl_locked(self.store.root(), &events, &event)
+        append_jsonl(self.store.root(), &events, &event)
     }
 }
 
@@ -538,10 +525,6 @@ fn artifact_path(artifact_id: &str) -> Result<PathBuf> {
             SafeSlug::new("artifact", artifact_id)?.as_str()
         )),
     )
-}
-fn lock_path(task_id: &str) -> Result<PathBuf> {
-    Ok(PathBuf::from("knowledge/reflection/.locks")
-        .join(format!("{}.lock", SafeSlug::new("task", task_id)?.as_str())))
 }
 fn invalid(kind: &'static str, message: impl Into<String>) -> StoreError {
     StoreError::InvalidDocument {

@@ -1,19 +1,9 @@
-//! The sole terminal writer exposed to the Historical Reflection profile.
-//!
-//! It deliberately accepts an analysis submission, not paths, IDs, timestamps
-//! or an Experience operation. The workflow service owns task completion,
-//! immutable Artifact persistence and `record_experience_case` idempotency.
+//! Rust-owned validation and persistence seam for Historical Reflection.
 
-use std::{fmt, sync::Arc};
-
-use anyhow::{bail, Context, Result};
-use orchestrator_core::{PatternIdentityV1, ReflectionDisposition, RuleRevisionV1, ToolId};
+use anyhow::{bail, Result};
+use orchestrator_core::{PatternIdentityV1, ReflectionDisposition, RuleRevisionV1};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
-
-use super::{api_tool_name, ToolDefinition};
-
-pub const FINALIZE_HISTORICAL_REFLECTION_NAME: &str = ToolId::FinalizeHistoricalReflection.as_str();
+use serde_json::Value;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -115,60 +105,10 @@ pub trait HistoricalReflectionTerminalService: Send + Sync {
     fn finalize(&self, submission: HistoricalReflectionSubmission) -> Result<Value>;
 }
 
-#[derive(Clone)]
-pub struct HistoricalReflectionTerminalBinding {
-    service: Arc<dyn HistoricalReflectionTerminalService>,
-}
-
-impl fmt::Debug for HistoricalReflectionTerminalBinding {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("HistoricalReflectionTerminalBinding")
-            .field("service", &"HistoricalReflectionTerminalService")
-            .finish()
-    }
-}
-
-impl HistoricalReflectionTerminalBinding {
-    pub fn new(service: Arc<dyn HistoricalReflectionTerminalService>) -> Self {
-        Self { service }
-    }
-
-    pub fn execute(&self, arguments: Value) -> Result<Value> {
-        let submission: HistoricalReflectionSubmission = serde_json::from_value(arguments)
-            .context("finalize_historical_reflection arguments are invalid")?;
-        submission.validate()?;
-        self.service
-            .finalize(submission)
-            .map(|artifact| json!({"status":"completed", "terminal":true, "artifact":artifact}))
-    }
-}
-
-pub fn definition() -> ToolDefinition {
-    ToolDefinition {
-        name: api_tool_name(FINALIZE_HISTORICAL_REFLECTION_NAME),
-        description: "Terminally submit the audited Historical Reflection. Duplicate is determined by Rust and is not a model disposition. Learned is the only disposition eligible to add a support case.".to_owned(),
-        parameters: json!({
-            "type":"object",
-            "properties":{
-                "disposition":{"type":"string","enum":["learned","no_reusable_memory","deferred","contested"]},
-                "summary":{"type":"string","minLength":1},
-                "detail":{"type":"string","minLength":1},
-                "confidence":{"type":["number","null"],"minimum":0.0,"maximum":1.0},
-                "root_cause_phase":{"type":["integer","null"],"minimum":1,"maximum":8},
-                "propagation_phases":{"type":"array","items":{"type":"integer","minimum":1,"maximum":8}},
-                "source_refs":{"type":"array","minItems":1,"items":{"type":"string","minLength":1}},
-                "pattern_identity":{"type":["object","null"]},
-                "learned_rule":{"type":["object","null"]}
-            },
-            "required":["disposition","summary","detail","confidence","root_cause_phase","propagation_phases","source_refs","pattern_identity","learned_rule"],
-            "additionalProperties":false
-        }),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn duplicate_is_not_a_model_disposition() {

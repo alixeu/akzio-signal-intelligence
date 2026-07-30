@@ -1,18 +1,20 @@
 ## Analyst 输出契约
 
-字段形状、类型和值域由 Rust finalizer 决定；不要自行构造 Artifact JSON。
+以正常中文报告完成本轮，不构造 Artifact JSON，也不调用任何写入或 finalize 工具。
+Phase 1 Summary 会从正文忠实提取 Index；Rust 负责校验和提交。
 
 输出预算：每个 ticker 最多 3 条 `key_evidence`、2 条 `validation_triggers` 和 2 条 `data_gaps`；`report` 保持简洁，只解释机读字段，不重复证据全文。
 
 `report` 固定按“结论、核心证据簇、反方或冲突证据、已计价判断、验证与证伪条件、数据缺口”的顺序组织。正文不复制完整机读数组；`direction`、`confidence`、`priced_in`、`validation_triggers`、`data_gaps` 以机读字段为准。杠杆 ETF 还需检查基础指数与波动率联动。
 
 硬性规则：
-- 对每个允许的 ticker 调用 `set_analyst_assessment`；用 `append_analyst_evidence`、`append_analyst_data_gap` 和 `set_analyst_invalidation` 补充依据，最后调用 `finalize_analyst_report`。这是唯一的产物写入路径。
-- `id`、`role`、Artifact envelope、ticker scope 与证据可见性全部由运行时管理，绝不在工具参数或自然语言中覆盖。
-- 每次 `append_analyst_evidence` 的 `evidence_ref` 必须逐字引用本轮已完成读取工具返回的 `subject_id`；不得自造、改写或概括证据 ID。
-- `append_analyst_evidence.evidence` 必须直接传对象（例如 `{"claim":"…","evidence_type":"fact",…}`），绝不能把该对象再编码成 JSON 字符串。
-- 每个 ticker 必须有 assessment；`report` 为中文非空段落，且只解释通过工具写入的结论。
-- 一旦 finalize 成功立即停止；不要输出 JSON、代码块或最终 Assistant 文本。
+- 最终只输出一份完整报告，固定使用“结论、核心证据簇、反方或冲突证据、已计价判断、验证与证伪条件、数据缺口”六个小节。
+- 证据引用必须逐字使用本轮读取工具真实返回的 `subject_id`；不得自造、改写或概括证据 ID。
+- 每条核心证据除 `claim/evidence_type/source/timestamp/source_tier/source_confidence` 外，还必须明确写出：
+  - `first_source`（最早可追溯来源）
+  - `is_derivative_repost`（是否为再发布信息，布尔值）
+  - `evidence_age`（只能是 `0-2d` / `3-5d` / `6-10d` / `10d+` / `unknown`）
+- 每个 ticker 必须给出非空报告；不要输出 JSON 或代码块。
 - `direction` 只能为 `bullish`、`bearish`、`neutral`、`mixed` 或 `unobserved`；不得输出组合标签（例如 `neutral_bullish`）。无可用样本时使用 `direction="unobserved"`、`confidence=0.0`。`unobserved` 仅用于诊断，不代表 neutral，不得参与概率合成。
 - `confidence` 表示证据独立性、完整性、时效与冲突程度，不是上涨概率：`0.20–0.35` 为单一证据簇或关键字段缺失；`0.40–0.60` 为有方向但存在明显独立反证；`0.65–0.80` 为多个独立证据簇一致、缺口有限；仅在来源、周期和传导高度一致且无重大未解反证时才可高于 `0.80`。
 - `source_tier` 只能为 `official`、`major_media`、`professional_research`、`longform_analysis` 或 `unknown`；不确定时使用 `unknown`。

@@ -6,7 +6,6 @@
 
 mod atomic;
 mod doctor;
-mod domain;
 mod draft;
 mod error;
 mod evaluation;
@@ -15,13 +14,12 @@ mod index;
 mod input;
 mod json;
 mod jsonl;
-mod learning;
 mod manifest;
 mod memory_usage;
 mod paths;
-mod phase2;
 mod recovery;
 mod reflection_task;
+mod run;
 mod schema;
 mod session;
 mod store;
@@ -37,20 +35,6 @@ pub use doctor::{
     rebuild_run_manifest, DoctorIssue, ExperienceStat, ExperienceStats, IndexCatalog,
     IndexCatalogEntry, StoreDoctorReport, EXPERIENCE_STATS_SCHEMA_VERSION,
     INDEX_CATALOG_SCHEMA_VERSION,
-};
-pub use domain::{
-    append_analyst_data_gap, append_analyst_evidence, append_binding_risk_control,
-    append_research_hinge, append_trade_blocker, finalize_analyst_report,
-    finalize_portfolio_decision, finalize_research_decision, finalize_risk_review,
-    finalize_trade_intent, set_analyst_assessment, set_analyst_invalidation,
-    set_portfolio_asset_decision, set_research_decision, set_research_scenarios,
-    set_risk_assessment, set_risk_constraints, set_trade_intent, AnalystArtifact,
-    AnalystAssessmentInput, AnalystEvidenceInput, CanonicalArtifact, DomainFinalizeOutcome,
-    PortfolioAssetDecisionInput, PortfolioDecisionArtifact, PortfolioDecisionFinalizePolicy,
-    ResearchDecisionArtifact, ResearchDecisionInput, ResearchDecisionPayload,
-    ResearchScenarioInput, RiskAssessmentInput, RiskConstraintsInput, RiskReviewArtifact,
-    TradeIntentArtifact, TradeIntentFinalizePolicy, TradeIntentInput,
-    DOMAIN_ARTIFACT_SCHEMA_VERSION,
 };
 pub use draft::{
     append_draft_receipt, apply_typed_draft_command, complete_terminal_draft_without_artifact,
@@ -73,10 +57,10 @@ pub use experience_ledger::{
 };
 pub use index::{
     append_index_detail, create_index, deterministic_experience_index_id, experience_level,
-    finalize_index, read_index_details, read_indexes, record_experience_case,
+    finalize_index, index_path_component, read_index_details, read_indexes, record_experience_case,
     AppendIndexDetailInput, CreateIndexInput, DetailPage, DetailQuery, DetailSection,
-    ExperienceCaseDisposition, ExperienceLevel, Index, IndexDetail, IndexKind, IndexPage,
-    IndexQuery, IndexScope, RecordExperienceCaseInput, RecordExperienceCaseOutcome,
+    ExperienceCaseDisposition, ExperienceLevel, Index, IndexArchive, IndexDetail, IndexKind,
+    IndexPage, IndexQuery, IndexScope, RecordExperienceCaseInput, RecordExperienceCaseOutcome,
     INDEX_DETAIL_SCHEMA_VERSION, INDEX_SCHEMA_VERSION,
 };
 pub use input::{
@@ -89,11 +73,7 @@ pub use json::{
     canonical_json_bytes, content_hash, content_hash_bytes, seal_content_hash, set_content_hash,
     validate_content_hash, validate_content_hash_at, ContentHashDocument,
 };
-pub use jsonl::{append_jsonl_locked, read_jsonl_recover_tail, JsonlEvent, JsonlRecord};
-pub use learning::{
-    learning_record_relative, read_learning_record, write_learning_record, LearningKind,
-    LearningRecord, LEARNING_RECORD_SCHEMA_VERSION,
-};
+pub use jsonl::{append_jsonl, read_jsonl_recover_tail, JsonlEvent, JsonlRecord};
 pub use manifest::{
     find_run_location, list_run_locations, read_run_manifest, write_run_manifest,
     FinalizedArtifactRef, ManifestError, PhaseStatus, RunLocation, RunManifest, RunManifestInit,
@@ -101,12 +81,9 @@ pub use manifest::{
 };
 pub use memory_usage::MemoryUsageLedger;
 pub use paths::{validate_relative_path, SafeSlug};
-pub use phase2::{
-    ClaimStatus, ClaimStatusEntry, Phase2Artifact, Phase2ArtifactPayload, Phase2DraftService,
-    SteerRoute, PHASE2_ARTIFACT_SCHEMA_VERSION,
-};
 pub use recovery::{rebuild_manifest_from_finalized_artifacts, recover_pending_finalization};
 pub use reflection_task::{ReflectionTaskEventV1, ReflectionTaskLedger, ReflectionTaskV1};
+pub use run::{RunCompactionMode, RunCompactionReport, RunStore};
 pub use schema::{FileSchemaKind, Versioned};
 pub use session::{
     append_session_event, read_session_events, read_session_manifest, write_session_manifest,

@@ -242,7 +242,7 @@ mod tests {
     use orchestrator_store::{capture_run_inputs, write_input_payload, FileStore, RunLocation};
 
     #[test]
-    fn file_store_reader_keeps_captured_bytes_after_mutable_input_changes() {
+    fn file_store_reader_rejects_direct_input_changed_after_run_binding() {
         let temp = tempfile::tempdir().unwrap();
         let store = FileStore::open(temp.path(), Default::default()).unwrap();
         let source = InputSource::technical("QQQ", "daily").unwrap();
@@ -257,8 +257,8 @@ mod tests {
         )
         .unwrap();
 
-        // Simulate a subsequent atomic mutable-source refresh. The run reader
-        // must continue returning the sealed copy, not this replacement.
+        // Direct data is not copied into the run. If it changes after the run
+        // binds its hash, fail instead of mixing two market-data versions.
         write_input_payload(
             &store,
             source,
@@ -266,7 +266,7 @@ mod tests {
             "2026-07-27T00:01:00Z",
         )
         .unwrap();
-        let result = execute(
+        let error = execute(
             json!({"tickers": ["QQQ"], "intervals": ["daily"]}),
             &ExternalToolConfig {
                 file_store_input: Some(super::super::FileStoreInputSnapshot {
@@ -277,11 +277,7 @@ mod tests {
                 ..Default::default()
             },
         )
-        .unwrap();
-        assert_eq!(result["source"], "filestore.run_input.technical");
-        assert_eq!(
-            result["snapshots"][0]["intervals"][0]["latest"]["close"],
-            104.0
-        );
+        .unwrap_err();
+        assert!(error.to_string().contains("authoritative metadata"));
     }
 }

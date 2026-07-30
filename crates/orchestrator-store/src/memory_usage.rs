@@ -8,8 +8,8 @@ use orchestrator_core::{
 };
 
 use crate::{
-    append_jsonl_locked, content_hash, ContentHashDocument, FileSchemaKind, FileStore, JsonlRecord,
-    Result, RunLocation, SafeSlug, StoreError, Versioned,
+    append_jsonl, content_hash, ContentHashDocument, FileStore, JsonlRecord, Result, RunLocation,
+    SafeSlug, StoreError, Versioned,
 };
 
 impl JsonlRecord for MemoryUsageEventV1 {
@@ -88,29 +88,25 @@ impl MemoryUsageLedger {
     pub fn append(&self, mut event: MemoryUsageEventV1) -> Result<MemoryUsageEventV1> {
         validate_event(&event)?;
         let path = event_path(&self.location, &event.unit_key)?;
-        self.store
-            .with_exclusive_lock(&lock_path(&self.location, &event.unit_key)?, || {
-                let events = if self.store.exists(&path)? {
-                    crate::read_jsonl_recover_tail::<MemoryUsageEventV1>(self.store.root(), &path)?
-                } else {
-                    Vec::new()
-                };
-                let next = events.last().map_or(1, |event| event.sequence + 1);
-                event.sequence = next;
-                event.event_id = content_hash(&serde_json::json!({
-                    "unit": event.unit_key,
-                    "sequence": next,
-                    "kind": event.kind,
-                    "query": event.lexical_query,
-                    "expanded": event.expanded_pattern_id,
-                }))?;
-                event.content_hash = content_hash(
-                    &serde_json::to_value(&event)
-                        .map_err(|source| StoreError::JsonSerialize { source })?,
-                )?;
-                append_jsonl_locked(self.store.root(), &path, &event)?;
-                Ok(event.clone())
-            })
+        let events = if self.store.exists(&path)? {
+            crate::read_jsonl_recover_tail::<MemoryUsageEventV1>(self.store.root(), &path)?
+        } else {
+            Vec::new()
+        };
+        let next = events.last().map_or(1, |event| event.sequence + 1);
+        event.sequence = next;
+        event.event_id = content_hash(&serde_json::json!({
+            "unit": event.unit_key,
+            "sequence": next,
+            "kind": event.kind,
+            "query": event.lexical_query,
+            "expanded": event.expanded_pattern_id,
+        }))?;
+        event.content_hash = content_hash(
+            &serde_json::to_value(&event).map_err(|source| StoreError::JsonSerialize { source })?,
+        )?;
+        append_jsonl(self.store.root(), &path, &event)?;
+        Ok(event)
     }
 
     pub fn read_all(&self) -> Result<Vec<MemoryUsageEventV1>> {
@@ -159,36 +155,32 @@ impl MemoryUsageLedger {
         Ok(events)
     }
 
-    pub fn rebuild_report(&self, created_at: &str) -> Result<MemoryUsageReportV1> {
-        let events = self.read_all()?;
-        let report_id =
-            content_hash(&serde_json::json!({"run_id":self.location.run_id,"events":events}))?;
-        self.store.write_authoritative_json(
-            &report_path(&self.location)?,
-            MemoryUsageReportV1 {
-                schema_version: MEMORY_USAGE_REPORT_SCHEMA_VERSION,
-                report_id,
-                run_id: self.location.run_id.clone(),
-                events,
-                created_at: created_at.to_owned(),
-                content_hash: String::new(),
-            },
-        )
-    }
-
-    pub fn report_reference(&self) -> Result<Option<DocumentRef>> {
-        let path = report_path(&self.location)?;
-        if !self.store.exists(&path)? {
-            return Ok(None);
-        }
-        let report: MemoryUsageReportV1 = self
-            .store
-            .read_versioned_json(&path, FileSchemaKind::MemoryUsageReport)?;
-        Ok(Some(DocumentRef {
+    pub fn publish_report(&self, created_at: &str) -> Result<DocumentRef> {
+        let report = self.build_report(created_at)?;
+        let path = PathBuf::from("knowledge/evaluation/memory_usage").join(format!(
+            "{}.json",
+            SafeSlug::new("memory-report", &report.report_id)?.as_str()
+        ));
+        let report = self.store.write_authoritative_json(&path, report)?;
+        Ok(DocumentRef {
             document_id: report.report_id,
             relative_path: path.to_string_lossy().to_string(),
             content_hash: report.content_hash,
-        }))
+        })
+    }
+
+    fn build_report(&self, created_at: &str) -> Result<MemoryUsageReportV1> {
+        let events = self.read_all()?;
+        let report_id =
+            content_hash(&serde_json::json!({"run_id":self.location.run_id,"events":events}))?;
+        Ok(MemoryUsageReportV1 {
+            schema_version: MEMORY_USAGE_REPORT_SCHEMA_VERSION,
+            report_id,
+            run_id: self.location.run_id.clone(),
+            events,
+            created_at: created_at.to_owned(),
+            content_hash: String::new(),
+        })
     }
 }
 
@@ -244,16 +236,6 @@ fn event_path(location: &RunLocation, unit_key: &str) -> Result<PathBuf> {
         SafeSlug::new("memory-unit", unit_key)?.as_str()
     )))
 }
-fn lock_path(location: &RunLocation, unit_key: &str) -> Result<PathBuf> {
-    location.child_relative(&PathBuf::from("memory/usage/.locks").join(format!(
-        "{}.lock",
-        SafeSlug::new("memory-unit", unit_key)?.as_str()
-    )))
-}
-fn report_path(location: &RunLocation) -> Result<PathBuf> {
-    location.child_relative(PathBuf::from("memory/usage/report.json").as_path())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,16 +264,31 @@ mod tests {
     }
 
     #[test]
-    fn report_rebuilds_from_raw_access_events() {
-        let temp = tempdir().unwrap();
-        let store = FileStore::open(temp.path(), crate::FileStoreOptions::default()).unwrap();
-        let location = RunLocation::new("2026-01-01", "run").unwrap();
-        let ledger = MemoryUsageLedger::new(store, location);
+    fn published_report_survives_run_cleanup() {
+        let directory = tempdir().unwrap();
+        let store = FileStore::open(directory.path(), Default::default()).unwrap();
+        let ledger = MemoryUsageLedger::new(
+            store.clone(),
+            RunLocation::new("2026-01-01", "run").unwrap(),
+        );
         ledger.append(event("technical")).unwrap();
         ledger.append(event("confirmation")).unwrap();
-        let report = ledger.rebuild_report("2026-01-01T01:00:00Z").unwrap();
+
+        let reference = ledger.publish_report("2026-01-02T00:00:00Z").unwrap();
+
+        assert!(reference
+            .relative_path
+            .starts_with("knowledge/evaluation/memory_usage/"));
+        assert!(store
+            .exists(std::path::Path::new(&reference.relative_path))
+            .unwrap());
+        let report: MemoryUsageReportV1 = store
+            .read_versioned_json(
+                std::path::Path::new(&reference.relative_path),
+                crate::FileSchemaKind::MemoryUsageReport,
+            )
+            .unwrap();
         assert_eq!(report.events.len(), 2);
-        assert!(ledger.report_reference().unwrap().is_some());
     }
 
     #[test]

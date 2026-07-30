@@ -9,7 +9,8 @@ use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use orchestrator_store::{
     inspect_store, rebuild_experience_stats, rebuild_experience_views, rebuild_index_catalog,
-    rebuild_run_manifest, FileStore, FileStoreOptions, IndexKind, RunLocation, RunManifestInit,
+    rebuild_run_manifest, FileStore, FileStoreOptions, IndexKind, RunCompactionMode, RunLocation,
+    RunManifestInit, RunStore,
 };
 
 #[derive(Parser)]
@@ -68,6 +69,16 @@ enum Command {
     RebuildExperienceViews {
         #[arg(long)]
         generated_at: String,
+    },
+    /// Preview or apply completed-run archives and runtime projection cleanup.
+    CompactRun {
+        #[arg(long)]
+        workflow_date: String,
+        #[arg(long)]
+        run_id: String,
+        /// Apply the deletion. Without this flag the command is a dry run.
+        #[arg(long)]
+        apply: bool,
     },
 }
 
@@ -140,6 +151,19 @@ fn main() -> Result<()> {
         }
         Command::RebuildExperienceViews { generated_at } => {
             serde_json::to_value(rebuild_experience_views(&store, &generated_at)?)?
+        }
+        Command::CompactRun {
+            workflow_date,
+            run_id,
+            apply,
+        } => {
+            let location = RunLocation::new(workflow_date, run_id)?;
+            let run = RunStore::new(store.clone(), location);
+            serde_json::to_value(run.compact_completed_run(if apply {
+                RunCompactionMode::Apply
+            } else {
+                RunCompactionMode::DryRun
+            })?)?
         }
     };
     println!("{}", serde_json::to_string_pretty(&output)?);

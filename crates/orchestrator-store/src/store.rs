@@ -1,5 +1,5 @@
 use std::{
-    fs::{self, OpenOptions},
+    fs,
     path::{Path, PathBuf},
     time::{Duration, SystemTime},
 };
@@ -8,8 +8,8 @@ use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 
 use crate::{
-    append_jsonl_locked, atomic::write_bytes_atomic_with_options, canonical_json_bytes,
-    error::io_error, jsonl::JsonlRecord, paths::resolve_existing, schema::deserialize_current,
+    append_jsonl, atomic::write_bytes_atomic_with_options, canonical_json_bytes, error::io_error,
+    jsonl::JsonlRecord, paths::resolve_existing, schema::deserialize_current,
     schema::validate_schema_version, validate_content_hash_at, AtomicWriteOptions,
     ContentHashDocument, FileSchemaKind, Result, StoreError, Versioned,
 };
@@ -161,27 +161,8 @@ impl FileStore {
         deserialize_current(value, &path)
     }
 
-    pub fn append_jsonl_locked<R: JsonlRecord>(&self, relative: &Path, record: &R) -> Result<()> {
-        append_jsonl_locked(&self.root, relative, record)
-    }
-
-    /// Execute a short critical section while holding an advisory exclusive
-    /// lock on a store-owned lock file.
-    pub fn with_exclusive_lock<T>(
-        &self,
-        relative: &Path,
-        operation: impl FnOnce() -> Result<T>,
-    ) -> Result<T> {
-        let path = crate::paths::resolve_for_write(&self.root, relative)?;
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-            .map_err(|source| io_error(&path, source))?;
-        file.lock().map_err(|source| io_error(&path, source))?;
-        operation()
+    pub fn append_jsonl<R: JsonlRecord>(&self, relative: &Path, record: &R) -> Result<()> {
+        append_jsonl(&self.root, relative, record)
     }
 
     pub fn exists(&self, relative: &Path) -> Result<bool> {

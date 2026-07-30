@@ -1,10 +1,8 @@
-//! Immutable per-run snapshots of mutable market-data inputs.
+//! Per-run bindings to market-data inputs stored at readable stable paths.
 //!
-//! Technical and Jin10 source files are updated atomically, but a workflow run
-//! must never silently observe a later update.  Capturing inputs therefore
-//! validates the source payload against its authoritative metadata, copies the
-//! exact bytes beneath the run, and publishes a hash-sealed manifest only after
-//! every copy is complete.  Consumers read the run-local copy exclusively.
+//! Technical and Jin10 source files are updated atomically. A run manifest
+//! records the exact hash it started with, and consumers reject a later update
+//! instead of duplicating the payload beneath each run.
 
 use std::{
     collections::BTreeSet,
@@ -15,26 +13,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     content_hash_bytes, validate_relative_path, ContentHashDocument, FileSchemaKind, FileStore,
-    Result, RunLocation, SafeSlug, StoreError, Versioned,
+    Result, RunLocation, StoreError, Versioned,
 };
 
 pub const DATA_FILE_METADATA_SCHEMA_VERSION: u32 = 1;
-pub const INPUT_SNAPSHOT_MANIFEST_SCHEMA_VERSION: u32 = 1;
+pub const INPUT_SNAPSHOT_MANIFEST_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InputKind {
     Technical,
     Jin10,
-}
-
-impl InputKind {
-    fn path_component(self) -> &'static str {
-        match self {
-            Self::Technical => "technical",
-            Self::Jin10 => "jin10",
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,17 +83,18 @@ impl InputSource {
         }
     }
 
-    /// The path of the mutable source payload.  Untrusted identifiers are
-    /// slugged and their originals remain in metadata and the run manifest.
+    /// The stable, human-readable path of the source payload.
     pub fn payload_relative_path(&self) -> Result<PathBuf> {
         self.validate()?;
         match self {
             Self::Technical { ticker, interval } => Ok(PathBuf::from("data")
                 .join("technical")
-                .join(SafeSlug::new("ticker", ticker)?.as_str())
+                .join(readable_component("ticker", ticker)?)
                 .join(format!(
                     "{}.csv",
-                    SafeSlug::new("interval", interval)?.as_str()
+                    orchestrator_core::interval_file_label(interval).ok_or_else(|| {
+                        invalid("technical input source", "interval is not supported")
+                    })?
                 ))),
             Self::Jin10 {
                 workflow_date,
@@ -122,31 +112,6 @@ impl InputSource {
             .and_then(|name| name.to_str())
             .ok_or_else(|| invalid("input source", "payload path is not valid UTF-8"))?;
         Ok(payload.with_file_name(format!("{name}.metadata.json")))
-    }
-
-    pub fn snapshot_relative_path(&self, location: &RunLocation) -> Result<PathBuf> {
-        let file = match self {
-            Self::Technical { ticker, interval } => format!(
-                "{}.csv",
-                SafeSlug::new("input", &format!("technical\0{ticker}\0{interval}"))?
-            ),
-            Self::Jin10 {
-                workflow_date,
-                format,
-            } => format!(
-                "{}.{}",
-                SafeSlug::new(
-                    "input",
-                    &format!("jin10\0{workflow_date}\0{}", format.extension())
-                )?,
-                format.extension()
-            ),
-        };
-        location.child_relative(
-            &Path::new("inputs")
-                .join(self.kind().path_component())
-                .join(file),
-        )
     }
 
     fn stable_key(&self) -> String {
@@ -273,11 +238,10 @@ impl ContentHashDocument for DataFileMetadata {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InputSnapshot {
     pub source: InputSource,
-    pub source_relative_path: String,
+    pub payload_relative_path: String,
     pub source_metadata_relative_path: String,
     pub source_metadata_hash: String,
     pub source_payload_hash: String,
-    pub snapshot_relative_path: String,
     pub payload_bytes: u64,
 }
 
@@ -285,31 +249,27 @@ impl InputSnapshot {
     fn from_metadata(
         source: InputSource,
         metadata: &DataFileMetadata,
-        location: &RunLocation,
+        _location: &RunLocation,
     ) -> Result<Self> {
         metadata.validate_for_source(&source)?;
         Ok(Self {
             source: source.clone(),
-            source_relative_path: path_string(&source.payload_relative_path()?)?,
+            payload_relative_path: path_string(&source.payload_relative_path()?)?,
             source_metadata_relative_path: path_string(&source.metadata_relative_path()?)?,
             source_metadata_hash: metadata.content_hash.clone(),
             source_payload_hash: metadata.payload_hash.clone(),
-            snapshot_relative_path: path_string(&source.snapshot_relative_path(location)?)?,
             payload_bytes: metadata.payload_bytes,
         })
     }
 
-    fn validate_for_location(&self, location: &RunLocation) -> Result<()> {
+    fn validate_for_location(&self, _location: &RunLocation) -> Result<()> {
         self.source.validate()?;
         let expected_payload = self.source.payload_relative_path()?;
         let expected_metadata = self.source.metadata_relative_path()?;
-        let expected_snapshot = self.source.snapshot_relative_path(location)?;
-        validate_relative_path(Path::new(&self.source_relative_path))?;
+        validate_relative_path(Path::new(&self.payload_relative_path))?;
         validate_relative_path(Path::new(&self.source_metadata_relative_path))?;
-        validate_relative_path(Path::new(&self.snapshot_relative_path))?;
-        if Path::new(&self.source_relative_path) != expected_payload
+        if Path::new(&self.payload_relative_path) != expected_payload
             || Path::new(&self.source_metadata_relative_path) != expected_metadata
-            || Path::new(&self.snapshot_relative_path) != expected_snapshot
         {
             return Err(invalid(
                 "input snapshot",
@@ -327,8 +287,7 @@ impl InputSnapshot {
     }
 }
 
-/// The single authority that binds a run to exact input bytes.  It is written
-/// last, so no partial set of copied files can become visible to a consumer.
+/// The authority that binds a run to the hashes of its stable input files.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InputSnapshotManifest {
     pub schema_version: u32,
@@ -439,11 +398,8 @@ pub fn write_input_payload(
     let metadata = DataFileMetadata::new(source.clone(), payload, written_at.into())?;
     let payload_relative = source.payload_relative_path()?;
     let metadata_relative = source.metadata_relative_path()?;
-    let lock_relative = input_lock_relative(&metadata_relative)?;
-    store.with_exclusive_lock(&lock_relative, || {
-        store.write_bytes(&payload_relative, payload)?;
-        store.write_authoritative_json(&metadata_relative, metadata.clone())
-    })
+    store.write_bytes(&payload_relative, payload)?;
+    store.write_authoritative_json(&metadata_relative, metadata)
 }
 
 pub fn read_input_metadata(store: &FileStore, source: &InputSource) -> Result<DataFileMetadata> {
@@ -472,9 +428,9 @@ pub fn read_input_payload(store: &FileStore, source: &InputSource) -> Result<Vec
     Ok(payload)
 }
 
-/// Capture the exact source bytes for this run.  If a manifest already exists
-/// it is reused only when the requested source identities match exactly; no
-/// mutable source file is reread during recovery.
+/// Bind this run to the current source hashes without copying the payloads.
+/// If a manifest already exists it is reused only when the requested source
+/// identities match exactly.
 pub fn capture_run_inputs(
     store: &FileStore,
     location: &RunLocation,
@@ -482,18 +438,6 @@ pub fn capture_run_inputs(
     created_at: impl Into<String>,
 ) -> Result<InputSnapshotManifest> {
     source_keys(sources)?;
-    let lock_relative = location.child_relative(Path::new(".inputs.lock"))?;
-    store.with_exclusive_lock(&lock_relative, || {
-        capture_run_inputs_locked(store, location, sources, created_at.into())
-    })
-}
-
-fn capture_run_inputs_locked(
-    store: &FileStore,
-    location: &RunLocation,
-    sources: &[InputSource],
-    created_at: String,
-) -> Result<InputSnapshotManifest> {
     let manifest_relative = InputSnapshotManifest::relative_path(location)?;
     if store.exists(&manifest_relative)? {
         let manifest = read_input_snapshot_manifest(store, location)?;
@@ -513,12 +457,10 @@ fn capture_run_inputs_locked(
             &metadata.payload_hash,
             metadata.payload_bytes,
         )?;
-        let snapshot = InputSnapshot::from_metadata(source, &metadata, location)?;
-        store.write_bytes(Path::new(&snapshot.snapshot_relative_path), &payload)?;
-        snapshots.push(snapshot);
+        snapshots.push(InputSnapshot::from_metadata(source, &metadata, location)?);
     }
 
-    let manifest = InputSnapshotManifest::new(location, created_at, snapshots)?;
+    let manifest = InputSnapshotManifest::new(location, created_at.into(), snapshots)?;
     store.write_authoritative_json(&manifest_relative, manifest)
 }
 
@@ -534,9 +476,8 @@ pub fn read_input_snapshot_manifest(
     Ok(manifest)
 }
 
-/// Read only a run-local immutable copy, and verify its hash before handing
-/// its contents to a workflow role.  This deliberately does not reread the
-/// mutable source path, even if it has since been updated.
+/// Read the stable source path and verify that it still matches the hash bound
+/// into this run's manifest.
 pub fn read_snapshotted_input(
     store: &FileStore,
     location: &RunLocation,
@@ -554,10 +495,10 @@ pub fn read_snapshotted_input(
                 "requested source was not captured",
             )
         })?;
-    let payload = store.read_bytes(Path::new(&snapshot.snapshot_relative_path))?;
+    let payload = store.read_bytes(Path::new(&snapshot.payload_relative_path))?;
     verify_payload(
-        "snapshotted input",
-        Path::new(&snapshot.snapshot_relative_path),
+        "bound input",
+        Path::new(&snapshot.payload_relative_path),
         &payload,
         &snapshot.source_payload_hash,
         snapshot.payload_bytes,
@@ -614,13 +555,21 @@ fn path_string(path: &Path) -> Result<String> {
         .ok_or_else(|| invalid("input path", "path must be valid UTF-8"))
 }
 
-fn input_lock_relative(metadata_relative: &Path) -> Result<PathBuf> {
-    validate_relative_path(metadata_relative)?;
-    let file_name = metadata_relative
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| invalid("input lock path", "metadata filename must be valid UTF-8"))?;
-    Ok(metadata_relative.with_file_name(format!(".{file_name}.lock")))
+fn readable_component(kind: &'static str, value: &str) -> Result<String> {
+    let value = value.trim();
+    if value.is_empty()
+        || value == "."
+        || value == ".."
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(invalid(
+            "input source",
+            format!("{kind} must contain only letters, numbers, dash, underscore, or dot"),
+        ));
+    }
+    Ok(value.to_ascii_lowercase())
 }
 
 fn invalid(kind: &'static str, message: impl Into<String>) -> StoreError {
@@ -701,23 +650,22 @@ mod tests {
     }
 
     #[test]
-    fn source_payload_and_metadata_are_atomic_and_hash_sealed() {
+    fn technical_source_uses_a_readable_lowercase_path() {
         let (_directory, store) = store();
-        let source = InputSource::technical("QQQ/very special", "20 min").unwrap();
+        let source = InputSource::technical("QQQ", "20min").unwrap();
         let metadata =
             write_input_payload(&store, source.clone(), b"first", "2026-07-27T00:00:00Z").unwrap();
 
         assert_eq!(read_input_payload(&store, &source).unwrap(), b"first");
         assert_eq!(read_input_metadata(&store, &source).unwrap(), metadata);
         let path = source.payload_relative_path().unwrap();
-        assert!(path.to_string_lossy().contains("ticker-qqq-very-special-"));
-        assert!(!path.to_string_lossy().contains("QQQ/very special"));
+        assert_eq!(path, Path::new("data/technical/qqq/20min.csv"));
     }
 
     #[test]
-    fn snapshot_is_immutable_when_the_mutable_source_changes() {
+    fn run_binding_rejects_a_source_changed_after_capture() {
         let (_directory, store) = store();
-        let source = InputSource::technical("QQQ", "1 day").unwrap();
+        let source = InputSource::technical("QQQ", "daily").unwrap();
         write_input_payload(&store, source.clone(), b"old", "2026-07-27T00:00:00Z").unwrap();
         let manifest = capture_run_inputs(
             &store,
@@ -727,13 +675,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(manifest.inputs.len(), 1);
+        assert!(!store
+            .exists(
+                &location()
+                    .child_relative(Path::new("inputs/technical"))
+                    .unwrap()
+            )
+            .unwrap());
 
         write_input_payload(&store, source.clone(), b"new", "2026-07-27T00:02:00Z").unwrap();
         assert_eq!(read_input_payload(&store, &source).unwrap(), b"new");
-        assert_eq!(
-            read_snapshotted_input(&store, &location(), &source).unwrap(),
-            b"old"
-        );
+        assert!(read_snapshotted_input(&store, &location(), &source).is_err());
     }
 
     #[test]
@@ -747,7 +699,7 @@ mod tests {
             "2026-07-27T00:00:00Z",
         )
         .unwrap();
-        let manifest = capture_run_inputs(
+        capture_run_inputs(
             &store,
             &location(),
             std::slice::from_ref(&source),
@@ -760,19 +712,13 @@ mod tests {
             .unwrap();
         assert!(read_input_payload(&store, &source).is_err());
 
-        store
-            .write_bytes(
-                Path::new(&manifest.inputs[0].snapshot_relative_path),
-                b"tampered",
-            )
-            .unwrap();
         assert!(read_snapshotted_input(&store, &location(), &source).is_err());
     }
 
     #[test]
     fn existing_manifest_is_reused_only_for_the_same_source_set() {
         let (_directory, store) = store();
-        let technical = InputSource::technical("QQQ", "1 day").unwrap();
+        let technical = InputSource::technical("QQQ", "daily").unwrap();
         let jin10 = InputSource::jin10("2026-07-27", Jin10Format::Csv).unwrap();
         write_input_payload(&store, technical.clone(), b"bars", "2026-07-27T00:00:00Z").unwrap();
         write_input_payload(&store, jin10.clone(), b"news", "2026-07-27T00:00:00Z").unwrap();
@@ -792,7 +738,7 @@ mod tests {
         .unwrap();
         assert_eq!(first, resumed);
 
-        let different = InputSource::technical("SOXX", "1 day").unwrap();
+        let different = InputSource::technical("SOXX", "daily").unwrap();
         assert!(
             capture_run_inputs(&store, &location(), &[different], "2026-07-27T00:03:00Z").is_err()
         );
@@ -803,7 +749,7 @@ mod tests {
         let (_directory, store) = store();
         let relative = InputSnapshotManifest::relative_path(&location()).unwrap();
         let future = set_content_hash(&json!({
-            "schema_version": 2,
+            "schema_version": 3,
             "run_id": "run:QQQ/one",
             "current_date": "2026-07-27",
             "created_at": "now",

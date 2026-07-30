@@ -5,7 +5,9 @@ use html_escape::encode_text;
 use orchestrator_core::{
     config_float, config_str, config_strings, display_ticker, project_path, run_slug,
 };
-use orchestrator_store::{FileStore, FileStoreOptions, RunLocation};
+use orchestrator_store::{
+    read_indexes, FileStore, FileStoreOptions, IndexKind, IndexQuery, RunLocation,
+};
 use serde_json::{json, Value};
 use std::{fs, path::PathBuf, process::Command};
 
@@ -66,18 +68,34 @@ fn build_payload(
     let location = RunLocation::new(today, run_id)?;
     let store = FileStore::open(&root, FileStoreOptions::default())?;
     let state_relative = location.child_relative(std::path::Path::new("state.json"))?;
-    let state = if store.exists(&state_relative)? {
+    let state_exists = store.exists(&state_relative)?;
+    let state = if state_exists {
         store.read_json_value(&state_relative)?
     } else {
-        json!({})
+        read_indexes(
+            &store,
+            Some(&location),
+            &IndexQuery {
+                kind: Some(IndexKind::PhaseSummary),
+                source_phase: Some(8),
+                limit: 1,
+                ..Default::default()
+            },
+        )?
+        .indexes
+        .into_iter()
+        .next()
+        .map(|index| Value::Object(index.authoritative_fields))
+        .unwrap_or_else(|| json!({}))
     };
+    let complete = state_exists || !state.as_object().is_none_or(serde_json::Map::is_empty);
     let report_markdown = super::builder::build_human_readable_report(&state);
     let report_html = super::builder::report_to_html(&report_markdown);
 
     Ok(json!({
         "subject": format!("{} strategy report {}", display_ticker(tickers), today),
         "today": today,
-        "orchestrator_status": if store.exists(&state_relative)? { "complete" } else { "missing" },
+        "orchestrator_status": if complete { "complete" } else { "missing" },
         "store_root": root,
         "run_id": location.run_id,
         "orchestrator_state": state,
@@ -308,6 +326,10 @@ fn normalize_probability(value: Option<&Value>) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use orchestrator_store::{
+        append_index_detail, create_index, finalize_index, AppendIndexDetailInput,
+        CreateIndexInput, DetailSection, IndexScope,
+    };
 
     #[test]
     fn email_decision_sends_first_daily_report() {
@@ -337,6 +359,67 @@ mod tests {
             .unwrap();
         let payload = build_payload(&config, Some(temp.path()), "2026-06-19", "TQQQ", &[]).unwrap();
         assert_eq!(payload["orchestrator_status"], "complete");
+    }
+
+    #[test]
+    fn build_payload_reads_final_decision_index_after_state_cleanup() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = json!({"orchestrator":{"store":{"root":temp.path()}}});
+        let store = FileStore::open(temp.path(), FileStoreOptions::default()).unwrap();
+        let date = "2026-06-19";
+        let run_id = crate::orchestration::lifecycle::run_id_for(&[], date);
+        let location = RunLocation::new(date, &run_id).unwrap();
+        let scope = IndexScope {
+            kind: IndexKind::PhaseSummary,
+            location: Some(location),
+            index_id: "idx-123456".to_owned(),
+            run_id,
+            source_run_id: None,
+            source_phase: 8,
+            role: "rust.final_decision".to_owned(),
+            ticker: Some("TQQQ".to_owned()),
+            topic_id: None,
+            source_payload_hash: "sha256:source".to_owned(),
+            authoritative_fields: json!({
+                "portfolio_allocation": {
+                    "total_equity_exposure": 0.25,
+                    "weights": {}
+                }
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+            created_at: "2026-06-19T00:00:00Z".to_owned(),
+        };
+        create_index(
+            &store,
+            CreateIndexInput {
+                scope: scope.clone(),
+                summary: "final decision".to_owned(),
+                confidence: 0.8,
+                pattern_key: None,
+                applies_to_phases: Vec::new(),
+            },
+        )
+        .unwrap();
+        append_index_detail(
+            &store,
+            AppendIndexDetailInput {
+                scope: scope.clone(),
+                section: DetailSection::Execution,
+                detail: "final decision detail".to_owned(),
+                source_refs: Vec::new(),
+            },
+        )
+        .unwrap();
+        finalize_index(&store, &scope).unwrap();
+
+        let payload = build_payload(&config, Some(temp.path()), date, "TQQQ", &[]).unwrap();
+        assert_eq!(payload["orchestrator_status"], "complete");
+        assert_eq!(
+            payload["orchestrator_state"]["portfolio_allocation"]["total_equity_exposure"],
+            0.25
+        );
     }
 
     #[test]

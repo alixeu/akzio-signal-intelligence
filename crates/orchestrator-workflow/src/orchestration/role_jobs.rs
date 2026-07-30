@@ -1,19 +1,18 @@
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
-use futures::{stream, StreamExt};
+use futures::{future::BoxFuture, stream, StreamExt};
 use orchestrator_core::{
-    default_project_root, HistoricalReflectionArtifactV1, ReflectionDisposition,
+    default_project_root, md5_3, HistoricalReflectionArtifactV1, ReflectionDisposition,
     ToolManagedProfile, HISTORICAL_REFLECTION_ARTIFACT_SCHEMA_VERSION,
 };
 use orchestrator_llm::{
     agent_loop::{
-        FileStoreSessionRuntime, ModelStreamResult, RetrievalPolicy, SessionRuntimeSpec,
-        TokenUsage, ToolResultItem, Turn,
+        FileStoreSessionRuntime, ModelStreamResult, RetrievalPolicy, SessionRuntimeSpec, TokenUsage,
     },
-    run_agent_loop_with_metrics,
+    run_agent_loop_with_metrics, run_agent_steer_loop_with_metrics,
     tools::{ExternalToolConfig, FileStoreInputSnapshot},
     truncation::TruncationConfig,
-    AgentLoopOutput, AgentSettings, RoleLlmSettings,
+    AgentLoopOutput, AgentSettings, RoleLlmSettings, SteerLoopInput,
 };
 use serde_json::{json, Map, Value};
 use std::time::{Duration, Instant};
@@ -26,7 +25,6 @@ use tokio::time;
 use tracing::{debug, warn};
 
 use super::config::{prompt_version, RetrievalConfig, RuntimeConfig};
-use super::domain_runtime::{file_store_domain_runtime, FileStoreDomainRuntimePlan};
 use super::index_runtime::{file_store_index_tool_runtime, FileStoreIndexRuntimePlan};
 use super::lifecycle::tickers_from_state;
 use super::render::{direct_context_manifest, render_prompt_with_plugins};
@@ -62,15 +60,11 @@ pub(crate) struct RoleJob {
     pub tickers: Vec<String>,
     pub tool_managed_profile: ToolManagedProfile,
     pub index_tool_runtime: Option<orchestrator_llm::tools::index_tools::IndexToolRuntimeBinding>,
-    pub historical_reflection_terminal:
-        Option<orchestrator_llm::tools::historical_reflection::HistoricalReflectionTerminalBinding>,
     pub experience_retrieval:
         Option<orchestrator_llm::tools::experience_tools::ExperienceRetrievalBinding>,
-    pub domain_tool_runtime:
-        Option<orchestrator_llm::tools::domain_tools::DomainToolRuntimeBinding>,
+    pub evidence_research:
+        Option<orchestrator_llm::tools::research_evidence_gap::EvidenceResearchBinding>,
     pub session_runtime: FileStoreSessionRuntime,
-    /// Per-role typed Draft/Index write-attempt budget from runtime config.
-    pub max_write_calls: Option<usize>,
     pub llm: Option<RoleLlmSettings>,
     pub reasoning_effort_override: Option<String>,
     pub tools: ExternalToolConfig,
@@ -117,11 +111,19 @@ fn prompt_version_for_role(state: &Value, role: &str, kind: &str) -> Option<Stri
     if role == "mediator.topic" && kind == "warmup" {
         return Some(prompt_version(config, "orchestrator.prompts.phase2.warmup"));
     }
+    if role == "compressor.phase_summary" {
+        let phase = state
+            .pointer("/_summary_source_payload/phase")
+            .and_then(Value::as_i64)?;
+        return Some(prompt_version(
+            config,
+            &format!("orchestrator.prompts.compressor.phase{phase}"),
+        ));
+    }
     let prompt_key = match role {
         "reflector.historical" => "orchestrator.prompts.reflection.historical",
         "analyst.technical" => "orchestrator.prompts.analyst.technical",
         "analyst.news_macro" => "orchestrator.prompts.analyst.news_macro",
-        "compressor.phase_summary" => "orchestrator.prompts.compressor.phase_summary",
         "mediator.topic" => "orchestrator.prompts.phase2.topic_generator",
         "researcher.bull.initial" => "orchestrator.prompts.phase2.bull_initial",
         "researcher.bull.interaction" => "orchestrator.prompts.phase2.bull_interaction",
@@ -152,6 +154,7 @@ fn tool_managed_profile_for_role_kind(role: &str, kind: &str) -> Option<ToolMana
             Some(ToolManagedProfile::DebateResponse)
         }
         "mediator.topic_controller" => Some(ToolManagedProfile::TopicControl),
+        "researcher.web_evidence" => Some(ToolManagedProfile::EvidenceResearch),
         "manager.research" => Some(ToolManagedProfile::ResearchDecision),
         "trader" => Some(ToolManagedProfile::TradeIntent),
         "risk.aggressive" | "risk.neutral" | "risk.conservative" => {
@@ -161,38 +164,6 @@ fn tool_managed_profile_for_role_kind(role: &str, kind: &str) -> Option<ToolMana
         "compressor.phase_summary" => Some(ToolManagedProfile::PhaseSummary),
         _ => None,
     }
-}
-
-/// Only structured evidence IDs may cross into a DomainTool scope.  Until the
-/// FileStore Session adapter records an `evidence_read` event, live roles get
-/// an empty set and a write that cites an invented ID fails closed.  Mock uses
-/// deterministic IDs so it can exercise the same Draft/finalize path.
-fn visible_domain_evidence_refs(
-    state: &Value,
-    role: &str,
-    tickers: &[String],
-    mock: bool,
-) -> BTreeSet<String> {
-    let mut visible = state
-        .get("visible_evidence_refs")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .map(str::trim)
-        .filter(|reference| !reference.is_empty())
-        .map(ToOwned::to_owned)
-        .collect::<BTreeSet<_>>();
-    if mock {
-        visible.extend(tickers.iter().map(|ticker| format!("mock:{role}:{ticker}")));
-        // Phase 2 aggregate units intentionally have no ticker scope, but
-        // their typed tools still need a structured, Rust-owned mock evidence
-        // reference to exercise the same finalize invariants as live runs.
-        if tickers.is_empty() && phase2_side_for_role(role).is_some() || role == "mediator.topic" {
-            visible.insert("mock:phase2:shared".to_owned());
-        }
-    }
-    visible
 }
 
 pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
@@ -277,9 +248,8 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
     let (
         tool_managed_profile,
         index_tool_runtime,
-        historical_reflection_terminal,
         experience_retrieval,
-        domain_tool_runtime,
+        evidence_research,
         file_store_input,
         tool_allowlist,
     ) = {
@@ -290,7 +260,6 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
             .get("store_root")
             .and_then(Value::as_str)
             .context("store_root missing for migrated ToolManaged domain role")?;
-        let visible = visible_domain_evidence_refs(&state, role, &tickers, mock);
         if profile == ToolManagedProfile::HistoricalReflection {
             let binding = file_store_historical_reflection_index_runtime(
                 Path::new(store_root),
@@ -298,86 +267,79 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
                 registration.profile_version,
                 registration.builder_version,
             )?;
-            let terminal = file_store_historical_reflection_terminal(
-                Path::new(store_root),
-                &state,
-                registration.profile_version,
-                registration.builder_version,
-            )?;
             (
                 profile,
                 Some(binding),
-                Some(terminal),
                 None,
                 None,
                 None,
-                registration.tool_allowlist.clone(),
+                registration
+                    .tool_allowlist
+                    .iter()
+                    .filter(|tool| is_read_only_model_tool(tool.as_str()))
+                    .cloned()
+                    .collect(),
             )
         } else if profile == ToolManagedProfile::PhaseSummary {
-            let binding = file_store_phase_summary_index_runtime(
-                Path::new(store_root),
-                &state,
-                registration.profile_version,
-                registration.builder_version,
-            )?;
-            (
-                profile,
-                Some(binding),
-                None,
-                None,
-                None,
-                None,
-                registration.tool_allowlist.clone(),
-            )
+            (profile, None, None, None, None, Vec::new())
         } else {
-            let binding = file_store_domain_runtime(
-                Path::new(store_root),
-                &state,
-                FileStoreDomainRuntimePlan {
-                    role: role.to_owned(),
-                    phase,
-                    profile,
-                    profile_version: registration.profile_version,
-                    builder_version: registration.builder_version,
-                    tickers: tickers.clone(),
-                    visible_evidence_refs: visible,
-                    topic_id: topic_id.map(ToOwned::to_owned),
-                    side: phase2_side_for_role(role).map(ToOwned::to_owned),
-                    round: round.and_then(|value| u32::try_from(value).ok()),
-                    visible_claims: visible_phase2_claims(&state, topic_id),
-                    fork: phase2_fork_reference(&state, role, topic_id),
-                    trade_candidate_action: trade_candidate_action(&state, &tickers),
-                    portfolio_rating: portfolio_rating(&state, &tickers),
-                    portfolio_current_weight: portfolio_current_weight(&state, &tickers),
-                },
-            )?;
             let input = if profile == ToolManagedProfile::AnalystReport && !mock {
                 Some(file_store_input_from_state(&state)?)
             } else {
                 None
             };
-            let experiences = file_store_experience_retrieval(
-                Path::new(store_root),
-                &state,
-                role,
-                phase,
-                &tickers,
-                config.retrieval.reflection_max_details,
-            )?;
+            let index_reader = registration
+                .allows_tool(orchestrator_llm::tools::index_tools::READ_INDEXES_NAME)
+                .then(|| {
+                    file_store_domain_index_read_runtime(
+                        Path::new(store_root),
+                        &state,
+                        role,
+                        phase,
+                        profile,
+                        &tickers,
+                    )
+                })
+                .transpose()?;
+            let experiences = registration
+                .allows_tool(orchestrator_llm::tools::experience_tools::SEARCH_EXPERIENCES_NAME)
+                .then(|| {
+                    file_store_experience_retrieval(
+                        Path::new(store_root),
+                        &state,
+                        role,
+                        phase,
+                        &tickers,
+                        config.retrieval.reflection_max_details,
+                    )
+                })
+                .transpose()?;
+            let evidence_research = registration
+                .allows_tool(orchestrator_llm::tools::research_evidence_gap::NAME)
+                .then(|| {
+                    phase2_evidence_research_binding(
+                        &state,
+                        role,
+                        topic_id,
+                        model_override,
+                        reasoning_effort_override,
+                        config,
+                        &tool_tickers,
+                    )
+                })
+                .transpose()?;
             (
                 profile,
-                Some(file_store_domain_index_read_runtime(
-                    Path::new(store_root),
-                    &state,
-                    role,
-                    phase,
-                    &tickers,
-                )?),
-                None,
-                Some(experiences),
-                Some(binding),
+                index_reader,
+                experiences,
+                evidence_research,
                 input,
-                registration.tool_allowlist.clone(),
+                registration
+                    .tool_allowlist
+                    .iter()
+                    .filter(|tool| is_read_only_model_tool(tool.as_str()))
+                    .cloned()
+                    .collect(),
             )
         }
     };
@@ -394,6 +356,17 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
     // snapshots. Clearing every alternate persistence handle here turns a missing
     // FileStore projection into a hard tool error instead of an accidental
     // alternate persistence fallback.
+    let phase2_fork = phase2_fork_reference(&state, role, topic_id, round);
+    let phase2_steer = phase2_steer_payload(
+        &state,
+        role,
+        kind,
+        topic_id,
+        round,
+        phase2_fork
+            .as_ref()
+            .map(|fork| fork.fork_from_turn_id.as_str()),
+    );
     let session_runtime = file_store_session_runtime(
         &state,
         role,
@@ -401,7 +374,7 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
         topic_id,
         round,
         tool_managed_profile,
-        phase2_fork_reference(&state, role, topic_id),
+        phase2_fork,
     )?;
 
     Ok(RoleJob {
@@ -414,16 +387,14 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
         debug: debug_enabled,
         prompt,
         prompt_path: prompt_path.map(|path| path.display().to_string()),
-        debug_output_path: phase2_debug_output_path(phase, role, kind, topic_id),
+        debug_output_path: phase2_debug_output_path(phase, role, kind, topic_id, round),
         prompt_version,
         tickers: tickers.clone(),
         tool_managed_profile,
         index_tool_runtime,
-        historical_reflection_terminal,
         experience_retrieval,
-        domain_tool_runtime,
+        evidence_research,
         session_runtime,
-        max_write_calls: Some(config.tool_managed.max_write_calls_per_role),
         llm,
         reasoning_effort_override: reasoning_effort_override.map(ToString::to_string),
         tools: ExternalToolConfig {
@@ -452,12 +423,394 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
                 &state,
                 tool_managed_profile,
             ),
+            phase2_steer,
         },
         web_search: config.web_search.get(role).cloned().unwrap_or_default(),
         truncation: config.truncation.clone(),
         retrieval_policy: retrieval_policy_for_role(role, kind, &config.retrieval),
         context_manifest: direct_context_manifest(&state, phase),
     })
+}
+
+fn is_read_only_model_tool(name: &str) -> bool {
+    name == "think"
+        || name == "web.run"
+        || name == orchestrator_llm::tools::record_phase2_steer::NAME
+        || name == "verify_event"
+        || name == orchestrator_llm::tools::research_evidence_gap::NAME
+        || name.starts_with("read_")
+        || name.starts_with("search_")
+        || name.starts_with("alpaca_get_")
+}
+
+#[derive(Clone)]
+struct WorkflowEvidenceResearchService {
+    store_root: PathBuf,
+    current_date: String,
+    run_id: String,
+    project_root: PathBuf,
+    prompt_path: PathBuf,
+    llm: RoleLlmSettings,
+    web_search: orchestrator_llm::web_search::WebSearchConfig,
+    truncation: TruncationConfig,
+    tools: ExternalToolConfig,
+    reasoning_effort_override: Option<String>,
+    debug: bool,
+}
+
+impl orchestrator_llm::tools::research_evidence_gap::EvidenceResearchService
+    for WorkflowEvidenceResearchService
+{
+    fn research(
+        &self,
+        request: orchestrator_llm::tools::research_evidence_gap::EvidenceResearchRequest,
+        request_id: String,
+        topic_id: Option<String>,
+    ) -> BoxFuture<'static, Result<Value>> {
+        let service = self.clone();
+        Box::pin(
+            async move { run_web_evidence_research(service, request, request_id, topic_id).await },
+        )
+    }
+}
+
+async fn run_web_evidence_research(
+    service: WorkflowEvidenceResearchService,
+    request: orchestrator_llm::tools::research_evidence_gap::EvidenceResearchRequest,
+    request_id: String,
+    topic_id: Option<String>,
+) -> Result<Value> {
+    let template = std::fs::read_to_string(&service.prompt_path).with_context(|| {
+        format!(
+            "failed to read Web evidence prompt {}",
+            service.prompt_path.display()
+        )
+    })?;
+    let request_json = serde_json::to_string_pretty(&json!({
+        "request_id": request_id,
+        "topic_id": topic_id,
+        "request": request,
+    }))?;
+    let prompt =
+        format!("{template}\n\n## Rust-owned evidence request\n\n```json\n{request_json}\n```");
+    let store = orchestrator_store::FileStore::open(
+        &service.store_root,
+        orchestrator_store::FileStoreOptions::default(),
+    )?;
+    let scope_component = topic_id
+        .as_deref()
+        .map(|topic| format!("topic-{}", md5_3(topic)))
+        .unwrap_or_else(|| "topic-generation".to_owned());
+    let session_id = format!(
+        "{}:p2:researcher.web_evidence:{}:{}",
+        service.run_id, scope_component, request_id
+    );
+    let session_runtime = FileStoreSessionRuntime::create_or_load(
+        store,
+        SessionRuntimeSpec {
+            run: orchestrator_store::RunLocation::new(&service.current_date, &service.run_id)?,
+            session_id,
+            role: "researcher.web_evidence".to_owned(),
+            phase: 2,
+            profile: ToolManagedProfile::EvidenceResearch.as_str().to_owned(),
+            fork: None,
+            created_at: Utc::now().to_rfc3339(),
+        },
+    )?;
+    let prompt_path = service
+        .prompt_path
+        .strip_prefix(&service.project_root)
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("prompts/phase2/web_evidence_researcher.md"));
+    let settings = AgentSettings {
+        role: "researcher.web_evidence".to_owned(),
+        phase: Some(2),
+        topic_id,
+        debug_prompt_path: Some(prompt_path),
+        debug_output_path: Some(
+            PathBuf::from("outputs/debug/phase2/evidence")
+                .join(scope_component)
+                .join(format!("{request_id}.json")),
+        ),
+        debug_round: None,
+        tickers: request.tickers,
+        tool_managed_profile: ToolManagedProfile::EvidenceResearch,
+        session_runtime,
+        index_tool_runtime: None,
+        experience_retrieval: None,
+        evidence_research: None,
+        llm: service.llm,
+        reasoning_effort_override: service.reasoning_effort_override,
+        tools: Some(service.tools),
+        web_search: service.web_search,
+        truncation: service.truncation,
+        debug: service.debug,
+        retrieval_policy: RetrievalPolicy::default(),
+    };
+    let output = run_agent_loop_with_metrics(&settings, &prompt).await?;
+    let response_text = output
+        .artifact
+        .get("response_text")
+        .and_then(Value::as_str)
+        .context("Web evidence researcher returned no final response text")?;
+    normalize_web_evidence_packet(response_text, &request_id)
+}
+
+fn phase2_evidence_research_binding(
+    state: &Value,
+    role: &str,
+    topic_id: Option<&str>,
+    model_override: Option<&str>,
+    reasoning_effort_override: Option<&str>,
+    config: &RuntimeConfig,
+    tickers: &[String],
+) -> Result<orchestrator_llm::tools::research_evidence_gap::EvidenceResearchBinding> {
+    use orchestrator_llm::tools::research_evidence_gap::{
+        EvidenceResearchBinding, EvidenceResearchScope,
+    };
+
+    let run_id = state
+        .get("run_id")
+        .and_then(Value::as_str)
+        .context("Phase 2 evidence research requires run_id")?;
+    let current_date = state
+        .get("current_date")
+        .and_then(Value::as_str)
+        .context("Phase 2 evidence research requires current_date")?;
+    let store_root = state
+        .get("store_root")
+        .and_then(Value::as_str)
+        .context("Phase 2 evidence research requires store_root")?;
+    let (scope_key, max_calls) = if role == "mediator.topic" {
+        (format!("{run_id}:phase2:topic-generation"), 2)
+    } else {
+        let topic_id = topic_id.context("Bull/Bear evidence research requires topic_id")?;
+        (format!("{run_id}:phase2:topic:{topic_id}"), 2)
+    };
+    let mut llm = config
+        .llm_roles
+        .get("researcher.web_evidence")
+        .context("missing LLM config for researcher.web_evidence")?
+        .clone();
+    if let Some(model) = model_override.filter(|value| !value.trim().is_empty()) {
+        llm.model = model.to_owned();
+    }
+    let registration = config.role_profile_registry.registration(
+        "researcher.web_evidence",
+        ToolManagedProfile::EvidenceResearch,
+    )?;
+    llm.tools = registration
+        .tool_allowlist
+        .iter()
+        .map(|tool| tool.as_str().to_owned())
+        .collect();
+    let project_root = default_project_root();
+    let service = WorkflowEvidenceResearchService {
+        store_root: PathBuf::from(store_root),
+        current_date: current_date.to_owned(),
+        run_id: run_id.to_owned(),
+        project_root: project_root.clone(),
+        prompt_path: config
+            .prompts
+            .path_for("researcher.web_evidence")
+            .context("missing Web evidence researcher prompt")?
+            .clone(),
+        llm,
+        web_search: config
+            .web_search
+            .get("researcher.web_evidence")
+            .context("missing Web search config for researcher.web_evidence")?
+            .clone(),
+        truncation: config.truncation.clone(),
+        tools: ExternalToolConfig {
+            project_root,
+            run_id: Some(run_id.to_owned()),
+            phase: Some(2),
+            phase_summary_page_limit: config.retrieval.summary_page_limit,
+            phase_summary_detail_page_limit: config.retrieval.detail_page_limit,
+            tickers: tickers.to_vec(),
+            alpaca_market_data: false,
+            alpaca_api_key: None,
+            alpaca_api_secret: None,
+            file_store_input: None,
+            file_store_reflection_source: None,
+            phase2_steer: None,
+        },
+        reasoning_effort_override: reasoning_effort_override.map(ToOwned::to_owned),
+        debug: state.get("debug").and_then(Value::as_bool).unwrap_or(false),
+    };
+    EvidenceResearchBinding::new(
+        Arc::new(service),
+        config.evidence_research_coordinator.clone(),
+        EvidenceResearchScope {
+            scope_key,
+            role: role.to_owned(),
+            topic_id: topic_id.map(ToOwned::to_owned),
+            allowed_tickers: tickers
+                .iter()
+                .map(|ticker| ticker.trim().to_ascii_uppercase())
+                .filter(|ticker| !ticker.is_empty())
+                .collect(),
+            max_calls,
+        },
+    )
+}
+
+fn normalize_web_evidence_packet(response_text: &str, request_id: &str) -> Result<Value> {
+    let start = response_text
+        .find('{')
+        .context("Web evidence response must contain one JSON object")?;
+    let end = response_text
+        .rfind('}')
+        .context("Web evidence response must contain one JSON object")?;
+    if end < start {
+        bail!("Web evidence response JSON object is malformed");
+    }
+    let value: Value = serde_json::from_str(&response_text[start..=end])
+        .context("Web evidence response is not valid JSON")?;
+    let object = value
+        .as_object()
+        .context("Web evidence response must be a JSON object")?;
+    let status = required_string(object, "status", 20)?;
+    if !matches!(
+        status.as_str(),
+        "supported" | "refuted" | "mixed" | "not_found"
+    ) {
+        bail!("Web evidence status must be supported, refuted, mixed, or not_found");
+    }
+    let retrieved_at = Utc::now().to_rfc3339();
+    let mut seen_ids = BTreeSet::new();
+    let mut evidence_limit = 5usize;
+    let mut evidence = normalize_web_evidence_items(
+        object.get("evidence"),
+        request_id,
+        &retrieved_at,
+        &mut seen_ids,
+        &mut evidence_limit,
+    )?;
+    let mut counter_limit = 5usize;
+    let mut counterevidence = normalize_web_evidence_items(
+        object.get("counterevidence"),
+        request_id,
+        &retrieved_at,
+        &mut seen_ids,
+        &mut counter_limit,
+    )?;
+    if evidence.len() + counterevidence.len() > 5 {
+        if evidence.is_empty() {
+            counterevidence.truncate(5);
+        } else if counterevidence.is_empty() {
+            evidence.truncate(5);
+        } else {
+            evidence.truncate(4);
+            counterevidence.truncate(5 - evidence.len());
+        }
+    }
+    if status == "not_found" && (!evidence.is_empty() || !counterevidence.is_empty()) {
+        bail!("Web evidence status not_found cannot include evidence");
+    }
+    if status != "not_found" && evidence.is_empty() && counterevidence.is_empty() {
+        bail!("Web evidence status {status} requires at least one source");
+    }
+    Ok(json!({
+        "status": status,
+        "request_id": request_id,
+        "evidence": evidence,
+        "counterevidence": counterevidence,
+        "unresolved_gaps": bounded_string_array(object.get("unresolved_gaps"), 5, 300),
+        "search_queries": bounded_string_array(object.get("search_queries"), 5, 256),
+        "source_count": evidence.len() + counterevidence.len(),
+    }))
+}
+
+fn normalize_web_evidence_items(
+    value: Option<&Value>,
+    request_id: &str,
+    retrieved_at: &str,
+    seen_ids: &mut BTreeSet<String>,
+    remaining: &mut usize,
+) -> Result<Vec<Value>> {
+    let items = value.and_then(Value::as_array).cloned().unwrap_or_default();
+    let mut normalized = Vec::new();
+    for item in items {
+        if *remaining == 0 {
+            break;
+        }
+        let object = item
+            .as_object()
+            .context("Web evidence entries must be JSON objects")?;
+        let claim = required_string(object, "claim", 500)?;
+        let relation = required_string(object, "relation", 20)?;
+        if !matches!(relation.as_str(), "supports" | "refutes" | "context") {
+            bail!("Web evidence relation must be supports, refutes, or context");
+        }
+        let source_url = required_string(object, "source_url", 1_000)?;
+        if !source_url.starts_with("https://") && !source_url.starts_with("http://") {
+            bail!("Web evidence source_url must use http or https");
+        }
+        let publisher = required_string(object, "publisher", 200)?;
+        let source_tier = required_string(object, "source_tier", 20)?;
+        if !matches!(
+            source_tier.as_str(),
+            "primary" | "official" | "major_media" | "secondary"
+        ) {
+            bail!("Web evidence source_tier is invalid");
+        }
+        let evidence_id = format!(
+            "web-{}",
+            md5_3(format!("{claim}\n{relation}\n{source_url}"))
+        );
+        if !seen_ids.insert(evidence_id.clone()) {
+            continue;
+        }
+        let published_at = match object.get("published_at") {
+            None | Some(Value::Null) => Value::Null,
+            Some(Value::String(value)) if value.chars().count() <= 100 => {
+                Value::String(value.clone())
+            }
+            _ => bail!("Web evidence published_at must be a short string or null"),
+        };
+        normalized.push(json!({
+            "evidence_id": evidence_id,
+            "request_id": request_id,
+            "claim": claim,
+            "relation": relation,
+            "source_url": source_url,
+            "publisher": publisher,
+            "published_at": published_at,
+            "retrieved_at": retrieved_at,
+            "source_tier": source_tier,
+        }));
+        *remaining -= 1;
+    }
+    Ok(normalized)
+}
+
+fn required_string(object: &Map<String, Value>, field: &str, max_chars: usize) -> Result<String> {
+    let value = object
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .with_context(|| format!("Web evidence response requires non-empty {field}"))?;
+    if value.chars().count() > max_chars {
+        bail!("Web evidence {field} exceeds {max_chars} characters");
+    }
+    Ok(value)
+}
+
+fn bounded_string_array(value: Option<&Value>, limit: usize, max_chars: usize) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.chars().count() <= max_chars)
+        .take(limit)
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 /// One read-only Index/Detail binding for a business role. The unit scope,
@@ -469,6 +822,7 @@ fn file_store_domain_index_read_runtime(
     state: &Value,
     role: &str,
     phase: i64,
+    profile: ToolManagedProfile,
     tickers: &[String],
 ) -> Result<orchestrator_llm::tools::index_tools::IndexToolRuntimeBinding> {
     use orchestrator_llm::tools::index_tools::{IndexKind, IndexOwnedScope, IndexReadVisibility};
@@ -483,9 +837,12 @@ fn file_store_domain_index_read_runtime(
         .and_then(Value::as_str)
         .context("domain Index reader requires current_date")?;
     let phase_u8 = u8::try_from(phase).context("domain Index reader phase must fit u8")?;
+    let source_phases = phase_summary_source_phases(profile)?;
     let source_payload_hash = content_hash(&json!({
         "reader_role": role,
         "phase": phase,
+        "profile": profile.as_str(),
+        "source_phases": source_phases,
         "tickers": tickers,
         "run_id": run_id,
     }))?;
@@ -503,9 +860,9 @@ fn file_store_domain_index_read_runtime(
         authoritative_fields: Map::new(),
     };
     let visibility = IndexReadVisibility {
-        kinds: BTreeSet::from([IndexKind::PhaseSummary, IndexKind::Experience]),
+        kinds: BTreeSet::from([IndexKind::PhaseSummary]),
         tickers: tickers.iter().cloned().collect(),
-        source_phases: (0..phase_u8).collect(),
+        source_phases,
         applies_to_phases: BTreeSet::from([phase_u8]),
         max_page_size: 20,
         ..Default::default()
@@ -521,109 +878,55 @@ fn file_store_domain_index_read_runtime(
     )
 }
 
-/// These values are intentionally projected before constructing the domain
-/// binding.  The model never receives either as a writable parameter.
-fn trade_candidate_action(state: &Value, tickers: &[String]) -> Option<String> {
-    let ticker = tickers.first()?;
-    state
-        .get("research_plan")
-        .and_then(|plan| plan.get("per_ticker"))
-        .and_then(|items| items.get(ticker))
-        .and_then(|item| item.get("rating"))
-        .or_else(|| {
-            state
-                .get("research_plan")
-                .and_then(|plan| plan.get("rating"))
-        })
-        .and_then(Value::as_str)
-        .map(|rating| match rating {
-            "Buy" | "Overweight" => "Buy",
-            "Sell" | "Underweight" => "Sell",
-            _ => "Hold",
-        })
-        .map(ToOwned::to_owned)
-}
-
-fn portfolio_rating(state: &Value, tickers: &[String]) -> Option<String> {
-    let ticker = tickers.first()?;
-    state
-        .get("research_plan")
-        .and_then(|plan| plan.get("per_ticker"))
-        .and_then(Value::as_object)
-        .and_then(|items| items.get(ticker))
-        .and_then(|item| item.get("rating"))
-        .or_else(|| {
-            state
-                .get("research_plan")
-                .and_then(|plan| plan.get("rating"))
-        })
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-}
-
-fn portfolio_current_weight(state: &Value, tickers: &[String]) -> Option<f64> {
-    let ticker = tickers.first()?;
-    state
-        .get("account")
-        .and_then(|account| account.get("positions"))
-        .and_then(|positions| positions.get(ticker))
-        .and_then(|position| position.get("weight"))
-        .and_then(Value::as_f64)
-        .or_else(|| {
-            state
-                .get("current_portfolio_weights")
-                .and_then(Value::as_object)
-                .and_then(|weights| weights.get(ticker))
-                .and_then(Value::as_f64)
-        })
-        .or(Some(0.0))
-}
-
-fn phase2_side_for_role(role: &str) -> Option<&'static str> {
-    if role.contains(".bull.") {
-        Some("bull")
-    } else if role.contains(".bear.") {
-        Some("bear")
-    } else {
-        None
-    }
-}
-
-fn visible_phase2_claims(state: &Value, topic_id: Option<&str>) -> BTreeSet<String> {
-    let Some(topic_id) = topic_id else {
-        return BTreeSet::new();
+fn phase_summary_source_phases(profile: ToolManagedProfile) -> Result<BTreeSet<u8>> {
+    let phases = match profile {
+        ToolManagedProfile::ResearcherWarmup
+        | ToolManagedProfile::TopicGeneration
+        | ToolManagedProfile::DebateSeed
+        | ToolManagedProfile::DebateResponse
+        | ToolManagedProfile::TopicControl => &[1][..],
+        ToolManagedProfile::ResearchDecision => &[1, 2],
+        ToolManagedProfile::TradeIntent => &[3],
+        ToolManagedProfile::RiskReview => &[3, 4],
+        ToolManagedProfile::PortfolioDecision => &[3, 4, 5],
+        ToolManagedProfile::HistoricalReflection
+        | ToolManagedProfile::AnalystReport
+        | ToolManagedProfile::EvidenceResearch
+        | ToolManagedProfile::PhaseSummary => {
+            bail!(
+                "profile {} does not own a domain Phase Summary reader",
+                profile.as_str()
+            )
+        }
     };
-    state
-        .pointer(&format!("/topic_debate_states/{topic_id}/turns"))
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .flat_map(|turn| {
-            turn.pointer("/artifact/payload/claims")
-                .or_else(|| turn.pointer("/artifact/claims"))
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-        })
-        .filter_map(|claim| claim.get("claim_id").and_then(Value::as_str))
-        .map(ToOwned::to_owned)
-        .collect()
+    Ok(phases.iter().copied().collect())
 }
 
 fn phase2_fork_reference(
     state: &Value,
     role: &str,
     topic_id: Option<&str>,
+    round: Option<i64>,
 ) -> Option<orchestrator_store::ForkReference> {
     let (session_id, turn_id) = if role == "mediator.topic_controller" {
-        let _ = topic_id?;
-        (
-            state
-                .get("topic_generation_session_id")?
-                .as_str()?
-                .to_owned(),
-            state.get("topic_generation_turn_id")?.as_str()?.to_owned(),
-        )
+        let topic_id = topic_id?;
+        if round.unwrap_or_default() > 0 {
+            let source = state.pointer(&format!(
+                "/phase2_file_store_sessions/{topic_id}/controller"
+            ))?;
+            (
+                source.get("session_id")?.as_str()?.to_owned(),
+                source.get("turn_id")?.as_str()?.to_owned(),
+            )
+        } else {
+            (
+                state
+                    .get("topic_generation_session_id")?
+                    .as_str()?
+                    .to_owned(),
+                state.get("topic_generation_turn_id")?.as_str()?.to_owned(),
+            )
+        }
     } else if matches!(role, "researcher.bull.initial" | "researcher.bear.initial") {
         let _ = topic_id?;
         let warmup = state.get("phase2_warmup")?;
@@ -650,6 +953,51 @@ fn phase2_fork_reference(
         fork_from_session_id: session_id,
         fork_from_turn_id: turn_id,
     })
+}
+
+fn phase2_steer_payload(
+    state: &Value,
+    role: &str,
+    kind: &str,
+    topic_id: Option<&str>,
+    round: Option<i64>,
+    fork_from_turn_id: Option<&str>,
+) -> Option<Value> {
+    let steer_kind = match role {
+        "researcher.bull.initial" | "researcher.bear.initial" => "topic_fork",
+        "researcher.bull.interaction" | "researcher.bear.interaction" => "point_debate",
+        "mediator.topic_controller" => "topic_control",
+        _ => return None,
+    };
+    let topic_id = topic_id?;
+    let round_num = round?;
+    let fork_from_turn_id = fork_from_turn_id?;
+    let topic_state = state.pointer(&format!("/topic_debate_states/{topic_id}"));
+    let mut steer = json!({
+        "kind": steer_kind,
+        "runtime_kind": kind,
+        "role": role,
+        "topic_id": topic_id,
+        "round": round_num,
+        "round_num": round_num,
+        "fork_from_turn_id": fork_from_turn_id,
+        "include_prompt_on_fork": true,
+    });
+    if let Some(topic) = topic_state.and_then(|value| value.get("topic")) {
+        steer["topic"] = topic.clone();
+    }
+    if role == "mediator.topic_controller" {
+        steer["debate_turns"] = topic_state
+            .and_then(|value| value.get("turns"))
+            .cloned()
+            .unwrap_or_else(|| json!([]));
+    } else if role.ends_with(".interaction") {
+        steer["controller"] = topic_state
+            .and_then(|value| value.get("controller_artifact"))
+            .cloned()
+            .unwrap_or(Value::Null);
+    }
+    Some(steer)
 }
 
 fn file_store_input_from_state(state: &Value) -> Result<FileStoreInputSnapshot> {
@@ -725,18 +1073,16 @@ fn file_store_session_runtime(
     )
 }
 
-/// Construct the one Phase 0 terminal writer. Generic Index tools remain a
-/// read-only evidence interface; this service owns every terminal state
-/// transition and is the only caller that may add an Experience support case.
-fn file_store_historical_reflection_terminal(
+/// Commit a Phase 0 Summary result. The model only writes prose; this Rust
+/// boundary owns task completion and the optional Experience support case.
+pub(crate) fn commit_historical_reflection(
     store_root: &Path,
     state: &Value,
-    _profile_version: u32,
-    _builder_version: u32,
-) -> Result<orchestrator_llm::tools::historical_reflection::HistoricalReflectionTerminalBinding> {
+    submission: orchestrator_llm::tools::historical_reflection::HistoricalReflectionSubmission,
+) -> Result<Value> {
     use orchestrator_store::{
-        find_run_location, read_indexes, FileStore, FileStoreOptions, IndexKind, IndexQuery,
-        ReflectionTaskLedger,
+        find_run_location, read_indexes, FileSchemaKind, FileStore, FileStoreOptions, IndexArchive,
+        IndexKind, IndexQuery, ReflectionTaskLedger,
     };
 
     let task_value = state
@@ -777,11 +1123,27 @@ fn file_store_historical_reflection_terminal(
     let sources = source_indexes
         .into_iter()
         .map(|index| {
-            let relative_path = source_location
+            let expanded_relative = source_location
                 .relative_root()
                 .join("index")
-                .join(orchestrator_store::SafeSlug::new("index", &index.index_id)?.as_str())
+                .join(format!("phase{}", index.source_phase))
+                .join(orchestrator_store::index_path_component(&index.index_id)?)
                 .join("index.json");
+            let (relative_path, content_hash) = if store.exists(&expanded_relative)? {
+                (expanded_relative, index.content_hash.clone())
+            } else {
+                let archive_relative = IndexArchive::relative_path(
+                    &source_location,
+                    index.source_phase,
+                    &index.index_id,
+                )?;
+                let archive: IndexArchive = store.read_versioned_json(
+                    &archive_relative,
+                    FileSchemaKind::Artifact("index_archive".to_owned()),
+                )?;
+                archive.validate_for_location(&source_location)?;
+                (archive_relative, archive.content_hash)
+            };
             Ok((
                 index.index_id.clone(),
                 (
@@ -790,22 +1152,22 @@ fn file_store_historical_reflection_terminal(
                     orchestrator_core::DocumentRef {
                         document_id: index.index_id,
                         relative_path: relative_path.to_string_lossy().to_string(),
-                        content_hash: index.content_hash,
+                        content_hash,
                     },
                 ),
             ))
         })
         .collect::<Result<BTreeMap<_, _>>>()?;
-    Ok(
-        orchestrator_llm::tools::historical_reflection::HistoricalReflectionTerminalBinding::new(
-            Arc::new(FileStoreHistoricalReflectionTerminal {
-                store,
-                ledger,
-                task,
-                actor_run_id: actor_run_id.to_owned(),
-                source_facts: sources,
-            }),
-        ),
+    submission.validate()?;
+    let service = FileStoreHistoricalReflectionTerminal {
+        store,
+        ledger,
+        task,
+        actor_run_id: actor_run_id.to_owned(),
+        source_facts: sources,
+    };
+    orchestrator_llm::tools::historical_reflection::HistoricalReflectionTerminalService::finalize(
+        &service, submission,
     )
 }
 
@@ -1314,139 +1676,6 @@ fn file_store_historical_reflection_index_runtime(
     )
 }
 
-/// Construct the sole live Phase Summary writer for one Rust-planned unit.
-/// The unit is copied into the role state by the executor and is never a tool
-/// argument. The model can only supply prose, confidence and Detail sections.
-fn file_store_phase_summary_index_runtime(
-    store_root: &Path,
-    state: &Value,
-    _profile_version: u32,
-    _builder_version: u32,
-) -> Result<orchestrator_llm::tools::index_tools::IndexToolRuntimeBinding> {
-    use orchestrator_llm::tools::index_tools::{IndexKind, IndexOwnedScope, IndexReadVisibility};
-    use orchestrator_store::{FileStore, FileStoreOptions, RunLocation};
-
-    let unit = state
-        .get("_summary_unit")
-        .and_then(Value::as_object)
-        .context("PhaseSummary role requires Rust-planned _summary_unit")?;
-    let required = |key: &str| -> Result<String> {
-        unit.get(key)
-            .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty())
-            .map(ToOwned::to_owned)
-            .with_context(|| format!("_summary_unit.{key} is required"))
-    };
-    let run_id = state
-        .get("run_id")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .context("run_id is required for PhaseSummary runtime")?
-        .to_owned();
-    let current_date = state
-        .get("current_date")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .context("current_date is required for PhaseSummary runtime")?
-        .to_owned();
-    let source_phase = unit
-        .get("source_phase")
-        .and_then(Value::as_u64)
-        .and_then(|value| u8::try_from(value).ok())
-        .context("_summary_unit.source_phase is required")?;
-    let mut source_refs = canonical_source_refs(
-        state
-            .get("_summary_source_payload")
-            .context("PhaseSummary role requires Rust-planned _summary_source_payload")?,
-    );
-    if source_refs.is_empty() {
-        source_refs = state
-            .get("_completed_units")
-            .and_then(Value::as_object)
-            .into_iter()
-            .flat_map(|units| units.values())
-            .filter(|artifact| {
-                artifact.get("phase").and_then(Value::as_i64) == Some(i64::from(source_phase))
-            })
-            .flat_map(canonical_source_refs)
-            .collect();
-    }
-    if source_refs.is_empty() {
-        bail!("PhaseSummary source payload contains no canonical Artifact or Index ID")
-    }
-    let unit_key = required("unit_key")?;
-    let source_payload_hash = required("source_payload_hash")?;
-    let authoritative_fields = Map::from_iter([
-        ("unit_key".to_owned(), Value::String(unit_key.clone())),
-        (
-            "source_payload".to_owned(),
-            state
-                .get("_summary_source_payload")
-                .cloned()
-                .context("PhaseSummary role requires Rust-planned _summary_source_payload")?,
-        ),
-    ]);
-    let owned = IndexOwnedScope {
-        run_id,
-        source_run_id: None,
-        source_phase,
-        role: required("role")?,
-        kind: IndexKind::PhaseSummary,
-        ticker: unit
-            .get("ticker")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned),
-        topic_id: unit
-            .get("topic_id")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned),
-        unit_key,
-        source_payload_hash,
-        index_id: required("index_id")?,
-        authoritative_fields,
-    };
-    let store = FileStore::open(store_root, FileStoreOptions::default())?;
-    file_store_index_tool_runtime(
-        store,
-        owned,
-        IndexReadVisibility {
-            source_refs,
-            applies_to_phases: (source_phase < 7)
-                .then_some(source_phase + 1)
-                .into_iter()
-                .collect(),
-            ..IndexReadVisibility::default().with_default_page_size(20)
-        },
-        FileStoreIndexRuntimePlan::for_phase_summary(
-            RunLocation::new(current_date, state["run_id"].as_str().unwrap_or_default())?,
-            Utc::now().to_rfc3339(),
-        ),
-    )?
-    .with_writer_role("compressor.phase_summary")
-}
-
-fn canonical_source_refs(value: &Value) -> BTreeSet<String> {
-    fn collect(value: &Value, refs: &mut BTreeSet<String>) {
-        match value {
-            Value::Array(values) => values.iter().for_each(|value| collect(value, refs)),
-            Value::Object(values) => {
-                for (key, value) in values {
-                    if matches!(key.as_str(), "artifact_id" | "index_id") {
-                        if let Some(id) = value.as_str().filter(|id| !id.trim().is_empty()) {
-                            refs.insert(id.to_owned());
-                        }
-                    }
-                    collect(value, refs);
-                }
-            }
-            _ => {}
-        }
-    }
-    let mut refs = BTreeSet::new();
-    collect(value, &mut refs);
-    refs
-}
-
 fn file_store_reflection_source(state: &Value, profile: ToolManagedProfile) -> Option<Value> {
     if profile != ToolManagedProfile::HistoricalReflection {
         return None;
@@ -1487,20 +1716,23 @@ fn retrieval_policy_for_role(role: &str, kind: &str, config: &RetrievalConfig) -
     match (role, kind) {
         ("reflector.historical", _) => policy(&[], &[], 1, config.reflection_max_details),
         ("mediator.topic", "warmup") => policy(&[1], &[], 0, 2),
-        ("mediator.topic", _) => policy(&[1], &[], 0, config.phase2_max_details),
+        ("mediator.topic", _) => policy(&[1], &[1], 1, config.phase2_max_details),
         ("researcher.bull.initial" | "researcher.bear.initial", _) => {
-            policy(&[1], &[], 0, config.phase2_max_details)
+            policy(&[1], &[1], 1, config.phase2_max_details)
         }
         ("researcher.bull.interaction" | "researcher.bear.interaction", _) => {
-            policy(&[1], &[], 0, config.phase2_max_details)
+            policy(&[1], &[1], 1, config.phase2_max_details)
         }
         ("mediator.topic_controller", _) => policy(&[1], &[], 0, config.phase2_max_details),
         ("manager.research", _) => policy(&[1, 2], &[], 1, config.phase3_max_details),
-        ("trader", _) => policy(&[3], &[3], 1, config.phase4_max_details),
+        // Indexes carry the validated execution fields.  Detail expansion is
+        // available for extra context but must not reject an otherwise valid
+        // free-text response when the model has already read the Index.
+        ("trader", _) => policy(&[3], &[], 0, config.phase4_max_details),
         ("risk.aggressive" | "risk.neutral" | "risk.conservative", _) => {
-            policy(&[3, 4], &[3, 4], 2, config.phase5_max_details)
+            policy(&[3, 4], &[], 0, config.phase5_max_details)
         }
-        ("portfolio.manager", _) => policy(&[3, 4, 5], &[3, 4, 5], 3, config.phase6_max_details),
+        ("portfolio.manager", _) => policy(&[3, 4, 5], &[], 0, config.phase6_max_details),
         _ => RetrievalPolicy::default(),
     }
 }
@@ -1510,7 +1742,14 @@ fn phase2_debug_output_path(
     role: &str,
     kind: &str,
     topic_id: Option<&str>,
+    round: Option<i64>,
 ) -> Option<PathBuf> {
+    if role == "compressor.phase_summary" {
+        return Some(
+            PathBuf::from(format!("outputs/debug/phase{phase}/summary"))
+                .join(format!("phase{phase}_summary.json")),
+        );
+    }
     if phase != 2 {
         return None;
     }
@@ -1537,12 +1776,13 @@ fn phase2_debug_output_path(
     } else {
         format!("topic-{safe_topic_id}")
     };
+    let round = round.unwrap_or_default();
     let file = if role == "mediator.topic_controller" {
-        "topic-controller.json"
+        format!("topic-controller-round-{round}.json")
     } else if role.contains(".bull.") {
-        "debate-bull.json"
+        format!("debate-bull-round-{round}.json")
     } else if role.contains(".bear.") {
-        "debate-bear.json"
+        format!("debate-bear-round-{round}.json")
     } else {
         return None;
     };
@@ -1897,16 +2137,7 @@ pub(crate) async fn run_role_job_with_timeout(job: RoleJob, timeout_sec: u64) ->
 
 async fn execute_role_job(job: RoleJob) -> Result<AgentLoopOutput> {
     if job.mock {
-        if let Some(binding) = job.domain_tool_runtime.clone() {
-            return mock_domain_tool_managed_output(job, binding);
-        }
-        if let Some(binding) = job.index_tool_runtime.clone() {
-            return mock_index_tool_managed_output(job, binding);
-        }
-        bail!(
-            "mock ToolManaged role {} has no typed Index or Domain runtime binding",
-            job.role
-        );
+        return Ok(mock_free_text_output(job));
     }
     let llm = job
         .llm
@@ -1916,6 +2147,7 @@ async fn execute_role_job(job: RoleJob) -> Result<AgentLoopOutput> {
         .as_deref()
         .and_then(debug_prompt_path_from_runtime_path);
     let debug_round = job.round.and_then(|round| usize::try_from(round).ok());
+    let steer = job.tools.phase2_steer.clone();
     let settings = AgentSettings {
         role: job.role,
         phase: Some(job.phase),
@@ -1926,11 +2158,9 @@ async fn execute_role_job(job: RoleJob) -> Result<AgentLoopOutput> {
         tickers: job.tickers,
         tool_managed_profile: job.tool_managed_profile,
         index_tool_runtime: job.index_tool_runtime.clone(),
-        historical_reflection_terminal: job.historical_reflection_terminal.clone(),
         experience_retrieval: job.experience_retrieval.clone(),
-        domain_tool_runtime: job.domain_tool_runtime.clone(),
+        evidence_research: job.evidence_research.clone(),
         session_runtime: job.session_runtime.clone(),
-        max_write_calls: job.max_write_calls,
         llm,
         reasoning_effort_override: job.reasoning_effort_override,
         tools: Some(job.tools),
@@ -1945,324 +2175,46 @@ async fn execute_role_job(job: RoleJob) -> Result<AgentLoopOutput> {
         prompt_chars = job.prompt.len(),
         "calling agent loop"
     );
-    let mut output = run_agent_loop_with_metrics(&settings, &job.prompt).await?;
+    let mut output = if let Some(steer) = steer {
+        let session_id = settings.session_runtime.manifest().session_id.clone();
+        let turn_id = format!("turn-{}", md5_3(&session_id));
+        let steer = serde_json::to_string(&steer)?;
+        run_agent_steer_loop_with_metrics(
+            &settings,
+            SteerLoopInput {
+                session_id,
+                turn_id,
+                prompt: &job.prompt,
+                steer: Some(steer),
+            },
+        )
+        .await?
+    } else {
+        run_agent_loop_with_metrics(&settings, &job.prompt).await?
+    };
     output.artifact["context_manifest"] = job.context_manifest;
     Ok(output)
 }
 
-fn mock_index_tool_managed_output(
-    job: RoleJob,
-    binding: orchestrator_llm::tools::index_tools::IndexToolRuntimeBinding,
-) -> Result<AgentLoopOutput> {
-    use orchestrator_llm::{
-        agent_loop::ToolRuntimeTurnContext,
-        tools::index_tools::{APPEND_INDEX_DETAIL_NAME, CREATE_INDEX_NAME, FINALIZE_INDEX_NAME},
-    };
-
-    let task = job
-        .tools
-        .file_store_reflection_source
-        .as_ref()
-        .and_then(|source| source.get("task"))
-        .cloned()
-        .unwrap_or(Value::Null);
-    let runtime = binding.build(ToolRuntimeTurnContext {
-        run_id: job.tools.run_id.clone().unwrap_or_default(),
-        phase: Some(job.phase),
-        role: job.role.clone(),
-        session_id: format!("{}:mock", job.role),
-        turn_id: "mock-reflection-finalize".to_owned(),
-    })?;
-    runtime.execute(
-        CREATE_INDEX_NAME,
-        json!({
-            "summary": "Verify historical evidence freshness before repeating this decision.",
-            "confidence": 0.5,
-            "pattern_key": "mock-historical-reflection",
-            "applies_to_phases": [1, 2, 3]
-        }),
-    )?;
-    runtime.execute(
-        APPEND_INDEX_DETAIL_NAME,
-        json!({
-            "section": "historical_case",
-            "detail": format!("Mock reflection for historical task {}.", task.get("task_id").and_then(Value::as_i64).unwrap_or_default()),
-            "source_refs": []
-        }),
-    )?;
-    let terminal = runtime.execute(FINALIZE_INDEX_NAME, json!({}))?;
-    let artifact = terminal
-        .get("artifact")
-        .cloned()
-        .context("mock Index finalizer did not return an artifact")?;
-    let terminal_result = ToolResultItem {
-        call_id: "mock-finalize-index".to_owned(),
-        name: FINALIZE_INDEX_NAME.to_owned(),
-        status: "completed".to_owned(),
-        output: terminal,
-        error: None,
-    };
-    let (session_id, turn_id) = persist_mock_terminal(&job, &terminal_result)?;
-    Ok(AgentLoopOutput {
-        artifact: artifact.clone(),
-        terminal_tool_result: Some(terminal_result),
-        metrics: ModelStreamResult::default(),
-        turn_id,
-        session_id,
-    })
-}
-
-fn mock_domain_tool_managed_output(
-    job: RoleJob,
-    binding: orchestrator_llm::tools::domain_tools::DomainToolRuntimeBinding,
-) -> Result<AgentLoopOutput> {
-    use orchestrator_llm::tools::domain_tools::{
-        ADD_AGREED_FACT, APPEND_ANALYST_EVIDENCE, APPEND_BINDING_RISK_CONTROL, CREATE_DEBATE_CLAIM,
-        CREATE_PHASE2_TOPIC, FINALIZE_ANALYST_REPORT, FINALIZE_DEBATE_RESPONSE,
-        FINALIZE_DEBATE_SEED, FINALIZE_PORTFOLIO_DECISION, FINALIZE_RESEARCHER_WARMUP,
-        FINALIZE_RESEARCH_DECISION, FINALIZE_RISK_REVIEW, FINALIZE_TOPIC_CONTROL,
-        FINALIZE_TOPIC_GENERATION, FINALIZE_TRADE_INTENT, RESPOND_TO_DEBATE_CLAIM,
-        SET_ANALYST_ASSESSMENT, SET_ANALYST_INVALIDATION, SET_DECISION_HINGE,
-        SET_PHASE2_COMMON_GROUND, SET_PORTFOLIO_ASSET_DECISION, SET_RESEARCH_DECISION,
-        SET_RESEARCH_SCENARIOS, SET_RISK_ASSESSMENT, SET_RISK_CONSTRAINTS, SET_TOPIC_SOFT_CONTROL,
-        SET_TRADE_INTENT,
-    };
-
-    let profile = binding.scope().profile;
-    let artifact = match profile {
-        ToolManagedProfile::AnalystReport => {
-            for ticker in &job.tickers {
-                binding.execute(
-                    SET_ANALYST_ASSESSMENT,
-                    json!({
-                        "ticker": ticker,
-                        "direction": "neutral",
-                        "confidence": 0.5,
-                        "report": format!("Mock FileStore report for {ticker} from {}.", job.role),
-                        "priced_in": "unclear",
-                        "echo_chamber_risk": "low",
-                        "crowded_consensus_risk": "low",
-                    }),
-                )?;
-                binding.execute(
-                    APPEND_ANALYST_EVIDENCE,
-                    json!({
-                        "ticker": ticker,
-                        "evidence_ref": format!("mock:{}:{ticker}", job.role),
-                        "evidence": {
-                            "claim": format!("Mock evidence for {ticker}."),
-                            "evidence_type": "fact",
-                            "source": "mock runtime",
-                            "timestamp": job.context_manifest.get("current_date").and_then(Value::as_str).unwrap_or("2026-01-01"),
-                            "source_tier": "official",
-                            "first_source": "mock runtime",
-                            "is_derivative_repost": false,
-                            "evidence_age": "0-2d",
-                            "source_confidence": 0.9,
-                        }
-                    }),
-                )?;
-                binding.execute(
-                    SET_ANALYST_INVALIDATION,
-                    json!({
-                        "ticker": ticker,
-                        "validation_triggers": [format!("Mock invalidation for {ticker}.")],
-                    }),
-                )?;
-            }
-            binding.execute(FINALIZE_ANALYST_REPORT, json!({}))?
-        }
-        ToolManagedProfile::ResearchDecision => {
-            for ticker in &job.tickers {
-                binding.execute(
-                    SET_RESEARCH_DECISION,
-                    json!({
-                        "ticker": ticker,
-                        "rating": "Hold",
-                        "long_probability": 0.5,
-                        "short_probability": 0.5,
-                        "confidence_basis": "evidence_balanced",
-                        "hold_reason": "evidence_balanced",
-                        "plan": format!("Mock FileStore research plan for {ticker}."),
-                        "probability_rationale": "Mock evidence is balanced.",
-                    }),
-                )?;
-                binding.execute(
-                    SET_RESEARCH_SCENARIOS,
-                    json!({
-                        "ticker": ticker,
-                        "bull": {"probability": 0.25, "drivers": ["mock upside"], "triggers": ["mock confirmation"], "confirmation": "mock"},
-                        "base": {"probability": 0.50, "drivers": ["mock balance"], "triggers": ["mock confirmation"], "confirmation": "mock"},
-                        "bear": {"probability": 0.25, "drivers": ["mock downside"], "triggers": ["mock confirmation"], "confirmation": "mock"},
-                    }),
-                )?;
-            }
-            binding.execute(FINALIZE_RESEARCH_DECISION, json!({}))?
-        }
-        ToolManagedProfile::TradeIntent => {
-            binding.execute(
-                SET_TRADE_INTENT,
-                json!({
-                    "action":"Hold", "execution_decision":"hold",
-                    "entry_price":null, "stop_loss":null, "position_size_pct_max":0.0,
-                    "rationale":"Mock FileStore trader preserves the Rust-owned Hold candidate."
-                }),
-            )?;
-            binding.execute(FINALIZE_TRADE_INTENT, json!({}))?
-        }
-        ToolManagedProfile::RiskReview => {
-            binding.execute(
-                SET_RISK_ASSESSMENT,
-                json!({
-                    "argument":"Mock risk assessment.",
-                    "unique_risk_contribution":"Mock stance-specific constraint.",
-                    "disagreement_with_prior":"none", "no_new_information":false
-                }),
-            )?;
-            binding.execute(
-                SET_RISK_CONSTRAINTS,
-                json!({
-                    "recommended_adjustment":"hold", "stop_type":"soft",
-                    "max_drawdown_pct":0.10, "position_cap_pct":0.0,
-                    "rebalance_trigger":"Mock rebalance trigger.",
-                    "risk_off_trigger":"Mock risk-off trigger.",
-                    "review_window":"daily", "cash_hedge_recommendation":"hold cash",
-                    "constraint_confidence":0.5
-                }),
-            )?;
-            binding.execute(FINALIZE_RISK_REVIEW, json!({}))?
-        }
-        ToolManagedProfile::PortfolioDecision => {
-            binding.execute(
-                SET_PORTFOLIO_ASSET_DECISION,
-                json!({
-                    "direction_constraint":"unchanged", "execution_status":"wait",
-                    "max_target_weight":0.0, "max_weight_delta":0.0,
-                    "execution_summary":"Mock portfolio decision waits.",
-                    "investment_thesis":"Mock Phase 3 is neutral.", "target_price":null,
-                    "horizon":"Mock horizon", "rationale":"Mock portfolio wait."
-                }),
-            )?;
-            binding.execute(APPEND_BINDING_RISK_CONTROL, json!({
-                "control":{"control":"Mock risk cap.","source_refs":[format!("mock:portfolio.manager:{}", job.tickers.first().context("mock portfolio ticker missing")?)]}
-            }))?;
-            binding.execute(FINALIZE_PORTFOLIO_DECISION, json!({}))?
-        }
-        ToolManagedProfile::ResearcherWarmup => {
-            binding.execute(FINALIZE_RESEARCHER_WARMUP, json!({}))?
-        }
-        ToolManagedProfile::TopicGeneration => {
-            binding.execute(
-                SET_PHASE2_COMMON_GROUND,
-                json!({"common_ground":"Mock Phase 2 common ground."}),
-            )?;
-            binding.execute(
-                CREATE_PHASE2_TOPIC,
-                json!({
-                    "topic":"Mock decision hinge", "decision_hinge":"Mock confirmation",
-                    "evidence_refs": ["mock:mediator.topic:QQQ"]
-                }),
-            )?;
-            binding.execute(FINALIZE_TOPIC_GENERATION, json!({}))?
-        }
-        ToolManagedProfile::DebateSeed => {
-            binding.execute(
-                CREATE_DEBATE_CLAIM,
-                json!({
-                    "claim": format!("Mock {} seed claim.", job.role), "confidence":0.5,
-                    "evidence_refs": [format!("mock:{}:QQQ", job.role)]
-                }),
-            )?;
-            binding.execute(FINALIZE_DEBATE_SEED, json!({}))?
-        }
-        ToolManagedProfile::DebateResponse => {
-            let claim_id = binding
-                .scope()
-                .visible_claims
-                .iter()
-                .next()
-                .cloned()
-                .context("mock debate response requires a visible claim")?;
-            binding.execute(
-                RESPOND_TO_DEBATE_CLAIM,
-                json!({
-                    "reply_to_claim_id":claim_id, "response":"Mock counterpoint.",
-                    "evidence_refs": [format!("mock:{}:QQQ", job.role)]
-                }),
-            )?;
-            binding.execute(FINALIZE_DEBATE_RESPONSE, json!({}))?
-        }
-        ToolManagedProfile::TopicControl => {
-            binding.execute(ADD_AGREED_FACT, json!({"value":"Mock topic fact."}))?;
-            binding.execute(SET_DECISION_HINGE, json!({"value":"Mock topic hinge."}))?;
-            binding.execute(SET_TOPIC_SOFT_CONTROL, json!({"should_continue":false}))?;
-            binding.execute(FINALIZE_TOPIC_CONTROL, json!({}))?
-        }
-        ToolManagedProfile::HistoricalReflection | ToolManagedProfile::PhaseSummary => {
-            anyhow::bail!(
-                "{} is an Index runtime profile, not a domain runtime profile",
-                profile.as_str()
-            )
-        }
-    };
-    let artifact = artifact
-        .get("artifact")
-        .cloned()
-        .context("mock domain finalizer did not return a canonical artifact")?;
-    let terminal_result = ToolResultItem {
-        call_id: "mock-finalize".to_owned(),
-        name: match profile {
-            ToolManagedProfile::AnalystReport => FINALIZE_ANALYST_REPORT,
-            ToolManagedProfile::ResearchDecision => FINALIZE_RESEARCH_DECISION,
-            ToolManagedProfile::TradeIntent => FINALIZE_TRADE_INTENT,
-            ToolManagedProfile::RiskReview => FINALIZE_RISK_REVIEW,
-            ToolManagedProfile::PortfolioDecision => FINALIZE_PORTFOLIO_DECISION,
-            ToolManagedProfile::ResearcherWarmup => FINALIZE_RESEARCHER_WARMUP,
-            ToolManagedProfile::TopicGeneration => FINALIZE_TOPIC_GENERATION,
-            ToolManagedProfile::DebateSeed => FINALIZE_DEBATE_SEED,
-            ToolManagedProfile::DebateResponse => FINALIZE_DEBATE_RESPONSE,
-            ToolManagedProfile::TopicControl => FINALIZE_TOPIC_CONTROL,
-            _ => unreachable!(),
-        }
-        .to_owned(),
-        status: "completed".to_owned(),
-        output: json!({"terminal": true, "artifact": artifact.clone()}),
-        error: None,
-    };
-    let (session_id, turn_id) = persist_mock_terminal(&job, &terminal_result)?;
-    Ok(AgentLoopOutput {
-        artifact: artifact.clone(),
-        terminal_tool_result: Some(terminal_result),
-        metrics: ModelStreamResult::default(),
-        turn_id,
-        session_id,
-    })
-}
-
-/// Mock finalizers use the same FileStore session record as live finalizers.
-/// This prevents deterministic test artifacts from looking like unaudited
-/// direct writes to Store Doctor or fork recovery.
-fn persist_mock_terminal(job: &RoleJob, terminal: &ToolResultItem) -> Result<(String, String)> {
-    let session = &job.session_runtime;
-    let session_id = session.manifest().session_id.clone();
-    let turn_id = format!(
-        "mock-finalize:{}:{}:{}:{}",
+fn mock_free_text_output(job: RoleJob) -> AgentLoopOutput {
+    let response_text = format!(
+        "Mock {} response for phase {} kind {} and tickers {}.",
+        job.role,
+        job.phase,
         job.kind,
-        job.tickers.join(","),
-        job.topic_id.as_deref().unwrap_or("aggregate"),
-        job.round.unwrap_or(0),
+        job.tickers.join(", ")
     );
-    let mut turn = Turn::new(
-        &turn_id,
-        &session_id,
-        job.tools.run_id.as_deref().unwrap_or_default(),
-        &job.role,
-        "",
-    );
-    turn.phase = Some(job.phase);
-    turn.terminal_tool_result = Some(terminal.clone());
-    session.append_terminal(&turn, terminal, Utc::now().to_rfc3339())?;
-    Ok((session_id, turn_id))
+    AgentLoopOutput {
+        artifact: json!({
+            "phase": job.phase,
+            "role": job.role,
+            "response_text": response_text,
+        }),
+        terminal_tool_result: None,
+        metrics: ModelStreamResult::default(),
+        turn_id: format!("turn-mock-{}-{}", job.phase, job.kind),
+        session_id: format!("session-mock-{}-{}", job.phase, job.role),
+    }
 }
 
 #[cfg(test)]
@@ -2309,41 +2261,243 @@ mod tests {
     }
 
     #[test]
+    fn phase_summary_read_scope_is_profile_exact() {
+        for (profile, expected) in [
+            (ToolManagedProfile::TopicGeneration, vec![1]),
+            (ToolManagedProfile::ResearcherWarmup, vec![1]),
+            (ToolManagedProfile::DebateSeed, vec![1]),
+            (ToolManagedProfile::DebateResponse, vec![1]),
+            (ToolManagedProfile::TopicControl, vec![1]),
+            (ToolManagedProfile::ResearchDecision, vec![1, 2]),
+            (ToolManagedProfile::TradeIntent, vec![3]),
+            (ToolManagedProfile::RiskReview, vec![3, 4]),
+            (ToolManagedProfile::PortfolioDecision, vec![3, 4, 5]),
+        ] {
+            assert_eq!(
+                phase_summary_source_phases(profile)
+                    .unwrap()
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+        assert!(phase_summary_source_phases(ToolManagedProfile::AnalystReport).is_err());
+        assert!(phase_summary_source_phases(ToolManagedProfile::EvidenceResearch).is_err());
+        assert!(phase_summary_source_phases(ToolManagedProfile::PhaseSummary).is_err());
+    }
+
+    #[test]
+    fn phase2_topic_and_debate_require_detail_before_completion() {
+        let config = RetrievalConfig {
+            summary_page_limit: 20,
+            detail_page_limit: 20,
+            phase2_max_details: 4,
+            phase3_max_details: 6,
+            phase4_max_details: 2,
+            phase5_max_details: 4,
+            phase6_max_details: 8,
+            reflection_max_details: 8,
+        };
+        for (role, kind) in [
+            ("mediator.topic", "topic_generation"),
+            ("researcher.bull.initial", "bull_seed"),
+            ("researcher.bear.interaction", "interaction"),
+        ] {
+            let policy = retrieval_policy_for_role(role, kind, &config);
+            assert!(policy.mandatory_summary_query);
+            assert_eq!(policy.required_source_phases, vec![1]);
+            assert_eq!(policy.minimum_detail_expansions, 1);
+            assert_eq!(policy.required_detail_source_phases, vec![1]);
+        }
+        assert_eq!(
+            retrieval_policy_for_role("mediator.topic", "warmup", &config)
+                .minimum_detail_expansions,
+            0
+        );
+    }
+
+    #[test]
+    fn web_evidence_packet_gets_rust_owned_ids_and_source_cap() {
+        let entries = (0..6)
+            .map(|index| {
+                json!({
+                    "claim": format!("fact-{index}"),
+                    "relation": "supports",
+                    "source_url": format!("https://example.com/{index}"),
+                    "publisher": "Example",
+                    "published_at": Value::Null,
+                    "source_tier": "official"
+                })
+            })
+            .collect::<Vec<_>>();
+        let response = json!({
+            "status": "supported",
+            "evidence": entries,
+            "counterevidence": [],
+            "unresolved_gaps": [],
+            "search_queries": ["one", "two"]
+        })
+        .to_string();
+
+        let packet = normalize_web_evidence_packet(&response, "web-abcdef").unwrap();
+        let evidence = packet["evidence"].as_array().unwrap();
+        assert_eq!(evidence.len(), 5);
+        assert_eq!(packet["source_count"], 5);
+        assert!(evidence.iter().all(|item| {
+            item["evidence_id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("web-") && id.len() == 10)
+        }));
+        assert!(evidence
+            .iter()
+            .all(|item| item["request_id"] == "web-abcdef"));
+    }
+
+    #[test]
+    fn web_evidence_packet_rejects_non_http_sources() {
+        let response = json!({
+            "status": "supported",
+            "evidence": [{
+                "claim": "fact",
+                "relation": "supports",
+                "source_url": "file:///tmp/fake",
+                "publisher": "Fake",
+                "published_at": null,
+                "source_tier": "secondary"
+            }],
+            "counterevidence": []
+        })
+        .to_string();
+        assert!(normalize_web_evidence_packet(&response, "web-abcdef")
+            .unwrap_err()
+            .to_string()
+            .contains("http"));
+    }
+
+    #[test]
+    fn web_evidence_cap_keeps_counterevidence() {
+        let evidence = (0..5)
+            .map(|index| {
+                json!({
+                    "claim": format!("support-{index}"),
+                    "relation": "supports",
+                    "source_url": format!("https://example.com/support/{index}"),
+                    "publisher": "Example",
+                    "published_at": null,
+                    "source_tier": "official"
+                })
+            })
+            .collect::<Vec<_>>();
+        let response = json!({
+            "status": "mixed",
+            "evidence": evidence,
+            "counterevidence": [{
+                "claim": "counter",
+                "relation": "refutes",
+                "source_url": "https://example.com/counter",
+                "publisher": "Example",
+                "published_at": null,
+                "source_tier": "official"
+            }]
+        })
+        .to_string();
+
+        let packet = normalize_web_evidence_packet(&response, "web-abcdef").unwrap();
+        assert_eq!(packet["evidence"].as_array().unwrap().len(), 4);
+        assert_eq!(packet["counterevidence"].as_array().unwrap().len(), 1);
+        assert_eq!(packet["source_count"], 5);
+    }
+
+    #[test]
     fn phase2_debug_paths_follow_the_checkpoint_and_topic_tree() {
         assert_eq!(
-            phase2_debug_output_path(2, "mediator.topic", "warmup", None),
+            phase2_debug_output_path(1, "compressor.phase_summary", "phase_summary", None, None),
+            Some(PathBuf::from(
+                "outputs/debug/phase1/summary/phase1_summary.json"
+            ))
+        );
+        assert_eq!(
+            phase2_debug_output_path(2, "mediator.topic", "warmup", None, Some(0)),
             Some(PathBuf::from(
                 "outputs/debug/phase2/phase2-warmup-shared.json"
             ))
         );
         assert_eq!(
-            phase2_debug_output_path(2, "mediator.topic", "topic_generation", None),
+            phase2_debug_output_path(2, "mediator.topic", "topic_generation", None, None),
             Some(PathBuf::from("outputs/debug/phase2/topic-generator.json"))
         );
-        for (role, file) in [
-            ("researcher.bull.initial", "debate-bull.json"),
-            ("researcher.bear.interaction", "debate-bear.json"),
-            ("mediator.topic_controller", "topic-controller.json"),
+        for (role, round, file) in [
+            ("researcher.bull.initial", 0, "debate-bull-round-0.json"),
+            ("researcher.bear.interaction", 1, "debate-bear-round-1.json"),
+            (
+                "mediator.topic_controller",
+                1,
+                "topic-controller-round-1.json",
+            ),
         ] {
             assert_eq!(
-                phase2_debug_output_path(2, role, "debate", Some("QQQ/risk")),
+                phase2_debug_output_path(2, role, "debate", Some("QQQ/risk"), Some(round)),
                 Some(PathBuf::from("outputs/debug/phase2/topic-QQQ_risk").join(file))
             );
         }
         assert_eq!(
-            phase2_debug_output_path(2, "researcher.bull.initial", "bull_seed", Some("topic_vix")),
+            phase2_debug_output_path(
+                2,
+                "researcher.bull.initial",
+                "bull_seed",
+                Some("topic_vix"),
+                Some(0),
+            ),
             Some(PathBuf::from(
-                "outputs/debug/phase2/topic_vix/debate-bull.json"
+                "outputs/debug/phase2/topic_vix/debate-bull-round-0.json"
             ))
+        );
+    }
+
+    #[test]
+    fn phase2_steer_records_topic_round_and_fork_parent() {
+        let steer = phase2_steer_payload(
+            &json!({
+                "topic_debate_states": {
+                    "topic-a": {
+                        "topic": {"topic_id": "topic-a"},
+                        "controller_artifact": {
+                            "payload": {"next_steers": [{"steer_id": "steer-1"}]}
+                        }
+                    }
+                }
+            }),
+            "researcher.bull.interaction",
+            "interaction",
+            Some("topic-a"),
+            Some(1),
+            Some("warmup-turn"),
+        )
+        .unwrap();
+
+        assert_eq!(steer["kind"], "point_debate");
+        assert_eq!(steer["topic_id"], "topic-a");
+        assert_eq!(steer["round"], 1);
+        assert_eq!(steer["round_num"], 1);
+        assert_eq!(steer["fork_from_turn_id"], "warmup-turn");
+        assert_eq!(steer["include_prompt_on_fork"], true);
+        assert_eq!(
+            steer["controller"]["payload"]["next_steers"][0]["steer_id"],
+            "steer-1"
         );
     }
 
     #[test]
     fn phase2_json_debug_files_retain_structured_messages() {
         let temp = tempfile::tempdir().unwrap();
-        let path =
-            phase2_debug_output_path(2, "researcher.bull.initial", "bull_seed", Some("topic-a"))
-                .unwrap();
+        let path = phase2_debug_output_path(
+            2,
+            "researcher.bull.initial",
+            "bull_seed",
+            Some("topic-a"),
+            Some(0),
+        )
+        .unwrap();
         orchestrator_llm::append_debug_output_record(
             temp.path(),
             &path,
@@ -2366,7 +2520,6 @@ mod tests {
                 .unwrap();
         assert_eq!(output["req"]["messages"][0]["content"], "准备完毕");
         assert_eq!(output["req"]["messages"][1]["role"], "user");
-        assert!(output.get("records").is_none());
     }
 
     #[test]

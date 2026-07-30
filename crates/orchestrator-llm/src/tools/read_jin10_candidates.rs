@@ -163,7 +163,7 @@ mod tests {
     }
 
     #[test]
-    fn file_store_reader_keeps_captured_jin10_after_mutable_input_changes() {
+    fn file_store_reader_rejects_jin10_changed_after_run_binding() {
         let temp = tempfile::tempdir().unwrap();
         let store = FileStore::open(temp.path(), Default::default()).unwrap();
         let source = InputSource::jin10("2026-07-27", Jin10Format::Csv).unwrap();
@@ -190,7 +190,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = execute(
+        let error = execute(
             json!({"tickers": ["QQQ"]}),
             &ExternalToolConfig {
                 file_store_input: Some(super::super::FileStoreInputSnapshot {
@@ -201,8 +201,7 @@ mod tests {
                 ..Default::default()
             },
         )
-        .unwrap();
-        assert_eq!(result["source"], "filestore.run_input.jin10");
-        assert_eq!(result["candidates"][0]["event_id"], "event-old");
+        .unwrap_err();
+        assert!(error.to_string().contains("authoritative metadata"));
     }
 }

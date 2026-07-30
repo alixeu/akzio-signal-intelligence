@@ -17,7 +17,7 @@ This repository is a Rust workspace for AI-assisted market-signal research and T
 - Prompt templates live under `prompts/` and are owned by their runtime phase:
   - `phase_summary`: completed-phase compression.
   - `phase1`: technical and news/macro research.
-  - `phase2`: Topic Generator, Bull/Bear debate, Topic Controller, and steer messages.
+  - `phase2`: Topic Generator, Bull/Bear debate, bounded Web evidence research, Topic Controller, and steer messages.
   - `phase3`: Research Manager probability decision.
   - `phase4`: Trader conversion.
   - `phase5`: aggressive, neutral, and conservative risk reviewers.
@@ -30,7 +30,10 @@ This repository is a Rust workspace for AI-assisted market-signal research and T
 - Phase 2 builds one shared Bull/Bear warm-up checkpoint and runs Topic
   Generator independently. Each topic's Bull/Bear conversations fork from the
   warm-up checkpoint, while Topic Controller forks from Topic Generator.
-  Debate reduction remains Rust-owned.
+  After a relevant Phase 1 Detail expansion, Topic Generator and Bull/Bear may
+  delegate an explicit evidence gap to a Web-only subagent. Rust owns the
+  per-role/topic budget, deduplication, validation, and evidence IDs. Debate
+  reduction remains Rust-owned.
 - Phase 0 historical scoring/task selection, Phase 7 allocation, and Phase 8
   decision snapshot/archive are Rust-owned stages. Phase 0 uses a dedicated
   historical-reflector prompt for causal analysis.

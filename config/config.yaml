@@ -6,7 +6,6 @@ orchestrator:
     stale_temp_age_sec: 3600
 
   tool_managed:
-    max_write_calls_per_role: 20
     max_summary_units_per_phase: 32
 
   runtime:
@@ -21,7 +20,7 @@ orchestrator:
     detail_page_limit: 20
     phase2_max_details: 4
     phase3_max_details: 6
-    phase4_max_details: 6
+    phase4_max_details: 2
     phase5_max_details: 4
     phase6_max_details: 8
     reflection_max_details: 8
@@ -78,7 +77,13 @@ orchestrator:
       technical: prompts/phase1/technical.md
       news_macro: prompts/phase1/news_macro.md
     compressor:
-      phase_summary: prompts/phase_summary/phase_summary.md
+      phase0: prompts/phase0/summary.md
+      phase1: prompts/phase1/summary.md
+      phase2: prompts/phase2/summary.md
+      phase3: prompts/phase3/summary.md
+      phase4: prompts/phase4/summary.md
+      phase5: prompts/phase5/summary.md
+      phase6: prompts/phase6/summary.md
     phase2:
       topic_generator: prompts/phase2/topic_generator.md
       warmup: prompts/phase2/researcher/warmup.md
@@ -86,6 +91,7 @@ orchestrator:
       bull_interaction: prompts/phase2/researcher/debate.md
       bear_initial: prompts/phase2/researcher/debate.md
       bear_interaction: prompts/phase2/researcher/debate.md
+      web_evidence: prompts/phase2/web_evidence_researcher.md
     mediator:
       topic_controller: prompts/phase2/topic_controller.md
     manager:

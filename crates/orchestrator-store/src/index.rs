@@ -3,7 +3,7 @@
 //! callers construct an [`IndexScope`] from Rust-owned unit planning.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -18,6 +18,7 @@ use crate::{
 
 pub const INDEX_SCHEMA_VERSION: u32 = 1;
 pub const INDEX_DETAIL_SCHEMA_VERSION: u32 = 1;
+pub const INDEX_ARCHIVE_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -139,6 +140,97 @@ pub struct IndexDetail {
     pub sort_order: usize,
     pub created_at: String,
     pub content_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IndexArchive {
+    pub schema_version: u32,
+    pub index: Index,
+    pub details: Vec<IndexDetail>,
+    pub content_hash: String,
+}
+
+impl IndexArchive {
+    pub(crate) fn from_index(
+        location: &RunLocation,
+        index: Index,
+        mut details: Vec<IndexDetail>,
+    ) -> Result<Self> {
+        details.sort_by_key(|detail| detail.sort_order);
+        let archive = Self {
+            schema_version: INDEX_ARCHIVE_SCHEMA_VERSION,
+            index,
+            details,
+            content_hash: String::new(),
+        };
+        archive.validate_for_location(location)?;
+        Ok(archive)
+    }
+
+    pub fn validate_for_location(&self, location: &RunLocation) -> Result<()> {
+        if self.schema_version != INDEX_ARCHIVE_SCHEMA_VERSION
+            || self.index.kind != IndexKind::PhaseSummary
+            || self.index.run_id != location.run_id
+            || self.index.detail_count != self.details.len()
+            || self.details.is_empty()
+        {
+            return Err(StoreError::InvalidDocument {
+                kind: "index archive",
+                message: "archive identity or Detail count is invalid".to_owned(),
+            });
+        }
+        if self.details.iter().enumerate().any(|(offset, detail)| {
+            detail.index_id != self.index.index_id || detail.sort_order != offset + 1
+        }) {
+            return Err(StoreError::InvalidDocument {
+                kind: "index archive",
+                message: "archive Details do not match their Index or contiguous order".to_owned(),
+            });
+        }
+        for value in std::iter::once(
+            serde_json::to_value(&self.index)
+                .map_err(|source| StoreError::JsonSerialize { source })?,
+        )
+        .chain(
+            self.details
+                .iter()
+                .map(|detail| {
+                    serde_json::to_value(detail)
+                        .map_err(|source| StoreError::JsonSerialize { source })
+                })
+                .collect::<Result<Vec<_>>>()?,
+        ) {
+            crate::validate_content_hash(&value)?;
+        }
+        Ok(())
+    }
+
+    pub fn relative_path(
+        location: &RunLocation,
+        source_phase: u8,
+        index_id: &str,
+    ) -> Result<PathBuf> {
+        Ok(location
+            .relative_root()
+            .join("index")
+            .join(format!("phase{source_phase}"))
+            .join(format!("{}.json", index_path_component(index_id)?)))
+    }
+}
+
+impl Versioned for IndexArchive {
+    const SCHEMA_VERSION: u32 = INDEX_ARCHIVE_SCHEMA_VERSION;
+}
+
+impl ContentHashDocument for IndexArchive {
+    fn content_hash(&self) -> &str {
+        &self.content_hash
+    }
+
+    fn set_content_hash(&mut self, hash: String) {
+        self.content_hash = hash;
+    }
 }
 
 impl Versioned for Index {
@@ -312,12 +404,12 @@ pub fn deterministic_experience_index_id(
             message: "pattern_key is required".to_owned(),
         });
     }
-    Ok(content_hash_bytes(
-        format!(
+    Ok(format!(
+        "exp-{}",
+        orchestrator_core::md5_3(format!(
             "kind=experience\x1fpattern_key={pattern_key}\x1fticker={}\x1fsource_phase={source_phase}",
             ticker.unwrap_or("")
-        )
-        .as_bytes(),
+        ))
     ))
 }
 
@@ -370,13 +462,6 @@ fn normalized_source_refs(source_refs: Vec<String>) -> Result<Vec<String>> {
         });
     }
     Ok(refs.into_iter().collect())
-}
-
-fn experience_lock_path(scope: &IndexScope) -> Result<PathBuf> {
-    Ok(PathBuf::from("knowledge/experience").join(format!(
-        ".experience-{}.lock",
-        SafeSlug::new("index", &scope.index_id)?.as_str()
-    )))
 }
 
 fn validate_existing_experience(
@@ -493,127 +578,136 @@ pub fn record_experience_case(
             message: "summary, detail, or confidence is invalid".to_owned(),
         });
     }
-    let lock = experience_lock_path(&input.scope)?;
-    store.with_exclusive_lock(&lock, || {
-        let final_directory = final_dir(&input.scope)?;
-        let final_index_path = index_path(&final_directory);
-        let source_run_id = input
-            .scope
-            .source_run_id
-            .as_deref()
-            .expect("validated historical source run")
-            .trim();
-        if !store.exists(&final_index_path)? {
-            create_index(
-                store,
-                CreateIndexInput {
-                    scope: input.scope.clone(),
-                    summary: input.summary.clone(),
-                    confidence: input.confidence,
-                    pattern_key: Some(input.pattern_key.clone()),
-                    applies_to_phases: input.applies_to_phases.clone(),
-                },
-            )?;
-            let detail = append_index_detail(
-                store,
-                AppendIndexDetailInput {
-                    scope: input.scope.clone(),
-                    section: DetailSection::HistoricalCase,
-                    detail: input.detail.trim().to_owned(),
-                    source_refs: normalized_source_refs(input.source_refs.clone())?,
-                },
-            )?;
-            let index = finalize_index(store, &input.scope)?;
-            return Ok(RecordExperienceCaseOutcome {
-                index,
-                detail,
-                disposition: ExperienceCaseDisposition::Created,
-                level: ExperienceLevel::RecentEpisode,
-            });
-        }
-
-        let mut index: Index =
-            store.read_versioned_json(&final_index_path, crate::FileSchemaKind::Index)?;
-        validate_existing_experience(&index, &input.scope, &input.pattern_key)?;
-        let details = read_all_completed_details(store, &input.scope)?;
-        if let Some(detail) = details.iter().find(|detail| {
-            detail.section == DetailSection::HistoricalCase && detail.source_run_id == source_run_id
-        }) {
-            if index.detail_count != details.len() {
-                index.detail_count = details.len();
-                index = store.write_authoritative_json(&final_index_path, index)?;
-            }
-            return Ok(RecordExperienceCaseOutcome {
-                index,
-                detail: detail.clone(),
-                disposition: ExperienceCaseDisposition::DuplicateSourceRun,
-                level: experience_level_from_details(&details),
-            });
-        }
-
-        let source_refs = normalized_source_refs(input.source_refs.clone())?;
-        let detail_text = input.detail.trim().to_owned();
-        let detail = store.write_authoritative_json(
-            &detail_path(
-                &final_directory,
-                &experience_case_detail_id(
-                    &index.index_id,
-                    source_run_id,
-                    &detail_text,
-                    &source_refs,
-                ),
-            )?,
-            IndexDetail {
-                schema_version: INDEX_DETAIL_SCHEMA_VERSION,
-                detail_id: experience_case_detail_id(
-                    &index.index_id,
-                    source_run_id,
-                    &detail_text,
-                    &source_refs,
-                ),
-                index_id: index.index_id.clone(),
-                section: DetailSection::HistoricalCase,
-                detail: detail_text,
-                source_run_id: source_run_id.to_owned(),
-                source_refs,
-                sort_order: details
-                    .iter()
-                    .map(|detail| detail.sort_order)
-                    .max()
-                    .unwrap_or(0)
-                    + 1,
-                created_at: input.scope.created_at.clone(),
-                content_hash: String::new(),
+    let final_directory = final_dir(&input.scope)?;
+    let final_index_path = index_path(&final_directory);
+    let source_run_id = input
+        .scope
+        .source_run_id
+        .as_deref()
+        .expect("validated historical source run")
+        .trim();
+    if !store.exists(&final_index_path)? {
+        create_index(
+            store,
+            CreateIndexInput {
+                scope: input.scope.clone(),
+                summary: input.summary.clone(),
+                confidence: input.confidence,
+                pattern_key: Some(input.pattern_key.clone()),
+                applies_to_phases: input.applies_to_phases.clone(),
             },
         )?;
-        let all_details = read_all_completed_details(store, &input.scope)?;
-        index.detail_count = all_details.len();
-        let index = store.write_authoritative_json(&final_index_path, index)?;
-        Ok(RecordExperienceCaseOutcome {
+        let detail = append_index_detail(
+            store,
+            AppendIndexDetailInput {
+                scope: input.scope.clone(),
+                section: DetailSection::HistoricalCase,
+                detail: input.detail.trim().to_owned(),
+                source_refs: normalized_source_refs(input.source_refs.clone())?,
+            },
+        )?;
+        let index = finalize_index(store, &input.scope)?;
+        return Ok(RecordExperienceCaseOutcome {
             index,
             detail,
-            disposition: ExperienceCaseDisposition::Appended,
-            level: experience_level_from_details(&all_details),
-        })
+            disposition: ExperienceCaseDisposition::Created,
+            level: ExperienceLevel::RecentEpisode,
+        });
+    }
+
+    let mut index: Index =
+        store.read_versioned_json(&final_index_path, crate::FileSchemaKind::Index)?;
+    validate_existing_experience(&index, &input.scope, &input.pattern_key)?;
+    let details = read_all_completed_details(store, &input.scope)?;
+    if let Some(detail) = details.iter().find(|detail| {
+        detail.section == DetailSection::HistoricalCase && detail.source_run_id == source_run_id
+    }) {
+        if index.detail_count != details.len() {
+            index.detail_count = details.len();
+            index = store.write_authoritative_json(&final_index_path, index)?;
+        }
+        return Ok(RecordExperienceCaseOutcome {
+            index,
+            detail: detail.clone(),
+            disposition: ExperienceCaseDisposition::DuplicateSourceRun,
+            level: experience_level_from_details(&details),
+        });
+    }
+
+    let source_refs = normalized_source_refs(input.source_refs.clone())?;
+    let detail_text = input.detail.trim().to_owned();
+    let detail = store.write_authoritative_json(
+        &detail_path(
+            &final_directory,
+            &experience_case_detail_id(&index.index_id, source_run_id, &detail_text, &source_refs),
+        )?,
+        IndexDetail {
+            schema_version: INDEX_DETAIL_SCHEMA_VERSION,
+            detail_id: experience_case_detail_id(
+                &index.index_id,
+                source_run_id,
+                &detail_text,
+                &source_refs,
+            ),
+            index_id: index.index_id.clone(),
+            section: DetailSection::HistoricalCase,
+            detail: detail_text,
+            source_run_id: source_run_id.to_owned(),
+            source_refs,
+            sort_order: details
+                .iter()
+                .map(|detail| detail.sort_order)
+                .max()
+                .unwrap_or(0)
+                + 1,
+            created_at: input.scope.created_at.clone(),
+            content_hash: String::new(),
+        },
+    )?;
+    let all_details = read_all_completed_details(store, &input.scope)?;
+    index.detail_count = all_details.len();
+    let index = store.write_authoritative_json(&final_index_path, index)?;
+    Ok(RecordExperienceCaseOutcome {
+        index,
+        detail,
+        disposition: ExperienceCaseDisposition::Appended,
+        level: experience_level_from_details(&all_details),
     })
 }
 
 fn final_dir(scope: &IndexScope) -> Result<PathBuf> {
     scope.validate()?;
-    let slug = SafeSlug::new("index", &scope.index_id)?;
+    let slug = index_path_component(&scope.index_id)?;
     Ok(match (&scope.kind, &scope.location) {
-        (IndexKind::PhaseSummary, Some(location)) => {
-            location.relative_root().join("index").join(slug.as_str())
-        }
-        (IndexKind::Experience, None) => PathBuf::from("knowledge/experience").join(slug.as_str()),
+        (IndexKind::PhaseSummary, Some(location)) => location
+            .relative_root()
+            .join("index")
+            .join(format!("phase{}", scope.source_phase))
+            .join(&slug),
+        (IndexKind::Experience, None) => PathBuf::from("knowledge/experience").join(slug),
         _ => unreachable!("validated scope"),
     })
 }
 fn draft_dir(scope: &IndexScope) -> Result<PathBuf> {
     Ok(final_dir(scope)?.with_file_name(format!(
         ".index-draft-{}",
-        SafeSlug::new("index", &scope.index_id)?.as_str()
+        index_path_component(&scope.index_id)?
     )))
+}
+pub fn index_path_component(index_id: &str) -> Result<String> {
+    let compact_hash = index_id
+        .strip_prefix("idx-")
+        .or_else(|| index_id.strip_prefix("exp-"));
+    if compact_hash.is_some_and(|hash| {
+        hash.len() == 6
+            && hash
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }) {
+        Ok(index_id.to_owned())
+    } else {
+        Ok(SafeSlug::new("index", index_id)?.as_str().to_owned())
+    }
 }
 fn index_path(dir: &Path) -> PathBuf {
     dir.join("index.json")
@@ -661,6 +755,24 @@ pub fn create_index(store: &FileStore, input: CreateIndexInput) -> Result<Index>
     // A finalized Index is authoritative over any stale Draft left behind by
     // a prior interrupted attempt.  Repeated create/finalize calls must
     // recover the canonical result rather than reopen or mutate that Draft.
+    if let Some(location) = input.scope.location.as_ref() {
+        let archive_path =
+            IndexArchive::relative_path(location, input.scope.source_phase, &input.scope.index_id)?;
+        if store.exists(&archive_path)? {
+            let archive: IndexArchive = store.read_versioned_json(
+                &archive_path,
+                crate::FileSchemaKind::Artifact("index_archive".to_owned()),
+            )?;
+            archive.validate_for_location(location)?;
+            if archive.index.source_payload_hash != input.scope.source_payload_hash {
+                return Err(StoreError::InvalidDocument {
+                    kind: "index",
+                    message: "completed Index identity differs from the requested scope".to_owned(),
+                });
+            }
+            return Ok(archive.index);
+        }
+    }
     let final_directory = final_dir(&input.scope)?;
     let final_index_path = index_path(&final_directory);
     if store.exists(&final_index_path)? {
@@ -712,63 +824,72 @@ pub fn append_index_detail(
     input: AppendIndexDetailInput,
 ) -> Result<IndexDetail> {
     let directory = draft_dir(&input.scope)?;
-    let lock = directory.join("details.lock");
-    store.with_exclusive_lock(&lock, || {
-        let index: Index =
-            store.read_versioned_json(&index_path(&directory), crate::FileSchemaKind::Index)?;
-        if index.index_id != input.scope.index_id || input.detail.trim().is_empty() {
-            return Err(StoreError::InvalidDocument {
-                kind: "index detail",
-                message: "draft missing or detail is empty".to_owned(),
-            });
-        }
-        let source_refs = input
-            .source_refs
-            .into_iter()
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        let source_run_id = input
-            .scope
-            .source_run_id
-            .clone()
-            .unwrap_or_else(|| input.scope.run_id.clone());
-        let detail_id = content_hash_bytes(
-            format!(
-                "{}\x1f{}\x1f{}\x1f{}\x1f{}",
-                index.index_id,
-                input.section as u8,
-                source_run_id,
-                input.detail.trim(),
-                source_refs.join("\x1e")
-            )
-            .as_bytes(),
-        );
-        let path = detail_path(&directory, &detail_id)?;
-        if store.exists(&path)? {
-            return store.read_versioned_json(&path, crate::FileSchemaKind::Detail);
-        }
-        let details_dir = directory.join("details");
-        let sort_order = count_details(store, &details_dir)? + 1;
-        store.write_authoritative_json(
-            &path,
-            IndexDetail {
-                schema_version: INDEX_DETAIL_SCHEMA_VERSION,
-                detail_id,
-                index_id: index.index_id,
-                section: input.section,
-                detail: input.detail,
-                source_run_id,
-                source_refs,
-                sort_order,
-                created_at: input.scope.created_at,
-                content_hash: String::new(),
-            },
+    let index: Index =
+        store.read_versioned_json(&index_path(&directory), crate::FileSchemaKind::Index)?;
+    if index.index_id != input.scope.index_id || input.detail.trim().is_empty() {
+        return Err(StoreError::InvalidDocument {
+            kind: "index detail",
+            message: "draft missing or detail is empty".to_owned(),
+        });
+    }
+    let source_refs = input
+        .source_refs
+        .into_iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let source_run_id = input
+        .scope
+        .source_run_id
+        .clone()
+        .unwrap_or_else(|| input.scope.run_id.clone());
+    let detail_id = content_hash_bytes(
+        format!(
+            "{}\x1f{}\x1f{}\x1f{}\x1f{}",
+            index.index_id,
+            input.section as u8,
+            source_run_id,
+            input.detail.trim(),
+            source_refs.join("\x1e")
         )
-    })
+        .as_bytes(),
+    );
+    let path = detail_path(&directory, &detail_id)?;
+    if store.exists(&path)? {
+        return store.read_versioned_json(&path, crate::FileSchemaKind::Detail);
+    }
+    let details_dir = directory.join("details");
+    let sort_order = count_details(store, &details_dir)? + 1;
+    store.write_authoritative_json(
+        &path,
+        IndexDetail {
+            schema_version: INDEX_DETAIL_SCHEMA_VERSION,
+            detail_id,
+            index_id: index.index_id,
+            section: input.section,
+            detail: input.detail,
+            source_run_id,
+            source_refs,
+            sort_order,
+            created_at: input.scope.created_at,
+            content_hash: String::new(),
+        },
+    )
 }
 
 pub fn finalize_index(store: &FileStore, scope: &IndexScope) -> Result<Index> {
+    if let Some(location) = scope.location.as_ref() {
+        let archive_path =
+            IndexArchive::relative_path(location, scope.source_phase, &scope.index_id)?;
+        if store.exists(&archive_path)? {
+            let archive: IndexArchive = store.read_versioned_json(
+                &archive_path,
+                crate::FileSchemaKind::Artifact("index_archive".to_owned()),
+            )?;
+            archive.validate_for_location(location)?;
+            return Ok(archive.index);
+        }
+    }
     let draft = draft_dir(scope)?;
     let final_dir = final_dir(scope)?;
     if store.exists(&index_path(&final_dir))? {
@@ -864,13 +985,19 @@ pub fn read_indexes(
 ) -> Result<IndexPage> {
     let base = match query.kind {
         Some(IndexKind::Experience) => PathBuf::from("knowledge/experience"),
-        _ => run
-            .ok_or_else(|| StoreError::InvalidDocument {
-                kind: "index query",
-                message: "run location is required for phase summaries".to_owned(),
-            })?
-            .relative_root()
-            .join("index"),
+        _ => {
+            let mut base = run
+                .ok_or_else(|| StoreError::InvalidDocument {
+                    kind: "index query",
+                    message: "run location is required for phase summaries".to_owned(),
+                })?
+                .relative_root()
+                .join("index");
+            if let Some(phase) = query.source_phase {
+                base.push(format!("phase{phase}"));
+            }
+            base
+        }
     };
     let absolute = store.root().join(&base);
     if !absolute.exists() {
@@ -879,39 +1006,76 @@ pub fn read_indexes(
             next_cursor: None,
         });
     }
-    let mut found = Vec::new();
-    for entry in fs::read_dir(&absolute).map_err(|source| StoreError::Io {
-        path: absolute.clone(),
-        source,
-    })? {
-        let entry = entry.map_err(|source| StoreError::Io {
-            path: absolute.clone(),
-            source,
-        })?;
-        if entry.file_name().to_string_lossy().starts_with('.') {
-            continue;
-        }
-        if !entry
-            .file_type()
+    let directories = if query.kind != Some(IndexKind::Experience) && query.source_phase.is_none() {
+        fs::read_dir(&absolute)
             .map_err(|source| StoreError::Io {
-                path: entry.path(),
+                path: absolute.clone(),
                 source,
             })?
-            .is_dir()
-        {
-            continue;
-        }
-        let relative = base.join(entry.file_name()).join("index.json");
-        let index: Index = match store.read_versioned_json(&relative, crate::FileSchemaKind::Index)
-        {
-            Ok(value) => value,
-            Err(_) => continue,
-        };
-        if matches_query(&index, query) {
-            found.push(index);
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry.file_type().is_ok_and(|value| value.is_dir())
+                    && entry.file_name().to_string_lossy().starts_with("phase")
+            })
+            .map(|entry| base.join(entry.file_name()))
+            .collect::<Vec<_>>()
+    } else {
+        vec![base.clone()]
+    };
+    let mut found = BTreeMap::new();
+    for directory in directories {
+        let directory_absolute = store.root().join(&directory);
+        for entry in fs::read_dir(&directory_absolute).map_err(|source| StoreError::Io {
+            path: directory_absolute.clone(),
+            source,
+        })? {
+            let entry = entry.map_err(|source| StoreError::Io {
+                path: directory_absolute.clone(),
+                source,
+            })?;
+            if entry.file_name().to_string_lossy().starts_with('.') {
+                continue;
+            }
+            let file_type = entry.file_type().map_err(|source| StoreError::Io {
+                path: entry.path(),
+                source,
+            })?;
+            let index = if file_type.is_dir() {
+                let relative = directory.join(entry.file_name()).join("index.json");
+                match store.read_versioned_json(&relative, crate::FileSchemaKind::Index) {
+                    Ok(value) => value,
+                    Err(_) => continue,
+                }
+            } else if file_type.is_file()
+                && (entry.file_name().to_string_lossy().starts_with("idx-")
+                    || entry.file_name().to_string_lossy().starts_with("index-"))
+                && entry
+                    .path()
+                    .extension()
+                    .is_some_and(|value| value == "json")
+            {
+                let relative = directory.join(entry.file_name());
+                let archive: IndexArchive = match store.read_versioned_json(
+                    &relative,
+                    crate::FileSchemaKind::Artifact("index_archive".to_owned()),
+                ) {
+                    Ok(value) => value,
+                    Err(_) => continue,
+                };
+                let Some(location) = run else {
+                    continue;
+                };
+                archive.validate_for_location(location)?;
+                archive.index
+            } else {
+                continue;
+            };
+            if matches_query(&index, query) {
+                found.insert(index.index_id.clone(), index);
+            }
         }
     }
-    found.sort_by(|a, b| a.index_id.cmp(&b.index_id));
+    let found = found.into_values().collect::<Vec<_>>();
     let start = query.cursor.min(found.len());
     let limit = query.limit.clamp(1, 100);
     let end = (start + limit).min(found.len());
@@ -943,6 +1107,39 @@ pub fn read_index_details(
     scope: &IndexScope,
     query: &DetailQuery,
 ) -> Result<DetailPage> {
+    if let Some(location) = scope.location.as_ref() {
+        let archive_path =
+            IndexArchive::relative_path(location, scope.source_phase, &scope.index_id)?;
+        if store.exists(&archive_path)? {
+            let archive: IndexArchive = store.read_versioned_json(
+                &archive_path,
+                crate::FileSchemaKind::Artifact("index_archive".to_owned()),
+            )?;
+            archive.validate_for_location(location)?;
+            if archive.index.index_id != scope.index_id {
+                return Err(StoreError::InvalidDocument {
+                    kind: "index archive",
+                    message: "archive Index does not match the requested scope".to_owned(),
+                });
+            }
+            let details = archive
+                .details
+                .into_iter()
+                .filter(|detail| {
+                    query
+                        .section
+                        .is_none_or(|section| section == detail.section)
+                })
+                .collect::<Vec<_>>();
+            let start = query.cursor.min(details.len());
+            let limit = query.limit.clamp(1, 100);
+            let end = (start + limit).min(details.len());
+            return Ok(DetailPage {
+                details: details[start..end].to_vec(),
+                next_cursor: (end < details.len()).then(|| end.to_string()),
+            });
+        }
+    }
     let dir = final_dir(scope)?;
     let details_dir = dir.join("details");
     let absolute = store.root().join(&details_dir);

@@ -20,7 +20,7 @@ pub const RUN_MANIFEST_SCHEMA_VERSION: u32 = 2;
 pub struct RunLocation {
     pub current_date: String,
     pub run_id: String,
-    run_slug: SafeSlug,
+    run_slug: String,
 }
 
 impl RunLocation {
@@ -39,8 +39,17 @@ impl RunLocation {
                 message: "run_id must not be empty".to_owned(),
             });
         }
+        let run_slug = if run_id.len() <= 99
+            && run_id
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        {
+            run_id.clone()
+        } else {
+            SafeSlug::new("run", &run_id)?.as_str().to_owned()
+        };
         Ok(Self {
-            run_slug: SafeSlug::new("run", &run_id)?,
+            run_slug,
             current_date,
             run_id,
         })
@@ -60,7 +69,7 @@ impl RunLocation {
         self.relative_root().join("state.json")
     }
 
-    pub fn run_slug(&self) -> &SafeSlug {
+    pub fn run_slug(&self) -> &String {
         &self.run_slug
     }
 
@@ -599,7 +608,7 @@ fn is_workflow_date(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::{collections::BTreeMap, path::PathBuf};
 
     use tempfile::tempdir;
 
@@ -638,6 +647,15 @@ mod tests {
             .contains("run-run-with-special-"));
         assert!(!written.content_hash.is_empty());
         assert_eq!(read_run_manifest(&store, &location).unwrap(), written);
+    }
+
+    #[test]
+    fn generated_run_id_is_the_directory_name() {
+        let location = RunLocation::new("2026-07-27", "qqq-soxx-vix-a1b2c3").unwrap();
+        assert_eq!(
+            location.relative_root(),
+            PathBuf::from("runs/2026-07-27/qqq-soxx-vix-a1b2c3")
+        );
     }
 
     #[test]

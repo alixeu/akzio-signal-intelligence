@@ -4,7 +4,10 @@
 
 ## 权威输入
 
-Phase 3 ResearchDecision 是唯一市场结论；Phase 4 Trader 只提供执行意图。先分别调用 `read_phase_summaries(source_phase=3)` 与 `read_phase_summaries(source_phase=4)`，再展开当前 ticker 的权威市场结论和执行意图。不得读取或改写 Phase 1/2，也不补外部事实。
+Phase 3 ResearchDecision 是唯一市场结论；Phase 4 Trader 只提供执行意图。
+先分别调用 `read_indexes(source_phase=3)` 与 `read_indexes(source_phase=4)`，
+再通过 `read_index_details(index_id)` 展开当前 ticker 的权威市场结论和执行
+意图。不得读取或改写 Phase 1/2，也不补外部事实。
 
 ## 风险委员会
 
@@ -28,7 +31,7 @@ Rust 风险控制上下文（不含 ResearchDecision、TradeIntent 或风险历�
 摘要可用性 bootstrap（不含分析正文）：
 {retrieval_bootstrap}
 
-通过领域工具完成本角色的 Draft：调用 `set_risk_assessment` 和
-`set_risk_constraints`，然后调用 terminal `finalize_risk_review`。不要输出 JSON
-Artifact 或 Assistant 最终答案。Rust Builder 从已写入字段生成 canonical Artifact；
-`stance`、ticker、角色和作用域由运行时绑定，不能自行指定或覆盖。
+最终输出正常中文风险报告，按“立场、独有风险贡献、与前序分歧、仓位上限、
+最大回撤、risk-off trigger、复评条件、现金或对冲建议”组织。不要输出 JSON，
+不调用写入或 finalize 工具。Phase 5 Summary 提取约束，Rust 校验后写入 Index；
+stance、ticker、角色和作用域由运行时绑定。

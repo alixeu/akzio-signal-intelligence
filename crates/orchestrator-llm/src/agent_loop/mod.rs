@@ -17,7 +17,6 @@ use std::{
     future::Future,
     path::PathBuf,
     pin::Pin,
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 use tracing::{debug, warn};
@@ -83,8 +82,8 @@ impl LoopModel for AgentLoopModel {
     fn stream_events<'a>(
         &'a mut self,
         input: ModelInput,
-        handler: &'a mut dyn ModelEventHandler,
-    ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
+        handler: &'a mut (dyn ModelEventHandler + Send),
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
             let prompt = model_role_prompt(&input)?;
             let mut capture =
@@ -117,9 +116,6 @@ pub struct AgentLoopConfig {
     pub model: String,
     pub topic_id: Option<String>,
     pub retrieval_policy: RetrievalPolicy,
-    /// Tool-managed roles must finish through a successful terminal tool,
-    /// rather than an assistant-message artifact.
-    pub require_terminal_tool: bool,
 }
 
 impl Default for AgentLoopConfig {
@@ -138,7 +134,6 @@ impl Default for AgentLoopConfig {
             model: String::new(),
             topic_id: None,
             retrieval_policy: RetrievalPolicy::default(),
-            require_terminal_tool: false,
         }
     }
 }
@@ -169,7 +164,7 @@ pub async fn run_turn_with_events<M, T, S>(
 where
     M: LoopModel,
     T: LoopToolRuntime,
-    S: AgentEventSink,
+    S: AgentEventSink + Send,
 {
     debug!(
         turn_id = turn.turn_id,
@@ -199,34 +194,35 @@ where
     }
     // Preload role default evidence before the first LLM hop (jin10/technical/compose).
     if !turn.tools_disabled {
-        let already = turn
-            .emitted_items
-            .iter()
-            .any(|item| item.item_type == TurnItemType::ToolResult);
-        if !already {
-            let available_tools = turn_available_tools(turn);
-            let preseed_calls = preseed_tool_calls(turn, &turn_tickers(turn), &available_tools);
-            for call in preseed_calls {
-                turn.emitted_items.push(TurnItem::tool_call(&call));
-                let result = tools.execute(call).await;
-                turn.emitted_items
-                    .push(TurnItem::tool_result(&result, &config.truncation));
+        let available_tools = turn_available_tools(turn);
+        let preseed_calls = preseed_tool_calls(turn, &turn_tickers(turn), &available_tools);
+        let mut wrote_preseed = false;
+        for call in preseed_calls {
+            let already_recorded = turn.emitted_items.iter().any(|item| {
+                item.item_type == TurnItemType::ToolResult && item.tool_call_id == call.call_id
+            });
+            if already_recorded {
+                continue;
             }
-            if turn
+            wrote_preseed = true;
+            turn.emitted_items.push(TurnItem::tool_call(&call));
+            let result = tools.execute(call).await;
+            turn.emitted_items
+                .push(TurnItem::tool_result(&result, &config.truncation));
+        }
+        if wrote_preseed
+            && turn
                 .emitted_items
                 .iter()
                 .any(|item| item.item_type == TurnItemType::ToolResult)
-            {
-                persist_turn(session, turn, &config.truncation)?;
-            }
+        {
+            persist_turn(session, turn, &config.truncation)?;
         }
     }
     let mut first_iteration = true;
     let max_loops = config.max_agent_loops.map(|value| value.max(1));
     let mut loop_index = 0usize;
     let mut aggregate_result = ModelStreamResult::default();
-    let mut retrieval_retry_queued = false;
-    let mut terminal_finalize_failures = 0usize;
     loop {
         if let Some(max_loops) = max_loops {
             if loop_index >= max_loops {
@@ -292,9 +288,8 @@ where
         if !turn.pending_tool_calls.is_empty() {
             let calls = std::mem::take(&mut turn.pending_tool_calls);
 
-            // Tool calls are intentionally sequential. A later write in the
-            // same model response may cite evidence returned by an earlier
-            // read, and a terminal tool must stop subsequent calls.
+            // Tool calls are intentionally sequential so a later detail read
+            // can rely on the visible Index IDs returned by an earlier list.
             let debug_metrics = config.debug;
             let debug_root = config.project_root.clone();
             let debug_role = turn.role.clone();
@@ -303,7 +298,6 @@ where
             let debug_loop = loop_index;
             let tool_batch_started = Instant::now();
             let mut terminal_completed = false;
-            let mut terminal_finalize_exhausted = false;
             let mut calls = calls.into_iter();
             while let Some(call) = calls.next() {
                 emit_tool_call_status(turn, sink, &call, AgentItemStatus::Running).await?;
@@ -318,7 +312,19 @@ where
                     tool = name,
                     "agent loop tool call starting"
                 );
-                let result = tools.execute(call).await;
+                let result = if let Some(error) =
+                    retrieval_policy_violation(turn, &call, &config.retrieval_policy)
+                {
+                    ToolResultItem {
+                        call_id: call.call_id,
+                        name: call.name,
+                        status: "error".to_string(),
+                        output: Value::Null,
+                        error: Some(error),
+                    }
+                } else {
+                    tools.execute(call).await
+                };
                 let tool_elapsed_ms = tool_started.elapsed().as_millis();
                 if debug_metrics {
                     if let Some(root) = debug_root.as_ref() {
@@ -371,7 +377,7 @@ where
                                 "items": []
                             }),
                             error: Some(
-                                "tool call was ignored because a prior terminal finalize succeeded"
+                                "tool call was ignored because a prior terminal result succeeded"
                                     .to_string(),
                             ),
                         };
@@ -379,19 +385,6 @@ where
                         turn.emitted_items
                             .push(TurnItem::tool_result(&ignored_result, &config.truncation));
                     }
-                    break;
-                }
-                if config.require_terminal_tool && is_terminal_finalize_attempt(&result) {
-                    terminal_finalize_failures += 1;
-                    if terminal_finalize_failures >= MAX_FINALIZE_ATTEMPTS {
-                        terminal_finalize_exhausted = true;
-                        break;
-                    }
-                    turn.push_pending_input(
-                        "The terminal finalize tool was rejected. Repair the Draft using the reported validation error, then call the assigned finalize tool exactly once more. Do not provide prose.",
-                    );
-                    // Do not execute further calls from the invalid response:
-                    // repair must be an explicit, auditable next model turn.
                     break;
                 }
             }
@@ -403,14 +396,7 @@ where
                 persist_turn(session, turn, &config.truncation)?;
                 return Ok(aggregate_result);
             }
-            if terminal_finalize_exhausted {
-                turn.end_reason = Some("terminal_finalize_failed".to_string());
-                persist_turn(session, turn, &config.truncation)?;
-                bail!(
-                    "tool-managed terminal finalize failed after {MAX_FINALIZE_ATTEMPTS} attempts"
-                );
-            }
-            if loop_index >= 3 && !config.require_terminal_tool {
+            if loop_index >= 3 {
                 turn.tools_disabled = true;
                 turn.push_pending_input(FINALIZE_INSTRUCTION);
             }
@@ -425,21 +411,22 @@ where
             continue;
         }
 
-        if config.require_terminal_tool {
-            if !retrieval_retry_queued {
-                retrieval_retry_queued = true;
-                turn.push_pending_input(
-                    "No terminal finalize tool succeeded. Use the assigned finalize tool now; do not provide a prose answer.",
-                );
-                turn.needs_follow_up = true;
-                persist_turn(session, turn, &config.truncation)?;
-                continue;
-            }
-            bail!("tool-managed agent ended without a successful terminal finalize tool");
-        }
-
         if turn.needs_follow_up {
             turn.needs_follow_up = false;
+            persist_turn(session, turn, &config.truncation)?;
+            continue;
+        }
+
+        if let Some(error) = retrieval_completion_violation(turn, &config.retrieval_policy) {
+            if turn.tools_disabled {
+                turn.end_reason = Some("retrieval_policy_failed".to_owned());
+                persist_turn(session, turn, &config.truncation)?;
+                bail!(error);
+            }
+            turn.push_pending_input(format!(
+                "The final response cannot be accepted yet: {error}. Complete the required reads, then return the final free-text response."
+            ));
+            turn.needs_follow_up = true;
             persist_turn(session, turn, &config.truncation)?;
             continue;
         }
@@ -473,9 +460,11 @@ pub fn retrieval_audit(turn: &Turn) -> Value {
     let mut summary_ids = BTreeSet::new();
     let mut detail_ids = BTreeSet::new();
     let mut expanded_summary_ids = Vec::new();
+    let mut successful_expanded_summary_ids = BTreeSet::new();
     let mut summary_source_phases = BTreeMap::<String, i64>::new();
     let mut visible_source_phases = BTreeSet::new();
     let mut expanded_source_phases = BTreeSet::new();
+    let mut successful_expanded_source_phases = BTreeSet::new();
     let mut listed_before_detail = BTreeSet::new();
     let mut detail_before_list = BTreeSet::new();
     let mut signatures = BTreeMap::<String, usize>::new();
@@ -487,7 +476,7 @@ pub fn retrieval_audit(turn: &Turn) -> Value {
     let mut summary_filters = Vec::new();
     let mut successful_summary_filters = Vec::new();
 
-    for item in &turn.emitted_items {
+    for item in turn.emitted_items.iter().skip(turn.retrieval_scope_start) {
         match item.item_type {
             TurnItemType::ToolCall
                 if matches!(
@@ -537,17 +526,23 @@ pub fn retrieval_audit(turn: &Turn) -> Value {
                             successful_summary_filters.push(arguments.clone());
                         }
                     }
+                    let summaries = output
+                        .get("items")
+                        .or_else(|| output.get("indexes"))
+                        .and_then(Value::as_array);
                     visible_summary_count = visible_summary_count.saturating_add(
                         output
                             .get("item_count")
                             .and_then(Value::as_u64)
-                            .unwrap_or(0) as usize,
+                            .map(|count| count as usize)
+                            .or_else(|| summaries.map(Vec::len))
+                            .unwrap_or(0),
                     );
                     any_truncated |= output
                         .get("truncated")
                         .and_then(Value::as_bool)
                         .unwrap_or(false);
-                    if let Some(items) = output.get("items").and_then(Value::as_array) {
+                    if let Some(items) = summaries {
                         for summary in items {
                             if let Some(id) = summary.get("index_id").and_then(Value::as_str) {
                                 summary_ids.insert(id.to_string());
@@ -562,11 +557,27 @@ pub fn retrieval_audit(turn: &Turn) -> Value {
                         }
                     }
                 } else if item.tool_name == tools::index_tools::READ_INDEX_DETAILS_NAME {
+                    if item.status == Some(AgentItemStatus::Completed) {
+                        if let Some(summary_id) = call_args
+                            .get(&item.tool_call_id)
+                            .and_then(|arguments| arguments.get("index_id"))
+                            .and_then(Value::as_str)
+                        {
+                            successful_expanded_summary_ids.insert(summary_id.to_string());
+                            if let Some(source_phase) = summary_source_phases.get(summary_id) {
+                                successful_expanded_source_phases.insert(*source_phase);
+                            }
+                        }
+                    }
                     any_truncated |= output
                         .get("truncated")
                         .and_then(Value::as_bool)
                         .unwrap_or(false);
-                    if let Some(items) = output.get("items").and_then(Value::as_array) {
+                    if let Some(items) = output
+                        .get("items")
+                        .or_else(|| output.get("details"))
+                        .and_then(Value::as_array)
+                    {
                         for detail in items {
                             if let Some(id) = detail.get("detail_id").and_then(Value::as_str) {
                                 detail_ids.insert(id.to_string());
@@ -599,6 +610,8 @@ pub fn retrieval_audit(turn: &Turn) -> Value {
         "visible_source_phases": visible_source_phases,
         "expanded_summary_ids": unique_expanded,
         "expanded_source_phases": expanded_source_phases,
+        "successful_expanded_summary_ids": successful_expanded_summary_ids,
+        "successful_expanded_source_phases": successful_expanded_source_phases,
         "read_detail_ids": detail_ids,
         "duplicate_retrieval_count": duplicate_retrievals,
         "detail_requested_before_visible_index": detail_before_list,
@@ -606,6 +619,223 @@ pub fn retrieval_audit(turn: &Turn) -> Value {
         "calls": calls,
         "call_argument_count": call_args.len()
     })
+}
+
+fn retrieval_policy_violation(
+    turn: &Turn,
+    call: &ToolCallRequest,
+    policy: &RetrievalPolicy,
+) -> Option<String> {
+    if turn.role == "researcher.web_evidence" && call.name == tools::web_run::NAME {
+        let executed_call_ids = executed_retrieval_call_ids(turn);
+        let query_count = turn
+            .emitted_items
+            .iter()
+            .skip(turn.retrieval_scope_start)
+            .filter(|item| {
+                item.item_type == TurnItemType::ToolCall
+                    && item.tool_name == tools::web_run::NAME
+                    && executed_call_ids.contains(&item.tool_call_id)
+            })
+            .map(|item| {
+                let arguments = item
+                    .content_json
+                    .pointer("/call/arguments")
+                    .unwrap_or(&Value::Null);
+                arguments
+                    .get("search_query")
+                    .and_then(Value::as_array)
+                    .map(Vec::len)
+                    .or_else(|| {
+                        arguments
+                            .get("search_query")
+                            .and_then(Value::as_str)
+                            .map(|_| 1)
+                    })
+                    .unwrap_or_default()
+            })
+            .sum::<usize>();
+        let current_query_count = call
+            .arguments
+            .get("search_query")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .or_else(|| {
+                call.arguments
+                    .get("search_query")
+                    .and_then(Value::as_str)
+                    .map(|_| 1)
+            })
+            .unwrap_or_default();
+        if query_count + current_query_count > tools::research_evidence_gap::MAX_WEB_SEARCH_QUERIES
+        {
+            return Some(format!(
+                "Web evidence search budget exceeded: maximum {} queries",
+                tools::research_evidence_gap::MAX_WEB_SEARCH_QUERIES
+            ));
+        }
+    }
+
+    if call.name == tools::research_evidence_gap::NAME {
+        let audit = retrieval_audit(turn);
+        let successful_details = audit
+            .get("successful_expanded_summary_ids")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or_default();
+        if successful_details == 0 {
+            return Some(
+                "research_evidence_gap requires a successful read_index_details expansion first"
+                    .to_owned(),
+            );
+        }
+    }
+
+    if matches!(
+        call.name.as_str(),
+        tools::index_tools::READ_INDEXES_NAME | tools::index_tools::READ_INDEX_DETAILS_NAME
+    ) {
+        let executed_call_ids = executed_retrieval_call_ids(turn);
+        let signature = format!("{}:{}", call.name, canonical_value(&call.arguments));
+        let same_call_count = turn
+            .emitted_items
+            .iter()
+            .skip(turn.retrieval_scope_start)
+            .filter(|item| item.item_type == TurnItemType::ToolCall)
+            .filter(|item| executed_call_ids.contains(&item.tool_call_id))
+            .filter(|item| {
+                let arguments = item
+                    .content_json
+                    .pointer("/call/arguments")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                format!("{}:{}", item.tool_name, canonical_value(&arguments)) == signature
+            })
+            .count();
+        if same_call_count > 0 {
+            return Some(format!(
+                "duplicate retrieval call rejected: {} with identical arguments",
+                call.name
+            ));
+        }
+    }
+
+    if call.name == tools::index_tools::READ_INDEX_DETAILS_NAME
+        && policy.maximum_detail_expansions > 0
+    {
+        let executed_call_ids = executed_retrieval_call_ids(turn);
+        let detail_call_count = turn
+            .emitted_items
+            .iter()
+            .skip(turn.retrieval_scope_start)
+            .filter(|item| {
+                item.item_type == TurnItemType::ToolCall
+                    && item.tool_name == tools::index_tools::READ_INDEX_DETAILS_NAME
+                    && executed_call_ids.contains(&item.tool_call_id)
+            })
+            .count();
+        if detail_call_count >= policy.maximum_detail_expansions {
+            return Some(format!(
+                "detail retrieval budget exceeded: maximum {} calls",
+                policy.maximum_detail_expansions
+            ));
+        }
+    }
+
+    None
+}
+
+fn executed_retrieval_call_ids(turn: &Turn) -> BTreeSet<String> {
+    turn.emitted_items
+        .iter()
+        .skip(turn.retrieval_scope_start)
+        .filter(|item| {
+            item.item_type == TurnItemType::ToolResult
+                && matches!(
+                    item.tool_name.as_str(),
+                    tools::web_run::NAME
+                        | tools::index_tools::READ_INDEXES_NAME
+                        | tools::index_tools::READ_INDEX_DETAILS_NAME
+                )
+        })
+        .map(|item| item.tool_call_id.clone())
+        .collect()
+}
+
+fn retrieval_completion_violation(turn: &Turn, policy: &RetrievalPolicy) -> Option<String> {
+    if !policy.mandatory_summary_query {
+        return None;
+    }
+    let audit = retrieval_audit(turn);
+    let successful_query_count = audit
+        .get("successful_summary_query_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if successful_query_count == 0 {
+        return Some("final response requires a successful read_indexes call".to_string());
+    }
+
+    let successful_filters = audit
+        .get("successful_summary_filters")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for required_phase in &policy.required_source_phases {
+        let covered = successful_filters.iter().any(|filter| {
+            filter.get("source_phase").is_none()
+                || filter.get("source_phase").and_then(Value::as_i64) == Some(*required_phase)
+        });
+        if !covered {
+            return Some(format!(
+                "final response requires read_indexes(source_phase={required_phase})"
+            ));
+        }
+    }
+
+    let visible_summary_count = audit
+        .get("visible_summary_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let details_before_list = audit
+        .get("detail_requested_before_visible_index")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    if details_before_list > 0 {
+        return Some(
+            "final response rejected because read_index_details was called before its Index was visible"
+                .to_string(),
+        );
+    }
+    if visible_summary_count == 0 && policy.allow_empty_when_no_visible_summary {
+        return None;
+    }
+
+    let expanded_ids = audit
+        .get("successful_expanded_summary_ids")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    if expanded_ids < policy.minimum_detail_expansions {
+        return Some(format!(
+            "final response requires at least {} distinct read_index_details expansions",
+            policy.minimum_detail_expansions
+        ));
+    }
+    let expanded_phases = audit
+        .get("successful_expanded_source_phases")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for required_phase in &policy.required_detail_source_phases {
+        if !expanded_phases
+            .iter()
+            .any(|phase| phase.as_i64() == Some(*required_phase))
+        {
+            return Some(format!(
+                "final response requires a read_index_details expansion from source phase {required_phase}"
+            ));
+        }
+    }
+    None
 }
 
 fn tool_result_output(item: &TurnItem) -> Option<Value> {
@@ -1252,6 +1482,13 @@ fn preseed_tool_calls(
 ) -> Vec<ToolCallRequest> {
     let mut calls = Vec::new();
     let tool_enabled = |name: &str| available_tools.iter().any(|tool| tool == name);
+    if tool_enabled(tools::record_phase2_steer::NAME) {
+        calls.push(ToolCallRequest {
+            call_id: format!("preseed-phase2-steer-{}", turn.turn_id),
+            name: tools::record_phase2_steer::NAME.to_owned(),
+            arguments: json!({}),
+        });
+    }
     match turn.role.as_str() {
         "analyst.technical" if tool_enabled("read_technical_snapshot") => {
             calls.push(ToolCallRequest {
@@ -1270,6 +1507,32 @@ fn preseed_tool_calls(
         _ => {}
     }
     calls
+}
+
+#[cfg(test)]
+mod phase2_steer_preseed_tests {
+    use super::*;
+
+    #[test]
+    fn every_phase2_child_turn_gets_its_own_steer_record_call() {
+        let turn = Turn::new(
+            "turn-child",
+            "session-child",
+            "run-a",
+            "researcher.bull.interaction",
+            "topic instruction",
+        );
+        let calls = preseed_tool_calls(
+            &turn,
+            &["QQQ".to_owned()],
+            &[tools::record_phase2_steer::NAME.to_owned()],
+        );
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, tools::record_phase2_steer::NAME);
+        assert_eq!(calls[0].call_id, "preseed-phase2-steer-turn-child");
+        assert_eq!(calls[0].arguments, json!({}));
+    }
 }
 
 /// Map assistant prose into a non-artifact response. Native function calls arrive on the stream.
@@ -1308,15 +1571,6 @@ pub fn is_terminal_tool_result(result: &ToolResultItem) -> bool {
             .get("terminal")
             .and_then(Value::as_bool)
             .unwrap_or(false)
-}
-
-/// ToolManaged profiles get one repair turn after a failed terminal finalizer.
-/// A second failed finalizer is handed to the workflow's existing degraded
-/// policy rather than allowing an unbounded model retry loop.
-pub const MAX_FINALIZE_ATTEMPTS: usize = 2;
-
-fn is_terminal_finalize_attempt(result: &ToolResultItem) -> bool {
-    result.name.starts_with("finalize_") && !is_terminal_tool_result(result)
 }
 
 /// System instruction for native tool calling + plain-text final artifacts.
@@ -1650,15 +1904,8 @@ pub struct ProjectToolRuntime {
         >,
     >,
     index_runtime_error: Option<String>,
-    index_write_allowed: bool,
-    historical_reflection_binding:
-        Option<tools::historical_reflection::HistoricalReflectionTerminalBinding>,
     experience_retrieval_binding: Option<tools::experience_tools::ExperienceRetrievalBinding>,
-    domain_binding: Option<tools::domain_tools::DomainToolRuntimeBinding>,
-    domain_runtime_error: Option<String>,
-    max_write_calls: Option<usize>,
-    write_call_count: AtomicUsize,
-    write_budget_exhausted: AtomicBool,
+    evidence_research_binding: Option<tools::research_evidence_gap::EvidenceResearchBinding>,
 }
 
 impl ProjectToolRuntime {
@@ -1684,14 +1931,8 @@ impl ProjectToolRuntime {
             index_binding: None,
             index_runtime: None,
             index_runtime_error: None,
-            index_write_allowed: false,
-            historical_reflection_binding: None,
             experience_retrieval_binding: None,
-            domain_binding: None,
-            domain_runtime_error: None,
-            max_write_calls: None,
-            write_call_count: AtomicUsize::new(0),
-            write_budget_exhausted: AtomicBool::new(false),
+            evidence_research_binding: None,
         }
     }
 
@@ -1700,26 +1941,12 @@ impl ProjectToolRuntime {
         self
     }
 
-    /// Attach the one typed FileStore Index domain runtime for a migrated
-    /// unit. Absence is intentional: profiles without an Index writer never gain a fallback path
-    /// to Index persistence.
+    /// Attach the read-only FileStore Index runtime for a migrated unit.
     pub fn with_index_tool_runtime(
         mut self,
         binding: tools::index_tools::IndexToolRuntimeBinding,
     ) -> Self {
-        self.index_write_allowed = binding.allows_write();
         self.index_binding = Some(binding);
-        self
-    }
-
-    /// Attach the sole Phase 0 terminal. This is intentionally independent
-    /// from generic Index writing so the model cannot create arbitrary
-    /// Experience records or select Duplicate.
-    pub fn with_historical_reflection_terminal(
-        mut self,
-        binding: tools::historical_reflection::HistoricalReflectionTerminalBinding,
-    ) -> Self {
-        self.historical_reflection_binding = Some(binding);
         self
     }
 
@@ -1731,21 +1958,11 @@ impl ProjectToolRuntime {
         self
     }
 
-    /// Attach the one typed FileStore business-domain runtime for a migrated
-    /// unit.  Absence is intentional: profiles without a domain writer can never invoke a domain
-    /// writer as an implicit fallback.
-    pub fn with_domain_tool_runtime(
+    pub fn with_evidence_research(
         mut self,
-        binding: tools::domain_tools::DomainToolRuntimeBinding,
+        binding: tools::research_evidence_gap::EvidenceResearchBinding,
     ) -> Self {
-        self.domain_binding = Some(binding);
-        self
-    }
-
-    /// Bound only typed FileStore writes; arbitrary natural-language output,
-    /// read tools, and `think` cannot consume or evade this Rust-owned limit.
-    pub fn with_max_write_calls(mut self, max_write_calls: Option<usize>) -> Self {
-        self.max_write_calls = max_write_calls;
+        self.evidence_research_binding = Some(binding);
         self
     }
 }
@@ -1761,32 +1978,13 @@ impl LoopToolRuntime for ProjectToolRuntime {
         );
         self.index_runtime = None;
         self.index_runtime_error = None;
-        self.domain_runtime_error = None;
-        self.write_call_count.store(0, Ordering::Release);
-        self.write_budget_exhausted.store(false, Ordering::Release);
         if let Some(binding) = &self.index_binding {
             match binding.build(context.clone()) {
                 Ok(runtime) => self.index_runtime = Some(runtime),
                 Err(error) => self.index_runtime_error = Some(error.to_string()),
             }
         }
-        if let Some(binding) = &self.domain_binding {
-            if let Err(error) = binding.set_turn_context(&context) {
-                self.domain_runtime_error = Some(error.to_string());
-            }
-        }
         self.turn_context = Some(context);
-    }
-
-    fn abort_reason(&self) -> Option<String> {
-        self.write_budget_exhausted
-            .load(Ordering::Acquire)
-            .then(|| {
-                format!(
-                    "ToolManaged write-call budget exhausted after {} attempts",
-                    self.write_call_count.load(Ordering::Acquire)
-                )
-            })
     }
 
     fn execute<'a>(
@@ -1799,11 +1997,8 @@ impl LoopToolRuntime for ProjectToolRuntime {
         let turn_context = self.turn_context.clone();
         let index_runtime = self.index_runtime.as_ref();
         let index_runtime_error = self.index_runtime_error.as_deref();
-        let index_write_allowed = self.index_write_allowed;
-        let historical_reflection_binding = self.historical_reflection_binding.as_ref();
         let experience_retrieval_binding = self.experience_retrieval_binding.as_ref();
-        let domain_binding = self.domain_binding.as_ref();
-        let domain_runtime_error = self.domain_runtime_error.as_deref();
+        let evidence_research_binding = self.evidence_research_binding.as_ref();
         Box::pin(async move {
             debug!(
                 call_id = call.call_id,
@@ -1814,36 +2009,21 @@ impl LoopToolRuntime for ProjectToolRuntime {
             let configured = available_tools.iter().any(|name| name == &call.name);
             let is_index_tool = matches!(
                 call.name.as_str(),
-                tools::index_tools::CREATE_INDEX_NAME
-                    | tools::index_tools::APPEND_INDEX_DETAIL_NAME
-                    | tools::index_tools::FINALIZE_INDEX_NAME
-                    | tools::index_tools::READ_INDEXES_NAME
-                    | tools::index_tools::READ_INDEX_DETAILS_NAME
+                tools::index_tools::READ_INDEXES_NAME | tools::index_tools::READ_INDEX_DETAILS_NAME
             );
-            let is_domain_tool = tools::domain_tools::is_domain_tool(&call.name);
-            let is_historical_terminal =
-                call.name == tools::historical_reflection::FINALIZE_HISTORICAL_REFLECTION_NAME;
             let is_experience_tool = matches!(
                 call.name.as_str(),
                 tools::experience_tools::SEARCH_EXPERIENCES_NAME
                     | tools::experience_tools::READ_EXPERIENCE_CASES_NAME
                     | tools::experience_tools::RECORD_MEMORY_APPLICATION_NAME
             );
-            let index_write_tool = matches!(
-                call.name.as_str(),
-                tools::index_tools::CREATE_INDEX_NAME
-                    | tools::index_tools::APPEND_INDEX_DETAIL_NAME
-                    | tools::index_tools::FINALIZE_INDEX_NAME
-            );
+            let is_evidence_research_tool = call.name == tools::research_evidence_gap::NAME;
             let enabled = call.name == "think"
                 || tools::enabled_tool_names(web_run_config, config.alpaca_market_data)
                     .contains(&call.name.as_str())
-                || (is_index_tool
-                    && index_runtime.is_some()
-                    && (!index_write_tool || index_write_allowed))
-                || (is_domain_tool && domain_binding.is_some())
-                || (is_historical_terminal && historical_reflection_binding.is_some())
-                || (is_experience_tool && experience_retrieval_binding.is_some());
+                || (is_index_tool && index_runtime.is_some())
+                || (is_experience_tool && experience_retrieval_binding.is_some())
+                || (is_evidence_research_tool && evidence_research_binding.is_some());
             if !configured || !enabled {
                 warn!(
                     call_id = call.call_id,
@@ -1857,23 +2037,6 @@ impl LoopToolRuntime for ProjectToolRuntime {
                     output: Value::Null,
                     error: Some("unknown tool name".to_string()),
                 };
-            }
-            if index_write_tool || is_domain_tool || is_historical_terminal {
-                if let Some(limit) = self.max_write_calls {
-                    let previous = self.write_call_count.fetch_add(1, Ordering::AcqRel);
-                    if previous >= limit {
-                        self.write_budget_exhausted.store(true, Ordering::Release);
-                        return ToolResultItem {
-                            call_id: call.call_id,
-                            name: call.name,
-                            status: "error".to_string(),
-                            output: Value::Null,
-                            error: Some(format!(
-                                "ToolManaged write-call budget of {limit} is exhausted"
-                            )),
-                        };
-                    }
-                }
             }
             if call.name == "think" {
                 return ToolResultItem {
@@ -1897,50 +2060,6 @@ impl LoopToolRuntime for ProjectToolRuntime {
                         "Index tools require a migrated FileStore runtime binding"
                     )),
                 };
-                return match output {
-                    Ok(output) => {
-                        if let (Some(binding), Some(context)) =
-                            (domain_binding, turn_context.as_ref())
-                        {
-                            if let Err(error) =
-                                tools::evidence_reads_from_tool_output(&name, &output, context)
-                                    .and_then(|reads| {
-                                        for read in reads {
-                                            binding.record_evidence_read(read)?;
-                                        }
-                                        Ok(())
-                                    })
-                            {
-                                return ToolResultItem {
-                                    call_id,
-                                    name,
-                                    status: "error".to_owned(),
-                                    output: Value::Null,
-                                    error: Some(error.to_string()),
-                                };
-                            }
-                        }
-                        ToolResultItem {
-                            call_id,
-                            name,
-                            status: "completed".to_owned(),
-                            output,
-                            error: None,
-                        }
-                    }
-                    Err(error) => ToolResultItem {
-                        call_id,
-                        name,
-                        status: "error".to_owned(),
-                        output: Value::Null,
-                        error: Some(error.to_string()),
-                    },
-                };
-            }
-            if is_historical_terminal {
-                let output = historical_reflection_binding
-                    .expect("enabled terminal has a binding")
-                    .execute(call.arguments);
                 return match output {
                     Ok(output) => ToolResultItem {
                         call_id,
@@ -1979,14 +2098,16 @@ impl LoopToolRuntime for ProjectToolRuntime {
                     },
                 };
             }
-            if is_domain_tool {
-                let output = match (domain_binding, domain_runtime_error) {
-                    (_, Some(error)) => Err(anyhow::anyhow!(error.to_owned())),
-                    (Some(binding), None) => binding.execute(&name, call.arguments),
-                    (None, None) => Err(anyhow::anyhow!(
-                        "domain tools require a migrated FileStore runtime binding"
-                    )),
-                };
+            if is_evidence_research_tool {
+                let output = evidence_research_binding
+                    .expect("enabled evidence research tool has a binding")
+                    .execute(
+                        call.arguments,
+                        turn_context
+                            .as_ref()
+                            .expect("tool runtime context is set before execution"),
+                    )
+                    .await;
                 return match output {
                     Ok(output) => ToolResultItem {
                         call_id,
@@ -2050,27 +2171,6 @@ impl LoopToolRuntime for ProjectToolRuntime {
             .await
             {
                 Ok(output) => {
-                    if let (Some(binding), Some(context)) = (domain_binding, turn_context.as_ref())
-                    {
-                        if let Err(error) =
-                            tools::evidence_reads_from_tool_output(&name, &output, context)
-                                .and_then(|reads| {
-                                    for read in reads {
-                                        binding.record_evidence_read(read)?;
-                                    }
-                                    Ok(())
-                                })
-                        {
-                            warn!(call_id, tool = name, error = %error, "project evidence read persistence failed");
-                            return ToolResultItem {
-                                call_id,
-                                name,
-                                status: "error".to_string(),
-                                output: Value::Null,
-                                error: Some(error.to_string()),
-                            };
-                        }
-                    }
                     debug!(call_id, tool = name, "project tool completed");
                     ToolResultItem {
                         call_id,
@@ -2140,7 +2240,379 @@ impl LoopToolRuntime for StaticToolRuntime {
 }
 
 #[cfg(test)]
-mod terminal_finalize_tests {
+mod retrieval_policy_tests {
+    use serde_json::json;
+
+    use super::{
+        retrieval_completion_violation, retrieval_policy_violation, RetrievalPolicy,
+        ToolCallRequest, ToolResultItem, TruncationConfig, Turn, TurnItem,
+    };
+
+    fn turn() -> Turn {
+        Turn::new("turn-1", "session-1", "run-1", "risk.neutral", "prompt")
+    }
+
+    fn push_completed(turn: &mut Turn, call: ToolCallRequest, output: serde_json::Value) {
+        turn.emitted_items.push(TurnItem::tool_call(&call));
+        turn.emitted_items.push(TurnItem::tool_result(
+            &ToolResultItem {
+                call_id: call.call_id,
+                name: call.name,
+                status: "completed".to_string(),
+                output,
+                error: None,
+            },
+            &TruncationConfig::default(),
+        ));
+    }
+
+    fn push_failed(turn: &mut Turn, call: ToolCallRequest) {
+        turn.emitted_items.push(TurnItem::tool_call(&call));
+        turn.emitted_items.push(TurnItem::tool_result(
+            &ToolResultItem {
+                call_id: call.call_id,
+                name: call.name,
+                status: "error".to_string(),
+                output: serde_json::Value::Null,
+                error: Some("read failed".to_string()),
+            },
+            &TruncationConfig::default(),
+        ));
+    }
+
+    #[test]
+    fn duplicate_retrieval_is_rejected_before_execution() {
+        let mut turn = turn();
+        let call = ToolCallRequest {
+            call_id: "list-1".to_string(),
+            name: "read_indexes".to_string(),
+            arguments: json!({"source_phase": 3}),
+        };
+        push_completed(&mut turn, call.clone(), json!({"indexes": []}));
+        let duplicate = ToolCallRequest {
+            call_id: "list-2".to_string(),
+            ..call
+        };
+
+        assert!(
+            retrieval_policy_violation(&turn, &duplicate, &RetrievalPolicy::default())
+                .unwrap()
+                .contains("duplicate retrieval")
+        );
+    }
+
+    #[test]
+    fn detail_budget_is_rejected_before_execution() {
+        let mut turn = turn();
+        let first = ToolCallRequest {
+            call_id: "detail-1".to_string(),
+            name: "read_index_details".to_string(),
+            arguments: json!({"index_id": "idx-1"}),
+        };
+        let second = ToolCallRequest {
+            call_id: "detail-2".to_string(),
+            name: "read_index_details".to_string(),
+            arguments: json!({"index_id": "idx-2"}),
+        };
+        push_completed(&mut turn, first, json!({"details": []}));
+        let policy = RetrievalPolicy {
+            maximum_detail_expansions: 1,
+            ..Default::default()
+        };
+
+        assert!(retrieval_policy_violation(&turn, &second, &policy)
+            .unwrap()
+            .contains("budget exceeded"));
+    }
+
+    #[test]
+    fn detail_budget_rejects_the_next_call_at_the_limit() {
+        let mut turn = turn();
+        let first = ToolCallRequest {
+            call_id: "detail-1".to_string(),
+            name: "read_index_details".to_string(),
+            arguments: json!({"index_id": "idx-1"}),
+        };
+        push_completed(&mut turn, first, json!({"details": []}));
+        let next = ToolCallRequest {
+            call_id: "detail-2".to_string(),
+            name: "read_index_details".to_string(),
+            arguments: json!({"index_id": "idx-2"}),
+        };
+        let policy = RetrievalPolicy {
+            maximum_detail_expansions: 1,
+            ..Default::default()
+        };
+        assert!(retrieval_policy_violation(&turn, &next, &policy)
+            .unwrap()
+            .contains("budget exceeded"));
+    }
+
+    #[test]
+    fn batched_detail_calls_allow_only_the_configured_prefix() {
+        let mut turn = turn();
+        let first = ToolCallRequest {
+            call_id: "detail-1".to_string(),
+            name: "read_index_details".to_string(),
+            arguments: json!({"index_id": "idx-1"}),
+        };
+        let second = ToolCallRequest {
+            call_id: "detail-2".to_string(),
+            name: "read_index_details".to_string(),
+            arguments: json!({"index_id": "idx-2"}),
+        };
+        let third = ToolCallRequest {
+            call_id: "detail-3".to_string(),
+            name: "read_index_details".to_string(),
+            arguments: json!({"index_id": "idx-3"}),
+        };
+        let policy = RetrievalPolicy {
+            maximum_detail_expansions: 2,
+            ..Default::default()
+        };
+        assert!(retrieval_policy_violation(&turn, &first, &policy).is_none());
+        push_completed(&mut turn, first, json!({"details": []}));
+        assert!(retrieval_policy_violation(&turn, &second, &policy).is_none());
+        push_completed(&mut turn, second, json!({"details": []}));
+        assert!(retrieval_policy_violation(&turn, &third, &policy)
+            .unwrap()
+            .contains("budget exceeded"));
+    }
+
+    #[test]
+    fn evidence_research_requires_successful_detail_expansion() {
+        let mut turn = turn();
+        push_completed(
+            &mut turn,
+            ToolCallRequest {
+                call_id: "list-1".to_string(),
+                name: "read_indexes".to_string(),
+                arguments: json!({"source_phase": 1}),
+            },
+            json!({"indexes": [{"index_id": "idx-1", "source_phase": 1}]}),
+        );
+        let research = ToolCallRequest {
+            call_id: "research-1".to_string(),
+            name: "research_evidence_gap".to_string(),
+            arguments: json!({}),
+        };
+        assert!(
+            retrieval_policy_violation(&turn, &research, &RetrievalPolicy::default())
+                .unwrap()
+                .contains("read_index_details")
+        );
+
+        push_completed(
+            &mut turn,
+            ToolCallRequest {
+                call_id: "detail-1".to_string(),
+                name: "read_index_details".to_string(),
+                arguments: json!({"index_id": "idx-1"}),
+            },
+            json!({"details": [{"index_id": "idx-1", "source_phase": 1}]}),
+        );
+        assert!(
+            retrieval_policy_violation(&turn, &research, &RetrievalPolicy::default()).is_none()
+        );
+    }
+
+    #[test]
+    fn web_evidence_researcher_has_a_five_query_budget() {
+        let mut turn = Turn::new(
+            "turn-1",
+            "session-1",
+            "run-1",
+            "researcher.web_evidence",
+            "prompt",
+        );
+        let first = ToolCallRequest {
+            call_id: "web-1".to_string(),
+            name: "web.run".to_string(),
+            arguments: json!({
+                "search_query": [{"q":"a"},{"q":"b"},{"q":"c"},{"q":"d"}]
+            }),
+        };
+        assert!(retrieval_policy_violation(&turn, &first, &RetrievalPolicy::default()).is_none());
+        push_completed(&mut turn, first, json!({"status": "supported"}));
+
+        let second = ToolCallRequest {
+            call_id: "web-2".to_string(),
+            name: "web.run".to_string(),
+            arguments: json!({"search_query": [{"q":"e"},{"q":"f"}]}),
+        };
+        assert!(
+            retrieval_policy_violation(&turn, &second, &RetrievalPolicy::default())
+                .unwrap()
+                .contains("maximum 5")
+        );
+    }
+
+    #[test]
+    fn final_response_requires_each_source_phase_and_detail_expansion() {
+        let mut turn = turn();
+        for phase in [3, 4] {
+            let index_id = format!("idx-{phase}");
+            push_completed(
+                &mut turn,
+                ToolCallRequest {
+                    call_id: format!("list-{phase}"),
+                    name: "read_indexes".to_string(),
+                    arguments: json!({"source_phase": phase}),
+                },
+                json!({
+                    "item_count": 1,
+                    "items": [{"index_id": index_id, "source_phase": phase}]
+                }),
+            );
+            push_completed(
+                &mut turn,
+                ToolCallRequest {
+                    call_id: format!("detail-{phase}"),
+                    name: "read_index_details".to_string(),
+                    arguments: json!({"index_id": index_id}),
+                },
+                json!({
+                    "item_count": 1,
+                    "items": [{"detail_id": format!("detail-{phase}")}]
+                }),
+            );
+        }
+        let policy = RetrievalPolicy {
+            mandatory_summary_query: true,
+            required_source_phases: vec![3, 4],
+            required_detail_source_phases: vec![3, 4],
+            minimum_detail_expansions: 2,
+            maximum_detail_expansions: 4,
+            ..Default::default()
+        };
+
+        assert_eq!(retrieval_completion_violation(&turn, &policy), None);
+    }
+
+    #[test]
+    fn retrieval_audit_accepts_current_index_detail_response_shape() {
+        let mut turn = turn();
+        push_completed(
+            &mut turn,
+            ToolCallRequest {
+                call_id: "list-1".to_string(),
+                name: "read_indexes".to_string(),
+                arguments: json!({"kind": "phase_summary"}),
+            },
+            json!({
+                "indexes": [{"index_id": "idx-1", "source_phase": 1}],
+                "next_cursor": null
+            }),
+        );
+        push_completed(
+            &mut turn,
+            ToolCallRequest {
+                call_id: "detail-1".to_string(),
+                name: "read_index_details".to_string(),
+                arguments: json!({"index_id": "idx-1"}),
+            },
+            json!({
+                "index_id": "idx-1",
+                "source_phase": 1,
+                "details": [{"detail_id": "detail-1"}],
+                "next_cursor": null
+            }),
+        );
+        let policy = RetrievalPolicy {
+            mandatory_summary_query: true,
+            required_source_phases: vec![1],
+            required_detail_source_phases: vec![1],
+            minimum_detail_expansions: 1,
+            ..Default::default()
+        };
+
+        assert_eq!(retrieval_completion_violation(&turn, &policy), None);
+    }
+
+    #[test]
+    fn failed_detail_read_does_not_satisfy_completion_policy() {
+        let mut turn = turn();
+        push_completed(
+            &mut turn,
+            ToolCallRequest {
+                call_id: "list-3".to_string(),
+                name: "read_indexes".to_string(),
+                arguments: json!({"source_phase": 3}),
+            },
+            json!({
+                "item_count": 1,
+                "items": [{"index_id": "idx-3", "source_phase": 3}]
+            }),
+        );
+        push_failed(
+            &mut turn,
+            ToolCallRequest {
+                call_id: "detail-3".to_string(),
+                name: "read_index_details".to_string(),
+                arguments: json!({"index_id": "idx-3"}),
+            },
+        );
+        let policy = RetrievalPolicy {
+            mandatory_summary_query: true,
+            required_source_phases: vec![3],
+            required_detail_source_phases: vec![3],
+            minimum_detail_expansions: 1,
+            maximum_detail_expansions: 2,
+            ..Default::default()
+        };
+        assert!(retrieval_completion_violation(&turn, &policy)
+            .unwrap()
+            .contains("at least 1"));
+    }
+
+    #[test]
+    fn fork_parent_retrieval_history_does_not_consume_child_budget() {
+        let mut turn = turn();
+        push_failed(
+            &mut turn,
+            ToolCallRequest {
+                call_id: "parent-list".to_string(),
+                name: "read_indexes".to_string(),
+                arguments: json!({"source_phase": 1}),
+            },
+        );
+        turn.retrieval_scope_start = turn.emitted_items.len();
+        let child_list = ToolCallRequest {
+            call_id: "child-list".to_string(),
+            name: "read_indexes".to_string(),
+            arguments: json!({"source_phase": 1}),
+        };
+        assert!(
+            retrieval_policy_violation(&turn, &child_list, &RetrievalPolicy::default(),).is_none()
+        );
+        push_completed(
+            &mut turn,
+            child_list.clone(),
+            json!({"items": [{"index_id": "idx-1", "source_phase": 1}]}),
+        );
+        push_completed(
+            &mut turn,
+            ToolCallRequest {
+                call_id: "child-detail".to_string(),
+                name: "read_index_details".to_string(),
+                arguments: json!({"index_id": "idx-1"}),
+            },
+            json!({"details": [{"detail_id": "detail-1"}]}),
+        );
+        let policy = RetrievalPolicy {
+            mandatory_summary_query: true,
+            required_source_phases: vec![1],
+            required_detail_source_phases: vec![1],
+            minimum_detail_expansions: 1,
+            maximum_detail_expansions: 1,
+            ..Default::default()
+        };
+        assert_eq!(retrieval_completion_violation(&turn, &policy), None);
+    }
+}
+
+#[cfg(test)]
+mod loop_limit_tests {
     use anyhow::Result;
     use orchestrator_store::{FileStore, FileStoreOptions, RunLocation};
     use serde_json::{json, Value};
@@ -2148,9 +2620,8 @@ mod terminal_finalize_tests {
     use tempfile::tempdir;
 
     use super::{
-        is_terminal_finalize_attempt, is_terminal_tool_result, run_turn, AgentLoopConfig,
-        FileStoreSessionRuntime, LoopModel, ModelInput, ModelResponse, SessionRuntimeSpec,
-        StaticToolRuntime, ToolCallRequest, ToolResultItem, Turn, TurnStatus,
+        run_turn, AgentLoopConfig, FileStoreSessionRuntime, LoopModel, ModelInput, ModelResponse,
+        SessionRuntimeSpec, StaticToolRuntime, ToolCallRequest, ToolResultItem, Turn, TurnStatus,
     };
 
     struct RepeatingToolModel {
@@ -2180,28 +2651,6 @@ mod terminal_finalize_tests {
                 })
             })
         }
-    }
-
-    #[test]
-    fn only_unsuccessful_finalize_calls_consume_the_repair_budget() {
-        let failed = ToolResultItem {
-            call_id: "call-1".to_owned(),
-            name: "finalize_analyst_report".to_owned(),
-            status: "error".to_owned(),
-            output: Value::Null,
-            error: Some("missing evidence".to_owned()),
-        };
-        assert!(is_terminal_finalize_attempt(&failed));
-
-        let succeeded = ToolResultItem {
-            call_id: "call-2".to_owned(),
-            name: "finalize_analyst_report".to_owned(),
-            status: "completed".to_owned(),
-            output: json!({"terminal": true, "artifact": {}}),
-            error: None,
-        };
-        assert!(is_terminal_tool_result(&succeeded));
-        assert!(!is_terminal_finalize_attempt(&succeeded));
     }
 
     #[tokio::test]

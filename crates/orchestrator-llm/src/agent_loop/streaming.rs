@@ -214,11 +214,11 @@ impl<'a, S: AgentEventSink> ModelStreamHandler<'a, S> {
     }
 }
 
-impl<S: AgentEventSink> ModelEventHandler for ModelStreamHandler<'_, S> {
+impl<S: AgentEventSink + Send> ModelEventHandler for ModelStreamHandler<'_, S> {
     fn handle<'a>(
         &'a mut self,
         event: ModelStreamEvent,
-    ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move { self.handle_event(event).await })
     }
 }

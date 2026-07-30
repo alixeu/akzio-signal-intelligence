@@ -1,5 +1,4 @@
 pub mod alpaca;
-pub mod domain_tools;
 pub mod experience_tools;
 pub mod historical_reflection;
 pub mod index_tools;
@@ -7,18 +6,19 @@ pub mod read_jin10_candidates;
 pub mod read_reflection_source;
 pub mod read_technical_detail;
 pub mod read_technical_snapshot;
+pub mod record_phase2_steer;
+pub mod research_evidence_gap;
 pub mod think;
 pub mod verify_event;
 pub mod web_run;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use tracing::{debug, warn};
 
 use crate::agent_loop::ToolRuntimeTurnContext;
-use crate::tools::domain_tools::EvidenceReadRecord;
 pub use crate::web_search::{WebSearchConfig, WebSearchProvider};
 pub use web_run::Runtime as WebRunRuntime;
 
@@ -48,8 +48,8 @@ pub struct ExternalToolConfig {
     #[serde(skip)]
     pub alpaca_api_secret: Option<String>,
     /// Present only for an explicitly migrated FileStore unit.  The typed
-    /// context is Rust-owned and lets read tools access the immutable input
-    /// copies for this run without accepting a model-provided path.
+    /// context is Rust-owned and lets read tools access stable, hash-bound
+    /// input paths without accepting a model-provided path.
     #[serde(skip)]
     pub file_store_input: Option<FileStoreInputSnapshot>,
     /// Rust-owned historical task bootstrap for the migrated Phase 0
@@ -57,12 +57,16 @@ pub struct ExternalToolConfig {
     /// retired database implementation.
     #[serde(skip)]
     pub file_store_reflection_source: Option<Value>,
+    /// Canonical Phase 2 topic/round identity. Models cannot choose or modify
+    /// these fields; the record tool only exposes this Rust-bound value.
+    #[serde(skip)]
+    pub phase2_steer: Option<Value>,
 }
 
-/// Identity of immutable Technical/Jin10 inputs captured for one FileStore
+/// Identity of Technical/Jin10 input hashes captured for one FileStore
 /// run.  This is deliberately not a general filesystem capability: readers
-/// derive every source path from `InputSource` and only read a hash-sealed
-/// run-local copy.
+/// derive every source path from `InputSource` and verify it against the
+/// run-local hash manifest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileStoreInputSnapshot {
     pub store_root: PathBuf,
@@ -96,6 +100,7 @@ impl Default for ExternalToolConfig {
             alpaca_api_secret: None,
             file_store_input: None,
             file_store_reflection_source: None,
+            phase2_steer: None,
         }
     }
 }
@@ -113,239 +118,12 @@ struct ToolEntry {
 
 const REGISTRY: &[ToolEntry] = &[
     ToolEntry {
-        name: domain_tools::SET_ANALYST_ASSESSMENT,
-        definition: || {
-            domain_tools::definition(domain_tools::SET_ANALYST_ASSESSMENT)
-                .expect("registered domain tool")
-        },
-    },
-    ToolEntry {
-        name: domain_tools::APPEND_ANALYST_EVIDENCE,
-        definition: || {
-            domain_tools::definition(domain_tools::APPEND_ANALYST_EVIDENCE)
-                .expect("registered domain tool")
-        },
-    },
-    ToolEntry {
-        name: domain_tools::APPEND_ANALYST_DATA_GAP,
-        definition: || {
-            domain_tools::definition(domain_tools::APPEND_ANALYST_DATA_GAP)
-                .expect("registered domain tool")
-        },
-    },
-    ToolEntry {
-        name: domain_tools::SET_ANALYST_INVALIDATION,
-        definition: || {
-            domain_tools::definition(domain_tools::SET_ANALYST_INVALIDATION)
-                .expect("registered domain tool")
-        },
-    },
-    ToolEntry {
-        name: domain_tools::FINALIZE_ANALYST_REPORT,
-        definition: || {
-            domain_tools::definition(domain_tools::FINALIZE_ANALYST_REPORT)
-                .expect("registered domain tool")
-        },
-    },
-    ToolEntry {
-        name: domain_tools::SET_RESEARCH_DECISION,
-        definition: || {
-            domain_tools::definition(domain_tools::SET_RESEARCH_DECISION)
-                .expect("registered domain tool")
-        },
-    },
-    ToolEntry {
-        name: domain_tools::SET_RESEARCH_SCENARIOS,
-        definition: || {
-            domain_tools::definition(domain_tools::SET_RESEARCH_SCENARIOS)
-                .expect("registered domain tool")
-        },
-    },
-    ToolEntry {
-        name: domain_tools::APPEND_RESEARCH_HINGE,
-        definition: || {
-            domain_tools::definition(domain_tools::APPEND_RESEARCH_HINGE)
-                .expect("registered domain tool")
-        },
-    },
-    ToolEntry {
-        name: domain_tools::FINALIZE_RESEARCH_DECISION,
-        definition: || {
-            domain_tools::definition(domain_tools::FINALIZE_RESEARCH_DECISION)
-                .expect("registered domain tool")
-        },
-    },
-    ToolEntry {
-        name: domain_tools::SET_TRADE_INTENT,
-        definition: || {
-            domain_tools::definition(domain_tools::SET_TRADE_INTENT)
-                .expect("registered domain tool")
-        },
-    },
-    ToolEntry {
-        name: domain_tools::APPEND_TRADE_BLOCKER,
-        definition: || {
-            domain_tools::definition(domain_tools::APPEND_TRADE_BLOCKER)
-                .expect("registered domain tool")
-        },
-    },
-    ToolEntry {
-        name: domain_tools::FINALIZE_TRADE_INTENT,
-        definition: || {
-            domain_tools::definition(domain_tools::FINALIZE_TRADE_INTENT)
-                .expect("registered domain tool")
-        },
-    },
-    ToolEntry {
-        name: domain_tools::SET_RISK_ASSESSMENT,
-        definition: || {
-            domain_tools::definition(domain_tools::SET_RISK_ASSESSMENT)
-                .expect("registered domain tool")
-        },
-    },
-    ToolEntry {
-        name: domain_tools::SET_RISK_CONSTRAINTS,
-        definition: || {
-            domain_tools::definition(domain_tools::SET_RISK_CONSTRAINTS)
-                .expect("registered domain tool")
-        },
-    },
-    ToolEntry {
-        name: domain_tools::FINALIZE_RISK_REVIEW,
-        definition: || {
-            domain_tools::definition(domain_tools::FINALIZE_RISK_REVIEW)
-                .expect("registered domain tool")
-        },
-    },
-    ToolEntry {
-        name: domain_tools::SET_PORTFOLIO_ASSET_DECISION,
-        definition: || {
-            domain_tools::definition(domain_tools::SET_PORTFOLIO_ASSET_DECISION)
-                .expect("registered domain tool")
-        },
-    },
-    ToolEntry {
-        name: domain_tools::APPEND_BINDING_RISK_CONTROL,
-        definition: || {
-            domain_tools::definition(domain_tools::APPEND_BINDING_RISK_CONTROL)
-                .expect("registered domain tool")
-        },
-    },
-    ToolEntry {
-        name: domain_tools::FINALIZE_PORTFOLIO_DECISION,
-        definition: || {
-            domain_tools::definition(domain_tools::FINALIZE_PORTFOLIO_DECISION)
-                .expect("registered domain tool")
-        },
-    },
-    ToolEntry {
-        name: domain_tools::SET_PHASE2_COMMON_GROUND,
-        definition: || {
-            domain_tools::definition(domain_tools::SET_PHASE2_COMMON_GROUND)
-                .expect("registered domain tool")
-        },
-    },
-    ToolEntry {
-        name: domain_tools::CREATE_PHASE2_TOPIC,
-        definition: || {
-            domain_tools::definition(domain_tools::CREATE_PHASE2_TOPIC)
-                .expect("registered domain tool")
-        },
-    },
-    ToolEntry {
-        name: domain_tools::FINALIZE_RESEARCHER_WARMUP,
-        definition: || {
-            domain_tools::definition(domain_tools::FINALIZE_RESEARCHER_WARMUP)
-                .expect("registered domain tool")
-        },
-    },
-    ToolEntry {
-        name: domain_tools::FINALIZE_TOPIC_GENERATION,
-        definition: || {
-            domain_tools::definition(domain_tools::FINALIZE_TOPIC_GENERATION)
-                .expect("registered domain tool")
-        },
-    },
-    ToolEntry {
-        name: domain_tools::CREATE_DEBATE_CLAIM,
-        definition: || {
-            domain_tools::definition(domain_tools::CREATE_DEBATE_CLAIM)
-                .expect("registered domain tool")
-        },
-    },
-    ToolEntry {
-        name: domain_tools::FINALIZE_DEBATE_SEED,
-        definition: || {
-            domain_tools::definition(domain_tools::FINALIZE_DEBATE_SEED)
-                .expect("registered domain tool")
-        },
-    },
-    ToolEntry {
-        name: domain_tools::RESPOND_TO_DEBATE_CLAIM,
-        definition: || {
-            domain_tools::definition(domain_tools::RESPOND_TO_DEBATE_CLAIM)
-                .expect("registered domain tool")
-        },
-    },
-    ToolEntry {
-        name: domain_tools::FINALIZE_DEBATE_RESPONSE,
-        definition: || {
-            domain_tools::definition(domain_tools::FINALIZE_DEBATE_RESPONSE)
-                .expect("registered domain tool")
-        },
-    },
-    ToolEntry {
-        name: domain_tools::SET_CLAIM_STATUS,
-        definition: || {
-            domain_tools::definition(domain_tools::SET_CLAIM_STATUS)
-                .expect("registered domain tool")
-        },
-    },
-    ToolEntry {
-        name: domain_tools::ADD_AGREED_FACT,
-        definition: || {
-            domain_tools::definition(domain_tools::ADD_AGREED_FACT).expect("registered domain tool")
-        },
-    },
-    ToolEntry {
-        name: domain_tools::SET_DECISION_HINGE,
-        definition: || {
-            domain_tools::definition(domain_tools::SET_DECISION_HINGE)
-                .expect("registered domain tool")
-        },
-    },
-    ToolEntry {
-        name: domain_tools::ROUTE_DEBATE_STEER,
-        definition: || {
-            domain_tools::definition(domain_tools::ROUTE_DEBATE_STEER)
-                .expect("registered domain tool")
-        },
-    },
-    ToolEntry {
-        name: domain_tools::SET_TOPIC_SOFT_CONTROL,
-        definition: || {
-            domain_tools::definition(domain_tools::SET_TOPIC_SOFT_CONTROL)
-                .expect("registered domain tool")
-        },
-    },
-    ToolEntry {
-        name: domain_tools::FINALIZE_TOPIC_CONTROL,
-        definition: || {
-            domain_tools::definition(domain_tools::FINALIZE_TOPIC_CONTROL)
-                .expect("registered domain tool")
-        },
-    },
-    ToolEntry {
         name: think::NAME,
         definition: think::definition,
     },
     ToolEntry {
         name: read_reflection_source::NAME,
         definition: read_reflection_source::definition,
-    },
-    ToolEntry {
-        name: historical_reflection::FINALIZE_HISTORICAL_REFLECTION_NAME,
-        definition: historical_reflection::definition,
     },
     ToolEntry {
         name: experience_tools::SEARCH_EXPERIENCES_NAME,
@@ -367,22 +145,6 @@ const REGISTRY: &[ToolEntry] = &[
             experience_tools::definition(experience_tools::RECORD_MEMORY_APPLICATION_NAME)
                 .expect("registered Experience tool")
         },
-    },
-    // FileStore Index tools are discoverable by a migrated ToolManaged
-    // profile, but are deliberately absent from `tool_names()` until the
-    // workflow injects an IndexToolRuntimeContext. Generic tool runtimes must
-    // never fall back to this store.
-    ToolEntry {
-        name: index_tools::CREATE_INDEX_NAME,
-        definition: index_tools::create_index_definition,
-    },
-    ToolEntry {
-        name: index_tools::APPEND_INDEX_DETAIL_NAME,
-        definition: index_tools::append_index_detail_definition,
-    },
-    ToolEntry {
-        name: index_tools::FINALIZE_INDEX_NAME,
-        definition: index_tools::finalize_index_definition,
     },
     ToolEntry {
         name: index_tools::READ_INDEXES_NAME,
@@ -413,6 +175,14 @@ const REGISTRY: &[ToolEntry] = &[
         definition: verify_event::definition,
     },
     ToolEntry {
+        name: record_phase2_steer::NAME,
+        definition: record_phase2_steer::definition,
+    },
+    ToolEntry {
+        name: research_evidence_gap::NAME,
+        definition: research_evidence_gap::definition,
+    },
+    ToolEntry {
         name: alpaca::GET_NEWS_NAME,
         definition: alpaca::get_news_definition,
     },
@@ -427,6 +197,7 @@ pub fn tool_names() -> &'static [&'static str] {
         read_technical_detail::NAME,
         read_jin10_candidates::NAME,
         verify_event::NAME,
+        record_phase2_steer::NAME,
         alpaca::GET_NEWS_NAME,
     ]
 }
@@ -574,200 +345,16 @@ pub async fn execute_named_tool(
         read_technical_detail::NAME => read_technical_detail::execute(args, config),
         read_jin10_candidates::NAME => read_jin10_candidates::execute(args, config),
         verify_event::NAME => verify_event::execute(args, config, web_run).await,
+        record_phase2_steer::NAME => record_phase2_steer::execute(args, config, turn_context),
+        research_evidence_gap::NAME => {
+            bail!("{name} requires an EvidenceResearchBinding and is unavailable without that typed binding")
+        }
         alpaca::GET_NEWS_NAME => alpaca::get_news(args, config).await,
-        index_tools::CREATE_INDEX_NAME
-        | index_tools::APPEND_INDEX_DETAIL_NAME
-        | index_tools::FINALIZE_INDEX_NAME
-        | index_tools::READ_INDEXES_NAME
-        | index_tools::READ_INDEX_DETAILS_NAME => {
+        index_tools::READ_INDEXES_NAME | index_tools::READ_INDEX_DETAILS_NAME => {
             bail!("{name} requires a FileStore IndexToolRuntimeContext and is unavailable without that typed binding")
         }
         other => bail!("unknown tool name: {other}"),
     }
-}
-
-/// Convert only successful, structured read-tool output into evidence
-/// visibility records.  This intentionally never examines assistant text or
-/// tool arguments: a model can cite an ID only after a Rust read tool actually
-/// returned that ID in the same session.
-pub fn evidence_reads_from_tool_output(
-    tool_name: &str,
-    output: &Value,
-    turn: &ToolRuntimeTurnContext,
-) -> Result<Vec<EvidenceReadRecord>> {
-    if !is_evidence_read_tool(tool_name) {
-        return Ok(Vec::new());
-    }
-    let source_phase = turn
-        .phase
-        .and_then(|phase| u8::try_from(phase).ok())
-        .context("evidence read requires a u8 current phase")?;
-    let default_kind = match tool_name {
-        read_technical_snapshot::NAME | read_technical_detail::NAME => "technical_signal",
-        read_jin10_candidates::NAME => "jin10_event",
-        index_tools::READ_INDEXES_NAME => "index",
-        index_tools::READ_INDEX_DETAILS_NAME => "detail",
-        read_reflection_source::NAME => "reflection_source",
-        verify_event::NAME => "verified_event",
-        _ => return Ok(Vec::new()),
-    };
-    let mut records = std::collections::BTreeMap::new();
-    collect_evidence_records(
-        output,
-        default_kind,
-        &turn.run_id,
-        source_phase,
-        None,
-        None,
-        tool_name,
-        turn,
-        &mut records,
-    )?;
-    Ok(records.into_values().collect())
-}
-
-fn is_evidence_read_tool(name: &str) -> bool {
-    matches!(
-        name,
-        read_technical_snapshot::NAME
-            | read_technical_detail::NAME
-            | read_jin10_candidates::NAME
-            | read_reflection_source::NAME
-            | verify_event::NAME
-            | index_tools::READ_INDEXES_NAME
-            | index_tools::READ_INDEX_DETAILS_NAME
-    )
-}
-
-#[allow(clippy::too_many_arguments, clippy::only_used_in_recursion)]
-fn collect_evidence_records(
-    value: &Value,
-    default_kind: &str,
-    inherited_run_id: &str,
-    inherited_phase: u8,
-    inherited_ticker: Option<&str>,
-    inherited_topic_id: Option<&str>,
-    tool_name: &str,
-    turn: &ToolRuntimeTurnContext,
-    records: &mut std::collections::BTreeMap<String, EvidenceReadRecord>,
-) -> Result<()> {
-    match value {
-        Value::Array(values) => {
-            for value in values {
-                collect_evidence_records(
-                    value,
-                    default_kind,
-                    inherited_run_id,
-                    inherited_phase,
-                    inherited_ticker,
-                    inherited_topic_id,
-                    tool_name,
-                    turn,
-                    records,
-                )?;
-            }
-        }
-        Value::Object(object) => {
-            let source_run_id = object
-                .get("source_run_id")
-                .or_else(|| object.get("run_id"))
-                .and_then(Value::as_str)
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or(inherited_run_id);
-            let source_phase = object
-                .get("source_phase")
-                .and_then(Value::as_u64)
-                .map(u8::try_from)
-                .transpose()
-                .context("evidence read source_phase must fit in u8")?
-                .unwrap_or(inherited_phase);
-            let ticker = object
-                .get("ticker")
-                .and_then(Value::as_str)
-                .filter(|value| !value.trim().is_empty())
-                .or(inherited_ticker);
-            let topic_id = object
-                .get("topic_id")
-                .and_then(Value::as_str)
-                .filter(|value| !value.trim().is_empty())
-                .or(inherited_topic_id);
-            for field in [
-                ("signal_id", "technical_signal"),
-                ("event_id", "jin10_event"),
-                ("summary_id", "index"),
-                ("index_id", "index"),
-                ("detail_id", "detail"),
-                ("experience_id", "experience"),
-                ("reflection_id", "reflection_source"),
-            ] {
-                if let Some(subject_id) = object
-                    .get(field.0)
-                    .and_then(Value::as_str)
-                    .filter(|value| !value.trim().is_empty())
-                {
-                    insert_evidence_record(
-                        records,
-                        EvidenceReadRecord {
-                            tool_name: tool_name.to_owned(),
-                            subject_kind: field.1.to_owned(),
-                            subject_id: subject_id.to_owned(),
-                            source_run_id: source_run_id.to_owned(),
-                            source_phase,
-                            ticker: ticker.map(ToOwned::to_owned),
-                            topic_id: topic_id.map(ToOwned::to_owned),
-                            turn_id: turn.turn_id.clone(),
-                            session_id: turn.session_id.clone(),
-                        },
-                    )?;
-                }
-            }
-            // Phase-summary SQL uses generic `id`; FileStore Index/Detail
-            // readers use typed IDs.  Keep this fallback bounded to their
-            // known reader tools rather than recursively accepting arbitrary
-            // JSON as evidence.
-            for nested in object.values() {
-                collect_evidence_records(
-                    nested,
-                    default_kind,
-                    source_run_id,
-                    source_phase,
-                    ticker,
-                    topic_id,
-                    tool_name,
-                    turn,
-                    records,
-                )?;
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-fn insert_evidence_record(
-    records: &mut std::collections::BTreeMap<String, EvidenceReadRecord>,
-    record: EvidenceReadRecord,
-) -> Result<()> {
-    record.validate()?;
-    match records.get(&record.subject_id) {
-        Some(existing)
-            if existing.subject_kind != record.subject_kind
-                || existing.source_run_id != record.source_run_id
-                || existing.source_phase != record.source_phase
-                || existing.ticker != record.ticker
-                || existing.topic_id != record.topic_id =>
-        {
-            bail!(
-                "read tool returned evidence ID `{}` with conflicting provenance",
-                record.subject_id
-            )
-        }
-        Some(_) => {}
-        None => {
-            records.insert(record.subject_id.clone(), record);
-        }
-    }
-    Ok(())
 }
 
 // --- Shared helpers ---
@@ -815,43 +402,6 @@ mod tests {
     use super::*;
     use orchestrator_core::RoleProfileRegistry;
     use std::collections::BTreeSet;
-
-    fn turn() -> ToolRuntimeTurnContext {
-        ToolRuntimeTurnContext {
-            run_id: "current-run".to_owned(),
-            session_id: "session-1".to_owned(),
-            turn_id: "turn-1".to_owned(),
-            role: "mediator.topic".to_owned(),
-            phase: Some(2),
-        }
-    }
-
-    #[test]
-    fn index_detail_reads_inherit_parent_index_provenance() {
-        let records = evidence_reads_from_tool_output(
-            index_tools::READ_INDEX_DETAILS_NAME,
-            &json!({
-                "index_id": "index-1",
-                "source_run_id": "source-run",
-                "source_phase": 1,
-                "ticker": "QQQ",
-                "topic_id": null,
-                "details": [{
-                    "detail_id": "detail-1",
-                    "index_id": "index-1",
-                    "source_run_id": "source-run"
-                }]
-            }),
-            &turn(),
-        )
-        .unwrap();
-        assert_eq!(records.len(), 2);
-        assert!(records.iter().all(|record| {
-            record.source_run_id == "source-run"
-                && record.source_phase == 1
-                && record.ticker.as_deref() == Some("QQQ")
-        }));
-    }
 
     #[test]
     fn every_registered_tool_has_a_profile_owner_or_runtime_only_path() {

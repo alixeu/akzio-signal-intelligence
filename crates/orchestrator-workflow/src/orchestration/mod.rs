@@ -1,6 +1,5 @@
 pub(crate) mod allocation;
 pub(crate) mod config;
-pub(crate) mod domain_runtime;
 pub mod index_runtime;
 pub(crate) mod input_snapshot_runtime;
 pub(crate) mod lifecycle;

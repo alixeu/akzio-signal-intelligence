@@ -1,8 +1,8 @@
 pub mod artifact;
 pub mod authority;
 pub mod config;
-pub mod domain_command;
 pub mod evaluation;
+pub mod id;
 pub mod jin10_csv;
 pub mod memory;
 pub mod paths;
@@ -31,14 +31,6 @@ pub use config::{
     config_bool, config_float, config_get, config_int, config_str, config_strings, deep_merge,
     expand_env_placeholders, load_config, load_project_env,
 };
-pub use domain_command::{
-    AnalystAssessmentCommand, AnalystDataGapCommand, AnalystEvidenceCommand,
-    AnalystInvalidationCommand, BindingRiskControlCommand, ClaimStatusCommand, DebateClaimCommand,
-    DebateResponseCommand, DebateSteerCommand, DomainCommand, Phase2CommonGroundCommand,
-    Phase2TopicCommand, PortfolioAssetDecisionCommand, ResearchDecisionCommand,
-    ResearchHingeCommand, ResearchScenariosCommand, RiskAssessmentCommand, RiskConstraintsCommand,
-    TextCommand, TopicSoftControlCommand, TradeBlockerCommand, TradeIntentCommand,
-};
 pub use evaluation::{
     AdjustmentPolicy, AllocationDecision, AllocationOutcome, BenchmarkBindingV1, BenchmarkOutcome,
     BenchmarkSelectionV1, CorporateActionCapability, DecisionSection,
@@ -57,6 +49,7 @@ pub use evaluation::{
     OUTCOME_RECORD_SCHEMA_VERSION, OUTCOME_REVISION_COMMIT_SCHEMA_VERSION,
     OUTCOME_WRITE_RECEIPT_SCHEMA_VERSION, TECHNICAL_SERIES_PROVENANCE_SCHEMA_VERSION,
 };
+pub use id::md5_3;
 pub use jin10_csv::{
     default_jin10_csv_dir, jin10_csv_path, jin10_item_id, load_jin10_csv, load_jin10_csv_recent,
     load_jin10_csv_recent_from_dir, parse_jin10_csv, read_jin10_csv, render_jin10_csv, Jin10CsvRow,

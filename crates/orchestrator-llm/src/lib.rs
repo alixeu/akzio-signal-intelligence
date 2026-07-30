@@ -1,6 +1,6 @@
 use agent_loop::{
     AgentLoopConfig, AgentLoopModel, ModelEventHandler, ModelStreamEvent, ModelStreamResult,
-    ProjectToolRuntime, RetrievalPolicy, ToolCallRequest, Turn,
+    ProjectToolRuntime, RetrievalPolicy, ToolCallRequest, ToolResultItem, Turn,
 };
 use anyhow::{bail, Context, Result};
 use async_openai::{config::OpenAIConfig, Client as OpenAIClient};
@@ -182,22 +182,16 @@ pub struct AgentSettings {
     /// Optional role-specific round number retained on every debug record.
     pub debug_round: Option<usize>,
     pub tickers: Vec<String>,
-    /// Rust-owned draft/builder contract; assistant prose is never an artifact.
+    /// Rust-owned role identity used to scope reads and Summary compilation.
     pub tool_managed_profile: ToolManagedProfile,
     /// Concrete FileStore authority for this agent session.
     pub session_runtime: agent_loop::FileStoreSessionRuntime,
     /// Present only for an Index/Detail unit.
     pub index_tool_runtime: Option<tools::index_tools::IndexToolRuntimeBinding>,
-    /// Present only for the Phase 0 Historical Reflection terminal.
-    pub historical_reflection_terminal:
-        Option<tools::historical_reflection::HistoricalReflectionTerminalBinding>,
     /// Read-only, Rust-scoped retrieval of historical Experience.
     pub experience_retrieval: Option<tools::experience_tools::ExperienceRetrievalBinding>,
-    /// Present only for a business unit. It is a typed, scoped FileStore service.
-    pub domain_tool_runtime: Option<tools::domain_tools::DomainToolRuntimeBinding>,
-    /// Upper bound for typed Draft/Index write attempts in one agent turn.
-    /// Reads and `think` do not consume this budget.
-    pub max_write_calls: Option<usize>,
+    /// Bounded Phase 2 delegation to the neutral Web evidence researcher.
+    pub evidence_research: Option<tools::research_evidence_gap::EvidenceResearchBinding>,
     pub llm: RoleLlmSettings,
     pub reasoning_effort_override: Option<String>,
     pub tools: Option<tools::ExternalToolConfig>,
@@ -208,20 +202,6 @@ pub struct AgentSettings {
 }
 
 impl AgentSettings {
-    fn validate_tool_managed(&self) -> Result<()> {
-        if let Some(binding) = self.domain_tool_runtime.as_ref() {
-            let profile = self.tool_managed_profile;
-            if binding.scope().profile != profile {
-                bail!(
-                    "DomainToolRuntime profile {} differs from AgentSettings profile {}",
-                    binding.scope().profile.as_str(),
-                    profile.as_str()
-                );
-            }
-        }
-        Ok(())
-    }
-
     fn reasoning_summary_as_enum(
         &self,
     ) -> Option<async_openai::types::responses::ReasoningSummary> {
@@ -294,7 +274,6 @@ pub async fn run_agent_loop_with_metrics(
     prompt: &str,
 ) -> Result<AgentLoopOutput> {
     settings.llm.validate(&settings.role)?;
-    settings.validate_tool_managed()?;
     validate_fallback_web_search_runtime_config(settings)?;
     let session = &settings.session_runtime;
     let session_id = session.manifest().session_id.clone();
@@ -323,18 +302,14 @@ pub async fn run_agent_loop_with_metrics(
             .map(ToString::to_string)
             .collect(),
     );
-    tools = tools.with_max_write_calls(settings.max_write_calls);
     if let Some(binding) = settings.index_tool_runtime.clone() {
         tools = tools.with_index_tool_runtime(binding);
-    }
-    if let Some(binding) = settings.historical_reflection_terminal.clone() {
-        tools = tools.with_historical_reflection_terminal(binding);
     }
     if let Some(binding) = settings.experience_retrieval.clone() {
         tools = tools.with_experience_retrieval(binding);
     }
-    if let Some(binding) = settings.domain_tool_runtime.clone() {
-        tools = tools.with_domain_tool_runtime(binding);
+    if let Some(binding) = settings.evidence_research.clone() {
+        tools = tools.with_evidence_research(binding);
     }
     if let Some(web_run) = web_run_runtime_for_settings(settings) {
         tools = tools.with_web_run_runtime(web_run);
@@ -349,6 +324,9 @@ pub async fn run_agent_loop_with_metrics(
     )
     .await?;
     let terminal_tool_result = turn.terminal_tool_result.clone();
+    if let Some(terminal) = terminal_tool_result.as_ref() {
+        finalize_debug_llm_record(settings, terminal)?;
+    }
     let artifact = completed_turn_artifact(&turn)?;
     Ok(AgentLoopOutput {
         artifact,
@@ -370,7 +348,6 @@ fn agent_loop_config_from_settings(settings: &AgentSettings) -> AgentLoopConfig 
         model: settings.llm.effective_model().to_string(),
         topic_id: settings.topic_id.clone(),
         retrieval_policy: settings.retrieval_policy.clone(),
-        require_terminal_tool: true,
         ..AgentLoopConfig::default()
     }
 }
@@ -389,7 +366,6 @@ pub async fn run_agent_steer_loop_with_metrics(
     input: SteerLoopInput<'_>,
 ) -> Result<AgentLoopOutput> {
     settings.llm.validate(&settings.role)?;
-    settings.validate_tool_managed()?;
     validate_fallback_web_search_runtime_config(settings)?;
     let session = &settings.session_runtime;
     // Scope resume detection to this turn_id. Using run_id-latest history made
@@ -443,6 +419,9 @@ pub async fn run_agent_steer_loop_with_metrics(
             })
             .collect();
     }
+    if is_new_fork {
+        turn.retrieval_scope_start = turn.emitted_items.len();
+    }
     if let Some(fork_input) = fork_input {
         turn.emitted_items
             .push(agent_loop::TurnItem::user(fork_input));
@@ -468,18 +447,14 @@ pub async fn run_agent_steer_loop_with_metrics(
             .map(ToString::to_string)
             .collect(),
     );
-    tools = tools.with_max_write_calls(settings.max_write_calls);
     if let Some(binding) = settings.index_tool_runtime.clone() {
         tools = tools.with_index_tool_runtime(binding);
-    }
-    if let Some(binding) = settings.historical_reflection_terminal.clone() {
-        tools = tools.with_historical_reflection_terminal(binding);
     }
     if let Some(binding) = settings.experience_retrieval.clone() {
         tools = tools.with_experience_retrieval(binding);
     }
-    if let Some(binding) = settings.domain_tool_runtime.clone() {
-        tools = tools.with_domain_tool_runtime(binding);
+    if let Some(binding) = settings.evidence_research.clone() {
+        tools = tools.with_evidence_research(binding);
     }
     if let Some(web_run) = web_run_runtime_for_settings(settings) {
         tools = tools.with_web_run_runtime(web_run);
@@ -494,6 +469,9 @@ pub async fn run_agent_steer_loop_with_metrics(
     )
     .await?;
     let terminal_tool_result = turn.terminal_tool_result.clone();
+    if let Some(terminal) = terminal_tool_result.as_ref() {
+        finalize_debug_llm_record(settings, terminal)?;
+    }
     let artifact = completed_turn_artifact(&turn)?;
     Ok(AgentLoopOutput {
         artifact,
@@ -504,17 +482,48 @@ pub async fn run_agent_steer_loop_with_metrics(
     })
 }
 
-/// Completion is terminal-tool-owned. Assistant prose is never an artifact.
+/// Write-managed roles complete through their terminal tool. Read-only roles
+/// complete with their final Assistant text, which is kept in memory until a
+/// phase-specific Summary commits the canonical Index.
 fn completed_turn_artifact(turn: &Turn) -> Result<Value> {
-    let terminal = turn
-        .terminal_tool_result
-        .as_ref()
-        .context("tool-managed agent loop finished without terminal tool result")?;
-    Ok(terminal
-        .output
-        .get("artifact")
-        .cloned()
-        .unwrap_or(Value::Null))
+    if let Some(terminal) = turn.terminal_tool_result.as_ref() {
+        return Ok(terminal
+            .output
+            .get("artifact")
+            .cloned()
+            .unwrap_or(Value::Null));
+    }
+    let mut response_text = turn
+        .emitted_items
+        .iter()
+        .rev()
+        .find(|item| {
+            item.item_type == agent_loop::TurnItemType::AssistantMessage
+                && item.phase == Some(agent_loop::AgentItemPhase::Final)
+                && !item.content_text.trim().is_empty()
+        })
+        .map(|item| item.content_text.trim().to_owned())
+        .context("read-only agent loop finished without final Assistant text")?;
+    let web_evidence = turn
+        .emitted_items
+        .iter()
+        .filter(|item| {
+            item.item_type == agent_loop::TurnItemType::ToolResult
+                && item.tool_name == tools::research_evidence_gap::NAME
+        })
+        .filter_map(|item| item.content_json.pointer("/result/output").cloned())
+        .collect::<Vec<_>>();
+    if !web_evidence.is_empty() {
+        response_text.push_str("\n\n");
+        response_text.push_str(tools::research_evidence_gap::VERIFIED_PACKET_MARKER);
+        response_text.push('\n');
+        response_text.push_str(&serde_json::to_string_pretty(&web_evidence)?);
+    }
+    Ok(json!({
+        "phase": turn.phase,
+        "role": turn.role,
+        "response_text": response_text,
+    }))
 }
 
 fn select_fork_history(target_history: Vec<Value>, fork_history: Vec<Value>) -> Vec<Value> {
@@ -546,9 +555,13 @@ fn prepare_steer_turn_inputs(
     include_prompt_on_fork: bool,
 ) -> (String, Option<String>, Option<String>) {
     if is_new_fork && include_prompt_on_fork {
+        let task = format!(
+            "这是一个新的子回合。上一条 assistant 输出只是恢复的 checkpoint 上下文，不是本轮答案。\
+             请执行下面的新角色与任务，生成新的回复。\n\n{prompt}"
+        );
         let fork_input = match steer {
-            Some(steer) => format!("{prompt}\n\nSteer: {steer}"),
-            None => prompt.to_string(),
+            Some(steer) => format!("{task}\n\nSteer: {steer}"),
+            None => task,
         };
         return (String::new(), Some(fork_input), None);
     }
@@ -596,6 +609,62 @@ pub fn append_debug_llm_record(settings: &AgentSettings, record: Value) -> Resul
             .or_insert_with(|| json!(settings.debug_round));
     }
     append_debug_output_record(&root, &output_path, &prompt_path.to_string_lossy(), record)
+}
+
+/// Mark the current (and only) debug request as terminal after its terminal
+/// tool has executed. The request itself remains the last model request.
+pub fn finalize_debug_llm_record(
+    settings: &AgentSettings,
+    terminal: &ToolResultItem,
+) -> Result<()> {
+    if !settings.debug {
+        return Ok(());
+    }
+    let root = debug_project_root(settings);
+    let prompt_path = settings.debug_prompt_path.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "debug LLM record for role {:?} requires debug_prompt_path",
+            settings.role
+        )
+    })?;
+    let output_path = settings
+        .debug_output_path
+        .as_deref()
+        .map(validate_debug_output_relative_path)
+        .transpose()?
+        .unwrap_or(debug_record_relative_path_from_prompt(prompt_path)?);
+    let path = root.join(output_path);
+    let prompt_path = prompt_path.to_string_lossy().into_owned();
+
+    with_debug_output_lock(|| {
+        let contents = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read debug LLM record {}", path.display()))?;
+        let mut record: Value = serde_json::from_str(&contents)
+            .with_context(|| format!("debug LLM record {} must be JSON", path.display()))?;
+        if record.get("prompt_path").and_then(Value::as_str) != Some(prompt_path.as_str()) {
+            bail!("debug LLM record prompt path does not match current role");
+        }
+        let object = record
+            .as_object_mut()
+            .context("debug LLM record must be a JSON object")?;
+        object.insert("end_turn".to_owned(), Value::Bool(true));
+        let response = object.entry("resp").or_insert_with(|| json!({}));
+        let response = response
+            .as_object_mut()
+            .context("debug LLM record resp must be a JSON object")?;
+        response.insert("status".to_owned(), json!(terminal.status));
+        response.insert(
+            "terminal".to_owned(),
+            json!({
+                "call_id": terminal.call_id,
+                "name": terminal.name,
+                "status": terminal.status,
+                "error": terminal.error,
+            }),
+        );
+        fs::write(&path, serde_json::to_string_pretty(&record)?)
+            .with_context(|| format!("failed to update debug LLM record {}", path.display()))
+    })
 }
 
 pub fn reset_debug_output_dir(project_root: &std::path::Path) -> Result<()> {
@@ -793,7 +862,7 @@ fn web_run_runtime(config: &WebSearchConfig) -> Option<tools::WebRunRuntime> {
 }
 
 fn web_run_runtime_for_settings(settings: &AgentSettings) -> Option<tools::WebRunRuntime> {
-    if uses_web_run_fallback(settings) {
+    if uses_web_run_fallback(settings) || uses_bounded_event_verification(settings) {
         web_run_runtime(&settings.web_search)
             .map(|runtime| runtime.with_truncation(settings.truncation.clone()))
     } else {
@@ -802,17 +871,35 @@ fn web_run_runtime_for_settings(settings: &AgentSettings) -> Option<tools::WebRu
 }
 
 fn uses_native_web_search(settings: &AgentSettings) -> bool {
-    !role_disables_web_search(&settings.role) && settings.llm.native_web_search
+    settings.llm.native_web_search
+        && settings
+            .llm
+            .tools
+            .iter()
+            .any(|name| name == tools::web_run::NAME)
 }
 
 fn uses_web_run_fallback(settings: &AgentSettings) -> bool {
-    !role_disables_web_search(&settings.role)
+    settings
+        .llm
+        .tools
+        .iter()
+        .any(|name| name == tools::web_run::NAME)
         && !uses_native_web_search(settings)
         && settings.web_search.mode != WebSearchMode::Disabled
 }
 
+fn uses_bounded_event_verification(settings: &AgentSettings) -> bool {
+    settings
+        .llm
+        .tools
+        .iter()
+        .any(|name| name == tools::verify_event::NAME)
+        && settings.web_search.mode != WebSearchMode::Disabled
+}
+
 fn validate_fallback_web_search_runtime_config(settings: &AgentSettings) -> Result<()> {
-    if uses_web_run_fallback(settings) {
+    if uses_web_run_fallback(settings) || uses_bounded_event_verification(settings) {
         validate_web_search_runtime_config(&settings.web_search, &settings.role)
     } else {
         Ok(())
@@ -2166,57 +2253,20 @@ fn configured_tool_names(settings: &AgentSettings) -> Vec<&str> {
                         .tools
                         .as_ref()
                         .is_some_and(|config| config.alpaca_market_data)
+                } else if *name == tools::web_run::NAME {
+                    uses_web_run_fallback(settings)
                 } else {
                     true
                 }
             }),
     );
-    if uses_web_run_fallback(settings) {
-        names.push(tools::web_run::NAME);
-    }
-    if let Some(binding) = &settings.index_tool_runtime {
-        if binding.allows_write() {
-            names.extend([
-                tools::index_tools::CREATE_INDEX_NAME,
-                tools::index_tools::APPEND_INDEX_DETAIL_NAME,
-                tools::index_tools::FINALIZE_INDEX_NAME,
-            ]);
-        }
-        names.extend([
-            tools::index_tools::READ_INDEXES_NAME,
-            tools::index_tools::READ_INDEX_DETAILS_NAME,
-        ]);
-        if !binding.allows_write() {
-            names.retain(|name| {
-                !matches!(
-                    *name,
-                    tools::index_tools::CREATE_INDEX_NAME
-                        | tools::index_tools::APPEND_INDEX_DETAIL_NAME
-                        | tools::index_tools::FINALIZE_INDEX_NAME
-                )
-            });
-        }
-    }
-    if settings.historical_reflection_terminal.is_some() {
-        names.push(tools::historical_reflection::FINALIZE_HISTORICAL_REFLECTION_NAME);
-    }
-    if settings.experience_retrieval.is_some() {
-        names.extend([
-            tools::experience_tools::SEARCH_EXPERIENCES_NAME,
-            tools::experience_tools::READ_EXPERIENCE_CASES_NAME,
-            tools::experience_tools::RECORD_MEMORY_APPLICATION_NAME,
-        ]);
-    }
-    // LLM role configuration can name the same read tool that a typed
-    // runtime injects. The gateway rejects duplicate schemas, so normalize
-    // the final Rust-owned allowlist before it is rendered or registered.
+    // The RoleProfileRegistry allowlist copied into `llm.tools` is the sole
+    // source of model-visible business authority. Typed runtime bindings
+    // independently reject unavailable execution paths, but must never add
+    // names that the profile did not authorize.
     let mut seen = BTreeSet::new();
     names.retain(|name| seen.insert(*name));
     names
-}
-
-fn role_disables_web_search(role: &str) -> bool {
-    role == "trader" || role.starts_with("risk.") || role == "portfolio.manager"
 }
 
 fn validate_tool_name(name: &str) -> Result<()> {
@@ -2275,6 +2325,7 @@ fn default_tool_config() -> tools::ExternalToolConfig {
         alpaca_api_secret: None,
         file_store_input: None,
         file_store_reflection_source: None,
+        phase2_steer: None,
     }
 }
 
@@ -2282,7 +2333,8 @@ fn default_tool_config() -> tools::ExternalToolConfig {
 mod tests {
     use super::{
         agent_loop, is_permanent_llm_error_text, is_transient_llm_error, tools, AgentSettings,
-        LlmRoute, LlmTransport, RoleLlmSettings, ToolManagedProfile, TruncationConfig,
+        LlmRoute, LlmTransport, RoleLlmSettings, ToolManagedProfile, ToolResultItem,
+        TruncationConfig,
     };
     use crate::web_search::{WebSearchConfig, WebSearchMode};
     use anyhow::anyhow;
@@ -2346,10 +2398,8 @@ mod tests {
             tool_managed_profile: ToolManagedProfile::ResearchDecision,
             session_runtime: test_session_runtime(),
             index_tool_runtime: None,
-            historical_reflection_terminal: None,
             experience_retrieval: None,
-            domain_tool_runtime: None,
-            max_write_calls: None,
+            evidence_research: None,
             llm: RoleLlmSettings {
                 route,
                 model: "gpt-5.4".to_string(),
@@ -2400,7 +2450,7 @@ mod tests {
             agent_loop::Turn::new("turn-1", "session-1", "run-1", "manager.research", "");
         turn.terminal_tool_result = Some(agent_loop::ToolResultItem {
             call_id: "finalize-1".to_string(),
-            name: "finalize_research_decision".to_string(),
+            name: "submit_terminal_result".to_string(),
             status: "completed".to_string(),
             output: json!({"terminal": true, "artifact": {"source": "terminal"}}),
             error: None,
@@ -2422,7 +2472,7 @@ mod tests {
         ));
         turn.terminal_tool_result = Some(agent_loop::ToolResultItem {
             call_id: "finalize-1".to_string(),
-            name: "finalize_research_decision".to_string(),
+            name: "submit_terminal_result".to_string(),
             status: "completed".to_string(),
             output: json!({"terminal": true, "artifact": {"source": "terminal"}}),
             error: None,
@@ -2445,6 +2495,34 @@ mod tests {
     }
 
     #[test]
+    fn read_only_completion_attaches_rust_verified_web_evidence() {
+        let mut turn = agent_loop::Turn::new("turn-1", "session-1", "run-1", "mediator.topic", "");
+        turn.emitted_items.push(agent_loop::TurnItem::tool_result(
+            &agent_loop::ToolResultItem {
+                call_id: "research-1".to_owned(),
+                name: tools::research_evidence_gap::NAME.to_owned(),
+                status: "completed".to_owned(),
+                output: json!({
+                    "status": "supported",
+                    "request_id": "web-abcdef",
+                    "evidence": [{"evidence_id":"web-123456"}]
+                }),
+                error: None,
+            },
+            &TruncationConfig::default(),
+        ));
+        let mut final_message = agent_loop::TurnItem::assistant("议题报告", Value::Null);
+        final_message.phase = Some(agent_loop::AgentItemPhase::Final);
+        turn.emitted_items.push(final_message);
+
+        let artifact = super::completed_turn_artifact(&turn).unwrap();
+        let response = artifact["response_text"].as_str().unwrap();
+        assert!(response.contains("议题报告"));
+        assert!(response.contains("Rust-verified Web evidence packets"));
+        assert!(response.contains("web-123456"));
+    }
+
+    #[test]
     fn external_tool_names_are_registered() {
         assert_eq!(
             tools::tool_names(),
@@ -2454,6 +2532,7 @@ mod tests {
                 "read_technical_detail",
                 "read_jin10_candidates",
                 "verify_event",
+                "record_phase2_steer",
                 "alpaca_get_news",
             ]
         );
@@ -2563,6 +2642,7 @@ mod tests {
             alpaca_api_secret: None,
             file_store_input: None,
             file_store_reflection_source: None,
+            phase2_steer: None,
         });
 
         super::append_debug_llm_record(
@@ -2602,6 +2682,59 @@ mod tests {
             .path()
             .join("outputs/debug/phase1/technical.jsonl")
             .exists());
+    }
+
+    #[test]
+    fn finalize_debug_llm_record_updates_the_latest_request_in_place() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut settings = base_settings(LlmRoute::Responses);
+        settings.debug = true;
+        settings.phase = Some(1);
+        settings.role = "analyst.technical".to_string();
+        settings.debug_prompt_path = Some(PathBuf::from("prompts/phase1/technical.md"));
+        settings.tools = Some(tools::ExternalToolConfig {
+            project_root: temp.path().to_path_buf(),
+            run_id: None,
+            phase: None,
+            phase_summary_page_limit: 20,
+            phase_summary_detail_page_limit: 20,
+            tickers: vec!["TQQQ".to_string()],
+            alpaca_market_data: false,
+            alpaca_api_key: None,
+            alpaca_api_secret: None,
+            file_store_input: None,
+            file_store_reflection_source: None,
+            phase2_steer: None,
+        });
+        super::append_debug_llm_record(
+            &settings,
+            json!({
+                "kind": "stream",
+                "end_turn": false,
+                "req": { "messages": [{"role": "user", "content": "last request"}] },
+                "resp": { "status": "in_progress" }
+            }),
+        )
+        .unwrap();
+        super::finalize_debug_llm_record(
+            &settings,
+            &ToolResultItem {
+                call_id: "call-final".to_owned(),
+                name: "submit_terminal_result".to_owned(),
+                status: "completed".to_owned(),
+                output: Value::Null,
+                error: None,
+            },
+        )
+        .unwrap();
+
+        let path = temp.path().join("outputs/debug/phase1/technical.json");
+        let output: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(output["req"]["messages"][0]["content"], "last request");
+        assert_eq!(output["end_turn"], true);
+        assert_eq!(output["resp"]["status"], "completed");
+        assert_eq!(output["resp"]["terminal"]["call_id"], "call-final");
+        assert!(output.get("records").is_none());
     }
 
     #[test]
@@ -2864,6 +2997,7 @@ mod tests {
         settings.llm.base_url = Some("https://llm.example.com/v1".to_string());
         settings.llm.api_key = Some("test-key".to_string());
         settings.llm.native_web_search = true;
+        settings.llm.tools = vec![tools::web_run::NAME.to_string()];
 
         assert_eq!(
             super::additional_params(&settings),
@@ -2888,6 +3022,7 @@ mod tests {
         settings.llm.base_url = Some("https://llm.example.com/v1".to_string());
         settings.llm.api_key = Some("test-key".to_string());
         settings.llm.native_web_search = true;
+        settings.llm.tools = vec![tools::web_run::NAME.to_string()];
         settings.web_search.mode = WebSearchMode::Live;
 
         assert_eq!(
@@ -2910,18 +3045,18 @@ mod tests {
         settings.web_search.mode = WebSearchMode::Live;
         assert_eq!(
             super::configured_tool_names(&settings),
-            vec!["think", "read_technical_snapshot", "web.run"]
+            vec!["think", "read_technical_snapshot"]
         );
 
         settings.llm.think_tool = false;
         assert_eq!(
             super::configured_tool_names(&settings),
-            vec!["read_technical_snapshot", "web.run"]
+            vec!["read_technical_snapshot"]
         );
     }
 
     #[test]
-    fn execution_roles_keep_scoped_tools_but_disable_web_search() {
+    fn web_search_is_never_added_outside_the_profile_allowlist() {
         for role in ["trader", "risk.neutral"] {
             let mut settings = base_settings(LlmRoute::Responses);
             settings.role = role.to_string();
@@ -2942,14 +3077,14 @@ mod tests {
             assert!(super::web_run_runtime_for_settings(&settings).is_none());
         }
 
-        // manager.research is not tool-disabled, so live search enables web.run.
         let mut settings = base_settings(LlmRoute::Responses);
         settings.role = "manager.research".to_string();
         settings.llm.base_url = Some("https://llm.example.com/v1".to_string());
         settings.llm.api_key = Some("test-key".to_string());
         settings.llm.tools = vec![tools::index_tools::READ_INDEXES_NAME.to_string()];
         settings.web_search.mode = WebSearchMode::Live;
-        assert!(super::configured_tool_names(&settings).contains(&tools::web_run::NAME));
+        assert!(!super::configured_tool_names(&settings).contains(&tools::web_run::NAME));
+        assert!(super::web_run_runtime_for_settings(&settings).is_none());
     }
 
     #[test]
@@ -2975,6 +3110,7 @@ mod tests {
         settings.llm.base_url = Some("https://llm.example.com/v1".to_string());
         settings.llm.api_key = Some("test-key".to_string());
         settings.llm.think_tool = false;
+        settings.llm.tools = vec![tools::web_run::NAME.to_string()];
 
         assert!(!super::configured_tool_names(&settings).contains(&tools::web_run::NAME));
 
@@ -2982,7 +3118,7 @@ mod tests {
         assert!(super::configured_tool_names(&settings).contains(&tools::web_run::NAME));
 
         settings.role = "trader".to_string();
-        assert!(!super::configured_tool_names(&settings).contains(&tools::web_run::NAME));
+        assert!(super::configured_tool_names(&settings).contains(&tools::web_run::NAME));
     }
 
     #[test]
@@ -2993,10 +3129,26 @@ mod tests {
         settings.llm.api_key = Some("test-key".to_string());
         settings.llm.think_tool = false;
         settings.llm.native_web_search = true;
+        settings.llm.tools = vec![tools::web_run::NAME.to_string()];
         settings.web_search.mode = WebSearchMode::Live;
 
         assert!(!super::configured_tool_names(&settings).contains(&tools::web_run::NAME));
         assert!(super::web_run_runtime_for_settings(&settings).is_none());
+    }
+
+    #[test]
+    fn verify_event_gets_an_internal_search_runtime_without_exposing_web_run() {
+        let mut settings = base_settings(LlmRoute::Responses);
+        settings.role = "analyst.news_macro".to_string();
+        settings.llm.think_tool = false;
+        settings.llm.tools = vec![tools::verify_event::NAME.to_string()];
+        settings.web_search.mode = WebSearchMode::Live;
+
+        assert_eq!(
+            super::configured_tool_names(&settings),
+            vec![tools::verify_event::NAME]
+        );
+        assert!(super::web_run_runtime_for_settings(&settings).is_some());
     }
 
     #[test]
@@ -3027,7 +3179,10 @@ mod tests {
         assert!(user_input.is_empty());
         assert_eq!(
             fork_input,
-            Some(format!("BULL ROLE PROMPT\n\nSteer: {steer}"))
+            Some(format!(
+                "这是一个新的子回合。上一条 assistant 输出只是恢复的 checkpoint 上下文，不是本轮答案。\
+                 请执行下面的新角色与任务，生成新的回复。\n\nBULL ROLE PROMPT\n\nSteer: {steer}"
+            ))
         );
         assert!(pending_steer.is_none());
     }

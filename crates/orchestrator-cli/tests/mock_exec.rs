@@ -1,4 +1,7 @@
 use orchestrator_cli::exec::{self, ExecArgs, Mode};
+use orchestrator_store::{
+    inspect_store, read_indexes, FileStore, FileStoreOptions, IndexKind, IndexQuery, RunLocation,
+};
 use std::{fs, path::Path};
 
 #[tokio::test]
@@ -6,7 +9,7 @@ async fn mock_exec_writes_file_store_manifest_and_indexes() {
     let temp = tempfile::tempdir().unwrap();
     let store_root = temp.path().join("store");
 
-    let result = exec::run(test_args(temp.path(), store_root.clone(), 3))
+    let result = exec::run(test_args(temp.path(), store_root.clone(), 8))
         .await
         .unwrap();
 
@@ -24,16 +27,48 @@ async fn mock_exec_writes_file_store_manifest_and_indexes() {
     assert!(state["analyst_reports"]["analyst.technical"].is_object());
     assert!(state["analyst_reports"]["analyst.news_macro"].is_object());
     assert_eq!(
-        state["debate_state_artifact"]["final_reducer"]["controllers"]
+        state["debate_state_artifact"]["final_reducer"]["authoritative_fields"]["controllers"]
             .as_object()
             .map(|items| items.len()),
-        Some(1)
+        Some(0)
     );
-    assert!(has_file_named(&store_root.join("runs"), "bull-seed.json"));
-    assert!(has_file_named(
-        &store_root.join("runs"),
-        "bear-response-round-1.json"
-    ));
+    assert_eq!(result["store_compaction"]["eligible"], true);
+    assert_eq!(result["store_compaction"]["applied"], true);
+    assert!(result["store_compaction"]["index_archives"]
+        .as_u64()
+        .is_some_and(|count| count > 0));
+    for removed in ["artifacts", "drafts", "inputs", "memory", "sessions"] {
+        assert!(!has_directory_named(&store_root.join("runs"), removed));
+    }
+    assert!(!has_file_named(&store_root.join("runs"), "state.json"));
+    assert!(!has_file_with_extension(&store_root.join("runs"), "lock"));
+    let store = FileStore::open(&store_root, FileStoreOptions::default()).unwrap();
+    let run = RunLocation::new("2026-06-15", result["run_id"].as_str().expect("run_id")).unwrap();
+    assert!(!read_indexes(
+        &store,
+        Some(&run),
+        &IndexQuery {
+            kind: Some(IndexKind::PhaseSummary),
+            limit: 100,
+            ..Default::default()
+        },
+    )
+    .unwrap()
+    .indexes
+    .is_empty());
+    let doctor = inspect_store(&store);
+    assert!(doctor.issues.is_empty(), "{:#?}", doctor.issues);
+    let run_root = store_root.join(run.relative_root());
+    for path in walk(&run_root).into_iter().filter(|path| path.is_file()) {
+        let relative = path.strip_prefix(&run_root).unwrap();
+        assert!(
+            relative == Path::new("manifest.json")
+                || (relative.starts_with("index")
+                    && relative.extension().is_some_and(|value| value == "json")),
+            "unexpected retained run file: {}",
+            relative.display()
+        );
+    }
 }
 
 #[tokio::test]
@@ -58,7 +93,7 @@ async fn mock_exec_phase7_writes_file_store_allocation() {
         result["portfolio_allocation"]["weights"]["cash_hedge"]["weight"],
         1.0
     );
-    assert!(has_file_named(&store_root.join("runs"), "allocation.json"));
+    assert!(has_phase_index(&store_root, &result, 7));
 
     let state = &result["run_state"];
     assert_eq!(state["phase_status"]["7"], "done");
@@ -83,7 +118,27 @@ async fn mock_exec_phase8_archives_to_file_store() {
 
     assert_eq!(result["run_state"]["phase_status"]["8"], "done");
     assert!(has_file_named(&store_root.join("runs"), "manifest.json"));
-    assert!(has_file_named(&store_root.join("runs"), "allocation.json"));
+    let store = FileStore::open(&store_root, FileStoreOptions::default()).unwrap();
+    let run = RunLocation::new("2026-06-15", result["run_id"].as_str().unwrap()).unwrap();
+    let final_index = read_indexes(
+        &store,
+        Some(&run),
+        &IndexQuery {
+            kind: Some(IndexKind::PhaseSummary),
+            source_phase: Some(8),
+            limit: 10,
+            ..Default::default()
+        },
+    )
+    .unwrap()
+    .indexes
+    .into_iter()
+    .next()
+    .expect("phase 8 final Index");
+    assert_eq!(
+        final_index.authoritative_fields["portfolio_allocation"]["total_equity_exposure"],
+        0.0
+    );
     assert!(
         !has_directory_named(&store_root.join("runs"), "decision"),
         "mock must not publish legacy Decision records"
@@ -92,6 +147,24 @@ async fn mock_exec_phase8_archives_to_file_store() {
         !store_root.join("knowledge/evaluation").exists(),
         "mock must not publish canonical evaluation data"
     );
+}
+
+fn has_phase_index(store_root: &Path, result: &serde_json::Value, phase: u8) -> bool {
+    let store = FileStore::open(store_root, FileStoreOptions::default()).unwrap();
+    let run = RunLocation::new("2026-06-15", result["run_id"].as_str().unwrap()).unwrap();
+    !read_indexes(
+        &store,
+        Some(&run),
+        &IndexQuery {
+            kind: Some(IndexKind::PhaseSummary),
+            source_phase: Some(phase),
+            limit: 10,
+            ..Default::default()
+        },
+    )
+    .unwrap()
+    .indexes
+    .is_empty()
 }
 
 fn test_args(config_root: &Path, store_root: std::path::PathBuf, to_phase: i64) -> ExecArgs {
@@ -204,6 +277,15 @@ fn has_directory_named(root: &Path, name: &str) -> bool {
     walk(root)
         .iter()
         .any(|path| path.is_dir() && path.file_name().is_some_and(|directory| directory == name))
+}
+
+fn has_file_with_extension(root: &Path, extension: &str) -> bool {
+    walk(root).iter().any(|path| {
+        path.is_file()
+            && path
+                .extension()
+                .is_some_and(|candidate| candidate == extension)
+    })
 }
 
 fn walk(root: &Path) -> Vec<std::path::PathBuf> {

@@ -225,6 +225,7 @@ fn infer_role_from_path(path: &Path, prompts_dir: &Path) -> String {
             "bull" | "bear" => format!("researcher.{stem}.initial"),
             "topic_generator" => "mediator.topic".to_string(),
             "topic_controller" => "mediator.topic_controller".to_string(),
+            "web_evidence_researcher" => "researcher.web_evidence".to_string(),
             "warmup" | "seed" => "researcher.bull.initial".to_string(),
             "debate" => "researcher.bull.interaction".to_string(),
             _ => String::new(),

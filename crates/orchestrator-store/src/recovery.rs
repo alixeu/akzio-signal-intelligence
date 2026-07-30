@@ -1,8 +1,5 @@
 use crate::{
-    draft::{
-        draft_relative, draft_unit_relative, read_draft, validate_existing_artifact_ref,
-        write_draft,
-    },
+    draft::{draft_relative, read_draft, validate_existing_artifact_ref, write_draft},
     write_run_manifest, ArtifactDraft, ArtifactScope, DraftLifecycle, FileStore,
     FinalizedArtifactRef, Result, RunLocation, RunManifest, RunManifestInit, StoreError,
 };
@@ -42,33 +39,30 @@ pub fn recover_pending_finalization(
     if !store.exists(&draft_relative)? {
         return Ok(None);
     }
-    let lock_relative = draft_unit_relative(location, scope)?.join("lifecycle.lock");
-    store.with_exclusive_lock(&lock_relative, || {
-        let mut draft = read_draft(store, location, &draft_relative, scope.profile)?;
-        if draft.lifecycle != DraftLifecycle::Draft {
-            return Ok(Some(draft));
-        }
-        let Some(pending) = draft.pending_artifact.clone() else {
-            return Ok(Some(draft));
-        };
-        let artifact_relative = location.child_relative(&pending.relative_path())?;
-        if !store.exists(&artifact_relative)? {
-            return Ok(Some(draft));
-        }
-        validate_existing_artifact_ref(store, &artifact_relative, &pending)?;
-        draft.lifecycle = DraftLifecycle::Completed;
-        draft.pending_artifact = None;
-        draft.finalized_artifact = Some(pending);
-        draft.revision += 1;
-        let updated_at = draft
-            .finalized_artifact
-            .as_ref()
-            .expect("completed draft has artifact")
-            .created_at
-            .clone();
-        draft.updated_at = updated_at;
-        Ok(Some(write_draft(store, location, &draft_relative, draft)?))
-    })
+    let mut draft = read_draft(store, location, &draft_relative, scope.profile)?;
+    if draft.lifecycle != DraftLifecycle::Draft {
+        return Ok(Some(draft));
+    }
+    let Some(pending) = draft.pending_artifact.clone() else {
+        return Ok(Some(draft));
+    };
+    let artifact_relative = location.child_relative(&pending.relative_path())?;
+    if !store.exists(&artifact_relative)? {
+        return Ok(Some(draft));
+    }
+    validate_existing_artifact_ref(store, &artifact_relative, &pending)?;
+    draft.lifecycle = DraftLifecycle::Completed;
+    draft.pending_artifact = None;
+    draft.finalized_artifact = Some(pending);
+    draft.revision += 1;
+    let updated_at = draft
+        .finalized_artifact
+        .as_ref()
+        .expect("completed draft has artifact")
+        .created_at
+        .clone();
+    draft.updated_at = updated_at;
+    Ok(Some(write_draft(store, location, &draft_relative, draft)?))
 }
 
 #[cfg(test)]

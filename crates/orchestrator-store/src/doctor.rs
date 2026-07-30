@@ -22,9 +22,9 @@ use crate::{
     content_hash_bytes, read_indexes, read_jsonl_recover_tail,
     rebuild_manifest_from_finalized_artifacts, validate_content_hash_at, validate_relative_path,
     write_run_manifest, ArtifactDraft, ContentHashDocument, DetailSection, ExperienceEventV1,
-    ExperienceViewV1, FileSchemaKind, FileStore, FinalizedArtifactRef, Index, IndexDetail,
-    IndexKind, IndexQuery, JsonlEvent, ReflectionTaskEventV1, Result, RunLocation, RunManifest,
-    RunManifestInit, SafeSlug, SessionEvent, SessionEventType, StoreError,
+    ExperienceViewV1, FileSchemaKind, FileStore, FinalizedArtifactRef, Index, IndexArchive,
+    IndexDetail, IndexKind, IndexQuery, JsonlEvent, ReflectionTaskEventV1, Result, RunLocation,
+    RunManifest, RunManifestInit, SafeSlug, SessionEvent, SessionEventType, StoreError,
 };
 
 pub const INDEX_CATALOG_SCHEMA_VERSION: u32 = 1;
@@ -331,7 +331,7 @@ fn validate_generic_document(value: &Value, path: &Path) -> Result<()> {
             .and_then(|profile| serde_json::from_value::<crate::ToolManagedProfile>(profile).ok())
             .is_some()
     {
-        crate::domain::DOMAIN_ARTIFACT_SCHEMA_VERSION
+        2
     } else {
         1
     };
@@ -607,42 +607,43 @@ fn terminal_ids_for_run(
                 .is_some_and(|extension| extension == "jsonl")
     }) {
         match read_jsonl_recover_tail::<SessionEvent>(store.root(), relative) {
-            Ok(events) => {
-                for event in events
-                    .into_iter()
-                    .filter(|event| event.event_type == SessionEventType::Terminal)
-                {
-                    // A terminal event persists the complete Rust-owned
-                    // ToolResultItem.  Its canonical result lives under
-                    // output.artifact (domain) or output.index (Index), not
-                    // at the event payload's top level.
-                    for result in [
-                        Some(&event.payload),
-                        event.payload.get("output"),
-                        event
-                            .payload
-                            .get("output")
-                            .and_then(|output| output.get("artifact")),
-                        event
-                            .payload
-                            .get("output")
-                            .and_then(|output| output.get("index")),
-                    ]
-                    .into_iter()
-                    .flatten()
-                    {
-                        for key in ["artifact_id", "index_id"] {
-                            if let Some(value) = result.get(key).and_then(Value::as_str) {
-                                ids.insert(value.to_owned());
-                            }
-                        }
-                    }
-                }
-            }
+            Ok(events) => collect_terminal_ids(events, &mut ids),
             Err(error) => report.issue("malformed_jsonl", relative, error.to_string()),
         }
     }
     ids
+}
+
+fn collect_terminal_ids(
+    events: impl IntoIterator<Item = SessionEvent>,
+    ids: &mut BTreeSet<String>,
+) {
+    for event in events
+        .into_iter()
+        .filter(|event| event.event_type == SessionEventType::Terminal)
+    {
+        for result in [
+            Some(&event.payload),
+            event.payload.get("output"),
+            event
+                .payload
+                .get("output")
+                .and_then(|output| output.get("artifact")),
+            event
+                .payload
+                .get("output")
+                .and_then(|output| output.get("index")),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            for key in ["artifact_id", "index_id"] {
+                if let Some(value) = result.get(key).and_then(Value::as_str) {
+                    ids.insert(value.to_owned());
+                }
+            }
+        }
+    }
 }
 
 fn inspect_indexes(store: &FileStore, files: &[PathBuf], report: &mut StoreDoctorReport) {
@@ -673,9 +674,6 @@ fn inspect_evaluation(store: &FileStore, files: &[PathBuf], report: &mut StoreDo
     let root = Path::new("knowledge/evaluation");
     for relative in files.iter().filter(|path| path.starts_with(root)) {
         let path = relative.as_path();
-        if path.components().any(|part| part.as_os_str() == ".locks") {
-            continue;
-        }
         let typed = if path.components().any(|part| part.as_os_str() == "outcomes") {
             store
                 .read_versioned_json::<OutcomeRecordV1>(path, FileSchemaKind::OutcomeRecord)
@@ -868,11 +866,11 @@ fn inspect_index_base(
         match store.read_versioned_json::<Index>(relative, FileSchemaKind::Index) {
             Ok(index) => {
                 let directory = relative.parent().expect("index path has parent");
-                match SafeSlug::new("index", &index.index_id) {
+                match crate::index_path_component(&index.index_id) {
                     Ok(slug)
                         if directory
                             .file_name()
-                            .is_some_and(|name| name == slug.as_os_str()) => {}
+                            .is_some_and(|name| name == slug.as_str()) => {}
                     Ok(_) => report.issue(
                         "path_identity_mismatch",
                         relative,
@@ -964,6 +962,75 @@ fn inspect_index_base(
         }
     }
     for relative in files.iter().filter(|path| {
+        path.parent() == Some(base)
+            && path.file_name().is_some_and(|name| {
+                let name = name.to_string_lossy();
+                name.starts_with("idx-") || name.starts_with("index-")
+            })
+            && path
+                .extension()
+                .is_some_and(|extension| extension == "json")
+    }) {
+        let archive = match store.read_versioned_json::<IndexArchive>(
+            relative,
+            FileSchemaKind::Artifact("index_archive".to_owned()),
+        ) {
+            Ok(archive) => archive,
+            Err(error) => {
+                report.issue("invalid_index_archive", relative, error.to_string());
+                continue;
+            }
+        };
+        let components = base.components().collect::<Vec<_>>();
+        let location = if components.len() == 4
+            && components[0].as_os_str() == "runs"
+            && components[3].as_os_str() == "index"
+        {
+            RunLocation::new(
+                components[1].as_os_str().to_string_lossy(),
+                archive.index.run_id.clone(),
+            )
+        } else {
+            Err(StoreError::InvalidDocument {
+                kind: "index archive",
+                message: "Index archives are allowed only inside a run".to_owned(),
+            })
+        };
+        let location = match location {
+            Ok(location) if location.relative_root().join("index") == base => location,
+            Ok(_) => {
+                report.issue(
+                    "path_identity_mismatch",
+                    relative,
+                    "archive run identity does not reproduce its Index base",
+                );
+                continue;
+            }
+            Err(error) => {
+                report.issue("invalid_index_archive", relative, error.to_string());
+                continue;
+            }
+        };
+        if let Err(error) = archive.validate_for_location(&location) {
+            report.issue("invalid_index_archive", relative, error.to_string());
+            continue;
+        }
+        match IndexArchive::relative_path(
+            &location,
+            archive.index.source_phase,
+            &archive.index.index_id,
+        ) {
+            Ok(expected) if expected == *relative => {}
+            Ok(_) => report.issue(
+                "path_identity_mismatch",
+                relative,
+                "Index ID does not reproduce archive path",
+            ),
+            Err(error) => report.issue("invalid_index_archive", relative, error.to_string()),
+        }
+        inspect_index_detail_semantics(&archive.index, &archive.details, relative, report);
+    }
+    for relative in files.iter().filter(|path| {
         path.parent()
             .is_some_and(|parent| parent.file_name().is_some_and(|name| name == "details"))
             && path.starts_with(base)
@@ -994,6 +1061,63 @@ fn inspect_index_base(
     }
 }
 
+fn inspect_index_detail_semantics(
+    index: &Index,
+    details: &[IndexDetail],
+    owner: &Path,
+    report: &mut StoreDoctorReport,
+) {
+    if details.len() != index.detail_count {
+        report.issue(
+            "index_detail_count_mismatch",
+            owner,
+            format!(
+                "Index records {} Details, found {}",
+                index.detail_count,
+                details.len()
+            ),
+        );
+    }
+    let sort_orders = details
+        .iter()
+        .map(|detail| detail.sort_order)
+        .collect::<BTreeSet<_>>();
+    if sort_orders.len() != details.len()
+        || sort_orders.iter().copied().collect::<Vec<_>>()
+            != (1..=details.len()).collect::<Vec<_>>()
+    {
+        report.issue(
+            "detail_sort_order_mismatch",
+            owner,
+            "Detail sort_order values must be contiguous and unique",
+        );
+    }
+    if details
+        .iter()
+        .any(|detail| detail.index_id != index.index_id)
+    {
+        report.issue(
+            "orphan_detail",
+            owner,
+            "archived Detail index_id does not match its Index",
+        );
+    }
+    if index.kind == IndexKind::Experience {
+        let historical_runs = details
+            .iter()
+            .filter(|detail| detail.section == DetailSection::HistoricalCase)
+            .map(|detail| detail.source_run_id.as_str())
+            .collect::<Vec<_>>();
+        if historical_runs.iter().collect::<BTreeSet<_>>().len() != historical_runs.len() {
+            report.issue(
+                "experience_duplicate_source_run",
+                owner,
+                "Experience has multiple historical_case Details for one source_run_id",
+            );
+        }
+    }
+}
+
 fn completed_index_dir_exists(store: &FileStore, directory: &Path) -> bool {
     store.root().join(directory).join("index.json").is_file()
         && !directory
@@ -1013,6 +1137,28 @@ fn resolve_source_refs(store: &FileStore, files: &[PathBuf], report: &mut StoreD
                     known.insert(format!("{field}:{id}"));
                 }
             }
+        }
+    }
+    for relative in files.iter().filter(|path| {
+        path.parent()
+            .is_some_and(|parent| parent.file_name().is_some_and(|name| name == "index"))
+            && path.file_name().is_some_and(|name| {
+                let name = name.to_string_lossy();
+                name.starts_with("idx-") || name.starts_with("index-")
+            })
+            && path
+                .extension()
+                .is_some_and(|extension| extension == "json")
+    }) {
+        let Ok(archive) = store.read_versioned_json::<IndexArchive>(
+            relative,
+            FileSchemaKind::Artifact("index_archive".to_owned()),
+        ) else {
+            continue;
+        };
+        known.insert(format!("index_id:{}", archive.index.index_id));
+        for detail in archive.details {
+            known.insert(format!("detail_id:{}", detail.detail_id));
         }
     }
     for relative in files
@@ -1055,6 +1201,44 @@ fn resolve_source_refs(store: &FileStore, files: &[PathBuf], report: &mut StoreD
             }
         }
         let _ = index;
+    }
+    for relative in files.iter().filter(|path| {
+        path.parent()
+            .is_some_and(|parent| parent.file_name().is_some_and(|name| name == "index"))
+            && path.file_name().is_some_and(|name| {
+                let name = name.to_string_lossy();
+                name.starts_with("idx-") || name.starts_with("index-")
+            })
+            && path
+                .extension()
+                .is_some_and(|extension| extension == "json")
+    }) {
+        let Ok(archive) = store.read_versioned_json::<IndexArchive>(
+            relative,
+            FileSchemaKind::Artifact("index_archive".to_owned()),
+        ) else {
+            continue;
+        };
+        for detail in &archive.details {
+            for reference in &detail.source_refs {
+                let Some((kind, id)) = reference.split_once(':') else {
+                    continue;
+                };
+                let supported = match kind {
+                    "artifact" => "artifact_id",
+                    "index" => "index_id",
+                    "detail" => "detail_id",
+                    _ => continue,
+                };
+                if !known.contains(&format!("{supported}:{id}")) {
+                    report.issue(
+                        "unresolved_source_ref",
+                        relative,
+                        format!("source ref `{reference}` cannot be resolved"),
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -1182,25 +1366,27 @@ pub fn rebuild_index_catalog(
             .join("index"),
         IndexKind::Experience => PathBuf::from("knowledge/experience"),
     };
-    let files = collect_files(store.root())?;
     let mut entries = Vec::new();
-    for relative in files.iter().filter(|path| {
-        path.parent()
-            .is_some_and(|parent| parent.parent() == Some(base.as_path()))
-            && path.file_name().is_some_and(|name| name == "index.json")
-    }) {
-        let index: Index = store.read_versioned_json(relative, FileSchemaKind::Index)?;
-        if index.kind == kind {
-            entries.push(IndexCatalogEntry {
-                index_id: index.index_id,
-                source_phase: index.source_phase,
-                role: index.role,
-                ticker: index.ticker,
-                topic_id: index.topic_id,
-                pattern_key: index.pattern_key,
-                detail_count: index.detail_count,
-            });
-        }
+    for index in read_indexes(
+        store,
+        run,
+        &IndexQuery {
+            kind: Some(kind),
+            limit: 100,
+            ..Default::default()
+        },
+    )?
+    .indexes
+    {
+        entries.push(IndexCatalogEntry {
+            index_id: index.index_id,
+            source_phase: index.source_phase,
+            role: index.role,
+            ticker: index.ticker,
+            topic_id: index.topic_id,
+            pattern_key: index.pattern_key,
+            detail_count: index.detail_count,
+        });
     }
     entries.sort_by(|a, b| a.index_id.cmp(&b.index_id));
     let catalog = IndexCatalog {
@@ -1465,7 +1651,7 @@ mod tests {
             &scope,
             Path::new("artifacts/phase1/QQQ.json"),
             TestArtifact {
-                schema_version: crate::domain::DOMAIN_ARTIFACT_SCHEMA_VERSION,
+                schema_version: 2,
                 artifact_id: "artifact-QQQ".to_owned(),
                 phase: 1,
                 role: "analyst.technical".to_owned(),
@@ -1498,7 +1684,7 @@ mod tests {
     fn doctor_accepts_the_current_domain_artifact_schema() {
         let path = Path::new("runs/2026-07-27/run-x/artifacts/phase1/QQQ.json");
         let value = crate::set_content_hash(&serde_json::json!({
-            "schema_version": crate::domain::DOMAIN_ARTIFACT_SCHEMA_VERSION,
+            "schema_version": 2,
             "artifact_id": "artifact-QQQ",
             "profile": "analyst_report"
         }))

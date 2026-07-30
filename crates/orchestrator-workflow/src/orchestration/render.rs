@@ -147,20 +147,25 @@ fn contains_leveraged_etf(tickers: &[String]) -> bool {
 
 fn retrieval_bootstrap(state: &Value, current_phase: i64) -> Value {
     let mut counts = serde_json::Map::new();
+    let mut roles = BTreeSet::new();
     let mut total = 0usize;
-    if let Some(completed) = state.get("phase_compress").and_then(Value::as_object) {
-        for (phase, summary) in completed {
+    if let Some(completed) = state.get("phase_summary_live").and_then(Value::as_object) {
+        for (phase, summaries) in completed {
             let Ok(phase) = phase.parse::<i64>() else {
                 continue;
             };
             if phase >= current_phase {
                 continue;
             }
-            let count = summary
-                .get("index_ids")
-                .and_then(Value::as_array)
-                .map(Vec::len)
-                .unwrap_or_default();
+            let count = summaries.as_array().map(Vec::len).unwrap_or_default();
+            if let Some(summaries) = summaries.as_array() {
+                roles.extend(
+                    summaries
+                        .iter()
+                        .filter_map(|summary| summary.get("role").and_then(Value::as_str))
+                        .map(ToOwned::to_owned),
+                );
+            }
             counts.insert(phase.to_string(), json!(count));
             total += count;
         }
@@ -184,11 +189,11 @@ fn retrieval_bootstrap(state: &Value, current_phase: i64) -> Value {
         "status": if total == 0 { "empty" } else { "available" },
         "item_count": total,
         "source_phase_counts": counts,
-        "source_roles_present": Vec::<String>::new(),
+        "source_roles_present": roles,
         "phase1_completed": state.get("phase1_index").is_some_and(|value| !value.is_null()),
         "direction_or_evidence_conflict_count": conflict_count,
         "source": "file_store_index_metadata",
-        "directly_injected": true,
+        "directly_injected": false,
         "semantic_content_included": false,
         "retrievable_via_tools": true
     })
@@ -1235,6 +1240,29 @@ required_variables = ["ticker", "tickers"]
     }
 
     #[test]
+    fn retrieval_bootstrap_uses_live_phase_summary_metadata() {
+        let bootstrap = retrieval_bootstrap(
+            &json!({
+                "phase_summary_live": {
+                    "1": [{"role": "analyst.technical"}],
+                    "3": [{"role": "manager.research"}],
+                    "6": [{"role": "portfolio.manager"}]
+                }
+            }),
+            6,
+        );
+        assert_eq!(bootstrap["status"], "available");
+        assert_eq!(bootstrap["item_count"], 2);
+        assert_eq!(bootstrap["source_phase_counts"]["1"], 1);
+        assert_eq!(bootstrap["source_phase_counts"]["3"], 1);
+        assert_eq!(bootstrap["directly_injected"], false);
+        assert_eq!(
+            bootstrap["source_roles_present"],
+            json!(["analyst.technical", "manager.research"])
+        );
+    }
+
+    #[test]
     fn context_manifest_records_source_size_and_visibility() {
         let manifest = direct_context_manifest(
             &json!({
@@ -1371,17 +1399,17 @@ required_variables = ["ticker", "tickers"]
     }
 
     #[test]
-    fn shipped_analyst_contract_delegates_shape_to_runtime_validation() {
+    fn shipped_analyst_contract_delegates_shape_to_phase_summary() {
         let contract = std::fs::read_to_string(
             project_prompts_dir().join("common/analyst_output_contract.md"),
         )
         .unwrap();
 
-        assert!(contract.contains("Rust finalizer"));
+        assert!(contract.contains("Phase 1 Summary"));
         assert!(!contract.contains("{analyst_artifact_schema}"));
         assert!(!contract.contains("顶层结构"));
-        assert!(contract.contains("finalize_analyst_report"));
-        assert!(!contract.contains("输出必须是单个 JSON 对象"));
+        assert!(!contract.contains("finalize_analyst_report"));
+        assert!(contract.contains("不要输出 JSON"));
         assert!(!contract.contains("```json"));
     }
 
@@ -1549,12 +1577,6 @@ required_variables = ["ticker", "tickers"]
         let state = golden_mock_state();
         let cases: &[(&str, i64, &str, &str)] = &[
             (
-                "compressor.phase_summary",
-                0,
-                "phase_summary",
-                "phase_summary/phase_summary.md",
-            ),
-            (
                 "mediator.topic",
                 2,
                 "topic_generation",
@@ -1599,6 +1621,12 @@ required_variables = ["ticker", "tickers"]
 
         for (role, phase, kind, relative) in [
             (
+                "compressor.phase_summary",
+                1,
+                "phase_summary",
+                "phase1/summary.md",
+            ),
+            (
                 "researcher.bull.initial",
                 2,
                 "bull_seed",
@@ -1629,12 +1657,11 @@ required_variables = ["ticker", "tickers"]
             );
         }
 
-        let summary =
-            std::fs::read_to_string(prompts.join("phase_summary/phase_summary.md")).unwrap();
-        assert!(summary.contains("create_index(kind=phase_summary)"));
-        assert!(summary.contains("append_index_detail"));
-        assert!(summary.contains("finalize_index"));
-        assert!(summary.contains("source_phase >= 2"));
+        let summary = std::fs::read_to_string(prompts.join("phase1/summary.md")).unwrap();
+        assert!(summary.contains("authoritative_fields"));
+        assert!(summary.contains("details"));
+        assert!(!summary.contains("create_index"));
+        assert!(!summary.contains("finalize_index"));
     }
 
     #[test]
@@ -1795,12 +1822,13 @@ required_variables = ["ticker", "tickers"]
     }
 
     #[test]
-    fn topic_controller_uses_only_canonical_control_fields() {
+    fn topic_controller_preserves_control_fields_in_free_text() {
         let content =
             std::fs::read_to_string(project_prompts_dir().join("phase2/topic_controller.md"))
                 .unwrap();
-        assert!(content.contains("set_claim_status"));
-        assert!(content.contains("route_debate_steer"));
+        assert!(content.contains("claim_ledger"));
+        assert!(content.contains("next_steers"));
+        assert!(content.contains("不要输出 JSON"));
         assert!(!content.contains("blocked_repeats"));
         assert!(!content.contains("next_agenda"));
     }
@@ -1832,11 +1860,11 @@ required_variables = ["ticker", "tickers"]
         let debate = std::fs::read_to_string(prompts.join("phase2/researcher/debate.md")).unwrap();
 
         assert!(warmup.contains("多空双方研究员共用的预热模式"));
-        assert!(warmup.contains("必须真实调用 `read_phase_summaries(source_phase=1)`"));
-        assert!(warmup.contains("1-2 个 summary"));
+        assert!(warmup.contains("`read_indexes(source_phase=1)`"));
+        assert!(warmup.contains("1-2 个 Index"));
         assert!(debate.contains("raw Jin10"));
-        assert!(debate.contains("create_debate_claim"));
-        assert!(debate.contains("respond_to_debate_claim"));
+        assert!(debate.contains("claim ID"));
+        assert!(debate.contains("accept | rebut | downgrade"));
         assert!(debate.contains("next_steers"));
         assert!(debate.contains("blocked_claims"));
         assert!(debate.contains("reply_to_claim_id"));

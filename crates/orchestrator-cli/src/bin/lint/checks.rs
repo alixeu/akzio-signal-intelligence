@@ -248,25 +248,19 @@ pub fn check_anti_injection(
     file_path: &Path,
     content: &str,
     role: &str,
-    config: &Value,
+    _config: &Value,
     issues: &mut Vec<LintIssue>,
 ) {
     if role.is_empty() {
         return;
     }
-    let tools =
-        orchestrator_core::config_get(config, &format!("orchestrator.llm.roles.{role}.tools"))
-            .and_then(Value::as_array);
-    let has_read_context = tools
-        .map(|tools| {
-            tools.iter().any(|value| {
-                matches!(
-                    value.as_str(),
-                    Some("read_phase_summaries" | "read_phase_summary_details")
-                )
-            })
-        })
-        .unwrap_or(false);
+    let has_read_context = orchestrator_core::RoleProfileRegistry::builtin()
+        .registrations()
+        .filter(|registration| registration.role_id == role)
+        .any(|registration| {
+            registration.allows_tool("read_indexes")
+                || registration.allows_tool("read_index_details")
+        });
     if !has_read_context {
         return;
     }

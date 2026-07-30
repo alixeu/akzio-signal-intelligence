@@ -1,8 +1,13 @@
-use orchestrator_core::run_slug;
+use orchestrator_core::{md5_3, run_slug};
 use serde_json::{json, Value};
 
 pub(crate) fn run_id_for(tickers: &[String], date: &str) -> String {
-    format!("{}-{}-exec", run_slug(tickers).to_ascii_lowercase(), date)
+    run_id_for_seed(tickers, date, "exec")
+}
+
+pub(crate) fn run_id_for_seed(tickers: &[String], date: &str, seed: &str) -> String {
+    let prefix = run_slug(tickers).to_ascii_lowercase().replace('_', "-");
+    format!("{prefix}-{}", md5_3(format!("{date}\x1f{seed}")))
 }
 
 pub(crate) fn set_phase_status(state: &mut Value, phase: i64, status: &str) {
@@ -63,13 +68,21 @@ pub(crate) fn research_plan_to_trade_intent(research_plan: &Value) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::run_id_for;
+    use super::{run_id_for, run_id_for_seed};
 
     #[test]
     fn run_id_does_not_depend_on_filesystem_path() {
         assert_eq!(
             run_id_for(&["QQQ".into(), "SOXX".into(), "VIX".into()], "2026-07-10"),
-            "qqq_soxx_vix-2026-07-10-exec"
+            "qqq-soxx-vix-0f6864"
+        );
+        assert_eq!(
+            run_id_for_seed(
+                &["QQQ".into(), "SOXX".into(), "VIX".into()],
+                "2026-07-10",
+                "debug:config"
+            ),
+            "qqq-soxx-vix-1493b0"
         );
     }
 }

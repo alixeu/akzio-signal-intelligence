@@ -5,7 +5,7 @@
 //! agent exactly one [`SummaryUnit`]. This module does not read or write a store.
 
 use anyhow::{bail, ensure, Result};
-use sha2::{Digest, Sha256};
+use orchestrator_core::md5_3;
 
 const INDEX_ID_DOMAIN: &[u8] = b"akzio.phase_summary.index.v1\0";
 
@@ -241,30 +241,29 @@ pub fn derive_summary_index_id(
     unit_key: &str,
     source_payload_hash: &str,
 ) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(INDEX_ID_DOMAIN);
-    hash_field(&mut hasher, run_id.as_bytes());
-    hash_field(&mut hasher, source_phase.to_string().as_bytes());
-    hash_field(&mut hasher, role.as_bytes());
-    hash_optional_field(&mut hasher, ticker);
-    hash_optional_field(&mut hasher, topic_id);
-    hash_field(&mut hasher, unit_key.as_bytes());
-    hash_field(&mut hasher, source_payload_hash.as_bytes());
-    format!("idx-{:x}", hasher.finalize())
+    let mut preimage = INDEX_ID_DOMAIN.to_vec();
+    push_field(&mut preimage, run_id.as_bytes());
+    push_field(&mut preimage, source_phase.to_string().as_bytes());
+    push_field(&mut preimage, role.as_bytes());
+    push_optional_field(&mut preimage, ticker);
+    push_optional_field(&mut preimage, topic_id);
+    push_field(&mut preimage, unit_key.as_bytes());
+    push_field(&mut preimage, source_payload_hash.as_bytes());
+    format!("idx-{}", md5_3(preimage))
 }
 
-fn hash_field(hasher: &mut Sha256, value: &[u8]) {
-    hasher.update((value.len() as u64).to_be_bytes());
-    hasher.update(value);
+fn push_field(output: &mut Vec<u8>, value: &[u8]) {
+    output.extend_from_slice(&(value.len() as u64).to_be_bytes());
+    output.extend_from_slice(value);
 }
 
-fn hash_optional_field(hasher: &mut Sha256, value: Option<&str>) {
+fn push_optional_field(output: &mut Vec<u8>, value: Option<&str>) {
     match value {
         Some(value) => {
-            hasher.update([1]);
-            hash_field(hasher, value.as_bytes());
+            output.push(1);
+            push_field(output, value.as_bytes());
         }
-        None => hasher.update([0]),
+        None => output.push(0),
     }
 }
 
@@ -429,7 +428,9 @@ mod tests {
             ]
         );
         assert!(units.iter().all(|unit| unit.topic_id.is_none()));
-        assert!(units.iter().all(|unit| unit.index_id.starts_with("idx-")));
+        assert!(units
+            .iter()
+            .all(|unit| { unit.index_id.starts_with("idx-") && unit.index_id.len() == 10 }));
     }
 
     #[test]

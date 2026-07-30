@@ -177,18 +177,18 @@ pub enum AgentLoopEvent {
     },
 }
 
-pub trait AgentEventSink {
+pub trait AgentEventSink: Send {
     fn emit<'a>(
         &'a mut self,
         event: AgentLoopEvent,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
 }
 
-pub trait ModelEventHandler {
+pub trait ModelEventHandler: Send {
     fn handle<'a>(
         &'a mut self,
         event: ModelStreamEvent,
-    ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
 }
 
 #[derive(Debug, Default)]
@@ -289,13 +289,22 @@ impl TurnItem {
         } else {
             AgentItemStatus::Failed
         };
-        let content_text = result
-            .output
-            .get("content")
-            .or_else(|| result.output.get("text"))
-            .and_then(Value::as_str)
-            .map(ToString::to_string)
-            .unwrap_or_else(|| result.output.to_string());
+        // A failed tool commonly has `output: null` and puts the actionable
+        // validation error in `error`.  Keep that error in the next model
+        // input: otherwise the model sees only `null`, cannot repair its
+        // Draft, and eventually exhausts its turn budget.
+        let content_text = result.error.as_ref().map_or_else(
+            || {
+                result
+                    .output
+                    .get("content")
+                    .or_else(|| result.output.get("text"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| result.output.to_string())
+            },
+            |error| json!({"error": error}).to_string(),
+        );
         let truncated_text = super::truncate_tool_result(&content_text, truncation);
         // Keep content_json lean. Storing the raw tool payload here previously
         // re-inflated truncated content_text when model_prompt serialized both.
@@ -372,6 +381,10 @@ pub struct Turn {
     pub model_context: String,
     pub pending_input: VecDeque<String>,
     pub emitted_items: Vec<TurnItem>,
+    /// First item belonging to this turn's retrieval budget. Forked turns
+    /// retain parent items for model context, but parent retrieval calls must
+    /// not consume the child turn's duplicate or detail budget.
+    pub retrieval_scope_start: usize,
     pub pending_tool_calls: Vec<ToolCallRequest>,
     pub cancellation_state: String,
     pub needs_follow_up: bool,
@@ -402,6 +415,7 @@ impl Turn {
             model_context: String::new(),
             pending_input: VecDeque::new(),
             emitted_items: Vec::new(),
+            retrieval_scope_start: 0,
             pending_tool_calls: Vec::new(),
             cancellation_state: "none".to_string(),
             needs_follow_up: false,
@@ -541,8 +555,8 @@ pub trait LoopModel: Send {
     fn stream_events<'a>(
         &'a mut self,
         input: ModelInput,
-        handler: &'a mut dyn ModelEventHandler,
-    ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
+        handler: &'a mut (dyn ModelEventHandler + Send),
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
             let response = self.generate(input).await?;
             for event in response_to_stream_events(response)? {
@@ -608,6 +622,33 @@ pub trait LoopToolRuntime: Send + Sync {
         &'a self,
         call: ToolCallRequest,
     ) -> Pin<Box<dyn Future<Output = ToolResultItem> + Send + 'a>>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_tool_result_keeps_the_actionable_error_in_history() {
+        let item = TurnItem::tool_result(
+            &ToolResultItem {
+                call_id: "call-1".to_owned(),
+                name: "submit_terminal_result".to_owned(),
+                status: "error".to_owned(),
+                output: Value::Null,
+                error: Some("key_evidence must contain at least one source-backed item".to_owned()),
+            },
+            &TruncationConfig::default(),
+        );
+
+        assert!(item.content_text.contains("key_evidence"));
+        assert_eq!(
+            item.content_json
+                .pointer("/result/error")
+                .and_then(Value::as_str),
+            Some("key_evidence must contain at least one source-backed item")
+        );
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -133,9 +133,7 @@ impl EvaluationStore {
     /// scan as a valid materialization input.
     pub fn list_decisions(&self, location: &RunLocation) -> Result<Vec<DecisionSnapshotV2>> {
         let directory = match &self.context.namespace {
-            PersistenceNamespace::Canonical => {
-                location.child_relative(Path::new("learning/v2/decisions"))?
-            }
+            PersistenceNamespace::Canonical => PathBuf::from(CANONICAL_ROOT).join("decisions"),
             _ => {
                 return Err(invalid(
                     "evaluation reader",
@@ -168,6 +166,9 @@ impl EvaluationStore {
                 &relative,
                 FileSchemaKind::DecisionSnapshot,
             )?;
+            if decision.source_run_id != location.run_id {
+                continue;
+            }
             validate_decision(&decision, location)?;
             decisions.push(decision);
         }
@@ -176,8 +177,7 @@ impl EvaluationStore {
     }
 
     /// Publish or reuse one global canonical Outcome and write only a receipt
-    /// beneath the evaluation run.  The evaluation-key lock serializes head
-    /// transitions; the outcome-id lock enforces cross-run create-if-absent.
+    /// beneath the evaluation run.
     pub fn publish_outcome(
         &self,
         evaluation_run: &RunLocation,
@@ -186,77 +186,71 @@ impl EvaluationStore {
     ) -> Result<OutcomeWriteReceiptV1> {
         self.require_outcome_write()?;
         validate_outcome(&outcome)?;
-        let evaluation_lock = self.lock_relative("evaluation-keys", &outcome.evaluation_key)?;
-        self.store.with_exclusive_lock(&evaluation_lock, || {
-            let mut head = self.read_or_rebuild_head(&outcome.evaluation_key)?;
-            let previous = head.current_outcome_id.clone();
-            let outcome_lock = self.lock_relative("outcomes", &outcome.outcome_id)?;
-            self.store.with_exclusive_lock(&outcome_lock, || {
-                // Always validate the immutable record before accepting an
-                // idempotent receipt.  An already-current ID with different
-                // bytes is a provenance violation, not a duplicate.
-                let outcome_relative = self.outcome_relative(&outcome.outcome_id)?;
-                let (sealed_outcome, existed) = create_or_validate(
-                    &self.store,
-                    &outcome_relative,
-                    FileSchemaKind::OutcomeRecord,
-                    outcome.clone(),
-                )?;
-                if previous.as_deref() == Some(outcome.outcome_id.as_str()) {
-                    return self.write_receipt(
-                        evaluation_run,
-                        &sealed_outcome,
-                        OutcomeWriteResultKind::AlreadyCurrent,
-                        None,
-                    );
-                }
-                if outcome.supersedes_outcome_id != previous {
-                    return Err(invalid(
-                        "outcome record",
-                        "supersedes_outcome_id must equal the current outcome head",
-                    ));
-                }
-                let sequence = head.as_of_revision.saturating_add(1);
-                let commit = new_publish_commit(
-                    &outcome,
-                    sequence,
-                    optional_hash(&head.content_hash),
-                    revision_reason.clone(),
-                )?;
-                let commit_relative =
-                    self.revision_relative(&outcome.evaluation_key, sequence, &commit.commit_id)?;
-                let (sealed_commit, _) = create_or_validate(
-                    &self.store,
-                    &commit_relative,
-                    FileSchemaKind::OutcomeRevisionCommit,
-                    commit,
-                )?;
-                apply_commit(&mut head, &sealed_commit)?;
-                head.revision_set_hash = revision_set_hash(&head)?;
-                let head_relative = self.head_relative(&outcome.evaluation_key)?;
-                let sealed_head = self.store.write_authoritative_json(&head_relative, head)?;
-                let receipt_result = if existed || previous.is_some() {
-                    OutcomeWriteResultKind::PublishedRevision
-                } else {
-                    OutcomeWriteResultKind::Created
-                };
-                self.write_receipt(
-                    evaluation_run,
-                    &sealed_outcome,
-                    receipt_result,
-                    Some(document_ref(
-                        &sealed_commit.commit_id,
-                        &commit_relative,
-                        &sealed_commit.content_hash,
-                    )),
-                )
-                .inspect(|_receipt| {
-                    debug_assert_eq!(
-                        sealed_head.current_outcome_id.as_deref(),
-                        Some(outcome.outcome_id.as_str())
-                    );
-                })
-            })
+        let mut head = self.read_or_rebuild_head(&outcome.evaluation_key)?;
+        let previous = head.current_outcome_id.clone();
+        // Always validate the immutable record before accepting an
+        // idempotent receipt.  An already-current ID with different
+        // bytes is a provenance violation, not a duplicate.
+        let outcome_relative = self.outcome_relative(&outcome.outcome_id)?;
+        let (sealed_outcome, existed) = create_or_validate(
+            &self.store,
+            &outcome_relative,
+            FileSchemaKind::OutcomeRecord,
+            outcome.clone(),
+        )?;
+        if previous.as_deref() == Some(outcome.outcome_id.as_str()) {
+            return self.write_receipt(
+                evaluation_run,
+                &sealed_outcome,
+                OutcomeWriteResultKind::AlreadyCurrent,
+                None,
+            );
+        }
+        if outcome.supersedes_outcome_id != previous {
+            return Err(invalid(
+                "outcome record",
+                "supersedes_outcome_id must equal the current outcome head",
+            ));
+        }
+        let sequence = head.as_of_revision.saturating_add(1);
+        let commit = new_publish_commit(
+            &outcome,
+            sequence,
+            optional_hash(&head.content_hash),
+            revision_reason.clone(),
+        )?;
+        let commit_relative =
+            self.revision_relative(&outcome.evaluation_key, sequence, &commit.commit_id)?;
+        let (sealed_commit, _) = create_or_validate(
+            &self.store,
+            &commit_relative,
+            FileSchemaKind::OutcomeRevisionCommit,
+            commit,
+        )?;
+        apply_commit(&mut head, &sealed_commit)?;
+        head.revision_set_hash = revision_set_hash(&head)?;
+        let head_relative = self.head_relative(&outcome.evaluation_key)?;
+        let sealed_head = self.store.write_authoritative_json(&head_relative, head)?;
+        let receipt_result = if existed || previous.is_some() {
+            OutcomeWriteResultKind::PublishedRevision
+        } else {
+            OutcomeWriteResultKind::Created
+        };
+        self.write_receipt(
+            evaluation_run,
+            &sealed_outcome,
+            receipt_result,
+            Some(document_ref(
+                &sealed_commit.commit_id,
+                &commit_relative,
+                &sealed_commit.content_hash,
+            )),
+        )
+        .inspect(|_receipt| {
+            debug_assert_eq!(
+                sealed_head.current_outcome_id.as_deref(),
+                Some(outcome.outcome_id.as_str())
+            );
         })
     }
 
@@ -661,12 +655,12 @@ impl EvaluationStore {
         self.require_decision_write()
     }
 
-    fn decision_relative(&self, location: &RunLocation, decision_id: &str) -> Result<PathBuf> {
+    fn decision_relative(&self, _location: &RunLocation, decision_id: &str) -> Result<PathBuf> {
         let filename = format!("{}.json", SafeSlug::new("decision", decision_id)?.as_str());
         match &self.context.namespace {
-            PersistenceNamespace::Canonical => {
-                location.child_relative(Path::new("learning/v2/decisions").join(filename).as_path())
-            }
+            PersistenceNamespace::Canonical => Ok(PathBuf::from(CANONICAL_ROOT)
+                .join("decisions")
+                .join(filename)),
             PersistenceNamespace::Debug { invocation_id } => namespace_relative(
                 "debug",
                 invocation_id,
@@ -839,17 +833,6 @@ impl EvaluationStore {
             .join(format!(
                 "{}.json",
                 SafeSlug::new("eval", evaluation_key)?.as_str()
-            )))
-    }
-
-    fn lock_relative(&self, kind: &str, identity: &str) -> Result<PathBuf> {
-        Ok(self
-            .evaluation_root()?
-            .join(".locks")
-            .join(kind)
-            .join(format!(
-                "{}.lock",
-                SafeSlug::new("lock", identity)?.as_str()
             )))
     }
 }

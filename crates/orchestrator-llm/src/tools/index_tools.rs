@@ -1,9 +1,7 @@
-//! Domain-only Index/Detail tool contracts for tool-managed agents.
+//! Read-only Index/Detail tools for business roles.
 //!
-//! These tools deliberately produce typed commands rather than accepting a
-//! store path, arbitrary JSON mutation, or a model-chosen ownership field.
-//! The FileStore runtime supplies [`IndexToolRuntimeContext`] from a planned
-//! unit and executes the resulting command against its Index/Detail service.
+//! Models may list completed Indexes and expand their Details. Rust owns every
+//! write after compiling a phase-specific Summary response.
 
 use std::{
     collections::BTreeSet,
@@ -20,46 +18,10 @@ use serde_json::{json, Map, Value};
 use super::{api_tool_name, ToolDefinition};
 use crate::agent_loop::ToolRuntimeTurnContext;
 
-pub const CREATE_INDEX_NAME: &str = ToolId::CreateIndex.as_str();
-pub const APPEND_INDEX_DETAIL_NAME: &str = ToolId::AppendIndexDetail.as_str();
-pub const FINALIZE_INDEX_NAME: &str = ToolId::FinalizeIndex.as_str();
 pub const READ_INDEXES_NAME: &str = ToolId::ReadIndexes.as_str();
 pub const READ_INDEX_DETAILS_NAME: &str = ToolId::ReadIndexDetails.as_str();
 
-const MODEL_OWNED_FIELD_NAMES: &[&str] = &[
-    "store_root",
-    "path",
-    "source_path",
-    "run_id",
-    "source_run_id",
-    "phase",
-    "source_phase",
-    "role",
-    "kind",
-    "index_id",
-    "detail_id",
-    "created_at",
-    "schema_version",
-    "content_hash",
-    "unit_key",
-    "source_payload_hash",
-    "session_id",
-    "turn_id",
-    "profile",
-    "profile_version",
-    "builder_version",
-    "round",
-    "side",
-    "stance",
-    "reflection_task",
-    "candidate_action",
-    "artifact_id",
-    "ticker",
-    "topic_id",
-];
-
-/// Immutable fields determined by the Rust Summary Unit planner or the
-/// historical-reflection task. None may be supplied by the model.
+/// Immutable identity supplied by the Rust unit planner.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct IndexOwnedScope {
     pub run_id: String,
@@ -71,11 +33,7 @@ pub struct IndexOwnedScope {
     pub topic_id: Option<String>,
     pub unit_key: String,
     pub source_payload_hash: String,
-    /// Rust-selected source facts copied into the finalized Index header.
-    /// Model tool arguments can never replace this provenance.
     pub authoritative_fields: Map<String, Value>,
-    /// The deterministic Index id assigned by Rust for this one Summary Unit,
-    /// or by the Experience key rule. It is intentionally not a tool argument.
     pub index_id: String,
 }
 
@@ -87,19 +45,16 @@ impl IndexOwnedScope {
             || self.source_payload_hash.trim().is_empty()
             || self.index_id.trim().is_empty()
         {
-            bail!(
-                "Index tool scope requires Rust-owned run, role, unit, source hash, and index id"
-            );
+            bail!("Index scope requires Rust-owned run, role, unit, source hash, and index id");
         }
         if self.source_phase > 8 {
-            bail!("Index tool scope source_phase must be in 0..=8");
+            bail!("Index scope source_phase must be in 0..=8");
         }
         Ok(())
     }
 }
 
-/// Read-only visibility calculated by Rust. Set membership is the complete
-/// authority boundary for model-selected filters and evidence references.
+/// Complete visibility boundary for model-selected read filters.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IndexReadVisibility {
     pub kinds: BTreeSet<IndexKind>,
@@ -119,28 +74,14 @@ impl IndexReadVisibility {
         self.max_page_size = page_size.clamp(1, 100);
         self
     }
-
-    fn allowed_source_refs(&self) -> BTreeSet<String> {
-        self.source_refs
-            .union(&self.evidence_ids)
-            .cloned()
-            .collect()
-    }
 }
 
-/// Runtime context is initialized by Rust from an active session/turn plus a
-/// planned Index Unit. The model cannot construct it or change its fields.
 #[derive(Debug)]
 pub struct IndexToolRuntimeContext {
     turn: ToolRuntimeTurnContext,
     owned: IndexOwnedScope,
     visibility: IndexReadVisibility,
     visible_index_ids: Mutex<BTreeSet<String>>,
-    /// Phase summaries have an index ID planned before the model starts.
-    /// Experiences are different: the model supplies the reusable
-    /// `pattern_key`, while Rust derives the ID from it.  Keep the resolved
-    /// scope in the runtime rather than accepting an ID from the model.
-    resolved_write_scope: Mutex<Option<IndexOwnedScope>>,
 }
 
 impl IndexToolRuntimeContext {
@@ -149,32 +90,18 @@ impl IndexToolRuntimeContext {
         owned: IndexOwnedScope,
         visibility: IndexReadVisibility,
     ) -> Result<Self> {
-        Self::new_with_writer_role(turn, owned, visibility, None)
-    }
-
-    /// The writer may be a Rust-owned summary compressor while `owned.role`
-    /// remains the source role represented by the Index. This is deliberately
-    /// an explicit binding parameter, never a model argument.
-    pub fn new_with_writer_role(
-        turn: ToolRuntimeTurnContext,
-        owned: IndexOwnedScope,
-        visibility: IndexReadVisibility,
-        writer_role: Option<&str>,
-    ) -> Result<Self> {
         owned.validate()?;
-        let expected_writer_role = writer_role.unwrap_or(&owned.role);
-        if turn.run_id != owned.run_id || turn.role != expected_writer_role {
-            bail!("Index tool turn context does not match the Rust-owned unit scope");
+        if turn.run_id != owned.run_id || turn.role != owned.role {
+            bail!("Index read context does not match the Rust-owned unit scope");
         }
         if turn.phase.is_none() {
-            bail!("Index tool runtime context requires the current execution phase");
+            bail!("Index read context requires the current execution phase");
         }
         Ok(Self {
             turn,
             owned,
             visibility,
             visible_index_ids: Mutex::new(BTreeSet::new()),
-            resolved_write_scope: Mutex::new(None),
         })
     }
 
@@ -186,8 +113,6 @@ impl IndexToolRuntimeContext {
         &self.turn
     }
 
-    /// Called only after the unified read service returns completed Indexes.
-    /// `read_index_details` accepts IDs from this list, never arbitrary IDs.
     pub fn record_visible_indexes(
         &self,
         index_ids: impl IntoIterator<Item = String>,
@@ -216,66 +141,9 @@ impl IndexToolRuntimeContext {
             (Some(_), _) => bail!("index_id is not visible in this turn"),
             (None, 1) => Ok(known.iter().next().expect("single entry").clone()),
             (None, 0) => bail!("read_index_details requires a preceding read_indexes result"),
-            (None, _) => bail!("index_id is required when multiple visible Indexes are available"),
+            (None, _) => bail!("index_id is required when multiple Indexes are visible"),
         }
     }
-
-    fn scope_for_create(&self, pattern_key: Option<&str>) -> Result<IndexOwnedScope> {
-        let mut scope = self.owned.clone();
-        if scope.kind == IndexKind::Experience {
-            let pattern_key = pattern_key.context("experience Indexes require pattern_key")?;
-            scope.index_id = orchestrator_store::deterministic_experience_index_id(
-                pattern_key,
-                scope.ticker.as_deref(),
-                scope.source_phase,
-            )?;
-        }
-        let mut resolved = self
-            .resolved_write_scope
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Index write scope lock poisoned"))?;
-        if let Some(existing) = resolved.as_ref() {
-            if existing != &scope {
-                bail!("create_index cannot change the already resolved Index identity")
-            }
-        } else {
-            *resolved = Some(scope.clone());
-        }
-        Ok(scope)
-    }
-
-    fn scope_for_followup(&self) -> Result<IndexOwnedScope> {
-        if self.owned.kind == IndexKind::PhaseSummary {
-            return Ok(self.owned.clone());
-        }
-        self.resolved_write_scope
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Index write scope lock poisoned"))?
-            .clone()
-            .context("experience append/finalize requires create_index in this turn")
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct CreateIndexCommand {
-    pub scope: IndexOwnedScope,
-    pub summary: String,
-    pub confidence: f64,
-    pub pattern_key: Option<String>,
-    pub applies_to_phases: Vec<u8>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct AppendIndexDetailCommand {
-    pub scope: IndexOwnedScope,
-    pub section: DetailSection,
-    pub detail: String,
-    pub source_refs: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct FinalizeIndexCommand {
-    pub scope: IndexOwnedScope,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
@@ -299,22 +167,13 @@ pub struct ReadIndexDetailsCommand {
     pub cursor: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum IndexToolCommand {
-    Create(CreateIndexCommand),
-    Append(AppendIndexDetailCommand),
-    Finalize(FinalizeIndexCommand),
     ReadIndexes(ReadIndexesCommand),
     ReadDetails(ReadIndexDetailsCommand),
 }
 
-/// The only execution seam permitted for the five Index domain tools. A
-/// FileStore adapter owns persistence; this trait intentionally has no method
-/// for raw file, SQL, path, or arbitrary JSON writes.
 pub trait IndexToolService: Send + Sync {
-    fn create_index(&self, command: CreateIndexCommand) -> Result<Value>;
-    fn append_index_detail(&self, command: AppendIndexDetailCommand) -> Result<Value>;
-    fn finalize_index(&self, command: FinalizeIndexCommand) -> Result<Value>;
     fn read_indexes(&self, command: ReadIndexesCommand) -> Result<IndexReadPage>;
     fn read_index_details(&self, command: ReadIndexDetailsCommand) -> Result<Value>;
 }
@@ -323,18 +182,6 @@ impl<T> IndexToolService for Arc<T>
 where
     T: IndexToolService + ?Sized,
 {
-    fn create_index(&self, command: CreateIndexCommand) -> Result<Value> {
-        (**self).create_index(command)
-    }
-
-    fn append_index_detail(&self, command: AppendIndexDetailCommand) -> Result<Value> {
-        (**self).append_index_detail(command)
-    }
-
-    fn finalize_index(&self, command: FinalizeIndexCommand) -> Result<Value> {
-        (**self).finalize_index(command)
-    }
-
     fn read_indexes(&self, command: ReadIndexesCommand) -> Result<IndexReadPage> {
         (**self).read_indexes(command)
     }
@@ -344,16 +191,11 @@ where
     }
 }
 
-/// Immutable wiring supplied by the workflow for one migrated agent unit.
-/// It is deliberately a typed domain seam: callers can provide an Index
-/// service, but never a generic file/SQL/path mutation callback.
 #[derive(Clone)]
 pub struct IndexToolRuntimeBinding {
     owned: IndexOwnedScope,
     visibility: IndexReadVisibility,
     service: Arc<dyn IndexToolService>,
-    writer_role: Option<String>,
-    allow_write: bool,
 }
 
 impl fmt::Debug for IndexToolRuntimeBinding {
@@ -378,33 +220,7 @@ impl IndexToolRuntimeBinding {
             owned,
             visibility,
             service,
-            writer_role: None,
-            allow_write: true,
         })
-    }
-
-    /// Restrict this binding to a Rust-designated writer role. The Index's
-    /// persisted `role` is unchanged and continues to describe its source
-    /// unit, not the compressor process that writes it.
-    pub fn with_writer_role(mut self, role: impl Into<String>) -> Result<Self> {
-        let role = role.into();
-        if role.trim().is_empty() {
-            bail!("Index tool writer role must not be empty")
-        }
-        self.writer_role = Some(role);
-        Ok(self)
-    }
-
-    /// Give a business role only retrieval capability.  The Index scope is
-    /// still Rust-owned, but create/append/finalize are not even advertised
-    /// or executable through this binding.
-    pub fn read_only(mut self) -> Self {
-        self.allow_write = false;
-        self
-    }
-
-    pub const fn allows_write(&self) -> bool {
-        self.allow_write
     }
 
     pub fn owned_scope(&self) -> &IndexOwnedScope {
@@ -416,46 +232,30 @@ impl IndexToolRuntimeBinding {
         turn: ToolRuntimeTurnContext,
     ) -> Result<IndexToolRuntime<Arc<dyn IndexToolService>>> {
         Ok(IndexToolRuntime::new(
-            IndexToolRuntimeContext::new_with_writer_role(
-                turn,
-                self.owned.clone(),
-                self.visibility.clone(),
-                self.writer_role.as_deref(),
-            )?,
+            IndexToolRuntimeContext::new(turn, self.owned.clone(), self.visibility.clone())?,
             Arc::clone(&self.service),
-            self.allow_write,
         ))
     }
 }
 
-/// A completed, visibility-checked list response. The FileStore adapter must
-/// return only Index IDs that it actually rendered in `output`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct IndexReadPage {
     pub output: Value,
     pub index_ids: Vec<String>,
 }
 
-/// Runtime adapter used only by migrated ToolManaged profiles. It converts
-/// model arguments to ownership-safe commands, updates the per-turn visible
-/// Index allowlist after reads, and makes `finalize_index` terminal.
 #[derive(Debug)]
 pub struct IndexToolRuntime<S> {
     context: IndexToolRuntimeContext,
     service: S,
-    allow_write: bool,
 }
 
 impl<S> IndexToolRuntime<S>
 where
     S: IndexToolService,
 {
-    pub fn new(context: IndexToolRuntimeContext, service: S, allow_write: bool) -> Self {
-        Self {
-            context,
-            service,
-            allow_write,
-        }
+    pub fn new(context: IndexToolRuntimeContext, service: S) -> Self {
+        Self { context, service }
     }
 
     pub fn context(&self) -> &IndexToolRuntimeContext {
@@ -463,25 +263,7 @@ where
     }
 
     pub fn execute(&self, name: &str, args: Value) -> Result<Value> {
-        if !self.allow_write
-            && matches!(
-                name,
-                CREATE_INDEX_NAME | APPEND_INDEX_DETAIL_NAME | FINALIZE_INDEX_NAME
-            )
-        {
-            bail!("this Index binding is read-only")
-        }
         match prepare_command(name, args, &self.context)? {
-            IndexToolCommand::Create(command) => self.service.create_index(command),
-            IndexToolCommand::Append(command) => self.service.append_index_detail(command),
-            IndexToolCommand::Finalize(command) => {
-                let artifact = self.service.finalize_index(command)?;
-                Ok(json!({
-                    "status": "completed",
-                    "terminal": true,
-                    "artifact": artifact,
-                }))
-            }
             IndexToolCommand::ReadIndexes(command) => {
                 let page = self.service.read_indexes(command)?;
                 self.context.record_visible_indexes(page.index_ids)?;
@@ -494,74 +276,16 @@ where
 
 pub fn definition(name: &str) -> Option<ToolDefinition> {
     match name {
-        CREATE_INDEX_NAME => Some(create_index_definition()),
-        APPEND_INDEX_DETAIL_NAME => Some(append_index_detail_definition()),
-        FINALIZE_INDEX_NAME => Some(finalize_index_definition()),
         READ_INDEXES_NAME => Some(read_indexes_definition()),
         READ_INDEX_DETAILS_NAME => Some(read_index_details_definition()),
         _ => None,
     }
 }
 
-pub fn create_index_definition() -> ToolDefinition {
-    ToolDefinition {
-        name: api_tool_name(CREATE_INDEX_NAME),
-        description: "Start the one Rust-planned Index for this unit. Ownership, source phase, ticker/topic scope, Index ID, timestamps, and authoritative fields are fixed by the runtime.".to_owned(),
-        parameters: json!({
-            "type": "object",
-            "properties": {
-                "summary": {"type": "string", "minLength": 1},
-                "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
-                "pattern_key": {"type": ["string", "null"], "minLength": 1},
-                "applies_to_phases": {
-                    "type": "array",
-                    "items": {"type": "integer", "minimum": 0, "maximum": 8},
-                    "uniqueItems": true
-                }
-            },
-            "required": ["summary", "confidence", "applies_to_phases"],
-            "additionalProperties": false
-        }),
-    }
-}
-
-pub fn append_index_detail_definition() -> ToolDefinition {
-    ToolDefinition {
-        name: api_tool_name(APPEND_INDEX_DETAIL_NAME),
-        description: "Append one independently understandable Detail to this unit's Rust-owned Index. Source references must have been made visible by a permitted read.".to_owned(),
-        parameters: json!({
-            "type": "object",
-            "properties": {
-                "section": {
-                    "type": "string",
-                    "enum": ["evidence", "counter_evidence", "conflict", "decision_hinge", "data_gap", "invalidation", "next_step", "analysis", "historical_case", "execution", "risk", "other"]
-                },
-                "detail": {"type": "string", "minLength": 1},
-                "source_refs": {"type": "array", "items": {"type": "string"}, "uniqueItems": true}
-            },
-            "required": ["section", "detail", "source_refs"],
-            "additionalProperties": false
-        }),
-    }
-}
-
-pub fn finalize_index_definition() -> ToolDefinition {
-    ToolDefinition {
-        name: api_tool_name(FINALIZE_INDEX_NAME),
-        description: "Terminally validate and atomically finalize this unit's Index and Details. It ends the tool-managed agent loop on success.".to_owned(),
-        parameters: json!({
-            "type": "object",
-            "properties": {},
-            "required": [],
-            "additionalProperties": false
-        }),
-    }
-}
-
 pub fn read_indexes_definition() -> ToolDefinition {
     ToolDefinition {
         name: api_tool_name(READ_INDEXES_NAME),
-        description: "List completed, visibility-authorized Index records. Omit Rust-owned singleton phase, ticker, role, and topic filters; use {} or kind only unless the runtime has explicitly offered multiple allowed values.".to_owned(),
+        description: "List completed, visibility-authorized Index records. Omit singleton filters because Rust fills them from the role scope.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -584,7 +308,7 @@ pub fn read_indexes_definition() -> ToolDefinition {
 pub fn read_index_details_definition() -> ToolDefinition {
     ToolDefinition {
         name: api_tool_name(READ_INDEX_DETAILS_NAME),
-        description: "Expand completed Details from an Index returned by read_indexes. If exactly one Index is visible, omit index_id; otherwise select an ID from the returned allowlist.".to_owned(),
+        description: "Expand Details from an Index returned by read_indexes. Omit index_id when exactly one Index is visible.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -599,111 +323,18 @@ pub fn read_index_details_definition() -> ToolDefinition {
     }
 }
 
-/// Parse a model tool call into a command whose ownership is fixed by
-/// `context`. This is intentionally independent of any legacy SQL runtime.
 pub fn prepare_command(
     name: &str,
     args: Value,
     context: &IndexToolRuntimeContext,
 ) -> Result<IndexToolCommand> {
     match name {
-        CREATE_INDEX_NAME => parse_create(args, context).map(IndexToolCommand::Create),
-        APPEND_INDEX_DETAIL_NAME => parse_append(args, context).map(IndexToolCommand::Append),
-        FINALIZE_INDEX_NAME => parse_finalize(args, context).map(IndexToolCommand::Finalize),
         READ_INDEXES_NAME => parse_read_indexes(args, context).map(IndexToolCommand::ReadIndexes),
         READ_INDEX_DETAILS_NAME => {
             parse_read_details(args, context).map(IndexToolCommand::ReadDetails)
         }
         _ => bail!("unknown Index tool name: {name}"),
     }
-}
-
-fn parse_create(args: Value, context: &IndexToolRuntimeContext) -> Result<CreateIndexCommand> {
-    let object = checked_object(
-        &args,
-        CREATE_INDEX_NAME,
-        &["summary", "confidence", "pattern_key", "applies_to_phases"],
-    )?;
-    let summary = required_string(object, "summary")?;
-    let confidence = object
-        .get("confidence")
-        .and_then(Value::as_f64)
-        .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
-        .context("create_index.confidence must be a finite number in 0..=1")?;
-    let supplied_pattern_key = optional_string(object, "pattern_key")?;
-    let supplied_applies_to_phases = phase_array(object, "applies_to_phases")?;
-    let (pattern_key, applies_to_phases) = match context.owned.kind {
-        // Summary ownership is fully planned before the writer starts. Some
-        // gateways serialize optional generic schema fields anyway; never let
-        // those values alter (or block) the canonical planned Index.
-        IndexKind::PhaseSummary => (
-            None,
-            context
-                .visibility
-                .applies_to_phases
-                .iter()
-                .copied()
-                .collect(),
-        ),
-        IndexKind::Experience => {
-            let pattern_key =
-                supplied_pattern_key.context("experience Indexes require pattern_key")?;
-            ensure_subset(
-                "applies_to_phases",
-                &supplied_applies_to_phases,
-                &context.visibility.applies_to_phases,
-            )?;
-            (Some(pattern_key), supplied_applies_to_phases)
-        }
-    };
-    Ok(CreateIndexCommand {
-        scope: context.scope_for_create(pattern_key.as_deref())?,
-        summary,
-        confidence,
-        pattern_key,
-        applies_to_phases,
-    })
-}
-
-fn parse_append(
-    args: Value,
-    context: &IndexToolRuntimeContext,
-) -> Result<AppendIndexDetailCommand> {
-    let object = checked_object(
-        &args,
-        APPEND_INDEX_DETAIL_NAME,
-        &["section", "detail", "source_refs"],
-    )?;
-    let section = DetailSection::parse(required_string(object, "section")?.as_str())?;
-    let detail = required_string(object, "detail")?;
-    let supplied_source_refs = string_array(object, "source_refs")?;
-    let source_refs = if context.owned.kind == IndexKind::PhaseSummary {
-        // A Summary Unit's provenance is fixed by the Rust-selected source
-        // payload. Models may describe the evidence but never select or
-        // replace canonical references with a human source label.
-        context.visibility.source_refs.iter().cloned().collect()
-    } else {
-        let allowed = context.visibility.allowed_source_refs();
-        for source_ref in &supplied_source_refs {
-            if !allowed.contains(source_ref) {
-                bail!("source_ref {source_ref:?} is not visible in this Index tool scope");
-            }
-        }
-        supplied_source_refs
-    };
-    Ok(AppendIndexDetailCommand {
-        scope: context.scope_for_followup()?,
-        section,
-        detail,
-        source_refs,
-    })
-}
-
-fn parse_finalize(args: Value, context: &IndexToolRuntimeContext) -> Result<FinalizeIndexCommand> {
-    checked_object(&args, FINALIZE_INDEX_NAME, &[])?;
-    Ok(FinalizeIndexCommand {
-        scope: context.scope_for_followup()?,
-    })
 }
 
 fn parse_read_indexes(
@@ -731,16 +362,14 @@ fn parse_read_indexes(
         .transpose()?;
     let kind = scoped_value_filter("kind", kind, &context.visibility.kinds)?;
     let ticker = scoped_filter(object, "ticker", &context.visibility.tickers)?;
-    let source_phase = optional_phase(object, "source_phase")?;
     let source_phase = scoped_value_filter(
         "source_phase",
-        source_phase,
+        optional_phase(object, "source_phase")?,
         &context.visibility.source_phases,
     )?;
-    let applies_to_phase = optional_phase(object, "applies_to_phase")?;
     let applies_to_phase = scoped_value_filter(
         "applies_to_phase",
-        applies_to_phase,
+        optional_phase(object, "applies_to_phase")?,
         &context.visibility.applies_to_phases,
     )?;
     let role = scoped_filter(object, "role", &context.visibility.roles)?;
@@ -792,21 +421,11 @@ fn checked_object<'a>(
         .as_object()
         .with_context(|| format!("{tool} arguments must be an object"))?;
     for field in object.keys() {
-        // Read filters may select only from a runtime allowlist. All write
-        // operations omit Rust-owned fields from `allowed`, so they reach the
-        // explicit ownership error below instead of becoming mutable.
-        if !allowed.contains(&field.as_str()) && MODEL_OWNED_FIELD_NAMES.contains(&field.as_str()) {
-            bail!("{tool}.{field} is Rust-owned and must not be supplied by the model");
-        }
         if !allowed.contains(&field.as_str()) {
             bail!("{tool}.{field} is not an allowed parameter");
         }
     }
     Ok(object)
-}
-
-fn required_string(object: &serde_json::Map<String, Value>, field: &str) -> Result<String> {
-    optional_string(object, field)?.with_context(|| format!("{field} is required"))
 }
 
 fn optional_string(object: &serde_json::Map<String, Value>, field: &str) -> Result<Option<String>> {
@@ -821,46 +440,6 @@ fn optional_string(object: &serde_json::Map<String, Value>, field: &str) -> Resu
         }
         Some(_) => bail!("{field} must be a string"),
     }
-}
-
-fn string_array(object: &serde_json::Map<String, Value>, field: &str) -> Result<Vec<String>> {
-    let values = object
-        .get(field)
-        .and_then(Value::as_array)
-        .with_context(|| format!("{field} must be an array"))?;
-    let mut unique = BTreeSet::new();
-    let mut result = Vec::with_capacity(values.len());
-    for value in values {
-        let value = value
-            .as_str()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .with_context(|| format!("{field} entries must be non-empty strings"))?;
-        if !unique.insert(value.to_owned()) {
-            bail!("{field} entries must be unique");
-        }
-        result.push(value.to_owned());
-    }
-    Ok(result)
-}
-
-fn phase_array(object: &serde_json::Map<String, Value>, field: &str) -> Result<Vec<u8>> {
-    let values = object
-        .get(field)
-        .and_then(Value::as_array)
-        .with_context(|| format!("{field} must be an array"))?;
-    let mut unique = BTreeSet::new();
-    for value in values {
-        let phase = value
-            .as_u64()
-            .filter(|value| *value <= 8)
-            .map(|value| value as u8)
-            .with_context(|| format!("{field} entries must be phases 0..=8"))?;
-        if !unique.insert(phase) {
-            bail!("{field} entries must be unique");
-        }
-    }
-    Ok(unique.into_iter().collect())
 }
 
 fn optional_phase(object: &serde_json::Map<String, Value>, field: &str) -> Result<Option<u8>> {
@@ -894,7 +473,7 @@ fn pagination_from_object(
         None | Some(Value::Null) => 0,
         Some(Value::String(value)) => value
             .parse::<usize>()
-            .context("cursor must be a pagination token returned by the prior call")?,
+            .context("cursor must be a token returned by the prior call")?,
         Some(_) => bail!("cursor must be a string or null"),
     };
     Ok((limit, cursor))
@@ -905,65 +484,27 @@ fn scoped_filter(
     field: &str,
     allowed: &BTreeSet<String>,
 ) -> Result<Option<String>> {
-    let value = optional_string(object, field)?;
-    match (value, allowed.len()) {
-        (Some(_), 0) => bail!("{field} is not selectable in this scope"),
-        (Some(_), 1) => bail!("{field} is Rust-owned for this singleton scope"),
-        (Some(value), _) if allowed.contains(&value) => Ok(Some(value)),
-        (Some(_), _) => bail!("{field} is not in this scope's allowlist"),
-        (None, _) => Ok(None),
-    }
+    scoped_value_filter(field, optional_string(object, field)?, allowed)
 }
 
 fn scoped_value_filter<T>(field: &str, value: Option<T>, allowed: &BTreeSet<T>) -> Result<Option<T>>
 where
-    T: Ord + std::fmt::Debug,
+    T: Clone + Ord + std::fmt::Debug,
 {
     match (value, allowed.len()) {
         (Some(_), 0) => bail!("{field} is not selectable in this scope"),
+        (Some(value), 1) if allowed.contains(&value) => Ok(Some(value)),
         (Some(_), 1) => bail!("{field} is Rust-owned for this singleton scope"),
         (Some(value), _) if allowed.contains(&value) => Ok(Some(value)),
         (Some(_), _) => bail!("{field} is not in this scope's allowlist"),
+        (None, 1) => Ok(allowed.iter().next().cloned()),
         (None, _) => Ok(None),
     }
-}
-
-fn ensure_value_visible<T>(field: &str, value: T, allowed: &BTreeSet<T>) -> Result<()>
-where
-    T: Ord + std::fmt::Debug,
-{
-    if !allowed.contains(&value) {
-        bail!("{field}={value:?} is not in this scope's allowlist");
-    }
-    Ok(())
-}
-
-fn ensure_subset(field: &str, values: &[u8], allowed: &BTreeSet<u8>) -> Result<()> {
-    for value in values {
-        ensure_value_visible(field, *value, allowed)?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn scope() -> IndexOwnedScope {
-        IndexOwnedScope {
-            run_id: "run-1".to_owned(),
-            source_run_id: None,
-            source_phase: 2,
-            role: "compressor.phase_summary".to_owned(),
-            kind: IndexKind::PhaseSummary,
-            ticker: Some("QQQ".to_owned()),
-            topic_id: None,
-            unit_key: "phase2-final".to_owned(),
-            source_payload_hash: "source-hash".to_owned(),
-            index_id: "index-1".to_owned(),
-            authoritative_fields: Default::default(),
-        }
-    }
 
     fn context() -> IndexToolRuntimeContext {
         IndexToolRuntimeContext::new(
@@ -971,232 +512,51 @@ mod tests {
                 run_id: "run-1".to_owned(),
                 session_id: "session-1".to_owned(),
                 turn_id: "turn-1".to_owned(),
-                role: "compressor.phase_summary".to_owned(),
-                phase: Some(2),
+                role: "manager.research".to_owned(),
+                phase: Some(3),
             },
-            scope(),
+            IndexOwnedScope {
+                run_id: "run-1".to_owned(),
+                source_run_id: None,
+                source_phase: 3,
+                role: "manager.research".to_owned(),
+                kind: IndexKind::PhaseSummary,
+                ticker: Some("QQQ".to_owned()),
+                topic_id: None,
+                unit_key: "phase3:QQQ".to_owned(),
+                source_payload_hash: "source-hash".to_owned(),
+                authoritative_fields: Default::default(),
+                index_id: "idx-000001".to_owned(),
+            },
             IndexReadVisibility {
-                kinds: BTreeSet::from([IndexKind::PhaseSummary, IndexKind::Experience]),
+                kinds: BTreeSet::from([IndexKind::PhaseSummary]),
                 tickers: BTreeSet::from(["QQQ".to_owned()]),
-                source_phases: BTreeSet::from([1, 2]),
-                applies_to_phases: BTreeSet::from([3, 4]),
-                roles: BTreeSet::from([
-                    "analyst.technical".to_owned(),
-                    "analyst.news_macro".to_owned(),
-                ]),
-                topic_ids: BTreeSet::new(),
-                pattern_keys: BTreeSet::from(["volatility-breakout".to_owned()]),
-                source_refs: BTreeSet::from(["artifact:phase2".to_owned()]),
-                evidence_ids: BTreeSet::from(["evidence:1".to_owned()]),
                 max_page_size: 20,
+                ..Default::default()
             },
         )
         .unwrap()
     }
 
     #[test]
-    fn every_definition_declares_required_array() {
-        for name in [
-            CREATE_INDEX_NAME,
-            APPEND_INDEX_DETAIL_NAME,
-            FINALIZE_INDEX_NAME,
-            READ_INDEXES_NAME,
-            READ_INDEX_DETAILS_NAME,
-        ] {
-            assert!(definition(name)
-                .unwrap()
-                .parameters
-                .get("required")
-                .is_some_and(Value::is_array));
-        }
+    fn only_read_definitions_exist() {
+        assert!(definition(READ_INDEXES_NAME).is_some());
+        assert!(definition(READ_INDEX_DETAILS_NAME).is_some());
+        assert!(definition("create_index").is_none());
+        assert!(definition("finalize_index").is_none());
     }
 
     #[test]
-    fn create_index_rejects_rust_owned_fields() {
-        let error = prepare_command(
-            CREATE_INDEX_NAME,
-            json!({
-                "summary": "topic conflict",
-                "confidence": 0.7,
-                "applies_to_phases": [3],
-                "run_id": "model-run"
-            }),
-            &context(),
-        )
-        .unwrap_err();
+    fn singleton_filters_accept_the_bound_value_and_reject_other_values() {
+        assert!(prepare_command(READ_INDEXES_NAME, json!({"ticker":"QQQ"}), &context()).is_ok());
+        let error =
+            prepare_command(READ_INDEXES_NAME, json!({"ticker":"SOXX"}), &context()).unwrap_err();
         assert!(error.to_string().contains("Rust-owned"));
     }
 
     #[test]
-    fn create_index_derives_summary_scope_and_discards_generic_model_fields() {
-        let command = prepare_command(
-            CREATE_INDEX_NAME,
-            json!({"summary": "topic conflict", "confidence": 0.7, "applies_to_phases": [3]}),
-            &context(),
-        )
-        .unwrap();
-        let IndexToolCommand::Create(command) = command else {
-            panic!("expected create command");
-        };
-        assert_eq!(command.scope.run_id, "run-1");
-        assert_eq!(command.scope.index_id, "index-1");
-        let command = prepare_command(
-            CREATE_INDEX_NAME,
-            json!({"summary": "topic conflict", "confidence": 0.7, "pattern_key": "x", "applies_to_phases": [3]}),
-            &context(),
-        )
-        .unwrap();
-        let IndexToolCommand::Create(command) = command else {
-            panic!("expected create command");
-        };
-        assert_eq!(command.pattern_key, None);
-        assert_eq!(command.applies_to_phases, vec![3, 4]);
-    }
-
-    #[test]
-    fn summary_append_derives_canonical_source_refs() {
-        let command = prepare_command(
-            APPEND_INDEX_DETAIL_NAME,
-            json!({"section": "evidence", "detail": "source", "source_refs": ["evidence:1", "artifact:phase2"]}),
-            &context(),
-        )
-        .unwrap();
-        let IndexToolCommand::Append(command) = command else {
-            panic!("expected append command");
-        };
-        assert_eq!(command.source_refs, vec!["artifact:phase2"]);
-        let command = prepare_command(
-            APPEND_INDEX_DETAIL_NAME,
-            json!({"section": "evidence", "detail": "source", "source_refs": ["unread"]}),
-            &context(),
-        )
-        .unwrap();
-        let IndexToolCommand::Append(command) = command else {
-            panic!("expected append command");
-        };
-        assert_eq!(command.source_refs, vec!["artifact:phase2"]);
-    }
-
-    #[test]
-    fn singleton_ticker_and_unknown_filters_are_rejected() {
-        let error =
-            prepare_command(READ_INDEXES_NAME, json!({"ticker": "QQQ"}), &context()).unwrap_err();
-        assert!(error.to_string().contains("singleton"));
-        let error =
-            prepare_command(READ_INDEXES_NAME, json!({"source_phase": 7}), &context()).unwrap_err();
-        assert!(error.to_string().contains("allowlist"));
-    }
-
-    #[test]
-    fn detail_read_uses_returned_index_allowlist() {
-        let context = context();
-        let error = prepare_command(READ_INDEX_DETAILS_NAME, json!({}), &context).unwrap_err();
+    fn details_require_a_visible_index() {
+        let error = prepare_command(READ_INDEX_DETAILS_NAME, json!({}), &context()).unwrap_err();
         assert!(error.to_string().contains("preceding read_indexes"));
-        context
-            .record_visible_indexes(["index-visible".to_owned()])
-            .unwrap();
-        let command = prepare_command(READ_INDEX_DETAILS_NAME, json!({}), &context).unwrap();
-        let IndexToolCommand::ReadDetails(command) = command else {
-            panic!("expected read details");
-        };
-        assert_eq!(command.index_id, "index-visible");
-        let error = prepare_command(
-            READ_INDEX_DETAILS_NAME,
-            json!({"index_id": "hidden-index"}),
-            &context,
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("not visible"));
-    }
-
-    #[test]
-    fn context_refuses_turn_scope_mismatch() {
-        let error = IndexToolRuntimeContext::new(
-            ToolRuntimeTurnContext {
-                run_id: "other-run".to_owned(),
-                session_id: "session-1".to_owned(),
-                turn_id: "turn-1".to_owned(),
-                role: "compressor.phase_summary".to_owned(),
-                phase: Some(2),
-            },
-            scope(),
-            IndexReadVisibility::default(),
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("does not match"));
-    }
-
-    #[test]
-    fn historical_experience_keeps_historical_source_phase_rust_owned() {
-        let mut historical = scope();
-        historical.kind = IndexKind::Experience;
-        historical.source_phase = 2;
-        historical.role = "reflector.historical".to_owned();
-        let context = IndexToolRuntimeContext::new(
-            ToolRuntimeTurnContext {
-                run_id: "run-1".to_owned(),
-                session_id: "session-1".to_owned(),
-                turn_id: "turn-1".to_owned(),
-                role: "reflector.historical".to_owned(),
-                phase: Some(0),
-            },
-            historical,
-            IndexReadVisibility {
-                applies_to_phases: BTreeSet::from([3]),
-                ..IndexReadVisibility::default()
-            },
-        )
-        .unwrap();
-        let command = prepare_command(
-            CREATE_INDEX_NAME,
-            json!({
-                "summary": "Wait for confirmation after volatility breaks.",
-                "confidence": 0.6,
-                "pattern_key": "volatility-breakout",
-                "applies_to_phases": [3]
-            }),
-            &context,
-        )
-        .unwrap();
-        let IndexToolCommand::Create(command) = command else {
-            panic!("expected create command");
-        };
-        assert_eq!(command.scope.source_phase, 2);
-        assert_eq!(
-            command.scope.index_id,
-            orchestrator_store::deterministic_experience_index_id(
-                "volatility-breakout",
-                command.scope.ticker.as_deref(),
-                2,
-            )
-            .unwrap()
-        );
-        let append = prepare_command(
-            APPEND_INDEX_DETAIL_NAME,
-            json!({
-                "section": "historical_case",
-                "detail": "The decision relied on a stale breakout signal.",
-                "source_refs": []
-            }),
-            &context,
-        )
-        .unwrap();
-        let IndexToolCommand::Append(append) = append else {
-            panic!("expected append command");
-        };
-        assert_eq!(append.scope.index_id, command.scope.index_id);
-        let error = prepare_command(
-            CREATE_INDEX_NAME,
-            json!({
-                "summary": "A different experience.",
-                "confidence": 0.6,
-                "pattern_key": "other-pattern",
-                "applies_to_phases": [3]
-            }),
-            &context,
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("cannot change"));
-        assert_eq!(context.turn_context().phase, Some(0));
     }
 }

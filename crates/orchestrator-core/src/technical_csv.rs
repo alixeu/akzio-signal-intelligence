@@ -111,20 +111,12 @@ pub fn render_technical_csv(rows: &[TechnicalCsvRow]) -> String {
 }
 
 fn safe_ticker_component(symbol: &str) -> String {
-    use sha2::{Digest, Sha256};
-
     let readable = crate::slug_ticker(symbol);
-    let digest = Sha256::digest(symbol.as_bytes());
-    let hash = digest[..8]
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    let prefix = if readable.is_empty() {
-        "ticker"
+    if readable.is_empty() {
+        "ticker".to_owned()
     } else {
-        &readable
-    };
-    format!("{}-{hash}", &prefix[..prefix.len().min(48)])
+        readable.to_ascii_lowercase()
+    }
 }
 
 pub fn read_technical_csv(path: &Path) -> Result<Vec<TechnicalCsvRow>> {
@@ -419,13 +411,13 @@ mod tests {
     }
 
     #[test]
-    fn path_uses_safe_ticker_directory_and_interval_file() {
+    fn path_uses_readable_safe_ticker_directory_and_interval_file() {
         let path = technical_csv_path(Path::new("root"), "QQQ/../../x", "1d").unwrap();
         assert_eq!(
             path.file_name().and_then(|name| name.to_str()),
             Some("day.csv")
         );
-        assert!(path.to_string_lossy().starts_with("root/QQQ_X-"));
+        assert!(path.to_string_lossy().starts_with("root/qqq_x/"));
         assert!(!path.to_string_lossy().contains(".."));
     }
 
