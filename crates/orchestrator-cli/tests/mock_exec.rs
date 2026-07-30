@@ -1,6 +1,7 @@
 use orchestrator_cli::exec::{self, ExecArgs, Mode};
 use orchestrator_store::{
-    inspect_store, read_indexes, FileStore, FileStoreOptions, IndexKind, IndexQuery, RunLocation,
+    inspect_store, read_indexes, read_run_manifest, FileStore, FileStoreOptions, IndexKind,
+    IndexQuery, RunLocation, RunStatus,
 };
 use std::{fs, path::Path};
 
@@ -105,6 +106,26 @@ async fn mock_exec_phase7_writes_file_store_allocation() {
         state["_completed_units"]["p6:portfolio.manager:artifact:aggregate:none:0"]["profile"],
         "portfolio_decision"
     );
+}
+
+#[tokio::test]
+async fn partial_run_stays_running_and_retains_only_temporary_recovery_files() {
+    let temp = tempfile::tempdir().unwrap();
+    let store_root = temp.path().join("store");
+
+    let result = exec::run(test_args(temp.path(), store_root.clone(), 7))
+        .await
+        .unwrap();
+
+    let store = FileStore::open(&store_root, FileStoreOptions::default()).unwrap();
+    let run = RunLocation::new("2026-06-15", result["run_id"].as_str().unwrap()).unwrap();
+    let manifest = read_run_manifest(&store, &run).unwrap();
+    assert_eq!(manifest.status, RunStatus::Running);
+    assert!(store.exists(&run.state_relative()).unwrap());
+    assert!(store
+        .exists(&run.child_relative(Path::new("sessions")).unwrap())
+        .unwrap());
+    assert_eq!(result["store_compaction"]["eligible"], false);
 }
 
 #[tokio::test]
