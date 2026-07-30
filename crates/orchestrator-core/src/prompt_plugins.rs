@@ -9,6 +9,9 @@ use crate::prompt::render_template;
 pub const KNOWN_RENDER_VARIABLES: &[&str] = &[
     "ticker",
     "tickers",
+    "analysis_universe",
+    "investable_assets",
+    "context_only_assets",
     "common_ticker_prompt",
     "analyst_output_contract",
     "retrieval_policy",

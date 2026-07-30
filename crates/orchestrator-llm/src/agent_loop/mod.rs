@@ -1350,7 +1350,7 @@ fn history_items(
     let items = if !turn.emitted_items.is_empty() {
         turn.emitted_items.clone()
     } else {
-        // Resume path for multi-round steer sessions that recreate a Turn with
+        // Resume path for multi-round fork sessions that recreate a Turn with
         // the same turn_id: reload only this turn's snapshot.
         session
             .read_current_turn(&turn.turn_id)?
@@ -1482,10 +1482,10 @@ fn preseed_tool_calls(
 ) -> Vec<ToolCallRequest> {
     let mut calls = Vec::new();
     let tool_enabled = |name: &str| available_tools.iter().any(|tool| tool == name);
-    if tool_enabled(tools::record_phase2_steer::NAME) {
+    if tool_enabled(tools::record_phase2_context::NAME) {
         calls.push(ToolCallRequest {
-            call_id: format!("preseed-phase2-steer-{}", turn.turn_id),
-            name: tools::record_phase2_steer::NAME.to_owned(),
+            call_id: format!("preseed-phase2-context-{}", turn.turn_id),
+            name: tools::record_phase2_context::NAME.to_owned(),
             arguments: json!({}),
         });
     }
@@ -1510,11 +1510,11 @@ fn preseed_tool_calls(
 }
 
 #[cfg(test)]
-mod phase2_steer_preseed_tests {
+mod phase2_context_preseed_tests {
     use super::*;
 
     #[test]
-    fn every_phase2_child_turn_gets_its_own_steer_record_call() {
+    fn every_phase2_child_turn_gets_its_own_context_record_call() {
         let turn = Turn::new(
             "turn-child",
             "session-child",
@@ -1525,12 +1525,12 @@ mod phase2_steer_preseed_tests {
         let calls = preseed_tool_calls(
             &turn,
             &["QQQ".to_owned()],
-            &[tools::record_phase2_steer::NAME.to_owned()],
+            &[tools::record_phase2_context::NAME.to_owned()],
         );
 
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, tools::record_phase2_steer::NAME);
-        assert_eq!(calls[0].call_id, "preseed-phase2-steer-turn-child");
+        assert_eq!(calls[0].name, tools::record_phase2_context::NAME);
+        assert_eq!(calls[0].call_id, "preseed-phase2-context-turn-child");
         assert_eq!(calls[0].arguments, json!({}));
     }
 }
@@ -1737,7 +1737,7 @@ pub fn extract_token_usage(raw: &Value) -> TokenUsage {
 
 /// Extract the role prompt (first user message) for use as the main prompt
 /// in the Responses API request. History items (tool calls, tool results,
-/// steer messages) are handled separately via native multi-turn messages.
+/// follow-up messages) are handled separately via native multi-turn messages.
 pub fn model_role_prompt(input: &ModelInput) -> Result<String> {
     let role_prompt = input
         .items

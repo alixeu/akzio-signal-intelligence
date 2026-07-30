@@ -9,10 +9,10 @@ use orchestrator_llm::{
     agent_loop::{
         FileStoreSessionRuntime, ModelStreamResult, RetrievalPolicy, SessionRuntimeSpec, TokenUsage,
     },
-    run_agent_loop_with_metrics, run_agent_steer_loop_with_metrics,
+    run_agent_fork_loop_with_metrics, run_agent_loop_with_metrics,
     tools::{ExternalToolConfig, FileStoreInputSnapshot},
     truncation::TruncationConfig,
-    AgentLoopOutput, AgentSettings, RoleLlmSettings, SteerLoopInput,
+    AgentLoopOutput, AgentSettings, ForkLoopInput, RoleLlmSettings,
 };
 use serde_json::{json, Map, Value};
 use std::time::{Duration, Instant};
@@ -357,10 +357,9 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
     // FileStore projection into a hard tool error instead of an accidental
     // alternate persistence fallback.
     let phase2_fork = phase2_fork_reference(&state, role, topic_id, round);
-    let phase2_steer = phase2_steer_payload(
+    let phase2_context = phase2_context_payload(
         &state,
         role,
-        kind,
         topic_id,
         round,
         phase2_fork
@@ -423,7 +422,7 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
                 &state,
                 tool_managed_profile,
             ),
-            phase2_steer,
+            phase2_context,
         },
         web_search: config.web_search.get(role).cloned().unwrap_or_default(),
         truncation: config.truncation.clone(),
@@ -435,7 +434,7 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
 fn is_read_only_model_tool(name: &str) -> bool {
     name == "think"
         || name == "web.run"
-        || name == orchestrator_llm::tools::record_phase2_steer::NAME
+        || name == orchestrator_llm::tools::record_phase2_context::NAME
         || name == "verify_event"
         || name == orchestrator_llm::tools::research_evidence_gap::NAME
         || name.starts_with("read_")
@@ -634,7 +633,7 @@ fn phase2_evidence_research_binding(
             alpaca_api_secret: None,
             file_store_input: None,
             file_store_reflection_source: None,
-            phase2_steer: None,
+            phase2_context: None,
         },
         reasoning_effort_override: reasoning_effort_override.map(ToOwned::to_owned),
         debug: state.get("debug").and_then(Value::as_bool).unwrap_or(false),
@@ -955,15 +954,14 @@ fn phase2_fork_reference(
     })
 }
 
-fn phase2_steer_payload(
+fn phase2_context_payload(
     state: &Value,
     role: &str,
-    kind: &str,
     topic_id: Option<&str>,
     round: Option<i64>,
     fork_from_turn_id: Option<&str>,
 ) -> Option<Value> {
-    let steer_kind = match role {
+    let context_kind = match role {
         "researcher.bull.initial" | "researcher.bear.initial" => "topic_fork",
         "researcher.bull.interaction" | "researcher.bear.interaction" => "point_debate",
         "mediator.topic_controller" => "topic_control",
@@ -973,9 +971,8 @@ fn phase2_steer_payload(
     let round_num = round?;
     let fork_from_turn_id = fork_from_turn_id?;
     let topic_state = state.pointer(&format!("/topic_debate_states/{topic_id}"));
-    let mut steer = json!({
-        "kind": steer_kind,
-        "runtime_kind": kind,
+    let mut context = json!({
+        "kind": context_kind,
         "role": role,
         "topic_id": topic_id,
         "round": round_num,
@@ -984,20 +981,20 @@ fn phase2_steer_payload(
         "include_prompt_on_fork": true,
     });
     if let Some(topic) = topic_state.and_then(|value| value.get("topic")) {
-        steer["topic"] = topic.clone();
+        context["topic"] = topic.clone();
     }
     if role == "mediator.topic_controller" {
-        steer["debate_turns"] = topic_state
+        context["debate_turns"] = topic_state
             .and_then(|value| value.get("turns"))
             .cloned()
             .unwrap_or_else(|| json!([]));
     } else if role.ends_with(".interaction") {
-        steer["controller"] = topic_state
+        context["controller"] = topic_state
             .and_then(|value| value.get("controller_artifact"))
             .cloned()
             .unwrap_or(Value::Null);
     }
-    Some(steer)
+    Some(context)
 }
 
 fn file_store_input_from_state(state: &Value) -> Result<FileStoreInputSnapshot> {
@@ -2147,7 +2144,7 @@ async fn execute_role_job(job: RoleJob) -> Result<AgentLoopOutput> {
         .as_deref()
         .and_then(debug_prompt_path_from_runtime_path);
     let debug_round = job.round.and_then(|round| usize::try_from(round).ok());
-    let steer = job.tools.phase2_steer.clone();
+    let phase2_context = job.tools.phase2_context.clone();
     let settings = AgentSettings {
         role: job.role,
         phase: Some(job.phase),
@@ -2175,17 +2172,25 @@ async fn execute_role_job(job: RoleJob) -> Result<AgentLoopOutput> {
         prompt_chars = job.prompt.len(),
         "calling agent loop"
     );
-    let mut output = if let Some(steer) = steer {
+    let mut output = if let Some(phase2_context) = phase2_context {
         let session_id = settings.session_runtime.manifest().session_id.clone();
         let turn_id = format!("turn-{}", md5_3(&session_id));
-        let steer = serde_json::to_string(&steer)?;
-        run_agent_steer_loop_with_metrics(
+        let fork_from_turn_id = phase2_context
+            .get("fork_from_turn_id")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+        let include_prompt_on_fork = phase2_context
+            .get("include_prompt_on_fork")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        run_agent_fork_loop_with_metrics(
             &settings,
-            SteerLoopInput {
+            ForkLoopInput {
                 session_id,
                 turn_id,
                 prompt: &job.prompt,
-                steer: Some(steer),
+                fork_from_turn_id,
+                include_prompt_on_fork,
             },
         )
         .await?
@@ -2455,8 +2460,8 @@ mod tests {
     }
 
     #[test]
-    fn phase2_steer_records_topic_round_and_fork_parent() {
-        let steer = phase2_steer_payload(
+    fn phase2_context_records_topic_round_and_fork_parent() {
+        let context = phase2_context_payload(
             &json!({
                 "topic_debate_states": {
                     "topic-a": {
@@ -2468,23 +2473,49 @@ mod tests {
                 }
             }),
             "researcher.bull.interaction",
-            "interaction",
             Some("topic-a"),
             Some(1),
             Some("warmup-turn"),
         )
         .unwrap();
 
-        assert_eq!(steer["kind"], "point_debate");
-        assert_eq!(steer["topic_id"], "topic-a");
-        assert_eq!(steer["round"], 1);
-        assert_eq!(steer["round_num"], 1);
-        assert_eq!(steer["fork_from_turn_id"], "warmup-turn");
-        assert_eq!(steer["include_prompt_on_fork"], true);
+        assert_eq!(context["kind"], "point_debate");
+        assert_eq!(context["topic_id"], "topic-a");
+        assert_eq!(context["round"], 1);
+        assert_eq!(context["round_num"], 1);
+        assert_eq!(context["fork_from_turn_id"], "warmup-turn");
+        assert_eq!(context["include_prompt_on_fork"], true);
         assert_eq!(
-            steer["controller"]["payload"]["next_steers"][0]["steer_id"],
+            context["controller"]["payload"]["next_steers"][0]["steer_id"],
             "steer-1"
         );
+    }
+
+    #[test]
+    fn phase2_controller_context_transfers_recorded_debate_turns() {
+        let context = phase2_context_payload(
+            &json!({
+                "topic_debate_states": {
+                    "topic-a": {
+                        "topic": {"topic_id": "topic-a", "title": "Volatility regime"},
+                        "turns": [
+                            {"role": "researcher.bull.initial", "artifact": {"summary": "bull"}},
+                            {"role": "researcher.bear.initial", "artifact": {"summary": "bear"}}
+                        ]
+                    }
+                }
+            }),
+            "mediator.topic_controller",
+            Some("topic-a"),
+            Some(0),
+            Some("topic-generator-turn"),
+        )
+        .unwrap();
+
+        assert_eq!(context["kind"], "topic_control");
+        assert_eq!(context["topic"]["title"], "Volatility regime");
+        assert_eq!(context["debate_turns"].as_array().unwrap().len(), 2);
+        assert!(context.get("controller").is_none());
     }
 
     #[test]

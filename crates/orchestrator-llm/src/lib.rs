@@ -220,36 +220,12 @@ impl AgentSettings {
 }
 
 #[derive(Debug, Clone)]
-pub struct SteerLoopInput<'a> {
+pub struct ForkLoopInput<'a> {
     pub session_id: String,
     pub turn_id: String,
     pub prompt: &'a str,
-    pub steer: Option<String>,
-}
-
-impl SteerLoopInput<'_> {
-    fn steer_value(&self) -> Option<Value> {
-        self.steer
-            .as_deref()
-            .and_then(|steer| serde_json::from_str(steer).ok())
-    }
-
-    fn fork_from_turn_id(&self) -> Option<String> {
-        self.steer_value()?
-            .get("fork_from_turn_id")?
-            .as_str()
-            .map(str::trim)
-            .filter(|turn_id| !turn_id.is_empty())
-            .map(ToString::to_string)
-    }
-
-    fn includes_prompt_on_fork(&self) -> bool {
-        self.steer_value()
-            .as_ref()
-            .and_then(|value| value.get("include_prompt_on_fork"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-    }
+    pub fork_from_turn_id: Option<String>,
+    pub include_prompt_on_fork: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -352,18 +328,18 @@ fn agent_loop_config_from_settings(settings: &AgentSettings) -> AgentLoopConfig 
     }
 }
 
-pub async fn run_agent_steer_loop(
+pub async fn run_agent_fork_loop(
     settings: &AgentSettings,
-    input: SteerLoopInput<'_>,
+    input: ForkLoopInput<'_>,
 ) -> Result<Value> {
-    Ok(run_agent_steer_loop_with_metrics(settings, input)
+    Ok(run_agent_fork_loop_with_metrics(settings, input)
         .await?
         .artifact)
 }
 
-pub async fn run_agent_steer_loop_with_metrics(
+pub async fn run_agent_fork_loop_with_metrics(
     settings: &AgentSettings,
-    input: SteerLoopInput<'_>,
+    input: ForkLoopInput<'_>,
 ) -> Result<AgentLoopOutput> {
     settings.llm.validate(&settings.role)?;
     validate_fallback_web_search_runtime_config(settings)?;
@@ -372,10 +348,10 @@ pub async fn run_agent_steer_loop_with_metrics(
     // later phase-2 roles see sibling turns as "existing history" and drop their
     // own role prompt (live debate mass max_agent_loops / empty context).
     if session.manifest().session_id != input.session_id {
-        bail!("steer input session does not match FileStore session authority");
+        bail!("fork input session does not match FileStore session authority");
     }
     let target_history = session_history_values(session.read_current_turn(&input.turn_id)?);
-    let fork_from_turn_id = input.fork_from_turn_id();
+    let fork_from_turn_id = input.fork_from_turn_id;
     let fork_history = if target_history.is_empty() {
         if fork_from_turn_id.is_some() {
             let history = session_history_values(session.read_fork_turn()?);
@@ -392,10 +368,9 @@ pub async fn run_agent_steer_loop_with_metrics(
     let is_new_fork = target_history.is_empty() && !fork_history.is_empty();
     let prior_history = select_fork_history(target_history, fork_history);
     let has_existing_history = !prior_history.is_empty();
-    let include_prompt_on_fork = input.includes_prompt_on_fork();
-    let (user_input, fork_input, pending_steer) = prepare_steer_turn_inputs(
+    let include_prompt_on_fork = input.include_prompt_on_fork;
+    let (user_input, fork_input, pending_context_instruction) = prepare_fork_turn_inputs(
         input.prompt,
-        input.steer,
         has_existing_history,
         is_new_fork,
         include_prompt_on_fork,
@@ -408,7 +383,7 @@ pub async fn run_agent_steer_loop_with_metrics(
         user_input,
     );
     if has_existing_history {
-        // Seed in-memory history so multi-round steer resumes do not wipe the
+        // Seed in-memory history so multi-round forks do not wipe the
         // previous full_context snapshot on the next persist_turn.
         turn.emitted_items = prior_history
             .into_iter()
@@ -436,8 +411,9 @@ pub async fn run_agent_steer_loop_with_metrics(
         serde_json::to_string(&configured_tool_names(settings))?,
         fork_from_turn_id.is_some()
     );
-    if let Some(steer) = pending_steer {
-        turn.push_pending_input(steer);
+    if let Some(instruction) = pending_context_instruction {
+        turn.emitted_items
+            .push(agent_loop::TurnItem::user(instruction));
     }
     let tool_config = settings.tools.clone().unwrap_or_else(default_tool_config);
     let mut tools = ProjectToolRuntime::with_available_tools(
@@ -547,30 +523,28 @@ fn session_history_values(events: Vec<orchestrator_store::SessionEvent>) -> Vec<
         .collect()
 }
 
-fn prepare_steer_turn_inputs(
+fn prepare_fork_turn_inputs(
     prompt: &str,
-    steer: Option<String>,
     has_existing_history: bool,
     is_new_fork: bool,
     include_prompt_on_fork: bool,
 ) -> (String, Option<String>, Option<String>) {
+    let context_instruction =
+        "请读取本轮 `record_phase2_context` 工具结果，并只基于其中的当前主题、已有辩论和控制路由完成本轮自由文字回复。";
     if is_new_fork && include_prompt_on_fork {
         let task = format!(
             "这是一个新的子回合。上一条 assistant 输出只是恢复的 checkpoint 上下文，不是本轮答案。\
-             请执行下面的新角色与任务，生成新的回复。\n\n{prompt}"
+             请执行下面的新角色与任务，生成新的回复。\n\n{prompt}\n\n{context_instruction}"
         );
-        let fork_input = match steer {
-            Some(steer) => format!("{task}\n\nSteer: {steer}"),
-            None => task,
-        };
-        return (String::new(), Some(fork_input), None);
+        return (String::new(), Some(task), None);
     }
     let user_input = if has_existing_history && !(is_new_fork && include_prompt_on_fork) {
         String::new()
     } else {
         prompt.to_string()
     };
-    (user_input, None, steer)
+    let pending_instruction = has_existing_history.then(|| context_instruction.to_owned());
+    (user_input, None, pending_instruction)
 }
 
 pub fn append_debug_llm_record(settings: &AgentSettings, record: Value) -> Result<()> {
@@ -2325,7 +2299,7 @@ fn default_tool_config() -> tools::ExternalToolConfig {
         alpaca_api_secret: None,
         file_store_input: None,
         file_store_reflection_source: None,
-        phase2_steer: None,
+        phase2_context: None,
     }
 }
 
@@ -2532,7 +2506,7 @@ mod tests {
                 "read_technical_detail",
                 "read_jin10_candidates",
                 "verify_event",
-                "record_phase2_steer",
+                "record_phase2_context",
                 "alpaca_get_news",
             ]
         );
@@ -2642,7 +2616,7 @@ mod tests {
             alpaca_api_secret: None,
             file_store_input: None,
             file_store_reflection_source: None,
-            phase2_steer: None,
+            phase2_context: None,
         });
 
         super::append_debug_llm_record(
@@ -2704,7 +2678,7 @@ mod tests {
             alpaca_api_secret: None,
             file_store_input: None,
             file_store_reflection_source: None,
-            phase2_steer: None,
+            phase2_context: None,
         });
         super::append_debug_llm_record(
             &settings,
@@ -3167,23 +3141,34 @@ mod tests {
 
     #[test]
     fn new_fork_appends_one_topic_instruction_after_checkpoint_history() {
-        let steer = r#"{"kind":"seed_claims","topic_id":"topic-a"}"#.to_string();
-        let (user_input, fork_input, pending_steer) = super::prepare_steer_turn_inputs(
-            "BULL ROLE PROMPT",
-            Some(steer.clone()),
-            true,
-            true,
-            true,
-        );
+        let (user_input, fork_input, pending_context_instruction) =
+            super::prepare_fork_turn_inputs("BULL ROLE PROMPT", true, true, true);
 
         assert!(user_input.is_empty());
         assert_eq!(
             fork_input,
-            Some(format!(
+            Some(
                 "这是一个新的子回合。上一条 assistant 输出只是恢复的 checkpoint 上下文，不是本轮答案。\
-                 请执行下面的新角色与任务，生成新的回复。\n\nBULL ROLE PROMPT\n\nSteer: {steer}"
-            ))
+                 请执行下面的新角色与任务，生成新的回复。\n\nBULL ROLE PROMPT\n\n\
+                 请读取本轮 `record_phase2_context` 工具结果，并只基于其中的当前主题、已有辩论和控制路由完成本轮自由文字回复。"
+                    .to_owned()
+            )
         );
-        assert!(pending_steer.is_none());
+        assert!(pending_context_instruction.is_none());
+    }
+
+    #[test]
+    fn resumed_topic_turn_uses_only_the_context_tool_for_dynamic_payload() {
+        let (user_input, fork_input, pending_instruction) =
+            super::prepare_fork_turn_inputs("BULL ROLE PROMPT", true, false, false);
+
+        assert!(user_input.is_empty());
+        assert!(fork_input.is_none());
+        assert_eq!(
+            pending_instruction.as_deref(),
+            Some(
+                "请读取本轮 `record_phase2_context` 工具结果，并只基于其中的当前主题、已有辩论和控制路由完成本轮自由文字回复。"
+            )
+        );
     }
 }

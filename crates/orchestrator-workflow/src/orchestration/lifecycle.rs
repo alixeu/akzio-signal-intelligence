@@ -1,5 +1,6 @@
 use orchestrator_core::{md5_3, run_slug};
 use serde_json::{json, Value};
+use std::collections::BTreeSet;
 
 pub(crate) fn run_id_for(tickers: &[String], date: &str) -> String {
     run_id_for_seed(tickers, date, "exec")
@@ -19,7 +20,8 @@ pub(crate) fn set_phase_status(state: &mut Value, phase: i64, status: &str) {
 
 pub(crate) fn tickers_from_state(state: &Value) -> Vec<String> {
     state
-        .get("tickers")
+        .get("analysis_universe")
+        .or_else(|| state.get("tickers"))
         .and_then(Value::as_array)
         .map(|items| {
             items
@@ -31,12 +33,45 @@ pub(crate) fn tickers_from_state(state: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-pub(crate) fn topic_state(state: &Value, topic_id: &str) -> Option<Value> {
+pub(crate) fn investable_assets_from_state(state: &Value) -> Vec<String> {
     state
-        .get("topic_debate_states")
-        .and_then(Value::as_object)
-        .and_then(|items| items.get(topic_id))
-        .cloned()
+        .get("investable_assets")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub(crate) fn validate_asset_scope(
+    analysis_universe: &[String],
+    investable_assets: &[String],
+    regime_signal: &str,
+) -> anyhow::Result<()> {
+    if investable_assets.is_empty() {
+        anyhow::bail!("orchestrator.allocation.investable_assets is required")
+    }
+    let universe = analysis_universe.iter().collect::<BTreeSet<_>>();
+    let unique_investable = investable_assets.iter().collect::<BTreeSet<_>>();
+    if unique_investable.len() != investable_assets.len() {
+        anyhow::bail!("orchestrator.allocation.investable_assets contains duplicates")
+    }
+    for asset in investable_assets {
+        if !universe.contains(asset) {
+            anyhow::bail!("investable asset {asset} is not in orchestrator.analysis_universe")
+        }
+    }
+    if investable_assets.iter().any(|asset| asset == regime_signal) {
+        anyhow::bail!("regime signal {regime_signal} cannot be an investable asset")
+    }
+    if !regime_signal.is_empty() && !analysis_universe.iter().any(|asset| asset == regime_signal) {
+        anyhow::bail!("regime signal {regime_signal} is not in orchestrator.analysis_universe")
+    }
+    Ok(())
 }
 
 pub(crate) fn research_plan_to_trade_intent(research_plan: &Value) -> Value {
@@ -68,7 +103,7 @@ pub(crate) fn research_plan_to_trade_intent(research_plan: &Value) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{run_id_for, run_id_for_seed};
+    use super::{run_id_for, run_id_for_seed, validate_asset_scope};
 
     #[test]
     fn run_id_does_not_depend_on_filesystem_path() {
@@ -84,5 +119,26 @@ mod tests {
             ),
             "qqq-soxx-vix-1493b0"
         );
+    }
+
+    #[test]
+    fn asset_scope_separates_analysis_from_execution() {
+        validate_asset_scope(
+            &["QQQ".into(), "SOXX".into(), "VIX".into()],
+            &["QQQ".into(), "SOXX".into()],
+            "VIX",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn asset_scope_rejects_regime_signal_as_investable() {
+        let error = validate_asset_scope(
+            &["QQQ".into(), "VIX".into()],
+            &["QQQ".into(), "VIX".into()],
+            "VIX",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("cannot be an investable asset"));
     }
 }

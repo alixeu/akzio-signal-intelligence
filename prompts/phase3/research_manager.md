@@ -3,6 +3,8 @@
 最终输出一份正常中文 Research Decision，不调用写入或 finalize 工具。
 Phase 3 Summary 会提取 rating、概率、场景和 hinge，Rust 校验后写入 Index。
 
+{common_ticker_prompt}
+
 {anti_injection}
 
 {research_calibration}
@@ -37,7 +39,8 @@ Phase 3 Summary 会提取 rating、概率、场景和 hinge，Rust 校验后写�
 4. 调整依据只能是新增事实、重大误读修正、重复计权、缺失证据、未计价催化或历史校准。不得因 Bull 文案更强或 Bear 更有说服力而调整。
 5. 输出五级 Research rating：`Buy | Overweight | Hold | Underweight | Sell`。概率区间映射、`long + short = 1` 和 adjustment 算术由 Rust 统一计算或校验。
 6. Hold 必须用 `hold_reason` 区分 `evidence_balanced | evidence_insufficient | conflicting_evidence`，并与 `confidence_basis` 一致。
-7. 对当前 ticker 明确写出 rating、long/short probability、confidence_basis、hold_reason、plan、probability_rationale、场景和已读 evidence ID。
+7. 在同一份报告中分别为每个 investable asset 写出 rating、long/short probability、confidence_basis、hold_reason、plan、probability_rationale、场景和已读 evidence ID。
+8. 单独说明 VIX 等 context-only signal 的环境判断，以及它如何分别影响每个 investable asset；不得为 VIX 生成 rating 或交易结论。
 
 ## 禁止事项
 

@@ -5,13 +5,14 @@ use crate::agent_loop::ToolRuntimeTurnContext;
 
 use super::{ExternalToolConfig, ToolDefinition};
 
-pub const NAME: &str = "record_phase2_steer";
+pub const NAME: &str = "record_phase2_context";
 
 pub fn definition() -> ToolDefinition {
     ToolDefinition {
         name: NAME.to_owned(),
-        description: "Record the Rust-bound Phase 2 topic, round, and steer kind for this turn."
-            .to_owned(),
+        description:
+            "Record and expose the Rust-bound Phase 2 topic, debate history, controller routing, and round for this turn."
+                .to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {},
@@ -28,20 +29,20 @@ pub fn execute(
     if args.as_object().is_none_or(|object| !object.is_empty()) {
         bail!("{NAME} accepts no model-selected arguments");
     }
-    let context = turn_context.context("record_phase2_steer requires turn context")?;
+    let context = turn_context.context("record_phase2_context requires turn context")?;
     if context.phase != Some(2) {
         bail!("{NAME} is available only in Phase 2");
     }
-    let steer = config
-        .phase2_steer
+    let phase2_context = config
+        .phase2_context
         .as_ref()
-        .context("record_phase2_steer requires a Rust-bound steer")?;
-    if steer.get("role").and_then(Value::as_str) != Some(context.role.as_str()) {
+        .context("record_phase2_context requires Rust-bound context")?;
+    if phase2_context.get("role").and_then(Value::as_str) != Some(context.role.as_str()) {
         bail!("{NAME} role does not match the Rust-bound turn");
     }
     Ok(json!({
         "status": "recorded",
-        "steer": steer,
+        "context": phase2_context,
         "turn_id": context.turn_id,
     }))
 }
@@ -52,14 +53,16 @@ mod tests {
     use crate::tools::ExternalToolConfig;
 
     #[test]
-    fn records_only_the_rust_bound_phase2_steer() {
+    fn records_only_the_rust_bound_phase2_context() {
         let config = ExternalToolConfig {
-            phase2_steer: Some(json!({
+            phase2_context: Some(json!({
                 "role": "researcher.bull.interaction",
                 "kind": "point_debate",
                 "topic_id": "topic-a",
                 "round": 1,
-                "round_num": 1
+                "round_num": 1,
+                "topic": {"title": "Volatility regime"},
+                "controller": {"next_steers": [{"steer_id": "steer-1"}]}
             })),
             ..ExternalToolConfig::default()
         };
@@ -73,7 +76,12 @@ mod tests {
 
         let output = execute(json!({}), &config, Some(&context)).unwrap();
         assert_eq!(output["status"], "recorded");
-        assert_eq!(output["steer"]["round_num"], 1);
+        assert_eq!(output["context"]["round_num"], 1);
+        assert_eq!(output["context"]["topic"]["title"], "Volatility regime");
+        assert_eq!(
+            output["context"]["controller"]["next_steers"][0]["steer_id"],
+            "steer-1"
+        );
         assert!(execute(json!({"round_num": 9}), &config, Some(&context)).is_err());
     }
 }

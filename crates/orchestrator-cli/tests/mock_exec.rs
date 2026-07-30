@@ -81,11 +81,11 @@ async fn mock_exec_phase7_writes_file_store_allocation() {
         .unwrap();
 
     assert_eq!(
-        result["run_state"]["trader_investment_plan"]["per_ticker"]["QQQ"]["payload"]["action"],
+        result["run_state"]["trader_investment_plan"]["per_ticker"]["QQQ"]["action"],
         "Hold"
     );
     assert_eq!(
-        result["run_state"]["final_trade_decision"]["per_asset"]["QQQ"]["payload"]["rating"],
+        result["run_state"]["final_trade_decision"]["per_asset"]["QQQ"]["rating"],
         "Hold"
     );
     assert_eq!(result["portfolio_allocation"]["total_equity_exposure"], 0.0);
@@ -98,11 +98,11 @@ async fn mock_exec_phase7_writes_file_store_allocation() {
     let state = &result["run_state"];
     assert_eq!(state["phase_status"]["7"], "done");
     assert_eq!(
-        state["trader_investment_plan"]["per_ticker"]["QQQ"]["profile"],
+        state["_completed_units"]["p4:trader:artifact:aggregate:none:0"]["profile"],
         "trade_intent"
     );
     assert_eq!(
-        state["final_trade_decision"]["per_asset"]["QQQ"]["profile"],
+        state["_completed_units"]["p6:portfolio.manager:artifact:aggregate:none:0"]["profile"],
         "portfolio_decision"
     );
 }

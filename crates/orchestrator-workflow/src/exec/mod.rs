@@ -23,10 +23,15 @@ use std::{
 
 use crate::evaluation::{materialize_pending, MarketInputConfigV1, MaterializerPolicyV1};
 use crate::orchestration::{
-    allocation::{compute_allocation_context, derive_guarded_allocation},
+    allocation::{
+        compute_allocation_context, derive_guarded_allocation, market_snapshot_from_technical,
+    },
     config::RuntimeConfig,
     input_snapshot_runtime::{capture_phase1_file_store_inputs, phase1_input_sources},
-    lifecycle::{run_id_for, run_id_for_seed, set_phase_status, tickers_from_state},
+    lifecycle::{
+        investable_assets_from_state, run_id_for, run_id_for_seed, set_phase_status,
+        tickers_from_state, validate_asset_scope,
+    },
     role_jobs::{
         commit_historical_reflection, prepare_role_job, record_role_job_metrics, run_role_jobs,
         RoleRun,
@@ -67,6 +72,11 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         bail!("orchestrator.analysis_universe is required in config")
     }
     let runtime = RuntimeConfig::from_value(&config)?;
+    validate_asset_scope(
+        &tickers,
+        &runtime.allocation.investable_assets,
+        &runtime.allocation.regime_signal,
+    )?;
     let store_root = runtime.store.resolve_root(args.store_root.as_deref())?;
     let canonical_run_id = run_id_for(&tickers, &current_date);
     // Paper/Live retain their stable identity so a configuration drift cannot
@@ -358,16 +368,14 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         "store_root": store.root(),
         "debate_mode": "file_store",
         "degraded": state["degraded"],
-        "rating": tickers_from_state(&state)
+        "rating": investable_assets_from_state(&state)
             .first()
             .and_then(|ticker| state.pointer(&format!("/research_plan/per_ticker/{ticker}/rating")))
             .cloned()
             .unwrap_or(Value::Null),
-        "action": tickers_from_state(&state)
+        "action": investable_assets_from_state(&state)
             .first()
-            .and_then(|ticker| {
-                state.pointer(&format!("/trader_investment_plan/per_ticker/{ticker}/payload/action"))
-            })
+            .and_then(|ticker| state.pointer(&format!("/trader_investment_plan/per_ticker/{ticker}/action")))
             .cloned()
             .unwrap_or(Value::Null),
         "portfolio_allocation": state.get("portfolio_allocation").cloned().unwrap_or(Value::Null),
@@ -667,10 +675,9 @@ async fn summarize(
         .collect())
 }
 
-fn required_phase_index_count(state: &Value, runtime: &RuntimeConfig, phase: u8) -> usize {
-    let tickers = tickers_from_state(state).len().max(1);
+fn required_phase_index_count(state: &Value, _runtime: &RuntimeConfig, phase: u8) -> usize {
     match phase {
-        1 => tickers * 2,
+        1 => 2,
         2 => {
             let topics = state
                 .pointer("/topic_generation_artifact/topics")
@@ -682,9 +689,8 @@ fn required_phase_index_count(state: &Value, runtime: &RuntimeConfig, phase: u8)
             // stop as soon as the controller says the debate is complete.
             3 + topics * 3
         }
-        3 | 4 => tickers,
-        5 => tickers * 3,
-        6 => runtime.allocation.investable_assets.len().max(1),
+        3 | 4 | 6 => 1,
+        5 => 3,
         7 | 8 => 1,
         _ => 0,
     }
@@ -990,6 +996,15 @@ async fn run_phase1(
             &tickers,
         )?;
         let input = capture_phase1_file_store_inputs(state, runtime, &sources)?;
+        let technical_snapshot = orchestrator_llm::tools::read_technical_snapshot::execute(
+            json!({"tickers": tickers, "intervals": ["daily"]}),
+            &orchestrator_llm::tools::ExternalToolConfig {
+                file_store_input: Some(input.clone()),
+                ..Default::default()
+            },
+        )?;
+        state["market_snapshot"] =
+            market_snapshot_from_technical(&technical_snapshot, &runtime.allocation)?;
         state["file_store_input"] = json!({
             "store_root": input.store_root,
             "run_id": input.run_id,
@@ -999,29 +1014,17 @@ async fn run_phase1(
     let roles = ["analyst.technical", "analyst.news_macro"];
     let mut reports = serde_json::Map::new();
     for role in roles {
-        for ticker in tickers_from_state(state) {
-            let artifact = run_unit(
-                state,
-                runtime,
-                role,
-                1,
-                "artifact",
-                None,
-                None,
-                Some(&ticker),
-                model,
-                reasoning,
-            )
-            .await?;
-            let entry = reports
-                .entry(role.to_owned())
-                .or_insert_with(|| json!({"role": role, "per_ticker": {}}));
-            entry["per_ticker"][ticker] =
-                artifact.get("payload").cloned().unwrap_or(artifact.clone());
-        }
+        let artifact = run_unit(
+            state, runtime, role, 1, "artifact", None, None, None, model, reasoning,
+        )
+        .await?;
+        reports.insert(
+            role.to_owned(),
+            artifact.get("payload").cloned().unwrap_or(artifact),
+        );
     }
     state["analyst_reports"] = Value::Object(reports);
-    state["phase1_index"] = json!({"per_ticker": phase1_index(state), "authority": "file_store"});
+    state["phase1_index"] = json!({"roles": state["analyst_reports"], "authority": "file_store"});
     state["weighted_probability_base"] = weighted_probability_base(state);
     Ok(())
 }
@@ -1242,39 +1245,42 @@ async fn run_phase3(
     model: Option<&str>,
     reasoning: Option<&str>,
 ) -> Result<()> {
-    let mut per_ticker = serde_json::Map::new();
-    for ticker in tickers_from_state(state) {
-        let artifact = run_unit(
-            state,
-            runtime,
-            "manager.research",
-            3,
-            "artifact",
-            None,
-            None,
-            Some(&ticker),
-            model,
-            reasoning,
-        )
-        .await?;
-        let decision = artifact
-            .pointer("/payload/decision")
-            .cloned()
-            .context("finalized research artifact is missing its typed decision payload")?;
-        per_ticker.insert(ticker, decision);
-    }
-    // This is an in-memory Rust aggregate view for downstream phases. The
-    // per-ticker canonical Artifacts remain the only persisted authority.
-    state["research_plan"] = json!({"per_ticker": per_ticker, "authority": "file_store"});
+    let artifact = run_unit(
+        state,
+        runtime,
+        "manager.research",
+        3,
+        "artifact",
+        None,
+        None,
+        None,
+        model,
+        reasoning,
+    )
+    .await?;
+    let decisions = artifact
+        .pointer("/payload/decisions")
+        .cloned()
+        .context("finalized research artifact is missing decisions")?;
+    state["research_plan"] = json!({
+        "per_ticker": decisions,
+        "regime_context": artifact.pointer("/payload/regime_context").cloned().unwrap_or(Value::Null),
+        "authority": "file_store"
+    });
     Ok(())
 }
 
 fn controller_should_continue(controller: &Value) -> Result<bool> {
-    let should_continue = controller
+    let Some(should_continue) = controller
         .pointer("/payload/soft_control/should_continue")
         .or_else(|| controller.pointer("/soft_control/should_continue"))
         .and_then(Value::as_bool)
-        .context("Topic Controller Summary requires soft_control.should_continue")?;
+    else {
+        tracing::warn!(
+            "Topic Controller Summary omitted soft_control.should_continue; stopping debate safely"
+        );
+        return Ok(false);
+    };
     if should_continue {
         let next_steers = controller
             .pointer("/payload/next_steers")
@@ -1294,24 +1300,15 @@ async fn run_phase4(
     model: Option<&str>,
     reasoning: Option<&str>,
 ) -> Result<()> {
-    let mut per_ticker = serde_json::Map::new();
-    for ticker in tickers_from_state(state) {
-        let artifact = run_unit(
-            state,
-            runtime,
-            "trader",
-            4,
-            "artifact",
-            None,
-            None,
-            Some(&ticker),
-            model,
-            reasoning,
-        )
-        .await?;
-        per_ticker.insert(ticker, artifact);
-    }
-    state["trader_investment_plan"] = json!({"per_ticker": per_ticker});
+    let artifact = run_unit(
+        state, runtime, "trader", 4, "artifact", None, None, None, model, reasoning,
+    )
+    .await?;
+    let plans = artifact
+        .pointer("/payload/plans")
+        .cloned()
+        .context("finalized trader artifact is missing plans")?;
+    state["trader_investment_plan"] = json!({"per_ticker": plans, "authority": "file_store"});
     Ok(())
 }
 
@@ -1323,23 +1320,11 @@ async fn run_phase5(
 ) -> Result<()> {
     let mut history = Vec::new();
     for role in ["risk.aggressive", "risk.neutral", "risk.conservative"] {
-        for ticker in tickers_from_state(state) {
-            history.push(
-                run_unit(
-                    state,
-                    runtime,
-                    role,
-                    5,
-                    "artifact",
-                    None,
-                    None,
-                    Some(&ticker),
-                    model,
-                    reasoning,
-                )
-                .await?,
-            );
-        }
+        let artifact = run_unit(
+            state, runtime, role, 5, "artifact", None, None, None, model, reasoning,
+        )
+        .await?;
+        history.push(artifact);
     }
     state["risk_debate_state"] = json!({"history": history, "authority": "file_store"});
     Ok(())
@@ -1351,28 +1336,23 @@ async fn run_phase6(
     model: Option<&str>,
     reasoning: Option<&str>,
 ) -> Result<()> {
-    let assets = if runtime.allocation.investable_assets.is_empty() {
-        tickers_from_state(state)
-    } else {
-        runtime.allocation.investable_assets.clone()
-    };
-    let mut per_asset = serde_json::Map::new();
-    for ticker in assets {
-        let artifact = run_unit(
-            state,
-            runtime,
-            "portfolio.manager",
-            6,
-            "artifact",
-            None,
-            None,
-            Some(&ticker),
-            model,
-            reasoning,
-        )
-        .await?;
-        per_asset.insert(ticker, artifact);
-    }
+    let artifact = run_unit(
+        state,
+        runtime,
+        "portfolio.manager",
+        6,
+        "artifact",
+        None,
+        None,
+        None,
+        model,
+        reasoning,
+    )
+    .await?;
+    let per_asset = artifact
+        .pointer("/payload/per_asset")
+        .cloned()
+        .context("finalized portfolio artifact is missing per_asset")?;
     state["final_trade_decision"] = json!({"per_asset": per_asset, "authority": "file_store"});
     Ok(())
 }
@@ -1450,7 +1430,7 @@ fn run_phase8(
                     document_ref: usage_ledger.publish_report(&Utc::now().to_rfc3339())?,
                 }
             };
-            for ticker in tickers_from_state(state) {
+            for ticker in investable_assets_from_state(state) {
                 let decision = decision_snapshot(
                     runtime,
                     location,
@@ -1663,7 +1643,7 @@ async fn run_unit(
     {
         return Ok(artifact);
     }
-    let scoped = scoped_state_for_unit(state, role, ticker);
+    let scoped = scoped_state_for_unit(state, ticker);
     let prompt_path = runtime
         .prompts
         .path_for(prompt_owner_for_unit(role, kind))
@@ -1755,9 +1735,9 @@ async fn compile_unit_response(
 ) -> Result<Value> {
     let phase_u8 = u8::try_from(phase).context("compiled phase must fit u8")?;
     let mut candidate = if state["mock"].as_bool().unwrap_or(false) {
-        mock_phase_index_candidate(phase_u8, role, kind, response_text)
+        mock_phase_index_candidate(state, phase_u8, role, kind, response_text)
     } else {
-        let mut scoped = scoped_state_for_unit(state, role, ticker);
+        let mut scoped = scoped_state_for_unit(state, ticker);
         scoped["_summary_source_payload"] = json!({
             "phase": phase,
             "role": role,
@@ -1824,6 +1804,7 @@ async fn compile_unit_response(
         response_text,
         &mut candidate.authoritative_fields,
     )?;
+    validate_compiled_asset_scope(state, phase_u8, &candidate.authoritative_fields)?;
     if phase_u8 == 0 {
         let submission = phase0_submission(&candidate, response_text)?;
         commit_historical_reflection(
@@ -1905,6 +1886,24 @@ fn enrich_compiled_fields(
     fields: &mut serde_json::Map<String, Value>,
 ) -> Result<()> {
     attach_verified_web_evidence(response_text, fields)?;
+    if kind == "topic_control" {
+        let has_valid_soft_control = fields
+            .get("soft_control")
+            .and_then(Value::as_object)
+            .and_then(|value| value.get("should_continue"))
+            .and_then(Value::as_bool)
+            .is_some();
+        if !has_valid_soft_control {
+            fields.insert(
+                "soft_control".to_owned(),
+                json!({
+                    "should_continue": false,
+                    "info_gain_score": 0.0,
+                    "stop_reason": "Summary omitted a valid soft_control decision; debate stopped safely.",
+                }),
+            );
+        }
+    }
     if kind == "topic_generation" {
         for (offset, topic) in fields
             .get_mut("topics")
@@ -2004,50 +2003,74 @@ fn attach_verified_web_evidence(
 }
 
 fn mock_phase_index_candidate(
+    state: &Value,
     phase: u8,
     role: &str,
     kind: &str,
     response_text: &str,
 ) -> PhaseIndexCandidate {
+    let analysis = tickers_from_state(state);
+    let investable = investable_assets_from_state(state);
     let authoritative_fields = match phase {
         0 => json!({"disposition":"no_reusable_memory","source_index_ids":[]}),
-        1 => json!({
-            "direction":"neutral","confidence":0.5,"priced_in":"unclear",
-            "report":response_text,"key_evidence":[],"validation_triggers":[],
-            "data_gaps":[],"echo_chamber_risk":"low","crowded_consensus_risk":"low",
-            "jin10_attention":[]
-        }),
+        1 => json!({"per_ticker": analysis.into_iter().map(|ticker| (
+            ticker,
+            json!({
+                "direction":"neutral","confidence":0.5,"priced_in":"unclear",
+                "report":response_text,"key_evidence":[],"validation_triggers":[],
+                "data_gaps":[],"echo_chamber_risk":"low","crowded_consensus_risk":"low",
+                "jin10_attention":[]
+            })
+        )).collect::<serde_json::Map<_, _>>()}),
         2 if kind == "topic_generation" => {
             json!({"common_ground":{},"topics":[],"summary":"No mock debate topic."})
         }
         2 => json!({"status":"prepared","claims":[],"replies":[]}),
-        3 => json!({"decision":{
-            "rating":"Hold","long_probability":0.5,"short_probability":0.5,
-            "base_probability":0.5,"debate_adjustment":0.0,
-            "confidence_basis":"evidence_balanced","hold_reason":"evidence_balanced",
-            "plan":response_text,"probability_rationale":"Mock evidence is balanced.",
-            "scenarios":{},"decision_hinges":[],"validation_plan":[]
-        }}),
-        4 => json!({
-            "action":"Hold","execution_decision":"hold",
-            "position_size_pct_max":0.0,"entry_price":null,"stop_loss":null,
-            "blockers":[],"execution_conditions":[],"downgrade_reason":"mock","rationale":response_text
+        3 => json!({
+            "decisions": investable.iter().map(|ticker| (
+                ticker.clone(),
+                json!({
+                    "rating":"Hold","long_probability":0.5,"short_probability":0.5,
+                    "base_probability":0.5,"debate_adjustment":0.0,
+                    "confidence_basis":"evidence_balanced","hold_reason":"evidence_balanced",
+                    "plan":response_text,"probability_rationale":"Mock evidence is balanced.",
+                    "scenarios":{},"decision_hinges":[],"validation_plan":[]
+                })
+            )).collect::<serde_json::Map<_, _>>(),
+            "regime_context": {"signal": "VIX", "status": "mock"}
         }),
+        4 => json!({"plans": investable.iter().map(|ticker| (
+            ticker.clone(),
+            json!({
+                "action":"Hold","execution_decision":"hold",
+                "position_size_pct_max":0.0,"entry_price":null,"stop_loss":null,
+                "blockers":[],"execution_conditions":[],"downgrade_reason":"mock","rationale":response_text
+            })
+        )).collect::<serde_json::Map<_, _>>()}),
         5 => json!({
             "stance":role.strip_prefix("risk.").unwrap_or("neutral"),
             "unique_risk_contribution":"","disagreement_with_prior":"",
             "no_new_information":true,"recommended_adjustment":"",
-            "position_cap_pct":0.0,"max_drawdown_pct":0.0,"stop_type":"",
-            "risk_off_trigger":"","rebalance_trigger":"","review_window":"",
-            "cash_hedge_recommendation":"","constraint_confidence":0.0
+            "per_asset": investable.iter().map(|ticker| (
+                ticker.clone(),
+                json!({
+                    "position_cap_pct":0.0,"max_drawdown_pct":0.0,"stop_type":"",
+                    "risk_off_trigger":"","rebalance_trigger":"","review_window":"",
+                    "constraint_confidence":0.0
+                })
+            )).collect::<serde_json::Map<_, _>>(),
+            "cash_hedge_recommendation":""
         }),
-        6 => json!({
-            "direction_constraint":"unchanged","execution_status":"wait",
-            "max_target_weight":0.0,"max_weight_delta":0.0,
-            "binding_risk_controls":[],"rating":"Hold",
-            "inherited_probability":0.5,"execution_rationale":response_text,
-            "unresolved_blockers":[]
-        }),
+        6 => json!({"per_asset": investable.iter().map(|ticker| (
+            ticker.clone(),
+            json!({
+                "direction_constraint":"unchanged","execution_status":"wait",
+                "max_target_weight":0.0,"max_weight_delta":0.0,
+                "binding_risk_controls":[],"rating":"Hold",
+                "inherited_probability":0.5,"execution_rationale":response_text,
+                "unresolved_blockers":[]
+            })
+        )).collect::<serde_json::Map<_, _>>()}),
         _ => json!({}),
     };
     PhaseIndexCandidate {
@@ -2075,14 +2098,12 @@ fn prompt_owner_for_unit<'a>(role: &'a str, kind: &str) -> &'a str {
     }
 }
 
-fn scoped_state_for_unit(state: &Value, role: &str, ticker: Option<&str>) -> Value {
+fn scoped_state_for_unit(state: &Value, ticker: Option<&str>) -> Value {
     let mut scoped = state.clone();
     if let Some(ticker) = ticker {
         scoped["ticker"] = json!(ticker);
         scoped["tickers"] = json!([ticker]);
-        if role == "portfolio.manager" {
-            scoped["investable_assets"] = json!([ticker]);
-        }
+        scoped["analysis_universe"] = json!([ticker]);
     }
     scoped
 }
@@ -2187,37 +2208,74 @@ fn record_phase2_session(
     state["phase2_file_store_sessions"][topic_id][side] = session;
 }
 
-fn phase1_index(state: &Value) -> serde_json::Map<String, Value> {
-    tickers_from_state(state)
-        .into_iter()
-        .map(|ticker| {
-            let roles = state["analyst_reports"]
-                .as_object()
-                .map(|reports| {
-                    reports
-                        .iter()
-                        .filter_map(|(role, report)| {
-                            report
-                                .pointer(&format!("/per_ticker/{ticker}"))
-                                .map(|value| json!({"role": role, "artifact": value}))
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            (
-                ticker,
-                json!({"role_summaries": roles, "evidence_quality": "tool_managed"}),
-            )
-        })
-        .collect()
-}
-
 fn weighted_probability_base(state: &Value) -> Value {
-    let values = tickers_from_state(state)
+    let values = investable_assets_from_state(state)
         .into_iter()
         .map(|ticker| (ticker, json!({"long_probability": 0.5, "short_probability": 0.5, "source": "phase1_tool_managed"})))
         .collect::<serde_json::Map<_, _>>();
     Value::Object(values)
+}
+
+fn validate_asset_keys(state: &Value, value: &Value, label: &str) -> Result<()> {
+    let actual = value
+        .as_object()
+        .with_context(|| format!("{label} must be an object"))?
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let expected = investable_assets_from_state(state)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    if actual != expected {
+        bail!("{label} must contain exactly {expected:?}; got {actual:?}")
+    }
+    Ok(())
+}
+
+fn validate_compiled_asset_scope(
+    state: &Value,
+    phase: u8,
+    fields: &serde_json::Map<String, Value>,
+) -> Result<()> {
+    match phase {
+        1 => validate_analysis_keys(
+            state,
+            fields.get("per_ticker").unwrap_or(&Value::Null),
+            "Phase 1 per_ticker",
+        ),
+        3 => validate_asset_keys(
+            state,
+            fields.get("decisions").unwrap_or(&Value::Null),
+            "Phase 3 decisions",
+        ),
+        4 => validate_asset_keys(
+            state,
+            fields.get("plans").unwrap_or(&Value::Null),
+            "Phase 4 plans",
+        ),
+        5 | 6 => validate_asset_keys(
+            state,
+            fields.get("per_asset").unwrap_or(&Value::Null),
+            &format!("Phase {phase} per_asset"),
+        ),
+        _ => Ok(()),
+    }
+}
+
+fn validate_analysis_keys(state: &Value, value: &Value, label: &str) -> Result<()> {
+    let actual = value
+        .as_object()
+        .with_context(|| format!("{label} must be an object"))?
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let expected = tickers_from_state(state)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    if actual != expected {
+        bail!("{label} must contain exactly {expected:?}; got {actual:?}")
+    }
+    Ok(())
 }
 
 fn seal_state(state: &mut Value) -> Result<()> {
@@ -2233,9 +2291,9 @@ mod phase2_session_tests {
     use serde_json::json;
 
     use super::{
-        attach_verified_web_evidence, controller_should_continue, highest_completed_phase,
-        prompt_owner_for_unit, record_phase2_session, runtime_session_key, scoped_state_for_unit,
-        select_reflection_task_budget, sync_manifest_health,
+        attach_verified_web_evidence, controller_should_continue, enrich_compiled_fields,
+        highest_completed_phase, prompt_owner_for_unit, record_phase2_session, runtime_session_key,
+        scoped_state_for_unit, select_reflection_task_budget, sync_manifest_health,
     };
 
     #[test]
@@ -2263,11 +2321,26 @@ mod phase2_session_tests {
             "payload": {"soft_control": {"should_continue": false}}
         }))
         .unwrap());
-        assert!(controller_should_continue(&json!({})).is_err());
+        assert!(!controller_should_continue(&json!({})).unwrap());
         assert!(controller_should_continue(&json!({
             "payload": {"soft_control": {"should_continue": true}}
         }))
         .is_err());
+    }
+
+    #[test]
+    fn missing_controller_soft_control_is_normalized_to_safe_stop() {
+        let mut fields = serde_json::Map::from_iter([("soft_control".to_owned(), json!(""))]);
+        enrich_compiled_fields(
+            "mediator.topic_controller",
+            "topic_control",
+            Some("topic-a"),
+            "controller report",
+            &mut fields,
+        )
+        .unwrap();
+        assert_eq!(fields["soft_control"]["should_continue"], false);
+        assert_eq!(fields["soft_control"]["info_gain_score"], 0.0);
     }
 
     #[test]
@@ -2303,14 +2376,18 @@ mod phase2_session_tests {
     }
 
     #[test]
-    fn portfolio_unit_only_sees_its_own_asset() {
+    fn historical_ticker_scope_does_not_narrow_investable_assets() {
         let scoped = scoped_state_for_unit(
-            &json!({"tickers": ["QQQ", "SOXX"], "investable_assets": ["QQQ", "SOXX"]}),
-            "portfolio.manager",
+            &json!({
+                "tickers": ["QQQ", "SOXX"],
+                "analysis_universe": ["QQQ", "SOXX"],
+                "investable_assets": ["QQQ", "SOXX"]
+            }),
             Some("SOXX"),
         );
         assert_eq!(scoped["tickers"], json!(["SOXX"]));
-        assert_eq!(scoped["investable_assets"], json!(["SOXX"]));
+        assert_eq!(scoped["analysis_universe"], json!(["SOXX"]));
+        assert_eq!(scoped["investable_assets"], json!(["QQQ", "SOXX"]));
     }
 
     #[test]

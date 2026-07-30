@@ -6,7 +6,7 @@ pub mod read_jin10_candidates;
 pub mod read_reflection_source;
 pub mod read_technical_detail;
 pub mod read_technical_snapshot;
-pub mod record_phase2_steer;
+pub mod record_phase2_context;
 pub mod research_evidence_gap;
 pub mod think;
 pub mod verify_event;
@@ -57,10 +57,10 @@ pub struct ExternalToolConfig {
     /// retired database implementation.
     #[serde(skip)]
     pub file_store_reflection_source: Option<Value>,
-    /// Canonical Phase 2 topic/round identity. Models cannot choose or modify
+    /// Canonical Phase 2 in-memory context. Models cannot choose or modify
     /// these fields; the record tool only exposes this Rust-bound value.
     #[serde(skip)]
-    pub phase2_steer: Option<Value>,
+    pub phase2_context: Option<Value>,
 }
 
 /// Identity of Technical/Jin10 input hashes captured for one FileStore
@@ -100,7 +100,7 @@ impl Default for ExternalToolConfig {
             alpaca_api_secret: None,
             file_store_input: None,
             file_store_reflection_source: None,
-            phase2_steer: None,
+            phase2_context: None,
         }
     }
 }
@@ -175,8 +175,8 @@ const REGISTRY: &[ToolEntry] = &[
         definition: verify_event::definition,
     },
     ToolEntry {
-        name: record_phase2_steer::NAME,
-        definition: record_phase2_steer::definition,
+        name: record_phase2_context::NAME,
+        definition: record_phase2_context::definition,
     },
     ToolEntry {
         name: research_evidence_gap::NAME,
@@ -197,7 +197,7 @@ pub fn tool_names() -> &'static [&'static str] {
         read_technical_detail::NAME,
         read_jin10_candidates::NAME,
         verify_event::NAME,
-        record_phase2_steer::NAME,
+        record_phase2_context::NAME,
         alpaca::GET_NEWS_NAME,
     ]
 }
@@ -345,7 +345,7 @@ pub async fn execute_named_tool(
         read_technical_detail::NAME => read_technical_detail::execute(args, config),
         read_jin10_candidates::NAME => read_jin10_candidates::execute(args, config),
         verify_event::NAME => verify_event::execute(args, config, web_run).await,
-        record_phase2_steer::NAME => record_phase2_steer::execute(args, config, turn_context),
+        record_phase2_context::NAME => record_phase2_context::execute(args, config, turn_context),
         research_evidence_gap::NAME => {
             bail!("{name} requires an EvidenceResearchBinding and is unavailable without that typed binding")
         }

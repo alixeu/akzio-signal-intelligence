@@ -5,6 +5,73 @@ use std::collections::BTreeMap;
 
 use super::config::AllocationConfig;
 
+pub(crate) fn market_snapshot_from_technical(
+    technical: &Value,
+    config: &AllocationConfig,
+) -> Result<Value> {
+    let mut per_ticker = serde_json::Map::new();
+    let mut regime_level = None;
+    for snapshot in technical
+        .get("snapshots")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(ticker) = snapshot.get("ticker").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(daily) = snapshot
+            .get("intervals")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .find(|interval| interval.get("interval").and_then(Value::as_str) == Some("daily"))
+        else {
+            continue;
+        };
+        let latest_close = daily.pointer("/latest/close").and_then(Value::as_f64);
+        let vol_pct = daily
+            .get("signals")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .find(|signal| signal.get("kind").and_then(Value::as_str) == Some("volatility"))
+            .and_then(|signal| signal.get("realized_volatility"))
+            .and_then(Value::as_f64);
+        if ticker == config.regime_signal {
+            regime_level = latest_close;
+        }
+        per_ticker.insert(
+            ticker.to_owned(),
+            json!({
+                "latest_close": latest_close,
+                "vol_pct": vol_pct,
+                "as_of": daily.pointer("/latest/date").cloned().unwrap_or(Value::Null),
+                "status": daily.get("status").cloned().unwrap_or(Value::Null),
+            }),
+        );
+    }
+    let vix = if let Some(level) = regime_level {
+        let (regime, equity_budget_hint) =
+            classify_regime(level, &config.regime_thresholds, &config.regime_labels);
+        json!({
+            "signal": config.regime_signal,
+            "level": level,
+            "regime": regime,
+            "equity_budget_hint": equity_budget_hint,
+            "status": "available"
+        })
+    } else {
+        unavailable_vix(config)
+    };
+    Ok(json!({
+        "source": "filestore.run_input.technical.daily",
+        "vix": vix,
+        "per_ticker": per_ticker,
+        "correlation_60d": null
+    }))
+}
+
 pub(crate) fn compute_allocation_context(
     state: &Value,
     config: &AllocationConfig,
@@ -88,13 +155,8 @@ pub(crate) fn compute_allocation_context(
         Some(_) => "相关性适中",
         None => "相关性数据不足",
     };
-    let trader_plan = investable
-        .first()
-        .and_then(|ticker| {
-            state.pointer(&format!(
-                "/trader_investment_plan/per_ticker/{ticker}/payload"
-            ))
-        })
+    let trader_plans = state
+        .pointer("/trader_investment_plan/per_ticker")
         .cloned()
         .unwrap_or(Value::Null);
 
@@ -103,7 +165,7 @@ pub(crate) fn compute_allocation_context(
         "vix": vix_info,
         "per_ticker": per_ticker,
         "research_plan": state.get("research_plan").cloned().unwrap_or(Value::Null),
-        "trader_plan": trader_plan,
+        "trader_plans": trader_plans,
         "risk_debate_state": state.get("risk_debate_state").cloned().unwrap_or(Value::Null),
         "final_trade_decision": state.get("final_trade_decision").cloned().unwrap_or(Value::Null),
         "correlation_60d": correlation_60d,
@@ -172,10 +234,10 @@ pub(crate) fn normalize_allocation(
         return fallback_inverse_vol(context, config, "llm_output_empty");
     }
 
-    if trader_plan_has_zero_position(context) {
+    if all_trader_plans_have_zero_position(context) {
         return cash_only_allocation(
             context,
-            "LLM allocation conflicts with the upstream 0% trader position",
+            "LLM allocation conflicts with all upstream trader plans being capped at 0%",
         );
     }
 
@@ -197,10 +259,10 @@ pub(crate) fn normalize_allocation(
         }
     }
 
-    let max_pos = effective_position_cap(context, config);
     let mut excess = 0.0;
     for ticker in &investable {
         if let Some(w) = weights.get_mut(ticker) {
+            let max_pos = effective_position_cap(context, config, ticker);
             if *w > max_pos {
                 excess += *w - max_pos;
                 *w = max_pos;
@@ -209,31 +271,6 @@ pub(crate) fn normalize_allocation(
     }
     if excess > 0.0 {
         *weights.entry("cash_hedge".to_string()).or_insert(0.0) += excess;
-    }
-
-    let equity_before_cap = investable
-        .iter()
-        .filter_map(|ticker| weights.get(ticker))
-        .sum::<f64>();
-    if let Some(total_cap) = trader_plan_position_cap(context) {
-        if equity_before_cap > total_cap + f64::EPSILON {
-            if total_cap <= f64::EPSILON {
-                return cash_only_allocation(
-                    context,
-                    "LLM allocation conflicts with the upstream 0% trader position",
-                );
-            }
-            let scale = total_cap / equity_before_cap;
-            for ticker in &investable {
-                if let Some(weight) = weights.get_mut(ticker) {
-                    *weight *= scale;
-                }
-            }
-            weights.insert("cash_hedge".to_string(), 1.0 - total_cap);
-            rationales
-                .entry("cash_hedge".to_string())
-                .or_insert_with(|| "Cash absorbs the upstream total-exposure cap.".to_string());
-        }
     }
 
     let weights_json: BTreeMap<String, AllocationWeight> = weights
@@ -321,7 +358,7 @@ fn apply_phase6_execution_constraints(
             .and_then(Value::as_f64)
             .filter(|weight| weight.is_finite())
             .unwrap_or(current)
-            .clamp(0.0, effective_position_cap(context, config));
+            .clamp(0.0, effective_position_cap(context, config, ticker));
         let delta = constraint
             .get("max_weight_delta")
             .and_then(Value::as_f64)
@@ -442,7 +479,8 @@ fn validate_allocation_output(
         if !weight.is_finite() || weight < 0.0 {
             bail!("allocation weight invalid for {asset}: {weight}");
         }
-        if asset != "cash_hedge" && weight > effective_position_cap(context, config) + 0.0001 {
+        if asset != "cash_hedge" && weight > effective_position_cap(context, config, asset) + 0.0001
+        {
             bail!("allocation weight exceeds cap for {asset}: {weight}");
         }
         total += weight;
@@ -454,10 +492,10 @@ fn validate_allocation_output(
 }
 
 fn fallback_inverse_vol(context: &Value, config: &AllocationConfig, reason: &str) -> Value {
-    if trader_plan_has_zero_position(context) {
+    if all_trader_plans_have_zero_position(context) {
         return cash_only_allocation(
             context,
-            &format!("Upstream trader plan has a 0% position; fallback reason={reason}"),
+            &format!("All upstream trader plans have a 0% position; fallback reason={reason}"),
         );
     }
 
@@ -484,9 +522,7 @@ fn fallback_inverse_vol(context: &Value, config: &AllocationConfig, reason: &str
         "defensive" => 0.30,
         _ => 0.70,
     };
-    let equity_budget = trader_plan_position_cap(context)
-        .map(|position_cap| regime_equity_budget.min(position_cap))
-        .unwrap_or(regime_equity_budget);
+    let equity_budget = regime_equity_budget;
 
     let vols: Vec<(String, f64)> = investable
         .iter()
@@ -513,7 +549,7 @@ fn fallback_inverse_vol(context: &Value, config: &AllocationConfig, reason: &str
     let mut weights = BTreeMap::new();
     for (ticker, vol) in &vols {
         let raw_w = (1.0 / vol) / inv_vol_sum * equity_budget;
-        let capped = raw_w.min(effective_position_cap(context, config));
+        let capped = raw_w.min(effective_position_cap(context, config, ticker));
         weights.insert(
             ticker.clone(),
             json!({
@@ -546,18 +582,24 @@ fn fallback_inverse_vol(context: &Value, config: &AllocationConfig, reason: &str
     })
 }
 
-fn trader_plan_has_zero_position(context: &Value) -> bool {
-    trader_plan_position_cap(context).is_some_and(|position| position <= f64::EPSILON)
+fn all_trader_plans_have_zero_position(context: &Value) -> bool {
+    let Some(investable) = context.get("investable_assets").and_then(Value::as_array) else {
+        return false;
+    };
+    !investable.is_empty()
+        && investable.iter().filter_map(Value::as_str).all(|ticker| {
+            trader_plan_position_cap(context, ticker).is_some_and(|cap| cap <= f64::EPSILON)
+        })
 }
 
-fn effective_position_cap(context: &Value, config: &AllocationConfig) -> f64 {
+fn effective_position_cap(context: &Value, config: &AllocationConfig, ticker: &str) -> f64 {
     let configured_cap = config.max_single_position.clamp(0.0, 1.0);
-    let trader_cap = trader_plan_position_cap(context).unwrap_or(1.0);
-    let risk_cap = active_risk_position_cap(context).unwrap_or(1.0);
+    let trader_cap = trader_plan_position_cap(context, ticker).unwrap_or(1.0);
+    let risk_cap = active_risk_position_cap(context, ticker).unwrap_or(1.0);
     configured_cap.min(trader_cap).min(risk_cap)
 }
 
-fn active_risk_position_cap(context: &Value) -> Option<f64> {
+fn active_risk_position_cap(context: &Value, ticker: &str) -> Option<f64> {
     let risk_state = context.get("risk_debate_state")?;
     let direct = std::iter::once(risk_state);
     let history = risk_state
@@ -565,7 +607,7 @@ fn active_risk_position_cap(context: &Value) -> Option<f64> {
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(|turn| turn.get("artifact"));
+        .map(|turn| turn.get("artifact").unwrap_or(turn));
     let constraints = risk_state
         .get("constraints")
         .and_then(Value::as_array)
@@ -576,8 +618,12 @@ fn active_risk_position_cap(context: &Value) -> Option<f64> {
         .chain(history)
         .chain(constraints)
         .filter(|artifact| !risk_artifact_is_degraded(artifact))
-        .filter_map(|artifact| artifact.get("payload"))
-        .filter_map(|payload| payload.get("position_cap_pct"))
+        .filter_map(|artifact| artifact.get("payload").or(Some(artifact)))
+        .filter_map(|payload| {
+            payload
+                .pointer(&format!("/per_asset/{ticker}/position_cap_pct"))
+                .or_else(|| payload.get("position_cap_pct"))
+        })
         .filter_map(position_fraction)
         .min_by(f64::total_cmp)
 }
@@ -591,8 +637,10 @@ fn risk_artifact_is_degraded(artifact: &Value) -> bool {
         )
 }
 
-fn trader_plan_position_cap(context: &Value) -> Option<f64> {
-    let plan = context.get("trader_plan")?;
+fn trader_plan_position_cap(context: &Value, ticker: &str) -> Option<f64> {
+    let plan = context
+        .pointer(&format!("/trader_plans/{ticker}"))
+        .or_else(|| context.get("trader_plan"))?;
     match plan.get("action").and_then(Value::as_str) {
         Some(action) if action.eq_ignore_ascii_case("hold") => Some(0.0),
         Some(action)
@@ -677,14 +725,13 @@ fn equity_budget_deviation(context: &Value, actual: f64) -> Value {
 }
 
 fn unavailable_vix(config: &AllocationConfig) -> Value {
-    let (regime, budget_hint) =
-        classify_regime(0.0, &config.regime_thresholds, &config.regime_labels);
     json!({
+        "signal": config.regime_signal,
         "level": null,
-        "regime": regime,
-        "equity_budget_hint": budget_hint,
+        "regime": "defensive",
+        "equity_budget_hint": "0.00-0.40",
         "status": "data_gap",
-        "reason": "run-local technical snapshot has no VIX projection"
+        "reason": "run-local technical snapshot has no VIX projection; fail closed"
     })
 }
 
@@ -792,6 +839,31 @@ mod tests {
     }
 
     #[test]
+    fn technical_snapshot_projects_vix_and_asset_volatility() {
+        let snapshot = market_snapshot_from_technical(
+            &json!({
+                "snapshots": [
+                    {"ticker": "QQQ", "intervals": [{
+                        "interval": "daily", "status": "ok",
+                        "latest": {"date": "2026-07-30", "close": 600.0},
+                        "signals": [{"kind": "volatility", "realized_volatility": 0.012}]
+                    }]},
+                    {"ticker": "VIX", "intervals": [{
+                        "interval": "daily", "status": "ok",
+                        "latest": {"date": "2026-07-30", "close": 22.0},
+                        "signals": [{"kind": "volatility", "realized_volatility": 0.08}]
+                    }]}
+                ]
+            }),
+            &test_config(),
+        )
+        .unwrap();
+
+        assert_eq!(snapshot["vix"]["regime"], "elevated");
+        assert_eq!(snapshot["per_ticker"]["QQQ"]["vol_pct"], 0.012);
+    }
+
+    #[test]
     fn normalize_allocation_filters_invalid_assets_and_moves_cap_excess_to_cash() {
         let allocation = normalize_allocation(
             &json!({
@@ -844,8 +916,10 @@ mod tests {
             allocation["allocation_method"],
             json!("fallback_inverse_vol")
         );
-        assert_eq!(allocation["total_equity_exposure"], json!(0.25));
-        assert_eq!(allocation["weights"]["cash_hedge"]["weight"], json!(0.75));
+        assert_eq!(allocation["total_equity_exposure"], json!(0.45));
+        assert_eq!(allocation["weights"]["QQQ"]["weight"], json!(0.25));
+        assert_eq!(allocation["weights"]["SOXX"]["weight"], json!(0.2));
+        assert_eq!(allocation["weights"]["cash_hedge"]["weight"], json!(0.55));
     }
 
     #[test]
@@ -871,7 +945,32 @@ mod tests {
     }
 
     #[test]
-    fn valid_llm_weights_are_scaled_to_explicit_trader_position_cap() {
+    fn one_hold_does_not_veto_another_investable_asset() {
+        let mut context = test_context();
+        context["trader_plans"] = json!({
+            "QQQ": {"action": "Hold", "position_size_pct_max": 0.0},
+            "SOXX": {"action": "Buy", "position_size_pct_max": 0.3}
+        });
+
+        let allocation = normalize_allocation(
+            &json!({
+                "weights": {
+                    "QQQ": {"weight": 0.4},
+                    "SOXX": {"weight": 0.4},
+                    "cash_hedge": {"weight": 0.2}
+                }
+            }),
+            &context,
+            &test_config(),
+        );
+
+        assert_eq!(allocation["weights"]["QQQ"]["weight"], json!(0.0));
+        assert_eq!(allocation["weights"]["SOXX"]["weight"], json!(0.3));
+        assert_eq!(allocation["weights"]["cash_hedge"]["weight"], json!(0.7));
+    }
+
+    #[test]
+    fn valid_llm_weights_are_capped_per_asset_by_trader_position_cap() {
         let mut context = test_context();
         context["trader_plan"] = json!({"action": "Buy", "position_size_pct_max": 0.1});
 
@@ -887,14 +986,14 @@ mod tests {
             &test_config(),
         );
 
-        assert_eq!(allocation["total_equity_exposure"], json!(0.1));
-        assert_eq!(allocation["weights"]["QQQ"]["weight"], json!(0.05));
-        assert_eq!(allocation["weights"]["SOXX"]["weight"], json!(0.05));
-        assert_eq!(allocation["weights"]["cash_hedge"]["weight"], json!(0.9));
+        assert_eq!(allocation["total_equity_exposure"], json!(0.2));
+        assert_eq!(allocation["weights"]["QQQ"]["weight"], json!(0.1));
+        assert_eq!(allocation["weights"]["SOXX"]["weight"], json!(0.1));
+        assert_eq!(allocation["weights"]["cash_hedge"]["weight"], json!(0.8));
     }
 
     #[test]
-    fn trader_numeric_position_cap_limits_total_exposure() {
+    fn trader_numeric_position_cap_limits_each_asset() {
         let mut context = test_context();
         context["trader_plan"] = json!({"action": "Buy", "position_size_pct_max": 0.25});
 
@@ -910,10 +1009,10 @@ mod tests {
             &test_config(),
         );
 
-        assert_eq!(allocation["total_equity_exposure"], json!(0.25));
-        assert_eq!(allocation["weights"]["QQQ"]["weight"], json!(0.125));
-        assert_eq!(allocation["weights"]["SOXX"]["weight"], json!(0.125));
-        assert_eq!(allocation["weights"]["cash_hedge"]["weight"], json!(0.75));
+        assert_eq!(allocation["total_equity_exposure"], json!(0.5));
+        assert_eq!(allocation["weights"]["QQQ"]["weight"], json!(0.25));
+        assert_eq!(allocation["weights"]["SOXX"]["weight"], json!(0.25));
+        assert_eq!(allocation["weights"]["cash_hedge"]["weight"], json!(0.5));
     }
 
     #[test]

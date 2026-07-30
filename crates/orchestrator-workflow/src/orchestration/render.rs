@@ -4,7 +4,9 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
-use super::lifecycle::{research_plan_to_trade_intent, tickers_from_state, topic_state};
+use super::lifecycle::{
+    investable_assets_from_state, research_plan_to_trade_intent, tickers_from_state,
+};
 use orchestrator_core::ComponentRegistry;
 
 /// Load a shared prompt component from `prompts/common/<file_name>` relative to
@@ -201,14 +203,21 @@ fn retrieval_bootstrap(state: &Value, current_phase: i64) -> Value {
 
 fn phase4_control_context(state: &Value) -> Value {
     let research_plan = state.get("research_plan").filter(|value| !value.is_null());
-    let candidate = research_plan
-        .map(research_plan_to_trade_intent)
+    let candidates = research_plan
+        .and_then(|plan| plan.get("per_ticker"))
+        .and_then(Value::as_object)
+        .map(|decisions| {
+            decisions
+                .iter()
+                .map(|(ticker, decision)| (ticker.clone(), research_plan_to_trade_intent(decision)))
+                .collect::<serde_json::Map<_, _>>()
+        })
+        .map(Value::Object)
         .unwrap_or(Value::Null);
     json!({
         "status": if research_plan.is_some() { "available" } else { "not_loaded" },
-        "item_count": usize::from(research_plan.is_some()),
-        "candidate_action": candidate.get("candidate_action"),
-        "allowed_direction": candidate.get("candidate_action"),
+        "item_count": candidates.as_object().map_or(0, serde_json::Map::len),
+        "per_asset": candidates,
         "semantic_source": "rust_deterministic_rating_mapping",
         "phase3_semantics_included": false
     })
@@ -354,12 +363,18 @@ pub(crate) fn render_prompt_with_plugins(
     role: &str,
     phase: i64,
     kind: &str,
-    round: Option<i64>,
-    topic_id: Option<&str>,
+    _round: Option<i64>,
+    _topic_id: Option<&str>,
     prompt_path: Option<&std::path::Path>,
     component_registry: Option<&ComponentRegistry>,
 ) -> Result<String> {
     let tickers = tickers_from_state(state);
+    let investable_assets = investable_assets_from_state(state);
+    let context_only_assets = tickers
+        .iter()
+        .filter(|ticker| !investable_assets.contains(ticker))
+        .cloned()
+        .collect::<Vec<_>>();
     let ticker = state
         .get("ticker")
         .and_then(Value::as_str)
@@ -455,6 +470,15 @@ pub(crate) fn render_prompt_with_plugins(
     insert_if_referenced(&mut values, &placeholders, "tickers", || {
         Ok(Value::String(tickers.join(",")))
     })?;
+    insert_if_referenced(&mut values, &placeholders, "analysis_universe", || {
+        Ok(Value::String(tickers.join(",")))
+    })?;
+    insert_if_referenced(&mut values, &placeholders, "investable_assets", || {
+        Ok(Value::String(investable_assets.join(",")))
+    })?;
+    insert_if_referenced(&mut values, &placeholders, "context_only_assets", || {
+        Ok(Value::String(context_only_assets.join(",")))
+    })?;
     insert_if_referenced(&mut values, &placeholders, "role", || {
         Ok(Value::String(role.to_string()))
     })?;
@@ -515,19 +539,6 @@ pub(crate) fn render_prompt_with_plugins(
     })?;
     insert_if_referenced(&mut values, &placeholders, "window_days", || {
         Ok(state.get("window_days").cloned().unwrap_or(Value::Null))
-    })?;
-    insert_if_referenced(&mut values, &placeholders, "round", || {
-        Ok(json!(round.unwrap_or_default()))
-    })?;
-    insert_if_referenced(&mut values, &placeholders, "topic_id", || {
-        Ok(Value::String(topic_id.unwrap_or("").to_string()))
-    })?;
-    insert_if_referenced(&mut values, &placeholders, "topic", || {
-        let current_topic = topic_id
-            .and_then(|id| topic_state(state, id))
-            .and_then(|topic| topic.get("topic").cloned())
-            .unwrap_or(Value::Null);
-        Ok(Value::String(serde_json::to_string_pretty(&current_topic)?))
     })?;
     insert_if_referenced(&mut values, &placeholders, "portfolio_decision", || {
         Ok(Value::String(serde_json::to_string_pretty(
@@ -1162,9 +1173,6 @@ required_variables = ["ticker", "tickers"]
         "{risk_analyst_body}",
         "{date}",
         "{window_days}",
-        "{topic_id}",
-        "{topic}",
-        "{round}",
         "{retrieval_bootstrap}",
         "{phase4_control_context}",
         "{phase5_control_context}",
@@ -1826,9 +1834,12 @@ required_variables = ["ticker", "tickers"]
         let content =
             std::fs::read_to_string(project_prompts_dir().join("phase2/topic_controller.md"))
                 .unwrap();
+        assert!(content.contains("record_phase2_context"));
         assert!(content.contains("claim_ledger"));
         assert!(content.contains("next_steers"));
         assert!(content.contains("不要输出 JSON"));
+        assert!(!content.contains("{topic}"));
+        assert!(!content.contains("{topic_id}"));
         assert!(!content.contains("blocked_repeats"));
         assert!(!content.contains("next_agenda"));
     }

@@ -112,15 +112,18 @@ than rewriting Phase 1.
 Rust rejects external-fact or schema-breaking output and retains a deterministic
 conflict fallback. For each selected topic, Topic Controller forks from the
 completed Topic Generator turn, while Bull and Bear each fork from the shared
-`准备完毕` warm-up checkpoint and receive the full topic in their new user
-instruction. These forks continue saved conversations rather than being
-reconstructed from summaries; warm-up itself never runs Phase Summary.
-Rust pre-calls `record_phase2_steer` in every topic child turn, so the role,
-topic, fork parent, and both `round` and `round_num` are structured control data
-rather than fields inferred from free text. After the two seed turns, the Topic
+`准备完毕` warm-up checkpoint. These forks continue saved conversations rather
+than being reconstructed from summaries; warm-up itself never runs Phase
+Summary. Topic Generator, Bull/Bear, and Topic Controller all return free text.
+After each Summary, Rust records the normalized topic or debate result in
+run-local memory. Rust then pre-calls `record_phase2_context` in every topic
+child turn, making that one tool result the only dynamic transfer channel for
+the current topic, prior debate, latest Controller route, fork parent, and both
+`round` and `round_num`. These fields are never inferred from free text or
+duplicated in the prompt. After the two seed turns, the Topic
 Controller decides whether another round is needed; each continued Bull/Bear
-turn receives the latest controller steer before the controller reviews that
-round. Debug records retain each turn separately as
+turn reads the latest controller route from the same context tool before the
+controller reviews that round. Debug records retain each turn separately as
 `debate-{bull,bear}-round-N.json` and `topic-controller-round-N.json`.
 Topics run concurrently, while turns inside one topic remain controller-routed.
 When no material hinge exists, Phase 2 records a no-debate artifact and still
@@ -129,6 +132,13 @@ advances to Phase 3.
 Trader, the three parallel risk reviewers, and Portfolio Manager are
 mandatory in the default workflow policy. Phase 6 emits only per-asset semantic
 constraints; it cannot read accounts, calculate quantities, or submit orders.
+`analysis_universe` 是单个角色的完整对话范围：配置
+`[QQQ, SOXX, VIX]` 时，角色在一次对话中同时比较三者。
+`allocation.investable_assets` 是更小的决策范围：配置 `[QQQ, SOXX]`
+时，只有 QQQ 和 SOXX 可以获得 rating、action、风险上限、目标权重或
+Decision snapshot；VIX 始终只是 context-only regime signal。Phase 1
+每个 Analyst role 各运行一次，Phase 3、4、6 各运行一次，Phase 5
+每个风险 stance 各运行一次。
 Phase 7 computes and validates target weights in Rust, projects those weights
 through the Phase 6 direction/cap/delta constraints, and refreshes current
 weights from the project-only Alpaca Paper account when credentials are present
@@ -174,6 +184,8 @@ dedicated `prompts/phaseN/summary.md` compiler extracts the fixed fields; Rust
 validates identity, probability, position, and risk constraints and writes one
 canonical Index with its Detail. The Summary compiler has no filesystem or
 write tool. Phase 7 and Phase 8 are calculated and written directly by Rust.
+多资产 Phase 只写一个聚合 Index：固定字段使用 `per_ticker`、`decisions`、
+`plans` 或 `per_asset` map，完整的跨资产自由文字只保存一次 Detail。
 
 The completed run layout is:
 
@@ -202,7 +214,7 @@ writes the Index directly.
 |---|---|---|
 | Runtime | `think` | Records bounded private reasoning for the current turn; it does not read data or write an Artifact. Enabled only when the role's LLM setting enables it. |
 | Runtime | `web.run` | Performs an allowlisted Exa web search and returns citable evidence. It is exposed directly only to the bounded `researcher.web_evidence` worker; Phase 1 event verification uses the same search adapter behind `verify_event`. Its OpenAI-compatible function name is `web_run`. |
-| Phase 2 control | `record_phase2_steer` | Records the Rust-bound role, topic, fork parent, and round identity for each Bull/Bear or Topic Controller turn. It accepts no model-selected fields. |
+| Phase 2 context | `record_phase2_context` | Records and exposes the Rust-bound role, topic, debate history, latest Controller route, fork parent, and round identity for each Bull/Bear or Topic Controller turn. It accepts no model-selected fields and writes no file. |
 | Phase 2 evidence gap | `research_evidence_gap` | Delegates one explicit gap after a successful Phase 1 Detail expansion. Rust owns role/topic scope, shared call budget, deduplication, output validation, and evidence IDs. |
 | Historical reflection | `read_reflection_source` | Reads the Rust-selected historical reflection task source; a model cannot select a different run. |
 | Experience | `search_experiences` | Searches eligible historical Experience Index entries for the current role/task. |
@@ -230,8 +242,8 @@ allowlist.
 | `reflector.historical` / Historical Reflection | `read_reflection_source`, `read_indexes`, `read_index_details`; Rust commits the validated Summary result |
 | `analyst.technical` / Analyst Report | `read_technical_snapshot`, `read_technical_detail`, and eligible Experience reads |
 | `analyst.news_macro` / Analyst Report | `read_jin10_candidates`, `verify_event`, optional `alpaca_get_news`, and eligible Experience reads |
-| Phase 2 Topic Generator and Bull/Bear | Phase 1-only `read_indexes` / `read_index_details`; Bull/Bear topic turns also receive Rust-bound `record_phase2_steer`; bounded `research_evidence_gap` after Detail |
-| Phase 2 warm-up and Topic Controller | Phase 1-only `read_indexes` / `read_index_details`; Controller turns also receive Rust-bound `record_phase2_steer`; no Web delegation |
+| Phase 2 Topic Generator and Bull/Bear | Phase 1-only `read_indexes` / `read_index_details`; Bull/Bear topic turns also receive Rust-bound `record_phase2_context`; bounded `research_evidence_gap` after Detail |
+| Phase 2 warm-up and Topic Controller | Phase 1-only `read_indexes` / `read_index_details`; Controller turns also receive Rust-bound `record_phase2_context`; no Web delegation |
 | `researcher.web_evidence` / Evidence Research | `web.run` only; no Index, Technical, Experience, trading, or write tools |
 | `manager.research` / Research Decision | Phase 1–2-only `read_indexes` / `read_index_details` and eligible Experience reads |
 | `trader` / Trade Intent | Phase 3-only `read_indexes` / `read_index_details` |
@@ -333,7 +345,7 @@ Active prompts are owned by the phase that executes them:
 |---|---|
 | `prompts/phase0/` | Historical outcome reflection and its Summary compiler |
 | `prompts/phase1/` | Technical/news analysts and their Summary compiler |
-| `prompts/phase2/` | Topic roles, bounded Web evidence researcher, topic-fork message, and Phase 2 Summary compiler |
+| `prompts/phase2/` | Topic roles, bounded Web evidence researcher, and Phase 2 Summary compiler |
 | `prompts/phase3/` | Research Manager and Phase 3 Summary compiler |
 | `prompts/phase4/` | Trader and Phase 4 Summary compiler |
 | `prompts/phase5/` | Risk reviewers and Phase 5 Summary compiler |
@@ -357,8 +369,8 @@ an LLM role with a Rust-owned evidence gate and runtime envelope; final debate
 reduction remains Rust-owned and belongs to Phase 2. Phase 7 allocation and
 Phase 8 decision snapshot/archive are also Rust-owned stages. Phase Summary runs
 after source phases 1 through 7. Phase 8 writes one Rust-owned final-decision
-Index per ticker; Phase 0 and the Phase 2 warm-up checkpoint do not produce an
-Index.
+Index covering only investable assets; Phase 0 and the Phase 2 warm-up
+checkpoint do not produce an Index.
 
 For Phases 2–6, Phase Summary is the only cross-phase semantic interface.
 Prompts receive only current-task packets, Rust-owned deterministic controls,

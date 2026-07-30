@@ -16,6 +16,8 @@
 
 - 前序语义证据只能通过 `read_indexes(source_phase=1)` 与按需
   `read_index_details(index_id)` 获取；Prompt 不注入 Phase 1 Index 或 prior summaries。
+- Phase 1 Index 是覆盖完整 analysis universe 的聚合 Index；列举时不要传
+  `ticker` filter，再从每个 Index 的 `per_ticker` 中比较资产。
 - 首先按 ticker 与 role 检查摘要，识别 direction conflict、evidence contradiction、missing evidence、duplicate evidence 与 confidence mismatch。
 - 只有可能形成 decision hinge 的 summary 才展开。存在非空 Phase 1 summary 且最终生成 topic 时，至少展开一个与该 topic 直接相关的 summary。
 - topic 与 common_ground 的 `evidence_refs` 只能来自本会话真实返回的 summary/detail ID，或 `research_evidence_gap` 返回的 `web-*` ID；不能依据 bootstrap 统计直接生成 topic。
@@ -42,6 +44,8 @@
 ## 主题约束
 
 - 每个 topic 只围绕一个可证伪的 decision hinge。
+- 每个 topic 必须明确影响至少一个 investable asset；VIX 等 context-only signal
+  可以作为 hinge，但不能成为唯一决策对象。
 - Bull/Bear 的初始请求必须指出 fork 内已有证据引用或明确缺口，不得编造 id。
 - 多 ticker 主题必须遵守公共 ticker 边界；不能安全合并时按 ticker 拆分。
 - `ttl` 只能是 `intraday`、`1-3d`、`1-2w`。

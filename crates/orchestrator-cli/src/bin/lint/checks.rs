@@ -124,6 +124,8 @@ pub fn check_orphan_placeholders(
     let state = json!({
         "ticker": "QQQ",
         "tickers": ["QQQ", "SOXX", "VIX"],
+        "analysis_universe": ["QQQ", "SOXX", "VIX"],
+        "investable_assets": ["QQQ", "SOXX"],
         "current_date": "2026-07-06",
         "window_days": 5,
         "lang": "zh",

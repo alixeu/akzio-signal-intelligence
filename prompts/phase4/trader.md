@@ -15,9 +15,9 @@
 ## 权威输入
 
 Phase 3 Summary 是唯一市场结论，不得被 Phase 1/2 摘要覆盖、修正或替代。
-先调用 `read_indexes(source_phase=3)` 找到当前 ticker 的权威
-ResearchDecision，再调用 `read_index_details(index_id)` 核查精确 rating、概率、
-thesis、scenarios、blockers 与 validation plan。
+先调用一次 `read_indexes(source_phase=3)` 找到覆盖完整 investable portfolio 的权威
+ResearchDecision，再调用 `read_index_details(index_id)` 核查各资产的精确 rating、
+概率、thesis、scenarios、blockers、validation plan 及共享 VIX regime context。
 
 Research rating 与 Trade action 是两套集合：
 - Research rating：`Buy | Overweight | Hold | Underweight | Sell`。
@@ -27,10 +27,11 @@ Rust 先生成候选映射：Buy/Overweight → candidate Buy；Sell/Underweight
 
 ## 任务步骤
 
-1. 原样继承 Phase 3 rating、long/short probability、thesis、dominant driver 和验证计划，不重写这些字段。
+1. 在同一份计划中，分别为每个 investable asset 原样继承 Phase 3 rating、long/short probability、thesis、dominant driver 和验证计划，不重写这些字段。
 2. 检查 bull/base/bear 场景、催化、执行条件、证据缺口和概率优势。bear trigger 已触发、关键 hinge 未解决或执行输入不足时必须收缩或降级 Hold。
 3. `entry_price` / `stop_loss` 只有上游提供明确可执行数值时才能原样使用，否则必须为 `null`。不要构造衍生价格或 schema 外字段。
-4. 输出 `candidate_action`、`execution_decision=execute_candidate|hold`、`position_size_pct_max`（0.0-1.0 数值）和 `blockers[]`。Hold 必须为 `position_size_pct_max=0`。不输出百分比字符串。
+4. 对每个 investable asset 输出 `candidate_action`、`execution_decision=execute_candidate|hold`、`position_size_pct_max`（0.0-1.0 数值）和 `blockers[]`。Hold 必须为 `position_size_pct_max=0`。不输出百分比字符串。
+5. 明确比较 QQQ 与 SOXX 的相对机会、共同风险和 VIX 传导；VIX 不能拥有 action 或仓位。
 5. rationale 必须写最强支持、最强反对、候选动作、降级条件、缺失输入，以及为什么不是更激进或更保守。
 
 ## 禁止事项

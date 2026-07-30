@@ -225,56 +225,84 @@ fn detail_section_for_phase(phase: u8) -> DetailSection {
 }
 
 fn validate_phase_fields(phase: u8, fields: &Map<String, Value>) -> Result<()> {
-    let number_in_range = |key: &str| {
-        fields
-            .get(key)
-            .and_then(Value::as_f64)
-            .is_none_or(|value| (0.0..=1.0).contains(&value))
-    };
     match phase {
-        1 if !number_in_range("confidence") => bail!("Phase 1 confidence must be in 0..=1"),
-        3 => {
-            let decision = fields
-                .get("decision")
-                .and_then(Value::as_object)
-                .context("Phase 3 Summary requires decision")?;
-            let long = decision
-                .get("long_probability")
-                .and_then(Value::as_f64)
-                .context("Phase 3 long_probability is required")?;
-            let short = decision
-                .get("short_probability")
-                .and_then(Value::as_f64)
-                .context("Phase 3 short_probability is required")?;
-            if !(0.0..=1.0).contains(&long)
-                || !(0.0..=1.0).contains(&short)
-                || (long + short - 1.0).abs() > 0.001
-            {
-                bail!("Phase 3 long_probability + short_probability must equal 1")
+        1 => {
+            for (ticker, report) in required_map(fields, "per_ticker", 1)? {
+                validate_optional_fraction(report, "confidence", 1, ticker)?;
             }
         }
-        4 if !number_in_range("position_size_pct_max") => {
-            bail!("Phase 4 position_size_pct_max must be in 0..=1")
+        3 => {
+            for (ticker, decision) in required_map(fields, "decisions", 3)? {
+                let long = decision
+                    .get("long_probability")
+                    .and_then(Value::as_f64)
+                    .with_context(|| {
+                        format!("Phase 3 long_probability is required for {ticker}")
+                    })?;
+                let short = decision
+                    .get("short_probability")
+                    .and_then(Value::as_f64)
+                    .with_context(|| {
+                        format!("Phase 3 short_probability is required for {ticker}")
+                    })?;
+                if !(0.0..=1.0).contains(&long)
+                    || !(0.0..=1.0).contains(&short)
+                    || (long + short - 1.0).abs() > 0.001
+                {
+                    bail!("Phase 3 long_probability + short_probability must equal 1 for {ticker}")
+                }
+            }
+        }
+        4 => {
+            for (ticker, plan) in required_map(fields, "plans", 4)? {
+                validate_optional_fraction(plan, "position_size_pct_max", 4, ticker)?;
+            }
         }
         5 => {
-            for key in [
-                "position_cap_pct",
-                "max_drawdown_pct",
-                "constraint_confidence",
-            ] {
-                if !number_in_range(key) {
-                    bail!("Phase 5 {key} must be in 0..=1")
+            for (ticker, constraint) in required_map(fields, "per_asset", 5)? {
+                for key in [
+                    "position_cap_pct",
+                    "max_drawdown_pct",
+                    "constraint_confidence",
+                ] {
+                    validate_optional_fraction(constraint, key, 5, ticker)?;
                 }
             }
         }
         6 => {
-            for key in ["max_target_weight", "max_weight_delta"] {
-                if !number_in_range(key) {
-                    bail!("Phase 6 {key} must be in 0..=1")
+            for (ticker, decision) in required_map(fields, "per_asset", 6)? {
+                for key in ["max_target_weight", "max_weight_delta"] {
+                    validate_optional_fraction(decision, key, 6, ticker)?;
                 }
             }
         }
         _ => {}
+    }
+    Ok(())
+}
+
+fn required_map<'a>(
+    fields: &'a Map<String, Value>,
+    key: &str,
+    phase: u8,
+) -> Result<&'a Map<String, Value>> {
+    let values = fields
+        .get(key)
+        .and_then(Value::as_object)
+        .with_context(|| format!("Phase {phase} Summary requires {key}"))?;
+    if values.is_empty() {
+        bail!("Phase {phase} Summary requires non-empty {key}")
+    }
+    Ok(values)
+}
+
+fn validate_optional_fraction(object: &Value, key: &str, phase: u8, ticker: &str) -> Result<()> {
+    if object
+        .get(key)
+        .and_then(Value::as_f64)
+        .is_some_and(|value| !(0.0..=1.0).contains(&value))
+    {
+        bail!("Phase {phase} {key} must be in 0..=1 for {ticker}")
     }
     Ok(())
 }

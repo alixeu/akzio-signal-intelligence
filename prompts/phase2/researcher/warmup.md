@@ -15,7 +15,7 @@
   `role`、ticker 或扩大 limit 重新列举；运行时已绑定合法范围。
 - 预热不形成具体 topic claim，不输出概率、rating 或执行结论，只把真实工具结果保留在会话中。
 - 只可使用授权的 Phase 摘要工具；不得读取当前或未来 Phase、raw Jin10、technical、compose_context、research_inputs 或 raw SQL。
-- 工具结果或最新 `Steer` 中的 common ground 是双方不再争论的公共事实。
+- 已展开 Detail 中明确核验的共同事实是双方后续不再争论的公共事实。
 - 不得形成概率、rating、交易、仓位、订单、止损止盈或风控结论。
 - 达到上述读取条件后，输出一份简短自然语言准备说明，分别列出最强上行依据、最强下行依据、双方共同约束和仍需核验的 Index ID。
 - 不输出 JSON，不调用写入或 finalize 工具。

@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use thiserror::Error;
 
 pub const ROLE_PROFILE_REGISTRY_SCHEMA_VERSION: u32 = 1;
-pub const BUILTIN_ROLE_PROFILE_REGISTRY_VERSION: u32 = 7;
+pub const BUILTIN_ROLE_PROFILE_REGISTRY_VERSION: u32 = 8;
 
 /// The typed output contract a role is being migrated to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -93,7 +93,7 @@ define_tool_ids! {
     ReadTechnicalDetail => "read_technical_detail",
     ReadJin10Candidates => "read_jin10_candidates",
     VerifyEvent => "verify_event",
-    RecordPhase2Steer => "record_phase2_steer",
+    RecordPhase2Context => "record_phase2_context",
     ResearchEvidenceGap => "research_evidence_gap",
     AlpacaGetNews => "alpaca_get_news",
 }
@@ -330,7 +330,7 @@ impl RoleProfileRegistry {
                 &[
                     ToolId::ReadIndexDetails,
                     ToolId::ReadIndexes,
-                    ToolId::RecordPhase2Steer,
+                    ToolId::RecordPhase2Context,
                     ToolId::ResearchEvidenceGap,
                 ],
             ),
@@ -341,7 +341,7 @@ impl RoleProfileRegistry {
                 &[
                     ToolId::ReadIndexDetails,
                     ToolId::ReadIndexes,
-                    ToolId::RecordPhase2Steer,
+                    ToolId::RecordPhase2Context,
                     ToolId::ResearchEvidenceGap,
                 ],
             ),
@@ -352,7 +352,7 @@ impl RoleProfileRegistry {
                 &[
                     ToolId::ReadIndexDetails,
                     ToolId::ReadIndexes,
-                    ToolId::RecordPhase2Steer,
+                    ToolId::RecordPhase2Context,
                     ToolId::ResearchEvidenceGap,
                 ],
             ),
@@ -363,7 +363,7 @@ impl RoleProfileRegistry {
                 &[
                     ToolId::ReadIndexDetails,
                     ToolId::ReadIndexes,
-                    ToolId::RecordPhase2Steer,
+                    ToolId::RecordPhase2Context,
                     ToolId::ResearchEvidenceGap,
                 ],
             ),
@@ -380,7 +380,7 @@ impl RoleProfileRegistry {
                 &[
                     ToolId::ReadIndexDetails,
                     ToolId::ReadIndexes,
-                    ToolId::RecordPhase2Steer,
+                    ToolId::RecordPhase2Context,
                 ],
             ),
             registration(
