@@ -218,6 +218,11 @@ where
         {
             persist_turn(session, turn, &config.truncation)?;
         }
+        if should_preseed_phase2_detail(turn, &available_tools)
+            && preseed_phase2_detail(turn, tools, &config.truncation).await
+        {
+            persist_turn(session, turn, &config.truncation)?;
+        }
     }
     let mut first_iteration = true;
     let max_loops = config.max_agent_loops.map(|value| value.max(1));
@@ -1509,6 +1514,118 @@ fn preseed_tool_calls(
     calls
 }
 
+fn should_preseed_phase2_detail(turn: &Turn, available_tools: &[String]) -> bool {
+    turn.phase == Some(2)
+        && matches!(
+            turn.role.as_str(),
+            "mediator.topic"
+                | "researcher.bull.initial"
+                | "researcher.bear.initial"
+                | "researcher.bull.interaction"
+                | "researcher.bear.interaction"
+        )
+        && available_tools
+            .iter()
+            .any(|tool| tool == tools::index_tools::READ_INDEXES_NAME)
+        && available_tools
+            .iter()
+            .any(|tool| tool == tools::index_tools::READ_INDEX_DETAILS_NAME)
+}
+
+/// Phase 2 seed/response turns have a mandatory Phase 1 Detail budget.  A
+/// forked turn intentionally excludes its parent's retrieval scope, so the
+/// warm-up list/detail calls cannot satisfy that budget.  Preload one visible
+/// Phase 1 Index and its Detail before the model's first response; this keeps
+/// the evidence contract deterministic while leaving the model free to write
+/// the debate in normal prose.
+async fn preseed_phase2_detail<T: LoopToolRuntime>(
+    turn: &mut Turn,
+    tools: &T,
+    truncation: &TruncationConfig,
+) -> bool {
+    let audit = retrieval_audit(turn);
+    if audit
+        .get("successful_expanded_summary_ids")
+        .and_then(Value::as_array)
+        .is_some_and(|ids| !ids.is_empty())
+    {
+        return false;
+    }
+
+    let mut index_id = audit
+        .get("returned_summary_ids")
+        .and_then(Value::as_array)
+        .and_then(|items| items.iter().find_map(Value::as_str))
+        .map(str::to_owned);
+    if index_id.is_none()
+        && audit
+            .get("successful_summary_query_count")
+            .and_then(Value::as_u64)
+            .unwrap_or_default()
+            == 0
+    {
+        let call = ToolCallRequest {
+            call_id: format!("preseed-phase1-indexes-{}", turn.turn_id),
+            name: tools::index_tools::READ_INDEXES_NAME.to_owned(),
+            arguments: json!({}),
+        };
+        let item_start = turn.emitted_items.len();
+        turn.emitted_items.push(TurnItem::tool_call(&call));
+        let result = tools.execute(call).await;
+        let completed = result.status == "completed";
+        index_id = result
+            .output
+            .get("items")
+            .or_else(|| result.output.get("indexes"))
+            .and_then(Value::as_array)
+            .and_then(|items| {
+                items.iter().find_map(|item| {
+                    (item.get("source_phase").and_then(Value::as_i64) == Some(1))
+                        .then(|| item.get("index_id").and_then(Value::as_str))
+                        .flatten()
+                })
+            })
+            .or_else(|| {
+                result
+                    .output
+                    .get("items")
+                    .or_else(|| result.output.get("indexes"))
+                    .and_then(Value::as_array)
+                    .and_then(|items| items.first())
+                    .and_then(|item| item.get("index_id"))
+                    .and_then(Value::as_str)
+            })
+            .map(str::to_owned);
+        if !completed {
+            // A failed automatic read must not consume the model's retry
+            // budget or make the same valid request look like a duplicate.
+            turn.emitted_items.truncate(item_start);
+            return false;
+        }
+        turn.emitted_items
+            .push(TurnItem::tool_result(&result, truncation));
+    }
+
+    let Some(index_id) = index_id else {
+        return false;
+    };
+    let call = ToolCallRequest {
+        call_id: format!("preseed-phase1-detail-{}", turn.turn_id),
+        name: tools::index_tools::READ_INDEX_DETAILS_NAME.to_owned(),
+        arguments: json!({"index_id": index_id}),
+    };
+    let item_start = turn.emitted_items.len();
+    turn.emitted_items.push(TurnItem::tool_call(&call));
+    let result = tools.execute(call).await;
+    if result.status != "completed" {
+        turn.emitted_items.truncate(item_start);
+        return false;
+    }
+    turn.emitted_items
+        .push(TurnItem::tool_result(&result, truncation));
+    true
+}
+
 #[cfg(test)]
 mod phase2_context_preseed_tests {
     use super::*;
@@ -2225,16 +2342,23 @@ impl LoopToolRuntime for StaticToolRuntime {
         call: ToolCallRequest,
     ) -> Pin<Box<dyn Future<Output = ToolResultItem> + Send + 'a>> {
         Box::pin(async move {
-            let Some(tool) = self.tools.get(&call.name) else {
+            let call_id = call.call_id.clone();
+            let name = call.name.clone();
+            let Some(tool) = self.tools.get(&name) else {
                 return ToolResultItem {
-                    call_id: call.call_id,
-                    name: call.name,
+                    call_id,
+                    name,
                     status: "error".to_string(),
                     output: Value::Null,
                     error: Some("unknown tool name".to_string()),
                 };
             };
-            tool(call.arguments)
+            let mut result = tool(call.arguments);
+            // Test handlers only describe the payload.  The runtime, like
+            // production tool adapters, owns the correlation identity.
+            result.call_id = call_id;
+            result.name = name;
+            result
         })
     }
 }
@@ -2621,8 +2745,29 @@ mod loop_limit_tests {
 
     use super::{
         run_turn, AgentLoopConfig, FileStoreSessionRuntime, LoopModel, ModelInput, ModelResponse,
-        SessionRuntimeSpec, StaticToolRuntime, ToolCallRequest, ToolResultItem, Turn, TurnStatus,
+        RetrievalPolicy, SessionRuntimeSpec, StaticToolRuntime, ToolCallRequest, ToolResultItem,
+        Turn, TurnStatus,
     };
+
+    struct FinalTextModel;
+
+    impl LoopModel for FinalTextModel {
+        fn generate<'a>(
+            &'a mut self,
+            _: ModelInput,
+        ) -> Pin<Box<dyn Future<Output = Result<ModelResponse>> + Send + 'a>> {
+            Box::pin(async {
+                Ok(ModelResponse {
+                    assistant_message: Some("bear final".to_owned()),
+                    reasoning_summary: None,
+                    tool_calls: Vec::new(),
+                    end_turn: true,
+                    raw: Value::Null,
+                    turn_status: TurnStatus::Unknown,
+                })
+            })
+        }
+    }
 
     struct RepeatingToolModel {
         calls: usize,
@@ -2697,5 +2842,76 @@ mod loop_limit_tests {
         assert_eq!(model.calls, 2);
         assert!(error.to_string().contains("max_agent_loops=2"));
         assert_eq!(turn.end_reason.as_deref(), Some("max_loops"));
+    }
+
+    #[tokio::test]
+    async fn phase2_bear_seed_preloads_phase1_detail_before_final_text() {
+        let temp = tempdir().unwrap();
+        let session = FileStoreSessionRuntime::create_or_load(
+            FileStore::open(temp.path(), FileStoreOptions::default()).unwrap(),
+            SessionRuntimeSpec {
+                run: RunLocation::new("2026-07-30", "run-a").unwrap(),
+                session_id: "session-bear".to_owned(),
+                role: "researcher.bear.initial".to_owned(),
+                phase: 2,
+                profile: "debate_seed".to_owned(),
+                fork: None,
+                created_at: "2026-07-30T00:00:00Z".to_owned(),
+            },
+        )
+        .unwrap();
+        let mut turn = Turn::new(
+            "turn-bear",
+            "session-bear",
+            "run-a",
+            "researcher.bear.initial",
+            "debate prompt",
+        );
+        turn.phase = Some(2);
+        turn.model_context = "available_tools=[\"read_indexes\",\"read_index_details\"]".to_owned();
+
+        let mut model = FinalTextModel;
+        let mut tools = StaticToolRuntime::new();
+        tools.add_tool("read_indexes", |_| ToolResultItem {
+            call_id: "list-result".to_owned(),
+            name: "read_indexes".to_owned(),
+            status: "completed".to_owned(),
+            output: json!({
+                "items": [{"index_id": "idx-phase1", "source_phase": 1}]
+            }),
+            error: None,
+        });
+        tools.add_tool("read_index_details", |_| ToolResultItem {
+            call_id: "detail-result".to_owned(),
+            name: "read_index_details".to_owned(),
+            status: "completed".to_owned(),
+            output: json!({
+                "index_id": "idx-phase1",
+                "source_phase": 1,
+                "details": [{"detail_id": "detail-1"}]
+            }),
+            error: None,
+        });
+
+        let config = AgentLoopConfig {
+            max_agent_loops: Some(2),
+            retrieval_policy: RetrievalPolicy {
+                mandatory_summary_query: true,
+                required_source_phases: vec![1],
+                required_detail_source_phases: vec![1],
+                minimum_detail_expansions: 1,
+                maximum_detail_expansions: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let result = run_turn(&session, &mut turn, &mut model, &mut tools, config).await;
+        assert!(
+            result.is_ok(),
+            "Bear seed should have a Phase 1 Detail available before final text: {:?}; audit={}",
+            result.err(),
+            super::retrieval_audit(&turn)
+        );
     }
 }

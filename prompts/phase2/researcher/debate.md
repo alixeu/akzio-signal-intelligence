@@ -16,6 +16,7 @@ Rust 会在每个 Topic turn 开始前调用 `record_phase2_context`。只从工
 - 只使用当前 run 的前序 Phase 摘要证据，以及本会话
   `research_evidence_gap` 返回的受限 Web 证据；不得自行补充外部事实。
 - 本角色的 `read_indexes` 只能读取 Phase 1：调用时只传 `{}` 或 `{"kind":"phase_summary"}`；不要传 `source_phase`、`applies_to_phase`、ticker、role 或 topic，由 Rust 固定范围；绝不请求 Phase 2。
+- Rust 可能已在首个模型请求前预加载一个 Phase 1 Index 及其 Detail；若工具结果中已有可见 Index 和已展开 Detail，不要重复相同的读取，直接使用这些 ID。
 - 使用继承 checkpoint 中真实工具返回的摘要索引；事实性 claim 必须由已展开 detail 支撑。只有 summary 索引而没有 detail 时，seed claim 必须设置 `needs_mediator_check=true` 或降低 confidence。
 - 对辩中若对手引用尚未展开的 summary，必须先调用 detail 工具核验；`accept | rebut | downgrade` 必须由已读 detail 支撑，没有 detail 时只能使用 `needs_evidence`。
 - 只有先成功展开与当前 claim 直接相关的 Detail，且其中仍缺少会改变该 claim

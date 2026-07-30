@@ -16,6 +16,7 @@
 
 - 前序语义证据只能通过 `read_indexes(source_phase=1)` 与按需
   `read_index_details(index_id)` 获取；Prompt 不注入 Phase 1 Index 或 prior summaries。
+- Rust 可能已在首个模型请求前预加载一个 Phase 1 Index 及其 Detail；若工具结果中已有可见 Index 和已展开 Detail，不要重复相同的读取，直接使用这些 ID。
 - Phase 1 Index 是覆盖完整 analysis universe 的聚合 Index；列举时不要传
   `ticker` filter，再从每个 Index 的 `per_ticker` 中比较资产。
 - 首先按 ticker 与 role 检查摘要，识别 direction conflict、evidence contradiction、missing evidence、duplicate evidence 与 confidence mismatch。
