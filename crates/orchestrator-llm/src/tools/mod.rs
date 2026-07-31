@@ -2,6 +2,7 @@ pub mod alpaca;
 pub mod experience_tools;
 pub mod historical_reflection;
 pub mod index_tools;
+pub mod phase2_stree;
 pub mod read_jin10_candidates;
 pub mod read_reflection_source;
 pub mod read_technical_detail;
@@ -72,6 +73,7 @@ pub struct FileStoreInputSnapshot {
     pub store_root: PathBuf,
     pub run_id: String,
     pub current_date: String,
+    pub storage_namespace: Option<String>,
 }
 
 impl FileStoreInputSnapshot {
@@ -80,8 +82,11 @@ impl FileStoreInputSnapshot {
             &self.store_root,
             orchestrator_store::FileStoreOptions::default(),
         )?;
-        let location =
-            orchestrator_store::RunLocation::new(self.current_date.clone(), self.run_id.clone())?;
+        let location = orchestrator_store::RunLocation::with_storage_namespace(
+            self.current_date.clone(),
+            self.run_id.clone(),
+            self.storage_namespace.clone(),
+        )?;
         orchestrator_store::read_snapshotted_input(&store, &location, source).map_err(Into::into)
     }
 }
@@ -179,6 +184,33 @@ const REGISTRY: &[ToolEntry] = &[
         definition: record_phase2_context::definition,
     },
     ToolEntry {
+        name: phase2_stree::SUBMIT_DEBATE_TURN,
+        definition: || {
+            phase2_stree::definition(phase2_stree::SUBMIT_DEBATE_TURN)
+                .expect("registered stree tool")
+        },
+    },
+    ToolEntry {
+        name: phase2_stree::ROUTE_DEBATE_TURN,
+        definition: || {
+            phase2_stree::definition(phase2_stree::ROUTE_DEBATE_TURN)
+                .expect("registered stree tool")
+        },
+    },
+    ToolEntry {
+        name: phase2_stree::WAIT_FOR_DEBATE_TURN,
+        definition: || {
+            phase2_stree::definition(phase2_stree::WAIT_FOR_DEBATE_TURN)
+                .expect("registered stree tool")
+        },
+    },
+    ToolEntry {
+        name: phase2_stree::CLOSE_DEBATE,
+        definition: || {
+            phase2_stree::definition(phase2_stree::CLOSE_DEBATE).expect("registered stree tool")
+        },
+    },
+    ToolEntry {
         name: research_evidence_gap::NAME,
         definition: research_evidence_gap::definition,
     },
@@ -198,6 +230,10 @@ pub fn tool_names() -> &'static [&'static str] {
         read_jin10_candidates::NAME,
         verify_event::NAME,
         record_phase2_context::NAME,
+        phase2_stree::SUBMIT_DEBATE_TURN,
+        phase2_stree::ROUTE_DEBATE_TURN,
+        phase2_stree::WAIT_FOR_DEBATE_TURN,
+        phase2_stree::CLOSE_DEBATE,
         alpaca::GET_NEWS_NAME,
     ]
 }
@@ -346,6 +382,10 @@ pub async fn execute_named_tool(
         read_jin10_candidates::NAME => read_jin10_candidates::execute(args, config),
         verify_event::NAME => verify_event::execute(args, config, web_run).await,
         record_phase2_context::NAME => record_phase2_context::execute(args, config, turn_context),
+        phase2_stree::SUBMIT_DEBATE_TURN
+        | phase2_stree::ROUTE_DEBATE_TURN
+        | phase2_stree::WAIT_FOR_DEBATE_TURN
+        | phase2_stree::CLOSE_DEBATE => phase2_stree::execute(name, args),
         research_evidence_gap::NAME => {
             bail!("{name} requires an EvidenceResearchBinding and is unavailable without that typed binding")
         }
@@ -423,7 +463,7 @@ mod tests {
         }
         for tool in registered_tool_names() {
             assert!(
-                owned.contains(tool) || matches!(tool, think::NAME | web_run::NAME),
+                owned.contains(tool) || matches!(tool, think::NAME | web_run::NAME | record_phase2_context::NAME),
                 "registered tool {tool} has neither a Role/Profile owner nor an explicit runtime-only path"
             );
         }

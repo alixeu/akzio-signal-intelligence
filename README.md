@@ -375,10 +375,13 @@ rtk cargo run -p orchestrator-cli --bin orchestrator-exec -- \
 
 常用选项:
 
-- `--store-root PATH`:时间分区 FileStore 的根目录(默认 `outputs/store`)。
+- `--store-root PATH`:FileStore 的根目录(默认 `outputs/store`)。普通运行位于
+  `runs/<日期>/`; Debug 运行固定在 `runs/debug/<ticker>-debug/`。
 - `--debug`:将工作流与 agent 循环调试日志打印到控制台,并将请求/响应记录、
   耗时与 token JSON 写入 `outputs/debug/`;Phase 7 同时在控制台输出订单
-  计划和模拟执行结果,固定为 10,000 美元、零仓位且不访问 Alpaca。
+  计划和模拟执行结果,固定为 10,000 美元、零仓位且不访问 Alpaca。运行 ID 不含
+  日期或配置哈希，例如 `QQQ/SOXX/VIX` 固定为 `qqq-soxx-vix-debug`，所以
+  `--debug --from-phase X --to-phase X` 会重开同一份 Index、会话与状态。
 - `--max-debate-rounds N`:限制条件辩论轮数。
 - `--max-topics-per-side N`:限制实质性冲突议题数。
 

@@ -30,6 +30,7 @@ const SYSTEM_PROMPT_TEMPLATE: &str = include_str!("../../../../prompts/system/ag
 const REQUEST_WRAPPER_TEMPLATE: &str =
     include_str!("../../../../prompts/system/messages/request_wrapper.md");
 const FINALIZE_INSTRUCTION: &str = include_str!("../../../../prompts/system/messages/finalize.md");
+const UNEXECUTED_TOOL_MARKUP_INSTRUCTION: &str = "The previous response contained literal unexecuted tool-call markup. Do not emit tool syntax, XML, DSML, or function-call markup. Use the completed evidence already in the conversation and write the exact final free-text response required by the active role prompt.";
 
 pub struct AgentLoopModel {
     settings: AgentSettings,
@@ -289,6 +290,28 @@ where
             .tool_calls
             .extend(stream_result.tool_calls.iter().cloned());
         aggregate_result.needs_follow_up = stream_result.needs_follow_up;
+
+        // Some Chat Completions gateways can return provider-native DSML
+        // tool syntax as assistant text instead of a parsed tool call.  It
+        // must not be accepted as a completed artifact: ask for plain text
+        // while preserving the already collected evidence and tool state.
+        let unexecuted_tool_markup = stream_result.tool_calls.is_empty()
+            && stream_result
+                .last_assistant_message_id
+                .as_deref()
+                .and_then(|item_id| {
+                    turn.emitted_items
+                        .iter()
+                        .rev()
+                        .find(|item| item.output_item_id == item_id)
+                })
+                .is_some_and(|item| contains_unexecuted_tool_markup(&item.content_text));
+        if unexecuted_tool_markup {
+            turn.push_pending_input(UNEXECUTED_TOOL_MARKUP_INSTRUCTION);
+            turn.needs_follow_up = false;
+            persist_turn(session, turn, &config.truncation)?;
+            continue;
+        }
 
         if !turn.pending_tool_calls.is_empty() {
             let calls = std::mem::take(&mut turn.pending_tool_calls);
@@ -1183,6 +1206,9 @@ fn build_model_input(
         // Keep the original role prompt + a capped slice of latest tool evidence.
         // Previously we kept two full tool results, which often made tokens_after
         // larger than tokens_before and defeated token-threshold compaction.
+        // Phase 2 context is already bounded when the ToolResult item is created;
+        // keep it at that structured-payload budget so a second hard character
+        // cutoff cannot turn the authoritative JSON into an unusable fragment.
         let evidence_char_cap = if needs_token_compaction {
             8_000
         } else {
@@ -1198,9 +1224,14 @@ fn build_model_input(
             .into_iter()
             .rev()
             .map(|mut tool_item| {
-                if tool_item.content_text.chars().count() > evidence_char_cap {
+                let cap = if tool_item.tool_name == tools::record_phase2_context::NAME {
+                    config.truncation.tool_result_chars
+                } else {
+                    evidence_char_cap
+                };
+                if tool_item.content_text.chars().count() > cap {
                     tool_item.content_text =
-                        truncate_chars(&tool_item.content_text, evidence_char_cap);
+                        truncate_semantic(&tool_item.content_text, cap, &config.truncation);
                     tool_item.content_json = json!({
                         "truncated": true,
                         "preview": tool_item.content_text.clone(),
@@ -1530,6 +1561,8 @@ fn should_preseed_phase2_detail(turn: &Turn, available_tools: &[String]) -> bool
         && matches!(
             turn.role.as_str(),
             "mediator.topic"
+                | "researcher.bull"
+                | "researcher.bear"
                 | "researcher.bull.initial"
                 | "researcher.bear.initial"
                 | "researcher.bull.interaction"
@@ -1681,6 +1714,25 @@ mod phase2_context_preseed_tests {
         assert_eq!(calls[0].name, tools::index_tools::READ_INDEXES_NAME);
         assert_eq!(calls[0].call_id, "preseed-phase1-indexes-turn-controller");
         assert_eq!(calls[0].arguments, json!({}));
+    }
+
+    #[test]
+    fn canonical_debate_turn_requires_its_own_phase1_detail() {
+        let mut turn = Turn::new(
+            "turn-bull",
+            "session-bull",
+            "run-a",
+            "researcher.bull",
+            "topic instruction",
+        );
+        turn.phase = Some(2);
+        assert!(should_preseed_phase2_detail(
+            &turn,
+            &[
+                tools::index_tools::READ_INDEXES_NAME.to_owned(),
+                tools::index_tools::READ_INDEX_DETAILS_NAME.to_owned(),
+            ]
+        ));
     }
 }
 
@@ -1875,9 +1927,12 @@ pub fn extract_token_usage(raw: &Value) -> TokenUsage {
     }
 }
 
-/// Extract the role prompt (first user message) for use as the main prompt
-/// in the Responses API request. History items (tool calls, tool results,
-/// follow-up messages) are handled separately via native multi-turn messages.
+/// Return a non-empty user message for the legacy stream interface.
+///
+/// Streaming request builders serialize `ModelInput.items` in chronological
+/// order and do not append this value. A fork can therefore begin with a
+/// Warmup user message while its child role task remains later in the same
+/// retained transcript.
 pub fn model_role_prompt(input: &ModelInput) -> Result<String> {
     let role_prompt = input
         .items
@@ -2020,6 +2075,11 @@ fn contains_error_signal(text: &str) -> bool {
         || lower.contains("panic")
         || lower.contains("bail!")
         || lower.contains("unwrap")
+}
+
+fn contains_unexecuted_tool_markup(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    (lower.contains("dsml") && lower.contains("tool_calls")) || lower.contains("<tool_calls>")
 }
 
 #[cfg(test)]
@@ -2386,12 +2446,23 @@ mod retrieval_policy_tests {
     use serde_json::json;
 
     use super::{
-        retrieval_completion_violation, retrieval_policy_violation, RetrievalPolicy,
-        ToolCallRequest, ToolResultItem, TruncationConfig, Turn, TurnItem,
+        contains_unexecuted_tool_markup, retrieval_completion_violation,
+        retrieval_policy_violation, RetrievalPolicy, ToolCallRequest, ToolResultItem,
+        TruncationConfig, Turn, TurnItem,
     };
 
     fn turn() -> Turn {
         Turn::new("turn-1", "session-1", "run-1", "risk.neutral", "prompt")
+    }
+
+    #[test]
+    fn literal_tool_markup_is_not_a_final_free_text_response() {
+        assert!(contains_unexecuted_tool_markup(
+            "<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name=\"read_indexes\">"
+        ));
+        assert!(!contains_unexecuted_tool_markup(
+            "The evidence supports holding QQQ and SOXX."
+        ));
     }
 
     fn push_completed(turn: &mut Turn, call: ToolCallRequest, output: serde_json::Value) {
@@ -2931,5 +3002,94 @@ mod loop_limit_tests {
             result.err(),
             super::retrieval_audit(&turn)
         );
+    }
+}
+
+#[cfg(test)]
+mod compaction_context_tests {
+    use super::{
+        build_model_input, AgentLoopConfig, FileStoreSessionRuntime, SessionRuntimeSpec,
+        ToolCallRequest, ToolResultItem, Turn, TurnItem, TurnItemType,
+    };
+    use orchestrator_store::{FileStore, FileStoreOptions, RunLocation};
+    use serde_json::{json, Value};
+    use tempfile::tempdir;
+
+    #[test]
+    fn phase2_context_remains_parseable_after_compaction() {
+        let temp = tempdir().unwrap();
+        let session = FileStoreSessionRuntime::create_or_load(
+            FileStore::open(temp.path(), FileStoreOptions::default()).unwrap(),
+            SessionRuntimeSpec {
+                run: RunLocation::new("2026-07-31", "run-a").unwrap(),
+                session_id: "session-controller".to_owned(),
+                role: "mediator.topic_controller".to_owned(),
+                phase: 2,
+                profile: "topic_control".to_owned(),
+                fork: None,
+                created_at: "2026-07-31T00:00:00Z".to_owned(),
+            },
+        )
+        .unwrap();
+        let mut turn = Turn::new(
+            "turn-controller",
+            "session-controller",
+            "run-a",
+            "mediator.topic_controller",
+            "controller prompt",
+        );
+        turn.phase = Some(2);
+        turn.model_context = "available_tools=[\"record_phase2_context\"]".to_owned();
+
+        let call = ToolCallRequest {
+            call_id: "context-call".to_owned(),
+            name: "record_phase2_context".to_owned(),
+            arguments: json!({}),
+        };
+        turn.emitted_items.push(TurnItem::tool_call(&call));
+        turn.emitted_items.push(TurnItem::tool_result(
+            &ToolResultItem {
+                call_id: call.call_id.clone(),
+                name: call.name.clone(),
+                status: "completed".to_owned(),
+                output: json!({
+                    "context": {
+                        "topic_id": "topic-a",
+                        "round": 2,
+                        "debate_turns": [{"claim": "x".repeat(12_000)}]
+                    },
+                    "status": "recorded"
+                }),
+                error: None,
+            },
+            &Default::default(),
+        ));
+        for _ in 0..4 {
+            turn.emitted_items
+                .push(TurnItem::assistant("filler", Value::Null));
+        }
+
+        let input = build_model_input(
+            &session,
+            &mut turn,
+            true,
+            &AgentLoopConfig {
+                compact_after_items: 4,
+                max_context_tokens: None,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let context_result = input
+            .items
+            .iter()
+            .find(|item| {
+                item.item_type == TurnItemType::ToolResult
+                    && item.tool_name == "record_phase2_context"
+            })
+            .expect("compaction must retain the phase2 context result");
+        let parsed: Value = serde_json::from_str(&context_result.content_text)
+            .expect("compaction must not turn phase2 context into invalid JSON");
+        assert_eq!(parsed["context"]["topic_id"], "topic-a");
     }
 }

@@ -11,11 +11,11 @@ use chrono::Utc;
 use orchestrator_llm::tools::FileStoreInputSnapshot;
 use orchestrator_store::{
     capture_run_inputs, read_input_snapshot_manifest, write_input_payload, FileStore,
-    FileStoreOptions, InputSnapshotManifest, InputSource, RunLocation,
+    FileStoreOptions, InputSnapshotManifest, InputSource,
 };
 use serde_json::Value;
 
-use super::config::RuntimeConfig;
+use super::{config::RuntimeConfig, lifecycle::run_location_from_state};
 
 /// Bind the full, Rust-planned Phase 1 source set exactly once for a run.
 /// A resumed run reuses the published hash manifest; readers reject a stable
@@ -28,7 +28,7 @@ pub(crate) fn capture_phase1_file_store_inputs(
     let store_root = required_string(state, "store_root")?;
     let current_date = required_string(state, "current_date")?;
     let run_id = required_string(state, "run_id")?;
-    let location = RunLocation::new(current_date.clone(), run_id.clone())?;
+    let location = run_location_from_state(state)?;
     let store = FileStore::open(
         &store_root,
         FileStoreOptions {
@@ -60,6 +60,10 @@ pub(crate) fn capture_phase1_file_store_inputs(
         store_root: PathBuf::from(store_root),
         run_id,
         current_date,
+        storage_namespace: state
+            .get("storage_namespace")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
     })
 }
 

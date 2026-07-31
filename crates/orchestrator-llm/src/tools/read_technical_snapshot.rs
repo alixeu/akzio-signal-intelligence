@@ -273,6 +273,7 @@ mod tests {
                     store_root: temp.path().to_path_buf(),
                     run_id: "run-input-test".to_owned(),
                     current_date: "2026-07-27".to_owned(),
+                    storage_namespace: None,
                 }),
                 ..Default::default()
             },

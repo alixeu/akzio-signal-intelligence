@@ -226,6 +226,9 @@ pub struct ForkLoopInput<'a> {
     pub prompt: &'a str,
     pub fork_from_turn_id: Option<String>,
     pub include_prompt_on_fork: bool,
+    /// Rust-owned cross-agent delivery appended as a user message to the
+    /// existing session before its next agent loop.
+    pub injected_user_message: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -365,7 +368,7 @@ pub async fn run_agent_fork_loop_with_metrics(
         input.session_id.clone(),
         session.manifest().run_id.clone(),
         settings.role.clone(),
-        user_input,
+        String::new(),
     );
     if has_existing_history {
         // Seed in-memory history so multi-round forks do not wipe the
@@ -378,6 +381,32 @@ pub async fn run_agent_fork_loop_with_metrics(
                 agent_loop::turn_item_from_history_value(value)
             })
             .collect();
+    }
+    if !user_input.trim().is_empty() {
+        // A forked debate is one continued conversation: preserve the
+        // complete parent transcript, then append the child role task, then
+        // append the Rust-owned stree user turn below.  Inserting the role
+        // task at index zero made the debug history and the model request
+        // start with a message that chronologically belongs after warmup.
+        turn.emitted_items
+            .push(agent_loop::TurnItem::user(user_input));
+    }
+    if let Some(message) = input
+        .injected_user_message
+        .filter(|value| !value.trim().is_empty())
+    {
+        turn.emitted_items.push(agent_loop::TurnItem {
+            item_type: agent_loop::TurnItemType::InjectedContext,
+            role: "user".to_owned(),
+            content_text: message,
+            content_json: json!({"source":"stree","delivery":"workflow"}),
+            tool_call_id: String::new(),
+            tool_name: String::new(),
+            output_item_id: String::new(),
+            phase: None,
+            status: None,
+            db_row_id: None,
+        });
     }
     if is_new_fork {
         turn.retrieval_scope_start = turn.emitted_items.len();
@@ -476,6 +505,7 @@ fn completed_turn_artifact(turn: &Turn) -> Result<Value> {
         "phase": turn.phase,
         "role": turn.role,
         "response_text": response_text,
+        "retrieval_audit": agent_loop::retrieval_audit(turn),
     }))
 }
 
@@ -507,7 +537,7 @@ fn prepare_fork_turn_input(
     include_prompt_on_fork: bool,
 ) -> String {
     let context_instruction =
-        "请读取本轮 `record_phase2_context` 工具结果，并只基于其中的当前主题、已有辩论和控制路由完成本轮自由文字回复。";
+        "继续这个既有会话；Rust 会以 `stree: {...}` user message 注入本轮跨角色信息。依据该消息和已有会话上下文完成本轮终端工具动作。";
     if is_new_fork && include_prompt_on_fork {
         return format!(
             "这是一个新的子回合。上一条 assistant 输出只是恢复的 checkpoint 上下文，不是本轮答案。\
@@ -515,7 +545,10 @@ fn prepare_fork_turn_input(
         );
     }
     if has_existing_history {
-        format!("{prompt}\n\n{context_instruction}")
+        // The initial child role task is already present after the forked
+        // history. Keep this turn empty so the only newly appended user data
+        // is the Rust-owned InjectedContext/stree item.
+        String::new()
     } else {
         prompt.to_string()
     }
@@ -556,7 +589,20 @@ pub fn append_debug_llm_record(settings: &AgentSettings, record: Value) -> Resul
             .entry("round")
             .or_insert_with(|| json!(settings.debug_round));
     }
-    append_debug_output_history(&root, &output_path, &prompt_path.to_string_lossy(), &record)?;
+    if uses_aggregated_phase2_debug_records(&output_path) {
+        return append_debug_output_history(
+            &root,
+            &output_path,
+            &prompt_path.to_string_lossy(),
+            &record,
+        );
+    }
+    append_debug_output_history(
+        &root,
+        &debug_output_history_relative_path(&output_path)?,
+        &prompt_path.to_string_lossy(),
+        &record,
+    )?;
     append_debug_output_record(&root, &output_path, &prompt_path.to_string_lossy(), record)
 }
 
@@ -582,7 +628,7 @@ pub fn finalize_debug_llm_record(
         .map(validate_debug_output_relative_path)
         .transpose()?
         .unwrap_or(debug_record_relative_path_from_prompt(prompt_path)?);
-    let path = root.join(output_path);
+    let path = root.join(&output_path);
     let prompt_path = prompt_path.to_string_lossy().into_owned();
 
     with_debug_output_lock(|| {
@@ -596,6 +642,16 @@ pub fn finalize_debug_llm_record(
         let object = record
             .as_object_mut()
             .context("debug LLM record must be a JSON object")?;
+        let object = if uses_aggregated_phase2_debug_records(&output_path) {
+            object
+                .get_mut("records")
+                .and_then(Value::as_array_mut)
+                .and_then(|records| records.last_mut())
+                .and_then(Value::as_object_mut)
+                .context("aggregated Phase 2 debug record must contain a latest object")?
+        } else {
+            object
+        };
         object.insert("end_turn".to_owned(), Value::Bool(true));
         let response = object.entry("resp").or_insert_with(|| json!({}));
         let response = response
@@ -764,11 +820,26 @@ pub fn append_debug_output_record(
     if source_label.is_empty() {
         bail!("debug source label must not be empty");
     }
-    let path = project_root.join(relative_output_path);
+    let path = project_root.join(&relative_output_path);
     with_debug_output_lock(|| {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create debug dir {}", parent.display()))?;
+        }
+        if phase2_latest_debug_path(&relative_output_path) && path.exists() {
+            let previous: Value = serde_json::from_str(
+                &fs::read_to_string(&path)
+                    .with_context(|| format!("failed to read debug record {}", path.display()))?,
+            )
+            .with_context(|| format!("debug record {} must be JSON", path.display()))?;
+            if previous.get("end_turn").and_then(Value::as_bool) == Some(true)
+                && record.get("end_turn").and_then(Value::as_bool) != Some(true)
+            {
+                // Keep the last completed request in the compatibility file.
+                // The in-progress follow-up is still preserved in the adjacent
+                // `.iterations.json` history by append_debug_llm_record.
+                return Ok(());
+            }
         }
         let mut output = record;
         let object = output.as_object_mut().ok_or_else(|| {
@@ -791,29 +862,36 @@ pub fn append_debug_output_record(
     })
 }
 
+fn phase2_latest_debug_path(relative_output_path: &Path) -> bool {
+    let in_phase2 = relative_output_path
+        .components()
+        .any(|component| component.as_os_str() == "phase2");
+    in_phase2
+        && matches!(
+            relative_output_path
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("phase2-warmup-shared.json")
+                | Some("topic-generator.json")
+                | Some("phase2_summary.json")
+        )
+}
+
 /// Keep the full sequence of requests beside the compatibility file that
 /// exposes the latest request. This is essential for inspecting multi-turn
 /// Phase 2 debates without making existing debug consumers parse a new shape.
 fn append_debug_output_history(
     project_root: &Path,
-    relative_output_path: &Path,
+    relative_history_path: &Path,
     source_label: &str,
     record: &Value,
 ) -> Result<()> {
-    let relative_output_path = validate_debug_output_relative_path(relative_output_path)?;
+    let relative_history_path = validate_debug_output_relative_path(relative_history_path)?;
     let source_label = source_label.trim();
     if source_label.is_empty() {
         bail!("debug source label must not be empty");
     }
-    let file_name = relative_output_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .context("debug output path must have a UTF-8 file name")?;
-    let history_name = file_name
-        .strip_suffix(".json")
-        .map(|stem| format!("{stem}.iterations.json"))
-        .context("debug output history requires a .json output path")?;
-    let history_path = project_root.join(relative_output_path.with_file_name(history_name));
+    let history_path = project_root.join(relative_history_path);
     with_debug_output_lock(|| {
         if let Some(parent) = history_path.parent() {
             fs::create_dir_all(parent).with_context(|| {
@@ -860,6 +938,22 @@ fn append_debug_output_history(
         fs::write(&history_path, serde_json::to_string_pretty(&history)?)
             .with_context(|| format!("failed to write debug history {}", history_path.display()))
     })
+}
+
+fn debug_output_history_relative_path(relative_output_path: &Path) -> Result<PathBuf> {
+    let file_name = relative_output_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("debug output path must have a UTF-8 file name")?;
+    let history_name = file_name
+        .strip_suffix(".json")
+        .map(|stem| format!("{stem}.iterations.json"))
+        .context("debug output history requires a .json output path")?;
+    Ok(relative_output_path.with_file_name(history_name))
+}
+
+fn uses_aggregated_phase2_debug_records(_relative_output_path: &Path) -> bool {
+    false
 }
 
 fn web_run_runtime(config: &WebSearchConfig) -> Option<tools::WebRunRuntime> {
@@ -946,7 +1040,7 @@ async fn run_responses_text_once(
     prompt: &str,
 ) -> Result<String> {
     let client = openai_compatible_responses_client(&settings.llm)?;
-    let request = build_responses_request(settings, input, prompt, false)?;
+    let request = build_responses_request(settings, input, prompt, false, true)?;
     let started = std::time::Instant::now();
     debug!(role = %settings.role, "sending non-streaming Responses API request");
     let response = client
@@ -971,7 +1065,7 @@ async fn run_chat_completions_text_once(
     prompt: &str,
 ) -> Result<String> {
     let client = openai_compatible_responses_client(&settings.llm)?;
-    let request = build_chat_completions_request(settings, input, prompt, false)?;
+    let request = build_chat_completions_request(settings, input, prompt, false, true)?;
     let started = std::time::Instant::now();
     debug!(role = %settings.role, "sending non-streaming Chat Completions API request");
     let response = client
@@ -999,6 +1093,7 @@ fn build_responses_request(
     input: &agent_loop::ModelInput,
     prompt: &str,
     with_tools: bool,
+    append_prompt: bool,
 ) -> Result<async_openai::types::responses::CreateResponse> {
     use async_openai::types::responses::*;
 
@@ -1008,10 +1103,22 @@ fn build_responses_request(
     for item in &input.items {
         match item.item_type {
             agent_loop::TurnItemType::UserMessage => {
-                if !seen_first_user {
+                if append_prompt && !seen_first_user {
                     seen_first_user = true;
                     continue;
                 }
+                let msg = EasyInputMessage {
+                    role: Role::User,
+                    content: EasyInputContent::Text(item.content_text.clone()),
+                    ..Default::default()
+                };
+                items.push(InputItem::EasyMessage(msg));
+            }
+            // `InjectedContext` is a Rust-owned user turn such as a Phase 2
+            // stree delivery.  It is intentionally distinct in the persisted
+            // history/debug view, but the model must receive it exactly like
+            // a follow-up user message in the existing conversation.
+            agent_loop::TurnItemType::InjectedContext => {
                 let msg = EasyInputMessage {
                     role: Role::User,
                     content: EasyInputContent::Text(item.content_text.clone()),
@@ -1100,12 +1207,14 @@ fn build_responses_request(
         }
     }
 
-    let user_msg = EasyInputMessage {
-        role: Role::User,
-        content: EasyInputContent::Text(prompt.to_string()),
-        ..Default::default()
-    };
-    items.push(InputItem::EasyMessage(user_msg));
+    if append_prompt {
+        let user_msg = EasyInputMessage {
+            role: Role::User,
+            content: EasyInputContent::Text(prompt.to_string()),
+            ..Default::default()
+        };
+        items.push(InputItem::EasyMessage(user_msg));
+    }
 
     let item_count = items.len();
     let model = settings.llm.model.clone();
@@ -1174,6 +1283,7 @@ fn build_chat_completions_request(
     input: &agent_loop::ModelInput,
     prompt: &str,
     with_tools: bool,
+    append_prompt: bool,
 ) -> Result<async_openai::types::chat::CreateChatCompletionRequest> {
     use async_openai::types::chat::*;
 
@@ -1221,10 +1331,22 @@ fn build_chat_completions_request(
         }
         match item.item_type {
             agent_loop::TurnItemType::UserMessage => {
-                if !seen_first_user {
+                if append_prompt && !seen_first_user {
                     seen_first_user = true;
                     continue;
                 }
+                messages.push(ChatCompletionRequestMessage::User(
+                    ChatCompletionRequestUserMessage {
+                        content: ChatCompletionRequestUserMessageContent::Text(
+                            item.content_text.clone(),
+                        ),
+                        name: None,
+                    },
+                ));
+            }
+            // Keep the persisted item type for traceability while delivering
+            // a stree node to the target role as an ordinary user message.
+            agent_loop::TurnItemType::InjectedContext => {
                 messages.push(ChatCompletionRequestMessage::User(
                     ChatCompletionRequestUserMessage {
                         content: ChatCompletionRequestUserMessageContent::Text(
@@ -1302,12 +1424,14 @@ fn build_chat_completions_request(
     }
     flush_tool_calls(&mut messages, &mut pending_tool_calls);
 
-    messages.push(ChatCompletionRequestMessage::User(
-        ChatCompletionRequestUserMessage {
-            content: ChatCompletionRequestUserMessageContent::Text(prompt.to_string()),
-            name: None,
-        },
-    ));
+    if append_prompt {
+        messages.push(ChatCompletionRequestMessage::User(
+            ChatCompletionRequestUserMessage {
+                content: ChatCompletionRequestUserMessageContent::Text(prompt.to_string()),
+                name: None,
+            },
+        ));
+    }
 
     let msg_count = messages.len();
     let model = settings.llm.effective_model().to_string();
@@ -1510,6 +1634,10 @@ fn is_permanent_llm_error_text(text: &str) -> bool {
                 || text.contains("token")))
 }
 
+fn is_recoverable_length_finish(text_started: bool, pending_tool_calls: bool) -> bool {
+    text_started && !pending_tool_calls
+}
+
 async fn stream_responses_once(
     settings: &AgentSettings,
     input: &agent_loop::ModelInput,
@@ -1520,7 +1648,8 @@ async fn stream_responses_once(
 
     let started = std::time::Instant::now();
     let client = openai_compatible_responses_client(&settings.llm).map_err(|e| (e, false))?;
-    let request = build_responses_request(settings, input, prompt, true).map_err(|e| (e, false))?;
+    let request =
+        build_responses_request(settings, input, prompt, true, false).map_err(|e| (e, false))?;
     debug!(role = %settings.role, "opening streaming Responses API connection");
     let mut stream = client
         .responses()
@@ -1847,8 +1976,8 @@ async fn stream_chat_completions_once(
 
     let started = std::time::Instant::now();
     let client = openai_compatible_responses_client(&settings.llm).map_err(|e| (e, false))?;
-    let request =
-        build_chat_completions_request(settings, input, prompt, true).map_err(|e| (e, false))?;
+    let request = build_chat_completions_request(settings, input, prompt, true, false)
+        .map_err(|e| (e, false))?;
     debug!(role = %settings.role, "opening streaming Chat Completions API connection");
     let mut stream = client.chat().create_stream(request).await.map_err(|e| {
         (
@@ -1869,6 +1998,7 @@ async fn stream_chat_completions_once(
     let mut made_progress = false;
     let mut event_count: u64 = 0;
     let mut saw_terminal_finish = false;
+    let mut truncated_by_length = false;
 
     struct PendingToolCall {
         id: String,
@@ -1982,8 +2112,24 @@ async fn stream_chat_completions_once(
 
             if let Some(finish_reason) = choice.finish_reason {
                 let finish = format!("{finish_reason:?}");
-                if finish.eq_ignore_ascii_case("length")
-                    || finish.eq_ignore_ascii_case("contentfilter")
+                if finish.eq_ignore_ascii_case("length") {
+                    if is_recoverable_length_finish(text_started, !pending_tool_calls.is_empty()) {
+                        // Preserve the completed text item and let the Agent
+                        // Loop request a continuation.  A length-terminated
+                        // tool call is still fatal because its arguments are
+                        // not safe to execute.
+                        truncated_by_length = true;
+                        saw_terminal_finish = true;
+                        continue;
+                    }
+                    return Err((
+                        anyhow::anyhow!(
+                            "Chat Completions stream terminated with non-recoverable finish_reason={finish}"
+                        ),
+                        made_progress,
+                    ));
+                }
+                if finish.eq_ignore_ascii_case("contentfilter")
                     || finish.eq_ignore_ascii_case("content_filter")
                 {
                     return Err((
@@ -2068,7 +2214,7 @@ async fn stream_chat_completions_once(
 
     handler
         .handle(ModelStreamEvent::ResponseCompleted {
-            end_turn: !saw_tool_call,
+            end_turn: !saw_tool_call && !truncated_by_length,
             raw: final_raw,
         })
         .await
@@ -2276,9 +2422,9 @@ fn default_tool_config() -> tools::ExternalToolConfig {
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_loop, is_permanent_llm_error_text, is_transient_llm_error, tools, AgentSettings,
-        LlmRoute, LlmTransport, RoleLlmSettings, ToolManagedProfile, ToolResultItem,
-        TruncationConfig,
+        agent_loop, is_permanent_llm_error_text, is_recoverable_length_finish,
+        is_transient_llm_error, tools, AgentSettings, LlmRoute, LlmTransport, RoleLlmSettings,
+        ToolManagedProfile, ToolResultItem, TruncationConfig,
     };
     use crate::web_search::{WebSearchConfig, WebSearchMode};
     use anyhow::anyhow;
@@ -2328,6 +2474,13 @@ mod tests {
              param: Some(\"\"), code: Some(\"insufficient_user_quota\") }} }})"
         );
         assert!(!is_transient_llm_error(&err));
+    }
+
+    #[test]
+    fn length_finish_is_recoverable_only_for_plain_text_without_pending_tools() {
+        assert!(is_recoverable_length_finish(true, false));
+        assert!(!is_recoverable_length_finish(false, false));
+        assert!(!is_recoverable_length_finish(true, true));
     }
 
     fn base_settings(route: LlmRoute) -> AgentSettings {
@@ -2464,6 +2617,7 @@ mod tests {
         assert!(response.contains("议题报告"));
         assert!(response.contains("Rust-verified Web evidence packets"));
         assert!(response.contains("web-123456"));
+        assert!(artifact.get("retrieval_audit").is_some());
     }
 
     #[test]
@@ -2477,6 +2631,10 @@ mod tests {
                 "read_jin10_candidates",
                 "verify_event",
                 "record_phase2_context",
+                "submit_debate_turn",
+                "route_debate_turn",
+                "wait_for_debate_turn",
+                "close_debate",
                 "alpaca_get_news",
             ]
         );
@@ -2554,6 +2712,7 @@ mod tests {
             &input,
             "produce final portfolio artifact",
             false,
+            true,
         )
         .unwrap();
         let messages = serde_json::to_value(request).unwrap()["messages"].clone();
@@ -2564,6 +2723,113 @@ mod tests {
         assert_eq!(messages[1]["tool_call_id"], "call-summary");
         assert_eq!(messages[2]["role"], "tool");
         assert_eq!(messages[2]["tool_call_id"], "call-details");
+    }
+
+    #[test]
+    fn stree_injected_context_is_sent_as_a_user_message_for_both_routes() {
+        let stree_text = "stree: bear accepts Bull claim topic-a:bull:1; please close the debate.";
+        let injected = agent_loop::TurnItem {
+            item_type: agent_loop::TurnItemType::InjectedContext,
+            role: "user".to_owned(),
+            content_text: stree_text.to_owned(),
+            content_json: json!({"source": "stree", "node_id": "node-a"}),
+            tool_call_id: String::new(),
+            tool_name: String::new(),
+            output_item_id: String::new(),
+            phase: None,
+            status: None,
+            db_row_id: None,
+        };
+        let input = agent_loop::ModelInput {
+            system_instruction: None,
+            items: vec![agent_loop::TurnItem::user("Bull role prompt"), injected],
+            available_tools: Vec::new(),
+            truncation: TruncationConfig::default(),
+        };
+
+        let responses = super::build_responses_request(
+            &base_settings(LlmRoute::Responses),
+            &input,
+            "continue the existing conversation",
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(serde_json::to_string(&responses)
+            .unwrap()
+            .contains(stree_text));
+
+        let chat = super::build_chat_completions_request(
+            &base_settings(LlmRoute::ChatCompletions),
+            &input,
+            "continue the existing conversation",
+            false,
+            false,
+        )
+        .unwrap();
+        let messages = serde_json::to_value(chat).unwrap()["messages"].clone();
+        assert!(messages.as_array().is_some_and(|items| {
+            items.iter().any(|message| {
+                message["role"] == "user" && message["content"].as_str() == Some(stree_text)
+            })
+        }));
+    }
+
+    #[test]
+    fn streaming_request_preserves_fork_history_role_task_then_stree() {
+        let stree_text = "stree: opening for topic-a";
+        let injected = agent_loop::TurnItem {
+            item_type: agent_loop::TurnItemType::InjectedContext,
+            role: "user".to_owned(),
+            content_text: stree_text.to_owned(),
+            content_json: json!({"source": "stree", "node_id": "topic-a:stree:1"}),
+            tool_call_id: String::new(),
+            tool_name: String::new(),
+            output_item_id: String::new(),
+            phase: None,
+            status: None,
+            db_row_id: None,
+        };
+        let input = agent_loop::ModelInput {
+            system_instruction: None,
+            items: vec![
+                agent_loop::TurnItem::user("WARMUP PROMPT"),
+                agent_loop::TurnItem::assistant("warmup ready", Value::Null),
+                agent_loop::TurnItem::user("BEAR ROLE TASK"),
+                injected,
+            ],
+            available_tools: Vec::new(),
+            truncation: TruncationConfig::default(),
+        };
+
+        let chat = super::build_chat_completions_request(
+            &base_settings(LlmRoute::ChatCompletions),
+            &input,
+            "must not be appended for a stream",
+            true,
+            false,
+        )
+        .unwrap();
+        let messages = serde_json::to_value(chat).unwrap()["messages"].clone();
+        assert_eq!(messages[0]["content"], "WARMUP PROMPT");
+        assert_eq!(messages[1]["content"], "warmup ready");
+        assert_eq!(messages[2]["content"], "BEAR ROLE TASK");
+        assert_eq!(messages[3]["content"], stree_text);
+
+        let responses = super::build_responses_request(
+            &base_settings(LlmRoute::Responses),
+            &input,
+            "must not be appended for a stream",
+            true,
+            false,
+        )
+        .unwrap();
+        let wire = serde_json::to_string(&responses).unwrap();
+        let warmup = wire.find("WARMUP PROMPT").unwrap();
+        let role = wire.find("BEAR ROLE TASK").unwrap();
+        let stree = wire.find(stree_text).unwrap();
+        assert!(warmup < role && role < stree);
+        assert!(!wire.contains("must not be appended for a stream"));
     }
 
     #[test]
@@ -2647,6 +2913,70 @@ mod tests {
     }
 
     #[test]
+    fn phase2_debate_debug_file_appends_rounds_in_place() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut settings = base_settings(LlmRoute::Responses);
+        settings.debug = true;
+        settings.phase = Some(2);
+        settings.role = "researcher.bull.initial".to_string();
+        settings.topic_id = Some("topic-a".to_string());
+        settings.debug_round = Some(0);
+        settings.debug_prompt_path = Some(PathBuf::from("prompts/phase2/researcher/debate.md"));
+        settings.debug_output_path = Some(PathBuf::from(
+            "outputs/debug/phase2/topic-a/debate-bull.json",
+        ));
+        settings.tools = Some(tools::ExternalToolConfig {
+            project_root: temp.path().to_path_buf(),
+            run_id: None,
+            phase: None,
+            phase_summary_page_limit: 20,
+            phase_summary_detail_page_limit: 20,
+            tickers: vec!["TQQQ".to_string()],
+            alpaca_market_data: false,
+            alpaca_api_key: None,
+            alpaca_api_secret: None,
+            file_store_input: None,
+            file_store_reflection_source: None,
+            phase2_context: None,
+        });
+
+        super::append_debug_llm_record(
+            &settings,
+            json!({"req": {"messages": [{"content": "round 0"}]}, "resp": {}}),
+        )
+        .unwrap();
+        settings.role = "researcher.bull".to_string();
+        settings.debug_round = Some(1);
+        super::append_debug_llm_record(
+            &settings,
+            json!({"req": {"messages": [{"content": "round 1"}]}, "resp": {}}),
+        )
+        .unwrap();
+        super::finalize_debug_llm_record(
+            &settings,
+            &ToolResultItem {
+                call_id: "call-round-1".to_string(),
+                name: "submit_terminal_result".to_string(),
+                status: "completed".to_string(),
+                output: Value::Null,
+                error: None,
+            },
+        )
+        .unwrap();
+
+        let path = temp
+            .path()
+            .join("outputs/debug/phase2/topic-a/debate-bull.json");
+        let output: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(output.get("records").is_none());
+        assert_eq!(output["round"], 1);
+        assert_eq!(output["role"], "researcher.bull");
+        assert_eq!(output["end_turn"], true);
+        assert_eq!(output["resp"]["terminal"]["call_id"], "call-round-1");
+        assert!(path.with_file_name("debate-bull.iterations.json").exists());
+    }
+
+    #[test]
     fn finalize_debug_llm_record_updates_the_latest_request_in_place() {
         let temp = tempfile::tempdir().unwrap();
         let mut settings = base_settings(LlmRoute::Responses);
@@ -2697,6 +3027,75 @@ mod tests {
         assert_eq!(output["resp"]["status"], "completed");
         assert_eq!(output["resp"]["terminal"]["call_id"], "call-final");
         assert!(output.get("records").is_none());
+    }
+
+    #[test]
+    fn phase2_latest_debug_file_keeps_completed_record_when_follow_up_is_in_progress() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut settings = base_settings(LlmRoute::Responses);
+        settings.debug = true;
+        settings.phase = Some(2);
+        settings.role = "mediator.topic".to_string();
+        settings.debug_prompt_path = Some(PathBuf::from("prompts/phase2/topic_generator.md"));
+        settings.debug_output_path =
+            Some(PathBuf::from("outputs/debug/phase2/topic-generator.json"));
+        settings.tools = Some(tools::ExternalToolConfig {
+            project_root: temp.path().to_path_buf(),
+            run_id: None,
+            phase: None,
+            phase_summary_page_limit: 20,
+            phase_summary_detail_page_limit: 20,
+            tickers: vec!["QQQ".to_string()],
+            alpaca_market_data: false,
+            alpaca_api_key: None,
+            alpaca_api_secret: None,
+            file_store_input: None,
+            file_store_reflection_source: None,
+            phase2_context: None,
+        });
+
+        super::append_debug_llm_record(
+            &settings,
+            json!({
+                "kind": "stream",
+                "end_turn": true,
+                "response_text": "completed debate checkpoint",
+                "resp": {"status": "completed"}
+            }),
+        )
+        .unwrap();
+        super::append_debug_llm_record(
+            &settings,
+            json!({
+                "kind": "stream",
+                "end_turn": false,
+                "response_text": "follow-up still in progress",
+                "resp": {"status": "in_progress"}
+            }),
+        )
+        .unwrap();
+
+        let latest: Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                temp.path()
+                    .join("outputs/debug/phase2/topic-generator.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(latest["end_turn"], true);
+        assert_eq!(latest["response_text"], "completed debate checkpoint");
+
+        let history: Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                temp.path()
+                    .join("outputs/debug/phase2/topic-generator.iterations.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(history["records"].as_array().unwrap().len(), 2);
+        assert_eq!(history["records"][1]["end_turn"], false);
     }
 
     #[test]
@@ -3054,17 +3453,14 @@ mod tests {
             input,
             "这是一个新的子回合。上一条 assistant 输出只是恢复的 checkpoint 上下文，不是本轮答案。\
              请执行下面的新角色与任务，生成新的回复。\n\nBULL ROLE PROMPT\n\n\
-             请读取本轮 `record_phase2_context` 工具结果，并只基于其中的当前主题、已有辩论和控制路由完成本轮自由文字回复。"
+             继续这个既有会话；Rust 会以 `stree: {...}` user message 注入本轮跨角色信息。依据该消息和已有会话上下文完成本轮终端工具动作。"
         );
     }
 
     #[test]
-    fn resumed_topic_turn_reasserts_the_current_role_prompt() {
+    fn resumed_topic_turn_keeps_the_existing_role_prompt() {
         let input = super::prepare_fork_turn_input("BULL ROLE PROMPT", true, false, false);
 
-        assert_eq!(
-            input,
-            "BULL ROLE PROMPT\n\n请读取本轮 `record_phase2_context` 工具结果，并只基于其中的当前主题、已有辩论和控制路由完成本轮自由文字回复。"
-        );
+        assert!(input.is_empty());
     }
 }

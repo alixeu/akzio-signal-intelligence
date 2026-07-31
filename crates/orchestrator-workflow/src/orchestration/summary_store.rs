@@ -5,13 +5,12 @@ use chrono::Utc;
 use orchestrator_store::{
     append_index_detail, content_hash, create_index, finalize_index, AppendIndexDetailInput,
     CreateIndexInput, DetailSection, FileStore, FileStoreOptions, Index, IndexKind, IndexScope,
-    RunLocation,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::{collections::BTreeSet, path::Path};
 
-use super::summary_units::derive_summary_index_id;
+use super::{lifecycle::run_location_from_state, summary_units::derive_summary_index_id};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -115,7 +114,7 @@ pub(crate) fn write_compiled_phase_index(
 ) -> Result<Index> {
     validate_phase_fields(phase, &candidate.authoritative_fields)?;
     let run_id = required_state_string(state, "run_id")?;
-    let location = RunLocation::new(required_state_string(state, "current_date")?, &run_id)?;
+    let location = run_location_from_state(state)?;
     let unit_key = [
         format!("phase{phase}"),
         role.to_owned(),
@@ -308,10 +307,18 @@ fn validate_optional_fraction(object: &Value, key: &str, phase: u8, ticker: &str
 }
 
 fn applies_to_phases(source_phase: u8) -> Vec<u8> {
-    (source_phase < 7)
-        .then_some(source_phase + 1)
-        .into_iter()
-        .collect()
+    match source_phase {
+        // Research Manager is explicitly allowed to compare the Phase 1
+        // baseline with Phase 2 debate deltas.  Keep Phase 1 unavailable to
+        // later execution stages; their source-phase policies already select
+        // the relevant Research/Trader/Risk summaries.
+        1 => vec![2, 3],
+        3 => vec![4, 5, 6],
+        4 => vec![5, 6],
+        5 => vec![6],
+        phase if phase < 7 => vec![phase + 1],
+        _ => Vec::new(),
+    }
 }
 
 fn required_state_string(state: &Value, key: &str) -> Result<String> {
@@ -343,5 +350,14 @@ mod tests {
         }))
         .unwrap();
         assert!(validate_phase_fields(3, &fields).is_err());
+    }
+
+    #[test]
+    fn phase1_summaries_are_visible_to_phase3_research_decisions() {
+        assert_eq!(applies_to_phases(1), vec![2, 3]);
+        assert_eq!(applies_to_phases(2), vec![3]);
+        assert_eq!(applies_to_phases(3), vec![4, 5, 6]);
+        assert_eq!(applies_to_phases(4), vec![5, 6]);
+        assert_eq!(applies_to_phases(5), vec![6]);
     }
 }

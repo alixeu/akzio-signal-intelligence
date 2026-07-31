@@ -13,18 +13,32 @@ use crate::{
 
 pub const RUN_MANIFEST_SCHEMA_VERSION: u32 = 2;
 
-/// Stable store location for one workflow run. The human workflow date stays
-/// readable; the untrusted/generated run ID is encoded before it becomes a
-/// path component.
+/// Stable store location for one workflow run. Normal runs use their human
+/// workflow date as the partition; the debug namespace deliberately uses one
+/// date-independent partition so an operator can resume the same diagnostic
+/// run across calendar days.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunLocation {
     pub current_date: String,
     pub run_id: String,
     run_slug: String,
+    storage_namespace: Option<String>,
 }
 
 impl RunLocation {
     pub fn new(current_date: impl Into<String>, run_id: impl Into<String>) -> Result<Self> {
+        Self::with_storage_namespace(current_date, run_id, None)
+    }
+
+    pub fn debug(current_date: impl Into<String>, run_id: impl Into<String>) -> Result<Self> {
+        Self::with_storage_namespace(current_date, run_id, Some("debug".to_owned()))
+    }
+
+    pub fn with_storage_namespace(
+        current_date: impl Into<String>,
+        run_id: impl Into<String>,
+        storage_namespace: Option<String>,
+    ) -> Result<Self> {
         let current_date = current_date.into();
         let run_id = run_id.into();
         if !is_workflow_date(&current_date) {
@@ -37,6 +51,15 @@ impl RunLocation {
             return Err(StoreError::InvalidDocument {
                 kind: "run location",
                 message: "run_id must not be empty".to_owned(),
+            });
+        }
+        if storage_namespace
+            .as_deref()
+            .is_some_and(|namespace| namespace != "debug")
+        {
+            return Err(StoreError::InvalidDocument {
+                kind: "run location",
+                message: "storage_namespace must be `debug` when present".to_owned(),
             });
         }
         let run_slug = if run_id.len() <= 99
@@ -52,12 +75,17 @@ impl RunLocation {
             run_slug,
             current_date,
             run_id,
+            storage_namespace,
         })
     }
 
     pub fn relative_root(&self) -> PathBuf {
         PathBuf::from("runs")
-            .join(&self.current_date)
+            .join(
+                self.storage_namespace
+                    .as_deref()
+                    .unwrap_or(&self.current_date),
+            )
             .join(self.run_slug.as_str())
     }
 
@@ -71,6 +99,10 @@ impl RunLocation {
 
     pub fn run_slug(&self) -> &String {
         &self.run_slug
+    }
+
+    pub fn storage_namespace(&self) -> Option<&str> {
+        self.storage_namespace.as_deref()
     }
 
     pub fn child_relative(&self, child: &Path) -> Result<PathBuf> {
@@ -215,6 +247,8 @@ pub struct RunManifest {
     pub schema_version: u32,
     pub run_id: String,
     pub current_date: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_namespace: Option<String>,
     pub status: RunStatus,
     pub current_phase: u8,
     pub phase_status: BTreeMap<String, PhaseStatus>,
@@ -287,6 +321,7 @@ impl TryFrom<LegacyRunManifestV1> for RunManifest {
             schema_version: RUN_MANIFEST_SCHEMA_VERSION,
             run_id: legacy.run_id,
             current_date: legacy.current_date,
+            storage_namespace: None,
             status: legacy.status,
             current_phase: legacy.current_phase,
             phase_status: legacy.phase_status,
@@ -329,6 +364,7 @@ impl RunManifest {
             schema_version: RUN_MANIFEST_SCHEMA_VERSION,
             run_id: init.location.run_id,
             current_date: init.location.current_date,
+            storage_namespace: init.location.storage_namespace.clone(),
             status: RunStatus::Running,
             current_phase: 0,
             phase_status: BTreeMap::new(),
@@ -348,7 +384,11 @@ impl RunManifest {
     }
 
     pub fn location(&self) -> Result<RunLocation> {
-        RunLocation::new(self.current_date.clone(), self.run_id.clone())
+        RunLocation::with_storage_namespace(
+            self.current_date.clone(),
+            self.run_id.clone(),
+            self.storage_namespace.clone(),
+        )
     }
 
     pub fn record_finalized_artifact(&mut self, artifact: FinalizedArtifactRef) -> Result<()> {
@@ -381,7 +421,12 @@ impl RunManifest {
                 message: "schema_version differs from current typed manifest".to_owned(),
             });
         }
-        if self.run_id != location.run_id || self.current_date != location.current_date {
+        let same_debug_namespace = self.storage_namespace.as_deref() == Some("debug")
+            && location.storage_namespace() == Some("debug");
+        if self.run_id != location.run_id
+            || (!same_debug_namespace && self.current_date != location.current_date)
+            || self.storage_namespace.as_deref() != location.storage_namespace()
+        {
             return Err(StoreError::InvalidDocument {
                 kind: "run manifest",
                 message: "manifest run identity differs from requested store location".to_owned(),
@@ -484,7 +529,7 @@ pub fn find_run_location(store: &FileStore, run_id: &str) -> Result<Option<RunLo
         if metadata.file_type().is_symlink() {
             return Err(StoreError::SymlinkPath { path: date_path });
         }
-        if !metadata.is_dir() || !is_workflow_date(&date.file_name().to_string_lossy()) {
+        if !metadata.is_dir() || !is_run_partition(&date.file_name().to_string_lossy()) {
             continue;
         }
         for entry in std::fs::read_dir(&date_path).map_err(|source| StoreError::Io {
@@ -517,7 +562,7 @@ pub fn find_run_location(store: &FileStore, run_id: &str) -> Result<Option<RunLo
             if manifest.run_id != run_id {
                 continue;
             }
-            let location = RunLocation::new(manifest.current_date, manifest.run_id)?;
+            let location = manifest.location()?;
             if found.replace(location).is_some() {
                 return Err(StoreError::InvalidDocument {
                     kind: "run location",
@@ -554,7 +599,7 @@ pub fn list_run_locations(store: &FileStore) -> Result<Vec<RunLocation>> {
         if metadata.file_type().is_symlink() {
             return Err(StoreError::SymlinkPath { path: date_path });
         }
-        if !metadata.is_dir() || !is_workflow_date(&date.file_name().to_string_lossy()) {
+        if !metadata.is_dir() || !is_run_partition(&date.file_name().to_string_lossy()) {
             continue;
         }
         for entry in std::fs::read_dir(&date_path).map_err(|source| StoreError::Io {
@@ -584,7 +629,7 @@ pub fn list_run_locations(store: &FileStore) -> Result<Vec<RunLocation>> {
                 continue;
             }
             let manifest = read_manifest_relative(store, &relative)?;
-            locations.push(RunLocation::new(manifest.current_date, manifest.run_id)?);
+            locations.push(manifest.location()?);
         }
     }
     locations.sort_by(|left, right| {
@@ -604,6 +649,10 @@ fn is_workflow_date(value: &str) -> bool {
             .bytes()
             .enumerate()
             .all(|(index, byte)| matches!(index, 4 | 7) || byte.is_ascii_digit())
+}
+
+fn is_run_partition(value: &str) -> bool {
+    value == "debug" || is_workflow_date(value)
 }
 
 #[cfg(test)]
@@ -655,6 +704,26 @@ mod tests {
         assert_eq!(
             location.relative_root(),
             PathBuf::from("runs/2026-07-27/qqq-soxx-vix-a1b2c3")
+        );
+    }
+
+    #[test]
+    fn debug_location_uses_a_date_independent_partition() {
+        let directory = tempdir().unwrap();
+        let store = FileStore::open(directory.path(), FileStoreOptions::default()).unwrap();
+        let location = RunLocation::debug("2026-07-31", "qqq-soxx-vix-debug").unwrap();
+        assert_eq!(location.current_date, "2026-07-31");
+        assert_eq!(location.storage_namespace(), Some("debug"));
+        assert_eq!(
+            location.relative_root(),
+            PathBuf::from("runs/debug/qqq-soxx-vix-debug")
+        );
+        assert_eq!(manifest(location.clone()).location().unwrap(), location);
+        write_run_manifest(&store, &location, manifest(location.clone())).unwrap();
+        let resumed = RunLocation::debug("2026-08-01", "qqq-soxx-vix-debug").unwrap();
+        assert_eq!(
+            read_run_manifest(&store, &resumed).unwrap().run_id,
+            resumed.run_id
         );
     }
 
