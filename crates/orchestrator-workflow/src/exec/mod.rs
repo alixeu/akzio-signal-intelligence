@@ -27,6 +27,10 @@ use crate::orchestration::{
         compute_allocation_context, derive_guarded_allocation, market_snapshot_from_technical,
     },
     config::RuntimeConfig,
+    execution::{
+        build_order_plan, credentials as alpaca_credentials, debug_account_snapshot,
+        load_alpaca_account_snapshot, submit_order_plan, AccountSnapshot, ExecutionReport,
+    },
     input_snapshot_runtime::{capture_phase1_file_store_inputs, phase1_input_sources},
     lifecycle::{
         investable_assets_from_state, run_id_for, run_id_for_seed, set_phase_status,
@@ -294,6 +298,9 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         && (!phase_completed(&manifest, 6)
             || !has_required_phase_summaries(&store, &location, &state, &runtime, 6)?)
     {
+        if !args.mock {
+            ensure_execution_account_snapshot(&mut state, &runtime, &args).await?;
+        }
         run_phase6(
             &mut state,
             &runtime,
@@ -318,7 +325,10 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         && (!phase_completed(&manifest, 7)
             || !has_required_phase_summaries(&store, &location, &state, &runtime, 7)?)
     {
-        run_phase7(&store, &location, &mut state, &runtime)?;
+        if !args.mock {
+            ensure_execution_account_snapshot(&mut state, &runtime, &args).await?;
+        }
+        run_phase7(&store, &location, &mut state, &runtime, &args).await?;
         let summary_units = summarize(
             &store_root,
             &mut state,
@@ -340,26 +350,38 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
 
     // Completed Indexes are the run's semantic authority. The manifest only
     // carries lifecycle and Index references.
+    let run_completed = phase_completed(&manifest, 8);
     manifest.artifacts.clear();
-    manifest.status = RunStatus::Completed;
+    manifest.status = if run_completed {
+        RunStatus::Completed
+    } else {
+        RunStatus::Running
+    };
     sync_manifest_health(&mut manifest, &state);
     if let Some(phase) = highest_completed_phase(&manifest) {
         manifest.current_phase = phase;
     }
-    manifest.completed_at = Some(Utc::now().to_rfc3339());
+    manifest.completed_at = run_completed.then(|| Utc::now().to_rfc3339());
     write_run_manifest(&store, &location, manifest)?;
     seal_state(&mut state)?;
     store.write_json_value(&location.child_relative(Path::new("state.json"))?, &state)?;
-    let store_compaction = match run_store.compact_completed_run(RunCompactionMode::Apply) {
-        Ok(report) => serde_json::to_value(report)?,
-        Err(error) => {
-            tracing::warn!(error = %error, "completed-run store compaction failed");
-            json!({
-                "eligible": true,
-                "applied": false,
-                "failure": error.to_string(),
-            })
+    let store_compaction = if run_completed {
+        match run_store.compact_completed_run(RunCompactionMode::Apply) {
+            Ok(report) => serde_json::to_value(report)?,
+            Err(error) => {
+                tracing::warn!(error = %error, "completed-run store compaction failed");
+                json!({
+                    "eligible": true,
+                    "applied": false,
+                    "failure": error.to_string(),
+                })
+            }
         }
+    } else {
+        json!({
+            "eligible": false,
+            "applied": false,
+        })
     };
 
     Ok(json!({
@@ -379,6 +401,8 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
             .cloned()
             .unwrap_or(Value::Null),
         "portfolio_allocation": state.get("portfolio_allocation").cloned().unwrap_or(Value::Null),
+        "order_plan": state.get("order_plan").cloned().unwrap_or(Value::Null),
+        "execution_report": state.get("execution_report").cloned().unwrap_or(Value::Null),
         "store_compaction": store_compaction,
         "run_state": state,
     }))
@@ -1142,13 +1166,18 @@ async fn run_phase2(
             Some(0),
         );
         state["topic_debate_states"][&topic_id]["controller_artifact"] = controller.clone();
+        checkpoint_state(state)?;
         let max_rounds = state
             .get("max_debate_rounds")
             .and_then(Value::as_i64)
             .unwrap_or(1)
             .max(0);
         for round in 1..=max_rounds {
-            if !controller_should_continue(&controller)? {
+            if !controller_should_continue(
+                &controller,
+                &state["topic_debate_states"][&topic_id],
+                &topic_id,
+            )? {
                 break;
             }
             for (role, side) in [
@@ -1180,6 +1209,7 @@ async fn run_phase2(
                     .as_array_mut()
                     .expect("topic turns initialized")
                     .push(json!({"role":role, "round":round, "artifact": response}));
+                checkpoint_state(state)?;
             }
             controller = run_unit(
                 state,
@@ -1203,6 +1233,7 @@ async fn run_phase2(
                 Some(round),
             );
             state["topic_debate_states"][&topic_id]["controller_artifact"] = controller.clone();
+            checkpoint_state(state)?;
         }
         controllers.insert(topic_id, controller);
     }
@@ -1236,6 +1267,7 @@ async fn run_phase2(
         "final_reducer": reducer,
         "authority": "file_store"
     });
+    checkpoint_state(state)?;
     Ok(())
 }
 
@@ -1270,16 +1302,17 @@ async fn run_phase3(
     Ok(())
 }
 
-fn controller_should_continue(controller: &Value) -> Result<bool> {
+fn controller_should_continue(
+    controller: &Value,
+    topic_state: &Value,
+    topic_id: &str,
+) -> Result<bool> {
     let Some(should_continue) = controller
         .pointer("/payload/soft_control/should_continue")
         .or_else(|| controller.pointer("/soft_control/should_continue"))
         .and_then(Value::as_bool)
     else {
-        tracing::warn!(
-            "Topic Controller Summary omitted soft_control.should_continue; stopping debate safely"
-        );
-        return Ok(false);
+        bail!("Topic Controller Summary omitted soft_control.should_continue");
     };
     if should_continue {
         let next_steers = controller
@@ -1290,8 +1323,63 @@ fn controller_should_continue(controller: &Value) -> Result<bool> {
         if next_steers.is_empty() {
             bail!("continuing Topic Controller Summary requires non-empty next_steers")
         }
+    } else if requires_initial_collision(topic_state) {
+        bail!(
+            "Topic Controller cannot stop {topic_id} before Bull and Bear directly respond to routed opposing claims"
+        );
     }
     Ok(should_continue)
+}
+
+fn requires_initial_collision(topic_state: &Value) -> bool {
+    let turns = topic_state
+        .get("turns")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let has_initial_claims = ["researcher.bull.initial", "researcher.bear.initial"]
+        .into_iter()
+        .all(|role| {
+            turns.iter().any(|turn| {
+                turn.get("role").and_then(Value::as_str) == Some(role)
+                    && turn
+                        .pointer("/artifact/payload/claims")
+                        .and_then(Value::as_array)
+                        .is_some_and(|claims| !claims.is_empty())
+            })
+        });
+    if !has_initial_claims {
+        return false;
+    }
+    let bull_replied_to_bear = turns.iter().any(|turn| {
+        turn.get("role").and_then(Value::as_str) == Some("researcher.bull.interaction")
+            && turn
+                .pointer("/artifact/payload/replies")
+                .and_then(Value::as_array)
+                .is_some_and(|replies| {
+                    replies.iter().any(|reply| {
+                        reply
+                            .get("reply_to_claim_id")
+                            .and_then(Value::as_str)
+                            .is_some_and(|id| id.contains(":bear:"))
+                    })
+                })
+    });
+    let bear_replied_to_bull = turns.iter().any(|turn| {
+        turn.get("role").and_then(Value::as_str) == Some("researcher.bear.interaction")
+            && turn
+                .pointer("/artifact/payload/replies")
+                .and_then(Value::as_array)
+                .is_some_and(|replies| {
+                    replies.iter().any(|reply| {
+                        reply
+                            .get("reply_to_claim_id")
+                            .and_then(Value::as_str)
+                            .is_some_and(|id| id.contains(":bull:"))
+                    })
+                })
+    });
+    !(bull_replied_to_bear && bear_replied_to_bull)
 }
 
 async fn run_phase4(
@@ -1330,6 +1418,44 @@ async fn run_phase5(
     Ok(())
 }
 
+async fn ensure_execution_account_snapshot(
+    state: &mut Value,
+    runtime: &RuntimeConfig,
+    args: &ExecArgs,
+) -> Result<()> {
+    if let Some(existing) = state
+        .get("account_snapshot")
+        .filter(|value| !value.is_null())
+    {
+        let snapshot: AccountSnapshot = serde_json::from_value(existing.clone())
+            .context("stored account_snapshot is invalid")?;
+        state["current_portfolio_weights"] = serde_json::to_value(snapshot.current_weights)?;
+        return Ok(());
+    }
+    let investable = investable_assets_from_state(state);
+    let snapshot = if args.debug {
+        debug_account_snapshot(&investable, runtime.alpaca_debug_starting_cash)?
+    } else {
+        let purpose = args
+            .run_purpose
+            .map(Into::into)
+            .unwrap_or(runtime.evaluation.default_run_purpose);
+        if purpose != RunPurpose::Paper {
+            bail!(
+                "Alpaca execution supports Paper runs only; use --debug for simulation or --run-purpose paper"
+            )
+        }
+        let credentials = alpaca_credentials(
+            runtime.alpaca_api_key.as_deref(),
+            runtime.alpaca_api_secret.as_deref(),
+        )?;
+        load_alpaca_account_snapshot(&credentials, &investable).await?
+    };
+    state["current_portfolio_weights"] = serde_json::to_value(snapshot.current_weights.clone())?;
+    state["account_snapshot"] = serde_json::to_value(snapshot)?;
+    checkpoint_state(state)
+}
+
 async fn run_phase6(
     state: &mut Value,
     runtime: &RuntimeConfig,
@@ -1357,12 +1483,41 @@ async fn run_phase6(
     Ok(())
 }
 
-fn run_phase7(
+fn inject_runtime_current_weights_into_final_decision(state: &mut Value) -> Result<()> {
+    let investable = investable_assets_from_state(state);
+    let weights = state
+        .get("current_portfolio_weights")
+        .and_then(Value::as_object)
+        .context("runtime current_portfolio_weights are required before Phase 7")?
+        .clone();
+    let per_asset = state
+        .pointer_mut("/final_trade_decision/per_asset")
+        .and_then(Value::as_object_mut)
+        .context("final_trade_decision.per_asset is required before Phase 7")?;
+    for ticker in investable {
+        let current_weight = weights
+            .get(&ticker)
+            .and_then(Value::as_f64)
+            .with_context(|| format!("runtime current weight missing for {ticker}"))?;
+        let decision = per_asset
+            .get_mut(&ticker)
+            .and_then(Value::as_object_mut)
+            .with_context(|| format!("Phase 6 decision missing for {ticker}"))?;
+        decision.insert("current_weight".to_owned(), json!(current_weight));
+    }
+    Ok(())
+}
+
+async fn run_phase7(
     store: &FileStore,
     _location: &RunLocation,
     state: &mut Value,
     runtime: &RuntimeConfig,
+    args: &ExecArgs,
 ) -> Result<Value> {
+    if !args.mock {
+        inject_runtime_current_weights_into_final_decision(state)?;
+    }
     let context = compute_allocation_context(state, &runtime.allocation)?;
     let allocation = derive_guarded_allocation(state, &context, &runtime.allocation)
         .unwrap_or_else(|error| {
@@ -1374,9 +1529,67 @@ fn run_phase7(
         });
     state["allocation_context"] = context;
     state["portfolio_allocation"] = allocation.clone();
+    if args.mock {
+        state["order_plan"] = json!({
+            "status": "disabled_mock",
+            "account_equity": null,
+            "orders": [],
+            "skipped": [],
+        });
+        state["execution_report"] = json!({
+            "status": "disabled_mock",
+            "simulated": true,
+            "receipts": [],
+        });
+    } else {
+        let account: AccountSnapshot = serde_json::from_value(
+            state
+                .get("account_snapshot")
+                .cloned()
+                .context("Phase 7 requires an account snapshot")?,
+        )
+        .context("stored account_snapshot is invalid")?;
+        let plan = build_order_plan(
+            state["run_id"].as_str().context("run_id is required")?,
+            &allocation,
+            state.get("market_snapshot"),
+            &account,
+        )?;
+        state["order_plan"] = serde_json::to_value(&plan)?;
+        // Persist the exact plan and deterministic client_order_ids before any
+        // remote mutation. A retry queries Alpaca by client_order_id first.
+        checkpoint_state(state)?;
+        let report = if args.debug {
+            submit_order_plan(&plan, &account, None, true).await?
+        } else if runtime.alpaca_order_submission_enabled {
+            let credentials = alpaca_credentials(
+                runtime.alpaca_api_key.as_deref(),
+                runtime.alpaca_api_secret.as_deref(),
+            )?;
+            submit_order_plan(&plan, &account, Some(&credentials), false).await?
+        } else {
+            ExecutionReport {
+                status: "planned_not_submitted".to_owned(),
+                simulated: false,
+                receipts: Vec::new(),
+            }
+        };
+        state["execution_report"] = serde_json::to_value(report)?;
+        tracing::info!(
+            order_plan = %serde_json::to_string(&state["order_plan"])?,
+            "Phase 7 order plan"
+        );
+        tracing::info!(
+            execution_report = %serde_json::to_string(&state["execution_report"])?,
+            "Phase 7 execution result"
+        );
+    }
     let response_text = serde_json::to_string(&json!({
+        "account_snapshot": state.get("account_snapshot").cloned().unwrap_or(Value::Null),
         "allocation_context": state["allocation_context"],
         "allocation": allocation,
+        "order_plan": state["order_plan"],
+        "execution_report": state["execution_report"],
     }))?;
     let artifact = write_compiled_phase_index(
         store.root(),
@@ -1392,8 +1605,11 @@ fn run_phase7(
             summary: "Rust 已完成受约束的组合分配。".to_owned(),
             confidence: 1.0,
             authoritative_fields: serde_json::from_value(json!({
+                "account_snapshot": state.get("account_snapshot").cloned().unwrap_or(Value::Null),
                 "allocation_context": state["allocation_context"],
                 "allocation": allocation,
+                "order_plan": state["order_plan"],
+                "execution_report": state["execution_report"],
             }))?,
             details: Vec::new(),
             missing_fields: Vec::new(),
@@ -1461,6 +1677,9 @@ fn write_final_decision_indexes(
         "allocation_context": state["allocation_context"],
         "portfolio_allocation": state["portfolio_allocation"],
         "allocation_result": state["allocation_result"],
+        "account_snapshot": state.get("account_snapshot").cloned().unwrap_or(Value::Null),
+        "order_plan": state.get("order_plan").cloned().unwrap_or(Value::Null),
+        "execution_report": state.get("execution_report").cloned().unwrap_or(Value::Null),
         "decision_snapshots": decision_snapshots,
     });
     let source_payload_hash = content_hash(&payload)?;
@@ -1804,6 +2023,14 @@ async fn compile_unit_response(
         response_text,
         &mut candidate.authoritative_fields,
     )?;
+    if phase_u8 == 6 {
+        inject_current_weights_into_phase6_fields(state, &mut candidate.authoritative_fields)?;
+    }
+    validate_phase2_compiled_contract(
+        kind,
+        &candidate.authoritative_fields,
+        &candidate.missing_fields,
+    )?;
     validate_compiled_asset_scope(state, phase_u8, &candidate.authoritative_fields)?;
     if phase_u8 == 0 {
         let submission = phase0_submission(&candidate, response_text)?;
@@ -1886,24 +2113,6 @@ fn enrich_compiled_fields(
     fields: &mut serde_json::Map<String, Value>,
 ) -> Result<()> {
     attach_verified_web_evidence(response_text, fields)?;
-    if kind == "topic_control" {
-        let has_valid_soft_control = fields
-            .get("soft_control")
-            .and_then(Value::as_object)
-            .and_then(|value| value.get("should_continue"))
-            .and_then(Value::as_bool)
-            .is_some();
-        if !has_valid_soft_control {
-            fields.insert(
-                "soft_control".to_owned(),
-                json!({
-                    "should_continue": false,
-                    "info_gain_score": 0.0,
-                    "stop_reason": "Summary omitted a valid soft_control decision; debate stopped safely.",
-                }),
-            );
-        }
-    }
     if kind == "topic_generation" {
         for (offset, topic) in fields
             .get_mut("topics")
@@ -1955,6 +2164,114 @@ fn enrich_compiled_fields(
                 ))
             });
         }
+    }
+    Ok(())
+}
+
+fn inject_current_weights_into_phase6_fields(
+    state: &Value,
+    fields: &mut serde_json::Map<String, Value>,
+) -> Result<()> {
+    let weights = state
+        .get("current_portfolio_weights")
+        .and_then(Value::as_object);
+    let per_asset = fields
+        .get_mut("per_asset")
+        .and_then(Value::as_object_mut)
+        .context("Phase 6 Summary requires per_asset before runtime weight injection")?;
+    for ticker in investable_assets_from_state(state) {
+        let current_weight = weights
+            .and_then(|items| items.get(&ticker))
+            .and_then(Value::as_f64)
+            .or_else(|| state["mock"].as_bool().unwrap_or(false).then_some(0.0))
+            .with_context(|| format!("runtime current weight missing for {ticker}"))?;
+        let decision = per_asset
+            .get_mut(&ticker)
+            .and_then(Value::as_object_mut)
+            .with_context(|| format!("Phase 6 Summary decision missing for {ticker}"))?;
+        decision.insert("current_weight".to_owned(), json!(current_weight));
+    }
+    Ok(())
+}
+
+fn validate_phase2_compiled_contract(
+    kind: &str,
+    fields: &serde_json::Map<String, Value>,
+    missing_fields: &[String],
+) -> Result<()> {
+    let missing = |field: &str| {
+        missing_fields
+            .iter()
+            .any(|missing| missing == field || missing.starts_with(&format!("{field}[")))
+    };
+    let required_array = |field: &str, min: usize, max: usize| -> Result<&Vec<Value>> {
+        if missing(field) {
+            bail!("Phase 2 {kind} Summary omitted required {field}")
+        }
+        let values = fields
+            .get(field)
+            .and_then(Value::as_array)
+            .with_context(|| format!("Phase 2 {kind} Summary requires array {field}"))?;
+        if values.len() < min || values.len() > max {
+            bail!(
+                "Phase 2 {kind} Summary requires {field} length in {min}..={max}, got {}",
+                values.len()
+            )
+        }
+        Ok(values)
+    };
+    match kind {
+        "bull_seed" | "bear_seed" => {
+            let claims = required_array("claims", 1, 2)?;
+            for claim in claims {
+                if claim
+                    .get("claim")
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty)
+                {
+                    bail!("Phase 2 {kind} Summary requires non-empty claim text")
+                }
+            }
+        }
+        "interaction" => {
+            let replies = required_array("replies", 1, 2)?;
+            for reply in replies {
+                for field in ["reply_to_claim_id", "stance", "reason"] {
+                    if reply
+                        .get(field)
+                        .and_then(Value::as_str)
+                        .is_none_or(str::is_empty)
+                    {
+                        bail!("Phase 2 interaction Summary requires non-empty {field}")
+                    }
+                }
+            }
+        }
+        "topic_control" => {
+            required_array("claim_ledger", 1, 3)?;
+            required_array("decision_hinges", 1, 3)?;
+            if missing("next_steers") || !fields.get("next_steers").is_some_and(Value::is_array) {
+                bail!("Phase 2 topic_control Summary requires next_steers array")
+            }
+            let soft_control = fields
+                .get("soft_control")
+                .and_then(Value::as_object)
+                .context("Phase 2 topic_control Summary requires soft_control object")?;
+            if soft_control
+                .get("should_continue")
+                .and_then(Value::as_bool)
+                .is_none()
+                || soft_control
+                    .get("stop_reason")
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty)
+            {
+                bail!(
+                    "Phase 2 topic_control Summary requires boolean soft_control.should_continue and non-empty stop_reason"
+                )
+            }
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -2291,9 +2608,9 @@ mod phase2_session_tests {
     use serde_json::json;
 
     use super::{
-        attach_verified_web_evidence, controller_should_continue, enrich_compiled_fields,
-        highest_completed_phase, prompt_owner_for_unit, record_phase2_session, runtime_session_key,
-        scoped_state_for_unit, select_reflection_task_budget, sync_manifest_health,
+        attach_verified_web_evidence, controller_should_continue, highest_completed_phase,
+        prompt_owner_for_unit, record_phase2_session, runtime_session_key, scoped_state_for_unit,
+        select_reflection_task_budget, sync_manifest_health, validate_phase2_compiled_contract,
     };
 
     #[test]
@@ -2310,37 +2627,66 @@ mod phase2_session_tests {
 
     #[test]
     fn controller_soft_control_owns_whether_another_round_runs() {
-        assert!(controller_should_continue(&json!({
-            "payload": {
-                "soft_control": {"should_continue": true},
-                "next_steers": [{"steer_id": "steer-1"}]
-            }
-        }))
+        let no_collision = json!({"turns": []});
+        assert!(controller_should_continue(
+            &json!({
+                "payload": {
+                    "soft_control": {"should_continue": true},
+                    "next_steers": [{"steer_id": "steer-1"}]
+                }
+            }),
+            &no_collision,
+            "topic-a"
+        )
         .unwrap());
-        assert!(!controller_should_continue(&json!({
-            "payload": {"soft_control": {"should_continue": false}}
-        }))
+        assert!(!controller_should_continue(
+            &json!({
+                "payload": {"soft_control": {"should_continue": false}}
+            }),
+            &no_collision,
+            "topic-a"
+        )
         .unwrap());
-        assert!(!controller_should_continue(&json!({})).unwrap());
-        assert!(controller_should_continue(&json!({
-            "payload": {"soft_control": {"should_continue": true}}
-        }))
+        assert!(controller_should_continue(&json!({}), &no_collision, "topic-a").is_err());
+        assert!(controller_should_continue(
+            &json!({
+                "payload": {"soft_control": {"should_continue": true}}
+            }),
+            &no_collision,
+            "topic-a"
+        )
         .is_err());
     }
 
     #[test]
-    fn missing_controller_soft_control_is_normalized_to_safe_stop() {
-        let mut fields = serde_json::Map::from_iter([("soft_control".to_owned(), json!(""))]);
-        enrich_compiled_fields(
-            "mediator.topic_controller",
-            "topic_control",
-            Some("topic-a"),
-            "controller report",
-            &mut fields,
+    fn controller_cannot_stop_before_direct_collision() {
+        let topic_state = json!({"turns": [
+            {"role": "researcher.bull.initial", "artifact": {"payload": {"claims": [{"claim_id": "topic-a:bull:1"}]}}},
+            {"role": "researcher.bear.initial", "artifact": {"payload": {"claims": [{"claim_id": "topic-a:bear:1"}]}}}
+        ]});
+        assert!(controller_should_continue(
+            &json!({"payload": {"soft_control": {"should_continue": false}}}),
+            &topic_state,
+            "topic-a",
         )
-        .unwrap();
-        assert_eq!(fields["soft_control"]["should_continue"], false);
-        assert_eq!(fields["soft_control"]["info_gain_score"], 0.0);
+        .is_err());
+    }
+
+    #[test]
+    fn phase2_seed_contract_rejects_claim_spam() {
+        let fields = serde_json::Map::from_iter([(
+            "claims".to_owned(),
+            json!([
+                {"claim": "one"}, {"claim": "two"}, {"claim": "three"}
+            ]),
+        )]);
+        assert!(validate_phase2_compiled_contract("bull_seed", &fields, &[]).is_err());
+    }
+
+    #[test]
+    fn controller_contract_rejects_topic_generator_fallback_fields() {
+        let fields = serde_json::Map::from_iter([("topics".to_owned(), json!([]))]);
+        assert!(validate_phase2_compiled_contract("topic_control", &fields, &[]).is_err());
     }
 
     #[test]

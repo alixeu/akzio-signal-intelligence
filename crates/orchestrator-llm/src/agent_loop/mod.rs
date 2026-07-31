@@ -1509,6 +1509,17 @@ fn preseed_tool_calls(
                 arguments: json!({ "tickers": tickers }),
             });
         }
+        // Topic Controller must satisfy its mandatory Phase 1 Index listing
+        // before writing a control report.  Preloading prevents a valid
+        // report from being followed by a retrieval-policy retry that can
+        // overwrite it with inherited fork context.
+        "mediator.topic_controller" if tool_enabled(tools::index_tools::READ_INDEXES_NAME) => {
+            calls.push(ToolCallRequest {
+                call_id: format!("preseed-phase1-indexes-{}", turn.turn_id),
+                name: tools::index_tools::READ_INDEXES_NAME.to_owned(),
+                arguments: json!({}),
+            });
+        }
         _ => {}
     }
     calls
@@ -1650,6 +1661,27 @@ mod phase2_context_preseed_tests {
         assert_eq!(calls[0].call_id, "preseed-phase2-context-turn-child");
         assert_eq!(calls[0].arguments, json!({}));
     }
+
+    #[test]
+    fn topic_controller_preloads_phase1_indexes_once() {
+        let turn = Turn::new(
+            "turn-controller",
+            "session-controller",
+            "run-a",
+            "mediator.topic_controller",
+            "topic instruction",
+        );
+        let calls = preseed_tool_calls(
+            &turn,
+            &[],
+            &[tools::index_tools::READ_INDEXES_NAME.to_owned()],
+        );
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, tools::index_tools::READ_INDEXES_NAME);
+        assert_eq!(calls[0].call_id, "preseed-phase1-indexes-turn-controller");
+        assert_eq!(calls[0].arguments, json!({}));
+    }
 }
 
 /// Map assistant prose into a non-artifact response. Native function calls arrive on the stream.
@@ -1706,15 +1738,6 @@ pub fn model_system_instruction(
             "{available_tools}",
             &serde_json::to_string(available_tools).unwrap_or_default(),
         )
-}
-
-/// Backward-compatible alias.
-pub fn react_system_instruction(
-    available_tools: &[String],
-    executing_role: &str,
-    tickers: &[String],
-) -> String {
-    model_system_instruction(available_tools, executing_role, tickers)
 }
 
 fn turn_item_prompt_json(
@@ -1898,11 +1921,6 @@ pub fn model_prompt(input: &ModelInput) -> Result<String> {
         .replace("{system}", &system)
         .replace("{static_context}", &static_context)
         .replace("{dynamic_context}", &dynamic_context))
-}
-
-/// Backward-compatible alias.
-pub fn react_prompt(input: &ModelInput) -> Result<String> {
-    model_prompt(input)
 }
 
 pub fn compact_summary_card(items: &[TurnItem]) -> String {

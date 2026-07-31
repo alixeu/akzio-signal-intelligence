@@ -1,22 +1,21 @@
 # Akzio Signal Intelligence
 
-Rust-native market-signal research workflow for a small ETF universe. The production path uses Alpaca Market Data, a Yahoo VIX fallback, Jin10, time-partitioned FileStore data, and an OpenAI-compatible LLM gateway. VIX is a regime signal, not an investable asset.
+面向小型 ETF 标的池的 Rust 原生市场信号研究工作流。生产路径使用 Alpaca Market Data、Yahoo VIX 回退、金十(Jin10)、按时间分区的 FileStore 数据,以及 OpenAI 兼容的 LLM 网关。VIX 是市场状态(regime)信号,不是可投资资产。
 
-## Current scope
+## 当前范围
 
-Active Phase 1 analysts are fixed to:
+活跃的 Phase 1 分析师固定为:
 
-| Role | Source | Weight | Critical |
+| 角色 | 数据源 | 权重 | 关键角色 |
 |---|---|---:|---|
-| `analyst.technical` | Alpaca OHLCV (Yahoo for VIX) and precomputed indicators | 50% | yes |
-| `analyst.news_macro` | Jin10, Alpaca News, and verified macro/event sources | 50% | yes |
+| `analyst.technical` | Alpaca OHLCV(VIX 使用 Yahoo)及预计算指标 | 50% | 是 |
+| `analyst.news_macro` | 金十、Alpaca News 以及经核实的宏观/事件源 | 50% | 是 |
 
-YouTube and Reddit/X remain explicit extension points, but their ingestion,
-FileStore readers, and Phase 1 roles are currently unconfigured; they are not scheduled or
-counted as evidence. A failed critical analyst aborts the run before probability
-and allocation phases; it is never converted into a neutral 0.5 vote.
+YouTube 与 Reddit/X 仍是明确的扩展点,但其数据摄取、FileStore 读取器和
+Phase 1 角色目前均未配置;它们不会被调度,也不计入证据。任一关键分析师失败
+都会在概率与配置阶段之前中止本次运行;绝不会被转换为中性的 0.5 投票。
 
-## Workflow
+## 工作流
 
 ```mermaid
 graph TD
@@ -97,97 +96,91 @@ graph TD
     SUM --> EXP
 ```
 
-Phase 2 begins with one shared Bull/Bear warm-up and an independent neutral
-Topic Generator. The generator uses the Phase 1 summary index through
-`read_indexes` and expands selected evidence with
-`read_index_details`; no warm-up history or Phase 1 artifact is embedded
-in its prompt.
-After at least one relevant Detail expansion, Topic Generator or Bull/Bear may
-delegate one explicit unresolved fact to `research_evidence_gap`. A neutral
-`researcher.web_evidence` worker receives only `web.run`; Topic Generator has
-two calls per run and Bull/Bear share two calls per topic across rounds.
-Rust deduplicates requests, validates and caps the returned source packet,
-assigns `web-<md5-3>` evidence IDs, and keeps that evidence in Phase 2 rather
-than rewriting Phase 1.
-Rust rejects external-fact or schema-breaking output and retains a deterministic
-conflict fallback. For each selected topic, Topic Controller forks from the
-completed Topic Generator turn, while Bull and Bear each fork from the shared
-`准备完毕` warm-up checkpoint. These forks continue saved conversations rather
-than being reconstructed from summaries; warm-up itself never runs Phase
-Summary. Topic Generator, Bull/Bear, and Topic Controller all return free text.
-After each Summary, Rust records the normalized topic or debate result in
-run-local memory. Rust then pre-calls `record_phase2_context` in every topic
-child turn, making that one tool result the only dynamic transfer channel for
-the current topic, prior debate, latest Controller route, fork parent, and both
-`round` and `round_num`. These fields are never inferred from free text or
-duplicated in the prompt. After the two seed turns, the Topic
-Controller decides whether another round is needed; each continued Bull/Bear
-turn reads the latest controller route from the same context tool before the
-controller reviews that round. Debug records retain each turn separately as
-`debate-{bull,bear}-round-N.json` and `topic-controller-round-N.json`.
-Topics run concurrently, while turns inside one topic remain controller-routed.
-When no material hinge exists, Phase 2 records a no-debate artifact and still
-advances to Phase 3.
+Phase 2 以一个共享的多空(Bull/Bear)预热会话和一个独立的中立 Topic
+Generator 开始。生成器通过 `read_indexes` 使用 Phase 1 摘要索引,并用
+`read_index_details` 展开选中的证据;其提示词中不嵌入任何预热历史或
+Phase 1 产物。
+在至少一次相关 Detail 展开之后,Topic Generator 或 Bull/Bear 可以把一个
+明确的未解决事实委托给 `research_evidence_gap`。中立的
+`researcher.web_evidence` 工作角色只接收 `web.run`;Topic Generator 每次
+运行有两次调用额度,Bull/Bear 每个议题的各轮次共享两次调用额度。
+Rust 负责请求去重、校验并限制返回的来源包(source packet),分配
+`web-<md5-3>` 证据 ID,并把该证据保留在 Phase 2 中,而不是改写 Phase 1。
+Rust 拒绝外部事实或破坏 schema 的输出,并保留确定性的冲突回退。对每个选中
+的议题,Topic Controller 从已完成的 Topic Generator 轮次 fork,而 Bull 与
+Bear 分别从共享的「准备完毕」预热检查点 fork。这些 fork 延续已保存的会话,
+而不是从摘要重建;预热本身从不运行 Phase Summary。Topic Generator、
+Bull/Bear 与 Topic Controller 均返回自由文本。
+每次 Summary 之后,Rust 将规范化后的议题或辩论结果记录到运行本地内存中。
+随后 Rust 在每个议题子轮次中预调用 `record_phase2_context`,使该工具结果
+成为当前议题、既往辩论、最新 Controller 路由、fork 父节点以及 `round` 和
+`round_num` 的唯一动态传递通道。这些字段从不从自由文本推断,也不在提示词
+中重复。两个种子轮次之后,由 Topic Controller 决定是否需要新一轮;每个后续
+Bull/Bear 轮次在 Controller 审查该轮之前,先从同一上下文工具读取最新的
+Controller 路由。Debug 记录将每个轮次分别保留为
+`debate-{bull,bear}-round-N.json` 和 `topic-controller-round-N.json`。
+各议题并发运行,而单个议题内部的轮次仍由 Controller 路由。
+当不存在实质性分歧点时,Phase 2 记录一个无辩论(no-debate)产物,并仍然
+推进到 Phase 3。
 
-Trader, the three parallel risk reviewers, and Portfolio Manager are
-mandatory in the default workflow policy. Phase 6 emits only per-asset semantic
-constraints; it cannot read accounts, calculate quantities, or submit orders.
-`analysis_universe` 是单个角色的完整对话范围：配置
-`[QQQ, SOXX, VIX]` 时，角色在一次对话中同时比较三者。
-`allocation.investable_assets` 是更小的决策范围：配置 `[QQQ, SOXX]`
-时，只有 QQQ 和 SOXX 可以获得 rating、action、风险上限、目标权重或
-Decision snapshot；VIX 始终只是 context-only regime signal。Phase 1
-每个 Analyst role 各运行一次，Phase 3、4、6 各运行一次，Phase 5
+在默认工作流策略中,Trader、三个并行风险审查员和 Portfolio Manager 均为
+必选。Phase 6 只输出按资产的语义约束;它不能读取账户、计算数量或提交订单。
+`analysis_universe` 是单个角色的完整对话范围:配置
+`[QQQ, SOXX, VIX]` 时,角色在一次对话中同时比较三者。
+`allocation.investable_assets` 是更小的决策范围:配置 `[QQQ, SOXX]`
+时,只有 QQQ 和 SOXX 可以获得 rating、action、风险上限、目标权重或
+Decision snapshot;VIX 始终只是 context-only regime signal。Phase 1
+每个 Analyst role 各运行一次,Phase 3、4、6 各运行一次,Phase 5
 每个风险 stance 各运行一次。
-Phase 7 computes and validates target weights in Rust, projects those weights
-through the Phase 6 direction/cap/delta constraints, and refreshes current
-weights from the project-only Alpaca Paper account when credentials are present
-in a non-mock, non-debug run. `--mock` and `--debug` remove all account and
-order tools from the model and make the tool runtime reject direct calls.
+Phase 7 在 Rust 中计算并校验目标权重,将这些权重投影到 Phase 6 的
+方向/上限/增量约束上。普通 Paper 运行先从 Alpaca Paper 读取账户和持仓,
+生成带确定性 `client_order_id` 的市价单计划,在持久化计划后调用
+`paper-api.alpaca.markets/v2/orders`;重试会先按 `client_order_id` 查询,
+避免重复下单。`--debug` 固定模拟 10,000 美元现金/净值/购买力和零仓位,
+输出同样的订单计划并记录 `simulated_filled`,不会访问 Alpaca。`--mock`
+保持禁用下单。账户与订单能力都由 Rust Runtime 拥有,不暴露给模型。
 
-## Canonical Contract v2 (Phase 4–6)
+## Canonical Contract v2(Phase 4–6)
 
-The file-backed ToolManaged path writes Canonical Contract v2. These changes are
-intentional breaking changes: a v2 reader does not silently default, normalize,
-or reinterpret a removed field. Older persisted files require an explicit
-migration before they can become v2 artifacts.
+基于文件的 ToolManaged 路径写入 Canonical Contract v2。这些变更是有意的
+破坏性变更:v2 读取器不会对已移除字段做静默默认、归一化或重新解释。旧的
+持久化文件需要显式迁移之后才能成为 v2 产物。
 
-| Area | Removed | v2 field / allowed values | Defaults and validation | Downstream consumer | Fallback |
+| 范围 | 已移除 | v2 字段 / 允许值 | 默认值与校验 | 下游消费者 | 回退 |
 |---|---|---|---|---|---|
-| Phase 4 `TradeIntent` | `position_size` free-form string | required numeric `position_size_pct_max` in `[0, 1]` | no implicit cap; Hold / `execution_decision=hold` requires `0` | Rust Phase 7 allocation and execution | reject invalid or legacy payload; degrade through the workflow policy, never parse percentage prose |
-| Phase 5 `RiskConstraints` | `tight`, `trailing`, `event_based`, `time_based`, and empty `stop_type` | required `stop_type`: `hard`, `soft`, or `none` | no implicit stop type | Phase 6 portfolio constraint builder and report renderer | reject at deserialization; no enum remapping |
-| Phase 6 binding controls | `binding_risk_controls: ["free-form text"]` | `binding_risk_controls: [{"control":"…","source_refs":["…"]}]` | control and each source reference are non-empty; provide an explicit empty array when there are none | Rust allocation projection, audit, and report detail | reject string controls or untraceable bindings |
-| Phase 1 evidence | `speculation`, `unclassified`, aliases, and string evidence | required `evidence_type`: `fact`, `opinion`, or `inference` | no type inference or alias normalization | evidence reducers and conflict analysis | reject non-v2 evidence; the role may use its normal degraded policy |
+| Phase 4 `TradeIntent` | `position_size` 自由文本字符串 | 必填数值 `position_size_pct_max`,取值 `[0, 1]` | 无隐式上限;Hold / `execution_decision=hold` 要求为 `0` | Rust Phase 7 配置与执行 | 拒绝无效或旧格式载荷;通过工作流策略降级,绝不解析百分比文字 |
+| Phase 5 `RiskConstraints` | `tight`、`trailing`、`event_based`、`time_based` 以及空 `stop_type` | 必填 `stop_type`:`hard`、`soft` 或 `none` | 无隐式止损类型 | Phase 6 组合约束构建器与报告渲染器 | 反序列化即拒绝;不做枚举重映射 |
+| Phase 6 绑定控制 | `binding_risk_controls: ["free-form text"]` | `binding_risk_controls: [{"control":"…","source_refs":["…"]}]` | control 与每个来源引用均非空;没有时提供显式空数组 | Rust 配置投影、审计与报告明细 | 拒绝字符串控制或不可追溯的绑定 |
+| Phase 1 证据 | `speculation`、`unclassified`、别名及字符串证据 | 必填 `evidence_type`:`fact`、`opinion` 或 `inference` | 不做类型推断或别名归一化 | 证据压缩器与冲突分析 | 拒绝非 v2 证据;角色可使用其正常降级策略 |
 
-Contract validation lives in `orchestrator-core` so builders, finalizers, and
-future consumers use the same pure checks. The contract does not retain a
-dual-write field or a reader fallback to the legacy representation.
+契约校验位于 `orchestrator-core`,使构建器、终结器和未来的消费者共用同一套
+纯函数检查。契约不保留双写字段,也没有读取器对旧表示的回退。
 
-## Workspace crates
+## Workspace crate
 
-| Crate | Responsibility |
+| Crate | 职责 |
 |---|---|
-| `orchestrator-core` | Config paths, role registry, ticker parsing, canonical schemas and validators |
-| `orchestrator-store` | Atomic FileStore persistence for manifests, Index/Detail knowledge, direct market inputs, and execution recovery |
-| `orchestrator-llm` | Responses/Chat Completions streaming, bounded agent loop, and read-only evidence tools |
-| `orchestrator-ingest` | Alpaca/Yahoo technical ingestion and Jin10 ingestion |
-| `orchestrator-workflow` | Phase orchestration, policy gates, reducers, probability and allocation guards |
-| `orchestrator-cli` | CLI binaries, reporting, operations, metrics and prompt linting |
+| `orchestrator-core` | 配置路径、角色注册表、ticker 解析、规范 schema 与校验器 |
+| `orchestrator-store` | 原子化 FileStore 持久化:manifest、Index/Detail 知识、直接市场输入与执行恢复 |
+| `orchestrator-llm` | Responses/Chat Completions 流式执行、有界 agent 循环与只读证据工具 |
+| `orchestrator-ingest` | Alpaca/Yahoo 技术数据摄取与金十摄取 |
+| `orchestrator-workflow` | 阶段编排、策略闸门、压缩器、概率与配置守卫 |
+| `orchestrator-cli` | CLI 可执行文件、报告、运维、指标与提示词 lint |
 
-There is no long-running service entry point. `orchestrator-exec` is the workflow entry point and persists only under the configured FileStore root (`outputs/store` by default).
+不存在常驻服务入口。`orchestrator-exec` 是工作流入口,只在配置的 FileStore
+根目录(默认 `outputs/store`)下持久化数据。
 
-## Model output and tools
+## 模型输出与工具
 
-Phase 0–6 business roles return one normal text response. They may use only
-their read-only evidence/input tools. Immediately after each response, the
-dedicated `prompts/phaseN/summary.md` compiler extracts the fixed fields; Rust
-validates identity, probability, position, and risk constraints and writes one
-canonical Index with its Detail. The Summary compiler has no filesystem or
-write tool. Phase 7 and Phase 8 are calculated and written directly by Rust.
-多资产 Phase 只写一个聚合 Index：固定字段使用 `per_ticker`、`decisions`、
-`plans` 或 `per_asset` map，完整的跨资产自由文字只保存一次 Detail。
+Phase 0–6 的业务角色返回一条普通文本响应。它们只能使用各自的只读证据/输入
+工具。每次响应之后,专用的 `prompts/phaseN/summary.md` 编译器立即提取固定
+字段;Rust 校验身份、概率、仓位与风险约束,并写入一份规范 Index 及其
+Detail。Summary 编译器没有文件系统或写入工具。Phase 7 与 Phase 8 由 Rust
+直接计算并写入。
+多资产 Phase 只写一个聚合 Index:固定字段使用 `per_ticker`、`decisions`、
+`plans` 或 `per_asset` map,完整的跨资产自由文字只保存一次 Detail。
 
-The completed run layout is:
+完成后的运行目录布局为:
 
 ```text
 outputs/store/runs/YYYY-MM-DD/<tickers>-<md5-3>/
@@ -198,80 +191,76 @@ outputs/store/runs/YYYY-MM-DD/<tickers>-<md5-3>/
     └── phase8/idx-<md5-3>.json
 ```
 
-Each `idx-*.json` archive contains both the Index and its Detail records.
-Sessions, temporary state, drafts, and debug files may exist while a run is in
-progress, but successful completion removes them.
+每个 `idx-*.json` 归档同时包含 Index 及其 Detail 记录。运行进行期间可能存在
+Session、临时状态、Draft 与调试文件,但成功完成后会将它们移除。
 
-### Model-visible tools
+### 模型可见工具
 
-All active FileStore reads derive their scope from the run, role, phase, and
-typed runtime binding; the model cannot supply a filesystem path or choose an
-arbitrary source run. Business-role completion is the final assistant text, not
-a write-tool call. Phase Summary has no model tools; Rust validates its JSON and
-writes the Index directly.
+所有活跃的 FileStore 读取都从运行、角色、阶段和类型化的运行时绑定推导其
+范围;模型不能提供文件系统路径,也不能选择任意来源运行。业务角色的完成
+标志是最终的 assistant 文本,而不是写入工具调用。Phase Summary 没有模型
+工具;Rust 校验其 JSON 并直接写入 Index。
 
-| Category | Tool ID | Purpose and boundary |
+| 类别 | 工具 ID | 用途与边界 |
 |---|---|---|
-| Runtime | `think` | Records bounded private reasoning for the current turn; it does not read data or write an Artifact. Enabled only when the role's LLM setting enables it. |
-| Runtime | `web.run` | Performs an allowlisted Exa web search and returns citable evidence. It is exposed directly only to the bounded `researcher.web_evidence` worker; Phase 1 event verification uses the same search adapter behind `verify_event`. Its OpenAI-compatible function name is `web_run`. |
-| Phase 2 context | `record_phase2_context` | Records and exposes the Rust-bound role, topic, debate history, latest Controller route, fork parent, and round identity for each Bull/Bear or Topic Controller turn. It accepts no model-selected fields and writes no file. |
-| Phase 2 evidence gap | `research_evidence_gap` | Delegates one explicit gap after a successful Phase 1 Detail expansion. Rust owns role/topic scope, shared call budget, deduplication, output validation, and evidence IDs. |
-| Historical reflection | `read_reflection_source` | Reads the Rust-selected historical reflection task source; a model cannot select a different run. |
-| Experience | `search_experiences` | Searches eligible historical Experience Index entries for the current role/task. |
-| Experience | `read_experience_cases` | Expands selected eligible historical Experience Detail entries. |
-| Experience | `record_memory_application` | Records whether and how retrieved experience was applied; it is audit data, not a mutation of the historical case. |
-| Knowledge Index + Detail | `read_indexes` | Lists role-visible Index/Phase Summary metadata with Rust-enforced source-phase and pagination rules. |
-| Knowledge Index + Detail | `read_index_details` | Expands only visible Index Details, subject to the role's detail budget and evidence policy. |
-| Current-run inputs | `read_technical_snapshot` | Reads batch technical data from the stable FileStore path and verifies the run-bound hash. |
-| Current-run inputs | `read_technical_detail` | Reads a bounded technical signal/range from the stable FileStore path and verifies the run-bound hash. |
-| Current-run inputs | `read_jin10_candidates` | Reads bounded Jin10 events from the stable FileStore path and verifies the run-bound hash. |
-| Current-run inputs | `verify_event` | Verifies an explicit news/macro event claim through the configured web-search runtime and reports missing fields. |
-| Current-run inputs | `alpaca_get_news` | Fetches Alpaca News for the scoped ticker/time request. It is exposed only when Alpaca market-data access is configured. |
+| 运行时 | `think` | 记录当前轮次的有界私有推理;不读取数据,也不写入 Artifact。仅当角色的 LLM 设置启用时才可用。 |
+| 运行时 | `web.run` | 执行白名单内的 Exa 网络搜索并返回可引用证据。仅直接暴露给有界的 `researcher.web_evidence` 工作角色;Phase 1 事件核实通过 `verify_event` 使用同一搜索适配器。其 OpenAI 兼容函数名为 `web_run`。 |
+| Phase 2 上下文 | `record_phase2_context` | 为每个 Bull/Bear 或 Topic Controller 轮次记录并暴露 Rust 绑定的角色、议题、辩论历史、最新 Controller 路由、fork 父节点与轮次身份。不接受模型选择的字段,也不写入文件。 |
+| Phase 2 证据缺口 | `research_evidence_gap` | 在一次成功的 Phase 1 Detail 展开后委托一个明确缺口。Rust 负责角色/议题范围、共享调用额度、去重、输出校验与证据 ID。 |
+| 历史反思 | `read_reflection_source` | 读取由 Rust 选定的历史反思任务来源;模型不能选择其他运行。 |
+| 经验 | `search_experiences` | 为当前角色/任务搜索符合条件的历史 Experience Index 条目。 |
+| 经验 | `read_experience_cases` | 展开选中的符合条件的历史 Experience Detail 条目。 |
+| 经验 | `record_memory_application` | 记录检索到的经验是否以及如何被应用;这是审计数据,不是对历史案例的修改。 |
+| 知识 Index + Detail | `read_indexes` | 列出角色可见的 Index/Phase Summary 元数据,由 Rust 强制来源阶段与分页规则。 |
+| 知识 Index + Detail | `read_index_details` | 只展开可见的 Index Detail,受角色的 Detail 额度与证据策略约束。 |
+| 当前运行输入 | `read_technical_snapshot` | 从稳定的 FileStore 路径读取批量技术数据并校验运行绑定的哈希。 |
+| 当前运行输入 | `read_technical_detail` | 从稳定的 FileStore 路径读取有界的技术信号/区间并校验运行绑定的哈希。 |
+| 当前运行输入 | `read_jin10_candidates` | 从稳定的 FileStore 路径读取有界的金十事件并校验运行绑定的哈希。 |
+| 当前运行输入 | `verify_event` | 通过配置的网络搜索运行时核实明确的新闻/宏观事件声明,并报告缺失字段。 |
+| 当前运行输入 | `alpaca_get_news` | 按限定的 ticker/时间请求获取 Alpaca News。仅在配置了 Alpaca 市场数据访问时暴露。 |
 
-### Active role-scoped access
+### 活跃角色的访问范围
 
-The table below describes the static business-tool scope. Only the two Phase 1
-analysts and the Phase 3 Research Manager receive `search_experiences`,
-`read_experience_cases`, and `record_memory_application`. `think` is an optional
-runtime helper and is disabled by the checked-in defaults. Runtime bindings may
-remove unavailable tools, but never add business authority outside the profile
-allowlist.
+下表描述静态业务工具范围。只有两个 Phase 1 分析师和 Phase 3 Research
+Manager 获得 `search_experiences`、`read_experience_cases` 与
+`record_memory_application`。`think` 是可选的运行时辅助工具,签入的默认
+配置将其禁用。运行时绑定可以移除不可用工具,但绝不会在配置允许列表之外
+增加业务权限。
 
-| Role / profile | Static tools in addition to experience retrieval |
+| 角色 / 配置档 | 经验检索之外的静态工具 |
 |---|---|
-| `reflector.historical` / Historical Reflection | `read_reflection_source`, `read_indexes`, `read_index_details`; Rust commits the validated Summary result |
-| `analyst.technical` / Analyst Report | `read_technical_snapshot`, `read_technical_detail`, and eligible Experience reads |
-| `analyst.news_macro` / Analyst Report | `read_jin10_candidates`, `verify_event`, optional `alpaca_get_news`, and eligible Experience reads |
-| Phase 2 Topic Generator and Bull/Bear | Phase 1-only `read_indexes` / `read_index_details`; Bull/Bear topic turns also receive Rust-bound `record_phase2_context`; bounded `research_evidence_gap` after Detail |
-| Phase 2 warm-up and Topic Controller | Phase 1-only `read_indexes` / `read_index_details`; Controller turns also receive Rust-bound `record_phase2_context`; no Web delegation |
-| `researcher.web_evidence` / Evidence Research | `web.run` only; no Index, Technical, Experience, trading, or write tools |
-| `manager.research` / Research Decision | Phase 1–2-only `read_indexes` / `read_index_details` and eligible Experience reads |
-| `trader` / Trade Intent | Phase 3-only `read_indexes` / `read_index_details` |
-| Phase 5 risk reviewers | Phase 3–4-only `read_indexes` / `read_index_details` |
-| `portfolio.manager` / Portfolio Decision | Phase 3–5-only `read_indexes` / `read_index_details` |
-| `compressor.phase_summary` / Phase Summary | No model-visible tools; Rust writes the parsed result |
+| `reflector.historical` / Historical Reflection | `read_reflection_source`、`read_indexes`、`read_index_details`;Rust 提交校验后的 Summary 结果 |
+| `analyst.technical` / Analyst Report | `read_technical_snapshot`、`read_technical_detail` 以及符合条件的经验读取 |
+| `analyst.news_macro` / Analyst Report | `read_jin10_candidates`、`verify_event`、可选的 `alpaca_get_news` 以及符合条件的经验读取 |
+| Phase 2 Topic Generator 与 Bull/Bear | 仅限 Phase 1 的 `read_indexes` / `read_index_details`;Bull/Bear 议题轮次还接收 Rust 绑定的 `record_phase2_context`;Detail 之后可用有界的 `research_evidence_gap` |
+| Phase 2 预热与 Topic Controller | 仅限 Phase 1 的 `read_indexes` / `read_index_details`;Controller 轮次还接收 Rust 绑定的 `record_phase2_context`;无 Web 委托 |
+| `researcher.web_evidence` / Evidence Research | 仅 `web.run`;无 Index、Technical、Experience、交易或写入工具 |
+| `manager.research` / Research Decision | 仅限 Phase 1–2 的 `read_indexes` / `read_index_details` 以及符合条件的经验读取 |
+| `trader` / Trade Intent | 仅限 Phase 3 的 `read_indexes` / `read_index_details` |
+| Phase 5 风险审查员 | 仅限 Phase 3–4 的 `read_indexes` / `read_index_details` |
+| `portfolio.manager` / Portfolio Decision | 仅限 Phase 3–5 的 `read_indexes` / `read_index_details` |
+| `compressor.phase_summary` / Phase Summary | 无模型可见工具;Rust 写入解析结果 |
 
-The Responses transport can use OpenAI's native `web_search` only when both
-`native_web_search` is enabled and the exact role profile explicitly authorizes
-`web.run`. Only the built-in Evidence Research profile currently does so. The
-provider-supplied native tool is intentionally separate from project function
-dispatch.
+只有当 `native_web_search` 启用且对应角色配置档明确授权 `web.run` 时,
+Responses 传输层才能使用 OpenAI 原生 `web_search`。目前只有内置的
+Evidence Research 配置档满足条件。提供方的原生工具有意与项目函数分发保持
+分离。
 
-The agent loop rejects identical repeated Index/Detail reads, enforces the
-profile's Detail expansion budget, and rejects terminal finalization until all
-required source phases and successful Detail expansions are present. The
-checked-in maximum Detail counts are: Historical Reflection 8, Phase 2 Warm-up
-2, other Phase 2 roles 4, Phase 3 6, Phase 4 2, Phase 5 4, and Phase 6 8.
+Agent 循环会拒绝完全重复的 Index/Detail 读取,强制配置档的 Detail 展开
+额度,并在所有必需来源阶段和成功的 Detail 展开齐备之前拒绝终局输出。
+签入的最大 Detail 数为:Historical Reflection 8、Phase 2 Warm-up 2、其他
+Phase 2 角色 4、Phase 3 6、Phase 4 2、Phase 5 4、Phase 6 8。
 
-## Requirements
+## 运行要求
 
-- Rust stable, edition 2021
-- Network access to Alpaca Market Data, Yahoo Finance, and Jin10
-- An OpenAI-compatible gateway key for non-mock workflow runs
-- `EXA_API_KEY` only when live Exa web search is enabled
-- `ALPACA_API_KEY` and `ALPACA_API_SECRET` for technical bars, Alpaca News, Phase 0 account/fill retrieval, and the optional Phase 7 account-weight refresh
+- Rust stable,edition 2021
+- 可访问 Alpaca Market Data、Yahoo Finance 与金十的网络
+- 非 mock 工作流运行需要 OpenAI 兼容网关密钥
+- 仅在启用实时 Exa 网络搜索时需要 `EXA_API_KEY`
+- `ALPACA_API_KEY` 和 `ALPACA_API_SECRET` 用于技术 K 线、Alpaca News、
+  Phase 0 账户/成交检索以及 Phase 7 Alpaca Paper 账户、持仓与下单
 
-Set secrets through the environment. The repository contains no key fallback:
+通过环境变量设置密钥。仓库中不包含任何密钥回退:
 
 ```bash
 export LLM_GATEWAY_API_KEY='...'
@@ -281,13 +270,14 @@ export ALPACA_API_KEY='...'
 export ALPACA_API_SECRET='...'
 ```
 
-`config/config.yaml` maps `orchestrator.alpaca.api_key` and
-`orchestrator.alpaca.api_secret` to the two Alpaca environment variables.
-Market data and news use `data.alpaca.markets`; brokerage actions intentionally
-use `paper-api.alpaca.markets`. No live-brokerage endpoint, registration, or
-alternate-account flow is implemented.
+`config/config.yaml` 将 `orchestrator.alpaca.api_key` 和
+`orchestrator.alpaca.api_secret` 映射到上述两个 Alpaca 环境变量。市场数据
+与新闻使用 `data.alpaca.markets`;券商操作有意使用
+`paper-api.alpaca.markets`。未实现任何实盘券商端点、注册或备用账户流程。
+`orchestrator.alpaca.order_submission_enabled` 控制普通 Paper 运行是否真正
+提交已持久化的订单计划;`debug_starting_cash` 只控制 debug 模拟账户。
 
-Report email credentials are only needed by `report-email`:
+报告邮件凭证只有 `report-email` 需要:
 
 ```bash
 export REPORT_SMTP_USERNAME='...'
@@ -296,13 +286,11 @@ export REPORT_SMTP_FROM='...'
 export REPORT_SMTP_TO='...'
 ```
 
-## Ingestion
+## 数据摄取
 
-Ingest real technical data for the configured research universe. Alpaca/IEX is
-the default; its intraday `3h` and `20min` bars retain pre-market and after-hours
-trades. Alpaca daily bars remain regular-session daily bars. VIX automatically
-uses the configured Yahoo fallback because Alpaca stock bars do not provide VIX
-OHLC:
+为配置的研究标的池摄取真实技术数据。Alpaca/IEX 为默认来源;其日内 `3h` 和
+`20min` K 线保留盘前与盘后成交。Alpaca 日线仍为常规交易时段日线。由于
+Alpaca 股票 K 线不提供 VIX OHLC,VIX 自动使用配置的 Yahoo 回退:
 
 ```bash
 rtk cargo run -p orchestrator-cli --bin orchestrator-ingest -- \
@@ -315,78 +303,69 @@ rtk cargo run -p orchestrator-cli --bin orchestrator-ingest -- \
   --timeout 20
 ```
 
-Ingest Jin10:
+摄取金十:
 
 ```bash
 rtk cargo run -p orchestrator-cli --bin orchestrator-ingest -- \
   jin10-flash --pages 2 --lookback-hours 24 --timeout 20
 ```
 
-Technical input is stored directly under the readable lowercase paths
-`outputs/store/data/technical/<ticker>/{day,3h,20min}.csv`, for example
-`outputs/store/data/technical/qqq/day.csv`. Jin10 is stored as an atomically
-replaced date CSV or JSONL file under `outputs/store/data/jin10/`. At run start,
-the manifest records each selected input's content hash. Tools read the stable
-data path and fail if its content changes during that run; no second CSV copy is
-created under the run directory.
+技术输入直接存储在可读的小写路径
+`outputs/store/data/technical/<ticker>/{day,3h,20min}.csv` 下,例如
+`outputs/store/data/technical/qqq/day.csv`。金十以原子替换的日期 CSV 或
+JSONL 文件存储在 `outputs/store/data/jin10/` 下。运行开始时,manifest 记录
+每个选中输入的内容哈希。工具从稳定数据路径读取,且当内容在运行期间发生
+变化时会失败;不会在运行目录下创建第二份 CSV 副本。
 
-Independent ticker/interval downloads run concurrently (default: 10). Set
-`technical.source: yahoo` or pass `--source yahoo` for a full Yahoo run.
-`technical.alpaca.feed` selects `iex`, `sip`, `boats`, or `otc`; the checked-in
-default is free-tier-compatible `iex`.
+相互独立的 ticker/周期下载并发执行(默认:10)。设置
+`technical.source: yahoo` 或传入 `--source yahoo` 可完全使用 Yahoo。
+`technical.alpaca.feed` 可选 `iex`、`sip`、`boats` 或 `otc`;签入的默认值
+是兼容免费档的 `iex`。
 
-The workflow refreshes both sources before Phase 1. Use `--tech-refresh-enabled=false` only when all required ticker/interval CSVs already exist. Jin10 lookback is controlled by `--jin10-refresh-lookback-hours`.
+工作流在 Phase 1 之前刷新两个数据源。仅当所有必需的 ticker/周期 CSV 已存在时才使用 `--tech-refresh-enabled=false`。金十回看窗口由 `--jin10-refresh-lookback-hours` 控制。
 
-## Run the workflow
+## 运行工作流
 
-Active prompts are owned by the phase that executes them:
+活跃提示词归其执行阶段所有:
 
-| Directory | Runtime owner |
+| 目录 | 运行时归属 |
 |---|---|
-| `prompts/phase0/` | Historical outcome reflection and its Summary compiler |
-| `prompts/phase1/` | Technical/news analysts and their Summary compiler |
-| `prompts/phase2/` | Topic roles, bounded Web evidence researcher, and Phase 2 Summary compiler |
-| `prompts/phase3/` | Research Manager and Phase 3 Summary compiler |
-| `prompts/phase4/` | Trader and Phase 4 Summary compiler |
-| `prompts/phase5/` | Risk reviewers and Phase 5 Summary compiler |
-| `prompts/phase6/` | Portfolio Manager and Phase 6 Summary compiler |
-| `prompts/common/` | Shared prompt components and contracts |
-| `prompts/system/` | Agent-loop and runtime messages |
+| `prompts/phase0/` | 历史结果反思及其 Summary 编译器 |
+| `prompts/phase1/` | 技术/新闻分析师及其 Summary 编译器 |
+| `prompts/phase2/` | 议题角色、有界 Web 证据研究员与 Phase 2 Summary 编译器 |
+| `prompts/phase3/` | Research Manager 与 Phase 3 Summary 编译器 |
+| `prompts/phase4/` | Trader 与 Phase 4 Summary 编译器 |
+| `prompts/phase5/` | 风险审查员与 Phase 5 Summary 编译器 |
+| `prompts/phase6/` | Portfolio Manager 与 Phase 6 Summary 编译器 |
+| `prompts/common/` | 共享提示词组件与契约 |
+| `prompts/system/` | Agent 循环与运行时消息 |
 
-Prompt components under `prompts/common/components/` are injected by role. The
-analytical trace applies only to Topic Generator and Research Manager; Trader
-and Portfolio Manager receive the execution trace; the Phase Summary compressor
-receives the summary trace. Bull/Bear packets, Topic Controller, and Phase 5
-risk reviewers retain their own compact audit records instead of emitting a
-second generic trace.
+`prompts/common/components/` 下的提示词组件按角色注入。分析轨迹
+(analytical trace)只用于 Topic Generator 和 Research Manager;Trader 和
+Portfolio Manager 接收执行轨迹(execution trace);Phase Summary 压缩器
+接收摘要轨迹(summary trace)。Bull/Bear 数据包、Topic Controller 和
+Phase 5 风险审查员保留各自的紧凑审计记录,而不是再输出一份通用轨迹。
 
-Historical experience is preloaded only for the two Phase 1 analysts and the
-Research Manager. No matching experience is a valid empty result; experience is
-advisory and cannot replace current evidence.
+历史经验只为两个 Phase 1 分析师和 Research Manager 预加载。没有匹配的
+经验是合法的空结果;经验仅供参考,不能替代当前证据。
 
-There is deliberately no runtime `phase25` bucket. Phase 2 topic generation is
-an LLM role with a Rust-owned evidence gate and runtime envelope; final debate
-reduction remains Rust-owned and belongs to Phase 2. Phase 7 allocation and
-Phase 8 decision snapshot/archive are also Rust-owned stages. Phase Summary runs
-after source phases 1 through 7. Phase 8 writes one Rust-owned final-decision
-Index covering only investable assets; Phase 0 and the Phase 2 warm-up
-checkpoint do not produce an Index.
+有意不设运行时 `phase25` 桶。Phase 2 议题生成是一个 LLM 角色,配以 Rust
+拥有的证据闸门与运行时封套;最终的辩论压缩仍由 Rust 拥有并属于 Phase 2。
+Phase 7 配置和 Phase 8 决策快照/归档也是 Rust 拥有的阶段。Phase Summary
+在来源阶段 1 至 7 之后运行。Phase 8 写入一个 Rust 拥有的最终决策 Index,
+只覆盖可投资资产;Phase 0 和 Phase 2 预热检查点不产生 Index。
 
-For Phases 2–6, Phase Summary is the only cross-phase semantic interface.
-Prompts receive only current-task packets, Rust-owned deterministic controls,
-and a small metadata-only retrieval bootstrap. Each role must list visible
-summaries before expanding details; role-specific policies enforce required
-source phases, detail budgets, pagination limits, and evidence references to IDs
-actually returned in that conversation. One policy failure gets a repair turn;
-a second failure produces a degraded artifact. Phase 0 uses the same tools, but
-Rust resolves an allowlisted reflection `task_id` to its historical source run,
-so the model cannot choose an arbitrary run.
+对 Phase 2–6 而言,Phase Summary 是唯一的跨阶段语义接口。提示词只接收
+当前任务数据包、Rust 拥有的确定性控制以及一个小型的仅元数据检索引导。
+每个角色必须先列出可见摘要再展开明细;各角色策略强制必需来源阶段、Detail
+额度、分页上限,以及证据引用必须指向本次对话中实际返回的 ID。策略失败
+一次给予一次修复轮次;第二次失败则产生降级产物。Phase 0 使用相同工具,但
+由 Rust 将允许列表中的反思 `task_id` 解析为其历史来源运行,因此模型无法
+选择任意运行。
 
-Retrieval limits are configured under `orchestrator.retrieval` in
-`config/config.yaml`. Role artifacts record both a `retrieval_audit` and a
-`context_manifest`; the latter reports each directly injected context's status,
-item count, character count, source, and whether the semantic payload is
-retrievable through tools.
+检索限制在 `config/config.yaml` 的 `orchestrator.retrieval` 下配置。角色
+产物同时记录 `retrieval_audit` 和 `context_manifest`;后者报告每个直接注入
+上下文的状态、条目数、字符数、来源,以及其语义载荷是否可通过工具检索。
 
 ```bash
 rtk cargo run -p orchestrator-cli --bin orchestrator-exec -- \
@@ -394,32 +373,30 @@ rtk cargo run -p orchestrator-cli --bin orchestrator-exec -- \
   --to-phase 8
 ```
 
-Useful options:
+常用选项:
 
-- `--store-root PATH`: root of the time-partitioned FileStore (default `outputs/store`).
-- `--debug`: print workflow and agent-loop debug logs to the console, and write
-  request/response records, timing, and token JSON under `outputs/debug/`.
-- `--max-debate-rounds N`: cap conditional debate rounds.
-- `--max-topics-per-side N`: cap material conflict topics.
+- `--store-root PATH`:时间分区 FileStore 的根目录(默认 `outputs/store`)。
+- `--debug`:将工作流与 agent 循环调试日志打印到控制台,并将请求/响应记录、
+  耗时与 token JSON 写入 `outputs/debug/`;Phase 7 同时在控制台输出订单
+  计划和模拟执行结果,固定为 10,000 美元、零仓位且不访问 Alpaca。
+- `--max-debate-rounds N`:限制条件辩论轮数。
+- `--max-topics-per-side N`:限制实质性冲突议题数。
 
-`--mock` exists only for local tests and development. It is not evidence that the production workflow or external services work. `--debug` resolves MemoryOS writes to `knowledge/debug/<run-id>/`; it never writes canonical Decision or Outcome data. Replay and migration fixtures use their own namespaces, and replay reads canonical Decisions only through a read-only reader while emitting only replay output.
+`--mock` 仅用于本地测试与开发,不能证明生产工作流或外部服务可用。`--debug` 将 MemoryOS 写入解析到 `knowledge/debug/<run-id>/`;它绝不写入规范的 Decision 或 Outcome 数据。回放与迁移夹具使用各自的命名空间,回放只通过只读读取器读取规范 Decision,且只输出回放结果。
 
-### Deterministic Outcome materialization
+### 确定性 Outcome 物化
 
-Phase 8 can write a typed `DecisionSnapshotV2` under
-`knowledge/evaluation/decisions/` when
-`orchestrator.evaluation.enabled` is set. Canonical Decision/Outcome writes
-require both Paper/Live purpose and
-`orchestrator.evaluation.canonical_memory_writes_enabled: true`; Debug uses an
-isolated namespace and Mock writes neither canonical Decision nor Outcome.
+当设置了 `orchestrator.evaluation.enabled` 时,Phase 8 可以在
+`knowledge/evaluation/decisions/` 下写入类型化的 `DecisionSnapshotV2`。
+规范 Decision/Outcome 写入需要同时满足 Paper/Live 用途和
+`orchestrator.evaluation.canonical_memory_writes_enabled: true`;Debug 使用
+隔离命名空间,Mock 既不写规范 Decision 也不写 Outcome。
 
-Matured outcomes are materialized only from hash-pinned technical CSV exports
-under an explicit `Close` or `AdjustedClose` basis and an explicit per-ticker
-benchmark mapping. A missing mapping, insufficient sessions, unavailable
-market data, or unresolved corporate action produces an auditable gap and does
-not block the current investment workflow. The canonical outcome is global
-under `knowledge/evaluation/`; evaluation runs only own receipts and batch
-reports.
+已到期的结果只能从哈希固定的技术 CSV 导出物化,并需明确的 `Close` 或
+`AdjustedClose` 价格基准以及明确的按 ticker 基准映射。缺失映射、交易日
+不足、市场数据不可用或未解决的公司行动会产生可审计的缺口,但不会阻塞当前
+投资工作流。规范结果全局存放在 `knowledge/evaluation/` 下;评估运行只拥有
+回执与批量报告。
 
 ```bash
 rtk cargo run -p orchestrator-cli --bin orchestrator-memory -- \
@@ -428,41 +405,36 @@ rtk cargo run -p orchestrator-cli --bin orchestrator-memory -- \
   --purpose paper
 ```
 
-The command reads the same strict project configuration as the workflow. It
-cannot accept an arbitrary outcome ID, source run, benchmark, or output path.
+该命令读取与工作流相同的严格项目配置。它不能接受任意的 outcome ID、来源
+运行、基准或输出路径。
 
-`--from-phase` accepts `0-8` and defaults to `0`; `--to-phase 0` runs only
-historical reflection/retrieval. Mock runs skip Alpaca and all learning writes.
+`--from-phase` 接受 `0-8`,默认为 `0`;`--to-phase 0` 只运行历史反思/检索。
+Mock 运行跳过 Alpaca 与所有学习写入。
 
-### FileStore layout
+### FileStore 布局
 
-Each run is isolated under `outputs/store/runs/<workflow_date>/<tickers>-<md5-3-bytes>/`;
-for example, `runs/2026-07-29/qqq-soxx-vix-a1b2c3/`. Phase Summary and
-Experience Index IDs use the same six-hex-character suffix as `idx-a1b2c3`
-and `exp-a1b2c3`.
-While a run is active, `manifest.json` and `state.json` record recovery state;
-independently finalized business units are stored below `artifacts/`;
-append-only session turns are below `sessions/`; incomplete writes are below
-`drafts/`; and phase summaries live below `index/`. These runtime projections
-are removed after a healthy non-debug run completes.
-Canonical files contain a schema version and content hash. Temporary files live
-beside their destination, are flushed and fsynced, and are atomically renamed.
-Store Doctor checks malformed content, hashes, path escape, orphan details,
-incomplete Drafts and manifest/file drift; its catalog and experience-level
-outputs are rebuildable caches.
+每次运行隔离在 `outputs/store/runs/<workflow_date>/<tickers>-<md5-3-bytes>/` 下;
+例如 `runs/2026-07-29/qqq-soxx-vix-a1b2c3/`。Phase Summary 与 Experience
+Index ID 使用与 `idx-a1b2c3`、`exp-a1b2c3` 相同的六位十六进制后缀。
+运行进行期间,`manifest.json` 和 `state.json` 记录恢复状态;独立终结的业务
+单元存放在 `artifacts/` 下;只追加的会话轮次存放在 `sessions/` 下;未完成
+写入存放在 `drafts/` 下;阶段摘要位于 `index/` 下。这些运行时投影会在健康
+的非 debug 运行完成后被移除。
+规范文件包含 schema 版本与内容哈希。临时文件位于目标位置旁,经过 flush 与
+fsync 后原子重命名。Store Doctor 检查格式错误内容、哈希、路径逃逸、孤立
+Detail、未完成 Draft 与 manifest/文件漂移;其目录和经验级输出是可重建的
+缓存。
 
-After Phase 8 finishes successfully, the run packs each finalized Index
-directory into one content-hashed archive, then deletes every other run-local
-file. The completed run retains only `manifest.json` and `index/*.json`; the
-Phase 8 Index contains the structured final decision and allocation. Canonical
-Decisions, MemoryUsage reports, Outcomes, and Experience remain under
-`knowledge/`. Partial, incomplete, or failed runs retain inputs, Artifacts,
-Sessions, Drafts, and state for recovery. Once Phase 8 completes, normal,
-degraded, and `--debug` runs are all compacted to the same final layout; degraded
-status and errors remain visible in `manifest.json`. The FileStore assumes one
-workflow writer and does not create filesystem lock files.
+Phase 8 成功结束后,运行会将每个终结的 Index 目录打包为一个内容哈希归档,
+然后删除其余所有运行本地文件。完成的运行只保留 `manifest.json` 和
+`index/*.json`;Phase 8 Index 包含结构化的最终决策与配置。规范 Decision、
+MemoryUsage 报告、Outcome 和 Experience 保留在 `knowledge/` 下。部分完成、
+未完成或失败的运行保留输入、Artifact、Session、Draft 与状态以供恢复。
+Phase 8 完成后,正常、降级和 `--debug` 运行都会被压实为相同的最终布局;
+降级状态与错误仍可在 `manifest.json` 中看到。FileStore 假定只有一个工作流
+写入者,不创建文件系统锁文件。
 
-Preview or apply the same completed-run compaction explicitly:
+显式预览或应用同样的完成运行压实:
 
 ```bash
 rtk cargo run -p orchestrator-cli --bin orchestrator-store-doctor -- \
@@ -474,62 +446,57 @@ rtk cargo run -p orchestrator-cli --bin orchestrator-store-doctor -- \
   compact-run --workflow-date YYYY-MM-DD --run-id RUN_ID --apply
 ```
 
-The first command is a dry run. `--apply` is accepted once Phase 8 and the run
-manifest are completed; debug and degraded runs use the same compact layout.
+第一条命令是 dry run。Phase 8 与运行 manifest 完成后即可接受 `--apply`;
+debug 与降级运行使用相同的压实布局。
 
-Evaluation data is separate: immutable canonical outcomes, revision commits,
-heads, market-input manifests, and gaps live under
-`knowledge/evaluation/`; `runs/<date>/<evaluation-run>/receipts/materialization/`
-and `reports/materialization/` are non-authoritative execution evidence.
+评估数据是分离的:不可变的规范结果、修订提交、head、市场输入 manifest 与
+缺口位于 `knowledge/evaluation/` 下;
+`runs/<date>/<evaluation-run>/receipts/materialization/` 和
+`reports/materialization/` 是非权威的执行证据。
 
-## Learning loop
+## 学习闭环
 
-The memory loop is deliberately outside the decision-critical path:
+记忆闭环刻意置于决策关键路径之外:
 
-1. Phase 8 records typed, sectioned `DecisionSnapshotV2` data. It never forces a
-   trade or manufactures missing thesis, execution, or allocation details.
-2. The deterministic materializer turns only matured, benchmark-configured
-   Decisions into global canonical Outcomes. Ordinary missing data becomes a
-   Materialization Gap; integrity/provenance failures fail closed for that
-   Decision without stopping other matured Decisions or the current workflow.
-3. Phase 0 schedules only current Outcome revisions. A Task Key binds the
-   source run, ticker, Outcome content hash, MemoryPolicy version, reflector
-   profile, and builder version. A newer Outcome supersedes unstarted or
-   claimed older tasks.
-4. The reflector can terminal as `learned`, `no_reusable_memory`, `deferred`,
-   or `contested`. `duplicate` is Rust-only idempotency state. Only `learned`
-   can append the legacy historical case and an `AddSupport` Experience Event;
-   later lifecycle policy may add verified contradictions to an existing
-   Pattern, never create a positive Pattern from `contested` alone.
-5. Experience Events are append-only authority. Experience Views are rebuilt
-   deterministically using independent date/regime clusters, support and
-   contradiction counts, utility EMA, and harmful-use rate. Retrieval treats
-   historical wording as untrusted data and logs actual search/expand access in
-   the current run's MemoryUsage ledger.
+1. Phase 8 记录类型化、分节的 `DecisionSnapshotV2` 数据。它绝不强制交易,
+   也不编造缺失的论点、执行或配置细节。
+2. 确定性物化器只将已到期、配置了基准的 Decision 转化为全局规范 Outcome。
+   普通的数据缺失成为 Materialization Gap;完整性/溯源失败对该 Decision
+   失败关闭(fail closed),但不阻止其他到期 Decision 或当前工作流。
+3. Phase 0 只调度当前 Outcome 的修订。Task Key 绑定来源运行、ticker、
+   Outcome 内容哈希、MemoryPolicy 版本、reflector 配置档与 builder 版本。
+   更新的 Outcome 会取代未开始或已认领的旧任务。
+4. Reflector 可以以 `learned`、`no_reusable_memory`、`deferred` 或
+   `contested` 终结。`duplicate` 是仅 Rust 的幂等状态。只有 `learned` 可以
+   追加旧版历史案例和一个 `AddSupport` Experience Event;后续生命周期策略
+   可以向既有 Pattern 添加经核实的反例,但绝不能仅凭 `contested` 创建正面
+   Pattern。
+5. Experience Event 是只追加的权威数据。Experience View 使用独立的日期/
+   状态聚类、支持与反驳计数、效用 EMA 及有害使用率进行确定性重建。检索将
+   历史措辞视为不可信数据,并在当前运行的 MemoryUsage 台账中记录实际的
+   搜索/展开访问。
 
-The current prediction never scores itself, mock runs never write formal
-Decision/Outcome data, and repeated processing is idempotent. Reflection
-failures become bounded retry events and remain non-blocking for the investment
-decision. Scheduler quotas are configured under `orchestrator.reflection`;
-the shipped 6/2/2 new/retry/backlog split is a policy default rather than a
-hard-coded invariant.
+当前预测绝不为自己评分,mock 运行绝不写入正式 Decision/Outcome 数据,重复
+处理是幂等的。反思失败成为有界重试事件,且对投资决策保持非阻塞。调度器
+配额在 `orchestrator.reflection` 下配置;交付的 6/2/2 新任务/重试/积压比例
+是策略默认值,而非硬编码不变量。
 
-## Reliability contracts
+## 可靠性契约
 
-- Both Phase 1 roles must cover every requested ticker with non-empty, attributed, timestamped, non-duplicate evidence.
-- An Artifact exists only after a terminal domain finalizer passes semantic validation.
-- Probabilities must be finite, inside `[0,1]`, and long/short must be coherent.
-- Manager output cannot replace missing evidence with a default 0.5 result.
-- Responses streams require `response.completed`; Chat Completions streams require a terminal `finish_reason`.
-- Tool calls require a non-empty `call_id`, name, and valid accumulated JSON arguments.
-- Technical/Jin10 tools read stable FileStore data paths and verify the hashes pinned by the run. The news analyst may call Alpaca News; evidence selection is retained in its current-run Artifact and tool audit.
-- Tool payload history is bounded to 16,000 characters by default.
-- Allocation excludes VIX, rejects missing per-ticker research, enforces non-negative finite weights, per-asset caps, cash constraints, and a total weight of 1.0.
-- Post-run learning is outcome-backed, idempotent, and outside the decision-critical research path; only qualified, non-mock Experience Index/Detail entries are reusable later.
+- 两个 Phase 1 角色必须用非空、有归属、有时间戳且不重复的证据覆盖每个请求的 ticker。
+- Artifact 只有在终局领域终结器通过语义校验后才存在。
+- 概率必须有限、位于 `[0,1]` 内,且多空必须自洽。
+- Manager 输出不能用默认 0.5 结果替代缺失证据。
+- Responses 流要求 `response.completed`;Chat Completions 流要求终局 `finish_reason`。
+- 工具调用要求非空 `call_id`、名称以及有效的累积 JSON 参数。
+- Technical/金十工具从稳定的 FileStore 数据路径读取并校验运行固定的哈希。新闻分析师可以调用 Alpaca News;证据选择保留在其当前运行 Artifact 与工具审计中。
+- 工具载荷历史默认限制为 16,000 字符。
+- 配置排除 VIX,拒绝缺失的按 ticker 研究,强制非负有限权重、按资产上限、现金约束以及总权重为 1.0。
+- 运行后学习是结果背书、幂等且在决策关键研究路径之外的;只有合格的、非 mock 的 Experience Index/Detail 条目可供后续复用。
 
-## Validation
+## 验证
 
-Run before handing off changes:
+交付变更前运行:
 
 ```bash
 rtk cargo fmt --all -- --check
@@ -539,10 +506,10 @@ rtk cargo test --workspace --all-features
 rtk cargo build --release --workspace
 ```
 
-Prompt lint:
+提示词 lint:
 
 ```bash
 rtk cargo run -p orchestrator-cli --bin orchestrator-prompt-lint
 ```
 
-Generated FileStore data, `outputs/`, debug logs, release artifacts, and credentials must not be committed.
+生成的 FileStore 数据、`outputs/`、调试日志、发布产物与凭证不得提交。

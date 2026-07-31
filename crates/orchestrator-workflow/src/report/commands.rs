@@ -3,7 +3,7 @@ use chrono::Local;
 use clap::{Args, ValueEnum};
 use html_escape::encode_text;
 use orchestrator_core::{
-    config_float, config_str, config_strings, display_ticker, project_path, run_slug,
+    config_float, config_str, config_strings, display_ticker, load_config, project_path, run_slug,
 };
 use orchestrator_store::{
     read_indexes, FileStore, FileStoreOptions, IndexKind, IndexQuery, RunLocation,
@@ -28,7 +28,8 @@ pub struct ReportArgs {
 }
 
 pub fn run(args: ReportArgs) -> Result<Value> {
-    let config = super::config::load_default_config();
+    let config = load_config(Some(&project_path("config/config.yaml")))
+        .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
     let tickers = config_strings(&config, "orchestrator.analysis_universe", &[]);
     let slug = if tickers.is_empty() {
         "TQQQ".to_string()
@@ -169,10 +170,7 @@ fn send_report(config: &Value, slug: &str, payload: &Value, html: &str) -> Resul
     if config_str(config, "report.email.enabled", "true") == "false" {
         return Ok(json!({"status": "skipped", "detail": "report.email.enabled=false"}));
     }
-    let state_path = super::config::project_path_from_config(format!(
-        "outputs/{}/report_email_state.json",
-        slug
-    ));
+    let state_path = project_path(format!("outputs/{}/report_email_state.json", slug));
     let state = fs::read_to_string(&state_path)
         .ok()
         .and_then(|text| serde_json::from_str::<Value>(&text).ok())

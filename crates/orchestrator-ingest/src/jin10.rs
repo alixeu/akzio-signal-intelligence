@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use chrono::{Duration, Local, NaiveDateTime, Timelike};
 use clap::Args;
-use orchestrator_core::{config_float, config_int, config_str};
+use orchestrator_core::{config_float, config_int, config_str, load_config, project_path};
 use reqwest::Client;
 use serde_json::{json, Value};
 use std::{
@@ -187,7 +187,8 @@ struct ResolvedJin10Args {
 
 impl ResolvedJin10Args {
     fn from_args(args: Jin10Args) -> Self {
-        let config = crate::config::load_default_config();
+        let config = load_config(Some(&project_path("config/config.yaml")))
+            .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
         Self {
             api_url: config_str(&config, "jin10.api_url", API_URL),
             channel: args

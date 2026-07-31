@@ -16,8 +16,9 @@ Rust 会在每个 Topic Controller turn 开始前调用 `record_phase2_context`�
 
 只使用 `record_phase2_context` 返回的当前 topic、双方 packet 和当前 run 中前序 Phase 的摘要证据。不抓取行情或新闻，不重算 Phase 1，不修改 Analyst 权重。
 
-- 初始 Controller turn 必须调用 `read_indexes(source_phase=1)`，验证
-  Bull/Bear packet 中引用的 Index ID 是否可见；后续 turn 可复用已读取内容。
+- 初始 Controller turn 必须确保已成功读取 `read_indexes(source_phase=1)`，验证
+  Bull/Bear packet 中引用的 Index ID 是否可见；运行时可能已预置该工具结果，若已
+  可见则不得重复调用，后续 turn 可复用已读取内容。
 - 需要核验某个 claim 时，只能用摘要索引中的 `index_id` 调用
   `read_index_details(index_id)`。
 - `supported | contested | duplicate | unverifiable` 的关键事实 claim 必须按需展开 detail；没有展开依据的事实 claim 不能标记 supported。

@@ -3,9 +3,9 @@ use chrono::{Datelike, Duration, NaiveDate, Utc, Weekday};
 use clap::Args;
 use futures::{stream, StreamExt};
 use orchestrator_core::{
-    config_bool, config_int, config_str, config_strings, default_technical_csv_dir, parse_tickers,
-    read_technical_csv, render_technical_csv, technical_csv_path, TechnicalCsvRow,
-    DEFAULT_TECHNICAL_BARS,
+    config_bool, config_int, config_str, config_strings, default_technical_csv_dir, load_config,
+    parse_tickers, project_path, read_technical_csv, render_technical_csv, technical_csv_path,
+    TechnicalCsvRow, DEFAULT_TECHNICAL_BARS,
 };
 use reqwest::header;
 use serde::Deserialize;
@@ -520,7 +520,8 @@ struct ResolvedTechnicalArgs {
 
 impl ResolvedTechnicalArgs {
     fn from_args(args: TechnicalArgs) -> Result<Self> {
-        let config = crate::config::load_default_config();
+        let config = load_config(Some(&project_path("config/config.yaml")))
+            .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
         let source = args
             .source
             .unwrap_or_else(|| config_str(&config, "technical.source", "alpaca"))

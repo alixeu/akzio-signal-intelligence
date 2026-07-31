@@ -1232,7 +1232,6 @@ dependencies = [
  "serde_yaml",
  "tempfile",
  "tokio",
- "tracing",
  "tracing-subscriber",
 ]
 
@@ -1314,9 +1313,9 @@ dependencies = [
  "orchestrator-llm",
  "orchestrator-store",
  "pulldown-cmark",
+ "reqwest",
  "serde",
  "serde_json",
- "sha2",
  "tempfile",
  "tokio",
  "toml",

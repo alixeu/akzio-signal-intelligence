@@ -1,56 +1,54 @@
 @/Users/alixeu/.codex/RTK.md
 
-# Agent Instructions
+# Agent 指令
 
-This repository is a Rust workspace for AI-assisted market-signal research and TQQQ-oriented report workflows.
+本仓库是一个 Rust workspace,用于 AI 辅助的市场信号研究与面向 TQQQ 的报告工作流。
 
-## Project Snapshot
+## 项目速览
 
-- Language: Rust 2021.
-- Workspace crates:
-  - `orchestrator-core`: shared config, paths, ticker parsing, prompt helpers, and artifact validation.
-  - `orchestrator-store`: atomic FileStore persistence, manifests, sessions, drafts, indexes, and execution recovery.
-  - `orchestrator-llm`: OpenAI Responses/Chat Completions execution and typed ToolManaged dispatch.
-  - `orchestrator-ingest`: technical-market and Jin10 input ingestion.
-  - `orchestrator-workflow`: phase orchestration, summaries, allocation, reports, and FileStore runtime adapters.
-  - `orchestrator-cli`: CLI binaries, operations, and prompt linting.
-- Prompt templates live under `prompts/` and are owned by their runtime phase:
-  - `phase_summary`: completed-phase compression.
-  - `phase1`: technical and news/macro research.
-  - `phase2`: Topic Generator, Bull/Bear debate, bounded Web evidence research, Topic Controller, and steer messages.
-  - `phase3`: Research Manager probability decision.
-  - `phase4`: Trader conversion.
-  - `phase5`: aggressive, neutral, and conservative risk reviewers.
-  - `phase6`: Portfolio Manager final decision.
-  - `common`: reusable contracts/components; `system`: agent-loop messages.
-- Prompt components are role-scoped. Topic Generator and Research Manager use
-  the analytical trace; Trader and Portfolio Manager use the execution trace;
-  Phase Summary uses the summary trace. Bull/Bear packets, Topic Controller,
-  and Phase 5 risk reviewers keep their compact packet/constraint audit data.
-- Phase 2 builds one shared Bull/Bear warm-up checkpoint and runs Topic
-  Generator independently. Each topic's Bull/Bear conversations fork from the
-  warm-up checkpoint, while Topic Controller forks from Topic Generator.
-  After a relevant Phase 1 Detail expansion, Topic Generator and Bull/Bear may
-  delegate an explicit evidence gap to a Web-only subagent. Rust owns the
-  per-role/topic budget, deduplication, validation, and evidence IDs. Debate
-  reduction remains Rust-owned.
-- Phase 0 historical scoring/task selection, Phase 7 allocation, and Phase 8
-  decision snapshot/archive are Rust-owned stages. Phase 0 uses a dedicated
-  historical-reflector prompt for causal analysis.
-- A non-mock workflow records outcome-backed historical cases as Experience
-  Index/Detail entries for later retrieval.
-- Phase Summary is the only cross-phase semantic interface for model roles in
-  Phases 2–6. Roles list summaries before expanding details; Rust enforces
-  role-specific source-phase, pagination, detail-budget, and evidence-ID policy.
-- Phase 5 reviewers run independently in parallel. Portfolio Manager combines
-  their separately compressed Phase 5 summaries.
-- Generated run outputs live under `outputs/` and should not be committed.
-- Runtime defaults live in `config/config.yaml`.
-- Live agent runs use run-sealed FileStore input snapshots by default.
+- 语言:Rust 2021。
+- Workspace crate:
+  - `orchestrator-core`:共享配置、路径、ticker 解析、提示词辅助函数与产物校验。
+  - `orchestrator-store`:原子化 FileStore 持久化、manifest、会话、草稿、索引与执行恢复。
+  - `orchestrator-llm`:OpenAI Responses/Chat Completions 执行与类型化 ToolManaged 分发。
+  - `orchestrator-ingest`:技术市场数据与金十(Jin10)输入摄取。
+  - `orchestrator-workflow`:阶段编排、摘要、配置、报告与 FileStore 运行时适配器。
+  - `orchestrator-cli`:CLI 可执行文件、运维操作与提示词 lint。
+- 提示词模板位于 `prompts/` 下,归其运行阶段所有:
+  - `phase_summary`:已完成阶段的压缩。
+  - `phase1`:技术与新闻/宏观研究。
+  - `phase2`:Topic Generator、多空(Bull/Bear)辩论、有界 Web 证据研究、Topic Controller 与引导消息。
+  - `phase3`:Research Manager 概率决策。
+  - `phase4`:Trader 转换。
+  - `phase5`:激进、中性与保守风险审查员。
+  - `phase6`:Portfolio Manager 最终决策。
+  - `common`:可复用契约/组件;`system`:agent 循环消息。
+- 提示词组件按角色划分范围。Topic Generator 与 Research Manager 使用分析
+  轨迹;Trader 与 Portfolio Manager 使用执行轨迹;Phase Summary 使用摘要
+  轨迹。Bull/Bear 数据包、Topic Controller 与 Phase 5 风险审查员保留各自
+  紧凑的数据包/约束审计数据。
+- Phase 2 构建一个共享的 Bull/Bear 预热检查点,并独立运行 Topic
+  Generator。每个议题的 Bull/Bear 对话从预热检查点 fork,而 Topic
+  Controller 从 Topic Generator fork。
+  在一次相关的 Phase 1 Detail 展开之后,Topic Generator 与 Bull/Bear 可以
+  将一个明确的证据缺口委托给仅限 Web 的子代理。Rust 负责按角色/议题的
+  额度、去重、校验与证据 ID。辩论压缩仍由 Rust 拥有。
+- Phase 0 历史评分/任务选择、Phase 7 配置以及 Phase 8 决策快照/归档是
+  Rust 拥有的阶段。Phase 0 使用专用的历史反思器提示词进行因果分析。
+- 非 mock 工作流将结果背书的历史案例记录为 Experience Index/Detail 条目,
+  供后续检索。
+- 对 Phase 2–6 的模型角色而言,Phase Summary 是唯一的跨阶段语义接口。
+  角色先列出摘要再展开明细;Rust 强制各角色的来源阶段、分页、Detail 额度
+  与证据 ID 策略。
+- Phase 5 审查员独立并行运行。Portfolio Manager 合并它们各自单独压缩的
+  Phase 5 摘要。
+- 生成的运行输出位于 `outputs/` 下,不应提交。
+- 运行时默认值位于 `config/config.yaml`。
+- 实时 agent 运行默认使用运行封存的 FileStore 输入快照。
 
-## Commands
+## 命令
 
-Use these checks before handing off code changes:
+交付代码变更前使用以下检查:
 
 ```bash
 rtk cargo fmt --all
@@ -58,7 +56,7 @@ rtk cargo test
 rtk cargo clippy --workspace --all-targets
 ```
 
-Common local runs:
+常用本地运行:
 
 ```bash
 rtk cargo run -p orchestrator-cli --bin orchestrator-exec -- --mock
@@ -67,57 +65,54 @@ rtk cargo run -p orchestrator-cli --bin report-email -- --help
 
 ## CodeGraph
 
-This project has a CodeGraph MCP server (`codegraph_*` tools) configured. CodeGraph is a tree-sitter-parsed knowledge graph of every symbol, edge, and file.
+本项目配置了 CodeGraph MCP 服务器(`codegraph_*` 工具)。CodeGraph 是由 tree-sitter 解析的知识图谱,覆盖每个符号、边和文件。
 
-Use CodeGraph for structural questions:
+结构性问题使用 CodeGraph:
 
-| Question | Tool |
+| 问题 | 工具 |
 | --- | --- |
-| Where is a symbol defined? | `codegraph_search` |
-| What calls a symbol? | `codegraph_callers` |
-| What does a symbol call? | `codegraph_callees` |
-| How does one symbol reach another? | `codegraph_trace` |
-| What would a change affect? | `codegraph_impact` |
-| Show signature/source/docstring | `codegraph_node` |
-| Get task-area context | `codegraph_context` |
-| Explore related source | `codegraph_explore` |
-| Browse indexed files | `codegraph_files` |
+| 符号在哪里定义? | `codegraph_search` |
+| 什么调用了某符号? | `codegraph_callers` |
+| 某符号调用了什么? | `codegraph_callees` |
+| 一个符号如何到达另一个符号? | `codegraph_trace` |
+| 修改会影响什么? | `codegraph_impact` |
+| 查看签名/源码/文档字符串 | `codegraph_node` |
+| 获取任务区域上下文 | `codegraph_context` |
+| 探索相关源码 | `codegraph_explore` |
+| 浏览已索引文件 | `codegraph_files` |
 
-Prefer `codegraph_context` first for architecture, feature, or bug-context questions. Use native `rg` only for literal text queries, generated files, or after a specific file is already identified.
+架构、功能或 bug 上下文问题优先使用 `codegraph_context`。原生 `rg` 只用于字面文本查询、生成文件,或已确定具体文件之后。
 
-## Coding Rules
+## 编码规则
 
-- Keep changes scoped and aligned with the existing crate boundaries.
-- Prefer existing helpers in `orchestrator-core` and `orchestrator-store` before adding new utilities.
-- Validate inputs at CLI and system boundaries.
-- Do not hardcode secrets; use environment variables.
-- Preserve mock paths for local development without `LLM_GATEWAY_API_KEY`.
-- Do not let live `orchestrator-exec` consume mutable market inputs directly; seal atomic Technical/Jin10 input snapshots in the run FileStore first.
-- Keep prompt paths configured under `orchestrator.prompts` and fail early if a configured prompt file is missing.
-- Keep `mediator.topic` evidence-only: it may use the Phase 1 index and prior
-  phase summaries, while Rust owns the topic artifact runtime envelope and
-  deterministic fallback.
-- Do not create a cross-phase prompt bucket such as `phase25`; move a role prompt
-  with its executing phase and update config defaults, `include_str!` paths,
-  prompt lint role inference, golden render tests, README, and this file together.
-- Keep the three Phase 5 reviewers on distinct prompt paths. Shared constraints
-  belong in `prompts/phase5/risk_analyst.md`, while stance-specific behavior
-  remains in `prompts/phase5/{aggressive,neutral,conservative}.md`.
-- Do not describe YouTube or Reddit/X as active inputs until ingestion, FileStore
-  context readers, role registration, prompts, and scheduling are all configured.
-- Keep reflection outcome-backed and historical: never learn from mock runs,
-  unscored predictions, or the current prediction. Experience Index writes must
-  remain idempotent, and reflection failures must not invalidate a completed
-  investment decision.
-- MemoryOS evaluation is FileStore-only: canonical Decision/Outcome writes are
-  allowed only for explicitly enabled Paper/Live contexts. Debug uses its own
-  namespace, Mock writes no formal Decision/Outcome, and replay must use a
-  separate root/namespace. Do not select benchmarks or price basis in code:
-  missing strict configuration is an auditable materialization gap.
-- Avoid committing local config, FileStore data, build output, or report artifacts.
+- 保持变更范围收敛,并与现有 crate 边界对齐。
+- 优先使用 `orchestrator-core` 和 `orchestrator-store` 中的现有辅助函数,再考虑新增工具函数。
+- 在 CLI 与系统边界校验输入。
+- 不要硬编码密钥;使用环境变量。
+- 保留 mock 路径,以便在没有 `LLM_GATEWAY_API_KEY` 的情况下进行本地开发。
+- 不要让实时 `orchestrator-exec` 直接消费可变的市场输入;先在运行 FileStore 中封存原子化的 Technical/金十输入快照。
+- 提示词路径保持配置在 `orchestrator.prompts` 下,配置的提示词文件缺失时应尽早失败。
+- 保持 `mediator.topic` 仅使用证据:它可以使用 Phase 1 索引和既往阶段
+  摘要,而议题产物的运行时封套与确定性回退由 Rust 拥有。
+- 不要创建诸如 `phase25` 的跨阶段提示词桶;角色提示词应随其执行阶段迁移,
+  并同步更新配置默认值、`include_str!` 路径、提示词 lint 角色推断、golden
+  渲染测试、README 与本文件。
+- 保持三个 Phase 5 审查员使用各自独立的提示词路径。共享约束放在
+  `prompts/phase5/risk_analyst.md`,立场特定行为保留在
+  `prompts/phase5/{aggressive,neutral,conservative}.md`。
+- 在摄取、FileStore 上下文读取器、角色注册、提示词与调度全部配置完成之前,
+  不要将 YouTube 或 Reddit/X 描述为活跃输入。
+- 保持反思为结果背书且面向历史:绝不从 mock 运行、未评分预测或当前预测
+  中学习。Experience Index 写入必须保持幂等,且反思失败不得使已完成的
+  投资决策失效。
+- MemoryOS 评估仅限 FileStore:规范 Decision/Outcome 写入只允许在显式启用
+  的 Paper/Live 上下文中进行。Debug 使用自己的命名空间,Mock 不写正式
+  Decision/Outcome,回放必须使用独立的根目录/命名空间。不要在代码中选择
+  基准或价格基础:缺失严格配置是可审计的物化缺口。
+- 避免提交本地配置、FileStore 数据、构建输出或报告产物。
 
-## Documentation Rules
+## 文档规则
 
-- Update `README.md` when commands, setup steps, environment variables, or crate responsibilities change.
-- Put durable project knowledge in existing docs or module-level comments only when it helps future maintainers.
-- Do not create new top-level docs unless the task explicitly needs them.
+- 当命令、安装步骤、环境变量或 crate 职责变化时更新 `README.md`。
+- 只有在对未来维护者有帮助时,才将持久性项目知识写入现有文档或模块级注释。
+- 除非任务明确需要,否则不要创建新的顶级文档。

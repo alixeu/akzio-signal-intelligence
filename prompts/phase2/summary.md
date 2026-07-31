@@ -8,8 +8,7 @@ SOURCE_PAYLOAD：
 
 - warmup：`{"status":"prepared","upside":[],"downside":[],"constraints":[],"evidence_refs":[]}`
 - topic_generation：`{"common_ground":{},"topics":[],"summary":"","web_evidence":[]}`。topic 只保留
-  topic、tickers、meta_factor、decision_hinge、ttl、bull_seed_request、
-  bear_seed_request、why_debate、evidence_refs；不要生成 topic_id。
+  topic、tickers、meta_factor、decision_hinge、ttl、why_debate、evidence_refs；不要生成 topic_id。
 - bull_seed / bear_seed：`{"claims":[],"web_evidence":[]}`。每条保留 claim、evidence_refs、
   confidence、needs_mediator_check；不要生成 claim_id。
 - interaction：`{"replies":[],"web_evidence":[]}`。每条保留 reply_to_claim_id、stance、reason、

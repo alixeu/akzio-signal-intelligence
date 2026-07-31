@@ -239,12 +239,6 @@ pub struct AgentLoopOutput {
     pub session_id: String,
 }
 
-pub async fn run_agent_loop(settings: &AgentSettings, prompt: &str) -> Result<Value> {
-    Ok(run_agent_loop_with_metrics(settings, prompt)
-        .await?
-        .artifact)
-}
-
 pub async fn run_agent_loop_with_metrics(
     settings: &AgentSettings,
     prompt: &str,
@@ -328,15 +322,6 @@ fn agent_loop_config_from_settings(settings: &AgentSettings) -> AgentLoopConfig 
     }
 }
 
-pub async fn run_agent_fork_loop(
-    settings: &AgentSettings,
-    input: ForkLoopInput<'_>,
-) -> Result<Value> {
-    Ok(run_agent_fork_loop_with_metrics(settings, input)
-        .await?
-        .artifact)
-}
-
 pub async fn run_agent_fork_loop_with_metrics(
     settings: &AgentSettings,
     input: ForkLoopInput<'_>,
@@ -369,7 +354,7 @@ pub async fn run_agent_fork_loop_with_metrics(
     let prior_history = select_fork_history(target_history, fork_history);
     let has_existing_history = !prior_history.is_empty();
     let include_prompt_on_fork = input.include_prompt_on_fork;
-    let (user_input, fork_input, pending_context_instruction) = prepare_fork_turn_inputs(
+    let user_input = prepare_fork_turn_input(
         input.prompt,
         has_existing_history,
         is_new_fork,
@@ -397,10 +382,6 @@ pub async fn run_agent_fork_loop_with_metrics(
     if is_new_fork {
         turn.retrieval_scope_start = turn.emitted_items.len();
     }
-    if let Some(fork_input) = fork_input {
-        turn.emitted_items
-            .push(agent_loop::TurnItem::user(fork_input));
-    }
     turn.phase = settings.phase;
     turn.tools_disabled = false;
     turn.model_context = format!(
@@ -411,10 +392,6 @@ pub async fn run_agent_fork_loop_with_metrics(
         serde_json::to_string(&configured_tool_names(settings))?,
         fork_from_turn_id.is_some()
     );
-    if let Some(instruction) = pending_context_instruction {
-        turn.emitted_items
-            .push(agent_loop::TurnItem::user(instruction));
-    }
     let tool_config = settings.tools.clone().unwrap_or_else(default_tool_config);
     let mut tools = ProjectToolRuntime::with_available_tools(
         tool_config,
@@ -523,28 +500,25 @@ fn session_history_values(events: Vec<orchestrator_store::SessionEvent>) -> Vec<
         .collect()
 }
 
-fn prepare_fork_turn_inputs(
+fn prepare_fork_turn_input(
     prompt: &str,
     has_existing_history: bool,
     is_new_fork: bool,
     include_prompt_on_fork: bool,
-) -> (String, Option<String>, Option<String>) {
+) -> String {
     let context_instruction =
         "请读取本轮 `record_phase2_context` 工具结果，并只基于其中的当前主题、已有辩论和控制路由完成本轮自由文字回复。";
     if is_new_fork && include_prompt_on_fork {
-        let task = format!(
+        return format!(
             "这是一个新的子回合。上一条 assistant 输出只是恢复的 checkpoint 上下文，不是本轮答案。\
              请执行下面的新角色与任务，生成新的回复。\n\n{prompt}\n\n{context_instruction}"
         );
-        return (String::new(), Some(task), None);
     }
-    let user_input = if has_existing_history && !(is_new_fork && include_prompt_on_fork) {
-        String::new()
+    if has_existing_history {
+        format!("{prompt}\n\n{context_instruction}")
     } else {
         prompt.to_string()
-    };
-    let pending_instruction = has_existing_history.then(|| context_instruction.to_owned());
-    (user_input, None, pending_instruction)
+    }
 }
 
 pub fn append_debug_llm_record(settings: &AgentSettings, record: Value) -> Result<()> {
@@ -582,6 +556,7 @@ pub fn append_debug_llm_record(settings: &AgentSettings, record: Value) -> Resul
             .entry("round")
             .or_insert_with(|| json!(settings.debug_round));
     }
+    append_debug_output_history(&root, &output_path, &prompt_path.to_string_lossy(), &record)?;
     append_debug_output_record(&root, &output_path, &prompt_path.to_string_lossy(), record)
 }
 
@@ -639,17 +614,6 @@ pub fn finalize_debug_llm_record(
         fs::write(&path, serde_json::to_string_pretty(&record)?)
             .with_context(|| format!("failed to update debug LLM record {}", path.display()))
     })
-}
-
-pub fn reset_debug_output_dir(project_root: &std::path::Path) -> Result<()> {
-    let debug_dir = project_root.join("outputs/debug");
-    if debug_dir.exists() {
-        fs::remove_dir_all(&debug_dir)
-            .with_context(|| format!("failed to clear debug dir {}", debug_dir.display()))?;
-    }
-    fs::create_dir_all(&debug_dir)
-        .with_context(|| format!("failed to create debug dir {}", debug_dir.display()))?;
-    Ok(())
 }
 
 /// Append one timing record to the formatted `outputs/debug/time.json` array.
@@ -824,6 +788,77 @@ pub fn append_debug_output_record(
         object.insert("prompt_path".to_string(), json!(source_label));
         fs::write(&path, serde_json::to_string_pretty(&output)?)
             .with_context(|| format!("failed to write debug record {}", path.display()))
+    })
+}
+
+/// Keep the full sequence of requests beside the compatibility file that
+/// exposes the latest request. This is essential for inspecting multi-turn
+/// Phase 2 debates without making existing debug consumers parse a new shape.
+fn append_debug_output_history(
+    project_root: &Path,
+    relative_output_path: &Path,
+    source_label: &str,
+    record: &Value,
+) -> Result<()> {
+    let relative_output_path = validate_debug_output_relative_path(relative_output_path)?;
+    let source_label = source_label.trim();
+    if source_label.is_empty() {
+        bail!("debug source label must not be empty");
+    }
+    let file_name = relative_output_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("debug output path must have a UTF-8 file name")?;
+    let history_name = file_name
+        .strip_suffix(".json")
+        .map(|stem| format!("{stem}.iterations.json"))
+        .context("debug output history requires a .json output path")?;
+    let history_path = project_root.join(relative_output_path.with_file_name(history_name));
+    with_debug_output_lock(|| {
+        if let Some(parent) = history_path.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!("failed to create debug history dir {}", parent.display())
+            })?;
+        }
+        let mut history = match fs::read_to_string(&history_path) {
+            Ok(contents) => serde_json::from_str(&contents).with_context(|| {
+                format!("failed to parse debug history {}", history_path.display())
+            })?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                json!({"prompt_path": source_label, "records": []})
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to read debug history {}", history_path.display())
+                })
+            }
+        };
+        let object = history.as_object_mut().ok_or_else(|| {
+            anyhow::anyhow!(
+                "debug history {} must be a JSON object",
+                history_path.display()
+            )
+        })?;
+        if object
+            .get("prompt_path")
+            .is_some_and(|value| value.as_str() != Some(source_label))
+        {
+            bail!(
+                "debug history {} has prompt_path {:?}, expected {:?}",
+                history_path.display(),
+                object.get("prompt_path"),
+                source_label
+            );
+        }
+        object.insert("prompt_path".to_owned(), json!(source_label));
+        object
+            .entry("records")
+            .or_insert_with(|| json!([]))
+            .as_array_mut()
+            .context("debug history records must be an array")?
+            .push(record.clone());
+        fs::write(&history_path, serde_json::to_string_pretty(&history)?)
+            .with_context(|| format!("failed to write debug history {}", history_path.display()))
     })
 }
 
@@ -2145,71 +2180,6 @@ fn free_opencode_client() -> Result<OpenAIClient<OpenAIConfig>> {
     Ok(OpenAIClient::with_config(config))
 }
 
-pub fn additional_params(settings: &AgentSettings) -> Option<Value> {
-    let mut params = openai_responses_reasoning_params(
-        &settings.llm,
-        settings
-            .llm
-            .effective_reasoning_effort(settings.reasoning_effort_override.as_deref()),
-    );
-    if uses_native_web_search(settings) {
-        params = Some(add_openai_responses_native_web_search(params));
-    }
-    params
-}
-
-pub fn openai_responses_reasoning_params(
-    settings: &RoleLlmSettings,
-    effort: Option<&str>,
-) -> Option<Value> {
-    let mut params = serde_json::Map::new();
-    let mut reasoning = serde_json::Map::new();
-    if let Some(effort) = effort
-        .map(str::trim)
-        .filter(|value| !value.is_empty() && !is_zero_reasoning_effort(value))
-    {
-        reasoning.insert("effort".to_string(), json!(effort.to_ascii_lowercase()));
-    }
-    if let Some(summary) = settings
-        .reasoning_summary
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        reasoning.insert("summary".to_string(), json!(summary.to_ascii_lowercase()));
-    }
-    if !reasoning.is_empty() {
-        params.insert("reasoning".to_string(), Value::Object(reasoning));
-    }
-    if settings.preserve_reasoning_state {
-        params.insert("store".to_string(), json!(false));
-        params.insert(
-            "include".to_string(),
-            json!(["reasoning.encrypted_content"]),
-        );
-    }
-    (!params.is_empty()).then_some(Value::Object(params))
-}
-
-fn add_openai_responses_native_web_search(params: Option<Value>) -> Value {
-    let mut object = match params {
-        Some(Value::Object(object)) => object,
-        Some(other) => {
-            let mut object = serde_json::Map::new();
-            object.insert("value".to_string(), other);
-            object
-        }
-        None => serde_json::Map::new(),
-    };
-    let mut tools = match object.remove("tools") {
-        Some(Value::Array(tools)) => tools,
-        _ => Vec::new(),
-    };
-    tools.push(json!({"type": "web_search"}));
-    object.insert("tools".to_string(), Value::Array(tools));
-    Value::Object(object)
-}
-
 fn configured_tool_names(settings: &AgentSettings) -> Vec<&str> {
     let mut names = Vec::new();
     if settings.llm.think_tool {
@@ -2652,6 +2622,24 @@ mod tests {
         assert!(output.get("elapsed_ms").is_some());
         assert!(output.get("token").is_some());
         assert!(output.get("records").is_none());
+        let history: Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                temp.path()
+                    .join("outputs/debug/phase1/technical.iterations.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(history["prompt_path"], "prompts/phase1/technical.md");
+        assert_eq!(history["records"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            history["records"][0]["req"]["messages"][0]["content"],
+            "hello"
+        );
+        assert_eq!(
+            history["records"][1]["req"]["messages"][0]["content"],
+            "again"
+        );
         assert!(!temp
             .path()
             .join("outputs/debug/phase1/technical.jsonl")
@@ -2933,83 +2921,6 @@ mod tests {
     }
 
     #[test]
-    fn responses_gets_reasoning_additional_params() {
-        let mut settings = base_settings(LlmRoute::Responses);
-        settings.llm.base_url = Some("https://llm.example.com/v1".to_string());
-        settings.llm.api_key = Some("test-key".to_string());
-        assert_eq!(
-            super::additional_params(&settings),
-            Some(json!({"reasoning": {"effort": "low"}}))
-        );
-
-        settings.reasoning_effort_override = Some("HIGH".to_string());
-        assert_eq!(
-            super::additional_params(&settings),
-            Some(json!({"reasoning": {"effort": "high"}}))
-        );
-
-        settings.reasoning_effort_override = Some("0".to_string());
-        assert_eq!(super::additional_params(&settings), None);
-
-        settings.reasoning_effort_override = Some("HIGH".to_string());
-        settings.llm.reasoning_summary = Some("auto".to_string());
-        settings.llm.preserve_reasoning_state = true;
-        assert_eq!(
-            super::additional_params(&settings),
-            Some(json!({
-                "reasoning": {"effort": "high", "summary": "auto"},
-                "store": false,
-                "include": ["reasoning.encrypted_content"]
-            }))
-        );
-    }
-
-    #[test]
-    fn native_web_search_adds_provider_tool_to_additional_params() {
-        let mut settings = base_settings(LlmRoute::Responses);
-        settings.role = "analyst.news_macro".to_string();
-        settings.llm.base_url = Some("https://llm.example.com/v1".to_string());
-        settings.llm.api_key = Some("test-key".to_string());
-        settings.llm.native_web_search = true;
-        settings.llm.tools = vec![tools::web_run::NAME.to_string()];
-
-        assert_eq!(
-            super::additional_params(&settings),
-            Some(json!({
-                "reasoning": {"effort": "low"},
-                "tools": [{"type": "web_search"}]
-            }))
-        );
-
-        settings.llm.reasoning_effort = None;
-        settings.reasoning_effort_override = None;
-        assert_eq!(
-            super::additional_params(&settings),
-            Some(json!({"tools": [{"type": "web_search"}]}))
-        );
-    }
-
-    #[test]
-    fn openai_compatible_responses_uses_responses_reasoning_and_native_web_search() {
-        let mut settings = base_settings(LlmRoute::Responses);
-        settings.role = "analyst.news_macro".to_string();
-        settings.llm.base_url = Some("https://llm.example.com/v1".to_string());
-        settings.llm.api_key = Some("test-key".to_string());
-        settings.llm.native_web_search = true;
-        settings.llm.tools = vec![tools::web_run::NAME.to_string()];
-        settings.web_search.mode = WebSearchMode::Live;
-
-        assert_eq!(
-            super::additional_params(&settings),
-            Some(json!({
-                "reasoning": {"effort": "low"},
-                "tools": [{"type": "web_search"}]
-            }))
-        );
-        assert!(!super::configured_tool_names(&settings).contains(&tools::web_run::NAME));
-    }
-
-    #[test]
     fn think_tool_registration_is_role_controlled() {
         let mut settings = base_settings(LlmRoute::Responses);
         settings.role = "analyst.technical".to_string();
@@ -3043,10 +2954,6 @@ mod tests {
             assert_eq!(
                 super::configured_tool_names(&settings),
                 vec!["think", tools::index_tools::READ_INDEXES_NAME]
-            );
-            assert_eq!(
-                super::additional_params(&settings),
-                Some(json!({"reasoning": {"effort": "low"}}))
             );
             assert!(super::web_run_runtime_for_settings(&settings).is_none());
         }
@@ -3140,35 +3047,24 @@ mod tests {
     }
 
     #[test]
-    fn new_fork_appends_one_topic_instruction_after_checkpoint_history() {
-        let (user_input, fork_input, pending_context_instruction) =
-            super::prepare_fork_turn_inputs("BULL ROLE PROMPT", true, true, true);
+    fn new_fork_pins_the_current_role_prompt() {
+        let input = super::prepare_fork_turn_input("BULL ROLE PROMPT", true, true, true);
 
-        assert!(user_input.is_empty());
         assert_eq!(
-            fork_input,
-            Some(
-                "这是一个新的子回合。上一条 assistant 输出只是恢复的 checkpoint 上下文，不是本轮答案。\
-                 请执行下面的新角色与任务，生成新的回复。\n\nBULL ROLE PROMPT\n\n\
-                 请读取本轮 `record_phase2_context` 工具结果，并只基于其中的当前主题、已有辩论和控制路由完成本轮自由文字回复。"
-                    .to_owned()
-            )
+            input,
+            "这是一个新的子回合。上一条 assistant 输出只是恢复的 checkpoint 上下文，不是本轮答案。\
+             请执行下面的新角色与任务，生成新的回复。\n\nBULL ROLE PROMPT\n\n\
+             请读取本轮 `record_phase2_context` 工具结果，并只基于其中的当前主题、已有辩论和控制路由完成本轮自由文字回复。"
         );
-        assert!(pending_context_instruction.is_none());
     }
 
     #[test]
-    fn resumed_topic_turn_uses_only_the_context_tool_for_dynamic_payload() {
-        let (user_input, fork_input, pending_instruction) =
-            super::prepare_fork_turn_inputs("BULL ROLE PROMPT", true, false, false);
+    fn resumed_topic_turn_reasserts_the_current_role_prompt() {
+        let input = super::prepare_fork_turn_input("BULL ROLE PROMPT", true, false, false);
 
-        assert!(user_input.is_empty());
-        assert!(fork_input.is_none());
         assert_eq!(
-            pending_instruction.as_deref(),
-            Some(
-                "请读取本轮 `record_phase2_context` 工具结果，并只基于其中的当前主题、已有辩论和控制路由完成本轮自由文字回复。"
-            )
+            input,
+            "BULL ROLE PROMPT\n\n请读取本轮 `record_phase2_context` 工具结果，并只基于其中的当前主题、已有辩论和控制路由完成本轮自由文字回复。"
         );
     }
 }

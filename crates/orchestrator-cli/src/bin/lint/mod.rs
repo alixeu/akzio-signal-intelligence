@@ -1,7 +1,7 @@
 //! Prompt lint data structures and orchestration.
 
 use anyhow::Result;
-use orchestrator_core::ComponentRegistry;
+use orchestrator_core::{load_config, project_path, ComponentRegistry};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -86,7 +86,7 @@ pub const VALID_PLACEHOLDERS: &[&str] = &[
 ];
 
 pub fn run_all_checks(prompts_dir: &Path) -> Result<LintReport> {
-    let config = orchestrator_cli::cli_config::load_default_config()
+    let config = load_config(Some(&project_path("config/config.yaml")))
         .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
     let mut issues = Vec::new();
     let mut files_checked = 0;

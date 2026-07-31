@@ -30,9 +30,13 @@ orchestrator:
 
   alpaca:
     # Paper Trading credentials, loaded from .env or the process environment.
-    # Never commit real credentials. Production brokerage endpoints are not configured.
+    # Never commit real credentials. Orders use paper-api.alpaca.markets only.
     api_key: ${ALPACA_API_KEY}
     api_secret: ${ALPACA_API_SECRET}
+    order_submission_enabled: true
+    # Debug never contacts Alpaca. It starts with this cash/equity/buying power
+    # and an empty position list, then records deterministic simulated fills.
+    debug_starting_cash: 10000
 
   reflection:
     task_limit: 10
@@ -45,7 +49,6 @@ orchestrator:
     # A failed Historical Reflector remains non-blocking and retries only
     # within this explicit bound; policy changes are recorded in Task Keys.
     max_attempts: 3
-    prediction_horizon_trading_days: 3
   # Goal 1 ships disabled until the owner approves strict per-ticker benchmark
   # mappings and provider/price-basis provenance. Missing mappings are a Gap,
   # never a silent fallback.
@@ -65,10 +68,6 @@ orchestrator:
     benchmarks: {}
   workflow:
     agent_timeout_sec: 600
-    reducer_timeout_sec: 600
-    phase1:
-      parallelism: 2
-      critical_roles: [analyst.technical, analyst.news_macro]
 
   prompts:
     reflection:
@@ -155,7 +154,6 @@ jin10:
   timeout: 15.0
 
 report:
-  mode: build-and-send
   email:
     enabled: true
     smtp_url: smtps://smtp.mail.me.com:465

@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use orchestrator_core::{
-    config_bool, config_get, config_int, config_str, config_strings, project_path,
+    config_bool, config_float, config_get, config_int, config_str, config_strings, project_path,
     AdjustmentPolicy, CorporateActionCapability, PriceBasis, RoleProfileRegistry, RunPurpose,
 };
 use orchestrator_llm::{
@@ -32,6 +32,8 @@ pub(crate) struct RuntimeConfig {
     pub allocation: AllocationConfig,
     pub alpaca_api_key: Option<String>,
     pub alpaca_api_secret: Option<String>,
+    pub alpaca_order_submission_enabled: bool,
+    pub alpaca_debug_starting_cash: f64,
     pub reflection: ReflectionConfig,
     pub evaluation: EvaluationConfig,
     pub retrieval: RetrievalConfig,
@@ -490,6 +492,13 @@ impl RuntimeConfig {
             .trim()
             .to_string();
         let alpaca_api_secret = (!alpaca_api_secret.is_empty()).then_some(alpaca_api_secret);
+        let alpaca_order_submission_enabled =
+            config_bool(config, "orchestrator.alpaca.order_submission_enabled", true);
+        let alpaca_debug_starting_cash =
+            config_float(config, "orchestrator.alpaca.debug_starting_cash", 10_000.0);
+        if !alpaca_debug_starting_cash.is_finite() || alpaca_debug_starting_cash <= 0.0 {
+            bail!("orchestrator.alpaca.debug_starting_cash must be finite and greater than zero")
+        }
         Ok(Self {
             llm_roles,
             web_search,
@@ -499,6 +508,8 @@ impl RuntimeConfig {
             allocation: AllocationConfig::from_value(config),
             alpaca_api_key,
             alpaca_api_secret,
+            alpaca_order_submission_enabled,
+            alpaca_debug_starting_cash,
             reflection: ReflectionConfig::from_value(config)?,
             evaluation: EvaluationConfig::from_value(config)?,
             retrieval: RetrievalConfig::from_value(config),

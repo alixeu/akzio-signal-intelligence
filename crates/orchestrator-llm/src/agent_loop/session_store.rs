@@ -108,16 +108,6 @@ impl FileStoreSessionRuntime {
         &self.manifest
     }
 
-    /// Persist one loop item using a fixed event mapping.
-    pub fn append_turn_item(
-        &self,
-        turn: &Turn,
-        item: &TurnItem,
-        created_at: impl Into<String>,
-    ) -> Result<SessionEvent> {
-        self.append_turn_item_at(turn, item, None, created_at)
-    }
-
     /// Append an item with its Rust-owned ordinal. The ordinal makes recovery
     /// idempotent without treating a human/model field as an event identity.
     pub fn append_turn_item_at(
@@ -189,25 +179,6 @@ impl FileStoreSessionRuntime {
             SessionEventType::Terminal,
             &turn.turn_id,
             serde_json::to_value(terminal).context("serialize terminal tool result")?,
-            created_at,
-        )
-    }
-
-    pub fn append_error(
-        &self,
-        turn: &Turn,
-        message: impl Into<String>,
-        created_at: impl Into<String>,
-    ) -> Result<SessionEvent> {
-        self.validate_turn(turn)?;
-        let message = message.into();
-        if message.trim().is_empty() {
-            bail!("session error message must not be empty")
-        }
-        self.append(
-            SessionEventType::Error,
-            &turn.turn_id,
-            json!({"message": message}),
             created_at,
         )
     }
@@ -318,7 +289,12 @@ mod tests {
         assert_eq!(runtime.manifest().status, SessionStatus::Active);
         let turn = turn();
         runtime
-            .append_turn_item(&turn, &TurnItem::user("prompt"), "2026-07-27T00:00:01Z")
+            .append_turn_item_at(
+                &turn,
+                &TurnItem::user("prompt"),
+                None,
+                "2026-07-27T00:00:01Z",
+            )
             .unwrap();
         runtime
             .append_checkpoint(
@@ -349,9 +325,10 @@ mod tests {
         let parent = runtime(&temp, None);
         let parent_turn = turn();
         parent
-            .append_turn_item(
+            .append_turn_item_at(
                 &parent_turn,
                 &TurnItem::user("parent prompt"),
+                None,
                 "2026-07-27T00:00:01Z",
             )
             .unwrap();
