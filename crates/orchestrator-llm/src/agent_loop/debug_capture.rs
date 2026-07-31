@@ -134,6 +134,11 @@ fn turn_item_to_debug_message(item: &TurnItem) -> Option<Value> {
             "role": if item.item_type == TurnItemType::CompactSummary { "system" } else { "user" },
             "content": item.content_text,
         })),
+        TurnItemType::InjectedContext => Some(json!({
+            "role": "user",
+            "content": item.content_text,
+            "source": "stree",
+        })),
         TurnItemType::AssistantMessage => Some(json!({
             "role": "assistant",
             "content": item.content_text,

@@ -26,7 +26,7 @@ use tracing::{debug, warn};
 
 use super::config::{prompt_version, RetrievalConfig, RuntimeConfig};
 use super::index_runtime::{file_store_index_tool_runtime, FileStoreIndexRuntimePlan};
-use super::lifecycle::tickers_from_state;
+use super::lifecycle::{run_location_from_state, tickers_from_state};
 use super::render::{direct_context_manifest, render_prompt_with_plugins};
 use crate::memory::{search_experiences, ExperienceSearchQuery};
 
@@ -125,10 +125,8 @@ fn prompt_version_for_role(state: &Value, role: &str, kind: &str) -> Option<Stri
         "analyst.technical" => "orchestrator.prompts.analyst.technical",
         "analyst.news_macro" => "orchestrator.prompts.analyst.news_macro",
         "mediator.topic" => "orchestrator.prompts.phase2.topic_generator",
-        "researcher.bull.initial" => "orchestrator.prompts.phase2.bull_initial",
-        "researcher.bull.interaction" => "orchestrator.prompts.phase2.bull_interaction",
-        "researcher.bear.initial" => "orchestrator.prompts.phase2.bear_initial",
-        "researcher.bear.interaction" => "orchestrator.prompts.phase2.bear_interaction",
+        "researcher.bull" => "orchestrator.prompts.phase2.bull_interaction",
+        "researcher.bear" => "orchestrator.prompts.phase2.bear_interaction",
         "mediator.topic_controller" => "orchestrator.prompts.mediator.topic_controller",
         "manager.research" => "orchestrator.prompts.manager.research",
         "trader" => "orchestrator.prompts.trader",
@@ -147,12 +145,7 @@ fn tool_managed_profile_for_role_kind(role: &str, kind: &str) -> Option<ToolMana
         "analyst.technical" | "analyst.news_macro" => Some(ToolManagedProfile::AnalystReport),
         "mediator.topic" if kind == "warmup" => Some(ToolManagedProfile::ResearcherWarmup),
         "mediator.topic" => Some(ToolManagedProfile::TopicGeneration),
-        "researcher.bull.initial" | "researcher.bear.initial" => {
-            Some(ToolManagedProfile::DebateSeed)
-        }
-        "researcher.bull.interaction" | "researcher.bear.interaction" => {
-            Some(ToolManagedProfile::DebateResponse)
-        }
+        "researcher.bull" | "researcher.bear" => Some(ToolManagedProfile::DebateResponse),
         "mediator.topic_controller" => Some(ToolManagedProfile::TopicControl),
         "researcher.web_evidence" => Some(ToolManagedProfile::EvidenceResearch),
         "manager.research" => Some(ToolManagedProfile::ResearchDecision),
@@ -435,6 +428,13 @@ fn is_read_only_model_tool(name: &str) -> bool {
     name == "think"
         || name == "web.run"
         || name == orchestrator_llm::tools::record_phase2_context::NAME
+        || matches!(
+            name,
+            orchestrator_llm::tools::phase2_stree::SUBMIT_DEBATE_TURN
+                | orchestrator_llm::tools::phase2_stree::ROUTE_DEBATE_TURN
+                | orchestrator_llm::tools::phase2_stree::WAIT_FOR_DEBATE_TURN
+                | orchestrator_llm::tools::phase2_stree::CLOSE_DEBATE
+        )
         || name == "verify_event"
         || name == orchestrator_llm::tools::research_evidence_gap::NAME
         || name.starts_with("read_")
@@ -447,6 +447,7 @@ struct WorkflowEvidenceResearchService {
     store_root: PathBuf,
     current_date: String,
     run_id: String,
+    storage_namespace: Option<String>,
     project_root: PathBuf,
     prompt_path: PathBuf,
     llm: RoleLlmSettings,
@@ -507,7 +508,11 @@ async fn run_web_evidence_research(
     let session_runtime = FileStoreSessionRuntime::create_or_load(
         store,
         SessionRuntimeSpec {
-            run: orchestrator_store::RunLocation::new(&service.current_date, &service.run_id)?,
+            run: orchestrator_store::RunLocation::with_storage_namespace(
+                &service.current_date,
+                &service.run_id,
+                service.storage_namespace.clone(),
+            )?,
             session_id,
             role: "researcher.web_evidence".to_owned(),
             phase: 2,
@@ -608,6 +613,10 @@ fn phase2_evidence_research_binding(
         store_root: PathBuf::from(store_root),
         current_date: current_date.to_owned(),
         run_id: run_id.to_owned(),
+        storage_namespace: state
+            .get("storage_namespace")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
         project_root: project_root.clone(),
         prompt_path: config
             .prompts
@@ -825,16 +834,12 @@ fn file_store_domain_index_read_runtime(
     tickers: &[String],
 ) -> Result<orchestrator_llm::tools::index_tools::IndexToolRuntimeBinding> {
     use orchestrator_llm::tools::index_tools::{IndexKind, IndexOwnedScope, IndexReadVisibility};
-    use orchestrator_store::{content_hash, FileStore, FileStoreOptions, RunLocation};
+    use orchestrator_store::{content_hash, FileStore, FileStoreOptions};
 
     let run_id = state
         .get("run_id")
         .and_then(Value::as_str)
         .context("domain Index reader requires run_id")?;
-    let current_date = state
-        .get("current_date")
-        .and_then(Value::as_str)
-        .context("domain Index reader requires current_date")?;
     let phase_u8 = u8::try_from(phase).context("domain Index reader phase must fit u8")?;
     let source_phases = phase_summary_source_phases(profile)?;
     let source_payload_hash = content_hash(&json!({
@@ -871,7 +876,7 @@ fn file_store_domain_index_read_runtime(
         owned,
         visibility,
         FileStoreIndexRuntimePlan::read_only(
-            vec![RunLocation::new(current_date, run_id)?],
+            vec![run_location_from_state(state)?],
             Utc::now().to_rfc3339(),
         ),
     )
@@ -905,45 +910,28 @@ fn phase2_fork_reference(
     state: &Value,
     role: &str,
     topic_id: Option<&str>,
-    round: Option<i64>,
+    _round: Option<i64>,
 ) -> Option<orchestrator_store::ForkReference> {
     let (session_id, turn_id) = if role == "mediator.topic_controller" {
         let topic_id = topic_id?;
-        if round.unwrap_or_default() > 0 {
-            let source = state.pointer(&format!(
-                "/phase2_file_store_sessions/{topic_id}/controller"
-            ))?;
-            (
-                source.get("session_id")?.as_str()?.to_owned(),
-                source.get("turn_id")?.as_str()?.to_owned(),
-            )
-        } else {
-            (
-                state
-                    .get("topic_generation_session_id")?
-                    .as_str()?
-                    .to_owned(),
-                state.get("topic_generation_turn_id")?.as_str()?.to_owned(),
-            )
-        }
-    } else if matches!(role, "researcher.bull.initial" | "researcher.bear.initial") {
+        // The controller has one canonical topic session. Its first turn
+        // forks Topic Generation; later turns reload that same session/turn
+        // and only receive a stree user-message injection, never a sibling
+        // controller fork.
+        let _ = topic_id;
+        (
+            state
+                .get("topic_generation_session_id")?
+                .as_str()?
+                .to_owned(),
+            state.get("topic_generation_turn_id")?.as_str()?.to_owned(),
+        )
+    } else if matches!(role, "researcher.bull" | "researcher.bear") {
         let _ = topic_id?;
         let warmup = state.get("phase2_warmup")?;
         (
             warmup.get("session_id")?.as_str()?.to_owned(),
             warmup.get("turn_id")?.as_str()?.to_owned(),
-        )
-    } else if role == "researcher.bull.interaction" || role == "researcher.bear.interaction" {
-        let topic_id = topic_id?;
-        let side = if role.contains("bull") {
-            "bull"
-        } else {
-            "bear"
-        };
-        let source = state.pointer(&format!("/phase2_file_store_sessions/{topic_id}/{side}"))?;
-        (
-            source.get("session_id")?.as_str()?.to_owned(),
-            source.get("turn_id")?.as_str()?.to_owned(),
         )
     } else {
         return None;
@@ -962,8 +950,7 @@ fn phase2_context_payload(
     fork_from_turn_id: Option<&str>,
 ) -> Option<Value> {
     let context_kind = match role {
-        "researcher.bull.initial" | "researcher.bear.initial" => "topic_fork",
-        "researcher.bull.interaction" | "researcher.bear.interaction" => "point_debate",
+        "researcher.bull" | "researcher.bear" => "stree_debate",
         "mediator.topic_controller" => "topic_control",
         _ => return None,
     };
@@ -983,18 +970,42 @@ fn phase2_context_payload(
     if let Some(topic) = topic_state.and_then(|value| value.get("topic")) {
         context["topic"] = topic.clone();
     }
-    if role == "mediator.topic_controller" {
-        context["debate_turns"] = topic_state
-            .and_then(|value| value.get("turns"))
-            .cloned()
-            .unwrap_or_else(|| json!([]));
-    } else if role.ends_with(".interaction") {
-        context["controller"] = topic_state
-            .and_then(|value| value.get("controller_artifact"))
-            .cloned()
-            .unwrap_or(Value::Null);
+    context["debate_turns"] = topic_state
+        .map(phase2_topic_context_turns)
+        .unwrap_or_else(|| json!([]));
+    if let Some(injection) = state.get("_phase2_stree_injection").and_then(Value::as_str) {
+        context["stree_injection"] = json!(injection);
     }
     Some(context)
+}
+
+fn phase2_topic_context_turns(topic_state: &Value) -> Value {
+    let mut turns = topic_state
+        .get("turns")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    turns.extend(
+        topic_state
+            .get("controller_turns")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
+    );
+    turns.sort_by_key(|turn| {
+        let round = turn
+            .get("round")
+            .and_then(Value::as_i64)
+            .unwrap_or_default();
+        let role_rank = match turn.get("role").and_then(Value::as_str) {
+            Some("researcher.bull") => 0,
+            Some("researcher.bear") => 1,
+            Some("mediator.topic_controller") => 2,
+            _ => 3,
+        };
+        (round, role_rank)
+    });
+    Value::Array(turns)
 }
 
 fn file_store_input_from_state(state: &Value) -> Result<FileStoreInputSnapshot> {
@@ -1015,6 +1026,10 @@ fn file_store_input_from_state(state: &Value) -> Result<FileStoreInputSnapshot> 
         store_root: PathBuf::from(required("store_root")?),
         run_id: required("run_id")?,
         current_date: required("current_date")?,
+        storage_namespace: input
+            .get("storage_namespace")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
     })
 }
 
@@ -1034,10 +1049,6 @@ fn file_store_session_runtime(
         .get("store_root")
         .and_then(Value::as_str)
         .context("migrated role requires FileStore root")?;
-    let current_date = state
-        .get("current_date")
-        .and_then(Value::as_str)
-        .context("migrated role requires current_date")?;
     let run_id = state
         .get("run_id")
         .and_then(Value::as_str)
@@ -1050,7 +1061,16 @@ fn file_store_session_runtime(
         role,
         profile.as_str(),
         topic_id.unwrap_or("aggregate"),
-        round.unwrap_or(0)
+        if phase == 2
+            && matches!(
+                role,
+                "researcher.bull" | "researcher.bear" | "mediator.topic_controller"
+            )
+        {
+            0
+        } else {
+            round.unwrap_or(0)
+        }
     );
     let store = orchestrator_store::FileStore::open(
         store_root,
@@ -1059,7 +1079,7 @@ fn file_store_session_runtime(
     FileStoreSessionRuntime::create_or_load(
         store,
         SessionRuntimeSpec {
-            run: orchestrator_store::RunLocation::new(current_date, run_id)?,
+            run: run_location_from_state(state)?,
             session_id,
             role: role.to_owned(),
             phase,
@@ -1383,16 +1403,7 @@ fn file_store_experience_retrieval(
         store_root,
         orchestrator_store::FileStoreOptions::default(),
     )?;
-    let location = orchestrator_store::RunLocation::new(
-        state
-            .get("current_date")
-            .and_then(Value::as_str)
-            .context("Experience retrieval requires current_date")?,
-        state
-            .get("run_id")
-            .and_then(Value::as_str)
-            .context("Experience retrieval requires run_id")?,
-    )?;
+    let location = run_location_from_state(state)?;
     let phase = u8::try_from(phase).context("Experience retrieval phase must fit u8")?;
     let query = ExperienceSearchQuery {
         phase,
@@ -1714,6 +1725,9 @@ fn retrieval_policy_for_role(role: &str, kind: &str, config: &RetrievalConfig) -
         ("reflector.historical", _) => policy(&[], &[], 1, config.reflection_max_details),
         ("mediator.topic", "warmup") => policy(&[1], &[], 0, 2),
         ("mediator.topic", _) => policy(&[1], &[1], 1, config.phase2_max_details),
+        ("researcher.bull" | "researcher.bear", _) => {
+            policy(&[1], &[1], 1, config.phase2_max_details)
+        }
         ("researcher.bull.initial" | "researcher.bear.initial", _) => {
             policy(&[1], &[1], 1, config.phase2_max_details)
         }
@@ -1739,12 +1753,22 @@ fn phase2_debug_output_path(
     role: &str,
     kind: &str,
     topic_id: Option<&str>,
-    round: Option<i64>,
+    _round: Option<i64>,
 ) -> Option<PathBuf> {
     if role == "compressor.phase_summary" {
+        let file = if phase == 2 && kind == "phase2_extraction" {
+            "phase2_extraction.json"
+        } else {
+            &format!("phase{phase}_summary.json")
+        };
         return Some(
-            PathBuf::from(format!("outputs/debug/phase{phase}/summary"))
-                .join(format!("phase{phase}_summary.json")),
+            PathBuf::from(format!("outputs/debug/phase{phase}"))
+                .join(if phase == 2 && kind == "phase2_extraction" {
+                    "extraction"
+                } else {
+                    "summary"
+                })
+                .join(file),
         );
     }
     if phase != 2 {
@@ -1773,13 +1797,12 @@ fn phase2_debug_output_path(
     } else {
         format!("topic-{safe_topic_id}")
     };
-    let round = round.unwrap_or_default();
     let file = if role == "mediator.topic_controller" {
-        format!("topic-controller-round-{round}.json")
-    } else if role.contains(".bull.") {
-        format!("debate-bull-round-{round}.json")
-    } else if role.contains(".bear.") {
-        format!("debate-bear-round-{round}.json")
+        "topic-controller.json"
+    } else if role == "researcher.bull" || role.contains(".bull.") {
+        "debate-bull.json"
+    } else if role == "researcher.bear" || role.contains(".bear.") {
+        "debate-bear.json"
     } else {
         return None;
     };
@@ -2183,6 +2206,10 @@ async fn execute_role_job(job: RoleJob) -> Result<AgentLoopOutput> {
             .get("include_prompt_on_fork")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let injected_user_message = phase2_context
+            .get("stree_injection")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
         run_agent_fork_loop_with_metrics(
             &settings,
             ForkLoopInput {
@@ -2191,6 +2218,7 @@ async fn execute_role_job(job: RoleJob) -> Result<AgentLoopOutput> {
                 prompt: &job.prompt,
                 fork_from_turn_id,
                 include_prompt_on_fork,
+                injected_user_message,
             },
         )
         .await?
@@ -2431,20 +2459,44 @@ mod tests {
             phase2_debug_output_path(2, "mediator.topic", "topic_generation", None, None),
             Some(PathBuf::from("outputs/debug/phase2/topic-generator.json"))
         );
-        for (role, round, file) in [
-            ("researcher.bull.initial", 0, "debate-bull-round-0.json"),
-            ("researcher.bear.interaction", 1, "debate-bear-round-1.json"),
-            (
-                "mediator.topic_controller",
-                1,
-                "topic-controller-round-1.json",
+        assert_eq!(
+            phase2_debug_output_path(
+                2,
+                "compressor.phase_summary",
+                "phase2_extraction",
+                None,
+                None
             ),
+            Some(PathBuf::from(
+                "outputs/debug/phase2/extraction/phase2_extraction.json"
+            ))
+        );
+        for (role, file) in [
+            ("researcher.bull.initial", "debate-bull.json"),
+            ("researcher.bear.interaction", "debate-bear.json"),
+            ("mediator.topic_controller", "topic-controller.json"),
         ] {
             assert_eq!(
-                phase2_debug_output_path(2, role, "debate", Some("QQQ/risk"), Some(round)),
+                phase2_debug_output_path(2, role, "debate", Some("QQQ/risk"), Some(1)),
                 Some(PathBuf::from("outputs/debug/phase2/topic-QQQ_risk").join(file))
             );
         }
+        assert_eq!(
+            phase2_debug_output_path(
+                2,
+                "researcher.bull.interaction",
+                "interaction",
+                Some("QQQ/risk"),
+                Some(2),
+            ),
+            phase2_debug_output_path(
+                2,
+                "researcher.bull.initial",
+                "bull_seed",
+                Some("QQQ/risk"),
+                Some(0),
+            )
+        );
         assert_eq!(
             phase2_debug_output_path(
                 2,
@@ -2454,7 +2506,7 @@ mod tests {
                 Some(0),
             ),
             Some(PathBuf::from(
-                "outputs/debug/phase2/topic_vix/debate-bull-round-0.json"
+                "outputs/debug/phase2/topic_vix/debate-bull.json"
             ))
         );
     }
@@ -2472,23 +2524,89 @@ mod tests {
                     }
                 }
             }),
-            "researcher.bull.interaction",
+            "researcher.bull",
             Some("topic-a"),
             Some(1),
             Some("warmup-turn"),
         )
         .unwrap();
 
-        assert_eq!(context["kind"], "point_debate");
+        assert_eq!(context["kind"], "stree_debate");
         assert_eq!(context["topic_id"], "topic-a");
         assert_eq!(context["round"], 1);
         assert_eq!(context["round_num"], 1);
         assert_eq!(context["fork_from_turn_id"], "warmup-turn");
         assert_eq!(context["include_prompt_on_fork"], true);
-        assert_eq!(
-            context["controller"]["payload"]["next_steers"][0]["steer_id"],
-            "steer-1"
-        );
+        assert!(context.get("controller").is_none());
+    }
+
+    #[test]
+    fn phase2_interaction_uses_shared_topic_tree_and_complete_prior_turns() {
+        let state = json!({
+            "phase2_warmup": {"session_id":"warmup-session", "turn_id":"warmup-turn"},
+            "topic_debate_states": {
+                "topic-a": {
+                    "topic": {"topic_id": "topic-a"},
+                    "turns": [
+                        {
+                            "role": "researcher.bull.initial",
+                            "round": 0,
+                            "artifact": {"payload": {"claims": [{"claim": "bull"}]}}
+                        },
+                        {
+                            "role": "researcher.bear.initial",
+                            "round": 0,
+                            "artifact": {"payload": {"claims": [{"claim": "bear"}]}}
+                        },
+                        {
+                            "role": "researcher.bull.interaction",
+                            "round": 1,
+                            "artifact": {"payload": {"replies": [{"reason": "bull reply"}]}}
+                        }
+                    ],
+                    "controller_turns": [
+                        {
+                            "role": "mediator.topic_controller",
+                            "round": 0,
+                            "artifact": {"payload": {"next_steers": [{"steer_id": "s1"}]}}
+                        }
+                    ],
+                    "controller_artifact": {
+                        "payload": {"next_steers": [{"steer_id": "s1"}]}
+                    }
+                }
+            }
+        });
+
+        for role in ["researcher.bull", "researcher.bear"] {
+            let fork = phase2_fork_reference(&state, role, Some("topic-a"), Some(1))
+                .expect("each canonical participant session forks from warmup once");
+            assert_eq!(fork.fork_from_session_id, "warmup-session");
+            assert_eq!(fork.fork_from_turn_id, "warmup-turn");
+
+            let context = phase2_context_payload(
+                &state,
+                role,
+                Some("topic-a"),
+                Some(1),
+                Some(&fork.fork_from_turn_id),
+            )
+            .unwrap();
+            let turns = context["debate_turns"].as_array().unwrap();
+            assert_eq!(
+                turns
+                    .iter()
+                    .map(|turn| turn["role"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                vec![
+                    "mediator.topic_controller",
+                    "researcher.bull.initial",
+                    "researcher.bear.initial",
+                    "researcher.bull.interaction",
+                ]
+            );
+            assert!(context.get("controller").is_none());
+        }
     }
 
     #[test]
@@ -2499,8 +2617,11 @@ mod tests {
                     "topic-a": {
                         "topic": {"topic_id": "topic-a", "title": "Volatility regime"},
                         "turns": [
-                            {"role": "researcher.bull.initial", "artifact": {"summary": "bull"}},
-                            {"role": "researcher.bear.initial", "artifact": {"summary": "bear"}}
+                            {"role": "researcher.bull", "artifact": {"summary": "bull"}},
+                            {"role": "researcher.bear", "artifact": {"summary": "bear"}}
+                        ],
+                        "controller_turns": [
+                            {"role": "mediator.topic_controller", "round": 0, "artifact": {"summary": "controller"}}
                         ]
                     }
                 }
@@ -2514,7 +2635,11 @@ mod tests {
 
         assert_eq!(context["kind"], "topic_control");
         assert_eq!(context["topic"]["title"], "Volatility regime");
-        assert_eq!(context["debate_turns"].as_array().unwrap().len(), 2);
+        assert_eq!(context["debate_turns"].as_array().unwrap().len(), 3);
+        assert_eq!(
+            context["debate_turns"][2]["role"],
+            "mediator.topic_controller"
+        );
         assert!(context.get("controller").is_none());
     }
 

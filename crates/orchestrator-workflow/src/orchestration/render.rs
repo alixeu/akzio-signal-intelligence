@@ -388,7 +388,7 @@ pub(crate) fn render_prompt_with_plugins(
     let mut placeholders = raw_template_placeholders(&template);
     let stance_role_label = role.strip_prefix("risk.").unwrap_or("");
     let (side, side_label, opponent, opponent_label, side_strategy_path) =
-        if role.contains(".bull.") {
+        if role == "researcher.bull" || role.contains(".bull.") {
             (
                 "bull",
                 "看多",
@@ -396,7 +396,7 @@ pub(crate) fn render_prompt_with_plugins(
                 "看空",
                 Some("phase2/researcher/side_bull.md"),
             )
-        } else if role.contains(".bear.") {
+        } else if role == "researcher.bear" || role.contains(".bear.") {
             (
                 "bear",
                 "看空",
@@ -1834,14 +1834,26 @@ required_variables = ["ticker", "tickers"]
         let content =
             std::fs::read_to_string(project_prompts_dir().join("phase2/topic_controller.md"))
                 .unwrap();
-        assert!(content.contains("record_phase2_context"));
+        assert!(content.contains("stree:"));
         assert!(content.contains("claim_ledger"));
+        assert!(content.contains("claim_ledger` 最多 3 项"));
+        assert!(content.contains("首轮强制碰撞"));
+        assert!(content.contains("round=0"));
         assert!(content.contains("next_steers"));
+        assert!(content.contains("next_steers: []"));
         assert!(content.contains("不要输出 JSON"));
         assert!(!content.contains("{topic}"));
         assert!(!content.contains("{topic_id}"));
         assert!(!content.contains("blocked_repeats"));
         assert!(!content.contains("next_agenda"));
+    }
+
+    #[test]
+    fn phase2_summary_compacts_interaction_replies() {
+        let content =
+            std::fs::read_to_string(project_prompts_dir().join("phase2/summary.md")).unwrap();
+        assert!(content.contains("最多保留 2 条 reply"));
+        assert!(content.contains("多个论点必须合并"));
     }
 
     #[test]
@@ -1874,11 +1886,11 @@ required_variables = ["ticker", "tickers"]
         assert!(warmup.contains("`read_indexes(source_phase=1)`"));
         assert!(warmup.contains("1-2 个 Index"));
         assert!(debate.contains("raw Jin10"));
-        assert!(debate.contains("claim ID"));
-        assert!(debate.contains("accept | rebut | downgrade"));
+        assert!(debate.contains("claim"));
+        assert!(debate.contains("partial_agree"));
         assert!(debate.contains("next_steers"));
         assert!(debate.contains("blocked_claims"));
-        assert!(debate.contains("reply_to_claim_id"));
+        assert!(debate.contains("reply_to_node_id"));
         assert!(debate.contains("no_new_info"));
         assert!(debate.contains("steelman"));
     }

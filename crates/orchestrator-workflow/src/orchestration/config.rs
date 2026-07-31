@@ -574,6 +574,33 @@ fn effective_llm_role_values(config: &Value) -> Result<BTreeMap<String, Value>> 
                 })
                 .or_insert_with(|| role_value.clone());
         }
+
+        // Phase 2 now owns one persistent session per side.  Keep existing
+        // `.initial`/`.interaction` overrides usable while the runtime
+        // resolves both turns through the canonical side role.
+        for (canonical, aliases) in [
+            (
+                "researcher.bull",
+                ["researcher.bull.initial", "researcher.bull.interaction"],
+            ),
+            (
+                "researcher.bear",
+                ["researcher.bear.initial", "researcher.bear.interaction"],
+            ),
+        ] {
+            if object.contains_key(canonical) {
+                continue;
+            }
+            for alias in aliases {
+                if let Some(alias_value) = object.get(alias) {
+                    role_values
+                        .entry(canonical.to_owned())
+                        .and_modify(|effective| {
+                            orchestrator_core::deep_merge(effective, alias_value.clone())
+                        });
+                }
+            }
+        }
     }
     Ok(role_values)
 }
@@ -586,10 +613,8 @@ fn builtin_llm_role_values() -> BTreeMap<String, Value> {
         ("analyst.news_macro", 10, None, true),
         // Phase-2 roles read the compact index, then expand selected summaries.
         ("mediator.topic", 6, Some("medium"), false),
-        ("researcher.bull.initial", 10, None, false),
-        ("researcher.bear.initial", 10, None, false),
-        ("researcher.bull.interaction", 10, None, false),
-        ("researcher.bear.interaction", 10, None, false),
+        ("researcher.bull", 10, None, false),
+        ("researcher.bear", 10, None, false),
         ("mediator.topic_controller", 10, Some("medium"), false),
         ("researcher.web_evidence", 6, Some("medium"), true),
         ("manager.research", 6, Some("medium"), false),
@@ -620,12 +645,7 @@ fn builtin_llm_role_values() -> BTreeMap<String, Value> {
             );
         } else if matches!(
             role,
-            "researcher.bull.initial"
-                | "researcher.bear.initial"
-                | "researcher.bull.interaction"
-                | "researcher.bear.interaction"
-                | "mediator.topic"
-                | "mediator.topic_controller"
+            "researcher.bull" | "researcher.bear" | "mediator.topic" | "mediator.topic_controller"
         ) {
             object.insert(
                 "web_search".to_string(),
@@ -716,10 +736,8 @@ pub(crate) fn required_llm_roles() -> Vec<String> {
         "analyst.news_macro",
         "reflector.historical",
         "mediator.topic",
-        "researcher.bull.initial",
-        "researcher.bear.initial",
-        "researcher.bull.interaction",
-        "researcher.bear.interaction",
+        "researcher.bull",
+        "researcher.bear",
         "mediator.topic_controller",
         "researcher.web_evidence",
         "manager.research",
@@ -1151,9 +1169,6 @@ mod tests {
             )
             .unwrap()
             .allows_tool("read_reflection_source"));
-        assert_eq!(
-            roles["researcher.bull.initial"]["web_search"]["mode"],
-            "disabled"
-        );
+        assert_eq!(roles["researcher.bull"]["web_search"]["mode"], "disabled");
     }
 }

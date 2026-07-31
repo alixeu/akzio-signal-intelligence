@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use thiserror::Error;
 
 pub const ROLE_PROFILE_REGISTRY_SCHEMA_VERSION: u32 = 1;
-pub const BUILTIN_ROLE_PROFILE_REGISTRY_VERSION: u32 = 8;
+pub const BUILTIN_ROLE_PROFILE_REGISTRY_VERSION: u32 = 9;
 
 /// The typed output contract a role is being migrated to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -94,6 +94,10 @@ define_tool_ids! {
     ReadJin10Candidates => "read_jin10_candidates",
     VerifyEvent => "verify_event",
     RecordPhase2Context => "record_phase2_context",
+    SubmitDebateTurn => "submit_debate_turn",
+    RouteDebateTurn => "route_debate_turn",
+    WaitForDebateTurn => "wait_for_debate_turn",
+    CloseDebate => "close_debate",
     ResearchEvidenceGap => "research_evidence_gap",
     AlpacaGetNews => "alpaca_get_news",
 }
@@ -324,47 +328,25 @@ impl RoleProfileRegistry {
                 &[ToolId::ReadIndexDetails, ToolId::ReadIndexes],
             ),
             registration(
-                "researcher.bull.initial",
-                ToolManagedProfile::DebateSeed,
-                UnitPlanner::DebateSeed,
-                &[
-                    ToolId::ReadIndexDetails,
-                    ToolId::ReadIndexes,
-                    ToolId::RecordPhase2Context,
-                    ToolId::ResearchEvidenceGap,
-                ],
-            ),
-            registration(
-                "researcher.bear.initial",
-                ToolManagedProfile::DebateSeed,
-                UnitPlanner::DebateSeed,
-                &[
-                    ToolId::ReadIndexDetails,
-                    ToolId::ReadIndexes,
-                    ToolId::RecordPhase2Context,
-                    ToolId::ResearchEvidenceGap,
-                ],
-            ),
-            registration(
-                "researcher.bull.interaction",
+                "researcher.bull",
                 ToolManagedProfile::DebateResponse,
                 UnitPlanner::DebateResponse,
                 &[
                     ToolId::ReadIndexDetails,
                     ToolId::ReadIndexes,
-                    ToolId::RecordPhase2Context,
                     ToolId::ResearchEvidenceGap,
+                    ToolId::SubmitDebateTurn,
                 ],
             ),
             registration(
-                "researcher.bear.interaction",
+                "researcher.bear",
                 ToolManagedProfile::DebateResponse,
                 UnitPlanner::DebateResponse,
                 &[
                     ToolId::ReadIndexDetails,
                     ToolId::ReadIndexes,
-                    ToolId::RecordPhase2Context,
                     ToolId::ResearchEvidenceGap,
+                    ToolId::SubmitDebateTurn,
                 ],
             ),
             registration(
@@ -380,7 +362,9 @@ impl RoleProfileRegistry {
                 &[
                     ToolId::ReadIndexDetails,
                     ToolId::ReadIndexes,
-                    ToolId::RecordPhase2Context,
+                    ToolId::RouteDebateTurn,
+                    ToolId::WaitForDebateTurn,
+                    ToolId::CloseDebate,
                 ],
             ),
             registration(
@@ -637,15 +621,12 @@ mod tests {
     #[test]
     fn builtin_registry_covers_each_current_agent_role_profile_exactly_once() {
         let registry = RoleProfileRegistry::builtin();
-        assert_eq!(registry.registrations().count(), 18);
+        assert_eq!(registry.registrations().count(), 16);
         assert!(registry
-            .registration("researcher.bull.initial", ToolManagedProfile::DebateSeed)
+            .registration("researcher.bull", ToolManagedProfile::DebateResponse)
             .is_ok());
         assert!(registry
-            .registration(
-                "researcher.bull.initial",
-                ToolManagedProfile::DebateResponse
-            )
+            .registration("researcher.bull", ToolManagedProfile::DebateSeed)
             .is_err());
         let web = registry
             .registration(
@@ -666,6 +647,13 @@ mod tests {
                 "mediator.topic",
                 ToolManagedProfile::ResearcherWarmup,
                 ToolId::ResearchEvidenceGap.as_str(),
+            )
+            .unwrap());
+        assert!(registry
+            .tool_is_allowed(
+                "researcher.bull",
+                ToolManagedProfile::DebateResponse,
+                ToolId::SubmitDebateTurn.as_str()
             )
             .unwrap());
     }

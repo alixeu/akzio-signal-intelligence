@@ -8,3 +8,4 @@ pub mod render;
 pub(crate) mod role_jobs;
 pub(crate) mod summary_store;
 pub mod summary_units;
+pub(crate) mod topic_debate_tree;
