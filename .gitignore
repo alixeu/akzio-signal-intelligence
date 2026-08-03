@@ -4,12 +4,8 @@
 /target/
 **/*.rs.bk
 
-# Python
-__pycache__/
-*.py[cod]
 
 # Local runtime outputs
-/outputs/
 /config/local*.yaml
 /config/*.local.yaml
 *.log

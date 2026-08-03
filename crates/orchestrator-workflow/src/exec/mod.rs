@@ -4931,11 +4931,12 @@ fn validate_phase5_compiled_fields(
                 missing_fields,
             )?,
             cash_hedge_recommendation: cash_hedge.clone(),
-            constraint_confidence: constraints
-                .get("constraint_confidence")
-                .and_then(Value::as_f64)
-                .filter(|value| value.is_finite())
-                .with_context(|| format!("Phase 5 constraint_confidence missing for {ticker}"))?,
+            constraint_confidence: phase5_number(
+                constraints.get("constraint_confidence"),
+                &ticker,
+                "constraint_confidence",
+                missing_fields,
+            )?,
         };
         validate_risk_constraints(&canonical).map_err(|error| {
             anyhow::anyhow!("Phase 5 constraints invalid for {ticker}: {error}")
@@ -5678,6 +5679,40 @@ mod phase2_session_tests {
             &mut fields
         )
         .is_err());
+    }
+
+    #[test]
+    fn phase5_accepts_declared_missing_constraint_confidence() {
+        let state = json!({"investable_assets": ["QQQ"]});
+        let mut fields = json!({
+            "stance": "neutral",
+            "unique_risk_contribution": "gap risk",
+            "disagreement_with_prior": "none",
+            "no_new_information": false,
+            "recommended_adjustment": "cap the position",
+            "per_asset": {"QQQ": {
+                "position_cap_pct": 0.2,
+                "max_drawdown_pct": 0.1,
+                "stop_type": "soft",
+                "risk_off_trigger": "breakdown",
+                "rebalance_trigger": "volatility doubles",
+                "review_window": "one day",
+                "constraint_confidence": null
+            }},
+            "cash_hedge_recommendation": "hold cash"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        validate_phase5_compiled_fields(
+            &state,
+            "risk.neutral",
+            "risk summary",
+            &["QQQ.constraint_confidence".to_owned()],
+            &mut fields,
+        )
+        .unwrap();
     }
 
     #[test]
