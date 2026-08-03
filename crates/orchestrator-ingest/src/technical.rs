@@ -749,7 +749,10 @@ fn insert_period_features(
     let c = close[i];
     features.insert(
         format!("ROC{suffix}"),
-        ref_value(close, i, d).zip(c).map(|(r, c)| r / (c + EPS)),
+        ref_value(close, i, d)
+            .filter(|reference| reference.abs() > EPS)
+            .zip(c)
+            .map(|(reference, current)| current / reference - 1.0),
     );
     features.insert(
         format!("MA{suffix}"),
@@ -1444,6 +1447,35 @@ mod tests {
         let rows = feature_rows_for_symbol(&bars);
         assert_eq!(rows[3].features["MA5"], None);
         assert!(rows[5].features["Return"].is_some());
+    }
+
+    #[test]
+    fn roc_is_a_signed_period_return_and_rejects_zero_reference() {
+        let rising = [100.0, 104.0, 108.0, 112.0, 116.0, 120.0]
+            .into_iter()
+            .enumerate()
+            .map(|(index, close)| bar(index + 1, Some(close)))
+            .collect::<Vec<_>>();
+        let rising_rows = feature_rows_for_symbol(&rising);
+        assert!((rising_rows[5].features["ROC5"].unwrap() - 0.2).abs() < 1e-9);
+
+        let falling = [120.0, 116.0, 112.0, 108.0, 104.0, 100.0]
+            .into_iter()
+            .enumerate()
+            .map(|(index, close)| bar(index + 1, Some(close)))
+            .collect::<Vec<_>>();
+        let falling_rows = feature_rows_for_symbol(&falling);
+        assert!((falling_rows[5].features["ROC5"].unwrap() + 1.0 / 6.0).abs() < 1e-9);
+
+        let zero_reference = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
+            .into_iter()
+            .enumerate()
+            .map(|(index, close)| bar(index + 1, Some(close)))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            feature_rows_for_symbol(&zero_reference)[5].features["ROC5"],
+            None
+        );
     }
 
     #[test]

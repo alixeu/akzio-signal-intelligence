@@ -5,6 +5,7 @@ use chrono::Utc;
 use orchestrator_store::{
     append_index_detail, content_hash, create_index, finalize_index, AppendIndexDetailInput,
     CreateIndexInput, DetailSection, FileStore, FileStoreOptions, Index, IndexKind, IndexScope,
+    StoreError,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -198,20 +199,21 @@ pub(crate) fn write_compiled_phase_index(
             applies_to_phases: applies_to_phases(phase),
         },
     )?;
-    if let Ok(index) = finalize_index(&store, &scope) {
-        return Ok(index);
+    match finalize_index(&store, &scope) {
+        Ok(index) => return Ok(index),
+        Err(error) if index_is_waiting_for_first_detail(&error) => {}
+        Err(error) => return Err(error.into()),
     }
     let mut source_refs = candidate
         .details
         .iter()
         .flat_map(|detail| detail.source_refs.iter().cloned())
-        .filter(|reference| is_stable_source_ref(reference))
         .collect::<BTreeSet<_>>();
-    collect_source_refs_from_value(
+    validate_source_refs(&source_refs)?;
+    collect_declared_source_refs(
         &Value::Object(scope.authoritative_fields.clone()),
         &mut source_refs,
-    );
-    collect_source_refs_from_text(response_text, &mut source_refs);
+    )?;
     let source_refs = source_refs.into_iter().collect();
     append_index_detail(
         &store,
@@ -232,60 +234,86 @@ pub(crate) fn write_compiled_phase_index(
                 scope: scope.clone(),
                 section: DetailSection::parse(&detail.section).unwrap_or(DetailSection::Other),
                 detail: detail.detail,
-                source_refs: detail.source_refs,
+                source_refs: normalized_source_refs(detail.source_refs)?,
             },
         )?;
     }
     finalize_index(&store, &scope).map_err(Into::into)
 }
 
-fn collect_source_refs_from_value(value: &Value, refs: &mut BTreeSet<String>) {
+fn index_is_waiting_for_first_detail(error: &StoreError) -> bool {
+    matches!(
+        error,
+        StoreError::InvalidDocument { kind: "index", message }
+            if message == "finalize requires at least one Detail"
+    )
+}
+
+fn collect_declared_source_refs(value: &Value, refs: &mut BTreeSet<String>) -> Result<()> {
+    collect_declared_source_refs_inner(value, None, refs)
+}
+
+fn collect_declared_source_refs_inner(
+    value: &Value,
+    parent_key: Option<&str>,
+    refs: &mut BTreeSet<String>,
+) -> Result<()> {
     match value {
-        Value::String(value) => collect_source_refs_from_text(value, refs),
         Value::Array(values) => {
-            for value in values {
-                collect_source_refs_from_value(value, refs);
+            if matches!(
+                parent_key,
+                Some("source_refs" | "evidence_refs" | "source_index_ids")
+            ) {
+                for value in values {
+                    let reference = value
+                        .as_str()
+                        .context("declared source reference must be a string")?;
+                    if !is_stable_source_ref(reference) {
+                        bail!("declared source reference {reference:?} is not a complete stable ID")
+                    }
+                    refs.insert(reference.to_owned());
+                }
+            } else {
+                for value in values {
+                    collect_declared_source_refs_inner(value, parent_key, refs)?;
+                }
             }
         }
         Value::Object(values) => {
-            for value in values.values() {
-                collect_source_refs_from_value(value, refs);
+            for (key, value) in values {
+                collect_declared_source_refs_inner(value, Some(key), refs)?;
             }
         }
         _ => {}
     }
+    Ok(())
 }
 
-fn collect_source_refs_from_text(text: &str, refs: &mut BTreeSet<String>) {
-    for token in text.split(|character: char| {
-        character.is_whitespace()
-            || matches!(
-                character,
-                '"' | '\'' | '`' | ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>'
-            )
-    }) {
-        let token = token
-            .trim_matches(|character: char| {
-                matches!(character, '.' | ':' | '!' | '?' | '。' | '，')
-            })
-            .strip_prefix("web.run:")
-            .unwrap_or(token);
-        if is_stable_source_ref(token) {
-            refs.insert(token.to_owned());
+fn normalized_source_refs(source_refs: Vec<String>) -> Result<Vec<String>> {
+    let source_refs = source_refs.into_iter().collect::<BTreeSet<_>>();
+    validate_source_refs(&source_refs)?;
+    Ok(source_refs.into_iter().collect())
+}
+
+fn validate_source_refs(source_refs: &BTreeSet<String>) -> Result<()> {
+    for reference in source_refs {
+        if !is_stable_source_ref(reference) {
+            bail!("source reference {reference:?} is not a complete stable ID")
         }
     }
+    Ok(())
 }
 
 fn is_stable_source_ref(reference: &str) -> bool {
-    !reference.contains("...")
-        && reference.len() >= 10
-        && (reference.starts_with("idx-")
-            || reference.starts_with("web-")
-            || reference.starts_with("technical-")
-            || reference.starts_with("jin10-"))
-        && reference
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+    ["idx-", "web-", "technical-", "jin10-"]
+        .into_iter()
+        .find_map(|prefix| reference.strip_prefix(prefix))
+        .is_some_and(|digest| {
+            digest.len() == 64
+                && digest
+                    .chars()
+                    .all(|character| character.is_ascii_hexdigit())
+        })
 }
 
 fn detail_section_for_phase(phase: u8) -> DetailSection {
@@ -456,16 +484,39 @@ mod tests {
     }
 
     #[test]
-    fn source_lineage_keeps_only_complete_stable_ids() {
+    fn source_lineage_uses_only_declared_complete_ids() {
+        let index = format!("idx-{}", "a".repeat(64));
         let mut refs = BTreeSet::new();
-        collect_source_refs_from_text(
-            "read idx-12345678 and web.run:web-abcdef1234, not idx-12... or sha256:deadbeef",
+        collect_declared_source_refs(
+            &json!({
+                "source_refs": [index.clone()],
+                "comment": "model prose can mention web-ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff but does not authorize it"
+            }),
             &mut refs,
-        );
+        )
+        .unwrap();
 
-        assert_eq!(
-            refs,
-            BTreeSet::from(["idx-12345678".to_owned(), "web-abcdef1234".to_owned()])
-        );
+        assert_eq!(refs, BTreeSet::from([index]));
+        assert!(collect_declared_source_refs(
+            &json!({"source_refs": ["idx-too-short"]}),
+            &mut BTreeSet::new(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn only_a_missing_first_detail_allows_summary_compilation_to_continue() {
+        assert!(index_is_waiting_for_first_detail(
+            &StoreError::InvalidDocument {
+                kind: "index",
+                message: "finalize requires at least one Detail".to_owned(),
+            }
+        ));
+        assert!(!index_is_waiting_for_first_detail(
+            &StoreError::InvalidDocument {
+                kind: "index",
+                message: "Index detail_count does not match Detail files".to_owned(),
+            }
+        ));
     }
 }

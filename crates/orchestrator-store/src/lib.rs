@@ -14,6 +14,7 @@ mod index;
 mod input;
 mod json;
 mod jsonl;
+mod lock;
 mod manifest;
 mod memory_usage;
 mod paths;
@@ -57,11 +58,11 @@ pub use experience_ledger::{
 };
 pub use index::{
     append_index_detail, create_index, deterministic_experience_index_id, experience_level,
-    finalize_index, index_path_component, read_index_details, read_indexes, record_experience_case,
-    AppendIndexDetailInput, CreateIndexInput, DetailPage, DetailQuery, DetailSection,
-    ExperienceCaseDisposition, ExperienceLevel, Index, IndexArchive, IndexDetail, IndexKind,
-    IndexPage, IndexQuery, IndexScope, RecordExperienceCaseInput, RecordExperienceCaseOutcome,
-    INDEX_DETAIL_SCHEMA_VERSION, INDEX_SCHEMA_VERSION,
+    finalize_index, index_path_component, read_all_indexes, read_index_details, read_indexes,
+    record_experience_case, AppendIndexDetailInput, CreateIndexInput, DetailPage, DetailQuery,
+    DetailSection, ExperienceCaseDisposition, ExperienceLevel, Index, IndexArchive, IndexDetail,
+    IndexKind, IndexPage, IndexQuery, IndexScope, RecordExperienceCaseInput,
+    RecordExperienceCaseOutcome, INDEX_DETAIL_SCHEMA_VERSION, INDEX_SCHEMA_VERSION,
 };
 pub use input::{
     capture_run_inputs, read_input_metadata, read_input_payload, read_input_snapshot_manifest,
@@ -73,7 +74,10 @@ pub use json::{
     canonical_json_bytes, content_hash, content_hash_bytes, seal_content_hash, set_content_hash,
     validate_content_hash, validate_content_hash_at, ContentHashDocument,
 };
-pub use jsonl::{append_jsonl, read_jsonl_recover_tail, JsonlEvent, JsonlRecord};
+pub use jsonl::{
+    append_jsonl, read_jsonl_recover_tail, read_jsonl_strict, JsonlEvent, JsonlRecord,
+};
+pub use lock::FileStoreLock;
 pub use manifest::{
     find_run_location, list_run_locations, read_run_manifest, write_run_manifest,
     FinalizedArtifactRef, ManifestError, PhaseStatus, RunLocation, RunManifest, RunManifestInit,

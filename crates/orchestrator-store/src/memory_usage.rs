@@ -8,8 +8,8 @@ use orchestrator_core::{
 };
 
 use crate::{
-    append_jsonl, content_hash, ContentHashDocument, FileStore, JsonlRecord, Result, RunLocation,
-    SafeSlug, StoreError, Versioned,
+    content_hash, ContentHashDocument, FileStore, JsonlRecord, Result, RunLocation, SafeSlug,
+    StoreError, Versioned,
 };
 
 impl JsonlRecord for MemoryUsageEventV1 {
@@ -88,25 +88,29 @@ impl MemoryUsageLedger {
     pub fn append(&self, mut event: MemoryUsageEventV1) -> Result<MemoryUsageEventV1> {
         validate_event(&event)?;
         let path = event_path(&self.location, &event.unit_key)?;
-        let events = if self.store.exists(&path)? {
-            crate::read_jsonl_recover_tail::<MemoryUsageEventV1>(self.store.root(), &path)?
-        } else {
-            Vec::new()
-        };
-        let next = events.last().map_or(1, |event| event.sequence + 1);
-        event.sequence = next;
-        event.event_id = content_hash(&serde_json::json!({
-            "unit": event.unit_key,
-            "sequence": next,
-            "kind": event.kind,
-            "query": event.lexical_query,
-            "expanded": event.expanded_pattern_id,
-        }))?;
-        event.content_hash = content_hash(
-            &serde_json::to_value(&event).map_err(|source| StoreError::JsonSerialize { source })?,
-        )?;
-        append_jsonl(self.store.root(), &path, &event)?;
-        Ok(event)
+        Ok(
+            crate::jsonl::append_jsonl_transaction::<MemoryUsageEventV1>(
+                self.store.root(),
+                &path,
+                move |events| {
+                    let next = events.last().map_or(1, |event| event.sequence + 1);
+                    event.sequence = next;
+                    event.event_id = content_hash(&serde_json::json!({
+                        "unit": event.unit_key,
+                        "sequence": next,
+                        "kind": event.kind,
+                        "query": event.lexical_query,
+                        "expanded": event.expanded_pattern_id,
+                    }))?;
+                    event.content_hash = content_hash(
+                        &serde_json::to_value(&event)
+                            .map_err(|source| StoreError::JsonSerialize { source })?,
+                    )?;
+                    Ok(Some(event))
+                },
+            )?
+            .expect("memory usage append transaction always returns an event"),
+        )
     }
 
     pub fn read_all(&self) -> Result<Vec<MemoryUsageEventV1>> {

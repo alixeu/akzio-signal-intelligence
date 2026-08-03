@@ -59,9 +59,11 @@ pub enum InputSource {
 
 impl InputSource {
     pub fn technical(ticker: impl Into<String>, interval: impl Into<String>) -> Result<Self> {
+        let ticker = ticker.into();
+        let interval = interval.into();
         let source = Self::Technical {
-            ticker: ticker.into(),
-            interval: interval.into(),
+            ticker: canonical_technical_ticker(&ticker)?,
+            interval: canonical_technical_interval(&interval)?,
         };
         source.validate()?;
         Ok(source)
@@ -116,7 +118,11 @@ impl InputSource {
 
     fn stable_key(&self) -> String {
         match self {
-            Self::Technical { ticker, interval } => format!("technical\0{ticker}\0{interval}"),
+            Self::Technical { ticker, interval } => format!(
+                "technical\0{}\0{}",
+                ticker.trim().to_ascii_uppercase(),
+                interval.trim().to_ascii_lowercase()
+            ),
             Self::Jin10 {
                 workflow_date,
                 format,
@@ -127,10 +133,12 @@ impl InputSource {
     fn validate(&self) -> Result<()> {
         match self {
             Self::Technical { ticker, interval } => {
-                if ticker.trim().is_empty() || interval.trim().is_empty() {
+                let canonical_ticker = canonical_technical_ticker(ticker)?;
+                let canonical_interval = canonical_technical_interval(interval)?;
+                if ticker != &canonical_ticker || interval != &canonical_interval {
                     return Err(invalid(
                         "technical input source",
-                        "ticker and interval must not be empty",
+                        "ticker must be uppercase and interval must be lowercase without surrounding whitespace",
                     ));
                 }
             }
@@ -449,6 +457,7 @@ pub fn capture_run_inputs(
     if store.exists(&manifest_relative)? {
         let manifest = read_input_snapshot_manifest(store, location)?;
         manifest.validate_requested_sources(sources)?;
+        validate_run_snapshot_payloads(store, &manifest)?;
         return Ok(manifest);
     }
 
@@ -483,6 +492,24 @@ pub fn read_input_snapshot_manifest(
     )?;
     manifest.validate_for_location(location)?;
     Ok(manifest)
+}
+
+fn validate_run_snapshot_payloads(
+    store: &FileStore,
+    manifest: &InputSnapshotManifest,
+) -> Result<()> {
+    for snapshot in &manifest.inputs {
+        let payload_relative = Path::new(&snapshot.payload_relative_path);
+        let payload = store.read_bytes(payload_relative)?;
+        verify_payload(
+            "bound input",
+            payload_relative,
+            &payload,
+            &snapshot.source_payload_hash,
+            snapshot.payload_bytes,
+        )?;
+    }
+    Ok(())
 }
 
 /// Read the immutable run-local copy and verify it against the run manifest.
@@ -591,6 +618,21 @@ fn readable_component(kind: &'static str, value: &str) -> Result<String> {
     Ok(value.to_ascii_lowercase())
 }
 
+fn canonical_technical_ticker(value: &str) -> Result<String> {
+    Ok(readable_component("ticker", value)?.to_ascii_uppercase())
+}
+
+fn canonical_technical_interval(value: &str) -> Result<String> {
+    let interval = value.trim().to_ascii_lowercase();
+    if orchestrator_core::interval_file_label(&interval).is_none() {
+        return Err(invalid(
+            "technical input source",
+            "interval is not supported",
+        ));
+    }
+    Ok(interval)
+}
+
 fn invalid(kind: &'static str, message: impl Into<String>) -> StoreError {
     StoreError::InvalidDocument {
         kind,
@@ -682,6 +724,19 @@ mod tests {
     }
 
     #[test]
+    fn technical_source_identity_is_canonicalized_before_snapshotting() {
+        let canonical = InputSource::technical(" QqQ ", " DAILY ").unwrap();
+        assert_eq!(
+            canonical,
+            InputSource::Technical {
+                ticker: "QQQ".to_owned(),
+                interval: "daily".to_owned(),
+            }
+        );
+        assert!(InputSource::technical("QQQ", "unsupported").is_err());
+    }
+
+    #[test]
     fn run_snapshot_survives_a_source_change_after_capture() {
         let (_directory, store) = store();
         let source = InputSource::technical("QQQ", "daily").unwrap();
@@ -741,6 +796,13 @@ mod tests {
             )
             .unwrap();
         assert!(read_snapshotted_input(&store, &location(), &source).is_err());
+        assert!(capture_run_inputs(
+            &store,
+            &location(),
+            std::slice::from_ref(&source),
+            "2026-07-27T00:02:00Z",
+        )
+        .is_err());
     }
 
     #[test]

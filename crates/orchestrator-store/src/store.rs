@@ -165,6 +165,19 @@ impl FileStore {
         append_jsonl(&self.root, relative, record)
     }
 
+    /// Serialize a read-modify-write operation for one store-relative
+    /// document across processes.  The caller must hold the returned guard
+    /// across both its read and its authoritative write.
+    pub fn lock_exclusive(&self, relative: &Path) -> Result<crate::FileStoreLock> {
+        crate::lock::lock_exclusive(&self.root, relative)
+    }
+
+    /// Hold a shared lock while reading a document that may otherwise be
+    /// recovered or appended by another process.
+    pub fn lock_shared(&self, relative: &Path) -> Result<crate::FileStoreLock> {
+        crate::lock::lock_shared(&self.root, relative)
+    }
+
     pub fn exists(&self, relative: &Path) -> Result<bool> {
         match resolve_existing(&self.root, relative) {
             Ok(path) => Ok(path.exists()),

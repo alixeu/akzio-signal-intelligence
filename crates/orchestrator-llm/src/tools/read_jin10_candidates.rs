@@ -46,12 +46,8 @@ pub fn execute(args: Value, config: &ExternalToolConfig) -> Result<Value> {
     } else {
         args.tickers
     };
-    let rows = if let Some(snapshot) = &config.file_store_input {
-        let source = InputSource::jin10(snapshot.current_date.clone(), Jin10Format::Csv)?;
-        let payload = snapshot.read(&source)?;
-        let raw =
-            std::str::from_utf8(&payload).context("snapshotted Jin10 CSV is not valid UTF-8")?;
-        orchestrator_core::parse_jin10_csv(raw)?
+    let rows = if let Some(rows) = read_snapshotted_rows(config)? {
+        rows
     } else {
         orchestrator_core::load_jin10_csv_recent_from_dir(
             &config
@@ -105,6 +101,21 @@ pub fn execute(args: Value, config: &ExternalToolConfig) -> Result<Value> {
     };
     log_tool_result(NAME, &Ok(result.clone()));
     Ok(result)
+}
+
+/// Return the Jin10 rows sealed for this run, when this role has a FileStore
+/// input binding.  Callers that need a run-local provenance guarantee must not
+/// fall back to the mutable project-root CSV when this returns `None`.
+pub(crate) fn read_snapshotted_rows(
+    config: &ExternalToolConfig,
+) -> Result<Option<Vec<orchestrator_core::Jin10CsvRow>>> {
+    let Some(snapshot) = &config.file_store_input else {
+        return Ok(None);
+    };
+    let source = InputSource::jin10(snapshot.current_date.clone(), Jin10Format::Csv)?;
+    let payload = snapshot.read(&source)?;
+    let raw = std::str::from_utf8(&payload).context("snapshotted Jin10 CSV is not valid UTF-8")?;
+    Ok(Some(orchestrator_core::parse_jin10_csv(raw)?))
 }
 
 fn candidate_priority(content: &str, tickers: &[String]) -> u8 {

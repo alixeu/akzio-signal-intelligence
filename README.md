@@ -281,7 +281,10 @@ export ALPACA_API_SECRET='...'
 普通 Paper 运行还必须显式使用 `--submit-orders` 才会真正提交已持久化的
 订单计划；`debug_starting_cash` 只控制 debug 模拟账户。
 
-报告邮件凭证只有 `report-email` 需要:
+报告邮件默认关闭，渲染报告不会发送任何外部消息。发送需要同时满足
+`report.email.enabled=true`、显式 `report-email --mode build-and-send`（或
+`run-daily-tqqq-report --send-report`），以及健康完成、非 degraded 的 Phase 8
+运行。报告邮件凭证只有显式发送时需要:
 
 ```bash
 export REPORT_SMTP_USERNAME='...'

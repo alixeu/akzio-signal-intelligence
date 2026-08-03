@@ -1,5 +1,6 @@
 use super::{
-    api_tool_name, log_tool_result, web_run, ExternalToolConfig, ToolDefinition, WebRunRuntime,
+    api_tool_name, log_tool_result, read_jin10_candidates, web_run, ExternalToolConfig,
+    ToolDefinition, WebRunRuntime,
 };
 use anyhow::{bail, Context, Result};
 use orchestrator_core::ToolId;
@@ -81,7 +82,7 @@ pub async fn execute(
     }) {
         bail!("verify_event received unsupported missing_fields");
     }
-    let event = event_context(args.event_id.as_deref(), &args.observed_claim, config);
+    let event = event_context(args.event_id.as_deref(), &args.observed_claim, config)?;
     let queries = fields
         .iter()
         .map(|field| {
@@ -113,24 +114,26 @@ fn event_context(
     event_id: Option<&str>,
     observed_claim: &str,
     config: &ExternalToolConfig,
-) -> Value {
+) -> Result<Value> {
     let event_id = event_id.map(str::trim).filter(|value| !value.is_empty());
-    let candidate = event_id.and_then(|id| {
-        orchestrator_core::load_jin10_csv_recent_from_dir(
-            &config
-                .project_root
-                .join(orchestrator_core::DEFAULT_JIN10_CSV_DIR),
-            3,
-        )
-        .into_iter()
-        .find(|row| row.id == id)
-    });
-    json!({
+    // Event context is advisory input to a Web query.  When a FileStore input
+    // binding exists, it must come from that run's sealed payload; when it
+    // does not, rely on the caller-supplied observation rather than reopening
+    // mutable project-root Jin10 files.
+    let candidate = if let Some(event_id) = event_id {
+        read_jin10_candidates::read_snapshotted_rows(config)?
+            .into_iter()
+            .flatten()
+            .find(|row| row.id == event_id)
+    } else {
+        None
+    };
+    Ok(json!({
         "event_id": event_id,
         "candidate_time": candidate.as_ref().map(|row| &row.time),
         "candidate_content": candidate.as_ref().map(|row| &row.content),
         "observed_claim": observed_claim
-    })
+    }))
 }
 
 fn verification_query(field: &str, event: &Value, args: &Args) -> String {
@@ -156,6 +159,9 @@ fn verification_query(field: &str, event: &Value, args: &Args) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use orchestrator_store::{
+        capture_run_inputs, write_input_payload, FileStore, InputSource, Jin10Format, RunLocation,
+    };
 
     #[tokio::test]
     async fn returns_a_safe_gap_when_search_is_disabled() {
@@ -168,5 +174,57 @@ mod tests {
         .unwrap();
         assert_eq!(result["status"], "data_gap");
         assert_eq!(result["missing_fields"][0], "actual_vs_expected");
+    }
+
+    #[tokio::test]
+    async fn event_context_uses_the_sealed_jin10_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = FileStore::open(temp.path(), Default::default()).unwrap();
+        let source = InputSource::jin10("2026-07-27", Jin10Format::Csv).unwrap();
+        write_input_payload(
+            &store,
+            source.clone(),
+            b"id,time,content\nevent-1,2026-07-27 09:00:00,sealed CPI update\n",
+            "2026-07-27T00:00:00Z",
+        )
+        .unwrap();
+        let location = RunLocation::new("2026-07-27", "run-verify-event-test").unwrap();
+        capture_run_inputs(
+            &store,
+            &location,
+            std::slice::from_ref(&source),
+            "2026-07-27T00:00:00Z",
+        )
+        .unwrap();
+        write_input_payload(
+            &store,
+            source,
+            b"id,time,content\nevent-1,2026-07-27 10:00:00,mutated CPI update\n",
+            "2026-07-27T00:01:00Z",
+        )
+        .unwrap();
+
+        let result = execute(
+            json!({
+                "event_id": "event-1",
+                "observed_claim": "CPI surprise",
+                "missing_fields": ["actual_vs_expected"]
+            }),
+            &ExternalToolConfig {
+                file_store_input: Some(super::super::FileStoreInputSnapshot {
+                    store_root: temp.path().to_path_buf(),
+                    run_id: "run-verify-event-test".to_owned(),
+                    current_date: "2026-07-27".to_owned(),
+                    storage_namespace: None,
+                }),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result["event"]["candidate_content"], "sealed CPI update");
+        assert_eq!(result["event"]["candidate_time"], "2026-07-27 09:00:00");
     }
 }

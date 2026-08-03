@@ -407,11 +407,15 @@ pub fn append_session_event(
 ) -> Result<SessionEvent> {
     session.validate_for_location(location)?;
     let events_relative = location.turn_events_relative(&input.turn_id)?;
-    let previous = read_jsonl_recover_tail::<SessionEvent>(store.root(), &events_relative)?;
-    let sequence = previous.last().map_or(1, |event| event.sequence + 1);
-    let event = SessionEvent::new(sequence, session, input)?;
-    store.append_jsonl(&events_relative, &event)?;
-    Ok(event)
+    Ok(crate::jsonl::append_jsonl_transaction::<SessionEvent>(
+        store.root(),
+        &events_relative,
+        move |previous| {
+            let sequence = previous.last().map_or(1, |event| event.sequence + 1);
+            Ok(Some(SessionEvent::new(sequence, session, input)?))
+        },
+    )?
+    .expect("session event append transaction always returns an event"))
 }
 
 pub fn read_session_events(

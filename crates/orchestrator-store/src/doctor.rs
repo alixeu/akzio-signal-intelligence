@@ -19,7 +19,7 @@ use orchestrator_core::{
 };
 
 use crate::{
-    content_hash_bytes, read_indexes, read_jsonl_recover_tail,
+    content_hash_bytes, read_all_indexes, read_jsonl_strict,
     rebuild_manifest_from_finalized_artifacts, validate_content_hash_at, validate_relative_path,
     write_run_manifest, ArtifactDraft, ContentHashDocument, DetailSection, ExperienceEventV1,
     ExperienceViewV1, FileSchemaKind, FileStore, FinalizedArtifactRef, Index, IndexArchive,
@@ -125,8 +125,9 @@ impl ContentHashDocument for ExperienceStats {
 
 /// Walk every store-owned file without following symbolic links, validate the
 /// generic envelope, then apply the cross-file checks that have enough typed
-/// context to be meaningful.  This operation may repair exactly one
-/// unterminated final JSONL line per log, matching normal read semantics.
+/// context to be meaningful. Inspection is read-only: unterminated JSONL
+/// tails are reported as corruption and may be repaired only by an explicit
+/// recovery operation.
 pub fn inspect_store(store: &FileStore) -> StoreDoctorReport {
     let mut report = StoreDoctorReport::default();
     let files = match collect_files(store.root()) {
@@ -186,6 +187,9 @@ fn collect_files_inner(root: &Path, directory: &Path, output: &mut Vec<PathBuf>)
             return Err(StoreError::SymlinkPath { path });
         }
         if metadata.is_dir() {
+            if path == root.join(".locks") {
+                continue;
+            }
             collect_files_inner(root, &path, output)?;
         } else if metadata.is_file() {
             let relative = path
@@ -241,44 +245,31 @@ fn inspect_file_envelope(store: &FileStore, relative: &Path, report: &mut StoreD
         .is_some_and(|extension| extension == "jsonl")
     {
         report.checked_files += 1;
-        let before = fs::metadata(&absolute).ok().map(|metadata| metadata.len());
         let parsed = if relative
             .components()
             .any(|component| component.as_os_str() == "sessions")
         {
-            read_jsonl_recover_tail::<SessionEvent>(store.root(), relative).map(|_| ())
+            read_jsonl_strict::<SessionEvent>(store.root(), relative).map(|_| ())
         } else if relative
             .components()
             .any(|component| component.as_os_str() == "reflection")
         {
-            read_jsonl_recover_tail::<ReflectionTaskEventV1>(store.root(), relative).map(|_| ())
+            read_jsonl_strict::<ReflectionTaskEventV1>(store.root(), relative).map(|_| ())
         } else if relative
             .components()
             .any(|component| component.as_os_str() == "experiences")
         {
-            read_jsonl_recover_tail::<ExperienceEventV1>(store.root(), relative).map(|_| ())
+            read_jsonl_strict::<ExperienceEventV1>(store.root(), relative).map(|_| ())
         } else if relative
             .components()
             .any(|component| component.as_os_str() == "memory")
         {
-            read_jsonl_recover_tail::<MemoryUsageEventV1>(store.root(), relative).map(|_| ())
+            read_jsonl_strict::<MemoryUsageEventV1>(store.root(), relative).map(|_| ())
         } else {
-            read_jsonl_recover_tail::<JsonlEvent>(store.root(), relative).map(|_| ())
+            read_jsonl_strict::<JsonlEvent>(store.root(), relative).map(|_| ())
         };
         match parsed {
-            Ok(()) => {
-                if before
-                    .zip(fs::metadata(&absolute).ok().map(|metadata| metadata.len()))
-                    .is_some_and(|(before, after)| after < before)
-                {
-                    report.recovered_jsonl_tails += 1;
-                    report.issue(
-                        "recovered_jsonl_tail",
-                        relative,
-                        "discarded one incomplete final JSONL line",
-                    );
-                }
-            }
+            Ok(()) => {}
             Err(error) => report.issue("malformed_jsonl", relative, error.to_string()),
         }
     }
@@ -606,7 +597,7 @@ fn terminal_ids_for_run(
                 .extension()
                 .is_some_and(|extension| extension == "jsonl")
     }) {
-        match read_jsonl_recover_tail::<SessionEvent>(store.root(), relative) {
+        match read_jsonl_strict::<SessionEvent>(store.root(), relative) {
             Ok(events) => collect_terminal_ids(events, &mut ids),
             Err(error) => report.issue("malformed_jsonl", relative, error.to_string()),
         }
@@ -1316,17 +1307,14 @@ pub fn rebuild_run_manifest(store: &FileStore, init: RunManifestInit) -> Result<
     // completed Index remains canonical; its Rust-owned unit key lets a
     // missing manifest recover the exact fixed planner unit without asking a
     // model or reconstructing identity from prose.
-    for index in read_indexes(
+    for index in read_all_indexes(
         store,
         Some(&location),
         &IndexQuery {
             kind: Some(IndexKind::PhaseSummary),
-            limit: 256,
             ..Default::default()
         },
-    )?
-    .indexes
-    {
+    )? {
         if let Some(unit_key) = index
             .authoritative_fields
             .get("unit_key")
@@ -1367,17 +1355,14 @@ pub fn rebuild_index_catalog(
         IndexKind::Experience => PathBuf::from("knowledge/experience"),
     };
     let mut entries = Vec::new();
-    for index in read_indexes(
+    for index in read_all_indexes(
         store,
         run,
         &IndexQuery {
             kind: Some(kind),
-            limit: 100,
             ..Default::default()
         },
-    )?
-    .indexes
-    {
+    )? {
         entries.push(IndexCatalogEntry {
             index_id: index.index_id,
             source_phase: index.source_phase,
@@ -1694,7 +1679,7 @@ mod tests {
     }
 
     #[test]
-    fn doctor_preserves_one_incomplete_jsonl_tail_and_rejects_middle_corruption() {
+    fn doctor_reports_an_incomplete_jsonl_tail_without_mutating_it() {
         let temp = tempdir().unwrap();
         let store = FileStore::open(temp.path(), Default::default()).unwrap();
         store
@@ -1703,11 +1688,14 @@ mod tests {
                 b"{",
             )
             .unwrap();
+        let path = Path::new("runs/2026-07-27/run-x/sessions/session-x/turn.jsonl");
+        let before = store.read_bytes(path).unwrap();
         let report = inspect_store(&store);
-        assert_eq!(report.recovered_jsonl_tails, 1);
+        assert_eq!(report.recovered_jsonl_tails, 0);
         assert!(report
             .issues
             .iter()
-            .any(|DoctorIssue { code, .. }| code == "recovered_jsonl_tail"));
+            .any(|DoctorIssue { code, .. }| code == "malformed_jsonl"));
+        assert_eq!(store.read_bytes(path).unwrap(), before);
     }
 }

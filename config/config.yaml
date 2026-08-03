@@ -159,7 +159,9 @@ jin10:
 
 report:
   email:
-    enabled: true
+    # Sending is opt-in: the CLI also requires an explicit send mode and only
+    # accepts a healthy, completed Phase 8 run.
+    enabled: false
     smtp_url: smtps://smtp.mail.me.com:465
     username: ${REPORT_SMTP_USERNAME}
     password: ${REPORT_SMTP_PASSWORD}

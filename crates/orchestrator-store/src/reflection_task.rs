@@ -10,8 +10,8 @@ use orchestrator_core::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    append_jsonl, content_hash, ContentHashDocument, FileSchemaKind, FileStore, JsonlRecord,
-    Result, SafeSlug, StoreError, Versioned,
+    content_hash, ContentHashDocument, FileSchemaKind, FileStore, JsonlRecord, Result, SafeSlug,
+    StoreError, Versioned,
 };
 
 pub const REFLECTION_TASK_EVENT_SCHEMA_VERSION: u32 = 1;
@@ -114,6 +114,7 @@ impl ReflectionTaskLedger {
         validate_key(&key, &outcome_ref)?;
         let task_id = content_hash(&serde_json::json!({"key": key}))?;
         let path = task_path(&task_id)?;
+        let _lock = self.store.lock_exclusive(&path)?;
         if self.store.exists(&path)? {
             return self
                 .store
@@ -220,10 +221,12 @@ impl ReflectionTaskLedger {
             ReflectionDisposition::Contested => ReflectionTaskStatus::Contested,
         };
         self.transition(task_id, actor_run_id, now, |task| {
-            if task.status != ReflectionTaskStatus::Claimed {
+            if task.status != ReflectionTaskStatus::Claimed
+                || task.claimed_by_run_id.as_deref() != Some(actor_run_id)
+            {
                 return Err(invalid(
                     "reflection task",
-                    "only a claimed task may complete",
+                    "only this run's claimed task may complete",
                 ));
             }
             task.status = status;
@@ -242,10 +245,12 @@ impl ReflectionTaskLedger {
         now: &str,
     ) -> Result<ReflectionTaskV1> {
         self.transition(task_id, actor_run_id, now, |task| {
-            if task.status != ReflectionTaskStatus::Claimed {
+            if task.status != ReflectionTaskStatus::Claimed
+                || task.claimed_by_run_id.as_deref() != Some(actor_run_id)
+            {
                 return Err(invalid(
                     "reflection task",
-                    "only a claimed task may become duplicate",
+                    "only this run's claimed task may become duplicate",
                 ));
             }
             task.status = ReflectionTaskStatus::Duplicate;
@@ -303,6 +308,7 @@ impl ReflectionTaskLedger {
         write_case: impl FnOnce() -> Result<crate::ExperienceCaseDisposition>,
     ) -> Result<ReflectionTaskV1> {
         let path = task_path(task_id)?;
+        let _lock = self.store.lock_exclusive(&path)?;
         let mut task: ReflectionTaskV1 = self
             .store
             .read_versioned_json(&path, FileSchemaKind::ReflectionTask)?;
@@ -404,6 +410,7 @@ impl ReflectionTaskLedger {
     pub fn write_artifact(&self, artifact: HistoricalReflectionArtifactV1) -> Result<DocumentRef> {
         validate_artifact(&artifact)?;
         let relative = artifact_path(&artifact.artifact_id)?;
+        let _lock = self.store.lock_exclusive(&relative)?;
         let sealed = crate::seal_content_hash(artifact.clone())?;
         if self.store.exists(&relative)? {
             let existing: HistoricalReflectionArtifactV1 = self
@@ -437,6 +444,7 @@ impl ReflectionTaskLedger {
         apply: impl FnOnce(&mut ReflectionTaskV1) -> Result<bool>,
     ) -> Result<Option<ReflectionTaskV1>> {
         let path = task_path(task_id)?;
+        let _lock = self.store.lock_exclusive(&path)?;
         let mut task: ReflectionTaskV1 = self
             .store
             .read_versioned_json(&path, FileSchemaKind::ReflectionTask)?;
@@ -465,28 +473,30 @@ impl ReflectionTaskLedger {
         now: &str,
     ) -> Result<()> {
         let events = event_path(&task.task_id)?;
-        let sequence = if self.store.exists(&events)? {
-            crate::read_jsonl_recover_tail::<ReflectionTaskEventV1>(self.store.root(), &events)?
-                .last()
-                .map_or(1, |event| event.sequence + 1)
-        } else {
-            1
-        };
-        let mut event = ReflectionTaskEventV1 {
-            schema_version: REFLECTION_TASK_EVENT_SCHEMA_VERSION,
-            sequence,
-            task_id: task.task_id.clone(),
-            from_status: from,
-            to_status: task.status,
-            actor_run_id: actor.map(ToOwned::to_owned),
-            reason,
-            created_at: now.to_owned(),
-            content_hash: String::new(),
-        };
-        event.content_hash = content_hash(
-            &serde_json::to_value(&event).map_err(|source| StoreError::JsonSerialize { source })?,
+        crate::jsonl::append_jsonl_transaction::<ReflectionTaskEventV1>(
+            self.store.root(),
+            &events,
+            move |previous| {
+                let sequence = previous.last().map_or(1, |event| event.sequence + 1);
+                let mut event = ReflectionTaskEventV1 {
+                    schema_version: REFLECTION_TASK_EVENT_SCHEMA_VERSION,
+                    sequence,
+                    task_id: task.task_id.clone(),
+                    from_status: from,
+                    to_status: task.status,
+                    actor_run_id: actor.map(ToOwned::to_owned),
+                    reason,
+                    created_at: now.to_owned(),
+                    content_hash: String::new(),
+                };
+                event.content_hash = content_hash(
+                    &serde_json::to_value(&event)
+                        .map_err(|source| StoreError::JsonSerialize { source })?,
+                )?;
+                Ok(Some(event))
+            },
         )?;
-        append_jsonl(self.store.root(), &events, &event)
+        Ok(())
     }
 }
 
@@ -631,6 +641,8 @@ fn validate_artifact(artifact: &HistoricalReflectionArtifactV1) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Barrier};
+
     use super::*;
     use orchestrator_core::PolicyRef;
     use tempfile::tempdir;
@@ -691,6 +703,89 @@ mod tests {
             .claim(&first.task_id, "other", "2026-01-03T00:00:00Z")
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn only_the_claiming_run_may_complete_or_mark_a_task_duplicate() {
+        let temp = tempdir().unwrap();
+        let store = FileStore::open(temp.path(), crate::FileStoreOptions::default()).unwrap();
+        let ledger = ReflectionTaskLedger::new(store);
+        let task = ledger
+            .create_or_read(key(), outcome_ref(), "2026-01-01T00:00:00Z")
+            .unwrap();
+        ledger
+            .claim(&task.task_id, "run-a", "2026-01-02T00:00:00Z")
+            .unwrap();
+        let artifact = DocumentRef {
+            document_id: "artifact".into(),
+            relative_path: "knowledge/reflection/artifacts/artifact.json".into(),
+            content_hash: "sha256:artifact".into(),
+        };
+
+        assert!(ledger
+            .mark_duplicate(
+                &task.task_id,
+                "run-b",
+                artifact.clone(),
+                "2026-01-02T00:01:00Z",
+            )
+            .is_err());
+        assert!(ledger
+            .complete(
+                &task.task_id,
+                "run-b",
+                ReflectionDisposition::NoReusableMemory,
+                artifact,
+                None,
+                "2026-01-02T00:01:00Z",
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn concurrent_claims_have_exactly_one_owner_and_a_complete_event_log() {
+        let temp = tempdir().unwrap();
+        let store = FileStore::open(temp.path(), crate::FileStoreOptions::default()).unwrap();
+        let ledger = ReflectionTaskLedger::new(store);
+        let task = ledger
+            .create_or_read(key(), outcome_ref(), "2026-01-01T00:00:00Z")
+            .unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+        let left = ledger.clone();
+        let right = ledger.clone();
+        let task_id = task.task_id.clone();
+
+        let (left_result, right_result) = std::thread::scope(|scope| {
+            let left_barrier = Arc::clone(&barrier);
+            let left_task_id = task_id.clone();
+            let left = scope.spawn(move || {
+                left_barrier.wait();
+                left.claim(&left_task_id, "run-left", "2026-01-02T00:00:00Z")
+            });
+            let right_barrier = Arc::clone(&barrier);
+            let right = scope.spawn(move || {
+                right_barrier.wait();
+                right.claim(&task_id, "run-right", "2026-01-02T00:00:00Z")
+            });
+            barrier.wait();
+            (left.join().unwrap(), right.join().unwrap())
+        });
+
+        assert_eq!(
+            [left_result, right_result]
+                .into_iter()
+                .filter(|result| result.as_ref().is_ok_and(Option::is_some))
+                .count(),
+            1
+        );
+        let events = crate::read_jsonl_strict::<ReflectionTaskEventV1>(
+            ledger.store.root(),
+            &event_path(&task.task_id).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].sequence, 1);
+        assert_eq!(events[1].sequence, 2);
     }
 
     #[test]

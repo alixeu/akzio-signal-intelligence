@@ -17,7 +17,7 @@ pub fn definition(name: &str) -> Option<ToolDefinition> {
     let (description, parameters) = match name {
         SUBMIT_DEBATE_TURN => (
             "Submit Bull or Bear's current position to the Topic Controller and end this turn.",
-            json!({"type":"object","additionalProperties":false,"required":["stance","message","report"],"properties":{
+            json!({"type":"object","additionalProperties":false,"required":["stance","message","evidence_refs","report"],"properties":{
                 "stance":{"type":"string","enum":["challenge","partial_agree","agree","retract","needs_evidence","no_new_info"]},
                 "message":{"type":"string","maxLength":1200}, "reply_to_node_id":{"type":"string"},
                 "evidence_refs":{"type":"array","items":{"type":"string"}},
@@ -53,37 +53,7 @@ pub fn definition(name: &str) -> Option<ToolDefinition> {
     })
 }
 
-pub fn execute(name: &str, mut args: Value) -> Result<Value> {
-    let object = args
-        .as_object_mut()
-        .context("Phase 2 stree command must be an object")?;
-    if matches!(
-        name,
-        SUBMIT_DEBATE_TURN | ROUTE_DEBATE_TURN | WAIT_FOR_DEBATE_TURN | CLOSE_DEBATE
-    ) {
-        // `report` is a compact audit copy of the command, so an omitted
-        // value can be recovered losslessly from the same command's message.
-        // Keep the agent turn terminal instead of forcing an avoidable retry.
-        let fallback_report = object
-            .get("message")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|message| !message.is_empty())
-            .unwrap_or("Phase 2 stree terminal command.")
-            .to_owned();
-        object
-            .entry("report".to_owned())
-            .or_insert(Value::String(fallback_report));
-    }
-    if name == ROUTE_DEBATE_TURN {
-        // The tree only has one valid routing fan-out. Some model providers
-        // occasionally omit a schema-required field, so canonicalize this
-        // unique default rather than turning a recoverable omission into a
-        // failed debate turn.
-        object
-            .entry("targets".to_owned())
-            .or_insert_with(|| json!(["bull", "bear"]));
-    }
+pub fn execute(name: &str, args: Value) -> Result<Value> {
     let object = args
         .as_object()
         .context("Phase 2 stree command must be an object")?;
@@ -92,6 +62,7 @@ pub fn execute(name: &str, mut args: Value) -> Result<Value> {
         SUBMIT_DEBATE_TURN => {
             required_string(object, "stance", 32)?;
             required_string(object, "message", 1_200)?;
+            required_evidence_refs(object)?;
         }
         ROUTE_DEBATE_TURN => {
             required_string(object, "reply_to_node_id", 128)?;
@@ -142,29 +113,66 @@ fn required_string(
     Ok(value)
 }
 
+fn required_evidence_refs(object: &serde_json::Map<String, Value>) -> Result<()> {
+    let references = object
+        .get("evidence_refs")
+        .and_then(Value::as_array)
+        .context("submit_debate_turn requires evidence_refs")?;
+    if references.len() > 3 {
+        bail!("submit_debate_turn permits at most three evidence_refs")
+    }
+    if references.iter().any(|reference| {
+        reference
+            .as_str()
+            .is_none_or(|reference| reference.trim().is_empty())
+    }) {
+        bail!("submit_debate_turn evidence_refs must contain non-empty strings")
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn route_defaults_to_the_required_collision_wave() {
-        let result = execute(
+    fn route_requires_explicit_required_fields() {
+        let missing_report = execute(
             ROUTE_DEBATE_TURN,
             json!({
+                "targets": ["bull", "bear"],
                 "reply_to_node_id": "topic-a:stree:4",
                 "message": "Both sides must address the opposing opening."
             }),
         )
-        .unwrap();
+        .unwrap_err();
+        assert!(missing_report.to_string().contains("non-empty report"));
 
-        assert_eq!(
-            result.pointer("/artifact/phase2_stree/payload/targets"),
-            Some(&json!(["bull", "bear"]))
-        );
-        assert_eq!(
-            result.pointer("/artifact/phase2_stree/payload/report"),
-            Some(&json!("Both sides must address the opposing opening."))
-        );
+        let missing_targets = execute(
+            ROUTE_DEBATE_TURN,
+            json!({
+                "reply_to_node_id": "topic-a:stree:4",
+                "message": "Both sides must address the opposing opening.",
+                "report": "Controller requests a collision wave."
+            }),
+        )
+        .unwrap_err();
+        assert!(missing_targets.to_string().contains("requires targets"));
+    }
+
+    #[test]
+    fn submission_requires_an_explicit_evidence_array() {
+        let error = execute(
+            SUBMIT_DEBATE_TURN,
+            json!({
+                "stance": "needs_evidence",
+                "message": "The claim needs a verified source.",
+                "report": "No evidence is claimed without an explicit empty array."
+            }),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("requires evidence_refs"));
     }
 
     #[test]

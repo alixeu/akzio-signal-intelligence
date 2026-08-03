@@ -1042,10 +1042,7 @@ pub fn read_indexes(
             })?;
             let index = if file_type.is_dir() {
                 let relative = directory.join(entry.file_name()).join("index.json");
-                match store.read_versioned_json(&relative, crate::FileSchemaKind::Index) {
-                    Ok(value) => value,
-                    Err(_) => continue,
-                }
+                store.read_versioned_json(&relative, crate::FileSchemaKind::Index)?
             } else if file_type.is_file()
                 && (entry.file_name().to_string_lossy().starts_with("idx-")
                     || entry.file_name().to_string_lossy().starts_with("index-"))
@@ -1055,13 +1052,10 @@ pub fn read_indexes(
                     .is_some_and(|value| value == "json")
             {
                 let relative = directory.join(entry.file_name());
-                let archive: IndexArchive = match store.read_versioned_json(
+                let archive: IndexArchive = store.read_versioned_json(
                     &relative,
                     crate::FileSchemaKind::Artifact("index_archive".to_owned()),
-                ) {
-                    Ok(value) => value,
-                    Err(_) => continue,
-                };
+                )?;
                 let Some(location) = run else {
                     continue;
                 };
@@ -1083,6 +1077,43 @@ pub fn read_indexes(
         indexes: found[start..end].to_vec(),
         next_cursor: (end < found.len()).then(|| end.to_string()),
     })
+}
+
+/// Read every finalized Index matching an internal query. Public/model-facing
+/// callers must retain their explicit page bounds; maintenance, recovery, and
+/// provenance code can use this helper when omission would be incorrect.
+pub fn read_all_indexes(
+    store: &FileStore,
+    run: Option<&RunLocation>,
+    query: &IndexQuery,
+) -> Result<Vec<Index>> {
+    let mut page_query = query.clone();
+    page_query.limit = 100;
+    let mut cursor = query.cursor;
+    let mut indexes = Vec::new();
+    loop {
+        page_query.cursor = cursor;
+        let page = read_indexes(store, run, &page_query)?;
+        indexes.extend(page.indexes);
+        let Some(next_cursor) = page.next_cursor else {
+            return Ok(indexes);
+        };
+        let next = next_cursor
+            .parse::<usize>()
+            .map_err(|_| StoreError::InvalidDocument {
+                kind: "index page",
+                message: format!("read_indexes returned a non-numeric cursor {next_cursor:?}"),
+            })?;
+        if next <= cursor {
+            return Err(StoreError::InvalidDocument {
+                kind: "index page",
+                message: format!(
+                    "read_indexes cursor did not advance: current {cursor}, next {next}"
+                ),
+            });
+        }
+        cursor = next;
+    }
 }
 
 fn matches_query(index: &Index, q: &IndexQuery) -> bool {
@@ -1239,6 +1270,62 @@ mod tests {
             1
         );
     }
+
+    #[test]
+    fn read_all_indexes_advances_past_the_single_page_cap() {
+        let temp = tempdir().unwrap();
+        let store = FileStore::open(temp.path(), Default::default()).unwrap();
+        let location = RunLocation::new("2026-07-27", "run").unwrap();
+        for sequence in 0..101 {
+            let mut item = scope(location.clone());
+            item.index_id = format!("idx-{sequence:03}");
+            item.source_payload_hash = format!("source-{sequence}");
+            create_index(
+                &store,
+                CreateIndexInput {
+                    scope: item.clone(),
+                    summary: format!("summary {sequence}"),
+                    confidence: 0.7,
+                    pattern_key: None,
+                    applies_to_phases: vec![3],
+                },
+            )
+            .unwrap();
+            append_index_detail(
+                &store,
+                AppendIndexDetailInput {
+                    scope: item.clone(),
+                    section: DetailSection::Evidence,
+                    detail: format!("evidence {sequence}"),
+                    source_refs: Vec::new(),
+                },
+            )
+            .unwrap();
+            finalize_index(&store, &item).unwrap();
+        }
+
+        let first_page = read_indexes(
+            &store,
+            Some(&location),
+            &IndexQuery {
+                limit: 100,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(first_page.indexes.len(), 100);
+        assert_eq!(first_page.next_cursor.as_deref(), Some("100"));
+        let all = read_all_indexes(&store, Some(&location), &IndexQuery::default()).unwrap();
+        assert_eq!(all.len(), 101);
+        assert_eq!(
+            all.first().map(|index| index.index_id.as_str()),
+            Some("idx-000")
+        );
+        assert_eq!(
+            all.last().map(|index| index.index_id.as_str()),
+            Some("idx-100")
+        );
+    }
     #[test]
     fn incomplete_draft_is_not_visible() {
         let temp = tempdir().unwrap();
@@ -1266,6 +1353,48 @@ mod tests {
         .unwrap()
         .indexes
         .is_empty());
+    }
+
+    #[test]
+    fn finalized_index_corruption_is_not_silently_omitted() {
+        let temp = tempdir().unwrap();
+        let store = FileStore::open(temp.path(), Default::default()).unwrap();
+        let scope = scope(RunLocation::new("2026-07-27", "run").unwrap());
+        create_index(
+            &store,
+            CreateIndexInput {
+                scope: scope.clone(),
+                summary: "summary".to_owned(),
+                confidence: 0.7,
+                pattern_key: None,
+                applies_to_phases: vec![3],
+            },
+        )
+        .unwrap();
+        append_index_detail(
+            &store,
+            AppendIndexDetailInput {
+                scope: scope.clone(),
+                section: DetailSection::Evidence,
+                detail: "evidence".to_owned(),
+                source_refs: Vec::new(),
+            },
+        )
+        .unwrap();
+        finalize_index(&store, &scope).unwrap();
+        store
+            .write_bytes(&index_path(&final_dir(&scope).unwrap()), b"not-json")
+            .unwrap();
+
+        assert!(read_indexes(
+            &store,
+            scope.location.as_ref(),
+            &IndexQuery {
+                limit: 20,
+                ..Default::default()
+            }
+        )
+        .is_err());
     }
 
     #[test]

@@ -9,8 +9,8 @@ use orchestrator_core::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    append_jsonl, content_hash, ContentHashDocument, FileStore, JsonlRecord, Result, SafeSlug,
-    StoreError, Versioned,
+    content_hash, ContentHashDocument, FileStore, JsonlRecord, Result, SafeSlug, StoreError,
+    Versioned,
 };
 
 pub const EXPERIENCE_EVENT_SCHEMA_VERSION: u32 = 3;
@@ -108,28 +108,34 @@ impl ExperienceLedger {
     pub fn append(&self, mut event: ExperienceEventV1) -> Result<ExperienceEventV1> {
         validate_event_fields(&event)?;
         let path = event_path(&event.pattern_id)?;
-        let existing = if self.store.exists(&path)? {
-            crate::read_jsonl_recover_tail::<ExperienceEventV1>(self.store.root(), &path)?
-        } else {
-            Vec::new()
-        };
-        if let Some(previous) = existing.iter().find(|previous| {
-            previous.operation == event.operation
-                && previous.source_run_id == event.source_run_id
-                && previous.outcome_id == event.outcome_id
-        }) {
-            return Ok(previous.clone());
-        }
-        let next = existing.last().map_or(1, |item| item.sequence + 1);
-        event.sequence = next;
-        event.event_id = content_hash(
-            &serde_json::json!({"pattern": event.pattern_id, "sequence": next, "operation": event.operation, "source": event.source_run_id, "outcome": event.outcome_id}),
+        let mut duplicate = None;
+        let appended = crate::jsonl::append_jsonl_transaction::<ExperienceEventV1>(
+            self.store.root(),
+            &path,
+            |existing| {
+                if let Some(previous) = existing.iter().find(|previous| {
+                    previous.operation == event.operation
+                        && previous.source_run_id == event.source_run_id
+                        && previous.outcome_id == event.outcome_id
+                }) {
+                    duplicate = Some(previous.clone());
+                    return Ok(None);
+                }
+                let next = existing.last().map_or(1, |item| item.sequence + 1);
+                event.sequence = next;
+                event.event_id = content_hash(
+                    &serde_json::json!({"pattern": event.pattern_id, "sequence": next, "operation": event.operation, "source": event.source_run_id, "outcome": event.outcome_id}),
+                )?;
+                event.content_hash = content_hash(
+                    &serde_json::to_value(&event)
+                        .map_err(|source| StoreError::JsonSerialize { source })?,
+                )?;
+                Ok(Some(event))
+            },
         )?;
-        event.content_hash = content_hash(
-            &serde_json::to_value(&event).map_err(|source| StoreError::JsonSerialize { source })?,
-        )?;
-        append_jsonl(self.store.root(), &path, &event)?;
-        Ok(event)
+        Ok(appended
+            .or(duplicate)
+            .expect("experience append returns a record"))
     }
 
     /// Read only the typed, rebuildable View documents. Retrieval must not

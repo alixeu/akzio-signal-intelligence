@@ -473,11 +473,18 @@ pub async fn run_agent_fork_loop_with_metrics(
 /// phase-specific Summary commits the canonical Index.
 fn completed_turn_artifact(turn: &Turn) -> Result<Value> {
     if let Some(terminal) = turn.terminal_tool_result.as_ref() {
-        return Ok(terminal
+        let mut artifact = terminal
             .output
             .get("artifact")
             .cloned()
-            .unwrap_or(Value::Null));
+            .unwrap_or(Value::Null);
+        if let Some(object) = artifact.as_object_mut() {
+            let evidence_refs = verified_terminal_evidence_refs(turn);
+            if !evidence_refs.is_empty() {
+                object.insert("verified_evidence_refs".to_owned(), json!(evidence_refs));
+            }
+        }
+        return Ok(artifact);
     }
     let mut response_text = turn
         .emitted_items
@@ -573,7 +580,13 @@ fn verified_web_search_results(turn: &Turn) -> Vec<Value> {
     for output in turn
         .emitted_items
         .iter()
-        .filter(|item| item.item_type == agent_loop::TurnItemType::ToolResult)
+        .filter(|item| {
+            item.item_type == agent_loop::TurnItemType::ToolResult
+                && matches!(
+                    item.tool_name.as_str(),
+                    tools::web_run::NAME | tools::verify_event::NAME
+                )
+        })
         .filter_map(|item| item.content_json.pointer("/result/output"))
     {
         for pointer in ["/search/results", "/results"] {
@@ -614,6 +627,63 @@ fn verified_web_search_results(turn: &Turn) -> Vec<Value> {
         }
     }
     by_id.into_values().collect()
+}
+
+/// Terminal tools own their artifact shape, but their output alone does not
+/// preserve evidence fetched earlier in the same turn. This reconstructs only
+/// IDs from actual tool results for the workflow's Rust-owned registry.
+fn verified_terminal_evidence_refs(turn: &Turn) -> Vec<String> {
+    let mut ids = verified_phase1_evidence_ids(turn)
+        .into_iter()
+        .filter(|id| is_complete_tool_evidence_id(id))
+        .collect::<BTreeSet<_>>();
+    for result in verified_web_search_results(turn) {
+        if let Some(id) = result
+            .get("evidence_id")
+            .and_then(Value::as_str)
+            .filter(|id| is_complete_tool_evidence_id(id))
+        {
+            ids.insert(id.to_owned());
+        }
+    }
+    for output in turn
+        .emitted_items
+        .iter()
+        .filter(|item| {
+            item.item_type == agent_loop::TurnItemType::ToolResult
+                && item.tool_name == tools::research_evidence_gap::NAME
+        })
+        .filter_map(|item| item.content_json.pointer("/result/output"))
+    {
+        for item in ["evidence", "counterevidence"].into_iter().flat_map(|key| {
+            output
+                .get(key)
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        }) {
+            if let Some(id) = item
+                .get("evidence_id")
+                .and_then(Value::as_str)
+                .filter(|id| is_complete_tool_evidence_id(id))
+            {
+                ids.insert(id.to_owned());
+            }
+        }
+    }
+    ids.into_iter().collect()
+}
+
+fn is_complete_tool_evidence_id(id: &str) -> bool {
+    ["technical-", "jin10-", "web-"]
+        .into_iter()
+        .find_map(|prefix| id.strip_prefix(prefix))
+        .is_some_and(|digest| {
+            digest.len() == 64
+                && digest
+                    .chars()
+                    .all(|character| character.is_ascii_hexdigit())
+        })
 }
 
 fn select_fork_history(target_history: Vec<Value>, fork_history: Vec<Value>) -> Vec<Value> {
@@ -1360,16 +1430,11 @@ fn build_responses_request(
         false
     };
 
-    let mut tool_count = 0;
-    if with_tools {
-        let tool_defs = tools::responses_tool_definitions(&input.available_tools);
-        tool_count = tool_defs.len();
-        if !tool_defs.is_empty() {
-            builder = builder
-                .tools(tool_defs)
-                .tool_choice(ToolChoiceParam::Mode(ToolChoiceOptions::Auto));
-        }
-    }
+    let mut tool_defs = if with_tools {
+        tools::responses_tool_definitions(&input.available_tools)
+    } else {
+        Vec::new()
+    };
 
     let has_reasoning = if let Some(reasoning) = build_reasoning_param(settings) {
         builder = builder.reasoning(reasoning);
@@ -1383,11 +1448,16 @@ fn build_responses_request(
         builder = builder.include(vec![IncludeEnum::ReasoningEncryptedContent]);
     }
 
-    if uses_native_web_search(settings) {
-        builder = builder.tools(vec![Tool::WebSearch(
+    if with_tools && uses_native_web_search(settings) {
+        tool_defs.push(Tool::WebSearch(
             WebSearchToolArgs::default().build().unwrap(),
-        )]);
-        tool_count += 1;
+        ));
+    }
+    let tool_count = tool_defs.len();
+    if !tool_defs.is_empty() {
+        builder = builder
+            .tools(tool_defs)
+            .tool_choice(ToolChoiceParam::Mode(ToolChoiceOptions::Auto));
     }
 
     debug!(
@@ -2294,7 +2364,11 @@ async fn stream_chat_completions_once(
         }
     }
 
-    if !(saw_terminal_finish || (settings.llm.free_opencode && made_progress)) {
+    // A provider-specific non-JSON SSE event may be skipped above, but it is
+    // never a completion signal. Treating any partial text from free_opencode
+    // as a successful turn can publish an incomplete report or execute an
+    // incomplete protocol transition downstream.
+    if !saw_terminal_finish {
         return Err((
             anyhow::anyhow!(
                 "Chat Completions stream ended without a terminal finish_reason after {event_count} chunks"
@@ -2707,6 +2781,38 @@ mod tests {
     }
 
     #[test]
+    fn terminal_completion_exposes_only_rust_verified_evidence_refs() {
+        let mut turn = agent_loop::Turn::new("turn-1", "session-1", "run-1", "researcher.bull", "");
+        let evidence_id = "web-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        turn.emitted_items.push(agent_loop::TurnItem::tool_result(
+            &agent_loop::ToolResultItem {
+                call_id: "research-1".to_owned(),
+                name: tools::research_evidence_gap::NAME.to_owned(),
+                status: "completed".to_owned(),
+                output: json!({
+                    "evidence": [
+                        {"evidence_id": evidence_id},
+                        {"evidence_id": "web-too-short"}
+                    ],
+                    "counterevidence": []
+                }),
+                error: None,
+            },
+            &TruncationConfig::default(),
+        ));
+        turn.terminal_tool_result = Some(agent_loop::ToolResultItem {
+            call_id: "finalize-1".to_owned(),
+            name: tools::phase2_stree::SUBMIT_DEBATE_TURN.to_owned(),
+            status: "completed".to_owned(),
+            output: json!({"terminal": true, "artifact": {"phase2_stree": {}}}),
+            error: None,
+        });
+
+        let artifact = super::completed_turn_artifact(&turn).unwrap();
+        assert_eq!(artifact["verified_evidence_refs"], json!([evidence_id]));
+    }
+
+    #[test]
     fn tool_managed_completion_ignores_assistant_text() {
         let mut turn =
             agent_loop::Turn::new("turn-1", "session-1", "run-1", "manager.research", "");
@@ -2783,6 +2889,35 @@ mod tests {
         assert!(response.contains("Rust-verified Web search results"));
         assert!(response.contains("https://example.com/fact"));
         assert!(artifact.get("retrieval_audit").is_some());
+    }
+
+    #[test]
+    fn read_only_completion_ignores_web_shaped_output_from_unrelated_tools() {
+        let mut turn = agent_loop::Turn::new("turn-1", "session-1", "run-1", "trader", "");
+        turn.emitted_items.push(agent_loop::TurnItem::tool_result(
+            &agent_loop::ToolResultItem {
+                call_id: "indexes-1".to_owned(),
+                name: tools::index_tools::READ_INDEXES_NAME.to_owned(),
+                status: "completed".to_owned(),
+                output: json!({
+                    "search": {"results": [{
+                        "subject_id": "web-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "url": "https://untrusted.example/result"
+                    }]}
+                }),
+                error: None,
+            },
+            &TruncationConfig::default(),
+        ));
+        let mut final_message = agent_loop::TurnItem::assistant("交易报告", Value::Null);
+        final_message.phase = Some(agent_loop::AgentItemPhase::Final);
+        turn.emitted_items.push(final_message);
+
+        let artifact = super::completed_turn_artifact(&turn).unwrap();
+        assert!(!artifact["response_text"]
+            .as_str()
+            .unwrap()
+            .contains(tools::web_run::VERIFIED_RESULTS_MARKER));
     }
 
     #[test]
@@ -3663,6 +3798,29 @@ mod tests {
 
         assert!(!super::configured_tool_names(&settings).contains(&tools::web_run::NAME));
         assert!(super::web_run_runtime_for_settings(&settings).is_none());
+    }
+
+    #[test]
+    fn native_web_search_is_added_without_discarding_function_tools() {
+        let mut settings = base_settings(LlmRoute::Responses);
+        settings.role = "analyst.news_macro".to_string();
+        settings.llm.native_web_search = true;
+        settings.llm.tools = vec![tools::web_run::NAME.to_owned()];
+        let input = agent_loop::ModelInput {
+            system_instruction: None,
+            items: vec![agent_loop::TurnItem::user("research")],
+            available_tools: vec![tools::think::NAME.to_owned()],
+            truncation: TruncationConfig::default(),
+        };
+
+        let request =
+            super::build_responses_request(&settings, &input, "research", true, true).unwrap();
+        let tools = serde_json::to_value(request).unwrap()["tools"]
+            .as_array()
+            .cloned()
+            .unwrap();
+        assert!(tools.iter().any(|tool| tool["type"] == "function"));
+        assert!(tools.iter().any(|tool| tool["type"] == "web_search"));
     }
 
     #[test]

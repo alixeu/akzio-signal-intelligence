@@ -1106,8 +1106,8 @@ pub(crate) fn commit_historical_reflection(
     submission: orchestrator_llm::tools::historical_reflection::HistoricalReflectionSubmission,
 ) -> Result<Value> {
     use orchestrator_store::{
-        find_run_location, read_indexes, FileSchemaKind, FileStore, FileStoreOptions, IndexArchive,
-        IndexKind, IndexQuery, ReflectionTaskLedger,
+        find_run_location, read_all_indexes, FileSchemaKind, FileStore, FileStoreOptions,
+        IndexArchive, IndexKind, IndexQuery, ReflectionTaskLedger,
     };
 
     let task_value = state
@@ -1134,17 +1134,15 @@ pub(crate) fn commit_historical_reflection(
                 task.key.source_run_id
             )
         })?;
-    let source_indexes = read_indexes(
+    let source_indexes = read_all_indexes(
         &store,
         Some(&source_location),
         &IndexQuery {
             kind: Some(IndexKind::PhaseSummary),
             ticker: Some(task.key.ticker.clone()),
-            limit: 100,
             ..Default::default()
         },
-    )?
-    .indexes;
+    )?;
     let sources = source_indexes
         .into_iter()
         .map(|index| {
@@ -1590,7 +1588,7 @@ fn file_store_historical_reflection_index_runtime(
 ) -> Result<orchestrator_llm::tools::index_tools::IndexToolRuntimeBinding> {
     use orchestrator_llm::tools::index_tools::{IndexKind, IndexOwnedScope, IndexReadVisibility};
     use orchestrator_store::{
-        content_hash, find_run_location, read_indexes, FileStore, FileStoreOptions,
+        content_hash, find_run_location, read_all_indexes, FileStore, FileStoreOptions,
         IndexKind as StoreIndexKind, IndexQuery,
     };
 
@@ -1624,17 +1622,15 @@ fn file_store_historical_reflection_index_runtime(
     let source_location = find_run_location(&store, &source_run_id)?.with_context(|| {
         format!("HistoricalReflection source run {source_run_id} is not available in FileStore")
     })?;
-    let source_indexes = read_indexes(
+    let source_indexes = read_all_indexes(
         &store,
         Some(&source_location),
         &IndexQuery {
             kind: Some(StoreIndexKind::PhaseSummary),
             ticker: Some(ticker.clone()),
-            limit: 100,
             ..Default::default()
         },
-    )?
-    .indexes;
+    )?;
     if source_indexes.is_empty() {
         bail!("HistoricalReflection source run has no ticker-scoped completed Phase Summary Index");
     }

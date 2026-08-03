@@ -6,7 +6,8 @@ use orchestrator_core::{
     config_float, config_str, config_strings, display_ticker, load_config, project_path, run_slug,
 };
 use orchestrator_store::{
-    read_indexes, FileStore, FileStoreOptions, IndexKind, IndexQuery, RunLocation,
+    read_indexes, read_run_manifest, FileStore, FileStoreOptions, IndexKind, IndexQuery,
+    PhaseStatus, RunLocation, RunStatus,
 };
 use serde_json::{json, Value};
 use std::{fs, path::PathBuf, process::Command};
@@ -20,7 +21,8 @@ pub enum ReportMode {
 
 #[derive(Debug, Clone, Args)]
 pub struct ReportArgs {
-    #[arg(long, value_enum, default_value_t = ReportMode::BuildAndSend)]
+    /// Rendering is the safe default. Sending requires an explicit mode.
+    #[arg(long, value_enum, default_value_t = ReportMode::Build)]
     pub mode: ReportMode,
     /// The same FileStore root used by orchestrator-exec; never a bare run directory.
     #[arg(long)]
@@ -29,7 +31,7 @@ pub struct ReportArgs {
 
 pub fn run(args: ReportArgs) -> Result<Value> {
     let config = load_config(Some(&project_path("config/config.yaml")))
-        .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
+        .context("failed to load config/config.yaml for report generation")?;
     let tickers = config_strings(&config, "orchestrator.analysis_universe", &[]);
     let slug = if tickers.is_empty() {
         "TQQQ".to_string()
@@ -68,6 +70,11 @@ fn build_payload(
     let run_id = crate::orchestration::lifecycle::run_id_for(tickers, today);
     let location = RunLocation::new(today, run_id)?;
     let store = FileStore::open(&root, FileStoreOptions::default())?;
+    let manifest = if store.exists(&location.manifest_relative())? {
+        Some(read_run_manifest(&store, &location)?)
+    } else {
+        None
+    };
     let state_relative = location.child_relative(std::path::Path::new("state.json"))?;
     let state_exists = store.exists(&state_relative)?;
     let state = if state_exists {
@@ -79,6 +86,7 @@ fn build_payload(
             &IndexQuery {
                 kind: Some(IndexKind::PhaseSummary),
                 source_phase: Some(8),
+                role: Some("rust.final_decision".to_owned()),
                 limit: 1,
                 ..Default::default()
             },
@@ -86,17 +94,23 @@ fn build_payload(
         .indexes
         .into_iter()
         .next()
-        .map(|index| Value::Object(index.authoritative_fields))
+        .map(|index| {
+            let mut fields = index.authoritative_fields;
+            fields
+                .remove("report_projection")
+                .filter(Value::is_object)
+                .unwrap_or(Value::Object(fields))
+        })
         .unwrap_or_else(|| json!({}))
     };
-    let complete = state_exists || !state.as_object().is_none_or(serde_json::Map::is_empty);
+    let orchestrator_status = report_status(manifest.as_ref(), &state);
     let report_markdown = super::builder::build_human_readable_report(&state);
     let report_html = super::builder::report_to_html(&report_markdown);
 
     Ok(json!({
         "subject": format!("{} strategy report {}", display_ticker(tickers), today),
         "today": today,
-        "orchestrator_status": if complete { "complete" } else { "missing" },
+        "orchestrator_status": orchestrator_status,
         "store_root": root,
         "run_id": location.run_id,
         "orchestrator_state": state,
@@ -104,6 +118,41 @@ fn build_payload(
         "report_html": report_html,
         "final_summary": ""
     }))
+}
+
+fn report_status(
+    manifest: Option<&orchestrator_store::RunManifest>,
+    state: &Value,
+) -> &'static str {
+    let Some(manifest) = manifest else {
+        return "missing";
+    };
+    if manifest.degraded || manifest.phase_status.get("8") == Some(&PhaseStatus::Degraded) {
+        return "degraded";
+    }
+    if manifest.status == RunStatus::Failed {
+        return "failed";
+    }
+    if manifest.status != RunStatus::Completed
+        || manifest.phase_status.get("8") != Some(&PhaseStatus::Completed)
+        || !super::builder::has_complete_report_projection(state)
+    {
+        return "incomplete";
+    }
+    if manifest.storage_namespace.is_some()
+        || state.get("mock").and_then(Value::as_bool) != Some(false)
+        || state.get("debug").and_then(Value::as_bool) != Some(false)
+        || state
+            .get("storage_namespace")
+            .is_some_and(|namespace| !namespace.is_null())
+    {
+        return "non_production";
+    }
+    "complete"
+}
+
+fn report_is_sendable(payload: &Value) -> bool {
+    payload.get("orchestrator_status").and_then(Value::as_str) == Some("complete")
 }
 
 fn build_html(payload: &Value) -> String {
@@ -167,7 +216,13 @@ fn allocation_html(payload: &Value) -> String {
 }
 
 fn send_report(config: &Value, slug: &str, payload: &Value, html: &str) -> Result<Value> {
-    if config_str(config, "report.email.enabled", "true") == "false" {
+    if !report_is_sendable(payload) {
+        return Ok(json!({
+            "status": "skipped",
+            "detail": "orchestrator_not_healthy_complete"
+        }));
+    }
+    if config_str(config, "report.email.enabled", "false") != "true" {
         return Ok(json!({"status": "skipped", "detail": "report.email.enabled=false"}));
     }
     let state_path = project_path(format!("outputs/{}/report_email_state.json", slug));
@@ -291,7 +346,7 @@ fn email_decision(payload: &Value, state: &Value, probability_threshold: f64) ->
 
 fn payload_direction(payload: &Value) -> (&'static str, f64) {
     let state = payload.get("orchestrator_state").unwrap_or(payload);
-    let research = state.get("research_plan").unwrap_or(state);
+    let research = report_research_for_primary_asset(state);
     let long = normalize_probability(research.get("long_probability")).unwrap_or(0.0);
     let short = normalize_probability(research.get("short_probability")).unwrap_or(0.0);
     if long > short {
@@ -303,8 +358,28 @@ fn payload_direction(payload: &Value) -> (&'static str, f64) {
     }
 }
 
+fn report_research_for_primary_asset(state: &Value) -> &Value {
+    let research = state.get("research_plan").unwrap_or(state);
+    let Some(per_ticker) = research.get("per_ticker").and_then(Value::as_object) else {
+        return research;
+    };
+    for field in ["investable_assets", "tickers"] {
+        if let Some(decision) = state
+            .get(field)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .find_map(|ticker| per_ticker.get(ticker))
+        {
+            return decision;
+        }
+    }
+    per_ticker.values().next().unwrap_or(research)
+}
+
 fn normalize_probability(value: Option<&Value>) -> Option<f64> {
-    match value? {
+    let value = match value? {
         Value::Number(number) => number.as_f64().map(|n| if n > 1.0 { n / 100.0 } else { n }),
         Value::String(text) => {
             let trimmed = text.trim();
@@ -318,16 +393,72 @@ fn normalize_probability(value: Option<&Value>) -> Option<f64> {
             }
         }
         _ => None,
-    }
+    }?;
+    (value.is_finite() && (0.0..=1.0).contains(&value)).then_some(value)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use orchestrator_store::{
-        append_index_detail, create_index, finalize_index, AppendIndexDetailInput,
-        CreateIndexInput, DetailSection, IndexScope,
+        append_index_detail, create_index, finalize_index, write_run_manifest,
+        AppendIndexDetailInput, CreateIndexInput, DetailSection, IndexScope, RunManifest,
+        RunManifestInit,
     };
+
+    fn completed_manifest(location: RunLocation) -> RunManifest {
+        let mut manifest = RunManifest::new(RunManifestInit {
+            location,
+            workflow_version: "test".to_owned(),
+            prompt_versions: Default::default(),
+            git_sha: "test".to_owned(),
+            config_hash: "test".to_owned(),
+            role_profile_registry_hash: "test".to_owned(),
+            created_at: "2026-06-19T00:00:00Z".to_owned(),
+        })
+        .unwrap();
+        manifest.status = RunStatus::Completed;
+        manifest
+            .phase_status
+            .insert("8".to_owned(), PhaseStatus::Completed);
+        manifest
+    }
+
+    fn complete_report_state() -> Value {
+        json!({
+            "current_date": "2026-06-19",
+            "ticker": "QQQ",
+            "tickers": ["QQQ"],
+            "investable_assets": ["QQQ"],
+            "mock": false,
+            "debug": false,
+            "storage_namespace": null,
+            "research_plan": {"per_ticker": {"QQQ": {
+                "rating": "Buy",
+                "long_probability": 0.72,
+                "short_probability": 0.28,
+                "probability_rationale": "positive breadth"
+            }}},
+            "trader_investment_plan": {"per_ticker": {"QQQ": {
+                "action": "Buy", "position_size_pct_max": 0.25,
+                "entry_price": 450.0, "stop_loss": 430.0
+            }}},
+            "risk_debate_state": {"history": [{"payload": {"argument": "volatility risk"}}]},
+            "final_trade_decision": {"per_asset": {"QQQ": {
+                "direction": "Buy", "long_probability": 0.72, "short_probability": 0.28
+            }}},
+            "portfolio_allocation": {"weights": {
+                "QQQ": {"weight": 0.25, "rationale": "positive breadth"},
+                "cash_hedge": {"weight": 0.75, "rationale": "risk budget"}
+            }, "total_equity_exposure": 0.25},
+            "debate_state_artifact": {"final_reducer": {"authoritative_fields": {
+                "controllers": {"topic-a": {"nodes": [
+                    {"from": "bull", "payload": {"report": "breadth improved", "evidence_refs": ["technical-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]}},
+                    {"from": "bear", "payload": {"report": "volatility remains", "evidence_refs": ["technical-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]}}
+                ]}}
+            }}}
+        })
+    }
 
     #[test]
     fn email_decision_sends_first_daily_report() {
@@ -338,7 +469,7 @@ mod tests {
     }
 
     #[test]
-    fn build_payload_reads_state_from_file_store() {
+    fn build_payload_does_not_treat_unmanifested_state_as_complete() {
         let temp = tempfile::tempdir().unwrap();
         let config = json!({"orchestrator":{"store":{"root":temp.path()}}});
         let store = FileStore::open(temp.path(), FileStoreOptions::default()).unwrap();
@@ -356,17 +487,18 @@ mod tests {
             )
             .unwrap();
         let payload = build_payload(&config, Some(temp.path()), "2026-06-19", "TQQQ", &[]).unwrap();
-        assert_eq!(payload["orchestrator_status"], "complete");
+        assert_eq!(payload["orchestrator_status"], "missing");
     }
 
     #[test]
-    fn build_payload_reads_final_decision_index_after_state_cleanup() {
+    fn build_payload_reads_report_projection_after_state_cleanup() {
         let temp = tempfile::tempdir().unwrap();
         let config = json!({"orchestrator":{"store":{"root":temp.path()}}});
         let store = FileStore::open(temp.path(), FileStoreOptions::default()).unwrap();
         let date = "2026-06-19";
         let run_id = crate::orchestration::lifecycle::run_id_for(&[], date);
         let location = RunLocation::new(date, &run_id).unwrap();
+        write_run_manifest(&store, &location, completed_manifest(location.clone())).unwrap();
         let scope = IndexScope {
             kind: IndexKind::PhaseSummary,
             location: Some(location),
@@ -379,10 +511,7 @@ mod tests {
             topic_id: None,
             source_payload_hash: "sha256:source".to_owned(),
             authoritative_fields: json!({
-                "portfolio_allocation": {
-                    "total_equity_exposure": 0.25,
-                    "weights": {}
-                }
+                "report_projection": crate::report::builder::report_projection(&complete_report_state())
             })
             .as_object()
             .unwrap()
@@ -414,10 +543,112 @@ mod tests {
 
         let payload = build_payload(&config, Some(temp.path()), date, "TQQQ", &[]).unwrap();
         assert_eq!(payload["orchestrator_status"], "complete");
+        assert!(report_is_sendable(&payload));
         assert_eq!(
             payload["orchestrator_state"]["portfolio_allocation"]["total_equity_exposure"],
             0.25
         );
+        assert!(payload["report_markdown"]
+            .as_str()
+            .unwrap()
+            .contains("positive breadth"));
+    }
+
+    #[test]
+    fn legacy_final_index_without_report_projection_is_not_sendable() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = json!({"orchestrator":{"store":{"root":temp.path()}}});
+        let store = FileStore::open(temp.path(), FileStoreOptions::default()).unwrap();
+        let date = "2026-06-19";
+        let run_id = crate::orchestration::lifecycle::run_id_for(&[], date);
+        let location = RunLocation::new(date, &run_id).unwrap();
+        write_run_manifest(&store, &location, completed_manifest(location.clone())).unwrap();
+        let scope = IndexScope {
+            kind: IndexKind::PhaseSummary,
+            location: Some(location),
+            index_id: "idx-legacy-final".to_owned(),
+            run_id,
+            source_run_id: None,
+            source_phase: 8,
+            role: "rust.final_decision".to_owned(),
+            ticker: Some("QQQ".to_owned()),
+            topic_id: None,
+            source_payload_hash: "sha256:legacy".to_owned(),
+            authoritative_fields: json!({"portfolio_allocation": {"weights": {}}})
+                .as_object()
+                .unwrap()
+                .clone(),
+            created_at: "2026-06-19T00:00:00Z".to_owned(),
+        };
+        create_index(
+            &store,
+            CreateIndexInput {
+                scope: scope.clone(),
+                summary: "legacy final decision".to_owned(),
+                confidence: 0.8,
+                pattern_key: None,
+                applies_to_phases: Vec::new(),
+            },
+        )
+        .unwrap();
+        append_index_detail(
+            &store,
+            AppendIndexDetailInput {
+                scope: scope.clone(),
+                section: DetailSection::Execution,
+                detail: "legacy final decision detail".to_owned(),
+                source_refs: Vec::new(),
+            },
+        )
+        .unwrap();
+        finalize_index(&store, &scope).unwrap();
+
+        let payload = build_payload(&config, Some(temp.path()), date, "TQQQ", &[]).unwrap();
+        assert_eq!(payload["orchestrator_status"], "incomplete");
+        assert!(!report_is_sendable(&payload));
+    }
+
+    #[test]
+    fn degraded_run_is_never_sendable() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = json!({"orchestrator":{"store":{"root":temp.path()}}});
+        let store = FileStore::open(temp.path(), FileStoreOptions::default()).unwrap();
+        let date = "2026-06-19";
+        let location =
+            RunLocation::new(date, crate::orchestration::lifecycle::run_id_for(&[], date)).unwrap();
+        let mut manifest = completed_manifest(location.clone());
+        manifest.degraded = true;
+        write_run_manifest(&store, &location, manifest).unwrap();
+        store
+            .write_json_value(
+                &location.state_relative(),
+                &json!({"final_trade_decision": {"action": "hold"}}),
+            )
+            .unwrap();
+
+        let payload = build_payload(&config, Some(temp.path()), date, "TQQQ", &[]).unwrap();
+        assert_eq!(payload["orchestrator_status"], "degraded");
+        assert!(!report_is_sendable(&payload));
+    }
+
+    #[test]
+    fn mock_run_is_never_sendable() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = json!({"orchestrator":{"store":{"root":temp.path()}}});
+        let store = FileStore::open(temp.path(), FileStoreOptions::default()).unwrap();
+        let date = "2026-06-19";
+        let location =
+            RunLocation::new(date, crate::orchestration::lifecycle::run_id_for(&[], date)).unwrap();
+        write_run_manifest(&store, &location, completed_manifest(location.clone())).unwrap();
+        let mut state = complete_report_state();
+        state["mock"] = Value::Bool(true);
+        store
+            .write_json_value(&location.state_relative(), &state)
+            .unwrap();
+
+        let payload = build_payload(&config, Some(temp.path()), date, "TQQQ", &[]).unwrap();
+        assert_eq!(payload["orchestrator_status"], "non_production");
+        assert!(!report_is_sendable(&payload));
     }
 
     #[test]
@@ -430,5 +661,11 @@ mod tests {
         let decision = email_decision(&strong, &state, 0.68);
         assert!(decision.should_send);
         assert_eq!(decision.reason, "high_probability_reversal");
+    }
+
+    #[test]
+    fn payload_direction_uses_the_primary_canonical_research_decision() {
+        let payload = json!({"orchestrator_state": complete_report_state()});
+        assert_eq!(payload_direction(&payload), ("long", 0.72));
     }
 }

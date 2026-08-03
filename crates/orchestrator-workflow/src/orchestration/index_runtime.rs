@@ -11,7 +11,7 @@ use orchestrator_llm::tools::index_tools::{
     IndexToolRuntimeBinding, IndexToolService, ReadIndexDetailsCommand, ReadIndexesCommand,
 };
 use orchestrator_store::{
-    read_index_details, read_indexes, DetailQuery, DetailSection, FileStore, Index, IndexKind,
+    read_all_indexes, read_index_details, DetailQuery, DetailSection, FileStore, Index, IndexKind,
     IndexQuery, IndexScope, RunLocation,
 };
 use serde_json::{json, Value};
@@ -114,7 +114,7 @@ impl IndexToolService for FileStoreIndexToolService {
                 per_run.kind = Some(IndexKind::PhaseSummary);
                 per_run.limit = 100;
                 per_run.cursor = 0;
-                for index in read_indexes(&self.store, Some(location), &per_run)?.indexes {
+                for index in read_all_indexes(&self.store, Some(location), &per_run)? {
                     found.push((index, Some(location.clone())));
                 }
             }
@@ -124,7 +124,7 @@ impl IndexToolService for FileStoreIndexToolService {
             experiences.kind = Some(IndexKind::Experience);
             experiences.limit = 100;
             experiences.cursor = 0;
-            for index in read_indexes(&self.store, None, &experiences)?.indexes {
+            for index in read_all_indexes(&self.store, None, &experiences)? {
                 found.push((index, None));
             }
         }

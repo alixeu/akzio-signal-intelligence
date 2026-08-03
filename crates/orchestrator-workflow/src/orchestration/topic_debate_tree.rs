@@ -10,7 +10,7 @@
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub const SCHEMA_VERSION: u32 = 1;
 
@@ -114,6 +114,10 @@ pub(crate) struct TopicDebateTree {
     pub nodes: Vec<StreeNode>,
     #[serde(default)]
     pub deliveries: Vec<StreeDelivery>,
+    /// Rust-observed evidence IDs that participants may cite. This survives
+    /// checkpoints so a resumed debate retains the same provenance boundary.
+    #[serde(default)]
+    pub evidence_registry: BTreeSet<String>,
     pub participants: BTreeMap<DebateActor, ParticipantState>,
     #[serde(default)]
     next_sequence: u64,
@@ -150,6 +154,7 @@ impl TopicDebateTree {
             closure: None,
             nodes: Vec::new(),
             deliveries: Vec::new(),
+            evidence_registry: BTreeSet::new(),
             participants,
             next_sequence: 1,
         };
@@ -178,6 +183,22 @@ impl TopicDebateTree {
                 participant.status = ParticipantStatus::RetryScheduled;
             }
         }
+    }
+
+    /// Admit evidence observed by Rust through a FileStore Index or a tool
+    /// result in this topic's current turn. Model payloads cannot populate this
+    /// set directly.
+    pub fn register_evidence_refs<'a>(
+        &mut self,
+        references: impl IntoIterator<Item = &'a str>,
+    ) -> Result<()> {
+        for reference in references {
+            if !is_complete_evidence_ref(reference) {
+                bail!("stree evidence registry requires a complete stable evidence ID")
+            }
+            self.evidence_registry.insert(reference.to_owned());
+        }
+        Ok(())
     }
 
     pub fn next_dispatch(&mut self) -> Option<DebateDispatch> {
@@ -266,6 +287,7 @@ impl TopicDebateTree {
         }
         let message = required_string(object, "message", 1_200)?;
         validate_stance_message_consistency(&stance, &message)?;
+        self.validate_submission_evidence_refs(object)?;
         let reply_reference = object
             .get("reply_to_node_id")
             .and_then(Value::as_str)
@@ -560,6 +582,7 @@ impl TopicDebateTree {
             "turn_count": self.nodes.len(),
             "concessions": concessions,
             "claim_ledger": self.structured_claim_ledger(),
+            "evidence_registry": self.evidence_registry,
             "nodes": self.nodes,
             "delivery_receipts": self.deliveries,
         })
@@ -870,6 +893,35 @@ impl TopicDebateTree {
             .collect()
     }
 
+    fn validate_submission_evidence_refs(
+        &self,
+        object: &serde_json::Map<String, Value>,
+    ) -> Result<()> {
+        let references = object
+            .get("evidence_refs")
+            .and_then(Value::as_array)
+            .context("stree submission requires evidence_refs array")?;
+        if references.len() > 3 {
+            bail!("stree submission permits at most three evidence_refs")
+        }
+        let mut seen = BTreeSet::new();
+        for reference in references {
+            let reference = reference
+                .as_str()
+                .context("stree submission evidence_refs must contain strings")?;
+            if !is_complete_evidence_ref(reference) {
+                bail!("stree submission evidence_refs must contain complete stable evidence IDs")
+            }
+            if !seen.insert(reference) {
+                bail!("stree submission contains duplicate evidence_refs")
+            }
+            if !self.evidence_registry.contains(reference) {
+                bail!("stree submission references evidence not observed by Rust")
+            }
+        }
+        Ok(())
+    }
+
     fn structured_claim_ledger(&self) -> Vec<Value> {
         self.nodes
             .iter()
@@ -934,6 +986,18 @@ fn required_string(
         bail!("stree payload field {field} exceeds {max_chars} characters");
     }
     Ok(value)
+}
+
+fn is_complete_evidence_ref(reference: &str) -> bool {
+    ["idx-", "technical-", "jin10-", "web-"]
+        .into_iter()
+        .find_map(|prefix| reference.strip_prefix(prefix))
+        .is_some_and(|digest| {
+            digest.len() == 64
+                && digest
+                    .chars()
+                    .all(|character| character.is_ascii_hexdigit())
+        })
 }
 
 fn validate_stance_message_consistency(stance: &str, message: &str) -> Result<()> {
@@ -1012,20 +1076,25 @@ fn parse_targets(value: Option<&Value>) -> Result<Vec<DebateActor>> {
 mod tests {
     use super::*;
 
+    const EVIDENCE_REF: &str =
+        "technical-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
     fn tree() -> TopicDebateTree {
-        TopicDebateTree::open(
+        let mut tree = TopicDebateTree::open(
             "topic-a",
             json!({"topic": "rate path", "decision_hinge": "yield response"}),
             3,
         )
-        .unwrap()
+        .unwrap();
+        tree.register_evidence_refs([EVIDENCE_REF]).unwrap();
+        tree
     }
 
     fn submission(stance: &str, reply_to_node_id: Option<&str>) -> Value {
         let mut value = json!({
             "stance": stance,
             "message": format!("{stance} with evidence boundary"),
-            "evidence_refs": ["idx-a"]
+            "evidence_refs": [EVIDENCE_REF]
         });
         if let Some(reply_to_node_id) = reply_to_node_id {
             value["reply_to_node_id"] = json!(reply_to_node_id);
@@ -1063,6 +1132,18 @@ mod tests {
         payload["message"] = json!("我同意对方的核心结论");
 
         assert!(tree.submit(DebateActor::Bull, payload).is_err());
+    }
+
+    #[test]
+    fn submission_rejects_evidence_that_rust_did_not_observe() {
+        let mut tree = tree();
+        assert_eq!(tree.next_dispatch().unwrap().actor, DebateActor::Bull);
+        let mut payload = submission("challenge", None);
+        payload["evidence_refs"] =
+            json!(["technical-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]);
+
+        let error = tree.submit(DebateActor::Bull, payload).unwrap_err();
+        assert!(error.to_string().contains("not observed by Rust"));
     }
 
     #[test]

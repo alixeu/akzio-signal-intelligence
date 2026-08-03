@@ -9,7 +9,8 @@
 use chrono::Local;
 use html_escape::encode_text;
 use pulldown_cmark::{html, Options, Parser};
-use serde_json::Value;
+use serde_json::{Map, Value};
+use std::collections::BTreeSet;
 
 /// CSS injected into the generated HTML report.
 const REPORT_CSS: &str = r#"
@@ -23,6 +24,56 @@ hr { border: none; border-top: 1px solid #e0e0e0; margin: 24px 0; }
 strong { color: #1a1a1a; }
 ul, ol { padding-left: 24px; }
 "#;
+
+const REPORT_PROJECTION_FIELDS: &[&str] = &[
+    "current_date",
+    "ticker",
+    "tickers",
+    "investable_assets",
+    "mock",
+    "debug",
+    "storage_namespace",
+    "research_plan",
+    "trader_investment_plan",
+    "risk_debate_state",
+    "final_trade_decision",
+    "portfolio_allocation",
+    "debate_state_artifact",
+];
+
+/// The compacted Phase 8 Index keeps this bounded, presentation-safe
+/// projection so a report can be rendered after transient run state is gone.
+pub(crate) fn report_projection(state: &Value) -> Value {
+    let mut projection = Map::new();
+    for field in REPORT_PROJECTION_FIELDS {
+        projection.insert(
+            (*field).to_owned(),
+            state.get(*field).cloned().unwrap_or(Value::Null),
+        );
+    }
+    Value::Object(projection)
+}
+
+/// A report is only eligible for external delivery when every canonical
+/// phase-owned section is available, rather than when a state file merely
+/// happens to exist.
+pub(crate) fn has_complete_report_projection(state: &Value) -> bool {
+    [
+        "/research_plan/per_ticker",
+        "/trader_investment_plan/per_ticker",
+        "/final_trade_decision/per_asset",
+        "/portfolio_allocation/weights",
+        "/risk_debate_state",
+        "/debate_state_artifact",
+    ]
+    .into_iter()
+    .all(|pointer| {
+        state
+            .pointer(pointer)
+            .and_then(Value::as_object)
+            .is_some_and(|fields| !fields.is_empty())
+    })
+}
 
 /// Build a structured human-readable Markdown report from state artifacts.
 ///
@@ -47,9 +98,22 @@ pub fn build_human_readable_report(state: &Value) -> String {
         .unwrap_or("N/A");
     let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
-    let research = state.get("research_plan").unwrap_or(&Value::Null);
-    let trader = state.get("trader_investment_plan").unwrap_or(&Value::Null);
-    let final_decision = state.get("final_trade_decision").unwrap_or(&Value::Null);
+    let primary_asset = primary_report_asset(state);
+    let research = report_asset_view(
+        state.get("research_plan").unwrap_or(&Value::Null),
+        "per_ticker",
+        primary_asset.as_deref(),
+    );
+    let trader = report_asset_view(
+        state.get("trader_investment_plan").unwrap_or(&Value::Null),
+        "per_ticker",
+        primary_asset.as_deref(),
+    );
+    let final_decision = report_asset_view(
+        state.get("final_trade_decision").unwrap_or(&Value::Null),
+        "per_asset",
+        primary_asset.as_deref(),
+    );
     let allocation = state.get("portfolio_allocation").unwrap_or(&Value::Null);
     let risk_state = state.get("risk_debate_state").unwrap_or(&Value::Null);
     let debate = state.get("debate_state_artifact").unwrap_or(&Value::Null);
@@ -99,11 +163,68 @@ pub fn build_human_readable_report(state: &Value) -> String {
     report
 }
 
+fn primary_report_asset(state: &Value) -> Option<String> {
+    for field in ["investable_assets", "tickers"] {
+        for candidate in state
+            .get(field)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
+            if report_asset_exists(state, candidate) {
+                return Some(candidate.to_owned());
+            }
+        }
+    }
+    [
+        ("research_plan", "per_ticker"),
+        ("trader_investment_plan", "per_ticker"),
+        ("final_trade_decision", "per_asset"),
+    ]
+    .into_iter()
+    .find_map(|(field, collection)| {
+        state
+            .get(field)
+            .and_then(|value| value.get(collection))
+            .and_then(Value::as_object)
+            .and_then(|items| items.keys().next())
+            .cloned()
+    })
+}
+
+fn report_asset_exists(state: &Value, asset: &str) -> bool {
+    [
+        ("research_plan", "per_ticker"),
+        ("trader_investment_plan", "per_ticker"),
+        ("final_trade_decision", "per_asset"),
+    ]
+    .into_iter()
+    .any(|(field, collection)| {
+        state
+            .get(field)
+            .and_then(|value| value.get(collection))
+            .and_then(Value::as_object)
+            .is_some_and(|items| items.contains_key(asset))
+    })
+}
+
+fn report_asset_view<'a>(root: &'a Value, collection: &str, asset: Option<&str>) -> &'a Value {
+    let Some(asset) = asset else {
+        return root;
+    };
+    root.get(collection)
+        .and_then(Value::as_object)
+        .and_then(|items| items.get(asset))
+        .unwrap_or(root)
+}
+
 fn executive_summary(research: &Value, trader: &Value, final_decision: &Value) -> String {
     let rating = research
         .get("rating")
         .and_then(Value::as_str)
         .or_else(|| final_decision.get("rating").and_then(Value::as_str))
+        .or_else(|| final_decision.get("direction").and_then(Value::as_str))
         .unwrap_or("N/A");
     let long_prob = research
         .get("long_probability")
@@ -160,6 +281,7 @@ fn investment_thesis(research: &Value, final_decision: &Value) -> String {
     let rating = final_decision
         .get("rating")
         .and_then(Value::as_str)
+        .or_else(|| final_decision.get("direction").and_then(Value::as_str))
         .or_else(|| research.get("rating").and_then(Value::as_str))
         .unwrap_or("N/A");
     let horizon = final_decision
@@ -271,33 +393,36 @@ fn bear_case(debate: &Value) -> String {
 
 /// Pull concise claims from finalized Phase 2 turn payloads filtered by side.
 fn extract_debate_evidence(debate: &Value, side: &str) -> Vec<String> {
-    let mut evidence: Vec<String> = Vec::new();
-    let turns = debate.get("debate_turns").and_then(Value::as_array);
-    if let Some(turns) = turns {
-        for turn in turns {
-            let role = turn.get("role").and_then(Value::as_str).unwrap_or("");
-            if !role.to_ascii_lowercase().contains(side) {
-                continue;
-            }
-            let payload = turn.pointer("/artifact/payload").unwrap_or(&Value::Null);
-            for item in payload
-                .get("claims")
-                .or_else(|| payload.get("responses"))
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
+    let mut evidence = Vec::new();
+    for (role, payload) in debate_entries(debate) {
+        if !role.to_ascii_lowercase().contains(side) {
+            continue;
+        }
+        for item in payload
+            .get("claims")
+            .or_else(|| payload.get("responses"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if let Some(text) = item
+                .get("claim")
+                .or_else(|| item.get("response"))
+                .and_then(Value::as_str)
+                .filter(|text| !text.trim().is_empty())
             {
-                if let Some(text) = item
-                    .get("claim")
-                    .or_else(|| item.get("response"))
-                    .and_then(Value::as_str)
-                {
-                    evidence.push(text.to_owned());
-                }
+                push_unique(&mut evidence, text);
             }
-            if evidence.len() >= 3 {
-                break;
-            }
+        }
+        if let Some(report) = payload
+            .get("report")
+            .and_then(Value::as_str)
+            .filter(|text| !text.trim().is_empty())
+        {
+            push_unique(&mut evidence, report);
+        }
+        if evidence.len() >= 3 {
+            break;
         }
     }
     evidence
@@ -305,30 +430,83 @@ fn extract_debate_evidence(debate: &Value, side: &str) -> Vec<String> {
 
 /// Collect source reference provenance for one debate side.
 fn collect_evidence_quality(debate: &Value, side: &str) -> String {
-    let mut lines: Vec<String> = Vec::new();
-    if let Some(turns) = debate.get("debate_turns").and_then(Value::as_array) {
-        for turn in turns {
-            let role = turn.get("role").and_then(Value::as_str).unwrap_or("");
-            if !role.to_ascii_lowercase().contains(side) {
-                continue;
-            }
-            let payload = turn.pointer("/artifact/payload").unwrap_or(&Value::Null);
-            for item in payload
-                .get("claims")
-                .or_else(|| payload.get("responses"))
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-            {
-                if let Some(refs) = item.get("evidence_refs").and_then(Value::as_array) {
-                    for reference in refs.iter().filter_map(Value::as_str) {
-                        lines.push(format!("- evidence reference: {reference}"));
-                    }
-                }
+    let mut references = BTreeSet::new();
+    for (role, payload) in debate_entries(debate) {
+        if !role.to_ascii_lowercase().contains(side) {
+            continue;
+        }
+        collect_evidence_refs(payload, &mut references);
+        for item in payload
+            .get("claims")
+            .or_else(|| payload.get("responses"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            collect_evidence_refs(item, &mut references);
+        }
+    }
+    references
+        .into_iter()
+        .map(|reference| format!("- evidence reference: {reference}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn debate_entries(debate: &Value) -> Vec<(&str, &Value)> {
+    let mut entries = Vec::new();
+    for turn in debate
+        .get("debate_turns")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if let Some(role) = turn.get("role").and_then(Value::as_str) {
+            entries.push((role, artifact_payload(turn)));
+        }
+    }
+    for controller in debate
+        .pointer("/final_reducer/authoritative_fields/controllers")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|controllers| controllers.values())
+    {
+        for node in controller
+            .get("nodes")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if let Some(role) = node.get("from").and_then(Value::as_str) {
+                entries.push((role, artifact_payload(node)));
             }
         }
     }
-    lines.join("\n")
+    entries
+}
+
+fn artifact_payload(value: &Value) -> &Value {
+    let artifact = value.get("artifact").unwrap_or(value);
+    artifact.get("payload").unwrap_or(artifact)
+}
+
+fn collect_evidence_refs(value: &Value, output: &mut BTreeSet<String>) {
+    for reference in value
+        .get("evidence_refs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|reference| !reference.trim().is_empty())
+    {
+        output.insert(reference.to_owned());
+    }
+}
+
+fn push_unique(output: &mut Vec<String>, value: &str) {
+    if !output.iter().any(|existing| existing == value) {
+        output.push(value.to_owned());
+    }
 }
 
 fn risk_field_str<'a>(rc: &'a Value, field: &str) -> Option<&'a str> {
@@ -365,8 +543,7 @@ fn risk_assessment(risk_state: &Value, allocation: &Value) -> String {
         .or_else(|| {
             history
                 .last()
-                .and_then(|entry| entry.get("artifact").or(Some(entry)))
-                .and_then(|artifact| artifact.get("recommended_adjustment"))
+                .and_then(|entry| artifact_payload(entry).get("recommended_adjustment"))
                 .and_then(Value::as_str)
         })
         .unwrap_or("None");
@@ -381,7 +558,7 @@ fn risk_assessment(risk_state: &Value, allocation: &Value) -> String {
     let mut risks: Vec<String> = Vec::new();
 
     for entry in &history {
-        let artifact = entry.get("artifact").unwrap_or(entry);
+        let artifact = artifact_payload(entry);
         // Prefer structured risk lists when available.
         let mut found_structured = false;
         if let Some(key_risks) = artifact.get("key_risks").and_then(Value::as_array) {
@@ -429,10 +606,7 @@ fn risk_assessment(risk_state: &Value, allocation: &Value) -> String {
     // Surface structured RiskConstraints fields when present. These live at
     // the top level of `risk_debate_state` or inside the last history
     // artifact in some flows. Missing fields are skipped.
-    let rc = history
-        .last()
-        .map(|entry| entry.get("artifact").unwrap_or(entry))
-        .unwrap_or(risk_state);
+    let rc = history.last().map(artifact_payload).unwrap_or(risk_state);
     let structured: Vec<String> = vec![
         risk_field_str(rc, "stop_type").map(|value| format!("- **Stop Type:** {value}")),
         risk_field_pct(rc, "max_drawdown_pct").map(|value| format!("- **Max Drawdown:** {value}")),
@@ -463,6 +637,7 @@ fn trade_plan(trader: &Value, final_decision: &Value) -> String {
     let action = trader
         .get("action")
         .and_then(Value::as_str)
+        .or_else(|| final_decision.get("direction").and_then(Value::as_str))
         .or_else(|| final_decision.get("rating").and_then(Value::as_str))
         .unwrap_or("N/A");
     let position_size = trader
@@ -470,14 +645,8 @@ fn trade_plan(trader: &Value, final_decision: &Value) -> String {
         .and_then(Value::as_f64)
         .map(|value| format!("{:.0}%", value * 100.0))
         .unwrap_or_else(|| "N/A".to_string());
-    let entry = trader
-        .get("entry_price")
-        .and_then(Value::as_str)
-        .unwrap_or("N/A");
-    let stop = trader
-        .get("stop_loss")
-        .and_then(Value::as_str)
-        .unwrap_or("N/A");
+    let entry = scalar_display(trader.get("entry_price"));
+    let stop = scalar_display(trader.get("stop_loss"));
     let horizon = final_decision
         .get("horizon")
         .and_then(Value::as_str)
@@ -492,6 +661,14 @@ fn trade_plan(trader: &Value, final_decision: &Value) -> String {
         | Stop Loss | {stop} |\n\
         | Horizon | {horizon} |\n"
     )
+}
+
+fn scalar_display(value: Option<&Value>) -> String {
+    match value {
+        Some(Value::String(value)) if !value.trim().is_empty() => value.to_owned(),
+        Some(Value::Number(value)) => value.to_string(),
+        _ => "N/A".to_owned(),
+    }
 }
 
 fn portfolio_allocation(allocation: &Value) -> String {
@@ -737,6 +914,69 @@ mod tests {
         })
     }
 
+    fn canonical_runtime_state() -> Value {
+        json!({
+            "ticker": "QQQ,SOXX,VIX",
+            "current_date": "2026-07-06",
+            "tickers": ["QQQ", "SOXX", "VIX"],
+            "investable_assets": ["QQQ", "SOXX"],
+            "research_plan": {"per_ticker": {
+                "QQQ": {
+                    "rating": "Buy",
+                    "long_probability": 0.74,
+                    "short_probability": 0.26,
+                    "probability_rationale": "QQQ breadth improved.",
+                    "dominant_driver": "QQQ momentum",
+                    "why_now": "QQQ reclaimed support",
+                    "plan": "Watch QQQ volume",
+                    "data_gaps": [],
+                    "validation_triggers": ["QQQ closes below support"]
+                },
+                "SOXX": {
+                    "rating": "Hold",
+                    "long_probability": 0.5,
+                    "short_probability": 0.5
+                }
+            }},
+            "trader_investment_plan": {"per_ticker": {
+                "QQQ": {
+                    "action": "Buy", "position_size_pct_max": 0.3,
+                    "entry_price": 450.25, "stop_loss": 430.5
+                },
+                "SOXX": {"action": "Hold", "position_size_pct_max": 0.0}
+            }},
+            "risk_debate_state": {"history": [{"payload": {
+                "argument": "Volatility can reverse the QQQ move.",
+                "recommended_adjustment": "Keep a cash hedge."
+            }}]},
+            "final_trade_decision": {"per_asset": {
+                "QQQ": {"direction": "Buy", "long_probability": 0.74, "short_probability": 0.26},
+                "SOXX": {"direction": "Hold", "long_probability": 0.5, "short_probability": 0.5}
+            }},
+            "portfolio_allocation": {
+                "weights": {
+                    "QQQ": {"weight": 0.3, "rationale": "primary exposure"},
+                    "SOXX": {"weight": 0.1, "rationale": "diversifier"},
+                    "cash_hedge": {"weight": 0.6, "rationale": "risk budget"}
+                },
+                "total_equity_exposure": 0.4,
+                "vix_regime": "normal"
+            },
+            "debate_state_artifact": {"final_reducer": {"authoritative_fields": {
+                "controllers": {"topic-qqq": {"nodes": [
+                    {"from": "bull", "payload": {
+                        "report": "Breadth supports the QQQ upside.",
+                        "evidence_refs": ["technical-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+                    }},
+                    {"from": "bear", "payload": {
+                        "report": "Volatility remains a QQQ downside risk.",
+                        "evidence_refs": ["jin10-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]
+                    }}
+                ]}}
+            }}}
+        })
+    }
+
     #[test]
     fn generates_all_nine_sections() {
         let report = build_human_readable_report(&full_state());
@@ -786,6 +1026,31 @@ mod tests {
         let report = build_human_readable_report(&full_state());
         assert!(report.contains("| TQQQ | 45.0% | Primary long exposure |"));
         assert!(report.contains("**Total Equity Exposure:** 45%"));
+    }
+
+    #[test]
+    fn canonical_runtime_shape_renders_primary_asset_and_stree_evidence() {
+        let state = canonical_runtime_state();
+        let report = build_human_readable_report(&state);
+
+        assert!(report.contains("Current rating: **Buy** (long: 74%, short: 26%)."));
+        assert!(report.contains("**Recommended Action:** Buy"));
+        assert!(report.contains("| Entry | 450.25 |"));
+        assert!(report.contains("| Stop Loss | 430.5 |"));
+        assert!(report.contains("Breadth supports the QQQ upside."));
+        assert!(report.contains("Volatility remains a QQQ downside risk."));
+        assert!(report.contains("Volatility can reverse the QQQ move."));
+        assert!(report.contains(
+            "technical-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ));
+        assert!(has_complete_report_projection(&state));
+
+        let projection = report_projection(&state);
+        assert_eq!(
+            projection["research_plan"]["per_ticker"]["QQQ"]["rating"],
+            "Buy"
+        );
+        assert!(has_complete_report_projection(&projection));
     }
 
     #[test]

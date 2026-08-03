@@ -14,10 +14,10 @@ use orchestrator_core::{
 use orchestrator_ingest::{jin10, technical};
 use orchestrator_store::{
     append_index_detail, canonical_json_bytes, content_hash, create_index, finalize_index,
-    read_indexes, read_run_manifest, write_run_manifest, AppendIndexDetailInput, CreateIndexInput,
-    DetailSection, EvaluationStore, FileStore, FileStoreOptions, IndexKind, IndexQuery, IndexScope,
-    ManifestError, RunCompactionMode, RunLocation, RunManifest, RunManifestInit, RunStatus,
-    RunStore,
+    read_all_indexes, read_indexes, read_run_manifest, write_run_manifest, AppendIndexDetailInput,
+    CreateIndexInput, DetailSection, EvaluationStore, FileStore, FileStoreOptions, IndexKind,
+    IndexQuery, IndexScope, ManifestError, RunCompactionMode, RunLocation, RunManifest,
+    RunManifestInit, RunStatus, RunStore,
 };
 use serde_json::{json, Map, Value};
 use std::{
@@ -733,6 +733,7 @@ fn rehydrate_completed_debug_state(
         &IndexQuery {
             kind: Some(IndexKind::PhaseSummary),
             source_phase: Some(8),
+            role: Some("rust.final_decision".to_owned()),
             limit: 1,
             ..Default::default()
         },
@@ -904,8 +905,12 @@ fn highest_completed_phase(manifest: &RunManifest) -> Option<u8> {
 }
 
 fn phase_completed(manifest: &RunManifest, phase: u8) -> bool {
-    manifest.phase_status.get(&phase.to_string())
-        == Some(&orchestrator_store::PhaseStatus::Completed)
+    matches!(
+        manifest.phase_status.get(&phase.to_string()),
+        Some(
+            orchestrator_store::PhaseStatus::Completed | orchestrator_store::PhaseStatus::Degraded
+        )
+    )
 }
 
 fn has_phase3_retrieval_audit(state: &Value) -> bool {
@@ -1004,17 +1009,15 @@ async fn summarize(
 ) -> Result<BTreeMap<String, String>> {
     let store = FileStore::open(store_root, FileStoreOptions::default())?;
     let location = run_location_from_state(state)?;
-    let completed_ids = read_indexes(
+    let completed_ids = read_all_indexes(
         &store,
         Some(&location),
         &IndexQuery {
             kind: Some(IndexKind::PhaseSummary),
             source_phase: Some(u8::try_from(phase).context("summary phase must fit u8")?),
-            limit: runtime.tool_managed.max_summary_units_per_phase,
             ..Default::default()
         },
-    )?
-    .indexes;
+    )?;
     let phase = u8::try_from(phase).context("summary phase must fit u8")?;
     let required = required_phase_index_count(state, runtime, phase);
     if completed_ids.len() < required {
@@ -1386,13 +1389,14 @@ async fn run_phase1(
 }
 
 async fn run_phase2(
-    _store: &FileStore,
-    _location: &RunLocation,
+    store: &FileStore,
+    location: &RunLocation,
     state: &mut Value,
     runtime: &RuntimeConfig,
     model: Option<&str>,
     reasoning: Option<&str>,
 ) -> Result<()> {
+    let phase1_evidence_registry = phase2_initial_evidence_registry(store, location)?;
     let warmup = run_unit(
         state,
         runtime,
@@ -1463,6 +1467,7 @@ async fn run_phase2(
             .unwrap_or(1)
             .max(0);
         let mut tree = TopicDebateTree::open(&topic_id, topic.clone(), max_rounds as u32)?;
+        tree.register_evidence_refs(phase1_evidence_registry.iter().map(String::as_str))?;
         tree.recover_inflight();
         state["topic_debate_states"][&topic_id] = json!({"topic": topic, "stree": tree});
         let mut final_controller = Value::Null;
@@ -1640,6 +1645,19 @@ fn select_phase2_topics(generated: Value, max_topics_per_side: usize) -> Result<
         .cloned()
         .context("Phase 2 topic generation topics must be an array")?;
     let generated_count = topics.len();
+    let mut topic_ids = BTreeSet::new();
+    for (index, topic) in topics.iter().enumerate() {
+        let topic_id = topic
+            .get("topic_id")
+            .and_then(Value::as_str)
+            .with_context(|| format!("Phase 2 topic {index} requires topic_id"))?;
+        if topic_id.trim().is_empty() || topic_id != topic_id.trim() {
+            bail!("Phase 2 topic {index} topic_id must be non-empty and trimmed")
+        }
+        if !topic_ids.insert(topic_id.to_owned()) {
+            bail!("Phase 2 topic generation returned duplicate topic_id {topic_id:?}")
+        }
+    }
     topics.truncate(max_topics_per_side);
     let selected_count = topics.len();
     Ok((
@@ -1653,6 +1671,30 @@ fn select_phase2_topics(generated: Value, max_topics_per_side: usize) -> Result<
             "truncated_count": generated_count.saturating_sub(selected_count),
         }),
     ))
+}
+
+fn phase2_initial_evidence_registry(
+    store: &FileStore,
+    location: &RunLocation,
+) -> Result<BTreeSet<String>> {
+    let indexes = read_all_indexes(
+        store,
+        Some(location),
+        &IndexQuery {
+            kind: Some(IndexKind::PhaseSummary),
+            source_phase: Some(1),
+            ..IndexQuery::default()
+        },
+    )?;
+    let mut references = BTreeSet::new();
+    for index in indexes {
+        references.insert(index.index_id);
+        collect_reference_array_ids(&Value::Object(index.authoritative_fields), &mut references);
+    }
+    if references.is_empty() {
+        bail!("Phase 2 requires persisted Phase 1 evidence provenance")
+    }
+    Ok(references)
 }
 
 fn record_phase2_runtime_failure(
@@ -1712,6 +1754,7 @@ fn apply_phase2_stree_command(
     actor: DebateActor,
     artifact: &Value,
 ) -> Result<()> {
+    register_stree_artifact_evidence_refs(tree, artifact)?;
     let command = artifact
         .pointer("/phase2_stree/command")
         .and_then(Value::as_str)
@@ -1739,6 +1782,27 @@ fn apply_phase2_stree_command(
         ),
     }
     Ok(())
+}
+
+fn register_stree_artifact_evidence_refs(
+    tree: &mut TopicDebateTree,
+    artifact: &Value,
+) -> Result<()> {
+    let Some(references) = artifact.get("verified_evidence_refs") else {
+        return Ok(());
+    };
+    let references = references
+        .as_array()
+        .context("Phase 2 terminal artifact verified_evidence_refs must be an array")?;
+    let references = references
+        .iter()
+        .map(|reference| {
+            reference
+                .as_str()
+                .context("Phase 2 terminal artifact verified_evidence_refs must contain strings")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    tree.register_evidence_refs(references)
 }
 
 fn phase2_stree_terminal_command_present(artifact: &Value) -> bool {
@@ -2440,23 +2504,23 @@ async fn run_phase7(
     let (allocation, allocation_failure) =
         match derive_guarded_allocation(state, &context, &runtime.allocation) {
             Ok(allocation) => (allocation, None),
-        Err(error) => {
-            let failure = error.to_string();
-            state["degraded"] = Value::Bool(true);
-            if !state["errors"].is_array() {
-                state["errors"] = json!([]);
+            Err(error) => {
+                let failure = error.to_string();
+                state["degraded"] = Value::Bool(true);
+                if !state["errors"].is_array() {
+                    state["errors"] = json!([]);
+                }
+                state["errors"]
+                    .as_array_mut()
+                    .expect("errors initialized as array")
+                    .push(json!({
+                        "phase": 7,
+                        "kind": "allocation_blocked",
+                        "failure": failure.clone(),
+                    }));
+                (cash_only_allocation(&context, &failure), Some(failure))
             }
-            state["errors"]
-                .as_array_mut()
-                .expect("errors initialized as array")
-                .push(json!({
-                    "phase": 7,
-                    "kind": "allocation_blocked",
-                    "failure": failure.clone(),
-                }));
-            (cash_only_allocation(&context, &failure), Some(failure))
-        }
-    };
+        };
     state["allocation_context"] = context;
     state["portfolio_allocation"] = allocation.clone();
     let execution_mode = phase7_execution_mode(
@@ -2577,7 +2641,11 @@ async fn run_phase7(
             } else {
                 "Rust 已完成受约束的组合分配。".to_owned()
             },
-            confidence: if allocation_failure.is_some() { 0.0 } else { 1.0 },
+            confidence: if allocation_failure.is_some() {
+                0.0
+            } else {
+                1.0
+            },
             authoritative_fields: serde_json::from_value(json!({
                 "account_snapshot": state.get("account_snapshot").cloned().unwrap_or(Value::Null),
                 "allocation_context": state["allocation_context"],
@@ -2588,17 +2656,15 @@ async fn run_phase7(
             details: vec![PhaseIndexCandidateDetail {
                 section: "execution".to_owned(),
                 detail: String::new(),
-                source_refs: read_indexes(
+                source_refs: read_all_indexes(
                     store,
                     Some(location),
                     &IndexQuery {
                         kind: Some(IndexKind::PhaseSummary),
                         source_phase: Some(6),
-                        limit: 100,
                         ..Default::default()
                     },
                 )?
-                .indexes
                 .into_iter()
                 .map(|index| index.index_id)
                 .collect(),
@@ -2666,16 +2732,7 @@ fn write_final_decision_indexes(
     let mut summary_units = BTreeMap::new();
     let created_at = Utc::now().to_rfc3339();
     let unit_key = "phase8:final-decision:aggregate".to_owned();
-    let payload = json!({
-        "final_trade_decision": state["final_trade_decision"],
-        "allocation_context": state["allocation_context"],
-        "portfolio_allocation": state["portfolio_allocation"],
-        "allocation_result": state["allocation_result"],
-        "account_snapshot": state.get("account_snapshot").cloned().unwrap_or(Value::Null),
-        "order_plan": state.get("order_plan").cloned().unwrap_or(Value::Null),
-        "execution_report": state.get("execution_report").cloned().unwrap_or(Value::Null),
-        "decision_snapshots": decision_snapshots,
-    });
+    let payload = final_decision_payload(state, decision_snapshots);
     let source_payload_hash = content_hash(&payload)?;
     let index_id = derive_summary_index_id(
         &location.run_id,
@@ -2721,17 +2778,15 @@ fn write_final_decision_indexes(
         .into_iter()
         .collect::<Vec<_>>();
     source_refs.extend(
-        read_indexes(
+        read_all_indexes(
             store,
             Some(location),
             &IndexQuery {
                 kind: Some(IndexKind::PhaseSummary),
                 source_phase: Some(6),
-                limit: 100,
                 ..Default::default()
             },
         )?
-        .indexes
         .into_iter()
         .map(|index| index.index_id),
     );
@@ -2749,6 +2804,20 @@ fn write_final_decision_indexes(
     finalize_index(store, &scope)?;
     summary_units.insert(unit_key, index_id);
     Ok(summary_units)
+}
+
+fn final_decision_payload(state: &Value, decision_snapshots: &BTreeMap<String, Value>) -> Value {
+    json!({
+        "final_trade_decision": state["final_trade_decision"],
+        "allocation_context": state["allocation_context"],
+        "portfolio_allocation": state["portfolio_allocation"],
+        "allocation_result": state["allocation_result"],
+        "account_snapshot": state.get("account_snapshot").cloned().unwrap_or(Value::Null),
+        "order_plan": state.get("order_plan").cloned().unwrap_or(Value::Null),
+        "execution_report": state.get("execution_report").cloned().unwrap_or(Value::Null),
+        "decision_snapshots": decision_snapshots,
+        "report_projection": crate::report::builder::report_projection(state),
+    })
 }
 
 fn evaluation_persistence_context(
@@ -3164,7 +3233,7 @@ async fn compile_unit_response(
             "authority": "transient_phase2_extraction"
         }));
     }
-    populate_missing_detail_source_refs(state, phase_u8, &mut candidate.details)?;
+    validate_declared_detail_source_refs(&candidate.details)?;
     if phase_u8 == 0 {
         let submission = phase0_submission(&candidate, response_text)?;
         commit_historical_reflection(
@@ -3207,55 +3276,39 @@ async fn compile_unit_response(
     }))
 }
 
-fn populate_missing_detail_source_refs(
-    state: &Value,
-    phase: u8,
-    details: &mut [PhaseIndexCandidateDetail],
-) -> Result<()> {
-    if phase < 2 || details.iter().all(|detail| !detail.source_refs.is_empty()) {
-        return Ok(());
+fn validate_declared_detail_source_refs(details: &[PhaseIndexCandidateDetail]) -> Result<()> {
+    for detail in details {
+        let mut seen = BTreeSet::new();
+        for reference in &detail.source_refs {
+            if !is_complete_declared_source_ref(reference) {
+                bail!(
+                    "Detail source reference {reference:?} must be an exact idx- or phase-1 evidence ID"
+                )
+            }
+            if !seen.insert(reference) {
+                bail!("Detail source references must not contain duplicates")
+            }
+        }
     }
-    let store_root = state
-        .get("store_root")
-        .and_then(Value::as_str)
-        .context("store_root is required for Detail source provenance")?;
-    let store = FileStore::open(store_root, FileStoreOptions::default())?;
-    let location = run_location_from_state(state)?;
-    let page = read_indexes(
-        &store,
-        Some(&location),
-        &IndexQuery {
-            source_phase: Some(phase - 1),
-            limit: 1_000,
-            ..IndexQuery::default()
-        },
-    )?;
-    let upstream_refs = page
-        .indexes
-        .into_iter()
-        .map(|index| index.index_id)
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    if upstream_refs.is_empty() {
-        bail!(
-            "Phase {phase} Detail source provenance requires persisted Phase {} Index IDs",
-            phase - 1
-        )
-    }
-    fill_empty_detail_source_refs(details, &upstream_refs);
     Ok(())
 }
 
-fn fill_empty_detail_source_refs(
-    details: &mut [PhaseIndexCandidateDetail],
-    upstream_refs: &[String],
-) {
-    for detail in details {
-        if detail.source_refs.is_empty() {
-            detail.source_refs = upstream_refs.to_vec();
-        }
-    }
+fn is_complete_declared_source_ref(reference: &str) -> bool {
+    let Some((prefix, digest)) = ["idx-", "technical-", "jin10-", "web-"]
+        .into_iter()
+        .find_map(|prefix| {
+            reference
+                .strip_prefix(prefix)
+                .map(|digest| (prefix, digest))
+        })
+    else {
+        return false;
+    };
+    let _ = prefix;
+    digest.len() == 64
+        && digest
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
 }
 
 fn phase0_submission(
@@ -3910,39 +3963,7 @@ fn canonicalize_verified_phase1_reference(
     reference: &str,
     verified_ids: &BTreeSet<String>,
 ) -> Option<String> {
-    if verified_ids.contains(reference) {
-        return Some(reference.to_owned());
-    }
-    let mut appended_suffix_candidates = verified_ids
-        .iter()
-        .filter(|candidate| reference.starts_with(candidate.as_str()));
-    if let Some(candidate) = appended_suffix_candidates.next() {
-        return appended_suffix_candidates
-            .next()
-            .is_none()
-            .then(|| candidate.clone());
-    }
-    // A model may transcribe one hexadecimal character incorrectly while
-    // copying a registry ID. Recover only a unique same-length neighbor; two
-    // possible matches remain untrusted and are removed by the caller.
-    let mut one_character_candidates = verified_ids
-        .iter()
-        .filter(|candidate| one_character_substitution_away(reference, candidate));
-    let candidate = one_character_candidates.next()?.clone();
-    one_character_candidates
-        .next()
-        .is_none()
-        .then_some(candidate)
-}
-
-fn one_character_substitution_away(reference: &str, candidate: &str) -> bool {
-    reference.len() == candidate.len()
-        && reference
-            .bytes()
-            .zip(candidate.bytes())
-            .filter(|(left, right)| left != right)
-            .count()
-            == 1
+    verified_ids.get(reference).cloned()
 }
 
 impl Phase1ReferenceNormalization {
@@ -4558,16 +4579,15 @@ fn verified_phase3_source_refs(state: &Value) -> Result<Option<BTreeSet<String>>
     let location = run_location_from_state(state)?;
     let mut verified = BTreeSet::new();
     for phase in [1_u8, 2_u8] {
-        let page = read_indexes(
+        let indexes = read_all_indexes(
             &store,
             Some(&location),
             &IndexQuery {
                 source_phase: Some(phase),
-                limit: 1_000,
                 ..IndexQuery::default()
             },
         )?;
-        for index in page.indexes {
+        for index in indexes {
             verified.insert(index.index_id);
             if phase == 1 {
                 collect_reference_array_ids(
@@ -5246,22 +5266,22 @@ mod phase2_session_tests {
     use crate::orchestration::summary_store::PhaseIndexCandidateDetail;
 
     use super::{
-        attach_verified_phase1_web_sources, attach_verified_web_evidence,
-        controller_should_continue, defers_phase_summary,
+        apply_phase2_stree_command, attach_verified_phase1_web_sources,
+        attach_verified_web_evidence, controller_should_continue, defers_phase_summary,
         enrich_and_validate_phase6_compiled_fields, enrich_final_trade_decision_fields,
-        ensure_initial_collision_route, fill_empty_detail_source_refs, finish_phase,
+        ensure_initial_collision_route, final_decision_payload, finish_phase,
         highest_completed_phase, is_cacheable_unit, load_or_initialize_state,
         normalize_phase2_topic_control_fields, persist_state, persists_phase_index,
         phase2_debate_debug_summary, phase2_stree_terminal_command_present,
-        phase2_terminal_tool_retry_injection, project_phase2_final_fields,
-        project_phase3_evidence_refs, prompt_owner_for_unit, record_phase2_runtime_failure,
-        record_phase2_session, redacted_config_for_state, resolve_git_sha, runtime_session_key,
-        scoped_state_for_unit, select_phase2_topics, select_reflection_task_budget,
-        phase7_execution_mode, sync_manifest_health, validate_phase1_compiled_fields,
-        validate_phase2_compiled_contract,
+        phase2_terminal_tool_retry_injection, phase7_execution_mode, phase_completed,
+        project_phase2_final_fields, project_phase3_evidence_refs, prompt_owner_for_unit,
+        record_phase2_runtime_failure, record_phase2_session, redacted_config_for_state,
+        resolve_git_sha, runtime_session_key, scoped_state_for_unit, select_phase2_topics,
+        select_reflection_task_budget, sync_manifest_health, validate_declared_detail_source_refs,
+        validate_phase1_compiled_fields, validate_phase2_compiled_contract,
         validate_phase2_topic_ttls, validate_phase3_compiled_fields,
         validate_phase4_compiled_fields, validate_phase5_compiled_fields,
-        weighted_probability_base, DebateActor, Phase7ExecutionMode,
+        weighted_probability_base, DebateActor, Phase7ExecutionMode, TopicDebateTree,
     };
 
     #[test]
@@ -5365,6 +5385,32 @@ mod phase2_session_tests {
     }
 
     #[test]
+    fn final_decision_index_payload_keeps_the_report_projection() {
+        let state = json!({
+            "current_date": "2026-08-03",
+            "ticker": "QQQ",
+            "investable_assets": ["QQQ"],
+            "research_plan": {"per_ticker": {"QQQ": {"long_probability": 0.7}}},
+            "trader_investment_plan": {"per_ticker": {"QQQ": {"action": "Buy"}}},
+            "risk_debate_state": {"history": [{"payload": {"argument": "risk"}}]},
+            "final_trade_decision": {"per_asset": {"QQQ": {"direction": "Buy"}}},
+            "portfolio_allocation": {"weights": {"QQQ": {"weight": 0.2}}},
+            "debate_state_artifact": {"status": "completed"}
+        });
+
+        let payload = final_decision_payload(&state, &Default::default());
+
+        assert_eq!(
+            payload["report_projection"]["research_plan"]["per_ticker"]["QQQ"]["long_probability"],
+            0.7
+        );
+        assert_eq!(
+            payload["report_projection"]["final_trade_decision"]["per_asset"]["QQQ"]["direction"],
+            "Buy"
+        );
+    }
+
+    #[test]
     fn weighted_probability_base_uses_phase1_direction_and_confidence() {
         let state = json!({
             "investable_assets": ["QQQ", "SOXX"],
@@ -5408,6 +5454,20 @@ mod phase2_session_tests {
         assert_eq!(audit["selected_count"], 2);
         assert_eq!(audit["truncated_count"], 1);
         assert_eq!(audit["max_topics_per_side"], 2);
+    }
+
+    #[test]
+    fn phase2_topic_selection_rejects_duplicate_topic_ids() {
+        let error = select_phase2_topics(
+            json!([
+                {"topic_id": "topic-a"},
+                {"topic_id": "topic-a"}
+            ]),
+            2,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("duplicate topic_id"));
     }
 
     #[test]
@@ -5671,6 +5731,29 @@ mod phase2_session_tests {
         assert_eq!(state["degraded"], true);
         assert_eq!(state["errors"][0]["phase"], 2);
         assert_eq!(state["errors"][0]["recovered"], true);
+    }
+
+    #[test]
+    fn phase2_registers_terminal_tool_evidence_before_accepting_a_submission() {
+        let mut tree = TopicDebateTree::open("topic-a", json!({"topic": "rates"}), 1).unwrap();
+        let actor = tree.next_dispatch().unwrap().actor;
+        let evidence_id = "web-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let artifact = json!({
+            "verified_evidence_refs": [evidence_id],
+            "phase2_stree": {
+                "command": "submit_debate_turn",
+                "payload": {
+                    "stance": "needs_evidence",
+                    "message": "Use the verified source before concluding.",
+                    "report": "Participant records an evidence gap.",
+                    "evidence_refs": [evidence_id]
+                }
+            }
+        });
+
+        apply_phase2_stree_command(&mut tree, actor, &artifact).unwrap();
+
+        assert!(tree.evidence_registry.contains(evidence_id));
     }
 
     #[test]
@@ -6189,7 +6272,7 @@ mod phase2_session_tests {
     }
 
     #[test]
-    fn phase1_canonicalizes_unique_one_character_transcriptions_against_tool_registry() {
+    fn phase1_drops_one_character_transcriptions_instead_of_repairing_them() {
         let response = format!(
             "报告\n\n{}\n{}",
             orchestrator_llm::VERIFIED_PHASE1_EVIDENCE_MARKER,
@@ -6224,24 +6307,24 @@ mod phase2_session_tests {
         );
         assert_eq!(
             fields["evidence_normalization"]["unverified_technical_refs_removed"],
-            0
+            1
         );
         assert_eq!(
             fields["evidence_normalization"]["unverified_jin10_refs_removed"],
-            0
+            1
         );
         assert_eq!(
             fields["evidence_normalization"]["canonicalized_technical_refs"],
-            1
+            0
         );
         assert_eq!(
             fields["evidence_normalization"]["canonicalized_jin10_refs"],
-            1
+            0
         );
     }
 
     #[test]
-    fn phase1_canonicalizes_extended_cross_asset_refs_against_tool_registry() {
+    fn phase1_drops_extended_cross_asset_refs_instead_of_trimming_them() {
         let technical =
             "technical-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let response = format!(
@@ -6264,13 +6347,10 @@ mod phase2_session_tests {
 
         attach_verified_phase1_web_sources(&response, &mut fields).unwrap();
 
-        assert_eq!(
-            fields["cross_asset_findings"][0]["evidence_refs"],
-            json!([technical])
-        );
+        assert_eq!(fields["cross_asset_findings"], json!([]));
         assert_eq!(
             fields["evidence_normalization"]["canonicalized_technical_refs"],
-            1
+            0
         );
     }
 
@@ -6373,8 +6453,9 @@ mod phase2_session_tests {
     }
 
     #[test]
-    fn empty_compiled_details_inherit_actual_upstream_index_refs() {
-        let mut details = vec![
+    fn empty_compiled_details_remain_uncited_without_a_declared_source() {
+        let index_ref = format!("idx-{}", "a".repeat(64));
+        let details = vec![
             PhaseIndexCandidateDetail {
                 section: "execution".to_owned(),
                 detail: "phase detail".to_owned(),
@@ -6383,20 +6464,13 @@ mod phase2_session_tests {
             PhaseIndexCandidateDetail {
                 section: "execution".to_owned(),
                 detail: "already cited".to_owned(),
-                source_refs: vec!["idx-existing".to_owned()],
+                source_refs: vec![index_ref.clone()],
             },
         ];
 
-        fill_empty_detail_source_refs(
-            &mut details,
-            &["idx-upstream-a".to_owned(), "idx-upstream-b".to_owned()],
-        );
-
-        assert_eq!(
-            details[0].source_refs,
-            vec!["idx-upstream-a".to_owned(), "idx-upstream-b".to_owned()]
-        );
-        assert_eq!(details[1].source_refs, vec!["idx-existing".to_owned()]);
+        validate_declared_detail_source_refs(&details).unwrap();
+        assert!(details[0].source_refs.is_empty());
+        assert_eq!(details[1].source_refs, vec![index_ref]);
     }
 
     #[test]
@@ -6519,6 +6593,29 @@ mod phase2_session_tests {
             .insert("8".to_owned(), PhaseStatus::Completed);
 
         assert_eq!(highest_completed_phase(&manifest), Some(8));
+    }
+
+    #[test]
+    fn degraded_phase_is_terminal_for_recovery() {
+        let mut manifest = RunManifest::new(RunManifestInit {
+            location: RunLocation::new("2026-08-03", "run-degraded-phase-test").unwrap(),
+            workflow_version: "test".to_owned(),
+            prompt_versions: Default::default(),
+            git_sha: "test".to_owned(),
+            config_hash: "test".to_owned(),
+            role_profile_registry_hash: "test".to_owned(),
+            created_at: "2026-08-03T00:00:00Z".to_owned(),
+        })
+        .unwrap();
+        manifest
+            .phase_status
+            .insert("7".to_owned(), PhaseStatus::Degraded);
+        manifest
+            .phase_status
+            .insert("8".to_owned(), PhaseStatus::Degraded);
+
+        assert!(phase_completed(&manifest, 7));
+        assert!(phase_completed(&manifest, 8));
     }
 
     #[test]

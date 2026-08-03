@@ -94,8 +94,12 @@ impl JsonlRecord for JsonlEvent {
 /// which makes a corrupt middle line a hard failure instead of silently
 /// skipping history.
 pub fn append_jsonl<R: JsonlRecord>(root: &Path, relative: &Path, record: &R) -> Result<()> {
+    let _lock = crate::lock::lock_exclusive(root, relative)?;
     let path = resolve_for_write(root, relative)?;
-    let parent = path.parent().expect("resolved JSONL path has a parent");
+    let parent = path
+        .parent()
+        .expect("resolved JSONL path has a parent")
+        .to_path_buf();
     let mut file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -104,26 +108,66 @@ pub fn append_jsonl<R: JsonlRecord>(root: &Path, relative: &Path, record: &R) ->
         .open(&path)
         .map_err(|source| io_error(&path, source))?;
     let records = read_jsonl_from_locked_file::<R>(&mut file, &path, true)?;
+    append_record(file, &path, &parent, &records, record)
+}
+
+/// Read, decide, and append one JSONL record while holding the file's
+/// path-scoped exclusive lock.  This is the primitive for idempotent ledgers
+/// whose record identity and sequence depend on their current history.
+/// Returning `None` performs no write and leaves the validated history intact.
+pub(crate) fn append_jsonl_transaction<R: JsonlRecord>(
+    root: &Path,
+    relative: &Path,
+    build: impl FnOnce(&[R]) -> Result<Option<R>>,
+) -> Result<Option<R>> {
+    let _lock = crate::lock::lock_exclusive(root, relative)?;
+    let path = resolve_for_write(root, relative)?;
+    let parent = path
+        .parent()
+        .expect("resolved JSONL path has a parent")
+        .to_path_buf();
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|source| io_error(&path, source))?;
+    let records = read_jsonl_from_locked_file::<R>(&mut file, &path, true)?;
+    let Some(record) = build(&records)? else {
+        return Ok(None);
+    };
+    append_record(file, &path, &parent, &records, &record)?;
+    Ok(Some(record))
+}
+
+fn append_record<R: JsonlRecord>(
+    mut file: File,
+    path: &Path,
+    parent: &Path,
+    records: &[R],
+    record: &R,
+) -> Result<()> {
     let expected = records.last().map_or(1, |last| last.sequence() + 1);
     if record.sequence() != expected {
         return Err(StoreError::JsonlSequence {
-            path,
+            path: path.to_path_buf(),
             expected,
             found: record.sequence(),
         });
     }
-    validate_record(record, &path)?;
+    validate_record(record, path)?;
 
     let value =
         serde_json::to_value(record).map_err(|source| StoreError::JsonSerialize { source })?;
     let mut bytes = canonical_json_bytes(&value)?;
     bytes.push(b'\n');
     file.seek(SeekFrom::End(0))
-        .map_err(|source| io_error(&path, source))?;
+        .map_err(|source| io_error(path, source))?;
     file.write_all(&bytes)
-        .map_err(|source| io_error(&path, source))?;
-    file.flush().map_err(|source| io_error(&path, source))?;
-    file.sync_all().map_err(|source| io_error(&path, source))?;
+        .map_err(|source| io_error(path, source))?;
+    file.flush().map_err(|source| io_error(path, source))?;
+    file.sync_all().map_err(|source| io_error(path, source))?;
     drop(file);
     sync_directory(parent)
 }
@@ -132,6 +176,7 @@ pub fn append_jsonl<R: JsonlRecord>(root: &Path, relative: &Path, record: &R) ->
 /// newline-terminated malformed line, invalid hash, or sequence discontinuity
 /// is a hard failure.
 pub fn read_jsonl_recover_tail<R: JsonlRecord>(root: &Path, relative: &Path) -> Result<Vec<R>> {
+    let _lock = crate::lock::lock_exclusive(root, relative)?;
     let path = resolve_for_write(root, relative)?;
     let mut file = OpenOptions::new()
         .read(true)
@@ -143,6 +188,16 @@ pub fn read_jsonl_recover_tail<R: JsonlRecord>(root: &Path, relative: &Path) -> 
     let records = read_jsonl_from_locked_file::<R>(&mut file, &path, true)?;
     drop(file);
     Ok(records)
+}
+
+/// Read JSONL without mutating the file. Unlike [`read_jsonl_recover_tail`],
+/// an unterminated final record is reported as corruption instead of being
+/// truncated. Use this for inspection and validation paths.
+pub fn read_jsonl_strict<R: JsonlRecord>(root: &Path, relative: &Path) -> Result<Vec<R>> {
+    let _lock = crate::lock::lock_shared(root, relative)?;
+    let path = resolve_for_write(root, relative)?;
+    let mut file = File::open(&path).map_err(|source| io_error(&path, source))?;
+    read_jsonl_from_locked_file::<R>(&mut file, &path, false)
 }
 
 fn read_jsonl_from_locked_file<R: JsonlRecord>(
@@ -162,13 +217,17 @@ fn read_jsonl_from_locked_file<R: JsonlRecord>(
         None => 0,
     };
     if complete_len < bytes.len() {
-        if repair_tail {
-            file.set_len(complete_len as u64)
-                .map_err(|source| io_error(path, source))?;
-            file.sync_all().map_err(|source| io_error(path, source))?;
-            if let Some(parent) = path.parent() {
-                sync_directory(parent)?;
-            }
+        if !repair_tail {
+            return Err(StoreError::JsonlHash {
+                path: path.to_path_buf(),
+                message: "unterminated final JSONL record".to_owned(),
+            });
+        }
+        file.set_len(complete_len as u64)
+            .map_err(|source| io_error(path, source))?;
+        file.sync_all().map_err(|source| io_error(path, source))?;
+        if let Some(parent) = path.parent() {
+            sync_directory(parent)?;
         }
         bytes.truncate(complete_len);
     }
@@ -230,7 +289,7 @@ mod tests {
     use serde_json::json;
     use tempfile::tempdir;
 
-    use super::{append_jsonl, read_jsonl_recover_tail, JsonlEvent};
+    use super::{append_jsonl, read_jsonl_recover_tail, read_jsonl_strict, JsonlEvent};
     use crate::StoreError;
 
     fn event(sequence: u64) -> JsonlEvent {
@@ -276,6 +335,19 @@ mod tests {
         let events = read_jsonl_recover_tail::<JsonlEvent>(directory.path(), path).unwrap();
         assert_eq!(events.len(), 1);
         assert!(fs::read(&absolute).unwrap().ends_with(b"\n"));
+    }
+
+    #[test]
+    fn strict_read_reports_an_unterminated_tail_without_truncating_it() {
+        let directory = tempdir().unwrap();
+        let path = Path::new("session/turn.jsonl");
+        append_jsonl(directory.path(), path, &event(1)).unwrap();
+        let absolute = directory.path().join(path);
+        let before = [fs::read(&absolute).unwrap(), b"{partial".to_vec()].concat();
+        fs::write(&absolute, &before).unwrap();
+
+        assert!(read_jsonl_strict::<JsonlEvent>(directory.path(), path).is_err());
+        assert_eq!(fs::read(&absolute).unwrap(), before);
     }
 
     #[test]

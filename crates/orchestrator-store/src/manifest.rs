@@ -642,13 +642,37 @@ pub fn list_run_locations(store: &FileStore) -> Result<Vec<RunLocation>> {
 }
 
 fn is_workflow_date(value: &str) -> bool {
-    value.len() == 10
-        && value.as_bytes()[4] == b'-'
-        && value.as_bytes()[7] == b'-'
-        && value
-            .bytes()
-            .enumerate()
-            .all(|(index, byte)| matches!(index, 4 | 7) || byte.is_ascii_digit())
+    let bytes = value.as_bytes();
+    if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
+        return false;
+    }
+    if !bytes
+        .iter()
+        .enumerate()
+        .all(|(index, byte)| index == 4 || index == 7 || byte.is_ascii_digit())
+    {
+        return false;
+    }
+    let Ok(year) = value[0..4].parse::<u32>() else {
+        return false;
+    };
+    let Ok(month) = value[5..7].parse::<u32>() else {
+        return false;
+    };
+    let Ok(day) = value[8..10].parse::<u32>() else {
+        return false;
+    };
+    if year == 0 || !(1..=12).contains(&month) {
+        return false;
+    }
+    let days = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if year % 400 == 0 || (year % 4 == 0 && year % 100 != 0) => 29,
+        2 => 28,
+        _ => return false,
+    };
+    (1..=days).contains(&day)
 }
 
 fn is_run_partition(value: &str) -> bool {
@@ -705,6 +729,13 @@ mod tests {
             location.relative_root(),
             PathBuf::from("runs/2026-07-27/qqq-soxx-vix-a1b2c3")
         );
+    }
+
+    #[test]
+    fn run_location_rejects_impossible_calendar_dates() {
+        assert!(RunLocation::new("2026-02-29", "run").is_err());
+        assert!(RunLocation::new("2024-02-29", "run").is_ok());
+        assert!(RunLocation::new("2026-04-31", "run").is_err());
     }
 
     #[test]

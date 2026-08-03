@@ -186,19 +186,21 @@ impl EvaluationStore {
     ) -> Result<OutcomeWriteReceiptV1> {
         self.require_outcome_write()?;
         validate_outcome(&outcome)?;
+        let head_relative = self.head_relative(&outcome.evaluation_key)?;
+        let _head_lock = self.store.lock_exclusive(&head_relative)?;
         let mut head = self.read_or_rebuild_head(&outcome.evaluation_key)?;
         let previous = head.current_outcome_id.clone();
-        // Always validate the immutable record before accepting an
-        // idempotent receipt.  An already-current ID with different
-        // bytes is a provenance violation, not a duplicate.
         let outcome_relative = self.outcome_relative(&outcome.outcome_id)?;
-        let (sealed_outcome, existed) = create_or_validate(
-            &self.store,
-            &outcome_relative,
-            FileSchemaKind::OutcomeRecord,
-            outcome.clone(),
-        )?;
         if previous.as_deref() == Some(outcome.outcome_id.as_str()) {
+            // An already-current ID still has to match its immutable
+            // canonical record; otherwise this is a provenance violation,
+            // never an idempotent retry.
+            let (sealed_outcome, _) = create_or_validate(
+                &self.store,
+                &outcome_relative,
+                FileSchemaKind::OutcomeRecord,
+                outcome,
+            )?;
             return self.write_receipt(
                 evaluation_run,
                 &sealed_outcome,
@@ -212,6 +214,12 @@ impl EvaluationStore {
                 "supersedes_outcome_id must equal the current outcome head",
             ));
         }
+        let (sealed_outcome, existed) = create_or_validate(
+            &self.store,
+            &outcome_relative,
+            FileSchemaKind::OutcomeRecord,
+            outcome.clone(),
+        )?;
         let sequence = head.as_of_revision.saturating_add(1);
         let commit = new_publish_commit(
             &outcome,
@@ -229,7 +237,6 @@ impl EvaluationStore {
         )?;
         apply_commit(&mut head, &sealed_commit)?;
         head.revision_set_hash = revision_set_hash(&head)?;
-        let head_relative = self.head_relative(&outcome.evaluation_key)?;
         let sealed_head = self.store.write_authoritative_json(&head_relative, head)?;
         let receipt_result = if existed || previous.is_some() {
             OutcomeWriteResultKind::PublishedRevision
@@ -518,6 +525,16 @@ impl EvaluationStore {
     }
 
     pub fn rebuild_outcome_head(&self, evaluation_key: &str) -> Result<OutcomeHeadV1> {
+        let head_relative = self.head_relative(evaluation_key)?;
+        let _head_lock = self.store.lock_exclusive(&head_relative)?;
+        self.rebuild_outcome_head_locked(evaluation_key, &head_relative)
+    }
+
+    fn rebuild_outcome_head_locked(
+        &self,
+        evaluation_key: &str,
+        head_relative: &Path,
+    ) -> Result<OutcomeHeadV1> {
         let mut commits = self.read_revision_commits(evaluation_key)?;
         commits.sort_by_key(|commit| commit.revision_sequence);
         // A first publish may follow an already-persisted empty head, so the
@@ -543,8 +560,7 @@ impl EvaluationStore {
             // next commit's previous_head_hash can be verified.
             head = crate::seal_content_hash(head)?;
         }
-        self.store
-            .write_authoritative_json(&self.head_relative(evaluation_key)?, head)
+        self.store.write_authoritative_json(head_relative, head)
     }
 
     fn read_or_rebuild_head(&self, evaluation_key: &str) -> Result<OutcomeHeadV1> {
@@ -553,7 +569,7 @@ impl EvaluationStore {
             self.store
                 .read_versioned_json(&relative, FileSchemaKind::OutcomeHead)
         } else {
-            self.rebuild_outcome_head(evaluation_key)
+            self.rebuild_outcome_head_locked(evaluation_key, &relative)
         }
     }
 
@@ -1019,6 +1035,7 @@ fn create_or_validate<T>(
 where
     T: Versioned + ContentHashDocument + serde::de::DeserializeOwned + Clone,
 {
+    let _lock = store.lock_exclusive(relative)?;
     let sealed = crate::seal_content_hash(document.clone())?;
     if store.exists(relative)? {
         let existing: T = store.read_versioned_json(relative, kind)?;
@@ -1186,6 +1203,8 @@ fn invalid(kind: &'static str, message: impl Into<String>) -> StoreError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Barrier};
+
     use super::*;
     use crate::FileStoreOptions;
     use orchestrator_core::{
@@ -1346,6 +1365,78 @@ mod tests {
         let visible = evaluation.list_current_outcomes().unwrap();
         assert_eq!(visible.len(), 1);
         assert_eq!(visible[0].outcome_id, "two");
+    }
+
+    #[test]
+    fn concurrent_initial_publications_are_serialized_by_the_outcome_head() {
+        let temp = tempdir().unwrap();
+        let store = FileStore::open(temp.path(), FileStoreOptions::default()).unwrap();
+        let evaluation = EvaluationStore::open(store, context()).unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+        let left = evaluation.clone();
+        let right = evaluation.clone();
+
+        let (left_result, right_result) = std::thread::scope(|scope| {
+            let left_barrier = Arc::clone(&barrier);
+            let left = scope.spawn(move || {
+                left_barrier.wait();
+                left.publish_outcome(
+                    &RunLocation::new("2026-01-07", "left").unwrap(),
+                    outcome("left", None),
+                    orchestrator_core::OutcomeRevisionReason::InitialMaterialization,
+                )
+            });
+            let right_barrier = Arc::clone(&barrier);
+            let right = scope.spawn(move || {
+                right_barrier.wait();
+                right.publish_outcome(
+                    &RunLocation::new("2026-01-07", "right").unwrap(),
+                    outcome("right", None),
+                    orchestrator_core::OutcomeRevisionReason::InitialMaterialization,
+                )
+            });
+            barrier.wait();
+            (left.join().unwrap(), right.join().unwrap())
+        });
+
+        assert_eq!(
+            [left_result, right_result]
+                .into_iter()
+                .filter(Result::is_ok)
+                .count(),
+            1
+        );
+        let current = evaluation
+            .read_current_outcome("evaluation")
+            .unwrap()
+            .expect("exactly one initial outcome is current");
+        assert!(matches!(current.outcome_id.as_str(), "left" | "right"));
+    }
+
+    #[test]
+    fn invalid_supersession_does_not_leave_an_unreferenced_outcome_record() {
+        let temp = tempdir().unwrap();
+        let store = FileStore::open(temp.path(), FileStoreOptions::default()).unwrap();
+        let evaluation = EvaluationStore::open(store.clone(), context()).unwrap();
+        let run = RunLocation::new("2026-01-07", "run").unwrap();
+        evaluation
+            .publish_outcome(
+                &run,
+                outcome("one", None),
+                orchestrator_core::OutcomeRevisionReason::InitialMaterialization,
+            )
+            .unwrap();
+
+        assert!(evaluation
+            .publish_outcome(
+                &run,
+                outcome("two", None),
+                orchestrator_core::OutcomeRevisionReason::InitialMaterialization,
+            )
+            .is_err());
+        assert!(!store
+            .exists(&evaluation.outcome_relative("two").unwrap())
+            .unwrap());
     }
 
     #[test]
