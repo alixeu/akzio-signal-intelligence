@@ -106,6 +106,12 @@ impl RunStore {
             });
         }
 
+        // Preflight every candidate before publishing the compacted manifest.
+        // Once that manifest is durable, the validated Index archives are the
+        // canonical completed-run projection, so an interrupted deletion can
+        // leave only reclaimable leftovers rather than manifest references to
+        // missing runtime artifacts.
+        let mut candidate_paths_for_removal = Vec::with_capacity(candidates.len());
         for relative in candidates.keys() {
             let path = resolve_existing(self.store.root(), relative)?;
             let metadata = fs::symlink_metadata(&path).map_err(|source| io_error(&path, source))?;
@@ -118,11 +124,14 @@ impl RunStore {
                     message: format!("candidate is not a regular file: {}", path.display()),
                 });
             }
-            fs::remove_file(&path).map_err(|source| io_error(&path, source))?;
+            candidate_paths_for_removal.push(path);
         }
         let mut compacted_manifest = manifest;
         compacted_manifest.artifacts.clear();
         crate::write_run_manifest(&self.store, &self.location, compacted_manifest)?;
+        for path in candidate_paths_for_removal {
+            fs::remove_file(&path).map_err(|source| io_error(&path, source))?;
+        }
         let removed_directories = remove_empty_directories(&run_root, &run_root)?;
 
         Ok(RunCompactionReport {

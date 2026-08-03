@@ -266,9 +266,24 @@ impl TopicDebateTree {
         }
         let message = required_string(object, "message", 1_200)?;
         validate_stance_message_consistency(&stance, &message)?;
-        if let Some(reply_reference) = object.get("reply_to_node_id").and_then(Value::as_str) {
+        let reply_reference = object
+            .get("reply_to_node_id")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+        if let Some((delivery_id, route_node_id)) = self.active_route_receipt(actor) {
+            // The delivery receipt is the authoritative parent for a routed
+            // response. The model may use either a claim alias or a node ID,
+            // but cannot redirect the reply away from the Controller's route.
+            // Retain the supplied value for audit without letting its spelling
+            // break the collision graph.
+            if let Some(reply_reference) = reply_reference {
+                payload["reply_to_reference"] = json!(reply_reference);
+            }
+            payload["reply_to_delivery_id"] = json!(delivery_id);
+            payload["reply_to_node_id"] = json!(route_node_id);
+        } else if let Some(reply_reference) = reply_reference {
             let reply_to_node_id =
-                self.resolve_participant_reply_node_id(actor, reply_reference)?;
+                self.resolve_participant_reply_node_id(actor, &reply_reference)?;
             if reply_to_node_id != reply_reference {
                 payload["reply_to_reference"] = json!(reply_reference);
                 payload["reply_to_node_id"] = json!(reply_to_node_id);
@@ -601,6 +616,19 @@ impl TopicDebateTree {
         })
     }
 
+    fn active_route_receipt(&self, actor: DebateActor) -> Option<(String, String)> {
+        self.deliveries.iter().rev().find_map(|delivery| {
+            if delivery.target != actor || !delivery.delivered {
+                return None;
+            }
+            self.nodes
+                .iter()
+                .find(|node| node.node_id == delivery.node_id)
+                .filter(|node| node.kind == StreeNodeKind::Route)
+                .map(|node| (delivery.delivery_id.clone(), node.node_id.clone()))
+        })
+    }
+
     fn resolve_controller_reply_node_id(&self, reference: &str) -> Result<String> {
         if self.nodes.iter().any(|node| node.node_id == reference) {
             return Ok(reference.to_owned());
@@ -659,19 +687,36 @@ impl TopicDebateTree {
         let topic_prefix = format!("{}:", self.topic_id);
         let reference = reference.strip_prefix(&topic_prefix).unwrap_or(reference);
         let (actor_label, sequence) = reference.split_once(':')?;
-        if sequence.is_empty() || !sequence.chars().all(|ch| ch.is_ascii_digit()) {
-            return None;
-        }
+        let sequence = sequence
+            .parse::<u64>()
+            .ok()
+            .filter(|sequence| *sequence > 0)?;
         let actor = match actor_label {
             "bull" | "researcher.bull" => DebateActor::Bull,
             "bear" | "researcher.bear" => DebateActor::Bear,
             _ => return None,
         };
-        let node_id = format!("{}:stree:{sequence}", self.topic_id);
+        // Legacy prompt artifacts use `<topic_id>:<side>:<claim ordinal>`,
+        // while the FileStore tree owns `<topic_id>:stree:<node sequence>`.
+        // Prefer an exact participant node sequence for backwards-compatible
+        // references such as `bear:4`; otherwise an initial seed claim alias
+        // resolves to that side's initial submission, regardless of how many
+        // claims it carried in a single message.
         self.nodes
             .iter()
-            .find(|node| node.node_id == node_id && node.from == Some(actor))
+            .find(|node| {
+                node.sequence == sequence
+                    && node.from == Some(actor)
+                    && matches!(
+                        node.kind,
+                        StreeNodeKind::Submission | StreeNodeKind::Agreement
+                    )
+            })
             .map(|node| node.node_id.clone())
+            .or_else(|| {
+                self.initial_submission_node(actor)
+                    .map(|node| node.node_id.clone())
+            })
     }
 
     fn append_node(
@@ -905,10 +950,35 @@ fn validate_stance_message_consistency(stance: &str, message: &str) -> Result<()
     ]
     .iter()
     .any(|marker| normalized.contains(marker));
-    if stance == "challenge" && explicit_agreement {
+    // A challenge can concede a premise while disputing the conclusion.  Treat
+    // an agreement/rejection marker as a disposition only when it is not
+    // qualified by an explicit counterargument; otherwise a valid direct
+    // collision is incorrectly recorded as a failed debate turn.
+    let has_counterargument = [
+        "但",
+        "但是",
+        "然而",
+        "不过",
+        "相反",
+        "尽管",
+        "不足以",
+        "尚未",
+        "并不",
+        "不应",
+        "but ",
+        "however",
+        " yet",
+        "although",
+        "unless",
+        "not enough",
+        "does not",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker));
+    if stance == "challenge" && explicit_agreement && !has_counterargument {
         bail!("challenge stance contradicts an explicit agreement in message")
     }
-    if stance == "agree" && explicit_rejection {
+    if stance == "agree" && explicit_rejection && !has_counterargument {
         bail!("agree stance contradicts an explicit rejection in message")
     }
     Ok(())
@@ -993,6 +1063,17 @@ mod tests {
         payload["message"] = json!("我同意对方的核心结论");
 
         assert!(tree.submit(DebateActor::Bull, payload).is_err());
+    }
+
+    #[test]
+    fn challenge_can_concede_a_premise_while_rejecting_the_conclusion() {
+        let mut tree = tree();
+        assert_eq!(tree.next_dispatch().unwrap().actor, DebateActor::Bull);
+        let mut payload = submission("challenge", None);
+        payload["message"] =
+            json!("我同意转向必须由硬触发量化，但当前无会后供需硬确认；尚不足以否定下行主线。");
+
+        assert!(tree.submit(DebateActor::Bull, payload).is_ok());
     }
 
     #[test]
@@ -1159,6 +1240,74 @@ mod tests {
     }
 
     #[test]
+    fn side_claim_aliases_resolve_to_the_initial_submission_node() {
+        let mut tree = tree();
+        tree.next_dispatch();
+        let bull = tree
+            .submit(DebateActor::Bull, submission("challenge", None))
+            .unwrap();
+        tree.next_dispatch();
+        let bear = tree
+            .submit(DebateActor::Bear, submission("challenge", None))
+            .unwrap();
+
+        assert_eq!(tree.next_dispatch().unwrap().actor, DebateActor::Controller);
+        let routes = tree
+            .controller_route(json!({
+                "targets": ["bull", "bear"],
+                "reply_to_node_id": "topic-a:bear:1",
+                "message": "both sides must answer the opposing initial claim"
+            }))
+            .unwrap();
+
+        assert_eq!(routes[0].payload["reply_to_node_id"], bear.node_id);
+        assert_eq!(routes[1].payload["reply_to_node_id"], bull.node_id);
+    }
+
+    #[test]
+    fn routed_participant_reply_binds_to_its_delivery_receipt() {
+        let mut tree = tree();
+        tree.next_dispatch();
+        let bull = tree
+            .submit(DebateActor::Bull, submission("challenge", None))
+            .unwrap();
+        tree.next_dispatch();
+        let bear = tree
+            .submit(DebateActor::Bear, submission("challenge", None))
+            .unwrap();
+
+        assert_eq!(tree.next_dispatch().unwrap().actor, DebateActor::Controller);
+        let routes = tree
+            .controller_route(json!({
+                "targets": ["bull", "bear"],
+                "reply_to_node_id": bear.node_id,
+                "message": "respond directly to the opposing initial claim"
+            }))
+            .unwrap();
+
+        assert_eq!(tree.next_dispatch().unwrap().actor, DebateActor::Bull);
+        let bull_reply = tree
+            .submit(
+                DebateActor::Bull,
+                submission("challenge", Some(&bull.node_id)),
+            )
+            .unwrap();
+        assert_eq!(bull_reply.payload["reply_to_node_id"], routes[0].node_id);
+        assert_eq!(bull_reply.payload["reply_to_reference"], bull.node_id);
+
+        assert_eq!(tree.next_dispatch().unwrap().actor, DebateActor::Bear);
+        let bear_reply = tree
+            .submit(
+                DebateActor::Bear,
+                submission("challenge", Some(&bear.node_id)),
+            )
+            .unwrap();
+        assert_eq!(bear_reply.payload["reply_to_node_id"], routes[1].node_id);
+        assert_eq!(bear_reply.payload["reply_to_reference"], bear.node_id);
+        assert!(tree.initial_collision_complete());
+    }
+
+    #[test]
     fn actor_claim_references_resolve_for_controller_and_participants() {
         let mut tree = tree();
         tree.next_dispatch();
@@ -1190,7 +1339,7 @@ mod tests {
                 submission("partial_agree", Some("bear:4")),
             )
             .unwrap();
-        assert_eq!(bull_reply.payload["reply_to_node_id"], bear.node_id);
+        assert_eq!(bull_reply.payload["reply_to_node_id"], bull_route.node_id);
         assert_eq!(bull_reply.payload["reply_to_reference"], "bear:4");
 
         assert_eq!(tree.next_dispatch().unwrap().actor, DebateActor::Bear);
@@ -1200,7 +1349,7 @@ mod tests {
                 submission("challenge", Some("topic-a:bull:3")),
             )
             .unwrap();
-        assert_eq!(bear_reply.payload["reply_to_node_id"], bull.node_id);
+        assert_eq!(bear_reply.payload["reply_to_node_id"], bear_route.node_id);
         assert_eq!(bear_reply.payload["reply_to_reference"], "topic-a:bull:3");
 
         assert!(tree.initial_collision_complete());

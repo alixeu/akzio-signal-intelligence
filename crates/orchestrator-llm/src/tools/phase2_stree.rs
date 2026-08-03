@@ -19,29 +19,29 @@ pub fn definition(name: &str) -> Option<ToolDefinition> {
             "Submit Bull or Bear's current position to the Topic Controller and end this turn.",
             json!({"type":"object","additionalProperties":false,"required":["stance","message","report"],"properties":{
                 "stance":{"type":"string","enum":["challenge","partial_agree","agree","retract","needs_evidence","no_new_info"]},
-                "message":{"type":"string"}, "reply_to_node_id":{"type":"string"},
+                "message":{"type":"string","maxLength":1200}, "reply_to_node_id":{"type":"string"},
                 "evidence_refs":{"type":"array","items":{"type":"string"}},
-                "report":{"type":"string"}
+                "report":{"type":"string","maxLength":4000}
             }}),
         ),
         ROUTE_DEBATE_TURN => (
-            "Route a concrete debate instruction to Bull and/or Bear, then end this Controller turn.",
+            "Route a concrete debate instruction to both Bull and Bear, then end this Controller turn.",
             json!({"type":"object","additionalProperties":false,"required":["targets","reply_to_node_id","message","report"],"properties":{
-                "targets":{"type":"array","minItems":2,"maxItems":2,"uniqueItems":true,"items":{"type":"string","enum":["bull","bear"]}},
-                "reply_to_node_id":{"type":"string"}, "message":{"type":"string"}, "report":{"type":"string"}
+                "targets":{"type":"array","description":"Always exactly [\"bull\", \"bear\"].","default":["bull","bear"],"minItems":2,"maxItems":2,"uniqueItems":true,"items":{"type":"string","enum":["bull","bear"]}},
+                "reply_to_node_id":{"type":"string"}, "message":{"type":"string","maxLength":1200}, "report":{"type":"string","maxLength":4000}
             }}),
         ),
         WAIT_FOR_DEBATE_TURN => (
             "Record that the Controller is waiting for the remaining participant response, then end this turn.",
             json!({"type":"object","additionalProperties":false,"required":["message","report"],"properties":{
-                "message":{"type":"string"}, "report":{"type":"string"}
+                "message":{"type":"string","maxLength":1200}, "report":{"type":"string","maxLength":4000}
             }}),
         ),
         CLOSE_DEBATE => (
             "Close the topic debate. Only the Controller may invoke this terminal action.",
             json!({"type":"object","additionalProperties":false,"required":["reason","message","report"],"properties":{
                 "reason":{"type":"string","enum":["consensus","unresolved_disagreement","evidence_exhausted","agent_failure","round_limit"]},
-                "message":{"type":"string"}, "report":{"type":"string"}
+                "message":{"type":"string","maxLength":1200}, "report":{"type":"string","maxLength":4000}
             }}),
         ),
         _ => return None,
@@ -53,7 +53,37 @@ pub fn definition(name: &str) -> Option<ToolDefinition> {
     })
 }
 
-pub fn execute(name: &str, args: Value) -> Result<Value> {
+pub fn execute(name: &str, mut args: Value) -> Result<Value> {
+    let object = args
+        .as_object_mut()
+        .context("Phase 2 stree command must be an object")?;
+    if matches!(
+        name,
+        SUBMIT_DEBATE_TURN | ROUTE_DEBATE_TURN | WAIT_FOR_DEBATE_TURN | CLOSE_DEBATE
+    ) {
+        // `report` is a compact audit copy of the command, so an omitted
+        // value can be recovered losslessly from the same command's message.
+        // Keep the agent turn terminal instead of forcing an avoidable retry.
+        let fallback_report = object
+            .get("message")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|message| !message.is_empty())
+            .unwrap_or("Phase 2 stree terminal command.")
+            .to_owned();
+        object
+            .entry("report".to_owned())
+            .or_insert(Value::String(fallback_report));
+    }
+    if name == ROUTE_DEBATE_TURN {
+        // The tree only has one valid routing fan-out. Some model providers
+        // occasionally omit a schema-required field, so canonicalize this
+        // unique default rather than turning a recoverable omission into a
+        // failed debate turn.
+        object
+            .entry("targets".to_owned())
+            .or_insert_with(|| json!(["bull", "bear"]));
+    }
     let object = args
         .as_object()
         .context("Phase 2 stree command must be an object")?;
@@ -110,4 +140,50 @@ fn required_string(
         bail!("Phase 2 stree {field} exceeds {max_chars} characters");
     }
     Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn route_defaults_to_the_required_collision_wave() {
+        let result = execute(
+            ROUTE_DEBATE_TURN,
+            json!({
+                "reply_to_node_id": "topic-a:stree:4",
+                "message": "Both sides must address the opposing opening."
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.pointer("/artifact/phase2_stree/payload/targets"),
+            Some(&json!(["bull", "bear"]))
+        );
+        assert_eq!(
+            result.pointer("/artifact/phase2_stree/payload/report"),
+            Some(&json!("Both sides must address the opposing opening."))
+        );
+    }
+
+    #[test]
+    fn terminal_tool_schemas_expose_the_runtime_text_limits() {
+        for name in [
+            SUBMIT_DEBATE_TURN,
+            ROUTE_DEBATE_TURN,
+            WAIT_FOR_DEBATE_TURN,
+            CLOSE_DEBATE,
+        ] {
+            let definition = definition(name).unwrap();
+            assert_eq!(
+                definition.parameters["properties"]["message"]["maxLength"],
+                1_200
+            );
+            assert_eq!(
+                definition.parameters["properties"]["report"]["maxLength"],
+                4_000
+            );
+        }
+    }
 }

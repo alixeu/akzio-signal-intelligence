@@ -493,7 +493,7 @@ impl RuntimeConfig {
             .to_string();
         let alpaca_api_secret = (!alpaca_api_secret.is_empty()).then_some(alpaca_api_secret);
         let alpaca_order_submission_enabled =
-            config_bool(config, "orchestrator.alpaca.order_submission_enabled", true);
+            config_bool(config, "orchestrator.alpaca.order_submission_enabled", false);
         let alpaca_debug_starting_cash =
             config_float(config, "orchestrator.alpaca.debug_starting_cash", 10_000.0);
         if !alpaca_debug_starting_cash.is_finite() || alpaca_debug_starting_cash <= 0.0 {

@@ -79,6 +79,11 @@ pub struct ExecArgs {
     /// Write inspectable LLM and local reducer records below outputs/debug/.
     #[arg(long)]
     pub debug: bool,
+    /// Explicitly authorize submitting an already-persisted Phase 7 plan to
+    /// Alpaca Paper. The config switch remains a second, deployment-level
+    /// guard; without both guards a normal run only plans orders.
+    #[arg(long)]
+    pub submit_orders: bool,
     /// Persistence authority for MemoryOS records. `--debug` resolves to
     /// debug and `--mock` resolves to mock regardless of this option.
     #[arg(long, value_enum)]

@@ -1345,7 +1345,10 @@ fn build_responses_request(
     let item_count = items.len();
     let model = settings.llm.model.clone();
     let mut binding = CreateResponseArgs::default();
-    let mut builder = binding.model(&model).input(InputParam::Items(items));
+    let mut builder = binding
+        .model(&model)
+        .input(InputParam::Items(items))
+        .prompt_cache_key(prompt_cache_key(settings));
 
     let has_system = if let Some(system) = &input.system_instruction {
         builder = builder.instructions(system.clone());
@@ -1562,7 +1565,10 @@ fn build_chat_completions_request(
     let msg_count = messages.len();
     let model = settings.llm.effective_model().to_string();
     let mut binding = CreateChatCompletionRequestArgs::default();
-    let mut builder = binding.model(&model).messages(messages);
+    let mut builder = binding
+        .model(&model)
+        .messages(messages)
+        .prompt_cache_key(prompt_cache_key(settings));
 
     if let Some(max_completion_tokens) = settings.llm.max_completion_tokens {
         // DeepSeek-compatible Chat Completions gateways use the legacy field.
@@ -1621,6 +1627,21 @@ fn build_chat_completions_request(
         .build()
         .map_err(|e| anyhow::anyhow!("{e}"))
         .context("failed to build chat completion request")
+}
+
+fn prompt_cache_key(settings: &AgentSettings) -> String {
+    let phase = settings
+        .phase
+        .map(|phase| phase.to_string())
+        .unwrap_or_else(|| "none".to_owned());
+    format!(
+        "akzio:p{phase}:{}:{}",
+        settings.role,
+        settings.tool_managed_profile.as_str()
+    )
+    .chars()
+    .take(64)
+    .collect()
 }
 
 fn build_chat_reasoning_effort(
@@ -2959,6 +2980,48 @@ mod tests {
                 message["role"] == "user" && message["content"].as_str() == Some(stree_text)
             })
         }));
+    }
+
+    #[test]
+    fn both_routes_emit_a_stable_role_scoped_prompt_cache_key() {
+        let input = agent_loop::ModelInput {
+            system_instruction: None,
+            items: vec![agent_loop::TurnItem::user("static summary prefix")],
+            available_tools: Vec::new(),
+            truncation: TruncationConfig::default(),
+        };
+        let mut chat_settings = base_settings(LlmRoute::ChatCompletions);
+        chat_settings.phase = Some(1);
+        chat_settings.role = "compressor.phase_summary".to_owned();
+        let expected = super::prompt_cache_key(&chat_settings);
+        let chat = super::build_chat_completions_request(
+            &chat_settings,
+            &input,
+            "dynamic payload",
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(chat).unwrap()["prompt_cache_key"],
+            expected
+        );
+
+        let mut response_settings = base_settings(LlmRoute::Responses);
+        response_settings.phase = Some(1);
+        response_settings.role = "compressor.phase_summary".to_owned();
+        let responses = super::build_responses_request(
+            &response_settings,
+            &input,
+            "dynamic payload",
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(responses).unwrap()["prompt_cache_key"],
+            super::prompt_cache_key(&response_settings)
+        );
     }
 
     #[test]

@@ -2003,6 +2003,8 @@ fn is_transient_role_error(message: &str) -> bool {
         || text.contains("transport error")
         || text.contains("error decoding response body")
         || text.contains("temporarily unavailable")
+        || text.contains("internal_server_error")
+        || text.contains("\"type\":\"server_error\"")
         || text.contains("upstream_error")
         || text.contains("upstream request failed")
 }
@@ -2704,6 +2706,13 @@ mod tests {
     fn gateway_502_is_transient_role_error() {
         let message = "LLM stream chunk failed: InvalidStatusCodeWithMessage(502, \
             \"{\\\"error\\\":{\\\"message\\\":\\\"Upstream request failed\\\",\\\"type\\\":\\\"upstream_error\\\"}}\")";
+        assert!(is_transient_role_error(message));
+    }
+
+    #[test]
+    fn gateway_internal_server_error_is_transient_role_error() {
+        let message = "Chat Completions stream chunk failed: failed to deserialize api response: \
+            error:missing field `id` content:{\"error\":{\"message\":\"stream error\",\"type\":\"server_error\",\"code\":\"internal_server_error\"}}";
         assert!(is_transient_role_error(message));
     }
 

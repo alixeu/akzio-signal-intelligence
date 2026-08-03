@@ -35,7 +35,9 @@ orchestrator:
     # Never commit real credentials. Orders use paper-api.alpaca.markets only.
     api_key: ${ALPACA_API_KEY}
     api_secret: ${ALPACA_API_SECRET}
-    order_submission_enabled: true
+    # A deployment-level guard only. A normal run also requires the explicit
+    # --submit-orders CLI authorization before it can POST a Paper order.
+    order_submission_enabled: false
     # Debug never contacts Alpaca. It seeds 20% of equity across investable
     # assets so both buy and sell paths can produce deterministic simulated fills.
     debug_starting_cash: 10000

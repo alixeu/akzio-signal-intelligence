@@ -206,6 +206,7 @@ fn test_args(config_root: &Path, store_root: std::path::PathBuf, to_phase: i64) 
         jin10_refresh_lookback_hours: 24.0,
         mock: true,
         debug: false,
+        submit_orders: false,
         run_purpose: None,
     }
 }

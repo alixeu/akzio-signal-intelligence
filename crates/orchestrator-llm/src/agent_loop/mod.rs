@@ -425,8 +425,19 @@ where
                 return Ok(aggregate_result);
             }
             if loop_index >= 3 {
-                turn.tools_disabled = true;
-                turn.push_pending_input(FINALIZE_INSTRUCTION);
+                if let Some(error) = retrieval_completion_violation(turn, &config.retrieval_policy)
+                {
+                    // The three-batch finalization cap must not disable the
+                    // only tools that can satisfy a mandatory retrieval
+                    // contract. Ask for the missing read in the same turn;
+                    // the overall model-loop budget still bounds retries.
+                    turn.push_pending_input(format!(
+                        "Required retrieval is still incomplete: {error}. Do not finalize or call unrelated tools. Complete the missing read now, then return the final free-text response."
+                    ));
+                } else {
+                    turn.tools_disabled = true;
+                    turn.push_pending_input(FINALIZE_INSTRUCTION);
+                }
             }
             turn.needs_follow_up = true;
             persist_turn(session, turn, &config.truncation)?;
@@ -2955,6 +2966,71 @@ mod loop_limit_tests {
         }
     }
 
+    struct RetrievalRepairModel {
+        calls: usize,
+    }
+
+    impl LoopModel for RetrievalRepairModel {
+        fn generate<'a>(
+            &'a mut self,
+            input: ModelInput,
+        ) -> Pin<Box<dyn Future<Output = Result<ModelResponse>> + Send + 'a>> {
+            self.calls += 1;
+            let call_number = self.calls;
+            let can_read_indexes = input
+                .available_tools
+                .iter()
+                .any(|tool| tool == "read_indexes");
+            Box::pin(async move {
+                let tool_call = |name: &str, arguments: Value| ToolCallRequest {
+                    call_id: format!("{name}-{call_number}"),
+                    name: name.to_owned(),
+                    arguments,
+                };
+                let response = match call_number {
+                    1 => ModelResponse {
+                        assistant_message: None,
+                        reasoning_summary: None,
+                        tool_calls: vec![tool_call("read_indexes", json!({"source_phase": 1}))],
+                        end_turn: false,
+                        raw: Value::Null,
+                        turn_status: TurnStatus::Unknown,
+                    },
+                    2 | 3 => ModelResponse {
+                        assistant_message: None,
+                        reasoning_summary: None,
+                        tool_calls: vec![tool_call("think", json!({}))],
+                        end_turn: false,
+                        raw: Value::Null,
+                        turn_status: TurnStatus::Unknown,
+                    },
+                    4 if can_read_indexes => ModelResponse {
+                        assistant_message: None,
+                        reasoning_summary: None,
+                        tool_calls: vec![tool_call("read_indexes", json!({"source_phase": 2}))],
+                        end_turn: false,
+                        raw: Value::Null,
+                        turn_status: TurnStatus::Unknown,
+                    },
+                    4 => {
+                        return Err(anyhow::anyhow!(
+                            "mandatory retrieval correction incorrectly disabled read_indexes"
+                        ));
+                    }
+                    _ => ModelResponse {
+                        assistant_message: Some("final decision after required reads".to_owned()),
+                        reasoning_summary: None,
+                        tool_calls: Vec::new(),
+                        end_turn: true,
+                        raw: Value::Null,
+                        turn_status: TurnStatus::Unknown,
+                    },
+                };
+                Ok(response)
+            })
+        }
+    }
+
     #[tokio::test]
     async fn model_iteration_limit_applies_when_tool_responses_do_not_end_the_turn() {
         let temp = tempdir().unwrap();
@@ -2999,6 +3075,72 @@ mod loop_limit_tests {
         assert_eq!(model.calls, 2);
         assert!(error.to_string().contains("max_agent_loops=2"));
         assert_eq!(turn.end_reason.as_deref(), Some("max_loops"));
+    }
+
+    #[tokio::test]
+    async fn mandatory_retrieval_stays_enabled_after_the_third_tool_batch() {
+        let temp = tempdir().unwrap();
+        let session = FileStoreSessionRuntime::create_or_load(
+            FileStore::open(temp.path(), FileStoreOptions::default()).unwrap(),
+            SessionRuntimeSpec {
+                run: RunLocation::new("2026-08-03", "run-a").unwrap(),
+                session_id: "session-retrieval-repair".to_owned(),
+                role: "manager.research".to_owned(),
+                phase: 3,
+                profile: "research_decision".to_owned(),
+                fork: None,
+                created_at: "2026-08-03T00:00:00Z".to_owned(),
+            },
+        )
+        .unwrap();
+        let mut turn = Turn::new(
+            "turn-retrieval-repair",
+            "session-retrieval-repair",
+            "run-a",
+            "manager.research",
+            "prompt",
+        );
+        turn.phase = Some(3);
+        turn.model_context = "available_tools=[\"read_indexes\",\"think\"]".to_owned();
+        let mut model = RetrievalRepairModel { calls: 0 };
+        let mut tools = StaticToolRuntime::new();
+        tools.add_tool("read_indexes", |arguments| ToolResultItem {
+            call_id: String::new(),
+            name: String::new(),
+            status: "completed".to_owned(),
+            output: json!({
+                "indexes": [{
+                    "index_id": format!("idx-phase-{}", arguments["source_phase"]),
+                    "source_phase": arguments["source_phase"]
+                }]
+            }),
+            error: None,
+        });
+        tools.add_tool("think", |_| ToolResultItem {
+            call_id: String::new(),
+            name: String::new(),
+            status: "completed".to_owned(),
+            output: json!({}),
+            error: None,
+        });
+        let config = AgentLoopConfig {
+            max_agent_loops: Some(6),
+            retrieval_policy: RetrievalPolicy {
+                mandatory_summary_query: true,
+                required_source_phases: vec![1, 2],
+                minimum_detail_expansions: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        run_turn(&session, &mut turn, &mut model, &mut tools, config)
+            .await
+            .unwrap();
+
+        assert_eq!(model.calls, 5);
+        assert!(turn.tools_disabled);
+        assert_eq!(turn.end_reason.as_deref(), Some("completed"));
     }
 
     #[tokio::test]

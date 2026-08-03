@@ -571,6 +571,16 @@ fn validate_args(args: &ExecArgs) -> Result<()> {
     {
         bail!("max_topics_per_side must be in 1..=20")
     }
+    if args.submit_orders && (args.mock || args.debug) {
+        bail!("--submit-orders is only valid for a non-mock, non-debug Paper run")
+    }
+    if args.submit_orders
+        && args
+            .run_purpose
+            .is_some_and(|purpose| !matches!(purpose, crate::exec::args::RunPurposeArg::Paper))
+    {
+        bail!("--submit-orders requires --run-purpose paper when --run-purpose is set")
+    }
     Ok(())
 }
 
@@ -1482,7 +1492,7 @@ async fn run_phase2(
                 .unwrap_or(Value::Null);
             state["topic_debate_states"][&topic_id]["stree"] = serde_json::to_value(&tree)?;
             checkpoint_state(state)?;
-            let artifact = match run_unit(
+            let mut artifact = match run_unit(
                 state,
                 runtime,
                 role,
@@ -1512,6 +1522,52 @@ async fn run_phase2(
                 }
             };
             state["_phase2_stree_injection"] = Value::Null;
+            // A natural-language response is not a completed STree turn. Give
+            // the same persisted conversation one Rust-owned correction before
+            // recording a tree failure: the model retains its analysis while
+            // the retry can only finish through the required terminal tool.
+            // This keeps a successful protocol repair out of the run's health
+            // failure projection, while a second omission remains observable
+            // and follows the bounded failure path below.
+            if !state["mock"].as_bool().unwrap_or(false)
+                && !phase2_stree_terminal_command_present(&artifact)
+            {
+                state["_phase2_stree_injection"] = Value::String(
+                    phase2_terminal_tool_retry_injection(&topic_id, dispatch.actor),
+                );
+                artifact = match run_unit(
+                    state,
+                    runtime,
+                    role,
+                    2,
+                    "stree_turn",
+                    Some(round),
+                    Some(&topic_id),
+                    None,
+                    model,
+                    reasoning,
+                )
+                .await
+                {
+                    Ok(retry) => retry,
+                    Err(error) => {
+                        state["_phase2_stree_injection"] = Value::Null;
+                        record_phase2_runtime_failure(
+                            state,
+                            &topic_id,
+                            dispatch.actor,
+                            "role_job_failure",
+                            &error.to_string(),
+                        );
+                        tree.record_failure(dispatch.actor, error.to_string(), 1)?;
+                        state["topic_debate_states"][&topic_id]["stree"] =
+                            serde_json::to_value(&tree)?;
+                        checkpoint_state(state)?;
+                        continue;
+                    }
+                };
+                state["_phase2_stree_injection"] = Value::Null;
+            }
             if state["mock"].as_bool().unwrap_or(false) {
                 apply_mock_phase2_stree_command(&mut tree, dispatch.actor)?;
             } else if let Err(error) =
@@ -1683,6 +1739,33 @@ fn apply_phase2_stree_command(
         ),
     }
     Ok(())
+}
+
+fn phase2_stree_terminal_command_present(artifact: &Value) -> bool {
+    artifact
+        .pointer("/phase2_stree/command")
+        .and_then(Value::as_str)
+        .is_some_and(|command| !command.trim().is_empty())
+}
+
+fn phase2_terminal_tool_retry_injection(topic_id: &str, actor: DebateActor) -> String {
+    let terminal_tools = match actor {
+        DebateActor::Bull | DebateActor::Bear => "submit_debate_turn",
+        DebateActor::Controller => {
+            "one of route_debate_turn, wait_for_debate_turn, or close_debate"
+        }
+    };
+    format!(
+        "stree: {}",
+        json!({
+            "trusted_protocol": "phase2_terminal_tool_retry",
+            "topic_id": topic_id,
+            "actor": actor.role(),
+            "instruction": format!(
+                "Your immediately preceding response did not invoke the required terminal tool. Do not emit prose or JSON text. Complete the already-delivered STree work item now by calling {terminal_tools} with a valid payload."
+            ),
+        })
+    )
 }
 
 fn apply_mock_phase2_stree_command(tree: &mut TopicDebateTree, actor: DebateActor) -> Result<()> {
@@ -2143,14 +2226,21 @@ async fn ensure_execution_account_snapshot(
     runtime: &RuntimeConfig,
     args: &ExecArgs,
 ) -> Result<()> {
-    if let Some(existing) = state
-        .get("account_snapshot")
-        .filter(|value| !value.is_null())
-    {
-        let snapshot: AccountSnapshot = serde_json::from_value(existing.clone())
-            .context("stored account_snapshot is invalid")?;
-        state["current_portfolio_weights"] = serde_json::to_value(snapshot.current_weights)?;
-        return Ok(());
+    // A persisted Paper snapshot is only a checkpoint, never an execution
+    // authorization. Refresh it immediately before Phase 6/7 so a resumed
+    // run cannot use stale positions or buying power to build an order plan.
+    // Debug snapshots are deterministic and isolated, so retaining one makes
+    // same-namespace recovery reproducible without contacting Alpaca.
+    if args.debug {
+        if let Some(existing) = state
+            .get("account_snapshot")
+            .filter(|value| !value.is_null())
+        {
+            let snapshot: AccountSnapshot = serde_json::from_value(existing.clone())
+                .context("stored account_snapshot is invalid")?;
+            state["current_portfolio_weights"] = serde_json::to_value(snapshot.current_weights)?;
+            return Ok(());
+        }
     }
     let investable = investable_assets_from_state(state);
     let snapshot = if args.debug {
@@ -2304,6 +2394,38 @@ fn inject_runtime_current_weights_into_final_decision(state: &mut Value) -> Resu
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase7ExecutionMode {
+    DisabledMock,
+    BlockedAllocation,
+    SimulatedDebug,
+    SubmitPaper,
+    PlannedConfigDisabled,
+    PlannedExplicitAuthorizationRequired,
+}
+
+fn phase7_execution_mode(
+    mock: bool,
+    debug: bool,
+    allocation_failed: bool,
+    config_order_submission_enabled: bool,
+    explicit_submit_orders: bool,
+) -> Phase7ExecutionMode {
+    if mock {
+        Phase7ExecutionMode::DisabledMock
+    } else if allocation_failed {
+        Phase7ExecutionMode::BlockedAllocation
+    } else if debug {
+        Phase7ExecutionMode::SimulatedDebug
+    } else if !config_order_submission_enabled {
+        Phase7ExecutionMode::PlannedConfigDisabled
+    } else if !explicit_submit_orders {
+        Phase7ExecutionMode::PlannedExplicitAuthorizationRequired
+    } else {
+        Phase7ExecutionMode::SubmitPaper
+    }
+}
+
 async fn run_phase7(
     store: &FileStore,
     location: &RunLocation,
@@ -2315,9 +2437,11 @@ async fn run_phase7(
         inject_runtime_current_weights_into_final_decision(state)?;
     }
     let context = compute_allocation_context(state, &runtime.allocation)?;
-    let allocation = match derive_guarded_allocation(state, &context, &runtime.allocation) {
-        Ok(allocation) => allocation,
+    let (allocation, allocation_failure) =
+        match derive_guarded_allocation(state, &context, &runtime.allocation) {
+            Ok(allocation) => (allocation, None),
         Err(error) => {
+            let failure = error.to_string();
             state["degraded"] = Value::Bool(true);
             if !state["errors"].is_array() {
                 state["errors"] = json!([]);
@@ -2327,68 +2451,108 @@ async fn run_phase7(
                 .expect("errors initialized as array")
                 .push(json!({
                     "phase": 7,
-                    "kind": "allocation_fallback",
-                    "failure": error.to_string(),
+                    "kind": "allocation_blocked",
+                    "failure": failure.clone(),
                 }));
-            cash_only_allocation(&context, &error.to_string())
+            (cash_only_allocation(&context, &failure), Some(failure))
         }
     };
     state["allocation_context"] = context;
     state["portfolio_allocation"] = allocation.clone();
-    if args.mock {
-        state["order_plan"] = json!({
-            "status": "disabled_mock",
-            "account_equity": null,
-            "orders": [],
-            "skipped": [],
-        });
-        state["execution_report"] = json!({
-            "status": "disabled_mock",
-            "simulated": true,
-            "receipts": [],
-        });
-    } else {
-        let account: AccountSnapshot = serde_json::from_value(
-            state
-                .get("account_snapshot")
-                .cloned()
-                .context("Phase 7 requires an account snapshot")?,
-        )
-        .context("stored account_snapshot is invalid")?;
-        let plan = build_order_plan(
-            state["run_id"].as_str().context("run_id is required")?,
-            &allocation,
-            state.get("market_snapshot"),
-            &account,
-        )?;
-        state["order_plan"] = serde_json::to_value(&plan)?;
-        // Persist the exact plan and deterministic client_order_ids before any
-        // remote mutation. A retry queries Alpaca by client_order_id first.
-        checkpoint_state(state)?;
-        let report = if args.debug {
-            submit_order_plan(&plan, &account, None, true).await?
-        } else if runtime.alpaca_order_submission_enabled {
-            let credentials = alpaca_credentials(
-                runtime.alpaca_api_key.as_deref(),
-                runtime.alpaca_api_secret.as_deref(),
+    let execution_mode = phase7_execution_mode(
+        args.mock,
+        args.debug,
+        allocation_failure.is_some(),
+        runtime.alpaca_order_submission_enabled,
+        args.submit_orders,
+    );
+    match execution_mode {
+        Phase7ExecutionMode::DisabledMock => {
+            state["order_plan"] = json!({
+                "status": "disabled_mock",
+                "account_equity": null,
+                "orders": [],
+                "skipped": [],
+            });
+            state["execution_report"] = json!({
+                "status": "disabled_mock",
+                "simulated": true,
+                "receipts": [],
+            });
+        }
+        Phase7ExecutionMode::BlockedAllocation => {
+            let failure = allocation_failure
+                .as_deref()
+                .expect("blocked allocation mode requires an allocation error");
+            state["order_plan"] = json!({
+                "status": "blocked_allocation_invalid",
+                "account_equity": null,
+                "orders": [],
+                "skipped": [{
+                    "symbol": "*",
+                    "reason": failure,
+                    "estimated_notional": 0.0,
+                }],
+            });
+            state["execution_report"] = json!({
+                "status": "blocked_allocation_invalid",
+                "simulated": args.debug,
+                "receipts": [],
+            });
+        }
+        _ => {
+            let account: AccountSnapshot = serde_json::from_value(
+                state
+                    .get("account_snapshot")
+                    .cloned()
+                    .context("Phase 7 requires an account snapshot")?,
+            )
+            .context("stored account_snapshot is invalid")?;
+            let plan = build_order_plan(
+                state["run_id"].as_str().context("run_id is required")?,
+                &allocation,
+                state.get("market_snapshot"),
+                &account,
             )?;
-            submit_order_plan(&plan, &account, Some(&credentials), false).await?
-        } else {
-            ExecutionReport {
-                status: "planned_not_submitted".to_owned(),
-                simulated: false,
-                receipts: Vec::new(),
-            }
-        };
-        state["execution_report"] = serde_json::to_value(report)?;
-        tracing::info!(
-            order_plan = %serde_json::to_string(&state["order_plan"])?,
-            "Phase 7 order plan"
-        );
-        tracing::info!(
-            execution_report = %serde_json::to_string(&state["execution_report"])?,
-            "Phase 7 execution result"
-        );
+            state["order_plan"] = serde_json::to_value(&plan)?;
+            // Persist the exact plan and deterministic client_order_ids before any
+            // remote mutation. A retry queries Alpaca by client_order_id first.
+            checkpoint_state(state)?;
+            let report = match execution_mode {
+                Phase7ExecutionMode::SimulatedDebug => {
+                    submit_order_plan(&plan, &account, None, true).await?
+                }
+                Phase7ExecutionMode::SubmitPaper => {
+                    let credentials = alpaca_credentials(
+                        runtime.alpaca_api_key.as_deref(),
+                        runtime.alpaca_api_secret.as_deref(),
+                    )?;
+                    submit_order_plan(&plan, &account, Some(&credentials), false).await?
+                }
+                Phase7ExecutionMode::PlannedConfigDisabled => ExecutionReport {
+                    status: "planned_submission_disabled_by_config".to_owned(),
+                    simulated: false,
+                    receipts: Vec::new(),
+                },
+                Phase7ExecutionMode::PlannedExplicitAuthorizationRequired => ExecutionReport {
+                    status: "planned_submission_not_authorized".to_owned(),
+                    simulated: false,
+                    receipts: Vec::new(),
+                },
+                Phase7ExecutionMode::DisabledMock | Phase7ExecutionMode::BlockedAllocation => {
+                    unreachable!("handled before building a Phase 7 order plan")
+                }
+            };
+            state["execution_report"] = serde_json::to_value(report)?;
+            tracing::info!(
+                order_plan = %serde_json::to_string(&state["order_plan"])?,
+                "Phase 7 order plan"
+            );
+            tracing::info!(
+                execution_report = %serde_json::to_string(&state["execution_report"])?,
+                "Phase 7 execution result"
+            );
+        }
     }
     let response_text = serde_json::to_string(&json!({
         "account_snapshot": state.get("account_snapshot").cloned().unwrap_or(Value::Null),
@@ -2408,8 +2572,12 @@ async fn run_phase7(
         None,
         &response_text,
         PhaseIndexCandidate {
-            summary: "Rust 已完成受约束的组合分配。".to_owned(),
-            confidence: 1.0,
+            summary: if allocation_failure.is_some() {
+                "Rust 拒绝了无效的受约束组合分配，未生成或提交订单。".to_owned()
+            } else {
+                "Rust 已完成受约束的组合分配。".to_owned()
+            },
+            confidence: if allocation_failure.is_some() { 0.0 } else { 1.0 },
             authoritative_fields: serde_json::from_value(json!({
                 "account_snapshot": state.get("account_snapshot").cloned().unwrap_or(Value::Null),
                 "allocation_context": state["allocation_context"],
@@ -2435,8 +2603,11 @@ async fn run_phase7(
                 .map(|index| index.index_id)
                 .collect(),
             }],
-            missing_fields: Vec::new(),
-            ambiguities: Vec::new(),
+            missing_fields: allocation_failure
+                .as_ref()
+                .map(|_| vec!["guarded_allocation".to_owned()])
+                .unwrap_or_default(),
+            ambiguities: allocation_failure.into_iter().collect(),
         },
     )?;
     let artifact = serde_json::to_value(artifact)?;
@@ -2993,6 +3164,7 @@ async fn compile_unit_response(
             "authority": "transient_phase2_extraction"
         }));
     }
+    populate_missing_detail_source_refs(state, phase_u8, &mut candidate.details)?;
     if phase_u8 == 0 {
         let submission = phase0_submission(&candidate, response_text)?;
         commit_historical_reflection(
@@ -3033,6 +3205,57 @@ async fn compile_unit_response(
         "index_id": index.index_id,
         "authority": "index",
     }))
+}
+
+fn populate_missing_detail_source_refs(
+    state: &Value,
+    phase: u8,
+    details: &mut [PhaseIndexCandidateDetail],
+) -> Result<()> {
+    if phase < 2 || details.iter().all(|detail| !detail.source_refs.is_empty()) {
+        return Ok(());
+    }
+    let store_root = state
+        .get("store_root")
+        .and_then(Value::as_str)
+        .context("store_root is required for Detail source provenance")?;
+    let store = FileStore::open(store_root, FileStoreOptions::default())?;
+    let location = run_location_from_state(state)?;
+    let page = read_indexes(
+        &store,
+        Some(&location),
+        &IndexQuery {
+            source_phase: Some(phase - 1),
+            limit: 1_000,
+            ..IndexQuery::default()
+        },
+    )?;
+    let upstream_refs = page
+        .indexes
+        .into_iter()
+        .map(|index| index.index_id)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if upstream_refs.is_empty() {
+        bail!(
+            "Phase {phase} Detail source provenance requires persisted Phase {} Index IDs",
+            phase - 1
+        )
+    }
+    fill_empty_detail_source_refs(details, &upstream_refs);
+    Ok(())
+}
+
+fn fill_empty_detail_source_refs(
+    details: &mut [PhaseIndexCandidateDetail],
+    upstream_refs: &[String],
+) {
+    for detail in details {
+        if detail.source_refs.is_empty() {
+            detail.source_refs = upstream_refs.to_vec();
+        }
+    }
 }
 
 fn phase0_submission(
@@ -3494,9 +3717,18 @@ fn attach_verified_phase1_web_sources(
             ))
         })
         .collect::<BTreeMap<_, _>>();
-    let mut unverified_web_refs_removed = 0usize;
-    let mut unverified_technical_refs_removed = 0usize;
-    let mut unverified_jin10_refs_removed = 0usize;
+    let verified_web_ids = urls.keys().cloned().collect::<BTreeSet<_>>();
+    let mut normalization = Phase1ReferenceNormalization::default();
+    for (key, value) in fields.iter_mut() {
+        normalize_phase1_reference_arrays(
+            value,
+            Some(key),
+            verified_tool_ids.as_ref(),
+            &verified_web_ids,
+            &mut normalization,
+        );
+    }
+    prune_unbacked_phase1_findings(fields, &mut normalization)?;
     for evidence in fields
         .get_mut("per_ticker")
         .and_then(Value::as_object_mut)
@@ -3513,36 +3745,6 @@ fn attach_verified_phase1_web_sources(
         let Some(evidence) = evidence.as_object_mut() else {
             continue;
         };
-        if let Some(references) = evidence
-            .get_mut("evidence_refs")
-            .and_then(Value::as_array_mut)
-        {
-            references.retain(|reference| {
-                let Some(reference) = reference.as_str() else {
-                    return true;
-                };
-                let keep = if reference.starts_with("web-") {
-                    let keep = urls.contains_key(reference);
-                    unverified_web_refs_removed += usize::from(!keep);
-                    keep
-                } else if reference.starts_with("technical-") {
-                    let keep = verified_tool_ids
-                        .as_ref()
-                        .is_none_or(|ids| ids.contains(reference));
-                    unverified_technical_refs_removed += usize::from(!keep);
-                    keep
-                } else if reference.starts_with("jin10-") {
-                    let keep = verified_tool_ids
-                        .as_ref()
-                        .is_none_or(|ids| ids.contains(reference));
-                    unverified_jin10_refs_removed += usize::from(!keep);
-                    keep
-                } else {
-                    true
-                };
-                keep
-            });
-        }
         let first_web_ref = evidence
             .get("evidence_refs")
             .and_then(Value::as_array)
@@ -3562,12 +3764,210 @@ fn attach_verified_phase1_web_sources(
         "evidence_normalization".to_owned(),
         json!({
             "authority": "rust",
-            "unverified_web_refs_removed": unverified_web_refs_removed,
-            "unverified_technical_refs_removed": unverified_technical_refs_removed,
-            "unverified_jin10_refs_removed": unverified_jin10_refs_removed,
+            "unverified_web_refs_removed": normalization.unverified_web_refs_removed,
+            "unverified_technical_refs_removed": normalization.unverified_technical_refs_removed,
+            "unverified_jin10_refs_removed": normalization.unverified_jin10_refs_removed,
+            "canonicalized_web_refs": normalization.canonicalized_web_refs,
+            "canonicalized_technical_refs": normalization.canonicalized_technical_refs,
+            "canonicalized_jin10_refs": normalization.canonicalized_jin10_refs,
+            "unbacked_key_evidence_removed": normalization.unbacked_key_evidence_removed,
+            "unbacked_cross_asset_findings_removed": normalization.unbacked_cross_asset_findings_removed,
         }),
     );
     Ok(())
+}
+
+#[derive(Default)]
+struct Phase1ReferenceNormalization {
+    unverified_web_refs_removed: usize,
+    unverified_technical_refs_removed: usize,
+    unverified_jin10_refs_removed: usize,
+    canonicalized_web_refs: usize,
+    canonicalized_technical_refs: usize,
+    canonicalized_jin10_refs: usize,
+    unbacked_key_evidence_removed: usize,
+    unbacked_cross_asset_findings_removed: usize,
+}
+
+fn prune_unbacked_phase1_findings(
+    fields: &mut serde_json::Map<String, Value>,
+    normalization: &mut Phase1ReferenceNormalization,
+) -> Result<()> {
+    if let Some(reports) = fields.get_mut("per_ticker").and_then(Value::as_object_mut) {
+        for (ticker, report) in reports {
+            let Some(key_evidence) = report.get_mut("key_evidence").and_then(Value::as_array_mut)
+            else {
+                continue;
+            };
+            let before = key_evidence.len();
+            key_evidence.retain(|evidence| {
+                evidence
+                    .get("evidence_refs")
+                    .and_then(Value::as_array)
+                    .is_none_or(|references| !references.is_empty())
+            });
+            normalization.unbacked_key_evidence_removed += before - key_evidence.len();
+            if key_evidence.is_empty() {
+                bail!("Phase 1 has no verified key evidence remaining for {ticker}");
+            }
+        }
+    }
+    if let Some(findings) = fields
+        .get_mut("cross_asset_findings")
+        .and_then(Value::as_array_mut)
+    {
+        let before = findings.len();
+        findings.retain(|finding| {
+            finding
+                .get("evidence_refs")
+                .and_then(Value::as_array)
+                .is_none_or(|references| !references.is_empty())
+        });
+        normalization.unbacked_cross_asset_findings_removed += before - findings.len();
+    }
+    Ok(())
+}
+
+fn normalize_phase1_reference_arrays(
+    value: &mut Value,
+    parent_key: Option<&str>,
+    verified_tool_ids: Option<&BTreeSet<String>>,
+    verified_web_ids: &BTreeSet<String>,
+    normalization: &mut Phase1ReferenceNormalization,
+) {
+    match value {
+        Value::Array(values) if matches!(parent_key, Some("evidence_refs" | "source_refs")) => {
+            let original = std::mem::take(values);
+            let mut normalized = Vec::with_capacity(original.len());
+            let mut seen = BTreeSet::new();
+            for reference in original {
+                let Some(reference_text) = reference.as_str() else {
+                    normalized.push(reference);
+                    continue;
+                };
+                let Some(canonical) = canonical_phase1_evidence_reference(
+                    reference_text,
+                    verified_tool_ids,
+                    verified_web_ids,
+                ) else {
+                    normalization.record_removed(reference_text);
+                    continue;
+                };
+                normalization.record_canonicalization(reference_text, &canonical);
+                if seen.insert(canonical.clone()) {
+                    normalized.push(Value::String(canonical));
+                }
+            }
+            *values = normalized;
+        }
+        Value::Array(values) => {
+            for value in values {
+                normalize_phase1_reference_arrays(
+                    value,
+                    parent_key,
+                    verified_tool_ids,
+                    verified_web_ids,
+                    normalization,
+                );
+            }
+        }
+        Value::Object(values) => {
+            for (key, value) in values {
+                normalize_phase1_reference_arrays(
+                    value,
+                    Some(key),
+                    verified_tool_ids,
+                    verified_web_ids,
+                    normalization,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+fn canonical_phase1_evidence_reference(
+    reference: &str,
+    verified_tool_ids: Option<&BTreeSet<String>>,
+    verified_web_ids: &BTreeSet<String>,
+) -> Option<String> {
+    if reference.starts_with("web-") {
+        return canonicalize_verified_phase1_reference(reference, verified_web_ids);
+    }
+    if reference.starts_with("technical-") || reference.starts_with("jin10-") {
+        return match verified_tool_ids {
+            Some(ids) => canonicalize_verified_phase1_reference(reference, ids),
+            // Without a Rust registry this normalizer cannot establish
+            // authority. Preserve the legacy value so the canonical field
+            // validator can report a precise format failure instead.
+            None => Some(reference.to_owned()),
+        };
+    }
+    Some(reference.to_owned())
+}
+
+fn canonicalize_verified_phase1_reference(
+    reference: &str,
+    verified_ids: &BTreeSet<String>,
+) -> Option<String> {
+    if verified_ids.contains(reference) {
+        return Some(reference.to_owned());
+    }
+    let mut appended_suffix_candidates = verified_ids
+        .iter()
+        .filter(|candidate| reference.starts_with(candidate.as_str()));
+    if let Some(candidate) = appended_suffix_candidates.next() {
+        return appended_suffix_candidates
+            .next()
+            .is_none()
+            .then(|| candidate.clone());
+    }
+    // A model may transcribe one hexadecimal character incorrectly while
+    // copying a registry ID. Recover only a unique same-length neighbor; two
+    // possible matches remain untrusted and are removed by the caller.
+    let mut one_character_candidates = verified_ids
+        .iter()
+        .filter(|candidate| one_character_substitution_away(reference, candidate));
+    let candidate = one_character_candidates.next()?.clone();
+    one_character_candidates
+        .next()
+        .is_none()
+        .then_some(candidate)
+}
+
+fn one_character_substitution_away(reference: &str, candidate: &str) -> bool {
+    reference.len() == candidate.len()
+        && reference
+            .bytes()
+            .zip(candidate.bytes())
+            .filter(|(left, right)| left != right)
+            .count()
+            == 1
+}
+
+impl Phase1ReferenceNormalization {
+    fn record_removed(&mut self, reference: &str) {
+        if reference.starts_with("web-") {
+            self.unverified_web_refs_removed += 1;
+        } else if reference.starts_with("technical-") {
+            self.unverified_technical_refs_removed += 1;
+        } else if reference.starts_with("jin10-") {
+            self.unverified_jin10_refs_removed += 1;
+        }
+    }
+
+    fn record_canonicalization(&mut self, reference: &str, canonical: &str) {
+        if reference == canonical {
+            return;
+        }
+        if reference.starts_with("web-") {
+            self.canonicalized_web_refs += 1;
+        } else if reference.starts_with("technical-") {
+            self.canonicalized_technical_refs += 1;
+        } else if reference.starts_with("jin10-") {
+            self.canonicalized_jin10_refs += 1;
+        }
+    }
 }
 
 fn mock_phase_index_candidate(
@@ -4029,12 +4429,24 @@ fn validate_phase3_compiled_fields(
         if let Some(verified_source_refs) = verified_source_refs.as_ref() {
             project_phase3_evidence_refs(decision, verified_source_refs);
         }
-        let base = required_probability(decision, "base_probability", &ticker)?;
-        if (base - rust_base).abs() > 0.000001 {
-            bail!(
-                "Phase 3 base_probability for {ticker} must equal Rust base {rust_base}; got {base}"
-            )
-        }
+        // The Phase 1 weighted base is Rust-owned. Preserve any model echo for
+        // audit, but always project the canonical value before checking the
+        // model-owned debate adjustment and final probability ledger.
+        let model_base = decision
+            .get("base_probability")
+            .and_then(Value::as_f64)
+            .filter(|value| value.is_finite() && (0.0..=1.0).contains(value));
+        let base_overridden = model_base.is_none_or(|base| (base - rust_base).abs() > 0.000001);
+        decision.insert("base_probability".to_owned(), json!(rust_base));
+        decision.insert(
+            "base_probability_projection".to_owned(),
+            json!({
+                "authority": "rust_weighted_probability_base",
+                "model_base_probability": model_base,
+                "projected_base_probability": rust_base,
+                "overridden": base_overridden,
+            }),
+        );
         let long = required_probability(decision, "long_probability", &ticker)?;
         let short = required_probability(decision, "short_probability", &ticker)?;
         if (long + short - 1.0).abs() > 0.000001 {
@@ -4045,10 +4457,10 @@ fn validate_phase3_compiled_fields(
             .and_then(Value::as_f64)
             .filter(|value| value.is_finite())
             .with_context(|| format!("Phase 3 debate_adjustment missing for {ticker}"))?;
-        let expected_long = round_probability(base + adjustment);
+        let expected_long = round_probability(rust_base + adjustment);
         if !(0.0..=1.0).contains(&expected_long) || (long - expected_long).abs() > 0.000001 {
             bail!(
-                "Phase 3 probability ledger mismatch for {ticker}: base {base} + debate_adjustment {adjustment} != long_probability {long}"
+                "Phase 3 probability ledger mismatch for {ticker}: Rust base {rust_base} + debate_adjustment {adjustment} != long_probability {long}"
             )
         }
         if adjustment.abs() > 0.000001 {
@@ -4402,7 +4814,13 @@ fn validate_phase5_compiled_fields(
         .strip_prefix("risk.")
         .with_context(|| format!("Phase 5 role {role} has no risk stance"))?;
     if let Some(reported) = fields.get("stance").and_then(Value::as_str) {
-        if reported != expected_stance {
+        // `stance` is a closed, Rust-owned enum. The Summary compiler may use
+        // display case (`AGGRESSIVE`) or echo the runtime role (`risk.neutral`).
+        // Both spellings identify the same enum member, but no other stance is
+        // accepted before Rust rewrites the stored field canonically.
+        let normalized = reported.trim().to_ascii_lowercase();
+        let normalized = normalized.strip_prefix("risk.").unwrap_or(&normalized);
+        if normalized != expected_stance {
             bail!("Phase 5 stance must match runtime role {expected_stance}; got {reported}")
         }
     }
@@ -4825,20 +5243,25 @@ mod phase2_session_tests {
     use std::collections::BTreeSet;
     use tempfile::tempdir;
 
+    use crate::orchestration::summary_store::PhaseIndexCandidateDetail;
+
     use super::{
         attach_verified_phase1_web_sources, attach_verified_web_evidence,
         controller_should_continue, defers_phase_summary,
         enrich_and_validate_phase6_compiled_fields, enrich_final_trade_decision_fields,
-        ensure_initial_collision_route, finish_phase, highest_completed_phase, is_cacheable_unit,
-        load_or_initialize_state, normalize_phase2_topic_control_fields, persist_state,
-        persists_phase_index, phase2_debate_debug_summary, project_phase2_final_fields,
+        ensure_initial_collision_route, fill_empty_detail_source_refs, finish_phase,
+        highest_completed_phase, is_cacheable_unit, load_or_initialize_state,
+        normalize_phase2_topic_control_fields, persist_state, persists_phase_index,
+        phase2_debate_debug_summary, phase2_stree_terminal_command_present,
+        phase2_terminal_tool_retry_injection, project_phase2_final_fields,
         project_phase3_evidence_refs, prompt_owner_for_unit, record_phase2_runtime_failure,
         record_phase2_session, redacted_config_for_state, resolve_git_sha, runtime_session_key,
         scoped_state_for_unit, select_phase2_topics, select_reflection_task_budget,
-        sync_manifest_health, validate_phase1_compiled_fields, validate_phase2_compiled_contract,
+        phase7_execution_mode, sync_manifest_health, validate_phase1_compiled_fields,
+        validate_phase2_compiled_contract,
         validate_phase2_topic_ttls, validate_phase3_compiled_fields,
         validate_phase4_compiled_fields, validate_phase5_compiled_fields,
-        weighted_probability_base,
+        weighted_probability_base, DebateActor, Phase7ExecutionMode,
     };
 
     #[test]
@@ -5086,6 +5509,28 @@ mod phase2_session_tests {
     }
 
     #[test]
+    fn phase3_projects_the_rust_owned_base_probability() {
+        let state = json!({
+            "investable_assets": ["QQQ"],
+            "weighted_probability_base": {"QQQ": {"long_probability": 0.45}}
+        });
+        let mut fields = canonical_phase3_fields();
+        fields["decisions"]["QQQ"]["base_probability"] = json!(0.28);
+
+        validate_phase3_compiled_fields(&state, &mut fields).unwrap();
+
+        assert_eq!(fields["decisions"]["QQQ"]["base_probability"], 0.45);
+        assert_eq!(
+            fields["decisions"]["QQQ"]["base_probability_projection"]["model_base_probability"],
+            0.28
+        );
+        assert_eq!(
+            fields["decisions"]["QQQ"]["base_probability_projection"]["overridden"],
+            true
+        );
+    }
+
+    #[test]
     fn phase3_rating_and_non_hold_reason_are_rust_projected() {
         let state = json!({
             "investable_assets": ["QQQ"],
@@ -5176,6 +5621,42 @@ mod phase2_session_tests {
     }
 
     #[test]
+    fn phase5_canonicalizes_display_case_and_role_prefix_before_role_validation() {
+        let state = json!({"investable_assets": ["QQQ"]});
+        let mut fields = json!({
+            "stance": "RISK.AGGRESSIVE",
+            "unique_risk_contribution": "",
+            "disagreement_with_prior": "none",
+            "no_new_information": true,
+            "recommended_adjustment": "",
+            "per_asset": {"QQQ": {
+                "position_cap_pct": 0.2,
+                "max_drawdown_pct": 0.1,
+                "stop_type": "soft",
+                "risk_off_trigger": "breakdown",
+                "rebalance_trigger": "volatility doubles",
+                "review_window": "one day",
+                "constraint_confidence": 0.7
+            }},
+            "cash_hedge_recommendation": "hold cash"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        validate_phase5_compiled_fields(
+            &state,
+            "risk.aggressive",
+            "risk summary",
+            &[],
+            &mut fields,
+        )
+        .unwrap();
+
+        assert_eq!(fields["stance"], "aggressive");
+    }
+
+    #[test]
     fn phase2_recovered_failure_degrades_the_run_health_projection() {
         let mut state = json!({"degraded": false, "errors": []});
 
@@ -5190,6 +5671,24 @@ mod phase2_session_tests {
         assert_eq!(state["degraded"], true);
         assert_eq!(state["errors"][0]["phase"], 2);
         assert_eq!(state["errors"][0]["recovered"], true);
+    }
+
+    #[test]
+    fn phase2_nonterminal_turn_gets_a_same_session_terminal_tool_retry() {
+        assert!(!phase2_stree_terminal_command_present(&json!({
+            "response_text": "analysis without a tool call"
+        })));
+        assert!(phase2_stree_terminal_command_present(&json!({
+            "phase2_stree": {"command": "submit_debate_turn"}
+        })));
+
+        let participant = phase2_terminal_tool_retry_injection("topic-a", DebateActor::Bull);
+        assert!(participant.contains("submit_debate_turn"));
+        assert!(participant.contains("phase2_terminal_tool_retry"));
+
+        let controller = phase2_terminal_tool_retry_injection("topic-a", DebateActor::Controller);
+        assert!(controller.contains("route_debate_turn"));
+        assert!(controller.contains("close_debate"));
     }
 
     #[test]
@@ -5690,7 +6189,7 @@ mod phase2_session_tests {
     }
 
     #[test]
-    fn phase1_drops_mutated_technical_and_jin10_ids_against_tool_registry() {
+    fn phase1_canonicalizes_unique_one_character_transcriptions_against_tool_registry() {
         let response = format!(
             "报告\n\n{}\n{}",
             orchestrator_llm::VERIFIED_PHASE1_EVIDENCE_MARKER,
@@ -5725,10 +6224,127 @@ mod phase2_session_tests {
         );
         assert_eq!(
             fields["evidence_normalization"]["unverified_technical_refs_removed"],
-            1
+            0
         );
         assert_eq!(
             fields["evidence_normalization"]["unverified_jin10_refs_removed"],
+            0
+        );
+        assert_eq!(
+            fields["evidence_normalization"]["canonicalized_technical_refs"],
+            1
+        );
+        assert_eq!(
+            fields["evidence_normalization"]["canonicalized_jin10_refs"],
+            1
+        );
+    }
+
+    #[test]
+    fn phase1_canonicalizes_extended_cross_asset_refs_against_tool_registry() {
+        let technical =
+            "technical-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let response = format!(
+            "报告\n\n{}\n{}",
+            orchestrator_llm::VERIFIED_PHASE1_EVIDENCE_MARKER,
+            json!([technical])
+        );
+        let mut fields = json!({
+            "per_ticker": {"QQQ": {"key_evidence": [{
+                "source": "FileStore",
+                "evidence_refs": [technical]
+            }]}},
+            "cross_asset_findings": [{
+                "evidence_refs": [format!("{technical}c")]
+            }]
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        attach_verified_phase1_web_sources(&response, &mut fields).unwrap();
+
+        assert_eq!(
+            fields["cross_asset_findings"][0]["evidence_refs"],
+            json!([technical])
+        );
+        assert_eq!(
+            fields["evidence_normalization"]["canonicalized_technical_refs"],
+            1
+        );
+    }
+
+    #[test]
+    fn phase1_does_not_guess_between_multiple_one_character_candidates() {
+        let technical_a = format!("technical-a{}", "0".repeat(63));
+        let technical_b = format!("technical-b{}", "0".repeat(63));
+        let ambiguous = format!("technical-c{}", "0".repeat(63));
+        let response = format!(
+            "报告\n\n{}\n{}",
+            orchestrator_llm::VERIFIED_PHASE1_EVIDENCE_MARKER,
+            json!([technical_a.clone(), technical_b])
+        );
+        let mut fields = json!({
+            "per_ticker": {"QQQ": {"key_evidence": [{
+                "source": "FileStore",
+                "evidence_refs": [ambiguous, technical_a.clone()]
+            }]}}
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        attach_verified_phase1_web_sources(&response, &mut fields).unwrap();
+
+        assert_eq!(
+            fields["per_ticker"]["QQQ"]["key_evidence"][0]["evidence_refs"],
+            json!([technical_a])
+        );
+        assert_eq!(
+            fields["evidence_normalization"]["unverified_technical_refs_removed"],
+            1
+        );
+    }
+
+    #[test]
+    fn phase1_prunes_only_key_evidence_and_findings_without_verified_refs() {
+        let valid = "jin10-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let invalid = "jin10-cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let response = format!(
+            "报告\n\n{}\n{}",
+            orchestrator_llm::VERIFIED_PHASE1_EVIDENCE_MARKER,
+            json!([valid])
+        );
+        let mut fields = json!({
+            "per_ticker": {"QQQ": {"key_evidence": [
+                {"source": "FileStore", "evidence_refs": [invalid]},
+                {"source": "FileStore", "evidence_refs": [valid]}
+            ]}},
+            "cross_asset_findings": [
+                {"evidence_refs": [invalid]},
+                {"evidence_refs": [valid]}
+            ]
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        attach_verified_phase1_web_sources(&response, &mut fields).unwrap();
+
+        assert_eq!(
+            fields["per_ticker"]["QQQ"]["key_evidence"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(fields["cross_asset_findings"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            fields["evidence_normalization"]["unbacked_key_evidence_removed"],
+            1
+        );
+        assert_eq!(
+            fields["evidence_normalization"]["unbacked_cross_asset_findings_removed"],
             1
         );
     }
@@ -5754,6 +6370,33 @@ mod phase2_session_tests {
             decision["evidence_reference_projection"]["unverified_refs_removed"],
             1
         );
+    }
+
+    #[test]
+    fn empty_compiled_details_inherit_actual_upstream_index_refs() {
+        let mut details = vec![
+            PhaseIndexCandidateDetail {
+                section: "execution".to_owned(),
+                detail: "phase detail".to_owned(),
+                source_refs: Vec::new(),
+            },
+            PhaseIndexCandidateDetail {
+                section: "execution".to_owned(),
+                detail: "already cited".to_owned(),
+                source_refs: vec!["idx-existing".to_owned()],
+            },
+        ];
+
+        fill_empty_detail_source_refs(
+            &mut details,
+            &["idx-upstream-a".to_owned(), "idx-upstream-b".to_owned()],
+        );
+
+        assert_eq!(
+            details[0].source_refs,
+            vec!["idx-upstream-a".to_owned(), "idx-upstream-b".to_owned()]
+        );
+        assert_eq!(details[1].source_refs, vec!["idx-existing".to_owned()]);
     }
 
     #[test]
@@ -5876,6 +6519,34 @@ mod phase2_session_tests {
             .insert("8".to_owned(), PhaseStatus::Completed);
 
         assert_eq!(highest_completed_phase(&manifest), Some(8));
+    }
+
+    #[test]
+    fn phase7_execution_requires_valid_allocation_and_two_explicit_paper_guards() {
+        assert_eq!(
+            phase7_execution_mode(false, false, true, true, true),
+            Phase7ExecutionMode::BlockedAllocation
+        );
+        assert_eq!(
+            phase7_execution_mode(false, false, false, false, true),
+            Phase7ExecutionMode::PlannedConfigDisabled
+        );
+        assert_eq!(
+            phase7_execution_mode(false, false, false, true, false),
+            Phase7ExecutionMode::PlannedExplicitAuthorizationRequired
+        );
+        assert_eq!(
+            phase7_execution_mode(false, false, false, true, true),
+            Phase7ExecutionMode::SubmitPaper
+        );
+        assert_eq!(
+            phase7_execution_mode(false, true, false, true, true),
+            Phase7ExecutionMode::SimulatedDebug
+        );
+        assert_eq!(
+            phase7_execution_mode(true, false, false, true, true),
+            Phase7ExecutionMode::DisabledMock
+        );
     }
 
     #[test]

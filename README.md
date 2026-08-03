@@ -134,9 +134,12 @@ Decision snapshot;VIX 始终只是 context-only regime signal。Phase 1
 每个风险 stance 各运行一次。
 Phase 7 在 Rust 中计算并校验目标权重,将这些权重投影到 Phase 6 的
 方向/上限/增量约束上。普通 Paper 运行先从 Alpaca Paper 读取账户和持仓,
-生成带确定性 `client_order_id` 的市价单计划,在持久化计划后调用
+生成带确定性 `client_order_id` 的市价单计划。只有配置
+`orchestrator.alpaca.order_submission_enabled=true` **且**命令显式提供
+`--submit-orders` 时,才会在持久化计划后调用
 `paper-api.alpaca.markets/v2/orders`;重试会先按 `client_order_id` 查询,
-避免重复下单。`--debug` 固定模拟 10,000 美元现金/净值/购买力和零仓位,
+避免重复下单。受约束分配校验失败时 Rust 只记录阻断结果,绝不生成或提交
+订单。`--debug` 固定模拟 10,000 美元现金/净值/购买力和零仓位,
 输出同样的订单计划并记录 `simulated_filled`,不会访问 Alpaca。`--mock`
 保持禁用下单。账户与订单能力都由 Rust Runtime 拥有,不暴露给模型。
 
@@ -274,8 +277,9 @@ export ALPACA_API_SECRET='...'
 `orchestrator.alpaca.api_secret` 映射到上述两个 Alpaca 环境变量。市场数据
 与新闻使用 `data.alpaca.markets`;券商操作有意使用
 `paper-api.alpaca.markets`。未实现任何实盘券商端点、注册或备用账户流程。
-`orchestrator.alpaca.order_submission_enabled` 控制普通 Paper 运行是否真正
-提交已持久化的订单计划;`debug_starting_cash` 只控制 debug 模拟账户。
+`orchestrator.alpaca.order_submission_enabled` 是部署级安全开关，默认关闭。
+普通 Paper 运行还必须显式使用 `--submit-orders` 才会真正提交已持久化的
+订单计划；`debug_starting_cash` 只控制 debug 模拟账户。
 
 报告邮件凭证只有 `report-email` 需要:
 
@@ -386,6 +390,8 @@ rtk cargo run -p orchestrator-cli --bin orchestrator-exec -- \
 - `--max-topics-per-side N`:限制每个 Bull/Bear 侧参与的实质性冲突议题数
   (默认 3)。Rust 会在进入辩论前确定性截断 Topic Generator 的结果,并在
   `topic_generation_artifact.selection` 记录生成数、选中数与截断数。
+- `--submit-orders`:仅限非 mock、非 debug 的 Paper 运行。它是实际下单的
+  显式命令授权；仍需要配置中的 `order_submission_enabled=true`。
 
 `--mock` 仅用于本地测试与开发,不能证明生产工作流或外部服务可用。`--debug` 将 MemoryOS 写入解析到 `knowledge/debug/<run-id>/`;它绝不写入规范的 Decision 或 Outcome 数据。回放与迁移夹具使用各自的命名空间,回放只通过只读读取器读取规范 Decision,且只输出回放结果。
 
@@ -430,14 +436,13 @@ fsync 后原子重命名。Store Doctor 检查格式错误内容、哈希、路�
 Detail、未完成 Draft 与 manifest/文件漂移;其目录和经验级输出是可重建的
 缓存。
 
-Phase 8 成功结束后,运行会将每个终结的 Index 目录打包为一个内容哈希归档,
-然后删除其余所有运行本地文件。完成的运行只保留 `manifest.json` 和
-`index/*.json`;Phase 8 Index 包含结构化的最终决策与配置。规范 Decision、
-MemoryUsage 报告、Outcome 和 Experience 保留在 `knowledge/` 下。部分完成、
-未完成或失败的运行保留输入、Artifact、Session、Draft 与状态以供恢复。
-Phase 8 完成后,正常、降级和 `--debug` 运行都会被压实为相同的最终布局;
-降级状态与错误仍可在 `manifest.json` 中看到。FileStore 假定只有一个工作流
-写入者,不创建文件系统锁文件。
+Phase 8 成功结束后,健康的普通运行会将每个终结的 Index 目录打包为一个
+内容哈希归档。归档完成并更新 manifest 后，才允许删除其余运行本地文件；
+完成的运行只保留 `manifest.json` 和 `index/*.json`。Phase 8 Index 包含
+结构化的最终决策与配置。规范 Decision、MemoryUsage 报告、Outcome 和
+Experience 保留在 `knowledge/` 下。部分完成、失败、降级和 `--debug` 运行
+始终保留输入、Artifact、Session、Draft 与状态以供恢复和诊断。FileStore
+目前假定单工作流写入者，不创建文件系统锁文件。
 
 显式预览或应用同样的完成运行压实:
 
