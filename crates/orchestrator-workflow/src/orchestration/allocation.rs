@@ -10,6 +10,7 @@ pub(crate) fn market_snapshot_from_technical(
     config: &AllocationConfig,
 ) -> Result<Value> {
     let mut per_ticker = serde_json::Map::new();
+    let mut daily_returns = BTreeMap::<String, BTreeMap<String, f64>>::new();
     let mut regime_level = None;
     for snapshot in technical
         .get("snapshots")
@@ -41,6 +42,21 @@ pub(crate) fn market_snapshot_from_technical(
         if ticker == config.regime_signal {
             regime_level = latest_close;
         }
+        if config.investable_assets.iter().any(|asset| asset == ticker) {
+            let returns = daily
+                .get("returns_60d")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|item| {
+                    Some((
+                        item.get("session")?.as_str()?.to_owned(),
+                        item.get("return")?.as_f64()?,
+                    ))
+                })
+                .collect::<BTreeMap<_, _>>();
+            daily_returns.insert(ticker.to_owned(), returns);
+        }
         per_ticker.insert(
             ticker.to_owned(),
             json!({
@@ -64,12 +80,52 @@ pub(crate) fn market_snapshot_from_technical(
     } else {
         unavailable_vix(config)
     };
+    let (correlation_60d, correlation_sample_size) =
+        correlation_for_assets(&config.investable_assets, &daily_returns)
+            .map_or((None, 0), |(correlation, sample_size)| {
+                (Some(correlation), sample_size)
+            });
     Ok(json!({
         "source": "filestore.run_input.technical.daily",
         "vix": vix,
         "per_ticker": per_ticker,
-        "correlation_60d": null
+        "correlation_60d": correlation_60d,
+        "correlation_sample_size": correlation_sample_size,
     }))
+}
+
+fn correlation_for_assets(
+    assets: &[String],
+    returns: &BTreeMap<String, BTreeMap<String, f64>>,
+) -> Option<(f64, usize)> {
+    if assets.len() != 2 {
+        return None;
+    }
+    let left = returns.get(&assets[0])?;
+    let right = returns.get(&assets[1])?;
+    let pairs = left
+        .iter()
+        .filter_map(|(session, left)| right.get(session).map(|right| (*left, *right)))
+        .collect::<Vec<_>>();
+    if pairs.len() < 2 {
+        return None;
+    }
+    let left_mean = pairs.iter().map(|(left, _)| left).sum::<f64>() / pairs.len() as f64;
+    let right_mean = pairs.iter().map(|(_, right)| right).sum::<f64>() / pairs.len() as f64;
+    let covariance = pairs
+        .iter()
+        .map(|(left, right)| (left - left_mean) * (right - right_mean))
+        .sum::<f64>();
+    let left_variance = pairs
+        .iter()
+        .map(|(left, _)| (left - left_mean).powi(2))
+        .sum::<f64>();
+    let right_variance = pairs
+        .iter()
+        .map(|(_, right)| (right - right_mean).powi(2))
+        .sum::<f64>();
+    let denominator = (left_variance * right_variance).sqrt();
+    (denominator > f64::EPSILON).then(|| ((covariance / denominator).clamp(-1.0, 1.0), pairs.len()))
 }
 
 pub(crate) fn compute_allocation_context(
@@ -407,6 +463,7 @@ fn apply_phase6_execution_constraints(
         }),
     );
     allocation["total_equity_exposure"] = json!((equity_total * 10_000.0).round() / 10_000.0);
+    allocation["equity_budget_deviation"] = equity_budget_deviation(context, equity_total);
     allocation["summary"] =
         json!("Rust allocation projected through Phase 6 per-asset constraints.");
     Ok(allocation)
@@ -468,6 +525,7 @@ fn validate_allocation_output(
         .filter_map(Value::as_str)
         .collect::<Vec<_>>();
     let mut total = 0.0;
+    let mut equity_total = 0.0;
     for (asset, entry) in weights {
         if asset != "cash_hedge" && !investable.contains(&asset.as_str()) {
             bail!("allocation contains non-investable asset {asset}");
@@ -484,9 +542,32 @@ fn validate_allocation_output(
             bail!("allocation weight exceeds cap for {asset}: {weight}");
         }
         total += weight;
+        if asset != "cash_hedge" {
+            equity_total += weight;
+        }
     }
     if (total - 1.0).abs() > 0.001 {
         bail!("allocation weights must sum to 1.0, got {total}");
+    }
+    let reported_equity = allocation
+        .get("total_equity_exposure")
+        .and_then(Value::as_f64)
+        .ok_or_else(|| anyhow::anyhow!("allocation total_equity_exposure missing"))?;
+    if (reported_equity - equity_total).abs() > 0.0001 {
+        bail!(
+            "allocation total_equity_exposure {reported_equity} differs from equity weights {equity_total}"
+        )
+    }
+    let diagnostic_equity = allocation
+        .pointer("/equity_budget_deviation/actual_equity_exposure")
+        .and_then(Value::as_f64)
+        .ok_or_else(|| {
+            anyhow::anyhow!("allocation equity_budget_deviation.actual_equity_exposure missing")
+        })?;
+    if (diagnostic_equity - equity_total).abs() > 0.0001 {
+        bail!(
+            "allocation equity budget diagnostic {diagnostic_equity} differs from equity weights {equity_total}"
+        )
     }
     Ok(())
 }
@@ -596,7 +677,29 @@ fn effective_position_cap(context: &Value, config: &AllocationConfig, ticker: &s
     let configured_cap = config.max_single_position.clamp(0.0, 1.0);
     let trader_cap = trader_plan_position_cap(context, ticker).unwrap_or(1.0);
     let risk_cap = active_risk_position_cap(context, ticker).unwrap_or(1.0);
-    configured_cap.min(trader_cap).min(risk_cap)
+    let upstream_cap = configured_cap.min(trader_cap).min(risk_cap);
+    phase6_unchanged_current_weight(context, ticker)
+        .map(|current| upstream_cap.max(current))
+        .unwrap_or(upstream_cap)
+}
+
+/// A final `unchanged` constraint means there is no authorized trade. Earlier
+/// candidate caps can prevent adding risk, but cannot silently turn a Hold into
+/// a forced sale during allocation validation.
+fn phase6_unchanged_current_weight(context: &Value, ticker: &str) -> Option<f64> {
+    let constraint = context.pointer(&format!("/final_trade_decision/per_asset/{ticker}"))?;
+    (constraint
+        .get("direction_constraint")
+        .and_then(Value::as_str)
+        == Some("unchanged"))
+    .then(|| {
+        constraint
+            .get("current_weight")
+            .and_then(Value::as_f64)
+            .filter(|weight| weight.is_finite())
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0)
+    })
 }
 
 fn active_risk_position_cap(context: &Value, ticker: &str) -> Option<f64> {
@@ -665,7 +768,7 @@ fn position_fraction(value: &Value) -> Option<f64> {
     }
 }
 
-fn cash_only_allocation(context: &Value, rationale: &str) -> Value {
+pub(crate) fn cash_only_allocation(context: &Value, rationale: &str) -> Value {
     let vix_regime = context
         .get("vix")
         .and_then(|v| v.get("regime"))
@@ -861,6 +964,39 @@ mod tests {
 
         assert_eq!(snapshot["vix"]["regime"], "elevated");
         assert_eq!(snapshot["per_ticker"]["QQQ"]["vol_pct"], 0.012);
+    }
+
+    #[test]
+    fn technical_snapshot_computes_correlation_from_common_daily_sessions() {
+        let snapshot = market_snapshot_from_technical(
+            &json!({"snapshots": [
+                {"ticker": "QQQ", "intervals": [{
+                    "interval": "daily", "status": "ok",
+                    "latest": {"date": "2026-07-30T04:00:00Z", "close": 600.0},
+                    "signals": [],
+                    "returns_60d": [
+                        {"session": "2026-07-28", "return": 0.01},
+                        {"session": "2026-07-29", "return": -0.02},
+                        {"session": "2026-07-30", "return": 0.03}
+                    ]
+                }]},
+                {"ticker": "SOXX", "intervals": [{
+                    "interval": "daily", "status": "ok",
+                    "latest": {"date": "2026-07-30T04:00:00Z", "close": 500.0},
+                    "signals": [],
+                    "returns_60d": [
+                        {"session": "2026-07-28", "return": 0.02},
+                        {"session": "2026-07-29", "return": -0.04},
+                        {"session": "2026-07-30", "return": 0.06}
+                    ]
+                }]}
+            ]}),
+            &test_config(),
+        )
+        .unwrap();
+
+        assert_eq!(snapshot["correlation_60d"], 1.0);
+        assert_eq!(snapshot["correlation_sample_size"], 3);
     }
 
     #[test]
@@ -1321,5 +1457,50 @@ mod tests {
         );
         assert_eq!(allocation["total_equity_exposure"], 0.0);
         assert_eq!(allocation["weights"]["cash_hedge"]["weight"], 1.0);
+        assert_eq!(
+            allocation["equity_budget_deviation"]["actual_equity_exposure"],
+            0.0
+        );
+        assert_eq!(
+            allocation["equity_budget_deviation"]["absolute_deviation"],
+            0.3
+        );
+    }
+
+    #[test]
+    fn phase6_unchanged_preserves_existing_weight_despite_zero_candidate_caps() {
+        let state = json!({
+            "research_plan": {"per_ticker": {
+                    "QQQ": {"long_probability": 0.51},
+                    "SOXX": {"long_probability": 0.49}
+                }},
+            "final_trade_decision": {
+                "per_asset": {
+                    "QQQ": {"direction_constraint": "unchanged", "execution_status": "wait", "current_weight": 0.1, "max_target_weight": 0.1, "max_weight_delta": 0.0, "binding_risk_controls": []},
+                    "SOXX": {"direction_constraint": "unchanged", "execution_status": "wait", "current_weight": 0.1, "max_target_weight": 0.1, "max_weight_delta": 0.0, "binding_risk_controls": []}
+                }
+            }
+        });
+        let mut context = test_context();
+        context["final_trade_decision"] = state["final_trade_decision"].clone();
+        context["trader_plans"] = json!({
+            "QQQ": {"action": "Hold", "position_size_pct_max": 0.0},
+            "SOXX": {"action": "Hold", "position_size_pct_max": 0.0}
+        });
+        context["risk_debate_state"] = json!({"history": [{"payload": {"per_asset": {
+            "QQQ": {"position_cap_pct": 0.0},
+            "SOXX": {"position_cap_pct": 0.0}
+        }}}]});
+
+        let allocation = derive_guarded_allocation(&state, &context, &test_config()).unwrap();
+
+        assert_eq!(allocation["weights"]["QQQ"]["weight"], 0.1);
+        assert_eq!(allocation["weights"]["SOXX"]["weight"], 0.1);
+        assert_eq!(allocation["weights"]["cash_hedge"]["weight"], 0.8);
+        assert_eq!(allocation["total_equity_exposure"], 0.2);
+        assert_eq!(
+            allocation["equity_budget_deviation"]["actual_equity_exposure"],
+            0.2
+        );
     }
 }

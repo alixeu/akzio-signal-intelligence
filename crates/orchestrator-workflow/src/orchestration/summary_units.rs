@@ -1,7 +1,5 @@
 //! Stable identifiers for Rust-owned Phase Summary indexes.
 
-use orchestrator_core::md5_3;
-
 const INDEX_ID_DOMAIN: &[u8] = b"akzio.phase_summary.index.v1\0";
 
 /// Stable Index ID for one Rust-owned summary. Length-prefixed fields keep the
@@ -23,7 +21,8 @@ pub fn derive_summary_index_id(
     push_optional_field(&mut preimage, topic_id);
     push_field(&mut preimage, unit_key.as_bytes());
     push_field(&mut preimage, source_payload_hash.as_bytes());
-    format!("idx-{}", md5_3(preimage))
+    let hash = orchestrator_store::content_hash_bytes(&preimage);
+    format!("idx-{}", hash.strip_prefix("sha256:").unwrap_or(&hash))
 }
 
 fn push_field(output: &mut Vec<u8>, value: &[u8]) {
@@ -56,7 +55,7 @@ mod tests {
             "phase3:manager.research:artifact:aggregate:none:0",
             "sha256:source",
         );
-        assert_eq!(aggregate.len(), 10);
+        assert_eq!(aggregate.len(), 68);
         assert!(aggregate.starts_with("idx-"));
         assert_ne!(
             aggregate,

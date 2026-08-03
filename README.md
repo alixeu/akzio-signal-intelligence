@@ -383,7 +383,9 @@ rtk cargo run -p orchestrator-cli --bin orchestrator-exec -- \
   日期或配置哈希，例如 `QQQ/SOXX/VIX` 固定为 `qqq-soxx-vix-debug`，所以
   `--debug --from-phase X --to-phase X` 会重开同一份 Index、会话与状态。
 - `--max-debate-rounds N`:限制条件辩论轮数。
-- `--max-topics-per-side N`:限制实质性冲突议题数。
+- `--max-topics-per-side N`:限制每个 Bull/Bear 侧参与的实质性冲突议题数
+  (默认 3)。Rust 会在进入辩论前确定性截断 Topic Generator 的结果,并在
+  `topic_generation_artifact.selection` 记录生成数、选中数与截断数。
 
 `--mock` 仅用于本地测试与开发,不能证明生产工作流或外部服务可用。`--debug` 将 MemoryOS 写入解析到 `knowledge/debug/<run-id>/`;它绝不写入规范的 Decision 或 Outcome 数据。回放与迁移夹具使用各自的命名空间,回放只通过只读读取器读取规范 Decision,且只输出回放结果。
 

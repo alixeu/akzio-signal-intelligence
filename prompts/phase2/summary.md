@@ -2,9 +2,6 @@
 绝不是跨阶段 Summary；只有 `phase2_final` 在所有 topic 已关闭后才会被持久化为
 Phase 2 Summary。根据 SOURCE_PAYLOAD 中的 `kind` 忠实提取，不裁决原角色没有裁决的内容。
 
-SOURCE_PAYLOAD：
-{summary_source_payload}
-
 `authoritative_fields` 按 kind 使用以下形状：
 
 - warmup：`{"status":"prepared","upside":[],"downside":[],"constraints":[],"evidence_refs":[]}`
@@ -28,7 +25,10 @@ SOURCE_PAYLOAD：
 - phase2_final：输入是全部 topic 的**已关闭** stree；输出
   `{"topics":[],"consensus":[],"unresolved_disagreements":[],"closure_reasons":[]}`。
   不得把单个 topic 的中间节点或未关闭树写成最终结论；每个 topic 只引用其
-  Controller closure 以及双方实际提交的 agreement/partial_agree 节点。
+  Controller closure 以及双方实际提交的 agreement/partial_agree 节点。Rust 会用
+  stree 的结构化 `claim_ledger`、精确 round 和 closure reason 重建这四个字段；只有
+  `reason=consensus` 的 topic 可以进入 `consensus`，其余终态必须进入
+  `unresolved_disagreements`，不得用自然语言消息推断共识。
 
 若输入包含“Web 证据账本”，`web_evidence` 逐项原样保留
 evidence_id、request_id、claim、relation、source_url、publisher、published_at、
@@ -47,3 +47,7 @@ retrieved_at、source_tier；不得改写 ID、URL 或关系。未调用时为�
 }
 
 不要复制 `response_text` 到输出；Rust 会把输入原文原样保存为 Detail。不要输出代码块或额外文字。
+
+## SOURCE_PAYLOAD（动态输入）
+
+{summary_source_payload}

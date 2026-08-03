@@ -2,10 +2,14 @@ use anyhow::{bail, Context, Result};
 use chrono::{Local, NaiveDate, Utc};
 use orchestrator_core::{
     config_get, config_int, config_str, config_strings, default_project_root, display_ticker,
-    load_config, parse_tickers, project_path, BenchmarkBindingV1, BenchmarkSelectionV1,
+    load_config, parse_tickers, project_path, research_rating_for_probability,
+    validate_analyst_ticker_artifact, validate_asset_execution_constraint,
+    validate_research_decision, validate_risk_constraints, validate_trade_intent,
+    AnalystTickerArtifact, AssetExecutionConstraint, BenchmarkBindingV1, BenchmarkSelectionV1,
     DecisionSection, DecisionSectionUnavailableReason, DecisionSnapshotV2, EvaluationSpec,
     MemoryPolicyV1, MemoryUsageReferenceStatus, PersistenceContextV1, PersistenceNamespace,
-    PolicyRef, ReflectionTaskStatus, RunPurpose, DECISION_SNAPSHOT_SCHEMA_VERSION,
+    PolicyRef, ReflectionTaskStatus, ResearchDecision, RiskConstraints, RunPurpose, StopType,
+    TradeIntent, DECISION_SNAPSHOT_SCHEMA_VERSION,
 };
 use orchestrator_ingest::{jin10, technical};
 use orchestrator_store::{
@@ -19,13 +23,15 @@ use serde_json::{json, Map, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
+    process::Command,
     time::Duration,
 };
 
 use crate::evaluation::{materialize_pending, MarketInputConfigV1, MaterializerPolicyV1};
 use crate::orchestration::{
     allocation::{
-        compute_allocation_context, derive_guarded_allocation, market_snapshot_from_technical,
+        cash_only_allocation, compute_allocation_context, derive_guarded_allocation,
+        market_snapshot_from_technical,
     },
     config::RuntimeConfig,
     execution::{
@@ -34,8 +40,9 @@ use crate::orchestration::{
     },
     input_snapshot_runtime::{capture_phase1_file_store_inputs, phase1_input_sources},
     lifecycle::{
-        debug_run_id_for, investable_assets_from_state, run_id_for, run_id_for_seed,
-        run_location_from_state, set_phase_status, tickers_from_state, validate_asset_scope,
+        debug_run_id_for, investable_assets_from_state, research_plan_to_trade_intent, run_id_for,
+        run_id_for_seed, run_location_from_state, set_phase_status, tickers_from_state,
+        validate_asset_scope,
     },
     role_jobs::{
         commit_historical_reflection, prepare_role_job, record_role_job_metrics, run_role_jobs,
@@ -143,9 +150,18 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         state_was_rehydrated =
             rehydrate_completed_debug_state(&store, &location, &manifest, &mut state)?;
     }
+    if rehydrate_completed_phase_projections(&store, &location, &manifest, &mut state)? {
+        state_was_rehydrated = true;
+        persist_state(&mut state)?;
+    }
     state["max_debate_rounds"] = json!(args.max_debate_rounds.unwrap_or_else(|| config_int(
         &config,
         "orchestrator.runtime.max_debate_rounds",
+        3
+    )));
+    state["max_topics_per_side"] = json!(args.max_topics_per_side.unwrap_or_else(|| config_int(
+        &config,
+        "orchestrator.runtime.max_topics_per_side",
         3
     )));
 
@@ -549,6 +565,12 @@ fn validate_args(args: &ExecArgs) -> Result<()> {
     {
         bail!("max_debate_rounds must be in 0..=10")
     }
+    if args
+        .max_topics_per_side
+        .is_some_and(|topics| !(1..=20).contains(&topics))
+    {
+        bail!("max_topics_per_side must be in 1..=20")
+    }
     Ok(())
 }
 
@@ -581,13 +603,46 @@ fn prepare_manifest(
             location: location.clone(),
             workflow_version: format!("orchestrator-workflow-v{}", env!("CARGO_PKG_VERSION")),
             prompt_versions: runtime.prompts.versions.clone(),
-            git_sha: option_env!("GIT_SHA").unwrap_or("unavailable").to_owned(),
+            git_sha: resolve_git_sha(&default_project_root())?,
             config_hash: content_hash(config)?,
             role_profile_registry_hash: snapshot.content_hash,
             created_at: Utc::now().to_rfc3339(),
         })?,
     )
     .map_err(Into::into)
+}
+
+fn resolve_git_sha(project_root: &Path) -> Result<String> {
+    if let Some(sha) = option_env!("GIT_SHA")
+        .map(str::trim)
+        .filter(|sha| is_git_sha(sha))
+    {
+        return Ok(sha.to_owned());
+    }
+    let output = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(project_root)
+        .output()
+        .with_context(|| format!("failed to resolve git SHA in {}", project_root.display()))?;
+    if !output.status.success() {
+        bail!(
+            "git rev-parse HEAD failed in {}: {}",
+            project_root.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+    }
+    let sha = String::from_utf8(output.stdout)
+        .context("git rev-parse HEAD returned non-UTF-8 output")?
+        .trim()
+        .to_owned();
+    if !is_git_sha(&sha) {
+        bail!("git rev-parse HEAD returned invalid SHA {sha:?}")
+    }
+    Ok(sha)
+}
+
+fn is_git_sha(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.chars().all(|character| character.is_ascii_hexdigit())
 }
 
 fn load_or_initialize_state(
@@ -713,6 +768,65 @@ fn rehydrate_completed_debug_state(
     Ok(true)
 }
 
+fn rehydrate_completed_phase_projections(
+    store: &FileStore,
+    location: &RunLocation,
+    manifest: &RunManifest,
+    state: &mut Value,
+) -> Result<bool> {
+    let mut changed = false;
+    for (phase, status) in &manifest.phase_status {
+        if matches!(
+            status,
+            orchestrator_store::PhaseStatus::Completed | orchestrator_store::PhaseStatus::Degraded
+        ) && state
+            .pointer(&format!("/phase_status/{phase}"))
+            .and_then(Value::as_str)
+            != Some("done")
+        {
+            state["phase_status"][phase.as_str()] = json!("done");
+            changed = true;
+        }
+    }
+    if phase_completed(manifest, 3) && state.get("research_plan").is_none() {
+        let index = read_indexes(
+            store,
+            Some(location),
+            &IndexQuery {
+                kind: Some(IndexKind::PhaseSummary),
+                source_phase: Some(3),
+                role: Some("manager.research".to_owned()),
+                limit: 1,
+                ..Default::default()
+            },
+        )?
+        .indexes
+        .into_iter()
+        .next()
+        .context("manifest completed Phase 3 but its ResearchDecision Index is missing")?;
+        let decisions = index
+            .authoritative_fields
+            .get("decisions")
+            .cloned()
+            .context("Phase 3 ResearchDecision Index is missing decisions")?;
+        state["research_plan"] = json!({
+            "per_ticker": decisions,
+            "regime_context": index
+                .authoritative_fields
+                .get("regime_context")
+                .cloned()
+                .unwrap_or(Value::Null),
+            "authority": "rehydrated_phase3_index",
+            "index_id": index.index_id,
+        });
+        state
+            .as_object_mut()
+            .map(|object| object.remove("_force_phase3_recompute"));
+        changed = true;
+    }
+    Ok(changed)
+}
+
 fn finish_phase(
     store: &FileStore,
     location: &RunLocation,
@@ -726,12 +840,18 @@ fn finish_phase(
     sync_manifest_health(manifest, state);
     manifest.phase_status.insert(
         phase.to_string(),
-        if status == "done" {
+        if status == "done" && manifest.degraded {
+            orchestrator_store::PhaseStatus::Degraded
+        } else if status == "done" {
             orchestrator_store::PhaseStatus::Completed
         } else {
             orchestrator_store::PhaseStatus::Failed
         },
     );
+    // Persist the state projection before the manifest advertises completion.
+    // A later phase may fail, and recovery must never observe a manifest that
+    // is ahead of the state it authorizes.
+    persist_state(state)?;
     write_run_manifest(store, location, manifest.clone())?;
     Ok(())
 }
@@ -1251,7 +1371,7 @@ async fn run_phase1(
     }
     state["analyst_reports"] = Value::Object(reports);
     state["phase1_index"] = json!({"roles": state["analyst_reports"], "authority": "file_store"});
-    state["weighted_probability_base"] = weighted_probability_base(state);
+    state["weighted_probability_base"] = weighted_probability_base(state)?;
     Ok(())
 }
 
@@ -1302,18 +1422,23 @@ async fn run_phase2(
         None,
         None,
     );
-    let topics = generated
+    let generated_topics = generated
         .pointer("/payload/topics")
         .or_else(|| generated.get("topics"))
         .cloned()
         .unwrap_or_else(|| json!([]));
+    let max_topics_per_side = state
+        .get("max_topics_per_side")
+        .and_then(Value::as_i64)
+        .unwrap_or(3)
+        .clamp(1, 20) as usize;
+    let (topics, topic_selection) = select_phase2_topics(generated_topics, max_topics_per_side)?;
     let topic_generation_session =
         runtime_session_for(state, "mediator.topic", "topic_generation", None, None);
     state["topic_generation_session_id"] = topic_generation_session["session_id"].clone();
     state["topic_generation_turn_id"] = topic_generation_session["turn_id"].clone();
     let actionable = topics.as_array().is_some_and(|items| !items.is_empty());
-    state["topic_generation_artifact"] =
-        json!({"artifact": generated, "topics": topics, "actionable": actionable});
+    state["topic_generation_artifact"] = json!({"artifact": generated, "topics": topics, "actionable": actionable, "selection": topic_selection});
 
     let mut controllers = serde_json::Map::new();
     for topic in topics.as_array().into_iter().flatten() {
@@ -1373,6 +1498,13 @@ async fn run_phase2(
             {
                 Ok(artifact) => artifact,
                 Err(error) => {
+                    record_phase2_runtime_failure(
+                        state,
+                        &topic_id,
+                        dispatch.actor,
+                        "role_job_failure",
+                        &error.to_string(),
+                    );
                     tree.record_failure(dispatch.actor, error.to_string(), 1)?;
                     state["topic_debate_states"][&topic_id]["stree"] = serde_json::to_value(&tree)?;
                     checkpoint_state(state)?;
@@ -1391,6 +1523,13 @@ async fn run_phase2(
                 {
                     tree.close_after_safety_limit()?;
                 } else {
+                    record_phase2_runtime_failure(
+                        state,
+                        &topic_id,
+                        dispatch.actor,
+                        "stree_command_failure",
+                        &error_text,
+                    );
                     tree.record_failure(dispatch.actor, error_text, 1)?;
                 }
             }
@@ -1437,6 +1576,51 @@ async fn run_phase2(
     checkpoint_state(state)?;
     write_phase2_debate_debug_summary(state)?;
     Ok(())
+}
+
+fn select_phase2_topics(generated: Value, max_topics_per_side: usize) -> Result<(Value, Value)> {
+    let mut topics = generated
+        .as_array()
+        .cloned()
+        .context("Phase 2 topic generation topics must be an array")?;
+    let generated_count = topics.len();
+    topics.truncate(max_topics_per_side);
+    let selected_count = topics.len();
+    Ok((
+        Value::Array(topics),
+        json!({
+            "authority": "rust",
+            "policy": "each Bull/Bear side participates in at most max_topics_per_side topic lanes",
+            "max_topics_per_side": max_topics_per_side,
+            "generated_count": generated_count,
+            "selected_count": selected_count,
+            "truncated_count": generated_count.saturating_sub(selected_count),
+        }),
+    ))
+}
+
+fn record_phase2_runtime_failure(
+    state: &mut Value,
+    topic_id: &str,
+    actor: DebateActor,
+    kind: &str,
+    failure: &str,
+) {
+    state["degraded"] = Value::Bool(true);
+    if !state["errors"].is_array() {
+        state["errors"] = json!([]);
+    }
+    state["errors"]
+        .as_array_mut()
+        .expect("errors initialized as array")
+        .push(json!({
+            "phase": 2,
+            "kind": kind,
+            "topic_id": topic_id,
+            "role": actor.role(),
+            "failure": failure,
+            "recovered": true,
+        }));
 }
 
 #[allow(dead_code)] // Retained temporarily for the legacy Controller contract regression tests below.
@@ -2122,7 +2306,7 @@ fn inject_runtime_current_weights_into_final_decision(state: &mut Value) -> Resu
 
 async fn run_phase7(
     store: &FileStore,
-    _location: &RunLocation,
+    location: &RunLocation,
     state: &mut Value,
     runtime: &RuntimeConfig,
     args: &ExecArgs,
@@ -2131,14 +2315,24 @@ async fn run_phase7(
         inject_runtime_current_weights_into_final_decision(state)?;
     }
     let context = compute_allocation_context(state, &runtime.allocation)?;
-    let allocation = derive_guarded_allocation(state, &context, &runtime.allocation)
-        .unwrap_or_else(|error| {
-            json!({
-                "weights": {"cash_hedge": {"weight": 1.0, "rationale": error.to_string()}},
-                "total_equity_exposure": 0.0,
-                "allocation_method": "fallback_cash",
-            })
-        });
+    let allocation = match derive_guarded_allocation(state, &context, &runtime.allocation) {
+        Ok(allocation) => allocation,
+        Err(error) => {
+            state["degraded"] = Value::Bool(true);
+            if !state["errors"].is_array() {
+                state["errors"] = json!([]);
+            }
+            state["errors"]
+                .as_array_mut()
+                .expect("errors initialized as array")
+                .push(json!({
+                    "phase": 7,
+                    "kind": "allocation_fallback",
+                    "failure": error.to_string(),
+                }));
+            cash_only_allocation(&context, &error.to_string())
+        }
+    };
     state["allocation_context"] = context;
     state["portfolio_allocation"] = allocation.clone();
     if args.mock {
@@ -2223,7 +2417,24 @@ async fn run_phase7(
                 "order_plan": state["order_plan"],
                 "execution_report": state["execution_report"],
             }))?,
-            details: Vec::new(),
+            details: vec![PhaseIndexCandidateDetail {
+                section: "execution".to_owned(),
+                detail: String::new(),
+                source_refs: read_indexes(
+                    store,
+                    Some(location),
+                    &IndexQuery {
+                        kind: Some(IndexKind::PhaseSummary),
+                        source_phase: Some(6),
+                        limit: 100,
+                        ..Default::default()
+                    },
+                )?
+                .indexes
+                .into_iter()
+                .map(|index| index.index_id)
+                .collect(),
+            }],
             missing_fields: Vec::new(),
             ambiguities: Vec::new(),
         },
@@ -2331,13 +2542,37 @@ fn write_final_decision_indexes(
             applies_to_phases: Vec::new(),
         },
     )?;
+    let mut source_refs = state
+        .get("allocation_artifact")
+        .and_then(|artifact| artifact.get("index_id"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .into_iter()
+        .collect::<Vec<_>>();
+    source_refs.extend(
+        read_indexes(
+            store,
+            Some(location),
+            &IndexQuery {
+                kind: Some(IndexKind::PhaseSummary),
+                source_phase: Some(6),
+                limit: 100,
+                ..Default::default()
+            },
+        )?
+        .indexes
+        .into_iter()
+        .map(|index| index.index_id),
+    );
+    source_refs.sort();
+    source_refs.dedup();
     append_index_detail(
         store,
         AppendIndexDetailInput {
             scope: scope.clone(),
             section: DetailSection::Execution,
             detail: serde_json::to_string(&payload)?,
-            source_refs: Vec::new(),
+            source_refs,
         },
     )?;
     finalize_index(store, &scope)?;
@@ -2701,6 +2936,12 @@ async fn compile_unit_response(
     if kind == "topic_control" {
         normalize_phase2_topic_control_fields(&mut candidate.authoritative_fields)?;
     }
+    if kind == "topic_generation" {
+        validate_phase2_topic_ttls(&candidate.authoritative_fields)?;
+    }
+    if kind == "phase2_final" {
+        project_phase2_final_fields(state, &mut candidate.authoritative_fields)?;
+    }
     if kind == "topic_control" {
         if let Some(topic_id) = topic_id {
             if let Some(topic_state) = state.pointer(&format!("/topic_debate_states/{topic_id}")) {
@@ -2713,7 +2954,26 @@ async fn compile_unit_response(
         }
     }
     if phase_u8 == 6 {
-        inject_current_weights_into_phase6_fields(state, &mut candidate.authoritative_fields)?;
+        enrich_and_validate_phase6_compiled_fields(state, &mut candidate.authoritative_fields)?;
+    }
+    if phase_u8 == 1 {
+        attach_verified_phase1_web_sources(response_text, &mut candidate.authoritative_fields)?;
+        validate_phase1_compiled_fields(&candidate.authoritative_fields)?;
+    }
+    if phase_u8 == 5 {
+        validate_phase5_compiled_fields(
+            state,
+            role,
+            &candidate.summary,
+            &candidate.missing_fields,
+            &mut candidate.authoritative_fields,
+        )?;
+    }
+    if phase_u8 == 4 {
+        validate_phase4_compiled_fields(state, &mut candidate.authoritative_fields)?;
+    }
+    if phase_u8 == 3 {
+        validate_phase3_compiled_fields(state, &mut candidate.authoritative_fields)?;
     }
     validate_phase2_compiled_contract(
         kind,
@@ -2834,9 +3094,13 @@ fn enrich_compiled_fields(
                         .unwrap_or("topic"),
                     offset
                 );
+                let hash = orchestrator_store::content_hash_bytes(seed.as_bytes());
                 topic_object.insert(
                     "topic_id".to_owned(),
-                    Value::String(format!("topic-{}", orchestrator_core::md5_3(seed))),
+                    Value::String(format!(
+                        "topic-{}",
+                        hash.strip_prefix("sha256:").unwrap_or(&hash)
+                    )),
                 );
             }
         }
@@ -2927,6 +3191,104 @@ fn normalize_phase2_topic_control_fields(
         normalized.push(Value::Object(item));
     }
     fields.insert("decision_hinges".to_owned(), Value::Array(normalized));
+    Ok(())
+}
+
+fn validate_phase2_topic_ttls(fields: &serde_json::Map<String, Value>) -> Result<()> {
+    let topics = fields
+        .get("topics")
+        .and_then(Value::as_array)
+        .context("Phase 2 topic_generation requires topics")?;
+    for (index, topic) in topics.iter().enumerate() {
+        let ttl = topic
+            .get("ttl")
+            .and_then(Value::as_str)
+            .with_context(|| format!("Phase 2 topic {index} requires ttl"))?;
+        if !matches!(ttl, "intraday" | "1-3d") {
+            bail!(
+                "Phase 2 topic {index} ttl {ttl:?} exceeds the supported 1-5 trading-day decision horizon"
+            )
+        }
+    }
+    Ok(())
+}
+
+fn project_phase2_final_fields(
+    state: &Value,
+    fields: &mut serde_json::Map<String, Value>,
+) -> Result<()> {
+    let empty_topic_states = serde_json::Map::new();
+    let topic_states = match state.get("topic_debate_states").and_then(Value::as_object) {
+        Some(topic_states) => topic_states,
+        None if state
+            .pointer("/topic_generation_artifact/topics")
+            .and_then(Value::as_array)
+            .is_none_or(Vec::is_empty) =>
+        {
+            &empty_topic_states
+        }
+        None => bail!("Phase 2 final projection requires topic_debate_states"),
+    };
+    let mut topic_ids = topic_states.keys().cloned().collect::<Vec<_>>();
+    topic_ids.sort();
+    let mut topics = Vec::with_capacity(topic_ids.len());
+    let mut consensus = Vec::new();
+    let mut unresolved = Vec::new();
+    let mut closure_reasons = Vec::with_capacity(topic_ids.len());
+    for topic_id in topic_ids {
+        let topic_state = &topic_states[&topic_id];
+        let stree = topic_state
+            .get("stree")
+            .and_then(Value::as_object)
+            .with_context(|| format!("Phase 2 topic {topic_id} has no stree"))?;
+        if stree.get("status").and_then(Value::as_str) != Some("closed") {
+            bail!("Phase 2 topic {topic_id} is not closed")
+        }
+        let closure = stree
+            .get("closure")
+            .and_then(Value::as_object)
+            .with_context(|| format!("Phase 2 topic {topic_id} has no closure"))?;
+        let reason = closure
+            .get("reason")
+            .and_then(Value::as_str)
+            .with_context(|| format!("Phase 2 topic {topic_id} closure has no reason"))?;
+        let ledger = closure
+            .get("claim_ledger")
+            .cloned()
+            .unwrap_or_else(|| json!([]));
+        let round = closure
+            .get("round")
+            .cloned()
+            .or_else(|| stree.get("round").cloned())
+            .unwrap_or_else(|| json!(0));
+        topics.push(json!({
+            "topic_id": topic_id,
+            "topic": topic_state.get("topic").cloned().unwrap_or(Value::Null),
+            "round": round,
+            "closure": closure,
+            "claim_ledger": ledger,
+        }));
+        closure_reasons.push(json!({"topic_id": topic_id, "reason": reason, "round": round}));
+        if reason == "consensus" {
+            consensus.push(json!({
+                "topic_id": topic_id,
+                "claim_ids": closure.get("consensus_claim_ids").cloned().unwrap_or_else(|| json!([])),
+            }));
+        } else {
+            unresolved.push(json!({
+                "topic_id": topic_id,
+                "reason": reason,
+                "claim_ids": closure.get("unresolved_claim_ids").cloned().unwrap_or_else(|| json!([])),
+            }));
+        }
+    }
+    fields.insert("topics".to_owned(), Value::Array(topics));
+    fields.insert("consensus".to_owned(), Value::Array(consensus));
+    fields.insert(
+        "unresolved_disagreements".to_owned(),
+        Value::Array(unresolved),
+    );
+    fields.insert("closure_reasons".to_owned(), Value::Array(closure_reasons));
     Ok(())
 }
 
@@ -3059,6 +3421,10 @@ fn attach_verified_web_evidence(
     let Some((_, packet_json)) = response_text.rsplit_once(marker) else {
         return Ok(());
     };
+    let packet_json = packet_json
+        .split(orchestrator_llm::tools::web_run::VERIFIED_RESULTS_MARKER)
+        .next()
+        .unwrap_or(packet_json);
     let packets: Vec<Value> = serde_json::from_str(packet_json.trim())
         .context("Rust-verified Web evidence packet attachment is malformed")?;
     let mut seen = BTreeSet::new();
@@ -3094,6 +3460,116 @@ fn attach_verified_web_evidence(
     Ok(())
 }
 
+fn attach_verified_phase1_web_sources(
+    response_text: &str,
+    fields: &mut serde_json::Map<String, Value>,
+) -> Result<()> {
+    let verified_tool_ids = response_text
+        .rsplit_once(orchestrator_llm::VERIFIED_PHASE1_EVIDENCE_MARKER)
+        .map(|(_, registry_json)| {
+            let registry_json = registry_json
+                .split(orchestrator_llm::tools::web_run::VERIFIED_RESULTS_MARKER)
+                .next()
+                .unwrap_or(registry_json);
+            serde_json::from_str::<Vec<String>>(registry_json.trim())
+                .context("Rust-verified Phase 1 evidence ID attachment is malformed")
+                .map(|ids| ids.into_iter().collect::<BTreeSet<_>>())
+        })
+        .transpose()?;
+    let marker = orchestrator_llm::tools::web_run::VERIFIED_RESULTS_MARKER;
+    let registry = response_text
+        .rsplit_once(marker)
+        .map(|(_, registry_json)| {
+            serde_json::from_str::<Vec<Value>>(registry_json.trim())
+                .context("Rust-verified Web search result attachment is malformed")
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let urls = registry
+        .into_iter()
+        .filter_map(|item| {
+            Some((
+                item.get("evidence_id")?.as_str()?.to_owned(),
+                item.get("source_url")?.as_str()?.to_owned(),
+            ))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut unverified_web_refs_removed = 0usize;
+    let mut unverified_technical_refs_removed = 0usize;
+    let mut unverified_jin10_refs_removed = 0usize;
+    for evidence in fields
+        .get_mut("per_ticker")
+        .and_then(Value::as_object_mut)
+        .into_iter()
+        .flat_map(|reports| reports.values_mut())
+        .flat_map(|report| {
+            report
+                .get_mut("key_evidence")
+                .and_then(Value::as_array_mut)
+                .into_iter()
+                .flatten()
+        })
+    {
+        let Some(evidence) = evidence.as_object_mut() else {
+            continue;
+        };
+        if let Some(references) = evidence
+            .get_mut("evidence_refs")
+            .and_then(Value::as_array_mut)
+        {
+            references.retain(|reference| {
+                let Some(reference) = reference.as_str() else {
+                    return true;
+                };
+                let keep = if reference.starts_with("web-") {
+                    let keep = urls.contains_key(reference);
+                    unverified_web_refs_removed += usize::from(!keep);
+                    keep
+                } else if reference.starts_with("technical-") {
+                    let keep = verified_tool_ids
+                        .as_ref()
+                        .is_none_or(|ids| ids.contains(reference));
+                    unverified_technical_refs_removed += usize::from(!keep);
+                    keep
+                } else if reference.starts_with("jin10-") {
+                    let keep = verified_tool_ids
+                        .as_ref()
+                        .is_none_or(|ids| ids.contains(reference));
+                    unverified_jin10_refs_removed += usize::from(!keep);
+                    keep
+                } else {
+                    true
+                };
+                keep
+            });
+        }
+        let first_web_ref = evidence
+            .get("evidence_refs")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .find(|reference| reference.starts_with("web-"));
+        let Some(web_ref) = first_web_ref else {
+            continue;
+        };
+        let source_url = urls
+            .get(web_ref)
+            .expect("unverified Web references were removed above");
+        evidence.insert("source".to_owned(), Value::String(source_url.clone()));
+    }
+    fields.insert(
+        "evidence_normalization".to_owned(),
+        json!({
+            "authority": "rust",
+            "unverified_web_refs_removed": unverified_web_refs_removed,
+            "unverified_technical_refs_removed": unverified_technical_refs_removed,
+            "unverified_jin10_refs_removed": unverified_jin10_refs_removed,
+        }),
+    );
+    Ok(())
+}
+
 fn mock_phase_index_candidate(
     state: &Value,
     phase: u8,
@@ -3109,7 +3585,13 @@ fn mock_phase_index_candidate(
             ticker,
             json!({
                 "direction":"neutral","confidence":0.5,"priced_in":"unclear",
-                "report":response_text,"key_evidence":[],"validation_triggers":[],
+                "report":response_text,"key_evidence":[{
+                    "claim":"mock evidence is explicitly non-live","evidence_type":"inference",
+                    "source":"mock fixture","timestamp":"1970-01-01T00:00:00Z",
+                    "source_tier":"unknown","first_source":"mock fixture",
+                    "is_derivative_repost":false,"evidence_age":"unknown","source_confidence":0.0,
+                    "evidence_refs":["technical-0000000000000000000000000000000000000000000000000000000000000000"]
+                }],"validation_triggers":[],
                 "data_gaps":[],"echo_chamber_risk":"low","crowded_consensus_risk":"low",
                 "jin10_attention":[]
             })
@@ -3126,7 +3608,11 @@ fn mock_phase_index_candidate(
                     "base_probability":0.5,"debate_adjustment":0.0,
                     "confidence_basis":"evidence_balanced","hold_reason":"evidence_balanced",
                     "plan":response_text,"probability_rationale":"Mock evidence is balanced.",
-                    "scenarios":{},"decision_hinges":[],"validation_plan":[]
+                    "scenarios":{
+                        "bull":{"probability":0.25,"drivers":["mock upside driver"],"triggers":["mock upside trigger"],"confirmation":"mock upside confirmation"},
+                        "base":{"probability":0.50,"drivers":["mock base driver"],"triggers":["mock base trigger"],"confirmation":"mock base confirmation"},
+                        "bear":{"probability":0.25,"drivers":["mock downside driver"],"triggers":["mock downside trigger"],"confirmation":"mock downside confirmation"}
+                    },"decision_hinges":[],"validation_plan":[]
                 })
             )).collect::<serde_json::Map<_, _>>(),
             "regime_context": {"signal": "VIX", "status": "mock"}
@@ -3134,7 +3620,7 @@ fn mock_phase_index_candidate(
         4 => json!({"plans": investable.iter().map(|ticker| (
             ticker.clone(),
             json!({
-                "action":"Hold","execution_decision":"hold",
+                "action":"Hold","candidate_action":"Hold","execution_decision":"hold",
                 "position_size_pct_max":0.0,"entry_price":null,"stop_loss":null,
                 "blockers":[],"execution_conditions":[],"downgrade_reason":"mock","rationale":response_text
             })
@@ -3146,12 +3632,12 @@ fn mock_phase_index_candidate(
             "per_asset": investable.iter().map(|ticker| (
                 ticker.clone(),
                 json!({
-                    "position_cap_pct":0.0,"max_drawdown_pct":0.0,"stop_type":"",
-                    "risk_off_trigger":"","rebalance_trigger":"","review_window":"",
+                    "position_cap_pct":0.0,"max_drawdown_pct":0.0,"stop_type":"none",
+                    "risk_off_trigger":"no mock trigger","rebalance_trigger":"no mock trigger","review_window":"mock review",
                     "constraint_confidence":0.0
                 })
             )).collect::<serde_json::Map<_, _>>(),
-            "cash_hedge_recommendation":""
+            "cash_hedge_recommendation":"no mock hedge"
         }),
         6 => json!({"per_asset": investable.iter().map(|ticker| (
             ticker.clone(),
@@ -3365,12 +3851,899 @@ fn record_phase2_session(
     state["phase2_file_store_sessions"][topic_id][side] = session;
 }
 
-fn weighted_probability_base(state: &Value) -> Value {
-    let values = investable_assets_from_state(state)
+fn weighted_probability_base(state: &Value) -> Result<Value> {
+    let reports = state
+        .get("analyst_reports")
+        .and_then(Value::as_object)
+        .context("weighted probability base requires analyst_reports")?;
+    let mut values = serde_json::Map::new();
+    for ticker in investable_assets_from_state(state) {
+        let mut contributions = Vec::new();
+        for (role, report) in reports {
+            let per_ticker = report
+                .get("per_ticker")
+                .and_then(Value::as_object)
+                .with_context(|| format!("{role} report requires per_ticker"))?;
+            let ticker_report = per_ticker
+                .get(&ticker)
+                .with_context(|| format!("{role} report missing investable ticker {ticker}"))?;
+            let direction = ticker_report
+                .get("direction")
+                .and_then(Value::as_str)
+                .with_context(|| format!("{role} direction missing for {ticker}"))?;
+            let confidence = ticker_report
+                .get("confidence")
+                .and_then(Value::as_f64)
+                .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
+                .with_context(|| format!("{role} confidence invalid for {ticker}"))?;
+            let long_probability = match direction {
+                "bullish" => confidence,
+                "bearish" => 1.0 - confidence,
+                "neutral" | "mixed" | "unobserved" => 0.5,
+                other => bail!("{role} direction {other:?} is invalid for {ticker}"),
+            };
+            contributions.push(json!({
+                "role": role,
+                "direction": direction,
+                "confidence": confidence,
+                "long_probability": round_probability(long_probability),
+            }));
+        }
+        if contributions.is_empty() {
+            bail!("weighted probability base has no Phase 1 contributions for {ticker}")
+        }
+        let long_probability = contributions
+            .iter()
+            .filter_map(|item| item.get("long_probability").and_then(Value::as_f64))
+            .sum::<f64>()
+            / contributions.len() as f64;
+        let long_probability = round_probability(long_probability);
+        values.insert(
+            ticker,
+            json!({
+                "long_probability": long_probability,
+                "short_probability": round_probability(1.0 - long_probability),
+                "source": "phase1_direction_confidence_v1",
+                "weighting": "equal_role_mean",
+                "contributions": contributions,
+            }),
+        );
+    }
+    Ok(Value::Object(values))
+}
+
+fn round_probability(value: f64) -> f64 {
+    (value * 1_000_000.0).round() / 1_000_000.0
+}
+
+fn validate_phase1_compiled_fields(fields: &serde_json::Map<String, Value>) -> Result<()> {
+    let per_ticker = fields
+        .get("per_ticker")
+        .and_then(Value::as_object)
+        .context("Phase 1 Summary requires per_ticker")?;
+    for (ticker, report) in per_ticker {
+        let canonical = serde_json::from_value::<AnalystTickerArtifact>(report.clone())
+            .with_context(|| {
+                format!("Phase 1 canonical AnalystTickerArtifact invalid for {ticker}")
+            })?;
+        validate_analyst_ticker_artifact(&canonical).map_err(|error| {
+            anyhow::anyhow!("Phase 1 analyst artifact invalid for {ticker}: {error}")
+        })?;
+        for evidence in &canonical.key_evidence {
+            if evidence.evidence_refs.is_empty() {
+                bail!("Phase 1 evidence for {ticker} requires at least one stable evidence_refs ID")
+            }
+        }
+    }
+    let fields_value = Value::Object(fields.clone());
+    validate_phase1_reference_arrays(&fields_value, None)?;
+    if contains_phase1_web_ref(&fields_value)
+        && !per_ticker.values().any(|report| {
+            report
+                .get("key_evidence")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|evidence| evidence.get("source").and_then(Value::as_str))
+                .any(|source| source.starts_with("https://") || source.starts_with("http://"))
+        })
+    {
+        bail!("Phase 1 web evidence requires an authoritative http(s) source URL")
+    }
+    Ok(())
+}
+
+fn contains_phase1_web_ref(value: &Value) -> bool {
+    match value {
+        Value::String(value) => value.starts_with("web-"),
+        Value::Array(values) => values.iter().any(contains_phase1_web_ref),
+        Value::Object(values) => values.values().any(contains_phase1_web_ref),
+        _ => false,
+    }
+}
+
+fn validate_phase1_reference_arrays(value: &Value, parent_key: Option<&str>) -> Result<()> {
+    match value {
+        Value::Array(values) if matches!(parent_key, Some("evidence_refs" | "source_refs")) => {
+            for reference in values {
+                let reference = reference
+                    .as_str()
+                    .context("Phase 1 evidence reference must be a string")?;
+                if !is_phase1_evidence_id(reference) {
+                    bail!(
+                        "Phase 1 evidence reference {reference:?} must be a complete technical-, jin10-, or web-sha256 ID"
+                    )
+                }
+            }
+            Ok(())
+        }
+        Value::Array(values) => {
+            for value in values {
+                validate_phase1_reference_arrays(value, parent_key)?;
+            }
+            Ok(())
+        }
+        Value::Object(values) => {
+            for (key, value) in values {
+                validate_phase1_reference_arrays(value, Some(key))?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn is_phase1_evidence_id(reference: &str) -> bool {
+    ["technical-", "jin10-", "web-"]
         .into_iter()
-        .map(|ticker| (ticker, json!({"long_probability": 0.5, "short_probability": 0.5, "source": "phase1_tool_managed"})))
-        .collect::<serde_json::Map<_, _>>();
-    Value::Object(values)
+        .find_map(|prefix| reference.strip_prefix(prefix))
+        .is_some_and(|digest| {
+            digest.len() == 64
+                && digest
+                    .chars()
+                    .all(|character| character.is_ascii_hexdigit())
+        })
+}
+
+fn validate_phase3_compiled_fields(
+    state: &Value,
+    fields: &mut serde_json::Map<String, Value>,
+) -> Result<()> {
+    let verified_source_refs = verified_phase3_source_refs(state)?;
+    let decisions = fields
+        .get_mut("decisions")
+        .and_then(Value::as_object_mut)
+        .context("Phase 3 Summary requires decisions")?;
+    for ticker in investable_assets_from_state(state) {
+        let rust_base = state
+            .pointer(&format!(
+                "/weighted_probability_base/{ticker}/long_probability"
+            ))
+            .and_then(Value::as_f64)
+            .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
+            .with_context(|| format!("Rust weighted probability base missing for {ticker}"))?;
+        let decision = decisions
+            .get_mut(&ticker)
+            .and_then(Value::as_object_mut)
+            .with_context(|| format!("Phase 3 Summary decision missing for {ticker}"))?;
+        if let Some(verified_source_refs) = verified_source_refs.as_ref() {
+            project_phase3_evidence_refs(decision, verified_source_refs);
+        }
+        let base = required_probability(decision, "base_probability", &ticker)?;
+        if (base - rust_base).abs() > 0.000001 {
+            bail!(
+                "Phase 3 base_probability for {ticker} must equal Rust base {rust_base}; got {base}"
+            )
+        }
+        let long = required_probability(decision, "long_probability", &ticker)?;
+        let short = required_probability(decision, "short_probability", &ticker)?;
+        if (long + short - 1.0).abs() > 0.000001 {
+            bail!("Phase 3 long_probability + short_probability must equal 1 for {ticker}")
+        }
+        let adjustment = decision
+            .get("debate_adjustment")
+            .and_then(Value::as_f64)
+            .filter(|value| value.is_finite())
+            .with_context(|| format!("Phase 3 debate_adjustment missing for {ticker}"))?;
+        let expected_long = round_probability(base + adjustment);
+        if !(0.0..=1.0).contains(&expected_long) || (long - expected_long).abs() > 0.000001 {
+            bail!(
+                "Phase 3 probability ledger mismatch for {ticker}: base {base} + debate_adjustment {adjustment} != long_probability {long}"
+            )
+        }
+        if adjustment.abs() > 0.000001 {
+            let hinges = decision
+                .get("decision_hinges")
+                .and_then(Value::as_array)
+                .with_context(|| {
+                    format!(
+                        "non-zero Phase 3 debate adjustment requires decision_hinges for {ticker}"
+                    )
+                })?;
+            if hinges.is_empty()
+                || hinges.iter().any(|hinge| {
+                    hinge
+                        .get("evidence_refs")
+                        .and_then(Value::as_array)
+                        .is_none_or(|refs| {
+                            refs.is_empty()
+                                || refs.iter().any(|reference| {
+                                    reference.as_str().is_none_or(|reference| {
+                                        reference.trim().is_empty()
+                                            || reference.contains("...")
+                                            || reference.starts_with("web.run:search")
+                                    })
+                                })
+                        })
+                })
+            {
+                bail!(
+                    "non-zero Phase 3 debate adjustment requires complete stable evidence_refs for {ticker}"
+                )
+            }
+        }
+        if decision.get("scenarios").is_none_or(Value::is_null) {
+            bail!("Phase 3 scenarios are required for {ticker}")
+        }
+        project_phase3_scenario_probabilities(decision, long, &ticker)?;
+        let model_rating = decision
+            .get("rating")
+            .and_then(Value::as_str)
+            .unwrap_or("missing")
+            .to_owned();
+        let rust_rating = research_rating_for_probability(long);
+        let rating_overridden = model_rating != rust_rating;
+        decision.insert("rating".to_owned(), Value::String(rust_rating.to_owned()));
+        decision.insert(
+            "rating_projection".to_owned(),
+            json!({
+                "authority": "rust",
+                "model_rating": model_rating,
+                "projected_rating": rust_rating,
+                "overridden": rating_overridden,
+            }),
+        );
+        if rust_rating == "Hold" {
+            let confidence_basis = decision
+                .get("confidence_basis")
+                .and_then(Value::as_str)
+                .context("Phase 3 Hold requires confidence_basis")?;
+            let hold_reason = match confidence_basis {
+                "evidence_balanced" => "evidence_balanced",
+                "data_insufficient" => "evidence_insufficient",
+                "conflicting_evidence" => "conflicting_evidence",
+                other => bail!("Phase 3 Hold cannot use confidence_basis={other}"),
+            };
+            decision.insert(
+                "hold_reason".to_owned(),
+                Value::String(hold_reason.to_owned()),
+            );
+        } else {
+            decision.insert("hold_reason".to_owned(), Value::Null);
+        }
+        let canonical = serde_json::from_value::<ResearchDecision>(json!({
+            "rating": decision.get("rating"),
+            "long_probability": long,
+            "short_probability": short,
+            "confidence_basis": decision.get("confidence_basis"),
+            "hold_reason": decision.get("hold_reason"),
+            "plan": decision.get("plan"),
+            "probability_rationale": decision.get("probability_rationale"),
+            "scenarios": decision.get("scenarios"),
+        }))
+        .with_context(|| format!("Phase 3 canonical ResearchDecision invalid for {ticker}"))?;
+        validate_research_decision(&canonical)
+            .map_err(|error| anyhow::anyhow!("Phase 3 decision invalid for {ticker}: {error}"))?;
+    }
+    Ok(())
+}
+
+fn verified_phase3_source_refs(state: &Value) -> Result<Option<BTreeSet<String>>> {
+    let Some(store_root) = state.get("store_root").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    let store = FileStore::open(store_root, FileStoreOptions::default())?;
+    let location = run_location_from_state(state)?;
+    let mut verified = BTreeSet::new();
+    for phase in [1_u8, 2_u8] {
+        let page = read_indexes(
+            &store,
+            Some(&location),
+            &IndexQuery {
+                source_phase: Some(phase),
+                limit: 1_000,
+                ..IndexQuery::default()
+            },
+        )?;
+        for index in page.indexes {
+            verified.insert(index.index_id);
+            if phase == 1 {
+                collect_reference_array_ids(
+                    &Value::Object(index.authoritative_fields),
+                    &mut verified,
+                );
+            } else if let Some(web_evidence) = index.authoritative_fields.get("web_evidence") {
+                collect_complete_phase1_ids(web_evidence, &mut verified);
+            }
+        }
+    }
+    if verified.is_empty() {
+        bail!("Phase 3 requires persisted Phase 1/2 Index provenance")
+    }
+    Ok(Some(verified))
+}
+
+fn collect_reference_array_ids(value: &Value, verified: &mut BTreeSet<String>) {
+    match value {
+        Value::Object(values) => {
+            for (key, value) in values {
+                if matches!(key.as_str(), "evidence_refs" | "source_refs") {
+                    collect_complete_phase1_ids(value, verified);
+                } else {
+                    collect_reference_array_ids(value, verified);
+                }
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                collect_reference_array_ids(value, verified);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_complete_phase1_ids(value: &Value, verified: &mut BTreeSet<String>) {
+    match value {
+        Value::String(reference) if is_phase1_evidence_id(reference) => {
+            verified.insert(reference.to_owned());
+        }
+        Value::Array(values) => {
+            for value in values {
+                collect_complete_phase1_ids(value, verified);
+            }
+        }
+        Value::Object(values) => {
+            for value in values.values() {
+                collect_complete_phase1_ids(value, verified);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn project_phase3_evidence_refs(
+    decision: &mut serde_json::Map<String, Value>,
+    verified_source_refs: &BTreeSet<String>,
+) {
+    let mut model_refs = Vec::new();
+    let mut projected_refs = BTreeSet::new();
+    let mut removed = 0usize;
+    for hinge in decision
+        .get_mut("decision_hinges")
+        .and_then(Value::as_array_mut)
+        .into_iter()
+        .flatten()
+    {
+        let Some(refs) = hinge.get_mut("evidence_refs").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for reference in refs.iter().filter_map(Value::as_str) {
+            model_refs.push(reference.to_owned());
+        }
+        refs.retain(|reference| {
+            let keep = reference
+                .as_str()
+                .is_some_and(|reference| verified_source_refs.contains(reference));
+            removed += usize::from(!keep);
+            if let Some(reference) = reference.as_str().filter(|_| keep) {
+                projected_refs.insert(reference.to_owned());
+            }
+            keep
+        });
+    }
+    decision.insert(
+        "evidence_reference_projection".to_owned(),
+        json!({
+            "authority": "rust_filestore_indexes",
+            "model_refs": model_refs,
+            "projected_refs": projected_refs.into_iter().collect::<Vec<_>>(),
+            "unverified_refs_removed": removed,
+        }),
+    );
+}
+
+fn project_phase3_scenario_probabilities(
+    decision: &mut serde_json::Map<String, Value>,
+    long_probability: f64,
+    ticker: &str,
+) -> Result<()> {
+    let (model_bull, model_base, model_bear) = {
+        let scenarios = decision
+            .get_mut("scenarios")
+            .and_then(Value::as_object_mut)
+            .with_context(|| format!("Phase 3 scenarios must be an object for {ticker}"))?;
+        let probability = |scenario: &str| -> Result<f64> {
+            scenarios
+                .get(scenario)
+                .and_then(Value::as_object)
+                .and_then(|value| value.get("probability"))
+                .and_then(Value::as_f64)
+                .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
+                .with_context(|| {
+                    format!("Phase 3 {ticker} scenario {scenario} probability is invalid")
+                })
+        };
+        (
+            probability("bull")?,
+            probability("base")?,
+            probability("bear")?,
+        )
+    };
+    let max_base = 2.0 * long_probability.min(1.0 - long_probability);
+    let projected_base = round_probability(model_base.min(max_base));
+    let projected_bull = round_probability(long_probability - 0.5 * projected_base);
+    let projected_bear = round_probability(1.0 - long_probability - 0.5 * projected_base);
+    let scenarios = decision
+        .get_mut("scenarios")
+        .and_then(Value::as_object_mut)
+        .expect("Phase 3 scenarios checked above");
+    for (scenario, probability) in [
+        ("bull", projected_bull),
+        ("base", projected_base),
+        ("bear", projected_bear),
+    ] {
+        scenarios
+            .get_mut(scenario)
+            .and_then(Value::as_object_mut)
+            .with_context(|| format!("Phase 3 {ticker} scenario {scenario} must be an object"))?
+            .insert("probability".to_owned(), json!(probability));
+    }
+    decision.insert(
+        "scenario_probability_projection".to_owned(),
+        json!({
+            "authority": "rust",
+            "model": {"bull": model_bull, "base": model_base, "bear": model_bear},
+            "projected": {"bull": projected_bull, "base": projected_base, "bear": projected_bear},
+            "base_probability_capped": model_base > max_base,
+            "identity": "long = bull + 0.5 * base; bull + base + bear = 1",
+        }),
+    );
+    Ok(())
+}
+
+fn required_probability(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+    ticker: &str,
+) -> Result<f64> {
+    object
+        .get(field)
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
+        .with_context(|| format!("Phase 3 {field} missing or invalid for {ticker}"))
+}
+
+fn validate_phase4_compiled_fields(
+    state: &Value,
+    fields: &mut serde_json::Map<String, Value>,
+) -> Result<()> {
+    let plans = fields
+        .get_mut("plans")
+        .and_then(Value::as_object_mut)
+        .context("Phase 4 Summary requires plans")?;
+    for ticker in investable_assets_from_state(state) {
+        let research = state
+            .pointer(&format!("/research_plan/per_ticker/{ticker}"))
+            .with_context(|| format!("Phase 3 research decision missing for {ticker}"))?;
+        let expected_candidate = research_plan_to_trade_intent(research)["candidate_action"]
+            .as_str()
+            .context("Rust-owned candidate action missing")?
+            .to_owned();
+        let plan = plans
+            .get_mut(&ticker)
+            .and_then(Value::as_object_mut)
+            .with_context(|| format!("Phase 4 plan missing for {ticker}"))?;
+        if let Some(reported_candidate) = plan.get("candidate_action").and_then(Value::as_str) {
+            if reported_candidate != expected_candidate {
+                bail!(
+                    "Phase 4 candidate_action for {ticker} must remain {expected_candidate}; got {reported_candidate}"
+                )
+            }
+        }
+        plan.insert(
+            "candidate_action".to_owned(),
+            Value::String(expected_candidate.clone()),
+        );
+        let action = plan
+            .get("action")
+            .and_then(Value::as_str)
+            .with_context(|| format!("Phase 4 action missing for {ticker}"))?;
+        if action != expected_candidate && action != "Hold" {
+            bail!(
+                "Phase 4 action for {ticker} may execute {expected_candidate} or downgrade to Hold; got {action}"
+            )
+        }
+        let execution_decision = plan
+            .get("execution_decision")
+            .and_then(Value::as_str)
+            .with_context(|| format!("Phase 4 execution_decision missing for {ticker}"))?;
+        if (action == "Hold" && execution_decision != "hold")
+            || (action != "Hold" && execution_decision != "execute_candidate")
+        {
+            bail!("Phase 4 action and execution_decision disagree for {ticker}")
+        }
+        let canonical = serde_json::from_value::<TradeIntent>(json!({
+            "action": plan.get("action"),
+            "candidate_action": plan.get("candidate_action"),
+            "execution_decision": plan.get("execution_decision"),
+            "entry_price": plan.get("entry_price"),
+            "stop_loss": plan.get("stop_loss"),
+            "position_size_pct_max": plan.get("position_size_pct_max"),
+            "blockers": plan.get("blockers"),
+            "rationale": plan.get("rationale"),
+        }))
+        .with_context(|| format!("Phase 4 canonical TradeIntent invalid for {ticker}"))?;
+        validate_trade_intent(&canonical).map_err(|error| {
+            anyhow::anyhow!("Phase 4 trade intent invalid for {ticker}: {error}")
+        })?;
+    }
+    Ok(())
+}
+
+fn validate_phase5_compiled_fields(
+    state: &Value,
+    role: &str,
+    summary: &str,
+    missing_fields: &[String],
+    fields: &mut serde_json::Map<String, Value>,
+) -> Result<()> {
+    let expected_stance = role
+        .strip_prefix("risk.")
+        .with_context(|| format!("Phase 5 role {role} has no risk stance"))?;
+    if let Some(reported) = fields.get("stance").and_then(Value::as_str) {
+        if reported != expected_stance {
+            bail!("Phase 5 stance must match runtime role {expected_stance}; got {reported}")
+        }
+    }
+    fields.insert(
+        "stance".to_owned(),
+        Value::String(expected_stance.to_owned()),
+    );
+    let no_new_information = fields
+        .get("no_new_information")
+        .and_then(Value::as_bool)
+        .context("Phase 5 no_new_information is required")?;
+    let unique = fields
+        .get("unique_risk_contribution")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let adjustment = fields
+        .get("recommended_adjustment")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if !no_new_information && (unique.trim().is_empty() || adjustment.trim().is_empty()) {
+        bail!("Phase 5 new information requires a contribution and recommended adjustment")
+    }
+    let disagreement = fields
+        .get("disagreement_with_prior")
+        .and_then(Value::as_str)
+        .context("Phase 5 disagreement_with_prior is required")?;
+    let cash_hedge = phase5_string(
+        fields.get("cash_hedge_recommendation"),
+        "portfolio",
+        "cash_hedge_recommendation",
+        missing_fields,
+    )?;
+    let per_asset = fields
+        .get("per_asset")
+        .and_then(Value::as_object)
+        .context("Phase 5 Summary requires per_asset")?;
+    for ticker in investable_assets_from_state(state) {
+        let constraints = per_asset
+            .get(&ticker)
+            .and_then(Value::as_object)
+            .with_context(|| format!("Phase 5 constraints missing for {ticker}"))?;
+        let stop_type = match constraints.get("stop_type").and_then(Value::as_str) {
+            Some("hard") => StopType::Hard,
+            Some("soft") => StopType::Soft,
+            Some("none") => StopType::None,
+            Some(other) if !other.trim().is_empty() => {
+                bail!("Phase 5 stop_type invalid for {ticker}: {other}")
+            }
+            _ if phase5_field_is_missing(missing_fields, &ticker, "stop_type") => StopType::None,
+            _ => bail!("Phase 5 stop_type missing without missing_fields entry for {ticker}"),
+        };
+        let canonical = RiskConstraints {
+            stance: expected_stance.to_owned(),
+            argument: summary.to_owned(),
+            unique_risk_contribution: unique.to_owned(),
+            disagreement_with_prior: disagreement.to_owned(),
+            no_new_information,
+            recommended_adjustment: adjustment.to_owned(),
+            stop_type,
+            max_drawdown_pct: phase5_number(
+                constraints.get("max_drawdown_pct"),
+                &ticker,
+                "max_drawdown_pct",
+                missing_fields,
+            )?,
+            position_cap_pct: phase5_number(
+                constraints.get("position_cap_pct"),
+                &ticker,
+                "position_cap_pct",
+                missing_fields,
+            )?,
+            rebalance_trigger: phase5_string(
+                constraints.get("rebalance_trigger"),
+                &ticker,
+                "rebalance_trigger",
+                missing_fields,
+            )?,
+            risk_off_trigger: phase5_string(
+                constraints.get("risk_off_trigger"),
+                &ticker,
+                "risk_off_trigger",
+                missing_fields,
+            )?,
+            review_window: phase5_string(
+                constraints.get("review_window"),
+                &ticker,
+                "review_window",
+                missing_fields,
+            )?,
+            cash_hedge_recommendation: cash_hedge.clone(),
+            constraint_confidence: constraints
+                .get("constraint_confidence")
+                .and_then(Value::as_f64)
+                .filter(|value| value.is_finite())
+                .with_context(|| format!("Phase 5 constraint_confidence missing for {ticker}"))?,
+        };
+        validate_risk_constraints(&canonical).map_err(|error| {
+            anyhow::anyhow!("Phase 5 constraints invalid for {ticker}: {error}")
+        })?;
+    }
+    Ok(())
+}
+
+fn phase5_field_is_missing(missing_fields: &[String], scope: &str, field: &str) -> bool {
+    let dotted = format!("{scope}.{field}");
+    let nested = format!("per_asset.{scope}.{field}");
+    let pointer = format!("/per_asset/{scope}/{field}");
+    missing_fields
+        .iter()
+        .any(|missing| matches!(missing.as_str(), value if value == dotted || value == nested || value == pointer))
+}
+
+fn phase5_number(
+    value: Option<&Value>,
+    scope: &str,
+    field: &str,
+    missing_fields: &[String],
+) -> Result<f64> {
+    if let Some(value) = value.and_then(Value::as_f64) {
+        return Ok(value);
+    }
+    if phase5_field_is_missing(missing_fields, scope, field) {
+        return Ok(0.0);
+    }
+    bail!("Phase 5 {scope}.{field} missing without missing_fields entry")
+}
+
+fn phase5_string(
+    value: Option<&Value>,
+    scope: &str,
+    field: &str,
+    missing_fields: &[String],
+) -> Result<String> {
+    if let Some(value) = value
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        return Ok(value.to_owned());
+    }
+    if phase5_field_is_missing(missing_fields, scope, field) {
+        return Ok(String::new());
+    }
+    bail!("Phase 5 {scope}.{field} missing without missing_fields entry")
+}
+
+fn enrich_and_validate_phase6_compiled_fields(
+    state: &Value,
+    fields: &mut serde_json::Map<String, Value>,
+) -> Result<()> {
+    inject_current_weights_into_phase6_fields(state, fields)?;
+    let per_asset = fields
+        .get_mut("per_asset")
+        .context("Phase 6 Summary requires per_asset")?;
+    enrich_final_trade_decision_fields(state, per_asset)?;
+
+    let phase5_refs = state
+        .pointer("/risk_debate_state/history")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|artifact| artifact.get("index_id").and_then(Value::as_str))
+        .map(ToOwned::to_owned)
+        .collect::<BTreeSet<_>>();
+    let risk_missing_fields = state
+        .pointer("/risk_debate_state/history")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .flat_map(|artifact| {
+            artifact
+                .pointer("/payload/missing_fields")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .filter_map(Value::as_str)
+        .map(ToOwned::to_owned)
+        .collect::<BTreeSet<_>>();
+    let investable = investable_assets_from_state(state);
+    let decisions = per_asset
+        .as_object_mut()
+        .context("Phase 6 per_asset must be an object")?;
+    for ticker in &investable {
+        let decision = decisions
+            .get_mut(ticker)
+            .and_then(Value::as_object_mut)
+            .with_context(|| format!("Phase 6 decision missing for {ticker}"))?;
+        let trader_action = state
+            .pointer(&format!(
+                "/trader_investment_plan/per_ticker/{ticker}/action"
+            ))
+            .and_then(Value::as_str)
+            .with_context(|| format!("Trader action missing for {ticker}"))?;
+        let model_direction = decision
+            .get("direction_constraint")
+            .and_then(Value::as_str)
+            .with_context(|| format!("Phase 6 direction_constraint missing for {ticker}"))?
+            .to_owned();
+        let projected_direction = match trader_action {
+            "Buy" => "increase_only",
+            "Sell" => "decrease_only",
+            "Hold" => "unchanged",
+            _ => bail!("unsupported Trader action {trader_action:?} for {ticker}"),
+        };
+        let current_weight = decision
+            .get("current_weight")
+            .and_then(Value::as_f64)
+            .with_context(|| format!("Phase 6 current_weight missing for {ticker}"))?;
+        let model_max_target_weight = decision
+            .get("max_target_weight")
+            .and_then(Value::as_f64)
+            .with_context(|| format!("Phase 6 max_target_weight missing for {ticker}"))?;
+        let model_max_weight_delta = decision
+            .get("max_weight_delta")
+            .and_then(Value::as_f64)
+            .with_context(|| format!("Phase 6 max_weight_delta missing for {ticker}"))?;
+        let projected_max_target_weight = match projected_direction {
+            "increase_only" => model_max_target_weight.max(current_weight),
+            "decrease_only" => model_max_target_weight.min(current_weight),
+            "unchanged" => current_weight,
+            _ => unreachable!("projected direction is exhaustive"),
+        };
+        let projected_max_weight_delta = if projected_direction == "unchanged" {
+            0.0
+        } else {
+            model_max_weight_delta
+        };
+        decision.insert(
+            "direction_constraint".to_owned(),
+            json!(projected_direction),
+        );
+        decision.insert(
+            "max_target_weight".to_owned(),
+            json!(projected_max_target_weight),
+        );
+        decision.insert(
+            "max_weight_delta".to_owned(),
+            json!(projected_max_weight_delta),
+        );
+        if trader_action == "Hold"
+            && decision.get("execution_status").and_then(Value::as_str) == Some("execute")
+        {
+            decision.insert("execution_status".to_owned(), json!("wait"));
+        }
+        decision.insert(
+            "constraint_projection".to_owned(),
+            json!({
+                "authority": "rust",
+                "trader_action": trader_action,
+                "model_direction_constraint": model_direction,
+                "projected_direction_constraint": projected_direction,
+                "model_max_target_weight": model_max_target_weight,
+                "projected_max_target_weight": projected_max_target_weight,
+                "model_max_weight_delta": model_max_weight_delta,
+                "projected_max_weight_delta": projected_max_weight_delta,
+                "overridden": model_direction != projected_direction
+                    || (model_max_target_weight - projected_max_target_weight).abs() > f64::EPSILON
+                    || (model_max_weight_delta - projected_max_weight_delta).abs() > f64::EPSILON,
+            }),
+        );
+
+        let controls = decision
+            .get_mut("binding_risk_controls")
+            .and_then(Value::as_array_mut)
+            .with_context(|| format!("Phase 6 binding_risk_controls missing for {ticker}"))?;
+        let mut control_source_projections = Vec::with_capacity(controls.len());
+        for control in controls.iter_mut() {
+            if let Some(text) = control.as_str() {
+                *control = json!({
+                    "control": text,
+                    "source_refs": phase5_refs.iter().cloned().collect::<Vec<_>>()
+                });
+            }
+            let object = control.as_object_mut().with_context(|| {
+                format!("Phase 6 binding risk control must be an object for {ticker}")
+            })?;
+            let control_text = object
+                .get("control")
+                .and_then(Value::as_str)
+                .filter(|text| !text.trim().is_empty())
+                .with_context(|| format!("Phase 6 binding risk control text missing for {ticker}"))?
+                .to_owned();
+            let model_refs = object
+                .get("source_refs")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let projected_refs = phase5_refs.iter().cloned().collect::<Vec<_>>();
+            object.insert("source_refs".to_owned(), json!(projected_refs));
+            control_source_projections.push(json!({
+                "control": control_text,
+                "model_source_refs": model_refs,
+                "projected_source_refs": phase5_refs.iter().cloned().collect::<Vec<_>>(),
+            }));
+        }
+        decision.insert(
+            "risk_control_source_projection".to_owned(),
+            json!({
+                "authority": "rust",
+                "controls": control_source_projections,
+            }),
+        );
+
+        let blockers = decision
+            .entry("unresolved_blockers".to_owned())
+            .or_insert_with(|| json!([]))
+            .as_array_mut()
+            .with_context(|| {
+                format!("Phase 6 unresolved_blockers must be an array for {ticker}")
+            })?;
+        for missing in &risk_missing_fields {
+            let belongs_to_other_ticker = investable
+                .iter()
+                .any(|asset| asset != ticker && missing.contains(asset));
+            if (missing.contains(ticker) || !belongs_to_other_ticker)
+                && !blockers
+                    .iter()
+                    .any(|existing| existing.as_str() == Some(missing))
+            {
+                blockers.push(Value::String(missing.clone()));
+            }
+        }
+        if !blockers.is_empty()
+            && decision.get("execution_status").and_then(Value::as_str) == Some("execute")
+        {
+            decision.insert("execution_status".to_owned(), json!("downgrade"));
+        }
+
+        let canonical = serde_json::from_value::<AssetExecutionConstraint>(json!({
+            "direction_constraint": decision.get("direction_constraint"),
+            "execution_status": decision.get("execution_status"),
+            "current_weight": decision.get("current_weight"),
+            "max_target_weight": decision.get("max_target_weight"),
+            "max_weight_delta": decision.get("max_weight_delta"),
+            "binding_risk_controls": decision.get("binding_risk_controls"),
+        }))
+        .with_context(|| format!("Phase 6 canonical execution constraint invalid for {ticker}"))?;
+        validate_asset_execution_constraint(&canonical)
+            .map_err(|error| anyhow::anyhow!("Phase 6 constraint invalid for {ticker}: {error}"))?;
+    }
+    Ok(())
 }
 
 fn validate_asset_keys(state: &Value, value: &Value, label: &str) -> Result<()> {
@@ -3449,16 +4822,23 @@ mod phase2_session_tests {
         RunManifestInit,
     };
     use serde_json::{json, Value};
+    use std::collections::BTreeSet;
     use tempfile::tempdir;
 
     use super::{
-        attach_verified_web_evidence, controller_should_continue, defers_phase_summary,
-        enrich_final_trade_decision_fields, ensure_initial_collision_route,
-        highest_completed_phase, is_cacheable_unit, load_or_initialize_state,
-        normalize_phase2_topic_control_fields, persist_state, persists_phase_index,
-        phase2_debate_debug_summary, prompt_owner_for_unit, record_phase2_session,
-        redacted_config_for_state, runtime_session_key, scoped_state_for_unit,
-        select_reflection_task_budget, sync_manifest_health, validate_phase2_compiled_contract,
+        attach_verified_phase1_web_sources, attach_verified_web_evidence,
+        controller_should_continue, defers_phase_summary,
+        enrich_and_validate_phase6_compiled_fields, enrich_final_trade_decision_fields,
+        ensure_initial_collision_route, finish_phase, highest_completed_phase, is_cacheable_unit,
+        load_or_initialize_state, normalize_phase2_topic_control_fields, persist_state,
+        persists_phase_index, phase2_debate_debug_summary, project_phase2_final_fields,
+        project_phase3_evidence_refs, prompt_owner_for_unit, record_phase2_runtime_failure,
+        record_phase2_session, redacted_config_for_state, resolve_git_sha, runtime_session_key,
+        scoped_state_for_unit, select_phase2_topics, select_reflection_task_budget,
+        sync_manifest_health, validate_phase1_compiled_fields, validate_phase2_compiled_contract,
+        validate_phase2_topic_ttls, validate_phase3_compiled_fields,
+        validate_phase4_compiled_fields, validate_phase5_compiled_fields,
+        weighted_probability_base,
     };
 
     #[test]
@@ -3559,6 +4939,402 @@ mod phase2_session_tests {
             per_asset["QQQ"]["invalidation_conditions"]["blockers"],
             json!(["missing price anchor"])
         );
+    }
+
+    #[test]
+    fn weighted_probability_base_uses_phase1_direction_and_confidence() {
+        let state = json!({
+            "investable_assets": ["QQQ", "SOXX"],
+            "analyst_reports": {
+                "analyst.technical": {"per_ticker": {
+                    "QQQ": {"direction": "bearish", "confidence": 0.60},
+                    "SOXX": {"direction": "bearish", "confidence": 0.78}
+                }},
+                "analyst.news_macro": {"per_ticker": {
+                    "QQQ": {"direction": "mixed", "confidence": 0.54},
+                    "SOXX": {"direction": "mixed", "confidence": 0.57}
+                }}
+            }
+        });
+
+        let base = weighted_probability_base(&state).unwrap();
+
+        assert_eq!(base["QQQ"]["long_probability"], 0.45);
+        assert_eq!(base["QQQ"]["short_probability"], 0.55);
+        assert_eq!(base["SOXX"]["long_probability"], 0.36);
+        assert_eq!(base["SOXX"]["short_probability"], 0.64);
+        assert_eq!(base["QQQ"]["source"], "phase1_direction_confidence_v1");
+    }
+
+    #[test]
+    fn phase2_topic_budget_is_deterministic_and_audited() {
+        let generated = json!([
+            {"topic_id": "topic-a"},
+            {"topic_id": "topic-b"},
+            {"topic_id": "topic-c"}
+        ]);
+
+        let (selected, audit) = select_phase2_topics(generated, 2).unwrap();
+
+        assert_eq!(
+            selected,
+            json!([{"topic_id": "topic-a"}, {"topic_id": "topic-b"}])
+        );
+        assert_eq!(audit["authority"], "rust");
+        assert_eq!(audit["generated_count"], 3);
+        assert_eq!(audit["selected_count"], 2);
+        assert_eq!(audit["truncated_count"], 1);
+        assert_eq!(audit["max_topics_per_side"], 2);
+    }
+
+    #[test]
+    fn phase1_rejects_raw_hashes_and_local_web_result_numbers() {
+        let fields = json!({
+            "per_ticker": {"QQQ": {
+                "direction": "mixed", "confidence": 0.5, "report": "mixed",
+                "key_evidence": [{
+                    "claim": "claim", "evidence_type": "fact", "source": "source",
+                    "timestamp": "2026-08-03T00:00:00Z", "source_tier": "official",
+                    "first_source": "source", "is_derivative_repost": false,
+                    "evidence_age": "0-2d", "source_confidence": 0.8
+                }],
+                "priced_in": "unclear", "echo_chamber_risk": "low",
+                "crowded_consensus_risk": "low", "validation_triggers": [], "data_gaps": [],
+                "analysis_trace": {"source_refs": ["web.run:search0"]}
+            }}
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        assert!(validate_phase1_compiled_fields(&fields).is_err());
+    }
+
+    #[test]
+    fn phase1_accepts_structured_evidence_with_a_stable_reference() {
+        let evidence_id = format!("technical-{}", "a".repeat(64));
+        let fields = json!({
+            "per_ticker": {"QQQ": {
+                "direction": "mixed", "confidence": 0.5, "report": "mixed",
+                "key_evidence": [{
+                    "claim": "claim", "evidence_type": "fact", "source": "filestore.run_input.technical",
+                    "timestamp": "2026-08-03T00:00:00Z", "source_tier": "unknown",
+                    "first_source": "filestore.run_input.technical", "is_derivative_repost": false,
+                    "evidence_age": "0-2d", "source_confidence": 0.8,
+                    "evidence_refs": [evidence_id]
+                }],
+                "priced_in": "unclear", "echo_chamber_risk": "unknown",
+                "crowded_consensus_risk": "unknown", "validation_triggers": [], "data_gaps": []
+            }}
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        validate_phase1_compiled_fields(&fields).unwrap();
+    }
+
+    fn canonical_phase3_fields() -> serde_json::Map<String, Value> {
+        json!({
+            "decisions": {
+                "QQQ": {
+                    "rating": "Underweight",
+                    "long_probability": 0.44,
+                    "short_probability": 0.56,
+                    "base_probability": 0.45,
+                    "debate_adjustment": -0.01,
+                    "confidence_basis": "directional_evidence",
+                    "hold_reason": null,
+                    "plan": "Maintain the evidence-bounded downside plan.",
+                    "probability_rationale": "The validated debate moved the Phase 1 base by one point.",
+                    "scenarios": {
+                        "bull": {"probability": 0.19, "drivers": ["breadth recovery"], "triggers": ["3h breakout"], "confirmation": "price confirms"},
+                        "base": {"probability": 0.50, "drivers": ["range continuation"], "triggers": ["range persists"], "confirmation": "range holds"},
+                        "bear": {"probability": 0.31, "drivers": ["downtrend continuation"], "triggers": ["20m breakdown"], "confirmation": "lower low confirms"}
+                    },
+                    "decision_hinges": [{"hinge": "validated collision", "evidence_refs": ["idx-123456"]}],
+                    "validation_plan": ["observe the cited hinge"]
+                }
+            }
+        })
+        .as_object()
+        .unwrap()
+        .clone()
+    }
+
+    #[test]
+    fn phase3_rejects_unaccounted_probability_shift() {
+        let state = json!({
+            "investable_assets": ["QQQ"],
+            "weighted_probability_base": {"QQQ": {"long_probability": 0.45}}
+        });
+        let mut fields = canonical_phase3_fields();
+        fields["decisions"]["QQQ"]["debate_adjustment"] = json!(0.0);
+
+        assert!(validate_phase3_compiled_fields(&state, &mut fields).is_err());
+    }
+
+    #[test]
+    fn phase3_accepts_only_canonical_accounted_decision() {
+        let state = json!({
+            "investable_assets": ["QQQ"],
+            "weighted_probability_base": {"QQQ": {"long_probability": 0.45}}
+        });
+        let mut fields = canonical_phase3_fields();
+
+        validate_phase3_compiled_fields(&state, &mut fields).unwrap();
+    }
+
+    #[test]
+    fn phase3_rating_and_non_hold_reason_are_rust_projected() {
+        let state = json!({
+            "investable_assets": ["QQQ"],
+            "weighted_probability_base": {"QQQ": {"long_probability": 0.45}}
+        });
+        let mut fields = canonical_phase3_fields();
+        fields["decisions"]["QQQ"]["rating"] = json!("Hold");
+        fields["decisions"]["QQQ"]["hold_reason"] = json!("conflicting_evidence");
+        fields["decisions"]["QQQ"]["scenarios"]["bull"]["probability"] = json!(0.1);
+        fields["decisions"]["QQQ"]["scenarios"]["base"]["probability"] = json!(0.2);
+        fields["decisions"]["QQQ"]["scenarios"]["bear"]["probability"] = json!(0.7);
+
+        validate_phase3_compiled_fields(&state, &mut fields).unwrap();
+
+        assert_eq!(fields["decisions"]["QQQ"]["rating"], "Underweight");
+        assert_eq!(fields["decisions"]["QQQ"]["hold_reason"], Value::Null);
+        assert_eq!(
+            fields["decisions"]["QQQ"]["rating_projection"]["overridden"],
+            true
+        );
+        assert_eq!(
+            fields["decisions"]["QQQ"]["scenarios"]["bull"]["probability"],
+            0.34
+        );
+        assert_eq!(
+            fields["decisions"]["QQQ"]["scenarios"]["base"]["probability"],
+            0.2
+        );
+        assert_eq!(
+            fields["decisions"]["QQQ"]["scenarios"]["bear"]["probability"],
+            0.46
+        );
+    }
+
+    #[test]
+    fn phase4_rejects_reversing_the_rust_owned_candidate_action() {
+        let state = json!({
+            "investable_assets": ["QQQ"],
+            "research_plan": {"per_ticker": {"QQQ": {
+                "rating": "Underweight", "probability_rationale": "downside dominates"
+            }}}
+        });
+        let mut fields = json!({"plans": {"QQQ": {
+            "action": "Buy", "candidate_action": "Buy",
+            "execution_decision": "execute_candidate", "position_size_pct_max": 0.2,
+            "entry_price": null, "stop_loss": null, "blockers": [],
+            "execution_conditions": [], "downgrade_reason": "", "rationale": "reverse it"
+        }}})
+        .as_object()
+        .unwrap()
+        .clone();
+
+        assert!(validate_phase4_compiled_fields(&state, &mut fields).is_err());
+    }
+
+    #[test]
+    fn phase5_rejects_an_undeclared_missing_constraint() {
+        let state = json!({"investable_assets": ["QQQ"]});
+        let mut fields = json!({
+            "stance": "neutral",
+            "unique_risk_contribution": "gap risk",
+            "disagreement_with_prior": "none",
+            "no_new_information": false,
+            "recommended_adjustment": "cap the position",
+            "per_asset": {"QQQ": {
+                "position_cap_pct": 0.2,
+                "max_drawdown_pct": null,
+                "stop_type": "soft",
+                "risk_off_trigger": "breakdown",
+                "rebalance_trigger": "volatility doubles",
+                "review_window": "one day",
+                "constraint_confidence": 0.7
+            }},
+            "cash_hedge_recommendation": "hold cash"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        assert!(validate_phase5_compiled_fields(
+            &state,
+            "risk.neutral",
+            "risk summary",
+            &[],
+            &mut fields
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn phase2_recovered_failure_degrades_the_run_health_projection() {
+        let mut state = json!({"degraded": false, "errors": []});
+
+        record_phase2_runtime_failure(
+            &mut state,
+            "topic-a",
+            super::DebateActor::Bear,
+            "stree_command_failure",
+            "invalid claim id",
+        );
+
+        assert_eq!(state["degraded"], true);
+        assert_eq!(state["errors"][0]["phase"], 2);
+        assert_eq!(state["errors"][0]["recovered"], true);
+    }
+
+    #[test]
+    fn phase2_rejects_a_topic_ttl_outside_the_decision_window() {
+        let fields = json!({"topics": [{"ttl": "1-2w"}]})
+            .as_object()
+            .unwrap()
+            .clone();
+
+        assert!(validate_phase2_topic_ttls(&fields).is_err());
+    }
+
+    #[test]
+    fn phase2_final_projection_does_not_invent_consensus() {
+        let state = json!({"topic_debate_states": {"topic-a": {
+            "topic": {"topic": "rates"},
+            "stree": {
+                "status": "closed", "round": 2,
+                "closure": {
+                    "reason": "unresolved_disagreement", "round": 2,
+                    "claim_ledger": [{"claim_id": "topic-a:stree:7"}],
+                    "consensus_claim_ids": [],
+                    "unresolved_claim_ids": ["topic-a:stree:7"]
+                }
+            }
+        }}});
+        let mut fields = json!({
+            "topics": [], "consensus": [{"topic_id": "topic-a"}],
+            "unresolved_disagreements": [], "closure_reasons": []
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        project_phase2_final_fields(&state, &mut fields).unwrap();
+
+        assert_eq!(fields["consensus"], json!([]));
+        assert_eq!(fields["unresolved_disagreements"][0]["topic_id"], "topic-a");
+        assert_eq!(fields["closure_reasons"][0]["round"], 2);
+    }
+
+    #[test]
+    fn manifest_git_sha_resolves_to_a_full_commit_identity() {
+        let sha = resolve_git_sha(&orchestrator_core::default_project_root()).unwrap();
+
+        assert!(matches!(sha.len(), 40 | 64));
+        assert!(sha.chars().all(|character| character.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn phase6_inherits_probability_and_projects_risk_gaps_with_sources() {
+        let state = json!({
+            "investable_assets": ["QQQ"],
+            "current_portfolio_weights": {"QQQ": 0.2},
+            "research_plan": {"per_ticker": {"QQQ": {
+                "rating": "Underweight", "long_probability": 0.44, "short_probability": 0.56
+            }}},
+            "trader_investment_plan": {"per_ticker": {"QQQ": {
+                "action": "Sell", "execution_conditions": [], "entry_price": null,
+                "stop_loss": null, "downgrade_reason": "wait for reversal", "blockers": []
+            }}},
+            "risk_debate_state": {"history": [{
+                "index_id": "idx-risk01",
+                "payload": {"missing_fields": ["QQQ.max_drawdown_pct"]}
+            }]}
+        });
+        let mut fields = json!({"per_asset": {"QQQ": {
+            "direction_constraint": "decrease_only",
+            "execution_status": "execute",
+            "max_target_weight": 0.20,
+            "max_weight_delta": 0.10,
+            "binding_risk_controls": ["reduce on a confirmed breakdown"],
+            "rating": "",
+            "inherited_probability": null,
+            "execution_rationale": "de-risk only",
+            "unresolved_blockers": []
+        }}})
+        .as_object()
+        .unwrap()
+        .clone();
+
+        enrich_and_validate_phase6_compiled_fields(&state, &mut fields).unwrap();
+
+        let decision = &fields["per_asset"]["QQQ"];
+        assert_eq!(decision["inherited_probability"], 0.44);
+        assert_eq!(decision["long_probability"], 0.44);
+        assert_eq!(decision["short_probability"], 0.56);
+        assert_eq!(
+            decision["binding_risk_controls"][0]["source_refs"],
+            json!(["idx-risk01"])
+        );
+        assert_eq!(decision["execution_status"], "downgrade");
+        assert!(decision["unresolved_blockers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item == "QQQ.max_drawdown_pct"));
+    }
+
+    #[test]
+    fn phase6_projects_constraints_from_the_trader_final_hold_action() {
+        let state = json!({
+            "investable_assets": ["QQQ"],
+            "current_portfolio_weights": {"QQQ": 0.1},
+            "research_plan": {"per_ticker": {"QQQ": {
+                "rating": "Hold", "long_probability": 0.51, "short_probability": 0.49
+            }}},
+            "trader_investment_plan": {"per_ticker": {"QQQ": {
+                "action": "Hold", "execution_conditions": [], "entry_price": null,
+                "stop_loss": null, "downgrade_reason": "insufficient confirmation", "blockers": []
+            }}},
+            "risk_debate_state": {"history": [{
+                "index_id": "idx-risk01", "payload": {"missing_fields": []}
+            }]}
+        });
+        let mut fields = json!({"per_asset": {"QQQ": {
+            "direction_constraint": "decrease_only",
+            "execution_status": "execute",
+            "max_target_weight": 0.0,
+            "max_weight_delta": 0.1,
+            "binding_risk_controls": [{
+                "control": "do not add without confirmation", "source_refs": ["idx-risk01"]
+            }],
+            "rating": "Hold",
+            "inherited_probability": null,
+            "execution_rationale": "wait",
+            "unresolved_blockers": []
+        }}})
+        .as_object()
+        .unwrap()
+        .clone();
+
+        enrich_and_validate_phase6_compiled_fields(&state, &mut fields).unwrap();
+
+        let decision = &fields["per_asset"]["QQQ"];
+        assert_eq!(decision["direction_constraint"], "unchanged");
+        assert_eq!(decision["execution_status"], "wait");
+        assert_eq!(decision["current_weight"], 0.1);
+        assert_eq!(decision["max_target_weight"], 0.1);
+        assert_eq!(decision["max_weight_delta"], 0.0);
+        assert_eq!(
+            decision["constraint_projection"]["model_direction_constraint"],
+            "decrease_only"
+        );
+        assert_eq!(decision["constraint_projection"]["overridden"], true);
     }
 
     #[test]
@@ -3855,6 +5631,132 @@ mod phase2_session_tests {
     }
 
     #[test]
+    fn phase1_web_source_is_restored_from_the_verified_runtime_registry() {
+        let response = format!(
+            "报告\n\n{}\n{}",
+            orchestrator_llm::tools::web_run::VERIFIED_RESULTS_MARKER,
+            json!([{
+                "evidence_id": "web-123456",
+                "source_url": "https://example.com/fact"
+            }])
+        );
+        let mut fields = json!({
+            "per_ticker": {"QQQ": {"key_evidence": [{
+                "source": "example.com",
+                "evidence_refs": ["jin10-123456", "web-123456"]
+            }]}}
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        attach_verified_phase1_web_sources(&response, &mut fields).unwrap();
+
+        assert_eq!(
+            fields["per_ticker"]["QQQ"]["key_evidence"][0]["source"],
+            "https://example.com/fact"
+        );
+    }
+
+    #[test]
+    fn phase1_drops_unverified_web_refs_without_guessing_an_id() {
+        let response = format!(
+            "报告\n\n{}\n[]",
+            orchestrator_llm::tools::web_run::VERIFIED_RESULTS_MARKER
+        );
+        let mut fields = json!({
+            "per_ticker": {"QQQ": {"key_evidence": [{
+                "source": "jin10",
+                "evidence_refs": [
+                    "jin10-123456",
+                    "web-ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+                ]
+            }]}}
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        attach_verified_phase1_web_sources(&response, &mut fields).unwrap();
+
+        assert_eq!(
+            fields["per_ticker"]["QQQ"]["key_evidence"][0]["evidence_refs"],
+            json!(["jin10-123456"])
+        );
+        assert_eq!(
+            fields["evidence_normalization"]["unverified_web_refs_removed"],
+            1
+        );
+    }
+
+    #[test]
+    fn phase1_drops_mutated_technical_and_jin10_ids_against_tool_registry() {
+        let response = format!(
+            "报告\n\n{}\n{}",
+            orchestrator_llm::VERIFIED_PHASE1_EVIDENCE_MARKER,
+            json!([
+                "technical-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "jin10-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            ])
+        );
+        let mut fields = json!({
+            "per_ticker": {"QQQ": {"key_evidence": [{
+                "source": "FileStore",
+                "evidence_refs": [
+                    "technical-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+                    "jin10-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbc",
+                    "technical-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "jin10-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                ]
+            }]}}
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        attach_verified_phase1_web_sources(&response, &mut fields).unwrap();
+
+        assert_eq!(
+            fields["per_ticker"]["QQQ"]["key_evidence"][0]["evidence_refs"],
+            json!([
+                "technical-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "jin10-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            ])
+        );
+        assert_eq!(
+            fields["evidence_normalization"]["unverified_technical_refs_removed"],
+            1
+        );
+        assert_eq!(
+            fields["evidence_normalization"]["unverified_jin10_refs_removed"],
+            1
+        );
+    }
+
+    #[test]
+    fn phase3_drops_refs_that_do_not_resolve_to_persisted_source_indexes() {
+        let valid = "idx-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let invalid = "idx-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab";
+        let mut decision = json!({
+            "decision_hinges": [{"hinge": "macro", "evidence_refs": [invalid, valid]}]
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        project_phase3_evidence_refs(&mut decision, &BTreeSet::from([valid.to_owned()]));
+
+        assert_eq!(
+            decision["decision_hinges"][0]["evidence_refs"],
+            json!([valid])
+        );
+        assert_eq!(
+            decision["evidence_reference_projection"]["unverified_refs_removed"],
+            1
+        );
+    }
+
+    #[test]
     fn historical_ticker_scope_does_not_narrow_investable_assets() {
         let scoped = scoped_state_for_unit(
             &json!({
@@ -3911,6 +5813,44 @@ mod phase2_session_tests {
         assert_eq!(manifest.errors.len(), 1);
         assert_eq!(manifest.errors[0].phase, Some(3));
         assert_eq!(manifest.errors[0].code, "artifact");
+    }
+
+    #[test]
+    fn finish_phase_persists_state_before_manifest_completion() {
+        let directory = tempdir().unwrap();
+        let store = FileStore::open(directory.path(), FileStoreOptions::default()).unwrap();
+        let location = RunLocation::new("2026-08-03", "run-finish-test").unwrap();
+        let mut manifest = RunManifest::new(RunManifestInit {
+            location: location.clone(),
+            workflow_version: "test".to_owned(),
+            prompt_versions: Default::default(),
+            git_sha: "a".repeat(40),
+            config_hash: "sha256:test".to_owned(),
+            role_profile_registry_hash: "sha256:test".to_owned(),
+            created_at: "2026-08-03T00:00:00Z".to_owned(),
+        })
+        .unwrap();
+        let mut state = json!({
+            "schema_version": 1,
+            "run_id": "run-finish-test",
+            "current_date": "2026-08-03",
+            "ticker": "QQQ",
+            "tickers": ["QQQ"],
+            "analysis_universe": ["QQQ"],
+            "investable_assets": ["QQQ"],
+            "store_root": directory.path(),
+            "config": {},
+            "storage_namespace": null,
+            "phase_status": {},
+            "degraded": false,
+            "errors": []
+        });
+
+        finish_phase(&store, &location, &mut manifest, &mut state, 3, "done").unwrap();
+
+        let persisted = store.read_json_value(&location.state_relative()).unwrap();
+        assert_eq!(persisted["phase_status"]["3"], "done");
+        assert_eq!(manifest.phase_status["3"], PhaseStatus::Completed);
     }
 
     #[test]

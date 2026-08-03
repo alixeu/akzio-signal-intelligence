@@ -9,7 +9,7 @@ use orchestrator_core::{default_project_root, ToolManagedProfile};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Component, Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
@@ -25,6 +25,10 @@ pub mod agent_loop;
 pub mod tools;
 pub mod truncation;
 pub mod web_search;
+
+/// Appended to read-only Phase 1 output so reducers can distinguish exact
+/// FileStore/tool evidence IDs from strings copied or mutated by the model.
+pub const VERIFIED_PHASE1_EVIDENCE_MARKER: &str = "<!-- Rust-verified Phase 1 evidence IDs -->";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -501,12 +505,115 @@ fn completed_turn_artifact(turn: &Turn) -> Result<Value> {
         response_text.push('\n');
         response_text.push_str(&serde_json::to_string_pretty(&web_evidence)?);
     }
+    let verified_phase1_ids = verified_phase1_evidence_ids(turn);
+    if !verified_phase1_ids.is_empty() {
+        response_text.push_str("\n\n");
+        response_text.push_str(VERIFIED_PHASE1_EVIDENCE_MARKER);
+        response_text.push('\n');
+        response_text.push_str(&serde_json::to_string_pretty(&verified_phase1_ids)?);
+    }
+    let verified_web_results = verified_web_search_results(turn);
+    if !verified_web_results.is_empty() {
+        response_text.push_str("\n\n");
+        response_text.push_str(tools::web_run::VERIFIED_RESULTS_MARKER);
+        response_text.push('\n');
+        response_text.push_str(&serde_json::to_string_pretty(&verified_web_results)?);
+    }
     Ok(json!({
         "phase": turn.phase,
         "role": turn.role,
         "response_text": response_text,
         "retrieval_audit": agent_loop::retrieval_audit(turn),
     }))
+}
+
+fn verified_phase1_evidence_ids(turn: &Turn) -> Vec<String> {
+    let mut ids = BTreeSet::new();
+    for item in turn.emitted_items.iter().filter(|item| {
+        item.item_type == agent_loop::TurnItemType::ToolResult
+            && matches!(
+                item.tool_name.as_str(),
+                tools::read_technical_snapshot::NAME | tools::read_jin10_candidates::NAME
+            )
+    }) {
+        let Some(output) = item.content_json.pointer("/result/output") else {
+            continue;
+        };
+        collect_verified_phase1_ids(output, &mut ids);
+    }
+    ids.into_iter().collect()
+}
+
+fn collect_verified_phase1_ids(value: &Value, ids: &mut BTreeSet<String>) {
+    match value {
+        Value::Object(values) => {
+            for (key, value) in values {
+                if matches!(key.as_str(), "signal_id" | "evidence_id") {
+                    if let Some(id) = value
+                        .as_str()
+                        .filter(|id| id.starts_with("technical-") || id.starts_with("jin10-"))
+                    {
+                        ids.insert(id.to_owned());
+                    }
+                }
+                collect_verified_phase1_ids(value, ids);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                collect_verified_phase1_ids(value, ids);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn verified_web_search_results(turn: &Turn) -> Vec<Value> {
+    let mut by_id = BTreeMap::new();
+    for output in turn
+        .emitted_items
+        .iter()
+        .filter(|item| item.item_type == agent_loop::TurnItemType::ToolResult)
+        .filter_map(|item| item.content_json.pointer("/result/output"))
+    {
+        for pointer in ["/search/results", "/results"] {
+            for result in output
+                .pointer(pointer)
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let Some(evidence_id) = result
+                    .get("subject_id")
+                    .or_else(|| result.get("ref_id"))
+                    .and_then(Value::as_str)
+                    .filter(|id| id.starts_with("web-"))
+                else {
+                    continue;
+                };
+                let Some(url) = result
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .filter(|url| url.starts_with("https://") || url.starts_with("http://"))
+                else {
+                    continue;
+                };
+                by_id.entry(evidence_id.to_owned()).or_insert_with(|| {
+                    json!({
+                        "evidence_id": evidence_id,
+                        "source_url": url,
+                        "title": result.get("title").cloned().unwrap_or(Value::Null),
+                        "published_at": result
+                            .get("published_at")
+                            .or_else(|| result.get("published"))
+                            .cloned()
+                            .unwrap_or(Value::Null),
+                    })
+                });
+            }
+        }
+    }
+    by_id.into_values().collect()
 }
 
 fn select_fork_history(target_history: Vec<Value>, fork_history: Vec<Value>) -> Vec<Value> {
@@ -578,6 +685,7 @@ pub fn append_debug_llm_record(settings: &AgentSettings, record: Value) -> Resul
 
     let mut record = record;
     if let Some(object) = record.as_object_mut() {
+        let session_id = settings.session_runtime.manifest().session_id.clone();
         object.entry("role").or_insert_with(|| json!(settings.role));
         object
             .entry("phase")
@@ -588,6 +696,24 @@ pub fn append_debug_llm_record(settings: &AgentSettings, record: Value) -> Resul
         object
             .entry("round")
             .or_insert_with(|| json!(settings.debug_round));
+        object
+            .entry("session_id")
+            .or_insert_with(|| json!(session_id));
+        object
+            .entry("profile")
+            .or_insert_with(|| json!(settings.tool_managed_profile.as_str()));
+        object.entry("unit_key").or_insert_with(|| {
+            json!(format!(
+                "p{}:{}:{}:{}:{}",
+                settings.phase.unwrap_or_default(),
+                settings.tool_managed_profile.as_str(),
+                settings.role,
+                settings.topic_id.as_deref().unwrap_or("aggregate"),
+                settings
+                    .debug_round
+                    .map_or_else(|| "none".to_owned(), |round| round.to_string())
+            ))
+        });
     }
     if uses_aggregated_phase2_debug_records(&output_path) {
         return append_debug_output_history(
@@ -2608,6 +2734,22 @@ mod tests {
             },
             &TruncationConfig::default(),
         ));
+        turn.emitted_items.push(agent_loop::TurnItem::tool_result(
+            &agent_loop::ToolResultItem {
+                call_id: "verify-1".to_owned(),
+                name: "verify_event".to_owned(),
+                status: "completed".to_owned(),
+                output: json!({
+                    "search": {"results": [{
+                        "subject_id": "web-123456",
+                        "url": "https://example.com/fact",
+                        "title": "Official fact"
+                    }]}
+                }),
+                error: None,
+            },
+            &TruncationConfig::default(),
+        ));
         let mut final_message = agent_loop::TurnItem::assistant("议题报告", Value::Null);
         final_message.phase = Some(agent_loop::AgentItemPhase::Final);
         turn.emitted_items.push(final_message);
@@ -2617,7 +2759,51 @@ mod tests {
         assert!(response.contains("议题报告"));
         assert!(response.contains("Rust-verified Web evidence packets"));
         assert!(response.contains("web-123456"));
+        assert!(response.contains("Rust-verified Web search results"));
+        assert!(response.contains("https://example.com/fact"));
         assert!(artifact.get("retrieval_audit").is_some());
+    }
+
+    #[test]
+    fn read_only_completion_attaches_exact_phase1_tool_evidence_ids() {
+        let mut turn = agent_loop::Turn::new("turn-1", "session-1", "run-1", "analyst.news", "");
+        for (name, output) in [
+            (
+                tools::read_technical_snapshot::NAME,
+                json!({"snapshots": [{"intervals": [{"signals": [{
+                    "signal_id": "technical-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                }]}]}]}),
+            ),
+            (
+                tools::read_jin10_candidates::NAME,
+                json!({"candidates": [{
+                    "evidence_id": "jin10-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                }]}),
+            ),
+        ] {
+            turn.emitted_items.push(agent_loop::TurnItem::tool_result(
+                &agent_loop::ToolResultItem {
+                    call_id: format!("{name}-1"),
+                    name: name.to_owned(),
+                    status: "completed".to_owned(),
+                    output,
+                    error: None,
+                },
+                &TruncationConfig::default(),
+            ));
+        }
+        let mut final_message = agent_loop::TurnItem::assistant("分析报告", Value::Null);
+        final_message.phase = Some(agent_loop::AgentItemPhase::Final);
+        turn.emitted_items.push(final_message);
+
+        let artifact = super::completed_turn_artifact(&turn).unwrap();
+        let response = artifact["response_text"].as_str().unwrap();
+        assert!(response.contains(super::VERIFIED_PHASE1_EVIDENCE_MARKER));
+        assert!(response.contains(
+            "technical-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ));
+        assert!(response
+            .contains("jin10-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
     }
 
     #[test]

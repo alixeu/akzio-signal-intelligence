@@ -628,9 +628,25 @@ fn merged_allowed_domains(global: &[String], query: &[String]) -> Vec<String> {
 }
 
 fn assign_ref_ids(results: &mut [SearchResult]) {
-    for (index, result) in results.iter_mut().enumerate() {
-        result.ref_id = format!("search{index}");
+    for result in results {
+        result.ref_id = stable_search_ref_id(result);
     }
+}
+
+pub(crate) fn stable_search_ref_id(result: &SearchResult) -> String {
+    let identity = format!(
+        "{}\0{}\0{}\0{}",
+        result.url.trim(),
+        result.published_at.as_deref().unwrap_or_default(),
+        result.title.trim(),
+        result.snippet.trim()
+    );
+    format!(
+        "web-{}",
+        orchestrator_store::content_hash_bytes(identity.as_bytes())
+            .strip_prefix("sha256:")
+            .unwrap_or_default()
+    )
 }
 
 fn lowercase_terms(query: &str) -> Vec<String> {
@@ -861,6 +877,23 @@ mod tests {
         assert_eq!(results[0].title, "Alpha liquidity");
         assert_eq!(results[0].url, "https://example.com/a");
         assert_eq!(results[0].snippet, "Liquidity");
+        assert!(results[0].ref_id.starts_with("web-"));
+        assert_eq!(results[0].ref_id.len(), 68);
+    }
+
+    #[test]
+    fn evidence_reference_is_content_stable_instead_of_result_local() {
+        let result = SearchResult {
+            ref_id: String::new(),
+            title: "Official release".to_owned(),
+            url: "https://example.com/release".to_owned(),
+            snippet: "The exact claim".to_owned(),
+            published_at: Some("2026-08-03T00:00:00Z".to_owned()),
+            source: Some("example.com".to_owned()),
+        };
+
+        assert_eq!(stable_search_ref_id(&result), stable_search_ref_id(&result));
+        assert_ne!(stable_search_ref_id(&result), "search0");
     }
 
     #[tokio::test]

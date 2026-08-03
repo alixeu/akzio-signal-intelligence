@@ -764,9 +764,17 @@ fn normalize_web_evidence_items(
         ) {
             bail!("Web evidence source_tier is invalid");
         }
+        let evidence_hash = orchestrator_store::content_hash(&json!({
+            "claim": claim,
+            "relation": relation,
+            "source_url": source_url,
+            "published_at": object.get("published_at").cloned().unwrap_or(Value::Null),
+        }))?;
         let evidence_id = format!(
             "web-{}",
-            md5_3(format!("{claim}\n{relation}\n{source_url}"))
+            evidence_hash
+                .strip_prefix("sha256:")
+                .unwrap_or(&evidence_hash)
         );
         if !seen_ids.insert(evidence_id.clone()) {
             continue;
@@ -1408,7 +1416,7 @@ fn file_store_experience_retrieval(
     let query = ExperienceSearchQuery {
         phase,
         role: role.to_owned(),
-        ticker: tickers.first().cloned(),
+        ticker: (tickers.len() == 1).then(|| tickers[0].clone()),
         horizon_trading_days: None,
         regime: orchestrator_core::MarketRegime::default(),
         lexical_query: String::new(),
@@ -2379,7 +2387,7 @@ mod tests {
         assert!(evidence.iter().all(|item| {
             item["evidence_id"]
                 .as_str()
-                .is_some_and(|id| id.starts_with("web-") && id.len() == 10)
+                .is_some_and(|id| id.starts_with("web-") && id.len() == 68)
         }));
         assert!(evidence
             .iter()

@@ -201,13 +201,18 @@ pub(crate) fn write_compiled_phase_index(
     if let Ok(index) = finalize_index(&store, &scope) {
         return Ok(index);
     }
-    let source_refs = candidate
+    let mut source_refs = candidate
         .details
         .iter()
         .flat_map(|detail| detail.source_refs.iter().cloned())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
+        .filter(|reference| is_stable_source_ref(reference))
+        .collect::<BTreeSet<_>>();
+    collect_source_refs_from_value(
+        &Value::Object(scope.authoritative_fields.clone()),
+        &mut source_refs,
+    );
+    collect_source_refs_from_text(response_text, &mut source_refs);
+    let source_refs = source_refs.into_iter().collect();
     append_index_detail(
         &store,
         AppendIndexDetailInput {
@@ -232,6 +237,55 @@ pub(crate) fn write_compiled_phase_index(
         )?;
     }
     finalize_index(&store, &scope).map_err(Into::into)
+}
+
+fn collect_source_refs_from_value(value: &Value, refs: &mut BTreeSet<String>) {
+    match value {
+        Value::String(value) => collect_source_refs_from_text(value, refs),
+        Value::Array(values) => {
+            for value in values {
+                collect_source_refs_from_value(value, refs);
+            }
+        }
+        Value::Object(values) => {
+            for value in values.values() {
+                collect_source_refs_from_value(value, refs);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_source_refs_from_text(text: &str, refs: &mut BTreeSet<String>) {
+    for token in text.split(|character: char| {
+        character.is_whitespace()
+            || matches!(
+                character,
+                '"' | '\'' | '`' | ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>'
+            )
+    }) {
+        let token = token
+            .trim_matches(|character: char| {
+                matches!(character, '.' | ':' | '!' | '?' | '。' | '，')
+            })
+            .strip_prefix("web.run:")
+            .unwrap_or(token);
+        if is_stable_source_ref(token) {
+            refs.insert(token.to_owned());
+        }
+    }
+}
+
+fn is_stable_source_ref(reference: &str) -> bool {
+    !reference.contains("...")
+        && reference.len() >= 10
+        && (reference.starts_with("idx-")
+            || reference.starts_with("web-")
+            || reference.starts_with("technical-")
+            || reference.starts_with("jin10-"))
+        && reference
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
 }
 
 fn detail_section_for_phase(phase: u8) -> DetailSection {
@@ -399,5 +453,19 @@ mod tests {
         assert_eq!(applies_to_phases(3), vec![4, 5, 6]);
         assert_eq!(applies_to_phases(4), vec![5, 6]);
         assert_eq!(applies_to_phases(5), vec![6]);
+    }
+
+    #[test]
+    fn source_lineage_keeps_only_complete_stable_ids() {
+        let mut refs = BTreeSet::new();
+        collect_source_refs_from_text(
+            "read idx-12345678 and web.run:web-abcdef1234, not idx-12... or sha256:deadbeef",
+            &mut refs,
+        );
+
+        assert_eq!(
+            refs,
+            BTreeSet::from(["idx-12345678".to_owned(), "web-abcdef1234".to_owned()])
+        );
     }
 }

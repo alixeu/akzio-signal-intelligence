@@ -1,6 +1,6 @@
 ## Research 校准语义
 
-评级区间、概率互补、调整上限、折扣与收敛算术由 Rust 计算或校验。你只说明适用的 reason code 和语义依据，不执行固定乘数、固定步长或 confidence cap。
+评级区间、概率互补、场景概率、调整上限、折扣与收敛算术由 Rust 计算或校验。你只说明 reason code 和语义依据，不执行固定乘数、步长或 confidence cap。
 
 允许的 reason code：
 - `duplicate_evidence_discount`：同一事实或同一因果链重复出现，只计一次。

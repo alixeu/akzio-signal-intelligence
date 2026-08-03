@@ -27,7 +27,7 @@ pub fn definition(name: &str) -> Option<ToolDefinition> {
         ROUTE_DEBATE_TURN => (
             "Route a concrete debate instruction to Bull and/or Bear, then end this Controller turn.",
             json!({"type":"object","additionalProperties":false,"required":["targets","reply_to_node_id","message","report"],"properties":{
-                "targets":{"type":"array","items":{"type":"string","enum":["bull","bear"]}},
+                "targets":{"type":"array","minItems":2,"maxItems":2,"uniqueItems":true,"items":{"type":"string","enum":["bull","bear"]}},
                 "reply_to_node_id":{"type":"string"}, "message":{"type":"string"}, "report":{"type":"string"}
             }}),
         ),
@@ -66,12 +66,14 @@ pub fn execute(name: &str, args: Value) -> Result<Value> {
         ROUTE_DEBATE_TURN => {
             required_string(object, "reply_to_node_id", 128)?;
             required_string(object, "message", 1_200)?;
-            if object
+            let targets = object
                 .get("targets")
                 .and_then(Value::as_array)
-                .is_none_or(Vec::is_empty)
-            {
-                bail!("route_debate_turn requires at least one target");
+                .context("route_debate_turn requires targets")?;
+            let has_bull = targets.iter().any(|target| target.as_str() == Some("bull"));
+            let has_bear = targets.iter().any(|target| target.as_str() == Some("bear"));
+            if targets.len() != 2 || !has_bull || !has_bear {
+                bail!("route_debate_turn requires exactly one bull and one bear target");
             }
         }
         WAIT_FOR_DEBATE_TURN => {

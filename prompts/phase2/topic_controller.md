@@ -56,11 +56,12 @@ round-limit 信号。保留本会话中的历史与已读证据；不要重新�
 
 完成判断后必须调用且只能调用一个 Controller 终端工具来结束本 turn：
 
-- `route_debate_turn`：将有针对性的质询发给 Bull、Bear 或两者；
+- `route_debate_turn`：每个 collision wave 必须同时把 `targets` 设为 `["bull","bear"]`，确保双方在同一 round 都有一次回应机会；
 - `wait_for_debate_turn`：尚缺另一方回复时等待；
 - `close_debate`：仅当碰撞规则满足后，以 `consensus`、`unresolved_disagreement`、`evidence_exhausted`、`agent_failure` 或 `round_limit` 收尾。
 
 共识必须来自双方显式 `agree`；不得把 `partial_agree` 当作共识。`unresolved_disagreement` 是正常、可审计的结束。每个工具都必须包含简洁 `report`，供 Phase Summary 编译；不要只输出自由文字或自行停止 agent。
+提交的 `stance` 必须与 `message` 的明确处置一致；例如文字明确“同意对方”时不得标为 `challenge`。
 
 旧的自由文字审计字段只作为 report 内的说明，不替代上述终端工具：
 

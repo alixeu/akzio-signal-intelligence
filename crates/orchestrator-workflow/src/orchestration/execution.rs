@@ -12,6 +12,7 @@ use std::{cmp::Ordering, collections::BTreeMap, time::Duration};
 
 const PAPER_BASE_URL: &str = "https://paper-api.alpaca.markets";
 const MIN_ORDER_NOTIONAL_USD: f64 = 1.0;
+const DEBUG_SEEDED_EQUITY_FRACTION: f64 = 0.20;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct PositionSnapshot {
@@ -128,19 +129,37 @@ pub(crate) fn debug_account_snapshot(
     if !starting_cash.is_finite() || starting_cash <= 0.0 {
         bail!("debug starting cash must be finite and greater than zero")
     }
+    let per_asset_weight = if investable_assets.is_empty() {
+        0.0
+    } else {
+        (DEBUG_SEEDED_EQUITY_FRACTION / investable_assets.len() as f64).min(0.10)
+    };
+    let position_value = starting_cash * per_asset_weight;
+    let current_price = 100.0;
+    let positions = investable_assets
+        .iter()
+        .map(|symbol| PositionSnapshot {
+            symbol: symbol.to_ascii_uppercase(),
+            qty: position_value / current_price,
+            market_value: position_value,
+            current_price,
+            weight: per_asset_weight,
+        })
+        .collect::<Vec<_>>();
+    let invested = position_value * positions.len() as f64;
     Ok(AccountSnapshot {
         status: "available".to_owned(),
         source: "debug_simulator".to_owned(),
         simulated: true,
         account_status: "ACTIVE".to_owned(),
-        cash: starting_cash,
+        cash: starting_cash - invested,
         equity: starting_cash,
-        buying_power: starting_cash,
+        buying_power: starting_cash - invested,
         trading_blocked: false,
-        positions: Vec::new(),
+        positions,
         current_weights: investable_assets
             .iter()
-            .map(|symbol| (symbol.to_ascii_uppercase(), 0.0))
+            .map(|symbol| (symbol.to_ascii_uppercase(), per_asset_weight))
             .collect(),
     })
 }
@@ -219,7 +238,12 @@ pub(crate) fn build_order_plan(
         if estimated_notional < MIN_ORDER_NOTIONAL_USD {
             skipped.push(SkippedOrder {
                 symbol: symbol.clone(),
-                reason: "below_minimum_order_notional".to_owned(),
+                reason: if estimated_notional <= f64::EPSILON {
+                    "already_at_target"
+                } else {
+                    "below_minimum_order_notional"
+                }
+                .to_owned(),
                 estimated_notional: round_money(estimated_notional),
             });
             continue;
@@ -678,22 +702,29 @@ mod tests {
     }
 
     #[test]
-    fn debug_snapshot_is_empty_with_ten_thousand_dollars() {
+    fn debug_snapshot_seeds_small_positions_for_buy_and_sell_coverage() {
         let snapshot =
             debug_account_snapshot(&["QQQ".to_owned(), "SOXX".to_owned()], 10_000.0).unwrap();
-        assert_eq!(snapshot.cash, 10_000.0);
+        assert_eq!(snapshot.cash, 8_000.0);
         assert_eq!(snapshot.equity, 10_000.0);
-        assert_eq!(snapshot.buying_power, 10_000.0);
-        assert!(snapshot.positions.is_empty());
-        assert_eq!(snapshot.current_weights["QQQ"], 0.0);
-        assert_eq!(snapshot.current_weights["SOXX"], 0.0);
+        assert_eq!(snapshot.buying_power, 8_000.0);
+        assert_eq!(snapshot.positions.len(), 2);
+        assert_eq!(snapshot.current_weights["QQQ"], 0.1);
+        assert_eq!(snapshot.current_weights["SOXX"], 0.1);
         assert!(snapshot.simulated);
     }
 
     #[test]
     fn zero_position_debug_plan_uses_buy_notional() {
-        let account =
+        let mut account =
             debug_account_snapshot(&["QQQ".to_owned(), "SOXX".to_owned()], 10_000.0).unwrap();
+        account.positions.clear();
+        account
+            .current_weights
+            .values_mut()
+            .for_each(|weight| *weight = 0.0);
+        account.cash = account.equity;
+        account.buying_power = account.equity;
         let allocation = json!({
             "weights": {
                 "QQQ": {"weight": 0.4},
@@ -782,7 +813,45 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(report.status, "simulated_filled");
-        assert_eq!(report.receipts[0].filled_qty, Some(10.0));
+        assert_eq!(report.receipts[0].filled_qty, Some(40.0));
         assert!(report.receipts[0].simulated);
+    }
+
+    #[tokio::test]
+    async fn debug_seeded_position_produces_a_simulated_sell_receipt() {
+        let account = debug_account_snapshot(&["QQQ".to_owned()], 10_000.0).unwrap();
+        let plan = build_order_plan(
+            "run-sell",
+            &json!({"weights": {
+                "QQQ": {"weight": 0.0}, "cash_hedge": {"weight": 1.0}
+            }}),
+            None,
+            &account,
+        )
+        .unwrap();
+        assert_eq!(plan.orders[0].side, "sell");
+
+        let report = submit_order_plan(&plan, &account, None, true)
+            .await
+            .unwrap();
+        assert_eq!(report.status, "simulated_filled");
+        assert_eq!(report.receipts[0].side, "sell");
+        assert!(report.receipts[0].simulated);
+    }
+
+    #[test]
+    fn exact_target_is_not_reported_as_below_minimum_notional() {
+        let account = debug_account_snapshot(&["QQQ".to_owned()], 10_000.0).unwrap();
+        let plan = build_order_plan(
+            "run-target",
+            &json!({"weights": {
+                "QQQ": {"weight": 0.1}, "cash_hedge": {"weight": 0.9}
+            }}),
+            None,
+            &account,
+        )
+        .unwrap();
+
+        assert_eq!(plan.skipped[0].reason, "already_at_target");
     }
 }

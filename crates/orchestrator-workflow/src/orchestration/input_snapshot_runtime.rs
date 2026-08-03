@@ -1,8 +1,8 @@
 //! FileStore binding of Phase 1 market-data inputs.
 //!
-//! Legacy roles keep using their existing readers.  A role that has explicitly
-//! migrated to FileStore receives a run-local hash binding to the stable files
-//! under `data/technical` and `data/jin10`; payloads are not copied per run.
+//! Legacy roles keep using their existing readers. A role that has explicitly
+//! migrated to FileStore receives a run-local immutable copy captured from the
+//! stable files under `data/technical` and `data/jin10`.
 
 use std::{fs, path::PathBuf, time::Duration};
 
@@ -18,8 +18,8 @@ use serde_json::Value;
 use super::{config::RuntimeConfig, lifecycle::run_location_from_state};
 
 /// Bind the full, Rust-planned Phase 1 source set exactly once for a run.
-/// A resumed run reuses the published hash manifest; readers reject a stable
-/// source file if its bytes no longer match that binding.
+/// A resumed run reuses the published hash manifest and run-local payloads;
+/// later changes to the mutable source files cannot affect the run.
 pub(crate) fn capture_phase1_file_store_inputs(
     state: &Value,
     config: &RuntimeConfig,

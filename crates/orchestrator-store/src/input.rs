@@ -1,8 +1,8 @@
-//! Per-run bindings to market-data inputs stored at readable stable paths.
+//! Per-run immutable copies of market-data inputs captured from readable stable paths.
 //!
 //! Technical and Jin10 source files are updated atomically. A run manifest
-//! records the exact hash it started with, and consumers reject a later update
-//! instead of duplicating the payload beneath each run.
+//! records the exact hash it started with and stores the corresponding bytes
+//! below the run. Consumers never reopen the mutable source after capture.
 
 use std::{
     collections::BTreeSet,
@@ -17,7 +17,7 @@ use crate::{
 };
 
 pub const DATA_FILE_METADATA_SCHEMA_VERSION: u32 = 1;
-pub const INPUT_SNAPSHOT_MANIFEST_SCHEMA_VERSION: u32 = 2;
+pub const INPUT_SNAPSHOT_MANIFEST_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -238,7 +238,10 @@ impl ContentHashDocument for DataFileMetadata {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InputSnapshot {
     pub source: InputSource,
+    /// Immutable payload copied beneath this run.
     pub payload_relative_path: String,
+    /// Mutable source path retained only as capture provenance.
+    pub source_payload_relative_path: String,
     pub source_metadata_relative_path: String,
     pub source_metadata_hash: String,
     pub source_payload_hash: String,
@@ -249,12 +252,13 @@ impl InputSnapshot {
     fn from_metadata(
         source: InputSource,
         metadata: &DataFileMetadata,
-        _location: &RunLocation,
+        location: &RunLocation,
     ) -> Result<Self> {
         metadata.validate_for_source(&source)?;
         Ok(Self {
             source: source.clone(),
-            payload_relative_path: path_string(&source.payload_relative_path()?)?,
+            payload_relative_path: path_string(&run_payload_relative_path(location, &source)?)?,
+            source_payload_relative_path: path_string(&source.payload_relative_path()?)?,
             source_metadata_relative_path: path_string(&source.metadata_relative_path()?)?,
             source_metadata_hash: metadata.content_hash.clone(),
             source_payload_hash: metadata.payload_hash.clone(),
@@ -262,13 +266,16 @@ impl InputSnapshot {
         })
     }
 
-    fn validate_for_location(&self, _location: &RunLocation) -> Result<()> {
+    fn validate_for_location(&self, location: &RunLocation) -> Result<()> {
         self.source.validate()?;
-        let expected_payload = self.source.payload_relative_path()?;
+        let expected_payload = run_payload_relative_path(location, &self.source)?;
+        let expected_source_payload = self.source.payload_relative_path()?;
         let expected_metadata = self.source.metadata_relative_path()?;
         validate_relative_path(Path::new(&self.payload_relative_path))?;
+        validate_relative_path(Path::new(&self.source_payload_relative_path))?;
         validate_relative_path(Path::new(&self.source_metadata_relative_path))?;
         if Path::new(&self.payload_relative_path) != expected_payload
+            || Path::new(&self.source_payload_relative_path) != expected_source_payload
             || Path::new(&self.source_metadata_relative_path) != expected_metadata
         {
             return Err(invalid(
@@ -428,7 +435,7 @@ pub fn read_input_payload(store: &FileStore, source: &InputSource) -> Result<Vec
     Ok(payload)
 }
 
-/// Bind this run to the current source hashes without copying the payloads.
+/// Copy the current source bytes beneath this run and bind the manifest to the copy.
 /// If a manifest already exists it is reused only when the requested source
 /// identities match exactly.
 pub fn capture_run_inputs(
@@ -457,7 +464,9 @@ pub fn capture_run_inputs(
             &metadata.payload_hash,
             metadata.payload_bytes,
         )?;
-        snapshots.push(InputSnapshot::from_metadata(source, &metadata, location)?);
+        let snapshot = InputSnapshot::from_metadata(source, &metadata, location)?;
+        store.write_bytes(Path::new(&snapshot.payload_relative_path), &payload)?;
+        snapshots.push(snapshot);
     }
 
     let manifest = InputSnapshotManifest::new(location, created_at.into(), snapshots)?;
@@ -476,8 +485,7 @@ pub fn read_input_snapshot_manifest(
     Ok(manifest)
 }
 
-/// Read the stable source path and verify that it still matches the hash bound
-/// into this run's manifest.
+/// Read the immutable run-local copy and verify it against the run manifest.
 pub fn read_snapshotted_input(
     store: &FileStore,
     location: &RunLocation,
@@ -504,6 +512,17 @@ pub fn read_snapshotted_input(
         snapshot.payload_bytes,
     )?;
     Ok(payload)
+}
+
+fn run_payload_relative_path(location: &RunLocation, source: &InputSource) -> Result<PathBuf> {
+    let source_path = source.payload_relative_path()?;
+    let suffix = source_path.strip_prefix("data").map_err(|_| {
+        invalid(
+            "input source",
+            "payload path must remain beneath the data directory",
+        )
+    })?;
+    location.child_relative(&Path::new("inputs/payloads").join(suffix))
 }
 
 fn sorted_sources(sources: &[InputSource]) -> Result<Vec<InputSource>> {
@@ -663,7 +682,7 @@ mod tests {
     }
 
     #[test]
-    fn run_binding_rejects_a_source_changed_after_capture() {
+    fn run_snapshot_survives_a_source_change_after_capture() {
         let (_directory, store) = store();
         let source = InputSource::technical("QQQ", "daily").unwrap();
         write_input_payload(&store, source.clone(), b"old", "2026-07-27T00:00:00Z").unwrap();
@@ -675,17 +694,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(manifest.inputs.len(), 1);
-        assert!(!store
-            .exists(
-                &location()
-                    .child_relative(Path::new("inputs/technical"))
-                    .unwrap()
-            )
-            .unwrap());
+        let run_payload = Path::new(&manifest.inputs[0].payload_relative_path);
+        assert!(store.exists(run_payload).unwrap());
+        assert_ne!(run_payload, source.payload_relative_path().unwrap());
 
         write_input_payload(&store, source.clone(), b"new", "2026-07-27T00:02:00Z").unwrap();
         assert_eq!(read_input_payload(&store, &source).unwrap(), b"new");
-        assert!(read_snapshotted_input(&store, &location(), &source).is_err());
+        assert_eq!(
+            read_snapshotted_input(&store, &location(), &source).unwrap(),
+            b"old"
+        );
     }
 
     #[test]
@@ -699,7 +717,7 @@ mod tests {
             "2026-07-27T00:00:00Z",
         )
         .unwrap();
-        capture_run_inputs(
+        let manifest = capture_run_inputs(
             &store,
             &location(),
             std::slice::from_ref(&source),
@@ -712,6 +730,16 @@ mod tests {
             .unwrap();
         assert!(read_input_payload(&store, &source).is_err());
 
+        assert_eq!(
+            read_snapshotted_input(&store, &location(), &source).unwrap(),
+            b"{\"id\":1}\n"
+        );
+        store
+            .write_bytes(
+                Path::new(&manifest.inputs[0].payload_relative_path),
+                b"mutated snapshot",
+            )
+            .unwrap();
         assert!(read_snapshotted_input(&store, &location(), &source).is_err());
     }
 
@@ -749,7 +777,7 @@ mod tests {
         let (_directory, store) = store();
         let relative = InputSnapshotManifest::relative_path(&location()).unwrap();
         let future = set_content_hash(&json!({
-            "schema_version": 3,
+            "schema_version": 4,
             "run_id": "run:QQQ/one",
             "current_date": "2026-07-27",
             "created_at": "now",

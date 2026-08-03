@@ -14,6 +14,8 @@ orchestrator:
     # 与 technical.days 对齐;分析判断窗口(1-5 交易日)由各 analyst prompt 内部定义。
     window_days: 60
     max_debate_rounds: 3
+    # Each Bull/Bear side participates in at most this many topic lanes.
+    max_topics_per_side: 3
 
   retrieval:
     summary_page_limit: 20
@@ -34,8 +36,8 @@ orchestrator:
     api_key: ${ALPACA_API_KEY}
     api_secret: ${ALPACA_API_SECRET}
     order_submission_enabled: true
-    # Debug never contacts Alpaca. It starts with this cash/equity/buying power
-    # and an empty position list, then records deterministic simulated fills.
+    # Debug never contacts Alpaca. It seeds 20% of equity across investable
+    # assets so both buy and sell paths can produce deterministic simulated fills.
     debug_starting_cash: 10000
 
   reflection:

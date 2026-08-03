@@ -76,8 +76,18 @@ pub fn execute(args: Value, config: &ExternalToolConfig) -> Result<Value> {
         .into_iter()
         .take(limit)
         .map(|(priority, row)| {
+            let evidence_hash = orchestrator_store::content_hash(&json!({
+                "event_id": row.id,
+                "event_time": row.time,
+                "content": row.content,
+            }))
+            .expect("Jin10 evidence identity contains only JSON-safe values");
             json!({
                 "event_id": row.id,
+                "evidence_id": format!(
+                    "jin10-{}",
+                    evidence_hash.strip_prefix("sha256:").unwrap_or(&evidence_hash)
+                ),
                 "event_time": row.time,
                 "content": row.content,
                 "runtime_priority": priority
@@ -163,7 +173,7 @@ mod tests {
     }
 
     #[test]
-    fn file_store_reader_rejects_jin10_changed_after_run_binding() {
+    fn file_store_reader_reuses_jin10_run_copy_after_source_changes() {
         let temp = tempfile::tempdir().unwrap();
         let store = FileStore::open(temp.path(), Default::default()).unwrap();
         let source = InputSource::jin10("2026-07-27", Jin10Format::Csv).unwrap();
@@ -190,7 +200,7 @@ mod tests {
         )
         .unwrap();
 
-        let error = execute(
+        let result = execute(
             json!({"tickers": ["QQQ"]}),
             &ExternalToolConfig {
                 file_store_input: Some(super::super::FileStoreInputSnapshot {
@@ -202,7 +212,7 @@ mod tests {
                 ..Default::default()
             },
         )
-        .unwrap_err();
-        assert!(error.to_string().contains("authoritative metadata"));
+        .unwrap();
+        assert_eq!(result["candidates"][0]["event_id"], "event-old");
     }
 }

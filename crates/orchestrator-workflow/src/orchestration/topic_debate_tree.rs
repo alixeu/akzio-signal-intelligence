@@ -264,7 +264,8 @@ impl TopicDebateTree {
         ) {
             bail!("unsupported debate stance {stance:?}");
         }
-        required_string(object, "message", 1_200)?;
+        let message = required_string(object, "message", 1_200)?;
+        validate_stance_message_consistency(&stance, &message)?;
         if let Some(reply_reference) = object.get("reply_to_node_id").and_then(Value::as_str) {
             let reply_to_node_id =
                 self.resolve_participant_reply_node_id(actor, reply_reference)?;
@@ -318,6 +319,9 @@ impl TopicDebateTree {
             self.initial_submission_node(DebateActor::Bear)
                 .map(|node| node.node_id.clone()),
         );
+        if targets.len() != DebateActor::PARTICIPANTS.len() {
+            bail!("controller route must target both Bull and Bear in the same collision wave");
+        }
         for target in targets {
             let target_reply_to_node_id = match (&initial_nodes.0, &initial_nodes.1) {
                 (Some(bull_initial), Some(bear_initial)) => match target {
@@ -395,6 +399,7 @@ impl TopicDebateTree {
         if reason == "consensus" && !self.has_full_agreement() {
             bail!("consensus close requires an explicit agreement from both Bull and Bear");
         }
+        let controller_message = object.get("message").cloned().unwrap_or(Value::Null);
         let node = self.append_node(
             Some(DebateActor::Controller),
             Vec::new(),
@@ -402,12 +407,27 @@ impl TopicDebateTree {
             payload.clone(),
         );
         self.status = DebateStatus::Closed;
+        let claim_ledger = self.structured_claim_ledger();
+        let consensus_claim_ids = if reason == "consensus" {
+            self.latest_claim_ids()
+        } else {
+            Vec::new()
+        };
+        let unresolved_claim_ids = if reason == "consensus" {
+            Vec::new()
+        } else {
+            self.latest_claim_ids()
+        };
         self.closure = Some(json!({
             "reason": reason,
-            "message": object.get("message").cloned().unwrap_or(Value::Null),
+            "message": format!("Rust recorded {reason} at completed collision round {}.", self.round),
+            "controller_message": controller_message,
             "node_id": node.node_id,
             "round": self.round,
             "controller_decided": true,
+            "claim_ledger": claim_ledger,
+            "consensus_claim_ids": consensus_claim_ids,
+            "unresolved_claim_ids": unresolved_claim_ids,
         }));
         for participant in self.participants.values_mut() {
             participant.status = ParticipantStatus::Closed;
@@ -524,6 +544,7 @@ impl TopicDebateTree {
             "closure": self.closure,
             "turn_count": self.nodes.len(),
             "concessions": concessions,
+            "claim_ledger": self.structured_claim_ledger(),
             "nodes": self.nodes,
             "delivery_receipts": self.deliveries,
         })
@@ -755,12 +776,86 @@ impl TopicDebateTree {
 
     fn has_full_agreement(&self) -> bool {
         DebateActor::PARTICIPANTS.into_iter().all(|actor| {
-            self.nodes.iter().any(|node| {
-                node.kind == StreeNodeKind::Agreement
-                    && node.from == Some(actor)
-                    && node.payload.get("stance").and_then(Value::as_str) == Some("agree")
-            })
+            let opponent = if actor == DebateActor::Bull {
+                DebateActor::Bear
+            } else {
+                DebateActor::Bull
+            };
+            let Some(opponent_initial) = self.initial_submission_node(opponent) else {
+                return false;
+            };
+            self.nodes
+                .iter()
+                .rev()
+                .find(|node| {
+                    matches!(
+                        node.kind,
+                        StreeNodeKind::Submission | StreeNodeKind::Agreement
+                    ) && node.from == Some(actor)
+                })
+                .is_some_and(|node| {
+                    node.kind == StreeNodeKind::Agreement
+                        && node.payload.get("stance").and_then(Value::as_str) == Some("agree")
+                        && node
+                            .payload
+                            .get("reply_to_node_id")
+                            .and_then(Value::as_str)
+                            .is_some_and(|reply| {
+                                self.reply_reaches_node(reply, &opponent_initial.node_id)
+                            })
+                })
         })
+    }
+
+    fn latest_claim_ids(&self) -> Vec<String> {
+        DebateActor::PARTICIPANTS
+            .into_iter()
+            .filter_map(|actor| {
+                self.nodes
+                    .iter()
+                    .rev()
+                    .find(|node| {
+                        matches!(
+                            node.kind,
+                            StreeNodeKind::Submission | StreeNodeKind::Agreement
+                        ) && node.from == Some(actor)
+                    })
+                    .map(|node| node.node_id.clone())
+            })
+            .collect()
+    }
+
+    fn structured_claim_ledger(&self) -> Vec<Value> {
+        self.nodes
+            .iter()
+            .filter(|node| {
+                matches!(node.kind, StreeNodeKind::Submission | StreeNodeKind::Agreement)
+            })
+            .map(|node| {
+                let stance = node
+                    .payload
+                    .get("stance")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let status = match stance {
+                    "agree" => "agreed",
+                    "partial_agree" => "partially_agreed",
+                    "retract" => "retracted",
+                    "needs_evidence" => "unverifiable",
+                    "no_new_info" => "duplicate",
+                    _ => "contested",
+                };
+                json!({
+                    "claim_id": node.node_id,
+                    "from": node.from,
+                    "round": node.round,
+                    "stance": stance,
+                    "status": status,
+                    "reply_to_claim_id": node.payload.get("reply_to_node_id").cloned().unwrap_or(Value::Null),
+                    "evidence_refs": node.payload.get("evidence_refs").cloned().unwrap_or_else(|| json!([])),
+                })
+            })
+            .collect()
     }
 
     fn close_after_controller_failure(&mut self, failure: &StreeNode) {
@@ -794,6 +889,29 @@ fn required_string(
         bail!("stree payload field {field} exceeds {max_chars} characters");
     }
     Ok(value)
+}
+
+fn validate_stance_message_consistency(stance: &str, message: &str) -> Result<()> {
+    let normalized = message.to_lowercase();
+    let explicit_agreement = ["我同意", "同意对方", "认可对方", "i agree", "we agree"]
+        .iter()
+        .any(|marker| normalized.contains(marker));
+    let explicit_rejection = [
+        "我不同意",
+        "反对对方",
+        "拒绝该",
+        "i disagree",
+        "we disagree",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker));
+    if stance == "challenge" && explicit_agreement {
+        bail!("challenge stance contradicts an explicit agreement in message")
+    }
+    if stance == "agree" && explicit_rejection {
+        bail!("agree stance contradicts an explicit rejection in message")
+    }
+    Ok(())
 }
 
 fn parse_targets(value: Option<&Value>) -> Result<Vec<DebateActor>> {
@@ -865,6 +983,37 @@ mod tests {
             .injected_user_message(&delivery)
             .unwrap()
             .starts_with("stree: "));
+    }
+
+    #[test]
+    fn stance_cannot_contradict_an_explicit_message_disposition() {
+        let mut tree = tree();
+        assert_eq!(tree.next_dispatch().unwrap().actor, DebateActor::Bull);
+        let mut payload = submission("challenge", None);
+        payload["message"] = json!("我同意对方的核心结论");
+
+        assert!(tree.submit(DebateActor::Bull, payload).is_err());
+    }
+
+    #[test]
+    fn controller_routes_only_complete_collision_waves() {
+        let mut tree = tree();
+        tree.next_dispatch();
+        tree.submit(DebateActor::Bull, submission("challenge", None))
+            .unwrap();
+        tree.next_dispatch();
+        let bear = tree
+            .submit(DebateActor::Bear, submission("challenge", None))
+            .unwrap();
+        assert_eq!(tree.next_dispatch().unwrap().actor, DebateActor::Controller);
+
+        assert!(tree
+            .controller_route(json!({
+                "targets": ["bear"],
+                "reply_to_node_id": bear.node_id,
+                "message": "one-sided extra round"
+            }))
+            .is_err());
     }
 
     #[test]
@@ -1022,16 +1171,17 @@ mod tests {
             .unwrap();
 
         assert_eq!(tree.next_dispatch().unwrap().actor, DebateActor::Controller);
-        let bull_route = tree
+        let routes = tree
             .controller_route(json!({
-                "targets": ["bull"],
+                "targets": ["bull", "bear"],
                 "reply_to_node_id": "topic-a:bear:4",
-                "message": "Bull must answer Bear's claim"
+                "message": "Both sides must answer the opposing claim"
             }))
-            .unwrap()
-            .pop()
             .unwrap();
+        let bull_route = &routes[0];
+        let bear_route = &routes[1];
         assert_eq!(bull_route.payload["reply_to_node_id"], bear.node_id);
+        assert_eq!(bear_route.payload["reply_to_node_id"], bull.node_id);
 
         assert_eq!(tree.next_dispatch().unwrap().actor, DebateActor::Bull);
         let bull_reply = tree
@@ -1042,18 +1192,6 @@ mod tests {
             .unwrap();
         assert_eq!(bull_reply.payload["reply_to_node_id"], bear.node_id);
         assert_eq!(bull_reply.payload["reply_to_reference"], "bear:4");
-
-        assert_eq!(tree.next_dispatch().unwrap().actor, DebateActor::Controller);
-        let bear_route = tree
-            .controller_route(json!({
-                "targets": ["bear"],
-                "reply_to_node_id": "bull:3",
-                "message": "Bear must answer Bull's claim"
-            }))
-            .unwrap()
-            .pop()
-            .unwrap();
-        assert_eq!(bear_route.payload["reply_to_node_id"], bull.node_id);
 
         assert_eq!(tree.next_dispatch().unwrap().actor, DebateActor::Bear);
         let bear_reply = tree

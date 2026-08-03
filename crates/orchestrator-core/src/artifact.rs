@@ -220,6 +220,9 @@ pub struct EvidenceItem {
     pub evidence_age: String,
     /// 0.0-1.0 confidence in the quality of the source.
     pub source_confidence: f64,
+    /// Complete stable IDs returned by the runtime evidence tools.
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
 }
 
 pub fn validate_evidence_types(
@@ -250,9 +253,9 @@ pub fn validate_evidence_types(
                 artifact.crowded_consensus_risk.as_str(),
             ),
         ] {
-            if !value.is_empty() && !["low", "medium", "high"].contains(&value) {
+            if !value.is_empty() && !["low", "medium", "high", "unknown"].contains(&value) {
                 return Err(format!(
-                    "invalid {field} '{value}'; must be low, medium, high, or empty"
+                    "invalid {field} '{value}'; must be low, medium, high, unknown, or empty"
                 ));
             }
         }
@@ -661,6 +664,7 @@ mod tests {
                 is_derivative_repost: false,
                 evidence_age: "0-2d".to_string(),
                 source_confidence: 0.9,
+                evidence_refs: vec![format!("technical-{}", "a".repeat(64))],
             }],
             priced_in: "unclear".to_string(),
             echo_chamber_risk: "low".to_string(),
@@ -830,6 +834,7 @@ mod tests {
                 is_derivative_repost: false,
                 evidence_age: String::new(),
                 source_confidence: 0.0,
+                evidence_refs: Vec::new(),
             }],
             priced_in: String::new(),
             echo_chamber_risk: String::new(),
@@ -857,6 +862,7 @@ mod tests {
                 is_derivative_repost: false,
                 evidence_age: String::new(),
                 source_confidence: 0.0,
+                evidence_refs: Vec::new(),
             }],
             priced_in: String::new(),
             echo_chamber_risk: "extreme".to_string(),

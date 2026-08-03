@@ -824,16 +824,6 @@ fn retrieval_completion_violation(turn: &Turn, policy: &RetrievalPolicy) -> Opti
         .get("visible_summary_count")
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    let details_before_list = audit
-        .get("detail_requested_before_visible_index")
-        .and_then(Value::as_array)
-        .map_or(0, Vec::len);
-    if details_before_list > 0 {
-        return Some(
-            "final response rejected because read_index_details was called before its Index was visible"
-                .to_string(),
-        );
-    }
     if visible_summary_count == 0 && policy.allow_empty_when_no_visible_summary {
         return None;
     }
@@ -842,6 +832,16 @@ fn retrieval_completion_violation(turn: &Turn, policy: &RetrievalPolicy) -> Opti
         .get("successful_expanded_summary_ids")
         .and_then(Value::as_array)
         .map_or(0, Vec::len);
+    let details_before_list = audit
+        .get("detail_requested_before_visible_index")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    if details_before_list > 0 && expanded_ids == 0 {
+        return Some(
+            "final response rejected because no visible Index Detail was successfully read after an invalid read_index_details request"
+                .to_string(),
+        );
+    }
     if expanded_ids < policy.minimum_detail_expansions {
         return Some(format!(
             "final response requires at least {} distinct read_index_details expansions",
@@ -2466,7 +2466,7 @@ mod retrieval_policy_tests {
     use serde_json::json;
 
     use super::{
-        contains_unexecuted_tool_markup, retrieval_completion_violation,
+        contains_unexecuted_tool_markup, retrieval_audit, retrieval_completion_violation,
         retrieval_policy_violation, RetrievalPolicy, ToolCallRequest, ToolResultItem,
         TruncationConfig, Turn, TurnItem,
     };
@@ -2796,6 +2796,54 @@ mod retrieval_policy_tests {
         assert!(retrieval_completion_violation(&turn, &policy)
             .unwrap()
             .contains("at least 1"));
+    }
+
+    #[test]
+    fn invalid_detail_id_is_audited_but_a_later_visible_expansion_recovers() {
+        let mut turn = turn();
+        push_completed(
+            &mut turn,
+            ToolCallRequest {
+                call_id: "list-3".to_string(),
+                name: "read_indexes".to_string(),
+                arguments: json!({"source_phase": 3}),
+            },
+            json!({"indexes": [{"index_id": "idx-visible", "source_phase": 3}]}),
+        );
+        push_failed(
+            &mut turn,
+            ToolCallRequest {
+                call_id: "detail-typo".to_string(),
+                name: "read_index_details".to_string(),
+                arguments: json!({"index_id": "idx-visib1e"}),
+            },
+        );
+        push_completed(
+            &mut turn,
+            ToolCallRequest {
+                call_id: "detail-visible".to_string(),
+                name: "read_index_details".to_string(),
+                arguments: json!({"index_id": "idx-visible"}),
+            },
+            json!({
+                "index_id": "idx-visible",
+                "source_phase": 3,
+                "details": [{"detail_id": "detail-3"}]
+            }),
+        );
+        let policy = RetrievalPolicy {
+            mandatory_summary_query: true,
+            required_source_phases: vec![3],
+            required_detail_source_phases: vec![3],
+            minimum_detail_expansions: 1,
+            ..Default::default()
+        };
+
+        assert_eq!(retrieval_completion_violation(&turn, &policy), None);
+        assert_eq!(
+            retrieval_audit(&turn)["detail_requested_before_visible_index"],
+            json!(["idx-visib1e"])
+        );
     }
 
     #[test]

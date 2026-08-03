@@ -125,7 +125,7 @@ fn snapshot_for(ticker: &str, interval: &str, rows: &[TechnicalCsvRow]) -> Value
             row.values
                 .get("Close")
                 .copied()
-                .map(|close| (&row.date, close))
+                .map(|close| (canonical_technical_timestamp(&row.date), close))
         })
         .collect::<Vec<_>>();
     if closes.len() < 2 {
@@ -139,8 +139,9 @@ fn snapshot_for(ticker: &str, interval: &str, rows: &[TechnicalCsvRow]) -> Value
 
     let window = closes.len().min(20);
     let recent = &closes[closes.len() - window..];
-    let (as_of, last_close) = recent[recent.len() - 1];
-    let (_, first_close) = recent[0];
+    let as_of = recent[recent.len() - 1].0.clone();
+    let last_close = recent[recent.len() - 1].1;
+    let first_close = recent[0].1;
     let previous = &recent[..recent.len() - 1];
     let previous_high = previous
         .iter()
@@ -180,19 +181,37 @@ fn snapshot_for(ticker: &str, interval: &str, rows: &[TechnicalCsvRow]) -> Value
     } else {
         0.5
     };
-    let evidence_rows = recent.iter().map(|(date, _)| *date).collect::<Vec<_>>();
-    json!({
+    let evidence_rows = recent
+        .iter()
+        .map(|(date, _)| date.clone())
+        .collect::<Vec<_>>();
+    let structure_signal_id =
+        technical_signal_id(ticker, interval, "structure", &as_of, &evidence_rows);
+    let volatility_evidence_rows = recent
+        .iter()
+        .rev()
+        .take(5)
+        .map(|(date, _)| date.clone())
+        .collect::<Vec<_>>();
+    let volatility_signal_id = technical_signal_id(
+        ticker,
+        interval,
+        "volatility",
+        &as_of,
+        &volatility_evidence_rows,
+    );
+    let mut snapshot = json!({
         "interval": interval,
         "status": "ok",
         "coverage": {
             "bars": rows.len(),
-            "from": closes.first().map(|(date, _)| *date),
+            "from": closes.first().map(|(date, _)| date.clone()),
             "through": as_of,
             "window_bars": window
         },
         "signals": [
             {
-                "signal_id": format!("{ticker}:{interval}:structure:{as_of}"),
+                "signal_id": structure_signal_id,
                 "kind": "structure",
                 "label": structure,
                 "as_of": as_of,
@@ -201,16 +220,73 @@ fn snapshot_for(ticker: &str, interval: &str, rows: &[TechnicalCsvRow]) -> Value
                 "evidence_rows": evidence_rows
             },
             {
-                "signal_id": format!("{ticker}:{interval}:volatility:{as_of}"),
+                "signal_id": volatility_signal_id,
                 "kind": "volatility",
                 "label": volatility_label(volatility),
                 "as_of": as_of,
                 "realized_volatility": volatility,
-                "evidence_rows": recent.iter().rev().take(5).map(|(date, _)| *date).collect::<Vec<_>>()
+                "evidence_rows": volatility_evidence_rows
             }
         ],
         "latest": {"date": as_of, "close": last_close}
-    })
+    });
+    if interval == "daily" {
+        let correlation_window = closes.len().min(61);
+        snapshot["returns_60d"] = Value::Array(
+            closes[closes.len() - correlation_window..]
+                .windows(2)
+                .filter_map(|pair| {
+                    (pair[0].1 > 0.0).then_some(json!({
+                        "session": pair[1].0.get(..10).unwrap_or(pair[1].0.as_str()),
+                        "return": pair[1].1 / pair[0].1 - 1.0,
+                    }))
+                })
+                .collect(),
+        );
+    }
+    snapshot
+}
+
+fn technical_signal_id(
+    ticker: &str,
+    interval: &str,
+    kind: &str,
+    as_of: &str,
+    evidence_rows: &[String],
+) -> String {
+    let hash = orchestrator_store::content_hash(&json!({
+        "ticker": ticker,
+        "interval": interval,
+        "kind": kind,
+        "as_of": as_of,
+        "evidence_rows": evidence_rows,
+    }))
+    .expect("technical signal identity contains only JSON-safe values");
+    format!(
+        "technical-{}",
+        hash.strip_prefix("sha256:").unwrap_or(&hash)
+    )
+}
+
+fn canonical_technical_timestamp(raw: &str) -> String {
+    let without_legacy_interval = raw
+        .strip_suffix(":20min")
+        .or_else(|| raw.strip_suffix(":3h"))
+        .unwrap_or(raw);
+    if without_legacy_interval.len() == 19 {
+        let bytes = without_legacy_interval.as_bytes();
+        if bytes.get(10) == Some(&b' ') {
+            return format!(
+                "{}T{}Z",
+                &without_legacy_interval[..10],
+                &without_legacy_interval[11..]
+            );
+        }
+        if bytes.get(10) == Some(&b'T') {
+            return format!("{without_legacy_interval}Z");
+        }
+    }
+    without_legacy_interval.to_owned()
 }
 
 fn standard_deviation(values: &[f64]) -> f64 {
@@ -242,7 +318,19 @@ mod tests {
     use orchestrator_store::{capture_run_inputs, write_input_payload, FileStore, RunLocation};
 
     #[test]
-    fn file_store_reader_rejects_direct_input_changed_after_run_binding() {
+    fn legacy_intraday_suffixes_are_projected_as_rfc3339_utc() {
+        assert_eq!(
+            canonical_technical_timestamp("2026-07-31T20:15:00Z:20min"),
+            "2026-07-31T20:15:00Z"
+        );
+        assert_eq!(
+            canonical_technical_timestamp("2026-07-31 20:15:00:3h"),
+            "2026-07-31T20:15:00Z"
+        );
+    }
+
+    #[test]
+    fn file_store_reader_reuses_run_copy_after_direct_input_changes() {
         let temp = tempfile::tempdir().unwrap();
         let store = FileStore::open(temp.path(), Default::default()).unwrap();
         let source = InputSource::technical("QQQ", "daily").unwrap();
@@ -257,8 +345,7 @@ mod tests {
         )
         .unwrap();
 
-        // Direct data is not copied into the run. If it changes after the run
-        // binds its hash, fail instead of mixing two market-data versions.
+        // Later source refreshes cannot replace the run-local immutable copy.
         write_input_payload(
             &store,
             source,
@@ -266,7 +353,7 @@ mod tests {
             "2026-07-27T00:01:00Z",
         )
         .unwrap();
-        let error = execute(
+        let result = execute(
             json!({"tickers": ["QQQ"], "intervals": ["daily"]}),
             &ExternalToolConfig {
                 file_store_input: Some(super::super::FileStoreInputSnapshot {
@@ -278,7 +365,10 @@ mod tests {
                 ..Default::default()
             },
         )
-        .unwrap_err();
-        assert!(error.to_string().contains("authoritative metadata"));
+        .unwrap();
+        assert_eq!(
+            result["snapshots"][0]["intervals"][0]["latest"]["close"],
+            104.0
+        );
     }
 }

@@ -9,11 +9,12 @@ use tracing::{debug, warn};
 use super::api_tool_name;
 use crate::truncation::TruncationConfig;
 use crate::web_search::{
-    SearchQuery, SearchResult, WebSearchConfig, WebSearchContextSize, WebSearchMode,
-    WebSearchOptions, WebSearchProvider,
+    stable_search_ref_id, SearchQuery, SearchResult, WebSearchConfig, WebSearchContextSize,
+    WebSearchMode, WebSearchOptions, WebSearchProvider,
 };
 
 pub const NAME: &str = ToolId::WebRun.as_str();
+pub const VERIFIED_RESULTS_MARKER: &str = "<!-- Rust-verified Web search results -->";
 const MAX_SEARCH_QUERIES: usize = 4;
 const MAX_QUERY_CHARS: usize = 512;
 
@@ -434,11 +435,11 @@ fn format_results(results: &[SearchResult]) -> String {
                 output.push('\n');
             }
             let ref_id = if result.ref_id.is_empty() {
-                format!("search{index}")
+                stable_search_ref_id(result)
             } else {
                 result.ref_id.clone()
             };
-            output.push_str(&format!("[evidence_ref: web.run:{ref_id}]\n"));
+            output.push_str(&format!("[evidence_ref: {ref_id}]\n"));
             output.push_str(&format!("Title: {}\n", result.title));
             output.push_str(&format!("URL: {}\n", result.url));
             output.push_str(&format!(
@@ -455,11 +456,10 @@ fn results_to_json(results: &[SearchResult]) -> Value {
     Value::Array(
         results
             .iter()
-            .enumerate()
-            .map(|(index, result)| {
+            .map(|result| {
                 json!({
-                    "ref_id": if result.ref_id.is_empty() { format!("search{index}") } else { result.ref_id.clone() },
-                    "subject_id": format!("web.run:{}", if result.ref_id.is_empty() { format!("search{index}") } else { result.ref_id.clone() }),
+                    "ref_id": if result.ref_id.is_empty() { stable_search_ref_id(result) } else { result.ref_id.clone() },
+                    "subject_id": if result.ref_id.is_empty() { stable_search_ref_id(result) } else { result.ref_id.clone() },
                     "title": result.title.clone(),
                     "url": result.url.clone(),
                     "published": result.published_at.clone(),

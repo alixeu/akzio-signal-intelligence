@@ -1097,7 +1097,7 @@ fn sum_positive_ratio(values: &[Option<f64>], i: usize, d: usize, positive: bool
     Some(selected / (total + EPS))
 }
 
-fn resample_bars(bars: Vec<Bar>, interval: &str, chunk: usize) -> Vec<Bar> {
+fn resample_bars(bars: Vec<Bar>, _interval: &str, chunk: usize) -> Vec<Bar> {
     let mut out = Vec::new();
     let mut bars = bars;
     bars.sort_by(|a, b| a.symbol.cmp(&b.symbol).then(a.date.cmp(&b.date)));
@@ -1117,7 +1117,9 @@ fn resample_bars(bars: Vec<Bar>, interval: &str, chunk: usize) -> Vec<Bar> {
             let last = &group[group.len() - 1];
             out.push(Bar {
                 symbol: first.symbol.clone(),
-                date: format!("{}:{interval}", last.date),
+                // The interval is already part of the FileStore source key.
+                // Appending it here made an otherwise RFC3339 timestamp invalid.
+                date: last.date.clone(),
                 open: first.open,
                 high: group
                     .iter()
@@ -1333,13 +1335,18 @@ fn value_at(values: Option<&[Option<f64>]>, index: usize) -> Option<f64> {
 
 fn timestamp_to_date(timestamp: i64) -> String {
     chrono::DateTime::from_timestamp(timestamp, 0)
-        .map(|value| value.naive_utc().to_string())
+        .map(|value| value.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
         .unwrap_or_else(|| timestamp.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn yahoo_timestamp_retains_its_utc_timezone() {
+        assert_eq!(timestamp_to_date(0), "1970-01-01T00:00:00Z");
+    }
 
     #[tokio::test]
     async fn unsupported_interval_is_an_error_not_top_level_success() {
@@ -1460,5 +1467,6 @@ mod tests {
         assert_eq!(sampled[0].open, Some(1.0));
         assert_eq!(sampled[0].close, Some(3.0));
         assert_eq!(sampled[0].volume, Some(306.0));
+        assert_eq!(sampled[0].date, "2026-01-01T03:00:00");
     }
 }
