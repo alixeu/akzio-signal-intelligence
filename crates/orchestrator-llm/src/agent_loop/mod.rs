@@ -1736,6 +1736,26 @@ mod phase2_context_preseed_tests {
     }
 }
 
+#[cfg(test)]
+mod system_prompt_tests {
+    use super::model_system_instruction;
+
+    #[test]
+    fn system_instruction_requires_simplified_chinese_without_mutating_contract_literals() {
+        let instruction = model_system_instruction(
+            &["read_indexes".to_owned()],
+            "researcher.bull",
+            &["QQQ".to_owned()],
+        );
+
+        assert!(instruction.contains("Simplified Chinese"));
+        assert!(instruction.contains("JSON keys"));
+        assert!(instruction.contains("researcher.bull"));
+        assert!(instruction.contains("QQQ"));
+        assert!(instruction.contains("read_indexes"));
+    }
+}
+
 /// Map assistant prose into a non-artifact response. Native function calls arrive on the stream.
 pub fn model_response_from_assistant_text(text: &str) -> ModelResponse {
     ModelResponse {

@@ -39,7 +39,7 @@ pub fn content_hash(value: &Value) -> Result<String> {
 
 /// Return a cloned object with a fresh top-level content hash.
 pub fn set_content_hash(value: &Value) -> Result<Value> {
-    let mut hashed = value.clone();
+    let mut hashed = canonicalized_value(value)?;
     let hash = content_hash(&hashed)?;
     let Some(object) = hashed.as_object_mut() else {
         return Err(StoreError::ContentHashRequiresObject {
@@ -62,7 +62,7 @@ pub fn seal_content_hash<T: ContentHashDocument>(mut document: T) -> Result<T> {
     document.set_content_hash(String::new());
     let value =
         serde_json::to_value(&document).map_err(|source| StoreError::JsonSerialize { source })?;
-    document.set_content_hash(content_hash(&value)?);
+    document.set_content_hash(content_hash(&canonicalized_value(&value)?)?);
     Ok(document)
 }
 
@@ -110,9 +110,19 @@ fn canonicalize(value: &Value) -> Value {
     }
 }
 
+/// Normalize a JSON value through the exact canonical representation emitted
+/// by the FileStore. `serde_json::Value` can preserve an arbitrary-precision
+/// number's original spelling in memory, while a subsequent write may emit a
+/// shorter equivalent spelling. Hashing this round-tripped value keeps the
+/// sealed document and its on-disk representation identical.
+fn canonicalized_value(value: &Value) -> Result<Value> {
+    let bytes = canonical_json_bytes(value)?;
+    serde_json::from_slice(&bytes).map_err(|source| StoreError::JsonSerialize { source })
+}
+
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use serde_json::{json, Value};
 
     use super::{canonical_json_bytes, set_content_hash, validate_content_hash};
 
@@ -134,5 +144,17 @@ mod tests {
         let mut tampered = value;
         tampered["a"] = json!(3);
         assert!(validate_content_hash(&tampered).is_err());
+    }
+
+    #[test]
+    fn content_hash_survives_float_normalization_on_write() {
+        let value = set_content_hash(&json!({
+            "schema_version": 1,
+            "computed": 0.37939999999999996
+        }))
+        .unwrap();
+        let bytes = canonical_json_bytes(&value).unwrap();
+        let persisted: Value = serde_json::from_slice(&bytes).unwrap();
+        validate_content_hash(&persisted).unwrap();
     }
 }

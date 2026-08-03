@@ -9,12 +9,13 @@ use orchestrator_core::{
 };
 use orchestrator_ingest::{jin10, technical};
 use orchestrator_store::{
-    append_index_detail, content_hash, create_index, finalize_index, read_indexes,
-    read_run_manifest, write_run_manifest, AppendIndexDetailInput, CreateIndexInput, DetailSection,
-    EvaluationStore, FileStore, FileStoreOptions, IndexKind, IndexQuery, IndexScope, ManifestError,
-    RunCompactionMode, RunLocation, RunManifest, RunManifestInit, RunStatus, RunStore,
+    append_index_detail, canonical_json_bytes, content_hash, create_index, finalize_index,
+    read_indexes, read_run_manifest, write_run_manifest, AppendIndexDetailInput, CreateIndexInput,
+    DetailSection, EvaluationStore, FileStore, FileStoreOptions, IndexKind, IndexQuery, IndexScope,
+    ManifestError, RunCompactionMode, RunLocation, RunManifest, RunManifestInit, RunStatus,
+    RunStore,
 };
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
@@ -119,7 +120,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         "analysis_universe": tickers,
         "investable_assets": runtime.allocation.investable_assets,
         "store_root": store.root(),
-        "config": config,
+        "config": redacted_config_for_state(&config),
         "mode": args.mode.as_str(),
         "lang": if args.lang == "zh" { config_str(&config, "orchestrator.runtime.lang", "zh") } else { args.lang.clone() },
         "window_days": args.window_days.unwrap_or_else(|| config_int(&config, "orchestrator.runtime.window_days", 150)),
@@ -129,7 +130,19 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         "phase_status": {},
         "degraded": false,
     });
+    let state_was_missing = !store.exists(&location.state_relative())?;
     let mut state = load_or_initialize_state(&store, &location, initial_state)?;
+    let mut state_was_rehydrated = false;
+    if args.debug
+        && manifest.status == RunStatus::Completed
+        && state
+            .get("phase_status")
+            .and_then(Value::as_object)
+            .is_some_and(Map::is_empty)
+    {
+        state_was_rehydrated =
+            rehydrate_completed_debug_state(&store, &location, &manifest, &mut state)?;
+    }
     state["max_debate_rounds"] = json!(args.max_debate_rounds.unwrap_or_else(|| config_int(
         &config,
         "orchestrator.runtime.max_debate_rounds",
@@ -240,7 +253,18 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
         manifest.summary_units.extend(summary_units);
         finish_phase(&store, &location, &mut manifest, &mut state, 2, "done")?;
     }
-    let phase3_retrieval_audit_missing = !args.mock && !has_phase3_retrieval_audit(&state);
+    // Completed Debug runs may intentionally retain only the manifest and
+    // finalized Index archives after an older compaction. The Indexes are the
+    // semantic authority in that state; do not reopen Phase 3 merely because
+    // its transient retrieval metrics were compacted with state.json.
+    let state_is_completed_projection = phase_completed(&manifest, 8)
+        && state.get("final_trade_decision").is_some()
+        && state.get("role_job_metrics").is_none();
+    let state_was_compacted = ((state_was_missing || state_was_rehydrated)
+        && phase_completed(&manifest, 8))
+        || state_is_completed_projection;
+    let phase3_retrieval_audit_missing =
+        !args.mock && !state_was_compacted && !has_phase3_retrieval_audit(&state);
     let phase3_visibility_missing =
         !args.mock && !phase_summary_visible_to_phase(&store, &location, &runtime, 3, 6, 1)?;
     if args.from_phase <= 3
@@ -411,8 +435,7 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
     }
     manifest.completed_at = run_completed.then(|| Utc::now().to_rfc3339());
     write_run_manifest(&store, &location, manifest)?;
-    seal_state(&mut state)?;
-    store.write_json_value(&location.child_relative(Path::new("state.json"))?, &state)?;
+    persist_state(&mut state)?;
     let store_compaction = if run_completed {
         match run_store.compact_completed_run(RunCompactionMode::Apply) {
             Ok(report) => serde_json::to_value(report)?,
@@ -631,6 +654,63 @@ fn load_or_initialize_state(
         }
     }
     Ok(state)
+}
+
+fn rehydrate_completed_debug_state(
+    store: &FileStore,
+    location: &RunLocation,
+    manifest: &RunManifest,
+    state: &mut Value,
+) -> Result<bool> {
+    let final_index = read_indexes(
+        store,
+        Some(location),
+        &IndexQuery {
+            kind: Some(IndexKind::PhaseSummary),
+            source_phase: Some(8),
+            limit: 1,
+            ..Default::default()
+        },
+    )?
+    .indexes
+    .into_iter()
+    .next()
+    .context("completed Debug run is missing its Phase 8 final-decision Index")?;
+
+    for key in [
+        "account_snapshot",
+        "allocation_context",
+        "allocation_result",
+        "execution_report",
+        "final_trade_decision",
+        "order_plan",
+        "portfolio_allocation",
+    ] {
+        if let Some(value) = final_index.authoritative_fields.get(key) {
+            state[key] = value.clone();
+        }
+    }
+    state["phase_status"] = Value::Object(
+        manifest
+            .phase_status
+            .iter()
+            .map(|(phase, status)| {
+                let value = if matches!(
+                    status,
+                    orchestrator_store::PhaseStatus::Completed
+                        | orchestrator_store::PhaseStatus::Degraded
+                ) {
+                    "done"
+                } else {
+                    "failed"
+                };
+                (phase.clone(), Value::String(value.to_owned()))
+            })
+            .collect(),
+    );
+    state["degraded"] = Value::Bool(manifest.degraded);
+    state["errors"] = serde_json::to_value(&manifest.errors)?;
+    Ok(true)
 }
 
 fn finish_phase(
@@ -1935,7 +2015,83 @@ async fn run_phase6(
         .pointer("/payload/per_asset")
         .cloned()
         .context("finalized portfolio artifact is missing per_asset")?;
+    let mut per_asset = per_asset;
+    enrich_final_trade_decision_fields(state, &mut per_asset)?;
     state["final_trade_decision"] = json!({"per_asset": per_asset, "authority": "file_store"});
+    Ok(())
+}
+
+fn enrich_final_trade_decision_fields(state: &Value, per_asset: &mut Value) -> Result<()> {
+    let research_per_ticker = state
+        .pointer("/research_plan/per_ticker")
+        .and_then(Value::as_object)
+        .context("final trade decision enrichment requires research_plan.per_ticker")?;
+    let trader_per_ticker = state
+        .pointer("/trader_investment_plan/per_ticker")
+        .and_then(Value::as_object)
+        .context("final trade decision enrichment requires trader_investment_plan.per_ticker")?;
+    let decisions = per_asset
+        .as_object_mut()
+        .context("finalized portfolio per_asset must be an object")?;
+
+    for (ticker, decision) in decisions {
+        let research = research_per_ticker
+            .get(ticker)
+            .with_context(|| format!("research_plan missing ticker {ticker}"))?;
+        let long_probability = research
+            .get("long_probability")
+            .and_then(Value::as_f64)
+            .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
+            .with_context(|| format!("research_plan long_probability missing for {ticker}"))?;
+        let short_probability = research
+            .get("short_probability")
+            .and_then(Value::as_f64)
+            .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
+            .with_context(|| format!("research_plan short_probability missing for {ticker}"))?;
+        let trader = trader_per_ticker
+            .get(ticker)
+            .with_context(|| format!("trader_investment_plan missing ticker {ticker}"))?;
+        let entry_conditions = trader
+            .get("execution_conditions")
+            .cloned()
+            .unwrap_or_else(|| json!([]));
+        if !entry_conditions.is_array() {
+            bail!("trader execution_conditions must be an array for {ticker}");
+        }
+        let blockers = trader.get("blockers").cloned().unwrap_or_else(|| json!([]));
+        if !blockers.is_array() {
+            bail!("trader blockers must be an array for {ticker}");
+        }
+        let decision = decision
+            .as_object_mut()
+            .with_context(|| format!("final portfolio decision must be an object for {ticker}"))?;
+        decision.insert("long_probability".to_owned(), json!(long_probability));
+        decision.insert("short_probability".to_owned(), json!(short_probability));
+        decision.insert("inherited_probability".to_owned(), json!(long_probability));
+        decision.insert(
+            "direction".to_owned(),
+            trader.get("action").cloned().unwrap_or(Value::Null),
+        );
+        decision.insert("entry_conditions".to_owned(), entry_conditions);
+        decision.insert(
+            "entry_price".to_owned(),
+            trader.get("entry_price").cloned().unwrap_or(Value::Null),
+        );
+        decision.insert(
+            "stop_loss".to_owned(),
+            trader.get("stop_loss").cloned().unwrap_or(Value::Null),
+        );
+        decision.insert(
+            "invalidation_conditions".to_owned(),
+            json!({
+                "downgrade_reason": trader
+                    .get("downgrade_reason")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                "blockers": blockers,
+            }),
+        );
+    }
     Ok(())
 }
 
@@ -3064,17 +3220,87 @@ fn completed_unit_key(
     )
 }
 
-fn checkpoint_state(state: &mut Value) -> Result<()> {
+fn persist_state(state: &mut Value) -> Result<()> {
     let store_root = state
         .get("store_root")
         .and_then(Value::as_str)
-        .context("store_root is required for FileStore state checkpoint")?
+        .context("store_root is required for FileStore state persistence")?
         .to_owned();
     let location = run_location_from_state(state)?;
-    seal_state(state)?;
-    FileStore::open(store_root, FileStoreOptions::default())?
-        .write_json_value(&location.child_relative(Path::new("state.json"))?, state)?;
+    let mut sealed = state.clone();
+    if let Some(config) = sealed.get("config").cloned() {
+        sealed["config"] = redacted_config_for_state(&config);
+    }
+    // `serde_json::Value` can retain an arbitrary-precision number's original
+    // spelling while the canonical FileStore write emits its normalized
+    // spelling (for example, `0.37939999999999996` becomes `0.3794`). Hash
+    // the same representation that will be persisted so checkpoints remain
+    // reloadable even when a phase computes floating-point metadata.
+    let canonical = canonical_json_bytes(&sealed)?;
+    sealed = serde_json::from_slice(&canonical)
+        .context("canonicalized run state could not be decoded")?;
+    seal_state(&mut sealed)?;
+    let store = FileStore::open(store_root, FileStoreOptions::default())?;
+    let relative = location.child_relative(Path::new("state.json"))?;
+    store.write_json_value(&relative, &sealed)?;
+
+    let persisted = store.read_json_value(&relative)?;
+    let stored_hash = persisted
+        .get("content_hash")
+        .and_then(Value::as_str)
+        .context("persisted run state content_hash is required")?;
+    let mut without_hash = persisted.clone();
+    without_hash["content_hash"] = Value::String(String::new());
+    let expected_hash = content_hash(&without_hash)?;
+    if stored_hash != expected_hash {
+        bail!(
+            "persisted run state content_hash mismatch at {}: expected {expected_hash}, found {stored_hash}",
+            store.root().join(relative).display()
+        );
+    }
+    *state = sealed;
     Ok(())
+}
+
+fn checkpoint_state(state: &mut Value) -> Result<()> {
+    persist_state(state)
+}
+
+fn redacted_config_for_state(config: &Value) -> Value {
+    match config {
+        Value::Object(object) => Value::Object(
+            object
+                .iter()
+                .map(|(key, value)| {
+                    let lower = key.to_ascii_lowercase();
+                    let sensitive = matches!(
+                        lower.as_str(),
+                        "api_key"
+                            | "api_secret"
+                            | "client_secret"
+                            | "password"
+                            | "secret"
+                            | "token"
+                    ) || lower.ends_with("_key")
+                        || lower.ends_with("_secret")
+                        || lower.ends_with("_password")
+                        || lower.ends_with("_token");
+                    (
+                        key.clone(),
+                        if sensitive {
+                            Value::String("[redacted]".to_owned())
+                        } else {
+                            redacted_config_for_state(value)
+                        },
+                    )
+                })
+                .collect(),
+        ),
+        Value::Array(values) => {
+            Value::Array(values.iter().map(redacted_config_for_state).collect())
+        }
+        _ => config.clone(),
+    }
 }
 
 fn runtime_session_key(
@@ -3218,16 +3444,122 @@ fn seal_state(state: &mut Value) -> Result<()> {
 #[cfg(test)]
 mod phase2_session_tests {
     use orchestrator_core::{MemoryPolicyV1, PolicyRef};
-    use orchestrator_store::{PhaseStatus, RunLocation, RunManifest, RunManifestInit};
-    use serde_json::json;
+    use orchestrator_store::{
+        content_hash, FileStore, FileStoreOptions, PhaseStatus, RunLocation, RunManifest,
+        RunManifestInit,
+    };
+    use serde_json::{json, Value};
+    use tempfile::tempdir;
 
     use super::{
         attach_verified_web_evidence, controller_should_continue, defers_phase_summary,
-        ensure_initial_collision_route, highest_completed_phase, is_cacheable_unit,
-        normalize_phase2_topic_control_fields, persists_phase_index, phase2_debate_debug_summary,
-        prompt_owner_for_unit, record_phase2_session, runtime_session_key, scoped_state_for_unit,
+        enrich_final_trade_decision_fields, ensure_initial_collision_route,
+        highest_completed_phase, is_cacheable_unit, load_or_initialize_state,
+        normalize_phase2_topic_control_fields, persist_state, persists_phase_index,
+        phase2_debate_debug_summary, prompt_owner_for_unit, record_phase2_session,
+        redacted_config_for_state, runtime_session_key, scoped_state_for_unit,
         select_reflection_task_budget, sync_manifest_health, validate_phase2_compiled_contract,
     };
+
+    #[test]
+    fn persisted_state_is_sealed_and_round_trippable() {
+        let directory = tempdir().unwrap();
+        let mut state = json!({
+            "schema_version": 1,
+            "run_id": "run-a",
+            "current_date": "2026-08-01",
+            "ticker": "QQQ,SOXX,VIX",
+            "tickers": ["QQQ", "SOXX", "VIX"],
+            "analysis_universe": ["QQQ", "SOXX", "VIX"],
+            "store_root": directory.path(),
+            "storage_namespace": "debug",
+            "computed_float": 0.37939999999999996,
+            "phase_status": {}
+        });
+
+        persist_state(&mut state).unwrap();
+        let store = FileStore::open(directory.path(), FileStoreOptions::default()).unwrap();
+        let location = RunLocation::debug("2026-08-01", "run-a").unwrap();
+        let persisted = store.read_json_value(&location.state_relative()).unwrap();
+        let stored_hash = persisted["content_hash"].as_str().unwrap();
+        let mut without_hash = persisted.clone();
+        without_hash["content_hash"] = Value::String(String::new());
+        assert_eq!(stored_hash, content_hash(&without_hash).unwrap());
+
+        state["phase_status"]["0"] = json!("completed");
+        persist_state(&mut state).unwrap();
+        assert!(load_or_initialize_state(
+            &store,
+            &location,
+            json!({
+                "storage_namespace": "debug",
+                "run_id": "run-a",
+                "ticker": "QQQ,SOXX,VIX",
+                "tickers": ["QQQ", "SOXX", "VIX"]
+            })
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn persisted_state_config_redacts_credentials_but_keeps_runtime_shape() {
+        let config = json!({
+            "orchestrator": {
+                "llm": {"api_key": "secret-key", "max_completion_tokens": 8192},
+                "alpaca": {"api_secret": "secret-value"}
+            },
+            "report": {"email": {"password": "smtp-secret"}}
+        });
+        let redacted = redacted_config_for_state(&config);
+        assert_eq!(redacted["orchestrator"]["llm"]["api_key"], "[redacted]");
+        assert_eq!(
+            redacted["orchestrator"]["llm"]["max_completion_tokens"],
+            8192
+        );
+        assert_eq!(
+            redacted["orchestrator"]["alpaca"]["api_secret"],
+            "[redacted]"
+        );
+        assert_eq!(redacted["report"]["email"]["password"], "[redacted]");
+    }
+
+    #[test]
+    fn final_trade_decision_carries_probability_and_execution_conditions() {
+        let state = json!({
+            "research_plan": {"per_ticker": {
+                "QQQ": {"long_probability": 0.46, "short_probability": 0.54}
+            }},
+            "trader_investment_plan": {"per_ticker": {
+                "QQQ": {
+                    "action": "Sell",
+                    "execution_conditions": ["10Y falls"],
+                    "entry_price": null,
+                    "stop_loss": null,
+                    "downgrade_reason": "invalidate on synchronized reversal",
+                    "blockers": ["missing price anchor"]
+                }
+            }}
+        });
+        let mut per_asset = json!({"QQQ": {"rating": "Sell"}});
+
+        enrich_final_trade_decision_fields(&state, &mut per_asset).unwrap();
+
+        assert_eq!(per_asset["QQQ"]["long_probability"], 0.46);
+        assert_eq!(per_asset["QQQ"]["short_probability"], 0.54);
+        assert_eq!(per_asset["QQQ"]["inherited_probability"], 0.46);
+        assert_eq!(per_asset["QQQ"]["direction"], "Sell");
+        assert_eq!(per_asset["QQQ"]["entry_conditions"], json!(["10Y falls"]));
+        assert_eq!(per_asset["QQQ"]["entry_price"], Value::Null);
+        assert_eq!(per_asset["QQQ"]["stop_loss"], Value::Null);
+        assert_eq!(
+            per_asset["QQQ"]["invalidation_conditions"]["downgrade_reason"],
+            "invalidate on synchronized reversal"
+        );
+        assert_eq!(
+            per_asset["QQQ"]["invalidation_conditions"]["blockers"],
+            json!(["missing price anchor"])
+        );
+    }
 
     #[test]
     fn stree_turns_defer_phase_summary_until_the_phase2_reducer() {

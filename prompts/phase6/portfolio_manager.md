@@ -27,8 +27,8 @@ Phase 3 权威结论、Phase 4 执行意图与 Phase 5 三方风险约束。不�
 
 - `direction_constraint`：`increase_only`、`decrease_only` 或 `unchanged`；不能反转 Trader 的候选方向。
 - `execution_status`：`execute`、`wait` 或 `downgrade`。
-- `max_target_weight`：该资产可达到的最大目标权重。
-- `max_weight_delta`：相对运行时账户当前权重的最大绝对变化。
+- `max_target_weight`：该资产可达到的最大目标权重，必须使用 0 到 1 之间的小数（例如 30% 写作 `0.30`），不得写百分数或负数。
+- `max_weight_delta`：相对运行时账户当前权重的最大绝对变化，必须使用 0 到 1 之间的非负小数。偏空或减持语义由 `direction_constraint=decrease_only` 表达，不要把目标权重写成负数。
 - `binding_risk_controls`：实际绑定该资产的 Phase 5 风险控制。
 
 运行时写入 `current_weight`，并验证 ticker 覆盖、方向、权重范围和跨字段约束。`wait` 默认维持当前权重；只有硬风控可降低。`downgrade` 只能缩小可行目标或变化范围，不能扩大敞口或反转方向。

@@ -42,14 +42,20 @@ impl RunStore {
         Self { store, location }
     }
 
-    /// Pack finalized run-local Indexes, then retain only those archives and
-    /// the completed manifest. Partial and failed runs are untouched.
+    /// Pack finalized run-local Indexes for ordinary healthy runs. Debug and
+    /// degraded runs are never compacted so their state, sessions, stree
+    /// checkpoints, and input snapshots remain available for diagnosis and
+    /// recovery. Partial and failed runs are untouched.
     pub fn compact_completed_run(&self, mode: RunCompactionMode) -> Result<RunCompactionReport> {
         let manifest = read_run_manifest(&self.store, &self.location)?;
         let skipped_reason = if manifest.status != RunStatus::Completed {
             Some(format!("run status is {:?}", manifest.status))
         } else if manifest.phase_status.get("8") != Some(&PhaseStatus::Completed) {
             Some("phase 8 is not completed".to_owned())
+        } else if self.location.storage_namespace() == Some("debug") {
+            Some("debug namespace is never compacted".to_owned())
+        } else if manifest.degraded {
+            Some("degraded run is never compacted".to_owned())
         } else {
             None
         };
@@ -468,12 +474,20 @@ mod tests {
     }
 
     #[test]
-    fn completed_degraded_run_is_compacted() {
+    fn completed_degraded_run_is_not_compacted() {
         let directory = tempdir().unwrap();
         let store = FileStore::open(directory.path(), FileStoreOptions::default()).unwrap();
         let location = location();
         let state = location.state_relative();
         store.write_bytes(&state, b"{}").unwrap();
+        let session_file = location
+            .child_relative(Path::new("sessions/session-one/turn.jsonl"))
+            .unwrap();
+        store.write_bytes(&session_file, b"{}").unwrap();
+        let input_manifest = location
+            .child_relative(Path::new("inputs/manifest.json"))
+            .unwrap();
+        store.write_bytes(&input_manifest, b"{}").unwrap();
         write_run_manifest(
             &store,
             &location,
@@ -483,9 +497,15 @@ mod tests {
 
         let run = RunStore::new(store.clone(), location.clone());
         let report = run.compact_completed_run(RunCompactionMode::Apply).unwrap();
-        assert!(report.eligible);
-        assert!(report.applied);
-        assert!(!store.exists(&state).unwrap());
+        assert!(!report.eligible);
+        assert!(!report.applied);
+        assert_eq!(
+            report.skipped_reason.as_deref(),
+            Some("degraded run is never compacted")
+        );
+        assert!(store.exists(&state).unwrap());
+        assert!(store.exists(&session_file).unwrap());
+        assert!(store.exists(&input_manifest).unwrap());
     }
 
     #[test]
@@ -515,7 +535,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_debug_run_is_compacted() {
+    fn completed_normal_namespace_is_compacted() {
         let directory = tempdir().unwrap();
         let store = FileStore::open(directory.path(), FileStoreOptions::default()).unwrap();
         let location = location();
@@ -536,6 +556,50 @@ mod tests {
         assert!(report.eligible);
         assert!(report.applied);
         assert!(!store.exists(&location.state_relative()).unwrap());
+    }
+
+    #[test]
+    fn completed_debug_namespace_retains_all_recovery_files() {
+        let directory = tempdir().unwrap();
+        let store = FileStore::open(directory.path(), FileStoreOptions::default()).unwrap();
+        let location = RunLocation::debug("2026-07-29", "debug-run").unwrap();
+        let state = set_content_hash(&serde_json::json!({"debug": true})).unwrap();
+        store
+            .write_json_value(&location.state_relative(), &state)
+            .unwrap();
+        let session_file = location
+            .child_relative(Path::new("sessions/session-one/turn.jsonl"))
+            .unwrap();
+        store.write_bytes(&session_file, b"{}").unwrap();
+        let stree_file = location
+            .child_relative(Path::new("drafts/topic-one/stree.json"))
+            .unwrap();
+        store.write_bytes(&stree_file, b"{}").unwrap();
+        let input_manifest = location
+            .child_relative(Path::new("inputs/manifest.json"))
+            .unwrap();
+        store.write_bytes(&input_manifest, b"{}").unwrap();
+        write_run_manifest(
+            &store,
+            &location,
+            manifest(location.clone(), RunStatus::Completed, false),
+        )
+        .unwrap();
+
+        let report = RunStore::new(store.clone(), location.clone())
+            .compact_completed_run(RunCompactionMode::Apply)
+            .unwrap();
+
+        assert!(!report.eligible);
+        assert!(!report.applied);
+        assert_eq!(
+            report.skipped_reason.as_deref(),
+            Some("debug namespace is never compacted")
+        );
+        assert!(store.exists(&location.state_relative()).unwrap());
+        assert!(store.exists(&session_file).unwrap());
+        assert!(store.exists(&stree_file).unwrap());
+        assert!(store.exists(&input_manifest).unwrap());
     }
 
     #[test]

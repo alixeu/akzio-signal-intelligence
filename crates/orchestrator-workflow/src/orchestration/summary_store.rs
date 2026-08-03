@@ -22,9 +22,9 @@ pub(crate) struct PhaseIndexCandidate {
     pub(crate) authoritative_fields: Map<String, Value>,
     #[serde(default, deserialize_with = "deserialize_details")]
     pub(crate) details: Vec<PhaseIndexCandidateDetail>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_string_list")]
     pub(crate) missing_fields: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_string_list")]
     pub(crate) ambiguities: Vec<String>,
 }
 
@@ -52,6 +52,26 @@ where
 {
     let value = Value::deserialize(deserializer)?;
     Ok(value.as_f64().unwrap_or(0.0))
+}
+
+/// Missing-field and ambiguity entries are exposed as strings in the
+/// canonical Index shape, but models sometimes return structured objects.
+/// Preserve those entries as compact JSON rather than failing the whole phase.
+fn deserialize_string_list<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    let Some(items) = value.as_array() else {
+        return Ok(Vec::new());
+    };
+    Ok(items
+        .iter()
+        .map(|item| match item {
+            Value::String(value) => value.clone(),
+            other => other.to_string(),
+        })
+        .collect())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -341,6 +361,26 @@ mod tests {
         )
         .unwrap();
         assert_eq!(candidate.summary, "ok");
+    }
+
+    #[test]
+    fn candidate_parser_preserves_structured_ambiguities_as_strings() {
+        let candidate = parse_phase_index_candidate(
+            &json!({
+                "summary": "ok",
+                "confidence": 0.5,
+                "authoritative_fields": {},
+                "missing_fields": [{"field": "volume"}],
+                "ambiguities": [{"asset": "QQQ", "issue": "trend"}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(candidate.missing_fields, vec![r#"{"field":"volume"}"#]);
+        assert_eq!(
+            candidate.ambiguities,
+            vec![r#"{"asset":"QQQ","issue":"trend"}"#]
+        );
     }
 
     #[test]

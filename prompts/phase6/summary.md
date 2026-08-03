@@ -33,4 +33,6 @@ SOURCE_PAYLOAD：
 }
 
 `per_asset` 必须且只能覆盖 investable assets；示例中的 QQQ 只是结构示意。
+`max_target_weight` 和 `max_weight_delta` 必须是 Rust 校验的 0 到 1 之间的非负小数；
+不要输出百分数字面量或负数，偏空方向由 `direction_constraint=decrease_only` 表达。
 缺失权重或冲突约束必须报告，不得猜测。不要输出代码块或额外文字。
