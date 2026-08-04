@@ -861,6 +861,22 @@ impl TopicDebateTree {
         if let Some(node_id) = self.resolve_claim_reference(reference) {
             return Ok(node_id);
         }
+        // Models occasionally copy a valid sequence with a typo in the topic
+        // prefix. The sequence is Rust-owned and unique within this tree, so
+        // accept only an unambiguous `:stree:<sequence>` alias and retain the
+        // original reference in the route payload for audit.
+        if let Some((topic_prefix, sequence)) = reference.rsplit_once(":stree:") {
+            if !topic_prefix.trim().is_empty() {
+                if let Ok(sequence) = sequence.parse::<u64>() {
+                    let mut matches = self.nodes.iter().filter(|node| node.sequence == sequence);
+                    if let Some(node) = matches.next() {
+                        if matches.next().is_none() {
+                            return Ok(node.node_id.clone());
+                        }
+                    }
+                }
+            }
+        }
         bail!("controller route reply_to_node_id is not in this topic tree")
     }
 
@@ -2012,6 +2028,35 @@ mod tests {
             .unwrap();
         assert_eq!(route.payload["reply_to_node_id"], bear.node_id);
         assert_eq!(route.payload["reply_to_delivery_id"], receipt_id);
+    }
+
+    #[test]
+    fn controller_canonicalizes_unique_stree_sequence_alias() {
+        let mut tree = tree();
+        tree.next_dispatch();
+        tree.submit(DebateActor::Bull, submission("challenge", None))
+            .unwrap();
+        tree.next_dispatch();
+        let bear = tree
+            .submit(DebateActor::Bear, submission("challenge", None))
+            .unwrap();
+
+        let malformed_reference = bear.node_id.replacen("topic-a", "topic-a-typo", 1);
+        tree.next_dispatch();
+        tree.controller_route(json!({
+            "targets": ["bull", "bear"],
+            "reply_to_node_id": malformed_reference,
+            "message": "both sides must address the opposing opening"
+        }))
+        .unwrap();
+
+        let route = tree
+            .nodes
+            .iter()
+            .find(|node| node.kind == StreeNodeKind::Route)
+            .unwrap();
+        assert_eq!(route.payload["reply_to_node_id"], bear.node_id);
+        assert_eq!(route.payload["reply_to_delivery_id"], malformed_reference);
     }
 
     #[test]

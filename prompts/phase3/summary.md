@@ -3,6 +3,15 @@
 
 {common_ticker_prompt}
 
+## Rust 概率基线
+
+以下是 Rust 计算并封存的唯一概率基线。逐字复制每个 investable asset 的
+`long_probability` 到 `base_probability`；不要从 Research Manager 自由文字、
+confidence 或场景概率推导或改写它。若自由文字与基线冲突，保留基线并在
+`ambiguities` 说明冲突。
+
+{phase3_context}
+
 最终只输出一个 JSON 对象：
 
 {

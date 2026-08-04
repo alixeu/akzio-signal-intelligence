@@ -1439,6 +1439,7 @@ pub fn turn_item_from_history_value(value: Value) -> TurnItem {
         "plan_update" => TurnItemType::PlanUpdate,
         "tool_call" => TurnItemType::ToolCall,
         "tool_result" => TurnItemType::ToolResult,
+        "native_web_search" => TurnItemType::NativeWebSearch,
         "system_context" => TurnItemType::SystemContext,
         "developer_context" => TurnItemType::DeveloperContext,
         "compact_summary" => TurnItemType::CompactSummary,

@@ -51,6 +51,10 @@ event ID、content hash、detail hash 或截断后的 64 位字符串。最终�
 
 `per_ticker` 必须覆盖 SOURCE_PAYLOAD 中的完整 analysis universe；示例中的 QQQ
 只是结构示意。context-only asset 也要保留分析，但不能生成投资动作。
+`authoritative_fields` 的结构必须保持为两个兄弟字段：`per_ticker` 与
+`cross_asset_findings`。`per_ticker` 只能包含完整 analysis universe 的 ticker
+键（通常是 `QQQ`、`SOXX`、`VIX`），绝不能把 `cross_asset_findings` 放进
+`per_ticker`。
 `long_probability` 是原 Analyst 明确表达的 1-5 个交易日多头概率，不得从
 `confidence`、direction 或文字语气推算；原文缺失时写入 `missing_fields`。
 `direction` 与 `long_probability` 必须一致：`bullish > 0.5`、`bearish < 0.5`、

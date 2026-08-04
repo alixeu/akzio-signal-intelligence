@@ -1,5 +1,6 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Context, Error, Result};
 use chrono::{Local, NaiveDate, Utc};
+use futures::{stream, StreamExt};
 use orchestrator_core::evaluation::RiskDecision;
 use orchestrator_core::{
     config_get, config_int, config_str, config_strings, default_project_root, display_ticker,
@@ -49,8 +50,8 @@ use crate::orchestration::{
         validate_asset_scope,
     },
     role_jobs::{
-        commit_historical_reflection, prepare_role_job, record_role_job_metrics, run_role_jobs,
-        RoleRun,
+        commit_historical_reflection, prepare_role_job, record_role_job_metrics,
+        refresh_role_job_metrics, run_role_jobs, RoleRun,
     },
     summary_store::{
         parse_phase_index_candidate, write_compiled_phase_index, PhaseIndexCandidate,
@@ -65,7 +66,35 @@ pub use args::*;
 
 const STATE_SCHEMA_VERSION: u32 = 1;
 
+#[derive(Debug, Clone)]
+struct RunFailureContext {
+    store: FileStore,
+    location: RunLocation,
+}
+
+#[derive(Debug, Clone)]
+struct UnitSpec {
+    role: String,
+    phase: i64,
+    kind: String,
+    round: Option<i64>,
+    topic_id: Option<String>,
+    ticker: Option<String>,
+}
+
 pub async fn run(args: ExecArgs) -> Result<Value> {
+    let mut failure_context = None;
+    let result = run_inner(args, &mut failure_context).await;
+    if let Err(error) = &result {
+        record_run_failure(failure_context.as_ref(), error);
+    }
+    result
+}
+
+async fn run_inner(
+    args: ExecArgs,
+    failure_context: &mut Option<RunFailureContext>,
+) -> Result<Value> {
     validate_args(&args)?;
     let current_date = args
         .date
@@ -121,6 +150,10 @@ pub async fn run(args: ExecArgs) -> Result<Value> {
     )?;
     let run_store = RunStore::new(store.clone(), location.clone());
     let mut manifest = prepare_manifest(&store, &location, &runtime, &config)?;
+    *failure_context = Some(RunFailureContext {
+        store: store.clone(),
+        location: location.clone(),
+    });
 
     let initial_state = json!({
         "schema_version": STATE_SCHEMA_VERSION,
@@ -1096,6 +1129,93 @@ fn rehydrate_completed_phase_projections(
     Ok(changed)
 }
 
+fn record_run_failure(context: Option<&RunFailureContext>, error: &anyhow::Error) {
+    let Some(context) = context else {
+        return;
+    };
+    let message = format!("{error:#}");
+    let mut manifest = match read_run_manifest(&context.store, &context.location) {
+        Ok(manifest) => manifest,
+        Err(read_error) => {
+            tracing::warn!(error = %read_error, failure = %message, "failed run could not reload its manifest");
+            return;
+        }
+    };
+    if manifest.status == RunStatus::Completed {
+        tracing::warn!(failure = %message, "refusing to overwrite a completed run while recording a later error");
+        return;
+    }
+
+    let phase = phase_from_failure_message(&message);
+    if let Some(phase) = phase {
+        manifest.current_phase = phase;
+        manifest
+            .phase_status
+            .insert(phase.to_string(), orchestrator_store::PhaseStatus::Failed);
+    }
+    manifest.status = RunStatus::Failed;
+    manifest.completed_at = None;
+    if !manifest
+        .errors
+        .iter()
+        .any(|entry| entry.code == "run_failed" && entry.message == message)
+    {
+        manifest.errors.push(ManifestError {
+            phase,
+            code: "run_failed".to_owned(),
+            message: message.clone(),
+            created_at: Utc::now().to_rfc3339(),
+        });
+    }
+
+    if let Err(state_error) = persist_run_failure_state(context, &message, phase) {
+        tracing::warn!(error = %state_error, failure = %message, "failed run state checkpoint failed");
+    }
+    if let Err(write_error) = write_run_manifest(&context.store, &context.location, manifest) {
+        tracing::warn!(error = %write_error, failure = %message, "failed run manifest update failed");
+    }
+}
+
+fn persist_run_failure_state(
+    context: &RunFailureContext,
+    message: &str,
+    phase: Option<u8>,
+) -> Result<()> {
+    let relative = context.location.state_relative();
+    if !context.store.exists(&relative)? {
+        return Ok(());
+    }
+    let mut state = context.store.read_json_value(&relative)?;
+    if let Some(phase) = phase {
+        set_phase_status(&mut state, i64::from(phase), "failed");
+    }
+    if !state.get("errors").is_some_and(Value::is_array) {
+        state["errors"] = json!([]);
+    }
+    state["errors"]
+        .as_array_mut()
+        .expect("errors set to array")
+        .push(json!({
+            "phase": phase,
+            "kind": "run_failed",
+            "failure": message,
+            "recovered": false,
+        }));
+    persist_state(&mut state)
+}
+
+fn phase_from_failure_message(message: &str) -> Option<u8> {
+    let lowercase = message.to_ascii_lowercase();
+    let marker = "phase ";
+    let start = lowercase.find(marker)? + marker.len();
+    let digits = lowercase[start..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>();
+    let phase = digits.parse::<u8>().ok()?;
+    (phase <= 8).then_some(phase)
+}
+
 fn finish_phase(
     store: &FileStore,
     location: &RunLocation,
@@ -1979,17 +2099,35 @@ async fn run_phase1(
         });
     }
     let roles = ["analyst.technical", "analyst.news_macro"];
-    let mut reports = serde_json::Map::new();
-    for role in roles {
-        let artifact = run_unit(
-            state, runtime, role, 1, "artifact", None, None, None, model, reasoning,
-        )
-        .await?;
-        reports.insert(
-            role.to_owned(),
-            artifact.get("payload").cloned().unwrap_or(artifact),
-        );
-    }
+    let artifacts = run_parallel_units(
+        state,
+        runtime,
+        roles
+            .iter()
+            .map(|role| UnitSpec {
+                role: (*role).to_owned(),
+                phase: 1,
+                kind: "artifact".to_owned(),
+                round: None,
+                topic_id: None,
+                ticker: None,
+            })
+            .collect(),
+        roles.len(),
+        model,
+        reasoning,
+    )
+    .await?;
+    let reports = roles
+        .into_iter()
+        .zip(artifacts)
+        .map(|(role, artifact)| {
+            (
+                role.to_owned(),
+                artifact.get("payload").cloned().unwrap_or(artifact),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
     state["analyst_reports"] = Value::Object(reports);
     state["phase1_index"] = json!({"roles": state["analyst_reports"], "authority": "file_store"});
     state["phase1_evidence_event_ledger"] = phase1_evidence_event_ledger(state)?;
@@ -2006,37 +2144,41 @@ async fn run_phase2(
     reasoning: Option<&str>,
 ) -> Result<()> {
     let phase1_evidence_clusters = phase2_initial_evidence_event_clusters(state, store, location)?;
-    let warmup = run_unit(
+    let mut initial_artifacts = run_parallel_units(
         state,
         runtime,
-        "mediator.topic",
+        vec![
+            UnitSpec {
+                role: "mediator.topic".to_owned(),
+                phase: 2,
+                kind: "warmup".to_owned(),
+                round: Some(0),
+                topic_id: None,
+                ticker: None,
+            },
+            UnitSpec {
+                role: "mediator.topic".to_owned(),
+                phase: 2,
+                kind: "topic_generation".to_owned(),
+                round: None,
+                topic_id: None,
+                ticker: None,
+            },
+        ],
         2,
-        "warmup",
-        Some(0),
-        None,
-        None,
         model,
         reasoning,
     )
     .await?;
+    let warmup = initial_artifacts.remove(0);
     state["phase2_warmup"] = warmup;
     // Preserve the completed Warmup artifact first, then attach its Rust-owned
     // session identity. Reversing this order silently erased the fork source
     // and let Bull/Bear seeds start without their required parent evidence.
     record_phase2_session(state, "mediator.topic", "warmup", None, None, Some(0));
-    let mut generated = run_unit(
-        state,
-        runtime,
-        "mediator.topic",
-        2,
-        "topic_generation",
-        None,
-        None,
-        None,
-        model,
-        reasoning,
-    )
-    .await?;
+    let mut generated = initial_artifacts
+        .pop()
+        .context("Phase 2 parallel initialization produced no Topic Generator artifact")?;
     record_phase2_session(
         state,
         "mediator.topic",
@@ -2107,211 +2249,82 @@ async fn run_phase2(
         "selection": topic_selection,
     });
 
-    let mut controllers = serde_json::Map::new();
-    for topic in topics.as_array().into_iter().flatten() {
-        let topic_id = topic
-            .get("topic_id")
-            .and_then(Value::as_str)
-            .context("Phase 2 topic generation returned a topic without topic_id")?
-            .to_owned();
-        let max_rounds = state
-            .get("max_debate_rounds")
-            .and_then(Value::as_i64)
-            .unwrap_or(1)
-            .max(0);
-        let mut tree = TopicDebateTree::open(&topic_id, topic.clone(), max_rounds as u32)?;
-        for (reference, event_cluster_id) in &phase1_evidence_clusters {
-            tree.register_evidence_ref_cluster(reference, event_cluster_id)?;
-        }
-        tree.set_independence_context(
-            phase2_role_model(runtime, model, "researcher.bull"),
-            phase2_role_model(runtime, model, "researcher.bear"),
-        );
-        tree.recover_inflight();
-        state["topic_debate_states"][&topic_id] = json!({"topic": topic, "stree": tree});
-        let mut final_controller = Value::Null;
-        let max_dispatches = (max_rounds as u32)
-            .saturating_mul(12)
-            .saturating_add(12)
-            .clamp(12, 64);
-        let mut dispatch_count = 0u32;
-        while !tree.is_closed() {
-            if dispatch_count >= max_dispatches {
-                tree.close_after_safety_limit()?;
-                break;
-            }
-            let Some(dispatch) = tree.next_dispatch() else {
-                tree.close_after_safety_limit()?;
-                break;
-            };
-            dispatch_count = dispatch_count.saturating_add(1);
-            let role = dispatch.actor.role();
-            let round = i64::from(tree.round);
-            state["_phase2_stree_injection"] = if dispatch.deliveries.is_empty() {
-                Value::Null
-            } else {
-                Value::String(tree.injected_user_message(&dispatch.deliveries)?)
-            };
-            state["topic_debate_states"][&topic_id]["stree"] = serde_json::to_value(&tree)?;
-            checkpoint_state(state)?;
-            let mut artifact = match run_unit(
-                state,
-                runtime,
-                role,
-                2,
-                "stree_turn",
-                Some(round),
-                Some(&topic_id),
-                None,
-                model,
-                reasoning,
-            )
-            .await
-            {
-                Ok(artifact) => artifact,
-                Err(error) => {
-                    record_phase2_runtime_failure(
-                        state,
-                        &topic_id,
-                        dispatch.actor,
-                        "role_job_failure",
-                        &error.to_string(),
-                    );
-                    tree.record_failure(dispatch.actor, error.to_string(), 1)?;
-                    state["topic_debate_states"][&topic_id]["stree"] = serde_json::to_value(&tree)?;
-                    checkpoint_state(state)?;
-                    continue;
-                }
-            };
-            state["_phase2_stree_injection"] = Value::Null;
-            // A natural-language response is not a completed STree turn. Give
-            // the same persisted conversation one Rust-owned correction before
-            // recording a tree failure: the model retains its analysis while
-            // the retry can only finish through the required terminal tool.
-            // This keeps a successful protocol repair out of the run's health
-            // failure projection, while a second omission remains observable
-            // and follows the bounded failure path below.
-            if !state["mock"].as_bool().unwrap_or(false)
-                && !phase2_stree_terminal_command_present(&artifact)
-            {
-                state["_phase2_stree_injection"] = Value::String(
-                    phase2_terminal_tool_retry_injection(&topic_id, dispatch.actor),
-                );
-                artifact = match run_unit(
-                    state,
+    let topic_values = topics.as_array().cloned().unwrap_or_default();
+    let base_state = state.clone();
+    let base_metric_count = state
+        .get("role_job_metrics")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let base_error_count = state
+        .get("errors")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let topic_outcomes =
+        stream::iter(topic_values.into_iter().enumerate().map(|(index, topic)| {
+            let topic_id = topic
+                .get("topic_id")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            let mut worker_state = base_state.clone();
+            let evidence_clusters = phase1_evidence_clusters.clone();
+            async move {
+                let topic_id = topic_id
+                    .context("Phase 2 topic generation returned a topic without topic_id")?;
+                let result = run_phase2_topic(
+                    &mut worker_state,
                     runtime,
-                    role,
-                    2,
-                    "stree_turn",
-                    Some(round),
-                    Some(&topic_id),
-                    None,
+                    topic,
+                    &evidence_clusters,
                     model,
                     reasoning,
                 )
-                .await
-                {
-                    Ok(retry) => retry,
-                    Err(error) => {
-                        state["_phase2_stree_injection"] = Value::Null;
-                        record_phase2_runtime_failure(
-                            state,
-                            &topic_id,
-                            dispatch.actor,
-                            "role_job_failure",
-                            &error.to_string(),
-                        );
-                        tree.record_failure(dispatch.actor, error.to_string(), 1)?;
-                        state["topic_debate_states"][&topic_id]["stree"] =
-                            serde_json::to_value(&tree)?;
-                        checkpoint_state(state)?;
-                        continue;
-                    }
-                };
-                state["_phase2_stree_injection"] = Value::Null;
+                .await;
+                Ok::<_, Error>((index, topic_id, result, worker_state))
             }
-            if state["mock"].as_bool().unwrap_or(false) {
-                apply_mock_phase2_stree_command(&mut tree, dispatch.actor)?;
-            } else if let Err(error) =
-                apply_phase2_stree_command(&mut tree, dispatch.actor, &artifact)
-            {
-                let error_text = error.to_string();
-                if dispatch.actor == DebateActor::Controller
-                    && is_phase2_controller_close_required_error(&error_text)
-                {
-                    // The Controller has already received the complete final
-                    // collision wave.  A rejected extra route must not turn
-                    // that evidence into an artificial Rust closure: give the
-                    // same persisted session one explicit terminal-close
-                    // correction, then record a bounded failure if it still
-                    // cannot close.
-                    state["_phase2_stree_injection"] =
-                        Value::String(phase2_controller_close_retry_injection(&topic_id));
-                    artifact = match run_unit(
-                        state,
-                        runtime,
-                        role,
-                        2,
-                        "stree_turn",
-                        Some(round),
-                        Some(&topic_id),
-                        None,
-                        model,
-                        reasoning,
-                    )
-                    .await
-                    {
-                        Ok(retry) => retry,
-                        Err(error) => {
-                            state["_phase2_stree_injection"] = Value::Null;
-                            record_phase2_runtime_failure(
-                                state,
-                                &topic_id,
-                                dispatch.actor,
-                                "role_job_failure",
-                                &error.to_string(),
-                            );
-                            tree.record_failure(dispatch.actor, error.to_string(), 1)?;
-                            state["topic_debate_states"][&topic_id]["stree"] =
-                                serde_json::to_value(&tree)?;
-                            checkpoint_state(state)?;
-                            continue;
-                        }
-                    };
-                    state["_phase2_stree_injection"] = Value::Null;
-                    if let Err(retry_error) =
-                        apply_phase2_stree_command(&mut tree, dispatch.actor, &artifact)
-                    {
-                        let retry_error_text = retry_error.to_string();
-                        record_phase2_runtime_failure(
-                            state,
-                            &topic_id,
-                            dispatch.actor,
-                            "stree_command_failure",
-                            &retry_error_text,
-                        );
-                        tree.record_failure(dispatch.actor, retry_error_text, 1)?;
-                    }
-                } else {
-                    record_phase2_runtime_failure(
-                        state,
-                        &topic_id,
-                        dispatch.actor,
-                        "stree_command_failure",
-                        &error_text,
-                    );
-                    tree.record_failure(dispatch.actor, error_text, 1)?;
+        }))
+        .buffer_unordered(state["max_topics_per_side"].as_u64().unwrap_or(3).max(1) as usize)
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?;
+    let mut topic_outcomes = topic_outcomes;
+    topic_outcomes.sort_by_key(|(index, _, _, _)| *index);
+
+    let mut controllers = serde_json::Map::new();
+    let mut first_topic_error: Option<Error> = None;
+    for (_, topic_id, result, worker_state) in topic_outcomes {
+        match result {
+            Ok(controller) => {
+                merge_parallel_state_delta(
+                    state,
+                    &worker_state,
+                    base_metric_count,
+                    base_error_count,
+                    Some(&topic_id),
+                );
+                controllers.insert(topic_id, controller);
+            }
+            Err(error) => {
+                merge_parallel_state_delta(
+                    state,
+                    &worker_state,
+                    base_metric_count,
+                    base_error_count,
+                    Some(&topic_id),
+                );
+                if first_topic_error.is_none() {
+                    first_topic_error =
+                        Some(error.context(format!("Phase 2 topic debate failed for {topic_id}")));
                 }
             }
-            if dispatch.actor == DebateActor::Controller {
-                final_controller = artifact.clone();
-            }
-            state["topic_debate_states"][&topic_id]["stree"] = serde_json::to_value(&tree)?;
-            state["topic_debate_states"][&topic_id]["latest_artifact"] = artifact;
-            checkpoint_state(state)?;
         }
-        controllers.insert(topic_id.clone(), tree.process_summary());
-        state["topic_debate_states"][&topic_id]["final_controller_artifact"] = final_controller;
+    }
+    refresh_role_job_metrics(state);
+    if let Some(error) = first_topic_error {
+        checkpoint_state(state).context("failed to persist Phase 2 parallel topic failure")?;
+        return Err(error);
     }
     // The only Phase 2-wide Summary runs after every topic tree has reached a
     // terminal Controller closure. Individual stree turns deliberately stay
@@ -2346,6 +2359,225 @@ async fn run_phase2(
     checkpoint_state(state)?;
     write_phase2_debate_debug_summary(state)?;
     Ok(())
+}
+
+/// Execute one complete topic tree. The tree itself remains sequential because
+/// each delivery depends on the previous mailbox state; separate topic trees
+/// are independent and are therefore run by `run_phase2` concurrently.
+async fn run_phase2_topic(
+    state: &mut Value,
+    runtime: &RuntimeConfig,
+    topic: Value,
+    phase1_evidence_clusters: &BTreeMap<String, String>,
+    model: Option<&str>,
+    reasoning: Option<&str>,
+) -> Result<Value> {
+    let topic_id = topic
+        .get("topic_id")
+        .and_then(Value::as_str)
+        .context("Phase 2 topic generation returned a topic without topic_id")?
+        .to_owned();
+    let max_rounds = state
+        .get("max_debate_rounds")
+        .and_then(Value::as_i64)
+        .unwrap_or(1)
+        .max(0);
+    let mut tree = TopicDebateTree::open(&topic_id, topic.clone(), max_rounds as u32)?;
+    for (reference, event_cluster_id) in phase1_evidence_clusters {
+        tree.register_evidence_ref_cluster(reference, event_cluster_id)?;
+    }
+    tree.set_independence_context(
+        phase2_role_model(runtime, model, "researcher.bull"),
+        phase2_role_model(runtime, model, "researcher.bear"),
+    );
+    tree.recover_inflight();
+    state["topic_debate_states"][&topic_id] = json!({"topic": topic, "stree": tree});
+    let mut final_controller = Value::Null;
+    let max_dispatches = (max_rounds as u32)
+        .saturating_mul(12)
+        .saturating_add(12)
+        .clamp(12, 64);
+    let mut dispatch_count = 0u32;
+    while !tree.is_closed() {
+        if dispatch_count >= max_dispatches {
+            tree.close_after_safety_limit()?;
+            break;
+        }
+        let Some(dispatch) = tree.next_dispatch() else {
+            tree.close_after_safety_limit()?;
+            break;
+        };
+        dispatch_count = dispatch_count.saturating_add(1);
+        let role = dispatch.actor.role();
+        let round = i64::from(tree.round);
+        let delivery_ids = dispatch
+            .deliveries
+            .iter()
+            .map(|delivery| delivery.delivery_id.as_str())
+            .collect::<Vec<_>>();
+        state["_phase2_stree_dispatch_key"] = json!(phase2_stree_dispatch_key(
+            &topic_id,
+            dispatch.actor,
+            &delivery_ids,
+        ));
+        state["_phase2_stree_injection"] = if dispatch.deliveries.is_empty() {
+            Value::Null
+        } else {
+            Value::String(tree.injected_user_message(&dispatch.deliveries)?)
+        };
+        state["topic_debate_states"][&topic_id]["stree"] = serde_json::to_value(&tree)?;
+        let mut artifact = match run_unit_with_checkpoint(
+            state,
+            runtime,
+            role,
+            2,
+            "stree_turn",
+            Some(round),
+            Some(&topic_id),
+            None,
+            model,
+            reasoning,
+            false,
+        )
+        .await
+        {
+            Ok(artifact) => artifact,
+            Err(error) => {
+                record_phase2_runtime_failure(
+                    state,
+                    &topic_id,
+                    dispatch.actor,
+                    "role_job_failure",
+                    &error.to_string(),
+                );
+                tree.record_failure(dispatch.actor, error.to_string(), 1)?;
+                state["topic_debate_states"][&topic_id]["stree"] = serde_json::to_value(&tree)?;
+                continue;
+            }
+        };
+        state["_phase2_stree_injection"] = Value::Null;
+        // A natural-language response is not a completed STree turn. Give the
+        // same persisted conversation one Rust-owned correction before
+        // recording a tree failure: the model retains its analysis while the
+        // retry can only finish through the required terminal tool.
+        if !state["mock"].as_bool().unwrap_or(false)
+            && !phase2_stree_terminal_command_present(&artifact)
+        {
+            state["_phase2_stree_injection"] = Value::String(phase2_terminal_tool_retry_injection(
+                &topic_id,
+                dispatch.actor,
+            ));
+            artifact = match run_unit_with_checkpoint(
+                state,
+                runtime,
+                role,
+                2,
+                "stree_turn",
+                Some(round),
+                Some(&topic_id),
+                None,
+                model,
+                reasoning,
+                false,
+            )
+            .await
+            {
+                Ok(retry) => retry,
+                Err(error) => {
+                    state["_phase2_stree_injection"] = Value::Null;
+                    record_phase2_runtime_failure(
+                        state,
+                        &topic_id,
+                        dispatch.actor,
+                        "role_job_failure",
+                        &error.to_string(),
+                    );
+                    tree.record_failure(dispatch.actor, error.to_string(), 1)?;
+                    state["topic_debate_states"][&topic_id]["stree"] = serde_json::to_value(&tree)?;
+                    continue;
+                }
+            };
+            state["_phase2_stree_injection"] = Value::Null;
+        }
+        if state["mock"].as_bool().unwrap_or(false) {
+            apply_mock_phase2_stree_command(&mut tree, dispatch.actor)?;
+        } else if let Err(error) = apply_phase2_stree_command(&mut tree, dispatch.actor, &artifact)
+        {
+            let error_text = error.to_string();
+            if dispatch.actor == DebateActor::Controller
+                && is_phase2_controller_close_required_error(&error_text)
+            {
+                // The Controller has already received the complete final
+                // collision wave. A rejected extra route must not turn that
+                // evidence into an artificial Rust closure: give the same
+                // persisted session one explicit terminal-close correction.
+                state["_phase2_stree_injection"] =
+                    Value::String(phase2_controller_close_retry_injection(&topic_id));
+                artifact = match run_unit_with_checkpoint(
+                    state,
+                    runtime,
+                    role,
+                    2,
+                    "stree_turn",
+                    Some(round),
+                    Some(&topic_id),
+                    None,
+                    model,
+                    reasoning,
+                    false,
+                )
+                .await
+                {
+                    Ok(retry) => retry,
+                    Err(error) => {
+                        state["_phase2_stree_injection"] = Value::Null;
+                        record_phase2_runtime_failure(
+                            state,
+                            &topic_id,
+                            dispatch.actor,
+                            "role_job_failure",
+                            &error.to_string(),
+                        );
+                        tree.record_failure(dispatch.actor, error.to_string(), 1)?;
+                        state["topic_debate_states"][&topic_id]["stree"] =
+                            serde_json::to_value(&tree)?;
+                        continue;
+                    }
+                };
+                state["_phase2_stree_injection"] = Value::Null;
+                if let Err(retry_error) =
+                    apply_phase2_stree_command(&mut tree, dispatch.actor, &artifact)
+                {
+                    let retry_error_text = retry_error.to_string();
+                    record_phase2_runtime_failure(
+                        state,
+                        &topic_id,
+                        dispatch.actor,
+                        "stree_command_failure",
+                        &retry_error_text,
+                    );
+                    tree.record_failure(dispatch.actor, retry_error_text, 1)?;
+                }
+            } else {
+                record_phase2_runtime_failure(
+                    state,
+                    &topic_id,
+                    dispatch.actor,
+                    "stree_command_failure",
+                    &error_text,
+                );
+                tree.record_failure(dispatch.actor, error_text, 1)?;
+            }
+        }
+        if dispatch.actor == DebateActor::Controller {
+            final_controller = artifact.clone();
+        }
+        state["topic_debate_states"][&topic_id]["stree"] = serde_json::to_value(&tree)?;
+        state["topic_debate_states"][&topic_id]["latest_artifact"] = artifact;
+    }
+    state["_phase2_stree_dispatch_key"] = Value::Null;
+    state["topic_debate_states"][&topic_id]["final_controller_artifact"] = final_controller;
+    Ok(tree.process_summary())
 }
 
 fn select_phase2_topics(generated: Value, max_topics_per_side: usize) -> Result<(Value, Value)> {
@@ -2901,6 +3133,10 @@ fn phase2_stree_terminal_command_present(artifact: &Value) -> bool {
         .is_some_and(|command| !command.trim().is_empty())
 }
 
+fn phase2_stree_dispatch_key(topic_id: &str, actor: DebateActor, delivery_ids: &[&str]) -> String {
+    format!("{topic_id}:{}:{}", actor.role(), delivery_ids.join(","))
+}
+
 fn phase2_terminal_tool_retry_injection(topic_id: &str, actor: DebateActor) -> String {
     let terminal_tools = match actor {
         DebateActor::Bull | DebateActor::Bear => "submit_debate_turn",
@@ -2938,7 +3174,75 @@ fn is_phase2_controller_close_required_error(error: &str) -> bool {
 }
 
 fn phase1_summary_validation_retry_instruction() -> String {
-    "Rust rejected the previous Phase 1 Summary contract. Preserve every explicit probability from the Analyst; do not derive it from confidence. Enforce direction coherence: bullish must be >0.5, bearish <0.5, neutral and unobserved exactly 0.5, and mixed may be 0.4..=0.6. When the source report explicitly describes conflicting timeframes or mixed evidence while giving a probability in 0.4..=0.6, use mixed instead of neutral. Every retained key_evidence.timestamp must be a non-empty ISO-8601 string, never null; optional event/publish/ingest/as_of fields may be null. If an item has no observed timestamp, remove it from key_evidence and record the gap instead of inventing a date. Return only the required JSON object and keep all evidence IDs unchanged.".to_owned()
+    "Rust rejected the previous Phase 1 Summary contract. Preserve every explicit probability from the Analyst; do not derive it from confidence. Enforce direction coherence: bullish must be >0.5, bearish <0.5, neutral and unobserved exactly 0.5, and mixed may be 0.4..=0.6. When the source report explicitly describes conflicting timeframes or mixed evidence while giving a probability in 0.4..=0.6, use mixed instead of neutral. For every ticker with observed evidence, retain at least one non-empty key_evidence item with its exact prior evidence_refs; never replace a previously non-empty key_evidence array with [] or drop a ticker while fixing another field. A context-only ticker explicitly marked unobserved may retain an empty key_evidence array only when its long_probability is 0.5 and data_gaps/missing_fields records the absence of evidence. The JSON shape is strict: authoritative_fields.per_ticker may contain only ticker keys QQQ, SOXX, and VIX; cross_asset_findings is a sibling of per_ticker under authoritative_fields, never a per_ticker key. Every retained key_evidence.timestamp must be a non-empty ISO-8601 string, never null; optional event/publish/ingest/as_of fields may be null. If an item has no observed timestamp, remove it from key_evidence and record the gap instead of inventing a date. Return only the required JSON object and keep all evidence IDs unchanged.".to_owned()
+}
+
+/// Models occasionally place the shared cross-asset findings inside the
+/// ticker map because the prompt shows both fields close together.  Keep the
+/// canonical Index shape stable by moving only that known misplaced field;
+/// every ticker artifact remains otherwise model-owned and fail-closed.
+fn normalize_phase1_summary_layout(fields: &mut serde_json::Map<String, Value>) -> Result<()> {
+    let nested_findings = fields
+        .get_mut("per_ticker")
+        .and_then(Value::as_object_mut)
+        .and_then(|per_ticker| per_ticker.remove("cross_asset_findings"));
+    let Some(nested_findings) = nested_findings else {
+        return Ok(());
+    };
+    let nested_findings = nested_findings
+        .as_array()
+        .context("Phase 1 cross_asset_findings must be an array")?
+        .clone();
+    if let Some(existing) = fields.get_mut("cross_asset_findings") {
+        let existing = existing
+            .as_array_mut()
+            .context("Phase 1 cross_asset_findings must be an array")?;
+        existing.extend(nested_findings);
+    } else {
+        fields.insert(
+            "cross_asset_findings".to_owned(),
+            Value::Array(nested_findings),
+        );
+    }
+    Ok(())
+}
+
+fn preserve_phase1_summary_key_evidence(
+    fields: &mut serde_json::Map<String, Value>,
+    previous: &Value,
+) {
+    let Some(current_reports) = fields.get_mut("per_ticker").and_then(Value::as_object_mut) else {
+        return;
+    };
+    let Some(previous_reports) = previous.get("per_ticker").and_then(Value::as_object) else {
+        return;
+    };
+
+    for (ticker, previous_report) in previous_reports {
+        let Some(previous_evidence) = previous_report
+            .get("key_evidence")
+            .and_then(Value::as_array)
+            .filter(|items| !items.is_empty())
+        else {
+            continue;
+        };
+        let Some(current_report) = current_reports
+            .get_mut(ticker)
+            .and_then(Value::as_object_mut)
+        else {
+            continue;
+        };
+        let current_is_empty = current_report
+            .get("key_evidence")
+            .and_then(Value::as_array)
+            .is_none_or(|items| items.is_empty());
+        if current_is_empty {
+            current_report.insert(
+                "key_evidence".to_owned(),
+                Value::Array(previous_evidence.clone()),
+            );
+        }
+    }
 }
 
 fn phase2_topic_generation_validation_retry_instruction() -> String {
@@ -3496,14 +3800,26 @@ async fn run_phase5(
     model: Option<&str>,
     reasoning: Option<&str>,
 ) -> Result<()> {
-    let mut history = Vec::new();
-    for role in ["risk.aggressive", "risk.neutral", "risk.conservative"] {
-        let artifact = run_unit(
-            state, runtime, role, 5, "artifact", None, None, None, model, reasoning,
-        )
-        .await?;
-        history.push(artifact);
-    }
+    let roles = ["risk.aggressive", "risk.neutral", "risk.conservative"];
+    let history = run_parallel_units(
+        state,
+        runtime,
+        roles
+            .iter()
+            .map(|role| UnitSpec {
+                role: (*role).to_owned(),
+                phase: 5,
+                kind: "artifact".to_owned(),
+                round: None,
+                topic_id: None,
+                ticker: None,
+            })
+            .collect(),
+        roles.len(),
+        model,
+        reasoning,
+    )
+    .await?;
     let reviewer_independence =
         phase5_reviewer_independence_ledger(&history, &investable_assets_from_state(state))?;
     state["risk_debate_state"] = json!({
@@ -4886,12 +5202,33 @@ async fn run_unit(
     model: Option<&str>,
     reasoning: Option<&str>,
 ) -> Result<Value> {
+    run_unit_with_checkpoint(
+        state, runtime, role, phase, kind, round, topic_id, ticker, model, reasoning, true,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_unit_with_checkpoint(
+    state: &mut Value,
+    runtime: &RuntimeConfig,
+    role: &str,
+    phase: i64,
+    kind: &str,
+    round: Option<i64>,
+    topic_id: Option<&str>,
+    ticker: Option<&str>,
+    model: Option<&str>,
+    reasoning: Option<&str>,
+    checkpoint: bool,
+) -> Result<Value> {
     let completed_key = completed_unit_key(role, phase, kind, round, topic_id, ticker);
     let cacheable_unit = is_cacheable_unit(phase, kind);
     if !cacheable_unit {
         // A stree dispatch is a mailbox event, not a repeatable unit.  Its
-        // session/turn identity is intentionally stable, but each delivery
-        // must execute another loop against that existing history.
+        // FileStore session identity is stable; each delivery gets its own stable
+        // turn key so retries resume that delivery while later deliveries in the
+        // same role/round execute in a fresh turn with the full prior history.
         if let Some(units) = state
             .get_mut("_completed_units")
             .and_then(Value::as_object_mut)
@@ -4941,6 +5278,15 @@ async fn run_unit(
         .next()
         .context("ToolManaged role produced no result")?;
     record_role_job_metrics(state, &result);
+    if result.artifact.is_none() {
+        // The normal success checkpoint happens after compilation below.  A
+        // failed role has no later success path, so persist its metrics before
+        // returning; otherwise the manifest/session show the failure while
+        // state.json silently loses the terminal role attempt.
+        if checkpoint {
+            checkpoint_state(state).context("failed to persist terminal role failure metrics")?;
+        }
+    }
     let raw = result.artifact.clone().with_context(|| {
         format!(
             "{} phase {phase} produced no final Assistant text: {}",
@@ -5011,9 +5357,10 @@ async fn run_unit(
                     persists_phase_index(phase, kind),
                 )
                 .await;
-                state
-                    .as_object_mut()
-                    .map(|object| object.remove("_phase1_summary_validation_retry"));
+                if let Some(object) = state.as_object_mut() {
+                    object.remove("_phase1_summary_validation_retry");
+                    object.remove("_phase1_summary_retry_candidate");
+                }
                 retry.with_context(|| {
                     format!(
                         "Phase 1 Summary correction failed after the first contract error: {error}"
@@ -5155,8 +5502,159 @@ async fn run_unit(
     if cacheable_unit {
         state["_completed_units"][completed_key] = artifact.clone();
     }
-    checkpoint_state(state)?;
+    if checkpoint {
+        checkpoint_state(state)?;
+    }
     Ok(artifact)
+}
+
+/// Run independent units concurrently while keeping Rust-owned compilation and
+/// state publication deterministic. Each worker receives a private state
+/// snapshot, so it may run the model and Summary compiler without racing on
+/// `state.json`; the deltas are merged in the caller's input order afterwards.
+async fn run_parallel_units(
+    state: &mut Value,
+    runtime: &RuntimeConfig,
+    specs: Vec<UnitSpec>,
+    parallelism: usize,
+    model: Option<&str>,
+    reasoning: Option<&str>,
+) -> Result<Vec<Value>> {
+    if specs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let base_state = state.clone();
+    let base_metric_count = state
+        .get("role_job_metrics")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let base_error_count = state
+        .get("errors")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let outcomes = stream::iter(specs.into_iter().enumerate().map(|(index, spec)| {
+        let mut worker_state = base_state.clone();
+        async move {
+            let result = run_unit_with_checkpoint(
+                &mut worker_state,
+                runtime,
+                &spec.role,
+                spec.phase,
+                &spec.kind,
+                spec.round,
+                spec.topic_id.as_deref(),
+                spec.ticker.as_deref(),
+                model,
+                reasoning,
+                false,
+            )
+            .await;
+            (index, spec, result, worker_state)
+        }
+    }))
+    .buffer_unordered(parallelism.max(1))
+    .collect::<Vec<_>>()
+    .await;
+
+    let mut outcomes = outcomes;
+    outcomes.sort_by_key(|(index, _, _, _)| *index);
+    let mut artifacts = Vec::with_capacity(outcomes.len());
+    let mut first_error: Option<Error> = None;
+    for (_, spec, result, worker_state) in outcomes {
+        merge_parallel_state_delta(
+            state,
+            &worker_state,
+            base_metric_count,
+            base_error_count,
+            spec.topic_id.as_deref(),
+        );
+        match result {
+            Ok(artifact) => artifacts.push(artifact),
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(error.context(format!(
+                        "{} phase {} {} failed",
+                        spec.role, spec.phase, spec.kind
+                    )));
+                }
+            }
+        }
+    }
+    refresh_role_job_metrics(state);
+    if let Some(error) = first_error {
+        // A failed worker did not checkpoint its private state. Publish the
+        // merged metrics and session identities before surfacing the failure.
+        checkpoint_state(state).context("failed to persist parallel unit failure metrics")?;
+        return Err(error);
+    }
+    Ok(artifacts)
+}
+
+fn merge_parallel_state_delta(
+    state: &mut Value,
+    worker_state: &Value,
+    base_metric_count: usize,
+    base_error_count: usize,
+    topic_id: Option<&str>,
+) {
+    append_array_delta(state, worker_state, "role_job_metrics", base_metric_count);
+    append_array_delta(state, worker_state, "errors", base_error_count);
+    merge_object_delta(state, worker_state, "_runtime_sessions");
+    merge_object_delta(state, worker_state, "_completed_units");
+    if worker_state
+        .get("degraded")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        state["degraded"] = Value::Bool(true);
+    }
+    if let Some(topic_id) = topic_id {
+        if let Some(topic_state) = worker_state
+            .get("topic_debate_states")
+            .and_then(Value::as_object)
+            .and_then(|topics| topics.get(topic_id))
+        {
+            state["topic_debate_states"][topic_id] = topic_state.clone();
+        }
+    }
+}
+
+fn append_array_delta(state: &mut Value, worker_state: &Value, key: &str, base_len: usize) {
+    let Some(worker_values) = worker_state.get(key).and_then(Value::as_array) else {
+        return;
+    };
+    let delta = worker_values
+        .iter()
+        .skip(base_len)
+        .cloned()
+        .collect::<Vec<_>>();
+    if delta.is_empty() {
+        return;
+    }
+    if !state.get(key).is_some_and(Value::is_array) {
+        state[key] = json!([]);
+    }
+    state[key]
+        .as_array_mut()
+        .expect("parallel state delta array initialized")
+        .extend(delta);
+}
+
+fn merge_object_delta(state: &mut Value, worker_state: &Value, key: &str) {
+    let Some(worker_object) = worker_state.get(key).and_then(Value::as_object) else {
+        return;
+    };
+    if !state.get(key).is_some_and(Value::is_object) {
+        state[key] = json!({});
+    }
+    let target = state[key]
+        .as_object_mut()
+        .expect("parallel state delta object initialized");
+    for (key, value) in worker_object {
+        target.insert(key.clone(), value.clone());
+    }
 }
 
 fn defers_phase_summary(phase: i64, kind: &str) -> bool {
@@ -5276,6 +5774,9 @@ async fn compile_unit_response(
                 )
             })?;
         let mut candidate = parse_phase_index_candidate(text)?;
+        if phase_u8 == 1 {
+            normalize_phase1_summary_layout(&mut candidate.authoritative_fields)?;
+        }
         // The Summary model compresses only the Index fields.  Preserve the
         // original free-text response exactly once in the Rust-owned Detail;
         // asking the model to copy it again wastes output budget and can cause
@@ -5342,8 +5843,21 @@ async fn compile_unit_response(
         enrich_and_validate_phase6_compiled_fields(state, &mut candidate.authoritative_fields)?;
     }
     if phase_u8 == 1 {
-        attach_verified_phase1_web_sources(response_text, &mut candidate.authoritative_fields)?;
-        validate_phase1_compiled_fields(&candidate.authoritative_fields)?;
+        if let Some(previous) = state.get("_phase1_summary_retry_candidate").cloned() {
+            preserve_phase1_summary_key_evidence(&mut candidate.authoritative_fields, &previous);
+        }
+        let retry_candidate = candidate.authoritative_fields.clone();
+        if let Err(error) =
+            attach_verified_phase1_web_sources(response_text, &mut candidate.authoritative_fields)
+        {
+            state["_phase1_summary_retry_candidate"] = Value::Object(retry_candidate);
+            return Err(error);
+        }
+        if let Err(error) = validate_phase1_compiled_fields(&candidate.authoritative_fields) {
+            state["_phase1_summary_retry_candidate"] =
+                Value::Object(candidate.authoritative_fields.clone());
+            return Err(error);
+        }
     }
     if phase_u8 == 5 {
         validate_phase5_compiled_fields(
@@ -6769,7 +7283,19 @@ fn prune_unbacked_phase1_findings(
             });
             normalization.unbacked_key_evidence_removed += before - key_evidence.len();
             if key_evidence.is_empty() {
-                bail!("Phase 1 has no verified key evidence remaining for {ticker}");
+                let explicitly_unobserved = report.get("direction").and_then(Value::as_str)
+                    == Some("unobserved")
+                    && report
+                        .get("long_probability")
+                        .and_then(Value::as_f64)
+                        .is_some_and(|probability| (probability - 0.5).abs() <= 0.000001)
+                    && report
+                        .get("data_gaps")
+                        .and_then(Value::as_array)
+                        .is_some_and(|gaps| !gaps.is_empty());
+                if !explicitly_unobserved {
+                    bail!("Phase 1 has no verified key evidence remaining for {ticker}");
+                }
             }
         }
     }
@@ -7544,6 +8070,37 @@ fn normalize_evidence_origin(value: &str) -> String {
         .collect()
 }
 
+fn phase1_source_confidence(item: &Value) -> (f64, &'static str) {
+    let reported = item
+        .get("source_confidence")
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
+        .unwrap_or(0.0);
+    let verified_technical_input = item
+        .get("source")
+        .and_then(Value::as_str)
+        .is_some_and(|source| source == "filestore.run_input.technical")
+        && item
+            .get("evidence_refs")
+            .and_then(Value::as_array)
+            .is_some_and(|references| {
+                references.iter().any(|reference| {
+                    reference.as_str().is_some_and(|reference| {
+                        reference.starts_with("technical-") && is_phase1_evidence_id(reference)
+                    })
+                })
+            });
+
+    if verified_technical_input && reported == 0.0 {
+        // The Phase 1 Summary schema uses 0.0 as the placeholder for an
+        // unavailable source-confidence value. A sealed technical input is
+        // runtime-verified, so a conservative neutral floor keeps a valid
+        // technical report from disappearing from the probability base.
+        return (0.5, "rust_verified_technical_input_neutral_default");
+    }
+    (reported, "model_reported")
+}
+
 fn phase1_evidence_assessment(
     ticker_report: &Value,
     role: &str,
@@ -7590,11 +8147,7 @@ fn phase1_evidence_assessment(
             "longform_analysis" => 0.58,
             _ => 0.45,
         };
-        let source_confidence = item
-            .get("source_confidence")
-            .and_then(Value::as_f64)
-            .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
-            .unwrap_or(0.0);
+        let (source_confidence, source_confidence_basis) = phase1_source_confidence(item);
         let derivative_weight = if item
             .get("is_derivative_repost")
             .and_then(Value::as_bool)
@@ -7639,6 +8192,7 @@ fn phase1_evidence_assessment(
             "evidence_type": evidence_type,
             "source_tier": source_tier,
             "source_confidence": source_confidence,
+            "source_confidence_basis": source_confidence_basis,
             "type_weight": type_weight,
             "tier_weight": tier_weight,
             "freshness_weight": freshness_weight,
@@ -7821,6 +8375,9 @@ fn validate_phase1_compiled_fields(fields: &serde_json::Map<String, Value>) -> R
         validate_analyst_ticker_artifact(&canonical).map_err(|error| {
             anyhow::anyhow!("Phase 1 analyst artifact invalid for {ticker}: {error}")
         })?;
+        if canonical.key_evidence.is_empty() && ticker != "VIX" {
+            bail!("Phase 1 empty key_evidence is only allowed for context-only VIX, not {ticker}");
+        }
         for evidence in &canonical.key_evidence {
             if evidence.evidence_refs.is_empty() {
                 bail!("Phase 1 evidence for {ticker} requires at least one stable evidence_refs ID")
@@ -9326,9 +9883,9 @@ mod phase2_session_tests {
     };
     use orchestrator_store::{
         append_index_detail, capture_run_inputs, content_hash, create_index, finalize_index,
-        write_input_payload, write_run_manifest, AppendIndexDetailInput, CreateIndexInput,
-        DetailSection, FileStore, FileStoreOptions, IndexKind, IndexScope, InputSource,
-        PhaseStatus, RunLocation, RunManifest, RunManifestInit,
+        read_run_manifest, write_input_payload, write_run_manifest, AppendIndexDetailInput,
+        CreateIndexInput, DetailSection, FileStore, FileStoreOptions, IndexKind, IndexScope,
+        InputSource, PhaseStatus, RunLocation, RunManifest, RunManifestInit,
     };
     use serde_json::{json, Value};
     use std::collections::{BTreeMap, BTreeSet};
@@ -9345,25 +9902,27 @@ mod phase2_session_tests {
         decision_snapshot, defers_phase_summary, enrich_and_validate_phase6_compiled_fields,
         enrich_compiled_fields, enrich_final_trade_decision_fields, ensure_initial_collision_route,
         final_decision_payload, finalized_phase_index, finish_phase, highest_completed_phase,
-        is_cacheable_unit, load_or_initialize_state, normalize_phase2_topic_control_fields,
+        is_cacheable_unit, load_or_initialize_state, merge_parallel_state_delta,
+        normalize_phase1_summary_layout, normalize_phase2_topic_control_fields,
         normalize_phase2_topic_generation_evidence_refs, persist_state, persists_phase_index,
         phase1_evidence_event_ledger, phase2_controller_close_retry_injection,
-        phase2_debate_debug_summary, phase2_initial_evidence_registry,
+        phase2_debate_debug_summary, phase2_initial_evidence_registry, phase2_stree_dispatch_key,
         phase2_stree_terminal_command_present, phase2_terminal_tool_retry_injection,
         phase3_scenario_validation_retry_instruction, phase5_reviewer_independence_ledger,
-        phase7_execution_mode, phase_completed, prepare_manifest,
-        project_detail_hash_source_refs_object, project_phase2_final_fields,
-        project_phase3_evidence_refs, project_topic_generation_selection, prompt_owner_for_unit,
-        record_phase2_runtime_failure, record_phase2_session, redacted_config_for_state,
-        reflection_learning_gap_reasons, resolve_git_sha, risk_decision_from_index,
-        runtime_session_key, scoped_state_for_unit, select_phase2_topics,
+        phase7_execution_mode, phase_completed, phase_from_failure_message, prepare_manifest,
+        preserve_phase1_summary_key_evidence, project_detail_hash_source_refs_object,
+        project_phase2_final_fields, project_phase3_evidence_refs,
+        project_topic_generation_selection, prompt_owner_for_unit, prune_unbacked_phase1_findings,
+        record_phase2_runtime_failure, record_phase2_session, record_run_failure,
+        redacted_config_for_state, reflection_learning_gap_reasons, resolve_git_sha,
+        risk_decision_from_index, runtime_session_key, scoped_state_for_unit, select_phase2_topics,
         select_reflection_task_budget, sync_manifest_health, unselected_phase2_candidates,
         validate_declared_detail_source_refs, validate_phase1_compiled_fields,
         validate_phase1_web_source_urls, validate_phase2_compiled_contract,
         validate_phase2_topic_ttls, validate_phase3_compiled_fields,
         validate_phase4_compiled_fields, validate_phase5_compiled_fields,
         weighted_probability_base, workflow_source_surface_hash_at, DebateActor,
-        Phase7ExecutionMode, TopicDebateTree,
+        Phase1ReferenceNormalization, Phase7ExecutionMode, RunFailureContext, TopicDebateTree,
     };
 
     #[test]
@@ -9890,6 +10449,83 @@ mod phase2_session_tests {
             base["QQQ"]["contributions"][0]["evidence_assessment"]["records"][0]
                 ["freshness_weight"],
             1.0
+        );
+    }
+
+    #[test]
+    fn weighted_probability_base_keeps_verified_technical_input_when_source_confidence_is_zero() {
+        let technical = json!({
+            "claim": "The sealed technical snapshot contains a current signal.",
+            "evidence_type": "fact",
+            "source": "filestore.run_input.technical",
+            "timestamp": "2026-08-03T00:00:00Z",
+            "source_tier": "unknown",
+            "first_source": "filestore.run_input.technical",
+            "is_derivative_repost": false,
+            "evidence_age": "0-2d",
+            "source_confidence": 0.0,
+            "evidence_refs": [format!("technical-{}", "a".repeat(64))]
+        });
+        let state = json!({
+            "current_date": "2026-08-03",
+            "investable_assets": ["QQQ"],
+            "analyst_reports": {
+                "analyst.technical": {"per_ticker": {
+                    "QQQ": {
+                        "direction": "mixed",
+                        "confidence": 0.55,
+                        "long_probability": 0.52,
+                        "key_evidence": [technical]
+                    }
+                }}
+            }
+        });
+
+        let base = weighted_probability_base(&state).unwrap();
+
+        assert_eq!(base["QQQ"]["contributions"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            base["QQQ"]["contributions"][0]["evidence_assessment"]["records"][0]
+                ["source_confidence"],
+            0.5
+        );
+    }
+
+    #[test]
+    fn phase1_summary_retry_preserves_prior_key_evidence_when_model_omits_it() {
+        let evidence = json!({
+            "claim": "The sealed VIX snapshot records a current observation.",
+            "evidence_type": "fact",
+            "source": "filestore.run_input.technical",
+            "timestamp": "2026-08-03T07:00:00Z",
+            "source_tier": "unknown",
+            "first_source": "filestore.run_input.technical",
+            "is_derivative_repost": false,
+            "evidence_age": "0-2d",
+            "source_confidence": 0.8,
+            "evidence_refs": [format!("technical-{}", "a".repeat(64))]
+        });
+        let previous = json!({
+            "per_ticker": {
+                "VIX": {"key_evidence": [evidence]}
+            }
+        });
+        let mut current = json!({
+            "per_ticker": {
+                "QQQ": {"key_evidence": [{"claim": "keep current QQQ evidence"}]},
+                "VIX": {"key_evidence": []}
+            }
+        });
+
+        preserve_phase1_summary_key_evidence(current.as_object_mut().unwrap(), &previous);
+
+        assert_eq!(
+            current["per_ticker"]["VIX"]["key_evidence"][0]["evidence_refs"][0],
+            "technical-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(
+            current["per_ticker"]["QQQ"]["key_evidence"][0]["claim"],
+            "keep current QQQ evidence"
         );
     }
 
@@ -10430,6 +11066,75 @@ mod phase2_session_tests {
         .unwrap()
         .clone();
 
+        validate_phase1_compiled_fields(&fields).unwrap();
+    }
+
+    #[test]
+    fn phase1_only_allows_empty_evidence_for_context_only_vix() {
+        let unobserved = |ticker: &str| {
+            json!({
+                "direction": "unobserved",
+                "confidence": 0.0,
+                "long_probability": 0.5,
+                "report": format!("{ticker} is unobserved."),
+                "key_evidence": [],
+                "priced_in": "unclear",
+                "echo_chamber_risk": "unknown",
+                "crowded_consensus_risk": "unknown",
+                "validation_triggers": ["Collect current evidence."],
+                "data_gaps": ["Current evidence is unavailable."]
+            })
+        };
+        let vix_only = json!({
+            "per_ticker": {"VIX": unobserved("VIX")}
+        });
+        validate_phase1_compiled_fields(vix_only.as_object().unwrap()).unwrap();
+
+        let investable = json!({
+            "per_ticker": {"QQQ": unobserved("QQQ")}
+        });
+        let error = validate_phase1_compiled_fields(investable.as_object().unwrap()).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("empty key_evidence is only allowed for context-only VIX"));
+    }
+
+    #[test]
+    fn phase1_normalizes_nested_cross_asset_findings_before_ticker_validation() {
+        let evidence_id = format!("technical-{}", "a".repeat(64));
+        let mut fields = json!({
+            "per_ticker": {
+                "QQQ": {
+                    "direction": "mixed", "confidence": 0.5, "long_probability": 0.5,
+                    "report": "mixed", "key_evidence": [{
+                        "claim": "claim", "evidence_type": "fact",
+                        "source": "filestore.run_input.technical",
+                        "timestamp": "2026-08-03T00:00:00Z", "source_tier": "unknown",
+                        "first_source": "filestore.run_input.technical",
+                        "is_derivative_repost": false, "evidence_age": "0-2d",
+                        "source_confidence": 0.8, "evidence_refs": [evidence_id]
+                    }],
+                    "priced_in": "unclear", "echo_chamber_risk": "unknown",
+                    "crowded_consensus_risk": "unknown", "validation_triggers": [],
+                    "data_gaps": []
+                },
+                "cross_asset_findings": [{
+                    "claim": "shared macro finding",
+                    "evidence_refs": [evidence_id]
+                }]
+            }
+        })
+        .as_object_mut()
+        .unwrap()
+        .clone();
+
+        normalize_phase1_summary_layout(&mut fields).unwrap();
+
+        assert!(fields["per_ticker"].get("cross_asset_findings").is_none());
+        assert_eq!(
+            fields["cross_asset_findings"][0]["claim"],
+            "shared macro finding"
+        );
         validate_phase1_compiled_fields(&fields).unwrap();
     }
 
@@ -11074,6 +11779,16 @@ mod phase2_session_tests {
         assert!(super::is_phase2_controller_close_required_error(
             "controller route exceeded max_debate_rounds"
         ));
+    }
+
+    #[test]
+    fn phase2_dispatch_key_changes_when_delivery_changes() {
+        let first = phase2_stree_dispatch_key("topic-a", DebateActor::Bull, &["delivery-a"]);
+        let retry = phase2_stree_dispatch_key("topic-a", DebateActor::Bull, &["delivery-a"]);
+        let next = phase2_stree_dispatch_key("topic-a", DebateActor::Bull, &["delivery-b"]);
+
+        assert_eq!(first, retry);
+        assert_ne!(first, next);
     }
 
     #[test]
@@ -12098,6 +12813,46 @@ mod phase2_session_tests {
     }
 
     #[test]
+    fn phase1_allows_unobserved_ticker_without_verified_evidence_when_gap_is_declared() {
+        let mut fields = json!({
+            "per_ticker": {
+                "VIX": {
+                    "direction": "unobserved",
+                    "long_probability": 0.5,
+                    "data_gaps": ["没有可验证的 VIX 反应数据"],
+                    "key_evidence": []
+                }
+            }
+        });
+        let mut normalization = Phase1ReferenceNormalization::default();
+
+        prune_unbacked_phase1_findings(fields.as_object_mut().unwrap(), &mut normalization)
+            .unwrap();
+    }
+
+    #[test]
+    fn phase1_still_rejects_observed_ticker_without_verified_evidence() {
+        let mut fields = json!({
+            "per_ticker": {
+                "QQQ": {
+                    "direction": "mixed",
+                    "long_probability": 0.5,
+                    "data_gaps": ["缺少独立证据"],
+                    "key_evidence": []
+                }
+            }
+        });
+        let mut normalization = Phase1ReferenceNormalization::default();
+
+        let error =
+            prune_unbacked_phase1_findings(fields.as_object_mut().unwrap(), &mut normalization)
+                .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("Phase 1 has no verified key evidence remaining for QQQ"));
+    }
+
+    #[test]
     fn phase3_drops_refs_that_do_not_resolve_to_persisted_source_indexes() {
         let valid = "idx-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let invalid = "idx-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab";
@@ -12175,6 +12930,91 @@ mod phase2_session_tests {
     }
 
     #[test]
+    fn parallel_state_deltas_preserve_order_and_only_merge_their_topic() {
+        let mut state = json!({
+            "role_job_metrics": [{"role": "prior"}],
+            "errors": [{"kind": "prior"}],
+            "_runtime_sessions": {"prior": {"turn_id": "prior"}},
+            "_completed_units": {"prior": {"status": "ok"}},
+            "degraded": false,
+            "topic_debate_states": {
+                "topic-a": {"status": "base"},
+                "topic-b": {"status": "base"}
+            }
+        });
+        let worker_a = json!({
+            "role_job_metrics": [{"role": "prior"}, {"role": "a"}],
+            "errors": [{"kind": "prior"}, {"kind": "a"}],
+            "_runtime_sessions": {
+                "prior": {"turn_id": "prior"},
+                "a": {"turn_id": "a"}
+            },
+            "_completed_units": {
+                "prior": {"status": "ok"},
+                "a": {"status": "ok"}
+            },
+            "degraded": true,
+            "topic_debate_states": {
+                "topic-a": {"status": "updated-a"},
+                "topic-b": {"status": "must-not-overwrite"}
+            }
+        });
+        merge_parallel_state_delta(&mut state, &worker_a, 1, 1, Some("topic-a"));
+
+        assert_eq!(state["role_job_metrics"].as_array().unwrap().len(), 2);
+        assert_eq!(state["role_job_metrics"][1]["role"], "a");
+        assert_eq!(state["errors"].as_array().unwrap().len(), 2);
+        assert_eq!(state["_runtime_sessions"]["a"]["turn_id"], "a");
+        assert_eq!(state["_completed_units"]["a"]["status"], "ok");
+        assert_eq!(
+            state["topic_debate_states"]["topic-a"]["status"],
+            "updated-a"
+        );
+        assert_eq!(state["topic_debate_states"]["topic-b"]["status"], "base");
+        assert!(state["degraded"].as_bool().unwrap());
+
+        let worker_b = json!({
+            "role_job_metrics": [{"role": "prior"}, {"role": "a"}, {"role": "b"}],
+            "errors": [{"kind": "prior"}, {"kind": "a"}, {"kind": "b"}],
+            "_runtime_sessions": {
+                "prior": {"turn_id": "prior"},
+                "a": {"turn_id": "a"},
+                "b": {"turn_id": "b"}
+            },
+            "_completed_units": {
+                "prior": {"status": "ok"},
+                "a": {"status": "ok"},
+                "b": {"status": "ok"}
+            },
+            "degraded": false,
+            "topic_debate_states": {
+                "topic-a": {"status": "must-not-overwrite"},
+                "topic-b": {"status": "updated-b"}
+            }
+        });
+        merge_parallel_state_delta(&mut state, &worker_b, 2, 2, Some("topic-b"));
+
+        assert_eq!(
+            state["role_job_metrics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|metric| metric["role"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["prior", "a", "b"]
+        );
+        assert_eq!(state["errors"].as_array().unwrap().len(), 3);
+        assert_eq!(
+            state["topic_debate_states"]["topic-a"]["status"],
+            "updated-a"
+        );
+        assert_eq!(
+            state["topic_debate_states"]["topic-b"]["status"],
+            "updated-b"
+        );
+    }
+
+    #[test]
     fn manifest_projects_degraded_state_on_each_completed_phase() {
         let mut manifest = RunManifest::new(RunManifestInit {
             location: RunLocation::new("2026-07-27", "run-health-test").unwrap(),
@@ -12200,6 +13040,73 @@ mod phase2_session_tests {
         assert_eq!(manifest.errors.len(), 1);
         assert_eq!(manifest.errors[0].phase, Some(3));
         assert_eq!(manifest.errors[0].code, "artifact");
+    }
+
+    #[test]
+    fn failed_run_persists_failure_status_and_terminal_phase() {
+        let directory = tempdir().unwrap();
+        let store = FileStore::open(directory.path(), FileStoreOptions::default()).unwrap();
+        let location = RunLocation::new("2026-08-03", "run-failure-test").unwrap();
+        let manifest = RunManifest::new(RunManifestInit {
+            location: location.clone(),
+            workflow_version: "test".to_owned(),
+            prompt_versions: Default::default(),
+            prompt_content_hash: "sha256:prompts".to_owned(),
+            source_surface_hash: "sha256:source".to_owned(),
+            git_sha: "a".repeat(40),
+            config_hash: "sha256:test".to_owned(),
+            role_profile_registry_hash: "sha256:test".to_owned(),
+            created_at: "2026-08-03T00:00:00Z".to_owned(),
+        })
+        .unwrap();
+        write_run_manifest(&store, &location, manifest).unwrap();
+        let mut state = json!({
+            "schema_version": 1,
+            "run_id": "run-failure-test",
+            "current_date": "2026-08-03",
+            "ticker": "QQQ",
+            "tickers": ["QQQ"],
+            "analysis_universe": ["QQQ"],
+            "store_root": directory.path(),
+            "phase_status": {},
+            "errors": [],
+            "degraded": false
+        });
+        persist_state(&mut state).unwrap();
+
+        let context = RunFailureContext {
+            store,
+            location: location.clone(),
+        };
+        let error = anyhow::anyhow!(
+            "risk.conservative phase 5 produced no final Assistant text: upstream stream failed"
+        );
+        record_run_failure(Some(&context), &error);
+
+        let manifest = read_run_manifest(&context.store, &location).unwrap();
+        assert_eq!(manifest.status, orchestrator_store::RunStatus::Failed);
+        assert_eq!(manifest.current_phase, 5);
+        assert_eq!(manifest.phase_status["5"], PhaseStatus::Failed);
+        assert_eq!(manifest.errors[0].phase, Some(5));
+        assert_eq!(manifest.errors[0].code, "run_failed");
+        let state = context
+            .store
+            .read_json_value(&location.state_relative())
+            .unwrap();
+        assert_eq!(state["phase_status"]["5"], "failed");
+        assert_eq!(state["errors"][0]["kind"], "run_failed");
+    }
+
+    #[test]
+    fn failure_phase_parser_ignores_unscoped_errors() {
+        assert_eq!(
+            phase_from_failure_message(
+                "risk.conservative phase 5 produced no final Assistant text"
+            ),
+            Some(5)
+        );
+        assert_eq!(phase_from_failure_message("configuration is invalid"), None);
+        assert_eq!(phase_from_failure_message("phase 9 is unsupported"), None);
     }
 
     #[test]

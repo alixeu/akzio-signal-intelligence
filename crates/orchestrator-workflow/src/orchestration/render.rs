@@ -1319,6 +1319,34 @@ required_variables = ["ticker", "tickers"]
     }
 
     #[test]
+    fn phase3_summary_prompt_includes_rust_probability_baseline() {
+        let prompts = project_prompts_dir();
+        let mut state = golden_mock_state();
+        state["weighted_probability_base"] = json!({
+            "QQQ": {"long_probability": 0.56},
+            "SOXX": {"long_probability": 0.47}
+        });
+        let rendered = render_prompt(
+            &state,
+            "compressor.phase_summary",
+            3,
+            "phase_summary",
+            None,
+            None,
+            Some(&prompts.join("phase3/summary.md")),
+            None,
+        )
+        .unwrap();
+
+        assert!(rendered.contains("Rust 概率基线"));
+        assert!(rendered.contains("\"QQQ\""));
+        assert!(rendered.contains("\"SOXX\""));
+        assert!(rendered.contains("\"long_probability\": 0.56"));
+        assert!(rendered.contains("\"long_probability\": 0.47"));
+        assert!(!rendered.contains("{phase3_context}"));
+    }
+
+    #[test]
     fn retrieval_bootstrap_uses_live_phase_summary_metadata() {
         let bootstrap = retrieval_bootstrap(
             &json!({

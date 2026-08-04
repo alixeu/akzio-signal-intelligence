@@ -102,7 +102,8 @@ Generator 开始。生成器通过 `read_indexes` 使用 Phase 1 摘要索引,�
 Phase 1 产物。
 在至少一次相关 Detail 展开之后,Topic Generator 或 Bull/Bear 可以把一个
 明确的未解决事实委托给 `research_evidence_gap`。中立的
-`researcher.web_evidence` 工作角色只接收 `web.run`;Topic Generator 每次
+`researcher.web_evidence` 工作角色只接收有界的 Web 搜索能力;它可使用项目
+`web.run` (Exa),或在明确配置后使用 Responses 原生 `web_search`;Topic Generator 每次
 运行有两次调用额度,Bull/Bear 每个议题的各轮次共享两次调用额度。
 Rust 负责请求去重、校验并限制返回的来源包(source packet),分配
 `web-<md5-3>` 证据 ID,并把该证据保留在 Phase 2 中,而不是改写 Phase 1。
@@ -207,7 +208,7 @@ Session、临时状态、Draft 与调试文件,但成功完成后会将它们移
 | 类别 | 工具 ID | 用途与边界 |
 |---|---|---|
 | 运行时 | `think` | 记录当前轮次的有界私有推理;不读取数据,也不写入 Artifact。仅当角色的 LLM 设置启用时才可用。 |
-| 运行时 | `web.run` | 执行白名单内的 Exa 网络搜索并返回可引用证据。仅直接暴露给有界的 `researcher.web_evidence` 工作角色;Phase 1 事件核实通过 `verify_event` 使用同一搜索适配器。其 OpenAI 兼容函数名为 `web_run`。 |
+| 运行时 | `web.run` | 执行白名单内的 Exa 网络搜索并返回可引用证据。仅直接暴露给有界的 `researcher.web_evidence` 工作角色;Phase 1 事件核实通过 `verify_event` 使用同一搜索适配器。其 OpenAI 兼容函数名为 `web_run`。Responses 原生 `web_search` 仅在该角色显式启用时替代这个函数路径。 |
 | Phase 2 上下文 | `record_phase2_context` | 为每个 Bull/Bear 或 Topic Controller 轮次记录并暴露 Rust 绑定的角色、议题、辩论历史、最新 Controller 路由、fork 父节点与轮次身份。不接受模型选择的字段,也不写入文件。 |
 | Phase 2 证据缺口 | `research_evidence_gap` | 在一次成功的 Phase 1 Detail 展开后委托一个明确缺口。Rust 负责角色/议题范围、共享调用额度、去重、输出校验与证据 ID。 |
 | 历史反思 | `read_reflection_source` | 读取由 Rust 选定的历史反思任务来源;模型不能选择其他运行。 |
@@ -237,17 +238,34 @@ Manager 获得 `search_experiences`、`read_experience_cases` 与
 | `analyst.news_macro` / Analyst Report | `read_jin10_candidates`、`verify_event`、可选的 `alpaca_get_news` 以及符合条件的经验读取 |
 | Phase 2 Topic Generator 与 Bull/Bear | 仅限 Phase 1 的 `read_indexes` / `read_index_details`;Bull/Bear 议题轮次还接收 Rust 绑定的 `record_phase2_context`;Detail 之后可用有界的 `research_evidence_gap` |
 | Phase 2 预热与 Topic Controller | 仅限 Phase 1 的 `read_indexes` / `read_index_details`;Controller 轮次还接收 Rust 绑定的 `record_phase2_context`;无 Web 委托 |
-| `researcher.web_evidence` / Evidence Research | 仅 `web.run`;无 Index、Technical、Experience、交易或写入工具 |
+| `researcher.web_evidence` / Evidence Research | 仅有界 Web 搜索:默认 `web.run`/Exa;显式启用时为 Responses 原生 `web_search`;无 Index、Technical、Experience、交易或写入工具 |
 | `manager.research` / Research Decision | 仅限 Phase 1–2 的 `read_indexes` / `read_index_details` 以及符合条件的经验读取 |
 | `trader` / Trade Intent | 仅限 Phase 3 的 `read_indexes` / `read_index_details` |
 | Phase 5 风险审查员 | 仅限 Phase 3–4 的 `read_indexes` / `read_index_details` |
 | `portfolio.manager` / Portfolio Decision | 仅限 Phase 3–5 的 `read_indexes` / `read_index_details` |
 | `compressor.phase_summary` / Phase Summary | 无模型可见工具;Rust 写入解析结果 |
 
-只有当 `native_web_search` 启用且对应角色配置档明确授权 `web.run` 时,
-Responses 传输层才能使用 OpenAI 原生 `web_search`。目前只有内置的
-Evidence Research 配置档满足条件。提供方的原生工具有意与项目函数分发保持
-分离。
+只有当 `native_web_search` 启用、`route: responses`、`web_search.mode: live`，且
+对应角色配置档明确授权 `web.run` 时，Responses 传输层才能使用原生
+`web_search`。目前只有内置的 Evidence Research 配置档满足条件；Phase 1 的
+`verify_event` 仍使用受限的 Exa 路径，其他 Phase 不会得到直接联网工具。
+原生搜索会把实际的 URL citation 写入 FileStore，并只接受这些 Rust 观察到的
+URL 作为 Phase 2 证据来源。`allowed_domains` 会传给原生工具；原生工具无法保证
+`blocked_domains`，因此配置了后者会拒绝启动而不是静默放宽策略。
+
+若网关和模型支持 Responses 原生网页搜索，可在用户自己的角色覆盖中启用它（本仓库
+不会替你改写 `config/config.yaml`）：
+
+```yaml
+orchestrator:
+  llm:
+    roles:
+      researcher.web_evidence:
+        route: responses
+        native_web_search: true
+```
+
+未启用该覆盖时，所有既有的联网行为继续使用 Exa。
 
 Agent 循环会拒绝完全重复的 Index/Detail 读取,强制配置档的 Detail 展开
 额度,并在所有必需来源阶段和成功的 Detail 展开齐备之前拒绝终局输出。
@@ -259,7 +277,7 @@ Phase 2 角色 4、Phase 3 6、Phase 4 2、Phase 5 4、Phase 6 8。
 - Rust stable,edition 2021
 - 可访问 Alpaca Market Data、Yahoo Finance 与金十的网络
 - 非 mock 工作流运行需要 OpenAI 兼容网关密钥
-- 仅在启用实时 Exa 网络搜索时需要 `EXA_API_KEY`
+- 仅在启用实时 Exa 网络搜索时需要 `EXA_API_KEY`;Responses 原生 `web_search` 不使用 Exa，但要求 LLM 网关实现 `/v1/responses` 和该托管工具
 - `ALPACA_API_KEY` 和 `ALPACA_API_SECRET` 用于技术 K 线、Alpaca News、
   Phase 0 账户/成交检索以及 Phase 7 Alpaca Paper 账户、持仓与下单
 

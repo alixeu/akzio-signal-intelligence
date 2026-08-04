@@ -181,6 +181,19 @@ impl<'a, S: AgentEventSink> ModelStreamHandler<'a, S> {
                 self.result.tool_calls.push(tool_call.clone());
                 self.turn.pending_tool_calls.push(tool_call);
             }
+            ModelStreamEvent::NativeWebSearchCompleted { item_id, record } => {
+                let source_count = record
+                    .get("results")
+                    .and_then(serde_json::Value::as_array)
+                    .map_or(0, Vec::len);
+                debug!(
+                    turn_id = self.turn.turn_id,
+                    item_id, source_count, "provider-hosted native web search completed"
+                );
+                self.turn
+                    .emitted_items
+                    .push(TurnItem::native_web_search(item_id, record));
+            }
             ModelStreamEvent::ResponseCompleted { end_turn, raw } => {
                 let token_usage = extract_token_usage(&raw);
                 debug!(

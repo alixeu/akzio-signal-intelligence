@@ -300,6 +300,13 @@ pub fn validate_evidence_quality(
         return Err("report must not be empty".to_string());
     }
     if artifact.key_evidence.is_empty() {
+        let explicit_unobserved_gap = artifact.direction == "unobserved"
+            && artifact.confidence.abs() <= f64::EPSILON
+            && (artifact.long_probability - 0.5).abs() <= 0.000001
+            && !artifact.data_gaps.is_empty();
+        if explicit_unobserved_gap {
+            return Ok(());
+        }
         return Err("key_evidence must contain at least one source-backed item".to_string());
     }
 
@@ -760,6 +767,18 @@ mod tests {
         let error = validate_analyst_ticker_artifact(&artifact).unwrap_err();
 
         assert!(error.contains("key_evidence"));
+    }
+
+    #[test]
+    fn analyst_validation_accepts_explicit_unobserved_context_gap() {
+        let mut artifact = valid_analyst_ticker_artifact();
+        artifact.direction = "unobserved".to_string();
+        artifact.confidence = 0.0;
+        artifact.long_probability = 0.5;
+        artifact.key_evidence.clear();
+        artifact.data_gaps = vec!["Current VIX level is unavailable.".to_string()];
+
+        validate_analyst_ticker_artifact(&artifact).unwrap();
     }
 
     #[test]

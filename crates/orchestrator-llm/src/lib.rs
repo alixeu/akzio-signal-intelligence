@@ -18,7 +18,8 @@ use tracing::debug;
 use truncation::TruncationConfig;
 use uuid::Uuid;
 use web_search::{
-    validate_web_search_runtime_config, ExaWebSearchProvider, WebSearchConfig, WebSearchMode,
+    validate_web_search_runtime_config, ExaWebSearchProvider, WebSearchConfig,
+    WebSearchContextSize, WebSearchMode,
 };
 
 pub mod agent_loop;
@@ -103,6 +104,11 @@ impl RoleLlmSettings {
         }
         if self.max_turns == Some(0) {
             bail!("LLM config for role {role:?} requires max_turns >= 1");
+        }
+        if self.native_web_search && self.effective_route() != LlmRoute::Responses {
+            bail!(
+                "LLM config for role {role:?} enables native_web_search but its effective route is not responses"
+            );
         }
         // free_opencode pins base_url / api_key to the opencode Zen gateway, so
         // the configured OpenAI-compatible endpoint credentials are not required.
@@ -234,6 +240,39 @@ impl AgentSettings {
     }
 }
 
+/// Validate the provider-hosted Responses web-search configuration at the
+/// boundary where both the role's LLM settings and its Rust-owned tool
+/// authority are known.  The boolean is deliberately supplied by the caller:
+/// configuration loading gets it from `RoleProfileRegistry`, while execution
+/// gets it from the already-bound tool allowlist.
+pub fn validate_native_web_search_configuration(
+    llm: &RoleLlmSettings,
+    web_search: &WebSearchConfig,
+    role: &str,
+    has_web_run_authority: bool,
+) -> Result<()> {
+    if !llm.native_web_search {
+        return Ok(());
+    }
+    if llm.effective_route() != LlmRoute::Responses {
+        bail!("native_web_search for role {role:?} requires the responses route");
+    }
+    if web_search.mode != WebSearchMode::Live {
+        bail!("native_web_search for role {role:?} requires web_search.mode=live");
+    }
+    if !has_web_run_authority {
+        bail!(
+            "native_web_search for role {role:?} requires a profile that explicitly authorizes web.run"
+        );
+    }
+    if !web_search.blocked_domains.is_empty() {
+        bail!(
+            "native_web_search for role {role:?} cannot honor blocked_domains; use allowed_domains or keep the Exa web.run path"
+        );
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct ForkLoopInput<'a> {
     pub session_id: String,
@@ -262,6 +301,7 @@ pub async fn run_agent_loop_with_metrics(
     prompt: &str,
 ) -> Result<AgentLoopOutput> {
     settings.llm.validate(&settings.role)?;
+    validate_native_web_search_runtime_config(settings)?;
     validate_fallback_web_search_runtime_config(settings)?;
     let session = &settings.session_runtime;
     let session_id = session.manifest().session_id.clone();
@@ -350,6 +390,7 @@ pub async fn run_agent_fork_loop_with_metrics(
     input: ForkLoopInput<'_>,
 ) -> Result<AgentLoopOutput> {
     settings.llm.validate(&settings.role)?;
+    validate_native_web_search_runtime_config(settings)?;
     validate_fallback_web_search_runtime_config(settings)?;
     let session = &settings.session_runtime;
     // Scope resume detection to this turn_id. Using run_id-latest history made
@@ -554,7 +595,7 @@ fn completed_turn_artifact(turn: &Turn) -> Result<Value> {
         response_text.push_str(&serde_json::to_string_pretty(&verified_phase1_ids)?);
     }
     let verified_web_results = verified_web_search_results(turn);
-    if !verified_web_results.is_empty() {
+    if !verified_web_results.is_empty() || has_verified_web_search_activity(turn) {
         response_text.push_str("\n\n");
         response_text.push_str(tools::web_run::VERIFIED_RESULTS_MARKER);
         response_text.push('\n');
@@ -748,7 +789,56 @@ fn verified_web_search_results(turn: &Turn) -> Vec<Value> {
             }
         }
     }
+    for item in turn.emitted_items.iter().filter(|item| {
+        item.item_type == agent_loop::TurnItemType::NativeWebSearch
+            && item.tool_name == "native_web_search"
+    }) {
+        for result in item
+            .content_json
+            .get("results")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(evidence_id) = result
+                .get("evidence_id")
+                .and_then(Value::as_str)
+                .filter(|id| id.starts_with("web-"))
+            else {
+                continue;
+            };
+            let Some(url) = result
+                .get("source_url")
+                .and_then(Value::as_str)
+                .filter(|url| url.starts_with("https://") || url.starts_with("http://"))
+            else {
+                continue;
+            };
+            by_id.entry(evidence_id.to_owned()).or_insert_with(|| {
+                json!({
+                    "evidence_id": evidence_id,
+                    "source_url": url,
+                    "title": result.get("title").cloned().unwrap_or(Value::Null),
+                    "published_at": result.get("published_at").cloned().unwrap_or(Value::Null),
+                    "provider": result.get("provider").cloned().unwrap_or(Value::Null),
+                    "citation": result.get("citation").cloned().unwrap_or(Value::Null),
+                })
+            });
+        }
+    }
     by_id.into_values().collect()
+}
+
+fn has_verified_web_search_activity(turn: &Turn) -> bool {
+    turn.emitted_items.iter().any(|item| {
+        (item.item_type == agent_loop::TurnItemType::ToolResult
+            && matches!(
+                item.tool_name.as_str(),
+                tools::web_run::NAME | tools::verify_event::NAME
+            ))
+            || (item.item_type == agent_loop::TurnItemType::NativeWebSearch
+                && item.tool_name == "native_web_search")
+    })
 }
 
 /// Terminal tools own their artifact shape, but their output alone does not
@@ -1418,6 +1508,7 @@ fn web_run_runtime_for_settings(settings: &AgentSettings) -> Option<tools::WebRu
 
 fn uses_native_web_search(settings: &AgentSettings) -> bool {
     settings.llm.native_web_search
+        && settings.web_search.mode == WebSearchMode::Live
         && settings
             .llm
             .tools
@@ -1450,6 +1541,49 @@ fn validate_fallback_web_search_runtime_config(settings: &AgentSettings) -> Resu
     } else {
         Ok(())
     }
+}
+
+fn validate_native_web_search_runtime_config(settings: &AgentSettings) -> Result<()> {
+    validate_native_web_search_configuration(
+        &settings.llm,
+        &settings.web_search,
+        &settings.role,
+        settings
+            .llm
+            .tools
+            .iter()
+            .any(|name| name == tools::web_run::NAME),
+    )
+}
+
+fn native_web_search_tool(
+    settings: &AgentSettings,
+) -> Result<Option<async_openai::types::responses::Tool>> {
+    use async_openai::types::responses::{
+        Tool, WebSearchTool, WebSearchToolFilters, WebSearchToolSearchContextSize,
+    };
+
+    if !settings.llm.native_web_search {
+        return Ok(None);
+    }
+    validate_native_web_search_runtime_config(settings)?;
+    if !uses_native_web_search(settings) {
+        return Ok(None);
+    }
+    let search_context_size = match settings.web_search.context_size {
+        WebSearchContextSize::Low => WebSearchToolSearchContextSize::Low,
+        WebSearchContextSize::Medium => WebSearchToolSearchContextSize::Medium,
+        WebSearchContextSize::High => WebSearchToolSearchContextSize::High,
+    };
+    let filters = (!settings.web_search.allowed_domains.is_empty()).then(|| WebSearchToolFilters {
+        allowed_domains: Some(settings.web_search.allowed_domains.clone()),
+    });
+    Ok(Some(Tool::WebSearch(WebSearchTool {
+        filters,
+        user_location: None,
+        search_context_size: Some(search_context_size),
+        search_content_types: None,
+    })))
 }
 
 async fn run_model_text_once(
@@ -1695,10 +1829,10 @@ fn build_responses_request(
         builder = builder.include(vec![IncludeEnum::ReasoningEncryptedContent]);
     }
 
-    if with_tools && uses_native_web_search(settings) {
-        tool_defs.push(Tool::WebSearch(
-            WebSearchToolArgs::default().build().unwrap(),
-        ));
+    if with_tools {
+        if let Some(native_web_search) = native_web_search_tool(settings)? {
+            tool_defs.push(native_web_search);
+        }
     }
     let tool_count = tool_defs.len();
     if !tool_defs.is_empty() {
@@ -1908,6 +2042,13 @@ fn build_chat_completions_request(
                     ToolChoiceOptions::Auto,
                 ));
         }
+    }
+
+    if settings.role == "compressor.phase_summary" && input.available_tools.is_empty() {
+        // Phase Summary has a strict JSON artifact contract and no tool-call
+        // protocol to preserve. Ask Chat Completions to enforce valid JSON at
+        // the transport boundary instead of relying on a corrective retry.
+        builder = builder.response_format(ResponseFormat::JsonObject);
     }
 
     let has_reasoning = if let Some(effort) = build_chat_reasoning_effort(settings) {
@@ -2351,6 +2492,18 @@ async fn stream_responses_once(
             }
             ResponseStreamEvent::ResponseCompleted(ev) => {
                 saw_response_completed = true;
+                if uses_native_web_search(settings) {
+                    let record = native_web_search_record(&ev.response)
+                        .map_err(|error| (error, made_progress))?;
+                    made_progress = true;
+                    handler
+                        .handle(ModelStreamEvent::NativeWebSearchCompleted {
+                            item_id: format!("native-web-search-{}", ev.response.id),
+                            record,
+                        })
+                        .await
+                        .map_err(|error| (error, made_progress))?;
+                }
                 final_raw = response_usage_to_raw(&ev.response);
             }
             _ => {}
@@ -2430,6 +2583,33 @@ async fn stream_chat_completions_with_retry(
     }
 }
 
+struct PendingChatToolCall {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+fn merge_chat_tool_call_delta(
+    pending: &mut PendingChatToolCall,
+    chunk: &async_openai::types::chat::ChatCompletionMessageToolCallChunk,
+) {
+    if let Some(id) = chunk.id.as_deref().filter(|id| !id.trim().is_empty()) {
+        pending.id = id.to_owned();
+    }
+    if let Some(function) = chunk.function.as_ref() {
+        if let Some(name) = function
+            .name
+            .as_deref()
+            .filter(|name| !name.trim().is_empty())
+        {
+            pending.name = name.to_owned();
+        }
+        if let Some(arguments) = function.arguments.as_deref() {
+            pending.arguments.push_str(arguments);
+        }
+    }
+}
+
 async fn stream_chat_completions_once(
     settings: &AgentSettings,
     input: &agent_loop::ModelInput,
@@ -2464,12 +2644,7 @@ async fn stream_chat_completions_once(
     let mut saw_terminal_finish = false;
     let mut truncated_by_length = false;
 
-    struct PendingToolCall {
-        id: String,
-        name: String,
-        arguments: String,
-    }
-    let mut pending_tool_calls: std::collections::HashMap<u32, PendingToolCall> =
+    let mut pending_tool_calls: std::collections::HashMap<u32, PendingChatToolCall> =
         std::collections::HashMap::new();
 
     while let Some(event) = stream.next().await {
@@ -2555,22 +2730,12 @@ async fn stream_chat_completions_once(
                     let pending =
                         pending_tool_calls
                             .entry(idx)
-                            .or_insert_with(|| PendingToolCall {
+                            .or_insert_with(|| PendingChatToolCall {
                                 id: String::new(),
                                 name: String::new(),
                                 arguments: String::new(),
                             });
-                    if let Some(id) = &tc_chunk.id {
-                        pending.id = id.clone();
-                    }
-                    if let Some(func) = &tc_chunk.function {
-                        if let Some(name) = &func.name {
-                            pending.name = name.clone();
-                        }
-                        if let Some(args) = &func.arguments {
-                            pending.arguments.push_str(args);
-                        }
-                    }
+                    merge_chat_tool_call_delta(pending, tc_chunk);
                 }
             }
 
@@ -2714,6 +2879,102 @@ fn response_usage_to_raw(response: &async_openai::types::responses::Response) ->
         }
         None => Value::Null,
     }
+}
+
+/// Extract Rust-observed provenance from a completed provider-hosted Responses
+/// web-search-capable response. The provider owns the search calls; recording
+/// them as a local function call would create an invalid transcript on the next
+/// model iteration, so they are persisted in a dedicated turn item. An empty
+/// call list is also retained: a Web-enabled role may not turn an unsearched
+/// URL into evidence.
+fn native_web_search_record(response: &async_openai::types::responses::Response) -> Result<Value> {
+    let raw = serde_json::to_value(response)
+        .context("failed to serialize completed Responses payload for native web provenance")?;
+    Ok(native_web_search_record_from_value(&raw))
+}
+
+fn native_web_search_record_from_value(raw: &Value) -> Value {
+    let output = raw
+        .get("output")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut search_calls = Vec::new();
+    let mut citations = BTreeMap::<String, Value>::new();
+
+    for item in &output {
+        if item.get("type").and_then(Value::as_str) == Some("web_search_call") {
+            search_calls.push(json!({
+                "id": item.get("id").cloned().unwrap_or(Value::Null),
+                "status": item.get("status").cloned().unwrap_or(Value::Null),
+                "action": item.get("action").cloned().unwrap_or(Value::Null),
+            }));
+        }
+        if item.get("type").and_then(Value::as_str) != Some("message") {
+            continue;
+        }
+        for content in item
+            .get("content")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if content.get("type").and_then(Value::as_str) != Some("output_text") {
+                continue;
+            }
+            for annotation in content
+                .get("annotations")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if annotation.get("type").and_then(Value::as_str) != Some("url_citation") {
+                    continue;
+                }
+                let Some(url) = annotation
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|url| url.starts_with("https://") || url.starts_with("http://"))
+                else {
+                    continue;
+                };
+                let title = annotation
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|title| !title.is_empty())
+                    .unwrap_or_default();
+                let evidence_id = web_search::stable_search_ref_id(&web_search::SearchResult {
+                    ref_id: String::new(),
+                    title: title.to_owned(),
+                    url: url.to_owned(),
+                    snippet: String::new(),
+                    published_at: None,
+                    source: None,
+                });
+                citations.entry(url.to_owned()).or_insert_with(|| {
+                    json!({
+                        "evidence_id": evidence_id,
+                        "source_url": url,
+                        "title": (!title.is_empty()).then_some(title),
+                        "published_at": Value::Null,
+                        "provider": "openai_responses_web_search",
+                        "citation": true,
+                    })
+                });
+            }
+        }
+    }
+
+    json!({
+        "provider": "openai_responses_web_search",
+        "response_id": raw.get("id").cloned().unwrap_or(Value::Null),
+        "created_at": raw.get("created_at").cloned().unwrap_or(Value::Null),
+        "completed_at": raw.get("completed_at").cloned().unwrap_or(Value::Null),
+        "search_calls": search_calls,
+        "results": citations.into_values().collect::<Vec<_>>(),
+    })
 }
 
 fn extract_encrypted_reasoning(raw: &Value) -> Option<String> {
@@ -2891,8 +3152,9 @@ fn default_tool_config() -> tools::ExternalToolConfig {
 mod tests {
     use super::{
         agent_loop, is_permanent_llm_error_text, is_recoverable_length_finish,
-        is_transient_llm_error, tools, AgentSettings, LlmRoute, LlmTransport, RoleLlmSettings,
-        ToolManagedProfile, ToolResultItem, TruncationConfig,
+        is_transient_llm_error, merge_chat_tool_call_delta, tools, AgentSettings, LlmRoute,
+        LlmTransport, PendingChatToolCall, RoleLlmSettings, ToolManagedProfile, ToolResultItem,
+        TruncationConfig,
     };
     use crate::web_search::{WebSearchConfig, WebSearchMode};
     use anyhow::anyhow;
@@ -2949,6 +3211,69 @@ mod tests {
         assert!(is_recoverable_length_finish(true, false));
         assert!(!is_recoverable_length_finish(false, false));
         assert!(!is_recoverable_length_finish(true, true));
+    }
+
+    #[test]
+    fn chat_tool_call_merge_preserves_metadata_when_follow_up_delta_is_empty() {
+        let first: async_openai::types::chat::ChatCompletionMessageToolCallChunk =
+            serde_json::from_value(json!({
+                "index": 0,
+                "id": "call-123",
+                "type": "function",
+                "function": {
+                    "name": "read_technical_detail",
+                    "arguments": ""
+                }
+            }))
+            .unwrap();
+        let follow_up: async_openai::types::chat::ChatCompletionMessageToolCallChunk =
+            serde_json::from_value(json!({
+                "index": 0,
+                "id": "",
+                "function": {
+                    "name": "",
+                    "arguments": "{\"ticker\":\"QQQ\"}"
+                }
+            }))
+            .unwrap();
+        let mut pending = PendingChatToolCall {
+            id: String::new(),
+            name: String::new(),
+            arguments: String::new(),
+        };
+
+        merge_chat_tool_call_delta(&mut pending, &first);
+        merge_chat_tool_call_delta(&mut pending, &follow_up);
+
+        assert_eq!(pending.id, "call-123");
+        assert_eq!(pending.name, "read_technical_detail");
+        assert_eq!(pending.arguments, r#"{"ticker":"QQQ"}"#);
+    }
+
+    #[test]
+    fn phase_summary_chat_request_requires_json_object_without_tools() {
+        let mut settings = base_settings(LlmRoute::ChatCompletions);
+        settings.role = "compressor.phase_summary".to_owned();
+        let input = agent_loop::ModelInput {
+            system_instruction: None,
+            items: vec![agent_loop::TurnItem::user("summary input")],
+            available_tools: Vec::new(),
+            truncation: TruncationConfig::default(),
+        };
+
+        let request = super::build_chat_completions_request(
+            &settings,
+            &input,
+            "return the phase summary as JSON",
+            true,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(
+            serde_json::to_value(request).unwrap()["response_format"],
+            json!({"type": "json_object"})
+        );
     }
 
     fn base_settings(route: LlmRoute) -> AgentSettings {
@@ -4096,7 +4421,7 @@ mod tests {
     #[test]
     fn native_web_search_suppresses_web_run_fallback_tool() {
         let mut settings = base_settings(LlmRoute::Responses);
-        settings.role = "analyst.news_macro".to_string();
+        settings.role = "researcher.web_evidence".to_string();
         settings.llm.base_url = Some("https://llm.example.com/v1".to_string());
         settings.llm.api_key = Some("test-key".to_string());
         settings.llm.think_tool = false;
@@ -4111,9 +4436,12 @@ mod tests {
     #[test]
     fn native_web_search_is_added_without_discarding_function_tools() {
         let mut settings = base_settings(LlmRoute::Responses);
-        settings.role = "analyst.news_macro".to_string();
+        settings.role = "researcher.web_evidence".to_string();
         settings.llm.native_web_search = true;
         settings.llm.tools = vec![tools::web_run::NAME.to_owned()];
+        settings.web_search.mode = WebSearchMode::Live;
+        settings.web_search.context_size = crate::web_search::WebSearchContextSize::High;
+        settings.web_search.allowed_domains = vec!["sec.gov".to_string()];
         let input = agent_loop::ModelInput {
             system_instruction: None,
             items: vec![agent_loop::TurnItem::user("research")],
@@ -4128,7 +4456,166 @@ mod tests {
             .cloned()
             .unwrap();
         assert!(tools.iter().any(|tool| tool["type"] == "function"));
-        assert!(tools.iter().any(|tool| tool["type"] == "web_search"));
+        let web_search = tools
+            .iter()
+            .find(|tool| tool["type"] == "web_search")
+            .expect("Responses request must contain native web_search");
+        assert_eq!(web_search["search_context_size"], "high");
+        assert_eq!(web_search["filters"]["allowed_domains"], json!(["sec.gov"]));
+    }
+
+    #[test]
+    fn native_web_search_requires_responses_live_and_role_authority() {
+        let mut settings = base_settings(LlmRoute::ChatCompletions);
+        settings.llm.native_web_search = true;
+        settings.llm.base_url = Some("https://llm.example.com/v1".to_string());
+        settings.llm.api_key = Some("test-key".to_string());
+        assert!(settings
+            .llm
+            .validate("researcher.web_evidence")
+            .unwrap_err()
+            .to_string()
+            .contains("effective route is not responses"));
+
+        let mut settings = base_settings(LlmRoute::Responses);
+        settings.llm.native_web_search = true;
+        settings.web_search.mode = WebSearchMode::Live;
+        super::validate_native_web_search_configuration(
+            &settings.llm,
+            &settings.web_search,
+            "researcher.web_evidence",
+            true,
+        )
+        .unwrap();
+
+        assert!(super::validate_native_web_search_configuration(
+            &settings.llm,
+            &settings.web_search,
+            "trader",
+            false,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("explicitly authorizes web.run"));
+
+        settings.web_search.blocked_domains = vec!["example.com".to_string()];
+        assert!(super::validate_native_web_search_configuration(
+            &settings.llm,
+            &settings.web_search,
+            "researcher.web_evidence",
+            true,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("cannot honor blocked_domains"));
+    }
+
+    #[test]
+    fn native_web_search_citations_become_stable_rust_owned_records() {
+        let record = super::native_web_search_record_from_value(&json!({
+            "id": "resp-native-1",
+            "created_at": 1_754_000_000,
+            "completed_at": 1_754_000_005,
+            "output": [
+                {
+                    "type": "web_search_call",
+                    "id": "ws-1",
+                    "status": "completed",
+                    "action": {
+                        "type": "search",
+                        "query": "SEC ETF filing",
+                        "sources": [{"type": "url", "url": "https://www.sec.gov/example"}]
+                    }
+                },
+                {
+                    "type": "message",
+                    "id": "msg-1",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "Verified filing.",
+                        "annotations": [{
+                            "type": "url_citation",
+                            "start_index": 0,
+                            "end_index": 16,
+                            "title": "SEC filing",
+                            "url": "https://www.sec.gov/example"
+                        }]
+                    }]
+                }
+            ]
+        }));
+
+        assert_eq!(record["provider"], "openai_responses_web_search");
+        assert_eq!(
+            record["search_calls"][0]["action"]["query"],
+            "SEC ETF filing"
+        );
+        assert_eq!(
+            record["results"][0]["source_url"],
+            "https://www.sec.gov/example"
+        );
+        assert!(record["results"][0]["evidence_id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("web-") && id.len() == 68));
+
+        let mut turn = agent_loop::Turn::new(
+            "turn-native",
+            "session-native",
+            "run-native",
+            "researcher.web_evidence",
+            "",
+        );
+        turn.emitted_items
+            .push(agent_loop::TurnItem::native_web_search(
+                "native-web-search-resp-native-1",
+                record,
+            ));
+        let mut final_message = agent_loop::TurnItem::assistant("{}", Value::Null);
+        final_message.phase = Some(agent_loop::AgentItemPhase::Final);
+        turn.emitted_items.push(final_message);
+
+        let artifact = super::completed_turn_artifact(&turn).unwrap();
+        let response_text = artifact["response_text"].as_str().unwrap();
+        assert!(response_text.contains(tools::web_run::VERIFIED_RESULTS_MARKER));
+        assert!(response_text.contains("https://www.sec.gov/example"));
+    }
+
+    #[test]
+    fn native_web_search_records_an_empty_attempt_for_fail_closed_evidence() {
+        let record = super::native_web_search_record_from_value(&json!({
+            "id": "resp-native-empty",
+            "created_at": 1_754_000_000,
+            "output": [{
+                "type": "message",
+                "id": "msg-empty",
+                "content": [{
+                    "type": "output_text",
+                    "text": "No source was searched.",
+                    "annotations": []
+                }]
+            }]
+        }));
+        assert_eq!(record["search_calls"], json!([]));
+        assert_eq!(record["results"], json!([]));
+
+        let mut turn = agent_loop::Turn::new(
+            "turn-empty",
+            "session-empty",
+            "run-empty",
+            "researcher.web_evidence",
+            "",
+        );
+        turn.emitted_items
+            .push(agent_loop::TurnItem::native_web_search(
+                "native-web-search-resp-native-empty",
+                record,
+            ));
+        let mut final_message = agent_loop::TurnItem::assistant("{}", Value::Null);
+        final_message.phase = Some(agent_loop::AgentItemPhase::Final);
+        turn.emitted_items.push(final_message);
+
+        let artifact = super::completed_turn_artifact(&turn).unwrap();
+        assert!(artifact["response_text"].as_str().unwrap().ends_with("[]"));
     }
 
     #[test]

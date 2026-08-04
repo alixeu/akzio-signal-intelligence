@@ -5,6 +5,7 @@ use orchestrator_core::{
 };
 use orchestrator_llm::{
     truncation::TruncationConfig,
+    validate_native_web_search_configuration,
     web_search::{validate_web_search_runtime_config, WebSearchConfig, WebSearchConfigOverride},
     RoleLlmSettings,
 };
@@ -484,6 +485,7 @@ impl RuntimeConfig {
         }
         let workflow = WorkflowConfig::from_value(config);
         let role_profile_registry = RoleProfileRegistry::builtin();
+        validate_native_web_search_roles(&llm_roles, &web_search, &role_profile_registry)?;
         let alpaca_api_key = config_str(config, "orchestrator.alpaca.api_key", "")
             .trim()
             .to_string();
@@ -689,6 +691,24 @@ pub(crate) fn web_search_by_role_from_config<'a>(
         web_search.insert(role.clone(), effective);
     }
     Ok(web_search)
+}
+
+fn validate_native_web_search_roles(
+    llm_roles: &BTreeMap<String, RoleLlmSettings>,
+    web_search: &BTreeMap<String, WebSearchConfig>,
+    role_profile_registry: &RoleProfileRegistry,
+) -> Result<()> {
+    for (role, llm) in llm_roles {
+        let search = web_search
+            .get(role)
+            .with_context(|| format!("missing Web search config for role {role:?}"))?;
+        let has_web_run_authority = role_profile_registry
+            .registrations()
+            .filter(|registration| registration.role_id == *role)
+            .any(|registration| registration.allows_tool(orchestrator_llm::tools::web_run::NAME));
+        validate_native_web_search_configuration(llm, search, role, has_web_run_authority)?;
+    }
+    Ok(())
 }
 
 fn web_search_config_at_path(config: &Value, path: &str) -> Result<Option<WebSearchConfig>> {
@@ -1178,5 +1198,47 @@ mod tests {
             .unwrap()
             .allows_tool("read_reflection_source"));
         assert_eq!(roles["researcher.bull"]["web_search"]["mode"], "disabled");
+    }
+
+    #[test]
+    fn native_responses_web_search_is_limited_to_evidence_research_role() {
+        let config = json!({
+            "orchestrator": {
+                "llm": {
+                    "defaults": {
+                        "route": "responses",
+                        "model": "gpt-5.6-luna",
+                        "base_url": "https://llm.example.com/v1",
+                        "api_key": "test-key"
+                    },
+                    "roles": {
+                        "researcher.web_evidence": {
+                            "native_web_search": true
+                        }
+                    }
+                },
+                "web_search": {"mode": "live"}
+            }
+        });
+        let roles = llm_roles_from_config(&config).unwrap();
+        let web_search = web_search_by_role_from_config(&config, roles.iter()).unwrap();
+        validate_native_web_search_roles(&roles, &web_search, &RoleProfileRegistry::builtin())
+            .unwrap();
+        assert!(roles["researcher.web_evidence"].native_web_search);
+
+        let mut invalid = config;
+        invalid["orchestrator"]["llm"]["roles"]["trader"] = json!({
+            "native_web_search": true
+        });
+        let roles = llm_roles_from_config(&invalid).unwrap();
+        let web_search = web_search_by_role_from_config(&invalid, roles.iter()).unwrap();
+        assert!(validate_native_web_search_roles(
+            &roles,
+            &web_search,
+            &RoleProfileRegistry::builtin(),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("explicitly authorizes web.run"));
     }
 }

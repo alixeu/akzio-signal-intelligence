@@ -18,6 +18,10 @@ pub enum TurnItemType {
     PlanUpdate,
     ToolCall,
     ToolResult,
+    /// Rust-observed output from the provider-hosted Responses `web_search`
+    /// tool. It is persisted for provenance but never replayed as a function
+    /// call or a user message on a later model iteration.
+    NativeWebSearch,
     SystemContext,
     DeveloperContext,
     CompactSummary,
@@ -34,6 +38,7 @@ impl TurnItemType {
             Self::PlanUpdate => "plan_update",
             Self::ToolCall => "tool_call",
             Self::ToolResult => "tool_result",
+            Self::NativeWebSearch => "native_web_search",
             Self::SystemContext => "system_context",
             Self::DeveloperContext => "developer_context",
             Self::CompactSummary => "compact_summary",
@@ -334,6 +339,30 @@ impl TurnItem {
             db_row_id: None,
         }
     }
+
+    /// Persist provider-hosted web-search provenance without fabricating a
+    /// function-call/tool-result pair. Responses manages this tool internally,
+    /// so replaying it as a function output would corrupt the next request.
+    pub fn native_web_search(output_item_id: impl Into<String>, record: Value) -> Self {
+        let output_item_id = output_item_id.into();
+        Self {
+            item_type: TurnItemType::NativeWebSearch,
+            role: "tool".to_string(),
+            content_text: "OpenAI Responses native web_search completed".to_string(),
+            content_json: merge_item_metadata(
+                record,
+                &output_item_id,
+                None,
+                AgentItemStatus::Completed,
+            ),
+            tool_call_id: String::new(),
+            tool_name: "native_web_search".to_string(),
+            output_item_id,
+            phase: None,
+            status: Some(AgentItemStatus::Completed),
+            db_row_id: None,
+        }
+    }
 }
 
 pub(super) fn merge_item_metadata(
@@ -516,6 +545,13 @@ pub enum ModelStreamEvent {
     },
     ToolCallCompleted {
         tool_call: ToolCallRequest,
+    },
+    /// Completed evidence/provenance from a provider-hosted Responses
+    /// `web_search` tool. Unlike `ToolCallCompleted`, this does not require a
+    /// local function response or a follow-up model turn.
+    NativeWebSearchCompleted {
+        item_id: String,
+        record: Value,
     },
     ResponseCompleted {
         end_turn: bool,

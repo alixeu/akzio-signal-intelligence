@@ -72,6 +72,10 @@ pub(crate) struct RoleJob {
     pub truncation: TruncationConfig,
     pub retrieval_policy: RetrievalPolicy,
     pub context_manifest: Value,
+    /// Stable identity for one Phase 2 STree mailbox delivery. Retries of the
+    /// same delivery reuse it, while later deliveries in the same role/round
+    /// receive a new turn in the existing session.
+    pub phase2_turn_key: Option<String>,
 }
 
 #[derive(Debug)]
@@ -174,6 +178,16 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
         prompt_path,
     } = input;
     let debug_enabled = state.get("debug").and_then(Value::as_bool).unwrap_or(false);
+    let phase2_turn_key = (phase == 2 && kind == "stree_turn")
+        .then(|| {
+            state
+                .get("_phase2_stree_dispatch_key")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+        })
+        .flatten();
     let alpaca_market_data = role == "analyst.news_macro" && !mock && !debug_enabled;
     let tickers = tickers_from_state(&state);
     let tool_tickers = if role == "portfolio.manager" {
@@ -421,6 +435,7 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
         truncation: config.truncation.clone(),
         retrieval_policy: retrieval_policy_for_role(role, kind, &config.retrieval),
         context_manifest: direct_context_manifest(&state, phase),
+        phase2_turn_key,
     })
 }
 
@@ -669,17 +684,20 @@ fn normalize_web_evidence_packet(response_text: &str, request_id: &str) -> Resul
     let start = response_text
         .find('{')
         .context("Web evidence response must contain one JSON object")?;
-    let end = response_text
-        .rfind('}')
+    // The agent loop appends Rust-owned Web provenance after the model's JSON
+    // response. Decode the first complete JSON value rather than extending the
+    // model object through that attachment.
+    let mut values =
+        serde_json::Deserializer::from_str(&response_text[start..]).into_iter::<Value>();
+    let value = values
+        .next()
+        .transpose()
+        .context("Web evidence response is not valid JSON")?
         .context("Web evidence response must contain one JSON object")?;
-    if end < start {
-        bail!("Web evidence response JSON object is malformed");
-    }
-    let value: Value = serde_json::from_str(&response_text[start..=end])
-        .context("Web evidence response is not valid JSON")?;
     let object = value
         .as_object()
         .context("Web evidence response must be a JSON object")?;
+    let verified_source_urls = verified_web_source_urls(response_text)?;
     let status = required_string(object, "status", 20)?;
     if !matches!(
         status.as_str(),
@@ -696,6 +714,7 @@ fn normalize_web_evidence_packet(response_text: &str, request_id: &str) -> Resul
         &retrieved_at,
         &mut seen_ids,
         &mut evidence_limit,
+        verified_source_urls.as_ref(),
     )?;
     let mut counter_limit = 5usize;
     let mut counterevidence = normalize_web_evidence_items(
@@ -704,6 +723,7 @@ fn normalize_web_evidence_packet(response_text: &str, request_id: &str) -> Resul
         &retrieved_at,
         &mut seen_ids,
         &mut counter_limit,
+        verified_source_urls.as_ref(),
     )?;
     if evidence.len() + counterevidence.len() > 5 {
         if evidence.is_empty() {
@@ -738,6 +758,7 @@ fn normalize_web_evidence_items(
     retrieved_at: &str,
     seen_ids: &mut BTreeSet<String>,
     remaining: &mut usize,
+    verified_source_urls: Option<&BTreeSet<String>>,
 ) -> Result<Vec<Value>> {
     let items = value.and_then(Value::as_array).cloned().unwrap_or_default();
     let mut normalized = Vec::new();
@@ -756,6 +777,11 @@ fn normalize_web_evidence_items(
         let source_url = required_string(object, "source_url", 1_000)?;
         if !source_url.starts_with("https://") && !source_url.starts_with("http://") {
             bail!("Web evidence source_url must use http or https");
+        }
+        if verified_source_urls.is_some_and(|urls| !urls.contains(&source_url)) {
+            bail!(
+                "Web evidence source_url was not present in the Rust-verified Web search results"
+            );
         }
         let publisher = required_string(object, "publisher", 200)?;
         let source_tier = required_string(object, "source_tier", 20)?;
@@ -801,6 +827,27 @@ fn normalize_web_evidence_items(
         *remaining -= 1;
     }
     Ok(normalized)
+}
+
+fn verified_web_source_urls(response_text: &str) -> Result<Option<BTreeSet<String>>> {
+    let marker = orchestrator_llm::tools::web_run::VERIFIED_RESULTS_MARKER;
+    let Some((_, registry_json)) = response_text.rsplit_once(marker) else {
+        return Ok(None);
+    };
+    let results: Vec<Value> = serde_json::from_str(registry_json.trim())
+        .context("Rust-verified Web search result attachment is malformed")?;
+    Ok(Some(
+        results
+            .into_iter()
+            .filter_map(|result| {
+                result
+                    .get("source_url")
+                    .and_then(Value::as_str)
+                    .filter(|url| url.starts_with("https://") || url.starts_with("http://"))
+                    .map(ToOwned::to_owned)
+            })
+            .collect(),
+    ))
 }
 
 fn required_string(object: &Map<String, Value>, field: &str, max_chars: usize) -> Result<String> {
@@ -2060,7 +2107,7 @@ fn debug_prompt_path_from_runtime_path(path: &str) -> Option<PathBuf> {
         })
 }
 
-fn refresh_role_job_metrics(state: &mut Value) {
+pub(crate) fn refresh_role_job_metrics(state: &mut Value) {
     let jobs = state
         .get("role_job_metrics")
         .and_then(Value::as_array)
@@ -2115,6 +2162,7 @@ fn is_transient_role_error(message: &str) -> bool {
         || text.contains("transport error")
         || text.contains("error decoding response body")
         || text.contains("temporarily unavailable")
+        || text.contains("without a terminal finish_reason")
         || text.contains("internal_server_error")
         || text.contains("\"type\":\"server_error\"")
         || text.contains("upstream_error")
@@ -2320,7 +2368,7 @@ async fn execute_role_job(job: RoleJob) -> Result<AgentLoopOutput> {
     );
     let mut output = if let Some(phase2_context) = phase2_context {
         let session_id = settings.session_runtime.manifest().session_id.clone();
-        let turn_id = format!("turn-{}", md5_3(&session_id));
+        let turn_id = role_turn_id(&session_id, job.phase2_turn_key.as_deref());
         let fork_from_turn_id = phase2_context
             .get("fork_from_turn_id")
             .and_then(Value::as_str)
@@ -2350,6 +2398,13 @@ async fn execute_role_job(job: RoleJob) -> Result<AgentLoopOutput> {
     };
     output.artifact["context_manifest"] = job.context_manifest;
     Ok(output)
+}
+
+fn role_turn_id(session_id: &str, phase2_turn_key: Option<&str>) -> String {
+    let turn_identity = phase2_turn_key
+        .map(|key| format!("{session_id}:{key}"))
+        .unwrap_or_else(|| session_id.to_owned());
+    format!("turn-{}", md5_3(&turn_identity))
 }
 
 fn mock_free_text_output(job: RoleJob) -> AgentLoopOutput {
@@ -2550,6 +2605,56 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("http"));
+    }
+
+    #[test]
+    fn web_evidence_packet_reads_model_json_before_runtime_provenance() {
+        let model_response = json!({
+            "status": "supported",
+            "evidence": [{
+                "claim": "The filing is available.",
+                "relation": "supports",
+                "source_url": "https://www.sec.gov/example",
+                "publisher": "SEC",
+                "published_at": null,
+                "source_tier": "primary"
+            }],
+            "counterevidence": []
+        });
+        let response = format!(
+            "{}\n\n{}\n{}",
+            model_response,
+            orchestrator_llm::tools::web_run::VERIFIED_RESULTS_MARKER,
+            json!([{
+                "evidence_id": "web-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "source_url": "https://www.sec.gov/example",
+                "title": "SEC filing"
+            }])
+        );
+
+        let packet = normalize_web_evidence_packet(&response, "request-1").unwrap();
+        assert_eq!(packet["source_count"], 1);
+        assert_eq!(
+            packet["evidence"][0]["source_url"],
+            "https://www.sec.gov/example"
+        );
+
+        let unverified_response = format!(
+            "{}\n\n{}\n{}",
+            model_response,
+            orchestrator_llm::tools::web_run::VERIFIED_RESULTS_MARKER,
+            json!([{
+                "evidence_id": "web-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "source_url": "https://unverified.example",
+                "title": "different source"
+            }])
+        );
+        assert!(
+            normalize_web_evidence_packet(&unverified_response, "request-1")
+                .unwrap_err()
+                .to_string()
+                .contains("Rust-verified Web search results")
+        );
     }
 
     #[test]
@@ -2856,6 +2961,23 @@ mod tests {
         assert!(is_transient_role_error(
             "Chat Completions stream chunk failed: stream failed: EventStream error: Transport error: error decoding response body"
         ));
+    }
+
+    #[test]
+    fn missing_chat_terminal_finish_is_transient_role_error() {
+        assert!(is_transient_role_error(
+            "Chat Completions stream ended without a terminal finish_reason after 1121 chunks"
+        ));
+    }
+
+    #[test]
+    fn phase2_delivery_turn_keys_are_stable_for_retries_and_distinct_between_deliveries() {
+        let first = role_turn_id("session", Some("delivery-a"));
+        let retry = role_turn_id("session", Some("delivery-a"));
+        let next = role_turn_id("session", Some("delivery-b"));
+
+        assert_eq!(first, retry);
+        assert_ne!(first, next);
     }
 
     #[test]

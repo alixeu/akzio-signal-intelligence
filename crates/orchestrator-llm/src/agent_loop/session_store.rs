@@ -125,7 +125,9 @@ impl FileStoreSessionRuntime {
             | TurnItemType::ReasoningState
             | TurnItemType::PlanUpdate => SessionEventType::Assistant,
             TurnItemType::ToolCall => SessionEventType::ToolCall,
-            TurnItemType::ToolResult => SessionEventType::ToolResult,
+            TurnItemType::ToolResult | TurnItemType::NativeWebSearch => {
+                SessionEventType::ToolResult
+            }
             TurnItemType::SystemContext
             | TurnItemType::DeveloperContext
             | TurnItemType::CompactSummary

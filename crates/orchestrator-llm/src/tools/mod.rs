@@ -306,7 +306,7 @@ fn chat_completions_tool_definition(
     Some(async_openai::types::chat::ChatCompletionTools::Function(
         async_openai::types::chat::ChatCompletionTool {
             function: async_openai::types::chat::FunctionObject {
-                name: core.name,
+                name: api_tool_name(&core.name),
                 description: Some(core.description),
                 parameters: Some(core.parameters),
                 strict: Some(false),
@@ -467,5 +467,19 @@ mod tests {
                 "registered tool {tool} has neither a Role/Profile owner nor an explicit runtime-only path"
             );
         }
+    }
+
+    #[test]
+    fn chat_completion_tool_names_are_api_safe_and_round_trip() {
+        let definitions = chat_completions_tool_definitions(&[web_run::NAME.to_owned()]);
+        let definition = serde_json::to_value(definitions)
+            .expect("Chat Completions tool definitions should serialize");
+        let api_name = definition[0]["function"]["name"]
+            .as_str()
+            .expect("function name should be a string");
+
+        assert_eq!(api_name, "web_run");
+        assert_eq!(resolve_tool_name(api_name), web_run::NAME);
+        assert!(!api_name.contains('.'));
     }
 }
