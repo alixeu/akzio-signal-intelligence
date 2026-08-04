@@ -118,7 +118,8 @@ orchestrator:
       #   (https://opencode.ai/zen/v1) 的 deepseek-v4-flash-free 模型，并自动附带
       #   opencode 所需的全部请求头。设为 false 时回退到常规 gateway 配置。
       free_opencode: false
-      route: chat_completions
+      route: responses
+      native_web_search: true
       model: gpt-5.6-luna
       base_url: *llm_gateway_base_url
       api_key: *llm_gateway_api_key

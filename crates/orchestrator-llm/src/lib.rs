@@ -6,7 +6,7 @@ use anyhow::{bail, Context, Result};
 use async_openai::{config::OpenAIConfig, Client as OpenAIClient};
 use futures::StreamExt;
 use orchestrator_core::{default_project_root, ToolManagedProfile};
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -1622,10 +1622,14 @@ async fn run_responses_text_once(
     debug!(role = %settings.role, "sending non-streaming Responses API request");
     let response = client
         .responses()
-        .create(request)
+        .create_byot::<_, Value>(request)
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))
         .context("OpenAI-compatible Responses prompt failed")?;
+    let response: async_openai::types::responses::Response =
+        deserialize_responses_payload(response)
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .context("OpenAI-compatible Responses response payload failed")?;
     let text = response.output_text().unwrap_or_default();
     debug!(
         role = %settings.role,
@@ -1634,6 +1638,101 @@ async fn run_responses_text_once(
         "non-streaming Responses API completed"
     );
     Ok(text)
+}
+
+/// Some OpenAI-compatible Responses gateways omit fields that the
+/// async-openai response models treat as required. Keep the compatibility
+/// shim at the wire boundary so the rest of the workflow can continue using
+/// typed SDK values and native web-search citation handling.
+fn normalize_responses_gateway_payload(value: &mut Value) {
+    fn visit(value: &mut Value, path: &mut Vec<String>) {
+        match value {
+            Value::Array(items) => {
+                for (index, item) in items.iter_mut().enumerate() {
+                    path.push(index.to_string());
+                    visit(item, path);
+                    path.pop();
+                }
+            }
+            Value::Object(object) => {
+                let kind = object
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
+                if kind.as_deref() == Some("output_text") && !object.contains_key("annotations") {
+                    object.insert("annotations".to_owned(), Value::Array(Vec::new()));
+                }
+                if kind.as_deref().is_some_and(is_responses_output_item_type)
+                    && !object.get("id").is_some_and(Value::is_string)
+                {
+                    let suffix = object
+                        .get("call_id")
+                        .and_then(Value::as_str)
+                        .filter(|call_id| !call_id.trim().is_empty())
+                        .map(ToOwned::to_owned)
+                        .unwrap_or_else(|| path.join("-"));
+                    object.insert(
+                        "id".to_owned(),
+                        Value::String(format!(
+                            "gateway-{}-{suffix}",
+                            kind.as_deref().unwrap_or("item")
+                        )),
+                    );
+                }
+                if kind.as_deref() == Some("message")
+                    && !object.get("status").is_some_and(Value::is_string)
+                {
+                    object.insert("status".to_owned(), Value::String("completed".to_owned()));
+                }
+                let keys = object.keys().cloned().collect::<Vec<_>>();
+                for key in keys {
+                    if let Some(child) = object.get_mut(&key) {
+                        path.push(key);
+                        visit(child, path);
+                        path.pop();
+                    }
+                }
+            }
+            Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+        }
+    }
+
+    fn is_responses_output_item_type(kind: &str) -> bool {
+        matches!(
+            kind,
+            "message"
+                | "file_search_call"
+                | "function_call"
+                | "function_call_output"
+                | "web_search_call"
+                | "computer_call"
+                | "computer_call_output"
+                | "reasoning"
+                | "compaction"
+                | "image_generation_call"
+                | "code_interpreter_call"
+                | "local_shell_call"
+                | "shell_call"
+                | "shell_call_output"
+                | "apply_patch_call"
+                | "apply_patch_call_output"
+                | "mcp_list_tools"
+                | "mcp_approval_request"
+                | "mcp_approval_response"
+                | "mcp_call"
+                | "custom_tool_call"
+                | "custom_tool_call_output"
+                | "tool_search_call"
+                | "tool_search_output"
+        )
+    }
+
+    visit(value, &mut vec!["root".to_owned()]);
+}
+
+fn deserialize_responses_payload<T: DeserializeOwned>(mut value: Value) -> serde_json::Result<T> {
+    normalize_responses_gateway_payload(&mut value);
+    serde_json::from_value(value)
 }
 
 async fn run_chat_completions_text_once(
@@ -1839,6 +1938,16 @@ fn build_responses_request(
         builder = builder
             .tools(tool_defs)
             .tool_choice(ToolChoiceParam::Mode(ToolChoiceOptions::Auto));
+    }
+
+    if settings.role == "compressor.phase_summary" && input.available_tools.is_empty() {
+        // Phase Summary has a strict JSON artifact contract and no tool-call
+        // protocol to preserve. Keep Responses aligned with the existing
+        // Chat Completions JSON mode instead of relying on a corrective retry.
+        builder = builder.text(ResponseTextParam {
+            format: TextResponseFormatConfiguration::JsonObject,
+            verbosity: None,
+        });
     }
 
     debug!(
@@ -2253,12 +2362,13 @@ async fn stream_responses_once(
 
     let started = std::time::Instant::now();
     let client = openai_compatible_responses_client(&settings.llm).map_err(|e| (e, false))?;
-    let request =
+    let mut request =
         build_responses_request(settings, input, prompt, true, false).map_err(|e| (e, false))?;
+    request.stream = Some(true);
     debug!(role = %settings.role, "opening streaming Responses API connection");
     let mut stream = client
         .responses()
-        .create_stream(request)
+        .create_stream_byot::<_, Value>(request)
         .await
         .map_err(|e| (anyhow::anyhow!("{e}").context("LLM stream failed"), false))?;
     debug!(
@@ -2279,10 +2389,11 @@ async fn stream_responses_once(
         std::collections::HashMap::new();
     let mut emitted_tool_calls: std::collections::HashSet<String> =
         std::collections::HashSet::new();
+    let mut native_web_response = json!({"output": []});
 
     while let Some(event) = stream.next().await {
         event_count += 1;
-        let event = match event {
+        let raw_event = match event {
             Ok(ev) => ev,
             Err(e) => {
                 return Err((
@@ -2291,6 +2402,15 @@ async fn stream_responses_once(
                 ))
             }
         };
+        if uses_native_web_search(settings) {
+            merge_native_web_search_stream_event(&mut native_web_response, &raw_event);
+        }
+        let event = deserialize_responses_payload(raw_event).map_err(|e| {
+            (
+                anyhow::anyhow!("{e}").context("Responses stream event deserialization failed"),
+                made_progress,
+            )
+        })?;
         match event {
             ResponseStreamEvent::ResponseOutputItemAdded(ev) => match &ev.item {
                 OutputItem::Message(msg) => {
@@ -2493,8 +2613,7 @@ async fn stream_responses_once(
             ResponseStreamEvent::ResponseCompleted(ev) => {
                 saw_response_completed = true;
                 if uses_native_web_search(settings) {
-                    let record = native_web_search_record(&ev.response)
-                        .map_err(|error| (error, made_progress))?;
+                    let record = native_web_search_record_from_value(&native_web_response);
                     made_progress = true;
                     handler
                         .handle(ModelStreamEvent::NativeWebSearchCompleted {
@@ -2886,11 +3005,209 @@ fn response_usage_to_raw(response: &async_openai::types::responses::Response) ->
 /// them as a local function call would create an invalid transcript on the next
 /// model iteration, so they are persisted in a dedicated turn item. An empty
 /// call list is also retained: a Web-enabled role may not turn an unsearched
-/// URL into evidence.
-fn native_web_search_record(response: &async_openai::types::responses::Response) -> Result<Value> {
-    let raw = serde_json::to_value(response)
-        .context("failed to serialize completed Responses payload for native web provenance")?;
-    Ok(native_web_search_record_from_value(&raw))
+/// URL into evidence. Streaming Responses gateways may omit these items from
+/// `response.completed`; the caller therefore supplies a stream-merged payload.
+fn merge_native_web_search_stream_event(accumulator: &mut Value, event: &Value) {
+    let event_type = event
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    match event_type {
+        "response.created" | "response.in_progress" | "response.completed" => {
+            let Some(response) = event.get("response") else {
+                return;
+            };
+            if let (Some(target), Some(source)) =
+                (accumulator.as_object_mut(), response.as_object())
+            {
+                for field in ["id", "created_at", "completed_at"] {
+                    if let Some(value) = source.get(field) {
+                        target.insert(field.to_owned(), value.clone());
+                    }
+                }
+            }
+            if let Some(output) = response.get("output").and_then(Value::as_array) {
+                for (index, item) in output.iter().enumerate() {
+                    merge_native_output_item(accumulator, index, item);
+                }
+            }
+        }
+        "response.output_item.added" | "response.output_item.done" => {
+            let Some(index) = event
+                .get("output_index")
+                .and_then(Value::as_u64)
+                .and_then(|index| usize::try_from(index).ok())
+            else {
+                return;
+            };
+            if let Some(item) = event.get("item") {
+                merge_native_output_item(accumulator, index, item);
+            }
+        }
+        "response.content_part.added" | "response.content_part.done" => {
+            let (Some(output_index), Some(content_index), Some(part)) = (
+                event
+                    .get("output_index")
+                    .and_then(Value::as_u64)
+                    .and_then(|index| usize::try_from(index).ok()),
+                event
+                    .get("content_index")
+                    .and_then(Value::as_u64)
+                    .and_then(|index| usize::try_from(index).ok()),
+                event.get("part"),
+            ) else {
+                return;
+            };
+            merge_native_output_content(accumulator, output_index, content_index, part);
+        }
+        "response.output_text.annotation.added" => {
+            let (Some(output_index), Some(content_index), Some(annotation_index), Some(annotation)) = (
+                event
+                    .get("output_index")
+                    .and_then(Value::as_u64)
+                    .and_then(|index| usize::try_from(index).ok()),
+                event
+                    .get("content_index")
+                    .and_then(Value::as_u64)
+                    .and_then(|index| usize::try_from(index).ok()),
+                event
+                    .get("annotation_index")
+                    .and_then(Value::as_u64)
+                    .and_then(|index| usize::try_from(index).ok()),
+                event.get("annotation"),
+            ) else {
+                return;
+            };
+            merge_native_output_annotation(
+                accumulator,
+                output_index,
+                content_index,
+                annotation_index,
+                annotation,
+            );
+        }
+        _ => {}
+    }
+}
+
+fn merge_native_output_item(accumulator: &mut Value, output_index: usize, item: &Value) {
+    let Some(items) = accumulator
+        .as_object_mut()
+        .and_then(|object| object.get_mut("output"))
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    if items.len() <= output_index {
+        items.resize_with(output_index + 1, || Value::Null);
+    }
+    if items[output_index].is_null() {
+        items[output_index] = item.clone();
+    } else {
+        merge_native_json_value(&mut items[output_index], item);
+    }
+}
+
+fn merge_native_output_content(
+    accumulator: &mut Value,
+    output_index: usize,
+    content_index: usize,
+    part: &Value,
+) {
+    let Some(items) = accumulator
+        .as_object_mut()
+        .and_then(|object| object.get_mut("output"))
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    if items.len() <= output_index {
+        items.resize_with(output_index + 1, || Value::Null);
+    }
+    if items[output_index].is_null() {
+        items[output_index] = json!({
+            "type": "message",
+            "content": []
+        });
+    }
+    let Some(item) = items[output_index].as_object_mut() else {
+        return;
+    };
+    let content = item
+        .entry("content".to_owned())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let Some(content) = content.as_array_mut() else {
+        return;
+    };
+    if content.len() <= content_index {
+        content.resize_with(content_index + 1, || Value::Null);
+    }
+    if content[content_index].is_null() {
+        content[content_index] = part.clone();
+    } else {
+        merge_native_json_value(&mut content[content_index], part);
+    }
+}
+
+fn merge_native_output_annotation(
+    accumulator: &mut Value,
+    output_index: usize,
+    content_index: usize,
+    annotation_index: usize,
+    annotation: &Value,
+) {
+    merge_native_output_content(
+        accumulator,
+        output_index,
+        content_index,
+        &json!({"type": "output_text", "text": "", "annotations": []}),
+    );
+    let Some(content) = accumulator
+        .as_object_mut()
+        .and_then(|object| object.get_mut("output"))
+        .and_then(Value::as_array_mut)
+        .and_then(|items| items.get_mut(output_index))
+        .and_then(Value::as_object_mut)
+        .and_then(|item| item.get_mut("content"))
+        .and_then(Value::as_array_mut)
+        .and_then(|content| content.get_mut(content_index))
+        .and_then(Value::as_object_mut)
+        .and_then(|part| part.get_mut("annotations"))
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    if content.len() <= annotation_index {
+        content.resize_with(annotation_index + 1, || Value::Null);
+    }
+    content[annotation_index] = annotation.clone();
+}
+
+fn merge_native_json_value(target: &mut Value, source: &Value) {
+    match (target, source) {
+        (Value::Object(target), Value::Object(source)) => {
+            for (key, value) in source {
+                if let Some(existing) = target.get_mut(key) {
+                    merge_native_json_value(existing, value);
+                } else {
+                    target.insert(key.clone(), value.clone());
+                }
+            }
+        }
+        (Value::Array(target), Value::Array(source)) => {
+            if target.len() < source.len() {
+                target.resize_with(source.len(), || Value::Null);
+            }
+            for (index, value) in source.iter().enumerate() {
+                if target[index].is_null() {
+                    target[index] = value.clone();
+                } else {
+                    merge_native_json_value(&mut target[index], value);
+                }
+            }
+        }
+        (target, source) => *target = source.clone(),
+    }
 }
 
 fn native_web_search_record_from_value(raw: &Value) -> Value {
@@ -2909,6 +3226,19 @@ fn native_web_search_record_from_value(raw: &Value) -> Value {
                 "status": item.get("status").cloned().unwrap_or(Value::Null),
                 "action": item.get("action").cloned().unwrap_or(Value::Null),
             }));
+            if let Some(sources) = item.pointer("/action/sources").and_then(Value::as_array) {
+                for source in sources {
+                    let Some(url) = source
+                        .get("url")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|url| url.starts_with("https://") || url.starts_with("http://"))
+                    else {
+                        continue;
+                    };
+                    insert_native_web_citation(&mut citations, url, None);
+                }
+            }
         }
         if item.get("type").and_then(Value::as_str) != Some("message") {
             continue;
@@ -2944,25 +3274,8 @@ fn native_web_search_record_from_value(raw: &Value) -> Value {
                     .and_then(Value::as_str)
                     .map(str::trim)
                     .filter(|title| !title.is_empty())
-                    .unwrap_or_default();
-                let evidence_id = web_search::stable_search_ref_id(&web_search::SearchResult {
-                    ref_id: String::new(),
-                    title: title.to_owned(),
-                    url: url.to_owned(),
-                    snippet: String::new(),
-                    published_at: None,
-                    source: None,
-                });
-                citations.entry(url.to_owned()).or_insert_with(|| {
-                    json!({
-                        "evidence_id": evidence_id,
-                        "source_url": url,
-                        "title": (!title.is_empty()).then_some(title),
-                        "published_at": Value::Null,
-                        "provider": "openai_responses_web_search",
-                        "citation": true,
-                    })
-                });
+                    .map(ToOwned::to_owned);
+                insert_native_web_citation(&mut citations, url, title.as_deref());
             }
         }
     }
@@ -2975,6 +3288,31 @@ fn native_web_search_record_from_value(raw: &Value) -> Value {
         "search_calls": search_calls,
         "results": citations.into_values().collect::<Vec<_>>(),
     })
+}
+
+fn insert_native_web_citation(
+    citations: &mut BTreeMap<String, Value>,
+    url: &str,
+    title: Option<&str>,
+) {
+    let evidence_id = web_search::stable_search_ref_id(&web_search::SearchResult {
+        ref_id: String::new(),
+        title: title.unwrap_or_default().to_owned(),
+        url: url.to_owned(),
+        snippet: String::new(),
+        published_at: None,
+        source: None,
+    });
+    citations.entry(url.to_owned()).or_insert_with(|| {
+        json!({
+            "evidence_id": evidence_id,
+            "source_url": url,
+            "title": title,
+            "published_at": Value::Null,
+            "provider": "openai_responses_web_search",
+            "citation": true,
+        })
+    });
 }
 
 fn extract_encrypted_reasoning(raw: &Value) -> Option<String> {
@@ -3272,6 +3610,32 @@ mod tests {
 
         assert_eq!(
             serde_json::to_value(request).unwrap()["response_format"],
+            json!({"type": "json_object"})
+        );
+    }
+
+    #[test]
+    fn phase_summary_responses_request_requires_json_object_without_tools() {
+        let mut settings = base_settings(LlmRoute::Responses);
+        settings.role = "compressor.phase_summary".to_owned();
+        let input = agent_loop::ModelInput {
+            system_instruction: None,
+            items: vec![agent_loop::TurnItem::user("summary input")],
+            available_tools: Vec::new(),
+            truncation: TruncationConfig::default(),
+        };
+
+        let request = super::build_responses_request(
+            &settings,
+            &input,
+            "return the phase summary as JSON",
+            false,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(
+            serde_json::to_value(request).unwrap()["text"]["format"],
             json!({"type": "json_object"})
         );
     }
@@ -3609,6 +3973,102 @@ mod tests {
             LlmRoute::ChatCompletions
         );
         assert!(serde_json::from_value::<LlmRoute>(json!("deepseek")).is_err());
+    }
+
+    #[test]
+    fn responses_stream_accepts_gateway_output_text_without_annotations() {
+        let raw = json!({
+            "type": "response.completed",
+            "sequence_number": 1,
+            "response": {
+                "id": "resp_gateway_1",
+                "object": "response",
+                "created_at": 1_754_000_000,
+                "model": "gpt-5.6-luna",
+                "status": "completed",
+                "output": [{
+                    "type": "message",
+                    "id": "msg_gateway_1",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "gateway response"
+                    }]
+                }]
+            }
+        });
+
+        let parsed = super::deserialize_responses_payload::<
+            async_openai::types::responses::ResponseStreamEvent,
+        >(raw);
+        assert!(
+            parsed.is_ok(),
+            "Responses gateway payload should accept omitted annotations: {parsed:?}"
+        );
+    }
+
+    #[test]
+    fn responses_stream_accepts_gateway_output_message_without_id() {
+        let raw = json!({
+            "type": "response.completed",
+            "sequence_number": 1,
+            "response": {
+                "id": "resp_gateway_2",
+                "object": "response",
+                "created_at": 1_754_000_000,
+                "model": "gpt-5.6-luna",
+                "status": "completed",
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "gateway response"
+                    }]
+                }]
+            }
+        });
+
+        let parsed = super::deserialize_responses_payload::<
+            async_openai::types::responses::ResponseStreamEvent,
+        >(raw);
+        assert!(
+            parsed.is_ok(),
+            "Responses gateway payload should tolerate an omitted output message id: {parsed:?}"
+        );
+    }
+
+    #[test]
+    fn responses_stream_accepts_gateway_output_message_without_status() {
+        let raw = json!({
+            "type": "response.completed",
+            "sequence_number": 1,
+            "response": {
+                "id": "resp_gateway_3",
+                "object": "response",
+                "created_at": 1_754_000_000,
+                "model": "gpt-5.6-luna",
+                "status": "completed",
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "gateway response"
+                    }]
+                }]
+            }
+        });
+
+        let parsed = super::deserialize_responses_payload::<
+            async_openai::types::responses::ResponseStreamEvent,
+        >(raw);
+        assert!(
+            parsed.is_ok(),
+            "Responses gateway payload should tolerate an omitted output message status: {parsed:?}"
+        );
     }
 
     #[test]
@@ -4578,6 +5038,90 @@ mod tests {
         let response_text = artifact["response_text"].as_str().unwrap();
         assert!(response_text.contains(tools::web_run::VERIFIED_RESULTS_MARKER));
         assert!(response_text.contains("https://www.sec.gov/example"));
+    }
+
+    #[test]
+    fn native_web_search_stream_events_restore_citations_missing_from_completed_response() {
+        let mut response = json!({"output": []});
+        for event in [
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "type": "web_search_call",
+                    "id": "ws-1",
+                    "status": "completed",
+                    "action": {
+                        "type": "search",
+                        "query": "SEC ETF filing",
+                        "sources": [{"type": "url", "url": "https://www.sec.gov/example"}]
+                    }
+                }
+            }),
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 1,
+                "item": {
+                    "type": "message",
+                    "id": "msg-1",
+                    "content": []
+                }
+            }),
+            json!({
+                "type": "response.output_text.annotation.added",
+                "output_index": 1,
+                "content_index": 0,
+                "annotation_index": 0,
+                "annotation": {
+                    "type": "url_citation",
+                    "title": "SEC filing",
+                    "url": "https://www.sec.gov/example"
+                }
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp-native-stream",
+                    "created_at": 1_754_000_000,
+                    "completed_at": 1_754_000_005,
+                    "output": []
+                }
+            }),
+        ] {
+            super::merge_native_web_search_stream_event(&mut response, &event);
+        }
+
+        let record = super::native_web_search_record_from_value(&response);
+        assert_eq!(
+            record["search_calls"][0]["action"]["query"],
+            "SEC ETF filing"
+        );
+        assert_eq!(
+            record["results"][0]["source_url"],
+            "https://www.sec.gov/example"
+        );
+    }
+
+    #[test]
+    fn native_web_search_action_sources_are_verified_without_text_annotations() {
+        let record = super::native_web_search_record_from_value(&json!({
+            "id": "resp-native-sources",
+            "output": [{
+                "type": "web_search_call",
+                "id": "ws-sources",
+                "status": "completed",
+                "action": {
+                    "type": "search",
+                    "query": "SEC ETF filing",
+                    "sources": [{"type": "url", "url": "https://www.sec.gov/example"}]
+                }
+            }]
+        }));
+
+        assert_eq!(
+            record["results"][0]["source_url"],
+            "https://www.sec.gov/example"
+        );
     }
 
     #[test]

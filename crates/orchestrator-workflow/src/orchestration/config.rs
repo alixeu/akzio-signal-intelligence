@@ -537,6 +537,7 @@ fn truncation_config_from_value(config: &Value) -> TruncationConfig {
 pub(crate) fn llm_roles_from_config(config: &Value) -> Result<BTreeMap<String, RoleLlmSettings>> {
     let defaults = config_get(config, "orchestrator.llm.defaults");
     let role_values = effective_llm_role_values(config)?;
+    let role_profile_registry = RoleProfileRegistry::builtin();
     let mut roles = BTreeMap::new();
     for (role, role_value) in role_values {
         let mut effective = defaults
@@ -550,6 +551,27 @@ pub(crate) fn llm_roles_from_config(config: &Value) -> Result<BTreeMap<String, R
         }
         let settings: RoleLlmSettings = serde_json::from_value(effective)
             .with_context(|| format!("invalid LLM config for role {role:?}"))?;
+        // Role IDs contain dots (for example `mediator.topic`), so they must
+        // be looked up as map keys rather than interpreted as path segments.
+        let role_native_override = config_get(config, "orchestrator.llm.roles")
+            .and_then(Value::as_object)
+            .and_then(|roles| roles.get(&role))
+            .and_then(Value::as_object)
+            .and_then(|role_config| role_config.get("native_web_search"))
+            .is_some();
+        let has_web_run_authority = role_profile_registry
+            .registrations()
+            .filter(|registration| registration.role_id == role)
+            .any(|registration| registration.allows_tool(orchestrator_llm::tools::web_run::NAME));
+        let mut settings = settings;
+        if settings.native_web_search && !role_native_override && !has_web_run_authority {
+            // `native_web_search` in defaults describes a model capability. It
+            // must not turn every role into a web-enabled role: the Rust-owned
+            // profile allowlist still decides which phase can receive a hosted
+            // search tool. A role-specific true is intentional and is checked
+            // below by the explicit authority validation.
+            settings.native_web_search = false;
+        }
         roles.insert(role, settings);
     }
     for role in required_llm_roles() {
@@ -1226,7 +1248,7 @@ mod tests {
             .unwrap();
         assert!(roles["researcher.web_evidence"].native_web_search);
 
-        let mut invalid = config;
+        let mut invalid = config.clone();
         invalid["orchestrator"]["llm"]["roles"]["trader"] = json!({
             "native_web_search": true
         });
@@ -1240,5 +1262,48 @@ mod tests {
         .unwrap_err()
         .to_string()
         .contains("explicitly authorizes web.run"));
+
+        let mut invalid_dotted = config.clone();
+        invalid_dotted["orchestrator"]["llm"]["roles"]["mediator.topic"] = json!({
+            "native_web_search": true,
+            "web_search": {"mode": "live"}
+        });
+        let roles = llm_roles_from_config(&invalid_dotted).unwrap();
+        assert!(roles["mediator.topic"].native_web_search);
+        let web_search = web_search_by_role_from_config(&invalid_dotted, roles.iter()).unwrap();
+        assert!(validate_native_web_search_roles(
+            &roles,
+            &web_search,
+            &RoleProfileRegistry::builtin(),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("explicitly authorizes web.run"));
+    }
+
+    #[test]
+    fn native_web_search_default_capability_does_not_block_non_web_roles() {
+        let config = json!({
+            "orchestrator": {
+                "llm": {
+                    "defaults": {
+                        "route": "responses",
+                        "native_web_search": true,
+                        "model": "gpt-5.6-luna",
+                        "base_url": "https://llm.example.com/v1",
+                        "api_key": "test-key"
+                    }
+                },
+                "web_search": {"mode": "live"}
+            }
+        });
+        let roles = llm_roles_from_config(&config).unwrap();
+        let web_search = web_search_by_role_from_config(&config, roles.iter()).unwrap();
+
+        validate_native_web_search_roles(&roles, &web_search, &RoleProfileRegistry::builtin())
+            .unwrap();
+
+        assert!(roles["researcher.web_evidence"].native_web_search);
+        assert!(!roles["trader"].native_web_search);
     }
 }

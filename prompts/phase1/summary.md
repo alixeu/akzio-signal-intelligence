@@ -51,6 +51,10 @@ event ID、content hash、detail hash 或截断后的 64 位字符串。最终�
 
 `per_ticker` 必须覆盖 SOURCE_PAYLOAD 中的完整 analysis universe；示例中的 QQQ
 只是结构示意。context-only asset 也要保留分析，但不能生成投资动作。
+如果 context-only 的 VIX 在原文或输入工具中没有任何可引用证据，必须使用
+`direction="unobserved"`、`long_probability=0.5`、`key_evidence=[]`，并在
+`data_gaps` 或 `missing_fields` 中明确记录缺口；不得输出
+`neutral`/`bullish`/`bearish`/`mixed` 搭配空的 `key_evidence`。
 `authoritative_fields` 的结构必须保持为两个兄弟字段：`per_ticker` 与
 `cross_asset_findings`。`per_ticker` 只能包含完整 analysis universe 的 ticker
 键（通常是 `QQQ`、`SOXX`、`VIX`），绝不能把 `cross_asset_findings` 放进
