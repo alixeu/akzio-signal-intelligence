@@ -620,7 +620,11 @@ fn builtin_llm_role_values() -> BTreeMap<String, Value> {
         ("researcher.bear", 10, None, false),
         ("mediator.topic_controller", 10, Some("medium"), false),
         ("researcher.web_evidence", 6, Some("medium"), true),
-        ("manager.research", 6, Some("medium"), false),
+        // Phase 3 must read Phase 1 and Phase 2 Indexes, expand one Detail
+        // from each, then receive the Rust-owned finalization turn. Eight
+        // turns leaves that bounded retrieval path room for one recoverable
+        // tool-argument correction without letting the role loop unboundedly.
+        ("manager.research", 8, Some("medium"), false),
         ("compressor.phase_summary", 4, None, false),
         ("trader", 6, None, false),
         ("risk.aggressive", 6, None, false),
@@ -1157,6 +1161,7 @@ mod tests {
         let roles = builtin_llm_role_values();
         assert!(roles.values().all(|role| role.get("tools").is_none()));
         assert_eq!(roles["analyst.news_macro"]["max_turns"], 10);
+        assert_eq!(roles["manager.research"]["max_turns"], 8);
         let registry = RoleProfileRegistry::builtin();
         assert!(registry
             .registration(

@@ -435,11 +435,15 @@ fn apply_phase6_execution_constraints(
             .and_then(Value::as_f64)
             .unwrap_or(0.0);
         let mut target = desired.min(cap).clamp(current - delta, current + delta);
-        if status == "wait" || direction == "unchanged" {
+        // `downgrade` narrows the next executable plan but does not itself
+        // authorize a Phase 7 trade.  Without this gate, a conditional
+        // downgrade with a zero target is indistinguishable from an explicit
+        // liquidation and can silently turn a review state into a full exit.
+        if status != "execute" || direction == "unchanged" {
             target = current;
         } else if direction == "increase_only" {
             target = target.max(current);
-        } else if direction == "decrease_only" || status == "downgrade" {
+        } else if direction == "decrease_only" {
             target = target.min(current);
         }
         target = target.clamp(0.0, cap.max(current));
@@ -678,21 +682,28 @@ fn effective_position_cap(context: &Value, config: &AllocationConfig, ticker: &s
     let trader_cap = trader_plan_position_cap(context, ticker).unwrap_or(1.0);
     let risk_cap = active_risk_position_cap(context, ticker).unwrap_or(1.0);
     let upstream_cap = configured_cap.min(trader_cap).min(risk_cap);
-    phase6_unchanged_current_weight(context, ticker)
+    phase6_retained_current_weight(context, ticker)
         .map(|current| upstream_cap.max(current))
         .unwrap_or(upstream_cap)
 }
 
-/// A final `unchanged` constraint means there is no authorized trade. Earlier
-/// candidate caps can prevent adding risk, but cannot silently turn a Hold into
-/// a forced sale during allocation validation.
-fn phase6_unchanged_current_weight(context: &Value, ticker: &str) -> Option<f64> {
+/// A final non-executable constraint (or `unchanged` direction) means there
+/// is no authorized Phase 7 trade.  Earlier candidate caps can prevent adding
+/// risk, but cannot make the persisted allocation invalid solely because an
+/// existing position is above a newly observed cap.  That condition remains
+/// explicit in Phase 6 and is actionable only after an executable
+/// `decrease_only` decision is produced.
+fn phase6_retained_current_weight(context: &Value, ticker: &str) -> Option<f64> {
     let constraint = context.pointer(&format!("/final_trade_decision/per_asset/{ticker}"))?;
-    (constraint
+    let direction = constraint
         .get("direction_constraint")
         .and_then(Value::as_str)
-        == Some("unchanged"))
-    .then(|| {
+        .unwrap_or("unchanged");
+    let execution_status = constraint
+        .get("execution_status")
+        .and_then(Value::as_str)
+        .unwrap_or("wait");
+    (execution_status != "execute" || direction == "unchanged").then(|| {
         constraint
             .get("current_weight")
             .and_then(Value::as_f64)
@@ -1502,5 +1513,97 @@ mod tests {
             allocation["equity_budget_deviation"]["actual_equity_exposure"],
             0.2
         );
+    }
+
+    #[test]
+    fn phase6_downgrade_does_not_turn_a_conditional_reduction_into_a_liquidation() {
+        let state = json!({
+            "research_plan": {"per_ticker": {
+                "QQQ": {"long_probability": 0.44},
+                "SOXX": {"long_probability": 0.51}
+            }},
+            "final_trade_decision": {
+                "per_asset": {
+                    "QQQ": {
+                        "direction_constraint": "decrease_only",
+                        "execution_status": "downgrade",
+                        "current_weight": 0.1,
+                        "max_target_weight": 0.0,
+                        "max_weight_delta": 0.1,
+                        "binding_risk_controls": [{
+                            "control": "Re-evaluate after the missing drawdown input is available.",
+                            "source_refs": ["idx-risk-qqq"]
+                        }]
+                    },
+                    "SOXX": {
+                        "direction_constraint": "unchanged",
+                        "execution_status": "wait",
+                        "current_weight": 0.1,
+                        "max_target_weight": 0.1,
+                        "max_weight_delta": 0.0,
+                        "binding_risk_controls": []
+                    }
+                }
+            }
+        });
+        let mut context = test_context();
+        context["final_trade_decision"] = state["final_trade_decision"].clone();
+        context["risk_debate_state"] = json!({"history": [{"payload": {"per_asset": {
+            "QQQ": {"position_cap_pct": 0.05}
+        }}}]});
+
+        let allocation = derive_guarded_allocation(&state, &context, &test_config()).unwrap();
+
+        // The existing 10% exposure is above the newly observed 5% cap, but
+        // this conditional downgrade authorizes no Phase 7 order.  It must
+        // remain a valid no-trade snapshot rather than fail allocation
+        // validation or become an implicit liquidation.
+        assert_eq!(allocation["weights"]["QQQ"]["weight"], 0.1);
+        assert_eq!(allocation["weights"]["SOXX"]["weight"], 0.1);
+        assert_eq!(allocation["total_equity_exposure"], 0.2);
+    }
+
+    #[test]
+    fn phase6_executable_decrease_only_projects_an_over_cap_position_to_the_risk_limit() {
+        let state = json!({
+            "research_plan": {"per_ticker": {
+                "QQQ": {"long_probability": 0.44},
+                "SOXX": {"long_probability": 0.51}
+            }},
+            "final_trade_decision": {
+                "per_asset": {
+                    "QQQ": {
+                        "direction_constraint": "decrease_only",
+                        "execution_status": "execute",
+                        "current_weight": 0.1,
+                        "max_target_weight": 0.05,
+                        "max_weight_delta": 0.05,
+                        "binding_risk_controls": [{
+                            "control": "Reduce to the verified risk cap.",
+                            "source_refs": ["idx-risk-qqq"]
+                        }]
+                    },
+                    "SOXX": {
+                        "direction_constraint": "unchanged",
+                        "execution_status": "wait",
+                        "current_weight": 0.1,
+                        "max_target_weight": 0.1,
+                        "max_weight_delta": 0.0,
+                        "binding_risk_controls": []
+                    }
+                }
+            }
+        });
+        let mut context = test_context();
+        context["final_trade_decision"] = state["final_trade_decision"].clone();
+        context["risk_debate_state"] = json!({"history": [{"payload": {"per_asset": {
+            "QQQ": {"position_cap_pct": 0.05}
+        }}}]});
+
+        let allocation = derive_guarded_allocation(&state, &context, &test_config()).unwrap();
+
+        assert_eq!(allocation["weights"]["QQQ"]["weight"], 0.05);
+        assert_eq!(allocation["weights"]["SOXX"]["weight"], 0.1);
+        assert_eq!(allocation["total_equity_exposure"], 0.15);
     }
 }

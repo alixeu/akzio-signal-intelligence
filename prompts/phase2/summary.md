@@ -5,8 +5,16 @@ Phase 2 Summary。根据 SOURCE_PAYLOAD 中的 `kind` 忠实提取，不裁决�
 `authoritative_fields` 按 kind 使用以下形状：
 
 - warmup：`{"status":"prepared","upside":[],"downside":[],"constraints":[],"evidence_refs":[]}`
-- topic_generation：`{"common_ground":{},"topics":[],"summary":"","web_evidence":[]}`。topic 只保留
-  topic、tickers、meta_factor、decision_hinge、ttl、why_debate、evidence_refs；不要生成 topic_id。
+- topic_generation：`{"common_ground":{},"coverage":[],"candidate_topics":[],"topics":[],"residual_risks":[],"summary":"","web_evidence":[]}`。
+  `coverage` 必须恰好保留 trend、valuation_expectations、macro、event_risk、data_quality 五类，每项保留
+  category、status、reason、evidence_refs 与可选 topic_id。candidate_topics 保留全部实质候选，topics 只保留优先辩论队列；
+  每个 topics 项必须逐字复用其对应 candidate 的 decision_hinge，不能用同义改写或新 hinge 标识选中项，
+  Rust 会将该 hinge 投影回候选的完整证据记录。
+  residual_risks 保留未进入队列、数据缺口或明确排除的风险；其 category 可为五个 coverage 类别，
+  也可为 candidate_only、residual_risk 或 data_gap 这三个 coverage 状态，不能把状态伪装成新的领域类别。topic 只保留
+  topic、tickers、meta_factor、decision_hinge、ttl、why_debate、evidence_refs；不要生成 topic_id。每个 topic 的
+  evidence_refs 必须为 1 到 5 条完整 ID，保留所有决定性而不重复的引用；不要为凑上限添加弱引用。evidence_refs
+  只能是完整 idx-/technical-/jin10-/web- ID；不得引用 `detail_id`、`content_hash` 或裸 `sha256:` 值。
 - bull_seed / bear_seed：`{"claims":[],"web_evidence":[]}`。每条必须保留非空 claim、
   `evidence_refs`（0 到 3 个非空完整 ID）、`confidence`（0 到 1 的数值）和
   `needs_mediator_check`（布尔值）；缺失信息写入 `missing_fields`，不得将这些字段写成
@@ -51,3 +59,5 @@ retrieved_at、source_tier；不得改写 ID、URL 或关系。未调用时为�
 ## SOURCE_PAYLOAD（动态输入）
 
 {summary_source_payload}
+
+{topic_generation_validation_instruction}

@@ -3,6 +3,7 @@ use serde_json::{json, Map, Value};
 
 const HARD_TRUNCATION_SUFFIX: &str = "\n[truncated]";
 const TEXT_TRUNCATION_SEPARATOR: &str = "\n[... middle truncated ...]\n";
+const MAX_REFERENCE_ARRAY_ITEMS: usize = 20;
 
 /// Content format detected for truncation strategy selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,7 +37,9 @@ pub struct TruncationConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct JsonTruncationConfig {
-    /// Fields to always preserve even when truncating (top-level keys).
+    /// Additional fields to preserve even when truncating. Stable identity and
+    /// evidence-reference fields are always preserved recursively by Rust,
+    /// regardless of this configurable list.
     pub preserve_fields: Vec<String>,
     /// Maximum array elements to keep when truncating arrays.
     pub max_array_elements: usize,
@@ -60,6 +63,68 @@ fn default_preserve_fields() -> Vec<String> {
         "role".to_string(),
         "id".to_string(),
     ]
+}
+
+/// Values in these fields are not prose: later tools need them verbatim to
+/// address a stored object. Truncating an `index_id` into an ellipsis makes a
+/// valid prior `read_indexes` result impossible to consume with
+/// `read_index_details`, which in turn converts a retrieval requirement into
+/// a futile tool loop.
+fn is_stable_reference_field(field: &str) -> bool {
+    matches!(
+        field,
+        "id" | "index_id"
+            | "detail_id"
+            | "content_hash"
+            | "run_id"
+            | "source_run_id"
+            | "session_id"
+            | "turn_id"
+            | "topic_id"
+            | "claim_id"
+            | "hinge_id"
+            | "evidence_id"
+            | "event_cluster_id"
+            | "decision_id"
+            | "outcome_id"
+            | "reflection_id"
+            | "pattern_id"
+            | "call_id"
+            | "output_item_id"
+            | "parent_index_id"
+    )
+}
+
+/// These are bounded collections of stable references rather than free-form
+/// prose. Keeping the first deterministic page preserves evidence lineage
+/// while the enclosing JSON truncation still has a hard size bound.
+fn is_reference_collection_field(field: &str) -> bool {
+    matches!(
+        field,
+        "source_refs" | "evidence_refs" | "evidence_ids" | "event_cluster_ids"
+    )
+}
+
+/// Small metadata needed to interpret a stable reference in a later call.
+fn is_reference_context_field(field: &str) -> bool {
+    matches!(
+        field,
+        "source_phase"
+            | "role"
+            | "kind"
+            | "ticker"
+            | "section"
+            | "next_cursor"
+            | "has_more"
+            | "truncated"
+    )
+}
+
+fn field_must_survive_truncation(field: &str, preserve_fields: &[String]) -> bool {
+    preserve_fields.iter().any(|configured| configured == field)
+        || is_stable_reference_field(field)
+        || is_reference_collection_field(field)
+        || is_reference_context_field(field)
 }
 
 impl Default for TruncationConfig {
@@ -226,7 +291,7 @@ fn reduce_json_value(
         Value::Object(object) => {
             let mut reduced = false;
             for (key, nested) in object.iter_mut() {
-                let nested_preserved = preserve_fields.iter().any(|field| field == key);
+                let nested_preserved = field_must_survive_truncation(key, preserve_fields);
                 reduced |= reduce_json_value(
                     nested,
                     max_array_elements,
@@ -250,7 +315,7 @@ fn prune_non_preserved_fields(value: &mut Value, preserve_fields: &[String]) -> 
         Value::Object(object) => {
             let before = object.len();
             object.retain(|key, nested| {
-                preserve_fields.iter().any(|field| field == key)
+                field_must_survive_truncation(key, preserve_fields)
                     || nested.is_array()
                     || nested.is_object()
             });
@@ -290,6 +355,12 @@ fn compact_preserved_json(
         }
     }
 
+    if let Some(Value::Object(reference_tree)) = compact_reference_tree(original) {
+        for (key, reference) in reference_tree {
+            object.entry(key).or_insert(reference);
+        }
+    }
+
     let mut value = Value::Object(object);
     if let Some(serialized) = serialize_json_within_limit(&value, max_chars) {
         return serialized;
@@ -313,19 +384,73 @@ fn compact_preserved_json(
         .unwrap_or_else(|| truncate_hard("{}", max_chars))
 }
 
-fn truncate_all_strings(value: &mut Value, max_string_chars: usize) {
+/// Build a shape-preserving projection of the fields that are required to
+/// address or verify a later ToolManaged read. This is used only as the final
+/// JSON fallback; normal truncation retains richer content first.
+fn compact_reference_tree(value: &Value) -> Option<Value> {
     match value {
-        Value::String(text) if text.chars().count() > max_string_chars => {
+        Value::Array(items) => {
+            let projected = items
+                .iter()
+                .filter_map(compact_reference_tree)
+                .take(MAX_REFERENCE_ARRAY_ITEMS)
+                .collect::<Vec<_>>();
+            (!projected.is_empty()).then_some(Value::Array(projected))
+        }
+        Value::Object(object) => {
+            let mut projected = Map::new();
+            for (key, nested) in object {
+                if is_stable_reference_field(key) || is_reference_context_field(key) {
+                    if nested.is_string() || nested.is_number() || nested.is_boolean() {
+                        projected.insert(key.clone(), nested.clone());
+                    }
+                    continue;
+                }
+                if is_reference_collection_field(key) {
+                    if let Value::Array(items) = nested {
+                        let items = items
+                            .iter()
+                            .filter(|item| item.is_string())
+                            .take(MAX_REFERENCE_ARRAY_ITEMS)
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        if !items.is_empty() {
+                            projected.insert(key.clone(), Value::Array(items));
+                        }
+                    }
+                    continue;
+                }
+                if let Some(child) = compact_reference_tree(nested) {
+                    projected.insert(key.clone(), child);
+                }
+            }
+            (!projected.is_empty()).then_some(Value::Object(projected))
+        }
+        _ => None,
+    }
+}
+
+fn truncate_all_strings(value: &mut Value, max_string_chars: usize) {
+    truncate_all_strings_at(value, max_string_chars, false);
+}
+
+fn truncate_all_strings_at(value: &mut Value, max_string_chars: usize, preserve_string: bool) {
+    match value {
+        Value::String(text) if !preserve_string && text.chars().count() > max_string_chars => {
             *text = truncate_string_with_suffix(text, max_string_chars);
         }
         Value::Array(items) => {
             for item in items {
-                truncate_all_strings(item, max_string_chars);
+                truncate_all_strings_at(item, max_string_chars, preserve_string);
             }
         }
         Value::Object(object) => {
-            for nested in object.values_mut() {
-                truncate_all_strings(nested, max_string_chars);
+            for (key, nested) in object {
+                truncate_all_strings_at(
+                    nested,
+                    max_string_chars,
+                    is_stable_reference_field(key) || is_reference_collection_field(key),
+                );
             }
         }
         _ => {}
@@ -539,6 +664,40 @@ mod tests {
             !daily.is_empty(),
             "truncation should retain at least one daily snapshot, got {truncated}"
         );
+    }
+
+    #[test]
+    fn json_truncation_keeps_nested_index_id_exact_for_follow_up_detail_reads() {
+        let index_id = "idx-70bef6dde5ca4652712360d7874e8497ca63216faeb731c78b60a81a3e724f01";
+        let content = serde_json::to_string(&json!({
+            "indexes": [{
+                "index_id": index_id,
+                "source_phase": 2,
+                "role": "mediator.topic_controller",
+                "summary": "x".repeat(20_000)
+            }],
+            "diagnostics": "y".repeat(20_000)
+        }))
+        .unwrap();
+
+        let truncated = truncate_semantic(&content, 500, &TruncationConfig::default());
+        let parsed: Value = serde_json::from_str(&truncated).unwrap();
+
+        assert_eq!(
+            parsed
+                .pointer("/indexes/0/index_id")
+                .and_then(Value::as_str),
+            Some(index_id),
+            "a model must retain the exact visible Index ID in order to call read_index_details"
+        );
+        assert_eq!(
+            parsed
+                .pointer("/indexes/0/source_phase")
+                .and_then(Value::as_u64),
+            Some(2),
+            "retrieval audit needs the source phase paired with the visible Index ID"
+        );
+        assert!(truncated.chars().count() <= 500);
     }
 
     #[test]

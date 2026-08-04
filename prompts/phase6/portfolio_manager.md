@@ -31,14 +31,14 @@ Phase 3 权威结论、Phase 4 执行意图与 Phase 5 三方风险约束。不�
 - `max_weight_delta`：相对运行时账户当前权重的最大绝对变化，必须使用 0 到 1 之间的非负小数。偏空或减持语义由 `direction_constraint=decrease_only` 表达，不要把目标权重写成负数。
 - `binding_risk_controls`：实际绑定该资产的 Phase 5 风险控制。
 
-运行时写入 `current_weight`，并验证 ticker 覆盖、方向、权重范围和跨字段约束。`wait` 默认维持当前权重；只有硬风控可降低。`downgrade` 只能缩小可行目标或变化范围，不能扩大敞口或反转方向。
+运行时写入 `current_weight`，并验证 ticker 覆盖、方向、权重范围和跨字段约束。`wait` 默认维持当前权重；只有硬风控可降低。`downgrade` 是条件性、非执行状态：Phase 7 本轮维持当前权重，只保存缩小后的未来目标或变化范围，等待后续明确的 `execute` 决策。若本轮必须立即减仓，必须明确写 `execution_status=execute`、`direction_constraint=decrease_only` 和对应的硬风控来源；`downgrade` 不能扩大敞口或反转方向。
 
 ## 校验步骤
 
 1. 检查 Phase 3 rating 与 Trader action 的方向是否一致；Trader 只能将候选 Buy/Sell 降级为 Hold，不能反转方向。
 2. 对 bull/base/bear 场景做执行压力测试，尤其检查 bear 场景最大损失、已触发条件和可观察复评条件。
 3. 区分风险委员会的新增信息、真实分歧和重复观点；做最终风险折中，在顶层和每资产 `execution_status` 中给出 `execute | wait | downgrade`。
-4. 合并 binding risk controls：position cap 不得突破最严格有效上限；risk-off triggers 合并去重；review window 取最短合理窗口。每项 control 必须同时保留实际读取的 Phase 5 summary/detail ID。
+4. 合并 binding risk controls：只有 Rust 的 Phase 5 leave-one-reviewer-out 账本证明“移除此 reviewer 会放松仓位上限”的单一 reviewer 可成为 binding source；`no_new_information=true`、重复风险维度或移除后 cap 不变的 reviewer 只能作为 report-only 背景，不能多源累计成确认。每项 binding control 只保留一个实际读取的合格 Phase 5 summary **Index ID**，position cap 不得突破该来源的有效上限；risk-off triggers 合并去重，review window 取最短合理窗口。
 5. `target_price` 只能原样继承上游；上游没有则为 `null`。
 6. rationale 说明为何当前执行强度不是更激进或更保守，并明确 Portfolio Manager 的最终裁决。
 
@@ -55,6 +55,11 @@ Phase 3 权威结论、Phase 4 执行意图与 Phase 5 三方风险约束。不�
 <!-- DYNAMIC SUFFIX (changes every call) -->
 Rust 账户与执行控制上下文（不含前序 Phase Artifact）：
 {phase6_control_context}
+
+其中 `phase5_marginal_control_context.per_asset.<ticker>.eligible_source_refs` 是唯一可写入
+该 ticker `binding_risk_controls.source_refs` 的 Phase 5 Summary Index ID 集合；空数组表示
+三位 reviewer 均未产生可验证的边际约束，此时 `binding_risk_controls` 必须为空，不能为了
+“三方审查”而填入重复来源。
 
 摘要可用性 bootstrap（不含分析正文）：
 {retrieval_bootstrap}

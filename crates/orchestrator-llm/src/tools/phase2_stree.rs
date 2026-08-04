@@ -7,6 +7,7 @@
 use super::{truncate_chars, ToolDefinition};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
+use std::collections::BTreeSet;
 
 pub const SUBMIT_DEBATE_TURN: &str = "submit_debate_turn";
 pub const ROUTE_DEBATE_TURN: &str = "route_debate_turn";
@@ -17,10 +18,14 @@ pub fn definition(name: &str) -> Option<ToolDefinition> {
     let (description, parameters) = match name {
         SUBMIT_DEBATE_TURN => (
             "Submit Bull or Bear's current position to the Topic Controller and end this turn.",
-            json!({"type":"object","additionalProperties":false,"required":["stance","message","evidence_refs","report"],"properties":{
+            json!({"type":"object","additionalProperties":false,"required":["stance","message","evidence_refs","evidence_links","report"],"properties":{
                 "stance":{"type":"string","enum":["challenge","partial_agree","agree","retract","needs_evidence","no_new_info"]},
                 "message":{"type":"string","maxLength":1200}, "reply_to_node_id":{"type":"string"},
-                "evidence_refs":{"type":"array","items":{"type":"string"}},
+                "evidence_refs":{"type":"array","maxItems":3,"items":{"type":"string"}},
+                "evidence_links":{"type":"array","maxItems":3,"items":{"type":"object","additionalProperties":false,"required":["evidence_ref","relation"],"properties":{
+                    "evidence_ref":{"type":"string"},
+                    "relation":{"type":"string","enum":["supports","refutes","qualifies"]}
+                }}},
                 "report":{"type":"string","maxLength":4000}
             }}),
         ),
@@ -41,7 +46,12 @@ pub fn definition(name: &str) -> Option<ToolDefinition> {
             "Close the topic debate. Only the Controller may invoke this terminal action.",
             json!({"type":"object","additionalProperties":false,"required":["reason","message","report"],"properties":{
                 "reason":{"type":"string","enum":["consensus","unresolved_disagreement","evidence_exhausted","agent_failure","round_limit"]},
-                "message":{"type":"string","maxLength":1200}, "report":{"type":"string","maxLength":4000}
+                "message":{"type":"string","maxLength":1200},
+                "accepted_claims":{"type":"array","maxItems":2,"items":{"type":"object","additionalProperties":false,"required":["claim_id","evidence_refs"],"properties":{
+                    "claim_id":{"type":"string"},
+                    "evidence_refs":{"type":"array","minItems":1,"maxItems":3,"items":{"type":"string"}}
+                }}},
+                "report":{"type":"string","maxLength":4000}
             }}),
         ),
         _ => return None,
@@ -63,6 +73,7 @@ pub fn execute(name: &str, args: Value) -> Result<Value> {
             required_string(object, "stance", 32)?;
             required_string(object, "message", 1_200)?;
             required_evidence_refs(object)?;
+            required_evidence_links(object)?;
         }
         ROUTE_DEBATE_TURN => {
             required_string(object, "reply_to_node_id", 128)?;
@@ -131,6 +142,53 @@ fn required_evidence_refs(object: &serde_json::Map<String, Value>) -> Result<()>
     Ok(())
 }
 
+/// Evidence IDs prove only that a source was observed.  Each submitted claim
+/// must also declare the narrow role that each source plays: support,
+/// refutation, or qualification.  Rust cannot infer semantic truth from text,
+/// but this one-to-one edge makes the declared relationship auditable and
+/// prevents a participant from attaching a bag of unrelated IDs.
+fn required_evidence_links(object: &serde_json::Map<String, Value>) -> Result<()> {
+    let references = object
+        .get("evidence_refs")
+        .and_then(Value::as_array)
+        .context("submit_debate_turn requires evidence_refs")?
+        .iter()
+        .map(|reference| {
+            reference
+                .as_str()
+                .map(str::trim)
+                .filter(|reference| !reference.is_empty())
+                .map(ToOwned::to_owned)
+                .context("submit_debate_turn evidence_refs must contain non-empty strings")
+        })
+        .collect::<Result<BTreeSet<_>>>()?;
+    let links = object
+        .get("evidence_links")
+        .and_then(Value::as_array)
+        .context("submit_debate_turn requires evidence_links")?;
+    if links.len() > 3 {
+        bail!("submit_debate_turn permits at most three evidence_links")
+    }
+    let mut linked = BTreeSet::new();
+    for link in links {
+        let link = link
+            .as_object()
+            .context("submit_debate_turn evidence_links must contain objects")?;
+        let reference = required_string(link, "evidence_ref", 128)?;
+        let relation = required_string(link, "relation", 32)?;
+        if !matches!(relation.as_str(), "supports" | "refutes" | "qualifies") {
+            bail!("submit_debate_turn evidence_links.relation is invalid")
+        }
+        if !linked.insert(reference) {
+            bail!("submit_debate_turn evidence_links contains duplicate evidence_ref")
+        }
+    }
+    if linked != references {
+        bail!("submit_debate_turn evidence_links must cover each evidence_ref exactly once")
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,6 +234,26 @@ mod tests {
     }
 
     #[test]
+    fn submission_requires_one_declared_relation_per_evidence_ref() {
+        let reference = format!("web-{}", "a".repeat(64));
+        let error = execute(
+            SUBMIT_DEBATE_TURN,
+            json!({
+                "stance": "challenge",
+                "message": "The source contradicts the current inference.",
+                "evidence_refs": [reference],
+                "evidence_links": [],
+                "report": "The position is evidence-bounded."
+            }),
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("cover each evidence_ref exactly once"));
+    }
+
+    #[test]
     fn terminal_tool_schemas_expose_the_runtime_text_limits() {
         for name in [
             SUBMIT_DEBATE_TURN,
@@ -193,5 +271,15 @@ mod tests {
                 4_000
             );
         }
+        assert_eq!(
+            definition(SUBMIT_DEBATE_TURN).unwrap().parameters["properties"]["evidence_refs"]
+                ["maxItems"],
+            3
+        );
+        assert_eq!(
+            definition(SUBMIT_DEBATE_TURN).unwrap().parameters["properties"]["evidence_links"]
+                ["maxItems"],
+            3
+        );
     }
 }

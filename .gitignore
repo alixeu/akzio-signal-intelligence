@@ -6,6 +6,7 @@
 
 
 # Local runtime outputs
+/outputs/
 /config/local*.yaml
 /config/*.local.yaml
 *.log

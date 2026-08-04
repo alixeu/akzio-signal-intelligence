@@ -182,6 +182,8 @@ mod tests {
             location: location.clone(),
             workflow_version: "workflow-v2".to_owned(),
             prompt_versions: BTreeMap::new(),
+            prompt_content_hash: "sha256:prompts".to_owned(),
+            source_surface_hash: "sha256:source".to_owned(),
             git_sha: "deadbeef".to_owned(),
             config_hash: "sha256:config".to_owned(),
             role_profile_registry_hash: "sha256:authority".to_owned(),

@@ -236,6 +236,13 @@ pub struct RunManifestInit {
     pub location: RunLocation,
     pub workflow_version: String,
     pub prompt_versions: BTreeMap<String, String>,
+    /// Hashes the prompt rendering surface (role templates, shared fragments,
+    /// and enabled components), not merely the configured version labels.
+    pub prompt_content_hash: String,
+    /// Hashes the executable Rust/Cargo source surface in the actual worktree,
+    /// including uncommitted files. A commit SHA alone cannot distinguish two
+    /// dirty builds resumed under the same Debug run ID.
+    pub source_surface_hash: String,
     pub git_sha: String,
     pub config_hash: String,
     pub role_profile_registry_hash: String,
@@ -254,6 +261,16 @@ pub struct RunManifest {
     pub phase_status: BTreeMap<String, PhaseStatus>,
     pub workflow_version: String,
     pub prompt_versions: BTreeMap<String, String>,
+    /// Empty only for a legacy manifest that predates prompt-content pinning.
+    /// The workflow refuses to resume such a run until it is explicitly
+    /// recreated or isolated.
+    #[serde(default)]
+    pub prompt_content_hash: String,
+    /// Empty only for a legacy manifest that predates source-surface pinning.
+    /// The workflow refuses to resume it because `git_sha` alone is not an
+    /// identity for an uncommitted executable tree.
+    #[serde(default)]
+    pub source_surface_hash: String,
     pub git_sha: String,
     pub config_hash: String,
     pub role_profile_registry_hash: String,
@@ -281,6 +298,10 @@ struct LegacyRunManifestV1 {
     pub phase_status: BTreeMap<String, PhaseStatus>,
     pub workflow_version: String,
     pub prompt_versions: BTreeMap<String, String>,
+    #[serde(default)]
+    pub prompt_content_hash: String,
+    #[serde(default)]
+    pub source_surface_hash: String,
     pub git_sha: String,
     pub config_hash: String,
     #[serde(default)]
@@ -327,6 +348,8 @@ impl TryFrom<LegacyRunManifestV1> for RunManifest {
             phase_status: legacy.phase_status,
             workflow_version: legacy.workflow_version,
             prompt_versions: legacy.prompt_versions,
+            prompt_content_hash: legacy.prompt_content_hash,
+            source_surface_hash: legacy.source_surface_hash,
             git_sha: legacy.git_sha,
             config_hash: legacy.config_hash,
             role_profile_registry_hash,
@@ -345,6 +368,8 @@ impl RunManifest {
     pub fn new(init: RunManifestInit) -> Result<Self> {
         for (name, value) in [
             ("workflow_version", &init.workflow_version),
+            ("prompt_content_hash", &init.prompt_content_hash),
+            ("source_surface_hash", &init.source_surface_hash),
             ("git_sha", &init.git_sha),
             ("config_hash", &init.config_hash),
             (
@@ -370,6 +395,8 @@ impl RunManifest {
             phase_status: BTreeMap::new(),
             workflow_version: init.workflow_version,
             prompt_versions: init.prompt_versions,
+            prompt_content_hash: init.prompt_content_hash,
+            source_surface_hash: init.source_surface_hash,
             git_sha: init.git_sha,
             config_hash: init.config_hash,
             role_profile_registry_hash: init.role_profile_registry_hash,
@@ -700,6 +727,8 @@ mod tests {
             location,
             workflow_version: "workflow-v2".to_owned(),
             prompt_versions: BTreeMap::new(),
+            prompt_content_hash: "sha256:prompts".to_owned(),
+            source_surface_hash: "sha256:source".to_owned(),
             git_sha: "deadbeef".to_owned(),
             config_hash: "sha256:config".to_owned(),
             role_profile_registry_hash: "sha256:authority".to_owned(),

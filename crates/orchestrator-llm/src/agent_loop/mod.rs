@@ -324,6 +324,9 @@ where
             let debug_phase = turn.phase;
             let debug_topic = config.topic_id.clone();
             let debug_loop = loop_index;
+            let debug_run_id = turn.run_id.clone();
+            let debug_session_id = turn.session_id.clone();
+            let debug_turn_id = turn.turn_id.clone();
             let tool_batch_started = Instant::now();
             let mut terminal_completed = false;
             let mut calls = calls.into_iter();
@@ -364,6 +367,9 @@ where
                                 "role": debug_role,
                                 "phase": debug_phase,
                                 "topic_id": debug_topic,
+                                "run_id": debug_run_id,
+                                "session_id": debug_session_id,
+                                "turn_id": debug_turn_id,
                                 "loop_index": debug_loop,
                                 "call_id": result.call_id,
                                 "status": result.status,
@@ -1892,6 +1898,8 @@ fn log_debug_llm_iteration(
             "topic_id": config.topic_id,
             "model": config.model,
             "loop_index": loop_index,
+            "run_id": turn.run_id,
+            "session_id": turn.session_id,
             "turn_id": turn.turn_id,
             "elapsed_ms": elapsed_ms,
             "llm_ms": elapsed_ms,
@@ -1909,6 +1917,8 @@ fn log_debug_llm_iteration(
             "topic_id": config.topic_id,
             "model": config.model,
             "loop_index": loop_index,
+            "run_id": turn.run_id,
+            "session_id": turn.session_id,
             "turn_id": turn.turn_id,
             "input_tokens": stream_result.usage.input_tokens,
             "output_tokens": stream_result.usage.output_tokens,

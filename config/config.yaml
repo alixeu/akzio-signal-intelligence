@@ -119,7 +119,7 @@ orchestrator:
       #   opencode 所需的全部请求头。设为 false 时回退到常规 gateway 配置。
       free_opencode: false
       route: chat_completions
-      model: gpt-5.3-codex-spark
+      model: DeepSeek-V4-Flash
       base_url: *llm_gateway_base_url
       api_key: *llm_gateway_api_key
       # The gateway's implicit cap truncates schema-valid multi-agent artifacts.

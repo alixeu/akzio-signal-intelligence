@@ -1,1 +1,0 @@
-{"content_hash":"sha256:955ef7812d377a351b3ef728ba384dd7c09ee12953ef52dc5ae33b9cfd200053","payload_bytes":107409,"payload_hash":"sha256:7d28760615fec95fa388e230173331f5028a81ba95c04af03fc9e5a96b3ff526","payload_relative_path":"data/technical/qqq/3h.csv","schema_version":1,"source":{"interval":"3h","kind":"technical","ticker":"QQQ"},"written_at":"2026-08-03T09:46:52.767917+00:00"}

@@ -15,9 +15,12 @@ Phase 1 Summary 会从正文忠实提取 Index；Rust 负责校验和提交。
   - `is_derivative_repost`（是否为再发布信息，布尔值）
   - `evidence_age`（只能是 `0-2d` / `3-5d` / `6-10d` / `10d+` / `unknown`）
   - `evidence_refs`（至少一个工具返回的完整稳定 ID，始终使用数组）
+  - 若工具可见，分别写 `event_time`、`published_time`、`ingested_time`、`as_of` 与 `timezone`；
+    它们不可从单一 `timestamp` 猜出，未知时明确为 unknown/null。
 - 每个 ticker 必须给出非空报告；不要输出 JSON 或代码块。
-- `direction` 只能为 `bullish`、`bearish`、`neutral`、`mixed` 或 `unobserved`；不得输出组合标签（例如 `neutral_bullish`）。无可用样本时使用 `direction="unobserved"`、`confidence=0.0`。`unobserved` 仅用于诊断，不代表 neutral，不得参与概率合成。
-- `confidence` 表示证据独立性、完整性、时效与冲突程度，不是上涨概率：`0.20–0.35` 为单一证据簇或关键字段缺失；`0.40–0.60` 为有方向但存在明显独立反证；`0.65–0.80` 为多个独立证据簇一致、缺口有限；仅在来源、周期和传导高度一致且无重大未解反证时才可高于 `0.80`。
+- `direction` 只能为 `bullish`、`bearish`、`neutral`、`mixed` 或 `unobserved`；不得输出组合标签（例如 `neutral_bullish`）。无样本用 `unobserved`、`confidence=0.0`、`long_probability=0.5`，且不参与概率合成。
+- `confidence` 只衡量证据独立性、完整性、时效与冲突，非上涨概率：单簇或缺字段 `0.20–0.35`，有独立反证 `0.40–0.60`，多独立簇一致 `0.65–0.80`；高于 `0.80` 须来源、周期、传导一致且无重大反证。
+- `long_probability` 是未来 1-5 日多头概率 `[0,1]`，独立于 `confidence`；`bullish>0.5`、`bearish<0.5`、`neutral=0.5`、`mixed=0.40–0.60`，不得由 `confidence` 推导。
 - `source_tier` 只能为 `official`、`major_media`、`professional_research`、`longform_analysis` 或 `unknown`；不确定时使用 `unknown`。
 - 不输出 Buy/Sell/Hold、仓位、止损、止盈或目标价。
 - `analyst.news_macro` 顶层包含 `jin10_attention`；允许为空，只能引用本轮真实读取的 Jin10 ID。

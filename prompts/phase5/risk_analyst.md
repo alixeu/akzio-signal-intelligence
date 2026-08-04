@@ -13,9 +13,9 @@ Phase 3 ResearchDecision 是唯一市场结论；Phase 4 Trader 只提供执行�
 
 ## 风险委员会
 
-本轮 stance 为 `{stance}`，必须遵守当前角色提示词中的 stance 专属规则。三个 reviewer 在同一 Phase 独立运行，不能通过前序 Phase 工具读取彼此结果。
+本轮 stance 为 `{stance}`，必须遵守当前角色提示词中的 stance 专属规则。三个 reviewer 使用同一冻结的 Phase 3/4 输入独立运行，不能通过前序 Phase 工具读取彼此结果；名称或立场不同不等于独立证据。
 
-每轮必须区分新增约束与 Phase 3/4 已隐含的重复约束，填写 `unique_risk_contribution` 和 `disagreement_with_prior`；确无新增信息时用 `no_new_information=true`。Trader 已保守时不得机械重复收缩。
+每轮必须区分新增约束与 Phase 3/4 已隐含的重复约束，填写 `unique_risk_contribution`、一个明确风险维度（gap、liquidity、volatility、correlation、concentration、execution、data_quality 或 other）和 `disagreement_with_prior`；确无新增信息时用 `no_new_information=true`，并将独有贡献和建议调整留空。Trader 已保守时不得机械重复收缩。
 
 隔夜跳空场景只能读取下方 Rust 控制上下文。状态不是 `available` 时不得自行补默认跌幅。
 

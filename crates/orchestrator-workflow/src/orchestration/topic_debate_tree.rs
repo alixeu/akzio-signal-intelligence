@@ -97,7 +97,11 @@ pub(crate) struct StreeDelivery {
 #[derive(Debug, Clone)]
 pub(crate) struct DebateDispatch {
     pub actor: DebateActor,
-    pub delivery: Option<StreeDelivery>,
+    /// A Controller dispatch consumes its entire pending mailbox atomically.
+    /// Bull and Bear receive one route/opening at a time.  Batching the
+    /// Controller side prevents it from closing or routing based on only the
+    /// first response in a collision wave.
+    pub deliveries: Vec<StreeDelivery>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,6 +122,17 @@ pub(crate) struct TopicDebateTree {
     /// checkpoints so a resumed debate retains the same provenance boundary.
     #[serde(default)]
     pub evidence_registry: BTreeSet<String>,
+    /// Event-level identity for every admissible evidence reference.  A new
+    /// URL or evidence ID is not new information when it resolves to an event
+    /// that was already visible in Phase 1 or an earlier debate turn.
+    #[serde(default)]
+    pub evidence_event_clusters: BTreeMap<String, String>,
+    /// Runtime facts about the two research forks.  They are deliberately
+    /// persisted with the tree so Phase 3 can distinguish a genuine
+    /// cross-model corroboration from two role prompts applied to the same
+    /// warm-up and model.
+    #[serde(default)]
+    pub independence_context: Value,
     pub participants: BTreeMap<DebateActor, ParticipantState>,
     #[serde(default)]
     next_sequence: u64,
@@ -155,6 +170,13 @@ impl TopicDebateTree {
             nodes: Vec::new(),
             deliveries: Vec::new(),
             evidence_registry: BTreeSet::new(),
+            evidence_event_clusters: BTreeMap::new(),
+            independence_context: json!({
+                "shared_warmup": true,
+                "bull_model": null,
+                "bear_model": null,
+                "model_independence": "unknown"
+            }),
             participants,
             next_sequence: 1,
         };
@@ -185,20 +207,66 @@ impl TopicDebateTree {
         }
     }
 
-    /// Admit evidence observed by Rust through a FileStore Index or a tool
-    /// result in this topic's current turn. Model payloads cannot populate this
-    /// set directly.
-    pub fn register_evidence_refs<'a>(
+    #[cfg(test)]
+    fn register_evidence_refs<'a>(
         &mut self,
         references: impl IntoIterator<Item = &'a str>,
     ) -> Result<()> {
         for reference in references {
-            if !is_complete_evidence_ref(reference) {
-                bail!("stree evidence registry requires a complete stable evidence ID")
-            }
-            self.evidence_registry.insert(reference.to_owned());
+            self.register_evidence_ref_cluster(reference, reference)?;
         }
         Ok(())
+    }
+
+    /// Register one Rust-observed evidence item with its event-level identity.
+    /// The caller owns the mapping; this tree only rejects malformed IDs and
+    /// makes the mapping immutable once a reference has been admitted.
+    pub fn register_evidence_ref_cluster(
+        &mut self,
+        reference: &str,
+        event_cluster_id: &str,
+    ) -> Result<()> {
+        if !is_complete_evidence_ref(reference) {
+            bail!("stree evidence registry requires a complete stable evidence ID")
+        }
+        let event_cluster_id = event_cluster_id.trim();
+        if event_cluster_id.is_empty() {
+            bail!("stree evidence registry requires a non-empty event cluster ID")
+        }
+        if let Some(existing) = self.evidence_event_clusters.get(reference) {
+            if existing != event_cluster_id {
+                bail!(
+                    "stree evidence reference {reference} cannot change event cluster from {existing} to {event_cluster_id}"
+                )
+            }
+        } else {
+            self.evidence_event_clusters
+                .insert(reference.to_owned(), event_cluster_id.to_owned());
+        }
+        self.evidence_registry.insert(reference.to_owned());
+        Ok(())
+    }
+
+    pub fn set_independence_context(
+        &mut self,
+        bull_model: impl Into<String>,
+        bear_model: impl Into<String>,
+    ) {
+        let bull_model = bull_model.into();
+        let bear_model = bear_model.into();
+        let model_independence = if bull_model.trim().is_empty() || bear_model.trim().is_empty() {
+            "unknown"
+        } else if bull_model == bear_model {
+            "same_model"
+        } else {
+            "distinct_models"
+        };
+        self.independence_context = json!({
+            "shared_warmup": true,
+            "bull_model": bull_model,
+            "bear_model": bear_model,
+            "model_independence": model_independence,
+        });
     }
 
     pub fn next_dispatch(&mut self) -> Option<DebateDispatch> {
@@ -236,27 +304,94 @@ impl TopicDebateTree {
                     .into_iter()
                     .find(|actor| self.has_pending_delivery(*actor))
             })?;
-        let delivery = self
+        let dispatch_all_pending = actor == DebateActor::Controller;
+        let mut deliveries = Vec::new();
+        for delivery in self
             .deliveries
             .iter_mut()
-            .find(|delivery| delivery.target == actor && !delivery.delivered)
-            .map(|delivery| {
-                delivery.delivered = true;
-                delivery.clone()
-            });
+            .filter(|delivery| delivery.target == actor && !delivery.delivered)
+        {
+            delivery.delivered = true;
+            deliveries.push(delivery.clone());
+            if !dispatch_all_pending {
+                break;
+            }
+        }
         self.participant_mut(actor)?.status = ParticipantStatus::Running;
-        Some(DebateDispatch { actor, delivery })
+        Some(DebateDispatch { actor, deliveries })
     }
 
-    pub fn injected_user_message(&self, delivery: &StreeDelivery) -> Result<String> {
-        let node = self
-            .nodes
+    pub fn injected_user_message(&self, deliveries: &[StreeDelivery]) -> Result<String> {
+        if deliveries.is_empty() {
+            bail!("stree dispatch requires at least one delivery to inject");
+        }
+        let mut payloads = deliveries
             .iter()
-            .find(|node| node.node_id == delivery.node_id)
-            .context("stree delivery references an unknown node")?;
-        Ok(format!(
-            "stree: {}",
-            serde_json::to_string(&json!({
+            .map(|delivery| {
+                let node = self
+                    .nodes
+                    .iter()
+                    .find(|node| node.node_id == delivery.node_id)
+                    .context("stree delivery references an unknown node")?;
+                Ok((delivery, node))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let controller_batch = deliveries
+            .iter()
+            .all(|delivery| delivery.target == DebateActor::Controller);
+        let message = if controller_batch {
+            // The Controller does not need the speaker label to route both
+            // sides.  Redacting it and canonically sorting a compact payload
+            // prevents the fixed Bull-first scheduler, duplicated report
+            // prose, and presentation order from becoming a hidden vote.
+            let mut normalized = payloads
+                .drain(..)
+                .map(|(delivery, node)| {
+                    let payload = controller_visible_payload(node);
+                    let sort_key = orchestrator_store::content_hash(&payload)?;
+                    Ok(json!({
+                        "delivery_id": delivery.delivery_id,
+                        "node_id": node.node_id,
+                        "sequence": node.sequence,
+                        "round": node.round,
+                        "kind": node.kind,
+                        "payload": payload,
+                        "presentation_key": sort_key,
+                    }))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            normalized.sort_by(|left, right| {
+                left.get("presentation_key")
+                    .and_then(Value::as_str)
+                    .cmp(&right.get("presentation_key").and_then(Value::as_str))
+                    .then_with(|| {
+                        left.get("node_id")
+                            .and_then(Value::as_str)
+                            .cmp(&right.get("node_id").and_then(Value::as_str))
+                    })
+            });
+            for payload in &mut normalized {
+                if let Some(object) = payload.as_object_mut() {
+                    object.remove("presentation_key");
+                }
+            }
+            json!({
+                "topic_id": self.topic_id,
+                "deliveries": normalized,
+                "current_round": self.round,
+                "max_rounds": self.max_rounds,
+                "terminal_close_required": self.round >= self.max_rounds,
+                "rust_continuation_gate": self.continuation_gate(),
+                "presentation_policy": {
+                    "role_labels_redacted": true,
+                    "delivery_order": "canonical_content_hash_v1",
+                    "duplicate_report_text_removed": true,
+                },
+                "trusted_protocol": "phase2_topic_debate_tree"
+            })
+        } else if payloads.len() == 1 {
+            let (delivery, node) = payloads.into_iter().next().expect("one payload");
+            let mut payload = json!({
                 "delivery_id": delivery.delivery_id,
                 "node_id": node.node_id,
                 "sequence": node.sequence,
@@ -264,9 +399,13 @@ impl TopicDebateTree {
                 "from": node.from,
                 "kind": node.kind,
                 "payload": node.payload,
-                "trusted_protocol": "phase2_topic_debate_tree"
-            }))?
-        ))
+            });
+            payload["trusted_protocol"] = json!("phase2_topic_debate_tree");
+            payload
+        } else {
+            bail!("only Controller deliveries may be batched in an stree dispatch");
+        };
+        Ok(format!("stree: {}", serde_json::to_string(&message)?))
     }
 
     pub fn submit(&mut self, actor: DebateActor, mut payload: Value) -> Result<StreeNode> {
@@ -275,23 +414,35 @@ impl TopicDebateTree {
             bail!("only Bull or Bear may submit a debate position");
         }
         self.require_running(actor)?;
-        let object = payload
-            .as_object()
-            .context("debate submission must be a JSON object")?;
-        let stance = required_string(object, "stance", 32)?;
-        if !matches!(
-            stance.as_str(),
-            "challenge" | "partial_agree" | "agree" | "retract" | "needs_evidence" | "no_new_info"
-        ) {
-            bail!("unsupported debate stance {stance:?}");
-        }
-        let message = required_string(object, "message", 1_200)?;
-        validate_stance_message_consistency(&stance, &message)?;
-        self.validate_submission_evidence_refs(object)?;
-        let reply_reference = object
-            .get("reply_to_node_id")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned);
+        let (stance, evidence_delta, evidence_links, reply_reference) = {
+            let object = payload
+                .as_object()
+                .context("debate submission must be a JSON object")?;
+            let stance = required_string(object, "stance", 32)?;
+            if !matches!(
+                stance.as_str(),
+                "challenge"
+                    | "partial_agree"
+                    | "agree"
+                    | "retract"
+                    | "needs_evidence"
+                    | "no_new_info"
+            ) {
+                bail!("unsupported debate stance {stance:?}");
+            }
+            let message = required_string(object, "message", 1_200)?;
+            validate_stance_message_consistency(&stance, &message)?;
+            self.validate_submission_evidence_refs(object)?;
+            let evidence_links = self.canonical_submission_evidence_links(object)?;
+            let evidence_delta = self.submission_evidence_delta(object)?;
+            let reply_reference = object
+                .get("reply_to_node_id")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            (stance, evidence_delta, evidence_links, reply_reference)
+        };
+        payload["evidence_delta"] = evidence_delta;
+        payload["evidence_links"] = Value::Array(evidence_links);
         if let Some((delivery_id, route_node_id)) = self.active_route_receipt(actor) {
             // The delivery receipt is the authoritative parent for a routed
             // response. The model may use either a claim alias or a node ID,
@@ -330,6 +481,12 @@ impl TopicDebateTree {
     pub fn controller_route(&mut self, mut payload: Value) -> Result<Vec<StreeNode>> {
         self.ensure_open()?;
         self.require_running(DebateActor::Controller)?;
+        self.require_controller_mailbox_drained()?;
+        if self.initial_collision_complete() && !self.continuation_allowed() {
+            bail!(
+                "controller must close the debate after the completed collision: no newly observed evidence event was introduced"
+            )
+        }
         let (targets, reply_reference) = {
             let object = payload
                 .as_object()
@@ -411,8 +568,21 @@ impl TopicDebateTree {
     }
 
     pub fn controller_close(&mut self, payload: Value) -> Result<StreeNode> {
+        self.controller_close_with_verified_evidence(payload, &BTreeSet::new())
+    }
+
+    /// Close a Controller turn with the exact evidence IDs Rust observed in
+    /// that Controller session.  Consensus is stronger than a role label: the
+    /// Controller must name the accepted current claims and attest to source
+    /// IDs it actually expanded or fetched in this turn.
+    pub fn controller_close_with_verified_evidence(
+        &mut self,
+        payload: Value,
+        controller_verified_evidence_refs: &BTreeSet<String>,
+    ) -> Result<StreeNode> {
         self.ensure_open()?;
         self.require_running(DebateActor::Controller)?;
+        self.require_controller_mailbox_drained()?;
         let object = payload
             .as_object()
             .context("controller close must be a JSON object")?;
@@ -436,6 +606,20 @@ impl TopicDebateTree {
         if reason == "consensus" && !self.has_full_agreement() {
             bail!("consensus close requires an explicit agreement from both Bull and Bear");
         }
+        let consensus_claim_ids = if reason == "consensus" {
+            self.latest_claim_ids()
+        } else {
+            Vec::new()
+        };
+        let accepted_evidence = if reason == "consensus" {
+            self.validate_controller_accepted_evidence(
+                object,
+                &consensus_claim_ids,
+                controller_verified_evidence_refs,
+            )?
+        } else {
+            Vec::new()
+        };
         let controller_message = object.get("message").cloned().unwrap_or(Value::Null);
         let node = self.append_node(
             Some(DebateActor::Controller),
@@ -445,11 +629,6 @@ impl TopicDebateTree {
         );
         self.status = DebateStatus::Closed;
         let claim_ledger = self.structured_claim_ledger();
-        let consensus_claim_ids = if reason == "consensus" {
-            self.latest_claim_ids()
-        } else {
-            Vec::new()
-        };
         let unresolved_claim_ids = if reason == "consensus" {
             Vec::new()
         } else {
@@ -464,7 +643,11 @@ impl TopicDebateTree {
             "controller_decided": true,
             "claim_ledger": claim_ledger,
             "consensus_claim_ids": consensus_claim_ids,
+            "accepted_evidence": accepted_evidence,
+            "controller_verified_evidence_refs": controller_verified_evidence_refs,
             "unresolved_claim_ids": unresolved_claim_ids,
+            "information_gain": self.information_gain_summary(),
+            "independence_assessment": self.independence_assessment(),
         }));
         for participant in self.participants.values_mut() {
             participant.status = ParticipantStatus::Closed;
@@ -583,6 +766,9 @@ impl TopicDebateTree {
             "concessions": concessions,
             "claim_ledger": self.structured_claim_ledger(),
             "evidence_registry": self.evidence_registry,
+            "evidence_event_clusters": self.evidence_event_clusters,
+            "continuation_gate": self.continuation_gate(),
+            "independence_assessment": self.independence_assessment(),
             "nodes": self.nodes,
             "delivery_receipts": self.deliveries,
         })
@@ -617,6 +803,15 @@ impl TopicDebateTree {
         self.deliveries
             .iter()
             .any(|delivery| delivery.target == actor && !delivery.delivered)
+    }
+
+    fn require_controller_mailbox_drained(&self) -> Result<()> {
+        if self.has_pending_delivery(DebateActor::Controller) {
+            bail!(
+                "Controller must receive every pending Bull/Bear submission before routing or closing"
+            );
+        }
+        Ok(())
     }
 
     fn has_pending_opening_delivery(&self, actor: DebateActor) -> bool {
@@ -922,6 +1117,424 @@ impl TopicDebateTree {
         Ok(())
     }
 
+    /// Canonicalize the model-declared relationship between the turn's one
+    /// compact claim (`message`) and each Rust-observed evidence ID.  This is
+    /// an auditable claim-to-source edge, not an attempt to have Rust infer
+    /// natural-language entailment.
+    fn canonical_submission_evidence_links(
+        &self,
+        object: &serde_json::Map<String, Value>,
+    ) -> Result<Vec<Value>> {
+        let references = object
+            .get("evidence_refs")
+            .and_then(Value::as_array)
+            .context("stree submission requires evidence_refs array")?
+            .iter()
+            .map(|reference| {
+                reference
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|reference| !reference.is_empty())
+                    .map(ToOwned::to_owned)
+                    .context("stree submission evidence_refs must contain strings")
+            })
+            .collect::<Result<BTreeSet<_>>>()?;
+        let links = object
+            .get("evidence_links")
+            .and_then(Value::as_array)
+            .context("stree submission requires evidence_links array")?;
+        if links.len() > 3 {
+            bail!("stree submission permits at most three evidence_links")
+        }
+        let mut canonical = BTreeMap::new();
+        for link in links {
+            let link = link
+                .as_object()
+                .context("stree submission evidence_links must contain objects")?;
+            let reference = required_string(link, "evidence_ref", 128)?;
+            if !is_complete_evidence_ref(&reference) {
+                bail!("stree submission evidence_links must use complete stable evidence IDs")
+            }
+            let relation = required_string(link, "relation", 32)?;
+            if !matches!(relation.as_str(), "supports" | "refutes" | "qualifies") {
+                bail!("stree submission evidence_links relation is invalid")
+            }
+            if canonical
+                .insert(reference.clone(), Value::String(relation))
+                .is_some()
+            {
+                bail!("stree submission evidence_links contains duplicate evidence_ref")
+            }
+        }
+        if canonical.keys().cloned().collect::<BTreeSet<_>>() != references {
+            bail!("stree submission evidence_links must cover each evidence_ref exactly once")
+        }
+        Ok(canonical
+            .into_iter()
+            .map(|(evidence_ref, relation)| {
+                json!({
+                    "evidence_ref": evidence_ref,
+                    "relation": relation,
+                    "authority": "model_declared_claim_evidence_relation_v1",
+                })
+            })
+            .collect())
+    }
+
+    fn submission_evidence_delta(&self, object: &serde_json::Map<String, Value>) -> Result<Value> {
+        let evidence_refs = object
+            .get("evidence_refs")
+            .and_then(Value::as_array)
+            .context("stree submission requires evidence_refs array")?
+            .iter()
+            .filter_map(Value::as_str)
+            .map(ToOwned::to_owned)
+            .collect::<BTreeSet<_>>();
+        let previous_refs = self.participant_evidence_refs();
+        let previous_clusters = self.participant_evidence_clusters();
+        let event_clusters = evidence_refs
+            .iter()
+            .filter_map(|reference| self.evidence_event_clusters.get(reference))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let novel_refs = evidence_refs
+            .difference(&previous_refs)
+            .cloned()
+            .collect::<Vec<_>>();
+        let novel_event_cluster_ids = event_clusters
+            .difference(&previous_clusters)
+            .cloned()
+            .collect::<Vec<_>>();
+        Ok(json!({
+            "authority": "rust_phase2_event_lineage_v1",
+            "evidence_refs": evidence_refs.into_iter().collect::<Vec<_>>(),
+            "event_cluster_ids": event_clusters.into_iter().collect::<Vec<_>>(),
+            "novel_evidence_refs": novel_refs,
+            "novel_event_cluster_ids": novel_event_cluster_ids,
+        }))
+    }
+
+    fn participant_evidence_refs(&self) -> BTreeSet<String> {
+        self.nodes
+            .iter()
+            .filter(|node| {
+                matches!(
+                    node.kind,
+                    StreeNodeKind::Submission | StreeNodeKind::Agreement
+                )
+            })
+            .flat_map(|node| {
+                node.payload
+                    .get("evidence_refs")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(ToOwned::to_owned)
+            })
+            .collect()
+    }
+
+    fn participant_evidence_clusters(&self) -> BTreeSet<String> {
+        self.nodes
+            .iter()
+            .filter(|node| {
+                matches!(
+                    node.kind,
+                    StreeNodeKind::Submission | StreeNodeKind::Agreement
+                )
+            })
+            .flat_map(|node| {
+                node.payload
+                    .pointer("/evidence_delta/event_cluster_ids")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(ToOwned::to_owned)
+            })
+            .collect()
+    }
+
+    fn continuation_allowed(&self) -> bool {
+        !self.initial_collision_complete()
+            || self
+                .nodes
+                .iter()
+                .filter(|node| {
+                    matches!(
+                        node.kind,
+                        StreeNodeKind::Submission | StreeNodeKind::Agreement
+                    ) && node.round > 0
+                })
+                .any(|node| {
+                    node.payload
+                        .pointer("/evidence_delta/novel_event_cluster_ids")
+                        .and_then(Value::as_array)
+                        .is_some_and(|items| !items.is_empty())
+                })
+    }
+
+    fn continuation_gate(&self) -> Value {
+        let post_collision_novel_event_clusters = self
+            .nodes
+            .iter()
+            .filter(|node| {
+                matches!(
+                    node.kind,
+                    StreeNodeKind::Submission | StreeNodeKind::Agreement
+                ) && node.round > 0
+            })
+            .flat_map(|node| {
+                node.payload
+                    .pointer("/evidence_delta/novel_event_cluster_ids")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(ToOwned::to_owned)
+            })
+            .collect::<BTreeSet<_>>();
+        let direct_collision_complete = self.initial_collision_complete();
+        let continuation_allowed = self.continuation_allowed();
+        json!({
+            "authority": "rust_phase2_information_gain_gate_v1",
+            "direct_collision_complete": direct_collision_complete,
+            "continuation_allowed": continuation_allowed,
+            "post_collision_novel_event_cluster_ids": post_collision_novel_event_clusters,
+            "reason": if continuation_allowed {
+                "initial_collision_pending_or_new_event_observed"
+            } else {
+                "close_required_no_new_event_after_direct_collision"
+            },
+        })
+    }
+
+    fn information_gain_summary(&self) -> Value {
+        let participant_nodes = self
+            .nodes
+            .iter()
+            .filter(|node| {
+                matches!(
+                    node.kind,
+                    StreeNodeKind::Submission | StreeNodeKind::Agreement
+                )
+            })
+            .collect::<Vec<_>>();
+        let post_collision_novel_event_cluster_ids = participant_nodes
+            .iter()
+            .filter(|node| node.round > 0)
+            .flat_map(|node| {
+                node.payload
+                    .pointer("/evidence_delta/novel_event_cluster_ids")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(ToOwned::to_owned)
+            })
+            .collect::<BTreeSet<_>>();
+        json!({
+            "authority": "rust_phase2_information_gain_gate_v1",
+            "participant_submission_count": participant_nodes.len(),
+            "post_collision_novel_event_cluster_ids": post_collision_novel_event_cluster_ids,
+            "continuation_gate": self.continuation_gate(),
+        })
+    }
+
+    fn independence_assessment(&self) -> Value {
+        let side_clusters = |actor| {
+            self.nodes
+                .iter()
+                .filter(|node| {
+                    matches!(
+                        node.kind,
+                        StreeNodeKind::Submission | StreeNodeKind::Agreement
+                    ) && node.from == Some(actor)
+                })
+                .flat_map(|node| {
+                    node.payload
+                        .pointer("/evidence_delta/event_cluster_ids")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .map(ToOwned::to_owned)
+                })
+                .collect::<BTreeSet<_>>()
+        };
+        let bull_clusters = side_clusters(DebateActor::Bull);
+        let bear_clusters = side_clusters(DebateActor::Bear);
+        let shared_clusters = bull_clusters
+            .intersection(&bear_clusters)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let bull_unique = bull_clusters
+            .difference(&shared_clusters)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let bear_unique = bear_clusters
+            .difference(&shared_clusters)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let model_independence = self
+            .independence_context
+            .get("model_independence")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let novel_event_observed = self
+            .nodes
+            .iter()
+            .filter(|node| {
+                matches!(
+                    node.kind,
+                    StreeNodeKind::Submission | StreeNodeKind::Agreement
+                ) && node.round > 0
+            })
+            .any(|node| {
+                node.payload
+                    .pointer("/evidence_delta/novel_event_cluster_ids")
+                    .and_then(Value::as_array)
+                    .is_some_and(|items| !items.is_empty())
+            });
+        let adjustment_eligible = self.initial_collision_complete()
+            && model_independence == "distinct_models"
+            && novel_event_observed;
+        json!({
+            "authority": "rust_phase2_independence_gate_v1",
+            "shared_warmup": self.independence_context.get("shared_warmup").cloned().unwrap_or(Value::Bool(true)),
+            "bull_model": self.independence_context.get("bull_model").cloned().unwrap_or(Value::Null),
+            "bear_model": self.independence_context.get("bear_model").cloned().unwrap_or(Value::Null),
+            "model_independence": model_independence,
+            "shared_event_cluster_ids": shared_clusters,
+            "bull_unique_event_cluster_ids": bull_unique,
+            "bear_unique_event_cluster_ids": bear_unique,
+            "novel_event_observed_after_collision": novel_event_observed,
+            "adjustment_eligible": adjustment_eligible,
+            "reason": if adjustment_eligible {
+                "distinct_models_and_new_event_after_direct_collision"
+            } else if model_independence == "same_model" {
+                "same_model_shared_warmup_is_correlated_not_an_independent_vote"
+            } else if !novel_event_observed {
+                "no_new_event_after_direct_collision"
+            } else {
+                "model_independence_not_proven"
+            },
+        })
+    }
+
+    fn validate_controller_accepted_evidence(
+        &self,
+        object: &serde_json::Map<String, Value>,
+        consensus_claim_ids: &[String],
+        controller_verified_evidence_refs: &BTreeSet<String>,
+    ) -> Result<Vec<Value>> {
+        let expected_claim_ids = consensus_claim_ids.iter().cloned().collect::<BTreeSet<_>>();
+        let accepted_claims = object
+            .get("accepted_claims")
+            .and_then(Value::as_array)
+            .context("consensus close requires accepted_claims")?;
+        if accepted_claims.len() != expected_claim_ids.len() {
+            bail!(
+                "consensus close accepted_claims must cover each current Bull/Bear agreement exactly once"
+            )
+        }
+        let mut canonical = BTreeMap::<String, BTreeSet<String>>::new();
+        for accepted_claim in accepted_claims {
+            let accepted_claim = accepted_claim
+                .as_object()
+                .context("consensus close accepted_claims must contain objects")?;
+            let claim_id = required_string(accepted_claim, "claim_id", 256)?;
+            if !expected_claim_ids.contains(&claim_id) {
+                bail!("consensus close accepted_claims references a non-current claim")
+            }
+            let evidence_refs = accepted_claim
+                .get("evidence_refs")
+                .and_then(Value::as_array)
+                .context("consensus close accepted_claims requires evidence_refs")?;
+            if evidence_refs.is_empty() || evidence_refs.len() > 3 {
+                bail!(
+                    "consensus close accepted_claims evidence_refs must contain one to three stable evidence IDs"
+                )
+            }
+            let declared_links = self.claim_declared_evidence_links(&claim_id)?;
+            let mut accepted_refs = BTreeSet::new();
+            for evidence_ref in evidence_refs {
+                let evidence_ref = evidence_ref
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .context(
+                        "consensus close accepted_claims evidence_refs must contain strings",
+                    )?;
+                if !is_complete_evidence_ref(evidence_ref) {
+                    bail!(
+                        "consensus close accepted_claims evidence_refs must use complete stable evidence IDs"
+                    )
+                }
+                if !declared_links.contains(evidence_ref) {
+                    bail!(
+                        "consensus close accepted evidence must have a participant-declared claim relation"
+                    )
+                }
+                if !controller_verified_evidence_refs.contains(evidence_ref) {
+                    bail!(
+                        "consensus close accepted evidence must have been observed by Rust in the Controller turn"
+                    )
+                }
+                if !accepted_refs.insert(evidence_ref.to_owned()) {
+                    bail!("consensus close accepted_claims contains duplicate evidence_refs")
+                }
+            }
+            if canonical.insert(claim_id, accepted_refs).is_some() {
+                bail!("consensus close accepted_claims contains duplicate claim_id")
+            }
+        }
+        if canonical.keys().cloned().collect::<BTreeSet<_>>() != expected_claim_ids {
+            bail!(
+                "consensus close accepted_claims must cover each current Bull/Bear agreement exactly once"
+            )
+        }
+        Ok(canonical
+            .into_iter()
+            .map(|(claim_id, evidence_refs)| {
+                json!({
+                    "claim_id": claim_id,
+                    "evidence_refs": evidence_refs,
+                    "authority": "rust_controller_observed_consensus_evidence_v1",
+                })
+            })
+            .collect())
+    }
+
+    fn claim_declared_evidence_links(&self, claim_id: &str) -> Result<BTreeSet<String>> {
+        let node = self
+            .nodes
+            .iter()
+            .find(|node| node.node_id == claim_id)
+            .with_context(|| format!("consensus claim {claim_id} is absent from the topic tree"))?;
+        if !matches!(
+            node.kind,
+            StreeNodeKind::Submission | StreeNodeKind::Agreement
+        ) {
+            bail!("consensus claim {claim_id} is not a participant submission")
+        }
+        let evidence_links = node
+            .payload
+            .get("evidence_links")
+            .and_then(Value::as_array)
+            .with_context(|| format!("consensus claim {claim_id} has no evidence_links"))?;
+        let links = evidence_links
+            .iter()
+            .filter_map(|link| link.get("evidence_ref").and_then(Value::as_str))
+            .map(ToOwned::to_owned)
+            .collect::<BTreeSet<_>>();
+        if links.is_empty() {
+            bail!("consensus claim {claim_id} has no evidence-linked support")
+        }
+        Ok(links)
+    }
+
     fn structured_claim_ledger(&self) -> Vec<Value> {
         self.nodes
             .iter()
@@ -950,6 +1563,8 @@ impl TopicDebateTree {
                     "status": status,
                     "reply_to_claim_id": node.payload.get("reply_to_node_id").cloned().unwrap_or(Value::Null),
                     "evidence_refs": node.payload.get("evidence_refs").cloned().unwrap_or_else(|| json!([])),
+                    "evidence_links": node.payload.get("evidence_links").cloned().unwrap_or_else(|| json!([])),
+                    "evidence_delta": node.payload.get("evidence_delta").cloned().unwrap_or(Value::Null),
                 })
             })
             .collect()
@@ -986,6 +1601,50 @@ fn required_string(
         bail!("stree payload field {field} exceeds {max_chars} characters");
     }
     Ok(value)
+}
+
+/// The Controller receives the evidence-bearing part of a participant turn,
+/// not the long-form report that happened to precede it.  The report remains
+/// in the immutable node for audit, while this compact packet removes a
+/// controllable source of length, placement, and role-label bias.
+fn controller_visible_payload(node: &StreeNode) -> Value {
+    let message = node
+        .payload
+        .get("message")
+        .and_then(Value::as_str)
+        .map(|value| value.chars().take(600).collect::<String>())
+        .unwrap_or_default();
+    let evidence_refs = node
+        .payload
+        .get("evidence_refs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(ToOwned::to_owned)
+        .collect::<BTreeSet<_>>();
+    let evidence_links = node
+        .payload
+        .get("evidence_links")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|link| {
+            let evidence_ref = link.get("evidence_ref")?.as_str()?;
+            let relation = link.get("relation")?.as_str()?;
+            Some(json!({"evidence_ref": evidence_ref, "relation": relation}))
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "stance": node.payload.get("stance").cloned().unwrap_or(Value::Null),
+        "message": message,
+        "reply_to_node_id": node.payload.get("reply_to_node_id").cloned().unwrap_or(Value::Null),
+        "evidence_refs": evidence_refs,
+        "evidence_links": evidence_links,
+        "evidence_delta": node.payload.get("evidence_delta").cloned().unwrap_or(Value::Null),
+        "failure": node.payload.get("error").cloned().unwrap_or(Value::Null),
+        "packet_policy": "role_blinded_compact_claim_v1",
+    })
 }
 
 fn is_complete_evidence_ref(reference: &str) -> bool {
@@ -1078,6 +1737,8 @@ mod tests {
 
     const EVIDENCE_REF: &str =
         "technical-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const SAME_EVENT_DIFFERENT_REF: &str =
+        "web-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
     fn tree() -> TopicDebateTree {
         let mut tree = TopicDebateTree::open(
@@ -1091,10 +1752,19 @@ mod tests {
     }
 
     fn submission(stance: &str, reply_to_node_id: Option<&str>) -> Value {
+        submission_with_evidence(stance, reply_to_node_id, EVIDENCE_REF)
+    }
+
+    fn submission_with_evidence(
+        stance: &str,
+        reply_to_node_id: Option<&str>,
+        evidence_ref: &str,
+    ) -> Value {
         let mut value = json!({
             "stance": stance,
             "message": format!("{stance} with evidence boundary"),
-            "evidence_refs": [EVIDENCE_REF]
+            "evidence_refs": [evidence_ref],
+            "evidence_links": [{"evidence_ref": evidence_ref, "relation": "supports"}]
         });
         if let Some(reply_to_node_id) = reply_to_node_id {
             value["reply_to_node_id"] = json!(reply_to_node_id);
@@ -1117,11 +1787,94 @@ mod tests {
 
         let controller = tree.next_dispatch().unwrap();
         assert_eq!(controller.actor, DebateActor::Controller);
-        let delivery = controller.delivery.unwrap();
+        assert_eq!(controller.deliveries.len(), 2);
+        let injection = tree.injected_user_message(&controller.deliveries).unwrap();
+        let payload: Value = serde_json::from_str(injection.trim_start_matches("stree: ")).unwrap();
+        assert_eq!(payload["deliveries"].as_array().unwrap().len(), 2);
+        assert_eq!(payload["deliveries"][0]["node_id"], "topic-a:stree:3");
+        assert_eq!(payload["deliveries"][1]["node_id"], "topic-a:stree:4");
+    }
+
+    #[test]
+    fn controller_receives_the_entire_final_collision_wave_before_closing() {
+        let mut tree = TopicDebateTree::open(
+            "topic-a",
+            json!({"topic": "rate path", "decision_hinge": "yield response"}),
+            1,
+        )
+        .unwrap();
+        tree.register_evidence_refs([EVIDENCE_REF]).unwrap();
+
+        assert_eq!(tree.next_dispatch().unwrap().actor, DebateActor::Bull);
+        let bull_opening = tree
+            .submit(DebateActor::Bull, submission("challenge", None))
+            .unwrap();
+        assert_eq!(tree.next_dispatch().unwrap().actor, DebateActor::Bear);
+        let bear_opening = tree
+            .submit(DebateActor::Bear, submission("challenge", None))
+            .unwrap();
+
+        let opening_controller = tree.next_dispatch().unwrap();
+        assert_eq!(opening_controller.actor, DebateActor::Controller);
+        assert_eq!(opening_controller.deliveries.len(), 2);
+        let routes = tree
+            .controller_route(json!({
+                "targets": ["bull", "bear"],
+                "reply_to_node_id": bear_opening.node_id,
+                "message": "both sides must address the opposing opening"
+            }))
+            .unwrap();
+
+        assert_eq!(tree.next_dispatch().unwrap().actor, DebateActor::Bull);
+        let bull_reply = tree
+            .submit(
+                DebateActor::Bull,
+                submission("partial_agree", Some(&routes[0].node_id)),
+            )
+            .unwrap();
+        assert_eq!(tree.next_dispatch().unwrap().actor, DebateActor::Bear);
+        let bear_reply = tree
+            .submit(
+                DebateActor::Bear,
+                submission("partial_agree", Some(&routes[1].node_id)),
+            )
+            .unwrap();
+
+        let final_controller = tree.next_dispatch().unwrap();
+        assert_eq!(final_controller.actor, DebateActor::Controller);
+        assert_eq!(final_controller.deliveries.len(), 2);
+        assert_eq!(
+            final_controller
+                .deliveries
+                .iter()
+                .map(|delivery| delivery.node_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![bull_reply.node_id.as_str(), bear_reply.node_id.as_str()]
+        );
+        let injection = tree
+            .injected_user_message(&final_controller.deliveries)
+            .unwrap();
+        let payload: Value = serde_json::from_str(injection.trim_start_matches("stree: ")).unwrap();
+        assert_eq!(payload["terminal_close_required"], true);
         assert!(tree
-            .injected_user_message(&delivery)
-            .unwrap()
-            .starts_with("stree: "));
+            .deliveries
+            .iter()
+            .filter(|delivery| delivery.target == DebateActor::Controller)
+            .all(|delivery| delivery.delivered));
+
+        tree.controller_close(json!({
+            "reason": "unresolved_disagreement",
+            "message": "both final replies were reviewed before the terminal decision"
+        }))
+        .unwrap();
+        assert_eq!(
+            tree.closure.as_ref().unwrap()["unresolved_claim_ids"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(bull_opening.node_id, "topic-a:stree:3");
     }
 
     #[test]
@@ -1141,6 +1894,10 @@ mod tests {
         let mut payload = submission("challenge", None);
         payload["evidence_refs"] =
             json!(["technical-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]);
+        payload["evidence_links"] = json!([{
+            "evidence_ref": "technical-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "relation": "supports"
+        }]);
 
         let error = tree.submit(DebateActor::Bull, payload).unwrap_err();
         assert!(error.to_string().contains("not observed by Rust"));
@@ -1193,9 +1950,6 @@ mod tests {
         assert!(tree
             .controller_close(json!({"reason":"unresolved_disagreement", "message":"too early"}))
             .is_err());
-        tree.controller_wait(json!({"message": "need Bear's initial position"}))
-            .unwrap();
-        assert_eq!(tree.next_dispatch().unwrap().actor, DebateActor::Controller);
         tree.controller_route(json!({
             "targets": ["bull", "bear"],
             "reply_to_node_id": bear.node_id,
@@ -1235,11 +1989,15 @@ mod tests {
             .submit(DebateActor::Bear, submission("challenge", None))
             .unwrap();
 
-        assert_eq!(tree.next_dispatch().unwrap().actor, DebateActor::Controller);
-        tree.controller_wait(json!({"message": "wait for Bear opening"}))
-            .unwrap();
         let controller = tree.next_dispatch().unwrap();
-        let receipt_id = controller.delivery.unwrap().delivery_id;
+        assert_eq!(controller.actor, DebateActor::Controller);
+        let receipt_id = controller
+            .deliveries
+            .iter()
+            .find(|delivery| delivery.node_id == bear.node_id)
+            .unwrap()
+            .delivery_id
+            .clone();
         tree.controller_route(json!({
             "targets": ["bull", "bear"],
             "reply_to_node_id": receipt_id,
@@ -1275,10 +2033,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(tree.next_dispatch().unwrap().actor, DebateActor::Controller);
-        tree.controller_wait(json!({"message": "record both seed positions"}))
-            .unwrap();
-        assert_eq!(tree.next_dispatch().unwrap().actor, DebateActor::Controller);
-
         let routes = tree
             .controller_route(json!({
                 "targets": ["bull", "bear"],
@@ -1458,12 +2212,9 @@ mod tests {
         assert_eq!(tree.next_dispatch().unwrap().actor, DebateActor::Controller);
         tree.controller_wait(json!({"message": "Bull retry is scheduled"}))
             .unwrap();
-        assert_eq!(tree.next_dispatch().unwrap().actor, DebateActor::Controller);
-        tree.controller_wait(json!({"message": "Bear initial position is available"}))
-            .unwrap();
         let retry = tree.next_dispatch().unwrap();
         assert_eq!(retry.actor, DebateActor::Bull);
-        assert!(retry.delivery.is_none());
+        assert!(retry.deliveries.is_empty());
         tree.record_failure(DebateActor::Bull, "gateway timeout", 1)
             .unwrap();
         assert_eq!(
@@ -1484,5 +2235,246 @@ mod tests {
         assert_eq!(tree.closure.as_ref().unwrap()["safety_enforced"], true);
         assert_eq!(tree.nodes.last().unwrap().kind, StreeNodeKind::Close);
         assert!(tree.next_dispatch().is_none());
+    }
+
+    #[test]
+    fn controller_packet_is_role_blinded_and_order_invariant() {
+        let mut tree = tree();
+        tree.next_dispatch();
+        let mut bull = submission("challenge", None);
+        bull["message"] = json!("Bull message with deliberately different wording");
+        bull["report"] = json!("Bull report must never be delivered to the Controller");
+        tree.submit(DebateActor::Bull, bull).unwrap();
+        tree.next_dispatch();
+        let mut bear = submission("challenge", None);
+        bear["message"] = json!("Bear message with deliberately different wording");
+        bear["report"] = json!("Bear report must never be delivered to the Controller");
+        tree.submit(DebateActor::Bear, bear).unwrap();
+
+        let dispatch = tree.next_dispatch().unwrap();
+        assert_eq!(dispatch.actor, DebateActor::Controller);
+        let canonical = tree.injected_user_message(&dispatch.deliveries).unwrap();
+        let mut reversed = dispatch.deliveries.clone();
+        reversed.reverse();
+        assert_eq!(canonical, tree.injected_user_message(&reversed).unwrap());
+
+        let packet: Value = serde_json::from_str(canonical.trim_start_matches("stree: ")).unwrap();
+        assert_eq!(packet["presentation_policy"]["role_labels_redacted"], true);
+        for delivery in packet["deliveries"].as_array().unwrap() {
+            assert!(delivery.get("from").is_none());
+            assert!(delivery["payload"].get("report").is_none());
+        }
+    }
+
+    #[test]
+    fn consensus_requires_controller_observed_claim_evidence() {
+        let mut tree = tree();
+        tree.set_independence_context("model-a", "model-b");
+        tree.next_dispatch();
+        let bull_opening = tree
+            .submit(DebateActor::Bull, submission("challenge", None))
+            .unwrap();
+        tree.next_dispatch();
+        let bear_opening = tree
+            .submit(DebateActor::Bear, submission("challenge", None))
+            .unwrap();
+        tree.next_dispatch();
+        let routes = tree
+            .controller_route(json!({
+                "targets": ["bull", "bear"],
+                "reply_to_node_id": bear_opening.node_id,
+                "message": "both sides must answer the opposing opening"
+            }))
+            .unwrap();
+
+        tree.next_dispatch();
+        let bull_agreement = tree
+            .submit(
+                DebateActor::Bull,
+                submission("agree", Some(&routes[0].node_id)),
+            )
+            .unwrap();
+        tree.next_dispatch();
+        let bear_agreement = tree
+            .submit(
+                DebateActor::Bear,
+                submission("agree", Some(&routes[1].node_id)),
+            )
+            .unwrap();
+        assert!(tree.initial_collision_complete());
+        assert_eq!(tree.next_dispatch().unwrap().actor, DebateActor::Controller);
+
+        let close = || {
+            json!({
+                "reason": "consensus",
+                "message": "Both current agreements were independently checked.",
+                "accepted_claims": [
+                    {"claim_id": bull_agreement.node_id, "evidence_refs": [EVIDENCE_REF]},
+                    {"claim_id": bear_agreement.node_id, "evidence_refs": [EVIDENCE_REF]}
+                ]
+            })
+        };
+        let error = tree
+            .controller_close_with_verified_evidence(close(), &BTreeSet::new())
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("observed by Rust in the Controller turn"));
+
+        let mut verified = BTreeSet::new();
+        verified.insert(EVIDENCE_REF.to_owned());
+        tree.controller_close_with_verified_evidence(close(), &verified)
+            .unwrap();
+        assert_eq!(
+            tree.closure.as_ref().unwrap()["accepted_evidence"][0]["authority"],
+            "rust_controller_observed_consensus_evidence_v1"
+        );
+        assert_eq!(
+            tree.closure.as_ref().unwrap()["consensus_claim_ids"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(bull_opening.node_id, "topic-a:stree:3");
+    }
+
+    #[test]
+    fn same_event_under_a_new_id_cannot_buy_an_extra_debate_round() {
+        let mut tree = TopicDebateTree::open(
+            "topic-a",
+            json!({"topic": "rate path", "decision_hinge": "yield response"}),
+            3,
+        )
+        .unwrap();
+        tree.register_evidence_ref_cluster(EVIDENCE_REF, "url:sameevent")
+            .unwrap();
+        tree.register_evidence_ref_cluster(SAME_EVENT_DIFFERENT_REF, "url:sameevent")
+            .unwrap();
+        tree.set_independence_context("model-a", "model-b");
+
+        assert_eq!(tree.next_dispatch().unwrap().actor, DebateActor::Bull);
+        let bull = tree
+            .submit(
+                DebateActor::Bull,
+                submission_with_evidence("challenge", None, EVIDENCE_REF),
+            )
+            .unwrap();
+        assert_eq!(tree.next_dispatch().unwrap().actor, DebateActor::Bear);
+        let bear = tree
+            .submit(
+                DebateActor::Bear,
+                submission_with_evidence("challenge", None, EVIDENCE_REF),
+            )
+            .unwrap();
+        assert_eq!(tree.next_dispatch().unwrap().actor, DebateActor::Controller);
+        let routes = tree
+            .controller_route(json!({
+                "targets": ["bull", "bear"],
+                "reply_to_node_id": bear.node_id,
+                "message": "direct collision first"
+            }))
+            .unwrap();
+        assert_eq!(tree.next_dispatch().unwrap().actor, DebateActor::Bull);
+        tree.submit(
+            DebateActor::Bull,
+            submission_with_evidence(
+                "challenge",
+                Some(&routes[0].node_id),
+                SAME_EVENT_DIFFERENT_REF,
+            ),
+        )
+        .unwrap();
+        assert_eq!(tree.next_dispatch().unwrap().actor, DebateActor::Bear);
+        tree.submit(
+            DebateActor::Bear,
+            submission_with_evidence(
+                "challenge",
+                Some(&routes[1].node_id),
+                SAME_EVENT_DIFFERENT_REF,
+            ),
+        )
+        .unwrap();
+
+        let controller = tree.next_dispatch().unwrap();
+        let packet: Value = serde_json::from_str(
+            tree.injected_user_message(&controller.deliveries)
+                .unwrap()
+                .trim_start_matches("stree: "),
+        )
+        .unwrap();
+        assert_eq!(
+            packet["rust_continuation_gate"]["continuation_allowed"],
+            false
+        );
+        let error = tree
+            .controller_route(json!({
+                "targets": ["bull", "bear"],
+                "reply_to_node_id": bull.node_id,
+                "message": "attempt an unsupported extra round"
+            }))
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("no newly observed evidence event"));
+        tree.controller_close(json!({
+            "reason": "evidence_exhausted",
+            "message": "same event was only repackaged under a new ID"
+        }))
+        .unwrap();
+        assert_eq!(
+            tree.closure.as_ref().unwrap()["information_gain"]["continuation_gate"]
+                ["continuation_allowed"],
+            false
+        );
+    }
+
+    #[test]
+    fn same_model_shared_warmup_is_not_an_independent_probability_vote() {
+        let mut tree = tree();
+        tree.set_independence_context("same-model", "same-model");
+        tree.next_dispatch();
+        let bull = tree
+            .submit(DebateActor::Bull, submission("challenge", None))
+            .unwrap();
+        tree.next_dispatch();
+        let bear = tree
+            .submit(DebateActor::Bear, submission("challenge", None))
+            .unwrap();
+        tree.next_dispatch();
+        let routes = tree
+            .controller_route(json!({
+                "targets": ["bull", "bear"],
+                "reply_to_node_id": bear.node_id,
+                "message": "direct collision"
+            }))
+            .unwrap();
+        tree.next_dispatch();
+        tree.submit(
+            DebateActor::Bull,
+            submission("partial_agree", Some(&routes[0].node_id)),
+        )
+        .unwrap();
+        tree.next_dispatch();
+        tree.submit(
+            DebateActor::Bear,
+            submission("partial_agree", Some(&routes[1].node_id)),
+        )
+        .unwrap();
+        tree.next_dispatch();
+        tree.controller_close(json!({
+            "reason": "unresolved_disagreement",
+            "message": "same model views remain correlated"
+        }))
+        .unwrap();
+        assert_eq!(
+            tree.closure.as_ref().unwrap()["independence_assessment"]["adjustment_eligible"],
+            false
+        );
+        assert_eq!(
+            tree.closure.as_ref().unwrap()["independence_assessment"]["reason"],
+            "same_model_shared_warmup_is_correlated_not_an_independent_vote"
+        );
+        assert_eq!(bull.node_id, "topic-a:stree:3");
     }
 }

@@ -5,6 +5,7 @@
 //! ranking derives from typed identity and evidence metrics, while callers
 //! retain responsibility for rendering rule text in a fenced data section.
 
+use chrono::NaiveDate;
 use orchestrator_core::{ExperienceState, MarketRegime, Scope};
 use orchestrator_store::{ExperienceLedger, ExperienceViewV1};
 
@@ -15,6 +16,9 @@ pub struct ExperienceSearchQuery {
     pub ticker: Option<String>,
     pub horizon_trading_days: Option<u32>,
     pub regime: MarketRegime,
+    /// The frozen date of the current run. Experiences learned after this
+    /// date are excluded so a replay cannot import future hindsight.
+    pub as_of_date: Option<NaiveDate>,
     pub lexical_query: String,
     pub max_results: usize,
 }
@@ -33,6 +37,11 @@ pub struct RetrievedExperience {
     pub pattern_id: String,
     pub score: i64,
     pub view: ExperienceViewV1,
+    pub scope: Scope,
+    pub ticker: Option<String>,
+    pub horizon_trading_days: Option<u32>,
+    pub regime: MarketRegime,
+    pub recency_penalty: i64,
     pub rule: String,
     pub trigger_conditions: Vec<String>,
     pub invalidation_conditions: Vec<String>,
@@ -67,6 +76,21 @@ pub fn search_experiences(
         };
         let pattern = event.pattern_identity.as_ref().expect("filtered");
         let rule = event.rule_revision.as_ref().expect("filtered");
+        // Applicability is a hard admission check, not a ranking bonus. A
+        // QQQ lesson, a different holding horizon, or a regime that has not
+        // been observed in the current frozen input must not leak into a
+        // current decision merely because its wording scores well.
+        if !ticker_matches(
+            pattern.scope,
+            pattern.ticker.as_deref(),
+            query.ticker.as_deref(),
+        ) || !horizon_matches(pattern.horizon_trading_days, query.horizon_trading_days)
+            || !pattern.regime.is_compatible_with(&query.regime)
+            || !experience_is_available_at_as_of(&view, query.as_of_date)
+        {
+            continue;
+        }
+        let recency_penalty = experience_recency_penalty(&view, query.as_of_date);
         let mut score = 0i64;
         if pattern.root_cause_phase == query.phase {
             score += 24;
@@ -74,19 +98,9 @@ pub fn search_experiences(
         if pattern.source_role == query.role {
             score += 18;
         }
-        if ticker_matches(
-            pattern.scope,
-            pattern.ticker.as_deref(),
-            query.ticker.as_deref(),
-        ) {
-            score += 16;
-        }
-        if pattern.horizon_trading_days == query.horizon_trading_days {
-            score += 10;
-        }
-        if pattern.regime.is_compatible_with(&query.regime) {
-            score += 8;
-        }
+        score += 16;
+        score += 10;
+        score += 8;
         score += lexical_score(&query.lexical_query, &rule.rule);
         score += i64::from(view.support_count.min(10));
         score += view
@@ -96,6 +110,7 @@ pub fn search_experiences(
             / 1_000_000;
         score -= i64::from(view.contradiction_count) * 12;
         score -= i64::from(view.harmful_usage_rate_ppm) / 50_000;
+        score -= recency_penalty;
         score += match view.state {
             ExperienceState::Active => 16,
             ExperienceState::RepeatedWarning => 6,
@@ -107,6 +122,11 @@ pub fn search_experiences(
             pattern_id: view.pattern_id.clone(),
             score,
             view,
+            scope: pattern.scope,
+            ticker: pattern.ticker.clone(),
+            horizon_trading_days: pattern.horizon_trading_days,
+            regime: pattern.regime.clone(),
+            recency_penalty,
             rule: rule.rule.clone(),
             trigger_conditions: rule.trigger_conditions.clone(),
             invalidation_conditions: rule.invalidation_conditions.clone(),
@@ -151,6 +171,50 @@ fn ticker_matches(scope: Scope, pattern_ticker: Option<&str>, query_ticker: Opti
     }
 }
 
+fn horizon_matches(pattern_horizon: Option<u32>, query_horizon: Option<u32>) -> bool {
+    match query_horizon {
+        Some(query_horizon) => pattern_horizon == Some(query_horizon),
+        // An unknown current horizon cannot justify applying a horizon-bound
+        // historical lesson. Only an explicitly horizon-agnostic Pattern may
+        // remain visible in that case.
+        None => pattern_horizon.is_none(),
+    }
+}
+
+fn experience_is_available_at_as_of(
+    view: &ExperienceViewV1,
+    as_of_date: Option<NaiveDate>,
+) -> bool {
+    let Some(as_of_date) = as_of_date else {
+        return true;
+    };
+    view.last_supported_at
+        .as_deref()
+        .and_then(parse_experience_date)
+        .is_some_and(|supported_at| supported_at <= as_of_date)
+}
+
+fn experience_recency_penalty(view: &ExperienceViewV1, as_of_date: Option<NaiveDate>) -> i64 {
+    let Some(as_of_date) = as_of_date else {
+        return 0;
+    };
+    let Some(supported_at) = view
+        .last_supported_at
+        .as_deref()
+        .and_then(parse_experience_date)
+    else {
+        return 0;
+    };
+    let age_days = (as_of_date - supported_at).num_days().max(0);
+    // Four ranking points per 90 calendar days, capped so a sound but older
+    // lesson remains inspectable when it is otherwise highly applicable.
+    ((age_days / 90) * 4).min(32)
+}
+
+fn parse_experience_date(value: &str) -> Option<NaiveDate> {
+    NaiveDate::parse_from_str(value.trim().get(..10)?, "%Y-%m-%d").ok()
+}
+
 fn lexical_score(query: &str, rule: &str) -> i64 {
     let rule = rule.to_ascii_lowercase();
     query
@@ -192,7 +256,10 @@ mod tests {
                 scope: Scope::Ticker,
                 ticker: Some("QQQ".into()),
                 horizon_trading_days: Some(3),
-                regime: MarketRegime::default(),
+                regime: MarketRegime {
+                    volatility: "normal".into(),
+                    ..Default::default()
+                },
                 signal_family: SignalFamily::Technical,
                 action_kind: PatternActionKind::Hold,
             }),
@@ -233,6 +300,7 @@ mod tests {
                 ticker: Some("QQQ".into()),
                 horizon_trading_days: Some(3),
                 regime: MarketRegime::default(),
+                as_of_date: Some(NaiveDate::from_ymd_opt(2026, 1, 2).unwrap()),
                 lexical_query: "technical confirmation".into(),
                 max_results: 1,
             },
@@ -240,5 +308,106 @@ mod tests {
         .unwrap();
         assert_eq!(result.items.len(), 1);
         assert_eq!(result.stop_reason, RetrievalStopReason::Sufficient);
+    }
+
+    #[test]
+    fn retrieval_filters_ticker_horizon_regime_and_future_hindsight_before_ranking() {
+        let ledger = ledger();
+        let base = event();
+        ledger.append(base).unwrap();
+
+        let mut wrong_ticker = event();
+        wrong_ticker.pattern_id = "wrong-ticker".into();
+        wrong_ticker.pattern_identity.as_mut().unwrap().ticker = Some("SOXX".into());
+        ledger.append(wrong_ticker).unwrap();
+
+        let mut wrong_horizon = event();
+        wrong_horizon.pattern_id = "wrong-horizon".into();
+        wrong_horizon
+            .pattern_identity
+            .as_mut()
+            .unwrap()
+            .horizon_trading_days = Some(5);
+        ledger.append(wrong_horizon).unwrap();
+
+        let mut wrong_regime = event();
+        wrong_regime.pattern_id = "wrong-regime".into();
+        wrong_regime.pattern_identity.as_mut().unwrap().regime = MarketRegime {
+            volatility: "elevated".into(),
+            ..Default::default()
+        };
+        ledger.append(wrong_regime).unwrap();
+
+        let mut future = event();
+        future.pattern_id = "future".into();
+        future.created_at = "2026-02-01T00:00:00Z".into();
+        ledger.append(future).unwrap();
+
+        for pattern_id in [
+            "pattern",
+            "wrong-ticker",
+            "wrong-horizon",
+            "wrong-regime",
+            "future",
+        ] {
+            ledger
+                .rebuild_view(pattern_id, "2026-02-02T00:00:00Z")
+                .unwrap();
+        }
+
+        let result = search_experiences(
+            &ledger,
+            &ExperienceSearchQuery {
+                phase: 3,
+                role: "manager.research".into(),
+                ticker: Some("QQQ".into()),
+                horizon_trading_days: Some(3),
+                regime: MarketRegime {
+                    volatility: "normal".into(),
+                    ..Default::default()
+                },
+                as_of_date: Some(NaiveDate::from_ymd_opt(2026, 1, 15).unwrap()),
+                lexical_query: "technical confirmation".into(),
+                max_results: 10,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            result
+                .items
+                .iter()
+                .map(|item| item.pattern_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["pattern"]
+        );
+        assert_eq!(result.items[0].recency_penalty, 0);
+    }
+
+    #[test]
+    fn retrieval_applies_a_bounded_recency_penalty() {
+        let ledger = ledger();
+        ledger.append(event()).unwrap();
+        ledger
+            .rebuild_view("pattern", "2026-08-01T00:00:00Z")
+            .unwrap();
+
+        let result = search_experiences(
+            &ledger,
+            &ExperienceSearchQuery {
+                phase: 3,
+                role: "manager.research".into(),
+                ticker: Some("QQQ".into()),
+                horizon_trading_days: Some(3),
+                regime: MarketRegime::default(),
+                as_of_date: Some(NaiveDate::from_ymd_opt(2026, 8, 1).unwrap()),
+                lexical_query: String::new(),
+                max_results: 1,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.items.len(), 1);
+        assert!(result.items[0].recency_penalty > 0);
     }
 }

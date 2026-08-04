@@ -411,6 +411,8 @@ mod tests {
             location,
             workflow_version: "test".to_owned(),
             prompt_versions: Default::default(),
+            prompt_content_hash: "sha256:prompts".to_owned(),
+            source_surface_hash: "sha256:source".to_owned(),
             git_sha: "test".to_owned(),
             config_hash: "test".to_owned(),
             role_profile_registry_hash: "test".to_owned(),

@@ -38,8 +38,9 @@
    - `evidence_refs`：fork 内真实存在的 summary id 或 `role:<role_id>` 引用。
 2. 从冲突和证据缺口中提取可验证的 `decision_hinge`。高严重度 `direction_conflict` / `evidence_contradiction` 各自至少形成一个候选主题。
 3. 将指向同一底层可观测变量的候选合并为一个 `meta_factor`，避免换措辞重复辩论。
-4. 按潜在定价影响排序：宏观、基本面、技术/期权、社媒情绪。
-5. 把保留主题写成“预期差问句”。`why_debate` 必须说明 common ground 之上仍争什么；若冲突属于 `evidence_overlap`，明确标注“证据可能重复计权”。
+4. 对 `trend`、`valuation_expectations`、`macro`、`event_risk`、`data_quality` 五类问题逐项建立 coverage。每类必须写清是 `selected`、`candidate_only`、`residual_risk`、`not_present` 还是 `data_gap`，以及证据或明确的排除原因。
+5. 按潜在定价影响排序：宏观、基本面、技术/期权、社媒情绪。
+6. 把保留主题写成“预期差问句”。`why_debate` 必须说明 common ground 之上仍争什么；若冲突属于 `evidence_overlap`，明确标注“证据可能重复计权”。未选主题或无法在本轮辩论的问题必须进入 `residual_risks`，供 Research Manager 继续看到，而不是随 topic 上限消失。
 
 ## 主题约束
 
@@ -54,11 +55,14 @@
 
 ## 输出大小
 
-- 最多保留 2 个 topics；每个 topic 的 `why_debate` 不超过 180 个中文字符。
+- `candidate_topics` 最多 5 项，记录全部实质候选；`topics` 最多保留 2 项作为优先辩论队列，每个 topic 的 `why_debate` 不超过 180 个中文字符。
 - `common_ground` 的每个数组最多 3 项；`summary` 不超过 240 个中文字符。
 - `analysis_trace` 只记录本次议题生成所必需的审计摘要：每个数组最多 2 项，每项只保留决定 topic 选择或排除的字段和值；不要复制 Phase 1 report、evidence claim 或输入全文。
 - `common_ground`：包含 `agreed_facts[]`, `shared_constraints[]`, `non_debated_assumptions[]`, `evidence_refs[]`
-- `topics`：数组；每项包含 `topic`, `tickers[]`, `meta_factor`, `decision_hinge`, `ttl`, `why_debate`, `evidence_refs`
+- `coverage`：恰好五项，分别为 `trend`、`valuation_expectations`、`macro`、`event_risk`、`data_quality`；每项包含 `category`、`status`、`reason`、`evidence_refs`，并可带 `topic_id`。
+- `candidate_topics`：数组；每项包含 `topic`, `tickers[]`, `meta_factor`, `decision_hinge`, `ttl`, `why_debate`, `evidence_refs`。
+- `topics`：优先辩论队列，必须是 `candidate_topics` 的子集；每项包含相同字段。
+- `residual_risks`：每个 `candidate_only`、`residual_risk` 或 `data_gap` 覆盖状态至少一项，包含 `category`、`reason`、`evidence_refs`，必要时带 `topic_id`。`category` 可写对应的五个 coverage 类别，或直接写这三个状态名；不要把状态名误写成新的领域类别。Rust 会独立保留未选候选的完整证据记录。
 - `summary`：非空字符串
 - `analysis_trace`：遵循公共可审计分析轨迹；即使 `topics=[]` 也必须记录实际证据缺口、替代解释与停止原因
 - `web_evidence`：若调用过证据研究工具，逐项记录

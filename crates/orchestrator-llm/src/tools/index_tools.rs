@@ -403,6 +403,17 @@ fn parse_read_details(
     let section = optional_string(object, "section")?
         .map(|value| DetailSection::parse(&value))
         .transpose()?;
+    // Phase 3 consumes Phase Summary Detail documents, whose canonical body
+    // lives in `analysis`. `topic_search_space` is an Index authoritative
+    // field, not a DetailSection; accepting arbitrary sections here lets a
+    // manager spend its bounded retrieval budget on a guaranteed empty page.
+    if context.owned_scope().role == "manager.research"
+        && section.is_some_and(|section| section != DetailSection::Analysis)
+    {
+        bail!(
+            "manager.research must use section=analysis for its required Phase 1/2 Detail reads; topic_search_space is available from read_indexes"
+        );
+    }
     let (limit, cursor) = pagination_from_object(object, context.visibility.max_page_size)?;
     Ok(ReadIndexDetailsCommand {
         index_id,
@@ -558,5 +569,28 @@ mod tests {
     fn details_require_a_visible_index() {
         let error = prepare_command(READ_INDEX_DETAILS_NAME, json!({}), &context()).unwrap_err();
         assert!(error.to_string().contains("preceding read_indexes"));
+    }
+
+    #[test]
+    fn research_manager_required_details_use_the_analysis_section() {
+        let context = context();
+        context
+            .record_visible_indexes(["idx-000001".to_owned()])
+            .unwrap();
+
+        let error = prepare_command(
+            READ_INDEX_DETAILS_NAME,
+            json!({"index_id":"idx-000001","section":"historical_case"}),
+            &context,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("section=analysis"));
+
+        assert!(prepare_command(
+            READ_INDEX_DETAILS_NAME,
+            json!({"index_id":"idx-000001","section":"analysis"}),
+            &context,
+        )
+        .is_ok());
     }
 }

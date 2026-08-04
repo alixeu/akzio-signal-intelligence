@@ -109,6 +109,8 @@ fn main() -> Result<()> {
                     location,
                     workflow_version,
                     prompt_versions: BTreeMap::new(),
+                    prompt_content_hash: "unavailable:manual-rebuild".to_owned(),
+                    source_surface_hash: "unavailable:manual-rebuild".to_owned(),
                     git_sha,
                     config_hash,
                     role_profile_registry_hash,

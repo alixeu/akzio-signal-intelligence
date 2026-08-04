@@ -1,9 +1,9 @@
 use anyhow::{bail, Context, Result};
-use chrono::Utc;
+use chrono::{NaiveDate, Utc};
 use futures::{future::BoxFuture, stream, StreamExt};
 use orchestrator_core::{
-    default_project_root, md5_3, HistoricalReflectionArtifactV1, ReflectionDisposition,
-    ToolManagedProfile, HISTORICAL_REFLECTION_ARTIFACT_SCHEMA_VERSION,
+    config_get, default_project_root, md5_3, HistoricalReflectionArtifactV1, MarketRegime,
+    ReflectionDisposition, ToolManagedProfile, HISTORICAL_REFLECTION_ARTIFACT_SCHEMA_VERSION,
 };
 use orchestrator_llm::{
     agent_loop::{
@@ -537,6 +537,7 @@ async fn run_web_evidence_research(
                 .join(format!("{request_id}.json")),
         ),
         debug_round: None,
+        debug_turn_id: None,
         tickers: request.tickers,
         tool_managed_profile: ToolManagedProfile::EvidenceResearch,
         session_runtime,
@@ -1414,26 +1415,90 @@ fn file_store_experience_retrieval(
     let query = ExperienceSearchQuery {
         phase,
         role: role.to_owned(),
-        ticker: (tickers.len() == 1).then(|| tickers[0].clone()),
-        horizon_trading_days: None,
-        regime: orchestrator_core::MarketRegime::default(),
+        // Ticker selection is per search call, but Rust constrains it to the
+        // role's actual asset universe. A multi-asset role cannot silently
+        // blend a QQQ experience into an SOXX conclusion.
+        ticker: None,
+        horizon_trading_days: experience_horizon_from_state(state),
+        regime: experience_regime_from_state(state),
+        as_of_date: experience_as_of_date_from_state(state),
         lexical_query: String::new(),
         max_results: max_results.clamp(1, 20),
     };
+    let allowed_tickers = if role == "manager.research" {
+        state
+            .get("investable_assets")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>()
+    } else {
+        tickers.to_vec()
+    };
     Ok(
-        orchestrator_llm::tools::experience_tools::ExperienceRetrievalBinding::new(Arc::new(
-            FileStoreExperienceRetrieval {
+        orchestrator_llm::tools::experience_tools::ExperienceRetrievalBinding::new_scoped(
+            Arc::new(FileStoreExperienceRetrieval {
                 ledger: orchestrator_store::ExperienceLedger::new(store.clone()),
                 memory_usage: orchestrator_store::MemoryUsageLedger::new(store, location),
+                max_case_events: max_results.clamp(1, 20),
                 query,
-            },
-        )),
+            }),
+            allowed_tickers,
+            max_results,
+        ),
     )
+}
+
+fn experience_horizon_from_state(state: &Value) -> Option<u32> {
+    state
+        .get("config")
+        .and_then(|config| {
+            config_get(
+                config,
+                "orchestrator.evaluation.prediction_horizon_trading_days",
+            )
+        })
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| *value > 0)
+}
+
+fn experience_as_of_date_from_state(state: &Value) -> Option<NaiveDate> {
+    state
+        .get("current_date")
+        .and_then(Value::as_str)
+        .and_then(|value| value.trim().get(..10))
+        .and_then(|value| NaiveDate::parse_from_str(value, "%Y-%m-%d").ok())
+}
+
+fn experience_regime_from_state(state: &Value) -> MarketRegime {
+    let volatility = state
+        .pointer("/market_snapshot/vix")
+        .filter(|vix| vix.get("status").and_then(Value::as_str) == Some("available"))
+        .and_then(|vix| vix.get("regime"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("unknown")
+        .to_owned();
+    // The current input has a Rust-derived VIX regime but no independently
+    // materialized liquidity/rates/breadth labels. "unknown" deliberately
+    // rejects lessons that claim those unobserved dimensions as prerequisites.
+    MarketRegime {
+        volatility,
+        trend: "unknown".to_owned(),
+        liquidity: "unknown".to_owned(),
+        rates: "unknown".to_owned(),
+        breadth: "unknown".to_owned(),
+    }
 }
 
 struct FileStoreExperienceRetrieval {
     ledger: orchestrator_store::ExperienceLedger,
     memory_usage: orchestrator_store::MemoryUsageLedger,
+    max_case_events: usize,
     query: ExperienceSearchQuery,
 }
 
@@ -1445,14 +1510,16 @@ struct MemoryUsageInput {
     retrieval_stop_reason: Option<String>,
     application_disposition: Option<orchestrator_core::MemoryApplicationDisposition>,
     application_reason: Option<String>,
+    ticker: Option<String>,
 }
 
 impl orchestrator_llm::tools::experience_tools::ExperienceRetrievalService
     for FileStoreExperienceRetrieval
 {
-    fn search(&self, lexical_query: &str) -> Result<Value> {
+    fn search(&self, lexical_query: &str, ticker: Option<&str>) -> Result<Value> {
         let mut query = self.query.clone();
         query.lexical_query = lexical_query.to_owned();
+        query.ticker = ticker.map(ToOwned::to_owned);
         let result = search_experiences(&self.ledger, &query)?;
         let stop_reason = retrieval_stop_reason_name(result.stop_reason);
         let items = result
@@ -1467,6 +1534,14 @@ impl orchestrator_llm::tools::experience_tools::ExperienceRetrievalService
                     "contradiction_count": item.view.contradiction_count,
                     "utility_ema_micros": item.view.utility_ema_micros,
                     "harmful_usage_rate_ppm": item.view.harmful_usage_rate_ppm,
+                    "applicability": {
+                        "scope": item.scope.as_str(),
+                        "ticker": item.ticker,
+                        "horizon_trading_days": item.horizon_trading_days,
+                        "regime": item.regime,
+                        "as_of_eligible": true,
+                        "recency_penalty": item.recency_penalty,
+                    },
                 })
             })
             .collect::<Vec<_>>();
@@ -1485,11 +1560,22 @@ impl orchestrator_llm::tools::experience_tools::ExperienceRetrievalService
             retrieval_stop_reason: Some(stop_reason.to_owned()),
             application_disposition: None,
             application_reason: None,
+            ticker: query.ticker.clone(),
         })?;
-        Ok(json!({"items": items, "stop_reason": stop_reason}))
+        Ok(json!({
+            "items": items,
+            "stop_reason": stop_reason,
+            "query_context": {
+                "ticker": query.ticker,
+                "horizon_trading_days": query.horizon_trading_days,
+                "regime": query.regime,
+                "as_of_date": query.as_of_date.map(|date| date.to_string()),
+                "authority": "rust_frozen_current_context_v1",
+            },
+        }))
     }
 
-    fn read_cases(&self, pattern_id: &str) -> Result<Value> {
+    fn read_cases(&self, pattern_id: &str, ticker: Option<&str>) -> Result<Value> {
         let events = self.ledger.read_events(pattern_id)?;
         self.record_usage(MemoryUsageInput {
             kind: orchestrator_core::MemoryUsageEventKind::Expand,
@@ -1499,23 +1585,32 @@ impl orchestrator_llm::tools::experience_tools::ExperienceRetrievalService
             retrieval_stop_reason: None,
             application_disposition: None,
             application_reason: None,
+            ticker: ticker.map(ToOwned::to_owned),
         })?;
         Ok(json!({
             "pattern_id": pattern_id,
-            "untrusted_historical_data": events.into_iter().map(|event| json!({
+            "untrusted_historical_data": events.into_iter().rev().take(self.max_case_events).rev().map(|event| json!({
                 "operation": event.operation,
                 "source_run_id": event.source_run_id,
                 "outcome_id": event.outcome_id,
+                "pattern_identity": event.pattern_identity,
                 "rule_revision": event.rule_revision,
                 "source_refs": event.source_refs,
+                "independent_date_cluster": event.independent_date_cluster,
+                "independent_regime": event.independent_regime,
+                "utility_sample_micros": event.utility_sample_micros,
+                "harmful_usage": event.harmful_usage,
                 "created_at": event.created_at,
             })).collect::<Vec<_>>(),
+            "case_event_limit": self.max_case_events,
+            "authority": "rust_bounded_untrusted_historical_data_v1",
         }))
     }
 
     fn record_application(
         &self,
         pattern_id: &str,
+        ticker: Option<&str>,
         disposition: orchestrator_core::MemoryApplicationDisposition,
         reason: &str,
     ) -> Result<Value> {
@@ -1527,6 +1622,7 @@ impl orchestrator_llm::tools::experience_tools::ExperienceRetrievalService
             retrieval_stop_reason: None,
             application_disposition: Some(disposition),
             application_reason: Some(reason.to_owned()),
+            ticker: ticker.map(ToOwned::to_owned),
         })?;
         Ok(json!({
             "pattern_id": pattern_id,
@@ -1546,12 +1642,12 @@ impl FileStoreExperienceRetrieval {
                 kind: input.kind,
                 role: self.query.role.clone(),
                 phase: self.query.phase,
-                ticker: self.query.ticker.clone(),
+                ticker: input.ticker.clone(),
                 unit_key: format!(
                     "memory:p{}:{}:{}",
                     self.query.phase,
                     self.query.role,
-                    self.query.ticker.as_deref().unwrap_or("aggregate")
+                    input.ticker.as_deref().unwrap_or("aggregate")
                 ),
                 lexical_query: input.lexical_query,
                 retrieved_pattern_ids: input.retrieved_pattern_ids,
@@ -1739,7 +1835,11 @@ fn retrieval_policy_for_role(role: &str, kind: &str, config: &RetrievalConfig) -
             policy(&[1], &[1], 1, config.phase2_max_details)
         }
         ("mediator.topic_controller", _) => policy(&[1], &[], 0, config.phase2_max_details),
-        ("manager.research", _) => policy(&[1, 2], &[], 1, config.phase3_max_details),
+        // The Research Manager is the only role allowed to translate the
+        // Phase 2 hinge into a probability adjustment.  Reading only the
+        // Phase 1 baseline would make a successful Phase 3 completion look
+        // valid while silently bypassing the debate.
+        ("manager.research", _) => policy(&[1, 2], &[1, 2], 2, config.phase3_max_details),
         // Indexes carry the validated execution fields.  Detail expansion is
         // available for extra context but must not reject an otherwise valid
         // free-text response when the model has already read the Index.
@@ -1841,6 +1941,11 @@ pub(crate) fn record_role_job_metrics(state: &mut Value, result: &RoleJobResult)
     } else {
         "degraded"
     };
+    let run_id = state
+        .get("run_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
     if !state.get("role_job_metrics").is_some_and(Value::is_array) {
         state["role_job_metrics"] = json!([]);
     }
@@ -1854,6 +1959,9 @@ pub(crate) fn record_role_job_metrics(state: &mut Value, result: &RoleJobResult)
             "topic_id": result.topic_id,
             "prompt_version": result.prompt_version,
             "model": result.model,
+            "run_id": run_id,
+            "session_id": result.session_id,
+            "turn_id": result.turn_id,
             "timed_out": result.timed_out,
             "elapsed_ms": result.elapsed_ms,
             "llm_ms": result.llm_ms,
@@ -1889,6 +1997,10 @@ pub(crate) fn record_role_job_metrics(state: &mut Value, result: &RoleJobResult)
                 "round": result.round,
                 "topic_id": result.topic_id,
                 "model": result.model,
+                "prompt_version": result.prompt_version,
+                "run_id": run_id,
+                "session_id": result.session_id,
+                "turn_id": result.turn_id,
                 "status": status,
                 "timed_out": result.timed_out,
                 "elapsed_ms": result.elapsed_ms,
@@ -1909,6 +2021,10 @@ pub(crate) fn record_role_job_metrics(state: &mut Value, result: &RoleJobResult)
                 "round": result.round,
                 "topic_id": result.topic_id,
                 "model": result.model,
+                "prompt_version": result.prompt_version,
+                "run_id": run_id,
+                "session_id": result.session_id,
+                "turn_id": result.turn_id,
                 "status": status,
                 "timed_out": result.timed_out,
                 "elapsed_ms": result.elapsed_ms,
@@ -2181,6 +2297,7 @@ async fn execute_role_job(job: RoleJob) -> Result<AgentLoopOutput> {
         debug_prompt_path,
         debug_output_path: job.debug_output_path,
         debug_round,
+        debug_turn_id: None,
         tickers: job.tickers,
         tool_managed_profile: job.tool_managed_profile,
         index_tool_runtime: job.index_tool_runtime.clone(),
@@ -2353,6 +2470,28 @@ mod tests {
                 .minimum_detail_expansions,
             0
         );
+    }
+
+    #[test]
+    fn research_manager_requires_phase1_and_phase2_detail_before_completion() {
+        let config = RetrievalConfig {
+            summary_page_limit: 20,
+            detail_page_limit: 20,
+            phase2_max_details: 4,
+            phase3_max_details: 6,
+            phase4_max_details: 2,
+            phase5_max_details: 4,
+            phase6_max_details: 8,
+            reflection_max_details: 8,
+        };
+
+        let policy = retrieval_policy_for_role("manager.research", "artifact", &config);
+
+        assert!(policy.mandatory_summary_query);
+        assert_eq!(policy.required_source_phases, vec![1, 2]);
+        assert_eq!(policy.required_detail_source_phases, vec![1, 2]);
+        assert_eq!(policy.minimum_detail_expansions, 2);
+        assert_eq!(policy.maximum_detail_expansions, 6);
     }
 
     #[test]
@@ -2721,7 +2860,7 @@ mod tests {
 
     #[test]
     fn records_role_job_metrics_and_aggregates() {
-        let mut state = json!({});
+        let mut state = json!({"run_id":"run-test"});
 
         record_role_job_metrics(&mut state, &result("manager.research", false, 7));
         record_role_job_metrics(&mut state, &result("trader", true, 11));
@@ -2736,6 +2875,9 @@ mod tests {
         assert_eq!(state["role_job_metrics"][0]["non_cached_input_tokens"], 8);
         assert_eq!(state["role_job_metrics"][0]["visible_output_tokens"], 4);
         assert_eq!(state["role_job_metrics"][0]["model"], "test-model");
+        assert_eq!(state["role_job_metrics"][0]["run_id"], "run-test");
+        assert_eq!(state["role_job_metrics"][0]["session_id"], "session-1");
+        assert_eq!(state["role_job_metrics"][0]["turn_id"], "turn-1");
         assert_eq!(state["role_job_metrics"][0]["turn_count"], 1);
         assert_eq!(state["role_job_metrics"][0]["tool_call_count"], 3);
         assert_eq!(state["workflow_metrics"]["role_job_count"], 2);

@@ -48,9 +48,10 @@ Rust 会把 `stree: {...}` 作为一条新的 user message 注入你**已有的�
 - 优先执行 `context.controller.next_steers`，且只处理其中路由给本方的 claim。
 - `blocked_claims` 是禁止继续使用的输入；将确认停止使用的 ID 写入 `blocked_ack`。
 - 被标记不可核验或 `soft_control` 禁止的本方 claim 必须撤回或降级。
-- 信息增量不足时使用 `stance=no_new_info`，但仍须填写回应对象和非空 `steer_id`。
+- 信息增量不足时使用 `stance=no_new_info`，但仍须填写回应对象。不能把相同 URL、
+  转述或同一事件的新 evidence ID 写成新事实；只有新的可观察事件才可支持额外回合。
 
-最多展开 1–2 个直接影响回应的 Detail；已有可见 claim 与证据后不得继续检索。完成后**必须调用一次** `submit_debate_turn` 结束本 turn：带上 stance、message、可选 reply_to_node_id、evidence_refs 和 report。`message` 最多 1,200 个字符，`report` 最多 4,000 个字符；超长时先压缩为可审计的结论与证据边界，绝不输出自由文字或自行结束会话。`agree` 与 `partial_agree` 是正常选项；若采纳对方的部分前提，明确写出采纳范围与剩余分歧。
+最多展开 1–2 个直接影响回应的 Detail；已有可见 claim 与证据后不得继续检索。完成后**必须调用一次** `submit_debate_turn` 结束本 turn：带上 stance、message、可选 reply_to_node_id、evidence_refs、与 evidence_refs 一一对应的 `evidence_links` 和 report。每个 link 只能写 `evidence_ref` 与 `relation`（`supports | refutes | qualifies`），表示该已读证据对本条 `message` 的外显关系；没有证据时两个数组都为空。不得把同一 ID 堆入多条 link，或把无关 ID 当作装饰引用。`message` 最多 1,200 个字符，`report` 最多 4,000 个字符；超长时先压缩为可审计的结论与证据边界，绝不输出自由文字或自行结束会话。`agree` 与 `partial_agree` 是正常选项；若采纳对方的部分前提，明确写出采纳范围与剩余分歧。
 
 # 紧凑审计预算
 

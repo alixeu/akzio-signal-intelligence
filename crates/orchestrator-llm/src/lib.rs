@@ -30,6 +30,13 @@ pub mod web_search;
 /// FileStore/tool evidence IDs from strings copied or mutated by the model.
 pub const VERIFIED_PHASE1_EVIDENCE_MARKER: &str = "<!-- Rust-verified Phase 1 evidence IDs -->";
 
+/// Appended before [`VERIFIED_PHASE1_EVIDENCE_MARKER`] when a Phase 1 tool
+/// exposed an authoritative clock for an evidence ID.  Reducers may use these
+/// records only to restore metadata for that exact ID; they are not model
+/// generated evidence.
+pub const VERIFIED_PHASE1_EVIDENCE_RECORDS_MARKER: &str =
+    "<!-- Rust-verified Phase 1 evidence metadata -->";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LlmRoute {
@@ -185,6 +192,10 @@ pub struct AgentSettings {
     pub debug_output_path: Option<PathBuf>,
     /// Optional role-specific round number retained on every debug record.
     pub debug_round: Option<usize>,
+    /// Rust-owned active FileStore turn identity. This is assigned immediately
+    /// before the model is invoked so every raw Debug request can be joined to
+    /// its immutable session transcript without guessing from timestamps.
+    pub debug_turn_id: Option<String>,
     pub tickers: Vec<String>,
     /// Rust-owned role identity used to scope reads and Summary compilation.
     pub tool_managed_profile: ToolManagedProfile,
@@ -291,7 +302,12 @@ pub async fn run_agent_loop_with_metrics(
     if let Some(web_run) = web_run_runtime_for_settings(settings) {
         tools = tools.with_web_run_runtime(web_run);
     }
-    let mut model = AgentLoopModel::new(settings.clone());
+    // The model writes raw request/response Debug records while `run_turn` is
+    // active. Bind the generated turn ID before constructing it; otherwise a
+    // record has only a session and cannot prove which retry/fork created it.
+    let mut debug_settings = settings.clone();
+    debug_settings.debug_turn_id = Some(turn.turn_id.clone());
+    let mut model = AgentLoopModel::new(debug_settings.clone());
     let metrics = agent_loop::run_turn(
         session,
         &mut turn,
@@ -302,7 +318,7 @@ pub async fn run_agent_loop_with_metrics(
     .await?;
     let terminal_tool_result = turn.terminal_tool_result.clone();
     if let Some(terminal) = terminal_tool_result.as_ref() {
-        finalize_debug_llm_record(settings, terminal)?;
+        finalize_debug_llm_record(&debug_settings, terminal)?;
     }
     let artifact = completed_turn_artifact(&turn)?;
     Ok(AgentLoopOutput {
@@ -445,7 +461,11 @@ pub async fn run_agent_fork_loop_with_metrics(
     if let Some(web_run) = web_run_runtime_for_settings(settings) {
         tools = tools.with_web_run_runtime(web_run);
     }
-    let mut model = AgentLoopModel::new(settings.clone());
+    // Forked debate turns use a deterministic caller-provided ID. Preserve it
+    // on the raw Debug request so sibling rounds cannot be conflated.
+    let mut debug_settings = settings.clone();
+    debug_settings.debug_turn_id = Some(turn.turn_id.clone());
+    let mut model = AgentLoopModel::new(debug_settings.clone());
     let metrics = agent_loop::run_turn(
         session,
         &mut turn,
@@ -456,7 +476,7 @@ pub async fn run_agent_fork_loop_with_metrics(
     .await?;
     let terminal_tool_result = turn.terminal_tool_result.clone();
     if let Some(terminal) = terminal_tool_result.as_ref() {
-        finalize_debug_llm_record(settings, terminal)?;
+        finalize_debug_llm_record(&debug_settings, terminal)?;
     }
     let artifact = completed_turn_artifact(&turn)?;
     Ok(AgentLoopOutput {
@@ -482,6 +502,13 @@ fn completed_turn_artifact(turn: &Turn) -> Result<Value> {
             let evidence_refs = verified_terminal_evidence_refs(turn);
             if !evidence_refs.is_empty() {
                 object.insert("verified_evidence_refs".to_owned(), json!(evidence_refs));
+            }
+            let evidence_records = verified_terminal_evidence_records(turn);
+            if !evidence_records.is_empty() {
+                object.insert(
+                    "verified_evidence_records".to_owned(),
+                    Value::Array(evidence_records),
+                );
             }
         }
         return Ok(artifact);
@@ -511,6 +538,13 @@ fn completed_turn_artifact(turn: &Turn) -> Result<Value> {
         response_text.push_str(tools::research_evidence_gap::VERIFIED_PACKET_MARKER);
         response_text.push('\n');
         response_text.push_str(&serde_json::to_string_pretty(&web_evidence)?);
+    }
+    let verified_phase1_records = verified_phase1_evidence_records(turn);
+    if !verified_phase1_records.is_empty() {
+        response_text.push_str("\n\n");
+        response_text.push_str(VERIFIED_PHASE1_EVIDENCE_RECORDS_MARKER);
+        response_text.push('\n');
+        response_text.push_str(&serde_json::to_string_pretty(&verified_phase1_records)?);
     }
     let verified_phase1_ids = verified_phase1_evidence_ids(turn);
     if !verified_phase1_ids.is_empty() {
@@ -549,6 +583,94 @@ fn verified_phase1_evidence_ids(turn: &Turn) -> Vec<String> {
         collect_verified_phase1_ids(output, &mut ids);
     }
     ids.into_iter().collect()
+}
+
+/// Preserve only source metadata that is emitted directly by the two Phase 1
+/// read tools.  In particular, a technical signal's `as_of` clock is not an
+/// inference by the analyst or Summary compiler.
+fn verified_phase1_evidence_records(turn: &Turn) -> Vec<Value> {
+    let mut records = BTreeMap::new();
+    for item in turn.emitted_items.iter().filter(|item| {
+        item.item_type == agent_loop::TurnItemType::ToolResult
+            && matches!(
+                item.tool_name.as_str(),
+                tools::read_technical_snapshot::NAME | tools::read_jin10_candidates::NAME
+            )
+    }) {
+        let Some(output) = item.content_json.pointer("/result/output") else {
+            continue;
+        };
+        collect_verified_phase1_evidence_records(output, &mut records);
+    }
+    records.into_values().collect()
+}
+
+fn collect_verified_phase1_evidence_records(value: &Value, records: &mut BTreeMap<String, Value>) {
+    match value {
+        Value::Object(values) => {
+            let evidence_id = values
+                .get("signal_id")
+                .or_else(|| values.get("evidence_id"))
+                .and_then(Value::as_str)
+                .filter(|id| id.starts_with("technical-") || id.starts_with("jin10-"));
+            if let Some(evidence_id) = evidence_id {
+                let mut record = serde_json::Map::new();
+                record.insert(
+                    "evidence_id".to_owned(),
+                    Value::String(evidence_id.to_owned()),
+                );
+                if evidence_id.starts_with("technical-") {
+                    record.insert(
+                        "source".to_owned(),
+                        Value::String("filestore.run_input.technical".to_owned()),
+                    );
+                    if let Some(as_of) = values.get("as_of").and_then(Value::as_str) {
+                        record.insert("event_time".to_owned(), Value::String(as_of.to_owned()));
+                        record.insert("as_of".to_owned(), Value::String(as_of.to_owned()));
+                        record.insert("timezone".to_owned(), Value::String("UTC".to_owned()));
+                    }
+                } else {
+                    record.insert(
+                        "source".to_owned(),
+                        Value::String("filestore.run_input.jin10".to_owned()),
+                    );
+                    for key in [
+                        "event_time",
+                        "published_time",
+                        "ingested_time",
+                        "as_of",
+                        "timezone",
+                    ] {
+                        if let Some(value) = values.get(key).filter(|value| value.is_string()) {
+                            record.insert(key.to_owned(), value.clone());
+                        }
+                    }
+                }
+                if ["event_time", "published_time", "ingested_time", "as_of"]
+                    .into_iter()
+                    .any(|key| {
+                        record
+                            .get(key)
+                            .and_then(Value::as_str)
+                            .is_some_and(|text| !text.trim().is_empty())
+                    })
+                {
+                    records
+                        .entry(evidence_id.to_owned())
+                        .or_insert(Value::Object(record));
+                }
+            }
+            for value in values.values() {
+                collect_verified_phase1_evidence_records(value, records);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                collect_verified_phase1_evidence_records(value, records);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn collect_verified_phase1_ids(value: &Value, ids: &mut BTreeSet<String>) {
@@ -637,6 +759,12 @@ fn verified_terminal_evidence_refs(turn: &Turn) -> Vec<String> {
         .into_iter()
         .filter(|id| is_complete_tool_evidence_id(id))
         .collect::<BTreeSet<_>>();
+    // A Phase 2 role can legitimately cite evidence carried by an expanded
+    // FileStore Detail.  Treat those Detail `source_refs` as visible only in
+    // this turn: this is the Rust-observed boundary used later when the
+    // Controller attests to a consensus claim.  An Index listing alone is not
+    // sufficient because it contains no underlying evidence body.
+    ids.extend(verified_index_detail_evidence_refs(turn));
     for result in verified_web_search_results(turn) {
         if let Some(id) = result
             .get("evidence_id")
@@ -672,6 +800,107 @@ fn verified_terminal_evidence_refs(turn: &Turn) -> Vec<String> {
         }
     }
     ids.into_iter().collect()
+}
+
+fn verified_index_detail_evidence_refs(turn: &Turn) -> BTreeSet<String> {
+    let mut ids = BTreeSet::new();
+    for output in turn
+        .emitted_items
+        .iter()
+        .filter(|item| {
+            item.item_type == agent_loop::TurnItemType::ToolResult
+                && item.tool_name == tools::index_tools::READ_INDEX_DETAILS_NAME
+        })
+        .filter_map(|item| item.content_json.pointer("/result/output"))
+    {
+        for detail in output
+            .get("details")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            for reference in detail
+                .get("source_refs")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .filter(|reference| is_complete_tool_evidence_id(reference))
+            {
+                ids.insert(reference.to_owned());
+            }
+        }
+    }
+    ids
+}
+
+/// Retain the event-identity fields that Rust actually observed in a terminal
+/// Phase 2 turn.  IDs alone only prove that a source existed; the workflow
+/// also needs URL/time metadata to recognize the same event arriving under a
+/// second `web-*` ID in another phase or fork.
+fn verified_terminal_evidence_records(turn: &Turn) -> Vec<Value> {
+    let mut by_id = BTreeMap::<String, Value>::new();
+    for result in verified_web_search_results(turn) {
+        let Some(evidence_id) = result
+            .get("evidence_id")
+            .and_then(Value::as_str)
+            .filter(|id| is_complete_tool_evidence_id(id))
+        else {
+            continue;
+        };
+        by_id.insert(
+            evidence_id.to_owned(),
+            json!({
+                "evidence_id": evidence_id,
+                "source_url": result.get("source_url").cloned().unwrap_or(Value::Null),
+                "published_at": result.get("published_at").cloned().unwrap_or(Value::Null),
+                "retrieved_at": result.get("retrieved_at").cloned().unwrap_or(Value::Null),
+                "publisher": result.get("publisher").cloned().unwrap_or(Value::Null),
+                "source_tier": result.get("source_tier").cloned().unwrap_or(Value::Null),
+                "event_identity_authority": "rust_verified_web_search_result",
+            }),
+        );
+    }
+    for output in turn
+        .emitted_items
+        .iter()
+        .filter(|item| {
+            item.item_type == agent_loop::TurnItemType::ToolResult
+                && item.tool_name == tools::research_evidence_gap::NAME
+        })
+        .filter_map(|item| item.content_json.pointer("/result/output"))
+    {
+        for item in ["evidence", "counterevidence"].into_iter().flat_map(|key| {
+            output
+                .get(key)
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        }) {
+            let Some(evidence_id) = item
+                .get("evidence_id")
+                .and_then(Value::as_str)
+                .filter(|id| is_complete_tool_evidence_id(id))
+            else {
+                continue;
+            };
+            by_id.insert(
+                evidence_id.to_owned(),
+                json!({
+                    "evidence_id": evidence_id,
+                    "source_url": item.get("source_url").cloned().unwrap_or(Value::Null),
+                    "published_at": item.get("published_at").cloned().unwrap_or(Value::Null),
+                    "retrieved_at": item.get("retrieved_at").cloned().unwrap_or(Value::Null),
+                    "publisher": item.get("publisher").cloned().unwrap_or(Value::Null),
+                    "source_tier": item.get("source_tier").cloned().unwrap_or(Value::Null),
+                    "claim": item.get("claim").cloned().unwrap_or(Value::Null),
+                    "relation": item.get("relation").cloned().unwrap_or(Value::Null),
+                    "event_identity_authority": "rust_verified_evidence_gap_result",
+                }),
+            );
+        }
+    }
+    by_id.into_values().collect()
 }
 
 fn is_complete_tool_evidence_id(id: &str) -> bool {
@@ -755,7 +984,18 @@ pub fn append_debug_llm_record(settings: &AgentSettings, record: Value) -> Resul
 
     let mut record = record;
     if let Some(object) = record.as_object_mut() {
-        let session_id = settings.session_runtime.manifest().session_id.clone();
+        let session_manifest = settings.session_runtime.manifest();
+        let session_id = session_manifest.session_id.clone();
+        let run_id = session_manifest.run_id.clone();
+        let prompt_content_hash = fs::read(root.join(prompt_path))
+            .map(|bytes| orchestrator_store::content_hash_bytes(&bytes))
+            .with_context(|| {
+                format!(
+                    "failed to hash debug prompt {} for role {:?}",
+                    root.join(prompt_path).display(),
+                    settings.role
+                )
+            })?;
         object.entry("role").or_insert_with(|| json!(settings.role));
         object
             .entry("phase")
@@ -769,6 +1009,13 @@ pub fn append_debug_llm_record(settings: &AgentSettings, record: Value) -> Resul
         object
             .entry("session_id")
             .or_insert_with(|| json!(session_id));
+        object.entry("run_id").or_insert_with(|| json!(run_id));
+        object
+            .entry("turn_id")
+            .or_insert_with(|| json!(settings.debug_turn_id));
+        object
+            .entry("prompt_content_hash")
+            .or_insert_with(|| json!(prompt_content_hash));
         object
             .entry("profile")
             .or_insert_with(|| json!(settings.tool_managed_profile.as_str()));
@@ -2712,6 +2959,7 @@ mod tests {
             debug_prompt_path: None,
             debug_output_path: None,
             debug_round: None,
+            debug_turn_id: None,
             tickers: vec!["TQQQ".to_string()],
             tool_managed_profile: ToolManagedProfile::ResearchDecision,
             session_runtime: test_session_runtime(),
@@ -2762,6 +3010,12 @@ mod tests {
         .unwrap()
     }
 
+    fn write_debug_prompt_fixture(root: &Path, prompt_path: &str) {
+        let path = root.join(prompt_path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "frozen prompt fixture").unwrap();
+    }
+
     #[test]
     fn tool_managed_completion_needs_no_assistant_message() {
         let mut turn =
@@ -2784,6 +3038,8 @@ mod tests {
     fn terminal_completion_exposes_only_rust_verified_evidence_refs() {
         let mut turn = agent_loop::Turn::new("turn-1", "session-1", "run-1", "researcher.bull", "");
         let evidence_id = "web-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let detail_evidence_id =
+            "technical-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         turn.emitted_items.push(agent_loop::TurnItem::tool_result(
             &agent_loop::ToolResultItem {
                 call_id: "research-1".to_owned(),
@@ -2791,10 +3047,29 @@ mod tests {
                 status: "completed".to_owned(),
                 output: json!({
                     "evidence": [
-                        {"evidence_id": evidence_id},
+                        {
+                            "evidence_id": evidence_id,
+                            "source_url": "https://example.test/event",
+                            "published_at": "2026-08-03T00:00:00Z",
+                            "publisher": "Example"
+                        },
                         {"evidence_id": "web-too-short"}
                     ],
                     "counterevidence": []
+                }),
+                error: None,
+            },
+            &TruncationConfig::default(),
+        ));
+        turn.emitted_items.push(agent_loop::TurnItem::tool_result(
+            &agent_loop::ToolResultItem {
+                call_id: "detail-1".to_owned(),
+                name: tools::index_tools::READ_INDEX_DETAILS_NAME.to_owned(),
+                status: "completed".to_owned(),
+                output: json!({
+                    "details": [{
+                        "source_refs": [detail_evidence_id, "idx-not-a-source-evidence-id"]
+                    }]
                 }),
                 error: None,
             },
@@ -2809,7 +3084,18 @@ mod tests {
         });
 
         let artifact = super::completed_turn_artifact(&turn).unwrap();
-        assert_eq!(artifact["verified_evidence_refs"], json!([evidence_id]));
+        assert_eq!(
+            artifact["verified_evidence_refs"],
+            json!([detail_evidence_id, evidence_id])
+        );
+        assert_eq!(
+            artifact["verified_evidence_records"][0]["source_url"],
+            "https://example.test/event"
+        );
+        assert_eq!(
+            artifact["verified_evidence_records"][0]["event_identity_authority"],
+            "rust_verified_evidence_gap_result"
+        );
     }
 
     #[test]
@@ -2927,13 +3213,15 @@ mod tests {
             (
                 tools::read_technical_snapshot::NAME,
                 json!({"snapshots": [{"intervals": [{"signals": [{
-                    "signal_id": "technical-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    "signal_id": "technical-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "as_of": "2026-08-03T15:00:00Z"
                 }]}]}]}),
             ),
             (
                 tools::read_jin10_candidates::NAME,
                 json!({"candidates": [{
-                    "evidence_id": "jin10-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    "evidence_id": "jin10-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "event_time": "2026-08-03T12:00:00Z"
                 }]}),
             ),
         ] {
@@ -2955,11 +3243,14 @@ mod tests {
         let artifact = super::completed_turn_artifact(&turn).unwrap();
         let response = artifact["response_text"].as_str().unwrap();
         assert!(response.contains(super::VERIFIED_PHASE1_EVIDENCE_MARKER));
+        assert!(response.contains(super::VERIFIED_PHASE1_EVIDENCE_RECORDS_MARKER));
         assert!(response.contains(
             "technical-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         ));
         assert!(response
             .contains("jin10-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
+        assert!(response.contains("2026-08-03T15:00:00Z"));
+        assert!(response.contains("2026-08-03T12:00:00Z"));
     }
 
     #[test]
@@ -3224,6 +3515,13 @@ mod tests {
         settings.phase = Some(1);
         settings.role = "analyst.technical".to_string();
         settings.debug_prompt_path = Some(PathBuf::from("prompts/phase1/technical.md"));
+        settings.debug_turn_id = Some("turn-debug-proof".to_owned());
+        std::fs::create_dir_all(temp.path().join("prompts/phase1")).unwrap();
+        std::fs::write(
+            temp.path().join("prompts/phase1/technical.md"),
+            "frozen prompt fixture",
+        )
+        .unwrap();
         settings.tools = Some(tools::ExternalToolConfig {
             project_root: temp.path().to_path_buf(),
             run_id: None,
@@ -3269,6 +3567,13 @@ mod tests {
         assert_eq!(output["kind"], "stream");
         assert_eq!(output["req"]["messages"][0]["content"], "again");
         assert_eq!(output["resp"]["id"], "resp_1");
+        assert_eq!(output["run_id"], "run-test");
+        assert_eq!(output["session_id"], "session-test");
+        assert_eq!(output["turn_id"], "turn-debug-proof");
+        assert_eq!(
+            output["prompt_content_hash"],
+            orchestrator_store::content_hash_bytes(b"frozen prompt fixture")
+        );
         assert!(output.get("elapsed_ms").is_some());
         assert!(output.get("token").is_some());
         assert!(output.get("records").is_none());
@@ -3306,6 +3611,7 @@ mod tests {
         settings.topic_id = Some("topic-a".to_string());
         settings.debug_round = Some(0);
         settings.debug_prompt_path = Some(PathBuf::from("prompts/phase2/researcher/debate.md"));
+        write_debug_prompt_fixture(temp.path(), "prompts/phase2/researcher/debate.md");
         settings.debug_output_path = Some(PathBuf::from(
             "outputs/debug/phase2/topic-a/debate-bull.json",
         ));
@@ -3368,6 +3674,7 @@ mod tests {
         settings.phase = Some(1);
         settings.role = "analyst.technical".to_string();
         settings.debug_prompt_path = Some(PathBuf::from("prompts/phase1/technical.md"));
+        write_debug_prompt_fixture(temp.path(), "prompts/phase1/technical.md");
         settings.tools = Some(tools::ExternalToolConfig {
             project_root: temp.path().to_path_buf(),
             run_id: None,
@@ -3421,6 +3728,7 @@ mod tests {
         settings.phase = Some(2);
         settings.role = "mediator.topic".to_string();
         settings.debug_prompt_path = Some(PathBuf::from("prompts/phase2/topic_generator.md"));
+        write_debug_prompt_fixture(temp.path(), "prompts/phase2/topic_generator.md");
         settings.debug_output_path =
             Some(PathBuf::from("outputs/debug/phase2/topic-generator.json"));
         settings.tools = Some(tools::ExternalToolConfig {

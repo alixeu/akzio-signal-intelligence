@@ -1,1 +1,0 @@
-{"content_hash":"sha256:bacd75edeab5e6c08916293f92e50e096859e1ee8c14299eacc7083296850325","payload_bytes":69753,"payload_hash":"sha256:01311dfbc339d6290965c483f9ca6be49dc26e1345c858b7d07b2cc8beb11299","payload_relative_path":"data/technical/vix/3h.csv","schema_version":1,"source":{"interval":"3h","kind":"technical","ticker":"VIX"},"written_at":"2026-08-03T09:46:52.904077+00:00"}

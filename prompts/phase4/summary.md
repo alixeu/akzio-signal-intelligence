@@ -32,7 +32,9 @@
 `plans` 必须且只能覆盖 investable assets；示例中的 QQQ 只是结构示意。
 `candidate_action` 必须按 Phase 3 rating 原样映射：Buy/Overweight -> Buy，
 Sell/Underweight -> Sell，Hold -> Hold。Trader 只能执行该候选方向或因阻断降级为 Hold，
-不能反向改写 Phase 3 结论。
+不能反向改写 Phase 3 结论。`blockers` 只放当前未解决的真实阻断；非空时 `action=Hold`、
+`execution_decision=hold`、`position_size_pct_max=0`，候选非 Hold 而降级时不得留空。
+Rust 给出的 probability position cap 是严格上限，Summary 不得扩大。
 缺失数字保持 null 并写入 `missing_fields`。不要输出代码块或额外文字。
 
 ## SOURCE_PAYLOAD（动态输入）

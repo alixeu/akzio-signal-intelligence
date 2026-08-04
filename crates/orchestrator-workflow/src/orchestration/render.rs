@@ -244,6 +244,25 @@ fn phase6_control_context(state: &Value) -> Value {
         .get("current_portfolio_weights")
         .cloned()
         .unwrap_or(Value::Null);
+    let marginal_risk_controls = state
+        .pointer("/risk_debate_state/reviewer_independence/per_asset")
+        .and_then(Value::as_object)
+        .map(|per_asset| {
+            per_asset
+                .iter()
+                .map(|(ticker, entry)| {
+                    (
+                        ticker.clone(),
+                        json!({
+                            "eligible_source_refs": entry.get("eligible_source_refs").cloned().unwrap_or_else(|| json!([])),
+                            "effective_position_cap_pct": entry.get("full_effective_position_cap_pct").cloned().unwrap_or(Value::Null),
+                        }),
+                    )
+                })
+                .collect::<serde_json::Map<_, _>>()
+        })
+        .map(Value::Object)
+        .unwrap_or_else(|| json!({}));
     json!({
         "status": "available",
         "investable_assets": state.get("investable_assets").cloned().unwrap_or_else(|| json!([])),
@@ -255,6 +274,11 @@ fn phase6_control_context(state: &Value) -> Value {
         },
         "hard_position_cap": state.pointer("/allocation_context/max_single_position")
             .cloned().unwrap_or(Value::Null),
+        "phase5_marginal_control_context": {
+            "status": if marginal_risk_controls.as_object().is_some_and(|items| !items.is_empty()) { "available" } else { "not_loaded" },
+            "per_asset": marginal_risk_controls,
+            "authority": "rust_phase5_leave_one_reviewer_out_v1"
+        },
         "allowed_execution_status": ["execute", "wait", "downgrade"],
         "prior_phase_semantics_included": false
     })
@@ -611,6 +635,50 @@ pub(crate) fn render_prompt_with_plugins(
                 .unwrap_or(Value::Null),
         )?))
     })?;
+    insert_if_referenced(
+        &mut values,
+        &placeholders,
+        "summary_validation_instruction",
+        || {
+            Ok(Value::String(
+                state
+                    .get("_phase1_summary_validation_retry")
+                    .or_else(|| state.get("_phase5_summary_validation_retry"))
+                    .or_else(|| state.get("_phase6_summary_validation_retry"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned(),
+            ))
+        },
+    )?;
+    insert_if_referenced(
+        &mut values,
+        &placeholders,
+        "research_validation_instruction",
+        || {
+            Ok(Value::String(
+                state
+                    .get("_phase3_research_validation_retry")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned(),
+            ))
+        },
+    )?;
+    insert_if_referenced(
+        &mut values,
+        &placeholders,
+        "topic_generation_validation_instruction",
+        || {
+            Ok(Value::String(
+                state
+                    .get("_phase2_topic_generation_validation_retry")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned(),
+            ))
+        },
+    )?;
 
     let mut values = Value::Object(values);
     let rendered_components = component_templates
@@ -1180,6 +1248,9 @@ required_variables = ["ticker", "tickers"]
         "{allocation_context}",
         "{reflection_task}",
         "{summary_source_payload}",
+        "{summary_validation_instruction}",
+        "{research_validation_instruction}",
+        "{topic_generation_validation_instruction}",
         "{phase3_context}",
         "{common_ground}",
     ];

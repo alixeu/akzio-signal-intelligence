@@ -32,6 +32,12 @@ pub struct ResearchDecision {
 pub struct Scenario {
     /// Probability of this scenario (0.0-1.0). All scenarios must sum to 1.0.
     pub probability: f64,
+    /// Conditional probability that the long outcome is realized if this
+    /// scenario occurs.  This is deliberately separate from `probability`:
+    /// the latter is a probability mass over regimes, while this field is the
+    /// payoff-direction probability inside that regime.  Their weighted sum
+    /// is the research decision's `long_probability`.
+    pub conditional_long_probability: f64,
     /// Key drivers that would cause this scenario to play out (1-3 items).
     pub drivers: Vec<String>,
     /// Observable triggers that would shift probability toward this scenario (1-3 items).
@@ -176,6 +182,10 @@ pub struct AnalystTickerArtifact {
     pub direction: String,
     /// Evidence-consistency / clarity, 0.0-1.0 (NOT 0-100, NOT upside probability).
     pub confidence: f64,
+    /// Explicit 1-5 trading-day probability that the ticker's long outcome is
+    /// realized. This is deliberately distinct from `confidence`, which is a
+    /// quality assessment of the evidence supporting the estimate.
+    pub long_probability: f64,
     /// Full prose analysis for this ticker (may contain sections / Markdown tables).
     pub report: String,
     /// The 2-3 most decisive evidence items.
@@ -209,6 +219,23 @@ pub struct EvidenceItem {
     pub source: String,
     /// ISO date when the evidence was observed or published.
     pub timestamp: String,
+    /// When the underlying market-relevant event happened, if distinct from
+    /// publication or ingestion time.  Optional only because some first-party
+    /// technical snapshots have no separate event clock.
+    #[serde(default)]
+    pub event_time: Option<String>,
+    /// When the source made the evidence public, if known.
+    #[serde(default)]
+    pub published_time: Option<String>,
+    /// When Akzio captured the source, if known.
+    #[serde(default)]
+    pub ingested_time: Option<String>,
+    /// The source's stated as-of time, if it has one.
+    #[serde(default)]
+    pub as_of: Option<String>,
+    /// IANA or explicit-offset timezone for the supplied clocks, if known.
+    #[serde(default)]
+    pub timezone: Option<String>,
     /// Source quality tier: official | major_media | professional_research |
     /// longform_analysis | unknown.
     pub source_tier: String,
@@ -317,8 +344,8 @@ pub fn validate_evidence_quality(
 /// Validate machine-read fields on an analyst per-ticker payload.
 ///
 /// Enforces the contract promised by `analyst_output_contract.md`:
-/// `direction` and `confidence` must exist and be legal, and evidence typing
-/// must pass `validate_evidence_types`.
+/// `direction`, `confidence`, and `long_probability` must exist and be legal,
+/// and evidence typing must pass `validate_evidence_types`.
 pub fn validate_analyst_ticker_artifact(
     artifact: &AnalystTickerArtifact,
 ) -> std::result::Result<(), String> {
@@ -334,6 +361,28 @@ pub fn validate_analyst_ticker_artifact(
         return Err(format!(
             "confidence {} out of range; must be in [0.0, 1.0]",
             artifact.confidence
+        ));
+    }
+    if !artifact.long_probability.is_finite() || !(0.0..=1.0).contains(&artifact.long_probability) {
+        return Err(format!(
+            "long_probability {} out of range; must be finite and in [0.0, 1.0]",
+            artifact.long_probability
+        ));
+    }
+    let direction_matches_probability = match artifact.direction.as_str() {
+        "bullish" => artifact.long_probability > 0.5,
+        "bearish" => artifact.long_probability < 0.5,
+        "neutral" => (artifact.long_probability - 0.5).abs() <= 0.000001,
+        "mixed" => (0.4..=0.6).contains(&artifact.long_probability),
+        // `unobserved` is a non-contributing diagnostic state. The neutral
+        // sentinel prevents it from carrying a hidden directional estimate.
+        "unobserved" => (artifact.long_probability - 0.5).abs() <= 0.000001,
+        _ => false,
+    };
+    if !direction_matches_probability {
+        return Err(format!(
+            "direction {} conflicts with long_probability {}",
+            artifact.direction, artifact.long_probability
         ));
     }
     validate_evidence_types(artifact)?;
@@ -586,7 +635,7 @@ pub fn validate_research_decision(
             return Err(ValidationError::ScenarioProbabilitySum(sum));
         }
 
-        let expected_long = scenarios.bull.probability + 0.5 * scenarios.base.probability;
+        let expected_long = scenario_expected_long_probability(scenarios);
         if (artifact.long_probability - expected_long).abs() > 0.05 {
             return Err(ValidationError::InconsistentLongProbability {
                 long: artifact.long_probability,
@@ -602,6 +651,11 @@ pub fn validate_research_decision(
             if !(0.0..=1.0).contains(&scenario.probability) {
                 return Err(ValidationError::InvalidProbability(format!(
                     "scenario {name}.probability"
+                )));
+            }
+            if !(0.0..=1.0).contains(&scenario.conditional_long_probability) {
+                return Err(ValidationError::InvalidProbability(format!(
+                    "scenario {name}.conditional_long_probability"
                 )));
             }
             if scenario.drivers.is_empty() {
@@ -624,8 +678,26 @@ pub fn validate_research_decision(
                 )));
             }
         }
+        if scenarios.bull.conditional_long_probability < scenarios.base.conditional_long_probability
+            || scenarios.base.conditional_long_probability
+                < scenarios.bear.conditional_long_probability
+        {
+            return Err(ValidationError::InvalidResearchField(
+                "scenario conditional_long_probability must be ordered bull >= base >= bear"
+                    .to_owned(),
+            ));
+        }
     }
     Ok(())
+}
+
+/// The expected long-outcome probability implied by a fully specified
+/// three-regime scenario tree.  Keeping the calculation here avoids an
+/// undocumented assumption such as treating every base scenario as 50/50.
+pub fn scenario_expected_long_probability(scenarios: &Scenarios) -> f64 {
+    scenarios.bull.probability * scenarios.bull.conditional_long_probability
+        + scenarios.base.probability * scenarios.base.conditional_long_probability
+        + scenarios.bear.probability * scenarios.bear.conditional_long_probability
 }
 
 fn scenario_driver_is_missing_evidence_placeholder(driver: &str) -> bool {
@@ -653,12 +725,18 @@ mod tests {
         AnalystTickerArtifact {
             direction: "bullish".to_string(),
             confidence: 0.7,
+            long_probability: 0.62,
             report: "QQQ remains above its 20-day average.".to_string(),
             key_evidence: vec![EvidenceItem {
                 claim: "QQQ closed above its 20-day average.".to_string(),
                 evidence_type: EvidenceType::Fact,
                 source: "Yahoo Finance daily OHLCV".to_string(),
                 timestamp: "2026-07-22".to_string(),
+                event_time: None,
+                published_time: None,
+                ingested_time: None,
+                as_of: Some("2026-07-22".to_string()),
+                timezone: None,
                 source_tier: "official".to_string(),
                 first_source: "Yahoo Finance".to_string(),
                 is_derivative_repost: false,
@@ -754,6 +832,7 @@ mod tests {
         let json = r#"{
             "direction": "bullish",
             "confidence": 0.7,
+            "long_probability": 0.62,
             "report": "CPI evidence supports the call.",
             "key_evidence": [
                 {"claim": "CPI 3.2%", "evidence_type": "fact", "source": "BLS", "timestamp": "2026-07-06", "source_tier":"official", "first_source":"BLS", "is_derivative_repost":false, "evidence_age":"0-2d", "source_confidence":0.9}
@@ -823,12 +902,18 @@ mod tests {
         let artifact = AnalystTickerArtifact {
             direction: "bullish".to_string(),
             confidence: 0.7,
+            long_probability: 0.62,
             report: String::new(),
             key_evidence: vec![EvidenceItem {
                 claim: "a claim".to_string(),
                 evidence_type: EvidenceType::Fact,
                 source: String::new(),
                 timestamp: String::new(),
+                event_time: None,
+                published_time: None,
+                ingested_time: None,
+                as_of: None,
+                timezone: None,
                 source_tier: "garbage".to_string(),
                 first_source: String::new(),
                 is_derivative_repost: false,
@@ -851,12 +936,18 @@ mod tests {
         let artifact = AnalystTickerArtifact {
             direction: "bullish".to_string(),
             confidence: 0.7,
+            long_probability: 0.62,
             report: String::new(),
             key_evidence: vec![EvidenceItem {
                 claim: "a claim".to_string(),
                 evidence_type: EvidenceType::Fact,
                 source: String::new(),
                 timestamp: String::new(),
+                event_time: None,
+                published_time: None,
+                ingested_time: None,
+                as_of: None,
+                timezone: None,
                 source_tier: String::new(),
                 first_source: String::new(),
                 is_derivative_repost: false,
@@ -910,6 +1001,7 @@ mod tests {
         let json = r#"{
             "direction": "bullish",
             "confidence": 0.7,
+            "long_probability": 0.62,
             "report": "CPI evidence supports the call.",
             "echo_chamber_risk": "medium",
             "crowded_consensus_risk": "high",
@@ -1041,18 +1133,21 @@ mod tests {
         Scenarios {
             bull: Scenario {
                 probability: 0.35,
+                conditional_long_probability: 0.8,
                 drivers: vec!["Fed cut".to_string()],
                 triggers: vec!["FOMC minutes".to_string()],
                 confirmation: "Close above 500".to_string(),
             },
             base: Scenario {
                 probability: 0.45,
+                conditional_long_probability: 0.6,
                 drivers: vec!["Range-bound".to_string()],
                 triggers: vec!["VIX below 20".to_string()],
                 confirmation: "5 days in range".to_string(),
             },
             bear: Scenario {
                 probability: 0.20,
+                conditional_long_probability: 0.125,
                 drivers: vec!["Inflation".to_string()],
                 triggers: vec!["CPI above 3.5%".to_string()],
                 confirmation: "Close below 475".to_string(),
@@ -1084,18 +1179,21 @@ mod tests {
         let artifact = research_decision_with_scenarios(Some(Scenarios {
             bull: Scenario {
                 probability: 0.4,
+                conditional_long_probability: 0.8,
                 drivers: vec!["x".into()],
                 triggers: vec!["y".into()],
                 confirmation: "z".into(),
             },
             base: Scenario {
                 probability: 0.4,
+                conditional_long_probability: 0.5,
                 drivers: vec!["x".into()],
                 triggers: vec!["y".into()],
                 confirmation: "z".into(),
             },
             bear: Scenario {
                 probability: 0.4,
+                conditional_long_probability: 0.2,
                 drivers: vec!["x".into()],
                 triggers: vec!["y".into()],
                 confirmation: "z".into(),
@@ -1117,18 +1215,21 @@ mod tests {
             ..research_decision_with_scenarios(Some(Scenarios {
                 bull: Scenario {
                     probability: 0.2,
+                    conditional_long_probability: 0.8,
                     drivers: vec!["x".into()],
                     triggers: vec!["y".into()],
                     confirmation: "z".into(),
                 },
                 base: Scenario {
                     probability: 0.5,
+                    conditional_long_probability: 0.5,
                     drivers: vec!["x".into()],
                     triggers: vec!["y".into()],
                     confirmation: "z".into(),
                 },
                 bear: Scenario {
                     probability: 0.3,
+                    conditional_long_probability: 0.1,
                     drivers: vec!["x".into()],
                     triggers: vec!["y".into()],
                     confirmation: "z".into(),
@@ -1139,7 +1240,33 @@ mod tests {
         assert!(matches!(
             validate_research_decision(&artifact),
             Err(ValidationError::InconsistentLongProbability { long, expected })
-                if (long - 0.7).abs() < 0.001 && (expected - 0.45).abs() < 0.001
+                if (long - 0.7).abs() < 0.001 && (expected - 0.44).abs() < 0.001
+        ));
+    }
+
+    #[test]
+    fn scenario_tree_uses_conditional_outcome_probabilities() {
+        let scenarios = valid_scenarios();
+
+        assert!((scenario_expected_long_probability(&scenarios) - 0.575).abs() < 0.000001);
+        assert!(
+            validate_research_decision(&research_decision_with_scenarios(Some(scenarios))).is_ok()
+        );
+    }
+
+    #[test]
+    fn scenario_tree_rejects_reversed_bull_and_bear_conditionals() {
+        let mut scenarios = valid_scenarios();
+        scenarios.bull.conditional_long_probability = 0.4;
+        let mut artifact = research_decision_with_scenarios(Some(scenarios));
+        artifact.long_probability = 0.435;
+        artifact.short_probability = 0.565;
+        artifact.rating = "Underweight".to_owned();
+
+        assert!(matches!(
+            validate_research_decision(&artifact),
+            Err(ValidationError::InvalidResearchField(message))
+                if message.contains("bull >= base >= bear")
         ));
     }
 
@@ -1248,6 +1375,7 @@ mod tests {
         let artifact = AnalystTickerArtifact {
             direction: "sideways".to_string(),
             confidence: 0.5,
+            long_probability: 0.5,
             report: String::new(),
             key_evidence: Vec::new(),
             priced_in: String::new(),
@@ -1258,6 +1386,16 @@ mod tests {
         };
         let err = validate_analyst_ticker_artifact(&artifact).unwrap_err();
         assert!(err.contains("invalid direction"));
+    }
+
+    #[test]
+    fn analyst_validation_keeps_probability_distinct_from_evidence_quality() {
+        let mut artifact = valid_analyst_ticker_artifact();
+        artifact.long_probability = 0.4;
+
+        let error = validate_analyst_ticker_artifact(&artifact).unwrap_err();
+
+        assert!(error.contains("conflicts with long_probability"));
     }
 
     #[test]

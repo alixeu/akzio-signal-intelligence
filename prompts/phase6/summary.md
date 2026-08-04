@@ -32,9 +32,13 @@
 `per_asset` 必须且只能覆盖 investable assets；示例中的 QQQ 只是结构示意。
 `max_target_weight` 和 `max_weight_delta` 必须是 Rust 校验的 0 到 1 之间的非负小数；
 不要输出百分数字面量或负数，偏空方向由 `direction_constraint=decrease_only` 表达。
-每个 binding risk control 必须是对象，并保留实际读取的 Phase 5 Index/Detail ID；
+每个 binding risk control 必须是对象，并保留实际读取的 Phase 5 Summary Index ID；
 不得只输出无来源的字符串。Phase 5 的缺失风控字段必须进入对应资产的
-`unresolved_blockers`。缺失权重或冲突约束必须报告，不得猜测。不要输出代码块或额外文字。
+`unresolved_blockers`。`downgrade` 是条件性、非执行状态：本轮 Phase 7 将保持
+`current_weight`；若本轮必须减仓，应使用 `execute + decrease_only` 并给出对应硬风控
+来源。缺失权重或冲突约束必须报告，不得猜测。不要输出代码块或额外文字。
+
+{summary_validation_instruction}
 
 ## SOURCE_PAYLOAD（动态输入）
 
