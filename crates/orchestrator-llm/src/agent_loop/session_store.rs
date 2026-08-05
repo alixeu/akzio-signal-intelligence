@@ -12,7 +12,9 @@ use orchestrator_store::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use super::{ToolResultItem, Turn, TurnItem, TurnItemType};
+use super::{
+    ToolExecutionRecord, ToolExecutionStatus, ToolResultItem, Turn, TurnItem, TurnItemType,
+};
 
 /// Rust-owned parameters used to create or recover a session manifest.
 #[derive(Debug, Clone)]
@@ -185,6 +187,150 @@ impl FileStoreSessionRuntime {
         )
     }
 
+    /// Persist one Rust-owned tool execution transition.  The existing
+    /// SessionEventType variants are intentionally reused: a pending/running
+    /// transition is a ToolCall, a completed result is a ToolResult, and an
+    /// interruption is an Error.  The `kind` discriminator keeps these
+    /// records separate from ordinary TurnItem payloads.
+    pub fn append_tool_execution(
+        &self,
+        turn: &Turn,
+        record: &ToolExecutionRecord,
+        created_at: impl Into<String>,
+    ) -> Result<SessionEvent> {
+        self.validate_turn(turn)?;
+        if record.key.session_id != turn.session_id || record.key.turn_id != turn.turn_id {
+            bail!("tool execution key does not match its FileStore turn")
+        }
+        self.append_tool_execution_record(record, created_at)
+    }
+
+    /// Append a tool execution transition from a cancellation guard.  This
+    /// variant validates against the session manifest and key only, so a
+    /// cancelled Future can record Interrupted without holding a Turn borrow.
+    pub fn append_tool_execution_record(
+        &self,
+        record: &ToolExecutionRecord,
+        created_at: impl Into<String>,
+    ) -> Result<SessionEvent> {
+        if record.key.session_id != self.manifest.session_id
+            || record.key.turn_id.trim().is_empty()
+            || record.tool_name.trim().is_empty()
+        {
+            bail!("tool execution record is outside its FileStore session authority")
+        }
+        if record.status == ToolExecutionStatus::Completed {
+            let result = record
+                .result
+                .as_ref()
+                .context("completed tool execution is missing its result")?;
+            if result.call_id != record.key.call_id || result.name != record.tool_name {
+                bail!("completed tool execution result does not match its key")
+            }
+        } else if record.result.is_some() {
+            bail!("non-completed tool execution cannot contain a result")
+        }
+        let event_type = match record.status {
+            ToolExecutionStatus::Pending | ToolExecutionStatus::Running => {
+                SessionEventType::ToolCall
+            }
+            ToolExecutionStatus::Completed => SessionEventType::ToolResult,
+            ToolExecutionStatus::Interrupted => SessionEventType::Error,
+        };
+        self.append(
+            event_type,
+            &record.key.turn_id,
+            json!({
+                "kind": "tool_execution",
+                "record": record,
+            }),
+            created_at,
+        )
+    }
+
+    /// Persist an interrupted turn before its Future is dropped by an outer
+    /// timeout or cancellation. Recovery can then distinguish an unfinished
+    /// turn from a cleanly persisted terminal turn without guessing.
+    pub fn append_turn_interruption(
+        &self,
+        turn_id: &str,
+        reason: impl Into<String>,
+        created_at: impl Into<String>,
+    ) -> Result<SessionEvent> {
+        if turn_id.trim().is_empty() {
+            bail!("turn interruption requires a non-empty turn id")
+        }
+        self.read_current_turn(turn_id)?;
+        self.append(
+            SessionEventType::Error,
+            turn_id,
+            json!({
+                "kind": "turn_execution",
+                "state": "interrupted",
+                "reason": reason.into(),
+            }),
+            created_at,
+        )
+    }
+
+    /// Return the latest persisted state for one execution key.
+    pub fn read_tool_execution(
+        &self,
+        turn_id: &str,
+        call_id: &str,
+    ) -> Result<Option<ToolExecutionRecord>> {
+        let mut latest = None;
+        for event in self.read_current_turn(turn_id)? {
+            if event.payload.get("kind").and_then(Value::as_str) != Some("tool_execution") {
+                continue;
+            }
+            let record: ToolExecutionRecord = serde_json::from_value(
+                event
+                    .payload
+                    .get("record")
+                    .cloned()
+                    .context("tool execution event is missing its record")?,
+            )
+            .context("decode persisted tool execution record")?;
+            if record.key.turn_id != turn_id || record.key.call_id != call_id {
+                continue;
+            }
+            if record.key.session_id != self.manifest.session_id {
+                bail!("persisted tool execution record violates FileStore authority")
+            }
+            latest = Some(record);
+        }
+        Ok(latest)
+    }
+
+    /// Return the latest state for every tool call in a turn.  Any malformed
+    /// matching record is an error rather than a reason to execute blindly.
+    pub fn read_tool_executions(&self, turn_id: &str) -> Result<Vec<ToolExecutionRecord>> {
+        let events = self.read_current_turn(turn_id)?;
+        let mut latest = std::collections::BTreeMap::<String, ToolExecutionRecord>::new();
+        for event in events {
+            if event.payload.get("kind").and_then(Value::as_str) != Some("tool_execution") {
+                continue;
+            }
+            let record: ToolExecutionRecord = serde_json::from_value(
+                event
+                    .payload
+                    .get("record")
+                    .cloned()
+                    .context("tool execution event is missing its record")?,
+            )
+            .context("decode persisted tool execution record")?;
+            if record.key.session_id != self.manifest.session_id
+                || record.key.turn_id != turn_id
+                || record.key.call_id.trim().is_empty()
+            {
+                bail!("persisted tool execution record violates FileStore authority")
+            }
+            latest.insert(record.key.call_id.clone(), record);
+        }
+        Ok(latest.into_values().collect())
+    }
+
     /// Events written by this session only, narrowed to one turn.
     pub fn read_current_turn(&self, turn_id: &str) -> Result<Vec<SessionEvent>> {
         self.read_turn_from(&self.location, turn_id)
@@ -252,7 +398,7 @@ impl FileStoreSessionRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent_loop::TurnItem;
+    use crate::agent_loop::{ToolExecutionKey, TurnItem};
     use orchestrator_store::{FileStoreOptions, SessionStatus};
     use tempfile::TempDir;
 
@@ -319,6 +465,99 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].event_type, SessionEventType::User);
         assert_eq!(events[1].event_type, SessionEventType::Checkpoint);
+    }
+
+    #[test]
+    fn tool_execution_state_is_durable_and_latest_state_wins() {
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime(&temp, None);
+        let turn = turn();
+        let key = ToolExecutionKey::new("session-a", "turn-a", "call-a").unwrap();
+        runtime
+            .append_tool_execution(
+                &turn,
+                &ToolExecutionRecord::pending(key.clone(), "read"),
+                "2026-07-27T00:00:01Z",
+            )
+            .unwrap();
+        runtime
+            .append_tool_execution(
+                &turn,
+                &ToolExecutionRecord::running(key.clone(), "read"),
+                "2026-07-27T00:00:02Z",
+            )
+            .unwrap();
+        let result = ToolResultItem {
+            call_id: "call-a".to_owned(),
+            name: "read".to_owned(),
+            status: "completed".to_owned(),
+            output: json!({"ok": true}),
+            error: None,
+        };
+        runtime
+            .append_tool_execution(
+                &turn,
+                &ToolExecutionRecord::completed(result.clone(), key),
+                "2026-07-27T00:00:03Z",
+            )
+            .unwrap();
+
+        let recovered = FileStoreSessionRuntime::load(
+            FileStore::open(temp.path(), FileStoreOptions::default()).unwrap(),
+            runtime.location().clone(),
+        )
+        .unwrap();
+        let record = recovered
+            .read_tool_execution("turn-a", "call-a")
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.status, ToolExecutionStatus::Completed);
+        assert_eq!(record.result, Some(result));
+    }
+
+    #[test]
+    fn interrupted_tool_execution_is_preserved_for_fail_closed_recovery() {
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime(&temp, None);
+        let turn = turn();
+        let key = ToolExecutionKey::new("session-a", "turn-a", "call-a").unwrap();
+        runtime
+            .append_tool_execution(
+                &turn,
+                &ToolExecutionRecord::interrupted(key, "write", "cancelled"),
+                "2026-07-27T00:00:01Z",
+            )
+            .unwrap();
+        let records = runtime.read_tool_executions("turn-a").unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].status, ToolExecutionStatus::Interrupted);
+        assert_eq!(records[0].reason.as_deref(), Some("cancelled"));
+    }
+
+    #[test]
+    fn interrupted_turn_state_is_durable() {
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime(&temp, None);
+        let turn = turn();
+        runtime
+            .append_turn_item_at(
+                &turn,
+                &TurnItem::user("prompt"),
+                Some(0),
+                "2026-07-27T00:00:00Z",
+            )
+            .unwrap();
+        runtime
+            .append_turn_interruption(
+                "turn-a",
+                "outer timeout cancelled agent loop",
+                "2026-07-27T00:00:01Z",
+            )
+            .unwrap();
+        let events = runtime.read_current_turn("turn-a").unwrap();
+        assert!(events.iter().any(|event| {
+            event.event_type == SessionEventType::Error && event.payload["state"] == "interrupted"
+        }));
     }
 
     #[test]

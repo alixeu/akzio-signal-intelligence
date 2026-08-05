@@ -1290,8 +1290,10 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
+ "tower",
  "tracing",
  "uuid",
 ]
@@ -1314,6 +1316,7 @@ name = "orchestrator-workflow"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-openai",
  "chrono",
  "clap",
  "futures",
@@ -1326,6 +1329,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "toml",

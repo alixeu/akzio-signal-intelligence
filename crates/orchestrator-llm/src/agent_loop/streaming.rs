@@ -36,6 +36,35 @@ impl<'a, S: AgentEventSink> ModelStreamHandler<'a, S> {
         }
     }
 
+    async fn record_tool_call(
+        &mut self,
+        tool_call: ToolCallRequest,
+        output_item_id: Option<String>,
+    ) -> Result<()> {
+        debug!(
+            turn_id = self.turn.turn_id,
+            call_id = tool_call.call_id,
+            tool = tool_call.name,
+            "model stream tool call requested"
+        );
+        let item = output_item_id.as_deref().map_or_else(
+            || TurnItem::tool_call(&tool_call),
+            |item_id| TurnItem::tool_call_with_output_item_id(&tool_call, item_id),
+        );
+        self.turn.emitted_items.push(item);
+        emit_completed(
+            self.turn,
+            self.sink,
+            self.turn.emitted_items.last().expect("just appended"),
+        )
+        .await?;
+        self.result.needs_follow_up = true;
+        self.result.tool_call_count += 1;
+        self.result.tool_calls.push(tool_call.clone());
+        self.turn.pending_tool_calls.push(tool_call);
+        Ok(())
+    }
+
     async fn handle_event(&mut self, event: ModelStreamEvent) -> Result<()> {
         match event {
             ModelStreamEvent::AssistantMessageStarted { item_id } => {
@@ -162,24 +191,14 @@ impl<'a, S: AgentEventSink> ModelStreamHandler<'a, S> {
                 self.turn.emitted_items.push(item);
             }
             ModelStreamEvent::ToolCallCompleted { tool_call } => {
-                debug!(
-                    turn_id = self.turn.turn_id,
-                    call_id = tool_call.call_id,
-                    tool = tool_call.name,
-                    "model stream tool call requested"
-                );
-                let item = TurnItem::tool_call(&tool_call);
-                self.turn.emitted_items.push(item);
-                emit_completed(
-                    self.turn,
-                    self.sink,
-                    self.turn.emitted_items.last().expect("just appended"),
-                )
-                .await?;
-                self.result.needs_follow_up = true;
-                self.result.tool_call_count += 1;
-                self.result.tool_calls.push(tool_call.clone());
-                self.turn.pending_tool_calls.push(tool_call);
+                self.record_tool_call(tool_call, None).await?;
+            }
+            ModelStreamEvent::ToolCallCompletedWithOutputItem {
+                tool_call,
+                output_item_id,
+            } => {
+                self.record_tool_call(tool_call, Some(output_item_id))
+                    .await?;
             }
             ModelStreamEvent::NativeWebSearchCompleted { item_id, record } => {
                 let source_count = record

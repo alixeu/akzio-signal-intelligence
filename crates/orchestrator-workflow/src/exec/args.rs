@@ -79,6 +79,10 @@ pub struct ExecArgs {
     /// Write inspectable LLM and local reducer records below outputs/debug/.
     #[arg(long)]
     pub debug: bool,
+    /// Validate the configured provider capabilities without creating a
+    /// FileStore run, reading market data, or executing workflow tools.
+    #[arg(long)]
+    pub provider_contract: bool,
     /// Explicitly authorize submitting an already-persisted Phase 7 plan to
     /// Alpaca Paper. The config switch remains a second, deployment-level
     /// guard; without both guards a normal run only plans orders.

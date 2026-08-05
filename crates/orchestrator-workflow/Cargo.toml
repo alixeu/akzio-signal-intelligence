@@ -7,6 +7,7 @@ publish = { workspace = true }
 
 [dependencies]
 anyhow = { workspace = true }
+async-openai = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
 futures = { workspace = true }
@@ -15,6 +16,7 @@ pulldown-cmark = "0.12"
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }

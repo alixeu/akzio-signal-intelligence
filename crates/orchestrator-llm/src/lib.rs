@@ -5,7 +5,7 @@ use agent_loop::{
 use anyhow::{bail, Context, Result};
 use futures::StreamExt;
 use orchestrator_core::{default_project_root, ToolManagedProfile};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -39,11 +39,103 @@ pub const VERIFIED_PHASE1_EVIDENCE_MARKER: &str = "<!-- Rust-verified Phase 1 ev
 pub const VERIFIED_PHASE1_EVIDENCE_RECORDS_MARKER: &str =
     "<!-- Rust-verified Phase 1 evidence metadata -->";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LlmRoute {
     Responses,
     ChatCompletions,
+}
+
+#[derive(Debug)]
+enum ProviderFailure {
+    Http(async_openai::error::OpenAIError),
+    StreamDisconnected,
+    ResponseFailed {
+        code: Option<String>,
+        message: Option<String>,
+    },
+    ResponseIncomplete {
+        reason: Option<String>,
+    },
+    ProtocolViolation {
+        detail: String,
+    },
+}
+
+impl std::fmt::Display for ProviderFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Http(error) => write!(formatter, "provider HTTP request failed: {error:?}"),
+            Self::StreamDisconnected => write!(formatter, "provider stream disconnected"),
+            Self::ResponseFailed { code, message } => write!(
+                formatter,
+                "provider response failed{}{}",
+                code.as_deref()
+                    .map(|code| format!(" ({code})"))
+                    .unwrap_or_default(),
+                message
+                    .as_deref()
+                    .map(|message| format!(": {message}"))
+                    .unwrap_or_default()
+            ),
+            Self::ResponseIncomplete { reason } => write!(
+                formatter,
+                "provider response incomplete{}",
+                reason
+                    .as_deref()
+                    .map(|reason| format!(": {reason}"))
+                    .unwrap_or_default()
+            ),
+            Self::ProtocolViolation { detail } => {
+                write!(formatter, "provider protocol violation: {detail}")
+            }
+        }
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplayState {
+    NoProviderEvent,
+    ProviderEventObserved,
+    ApplicationEventEmitted,
+    SideEffectCommitted,
+}
+
+#[derive(Debug)]
+struct StreamAttemptError {
+    error: anyhow::Error,
+    replay_state: ReplayState,
+}
+
+impl StreamAttemptError {
+    fn new(error: anyhow::Error, replay_state: ReplayState) -> Self {
+        Self {
+            error,
+            replay_state,
+        }
+    }
+
+    fn provider(failure: ProviderFailure, replay_state: ReplayState) -> Self {
+        Self::new(anyhow::anyhow!(failure.to_string()), replay_state)
+    }
+
+    fn protocol(detail: impl Into<String>, replay_state: ReplayState) -> Self {
+        Self::provider(
+            ProviderFailure::ProtocolViolation {
+                detail: detail.into(),
+            },
+            replay_state,
+        )
+    }
+
+    fn handler(error: anyhow::Error, replay_state: ReplayState) -> Self {
+        Self::new(error.context("model event handler failed"), replay_state)
+    }
+
+    fn with_context(self, context: String) -> Self {
+        Self::new(self.error.context(context), self.replay_state)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1593,14 +1685,10 @@ async fn run_responses_text_once(
     debug!(role = %settings.role, "sending non-streaming Responses API request");
     let response = client
         .responses()
-        .create_byot::<_, Value>(request)
+        .create(request)
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))
         .context("OpenAI-compatible Responses prompt failed")?;
-    let response: async_openai::types::responses::Response =
-        deserialize_responses_payload(response)
-            .map_err(|e| anyhow::anyhow!("{e}"))
-            .context("OpenAI-compatible Responses response payload failed")?;
     let text = response.output_text().unwrap_or_default();
     debug!(
         role = %settings.role,
@@ -1609,101 +1697,6 @@ async fn run_responses_text_once(
         "non-streaming Responses API completed"
     );
     Ok(text)
-}
-
-/// Some OpenAI-compatible Responses gateways omit fields that the
-/// async-openai response models treat as required. Keep the compatibility
-/// shim at the wire boundary so the rest of the workflow can continue using
-/// typed SDK values and native web-search citation handling.
-fn normalize_responses_gateway_payload(value: &mut Value) {
-    fn visit(value: &mut Value, path: &mut Vec<String>) {
-        match value {
-            Value::Array(items) => {
-                for (index, item) in items.iter_mut().enumerate() {
-                    path.push(index.to_string());
-                    visit(item, path);
-                    path.pop();
-                }
-            }
-            Value::Object(object) => {
-                let kind = object
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned);
-                if kind.as_deref() == Some("output_text") && !object.contains_key("annotations") {
-                    object.insert("annotations".to_owned(), Value::Array(Vec::new()));
-                }
-                if kind.as_deref().is_some_and(is_responses_output_item_type)
-                    && !object.get("id").is_some_and(Value::is_string)
-                {
-                    let suffix = object
-                        .get("call_id")
-                        .and_then(Value::as_str)
-                        .filter(|call_id| !call_id.trim().is_empty())
-                        .map(ToOwned::to_owned)
-                        .unwrap_or_else(|| path.join("-"));
-                    object.insert(
-                        "id".to_owned(),
-                        Value::String(format!(
-                            "gateway-{}-{suffix}",
-                            kind.as_deref().unwrap_or("item")
-                        )),
-                    );
-                }
-                if kind.as_deref() == Some("message")
-                    && !object.get("status").is_some_and(Value::is_string)
-                {
-                    object.insert("status".to_owned(), Value::String("completed".to_owned()));
-                }
-                let keys = object.keys().cloned().collect::<Vec<_>>();
-                for key in keys {
-                    if let Some(child) = object.get_mut(&key) {
-                        path.push(key);
-                        visit(child, path);
-                        path.pop();
-                    }
-                }
-            }
-            Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
-        }
-    }
-
-    fn is_responses_output_item_type(kind: &str) -> bool {
-        matches!(
-            kind,
-            "message"
-                | "file_search_call"
-                | "function_call"
-                | "function_call_output"
-                | "web_search_call"
-                | "computer_call"
-                | "computer_call_output"
-                | "reasoning"
-                | "compaction"
-                | "image_generation_call"
-                | "code_interpreter_call"
-                | "local_shell_call"
-                | "shell_call"
-                | "shell_call_output"
-                | "apply_patch_call"
-                | "apply_patch_call_output"
-                | "mcp_list_tools"
-                | "mcp_approval_request"
-                | "mcp_approval_response"
-                | "mcp_call"
-                | "custom_tool_call"
-                | "custom_tool_call_output"
-                | "tool_search_call"
-                | "tool_search_output"
-        )
-    }
-
-    visit(value, &mut vec!["root".to_owned()]);
-}
-
-fn deserialize_responses_payload<T: DeserializeOwned>(mut value: Value) -> serde_json::Result<T> {
-    normalize_responses_gateway_payload(&mut value);
-    serde_json::from_value(value)
 }
 
 async fn run_chat_completions_text_once(
@@ -1784,39 +1777,63 @@ fn build_responses_request(
                 }
             }
             agent_loop::TurnItemType::ToolCall => {
-                let call = item.content_json.get("call");
+                let call = item
+                    .content_json
+                    .get("call")
+                    .context("Responses history tool call is missing its call payload")?;
                 let arguments = call
-                    .and_then(|c| c.get("arguments"))
+                    .get("arguments")
                     .cloned()
-                    .unwrap_or(Value::Null);
-                let name = call
-                    .and_then(|c| c.get("name"))
-                    .and_then(Value::as_str)
-                    .unwrap_or(&item.tool_name)
-                    .to_string();
-                let call_id = item.tool_call_id.clone();
-                if let Ok(tc) = serde_json::from_value::<InputItem>(json!({
-                    "type": "function_call",
-                    "call_id": call_id,
-                    "name": name,
-                    "arguments": arguments.to_string()
-                })) {
-                    items.push(tc);
+                    .context("Responses history tool call is missing arguments")?;
+                if !arguments.is_object() {
+                    bail!("Responses history tool call arguments must be a JSON object");
                 }
+                let name = call
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .filter(|name| !name.trim().is_empty())
+                    .or_else(|| {
+                        (!item.tool_name.trim().is_empty()).then_some(item.tool_name.as_str())
+                    })
+                    .context("Responses history tool call is missing its name")?
+                    .to_owned();
+                let call_id = item.tool_call_id.clone();
+                if call_id.trim().is_empty() {
+                    bail!("Responses history tool call is missing call_id");
+                }
+                // Keep the persisted call id and provider item id distinct.
+                // The previous JSON round-trip silently dropped the latter
+                // and made malformed history look like a valid call.
+                let item_id = (!item.output_item_id.trim().is_empty())
+                    .then(|| item.output_item_id.clone())
+                    .context("Responses history tool call is missing output item id")?;
+                items.push(InputItem::Item(Item::FunctionCall(FunctionToolCall {
+                    arguments: arguments.to_string(),
+                    call_id,
+                    namespace: None,
+                    name,
+                    id: Some(item_id),
+                    status: Some(OutputStatus::Completed),
+                })));
             }
             agent_loop::TurnItemType::ToolResult => {
+                // TurnItem stores a bounded text projection for model input;
+                // the full structured ToolResultItem remains in the durable
+                // tool_execution record used for idempotent recovery.
                 let content_text = truncation::truncate_semantic(
                     &item.content_text,
                     input.truncation.tool_result_chars,
                     &input.truncation,
                 );
-                if let Ok(tr) = serde_json::from_value::<InputItem>(json!({
-                    "type": "function_call_output",
-                    "call_id": item.tool_call_id,
-                    "output": content_text
-                })) {
-                    items.push(tr);
-                }
+                items.push(InputItem::Item(Item::FunctionCallOutput(
+                    FunctionCallOutputItemParam {
+                        call_id: item.tool_call_id.clone(),
+                        output: FunctionCallOutput::Text(content_text),
+                        id: (!item.output_item_id.trim().is_empty())
+                            .then(|| item.output_item_id.clone()),
+                        status: Some(OutputStatus::Completed),
+                    },
+                )));
             }
             agent_loop::TurnItemType::ReasoningState => {
                 if settings.llm.preserve_reasoning_state {
@@ -1828,14 +1845,13 @@ fn build_responses_request(
                             .get("encrypted_content")
                             .and_then(Value::as_str),
                     ) {
-                        if let Ok(ri) = serde_json::from_value::<InputItem>(json!({
-                            "type": "reasoning",
-                            "id": id,
-                            "encrypted_content": encrypted,
-                            "summary": []
-                        })) {
-                            items.push(ri);
-                        }
+                        items.push(InputItem::Item(Item::Reasoning(ReasoningItem {
+                            id: Some(id.to_owned()),
+                            summary: Vec::new(),
+                            content: None,
+                            encrypted_content: Some(encrypted.to_owned()),
+                            status: Some(OutputStatus::Completed),
+                        })));
                     }
                 }
             }
@@ -1911,10 +1927,15 @@ fn build_responses_request(
             .tool_choice(ToolChoiceParam::Mode(ToolChoiceOptions::Auto));
     }
 
-    // The gateway returns 502 for the real Phase 2 extraction prompt when
-    // Responses sends provider-level JSON mode. The prompt and Rust artifact
-    // validation still own this contract, so do not send the incompatible
-    // `text.format=json_object` field here.
+    // JSON mode is only used for the tool-free phase-summary compressor. It
+    // guarantees syntactically valid JSON; the Rust PhaseIndexCandidate
+    // validator remains the business-schema authority.
+    if settings.role == "compressor.phase_summary" && input.available_tools.is_empty() {
+        builder = builder.text(ResponseTextParam {
+            format: TextResponseFormatConfiguration::JsonObject,
+            verbosity: None,
+        });
+    }
 
     debug!(
         model = %model,
@@ -2234,84 +2255,25 @@ async fn stream_responses_with_retry(
     prompt: &str,
     handler: &mut dyn ModelEventHandler,
 ) -> Result<()> {
-    const MAX_ATTEMPTS: usize = 5;
-    let mut attempt = 0usize;
-    loop {
-        attempt += 1;
+    const MAX_SSE_OPENS: usize = 2;
+    for attempt in 1..=MAX_SSE_OPENS {
         match stream_responses_once(settings, input, prompt, handler).await {
             Ok(()) => return Ok(()),
-            Err((error, made_progress))
-                if attempt < MAX_ATTEMPTS && !made_progress && is_transient_llm_error(&error) =>
+            Err(error)
+                if attempt < MAX_SSE_OPENS
+                    && error.replay_state == ReplayState::NoProviderEvent =>
             {
-                let backoff_ms = 1_000u64 * (1u64 << (attempt - 1)).min(8)
-                    + retry_jitter_ms(&settings.role, attempt);
                 tracing::warn!(
                     attempt,
-                    backoff_ms,
-                    error = %error,
-                    error_chain = %format!("{error:#}"),
                     role = %settings.role,
-                    "retrying transient LLM stream failure"
+                    error = %error.error,
+                    "reopening Responses stream before any provider event"
                 );
-                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
             }
-            Err((error, _)) => return Err(error),
+            Err(error) => return Err(error.error),
         }
     }
-}
-
-fn is_transient_llm_error(error: &anyhow::Error) -> bool {
-    let text = format!("{error:#}").to_ascii_lowercase();
-    // Provider request IDs are numeric and can accidentally contain "502" or
-    // "503". Quota exhaustion is unambiguously permanent, so reject it before
-    // scanning the free-form error text for transient status fragments.
-    if text.contains("insufficient_user_quota") || text.contains("额度已用完") {
-        return false;
-    }
-    // Some gateways (e.g. the opencode free tier) wrap transient upstream
-    // failures in a 400 invalid_request_error envelope. Evaluate explicit
-    // transient signals first so they win over the permanent-error heuristic.
-    let has_transient_signal = text.contains("503")
-        || text.contains("502")
-        || text.contains("429")
-        || text.contains("bad_response_status_code")
-        || text.contains("no healthy upstream")
-        || text.contains("timeout")
-        || text.contains("timed out")
-        || text.contains("connection reset")
-        || text.contains("transport error")
-        || text.contains("error decoding response body")
-        || text.contains("temporarily unavailable")
-        || text.contains("upstream_error")
-        || text.contains("upstream request failed");
-    if has_transient_signal {
-        return true;
-    }
-    // Permanent request/context errors must not burn stream retries.
-    !is_permanent_llm_error_text(&text)
-}
-
-fn retry_jitter_ms(role: &str, attempt: usize) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    role.hash(&mut hasher);
-    attempt.hash(&mut hasher);
-    hasher.finish() % 251
-}
-
-fn is_permanent_llm_error_text(text: &str) -> bool {
-    text.contains("insufficient_user_quota")
-        || text.contains("额度已用完")
-        || text.contains("context window is full")
-        || text.contains("reduce conversation history")
-        || text.contains("invalid_request_error")
-        || text.contains("请精简对话历史")
-        || text.contains("context window")
-        || (text.contains("400")
-            && (text.contains("invalid_request")
-                || text.contains("context")
-                || text.contains("too large")
-                || text.contains("token")))
+    unreachable!("the bounded Responses stream retry loop always returns")
 }
 
 fn is_recoverable_length_finish(text_started: bool, pending_tool_calls: bool) -> bool {
@@ -2323,21 +2285,23 @@ async fn stream_responses_once(
     input: &agent_loop::ModelInput,
     prompt: &str,
     handler: &mut dyn ModelEventHandler,
-) -> std::result::Result<(), (anyhow::Error, bool)> {
+) -> std::result::Result<(), StreamAttemptError> {
     use async_openai::types::responses::{OutputItem, ResponseStreamEvent};
 
     let started = std::time::Instant::now();
-    let client =
-        providers::openai_compatible_responses_client(&settings.llm).map_err(|e| (e, false))?;
-    let mut request =
-        build_responses_request(settings, input, prompt, true, false).map_err(|e| (e, false))?;
+    let client = providers::openai_compatible_responses_client(&settings.llm)
+        .map_err(|error| StreamAttemptError::new(error, ReplayState::NoProviderEvent))?;
+    let mut request = build_responses_request(settings, input, prompt, true, false)
+        .map_err(|error| StreamAttemptError::new(error, ReplayState::NoProviderEvent))?;
     request.stream = Some(true);
     debug!(role = %settings.role, "opening streaming Responses API connection");
     let mut stream = client
         .responses()
-        .create_stream_byot::<_, Value>(request)
+        .create_stream(request)
         .await
-        .map_err(|e| (anyhow::anyhow!("{e}").context("LLM stream failed"), false))?;
+        .map_err(|error| {
+            StreamAttemptError::provider(ProviderFailure::Http(error), ReplayState::NoProviderEvent)
+        })?;
     debug!(
         role = %settings.role,
         connect_ms = started.elapsed().as_millis() as u64,
@@ -2346,39 +2310,59 @@ async fn stream_responses_once(
 
     let mut text_item_id: Option<String> = None;
     let mut text_started = false;
-    let mut saw_tool_call = false;
     let mut final_raw = Value::Null;
-    let mut made_progress = false;
     let mut reasoning_item_id: Option<String> = None;
     let mut event_count: u64 = 0;
-    let mut saw_response_completed = false;
-    let mut function_call_meta: std::collections::HashMap<String, (String, String)> =
-        std::collections::HashMap::new();
+    let mut saw_response_created = false;
+    let mut saw_terminal = false;
+    let mut replay_state = ReplayState::NoProviderEvent;
     let mut emitted_tool_calls: std::collections::HashSet<String> =
         std::collections::HashSet::new();
-    let mut native_web_response = json!({"output": []});
+    let mut native_web_response = NativeWebSearchCollector::default();
 
     while let Some(event) = stream.next().await {
         event_count += 1;
-        let raw_event = match event {
-            Ok(ev) => ev,
-            Err(e) => {
-                return Err((
-                    anyhow::anyhow!("{e}").context("LLM stream chunk failed"),
-                    made_progress,
-                ))
+        let event = match event {
+            Ok(event) => {
+                // Any successfully decoded provider event makes replay
+                // unsafe, even if no text/tool side effect was emitted yet.
+                replay_state = ReplayState::ProviderEventObserved;
+                event
+            }
+            Err(error) => {
+                let error_text = error.to_string();
+                let failure = match &error {
+                    async_openai::error::OpenAIError::JSONDeserialize(_, detail) => {
+                        ProviderFailure::ProtocolViolation {
+                            detail: detail.clone(),
+                        }
+                    }
+                    _ => ProviderFailure::StreamDisconnected,
+                };
+                return Err(StreamAttemptError::provider(failure, replay_state)
+                    .with_context(format!("Responses stream chunk failed: {error_text}")));
             }
         };
         if uses_native_web_search(settings) {
-            merge_native_web_search_stream_event(&mut native_web_response, &raw_event);
+            native_web_response.observe(&event);
         }
-        let event = deserialize_responses_payload(raw_event).map_err(|e| {
-            (
-                anyhow::anyhow!("{e}").context("Responses stream event deserialization failed"),
-                made_progress,
-            )
-        })?;
+        if saw_terminal {
+            return Err(StreamAttemptError::protocol(
+                "Responses stream emitted an event after a terminal response event",
+                replay_state,
+            ));
+        }
+        if !saw_response_created {
+            if !matches!(&event, ResponseStreamEvent::ResponseCreated(_)) {
+                return Err(StreamAttemptError::protocol(
+                    "Responses stream did not begin with response.created",
+                    replay_state,
+                ));
+            }
+            saw_response_created = true;
+        }
         match event {
+            ResponseStreamEvent::ResponseCreated(_) => {}
             ResponseStreamEvent::ResponseOutputItemAdded(ev) => match &ev.item {
                 OutputItem::Message(msg) => {
                     let item_id = msg.id.clone();
@@ -2389,25 +2373,17 @@ async fn stream_responses_once(
                                 item_id: item_id.clone(),
                             })
                             .await
-                            .map_err(|e| (e, made_progress))?;
+                            .map_err(|e| StreamAttemptError::handler(e, replay_state))?;
                         text_started = true;
-                    }
-                }
-                OutputItem::FunctionCall(fc) => {
-                    if let Some(id) = &fc.id {
-                        function_call_meta
-                            .insert(id.clone(), (fc.name.clone(), fc.call_id.clone()));
+                        replay_state = ReplayState::ApplicationEventEmitted;
                     }
                 }
                 OutputItem::Reasoning(r) => {
-                    reasoning_item_id =
-                        r.id.clone()
-                            .or_else(|| Some(format!("reasoning-{}", Uuid::new_v4())));
+                    reasoning_item_id = r.id.clone();
                 }
                 _ => {}
             },
             ResponseStreamEvent::ResponseOutputTextDelta(ev) => {
-                made_progress = true;
                 let item_id = text_item_id
                     .clone()
                     .unwrap_or_else(|| format!("msg-{}", Uuid::new_v4()));
@@ -2418,7 +2394,7 @@ async fn stream_responses_once(
                             item_id: item_id.clone(),
                         })
                         .await
-                        .map_err(|e| (e, made_progress))?;
+                        .map_err(|e| StreamAttemptError::handler(e, replay_state))?;
                     text_started = true;
                 }
                 handler
@@ -2427,7 +2403,8 @@ async fn stream_responses_once(
                         delta: ev.delta,
                     })
                     .await
-                    .map_err(|e| (e, made_progress))?;
+                    .map_err(|e| StreamAttemptError::handler(e, replay_state))?;
+                replay_state = ReplayState::ApplicationEventEmitted;
             }
             ResponseStreamEvent::ResponseOutputTextDone(_ev) => {
                 if text_started {
@@ -2440,13 +2417,13 @@ async fn stream_responses_once(
                             turn_status: agent_loop::TurnStatus::Unknown,
                         })
                         .await
-                        .map_err(|e| (e, made_progress))?;
+                        .map_err(|e| StreamAttemptError::handler(e, replay_state))?;
+                    replay_state = ReplayState::ApplicationEventEmitted;
                     text_started = false;
                     text_item_id = None;
                 }
             }
             ResponseStreamEvent::ResponseReasoningSummaryTextDelta(ev) => {
-                made_progress = true;
                 let item_id = reasoning_item_id
                     .clone()
                     .unwrap_or_else(|| format!("reasoning-{}", Uuid::new_v4()));
@@ -2456,141 +2433,124 @@ async fn stream_responses_once(
                         delta: ev.delta,
                     })
                     .await
-                    .map_err(|e| (e, made_progress))?;
+                    .map_err(|e| StreamAttemptError::handler(e, replay_state))?;
+                replay_state = ReplayState::ApplicationEventEmitted;
             }
             ResponseStreamEvent::ResponseReasoningSummaryTextDone(_ev) => {
                 if let Some(item_id) = reasoning_item_id.clone() {
                     handler
                         .handle(ModelStreamEvent::ReasoningSummaryCompleted { item_id })
                         .await
-                        .map_err(|e| (e, made_progress))?;
+                        .map_err(|e| StreamAttemptError::handler(e, replay_state))?;
+                    replay_state = ReplayState::ApplicationEventEmitted;
                 }
             }
             ResponseStreamEvent::ResponseOutputItemDone(ev) => match &ev.item {
                 OutputItem::Reasoning(r) => {
-                    if let Ok(raw) = serde_json::to_value(r) {
-                        if let Some(encrypted) = extract_encrypted_reasoning(&raw) {
-                            let item_id =
-                                r.id.clone()
-                                    .unwrap_or_else(|| format!("reasoning-{}", Uuid::new_v4()));
-                            made_progress = true;
-                            handler
-                                .handle(ModelStreamEvent::ReasoningStateCompleted {
-                                    item_id,
-                                    encrypted_content: encrypted,
-                                })
-                                .await
-                                .map_err(|e| (e, made_progress))?;
-                        }
+                    if let Some(encrypted) = r.encrypted_content.clone() {
+                        let item_id = r.id.clone().ok_or_else(|| {
+                            StreamAttemptError::protocol(
+                                "Responses reasoning item is missing id",
+                                replay_state,
+                            )
+                        })?;
+                        handler
+                            .handle(ModelStreamEvent::ReasoningStateCompleted {
+                                item_id,
+                                encrypted_content: encrypted,
+                            })
+                            .await
+                            .map_err(|e| StreamAttemptError::handler(e, replay_state))?;
+                        replay_state = ReplayState::ApplicationEventEmitted;
                     }
                     reasoning_item_id = None;
                 }
                 OutputItem::FunctionCall(fc) => {
-                    let item_id = fc.id.as_deref().unwrap_or(&fc.call_id);
-                    if !emitted_tool_calls.contains(item_id) {
-                        if fc.call_id.trim().is_empty() || fc.name.trim().is_empty() {
-                            return Err((
-                                    anyhow::anyhow!(
-                                        "Responses tool call completed without call_id/name (item_id={item_id})"
-                                    ),
-                                    made_progress,
-                                ));
-                        }
-                        made_progress = true;
-                        saw_tool_call = true;
-                        let arguments: Value = serde_json::from_str(&fc.arguments).map_err(|error| {
-                                (
-                                    anyhow::anyhow!(error).context(format!(
-                                        "malformed Responses tool arguments for item_id={item_id}, call_id={}",
-                                        fc.call_id
-                                    )),
-                                    made_progress,
+                    validate_responses_function_call(fc, replay_state)?;
+                    if emitted_tool_calls.insert(fc.call_id.clone()) {
+                        let arguments: Value =
+                            serde_json::from_str(&fc.arguments).map_err(|error| {
+                                StreamAttemptError::protocol(
+                                    format!("malformed Responses tool arguments: {error}"),
+                                    replay_state,
                                 )
                             })?;
-                        let name = tools::resolve_tool_name(&fc.name);
-                        emitted_tool_calls.insert(item_id.to_string());
+                        let Value::Object(_) = arguments else {
+                            return Err(StreamAttemptError::protocol(
+                                "Responses function call arguments must be a JSON object",
+                                replay_state,
+                            ));
+                        };
                         handler
-                            .handle(ModelStreamEvent::ToolCallCompleted {
+                            .handle(ModelStreamEvent::ToolCallCompletedWithOutputItem {
                                 tool_call: ToolCallRequest {
                                     call_id: fc.call_id.clone(),
-                                    name,
+                                    name: tools::resolve_tool_name(&fc.name),
                                     arguments,
                                 },
+                                output_item_id: fc.id.clone().expect("validated output item id"),
                             })
                             .await
-                            .map_err(|e| (e, made_progress))?;
+                            .map_err(|e| StreamAttemptError::handler(e, replay_state))?;
+                        replay_state = ReplayState::ApplicationEventEmitted;
                     }
                 }
                 _ => {}
             },
-            ResponseStreamEvent::ResponseFunctionCallArgumentsDone(ev) => {
-                if emitted_tool_calls.contains(&ev.item_id) {
-                    continue;
-                }
-                made_progress = true;
-                saw_tool_call = true;
-                let arguments: Value = serde_json::from_str(&ev.arguments).map_err(|error| {
-                    (
-                        anyhow::anyhow!(error).context(format!(
-                            "malformed Responses tool arguments for item_id={}",
-                            ev.item_id
-                        )),
-                        made_progress,
-                    )
-                })?;
-                let meta = function_call_meta.get(&ev.item_id);
-                let name = ev
-                    .name
-                    .as_deref()
-                    .filter(|n| !n.is_empty() && *n != "unknown")
-                    .or_else(|| meta.map(|(n, _)| n.as_str()))
-                    .ok_or_else(|| {
-                        (
-                            anyhow::anyhow!(
-                                "Responses tool arguments completed without a tool name (item_id={})",
-                                ev.item_id
-                            ),
-                            made_progress,
-                        )
-                    })?;
-                let call_id = meta
-                    .map(|(_, cid)| cid.clone())
-                    .unwrap_or_else(|| ev.item_id.clone());
-                if call_id.trim().is_empty() {
-                    return Err((
-                        anyhow::anyhow!(
-                            "Responses tool arguments completed without call_id (item_id={})",
-                            ev.item_id
-                        ),
-                        made_progress,
-                    ));
-                }
-                emitted_tool_calls.insert(ev.item_id);
-                handler
-                    .handle(ModelStreamEvent::ToolCallCompleted {
-                        tool_call: ToolCallRequest {
-                            call_id,
-                            name: tools::resolve_tool_name(name),
-                            arguments,
-                        },
-                    })
-                    .await
-                    .map_err(|e| (e, made_progress))?;
-            }
+            // Argument delta/done events are useful for UI progress but are
+            // never sufficient to execute a tool. Only output_item.done is
+            // authoritative for a complete FunctionToolCall.
+            ResponseStreamEvent::ResponseFunctionCallArgumentsDelta(_)
+            | ResponseStreamEvent::ResponseFunctionCallArgumentsDone(_) => {}
             ResponseStreamEvent::ResponseCompleted(ev) => {
-                saw_response_completed = true;
+                validate_response_output(&ev.response.output, replay_state)?;
+                saw_terminal = true;
                 if uses_native_web_search(settings) {
-                    let record = native_web_search_record_from_value(&native_web_response);
-                    made_progress = true;
+                    let record = native_web_response.record(&ev.response);
                     handler
                         .handle(ModelStreamEvent::NativeWebSearchCompleted {
                             item_id: format!("native-web-search-{}", ev.response.id),
                             record,
                         })
                         .await
-                        .map_err(|error| (error, made_progress))?;
+                        .map_err(|error| StreamAttemptError::handler(error, replay_state))?;
+                    replay_state = ReplayState::ApplicationEventEmitted;
                 }
                 final_raw = response_usage_to_raw(&ev.response);
+            }
+            ResponseStreamEvent::ResponseFailed(ev) => {
+                return Err(StreamAttemptError::provider(
+                    ProviderFailure::ResponseFailed {
+                        code: ev.response.error.as_ref().map(|error| error.code.clone()),
+                        message: ev
+                            .response
+                            .error
+                            .as_ref()
+                            .map(|error| error.message.clone()),
+                    },
+                    replay_state,
+                ));
+            }
+            ResponseStreamEvent::ResponseIncomplete(ev) => {
+                return Err(StreamAttemptError::provider(
+                    ProviderFailure::ResponseIncomplete {
+                        reason: ev
+                            .response
+                            .incomplete_details
+                            .as_ref()
+                            .map(|details| details.reason.clone()),
+                    },
+                    replay_state,
+                ));
+            }
+            ResponseStreamEvent::ResponseError(ev) => {
+                return Err(StreamAttemptError::provider(
+                    ProviderFailure::ResponseFailed {
+                        code: ev.code,
+                        message: Some(ev.message),
+                    },
+                    replay_state,
+                ));
             }
             _ => {}
         }
@@ -2601,16 +2561,14 @@ async fn stream_responses_once(
         elapsed_ms = started.elapsed().as_millis() as u64,
         event_count,
         has_text = text_started,
-        has_tool_call = saw_tool_call,
+        has_tool_call = !emitted_tool_calls.is_empty(),
         "stream completed"
     );
 
-    if !saw_response_completed {
-        return Err((
-            anyhow::anyhow!(
-                "Responses stream ended without response.completed after {event_count} events"
-            ),
-            made_progress,
+    if !saw_terminal {
+        return Err(StreamAttemptError::protocol(
+            format!("Responses stream ended without a terminal event after {event_count} events"),
+            replay_state,
         ));
     }
 
@@ -2622,18 +2580,65 @@ async fn stream_responses_once(
                     turn_status: agent_loop::TurnStatus::Unknown,
                 })
                 .await
-                .map_err(|e| (e, made_progress))?;
+                .map_err(|e| StreamAttemptError::handler(e, replay_state))?;
+            replay_state = ReplayState::ApplicationEventEmitted;
         }
     }
 
     handler
         .handle(ModelStreamEvent::ResponseCompleted {
-            end_turn: !saw_tool_call,
+            end_turn: emitted_tool_calls.is_empty(),
             raw: final_raw,
         })
         .await
-        .map_err(|e| (e, made_progress))?;
+        .map_err(|e| StreamAttemptError::handler(e, replay_state))?;
 
+    Ok(())
+}
+
+fn validate_responses_function_call(
+    call: &async_openai::types::responses::FunctionToolCall,
+    replay_state: ReplayState,
+) -> std::result::Result<(), StreamAttemptError> {
+    if call.id.as_deref().is_none_or(|id| id.trim().is_empty())
+        || call.call_id.trim().is_empty()
+        || call.name.trim().is_empty()
+    {
+        return Err(StreamAttemptError::protocol(
+            "Responses FunctionToolCall is missing id, call_id, or name",
+            replay_state,
+        ));
+    }
+    if call.status != Some(async_openai::types::responses::OutputStatus::Completed) {
+        return Err(StreamAttemptError::protocol(
+            "Responses FunctionToolCall output_item.done is not completed",
+            replay_state,
+        ));
+    }
+    let arguments: Value = serde_json::from_str(&call.arguments).map_err(|error| {
+        StreamAttemptError::protocol(
+            format!("malformed Responses tool arguments: {error}"),
+            replay_state,
+        )
+    })?;
+    if !arguments.is_object() {
+        return Err(StreamAttemptError::protocol(
+            "Responses function call arguments must be a JSON object",
+            replay_state,
+        ));
+    }
+    Ok(())
+}
+
+fn validate_response_output(
+    output: &[async_openai::types::responses::OutputItem],
+    replay_state: ReplayState,
+) -> std::result::Result<(), StreamAttemptError> {
+    for item in output {
+        if let async_openai::types::responses::OutputItem::FunctionCall(call) = item {
+            validate_responses_function_call(call, replay_state)?;
+        }
+    }
     Ok(())
 }
 
@@ -2643,30 +2648,23 @@ async fn stream_chat_completions_with_retry(
     prompt: &str,
     handler: &mut dyn ModelEventHandler,
 ) -> Result<()> {
-    const MAX_ATTEMPTS: usize = 5;
-    let mut attempt = 0usize;
-    loop {
-        attempt += 1;
+    const MAX_SSE_OPENS: usize = 2;
+    for attempt in 1..=MAX_SSE_OPENS {
         match stream_chat_completions_once(settings, input, prompt, handler).await {
             Ok(()) => return Ok(()),
-            Err((error, made_progress))
-                if attempt < MAX_ATTEMPTS && !made_progress && is_transient_llm_error(&error) =>
-            {
-                let backoff_ms = 1_000u64 * (1u64 << (attempt - 1)).min(8)
-                    + retry_jitter_ms(&settings.role, attempt);
+            Err((error, made_progress)) if attempt < MAX_SSE_OPENS && !made_progress => {
                 tracing::warn!(
                     attempt,
-                    backoff_ms,
                     error = %error,
                     error_chain = %format!("{error:#}"),
                     role = %settings.role,
-                    "retrying transient Chat Completions stream failure"
+                    "reopening Chat Completions stream before any provider event"
                 );
-                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
             }
             Err((error, _)) => return Err(error),
         }
     }
+    unreachable!("the bounded Chat Completions stream retry loop always returns")
 }
 
 struct PendingChatToolCall {
@@ -2737,7 +2735,12 @@ async fn stream_chat_completions_once(
     while let Some(event) = stream.next().await {
         event_count += 1;
         let chunk = match event {
-            Ok(ev) => ev,
+            Ok(ev) => {
+                // A successfully decoded provider chunk is enough to make
+                // replay unsafe, even before text or a tool call is emitted.
+                made_progress = true;
+                ev
+            }
             Err(async_openai::error::OpenAIError::JSONDeserialize(err, _))
                 if settings.llm.free_opencode =>
             {
@@ -2946,21 +2949,13 @@ async fn stream_chat_completions_once(
 fn response_usage_to_raw(response: &async_openai::types::responses::Response) -> Value {
     match &response.usage {
         Some(usage) => {
-            let cached = serde_json::to_value(&usage.input_tokens_details)
-                .ok()
-                .and_then(|v| v.get("cached_tokens").and_then(Value::as_u64))
-                .unwrap_or(0);
-            let reasoning = serde_json::to_value(&usage.output_tokens_details)
-                .ok()
-                .and_then(|v| v.get("reasoning_tokens").and_then(Value::as_u64))
-                .unwrap_or(0);
             json!({
                 "usage": {
                     "input_tokens": usage.input_tokens,
                     "output_tokens": usage.output_tokens,
                     "total_tokens": usage.total_tokens,
-                    "input_tokens_details": { "cached_tokens": cached },
-                    "output_tokens_details": { "reasoning_tokens": reasoning }
+                    "input_tokens_details": { "cached_tokens": usage.input_tokens_details.cached_tokens },
+                    "output_tokens_details": { "reasoning_tokens": usage.output_tokens_details.reasoning_tokens }
                 }
             })
         }
@@ -2968,300 +2963,156 @@ fn response_usage_to_raw(response: &async_openai::types::responses::Response) ->
     }
 }
 
-/// Extract Rust-observed provenance from a completed provider-hosted Responses
-/// web-search-capable response. The provider owns the search calls; recording
-/// them as a local function call would create an invalid transcript on the next
-/// model iteration, so they are persisted in a dedicated turn item. An empty
-/// call list is also retained: a Web-enabled role may not turn an unsearched
-/// URL into evidence. Streaming Responses gateways may omit these items from
-/// `response.completed`; the caller therefore supplies a stream-merged payload.
-fn merge_native_web_search_stream_event(accumulator: &mut Value, event: &Value) {
-    let event_type = event
-        .get("type")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    match event_type {
-        "response.created" | "response.in_progress" | "response.completed" => {
-            let Some(response) = event.get("response") else {
-                return;
-            };
-            if let (Some(target), Some(source)) =
-                (accumulator.as_object_mut(), response.as_object())
-            {
-                for field in ["id", "created_at", "completed_at"] {
-                    if let Some(value) = source.get(field) {
-                        target.insert(field.to_owned(), value.clone());
+#[derive(Default)]
+struct NativeWebSearchCollector {
+    response_id: Option<String>,
+    created_at: Option<u64>,
+    completed_at: Option<u64>,
+    output: BTreeMap<u32, async_openai::types::responses::OutputItem>,
+}
+
+impl NativeWebSearchCollector {
+    fn observe(&mut self, event: &async_openai::types::responses::ResponseStreamEvent) {
+        use async_openai::types::responses::ResponseStreamEvent;
+
+        match event {
+            ResponseStreamEvent::ResponseCreated(event) => self.observe_response(&event.response),
+            ResponseStreamEvent::ResponseInProgress(event) => {
+                self.observe_response(&event.response)
+            }
+            ResponseStreamEvent::ResponseCompleted(event) => self.observe_response(&event.response),
+            ResponseStreamEvent::ResponseFailed(event) => self.observe_response(&event.response),
+            ResponseStreamEvent::ResponseIncomplete(event) => {
+                self.observe_response(&event.response)
+            }
+            ResponseStreamEvent::ResponseOutputItemDone(event) => {
+                self.output.insert(event.output_index, event.item.clone());
+            }
+            _ => {}
+        }
+    }
+
+    fn observe_response(&mut self, response: &async_openai::types::responses::Response) {
+        self.response_id = Some(response.id.clone());
+        self.created_at = Some(response.created_at);
+        self.completed_at = response.completed_at;
+        for (index, item) in response.output.iter().enumerate() {
+            self.output.insert(index as u32, item.clone());
+        }
+    }
+
+    fn record(&self, response: &async_openai::types::responses::Response) -> Value {
+        use async_openai::types::responses::{Annotation, OutputItem, WebSearchToolCallAction};
+
+        let mut search_calls = Vec::new();
+        let mut sources = BTreeSet::new();
+        let mut citations = BTreeMap::<String, Value>::new();
+
+        for item in self.output.values() {
+            match item {
+                OutputItem::WebSearchCall(call) => {
+                    if let Some(WebSearchToolCallAction::Search(search)) = &call.action {
+                        for source in search.sources.iter().flatten() {
+                            if let Some(url) = normalize_native_web_url(&source.url) {
+                                sources.insert(url);
+                            }
+                        }
+                    }
+                    search_calls.push(json!({
+                        "id": call.id,
+                        "status": call.status,
+                        "action": call.action,
+                    }));
+                }
+                OutputItem::Message(message) => {
+                    for content in &message.content {
+                        let async_openai::types::responses::OutputMessageContent::OutputText(text) =
+                            content
+                        else {
+                            continue;
+                        };
+                        for annotation in &text.annotations {
+                            let Annotation::UrlCitation(_) = annotation else {
+                                continue;
+                            };
+                            let Ok(raw) = serde_json::to_value(annotation) else {
+                                continue;
+                            };
+                            let Some(url) = raw.get("url").and_then(Value::as_str) else {
+                                continue;
+                            };
+                            let Some(url) = normalize_native_web_url(url) else {
+                                continue;
+                            };
+                            let title = raw.get("title").and_then(Value::as_str);
+                            let authority = if sources.contains(&url) {
+                                "citation_and_source"
+                            } else {
+                                "citation_only"
+                            };
+                            insert_native_web_citation_with_authority(
+                                &mut citations,
+                                &url,
+                                title,
+                                authority,
+                            );
+                        }
                     }
                 }
-            }
-            if let Some(output) = response.get("output").and_then(Value::as_array) {
-                for (index, item) in output.iter().enumerate() {
-                    merge_native_output_item(accumulator, index, item);
-                }
+                _ => {}
             }
         }
-        "response.output_item.added" | "response.output_item.done" => {
-            let Some(index) = event
-                .get("output_index")
-                .and_then(Value::as_u64)
-                .and_then(|index| usize::try_from(index).ok())
-            else {
-                return;
-            };
-            if let Some(item) = event.get("item") {
-                merge_native_output_item(accumulator, index, item);
-            }
+
+        // Sources without a matching citation remain diagnostic provenance;
+        // they are never promoted to cited evidence.
+        for url in sources {
+            citations
+                .entry(url.clone())
+                .or_insert_with(|| native_web_diagnostic_citation(&url, "source_only"));
         }
-        "response.content_part.added" | "response.content_part.done" => {
-            let (Some(output_index), Some(content_index), Some(part)) = (
-                event
-                    .get("output_index")
-                    .and_then(Value::as_u64)
-                    .and_then(|index| usize::try_from(index).ok()),
-                event
-                    .get("content_index")
-                    .and_then(Value::as_u64)
-                    .and_then(|index| usize::try_from(index).ok()),
-                event.get("part"),
-            ) else {
-                return;
-            };
-            merge_native_output_content(accumulator, output_index, content_index, part);
-        }
-        "response.output_text.annotation.added" => {
-            let (Some(output_index), Some(content_index), Some(annotation_index), Some(annotation)) = (
-                event
-                    .get("output_index")
-                    .and_then(Value::as_u64)
-                    .and_then(|index| usize::try_from(index).ok()),
-                event
-                    .get("content_index")
-                    .and_then(Value::as_u64)
-                    .and_then(|index| usize::try_from(index).ok()),
-                event
-                    .get("annotation_index")
-                    .and_then(Value::as_u64)
-                    .and_then(|index| usize::try_from(index).ok()),
-                event.get("annotation"),
-            ) else {
-                return;
-            };
-            merge_native_output_annotation(
-                accumulator,
-                output_index,
-                content_index,
-                annotation_index,
-                annotation,
-            );
-        }
-        _ => {}
+
+        json!({
+            "provider": "openai_responses_web_search",
+            "response_id": self.response_id.as_deref().unwrap_or(&response.id),
+            "created_at": self.created_at.or(Some(response.created_at)),
+            "completed_at": self.completed_at.or(response.completed_at),
+            "search_calls": search_calls,
+            "results": citations.into_values().collect::<Vec<_>>(),
+        })
     }
 }
 
-fn merge_native_output_item(accumulator: &mut Value, output_index: usize, item: &Value) {
-    let Some(items) = accumulator
-        .as_object_mut()
-        .and_then(|object| object.get_mut("output"))
-        .and_then(Value::as_array_mut)
-    else {
-        return;
-    };
-    if items.len() <= output_index {
-        items.resize_with(output_index + 1, || Value::Null);
+fn normalize_native_web_url(value: &str) -> Option<String> {
+    let mut url = reqwest::Url::parse(value.trim()).ok()?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return None;
     }
-    if items[output_index].is_null() {
-        items[output_index] = item.clone();
+    url.set_fragment(None);
+    let retained = url
+        .query_pairs()
+        .filter(|(key, _)| {
+            let key = key.to_ascii_lowercase();
+            !key.starts_with("utm_") && !matches!(key.as_str(), "gclid" | "fbclid")
+        })
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>();
+    if retained.is_empty() {
+        url.set_query(None);
     } else {
-        merge_native_json_value(&mut items[output_index], item);
+        url.set_query(Some(&retained.join("&")));
     }
+    if url.path() != "/" {
+        let path = url.path().trim_end_matches('/').to_owned();
+        url.set_path(if path.is_empty() { "/" } else { &path });
+    }
+    Some(url.to_string())
 }
 
-fn merge_native_output_content(
-    accumulator: &mut Value,
-    output_index: usize,
-    content_index: usize,
-    part: &Value,
-) {
-    let Some(items) = accumulator
-        .as_object_mut()
-        .and_then(|object| object.get_mut("output"))
-        .and_then(Value::as_array_mut)
-    else {
-        return;
-    };
-    if items.len() <= output_index {
-        items.resize_with(output_index + 1, || Value::Null);
-    }
-    if items[output_index].is_null() {
-        items[output_index] = json!({
-            "type": "message",
-            "content": []
-        });
-    }
-    let Some(item) = items[output_index].as_object_mut() else {
-        return;
-    };
-    let content = item
-        .entry("content".to_owned())
-        .or_insert_with(|| Value::Array(Vec::new()));
-    let Some(content) = content.as_array_mut() else {
-        return;
-    };
-    if content.len() <= content_index {
-        content.resize_with(content_index + 1, || Value::Null);
-    }
-    if content[content_index].is_null() {
-        content[content_index] = part.clone();
-    } else {
-        merge_native_json_value(&mut content[content_index], part);
-    }
-}
-
-fn merge_native_output_annotation(
-    accumulator: &mut Value,
-    output_index: usize,
-    content_index: usize,
-    annotation_index: usize,
-    annotation: &Value,
-) {
-    merge_native_output_content(
-        accumulator,
-        output_index,
-        content_index,
-        &json!({"type": "output_text", "text": "", "annotations": []}),
-    );
-    let Some(content) = accumulator
-        .as_object_mut()
-        .and_then(|object| object.get_mut("output"))
-        .and_then(Value::as_array_mut)
-        .and_then(|items| items.get_mut(output_index))
-        .and_then(Value::as_object_mut)
-        .and_then(|item| item.get_mut("content"))
-        .and_then(Value::as_array_mut)
-        .and_then(|content| content.get_mut(content_index))
-        .and_then(Value::as_object_mut)
-        .and_then(|part| part.get_mut("annotations"))
-        .and_then(Value::as_array_mut)
-    else {
-        return;
-    };
-    if content.len() <= annotation_index {
-        content.resize_with(annotation_index + 1, || Value::Null);
-    }
-    content[annotation_index] = annotation.clone();
-}
-
-fn merge_native_json_value(target: &mut Value, source: &Value) {
-    match (target, source) {
-        (Value::Object(target), Value::Object(source)) => {
-            for (key, value) in source {
-                if let Some(existing) = target.get_mut(key) {
-                    merge_native_json_value(existing, value);
-                } else {
-                    target.insert(key.clone(), value.clone());
-                }
-            }
-        }
-        (Value::Array(target), Value::Array(source)) => {
-            if target.len() < source.len() {
-                target.resize_with(source.len(), || Value::Null);
-            }
-            for (index, value) in source.iter().enumerate() {
-                if target[index].is_null() {
-                    target[index] = value.clone();
-                } else {
-                    merge_native_json_value(&mut target[index], value);
-                }
-            }
-        }
-        (target, source) => *target = source.clone(),
-    }
-}
-
-fn native_web_search_record_from_value(raw: &Value) -> Value {
-    let output = raw
-        .get("output")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let mut search_calls = Vec::new();
-    let mut citations = BTreeMap::<String, Value>::new();
-
-    for item in &output {
-        if item.get("type").and_then(Value::as_str) == Some("web_search_call") {
-            search_calls.push(json!({
-                "id": item.get("id").cloned().unwrap_or(Value::Null),
-                "status": item.get("status").cloned().unwrap_or(Value::Null),
-                "action": item.get("action").cloned().unwrap_or(Value::Null),
-            }));
-            if let Some(sources) = item.pointer("/action/sources").and_then(Value::as_array) {
-                for source in sources {
-                    let Some(url) = source
-                        .get("url")
-                        .and_then(Value::as_str)
-                        .map(str::trim)
-                        .filter(|url| url.starts_with("https://") || url.starts_with("http://"))
-                    else {
-                        continue;
-                    };
-                    insert_native_web_citation(&mut citations, url, None);
-                }
-            }
-        }
-        if item.get("type").and_then(Value::as_str) != Some("message") {
-            continue;
-        }
-        for content in item
-            .get("content")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            if content.get("type").and_then(Value::as_str) != Some("output_text") {
-                continue;
-            }
-            for annotation in content
-                .get("annotations")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-            {
-                if annotation.get("type").and_then(Value::as_str) != Some("url_citation") {
-                    continue;
-                }
-                let Some(url) = annotation
-                    .get("url")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|url| url.starts_with("https://") || url.starts_with("http://"))
-                else {
-                    continue;
-                };
-                let title = annotation
-                    .get("title")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|title| !title.is_empty())
-                    .map(ToOwned::to_owned);
-                insert_native_web_citation(&mut citations, url, title.as_deref());
-            }
-        }
-    }
-
-    json!({
-        "provider": "openai_responses_web_search",
-        "response_id": raw.get("id").cloned().unwrap_or(Value::Null),
-        "created_at": raw.get("created_at").cloned().unwrap_or(Value::Null),
-        "completed_at": raw.get("completed_at").cloned().unwrap_or(Value::Null),
-        "search_calls": search_calls,
-        "results": citations.into_values().collect::<Vec<_>>(),
-    })
-}
-
-fn insert_native_web_citation(
+fn insert_native_web_citation_with_authority(
     citations: &mut BTreeMap<String, Value>,
     url: &str,
     title: Option<&str>,
+    authority: &str,
 ) {
     let evidence_id = web_search::stable_search_ref_id(&web_search::SearchResult {
         ref_id: String::new(),
@@ -3278,22 +3129,30 @@ fn insert_native_web_citation(
             "title": title,
             "published_at": Value::Null,
             "provider": "openai_responses_web_search",
-            "citation": true,
+            "citation": authority != "source_only",
+            "authority": authority,
         })
     });
 }
 
-fn extract_encrypted_reasoning(raw: &Value) -> Option<String> {
-    raw.get("content")
-        .and_then(Value::as_array)
-        .and_then(|arr| {
-            arr.iter().find_map(|c| {
-                c.get("encrypted_content")
-                    .and_then(Value::as_str)
-                    .filter(|s| !s.is_empty())
-                    .map(ToString::to_string)
-            })
-        })
+fn native_web_diagnostic_citation(url: &str, authority: &str) -> Value {
+    let evidence_id = web_search::stable_search_ref_id(&web_search::SearchResult {
+        ref_id: String::new(),
+        title: String::new(),
+        url: url.to_owned(),
+        snippet: String::new(),
+        published_at: None,
+        source: None,
+    });
+    json!({
+        "evidence_id": evidence_id,
+        "source_url": url,
+        "title": Value::Null,
+        "published_at": Value::Null,
+        "provider": "openai_responses_web_search",
+        "citation": false,
+        "authority": authority,
+    })
 }
 
 fn configured_tool_names(settings: &AgentSettings) -> Vec<&str> {
@@ -3392,60 +3251,14 @@ fn default_tool_config() -> tools::ExternalToolConfig {
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_loop, is_permanent_llm_error_text, is_recoverable_length_finish,
-        is_transient_llm_error, merge_chat_tool_call_delta, tools, AgentSettings, LlmRoute,
-        LlmTransport, PendingChatToolCall, RoleLlmSettings, ToolManagedProfile, ToolResultItem,
-        TruncationConfig,
+        agent_loop, is_recoverable_length_finish, merge_chat_tool_call_delta, tools, AgentSettings,
+        LlmRoute, LlmTransport, PendingChatToolCall, RoleLlmSettings, ToolManagedProfile,
+        ToolResultItem, TruncationConfig,
     };
     use crate::web_search::{WebSearchConfig, WebSearchMode};
-    use anyhow::anyhow;
     use orchestrator_store::{FileStore, FileStoreOptions, RunLocation};
     use serde_json::{json, Value};
     use std::path::{Path, PathBuf};
-
-    #[test]
-    fn context_window_full_is_not_transient() {
-        let err = anyhow!(
-            "LLM stream chunk failed: InvalidStatusCodeWithMessage(400, \
-             \"{{\\\"error\\\":{{\\\"message\\\":\\\"Context window is full — reduce conversation history\\\"\
-             ,\\\"type\\\":\\\"invalid_request_error\\\"}}}}\")"
-        );
-        assert!(!is_transient_llm_error(&err));
-        assert!(is_permanent_llm_error_text(
-            &format!("{err:#}").to_ascii_lowercase()
-        ));
-    }
-
-    #[test]
-    fn gateway_502_upstream_is_transient() {
-        let err = anyhow!(
-            "LLM stream chunk failed: InvalidStatusCodeWithMessage(502, \
-             \"{{\\\"error\\\":{{\\\"message\\\":\\\"Upstream request failed\\\",\\\"type\\\":\\\"upstream_error\\\"}}}}\")"
-        );
-        assert!(is_transient_llm_error(&err));
-    }
-
-    #[test]
-    fn opencode_400_upstream_request_failed_is_transient() {
-        // The opencode free tier wraps transient upstream failures in a 400
-        // invalid_request_error envelope; it must still be retried.
-        let err = anyhow!(
-            "Chat Completions stream failed: ApiError(ApiErrorResponse {{ status_code: 400, \
-             api_error: ApiError {{ message: \"Error from provider (Console): Upstream request failed\", \
-             type: Some(\"invalid_request_error\"), param: None, code: Some(\"invalid_request_error\") }} }})"
-        );
-        assert!(is_transient_llm_error(&err));
-    }
-
-    #[test]
-    fn insufficient_user_quota_is_not_transient() {
-        let err = anyhow!(
-            "Chat Completions stream failed: ApiError(ApiErrorResponse {{ status_code: 403, \
-             api_error: ApiError {{ message: \"quota exhausted (request id: 2026072711094651059170850217812)\", type: Some(\"one_api_error\"), \
-             param: Some(\"\"), code: Some(\"insufficient_user_quota\") }} }})"
-        );
-        assert!(!is_transient_llm_error(&err));
-    }
 
     #[test]
     fn length_finish_is_recoverable_only_for_plain_text_without_pending_tools() {
@@ -3518,7 +3331,7 @@ mod tests {
     }
 
     #[test]
-    fn phase_summary_responses_request_defers_json_validation_to_rust() {
+    fn phase_summary_responses_request_uses_json_object_with_rust_schema_validation() {
         let mut settings = base_settings(LlmRoute::Responses);
         settings.role = "compressor.phase_summary".to_owned();
         let input = agent_loop::ModelInput {
@@ -3537,7 +3350,10 @@ mod tests {
         )
         .unwrap();
 
-        assert!(serde_json::to_value(request).unwrap().get("text").is_none());
+        assert_eq!(
+            serde_json::to_value(request).unwrap()["text"],
+            json!({"format": {"type": "json_object"}})
+        );
     }
 
     fn base_settings(route: LlmRoute) -> AgentSettings {
@@ -3873,102 +3689,6 @@ mod tests {
             LlmRoute::ChatCompletions
         );
         assert!(serde_json::from_value::<LlmRoute>(json!("deepseek")).is_err());
-    }
-
-    #[test]
-    fn responses_stream_accepts_gateway_output_text_without_annotations() {
-        let raw = json!({
-            "type": "response.completed",
-            "sequence_number": 1,
-            "response": {
-                "id": "resp_gateway_1",
-                "object": "response",
-                "created_at": 1_754_000_000,
-                "model": "gpt-5.6-luna",
-                "status": "completed",
-                "output": [{
-                    "type": "message",
-                    "id": "msg_gateway_1",
-                    "role": "assistant",
-                    "status": "completed",
-                    "content": [{
-                        "type": "output_text",
-                        "text": "gateway response"
-                    }]
-                }]
-            }
-        });
-
-        let parsed = super::deserialize_responses_payload::<
-            async_openai::types::responses::ResponseStreamEvent,
-        >(raw);
-        assert!(
-            parsed.is_ok(),
-            "Responses gateway payload should accept omitted annotations: {parsed:?}"
-        );
-    }
-
-    #[test]
-    fn responses_stream_accepts_gateway_output_message_without_id() {
-        let raw = json!({
-            "type": "response.completed",
-            "sequence_number": 1,
-            "response": {
-                "id": "resp_gateway_2",
-                "object": "response",
-                "created_at": 1_754_000_000,
-                "model": "gpt-5.6-luna",
-                "status": "completed",
-                "output": [{
-                    "type": "message",
-                    "role": "assistant",
-                    "status": "completed",
-                    "content": [{
-                        "type": "output_text",
-                        "text": "gateway response"
-                    }]
-                }]
-            }
-        });
-
-        let parsed = super::deserialize_responses_payload::<
-            async_openai::types::responses::ResponseStreamEvent,
-        >(raw);
-        assert!(
-            parsed.is_ok(),
-            "Responses gateway payload should tolerate an omitted output message id: {parsed:?}"
-        );
-    }
-
-    #[test]
-    fn responses_stream_accepts_gateway_output_message_without_status() {
-        let raw = json!({
-            "type": "response.completed",
-            "sequence_number": 1,
-            "response": {
-                "id": "resp_gateway_3",
-                "object": "response",
-                "created_at": 1_754_000_000,
-                "model": "gpt-5.6-luna",
-                "status": "completed",
-                "output": [{
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [{
-                        "type": "output_text",
-                        "text": "gateway response"
-                    }]
-                }]
-            }
-        });
-
-        let parsed = super::deserialize_responses_payload::<
-            async_openai::types::responses::ResponseStreamEvent,
-        >(raw);
-        assert!(
-            parsed.is_ok(),
-            "Responses gateway payload should tolerate an omitted output message status: {parsed:?}"
-        );
     }
 
     #[test]
@@ -4870,12 +4590,28 @@ mod tests {
         .contains("cannot honor blocked_domains"));
     }
 
+    fn typed_native_web_record(response: &async_openai::types::responses::Response) -> Value {
+        let mut collector = super::NativeWebSearchCollector::default();
+        collector.observe(
+            &async_openai::types::responses::ResponseStreamEvent::ResponseCompleted(
+                async_openai::types::responses::ResponseCompletedEvent {
+                    sequence_number: 0,
+                    response: response.clone(),
+                },
+            ),
+        );
+        collector.record(response)
+    }
+
     #[test]
     fn native_web_search_citations_become_stable_rust_owned_records() {
-        let record = super::native_web_search_record_from_value(&json!({
+        let response: async_openai::types::responses::Response = serde_json::from_value(json!({
             "id": "resp-native-1",
             "created_at": 1_754_000_000,
             "completed_at": 1_754_000_005,
+            "object": "response",
+            "status": "completed",
+            "model": "fixture",
             "output": [
                 {
                     "type": "web_search_call",
@@ -4884,12 +4620,14 @@ mod tests {
                     "action": {
                         "type": "search",
                         "query": "SEC ETF filing",
-                        "sources": [{"type": "url", "url": "https://www.sec.gov/example"}]
+                        "sources": [{"type": "url", "url": "https://www.sec.gov/example/?utm_source=test#fragment"}]
                     }
                 },
                 {
                     "type": "message",
                     "id": "msg-1",
+                    "role": "assistant",
+                    "status": "completed",
                     "content": [{
                         "type": "output_text",
                         "text": "Verified filing.",
@@ -4903,7 +4641,9 @@ mod tests {
                     }]
                 }
             ]
-        }));
+        }))
+        .unwrap();
+        let record = typed_native_web_record(&response);
 
         assert_eq!(record["provider"], "openai_responses_web_search");
         assert_eq!(
@@ -4914,6 +4654,7 @@ mod tests {
             record["results"][0]["source_url"],
             "https://www.sec.gov/example"
         );
+        assert_eq!(record["results"][0]["authority"], "citation_and_source");
         assert!(record["results"][0]["evidence_id"]
             .as_str()
             .is_some_and(|id| id.starts_with("web-") && id.len() == 68));
@@ -4941,71 +4682,13 @@ mod tests {
     }
 
     #[test]
-    fn native_web_search_stream_events_restore_citations_missing_from_completed_response() {
-        let mut response = json!({"output": []});
-        for event in [
-            json!({
-                "type": "response.output_item.done",
-                "output_index": 0,
-                "item": {
-                    "type": "web_search_call",
-                    "id": "ws-1",
-                    "status": "completed",
-                    "action": {
-                        "type": "search",
-                        "query": "SEC ETF filing",
-                        "sources": [{"type": "url", "url": "https://www.sec.gov/example"}]
-                    }
-                }
-            }),
-            json!({
-                "type": "response.output_item.added",
-                "output_index": 1,
-                "item": {
-                    "type": "message",
-                    "id": "msg-1",
-                    "content": []
-                }
-            }),
-            json!({
-                "type": "response.output_text.annotation.added",
-                "output_index": 1,
-                "content_index": 0,
-                "annotation_index": 0,
-                "annotation": {
-                    "type": "url_citation",
-                    "title": "SEC filing",
-                    "url": "https://www.sec.gov/example"
-                }
-            }),
-            json!({
-                "type": "response.completed",
-                "response": {
-                    "id": "resp-native-stream",
-                    "created_at": 1_754_000_000,
-                    "completed_at": 1_754_000_005,
-                    "output": []
-                }
-            }),
-        ] {
-            super::merge_native_web_search_stream_event(&mut response, &event);
-        }
-
-        let record = super::native_web_search_record_from_value(&response);
-        assert_eq!(
-            record["search_calls"][0]["action"]["query"],
-            "SEC ETF filing"
-        );
-        assert_eq!(
-            record["results"][0]["source_url"],
-            "https://www.sec.gov/example"
-        );
-    }
-
-    #[test]
     fn native_web_search_action_sources_are_verified_without_text_annotations() {
-        let record = super::native_web_search_record_from_value(&json!({
+        let response: async_openai::types::responses::Response = serde_json::from_value(json!({
             "id": "resp-native-sources",
+            "object": "response",
+            "created_at": 1_754_000_000,
+            "status": "completed",
+            "model": "fixture",
             "output": [{
                 "type": "web_search_call",
                 "id": "ws-sources",
@@ -5016,7 +4699,9 @@ mod tests {
                     "sources": [{"type": "url", "url": "https://www.sec.gov/example"}]
                 }
             }]
-        }));
+        }))
+        .unwrap();
+        let record = typed_native_web_record(&response);
 
         assert_eq!(
             record["results"][0]["source_url"],
@@ -5026,19 +4711,26 @@ mod tests {
 
     #[test]
     fn native_web_search_records_an_empty_attempt_for_fail_closed_evidence() {
-        let record = super::native_web_search_record_from_value(&json!({
+        let response: async_openai::types::responses::Response = serde_json::from_value(json!({
             "id": "resp-native-empty",
             "created_at": 1_754_000_000,
+            "object": "response",
+            "status": "completed",
+            "model": "fixture",
             "output": [{
                 "type": "message",
                 "id": "msg-empty",
+                "role": "assistant",
+                "status": "completed",
                 "content": [{
                     "type": "output_text",
                     "text": "No source was searched.",
                     "annotations": []
                 }]
             }]
-        }));
+        }))
+        .unwrap();
+        let record = typed_native_web_record(&response);
         assert_eq!(record["search_calls"], json!([]));
         assert_eq!(record["results"], json!([]));
 

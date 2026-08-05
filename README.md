@@ -413,6 +413,11 @@ rtk cargo run -p orchestrator-cli --bin orchestrator-exec -- \
   `topic_generation_artifact.selection` 记录生成数、选中数与截断数。
 - `--submit-orders`:仅限非 mock、非 debug 的 Paper 运行。它是实际下单的
   显式命令授权；仍需要配置中的 `order_submission_enabled=true`。
+- `--provider-contract`:在启动正式工作流前，用当前 Gateway/模型配置执行
+  Responses/Chat SSE、Reasoning、Function Call、Native Web Search 与 JSON
+  Object 能力预检。该路径不创建 FileStore、不读取市场数据、不执行工具；
+  报告脱敏输出到 stdout，任一能力失败时退出码为 1。只有报告通过后才可
+  发布严格 Typed Responses provider 路径。
 
 `--mock` 仅用于本地测试与开发,不能证明生产工作流或外部服务可用。`--debug` 将 MemoryOS 写入解析到 `knowledge/debug/<run-id>/`;它绝不写入规范的 Decision 或 Outcome 数据。回放与迁移夹具使用各自的命名空间,回放只通过只读读取器读取规范 Decision,且只输出回放结果。
 

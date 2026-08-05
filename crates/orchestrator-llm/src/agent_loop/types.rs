@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::VecDeque;
@@ -55,7 +55,7 @@ pub struct ToolCallRequest {
     pub arguments: Value,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolResultItem {
     pub call_id: String,
     pub name: String,
@@ -64,6 +64,109 @@ pub struct ToolResultItem {
     pub output: Value,
     #[serde(default)]
     pub error: Option<String>,
+}
+
+/// Stable identity for one externally visible tool execution.
+///
+/// Provider output-item IDs are not execution identities: a provider may
+/// re-emit an item while the same FileStore turn is being resumed.  The
+/// session/turn/call tuple is owned by Rust and is therefore the only key used
+/// for execution recovery and idempotency.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ToolExecutionKey {
+    pub session_id: String,
+    pub turn_id: String,
+    pub call_id: String,
+}
+
+impl ToolExecutionKey {
+    pub fn new(
+        session_id: impl Into<String>,
+        turn_id: impl Into<String>,
+        call_id: impl Into<String>,
+    ) -> Result<Self> {
+        let key = Self {
+            session_id: session_id.into(),
+            turn_id: turn_id.into(),
+            call_id: call_id.into(),
+        };
+        if key.session_id.trim().is_empty()
+            || key.turn_id.trim().is_empty()
+            || key.call_id.trim().is_empty()
+        {
+            bail!("tool execution key requires non-empty session, turn, and call IDs")
+        }
+        Ok(key)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolExecutionStatus {
+    Pending,
+    Running,
+    Completed,
+    Interrupted,
+}
+
+/// FileStore record for a tool side effect.  A `Completed` record contains
+/// the exact ToolResultItem that can be replayed; `Running` and `Interrupted`
+/// are deliberately fail-closed on recovery.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolExecutionRecord {
+    pub key: ToolExecutionKey,
+    pub tool_name: String,
+    pub status: ToolExecutionStatus,
+    #[serde(default)]
+    pub result: Option<ToolResultItem>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+impl ToolExecutionRecord {
+    pub fn pending(key: ToolExecutionKey, tool_name: impl Into<String>) -> Self {
+        Self {
+            key,
+            tool_name: tool_name.into(),
+            status: ToolExecutionStatus::Pending,
+            result: None,
+            reason: None,
+        }
+    }
+
+    pub fn running(key: ToolExecutionKey, tool_name: impl Into<String>) -> Self {
+        Self {
+            key,
+            tool_name: tool_name.into(),
+            status: ToolExecutionStatus::Running,
+            result: None,
+            reason: None,
+        }
+    }
+
+    pub fn completed(result: ToolResultItem, key: ToolExecutionKey) -> Self {
+        Self {
+            key,
+            tool_name: result.name.clone(),
+            status: ToolExecutionStatus::Completed,
+            result: Some(result),
+            reason: None,
+        }
+    }
+
+    pub fn interrupted(
+        key: ToolExecutionKey,
+        tool_name: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            key,
+            tool_name: tool_name.into(),
+            status: ToolExecutionStatus::Interrupted,
+            result: None,
+            reason: Some(reason.into()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -286,6 +389,19 @@ impl TurnItem {
             status: Some(AgentItemStatus::Pending),
             db_row_id: None,
         }
+    }
+
+    pub fn tool_call_with_output_item_id(
+        call: &ToolCallRequest,
+        output_item_id: impl Into<String>,
+    ) -> Self {
+        let output_item_id = output_item_id.into();
+        let mut item = Self::tool_call(call);
+        item.output_item_id = output_item_id.clone();
+        if let Some(object) = item.content_json.as_object_mut() {
+            object.insert("output_item_id".to_owned(), Value::String(output_item_id));
+        }
+        item
     }
 
     pub fn tool_result(result: &ToolResultItem, truncation: &TruncationConfig) -> Self {
@@ -545,6 +661,13 @@ pub enum ModelStreamEvent {
     },
     ToolCallCompleted {
         tool_call: ToolCallRequest,
+    },
+    /// A Responses FunctionToolCall carries both the execution `call_id` and
+    /// a distinct provider output-item `id`. Keep both when persisting the
+    /// transcript; the call_id remains the tool-execution idempotency key.
+    ToolCallCompletedWithOutputItem {
+        tool_call: ToolCallRequest,
+        output_item_id: String,
     },
     /// Completed evidence/provenance from a provider-hosted Responses
     /// `web_search` tool. Unlike `ToolCallCompleted`, this does not require a

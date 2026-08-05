@@ -12,7 +12,7 @@ pub use types::*;
 use persisted_items::{output_item_for, runtime_status_for_tool_result};
 use streaming::ModelStreamHandler;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use orchestrator_core;
 use serde_json::{json, Value};
 use std::{
@@ -157,6 +157,119 @@ where
     run_turn_with_events(session, turn, model, tools, config, &mut sink).await
 }
 
+struct ToolExecutionGuard {
+    session: FileStoreSessionRuntime,
+    key: ToolExecutionKey,
+    tool_name: String,
+    finished: bool,
+}
+
+struct TurnExecutionGuard {
+    session: FileStoreSessionRuntime,
+    turn_id: String,
+    finished: bool,
+}
+
+impl Drop for TurnExecutionGuard {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let _ = self.session.append_turn_interruption(
+            &self.turn_id,
+            "agent loop Future cancelled or failed before terminal persistence",
+            session_timestamp(),
+        );
+    }
+}
+
+impl Drop for ToolExecutionGuard {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        // Drop runs when tokio::time::timeout cancels the in-flight tool
+        // Future.  FileStore writes are synchronous and therefore safe here;
+        // any persistence error is deliberately surfaced on the next resume
+        // as the still-visible Running state rather than guessed away.
+        let record = ToolExecutionRecord::interrupted(
+            self.key.clone(),
+            self.tool_name.clone(),
+            "tool future cancelled before a durable completion was recorded",
+        );
+        let _ = self
+            .session
+            .append_tool_execution_record(&record, session_timestamp());
+    }
+}
+
+/// Execute one external tool at most once for a FileStore-owned call key.
+/// Completed results are replayed; Running and Interrupted states are
+/// fail-closed so a process restart cannot duplicate a side effect.
+async fn execute_tool_with_recovery<T: LoopToolRuntime + ?Sized>(
+    session: &FileStoreSessionRuntime,
+    turn: &Turn,
+    tools: &T,
+    call: ToolCallRequest,
+) -> Result<ToolResultItem> {
+    let key = ToolExecutionKey::new(
+        turn.session_id.clone(),
+        turn.turn_id.clone(),
+        call.call_id.clone(),
+    )?;
+    if let Some(record) = session.read_tool_execution(&turn.turn_id, &call.call_id)? {
+        if record.tool_name != call.name {
+            bail!(
+                "tool execution {} changed tool name from {:?} to {:?}",
+                key.call_id,
+                record.tool_name,
+                call.name
+            );
+        }
+        match record.status {
+            ToolExecutionStatus::Completed => {
+                return record
+                    .result
+                    .context("completed tool execution is missing its result");
+            }
+            ToolExecutionStatus::Running | ToolExecutionStatus::Interrupted => {
+                bail!(
+                    "tool execution {} is {:?}; refusing to replay",
+                    key.call_id,
+                    record.status
+                );
+            }
+            ToolExecutionStatus::Pending => {}
+        }
+    } else {
+        session.append_tool_execution(
+            turn,
+            &ToolExecutionRecord::pending(key.clone(), call.name.clone()),
+            session_timestamp(),
+        )?;
+    }
+
+    session.append_tool_execution(
+        turn,
+        &ToolExecutionRecord::running(key.clone(), call.name.clone()),
+        session_timestamp(),
+    )?;
+    let mut guard = ToolExecutionGuard {
+        session: session.clone(),
+        key: key.clone(),
+        tool_name: call.name.clone(),
+        finished: false,
+    };
+    let result = tools.execute(call).await;
+    session.append_tool_execution(
+        turn,
+        &ToolExecutionRecord::completed(result.clone(), key),
+        session_timestamp(),
+    )?;
+    guard.finished = true;
+    Ok(result)
+}
+
 pub async fn run_turn_with_events<M, T, S>(
     session: &FileStoreSessionRuntime,
     turn: &mut Turn,
@@ -184,7 +297,28 @@ where
         truncation_strategy = ?config.truncation.strategy,
         "agent loop starting"
     );
+    // A resumed turn may contain a side-effecting tool whose Future was
+    // cancelled after its durable Running transition.  Never guess whether
+    // the external operation completed: fail closed until an operator or a
+    // provider-specific reconciliation path resolves it.
+    for record in session.read_tool_executions(&turn.turn_id)? {
+        if matches!(
+            record.status,
+            ToolExecutionStatus::Running | ToolExecutionStatus::Interrupted
+        ) {
+            bail!(
+                "tool execution {} is {:?}; refusing to replay a possibly side-effecting call",
+                record.key.call_id,
+                record.status
+            );
+        }
+    }
     persist_turn(session, turn, &config.truncation)?;
+    let mut turn_execution_guard = TurnExecutionGuard {
+        session: session.clone(),
+        turn_id: turn.turn_id.clone(),
+        finished: false,
+    };
     tools.set_turn_context(ToolRuntimeTurnContext {
         run_id: turn.run_id.clone(),
         session_id: turn.session_id.clone(),
@@ -210,7 +344,7 @@ where
             }
             wrote_preseed = true;
             turn.emitted_items.push(TurnItem::tool_call(&call));
-            let result = tools.execute(call).await;
+            let result = execute_tool_with_recovery(session, turn, tools, call).await?;
             turn.emitted_items
                 .push(TurnItem::tool_result(&result, &config.truncation));
         }
@@ -223,7 +357,7 @@ where
             persist_turn(session, turn, &config.truncation)?;
         }
         if should_preseed_phase2_detail(turn, &available_tools)
-            && preseed_phase2_detail(turn, tools, &config.truncation).await
+            && preseed_phase2_detail(session, turn, tools, &config.truncation).await?
         {
             persist_turn(session, turn, &config.truncation)?;
         }
@@ -357,7 +491,7 @@ where
                         error: Some(error),
                     }
                 } else {
-                    tools.execute(call).await
+                    execute_tool_with_recovery(session, turn, tools, call).await?
                 };
                 let tool_elapsed_ms = tool_started.elapsed().as_millis();
                 if debug_metrics {
@@ -431,6 +565,7 @@ where
             if terminal_completed {
                 turn.end_reason = Some("terminal_tool".to_string());
                 persist_turn(session, turn, &config.truncation)?;
+                turn_execution_guard.finished = true;
                 return Ok(aggregate_result);
             }
             if loop_index >= 3 {
@@ -498,6 +633,7 @@ where
             "agent loop completed"
         );
         persist_turn(session, turn, &config.truncation)?;
+        turn_execution_guard.finished = true;
         return Ok(aggregate_result);
     }
 }
@@ -1481,18 +1617,19 @@ fn should_preseed_phase2_detail(turn: &Turn, available_tools: &[String]) -> bool
 /// Phase 1 Index and its Detail before the model's first response; this keeps
 /// the evidence contract deterministic while leaving the model free to write
 /// the debate in normal prose.
-async fn preseed_phase2_detail<T: LoopToolRuntime>(
+async fn preseed_phase2_detail<T: LoopToolRuntime + ?Sized>(
+    session: &FileStoreSessionRuntime,
     turn: &mut Turn,
     tools: &T,
     truncation: &TruncationConfig,
-) -> bool {
+) -> Result<bool> {
     let audit = retrieval_audit(turn);
     if audit
         .get("successful_expanded_summary_ids")
         .and_then(Value::as_array)
         .is_some_and(|ids| !ids.is_empty())
     {
-        return false;
+        return Ok(false);
     }
 
     let mut index_id = audit
@@ -1514,7 +1651,13 @@ async fn preseed_phase2_detail<T: LoopToolRuntime>(
         };
         let item_start = turn.emitted_items.len();
         turn.emitted_items.push(TurnItem::tool_call(&call));
-        let result = tools.execute(call).await;
+        let result = match execute_tool_with_recovery(session, turn, tools, call).await {
+            Ok(result) => result,
+            Err(error) => {
+                turn.emitted_items.truncate(item_start);
+                return Err(error);
+            }
+        };
         let completed = result.status == "completed";
         index_id = result
             .output
@@ -1543,14 +1686,14 @@ async fn preseed_phase2_detail<T: LoopToolRuntime>(
             // A failed automatic read must not consume the model's retry
             // budget or make the same valid request look like a duplicate.
             turn.emitted_items.truncate(item_start);
-            return false;
+            return Ok(false);
         }
         turn.emitted_items
             .push(TurnItem::tool_result(&result, truncation));
     }
 
     let Some(index_id) = index_id else {
-        return false;
+        return Ok(false);
     };
     let call = ToolCallRequest {
         call_id: format!("preseed-phase1-detail-{}", turn.turn_id),
@@ -1559,14 +1702,20 @@ async fn preseed_phase2_detail<T: LoopToolRuntime>(
     };
     let item_start = turn.emitted_items.len();
     turn.emitted_items.push(TurnItem::tool_call(&call));
-    let result = tools.execute(call).await;
+    let result = match execute_tool_with_recovery(session, turn, tools, call).await {
+        Ok(result) => result,
+        Err(error) => {
+            turn.emitted_items.truncate(item_start);
+            return Err(error);
+        }
+    };
     if result.status != "completed" {
         turn.emitted_items.truncate(item_start);
-        return false;
+        return Ok(false);
     }
     turn.emitted_items
         .push(TurnItem::tool_result(&result, truncation));
-    true
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -2361,6 +2510,151 @@ impl LoopToolRuntime for StaticToolRuntime {
             result.name = name;
             result
         })
+    }
+}
+
+#[cfg(test)]
+mod tool_execution_tests {
+    use super::*;
+    use orchestrator_store::{FileStore, FileStoreOptions, RunLocation};
+    use std::{
+        future::Future,
+        pin::Pin,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+    };
+    use tempfile::tempdir;
+    use tokio::time::{sleep, timeout, Duration};
+
+    struct SlowToolRuntime;
+
+    impl LoopToolRuntime for SlowToolRuntime {
+        fn execute<'a>(
+            &'a self,
+            call: ToolCallRequest,
+        ) -> Pin<Box<dyn Future<Output = ToolResultItem> + Send + 'a>> {
+            Box::pin(async move {
+                sleep(Duration::from_millis(50)).await;
+                ToolResultItem {
+                    call_id: call.call_id,
+                    name: call.name,
+                    status: "completed".to_owned(),
+                    output: json!({"ok": true}),
+                    error: None,
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn completed_tool_result_is_replayed_without_reexecuting() {
+        let temp = tempdir().unwrap();
+        let session = FileStoreSessionRuntime::create_or_load(
+            FileStore::open(temp.path(), FileStoreOptions::default()).unwrap(),
+            SessionRuntimeSpec {
+                run: RunLocation::new("2026-08-05", "run-a").unwrap(),
+                session_id: "session-a".to_owned(),
+                role: "analyst.technical".to_owned(),
+                phase: 1,
+                profile: "analyst_report".to_owned(),
+                fork: None,
+                created_at: "2026-08-05T00:00:00Z".to_owned(),
+            },
+        )
+        .unwrap();
+        let mut turn = Turn::new(
+            "turn-a",
+            "session-a",
+            "run-a",
+            "analyst.technical",
+            "prompt",
+        );
+        turn.phase = Some(1);
+        let executions = Arc::new(AtomicUsize::new(0));
+        let executions_for_tool = Arc::clone(&executions);
+        let mut tools = StaticToolRuntime::new();
+        tools.add_tool("read", move |_| {
+            executions_for_tool.fetch_add(1, Ordering::SeqCst);
+            ToolResultItem {
+                call_id: String::new(),
+                name: String::new(),
+                status: "completed".to_owned(),
+                output: json!({"ok": true}),
+                error: None,
+            }
+        });
+        let call = ToolCallRequest {
+            call_id: "call-a".to_owned(),
+            name: "read".to_owned(),
+            arguments: json!({}),
+        };
+
+        let first = execute_tool_with_recovery(&session, &turn, &tools, call.clone())
+            .await
+            .unwrap();
+        let second = execute_tool_with_recovery(&session, &turn, &tools, call)
+            .await
+            .unwrap();
+
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
+        assert_eq!(first, second);
+        assert_eq!(
+            session
+                .read_tool_execution("turn-a", "call-a")
+                .unwrap()
+                .unwrap()
+                .status,
+            ToolExecutionStatus::Completed
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_tool_future_records_interrupted_and_blocks_replay() {
+        let temp = tempdir().unwrap();
+        let session = FileStoreSessionRuntime::create_or_load(
+            FileStore::open(temp.path(), FileStoreOptions::default()).unwrap(),
+            SessionRuntimeSpec {
+                run: RunLocation::new("2026-08-05", "run-a").unwrap(),
+                session_id: "session-a".to_owned(),
+                role: "analyst.technical".to_owned(),
+                phase: 1,
+                profile: "analyst_report".to_owned(),
+                fork: None,
+                created_at: "2026-08-05T00:00:00Z".to_owned(),
+            },
+        )
+        .unwrap();
+        let mut turn = Turn::new(
+            "turn-a",
+            "session-a",
+            "run-a",
+            "analyst.technical",
+            "prompt",
+        );
+        turn.phase = Some(1);
+        let tools = SlowToolRuntime;
+        let call = ToolCallRequest {
+            call_id: "call-a".to_owned(),
+            name: "write".to_owned(),
+            arguments: json!({}),
+        };
+
+        assert!(timeout(
+            Duration::from_millis(1),
+            execute_tool_with_recovery(&session, &turn, &tools, call.clone())
+        )
+        .await
+        .is_err());
+        let record = session
+            .read_tool_execution("turn-a", "call-a")
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.status, ToolExecutionStatus::Interrupted);
+        assert!(execute_tool_with_recovery(&session, &turn, &tools, call)
+            .await
+            .is_err());
     }
 }
 

@@ -25,11 +25,12 @@ html-escape = "0.2.13"
 md-5 = "0.10.6"
 regex = "1.11.1"
 reqwest = { version = "0.13.4", default-features = false, features = ["cookies", "json", "query", "rustls"] }
-async-openai = { version = "0.41.1", features = ["responses", "chat-completion", "byot"] }
+async-openai = { version = "0.41.1", features = ["responses", "chat-completion", "middleware"] }
 serde = { version = "1.0.217", features = ["derive"] }
 serde_json = "1.0.135"
 serde_yaml = "0.9.34"
 sha2 = "0.10.8"
+ tower = "0.5.3"
 tempfile = "3.15.0"
 thiserror = "2.0.11"
 toml = "0.8"

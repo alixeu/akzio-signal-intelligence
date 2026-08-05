@@ -1,9 +1,18 @@
 use anyhow::{bail, Context, Result};
-use async_openai::{config::OpenAIConfig, Client as OpenAIClient};
+use async_openai::{
+    config::OpenAIConfig,
+    middleware::{retry::OpenAIRetryLayer, ReqwestService},
+    Client as OpenAIClient,
+};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::HashMap,
+    sync::{Mutex, OnceLock},
+};
 use tracing::debug;
 use uuid::Uuid;
 
-use super::RoleLlmSettings;
+use super::{LlmRoute, RoleLlmSettings};
 
 /// Fixed endpoint, credentials, and model for the free opencode Zen gateway.
 /// When a role sets `free_opencode`, the configured gateway base_url / api_key
@@ -11,6 +20,33 @@ use super::RoleLlmSettings;
 const FREE_OPENCODE_BASE_URL: &str = "https://opencode.ai/zen/v1";
 const FREE_OPENCODE_API_KEY: &str = "public";
 const FREE_OPENCODE_MODEL: &str = "deepseek-v4-flash-free";
+
+/// Transport identity for a standard OpenAI-compatible client.  The model is
+/// intentionally absent: it is a request field and does not change the HTTP
+/// connection pool or retry policy.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) struct ProviderClientKey {
+    pub base_url: String,
+    pub auth_fingerprint: String,
+    pub route: LlmRoute,
+    pub compatibility: ProviderCompatibility,
+    pub retry_policy: RetryPolicyKey,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum ProviderCompatibility {
+    OpenAiStandard,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum RetryPolicyKey {
+    OpenAiRetries2,
+}
+
+type StandardClient = OpenAIClient<OpenAIConfig>;
+type ClientRegistry = HashMap<ProviderClientKey, StandardClient>;
+
+static STANDARD_CLIENTS: OnceLock<Mutex<ClientRegistry>> = OnceLock::new();
 
 pub(super) fn validate_configuration(settings: &RoleLlmSettings, role: &str) -> Result<()> {
     // free_opencode pins base_url / api_key to the opencode Zen gateway, so
@@ -51,16 +87,48 @@ pub(super) fn openai_compatible_responses_client(
         return free_opencode_client();
     }
     let api_key = openai_compatible_api_key(settings)?;
-    let base_url = openai_compatible_base_url(settings)?;
+    let base_url = openai_compatible_base_url(settings)?.to_owned();
+    let key = ProviderClientKey {
+        base_url: base_url.clone(),
+        auth_fingerprint: auth_fingerprint(&api_key),
+        route: settings.effective_route(),
+        compatibility: ProviderCompatibility::OpenAiStandard,
+        retry_policy: RetryPolicyKey::OpenAiRetries2,
+    };
+
+    let registry = STANDARD_CLIENTS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut clients = registry
+        .lock()
+        .map_err(|_| anyhow::anyhow!("standard provider client registry poisoned"))?;
+    if let Some(client) = clients.get(&key) {
+        return Ok(client.clone());
+    }
+
     debug!(
         base_url = %base_url,
         model = %settings.model,
-        "creating OpenAI-compatible responses client"
+        route = ?settings.effective_route(),
+        "creating standard OpenAI-compatible provider client"
     );
     let config = OpenAIConfig::new()
         .with_api_key(api_key)
-        .with_api_base(base_url);
-    Ok(OpenAIClient::with_config(config))
+        .with_api_base(base_url.clone());
+
+    // Installing a custom service replaces async-openai's default executor,
+    // so this is the only HTTP retry layer for standard clients.  `new(2)`
+    // means two additional attempts after the initial request (three HTTP
+    // attempts total per SSE open).
+    let service = tower::ServiceBuilder::new()
+        .layer(OpenAIRetryLayer::new(2))
+        .service(ReqwestService::new(reqwest::Client::new()));
+    let client = OpenAIClient::with_config(config).with_http_service(service);
+    clients.insert(key, client.clone());
+    Ok(client)
+}
+
+fn auth_fingerprint(api_key: &str) -> String {
+    let digest = Sha256::digest(api_key.as_bytes());
+    format!("{digest:x}")
 }
 
 fn openai_compatible_api_key(settings: &RoleLlmSettings) -> Result<String> {

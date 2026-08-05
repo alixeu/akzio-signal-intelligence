@@ -12,10 +12,12 @@ orchestrator-store = { path = "../orchestrator-store" }
 futures.workspace = true
 async-openai.workspace = true
 reqwest.workspace = true
+sha2.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+tower.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]

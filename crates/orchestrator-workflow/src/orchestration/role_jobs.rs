@@ -31,9 +31,7 @@ use super::render::{direct_context_manifest, render_prompt_with_plugins};
 use crate::memory::{search_experiences, ExperienceSearchQuery};
 
 mod metrics;
-mod retry;
 pub(crate) use self::metrics::{record_role_job_metrics, refresh_role_job_metrics};
-use self::retry::{backoff_ms, is_transient_role_error};
 
 pub(crate) struct RoleRun<'a> {
     pub state: Value,
@@ -2009,64 +2007,25 @@ pub(crate) async fn run_role_job_with_timeout(job: RoleJob, timeout_sec: u64) ->
     let round = job.round;
     let topic_id = job.topic_id.clone();
     let prompt_version = job.prompt_version.clone();
+    let session_id = job.session_runtime.manifest().session_id.clone();
     let started_at = Instant::now();
     debug!(
         role,
         phase, kind, round, topic_id, timeout_sec, "role job starting"
     );
 
-    // Live gateway 503s can exhaust stream-level retries; retry the whole role a
-    // couple of times before surfacing a critical failure.
-    const MAX_ROLE_ATTEMPTS: usize = 3;
-    let mut attempt = 0usize;
-    let result = loop {
-        attempt += 1;
-        match time::timeout(
-            Duration::from_secs(timeout_sec.max(1)),
-            execute_role_job(job.clone()),
-        )
-        .await
-        {
-            Ok(Ok(output)) => break Ok(output),
-            Ok(Err(error)) => {
-                // Use the full chain so permanent upstream messages (e.g. context
-                // window full) are not masked by outer "LLM stream chunk failed".
-                let message = format!("{error:#}");
-                if attempt < MAX_ROLE_ATTEMPTS && is_transient_role_error(&message) {
-                    let backoff_ms = backoff_ms(&role, attempt);
-                    warn!(
-                        role = role.as_str(),
-                        phase,
-                        kind = kind.as_str(),
-                        attempt,
-                        backoff_ms,
-                        error = %message,
-                        "retrying transient role job failure"
-                    );
-                    time::sleep(Duration::from_millis(backoff_ms)).await;
-                    continue;
-                }
-                break Err((message, false));
-            }
-            Err(_) => {
-                let message = format!("role execution timed out after {timeout_sec}s");
-                if attempt < MAX_ROLE_ATTEMPTS {
-                    let backoff_ms = backoff_ms(&role, attempt);
-                    warn!(
-                        role = role.as_str(),
-                        phase,
-                        kind = kind.as_str(),
-                        attempt,
-                        backoff_ms,
-                        error = %message,
-                        "retrying timed-out role job"
-                    );
-                    time::sleep(Duration::from_millis(backoff_ms)).await;
-                    continue;
-                }
-                break Err((message, true));
-            }
-        }
+    let result = match time::timeout(
+        Duration::from_secs(timeout_sec.max(1)),
+        execute_role_job(job),
+    )
+    .await
+    {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(error)) => Err((format!("{error:#}"), false)),
+        Err(_) => Err((
+            format!("role execution timed out after {timeout_sec}s"),
+            true,
+        )),
     };
 
     match result {
@@ -2119,7 +2078,7 @@ pub(crate) async fn run_role_job_with_timeout(job: RoleJob, timeout_sec: u64) ->
                 prompt_version,
                 model: String::new(),
                 turn_id: String::new(),
-                session_id: String::new(),
+                session_id,
                 artifact: None,
                 error: Some(message),
                 timed_out,

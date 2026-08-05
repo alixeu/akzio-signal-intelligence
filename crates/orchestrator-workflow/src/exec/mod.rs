@@ -64,6 +64,7 @@ use crate::orchestration::{
 mod args;
 mod finalization;
 mod gates;
+mod provider_contract;
 pub use args::*;
 
 #[cfg(test)]
@@ -126,6 +127,10 @@ async fn run_inner(
     } else {
         load_config(Some(&config_path)).unwrap_or_else(|_| json!({}))
     };
+    if args.provider_contract {
+        let runtime = RuntimeConfig::from_value(&config)?;
+        return provider_contract::run(&runtime).await;
+    }
     let tickers =
         parse_tickers(config_strings(&config, "orchestrator.analysis_universe", &[]).join(","));
     if tickers.is_empty() {
@@ -607,6 +612,21 @@ fn record_nonblocking_evaluation_failure(state: &mut Value, error: &anyhow::Erro
 }
 
 fn validate_args(args: &ExecArgs) -> Result<()> {
+    if args.provider_contract {
+        if args.mock || args.debug {
+            bail!("--provider-contract cannot be combined with --mock or --debug")
+        }
+        if args.from_phase != 0 || args.to_phase != 8 {
+            bail!("--provider-contract cannot be combined with phase selection")
+        }
+        if args.model.is_some() || args.reasoning_effort.is_some() {
+            bail!("--provider-contract uses the configured provider targets; remove --model and --reasoning-effort")
+        }
+        if args.submit_orders || args.store_root.is_some() {
+            bail!("--provider-contract cannot be combined with --submit-orders or --store-root")
+        }
+        return Ok(());
+    }
     validate_phase_range(args)?;
     if args
         .max_debate_rounds
