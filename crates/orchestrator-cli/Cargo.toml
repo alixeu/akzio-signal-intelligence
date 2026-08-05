@@ -11,7 +11,6 @@ chrono.workspace = true
 clap.workspace = true
 regex.workspace = true
 orchestrator-core = { path = "../orchestrator-core" }
-orchestrator-llm = { path = "../orchestrator-llm" }
 orchestrator-ingest = { path = "../orchestrator-ingest" }
 orchestrator-store = { path = "../orchestrator-store" }
 orchestrator-workflow = { path = "../orchestrator-workflow" }

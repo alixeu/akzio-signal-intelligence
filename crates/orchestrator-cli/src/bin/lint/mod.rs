@@ -1,7 +1,7 @@
 //! Prompt lint data structures and orchestration.
 
 use anyhow::Result;
-use orchestrator_core::{load_config, project_path, ComponentRegistry};
+use orchestrator_core::ComponentRegistry;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -89,8 +89,6 @@ pub const VALID_PLACEHOLDERS: &[&str] = &[
 ];
 
 pub fn run_all_checks(prompts_dir: &Path) -> Result<LintReport> {
-    let config = load_config(Some(&project_path("config/config.yaml")))
-        .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
     let mut issues = Vec::new();
     let mut files_checked = 0;
 
@@ -122,7 +120,7 @@ pub fn run_all_checks(prompts_dir: &Path) -> Result<LintReport> {
             );
         }
         checks::check_file_size(path, content, &mut issues);
-        checks::check_anti_injection(path, content, &role, &config, &mut issues);
+        checks::check_anti_injection(path, content, &role, &mut issues);
     }
     checks::check_duplicate_content(&prompt_files, &mut issues);
 

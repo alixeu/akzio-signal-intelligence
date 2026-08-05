@@ -3,7 +3,6 @@ use agent_loop::{
     ProjectToolRuntime, RetrievalPolicy, ToolCallRequest, ToolResultItem, Turn,
 };
 use anyhow::{bail, Context, Result};
-use async_openai::{config::OpenAIConfig, Client as OpenAIClient};
 use futures::StreamExt;
 use orchestrator_core::{default_project_root, ToolManagedProfile};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -26,6 +25,8 @@ pub mod agent_loop;
 pub mod tools;
 pub mod truncation;
 pub mod web_search;
+
+mod providers;
 
 /// Appended to read-only Phase 1 output so reducers can distinguish exact
 /// FileStore/tool evidence IDs from strings copied or mutated by the model.
@@ -52,13 +53,6 @@ pub enum LlmTransport {
     Http,
     Ws,
 }
-
-/// Fixed endpoint, credentials, and model for the free opencode Zen gateway.
-/// When a role sets `free_opencode`, the configured gateway base_url / api_key
-/// and model are ignored in favor of these values (chat_completions only).
-const FREE_OPENCODE_BASE_URL: &str = "https://opencode.ai/zen/v1";
-const FREE_OPENCODE_API_KEY: &str = "public";
-const FREE_OPENCODE_MODEL: &str = "deepseek-v4-flash-free";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoleLlmSettings {
@@ -110,26 +104,7 @@ impl RoleLlmSettings {
                 "LLM config for role {role:?} enables native_web_search but its effective route is not responses"
             );
         }
-        // free_opencode pins base_url / api_key to the opencode Zen gateway, so
-        // the configured OpenAI-compatible endpoint credentials are not required.
-        if !self.free_opencode
-            && self
-                .base_url
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .is_none()
-        {
-            bail!("LLM config for role {role:?} requires base_url for openai_compatible");
-        }
-        let has_api_key = self
-            .api_key
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|value| !value.is_empty());
-        if !self.free_opencode && !has_api_key {
-            bail!("LLM config for role {role:?} requires api_key for openai_compatible");
-        }
+        providers::validate_configuration(self, role)?;
         for tool in &self.tools {
             validate_tool_name(tool)
                 .with_context(|| format!("unknown tool name {tool:?} for role {role:?}"))?;
@@ -178,11 +153,7 @@ impl RoleLlmSettings {
     /// The model actually sent to the provider. free_opencode pins the model to
     /// the free opencode model regardless of the configured value.
     pub fn effective_model(&self) -> &str {
-        if self.free_opencode {
-            FREE_OPENCODE_MODEL
-        } else {
-            self.model.as_str()
-        }
+        providers::effective_model(self)
     }
 }
 
@@ -1616,7 +1587,7 @@ async fn run_responses_text_once(
     input: &agent_loop::ModelInput,
     prompt: &str,
 ) -> Result<String> {
-    let client = openai_compatible_responses_client(&settings.llm)?;
+    let client = providers::openai_compatible_responses_client(&settings.llm)?;
     let request = build_responses_request(settings, input, prompt, false, true)?;
     let started = std::time::Instant::now();
     debug!(role = %settings.role, "sending non-streaming Responses API request");
@@ -1740,7 +1711,7 @@ async fn run_chat_completions_text_once(
     input: &agent_loop::ModelInput,
     prompt: &str,
 ) -> Result<String> {
-    let client = openai_compatible_responses_client(&settings.llm)?;
+    let client = providers::openai_compatible_responses_client(&settings.llm)?;
     let request = build_chat_completions_request(settings, input, prompt, false, true)?;
     let started = std::time::Instant::now();
     debug!(role = %settings.role, "sending non-streaming Chat Completions API request");
@@ -1940,15 +1911,10 @@ fn build_responses_request(
             .tool_choice(ToolChoiceParam::Mode(ToolChoiceOptions::Auto));
     }
 
-    if settings.role == "compressor.phase_summary" && input.available_tools.is_empty() {
-        // Phase Summary has a strict JSON artifact contract and no tool-call
-        // protocol to preserve. Keep Responses aligned with the existing
-        // Chat Completions JSON mode instead of relying on a corrective retry.
-        builder = builder.text(ResponseTextParam {
-            format: TextResponseFormatConfiguration::JsonObject,
-            verbosity: None,
-        });
-    }
+    // The gateway returns 502 for the real Phase 2 extraction prompt when
+    // Responses sends provider-level JSON mode. The prompt and Rust artifact
+    // validation still own this contract, so do not send the incompatible
+    // `text.format=json_object` field here.
 
     debug!(
         model = %model,
@@ -2361,7 +2327,8 @@ async fn stream_responses_once(
     use async_openai::types::responses::{OutputItem, ResponseStreamEvent};
 
     let started = std::time::Instant::now();
-    let client = openai_compatible_responses_client(&settings.llm).map_err(|e| (e, false))?;
+    let client =
+        providers::openai_compatible_responses_client(&settings.llm).map_err(|e| (e, false))?;
     let mut request =
         build_responses_request(settings, input, prompt, true, false).map_err(|e| (e, false))?;
     request.stream = Some(true);
@@ -2738,7 +2705,8 @@ async fn stream_chat_completions_once(
     use async_openai::types::chat::FinishReason;
 
     let started = std::time::Instant::now();
-    let client = openai_compatible_responses_client(&settings.llm).map_err(|e| (e, false))?;
+    let client =
+        providers::openai_compatible_responses_client(&settings.llm).map_err(|e| (e, false))?;
     let request = build_chat_completions_request(settings, input, prompt, true, false)
         .map_err(|e| (e, false))?;
     debug!(role = %settings.role, "opening streaming Chat Completions API connection");
@@ -3328,71 +3296,6 @@ fn extract_encrypted_reasoning(raw: &Value) -> Option<String> {
         })
 }
 
-fn openai_compatible_api_key(settings: &RoleLlmSettings) -> Result<String> {
-    if let Some(api_key) = settings
-        .api_key
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        return Ok(api_key.to_string());
-    }
-    bail!("api_key is required for OpenAI-compatible provider")
-}
-
-fn openai_compatible_base_url(settings: &RoleLlmSettings) -> Result<&str> {
-    settings
-        .base_url
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .context("base_url is required for OpenAI-compatible provider")
-}
-
-fn openai_compatible_responses_client(
-    settings: &RoleLlmSettings,
-) -> Result<OpenAIClient<OpenAIConfig>> {
-    if settings.free_opencode {
-        return free_opencode_client();
-    }
-    let api_key = openai_compatible_api_key(settings)?;
-    let base_url = openai_compatible_base_url(settings)?;
-    debug!(
-        base_url = %base_url,
-        model = %settings.model,
-        "creating OpenAI-compatible responses client"
-    );
-    let config = OpenAIConfig::new()
-        .with_api_key(api_key)
-        .with_api_base(base_url);
-    Ok(OpenAIClient::with_config(config))
-}
-
-/// Build a client for the free opencode Zen gateway. Every documented header
-/// must be present or the gateway rejects the request: Authorization comes from
-/// the fixed public api key, Content-Type is added per JSON request by the
-/// client, and the remaining opencode headers are attached here.
-fn free_opencode_client() -> Result<OpenAIClient<OpenAIConfig>> {
-    let session = format!("sess_{}", Uuid::new_v4().simple());
-    let request_id = format!("msg_{}", Uuid::new_v4().simple());
-    debug!(
-        base_url = %FREE_OPENCODE_BASE_URL,
-        model = %FREE_OPENCODE_MODEL,
-        "creating free opencode Zen chat completions client"
-    );
-    let config = OpenAIConfig::new()
-        .with_api_base(FREE_OPENCODE_BASE_URL)
-        .with_api_key(FREE_OPENCODE_API_KEY)
-        .with_header("x-opencode-project", "proj_akzio_signal")
-        .and_then(|config| config.with_header("x-opencode-session", session.as_str()))
-        .and_then(|config| config.with_header("x-opencode-request", request_id.as_str()))
-        .and_then(|config| config.with_header("x-opencode-client", "cli"))
-        .and_then(|config| config.with_header("Accept", "text/event-stream"))
-        .map_err(|e| anyhow::anyhow!("{e}"))
-        .context("failed to set free opencode gateway headers")?;
-    Ok(OpenAIClient::with_config(config))
-}
-
 fn configured_tool_names(settings: &AgentSettings) -> Vec<&str> {
     let mut names = Vec::new();
     if settings.llm.think_tool {
@@ -3615,7 +3518,7 @@ mod tests {
     }
 
     #[test]
-    fn phase_summary_responses_request_requires_json_object_without_tools() {
+    fn phase_summary_responses_request_defers_json_validation_to_rust() {
         let mut settings = base_settings(LlmRoute::Responses);
         settings.role = "compressor.phase_summary".to_owned();
         let input = agent_loop::ModelInput {
@@ -3634,10 +3537,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            serde_json::to_value(request).unwrap()["text"]["format"],
-            json!({"type": "json_object"})
-        );
+        assert!(serde_json::to_value(request).unwrap().get("text").is_none());
     }
 
     fn base_settings(route: LlmRoute) -> AgentSettings {

@@ -11,6 +11,27 @@ pub struct ModelPricing {
     pub context_window: u64,
 }
 
+const fn model_pricing(
+    input_per_mtok: f64,
+    cached_input_per_mtok: f64,
+    output_per_mtok: f64,
+    context_window: u64,
+) -> ModelPricing {
+    ModelPricing {
+        input_per_mtok,
+        cached_input_per_mtok,
+        output_per_mtok,
+        context_window,
+    }
+}
+
+const O3_PRICING: ModelPricing = model_pricing(2.0, 0.50, 8.0, 200_000);
+const O4_PRICING: ModelPricing = model_pricing(10.0, 2.50, 40.0, 200_000);
+const GPT_41_PRICING: ModelPricing = model_pricing(2.0, 0.50, 8.0, 1_000_000);
+const GPT_41_MINI_PRICING: ModelPricing = model_pricing(0.40, 0.10, 1.60, 1_000_000);
+const GPT_4O_MINI_PRICING: ModelPricing = model_pricing(0.15, 0.075, 0.60, 128_000);
+const GPT_4O_PRICING: ModelPricing = model_pricing(2.50, 1.25, 10.0, 128_000);
+
 /// Compute cost in USD from token counts and pricing.
 /// Uses `non_cached_input_tokens` and `cached_tokens` separately to avoid
 /// double-counting the cached portion.
@@ -31,86 +52,46 @@ pub fn cost_usd(
 pub fn pricing_for_model(model: &str) -> ModelPricing {
     let m = model.to_ascii_lowercase();
     if m.starts_with("o3") || m.starts_with("o4-mini") {
-        ModelPricing {
-            input_per_mtok: 2.0,
-            cached_input_per_mtok: 0.50,
-            output_per_mtok: 8.0,
-            context_window: 200_000,
-        }
+        O3_PRICING
     } else if m.starts_with("o4") {
-        ModelPricing {
-            input_per_mtok: 10.0,
-            cached_input_per_mtok: 2.50,
-            output_per_mtok: 40.0,
-            context_window: 200_000,
-        }
+        O4_PRICING
     } else if m.starts_with("gpt-5") {
-        ModelPricing {
-            input_per_mtok: 2.0,
-            cached_input_per_mtok: 0.50,
-            output_per_mtok: 8.0,
-            context_window: 1_000_000,
-        }
+        GPT_41_PRICING
     } else if m.starts_with("gpt-4.1-mini") || m.starts_with("gpt-4.1-nano") {
-        ModelPricing {
-            input_per_mtok: 0.40,
-            cached_input_per_mtok: 0.10,
-            output_per_mtok: 1.60,
-            context_window: 1_000_000,
-        }
+        GPT_41_MINI_PRICING
     } else if m.starts_with("gpt-4.1") {
-        ModelPricing {
-            input_per_mtok: 2.0,
-            cached_input_per_mtok: 0.50,
-            output_per_mtok: 8.0,
-            context_window: 1_000_000,
-        }
+        GPT_41_PRICING
     } else if m.starts_with("gpt-4o-mini") {
-        ModelPricing {
-            input_per_mtok: 0.15,
-            cached_input_per_mtok: 0.075,
-            output_per_mtok: 0.60,
-            context_window: 128_000,
-        }
+        GPT_4O_MINI_PRICING
     } else if m.starts_with("gpt-4o") {
-        ModelPricing {
-            input_per_mtok: 2.50,
-            cached_input_per_mtok: 1.25,
-            output_per_mtok: 10.0,
-            context_window: 128_000,
-        }
+        GPT_4O_PRICING
     } else {
         // Fallback: gpt-4.1 pricing
-        ModelPricing {
-            input_per_mtok: 2.0,
-            cached_input_per_mtok: 0.50,
-            output_per_mtok: 8.0,
-            context_window: 1_000_000,
-        }
+        GPT_41_PRICING
     }
 }
 
 /// Estimate token count for a string.
 /// Heuristic: ~4 ASCII chars per token, ~1.5 CJK chars per token.
 pub fn estimate_tokens(text: &str) -> usize {
-    let cjk_count = text
-        .chars()
-        .filter(|c| {
-            ('\u{4E00}'..='\u{9FFF}').contains(c)
-                || ('\u{3400}'..='\u{4DBF}').contains(c)
-                || ('\u{F900}'..='\u{FAFF}').contains(c)
-                || ('\u{3000}'..='\u{303F}').contains(c)
-                || ('\u{FF00}'..='\u{FFEF}').contains(c)
-        })
-        .count();
-    let ascii_count = text.chars().count() - cjk_count;
+    let (cjk_count, char_count) = text.chars().fold((0, 0), |(cjk, total), character| {
+        (cjk + is_cjk_or_fullwidth(character) as usize, total + 1)
+    });
+    let ascii_count = char_count - cjk_count;
     (cjk_count as f64 / 1.5).ceil() as usize + (ascii_count as f64 / 4.0).ceil() as usize
+}
+
+fn is_cjk_or_fullwidth(character: char) -> bool {
+    ('\u{4E00}'..='\u{9FFF}').contains(&character)
+        || ('\u{3400}'..='\u{4DBF}').contains(&character)
+        || ('\u{F900}'..='\u{FAFF}').contains(&character)
+        || ('\u{3000}'..='\u{303F}').contains(&character)
+        || ('\u{FF00}'..='\u{FFEF}').contains(&character)
 }
 
 /// Estimate tokens for a JSON value (stringifies it first)
 pub fn estimate_json_tokens(value: &Value) -> usize {
-    let s = value.to_string();
-    estimate_tokens(&s)
+    estimate_tokens(&value.to_string())
 }
 
 /// Estimate tokens for a single turn item based on its parts

@@ -171,29 +171,49 @@ pub fn detect_format(content: &str) -> ContentFormat {
     }
 }
 
+fn is_within_char_budget(content: &str, max_chars: usize) -> bool {
+    content.chars().count() <= max_chars
+}
+
 /// Semantic truncation: format-aware, preserves JSON validity for valid JSON inputs.
 pub fn truncate_semantic(content: &str, max_chars: usize, config: &TruncationConfig) -> String {
-    if content.chars().count() <= max_chars {
+    if is_within_char_budget(content, max_chars) {
         return content.to_string();
     }
     if max_chars == 0 {
         return String::new();
     }
 
+    truncate_semantic_over_budget(content, max_chars, config)
+}
+
+fn truncate_semantic_over_budget(
+    content: &str,
+    max_chars: usize,
+    config: &TruncationConfig,
+) -> String {
     match config.strategy {
         TruncationStrategy::Hard => truncate_hard(content, max_chars),
-        TruncationStrategy::Semantic => match detect_format(content) {
-            ContentFormat::Json => truncate_json(content, max_chars, config),
-            ContentFormat::Text | ContentFormat::Markdown => {
-                truncate_text_head_tail(content, max_chars, &config.text)
-            }
-        },
+        TruncationStrategy::Semantic => truncate_semantic_by_format(content, max_chars, config),
+    }
+}
+
+fn truncate_semantic_by_format(
+    content: &str,
+    max_chars: usize,
+    config: &TruncationConfig,
+) -> String {
+    match detect_format(content) {
+        ContentFormat::Json => truncate_json(content, max_chars, config),
+        ContentFormat::Text | ContentFormat::Markdown => {
+            truncate_text_head_tail(content, max_chars, &config.text)
+        }
     }
 }
 
 /// Legacy hard truncation. This intentionally matches `tools::truncate_chars`.
 pub fn truncate_hard(content: &str, max_chars: usize) -> String {
-    if content.chars().count() <= max_chars {
+    if is_within_char_budget(content, max_chars) {
         return content.to_string();
     }
     if max_chars == 0 {
@@ -212,45 +232,97 @@ pub fn truncate_hard(content: &str, max_chars: usize) -> String {
 }
 
 fn truncate_json(content: &str, max_chars: usize, config: &TruncationConfig) -> String {
-    let Ok(original) = serde_json::from_str::<Value>(content.trim()) else {
+    let Some(original) = parse_json_content(content) else {
         return truncate_text_head_tail(content, max_chars, &config.text);
     };
 
     let preserve = &config.json.preserve_fields;
     let mut value = original.clone();
-    let mut max_array_elements = config.json.max_array_elements;
-    let mut max_string_chars = max_chars.saturating_div(4).max(32);
 
-    for _ in 0..12 {
-        reduce_json_value(
-            &mut value,
-            max_array_elements,
-            preserve,
-            max_string_chars,
-            false,
-        );
-        if let Some(serialized) = serialize_json_within_limit(&value, max_chars) {
-            return serialized;
-        }
-
-        // Keep at least one array element while shrinking so useful payloads
-        // are not reduced to empty shells before the final compact fallback.
-        let next_array_elements = max_array_elements.saturating_div(2).max(1);
-        let next_string_chars = max_string_chars.saturating_div(2).max(16);
-        if next_array_elements == max_array_elements && next_string_chars == max_string_chars {
-            break;
-        }
-        max_array_elements = next_array_elements;
-        max_string_chars = next_string_chars;
+    if let Some(serialized) = reduce_json_until_within_limit(
+        &mut value,
+        max_chars,
+        preserve,
+        JsonReductionBudget::from_limit(max_chars, config.json.max_array_elements),
+    ) {
+        return serialized;
     }
 
-    let mut pruned = value.clone();
-    prune_non_preserved_fields(&mut pruned, preserve);
+    fallback_json_truncation(&original, &value, max_chars, preserve)
+}
+
+fn parse_json_content(content: &str) -> Option<Value> {
+    serde_json::from_str(content.trim()).ok()
+}
+
+#[derive(Debug, Clone, Copy)]
+struct JsonReductionBudget {
+    max_array_elements: usize,
+    max_string_chars: usize,
+}
+
+impl JsonReductionBudget {
+    fn from_limit(max_chars: usize, max_array_elements: usize) -> Self {
+        Self {
+            max_array_elements,
+            max_string_chars: max_chars.saturating_div(4).max(32),
+        }
+    }
+
+    /// Keep at least one array element and a small string budget while shrinking.
+    fn shrink(&mut self) -> bool {
+        let next_array_elements = self.max_array_elements.saturating_div(2).max(1);
+        let next_string_chars = self.max_string_chars.saturating_div(2).max(16);
+        if next_array_elements == self.max_array_elements
+            && next_string_chars == self.max_string_chars
+        {
+            return false;
+        }
+        self.max_array_elements = next_array_elements;
+        self.max_string_chars = next_string_chars;
+        true
+    }
+}
+
+fn reduce_json_until_within_limit(
+    value: &mut Value,
+    max_chars: usize,
+    preserve_fields: &[String],
+    mut budget: JsonReductionBudget,
+) -> Option<String> {
+    for _ in 0..12 {
+        reduce_json_value(
+            value,
+            budget.max_array_elements,
+            preserve_fields,
+            budget.max_string_chars,
+            false,
+        );
+        if let Some(serialized) = serialize_json_within_limit(value, max_chars) {
+            return Some(serialized);
+        }
+
+        if !budget.shrink() {
+            break;
+        }
+    }
+
+    None
+}
+
+fn fallback_json_truncation(
+    original: &Value,
+    reduced: &Value,
+    max_chars: usize,
+    preserve_fields: &[String],
+) -> String {
+    let mut pruned = reduced.clone();
+    prune_non_preserved_fields(&mut pruned, preserve_fields);
     if let Some(serialized) = serialize_json_within_limit(&pruned, max_chars) {
         return serialized;
     }
 
-    compact_preserved_json(&original, max_chars, preserve)
+    compact_preserved_json(original, max_chars, preserve_fields)
 }
 
 fn serialize_json_within_limit(value: &Value, max_chars: usize) -> Option<String> {
@@ -480,37 +552,16 @@ fn truncate_text_head_tail(
     config: &TextTruncationConfig,
 ) -> String {
     let total_chars = content.chars().count();
-    if total_chars <= max_chars {
+    if is_within_char_budget(content, max_chars) {
         return content.to_string();
     }
     if max_chars == 0 {
         return String::new();
     }
 
-    let separator_len = TEXT_TRUNCATION_SEPARATOR.chars().count();
-    if max_chars <= separator_len {
+    let Some((head_chars, tail_chars)) = text_split_budget(max_chars, config) else {
         return content.chars().take(max_chars).collect();
-    }
-
-    let available = max_chars - separator_len;
-    let head_ratio = if config.head_ratio.is_finite() && config.head_ratio >= 0.0 {
-        config.head_ratio
-    } else {
-        TextTruncationConfig::default().head_ratio
     };
-    let tail_ratio = if config.tail_ratio.is_finite() && config.tail_ratio >= 0.0 {
-        config.tail_ratio
-    } else {
-        TextTruncationConfig::default().tail_ratio
-    };
-    let ratio_total = head_ratio + tail_ratio;
-    let head_fraction = if ratio_total > 0.0 {
-        head_ratio / ratio_total
-    } else {
-        TextTruncationConfig::default().head_ratio
-    };
-    let head_chars = ((available as f64) * head_fraction).floor() as usize;
-    let tail_chars = available.saturating_sub(head_chars);
 
     let head = content.chars().take(head_chars).collect::<String>();
     let tail = content
@@ -518,6 +569,35 @@ fn truncate_text_head_tail(
         .skip(total_chars.saturating_sub(tail_chars))
         .collect::<String>();
     format!("{head}{TEXT_TRUNCATION_SEPARATOR}{tail}")
+}
+
+fn text_split_budget(max_chars: usize, config: &TextTruncationConfig) -> Option<(usize, usize)> {
+    let separator_len = TEXT_TRUNCATION_SEPARATOR.chars().count();
+    if max_chars <= separator_len {
+        return None;
+    }
+
+    let available = max_chars - separator_len;
+    let defaults = TextTruncationConfig::default();
+    let head_ratio = normalized_ratio(config.head_ratio, defaults.head_ratio);
+    let tail_ratio = normalized_ratio(config.tail_ratio, defaults.tail_ratio);
+    let ratio_total = head_ratio + tail_ratio;
+    let head_fraction = if ratio_total > 0.0 {
+        head_ratio / ratio_total
+    } else {
+        defaults.head_ratio
+    };
+    let head_chars = ((available as f64) * head_fraction).floor() as usize;
+    let tail_chars = available.saturating_sub(head_chars);
+    Some((head_chars, tail_chars))
+}
+
+fn normalized_ratio(value: f64, default: f64) -> f64 {
+    if value.is_finite() && value >= 0.0 {
+        value
+    } else {
+        default
+    }
 }
 
 #[cfg(test)]

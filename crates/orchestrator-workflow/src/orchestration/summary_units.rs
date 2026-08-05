@@ -4,7 +4,7 @@ const INDEX_ID_DOMAIN: &[u8] = b"akzio.phase_summary.index.v1\0";
 
 /// Stable Index ID for one Rust-owned summary. Length-prefixed fields keep the
 /// preimage unambiguous and preserve the distinction between `None` and `""`.
-pub fn derive_summary_index_id(
+pub(crate) fn derive_summary_index_id(
     run_id: &str,
     source_phase: u8,
     role: &str,

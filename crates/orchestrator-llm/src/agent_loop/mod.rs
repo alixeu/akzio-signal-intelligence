@@ -1,12 +1,15 @@
 mod debug_capture;
+mod persisted_items;
 mod session_store;
 mod streaming;
 mod types;
 
 pub use debug_capture::input_to_debug_messages;
+pub(crate) use persisted_items::turn_item_from_history_value;
 pub use session_store::{FileStoreSessionRuntime, SessionRuntimeSpec, TurnCheckpoint};
 pub use types::*;
 
+use persisted_items::{output_item_for, runtime_status_for_tool_result};
 use streaming::ModelStreamHandler;
 
 use anyhow::{bail, Result};
@@ -985,50 +988,6 @@ pub(super) fn update_turn_item(
     Ok(Some(item))
 }
 
-fn output_item_for(item: &TurnItem) -> Option<AgentOutputItem> {
-    let id = if item.output_item_id.is_empty() {
-        item.tool_call_id.clone()
-    } else {
-        item.output_item_id.clone()
-    };
-    match item.item_type {
-        TurnItemType::AssistantMessage => Some(AgentOutputItem::AssistantMessage {
-            id,
-            phase: item.phase.clone().unwrap_or(AgentItemPhase::Commentary),
-            content: item.content_text.clone(),
-            status: item.status.clone().unwrap_or(AgentItemStatus::Completed),
-        }),
-        TurnItemType::ReasoningSummary => Some(AgentOutputItem::ReasoningSummary {
-            id,
-            content: item.content_text.clone(),
-            status: item.status.clone().unwrap_or(AgentItemStatus::Completed),
-        }),
-        TurnItemType::PlanUpdate => Some(AgentOutputItem::PlanUpdate {
-            id,
-            content: item.content_text.clone(),
-            status: item.status.clone().unwrap_or(AgentItemStatus::Completed),
-        }),
-        TurnItemType::ToolCall => Some(AgentOutputItem::ToolCall {
-            id,
-            tool_name: item.tool_name.clone(),
-            arguments: item
-                .content_json
-                .get("call")
-                .and_then(|value| value.get("arguments"))
-                .cloned()
-                .unwrap_or(Value::Null),
-            status: item.status.clone().unwrap_or(AgentItemStatus::Pending),
-        }),
-        TurnItemType::ToolResult => Some(AgentOutputItem::ToolResult {
-            id,
-            tool_call_id: item.tool_call_id.clone(),
-            content: item.content_text.clone(),
-            status: item.status.clone().unwrap_or(AgentItemStatus::Completed),
-        }),
-        _ => None,
-    }
-}
-
 pub(super) async fn emit_started<S: AgentEventSink>(
     turn: &Turn,
     sink: &mut S,
@@ -1131,11 +1090,7 @@ async fn emit_tool_result<S: AgentEventSink>(
     sink: &mut S,
     result: &ToolResultItem,
 ) -> Result<()> {
-    let status = if result.status == "completed" || result.status == "started" {
-        AgentItemStatus::Completed
-    } else {
-        AgentItemStatus::Failed
-    };
+    let status = runtime_status_for_tool_result(&result.status);
     sink.emit(AgentLoopEvent::TurnItemCompleted {
         turn_id: turn.turn_id.clone(),
         item: AgentOutputItem::ToolResult {
@@ -1422,80 +1377,6 @@ fn history_items(
         return Ok(items);
     }
     Ok(items[items.len() - limit..].to_vec())
-}
-
-/// Convert a persisted agent-event history value into a runtime turn item.
-pub fn turn_item_from_history_value(value: Value) -> TurnItem {
-    let item_type = match value
-        .get("event_type")
-        .or_else(|| value.get("item_type"))
-        .and_then(Value::as_str)
-        .unwrap_or("")
-    {
-        "user_message" => TurnItemType::UserMessage,
-        "assistant_message" => TurnItemType::AssistantMessage,
-        "reasoning_summary" => TurnItemType::ReasoningSummary,
-        "reasoning_state" => TurnItemType::ReasoningState,
-        "plan_update" => TurnItemType::PlanUpdate,
-        "tool_call" => TurnItemType::ToolCall,
-        "tool_result" => TurnItemType::ToolResult,
-        "native_web_search" => TurnItemType::NativeWebSearch,
-        "system_context" => TurnItemType::SystemContext,
-        "developer_context" => TurnItemType::DeveloperContext,
-        "compact_summary" => TurnItemType::CompactSummary,
-        _ => TurnItemType::InjectedContext,
-    };
-    let content_json = value.get("content_json").cloned().unwrap_or(Value::Null);
-    TurnItem {
-        item_type,
-        role: value
-            .get("role")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string(),
-        content_text: value
-            .get("content_text")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string(),
-        content_json: content_json.clone(),
-        tool_call_id: value
-            .get("tool_call_id")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string(),
-        tool_name: value
-            .get("tool_name")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string(),
-        output_item_id: content_json
-            .get("output_item_id")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string(),
-        phase: content_json
-            .get("phase")
-            .and_then(Value::as_str)
-            .and_then(|value| match value {
-                "commentary" => Some(AgentItemPhase::Commentary),
-                "final" => Some(AgentItemPhase::Final),
-                _ => None,
-            }),
-        status: content_json
-            .get("status")
-            .and_then(Value::as_str)
-            .and_then(|value| match value {
-                "in_progress" => Some(AgentItemStatus::InProgress),
-                "completed" => Some(AgentItemStatus::Completed),
-                "pending" => Some(AgentItemStatus::Pending),
-                "running" => Some(AgentItemStatus::Running),
-                "failed" => Some(AgentItemStatus::Failed),
-                "interrupted" => Some(AgentItemStatus::Interrupted),
-                _ => None,
-            }),
-        db_row_id: None,
-    }
 }
 
 async fn mark_last_assistant_message_as_final<S: AgentEventSink>(

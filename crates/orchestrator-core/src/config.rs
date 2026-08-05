@@ -125,32 +125,19 @@ pub fn config_get<'a>(config: &'a Value, path: &str) -> Option<&'a Value> {
 }
 
 pub fn config_str(config: &Value, path: &str, default: &str) -> String {
-    match config_get(config, path) {
-        Some(Value::String(value)) => value.clone(),
-        Some(Value::Number(value)) => value.to_string(),
-        Some(Value::Bool(value)) => value.to_string(),
-        Some(value) if !value.is_null() => value.to_string(),
-        _ => default.to_string(),
-    }
+    config_get(config, path)
+        .and_then(config_value_string)
+        .unwrap_or_else(|| default.to_string())
 }
 
 pub fn config_strings(config: &Value, path: &str, default: &[&str]) -> Vec<String> {
     match config_get(config, path) {
-        Some(Value::Array(values)) => values
-            .iter()
-            .filter_map(|value| match value {
-                Value::String(text) if !text.trim().is_empty() => Some(text.to_string()),
-                Value::Number(number) => Some(number.to_string()),
-                Value::Bool(value) => Some(value.to_string()),
-                _ => None,
-            })
-            .collect(),
+        Some(Value::Array(values)) => values.iter().filter_map(config_scalar_string).collect(),
         Some(Value::String(text)) => text
             .split(',')
-            .filter_map(|item| {
-                let item = item.trim();
-                (!item.is_empty()).then(|| item.to_string())
-            })
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(str::to_string)
             .collect(),
         _ => default.iter().map(|item| item.to_string()).collect(),
     }
@@ -158,36 +145,67 @@ pub fn config_strings(config: &Value, path: &str, default: &[&str]) -> Vec<Strin
 
 pub fn config_int(config: &Value, path: &str, default: i64) -> i64 {
     config_get(config, path)
-        .and_then(|value| match value {
-            Value::Number(number) => number.as_i64(),
-            Value::String(text) => text.parse::<i64>().ok(),
-            _ => None,
-        })
+        .and_then(parse_config_int)
         .unwrap_or(default)
 }
 
 pub fn config_float(config: &Value, path: &str, default: f64) -> f64 {
     config_get(config, path)
-        .and_then(|value| match value {
-            Value::Number(number) => number.as_f64(),
-            Value::String(text) => text.parse::<f64>().ok(),
-            _ => None,
-        })
+        .and_then(parse_config_float)
         .unwrap_or(default)
 }
 
 pub fn config_bool(config: &Value, path: &str, default: bool) -> bool {
     config_get(config, path)
-        .and_then(|value| match value {
-            Value::Bool(value) => Some(*value),
-            Value::String(text) => match text.trim().to_ascii_lowercase().as_str() {
-                "1" | "true" | "yes" | "y" | "on" => Some(true),
-                "0" | "false" | "no" | "n" | "off" => Some(false),
-                _ => None,
-            },
-            _ => None,
-        })
+        .and_then(parse_config_bool)
         .unwrap_or(default)
+}
+
+fn config_value_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => Some(value.clone()),
+        Value::Number(value) => Some(value.to_string()),
+        Value::Bool(value) => Some(value.to_string()),
+        value if !value.is_null() => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn config_scalar_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) if !text.trim().is_empty() => Some(text.to_string()),
+        Value::Number(number) => Some(number.to_string()),
+        Value::Bool(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn parse_config_int(value: &Value) -> Option<i64> {
+    match value {
+        Value::Number(number) => number.as_i64(),
+        Value::String(text) => text.parse().ok(),
+        _ => None,
+    }
+}
+
+fn parse_config_float(value: &Value) -> Option<f64> {
+    match value {
+        Value::Number(number) => number.as_f64(),
+        Value::String(text) => text.parse().ok(),
+        _ => None,
+    }
+}
+
+fn parse_config_bool(value: &Value) -> Option<bool> {
+    match value {
+        Value::Bool(value) => Some(*value),
+        Value::String(text) => match text.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "y" | "on" => Some(true),
+            "0" | "false" | "no" | "n" | "off" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 #[cfg(test)]

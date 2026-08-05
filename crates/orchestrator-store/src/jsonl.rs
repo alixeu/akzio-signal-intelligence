@@ -1,15 +1,18 @@
 use std::{
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    atomic::sync_directory, canonical_json_bytes, content_hash, error::io_error,
-    paths::resolve_for_write, Result, StoreError,
+    atomic::sync_directory,
+    canonical_json_bytes, content_hash,
+    error::io_error,
+    paths::{resolve_existing, resolve_for_write},
+    Result, StoreError,
 };
 
 pub const SESSION_EVENT_SCHEMA_VERSION: u32 = 1;
@@ -95,11 +98,7 @@ impl JsonlRecord for JsonlEvent {
 /// skipping history.
 pub fn append_jsonl<R: JsonlRecord>(root: &Path, relative: &Path, record: &R) -> Result<()> {
     let _lock = crate::lock::lock_exclusive(root, relative)?;
-    let path = resolve_for_write(root, relative)?;
-    let parent = path
-        .parent()
-        .expect("resolved JSONL path has a parent")
-        .to_path_buf();
+    let (path, parent) = resolve_jsonl_write_path(root, relative)?;
     let mut file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -121,11 +120,7 @@ pub(crate) fn append_jsonl_transaction<R: JsonlRecord>(
     build: impl FnOnce(&[R]) -> Result<Option<R>>,
 ) -> Result<Option<R>> {
     let _lock = crate::lock::lock_exclusive(root, relative)?;
-    let path = resolve_for_write(root, relative)?;
-    let parent = path
-        .parent()
-        .expect("resolved JSONL path has a parent")
-        .to_path_buf();
+    let (path, parent) = resolve_jsonl_write_path(root, relative)?;
     let mut file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -195,9 +190,18 @@ pub fn read_jsonl_recover_tail<R: JsonlRecord>(root: &Path, relative: &Path) -> 
 /// truncated. Use this for inspection and validation paths.
 pub fn read_jsonl_strict<R: JsonlRecord>(root: &Path, relative: &Path) -> Result<Vec<R>> {
     let _lock = crate::lock::lock_shared(root, relative)?;
-    let path = resolve_for_write(root, relative)?;
+    let path = resolve_existing(root, relative)?;
     let mut file = File::open(&path).map_err(|source| io_error(&path, source))?;
     read_jsonl_from_locked_file::<R>(&mut file, &path, false)
+}
+
+fn resolve_jsonl_write_path(root: &Path, relative: &Path) -> Result<(PathBuf, PathBuf)> {
+    let path = resolve_for_write(root, relative)?;
+    let parent = path
+        .parent()
+        .expect("resolved JSONL path has a parent")
+        .to_path_buf();
+    Ok((path, parent))
 }
 
 fn read_jsonl_from_locked_file<R: JsonlRecord>(
@@ -348,6 +352,15 @@ mod tests {
 
         assert!(read_jsonl_strict::<JsonlEvent>(directory.path(), path).is_err());
         assert_eq!(fs::read(&absolute).unwrap(), before);
+    }
+
+    #[test]
+    fn strict_read_of_missing_path_does_not_create_parent_directory() {
+        let directory = tempdir().unwrap();
+        let path = Path::new("missing/session/turn.jsonl");
+
+        assert!(read_jsonl_strict::<JsonlEvent>(directory.path(), path).is_err());
+        assert!(!directory.path().join("missing").exists());
     }
 
     #[test]

@@ -9,7 +9,7 @@ pub(crate) fn run_id_for(tickers: &[String], date: &str) -> String {
 }
 
 pub(crate) fn run_id_for_seed(tickers: &[String], date: &str, seed: &str) -> String {
-    let prefix = run_slug(tickers).to_ascii_lowercase().replace('_', "-");
+    let prefix = run_prefix(tickers);
     format!("{prefix}-{}", md5_3(format!("{date}\x1f{seed}")))
 }
 
@@ -17,8 +17,11 @@ pub(crate) fn run_id_for_seed(tickers: &[String], date: &str, seed: &str) -> Str
 /// safe only while the manifest's code/config/prompt identity matches; the
 /// executor rejects drift before reopening this workspace.
 pub(crate) fn debug_run_id_for(tickers: &[String]) -> String {
-    let prefix = run_slug(tickers).to_ascii_lowercase().replace('_', "-");
-    format!("{prefix}-debug")
+    format!("{}-debug", run_prefix(tickers))
+}
+
+fn run_prefix(tickers: &[String]) -> String {
+    run_slug(tickers).to_ascii_lowercase().replace('_', "-")
 }
 
 /// Resolve the FileStore location from persisted state while preserving the

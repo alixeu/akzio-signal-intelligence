@@ -250,7 +250,6 @@ pub fn check_anti_injection(
     file_path: &Path,
     content: &str,
     role: &str,
-    _config: &Value,
     issues: &mut Vec<LintIssue>,
 ) {
     if role.is_empty() {
