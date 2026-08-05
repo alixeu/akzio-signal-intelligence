@@ -13,7 +13,7 @@ use async_openai::{
 };
 use chrono::Utc;
 use futures::StreamExt;
-use orchestrator_llm::{tools, LlmRoute};
+use orchestrator_llm::{build_provider_contract_client, tools, LlmRoute};
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -208,16 +208,7 @@ async fn check_target(target: &ProviderContractTarget) -> TargetReport {
 }
 
 fn client_for(target: &ProviderContractTarget) -> Result<Client<OpenAIConfig>> {
-    if target.base_url.trim().is_empty() {
-        bail!("provider base_url is empty")
-    }
-    if target.api_key.trim().is_empty() {
-        bail!("provider api_key is empty")
-    }
-    let config = OpenAIConfig::new()
-        .with_api_key(target.api_key.clone())
-        .with_api_base(target.base_url.clone());
-    Ok(Client::with_config(config))
+    build_provider_contract_client(&target.base_url, &target.api_key)
 }
 
 async fn check_responses(

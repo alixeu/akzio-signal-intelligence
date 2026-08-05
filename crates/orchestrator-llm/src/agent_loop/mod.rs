@@ -1,10 +1,8 @@
-mod debug_capture;
 mod persisted_items;
 mod session_store;
 mod streaming;
 mod types;
 
-pub use debug_capture::input_to_debug_messages;
 pub(crate) use persisted_items::turn_item_from_history_value;
 pub use session_store::{FileStoreSessionRuntime, SessionRuntimeSpec, TurnCheckpoint};
 pub use types::*;
@@ -51,33 +49,8 @@ impl LoopModel for AgentLoopModel {
         input: ModelInput,
     ) -> Pin<Box<dyn Future<Output = Result<ModelResponse>> + Send + 'a>> {
         Box::pin(async move {
-            let started = Instant::now();
-            let req_messages = input_to_debug_messages(&input);
             let prompt = model_prompt(&input)?;
             let result = crate::run_model_text_once(&self.settings, &input, &prompt).await;
-            if self.settings.debug {
-                let elapsed_ms = started.elapsed().as_millis();
-                crate::append_debug_llm_record(
-                    &self.settings,
-                    json!({
-                        "kind": "generate",
-                        "role": self.settings.role,
-                        "phase": self.settings.phase,
-                        "topic_id": self.settings.topic_id,
-                        "round": self.settings.debug_round,
-                        "model": self.settings.llm.model,
-                        "req": { "messages": req_messages },
-                        "resp": {
-                            "status": if result.is_ok() { "completed" } else { "error" },
-                            "output": result.as_ref().ok().map(|text| json!([{"type": "output_text", "text": text}])).unwrap_or_else(|| json!([])),
-                            "error": result.as_ref().err().map(ToString::to_string),
-                        },
-                        "elapsed_ms": elapsed_ms,
-                        "token": null,
-                        "response_text": result.as_ref().ok(),
-                    }),
-                )?;
-            }
             let text = result?;
             Ok(model_response_from_assistant_text(&text))
         })
@@ -90,17 +63,7 @@ impl LoopModel for AgentLoopModel {
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
             let prompt = model_role_prompt(&input)?;
-            let mut capture =
-                debug_capture::DebugLlmCapture::new(handler, &input, &self.settings.llm.tools);
-            let result =
-                crate::run_model_event_stream(&self.settings, &input, &prompt, &mut capture).await;
-            if self.settings.debug {
-                crate::append_debug_llm_record(
-                    &self.settings,
-                    capture.into_record(&self.settings, result.as_ref().err()),
-                )?;
-            }
-            result
+            crate::run_model_event_stream(&self.settings, &input, &prompt, handler).await
         })
     }
 }
@@ -463,7 +426,7 @@ where
             let debug_loop = loop_index;
             let debug_run_id = turn.run_id.clone();
             let debug_session_id = turn.session_id.clone();
-            let debug_turn_id = turn.turn_id.clone();
+            let tool_turn_id = turn.turn_id.clone();
             let tool_batch_started = Instant::now();
             let mut terminal_completed = false;
             let mut calls = calls.into_iter();
@@ -506,7 +469,7 @@ where
                                 "topic_id": debug_topic,
                                 "run_id": debug_run_id,
                                 "session_id": debug_session_id,
-                                "turn_id": debug_turn_id,
+                                "turn_id": tool_turn_id,
                                 "loop_index": debug_loop,
                                 "call_id": result.call_id,
                                 "status": result.status,

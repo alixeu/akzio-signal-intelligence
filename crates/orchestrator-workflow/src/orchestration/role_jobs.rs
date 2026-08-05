@@ -57,8 +57,6 @@ pub(crate) struct RoleJob {
     pub mock: bool,
     pub debug: bool,
     pub prompt: String,
-    pub prompt_path: Option<String>,
-    pub debug_output_path: Option<PathBuf>,
     pub prompt_version: Option<String>,
     pub tickers: Vec<String>,
     pub tool_managed_profile: ToolManagedProfile,
@@ -395,8 +393,6 @@ pub(crate) fn prepare_role_job(input: RoleRun<'_>) -> Result<RoleJob> {
         mock,
         debug: debug_enabled,
         prompt,
-        prompt_path: prompt_path.map(|path| path.display().to_string()),
-        debug_output_path: phase2_debug_output_path(phase, role, kind, topic_id, round),
         prompt_version,
         tickers: tickers.clone(),
         tool_managed_profile,
@@ -466,7 +462,6 @@ struct WorkflowEvidenceResearchService {
     current_date: String,
     run_id: String,
     storage_namespace: Option<String>,
-    project_root: PathBuf,
     prompt_path: PathBuf,
     llm: RoleLlmSettings,
     web_search: orchestrator_llm::web_search::WebSearchConfig,
@@ -539,23 +534,10 @@ async fn run_web_evidence_research(
             created_at: Utc::now().to_rfc3339(),
         },
     )?;
-    let prompt_path = service
-        .prompt_path
-        .strip_prefix(&service.project_root)
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("prompts/phase2/web_evidence_researcher.md"));
     let settings = AgentSettings {
         role: "researcher.web_evidence".to_owned(),
         phase: Some(2),
         topic_id,
-        debug_prompt_path: Some(prompt_path),
-        debug_output_path: Some(
-            PathBuf::from("outputs/debug/phase2/evidence")
-                .join(scope_component)
-                .join(format!("{request_id}.json")),
-        ),
-        debug_round: None,
-        debug_turn_id: None,
         tickers: request.tickers,
         tool_managed_profile: ToolManagedProfile::EvidenceResearch,
         session_runtime,
@@ -636,7 +618,6 @@ fn phase2_evidence_research_binding(
             .get("storage_namespace")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned),
-        project_root: project_root.clone(),
         prompt_path: config
             .prompts
             .path_for("researcher.web_evidence")
@@ -1902,71 +1883,6 @@ fn retrieval_policy_for_role(role: &str, kind: &str, config: &RetrievalConfig) -
     }
 }
 
-fn phase2_debug_output_path(
-    phase: i64,
-    role: &str,
-    kind: &str,
-    topic_id: Option<&str>,
-    _round: Option<i64>,
-) -> Option<PathBuf> {
-    if role == "compressor.phase_summary" {
-        let file = if phase == 2 && kind == "phase2_extraction" {
-            "phase2_extraction.json"
-        } else {
-            &format!("phase{phase}_summary.json")
-        };
-        return Some(
-            PathBuf::from(format!("outputs/debug/phase{phase}"))
-                .join(if phase == 2 && kind == "phase2_extraction" {
-                    "extraction"
-                } else {
-                    "summary"
-                })
-                .join(file),
-        );
-    }
-    if phase != 2 {
-        return None;
-    }
-    if role == "mediator.topic" {
-        return Some(PathBuf::from(if kind == "warmup" {
-            "outputs/debug/phase2/phase2-warmup-shared.json"
-        } else {
-            "outputs/debug/phase2/topic-generator.json"
-        }));
-    }
-    let topic_id = topic_id?;
-    let safe_topic_id: String = topic_id
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let topic_dir = if safe_topic_id.starts_with("topic-") || safe_topic_id.starts_with("topic_") {
-        safe_topic_id
-    } else {
-        format!("topic-{safe_topic_id}")
-    };
-    let file = if role == "mediator.topic_controller" {
-        "topic-controller.json"
-    } else if role == "researcher.bull" || role.contains(".bull.") {
-        "debate-bull.json"
-    } else if role == "researcher.bear" || role.contains(".bear.") {
-        "debate-bear.json"
-    } else {
-        return None;
-    };
-    Some(
-        PathBuf::from("outputs/debug/phase2")
-            .join(topic_dir)
-            .join(file),
-    )
-}
-
 pub(crate) async fn run_role_jobs(
     jobs: Vec<RoleJob>,
     parallelism: usize,
@@ -1983,21 +1899,6 @@ pub(crate) async fn run_role_jobs(
         .buffer_unordered(parallelism.max(1))
         .collect()
         .await
-}
-
-fn debug_prompt_path_from_runtime_path(path: &str) -> Option<PathBuf> {
-    let path = PathBuf::from(path);
-    let project_root = default_project_root();
-    path.strip_prefix(&project_root)
-        .ok()
-        .map(PathBuf::from)
-        .or_else(|| {
-            path.to_str().and_then(|value| {
-                value
-                    .find("prompts/")
-                    .map(|index| PathBuf::from(&value[index..]))
-            })
-        })
 }
 
 pub(crate) async fn run_role_job_with_timeout(job: RoleJob, timeout_sec: u64) -> RoleJobResult {
@@ -2100,20 +2001,11 @@ async fn execute_role_job(job: RoleJob) -> Result<AgentLoopOutput> {
     let llm = job
         .llm
         .with_context(|| format!("missing prepared LLM config for role {:?}", job.role))?;
-    let debug_prompt_path = job
-        .prompt_path
-        .as_deref()
-        .and_then(debug_prompt_path_from_runtime_path);
-    let debug_round = job.round.and_then(|round| usize::try_from(round).ok());
     let phase2_context = job.tools.phase2_context.clone();
     let settings = AgentSettings {
         role: job.role,
         phase: Some(job.phase),
         topic_id: job.topic_id,
-        debug_prompt_path,
-        debug_output_path: job.debug_output_path,
-        debug_round,
-        debug_turn_id: None,
         tickers: job.tickers,
         tool_managed_profile: job.tool_managed_profile,
         index_tool_runtime: job.index_tool_runtime.clone(),
@@ -2460,76 +2352,6 @@ mod tests {
     }
 
     #[test]
-    fn phase2_debug_paths_follow_the_checkpoint_and_topic_tree() {
-        assert_eq!(
-            phase2_debug_output_path(1, "compressor.phase_summary", "phase_summary", None, None),
-            Some(PathBuf::from(
-                "outputs/debug/phase1/summary/phase1_summary.json"
-            ))
-        );
-        assert_eq!(
-            phase2_debug_output_path(2, "mediator.topic", "warmup", None, Some(0)),
-            Some(PathBuf::from(
-                "outputs/debug/phase2/phase2-warmup-shared.json"
-            ))
-        );
-        assert_eq!(
-            phase2_debug_output_path(2, "mediator.topic", "topic_generation", None, None),
-            Some(PathBuf::from("outputs/debug/phase2/topic-generator.json"))
-        );
-        assert_eq!(
-            phase2_debug_output_path(
-                2,
-                "compressor.phase_summary",
-                "phase2_extraction",
-                None,
-                None
-            ),
-            Some(PathBuf::from(
-                "outputs/debug/phase2/extraction/phase2_extraction.json"
-            ))
-        );
-        for (role, file) in [
-            ("researcher.bull.initial", "debate-bull.json"),
-            ("researcher.bear.interaction", "debate-bear.json"),
-            ("mediator.topic_controller", "topic-controller.json"),
-        ] {
-            assert_eq!(
-                phase2_debug_output_path(2, role, "debate", Some("QQQ/risk"), Some(1)),
-                Some(PathBuf::from("outputs/debug/phase2/topic-QQQ_risk").join(file))
-            );
-        }
-        assert_eq!(
-            phase2_debug_output_path(
-                2,
-                "researcher.bull.interaction",
-                "interaction",
-                Some("QQQ/risk"),
-                Some(2),
-            ),
-            phase2_debug_output_path(
-                2,
-                "researcher.bull.initial",
-                "bull_seed",
-                Some("QQQ/risk"),
-                Some(0),
-            )
-        );
-        assert_eq!(
-            phase2_debug_output_path(
-                2,
-                "researcher.bull.initial",
-                "bull_seed",
-                Some("topic_vix"),
-                Some(0),
-            ),
-            Some(PathBuf::from(
-                "outputs/debug/phase2/topic_vix/debate-bull.json"
-            ))
-        );
-    }
-
-    #[test]
     fn phase2_context_records_topic_round_and_fork_parent() {
         let context = phase2_context_payload(
             &json!({
@@ -2659,41 +2481,6 @@ mod tests {
             "mediator.topic_controller"
         );
         assert!(context.get("controller").is_none());
-    }
-
-    #[test]
-    fn phase2_json_debug_files_retain_structured_messages() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = phase2_debug_output_path(
-            2,
-            "researcher.bull.initial",
-            "bull_seed",
-            Some("topic-a"),
-            Some(0),
-        )
-        .unwrap();
-        orchestrator_llm::append_debug_output_record(
-            temp.path(),
-            &path,
-            "prompts/phase2/researcher/debate.md",
-            json!({
-                "kind": "stream",
-                "req": {
-                    "messages": [
-                        {"role": "assistant", "content": "准备完毕"},
-                        {"role": "user", "content": "BULL ROLE PROMPT\n\nSteer: topic-a"}
-                    ]
-                },
-                "resp": {"status": "completed"}
-            }),
-        )
-        .unwrap();
-
-        let output: Value =
-            serde_json::from_str(&std::fs::read_to_string(temp.path().join(path)).unwrap())
-                .unwrap();
-        assert_eq!(output["req"]["messages"][0]["content"], "准备完毕");
-        assert_eq!(output["req"]["messages"][1]["role"], "user");
     }
 
     #[test]

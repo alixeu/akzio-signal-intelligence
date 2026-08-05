@@ -613,8 +613,8 @@ fn record_nonblocking_evaluation_failure(state: &mut Value, error: &anyhow::Erro
 
 fn validate_args(args: &ExecArgs) -> Result<()> {
     if args.provider_contract {
-        if args.mock || args.debug {
-            bail!("--provider-contract cannot be combined with --mock or --debug")
+        if args.mock {
+            bail!("--provider-contract cannot be combined with --mock")
         }
         if args.from_phase != 0 || args.to_phase != 8 {
             bail!("--provider-contract cannot be combined with phase selection")

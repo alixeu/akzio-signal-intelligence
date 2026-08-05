@@ -118,8 +118,9 @@ Bull/Bear 与 Topic Controller 均返回自由文本。
 `round_num` 的唯一动态传递通道。这些字段从不从自由文本推断,也不在提示词
 中重复。两个种子轮次之后,由 Topic Controller 决定是否需要新一轮;每个后续
 Bull/Bear 轮次在 Controller 审查该轮之前,先从同一上下文工具读取最新的
-Controller 路由。Debug 记录将每个轮次分别保留为
-`debate-{bull,bear}-round-N.json` 和 `topic-controller-round-N.json`。
+Controller 路由。每个轮次的完整会话仍以 FileStore Session 为准；Debug 只写入
+Rust-owned 的 Phase 2 汇总视图（`summary/debate_process_summary.json` 和每个议题
+的 `debate-{bull,bear}.json`、`topic-controller.json`）。
 各议题并发运行,而单个议题内部的轮次仍由 Controller 路由。
 当不存在实质性分歧点时,Phase 2 记录一个无辩论(no-debate)产物,并仍然
 推进到 Phase 3。
@@ -402,11 +403,15 @@ rtk cargo run -p orchestrator-cli --bin orchestrator-exec -- \
 
 - `--store-root PATH`:FileStore 的根目录(默认 `outputs/store`)。普通运行位于
   `runs/<日期>/`; Debug 运行固定在 `runs/debug/<ticker>-debug/`。
-- `--debug`:将工作流与 agent 循环调试日志打印到控制台,并将请求/响应记录、
-  耗时与 token JSON 写入 `outputs/debug/`;Phase 7 同时在控制台输出订单
-  计划和模拟执行结果,固定为 10,000 美元、零仓位且不访问 Alpaca。运行 ID 不含
-  日期或配置哈希，例如 `QQQ/SOXX/VIX` 固定为 `qqq-soxx-vix-debug`，所以
-  `--debug --from-phase X --to-phase X` 会重开同一份 Index、会话与状态。
+- `--debug`:将工作流、agent 循环和 `async-openai` HTTP 调试日志打印到控制台，
+  包括脱敏后的 request JSON、response 状态/headers、耗时、请求指纹以及 typed
+  Responses/Chat SSE 事件。旧的 LLM 请求/响应投影已删除；`outputs/debug/` 只保留
+  Rust-owned 的阶段/Reducer 记录以及耗时、token 指标。Authorization、API key、Cookie
+  不会打印；SSE body 由 SDK 流继续消费，不在 HTTP middleware 中读取。Phase 7 同时在控制台输出订单计划和
+  模拟执行结果,固定为 10,000 美元、零仓位且不访问 Alpaca。运行 ID 不含日期或
+  配置哈希，例如 `QQQ/SOXX/VIX` 固定为 `qqq-soxx-vix-debug`，所以
+  `--debug --from-phase X --to-phase X` 会重开同一份 Index、会话与状态。若只需要
+  HTTP 层日志，可使用 `RUST_LOG=orchestrator_llm::http=debug,orchestrator_llm=info`。
 - `--max-debate-rounds N`:限制条件辩论轮数。
 - `--max-topics-per-side N`:限制每个 Bull/Bear 侧参与的实质性冲突议题数
   (默认 3)。Rust 会在进入辩论前确定性截断 Topic Generator 的结果,并在
@@ -417,7 +422,8 @@ rtk cargo run -p orchestrator-cli --bin orchestrator-exec -- \
   Responses/Chat SSE、Reasoning、Function Call、Native Web Search 与 JSON
   Object 能力预检。该路径不创建 FileStore、不读取市场数据、不执行工具；
   报告脱敏输出到 stdout，任一能力失败时退出码为 1。只有报告通过后才可
-  发布严格 Typed Responses provider 路径。
+  发布严格 Typed Responses provider 路径。可附加 `--debug` 查看同一份
+  async-openai HTTP request/response 元数据和 typed SSE 事件。
 
 `--mock` 仅用于本地测试与开发,不能证明生产工作流或外部服务可用。`--debug` 将 MemoryOS 写入解析到 `knowledge/debug/<run-id>/`;它绝不写入规范的 Decision 或 Outcome 数据。回放与迁移夹具使用各自的命名空间,回放只通过只读读取器读取规范 Decision,且只输出回放结果。
 

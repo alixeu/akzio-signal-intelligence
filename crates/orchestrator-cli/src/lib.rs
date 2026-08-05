@@ -8,15 +8,22 @@ pub fn init_tracing() {
 }
 
 pub fn init_tracing_with_debug(debug: bool) {
-    let default_filter = if debug {
-        "orchestrator_cli=debug,orchestrator_workflow=debug,orchestrator_llm=debug,info"
+    let default_filter =
+        "orchestrator_cli=debug,orchestrator_workflow=debug,orchestrator_llm=debug,orchestrator_llm::http=debug,info";
+    let configured_filter = std::env::var("RUST_LOG").ok();
+    let filter = if debug {
+        // `--debug` must remain useful even when the shell exports a coarse
+        // `RUST_LOG=warn`; append the debug targets instead of letting that
+        // environment value hide the request/response diagnostics.
+        configured_filter
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| format!("{value},{default_filter}"))
+            .unwrap_or_else(|| default_filter.to_owned())
     } else {
-        "info"
+        configured_filter.unwrap_or_else(|| "info".to_owned())
     };
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_filter)),
-        )
-        .try_init();
+    let fallback_filter = if debug { default_filter } else { "info" };
+    let filter = tracing_subscriber::EnvFilter::try_new(filter)
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(fallback_filter));
+    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
 }

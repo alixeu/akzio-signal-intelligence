@@ -76,7 +76,7 @@ pub struct ExecArgs {
     pub jin10_refresh_lookback_hours: f64,
     #[arg(long)]
     pub mock: bool,
-    /// Write inspectable LLM and local reducer records below outputs/debug/.
+    /// Write timing/token metrics and Rust-owned phase/reducer records below outputs/debug.
     #[arg(long)]
     pub debug: bool,
     /// Validate the configured provider capabilities without creating a

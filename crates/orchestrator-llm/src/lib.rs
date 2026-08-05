@@ -1,6 +1,6 @@
 use agent_loop::{
     AgentLoopConfig, AgentLoopModel, ModelEventHandler, ModelStreamEvent, ModelStreamResult,
-    ProjectToolRuntime, RetrievalPolicy, ToolCallRequest, ToolResultItem, Turn,
+    ProjectToolRuntime, RetrievalPolicy, ToolCallRequest, Turn,
 };
 use anyhow::{bail, Context, Result};
 use futures::StreamExt;
@@ -13,7 +13,7 @@ use std::{
     path::{Component, Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
 };
-use tracing::debug;
+use tracing::{debug, enabled, Level};
 use truncation::TruncationConfig;
 use uuid::Uuid;
 use web_search::{
@@ -44,6 +44,16 @@ pub const VERIFIED_PHASE1_EVIDENCE_RECORDS_MARKER: &str =
 pub enum LlmRoute {
     Responses,
     ChatCompletions,
+}
+
+/// Build the same typed async-openai transport used by the runtime for the
+/// isolated provider contract probes.  The contract path still owns its own
+/// requests and never creates a FileStore or workflow runtime.
+pub fn build_provider_contract_client(
+    base_url: &str,
+    api_key: &str,
+) -> Result<async_openai::Client<async_openai::config::OpenAIConfig>> {
+    providers::openai_compatible_contract_client(base_url, api_key)
 }
 
 #[derive(Debug)]
@@ -253,18 +263,8 @@ impl RoleLlmSettings {
 pub struct AgentSettings {
     pub role: String,
     pub phase: Option<i64>,
-    /// Optional topic identifier retained on every debug record.
+    /// Optional topic identifier retained on timing and token metrics.
     pub topic_id: Option<String>,
-    /// Prompt source path relative to the project root, used to mirror debug output.
-    pub debug_prompt_path: Option<PathBuf>,
-    /// Optional debug output path relative to the project root for non-standard layouts.
-    pub debug_output_path: Option<PathBuf>,
-    /// Optional role-specific round number retained on every debug record.
-    pub debug_round: Option<usize>,
-    /// Rust-owned active FileStore turn identity. This is assigned immediately
-    /// before the model is invoked so every raw Debug request can be joined to
-    /// its immutable session transcript without guessing from timestamps.
-    pub debug_turn_id: Option<String>,
     pub tickers: Vec<String>,
     /// Rust-owned role identity used to scope reads and Summary compilation.
     pub tool_managed_profile: ToolManagedProfile,
@@ -405,12 +405,7 @@ pub async fn run_agent_loop_with_metrics(
     if let Some(web_run) = web_run_runtime_for_settings(settings) {
         tools = tools.with_web_run_runtime(web_run);
     }
-    // The model writes raw request/response Debug records while `run_turn` is
-    // active. Bind the generated turn ID before constructing it; otherwise a
-    // record has only a session and cannot prove which retry/fork created it.
-    let mut debug_settings = settings.clone();
-    debug_settings.debug_turn_id = Some(turn.turn_id.clone());
-    let mut model = AgentLoopModel::new(debug_settings.clone());
+    let mut model = AgentLoopModel::new(settings.clone());
     let metrics = agent_loop::run_turn(
         session,
         &mut turn,
@@ -420,9 +415,6 @@ pub async fn run_agent_loop_with_metrics(
     )
     .await?;
     let terminal_tool_result = turn.terminal_tool_result.clone();
-    if let Some(terminal) = terminal_tool_result.as_ref() {
-        finalize_debug_llm_record(&debug_settings, terminal)?;
-    }
     let artifact = completed_turn_artifact(&turn)?;
     Ok(AgentLoopOutput {
         artifact,
@@ -565,11 +557,7 @@ pub async fn run_agent_fork_loop_with_metrics(
     if let Some(web_run) = web_run_runtime_for_settings(settings) {
         tools = tools.with_web_run_runtime(web_run);
     }
-    // Forked debate turns use a deterministic caller-provided ID. Preserve it
-    // on the raw Debug request so sibling rounds cannot be conflated.
-    let mut debug_settings = settings.clone();
-    debug_settings.debug_turn_id = Some(turn.turn_id.clone());
-    let mut model = AgentLoopModel::new(debug_settings.clone());
+    let mut model = AgentLoopModel::new(settings.clone());
     let metrics = agent_loop::run_turn(
         session,
         &mut turn,
@@ -579,9 +567,6 @@ pub async fn run_agent_fork_loop_with_metrics(
     )
     .await?;
     let terminal_tool_result = turn.terminal_tool_result.clone();
-    if let Some(terminal) = terminal_tool_result.as_ref() {
-        finalize_debug_llm_record(&debug_settings, terminal)?;
-    }
     let artifact = completed_turn_artifact(&turn)?;
     Ok(AgentLoopOutput {
         artifact,
@@ -1113,161 +1098,6 @@ fn prepare_fork_turn_input(
     }
 }
 
-pub fn append_debug_llm_record(settings: &AgentSettings, record: Value) -> Result<()> {
-    if !settings.debug {
-        return Ok(());
-    }
-    let root = settings
-        .tools
-        .as_ref()
-        .map(|tools| tools.project_root.clone())
-        .unwrap_or_else(default_project_root);
-    let prompt_path = settings.debug_prompt_path.as_deref().ok_or_else(|| {
-        anyhow::anyhow!(
-            "debug LLM record for role {:?} requires debug_prompt_path",
-            settings.role
-        )
-    })?;
-    let output_path = settings
-        .debug_output_path
-        .as_deref()
-        .map(validate_debug_output_relative_path)
-        .transpose()?
-        .unwrap_or(debug_record_relative_path_from_prompt(prompt_path)?);
-
-    let mut record = record;
-    if let Some(object) = record.as_object_mut() {
-        let session_manifest = settings.session_runtime.manifest();
-        let session_id = session_manifest.session_id.clone();
-        let run_id = session_manifest.run_id.clone();
-        let prompt_content_hash = fs::read(root.join(prompt_path))
-            .map(|bytes| orchestrator_store::content_hash_bytes(&bytes))
-            .with_context(|| {
-                format!(
-                    "failed to hash debug prompt {} for role {:?}",
-                    root.join(prompt_path).display(),
-                    settings.role
-                )
-            })?;
-        object.entry("role").or_insert_with(|| json!(settings.role));
-        object
-            .entry("phase")
-            .or_insert_with(|| json!(settings.phase));
-        object
-            .entry("topic_id")
-            .or_insert_with(|| json!(settings.topic_id));
-        object
-            .entry("round")
-            .or_insert_with(|| json!(settings.debug_round));
-        object
-            .entry("session_id")
-            .or_insert_with(|| json!(session_id));
-        object.entry("run_id").or_insert_with(|| json!(run_id));
-        object
-            .entry("turn_id")
-            .or_insert_with(|| json!(settings.debug_turn_id));
-        object
-            .entry("prompt_content_hash")
-            .or_insert_with(|| json!(prompt_content_hash));
-        object
-            .entry("profile")
-            .or_insert_with(|| json!(settings.tool_managed_profile.as_str()));
-        object.entry("unit_key").or_insert_with(|| {
-            json!(format!(
-                "p{}:{}:{}:{}:{}",
-                settings.phase.unwrap_or_default(),
-                settings.tool_managed_profile.as_str(),
-                settings.role,
-                settings.topic_id.as_deref().unwrap_or("aggregate"),
-                settings
-                    .debug_round
-                    .map_or_else(|| "none".to_owned(), |round| round.to_string())
-            ))
-        });
-    }
-    if uses_aggregated_phase2_debug_records(&output_path) {
-        return append_debug_output_history(
-            &root,
-            &output_path,
-            &prompt_path.to_string_lossy(),
-            &record,
-        );
-    }
-    append_debug_output_history(
-        &root,
-        &debug_output_history_relative_path(&output_path)?,
-        &prompt_path.to_string_lossy(),
-        &record,
-    )?;
-    append_debug_output_record(&root, &output_path, &prompt_path.to_string_lossy(), record)
-}
-
-/// Mark the current (and only) debug request as terminal after its terminal
-/// tool has executed. The request itself remains the last model request.
-pub fn finalize_debug_llm_record(
-    settings: &AgentSettings,
-    terminal: &ToolResultItem,
-) -> Result<()> {
-    if !settings.debug {
-        return Ok(());
-    }
-    let root = debug_project_root(settings);
-    let prompt_path = settings.debug_prompt_path.as_deref().ok_or_else(|| {
-        anyhow::anyhow!(
-            "debug LLM record for role {:?} requires debug_prompt_path",
-            settings.role
-        )
-    })?;
-    let output_path = settings
-        .debug_output_path
-        .as_deref()
-        .map(validate_debug_output_relative_path)
-        .transpose()?
-        .unwrap_or(debug_record_relative_path_from_prompt(prompt_path)?);
-    let path = root.join(&output_path);
-    let prompt_path = prompt_path.to_string_lossy().into_owned();
-
-    with_debug_output_lock(|| {
-        let contents = fs::read_to_string(&path)
-            .with_context(|| format!("failed to read debug LLM record {}", path.display()))?;
-        let mut record: Value = serde_json::from_str(&contents)
-            .with_context(|| format!("debug LLM record {} must be JSON", path.display()))?;
-        if record.get("prompt_path").and_then(Value::as_str) != Some(prompt_path.as_str()) {
-            bail!("debug LLM record prompt path does not match current role");
-        }
-        let object = record
-            .as_object_mut()
-            .context("debug LLM record must be a JSON object")?;
-        let object = if uses_aggregated_phase2_debug_records(&output_path) {
-            object
-                .get_mut("records")
-                .and_then(Value::as_array_mut)
-                .and_then(|records| records.last_mut())
-                .and_then(Value::as_object_mut)
-                .context("aggregated Phase 2 debug record must contain a latest object")?
-        } else {
-            object
-        };
-        object.insert("end_turn".to_owned(), Value::Bool(true));
-        let response = object.entry("resp").or_insert_with(|| json!({}));
-        let response = response
-            .as_object_mut()
-            .context("debug LLM record resp must be a JSON object")?;
-        response.insert("status".to_owned(), json!(terminal.status));
-        response.insert(
-            "terminal".to_owned(),
-            json!({
-                "call_id": terminal.call_id,
-                "name": terminal.name,
-                "status": terminal.status,
-                "error": terminal.error,
-            }),
-        );
-        fs::write(&path, serde_json::to_string_pretty(&record)?)
-            .with_context(|| format!("failed to update debug LLM record {}", path.display()))
-    })
-}
-
 /// Append one timing record to the formatted `outputs/debug/time.json` array.
 pub fn append_debug_time_record(project_root: &std::path::Path, record: Value) -> Result<()> {
     append_debug_json_record(project_root, "outputs/debug/time.json", record)
@@ -1348,42 +1178,6 @@ fn with_debug_output_lock<T>(write: impl FnOnce() -> Result<T>) -> Result<T> {
     write()
 }
 
-/// Resolve the prompt-mirrored JSON debug output path.
-///
-/// `prompts/phase1/news_macro.md` becomes `outputs/debug/phase1/news_macro.json`.
-pub fn debug_record_relative_path_from_prompt(prompt_path: &Path) -> Result<PathBuf> {
-    let mut components = prompt_path.components();
-    if components.next() != Some(Component::Normal("prompts".as_ref()))
-        || components.clone().any(|component| {
-            matches!(
-                component,
-                Component::ParentDir | Component::RootDir | Component::Prefix(_)
-            )
-        })
-    {
-        bail!(
-            "debug prompt path must be a relative path under prompts/: {}",
-            prompt_path.display()
-        );
-    }
-    if prompt_path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        != Some("md")
-    {
-        bail!(
-            "debug prompt path must name a .md file: {}",
-            prompt_path.display()
-        );
-    }
-    let relative = prompt_path
-        .strip_prefix("prompts")
-        .expect("checked prompts path prefix");
-    Ok(PathBuf::from("outputs/debug")
-        .join(relative)
-        .with_extension("json"))
-}
-
 fn validate_debug_output_relative_path(path: &Path) -> Result<PathBuf> {
     if path.is_absolute()
         || path.components().any(|component| {
@@ -1401,7 +1195,7 @@ fn validate_debug_output_relative_path(path: &Path) -> Result<PathBuf> {
     Ok(path.to_path_buf())
 }
 
-/// Write the latest workflow-local or runtime debug request/response record.
+/// Write the latest workflow-local or runtime debug record.
 ///
 /// `relative_output_path` is relative to the project root, typically below
 /// `outputs/debug/`; `source_label` identifies a non-prompt producer such as `runtime`.
@@ -1422,21 +1216,6 @@ pub fn append_debug_output_record(
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create debug dir {}", parent.display()))?;
         }
-        if phase2_latest_debug_path(&relative_output_path) && path.exists() {
-            let previous: Value = serde_json::from_str(
-                &fs::read_to_string(&path)
-                    .with_context(|| format!("failed to read debug record {}", path.display()))?,
-            )
-            .with_context(|| format!("debug record {} must be JSON", path.display()))?;
-            if previous.get("end_turn").and_then(Value::as_bool) == Some(true)
-                && record.get("end_turn").and_then(Value::as_bool) != Some(true)
-            {
-                // Keep the last completed request in the compatibility file.
-                // The in-progress follow-up is still preserved in the adjacent
-                // `.iterations.json` history by append_debug_llm_record.
-                return Ok(());
-            }
-        }
         let mut output = record;
         let object = output.as_object_mut().ok_or_else(|| {
             anyhow::anyhow!("debug record {} must be a JSON object", path.display())
@@ -1456,100 +1235,6 @@ pub fn append_debug_output_record(
         fs::write(&path, serde_json::to_string_pretty(&output)?)
             .with_context(|| format!("failed to write debug record {}", path.display()))
     })
-}
-
-fn phase2_latest_debug_path(relative_output_path: &Path) -> bool {
-    let in_phase2 = relative_output_path
-        .components()
-        .any(|component| component.as_os_str() == "phase2");
-    in_phase2
-        && matches!(
-            relative_output_path
-                .file_name()
-                .and_then(|name| name.to_str()),
-            Some("phase2-warmup-shared.json")
-                | Some("topic-generator.json")
-                | Some("phase2_summary.json")
-        )
-}
-
-/// Keep the full sequence of requests beside the compatibility file that
-/// exposes the latest request. This is essential for inspecting multi-turn
-/// Phase 2 debates without making existing debug consumers parse a new shape.
-fn append_debug_output_history(
-    project_root: &Path,
-    relative_history_path: &Path,
-    source_label: &str,
-    record: &Value,
-) -> Result<()> {
-    let relative_history_path = validate_debug_output_relative_path(relative_history_path)?;
-    let source_label = source_label.trim();
-    if source_label.is_empty() {
-        bail!("debug source label must not be empty");
-    }
-    let history_path = project_root.join(relative_history_path);
-    with_debug_output_lock(|| {
-        if let Some(parent) = history_path.parent() {
-            fs::create_dir_all(parent).with_context(|| {
-                format!("failed to create debug history dir {}", parent.display())
-            })?;
-        }
-        let mut history = match fs::read_to_string(&history_path) {
-            Ok(contents) => serde_json::from_str(&contents).with_context(|| {
-                format!("failed to parse debug history {}", history_path.display())
-            })?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                json!({"prompt_path": source_label, "records": []})
-            }
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("failed to read debug history {}", history_path.display())
-                })
-            }
-        };
-        let object = history.as_object_mut().ok_or_else(|| {
-            anyhow::anyhow!(
-                "debug history {} must be a JSON object",
-                history_path.display()
-            )
-        })?;
-        if object
-            .get("prompt_path")
-            .is_some_and(|value| value.as_str() != Some(source_label))
-        {
-            bail!(
-                "debug history {} has prompt_path {:?}, expected {:?}",
-                history_path.display(),
-                object.get("prompt_path"),
-                source_label
-            );
-        }
-        object.insert("prompt_path".to_owned(), json!(source_label));
-        object
-            .entry("records")
-            .or_insert_with(|| json!([]))
-            .as_array_mut()
-            .context("debug history records must be an array")?
-            .push(record.clone());
-        fs::write(&history_path, serde_json::to_string_pretty(&history)?)
-            .with_context(|| format!("failed to write debug history {}", history_path.display()))
-    })
-}
-
-fn debug_output_history_relative_path(relative_output_path: &Path) -> Result<PathBuf> {
-    let file_name = relative_output_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .context("debug output path must have a UTF-8 file name")?;
-    let history_name = file_name
-        .strip_suffix(".json")
-        .map(|stem| format!("{stem}.iterations.json"))
-        .context("debug output history requires a .json output path")?;
-    Ok(relative_output_path.with_file_name(history_name))
-}
-
-fn uses_aggregated_phase2_debug_records(_relative_output_path: &Path) -> bool {
-    false
 }
 
 fn web_run_runtime(config: &WebSearchConfig) -> Option<tools::WebRunRuntime> {
@@ -1674,6 +1359,22 @@ pub async fn run_model_event_stream(
     }
 }
 
+const HTTP_TRACE_TARGET: &str = "orchestrator_llm::http";
+
+fn log_typed_provider_payload<T: Serialize>(role: &str, route: &str, direction: &str, payload: &T) {
+    if !enabled!(target: HTTP_TRACE_TARGET, Level::DEBUG) {
+        return;
+    }
+    debug!(
+        target: HTTP_TRACE_TARGET,
+        role,
+        route,
+        direction,
+        payload = %providers::debug_typed_payload(payload),
+        "async-openai typed provider payload"
+    );
+}
+
 async fn run_responses_text_once(
     settings: &AgentSettings,
     input: &agent_loop::ModelInput,
@@ -1689,6 +1390,7 @@ async fn run_responses_text_once(
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))
         .context("OpenAI-compatible Responses prompt failed")?;
+    log_typed_provider_payload(&settings.role, "responses", "response", &response);
     let text = response.output_text().unwrap_or_default();
     debug!(
         role = %settings.role,
@@ -1714,6 +1416,7 @@ async fn run_chat_completions_text_once(
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))
         .context("OpenAI-compatible Chat Completions prompt failed")?;
+    log_typed_provider_payload(&settings.role, "chat_completions", "response", &response);
     let text = response
         .choices
         .first()
@@ -2327,6 +2030,7 @@ async fn stream_responses_once(
                 // Any successfully decoded provider event makes replay
                 // unsafe, even if no text/tool side effect was emitted yet.
                 replay_state = ReplayState::ProviderEventObserved;
+                log_typed_provider_payload(&settings.role, "responses", "sse_event", &event);
                 event
             }
             Err(error) => {
@@ -2739,6 +2443,7 @@ async fn stream_chat_completions_once(
                 // A successfully decoded provider chunk is enough to make
                 // replay unsafe, even before text or a tool call is emitted.
                 made_progress = true;
+                log_typed_provider_payload(&settings.role, "chat_completions", "sse_chunk", &ev);
                 ev
             }
             Err(async_openai::error::OpenAIError::JSONDeserialize(err, _))
@@ -3253,12 +2958,12 @@ mod tests {
     use super::{
         agent_loop, is_recoverable_length_finish, merge_chat_tool_call_delta, tools, AgentSettings,
         LlmRoute, LlmTransport, PendingChatToolCall, RoleLlmSettings, ToolManagedProfile,
-        ToolResultItem, TruncationConfig,
+        TruncationConfig,
     };
     use crate::web_search::{WebSearchConfig, WebSearchMode};
     use orchestrator_store::{FileStore, FileStoreOptions, RunLocation};
     use serde_json::{json, Value};
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
 
     #[test]
     fn length_finish_is_recoverable_only_for_plain_text_without_pending_tools() {
@@ -3361,10 +3066,6 @@ mod tests {
             role: "manager.research".to_string(),
             phase: None,
             topic_id: None,
-            debug_prompt_path: None,
-            debug_output_path: None,
-            debug_round: None,
-            debug_turn_id: None,
             tickers: vec!["TQQQ".to_string()],
             tool_managed_profile: ToolManagedProfile::ResearchDecision,
             session_runtime: test_session_runtime(),
@@ -3413,12 +3114,6 @@ mod tests {
             },
         )
         .unwrap()
-    }
-
-    fn write_debug_prompt_fixture(root: &Path, prompt_path: &str) {
-        let path = root.join(prompt_path);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, "frozen prompt fixture").unwrap();
     }
 
     #[test]
@@ -3913,289 +3608,6 @@ mod tests {
     }
 
     #[test]
-    fn append_debug_llm_record_keeps_only_the_latest_request_and_response() {
-        let temp = tempfile::tempdir().unwrap();
-        let mut settings = base_settings(LlmRoute::Responses);
-        settings.debug = true;
-        settings.phase = Some(1);
-        settings.role = "analyst.technical".to_string();
-        settings.debug_prompt_path = Some(PathBuf::from("prompts/phase1/technical.md"));
-        settings.debug_turn_id = Some("turn-debug-proof".to_owned());
-        std::fs::create_dir_all(temp.path().join("prompts/phase1")).unwrap();
-        std::fs::write(
-            temp.path().join("prompts/phase1/technical.md"),
-            "frozen prompt fixture",
-        )
-        .unwrap();
-        settings.tools = Some(tools::ExternalToolConfig {
-            project_root: temp.path().to_path_buf(),
-            run_id: None,
-            phase: None,
-            phase_summary_page_limit: 20,
-            phase_summary_detail_page_limit: 20,
-            tickers: vec!["TQQQ".to_string()],
-            alpaca_market_data: false,
-            alpaca_api_key: None,
-            alpaca_api_secret: None,
-            file_store_input: None,
-            file_store_reflection_source: None,
-            phase2_context: None,
-        });
-
-        super::append_debug_llm_record(
-            &settings,
-            json!({
-                "kind": "generate",
-                "req": { "messages": [{"role": "user", "content": "hello"}] },
-                "resp": { "status": "completed", "output": [{"type": "output_text", "text": "world"}] },
-                "elapsed_ms": 50,
-                "token": null,
-            }),
-        )
-        .unwrap();
-        super::append_debug_llm_record(
-            &settings,
-            json!({
-                "kind": "stream",
-                "req": { "messages": [{"role": "user", "content": "again"}] },
-                "resp": { "id": "resp_1", "status": "completed" },
-                "elapsed_ms": 120,
-                "token": { "input_tokens": 10, "output_tokens": 5, "total_tokens": 15 },
-            }),
-        )
-        .unwrap();
-
-        let path = temp.path().join("outputs/debug/phase1/technical.json");
-        let contents = std::fs::read_to_string(&path).unwrap();
-        let output: Value = serde_json::from_str(&contents).unwrap();
-        assert_eq!(output["prompt_path"], "prompts/phase1/technical.md");
-        assert_eq!(output["kind"], "stream");
-        assert_eq!(output["req"]["messages"][0]["content"], "again");
-        assert_eq!(output["resp"]["id"], "resp_1");
-        assert_eq!(output["run_id"], "run-test");
-        assert_eq!(output["session_id"], "session-test");
-        assert_eq!(output["turn_id"], "turn-debug-proof");
-        assert_eq!(
-            output["prompt_content_hash"],
-            orchestrator_store::content_hash_bytes(b"frozen prompt fixture")
-        );
-        assert!(output.get("elapsed_ms").is_some());
-        assert!(output.get("token").is_some());
-        assert!(output.get("records").is_none());
-        let history: Value = serde_json::from_str(
-            &std::fs::read_to_string(
-                temp.path()
-                    .join("outputs/debug/phase1/technical.iterations.json"),
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(history["prompt_path"], "prompts/phase1/technical.md");
-        assert_eq!(history["records"].as_array().unwrap().len(), 2);
-        assert_eq!(
-            history["records"][0]["req"]["messages"][0]["content"],
-            "hello"
-        );
-        assert_eq!(
-            history["records"][1]["req"]["messages"][0]["content"],
-            "again"
-        );
-        assert!(!temp
-            .path()
-            .join("outputs/debug/phase1/technical.jsonl")
-            .exists());
-    }
-
-    #[test]
-    fn phase2_debate_debug_file_appends_rounds_in_place() {
-        let temp = tempfile::tempdir().unwrap();
-        let mut settings = base_settings(LlmRoute::Responses);
-        settings.debug = true;
-        settings.phase = Some(2);
-        settings.role = "researcher.bull.initial".to_string();
-        settings.topic_id = Some("topic-a".to_string());
-        settings.debug_round = Some(0);
-        settings.debug_prompt_path = Some(PathBuf::from("prompts/phase2/researcher/debate.md"));
-        write_debug_prompt_fixture(temp.path(), "prompts/phase2/researcher/debate.md");
-        settings.debug_output_path = Some(PathBuf::from(
-            "outputs/debug/phase2/topic-a/debate-bull.json",
-        ));
-        settings.tools = Some(tools::ExternalToolConfig {
-            project_root: temp.path().to_path_buf(),
-            run_id: None,
-            phase: None,
-            phase_summary_page_limit: 20,
-            phase_summary_detail_page_limit: 20,
-            tickers: vec!["TQQQ".to_string()],
-            alpaca_market_data: false,
-            alpaca_api_key: None,
-            alpaca_api_secret: None,
-            file_store_input: None,
-            file_store_reflection_source: None,
-            phase2_context: None,
-        });
-
-        super::append_debug_llm_record(
-            &settings,
-            json!({"req": {"messages": [{"content": "round 0"}]}, "resp": {}}),
-        )
-        .unwrap();
-        settings.role = "researcher.bull".to_string();
-        settings.debug_round = Some(1);
-        super::append_debug_llm_record(
-            &settings,
-            json!({"req": {"messages": [{"content": "round 1"}]}, "resp": {}}),
-        )
-        .unwrap();
-        super::finalize_debug_llm_record(
-            &settings,
-            &ToolResultItem {
-                call_id: "call-round-1".to_string(),
-                name: "submit_terminal_result".to_string(),
-                status: "completed".to_string(),
-                output: Value::Null,
-                error: None,
-            },
-        )
-        .unwrap();
-
-        let path = temp
-            .path()
-            .join("outputs/debug/phase2/topic-a/debate-bull.json");
-        let output: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert!(output.get("records").is_none());
-        assert_eq!(output["round"], 1);
-        assert_eq!(output["role"], "researcher.bull");
-        assert_eq!(output["end_turn"], true);
-        assert_eq!(output["resp"]["terminal"]["call_id"], "call-round-1");
-        assert!(path.with_file_name("debate-bull.iterations.json").exists());
-    }
-
-    #[test]
-    fn finalize_debug_llm_record_updates_the_latest_request_in_place() {
-        let temp = tempfile::tempdir().unwrap();
-        let mut settings = base_settings(LlmRoute::Responses);
-        settings.debug = true;
-        settings.phase = Some(1);
-        settings.role = "analyst.technical".to_string();
-        settings.debug_prompt_path = Some(PathBuf::from("prompts/phase1/technical.md"));
-        write_debug_prompt_fixture(temp.path(), "prompts/phase1/technical.md");
-        settings.tools = Some(tools::ExternalToolConfig {
-            project_root: temp.path().to_path_buf(),
-            run_id: None,
-            phase: None,
-            phase_summary_page_limit: 20,
-            phase_summary_detail_page_limit: 20,
-            tickers: vec!["TQQQ".to_string()],
-            alpaca_market_data: false,
-            alpaca_api_key: None,
-            alpaca_api_secret: None,
-            file_store_input: None,
-            file_store_reflection_source: None,
-            phase2_context: None,
-        });
-        super::append_debug_llm_record(
-            &settings,
-            json!({
-                "kind": "stream",
-                "end_turn": false,
-                "req": { "messages": [{"role": "user", "content": "last request"}] },
-                "resp": { "status": "in_progress" }
-            }),
-        )
-        .unwrap();
-        super::finalize_debug_llm_record(
-            &settings,
-            &ToolResultItem {
-                call_id: "call-final".to_owned(),
-                name: "submit_terminal_result".to_owned(),
-                status: "completed".to_owned(),
-                output: Value::Null,
-                error: None,
-            },
-        )
-        .unwrap();
-
-        let path = temp.path().join("outputs/debug/phase1/technical.json");
-        let output: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
-        assert_eq!(output["req"]["messages"][0]["content"], "last request");
-        assert_eq!(output["end_turn"], true);
-        assert_eq!(output["resp"]["status"], "completed");
-        assert_eq!(output["resp"]["terminal"]["call_id"], "call-final");
-        assert!(output.get("records").is_none());
-    }
-
-    #[test]
-    fn phase2_latest_debug_file_keeps_completed_record_when_follow_up_is_in_progress() {
-        let temp = tempfile::tempdir().unwrap();
-        let mut settings = base_settings(LlmRoute::Responses);
-        settings.debug = true;
-        settings.phase = Some(2);
-        settings.role = "mediator.topic".to_string();
-        settings.debug_prompt_path = Some(PathBuf::from("prompts/phase2/topic_generator.md"));
-        write_debug_prompt_fixture(temp.path(), "prompts/phase2/topic_generator.md");
-        settings.debug_output_path =
-            Some(PathBuf::from("outputs/debug/phase2/topic-generator.json"));
-        settings.tools = Some(tools::ExternalToolConfig {
-            project_root: temp.path().to_path_buf(),
-            run_id: None,
-            phase: None,
-            phase_summary_page_limit: 20,
-            phase_summary_detail_page_limit: 20,
-            tickers: vec!["QQQ".to_string()],
-            alpaca_market_data: false,
-            alpaca_api_key: None,
-            alpaca_api_secret: None,
-            file_store_input: None,
-            file_store_reflection_source: None,
-            phase2_context: None,
-        });
-
-        super::append_debug_llm_record(
-            &settings,
-            json!({
-                "kind": "stream",
-                "end_turn": true,
-                "response_text": "completed debate checkpoint",
-                "resp": {"status": "completed"}
-            }),
-        )
-        .unwrap();
-        super::append_debug_llm_record(
-            &settings,
-            json!({
-                "kind": "stream",
-                "end_turn": false,
-                "response_text": "follow-up still in progress",
-                "resp": {"status": "in_progress"}
-            }),
-        )
-        .unwrap();
-
-        let latest: Value = serde_json::from_str(
-            &std::fs::read_to_string(
-                temp.path()
-                    .join("outputs/debug/phase2/topic-generator.json"),
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(latest["end_turn"], true);
-        assert_eq!(latest["response_text"], "completed debate checkpoint");
-
-        let history: Value = serde_json::from_str(
-            &std::fs::read_to_string(
-                temp.path()
-                    .join("outputs/debug/phase2/topic-generator.iterations.json"),
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(history["records"].as_array().unwrap().len(), 2);
-        assert_eq!(history["records"][1]["end_turn"], false);
-    }
-
-    #[test]
     fn append_debug_output_record_serializes_concurrent_latest_writes() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().to_path_buf();
@@ -4207,7 +3619,7 @@ mod tests {
                     &root,
                     Path::new("outputs/debug/phase0/runtime.json"),
                     "runtime",
-                    json!({"req": {"id": id}, "resp": {"status": "derived"}}),
+                    json!({"kind": "runtime", "id": id, "status": "derived"}),
                 )
             }));
         }
@@ -4221,8 +3633,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(output["prompt_path"], "runtime");
-        assert!(output["req"]["id"].as_u64().is_some_and(|id| id < 8));
-        assert_eq!(output["resp"]["status"], "derived");
+        assert!(output["id"].as_u64().is_some_and(|id| id < 8));
+        assert_eq!(output["status"], "derived");
         assert!(output.get("records").is_none());
     }
 
@@ -4274,33 +3686,6 @@ mod tests {
         assert_eq!(token_records.len(), 1);
         assert_eq!(token_records[0]["total_tokens"], 14);
         assert!(token_records[0].get("ts_ms").is_some());
-    }
-
-    #[test]
-    fn debug_record_path_mirrors_prompt_hierarchy() {
-        let path = super::debug_record_relative_path_from_prompt(Path::new(
-            "prompts/phase2/researcher/debate.md",
-        ))
-        .unwrap();
-        assert_eq!(
-            path,
-            PathBuf::from("outputs/debug/phase2/researcher/debate.json")
-        );
-        assert_eq!(
-            super::debug_record_relative_path_from_prompt(Path::new(
-                "prompts/phase1/news_macro.md"
-            ))
-            .unwrap(),
-            PathBuf::from("outputs/debug/phase1/news_macro.json")
-        );
-        assert!(
-            super::debug_record_relative_path_from_prompt(Path::new("phase1/news_macro.md"))
-                .is_err()
-        );
-        assert!(
-            super::debug_record_relative_path_from_prompt(Path::new("prompts/../outside.md"))
-                .is_err()
-        );
     }
 
     #[test]
