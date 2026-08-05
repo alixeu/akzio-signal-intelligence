@@ -406,8 +406,10 @@ rtk cargo run -p orchestrator-cli --bin orchestrator-exec -- \
 - `--debug`:将工作流、agent 循环和 `async-openai` HTTP 调试日志打印到控制台，
   包括脱敏后的 request JSON、response 状态/headers、耗时、请求指纹以及 typed
   Responses/Chat SSE 事件。旧的 LLM 请求/响应投影已删除；`outputs/debug/` 只保留
-  Rust-owned 的阶段/Reducer 记录以及耗时、token 指标。Authorization、API key、Cookie
-  不会打印；SSE body 由 SDK 流继续消费，不在 HTTP middleware 中读取。Phase 7 同时在控制台输出订单计划和
+  `phaseN/<role>.jsonl` 中的上述 async-openai 日志，例如
+  `outputs/debug/phase1/news_macro.jsonl`、`technical.jsonl`；Rust-owned 阶段/Reducer
+  记录以及耗时、token 指标仍按既有目录保存。Authorization、API key、Cookie 不会打印；
+  SSE body 由 SDK 流继续消费，不在 HTTP middleware 中读取。Phase 7 同时在控制台输出订单计划和
   模拟执行结果,固定为 10,000 美元、零仓位且不访问 Alpaca。运行 ID 不含日期或
   配置哈希，例如 `QQQ/SOXX/VIX` 固定为 `qqq-soxx-vix-debug`，所以
   `--debug --from-phase X --to-phase X` 会重开同一份 Index、会话与状态。若只需要

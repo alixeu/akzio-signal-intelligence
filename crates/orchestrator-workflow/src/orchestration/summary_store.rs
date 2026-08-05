@@ -88,18 +88,93 @@ pub(crate) fn parse_phase_index_candidate(text: &str) -> Result<PhaseIndexCandid
     let text = text.trim();
     let candidate = match serde_json::from_str(text) {
         Ok(candidate) => candidate,
-        Err(_) => {
-            let start = text
-                .find('{')
-                .context("Summary response contains no JSON object")?;
-            let end = text
-                .rfind('}')
-                .context("Summary response contains no complete JSON object")?;
-            serde_json::from_str(&text[start..=end])?
-        }
+        Err(_) => parse_candidate_with_recoverable_suffix(text)?,
     };
     validate_phase_index_candidate(&candidate)?;
     Ok(candidate)
+}
+
+/// Parse a Summary object when a provider closes the outer object before
+/// emitting the remaining top-level fields, or emits a second JSON object.
+///
+/// This is deliberately narrow: only valid JSON objects are accepted and
+/// duplicate fields must be byte-for-byte equivalent. We never discard a
+/// trailing fragment or silently choose between conflicting values.
+fn parse_candidate_with_recoverable_suffix(text: &str) -> Result<PhaseIndexCandidate> {
+    let start = text
+        .find('{')
+        .context("Summary response contains no JSON object")?;
+    let json_text = &text[start..];
+    let mut stream = serde_json::Deserializer::from_str(json_text).into_iter::<Value>();
+    let first = stream
+        .next()
+        .transpose()
+        .context("Summary response contains no complete JSON object")?
+        .context("Summary response contains no complete JSON object")?;
+    let consumed = stream.byte_offset();
+    let mut fields = first
+        .as_object()
+        .cloned()
+        .context("Summary response JSON root must be an object")?;
+    let suffix = json_text[consumed..].trim();
+
+    if !suffix.is_empty() {
+        let supplemental = parse_candidate_suffix(suffix)?;
+        let supplemental = supplemental
+            .as_object()
+            .cloned()
+            .context("Summary response trailing JSON must be an object")?;
+        merge_candidate_fields(&mut fields, supplemental)?;
+    }
+
+    serde_json::from_value(Value::Object(fields))
+        .context("Summary response JSON did not match the Phase Summary contract")
+}
+
+fn parse_candidate_suffix(suffix: &str) -> Result<Value> {
+    let suffix = suffix.strip_prefix(',').map_or(suffix, str::trim_start);
+    if suffix.is_empty() {
+        bail!("Summary response ended after a JSON object separator")
+    }
+
+    if suffix.starts_with('{') {
+        let mut stream = serde_json::Deserializer::from_str(suffix).into_iter::<Value>();
+        let value = stream
+            .next()
+            .transpose()
+            .context("Summary response trailing JSON could not be parsed")?
+            .context("Summary response trailing JSON is empty")?;
+        if !suffix[stream.byte_offset()..].trim().is_empty() {
+            bail!("Summary response contains non-JSON content after trailing object")
+        }
+        return Ok(value);
+    }
+
+    if suffix.starts_with('"') {
+        // A prematurely closed outer object leaves a valid JSON member list,
+        // e.g. `, "details": [...], "missing_fields": [...]}`. The final
+        // brace belongs to this reconstructed object.
+        return serde_json::from_str(&format!("{{{suffix}"))
+            .context("Summary response trailing fields could not be parsed");
+    }
+
+    bail!("Summary response contains unsupported trailing content")
+}
+
+fn merge_candidate_fields(
+    fields: &mut serde_json::Map<String, Value>,
+    supplemental: serde_json::Map<String, Value>,
+) -> Result<()> {
+    for (key, value) in supplemental {
+        if let Some(existing) = fields.get(&key) {
+            if existing != &value {
+                bail!("Summary response contains conflicting duplicate field `{key}`")
+            }
+        } else {
+            fields.insert(key, value);
+        }
+    }
+    Ok(())
 }
 
 fn validate_phase_index_candidate(candidate: &PhaseIndexCandidate) -> Result<()> {
@@ -443,6 +518,41 @@ mod tests {
         )
         .unwrap();
         assert_eq!(candidate.summary, "ok");
+    }
+
+    #[test]
+    fn candidate_parser_reassembles_premature_outer_close_without_dropping_fields() {
+        let candidate = parse_phase_index_candidate(
+            r#"{"summary":"ok","confidence":0.5,"authoritative_fields":{}},"details":[{"section":"analysis","detail":"raw","source_refs":[]}],"missing_fields":["volume"],"ambiguities":["trend"]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(candidate.details.len(), 1);
+        assert_eq!(candidate.details[0].detail, "raw");
+        assert_eq!(candidate.missing_fields, vec!["volume"]);
+        assert_eq!(candidate.ambiguities, vec!["trend"]);
+    }
+
+    #[test]
+    fn candidate_parser_merges_disjoint_json_objects() {
+        let candidate = parse_phase_index_candidate(
+            r#"{"summary":"ok","confidence":0.5,"authoritative_fields":{}} {"details":[],"missing_fields":["volume"],"ambiguities":[]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(candidate.summary, "ok");
+        assert_eq!(candidate.missing_fields, vec!["volume"]);
+    }
+
+    #[test]
+    fn candidate_parser_rejects_conflicting_duplicate_fields() {
+        let error = parse_phase_index_candidate(
+            r#"{"summary":"first","confidence":0.5,"authoritative_fields":{}} {"summary":"second"}"#,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("conflicting duplicate field `summary`"));
     }
 
     #[test]

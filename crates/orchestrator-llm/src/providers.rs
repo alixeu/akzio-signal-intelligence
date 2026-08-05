@@ -5,18 +5,22 @@ use async_openai::{
     middleware::{retry::OpenAIRetryLayer, HttpRequestFactory},
     Client as OpenAIClient,
 };
+use orchestrator_core::default_project_root;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
+    fs::{self, OpenOptions},
     future::Future,
+    io::Write,
+    path::Path,
     pin::Pin,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex, OnceLock,
     },
     task::{Context as TaskContext, Poll},
-    time::Instant,
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 use tower::Service;
 use tracing::{debug, enabled, Level};
@@ -99,7 +103,21 @@ impl Service<HttpRequestFactory> for HttpDebugService {
             let url = safe_url(request.url());
             let request_fingerprint = request_fingerprint(&request);
             let http_debug = enabled!(target: HTTP_TRACE_TARGET, Level::DEBUG);
-            let request_body = http_debug.then(|| debug_request_body(&request)).flatten();
+            let request_context = http_debug.then(|| debug_request_context(&request));
+            let phase = request_context
+                .as_ref()
+                .map(|context| context.phase.clone())
+                .unwrap_or_else(|| "phase-unknown".to_owned());
+            let role = request_context
+                .as_ref()
+                .and_then(|context| context.role.clone());
+            let profile = request_context
+                .as_ref()
+                .and_then(|context| context.profile.clone());
+            let file_stem = debug_file_stem(role.as_deref(), profile.as_deref());
+            let request_body = request_context
+                .as_ref()
+                .map(|context| context.body.as_str());
 
             if http_debug {
                 debug!(
@@ -109,8 +127,24 @@ impl Service<HttpRequestFactory> for HttpDebugService {
                     method = %method,
                     url = %url,
                     request_fingerprint = %request_fingerprint,
-                    request_body = request_body.as_deref().unwrap_or("<unavailable>"),
+                    request_body = request_body.unwrap_or("<unavailable>"),
                     "async-openai HTTP request"
+                );
+                append_file_debug_record(
+                    &phase,
+                    &file_stem,
+                    json!({
+                        "kind": "http",
+                        "phase_dir": &phase,
+                        "file_stem": &file_stem,
+                        "direction": "request",
+                        "attempt": attempt,
+                        "method": &method,
+                        "url": &url,
+                        "request_fingerprint": &request_fingerprint,
+                        "role": role.as_deref(),
+                        "request_body": request_body,
+                    }),
                 );
             }
 
@@ -136,6 +170,29 @@ impl Service<HttpRequestFactory> for HttpDebugService {
                             elapsed_ms = started.elapsed().as_millis() as u64,
                             "async-openai HTTP response headers"
                         );
+                        append_file_debug_record(
+                            &phase,
+                            &file_stem,
+                            json!({
+                                "kind": "http",
+                                "phase_dir": &phase,
+                                "file_stem": &file_stem,
+                                "direction": "response",
+                                "attempt": attempt,
+                                "method": &method,
+                                "url": &url,
+                                "request_fingerprint": &request_fingerprint,
+                                "role": role.as_deref(),
+                                "status": response.status().as_u16(),
+                                "content_type": response
+                                    .headers()
+                                    .get(reqwest::header::CONTENT_TYPE)
+                                    .and_then(|value| value.to_str().ok()),
+                                "content_length": response.content_length(),
+                                "request_id": response_request_id(response),
+                                "elapsed_ms": started.elapsed().as_millis() as u64,
+                            }),
+                        );
                     }
                 }
                 Err(_) => {
@@ -148,6 +205,23 @@ impl Service<HttpRequestFactory> for HttpDebugService {
                         request_fingerprint = %request_fingerprint,
                         elapsed_ms = started.elapsed().as_millis() as u64,
                         "async-openai HTTP transport failed"
+                    );
+                    append_file_debug_record(
+                        &phase,
+                        &file_stem,
+                        json!({
+                            "kind": "http",
+                            "phase_dir": &phase,
+                            "file_stem": &file_stem,
+                            "direction": "response",
+                            "attempt": attempt,
+                            "method": &method,
+                            "url": &url,
+                            "request_fingerprint": &request_fingerprint,
+                            "role": role.as_deref(),
+                            "status": "transport_error",
+                            "elapsed_ms": started.elapsed().as_millis() as u64,
+                        }),
                     );
                 }
             }
@@ -201,14 +275,64 @@ fn request_fingerprint(request: &reqwest::Request) -> String {
         .collect()
 }
 
-fn debug_request_body(request: &reqwest::Request) -> Option<String> {
-    let bytes = request.body()?.as_bytes()?;
+struct DebugRequestContext {
+    body: String,
+    phase: String,
+    role: Option<String>,
+    profile: Option<String>,
+}
+
+fn debug_request_context(request: &reqwest::Request) -> DebugRequestContext {
+    let Some(bytes) = request.body().and_then(reqwest::Body::as_bytes) else {
+        return DebugRequestContext {
+            body: "<unavailable>".to_owned(),
+            phase: "phase-unknown".to_owned(),
+            role: None,
+            profile: None,
+        };
+    };
     let mut value = serde_json::from_slice::<Value>(bytes)
         .unwrap_or_else(|_| json!({"raw": String::from_utf8_lossy(bytes)}));
+    let (phase, role, profile) = value
+        .get("prompt_cache_key")
+        .and_then(Value::as_str)
+        .map(parse_prompt_cache_key)
+        .unwrap_or_else(|| ("phase-unknown".to_owned(), None, None));
     redact_debug_value(&mut value);
-    Some(truncate_debug_payload(
-        serde_json::to_string(&value).unwrap_or_else(|_| "<unserializable>".to_owned()),
-    ))
+    DebugRequestContext {
+        body: truncate_debug_payload(
+            serde_json::to_string(&value).unwrap_or_else(|_| "<unserializable>".to_owned()),
+        ),
+        phase,
+        role,
+        profile,
+    }
+}
+
+fn parse_prompt_cache_key(value: &str) -> (String, Option<String>, Option<String>) {
+    let Some(value) = value.strip_prefix("akzio:p") else {
+        return ("phase-unknown".to_owned(), None, None);
+    };
+    let (phase_value, role_value) = value.split_once(':').unwrap_or((value, ""));
+    let phase = phase_value
+        .parse::<i64>()
+        .ok()
+        .filter(|phase| *phase >= 0)
+        .map(|phase| format!("phase{phase}"))
+        .unwrap_or_else(|| "phase-unknown".to_owned());
+    let role = role_value
+        .split_once(':')
+        .map(|(role, _)| role)
+        .unwrap_or(role_value)
+        .trim();
+    let role = (!role.is_empty()).then(|| role.to_owned());
+    let profile = role_value
+        .split_once(':')
+        .map(|(_, profile)| profile)
+        .map(str::trim)
+        .filter(|profile| !profile.is_empty())
+        .map(ToOwned::to_owned);
+    (phase, role, profile)
 }
 
 pub(super) fn debug_typed_payload<T: serde::Serialize>(payload: &T) -> String {
@@ -252,7 +376,7 @@ fn is_sensitive_key(key: &str) -> bool {
     )
 }
 
-fn truncate_debug_payload(payload: String) -> String {
+pub(super) fn truncate_debug_payload(payload: String) -> String {
     if payload.len() <= MAX_DEBUG_PAYLOAD_CHARS {
         return payload;
     }
@@ -262,6 +386,109 @@ fn truncate_debug_payload(payload: String) -> String {
         .collect::<String>();
     truncated.push_str("...[truncated]");
     truncated
+}
+
+static DEBUG_FILE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+pub(super) fn append_file_debug_record(phase: &str, file_stem: &str, record: Value) {
+    if let Err(error) =
+        append_file_debug_record_at(&default_project_root(), phase, file_stem, record)
+    {
+        tracing::warn!(
+            target: HTTP_TRACE_TARGET,
+            error = %error,
+            "failed to persist async-openai debug record"
+        );
+    }
+}
+
+pub(super) fn debug_phase_directory(phase: Option<i64>) -> String {
+    phase
+        .filter(|phase| *phase >= 0)
+        .map(|phase| format!("phase{phase}"))
+        .unwrap_or_else(|| "phase-unknown".to_owned())
+}
+
+pub(super) fn debug_file_stem(role: Option<&str>, profile: Option<&str>) -> String {
+    if role == Some("mediator.topic") {
+        return match profile {
+            Some("researcher_warmup") => "warmup".to_owned(),
+            Some("topic_generation") => "topic_generator".to_owned(),
+            _ => "topic".to_owned(),
+        };
+    }
+    let role = role.unwrap_or("provider");
+    let stem = role
+        .split_once('.')
+        .map(|(_, rest)| rest)
+        .unwrap_or(role)
+        .replace('.', "_");
+    sanitize_debug_file_stem(&stem)
+}
+
+fn sanitize_debug_file_stem(stem: &str) -> String {
+    let stem: String = stem
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if stem.is_empty() {
+        "provider".to_owned()
+    } else {
+        stem
+    }
+}
+
+fn append_file_debug_record_at(
+    root: &Path,
+    phase: &str,
+    file_stem: &str,
+    record: Value,
+) -> Result<()> {
+    let phase = if phase.starts_with("phase") {
+        phase
+    } else {
+        "phase-unknown"
+    };
+    let path = root
+        .join("outputs/debug")
+        .join(phase)
+        .join(format!("{}.jsonl", sanitize_debug_file_stem(file_stem)));
+    let lock = DEBUG_FILE_LOCK.get_or_init(|| Mutex::new(()));
+    let _guard = lock
+        .lock()
+        .map_err(|_| anyhow::anyhow!("async-openai debug file lock was poisoned"))?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create debug directory {}", parent.display()))?;
+    }
+    let mut record = record;
+    if let Some(object) = record.as_object_mut() {
+        object
+            .entry("ts_ms".to_owned())
+            .or_insert_with(|| json!(debug_now_ms()));
+    }
+    let mut line = serde_json::to_string(&record)?;
+    line.push('\n');
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("failed to open debug file {}", path.display()))?
+        .write_all(line.as_bytes())
+        .with_context(|| format!("failed to append debug file {}", path.display()))
+}
+
+fn debug_now_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default()
 }
 
 pub(super) fn validate_configuration(settings: &RoleLlmSettings, role: &str) -> Result<()> {
@@ -427,5 +654,57 @@ mod tests {
         let url = reqwest::Url::parse("https://gateway.example/v1/responses?api_key=secret")
             .expect("test URL should parse");
         assert_eq!(safe_url(&url), "https://gateway.example/v1/responses");
+    }
+
+    #[test]
+    fn request_context_extracts_phase_and_role_without_leaking_tokens() {
+        let request = reqwest::Client::new()
+            .post("https://gateway.example/v1/responses")
+            .json(&json!({
+                "prompt_cache_key": "akzio:p2:researcher.bull:debate",
+                "token": "secret",
+            }))
+            .build()
+            .unwrap();
+
+        let context = debug_request_context(&request);
+        assert_eq!(context.phase, "phase2");
+        assert_eq!(context.role.as_deref(), Some("researcher.bull"));
+        assert_eq!(context.profile.as_deref(), Some("debate"));
+        assert!(!context.body.contains("secret"));
+        assert!(context.body.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn file_debug_record_is_jsonl_under_the_phase_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        assert_eq!(debug_phase_directory(Some(3)), "phase3");
+        assert_eq!(debug_phase_directory(None), "phase-unknown");
+        assert_eq!(
+            debug_file_stem(Some("analyst.news_macro"), Some("analyst_report")),
+            "news_macro"
+        );
+        assert_eq!(
+            debug_file_stem(Some("mediator.topic"), Some("researcher_warmup")),
+            "warmup"
+        );
+        append_file_debug_record_at(
+            temp.path(),
+            "phase3",
+            "news_macro",
+            json!({"kind": "typed_provider_payload", "direction": "response"}),
+        )
+        .unwrap();
+
+        let path = temp.path().join("outputs/debug/phase3/news_macro.jsonl");
+        let lines = std::fs::read_to_string(path).unwrap();
+        let records: Vec<Value> = lines
+            .lines()
+            .map(serde_json::from_str)
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["kind"], "typed_provider_payload");
+        assert!(records[0]["ts_ms"].as_u64().is_some());
     }
 }

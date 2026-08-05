@@ -1361,17 +1361,40 @@ pub async fn run_model_event_stream(
 
 const HTTP_TRACE_TARGET: &str = "orchestrator_llm::http";
 
-fn log_typed_provider_payload<T: Serialize>(role: &str, route: &str, direction: &str, payload: &T) {
+fn log_typed_provider_payload<T: Serialize>(
+    phase: Option<i64>,
+    role: &str,
+    profile: &str,
+    route: &str,
+    direction: &str,
+    payload: &T,
+) {
     if !enabled!(target: HTTP_TRACE_TARGET, Level::DEBUG) {
         return;
     }
+    let rendered = providers::debug_typed_payload(payload);
     debug!(
         target: HTTP_TRACE_TARGET,
         role,
         route,
         direction,
-        payload = %providers::debug_typed_payload(payload),
+        payload = %rendered,
         "async-openai typed provider payload"
+    );
+    let file_stem = providers::debug_file_stem(Some(role), Some(profile));
+    providers::append_file_debug_record(
+        &providers::debug_phase_directory(phase),
+        &file_stem,
+        json!({
+            "kind": "typed_provider_payload",
+            "phase": phase,
+            "file_stem": file_stem,
+            "direction": direction,
+            "role": role,
+            "profile": profile,
+            "route": route,
+            "payload": rendered,
+        }),
     );
 }
 
@@ -1390,7 +1413,14 @@ async fn run_responses_text_once(
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))
         .context("OpenAI-compatible Responses prompt failed")?;
-    log_typed_provider_payload(&settings.role, "responses", "response", &response);
+    log_typed_provider_payload(
+        settings.phase,
+        &settings.role,
+        settings.tool_managed_profile.as_str(),
+        "responses",
+        "response",
+        &response,
+    );
     let text = response.output_text().unwrap_or_default();
     debug!(
         role = %settings.role,
@@ -1416,7 +1446,14 @@ async fn run_chat_completions_text_once(
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))
         .context("OpenAI-compatible Chat Completions prompt failed")?;
-    log_typed_provider_payload(&settings.role, "chat_completions", "response", &response);
+    log_typed_provider_payload(
+        settings.phase,
+        &settings.role,
+        settings.tool_managed_profile.as_str(),
+        "chat_completions",
+        "response",
+        &response,
+    );
     let text = response
         .choices
         .first()
@@ -1590,6 +1627,10 @@ fn build_responses_request(
         .input(InputParam::Items(items))
         .prompt_cache_key(prompt_cache_key(settings));
 
+    if let Some(max_output_tokens) = settings.llm.max_completion_tokens {
+        builder = builder.max_output_tokens(max_output_tokens);
+    }
+
     let has_system = if let Some(system) = &input.system_instruction {
         builder = builder.instructions(system.clone());
         true
@@ -1613,9 +1654,21 @@ fn build_responses_request(
         false
     };
 
+    let mut includes = Vec::new();
     if settings.llm.preserve_reasoning_state {
         builder = builder.store(false);
-        builder = builder.include(vec![IncludeEnum::ReasoningEncryptedContent]);
+        includes.push(IncludeEnum::ReasoningEncryptedContent);
+    }
+    // The native Responses web-search path needs the provider-owned source
+    // records in the response.  Without this explicit include, a compatible
+    // Gateway may execute (or attempt) web search but omit
+    // `web_search_call.action.sources`, leaving the Rust evidence collector
+    // with no authoritative URLs to attach to the Phase 2 packet.
+    if uses_native_web_search(settings) {
+        includes.push(IncludeEnum::WebSearchCallActionSources);
+    }
+    if !includes.is_empty() {
+        builder = builder.include(includes);
     }
 
     if with_tools {
@@ -1983,6 +2036,94 @@ fn is_recoverable_length_finish(text_started: bool, pending_tool_calls: bool) ->
     text_started && !pending_tool_calls
 }
 
+/// The configured OpenAI-compatible Gateway omits `response.model` from
+/// lifecycle events such as `response.created`.  The SDK's typed `Response`
+/// requires that field, so normalize only this known transport omission before
+/// deserializing the event.  All other fields remain strictly SDK-validated.
+fn normalize_gateway_response_event(raw_event: &mut Value, model: &str) -> bool {
+    let Some(response) = raw_event.get_mut("response").and_then(Value::as_object_mut) else {
+        return false;
+    };
+    if response.get("model").and_then(Value::as_str).is_some() {
+        return false;
+    }
+    response.insert("model".to_owned(), Value::String(model.to_owned()));
+    true
+}
+
+fn normalize_gateway_response_event_with_output(raw_event: &mut Value, model: &str) -> bool {
+    let mut changed = normalize_gateway_response_event(raw_event, model);
+    let event_type = raw_event
+        .get("type")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    if let Some(response) = raw_event.get_mut("response").and_then(Value::as_object_mut) {
+        // This Gateway omits the optional-looking usage detail objects even
+        // though async-openai's `ResponseUsage` currently requires both of
+        // them.  Preserve the real token totals and fill only the absent
+        // zero-valued breakdowns; no business response fields are inferred.
+        if let Some(usage) = response.get_mut("usage").and_then(Value::as_object_mut) {
+            if !usage.contains_key("input_tokens_details") {
+                usage.insert(
+                    "input_tokens_details".to_owned(),
+                    json!({"cached_tokens": 0}),
+                );
+                changed = true;
+            }
+            if !usage.contains_key("output_tokens_details") {
+                usage.insert(
+                    "output_tokens_details".to_owned(),
+                    json!({"reasoning_tokens": 0}),
+                );
+                changed = true;
+            }
+        }
+
+        // The Gateway echoes request tools in Chat-style `{function: {...}}`
+        // objects, while Responses SDK `Tool` expects the flattened shape.
+        // The runtime never consumes response.tools, so drop this metadata
+        // rather than weakening output/tool-call validation.
+        if response.remove("tools").is_some() {
+            changed = true;
+        }
+    }
+    if matches!(
+        event_type.as_deref(),
+        Some("response.created" | "response.in_progress")
+    ) {
+        if let Some(response) = raw_event.get_mut("response").and_then(Value::as_object_mut) {
+            // The Gateway omits the not-yet-materialized output array on
+            // lifecycle events. Treat that as an empty output only before
+            // completion; completed responses remain strict.
+            if !response.contains_key("output") {
+                response.insert("output".to_owned(), json!([]));
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+fn is_skippable_non_authoritative_gateway_event(raw_event: &Value) -> bool {
+    match raw_event.get("type").and_then(Value::as_str) {
+        Some("response.function_call_arguments.done") => raw_event
+            .get("name")
+            .and_then(Value::as_str)
+            .is_none_or(|name| name.trim().is_empty()),
+        Some("response.output_item.added") => {
+            let Some(item) = raw_event.get("item") else {
+                return false;
+            };
+            item.get("type").and_then(Value::as_str) == Some("function_call")
+                && item
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .is_none_or(|name| name.trim().is_empty())
+        }
+        _ => false,
+    }
+}
+
 async fn stream_responses_once(
     settings: &AgentSettings,
     input: &agent_loop::ModelInput,
@@ -2000,7 +2141,7 @@ async fn stream_responses_once(
     debug!(role = %settings.role, "opening streaming Responses API connection");
     let mut stream = client
         .responses()
-        .create_stream(request)
+        .create_stream_byot::<_, Value>(request)
         .await
         .map_err(|error| {
             StreamAttemptError::provider(ProviderFailure::Http(error), ReplayState::NoProviderEvent)
@@ -2026,15 +2167,132 @@ async fn stream_responses_once(
     while let Some(event) = stream.next().await {
         event_count += 1;
         let event = match event {
-            Ok(event) => {
+            Ok(mut raw_event) => {
+                if normalize_gateway_response_event_with_output(
+                    &mut raw_event,
+                    settings.llm.effective_model(),
+                ) {
+                    debug!(
+                        role = %settings.role,
+                        "filled missing Responses response.model from request model"
+                    );
+                }
+                if raw_event.get("type").and_then(Value::as_str)
+                    == Some("response.function_call_arguments.done")
+                    && raw_event
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .is_none_or(|name| name.trim().is_empty())
+                {
+                    debug!(
+                        role = %settings.role,
+                        "ignored non-authoritative function-call arguments.done without name"
+                    );
+                    providers::append_file_debug_record(
+                        &providers::debug_phase_directory(settings.phase),
+                        &providers::debug_file_stem(
+                            Some(&settings.role),
+                            Some(settings.tool_managed_profile.as_str()),
+                        ),
+                        json!({
+                            "kind": "provider_event_skipped",
+                            "event_type": "response.function_call_arguments.done",
+                            "reason": "missing_name_non_authoritative",
+                            "payload": providers::debug_typed_payload(&raw_event),
+                            "phase": settings.phase,
+                            "role": settings.role,
+                        }),
+                    );
+                    continue;
+                }
+                let event: ResponseStreamEvent = match serde_json::from_value(raw_event.clone()) {
+                    Ok(event) => event,
+                    Err(error) if is_skippable_non_authoritative_gateway_event(&raw_event) => {
+                        debug!(
+                            role = %settings.role,
+                            error = %error,
+                            "ignored malformed non-authoritative Responses event"
+                        );
+                        providers::append_file_debug_record(
+                            &providers::debug_phase_directory(settings.phase),
+                            &providers::debug_file_stem(
+                                Some(&settings.role),
+                                Some(settings.tool_managed_profile.as_str()),
+                            ),
+                            json!({
+                                "kind": "provider_event_skipped",
+                                "event_type": raw_event.get("type"),
+                                "reason": "malformed_non_authoritative_event",
+                                "decode_error": error.to_string(),
+                                "payload": providers::debug_typed_payload(&raw_event),
+                                "phase": settings.phase,
+                                "role": settings.role,
+                            }),
+                        );
+                        continue;
+                    }
+                    Err(error) => {
+                        providers::append_file_debug_record(
+                            &providers::debug_phase_directory(settings.phase),
+                            &providers::debug_file_stem(
+                                Some(&settings.role),
+                                Some(settings.tool_managed_profile.as_str()),
+                            ),
+                            json!({
+                                "kind": "provider_event_decode_error",
+                                "event_type": raw_event.get("type"),
+                                "decode_error": error.to_string(),
+                                "payload": providers::debug_typed_payload(&raw_event),
+                                "phase": settings.phase,
+                                "role": settings.role,
+                            }),
+                        );
+                        return Err(StreamAttemptError::protocol(
+                            format!("Responses event failed SDK decode: {error}"),
+                            ReplayState::ProviderEventObserved,
+                        ));
+                    }
+                };
                 // Any successfully decoded provider event makes replay
                 // unsafe, even if no text/tool side effect was emitted yet.
                 replay_state = ReplayState::ProviderEventObserved;
-                log_typed_provider_payload(&settings.role, "responses", "sse_event", &event);
+                log_typed_provider_payload(
+                    settings.phase,
+                    &settings.role,
+                    settings.tool_managed_profile.as_str(),
+                    "responses",
+                    "sse_event",
+                    &event,
+                );
                 event
             }
             Err(error) => {
                 let error_text = error.to_string();
+                let (detail, raw_event_chars) = match &error {
+                    async_openai::error::OpenAIError::JSONDeserialize(_, raw) => (
+                        Some(providers::truncate_debug_payload(raw.clone())),
+                        Some(raw.len()),
+                    ),
+                    _ => (None, None),
+                };
+                providers::append_file_debug_record(
+                    &providers::debug_phase_directory(settings.phase),
+                    &providers::debug_file_stem(
+                        Some(&settings.role),
+                        Some(settings.tool_managed_profile.as_str()),
+                    ),
+                    json!({
+                        "kind": "stream_error",
+                        "route": "responses",
+                        "phase": settings.phase,
+                        "role": settings.role,
+                        "event_count": event_count,
+                        "replay_state": format!("{replay_state:?}"),
+                        "error": error_text,
+                        "raw_event_chars": raw_event_chars,
+                        "raw_event": detail,
+                    }),
+                );
                 let failure = match &error {
                     async_openai::error::OpenAIError::JSONDeserialize(_, detail) => {
                         ProviderFailure::ProtocolViolation {
@@ -2443,7 +2701,14 @@ async fn stream_chat_completions_once(
                 // A successfully decoded provider chunk is enough to make
                 // replay unsafe, even before text or a tool call is emitted.
                 made_progress = true;
-                log_typed_provider_payload(&settings.role, "chat_completions", "sse_chunk", &ev);
+                log_typed_provider_payload(
+                    settings.phase,
+                    &settings.role,
+                    settings.tool_managed_profile.as_str(),
+                    "chat_completions",
+                    "sse_chunk",
+                    &ev,
+                );
                 ev
             }
             Err(async_openai::error::OpenAIError::JSONDeserialize(err, _))
@@ -2973,6 +3238,75 @@ mod tests {
     }
 
     #[test]
+    fn gateway_response_created_without_model_is_normalized_before_sdk_decode() {
+        let mut raw_event = json!({
+            "type": "response.created",
+            "sequence_number": 1,
+            "response": {
+                "id": "resp_test",
+                "object": "response",
+                "created_at": 1_785_917_226u64,
+                "status": "in_progress",
+                "background": false,
+                "error": null,
+                "output": []
+            }
+        });
+
+        assert!(super::normalize_gateway_response_event(
+            &mut raw_event,
+            "gpt-5.6-luna"
+        ));
+        let event: async_openai::types::responses::ResponseStreamEvent =
+            serde_json::from_value(raw_event).expect("normalized event should decode");
+        match event {
+            async_openai::types::responses::ResponseStreamEvent::ResponseCreated(event) => {
+                assert_eq!(event.response.model, "gpt-5.6-luna");
+            }
+            other => panic!("expected response.created, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gateway_response_usage_missing_breakdowns_are_filled_before_sdk_decode() {
+        let mut raw_event = json!({
+            "type": "response.completed",
+            "sequence_number": 9,
+            "response": {
+                "id": "resp_test",
+                "object": "response",
+                "created_at": 1_785_917_226u64,
+                "completed_at": 1_785_917_227u64,
+                "status": "completed",
+                "background": false,
+                "error": null,
+                "model": "gpt-5.6-luna",
+                "output": [],
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 4,
+                    "total_tokens": 14
+                }
+            }
+        });
+
+        assert!(super::normalize_gateway_response_event_with_output(
+            &mut raw_event,
+            "gpt-5.6-luna"
+        ));
+        let event: async_openai::types::responses::ResponseStreamEvent =
+            serde_json::from_value(raw_event).expect("normalized event should decode");
+        match event {
+            async_openai::types::responses::ResponseStreamEvent::ResponseCompleted(event) => {
+                let usage = event.response.usage.expect("usage should be preserved");
+                assert_eq!(usage.input_tokens_details.cached_tokens, 0);
+                assert_eq!(usage.output_tokens_details.reasoning_tokens, 0);
+            }
+            other => panic!("expected response.completed, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn chat_tool_call_merge_preserves_metadata_when_follow_up_delta_is_empty() {
         let first: async_openai::types::chat::ChatCompletionMessageToolCallChunk =
             serde_json::from_value(json!({
@@ -3039,6 +3373,7 @@ mod tests {
     fn phase_summary_responses_request_uses_json_object_with_rust_schema_validation() {
         let mut settings = base_settings(LlmRoute::Responses);
         settings.role = "compressor.phase_summary".to_owned();
+        settings.llm.max_completion_tokens = Some(4096);
         let input = agent_loop::ModelInput {
             system_instruction: None,
             items: vec![agent_loop::TurnItem::user("summary input")],
@@ -3055,10 +3390,9 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            serde_json::to_value(request).unwrap()["text"],
-            json!({"format": {"type": "json_object"}})
-        );
+        let wire = serde_json::to_value(&request).unwrap();
+        assert_eq!(wire["text"], json!({"format": {"type": "json_object"}}));
+        assert_eq!(wire["max_output_tokens"], 4096);
     }
 
     fn base_settings(route: LlmRoute) -> AgentSettings {
@@ -3916,10 +4250,12 @@ mod tests {
 
         let request =
             super::build_responses_request(&settings, &input, "research", true, true).unwrap();
-        let tools = serde_json::to_value(request).unwrap()["tools"]
-            .as_array()
-            .cloned()
-            .unwrap();
+        let request = serde_json::to_value(request).unwrap();
+        assert_eq!(
+            request["include"],
+            json!(["web_search_call.action.sources"])
+        );
+        let tools = request["tools"].as_array().cloned().unwrap();
         assert!(tools.iter().any(|tool| tool["type"] == "function"));
         let web_search = tools
             .iter()
