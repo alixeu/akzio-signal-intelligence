@@ -1,0 +1,10 @@
+[daemon]
+store_root = "outputs/v2-store"
+http_addr = "127.0.0.1:7342"
+unix_socket = "outputs/v2-store/akzio.sock"
+token_env = "AKZIO_DAEMON_TOKEN"
+worker_count = 4
+auto_paper = true
+
+[execution]
+assets = ["TQQQ", "QQQ", "SOXX", "SOXL"]

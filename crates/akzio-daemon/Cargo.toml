@@ -1,0 +1,29 @@
+[package]
+name = "akzio-daemon"
+version = "0.2.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+akzio-domain = { path = "../akzio-domain" }
+akzio-execution = { path = "../akzio-execution" }
+akzio-ingest = { path = "../akzio-ingest" }
+akzio-learning = { path = "../akzio-learning" }
+akzio-context = { path = "../akzio-context" }
+akzio-model = { path = "../akzio-model" }
+akzio-research = { path = "../akzio-research" }
+akzio-runtime = { path = "../akzio-runtime" }
+akzio-store = { path = "../akzio-store" }
+async-stream.workspace = true
+axum.workspace = true
+chrono.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

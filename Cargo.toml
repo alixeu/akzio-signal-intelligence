@@ -1,11 +1,16 @@
 [workspace]
 members = [
-    "crates/orchestrator-core",
-    "crates/orchestrator-llm",
-    "crates/orchestrator-cli",
-    "crates/orchestrator-workflow",
-    "crates/orchestrator-ingest",
-    "crates/orchestrator-store",
+    "crates/akzio-domain",
+    "crates/akzio-store",
+    "crates/akzio-context",
+    "crates/akzio-ingest",
+    "crates/akzio-runtime",
+    "crates/akzio-execution",
+    "crates/akzio-learning",
+    "crates/akzio-model",
+    "crates/akzio-research",
+    "crates/akzio-daemon",
+    "crates/akzio-cli",
 ]
 resolver = "2"
 
@@ -26,15 +31,19 @@ md-5 = "0.10.6"
 regex = "1.11.1"
 reqwest = { version = "0.13.4", default-features = false, features = ["cookies", "json", "query", "rustls"] }
 async-openai = { version = "0.41.1", features = ["responses", "chat-completion", "middleware", "byot"] }
+async-stream = "0.3.6"
+axum = "0.8.4"
 serde = { version = "1.0.217", features = ["derive"] }
 serde_json = "1.0.135"
 serde_yaml = "0.9.34"
 sha2 = "0.10.8"
+rusqlite = { version = "0.32.1", features = ["bundled"] }
  tower = "0.5.3"
 tempfile = "3.15.0"
 thiserror = "2.0.11"
 toml = "0.8"
 tokio = { version = "1.43.0", features = ["full"] }
+tokio-stream = "0.1.17"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 uuid = { version = "1.12.0", features = ["v4", "serde"] }

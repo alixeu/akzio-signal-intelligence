@@ -1,0 +1,18 @@
+[package]
+name = "akzio-context"
+version = "0.2.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+akzio-domain = { path = "../akzio-domain" }
+akzio-store = { path = "../akzio-store" }
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
