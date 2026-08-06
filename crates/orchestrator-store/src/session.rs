@@ -423,10 +423,21 @@ pub fn read_session_events(
     location: &SessionLocation,
 ) -> Result<Vec<SessionEvent>> {
     let manifest = read_session_manifest(store, location)?;
+    read_session_event_files(store, location, &manifest)
+}
+
+/// Read the event files for an already validated session manifest.
+///
+/// The manifest and event directory are created together.  Do not probe the
+/// directory with `exists()` before opening it: a concurrent cleanup can remove
+/// it between the two syscalls and make a missing history look like an empty
+/// history.  Returning the `read_dir` error keeps recovery fail-closed.
+fn read_session_event_files(
+    store: &FileStore,
+    location: &SessionLocation,
+    manifest: &SessionManifest,
+) -> Result<Vec<SessionEvent>> {
     let absolute = store.root().join(location.relative_dir());
-    if !absolute.exists() {
-        return Ok(Vec::new());
-    }
     let mut relative_logs = Vec::new();
     for entry in fs::read_dir(&absolute).map_err(|source| io_error(&absolute, source))? {
         let entry = entry.map_err(|source| io_error(&absolute, source))?;
@@ -448,7 +459,7 @@ pub fn read_session_events(
     let mut events = Vec::new();
     for relative in relative_logs {
         for event in read_jsonl_recover_tail::<SessionEvent>(store.root(), &relative)? {
-            validate_event_for_session(&event, &manifest)?;
+            validate_event_for_session(&event, manifest)?;
             events.push(event);
         }
     }
@@ -494,6 +505,30 @@ mod tests {
             "session / child",
         )
         .unwrap()
+    }
+
+    #[test]
+    fn missing_session_event_directory_is_not_treated_as_empty_history() {
+        let directory = tempdir().unwrap();
+        let store = FileStore::open(directory.path(), FileStoreOptions::default()).unwrap();
+        let location = location();
+        let manifest = SessionManifest::new(
+            &location,
+            "analyst.technical",
+            1,
+            "analyst_report",
+            None,
+            "2026-07-27T00:00:00Z",
+        )
+        .unwrap();
+
+        let error = super::read_session_event_files(&store, &location, &manifest).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("sessions"), "unexpected error: {message}");
+        assert!(
+            message.contains("No such file") || message.contains("not found"),
+            "unexpected error: {message}"
+        );
     }
 
     #[test]

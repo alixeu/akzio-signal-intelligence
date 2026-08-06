@@ -3054,7 +3054,13 @@ fn is_phase2_controller_close_required_error(error: &str) -> bool {
 }
 
 fn phase1_summary_validation_retry_instruction() -> String {
-    "Rust rejected the previous Phase 1 Summary contract. Preserve every explicit probability from the Analyst; do not derive it from confidence. Enforce direction coherence: bullish must be >0.5, bearish <0.5, neutral and unobserved exactly 0.5, and mixed may be 0.4..=0.6. When the source report explicitly describes conflicting timeframes or mixed evidence while giving a probability in 0.4..=0.6, use mixed instead of neutral. For every ticker with observed evidence, retain at least one non-empty key_evidence item with its exact prior evidence_refs; never replace a previously non-empty key_evidence array with [] or drop a ticker while fixing another field. If context-only VIX has no cited evidence or every VIX evidence_refs array is empty, this is an unobserved data gap: set VIX direction to unobserved, keep long_probability at 0.5, set key_evidence to [], and record the absence in data_gaps or missing_fields. Never return neutral, bullish, bearish, or mixed for VIX with an empty key_evidence array. The JSON shape is strict: authoritative_fields.per_ticker may contain only ticker keys QQQ, SOXX, and VIX; cross_asset_findings is a sibling of per_ticker under authoritative_fields, never a per_ticker key. Every retained key_evidence.timestamp must be a non-empty ISO-8601 string, never null; optional event/publish/ingest/as_of fields may be null. If an item has no observed timestamp, remove it from key_evidence and record the gap instead of inventing a date. Return only the required JSON object and keep all evidence IDs unchanged.".to_owned()
+    "Rust rejected the previous Phase 1 Summary contract. Preserve every explicit probability from the Analyst; do not derive it from confidence. Enforce direction coherence: bullish must be >0.5, bearish <0.5, neutral and unobserved exactly 0.5, and mixed may be 0.4..=0.6. When the source report explicitly describes conflicting timeframes or mixed evidence while giving a probability in 0.4..=0.6, use mixed instead of neutral. For every ticker with observed evidence, retain at least one non-empty key_evidence item with its exact prior evidence_refs; never replace a previously non-empty key_evidence array with [] or drop a ticker while fixing another field. If context-only VIX has no cited evidence or every VIX evidence_refs array is empty, this is an unobserved data gap: set VIX direction to unobserved, confidence to 0.0, keep long_probability at 0.5, set key_evidence to [], and record the absence in data_gaps or missing_fields. Never return neutral, bullish, bearish, or mixed for VIX with an empty key_evidence array. The JSON shape is strict: authoritative_fields.per_ticker may contain only ticker keys QQQ, SOXX, and VIX; cross_asset_findings is a sibling of per_ticker under authoritative_fields, never a per_ticker key. Every retained key_evidence.timestamp must be a non-empty ISO-8601 string, never null; optional event/publish/ingest/as_of fields may be null. If an item has no observed timestamp, remove it from key_evidence and record the gap instead of inventing a date. Return only the required JSON object and keep all evidence IDs unchanged.".to_owned()
+}
+
+fn strict_phase1_summary_validation_retry_instruction() -> String {
+    let mut instruction = phase1_summary_validation_retry_instruction();
+    instruction.push_str(" Return exactly one top-level JSON object with the sibling keys summary, confidence, authoritative_fields, details, missing_fields, and ambiguities. Do not emit Markdown fences, prose, a second JSON object, or any bytes before the first { or after the final }. Do not close the outer object before emitting details, missing_fields, and ambiguities. Preserve all valid fields and evidence IDs from the previous response unchanged.");
+    instruction
 }
 
 /// Models occasionally place the shared cross-asset findings inside the
@@ -3473,11 +3479,13 @@ fn is_phase3_scenario_contract_error(error: &anyhow::Error) -> bool {
         || message.contains("scenario probabilities must sum to 1")
         || message.contains("scenario conditional_long_probability")
         || message.contains("scenario conditional_long_probability must be ordered")
+        || message.contains("Phase 3 Hold cannot use confidence_basis=")
+        || message.contains("Phase 3 Hold requires confidence_basis")
 }
 
 fn phase3_scenario_validation_retry_instruction(error: &anyhow::Error) -> String {
     format!(
-        "## Rust scenario-contract correction required\n\nThe immediately preceding Decision was rejected: `{error}`. Rewrite the entire Decision using the same allowed evidence; do not invent a debate adjustment or change the Rust base. `probability` is the probability mass that a bull/base/bear regime occurs. `conditional_long_probability` is the chance that the long outcome occurs conditional on that regime. For every ticker, make scenario masses sum to 1 and make `long_probability` exactly equal to `Σ(probability × conditional_long_probability)` (six decimal places or fewer). Keep the semantic order `bull >= base >= bear` for conditional_long_probability. Do not use the invalid shortcut `bull + base = long` or assume the base conditional probability is always 0.5."
+        "## Rust scenario-contract correction required\n\nThe immediately preceding Decision was rejected: `{error}`. Rewrite the entire Decision using the same allowed evidence; do not invent a debate adjustment or change the Rust base. `probability` is the probability mass that a bull/base/bear regime occurs. `conditional_long_probability` is the chance that the long outcome occurs conditional on that regime. For every ticker, make scenario masses sum to 1 and make `long_probability` exactly equal to `Σ(probability × conditional_long_probability)` (six decimal places or fewer). Keep the semantic order `bull >= base >= bear` for conditional_long_probability. Do not use the invalid shortcut `bull + base = long` or assume the base conditional probability is always 0.5. Rust projects the final probability to a rating: when that projection is `Hold`, `confidence_basis` must be exactly one of `evidence_balanced`, `data_insufficient`, or `conflicting_evidence` (never `directional_evidence`), and `hold_reason` must match it as `evidence_balanced`, `evidence_insufficient`, or `conflicting_evidence`. For non-Hold ratings, leave `hold_reason` null."
     )
 }
 
@@ -4415,7 +4423,7 @@ async fn run_unit_with_checkpoint(
                 // persisted Summary session once with a Rust-owned correction;
                 // never silently coerce the probability in the reducer.
                 state["_phase1_summary_validation_retry"] =
-                    Value::String(phase1_summary_validation_retry_instruction());
+                    Value::String(strict_phase1_summary_validation_retry_instruction());
                 let retry = compile_unit_response(
                     state,
                     runtime,
@@ -10392,6 +10400,9 @@ mod phase2_session_tests {
         assert!(instruction.contains("do not invent a debate adjustment"));
         assert!(instruction.contains("conditional_long_probability"));
         assert!(instruction.contains("Σ(probability × conditional_long_probability)"));
+        assert!(instruction.contains("when that projection is `Hold`"));
+        assert!(instruction.contains("never `directional_evidence`"));
+        assert!(instruction.contains("hold_reason` must match"));
     }
 
     #[test]

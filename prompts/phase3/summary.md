@@ -63,6 +63,10 @@ evidence 有交集。未解决 Topic 不能支持非零调整。三种 scenario 
 `probability` 和该情景下 long outcome 的 `conditional_long_probability`；情景概率合计为 1，
 并满足 `long_probability = Σ(probability * conditional_long_probability)`，且 bull/base/bear 的
 条件概率满足 `bull >= base >= bear`；不满足时报告冲突，绝不由 Summary 改写。
+Rust 会按最终 `long_probability` 投影 rating；若投影为 `Hold`，`confidence_basis` 只能为
+`evidence_balanced`、`data_insufficient` 或 `conflicting_evidence`，不得保留
+`directional_evidence`，并将 `hold_reason` 分别写为 `evidence_balanced`、
+`evidence_insufficient` 或 `conflicting_evidence`。非 Hold 的 `hold_reason` 必须为 null。
 非零调整必须保留 `adjustment_reason`（`new_information`、`duplicate_evidence_discount`、
 `direction_conflict_discount`、`evidence_contradiction_discount`、`missing_data_convergence`、
 `track_record_convergence` 之一）与 `adjustment_scale`。当前没有足量历史校准时，scale 必须为

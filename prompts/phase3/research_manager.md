@@ -39,8 +39,8 @@ Decision 的历史经验入口。两个 Detail 均返回后，
 ## 任务步骤
 
 1. 原样使用 `weighted_probability_base`；缺失不得补 0.50。先读取 Phase 2 的 `topic_search_space.residual_risks` 与 `unselected_candidates`：未进入辩论队列的趋势、估值/预期、宏观、事件风险和数据质量缺口仍是当前结论的反证或不确定性，不能因 topic 上限消失；同一证据在两处出现只能算一次。无新增量时 `debate_adjustment=0`。非零调整写明 `adjustment_reason` 和 `adjustment_scale`：没有足量历史校准只能用 `uncalibrated_conservative_v1` 的 ±0.01 或 ±0.03；只来自新事实、误读、重复计权、缺口、未计价催化或历史校准，且 `phase2_claim_ids` 必须是 Phase 2 `consensus_claim_ids` 并与 `evidence_refs` 相交。已进入 base 的同一事件只能作为纠正，且必须使概率向 0.5 收敛，不能再次强化方向。
-2. `long=base+adjustment`、`short=1-long`；Rust 按 long 投影 rating。Hold 的 `hold_reason` 必须匹配 `confidence_basis`。
-3. 每资产写 rating、long/short、basis、hold_reason、plan、rationale、场景和完整 evidence ID；basis 只能为 `evidence_balanced | data_insufficient | conflicting_evidence | directional_evidence`。
+2. `long=base+adjustment`、`short=1-long`；Rust 按最终 `long` 投影 rating。若 Rust 投影为 `Hold`，`confidence_basis` 只能是 `evidence_balanced`、`data_insufficient` 或 `conflicting_evidence`，不得使用 `directional_evidence`；`hold_reason` 必须分别为 `evidence_balanced`、`evidence_insufficient` 或 `conflicting_evidence` 并与 basis 一致。非 Hold 的 `hold_reason` 必须为 null。
+3. 每资产写 rating、long/short、basis、hold_reason、plan、rationale、场景和完整 evidence ID；basis 只能为 `evidence_balanced | data_insufficient | conflicting_evidence | directional_evidence`，但 `directional_evidence` 仅适用于非 Hold 的 Rust 投影。
 4. bull/base/bear 各含情景发生概率 `probability`、条件方向概率 `conditional_long_probability`、1-3 个 drivers/triggers 和 confirmation。情景概率和为 1，`long_probability = Σ(probability * conditional_long_probability)`；不得把 `base.probability` 当 long 或假定其条件概率为 0.5；条件概率必须 `bull >= base >= bear`。
 5. 禁用截断 ID、`web.run:searchN`。context-only 只写环境影响，不生成 rating/交易结论。
 
