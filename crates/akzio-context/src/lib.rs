@@ -16,6 +16,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
+mod rebuild;
+pub use rebuild::*;
+
 #[derive(Debug, Error)]
 pub enum ContextError {
     #[error(transparent)]

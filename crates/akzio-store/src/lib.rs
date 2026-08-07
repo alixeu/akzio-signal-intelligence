@@ -22,6 +22,9 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use thiserror::Error;
 use uuid::Uuid;
 
+mod rebuild;
+pub use rebuild::*;
+
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("io at {path}: {source}")]

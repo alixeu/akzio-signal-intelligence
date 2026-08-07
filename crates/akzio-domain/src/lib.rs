@@ -13,6 +13,9 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
+mod rebuild;
+pub use rebuild::*;
+
 pub const V2_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Error, PartialEq, Eq)]
