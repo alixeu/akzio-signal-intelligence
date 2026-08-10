@@ -30,6 +30,8 @@ pub enum DomainError {
     DuplicateTaskId(TaskId),
     #[error("task {task} references unknown dependency {dependency}")]
     UnknownDependency { task: TaskId, dependency: TaskId },
+    #[error("evidence source {0} is not allowed by the installed recipe")]
+    EvidenceSourceNotAllowed(String),
     #[error("task graph contains a cycle")]
     CyclicPlan,
     #[error("budget {field} must be positive")]

@@ -7,9 +7,10 @@ use std::{
 };
 
 use akzio_domain::{
-    Artifact, ArtifactKind, ArtifactLifecycle, ArtifactProvenance, ArtifactRef, DomainError, RunId,
-    RunPurpose, RuntimeTaskClass, TaskRecipe, TaskRecipeId, TaskStatus, WorkflowGraph,
-    WorkflowNode, WorkflowProposal, REBUILD_SCHEMA_VERSION,
+    Artifact, ArtifactKind, ArtifactLifecycle, ArtifactOrigin, ArtifactProvenance, ArtifactRef,
+    DomainError, EvidenceNeed, RunId, RunPurpose, RuntimeTaskClass, TaskRecipe, TaskRecipeId,
+    TaskStatus, WorkflowGraph, WorkflowNode, WorkflowProposal, WorkflowProposalDraft,
+    WorkflowProposalTask, REBUILD_SCHEMA_VERSION,
 };
 use akzio_store::v2::{
     ClaimedAttempt, RetryTaskResult, StoreError, StoredRun, V2Store, WorkflowCommit,
@@ -294,22 +295,25 @@ impl RebuildWorkflowRuntime {
 
     /// Applies a Planner proposal to a bootstrap graph. It adds all research nodes
     /// and then one immutable terminal chain; a later Planner cannot patch gates.
-    pub fn apply_proposal(
+    pub fn apply_planner_output(
         &self,
         planner: &ClaimedAttempt,
         previous_graph_artifact: &Artifact,
         previous_graph: &WorkflowGraph,
-        proposal_artifact: &Artifact,
+        planner_output: &Artifact,
         now: DateTime<Utc>,
     ) -> RebuildRuntimeResult<Artifact> {
         self.assert_planner_attempt(planner)?;
-        if proposal_artifact.kind != ArtifactKind::WorkflowProposal {
+        if planner_output.kind != ArtifactKind::WorkflowProposalDraft {
             return Err(RebuildRuntimeError::Store(
                 StoreError::InvalidWorkflowProposalArtifact,
             ));
         }
-        let proposal: WorkflowProposal =
-            serde_json::from_slice(&self.store.read_blob(&proposal_artifact.blob)?)?;
+        let draft: WorkflowProposalDraft =
+            serde_json::from_slice(&self.store.read_blob(&planner_output.blob)?)?;
+        draft.validate(&self.catalogue.recipes)?;
+        let (proposal, evidence_needs, proposal_artifact) =
+            self.materialize_planner_output(planner, planner_output, draft, now)?;
         let run_id = &planner.run_id;
         let purpose = self.store.run_purpose(run_id)?;
         if purpose == RunPurpose::Paper {
@@ -382,6 +386,8 @@ impl RebuildWorkflowRuntime {
         self.store.commit_workflow_patch(&WorkflowPatchCommit {
             permit: planner.permit.clone(),
             previous_graph_artifact_id: previous_graph_artifact.artifact_id.clone(),
+            planner_output: planner_output.clone(),
+            evidence_needs,
             proposal: proposal_artifact.clone(),
             next_graph: next_artifact.clone(),
             added_nodes,
@@ -389,6 +395,99 @@ impl RebuildWorkflowRuntime {
             completed_at: now,
         })?;
         Ok(next_artifact)
+    }
+
+    fn materialize_planner_output(
+        &self,
+        planner: &ClaimedAttempt,
+        planner_output: &Artifact,
+        draft: WorkflowProposalDraft,
+        now: DateTime<Utc>,
+    ) -> RebuildRuntimeResult<(WorkflowProposal, Vec<Artifact>, Artifact)> {
+        let planner_output_ref = ArtifactRef {
+            artifact_id: planner_output.artifact_id.clone(),
+            kind: ArtifactKind::WorkflowProposalDraft,
+        };
+        let origin = ArtifactOrigin {
+            run_id: Some(planner.run_id.clone()),
+            task_id: Some(planner.node.task_id.clone()),
+            attempt_id: Some(planner.permit.attempt_id.clone()),
+            contract_hash: planner.permit.contract_hash.clone(),
+        };
+        let provenance = ArtifactProvenance {
+            source_family: "akzio.workflow.planner".to_owned(),
+            observed_at: None,
+            retrieved_at: now,
+            source_uri: None,
+            confidence_ppm: 1_000_000,
+            producer_contract_hash: planner.permit.contract_hash.clone(),
+        };
+
+        let mut need_artifacts = BTreeMap::<EvidenceNeed, Artifact>::new();
+        let mut tasks = BTreeMap::new();
+        for (alias, task) in draft.tasks {
+            let mut evidence_needs = Vec::with_capacity(task.evidence_needs.len());
+            for need in task.evidence_needs {
+                let artifact = if let Some(artifact) = need_artifacts.get(&need) {
+                    artifact.clone()
+                } else {
+                    let artifact = Artifact::new(
+                        ArtifactKind::EvidenceNeed,
+                        self.store.put_json(&need)?,
+                        "runtime.planner.evidence_need",
+                        ArtifactLifecycle::RunScoped,
+                        provenance.clone(),
+                        Some(origin.clone()),
+                        vec![planner_output_ref.clone()],
+                        now,
+                    )?;
+                    need_artifacts.insert(need.clone(), artifact.clone());
+                    artifact
+                };
+                evidence_needs.push(ArtifactRef {
+                    artifact_id: artifact.artifact_id,
+                    kind: ArtifactKind::EvidenceNeed,
+                });
+            }
+            tasks.insert(
+                alias,
+                WorkflowProposalTask {
+                    recipe_id: task.recipe_id,
+                    objective: task.objective,
+                    depends_on: task.depends_on,
+                    priority: task.priority,
+                    evidence_needs,
+                },
+            );
+        }
+
+        let proposal = WorkflowProposal {
+            schema_version: draft.schema_version,
+            topology_id: draft.topology_id,
+            tasks,
+            stop_reason: draft.stop_reason,
+        };
+        proposal.validate(&self.catalogue.recipes)?;
+        self.validate_proposal_limits(&proposal)?;
+
+        let evidence_needs = need_artifacts.into_values().collect::<Vec<_>>();
+        let proposal_sources = std::iter::once(planner_output_ref)
+            .chain(evidence_needs.iter().map(|artifact| ArtifactRef {
+                artifact_id: artifact.artifact_id.clone(),
+                kind: ArtifactKind::EvidenceNeed,
+            }))
+            .collect();
+        let proposal_artifact = Artifact::new(
+            ArtifactKind::WorkflowProposal,
+            self.store.put_json(&proposal)?,
+            "runtime.planner.proposal",
+            ArtifactLifecycle::RunScoped,
+            provenance,
+            Some(origin),
+            proposal_sources,
+            now,
+        )?;
+        Ok((proposal, evidence_needs, proposal_artifact))
     }
 
     fn assert_planner_attempt(&self, planner: &ClaimedAttempt) -> RebuildRuntimeResult<()> {
@@ -868,6 +967,7 @@ pub enum RebuildRetryCause {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RebuildTaskCompletion {
     Succeeded(Vec<Artifact>),
+    Committed,
     Failed,
     Skipped,
     Cancelled,
@@ -960,6 +1060,10 @@ impl RebuildTaskRuntime {
                 self.store
                     .commit_attempt(&task.permit, &artifacts, TaskStatus::Succeeded, now)?;
             }
+            RebuildTaskCompletion::Committed => {
+                self.store
+                    .verify_attempt_terminal(&task.permit, TaskStatus::Succeeded)?;
+            }
             RebuildTaskCompletion::Failed => {
                 self.store
                     .finish_task(&task.permit, TaskStatus::Failed, now)?;
@@ -1033,10 +1137,11 @@ fn leaf_ids(nodes: &[WorkflowNode]) -> Vec<akzio_domain::TaskId> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use akzio_domain::{
-        ArtifactOrigin, ContentHash, ContractPurpose, FailureDisposition, RetryPolicy, TaskBudget,
+        ArtifactOrigin, ContentHash, ContractPurpose, EvidenceNeed, FailureDisposition,
+        RetryPolicy, TaskBudget, WorkflowProposalDraft, WorkflowProposalDraftTask,
         WorkflowProposalTask,
     };
     use tempfile::tempdir;
@@ -1068,6 +1173,9 @@ mod tests {
             purpose: ContractPurpose::new(id).unwrap(),
             contract_hash: agent.then(|| ContentHash::of_bytes(id.as_bytes())),
             task_class: class,
+            allowed_evidence_sources: agent
+                .then(|| BTreeSet::from(["alpaca".to_owned()]))
+                .unwrap_or_default(),
             max_children: 8,
             max_depth: 2,
             priority_ceiling: 100,
@@ -1137,15 +1245,46 @@ mod tests {
         }
     }
 
-    fn proposal_artifact(
+    fn planner_output_artifact(
         store: &V2Store,
         planner: &ClaimedAttempt,
-        proposal: &WorkflowProposal,
         now: DateTime<Utc>,
     ) -> Artifact {
+        let draft = WorkflowProposalDraft {
+            schema_version: REBUILD_SCHEMA_VERSION,
+            topology_id: "active".to_owned(),
+            tasks: BTreeMap::from([
+                (
+                    "analyst".to_owned(),
+                    WorkflowProposalDraftTask {
+                        recipe_id: TaskRecipeId::new("research.analyst").unwrap(),
+                        objective: "analyse evidence".to_owned(),
+                        depends_on: vec![],
+                        priority: 80,
+                        evidence_needs: vec![EvidenceNeed {
+                            schema_version: REBUILD_SCHEMA_VERSION,
+                            source_family: "alpaca".to_owned(),
+                            resource: "bars:TQQQ:1d".to_owned(),
+                            max_age_secs: 86_400,
+                        }],
+                    },
+                ),
+                (
+                    "critic".to_owned(),
+                    WorkflowProposalDraftTask {
+                        recipe_id: TaskRecipeId::new("research.critic").unwrap(),
+                        objective: "challenge claim".to_owned(),
+                        depends_on: vec!["analyst".to_owned()],
+                        priority: 70,
+                        evidence_needs: vec![],
+                    },
+                ),
+            ]),
+            stop_reason: None,
+        };
         Artifact::new(
-            ArtifactKind::WorkflowProposal,
-            store.put_json(proposal).unwrap(),
+            ArtifactKind::WorkflowProposalDraft,
+            store.put_json(&draft).unwrap(),
             "agent.planner",
             ArtifactLifecycle::RunScoped,
             ArtifactProvenance {
@@ -1403,26 +1542,29 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(planner.node.recipe_id.as_str(), "research.planner");
-        let mut expansion = proposal();
-        let follow_up = expansion.tasks.remove("analyst").unwrap();
-        expansion.tasks = BTreeMap::from([("follow_up".to_owned(), follow_up)]);
-        let expansion_artifact = proposal_artifact(&store, &planner, &expansion, Utc::now());
+        let planner_output = planner_output_artifact(&store, &planner, Utc::now());
         let second = runtime
-            .apply_proposal(&planner, &first, &graph, &expansion_artifact, Utc::now())
+            .apply_planner_output(&planner, &first, &graph, &planner_output, Utc::now())
             .unwrap();
         let patched: WorkflowGraph =
             serde_json::from_slice(&store.read_blob(&second.blob).unwrap()).unwrap();
         assert_eq!(
-            store.artifact(&expansion_artifact.artifact_id).unwrap(),
-            expansion_artifact
+            store.artifact(&planner_output.artifact_id).unwrap(),
+            planner_output
         );
         assert!(second.source_refs.contains(&ArtifactRef {
             artifact_id: first.artifact_id.clone(),
             kind: ArtifactKind::WorkflowGraph,
         }));
-        assert!(second.source_refs.contains(&ArtifactRef {
-            artifact_id: expansion_artifact.artifact_id.clone(),
-            kind: ArtifactKind::WorkflowProposal,
+        let proposal_ref = second
+            .source_refs
+            .iter()
+            .find(|reference| reference.kind == ArtifactKind::WorkflowProposal)
+            .unwrap();
+        let stored_proposal = store.artifact(&proposal_ref.artifact_id).unwrap();
+        assert!(stored_proposal.source_refs.iter().any(|reference| {
+            reference.artifact_id == planner_output.artifact_id
+                && reference.kind == ArtifactKind::WorkflowProposalDraft
         }));
         assert!(matches!(
             store.validate_task_permit(&planner.permit),
@@ -1502,20 +1644,54 @@ mod tests {
             .claim_next_task("planner-worker", Utc::now(), Duration::seconds(30))
             .unwrap()
             .unwrap();
-        let expansion = proposal();
-        let proposal_artifact = proposal_artifact(&store, &planner, &expansion, Utc::now());
+        let planner_output = planner_output_artifact(&store, &planner, Utc::now());
         let second = workflow
-            .apply_proposal(&planner, &first, &graph, &proposal_artifact, Utc::now())
+            .apply_planner_output(&planner, &first, &graph, &planner_output, Utc::now())
             .unwrap();
         let patched: WorkflowGraph =
             serde_json::from_slice(&store.read_blob(&second.blob).unwrap()).unwrap();
         let events_before = store.events_after(&run_id, 0, 100).unwrap();
 
         assert!(matches!(
-            workflow.apply_proposal(&planner, &second, &patched, &proposal_artifact, Utc::now(),),
+            workflow
+                .apply_planner_output(&planner, &second, &patched, &planner_output, Utc::now(),),
             Err(RebuildRuntimeError::Store(StoreError::StalePermit(_)))
         ));
         assert_eq!(store.events_after(&run_id, 0, 100).unwrap(), events_before);
+    }
+
+    #[tokio::test]
+    async fn task_runtime_accepts_only_store_verified_committed_attempts() {
+        let root = tempdir().unwrap();
+        let store = V2Store::open(root.path()).unwrap();
+        let workflow = RebuildWorkflowRuntime::new(store.clone(), catalogue());
+        let graph = workflow.bootstrap(RunPurpose::Debug, "active").unwrap();
+        let run_id = RunId::new();
+        let first = workflow
+            .submit(run_id, RunPurpose::Debug, graph.clone(), Utc::now())
+            .unwrap();
+        let tasks = RebuildTaskRuntime::new(store.clone());
+        let handler_store = store.clone();
+        let handler_workflow = workflow.clone();
+        assert!(tasks
+            .run_one("planner-worker", move |planner| {
+                let planner_output = planner_output_artifact(&handler_store, &planner, Utc::now());
+                handler_workflow
+                    .apply_planner_output(&planner, &first, &graph, &planner_output, Utc::now())
+                    .unwrap();
+                async { RebuildTaskCompletion::Committed }
+            })
+            .await
+            .unwrap());
+
+        assert!(matches!(
+            tasks
+                .run_one("untrusted-worker", |_| async {
+                    RebuildTaskCompletion::Committed
+                })
+                .await,
+            Err(RebuildRuntimeError::Store(StoreError::StalePermit(_)))
+        ));
     }
 
     #[tokio::test]

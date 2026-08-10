@@ -1,8 +1,8 @@
 //! Durable local control plane for Akzio v2.
 //!
-//! Transport only submits work and streams the durable event log. The task
-//! dispatcher owns business sequencing; `TaskRuntime` owns leases, retries,
-//! heartbeats, and terminal task state.
+//! This crate is deliberately thin: it owns worker supervision and transport,
+//! while the v2 Store and runtimes own durable state, contracts, context
+//! grants, task attempts, and workflow transitions.
 
 mod dispatch;
 mod worker;
@@ -10,22 +10,27 @@ mod worker;
 pub use worker::{TaskHandler, WorkerPool, WorkerPoolConfig};
 
 use std::{
-    collections::BTreeMap, convert::Infallible, net::SocketAddr, path::PathBuf, sync::Arc,
-    time::Duration as StdDuration,
+    collections::{BTreeMap, BTreeSet},
+    convert::Infallible,
+    net::SocketAddr,
+    path::PathBuf,
+    sync::Arc,
 };
 
-use akzio_context::legacy::ContextError;
-use akzio_domain::{DocumentKind, RunId, RunPurpose, WorkflowPlan};
-use akzio_execution::{
-    paper::{AlpacaPaper, PaperError},
-    ExecutionRuntimeError,
+use akzio_domain::{
+    ArtifactId, ArtifactKind, ArtifactRef, ContextPolicy, EvidenceNeed, RunId, RunPurpose,
+    RuntimeTaskClass, TaskId, TaskStatus,
 };
-use akzio_ingest::legacy::IngestError;
-use akzio_learning::{LedgerError, TopologyLedger, TopologyState};
+use akzio_ingest::{
+    AcquiredEvidence, EvidenceRequest, EvidenceRuntime, EvidenceRuntimeError, EvidenceSource,
+    FixtureEvidenceAdapter,
+};
 use akzio_model::{ModelClient, ModelError};
-use akzio_research::legacy::{baseline_topology, bootstrap_workflow, ContractRegistry};
-use akzio_runtime::legacy::{CompiledWorkflow, RuntimeError, TaskRuntime, WorkflowRuntime};
-use akzio_store::legacy::{DaemonLease, StoreError, StoredEvent, V2Store};
+use akzio_research::v2::{
+    ActiveResearchCatalogue, AgentRuntime, ModelClientAdapter, ResearchError,
+};
+use akzio_runtime::{RuntimeError, TaskCompletion, TaskRuntime, WorkflowRuntime};
+use akzio_store::v2::{ClaimedAttempt, StoreError, StoredEvent, V2Store};
 use async_stream::stream;
 use axum::{
     extract::{Path, Query, State},
@@ -34,7 +39,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use chrono::{NaiveDate, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::{
@@ -43,6 +48,11 @@ use tokio::{
     sync::watch,
 };
 
+const SCHEDULER_LEASE_NAME: &str = "akzio.local.scheduler";
+const EVENT_PAGE_SIZE: usize = 256;
+
+pub type FixtureEvidence = BTreeMap<EvidenceSource, BTreeMap<String, AcquiredEvidence>>;
+
 #[derive(Debug, Error)]
 pub enum DaemonError {
     #[error(transparent)]
@@ -50,36 +60,25 @@ pub enum DaemonError {
     #[error(transparent)]
     Runtime(#[from] RuntimeError),
     #[error(transparent)]
-    Context(#[from] ContextError),
+    Research(#[from] ResearchError),
     #[error(transparent)]
-    Research(#[from] akzio_research::legacy::ResearchError),
+    Evidence(#[from] EvidenceRuntimeError),
     #[error(transparent)]
     Model(#[from] ModelError),
     #[error(transparent)]
-    Ingest(#[from] IngestError),
-    #[error(transparent)]
-    Execution(#[from] ExecutionRuntimeError),
-    #[error(transparent)]
-    Learning(#[from] LedgerError),
+    Json(#[from] serde_json::Error),
     #[error(transparent)]
     Io(#[from] std::io::Error),
-    #[error(transparent)]
-    Json(#[from] serde_json::Error),
-    #[error("run {run_id} has no {kind:?} document")]
-    MissingRunDocument { run_id: RunId, kind: DocumentKind },
-    #[error("invalid sealed execution input: {0}")]
+    #[error("invalid daemon input: {0}")]
     InvalidInput(String),
-}
-
-impl DaemonError {
-    fn is_retryable(&self) -> bool {
-        matches!(
-            self,
-            Self::Model(ModelError::Transport(_))
-                | Self::Ingest(IngestError::Transport { .. })
-                | Self::Execution(ExecutionRuntimeError::Paper(PaperError::Transport { .. }))
-        )
-    }
+    #[error("{0}")]
+    Unavailable(String),
+    #[error("task class {0:?} is not safely wired in this daemon checkpoint")]
+    UnsupportedTaskClass(RuntimeTaskClass),
+    #[error("task {0} has no committed permitted context")]
+    MissingTaskContext(TaskId),
+    #[error("task {task_id} depends on non-succeeded task {dependency}")]
+    UnfinishedDependency { task_id: TaskId, dependency: TaskId },
 }
 
 pub type Result<T> = std::result::Result<T, DaemonError>;
@@ -97,15 +96,15 @@ pub struct Daemon {
     store: V2Store,
     workflow: WorkflowRuntime,
     task_runtime: TaskRuntime,
-    contracts: ContractRegistry,
-    model: ModelClient,
+    agents: AgentRuntime,
+    model: ModelClientAdapter,
+    fixture_evidence: Arc<FixtureEvidence>,
     http_token: String,
-    instance_id: String,
-    worker_pool: WorkerPoolConfig,
     auto_paper: bool,
+    worker_pool: WorkerPoolConfig,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DaemonHealth {
     pub status: String,
     pub scheduler_owner: Option<String>,
@@ -123,7 +122,7 @@ pub enum DaemonCommand {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "reply", rename_all = "snake_case")]
 pub enum DaemonReply {
     Health {
         status: String,
@@ -164,308 +163,91 @@ struct SubmitRequest {
     purpose: RunPurpose,
 }
 
-const SCHEDULER_LEASE_NAME: &str = "akzio.local.scheduler";
-const SCHEDULER_LEASE_SECONDS: i64 = 15;
-const SCHEDULER_HEARTBEAT: StdDuration = StdDuration::from_secs(5);
-const SCHEDULER_RETRY: StdDuration = StdDuration::from_millis(500);
-const PAPER_SCHEDULE_POLL: StdDuration = StdDuration::from_secs(60);
-
 impl Daemon {
-    /// Construct the production daemon. Model credentials are read only here,
-    /// never persisted in the Store.
+    /// Construct the local daemon with its production model adapter. Credentials
+    /// remain in the environment and are never persisted by this crate.
     pub fn open(config: DaemonConfig) -> Result<Self> {
         Self::with_model(config, ModelClient::from_env()?)
     }
 
-    /// Explicit injection keeps local fixture/debug tests on exactly the same
-    /// dispatcher without giving a production daemon a fixture fallback.
+    /// Injecting a model keeps fixture and production dispatch on the same v2
+    /// Runtime path. It deliberately installs no evidence adapter: a missing
+    /// adapter fails evidence work closed.
     pub fn with_model(config: DaemonConfig, model: ModelClient) -> Result<Self> {
-        let store = V2Store::open(config.store_root)?;
-        let contracts = ContractRegistry::install(
-            &akzio_context::legacy::ContextBroker::new(store.clone()),
-            Utc::now(),
-        )?;
+        Self::with_fixture_evidence(config, model, FixtureEvidence::new())
+    }
+
+    /// Install deterministic local fixture evidence for tests and replay only.
+    /// This adapter has no HTTP or filesystem capability.
+    pub fn with_fixture_evidence(
+        config: DaemonConfig,
+        model: ModelClient,
+        fixture_evidence: FixtureEvidence,
+    ) -> Result<Self> {
+        let store = V2Store::open(&config.store_root)?;
+        let active = ActiveResearchCatalogue::install(&store, Utc::now())?;
+        let workflow = WorkflowRuntime::new(store.clone(), active.recipes);
+        let agents = AgentRuntime::new(store.clone(), active.contracts, Duration::minutes(5));
+
         Ok(Self {
-            workflow: WorkflowRuntime::new(store.clone()),
             task_runtime: TaskRuntime::new(store.clone()),
-            contracts,
-            store,
-            model,
+            workflow,
+            agents,
+            model: ModelClientAdapter::new(model),
+            fixture_evidence: Arc::new(fixture_evidence),
             http_token: config.http_token,
             auto_paper: config.auto_paper,
-            instance_id: format!(
-                "akzio-{}-{}",
-                std::process::id(),
-                Utc::now().timestamp_micros()
-            ),
             worker_pool: WorkerPoolConfig {
                 worker_count: config.worker_count.max(1),
                 ..WorkerPoolConfig::default()
             },
+            store,
         })
     }
 
-    pub fn submit(
-        &self,
-        run_id: &RunId,
-        purpose: RunPurpose,
-        plan: WorkflowPlan,
-    ) -> Result<CompiledWorkflow> {
-        self.workflow
-            .submit(run_id, purpose, plan, Utc::now())
-            .map_err(Into::into)
+    pub fn store(&self) -> &V2Store {
+        &self.store
     }
 
-    fn default_plan(&self, run_id: &RunId, purpose: RunPurpose) -> Result<WorkflowPlan> {
-        let baseline = baseline_topology();
-        let broker = akzio_context::legacy::ContextBroker::new(self.store.clone());
-        let topology = if purpose == RunPurpose::Paper {
-            TopologyLedger::new(broker.clone()).topology_for_run(run_id, baseline.clone())?
-        } else {
-            baseline.clone()
-        };
-        Ok(bootstrap_workflow(
-            purpose,
-            topology,
-            &self.contracts.installed(),
-        ))
-    }
-
-    fn ensure_topology_for_plan(
-        &self,
-        run_id: &RunId,
-        purpose: RunPurpose,
-        plan: &WorkflowPlan,
-        now: chrono::DateTime<Utc>,
-    ) -> Result<()> {
-        if purpose == RunPurpose::Paper {
-            let state = if plan.topology_id == baseline_topology() {
-                TopologyState::Active
-            } else {
-                TopologyState::Candidate
-            };
-            TopologyLedger::new(akzio_context::legacy::ContextBroker::new(
-                self.store.clone(),
-            ))
-            .ensure_topology(run_id, plan.topology_id.clone(), state, now)?;
-        }
-        Ok(())
-    }
-
+    /// Paper sessions are scheduler-owned and require a frozen session slot.
+    /// The R5 daemon does not construct one directly, so this public submit
+    /// surface rejects Paper before any workflow or broker side effect.
     pub fn submit_default(&self, purpose: RunPurpose) -> Result<RunId> {
         if purpose == RunPurpose::Paper {
             return Err(DaemonError::InvalidInput(
-                "Paper runs are scheduler-owned; start the daemon and wait for an open market session"
+                "Paper runs are scheduler-owned and unavailable until the fenced scheduler is wired"
                     .to_owned(),
             ));
         }
+
         let run_id = RunId::new();
-        let now = Utc::now();
-        let plan = self.default_plan(&run_id, purpose)?;
-        self.workflow.submit(&run_id, purpose, plan.clone(), now)?;
-        self.ensure_topology_for_plan(&run_id, purpose, &plan, now)?;
-        Ok(run_id)
-    }
-
-    fn schedule_paper_session(
-        &self,
-        lease: &DaemonLease,
-        session_date: NaiveDate,
-        now: chrono::DateTime<Utc>,
-    ) -> Result<Option<RunId>> {
-        if !self.auto_paper {
-            return Ok(None);
-        }
-        let session_key = format!("paper:{}", session_date.format("%F"));
-        let reservation = if let Some(slot) = self.store.paper_schedule_slot(&session_key)? {
-            self.store.reserve_paper_schedule_slot(
-                lease,
-                &session_key,
-                &slot.run_id,
-                &slot.plan,
-                now,
-            )?
-        } else {
-            let proposed_run_id = RunId::new();
-            let plan = self.default_plan(&proposed_run_id, RunPurpose::Paper)?;
-            self.store.reserve_paper_schedule_slot(
-                lease,
-                &session_key,
-                &proposed_run_id,
-                &plan,
-                now,
-            )?
-        };
-        let slot = reservation.slot;
-        if slot.submitted_at.is_some() {
-            return Ok(Some(slot.run_id));
-        }
+        let graph = self.workflow.bootstrap(purpose, "active")?;
         self.workflow
-            .submit_or_recover(&slot.run_id, RunPurpose::Paper, slot.plan.clone(), now)?;
-        self.ensure_topology_for_plan(&slot.run_id, RunPurpose::Paper, &slot.plan, now)?;
-        if self
-            .store
-            .mark_paper_schedule_submitted(lease, &session_key, &slot.run_id, now)?
-        {
-            let plan_document_id = self.store.workflow_plan_document(&slot.run_id)?;
-            let plan_document = self.store.read_document(&plan_document_id)?;
-            self.store.append_event(&akzio_domain::EventEnvelope {
-                schema_version: akzio_domain::V2_SCHEMA_VERSION,
-                run_id: slot.run_id.clone(),
-                task_id: None,
-                attempt_id: None,
-                contract_hash: None,
-                causation_id: Some(session_key),
-                event_type: "scheduler.paper_submitted".to_owned(),
-                payload_document_id: Some(plan_document_id),
-                payload: Some(plan_document.blob),
-                created_at: now,
-            })?;
-        }
-        Ok(Some(slot.run_id))
-    }
-
-    async fn maybe_schedule_paper(
-        &self,
-        lease: &DaemonLease,
-        now: chrono::DateTime<Utc>,
-    ) -> Result<()> {
-        if !self.auto_paper {
-            return Ok(());
-        }
-        let paper = AlpacaPaper::from_env().map_err(ExecutionRuntimeError::Paper)?;
-        let clock = paper
-            .market_clock()
-            .await
-            .map_err(ExecutionRuntimeError::Paper)?;
-        if clock.is_open {
-            self.schedule_paper_session(lease, clock.session_date, now)?;
-        }
-        Ok(())
-    }
-
-    async fn poll_paper_schedule(
-        &self,
-        lease: &DaemonLease,
-        now: chrono::DateTime<Utc>,
-    ) -> Result<()> {
-        match self.maybe_schedule_paper(lease, now).await {
-            Ok(()) => Ok(()),
-            Err(error) if error.is_retryable() => {
-                tracing::warn!(error = %error, "paper schedule poll will retry");
-                Ok(())
-            }
-            Err(error) => Err(error),
-        }
+            .submit(run_id.clone(), purpose, graph, Utc::now())?;
+        Ok(run_id)
     }
 
     pub async fn run_one(&self, worker_id: &str) -> Result<bool> {
         let daemon = self.clone();
-        self.task_runtime
-            .run_one_async(worker_id, move |task| {
-                let daemon = daemon.clone();
-                async move { daemon.execute_task(task).await }
+        Ok(self
+            .task_runtime
+            .run_one(worker_id, move |task| async move {
+                daemon.execute_task(task).await
             })
-            .await
-            .map_err(Into::into)
+            .await?)
     }
 
-    pub async fn serve_workers(self: Arc<Self>, mut shutdown: watch::Receiver<bool>) -> Result<()> {
-        loop {
-            if *shutdown.borrow() {
-                return Ok(());
-            }
-            let now = Utc::now();
-            let Some(lease) = self.store.acquire_daemon_lease(
-                SCHEDULER_LEASE_NAME,
-                &self.instance_id,
-                now,
-                now + chrono::Duration::seconds(SCHEDULER_LEASE_SECONDS),
-            )?
-            else {
-                tokio::select! {
-                    _ = tokio::time::sleep(SCHEDULER_RETRY) => {}
-                    changed = shutdown.changed() => {
-                        if changed.is_err() || *shutdown.borrow() {
-                            return Ok(());
-                        }
-                    }
-                }
-                continue;
-            };
-            self.store.recover_expired_tasks(now)?;
-            self.poll_paper_schedule(&lease, now).await?;
-            let (leader_shutdown_tx, leader_shutdown_rx) = watch::channel(false);
-            let daemon = self.clone();
-            let handler: TaskHandler = Arc::new(move |task| {
-                let daemon = daemon.clone();
-                Box::pin(async move { daemon.execute_task(task).await })
-            });
-            let pool = WorkerPool::new(self.task_runtime.clone(), self.worker_pool.clone());
-            let mut workers =
-                tokio::spawn(async move { pool.serve(handler, leader_shutdown_rx).await });
-            let mut heartbeat = tokio::time::interval(SCHEDULER_HEARTBEAT);
-            heartbeat.tick().await;
-            let mut paper_schedule = tokio::time::interval(PAPER_SCHEDULE_POLL);
-            paper_schedule.tick().await;
-            let mut worker_finished = false;
-            let mut lost_leadership = false;
-            let mut worker_error = None;
-            loop {
-                tokio::select! {
-                    result = &mut workers => {
-                        worker_finished = true;
-                        worker_error = Some(result);
-                        break;
-                    }
-                    _ = heartbeat.tick() => {
-                        let now = Utc::now();
-                    if !self.store.heartbeat_daemon_lease(
-                        &lease,
-                        now,
-                        now + chrono::Duration::seconds(SCHEDULER_LEASE_SECONDS),
-                    )? {
-                        lost_leadership = true;
-                        break;
-                    }
-                    }
-                    _ = paper_schedule.tick() => {
-                        self.poll_paper_schedule(&lease, Utc::now()).await?;
-                    }
-                    changed = shutdown.changed() => {
-                        if changed.is_err() || *shutdown.borrow() {
-                            break;
-                        }
-                    }
-                }
-            }
-            let _ = leader_shutdown_tx.send(true);
-            if !worker_finished {
-                let result = workers.await.map_err(|error| {
-                    DaemonError::Runtime(RuntimeError::Handler(format!(
-                        "leader worker pool join failed: {error}"
-                    )))
-                })?;
-                result?;
-            } else if let Some(result) = worker_error {
-                result
-                    .map_err(|error| {
-                        DaemonError::Runtime(RuntimeError::Handler(format!(
-                            "leader worker pool join failed: {error}"
-                        )))
-                    })?
-                    .map_err(DaemonError::from)?;
-            }
-            let _ = self.store.release_daemon_lease(&lease)?;
-            if *shutdown.borrow() {
-                return Ok(());
-            }
-            if !lost_leadership {
-                return Err(DaemonError::Runtime(RuntimeError::Handler(
-                    "leader worker pool exited unexpectedly".to_owned(),
-                )));
-            }
-        }
+    /// Worker supervision contains no research, execution, or learning policy.
+    pub async fn serve_workers(&self, shutdown: watch::Receiver<bool>) -> Result<()> {
+        let daemon = self.clone();
+        let handler: TaskHandler = Arc::new(move |task| {
+            let daemon = daemon.clone();
+            Box::pin(async move { daemon.execute_task(task).await })
+        });
+        WorkerPool::new(self.task_runtime.clone(), self.worker_pool.clone())
+            .serve(handler, shutdown)
+            .await?;
+        Ok(())
     }
 
     pub fn health(&self) -> Result<DaemonHealth> {
@@ -474,7 +256,11 @@ impl Daemon {
             .daemon_lease(SCHEDULER_LEASE_NAME)?
             .filter(|lease| lease.expires_at > Utc::now());
         Ok(DaemonHealth {
-            status: "ok".to_owned(),
+            status: if self.auto_paper {
+                "paper_scheduler_fail_closed".to_owned()
+            } else {
+                "ok".to_owned()
+            },
             scheduler_owner: lease.as_ref().map(|lease| lease.owner_id.clone()),
             scheduler_epoch: lease.map(|lease| lease.epoch),
         })
@@ -493,7 +279,7 @@ impl Daemon {
             DaemonCommand::Events { run_id, after } => Ok(DaemonReply::Events {
                 events: self
                     .store
-                    .events_after(&run_id, after, 256)?
+                    .events_after(&run_id, after, EVENT_PAGE_SIZE)?
                     .into_iter()
                     .map(EventView::from)
                     .collect(),
@@ -501,138 +287,324 @@ impl Daemon {
             DaemonCommand::Submit { purpose } => Ok(DaemonReply::Submitted {
                 run_id: self.submit_default(purpose)?,
             }),
-            DaemonCommand::Cancel { run_id } => {
-                let cancelled_tasks = self.store.cancel_run(&run_id, Utc::now())?;
-                let payload = self.store.put_bytes(
-                    serde_json::to_string(&serde_json::json!({
-                        "cancelled_tasks": cancelled_tasks,
-                    }))?
-                    .as_bytes(),
-                    "application/json",
-                )?;
-                self.store.append_event(&akzio_domain::EventEnvelope {
-                    schema_version: akzio_domain::V2_SCHEMA_VERSION,
-                    run_id: run_id.clone(),
-                    task_id: None,
-                    attempt_id: None,
-                    contract_hash: None,
-                    causation_id: None,
-                    event_type: "workflow.cancel_requested".to_owned(),
-                    payload_document_id: None,
-                    payload: Some(payload),
-                    created_at: Utc::now(),
-                })?;
-                Ok(DaemonReply::Cancelled {
-                    run_id,
-                    cancelled_tasks,
-                })
-            }
-            DaemonCommand::Retry { run_id } => {
-                let purpose = self.store.run_purpose(&run_id)?;
-                if purpose == RunPurpose::Paper {
-                    return Err(DaemonError::InvalidInput(
-                        "Paper retries are scheduler-owned; retrying a completed session would create a second execution path"
-                            .to_owned(),
-                    ));
-                }
-                let retry_run_id = self.submit_default(purpose)?;
-                let payload = self.store.put_bytes(
-                    serde_json::to_string(&serde_json::json!({"retry_of": run_id}))?.as_bytes(),
-                    "application/json",
-                )?;
-                self.store.append_event(&akzio_domain::EventEnvelope {
-                    schema_version: akzio_domain::V2_SCHEMA_VERSION,
-                    run_id: retry_run_id.clone(),
-                    task_id: None,
-                    attempt_id: None,
-                    contract_hash: None,
-                    causation_id: Some(run_id.0.clone()),
-                    event_type: "workflow.retried".to_owned(),
-                    payload_document_id: None,
-                    payload: Some(payload),
-                    created_at: Utc::now(),
-                })?;
-                Ok(DaemonReply::Retried {
-                    source_run_id: run_id,
-                    run_id: retry_run_id,
-                })
-            }
+            DaemonCommand::Cancel { .. } => Err(DaemonError::Unavailable(
+                "v2 cancellation is not wired; fail closed rather than mutate task state outside TaskRuntime"
+                    .to_owned(),
+            )),
+            DaemonCommand::Retry { .. } => Err(DaemonError::Unavailable(
+                "v2 retry is owned by TaskRuntime retry policy; direct run retry is unavailable"
+                    .to_owned(),
+            )),
         }
     }
 
-    pub fn router(self: Arc<Self>) -> Router {
+    pub fn router(&self) -> Router {
         Router::new()
             .route("/health", get(http_health))
             .route("/runs/{run_id}/events", get(http_events))
             .route("/runs", post(http_submit))
             .route("/runs/{run_id}/cancel", post(http_cancel))
             .route("/runs/{run_id}/retry", post(http_retry))
-            .with_state(self)
+            .with_state(Arc::new(self.clone()))
     }
 
     pub async fn serve_http(
-        self: Arc<Self>,
+        &self,
         address: SocketAddr,
         shutdown: watch::Receiver<bool>,
     ) -> Result<()> {
         let listener = TcpListener::bind(address).await?;
         axum::serve(listener, self.router())
             .with_graceful_shutdown(wait_for_shutdown(shutdown))
-            .await?;
-        Ok(())
+            .await
+            .map_err(DaemonError::Io)
     }
 
+    /// Transitional local Unix JSON transport retained until R8/R9. Its
+    /// commands call the same v2 Daemon API as HTTP and never bypass it.
     pub async fn serve_unix(
-        self: Arc<Self>,
+        &self,
         path: PathBuf,
         mut shutdown: watch::Receiver<bool>,
     ) -> Result<()> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            tokio::fs::create_dir_all(parent).await?;
         }
         if path.exists() {
-            std::fs::remove_file(&path)?;
+            tokio::fs::remove_file(&path).await?;
         }
-        let listener = UnixListener::bind(path)?;
+        let listener = UnixListener::bind(&path)?;
+
         loop {
-            let (stream, _) = tokio::select! {
-                accepted = listener.accept() => accepted?,
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let (stream, _) = accepted?;
+                    let daemon = self.clone();
+                    tokio::spawn(async move {
+                        let (read, mut write) = stream.into_split();
+                        let mut lines = BufReader::new(read).lines();
+                        while let Ok(Some(line)) = lines.next_line().await {
+                            let payload = match serde_json::from_str::<DaemonCommand>(&line)
+                                .map_err(DaemonError::from)
+                                .and_then(|command| daemon.handle(command))
+                            {
+                                Ok(reply) => serde_json::to_string(&reply),
+                                Err(error) => serde_json::to_string(&serde_json::json!({
+                                    "error": error.to_string(),
+                                })),
+                            };
+                            let Ok(payload) = payload else {
+                                break;
+                            };
+                            if write
+                                .write_all(format!("{payload}\n").as_bytes())
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    });
+                }
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {
                         return Ok(());
                     }
-                    continue;
                 }
-            };
-            let daemon = self.clone();
-            tokio::spawn(async move {
-                let (read, mut write) = stream.into_split();
-                let mut lines = BufReader::new(read).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    let reply = serde_json::from_str::<DaemonCommand>(&line)
-                        .map_err(DaemonError::from)
-                        .and_then(|command| daemon.handle(command));
-                    let payload = match reply {
-                        Ok(reply) => serde_json::to_string(&reply),
-                        Err(error) => serde_json::to_string(&serde_json::json!({
-                            "error": error.to_string()
-                        })),
-                    };
-                    let Ok(payload) = payload else { break };
-                    if write
-                        .write_all(format!("{payload}\n").as_bytes())
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            });
+            }
         }
     }
 
-    pub fn store(&self) -> &V2Store {
-        &self.store
+    pub(crate) async fn execute_task(&self, task: ClaimedAttempt) -> TaskCompletion {
+        match self.execute_task_inner(&task, Utc::now()).await {
+            Ok(completion) => completion,
+            Err(error) => {
+                tracing::warn!(
+                    run_id = %task.run_id,
+                    task_id = %task.node.task_id,
+                    recipe = %task.node.recipe_id,
+                    error = %error,
+                    "v2 daemon task failed closed"
+                );
+                TaskCompletion::Failed
+            }
+        }
+    }
+
+    async fn execute_task_inner(
+        &self,
+        task: &ClaimedAttempt,
+        now: DateTime<Utc>,
+    ) -> Result<TaskCompletion> {
+        let recipe = self.workflow.catalogue().recipe(&task.node.recipe_id)?;
+        match recipe.task_class {
+            RuntimeTaskClass::Agent => {
+                let candidates = self.context_candidates(task)?;
+                let output = self
+                    .agents
+                    .run(&task.permit, &task.node, candidates, &self.model, now)
+                    .await?;
+                if task.node.recipe_id.as_str() == "research.planner" {
+                    let revision = self.workflow.recover(&task.run_id)?.revision;
+                    self.workflow.apply_planner_output(
+                        task,
+                        &revision.graph_artifact,
+                        &revision.graph,
+                        &output,
+                        now,
+                    )?;
+                    Ok(TaskCompletion::Committed)
+                } else {
+                    Ok(TaskCompletion::Succeeded(vec![output]))
+                }
+            }
+            RuntimeTaskClass::Evidence => {
+                Ok(TaskCompletion::Succeeded(self.acquire_evidence(task, now)?))
+            }
+            RuntimeTaskClass::DecisionGate
+            | RuntimeTaskClass::ExecutionGate
+            | RuntimeTaskClass::PaperCommit
+            | RuntimeTaskClass::Reconcile
+            | RuntimeTaskClass::Evaluate => {
+                Err(DaemonError::UnsupportedTaskClass(recipe.task_class))
+            }
+        }
+    }
+
+    /// Build agent input strictly from its declared inputs and the Store's
+    /// semantic committed-output query for declared, successful dependencies.
+    /// This never scans a run's artifact set or exposes raw evidence;
+    /// `AgentRuntime` then creates the task-bound ContextManifest and
+    /// ReadGrant.
+    fn context_candidates(&self, task: &ClaimedAttempt) -> Result<Vec<ArtifactRef>> {
+        let contract_hash = task.node.contract_hash.as_ref().ok_or_else(|| {
+            DaemonError::InvalidInput(format!(
+                "agent task {} has no contract hash",
+                task.node.task_id
+            ))
+        })?;
+        let policy = &self.agents.catalogue().get(contract_hash)?.contract.context;
+        let mut candidates = BTreeMap::<ArtifactId, ArtifactRef>::new();
+
+        for reference in &task.node.input_artifacts {
+            self.admit_context_candidate(&mut candidates, policy, reference)?;
+        }
+
+        let dependencies = task
+            .node
+            .dependencies
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if !dependencies.is_empty() {
+            let snapshot = self.store.workflow_snapshot(&task.run_id)?;
+            for dependency in &dependencies {
+                let dependency_task = snapshot
+                    .tasks
+                    .iter()
+                    .find(|stored| stored.node.task_id == *dependency)
+                    .ok_or_else(|| {
+                        DaemonError::InvalidInput(format!(
+                            "task {} references missing dependency {dependency}",
+                            task.node.task_id
+                        ))
+                    })?;
+                if dependency_task.status != TaskStatus::Succeeded {
+                    return Err(DaemonError::UnfinishedDependency {
+                        task_id: task.node.task_id.clone(),
+                        dependency: dependency.clone(),
+                    });
+                }
+            }
+
+            for dependency in dependencies {
+                for artifact in self
+                    .store
+                    .committed_task_outputs(&task.run_id, &dependency)?
+                {
+                    self.admit_context_candidate(
+                        &mut candidates,
+                        policy,
+                        &ArtifactRef {
+                            artifact_id: artifact.artifact_id,
+                            kind: artifact.kind,
+                        },
+                    )?;
+                }
+            }
+        }
+
+        if candidates.is_empty() && task.node.recipe_id.as_str() != "research.planner" {
+            return Err(DaemonError::MissingTaskContext(task.node.task_id.clone()));
+        }
+        Ok(candidates.into_values().collect())
+    }
+
+    fn admit_context_candidate(
+        &self,
+        candidates: &mut BTreeMap<ArtifactId, ArtifactRef>,
+        policy: &ContextPolicy,
+        reference: &ArtifactRef,
+    ) -> Result<()> {
+        let artifact = self.store.artifact(&reference.artifact_id)?;
+        if artifact.kind == ArtifactKind::RawEvidence {
+            return Ok(());
+        }
+        if policy.permitted_kinds.contains(&artifact.kind)
+            && policy
+                .permitted_source_families
+                .contains(&artifact.provenance.source_family)
+        {
+            candidates.insert(
+                artifact.artifact_id.clone(),
+                ArtifactRef {
+                    artifact_id: artifact.artifact_id,
+                    kind: artifact.kind,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    fn acquire_evidence(
+        &self,
+        task: &ClaimedAttempt,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<akzio_domain::Artifact>> {
+        let mut artifacts = BTreeMap::new();
+        for need_reference in &task.node.input_artifacts {
+            if need_reference.kind != ArtifactKind::EvidenceNeed {
+                return Err(DaemonError::InvalidInput(format!(
+                    "evidence task {} has non-EvidenceNeed input",
+                    task.node.task_id
+                )));
+            }
+            let need_artifact = self.store.artifact(&need_reference.artifact_id)?;
+            let need: EvidenceNeed =
+                serde_json::from_slice(&self.store.read_blob(&need_artifact.blob)?)?;
+            need.validate()
+                .map_err(|error| DaemonError::InvalidInput(error.to_string()))?;
+            let source = evidence_source(&need.source_family)?;
+            let max_age_secs = i64::try_from(need.max_age_secs).map_err(|_| {
+                DaemonError::InvalidInput("EvidenceNeed max_age_secs exceeds i64".to_owned())
+            })?;
+            let responses = self.fixture_evidence.get(&source).ok_or_else(|| {
+                DaemonError::Unavailable(format!(
+                    "no local fixture adapter configured for evidence source {}",
+                    source.as_str()
+                ))
+            })?;
+            let adapter = FixtureEvidenceAdapter::new(
+                source,
+                responses
+                    .iter()
+                    .map(|(resource, evidence)| (resource.clone(), evidence.clone())),
+            );
+            let runtime = EvidenceRuntime::new(self.store.clone(), [source]);
+            let bundle = runtime.acquire_and_normalize(
+                &task.permit,
+                need_reference,
+                &EvidenceRequest {
+                    source,
+                    resource: need.resource,
+                    max_age: Duration::seconds(max_age_secs),
+                },
+                &adapter,
+                now,
+            )?;
+            artifacts.insert(bundle.raw.artifact_id.clone(), bundle.raw);
+            artifacts.insert(bundle.normalized.artifact_id.clone(), bundle.normalized);
+        }
+        if artifacts.is_empty() {
+            return Err(DaemonError::InvalidInput(format!(
+                "evidence task {} has no EvidenceNeed inputs",
+                task.node.task_id
+            )));
+        }
+        Ok(artifacts.into_values().collect())
+    }
+}
+
+fn evidence_source(source_family: &str) -> Result<EvidenceSource> {
+    match source_family {
+        "alpaca" => Ok(EvidenceSource::Alpaca),
+        "sec_edgar" => Ok(EvidenceSource::SecEdgar),
+        "fred" => Ok(EvidenceSource::Fred),
+        "news_web" => Ok(EvidenceSource::NewsWeb),
+        other => Err(DaemonError::InvalidInput(format!(
+            "unsupported evidence source family {other}"
+        ))),
+    }
+}
+
+impl From<StoredEvent> for EventView {
+    fn from(event: StoredEvent) -> Self {
+        Self {
+            cursor: event.cursor,
+            event_type: event.event_type,
+            task_id: event.task_id.map(|task_id| task_id.0),
+            created_at: event.created_at.to_rfc3339(),
+        }
     }
 }
 
@@ -643,17 +615,6 @@ async fn wait_for_shutdown(mut shutdown: watch::Receiver<bool>) {
     while shutdown.changed().await.is_ok() {
         if *shutdown.borrow() {
             return;
-        }
-    }
-}
-
-impl From<StoredEvent> for EventView {
-    fn from(event: StoredEvent) -> Self {
-        Self {
-            cursor: event.cursor,
-            event_type: event.envelope.event_type,
-            task_id: event.envelope.task_id.map(|task| task.0),
-            created_at: event.envelope.created_at.to_rfc3339(),
         }
     }
 }
@@ -683,19 +644,26 @@ async fn http_events(
     let mut cursor = query.after.unwrap_or(0);
     let stream = stream! {
         loop {
-            match daemon.store.events_after(&run_id, cursor, 256) {
+            match daemon.store.events_after(&run_id, cursor, EVENT_PAGE_SIZE) {
                 Ok(events) if events.is_empty() => {
                     yield Ok(Event::default().comment("keepalive"));
                 }
                 Ok(events) => {
                     for event in events {
                         cursor = event.cursor;
-                        let data = serde_json::to_string(&EventView::from(event))
-                            .unwrap_or_else(|_| "{}".to_owned());
-                        yield Ok(Event::default().id(cursor.to_string()).event("akzio").data(data));
+                        match serde_json::to_string(&EventView::from(event)) {
+                            Ok(data) => {
+                                yield Ok(Event::default().id(cursor.to_string()).event("akzio").data(data));
+                            }
+                            Err(error) => {
+                                yield Ok(Event::default().event("error").data(error.to_string()));
+                            }
+                        }
                     }
                 }
-                Err(error) => yield Ok(Event::default().event("error").data(error.to_string())),
+                Err(error) => {
+                    yield Ok(Event::default().event("error").data(error.to_string()));
+                }
             }
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
@@ -728,7 +696,7 @@ async fn http_cancel(
             run_id: RunId(run_id),
         })
         .map(Json)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        .map_err(|_| StatusCode::CONFLICT)
 }
 
 async fn http_retry(
@@ -742,43 +710,64 @@ async fn http_retry(
             run_id: RunId(run_id),
         })
         .map(Json)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        .map_err(|_| StatusCode::CONFLICT)
 }
 
 fn authorize(daemon: &Daemon, headers: &HeaderMap) -> std::result::Result<(), StatusCode> {
-    (headers
+    headers
         .get("x-akzio-token")
         .and_then(|value| value.to_str().ok())
-        == Some(daemon.http_token.as_str()))
-    .then_some(())
-    .ok_or(StatusCode::UNAUTHORIZED)
+        .filter(|value| *value == daemon.http_token)
+        .map(|_| ())
+        .ok_or(StatusCode::UNAUTHORIZED)
 }
 
 pub fn fixture_model_client() -> ModelClient {
+    let planner = serde_json::json!({
+        "schema_version": akzio_domain::V2_DOMAIN_SCHEMA_VERSION,
+        "topology_id": "active",
+        "tasks": {
+            "analyst": {
+                "recipe_id": "research.analyst",
+                "objective": "Produce a fixture claim",
+                "depends_on": [],
+                "priority": 80,
+                "evidence_needs": []
+            }
+        },
+        "stop_reason": "fixture planner has no configured evidence adapter"
+    });
+    let response = |output: serde_json::Value| {
+        serde_json::json!({
+            "output_text": serde_json::to_string(&output).expect("static fixture JSON"),
+        })
+    };
     ModelClient::FixtureBySchema(BTreeMap::from([
+        ("research.planner".to_owned(), response(planner)),
         (
-            "workflow_plan".to_owned(),
-            serde_json::json!({
-                "output_text": r#"{"summary":"fixture plan","tasks":[{"role":"investigator","question":"Assess current four-ETF evidence","priority":80},{"role":"challenger","question":"Find missing or contradictory evidence","priority":70}]}"#
-            }),
+            "research.analyst".to_owned(),
+            response(serde_json::json!({
+                "summary": "fixture claim",
+                "confidence_ppm": 500000,
+                "rationale": "fixture-only"
+            })),
         ),
         (
-            "claims".to_owned(),
-            serde_json::json!({
-                "output_text": r#"{"summary":"fixture evidence","claims":[{"claim":"No actionable edge in fixture input","evidence_refs":[]}]}"#
-            }),
+            "research.critic".to_owned(),
+            response(serde_json::json!({
+                "summary": "fixture critique",
+                "severity": "low",
+                "blocker": false
+            })),
         ),
         (
-            "challenge".to_owned(),
-            serde_json::json!({
-                "output_text": r#"{"summary":"fixture challenge","verdict":"unresolved","arguments":[]}"#
-            }),
-        ),
-        (
-            "decision_draft".to_owned(),
-            serde_json::json!({
-                    "output_text": r#"{"summary":"fixture decision: stay in cash","targets":{"weights":{"TQQQ":0,"QQQ":0,"SOXX":0,"SOXL":0}},"confidence_ppm":500000,"forecasts":[{"trading_days":1,"positive_return_probability_ppm":500000,"expected_return_ppm":0},{"trading_days":3,"positive_return_probability_ppm":500000,"expected_return_ppm":0},{"trading_days":5,"positive_return_probability_ppm":500000,"expected_return_ppm":0}],"blockers":[],"claim_refs":[]}"#
-            }),
+            "research.synthesizer".to_owned(),
+            response(serde_json::json!({
+                "summary": "fixture decision draft",
+                "confidence_ppm": 500000,
+                "blockers": [],
+                "asset_views": {}
+            })),
         ),
     ]))
 }
@@ -786,236 +775,172 @@ pub fn fixture_model_client() -> ModelClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use akzio_domain::{
+        ArtifactKind, EvidenceNeed, TaskRecipeId, WorkflowProposalDraft, WorkflowProposalDraftTask,
+    };
+    use akzio_ingest::NormalizedEvidencePayload;
     use tempfile::tempdir;
 
-    fn daemon() -> (tempfile::TempDir, Daemon) {
+    fn config(root: PathBuf) -> DaemonConfig {
+        DaemonConfig {
+            store_root: root,
+            http_token: "fixture-token".to_owned(),
+            worker_count: 1,
+            auto_paper: false,
+        }
+    }
+
+    fn response(output: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "output_text": serde_json::to_string(&output).unwrap(),
+        })
+    }
+
+    fn planner_with_alpaca_need() -> ModelClient {
+        let draft = WorkflowProposalDraft {
+            schema_version: akzio_domain::V2_DOMAIN_SCHEMA_VERSION,
+            topology_id: "active".to_owned(),
+            tasks: BTreeMap::from([(
+                "analyst".to_owned(),
+                WorkflowProposalDraftTask {
+                    recipe_id: TaskRecipeId::new("research.analyst").unwrap(),
+                    objective: "Assess TQQQ fixture evidence".to_owned(),
+                    depends_on: vec![],
+                    priority: 80,
+                    evidence_needs: vec![EvidenceNeed {
+                        schema_version: akzio_domain::V2_DOMAIN_SCHEMA_VERSION,
+                        source_family: "alpaca".to_owned(),
+                        resource: "bars:TQQQ:1d".to_owned(),
+                        max_age_secs: 86_400,
+                    }],
+                },
+            )]),
+            stop_reason: Some("fixture".to_owned()),
+        };
+        ModelClient::FixtureBySchema(BTreeMap::from([
+            (
+                "research.planner".to_owned(),
+                response(serde_json::to_value(draft).unwrap()),
+            ),
+            (
+                "research.analyst".to_owned(),
+                response(serde_json::json!({
+                    "summary": "fixture claim",
+                    "confidence_ppm": 500000,
+                    "rationale": "normalized fixture evidence"
+                })),
+            ),
+        ]))
+    }
+
+    #[tokio::test]
+    async fn planner_task_runs_agent_runtime_and_commits_graph_patch() {
         let directory = tempdir().unwrap();
         let daemon = Daemon::with_model(
-            DaemonConfig {
-                store_root: directory.path().to_path_buf(),
-                http_token: "test-token".to_owned(),
-                worker_count: 2,
-                auto_paper: false,
-            },
+            config(directory.path().to_path_buf()),
             fixture_model_client(),
         )
         .unwrap();
-        (directory, daemon)
-    }
+        let run_id = daemon.submit_default(RunPurpose::Debug).unwrap();
 
-    #[test]
-    fn command_router_reads_the_durable_event_log() {
-        let (_directory, daemon) = daemon();
-        let run = RunId::new();
-        daemon
-            .store()
-            .create_run(&run, RunPurpose::Debug, "test", Utc::now())
-            .unwrap();
-        daemon
-            .store()
-            .append_event(&akzio_domain::EventEnvelope {
-                schema_version: akzio_domain::V2_SCHEMA_VERSION,
-                run_id: run.clone(),
-                task_id: None,
-                attempt_id: None,
-                contract_hash: None,
-                causation_id: None,
-                event_type: "workflow.submitted".to_owned(),
-                payload_document_id: None,
-                payload: None,
-                created_at: Utc::now(),
-            })
-            .unwrap();
-        let DaemonReply::Events { events } = daemon
-            .handle(DaemonCommand::Events {
-                run_id: run,
-                after: 0,
-            })
-            .unwrap()
-        else {
-            panic!("expected events");
-        };
-        assert_eq!(events.len(), 1);
-    }
+        assert!(daemon.run_one("fixture").await.unwrap());
 
-    #[test]
-    fn paper_dry_run_never_creates_canonical_topology_state() {
-        let (_directory, daemon) = daemon();
-        let topology_state_count = || {
-            daemon
-                .store()
-                .documents_by_kind(DocumentKind::Evaluation)
-                .unwrap()
-                .into_iter()
-                .filter(|document| document.producer == "learning.topology_state")
-                .count()
-        };
-
-        let before = topology_state_count();
-        let plan = daemon
-            .default_plan(&RunId::new(), RunPurpose::PaperDryRun)
-            .unwrap();
-        assert_eq!(plan.topology_id, baseline_topology());
-        assert_eq!(topology_state_count(), before);
-
-        let run_id = daemon.submit_default(RunPurpose::PaperDryRun).unwrap();
-        assert_eq!(topology_state_count(), before);
+        let snapshot = daemon.store().workflow_snapshot(&run_id).unwrap();
+        assert!(snapshot
+            .revision
+            .graph
+            .nodes
+            .iter()
+            .any(|node| node.recipe_id.as_str() == "research.analyst"));
         assert!(daemon
             .store()
-            .documents_for_run(&run_id)
+            .events_after(&run_id, 0, 64)
+            .unwrap()
+            .iter()
+            .any(|event| event.event_type == "task.succeeded"));
+        daemon.store().verify_integrity().unwrap();
+    }
+
+    #[tokio::test]
+    async fn evidence_gate_resolves_need_with_fixture_adapter_and_keeps_provenance() {
+        let directory = tempdir().unwrap();
+        let observed_at = Utc::now();
+        let fixture_evidence = BTreeMap::from([(
+            EvidenceSource::Alpaca,
+            BTreeMap::from([(
+                "bars:TQQQ:1d".to_owned(),
+                AcquiredEvidence {
+                    raw: br#"{\"bars\":[{\"close\":100}]}"#.to_vec(),
+                    media_type: "application/json".to_owned(),
+                    source_uri: "fixture://alpaca/bars/TQQQ/1d".to_owned(),
+                    observed_at,
+                    normalized: serde_json::json!({"close": 100}),
+                },
+            )]),
+        )]);
+        let daemon = Daemon::with_fixture_evidence(
+            config(directory.path().to_path_buf()),
+            planner_with_alpaca_need(),
+            fixture_evidence,
+        )
+        .unwrap();
+        let run_id = daemon.submit_default(RunPurpose::Debug).unwrap();
+
+        for _ in 0..16 {
+            if !daemon.run_one("fixture").await.unwrap() {
+                break;
+            }
+        }
+        let artifacts = daemon
+            .store()
+            .events_after(&run_id, 0, 256)
             .unwrap()
             .into_iter()
-            .all(|document| document.producer != "learning.topology_state"));
+            .filter_map(|event| event.artifact_id)
+            .filter_map(|artifact_id| daemon.store().artifact(&artifact_id).ok())
+            .collect::<Vec<_>>();
+        let normalized = artifacts
+            .iter()
+            .find(|artifact| artifact.kind == ArtifactKind::NormalizedEvidence)
+            .expect("evidence gate committed normalized fixture evidence");
+        let payload: NormalizedEvidencePayload =
+            serde_json::from_slice(&daemon.store().read_blob(&normalized.blob).unwrap()).unwrap();
+        assert_eq!(payload.resource, "bars:TQQQ:1d");
+        assert_eq!(payload.need.kind, ArtifactKind::EvidenceNeed);
+        assert!(artifacts
+            .iter()
+            .any(|artifact| artifact.kind == ArtifactKind::Claim));
+
+        let snapshot = daemon.store().workflow_snapshot(&run_id).unwrap();
+        let task_status = |recipe_id: &str| {
+            snapshot
+                .tasks
+                .iter()
+                .find(|task| task.node.recipe_id.as_str() == recipe_id)
+                .map(|task| task.status)
+        };
+        assert_eq!(task_status("research.analyst"), Some(TaskStatus::Succeeded));
+        assert_eq!(task_status("gate.decision"), Some(TaskStatus::Failed));
+        daemon.store().verify_integrity().unwrap();
     }
 
     #[test]
-    fn paper_schedule_recovers_a_reserved_slot_after_leader_takeover() {
+    fn paper_submit_and_direct_retry_fail_closed() {
         let directory = tempdir().unwrap();
         let daemon = Daemon::with_model(
-            DaemonConfig {
-                store_root: directory.path().to_path_buf(),
-                http_token: "test-token".to_owned(),
-                worker_count: 2,
-                auto_paper: true,
-            },
+            config(directory.path().to_path_buf()),
             fixture_model_client(),
         )
         .unwrap();
-        let now = chrono::DateTime::parse_from_rfc3339("2026-08-06T14:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let first_lease = daemon
-            .store
-            .acquire_daemon_lease(
-                SCHEDULER_LEASE_NAME,
-                "leader-a",
-                now,
-                now + chrono::Duration::seconds(SCHEDULER_LEASE_SECONDS),
-            )
-            .unwrap()
-            .unwrap();
-        let run_id = RunId::new();
-        let plan = daemon.default_plan(&run_id, RunPurpose::Paper).unwrap();
-        let reservation = daemon
-            .store
-            .reserve_paper_schedule_slot(&first_lease, "paper:2026-08-06", &run_id, &plan, now)
-            .unwrap();
-        assert!(reservation.newly_reserved);
-        assert!(!daemon.store.run_exists(&run_id).unwrap());
-
-        let takeover_at = now + chrono::Duration::seconds(SCHEDULER_LEASE_SECONDS + 1);
-        let replacement_lease = daemon
-            .store
-            .acquire_daemon_lease(
-                SCHEDULER_LEASE_NAME,
-                "leader-b",
-                takeover_at,
-                takeover_at + chrono::Duration::seconds(SCHEDULER_LEASE_SECONDS),
-            )
-            .unwrap()
-            .unwrap();
-        let scheduled = daemon
-            .schedule_paper_session(
-                &replacement_lease,
-                chrono::NaiveDate::from_ymd_opt(2026, 8, 6).unwrap(),
-                takeover_at,
-            )
-            .unwrap()
-            .unwrap();
-        assert_eq!(scheduled, run_id);
-        assert_eq!(
-            daemon.store.run_purpose(&run_id).unwrap(),
-            RunPurpose::Paper
-        );
-        assert_eq!(daemon.store.workflow_plan(&run_id).unwrap(), plan);
-        assert!(daemon
-            .store
-            .paper_schedule_slot("paper:2026-08-06")
-            .unwrap()
-            .unwrap()
-            .submitted_at
-            .is_some());
-        assert_eq!(
-            daemon
-                .store
-                .events_after(&run_id, 0, 32)
-                .unwrap()
-                .into_iter()
-                .filter(|event| event.envelope.event_type == "scheduler.paper_submitted")
-                .count(),
-            1
-        );
-        assert_eq!(
-            daemon
-                .schedule_paper_session(
-                    &replacement_lease,
-                    chrono::NaiveDate::from_ymd_opt(2026, 8, 6).unwrap(),
-                    takeover_at,
-                )
-                .unwrap(),
-            Some(run_id.clone())
-        );
-        daemon.store.verify_integrity().unwrap();
-    }
-
-    #[test]
-    fn direct_paper_submission_is_rejected() {
-        let (_directory, daemon) = daemon();
         assert!(matches!(
             daemon.submit_default(RunPurpose::Paper),
             Err(DaemonError::InvalidInput(_))
         ));
-    }
-
-    #[tokio::test]
-    async fn debug_run_uses_the_real_dispatcher_without_paper_orders() {
-        let (_directory, daemon) = daemon();
-        let run = daemon.submit_default(RunPurpose::Debug).unwrap();
-        while daemon.run_one("fixture").await.unwrap() {}
-
-        assert_eq!(
-            daemon.store().run_status(&run).unwrap(),
-            akzio_domain::WorkflowStatus::Completed
-        );
-        assert!(daemon.store().verify_integrity().is_ok());
-        let documents = daemon.store().documents_for_run(&run).unwrap();
-        assert!(documents
-            .iter()
-            .any(|document| document.kind == DocumentKind::Decision));
-        assert!(documents
-            .iter()
-            .any(|document| document.kind == DocumentKind::ExecutionPlan));
-        assert!(documents
-            .iter()
-            .all(|document| document.producer != "alpaca.paper"));
-        assert_eq!(daemon.store.child_run(&run, "shadow").unwrap(), None);
-    }
-
-    #[tokio::test]
-    async fn leader_supervisor_runs_workers_and_releases_its_lease() {
-        let (_directory, daemon) = daemon();
-        let daemon = Arc::new(daemon);
-        let run = daemon.submit_default(RunPurpose::Debug).unwrap();
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let service = tokio::spawn(daemon.clone().serve_workers(shutdown_rx));
-        for _ in 0..100 {
-            if matches!(
-                daemon.store().run_status(&run).unwrap(),
-                akzio_domain::WorkflowStatus::Completed
-                    | akzio_domain::WorkflowStatus::CompletedWithExecutionRejection
-            ) {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert_eq!(
-            daemon.store().run_status(&run).unwrap(),
-            akzio_domain::WorkflowStatus::Completed
-        );
-        assert!(daemon.health().unwrap().scheduler_owner.is_some());
-        shutdown_tx.send(true).unwrap();
-        service.await.unwrap().unwrap();
-        assert!(daemon.health().unwrap().scheduler_owner.is_none());
-        daemon.store().verify_integrity().unwrap();
+        assert!(matches!(
+            daemon.handle(DaemonCommand::Retry {
+                run_id: RunId::new(),
+            }),
+            Err(DaemonError::Unavailable(_))
+        ));
     }
 }

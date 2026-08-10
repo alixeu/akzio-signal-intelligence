@@ -5,7 +5,7 @@
 //! silent in-place migration.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -73,6 +73,13 @@ pub enum RebuildStoreError {
     UnresolvedDependencies(TaskId),
     #[error("task {0} is not runnable")]
     TaskNotRunnable(TaskId),
+    #[error("attempt {attempt_id} is not a succeeded output attempt for task {task_id}")]
+    CommittedOutputAttempt {
+        task_id: TaskId,
+        attempt_id: AttemptId,
+    },
+    #[error("task {task_id} in run {run_id} has no succeeded output attempt")]
+    CommittedOutputTask { run_id: RunId, task_id: TaskId },
     #[error("task {0} does not exist")]
     MissingTask(TaskId),
     #[error("blob {0} is missing or corrupt")]
@@ -140,6 +147,8 @@ pub struct WorkflowCommit {
 pub struct WorkflowPatchCommit {
     pub permit: TaskWritePermit,
     pub previous_graph_artifact_id: ArtifactId,
+    pub planner_output: Artifact,
+    pub evidence_needs: Vec<Artifact>,
     pub proposal: Artifact,
     pub next_graph: Artifact,
     pub added_nodes: Vec<WorkflowNode>,
@@ -1150,25 +1159,42 @@ impl RebuildStore {
     /// graph, task rows, events, and Planner completion become visible together.
     pub fn commit_workflow_patch(&self, commit: &WorkflowPatchCommit) -> RebuildStoreResult<()> {
         let permit = &commit.permit;
+        let planner_output = &commit.planner_output;
+        let evidence_needs = &commit.evidence_needs;
         let proposal_artifact = &commit.proposal;
         let previous_graph_artifact_id = &commit.previous_graph_artifact_id;
         let next_graph = &commit.next_graph;
         let added_nodes = &commit.added_nodes;
         let updated_nodes = &commit.updated_nodes;
         let now = commit.completed_at;
-        if proposal_artifact.kind != ArtifactKind::WorkflowProposal {
+        if planner_output.kind != ArtifactKind::WorkflowProposalDraft
+            || proposal_artifact.kind != ArtifactKind::WorkflowProposal
+            || evidence_needs
+                .iter()
+                .any(|artifact| artifact.kind != ArtifactKind::EvidenceNeed)
+        {
             return Err(RebuildStoreError::InvalidWorkflowProposalArtifact);
         }
         if next_graph.kind != ArtifactKind::WorkflowGraph {
             return Err(RebuildStoreError::InvalidWorkflowGraphArtifact);
         }
-        if proposal_artifact.lifecycle != ArtifactLifecycle::RunScoped
+        if planner_output.lifecycle != ArtifactLifecycle::RunScoped
+            || evidence_needs
+                .iter()
+                .any(|artifact| artifact.lifecycle != ArtifactLifecycle::RunScoped)
+            || proposal_artifact.lifecycle != ArtifactLifecycle::RunScoped
             || next_graph.lifecycle != ArtifactLifecycle::RunScoped
         {
             return Err(RebuildStoreError::InvalidWorkflowProposalArtifact);
         }
+        planner_output.validate()?;
         proposal_artifact.validate()?;
         next_graph.validate()?;
+        self.read_blob(&planner_output.blob)?;
+        for evidence_need in evidence_needs {
+            evidence_need.validate()?;
+            self.read_blob(&evidence_need.blob)?;
+        }
         self.read_blob(&proposal_artifact.blob)?;
         let proposal: WorkflowProposal =
             serde_json::from_slice(&self.read_blob(&proposal_artifact.blob)?)?;
@@ -1177,7 +1203,24 @@ impl RebuildStore {
         if proposal.topology_id != graph.topology_id {
             return Err(RebuildStoreError::WorkflowGraphMismatch);
         }
-        if proposal_artifact.provenance.producer_contract_hash != permit.contract_hash
+        let expected_proposal_sources = std::iter::once(ArtifactRef {
+            artifact_id: planner_output.artifact_id.clone(),
+            kind: ArtifactKind::WorkflowProposalDraft,
+        })
+        .chain(evidence_needs.iter().map(|artifact| ArtifactRef {
+            artifact_id: artifact.artifact_id.clone(),
+            kind: ArtifactKind::EvidenceNeed,
+        }))
+        .collect::<std::collections::BTreeSet<_>>();
+        let proposal_sources = proposal_artifact
+            .source_refs
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        if planner_output.provenance.producer_contract_hash != permit.contract_hash
+            || proposal_artifact.provenance.producer_contract_hash != permit.contract_hash
+            || expected_proposal_sources.len() != evidence_needs.len() + 1
+            || proposal_sources != expected_proposal_sources
             || next_graph.source_refs.len() != 2
             || !next_graph.source_refs.iter().any(|reference| {
                 reference.artifact_id == *previous_graph_artifact_id
@@ -1213,8 +1256,34 @@ impl RebuildStore {
         let mut connection = self.connection.lock().expect("store connection poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         assert_permit(&transaction, permit)?;
+        assert_origin_matches(planner_output.origin.as_ref(), permit)?;
+        for evidence_need in evidence_needs {
+            assert_origin_matches(evidence_need.origin.as_ref(), permit)?;
+        }
         assert_origin_matches(proposal_artifact.origin.as_ref(), permit)?;
         let run_id = &permit.run_id;
+        insert_artifact(&transaction, planner_output)?;
+        append_event(
+            &transaction,
+            run_id,
+            Some(&permit.task_id),
+            Some(&permit.attempt_id),
+            "artifact.committed",
+            Some(&planner_output.artifact_id),
+            now,
+        )?;
+        for evidence_need in evidence_needs {
+            insert_artifact(&transaction, evidence_need)?;
+            append_event(
+                &transaction,
+                run_id,
+                Some(&permit.task_id),
+                Some(&permit.attempt_id),
+                "artifact.committed",
+                Some(&evidence_need.artifact_id),
+                now,
+            )?;
+        }
         assert_workflow_input_artifacts(&transaction, &graph.nodes)?;
         let current = transaction
             .query_row(
@@ -1290,7 +1359,7 @@ impl RebuildStore {
             return Err(RebuildStoreError::WorkflowGraphMismatch);
         }
         insert_artifact(&transaction, proposal_artifact)?;
-        append_event(
+        let proposal_event_id = append_event(
             &transaction,
             run_id,
             Some(&permit.task_id),
@@ -1298,6 +1367,12 @@ impl RebuildStore {
             "artifact.committed",
             Some(&proposal_artifact.artifact_id),
             now,
+        )?;
+        record_attempt_output(
+            &transaction,
+            permit,
+            &proposal_artifact.artifact_id,
+            proposal_event_id,
         )?;
         insert_artifact(&transaction, next_graph)?;
         for node in added_nodes {
@@ -1639,6 +1714,60 @@ impl RebuildStore {
         Ok(())
     }
 
+    /// Verify a handler-owned transaction already closed this exact attempt.
+    /// A merely stale permit is insufficient: task and attempt terminal state,
+    /// run, lease, epoch, and contract must all still identify the caller.
+    pub fn verify_attempt_terminal(
+        &self,
+        permit: &TaskWritePermit,
+        status: TaskStatus,
+    ) -> RebuildStoreResult<()> {
+        if !status.is_terminal() {
+            return Err(RebuildStoreError::TaskNotRunnable(permit.task_id.clone()));
+        }
+        let connection = self.connection.lock().expect("store connection poisoned");
+        let current = connection
+            .query_row(
+                r#"SELECT t.run_id, t.status, t.active_attempt_id, t.contract_hash,
+                          a.task_id, a.run_id, a.lease_id, a.epoch, a.status
+                   FROM rebuild_attempts AS a
+                   JOIN rebuild_tasks AS t ON t.task_id = a.task_id
+                   WHERE a.attempt_id = ?1"#,
+                params![permit.attempt_id.0],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, u64>(7)?,
+                        row.get::<_, String>(8)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some(current) = current else {
+            return Err(RebuildStoreError::StalePermit(permit.task_id.clone()));
+        };
+        let expected_contract = permit.contract_hash.as_ref().map(ContentHash::as_str);
+        if current.0 != permit.run_id.0
+            || current.1 != enum_name(status)
+            || current.2.is_some()
+            || current.3.as_deref() != expected_contract
+            || current.4 != permit.task_id.0
+            || current.5 != permit.run_id.0
+            || current.6 != permit.lease_id.0
+            || current.7 != permit.epoch
+            || current.8 != enum_name(status)
+        {
+            return Err(RebuildStoreError::StalePermit(permit.task_id.clone()));
+        }
+        Ok(())
+    }
+
     pub fn write_task_artifact(
         &self,
         permit: &TaskWritePermit,
@@ -1701,8 +1830,10 @@ impl RebuildStore {
 
         for artifact in artifacts {
             assert_origin_matches(artifact.origin.as_ref(), permit)?;
-            insert_artifact(&transaction, artifact)?;
-            append_event(
+            if std::ptr::eq(artifact, &artifacts[0]) {
+                insert_artifact_batch(&transaction, artifacts)?;
+            }
+            let event_id = append_event(
                 &transaction,
                 &permit.run_id,
                 Some(&permit.task_id),
@@ -1711,6 +1842,9 @@ impl RebuildStore {
                 Some(&artifact.artifact_id),
                 now,
             )?;
+            if status == TaskStatus::Succeeded {
+                record_attempt_output(&transaction, permit, &artifact.artifact_id, event_id)?;
+            }
         }
 
         finish_permitted_task(
@@ -2065,6 +2199,74 @@ impl RebuildStore {
         read_artifact(&connection, artifact_id)
     }
 
+    /// Returns final artifacts for the only succeeded attempt of an exact task
+    /// in an exact run. Intermediate Agent/Tool artifacts are deliberately
+    /// absent: only the atomic completion surface records attempt outputs.
+    pub fn committed_task_outputs(
+        &self,
+        run_id: &RunId,
+        task_id: &TaskId,
+    ) -> RebuildStoreResult<Vec<Artifact>> {
+        let connection = self.connection.lock().expect("store connection poisoned");
+        let attempt_id = connection
+            .query_row(
+                r#"SELECT a.attempt_id
+                   FROM rebuild_tasks AS t
+                   JOIN rebuild_attempts AS a ON a.task_id = t.task_id
+                  WHERE t.run_id = ?1
+                    AND t.task_id = ?2
+                    AND t.status = 'succeeded'
+                    AND a.status = 'succeeded'
+                  ORDER BY a.finished_at DESC, a.attempt_id DESC
+                  LIMIT 1"#,
+                params![run_id.0, task_id.0],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .ok_or_else(|| RebuildStoreError::CommittedOutputTask {
+                run_id: run_id.clone(),
+                task_id: task_id.clone(),
+            })?;
+        read_committed_attempt_outputs(&connection, Some(run_id), task_id, &AttemptId(attempt_id))
+    }
+
+    /// Returns final artifacts for one exact succeeded task attempt. This is
+    /// intentionally stricter than an event-log query so callers cannot feed
+    /// an AgentTurn, ToolCall, or failed-attempt artifact into another task.
+    pub fn committed_attempt_outputs(
+        &self,
+        task_id: &TaskId,
+        attempt_id: &AttemptId,
+    ) -> RebuildStoreResult<Vec<Artifact>> {
+        let connection = self.connection.lock().expect("store connection poisoned");
+        read_committed_attempt_outputs(&connection, None, task_id, attempt_id)
+    }
+
+    pub fn artifacts_referencing(
+        &self,
+        source_artifact_id: &ArtifactId,
+        kind: Option<ArtifactKind>,
+    ) -> RebuildStoreResult<Vec<Artifact>> {
+        let connection = self.connection.lock().expect("store connection poisoned");
+        let kind = kind.map(enum_name);
+        let mut statement = connection.prepare(
+            r#"SELECT r.artifact_id
+               FROM rebuild_artifact_refs AS r
+               JOIN rebuild_artifacts AS a ON a.artifact_id = r.artifact_id
+               WHERE r.source_artifact_id = ?1 AND (?2 IS NULL OR a.kind = ?2)
+               ORDER BY r.artifact_id ASC"#,
+        )?;
+        let ids = statement
+            .query_map(params![source_artifact_id.0.as_str(), kind], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        ids.into_iter()
+            .map(|id| read_artifact(&connection, &ArtifactId(ContentHash::new(id)?)))
+            .collect()
+    }
+
     /// Return the newest immutable artifact of a kind. Mutable state such as
     /// execution freeze is represented as an append-only artifact history;
     /// callers never receive a writable row handle.
@@ -2194,7 +2396,7 @@ impl RebuildStore {
             .ok_or_else(|| {
                 RebuildStoreError::Integrity(format!("run {run_id} has no workflow revision"))
             })?;
-        let revision = self.hydrate_workflow_revision(&connection, revision_row)?;
+        let revision = self.hydrate_workflow_revision(connection, revision_row)?;
         if revision.graph_artifact.artifact_id != run.graph_artifact_id
             || revision.graph.topology_id != run.topology_id
         {
@@ -2244,7 +2446,7 @@ impl RebuildStore {
             if task_run_id != *run_id {
                 return Err(RebuildStoreError::WorkflowGraphMismatch);
             }
-            node.dependencies = task_dependencies(&connection, &node.task_id)?;
+            node.dependencies = task_dependencies(connection, &node.task_id)?;
             let task_status = parse_task_status(&task_status)?;
             let active_attempt = match (lease_id, active_attempt_id, lease_until, worker_id) {
                 (Some(lease_id), Some(attempt_id), Some(lease_until), Some(worker_id))
@@ -2508,6 +2710,31 @@ impl RebuildStore {
         if fk.is_some() {
             return Err(RebuildStoreError::Integrity(
                 "foreign key check failed".to_owned(),
+            ));
+        }
+        let invalid_attempt_output = connection
+            .query_row(
+                r#"SELECT o.event_id
+                     FROM rebuild_attempt_outputs AS o
+                     JOIN rebuild_attempts AS a ON a.attempt_id = o.attempt_id
+                     JOIN rebuild_tasks AS t ON t.task_id = o.task_id
+                     JOIN rebuild_events AS e ON e.event_id = o.event_id
+                    WHERE o.task_id != a.task_id
+                       OR a.status != 'succeeded'
+                       OR t.status != 'succeeded'
+                       OR e.run_id != a.run_id
+                       OR e.task_id != o.task_id
+                       OR e.attempt_id != o.attempt_id
+                       OR e.event_type != 'artifact.committed'
+                       OR e.artifact_id != o.artifact_id
+                    LIMIT 1"#,
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        if invalid_attempt_output.is_some() {
+            return Err(RebuildStoreError::Integrity(
+                "attempt output has invalid terminal-event lineage".to_owned(),
             ));
         }
         let mut statement = connection.prepare(
@@ -3134,13 +3361,20 @@ CREATE TABLE IF NOT EXISTS rebuild_workflow_revisions (
            finished_at TEXT
          );
 CREATE TABLE IF NOT EXISTS rebuild_events (
-           event_id INTEGER PRIMARY KEY AUTOINCREMENT,
-           run_id TEXT NOT NULL REFERENCES rebuild_runs(run_id),
-           task_id TEXT REFERENCES rebuild_tasks(task_id),
-           attempt_id TEXT REFERENCES rebuild_attempts(attempt_id),
-           event_type TEXT NOT NULL,
-           artifact_id TEXT REFERENCES rebuild_artifacts(artifact_id),
-  created_at TEXT NOT NULL
+    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL REFERENCES rebuild_runs(run_id),
+    task_id TEXT REFERENCES rebuild_tasks(task_id),
+    attempt_id TEXT REFERENCES rebuild_attempts(attempt_id),
+    event_type TEXT NOT NULL,
+    artifact_id TEXT REFERENCES rebuild_artifacts(artifact_id),
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS rebuild_attempt_outputs (
+    attempt_id TEXT NOT NULL REFERENCES rebuild_attempts(attempt_id),
+    task_id TEXT NOT NULL REFERENCES rebuild_tasks(task_id),
+    artifact_id TEXT NOT NULL REFERENCES rebuild_artifacts(artifact_id),
+    event_id INTEGER NOT NULL UNIQUE REFERENCES rebuild_events(event_id),
+    PRIMARY KEY (attempt_id, artifact_id)
 );
 CREATE TABLE IF NOT EXISTS rebuild_daemon_leases (
   lease_name TEXT PRIMARY KEY,
@@ -3203,6 +3437,8 @@ CREATE INDEX IF NOT EXISTS rebuild_tasks_claimable
     ON rebuild_tasks(status, ready_at, priority);
 CREATE INDEX IF NOT EXISTS rebuild_events_cursor
     ON rebuild_events(run_id, event_id);
+CREATE INDEX IF NOT EXISTS rebuild_attempt_outputs_cursor
+    ON rebuild_attempt_outputs(attempt_id, event_id);
 CREATE INDEX IF NOT EXISTS rebuild_policy_transitions_subject
     ON rebuild_policy_transitions(subject_id, revision);
 CREATE INDEX IF NOT EXISTS rebuild_shadow_pairs_freshness
@@ -3272,6 +3508,53 @@ fn insert_artifact(transaction: &Transaction<'_>, artifact: &Artifact) -> Rebuil
                 enum_name(source.kind),
             ],
         )?;
+    }
+    Ok(())
+}
+
+/// Inserts a completion batch in source-closure order. A task may create a
+/// RawEvidence artifact and its NormalizedEvidence dependent in the same
+/// atomic attempt; callers need not rely on input ordering for correctness.
+fn insert_artifact_batch(
+    transaction: &Transaction<'_>,
+    artifacts: &[Artifact],
+) -> RebuildStoreResult<()> {
+    let mut pending = BTreeMap::<ArtifactId, &Artifact>::new();
+    for artifact in artifacts {
+        artifact.validate()?;
+        if let Some(existing) = pending.insert(artifact.artifact_id.clone(), artifact) {
+            if existing != artifact {
+                return Err(RebuildStoreError::Integrity(format!(
+                    "conflicting completion artifacts for {}",
+                    artifact.artifact_id
+                )));
+            }
+        }
+    }
+
+    while !pending.is_empty() {
+        let ready = pending
+            .iter()
+            .find(|(_, artifact)| {
+                artifact
+                    .source_refs
+                    .iter()
+                    .all(|reference| !pending.contains_key(&reference.artifact_id))
+            })
+            .map(|(artifact_id, _)| artifact_id.clone());
+        let Some(artifact_id) = ready else {
+            return Err(RebuildStoreError::InvalidArtifactClosure(
+                pending
+                    .first_key_value()
+                    .expect("pending batch is non-empty")
+                    .0
+                    .clone(),
+            ));
+        };
+        let artifact = pending
+            .remove(&artifact_id)
+            .expect("ready artifact is still pending");
+        insert_artifact(transaction, artifact)?;
     }
     Ok(())
 }
@@ -3602,7 +3885,7 @@ fn append_event(
     event_type: &str,
     artifact_id: Option<&ArtifactId>,
     created_at: DateTime<Utc>,
-) -> RebuildStoreResult<()> {
+) -> RebuildStoreResult<i64> {
     transaction.execute(
         r#"INSERT INTO rebuild_events
            (run_id, task_id, attempt_id, event_type, artifact_id, created_at)
@@ -3616,7 +3899,97 @@ fn append_event(
             created_at.to_rfc3339(),
         ],
     )?;
+    Ok(transaction.last_insert_rowid())
+}
+
+fn record_attempt_output(
+    transaction: &Transaction<'_>,
+    permit: &TaskWritePermit,
+    artifact_id: &ArtifactId,
+    event_id: i64,
+) -> RebuildStoreResult<()> {
+    transaction.execute(
+        r#"INSERT OR IGNORE INTO rebuild_attempt_outputs
+            (attempt_id, task_id, artifact_id, event_id)
+          VALUES (?1, ?2, ?3, ?4)"#,
+        params![
+            permit.attempt_id.0,
+            permit.task_id.0,
+            artifact_id.0.as_str(),
+            event_id,
+        ],
+    )?;
     Ok(())
+}
+
+fn read_committed_attempt_outputs(
+    connection: &Connection,
+    expected_run_id: Option<&RunId>,
+    task_id: &TaskId,
+    attempt_id: &AttemptId,
+) -> RebuildStoreResult<Vec<Artifact>> {
+    let attempt = connection
+        .query_row(
+            r#"SELECT a.run_id, a.task_id, a.status, t.status
+                 FROM rebuild_attempts AS a
+                 JOIN rebuild_tasks AS t ON t.task_id = a.task_id
+                WHERE a.attempt_id = ?1"#,
+            params![attempt_id.0],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((attempt_run_id, attempt_task_id, attempt_status, task_status)) = attempt else {
+        return Err(RebuildStoreError::CommittedOutputAttempt {
+            task_id: task_id.clone(),
+            attempt_id: attempt_id.clone(),
+        });
+    };
+    if attempt_task_id != task_id.0
+        || attempt_status != "succeeded"
+        || task_status != "succeeded"
+        || expected_run_id.is_some_and(|run_id| attempt_run_id != run_id.0)
+    {
+        return Err(RebuildStoreError::CommittedOutputAttempt {
+            task_id: task_id.clone(),
+            attempt_id: attempt_id.clone(),
+        });
+    }
+
+    let mut statement = connection.prepare(
+        r#"SELECT o.artifact_id
+              FROM rebuild_attempt_outputs AS o
+              JOIN rebuild_events AS e ON e.event_id = o.event_id
+             WHERE o.attempt_id = ?1
+               AND o.task_id = ?2
+               AND e.run_id = ?3
+               AND e.task_id = o.task_id
+               AND e.attempt_id = o.attempt_id
+               AND e.event_type = 'artifact.committed'
+               AND e.artifact_id = o.artifact_id
+             ORDER BY o.event_id ASC"#,
+    )?;
+    let ids = statement
+        .query_map(params![attempt_id.0, task_id.0, attempt_run_id], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    if ids.is_empty() {
+        return Err(RebuildStoreError::CommittedOutputAttempt {
+            task_id: task_id.clone(),
+            attempt_id: attempt_id.clone(),
+        });
+    }
+    drop(statement);
+    ids.into_iter()
+        .map(|id| read_artifact(connection, &ArtifactId(ContentHash::new(id)?)))
+        .collect()
 }
 
 fn refresh_run_status(
@@ -4172,6 +4545,9 @@ mod tests {
         value: &str,
         origin: Option<ArtifactOrigin>,
     ) -> Artifact {
+        let producer_contract_hash = origin
+            .as_ref()
+            .and_then(|origin| origin.contract_hash.clone());
         Artifact::new(
             kind,
             store
@@ -4185,7 +4561,7 @@ mod tests {
                 retrieved_at: Utc::now(),
                 source_uri: None,
                 confidence_ppm: 1_000_000,
-                producer_contract_hash: None,
+                producer_contract_hash,
             },
             origin,
             vec![],
@@ -4391,6 +4767,24 @@ mod tests {
             .claim_next_task("worker", Utc::now(), Duration::seconds(30))
             .unwrap()
             .unwrap();
+        let turn = artifact(
+            &store,
+            ArtifactKind::AgentTurn,
+            "intermediate turn",
+            Some(ArtifactOrigin {
+                run_id: Some(claimed.permit.run_id.clone()),
+                task_id: Some(claimed.permit.task_id.clone()),
+                attempt_id: Some(claimed.permit.attempt_id.clone()),
+                contract_hash: None,
+            }),
+        );
+        store
+            .write_task_artifact(&claimed.permit, &turn, "agent.turn", Utc::now())
+            .unwrap();
+        assert!(matches!(
+            store.committed_attempt_outputs(&claimed.permit.task_id, &claimed.permit.attempt_id),
+            Err(RebuildStoreError::CommittedOutputAttempt { .. })
+        ));
         let output = artifact(
             &store,
             ArtifactKind::Claim,
@@ -4406,17 +4800,125 @@ mod tests {
         store
             .commit_attempt(
                 &claimed.permit,
-                &[output],
+                std::slice::from_ref(&output),
                 TaskStatus::Succeeded,
                 Utc::now(),
             )
             .unwrap();
 
-        assert_eq!(store.events_after(&run.run_id, 0, 10).unwrap().len(), 4);
+        assert_eq!(
+            store
+                .committed_attempt_outputs(&claimed.permit.task_id, &claimed.permit.attempt_id)
+                .unwrap(),
+            vec![output.clone()]
+        );
+        assert_eq!(
+            store
+                .committed_task_outputs(&run.run_id, &claimed.permit.task_id)
+                .unwrap(),
+            vec![output]
+        );
+        assert_eq!(store.events_after(&run.run_id, 0, 10).unwrap().len(), 5);
         assert!(store
             .claim_next_task("worker", Utc::now(), Duration::seconds(30))
             .unwrap()
             .is_none());
+        store.verify_integrity().unwrap();
+    }
+
+    #[test]
+    fn attempt_commit_resolves_same_batch_evidence_closure_before_persisting() {
+        let root = tempdir().unwrap();
+        let store = RebuildStore::open(root.path()).unwrap();
+        let graph = graph();
+        let graph_artifact = artifact(
+            &store,
+            ArtifactKind::WorkflowGraph,
+            &serde_json::to_string(&graph).unwrap(),
+            None,
+        );
+        let run = RebuildRun {
+            run_id: RunId::new(),
+            purpose: RunPurpose::Debug,
+            topology_id: graph.topology_id.clone(),
+            graph_artifact_id: graph_artifact.artifact_id.clone(),
+            created_at: Utc::now(),
+        };
+        store
+            .commit_workflow(&WorkflowCommit {
+                run: run.clone(),
+                graph: graph_artifact,
+                nodes: graph.nodes,
+            })
+            .unwrap();
+        let claimed = store
+            .claim_next_task("worker", Utc::now(), Duration::seconds(30))
+            .unwrap()
+            .unwrap();
+        let origin = Some(ArtifactOrigin {
+            run_id: Some(claimed.permit.run_id.clone()),
+            task_id: Some(claimed.permit.task_id.clone()),
+            attempt_id: Some(claimed.permit.attempt_id.clone()),
+            contract_hash: None,
+        });
+        let raw = artifact(&store, ArtifactKind::RawEvidence, "raw", origin.clone());
+        let normalized = Artifact::new(
+            ArtifactKind::NormalizedEvidence,
+            store.put_bytes(b"normalized", "application/json").unwrap(),
+            "fixture.normalized",
+            ArtifactLifecycle::RunScoped,
+            raw.provenance.clone(),
+            origin.clone(),
+            vec![ArtifactRef {
+                artifact_id: raw.artifact_id.clone(),
+                kind: ArtifactKind::RawEvidence,
+            }],
+            Utc::now(),
+        )
+        .unwrap();
+        let missing = Artifact::new(
+            ArtifactKind::NormalizedEvidence,
+            store.put_bytes(b"missing", "application/json").unwrap(),
+            "fixture.normalized",
+            ArtifactLifecycle::RunScoped,
+            raw.provenance.clone(),
+            origin,
+            vec![ArtifactRef {
+                artifact_id: ArtifactId(ContentHash::of_bytes(b"missing raw")),
+                kind: ArtifactKind::RawEvidence,
+            }],
+            Utc::now(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            store.commit_attempt(
+                &claimed.permit,
+                std::slice::from_ref(&missing),
+                TaskStatus::Succeeded,
+                Utc::now(),
+            ),
+            Err(RebuildStoreError::InvalidArtifactClosure(_))
+        ));
+        assert!(matches!(
+            store.artifact(&missing.artifact_id),
+            Err(RebuildStoreError::MissingArtifact(_))
+        ));
+
+        store
+            .commit_attempt(
+                &claimed.permit,
+                &[normalized.clone(), raw.clone()],
+                TaskStatus::Succeeded,
+                Utc::now(),
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .committed_task_outputs(&run.run_id, &claimed.permit.task_id)
+                .unwrap(),
+            vec![normalized, raw]
+        );
         store.verify_integrity().unwrap();
     }
 
@@ -4520,6 +5022,7 @@ mod tests {
             on_failure: FailureDisposition::FailRun,
             parent_task_id: None,
         };
+        let planner_task_id = planner.task_id.clone();
         let evidence = WorkflowNode {
             task_id: TaskId::new(),
             recipe_id: TaskRecipeId::new("gate.evidence").unwrap(),
@@ -4599,18 +5102,21 @@ mod tests {
                 contract_hash: claimed.permit.contract_hash.clone(),
             }),
         );
-        store
-            .write_task_artifact(
-                &claimed.permit,
-                &evidence_need,
-                "planner.evidence_need_created",
-                now,
-            )
-            .unwrap();
         let evidence_need_ref = ArtifactRef {
             artifact_id: evidence_need.artifact_id.clone(),
             kind: ArtifactKind::EvidenceNeed,
         };
+        let planner_output = artifact(
+            &store,
+            ArtifactKind::WorkflowProposalDraft,
+            "planner output",
+            Some(ArtifactOrigin {
+                run_id: Some(run.run_id.clone()),
+                task_id: Some(planner.task_id.clone()),
+                attempt_id: Some(claimed.permit.attempt_id.clone()),
+                contract_hash: claimed.permit.contract_hash.clone(),
+            }),
+        );
 
         let proposal = WorkflowProposal {
             schema_version: REBUILD_SCHEMA_VERSION,
@@ -4646,7 +5152,13 @@ mod tests {
                 attempt_id: Some(claimed.permit.attempt_id.clone()),
                 contract_hash: claimed.permit.contract_hash.clone(),
             }),
-            vec![],
+            vec![
+                ArtifactRef {
+                    artifact_id: planner_output.artifact_id.clone(),
+                    kind: ArtifactKind::WorkflowProposalDraft,
+                },
+                evidence_need_ref.clone(),
+            ],
             now,
         )
         .unwrap();
@@ -4708,6 +5220,8 @@ mod tests {
         let patch = WorkflowPatchCommit {
             permit: claimed.permit.clone(),
             previous_graph_artifact_id: graph_artifact.artifact_id.clone(),
+            planner_output: planner_output.clone(),
+            evidence_needs: vec![evidence_need.clone()],
             proposal: proposal_artifact.clone(),
             next_graph: next_graph_artifact.clone(),
             added_nodes: vec![added.clone()],
@@ -4752,6 +5266,14 @@ mod tests {
             assert_eq!(added_tasks, 0);
         }
         assert!(matches!(
+            store.artifact(&planner_output.artifact_id),
+            Err(RebuildStoreError::MissingArtifact(_))
+        ));
+        assert!(matches!(
+            store.artifact(&evidence_need.artifact_id),
+            Err(RebuildStoreError::MissingArtifact(_))
+        ));
+        assert!(matches!(
             store.artifact(&proposal_artifact.artifact_id),
             Err(RebuildStoreError::MissingArtifact(_))
         ));
@@ -4759,13 +5281,33 @@ mod tests {
             store.artifact(&next_graph_artifact.artifact_id),
             Err(RebuildStoreError::MissingArtifact(_))
         ));
-        assert_eq!(store.events_after(&run.run_id, 0, 100).unwrap().len(), 3);
+        assert_eq!(store.events_after(&run.run_id, 0, 100).unwrap().len(), 2);
         store.validate_task_permit(&claimed.permit).unwrap();
 
         store.commit_workflow_patch(&patch).unwrap();
         assert_eq!(
+            store.artifact(&planner_output.artifact_id).unwrap(),
+            planner_output
+        );
+        assert_eq!(
+            store.artifact(&evidence_need.artifact_id).unwrap(),
+            evidence_need
+        );
+        assert_eq!(
             store.artifact(&proposal_artifact.artifact_id).unwrap(),
             proposal_artifact
+        );
+        assert_eq!(
+            store
+                .committed_task_outputs(&run.run_id, &planner_task_id)
+                .unwrap(),
+            vec![proposal_artifact.clone()]
+        );
+        assert_eq!(
+            store
+                .committed_attempt_outputs(&planner_task_id, &claimed.permit.attempt_id)
+                .unwrap(),
+            vec![proposal_artifact.clone()]
         );
         let stored_graph = store.artifact(&next_graph_artifact.artifact_id).unwrap();
         assert_eq!(stored_graph.artifact_id, next_graph_artifact.artifact_id);

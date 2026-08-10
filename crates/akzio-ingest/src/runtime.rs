@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use akzio_domain::{
     Artifact, ArtifactKind, ArtifactLifecycle, ArtifactOrigin, ArtifactProvenance, ArtifactRef,
-    DomainError, TaskWritePermit, V2_DOMAIN_SCHEMA_VERSION,
+    DomainError, EvidenceNeed, TaskWritePermit, V2_DOMAIN_SCHEMA_VERSION,
 };
 use akzio_store::v2::{StoreError, V2Store};
 use chrono::{DateTime, Duration, Utc};
@@ -65,6 +65,7 @@ pub struct NormalizedEvidencePayload {
     pub schema_version: u32,
     pub source: EvidenceSource,
     pub resource: String,
+    pub need: ArtifactRef,
     pub raw: ArtifactRef,
     pub observed_at: DateTime<Utc>,
     pub value: Value,
@@ -146,6 +147,8 @@ pub enum EvidenceRuntimeError {
     SourceNotAllowed(EvidenceSource),
     #[error("evidence request is invalid")]
     InvalidRequest,
+    #[error("evidence request does not reference a committed EvidenceNeed in this run")]
+    InvalidEvidenceNeed,
     #[error("acquired evidence is stale")]
     StaleEvidence,
     #[error("acquired evidence is empty or lacks a media type")]
@@ -176,14 +179,40 @@ impl EvidenceRuntime {
 
     /// Construct raw and normalized evidence artifacts. The caller returns
     /// them to `TaskRuntime`, which atomically commits the attempt.
-    pub fn acquire_and_normalize<A: EvidenceAdapter>(
+    pub fn acquire_and_normalize<A: EvidenceAdapter + ?Sized>(
         &self,
         permit: &TaskWritePermit,
+        need: &ArtifactRef,
         request: &EvidenceRequest,
         adapter: &A,
         now: DateTime<Utc>,
     ) -> EvidenceRuntimeResult<EvidenceBundle> {
         request.validate()?;
+        if need.kind != ArtifactKind::EvidenceNeed {
+            return Err(EvidenceRuntimeError::InvalidEvidenceNeed);
+        }
+        let need_artifact = self.store.artifact(&need.artifact_id)?;
+        if need_artifact.kind != ArtifactKind::EvidenceNeed
+            || need_artifact
+                .origin
+                .as_ref()
+                .and_then(|origin| origin.run_id.as_ref())
+                != Some(&permit.run_id)
+        {
+            return Err(EvidenceRuntimeError::InvalidEvidenceNeed);
+        }
+        let declared: EvidenceNeed =
+            serde_json::from_slice(&self.store.read_blob(&need_artifact.blob)?)?;
+        declared.validate()?;
+        let declared_max_age = i64::try_from(declared.max_age_secs)
+            .map(Duration::seconds)
+            .map_err(|_| EvidenceRuntimeError::InvalidEvidenceNeed)?;
+        if declared.source_family != request.source.as_str()
+            || declared.resource != request.resource
+            || declared_max_age != request.max_age
+        {
+            return Err(EvidenceRuntimeError::InvalidEvidenceNeed);
+        }
         if !self.allowed_sources.contains(&request.source) {
             return Err(EvidenceRuntimeError::SourceNotAllowed(request.source));
         }
@@ -226,6 +255,7 @@ impl EvidenceRuntime {
             schema_version: V2_DOMAIN_SCHEMA_VERSION,
             source: request.source,
             resource: request.resource.clone(),
+            need: need.clone(),
             raw: raw_ref.clone(),
             observed_at: acquired.observed_at,
             value: acquired.normalized,
@@ -244,7 +274,7 @@ impl EvidenceRuntime {
                 producer_contract_hash: permit.contract_hash.clone(),
             },
             task_origin(permit),
-            vec![raw_ref],
+            vec![raw_ref, need.clone()],
             now,
         )?;
         Ok(EvidenceBundle { raw, normalized })
@@ -396,6 +426,54 @@ mod tests {
         )
     }
 
+    fn evidence_need(
+        store: &V2Store,
+        task: &akzio_store::v2::ClaimedAttempt,
+        now: DateTime<Utc>,
+    ) -> ArtifactRef {
+        let payload = akzio_domain::EvidenceNeed {
+            schema_version: V2_DOMAIN_SCHEMA_VERSION,
+            source_family: "alpaca".to_owned(),
+            resource: "quote".to_owned(),
+            max_age_secs: 30,
+        };
+        let artifact = Artifact::new(
+            ArtifactKind::EvidenceNeed,
+            store.put_json(&payload).unwrap(),
+            "fixture.planner",
+            ArtifactLifecycle::RunScoped,
+            ArtifactProvenance {
+                source_family: "akzio.workflow.planner".to_owned(),
+                observed_at: None,
+                retrieved_at: now,
+                source_uri: None,
+                confidence_ppm: 1_000_000,
+                producer_contract_hash: task.permit.contract_hash.clone(),
+            },
+            Some(ArtifactOrigin {
+                run_id: Some(task.run_id.clone()),
+                task_id: Some(task.node.task_id.clone()),
+                attempt_id: Some(task.permit.attempt_id.clone()),
+                contract_hash: task.permit.contract_hash.clone(),
+            }),
+            vec![],
+            now,
+        )
+        .unwrap();
+        store
+            .write_task_artifact(
+                &task.permit,
+                &artifact,
+                "planner.evidence_need_created",
+                now,
+            )
+            .unwrap();
+        ArtifactRef {
+            artifact_id: artifact.artifact_id,
+            kind: ArtifactKind::EvidenceNeed,
+        }
+    }
+
     #[test]
     fn acquisition_returns_uncommitted_artifacts_until_task_runtime_commits() {
         let root = tempdir().unwrap();
@@ -406,11 +484,13 @@ mod tests {
             .claim_next_task("evidence-worker", now, Duration::seconds(30))
             .unwrap()
             .unwrap();
+        let need = evidence_need(&store, &claimed, now);
         let events_before = store.events_after(&run_id, 0, 10).unwrap();
         let runtime = EvidenceRuntime::new(store.clone(), [EvidenceSource::Alpaca]);
         let sealed = runtime
             .acquire_and_normalize(
                 &claimed.permit,
+                &need,
                 &EvidenceRequest {
                     source: EvidenceSource::Alpaca,
                     resource: "quote".to_owned(),
@@ -422,13 +502,15 @@ mod tests {
             .unwrap();
         assert_eq!(sealed.raw.kind, ArtifactKind::RawEvidence);
         assert_eq!(sealed.normalized.kind, ArtifactKind::NormalizedEvidence);
-        assert_eq!(
-            sealed.normalized.source_refs,
-            vec![ArtifactRef {
+        let mut expected_source_refs = vec![
+            ArtifactRef {
                 artifact_id: sealed.raw.artifact_id.clone(),
                 kind: ArtifactKind::RawEvidence,
-            }]
-        );
+            },
+            need.clone(),
+        ];
+        expected_source_refs.sort();
+        assert_eq!(sealed.normalized.source_refs, expected_source_refs);
         assert!(matches!(
             store.artifact(&sealed.raw.artifact_id),
             Err(akzio_store::v2::StoreError::MissingArtifact(_))
@@ -453,6 +535,12 @@ mod tests {
             store.artifact(&sealed.normalized.artifact_id).unwrap(),
             sealed.normalized
         );
+        assert_eq!(
+            store
+                .artifacts_referencing(&need.artifact_id, Some(ArtifactKind::NormalizedEvidence))
+                .unwrap(),
+            vec![sealed.normalized.clone()]
+        );
         let events_after = store.events_after(&run_id, 0, 10).unwrap();
         assert_eq!(events_after.len(), events_before.len() + 3);
         assert_eq!(
@@ -471,11 +559,13 @@ mod tests {
         let store = V2Store::open(root.path()).unwrap();
         let now = Utc::now();
         let run_id = install_run(&store, now, 1);
-        let permit = store
+        let claimed = store
             .claim_next_task("evidence-worker", now, Duration::seconds(30))
             .unwrap()
-            .unwrap()
-            .permit;
+            .unwrap();
+        let need = evidence_need(&store, &claimed, now);
+        let permit = claimed.permit;
+        let events_before = store.events_after(&run_id, 0, 10).unwrap();
         let stale = FixtureEvidenceAdapter::new(
             EvidenceSource::Alpaca,
             [(
@@ -493,6 +583,21 @@ mod tests {
         assert!(matches!(
             runtime.acquire_and_normalize(
                 &permit,
+                &need,
+                &EvidenceRequest {
+                    source: EvidenceSource::Alpaca,
+                    resource: "bars".to_owned(),
+                    max_age: Duration::seconds(30),
+                },
+                &stale,
+                now,
+            ),
+            Err(EvidenceRuntimeError::InvalidEvidenceNeed)
+        ));
+        assert!(matches!(
+            runtime.acquire_and_normalize(
+                &permit,
+                &need,
                 &EvidenceRequest {
                     source: EvidenceSource::Alpaca,
                     resource: "quote".to_owned(),
@@ -503,10 +608,11 @@ mod tests {
             ),
             Err(EvidenceRuntimeError::StaleEvidence)
         ));
-        assert_eq!(store.events_after(&run_id, 0, 10).unwrap().len(), 2);
+        assert_eq!(store.events_after(&run_id, 0, 10).unwrap(), events_before);
         assert!(matches!(
             EvidenceRuntime::new(store, [EvidenceSource::Fred]).acquire_and_normalize(
                 &permit,
+                &need,
                 &EvidenceRequest {
                     source: EvidenceSource::Alpaca,
                     resource: "quote".to_owned(),
@@ -531,10 +637,12 @@ mod tests {
             .claim_next_task("evidence-worker", now, Duration::seconds(30))
             .unwrap()
             .unwrap();
+        let need = evidence_need(&store, &first, now);
         let runtime = EvidenceRuntime::new(store.clone(), [EvidenceSource::Alpaca]);
         let sealed = runtime
             .acquire_and_normalize(
                 &first.permit,
+                &need,
                 &EvidenceRequest {
                     source: EvidenceSource::Alpaca,
                     resource: "quote".to_owned(),

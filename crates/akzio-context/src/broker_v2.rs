@@ -118,7 +118,7 @@ impl RebuildContextBroker {
                 estimated_tokens: tokens,
             });
         }
-        if selections.is_empty() {
+        if selections.len() < usize::from(policy.min_artifacts) {
             return Err(RebuildContextError::BudgetExceeded);
         }
 
@@ -384,6 +384,7 @@ mod tests {
             ContextPolicy {
                 permitted_kinds: BTreeSet::from([ArtifactKind::NormalizedEvidence]),
                 permitted_source_families: BTreeSet::from(["market".to_owned()]),
+                min_artifacts: 1,
                 max_artifacts: 4,
                 max_bytes: 4096,
                 max_tokens: 1024,
@@ -610,6 +611,45 @@ mod tests {
             broker.read(&manifest.grant, &second.artifact_id, Utc::now()),
             Err(RebuildContextError::GrantDenied { .. })
         ));
+    }
+
+    #[test]
+    fn bootstrap_policy_can_mint_an_explicit_empty_manifest_only_when_allowed() {
+        let root = tempdir().unwrap();
+        let store = V2Store::open(root.path()).unwrap();
+        let permit = permit(&store);
+        let broker = RebuildContextBroker::new(store.clone());
+
+        assert!(matches!(
+            broker.assemble(
+                &permit,
+                &contract(&store),
+                std::iter::empty(),
+                Utc::now(),
+                Duration::minutes(5),
+            ),
+            Err(RebuildContextError::BudgetExceeded)
+        ));
+
+        let mut bootstrap = contract(&store);
+        bootstrap.context.min_artifacts = 0;
+        bootstrap.candidate_capability_ceiling.context.min_artifacts = 0;
+        bootstrap.termination.require_evidence = false;
+        bootstrap.contract_hash = bootstrap.expected_hash().unwrap();
+        bootstrap.validate().unwrap();
+
+        let manifest = broker
+            .assemble(
+                &permit,
+                &bootstrap,
+                std::iter::empty(),
+                Utc::now(),
+                Duration::minutes(5),
+            )
+            .unwrap();
+        assert!(manifest.payload.selections.is_empty());
+        assert!(manifest.grant.readable.is_empty());
+        assert!(manifest.grant.raw_source_closure.is_empty());
     }
 
     #[test]

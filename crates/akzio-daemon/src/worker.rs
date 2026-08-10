@@ -7,13 +7,14 @@
 
 use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 
-use akzio_runtime::legacy::{RuntimeError, TaskCompletion, TaskRuntime};
-use akzio_store::legacy::ClaimedTask;
+use akzio_runtime::{RuntimeError, TaskCompletion, TaskRuntime};
+use akzio_store::v2::{ClaimedAttempt, StoreError};
 use chrono::Utc;
 use tokio::sync::watch;
 
-pub type TaskHandler =
-    Arc<dyn Fn(ClaimedTask) -> Pin<Box<dyn Future<Output = TaskCompletion> + Send>> + Send + Sync>;
+pub type TaskHandler = Arc<
+    dyn Fn(ClaimedAttempt) -> Pin<Box<dyn Future<Output = TaskCompletion> + Send>> + Send + Sync,
+>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerPoolConfig {
@@ -83,7 +84,9 @@ impl WorkerPool {
 
         while let Some(result) = workers.join_next().await {
             result.map_err(|error| {
-                RuntimeError::Handler(format!("worker task panicked: {error}"))
+                RuntimeError::Store(StoreError::Integrity(format!(
+                    "worker task panicked: {error}"
+                )))
             })??;
         }
         Ok(())
@@ -108,9 +111,7 @@ async fn worker_loop(
             return Ok(());
         }
 
-        let did_run = runtime
-            .run_one_async(&worker_id, |task| handler(task))
-            .await?;
+        let did_run = runtime.run_one(&worker_id, |task| handler(task)).await?;
         if did_run {
             continue;
         }
@@ -133,35 +134,140 @@ mod tests {
         sync::atomic::{AtomicUsize, Ordering},
     };
 
-    use akzio_domain::{RunId, RunPurpose, TaskId, TaskKind};
-    use akzio_store::legacy::V2Store;
+    use akzio_domain::{
+        Artifact, ArtifactKind, ArtifactLifecycle, ArtifactOrigin, ArtifactProvenance,
+        FailureDisposition, RetryPolicy, RunId, RunPurpose, TaskBudget, TaskId, TaskRecipeId,
+        TaskStatus, WorkflowGraph, WorkflowNode, V2_DOMAIN_SCHEMA_VERSION,
+    };
+    use akzio_store::v2::{StoredRun, V2Store, WorkflowCommit};
     use chrono::Utc;
     use tempfile::tempdir;
 
     use super::*;
 
+    fn budget() -> TaskBudget {
+        TaskBudget {
+            max_input_tokens: 64,
+            max_output_tokens: 64,
+            max_wall_time_secs: 30,
+            max_tool_calls: 1,
+        }
+    }
+
+    fn retry() -> RetryPolicy {
+        RetryPolicy {
+            max_attempts: 1,
+            initial_backoff_ms: 1,
+            retry_transport: false,
+            retry_rate_limited: false,
+            retry_invalid_output: false,
+        }
+    }
+
+    fn workflow() -> WorkflowGraph {
+        WorkflowGraph {
+            schema_version: V2_DOMAIN_SCHEMA_VERSION,
+            topology_id: "worker-pool-fixture".to_owned(),
+            nodes: (0..4)
+                .map(|index| WorkflowNode {
+                    task_id: TaskId::new(),
+                    recipe_id: TaskRecipeId::new("research.analyst").unwrap(),
+                    contract_hash: None,
+                    objective: format!("fixture task {index}"),
+                    dependencies: vec![],
+                    input_artifacts: vec![],
+                    priority: 100,
+                    budget: budget(),
+                    retry: retry(),
+                    on_failure: FailureDisposition::FailRun,
+                    parent_task_id: None,
+                })
+                .collect(),
+        }
+    }
+
+    fn provenance(now: chrono::DateTime<Utc>) -> ArtifactProvenance {
+        ArtifactProvenance {
+            source_family: "fixture.worker".to_owned(),
+            observed_at: Some(now),
+            retrieved_at: now,
+            source_uri: None,
+            confidence_ppm: 1_000_000,
+            producer_contract_hash: None,
+        }
+    }
+
     #[tokio::test]
     async fn pool_runs_ready_tasks_across_workers_and_stops_cleanly() {
         let directory = tempdir().unwrap();
         let store = V2Store::open(directory.path()).unwrap();
-        let run = RunId::new();
+        let now = Utc::now();
+        let graph = workflow();
+        let run_id = RunId::new();
+        let graph_artifact = Artifact::new(
+            ArtifactKind::WorkflowGraph,
+            store.put_json(&graph).unwrap(),
+            "fixture.workflow",
+            ArtifactLifecycle::RunScoped,
+            provenance(now),
+            None,
+            vec![],
+            now,
+        )
+        .unwrap();
         store
-            .create_run(&run, RunPurpose::Debug, "test", Utc::now())
+            .commit_workflow(&WorkflowCommit {
+                run: StoredRun {
+                    run_id: run_id.clone(),
+                    purpose: RunPurpose::Debug,
+                    topology_id: graph.topology_id.clone(),
+                    graph_artifact_id: graph_artifact.artifact_id.clone(),
+                    created_at: now,
+                },
+                graph: graph_artifact,
+                nodes: graph.nodes,
+            })
             .unwrap();
-        for _ in 0..4 {
-            store
-                .enqueue_task(&run, &TaskId::new(), TaskKind::Evaluate, Utc::now())
-                .unwrap();
-        }
 
         let completed = Arc::new(AtomicUsize::new(0));
         let handler: TaskHandler = {
             let completed = completed.clone();
-            Arc::new(move |_| {
+            let handler_store = store.clone();
+            Arc::new(move |task| {
                 let completed = completed.clone();
+                let store = handler_store.clone();
                 Box::pin(async move {
+                    let now = Utc::now();
+                    let artifact = Artifact::new(
+                        ArtifactKind::AgentTurn,
+                        store
+                            .put_bytes(b"fixture worker completion", "text/plain")
+                            .unwrap(),
+                        "fixture.worker",
+                        ArtifactLifecycle::RunScoped,
+                        ArtifactProvenance {
+                            source_family: "fixture.worker".to_owned(),
+                            observed_at: Some(now),
+                            retrieved_at: now,
+                            source_uri: None,
+                            confidence_ppm: 1_000_000,
+                            producer_contract_hash: task.permit.contract_hash.clone(),
+                        },
+                        Some(ArtifactOrigin {
+                            run_id: Some(task.run_id.clone()),
+                            task_id: Some(task.node.task_id.clone()),
+                            attempt_id: Some(task.permit.attempt_id.clone()),
+                            contract_hash: task.permit.contract_hash.clone(),
+                        }),
+                        vec![],
+                        now,
+                    )
+                    .unwrap();
+                    store
+                        .commit_attempt(&task.permit, &[artifact], TaskStatus::Succeeded, now)
+                        .unwrap();
                     completed.fetch_add(1, Ordering::SeqCst);
-                    TaskCompletion::Succeeded
+                    TaskCompletion::Committed
                 })
             })
         };
@@ -179,12 +285,25 @@ mod tests {
             async move { pool.serve(handler, shutdown_rx).await }
         });
 
-        while completed.load(Ordering::SeqCst) < 4 {
-            tokio::task::yield_now().await;
-        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while completed.load(Ordering::SeqCst) < 4 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
         shutdown_tx.send(true).unwrap();
         task.await.unwrap().unwrap();
         assert_eq!(completed.load(Ordering::SeqCst), 4);
+        assert_eq!(
+            store
+                .events_after(&run_id, 0, 100)
+                .unwrap()
+                .iter()
+                .filter(|event| event.event_type == "task.succeeded")
+                .count(),
+            4
+        );
         assert!(store.verify_integrity().is_ok());
         assert_eq!(
             pool.worker_ids().into_iter().collect::<BTreeSet<_>>().len(),

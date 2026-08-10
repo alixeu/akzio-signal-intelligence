@@ -20,7 +20,7 @@ use crate::{
 
 /// A Store Root with this schema is intentionally incompatible with the previous
 /// v2 database. It is a rebuild, not a migration layer.
-pub const REBUILD_SCHEMA_VERSION: u32 = 5;
+pub const REBUILD_SCHEMA_VERSION: u32 = 6;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -48,6 +48,7 @@ pub enum ArtifactKind {
     ContextRepair,
     EvidenceNeed,
     Contract,
+    WorkflowProposalDraft,
     WorkflowProposal,
     WorkflowGraph,
     AgentTurn,
@@ -81,7 +82,29 @@ impl ArtifactKind {
     }
 
     pub const fn can_be_canonical(self) -> bool {
-        !matches!(self, Self::AgentTurn | Self::ToolCall | Self::ToolResult)
+        matches!(
+            self,
+            Self::RawEvidence
+                | Self::NormalizedEvidence
+                | Self::SemanticDetail
+                | Self::Contract
+                | Self::Claim
+                | Self::Critique
+                | Self::DecisionContext
+                | Self::Decision
+                | Self::ExecutionContext
+                | Self::ExecutionVerdict
+                | Self::ExecutionPlan
+                | Self::ExecutionCommitment
+                | Self::ExecutionReprice
+                | Self::OrderReceipt
+                | Self::Reconciliation
+                | Self::Experience
+                | Self::Outcome
+                | Self::Evaluation
+                | Self::CandidatePolicy
+                | Self::FreezeState
+        )
     }
 }
 
@@ -103,7 +126,7 @@ impl ArtifactLifecycle {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ArtifactRef {
     pub artifact_id: ArtifactId,
     pub kind: ArtifactKind,
@@ -183,6 +206,8 @@ impl Artifact {
         created_at: DateTime<Utc>,
     ) -> Result<Self, DomainError> {
         let producer = producer.into();
+        let mut source_refs = source_refs;
+        source_refs.sort();
         let mut artifact = Self {
             schema_version: REBUILD_SCHEMA_VERSION,
             artifact_id: ArtifactId(ContentHash::of_bytes(b"uninitialized artifact")),
@@ -202,11 +227,7 @@ impl Artifact {
 
     pub fn expected_hash(&self) -> Result<ContentHash, DomainError> {
         let mut canonical = self.clone();
-        canonical.source_refs.sort_by(|left, right| {
-            left.artifact_id
-                .cmp(&right.artifact_id)
-                .then_with(|| left.kind.cmp(&right.kind))
-        });
+        canonical.source_refs.sort();
         let mut value = serde_json::to_value(canonical).map_err(|_| DomainError::EmptyField {
             field: "artifact.serialize",
         })?;
@@ -248,6 +269,11 @@ impl Artifact {
     }
 
     fn validate_source_refs(&self) -> Result<(), DomainError> {
+        if self.source_refs.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(DomainError::EmptyField {
+                field: "artifact.source_refs",
+            });
+        }
         let mut seen = BTreeSet::new();
 
         if self.source_refs.iter().any(|reference| {
@@ -317,6 +343,10 @@ impl ContractPurpose {
 pub struct ContextPolicy {
     pub permitted_kinds: BTreeSet<ArtifactKind>,
     pub permitted_source_families: BTreeSet<String>,
+    /// Minimum selected artifacts required before an Agent task can start.
+    /// A zero value is reserved for the bootstrap Planner, which creates the
+    /// first governed evidence requests from an intentionally empty context.
+    pub min_artifacts: u16,
     pub max_artifacts: u16,
     pub max_bytes: u64,
     pub max_tokens: u32,
@@ -326,6 +356,7 @@ pub struct ContextPolicy {
 impl ContextPolicy {
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.permitted_kinds.is_empty()
+            || self.min_artifacts > self.max_artifacts
             || self.max_artifacts == 0
             || self.max_bytes == 0
             || self.max_tokens == 0
@@ -377,6 +408,7 @@ impl CandidateCapabilityCeiling {
             && context
                 .permitted_source_families
                 .is_subset(&self.context.permitted_source_families)
+            && context.min_artifacts >= self.context.min_artifacts
             && context.max_artifacts <= self.context.max_artifacts
             && context.max_bytes <= self.context.max_bytes
             && context.max_tokens <= self.context.max_tokens
@@ -540,6 +572,7 @@ impl AgentContract {
         if !matches!(
             self.output.artifact_kind,
             ArtifactKind::EvidenceNeed
+                | ArtifactKind::WorkflowProposalDraft
                 | ArtifactKind::WorkflowProposal
                 | ArtifactKind::Claim
                 | ArtifactKind::Critique
@@ -588,6 +621,7 @@ pub struct TaskRecipe {
     pub purpose: ContractPurpose,
     pub contract_hash: Option<ContentHash>,
     pub task_class: RuntimeTaskClass,
+    pub allowed_evidence_sources: BTreeSet<String>,
     pub max_children: u16,
     pub max_depth: u16,
     pub priority_ceiling: u8,
@@ -610,6 +644,15 @@ impl TaskRecipe {
                 field: "task_recipe.contract_hash",
             });
         }
+        if self
+            .allowed_evidence_sources
+            .iter()
+            .any(|source| source.trim().is_empty())
+        {
+            return Err(DomainError::EmptyField {
+                field: "task_recipe.allowed_evidence_sources",
+            });
+        }
         Ok(())
     }
 }
@@ -624,6 +667,132 @@ pub enum RuntimeTaskClass {
     PaperCommit,
     Reconcile,
     Evaluate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct EvidenceNeed {
+    pub schema_version: u32,
+    pub source_family: String,
+    pub resource: String,
+    pub max_age_secs: u64,
+}
+
+impl EvidenceNeed {
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if self.schema_version != REBUILD_SCHEMA_VERSION
+            || self.source_family.trim().is_empty()
+            || self.resource.trim().is_empty()
+            || self.max_age_secs == 0
+        {
+            return Err(DomainError::EmptyField {
+                field: "evidence_need",
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowProposalDraftTask {
+    pub recipe_id: TaskRecipeId,
+    pub objective: String,
+    pub depends_on: Vec<String>,
+    pub priority: u8,
+    pub evidence_needs: Vec<EvidenceNeed>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowProposalDraft {
+    pub schema_version: u32,
+    pub topology_id: String,
+    pub tasks: BTreeMap<String, WorkflowProposalDraftTask>,
+    pub stop_reason: Option<String>,
+}
+
+impl WorkflowProposalDraft {
+    pub fn validate(
+        &self,
+        recipes: &BTreeMap<TaskRecipeId, TaskRecipe>,
+    ) -> Result<(), DomainError> {
+        if self.schema_version != REBUILD_SCHEMA_VERSION || self.topology_id.trim().is_empty() {
+            return Err(DomainError::EmptyField {
+                field: "workflow_proposal_draft.identity",
+            });
+        }
+        if self.tasks.is_empty() {
+            return Err(DomainError::EmptyField {
+                field: "workflow_proposal_draft.tasks",
+            });
+        }
+        for (alias, task) in &self.tasks {
+            if alias.trim().is_empty() || task.objective.trim().is_empty() || task.priority > 100 {
+                return Err(DomainError::InvalidBudget {
+                    field: "workflow_proposal_draft.task",
+                });
+            }
+            let recipe = recipes
+                .get(&task.recipe_id)
+                .ok_or(DomainError::EmptyField {
+                    field: "workflow_proposal_draft.recipe",
+                })?;
+            if task.priority > recipe.priority_ceiling {
+                return Err(DomainError::InvalidBudget {
+                    field: "workflow_proposal_draft.priority",
+                });
+            }
+            let unique_needs = task.evidence_needs.iter().collect::<BTreeSet<_>>();
+            if unique_needs.len() != task.evidence_needs.len() {
+                return Err(DomainError::EmptyField {
+                    field: "workflow_proposal_draft.evidence_needs",
+                });
+            }
+            for need in &task.evidence_needs {
+                need.validate()?;
+                if !recipe
+                    .allowed_evidence_sources
+                    .contains(&need.source_family)
+                {
+                    return Err(DomainError::EvidenceSourceNotAllowed(
+                        need.source_family.clone(),
+                    ));
+                }
+            }
+            if task
+                .depends_on
+                .iter()
+                .any(|dependency| !self.tasks.contains_key(dependency))
+            {
+                return Err(DomainError::UnknownDependency {
+                    task: TaskId(alias.clone()),
+                    dependency: TaskId("proposal alias".to_owned()),
+                });
+            }
+        }
+
+        fn visit(
+            alias: &str,
+            tasks: &BTreeMap<String, WorkflowProposalDraftTask>,
+            states: &mut BTreeMap<String, u8>,
+        ) -> Result<(), DomainError> {
+            match states.get(alias).copied() {
+                Some(1) => return Err(DomainError::CyclicPlan),
+                Some(2) => return Ok(()),
+                _ => {}
+            }
+            states.insert(alias.to_owned(), 1);
+            for dependency in &tasks[alias].depends_on {
+                visit(dependency, tasks, states)?;
+            }
+            states.insert(alias.to_owned(), 2);
+            Ok(())
+        }
+
+        let mut states = BTreeMap::new();
+        for alias in self.tasks.keys() {
+            visit(alias, &self.tasks, &mut states)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -843,7 +1012,7 @@ pub struct ContextManifestPayload {
 impl ContextManifestPayload {
     pub fn validate(&self, policy: &ContextPolicy) -> Result<(), DomainError> {
         if self.schema_version != REBUILD_SCHEMA_VERSION
-            || self.selections.is_empty()
+            || self.selections.len() < usize::from(policy.min_artifacts)
             || self.selections.len() > usize::from(policy.max_artifacts)
             || self.total_bytes > policy.max_bytes
             || self.estimated_tokens > policy.max_tokens
@@ -1038,15 +1207,35 @@ mod tests {
             ArtifactLifecycle::RunScoped,
             provenance(),
             None,
-            vec![first, second],
+            vec![first.clone(), second.clone()],
             Utc::now(),
         )
         .unwrap();
 
+        assert_eq!(artifact.source_refs, vec![second, first]);
+
         let mut reordered = artifact.clone();
         reordered.source_refs.reverse();
-        reordered.validate().unwrap();
+        assert_eq!(
+            reordered.validate(),
+            Err(DomainError::EmptyField {
+                field: "artifact.source_refs",
+            })
+        );
         assert_eq!(reordered.expected_hash().unwrap(), artifact.artifact_id.0);
+    }
+
+    #[test]
+    fn planner_artifacts_cannot_be_canonical() {
+        for kind in [
+            ArtifactKind::EvidenceNeed,
+            ArtifactKind::WorkflowProposalDraft,
+            ArtifactKind::WorkflowProposal,
+            ArtifactKind::WorkflowGraph,
+            ArtifactKind::DecisionProposal,
+        ] {
+            assert!(!kind.can_be_canonical());
+        }
     }
 
     #[test]
@@ -1084,6 +1273,7 @@ mod tests {
             ContextPolicy {
                 permitted_kinds: BTreeSet::from([ArtifactKind::NormalizedEvidence]),
                 permitted_source_families: BTreeSet::from(["market".to_owned()]),
+                min_artifacts: 1,
                 max_artifacts: 4,
                 max_bytes: 1024,
                 max_tokens: 256,
@@ -1170,6 +1360,36 @@ mod tests {
     }
 
     #[test]
+    fn context_minimum_is_validated_and_candidates_cannot_lower_it() {
+        let policy = ContextPolicy {
+            permitted_kinds: BTreeSet::from([ArtifactKind::NormalizedEvidence]),
+            permitted_source_families: BTreeSet::from(["market".to_owned()]),
+            min_artifacts: 1,
+            max_artifacts: 4,
+            max_bytes: 1024,
+            max_tokens: 256,
+            allow_raw_reread: false,
+        };
+        policy.validate().unwrap();
+        let ceiling = CandidateCapabilityCeiling {
+            context: policy.clone(),
+            tool_grants: vec![],
+        };
+
+        let mut lower_minimum = policy.clone();
+        lower_minimum.min_artifacts = 0;
+        assert!(!ceiling.permits(&lower_minimum, &[]));
+
+        let mut stricter_minimum = policy.clone();
+        stricter_minimum.min_artifacts = 2;
+        assert!(ceiling.permits(&stricter_minimum, &[]));
+
+        let mut invalid = policy;
+        invalid.min_artifacts = invalid.max_artifacts + 1;
+        assert!(invalid.validate().is_err());
+    }
+
+    #[test]
     fn hard_blocker_requires_evidence() {
         let blocker = DecisionBlocker {
             code: "stale_quote".to_owned(),
@@ -1189,6 +1409,7 @@ mod tests {
             purpose: ContractPurpose::new("research.analyst").unwrap(),
             contract_hash: Some(ContentHash::of_bytes(b"fixture-contract")),
             task_class: RuntimeTaskClass::Agent,
+            allowed_evidence_sources: BTreeSet::new(),
             max_children: 4,
             max_depth: 4,
             priority_ceiling: 80,
@@ -1259,6 +1480,66 @@ mod tests {
                 field: "workflow_proposal.recipe"
             })
         ));
+    }
+
+    #[test]
+    fn workflow_proposal_draft_limits_evidence_to_recipe_sources() {
+        let recipe_id = TaskRecipeId::new("research.analyst").unwrap();
+        let recipe = TaskRecipe {
+            recipe_id: recipe_id.clone(),
+            purpose: ContractPurpose::new("research.analyst").unwrap(),
+            contract_hash: Some(ContentHash::of_bytes(b"fixture-contract")),
+            task_class: RuntimeTaskClass::Agent,
+            allowed_evidence_sources: BTreeSet::from(["alpaca".to_owned()]),
+            max_children: 4,
+            max_depth: 4,
+            priority_ceiling: 80,
+            budget: TaskBudget {
+                max_input_tokens: 256,
+                max_output_tokens: 128,
+                max_wall_time_secs: 30,
+                max_tool_calls: 2,
+            },
+            retry: RetryPolicy {
+                max_attempts: 1,
+                initial_backoff_ms: 1,
+                retry_transport: true,
+                retry_rate_limited: true,
+                retry_invalid_output: false,
+            },
+            on_failure: FailureDisposition::FailTask,
+        };
+        let recipes = BTreeMap::from([(recipe_id.clone(), recipe)]);
+        let mut draft = WorkflowProposalDraft {
+            schema_version: REBUILD_SCHEMA_VERSION,
+            topology_id: "fixture".to_owned(),
+            tasks: BTreeMap::from([(
+                "analyst".to_owned(),
+                WorkflowProposalDraftTask {
+                    recipe_id,
+                    objective: "analyze governed market evidence".to_owned(),
+                    depends_on: vec![],
+                    priority: 50,
+                    evidence_needs: vec![EvidenceNeed {
+                        schema_version: REBUILD_SCHEMA_VERSION,
+                        source_family: "alpaca".to_owned(),
+                        resource: "bars:TQQQ:1d".to_owned(),
+                        max_age_secs: 86_400,
+                    }],
+                },
+            )]),
+            stop_reason: None,
+        };
+        draft.validate(&recipes).unwrap();
+
+        draft.tasks.get_mut("analyst").unwrap().evidence_needs[0].source_family =
+            "uninstalled-web".to_owned();
+        assert_eq!(
+            draft.validate(&recipes),
+            Err(DomainError::EvidenceSourceNotAllowed(
+                "uninstalled-web".to_owned()
+            ))
+        );
     }
 
     #[test]

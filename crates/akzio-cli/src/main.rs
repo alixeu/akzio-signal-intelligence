@@ -208,13 +208,11 @@ async fn serve(config: Config) -> Result<()> {
         let _ = tokio::signal::ctrl_c().await;
         let _ = shutdown_tx.send(true);
     });
+    let http_daemon = daemon.clone();
+    let unix_daemon = daemon.clone();
     tokio::try_join!(
-        daemon
-            .clone()
-            .serve_http(config.daemon.http_addr, shutdown_rx.clone()),
-        daemon
-            .clone()
-            .serve_unix(config.daemon.unix_socket, shutdown_rx.clone()),
+        http_daemon.serve_http(config.daemon.http_addr, shutdown_rx.clone()),
+        unix_daemon.serve_unix(config.daemon.unix_socket, shutdown_rx.clone()),
         daemon.serve_workers(shutdown_rx),
     )?;
     Ok(())

@@ -1,7 +1,7 @@
 //! Contract-driven Agent runtime for the v2 system.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     time::{Duration as StdDuration, Instant},
 };
 
@@ -11,9 +11,13 @@ use akzio_context::v2::{
 };
 use akzio_domain::{
     AgentContract, Artifact, ArtifactId, ArtifactKind, ArtifactLifecycle, ArtifactOrigin,
-    ArtifactProvenance, ArtifactRef, DomainError, ReadGrant, TaskWritePermit, WorkflowNode,
+    ArtifactProvenance, ArtifactRef, ContextPolicy, ContractId, ContractPurpose, DomainError,
+    FailureDisposition, OutputContract, ReadGrant, RetryPolicy, RuntimeTaskClass, TaskBudget,
+    TaskRecipe, TaskRecipeId, TaskWritePermit, TerminationPolicy, ToolGrant, ToolKind,
+    WorkflowNode, REBUILD_SCHEMA_VERSION,
 };
 use akzio_model::{ModelClient, ModelError, ModelRequest, ModelToolDefinition};
+use akzio_runtime::v2::{RecipeCatalogue, RuntimeError as RebuildRuntimeError, TerminalRecipeSet};
 use akzio_store::v2::{StoreError, V2Store};
 use chrono::{DateTime, Duration, Utc};
 use futures::future::BoxFuture;
@@ -31,6 +35,8 @@ pub enum RebuildResearchError {
     Domain(#[from] DomainError),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    Runtime(#[from] RebuildRuntimeError),
     #[error("task has no Agent Contract hash")]
     MissingContractHash,
     #[error("Agent Contract {0} is not installed")]
@@ -46,6 +52,20 @@ pub enum RebuildResearchError {
         contract_id: akzio_domain::ContractId,
         version: u32,
     },
+    #[error("active research contract purpose is not allowed: {0}")]
+    UnexpectedActiveContractPurpose(String),
+    #[error("active research contract purpose appears more than once: {0}")]
+    DuplicateActiveContractPurpose(String),
+    #[error("active research contract is missing: {0}")]
+    MissingActiveContract(&'static str),
+    #[error("active research contract {purpose} outputs {actual:?}, expected {expected:?}")]
+    ActiveContractOutputMismatch {
+        purpose: String,
+        expected: ArtifactKind,
+        actual: ArtifactKind,
+    },
+    #[error("active research contract {0} differs from the canonical definition")]
+    NonCanonicalActiveContract(String),
     #[error("candidate contract {candidate} expands active contract {active} capability")]
     CandidateCapabilityExpansion {
         active: akzio_domain::ContentHash,
@@ -82,6 +102,75 @@ pub struct InstalledContract {
     pub contract: AgentContract,
     pub artifact: Artifact,
 }
+
+/// The bounded initial topology is expressed as installed Contracts, never as
+/// a role registry. Daemon bootstrap consumes this pair atomically at the API
+/// boundary: contracts drive model turns; recipes drive Rust DAG lowering.
+#[derive(Debug, Clone)]
+pub struct ActiveResearchCatalogue {
+    pub contracts: RebuildContractCatalogue,
+    pub recipes: RecipeCatalogue,
+}
+
+impl ActiveResearchCatalogue {
+    /// Install exactly the immutable, locally-defined Active research
+    /// contracts and derive the only RecipeCatalogue that can execute them.
+    /// Candidate contracts deliberately have no path through this constructor.
+    pub fn install(store: &V2Store, now: DateTime<Utc>) -> RebuildResearchResult<Self> {
+        let contracts =
+            RebuildContractCatalogue::install(store, canonical_active_contracts(store)?, now)?;
+        let recipes = contracts.active_recipe_catalogue(store)?;
+        Ok(Self { contracts, recipes })
+    }
+}
+
+pub const ACTIVE_RESEARCH_MAX_NODES: usize = 32;
+
+const ACTIVE_CONTRACT_VERSION: u32 = 1;
+const PLANNER_RECIPE_ID: &str = "research.planner";
+const PLANNER_CHILD_RECIPE_IDS: [&str; 3] = [
+    "research.analyst",
+    "research.critic",
+    "research.synthesizer",
+];
+const GOVERNED_EVIDENCE_SOURCE_FAMILIES: [&str; 4] = ["alpaca", "sec_edgar", "fred", "news_web"];
+const PLANNER_MAX_DRAFT_TASKS: u16 = 8;
+const EVIDENCE_GATE_RECIPE_ID: &str = "gate.evidence";
+const DECISION_GATE_RECIPE_ID: &str = "gate.decision";
+const EXECUTION_GATE_RECIPE_ID: &str = "gate.execution";
+const PAPER_COMMIT_RECIPE_ID: &str = "gate.paper";
+const RECONCILE_RECIPE_ID: &str = "gate.reconcile";
+const EVALUATE_RECIPE_ID: &str = "gate.evaluate";
+
+#[derive(Debug, Clone, Copy)]
+struct ActiveRecipePolicy {
+    purpose: &'static str,
+    output_kind: ArtifactKind,
+    priority_ceiling: u8,
+}
+
+const ACTIVE_RECIPE_POLICIES: [ActiveRecipePolicy; 4] = [
+    ActiveRecipePolicy {
+        purpose: PLANNER_RECIPE_ID,
+        output_kind: ArtifactKind::WorkflowProposalDraft,
+        priority_ceiling: 100,
+    },
+    ActiveRecipePolicy {
+        purpose: "research.analyst",
+        output_kind: ArtifactKind::Claim,
+        priority_ceiling: 90,
+    },
+    ActiveRecipePolicy {
+        purpose: "research.critic",
+        output_kind: ArtifactKind::Critique,
+        priority_ceiling: 80,
+    },
+    ActiveRecipePolicy {
+        purpose: "research.synthesizer",
+        output_kind: ArtifactKind::DecisionProposal,
+        priority_ceiling: 100,
+    },
+];
 
 #[derive(Debug, Clone, Default)]
 pub struct RebuildContractCatalogue {
@@ -163,6 +252,80 @@ impl RebuildContractCatalogue {
         self.by_identity.get(&(contract_id.clone(), version))
     }
 
+    /// Lower only the canonical initial Active contracts into agent recipes.
+    /// The recipe limits come from each contract's termination/budget/retry
+    /// policy; Rust owns the fixed priority ceilings and terminal gate recipes.
+    ///
+    /// This method rejects both altered Active contracts and additional
+    /// candidate/unknown contracts rather than silently granting a new recipe.
+    pub fn active_recipe_catalogue(
+        &self,
+        store: &V2Store,
+    ) -> RebuildResearchResult<RecipeCatalogue> {
+        let expected_by_purpose = canonical_active_contracts(store)?
+            .into_iter()
+            .map(|contract| (contract.purpose.as_str().to_owned(), contract))
+            .collect::<BTreeMap<_, _>>();
+        let mut installed_purposes = BTreeSet::new();
+        let mut recipes = Vec::with_capacity(ACTIVE_RECIPE_POLICIES.len() + 6);
+
+        for installed in self.contracts() {
+            let purpose = installed.contract.purpose.as_str();
+            let policy = active_recipe_policy(purpose).ok_or_else(|| {
+                RebuildResearchError::UnexpectedActiveContractPurpose(purpose.to_owned())
+            })?;
+            if !installed_purposes.insert(purpose.to_owned()) {
+                return Err(RebuildResearchError::DuplicateActiveContractPurpose(
+                    purpose.to_owned(),
+                ));
+            }
+            if installed.contract.output.artifact_kind != policy.output_kind {
+                return Err(RebuildResearchError::ActiveContractOutputMismatch {
+                    purpose: purpose.to_owned(),
+                    expected: policy.output_kind,
+                    actual: installed.contract.output.artifact_kind,
+                });
+            }
+            let expected = expected_by_purpose
+                .get(purpose)
+                .expect("active recipe policy has a canonical contract");
+            if installed.contract.contract_hash != expected.contract_hash {
+                return Err(RebuildResearchError::NonCanonicalActiveContract(
+                    purpose.to_owned(),
+                ));
+            }
+
+            recipes.push(TaskRecipe {
+                recipe_id: TaskRecipeId::new(purpose)?,
+                purpose: installed.contract.purpose.clone(),
+                contract_hash: Some(installed.contract.contract_hash.clone()),
+                task_class: RuntimeTaskClass::Agent,
+                allowed_evidence_sources: recipe_evidence_sources(&installed.contract),
+                max_children: installed.contract.termination.max_child_tasks,
+                max_depth: installed.contract.termination.max_depth,
+                priority_ceiling: policy.priority_ceiling,
+                budget: installed.contract.budget.clone(),
+                retry: installed.contract.retry.clone(),
+                on_failure: installed.contract.on_failure,
+            });
+        }
+
+        for policy in ACTIVE_RECIPE_POLICIES {
+            if !installed_purposes.contains(policy.purpose) {
+                return Err(RebuildResearchError::MissingActiveContract(policy.purpose));
+            }
+        }
+
+        let (terminal_recipes, terminals) = rust_terminal_recipes()?;
+        recipes.extend(terminal_recipes);
+        Ok(RecipeCatalogue::new(
+            recipes,
+            TaskRecipeId::new(PLANNER_RECIPE_ID)?,
+            terminals,
+            ACTIVE_RESEARCH_MAX_NODES,
+        )?)
+    }
+
     /// Candidate contracts are data for later shadow evaluation. This gate
     /// proves they cannot request a wider source or tool surface than the
     /// installed active contract that sponsors them.
@@ -182,6 +345,395 @@ impl RebuildContractCatalogue {
             })
         }
     }
+}
+
+fn active_recipe_policy(purpose: &str) -> Option<ActiveRecipePolicy> {
+    ACTIVE_RECIPE_POLICIES
+        .iter()
+        .copied()
+        .find(|policy| policy.purpose == purpose)
+}
+
+struct CanonicalContractDefinition {
+    purpose: &'static str,
+    responsibility: &'static str,
+    prompt: &'static str,
+    output_kind: ArtifactKind,
+    output_schema: Value,
+    permitted_kinds: BTreeSet<ArtifactKind>,
+    min_context_artifacts: u16,
+    budget: TaskBudget,
+    termination: TerminationPolicy,
+    on_failure: FailureDisposition,
+}
+
+fn canonical_active_contracts(store: &V2Store) -> RebuildResearchResult<Vec<AgentContract>> {
+    [
+        CanonicalContractDefinition {
+            purpose: PLANNER_RECIPE_ID,
+            responsibility: "Lower a bounded research objective into a WorkflowProposalDraft using only installed research recipes and inline EvidenceNeed requests.",
+            prompt: "You are Akzio's bounded research planner. Return only JSON matching the WorkflowProposalDraft schema. You may name only research.analyst, research.critic, and research.synthesizer recipes, and express evidence needs inline. Do not construct ArtifactRef values, request sources or tools beyond the contract, submit a decision, or submit an order.",
+            output_kind: ArtifactKind::WorkflowProposalDraft,
+            output_schema: planner_draft_output_schema(),
+            permitted_kinds: BTreeSet::from([
+                ArtifactKind::NormalizedEvidence,
+                ArtifactKind::SemanticDetail,
+                ArtifactKind::Claim,
+                ArtifactKind::Critique,
+            ]),
+            min_context_artifacts: 0,
+            budget: TaskBudget {
+                max_input_tokens: 12_000,
+                max_output_tokens: 2_000,
+                max_wall_time_secs: 60,
+                max_tool_calls: 4,
+            },
+            termination: TerminationPolicy {
+                max_child_tasks: PLANNER_MAX_DRAFT_TASKS,
+                max_depth: 2,
+                require_evidence: false,
+                stop_when_evidence_complete: true,
+            },
+            on_failure: FailureDisposition::FailRun,
+        },
+        CanonicalContractDefinition {
+            purpose: "research.analyst",
+            responsibility: "Produce evidence-linked, bounded research claims for one shard of the approved workflow.",
+            prompt: "You are Akzio's research analyst. Return only a JSON Claim. Use granted context and read only artifacts named by the ContextManifest. Do not call external systems, widen sources, change topology, submit decisions, or submit orders.",
+            output_kind: ArtifactKind::Claim,
+            output_schema: claim_output_schema(),
+            permitted_kinds: BTreeSet::from([
+                ArtifactKind::NormalizedEvidence,
+                ArtifactKind::SemanticDetail,
+            ]),
+            min_context_artifacts: 1,
+            budget: TaskBudget {
+                max_input_tokens: 8_000,
+                max_output_tokens: 1_500,
+                max_wall_time_secs: 60,
+                max_tool_calls: 4,
+            },
+            termination: TerminationPolicy {
+                max_child_tasks: 2,
+                max_depth: 2,
+                require_evidence: true,
+                stop_when_evidence_complete: true,
+            },
+            on_failure: FailureDisposition::FailTask,
+        },
+        CanonicalContractDefinition {
+            purpose: "research.critic",
+            responsibility: "Challenge material claims and surface evidence or risk gaps without changing facts or execution authority.",
+            prompt: "You are Akzio's research critic. Return only a JSON Critique. Challenge supplied claims using granted context. Do not invent evidence, widen sources or tools, alter the workflow, produce a decision, or submit an order.",
+            output_kind: ArtifactKind::Critique,
+            output_schema: critique_output_schema(),
+            permitted_kinds: BTreeSet::from([
+                ArtifactKind::Claim,
+                ArtifactKind::SemanticDetail,
+            ]),
+            min_context_artifacts: 1,
+            budget: TaskBudget {
+                max_input_tokens: 6_000,
+                max_output_tokens: 1_500,
+                max_wall_time_secs: 45,
+                max_tool_calls: 2,
+            },
+            termination: TerminationPolicy {
+                max_child_tasks: 1,
+                max_depth: 1,
+                require_evidence: true,
+                stop_when_evidence_complete: true,
+            },
+            on_failure: FailureDisposition::SkipTask,
+        },
+        CanonicalContractDefinition {
+            purpose: "research.synthesizer",
+            responsibility: "Synthesize approved claims and critiques into a DecisionProposal with typed blockers for Rust-owned gates.",
+            prompt: "You are Akzio's research synthesizer. Return only a JSON DecisionProposal with explicit blockers. Use supplied claims and critiques only. Do not change evidence, bypass the DecisionGate, submit an order, or expand any capability.",
+            output_kind: ArtifactKind::DecisionProposal,
+            output_schema: decision_proposal_output_schema(),
+            permitted_kinds: BTreeSet::from([
+                ArtifactKind::Claim,
+                ArtifactKind::Critique,
+                ArtifactKind::SemanticDetail,
+            ]),
+            min_context_artifacts: 1,
+            budget: TaskBudget {
+                max_input_tokens: 12_000,
+                max_output_tokens: 2_000,
+                max_wall_time_secs: 60,
+                max_tool_calls: 2,
+            },
+            termination: TerminationPolicy::leaf(),
+            on_failure: FailureDisposition::FailRun,
+        },
+    ]
+    .into_iter()
+    .map(|definition| canonical_active_contract(store, definition))
+    .collect()
+}
+
+fn canonical_active_contract(
+    store: &V2Store,
+    definition: CanonicalContractDefinition,
+) -> RebuildResearchResult<AgentContract> {
+    let prompt = store.put_bytes(definition.prompt.as_bytes(), "text/plain")?;
+    let schema = store.put_json(&definition.output_schema)?;
+    Ok(AgentContract::new(
+        ContractId(format!("akzio.v2.{}", definition.purpose)),
+        ACTIVE_CONTRACT_VERSION,
+        ContractPurpose::new(definition.purpose)?,
+        definition.responsibility,
+        prompt,
+        ContextPolicy {
+            permitted_kinds: definition.permitted_kinds,
+            permitted_source_families: governed_context_sources(),
+            min_artifacts: definition.min_context_artifacts,
+            max_artifacts: 24,
+            max_bytes: 128 * 1024,
+            max_tokens: definition.budget.max_input_tokens,
+            allow_raw_reread: false,
+        },
+        evidence_read_grants(),
+        OutputContract {
+            artifact_kind: definition.output_kind,
+            schema,
+        },
+        definition.budget,
+        active_retry_policy(),
+        definition.termination,
+        definition.on_failure,
+    )?)
+}
+
+fn governed_context_sources() -> BTreeSet<String> {
+    GOVERNED_EVIDENCE_SOURCE_FAMILIES
+        .into_iter()
+        .chain(["akzio.agent"])
+        .map(str::to_owned)
+        .collect()
+}
+
+fn evidence_read_grants() -> Vec<ToolGrant> {
+    vec![ToolGrant {
+        kind: ToolKind::ReadEvidence,
+        allowed_sources: GOVERNED_EVIDENCE_SOURCE_FAMILIES
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+    }]
+}
+
+fn recipe_evidence_sources(contract: &AgentContract) -> BTreeSet<String> {
+    contract
+        .tool_grants
+        .iter()
+        .filter(|grant| grant.kind == ToolKind::ReadEvidence)
+        .flat_map(|grant| grant.allowed_sources.iter().cloned())
+        .collect()
+}
+
+fn active_retry_policy() -> RetryPolicy {
+    RetryPolicy {
+        max_attempts: 2,
+        initial_backoff_ms: 250,
+        retry_transport: true,
+        retry_rate_limited: true,
+        retry_invalid_output: true,
+    }
+}
+
+fn planner_draft_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "schema_version": {
+                "type": "integer",
+                "enum": [REBUILD_SCHEMA_VERSION]
+            },
+            "topology_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128
+            },
+            "tasks": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "minProperties": 1,
+                "maxProperties": PLANNER_MAX_DRAFT_TASKS,
+                "additionalProperties": planner_draft_task_schema()
+            },
+            "stop_reason": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 1024
+            }
+        },
+        "required": ["schema_version", "topology_id", "tasks"],
+        "additionalProperties": false
+    })
+}
+
+fn planner_draft_task_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "recipe_id": {
+                "type": "string",
+                "enum": PLANNER_CHILD_RECIPE_IDS
+            },
+            "objective": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 2048
+            },
+            "depends_on": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128
+                },
+                "maxItems": PLANNER_MAX_DRAFT_TASKS
+            },
+            "priority": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 100
+            },
+            "evidence_needs": {
+                "type": "array",
+                "items": evidence_need_output_schema(),
+                "maxItems": PLANNER_MAX_DRAFT_TASKS
+            }
+        },
+        "required": [
+            "recipe_id",
+            "objective",
+            "depends_on",
+            "priority",
+            "evidence_needs"
+        ],
+        "additionalProperties": false
+    })
+}
+
+fn evidence_need_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "schema_version": {
+                "type": "integer",
+                "enum": [REBUILD_SCHEMA_VERSION]
+            },
+            "source_family": {
+                "type": "string",
+                "enum": GOVERNED_EVIDENCE_SOURCE_FAMILIES
+            },
+            "resource": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512
+            },
+            "max_age_secs": {
+                "type": "integer",
+                "minimum": 1
+            }
+        },
+        "required": ["schema_version", "source_family", "resource", "max_age_secs"],
+        "additionalProperties": false
+    })
+}
+
+fn claim_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "summary": { "type": "string" },
+            "confidence_ppm": { "type": "integer" },
+            "rationale": { "type": "string" }
+        },
+        "required": ["summary", "confidence_ppm"],
+        "additionalProperties": false
+    })
+}
+
+fn critique_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "summary": { "type": "string" },
+            "severity": { "type": "string", "enum": ["low", "medium", "high"] },
+            "blocker": { "type": "boolean" }
+        },
+        "required": ["summary", "severity", "blocker"],
+        "additionalProperties": false
+    })
+}
+
+fn decision_proposal_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "summary": { "type": "string" },
+            "confidence_ppm": { "type": "integer" },
+            "blockers": { "type": "array", "items": { "type": "string" } },
+            "asset_views": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": true
+            }
+        },
+        "required": ["summary", "confidence_ppm", "blockers", "asset_views"],
+        "additionalProperties": false
+    })
+}
+
+fn rust_terminal_recipes() -> RebuildResearchResult<(Vec<TaskRecipe>, TerminalRecipeSet)> {
+    let evidence = rust_gate_recipe(EVIDENCE_GATE_RECIPE_ID, RuntimeTaskClass::Evidence)?;
+    let decision = rust_gate_recipe(DECISION_GATE_RECIPE_ID, RuntimeTaskClass::DecisionGate)?;
+    let execution = rust_gate_recipe(EXECUTION_GATE_RECIPE_ID, RuntimeTaskClass::ExecutionGate)?;
+    let paper = rust_gate_recipe(PAPER_COMMIT_RECIPE_ID, RuntimeTaskClass::PaperCommit)?;
+    let reconcile = rust_gate_recipe(RECONCILE_RECIPE_ID, RuntimeTaskClass::Reconcile)?;
+    let evaluate = rust_gate_recipe(EVALUATE_RECIPE_ID, RuntimeTaskClass::Evaluate)?;
+    let terminals = TerminalRecipeSet {
+        evidence_gate: evidence.recipe_id.clone(),
+        decision_gate: decision.recipe_id.clone(),
+        execution_gate: execution.recipe_id.clone(),
+        paper_commit: paper.recipe_id.clone(),
+        reconcile: reconcile.recipe_id.clone(),
+        evaluate: evaluate.recipe_id.clone(),
+    };
+    Ok((
+        vec![evidence, decision, execution, paper, reconcile, evaluate],
+        terminals,
+    ))
+}
+
+fn rust_gate_recipe(
+    recipe_id: &str,
+    task_class: RuntimeTaskClass,
+) -> RebuildResearchResult<TaskRecipe> {
+    Ok(TaskRecipe {
+        recipe_id: TaskRecipeId::new(recipe_id)?,
+        purpose: ContractPurpose::new(recipe_id)?,
+        contract_hash: None,
+        task_class,
+        allowed_evidence_sources: BTreeSet::new(),
+        max_children: 0,
+        max_depth: 0,
+        priority_ceiling: 100,
+        budget: TaskBudget {
+            max_input_tokens: 1,
+            max_output_tokens: 1,
+            max_wall_time_secs: 30,
+            max_tool_calls: 0,
+        },
+        retry: RetryPolicy::none(),
+        on_failure: FailureDisposition::FailRun,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -907,7 +1459,20 @@ fn validate_schema_value(value: &Value, schema: &Value, path: &str) -> Result<()
     for key in definition.keys() {
         if !matches!(
             key.as_str(),
-            "type" | "enum" | "properties" | "required" | "additionalProperties" | "items"
+            "type"
+                | "enum"
+                | "properties"
+                | "required"
+                | "additionalProperties"
+                | "items"
+                | "minimum"
+                | "maximum"
+                | "minLength"
+                | "maxLength"
+                | "minItems"
+                | "maxItems"
+                | "minProperties"
+                | "maxProperties"
         ) {
             return Err(format!("{path} schema keyword {key} is unsupported"));
         }
@@ -929,6 +1494,7 @@ fn validate_schema_value(value: &Value, schema: &Value, path: &str) -> Result<()
     if !valid_kind {
         return Err(format!("{path} must be a {kind}"));
     }
+    validate_schema_bounds(value, definition, kind, path)?;
     if let Some(options) = definition.get("enum") {
         let options = options
             .as_array()
@@ -973,6 +1539,141 @@ fn validate_schema_value(value: &Value, schema: &Value, path: &str) -> Result<()
     }
 }
 
+fn validate_schema_bounds(
+    value: &Value,
+    definition: &serde_json::Map<String, Value>,
+    kind: &str,
+    path: &str,
+) -> Result<(), String> {
+    match kind {
+        "integer" | "number" => {
+            let actual = value
+                .as_f64()
+                .ok_or_else(|| format!("{path} must be numeric"))?;
+            for (keyword, accepts) in [("minimum", true), ("maximum", false)] {
+                if let Some(bound) = definition.get(keyword) {
+                    let bound = bound
+                        .as_f64()
+                        .ok_or_else(|| format!("{path} schema.{keyword} must be numeric"))?;
+                    if (accepts && actual < bound) || (!accepts && actual > bound) {
+                        return Err(format!("{path} violates schema.{keyword}"));
+                    }
+                }
+            }
+            if definition.contains_key("minLength")
+                || definition.contains_key("maxLength")
+                || definition.contains_key("minItems")
+                || definition.contains_key("maxItems")
+                || definition.contains_key("minProperties")
+                || definition.contains_key("maxProperties")
+            {
+                return Err(format!(
+                    "{path} numeric schema contains incompatible bounds"
+                ));
+            }
+        }
+        "string" => {
+            validate_size_bounds(
+                value.as_str().expect("validated string").chars().count(),
+                definition,
+                "minLength",
+                "maxLength",
+                path,
+            )?;
+            if definition.contains_key("minimum")
+                || definition.contains_key("maximum")
+                || definition.contains_key("minItems")
+                || definition.contains_key("maxItems")
+                || definition.contains_key("minProperties")
+                || definition.contains_key("maxProperties")
+            {
+                return Err(format!("{path} string schema contains incompatible bounds"));
+            }
+        }
+        "array" => {
+            validate_size_bounds(
+                value.as_array().expect("validated array").len(),
+                definition,
+                "minItems",
+                "maxItems",
+                path,
+            )?;
+            if definition.contains_key("minimum")
+                || definition.contains_key("maximum")
+                || definition.contains_key("minLength")
+                || definition.contains_key("maxLength")
+                || definition.contains_key("minProperties")
+                || definition.contains_key("maxProperties")
+            {
+                return Err(format!("{path} array schema contains incompatible bounds"));
+            }
+        }
+        "object" => {
+            validate_size_bounds(
+                value.as_object().expect("validated object").len(),
+                definition,
+                "minProperties",
+                "maxProperties",
+                path,
+            )?;
+            if definition.contains_key("minimum")
+                || definition.contains_key("maximum")
+                || definition.contains_key("minLength")
+                || definition.contains_key("maxLength")
+                || definition.contains_key("minItems")
+                || definition.contains_key("maxItems")
+            {
+                return Err(format!("{path} object schema contains incompatible bounds"));
+            }
+        }
+        _ => {
+            if definition.contains_key("minimum")
+                || definition.contains_key("maximum")
+                || definition.contains_key("minLength")
+                || definition.contains_key("maxLength")
+                || definition.contains_key("minItems")
+                || definition.contains_key("maxItems")
+                || definition.contains_key("minProperties")
+                || definition.contains_key("maxProperties")
+            {
+                return Err(format!("{path} scalar schema contains bounds"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_size_bounds(
+    actual: usize,
+    definition: &serde_json::Map<String, Value>,
+    minimum_key: &str,
+    maximum_key: &str,
+    path: &str,
+) -> Result<(), String> {
+    let parse_bound = |key: &str| -> Result<Option<usize>, String> {
+        definition
+            .get(key)
+            .map(|value| {
+                value
+                    .as_u64()
+                    .and_then(|value| usize::try_from(value).ok())
+                    .ok_or_else(|| format!("{path} schema.{key} must be a non-negative integer"))
+            })
+            .transpose()
+    };
+    if let Some(minimum) = parse_bound(minimum_key)? {
+        if actual < minimum {
+            return Err(format!("{path} violates schema.{minimum_key}"));
+        }
+    }
+    if let Some(maximum) = parse_bound(maximum_key)? {
+        if actual > maximum {
+            return Err(format!("{path} violates schema.{maximum_key}"));
+        }
+    }
+    Ok(())
+}
+
 fn validate_object_schema(
     value: &Value,
     definition: &serde_json::Map<String, Value>,
@@ -991,8 +1692,8 @@ fn validate_object_schema(
         .ok_or_else(|| format!("{path} object schema.required missing"))?;
     let additional_properties = definition
         .get("additionalProperties")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+        .cloned()
+        .unwrap_or(Value::Bool(false));
     let object = value.as_object().expect("validated object");
     for required_name in required {
         let name = required_name
@@ -1012,8 +1713,18 @@ fn validate_object_schema(
             Some(property_schema) => {
                 validate_schema_value(item, property_schema, &format!("{path}.{name}"))?;
             }
-            None if additional_properties => {}
-            None => return Err(format!("{path}.{name} is not allowed")),
+            None if additional_properties == Value::Bool(true) => {}
+            None if additional_properties == Value::Bool(false) => {
+                return Err(format!("{path}.{name} is not allowed"));
+            }
+            None if additional_properties.is_object() => {
+                validate_schema_value(item, &additional_properties, &format!("{path}.{name}"))?;
+            }
+            None => {
+                return Err(format!(
+                    "{path} schema.additionalProperties must be a boolean or schema object"
+                ));
+            }
         }
     }
     Ok(())
@@ -1142,10 +1853,11 @@ mod tests {
             ContractPurpose::new("research.analyst").unwrap(),
             "produce a claim",
             store.put_bytes(b"prompt", "text/plain").unwrap(),
-            ContextPolicy {
-                permitted_kinds: BTreeSet::from([ArtifactKind::NormalizedEvidence]),
-                permitted_source_families: BTreeSet::from(["market".to_owned()]),
-                max_artifacts: 4,
+        ContextPolicy {
+            permitted_kinds: BTreeSet::from([ArtifactKind::NormalizedEvidence]),
+            permitted_source_families: BTreeSet::from(["market".to_owned()]),
+            min_artifacts: 1,
+            max_artifacts: 4,
                 max_bytes: 4096,
                 max_tokens: 1024,
                 allow_raw_reread: false,
@@ -1287,6 +1999,174 @@ mod tests {
             claimed,
             evidence,
         }
+    }
+
+    #[test]
+    fn planner_draft_schema_is_closed_and_governed() {
+        let schema = planner_draft_output_schema();
+        let valid = serde_json::json!({
+            "schema_version": REBUILD_SCHEMA_VERSION,
+            "topology_id": "active",
+            "tasks": {
+                "analyst": {
+                    "recipe_id": "research.analyst",
+                    "objective": "analyse governed TQQQ evidence",
+                    "depends_on": [],
+                    "priority": 50,
+                    "evidence_needs": [{
+                        "schema_version": REBUILD_SCHEMA_VERSION,
+                        "source_family": "alpaca",
+                        "resource": "bars:TQQQ:1d",
+                        "max_age_secs": 86400
+                    }]
+                }
+            }
+        });
+        validate_schema_value(&valid, &schema, "$").unwrap();
+
+        let mut invalid_version = valid.clone();
+        invalid_version["schema_version"] = serde_json::json!(REBUILD_SCHEMA_VERSION + 1);
+        assert!(validate_schema_value(&invalid_version, &schema, "$").is_err());
+
+        let mut invalid_recipe = valid.clone();
+        invalid_recipe["tasks"]["analyst"]["recipe_id"] = serde_json::json!("gate.paper");
+        assert!(validate_schema_value(&invalid_recipe, &schema, "$").is_err());
+
+        let mut invalid_source = valid.clone();
+        invalid_source["tasks"]["analyst"]["evidence_needs"][0]["source_family"] =
+            serde_json::json!("uninstalled-web");
+        assert!(validate_schema_value(&invalid_source, &schema, "$").is_err());
+
+        let mut invalid_priority = valid.clone();
+        invalid_priority["tasks"]["analyst"]["priority"] = serde_json::json!(101);
+        assert!(validate_schema_value(&invalid_priority, &schema, "$").is_err());
+
+        let mut artifact_ref = valid.clone();
+        artifact_ref["tasks"]["analyst"]["artifact_id"] = serde_json::json!("sha256:forged");
+        assert!(validate_schema_value(&artifact_ref, &schema, "$").is_err());
+
+        let mut tool_or_role = valid;
+        tool_or_role["tasks"]["analyst"]["tool"] = serde_json::json!("fetch_web");
+        assert!(validate_schema_value(&tool_or_role, &schema, "$").is_err());
+    }
+
+    #[test]
+    fn active_catalogue_installs_canonical_contracts_and_bounded_recipes() {
+        let root = tempdir().unwrap();
+        let store = V2Store::open(root.path()).unwrap();
+        let active = ActiveResearchCatalogue::install(&store, Utc::now()).unwrap();
+        let expected = [
+            (PLANNER_RECIPE_ID, ArtifactKind::WorkflowProposalDraft),
+            ("research.analyst", ArtifactKind::Claim),
+            ("research.critic", ArtifactKind::Critique),
+            ("research.synthesizer", ArtifactKind::DecisionProposal),
+        ];
+
+        assert_eq!(active.contracts.contracts().count(), expected.len());
+        for (purpose, output_kind) in expected {
+            let installed = active
+                .contracts
+                .contracts()
+                .find(|installed| installed.contract.purpose.as_str() == purpose)
+                .unwrap();
+            assert_eq!(installed.contract.output.artifact_kind, output_kind);
+            assert_eq!(
+                installed.contract.context.min_artifacts,
+                if purpose == PLANNER_RECIPE_ID { 0 } else { 1 }
+            );
+            assert_eq!(
+                installed.contract.termination.require_evidence,
+                purpose != PLANNER_RECIPE_ID
+            );
+            let recipe = active
+                .recipes
+                .recipe(&TaskRecipeId::new(purpose).unwrap())
+                .unwrap();
+            assert_eq!(
+                recipe.contract_hash.as_ref(),
+                Some(&installed.contract.contract_hash)
+            );
+            assert_eq!(recipe.budget, installed.contract.budget);
+            assert_eq!(recipe.retry, installed.contract.retry);
+            assert_eq!(recipe.on_failure, installed.contract.on_failure);
+            assert_eq!(
+                recipe.max_children,
+                installed.contract.termination.max_child_tasks
+            );
+            assert_eq!(recipe.max_depth, installed.contract.termination.max_depth);
+            assert_eq!(
+                recipe.allowed_evidence_sources,
+                recipe_evidence_sources(&installed.contract)
+            );
+        }
+
+        for (recipe_id, task_class) in [
+            (EVIDENCE_GATE_RECIPE_ID, RuntimeTaskClass::Evidence),
+            (DECISION_GATE_RECIPE_ID, RuntimeTaskClass::DecisionGate),
+            (EXECUTION_GATE_RECIPE_ID, RuntimeTaskClass::ExecutionGate),
+            (PAPER_COMMIT_RECIPE_ID, RuntimeTaskClass::PaperCommit),
+            (RECONCILE_RECIPE_ID, RuntimeTaskClass::Reconcile),
+            (EVALUATE_RECIPE_ID, RuntimeTaskClass::Evaluate),
+        ] {
+            let recipe = active
+                .recipes
+                .recipe(&TaskRecipeId::new(recipe_id).unwrap())
+                .unwrap();
+            assert_eq!(recipe.task_class, task_class);
+            assert_eq!(recipe.contract_hash, None);
+            assert!(recipe.allowed_evidence_sources.is_empty());
+        }
+        store.verify_integrity().unwrap();
+    }
+
+    #[test]
+    fn active_catalogue_rejects_planner_that_does_not_output_a_draft() {
+        let root = tempdir().unwrap();
+        let store = V2Store::open(root.path()).unwrap();
+        let mut contracts = canonical_active_contracts(&store).unwrap();
+        let planner = contracts
+            .iter_mut()
+            .find(|contract| contract.purpose.as_str() == PLANNER_RECIPE_ID)
+            .unwrap();
+        planner.output.artifact_kind = ArtifactKind::WorkflowProposal;
+        planner.contract_hash = planner.expected_hash().unwrap();
+        planner.validate().unwrap();
+        let catalogue = RebuildContractCatalogue::install(&store, contracts, Utc::now()).unwrap();
+
+        assert!(matches!(
+            catalogue.active_recipe_catalogue(&store),
+            Err(RebuildResearchError::ActiveContractOutputMismatch {
+                purpose,
+                expected: ArtifactKind::WorkflowProposalDraft,
+                actual: ArtifactKind::WorkflowProposal,
+            }) if purpose == PLANNER_RECIPE_ID
+        ));
+    }
+
+    #[test]
+    fn active_catalogue_rejects_candidate_or_unknown_contract_recipe() {
+        let root = tempdir().unwrap();
+        let store = V2Store::open(root.path()).unwrap();
+        let mut contracts = canonical_active_contracts(&store).unwrap();
+        let mut candidate = contracts
+            .iter()
+            .find(|contract| contract.purpose.as_str() == "research.analyst")
+            .unwrap()
+            .clone();
+        candidate.contract_id = ContractId("akzio.v2.research.candidate".to_owned());
+        candidate.version = 2;
+        candidate.purpose = ContractPurpose::new("research.candidate").unwrap();
+        candidate.responsibility = "candidate data only".to_owned();
+        candidate.contract_hash = candidate.expected_hash().unwrap();
+        candidate.validate().unwrap();
+        contracts.push(candidate);
+        let catalogue = RebuildContractCatalogue::install(&store, contracts, Utc::now()).unwrap();
+
+        assert!(matches!(
+            catalogue.active_recipe_catalogue(&store),
+            Err(RebuildResearchError::UnexpectedActiveContractPurpose(purpose))
+                if purpose == "research.candidate"
+        ));
     }
 
     #[test]
