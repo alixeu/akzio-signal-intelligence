@@ -1173,9 +1173,11 @@ mod tests {
             purpose: ContractPurpose::new(id).unwrap(),
             contract_hash: agent.then(|| ContentHash::of_bytes(id.as_bytes())),
             task_class: class,
-            allowed_evidence_sources: agent
-                .then(|| BTreeSet::from(["alpaca".to_owned()]))
-                .unwrap_or_default(),
+            allowed_evidence_sources: if agent {
+                BTreeSet::from(["alpaca".to_owned()])
+            } else {
+                BTreeSet::new()
+            },
             max_children: 8,
             max_depth: 2,
             priority_ceiling: 100,

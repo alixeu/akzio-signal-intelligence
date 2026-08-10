@@ -13,12 +13,13 @@ use std::{
 };
 
 use akzio_domain::{
-    Artifact, ArtifactId, ArtifactKind, ArtifactLifecycle, ArtifactOrigin, ArtifactRef, Asset,
-    AttemptId, BlobRef, ContentHash, DomainError, Evaluation, Experience, FailureDisposition,
-    LeaseId, OrderReceipt, OrderReceiptState, Outcome, OutcomeHorizon, PaperCommitment,
-    PaperReprice, PolicyState, PolicyTransition, PolicyTransitionId, RetryPolicy, RunId,
-    RunPurpose, TaskId, TaskRecipeId, TaskStatus, TaskWritePermit, WorkflowGraph, WorkflowNode,
-    WorkflowProposal, WorkflowStatus, REBUILD_SCHEMA_VERSION,
+    AgentContract, Artifact, ArtifactId, ArtifactKind, ArtifactLifecycle, ArtifactOrigin,
+    ArtifactRef, Asset, AttemptId, BlobRef, CandidatePolicy, ContentHash, DomainError, Evaluation,
+    ExecutionVerdict, Experience, FailureDisposition, LeaseId, OrderReceipt, OrderReceiptState,
+    Outcome, OutcomeExecutionLineage, OutcomeHorizon, OutcomeSchedule, PaperCommitment,
+    PaperReprice, PolicyState, PolicySubject, PolicyTransition, PolicyTransitionId, Reconciliation,
+    RetryPolicy, RunId, RunPurpose, TaskId, TaskRecipeId, TaskStatus, TaskWritePermit,
+    WorkflowGraph, WorkflowNode, WorkflowProposal, WorkflowStatus, REBUILD_SCHEMA_VERSION,
 };
 use chrono::{DateTime, Duration, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
@@ -106,6 +107,8 @@ pub enum RebuildStoreError {
     PolicyHeadMismatch(String),
     #[error("policy transition {0} conflicts with a prior immutable transition")]
     PolicyTransitionConflict(String),
+    #[error("policy evaluation {0} conflicts with prior immutable evaluation")]
+    PolicyEvaluationConflict(String),
     #[error("shadow pair {0} conflicts with a prior immutable completion")]
     ShadowPairConflict(String),
     #[error("Store Doctor: {0}")]
@@ -289,37 +292,93 @@ pub struct RepriceCommitResult {
 /// transactionally maintained reconstruction cursor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyHead {
-    pub subject_id: String,
+    pub subject: PolicySubject,
     pub state: PolicyState,
     pub revision: u64,
     pub transition_id: PolicyTransitionId,
+    /// Durable event cursor for the transition that produced this head.
+    pub transition_cursor: i64,
     pub updated_at: DateTime<Utc>,
 }
 
-/// The three canonical artifacts and state transition produced by one
-/// evaluation task. Store commits them together so a policy head can never
-/// reference an evaluation a reader cannot observe.
+/// Every canonical evaluation is recorded, even when it leaves the policy
+/// state unchanged. This closes the freshness cursor so the same shadow pair
+/// cannot be reconsidered after a no-op evaluation.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PolicyTransitionCommit {
+pub struct PolicyEvaluationCommit {
     pub permit: TaskWritePermit,
     pub outcome: Artifact,
     pub experience: Artifact,
     pub evaluation: Artifact,
-    pub transition: PolicyTransition,
+    pub candidate_policy: Option<Artifact>,
+    pub subject: PolicySubject,
+    pub from: PolicyState,
+    pub to: PolicyState,
+    /// Store-issued immutable cutoff and counts used to derive this
+    /// evaluation. Pairs completed after `through_cursor` remain fresh.
+    pub pair_snapshot: PolicyShadowPairSnapshot,
+    /// Present only for an actual state transition. No-op evaluations retain
+    /// immutable evidence history but do not manufacture an invalid
+    /// `PolicyTransition { from == to }`.
+    pub transition: Option<PolicyTransition>,
     pub completed_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PolicyTransitionResult {
-    Applied(PolicyHead),
-    Existing(PolicyHead),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PolicyShadowPairSnapshot {
+    pub after_cursor: i64,
+    pub through_cursor: i64,
+    pub counts_by_horizon: [u64; 3],
 }
 
+impl PolicyShadowPairSnapshot {
+    pub const fn count(self, horizon: OutcomeHorizon) -> u64 {
+        self.counts_by_horizon[match horizon {
+            OutcomeHorizon::T1 => 0,
+            OutcomeHorizon::T3 => 1,
+            OutcomeHorizon::T5 => 2,
+        }]
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyEvaluationResult {
+    pub policy_head: Option<PolicyHead>,
+    pub consumed_pair_cursor: i64,
+    pub evaluation_cursor: i64,
+    pub newly_recorded: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StoredPolicyEvaluation {
+    subject: PolicySubject,
+    outcome_artifact_id: ArtifactId,
+    experience_artifact_id: ArtifactId,
+    evaluation_artifact_id: ArtifactId,
+    candidate_policy_artifact_id: Option<ArtifactId>,
+    from: PolicyState,
+    to: PolicyState,
+    transition_id: Option<PolicyTransitionId>,
+    run_id: RunId,
+    consumed_pair_cursor: i64,
+    event_cursor: i64,
+    completed_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PolicyConsumptionHead {
+    subject: PolicySubject,
+    consumed_pair_cursor: i64,
+    evaluation_artifact_id: ArtifactId,
+    evaluation_cursor: i64,
+    updated_at: DateTime<Utc>,
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyTransitionRecord {
     pub transition: PolicyTransition,
     pub run_id: RunId,
     pub revision: u64,
+    pub transition_cursor: i64,
 }
 
 /// One completed, outcome-backed comparison between the production decision
@@ -328,7 +387,7 @@ pub struct PolicyTransitionRecord {
 /// idempotent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ShadowPairCompletion {
-    pub subject_id: String,
+    pub subject: PolicySubject,
     pub parent_decision: ArtifactRef,
     pub execution_context: ArtifactRef,
     pub candidate_decision: ArtifactRef,
@@ -343,7 +402,7 @@ pub struct ShadowPairCompletion {
 impl ShadowPairCompletion {
     pub fn pair_key(&self) -> RebuildStoreResult<ContentHash> {
         let key = serde_json::json!({
-            "subject_id": &self.subject_id,
+            "subject": &self.subject,
             "parent_decision": &self.parent_decision,
             "execution_context": &self.execution_context,
             "candidate_decision": &self.candidate_decision,
@@ -355,10 +414,26 @@ impl ShadowPairCompletion {
     }
 
     fn validate(&self) -> RebuildStoreResult<()> {
-        if self.subject_id.trim().is_empty() || self.candidate_topology_id.trim().is_empty() {
+        self.subject.validate()?;
+        if self.candidate_topology_id.trim().is_empty() {
             return Err(RebuildStoreError::InvalidLearningCommit(
                 "shadow_pair.identity",
             ));
+        }
+        match &self.subject {
+            PolicySubject::Contract(contract_hash)
+                if contract_hash != &self.candidate_contract_hash =>
+            {
+                return Err(RebuildStoreError::InvalidLearningCommit(
+                    "shadow_pair.contract_subject",
+                ));
+            }
+            PolicySubject::Topology(topology_id) if topology_id.0 != self.candidate_topology_id => {
+                return Err(RebuildStoreError::InvalidLearningCommit(
+                    "shadow_pair.topology_subject",
+                ));
+            }
+            _ => {}
         }
         if self.parent_decision.kind != ArtifactKind::Decision
             || self.execution_context.kind != ArtifactKind::ExecutionContext
@@ -378,6 +453,8 @@ impl ShadowPairCompletion {
 pub struct StoredShadowPair {
     pub pair_key: ContentHash,
     pub completion: ShadowPairCompletion,
+    /// Durable event cursor for the idempotent pair completion.
+    pub completion_cursor: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -399,7 +476,7 @@ impl RebuildStore {
         let database = root.join(DATABASE_FILE);
         let mut connection = Connection::open(&database)?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
-        initialize(&mut connection)?;
+        initialize(&mut connection, &root)?;
         Ok(Self {
             blobs: Arc::new(root.join("blobs")),
             root: Arc::new(root),
@@ -476,7 +553,7 @@ impl RebuildStore {
         if artifact.origin.is_some()
             || !matches!(
                 artifact.kind,
-                ArtifactKind::Contract | ArtifactKind::CandidatePolicy | ArtifactKind::FreezeState
+                ArtifactKind::Contract | ArtifactKind::FreezeState
             )
         {
             return Err(RebuildStoreError::PermitOriginMismatch);
@@ -1776,6 +1853,7 @@ impl RebuildStore {
         now: DateTime<Utc>,
     ) -> RebuildStoreResult<()> {
         artifact.validate()?;
+        reject_generic_learning_artifact(artifact)?;
         self.read_blob(&artifact.blob)?;
         if event_type.trim().is_empty() {
             return Err(RebuildStoreError::Domain(DomainError::EmptyField {
@@ -1820,6 +1898,7 @@ impl RebuildStore {
         }
         for artifact in artifacts {
             artifact.validate()?;
+            reject_generic_learning_artifact(artifact)?;
             self.read_blob(&artifact.blob)?;
         }
 
@@ -1859,6 +1938,102 @@ impl RebuildStore {
         Ok(())
     }
 
+    /// Commits sealed Paper or Shadow outcomes through a purpose-aware path.
+    /// Generic task artifact APIs reject Outcome so learning lineage cannot be
+    /// created without these checks.
+    pub fn commit_outcomes(
+        &self,
+        permit: &TaskWritePermit,
+        outcomes: &[Artifact],
+        now: DateTime<Utc>,
+    ) -> RebuildStoreResult<()> {
+        if outcomes.is_empty() {
+            return Err(RebuildStoreError::Domain(DomainError::EmptyField {
+                field: "commit_outcomes.outcomes",
+            }));
+        }
+        let payloads = outcomes
+            .iter()
+            .map(|artifact| {
+                artifact.validate()?;
+                self.read_blob(&artifact.blob)?;
+                if artifact.kind != ArtifactKind::Outcome {
+                    return Err(RebuildStoreError::InvalidLearningCommit(
+                        "commit_outcomes.kind",
+                    ));
+                }
+                let outcome: Outcome = self.read_artifact_payload(artifact)?;
+                outcome.validate_sealed()?;
+                Ok(outcome)
+            })
+            .collect::<RebuildStoreResult<Vec<_>>>()?;
+
+        let mut connection = self.connection.lock().expect("store connection poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        assert_permit(&transaction, permit)?;
+        let purpose = run_purpose_from_connection(&transaction, &permit.run_id)?;
+        let expected_lifecycle = match purpose {
+            RunPurpose::Paper => ArtifactLifecycle::Canonical,
+            RunPurpose::Shadow => ArtifactLifecycle::RunScoped,
+            _ => return Err(RebuildStoreError::NonCanonicalLearningPurpose(purpose)),
+        };
+        let allowed_schedule_purposes: &[RunPurpose] = match purpose {
+            RunPurpose::Paper => &[RunPurpose::Paper],
+            RunPurpose::Shadow => &[RunPurpose::Paper, RunPurpose::Shadow],
+            _ => unreachable!("non-learning purpose rejected above"),
+        };
+        for (artifact, outcome) in outcomes.iter().zip(&payloads) {
+            if artifact.lifecycle != expected_lifecycle {
+                return Err(RebuildStoreError::InvalidLearningCommit(
+                    "commit_outcomes.lifecycle",
+                ));
+            }
+            let schedule_artifact = read_artifact(&transaction, &outcome.schedule.artifact_id)?;
+            assert_artifact_from_allowed_purposes(&transaction, &schedule_artifact, &[purpose])?;
+            self.read_outcome_schedule_with_connection(
+                &transaction,
+                outcome,
+                allowed_schedule_purposes,
+            )?;
+            if !has_exact_source_refs(
+                artifact,
+                &std::iter::once(outcome.schedule.clone())
+                    .chain(outcome.market_evidence.iter().cloned())
+                    .collect::<Vec<_>>(),
+            ) {
+                return Err(RebuildStoreError::InvalidLearningCommit(
+                    "commit_outcomes.source_refs",
+                ));
+            }
+        }
+
+        let (_, on_failure) = task_retry_policy(&transaction, &permit.task_id)?;
+        insert_artifact_batch(&transaction, outcomes)?;
+        for artifact in outcomes {
+            assert_origin_matches(artifact.origin.as_ref(), permit)?;
+            let event_id = append_event(
+                &transaction,
+                &permit.run_id,
+                Some(&permit.task_id),
+                Some(&permit.attempt_id),
+                "artifact.committed",
+                Some(&artifact.artifact_id),
+                now,
+            )?;
+            record_attempt_output(&transaction, permit, &artifact.artifact_id, event_id)?;
+        }
+        finish_permitted_task(
+            &transaction,
+            permit,
+            TaskStatus::Succeeded,
+            on_failure,
+            outcomes.last().map(|artifact| &artifact.artifact_id),
+            now,
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Records an immutable outcome-backed comparison. Completion is keyed by
     /// the compared decisions/context/candidate/horizon, never by wall-clock
     /// time, so a recovered attempt cannot create a second pair.
@@ -1868,15 +2043,17 @@ impl RebuildStore {
         completion: &ShadowPairCompletion,
     ) -> RebuildStoreResult<ShadowPairWriteResult> {
         completion.validate()?;
-        let purpose = self.run_purpose(&permit.run_id)?;
-        if purpose != RunPurpose::Paper {
-            return Err(RebuildStoreError::NonCanonicalLearningPurpose(purpose));
-        }
-        self.assert_shadow_pair_sources(completion)?;
         let pair_key = completion.pair_key()?;
+        let subject_id = completion.subject.subject_id();
+        let subject_json = serde_json::to_string(&completion.subject)?;
 
         let mut connection = self.connection.lock().expect("store connection poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        assert_permit(&transaction, permit)?;
+        assert_paper_run(&transaction, &permit.run_id)?;
+        self.assert_shadow_pair_sources_with_connection(&transaction, completion)?;
+
         if let Some(existing) = read_shadow_pair(&transaction, &pair_key)? {
             if same_shadow_pair(&existing.completion, completion) {
                 transaction.commit()?;
@@ -1885,17 +2062,26 @@ impl RebuildStore {
             return Err(RebuildStoreError::ShadowPairConflict(pair_key.to_string()));
         }
 
-        assert_permit(&transaction, permit)?;
-        assert_paper_run(&transaction, &permit.run_id)?;
+        let completion_cursor = append_event(
+            &transaction,
+            &permit.run_id,
+            Some(&permit.task_id),
+            Some(&permit.attempt_id),
+            "shadow_pair.completed",
+            Some(&completion.candidate_outcome.artifact_id),
+            completion.completed_at,
+        )?;
         transaction.execute(
             r#"INSERT INTO rebuild_shadow_pairs
-               (pair_key, subject_id, parent_decision_artifact_id, execution_context_artifact_id,
-                candidate_decision_artifact_id, candidate_contract_hash, candidate_topology_id,
-                horizon, parent_outcome_artifact_id, candidate_outcome_artifact_id, completed_at)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"#,
+            (pair_key, subject_id, subject_json, parent_decision_artifact_id, execution_context_artifact_id,
+             candidate_decision_artifact_id, candidate_contract_hash, candidate_topology_id,
+             horizon, parent_outcome_artifact_id, candidate_outcome_artifact_id, completed_at,
+             pair_event_cursor)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"#,
             params![
                 pair_key.as_str(),
-                completion.subject_id,
+                subject_id,
+                subject_json,
                 completion.parent_decision.artifact_id.0.as_str(),
                 completion.execution_context.artifact_id.0.as_str(),
                 completion.candidate_decision.artifact_id.0.as_str(),
@@ -1905,90 +2091,119 @@ impl RebuildStore {
                 completion.parent_outcome.artifact_id.0.as_str(),
                 completion.candidate_outcome.artifact_id.0.as_str(),
                 completion.completed_at.to_rfc3339(),
+                completion_cursor,
             ],
-        )?;
-        append_event(
-            &transaction,
-            &permit.run_id,
-            Some(&permit.task_id),
-            Some(&permit.attempt_id),
-            "shadow_pair.completed",
-            Some(&completion.candidate_outcome.artifact_id),
-            completion.completed_at,
         )?;
         transaction.commit()?;
         Ok(ShadowPairWriteResult::Inserted(StoredShadowPair {
             pair_key,
             completion: completion.clone(),
+            completion_cursor,
         }))
     }
 
-    /// Commits sealed Paper outcome, experience, evaluation, immutable policy
-    /// transition, reconstructed head, events, and task completion in one
-    /// transaction. This is the sole Store mutation that advances policy.
-    pub fn record_policy_transition(
+    /// Commits every canonical outcome-backed evaluation. A no-op still closes
+    /// the subject's durable pair-consumption cursor, so one completed shadow
+    /// pair cannot be used by more than one canonical evaluation.
+    pub fn record_policy_evaluation(
         &self,
-        commit: &PolicyTransitionCommit,
-    ) -> RebuildStoreResult<PolicyTransitionResult> {
-        self.validate_policy_transition_commit(commit)?;
-        let purpose = self.run_purpose(&commit.permit.run_id)?;
-        if purpose != RunPurpose::Paper {
-            return Err(RebuildStoreError::NonCanonicalLearningPurpose(purpose));
+        commit: &PolicyEvaluationCommit,
+    ) -> RebuildStoreResult<PolicyEvaluationResult> {
+        commit.subject.validate()?;
+        if !commit.subject.accepts_state(commit.from) || !commit.subject.accepts_state(commit.to) {
+            return Err(RebuildStoreError::InvalidLearningCommit(
+                "policy_evaluation.subject_state",
+            ));
         }
+        let subject_id = commit.subject.subject_id();
+        let subject_json = serde_json::to_string(&commit.subject)?;
 
         let mut connection = self.connection.lock().expect("store connection poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        self.validate_policy_evaluation_commit_with_connection(&transaction, commit)?;
+
         if let Some(existing) =
-            read_policy_transition(&transaction, &commit.transition.transition_id)?
+            read_policy_evaluation(&transaction, &commit.evaluation.artifact_id)?
         {
-            if existing.transition.subject_id == commit.transition.subject_id
-                && existing.transition.from == commit.transition.from
-                && existing.transition.to == commit.transition.to
-                && existing.transition.evaluation == commit.transition.evaluation
-                && existing.run_id == commit.permit.run_id
-            {
-                let head = read_policy_head(&transaction, &commit.transition.subject_id)?
-                    .ok_or_else(|| {
-                        RebuildStoreError::Integrity(format!(
-                            "policy transition {} has no policy head",
-                            commit.transition.transition_id
-                        ))
-                    })?;
-                transaction.commit()?;
-                return Ok(PolicyTransitionResult::Existing(head));
+            if !same_policy_evaluation(&existing, commit) {
+                return Err(RebuildStoreError::PolicyEvaluationConflict(
+                    commit.evaluation.artifact_id.to_string(),
+                ));
             }
-            return Err(RebuildStoreError::PolicyTransitionConflict(
-                commit.transition.transition_id.to_string(),
-            ));
+            if let Some(candidate_policy) = &commit.candidate_policy {
+                let stored = read_artifact(&transaction, &candidate_policy.artifact_id)?;
+                if stored != *candidate_policy {
+                    return Err(RebuildStoreError::PolicyEvaluationConflict(
+                        commit.evaluation.artifact_id.to_string(),
+                    ));
+                }
+            }
+            let consumption = read_policy_consumption_head(&transaction, &commit.subject)?
+                .ok_or_else(|| {
+                    RebuildStoreError::Integrity(format!(
+                        "policy evaluation {} has no consumption head",
+                        commit.evaluation.artifact_id
+                    ))
+                })?;
+            if consumption.consumed_pair_cursor < existing.consumed_pair_cursor {
+                return Err(RebuildStoreError::Integrity(format!(
+                    "policy evaluation {} consumption cursor regressed",
+                    commit.evaluation.artifact_id
+                )));
+            }
+            let policy_head = read_policy_head(&transaction, &commit.subject)?;
+            transaction.commit()?;
+            return Ok(PolicyEvaluationResult {
+                policy_head,
+                consumed_pair_cursor: existing.consumed_pair_cursor,
+                evaluation_cursor: existing.event_cursor,
+                newly_recorded: false,
+            });
         }
 
         assert_permit(&transaction, &commit.permit)?;
         assert_paper_run(&transaction, &commit.permit.run_id)?;
-        let previous = read_policy_head(&transaction, &commit.transition.subject_id)?;
+        let previous = read_policy_head(&transaction, &commit.subject)?;
         match &previous {
-            Some(head) if head.state != commit.transition.from => {
-                return Err(RebuildStoreError::PolicyHeadMismatch(
-                    commit.transition.subject_id.clone(),
-                ));
+            Some(head) if head.state != commit.from => {
+                return Err(RebuildStoreError::PolicyHeadMismatch(subject_id));
             }
-            None if !is_initial_policy_state(commit.transition.from) => {
-                return Err(RebuildStoreError::PolicyHeadMismatch(
-                    commit.transition.subject_id.clone(),
-                ));
+            None if commit.subject.initial_state() != commit.from => {
+                return Err(RebuildStoreError::PolicyHeadMismatch(subject_id));
             }
             _ => {}
         }
-        if !is_allowed_policy_transition(commit.transition.from, commit.transition.to) {
-            return Err(RebuildStoreError::InvalidLearningCommit(
-                "policy_transition.path",
-            ));
+        match &commit.transition {
+            Some(transition) => {
+                if commit.from == commit.to || !is_allowed_policy_transition(commit.from, commit.to)
+                {
+                    return Err(RebuildStoreError::InvalidLearningCommit(
+                        "policy_transition.path",
+                    ));
+                }
+                if read_policy_transition(&transaction, &transition.transition_id)?.is_some() {
+                    return Err(RebuildStoreError::PolicyTransitionConflict(
+                        transition.transition_id.to_string(),
+                    ));
+                }
+            }
+            None if commit.from != commit.to => {
+                return Err(RebuildStoreError::InvalidLearningCommit(
+                    "policy_evaluation.noop_state",
+                ));
+            }
+            None => {}
         }
+        validate_policy_shadow_pair_snapshot(&transaction, &commit.subject, commit.pair_snapshot)?;
 
         let (_, on_failure) = task_retry_policy(&transaction, &commit.permit.task_id)?;
-        for artifact in [&commit.outcome, &commit.experience, &commit.evaluation] {
+        for artifact in [&commit.outcome, &commit.experience, &commit.evaluation]
+            .into_iter()
+            .chain(commit.candidate_policy.iter())
+        {
             assert_origin_matches(artifact.origin.as_ref(), &commit.permit)?;
             insert_artifact(&transaction, artifact)?;
-            append_event(
+            let event_id = append_event(
                 &transaction,
                 &commit.permit.run_id,
                 Some(&commit.permit.task_id),
@@ -1997,63 +2212,149 @@ impl RebuildStore {
                 Some(&artifact.artifact_id),
                 commit.completed_at,
             )?;
+            record_attempt_output(
+                &transaction,
+                &commit.permit,
+                &artifact.artifact_id,
+                event_id,
+            )?;
         }
 
-        let revision = previous
-            .as_ref()
-            .map_or(1, |head| head.revision.saturating_add(1));
-        transaction.execute(
-            r#"INSERT INTO rebuild_policy_transitions
-               (transition_id, subject_id, from_state_json, to_state_json, evaluation_artifact_id,
-                run_id, revision, created_at)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
-            params![
-                commit.transition.transition_id.0,
-                commit.transition.subject_id,
-                serde_json::to_string(&commit.transition.from)?,
-                serde_json::to_string(&commit.transition.to)?,
-                commit.transition.evaluation.artifact_id.0.as_str(),
-                commit.permit.run_id.0,
-                revision,
-                commit.transition.created_at.to_rfc3339(),
-            ],
-        )?;
-        match previous {
-            Some(_) => {
-                transaction.execute(
-                    "UPDATE rebuild_policy_heads SET state_json = ?1, revision = ?2, transition_id = ?3, updated_at = ?4 WHERE subject_id = ?5",
-                    params![
-                        serde_json::to_string(&commit.transition.to)?,
-                        revision,
-                        commit.transition.transition_id.0,
-                        commit.transition.created_at.to_rfc3339(),
-                        commit.transition.subject_id,
-                    ],
-                )?;
-            }
-            None => {
-                transaction.execute(
-                    r#"INSERT INTO rebuild_policy_heads
-                       (subject_id, state_json, revision, transition_id, updated_at)
-                       VALUES (?1, ?2, ?3, ?4, ?5)"#,
-                    params![
-                        commit.transition.subject_id,
-                        serde_json::to_string(&commit.transition.to)?,
-                        revision,
-                        commit.transition.transition_id.0,
-                        commit.transition.created_at.to_rfc3339(),
-                    ],
-                )?;
-            }
-        }
-        append_event(
+        let consumed_pair_cursor = commit.pair_snapshot.through_cursor;
+        let evaluation_cursor = append_event(
             &transaction,
             &commit.permit.run_id,
             Some(&commit.permit.task_id),
             Some(&commit.permit.attempt_id),
-            "policy.transitioned",
+            "policy.evaluated",
             Some(&commit.evaluation.artifact_id),
             commit.completed_at,
+        )?;
+
+        let policy_head = if let Some(transition) = &commit.transition {
+            let revision = previous
+                .as_ref()
+                .map_or(1, |head| head.revision.saturating_add(1));
+            let transition_cursor = append_event(
+                &transaction,
+                &commit.permit.run_id,
+                Some(&commit.permit.task_id),
+                Some(&commit.permit.attempt_id),
+                "policy.transitioned",
+                Some(&commit.evaluation.artifact_id),
+                commit.completed_at,
+            )?;
+            transaction.execute(
+                r#"INSERT INTO rebuild_policy_transitions
+                   (transition_id, subject_id, subject_json, from_state_json, to_state_json,
+                    evaluation_artifact_id, run_id, revision, created_at, event_cursor)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"#,
+                params![
+                    transition.transition_id.0,
+                    subject_id,
+                    subject_json,
+                    serde_json::to_string(&commit.from)?,
+                    serde_json::to_string(&commit.to)?,
+                    commit.evaluation.artifact_id.0.as_str(),
+                    commit.permit.run_id.0,
+                    revision,
+                    transition.created_at.to_rfc3339(),
+                    transition_cursor,
+                ],
+            )?;
+            match previous {
+                Some(_) => {
+                    transaction.execute(
+                        "UPDATE rebuild_policy_heads SET subject_json = ?1, state_json = ?2, revision = ?3, transition_id = ?4, transition_event_cursor = ?5, updated_at = ?6 WHERE subject_id = ?7",
+                        params![
+                            serde_json::to_string(&commit.subject)?,
+                            serde_json::to_string(&commit.to)?,
+                            revision,
+                            transition.transition_id.0,
+                            transition_cursor,
+                            transition.created_at.to_rfc3339(),
+                            commit.subject.subject_id(),
+                        ],
+                    )?;
+                }
+                None => {
+                    transaction.execute(
+                        r#"INSERT INTO rebuild_policy_heads
+                           (subject_id, subject_json, state_json, revision, transition_id,
+                            transition_event_cursor, updated_at)
+                           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"#,
+                        params![
+                            commit.subject.subject_id(),
+                            serde_json::to_string(&commit.subject)?,
+                            serde_json::to_string(&commit.to)?,
+                            revision,
+                            transition.transition_id.0,
+                            transition_cursor,
+                            transition.created_at.to_rfc3339(),
+                        ],
+                    )?;
+                }
+            }
+            Some(PolicyHead {
+                subject: commit.subject.clone(),
+                state: commit.to,
+                revision,
+                transition_id: transition.transition_id.clone(),
+                transition_cursor,
+                updated_at: transition.created_at,
+            })
+        } else {
+            previous
+        };
+
+        transaction.execute(
+            r#"INSERT INTO rebuild_policy_evaluations
+                (evaluation_artifact_id, subject_id, subject_json, outcome_artifact_id,
+                 experience_artifact_id, candidate_policy_artifact_id, from_state_json,
+                 to_state_json, transition_id, run_id, consumed_pair_cursor, event_cursor,
+                 completed_at)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"#,
+            params![
+                commit.evaluation.artifact_id.0.as_str(),
+                commit.subject.subject_id(),
+                serde_json::to_string(&commit.subject)?,
+                commit.outcome.artifact_id.0.as_str(),
+                commit.experience.artifact_id.0.as_str(),
+                commit
+                    .candidate_policy
+                    .as_ref()
+                    .map(|artifact| artifact.artifact_id.0.as_str()),
+                serde_json::to_string(&commit.from)?,
+                serde_json::to_string(&commit.to)?,
+                commit
+                    .transition
+                    .as_ref()
+                    .map(|transition| transition.transition_id.0.as_str()),
+                commit.permit.run_id.0,
+                consumed_pair_cursor,
+                evaluation_cursor,
+                commit.completed_at.to_rfc3339(),
+            ],
+        )?;
+        transaction.execute(
+            r#"INSERT INTO rebuild_policy_consumption_heads
+               (subject_id, subject_json, consumed_pair_cursor, evaluation_artifact_id,
+                evaluation_event_cursor, updated_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+               ON CONFLICT(subject_id) DO UPDATE SET
+                   subject_json = excluded.subject_json,
+                   consumed_pair_cursor = excluded.consumed_pair_cursor,
+                   evaluation_artifact_id = excluded.evaluation_artifact_id,
+                   evaluation_event_cursor = excluded.evaluation_event_cursor,
+                   updated_at = excluded.updated_at"#,
+            params![
+                commit.subject.subject_id(),
+                serde_json::to_string(&commit.subject)?,
+                consumed_pair_cursor,
+                commit.evaluation.artifact_id.0.as_str(),
+                evaluation_cursor,
+                commit.completed_at.to_rfc3339(),
+            ],
         )?;
         finish_permitted_task(
             &transaction,
@@ -2064,13 +2365,12 @@ impl RebuildStore {
             commit.completed_at,
         )?;
         transaction.commit()?;
-        Ok(PolicyTransitionResult::Applied(PolicyHead {
-            subject_id: commit.transition.subject_id.clone(),
-            state: commit.transition.to,
-            revision,
-            transition_id: commit.transition.transition_id.clone(),
-            updated_at: commit.transition.created_at,
-        }))
+        Ok(PolicyEvaluationResult {
+            policy_head,
+            consumed_pair_cursor,
+            evaluation_cursor,
+            newly_recorded: true,
+        })
     }
 
     pub fn finish_task(
@@ -2249,6 +2549,8 @@ impl RebuildStore {
     ) -> RebuildStoreResult<Vec<Artifact>> {
         let connection = self.connection.lock().expect("store connection poisoned");
         let kind = kind.map(enum_name);
+        self.verify_policy_evaluation_history(&connection)?;
+
         let mut statement = connection.prepare(
             r#"SELECT r.artifact_id
                FROM rebuild_artifact_refs AS r
@@ -2619,53 +2921,96 @@ impl RebuildStore {
 
     /// Reads the current policy head without exposing mutable storage to
     /// callers. Previous policy versions remain in `rebuild_policy_transitions`.
-    pub fn policy_head(&self, subject_id: &str) -> RebuildStoreResult<Option<PolicyHead>> {
-        if subject_id.trim().is_empty() {
-            return Err(RebuildStoreError::InvalidLearningCommit(
-                "policy_head.subject_id",
-            ));
-        }
+    pub fn policy_head(&self, subject: &PolicySubject) -> RebuildStoreResult<Option<PolicyHead>> {
+        subject.validate()?;
         let connection = self.connection.lock().expect("store connection poisoned");
-        read_policy_head(&connection, subject_id)
+        read_policy_head(&connection, subject)
+    }
+
+    /// Captures one durable freshness window for all horizons. The returned
+    /// cutoff is later committed verbatim; pairs completed after it remain
+    /// fresh even if they arrive before evaluation persistence.
+    pub fn policy_shadow_pair_snapshot(
+        &self,
+        subject: &PolicySubject,
+    ) -> RebuildStoreResult<PolicyShadowPairSnapshot> {
+        subject.validate()?;
+        let mut connection = self.connection.lock().expect("store connection poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let after_cursor = read_policy_consumption_head(&transaction, subject)?
+            .map_or(0, |head| head.consumed_pair_cursor);
+        let through_cursor = max_shadow_pair_cursor(&transaction, subject)?;
+        let counts_by_horizon =
+            shadow_pair_counts_between(&transaction, subject, after_cursor, through_cursor)?;
+        transaction.commit()?;
+        Ok(PolicyShadowPairSnapshot {
+            after_cursor,
+            through_cursor,
+            counts_by_horizon,
+        })
+    }
+
+    /// Resolves only policy influences that were durably committed by a
+    /// canonical evaluation. Arbitrary Experience/CandidatePolicy artifacts
+    /// therefore cannot enter Context or Execution provenance.
+    pub fn recorded_policy_influence_subject(
+        &self,
+        artifact_id: &ArtifactId,
+    ) -> RebuildStoreResult<Option<PolicySubject>> {
+        let connection = self.connection.lock().expect("store connection poisoned");
+        let mut statement = connection.prepare(
+            r#"SELECT subject_id, subject_json, 'experience'
+               FROM rebuild_policy_evaluations WHERE experience_artifact_id = ?1
+               UNION ALL
+               SELECT subject_id, subject_json, 'candidate_policy'
+               FROM rebuild_policy_evaluations WHERE candidate_policy_artifact_id = ?1"#,
+        )?;
+        let rows = statement
+            .query_map(params![artifact_id.0.as_str()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        let artifact = read_artifact(&connection, artifact_id)?;
+        let mut resolved = None;
+        for (subject_id, subject_json, influence_kind) in rows {
+            let expected_kind = match influence_kind.as_str() {
+                "experience" => ArtifactKind::Experience,
+                "candidate_policy" => ArtifactKind::CandidatePolicy,
+                _ => unreachable!("query emits fixed influence kinds"),
+            };
+            if artifact.kind != expected_kind {
+                return Err(RebuildStoreError::Integrity(format!(
+                    "policy influence {artifact_id} has invalid kind"
+                )));
+            }
+            let subject = parse_persisted_subject(&subject_id, &subject_json)?;
+            if resolved.as_ref().is_some_and(|current| current != &subject) {
+                return Err(RebuildStoreError::Integrity(format!(
+                    "policy influence {artifact_id} has conflicting subjects"
+                )));
+            }
+            resolved = Some(subject);
+        }
+        Ok(resolved)
     }
 
     /// Replays immutable policy transitions in revision order. Consumers use
     /// this for audit/replay; mutations remain limited to
-    /// `record_policy_transition`.
+    /// `record_policy_evaluation`.
     pub fn policy_transitions(
         &self,
-        subject_id: &str,
+        subject: &PolicySubject,
     ) -> RebuildStoreResult<Vec<PolicyTransitionRecord>> {
-        if subject_id.trim().is_empty() {
-            return Err(RebuildStoreError::InvalidLearningCommit(
-                "policy_transitions.subject_id",
-            ));
-        }
+        subject.validate()?;
         let connection = self.connection.lock().expect("store connection poisoned");
-        read_policy_transitions(&connection, subject_id)
-    }
-
-    /// Counts distinct completed pairs produced after a policy head was last
-    /// advanced. Callers must require every horizon before promotion.
-    pub fn fresh_shadow_pair_count(
-        &self,
-        subject_id: &str,
-        horizon: OutcomeHorizon,
-        after: DateTime<Utc>,
-    ) -> RebuildStoreResult<u64> {
-        if subject_id.trim().is_empty() {
-            return Err(RebuildStoreError::InvalidLearningCommit(
-                "shadow_pair.subject_id",
-            ));
-        }
-        let connection = self.connection.lock().expect("store connection poisoned");
-        let count = connection.query_row(
-            "SELECT COUNT(*) FROM rebuild_shadow_pairs \
-             WHERE subject_id = ?1 AND horizon = ?2 AND completed_at > ?3",
-            params![subject_id, enum_name(horizon), after.to_rfc3339()],
-            |row| row.get::<_, u64>(0),
-        )?;
-        Ok(count)
+        read_policy_transitions(&connection, subject)
     }
 
     pub fn events_after(
@@ -2968,7 +3313,8 @@ impl RebuildStore {
         }
 
         let mut statement = connection.prepare(
-            "SELECT subject_id, state_json, revision, transition_id, updated_at \
+            "SELECT subject_id, state_json, revision, transition_id, \
+                    transition_event_cursor, updated_at \
              FROM rebuild_policy_heads ORDER BY subject_id",
         )?;
         let heads = statement
@@ -2978,11 +3324,14 @@ impl RebuildStore {
                     row.get::<_, String>(1)?,
                     row.get::<_, u64>(2)?,
                     row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
-        for (subject_id, state_json, revision, transition_id, updated_at) in heads {
+        for (subject_id, state_json, revision, transition_id, transition_cursor, updated_at) in
+            heads
+        {
             if subject_id.trim().is_empty() || revision == 0 {
                 return Err(RebuildStoreError::Integrity(format!(
                     "policy head {subject_id} is invalid"
@@ -2996,13 +3345,25 @@ impl RebuildStore {
                     "policy head {subject_id} references missing transition {transition_id}"
                 ))
                     })?;
-            if transition.transition.subject_id != subject_id
+            if transition.transition.subject.subject_id() != subject_id
                 || transition.revision != revision
                 || transition.transition.to != state
+                || transition.transition_cursor != transition_cursor
                 || transition.transition.created_at != parse_time(&updated_at)?
             {
                 return Err(RebuildStoreError::Integrity(format!(
                     "policy head {subject_id} disagrees with its transition"
+                )));
+            }
+            let latest = connection.query_row(
+                "SELECT transition_id, revision FROM rebuild_policy_transitions \
+                 WHERE subject_id = ?1 ORDER BY revision DESC LIMIT 1",
+                params![subject_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?)),
+            )?;
+            if latest != (transition_id.clone(), revision) {
+                return Err(RebuildStoreError::Integrity(format!(
+                    "policy head {subject_id} is stale"
                 )));
             }
             let evaluation =
@@ -3046,35 +3407,12 @@ impl RebuildStore {
                     "shadow pair {pair_key} key mismatch"
                 )));
             }
-            for reference in [
-                &pair.completion.parent_decision,
-                &pair.completion.execution_context,
-                &pair.completion.candidate_decision,
-                &pair.completion.parent_outcome,
-                &pair.completion.candidate_outcome,
-            ] {
-                let artifact = read_artifact(&connection, &reference.artifact_id)?;
-                if artifact.kind != reference.kind
-                    || artifact_run_purpose(&connection, &artifact)? != RunPurpose::Paper
-                {
-                    return Err(RebuildStoreError::Integrity(format!(
-                        "shadow pair {pair_key} has non-Paper reference"
-                    )));
-                }
-            }
-            for reference in [
-                &pair.completion.parent_outcome,
-                &pair.completion.candidate_outcome,
-            ] {
-                let artifact = read_artifact(&connection, &reference.artifact_id)?;
-                let outcome: Outcome = serde_json::from_slice(&self.read_blob(&artifact.blob)?)?;
-                outcome.validate_sealed()?;
-                if outcome.execution_context != pair.completion.execution_context {
-                    return Err(RebuildStoreError::Integrity(format!(
-                        "shadow pair {pair_key} outcome context mismatch"
-                    )));
-                }
-            }
+            self.assert_shadow_pair_sources_with_connection(&connection, &pair.completion)
+                .map_err(|error| {
+                    RebuildStoreError::Integrity(format!(
+                        "shadow pair {pair_key} lineage is invalid: {error}"
+                    ))
+                })?;
         }
 
         let orphan = connection
@@ -3099,12 +3437,342 @@ impl RebuildStore {
             let snapshot = self.workflow_snapshot_with_connection(&connection, &run_id)?;
             self.verify_workflow_history(&connection, &snapshot)?;
         }
+        self.verify_policy_evaluation_history(&connection)?;
+        self.verify_candidate_policy_history(&connection)?;
         Ok(())
     }
 
-    fn validate_policy_transition_commit(
+    fn verify_policy_evaluation_history(&self, connection: &Connection) -> RebuildStoreResult<()> {
+        let evaluation_ids = connection
+            .prepare(
+                "SELECT evaluation_artifact_id FROM rebuild_policy_evaluations \
+                 ORDER BY event_cursor",
+            )?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut subject_history: BTreeMap<String, (i64, PolicyState)> = BTreeMap::new();
+
+        for value in evaluation_ids {
+            let evaluation_artifact_id = ArtifactId(ContentHash::new(value)?);
+            let stored =
+                read_policy_evaluation(connection, &evaluation_artifact_id)?.ok_or_else(|| {
+                    RebuildStoreError::Integrity(format!(
+                        "policy evaluation {evaluation_artifact_id} disappeared"
+                    ))
+                })?;
+            stored.subject.validate()?;
+            if !stored.subject.accepts_state(stored.from)
+                || !stored.subject.accepts_state(stored.to)
+            {
+                return Err(RebuildStoreError::Integrity(format!(
+                    "policy evaluation {evaluation_artifact_id} has incompatible subject state"
+                )));
+            }
+            let subject_id = stored.subject.subject_id();
+            let (previous_consumed_cursor, expected_from) = subject_history
+                .get(&subject_id)
+                .copied()
+                .unwrap_or((0, stored.subject.initial_state()));
+            if stored.from != expected_from
+                || stored.consumed_pair_cursor < previous_consumed_cursor
+            {
+                return Err(RebuildStoreError::Integrity(format!(
+                    "policy evaluation {evaluation_artifact_id} breaks subject history"
+                )));
+            }
+
+            let outcome_artifact = read_artifact(connection, &stored.outcome_artifact_id)?;
+            let experience_artifact = read_artifact(connection, &stored.experience_artifact_id)?;
+            let evaluation_artifact = read_artifact(connection, &stored.evaluation_artifact_id)?;
+            for (artifact, expected_kind) in [
+                (&outcome_artifact, ArtifactKind::Outcome),
+                (&experience_artifact, ArtifactKind::Experience),
+                (&evaluation_artifact, ArtifactKind::Evaluation),
+            ] {
+                if artifact.kind != expected_kind
+                    || artifact.lifecycle != ArtifactLifecycle::Canonical
+                    || artifact_run_purpose(connection, artifact)? != RunPurpose::Paper
+                {
+                    return Err(RebuildStoreError::Integrity(format!(
+                        "policy evaluation {evaluation_artifact_id} has invalid canonical artifact"
+                    )));
+                }
+            }
+
+            let outcome: Outcome =
+                serde_json::from_slice(&self.read_blob(&outcome_artifact.blob)?)?;
+            outcome.validate_sealed()?;
+            let schedule = self.read_outcome_schedule_with_connection(
+                connection,
+                &outcome,
+                &[RunPurpose::Paper],
+            )?;
+            let experience: Experience =
+                serde_json::from_slice(&self.read_blob(&experience_artifact.blob)?)?;
+            experience.validate()?;
+            let evaluation: Evaluation =
+                serde_json::from_slice(&self.read_blob(&evaluation_artifact.blob)?)?;
+            evaluation.validate()?;
+
+            let outcome_ref = ArtifactRef {
+                artifact_id: outcome_artifact.artifact_id.clone(),
+                kind: ArtifactKind::Outcome,
+            };
+            let experience_ref = ArtifactRef {
+                artifact_id: experience_artifact.artifact_id.clone(),
+                kind: ArtifactKind::Experience,
+            };
+            if experience.subject != stored.subject
+                || experience.policy_state != stored.from
+                || experience.outcome != outcome_ref
+                || experience.decision != schedule.decision
+                || experience.decision_context != schedule.decision_context
+                || experience.execution_context != schedule.execution_context
+                || evaluation.outcome != outcome_ref
+                || evaluation.experience != experience_ref
+            {
+                return Err(RebuildStoreError::Integrity(format!(
+                    "policy evaluation {evaluation_artifact_id} lineage is invalid"
+                )));
+            }
+
+            match (&stored.subject, &stored.candidate_policy_artifact_id) {
+                (PolicySubject::Memory(_), None) => {}
+                (PolicySubject::Memory(_), Some(_)) => {
+                    return Err(RebuildStoreError::Integrity(format!(
+                        "policy evaluation {evaluation_artifact_id} binds a memory candidate"
+                    )));
+                }
+                (PolicySubject::Contract(_) | PolicySubject::Topology(_), None) => {
+                    return Err(RebuildStoreError::Integrity(format!(
+                        "policy evaluation {evaluation_artifact_id} has no candidate policy"
+                    )));
+                }
+                (_, Some(candidate_policy_artifact_id)) => {
+                    let candidate = read_artifact(connection, candidate_policy_artifact_id)?;
+                    if candidate.kind != ArtifactKind::CandidatePolicy
+                        || candidate.lifecycle != ArtifactLifecycle::Canonical
+                        || artifact_run_purpose(connection, &candidate)? != RunPurpose::Paper
+                    {
+                        return Err(RebuildStoreError::Integrity(format!(
+                            "policy evaluation {evaluation_artifact_id} has invalid candidate policy"
+                        )));
+                    }
+                }
+            }
+
+            match &stored.transition_id {
+                Some(transition_id) => {
+                    let transition = read_policy_transition(connection, transition_id)?
+                        .ok_or_else(|| {
+                            RebuildStoreError::Integrity(format!(
+                                "policy evaluation {evaluation_artifact_id} references missing transition {transition_id}"
+                            ))
+                        })?;
+                    if transition.transition.subject != stored.subject
+                        || transition.transition.from != stored.from
+                        || transition.transition.to != stored.to
+                        || transition.transition.evaluation.artifact_id
+                            != stored.evaluation_artifact_id
+                        || transition.run_id != stored.run_id
+                    {
+                        return Err(RebuildStoreError::Integrity(format!(
+                            "policy evaluation {evaluation_artifact_id} disagrees with transition {transition_id}"
+                        )));
+                    }
+                }
+                None if stored.from != stored.to => {
+                    return Err(RebuildStoreError::Integrity(format!(
+                        "policy evaluation {evaluation_artifact_id} changed state without transition"
+                    )));
+                }
+                None => {}
+            }
+
+            let event = connection
+                .query_row(
+                    "SELECT run_id, event_type, artifact_id, created_at \
+                     FROM rebuild_events WHERE event_id = ?1",
+                    params![stored.event_cursor],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, String>(3)?,
+                        ))
+                    },
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    RebuildStoreError::Integrity(format!(
+                        "policy evaluation {evaluation_artifact_id} has no durable event"
+                    ))
+                })?;
+            if event.0 != stored.run_id.0
+                || event.1 != "policy.evaluated"
+                || event.2.as_deref() != Some(stored.evaluation_artifact_id.0.as_str())
+                || parse_time(&event.3)? != stored.completed_at
+            {
+                return Err(RebuildStoreError::Integrity(format!(
+                    "policy evaluation {evaluation_artifact_id} event is invalid"
+                )));
+            }
+
+            if stored.consumed_pair_cursor < 0
+                || (stored.consumed_pair_cursor != 0
+                    && stored.consumed_pair_cursor >= stored.event_cursor)
+            {
+                return Err(RebuildStoreError::Integrity(format!(
+                    "policy evaluation {evaluation_artifact_id} consumed invalid shadow cursor"
+                )));
+            }
+            if stored.consumed_pair_cursor > previous_consumed_cursor {
+                let boundary_exists = connection
+                    .query_row(
+                        "SELECT 1 FROM rebuild_shadow_pairs \
+                         WHERE subject_id = ?1 AND pair_event_cursor = ?2",
+                        params![subject_id, stored.consumed_pair_cursor],
+                        |_| Ok(()),
+                    )
+                    .optional()?
+                    .is_some();
+                if !boundary_exists {
+                    return Err(RebuildStoreError::Integrity(format!(
+                        "policy evaluation {evaluation_artifact_id} consumed non-pair cursor"
+                    )));
+                }
+            }
+            subject_history.insert(subject_id, (stored.consumed_pair_cursor, stored.to));
+        }
+
+        let head_subjects = connection
+            .prepare(
+                "SELECT subject_json FROM rebuild_policy_consumption_heads ORDER BY subject_id",
+            )?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        for subject_json in head_subjects {
+            let subject: PolicySubject = serde_json::from_str(&subject_json)?;
+            subject.validate()?;
+            let head = read_policy_consumption_head(connection, &subject)?.ok_or_else(|| {
+                RebuildStoreError::Integrity(format!(
+                    "policy consumption head {} disappeared",
+                    subject.subject_id()
+                ))
+            })?;
+            let latest_id = connection.query_row(
+                "SELECT evaluation_artifact_id FROM rebuild_policy_evaluations \
+                 WHERE subject_id = ?1 ORDER BY event_cursor DESC LIMIT 1",
+                params![subject.subject_id()],
+                |row| row.get::<_, String>(0),
+            )?;
+            let latest =
+                read_policy_evaluation(connection, &ArtifactId(ContentHash::new(latest_id)?))?
+                    .ok_or_else(|| {
+                        RebuildStoreError::Integrity(format!(
+                            "policy consumption head {} has no evaluation",
+                            subject.subject_id()
+                        ))
+                    })?;
+            if head.subject != latest.subject
+                || head.consumed_pair_cursor != latest.consumed_pair_cursor
+                || head.evaluation_artifact_id != latest.evaluation_artifact_id
+                || head.evaluation_cursor != latest.event_cursor
+                || head.updated_at != latest.completed_at
+            {
+                return Err(RebuildStoreError::Integrity(format!(
+                    "policy consumption head {} does not match latest evaluation",
+                    subject.subject_id()
+                )));
+            }
+        }
+
+        let orphan_evaluation = connection
+            .query_row(
+                r#"SELECT e.evaluation_artifact_id
+                   FROM rebuild_policy_evaluations AS e
+                   LEFT JOIN rebuild_policy_consumption_heads AS h
+                     ON h.subject_id = e.subject_id
+                   WHERE h.subject_id IS NULL LIMIT 1"#,
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(evaluation_id) = orphan_evaluation {
+            return Err(RebuildStoreError::Integrity(format!(
+                "policy evaluation {evaluation_id} has no consumption head"
+            )));
+        }
+
+        Ok(())
+    }
+
+    fn verify_candidate_policy_history(&self, connection: &Connection) -> RebuildStoreResult<()> {
+        let artifact_ids = connection
+            .prepare(
+                "SELECT artifact_id FROM rebuild_artifacts WHERE kind = ?1 ORDER BY artifact_id",
+            )?
+            .query_map(params![enum_name(ArtifactKind::CandidatePolicy)], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        for value in artifact_ids {
+            let artifact_id = ArtifactId(ContentHash::new(value)?);
+            let artifact = read_artifact(connection, &artifact_id)?;
+            if artifact.lifecycle != ArtifactLifecycle::Canonical {
+                return Err(RebuildStoreError::Integrity(format!(
+                    "candidate policy {artifact_id} is noncanonical"
+                )));
+            }
+            assert_artifact_from_paper_with_connection(connection, &artifact).map_err(|error| {
+                RebuildStoreError::Integrity(format!(
+                    "candidate policy {artifact_id} has invalid origin: {error}"
+                ))
+            })?;
+            let policy: CandidatePolicy = self.read_artifact_payload(&artifact)?;
+            policy.validate()?;
+            if !has_exact_source_refs(
+                &artifact,
+                &[
+                    policy.baseline.clone(),
+                    policy.candidate.clone(),
+                    policy.source_evaluation.clone(),
+                ],
+            ) {
+                return Err(RebuildStoreError::Integrity(format!(
+                    "candidate policy {artifact_id} has invalid source closure"
+                )));
+            }
+            let evaluation =
+                read_policy_evaluation(connection, &policy.source_evaluation.artifact_id)?
+                    .ok_or_else(|| {
+                        RebuildStoreError::Integrity(format!(
+                            "candidate policy {artifact_id} has no source evaluation"
+                        ))
+                    })?;
+            if evaluation.subject != policy.subject
+                || evaluation.completed_at != policy.created_at
+                || evaluation.candidate_policy_artifact_id.as_ref() != Some(&artifact_id)
+            {
+                return Err(RebuildStoreError::Integrity(format!(
+                    "candidate policy {artifact_id} disagrees with source evaluation"
+                )));
+            }
+            self.validate_candidate_policy_sources(connection, &policy)
+                .map_err(|error| {
+                    RebuildStoreError::Integrity(format!(
+                        "candidate policy {artifact_id} has invalid binding: {error}"
+                    ))
+                })?;
+        }
+        Ok(())
+    }
+
+    fn validate_policy_evaluation_commit_with_connection(
         &self,
-        commit: &PolicyTransitionCommit,
+        connection: &Connection,
+        commit: &PolicyEvaluationCommit,
     ) -> RebuildStoreResult<()> {
         for (artifact, kind) in [
             (&commit.outcome, ArtifactKind::Outcome),
@@ -3119,6 +3787,17 @@ impl RebuildStore {
                 ));
             }
         }
+        if let Some(candidate_policy) = &commit.candidate_policy {
+            candidate_policy.validate()?;
+            self.read_blob(&candidate_policy.blob)?;
+            if candidate_policy.kind != ArtifactKind::CandidatePolicy
+                || candidate_policy.lifecycle != ArtifactLifecycle::Canonical
+            {
+                return Err(RebuildStoreError::InvalidLearningCommit(
+                    "candidate_policy.kind_or_lifecycle",
+                ));
+            }
+        }
         let outcome: Outcome = self.read_artifact_payload(&commit.outcome)?;
         outcome.validate()?;
         if !outcome.is_sealed() {
@@ -3126,12 +3805,14 @@ impl RebuildStore {
                 commit.outcome.artifact_id.clone(),
             ));
         }
+        let schedule =
+            self.read_outcome_schedule_with_connection(connection, &outcome, &[RunPurpose::Paper])?;
         let experience: Experience = self.read_artifact_payload(&commit.experience)?;
         experience.validate()?;
         let evaluation: Evaluation = self.read_artifact_payload(&commit.evaluation)?;
         evaluation.validate()?;
 
-        for reference in std::iter::once(&outcome.execution_context)
+        for reference in std::iter::once(&outcome.schedule)
             .chain(outcome.market_evidence.iter())
             .chain([
                 &experience.decision,
@@ -3140,13 +3821,13 @@ impl RebuildStore {
                 &experience.policy_verdict,
             ])
         {
-            let source = self.artifact(&reference.artifact_id)?;
+            let source = read_artifact(connection, &reference.artifact_id)?;
             if source.kind != reference.kind {
                 return Err(RebuildStoreError::InvalidLearningCommit(
                     "learning_artifact.source_kind",
                 ));
             }
-            self.assert_artifact_from_paper(&source)?;
+            assert_artifact_from_paper_with_connection(connection, &source)?;
         }
 
         let outcome_ref = ArtifactRef {
@@ -3161,11 +3842,66 @@ impl RebuildStore {
             artifact_id: commit.evaluation.artifact_id.clone(),
             kind: ArtifactKind::Evaluation,
         };
+        match (&commit.subject, &commit.candidate_policy) {
+            (PolicySubject::Memory(_), None) => {}
+            (PolicySubject::Memory(_), Some(_)) => {
+                return Err(RebuildStoreError::InvalidLearningCommit(
+                    "candidate_policy.memory_subject",
+                ));
+            }
+            (PolicySubject::Contract(_) | PolicySubject::Topology(_), None) => {
+                return Err(RebuildStoreError::InvalidLearningCommit(
+                    "candidate_policy.missing",
+                ));
+            }
+            (PolicySubject::Contract(_) | PolicySubject::Topology(_), Some(artifact)) => {
+                let candidate_policy: CandidatePolicy = self.read_artifact_payload(artifact)?;
+                candidate_policy.validate()?;
+                if candidate_policy.subject != commit.subject
+                    || candidate_policy.source_evaluation != evaluation_ref
+                    || candidate_policy.created_at != commit.completed_at
+                    || !has_exact_source_refs(
+                        artifact,
+                        &[
+                            candidate_policy.baseline.clone(),
+                            candidate_policy.candidate.clone(),
+                            candidate_policy.source_evaluation.clone(),
+                        ],
+                    )
+                {
+                    return Err(RebuildStoreError::InvalidLearningCommit(
+                        "candidate_policy.links",
+                    ));
+                }
+                self.validate_candidate_policy_sources(connection, &candidate_policy)?;
+            }
+        }
+        commit.subject.validate()?;
+        if !commit.subject.accepts_state(commit.from) || !commit.subject.accepts_state(commit.to) {
+            return Err(RebuildStoreError::InvalidLearningCommit(
+                "policy_evaluation.subject_state",
+            ));
+        }
+        let transition_matches = match &commit.transition {
+            Some(transition) => {
+                transition.validate()?;
+                transition.subject == commit.subject
+                    && transition.from == commit.from
+                    && transition.to == commit.to
+                    && transition.evaluation == evaluation_ref
+                    && transition.created_at == commit.completed_at
+            }
+            None => commit.from == commit.to,
+        };
         if experience.outcome != outcome_ref
             || evaluation.outcome != outcome_ref
             || evaluation.experience != experience_ref
-            || commit.transition.evaluation != evaluation_ref
-            || commit.transition.created_at != commit.completed_at
+            || !transition_matches
+            || experience.subject != commit.subject
+            || experience.policy_state != commit.from
+            || experience.decision != schedule.decision
+            || experience.decision_context != schedule.decision_context
+            || experience.execution_context != schedule.execution_context
         {
             return Err(RebuildStoreError::InvalidLearningCommit(
                 "learning_artifact.links",
@@ -3173,7 +3909,7 @@ impl RebuildStore {
         }
         if !has_exact_source_refs(
             &commit.outcome,
-            &std::iter::once(outcome.execution_context.clone())
+            &std::iter::once(outcome.schedule.clone())
                 .chain(outcome.market_evidence.iter().cloned())
                 .collect::<Vec<_>>(),
         ) || !has_exact_source_refs(
@@ -3193,60 +3929,125 @@ impl RebuildStore {
                 "learning_artifact.source_refs",
             ));
         }
-        commit.transition.validate()?;
         Ok(())
     }
 
-    fn assert_shadow_pair_sources(
+    fn validate_candidate_policy_sources(
         &self,
+        connection: &Connection,
+        policy: &CandidatePolicy,
+    ) -> RebuildStoreResult<()> {
+        let baseline =
+            read_required_artifact(connection, &policy.baseline, "candidate_policy.baseline")?;
+        let candidate =
+            read_required_artifact(connection, &policy.candidate, "candidate_policy.candidate")?;
+        match &policy.subject {
+            PolicySubject::Memory(_) => Err(RebuildStoreError::InvalidLearningCommit(
+                "candidate_policy.memory_subject",
+            )),
+            PolicySubject::Contract(candidate_hash) => {
+                if baseline.lifecycle != ArtifactLifecycle::Canonical
+                    || candidate.lifecycle != ArtifactLifecycle::Canonical
+                {
+                    return Err(RebuildStoreError::InvalidLearningCommit(
+                        "candidate_policy.contract_lifecycle",
+                    ));
+                }
+                let baseline_contract: AgentContract = self.read_artifact_payload(&baseline)?;
+                let candidate_contract: AgentContract = self.read_artifact_payload(&candidate)?;
+                baseline_contract.validate()?;
+                candidate_contract.validate()?;
+                if &candidate_contract.contract_hash != candidate_hash
+                    || !baseline_contract.permits_candidate(&candidate_contract)
+                {
+                    return Err(RebuildStoreError::InvalidLearningCommit(
+                        "candidate_policy.contract_binding",
+                    ));
+                }
+                Ok(())
+            }
+            PolicySubject::Topology(topology_id) => {
+                let baseline_graph: WorkflowGraph = self.read_artifact_payload(&baseline)?;
+                let candidate_graph: WorkflowGraph = self.read_artifact_payload(&candidate)?;
+                baseline_graph.validate()?;
+                candidate_graph.validate()?;
+                if candidate_graph.topology_id != topology_id.0
+                    || workflow_graph_run_purpose(connection, &baseline.artifact_id)?
+                        != RunPurpose::Paper
+                    || workflow_graph_run_purpose(connection, &candidate.artifact_id)?
+                        != RunPurpose::Shadow
+                {
+                    return Err(RebuildStoreError::InvalidLearningCommit(
+                        "candidate_policy.topology_binding",
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn assert_shadow_pair_sources_with_connection(
+        &self,
+        connection: &Connection,
         completion: &ShadowPairCompletion,
     ) -> RebuildStoreResult<()> {
-        let mut outcomes = Vec::new();
-        for reference in [
+        let parent_decision = read_required_artifact(
+            connection,
             &completion.parent_decision,
+            "shadow_pair.parent_decision",
+        )?;
+        let execution_context = read_required_artifact(
+            connection,
             &completion.execution_context,
+            "shadow_pair.execution_context",
+        )?;
+        let candidate_decision = read_required_artifact(
+            connection,
             &completion.candidate_decision,
+            "shadow_pair.candidate_decision",
+        )?;
+        let parent_outcome_artifact = read_required_artifact(
+            connection,
             &completion.parent_outcome,
+            "shadow_pair.parent_outcome",
+        )?;
+        let candidate_outcome_artifact = read_required_artifact(
+            connection,
             &completion.candidate_outcome,
-        ] {
-            let artifact = self.artifact(&reference.artifact_id)?;
-            if artifact.kind != reference.kind {
-                return Err(RebuildStoreError::InvalidLearningCommit(
-                    "shadow_pair.artifact_kind",
-                ));
-            }
-            self.assert_artifact_from_paper(&artifact)?;
-            if reference.kind == ArtifactKind::Outcome {
-                outcomes.push(self.read_artifact_payload::<Outcome>(&artifact)?);
-            }
-        }
-        if outcomes.len() != 2 || outcomes.iter().any(|outcome| !outcome.is_sealed()) {
-            return Err(RebuildStoreError::InvalidLearningCommit(
-                "shadow_pair.sealed_outcome",
-            ));
-        }
-        if outcomes
-            .iter()
-            .any(|outcome| outcome.execution_context != completion.execution_context)
+            "shadow_pair.candidate_outcome",
+        )?;
+
+        assert_canonical_paper_artifact(connection, &parent_decision)?;
+        assert_artifact_from_paper_with_connection(connection, &execution_context)?;
+        assert_canonical_paper_artifact(connection, &parent_outcome_artifact)?;
+        assert_shadow_candidate_artifact(connection, &candidate_decision)?;
+        assert_shadow_candidate_artifact(connection, &candidate_outcome_artifact)?;
+        assert_candidate_decision_binding(connection, &candidate_decision, completion)?;
+
+        let parent_outcome: Outcome =
+            serde_json::from_slice(&self.read_blob(&parent_outcome_artifact.blob)?)?;
+        let candidate_outcome: Outcome =
+            serde_json::from_slice(&self.read_blob(&candidate_outcome_artifact.blob)?)?;
+        parent_outcome.validate_sealed()?;
+        candidate_outcome.validate_sealed()?;
+
+        let parent_schedule = self.read_outcome_schedule_with_connection(
+            connection,
+            &parent_outcome,
+            &[RunPurpose::Paper],
+        )?;
+        let candidate_schedule = self.read_outcome_schedule_with_connection(
+            connection,
+            &candidate_outcome,
+            &[RunPurpose::Paper, RunPurpose::Shadow],
+        )?;
+        if parent_schedule.decision != completion.parent_decision
+            || candidate_schedule.decision != completion.candidate_decision
+            || parent_schedule.execution_context != completion.execution_context
+            || candidate_schedule.execution_context != completion.execution_context
         {
             return Err(RebuildStoreError::InvalidLearningCommit(
-                "shadow_pair.execution_context",
-            ));
-        }
-        Ok(())
-    }
-
-    fn assert_artifact_from_paper(&self, artifact: &Artifact) -> RebuildStoreResult<()> {
-        let run_id = artifact
-            .origin
-            .as_ref()
-            .and_then(|origin| origin.run_id.as_ref())
-            .ok_or(RebuildStoreError::InvalidLearningCommit(
-                "learning_artifact.origin",
-            ))?;
-        if self.run_purpose(run_id)? != RunPurpose::Paper {
-            return Err(RebuildStoreError::NonCanonicalLearningPurpose(
-                self.run_purpose(run_id)?,
+                "shadow_pair.schedule_binding",
             ));
         }
         Ok(())
@@ -3259,12 +4060,183 @@ impl RebuildStore {
         Ok(serde_json::from_slice(&self.read_blob(&artifact.blob)?)?)
     }
 
+    fn read_outcome_schedule_with_connection(
+        &self,
+        connection: &Connection,
+        outcome: &Outcome,
+        allowed_purposes: &[RunPurpose],
+    ) -> RebuildStoreResult<OutcomeSchedule> {
+        if outcome.schedule.kind != ArtifactKind::OutcomeSchedule {
+            return Err(RebuildStoreError::InvalidLearningCommit(
+                "outcome.schedule_kind",
+            ));
+        }
+        let schedule_artifact = read_artifact(connection, &outcome.schedule.artifact_id)?;
+        if schedule_artifact.kind != ArtifactKind::OutcomeSchedule {
+            return Err(RebuildStoreError::InvalidLearningCommit(
+                "outcome.schedule_artifact",
+            ));
+        }
+        let schedule_purpose = artifact_run_purpose(connection, &schedule_artifact)?;
+        let expected_lifecycle = match schedule_purpose {
+            RunPurpose::Paper => ArtifactLifecycle::Canonical,
+            RunPurpose::Shadow => ArtifactLifecycle::RunScoped,
+            _ => {
+                return Err(RebuildStoreError::InvalidLearningCommit(
+                    "outcome.schedule_artifact",
+                ));
+            }
+        };
+        if schedule_artifact.lifecycle != expected_lifecycle {
+            return Err(RebuildStoreError::InvalidLearningCommit(
+                "outcome.schedule_artifact",
+            ));
+        }
+        assert_artifact_from_allowed_purposes(connection, &schedule_artifact, allowed_purposes)?;
+        let schedule: OutcomeSchedule =
+            serde_json::from_slice(&self.read_blob(&schedule_artifact.blob)?)?;
+        schedule.validate()?;
+        if schedule.outcome_id != outcome.outcome_id {
+            return Err(RebuildStoreError::InvalidLearningCommit(
+                "outcome.schedule_identity",
+            ));
+        }
+
+        let expected = outcome_schedule_source_refs(&schedule);
+        if !has_exact_source_refs(&schedule_artifact, &expected) {
+            return Err(RebuildStoreError::InvalidLearningCommit(
+                "outcome_schedule.source_refs",
+            ));
+        }
+        for reference in &expected {
+            let artifact = read_artifact(connection, &reference.artifact_id)?;
+            if artifact.kind != reference.kind {
+                return Err(RebuildStoreError::InvalidLearningCommit(
+                    "outcome_schedule.source_kind",
+                ));
+            }
+            assert_artifact_from_allowed_purposes(connection, &artifact, allowed_purposes)?;
+        }
+        self.validate_outcome_schedule_execution_lineage(connection, &schedule, allowed_purposes)?;
+        Ok(schedule)
+    }
+
+    fn validate_outcome_schedule_execution_lineage(
+        &self,
+        connection: &Connection,
+        schedule: &OutcomeSchedule,
+        allowed_purposes: &[RunPurpose],
+    ) -> RebuildStoreResult<()> {
+        let verdict_ref = match &schedule.execution {
+            OutcomeExecutionLineage::NoOrder { execution_verdict } => execution_verdict,
+            OutcomeExecutionLineage::ReconciledPaper {
+                execution_verdict, ..
+            } => execution_verdict,
+        };
+        let verdict_artifact = read_artifact(connection, &verdict_ref.artifact_id)?;
+        if verdict_artifact.kind != ArtifactKind::ExecutionVerdict {
+            return Err(RebuildStoreError::InvalidLearningCommit(
+                "outcome_schedule.execution_verdict_kind",
+            ));
+        }
+        assert_artifact_from_allowed_purposes(connection, &verdict_artifact, allowed_purposes)?;
+        let verdict: ExecutionVerdict =
+            serde_json::from_slice(&self.read_blob(&verdict_artifact.blob)?)?;
+        verdict.validate()?;
+
+        match (&schedule.execution, verdict) {
+            (
+                OutcomeExecutionLineage::NoOrder { execution_verdict },
+                ExecutionVerdict::NoOrder { no_order },
+            ) if execution_verdict == verdict_ref
+                && no_order.execution_context == schedule.execution_context =>
+            {
+                if !verdict_artifact
+                    .source_refs
+                    .iter()
+                    .any(|reference| reference == &schedule.execution_context)
+                {
+                    return Err(RebuildStoreError::InvalidLearningCommit(
+                        "outcome_schedule.no_order_context",
+                    ));
+                }
+            }
+            (
+                OutcomeExecutionLineage::ReconciledPaper {
+                    execution_verdict,
+                    commitment,
+                    reconciliation,
+                },
+                ExecutionVerdict::Accepted { execution_context },
+            ) if execution_verdict == verdict_ref
+                && execution_context == schedule.execution_context =>
+            {
+                let commitment_artifact = read_artifact(connection, &commitment.artifact_id)?;
+                if commitment_artifact.kind != ArtifactKind::ExecutionCommitment {
+                    return Err(RebuildStoreError::InvalidLearningCommit(
+                        "outcome_schedule.commitment_kind",
+                    ));
+                }
+                assert_artifact_from_allowed_purposes(
+                    connection,
+                    &commitment_artifact,
+                    allowed_purposes,
+                )?;
+                let commitment_payload: PaperCommitment =
+                    serde_json::from_slice(&self.read_blob(&commitment_artifact.blob)?)?;
+                commitment_payload.validate()?;
+                if commitment_payload.execution_context != schedule.execution_context
+                    || !commitment_artifact
+                        .source_refs
+                        .iter()
+                        .any(|reference| reference == execution_verdict)
+                {
+                    return Err(RebuildStoreError::InvalidLearningCommit(
+                        "outcome_schedule.commitment_lineage",
+                    ));
+                }
+
+                let reconciliation_artifact =
+                    read_artifact(connection, &reconciliation.artifact_id)?;
+                if reconciliation_artifact.kind != ArtifactKind::Reconciliation {
+                    return Err(RebuildStoreError::InvalidLearningCommit(
+                        "outcome_schedule.reconciliation_kind",
+                    ));
+                }
+                assert_artifact_from_allowed_purposes(
+                    connection,
+                    &reconciliation_artifact,
+                    allowed_purposes,
+                )?;
+                let reconciliation_payload: Reconciliation =
+                    serde_json::from_slice(&self.read_blob(&reconciliation_artifact.blob)?)?;
+                reconciliation_payload.validate()?;
+                if reconciliation_payload.commitment != *commitment
+                    || !reconciliation_artifact
+                        .source_refs
+                        .iter()
+                        .any(|reference| reference == commitment)
+                {
+                    return Err(RebuildStoreError::InvalidLearningCommit(
+                        "outcome_schedule.reconciliation_lineage",
+                    ));
+                }
+            }
+            _ => {
+                return Err(RebuildStoreError::InvalidLearningCommit(
+                    "outcome_schedule.execution_lineage",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn blob_path(&self, hash: &ContentHash) -> PathBuf {
         self.blobs.join(&hash.as_str()[..2]).join(hash.as_str())
     }
 }
 
-fn initialize(connection: &mut Connection) -> RebuildStoreResult<()> {
+fn initialize(connection: &mut Connection, root: &Path) -> RebuildStoreResult<()> {
     connection.execute_batch(
         "CREATE TABLE IF NOT EXISTS rebuild_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
     )?;
@@ -3275,6 +4247,15 @@ fn initialize(connection: &mut Connection) -> RebuildStoreResult<()> {
             |row| row.get::<_, String>(0),
         )
         .optional()?;
+    if version.is_some()
+        && !table_has_column(
+            connection,
+            "rebuild_policy_evaluations",
+            "candidate_policy_artifact_id",
+        )?
+    {
+        return Err(RebuildStoreError::IncompatibleStoreRoot(root.to_path_buf()));
+    }
     if let Some(value) = version.as_deref() {
         if value != REBUILD_SCHEMA_VERSION.to_string() {
             return Err(RebuildStoreError::IncompatibleStoreRoot(PathBuf::from(
@@ -3405,24 +4386,53 @@ CREATE TABLE IF NOT EXISTS rebuild_execution_reprices (
 CREATE TABLE IF NOT EXISTS rebuild_policy_transitions (
     transition_id TEXT PRIMARY KEY,
     subject_id TEXT NOT NULL,
+    subject_json TEXT NOT NULL,
     from_state_json TEXT NOT NULL,
     to_state_json TEXT NOT NULL,
     evaluation_artifact_id TEXT NOT NULL REFERENCES rebuild_artifacts(artifact_id),
     run_id TEXT NOT NULL REFERENCES rebuild_runs(run_id),
     revision INTEGER NOT NULL,
     created_at TEXT NOT NULL,
+    event_cursor INTEGER NOT NULL UNIQUE REFERENCES rebuild_events(event_id),
     UNIQUE(subject_id, revision)
+);
+CREATE TABLE IF NOT EXISTS rebuild_policy_evaluations (
+    evaluation_artifact_id TEXT PRIMARY KEY REFERENCES rebuild_artifacts(artifact_id),
+    subject_id TEXT NOT NULL,
+    subject_json TEXT NOT NULL,
+    outcome_artifact_id TEXT NOT NULL REFERENCES rebuild_artifacts(artifact_id),
+    experience_artifact_id TEXT NOT NULL REFERENCES rebuild_artifacts(artifact_id),
+    candidate_policy_artifact_id TEXT UNIQUE REFERENCES rebuild_artifacts(artifact_id),
+    from_state_json TEXT NOT NULL,
+    to_state_json TEXT NOT NULL,
+    transition_id TEXT UNIQUE REFERENCES rebuild_policy_transitions(transition_id),
+    run_id TEXT NOT NULL REFERENCES rebuild_runs(run_id),
+    consumed_pair_cursor INTEGER NOT NULL,
+    event_cursor INTEGER NOT NULL UNIQUE REFERENCES rebuild_events(event_id),
+    completed_at TEXT NOT NULL,
+    UNIQUE(subject_id, event_cursor)
+);
+CREATE TABLE IF NOT EXISTS rebuild_policy_consumption_heads (
+    subject_id TEXT PRIMARY KEY,
+    subject_json TEXT NOT NULL,
+    consumed_pair_cursor INTEGER NOT NULL,
+    evaluation_artifact_id TEXT NOT NULL REFERENCES rebuild_policy_evaluations(evaluation_artifact_id),
+    evaluation_event_cursor INTEGER NOT NULL UNIQUE REFERENCES rebuild_events(event_id),
+    updated_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS rebuild_policy_heads (
     subject_id TEXT PRIMARY KEY,
+    subject_json TEXT NOT NULL,
     state_json TEXT NOT NULL,
     revision INTEGER NOT NULL,
     transition_id TEXT NOT NULL REFERENCES rebuild_policy_transitions(transition_id),
+    transition_event_cursor INTEGER NOT NULL UNIQUE REFERENCES rebuild_events(event_id),
     updated_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS rebuild_shadow_pairs (
     pair_key TEXT PRIMARY KEY,
     subject_id TEXT NOT NULL,
+    subject_json TEXT NOT NULL,
     parent_decision_artifact_id TEXT NOT NULL REFERENCES rebuild_artifacts(artifact_id),
     execution_context_artifact_id TEXT NOT NULL REFERENCES rebuild_artifacts(artifact_id),
     candidate_decision_artifact_id TEXT NOT NULL REFERENCES rebuild_artifacts(artifact_id),
@@ -3431,7 +4441,8 @@ CREATE TABLE IF NOT EXISTS rebuild_shadow_pairs (
     horizon TEXT NOT NULL,
     parent_outcome_artifact_id TEXT NOT NULL REFERENCES rebuild_artifacts(artifact_id),
     candidate_outcome_artifact_id TEXT NOT NULL REFERENCES rebuild_artifacts(artifact_id),
-    completed_at TEXT NOT NULL
+    completed_at TEXT NOT NULL,
+    pair_event_cursor INTEGER NOT NULL UNIQUE REFERENCES rebuild_events(event_id)
 );
 CREATE INDEX IF NOT EXISTS rebuild_tasks_claimable
     ON rebuild_tasks(status, ready_at, priority);
@@ -3441,10 +4452,19 @@ CREATE INDEX IF NOT EXISTS rebuild_attempt_outputs_cursor
     ON rebuild_attempt_outputs(attempt_id, event_id);
 CREATE INDEX IF NOT EXISTS rebuild_policy_transitions_subject
     ON rebuild_policy_transitions(subject_id, revision);
+CREATE INDEX IF NOT EXISTS rebuild_policy_evaluations_subject
+    ON rebuild_policy_evaluations(subject_id, event_cursor);
 CREATE INDEX IF NOT EXISTS rebuild_shadow_pairs_freshness
-    ON rebuild_shadow_pairs(subject_id, horizon, completed_at);
+    ON rebuild_shadow_pairs(subject_id, horizon, pair_event_cursor);
 COMMIT;",
     )?;
+    if !table_has_column(
+        connection,
+        "rebuild_policy_evaluations",
+        "candidate_policy_artifact_id",
+    )? {
+        return Err(RebuildStoreError::IncompatibleStoreRoot(root.to_path_buf()));
+    }
     if version.is_none() {
         connection.execute(
             "INSERT INTO rebuild_metadata (key, value) VALUES ('schema_version', ?1)",
@@ -3452,6 +4472,18 @@ COMMIT;",
         )?;
     }
     Ok(())
+}
+
+fn table_has_column(
+    connection: &Connection,
+    table: &str,
+    required_column: &str,
+) -> RebuildStoreResult<bool> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(columns.iter().any(|column| column == required_column))
 }
 
 fn insert_artifact(transaction: &Transaction<'_>, artifact: &Artifact) -> RebuildStoreResult<()> {
@@ -4130,32 +5162,302 @@ fn parse_time(value: &str) -> RebuildStoreResult<DateTime<Utc>> {
         .map_err(|error| RebuildStoreError::Integrity(format!("invalid time {value}: {error}")))
 }
 
-fn read_policy_head(
-    connection: &Connection,
+/// The indexed subject ID is derived from this typed JSON, never accepted as
+/// an independent authority. A corrupt or hand-edited row must therefore
+/// fail closed rather than silently changing a policy namespace.
+fn parse_persisted_subject(
     subject_id: &str,
-) -> RebuildStoreResult<Option<PolicyHead>> {
+    subject_json: &str,
+) -> RebuildStoreResult<PolicySubject> {
+    let subject: PolicySubject = serde_json::from_str(subject_json)?;
+    subject.validate()?;
+    if subject.subject_id() != subject_id {
+        return Err(RebuildStoreError::Integrity(format!(
+            "policy subject JSON does not match indexed identity {subject_id}"
+        )));
+    }
+    Ok(subject)
+}
+
+fn read_policy_evaluation(
+    connection: &Connection,
+    evaluation_artifact_id: &ArtifactId,
+) -> RebuildStoreResult<Option<StoredPolicyEvaluation>> {
     let row = connection
         .query_row(
-            "SELECT state_json, revision, transition_id, updated_at FROM rebuild_policy_heads WHERE subject_id = ?1",
-            params![subject_id],
+            r#"SELECT subject_id, subject_json, outcome_artifact_id, experience_artifact_id,
+                      candidate_policy_artifact_id, from_state_json, to_state_json,
+                      transition_id, run_id, consumed_pair_cursor, event_cursor, completed_at
+               FROM rebuild_policy_evaluations WHERE evaluation_artifact_id = ?1"#,
+            params![evaluation_artifact_id.0.as_str()],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
-                    row.get::<_, u64>(1)?,
+                    row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, i64>(10)?,
+                    row.get::<_, String>(11)?,
                 ))
             },
         )
         .optional()?;
-    let Some((state, revision, transition_id, updated_at)) = row else {
+    let Some((
+        subject_id,
+        subject_json,
+        outcome_artifact_id,
+        experience_artifact_id,
+        candidate_policy_artifact_id,
+        from,
+        to,
+        transition_id,
+        run_id,
+        consumed_pair_cursor,
+        event_cursor,
+        completed_at,
+    )) = row
+    else {
         return Ok(None);
     };
+    Ok(Some(StoredPolicyEvaluation {
+        subject: parse_persisted_subject(&subject_id, &subject_json)?,
+        outcome_artifact_id: ArtifactId(ContentHash::new(outcome_artifact_id)?),
+        experience_artifact_id: ArtifactId(ContentHash::new(experience_artifact_id)?),
+        evaluation_artifact_id: evaluation_artifact_id.clone(),
+        candidate_policy_artifact_id: candidate_policy_artifact_id
+            .map(ContentHash::new)
+            .transpose()?
+            .map(ArtifactId),
+        from: serde_json::from_str(&from)?,
+        to: serde_json::from_str(&to)?,
+        transition_id: transition_id.map(PolicyTransitionId),
+        run_id: RunId(run_id),
+        consumed_pair_cursor,
+        event_cursor,
+        completed_at: parse_time(&completed_at)?,
+    }))
+}
+
+fn read_policy_consumption_head(
+    connection: &Connection,
+    expected_subject: &PolicySubject,
+) -> RebuildStoreResult<Option<PolicyConsumptionHead>> {
+    let subject_id = expected_subject.subject_id();
+    let row = connection
+        .query_row(
+            r#"SELECT subject_json, consumed_pair_cursor, evaluation_artifact_id,
+                       evaluation_event_cursor, updated_at
+                FROM rebuild_policy_consumption_heads WHERE subject_id = ?1"#,
+            params![subject_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        subject_json,
+        consumed_pair_cursor,
+        evaluation_artifact_id,
+        evaluation_cursor,
+        updated_at,
+    )) = row
+    else {
+        return Ok(None);
+    };
+    let subject = parse_persisted_subject(&subject_id, &subject_json)?;
+    if &subject != expected_subject {
+        return Err(RebuildStoreError::Integrity(format!(
+            "policy consumption head {subject_id} subject identity disagrees with lookup"
+        )));
+    }
+    Ok(Some(PolicyConsumptionHead {
+        subject,
+        consumed_pair_cursor,
+        evaluation_artifact_id: ArtifactId(ContentHash::new(evaluation_artifact_id)?),
+        evaluation_cursor,
+        updated_at: parse_time(&updated_at)?,
+    }))
+}
+
+fn max_shadow_pair_cursor(
+    connection: &Connection,
+    subject: &PolicySubject,
+) -> RebuildStoreResult<i64> {
+    connection
+        .query_row(
+            "SELECT COALESCE(MAX(pair_event_cursor), 0) FROM rebuild_shadow_pairs WHERE subject_id = ?1",
+            params![subject.subject_id()],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(Into::into)
+}
+
+fn shadow_pair_counts_between(
+    connection: &Connection,
+    subject: &PolicySubject,
+    after_cursor: i64,
+    through_cursor: i64,
+) -> RebuildStoreResult<[u64; 3]> {
+    if after_cursor < 0 || through_cursor < after_cursor {
+        return Err(RebuildStoreError::InvalidLearningCommit(
+            "shadow_pair.snapshot_cursor",
+        ));
+    }
+    let mut counts = [0; 3];
+    for (index, horizon) in OutcomeHorizon::ALL.into_iter().enumerate() {
+        counts[index] = connection.query_row(
+            "SELECT COUNT(*) FROM rebuild_shadow_pairs \
+             WHERE subject_id = ?1 AND horizon = ?2 \
+               AND pair_event_cursor > ?3 AND pair_event_cursor <= ?4",
+            params![
+                subject.subject_id(),
+                enum_name(horizon),
+                after_cursor,
+                through_cursor
+            ],
+            |row| row.get(0),
+        )?;
+    }
+    Ok(counts)
+}
+
+fn validate_policy_shadow_pair_snapshot(
+    connection: &Connection,
+    subject: &PolicySubject,
+    snapshot: PolicyShadowPairSnapshot,
+) -> RebuildStoreResult<()> {
+    let current_after = read_policy_consumption_head(connection, subject)?
+        .map_or(0, |head| head.consumed_pair_cursor);
+    if snapshot.after_cursor != current_after {
+        return Err(RebuildStoreError::InvalidLearningCommit(
+            "policy_evaluation.pair_snapshot_stale",
+        ));
+    }
+    let current_max = max_shadow_pair_cursor(connection, subject)?;
+    if snapshot.through_cursor < snapshot.after_cursor || snapshot.through_cursor > current_max {
+        return Err(RebuildStoreError::InvalidLearningCommit(
+            "policy_evaluation.pair_snapshot_boundary",
+        ));
+    }
+    if snapshot.through_cursor > snapshot.after_cursor {
+        let boundary_exists = connection
+            .query_row(
+                "SELECT 1 FROM rebuild_shadow_pairs \
+                 WHERE subject_id = ?1 AND pair_event_cursor = ?2",
+                params![subject.subject_id(), snapshot.through_cursor],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !boundary_exists {
+            return Err(RebuildStoreError::InvalidLearningCommit(
+                "policy_evaluation.pair_snapshot_boundary",
+            ));
+        }
+    }
+    if shadow_pair_counts_between(
+        connection,
+        subject,
+        snapshot.after_cursor,
+        snapshot.through_cursor,
+    )? != snapshot.counts_by_horizon
+    {
+        return Err(RebuildStoreError::InvalidLearningCommit(
+            "policy_evaluation.pair_snapshot_counts",
+        ));
+    }
+    Ok(())
+}
+
+fn reject_generic_learning_artifact(artifact: &Artifact) -> RebuildStoreResult<()> {
+    if matches!(
+        artifact.kind,
+        ArtifactKind::Outcome
+            | ArtifactKind::Experience
+            | ArtifactKind::Evaluation
+            | ArtifactKind::CandidatePolicy
+    ) {
+        return Err(RebuildStoreError::InvalidLearningCommit(
+            "learning_artifact.atomic_commit_required",
+        ));
+    }
+    Ok(())
+}
+
+fn same_policy_evaluation(
+    existing: &StoredPolicyEvaluation,
+    commit: &PolicyEvaluationCommit,
+) -> bool {
+    existing.subject == commit.subject
+        && existing.outcome_artifact_id == commit.outcome.artifact_id
+        && existing.experience_artifact_id == commit.experience.artifact_id
+        && existing.evaluation_artifact_id == commit.evaluation.artifact_id
+        && existing.candidate_policy_artifact_id
+            == commit
+                .candidate_policy
+                .as_ref()
+                .map(|artifact| artifact.artifact_id.clone())
+        && existing.from == commit.from
+        && existing.to == commit.to
+        && existing.transition_id
+            == commit
+                .transition
+                .as_ref()
+                .map(|transition| transition.transition_id.clone())
+        && existing.run_id == commit.permit.run_id
+        && existing.consumed_pair_cursor == commit.pair_snapshot.through_cursor
+        && existing.completed_at == commit.completed_at
+}
+
+fn read_policy_head(
+    connection: &Connection,
+    expected_subject: &PolicySubject,
+) -> RebuildStoreResult<Option<PolicyHead>> {
+    let subject_id = expected_subject.subject_id();
+    let row = connection
+        .query_row(
+            "SELECT subject_json, state_json, revision, transition_id, transition_event_cursor, updated_at FROM rebuild_policy_heads WHERE subject_id = ?1",
+            params![subject_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, u64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((subject_json, state, revision, transition_id, transition_cursor, updated_at)) = row
+    else {
+        return Ok(None);
+    };
+    let subject = parse_persisted_subject(&subject_id, &subject_json)?;
+    if &subject != expected_subject {
+        return Err(RebuildStoreError::Integrity(format!(
+            "policy head {subject_id} subject identity disagrees with lookup"
+        )));
+    }
     Ok(Some(PolicyHead {
-        subject_id: subject_id.to_owned(),
+        subject,
         state: serde_json::from_str(&state)?,
         revision,
         transition_id: PolicyTransitionId(transition_id),
+        transition_cursor,
         updated_at: parse_time(&updated_at)?,
     }))
 }
@@ -4166,8 +5468,8 @@ fn read_policy_transition(
 ) -> RebuildStoreResult<Option<PolicyTransitionRecord>> {
     let row = connection
         .query_row(
-            r#"SELECT subject_id, from_state_json, to_state_json, evaluation_artifact_id, run_id,
-                      revision, created_at
+            r#"SELECT subject_id, subject_json, from_state_json, to_state_json,
+                      evaluation_artifact_id, run_id, revision, created_at, event_cursor
                FROM rebuild_policy_transitions WHERE transition_id = ?1"#,
             params![transition_id.0],
             |row| {
@@ -4177,20 +5479,34 @@ fn read_policy_transition(
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
                     row.get::<_, String>(4)?,
-                    row.get::<_, u64>(5)?,
-                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, u64>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, i64>(8)?,
                 ))
             },
         )
         .optional()?;
-    let Some((subject_id, from, to, evaluation_id, run_id, revision, created_at)) = row else {
+    let Some((
+        subject_id,
+        subject_json,
+        from,
+        to,
+        evaluation_id,
+        run_id,
+        revision,
+        created_at,
+        transition_cursor,
+    )) = row
+    else {
         return Ok(None);
     };
+    let subject = parse_persisted_subject(&subject_id, &subject_json)?;
     Ok(Some(PolicyTransitionRecord {
         transition: PolicyTransition {
             schema_version: REBUILD_SCHEMA_VERSION,
             transition_id: transition_id.clone(),
-            subject_id,
+            subject,
             from: serde_json::from_str(&from)?,
             to: serde_json::from_str(&to)?,
             evaluation: ArtifactRef {
@@ -4201,16 +5517,18 @@ fn read_policy_transition(
         },
         run_id: RunId(run_id),
         revision,
+        transition_cursor,
     }))
 }
 
 fn read_policy_transitions(
     connection: &Connection,
-    subject_id: &str,
+    expected_subject: &PolicySubject,
 ) -> RebuildStoreResult<Vec<PolicyTransitionRecord>> {
+    let subject_id = expected_subject.subject_id();
     let mut statement = connection.prepare(
-        r#"SELECT transition_id, from_state_json, to_state_json, evaluation_artifact_id, run_id,
-                  revision, created_at
+        r#"SELECT transition_id, subject_json, from_state_json, to_state_json,
+                  evaluation_artifact_id, run_id, revision, created_at, event_cursor
            FROM rebuild_policy_transitions WHERE subject_id = ?1 ORDER BY revision ASC"#,
     )?;
     let rows = statement
@@ -4221,32 +5539,39 @@ fn read_policy_transitions(
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, String>(4)?,
-                row.get::<_, u64>(5)?,
-                row.get::<_, String>(6)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, u64>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, i64>(8)?,
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
     rows.into_iter()
-        .map(
-            |(transition_id, from, to, evaluation_id, run_id, revision, created_at)| {
-                Ok(PolicyTransitionRecord {
-                    transition: PolicyTransition {
-                        schema_version: REBUILD_SCHEMA_VERSION,
-                        transition_id: PolicyTransitionId(transition_id),
-                        subject_id: subject_id.to_owned(),
-                        from: serde_json::from_str(&from)?,
-                        to: serde_json::from_str(&to)?,
-                        evaluation: ArtifactRef {
-                            artifact_id: ArtifactId(ContentHash::new(evaluation_id)?),
-                            kind: ArtifactKind::Evaluation,
-                        },
-                        created_at: parse_time(&created_at)?,
+        .map(|(transition_id, subject_json, from, to, evaluation_id, run_id, revision, created_at, transition_cursor)| {
+            let subject = parse_persisted_subject(&subject_id, &subject_json)?;
+            if &subject != expected_subject {
+                return Err(RebuildStoreError::Integrity(format!(
+                    "policy transition {transition_id} subject identity disagrees with key {subject_id}"
+                )));
+            }
+            Ok(PolicyTransitionRecord {
+                transition: PolicyTransition {
+                    schema_version: REBUILD_SCHEMA_VERSION,
+                    transition_id: PolicyTransitionId(transition_id),
+                    subject,
+                    from: serde_json::from_str(&from)?,
+                    to: serde_json::from_str(&to)?,
+                    evaluation: ArtifactRef {
+                        artifact_id: ArtifactId(ContentHash::new(evaluation_id)?),
+                        kind: ArtifactKind::Evaluation,
                     },
-                    run_id: RunId(run_id),
-                    revision,
-                })
-            },
-        )
+                    created_at: parse_time(&created_at)?,
+                },
+                run_id: RunId(run_id),
+                revision,
+                transition_cursor,
+            })
+        })
         .collect()
 }
 
@@ -4256,9 +5581,10 @@ fn read_shadow_pair(
 ) -> RebuildStoreResult<Option<StoredShadowPair>> {
     let row = connection
         .query_row(
-            r#"SELECT subject_id, parent_decision_artifact_id, execution_context_artifact_id,
+            r#"SELECT subject_id, subject_json, parent_decision_artifact_id, execution_context_artifact_id,
                       candidate_decision_artifact_id, candidate_contract_hash, candidate_topology_id,
-                      horizon, parent_outcome_artifact_id, candidate_outcome_artifact_id, completed_at
+                      horizon, parent_outcome_artifact_id, candidate_outcome_artifact_id, completed_at,
+                      pair_event_cursor
                FROM rebuild_shadow_pairs WHERE pair_key = ?1"#,
             params![pair_key.as_str()],
             |row| {
@@ -4273,12 +5599,15 @@ fn read_shadow_pair(
                     row.get::<_, String>(7)?,
                     row.get::<_, String>(8)?,
                     row.get::<_, String>(9)?,
+                    row.get::<_, String>(10)?,
+                    row.get::<_, i64>(11)?,
                 ))
             },
         )
         .optional()?;
     let Some((
         subject_id,
+        subject_json,
         parent_decision,
         execution_context,
         candidate_decision,
@@ -4288,6 +5617,7 @@ fn read_shadow_pair(
         parent_outcome,
         candidate_outcome,
         completed_at,
+        completion_cursor,
     )) = row
     else {
         return Ok(None);
@@ -4295,7 +5625,7 @@ fn read_shadow_pair(
     Ok(Some(StoredShadowPair {
         pair_key: pair_key.clone(),
         completion: ShadowPairCompletion {
-            subject_id,
+            subject: parse_persisted_subject(&subject_id, &subject_json)?,
             parent_decision: ArtifactRef {
                 artifact_id: ArtifactId(ContentHash::new(parent_decision)?),
                 kind: ArtifactKind::Decision,
@@ -4321,11 +5651,12 @@ fn read_shadow_pair(
             },
             completed_at: parse_time(&completed_at)?,
         },
+        completion_cursor,
     }))
 }
 
 fn same_shadow_pair(left: &ShadowPairCompletion, right: &ShadowPairCompletion) -> bool {
-    left.subject_id == right.subject_id
+    left.subject == right.subject
         && left.parent_decision == right.parent_decision
         && left.execution_context == right.execution_context
         && left.candidate_decision == right.candidate_decision
@@ -4351,6 +5682,21 @@ fn run_purpose_from_connection(
     parse_enum(&purpose)
 }
 
+fn workflow_graph_run_purpose(
+    connection: &Connection,
+    artifact_id: &ArtifactId,
+) -> RebuildStoreResult<RunPurpose> {
+    let purpose = connection
+        .query_row(
+            "SELECT purpose FROM rebuild_runs WHERE graph_artifact_id = ?1",
+            params![artifact_id.0.as_str()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .ok_or_else(|| RebuildStoreError::MissingArtifact(artifact_id.clone()))?;
+    parse_enum(&purpose)
+}
+
 fn artifact_run_purpose(
     connection: &Connection,
     artifact: &Artifact,
@@ -4365,6 +5711,30 @@ fn artifact_run_purpose(
     run_purpose_from_connection(connection, run_id)
 }
 
+fn assert_artifact_from_allowed_purposes(
+    connection: &Connection,
+    artifact: &Artifact,
+    allowed_purposes: &[RunPurpose],
+) -> RebuildStoreResult<()> {
+    let purpose = artifact_run_purpose(connection, artifact)?;
+    if allowed_purposes.contains(&purpose) {
+        return Ok(());
+    }
+    if allowed_purposes == [RunPurpose::Paper] {
+        return Err(RebuildStoreError::NonCanonicalLearningPurpose(purpose));
+    }
+    Err(RebuildStoreError::InvalidLearningCommit(
+        "learning_artifact.run_purpose",
+    ))
+}
+
+fn assert_artifact_from_paper_with_connection(
+    connection: &Connection,
+    artifact: &Artifact,
+) -> RebuildStoreResult<()> {
+    assert_artifact_from_allowed_purposes(connection, artifact, &[RunPurpose::Paper])
+}
+
 fn assert_paper_run(transaction: &Transaction<'_>, run_id: &RunId) -> RebuildStoreResult<()> {
     let purpose = run_purpose_from_connection(transaction, run_id)?;
     if purpose != RunPurpose::Paper {
@@ -4373,13 +5743,106 @@ fn assert_paper_run(transaction: &Transaction<'_>, run_id: &RunId) -> RebuildSto
     Ok(())
 }
 
-fn is_initial_policy_state(state: PolicyState) -> bool {
-    matches!(
-        state,
-        PolicyState::Memory(akzio_domain::MemoryLifecycle::Candidate)
-            | PolicyState::Contract(akzio_domain::CandidatePolicyState::Candidate)
-            | PolicyState::Topology(akzio_domain::CandidatePolicyState::Candidate)
-    )
+fn read_required_artifact(
+    connection: &Connection,
+    reference: &ArtifactRef,
+    error: &'static str,
+) -> RebuildStoreResult<Artifact> {
+    let artifact = read_artifact(connection, &reference.artifact_id)?;
+    if artifact.kind != reference.kind {
+        return Err(RebuildStoreError::InvalidLearningCommit(error));
+    }
+    Ok(artifact)
+}
+
+fn assert_canonical_paper_artifact(
+    connection: &Connection,
+    artifact: &Artifact,
+) -> RebuildStoreResult<()> {
+    if artifact.lifecycle != ArtifactLifecycle::Canonical {
+        return Err(RebuildStoreError::InvalidLearningCommit(
+            "shadow_pair.parent_lifecycle",
+        ));
+    }
+    assert_artifact_from_paper_with_connection(connection, artifact)
+}
+
+fn assert_shadow_candidate_artifact(
+    connection: &Connection,
+    artifact: &Artifact,
+) -> RebuildStoreResult<()> {
+    match artifact_run_purpose(connection, artifact)? {
+        RunPurpose::Paper => Ok(()),
+        RunPurpose::Shadow if artifact.lifecycle != ArtifactLifecycle::Canonical => Ok(()),
+        RunPurpose::Shadow => Err(RebuildStoreError::InvalidLearningCommit(
+            "shadow_pair.candidate_shadow_canonical",
+        )),
+        _ => Err(RebuildStoreError::InvalidLearningCommit(
+            "shadow_pair.candidate_purpose",
+        )),
+    }
+}
+
+fn assert_candidate_decision_binding(
+    connection: &Connection,
+    candidate_decision: &Artifact,
+    completion: &ShadowPairCompletion,
+) -> RebuildStoreResult<()> {
+    let origin =
+        candidate_decision
+            .origin
+            .as_ref()
+            .ok_or(RebuildStoreError::InvalidLearningCommit(
+                "shadow_pair.candidate_origin",
+            ))?;
+    if origin.contract_hash.as_ref() != Some(&completion.candidate_contract_hash) {
+        return Err(RebuildStoreError::InvalidLearningCommit(
+            "shadow_pair.candidate_contract",
+        ));
+    }
+    let run_id = origin
+        .run_id
+        .as_ref()
+        .ok_or(RebuildStoreError::InvalidLearningCommit(
+            "shadow_pair.candidate_run",
+        ))?;
+    let topology_id = connection
+        .query_row(
+            "SELECT topology_id FROM rebuild_runs WHERE run_id = ?1",
+            params![run_id.0],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .ok_or_else(|| RebuildStoreError::MissingRun(run_id.clone()))?;
+    if topology_id != completion.candidate_topology_id {
+        return Err(RebuildStoreError::InvalidLearningCommit(
+            "shadow_pair.candidate_topology",
+        ));
+    }
+    Ok(())
+}
+
+fn outcome_schedule_source_refs(schedule: &OutcomeSchedule) -> Vec<ArtifactRef> {
+    let mut references = vec![
+        schedule.decision.clone(),
+        schedule.decision_context.clone(),
+        schedule.execution_context.clone(),
+    ];
+    match &schedule.execution {
+        OutcomeExecutionLineage::NoOrder { execution_verdict } => {
+            references.push(execution_verdict.clone());
+        }
+        OutcomeExecutionLineage::ReconciledPaper {
+            execution_verdict,
+            commitment,
+            reconciliation,
+        } => {
+            references.push(execution_verdict.clone());
+            references.push(commitment.clone());
+            references.push(reconciliation.clone());
+        }
+    }
+    references
 }
 
 #[allow(clippy::match_like_matches_macro)]
@@ -4587,6 +6050,456 @@ mod tests {
                 on_failure: FailureDisposition::FailRun,
                 parent_task_id: None,
             }],
+        }
+    }
+
+    fn permit_artifact<T: Serialize>(
+        store: &RebuildStore,
+        permit: &TaskWritePermit,
+        kind: ArtifactKind,
+        payload: &T,
+        source_refs: Vec<ArtifactRef>,
+        lifecycle: ArtifactLifecycle,
+        now: DateTime<Utc>,
+    ) -> Artifact {
+        Artifact::new(
+            kind,
+            store.put_json(payload).unwrap(),
+            "fixture.policy",
+            lifecycle,
+            ArtifactProvenance {
+                source_family: "fixture.policy".to_owned(),
+                observed_at: Some(now),
+                retrieved_at: now,
+                source_uri: None,
+                confidence_ppm: 1_000_000,
+                producer_contract_hash: permit.contract_hash.clone(),
+            },
+            Some(ArtifactOrigin {
+                run_id: Some(permit.run_id.clone()),
+                task_id: Some(permit.task_id.clone()),
+                attempt_id: Some(permit.attempt_id.clone()),
+                contract_hash: permit.contract_hash.clone(),
+            }),
+            source_refs,
+            now,
+        )
+        .unwrap()
+    }
+
+    fn artifact_ref(artifact: &Artifact) -> ArtifactRef {
+        ArtifactRef {
+            artifact_id: artifact.artifact_id.clone(),
+            kind: artifact.kind,
+        }
+    }
+
+    struct PolicyCommitFixture {
+        _root: tempfile::TempDir,
+        store: RebuildStore,
+        run: RebuildRun,
+        permit: TaskWritePermit,
+        subject: PolicySubject,
+        outcome: Artifact,
+        experience: Artifact,
+        evaluation: Artifact,
+        candidate_policy: Option<Artifact>,
+        transition: PolicyTransition,
+        seed_artifact_id: ArtifactId,
+        now: DateTime<Utc>,
+    }
+
+    impl PolicyCommitFixture {
+        fn memory() -> Self {
+            Self::new(false)
+        }
+
+        fn topology() -> Self {
+            Self::new(true)
+        }
+
+        fn new(with_candidate: bool) -> Self {
+            let root = tempdir().unwrap();
+            let store = RebuildStore::open(root.path()).unwrap();
+            let now = Utc::now();
+
+            let mut paper_graph = graph();
+            paper_graph.topology_id = "policy-paper".to_owned();
+            let seed = paper_graph.nodes[0].clone();
+            let mut evaluation_node = seed.clone();
+            evaluation_node.task_id = TaskId::new();
+            evaluation_node.dependencies = vec![seed.task_id.clone()];
+            evaluation_node.objective = "evaluate policy".to_owned();
+            paper_graph.nodes = vec![seed, evaluation_node];
+            paper_graph.validate().unwrap();
+            let paper_graph_artifact = artifact(
+                &store,
+                ArtifactKind::WorkflowGraph,
+                &serde_json::to_string(&paper_graph).unwrap(),
+                None,
+            );
+            let paper_graph_ref = artifact_ref(&paper_graph_artifact);
+            let run = RebuildRun {
+                run_id: RunId::new(),
+                purpose: RunPurpose::Paper,
+                topology_id: paper_graph.topology_id.clone(),
+                graph_artifact_id: paper_graph_artifact.artifact_id.clone(),
+                created_at: now,
+            };
+            store
+                .commit_workflow(&WorkflowCommit {
+                    run: run.clone(),
+                    graph: paper_graph_artifact,
+                    nodes: paper_graph.nodes,
+                })
+                .unwrap();
+
+            let seed_permit = store
+                .claim_next_task("policy-seed", now, Duration::seconds(30))
+                .unwrap()
+                .unwrap()
+                .permit;
+            let normalized = permit_artifact(
+                &store,
+                &seed_permit,
+                ArtifactKind::NormalizedEvidence,
+                &serde_json::json!({"normalized": true}),
+                vec![],
+                ArtifactLifecycle::RunScoped,
+                now,
+            );
+            let decision = permit_artifact(
+                &store,
+                &seed_permit,
+                ArtifactKind::Decision,
+                &serde_json::json!({"decision": true}),
+                vec![],
+                ArtifactLifecycle::RunScoped,
+                now,
+            );
+            let decision_context = permit_artifact(
+                &store,
+                &seed_permit,
+                ArtifactKind::DecisionContext,
+                &serde_json::json!({"context": true}),
+                vec![],
+                ArtifactLifecycle::RunScoped,
+                now,
+            );
+            let execution_context = permit_artifact(
+                &store,
+                &seed_permit,
+                ArtifactKind::ExecutionContext,
+                &serde_json::json!({"execution": true}),
+                vec![],
+                ArtifactLifecycle::RunScoped,
+                now,
+            );
+            let verdict_payload = ExecutionVerdict::NoOrder {
+                no_order: akzio_domain::NoOrder {
+                    execution_context: artifact_ref(&execution_context),
+                    blockers: vec![akzio_domain::HardBlocker::Frozen],
+                    created_at: now,
+                },
+            };
+            let verdict = permit_artifact(
+                &store,
+                &seed_permit,
+                ArtifactKind::ExecutionVerdict,
+                &verdict_payload,
+                vec![artifact_ref(&execution_context)],
+                ArtifactLifecycle::RunScoped,
+                now,
+            );
+            let outcome_id = akzio_domain::OutcomeId::new();
+            let schedule_payload = OutcomeSchedule {
+                schema_version: REBUILD_SCHEMA_VERSION,
+                outcome_id: outcome_id.clone(),
+                decision: artifact_ref(&decision),
+                decision_context: artifact_ref(&decision_context),
+                execution_context: artifact_ref(&execution_context),
+                execution: OutcomeExecutionLineage::NoOrder {
+                    execution_verdict: artifact_ref(&verdict),
+                },
+                baseline_trading_day: now.date_naive(),
+                created_at: now,
+            };
+            let schedule = permit_artifact(
+                &store,
+                &seed_permit,
+                ArtifactKind::OutcomeSchedule,
+                &schedule_payload,
+                vec![
+                    schedule_payload.decision.clone(),
+                    schedule_payload.decision_context.clone(),
+                    schedule_payload.execution_context.clone(),
+                    artifact_ref(&verdict),
+                ],
+                ArtifactLifecycle::Canonical,
+                now,
+            );
+            store
+                .commit_attempt(
+                    &seed_permit,
+                    &[
+                        normalized.clone(),
+                        decision.clone(),
+                        decision_context.clone(),
+                        execution_context.clone(),
+                        verdict.clone(),
+                        schedule.clone(),
+                    ],
+                    TaskStatus::Succeeded,
+                    now,
+                )
+                .unwrap();
+
+            let permit = store
+                .claim_next_task("policy-evaluation", now, Duration::seconds(30))
+                .unwrap()
+                .unwrap()
+                .permit;
+
+            let candidate_graph = if with_candidate {
+                let mut candidate_graph = graph();
+                candidate_graph.topology_id = "policy-shadow-candidate".to_owned();
+                let candidate_graph_artifact = artifact(
+                    &store,
+                    ArtifactKind::WorkflowGraph,
+                    &serde_json::to_string(&candidate_graph).unwrap(),
+                    None,
+                );
+                let reference = artifact_ref(&candidate_graph_artifact);
+                let candidate_run = RebuildRun {
+                    run_id: RunId::new(),
+                    purpose: RunPurpose::Shadow,
+                    topology_id: candidate_graph.topology_id.clone(),
+                    graph_artifact_id: candidate_graph_artifact.artifact_id.clone(),
+                    created_at: now,
+                };
+                store
+                    .commit_workflow(&WorkflowCommit {
+                        run: candidate_run,
+                        graph: candidate_graph_artifact,
+                        nodes: candidate_graph.nodes,
+                    })
+                    .unwrap();
+                Some((reference, candidate_graph.topology_id))
+            } else {
+                None
+            };
+            let subject = candidate_graph.as_ref().map_or_else(
+                || PolicySubject::Memory(akzio_domain::MemoryId::new()),
+                |(_, topology_id)| {
+                    PolicySubject::Topology(akzio_domain::TopologyId(topology_id.clone()))
+                },
+            );
+            let from = subject.initial_state();
+            let to = match subject {
+                PolicySubject::Memory(_) => {
+                    PolicyState::Memory(akzio_domain::MemoryLifecycle::Active)
+                }
+                PolicySubject::Topology(_) => {
+                    PolicyState::Topology(akzio_domain::CandidatePolicyState::Canary10)
+                }
+                PolicySubject::Contract(_) => unreachable!(),
+            };
+            let outcome_payload = Outcome {
+                schema_version: REBUILD_SCHEMA_VERSION,
+                outcome_id,
+                schedule: artifact_ref(&schedule),
+                market_evidence: vec![artifact_ref(&normalized)],
+                windows: OutcomeHorizon::ALL
+                    .into_iter()
+                    .map(|horizon| akzio_domain::OutcomeWindow {
+                        horizon,
+                        observed_trading_day: now.date_naive()
+                            + chrono::Days::new(u64::from(horizon.trading_days())),
+                        portfolio_return_ppm: 1,
+                        benchmark_return_ppm: 0,
+                        utility_ppm: 1,
+                        calibration_ppm: 1_000_000,
+                        evidence_completeness_ppm: 1_000_000,
+                        risk_recall_ppm: 1_000_000,
+                    })
+                    .collect(),
+                sealed_at: Some(now),
+            };
+            let outcome = permit_artifact(
+                &store,
+                &permit,
+                ArtifactKind::Outcome,
+                &outcome_payload,
+                vec![artifact_ref(&schedule), artifact_ref(&normalized)],
+                ArtifactLifecycle::Canonical,
+                now,
+            );
+            let experience_payload = Experience {
+                schema_version: REBUILD_SCHEMA_VERSION,
+                experience_id: akzio_domain::ExperienceId::new(),
+                subject: subject.clone(),
+                hypothesis_id: "fixture".to_owned(),
+                decision: artifact_ref(&decision),
+                decision_context: artifact_ref(&decision_context),
+                execution_context: artifact_ref(&execution_context),
+                policy_verdict: artifact_ref(&verdict),
+                outcome: artifact_ref(&outcome),
+                contract_hash: ContentHash::of_bytes(b"fixture-contract"),
+                topology_id: match &subject {
+                    PolicySubject::Topology(topology_id) => topology_id.clone(),
+                    _ => akzio_domain::TopologyId("fixture-topology".to_owned()),
+                },
+                policy_state: from,
+                created_at: now,
+            };
+            let experience = permit_artifact(
+                &store,
+                &permit,
+                ArtifactKind::Experience,
+                &experience_payload,
+                vec![
+                    experience_payload.decision.clone(),
+                    experience_payload.decision_context.clone(),
+                    experience_payload.execution_context.clone(),
+                    experience_payload.policy_verdict.clone(),
+                    experience_payload.outcome.clone(),
+                ],
+                ArtifactLifecycle::Canonical,
+                now,
+            );
+            let evaluation_payload = Evaluation {
+                schema_version: REBUILD_SCHEMA_VERSION,
+                evaluation_id: akzio_domain::EvaluationId::new(),
+                outcome: artifact_ref(&outcome),
+                experience: artifact_ref(&experience),
+                marginal_utility_ppm: 1,
+                token_cost: 1,
+                latency_millis: 1,
+                created_at: now,
+            };
+            let evaluation = permit_artifact(
+                &store,
+                &permit,
+                ArtifactKind::Evaluation,
+                &evaluation_payload,
+                vec![artifact_ref(&outcome), artifact_ref(&experience)],
+                ArtifactLifecycle::Canonical,
+                now,
+            );
+            let candidate_policy = candidate_graph.map(|(candidate, _)| {
+                let payload = CandidatePolicy {
+                    schema_version: REBUILD_SCHEMA_VERSION,
+                    subject: subject.clone(),
+                    baseline: paper_graph_ref,
+                    candidate,
+                    source_evaluation: artifact_ref(&evaluation),
+                    created_at: now,
+                };
+                permit_artifact(
+                    &store,
+                    &permit,
+                    ArtifactKind::CandidatePolicy,
+                    &payload,
+                    vec![
+                        payload.baseline.clone(),
+                        payload.candidate.clone(),
+                        payload.source_evaluation.clone(),
+                    ],
+                    ArtifactLifecycle::Canonical,
+                    now,
+                )
+            });
+            let transition = PolicyTransition {
+                schema_version: REBUILD_SCHEMA_VERSION,
+                transition_id: PolicyTransitionId::new(),
+                subject: subject.clone(),
+                from,
+                to,
+                evaluation: artifact_ref(&evaluation),
+                created_at: now,
+            };
+
+            Self {
+                _root: root,
+                store,
+                run,
+                permit,
+                subject,
+                outcome,
+                experience,
+                evaluation,
+                candidate_policy,
+                transition,
+                seed_artifact_id: decision.artifact_id,
+                now,
+            }
+        }
+
+        fn commit(&self, pair_snapshot: PolicyShadowPairSnapshot) -> PolicyEvaluationCommit {
+            PolicyEvaluationCommit {
+                permit: self.permit.clone(),
+                outcome: self.outcome.clone(),
+                experience: self.experience.clone(),
+                evaluation: self.evaluation.clone(),
+                candidate_policy: self.candidate_policy.clone(),
+                subject: self.subject.clone(),
+                from: self.transition.from,
+                to: self.transition.to,
+                pair_snapshot,
+                transition: Some(self.transition.clone()),
+                completed_at: self.now,
+            }
+        }
+
+        fn insert_pair(
+            &self,
+            label: &str,
+            horizon: OutcomeHorizon,
+            completed_at: DateTime<Utc>,
+        ) -> i64 {
+            let pair_key = ContentHash::of_bytes(label.as_bytes());
+            let mut connection = self.store.connection.lock().unwrap();
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let cursor = append_event(
+                &transaction,
+                &self.run.run_id,
+                Some(&self.permit.task_id),
+                Some(&self.permit.attempt_id),
+                "shadow_pair.completed",
+                Some(&self.seed_artifact_id),
+                completed_at,
+            )
+            .unwrap();
+            transaction
+                .execute(
+                    r#"INSERT INTO rebuild_shadow_pairs
+                       (pair_key, subject_id, subject_json, parent_decision_artifact_id,
+                        execution_context_artifact_id, candidate_decision_artifact_id,
+                        candidate_contract_hash, candidate_topology_id, horizon,
+                        parent_outcome_artifact_id, candidate_outcome_artifact_id,
+                        completed_at, pair_event_cursor)
+                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"#,
+                    params![
+                        pair_key.as_str(),
+                        self.subject.subject_id(),
+                        serde_json::to_string(&self.subject).unwrap(),
+                        self.seed_artifact_id.0.as_str(),
+                        self.seed_artifact_id.0.as_str(),
+                        self.seed_artifact_id.0.as_str(),
+                        ContentHash::of_bytes(b"fixture-candidate-contract").as_str(),
+                        "fixture-candidate-topology",
+                        enum_name(horizon),
+                        self.seed_artifact_id.0.as_str(),
+                        self.seed_artifact_id.0.as_str(),
+                        completed_at.to_rfc3339(),
+                        cursor,
+                    ],
+                )
+                .unwrap();
+            transaction.commit().unwrap();
+            cursor
         }
     }
 
@@ -5865,12 +7778,44 @@ mod tests {
             vec![],
             ArtifactLifecycle::RunScoped,
         );
+        let verdict_payload = ExecutionVerdict::NoOrder {
+            no_order: akzio_domain::NoOrder {
+                execution_context: reference(&execution_context),
+                blockers: vec![akzio_domain::HardBlocker::Frozen],
+                created_at: now,
+            },
+        };
         let verdict = make_artifact(
             &seed_permit,
             ArtifactKind::ExecutionVerdict,
-            serde_json::json!({"verdict": true}),
-            vec![],
+            serde_json::to_value(&verdict_payload).unwrap(),
+            vec![reference(&execution_context)],
             ArtifactLifecycle::RunScoped,
+        );
+        let outcome_id = akzio_domain::OutcomeId::new();
+        let schedule_payload = OutcomeSchedule {
+            schema_version: REBUILD_SCHEMA_VERSION,
+            outcome_id: outcome_id.clone(),
+            decision: reference(&decision),
+            decision_context: reference(&decision_context),
+            execution_context: reference(&execution_context),
+            execution: OutcomeExecutionLineage::NoOrder {
+                execution_verdict: reference(&verdict),
+            },
+            baseline_trading_day: now.date_naive(),
+            created_at: now,
+        };
+        let schedule = make_artifact(
+            &seed_permit,
+            ArtifactKind::OutcomeSchedule,
+            serde_json::to_value(&schedule_payload).unwrap(),
+            vec![
+                schedule_payload.decision.clone(),
+                schedule_payload.decision_context.clone(),
+                schedule_payload.execution_context.clone(),
+                reference(&verdict),
+            ],
+            ArtifactLifecycle::Canonical,
         );
         store
             .commit_attempt(
@@ -5882,6 +7827,7 @@ mod tests {
                     decision.clone(),
                     decision_context.clone(),
                     verdict.clone(),
+                    schedule.clone(),
                 ],
                 TaskStatus::Succeeded,
                 now,
@@ -5897,8 +7843,8 @@ mod tests {
         let evidence_ref = reference(&normalized);
         let outcome_payload = Outcome {
             schema_version: REBUILD_SCHEMA_VERSION,
-            outcome_id: akzio_domain::OutcomeId::new(),
-            execution_context: execution_ref.clone(),
+            outcome_id,
+            schedule: reference(&schedule),
             market_evidence: vec![evidence_ref.clone()],
             windows: [
                 akzio_domain::OutcomeHorizon::T1,
@@ -5908,6 +7854,8 @@ mod tests {
             .into_iter()
             .map(|horizon| akzio_domain::OutcomeWindow {
                 horizon,
+                observed_trading_day: now.date_naive()
+                    + chrono::Days::new(u64::from(horizon.trading_days())),
                 portfolio_return_ppm: 1,
                 benchmark_return_ppm: 0,
                 utility_ppm: 1,
@@ -5922,13 +7870,15 @@ mod tests {
             &evaluation_permit,
             ArtifactKind::Outcome,
             serde_json::to_value(&outcome_payload).unwrap(),
-            vec![execution_ref.clone(), evidence_ref],
+            vec![reference(&schedule), evidence_ref],
             ArtifactLifecycle::Canonical,
         );
         let outcome_ref = reference(&outcome);
+        let subject = PolicySubject::Memory(akzio_domain::MemoryId::new());
         let experience_payload = Experience {
             schema_version: REBUILD_SCHEMA_VERSION,
             experience_id: akzio_domain::ExperienceId::new(),
+            subject: subject.clone(),
             hypothesis_id: "fixture".to_owned(),
             decision: reference(&decision),
             decision_context: reference(&decision_context),
@@ -5937,7 +7887,7 @@ mod tests {
             outcome: outcome_ref.clone(),
             contract_hash: ContentHash::of_bytes(b"fixture-contract"),
             topology_id: akzio_domain::TopologyId("fixture-topology".to_owned()),
-            lifecycle: akzio_domain::MemoryLifecycle::Candidate,
+            policy_state: PolicyState::Memory(akzio_domain::MemoryLifecycle::Candidate),
             created_at: now,
         };
         let experience = make_artifact(
@@ -5971,21 +7921,26 @@ mod tests {
             vec![outcome_ref, experience_ref],
             ArtifactLifecycle::Canonical,
         );
-        let subject_id = "contract:fixture-contract".to_owned();
-        let commit = PolicyTransitionCommit {
+        let pair_snapshot = store.policy_shadow_pair_snapshot(&subject).unwrap();
+        let commit = PolicyEvaluationCommit {
             permit: evaluation_permit,
             outcome: outcome.clone(),
             experience,
             evaluation: evaluation.clone(),
-            transition: PolicyTransition {
+            candidate_policy: None,
+            subject: subject.clone(),
+            from: PolicyState::Memory(akzio_domain::MemoryLifecycle::Candidate),
+            to: PolicyState::Memory(akzio_domain::MemoryLifecycle::Active),
+            pair_snapshot,
+            transition: Some(PolicyTransition {
                 schema_version: REBUILD_SCHEMA_VERSION,
                 transition_id: PolicyTransitionId::new(),
-                subject_id: subject_id.clone(),
-                from: PolicyState::Contract(akzio_domain::CandidatePolicyState::Candidate),
-                to: PolicyState::Contract(akzio_domain::CandidatePolicyState::Canary10),
+                subject: subject.clone(),
+                from: PolicyState::Memory(akzio_domain::MemoryLifecycle::Candidate),
+                to: PolicyState::Memory(akzio_domain::MemoryLifecycle::Active),
                 evaluation: reference(&evaluation),
                 created_at: now,
-            },
+            }),
             completed_at: now,
         };
         {
@@ -5998,17 +7953,18 @@ mod tests {
                 )
                 .unwrap();
         }
-        assert!(matches!(
-            store.record_policy_transition(&commit),
-            Err(RebuildStoreError::Sql(_))
-        ));
+        let failed = store.record_policy_evaluation(&commit);
+        assert!(
+            matches!(&failed, Err(RebuildStoreError::Sql(_))),
+            "unexpected policy transition result: {failed:?}"
+        );
         {
             let connection = store.connection.lock().unwrap();
             connection
                 .execute_batch("DROP TRIGGER fail_policy_event;")
                 .unwrap();
         }
-        assert!(store.policy_head(&subject_id).unwrap().is_none());
+        assert!(store.policy_head(&subject).unwrap().is_none());
         assert!(matches!(
             store.artifact(&outcome.artifact_id),
             Err(RebuildStoreError::MissingArtifact(_))
@@ -6019,11 +7975,239 @@ mod tests {
             .iter()
             .all(|event| event.event_type != "policy.transitioned"));
 
-        assert!(matches!(
-            store.record_policy_transition(&commit).unwrap(),
-            PolicyTransitionResult::Applied(_)
-        ));
-        assert_eq!(store.policy_transitions(&subject_id).unwrap().len(), 1);
+        let recorded = store.record_policy_evaluation(&commit).unwrap();
+        assert!(recorded.newly_recorded);
+        assert!(recorded.policy_head.is_some());
+        assert_eq!(store.policy_transitions(&subject).unwrap().len(), 1);
         store.verify_integrity().unwrap();
+
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE rebuild_policy_consumption_heads \
+                 SET consumed_pair_cursor = 999 WHERE subject_id = ?1",
+                params![subject.subject_id()],
+            )
+            .unwrap();
+        let corrupted = store.verify_integrity();
+        assert!(
+            matches!(&corrupted, Err(RebuildStoreError::Integrity(_))),
+            "unexpected Doctor result after policy cursor corruption: {corrupted:?}"
+        );
+    }
+
+    #[test]
+    fn generic_learning_artifacts_require_specialized_atomic_apis() {
+        let fixture = PolicyCommitFixture::memory();
+        let candidate_policy = permit_artifact(
+            &fixture.store,
+            &fixture.permit,
+            ArtifactKind::CandidatePolicy,
+            &serde_json::json!({"candidate": true}),
+            vec![],
+            ArtifactLifecycle::Canonical,
+            fixture.now,
+        );
+
+        for protected in [
+            fixture.outcome.clone(),
+            fixture.experience.clone(),
+            fixture.evaluation.clone(),
+            candidate_policy,
+        ] {
+            assert!(matches!(
+                fixture.store.write_task_artifact(
+                    &fixture.permit,
+                    &protected,
+                    "fixture.generic_write",
+                    fixture.now,
+                ),
+                Err(RebuildStoreError::InvalidLearningCommit(
+                    "learning_artifact.atomic_commit_required"
+                ))
+            ));
+            assert!(matches!(
+                fixture.store.commit_attempt(
+                    &fixture.permit,
+                    &[protected],
+                    TaskStatus::Succeeded,
+                    fixture.now,
+                ),
+                Err(RebuildStoreError::InvalidLearningCommit(
+                    "learning_artifact.atomic_commit_required"
+                ))
+            ));
+        }
+    }
+
+    #[test]
+    fn old_v7_policy_evaluation_shape_is_rejected() {
+        let root = tempdir().unwrap();
+        let database = root.path().join(DATABASE_FILE);
+        let connection = Connection::open(database).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE rebuild_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO rebuild_metadata (key, value) VALUES ('schema_version', '7');
+                 CREATE TABLE rebuild_policy_evaluations (
+                    evaluation_artifact_id TEXT PRIMARY KEY,
+                    subject_id TEXT NOT NULL,
+                    outcome_artifact_id TEXT NOT NULL,
+                    experience_artifact_id TEXT NOT NULL
+                 );",
+            )
+            .unwrap();
+        drop(connection);
+
+        assert!(matches!(
+            RebuildStore::open(root.path()),
+            Err(RebuildStoreError::IncompatibleStoreRoot(path)) if path == root.path()
+        ));
+    }
+
+    #[test]
+    fn policy_snapshot_does_not_consume_pairs_completed_after_cutoff() {
+        let fixture = PolicyCommitFixture::memory();
+        let first_cursor =
+            fixture.insert_pair("snapshot-before-cutoff", OutcomeHorizon::T1, fixture.now);
+        let snapshot = fixture
+            .store
+            .policy_shadow_pair_snapshot(&fixture.subject)
+            .unwrap();
+        assert_eq!(snapshot.through_cursor, first_cursor);
+        assert_eq!(snapshot.counts_by_horizon, [1, 0, 0]);
+
+        let second_cursor = fixture.insert_pair(
+            "snapshot-after-cutoff",
+            OutcomeHorizon::T3,
+            fixture.now + Duration::seconds(1),
+        );
+        let recorded = fixture
+            .store
+            .record_policy_evaluation(&fixture.commit(snapshot))
+            .unwrap();
+        assert_eq!(recorded.consumed_pair_cursor, first_cursor);
+
+        let remaining = fixture
+            .store
+            .policy_shadow_pair_snapshot(&fixture.subject)
+            .unwrap();
+        assert_eq!(remaining.after_cursor, first_cursor);
+        assert_eq!(remaining.through_cursor, second_cursor);
+        assert_eq!(remaining.counts_by_horizon, [0, 1, 0]);
+    }
+
+    #[test]
+    fn doctor_rejects_candidate_reverse_binding_corruption() {
+        let fixture = PolicyCommitFixture::topology();
+        let commit = fixture.commit(
+            fixture
+                .store
+                .policy_shadow_pair_snapshot(&fixture.subject)
+                .unwrap(),
+        );
+        fixture.store.record_policy_evaluation(&commit).unwrap();
+        fixture.store.verify_integrity().unwrap();
+
+        let original = commit.candidate_policy.as_ref().unwrap();
+        let forged = Artifact::new(
+            ArtifactKind::CandidatePolicy,
+            original.blob.clone(),
+            "fixture.policy.reverse-corruption",
+            ArtifactLifecycle::Canonical,
+            original.provenance.clone(),
+            original.origin.clone(),
+            original.source_refs.clone(),
+            original.created_at + Duration::microseconds(1),
+        )
+        .unwrap();
+        {
+            let mut connection = fixture.store.connection.lock().unwrap();
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            insert_artifact(&transaction, &forged).unwrap();
+            transaction
+                .execute(
+                    "UPDATE rebuild_policy_evaluations
+                     SET candidate_policy_artifact_id = ?1
+                     WHERE evaluation_artifact_id = ?2",
+                    params![
+                        forged.artifact_id.0.as_str(),
+                        fixture.evaluation.artifact_id.0.as_str(),
+                    ],
+                )
+                .unwrap();
+            transaction.commit().unwrap();
+        }
+
+        match fixture.store.verify_integrity() {
+            Err(RebuildStoreError::Integrity(_)) => {}
+            other => panic!("unexpected Doctor result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn doctor_rejects_stale_policy_head() {
+        let fixture = PolicyCommitFixture::memory();
+        let commit = fixture.commit(
+            fixture
+                .store
+                .policy_shadow_pair_snapshot(&fixture.subject)
+                .unwrap(),
+        );
+        fixture.store.record_policy_evaluation(&commit).unwrap();
+        fixture.store.verify_integrity().unwrap();
+
+        let stale_transition = PolicyTransition {
+            transition_id: PolicyTransitionId::new(),
+            created_at: fixture.now + Duration::seconds(1),
+            ..fixture.transition.clone()
+        };
+        {
+            let mut connection = fixture.store.connection.lock().unwrap();
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let event_cursor = append_event(
+                &transaction,
+                &fixture.run.run_id,
+                Some(&fixture.permit.task_id),
+                Some(&fixture.permit.attempt_id),
+                "policy.transitioned",
+                Some(&fixture.evaluation.artifact_id),
+                stale_transition.created_at,
+            )
+            .unwrap();
+            transaction
+                .execute(
+                    r#"INSERT INTO rebuild_policy_transitions
+                       (transition_id, subject_id, subject_json, from_state_json, to_state_json,
+                        evaluation_artifact_id, run_id, revision, created_at, event_cursor)
+                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"#,
+                    params![
+                        stale_transition.transition_id.0,
+                        fixture.subject.subject_id(),
+                        serde_json::to_string(&fixture.subject).unwrap(),
+                        serde_json::to_string(&stale_transition.from).unwrap(),
+                        serde_json::to_string(&stale_transition.to).unwrap(),
+                        fixture.evaluation.artifact_id.0.as_str(),
+                        fixture.run.run_id.0,
+                        2_u64,
+                        stale_transition.created_at.to_rfc3339(),
+                        event_cursor,
+                    ],
+                )
+                .unwrap();
+            transaction.commit().unwrap();
+        }
+
+        let corrupted = fixture.store.verify_integrity();
+        assert!(matches!(
+            &corrupted,
+            Err(RebuildStoreError::Integrity(message)) if message.contains("stale")
+        ));
     }
 }

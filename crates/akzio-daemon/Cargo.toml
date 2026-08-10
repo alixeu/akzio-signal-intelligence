@@ -9,7 +9,6 @@ publish.workspace = true
 akzio-domain = { path = "../akzio-domain" }
 akzio-execution = { path = "../akzio-execution" }
 akzio-ingest = { path = "../akzio-ingest" }
-akzio-learning = { path = "../akzio-learning" }
 akzio-context = { path = "../akzio-context" }
 akzio-model = { path = "../akzio-model" }
 akzio-research = { path = "../akzio-research" }

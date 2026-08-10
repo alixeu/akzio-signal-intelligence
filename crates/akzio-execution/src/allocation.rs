@@ -107,6 +107,7 @@ mod tests {
             }],
             critiques: vec![],
             evidence: vec![],
+            policy_influences: vec![],
             material_conflicts: vec![],
             hard_blockers: blockers,
             soft_warnings: vec![],

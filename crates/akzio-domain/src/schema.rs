@@ -20,7 +20,7 @@ use crate::{
 
 /// A Store Root with this schema is intentionally incompatible with the previous
 /// v2 database. It is a rebuild, not a migration layer.
-pub const REBUILD_SCHEMA_VERSION: u32 = 6;
+pub const REBUILD_SCHEMA_VERSION: u32 = 7;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -66,6 +66,7 @@ pub enum ArtifactKind {
     ExecutionReprice,
     OrderReceipt,
     Reconciliation,
+    OutcomeSchedule,
     Experience,
     Outcome,
     Evaluation,
@@ -99,6 +100,7 @@ impl ArtifactKind {
                 | Self::ExecutionReprice
                 | Self::OrderReceipt
                 | Self::Reconciliation
+                | Self::OutcomeSchedule
                 | Self::Experience
                 | Self::Outcome
                 | Self::Evaluation

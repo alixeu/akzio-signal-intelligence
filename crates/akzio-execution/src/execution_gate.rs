@@ -9,8 +9,9 @@ use std::collections::BTreeSet;
 
 use akzio_domain::{
     Artifact, ArtifactKind, ArtifactLifecycle, ArtifactOrigin, ArtifactProvenance, ArtifactRef,
-    DecisionContext, DomainError, ExecutionContext, ExecutionVerdict, FactorExposure, FreezeState,
-    HardBlocker, NoOrder, RunPurpose, TaskStatus, TaskWritePermit,
+    CandidatePolicy, ContextManifestPayload, DecisionContext, DomainError, ExecutionContext,
+    ExecutionVerdict, Experience, FactorExposure, FreezeState, HardBlocker, NoOrder, PolicySubject,
+    RunPurpose, TaskStatus, TaskWritePermit,
 };
 use akzio_store::v2::{StoreError, V2Store};
 use chrono::{DateTime, Utc};
@@ -41,6 +42,12 @@ pub type ExecutionGateResult<T> = std::result::Result<T, ExecutionGateError>;
 
 /// Rust-supplied gate inputs. Freshness and market state originate from the
 /// trusted adapter/scheduler, never a model turn.
+fn invalid_policy_influence() -> ExecutionGateError {
+    ExecutionGateError::Domain(DomainError::EmptyField {
+        field: "decision_context.policy_influences",
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct ExecutionGateInput {
     pub permit: TaskWritePermit,
@@ -293,6 +300,7 @@ impl V2ExecutionRuntime {
             .iter()
             .chain(decision.critiques.iter())
             .chain(decision.evidence.iter())
+            .chain(decision.policy_influences.iter())
             .chain(
                 decision
                     .material_conflicts
@@ -312,7 +320,113 @@ impl V2ExecutionRuntime {
                 }));
             }
         }
+        self.validate_policy_influences(artifact, decision)
+    }
+
+    fn validate_policy_influences(
+        &self,
+        decision_artifact: &Artifact,
+        decision: &DecisionContext,
+    ) -> ExecutionGateResult<()> {
+        if decision.policy_influences.is_empty() {
+            return Ok(());
+        }
+        let manifest_refs = decision_artifact
+            .source_refs
+            .iter()
+            .filter(|reference| reference.kind == ArtifactKind::ContextManifest)
+            .collect::<Vec<_>>();
+        if manifest_refs.len() != 1 {
+            return Err(invalid_policy_influence());
+        }
+        let manifest = self.store.artifact(&manifest_refs[0].artifact_id)?;
+        if manifest.kind != ArtifactKind::ContextManifest
+            || manifest
+                .origin
+                .as_ref()
+                .and_then(|origin| origin.run_id.as_ref())
+                != Some(&decision.run_id)
+        {
+            return Err(invalid_policy_influence());
+        }
+        let payload: ContextManifestPayload =
+            serde_json::from_slice(&self.store.read_blob(&manifest.blob)?)?;
+        let selected = payload
+            .selections
+            .iter()
+            .map(|selection| selection.artifact.clone())
+            .collect::<BTreeSet<_>>();
+        let declared = manifest
+            .source_refs
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if selected != declared
+            || decision
+                .policy_influences
+                .iter()
+                .any(|reference| !selected.contains(reference))
+        {
+            return Err(invalid_policy_influence());
+        }
+
+        for reference in &decision.policy_influences {
+            let influence = self.store.artifact(&reference.artifact_id)?;
+            if influence.kind != reference.kind || !self.is_canonical_paper(&influence)? {
+                return Err(invalid_policy_influence());
+            }
+            let subject: PolicySubject = match reference.kind {
+                ArtifactKind::Experience => {
+                    let experience: Experience =
+                        serde_json::from_slice(&self.store.read_blob(&influence.blob)?)?;
+                    experience.validate()?;
+                    experience.subject
+                }
+                ArtifactKind::CandidatePolicy => {
+                    let policy: CandidatePolicy =
+                        serde_json::from_slice(&self.store.read_blob(&influence.blob)?)?;
+                    policy.validate()?;
+                    let evaluation = self.store.artifact(&policy.source_evaluation.artifact_id)?;
+                    if evaluation.kind != ArtifactKind::Evaluation
+                        || !self.is_canonical_paper(&evaluation)?
+                    {
+                        return Err(invalid_policy_influence());
+                    }
+                    policy.subject
+                }
+                _ => return Err(invalid_policy_influence()),
+            };
+            if self
+                .store
+                .recorded_policy_influence_subject(&reference.artifact_id)?
+                .as_ref()
+                != Some(&subject)
+            {
+                return Err(invalid_policy_influence());
+            }
+            let head = self
+                .store
+                .policy_head(&subject)?
+                .ok_or_else(invalid_policy_influence)?;
+            if !head.state.permits_influence_kind(reference.kind) {
+                return Err(invalid_policy_influence());
+            }
+        }
         Ok(())
+    }
+
+    fn is_canonical_paper(&self, artifact: &Artifact) -> ExecutionGateResult<bool> {
+        if artifact.lifecycle != ArtifactLifecycle::Canonical {
+            return Ok(false);
+        }
+        let Some(run_id) = artifact
+            .origin
+            .as_ref()
+            .and_then(|origin| origin.run_id.as_ref())
+        else {
+            return Ok(false);
+        };
+        Ok(self.store.run_purpose(run_id)? == RunPurpose::Paper)
     }
 
     fn frozen(&self) -> ExecutionGateResult<bool> {
@@ -563,6 +677,7 @@ mod tests {
             claims: vec![claim_ref.clone()],
             critiques: vec![],
             evidence: vec![account_ref.clone(), quote_ref.clone()],
+            policy_influences: vec![],
             material_conflicts: vec![],
             hard_blockers,
             soft_warnings: Vec::<SoftWarning>::new(),
@@ -719,6 +834,54 @@ mod tests {
             store.artifact(&output.verdict.artifact_id).unwrap().kind,
             ArtifactKind::ExecutionVerdict
         );
+    }
+
+    #[test]
+    fn policy_influence_without_context_manifest_is_rejected() {
+        let directory = tempdir().unwrap();
+        let store = V2Store::open(directory.path()).unwrap();
+        let now = Utc::now();
+        let runtime = V2ExecutionRuntime::new(store.clone(), policy(100)).unwrap();
+        let forged_ref = ArtifactRef {
+            artifact_id: akzio_domain::ArtifactId(akzio_domain::ContentHash::of_bytes(
+                b"unrecorded-experience",
+            )),
+            kind: ArtifactKind::Experience,
+        };
+        let decision = DecisionContext {
+            schema_version: REBUILD_SCHEMA_VERSION,
+            decision_id: DecisionId::new(),
+            run_id: RunId::new(),
+            claims: vec![],
+            critiques: vec![],
+            evidence: vec![],
+            policy_influences: vec![forged_ref.clone()],
+            material_conflicts: vec![],
+            hard_blockers: vec![],
+            soft_warnings: vec![],
+            target: TargetPortfolio::zeroed(),
+            created_at: now,
+        };
+        let decision_artifact = Artifact::new(
+            ArtifactKind::DecisionContext,
+            store.put_json(&decision).unwrap(),
+            "fixture.unrecorded_policy_influence",
+            ArtifactLifecycle::RunScoped,
+            provenance(now),
+            None,
+            vec![forged_ref],
+            now,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            runtime
+                .validate_policy_influences(&decision_artifact, &decision)
+                .unwrap_err(),
+            ExecutionGateError::Domain(DomainError::EmptyField {
+                field: "decision_context.policy_influences"
+            })
+        ));
     }
 
     #[test]

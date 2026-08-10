@@ -213,11 +213,19 @@ impl Daemon {
     /// The R5 daemon does not construct one directly, so this public submit
     /// surface rejects Paper before any workflow or broker side effect.
     pub fn submit_default(&self, purpose: RunPurpose) -> Result<RunId> {
-        if purpose == RunPurpose::Paper {
-            return Err(DaemonError::InvalidInput(
-                "Paper runs are scheduler-owned and unavailable until the fenced scheduler is wired"
-                    .to_owned(),
-            ));
+        match purpose {
+            RunPurpose::Debug | RunPurpose::PaperDryRun => {}
+            RunPurpose::Paper => {
+                return Err(DaemonError::InvalidInput(
+                    "Paper runs are scheduler-owned and unavailable until the fenced scheduler is wired"
+                        .to_owned(),
+                ));
+            }
+            RunPurpose::Replay | RunPurpose::Shadow => {
+                return Err(DaemonError::InvalidInput(
+                    "Replay and Shadow runs must be created by their owning runtimes".to_owned(),
+                ));
+            }
         }
 
         let run_id = RunId::new();
@@ -941,6 +949,43 @@ mod tests {
                 run_id: RunId::new(),
             }),
             Err(DaemonError::Unavailable(_))
+        ));
+    }
+
+    #[test]
+    fn direct_submit_allows_only_debug_and_paper_dry_run() {
+        let directory = tempdir().unwrap();
+        let daemon = Daemon::with_model(
+            config(directory.path().to_path_buf()),
+            fixture_model_client(),
+        )
+        .unwrap();
+
+        for purpose in [RunPurpose::Paper, RunPurpose::Replay, RunPurpose::Shadow] {
+            assert!(matches!(
+                daemon.submit_default(purpose),
+                Err(DaemonError::InvalidInput(_))
+            ));
+        }
+
+        assert!(daemon.submit_default(RunPurpose::Debug).is_ok());
+        assert!(daemon.submit_default(RunPurpose::PaperDryRun).is_ok());
+    }
+
+    #[test]
+    fn json_submit_rejects_replay_before_workflow_creation() {
+        let directory = tempdir().unwrap();
+        let daemon = Daemon::with_model(
+            config(directory.path().to_path_buf()),
+            fixture_model_client(),
+        )
+        .unwrap();
+        let command: DaemonCommand =
+            serde_json::from_str(r#"{"command":"submit","purpose":"replay"}"#).unwrap();
+
+        assert!(matches!(
+            daemon.handle(command),
+            Err(DaemonError::InvalidInput(_))
         ));
     }
 }

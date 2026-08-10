@@ -6,11 +6,11 @@
 
 pub use crate::store_v2::{
     ClaimedRebuildTask as ClaimedAttempt, DaemonLease, ExecutionCommit, ExecutionCommitResult,
-    PolicyHead, PolicyTransitionCommit, PolicyTransitionRecord, PolicyTransitionResult,
-    RebuildRun as StoredRun, RebuildStore as V2Store, RebuildStoreError as StoreError,
-    RebuildStoreResult as Result, RebuildTask as StoredTask, RepriceCommit, RepriceCommitResult,
-    RetryTaskResult, SessionReservation, SessionSlot, SessionSlotReservation, ShadowPairCompletion,
-    ShadowPairWriteResult, StoredActiveAttempt, StoredRebuildEvent as StoredEvent,
-    StoredShadowPair, StoredTaskSnapshot, WorkflowCommit, WorkflowPatchCommit, WorkflowRevision,
-    WorkflowSnapshot,
+    PolicyEvaluationCommit, PolicyEvaluationResult, PolicyHead, PolicyShadowPairSnapshot,
+    PolicyTransitionRecord, RebuildRun as StoredRun, RebuildStore as V2Store,
+    RebuildStoreError as StoreError, RebuildStoreResult as Result, RebuildTask as StoredTask,
+    RepriceCommit, RepriceCommitResult, RetryTaskResult, SessionReservation, SessionSlot,
+    SessionSlotReservation, ShadowPairCompletion, ShadowPairWriteResult, StoredActiveAttempt,
+    StoredRebuildEvent as StoredEvent, StoredShadowPair, StoredTaskSnapshot, WorkflowCommit,
+    WorkflowPatchCommit, WorkflowRevision, WorkflowSnapshot,
 };

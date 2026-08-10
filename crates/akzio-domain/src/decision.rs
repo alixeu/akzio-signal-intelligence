@@ -74,6 +74,7 @@ pub struct DecisionContext {
     pub claims: Vec<ArtifactRef>,
     pub critiques: Vec<ArtifactRef>,
     pub evidence: Vec<ArtifactRef>,
+    pub policy_influences: Vec<ArtifactRef>,
     pub material_conflicts: Vec<MaterialConflict>,
     pub hard_blockers: Vec<HardBlocker>,
     pub soft_warnings: Vec<SoftWarning>,
@@ -109,6 +110,12 @@ impl DecisionContext {
                 !matches!(
                     reference.kind,
                     ArtifactKind::NormalizedEvidence | ArtifactKind::SemanticDetail
+                )
+            })
+            || self.policy_influences.iter().any(|reference| {
+                !matches!(
+                    reference.kind,
+                    ArtifactKind::Experience | ArtifactKind::CandidatePolicy
                 )
             })
         {
@@ -261,6 +268,7 @@ mod tests {
             claims: vec![],
             critiques: vec![],
             evidence: vec![],
+            policy_influences: vec![],
             material_conflicts: vec![],
             hard_blockers: vec![HardBlocker::Frozen],
             soft_warnings: vec![],
@@ -270,6 +278,28 @@ mod tests {
 
         context.validate().unwrap();
         assert!(!context.accepted());
+    }
+
+    #[test]
+    fn decision_context_accepts_only_learning_policy_influences() {
+        let mut context = DecisionContext {
+            schema_version: crate::V2_DOMAIN_SCHEMA_VERSION,
+            decision_id: DecisionId::new(),
+            run_id: RunId::new(),
+            claims: vec![],
+            critiques: vec![],
+            evidence: vec![],
+            policy_influences: vec![reference(ArtifactKind::Experience, b"experience")],
+            material_conflicts: vec![],
+            hard_blockers: vec![HardBlocker::Frozen],
+            soft_warnings: vec![],
+            target: TargetPortfolio::zeroed(),
+            created_at: Utc::now(),
+        };
+        context.validate().unwrap();
+
+        context.policy_influences = vec![reference(ArtifactKind::Claim, b"claim")];
+        assert!(context.validate().is_err());
     }
 
     #[test]

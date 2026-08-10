@@ -545,6 +545,7 @@ pub enum RunPurpose {
     Debug,
     Paper,
     PaperDryRun,
+    Replay,
     Shadow,
 }
 
@@ -909,6 +910,23 @@ mod tests {
         assert_eq!(Asset::EXECUTABLE.len(), 4);
         assert_eq!(Asset::try_from("SOXL").unwrap(), Asset::Soxl);
         assert!(Asset::try_from("VIX").is_err());
+    }
+
+    #[test]
+    fn only_paper_runs_are_canonical_learning() {
+        assert!(RunPurpose::Paper.is_canonical_learning());
+        for purpose in [
+            RunPurpose::Debug,
+            RunPurpose::Replay,
+            RunPurpose::PaperDryRun,
+            RunPurpose::Shadow,
+        ] {
+            assert!(!purpose.is_canonical_learning());
+        }
+        assert_eq!(
+            serde_json::to_string(&RunPurpose::Replay).unwrap(),
+            "\"replay\""
+        );
     }
 
     #[test]
