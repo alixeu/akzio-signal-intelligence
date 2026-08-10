@@ -14,18 +14,18 @@ use std::{
     time::Duration as StdDuration,
 };
 
-use akzio_context::ContextError;
+use akzio_context::legacy::ContextError;
 use akzio_domain::{DocumentKind, RunId, RunPurpose, WorkflowPlan};
 use akzio_execution::{
     paper::{AlpacaPaper, PaperError},
     ExecutionRuntimeError,
 };
-use akzio_ingest::IngestError;
+use akzio_ingest::legacy::IngestError;
 use akzio_learning::{LedgerError, TopologyLedger, TopologyState};
 use akzio_model::{ModelClient, ModelError};
-use akzio_research::{baseline_topology, bootstrap_workflow, ContractRegistry};
-use akzio_runtime::{CompiledWorkflow, RuntimeError, TaskRuntime, WorkflowRuntime};
-use akzio_store::{DaemonLease, StoreError, StoredEvent, V2Store};
+use akzio_research::legacy::{baseline_topology, bootstrap_workflow, ContractRegistry};
+use akzio_runtime::legacy::{CompiledWorkflow, RuntimeError, TaskRuntime, WorkflowRuntime};
+use akzio_store::legacy::{DaemonLease, StoreError, StoredEvent, V2Store};
 use async_stream::stream;
 use axum::{
     extract::{Path, Query, State},
@@ -52,7 +52,7 @@ pub enum DaemonError {
     #[error(transparent)]
     Context(#[from] ContextError),
     #[error(transparent)]
-    Research(#[from] akzio_research::ResearchError),
+    Research(#[from] akzio_research::legacy::ResearchError),
     #[error(transparent)]
     Model(#[from] ModelError),
     #[error(transparent)]
@@ -182,7 +182,7 @@ impl Daemon {
     pub fn with_model(config: DaemonConfig, model: ModelClient) -> Result<Self> {
         let store = V2Store::open(config.store_root)?;
         let contracts = ContractRegistry::install(
-            &akzio_context::ContextBroker::new(store.clone()),
+            &akzio_context::legacy::ContextBroker::new(store.clone()),
             Utc::now(),
         )?;
         Ok(Self {
@@ -218,8 +218,8 @@ impl Daemon {
 
     fn default_plan(&self, run_id: &RunId, purpose: RunPurpose) -> Result<WorkflowPlan> {
         let baseline = baseline_topology();
-        let broker = akzio_context::ContextBroker::new(self.store.clone());
-        let topology = if matches!(purpose, RunPurpose::Paper | RunPurpose::PaperDryRun) {
+        let broker = akzio_context::legacy::ContextBroker::new(self.store.clone());
+        let topology = if purpose == RunPurpose::Paper {
             TopologyLedger::new(broker.clone()).topology_for_run(run_id, baseline.clone())?
         } else {
             baseline.clone()
@@ -238,14 +238,16 @@ impl Daemon {
         plan: &WorkflowPlan,
         now: chrono::DateTime<Utc>,
     ) -> Result<()> {
-        if matches!(purpose, RunPurpose::Paper | RunPurpose::PaperDryRun) {
+        if purpose == RunPurpose::Paper {
             let state = if plan.topology_id == baseline_topology() {
                 TopologyState::Active
             } else {
                 TopologyState::Candidate
             };
-            TopologyLedger::new(akzio_context::ContextBroker::new(self.store.clone()))
-                .ensure_topology(run_id, plan.topology_id.clone(), state, now)?;
+            TopologyLedger::new(akzio_context::legacy::ContextBroker::new(
+                self.store.clone(),
+            ))
+            .ensure_topology(run_id, plan.topology_id.clone(), state, now)?;
         }
         Ok(())
     }
@@ -834,6 +836,36 @@ mod tests {
             panic!("expected events");
         };
         assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn paper_dry_run_never_creates_canonical_topology_state() {
+        let (_directory, daemon) = daemon();
+        let topology_state_count = || {
+            daemon
+                .store()
+                .documents_by_kind(DocumentKind::Evaluation)
+                .unwrap()
+                .into_iter()
+                .filter(|document| document.producer == "learning.topology_state")
+                .count()
+        };
+
+        let before = topology_state_count();
+        let plan = daemon
+            .default_plan(&RunId::new(), RunPurpose::PaperDryRun)
+            .unwrap();
+        assert_eq!(plan.topology_id, baseline_topology());
+        assert_eq!(topology_state_count(), before);
+
+        let run_id = daemon.submit_default(RunPurpose::PaperDryRun).unwrap();
+        assert_eq!(topology_state_count(), before);
+        assert!(daemon
+            .store()
+            .documents_for_run(&run_id)
+            .unwrap()
+            .into_iter()
+            .all(|document| document.producer != "learning.topology_state"));
     }
 
     #[test]

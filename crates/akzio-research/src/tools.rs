@@ -5,10 +5,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use akzio_context::{ContextBroker, NewJsonDocument};
+use akzio_context::legacy::{ContextBroker, ContextError, NewJsonDocument};
 use akzio_domain::{
-    AgentContract, AttemptId, ContentHash, DocumentId, DocumentKind, DocumentLifecycle,
-    DocumentOrigin, DocumentRecord, EventEnvelope, RunId, TaskId, ToolGrant, ToolKind,
+    AttemptId, ContentHash, DocumentId, DocumentKind, DocumentLifecycle, DocumentOrigin,
+    DocumentRecord, EventEnvelope, LegacyAgentContract, RunId, TaskId, ToolGrant, ToolKind,
     V2_SCHEMA_VERSION,
 };
 use akzio_model::{ModelToolCall, ModelToolDefinition};
@@ -59,11 +59,10 @@ impl SourceRegistry {
     }
 
     fn permits(&self, grant: &ToolGrant, source: &str, needs_raw: bool) -> bool {
-        let names: BTreeSet<_> = if grant.allowed_sources.is_empty() {
-            self.rules.keys().cloned().collect()
-        } else {
-            grant.allowed_sources.iter().cloned().collect()
-        };
+        if grant.allowed_sources.is_empty() {
+            return false;
+        }
+        let names: BTreeSet<_> = grant.allowed_sources.iter().cloned().collect();
         names.into_iter().any(|name| {
             self.rules.get(&name).is_some_and(|rule| {
                 (!needs_raw || rule.allow_raw)
@@ -100,9 +99,9 @@ pub struct ToolExecution {
 #[derive(Debug, Error)]
 pub enum ToolError {
     #[error(transparent)]
-    Context(#[from] akzio_context::ContextError),
+    Context(#[from] ContextError),
     #[error(transparent)]
-    Store(#[from] akzio_store::StoreError),
+    Store(#[from] akzio_store::legacy::StoreError),
     #[error("unknown tool {0}")]
     UnknownTool(String),
     #[error("contract does not grant {0:?}")]
@@ -111,6 +110,12 @@ pub enum ToolError {
     MissingDocumentId,
     #[error("tool argument document_id is invalid")]
     InvalidDocumentId,
+    #[error("tool call is missing its task-bound context manifest")]
+    MissingContextManifest,
+    #[error("tool context manifest does not belong to this task attempt")]
+    InvalidContextManifest,
+    #[error("document {0} is outside the active context manifest")]
+    OutsideContextManifest(DocumentId),
     #[error("{tool:?} cannot read document kind {kind:?}")]
     ForbiddenKind { tool: ToolKind, kind: DocumentKind },
     #[error("source {source_name:?} is not permitted by the contract")]
@@ -132,7 +137,7 @@ impl ToolRuntime {
         Self { broker, sources }
     }
 
-    pub fn definitions(&self, contract: &AgentContract) -> Vec<ModelToolDefinition> {
+    pub fn definitions(&self, contract: &LegacyAgentContract) -> Vec<ModelToolDefinition> {
         let granted = contract
             .tool_grants
             .iter()
@@ -143,16 +148,6 @@ impl ToolRuntime {
                 ToolKind::ReadEvidence,
                 "read_evidence",
                 "Read one permitted normalized, semantic, claim, challenge, or memory document by durable ID.",
-            ),
-            (
-                ToolKind::ReadRawEvidence,
-                "read_raw_evidence",
-                "Controlled reread of one permitted raw market evidence document by durable ID.",
-            ),
-            (
-                ToolKind::ReadMarketData,
-                "read_market_data",
-                "Read one sealed Alpaca market or account document by durable ID.",
             ),
         ]
         .into_iter()
@@ -174,7 +169,7 @@ impl ToolRuntime {
     /// allowing the model to recover without bypassing Rust authority.
     pub fn execute(
         &self,
-        contract: &AgentContract,
+        contract: &LegacyAgentContract,
         context: &ToolCallContext,
         call: &ModelToolCall,
         now: DateTime<Utc>,
@@ -210,7 +205,7 @@ impl ToolRuntime {
             created_at: now,
         })?;
 
-        let result = self.read(contract, call);
+        let result = self.read(contract, context, call);
         let (model_result, source_refs) = match result {
             Ok((value, document_id)) => (
                 json!({"ok": true, "value": value}),
@@ -257,7 +252,12 @@ impl ToolRuntime {
         })
     }
 
-    fn read(&self, contract: &AgentContract, call: &ModelToolCall) -> Result<(Value, DocumentId)> {
+    fn read(
+        &self,
+        contract: &LegacyAgentContract,
+        context: &ToolCallContext,
+        call: &ModelToolCall,
+    ) -> Result<(Value, DocumentId)> {
         let kind = tool_kind(&call.name)?;
         let grant = contract
             .tool_grants
@@ -274,8 +274,8 @@ impl ToolRuntime {
                     .then(|| DocumentId(id.to_owned()))
                     .ok_or(ToolError::InvalidDocumentId)
             })?;
+        self.ensure_manifest_allows(context, &document_id)?;
         let document = self.broker.store().read_document(&document_id)?;
-        let needs_raw = kind == ToolKind::ReadRawEvidence;
         if !allowed_kind(kind, document.kind) {
             return Err(ToolError::ForbiddenKind {
                 tool: kind,
@@ -287,7 +287,7 @@ impl ToolRuntime {
         }
         if !self
             .sources
-            .permits(grant, &document.provenance.source, needs_raw)
+            .permits(grant, &document.provenance.source, false)
         {
             return Err(ToolError::ForbiddenSource {
                 source_name: document.provenance.source,
@@ -306,13 +306,45 @@ impl ToolRuntime {
             document_id,
         ))
     }
+    fn ensure_manifest_allows(
+        &self,
+        context: &ToolCallContext,
+        document_id: &DocumentId,
+    ) -> Result<()> {
+        let manifest_id = context
+            .context_manifest_id
+            .as_ref()
+            .ok_or(ToolError::MissingContextManifest)?;
+        let manifest = self.broker.store().read_document(manifest_id)?;
+        let origin_matches = manifest.origin.as_ref().is_some_and(|origin| {
+            origin.task_id.as_ref() == Some(&context.task_id)
+                && origin.attempt_id.as_ref() == Some(&context.attempt_id)
+                && origin.contract_hash.as_ref() == Some(&context.contract_hash)
+        });
+        if manifest.kind != DocumentKind::ContextManifest
+            || manifest.run_id.as_ref() != Some(&context.run_id)
+            || !origin_matches
+        {
+            return Err(ToolError::InvalidContextManifest);
+        }
+        let value = self.broker.read_json(&manifest)?;
+        let selected = value
+            .get("documents")
+            .and_then(Value::as_array)
+            .ok_or(ToolError::InvalidContextManifest)?;
+        if selected.iter().any(|entry| {
+            entry.get("document_id").and_then(Value::as_str) == Some(document_id.0.as_str())
+        }) {
+            Ok(())
+        } else {
+            Err(ToolError::OutsideContextManifest(document_id.clone()))
+        }
+    }
 }
 
 fn tool_kind(name: &str) -> Result<ToolKind> {
     match name {
         "read_evidence" => Ok(ToolKind::ReadEvidence),
-        "read_raw_evidence" => Ok(ToolKind::ReadRawEvidence),
-        "read_market_data" => Ok(ToolKind::ReadMarketData),
         other => Err(ToolError::UnknownTool(other.to_owned())),
     }
 }
@@ -320,28 +352,23 @@ fn tool_kind(name: &str) -> Result<ToolKind> {
 fn allowed_kind(tool: ToolKind, kind: DocumentKind) -> bool {
     match tool {
         ToolKind::ReadEvidence => !matches!(kind, DocumentKind::RawEvidence),
-        ToolKind::ReadRawEvidence => kind == DocumentKind::RawEvidence,
-        ToolKind::ReadMarketData => matches!(
-            kind,
-            DocumentKind::RawEvidence | DocumentKind::NormalizedEvidence
-        ),
-        ToolKind::FetchWebEvidence => false,
+        _ => false,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use akzio_context::NewJsonDocument;
+    use akzio_context::legacy::NewJsonDocument;
     use akzio_domain::{
         BlobRef, ContractId, FailureDisposition, RetryPolicy, TaskBudget, TerminationPolicy,
     };
-    use akzio_store::V2Store;
+    use akzio_store::legacy::V2Store;
     use tempfile::tempdir;
 
-    fn contract() -> AgentContract {
+    fn contract() -> LegacyAgentContract {
         let hash = ContentHash::of_bytes(b"contract");
-        AgentContract {
+        LegacyAgentContract {
             schema_version: V2_SCHEMA_VERSION,
             contract_id: ContractId::new(),
             version: 1,
@@ -352,9 +379,9 @@ mod tests {
                 media_type: "text/plain".to_owned(),
                 bytes: 1,
             },
-            input_context_kinds: vec![DocumentKind::RawEvidence],
+            input_context_kinds: vec![DocumentKind::NormalizedEvidence],
             tool_grants: vec![ToolGrant {
-                kind: ToolKind::ReadRawEvidence,
+                kind: ToolKind::ReadEvidence,
                 allowed_sources: vec!["market".to_owned()],
             }],
             output_type: "claims".to_owned(),
@@ -393,7 +420,7 @@ mod tests {
         let raw = broker
             .record_json_with_provenance(
                 NewJsonDocument {
-                    kind: DocumentKind::RawEvidence,
+                    kind: DocumentKind::NormalizedEvidence,
                     producer: "ingest.quote".to_owned(),
                     run_id: Some(run.clone()),
                     lifecycle: DocumentLifecycle::Canonical,
@@ -412,27 +439,85 @@ mod tests {
                 },
             )
             .unwrap();
+        let contract = contract();
+        let attempt_id = AttemptId::new();
+        let manifest = broker
+            .record_json(NewJsonDocument {
+                kind: DocumentKind::ContextManifest,
+                producer: "context.test.agent".to_owned(),
+                run_id: Some(run.clone()),
+                lifecycle: DocumentLifecycle::RunScoped,
+                source_refs: vec![raw.document_id.clone()],
+                origin: Some(DocumentOrigin::task(
+                    task_id.clone(),
+                    attempt_id.clone(),
+                    Some(contract.contract_hash.clone()),
+                )),
+                value: &json!({"documents": [{"document_id": raw.document_id}]}),
+                created_at: now,
+            })
+            .unwrap();
         let runtime = ToolRuntime::new(broker.clone(), SourceRegistry::default());
         let context = ToolCallContext {
             run_id: run,
             task_id,
-            attempt_id: AttemptId::new(),
-            contract_hash: contract().contract_hash.clone(),
-            context_manifest_id: None,
+            attempt_id,
+            contract_hash: contract.contract_hash.clone(),
+            context_manifest_id: Some(manifest.document_id),
         };
         let result = runtime
             .execute(
-                &contract(),
+                &contract,
                 &context,
                 &ModelToolCall {
                     call_id: "call-1".to_owned(),
-                    name: "read_raw_evidence".to_owned(),
+                    name: "read_evidence".to_owned(),
                     arguments: json!({"document_id": raw.document_id}),
                 },
                 now,
             )
             .unwrap();
         assert_eq!(result.model_result["ok"], true);
-        assert_eq!(broker.store().event_count(&context.run_id).unwrap(), 2);
+
+        let outside = broker
+            .record_json_with_provenance(
+                NewJsonDocument {
+                    kind: DocumentKind::NormalizedEvidence,
+                    producer: "ingest.quote".to_owned(),
+                    run_id: Some(context.run_id.clone()),
+                    lifecycle: DocumentLifecycle::Canonical,
+                    source_refs: vec![],
+                    origin: None,
+                    value: &json!({"price": 11}),
+                    created_at: now,
+                },
+                akzio_domain::Provenance {
+                    source: "alpaca.quote.QQQ".to_owned(),
+                    observed_at: Some(now),
+                    retrieved_at: now,
+                    source_uri: None,
+                    confidence_ppm: 1_000_000,
+                    contract_hash: None,
+                },
+            )
+            .unwrap();
+        let rejected = runtime
+            .execute(
+                &contract,
+                &context,
+                &ModelToolCall {
+                    call_id: "call-2".to_owned(),
+                    name: "read_evidence".to_owned(),
+                    arguments: json!({"document_id": outside.document_id}),
+                },
+                now,
+            )
+            .unwrap();
+        assert_eq!(rejected.model_result["ok"], false);
+        assert!(rejected.model_result["error"]
+            .as_str()
+            .unwrap()
+            .contains("outside the active context manifest"));
+        assert_eq!(broker.store().event_count(&context.run_id).unwrap(), 4);
     }
 }

@@ -1,0 +1,1717 @@
+//! Dynamic workflow lowering for the v2 runtime.
+
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    future::Future,
+    time::Duration as StdDuration,
+};
+
+use akzio_domain::{
+    Artifact, ArtifactKind, ArtifactLifecycle, ArtifactProvenance, ArtifactRef, DomainError, RunId,
+    RunPurpose, RuntimeTaskClass, TaskRecipe, TaskRecipeId, TaskStatus, WorkflowGraph,
+    WorkflowNode, WorkflowProposal, REBUILD_SCHEMA_VERSION,
+};
+use akzio_store::v2::{
+    ClaimedAttempt, RetryTaskResult, StoreError, StoredRun, V2Store, WorkflowCommit,
+    WorkflowPatchCommit, WorkflowRevision, WorkflowSnapshot,
+};
+use chrono::{DateTime, Duration, Utc};
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum RebuildRuntimeError {
+    #[error(transparent)]
+    Domain(#[from] DomainError),
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+    #[error("recipe {0} is missing")]
+    MissingRecipe(TaskRecipeId),
+    #[error("Planner may not schedule Rust terminal recipe {0}")]
+    TerminalRecipeInProposal(TaskRecipeId),
+    #[error("terminal recipe {recipe} has class {actual:?}, expected {expected:?}")]
+    InvalidTerminalRecipe {
+        recipe: TaskRecipeId,
+        actual: RuntimeTaskClass,
+        expected: RuntimeTaskClass,
+    },
+    #[error("workflow already contains a terminal execution gate")]
+    TerminalGateAlreadyPresent,
+    #[error("proposal would exceed the configured workflow node limit")]
+    WorkflowNodeLimit,
+    #[error("Paper workflow {0} is frozen once submitted")]
+    FrozenPaperWorkflow(RunId),
+    #[error("planner task {task} exceeds child limit for recipe {recipe}")]
+    WorkflowFanoutLimit { task: String, recipe: TaskRecipeId },
+    #[error("planner task {task} exceeds depth limit for recipe {recipe}")]
+    WorkflowDepthLimit { task: String, recipe: TaskRecipeId },
+    #[error("task lease duration must be positive")]
+    InvalidTaskLeaseDuration,
+    #[error("task retry backoff exceeds supported duration")]
+    InvalidRetryBackoff,
+    #[error("workflow node {0} diverges from its installed recipe")]
+    NodeRecipeMismatch(akzio_domain::TaskId),
+    #[error("workflow is missing required terminal gate {0}")]
+    MissingTerminalGate(TaskRecipeId),
+    #[error("workflow is missing required evidence gate {0}")]
+    MissingEvidenceGate(TaskRecipeId),
+    #[error("workflow includes unexpected terminal gate {0}")]
+    UnexpectedTerminalGate(TaskRecipeId),
+    #[error("workflow terminal gate {0} has an invalid dependency chain")]
+    InvalidTerminalDependencies(TaskRecipeId),
+    #[error("research node {0} may not depend on a terminal gate")]
+    ResearchDependsOnTerminal(akzio_domain::TaskId),
+    #[error("research root {0} bypasses the required evidence gate")]
+    ResearchBypassesEvidence(akzio_domain::TaskId),
+    #[error("task {0} has an invalid EvidenceNeed input")]
+    InvalidEvidenceNeed(akzio_domain::TaskId),
+    #[error("Evidence Gate input plan does not match research EvidenceNeeds")]
+    InvalidEvidencePlan,
+    #[error("workflow contains more than one planner task")]
+    DuplicatePlannerTask,
+    #[error("workflow patch must be authored by an active planner attempt")]
+    PlannerPermitRequired,
+    #[error("Paper workflows require a precompiled proposal")]
+    PaperWorkflowRequiresPrecompiledProposal,
+}
+
+pub type RebuildRuntimeResult<T> = Result<T, RebuildRuntimeError>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalRecipeSet {
+    pub evidence_gate: TaskRecipeId,
+    pub decision_gate: TaskRecipeId,
+    pub execution_gate: TaskRecipeId,
+    pub paper_commit: TaskRecipeId,
+    pub reconcile: TaskRecipeId,
+    pub evaluate: TaskRecipeId,
+}
+
+#[derive(Debug, Clone)]
+pub struct RecipeCatalogue {
+    recipes: BTreeMap<TaskRecipeId, TaskRecipe>,
+    planner: TaskRecipeId,
+    terminals: TerminalRecipeSet,
+    max_nodes: usize,
+}
+
+impl RecipeCatalogue {
+    pub fn new(
+        recipes: impl IntoIterator<Item = TaskRecipe>,
+        planner: TaskRecipeId,
+        terminals: TerminalRecipeSet,
+        max_nodes: usize,
+    ) -> RebuildRuntimeResult<Self> {
+        let recipes = recipes
+            .into_iter()
+            .map(|recipe| {
+                recipe.validate()?;
+                Ok((recipe.recipe_id.clone(), recipe))
+            })
+            .collect::<Result<BTreeMap<_, _>, DomainError>>()?;
+        let catalogue = Self {
+            recipes,
+            planner,
+            terminals,
+            max_nodes,
+        };
+        if catalogue.max_nodes == 0 {
+            return Err(RebuildRuntimeError::WorkflowNodeLimit);
+        }
+        catalogue.assert_planner(&catalogue.planner)?;
+        catalogue.assert_terminal(
+            &catalogue.terminals.evidence_gate,
+            RuntimeTaskClass::Evidence,
+        )?;
+        catalogue.assert_terminal(
+            &catalogue.terminals.decision_gate,
+            RuntimeTaskClass::DecisionGate,
+        )?;
+        catalogue.assert_terminal(
+            &catalogue.terminals.execution_gate,
+            RuntimeTaskClass::ExecutionGate,
+        )?;
+        catalogue.assert_terminal(
+            &catalogue.terminals.paper_commit,
+            RuntimeTaskClass::PaperCommit,
+        )?;
+        catalogue.assert_terminal(&catalogue.terminals.reconcile, RuntimeTaskClass::Reconcile)?;
+        catalogue.assert_terminal(&catalogue.terminals.evaluate, RuntimeTaskClass::Evaluate)?;
+        Ok(catalogue)
+    }
+
+    fn assert_planner(&self, recipe_id: &TaskRecipeId) -> RebuildRuntimeResult<()> {
+        let recipe = self.recipe(recipe_id)?;
+        if recipe.task_class != RuntimeTaskClass::Agent || recipe.contract_hash.is_none() {
+            return Err(RebuildRuntimeError::PlannerPermitRequired);
+        }
+        Ok(())
+    }
+
+    pub fn recipe(&self, recipe_id: &TaskRecipeId) -> RebuildRuntimeResult<&TaskRecipe> {
+        self.recipes
+            .get(recipe_id)
+            .ok_or_else(|| RebuildRuntimeError::MissingRecipe(recipe_id.clone()))
+    }
+
+    fn assert_terminal(
+        &self,
+        recipe_id: &TaskRecipeId,
+        expected: RuntimeTaskClass,
+    ) -> RebuildRuntimeResult<()> {
+        let recipe = self.recipe(recipe_id)?;
+        if recipe.task_class != expected {
+            return Err(RebuildRuntimeError::InvalidTerminalRecipe {
+                recipe: recipe_id.clone(),
+                actual: recipe.task_class,
+                expected,
+            });
+        }
+        Ok(())
+    }
+
+    fn is_terminal(&self, recipe_id: &TaskRecipeId) -> bool {
+        [
+            &self.terminals.decision_gate,
+            &self.terminals.execution_gate,
+            &self.terminals.paper_commit,
+            &self.terminals.reconcile,
+            &self.terminals.evaluate,
+        ]
+        .into_iter()
+        .any(|terminal| terminal == recipe_id)
+    }
+
+    fn is_rust_gate(&self, recipe_id: &TaskRecipeId) -> bool {
+        recipe_id == &self.terminals.evidence_gate || self.is_terminal(recipe_id)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RebuildWorkflowRuntime {
+    store: V2Store,
+    catalogue: RecipeCatalogue,
+}
+
+impl RebuildWorkflowRuntime {
+    pub fn new(store: V2Store, catalogue: RecipeCatalogue) -> Self {
+        Self { store, catalogue }
+    }
+
+    pub fn catalogue(&self) -> &RecipeCatalogue {
+        &self.catalogue
+    }
+
+    /// Compile a model proposal into a graph plus Rust-owned terminal gates. The
+    /// proposal cannot name any gate recipe, create a contract, or omit final
+    /// audit/evaluation transitions.
+    pub fn lower(
+        &self,
+        purpose: RunPurpose,
+        proposal: &WorkflowProposal,
+    ) -> RebuildRuntimeResult<WorkflowGraph> {
+        let nodes = self.lower_research_nodes(proposal)?;
+        self.with_terminal_gates(purpose, proposal.topology_id.clone(), nodes)
+    }
+
+    /// Creates the non-Paper bootstrap graph whose sole model task is the
+    /// installed Planner. The Planner may extend this graph only while its
+    /// active attempt still owns a valid write permit.
+    pub fn bootstrap(
+        &self,
+        purpose: RunPurpose,
+        topology_id: impl Into<String>,
+    ) -> RebuildRuntimeResult<WorkflowGraph> {
+        if purpose == RunPurpose::Paper {
+            return Err(RebuildRuntimeError::PaperWorkflowRequiresPrecompiledProposal);
+        }
+        let topology_id = topology_id.into();
+        if topology_id.trim().is_empty() {
+            return Err(RebuildRuntimeError::Domain(DomainError::EmptyField {
+                field: "workflow.topology_id",
+            }));
+        }
+        let recipe = self.catalogue.recipe(&self.catalogue.planner)?;
+        let planner = WorkflowNode {
+            task_id: akzio_domain::TaskId::new(),
+            recipe_id: recipe.recipe_id.clone(),
+            contract_hash: recipe.contract_hash.clone(),
+            objective: "Produce a bounded workflow proposal".to_owned(),
+            dependencies: vec![],
+            input_artifacts: vec![],
+            priority: recipe.priority_ceiling,
+            budget: recipe.budget.clone(),
+            retry: recipe.retry.clone(),
+            on_failure: recipe.on_failure,
+            parent_task_id: None,
+        };
+        self.with_terminal_gates(purpose, topology_id, vec![planner])
+    }
+
+    pub fn submit(
+        &self,
+        run_id: RunId,
+        purpose: RunPurpose,
+        graph: WorkflowGraph,
+        now: DateTime<Utc>,
+    ) -> RebuildRuntimeResult<Artifact> {
+        graph.validate()?;
+        self.validate_compiled_graph(purpose, &graph)?;
+        let graph_artifact = self.graph_artifact(&graph, vec![], now)?;
+        self.store.commit_workflow(&WorkflowCommit {
+            run: StoredRun {
+                run_id,
+                purpose,
+                topology_id: graph.topology_id.clone(),
+                graph_artifact_id: graph_artifact.artifact_id.clone(),
+                created_at: now,
+            },
+            graph: graph_artifact.clone(),
+            nodes: graph.nodes,
+        })?;
+        Ok(graph_artifact)
+    }
+
+    /// Load the exact durable graph/task state for crash recovery. Recovery
+    /// never re-lowers a proposal or allocates replacement task IDs.
+    pub fn recover(&self, run_id: &RunId) -> RebuildRuntimeResult<WorkflowSnapshot> {
+        let snapshot = self.store.workflow_snapshot(run_id)?;
+        self.validate_compiled_graph(snapshot.run.purpose, &snapshot.revision.graph)?;
+        Ok(snapshot)
+    }
+
+    /// Replay an immutable graph revision through the current v2 invariants.
+    pub fn replay_revision(
+        &self,
+        run_id: &RunId,
+        revision: u64,
+    ) -> RebuildRuntimeResult<WorkflowRevision> {
+        let revision = self.store.workflow_revision(run_id, revision)?;
+        self.validate_compiled_graph(self.store.run_purpose(run_id)?, &revision.graph)?;
+        Ok(revision)
+    }
+
+    /// Applies a Planner proposal to a bootstrap graph. It adds all research nodes
+    /// and then one immutable terminal chain; a later Planner cannot patch gates.
+    pub fn apply_proposal(
+        &self,
+        planner: &ClaimedAttempt,
+        previous_graph_artifact: &Artifact,
+        previous_graph: &WorkflowGraph,
+        proposal_artifact: &Artifact,
+        now: DateTime<Utc>,
+    ) -> RebuildRuntimeResult<Artifact> {
+        self.assert_planner_attempt(planner)?;
+        if proposal_artifact.kind != ArtifactKind::WorkflowProposal {
+            return Err(RebuildRuntimeError::Store(
+                StoreError::InvalidWorkflowProposalArtifact,
+            ));
+        }
+        let proposal: WorkflowProposal =
+            serde_json::from_slice(&self.store.read_blob(&proposal_artifact.blob)?)?;
+        let run_id = &planner.run_id;
+        let purpose = self.store.run_purpose(run_id)?;
+        if purpose == RunPurpose::Paper {
+            return Err(RebuildRuntimeError::FrozenPaperWorkflow(run_id.clone()));
+        }
+        previous_graph.validate()?;
+        self.validate_compiled_graph(purpose, previous_graph)?;
+        if previous_graph.topology_id != proposal.topology_id {
+            return Err(RebuildRuntimeError::Domain(DomainError::EmptyField {
+                field: "workflow_proposal.topology_id",
+            }));
+        }
+        let mut nodes = previous_graph.nodes.clone();
+        let evidence_index = nodes
+            .iter()
+            .position(|node| node.recipe_id == self.catalogue.terminals.evidence_gate)
+            .ok_or_else(|| {
+                RebuildRuntimeError::MissingEvidenceGate(
+                    self.catalogue.terminals.evidence_gate.clone(),
+                )
+            })?;
+        let evidence_task_id = nodes[evidence_index].task_id.clone();
+        let mut added_nodes = self.lower_research_nodes(&proposal)?;
+        self.attach_evidence_gate(&mut added_nodes, &evidence_task_id);
+        nodes.extend(added_nodes.iter().cloned());
+        let decision_index = nodes
+            .iter()
+            .position(|node| node.recipe_id == self.catalogue.terminals.decision_gate)
+            .ok_or_else(|| {
+                RebuildRuntimeError::MissingTerminalGate(
+                    self.catalogue.terminals.decision_gate.clone(),
+                )
+            })?;
+        let mut decision = nodes[decision_index].clone();
+        let research = nodes
+            .iter()
+            .filter(|node| !self.is_terminal_node(node) && node.recipe_id != self.catalogue.planner)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut evidence = nodes[evidence_index].clone();
+        evidence.input_artifacts = self.aggregate_evidence_needs(&research)?;
+        nodes[evidence_index] = evidence.clone();
+        decision.dependencies = if research.is_empty() {
+            vec![evidence_task_id]
+        } else {
+            leaf_ids(&research)
+        };
+        nodes[decision_index] = decision.clone();
+        let graph = WorkflowGraph {
+            schema_version: REBUILD_SCHEMA_VERSION,
+            topology_id: previous_graph.topology_id.clone(),
+            nodes,
+        };
+        graph.validate()?;
+        self.validate_compiled_graph(purpose, &graph)?;
+        let next_artifact = self.graph_artifact(
+            &graph,
+            vec![
+                ArtifactRef {
+                    artifact_id: previous_graph_artifact.artifact_id.clone(),
+                    kind: ArtifactKind::WorkflowGraph,
+                },
+                ArtifactRef {
+                    artifact_id: proposal_artifact.artifact_id.clone(),
+                    kind: ArtifactKind::WorkflowProposal,
+                },
+            ],
+            now,
+        )?;
+        self.store.commit_workflow_patch(&WorkflowPatchCommit {
+            permit: planner.permit.clone(),
+            previous_graph_artifact_id: previous_graph_artifact.artifact_id.clone(),
+            proposal: proposal_artifact.clone(),
+            next_graph: next_artifact.clone(),
+            added_nodes,
+            updated_nodes: vec![evidence, decision],
+            completed_at: now,
+        })?;
+        Ok(next_artifact)
+    }
+
+    fn assert_planner_attempt(&self, planner: &ClaimedAttempt) -> RebuildRuntimeResult<()> {
+        let recipe = self.catalogue.recipe(&self.catalogue.planner)?;
+        if planner.node.recipe_id != self.catalogue.planner
+            || planner.node.contract_hash != recipe.contract_hash
+            || planner.permit.contract_hash != recipe.contract_hash
+        {
+            return Err(RebuildRuntimeError::PlannerPermitRequired);
+        }
+        Ok(())
+    }
+
+    fn validate_compiled_graph(
+        &self,
+        purpose: RunPurpose,
+        graph: &WorkflowGraph,
+    ) -> RebuildRuntimeResult<()> {
+        self.validate_evidence_gate(graph)?;
+        let mut terminals = BTreeMap::<TaskRecipeId, &WorkflowNode>::new();
+        let mut research = Vec::new();
+        for node in &graph.nodes {
+            let recipe = self.catalogue.recipe(&node.recipe_id)?;
+            if node.contract_hash != recipe.contract_hash
+                || node.budget != recipe.budget
+                || node.retry != recipe.retry
+                || node.on_failure != recipe.on_failure
+                || node.priority > recipe.priority_ceiling
+            {
+                return Err(RebuildRuntimeError::NodeRecipeMismatch(
+                    node.task_id.clone(),
+                ));
+            }
+            if matches!(
+                recipe.task_class,
+                RuntimeTaskClass::DecisionGate
+                    | RuntimeTaskClass::ExecutionGate
+                    | RuntimeTaskClass::PaperCommit
+                    | RuntimeTaskClass::Reconcile
+                    | RuntimeTaskClass::Evaluate
+            ) {
+                if !self.catalogue.is_terminal(&node.recipe_id)
+                    || terminals.insert(node.recipe_id.clone(), node).is_some()
+                {
+                    return Err(RebuildRuntimeError::UnexpectedTerminalGate(
+                        node.recipe_id.clone(),
+                    ));
+                }
+            } else {
+                research.push(node.clone());
+            }
+        }
+        if research.is_empty() {
+            return Err(RebuildRuntimeError::WorkflowNodeLimit);
+        }
+
+        let decision = required_terminal(&terminals, &self.catalogue.terminals.decision_gate)?;
+        let execution = required_terminal(&terminals, &self.catalogue.terminals.execution_gate)?;
+        let reconcile = required_terminal(&terminals, &self.catalogue.terminals.reconcile)?;
+        let evaluate = required_terminal(&terminals, &self.catalogue.terminals.evaluate)?;
+        let paper = terminals
+            .get(&self.catalogue.terminals.paper_commit)
+            .copied();
+        if purpose == RunPurpose::Paper && paper.is_none() {
+            return Err(RebuildRuntimeError::MissingTerminalGate(
+                self.catalogue.terminals.paper_commit.clone(),
+            ));
+        }
+        if purpose != RunPurpose::Paper && paper.is_some() {
+            return Err(RebuildRuntimeError::UnexpectedTerminalGate(
+                self.catalogue.terminals.paper_commit.clone(),
+            ));
+        }
+
+        let terminal_ids = terminals
+            .values()
+            .map(|node| node.task_id.clone())
+            .collect::<BTreeSet<_>>();
+        if research.iter().any(|node| {
+            node.dependencies
+                .iter()
+                .any(|dependency| terminal_ids.contains(dependency))
+        }) {
+            let offender = research
+                .iter()
+                .find(|node| {
+                    node.dependencies
+                        .iter()
+                        .any(|dependency| terminal_ids.contains(dependency))
+                })
+                .expect("research dependency predicate found an offender");
+            return Err(RebuildRuntimeError::ResearchDependsOnTerminal(
+                offender.task_id.clone(),
+            ));
+        }
+
+        let expected_decision_dependencies =
+            leaf_ids(&research).into_iter().collect::<BTreeSet<_>>();
+        if decision
+            .dependencies
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            != expected_decision_dependencies
+        {
+            return Err(RebuildRuntimeError::InvalidTerminalDependencies(
+                self.catalogue.terminals.decision_gate.clone(),
+            ));
+        }
+        if execution.dependencies != vec![decision.task_id.clone()] {
+            return Err(RebuildRuntimeError::InvalidTerminalDependencies(
+                self.catalogue.terminals.execution_gate.clone(),
+            ));
+        }
+        let predecessor = if let Some(paper) = paper {
+            if paper.dependencies != vec![execution.task_id.clone()] {
+                return Err(RebuildRuntimeError::InvalidTerminalDependencies(
+                    self.catalogue.terminals.paper_commit.clone(),
+                ));
+            }
+            paper.task_id.clone()
+        } else {
+            execution.task_id.clone()
+        };
+        if reconcile.dependencies != vec![predecessor] {
+            return Err(RebuildRuntimeError::InvalidTerminalDependencies(
+                self.catalogue.terminals.reconcile.clone(),
+            ));
+        }
+        if evaluate.dependencies != vec![reconcile.task_id.clone()] {
+            return Err(RebuildRuntimeError::InvalidTerminalDependencies(
+                self.catalogue.terminals.evaluate.clone(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_evidence_gate(&self, graph: &WorkflowGraph) -> RebuildRuntimeResult<()> {
+        let evidence_nodes = graph
+            .nodes
+            .iter()
+            .filter(|node| node.recipe_id == self.catalogue.terminals.evidence_gate)
+            .collect::<Vec<_>>();
+        let Some(evidence) = evidence_nodes.first().copied() else {
+            return Err(RebuildRuntimeError::MissingEvidenceGate(
+                self.catalogue.terminals.evidence_gate.clone(),
+            ));
+        };
+        if evidence_nodes.len() != 1 {
+            return Err(RebuildRuntimeError::UnexpectedTerminalGate(
+                self.catalogue.terminals.evidence_gate.clone(),
+            ));
+        }
+
+        let planner_nodes = graph
+            .nodes
+            .iter()
+            .filter(|node| node.recipe_id == self.catalogue.planner)
+            .collect::<Vec<_>>();
+        if planner_nodes.len() > 1 {
+            return Err(RebuildRuntimeError::DuplicatePlannerTask);
+        }
+        let expected_evidence_dependencies = planner_nodes
+            .first()
+            .map(|planner| vec![planner.task_id.clone()])
+            .unwrap_or_default();
+        if evidence.dependencies != expected_evidence_dependencies {
+            return Err(RebuildRuntimeError::InvalidTerminalDependencies(
+                self.catalogue.terminals.evidence_gate.clone(),
+            ));
+        }
+
+        let research = graph
+            .nodes
+            .iter()
+            .filter(|node| node.recipe_id != self.catalogue.planner && !self.is_terminal_node(node))
+            .cloned()
+            .collect::<Vec<_>>();
+        let research_ids = research
+            .iter()
+            .map(|node| node.task_id.clone())
+            .collect::<BTreeSet<_>>();
+        if evidence.input_artifacts != self.aggregate_evidence_needs(&research)? {
+            return Err(RebuildRuntimeError::InvalidEvidencePlan);
+        }
+        for node in &research {
+            let has_research_parent = node
+                .dependencies
+                .iter()
+                .any(|dependency| research_ids.contains(dependency));
+            if !has_research_parent && node.dependencies != vec![evidence.task_id.clone()] {
+                return Err(RebuildRuntimeError::ResearchBypassesEvidence(
+                    node.task_id.clone(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn lower_research_nodes(
+        &self,
+        proposal: &WorkflowProposal,
+    ) -> RebuildRuntimeResult<Vec<WorkflowNode>> {
+        proposal.validate(&self.catalogue.recipes)?;
+        self.validate_proposal_limits(proposal)?;
+        if proposal.tasks.len() > self.catalogue.max_nodes {
+            return Err(RebuildRuntimeError::WorkflowNodeLimit);
+        }
+        let ids = proposal
+            .tasks
+            .keys()
+            .map(|alias| (alias.clone(), akzio_domain::TaskId::new()))
+            .collect::<BTreeMap<_, _>>();
+        proposal
+            .tasks
+            .iter()
+            .map(|(alias, task)| {
+                let recipe = self.catalogue.recipe(&task.recipe_id)?;
+                if self.catalogue.is_rust_gate(&task.recipe_id)
+                    || matches!(
+                        recipe.task_class,
+                        RuntimeTaskClass::DecisionGate
+                            | RuntimeTaskClass::ExecutionGate
+                            | RuntimeTaskClass::PaperCommit
+                            | RuntimeTaskClass::Reconcile
+                            | RuntimeTaskClass::Evaluate
+                    )
+                {
+                    return Err(RebuildRuntimeError::TerminalRecipeInProposal(
+                        task.recipe_id.clone(),
+                    ));
+                }
+                Ok(WorkflowNode {
+                    task_id: ids[alias].clone(),
+                    recipe_id: recipe.recipe_id.clone(),
+                    contract_hash: recipe.contract_hash.clone(),
+                    objective: task.objective.clone(),
+                    dependencies: task
+                        .depends_on
+                        .iter()
+                        .map(|dependency| ids[dependency].clone())
+                        .collect(),
+                    input_artifacts: task.evidence_needs.clone(),
+                    priority: task.priority,
+                    budget: recipe.budget.clone(),
+                    retry: recipe.retry.clone(),
+                    on_failure: recipe.on_failure,
+                    parent_task_id: None,
+                })
+            })
+            .collect()
+    }
+
+    fn validate_proposal_limits(&self, proposal: &WorkflowProposal) -> RebuildRuntimeResult<()> {
+        let mut children = BTreeMap::<String, Vec<String>>::new();
+        for (alias, task) in &proposal.tasks {
+            for dependency in &task.depends_on {
+                let parent = proposal
+                    .tasks
+                    .get(dependency)
+                    .expect("proposal validation checked dependencies");
+                let parent_recipe = self.catalogue.recipe(&parent.recipe_id)?;
+                let descendants = children.entry(dependency.clone()).or_default();
+                descendants.push(alias.clone());
+                if descendants.len() > usize::from(parent_recipe.max_children) {
+                    return Err(RebuildRuntimeError::WorkflowFanoutLimit {
+                        task: dependency.clone(),
+                        recipe: parent.recipe_id.clone(),
+                    });
+                }
+            }
+        }
+        for (root, task) in &proposal.tasks {
+            let recipe = self.catalogue.recipe(&task.recipe_id)?;
+            let mut stack = vec![(root.clone(), 0_u16)];
+            while let Some((alias, depth)) = stack.pop() {
+                if depth > recipe.max_depth {
+                    return Err(RebuildRuntimeError::WorkflowDepthLimit {
+                        task: alias,
+                        recipe: recipe.recipe_id.clone(),
+                    });
+                }
+                if let Some(descendants) = children.get(&alias) {
+                    stack.extend(descendants.iter().cloned().map(|child| (child, depth + 1)));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn with_terminal_gates(
+        &self,
+        purpose: RunPurpose,
+        topology_id: String,
+        mut nodes: Vec<WorkflowNode>,
+    ) -> RebuildRuntimeResult<WorkflowGraph> {
+        let planners = nodes
+            .iter()
+            .filter(|node| node.recipe_id == self.catalogue.planner)
+            .collect::<Vec<_>>();
+        if planners.len() > 1 {
+            return Err(RebuildRuntimeError::DuplicatePlannerTask);
+        }
+
+        let evidence_dependencies = planners
+            .first()
+            .map(|planner| vec![planner.task_id.clone()])
+            .unwrap_or_default();
+        let evidence_needs = self.aggregate_evidence_needs(&nodes)?;
+        let mut evidence = self.gate_node(
+            &self.catalogue.terminals.evidence_gate,
+            evidence_dependencies,
+        )?;
+        evidence.input_artifacts = evidence_needs;
+        let evidence_task_id = evidence.task_id.clone();
+        for node in &mut nodes {
+            if node.recipe_id != self.catalogue.planner && node.dependencies.is_empty() {
+                node.dependencies.push(evidence_task_id.clone());
+            }
+        }
+
+        let research = nodes
+            .iter()
+            .filter(|node| node.recipe_id != self.catalogue.planner)
+            .cloned()
+            .collect::<Vec<_>>();
+        let decision_dependencies = if research.is_empty() {
+            vec![evidence_task_id]
+        } else {
+            leaf_ids(&research)
+        };
+        let decision = self.gate_node(
+            &self.catalogue.terminals.decision_gate,
+            decision_dependencies,
+        )?;
+        let execution = self.gate_node(
+            &self.catalogue.terminals.execution_gate,
+            vec![decision.task_id.clone()],
+        )?;
+        let predecessor = if purpose == RunPurpose::Paper {
+            let paper = self.gate_node(
+                &self.catalogue.terminals.paper_commit,
+                vec![execution.task_id.clone()],
+            )?;
+            let task_id = paper.task_id.clone();
+            nodes.push(paper);
+            task_id
+        } else {
+            execution.task_id.clone()
+        };
+        let reconcile = self.gate_node(&self.catalogue.terminals.reconcile, vec![predecessor])?;
+        let evaluate = self.gate_node(
+            &self.catalogue.terminals.evaluate,
+            vec![reconcile.task_id.clone()],
+        )?;
+        nodes.push(evidence);
+        nodes.extend([decision, execution, reconcile, evaluate]);
+        if nodes.len() > self.catalogue.max_nodes {
+            return Err(RebuildRuntimeError::WorkflowNodeLimit);
+        }
+        let graph = WorkflowGraph {
+            schema_version: REBUILD_SCHEMA_VERSION,
+            topology_id,
+            nodes,
+        };
+        graph.validate()?;
+        Ok(graph)
+    }
+
+    fn attach_evidence_gate(
+        &self,
+        nodes: &mut [WorkflowNode],
+        evidence_task_id: &akzio_domain::TaskId,
+    ) {
+        for node in nodes {
+            if node.recipe_id != self.catalogue.planner && node.dependencies.is_empty() {
+                node.dependencies.push(evidence_task_id.clone());
+            }
+        }
+    }
+
+    fn aggregate_evidence_needs(
+        &self,
+        nodes: &[WorkflowNode],
+    ) -> RebuildRuntimeResult<Vec<ArtifactRef>> {
+        let mut needs = BTreeMap::new();
+        for node in nodes {
+            let mut task_needs = BTreeSet::new();
+            for reference in &node.input_artifacts {
+                if reference.kind != ArtifactKind::EvidenceNeed
+                    || !task_needs.insert(reference.artifact_id.clone())
+                {
+                    return Err(RebuildRuntimeError::InvalidEvidenceNeed(
+                        node.task_id.clone(),
+                    ));
+                }
+                needs
+                    .entry(reference.artifact_id.clone())
+                    .or_insert_with(|| reference.clone());
+            }
+        }
+        Ok(needs.into_values().collect())
+    }
+
+    fn gate_node(
+        &self,
+        recipe_id: &TaskRecipeId,
+        dependencies: Vec<akzio_domain::TaskId>,
+    ) -> RebuildRuntimeResult<WorkflowNode> {
+        let recipe = self.catalogue.recipe(recipe_id)?;
+        Ok(WorkflowNode {
+            task_id: akzio_domain::TaskId::new(),
+            recipe_id: recipe.recipe_id.clone(),
+            contract_hash: None,
+            objective: format!("Rust-owned {}", recipe.purpose.as_str()),
+            dependencies,
+            input_artifacts: vec![],
+            priority: recipe.priority_ceiling,
+            budget: recipe.budget.clone(),
+            retry: recipe.retry.clone(),
+            on_failure: recipe.on_failure,
+            parent_task_id: None,
+        })
+    }
+
+    fn graph_artifact(
+        &self,
+        graph: &WorkflowGraph,
+        source_refs: Vec<ArtifactRef>,
+        now: DateTime<Utc>,
+    ) -> RebuildRuntimeResult<Artifact> {
+        Ok(Artifact::new(
+            ArtifactKind::WorkflowGraph,
+            self.store.put_json(graph)?,
+            "runtime.workflow",
+            ArtifactLifecycle::RunScoped,
+            ArtifactProvenance {
+                source_family: "akzio.runtime".to_owned(),
+                observed_at: None,
+                retrieved_at: now,
+                source_uri: None,
+                confidence_ppm: 1_000_000,
+                producer_contract_hash: None,
+            },
+            None,
+            source_refs,
+            now,
+        )?)
+    }
+
+    fn is_terminal_node(&self, node: &WorkflowNode) -> bool {
+        self.catalogue.recipe(&node.recipe_id).is_ok_and(|recipe| {
+            matches!(
+                recipe.task_class,
+                RuntimeTaskClass::Evidence
+                    | RuntimeTaskClass::DecisionGate
+                    | RuntimeTaskClass::ExecutionGate
+                    | RuntimeTaskClass::PaperCommit
+                    | RuntimeTaskClass::Reconcile
+                    | RuntimeTaskClass::Evaluate
+            )
+        })
+    }
+}
+
+/// A handler may only report business completion. Claiming, heartbeats,
+/// timeout, cancellation, retry eligibility, and durable terminal commits are
+/// owned by this runtime and its `V2Store` transaction surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RebuildRetryCause {
+    Transport,
+    RateLimited,
+    InvalidOutput,
+    Timeout,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RebuildTaskCompletion {
+    Succeeded(Vec<Artifact>),
+    Failed,
+    Skipped,
+    Cancelled,
+    Retry(RebuildRetryCause),
+}
+
+#[derive(Debug, Clone)]
+pub struct RebuildTaskRuntime {
+    store: V2Store,
+    lease_duration: Duration,
+}
+
+impl RebuildTaskRuntime {
+    pub fn new(store: V2Store) -> Self {
+        Self {
+            store,
+            lease_duration: Duration::seconds(30),
+        }
+    }
+
+    pub fn with_lease_duration(mut self, lease_duration: Duration) -> RebuildRuntimeResult<Self> {
+        if lease_duration <= Duration::zero() {
+            return Err(RebuildRuntimeError::InvalidTaskLeaseDuration);
+        }
+        self.lease_duration = lease_duration;
+        Ok(self)
+    }
+
+    pub fn store(&self) -> &V2Store {
+        &self.store
+    }
+
+    pub async fn run_one<F, Fut>(&self, worker_id: &str, handle: F) -> RebuildRuntimeResult<bool>
+    where
+        F: FnOnce(ClaimedAttempt) -> Fut,
+        Fut: Future<Output = RebuildTaskCompletion>,
+    {
+        let now = Utc::now();
+        self.store.recover_expired_tasks(now)?;
+        let Some(task) = self
+            .store
+            .claim_next_task(worker_id, now, self.lease_duration)?
+        else {
+            return Ok(false);
+        };
+        if self.store.run_cancel_requested(&task.run_id)? {
+            self.store
+                .finish_task(&task.permit, TaskStatus::Cancelled, Utc::now())?;
+            return Ok(true);
+        }
+
+        let heartbeat_millis = u64::try_from(self.lease_duration.num_milliseconds())
+            .map_err(|_| RebuildRuntimeError::InvalidTaskLeaseDuration)?
+            .saturating_div(3)
+            .max(1);
+        let mut heartbeat = tokio::time::interval(StdDuration::from_millis(heartbeat_millis));
+        heartbeat.tick().await;
+        let mut handler = Box::pin(handle(task.clone()));
+        let timeout = tokio::time::sleep(StdDuration::from_secs(u64::from(
+            task.node.budget.max_wall_time_secs,
+        )));
+        tokio::pin!(timeout);
+        let completion = loop {
+            tokio::select! {
+                result = &mut handler => break result,
+                _ = heartbeat.tick() => {
+                    if self.store.run_cancel_requested(&task.run_id)? {
+                        break RebuildTaskCompletion::Cancelled;
+                    }
+                    self.store.heartbeat_task(
+                        &task.permit,
+                        Utc::now() + self.lease_duration,
+                    )?;
+                }
+                _ = &mut timeout => break RebuildTaskCompletion::Retry(RebuildRetryCause::Timeout),
+            }
+        };
+        self.finish(&task, completion, Utc::now())?;
+        Ok(true)
+    }
+
+    fn finish(
+        &self,
+        task: &ClaimedAttempt,
+        completion: RebuildTaskCompletion,
+        now: DateTime<Utc>,
+    ) -> RebuildRuntimeResult<()> {
+        match completion {
+            RebuildTaskCompletion::Succeeded(artifacts) => {
+                self.store
+                    .commit_attempt(&task.permit, &artifacts, TaskStatus::Succeeded, now)?;
+            }
+            RebuildTaskCompletion::Failed => {
+                self.store
+                    .finish_task(&task.permit, TaskStatus::Failed, now)?;
+            }
+            RebuildTaskCompletion::Skipped => {
+                self.store
+                    .finish_task(&task.permit, TaskStatus::Skipped, now)?;
+            }
+            RebuildTaskCompletion::Cancelled => {
+                self.store
+                    .finish_task(&task.permit, TaskStatus::Cancelled, now)?;
+            }
+            RebuildTaskCompletion::Retry(cause) => {
+                if self.retry_allowed(task, cause) {
+                    let retry_at = self.retry_at(task, now)?;
+                    match self.store.retry_task(&task.permit, retry_at, now)? {
+                        RetryTaskResult::Requeued | RetryTaskResult::Terminal(_) => {}
+                    }
+                } else {
+                    self.store
+                        .finish_task(&task.permit, TaskStatus::Failed, now)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn retry_allowed(&self, task: &ClaimedAttempt, cause: RebuildRetryCause) -> bool {
+        match cause {
+            RebuildRetryCause::Transport | RebuildRetryCause::Timeout => {
+                task.node.retry.retry_transport
+            }
+            RebuildRetryCause::RateLimited => task.node.retry.retry_rate_limited,
+            RebuildRetryCause::InvalidOutput => task.node.retry.retry_invalid_output,
+        }
+    }
+
+    fn retry_at(
+        &self,
+        task: &ClaimedAttempt,
+        now: DateTime<Utc>,
+    ) -> RebuildRuntimeResult<DateTime<Utc>> {
+        let milliseconds = i64::try_from(task.node.retry.initial_backoff_ms)
+            .map_err(|_| RebuildRuntimeError::InvalidRetryBackoff)?;
+        now.checked_add_signed(Duration::milliseconds(milliseconds))
+            .ok_or(RebuildRuntimeError::InvalidRetryBackoff)
+    }
+}
+
+fn required_terminal<'a>(
+    terminals: &BTreeMap<TaskRecipeId, &'a WorkflowNode>,
+    recipe_id: &TaskRecipeId,
+) -> RebuildRuntimeResult<&'a WorkflowNode> {
+    terminals
+        .get(recipe_id)
+        .copied()
+        .ok_or_else(|| RebuildRuntimeError::MissingTerminalGate(recipe_id.clone()))
+}
+
+fn leaf_ids(nodes: &[WorkflowNode]) -> Vec<akzio_domain::TaskId> {
+    let depended_on = nodes
+        .iter()
+        .flat_map(|node| node.dependencies.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    nodes
+        .iter()
+        .map(|node| node.task_id.clone())
+        .filter(|task_id| !depended_on.contains(task_id))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use akzio_domain::{
+        ArtifactOrigin, ContentHash, ContractPurpose, FailureDisposition, RetryPolicy, TaskBudget,
+        WorkflowProposalTask,
+    };
+    use tempfile::tempdir;
+
+    use super::*;
+
+    fn budget() -> TaskBudget {
+        TaskBudget {
+            max_input_tokens: 100,
+            max_output_tokens: 50,
+            max_wall_time_secs: 30,
+            max_tool_calls: 2,
+        }
+    }
+
+    fn retry() -> RetryPolicy {
+        RetryPolicy {
+            max_attempts: 2,
+            initial_backoff_ms: 0,
+            retry_transport: true,
+            retry_rate_limited: true,
+            retry_invalid_output: false,
+        }
+    }
+
+    fn recipe(id: &str, class: RuntimeTaskClass, agent: bool) -> TaskRecipe {
+        TaskRecipe {
+            recipe_id: TaskRecipeId::new(id).unwrap(),
+            purpose: ContractPurpose::new(id).unwrap(),
+            contract_hash: agent.then(|| ContentHash::of_bytes(id.as_bytes())),
+            task_class: class,
+            max_children: 8,
+            max_depth: 2,
+            priority_ceiling: 100,
+            budget: budget(),
+            retry: retry(),
+            on_failure: FailureDisposition::FailRun,
+        }
+    }
+
+    fn catalogue() -> RecipeCatalogue {
+        let mut analyst = recipe("research.analyst", RuntimeTaskClass::Agent, true);
+        analyst.max_children = 1;
+        analyst.max_depth = 1;
+        RecipeCatalogue::new(
+            [
+                recipe("research.planner", RuntimeTaskClass::Agent, true),
+                analyst,
+                recipe("research.critic", RuntimeTaskClass::Agent, true),
+                recipe("gate.evidence", RuntimeTaskClass::Evidence, false),
+                recipe("gate.decision", RuntimeTaskClass::DecisionGate, false),
+                recipe("gate.execution", RuntimeTaskClass::ExecutionGate, false),
+                recipe("gate.paper", RuntimeTaskClass::PaperCommit, false),
+                recipe("gate.reconcile", RuntimeTaskClass::Reconcile, false),
+                recipe("gate.evaluate", RuntimeTaskClass::Evaluate, false),
+            ],
+            TaskRecipeId::new("research.planner").unwrap(),
+            TerminalRecipeSet {
+                evidence_gate: TaskRecipeId::new("gate.evidence").unwrap(),
+                decision_gate: TaskRecipeId::new("gate.decision").unwrap(),
+                execution_gate: TaskRecipeId::new("gate.execution").unwrap(),
+                paper_commit: TaskRecipeId::new("gate.paper").unwrap(),
+                reconcile: TaskRecipeId::new("gate.reconcile").unwrap(),
+                evaluate: TaskRecipeId::new("gate.evaluate").unwrap(),
+            },
+            32,
+        )
+        .unwrap()
+    }
+
+    fn proposal() -> WorkflowProposal {
+        WorkflowProposal {
+            schema_version: REBUILD_SCHEMA_VERSION,
+            topology_id: "active".to_owned(),
+            tasks: BTreeMap::from([
+                (
+                    "analyst".to_owned(),
+                    WorkflowProposalTask {
+                        recipe_id: TaskRecipeId::new("research.analyst").unwrap(),
+                        objective: "analyse evidence".to_owned(),
+                        depends_on: vec![],
+                        priority: 80,
+                        evidence_needs: vec![],
+                    },
+                ),
+                (
+                    "critic".to_owned(),
+                    WorkflowProposalTask {
+                        recipe_id: TaskRecipeId::new("research.critic").unwrap(),
+                        objective: "challenge claim".to_owned(),
+                        depends_on: vec!["analyst".to_owned()],
+                        priority: 70,
+                        evidence_needs: vec![],
+                    },
+                ),
+            ]),
+            stop_reason: None,
+        }
+    }
+
+    fn proposal_artifact(
+        store: &V2Store,
+        planner: &ClaimedAttempt,
+        proposal: &WorkflowProposal,
+        now: DateTime<Utc>,
+    ) -> Artifact {
+        Artifact::new(
+            ArtifactKind::WorkflowProposal,
+            store.put_json(proposal).unwrap(),
+            "agent.planner",
+            ArtifactLifecycle::RunScoped,
+            ArtifactProvenance {
+                source_family: "akzio.agent".to_owned(),
+                observed_at: None,
+                retrieved_at: now,
+                source_uri: None,
+                confidence_ppm: 1_000_000,
+                producer_contract_hash: planner.permit.contract_hash.clone(),
+            },
+            Some(ArtifactOrigin {
+                run_id: Some(planner.run_id.clone()),
+                task_id: Some(planner.node.task_id.clone()),
+                attempt_id: Some(planner.permit.attempt_id.clone()),
+                contract_hash: planner.permit.contract_hash.clone(),
+            }),
+            vec![],
+            now,
+        )
+        .unwrap()
+    }
+
+    fn task_artifact(store: &V2Store, task: &ClaimedAttempt, now: DateTime<Utc>) -> Artifact {
+        let blob = store
+            .put_bytes(b"task output", "text/plain; charset=utf-8")
+            .unwrap();
+        Artifact::new(
+            ArtifactKind::AgentTurn,
+            blob,
+            "runtime.fixture",
+            ArtifactLifecycle::RunScoped,
+            ArtifactProvenance {
+                source_family: "fixture".to_owned(),
+                observed_at: None,
+                retrieved_at: now,
+                source_uri: None,
+                confidence_ppm: 1_000_000,
+                producer_contract_hash: task.permit.contract_hash.clone(),
+            },
+            Some(ArtifactOrigin {
+                run_id: Some(task.run_id.clone()),
+                task_id: Some(task.node.task_id.clone()),
+                attempt_id: Some(task.permit.attempt_id.clone()),
+                contract_hash: task.permit.contract_hash.clone(),
+            }),
+            vec![],
+            now,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn planner_graph_gets_non_bypassable_terminal_gates() {
+        let root = tempdir().unwrap();
+        let runtime = RebuildWorkflowRuntime::new(V2Store::open(root.path()).unwrap(), catalogue());
+        let graph = runtime.bootstrap(RunPurpose::Debug, "active").unwrap();
+        assert_eq!(graph.nodes.len(), 6);
+        assert!(graph
+            .nodes
+            .iter()
+            .any(|node| node.recipe_id.as_str() == "gate.evidence"));
+        assert!(graph
+            .nodes
+            .iter()
+            .any(|node| node.recipe_id.as_str() == "gate.decision"));
+        assert!(!graph
+            .nodes
+            .iter()
+            .any(|node| node.recipe_id.as_str() == "gate.paper"));
+        graph.validate().unwrap();
+    }
+
+    #[test]
+    fn planner_cannot_schedule_a_terminal_gate() {
+        let root = tempdir().unwrap();
+        let runtime = RebuildWorkflowRuntime::new(V2Store::open(root.path()).unwrap(), catalogue());
+        let mut proposal = proposal();
+        proposal.tasks.insert(
+            "escape".to_owned(),
+            WorkflowProposalTask {
+                recipe_id: TaskRecipeId::new("gate.execution").unwrap(),
+                objective: "bypass".to_owned(),
+                depends_on: vec![],
+                priority: 100,
+                evidence_needs: vec![],
+            },
+        );
+        assert!(matches!(
+            runtime.lower(RunPurpose::Debug, &proposal),
+            Err(RebuildRuntimeError::TerminalRecipeInProposal(_))
+        ));
+    }
+
+    #[test]
+    fn proposal_lowering_enforces_recipe_fanout_and_depth_limits() {
+        let root = tempdir().unwrap();
+        let runtime = RebuildWorkflowRuntime::new(V2Store::open(root.path()).unwrap(), catalogue());
+
+        let mut fanout = proposal();
+        fanout.tasks.insert(
+            "parallel".to_owned(),
+            WorkflowProposalTask {
+                recipe_id: TaskRecipeId::new("research.critic").unwrap(),
+                objective: "parallel review".to_owned(),
+                depends_on: vec!["analyst".to_owned()],
+                priority: 60,
+                evidence_needs: vec![],
+            },
+        );
+        assert!(matches!(
+            runtime.lower(RunPurpose::Debug, &fanout),
+            Err(RebuildRuntimeError::WorkflowFanoutLimit { .. })
+        ));
+
+        let mut depth = proposal();
+        depth.tasks.insert(
+            "grandchild".to_owned(),
+            WorkflowProposalTask {
+                recipe_id: TaskRecipeId::new("research.critic").unwrap(),
+                objective: "deeper review".to_owned(),
+                depends_on: vec!["critic".to_owned()],
+                priority: 60,
+                evidence_needs: vec![],
+            },
+        );
+        assert!(matches!(
+            runtime.lower(RunPurpose::Debug, &depth),
+            Err(RebuildRuntimeError::WorkflowDepthLimit { .. })
+        ));
+    }
+
+    #[test]
+    fn proposal_rejects_cycles_unknown_recipes_and_priority_escalation() {
+        let root = tempdir().unwrap();
+        let runtime = RebuildWorkflowRuntime::new(V2Store::open(root.path()).unwrap(), catalogue());
+
+        let mut cyclic = proposal();
+        cyclic.tasks.get_mut("analyst").unwrap().depends_on = vec!["critic".to_owned()];
+        assert!(matches!(
+            runtime.lower(RunPurpose::Debug, &cyclic),
+            Err(RebuildRuntimeError::Domain(DomainError::CyclicPlan))
+        ));
+
+        let mut unknown = proposal();
+        unknown.tasks.get_mut("analyst").unwrap().recipe_id =
+            TaskRecipeId::new("research.uninstalled").unwrap();
+        assert!(matches!(
+            runtime.lower(RunPurpose::Debug, &unknown),
+            Err(RebuildRuntimeError::Domain(DomainError::EmptyField {
+                field: "workflow_proposal.recipe"
+            }))
+        ));
+
+        let mut escalated = proposal();
+        escalated.tasks.get_mut("analyst").unwrap().priority = 101;
+        assert!(matches!(
+            runtime.lower(RunPurpose::Debug, &escalated),
+            Err(RebuildRuntimeError::Domain(
+                DomainError::InvalidBudget { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn evidence_gate_aggregates_unique_evidence_needs_and_rejects_other_kinds() {
+        let root = tempdir().unwrap();
+        let runtime = RebuildWorkflowRuntime::new(V2Store::open(root.path()).unwrap(), catalogue());
+        let need = ArtifactRef {
+            artifact_id: akzio_domain::ArtifactId(ContentHash::of_bytes(b"evidence-need")),
+            kind: ArtifactKind::EvidenceNeed,
+        };
+        let mut proposed = proposal();
+        proposed.tasks.get_mut("analyst").unwrap().evidence_needs = vec![need.clone()];
+        proposed.tasks.get_mut("critic").unwrap().evidence_needs = vec![need.clone()];
+
+        let graph = runtime.lower(RunPurpose::Debug, &proposed).unwrap();
+        let evidence_gate = graph
+            .nodes
+            .iter()
+            .find(|node| node.recipe_id.as_str() == "gate.evidence")
+            .unwrap();
+        assert_eq!(evidence_gate.input_artifacts, vec![need]);
+
+        proposed.tasks.get_mut("analyst").unwrap().evidence_needs[0].kind = ArtifactKind::Claim;
+        assert!(matches!(
+            runtime.lower(RunPurpose::Debug, &proposed),
+            Err(RebuildRuntimeError::Domain(DomainError::EmptyField {
+                field: "workflow_proposal.evidence_needs"
+            }))
+        ));
+    }
+
+    #[test]
+    fn independent_research_nodes_are_claimable_in_parallel() {
+        let root = tempdir().unwrap();
+        let store = V2Store::open(root.path()).unwrap();
+        let runtime = RebuildWorkflowRuntime::new(store.clone(), catalogue());
+        let mut parallel = proposal();
+        parallel.tasks.insert(
+            "parallel".to_owned(),
+            WorkflowProposalTask {
+                recipe_id: TaskRecipeId::new("research.critic").unwrap(),
+                objective: "independent review".to_owned(),
+                depends_on: vec![],
+                priority: 60,
+                evidence_needs: vec![],
+            },
+        );
+        let graph = runtime.lower(RunPurpose::Debug, &parallel).unwrap();
+        let run_id = RunId::new();
+        runtime
+            .submit(run_id, RunPurpose::Debug, graph, Utc::now())
+            .unwrap();
+
+        let evidence = store
+            .claim_next_task("evidence-worker", Utc::now(), Duration::seconds(30))
+            .unwrap()
+            .unwrap();
+        assert_eq!(evidence.node.recipe_id.as_str(), "gate.evidence");
+        let evidence_output = task_artifact(&store, &evidence, Utc::now());
+        store
+            .commit_attempt(
+                &evidence.permit,
+                &[evidence_output],
+                TaskStatus::Succeeded,
+                Utc::now(),
+            )
+            .unwrap();
+
+        let first = store
+            .claim_next_task("worker-a", Utc::now(), Duration::seconds(30))
+            .unwrap()
+            .unwrap();
+        let second = store
+            .claim_next_task("worker-b", Utc::now(), Duration::seconds(30))
+            .unwrap()
+            .unwrap();
+        assert_ne!(first.node.task_id, second.node.task_id);
+        assert_eq!(first.node.objective, "analyse evidence");
+        assert_eq!(second.node.objective, "independent review");
+    }
+
+    #[test]
+    fn dynamic_patch_extends_research_without_replacing_terminal_chain() {
+        let root = tempdir().unwrap();
+        let store = V2Store::open(root.path()).unwrap();
+        let runtime = RebuildWorkflowRuntime::new(store.clone(), catalogue());
+        let graph = runtime.bootstrap(RunPurpose::Debug, "active").unwrap();
+        let run_id = RunId::new();
+        let first = runtime
+            .submit(run_id.clone(), RunPurpose::Debug, graph.clone(), Utc::now())
+            .unwrap();
+        let planner = store
+            .claim_next_task("planner-worker", Utc::now(), Duration::seconds(30))
+            .unwrap()
+            .unwrap();
+        assert_eq!(planner.node.recipe_id.as_str(), "research.planner");
+        let mut expansion = proposal();
+        let follow_up = expansion.tasks.remove("analyst").unwrap();
+        expansion.tasks = BTreeMap::from([("follow_up".to_owned(), follow_up)]);
+        let expansion_artifact = proposal_artifact(&store, &planner, &expansion, Utc::now());
+        let second = runtime
+            .apply_proposal(&planner, &first, &graph, &expansion_artifact, Utc::now())
+            .unwrap();
+        let patched: WorkflowGraph =
+            serde_json::from_slice(&store.read_blob(&second.blob).unwrap()).unwrap();
+        assert_eq!(
+            store.artifact(&expansion_artifact.artifact_id).unwrap(),
+            expansion_artifact
+        );
+        assert!(second.source_refs.contains(&ArtifactRef {
+            artifact_id: first.artifact_id.clone(),
+            kind: ArtifactKind::WorkflowGraph,
+        }));
+        assert!(second.source_refs.contains(&ArtifactRef {
+            artifact_id: expansion_artifact.artifact_id.clone(),
+            kind: ArtifactKind::WorkflowProposal,
+        }));
+        assert!(matches!(
+            store.validate_task_permit(&planner.permit),
+            Err(StoreError::StalePermit(_))
+        ));
+        let recovered = runtime.recover(&run_id).unwrap();
+        assert_eq!(recovered.revision.revision, 1);
+        assert_eq!(recovered.revision.graph, patched);
+        assert_eq!(runtime.replay_revision(&run_id, 0).unwrap().graph, graph);
+        assert_eq!(
+            recovered
+                .tasks
+                .iter()
+                .map(|task| task.node.task_id.clone())
+                .collect::<BTreeSet<_>>(),
+            patched
+                .nodes
+                .iter()
+                .map(|node| node.task_id.clone())
+                .collect::<BTreeSet<_>>()
+        );
+        let evidence = store
+            .claim_next_task("evidence-worker", Utc::now(), Duration::seconds(30))
+            .unwrap()
+            .unwrap();
+        assert_eq!(evidence.node.recipe_id.as_str(), "gate.evidence");
+        assert!(store
+            .events_after(&run_id, 0, 100)
+            .unwrap()
+            .iter()
+            .any(|event| {
+                event.event_type == "workflow.patched"
+                    && event.artifact_id.as_ref() == Some(&second.artifact_id)
+            }));
+        for recipe in [
+            "gate.evidence",
+            "gate.decision",
+            "gate.execution",
+            "gate.reconcile",
+            "gate.evaluate",
+        ] {
+            let before = graph
+                .nodes
+                .iter()
+                .find(|node| node.recipe_id.as_str() == recipe)
+                .unwrap();
+            let after = patched
+                .nodes
+                .iter()
+                .find(|node| node.recipe_id.as_str() == recipe)
+                .unwrap();
+            assert_eq!(before.task_id, after.task_id);
+        }
+        let decision = patched
+            .nodes
+            .iter()
+            .find(|node| node.recipe_id.as_str() == "gate.decision")
+            .unwrap();
+        assert_eq!(decision.dependencies.len(), 1);
+        assert!(matches!(
+            runtime.bootstrap(RunPurpose::Paper, "active"),
+            Err(RebuildRuntimeError::PaperWorkflowRequiresPrecompiledProposal)
+        ));
+    }
+
+    #[test]
+    fn planner_proposal_cannot_be_replayed_after_atomic_commit() {
+        let root = tempdir().unwrap();
+        let store = V2Store::open(root.path()).unwrap();
+        let workflow = RebuildWorkflowRuntime::new(store.clone(), catalogue());
+        let graph = workflow.bootstrap(RunPurpose::Debug, "active").unwrap();
+        let run_id = RunId::new();
+        let first = workflow
+            .submit(run_id.clone(), RunPurpose::Debug, graph.clone(), Utc::now())
+            .unwrap();
+        let planner = store
+            .claim_next_task("planner-worker", Utc::now(), Duration::seconds(30))
+            .unwrap()
+            .unwrap();
+        let expansion = proposal();
+        let proposal_artifact = proposal_artifact(&store, &planner, &expansion, Utc::now());
+        let second = workflow
+            .apply_proposal(&planner, &first, &graph, &proposal_artifact, Utc::now())
+            .unwrap();
+        let patched: WorkflowGraph =
+            serde_json::from_slice(&store.read_blob(&second.blob).unwrap()).unwrap();
+        let events_before = store.events_after(&run_id, 0, 100).unwrap();
+
+        assert!(matches!(
+            workflow.apply_proposal(&planner, &second, &patched, &proposal_artifact, Utc::now(),),
+            Err(RebuildRuntimeError::Store(StoreError::StalePermit(_)))
+        ));
+        assert_eq!(store.events_after(&run_id, 0, 100).unwrap(), events_before);
+    }
+
+    #[tokio::test]
+    async fn task_runtime_retries_then_commits_outputs_with_a_new_attempt() {
+        let root = tempdir().unwrap();
+        let store = V2Store::open(root.path()).unwrap();
+        let workflow = RebuildWorkflowRuntime::new(store.clone(), catalogue());
+        let graph = workflow.lower(RunPurpose::Debug, &proposal()).unwrap();
+        let run_id = RunId::new();
+        workflow
+            .submit(run_id.clone(), RunPurpose::Debug, graph, Utc::now())
+            .unwrap();
+        let tasks = RebuildTaskRuntime::new(store.clone())
+            .with_lease_duration(Duration::seconds(3))
+            .unwrap();
+        assert!(tasks
+            .run_one("worker", |_| async {
+                RebuildTaskCompletion::Retry(RebuildRetryCause::Transport)
+            })
+            .await
+            .unwrap());
+        assert!(tasks
+            .run_one("worker", move |task| {
+                let artifact = task_artifact(&store, &task, Utc::now());
+                async move { RebuildTaskCompletion::Succeeded(vec![artifact]) }
+            })
+            .await
+            .unwrap());
+        let events = tasks.store().events_after(&run_id, 0, 100).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "task.retry_scheduled")
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "task.started")
+                .count(),
+            2
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "task.succeeded")
+                .count(),
+            1
+        );
+        let first_page = tasks.store().events_after(&run_id, 0, 2).unwrap();
+        let cursor = first_page.last().unwrap().cursor;
+        let mut replay = first_page;
+        replay.extend(tasks.store().events_after(&run_id, cursor, 100).unwrap());
+        assert_eq!(replay, events);
+    }
+
+    #[tokio::test]
+    async fn task_runtime_recovers_expired_attempt_and_honors_cancel_requests() {
+        let root = tempdir().unwrap();
+        let store = V2Store::open(root.path()).unwrap();
+        let workflow = RebuildWorkflowRuntime::new(store.clone(), catalogue());
+        let graph = workflow.lower(RunPurpose::Debug, &proposal()).unwrap();
+        let run_id = RunId::new();
+        workflow
+            .submit(run_id.clone(), RunPurpose::Debug, graph, Utc::now())
+            .unwrap();
+        let abandoned = store
+            .claim_next_task("crashed-worker", Utc::now(), Duration::milliseconds(-1))
+            .unwrap()
+            .unwrap();
+        let abandoned_task_id = abandoned.node.task_id.clone();
+        let before_recovery = workflow.recover(&run_id).unwrap();
+        assert_eq!(
+            before_recovery
+                .tasks
+                .iter()
+                .find(|task| task.node.task_id == abandoned_task_id)
+                .unwrap()
+                .active_attempt
+                .as_ref()
+                .unwrap()
+                .permit,
+            abandoned.permit
+        );
+        let tasks = RebuildTaskRuntime::new(store.clone())
+            .with_lease_duration(Duration::seconds(3))
+            .unwrap();
+        let old_permit = abandoned.permit.clone();
+        let old_attempt_id = old_permit.attempt_id.clone();
+        let old_epoch = old_permit.epoch;
+        assert!(tasks
+            .run_one("recovery-worker", move |task| {
+                assert_ne!(task.permit.attempt_id, old_attempt_id);
+                assert!(task.permit.epoch > old_epoch);
+                let artifact = task_artifact(&store, &task, Utc::now());
+                async move { RebuildTaskCompletion::Succeeded(vec![artifact]) }
+            })
+            .await
+            .unwrap());
+        let after_recovery = workflow.recover(&run_id).unwrap();
+        assert_eq!(after_recovery.revision, before_recovery.revision);
+        assert_eq!(
+            after_recovery
+                .tasks
+                .iter()
+                .map(|task| task.node.task_id.clone())
+                .collect::<BTreeSet<_>>(),
+            before_recovery
+                .tasks
+                .iter()
+                .map(|task| task.node.task_id.clone())
+                .collect::<BTreeSet<_>>()
+        );
+        let recovered_task = after_recovery
+            .tasks
+            .iter()
+            .find(|task| task.node.task_id == abandoned_task_id)
+            .unwrap();
+        assert_eq!(recovered_task.status, TaskStatus::Succeeded);
+        assert_eq!(recovered_task.attempt_count, 2);
+        assert!(recovered_task.active_attempt.is_none());
+        assert!(matches!(
+            tasks
+                .store()
+                .finish_task(&old_permit, TaskStatus::Skipped, Utc::now()),
+            Err(StoreError::StalePermit(_))
+        ));
+        assert!(tasks
+            .store()
+            .request_run_cancel(&run_id, "operator", Utc::now())
+            .unwrap());
+        assert!(!tasks
+            .store()
+            .request_run_cancel(&run_id, "operator", Utc::now())
+            .unwrap());
+        assert!(!tasks
+            .run_one("cancelled-worker", |_| async {
+                panic!("cancelled run must not dispatch")
+            })
+            .await
+            .unwrap());
+        let events = tasks.store().events_after(&run_id, 0, 100).unwrap();
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "task.recovered"));
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "run.cancel_requested"));
+    }
+
+    #[test]
+    fn submit_rejects_graphs_that_bypass_or_mutate_rust_terminal_gates() {
+        let root = tempdir().unwrap();
+        let runtime = RebuildWorkflowRuntime::new(V2Store::open(root.path()).unwrap(), catalogue());
+        let mut missing_gate = runtime.lower(RunPurpose::Debug, &proposal()).unwrap();
+        missing_gate
+            .nodes
+            .retain(|node| node.recipe_id.as_str() != "gate.evaluate");
+        missing_gate.validate().unwrap();
+        assert!(matches!(
+            runtime.submit(RunId::new(), RunPurpose::Debug, missing_gate, Utc::now()),
+            Err(RebuildRuntimeError::MissingTerminalGate(_))
+        ));
+
+        let mut altered_gate = runtime.lower(RunPurpose::Debug, &proposal()).unwrap();
+        altered_gate
+            .nodes
+            .iter_mut()
+            .find(|node| node.recipe_id.as_str() == "gate.execution")
+            .unwrap()
+            .dependencies
+            .clear();
+        altered_gate.validate().unwrap();
+        assert!(matches!(
+            runtime.submit(RunId::new(), RunPurpose::Debug, altered_gate, Utc::now()),
+            Err(RebuildRuntimeError::InvalidTerminalDependencies(_))
+        ));
+    }
+
+    #[test]
+    fn submit_rejects_nodes_that_diverge_from_the_installed_recipe() {
+        let root = tempdir().unwrap();
+        let runtime = RebuildWorkflowRuntime::new(V2Store::open(root.path()).unwrap(), catalogue());
+        let mut graph = runtime.lower(RunPurpose::Debug, &proposal()).unwrap();
+        graph
+            .nodes
+            .iter_mut()
+            .find(|node| node.recipe_id.as_str() == "research.analyst")
+            .unwrap()
+            .budget
+            .max_output_tokens = 49;
+        graph.validate().unwrap();
+        assert!(matches!(
+            runtime.submit(RunId::new(), RunPurpose::Debug, graph, Utc::now()),
+            Err(RebuildRuntimeError::NodeRecipeMismatch(_))
+        ));
+    }
+}

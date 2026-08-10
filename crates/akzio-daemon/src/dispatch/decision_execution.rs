@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use akzio_context::{ContextBroker, NewJsonDocument};
+use akzio_context::legacy::{ContextBroker, NewJsonDocument};
 use akzio_domain::{
     Asset, DocumentKind, DocumentLifecycle, DocumentOrigin, MoneyMicros, RunId, RunPurpose,
 };
@@ -10,7 +10,7 @@ use akzio_execution::{
     paper::AlpacaPaper, AccountSnapshot, ExecutionPlan, ExecutionRunContext, ExecutionRuntime,
     ExecutionRuntimeError, Position, Quote,
 };
-use akzio_ingest::{IngestConfig, Ingestor};
+use akzio_ingest::legacy::{IngestConfig, Ingestor};
 use akzio_learning::LearningLedger;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -220,7 +220,7 @@ mod tests {
         sync::{Mutex, MutexGuard},
     };
 
-    use akzio_context::ContextBroker;
+    use akzio_context::legacy::ContextBroker;
     use akzio_domain::{AttemptId, DocumentKind, DocumentOrigin, RunId, RunPurpose, TaskId};
     use chrono::Utc;
     use tempfile::tempdir;

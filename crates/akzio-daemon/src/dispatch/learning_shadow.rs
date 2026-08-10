@@ -1,11 +1,11 @@
 //! Memory overlay, outcome scheduling, and paired shadow launch.
 
-use akzio_context::{ContextBroker, NewJsonDocument};
+use akzio_context::legacy::{ContextBroker, NewJsonDocument};
 use akzio_domain::{
     DocumentKind, DocumentLifecycle, DocumentOrigin, PortfolioDecision, RunId, RunPurpose, TaskKind,
 };
 use akzio_learning::{LearningLedger, StoredMemory, TopologyLedger};
-use akzio_research::{bootstrap_workflow, shadow_topology};
+use akzio_research::legacy::{bootstrap_workflow, shadow_topology};
 use chrono::{DateTime, Utc};
 
 use crate::{Daemon, DaemonError, Result};

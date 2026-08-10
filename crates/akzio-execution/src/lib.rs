@@ -3,8 +3,31 @@
 //! This module has no model dependency.  An agent may explain a decision, but
 //! only this module can turn a target allocation into broker-safe order intent.
 
+pub mod allocation;
+pub mod execution_gate;
 pub mod paper;
+pub mod paper_commitment;
+pub mod policy;
+pub mod reconciliation;
+pub mod reprice;
 pub mod runtime;
+
+pub use allocation::{AllocationError, AllocationInput, V2AllocationRuntime};
+pub use execution_gate::{
+    ExecutionGateError, ExecutionGateInput, ExecutionGateOutput, V2ExecutionRuntime,
+};
+pub use paper::{
+    PaperDispatchError, PaperDispatchInput, PaperDispatchOutput, PaperRepriceDispatchInput,
+    V2PaperDispatchRuntime,
+};
+pub use paper_commitment::{
+    PaperCommitmentError, PaperCommitmentInput, PaperCommitmentOutput, V2PaperCommitmentRuntime,
+};
+pub use policy::ExecutionGatePolicy;
+pub use reconciliation::{
+    ReconciliationError, ReconciliationInput, ReconciliationOutput, V2ReconciliationRuntime,
+};
+pub use reprice::{RepriceError, RepriceInput, RepriceOutput, V2RepriceRuntime};
 
 pub use runtime::{
     DecisionGatePolicy, ExecutionRunContext, ExecutionRuntime, ExecutionRuntimeError,
@@ -215,7 +238,7 @@ fn scaled_weight(equity: MoneyMicros, weight: WeightPpm) -> MoneyMicros {
     MoneyMicros(equity.0.saturating_mul(weight.0 as i64) / WEIGHT_SCALE)
 }
 
-fn validate_quote(
+pub(crate) fn validate_quote(
     max_age_secs: i64,
     max_spread_bps: u32,
     asset: Asset,
@@ -236,7 +259,11 @@ fn validate_quote(
     Ok(())
 }
 
-fn protected_limit_price(quote: Quote, side: OrderSide, protection_bps: u32) -> MoneyMicros {
+pub(crate) fn protected_limit_price(
+    quote: Quote,
+    side: OrderSide,
+    protection_bps: u32,
+) -> MoneyMicros {
     let protection = protection_bps as i64;
     match side {
         OrderSide::Buy => {

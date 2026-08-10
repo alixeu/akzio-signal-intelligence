@@ -1,10 +1,11 @@
 [daemon]
-store_root = "outputs/v2-store"
+store_root = "outputs/akzio-v2-rebuild"
 http_addr = "127.0.0.1:7342"
-unix_socket = "outputs/v2-store/akzio.sock"
+# Transitional internal setting. R9 removes the Unix business transport; do not add callers.
+unix_socket = "outputs/akzio-v2-rebuild/akzio.sock"
 token_env = "AKZIO_DAEMON_TOKEN"
 worker_count = 4
-auto_paper = true
+auto_paper = false
 
 [execution]
 assets = ["TQQQ", "QQQ", "SOXX", "SOXL"]

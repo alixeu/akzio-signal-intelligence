@@ -5,13 +5,13 @@ mod learning_shadow;
 mod research_ingest;
 mod value;
 
-use akzio_context::{ContextBroker, NewJsonDocument};
+use akzio_context::legacy::{ContextBroker, NewJsonDocument};
 use akzio_domain::{
     DocumentKind, DocumentLifecycle, DocumentOrigin, DocumentRecord, RunId, TaskKind,
 };
-use akzio_research::execute_research_task;
-use akzio_runtime::TaskCompletion;
-use akzio_store::ClaimedTask;
+use akzio_research::legacy::execute_research_task;
+use akzio_runtime::legacy::TaskCompletion;
+use akzio_store::legacy::ClaimedTask;
 use chrono::{DateTime, Duration, Utc};
 
 use crate::{Daemon, DaemonError, Result};

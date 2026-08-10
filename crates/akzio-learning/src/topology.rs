@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use akzio_context::{ContextBroker, NewJsonDocument};
+use akzio_context::legacy::{ContextBroker, NewJsonDocument};
 use akzio_domain::{
     ContentHash, DocumentId, DocumentKind, DocumentLifecycle, DocumentOrigin, DocumentRecord,
     PortfolioDecision, Provenance, RunId, TargetPortfolio, TopologyId, V2_SCHEMA_VERSION,
@@ -782,9 +782,9 @@ fn replace_if_newer<K: Ord, V>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use akzio_context::NewJsonDocument;
+    use akzio_context::legacy::NewJsonDocument;
     use akzio_domain::{DocumentLifecycle, RunPurpose};
-    use akzio_store::V2Store;
+    use akzio_store::legacy::V2Store;
     use tempfile::tempdir;
 
     fn metrics(utility_micros: i64, risk_recall_ppm: u32, evidence_ppm: u32) -> TopologyMetrics {
@@ -851,7 +851,7 @@ mod tests {
             policy_hash: ContentHash::of_bytes(b"test-policy"),
             created_at: now,
             valid_until: now + chrono::Duration::hours(1),
-            draft: akzio_domain::DecisionDraft {
+            draft: akzio_domain::LegacyDecisionDraft {
                 summary: "topology test".to_owned(),
                 targets,
                 confidence_ppm: 500_000,

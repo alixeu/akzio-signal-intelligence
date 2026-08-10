@@ -1,13 +1,13 @@
-//! Manifest-and-grant context broker for the rebuilt v2 runtime.
+//! Manifest-and-grant context broker for the v2 runtime.
 
 use std::collections::{BTreeSet, VecDeque};
 
 use akzio_domain::{
-    content_hash_json, Artifact, ArtifactId, ArtifactKind, ArtifactLifecycle, ArtifactOrigin,
-    ArtifactProvenance, ArtifactRef, ContextGrant, ContextManifestPayload, ContextPolicy,
-    ContextSelection, ContractSpec, DomainError, TaskWritePermit,
+    content_hash_json, AgentContract, Artifact, ArtifactId, ArtifactKind, ArtifactLifecycle,
+    ArtifactOrigin, ArtifactProvenance, ArtifactRef, ContextManifestPayload, ContextPolicy,
+    ContextSelection, DomainError, ReadGrant, TaskWritePermit, V2_DOMAIN_SCHEMA_VERSION,
 };
-use akzio_store::{RebuildStore, RebuildStoreError};
+use akzio_store::v2::{StoreError, V2Store};
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 use thiserror::Error;
@@ -15,7 +15,7 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum RebuildContextError {
     #[error(transparent)]
-    Store(#[from] RebuildStoreError),
+    Store(#[from] StoreError),
     #[error(transparent)]
     Domain(#[from] DomainError),
     #[error(transparent)]
@@ -41,22 +41,22 @@ pub type RebuildContextResult<T> = Result<T, RebuildContextError>;
 
 #[derive(Debug, Clone)]
 pub struct RebuildContextBroker {
-    store: RebuildStore,
+    store: V2Store,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RebuildContextManifest {
     pub artifact: Artifact,
     pub payload: ContextManifestPayload,
-    pub grant: ContextGrant,
+    pub grant: ReadGrant,
 }
 
 impl RebuildContextBroker {
-    pub fn new(store: RebuildStore) -> Self {
+    pub fn new(store: V2Store) -> Self {
         Self { store }
     }
 
-    pub fn store(&self) -> &RebuildStore {
+    pub fn store(&self) -> &V2Store {
         &self.store
     }
 
@@ -66,7 +66,7 @@ impl RebuildContextBroker {
     pub fn assemble(
         &self,
         permit: &TaskWritePermit,
-        contract: &ContractSpec,
+        contract: &AgentContract,
         candidates: impl IntoIterator<Item = ArtifactRef>,
         now: DateTime<Utc>,
         grant_ttl: Duration,
@@ -129,7 +129,7 @@ impl RebuildContextBroker {
                 .collect::<Vec<_>>(),
         )?)?;
         let payload = ContextManifestPayload {
-            schema_version: akzio_domain::REBUILD_SCHEMA_VERSION,
+            schema_version: V2_DOMAIN_SCHEMA_VERSION,
             contract_hash: contract.contract_hash.clone(),
             selections: selections.clone(),
             total_bytes,
@@ -157,13 +157,21 @@ impl RebuildContextBroker {
                 attempt_id: Some(permit.attempt_id.clone()),
                 contract_hash: permit.contract_hash.clone(),
             }),
-            selections.iter().map(|selection| selection.artifact.clone()).collect(),
+            selections
+                .iter()
+                .map(|selection| selection.artifact.clone())
+                .collect(),
             now,
         )?;
         self.store
             .write_task_artifact(permit, &artifact, "context.manifest_created", now)?;
-        let grant = ContextGrant {
+        let grant = ReadGrant {
             manifest_artifact_id: artifact.artifact_id.clone(),
+            run_id: permit.run_id.clone(),
+            task_id: permit.task_id.clone(),
+            attempt_id: permit.attempt_id.clone(),
+            lease_id: permit.lease_id.clone(),
+            epoch: permit.epoch,
             contract_hash: contract.contract_hash.clone(),
             readable: selections
                 .iter()
@@ -179,7 +187,12 @@ impl RebuildContextBroker {
         })
     }
 
-    pub fn read(&self, grant: &ContextGrant, artifact_id: &ArtifactId, now: DateTime<Utc>) -> RebuildContextResult<Artifact> {
+    pub fn read(
+        &self,
+        grant: &ReadGrant,
+        artifact_id: &ArtifactId,
+        now: DateTime<Utc>,
+    ) -> RebuildContextResult<Artifact> {
         if !grant.permits(artifact_id, false, now) {
             return Err(RebuildContextError::GrantDenied {
                 manifest_id: grant.manifest_artifact_id.clone(),
@@ -195,7 +208,7 @@ impl RebuildContextBroker {
 
     pub fn read_raw(
         &self,
-        grant: &ContextGrant,
+        grant: &ReadGrant,
         artifact_id: &ArtifactId,
         now: DateTime<Utc>,
     ) -> RebuildContextResult<Artifact> {
@@ -217,14 +230,18 @@ impl RebuildContextBroker {
     pub fn record_repair<T: Serialize>(
         &self,
         permit: &TaskWritePermit,
-        contract: &ContractSpec,
-        grant: &ContextGrant,
+        contract: &AgentContract,
+        grant: &ReadGrant,
         source_refs: Vec<ArtifactRef>,
         value: &T,
         now: DateTime<Utc>,
     ) -> RebuildContextResult<Artifact> {
         for source in &source_refs {
-            if !grant.permits(&source.artifact_id, source.kind == ArtifactKind::RawEvidence, now) {
+            if !grant.permits(
+                &source.artifact_id,
+                source.kind == ArtifactKind::RawEvidence,
+                now,
+            ) {
                 return Err(RebuildContextError::GrantDenied {
                     manifest_id: grant.manifest_artifact_id.clone(),
                     artifact_id: source.artifact_id.clone(),
@@ -348,17 +365,17 @@ mod tests {
     use std::collections::BTreeSet;
 
     use akzio_domain::{
-        ArtifactKind, ContractId, ContractPurpose, FailureDisposition, OutputContract,
-        RetryPolicy, TaskBudget, TerminationPolicy, ToolGrant, ToolKind, WorkflowGraph,
-        WorkflowNode, REBUILD_SCHEMA_VERSION,
+        ArtifactKind, ContractId, ContractPurpose, FailureDisposition, OutputContract, RetryPolicy,
+        TaskBudget, TerminationPolicy, ToolGrant, ToolKind, WorkflowGraph, WorkflowNode,
+        REBUILD_SCHEMA_VERSION,
     };
-    use akzio_store::{RebuildRun, WorkflowCommit};
+    use akzio_store::v2::{StoredRun, WorkflowCommit};
     use tempfile::tempdir;
 
     use super::*;
 
-    fn contract(store: &RebuildStore) -> ContractSpec {
-        ContractSpec::new(
+    fn contract(store: &V2Store) -> AgentContract {
+        AgentContract::new(
             ContractId::new(),
             1,
             ContractPurpose::new("research.analyst").unwrap(),
@@ -399,7 +416,7 @@ mod tests {
         .unwrap()
     }
 
-    fn permit(store: &RebuildStore) -> TaskWritePermit {
+    fn permit(store: &V2Store) -> TaskWritePermit {
         let node = WorkflowNode {
             task_id: akzio_domain::TaskId::new(),
             recipe_id: akzio_domain::TaskRecipeId::new("research.analyst").unwrap(),
@@ -440,7 +457,7 @@ mod tests {
             Utc::now(),
         )
         .unwrap();
-        let run = RebuildRun {
+        let run = StoredRun {
             run_id: akzio_domain::RunId::new(),
             purpose: akzio_domain::RunPurpose::Debug,
             topology_id: graph.topology_id.clone(),
@@ -473,7 +490,7 @@ mod tests {
     }
 
     fn task_artifact(
-        store: &RebuildStore,
+        store: &V2Store,
         permit: &TaskWritePermit,
         kind: ArtifactKind,
         source_refs: Vec<ArtifactRef>,
@@ -481,7 +498,9 @@ mod tests {
     ) -> Artifact {
         Artifact::new(
             kind,
-            store.put_bytes(value.as_bytes(), "application/json").unwrap(),
+            store
+                .put_bytes(value.as_bytes(), "application/json")
+                .unwrap(),
             "fixture",
             ArtifactLifecycle::RunScoped,
             provenance("market"),
@@ -500,7 +519,7 @@ mod tests {
     #[test]
     fn context_is_explicit_and_raw_is_only_granted_by_closure() {
         let root = tempdir().unwrap();
-        let store = RebuildStore::open(root.path()).unwrap();
+        let store = V2Store::open(root.path()).unwrap();
         let permit = permit(&store);
         let raw = task_artifact(&store, &permit, ArtifactKind::RawEvidence, vec![], "raw");
         store
@@ -551,19 +570,38 @@ mod tests {
     #[test]
     fn unrelated_artifact_is_not_visible_to_the_grant() {
         let root = tempdir().unwrap();
-        let store = RebuildStore::open(root.path()).unwrap();
+        let store = V2Store::open(root.path()).unwrap();
         let permit = permit(&store);
-        let first = task_artifact(&store, &permit, ArtifactKind::NormalizedEvidence, vec![], "first");
-        let second = task_artifact(&store, &permit, ArtifactKind::NormalizedEvidence, vec![], "second");
-        store.write_task_artifact(&permit, &first, "evidence", Utc::now()).unwrap();
-        store.write_task_artifact(&permit, &second, "evidence", Utc::now()).unwrap();
+        let first = task_artifact(
+            &store,
+            &permit,
+            ArtifactKind::NormalizedEvidence,
+            vec![],
+            "first",
+        );
+        let second = task_artifact(
+            &store,
+            &permit,
+            ArtifactKind::NormalizedEvidence,
+            vec![],
+            "second",
+        );
+        store
+            .write_task_artifact(&permit, &first, "evidence", Utc::now())
+            .unwrap();
+        store
+            .write_task_artifact(&permit, &second, "evidence", Utc::now())
+            .unwrap();
         let broker = RebuildContextBroker::new(store.clone());
         let contract = contract(&store);
         let manifest = broker
             .assemble(
                 &permit,
                 &contract,
-                [ArtifactRef { artifact_id: first.artifact_id.clone(), kind: first.kind }],
+                [ArtifactRef {
+                    artifact_id: first.artifact_id.clone(),
+                    kind: first.kind,
+                }],
                 Utc::now(),
                 Duration::minutes(5),
             )
@@ -572,5 +610,76 @@ mod tests {
             broker.read(&manifest.grant, &second.artifact_id, Utc::now()),
             Err(RebuildContextError::GrantDenied { .. })
         ));
+    }
+
+    #[test]
+    fn repair_is_explicit_and_cannot_expand_a_grant() {
+        let root = tempdir().unwrap();
+        let store = V2Store::open(root.path()).unwrap();
+        let permit = permit(&store);
+        let normalized = task_artifact(
+            &store,
+            &permit,
+            ArtifactKind::NormalizedEvidence,
+            vec![],
+            "normalized",
+        );
+        let unrelated = task_artifact(
+            &store,
+            &permit,
+            ArtifactKind::NormalizedEvidence,
+            vec![],
+            "unrelated",
+        );
+        store
+            .write_task_artifact(&permit, &normalized, "evidence", Utc::now())
+            .unwrap();
+        store
+            .write_task_artifact(&permit, &unrelated, "evidence", Utc::now())
+            .unwrap();
+        let broker = RebuildContextBroker::new(store.clone());
+        let contract = contract(&store);
+        let manifest = broker
+            .assemble(
+                &permit,
+                &contract,
+                [ArtifactRef {
+                    artifact_id: normalized.artifact_id.clone(),
+                    kind: ArtifactKind::NormalizedEvidence,
+                }],
+                Utc::now(),
+                Duration::minutes(5),
+            )
+            .unwrap();
+        let repair = broker
+            .record_repair(
+                &permit,
+                &contract,
+                &manifest.grant,
+                vec![ArtifactRef {
+                    artifact_id: normalized.artifact_id.clone(),
+                    kind: ArtifactKind::NormalizedEvidence,
+                }],
+                &serde_json::json!({"repair": "fixture"}),
+                Utc::now(),
+            )
+            .unwrap();
+        assert_eq!(repair.kind, ArtifactKind::ContextRepair);
+        assert_eq!(repair.source_refs[0].artifact_id, normalized.artifact_id);
+        assert!(matches!(
+            broker.record_repair(
+                &permit,
+                &contract,
+                &manifest.grant,
+                vec![ArtifactRef {
+                    artifact_id: unrelated.artifact_id,
+                    kind: ArtifactKind::NormalizedEvidence,
+                }],
+                &serde_json::json!({"repair": "forbidden"}),
+                Utc::now(),
+            ),
+            Err(RebuildContextError::GrantDenied { .. })
+        ));
+        store.verify_integrity().unwrap();
     }
 }

@@ -1,121 +1,60 @@
 # Akzio Signal Intelligence v2
 
-Akzio v2 是一个本地常驻、Rust 受控的 Multi-Agent Research System。它只研究并可在 Alpaca **Paper** 账户执行 `TQQQ`、`QQQ`、`SOXX`、`SOXL`；Live Trading 不在本版本范围内。
+Akzio v2 是本地常驻、Rust 受控、Paper-only 的 Multi-Agent Research System。可执行资产严格为 `TQQQ`、`QQQ`、`SOXX`、`SOXL`；Live Trading 永不实现。
 
-这是 v2-only 仓库：不读取、不迁移也不兼容旧 `orchestrator-*` crate、Phase 0–8、FileStore、Prompt 或 `outputs/store` 格式。使用新的 Store Root。
+这是 source-incompatible 的 v2-only 重构：不读取、迁移或兼容旧 `orchestrator-*`、Phase 0–8、FileStore、旧 prompt 或 `outputs/store`。canonical 状态只属于 `V2Store`，新的 Store Root 是 `outputs/akzio-v2-rebuild`。
 
-## 架构
+## 目标架构
 
 ```mermaid
 flowchart LR
-    CLI[akzio CLI] --> D[Daemon: Unix Socket + HTTP/SSE]
-    D --> L{leader lease + epoch fence}
-    L --> S[Paper scheduler\nAlpaca market clock]
-    S --> SLOT[durable session slot\nimmutable workflow plan]
-    L --> Q[TaskRuntime\nqueue, lease, retry, recovery]
-    SLOT --> W[WorkflowRuntime\nplan + non-bypassable gates]
-    Q --> W
-    W --> R[Research agents\nplanner / investigator / challenger / synthesizer]
-    R --> C[Context Broker]
-    C --> E[CAS Evidence + SQLite control plane]
-    W --> X[ExecutionRuntime\nRust policy + idempotent Paper adapter]
-    W --> M[Learning\nMemory + Shadow topology eval]
-    M --> E
-    X --> E
+  CLI[akzio CLI] --> API[Loopback HTTP Control API]
+  API --> D[Daemon supervisor\nlease / epoch / scheduler / SSE]
+  D --> WR[WorkflowRuntime]
+  WR --> TR[TaskRuntime]
+  TR --> AR[AgentRuntime]
+  TR --> IR[EvidenceRuntime]
+  TR --> ER[EvaluationRuntime]
+  TR --> XR[ExecutionRuntime]
+  AR --> CB[ContextBroker\nmanifest + grants]
+  CB --> S[(V2Store\nCAS + SQLite + events)]
+  IR --> S
+  ER --> S
+  XR --> S
 ```
 
-Rust is the authority for task state, leases, agent contracts, allowed context, evidence provenance, risk gates, topology promotion, execution policy and broker idempotency. Models only produce schema-validated research artifacts and planner proposals.
+Rust 是状态、权限、Contract、预算、workflow gate、持久化、学习迁移和执行策略的唯一权威。模型只能输出 schema 限制的研究提案、证据需求、claim、critique 与 decision draft；它没有任意文件、HTTP、Raw Evidence、SQLite 或交易权限。
 
-## Workspace
+`ContextManifest` 与 task/attempt-bound `ReadGrant` 是 Agent 获得资料的唯一通道。Debug、Replay、Shadow 与 Paper Dry Run 永远 noncanonical；只有 sealed Paper Outcome 可推动 memory 或 topology 状态。
 
-| Crate | Responsibility |
-| --- | --- |
-| `akzio-domain` | Versioned IDs, contracts, schemas, workflow and policy types |
-| `akzio-store` | SQLite control plane, CAS blobs, event stream, task leases, schedule slots, Store Doctor |
-| `akzio-context` | Provenance-aware Context Broker and document access rules |
-| `akzio-ingest` | Seals market/account inputs before they reach research or execution |
-| `akzio-model` | Responses-compatible model transport and fixtures |
-| `akzio-research` | Contract registry, planner and research task execution |
-| `akzio-runtime` | Workflow compiler, planner patch gate, task lifecycle and recovery |
-| `akzio-execution` | Rust-owned decision/execution gates and Alpaca Paper adapter |
-| `akzio-learning` | Experience memory, outcomes, Shadow pairs and topology promotion/rollback |
-| `akzio-daemon` | Leader election, worker pool, scheduler, local HTTP/SSE and Unix socket control plane |
-| `akzio-cli` | `akzio` commands and TOML validation |
+## 当前重构状态
 
-## Data and learning model
+R0 已定义不变量、测试矩阵和删除图：
 
-`V2Store` keeps immutable content-addressed blobs and a SQLite graph. Raw/normalized evidence, semantic detail, claims, decisions, execution context, memory and evaluations reference sources by document ID; compaction cannot invalidate a canonical decision's evidence chain.
+- [v2 invariants](docs/architecture/AKZIO_V2_INVARIANTS.md)
+- [test matrix](docs/architecture/AKZIO_V2_TEST_MATRIX.md)
+- [deletion graph](docs/architecture/AKZIO_V2_DELETION_GRAPH.md)
 
-Paper outcomes feed two bounded loops:
+当前 checkout 仍包含待替换的旧 active path 与五个 `rebuild.rs` 原型。它们不是 v2 完成证据，并会按删除图在 R1–R10 被替换和删除。尤其是当前 Unix transport 仅是待删除的内部过渡实现：它不是 v2 public control plane，也不得为它新增调用者或兼容层。
 
-- Memory: `Candidate → Active/Proven → Contested/Retired` under Rust policy.
-- Topology: Candidate research graphs receive paired Shadow outcomes and move through `Candidate → Canary10 → Canary25 → Canary50 → Active`; weaker risk recall or evidence completeness rolls them back immediately. Each promotion needs a fresh 12-pair window.
+## 安全边界
 
-Debug and Paper Dry Run runs never enter canonical learning.
+- `AlpacaPaper::new` 必须在发起任何 HTTP I/O 前拒绝非 Paper endpoint。
+- Paper commitment 仅归 scheduler 所有；每个 broker session 最多一个 durable slot，且所有 slot 写入均以 daemon lease owner/epoch fenced。
+- Rust 可自动 freeze；只能通过 loopback operator HTTP API 或经该 API 的 CLI unfreeze。
+- 不存在 direct CLI/API Paper submit 或 retry 路径。
 
-## Daemon and automatic Paper execution
+R0 配置把 `auto_paper` 默认关闭。后续只有 R7/R8 的 decision gate、scheduler fencing 和恢复测试全部通过后，才可在受控本地环境显式启用自动 Paper；本仓库的 fixture 验证从不构成真实市场、模型或 Paper order 验证。
 
-`auto_paper = true` is the default in [`config/akzio.toml`](config/akzio.toml). The elected daemon leader polls Alpaca Paper's `/v2/clock` once per minute. It creates at most one Paper run per broker-reported open-session date.
-
-Before creating the run, the daemon stores a session slot containing the exact, content-addressed workflow plan. If the process crashes after reservation, a replacement leader resumes the same run ID and task IDs. A stale leader cannot submit or mark a slot because every write is fenced by the daemon lease epoch.
-
-Direct `Paper` submissions and Paper retries are intentionally rejected. This prevents an operator command from producing a second broker execution path for the same session. Use Paper Dry Run for manual validation.
-
-Paper execution is still non-bypassable: Rust checks universe, gross/correlation exposure, turnover, account state, quote freshness, blockers, plan hash and idempotency before sending an Alpaca Paper order. Live endpoints are rejected by the adapter.
-
-## Configuration and environment
-
-The default config is [`config/akzio.toml`](config/akzio.toml). Its `execution.assets` must remain exactly `TQQQ`, `QQQ`, `SOXX`, `SOXL`.
-
-Production daemon inputs:
+## Local verification
 
 ```bash
-export AKZIO_DAEMON_TOKEN='local-control-token'
-export LLM_GATEWAY_BASE_URL='https://gateway.example/v1'
-export LLM_GATEWAY_API_KEY='...'
-export AKZIO_MODEL='...'
-export ALPACA_API_KEY='...'
-export ALPACA_API_SECRET='...'
-# Optional; defaults to https://paper-api.alpaca.markets
-export ALPACA_PAPER_BASE_URL='https://paper-api.alpaca.markets'
-```
-
-Set `auto_paper = false` only for local daemon development or a manual Paper Dry Run. It does not enable Live Trading.
-
-## Commands
-
-Use the Headroom RTK wrapper in this workspace.
-
-```bash
-# No credentials or daemon required; isolated fixture store run.
-rtk cargo run -p akzio-cli -- run fixture-debug
-
-# Start local control plane. With auto_paper=true, this can execute Paper
-# automatically during an open Alpaca-reported market session.
-rtk cargo run -p akzio-cli -- daemon serve
-
-# Control the running daemon over its Unix socket.
-rtk cargo run -p akzio-cli -- daemon health
-rtk cargo run -p akzio-cli -- run submit debug
-rtk cargo run -p akzio-cli -- run submit paper-dry-run
-rtk cargo run -p akzio-cli -- run events <run-id>
-rtk cargo run -p akzio-cli -- run cancel <run-id>
-
-# Verify blobs, references, leases, commitments and scheduled Paper slots.
-rtk cargo run -p akzio-cli -- store doctor
-```
-
-The configured Store Root defaults to `outputs/v2-store`. It contains `control.sqlite3`, CAS blobs and the Unix socket; it is generated state and must not be committed.
-
-## Verification
-
-```bash
-rtk cargo fmt --all
-rtk cargo check --workspace
-rtk cargo clippy --workspace --all-targets
-rtk cargo test --workspace
+rtk cargo fmt --all -- --check
+rtk cargo check --workspace --offline
+rtk cargo clippy --workspace --all-targets --offline
+rtk cargo test --workspace --offline
 rtk cargo run -p akzio-cli -- run fixture-debug
 rtk cargo run -p akzio-cli -- store doctor
 ```
 
-`fixture-debug` proves the deterministic Debug path only. It does not prove gateway availability, broker connectivity, market-open state or Paper execution.
+`fixture-debug` 只证明离线 fixture 路径。它不证明 gateway 可用、broker 连通、市场状态或任何 Paper execution。

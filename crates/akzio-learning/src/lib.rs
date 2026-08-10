@@ -4,8 +4,13 @@
 //! available to research, but it cannot alter target weights, execution plans,
 //! tool permissions, or an active topology directly.
 
+pub mod rebuild;
 mod topology;
 
+pub use rebuild::{
+    EvaluationInput, EvaluationPolicy, EvaluationResult, PolicySubject, RebuildEvaluationError,
+    RebuildEvaluationResult, RebuildEvaluationRuntime, ShadowObservation,
+};
 pub use topology::{
     advance_topology, ShadowPair, TopologyLedger, TopologyMetrics, TopologyOutcome, TopologyRecord,
     TopologyState,
@@ -13,7 +18,7 @@ pub use topology::{
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use akzio_context::{ContextBroker, ContextError, NewJsonDocument};
+use akzio_context::legacy::{ContextBroker, ContextError, NewJsonDocument};
 use akzio_domain::{
     Asset, DocumentId, DocumentKind, DocumentLifecycle, DocumentOrigin, DocumentRecord, MemoryId,
     MoneyMicros, PortfolioDecision, Provenance, RunId, RunPurpose, TargetPortfolio,
@@ -303,7 +308,7 @@ pub enum LedgerError {
     #[error(transparent)]
     Context(#[from] ContextError),
     #[error(transparent)]
-    Store(#[from] akzio_store::StoreError),
+    Store(#[from] akzio_store::legacy::StoreError),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error("memory {0} does not exist")]
@@ -696,9 +701,9 @@ fn derive_memory_state(samples: &[OutcomeSample]) -> MemoryState {
 
 #[cfg(test)]
 mod tests {
-    use akzio_context::{ContextBroker, NewJsonDocument};
+    use akzio_context::legacy::{ContextBroker, NewJsonDocument};
     use akzio_domain::{DocumentKind, DocumentLifecycle, RunId, RunPurpose};
-    use akzio_store::V2Store;
+    use akzio_store::legacy::V2Store;
     use chrono::Utc;
     use tempfile::tempdir;
 
@@ -871,7 +876,7 @@ mod tests {
             policy_hash: akzio_domain::ContentHash::of_bytes(b"policy"),
             created_at: now,
             valid_until: now + chrono::Duration::hours(1),
-            draft: akzio_domain::DecisionDraft {
+            draft: akzio_domain::LegacyDecisionDraft {
                 summary: "paper test".to_owned(),
                 targets,
                 confidence_ppm: 500_000,

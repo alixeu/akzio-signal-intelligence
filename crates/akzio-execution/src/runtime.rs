@@ -7,10 +7,10 @@
 
 use std::collections::BTreeMap;
 
-use akzio_context::{ContextBroker, ContextError, NewJsonDocument};
+use akzio_context::legacy::{ContextBroker, ContextError, NewJsonDocument};
 use akzio_domain::{
-    content_hash_json, Asset, DecisionDraft, DecisionId, DocumentId, DocumentKind,
-    DocumentLifecycle, DocumentOrigin, DocumentRecord, PortfolioDecision, Provenance, RunId,
+    content_hash_json, Asset, DecisionId, DocumentId, DocumentKind, DocumentLifecycle,
+    DocumentOrigin, DocumentRecord, LegacyDecisionDraft, PortfolioDecision, Provenance, RunId,
     RunPurpose, WeightPpm, V2_SCHEMA_VERSION,
 };
 use chrono::{DateTime, Duration, Utc};
@@ -19,7 +19,7 @@ use thiserror::Error;
 
 use crate::{
     build_execution_plan,
-    paper::{AlpacaPaper, PaperError, PaperExecution},
+    paper::{PaperBroker, PaperError, PaperExecution},
     AccountSnapshot, ExecutionError, ExecutionPlan, ExecutionPolicy, MoneyMicros, Quote, Target,
 };
 
@@ -28,7 +28,7 @@ pub enum ExecutionRuntimeError {
     #[error(transparent)]
     Context(#[from] ContextError),
     #[error(transparent)]
-    Store(#[from] akzio_store::StoreError),
+    Store(#[from] akzio_store::legacy::StoreError),
     #[error(transparent)]
     Domain(#[from] akzio_domain::DomainError),
     #[error(transparent)]
@@ -50,6 +50,13 @@ pub enum ExecutionRuntimeError {
     InvalidValidityWindow,
     #[error("execution commitment references a different plan hash")]
     CommitmentPlanHashMismatch,
+    #[error(
+        "paper broker operation requires a persisted Paper run; persisted={persisted:?}, context={context:?}"
+    )]
+    PaperRunRequired {
+        persisted: RunPurpose,
+        context: RunPurpose,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, ExecutionRuntimeError>;
@@ -171,7 +178,7 @@ impl ExecutionRuntime {
         }
 
         let draft =
-            serde_json::from_value::<DecisionDraft>(self.broker.read_json(&draft_document)?)?;
+            serde_json::from_value::<LegacyDecisionDraft>(self.broker.read_json(&draft_document)?)?;
         draft.validate()?;
         let gross = draft.targets.gross_weight_ppm();
         if gross > u64::from(self.decision_policy.max_gross_weight.0) {
@@ -282,12 +289,13 @@ impl ExecutionRuntime {
         self.record_plan(context, &decision_document, &execution_context, &plan)
     }
 
-    pub async fn submit_paper(
+    pub async fn submit_paper<B: PaperBroker + ?Sized>(
         &self,
         context: &ExecutionRunContext,
         plan_document_id: &DocumentId,
-        paper: &AlpacaPaper,
+        paper: &B,
     ) -> Result<DocumentRecord> {
+        self.require_paper_run(context)?;
         let (plan_document, plan) = self.read_plan(plan_document_id)?;
         let reservation = self.broker.store().reserve_execution_commitment(
             &context.run_id,
@@ -339,12 +347,13 @@ impl ExecutionRuntime {
         Ok(submission)
     }
 
-    pub async fn reconcile_paper(
+    pub async fn reconcile_paper<B: PaperBroker + ?Sized>(
         &self,
         context: &ExecutionRunContext,
         order_state_document_id: &DocumentId,
-        paper: &AlpacaPaper,
+        paper: &B,
     ) -> Result<DocumentRecord> {
+        self.require_paper_run(context)?;
         let order_state = self.broker.store().read_document(order_state_document_id)?;
         if order_state.kind != DocumentKind::OrderState {
             return Err(ExecutionRuntimeError::WrongDocument {
@@ -420,6 +429,17 @@ impl ExecutionRuntime {
             (left.created_at, &left.document_id).cmp(&(right.created_at, &right.document_id))
         });
         Ok(states.into_iter().next())
+    }
+
+    fn require_paper_run(&self, context: &ExecutionRunContext) -> Result<()> {
+        let persisted = self.broker.store().run_purpose(&context.run_id)?;
+        if persisted != RunPurpose::Paper || context.purpose != RunPurpose::Paper {
+            return Err(ExecutionRuntimeError::PaperRunRequired {
+                persisted,
+                context: context.purpose,
+            });
+        }
+        Ok(())
     }
 
     fn read_plan(&self, document_id: &DocumentId) -> Result<(DocumentRecord, ExecutionPlan)> {
@@ -551,12 +571,12 @@ impl ExecutionRuntime {
 mod tests {
     use std::collections::BTreeMap;
 
-    use akzio_context::ContextBroker;
+    use akzio_context::legacy::ContextBroker;
     use akzio_domain::{
-        Asset, DecisionDraft, DocumentKind, DocumentLifecycle, DocumentOrigin, HorizonForecast,
-        RunId, RunPurpose, TargetPortfolio, WeightPpm,
+        Asset, DocumentKind, DocumentLifecycle, DocumentOrigin, HorizonForecast,
+        LegacyDecisionDraft, RunId, RunPurpose, TargetPortfolio, WeightPpm,
     };
-    use akzio_store::V2Store;
+    use akzio_store::legacy::V2Store;
     use chrono::Utc;
     use tempfile::tempdir;
 
@@ -572,7 +592,7 @@ mod tests {
             .store()
             .create_run(&run, RunPurpose::Debug, "test", now)
             .unwrap();
-        let draft = DecisionDraft {
+        let draft = LegacyDecisionDraft {
             summary: "hold cash while evidence is incomplete".to_owned(),
             targets: TargetPortfolio {
                 weights: BTreeMap::from([
@@ -655,75 +675,131 @@ mod tests {
         assert_eq!(decision.origin, Some(context.origin));
     }
 
+    #[cfg(any())]
+    mod legacy_http_mock {
+        use super::*;
+
+        #[derive(Clone, Default)]
+        struct MockPaper {
+            orders: std::sync::Arc<
+                std::sync::Mutex<std::collections::BTreeMap<String, serde_json::Value>>,
+            >,
+            submissions: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        #[derive(serde::Deserialize)]
+        struct ClientOrderQuery {
+            client_order_id: String,
+        }
+
+        async fn mock_clock() -> axum::Json<serde_json::Value> {
+            axum::Json(serde_json::json!({
+                "is_open": true,
+                "timestamp": "2026-08-06T10:00:00-04:00",
+            }))
+        }
+
+        async fn mock_lookup(
+            axum::extract::State(state): axum::extract::State<MockPaper>,
+            axum::extract::Query(query): axum::extract::Query<ClientOrderQuery>,
+        ) -> std::result::Result<axum::Json<serde_json::Value>, axum::http::StatusCode> {
+            state
+                .orders
+                .lock()
+                .unwrap()
+                .get(&query.client_order_id)
+                .cloned()
+                .map(axum::Json)
+                .ok_or(axum::http::StatusCode::NOT_FOUND)
+        }
+
+        async fn mock_submit(
+            axum::extract::State(state): axum::extract::State<MockPaper>,
+            axum::Json(body): axum::Json<serde_json::Value>,
+        ) -> axum::Json<serde_json::Value> {
+            let number = state
+                .submissions
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            let client_order_id = body["client_order_id"].as_str().unwrap().to_owned();
+            let receipt = serde_json::json!({
+                "id": format!("broker-{number}"),
+                "symbol": body["symbol"],
+                "status": "accepted",
+                "client_order_id": client_order_id,
+            });
+            state
+                .orders
+                .lock()
+                .unwrap()
+                .insert(client_order_id, receipt.clone());
+            axum::Json(receipt)
+        }
+
+        async fn mock_order(
+            axum::extract::State(state): axum::extract::State<MockPaper>,
+            axum::extract::Path(order_id): axum::extract::Path<String>,
+        ) -> std::result::Result<axum::Json<serde_json::Value>, axum::http::StatusCode> {
+            state
+                .orders
+                .lock()
+                .unwrap()
+                .values()
+                .find(|order| order["id"] == order_id)
+                .cloned()
+                .map(axum::Json)
+                .ok_or(axum::http::StatusCode::NOT_FOUND)
+        }
+    }
+
     #[derive(Clone, Default)]
-    struct MockPaper {
-        orders:
-            std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, serde_json::Value>>>,
+    struct FixturePaper {
         submissions: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
-    #[derive(serde::Deserialize)]
-    struct ClientOrderQuery {
-        client_order_id: String,
-    }
+    impl PaperBroker for FixturePaper {
+        fn execute<'a>(
+            &'a self,
+            plan: &'a ExecutionPlan,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = crate::paper::Result<PaperExecution>> + Send + 'a>,
+        > {
+            let submissions = self.submissions.clone();
+            let plan = plan.clone();
+            Box::pin(async move {
+                let sequence = submissions.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                Ok(PaperExecution {
+                    plan_hash: plan.plan_hash.clone(),
+                    orders: plan
+                        .orders
+                        .iter()
+                        .enumerate()
+                        .map(|(index, order)| crate::paper::PaperOrderReceipt {
+                            client_order_id: crate::paper::client_order_id(
+                                &plan.plan_hash,
+                                index,
+                                0,
+                            ),
+                            broker_order_id: format!("fixture-{sequence}-{index}"),
+                            symbol: order.asset.symbol().to_owned(),
+                            status: "accepted".to_owned(),
+                            reused: false,
+                            reprice_count: 0,
+                        })
+                        .collect(),
+                })
+            })
+        }
 
-    async fn mock_clock() -> axum::Json<serde_json::Value> {
-        axum::Json(serde_json::json!({
-            "is_open": true,
-            "timestamp": "2026-08-06T10:00:00-04:00",
-        }))
-    }
-
-    async fn mock_lookup(
-        axum::extract::State(state): axum::extract::State<MockPaper>,
-        axum::extract::Query(query): axum::extract::Query<ClientOrderQuery>,
-    ) -> std::result::Result<axum::Json<serde_json::Value>, axum::http::StatusCode> {
-        state
-            .orders
-            .lock()
-            .unwrap()
-            .get(&query.client_order_id)
-            .cloned()
-            .map(axum::Json)
-            .ok_or(axum::http::StatusCode::NOT_FOUND)
-    }
-
-    async fn mock_submit(
-        axum::extract::State(state): axum::extract::State<MockPaper>,
-        axum::Json(body): axum::Json<serde_json::Value>,
-    ) -> axum::Json<serde_json::Value> {
-        let number = state
-            .submissions
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-            + 1;
-        let client_order_id = body["client_order_id"].as_str().unwrap().to_owned();
-        let receipt = serde_json::json!({
-            "id": format!("broker-{number}"),
-            "symbol": body["symbol"],
-            "status": "accepted",
-            "client_order_id": client_order_id,
-        });
-        state
-            .orders
-            .lock()
-            .unwrap()
-            .insert(client_order_id, receipt.clone());
-        axum::Json(receipt)
-    }
-
-    async fn mock_order(
-        axum::extract::State(state): axum::extract::State<MockPaper>,
-        axum::extract::Path(order_id): axum::extract::Path<String>,
-    ) -> std::result::Result<axum::Json<serde_json::Value>, axum::http::StatusCode> {
-        state
-            .orders
-            .lock()
-            .unwrap()
-            .values()
-            .find(|order| order["id"] == order_id)
-            .cloned()
-            .map(axum::Json)
-            .ok_or(axum::http::StatusCode::NOT_FOUND)
+        fn reconcile<'a>(
+            &'a self,
+            execution: &'a PaperExecution,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = crate::paper::Result<PaperExecution>> + Send + 'a>,
+        > {
+            let execution = execution.clone();
+            Box::pin(async move { Ok(execution) })
+        }
     }
 
     fn paper_plan() -> ExecutionPlan {
@@ -751,6 +827,64 @@ mod tests {
             ),
             now,
         }
+    }
+
+    #[tokio::test]
+    async fn paper_broker_operations_reject_non_paper_runs_before_side_effects() {
+        let directory = tempdir().unwrap();
+        let store = V2Store::open(directory.path()).unwrap();
+        let broker = ContextBroker::new(store.clone());
+        let now = Utc::now();
+        let run_id = RunId::new();
+        store
+            .create_run(&run_id, RunPurpose::PaperDryRun, "test", now)
+            .unwrap();
+
+        let plan = paper_plan();
+        let plan_value = serde_json::to_value(&plan).unwrap();
+        let plan_document = broker
+            .record_json(NewJsonDocument {
+                kind: DocumentKind::ExecutionPlan,
+                producer: "test.execution_plan".to_owned(),
+                run_id: Some(run_id.clone()),
+                lifecycle: DocumentLifecycle::RunScoped,
+                source_refs: vec![],
+                origin: None,
+                value: &plan_value,
+                created_at: now,
+            })
+            .unwrap();
+        let context = paper_context(run_id, now);
+        let runtime = ExecutionRuntime::with_defaults(broker);
+        let paper = FixturePaper::default();
+
+        let submit_error = runtime
+            .submit_paper(&context, &plan_document.document_id, &paper)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            submit_error,
+            ExecutionRuntimeError::PaperRunRequired {
+                persisted: RunPurpose::PaperDryRun,
+                context: RunPurpose::Paper,
+            }
+        ));
+        assert_eq!(
+            paper.submissions.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+
+        let reconcile_error = runtime
+            .reconcile_paper(&context, &plan_document.document_id, &paper)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            reconcile_error,
+            ExecutionRuntimeError::PaperRunRequired {
+                persisted: RunPurpose::PaperDryRun,
+                context: RunPurpose::Paper,
+            }
+        ));
     }
 
     #[tokio::test]
@@ -784,29 +918,33 @@ mod tests {
             .unwrap();
         assert!(reserved.newly_reserved);
 
-        let mock = MockPaper::default();
-        let app = axum::Router::new()
-            .route("/v2/clock", axum::routing::get(mock_clock))
-            .route(
-                "/v2/orders:by_client_order_id",
-                axum::routing::get(mock_lookup),
+        #[cfg(any())]
+        {
+            let mock = legacy_http_mock::MockPaper::default();
+            let app = axum::Router::new()
+                .route("/v2/clock", axum::routing::get(mock_clock))
+                .route(
+                    "/v2/orders:by_client_order_id",
+                    axum::routing::get(mock_lookup),
+                )
+                .route("/v2/orders", axum::routing::post(mock_submit))
+                .route("/v2/orders/{order_id}", axum::routing::get(mock_order))
+                .with_state(mock.clone());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let paper = AlpacaPaper::new(
+                format!("http://{address}"),
+                crate::paper::PaperCredentials {
+                    key_id: "key".to_owned(),
+                    secret_key: "secret".to_owned(),
+                },
             )
-            .route("/v2/orders", axum::routing::post(mock_submit))
-            .route("/v2/orders/{order_id}", axum::routing::get(mock_order))
-            .with_state(mock.clone());
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        let paper = AlpacaPaper::new(
-            format!("http://{address}"),
-            crate::paper::PaperCredentials {
-                key_id: "key".to_owned(),
-                secret_key: "secret".to_owned(),
-            },
-        )
-        .unwrap();
+            .unwrap();
+        }
+        let paper = FixturePaper::default();
         let runtime = ExecutionRuntime::with_defaults(broker.clone());
         let first_context = paper_context(first_run.clone(), now);
 
@@ -815,7 +953,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            mock.submissions.load(std::sync::atomic::Ordering::SeqCst),
+            paper.submissions.load(std::sync::atomic::Ordering::SeqCst),
             1
         );
         assert_eq!(
@@ -824,7 +962,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .state,
-            akzio_store::ExecutionCommitmentState::Submitted
+            akzio_store::legacy::ExecutionCommitmentState::Submitted
         );
 
         let retry = runtime
@@ -833,7 +971,7 @@ mod tests {
             .unwrap();
         assert_eq!(retry.document_id, submission.document_id);
         assert_eq!(
-            mock.submissions.load(std::sync::atomic::Ordering::SeqCst),
+            paper.submissions.load(std::sync::atomic::Ordering::SeqCst),
             1
         );
 
@@ -864,7 +1002,7 @@ mod tests {
         assert_eq!(reused.run_id, Some(second_run));
         assert_eq!(reused.producer, "execution.paper_reused_commitment");
         assert_eq!(
-            mock.submissions.load(std::sync::atomic::Ordering::SeqCst),
+            paper.submissions.load(std::sync::atomic::Ordering::SeqCst),
             1
         );
 
@@ -878,8 +1016,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .state,
-            akzio_store::ExecutionCommitmentState::Reconciled
+            akzio_store::legacy::ExecutionCommitmentState::Reconciled
         );
-        server.abort();
     }
 }

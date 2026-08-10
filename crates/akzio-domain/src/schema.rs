@@ -1,10 +1,13 @@
-//! Rebuilt v2 vocabulary.
+//! Canonical v2 artifact, contract, workflow, and authority schema.
 //!
 //! This module is intentionally introduced beside the former vocabulary while the
 //! workspace is migrated. Its types are the only types new runtime code may use;
 //! the old document/role/task types are removed once every crate crosses this seam.
 
-use std::{collections::{BTreeMap, BTreeSet}, fmt};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -12,12 +15,12 @@ use serde::{Deserialize, Serialize};
 use crate::{
     content_hash_json, BlobRef, ContentHash, ContractId, DocumentLifecycle, DomainError,
     FailureDisposition, LeaseId, RetryPolicy, RunId, TaskBudget, TaskId, TerminationPolicy,
-    ToolGrant,
+    ToolGrant, ToolKind,
 };
 
 /// A Store Root with this schema is intentionally incompatible with the previous
 /// v2 database. It is a rebuild, not a migration layer.
-pub const REBUILD_SCHEMA_VERSION: u32 = 2;
+pub const REBUILD_SCHEMA_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -59,7 +62,9 @@ pub enum ArtifactKind {
     ExecutionVerdict,
     ExecutionPlan,
     ExecutionCommitment,
+    ExecutionReprice,
     OrderReceipt,
+    Reconciliation,
     Experience,
     Outcome,
     Evaluation,
@@ -196,14 +201,22 @@ impl Artifact {
     }
 
     pub fn expected_hash(&self) -> Result<ContentHash, DomainError> {
-        let mut value = serde_json::to_value(self)
-            .map_err(|_| DomainError::EmptyField { field: "artifact.serialize" })?;
+        let mut canonical = self.clone();
+        canonical.source_refs.sort_by(|left, right| {
+            left.artifact_id
+                .cmp(&right.artifact_id)
+                .then_with(|| left.kind.cmp(&right.kind))
+        });
+        let mut value = serde_json::to_value(canonical).map_err(|_| DomainError::EmptyField {
+            field: "artifact.serialize",
+        })?;
         value
             .as_object_mut()
             .expect("artifact serializes to object")
             .remove("artifact_id");
-        content_hash_json(&value)
-            .map_err(|_| DomainError::EmptyField { field: "artifact.serialize" })
+        content_hash_json(&value).map_err(|_| DomainError::EmptyField {
+            field: "artifact.serialize",
+        })
     }
 
     pub fn validate(&self) -> Result<(), DomainError> {
@@ -222,6 +235,7 @@ impl Artifact {
         if let Some(origin) = &self.origin {
             origin.validate()?;
         }
+        self.validate_source_refs()?;
         if self.lifecycle == ArtifactLifecycle::Canonical && !self.kind.can_be_canonical() {
             return Err(DomainError::EmptyField {
                 field: "artifact.canonical_kind",
@@ -231,6 +245,51 @@ impl Artifact {
             return Err(DomainError::InvalidContentHash);
         }
         Ok(())
+    }
+
+    fn validate_source_refs(&self) -> Result<(), DomainError> {
+        let mut seen = BTreeSet::new();
+
+        if self.source_refs.iter().any(|reference| {
+            reference.artifact_id == self.artifact_id || !seen.insert(reference.artifact_id.clone())
+        }) {
+            return Err(DomainError::EmptyField {
+                field: "artifact.source_refs",
+            });
+        }
+
+        match self.kind {
+            ArtifactKind::RawEvidence if !self.source_refs.is_empty() => {
+                Err(DomainError::EmptyField {
+                    field: "artifact.raw_source_refs",
+                })
+            }
+            ArtifactKind::NormalizedEvidence
+                if !self.source_refs.is_empty()
+                    && !self
+                        .source_refs
+                        .iter()
+                        .any(|reference| reference.kind == ArtifactKind::RawEvidence) =>
+            {
+                Err(DomainError::EmptyField {
+                    field: "artifact.normalized_source_refs",
+                })
+            }
+            ArtifactKind::SemanticDetail
+                if !self.source_refs.is_empty()
+                    && !self.source_refs.iter().any(|reference| {
+                        matches!(
+                            reference.kind,
+                            ArtifactKind::RawEvidence | ArtifactKind::NormalizedEvidence
+                        )
+                    }) =>
+            {
+                Err(DomainError::EmptyField {
+                    field: "artifact.detail_source_refs",
+                })
+            }
+            _ => Ok(()),
+        }
     }
 }
 
@@ -291,10 +350,68 @@ impl ContextPolicy {
     }
 }
 
+/// The maximum context and tool authority an active contract may delegate to
+/// a candidate. Candidate contracts may narrow this surface, never widen it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CandidateCapabilityCeiling {
+    pub context: ContextPolicy,
+    pub tool_grants: Vec<ToolGrant>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutputContract {
     pub artifact_kind: ArtifactKind,
     pub schema: BlobRef,
+}
+
+impl CandidateCapabilityCeiling {
+    pub fn validate(&self) -> Result<(), DomainError> {
+        self.context.validate()?;
+        validate_tool_grants(&self.tool_grants, &self.context)
+    }
+
+    fn permits(&self, context: &ContextPolicy, tool_grants: &[ToolGrant]) -> bool {
+        context
+            .permitted_kinds
+            .is_subset(&self.context.permitted_kinds)
+            && context
+                .permitted_source_families
+                .is_subset(&self.context.permitted_source_families)
+            && context.max_artifacts <= self.context.max_artifacts
+            && context.max_bytes <= self.context.max_bytes
+            && context.max_tokens <= self.context.max_tokens
+            && (!context.allow_raw_reread || self.context.allow_raw_reread)
+            && tool_grants.iter().all(|requested| {
+                self.tool_grants.iter().any(|allowed| {
+                    allowed.kind == requested.kind
+                        && requested
+                            .allowed_sources
+                            .iter()
+                            .all(|source| allowed.allowed_sources.contains(source))
+                })
+            })
+    }
+}
+
+fn validate_tool_grants(
+    tool_grants: &[ToolGrant],
+    context: &ContextPolicy,
+) -> Result<(), DomainError> {
+    if tool_grants.iter().any(|grant| {
+        !matches!(
+            grant.kind,
+            ToolKind::ReadEvidence | ToolKind::ReadRawEvidence
+        ) || grant.allowed_sources.is_empty()
+            || grant.allowed_sources.iter().any(|source| {
+                source.trim().is_empty() || !context.permitted_source_families.contains(source)
+            })
+            || (grant.kind == ToolKind::ReadRawEvidence && !context.allow_raw_reread)
+    }) {
+        return Err(DomainError::EmptyField {
+            field: "contract.tool_grants",
+        });
+    }
+    Ok(())
 }
 
 impl OutputContract {
@@ -306,7 +423,7 @@ impl OutputContract {
 /// One canonical definition drives prompt, runtime access, schema validation,
 /// retry/termination limits, and task policy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ContractSpec {
+pub struct AgentContract {
     pub schema_version: u32,
     pub contract_id: ContractId,
     pub version: u32,
@@ -315,6 +432,7 @@ pub struct ContractSpec {
     pub prompt: BlobRef,
     pub context: ContextPolicy,
     pub tool_grants: Vec<ToolGrant>,
+    pub candidate_capability_ceiling: CandidateCapabilityCeiling,
     pub output: OutputContract,
     pub budget: TaskBudget,
     pub retry: RetryPolicy,
@@ -323,7 +441,7 @@ pub struct ContractSpec {
     pub contract_hash: ContentHash,
 }
 
-impl ContractSpec {
+impl AgentContract {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         contract_id: ContractId,
@@ -347,6 +465,10 @@ impl ContractSpec {
             purpose,
             responsibility,
             prompt,
+            candidate_capability_ceiling: CandidateCapabilityCeiling {
+                context: context.clone(),
+                tool_grants: tool_grants.clone(),
+            },
             context,
             tool_grants,
             output,
@@ -362,14 +484,31 @@ impl ContractSpec {
     }
 
     pub fn expected_hash(&self) -> Result<ContentHash, DomainError> {
-        let mut value = serde_json::to_value(self)
-            .map_err(|_| DomainError::EmptyField { field: "contract.serialize" })?;
+        let mut value = serde_json::to_value(self).map_err(|_| DomainError::EmptyField {
+            field: "contract.serialize",
+        })?;
         value
             .as_object_mut()
             .expect("contract serializes to object")
             .remove("contract_hash");
-        content_hash_json(&value)
-            .map_err(|_| DomainError::EmptyField { field: "contract.serialize" })
+        content_hash_json(&value).map_err(|_| DomainError::EmptyField {
+            field: "contract.serialize",
+        })
+    }
+
+    pub fn with_candidate_capability_ceiling(
+        mut self,
+        candidate_capability_ceiling: CandidateCapabilityCeiling,
+    ) -> Result<Self, DomainError> {
+        self.candidate_capability_ceiling = candidate_capability_ceiling;
+        self.contract_hash = self.expected_hash()?;
+        self.validate()?;
+        Ok(self)
+    }
+
+    pub fn permits_candidate(&self, candidate: &Self) -> bool {
+        self.candidate_capability_ceiling
+            .permits(&candidate.context, &candidate.tool_grants)
     }
 
     pub fn validate(&self) -> Result<(), DomainError> {
@@ -385,9 +524,31 @@ impl ContractSpec {
         }
         self.prompt.validate()?;
         self.context.validate()?;
+        self.candidate_capability_ceiling.validate()?;
+        if !self
+            .candidate_capability_ceiling
+            .permits(&self.context, &self.tool_grants)
+        {
+            return Err(DomainError::EmptyField {
+                field: "contract.candidate_capability_ceiling",
+            });
+        }
         self.output.validate()?;
         self.budget.validate()?;
         self.retry.validate()?;
+        validate_tool_grants(&self.tool_grants, &self.context)?;
+        if !matches!(
+            self.output.artifact_kind,
+            ArtifactKind::EvidenceNeed
+                | ArtifactKind::WorkflowProposal
+                | ArtifactKind::Claim
+                | ArtifactKind::Critique
+                | ArtifactKind::DecisionProposal
+        ) {
+            return Err(DomainError::EmptyField {
+                field: "contract.output.artifact_kind",
+            });
+        }
         if self.contract_hash != self.expected_hash()? {
             return Err(DomainError::InvalidContentHash);
         }
@@ -483,7 +644,10 @@ pub struct WorkflowProposal {
 }
 
 impl WorkflowProposal {
-    pub fn validate(&self, recipes: &BTreeMap<TaskRecipeId, TaskRecipe>) -> Result<(), DomainError> {
+    pub fn validate(
+        &self,
+        recipes: &BTreeMap<TaskRecipeId, TaskRecipe>,
+    ) -> Result<(), DomainError> {
         if self.schema_version != REBUILD_SCHEMA_VERSION || self.topology_id.trim().is_empty() {
             return Err(DomainError::EmptyField {
                 field: "workflow_proposal.identity",
@@ -500,20 +664,64 @@ impl WorkflowProposal {
                     field: "workflow_proposal.task",
                 });
             }
-            let recipe = recipes.get(&task.recipe_id).ok_or(DomainError::EmptyField {
-                field: "workflow_proposal.recipe",
-            })?;
+            let recipe = recipes
+                .get(&task.recipe_id)
+                .ok_or(DomainError::EmptyField {
+                    field: "workflow_proposal.recipe",
+                })?;
             if task.priority > recipe.priority_ceiling {
                 return Err(DomainError::InvalidBudget {
                     field: "workflow_proposal.priority",
                 });
             }
-            if task.depends_on.iter().any(|dependency| !self.tasks.contains_key(dependency)) {
+            let evidence_need_ids = task
+                .evidence_needs
+                .iter()
+                .map(|reference| reference.artifact_id.clone())
+                .collect::<BTreeSet<_>>();
+            if evidence_need_ids.len() != task.evidence_needs.len()
+                || task
+                    .evidence_needs
+                    .iter()
+                    .any(|reference| reference.kind != ArtifactKind::EvidenceNeed)
+            {
+                return Err(DomainError::EmptyField {
+                    field: "workflow_proposal.evidence_needs",
+                });
+            }
+            if task
+                .depends_on
+                .iter()
+                .any(|dependency| !self.tasks.contains_key(dependency))
+            {
                 return Err(DomainError::UnknownDependency {
                     task: TaskId(alias.clone()),
                     dependency: TaskId("proposal alias".to_owned()),
                 });
             }
+        }
+
+        fn visit(
+            alias: &str,
+            tasks: &BTreeMap<String, WorkflowProposalTask>,
+            states: &mut BTreeMap<String, u8>,
+        ) -> Result<(), DomainError> {
+            match states.get(alias).copied() {
+                Some(1) => return Err(DomainError::CyclicPlan),
+                Some(2) => return Ok(()),
+                _ => {}
+            }
+            states.insert(alias.to_owned(), 1);
+            for dependency in &tasks[alias].depends_on {
+                visit(dependency, tasks, states)?;
+            }
+            states.insert(alias.to_owned(), 2);
+            Ok(())
+        }
+
+        let mut states = BTreeMap::new();
+        for alias in self.tasks.keys() {
+            visit(alias, &self.tasks, &mut states)?;
         }
         Ok(())
     }
@@ -562,11 +770,7 @@ impl WorkflowGraph {
             .collect::<BTreeMap<_, _>>();
         if nodes.len() != self.nodes.len() {
             return Err(DomainError::DuplicateTaskId(
-                self.nodes
-                    .first()
-                    .expect("nonempty nodes")
-                    .task_id
-                    .clone(),
+                self.nodes.first().expect("nonempty nodes").task_id.clone(),
             ));
         }
         for node in &self.nodes {
@@ -664,16 +868,30 @@ impl ContextManifestPayload {
 /// Ephemeral, task-scoped authorization derived from a persisted manifest. It is
 /// never model-produced and never grants a broader artifact surface than the
 /// manifest selection/closure.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ContextGrant {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadGrant {
     pub manifest_artifact_id: ArtifactId,
+    pub run_id: RunId,
+    pub task_id: TaskId,
+    pub attempt_id: crate::AttemptId,
+    pub lease_id: LeaseId,
+    pub epoch: u64,
     pub contract_hash: ContentHash,
     pub readable: BTreeSet<ArtifactId>,
     pub raw_source_closure: BTreeSet<ArtifactId>,
     pub expires_at: DateTime<Utc>,
 }
 
-impl ContextGrant {
+impl ReadGrant {
+    pub fn matches_permit(&self, permit: &TaskWritePermit) -> bool {
+        self.run_id == permit.run_id
+            && self.task_id == permit.task_id
+            && self.attempt_id == permit.attempt_id
+            && self.lease_id == permit.lease_id
+            && self.epoch == permit.epoch
+            && permit.contract_hash.as_ref() == Some(&self.contract_hash)
+    }
+
     pub fn permits(&self, artifact_id: &ArtifactId, raw: bool, now: DateTime<Utc>) -> bool {
         now <= self.expires_at
             && if raw {
@@ -685,7 +903,7 @@ impl ContextGrant {
 }
 
 /// Authorizes exactly one running attempt to create an artifact or commit a result.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskWritePermit {
     pub run_id: RunId,
     pub task_id: TaskId,
@@ -804,8 +1022,60 @@ mod tests {
     }
 
     #[test]
+    fn artifact_identity_canonicalizes_source_reference_order() {
+        let first = ArtifactRef {
+            artifact_id: ArtifactId(ContentHash::of_bytes(b"z-source")),
+            kind: ArtifactKind::ToolCall,
+        };
+        let second = ArtifactRef {
+            artifact_id: ArtifactId(ContentHash::of_bytes(b"a-source")),
+            kind: ArtifactKind::NormalizedEvidence,
+        };
+        let artifact = Artifact::new(
+            ArtifactKind::Claim,
+            blob(b"claim"),
+            "fixture",
+            ArtifactLifecycle::RunScoped,
+            provenance(),
+            None,
+            vec![first, second],
+            Utc::now(),
+        )
+        .unwrap();
+
+        let mut reordered = artifact.clone();
+        reordered.source_refs.reverse();
+        reordered.validate().unwrap();
+        assert_eq!(reordered.expected_hash().unwrap(), artifact.artifact_id.0);
+    }
+
+    #[test]
+    fn normalized_evidence_rejects_a_non_raw_source() {
+        let source = ArtifactRef {
+            artifact_id: ArtifactId(ContentHash::of_bytes(b"detail")),
+            kind: ArtifactKind::SemanticDetail,
+        };
+
+        assert!(matches!(
+            Artifact::new(
+                ArtifactKind::NormalizedEvidence,
+                blob(b"normalized"),
+                "fixture",
+                ArtifactLifecycle::RunScoped,
+                provenance(),
+                None,
+                vec![source],
+                Utc::now(),
+            ),
+            Err(DomainError::EmptyField {
+                field: "artifact.normalized_source_refs"
+            })
+        ));
+    }
+
+    #[test]
     fn contract_hash_rejects_prompt_or_grant_substitution() {
-        let contract = ContractSpec::new(
+        let contract = AgentContract::new(
             ContractId::new(),
             1,
             ContractPurpose::new("research.analyst").unwrap(),
@@ -849,6 +1119,54 @@ mod tests {
         let mut substituted = contract.clone();
         substituted.prompt = blob(b"different prompt");
         assert_eq!(substituted.validate(), Err(DomainError::InvalidContentHash));
+
+        let mut expanded = contract.clone();
+        expanded.tool_grants = vec![ToolGrant {
+            kind: ToolKind::FetchWebEvidence,
+            allowed_sources: vec!["news".to_owned()],
+        }];
+        expanded.contract_hash = expanded.expected_hash().unwrap();
+        assert!(expanded.validate().is_err());
+
+        expanded = contract.clone();
+        expanded.tool_grants = vec![ToolGrant {
+            kind: ToolKind::ReadEvidence,
+            allowed_sources: vec!["news".to_owned()],
+        }];
+        expanded.contract_hash = expanded.expected_hash().unwrap();
+        assert!(expanded.validate().is_err());
+
+        let mut candidate = contract.clone();
+        candidate
+            .context
+            .permitted_source_families
+            .insert("news".to_owned());
+        candidate.tool_grants = vec![ToolGrant {
+            kind: ToolKind::ReadEvidence,
+            allowed_sources: vec!["market".to_owned(), "news".to_owned()],
+        }];
+        candidate.candidate_capability_ceiling = CandidateCapabilityCeiling {
+            context: candidate.context.clone(),
+            tool_grants: candidate.tool_grants.clone(),
+        };
+        candidate.contract_hash = candidate.expected_hash().unwrap();
+        candidate.validate().unwrap();
+        assert!(!contract.permits_candidate(&candidate));
+
+        let active = contract
+            .clone()
+            .with_candidate_capability_ceiling(candidate.candidate_capability_ceiling.clone())
+            .unwrap();
+        assert!(active.permits_candidate(&candidate));
+
+        expanded = contract;
+        expanded.context.allow_raw_reread = false;
+        expanded.tool_grants = vec![ToolGrant {
+            kind: ToolKind::ReadRawEvidence,
+            allowed_sources: vec!["market".to_owned()],
+        }];
+        expanded.contract_hash = expanded.expected_hash().unwrap();
+        assert!(expanded.validate().is_err());
     }
 
     #[test]
@@ -864,6 +1182,86 @@ mod tests {
     }
 
     #[test]
+    fn workflow_proposal_rejects_unknown_recipes_and_cycles() {
+        let recipe_id = TaskRecipeId::new("analyst").unwrap();
+        let recipe = TaskRecipe {
+            recipe_id: recipe_id.clone(),
+            purpose: ContractPurpose::new("research.analyst").unwrap(),
+            contract_hash: Some(ContentHash::of_bytes(b"fixture-contract")),
+            task_class: RuntimeTaskClass::Agent,
+            max_children: 4,
+            max_depth: 4,
+            priority_ceiling: 80,
+            budget: TaskBudget {
+                max_input_tokens: 256,
+                max_output_tokens: 128,
+                max_wall_time_secs: 30,
+                max_tool_calls: 2,
+            },
+            retry: RetryPolicy {
+                max_attempts: 1,
+                initial_backoff_ms: 1,
+                retry_transport: true,
+                retry_rate_limited: true,
+                retry_invalid_output: false,
+            },
+            on_failure: FailureDisposition::FailTask,
+        };
+        let recipes = BTreeMap::from([(recipe_id.clone(), recipe)]);
+        let mut proposal = WorkflowProposal {
+            schema_version: REBUILD_SCHEMA_VERSION,
+            topology_id: "fixture".to_owned(),
+            tasks: BTreeMap::from([
+                (
+                    "analyst".to_owned(),
+                    WorkflowProposalTask {
+                        recipe_id: recipe_id.clone(),
+                        objective: "analyze evidence".to_owned(),
+                        depends_on: vec![],
+                        priority: 50,
+                        evidence_needs: vec![],
+                    },
+                ),
+                (
+                    "critic".to_owned(),
+                    WorkflowProposalTask {
+                        recipe_id,
+                        objective: "challenge the analysis".to_owned(),
+                        depends_on: vec!["analyst".to_owned()],
+                        priority: 50,
+                        evidence_needs: vec![],
+                    },
+                ),
+            ]),
+            stop_reason: None,
+        };
+        proposal.validate(&recipes).unwrap();
+
+        proposal
+            .tasks
+            .get_mut("analyst")
+            .unwrap()
+            .depends_on
+            .push("critic".to_owned());
+        assert_eq!(proposal.validate(&recipes), Err(DomainError::CyclicPlan));
+
+        proposal
+            .tasks
+            .get_mut("analyst")
+            .unwrap()
+            .depends_on
+            .clear();
+        proposal.tasks.get_mut("critic").unwrap().recipe_id =
+            TaskRecipeId::new("uninstalled").unwrap();
+        assert!(matches!(
+            proposal.validate(&recipes),
+            Err(DomainError::EmptyField {
+                field: "workflow_proposal.recipe"
+            })
+        ));
+    }
+
+    #[test]
     fn write_permit_is_attempt_specific() {
         let permit = TaskWritePermit {
             run_id: RunId::new(),
@@ -874,5 +1272,33 @@ mod tests {
             contract_hash: None,
         };
         assert_ne!(permit.attempt_id.0, AttemptId::new().0);
+    }
+
+    #[test]
+    fn read_grant_is_bound_to_the_minting_permit() {
+        let permit = TaskWritePermit {
+            run_id: RunId::new(),
+            task_id: TaskId::new(),
+            attempt_id: AttemptId::new(),
+            lease_id: LeaseId::new(),
+            epoch: 7,
+            contract_hash: Some(ContentHash::of_bytes(b"contract")),
+        };
+        let mut grant = ReadGrant {
+            manifest_artifact_id: ArtifactId(ContentHash::of_bytes(b"manifest")),
+            run_id: permit.run_id.clone(),
+            task_id: permit.task_id.clone(),
+            attempt_id: permit.attempt_id.clone(),
+            lease_id: permit.lease_id.clone(),
+            epoch: permit.epoch,
+            contract_hash: permit.contract_hash.clone().unwrap(),
+            readable: BTreeSet::new(),
+            raw_source_closure: BTreeSet::new(),
+            expires_at: Utc::now(),
+        };
+
+        assert!(grant.matches_permit(&permit));
+        grant.epoch += 1;
+        assert!(!grant.matches_permit(&permit));
     }
 }

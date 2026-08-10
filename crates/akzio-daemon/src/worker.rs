@@ -7,8 +7,8 @@
 
 use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 
-use akzio_runtime::{RuntimeError, TaskCompletion, TaskRuntime};
-use akzio_store::ClaimedTask;
+use akzio_runtime::legacy::{RuntimeError, TaskCompletion, TaskRuntime};
+use akzio_store::legacy::ClaimedTask;
 use chrono::Utc;
 use tokio::sync::watch;
 
@@ -134,7 +134,7 @@ mod tests {
     };
 
     use akzio_domain::{RunId, RunPurpose, TaskId, TaskKind};
-    use akzio_store::V2Store;
+    use akzio_store::legacy::V2Store;
     use chrono::Utc;
     use tempfile::tempdir;
 

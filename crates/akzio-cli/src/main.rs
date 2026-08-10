@@ -2,7 +2,7 @@ use std::{collections::BTreeSet, net::SocketAddr, path::PathBuf, sync::Arc};
 
 use akzio_daemon::{fixture_model_client, Daemon, DaemonCommand, DaemonConfig, DaemonReply};
 use akzio_domain::{Asset, RunPurpose};
-use akzio_store::V2Store;
+use akzio_store::legacy::V2Store;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Deserialize;

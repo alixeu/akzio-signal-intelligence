@@ -1,10 +1,10 @@
 //! Sealed research input and outcome-market projection.
 
-use akzio_context::{ContextBroker, NewJsonDocument};
+use akzio_context::legacy::{ContextBroker, NewJsonDocument};
 use akzio_domain::{Asset, DocumentKind, DocumentLifecycle, RunPurpose};
-use akzio_ingest::{IngestConfig, Ingestor};
+use akzio_ingest::legacy::{IngestConfig, Ingestor};
 use akzio_learning::{DailyClose, LearningLedger, OutcomeMarket, TopologyLedger};
-use akzio_store::ClaimedTask;
+use akzio_store::legacy::ClaimedTask;
 use chrono::{DateTime, NaiveDate, Utc};
 use serde_json::Value;
 
