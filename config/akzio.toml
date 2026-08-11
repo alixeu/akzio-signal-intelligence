@@ -8,6 +8,10 @@ auto_paper = false
 
 [execution]
 assets = ["TQQQ", "QQQ", "SOXX", "SOXL"]
+# Explicit parts-per-million assumptions used only when sealing Outcome windows.
+# Keep zero for fixtures; Paper launch approval must set audited values.
+transaction_cost_ppm = 0
+slippage_ppm = 0
 
 # Copy this file to config/akzio.local.toml before adding a real API key, then
 # start the daemon with `--config config/akzio.local.toml`.

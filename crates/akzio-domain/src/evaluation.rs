@@ -132,6 +132,8 @@ pub struct OutcomeWindow {
     pub observed_trading_day: NaiveDate,
     pub portfolio_return_ppm: i64,
     pub benchmark_return_ppm: i64,
+    pub transaction_cost_ppm: u32,
+    pub slippage_ppm: u32,
     pub utility_ppm: i64,
     pub calibration_ppm: u32,
     pub evidence_completeness_ppm: u32,
@@ -144,12 +146,34 @@ impl OutcomeWindow {
             self.calibration_ppm,
             self.evidence_completeness_ppm,
             self.risk_recall_ppm,
+            self.transaction_cost_ppm,
+            self.slippage_ppm,
         ]
         .into_iter()
         .any(|value| value > 1_000_000)
         {
             return Err(DomainError::InvalidBudget {
                 field: "outcome_window.ppm",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Rust-owned cost assumptions applied to every sealed outcome window.
+/// Values are parts-per-million of notional; later Paper reconciliation may
+/// replace them with observed fill costs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutcomeCostModel {
+    pub transaction_cost_ppm: u32,
+    pub slippage_ppm: u32,
+}
+
+impl OutcomeCostModel {
+    pub fn validate(self) -> Result<(), DomainError> {
+        if self.transaction_cost_ppm > 1_000_000 || self.slippage_ppm > 1_000_000 {
+            return Err(DomainError::InvalidBudget {
+                field: "outcome.cost_model",
             });
         }
         Ok(())
@@ -527,9 +551,9 @@ mod tests {
     use chrono::{NaiveDate, Utc};
 
     use super::{
-        CandidatePolicy, CandidatePolicyState, Experience, Outcome, OutcomeExecutionLineage,
-        OutcomeHorizon, OutcomeSchedule, OutcomeWindow, PolicyState, PolicySubject,
-        PolicyTransition,
+        CandidatePolicy, CandidatePolicyState, Experience, Outcome, OutcomeCostModel,
+        OutcomeExecutionLineage, OutcomeHorizon, OutcomeSchedule, OutcomeWindow, PolicyState,
+        PolicySubject, PolicyTransition,
     };
     use crate::{
         artifact::{ArtifactId, ArtifactKind, ArtifactRef},
@@ -569,11 +593,23 @@ mod tests {
             observed_trading_day: trading_day(day),
             portfolio_return_ppm: 1,
             benchmark_return_ppm: 0,
+            transaction_cost_ppm: 0,
+            slippage_ppm: 0,
             utility_ppm: 1,
             calibration_ppm: 1,
             evidence_completeness_ppm: 1_000_000,
             risk_recall_ppm: 1_000_000,
         }
+    }
+
+    #[test]
+    fn outcome_cost_model_rejects_values_above_one() {
+        assert!(OutcomeCostModel {
+            transaction_cost_ppm: 1_000_001,
+            slippage_ppm: 0,
+        }
+        .validate()
+        .is_err());
     }
 
     fn reconciled_schedule() -> OutcomeSchedule {

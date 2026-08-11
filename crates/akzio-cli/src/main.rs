@@ -7,7 +7,9 @@ use akzio_daemon::{
 };
 use akzio_domain::{ArtifactKind, Asset, RunPurpose, WorkflowStatus};
 use akzio_execution::paper::AlpacaPaper;
-use akzio_learning::{evaluate_frozen_evidence, FrozenEvidenceRecord, FrozenEvidenceSet};
+use akzio_learning::{
+    evaluate_frozen_evidence, FrozenEvidenceRecord, FrozenEvidenceSet, OutcomeCostModel,
+};
 use akzio_model::ModelConfig;
 use akzio_store::V2Store;
 use anyhow::{bail, Context, Result};
@@ -128,6 +130,10 @@ struct DaemonSettings {
 #[serde(deny_unknown_fields)]
 struct ExecutionSettings {
     assets: Vec<Asset>,
+    #[serde(default)]
+    transaction_cost_ppm: u32,
+    #[serde(default)]
+    slippage_ppm: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -419,6 +425,18 @@ fn load_config(path: &PathBuf) -> Result<Config> {
     if actual != expected || config.execution.assets.len() != expected.len() {
         bail!("execution.assets must contain exactly TQQQ, QQQ, SOXX, SOXL");
     }
+    OutcomeCostModel {
+        transaction_cost_ppm: config.execution.transaction_cost_ppm,
+        slippage_ppm: config.execution.slippage_ppm,
+    }
+    .validate()
+    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    if config.daemon.auto_paper.unwrap_or(false)
+        && config.execution.transaction_cost_ppm == 0
+        && config.execution.slippage_ppm == 0
+    {
+        bail!("Paper scheduler requires explicit transaction_cost_ppm or slippage_ppm");
+    }
     Ok(config)
 }
 
@@ -444,6 +462,10 @@ async fn serve(config: Config) -> Result<()> {
             http_token: token,
             worker_count: config.daemon.worker_count.unwrap_or(4),
             auto_paper,
+            outcome_cost_model: OutcomeCostModel {
+                transaction_cost_ppm: config.execution.transaction_cost_ppm,
+                slippage_ppm: config.execution.slippage_ppm,
+            },
         },
         model,
     )?;
@@ -526,6 +548,10 @@ fn fixture_daemon(config: &Config) -> Result<Daemon> {
             http_token: "fixture-only".to_owned(),
             worker_count: config.daemon.worker_count.unwrap_or(2),
             auto_paper: false,
+            outcome_cost_model: OutcomeCostModel {
+                transaction_cost_ppm: config.execution.transaction_cost_ppm,
+                slippage_ppm: config.execution.slippage_ppm,
+            },
         },
         fixture_model_client(),
     )?)
@@ -838,6 +864,20 @@ mod tests {
         let path = write_config(&directory, "http_addr='127.0.0.1:1'", "['TQQQ']");
 
         assert!(load_config(&path).is_err());
+    }
+
+    #[test]
+    fn config_rejects_zero_cost_auto_paper() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("akzio.toml");
+        std::fs::write(
+            &path,
+            "[daemon]\nstore_root='store'\nauto_paper=true\nhttp_addr='127.0.0.1:1'\ntoken_env='TOKEN'\n[execution]\nassets=['TQQQ', 'QQQ', 'SOXX', 'SOXL']\n",
+        )
+        .unwrap();
+
+        let error = load_config(&path).unwrap_err().to_string();
+        assert!(error.contains("transaction_cost_ppm or slippage_ppm"));
     }
 
     #[test]

@@ -257,10 +257,12 @@ pub fn validate_daily_bar_payload(value: &Value) -> Result<(), EvidenceRuntimeEr
         if high < open.max(close) || low > open.min(close) || volume <= 0.0 {
             return Err(EvidenceRuntimeError::InvalidAcquisition);
         }
-        if let Some(adjustment) = bar.get("adjustment").and_then(Value::as_str) {
-            if adjustment != "all" {
-                return Err(EvidenceRuntimeError::InvalidAcquisition);
-            }
+        let adjustment = bar
+            .get("adjustment")
+            .and_then(Value::as_str)
+            .ok_or(EvidenceRuntimeError::InvalidAcquisition)?;
+        if adjustment != "all" {
+            return Err(EvidenceRuntimeError::InvalidAcquisition);
         }
     }
     Ok(())
@@ -1830,6 +1832,16 @@ mod tests {
         let mut missing = valid.clone();
         missing["bars"][0].as_object_mut().unwrap().remove("v");
         assert!(validate_daily_bar_payload(&missing).is_err());
+
+        let mut missing_adjustment = valid.clone();
+        missing_adjustment["bars"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("adjustment");
+        assert!(validate_daily_bar_payload(&missing_adjustment).is_err());
+        let mut split_unadjusted = valid.clone();
+        split_unadjusted["bars"][0]["adjustment"] = serde_json::json!("raw");
+        assert!(validate_daily_bar_payload(&split_unadjusted).is_err());
 
         let weekend = serde_json::json!({
             "bars": [{

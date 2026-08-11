@@ -6,7 +6,7 @@ mod evaluation;
 mod frozen_eval;
 mod outcome_schedule;
 
-pub use akzio_domain::PolicySubject;
+pub use akzio_domain::{OutcomeCostModel, PolicySubject};
 pub use evaluation::{
     materialize_outcome, CandidatePolicyInput, EvaluationError, EvaluationInput, EvaluationPolicy,
     EvaluationResult, EvaluationRuntime, EvaluationRuntimeResult, GovernedHorizonObservation,

@@ -14,8 +14,8 @@ use akzio_domain::{
     content_hash_json, Artifact, ArtifactKind, ArtifactLifecycle, ArtifactOrigin,
     ArtifactProvenance, ArtifactRef, Asset, CandidatePolicy, CandidatePolicyState, ContentHash,
     DecisionHorizon, DomainError, Evaluation, EvaluationId, Experience, ExperienceId, Forecast,
-    MemoryLifecycle, MoneyMicros, Outcome, OutcomeExecutionLineage, OutcomeHorizon,
-    OutcomeSchedule, OutcomeWindow, PolicyState, PolicySubject, PolicyTransition,
+    MemoryLifecycle, MoneyMicros, Outcome, OutcomeCostModel, OutcomeExecutionLineage,
+    OutcomeHorizon, OutcomeSchedule, OutcomeWindow, PolicyState, PolicySubject, PolicyTransition,
     PolicyTransitionId, RunPurpose, TargetPortfolio, TaskWritePermit, TopologyId,
     V2_SCHEMA_VERSION,
 };
@@ -78,6 +78,7 @@ pub struct OutcomeMaterializationInput {
     pub baseline_prices: BTreeMap<Asset, MoneyMicros>,
     pub observations: Vec<GovernedHorizonObservation>,
     pub market_evidence: Vec<ArtifactRef>,
+    pub cost_model: OutcomeCostModel,
     pub sealed_at: DateTime<Utc>,
 }
 
@@ -446,6 +447,7 @@ pub fn materialize_outcome(
         ));
     }
     input.target.validate_universe()?;
+    input.cost_model.validate()?;
     validate_prices(&input.baseline_prices)?;
 
     let forecasts = index_forecasts(&input.forecasts)?;
@@ -473,12 +475,16 @@ pub fn materialize_outcome(
         )?;
         let utility_ppm = portfolio_return_ppm
             .checked_sub(benchmark_return_ppm)
+            .and_then(|value| value.checked_sub(i64::from(input.cost_model.transaction_cost_ppm)))
+            .and_then(|value| value.checked_sub(i64::from(input.cost_model.slippage_ppm)))
             .ok_or(EvaluationError::ArithmeticOverflow)?;
         windows.push(OutcomeWindow {
             horizon,
             observed_trading_day: observation.observed_trading_day,
             portfolio_return_ppm,
             benchmark_return_ppm,
+            transaction_cost_ppm: input.cost_model.transaction_cost_ppm,
+            slippage_ppm: input.cost_model.slippage_ppm,
             utility_ppm,
             calibration_ppm: directional_calibration_ppm(
                 forecast.positive_return_probability_ppm,
@@ -805,6 +811,10 @@ mod tests {
                 observation(OutcomeHorizon::T5, 5, 10, prices(100_000_000, 100_000_000)),
             ],
             market_evidence: vec![reference(ArtifactKind::NormalizedEvidence, b"market")],
+            cost_model: OutcomeCostModel {
+                transaction_cost_ppm: 100,
+                slippage_ppm: 50,
+            },
             sealed_at: Utc::now(),
         }
     }
@@ -1399,7 +1409,9 @@ mod tests {
         let t1 = &outcome.windows[0];
         assert_eq!(t1.portfolio_return_ppm, 100_000);
         assert_eq!(t1.benchmark_return_ppm, 50_000);
-        assert_eq!(t1.utility_ppm, 50_000);
+        assert_eq!(t1.transaction_cost_ppm, 100);
+        assert_eq!(t1.slippage_ppm, 50);
+        assert_eq!(t1.utility_ppm, 49_850);
         assert_eq!(t1.calibration_ppm, 800_000);
         assert_eq!(t1.evidence_completeness_ppm, 750_000);
         assert_eq!(t1.risk_recall_ppm, 500_000);
@@ -1407,7 +1419,7 @@ mod tests {
         let t3 = &outcome.windows[1];
         assert_eq!(t3.portfolio_return_ppm, -100_000);
         assert_eq!(t3.benchmark_return_ppm, -50_000);
-        assert_eq!(t3.utility_ppm, -50_000);
+        assert_eq!(t3.utility_ppm, -50_150);
         assert_eq!(t3.calibration_ppm, 800_000);
     }
 
@@ -1461,6 +1473,19 @@ mod tests {
         assert!(matches!(
             materialize_outcome(&incomplete),
             Err(EvaluationError::InvalidMaterialization(_))
+        ));
+    }
+
+    #[test]
+    fn materializer_rejects_cost_model_above_one_hundred_percent() {
+        let mut input = materialization();
+        input.cost_model.transaction_cost_ppm = 1_000_001;
+
+        assert!(matches!(
+            materialize_outcome(&input),
+            Err(EvaluationError::Domain(DomainError::InvalidBudget {
+                field: "outcome.cost_model"
+            }))
         ));
     }
 

@@ -44,8 +44,8 @@ use akzio_ingest::{
 };
 use akzio_learning::{
     EvaluationError, EvaluationInput, EvaluationPolicy, EvaluationRuntime,
-    GovernedHorizonObservation, OutcomeMaterializationInput, OutcomeScheduleError,
-    OutcomeScheduleInput, OutcomeSchedulingRuntime,
+    GovernedHorizonObservation, OutcomeCostModel, OutcomeMaterializationInput,
+    OutcomeScheduleError, OutcomeScheduleInput, OutcomeSchedulingRuntime,
 };
 use akzio_model::{ModelClient, ModelConfig, ModelError};
 use akzio_research::v2::{
@@ -136,6 +136,7 @@ pub struct DaemonConfig {
     pub http_token: String,
     pub worker_count: usize,
     pub auto_paper: bool,
+    pub outcome_cost_model: OutcomeCostModel,
 }
 
 #[derive(Clone)]
@@ -156,6 +157,7 @@ pub struct Daemon {
     scheduler: PaperScheduler,
     http_token: String,
     auto_paper: bool,
+    outcome_cost_model: OutcomeCostModel,
     worker_pool: WorkerPoolConfig,
 }
 
@@ -312,6 +314,7 @@ impl Daemon {
             scheduler,
             http_token: config.http_token,
             auto_paper: config.auto_paper,
+            outcome_cost_model: config.outcome_cost_model,
             worker_pool: WorkerPoolConfig {
                 worker_count: config.worker_count.max(1),
                 ..WorkerPoolConfig::default()
@@ -1050,6 +1053,7 @@ impl Daemon {
                         kind: artifact.kind,
                     })
                     .collect(),
+                cost_model: self.outcome_cost_model,
                 sealed_at: now,
             },
             evidence_artifacts,
@@ -1930,6 +1934,7 @@ mod tests {
             http_token: "fixture-token".to_owned(),
             worker_count: 1,
             auto_paper: false,
+            outcome_cost_model: OutcomeCostModel::default(),
         }
     }
 
