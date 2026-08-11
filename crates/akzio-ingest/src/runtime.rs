@@ -1137,7 +1137,7 @@ impl EvidenceRuntime {
                 producer_contract_hash: permit.contract_hash.clone(),
             },
             task_origin(permit),
-            vec![need.clone()],
+            vec![],
             now,
         )?;
         let raw_ref = ArtifactRef {

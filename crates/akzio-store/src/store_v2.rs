@@ -30,6 +30,7 @@ use thiserror::Error;
 
 const DATABASE_FILE: &str = "akzio.sqlite3";
 const INCOMPATIBLE_DATABASE_FILE: &str = "control.sqlite3";
+const POST_TERMINAL_WORKER_RECIPE_ID: &str = "learning.outcome_worker";
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -3767,6 +3768,7 @@ impl V2Store {
             .collect::<std::collections::BTreeMap<_, _>>();
         let stored_nodes = tasks
             .iter()
+            .filter(|task| task.node.recipe_id.as_str() != POST_TERMINAL_WORKER_RECIPE_ID)
             .map(|task| (task.node.task_id.clone(), task.node.clone()))
             .collect::<std::collections::BTreeMap<_, _>>();
         if graph_nodes != stored_nodes {

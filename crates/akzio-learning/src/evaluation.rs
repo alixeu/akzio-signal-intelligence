@@ -450,7 +450,7 @@ pub fn materialize_outcome(
     input.cost_model.validate()?;
     validate_prices(&input.baseline_prices)?;
 
-    let forecasts = index_forecasts(&input.forecasts)?;
+    let forecasts = index_forecasts(&input.target, &input.forecasts)?;
     let observations = index_observations(&input.schedule, &input.observations)?;
     let mut market_evidence = input.market_evidence.clone();
     market_evidence.sort();
@@ -458,7 +458,7 @@ pub fn materialize_outcome(
 
     let mut windows = Vec::with_capacity(OutcomeHorizon::ALL.len());
     for horizon in OutcomeHorizon::ALL {
-        let forecast = forecasts
+        let forecast_probability_ppm = forecasts
             .get(&horizon)
             .expect("index_forecasts requires all horizons");
         let observation = observations
@@ -487,7 +487,7 @@ pub fn materialize_outcome(
             slippage_ppm: input.cost_model.slippage_ppm,
             utility_ppm,
             calibration_ppm: directional_calibration_ppm(
-                forecast.positive_return_probability_ppm,
+                *forecast_probability_ppm,
                 portfolio_return_ppm,
             ),
             evidence_completeness_ppm: bounded_ratio_ppm(
@@ -514,9 +514,10 @@ pub fn materialize_outcome(
 }
 
 fn index_forecasts(
+    target: &TargetPortfolio,
     forecasts: &[Forecast],
-) -> EvaluationRuntimeResult<BTreeMap<OutcomeHorizon, Forecast>> {
-    let mut indexed = BTreeMap::new();
+) -> EvaluationRuntimeResult<BTreeMap<OutcomeHorizon, u32>> {
+    let mut by_horizon = BTreeMap::<OutcomeHorizon, BTreeMap<Asset, &Forecast>>::new();
     for forecast in forecasts {
         forecast.validate()?;
         let horizon = match forecast.horizon {
@@ -524,18 +525,62 @@ fn index_forecasts(
             DecisionHorizon::T3 => OutcomeHorizon::T3,
             DecisionHorizon::T5 => OutcomeHorizon::T5,
         };
-        if indexed.insert(horizon, forecast.clone()).is_some() {
+        let by_asset = by_horizon.entry(horizon).or_default();
+        if by_asset.insert(forecast.asset, forecast).is_some() {
             return Err(EvaluationError::InvalidMaterialization(
                 "duplicate forecast horizon",
             ));
         }
     }
-    if indexed.len() != OutcomeHorizon::ALL.len() {
+    if by_horizon.len() != OutcomeHorizon::ALL.len() {
         return Err(EvaluationError::InvalidMaterialization(
             "missing forecast horizon",
         ));
     }
-    Ok(indexed)
+
+    OutcomeHorizon::ALL
+        .into_iter()
+        .map(|horizon| {
+            let by_asset = by_horizon
+                .get(&horizon)
+                .expect("forecast horizon presence checked above");
+            let probability = if by_asset.len() == 1 {
+                by_asset
+                    .values()
+                    .next()
+                    .expect("single forecast presence checked above")
+                    .positive_return_probability_ppm
+            } else {
+                if by_asset.len() != Asset::EXECUTABLE.len()
+                    || Asset::EXECUTABLE
+                        .into_iter()
+                        .any(|asset| !by_asset.contains_key(&asset))
+                {
+                    return Err(EvaluationError::InvalidMaterialization(
+                        "forecast asset coverage",
+                    ));
+                }
+                let weighted = target
+                    .weights
+                    .iter()
+                    .try_fold(0_i128, |sum, (asset, weight)| {
+                        sum.checked_add(
+                            i128::from(weight.0)
+                                * i128::from(
+                                    by_asset
+                                        .get(asset)
+                                        .expect("forecast asset coverage checked above")
+                                        .positive_return_probability_ppm,
+                                ),
+                        )
+                        .ok_or(EvaluationError::ArithmeticOverflow)
+                    })?;
+                u32::try_from(weighted / i128::from(PPM_ONE))
+                    .map_err(|_| EvaluationError::ArithmeticOverflow)?
+            };
+            Ok((horizon, probability))
+        })
+        .collect()
 }
 
 fn index_observations<'a>(

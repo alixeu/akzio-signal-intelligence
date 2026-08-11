@@ -623,10 +623,10 @@ impl Daemon {
         task: &ClaimedAttempt,
         now: DateTime<Utc>,
     ) -> Result<TaskCompletion> {
-        let recipe = self.workflow.catalogue().recipe(&task.node.recipe_id)?;
         if task.node.recipe_id.as_str() == OUTCOME_WORKER_RECIPE_ID {
             return self.execute_outcome_worker(task, now).await;
         }
+        let recipe = self.workflow.catalogue().recipe(&task.node.recipe_id)?;
         match recipe.task_class {
             RuntimeTaskClass::Agent => {
                 let candidates = self.context_candidates(task)?;
@@ -907,9 +907,8 @@ impl Daemon {
             DaemonError::Unavailable("Paper outcome baseline quote snapshot missing".to_owned())
         })?;
         let quote_artifact = self.store.artifact(&quote_reference.artifact_id)?;
-        let quote_payload: NormalizedEvidencePayload =
+        let quotes: QuoteSnapshot =
             serde_json::from_slice(&self.store.read_blob(&quote_artifact.blob)?)?;
-        let quotes: QuoteSnapshot = serde_json::from_value(quote_payload.value)?;
         quotes.validate()?;
         let baseline_prices = quotes
             .quotes
@@ -1913,18 +1912,22 @@ mod tests {
     use super::*;
     use akzio_domain::{
         ArtifactLifecycle, ArtifactOrigin, ArtifactProvenance, ArtifactRef, Asset, EvidenceNeed,
-        MoneyMicros, OutcomeExecutionLineage, OutcomeSchedule, Quote, TaskRecipeId,
+        MoneyMicros, Outcome, OutcomeExecutionLineage, OutcomeSchedule, Quote, TaskRecipeId,
         WorkflowProposal, WorkflowProposalDraft, WorkflowProposalDraftTask, WorkflowProposalTask,
     };
     use akzio_execution::paper::{
         CommittedPaperBroker, PaperError, PaperExecution, PaperOrderReceipt,
     };
-    use akzio_ingest::{EvidenceProvenance, EvidenceQuality, NormalizedEvidencePayload};
+    use akzio_ingest::{
+        runtime::EvidenceAdapterError, AcquiredEvidence, AsyncEvidenceAdapter, EvidenceProvenance,
+        EvidenceQuality, EvidenceRequest, NormalizedEvidencePayload,
+    };
     use axum::{
         body::{to_bytes, Body},
         http::{Request, StatusCode},
     };
-    use futures::StreamExt;
+    use chrono::{Datelike, Duration as ChronoDuration, Weekday};
+    use futures::{future::BoxFuture, StreamExt};
     use tempfile::tempdir;
     use tower::ServiceExt;
 
@@ -2078,6 +2081,93 @@ mod tests {
             >,
         > {
             Box::pin(async move { Ok(self.0.clone()) })
+        }
+    }
+
+    #[derive(Clone)]
+    struct OutcomeBarsAdapter {
+        responses: BTreeMap<String, AcquiredEvidence>,
+    }
+
+    impl OutcomeBarsAdapter {
+        fn new(baseline: NaiveDate, observed_at: DateTime<Utc>) -> Self {
+            let mut responses = BTreeMap::new();
+            for asset in Asset::EXECUTABLE {
+                let resource = format!(
+                    "bars:{}:1d:{}:6",
+                    asset.symbol(),
+                    baseline.format("%Y-%m-%d")
+                );
+                let mut bars = Vec::new();
+                let mut date = baseline;
+                let mut index = 0_u64;
+                while bars.len() < 6 {
+                    date += ChronoDuration::days(1);
+                    if matches!(date.weekday(), Weekday::Sat | Weekday::Sun) {
+                        continue;
+                    }
+                    let price = 100.0 + index as f64;
+                    bars.push(serde_json::json!({
+                        "t": format!("{}T20:00:00Z", date.format("%Y-%m-%d")),
+                        "o": price,
+                        "h": price + 1.0,
+                        "l": price - 1.0,
+                        "c": price + 0.5,
+                        "v": 1_000,
+                        "adjustment": "all",
+                    }));
+                    index += 1;
+                }
+                let normalized = serde_json::json!({"bars": bars});
+                let raw = serde_json::to_vec(&normalized).unwrap();
+                let source_uri = format!(
+                    "https://paper-api.alpaca.markets/v2/stocks/{}/bars?timeframe=1Day&limit=6&adjustment=all&start={}",
+                    asset.symbol(),
+                    baseline.format("%Y-%m-%d")
+                );
+                responses.insert(
+                    resource.clone(),
+                    AcquiredEvidence {
+                        raw,
+                        media_type: "application/json".to_owned(),
+                        source_uri: source_uri.clone(),
+                        observed_at,
+                        normalized,
+                        provenance: EvidenceProvenance {
+                            document_id: Some(resource.clone()),
+                            published_at: None,
+                            observed_at,
+                            revision: Some("fixture-bars-v1".to_owned()),
+                            source_uri,
+                            dedupe_key: resource,
+                            citations: Vec::new(),
+                        },
+                        quality: EvidenceQuality::default(),
+                    },
+                );
+            }
+            Self { responses }
+        }
+    }
+
+    impl AsyncEvidenceAdapter for OutcomeBarsAdapter {
+        fn source(&self) -> EvidenceSource {
+            EvidenceSource::Alpaca
+        }
+
+        fn acquire<'a>(
+            &'a self,
+            request: &'a EvidenceRequest,
+        ) -> BoxFuture<'a, std::result::Result<AcquiredEvidence, EvidenceAdapterError>> {
+            let result = if request.source != EvidenceSource::Alpaca {
+                Err(EvidenceAdapterError::SourceMismatch)
+            } else {
+                self.responses
+                    .get(&request.resource)
+                    .cloned()
+                    .ok_or_else(|| EvidenceAdapterError::MissingFixture(request.resource.clone()))
+            };
+            Box::pin(async move { result })
         }
     }
 
@@ -2387,14 +2477,19 @@ mod tests {
             schema_version: akzio_domain::V2_DOMAIN_SCHEMA_VERSION,
             broker_session: session_key.clone(),
             observed_at: now,
-            quotes: BTreeMap::from([(
-                Asset::Qqq,
-                Quote {
-                    bid: MoneyMicros::from_usd_cents(10_000),
-                    ask: MoneyMicros::from_usd_cents(10_010),
-                    observed_at: now,
-                },
-            )]),
+            quotes: Asset::EXECUTABLE
+                .into_iter()
+                .map(|asset| {
+                    (
+                        asset,
+                        Quote {
+                            bid: MoneyMicros::from_usd_cents(10_000),
+                            ask: MoneyMicros::from_usd_cents(10_010),
+                            observed_at: now,
+                        },
+                    )
+                })
+                .collect(),
         };
         let clock = MarketClockSnapshot {
             schema_version: akzio_domain::V2_DOMAIN_SCHEMA_VERSION,
@@ -2446,8 +2541,8 @@ mod tests {
             ModelClient::FixtureSequence(responses.clone()),
             BTreeMap::from([(EvidenceSource::Alpaca, evidence)]),
         )
-        .unwrap()
-        .with_paper_broker(broker.clone());
+        .unwrap();
+        let mut daemon = daemon.with_paper_broker(broker.clone());
         let paper_run_id = RunId::new();
         let setup_artifacts = [
             scheduler_snapshot_need(daemon.store(), &paper_run_id, PAPER_ACCOUNT_RESOURCE, now),
@@ -2502,6 +2597,13 @@ mod tests {
                 now,
             )
             .unwrap();
+        daemon.production_evidence = Arc::new(BTreeMap::from([(
+            EvidenceSource::Alpaca,
+            Arc::new(OutcomeBarsAdapter::new(now.date_naive(), now))
+                as Arc<dyn AsyncEvidenceAdapter>,
+        )]));
+        daemon.outcome_scheduling_runtime =
+            OutcomeSchedulingRuntime::new(daemon.store.clone()).with_worker_enabled(true);
 
         assert!(daemon.run_one("accepted-paper-analyst").await.unwrap());
         let analyst_task = daemon
@@ -2565,7 +2667,21 @@ mod tests {
             .store()
             .artifacts_referencing(&schedule.artifact_id, None)
             .unwrap()
-            .is_empty());
+            .iter()
+            .any(|artifact| artifact.kind == ArtifactKind::Outcome));
+        let outcome = daemon
+            .store()
+            .latest_artifact_by_kind(ArtifactKind::Outcome)
+            .unwrap()
+            .expect("outcome worker must seal a Paper Outcome");
+        let outcome: Outcome =
+            serde_json::from_slice(&daemon.store().read_blob(&outcome.blob).unwrap()).unwrap();
+        assert_eq!(outcome.windows.len(), 3);
+        assert!(daemon
+            .store()
+            .latest_artifact_by_kind(ArtifactKind::Evaluation)
+            .unwrap()
+            .is_some());
         assert!(daemon
             .store()
             .events_after(&run_id, 0, 256)
