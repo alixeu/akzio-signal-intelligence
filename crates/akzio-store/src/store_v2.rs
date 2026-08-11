@@ -675,6 +675,9 @@ impl V2Store {
                     source: source_error,
                 }
             })?)?;
+        if manifest.schema_version != V2_DOMAIN_SCHEMA_VERSION {
+            return Err(StoreError::InvalidBackup(source));
+        }
         let database_bytes = fs::read(&database).map_err(|source_error| StoreError::Io {
             path: database.clone(),
             source: source_error,
@@ -692,7 +695,10 @@ impl V2Store {
             path: target.join(DATABASE_FILE),
             source: source_error,
         })?;
-        copy_blob_tree(&blobs, &target.join("blobs"))?;
+        let copied = copy_blob_tree(&blobs, &target.join("blobs"))?;
+        if copied != (manifest.blob_count, manifest.blob_bytes) {
+            return Err(StoreError::InvalidBackup(source));
+        }
         fs::copy(&manifest_path, target.join("manifest.json")).map_err(|source_error| {
             StoreError::Io {
                 path: target.join("manifest.json"),
