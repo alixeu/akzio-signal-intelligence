@@ -84,7 +84,6 @@ dependencies = [
 name = "akzio-execution"
 version = "0.2.0"
 dependencies = [
- "akzio-context",
  "akzio-domain",
  "akzio-store",
  "axum",

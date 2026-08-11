@@ -11,7 +11,7 @@ use akzio_domain::{
     FreezeState, OrderReceipt, OrderReceiptState, PaperCommitment, PaperReprice, RunPurpose,
     TaskWritePermit,
 };
-use akzio_store::v2::{StoreError, V2Store};
+use akzio_store::v2::{DaemonLease, StoreError, V2Store};
 use chrono::{DateTime, NaiveDate, Utc};
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
@@ -25,6 +25,8 @@ use crate::{
 
 #[derive(Debug, Error)]
 pub enum PaperError {
+    #[error(transparent)]
+    Domain(#[from] DomainError),
     #[error("ALPACA_API_KEY is not set")]
     MissingKey,
     #[error("ALPACA_API_SECRET is not set")]
@@ -47,8 +49,8 @@ pub enum PaperError {
     InvalidClock(String),
     #[error("order quantity rounds to zero")]
     ZeroQuantity,
-    #[error("one repricing attempt is already consumed")]
-    RepriceConsumed,
+    #[error("broker returned invalid quantity for {0}")]
+    InvalidQuantity(&'static str),
     #[error("original Paper order is no longer eligible for the durable reprice")]
     RepricePriorClosed,
     #[error("Paper commitment is invalid: {0}")]
@@ -82,6 +84,12 @@ pub struct PaperOrderReceipt {
     pub broker_order_id: String,
     pub symbol: String,
     pub status: String,
+    pub requested_quantity_micros: i64,
+    pub filled_quantity_micros: i64,
+    pub remaining_quantity_micros: i64,
+    pub average_fill_price: Option<MoneyMicros>,
+    pub broker_updated_at: DateTime<Utc>,
+    pub reason: Option<String>,
     pub reused: bool,
     pub reprice_count: u8,
 }
@@ -95,18 +103,6 @@ pub struct PaperExecution {
 /// Minimal broker protocol used by Rust-gated execution. The production
 /// implementation is Alpaca Paper only; fixtures use an in-memory fake rather
 /// than weakening endpoint validation with localhost exceptions.
-pub trait PaperBroker: Send + Sync {
-    fn execute<'a>(
-        &'a self,
-        plan: &'a ExecutionPlan,
-    ) -> Pin<Box<dyn Future<Output = Result<PaperExecution>> + Send + 'a>>;
-
-    fn reconcile<'a>(
-        &'a self,
-        execution: &'a PaperExecution,
-    ) -> Pin<Box<dyn Future<Output = Result<PaperExecution>> + Send + 'a>>;
-}
-
 /// v2 broker protocol. It accepts only a durable Rust-owned commitment and
 /// the allocation plan it commits to; callers cannot submit a naked plan.
 pub trait CommittedPaperBroker: Send + Sync {
@@ -122,6 +118,12 @@ pub trait CommittedPaperBroker: Send + Sync {
         reprice: &'a PaperReprice,
         replacement: &'a OrderIntent,
     ) -> Pin<Box<dyn Future<Output = Result<PaperOrderReceipt>> + Send + 'a>>;
+
+    fn reconcile_commitment<'a>(
+        &'a self,
+        commitment: &'a PaperCommitment,
+        execution: &'a PaperExecution,
+    ) -> Pin<Box<dyn Future<Output = Result<PaperExecution>> + Send + 'a>>;
 }
 
 /// Input for the task that is allowed to submit an already durable Paper
@@ -129,6 +131,7 @@ pub trait CommittedPaperBroker: Send + Sync {
 /// this task can only replay that exact commitment through a broker.
 #[derive(Debug, Clone)]
 pub struct PaperDispatchInput {
+    pub lease: DaemonLease,
     pub permit: TaskWritePermit,
     pub commitment: ArtifactRef,
     pub now: DateTime<Utc>,
@@ -137,6 +140,7 @@ pub struct PaperDispatchInput {
 /// Submission input for a durable, one-time r0 -> r1 replacement intent.
 #[derive(Debug, Clone)]
 pub struct PaperRepriceDispatchInput {
+    pub lease: DaemonLease,
     pub permit: TaskWritePermit,
     pub reprice: ArtifactRef,
     pub now: DateTime<Utc>,
@@ -247,28 +251,39 @@ impl V2PaperDispatchRuntime {
         let context: ExecutionContext =
             serde_json::from_slice(&self.store.read_blob(&context_artifact.blob)?)?;
         context.validate()?;
+        context.validate_complete_plan_closure()?;
         if context.run_id != input.permit.run_id
-            || context.broker_session != commitment.broker_session
-            || context.plan_hash != commitment.plan_hash
+            || context.broker_session.as_deref() != Some(commitment.broker_session.as_str())
+            || context.plan_hash.as_ref() != Some(&commitment.plan_hash)
         {
             return Err(PaperDispatchError::ContextMismatch);
         }
-        let plan_reference = context_artifact
-            .source_refs
-            .iter()
-            .find(|reference| reference.kind == ArtifactKind::ExecutionPlan)
-            .cloned()
+        let plan_reference = context
+            .execution_plan
+            .clone()
             .ok_or(PaperDispatchError::MissingAllocationPlan)?;
+        if !context_artifact.source_refs.contains(&plan_reference) {
+            return Err(PaperDispatchError::MissingAllocationPlan);
+        }
         let plan_artifact = self.load_expected(&plan_reference, ArtifactKind::ExecutionPlan)?;
         let plan: ExecutionPlan =
             serde_json::from_slice(&self.store.read_blob(&plan_artifact.blob)?)?;
-        if plan.plan_hash != commitment.plan_hash {
+        plan.validate()?;
+        if plan.plan_hash != commitment.plan_hash
+            || plan.broker_session != commitment.broker_session
+        {
             return Err(PaperDispatchError::PlanHashMismatch);
         }
 
         self.ensure_unfrozen()?;
+        self.store.validate_daemon_lease(&input.lease, Utc::now())?;
         self.store.validate_task_permit(&input.permit)?;
-        let execution = broker.execute_commitment(&commitment, &plan).await?;
+        let submitted = broker.execute_commitment(&commitment, &plan).await?;
+        if submitted.plan_hash != commitment.plan_hash {
+            return Err(PaperDispatchError::BrokerPlanHashMismatch);
+        }
+        self.store.validate_daemon_lease(&input.lease, Utc::now())?;
+        let execution = broker.reconcile_commitment(&commitment, &submitted).await?;
         if execution.plan_hash != commitment.plan_hash {
             return Err(PaperDispatchError::BrokerPlanHashMismatch);
         }
@@ -285,7 +300,7 @@ impl V2PaperDispatchRuntime {
             broker_receipts,
             now: input.now,
         })?;
-        reconciliation_runtime.commit(&input.permit, &reconciliation, input.now)?;
+        reconciliation_runtime.commit(&input.lease, &input.permit, &reconciliation, Utc::now())?;
 
         Ok(PaperDispatchOutput {
             commitment: commitment_artifact,
@@ -346,22 +361,27 @@ impl V2PaperDispatchRuntime {
         let context: ExecutionContext =
             serde_json::from_slice(&self.store.read_blob(&context_artifact.blob)?)?;
         context.validate()?;
+        context.validate_complete_plan_closure()?;
         if context.run_id != input.permit.run_id
-            || context.broker_session != commitment.broker_session
-            || context.plan_hash != commitment.plan_hash
+            || context.broker_session.as_deref() != Some(commitment.broker_session.as_str())
+            || context.plan_hash.as_ref() != Some(&commitment.plan_hash)
         {
             return Err(PaperDispatchError::ContextMismatch);
         }
-        let plan_reference = context_artifact
-            .source_refs
-            .iter()
-            .find(|reference| reference.kind == ArtifactKind::ExecutionPlan)
-            .cloned()
+        let plan_reference = context
+            .execution_plan
+            .clone()
             .ok_or(PaperDispatchError::MissingAllocationPlan)?;
+        if !context_artifact.source_refs.contains(&plan_reference) {
+            return Err(PaperDispatchError::MissingAllocationPlan);
+        }
         let plan_artifact = self.load_expected(&plan_reference, ArtifactKind::ExecutionPlan)?;
         let plan: ExecutionPlan =
             serde_json::from_slice(&self.store.read_blob(&plan_artifact.blob)?)?;
-        if plan.plan_hash != commitment.plan_hash {
+        plan.validate()?;
+        if plan.plan_hash != commitment.plan_hash
+            || plan.broker_session != commitment.broker_session
+        {
             return Err(PaperDispatchError::PlanHashMismatch);
         }
         let (order_index, original) = plan
@@ -372,7 +392,7 @@ impl V2PaperDispatchRuntime {
             .ok_or(PaperDispatchError::RepricePlanMismatch)?;
         if commitment.client_order_ids.get(&reprice.asset) != Some(&reprice.prior_client_order_id)
             || reprice.replacement_client_order_id
-                != client_order_id(&plan.plan_hash, order_index, 1)
+                != client_order_id(&commitment.broker_session, &plan.plan_hash, order_index, 1)
         {
             return Err(PaperDispatchError::RepricePlanMismatch);
         }
@@ -384,24 +404,34 @@ impl V2PaperDispatchRuntime {
         };
 
         self.ensure_unfrozen()?;
+        self.store.validate_daemon_lease(&input.lease, Utc::now())?;
         self.store.validate_task_permit(&input.permit)?;
         let receipt = broker
             .replace_commitment_once(&commitment, &reprice, &replacement)
             .await?;
-        let broker_receipt = broker_receipt(&receipt, &commitment, Some(&reprice), input.now)?;
-        let execution = PaperExecution {
+        let submitted = PaperExecution {
             plan_hash: plan.plan_hash.clone(),
             orders: vec![receipt],
         };
+        self.store.validate_daemon_lease(&input.lease, Utc::now())?;
+        let execution = broker.reconcile_commitment(&commitment, &submitted).await?;
+        if execution.plan_hash != commitment.plan_hash {
+            return Err(PaperDispatchError::BrokerPlanHashMismatch);
+        }
+        let broker_receipts = execution
+            .orders
+            .iter()
+            .map(|receipt| broker_receipt(receipt, &commitment, Some(&reprice), input.now))
+            .collect::<PaperDispatchResult<Vec<_>>>()?;
         let reconciliation_runtime = V2ReconciliationRuntime::new(self.store.clone());
         let reconciliation = reconciliation_runtime.reconcile(&ReconciliationInput {
             permit: input.permit.clone(),
             commitment: reprice.commitment.clone(),
             reprice: Some(input.reprice.clone()),
-            broker_receipts: vec![broker_receipt],
+            broker_receipts,
             now: input.now,
         })?;
-        reconciliation_runtime.commit(&input.permit, &reconciliation, input.now)?;
+        reconciliation_runtime.commit(&input.lease, &input.permit, &reconciliation, Utc::now())?;
 
         Ok(PaperDispatchOutput {
             commitment: commitment_artifact,
@@ -465,6 +495,12 @@ fn broker_receipt(
         client_order_id: receipt.client_order_id.clone(),
         broker_order_id: receipt.broker_order_id.clone(),
         state: receipt_state(&receipt.status)?,
+        requested_quantity_micros: receipt.requested_quantity_micros,
+        filled_quantity_micros: receipt.filled_quantity_micros,
+        remaining_quantity_micros: receipt.remaining_quantity_micros,
+        average_fill_price: receipt.average_fill_price,
+        broker_updated_at: receipt.broker_updated_at,
+        reason: receipt.reason.clone(),
         observed_at,
     })
 }
@@ -548,18 +584,26 @@ impl AlpacaPaper {
         market_clock_from_value(&clock)
     }
 
-    pub async fn execute(&self, plan: &ExecutionPlan) -> Result<PaperExecution> {
+    async fn execute_committed(
+        &self,
+        commitment: &PaperCommitment,
+        plan: &ExecutionPlan,
+    ) -> Result<PaperExecution> {
+        self.validate_commitment(commitment, plan)?;
         self.assert_market_open().await?;
         let mut orders = Vec::with_capacity(plan.orders.len());
-        for (index, order) in plan.orders.iter().enumerate() {
-            let client_order_id = client_order_id(&plan.plan_hash, index, 0);
-            let receipt = match self.lookup(&client_order_id).await? {
+        for order in &plan.orders {
+            let client_order_id = commitment
+                .client_order_ids
+                .get(&order.asset)
+                .ok_or(PaperError::CommitmentClientOrderMismatch(order.asset))?;
+            let receipt = match self.lookup(client_order_id).await? {
                 Some(receipt) => PaperOrderReceipt {
                     reused: true,
                     reprice_count: 0,
                     ..receipt
                 },
-                None => self.submit_order(order, &client_order_id, 0).await?,
+                None => self.submit_order(order, client_order_id, 0).await?,
             };
             orders.push(receipt);
         }
@@ -569,18 +613,26 @@ impl AlpacaPaper {
         })
     }
 
-    pub async fn execute_committed(
+    async fn reconcile_committed(
         &self,
         commitment: &PaperCommitment,
-        plan: &ExecutionPlan,
+        execution: &PaperExecution,
     ) -> Result<PaperExecution> {
-        self.validate_commitment(commitment, plan)?;
-        self.execute(plan).await
-    }
-
-    pub async fn reconcile(&self, execution: &PaperExecution) -> Result<PaperExecution> {
+        if execution.plan_hash != commitment.plan_hash {
+            return Err(PaperError::CommitmentPlanHashMismatch);
+        }
         let mut orders = Vec::with_capacity(execution.orders.len());
         for receipt in &execution.orders {
+            let asset = Asset::try_from(receipt.symbol.as_str())?;
+            let original = commitment
+                .client_order_ids
+                .get(&asset)
+                .ok_or(PaperError::CommitmentClientOrderMismatch(asset))?;
+            if receipt.client_order_id != *original
+                && receipt.client_order_id != replacement_client_order_id(original)
+            {
+                return Err(PaperError::CommitmentClientOrderMismatch(asset));
+            }
             orders.push(
                 self.get_order(
                     &receipt.broker_order_id,
@@ -598,20 +650,6 @@ impl AlpacaPaper {
 
     /// The caller supplies a newly gate-validated replacement intent.  This
     /// adapter guarantees exactly one cancellation/replacement lineage.
-    pub async fn cancel_and_replace_once(
-        &self,
-        receipt: &PaperOrderReceipt,
-        replacement: &OrderIntent,
-    ) -> Result<PaperOrderReceipt> {
-        if receipt.reprice_count >= 1 {
-            return Err(PaperError::RepriceConsumed);
-        }
-        self.delete(&format!("/v2/orders/{}", receipt.broker_order_id))
-            .await?;
-        let client_order_id = replacement_client_order_id(&receipt.client_order_id);
-        self.submit_order(replacement, &client_order_id, 1).await
-    }
-
     /// Execute only the pre-recorded r0 -> r1 reprice lineage. A retry first
     /// looks up the deterministic replacement ID, so a crash after submission
     /// never creates another Paper order.
@@ -663,8 +701,14 @@ impl AlpacaPaper {
         commitment
             .validate()
             .map_err(|error| PaperError::InvalidCommitment(error.to_string()))?;
+        plan.validate()?;
         if commitment.plan_hash != plan.plan_hash {
             return Err(PaperError::CommitmentPlanHashMismatch);
+        }
+        if commitment.broker_session != plan.broker_session {
+            return Err(PaperError::InvalidCommitment(
+                "broker session does not match execution plan".to_owned(),
+            ));
         }
         if commitment.client_order_ids.len() != plan.orders.len() {
             return Err(PaperError::InvalidCommitment(
@@ -672,7 +716,7 @@ impl AlpacaPaper {
             ));
         }
         for (index, order) in plan.orders.iter().enumerate() {
-            let expected = client_order_id(&plan.plan_hash, index, 0);
+            let expected = client_order_id(&commitment.broker_session, &plan.plan_hash, index, 0);
             if commitment.client_order_ids.get(&order.asset) != Some(&expected) {
                 return Err(PaperError::CommitmentClientOrderMismatch(order.asset));
             }
@@ -852,22 +896,6 @@ impl AlpacaPaper {
     }
 }
 
-impl PaperBroker for AlpacaPaper {
-    fn execute<'a>(
-        &'a self,
-        plan: &'a ExecutionPlan,
-    ) -> Pin<Box<dyn Future<Output = Result<PaperExecution>> + Send + 'a>> {
-        Box::pin(AlpacaPaper::execute(self, plan))
-    }
-
-    fn reconcile<'a>(
-        &'a self,
-        execution: &'a PaperExecution,
-    ) -> Pin<Box<dyn Future<Output = Result<PaperExecution>> + Send + 'a>> {
-        Box::pin(AlpacaPaper::reconcile(self, execution))
-    }
-}
-
 impl CommittedPaperBroker for AlpacaPaper {
     fn execute_commitment<'a>(
         &'a self,
@@ -890,30 +918,102 @@ impl CommittedPaperBroker for AlpacaPaper {
             replacement,
         ))
     }
+
+    fn reconcile_commitment<'a>(
+        &'a self,
+        commitment: &'a PaperCommitment,
+        execution: &'a PaperExecution,
+    ) -> Pin<Box<dyn Future<Output = Result<PaperExecution>> + Send + 'a>> {
+        Box::pin(AlpacaPaper::reconcile_committed(
+            self, commitment, execution,
+        ))
+    }
 }
 
 fn receipt_from_value(
     value: Value,
-    fallback_client_order_id: &str,
+    expected_client_order_id: &str,
     reused: bool,
     reprice_count: u8,
 ) -> Result<PaperOrderReceipt> {
     let broker_order_id = required_string(&value, "id")?;
     let symbol = required_string(&value, "symbol")?;
     let status = required_string(&value, "status")?;
-    let client_order_id = value
-        .get("client_order_id")
+    let client_order_id = required_string(&value, "client_order_id")?;
+    if client_order_id != expected_client_order_id {
+        return Err(PaperError::InvalidCommitment(
+            "broker client order ID does not match durable commitment".to_owned(),
+        ));
+    }
+    let requested_quantity_micros = decimal_micros(&required_string(&value, "qty")?)?;
+    let filled_quantity_micros = decimal_micros(&required_string(&value, "filled_qty")?)?;
+    let remaining_quantity_micros = requested_quantity_micros
+        .checked_sub(filled_quantity_micros)
+        .filter(|quantity| *quantity >= 0)
+        .ok_or(PaperError::InvalidQuantity("filled_qty"))?;
+    let average_fill_price = value
+        .get("filled_avg_price")
         .and_then(Value::as_str)
-        .unwrap_or(fallback_client_order_id)
-        .to_owned();
+        .filter(|price| !price.trim().is_empty())
+        .map(decimal_micros)
+        .transpose()?
+        .map(MoneyMicros);
+    let broker_updated_at = DateTime::parse_from_rfc3339(&required_string(&value, "updated_at")?)
+        .map_err(|error| PaperError::InvalidClock(error.to_string()))?
+        .with_timezone(&Utc);
+    let reason = ["reject_reason", "cancel_reason"]
+        .into_iter()
+        .find_map(|field| value.get(field).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty())
+        .map(ToOwned::to_owned);
     Ok(PaperOrderReceipt {
         client_order_id,
         broker_order_id,
         symbol,
         status,
+        requested_quantity_micros,
+        filled_quantity_micros,
+        remaining_quantity_micros,
+        average_fill_price,
+        broker_updated_at,
+        reason,
         reused,
         reprice_count,
     })
+}
+
+fn decimal_micros(value: &str) -> Result<i64> {
+    let value = value.trim();
+    let (negative, value) = match value.strip_prefix('-') {
+        Some(value) => (true, value),
+        None => (false, value.strip_prefix('+').unwrap_or(value)),
+    };
+    let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
+    if whole.is_empty()
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+        || fraction.len() > 6
+    {
+        return Err(PaperError::InvalidQuantity("decimal"));
+    }
+    let whole = whole
+        .parse::<i64>()
+        .map_err(|_| PaperError::InvalidQuantity("decimal"))?;
+    let fraction = if fraction.is_empty() {
+        0
+    } else {
+        fraction
+            .parse::<i64>()
+            .map_err(|_| PaperError::InvalidQuantity("decimal"))?
+            .checked_mul(10_i64.pow((6 - fraction.len()) as u32))
+            .ok_or(PaperError::InvalidQuantity("decimal"))?
+    };
+    let micros = whole
+        .checked_mul(1_000_000)
+        .and_then(|whole| whole.checked_add(fraction))
+        .ok_or(PaperError::InvalidQuantity("decimal"))?;
+    Ok(if negative { -micros } else { micros })
 }
 
 fn required_string(value: &Value, field: &'static str) -> Result<String> {
@@ -973,8 +1073,15 @@ fn quantity_string(order: &OrderIntent) -> Result<String> {
     Ok(format!("{whole}.{fraction:06}"))
 }
 
-pub fn client_order_id(plan_hash: &ContentHash, order_index: usize, reprice_count: u8) -> String {
-    let prefix = &plan_hash.as_str()[..16];
+pub fn client_order_id(
+    broker_session: &str,
+    plan_hash: &ContentHash,
+    order_index: usize,
+    reprice_count: u8,
+) -> String {
+    let identity =
+        ContentHash::of_bytes(format!("{broker_session}\0{plan_hash}\0{order_index}").as_bytes());
+    let prefix = &identity.as_str()[..16];
     format!("akzio-v2-{prefix}-{order_index}-r{reprice_count}")
 }
 
@@ -988,17 +1095,62 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
-    use crate::{ExecutionPlan, ExecutionPolicy, MoneyMicros, OrderIntent};
+    use crate::{ExecutionPlan, MoneyMicros, OrderIntent};
     use akzio_domain::{
-        ArtifactId, ArtifactKind, ArtifactRef, Asset, ContentHash, PaperCommitmentId,
+        ArtifactId, ArtifactKind, ArtifactRef, Asset, ContentHash, FactorExposure,
+        PaperCommitmentId, TargetPortfolio, WeightPpm, REBUILD_SCHEMA_VERSION,
     };
+    use chrono::Utc;
+
+    fn fixture_plan() -> ExecutionPlan {
+        let mut target = TargetPortfolio::zeroed();
+        target.weights.insert(Asset::Tqqq, WeightPpm(100_000));
+        let mut plan = ExecutionPlan {
+            schema_version: REBUILD_SCHEMA_VERSION,
+            decision_context: ArtifactRef {
+                artifact_id: ArtifactId(ContentHash::of_bytes(b"decision")),
+                kind: ArtifactKind::DecisionContext,
+            },
+            account_snapshot: ArtifactRef {
+                artifact_id: ArtifactId(ContentHash::of_bytes(b"account")),
+                kind: ArtifactKind::NormalizedEvidence,
+            },
+            quote_snapshot: ArtifactRef {
+                artifact_id: ArtifactId(ContentHash::of_bytes(b"quote")),
+                kind: ArtifactKind::NormalizedEvidence,
+            },
+            market_clock_snapshot: ArtifactRef {
+                artifact_id: ArtifactId(ContentHash::of_bytes(b"clock")),
+                kind: ArtifactKind::NormalizedEvidence,
+            },
+            policy_hash: ContentHash::of_bytes(b"policy"),
+            target: target.clone(),
+            orders: vec![OrderIntent {
+                asset: Asset::Tqqq,
+                side: OrderSide::Buy,
+                notional: MoneyMicros::from_usd_cents(10_000),
+                limit_price: MoneyMicros::from_usd_cents(2_500),
+            }],
+            gross_exposure_ppm: 100_000,
+            net_exposure_ppm: 100_000,
+            factor_exposure: FactorExposure::from_target(&target).unwrap(),
+            turnover_ppm: 100_000,
+            broker_session: "paper:fixture".to_owned(),
+            created_at: Utc::now(),
+            plan_hash: ContentHash::of_bytes(b"pending"),
+        };
+        plan.refresh_hash().unwrap();
+        plan
+    }
 
     #[test]
     fn ids_are_deterministic_and_bounded() {
         let hash = ContentHash::of_bytes(b"plan");
-        let id = client_order_id(&hash, 12, 0);
+        let id = client_order_id("paper:2026-08-10", &hash, 12, 0);
         assert!(id.starts_with("akzio-v2-"));
         assert!(id.len() <= 48);
+        assert_eq!(id, client_order_id("paper:2026-08-10", &hash, 12, 0));
+        assert_ne!(id, client_order_id("paper:2026-08-11", &hash, 12, 0));
         assert_eq!(
             replacement_client_order_id(&id),
             format!("{}-r1", id.split("-r").next().unwrap())
@@ -1017,18 +1169,29 @@ mod tests {
     }
 
     #[test]
+    fn receipt_states_cover_lifecycle_and_terminal_outcomes() {
+        assert_eq!(
+            receipt_state("accepted").unwrap(),
+            OrderReceiptState::Accepted
+        );
+        assert_eq!(
+            receipt_state("partially_filled").unwrap(),
+            OrderReceiptState::PartiallyFilled
+        );
+        assert_eq!(receipt_state("filled").unwrap(), OrderReceiptState::Filled);
+        assert_eq!(
+            receipt_state("canceled").unwrap(),
+            OrderReceiptState::Canceled
+        );
+        assert_eq!(
+            receipt_state("rejected").unwrap(),
+            OrderReceiptState::Rejected
+        );
+    }
+
+    #[test]
     fn committed_adapter_rejects_mismatched_plan_or_client_id_before_http() {
-        let plan = ExecutionPlan {
-            policy: ExecutionPolicy::default(),
-            targets: vec![],
-            orders: vec![OrderIntent {
-                asset: Asset::Tqqq,
-                side: OrderSide::Buy,
-                notional: MoneyMicros::from_usd_cents(10_000),
-                limit_price: MoneyMicros::from_usd_cents(2_500),
-            }],
-            plan_hash: ContentHash::of_bytes(b"committed-plan"),
-        };
+        let plan = fixture_plan();
         let credentials = PaperCredentials {
             key_id: "key".to_owned(),
             secret_key: "secret".to_owned(),
@@ -1044,7 +1207,7 @@ mod tests {
             broker_session: "paper:fixture".to_owned(),
             client_order_ids: BTreeMap::from([(
                 Asset::Tqqq,
-                client_order_id(&plan.plan_hash, 0, 0),
+                client_order_id(&plan.broker_session, &plan.plan_hash, 0, 0),
             )]),
             created_at: chrono::Utc::now(),
         };

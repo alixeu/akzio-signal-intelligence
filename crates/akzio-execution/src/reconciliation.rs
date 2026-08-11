@@ -7,7 +7,7 @@ use akzio_domain::{
     Asset, DomainError, OrderReceipt, OrderReceiptState, PaperCommitment, PaperReprice,
     Reconciliation, ReconciliationId, ReconciliationState, RunPurpose, TaskStatus, TaskWritePermit,
 };
-use akzio_store::v2::{StoreError, V2Store};
+use akzio_store::v2::{DaemonLease, StoreError, V2Store};
 use chrono::{DateTime, Utc};
 use thiserror::Error;
 
@@ -167,6 +167,7 @@ impl V2ReconciliationRuntime {
 
     pub fn commit(
         &self,
+        lease: &DaemonLease,
         permit: &TaskWritePermit,
         output: &ReconciliationOutput,
         now: DateTime<Utc>,
@@ -174,7 +175,7 @@ impl V2ReconciliationRuntime {
         let mut artifacts = output.receipts.clone();
         artifacts.push(output.reconciliation.clone());
         self.store
-            .commit_attempt(permit, &artifacts, TaskStatus::Succeeded, now)?;
+            .commit_fenced_attempt(lease, permit, &artifacts, TaskStatus::Succeeded, now)?;
         Ok(())
     }
 
@@ -234,16 +235,27 @@ fn reconciliation_state(
     if receipts.iter().any(|receipt| {
         matches!(
             receipt.state,
-            OrderReceiptState::Rejected | OrderReceiptState::Failed
+            OrderReceiptState::Canceled | OrderReceiptState::Rejected | OrderReceiptState::Failed
         )
     }) {
         ReconciliationState::Failed
-    } else if receipt_count == commitment.client_order_ids.len() {
+    } else if receipt_count == commitment.client_order_ids.len()
+        && receipts
+            .iter()
+            .all(|receipt| receipt.state == OrderReceiptState::Filled)
+    {
         ReconciliationState::Complete
     } else if receipt_count == 0 {
         ReconciliationState::Pending
-    } else {
+    } else if receipts.iter().any(|receipt| {
+        matches!(
+            receipt.state,
+            OrderReceiptState::PartiallyFilled | OrderReceiptState::Filled
+        )
+    }) {
         ReconciliationState::Partial
+    } else {
+        ReconciliationState::Pending
     }
 }
 
@@ -354,6 +366,15 @@ mod tests {
         let directory = tempdir().unwrap();
         let store = V2Store::open(directory.path()).unwrap();
         let now = Utc::now();
+        let lease = store
+            .acquire_daemon_lease(
+                "scheduler",
+                "fixture-daemon",
+                now,
+                now + Duration::seconds(30),
+            )
+            .unwrap()
+            .expect("fresh fixture must acquire the scheduler lease");
         let permit = claimed_paper_task(&store, now);
         let plan_hash = ContentHash::of_bytes(b"plan");
         let commitment = Artifact::new(
@@ -399,6 +420,12 @@ mod tests {
                     client_order_id: "client-qqq".to_owned(),
                     broker_order_id: "broker-qqq".to_owned(),
                     state: OrderReceiptState::Filled,
+                    requested_quantity_micros: 1_000_000,
+                    filled_quantity_micros: 1_000_000,
+                    remaining_quantity_micros: 0,
+                    average_fill_price: Some(akzio_domain::MoneyMicros(1_000_000)),
+                    broker_updated_at: now,
+                    reason: None,
                     observed_at: now,
                 }],
                 now,
@@ -408,7 +435,7 @@ mod tests {
             serde_json::from_slice(&store.read_blob(&output.reconciliation.blob).unwrap()).unwrap();
         assert_eq!(reconciliation.state, ReconciliationState::Complete);
         V2ReconciliationRuntime::new(store.clone())
-            .commit(&permit, &output, now)
+            .commit(&lease, &permit, &output, now)
             .unwrap();
         assert_eq!(
             store

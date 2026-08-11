@@ -6,9 +6,10 @@
 pub mod runtime;
 
 pub use runtime::{
-    AcquiredEvidence, DetailInput, EvidenceAdapter, EvidenceBundle, EvidenceRequest,
-    EvidenceRuntime, EvidenceRuntimeError, EvidenceRuntimeResult, EvidenceSource,
-    FixtureEvidenceAdapter, NormalizedEvidencePayload,
+    AcquiredEvidence, AlpacaEvidenceAdapter, DetailInput, EvidenceAdapter, EvidenceBundle,
+    EvidenceRequest, EvidenceRuntime, EvidenceRuntimeError, EvidenceRuntimeResult, EvidenceSource,
+    FixtureEvidenceAdapter, FredEvidenceAdapter, GovernedEvidenceTransport, NewsWebEvidenceAdapter,
+    NormalizedEvidencePayload, SecEdgarEvidenceAdapter,
 };
 
 #[doc(hidden)]

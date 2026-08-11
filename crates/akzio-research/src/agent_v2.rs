@@ -449,14 +449,17 @@ fn canonical_active_contracts(store: &V2Store) -> RebuildResearchResult<Vec<Agen
         CanonicalContractDefinition {
             purpose: "research.synthesizer",
             responsibility: "Synthesize approved claims and critiques into a DecisionProposal with typed blockers for Rust-owned gates.",
-            prompt: "You are Akzio's research synthesizer. Return only a JSON DecisionProposal with explicit blockers. Use supplied claims and critiques only. Do not change evidence, bypass the DecisionGate, submit an order, or expand any capability.",
+            prompt: "You are Akzio's research synthesizer. Return only a JSON DecisionProposal matching the supplied schema. Use only artifacts selected by the ContextManifest. Do not change evidence, bypass the DecisionGate, submit an order, or expand any capability.",
             output_kind: ArtifactKind::DecisionProposal,
             output_schema: decision_proposal_output_schema(),
-            permitted_kinds: BTreeSet::from([
-                ArtifactKind::Claim,
-                ArtifactKind::Critique,
-                ArtifactKind::SemanticDetail,
-            ]),
+                permitted_kinds: BTreeSet::from([
+                    ArtifactKind::Claim,
+                    ArtifactKind::Critique,
+                    ArtifactKind::Experience,
+                    ArtifactKind::CandidatePolicy,
+                    ArtifactKind::NormalizedEvidence,
+                    ArtifactKind::SemanticDetail,
+                ]),
             min_context_artifacts: 1,
             budget: TaskBudget {
                 max_input_tokens: 12_000,
@@ -676,17 +679,97 @@ fn decision_proposal_output_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "summary": { "type": "string" },
-            "confidence_ppm": { "type": "integer" },
-            "blockers": { "type": "array", "items": { "type": "string" } },
-            "asset_views": {
-                "type": "object",
-                "properties": {},
-                "required": [],
-                "additionalProperties": true
+            "summary": { "type": "string", "minLength": 1 },
+            "confidence_ppm": { "type": "integer", "minimum": 0, "maximum": 1000000 },
+            "forecasts": {
+                "type": "array",
+                "minItems": 12,
+                "maxItems": 12,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "asset": { "type": "string", "enum": ["TQQQ", "QQQ", "SOXX", "SOXL"] },
+                        "horizon": { "type": "string", "enum": ["t1", "t3", "t5"] },
+                        "positive_return_probability_ppm": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 1000000
+                        },
+                        "expected_return_ppm": { "type": "integer" }
+                    },
+                    "required": [
+                        "asset",
+                        "horizon",
+                        "positive_return_probability_ppm",
+                        "expected_return_ppm"
+                    ],
+                    "additionalProperties": false
+                }
+            },
+            "claims": { "type": "array", "items": artifact_ref_schema(&["claim"]) },
+            "critiques": { "type": "array", "items": artifact_ref_schema(&["critique"]) },
+            "evidence": {
+                "type": "array",
+                "items": artifact_ref_schema(&["normalized_evidence", "semantic_detail"])
+            },
+            "material_conflicts": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "claim": artifact_ref_schema(&["claim"]),
+                        "critique": artifact_ref_schema(&["critique"]),
+                        "topic": { "type": "string", "minLength": 1 },
+                        "rationale": { "type": "string", "minLength": 1 }
+                    },
+                    "required": ["claim", "critique", "topic", "rationale"],
+                    "additionalProperties": false
+                }
+            },
+            "hard_blockers": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "enum": [
+                        "unsupported_universe", "no_executable_order", "frozen",
+                        "missing_evidence", "invalid_provenance", "material_conflict",
+                        "stale_quote", "missing_quote", "stale_account", "missing_account",
+                        "market_closed", "factor_limit", "pair_exposure_limit",
+                        "turnover_limit", "plan_hash_mismatch", "duplicate_commitment",
+                        "non_paper_endpoint", "non_canonical_run", "recovery_incomplete"
+                    ]
+                }
+            },
+            "soft_warnings": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "enum": [
+                        "low_confidence", "incomplete_evidence", "elevated_turnover",
+                        "slow_model_response", "stale_noncritical_evidence"
+                    ]
+                }
             }
         },
-        "required": ["summary", "confidence_ppm", "blockers", "asset_views"],
+        "required": [
+            "summary", "confidence_ppm", "forecasts", "claims", "critiques",
+            "evidence", "material_conflicts", "hard_blockers", "soft_warnings"
+        ],
+        "additionalProperties": false
+    })
+}
+
+fn artifact_ref_schema(kinds: &[&str]) -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "artifact_id": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+            },
+            "kind": { "type": "string", "enum": kinds }
+        },
+        "required": ["artifact_id", "kind"],
         "additionalProperties": false
     })
 }
@@ -2117,6 +2200,66 @@ mod tests {
             assert!(recipe.allowed_evidence_sources.is_empty());
         }
         store.verify_integrity().unwrap();
+    }
+
+    #[test]
+    fn decision_proposal_schema_matches_typed_decision_draft() {
+        let schema = decision_proposal_output_schema();
+        let forecasts = akzio_domain::Asset::EXECUTABLE
+            .into_iter()
+            .flat_map(|asset| {
+                ["t1", "t3", "t5"].into_iter().map(move |horizon| {
+                    json!({
+                        "asset": asset.symbol(),
+                        "horizon": horizon,
+                        "positive_return_probability_ppm": 500000,
+                        "expected_return_ppm": 0,
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        let valid = json!({
+            "summary": "blocked fixture decision",
+            "confidence_ppm": 500000,
+            "forecasts": forecasts,
+            "claims": [],
+            "critiques": [],
+            "evidence": [],
+            "material_conflicts": [],
+            "hard_blockers": ["missing_evidence"],
+            "soft_warnings": []
+        });
+
+        validate_schema_value(&valid, &schema, "$").unwrap();
+        serde_json::from_value::<akzio_domain::DecisionDraft>(valid)
+            .unwrap()
+            .validate()
+            .unwrap();
+        for invalid in [
+            json!({
+                "summary": "legacy",
+                "confidence_ppm": 500000,
+                "blockers": ["anything"],
+                "asset_views": {}
+            }),
+            json!({
+                "summary": "extra field",
+                "targets": {
+                    "weights": { "TQQQ": 0, "QQQ": 0, "SOXX": 0, "SOXL": 0 }
+                },
+                "confidence_ppm": 500000,
+                "forecasts": [],
+                "claims": [],
+                "critiques": [],
+                "evidence": [],
+                "material_conflicts": [],
+                "hard_blockers": ["missing_evidence"],
+                "soft_warnings": [],
+                "authority": "paper"
+            }),
+        ] {
+            assert!(validate_schema_value(&invalid, &schema, "$").is_err());
+        }
     }
 
     #[test]

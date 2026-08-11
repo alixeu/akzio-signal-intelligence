@@ -11,6 +11,7 @@ use akzio_domain::{
 };
 use akzio_store::v2::{StoreError, V2Store};
 use chrono::{DateTime, Duration, Utc};
+use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -89,6 +90,8 @@ pub enum EvidenceAdapterError {
     MissingFixture(String),
     #[error("adapter source does not match request")]
     SourceMismatch,
+    #[error("governed evidence transport failed: {0}")]
+    Transport(String),
 }
 
 pub trait EvidenceAdapter: Send + Sync {
@@ -96,6 +99,59 @@ pub trait EvidenceAdapter: Send + Sync {
 
     fn acquire(&self, request: &EvidenceRequest) -> Result<AcquiredEvidence, EvidenceAdapterError>;
 }
+
+/// Rust-injected transport for governed evidence adapters. It accepts a
+/// source enum and resource instead of an arbitrary URL, so model code never
+/// gets a route to network access.
+pub trait GovernedEvidenceTransport: Send + Sync {
+    fn acquire(
+        &self,
+        source: EvidenceSource,
+        resource: &str,
+    ) -> Result<AcquiredEvidence, EvidenceAdapterError>;
+}
+
+macro_rules! governed_adapter {
+    ($name:ident, $source:expr) => {
+        #[derive(Debug, Clone)]
+        pub struct $name<T> {
+            transport: T,
+        }
+
+        impl<T> $name<T> {
+            pub fn new(transport: T) -> Self {
+                Self { transport }
+            }
+        }
+
+        impl<T: GovernedEvidenceTransport> EvidenceAdapter for $name<T> {
+            fn source(&self) -> EvidenceSource {
+                $source
+            }
+
+            fn acquire(
+                &self,
+                request: &EvidenceRequest,
+            ) -> Result<AcquiredEvidence, EvidenceAdapterError> {
+                if request.source != $source {
+                    return Err(EvidenceAdapterError::SourceMismatch);
+                }
+                let mut acquired = self.transport.acquire($source, &request.resource)?;
+                acquired.normalized = serde_json::json!({
+                    "adapter": $source.as_str(),
+                    "resource": request.resource,
+                    "payload": acquired.normalized,
+                });
+                Ok(acquired)
+            }
+        }
+    };
+}
+
+governed_adapter!(AlpacaEvidenceAdapter, EvidenceSource::Alpaca);
+governed_adapter!(SecEdgarEvidenceAdapter, EvidenceSource::SecEdgar);
+governed_adapter!(FredEvidenceAdapter, EvidenceSource::Fred);
+governed_adapter!(NewsWebEvidenceAdapter, EvidenceSource::NewsWeb);
 
 /// Local-only adapter for deterministic test and replay input. It has no
 /// filesystem, network, or model capability.
@@ -153,6 +209,8 @@ pub enum EvidenceRuntimeError {
     StaleEvidence,
     #[error("acquired evidence is empty or lacks a media type")]
     InvalidAcquisition,
+    #[error("acquired evidence source URI is invalid or contains credentials")]
+    UnsafeSourceUri,
     #[error("semantic detail must cite normalized evidence")]
     DetailRequiresNormalizedEvidence,
 }
@@ -226,6 +284,7 @@ impl EvidenceRuntime {
         {
             return Err(EvidenceRuntimeError::InvalidAcquisition);
         }
+        Self::validate_source_uri(&acquired.source_uri)?;
         if now.signed_duration_since(acquired.observed_at) > request.max_age {
             return Err(EvidenceRuntimeError::StaleEvidence);
         }
@@ -314,6 +373,14 @@ impl EvidenceRuntime {
         )?;
         Ok(detail)
     }
+
+    fn validate_source_uri(source_uri: &str) -> EvidenceRuntimeResult<()> {
+        let parsed = Url::parse(source_uri).map_err(|_| EvidenceRuntimeError::UnsafeSourceUri)?;
+        if parsed.username() != "" || parsed.password().is_some() || parsed.query().is_some() {
+            return Err(EvidenceRuntimeError::UnsafeSourceUri);
+        }
+        Ok(())
+    }
 }
 
 fn task_origin(permit: &TaskWritePermit) -> Option<ArtifactOrigin> {
@@ -353,6 +420,95 @@ mod tests {
             retry_rate_limited: true,
             retry_invalid_output: false,
         }
+    }
+
+    #[derive(Clone)]
+    struct FixtureTransport {
+        evidence: AcquiredEvidence,
+    }
+
+    impl GovernedEvidenceTransport for FixtureTransport {
+        fn acquire(
+            &self,
+            _source: EvidenceSource,
+            _resource: &str,
+        ) -> Result<AcquiredEvidence, EvidenceAdapterError> {
+            Ok(self.evidence.clone())
+        }
+    }
+
+    fn transport() -> FixtureTransport {
+        FixtureTransport {
+            evidence: AcquiredEvidence {
+                raw: br#"{\"fixture\":true}"#.to_vec(),
+                media_type: "application/json".to_owned(),
+                source_uri: "fixture://governed/resource".to_owned(),
+                observed_at: Utc::now(),
+                normalized: serde_json::json!({"fixture": true}),
+            },
+        }
+    }
+
+    fn assert_governed_adapter<A: EvidenceAdapter>(
+        adapter: A,
+        source: EvidenceSource,
+        other: EvidenceSource,
+    ) {
+        let response = adapter
+            .acquire(&EvidenceRequest {
+                source,
+                resource: "resource".to_owned(),
+                max_age: Duration::seconds(30),
+            })
+            .unwrap();
+        assert_eq!(response.normalized["adapter"], source.as_str());
+        assert_eq!(response.normalized["resource"], "resource");
+        assert_eq!(response.normalized["payload"]["fixture"], true);
+        assert!(matches!(
+            adapter.acquire(&EvidenceRequest {
+                source: other,
+                resource: "resource".to_owned(),
+                max_age: Duration::seconds(30),
+            }),
+            Err(EvidenceAdapterError::SourceMismatch)
+        ));
+    }
+
+    #[test]
+    fn governed_adapters_are_source_typed_and_local_transport_only() {
+        assert_governed_adapter(
+            AlpacaEvidenceAdapter::new(transport()),
+            EvidenceSource::Alpaca,
+            EvidenceSource::SecEdgar,
+        );
+        assert_governed_adapter(
+            SecEdgarEvidenceAdapter::new(transport()),
+            EvidenceSource::SecEdgar,
+            EvidenceSource::Fred,
+        );
+        assert_governed_adapter(
+            FredEvidenceAdapter::new(transport()),
+            EvidenceSource::Fred,
+            EvidenceSource::NewsWeb,
+        );
+        assert_governed_adapter(
+            NewsWebEvidenceAdapter::new(transport()),
+            EvidenceSource::NewsWeb,
+            EvidenceSource::Alpaca,
+        );
+    }
+
+    #[test]
+    fn source_uri_rejects_credentials_and_query_parameters() {
+        assert!(EvidenceRuntime::validate_source_uri("fixture://alpaca/quote").is_ok());
+        assert!(matches!(
+            EvidenceRuntime::validate_source_uri("https://key:secret@example.test/evidence"),
+            Err(EvidenceRuntimeError::UnsafeSourceUri)
+        ));
+        assert!(matches!(
+            EvidenceRuntime::validate_source_uri("https://example.test/evidence?token=secret"),
+            Err(EvidenceRuntimeError::UnsafeSourceUri)
+        ));
     }
 
     fn install_run(store: &V2Store, now: DateTime<Utc>, tasks: usize) -> RunId {

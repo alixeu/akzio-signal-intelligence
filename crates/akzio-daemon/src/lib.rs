@@ -745,6 +745,19 @@ pub fn fixture_model_client() -> ModelClient {
         },
         "stop_reason": "fixture planner has no configured evidence adapter"
     });
+    let forecasts = akzio_domain::Asset::EXECUTABLE
+        .into_iter()
+        .flat_map(|asset| {
+            ["t1", "t3", "t5"].into_iter().map(move |horizon| {
+                serde_json::json!({
+                    "asset": asset.symbol(),
+                    "horizon": horizon,
+                    "positive_return_probability_ppm": 500000,
+                    "expected_return_ppm": 0,
+                })
+            })
+        })
+        .collect::<Vec<_>>();
     let response = |output: serde_json::Value| {
         serde_json::json!({
             "output_text": serde_json::to_string(&output).expect("static fixture JSON"),
@@ -771,10 +784,15 @@ pub fn fixture_model_client() -> ModelClient {
         (
             "research.synthesizer".to_owned(),
             response(serde_json::json!({
-                "summary": "fixture decision draft",
-                "confidence_ppm": 500000,
-                "blockers": [],
-                "asset_views": {}
+                    "summary": "fixture decision draft",
+                    "confidence_ppm": 500000,
+                    "forecasts": forecasts,
+                "claims": [],
+                "critiques": [],
+                "evidence": [],
+                "material_conflicts": [],
+                "hard_blockers": ["missing_evidence"],
+                "soft_warnings": []
             })),
         ),
     ]))

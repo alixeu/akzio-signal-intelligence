@@ -740,6 +740,7 @@ mod tests {
 
     fn forecast(horizon: DecisionHorizon, probability: u32) -> Forecast {
         Forecast {
+            asset: Asset::Tqqq,
             horizon,
             positive_return_probability_ppm: probability,
             expected_return_ppm: 0,

@@ -775,7 +775,6 @@ mod tests {
 
     #[test]
     fn experience_and_transition_use_typed_policy_subjects() {
-        assert_eq!(crate::V2_DOMAIN_SCHEMA_VERSION, 7);
         let contract_hash = ContentHash::of_bytes(b"contract");
         let subject = PolicySubject::Contract(contract_hash.clone());
         let experience = Experience {

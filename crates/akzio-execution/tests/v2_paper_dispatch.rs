@@ -1,25 +1,34 @@
 use std::{
+    collections::{BTreeMap, VecDeque},
     future::Future,
     pin::Pin,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Mutex,
+    },
 };
 
 use akzio_domain::{
     Artifact, ArtifactId, ArtifactKind, ArtifactLifecycle, ArtifactOrigin, ArtifactProvenance,
     ArtifactRef, Asset, ContentHash, ExecutionContext, ExecutionVerdict, FactorExposure,
-    FailureDisposition, PaperCommitment, Reconciliation, ReconciliationState, RetryPolicy, RunId,
-    RunPurpose, TaskBudget, TaskId, TaskRecipeId, TaskWritePermit, WorkflowGraph, WorkflowNode,
-    REBUILD_SCHEMA_VERSION,
+    FailureDisposition, PaperCommitment, PaperCommitmentId, Reconciliation, ReconciliationState,
+    RetryPolicy, RunId, RunPurpose, TargetPortfolio, TaskBudget, TaskId, TaskRecipeId,
+    TaskWritePermit, WeightPpm, WorkflowGraph, WorkflowNode, REBUILD_SCHEMA_VERSION,
 };
 use akzio_execution::{
-    paper::{CommittedPaperBroker, PaperExecution, PaperOrderReceipt, Result as PaperResult},
+    paper::{
+        client_order_id, CommittedPaperBroker, PaperError, PaperExecution, PaperOrderReceipt,
+        Result as PaperResult,
+    },
     ExecutionPlan, ExecutionPolicy, MoneyMicros, OrderIntent, OrderSide, PaperCommitmentInput,
     PaperDispatchError, PaperDispatchInput, PaperRepriceDispatchInput, Quote, RepriceError,
     RepriceInput, V2PaperCommitmentRuntime, V2PaperDispatchRuntime, V2RepriceRuntime,
 };
-use akzio_store::v2::{SessionReservation, StoreError, StoredRun, V2Store, WorkflowCommit};
-use chrono::{Duration, Utc};
-use tempfile::tempdir;
+use akzio_store::v2::{
+    DaemonLease, SessionReservation, StoreError, StoredRun, V2Store, WorkflowCommit,
+};
+use chrono::{DateTime, Duration, Utc};
+use tempfile::{tempdir, TempDir};
 
 fn budget() -> TaskBudget {
     TaskBudget {
@@ -32,7 +41,7 @@ fn budget() -> TaskBudget {
 
 fn retry() -> RetryPolicy {
     RetryPolicy {
-        max_attempts: 1,
+        max_attempts: 2,
         initial_backoff_ms: 1,
         retry_transport: false,
         retry_rate_limited: false,
@@ -66,7 +75,7 @@ fn workflow() -> WorkflowGraph {
                 task_id: dispatch_task_id.clone(),
                 recipe_id: TaskRecipeId::new("execution.dispatch").unwrap(),
                 contract_hash: None,
-                objective: "submit durable paper commitment".to_owned(),
+                objective: "dispatch paper execution".to_owned(),
                 dependencies: vec![commitment_task_id],
                 input_artifacts: vec![],
                 priority: 90,
@@ -79,7 +88,7 @@ fn workflow() -> WorkflowGraph {
                 task_id: reprice_task_id.clone(),
                 recipe_id: TaskRecipeId::new("execution.reprice.prepare").unwrap(),
                 contract_hash: None,
-                objective: "record one durable Paper reprice".to_owned(),
+                objective: "prepare one paper reprice".to_owned(),
                 dependencies: vec![dispatch_task_id],
                 input_artifacts: vec![],
                 priority: 80,
@@ -92,7 +101,7 @@ fn workflow() -> WorkflowGraph {
                 task_id: reprice_dispatch_task_id.clone(),
                 recipe_id: TaskRecipeId::new("execution.reprice.dispatch").unwrap(),
                 contract_hash: None,
-                objective: "submit one durable Paper reprice".to_owned(),
+                objective: "dispatch one paper reprice".to_owned(),
                 dependencies: vec![reprice_task_id],
                 input_artifacts: vec![],
                 priority: 70,
@@ -105,7 +114,7 @@ fn workflow() -> WorkflowGraph {
                 task_id: TaskId::new(),
                 recipe_id: TaskRecipeId::new("execution.reprice.duplicate").unwrap(),
                 contract_hash: None,
-                objective: "reject a second Paper reprice lineage".to_owned(),
+                objective: "reject duplicate paper reprice".to_owned(),
                 dependencies: vec![reprice_dispatch_task_id],
                 input_artifacts: vec![],
                 priority: 60,
@@ -118,7 +127,56 @@ fn workflow() -> WorkflowGraph {
     }
 }
 
-fn provenance(now: chrono::DateTime<Utc>) -> ArtifactProvenance {
+fn policy() -> ExecutionPolicy {
+    ExecutionPolicy {
+        assets: Asset::EXECUTABLE.iter().copied().collect(),
+        max_gross_weight: WeightPpm(1_000_000),
+        max_new_notional: MoneyMicros::from_usd_cents(1_000_000),
+        max_daily_turnover: WeightPpm(1_000_000),
+        max_account_age_secs: 60,
+        max_quote_age_secs: 60,
+        max_clock_age_secs: 60,
+        max_spread_bps: 500,
+        limit_protection_bps: 100,
+    }
+}
+
+fn plan(
+    now: DateTime<Utc>,
+    decision_context: ArtifactRef,
+    account_snapshot: ArtifactRef,
+    quote_snapshot: ArtifactRef,
+    market_clock_snapshot: ArtifactRef,
+) -> ExecutionPlan {
+    let mut target = TargetPortfolio::zeroed();
+    target.weights.insert(Asset::Qqq, WeightPpm(100_000));
+    let mut plan = ExecutionPlan {
+        schema_version: REBUILD_SCHEMA_VERSION,
+        decision_context,
+        account_snapshot,
+        quote_snapshot,
+        market_clock_snapshot,
+        policy_hash: policy().policy_hash().unwrap(),
+        target: target.clone(),
+        orders: vec![OrderIntent {
+            asset: Asset::Qqq,
+            side: OrderSide::Buy,
+            notional: MoneyMicros::from_usd_cents(10_000),
+            limit_price: MoneyMicros::from_usd_cents(2_500),
+        }],
+        gross_exposure_ppm: 100_000,
+        net_exposure_ppm: 100_000,
+        factor_exposure: FactorExposure::from_target(&target).unwrap(),
+        turnover_ppm: 100_000,
+        broker_session: "paper:fixture".to_owned(),
+        created_at: now,
+        plan_hash: ContentHash::of_bytes(b"pending"),
+    };
+    plan.refresh_hash().unwrap();
+    plan
+}
+
+fn provenance(now: DateTime<Utc>) -> ArtifactProvenance {
     ArtifactProvenance {
         source_family: "fixture.paper".to_owned(),
         observed_at: Some(now),
@@ -145,10 +203,121 @@ fn artifact_ref(artifact: &Artifact) -> ArtifactRef {
     }
 }
 
+fn artifact_ref_for(kind: ArtifactKind, name: &[u8]) -> ArtifactRef {
+    ArtifactRef {
+        artifact_id: ArtifactId(ContentHash::of_bytes(name)),
+        kind,
+    }
+}
+
+fn write_source(
+    store: &V2Store,
+    permit: &TaskWritePermit,
+    kind: ArtifactKind,
+    label: &str,
+    now: DateTime<Utc>,
+) -> ArtifactRef {
+    let artifact = Artifact::new(
+        kind,
+        store
+            .put_json(&serde_json::json!({ "fixture": label }))
+            .unwrap(),
+        "fixture.execution_source",
+        ArtifactLifecycle::RunScoped,
+        provenance(now),
+        Some(origin(permit)),
+        vec![],
+        now,
+    )
+    .unwrap();
+    store
+        .write_task_artifact(permit, &artifact, "fixture.execution_source_created", now)
+        .unwrap();
+    artifact_ref(&artifact)
+}
+
 #[derive(Default)]
+struct FakeBrokerState {
+    statuses: VecDeque<String>,
+    orders: BTreeMap<String, PaperOrderReceipt>,
+}
+
 struct FakeCommittedBroker {
-    calls: AtomicUsize,
+    state: Mutex<FakeBrokerState>,
+    execute_calls: AtomicUsize,
+    actual_submit_calls: AtomicUsize,
+    lookup_calls: AtomicUsize,
+    reconcile_calls: AtomicUsize,
     reprice_calls: AtomicUsize,
+    fail_reconcile_once: AtomicBool,
+}
+
+impl FakeCommittedBroker {
+    fn new(statuses: impl IntoIterator<Item = &'static str>) -> Self {
+        Self {
+            state: Mutex::new(FakeBrokerState {
+                statuses: statuses.into_iter().map(ToOwned::to_owned).collect(),
+                orders: BTreeMap::new(),
+            }),
+            execute_calls: AtomicUsize::new(0),
+            actual_submit_calls: AtomicUsize::new(0),
+            lookup_calls: AtomicUsize::new(0),
+            reconcile_calls: AtomicUsize::new(0),
+            reprice_calls: AtomicUsize::new(0),
+            fail_reconcile_once: AtomicBool::new(false),
+        }
+    }
+
+    fn fail_next_reconcile(&self) {
+        self.fail_reconcile_once.store(true, Ordering::SeqCst);
+    }
+
+    fn receipt(
+        client_order_id: String,
+        broker_order_id: String,
+        symbol: String,
+        status: &str,
+        reprice_count: u8,
+        now: DateTime<Utc>,
+    ) -> PaperOrderReceipt {
+        let requested_quantity_micros = 4_000_000;
+        let filled_quantity_micros = match status {
+            "partially_filled" => 2_000_000,
+            "filled" => requested_quantity_micros,
+            _ => 0,
+        };
+        PaperOrderReceipt {
+            client_order_id,
+            broker_order_id,
+            symbol,
+            status: status.to_owned(),
+            requested_quantity_micros,
+            filled_quantity_micros,
+            remaining_quantity_micros: requested_quantity_micros - filled_quantity_micros,
+            average_fill_price: (filled_quantity_micros > 0)
+                .then_some(MoneyMicros::from_usd_cents(2_500)),
+            broker_updated_at: now,
+            reason: match status {
+                "canceled" => Some("fixture cancellation".to_owned()),
+                "rejected" => Some("fixture rejection".to_owned()),
+                _ => None,
+            },
+            reused: false,
+            reprice_count,
+        }
+    }
+
+    fn set_status(receipt: &mut PaperOrderReceipt, status: &str, now: DateTime<Utc>) {
+        let next = Self::receipt(
+            receipt.client_order_id.clone(),
+            receipt.broker_order_id.clone(),
+            receipt.symbol.clone(),
+            status,
+            receipt.reprice_count,
+            now,
+        );
+        *receipt = next;
+    }
 }
 
 impl CommittedPaperBroker for FakeCommittedBroker {
@@ -158,21 +327,37 @@ impl CommittedPaperBroker for FakeCommittedBroker {
         plan: &'a ExecutionPlan,
     ) -> Pin<Box<dyn Future<Output = PaperResult<PaperExecution>> + Send + 'a>> {
         Box::pin(async move {
-            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.execute_calls.fetch_add(1, Ordering::SeqCst);
+            let now = Utc::now();
+            let mut state = self.state.lock().unwrap();
+            let orders = plan
+                .orders
+                .iter()
+                .map(|order| {
+                    let client_order_id = commitment.client_order_ids[&order.asset].clone();
+                    if let Some(existing) = state.orders.get(&client_order_id) {
+                        self.lookup_calls.fetch_add(1, Ordering::SeqCst);
+                        return PaperOrderReceipt {
+                            reused: true,
+                            ..existing.clone()
+                        };
+                    }
+                    self.actual_submit_calls.fetch_add(1, Ordering::SeqCst);
+                    let receipt = Self::receipt(
+                        client_order_id.clone(),
+                        format!("fixture-{}", order.asset.symbol()),
+                        order.asset.symbol().to_owned(),
+                        "accepted",
+                        0,
+                        now,
+                    );
+                    state.orders.insert(client_order_id, receipt.clone());
+                    receipt
+                })
+                .collect();
             Ok(PaperExecution {
                 plan_hash: plan.plan_hash.clone(),
-                orders: plan
-                    .orders
-                    .iter()
-                    .map(|order| PaperOrderReceipt {
-                        client_order_id: commitment.client_order_ids[&order.asset].clone(),
-                        broker_order_id: format!("fixture-{}", order.asset.symbol()),
-                        symbol: order.asset.symbol().to_owned(),
-                        status: "accepted".to_owned(),
-                        reused: false,
-                        reprice_count: 0,
-                    })
-                    .collect(),
+                orders,
             })
         })
     }
@@ -185,20 +370,79 @@ impl CommittedPaperBroker for FakeCommittedBroker {
     ) -> Pin<Box<dyn Future<Output = PaperResult<PaperOrderReceipt>> + Send + 'a>> {
         Box::pin(async move {
             self.reprice_calls.fetch_add(1, Ordering::SeqCst);
-            Ok(PaperOrderReceipt {
-                client_order_id: reprice.replacement_client_order_id.clone(),
-                broker_order_id: format!("fixture-reprice-{}", replacement.asset.symbol()),
-                symbol: replacement.asset.symbol().to_owned(),
-                status: "partially_filled".to_owned(),
-                reused: false,
-                reprice_count: 1,
+            let receipt = Self::receipt(
+                reprice.replacement_client_order_id.clone(),
+                format!("fixture-reprice-{}", replacement.asset.symbol()),
+                replacement.asset.symbol().to_owned(),
+                "accepted",
+                1,
+                Utc::now(),
+            );
+            self.state
+                .lock()
+                .unwrap()
+                .orders
+                .insert(receipt.client_order_id.clone(), receipt.clone());
+            Ok(receipt)
+        })
+    }
+
+    fn reconcile_commitment<'a>(
+        &'a self,
+        commitment: &'a PaperCommitment,
+        execution: &'a PaperExecution,
+    ) -> Pin<Box<dyn Future<Output = PaperResult<PaperExecution>> + Send + 'a>> {
+        Box::pin(async move {
+            self.reconcile_calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail_reconcile_once.swap(false, Ordering::SeqCst) {
+                return Err(PaperError::InvalidCommitment(
+                    "fixture crash after submit".to_owned(),
+                ));
+            }
+            if execution.plan_hash != commitment.plan_hash {
+                return Err(PaperError::CommitmentPlanHashMismatch);
+            }
+            let now = Utc::now();
+            let mut state = self.state.lock().unwrap();
+            let status = state
+                .statuses
+                .pop_front()
+                .unwrap_or_else(|| "filled".to_owned());
+            let orders = execution
+                .orders
+                .iter()
+                .map(|submitted| {
+                    let mut receipt = state
+                        .orders
+                        .get(&submitted.client_order_id)
+                        .cloned()
+                        .ok_or_else(|| PaperError::InvalidCommitment("missing order".to_owned()))?;
+                    receipt.reused = submitted.reused;
+                    Self::set_status(&mut receipt, &status, now);
+                    receipt.reused = submitted.reused;
+                    state
+                        .orders
+                        .insert(receipt.client_order_id.clone(), receipt.clone());
+                    Ok(receipt)
+                })
+                .collect::<PaperResult<Vec<_>>>()?;
+            Ok(PaperExecution {
+                plan_hash: execution.plan_hash.clone(),
+                orders,
             })
         })
     }
 }
 
-#[tokio::test]
-async fn durable_commitment_dispatches_once_and_atomically_reconciles() {
+struct PreparedCommitment {
+    _directory: TempDir,
+    store: V2Store,
+    now: DateTime<Utc>,
+    lease: DaemonLease,
+    commitment: Artifact,
+}
+
+fn prepared_commitment() -> PreparedCommitment {
     let directory = tempdir().unwrap();
     let store = V2Store::open(directory.path()).unwrap();
     let now = Utc::now();
@@ -244,92 +488,109 @@ async fn durable_commitment_dispatches_once_and_atomically_reconciles() {
         )
         .unwrap();
     store.commit_workflow(&reservation.slot.workflow).unwrap();
-    let commitment_permit = store
+    let permit = store
         .claim_next_task("commitment-worker", now, Duration::seconds(30))
         .unwrap()
         .unwrap()
         .permit;
-
-    let plan = ExecutionPlan {
-        policy: ExecutionPolicy::default(),
-        targets: vec![],
-        orders: vec![OrderIntent {
-            asset: Asset::Qqq,
-            side: OrderSide::Buy,
-            notional: MoneyMicros::from_usd_cents(10_000),
-            limit_price: MoneyMicros::from_usd_cents(2_500),
-        }],
-        plan_hash: ContentHash::of_bytes(b"v2-paper-dispatch-plan"),
-    };
-    let plan_artifact = Artifact::new(
+    let decision_context = write_source(
+        &store,
+        &permit,
+        ArtifactKind::DecisionContext,
+        "decision-context",
+        now,
+    );
+    let account_snapshot = write_source(
+        &store,
+        &permit,
+        ArtifactKind::NormalizedEvidence,
+        "account",
+        now,
+    );
+    let quote_snapshot = write_source(
+        &store,
+        &permit,
+        ArtifactKind::NormalizedEvidence,
+        "quote",
+        now,
+    );
+    let market_clock_snapshot = write_source(
+        &store,
+        &permit,
+        ArtifactKind::NormalizedEvidence,
+        "clock",
+        now,
+    );
+    let allocation = plan(
+        now,
+        decision_context,
+        account_snapshot,
+        quote_snapshot,
+        market_clock_snapshot,
+    );
+    let allocation_artifact = Artifact::new(
         ArtifactKind::ExecutionPlan,
-        store.put_json(&plan).unwrap(),
+        store.put_json(&allocation).unwrap(),
         "fixture.allocation",
         ArtifactLifecycle::RunScoped,
         provenance(now),
-        Some(origin(&commitment_permit)),
-        vec![],
+        Some(origin(&permit)),
+        vec![
+            allocation.decision_context.clone(),
+            allocation.account_snapshot.clone(),
+            allocation.quote_snapshot.clone(),
+            allocation.market_clock_snapshot.clone(),
+        ],
         now,
     )
     .unwrap();
     store
         .write_task_artifact(
-            &commitment_permit,
-            &plan_artifact,
+            &permit,
+            &allocation_artifact,
             "execution.allocation_created",
             now,
         )
         .unwrap();
-    let plan_ref = artifact_ref(&plan_artifact);
-    let context_payload = ExecutionContext {
+    let allocation_ref = artifact_ref(&allocation_artifact);
+    let context = ExecutionContext {
         schema_version: REBUILD_SCHEMA_VERSION,
-        run_id: commitment_permit.run_id.clone(),
-        decision_context: ArtifactRef {
-            artifact_id: ArtifactId(ContentHash::of_bytes(b"decision-context")),
-            kind: ArtifactKind::DecisionContext,
-        },
-        account_snapshot: ArtifactRef {
-            artifact_id: ArtifactId(ContentHash::of_bytes(b"account")),
-            kind: ArtifactKind::NormalizedEvidence,
-        },
-        quote_snapshot: ArtifactRef {
-            artifact_id: ArtifactId(ContentHash::of_bytes(b"quote")),
-            kind: ArtifactKind::NormalizedEvidence,
-        },
-        factor_exposure: FactorExposure {
-            leveraged_equity_ppm: 0,
-            nasdaq_ppm: 0,
-            semiconductor_ppm: 0,
-            tqqq_qqq_pair_ppm: 0,
-            soxl_soxx_pair_ppm: 0,
-        },
-        turnover_ppm: 0,
-        plan_hash: plan.plan_hash.clone(),
-        broker_session: "paper:fixture".to_owned(),
+        run_id: permit.run_id.clone(),
+        decision_context: allocation.decision_context.clone(),
+        account_snapshot: Some(allocation.account_snapshot.clone()),
+        quote_snapshot: Some(allocation.quote_snapshot.clone()),
+        market_clock_snapshot: Some(allocation.market_clock_snapshot.clone()),
+        execution_plan: Some(allocation_ref.clone()),
+        factor_exposure: Some(allocation.factor_exposure.clone()),
+        turnover_ppm: Some(allocation.turnover_ppm),
+        plan_hash: Some(allocation.plan_hash.clone()),
+        broker_session: Some(allocation.broker_session.clone()),
         frozen: false,
         created_at: now,
     };
+    context.validate_complete_plan_closure().unwrap();
     let context_artifact = Artifact::new(
         ArtifactKind::ExecutionContext,
-        store.put_json(&context_payload).unwrap(),
+        store.put_json(&context).unwrap(),
         "fixture.execution_context",
         ArtifactLifecycle::RunScoped,
         provenance(now),
-        Some(origin(&commitment_permit)),
-        vec![plan_ref],
+        Some(origin(&permit)),
+        vec![
+            context.decision_context.clone(),
+            context.account_snapshot.clone().unwrap(),
+            context.quote_snapshot.clone().unwrap(),
+            context.market_clock_snapshot.clone().unwrap(),
+            allocation_ref,
+        ],
         now,
     )
     .unwrap();
     store
-        .write_task_artifact(
-            &commitment_permit,
-            &context_artifact,
-            "execution.context_created",
-            now,
-        )
+        .write_task_artifact(&permit, &context_artifact, "execution.context_created", now)
         .unwrap();
     let context_ref = artifact_ref(&context_artifact);
-    let verdict_artifact = Artifact::new(
+    let verdict = Artifact::new(
         ArtifactKind::ExecutionVerdict,
         store
             .put_json(&ExecutionVerdict::Accepted {
@@ -339,41 +600,54 @@ async fn durable_commitment_dispatches_once_and_atomically_reconciles() {
         "fixture.execution_verdict",
         ArtifactLifecycle::RunScoped,
         provenance(now),
-        Some(origin(&commitment_permit)),
+        Some(origin(&permit)),
         vec![context_ref],
         now,
     )
     .unwrap();
     store
-        .write_task_artifact(
-            &commitment_permit,
-            &verdict_artifact,
-            "execution.verdict_created",
-            now,
-        )
+        .write_task_artifact(&permit, &verdict, "execution.verdict_created", now)
         .unwrap();
     let commitment = V2PaperCommitmentRuntime::new(store.clone())
         .commit(&PaperCommitmentInput {
             lease: lease.clone(),
-            permit: commitment_permit,
-            verdict: artifact_ref(&verdict_artifact),
+            permit,
+            verdict: artifact_ref(&verdict),
             session_key: "paper:fixture".to_owned(),
             now,
         })
         .unwrap()
         .commitment;
+    PreparedCommitment {
+        _directory: directory,
+        store,
+        now,
+        lease,
+        commitment,
+    }
+}
 
+#[tokio::test]
+async fn partial_then_filled_reprice_uses_one_durable_lineage() {
+    let PreparedCommitment {
+        _directory,
+        store,
+        now,
+        lease,
+        commitment,
+    } = prepared_commitment();
     let dispatch_permit = store
         .claim_next_task("dispatch-worker", now, Duration::seconds(30))
         .unwrap()
         .unwrap()
         .permit;
-    let broker = FakeCommittedBroker::default();
+    let broker = FakeCommittedBroker::new(["partially_filled", "filled"]);
     let runtime = V2PaperDispatchRuntime::new(store.clone());
     let output = runtime
         .dispatch(
             &broker,
             &PaperDispatchInput {
+                lease: lease.clone(),
                 permit: dispatch_permit.clone(),
                 commitment: artifact_ref(&commitment),
                 now,
@@ -381,34 +655,29 @@ async fn durable_commitment_dispatches_once_and_atomically_reconciles() {
         )
         .await
         .unwrap();
-
-    assert_eq!(broker.calls.load(Ordering::SeqCst), 1);
-    assert_eq!(output.reconciliation.receipts.len(), 1);
     let reconciliation: Reconciliation = serde_json::from_slice(
         &store
             .read_blob(&output.reconciliation.reconciliation.blob)
             .unwrap(),
     )
     .unwrap();
-    assert_eq!(reconciliation.state, ReconciliationState::Complete);
-    assert!(store
-        .events_after(&dispatch_permit.run_id, 0, 50)
-        .unwrap()
-        .iter()
-        .any(|event| {
-            event.event_type == "task.succeeded"
-                && event.task_id.as_ref() == Some(&dispatch_permit.task_id)
-                && event.attempt_id.as_ref() == Some(&dispatch_permit.attempt_id)
-                && event.artifact_id.as_ref()
-                    == Some(&output.reconciliation.reconciliation.artifact_id)
-        }));
+    assert_eq!(reconciliation.state, ReconciliationState::Partial);
+    let receipt = store
+        .artifact(&output.reconciliation.receipts[0].artifact_id)
+        .unwrap();
+    let receipt: akzio_domain::OrderReceipt =
+        serde_json::from_slice(&store.read_blob(&receipt.blob).unwrap()).unwrap();
+    assert_eq!(
+        receipt.state,
+        akzio_domain::OrderReceiptState::PartiallyFilled
+    );
 
     let reprice_permit = store
         .claim_next_task("reprice-worker", now, Duration::seconds(30))
         .unwrap()
         .unwrap()
         .permit;
-    let reprice_runtime = V2RepriceRuntime::new(store.clone(), ExecutionPolicy::default());
+    let reprice_runtime = V2RepriceRuntime::new(store.clone(), policy());
     let reprice = reprice_runtime
         .prepare(&RepriceInput {
             lease: lease.clone(),
@@ -432,29 +701,33 @@ async fn durable_commitment_dispatches_once_and_atomically_reconciles() {
         .dispatch_reprice(
             &broker,
             &PaperRepriceDispatchInput {
-                permit: reprice_dispatch_permit.clone(),
+                lease: lease.clone(),
+                permit: reprice_dispatch_permit,
                 reprice: artifact_ref(&reprice.reprice),
                 now,
             },
         )
         .await
         .unwrap();
+    let reconciliation: Reconciliation = serde_json::from_slice(
+        &store
+            .read_blob(&reprice_dispatch.reconciliation.reconciliation.blob)
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(reconciliation.state, ReconciliationState::Complete);
+    assert_eq!(broker.actual_submit_calls.load(Ordering::SeqCst), 1);
     assert_eq!(broker.reprice_calls.load(Ordering::SeqCst), 1);
-    assert_eq!(reprice_dispatch.reconciliation.receipts.len(), 1);
-    assert!(reprice_dispatch.reconciliation.receipts[0]
-        .source_refs
-        .iter()
-        .any(|source| source == &artifact_ref(&reprice.reprice)));
 
-    let duplicate_reprice_permit = store
-        .claim_next_task("duplicate-reprice-worker", now, Duration::seconds(30))
+    let duplicate_permit = store
+        .claim_next_task("duplicate-worker", now, Duration::seconds(30))
         .unwrap()
         .unwrap()
         .permit;
     assert!(matches!(
         reprice_runtime.prepare(&RepriceInput {
-            lease,
-            permit: duplicate_reprice_permit,
+            lease: lease.clone(),
+            permit: duplicate_permit,
             commitment: artifact_ref(&commitment),
             prior_receipt: artifact_ref(&output.reconciliation.receipts[0]),
             quote: Quote {
@@ -468,21 +741,176 @@ async fn durable_commitment_dispatches_once_and_atomically_reconciles() {
             _
         )))
     ));
+    store.verify_integrity().unwrap();
+}
 
+#[tokio::test]
+async fn stale_scheduler_epoch_never_calls_broker() {
+    let PreparedCommitment {
+        _directory,
+        store,
+        now,
+        lease,
+        commitment,
+    } = prepared_commitment();
+    let dispatch_permit = store
+        .claim_next_task("dispatch-worker", now, Duration::seconds(30))
+        .unwrap()
+        .unwrap()
+        .permit;
+    let takeover_at = now + Duration::seconds(31);
+    store
+        .acquire_daemon_lease(
+            "scheduler",
+            "successor-daemon",
+            takeover_at,
+            takeover_at + Duration::seconds(30),
+        )
+        .unwrap()
+        .unwrap();
+    let broker = FakeCommittedBroker::new(["filled"]);
+    assert!(matches!(
+        V2PaperDispatchRuntime::new(store.clone())
+            .dispatch(
+                &broker,
+                &PaperDispatchInput {
+                    lease,
+                    permit: dispatch_permit,
+                    commitment: artifact_ref(&commitment),
+                    now: takeover_at,
+                },
+            )
+            .await,
+        Err(PaperDispatchError::Store(StoreError::SchedulerFenced(_)))
+    ));
+    assert_eq!(broker.execute_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(broker.reconcile_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(broker.reprice_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn crash_after_submit_reuses_durable_client_order_id() {
+    let PreparedCommitment {
+        _directory,
+        store,
+        now,
+        lease,
+        commitment,
+    } = prepared_commitment();
+    let first_permit = store
+        .claim_next_task("dispatch-worker", now, Duration::seconds(30))
+        .unwrap()
+        .unwrap()
+        .permit;
+    let broker = FakeCommittedBroker::new(["filled"]);
+    broker.fail_next_reconcile();
+    let runtime = V2PaperDispatchRuntime::new(store.clone());
     assert!(matches!(
         runtime
             .dispatch(
                 &broker,
                 &PaperDispatchInput {
-                    permit: dispatch_permit,
+                    lease,
+                    permit: first_permit,
                     commitment: artifact_ref(&commitment),
                     now,
                 },
             )
             .await,
-        Err(PaperDispatchError::Store(StoreError::StalePermit(_)))
+        Err(PaperDispatchError::Broker(PaperError::InvalidCommitment(_)))
     ));
-    assert_eq!(broker.calls.load(Ordering::SeqCst), 1);
-    assert_eq!(broker.reprice_calls.load(Ordering::SeqCst), 1);
-    store.verify_integrity().unwrap();
+    let retry_at = now + Duration::seconds(31);
+    assert_eq!(store.recover_expired_tasks(retry_at).unwrap(), 1);
+    let retry_lease = store
+        .acquire_daemon_lease(
+            "scheduler",
+            "recovered-daemon",
+            retry_at,
+            retry_at + Duration::seconds(30),
+        )
+        .unwrap()
+        .unwrap();
+    let retry_permit = store
+        .claim_next_task("recovered-worker", retry_at, Duration::seconds(30))
+        .unwrap()
+        .unwrap()
+        .permit;
+    let output = runtime
+        .dispatch(
+            &broker,
+            &PaperDispatchInput {
+                lease: retry_lease,
+                permit: retry_permit,
+                commitment: artifact_ref(&commitment),
+                now: retry_at,
+            },
+        )
+        .await
+        .unwrap();
+    let payload: PaperCommitment =
+        serde_json::from_slice(&store.read_blob(&commitment.blob).unwrap()).unwrap();
+    assert_eq!(
+        output.execution.orders[0].client_order_id,
+        payload.client_order_ids[&Asset::Qqq]
+    );
+    assert!(output.execution.orders[0].reused);
+    assert_eq!(broker.actual_submit_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(broker.lookup_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(broker.execute_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(broker.reconcile_calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn fake_broker_reports_lifecycle_and_terminal_statuses() {
+    let now = Utc::now();
+    let plan = plan(
+        now,
+        artifact_ref_for(ArtifactKind::DecisionContext, b"decision-context"),
+        artifact_ref_for(ArtifactKind::NormalizedEvidence, b"account"),
+        artifact_ref_for(ArtifactKind::NormalizedEvidence, b"quote"),
+        artifact_ref_for(ArtifactKind::NormalizedEvidence, b"clock"),
+    );
+    let commitment = PaperCommitment {
+        commitment_id: PaperCommitmentId::new(),
+        execution_context: artifact_ref_for(ArtifactKind::ExecutionContext, b"context"),
+        plan_hash: plan.plan_hash.clone(),
+        broker_session: plan.broker_session.clone(),
+        client_order_ids: BTreeMap::from([(
+            Asset::Qqq,
+            client_order_id(&plan.broker_session, &plan.plan_hash, 0, 0),
+        )]),
+        created_at: now,
+    };
+    let broker = FakeCommittedBroker::new([
+        "accepted",
+        "partially_filled",
+        "filled",
+        "canceled",
+        "rejected",
+    ]);
+    let submitted = broker.execute_commitment(&commitment, &plan).await.unwrap();
+    for (status, filled, remaining) in [
+        ("accepted", 0, 4_000_000),
+        ("partially_filled", 2_000_000, 2_000_000),
+        ("filled", 4_000_000, 0),
+        ("canceled", 0, 4_000_000),
+        ("rejected", 0, 4_000_000),
+    ] {
+        let observation = broker
+            .reconcile_commitment(&commitment, &submitted)
+            .await
+            .unwrap();
+        let receipt = &observation.orders[0];
+        assert_eq!(receipt.status, status);
+        assert_eq!(receipt.filled_quantity_micros, filled);
+        assert_eq!(receipt.remaining_quantity_micros, remaining);
+        assert_eq!(
+            receipt.requested_quantity_micros,
+            receipt.filled_quantity_micros + receipt.remaining_quantity_micros
+        );
+        assert_eq!(
+            receipt.reason.is_some(),
+            matches!(status, "canceled" | "rejected")
+        );
+    }
 }

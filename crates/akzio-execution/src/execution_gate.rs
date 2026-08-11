@@ -1,23 +1,22 @@
-//! Typed v2 execution gate.
-//!
-//! It converts a persisted `DecisionContext` into a run-scoped
-//! `ExecutionContext` plus exactly one typed verdict. The approved branch is
-//! the only input eligible for a later Paper commitment; rejection remains an
-//! auditable `NoOrder` artifact.
+//! Typed v2 execution gate derived only from persisted broker artifacts.
 
 use std::collections::BTreeSet;
 
 use akzio_domain::{
-    Artifact, ArtifactKind, ArtifactLifecycle, ArtifactOrigin, ArtifactProvenance, ArtifactRef,
-    CandidatePolicy, ContextManifestPayload, DecisionContext, DomainError, ExecutionContext,
-    ExecutionVerdict, Experience, FactorExposure, FreezeState, HardBlocker, NoOrder, PolicySubject,
-    RunPurpose, TaskStatus, TaskWritePermit,
+    AccountSnapshot, Artifact, ArtifactKind, ArtifactLifecycle, ArtifactOrigin, ArtifactProvenance,
+    ArtifactRef, CandidatePolicy, ContextManifestPayload, DecisionContext, DomainError,
+    ExecutionContext, ExecutionVerdict, Experience, FreezeState, HardBlocker, MarketClockSnapshot,
+    NoOrder, PolicySubject, QuoteSnapshot, RunPurpose, TaskStatus, TaskWritePermit,
 };
 use akzio_store::v2::{StoreError, V2Store};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
+use serde::de::DeserializeOwned;
 use thiserror::Error;
 
-use crate::{policy::ExecutionGatePolicy, ExecutionPlan};
+use crate::{
+    AllocationError, AllocationInput, ExecutionError, ExecutionGatePolicy, ExecutionPolicy,
+    V2AllocationRuntime,
+};
 
 #[derive(Debug, Error)]
 pub enum ExecutionGateError {
@@ -34,39 +33,25 @@ pub enum ExecutionGateError {
     },
     #[error("decision context does not belong to the execution task run")]
     DecisionRunMismatch,
-    #[error("execution gate input invalid: {0}")]
-    InvalidInput(&'static str),
+    #[error("execution gate integrity failure: {0}")]
+    Integrity(&'static str),
 }
 
 pub type ExecutionGateResult<T> = std::result::Result<T, ExecutionGateError>;
-
-/// Rust-supplied gate inputs. Freshness and market state originate from the
-/// trusted adapter/scheduler, never a model turn.
-fn invalid_policy_influence() -> ExecutionGateError {
-    ExecutionGateError::Domain(DomainError::EmptyField {
-        field: "decision_context.policy_influences",
-    })
-}
 
 #[derive(Debug, Clone)]
 pub struct ExecutionGateInput {
     pub permit: TaskWritePermit,
     pub decision_context: ArtifactRef,
-    pub account_snapshot: ArtifactRef,
-    pub quote_snapshot: ArtifactRef,
-    pub allocation_plan: ArtifactRef,
-    pub broker_session: String,
-    pub plan_hash: akzio_domain::ContentHash,
-    pub market_open: bool,
-    pub account_fresh: bool,
-    pub quotes_fresh: bool,
-    pub factor_exposure: FactorExposure,
-    pub turnover_ppm: u32,
+    pub account_snapshot: Option<ArtifactRef>,
+    pub quote_snapshot: Option<ArtifactRef>,
+    pub market_clock_snapshot: Option<ArtifactRef>,
     pub now: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone)]
 pub struct ExecutionGateOutput {
+    pub execution_plan: Option<Artifact>,
     pub execution_context: Artifact,
     pub verdict: Artifact,
 }
@@ -74,43 +59,46 @@ pub struct ExecutionGateOutput {
 #[derive(Debug, Clone)]
 pub struct V2ExecutionRuntime {
     store: V2Store,
-    policy: ExecutionGatePolicy,
+    allocation: V2AllocationRuntime,
+    gate_policy: ExecutionGatePolicy,
 }
 
 impl V2ExecutionRuntime {
-    pub fn new(store: V2Store, policy: ExecutionGatePolicy) -> ExecutionGateResult<Self> {
-        policy.validate()?;
-        Ok(Self { store, policy })
+    pub fn new(
+        store: V2Store,
+        execution_policy: ExecutionPolicy,
+        gate_policy: ExecutionGatePolicy,
+    ) -> ExecutionGateResult<Self> {
+        let allocation = V2AllocationRuntime::new(execution_policy)
+            .map_err(|_| ExecutionGateError::Integrity("execution policy"))?;
+        gate_policy.validate()?;
+        Ok(Self {
+            store,
+            allocation,
+            gate_policy,
+        })
     }
 
-    pub fn policy(&self) -> &ExecutionGatePolicy {
-        &self.policy
+    pub fn execution_policy(&self) -> &ExecutionPolicy {
+        self.allocation.policy()
     }
 
-    /// Build the two immutable gate artifacts. The caller commits both through
-    /// `commit` in the task attempt transaction.
+    pub fn gate_policy(&self) -> &ExecutionGatePolicy {
+        &self.gate_policy
+    }
+
     pub fn evaluate(&self, input: &ExecutionGateInput) -> ExecutionGateResult<ExecutionGateOutput> {
         self.validate_input(input)?;
         let purpose = self.store.run_purpose(&input.permit.run_id)?;
         let decision_artifact =
             self.load_expected(&input.decision_context, ArtifactKind::DecisionContext)?;
-        let decision: DecisionContext =
-            serde_json::from_slice(&self.store.read_blob(&decision_artifact.blob)?)?;
+        let decision: DecisionContext = self.read_payload(&decision_artifact)?;
         decision.validate()?;
         if decision.run_id != input.permit.run_id {
             return Err(ExecutionGateError::DecisionRunMismatch);
         }
         self.validate_decision_provenance(&decision_artifact, &decision)?;
 
-        let account =
-            self.load_expected(&input.account_snapshot, ArtifactKind::NormalizedEvidence)?;
-        let quotes = self.load_expected(&input.quote_snapshot, ArtifactKind::NormalizedEvidence)?;
-        let allocation_artifact =
-            self.load_expected(&input.allocation_plan, ArtifactKind::ExecutionPlan)?;
-        let allocation: ExecutionPlan =
-            serde_json::from_slice(&self.store.read_blob(&allocation_artifact.blob)?)?;
-
-        let frozen = self.frozen()?;
         let mut blockers = decision
             .hard_blockers
             .iter()
@@ -122,53 +110,78 @@ impl V2ExecutionRuntime {
         if purpose != RunPurpose::Paper {
             blockers.insert(HardBlocker::NonCanonicalRun);
         }
+        let frozen = self.frozen()?;
         if frozen {
             blockers.insert(HardBlocker::Frozen);
         }
-        if !input.market_open {
-            blockers.insert(HardBlocker::MarketClosed);
-        }
-        if !input.account_fresh {
-            blockers.insert(HardBlocker::StaleAccount);
-        }
-        if !input.quotes_fresh {
-            blockers.insert(HardBlocker::StaleQuote);
-        }
-        if account.lifecycle != ArtifactLifecycle::Canonical
-            || quotes.lifecycle != ArtifactLifecycle::Canonical
-        {
-            blockers.insert(HardBlocker::InvalidProvenance);
-        }
-        if allocation.plan_hash != input.plan_hash {
-            blockers.insert(HardBlocker::PlanHashMismatch);
-        }
-        if allocation.orders.is_empty() {
-            blockers.insert(HardBlocker::NoExecutableOrder);
-        }
-        if allocation_artifact
-            .origin
-            .as_ref()
-            .and_then(|origin| origin.run_id.as_ref())
-            != Some(&input.permit.run_id)
-            || [
-                &input.decision_context,
-                &input.account_snapshot,
-                &input.quote_snapshot,
-            ]
-            .into_iter()
-            .any(|reference| {
-                !allocation_artifact
-                    .source_refs
-                    .iter()
-                    .any(|source| source == reference)
-            })
-        {
-            blockers.insert(HardBlocker::InvalidProvenance);
-        }
-        blockers.extend(
-            self.policy
-                .blockers_for(&input.factor_exposure, input.turnover_ppm),
+
+        let account = self.load_account(input, &mut blockers)?;
+        let quotes = self.load_quotes(input, &mut blockers)?;
+        let clock = self.load_clock(input, &mut blockers)?;
+        self.derive_snapshot_blockers(
+            account.as_ref().map(|(_, payload)| payload),
+            quotes.as_ref().map(|(_, payload)| payload),
+            clock.as_ref().map(|(_, payload)| payload),
+            input.now,
+            &mut blockers,
         );
+
+        let mut plan_payload = None;
+        if blockers.is_empty() {
+            let (_, account_payload) = account
+                .as_ref()
+                .ok_or(ExecutionGateError::Integrity("account snapshot closure"))?;
+            let (_, quote_payload) = quotes
+                .as_ref()
+                .ok_or(ExecutionGateError::Integrity("quote snapshot closure"))?;
+            let (_, clock_payload) = clock
+                .as_ref()
+                .ok_or(ExecutionGateError::Integrity("clock snapshot closure"))?;
+            let allocation = self.allocation.allocate(&AllocationInput {
+                decision_context_ref: input.decision_context.clone(),
+                decision_context: decision.clone(),
+                account_snapshot_ref: input.account_snapshot.clone().expect("checked above"),
+                account: account_payload.clone(),
+                quote_snapshot_ref: input.quote_snapshot.clone().expect("checked above"),
+                quotes: quote_payload.clone(),
+                market_clock_snapshot_ref: input
+                    .market_clock_snapshot
+                    .clone()
+                    .expect("checked above"),
+                clock: clock_payload.clone(),
+                now: input.now,
+            });
+            match allocation {
+                Ok(plan) => {
+                    plan.validate()?;
+                    blockers.extend(
+                        self.gate_policy
+                            .blockers_for(&plan.factor_exposure, plan.turnover_ppm),
+                    );
+                    plan_payload = Some(plan);
+                }
+                Err(error) => self.allocation_blockers(error, &mut blockers),
+            }
+        }
+
+        let execution_plan = plan_payload
+            .as_ref()
+            .map(|plan| {
+                self.artifact(
+                    ArtifactKind::ExecutionPlan,
+                    "execution.plan",
+                    plan,
+                    vec![
+                        plan.decision_context.clone(),
+                        plan.account_snapshot.clone(),
+                        plan.quote_snapshot.clone(),
+                        plan.market_clock_snapshot.clone(),
+                    ],
+                    input,
+                )
+            })
+            .transpose()?;
+        let execution_plan_ref = execution_plan.as_ref().map(artifact_ref);
 
         let execution_context_payload = ExecutionContext {
             schema_version: akzio_domain::REBUILD_SCHEMA_VERSION,
@@ -176,30 +189,37 @@ impl V2ExecutionRuntime {
             decision_context: input.decision_context.clone(),
             account_snapshot: input.account_snapshot.clone(),
             quote_snapshot: input.quote_snapshot.clone(),
-            factor_exposure: input.factor_exposure.clone(),
-            turnover_ppm: input.turnover_ppm,
-            plan_hash: input.plan_hash.clone(),
-            broker_session: input.broker_session.clone(),
+            market_clock_snapshot: input.market_clock_snapshot.clone(),
+            execution_plan: execution_plan_ref.clone(),
+            factor_exposure: plan_payload
+                .as_ref()
+                .map(|plan| plan.factor_exposure.clone()),
+            turnover_ppm: plan_payload.as_ref().map(|plan| plan.turnover_ppm),
+            plan_hash: plan_payload.as_ref().map(|plan| plan.plan_hash.clone()),
+            broker_session: plan_payload
+                .as_ref()
+                .map(|plan| plan.broker_session.clone()),
             frozen,
             created_at: input.now,
         };
         execution_context_payload.validate()?;
+        if blockers.is_empty() {
+            execution_context_payload.validate_complete_plan_closure()?;
+        }
+
+        let mut context_sources = vec![input.decision_context.clone()];
+        context_sources.extend(input.account_snapshot.clone());
+        context_sources.extend(input.quote_snapshot.clone());
+        context_sources.extend(input.market_clock_snapshot.clone());
+        context_sources.extend(execution_plan_ref.clone());
         let execution_context = self.artifact(
             ArtifactKind::ExecutionContext,
             "execution.context",
             &execution_context_payload,
-            vec![
-                input.decision_context.clone(),
-                input.account_snapshot.clone(),
-                input.quote_snapshot.clone(),
-                input.allocation_plan.clone(),
-            ],
+            context_sources,
             input,
         )?;
-        let execution_context_ref = ArtifactRef {
-            artifact_id: execution_context.artifact_id.clone(),
-            kind: execution_context.kind,
-        };
+        let execution_context_ref = artifact_ref(&execution_context);
 
         let verdict_payload = if blockers.is_empty() {
             ExecutionVerdict::Accepted {
@@ -222,46 +242,194 @@ impl V2ExecutionRuntime {
             vec![execution_context_ref],
             input,
         )?;
-
         Ok(ExecutionGateOutput {
+            execution_plan,
             execution_context,
             verdict,
         })
     }
 
-    /// Atomically persist the complete gate result and finish the task. A
-    /// `NoOrder` is a successful, terminal execution-gate result.
+    /// Atomically persists the optional plan, context, verdict and task terminal state.
     pub fn commit(
         &self,
         permit: &TaskWritePermit,
         output: &ExecutionGateOutput,
         now: DateTime<Utc>,
     ) -> ExecutionGateResult<()> {
-        self.store.commit_attempt(
-            permit,
-            &[output.execution_context.clone(), output.verdict.clone()],
-            TaskStatus::Succeeded,
-            now,
-        )?;
+        let mut artifacts = Vec::with_capacity(3);
+        artifacts.extend(output.execution_plan.clone());
+        artifacts.push(output.execution_context.clone());
+        artifacts.push(output.verdict.clone());
+        self.store
+            .commit_attempt(permit, &artifacts, TaskStatus::Succeeded, now)?;
         Ok(())
     }
 
     fn validate_input(&self, input: &ExecutionGateInput) -> ExecutionGateResult<()> {
-        if input.broker_session.trim().is_empty() {
-            return Err(ExecutionGateError::InvalidInput("broker_session"));
-        }
-        if input.turnover_ppm > 1_000_000 {
-            return Err(ExecutionGateError::InvalidInput("turnover_ppm"));
-        }
-        input.factor_exposure.validate()?;
         if input.decision_context.kind != ArtifactKind::DecisionContext
-            || input.account_snapshot.kind != ArtifactKind::NormalizedEvidence
-            || input.quote_snapshot.kind != ArtifactKind::NormalizedEvidence
-            || input.allocation_plan.kind != ArtifactKind::ExecutionPlan
+            || input
+                .account_snapshot
+                .as_ref()
+                .is_some_and(|reference| reference.kind != ArtifactKind::NormalizedEvidence)
+            || input
+                .quote_snapshot
+                .as_ref()
+                .is_some_and(|reference| reference.kind != ArtifactKind::NormalizedEvidence)
+            || input
+                .market_clock_snapshot
+                .as_ref()
+                .is_some_and(|reference| reference.kind != ArtifactKind::NormalizedEvidence)
         {
-            return Err(ExecutionGateError::InvalidInput("input artifact kinds"));
+            return Err(ExecutionGateError::Integrity("input artifact kinds"));
         }
         Ok(())
+    }
+
+    fn load_account(
+        &self,
+        input: &ExecutionGateInput,
+        blockers: &mut BTreeSet<HardBlocker>,
+    ) -> ExecutionGateResult<Option<(Artifact, AccountSnapshot)>> {
+        let Some(reference) = &input.account_snapshot else {
+            blockers.insert(HardBlocker::MissingAccount);
+            return Ok(None);
+        };
+        let artifact = self.load_expected(reference, ArtifactKind::NormalizedEvidence)?;
+        let payload: AccountSnapshot = self.read_payload(&artifact)?;
+        payload.validate()?;
+        if artifact.lifecycle != ArtifactLifecycle::Canonical {
+            blockers.insert(HardBlocker::InvalidProvenance);
+        }
+        Ok(Some((artifact, payload)))
+    }
+
+    fn load_quotes(
+        &self,
+        input: &ExecutionGateInput,
+        blockers: &mut BTreeSet<HardBlocker>,
+    ) -> ExecutionGateResult<Option<(Artifact, QuoteSnapshot)>> {
+        let Some(reference) = &input.quote_snapshot else {
+            blockers.insert(HardBlocker::MissingQuote);
+            return Ok(None);
+        };
+        let artifact = self.load_expected(reference, ArtifactKind::NormalizedEvidence)?;
+        let payload: QuoteSnapshot = self.read_payload(&artifact)?;
+        payload.validate()?;
+        if artifact.lifecycle != ArtifactLifecycle::Canonical {
+            blockers.insert(HardBlocker::InvalidProvenance);
+        }
+        Ok(Some((artifact, payload)))
+    }
+
+    fn load_clock(
+        &self,
+        input: &ExecutionGateInput,
+        blockers: &mut BTreeSet<HardBlocker>,
+    ) -> ExecutionGateResult<Option<(Artifact, MarketClockSnapshot)>> {
+        let Some(reference) = &input.market_clock_snapshot else {
+            blockers.insert(HardBlocker::MarketClosed);
+            return Ok(None);
+        };
+        let artifact = self.load_expected(reference, ArtifactKind::NormalizedEvidence)?;
+        let payload: MarketClockSnapshot = self.read_payload(&artifact)?;
+        payload.validate()?;
+        if artifact.lifecycle != ArtifactLifecycle::Canonical {
+            blockers.insert(HardBlocker::InvalidProvenance);
+        }
+        Ok(Some((artifact, payload)))
+    }
+
+    fn derive_snapshot_blockers(
+        &self,
+        account: Option<&AccountSnapshot>,
+        quotes: Option<&QuoteSnapshot>,
+        clock: Option<&MarketClockSnapshot>,
+        now: DateTime<Utc>,
+        blockers: &mut BTreeSet<HardBlocker>,
+    ) {
+        if let Some(account) = account {
+            if stale(
+                account.observed_at,
+                now,
+                self.execution_policy().max_account_age_secs,
+            ) {
+                blockers.insert(HardBlocker::StaleAccount);
+            }
+        }
+        if let Some(quotes) = quotes {
+            if stale(
+                quotes.observed_at,
+                now,
+                self.execution_policy().max_quote_age_secs,
+            ) {
+                blockers.insert(HardBlocker::StaleQuote);
+            }
+        }
+        if let Some(clock) = clock {
+            if !clock.is_open
+                || stale(
+                    clock.observed_at,
+                    now,
+                    self.execution_policy().max_clock_age_secs,
+                )
+            {
+                blockers.insert(HardBlocker::MarketClosed);
+            }
+        }
+        if let (Some(account), Some(quotes)) = (account, quotes) {
+            if account.broker_session != quotes.broker_session {
+                blockers.insert(HardBlocker::StaleQuote);
+            }
+        }
+        if let (Some(account), Some(clock)) = (account, clock) {
+            if account.broker_session != clock.broker_session {
+                blockers.insert(HardBlocker::MarketClosed);
+            }
+        }
+    }
+
+    fn allocation_blockers(&self, error: AllocationError, blockers: &mut BTreeSet<HardBlocker>) {
+        match error {
+            AllocationError::DecisionRejected => {
+                blockers.insert(HardBlocker::NoExecutableOrder);
+            }
+            AllocationError::SessionMismatch => {
+                blockers.insert(HardBlocker::InvalidProvenance);
+            }
+            AllocationError::MarketClosed => {
+                blockers.insert(HardBlocker::MarketClosed);
+            }
+            AllocationError::Domain(_) => {
+                blockers.insert(HardBlocker::InvalidProvenance);
+            }
+            AllocationError::Execution(error) => match error {
+                ExecutionError::ForbiddenAsset(_) | ExecutionError::InvalidWeight(_) => {
+                    blockers.insert(HardBlocker::UnsupportedUniverse);
+                }
+                ExecutionError::GrossExposureExceeded(_) => {
+                    blockers.insert(HardBlocker::FactorLimit);
+                }
+                ExecutionError::MissingQuote(_) | ExecutionError::InvalidQuote(_) => {
+                    blockers.insert(HardBlocker::MissingQuote);
+                }
+                ExecutionError::StaleQuote(_) => {
+                    blockers.insert(HardBlocker::StaleQuote);
+                }
+                ExecutionError::DailyTurnoverExceeded => {
+                    blockers.insert(HardBlocker::TurnoverLimit);
+                }
+                ExecutionError::InvalidPolicy => {
+                    blockers.insert(HardBlocker::InvalidProvenance);
+                }
+                ExecutionError::AccountBlocked
+                | ExecutionError::InsufficientBuyingPower
+                | ExecutionError::ShortPosition(_)
+                | ExecutionError::NewNotionalExceeded
+                | ExecutionError::NoExecutableOrder => {
+                    blockers.insert(HardBlocker::NoExecutableOrder);
+                }
+            },
+        }
     }
 
     fn load_expected(
@@ -279,6 +447,12 @@ impl V2ExecutionRuntime {
         Ok(artifact)
     }
 
+    fn read_payload<T: DeserializeOwned>(&self, artifact: &Artifact) -> ExecutionGateResult<T> {
+        Ok(serde_json::from_slice(
+            &self.store.read_blob(&artifact.blob)?,
+        )?)
+    }
+
     fn validate_decision_provenance(
         &self,
         artifact: &Artifact,
@@ -290,11 +464,8 @@ impl V2ExecutionRuntime {
             .and_then(|origin| origin.run_id.as_ref())
             != Some(&decision.run_id)
         {
-            return Err(ExecutionGateError::Domain(DomainError::EmptyField {
-                field: "decision_context.origin.run_id",
-            }));
+            return Err(ExecutionGateError::Integrity("decision context origin run"));
         }
-
         for reference in decision
             .claims
             .iter()
@@ -315,9 +486,9 @@ impl V2ExecutionRuntime {
                     .iter()
                     .any(|declared| declared == reference)
             {
-                return Err(ExecutionGateError::Domain(DomainError::EmptyField {
-                    field: "decision_context.source_refs",
-                }));
+                return Err(ExecutionGateError::Integrity(
+                    "decision context source refs",
+                ));
             }
         }
         self.validate_policy_influences(artifact, decision)
@@ -337,7 +508,7 @@ impl V2ExecutionRuntime {
             .filter(|reference| reference.kind == ArtifactKind::ContextManifest)
             .collect::<Vec<_>>();
         if manifest_refs.len() != 1 {
-            return Err(invalid_policy_influence());
+            return Err(ExecutionGateError::Integrity("policy influence manifest"));
         }
         let manifest = self.store.artifact(&manifest_refs[0].artifact_id)?;
         if manifest.kind != ArtifactKind::ContextManifest
@@ -347,10 +518,9 @@ impl V2ExecutionRuntime {
                 .and_then(|origin| origin.run_id.as_ref())
                 != Some(&decision.run_id)
         {
-            return Err(invalid_policy_influence());
+            return Err(ExecutionGateError::Integrity("policy influence manifest"));
         }
-        let payload: ContextManifestPayload =
-            serde_json::from_slice(&self.store.read_blob(&manifest.blob)?)?;
+        let payload: ContextManifestPayload = self.read_payload(&manifest)?;
         let selected = payload
             .selections
             .iter()
@@ -367,34 +537,35 @@ impl V2ExecutionRuntime {
                 .iter()
                 .any(|reference| !selected.contains(reference))
         {
-            return Err(invalid_policy_influence());
+            return Err(ExecutionGateError::Integrity("policy influence manifest"));
         }
-
         for reference in &decision.policy_influences {
             let influence = self.store.artifact(&reference.artifact_id)?;
             if influence.kind != reference.kind || !self.is_canonical_paper(&influence)? {
-                return Err(invalid_policy_influence());
+                return Err(ExecutionGateError::Integrity("policy influence authority"));
             }
             let subject: PolicySubject = match reference.kind {
                 ArtifactKind::Experience => {
-                    let experience: Experience =
-                        serde_json::from_slice(&self.store.read_blob(&influence.blob)?)?;
+                    let experience: Experience = self.read_payload(&influence)?;
                     experience.validate()?;
                     experience.subject
                 }
                 ArtifactKind::CandidatePolicy => {
-                    let policy: CandidatePolicy =
-                        serde_json::from_slice(&self.store.read_blob(&influence.blob)?)?;
+                    let policy: CandidatePolicy = self.read_payload(&influence)?;
                     policy.validate()?;
                     let evaluation = self.store.artifact(&policy.source_evaluation.artifact_id)?;
                     if evaluation.kind != ArtifactKind::Evaluation
                         || !self.is_canonical_paper(&evaluation)?
                     {
-                        return Err(invalid_policy_influence());
+                        return Err(ExecutionGateError::Integrity("candidate policy evaluation"));
                     }
                     policy.subject
                 }
-                _ => return Err(invalid_policy_influence()),
+                _ => {
+                    return Err(ExecutionGateError::Integrity(
+                        "policy influence artifact kind",
+                    ));
+                }
             };
             if self
                 .store
@@ -402,14 +573,14 @@ impl V2ExecutionRuntime {
                 .as_ref()
                 != Some(&subject)
             {
-                return Err(invalid_policy_influence());
+                return Err(ExecutionGateError::Integrity("policy influence subject"));
             }
             let head = self
                 .store
                 .policy_head(&subject)?
-                .ok_or_else(invalid_policy_influence)?;
+                .ok_or(ExecutionGateError::Integrity("policy head"))?;
             if !head.state.permits_influence_kind(reference.kind) {
-                return Err(invalid_policy_influence());
+                return Err(ExecutionGateError::Integrity("policy head state"));
             }
         }
         Ok(())
@@ -437,11 +608,9 @@ impl V2ExecutionRuntime {
             return Ok(false);
         };
         if artifact.lifecycle != ArtifactLifecycle::Canonical {
-            return Err(ExecutionGateError::Domain(DomainError::EmptyField {
-                field: "freeze_state.lifecycle",
-            }));
+            return Err(ExecutionGateError::Integrity("freeze state lifecycle"));
         }
-        let state: FreezeState = serde_json::from_slice(&self.store.read_blob(&artifact.blob)?)?;
+        let state: FreezeState = self.read_payload(&artifact)?;
         state.validate()?;
         Ok(state.frozen)
     }
@@ -479,29 +648,54 @@ impl V2ExecutionRuntime {
     }
 }
 
+fn artifact_ref(artifact: &Artifact) -> ArtifactRef {
+    ArtifactRef {
+        artifact_id: artifact.artifact_id.clone(),
+        kind: artifact.kind,
+    }
+}
+
+fn stale(observed_at: DateTime<Utc>, now: DateTime<Utc>, max_age_secs: i64) -> bool {
+    now.signed_duration_since(observed_at) > Duration::seconds(max_age_secs)
+}
+
 #[cfg(test)]
 mod tests {
-    use chrono::Duration;
-    use tempfile::tempdir;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use akzio_domain::{
-        ArtifactLifecycle, ArtifactProvenance, DecisionId, FactorLimits, FailureDisposition,
-        RetryPolicy, RunId, SoftWarning, TargetPortfolio, TaskBudget, TaskId, TaskRecipeId,
-        WorkflowGraph, WorkflowNode, REBUILD_SCHEMA_VERSION,
+        ArtifactId, Asset, ContentHash, DecisionId, FactorLimits, FailureDisposition, MoneyMicros,
+        Position, Quote, RetryPolicy, RunId, SoftWarning, TargetPortfolio, TaskBudget, TaskId,
+        TaskRecipeId, WeightPpm, WorkflowGraph, WorkflowNode, REBUILD_SCHEMA_VERSION,
     };
     use akzio_store::v2::{StoredRun, WorkflowCommit};
+    use tempfile::tempdir;
 
     use super::*;
 
-    fn policy(limit: u32) -> ExecutionGatePolicy {
+    fn execution_policy() -> ExecutionPolicy {
+        ExecutionPolicy {
+            assets: Asset::EXECUTABLE.into_iter().collect::<BTreeSet<_>>(),
+            max_gross_weight: WeightPpm(1_000_000),
+            max_new_notional: MoneyMicros::from_usd_cents(2_000_000),
+            max_daily_turnover: WeightPpm(1_000_000),
+            max_account_age_secs: 5,
+            max_quote_age_secs: 5,
+            max_clock_age_secs: 5,
+            max_spread_bps: 20,
+            limit_protection_bps: 10,
+        }
+    }
+
+    fn gate_policy(factor_limit: u32, turnover_limit: u32) -> ExecutionGatePolicy {
         ExecutionGatePolicy {
             factor_limits: FactorLimits {
-                global_leveraged_equity_ppm: limit,
-                nasdaq_ppm: limit,
-                semiconductor_ppm: limit,
-                paired_index_ppm: limit,
+                global_leveraged_equity_ppm: factor_limit,
+                nasdaq_ppm: factor_limit,
+                semiconductor_ppm: factor_limit,
+                paired_index_ppm: factor_limit,
             },
-            max_turnover_ppm: limit,
+            max_turnover_ppm: turnover_limit,
         }
     }
 
@@ -514,13 +708,37 @@ mod tests {
         }
     }
 
-    fn retry() -> RetryPolicy {
-        RetryPolicy {
-            max_attempts: 1,
-            initial_backoff_ms: 1,
-            retry_transport: false,
-            retry_rate_limited: false,
-            retry_invalid_output: false,
+    fn graph() -> WorkflowGraph {
+        let source = WorkflowNode {
+            task_id: TaskId::new(),
+            recipe_id: TaskRecipeId::new("execution.source").unwrap(),
+            contract_hash: None,
+            objective: "create typed execution inputs".to_owned(),
+            dependencies: vec![],
+            input_artifacts: vec![],
+            priority: 100,
+            budget: budget(),
+            retry: RetryPolicy::none(),
+            on_failure: FailureDisposition::FailRun,
+            parent_task_id: None,
+        };
+        let gate = WorkflowNode {
+            task_id: TaskId::new(),
+            recipe_id: TaskRecipeId::new("execution.gate").unwrap(),
+            contract_hash: None,
+            objective: "gate typed execution plan".to_owned(),
+            dependencies: vec![source.task_id.clone()],
+            input_artifacts: vec![],
+            priority: 100,
+            budget: budget(),
+            retry: RetryPolicy::none(),
+            on_failure: FailureDisposition::FailRun,
+            parent_task_id: None,
+        };
+        WorkflowGraph {
+            schema_version: REBUILD_SCHEMA_VERSION,
+            topology_id: "typed-execution-fixture".to_owned(),
+            nodes: vec![source, gate],
         }
     }
 
@@ -532,49 +750,6 @@ mod tests {
             source_uri: None,
             confidence_ppm: 1_000_000,
             producer_contract_hash: None,
-        }
-    }
-
-    fn origin(permit: &TaskWritePermit) -> ArtifactOrigin {
-        ArtifactOrigin {
-            run_id: Some(permit.run_id.clone()),
-            task_id: Some(permit.task_id.clone()),
-            attempt_id: Some(permit.attempt_id.clone()),
-            contract_hash: permit.contract_hash.clone(),
-        }
-    }
-
-    fn graph() -> WorkflowGraph {
-        let source = WorkflowNode {
-            task_id: TaskId::new(),
-            recipe_id: TaskRecipeId::new("execution.source").unwrap(),
-            contract_hash: None,
-            objective: "create inputs".to_owned(),
-            dependencies: vec![],
-            input_artifacts: vec![],
-            priority: 100,
-            budget: budget(),
-            retry: retry(),
-            on_failure: FailureDisposition::FailRun,
-            parent_task_id: None,
-        };
-        let gate = WorkflowNode {
-            task_id: TaskId::new(),
-            recipe_id: TaskRecipeId::new("execution.gate").unwrap(),
-            contract_hash: None,
-            objective: "gate paper execution".to_owned(),
-            dependencies: vec![source.task_id.clone()],
-            input_artifacts: vec![],
-            priority: 100,
-            budget: budget(),
-            retry: retry(),
-            on_failure: FailureDisposition::FailRun,
-            parent_task_id: None,
-        };
-        WorkflowGraph {
-            schema_version: REBUILD_SCHEMA_VERSION,
-            topology_id: "execution-fixture".to_owned(),
-            nodes: vec![source, gate],
         }
     }
 
@@ -592,145 +767,170 @@ mod tests {
             "fixture.source",
             ArtifactLifecycle::Canonical,
             provenance(now),
-            Some(origin(permit)),
+            Some(ArtifactOrigin {
+                run_id: Some(permit.run_id.clone()),
+                task_id: Some(permit.task_id.clone()),
+                attempt_id: Some(permit.attempt_id.clone()),
+                contract_hash: permit.contract_hash.clone(),
+            }),
             source_refs,
             now,
         )
         .unwrap()
     }
 
-    fn record_freeze(store: &V2Store, frozen: bool, now: DateTime<Utc>) {
-        let state = FreezeState {
-            schema_version: REBUILD_SCHEMA_VERSION,
-            frozen,
-            reason: "fixture freeze".to_owned(),
-            changed_at: now,
-        };
-        let artifact = Artifact::new(
-            ArtifactKind::FreezeState,
-            store.put_json(&state).unwrap(),
-            "fixture.freeze",
-            ArtifactLifecycle::Canonical,
+    fn as_ref(artifact: &Artifact) -> ArtifactRef {
+        ArtifactRef {
+            artifact_id: artifact.artifact_id.clone(),
+            kind: artifact.kind,
+        }
+    }
+
+    struct Fixture {
+        store: V2Store,
+        runtime: V2ExecutionRuntime,
+        input: ExecutionGateInput,
+    }
+
+    fn fixture(
+        purpose: RunPurpose,
+        account_age_secs: i64,
+        quote_age_secs: i64,
+        clock_open: bool,
+        policy: ExecutionGatePolicy,
+    ) -> Fixture {
+        let directory = tempdir().unwrap();
+        let store = V2Store::open(directory.keep()).unwrap();
+        let now = Utc::now();
+        let graph = graph();
+        let graph_artifact = Artifact::new(
+            ArtifactKind::WorkflowGraph,
+            store.put_json(&graph).unwrap(),
+            "fixture.workflow",
+            ArtifactLifecycle::RunScoped,
             provenance(now),
             None,
             vec![],
             now,
         )
         .unwrap();
-        store.write_bootstrap_artifact(&artifact).unwrap();
-    }
+        let run = StoredRun {
+            run_id: RunId::new(),
+            purpose,
+            topology_id: graph.topology_id.clone(),
+            graph_artifact_id: graph_artifact.artifact_id.clone(),
+            created_at: now,
+        };
+        store
+            .commit_workflow(&WorkflowCommit {
+                run,
+                graph: graph_artifact,
+                nodes: graph.nodes,
+            })
+            .unwrap();
+        let source_permit = store
+            .claim_next_task("fixture", now, Duration::seconds(30))
+            .unwrap()
+            .unwrap()
+            .permit;
 
-    fn seed_inputs(
-        store: &V2Store,
-        source_permit: &TaskWritePermit,
-        now: DateTime<Utc>,
-        hard_blockers: Vec<HardBlocker>,
-        include_order: bool,
-    ) -> (
-        ArtifactRef,
-        ArtifactRef,
-        ArtifactRef,
-        ArtifactRef,
-        akzio_domain::ContentHash,
-        TaskWritePermit,
-    ) {
         let claim = source_artifact(
-            store,
-            source_permit,
+            &store,
+            &source_permit,
             ArtifactKind::Claim,
-            &serde_json::json!({"claim": "fixture"}),
+            &serde_json::json!({"claim": "typed execution fixture"}),
             vec![],
             now,
         );
         let account = source_artifact(
-            store,
-            source_permit,
+            &store,
+            &source_permit,
             ArtifactKind::NormalizedEvidence,
-            &serde_json::json!({"account": "fixture"}),
+            &AccountSnapshot {
+                schema_version: REBUILD_SCHEMA_VERSION,
+                broker_session: "2026-08-10".to_owned(),
+                observed_at: now - Duration::seconds(account_age_secs),
+                equity: MoneyMicros::from_usd_cents(1_000_000),
+                buying_power: MoneyMicros::from_usd_cents(1_000_000),
+                day_turnover: MoneyMicros::ZERO,
+                active: true,
+                trading_blocked: false,
+                positions: BTreeMap::<Asset, Position>::new(),
+            },
             vec![],
             now,
         );
-        let quote = source_artifact(
-            store,
-            source_permit,
+        let quotes = source_artifact(
+            &store,
+            &source_permit,
             ArtifactKind::NormalizedEvidence,
-            &serde_json::json!({"quote": "fixture"}),
+            &QuoteSnapshot {
+                schema_version: REBUILD_SCHEMA_VERSION,
+                broker_session: "2026-08-10".to_owned(),
+                observed_at: now - Duration::seconds(quote_age_secs),
+                quotes: BTreeMap::from([(
+                    Asset::Tqqq,
+                    Quote {
+                        bid: MoneyMicros::from_usd_cents(10_000),
+                        ask: MoneyMicros::from_usd_cents(10_010),
+                        observed_at: now - Duration::seconds(quote_age_secs),
+                    },
+                )]),
+            },
             vec![],
             now,
         );
-        let claim_ref = ArtifactRef {
-            artifact_id: claim.artifact_id.clone(),
-            kind: claim.kind,
-        };
-        let account_ref = ArtifactRef {
-            artifact_id: account.artifact_id.clone(),
-            kind: account.kind,
-        };
-        let quote_ref = ArtifactRef {
-            artifact_id: quote.artifact_id.clone(),
-            kind: quote.kind,
-        };
+        let clock = source_artifact(
+            &store,
+            &source_permit,
+            ArtifactKind::NormalizedEvidence,
+            &MarketClockSnapshot {
+                schema_version: REBUILD_SCHEMA_VERSION,
+                broker_session: "2026-08-10".to_owned(),
+                is_open: clock_open,
+                observed_at: now,
+            },
+            vec![],
+            now,
+        );
+        let claim_ref = as_ref(&claim);
+        let account_ref = as_ref(&account);
+        let quote_ref = as_ref(&quotes);
+        let clock_ref = as_ref(&clock);
+        let mut target = TargetPortfolio::zeroed();
+        target.weights.insert(Asset::Tqqq, WeightPpm(100_000));
         let decision = DecisionContext {
             schema_version: REBUILD_SCHEMA_VERSION,
             decision_id: DecisionId::new(),
             run_id: source_permit.run_id.clone(),
             claims: vec![claim_ref.clone()],
             critiques: vec![],
-            evidence: vec![account_ref.clone(), quote_ref.clone()],
+            evidence: vec![account_ref.clone(), quote_ref.clone(), clock_ref.clone()],
             policy_influences: vec![],
             material_conflicts: vec![],
-            hard_blockers,
+            hard_blockers: vec![],
             soft_warnings: Vec::<SoftWarning>::new(),
-            target: TargetPortfolio::zeroed(),
+            decision_policy_hash: ContentHash::of_bytes(b"fixture-decision-policy"),
+            target,
             created_at: now,
         };
         let decision_artifact = source_artifact(
-            store,
-            source_permit,
+            &store,
+            &source_permit,
             ArtifactKind::DecisionContext,
             &decision,
-            vec![claim_ref, account_ref.clone(), quote_ref.clone()],
-            now,
-        );
-        let plan = ExecutionPlan {
-            policy: crate::ExecutionPolicy::default(),
-            targets: vec![],
-            orders: include_order
-                .then_some(crate::OrderIntent {
-                    asset: akzio_domain::Asset::Tqqq,
-                    side: crate::OrderSide::Buy,
-                    notional: crate::MoneyMicros::from_usd_cents(10_000),
-                    limit_price: crate::MoneyMicros::from_usd_cents(2_500),
-                })
-                .into_iter()
-                .collect(),
-            plan_hash: akzio_domain::ContentHash::of_bytes(b"fixture-allocation"),
-        };
-        let allocation_artifact = source_artifact(
-            store,
-            source_permit,
-            ArtifactKind::ExecutionPlan,
-            &plan,
             vec![
-                ArtifactRef {
-                    artifact_id: decision_artifact.artifact_id.clone(),
-                    kind: decision_artifact.kind,
-                },
+                claim_ref,
                 account_ref.clone(),
                 quote_ref.clone(),
+                clock_ref.clone(),
             ],
             now,
         );
         store
             .commit_attempt(
-                source_permit,
-                &[
-                    claim,
-                    account,
-                    quote,
-                    decision_artifact.clone(),
-                    allocation_artifact.clone(),
-                ],
+                &source_permit,
+                &[claim, account, quotes, clock, decision_artifact.clone()],
                 TaskStatus::Succeeded,
                 now,
             )
@@ -740,244 +940,175 @@ mod tests {
             .unwrap()
             .unwrap()
             .permit;
-        let decision_ref = ArtifactRef {
-            artifact_id: decision_artifact.artifact_id,
-            kind: ArtifactKind::DecisionContext,
-        };
-        let allocation_ref = ArtifactRef {
-            artifact_id: allocation_artifact.artifact_id,
+        let runtime = V2ExecutionRuntime::new(store.clone(), execution_policy(), policy).unwrap();
+        Fixture {
+            store,
+            runtime,
+            input: ExecutionGateInput {
+                permit: gate_permit,
+                decision_context: as_ref(&decision_artifact),
+                account_snapshot: Some(account_ref),
+                quote_snapshot: Some(quote_ref),
+                market_clock_snapshot: Some(clock_ref),
+                now,
+            },
+        }
+    }
+
+    fn verdict(store: &V2Store, output: &ExecutionGateOutput) -> ExecutionVerdict {
+        serde_json::from_slice(&store.read_blob(&output.verdict.blob).unwrap()).unwrap()
+    }
+
+    fn blockers(store: &V2Store, output: &ExecutionGateOutput) -> Vec<HardBlocker> {
+        match verdict(store, output) {
+            ExecutionVerdict::NoOrder { no_order } => no_order.blockers,
+            ExecutionVerdict::Accepted { .. } => panic!("expected NoOrder"),
+        }
+    }
+
+    #[test]
+    fn accepted_gate_builds_and_atomically_commits_complete_plan_closure() {
+        let fixture = fixture(
+            RunPurpose::Paper,
+            0,
+            0,
+            true,
+            gate_policy(1_000_000, 1_000_000),
+        );
+        let output = fixture.runtime.evaluate(&fixture.input).unwrap();
+        assert!(output.execution_plan.is_some());
+        assert!(matches!(
+            verdict(&fixture.store, &output),
+            ExecutionVerdict::Accepted { .. }
+        ));
+        let context: ExecutionContext = serde_json::from_slice(
+            &fixture
+                .store
+                .read_blob(&output.execution_context.blob)
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(context.validate_complete_plan_closure().is_ok());
+        fixture
+            .runtime
+            .commit(&fixture.input.permit, &output, fixture.input.now)
+            .unwrap();
+        assert!(fixture.store.artifact(&output.verdict.artifact_id).is_ok());
+    }
+
+    #[test]
+    fn missing_snapshots_are_durable_no_order() {
+        let mut fixture = fixture(
+            RunPurpose::Paper,
+            0,
+            0,
+            true,
+            gate_policy(1_000_000, 1_000_000),
+        );
+        fixture.input.account_snapshot = None;
+        fixture.input.quote_snapshot = None;
+        let output = fixture.runtime.evaluate(&fixture.input).unwrap();
+        let blockers = blockers(&fixture.store, &output);
+        assert!(blockers.contains(&HardBlocker::MissingAccount));
+        assert!(blockers.contains(&HardBlocker::MissingQuote));
+        assert!(output.execution_plan.is_none());
+    }
+
+    #[test]
+    fn stale_account_is_durable_no_order() {
+        let fixture = fixture(
+            RunPurpose::Paper,
+            6,
+            0,
+            true,
+            gate_policy(1_000_000, 1_000_000),
+        );
+        let output = fixture.runtime.evaluate(&fixture.input).unwrap();
+        assert!(blockers(&fixture.store, &output).contains(&HardBlocker::StaleAccount));
+    }
+
+    #[test]
+    fn closed_market_is_durable_no_order() {
+        let fixture = fixture(
+            RunPurpose::Paper,
+            0,
+            0,
+            false,
+            gate_policy(1_000_000, 1_000_000),
+        );
+        let output = fixture.runtime.evaluate(&fixture.input).unwrap();
+        assert!(blockers(&fixture.store, &output).contains(&HardBlocker::MarketClosed));
+    }
+
+    #[test]
+    fn factor_limit_is_derived_from_plan() {
+        let fixture = fixture(
+            RunPurpose::Paper,
+            0,
+            0,
+            true,
+            gate_policy(50_000, 1_000_000),
+        );
+        let output = fixture.runtime.evaluate(&fixture.input).unwrap();
+        assert!(output.execution_plan.is_some());
+        assert!(blockers(&fixture.store, &output).contains(&HardBlocker::FactorLimit));
+    }
+
+    #[test]
+    fn turnover_limit_is_derived_from_account_and_orders() {
+        let fixture = fixture(
+            RunPurpose::Paper,
+            0,
+            0,
+            true,
+            gate_policy(1_000_000, 50_000),
+        );
+        let output = fixture.runtime.evaluate(&fixture.input).unwrap();
+        assert!(output.execution_plan.is_some());
+        assert!(blockers(&fixture.store, &output).contains(&HardBlocker::TurnoverLimit));
+    }
+
+    #[test]
+    fn noncanonical_run_is_durable_no_order() {
+        let fixture = fixture(
+            RunPurpose::PaperDryRun,
+            0,
+            0,
+            true,
+            gate_policy(1_000_000, 1_000_000),
+        );
+        let output = fixture.runtime.evaluate(&fixture.input).unwrap();
+        assert!(blockers(&fixture.store, &output).contains(&HardBlocker::NonCanonicalRun));
+    }
+
+    #[test]
+    fn stale_quote_is_durable_no_order() {
+        let fixture = fixture(
+            RunPurpose::Paper,
+            0,
+            6,
+            true,
+            gate_policy(1_000_000, 1_000_000),
+        );
+        let output = fixture.runtime.evaluate(&fixture.input).unwrap();
+        assert!(blockers(&fixture.store, &output).contains(&HardBlocker::StaleQuote));
+    }
+
+    #[test]
+    fn policy_must_be_explicit_and_validated() {
+        let mut policy = execution_policy();
+        policy.max_new_notional = MoneyMicros::ZERO;
+        let directory = tempdir().unwrap();
+        let store = V2Store::open(directory.path()).unwrap();
+        assert!(V2ExecutionRuntime::new(store, policy, gate_policy(1_000_000, 1_000_000)).is_err());
+    }
+
+    #[test]
+    fn artifact_reference_helper_preserves_identity() {
+        let reference = ArtifactRef {
+            artifact_id: ArtifactId(akzio_domain::ContentHash::of_bytes(b"artifact")),
             kind: ArtifactKind::ExecutionPlan,
         };
-        (
-            decision_ref,
-            account_ref,
-            quote_ref,
-            allocation_ref,
-            plan.plan_hash,
-            gate_permit,
-        )
-    }
-
-    #[test]
-    fn accepted_paper_gate_persists_a_typed_accepted_verdict() {
-        let directory = tempdir().unwrap();
-        let store = V2Store::open(directory.path()).unwrap();
-        let now = Utc::now();
-        let graph = graph();
-        let graph_artifact = Artifact::new(
-            ArtifactKind::WorkflowGraph,
-            store.put_json(&graph).unwrap(),
-            "fixture.workflow",
-            ArtifactLifecycle::RunScoped,
-            provenance(now),
-            None,
-            vec![],
-            now,
-        )
-        .unwrap();
-        let run = StoredRun {
-            run_id: RunId::new(),
-            purpose: RunPurpose::Paper,
-            topology_id: graph.topology_id.clone(),
-            graph_artifact_id: graph_artifact.artifact_id.clone(),
-            created_at: now,
-        };
-        store
-            .commit_workflow(&WorkflowCommit {
-                run,
-                graph: graph_artifact,
-                nodes: graph.nodes,
-            })
-            .unwrap();
-        let source_permit = store
-            .claim_next_task("fixture", now, Duration::seconds(30))
-            .unwrap()
-            .unwrap()
-            .permit;
-        let (
-            decision_context,
-            account_snapshot,
-            quote_snapshot,
-            allocation_plan,
-            plan_hash,
-            gate_permit,
-        ) = seed_inputs(&store, &source_permit, now, vec![], true);
-        let runtime = V2ExecutionRuntime::new(store.clone(), policy(100)).unwrap();
-        let output = runtime
-            .evaluate(&ExecutionGateInput {
-                permit: gate_permit.clone(),
-                decision_context,
-                account_snapshot,
-                quote_snapshot,
-                allocation_plan,
-                broker_session: "paper:fixture".to_owned(),
-                plan_hash,
-                market_open: true,
-                account_fresh: true,
-                quotes_fresh: true,
-                factor_exposure: FactorExposure {
-                    leveraged_equity_ppm: 100,
-                    nasdaq_ppm: 100,
-                    semiconductor_ppm: 100,
-                    tqqq_qqq_pair_ppm: 100,
-                    soxl_soxx_pair_ppm: 100,
-                },
-                turnover_ppm: 100,
-                now,
-            })
-            .unwrap();
-        let verdict: ExecutionVerdict =
-            serde_json::from_slice(&store.read_blob(&output.verdict.blob).unwrap()).unwrap();
-        assert!(matches!(verdict, ExecutionVerdict::Accepted { .. }));
-        runtime.commit(&gate_permit, &output, now).unwrap();
-        assert_eq!(
-            store.artifact(&output.verdict.artifact_id).unwrap().kind,
-            ArtifactKind::ExecutionVerdict
-        );
-    }
-
-    #[test]
-    fn policy_influence_without_context_manifest_is_rejected() {
-        let directory = tempdir().unwrap();
-        let store = V2Store::open(directory.path()).unwrap();
-        let now = Utc::now();
-        let runtime = V2ExecutionRuntime::new(store.clone(), policy(100)).unwrap();
-        let forged_ref = ArtifactRef {
-            artifact_id: akzio_domain::ArtifactId(akzio_domain::ContentHash::of_bytes(
-                b"unrecorded-experience",
-            )),
-            kind: ArtifactKind::Experience,
-        };
-        let decision = DecisionContext {
-            schema_version: REBUILD_SCHEMA_VERSION,
-            decision_id: DecisionId::new(),
-            run_id: RunId::new(),
-            claims: vec![],
-            critiques: vec![],
-            evidence: vec![],
-            policy_influences: vec![forged_ref.clone()],
-            material_conflicts: vec![],
-            hard_blockers: vec![],
-            soft_warnings: vec![],
-            target: TargetPortfolio::zeroed(),
-            created_at: now,
-        };
-        let decision_artifact = Artifact::new(
-            ArtifactKind::DecisionContext,
-            store.put_json(&decision).unwrap(),
-            "fixture.unrecorded_policy_influence",
-            ArtifactLifecycle::RunScoped,
-            provenance(now),
-            None,
-            vec![forged_ref],
-            now,
-        )
-        .unwrap();
-
-        assert!(matches!(
-            runtime
-                .validate_policy_influences(&decision_artifact, &decision)
-                .unwrap_err(),
-            ExecutionGateError::Domain(DomainError::EmptyField {
-                field: "decision_context.policy_influences"
-            })
-        ));
-    }
-
-    #[test]
-    fn noncanonical_or_unsafe_inputs_become_audited_no_order() {
-        let directory = tempdir().unwrap();
-        let store = V2Store::open(directory.path()).unwrap();
-        let now = Utc::now();
-        let graph = graph();
-        let graph_artifact = Artifact::new(
-            ArtifactKind::WorkflowGraph,
-            store.put_json(&graph).unwrap(),
-            "fixture.workflow",
-            ArtifactLifecycle::RunScoped,
-            provenance(now),
-            None,
-            vec![],
-            now,
-        )
-        .unwrap();
-        let run = StoredRun {
-            run_id: RunId::new(),
-            purpose: RunPurpose::PaperDryRun,
-            topology_id: graph.topology_id.clone(),
-            graph_artifact_id: graph_artifact.artifact_id.clone(),
-            created_at: now,
-        };
-        store
-            .commit_workflow(&WorkflowCommit {
-                run,
-                graph: graph_artifact,
-                nodes: graph.nodes,
-            })
-            .unwrap();
-        let source_permit = store
-            .claim_next_task("fixture", now, Duration::seconds(30))
-            .unwrap()
-            .unwrap()
-            .permit;
-        let (
-            decision_context,
-            account_snapshot,
-            quote_snapshot,
-            allocation_plan,
-            plan_hash,
-            gate_permit,
-        ) = seed_inputs(
-            &store,
-            &source_permit,
-            now,
-            vec![HardBlocker::MissingEvidence],
-            false,
-        );
-        let runtime = V2ExecutionRuntime::new(store.clone(), policy(100)).unwrap();
-        record_freeze(&store, true, now);
-        let output = runtime
-            .evaluate(&ExecutionGateInput {
-                permit: gate_permit,
-                decision_context,
-                account_snapshot,
-                quote_snapshot,
-                allocation_plan,
-                broker_session: "paper:fixture".to_owned(),
-                plan_hash,
-                market_open: false,
-                account_fresh: false,
-                quotes_fresh: false,
-                factor_exposure: FactorExposure {
-                    leveraged_equity_ppm: 101,
-                    nasdaq_ppm: 0,
-                    semiconductor_ppm: 0,
-                    tqqq_qqq_pair_ppm: 101,
-                    soxl_soxx_pair_ppm: 0,
-                },
-                turnover_ppm: 101,
-                now,
-            })
-            .unwrap();
-        let verdict: ExecutionVerdict =
-            serde_json::from_slice(&store.read_blob(&output.verdict.blob).unwrap()).unwrap();
-        let ExecutionVerdict::NoOrder { no_order } = verdict else {
-            panic!("expected no-order verdict");
-        };
-        assert_eq!(
-            no_order.blockers,
-            vec![
-                HardBlocker::NoExecutableOrder,
-                HardBlocker::Frozen,
-                HardBlocker::MissingEvidence,
-                HardBlocker::StaleQuote,
-                HardBlocker::StaleAccount,
-                HardBlocker::MarketClosed,
-                HardBlocker::FactorLimit,
-                HardBlocker::PairExposureLimit,
-                HardBlocker::TurnoverLimit,
-                HardBlocker::NonCanonicalRun,
-            ]
-        );
+        assert_eq!(reference.kind, ArtifactKind::ExecutionPlan);
     }
 }

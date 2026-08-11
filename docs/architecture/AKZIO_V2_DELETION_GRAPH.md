@@ -1,6 +1,6 @@
 # Akzio v2 Deletion Graph
 
-状态：R0 冻结。该图指定删除顺序；它不授权提前删除仍由 active path 使用的代码，也不允许新增 compatibility wrapper。
+状态：R0 refresh。该图指定删除顺序；它不授权提前删除仍由 active path 使用的代码，也不允许新增 compatibility wrapper。
 
 ```mermaid
 flowchart LR
@@ -30,14 +30,14 @@ flowchart LR
 | daemon dispatch owns cross-domain policy | `akzio-daemon` dispatch modules | owner-crate runtime APIs | R8 | daemon only coordinates/dispatches |
 | Unix JSON-line business transport and `UnixStream` CLI | `akzio-cli/src/main.rs`, README/config transitional references | loopback HTTP/SSE control API | R9 | no Unix business command, socket config or caller |
 | `outputs/v2-store` and old output compatibility claim | README/config active default | fresh `outputs/akzio-v2-rebuild`; old root rejects | R9 | incompatibility test and zero active defaults |
-| exported but unused `rebuild.rs` prototypes | domain/store/context/runtime/research exports | active v2 modules | R10 | prototypes removed and no re-export/dead code |
+| remaining compatibility-named implementation | current tree only retains `crates/akzio-learning/src/rebuild.rs`; the former cross-crate prototype set is gone | active v2 modules | R10 | remaining file removed or renamed only after its owner replacement is active; no re-export/dead code |
 | old `orchestrator-*`, Phase 0–8, FileStore, old prompts/docs | source/docs inventory | none | R10 | static inventory has zero active support claims |
 
 ## R0 inventory policy
 
 - `rg -n -i 'orchestrator|phase[[:space:]]*[0-8]|filestore|outputs/(store|v2-store)|unix|direct.*paper'` is an inventory, not a deletion command.
 - Each hit is classified as: historical architecture evidence, temporary transitional code with the above phase, or a defect. Only the first may remain after R10.
-- The five `rebuild.rs` files are prototypes, not v2 completion evidence. They remain until their replacement modules are active and covered by the target tests, then are deleted in R10.
+- Historical R0 material recorded a cross-crate `rebuild.rs` prototype set. That inventory is no longer current: only `crates/akzio-learning/src/rebuild.rs` remains. The remaining file is not v2 completion evidence and stays in the deletion inventory until its owner replacement is active and covered by target tests.
 - No data migration is permitted. Existing output directories stay untouched; the final Store API rejects the old root rather than reading or importing it.
 
 ## Source-audited R1 boundary correction

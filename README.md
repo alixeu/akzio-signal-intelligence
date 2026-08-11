@@ -29,13 +29,15 @@ Rust 是状态、权限、Contract、预算、workflow gate、持久化、学习
 
 ## 当前重构状态
 
-R0 已定义不变量、测试矩阵和删除图：
+R0 已验证；不变量、测试矩阵和删除图仍是当前执行入口：
 
 - [v2 invariants](docs/architecture/AKZIO_V2_INVARIANTS.md)
 - [test matrix](docs/architecture/AKZIO_V2_TEST_MATRIX.md)
 - [deletion graph](docs/architecture/AKZIO_V2_DELETION_GRAPH.md)
 
-当前 checkout 仍包含待替换的旧 active path 与五个 `rebuild.rs` 原型。它们不是 v2 完成证据，并会按删除图在 R1–R10 被替换和删除。尤其是当前 Unix transport 仅是待删除的内部过渡实现：它不是 v2 public control plane，也不得为它新增调用者或兼容层。
+当前 tree 已不再保留 domain/store/context/runtime/research 的 `rebuild.rs` 原型集合；仅 `crates/akzio-learning/src/rebuild.rs` 仍在删除清单中。它不是 v2 完成证据。阶段状态以 Goal 执行计划为准：R1/R2 为 complete pending regression，R3/R4 为 partial，R5 为 core complete 且 replay pending，R6 为 complete，R7 为 in progress。当前 Unix transport 仍是待删除的内部过渡实现：它不是 v2 public control plane，也不得为它新增调用者或兼容层。
+
+> 2026-08-11 checkpoint: the phase-status sentence immediately above is superseded by the Goal plan: R0 verified; R1–R3 narrow regression verified; R4 durable catalogue lifecycle pending; R5 event-reducer replay pending; R6 awaits R10 final review; R7 remains in progress.
 
 ## 安全边界
 
@@ -46,15 +48,12 @@ R0 已定义不变量、测试矩阵和删除图：
 
 R0 配置把 `auto_paper` 默认关闭。后续只有 R7/R8 的 decision gate、scheduler fencing 和恢复测试全部通过后，才可在受控本地环境显式启用自动 Paper；本仓库的 fixture 验证从不构成真实市场、模型或 Paper order 验证。
 
-## Local verification
+## R0 refresh local baseline
 
 ```bash
-rtk cargo fmt --all -- --check
-rtk cargo check --workspace --offline
-rtk cargo clippy --workspace --all-targets --offline
-rtk cargo test --workspace --offline
-rtk cargo run -p akzio-cli -- run fixture-debug
-rtk cargo run -p akzio-cli -- store doctor
+cargo metadata --offline --format-version 1 --no-deps
+cargo test --offline -p akzio-store workflow_commit_accepts_out_of_order_nodes_and_preserves_dependencies
+cargo test --offline -p akzio-runtime planner_graph_gets_non_bypassable_terminal_gates
 ```
 
-`fixture-debug` 只证明离线 fixture 路径。它不证明 gateway 可用、broker 连通、市场状态或任何 Paper execution。
+以上是当前 tree 可重复的窄 v2 基线，不等同于完整验收。全 workspace、`fixture-debug` 与 `store doctor` 仍是 R10 终局 gate；R7 in progress 时不得把它们表述为已通过。任何 fixture 结果都不证明 gateway 可用、broker 连通、市场状态或 Paper execution。

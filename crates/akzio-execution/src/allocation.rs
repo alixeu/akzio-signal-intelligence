@@ -1,19 +1,13 @@
-//! Model-free target-to-order allocation.
-//!
-//! A decision context supplies target weights only. This module owns the
-//! conversion to protected order intents using Rust policy, account state and
-//! quote freshness; no model output reaches the Paper adapter directly.
+//! Model-free conversion from a typed decision and broker snapshots to orders.
 
-use std::collections::BTreeMap;
-
-use akzio_domain::{Asset, DecisionContext, DomainError};
+use akzio_domain::{
+    AccountSnapshot, ArtifactRef, DecisionContext, DomainError, ExecutionPlan, MarketClockSnapshot,
+    QuoteSnapshot,
+};
 use chrono::{DateTime, Utc};
 use thiserror::Error;
 
-use crate::{
-    build_execution_plan, AccountSnapshot, ExecutionError, ExecutionPlan, ExecutionPolicy,
-    MoneyMicros, Quote, Target,
-};
+use crate::{build_execution_plan, ExecutionError, ExecutionPolicy};
 
 #[derive(Debug, Error)]
 pub enum AllocationError {
@@ -23,16 +17,24 @@ pub enum AllocationError {
     Execution(#[from] ExecutionError),
     #[error("execution allocation requires an accepted decision context")]
     DecisionRejected,
+    #[error("execution snapshots do not describe the same broker session")]
+    SessionMismatch,
+    #[error("market is closed")]
+    MarketClosed,
 }
 
 pub type AllocationResult<T> = std::result::Result<T, AllocationError>;
 
 #[derive(Debug, Clone)]
 pub struct AllocationInput {
+    pub decision_context_ref: ArtifactRef,
     pub decision_context: DecisionContext,
+    pub account_snapshot_ref: ArtifactRef,
     pub account: AccountSnapshot,
-    pub quotes: BTreeMap<Asset, Quote>,
-    pub daily_turnover: MoneyMicros,
+    pub quote_snapshot_ref: ArtifactRef,
+    pub quotes: QuoteSnapshot,
+    pub market_clock_snapshot_ref: ArtifactRef,
+    pub clock: MarketClockSnapshot,
     pub now: DateTime<Utc>,
 }
 
@@ -42,8 +44,9 @@ pub struct V2AllocationRuntime {
 }
 
 impl V2AllocationRuntime {
-    pub fn new(policy: ExecutionPolicy) -> Self {
-        Self { policy }
+    pub fn new(policy: ExecutionPolicy) -> AllocationResult<Self> {
+        policy.validate()?;
+        Ok(Self { policy })
     }
 
     pub fn policy(&self) -> &ExecutionPolicy {
@@ -52,27 +55,29 @@ impl V2AllocationRuntime {
 
     pub fn allocate(&self, input: &AllocationInput) -> AllocationResult<ExecutionPlan> {
         input.decision_context.validate()?;
+        input.account.validate()?;
+        input.quotes.validate()?;
+        input.clock.validate()?;
         if !input.decision_context.accepted() {
             return Err(AllocationError::DecisionRejected);
         }
-        let targets = Asset::EXECUTABLE
-            .into_iter()
-            .map(|asset| Target {
-                asset,
-                weight: *input
-                    .decision_context
-                    .target
-                    .weights
-                    .get(&asset)
-                    .expect("validated target portfolio contains every executable asset"),
-            })
-            .collect::<Vec<_>>();
+        if input.account.broker_session != input.quotes.broker_session
+            || input.account.broker_session != input.clock.broker_session
+        {
+            return Err(AllocationError::SessionMismatch);
+        }
+        if !input.clock.is_open {
+            return Err(AllocationError::MarketClosed);
+        }
         Ok(build_execution_plan(
-            self.policy.clone(),
+            &self.policy,
+            input.decision_context_ref.clone(),
+            input.account_snapshot_ref.clone(),
+            input.quote_snapshot_ref.clone(),
+            input.market_clock_snapshot_ref.clone(),
+            &input.decision_context.target,
             &input.account,
             &input.quotes,
-            &targets,
-            input.daily_turnover,
             input.now,
         )?)
     }
@@ -80,90 +85,111 @@ impl V2AllocationRuntime {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use akzio_domain::{
-        ArtifactId, ArtifactKind, ArtifactRef, DecisionId, HardBlocker, RunId, TargetPortfolio,
-        WeightPpm, REBUILD_SCHEMA_VERSION,
+        ArtifactId, ArtifactKind, Asset, ContentHash, DecisionId, HardBlocker, MoneyMicros,
+        Position, Quote, RunId, TargetPortfolio, WeightPpm, REBUILD_SCHEMA_VERSION,
     };
     use chrono::Utc;
 
-    use crate::{AccountSnapshot, ExecutionPolicy, MoneyMicros, Position, Quote};
+    use super::*;
 
-    use super::{AllocationError, AllocationInput, V2AllocationRuntime};
-
-    fn decision(blockers: Vec<HardBlocker>) -> akzio_domain::DecisionContext {
-        let mut target = TargetPortfolio::zeroed();
-        target
-            .weights
-            .insert(akzio_domain::Asset::Tqqq, WeightPpm(100_000));
-        akzio_domain::DecisionContext {
-            schema_version: REBUILD_SCHEMA_VERSION,
-            decision_id: DecisionId::new(),
-            run_id: RunId::new(),
-            claims: vec![ArtifactRef {
-                artifact_id: ArtifactId(akzio_domain::ContentHash::of_bytes(b"claim")),
-                kind: ArtifactKind::Claim,
-            }],
-            critiques: vec![],
-            evidence: vec![],
-            policy_influences: vec![],
-            material_conflicts: vec![],
-            hard_blockers: blockers,
-            soft_warnings: vec![],
-            target,
-            created_at: Utc::now(),
+    fn reference(kind: ArtifactKind, name: &[u8]) -> ArtifactRef {
+        ArtifactRef {
+            artifact_id: ArtifactId(ContentHash::of_bytes(name)),
+            kind,
         }
     }
 
-    #[test]
-    fn accepted_decision_context_is_allocated_by_rust_policy() {
+    fn policy() -> ExecutionPolicy {
+        ExecutionPolicy {
+            assets: Asset::EXECUTABLE.into_iter().collect::<BTreeSet<_>>(),
+            max_gross_weight: WeightPpm(500_000),
+            max_new_notional: MoneyMicros::from_usd_cents(1_000_000),
+            max_daily_turnover: WeightPpm(500_000),
+            max_account_age_secs: 5,
+            max_quote_age_secs: 5,
+            max_clock_age_secs: 5,
+            max_spread_bps: 20,
+            limit_protection_bps: 10,
+        }
+    }
+
+    fn input(blockers: Vec<HardBlocker>) -> AllocationInput {
         let now = Utc::now();
-        let plan = V2AllocationRuntime::new(ExecutionPolicy::default())
-            .allocate(&AllocationInput {
-                decision_context: decision(vec![]),
-                account: AccountSnapshot {
-                    equity: MoneyMicros::from_usd_cents(1_000_000),
-                    buying_power: MoneyMicros::from_usd_cents(1_000_000),
-                    active: true,
-                    trading_blocked: false,
-                    positions: BTreeMap::<akzio_domain::Asset, Position>::new(),
-                },
+        let mut target = TargetPortfolio::zeroed();
+        target.weights.insert(Asset::Tqqq, WeightPpm(100_000));
+        AllocationInput {
+            decision_context_ref: reference(ArtifactKind::DecisionContext, b"decision"),
+            decision_context: DecisionContext {
+                schema_version: REBUILD_SCHEMA_VERSION,
+                decision_id: DecisionId::new(),
+                run_id: RunId::new(),
+                claims: vec![reference(ArtifactKind::Claim, b"claim")],
+                critiques: vec![],
+                evidence: vec![],
+                policy_influences: vec![],
+                material_conflicts: vec![],
+                hard_blockers: blockers,
+                soft_warnings: vec![],
+                decision_policy_hash: ContentHash::of_bytes(b"fixture-decision-policy"),
+                target,
+                created_at: now,
+            },
+            account_snapshot_ref: reference(ArtifactKind::NormalizedEvidence, b"account"),
+            account: AccountSnapshot {
+                schema_version: REBUILD_SCHEMA_VERSION,
+                broker_session: "2026-08-10".to_owned(),
+                observed_at: now,
+                equity: MoneyMicros::from_usd_cents(1_000_000),
+                buying_power: MoneyMicros::from_usd_cents(1_000_000),
+                day_turnover: MoneyMicros::ZERO,
+                active: true,
+                trading_blocked: false,
+                positions: BTreeMap::<Asset, Position>::new(),
+            },
+            quote_snapshot_ref: reference(ArtifactKind::NormalizedEvidence, b"quotes"),
+            quotes: QuoteSnapshot {
+                schema_version: REBUILD_SCHEMA_VERSION,
+                broker_session: "2026-08-10".to_owned(),
+                observed_at: now,
                 quotes: BTreeMap::from([(
-                    akzio_domain::Asset::Tqqq,
+                    Asset::Tqqq,
                     Quote {
                         bid: MoneyMicros::from_usd_cents(10_000),
                         ask: MoneyMicros::from_usd_cents(10_010),
                         observed_at: now,
                     },
                 )]),
-                daily_turnover: MoneyMicros::ZERO,
-                now,
-            })
-            .unwrap();
-
-        assert_eq!(plan.orders.len(), 1);
-        assert_eq!(plan.orders[0].asset, akzio_domain::Asset::Tqqq);
+            },
+            market_clock_snapshot_ref: reference(ArtifactKind::NormalizedEvidence, b"clock"),
+            clock: MarketClockSnapshot {
+                schema_version: REBUILD_SCHEMA_VERSION,
+                broker_session: "2026-08-10".to_owned(),
+                is_open: true,
+                observed_at: now,
+            },
+            now,
+        }
     }
 
     #[test]
-    fn blocked_decision_cannot_be_allocated() {
-        let error = V2AllocationRuntime::new(ExecutionPolicy::default())
-            .allocate(&AllocationInput {
-                decision_context: decision(vec![HardBlocker::Frozen]),
-                account: AccountSnapshot {
-                    equity: MoneyMicros::from_usd_cents(1_000_000),
-                    buying_power: MoneyMicros::from_usd_cents(1_000_000),
-                    active: true,
-                    trading_blocked: false,
-                    positions: BTreeMap::new(),
-                },
-                quotes: BTreeMap::new(),
-                daily_turnover: MoneyMicros::ZERO,
-                now: Utc::now(),
-            })
-            .unwrap_err();
+    fn accepted_decision_is_allocated_by_explicit_policy() {
+        let plan = V2AllocationRuntime::new(policy())
+            .unwrap()
+            .allocate(&input(vec![]))
+            .unwrap();
+        assert_eq!(plan.orders.len(), 1);
+        assert!(plan.validate().is_ok());
+    }
 
+    #[test]
+    fn blocked_decision_is_not_allocated() {
+        let error = V2AllocationRuntime::new(policy())
+            .unwrap()
+            .allocate(&input(vec![HardBlocker::Frozen]))
+            .unwrap_err();
         assert!(matches!(error, AllocationError::DecisionRejected));
     }
 }

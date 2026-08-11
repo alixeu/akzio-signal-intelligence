@@ -147,22 +147,27 @@ impl V2RepriceRuntime {
         let context: ExecutionContext =
             serde_json::from_slice(&self.store.read_blob(&context_artifact.blob)?)?;
         context.validate()?;
+        context.validate_complete_plan_closure()?;
         if context.run_id != input.permit.run_id
-            || context.plan_hash != commitment.plan_hash
-            || context.broker_session != commitment.broker_session
+            || context.plan_hash.as_ref() != Some(&commitment.plan_hash)
+            || context.broker_session.as_deref() != Some(commitment.broker_session.as_str())
         {
             return Err(RepriceError::PlanHashMismatch);
         }
-        let plan_reference = context_artifact
-            .source_refs
-            .iter()
-            .find(|reference| reference.kind == ArtifactKind::ExecutionPlan)
-            .cloned()
+        let plan_reference = context
+            .execution_plan
+            .clone()
             .ok_or(RepriceError::MissingAllocationPlan)?;
+        if !context_artifact.source_refs.contains(&plan_reference) {
+            return Err(RepriceError::MissingAllocationPlan);
+        }
         let plan_artifact = self.load_expected(&plan_reference, ArtifactKind::ExecutionPlan)?;
         let plan: ExecutionPlan =
             serde_json::from_slice(&self.store.read_blob(&plan_artifact.blob)?)?;
-        if plan.plan_hash != commitment.plan_hash {
+        plan.validate()?;
+        if plan.plan_hash != commitment.plan_hash
+            || plan.broker_session != commitment.broker_session
+        {
             return Err(RepriceError::PlanHashMismatch);
         }
         let (order_index, original) = plan
@@ -197,6 +202,7 @@ impl V2RepriceRuntime {
             asset: prior.asset,
             prior_client_order_id: prior.client_order_id.clone(),
             replacement_client_order_id: crate::paper::client_order_id(
+                &commitment.broker_session,
                 &plan.plan_hash,
                 order_index,
                 1,
@@ -237,7 +243,7 @@ impl V2RepriceRuntime {
             &RepriceCommit {
                 permit: input.permit.clone(),
                 reprice: reprice.clone(),
-                committed_at: input.now,
+                committed_at: Utc::now(),
             },
         )?;
         let reprice = if result.newly_committed {

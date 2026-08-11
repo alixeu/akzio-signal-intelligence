@@ -1,12 +1,12 @@
 # Akzio v2 Test Matrix
 
-状态：R0 冻结。所有命令仅使用本地 workspace 与已缓存依赖；fixture、Dry Run 和静态检查不得描述为真实 broker、市场或模型验证。
+状态：R0 verified。所有命令仅使用本地 workspace 与已缓存依赖；fixture、Dry Run 和静态检查不得描述为真实 broker、市场或模型验证。
 
 ## 阶段 gate
 
 | 阶段 | 必测行为 | owner | 退出证据 |
 | --- | --- | --- | --- |
-| R0 | workspace metadata、格式化、Store scheduler slot 不死锁、fixture-debug、Doctor、legacy inventory | workspace / store / daemon | 基线命令成功；每条 invariant、删除项均有 owner |
+| R0 | workspace metadata、当前 v2 Store/Runtime 窄基线、legacy inventory | workspace / store / runtime | 基线命令成功；每条 invariant、删除项均有 owner；全 workspace/CLI 留给相应阶段重新认证 |
 | R1 | canonical hash、serde、asset 闭集、生命周期/provenance、graph/budget | `akzio-domain` | domain 窄测 + workspace check |
 | R2 | CAS hash、atomic workflow commit、TaskWritePermit、failure injection、lease/epoch、Doctor | `akzio-store` | store 窄测 + stale leader cannot mutate |
 | R3 | Raw/Normalized/Detail、manifest closure、grant scope/expiry、repair、evidence integrity | `akzio-context` / `akzio-ingest` | context/evidence 窄测 |
@@ -39,15 +39,12 @@ Run from the workspace root with no network access:
 
 ```bash
 cargo metadata --offline --format-version 1 --no-deps
-cargo fmt --all -- --check
-cargo check --workspace --offline
-cargo test -p akzio-store paper_schedule_slot_is_singleton_fenced_and_doctor_checked
-cargo test -p akzio-daemon paper_schedule_recovers_a_reserved_slot_after_leader_takeover
-cargo run -p akzio-cli -- --config /path/to/isolated-akzio.toml run fixture-debug
-cargo run -p akzio-cli -- --config /path/to/isolated-akzio.toml store doctor
+cargo test --offline -p akzio-store workflow_commit_accepts_out_of_order_nodes_and_preserves_dependencies
+cargo test --offline -p akzio-runtime planner_graph_gets_non_bypassable_terminal_gates
+git diff --check
 ```
 
-The isolated config must set `daemon.store_root` to a fresh temporary directory. The two scheduler commands must terminate successfully; a timeout is a failure even if no assertion reports one. The temporary Store Roots are local fixture evidence only.
+历史 R0 基线中的 daemon scheduler 测试命令已不再是当前 Daemon 的可运行入口，故不再用于通过声明。当前 `store_v2::tests::session_slot_is_fenced_and_reuses_the_frozen_workflow` 属于 R2/R8 回归项；它已在 2026-08-11 refresh 中通过，但不构成 R0 或 R8 的完整验收。全 workspace、`fixture-debug` 与 `store doctor` 仍由 R7/R8 修复后在 R10 fresh Store Root 下实际运行。临时 Store Roots 始终只构成本地 fixture 证据。
 
 ## Final offline acceptance
 

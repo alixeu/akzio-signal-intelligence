@@ -15,11 +15,12 @@ use std::{
 use akzio_domain::{
     AgentContract, Artifact, ArtifactId, ArtifactKind, ArtifactLifecycle, ArtifactOrigin,
     ArtifactRef, Asset, AttemptId, BlobRef, CandidatePolicy, ContentHash, DomainError, Evaluation,
-    ExecutionVerdict, Experience, FailureDisposition, LeaseId, OrderReceipt, OrderReceiptState,
-    Outcome, OutcomeExecutionLineage, OutcomeHorizon, OutcomeSchedule, PaperCommitment,
-    PaperReprice, PolicyState, PolicySubject, PolicyTransition, PolicyTransitionId, Reconciliation,
-    RetryPolicy, RunId, RunPurpose, TaskId, TaskRecipeId, TaskStatus, TaskWritePermit,
-    WorkflowGraph, WorkflowNode, WorkflowProposal, WorkflowStatus, REBUILD_SCHEMA_VERSION,
+    ExecutionContext, ExecutionPlan, ExecutionVerdict, Experience, FailureDisposition, LeaseId,
+    OrderReceipt, OrderReceiptState, Outcome, OutcomeExecutionLineage, OutcomeHorizon,
+    OutcomeSchedule, PaperCommitment, PaperReprice, PolicyState, PolicySubject, PolicyTransition,
+    PolicyTransitionId, Reconciliation, RetryPolicy, RunId, RunPurpose, TaskId, TaskRecipeId,
+    TaskStatus, TaskWritePermit, WorkflowGraph, WorkflowNode, WorkflowProposal, WorkflowStatus,
+    REBUILD_SCHEMA_VERSION,
 };
 use chrono::{DateTime, Duration, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
@@ -740,6 +741,20 @@ impl RebuildStore {
             .map_err(Into::into)
     }
 
+    /// Verify that the caller still owns the current, unexpired daemon epoch.
+    /// Broker adapters call this immediately before external Paper I/O.
+    pub fn validate_daemon_lease(
+        &self,
+        lease: &DaemonLease,
+        now: DateTime<Utc>,
+    ) -> RebuildStoreResult<()> {
+        let mut connection = self.connection.lock().expect("store connection poisoned");
+        let transaction = connection.transaction()?;
+        assert_daemon_lease(&transaction, lease, now)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Freeze the exact Paper graph before its Run is installed. A duplicate
     /// session returns the original graph and task IDs without recording the
     /// caller's replacement proposal.
@@ -919,6 +934,13 @@ impl RebuildStore {
         assert_permit(&transaction, &commit.permit)?;
         assert_paper_run(&transaction, &commit.permit.run_id)?;
         assert_origin_matches(commit.commitment.origin.as_ref(), &commit.permit)?;
+        self.validate_execution_commitment_lineage(
+            &transaction,
+            &commit.commitment,
+            &payload,
+            &commit.permit.run_id,
+            &commit.session_key,
+        )?;
         let (_, on_failure) = task_retry_policy(&transaction, &commit.permit.task_id)?;
         let slot = transaction
             .query_row(
@@ -939,6 +961,19 @@ impl RebuildStore {
         }
         if let Some(existing_commitment) = existing_commitment {
             if existing_commitment == commit.commitment.artifact_id.0.as_str() {
+                let existing_artifact = read_artifact(
+                    &transaction,
+                    &ArtifactId(ContentHash::new(existing_commitment)?),
+                )?;
+                let existing_payload: PaperCommitment =
+                    serde_json::from_slice(&self.read_blob(&existing_artifact.blob)?)?;
+                self.validate_execution_commitment_lineage(
+                    &transaction,
+                    &existing_artifact,
+                    &existing_payload,
+                    &commit.permit.run_id,
+                    &commit.session_key,
+                )?;
                 append_event(
                     &transaction,
                     &commit.permit.run_id,
@@ -967,6 +1002,13 @@ impl RebuildStore {
             if existing_artifact.kind == ArtifactKind::ExecutionCommitment {
                 let existing_payload: PaperCommitment =
                     serde_json::from_slice(&self.read_blob(&existing_artifact.blob)?)?;
+                self.validate_execution_commitment_lineage(
+                    &transaction,
+                    &existing_artifact,
+                    &existing_payload,
+                    &commit.permit.run_id,
+                    &commit.session_key,
+                )?;
                 if same_paper_commitment(&existing_payload, &payload) {
                     append_event(
                         &transaction,
@@ -1027,6 +1069,149 @@ impl RebuildStore {
             commitment_artifact_id: commit.commitment.artifact_id.clone(),
             newly_committed: true,
         })
+    }
+
+    fn validate_execution_commitment_lineage(
+        &self,
+        connection: &Connection,
+        commitment_artifact: &Artifact,
+        commitment: &PaperCommitment,
+        run_id: &RunId,
+        session_key: &str,
+    ) -> RebuildStoreResult<()> {
+        let invalid = || RebuildStoreError::InvalidSessionSlot(session_key.to_owned());
+        if commitment_artifact.kind != ArtifactKind::ExecutionCommitment
+            || commitment_artifact.lifecycle != ArtifactLifecycle::Canonical
+            || commitment.broker_session != session_key
+            || commitment_artifact
+                .origin
+                .as_ref()
+                .and_then(|origin| origin.run_id.as_ref())
+                != Some(run_id)
+        {
+            return Err(invalid());
+        }
+
+        let verdict_refs = commitment_artifact
+            .source_refs
+            .iter()
+            .filter(|reference| reference.kind == ArtifactKind::ExecutionVerdict)
+            .cloned()
+            .collect::<Vec<_>>();
+        let context_refs = commitment_artifact
+            .source_refs
+            .iter()
+            .filter(|reference| reference.kind == ArtifactKind::ExecutionContext)
+            .cloned()
+            .collect::<Vec<_>>();
+        if verdict_refs.len() != 1
+            || context_refs.len() != 1
+            || context_refs[0] != commitment.execution_context
+            || !has_exact_source_refs(
+                commitment_artifact,
+                &[verdict_refs[0].clone(), context_refs[0].clone()],
+            )
+        {
+            return Err(invalid());
+        }
+
+        let context_ref = &context_refs[0];
+        let verdict_artifact = read_artifact(connection, &verdict_refs[0].artifact_id)?;
+        if verdict_artifact.kind != ArtifactKind::ExecutionVerdict
+            || verdict_artifact
+                .origin
+                .as_ref()
+                .and_then(|origin| origin.run_id.as_ref())
+                != Some(run_id)
+            || !has_exact_source_refs(&verdict_artifact, std::slice::from_ref(context_ref))
+        {
+            return Err(invalid());
+        }
+        let verdict: ExecutionVerdict =
+            serde_json::from_slice(&self.read_blob(&verdict_artifact.blob)?)?;
+        let ExecutionVerdict::Accepted { execution_context } = verdict else {
+            return Err(invalid());
+        };
+        if execution_context != *context_ref {
+            return Err(invalid());
+        }
+
+        let context_artifact = read_artifact(connection, &context_ref.artifact_id)?;
+        if context_artifact.kind != ArtifactKind::ExecutionContext
+            || context_artifact
+                .origin
+                .as_ref()
+                .and_then(|origin| origin.run_id.as_ref())
+                != Some(run_id)
+        {
+            return Err(invalid());
+        }
+        let context: ExecutionContext =
+            serde_json::from_slice(&self.read_blob(&context_artifact.blob)?)?;
+        context.validate_complete_plan_closure()?;
+        if context.run_id != *run_id
+            || context.broker_session.as_deref() != Some(session_key)
+            || context.plan_hash.as_ref() != Some(&commitment.plan_hash)
+        {
+            return Err(invalid());
+        }
+
+        let context_sources = [
+            context.decision_context.clone(),
+            context.account_snapshot.clone().expect("validated closure"),
+            context.quote_snapshot.clone().expect("validated closure"),
+            context
+                .market_clock_snapshot
+                .clone()
+                .expect("validated closure"),
+            context.execution_plan.clone().expect("validated closure"),
+        ];
+        if !has_exact_source_refs(&context_artifact, &context_sources) {
+            return Err(invalid());
+        }
+
+        let plan_refs = context_artifact
+            .source_refs
+            .iter()
+            .filter(|reference| reference.kind == ArtifactKind::ExecutionPlan)
+            .collect::<Vec<_>>();
+        if plan_refs.len() != 1 {
+            return Err(invalid());
+        }
+        if context.execution_plan.as_ref() != Some(plan_refs[0]) {
+            return Err(invalid());
+        }
+        let plan_artifact = read_artifact(connection, &plan_refs[0].artifact_id)?;
+        if plan_artifact.kind != ArtifactKind::ExecutionPlan
+            || plan_artifact
+                .origin
+                .as_ref()
+                .and_then(|origin| origin.run_id.as_ref())
+                != Some(run_id)
+        {
+            return Err(invalid());
+        }
+        let plan: ExecutionPlan = serde_json::from_slice(&self.read_blob(&plan_artifact.blob)?)?;
+        plan.validate()?;
+        if !has_exact_source_refs(
+            &plan_artifact,
+            &[
+                plan.decision_context.clone(),
+                plan.account_snapshot.clone(),
+                plan.quote_snapshot.clone(),
+                plan.market_clock_snapshot.clone(),
+            ],
+        ) || plan.decision_context != context.decision_context
+            || Some(&plan.account_snapshot) != context.account_snapshot.as_ref()
+            || Some(&plan.quote_snapshot) != context.quote_snapshot.as_ref()
+            || Some(&plan.market_clock_snapshot) != context.market_clock_snapshot.as_ref()
+            || plan.broker_session != session_key
+            || context.plan_hash.as_ref() != Some(&plan.plan_hash)
+            || plan.plan_hash != commitment.plan_hash
+        {
+            return Err(invalid());
+        }
+        Ok(())
     }
 
     /// Return the one durable r0 -> r1 intent for an order in a committed
@@ -1888,6 +2073,39 @@ impl RebuildStore {
         status: TaskStatus,
         now: DateTime<Utc>,
     ) -> RebuildStoreResult<()> {
+        self.validate_attempt_commit(permit, artifacts, status)?;
+        let mut connection = self.connection.lock().expect("store connection poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        commit_attempt_transaction(&transaction, permit, artifacts, status, now)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Atomically persist broker-visible task outputs only while both the
+    /// daemon epoch and task attempt permit remain current.
+    pub fn commit_fenced_attempt(
+        &self,
+        lease: &DaemonLease,
+        permit: &TaskWritePermit,
+        artifacts: &[Artifact],
+        status: TaskStatus,
+        now: DateTime<Utc>,
+    ) -> RebuildStoreResult<()> {
+        self.validate_attempt_commit(permit, artifacts, status)?;
+        let mut connection = self.connection.lock().expect("store connection poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        assert_daemon_lease(&transaction, lease, now)?;
+        commit_attempt_transaction(&transaction, permit, artifacts, status, now)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn validate_attempt_commit(
+        &self,
+        permit: &TaskWritePermit,
+        artifacts: &[Artifact],
+        status: TaskStatus,
+    ) -> RebuildStoreResult<()> {
         if !status.is_terminal() {
             return Err(RebuildStoreError::TaskNotRunnable(permit.task_id.clone()));
         }
@@ -1901,40 +2119,6 @@ impl RebuildStore {
             reject_generic_learning_artifact(artifact)?;
             self.read_blob(&artifact.blob)?;
         }
-
-        let mut connection = self.connection.lock().expect("store connection poisoned");
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        assert_permit(&transaction, permit)?;
-        let (_, on_failure) = task_retry_policy(&transaction, &permit.task_id)?;
-
-        for artifact in artifacts {
-            assert_origin_matches(artifact.origin.as_ref(), permit)?;
-            if std::ptr::eq(artifact, &artifacts[0]) {
-                insert_artifact_batch(&transaction, artifacts)?;
-            }
-            let event_id = append_event(
-                &transaction,
-                &permit.run_id,
-                Some(&permit.task_id),
-                Some(&permit.attempt_id),
-                "artifact.committed",
-                Some(&artifact.artifact_id),
-                now,
-            )?;
-            if status == TaskStatus::Succeeded {
-                record_attempt_output(&transaction, permit, &artifact.artifact_id, event_id)?;
-            }
-        }
-
-        finish_permitted_task(
-            &transaction,
-            permit,
-            status,
-            on_failure,
-            artifacts.last().map(|artifact| &artifact.artifact_id),
-            now,
-        )?;
-        transaction.commit()?;
         Ok(())
     }
 
@@ -3204,21 +3388,18 @@ impl RebuildStore {
                     let payload: PaperCommitment =
                         serde_json::from_slice(&self.read_blob(&commitment_artifact.blob)?)?;
                     payload.validate()?;
-                    if payload.broker_session != session_key
-                        || !commitment_artifact
-                            .source_refs
-                            .iter()
-                            .any(|source| source == &payload.execution_context)
-                        || commitment_artifact
-                            .origin
-                            .as_ref()
-                            .and_then(|origin| origin.run_id.as_ref())
-                            != Some(&RunId(run_id.clone()))
-                    {
-                        return Err(RebuildStoreError::Integrity(format!(
-                            "session slot {session_key} commitment provenance is invalid"
-                        )));
-                    }
+                    self.validate_execution_commitment_lineage(
+                        &connection,
+                        &commitment_artifact,
+                        &payload,
+                        &RunId(run_id.clone()),
+                        &session_key,
+                    )
+                    .map_err(|error| {
+                        RebuildStoreError::Integrity(format!(
+                            "session slot {session_key} commitment lineage is invalid: {error}"
+                        ))
+                    })?;
                     parse_time(&committed_at)?;
                 }
             }
@@ -4773,6 +4954,46 @@ fn task_retry_policy(
     Ok((serde_json::from_str(&retry_json)?, parse_enum(&on_failure)?))
 }
 
+fn commit_attempt_transaction(
+    transaction: &Transaction<'_>,
+    permit: &TaskWritePermit,
+    artifacts: &[Artifact],
+    status: TaskStatus,
+    now: DateTime<Utc>,
+) -> RebuildStoreResult<()> {
+    assert_permit(transaction, permit)?;
+    let (_, on_failure) = task_retry_policy(transaction, &permit.task_id)?;
+    for artifact in artifacts {
+        assert_origin_matches(artifact.origin.as_ref(), permit)?;
+    }
+    if !artifacts.is_empty() {
+        insert_artifact_batch(transaction, artifacts)?;
+    }
+    for artifact in artifacts {
+        let event_id = append_event(
+            transaction,
+            &permit.run_id,
+            Some(&permit.task_id),
+            Some(&permit.attempt_id),
+            "artifact.committed",
+            Some(&artifact.artifact_id),
+            now,
+        )?;
+        if status == TaskStatus::Succeeded {
+            record_attempt_output(transaction, permit, &artifact.artifact_id, event_id)?;
+        }
+    }
+    finish_permitted_task(
+        transaction,
+        permit,
+        status,
+        on_failure,
+        artifacts.last().map(|artifact| &artifact.artifact_id),
+        now,
+    )?;
+    Ok(())
+}
+
 fn finish_permitted_task(
     transaction: &Transaction<'_>,
     permit: &TaskWritePermit,
@@ -5976,8 +6197,10 @@ fn parse_task_status(value: &str) -> RebuildStoreResult<TaskStatus> {
 #[cfg(test)]
 mod tests {
     use akzio_domain::{
-        ArtifactLifecycle, ArtifactProvenance, Asset, FailureDisposition, PaperCommitment,
-        PaperCommitmentId, RetryPolicy, TaskBudget, TaskRecipeId, WorkflowProposalTask,
+        ArtifactLifecycle, ArtifactProvenance, Asset, ExecutionPlan, FactorExposure,
+        FailureDisposition, HardBlocker, MoneyMicros, NoOrder, OrderIntent, OrderSide,
+        PaperCommitment, PaperCommitmentId, RetryPolicy, TargetPortfolio, TaskBudget, TaskRecipeId,
+        WeightPpm, WorkflowProposalTask,
     };
     use tempfile::tempdir;
 
@@ -6091,6 +6314,210 @@ mod tests {
         ArtifactRef {
             artifact_id: artifact.artifact_id.clone(),
             kind: artifact.kind,
+        }
+    }
+
+    fn valid_execution_commitment(
+        store: &RebuildStore,
+        permit: &TaskWritePermit,
+        session_key: &str,
+        now: DateTime<Utc>,
+    ) -> Artifact {
+        let source = |kind, name: &'static [u8]| {
+            let artifact = permit_artifact(
+                store,
+                permit,
+                kind,
+                &serde_json::json!({"fixture": String::from_utf8_lossy(name)}),
+                vec![],
+                ArtifactLifecycle::RunScoped,
+                now,
+            );
+            store
+                .write_task_artifact(permit, &artifact, "fixture.source.created", now)
+                .unwrap();
+            artifact_ref(&artifact)
+        };
+        let decision_context = source(ArtifactKind::DecisionContext, b"decision-context");
+        let account_snapshot = source(ArtifactKind::NormalizedEvidence, b"account");
+        let quote_snapshot = source(ArtifactKind::NormalizedEvidence, b"quote");
+        let market_clock_snapshot = source(ArtifactKind::NormalizedEvidence, b"market-clock");
+
+        let mut target = TargetPortfolio::zeroed();
+        target.weights.insert(Asset::Qqq, WeightPpm(100_000));
+        let mut plan_payload = ExecutionPlan {
+            schema_version: REBUILD_SCHEMA_VERSION,
+            decision_context: decision_context.clone(),
+            account_snapshot: account_snapshot.clone(),
+            quote_snapshot: quote_snapshot.clone(),
+            market_clock_snapshot: market_clock_snapshot.clone(),
+            policy_hash: ContentHash::of_bytes(b"fixture-policy"),
+            target: target.clone(),
+            orders: vec![OrderIntent {
+                asset: Asset::Qqq,
+                side: OrderSide::Buy,
+                notional: MoneyMicros::from_usd_cents(10_000),
+                limit_price: MoneyMicros::from_usd_cents(5_000),
+            }],
+            gross_exposure_ppm: 100_000,
+            net_exposure_ppm: 100_000,
+            factor_exposure: FactorExposure::from_target(&target).unwrap(),
+            turnover_ppm: 100_000,
+            broker_session: session_key.to_owned(),
+            created_at: now,
+            plan_hash: ContentHash::of_bytes(b"pending"),
+        };
+        plan_payload.refresh_hash().unwrap();
+        let plan_hash = plan_payload.plan_hash.clone();
+        let plan = permit_artifact(
+            store,
+            permit,
+            ArtifactKind::ExecutionPlan,
+            &plan_payload,
+            vec![
+                decision_context.clone(),
+                account_snapshot.clone(),
+                quote_snapshot.clone(),
+                market_clock_snapshot.clone(),
+            ],
+            ArtifactLifecycle::RunScoped,
+            now,
+        );
+        store
+            .write_task_artifact(permit, &plan, "execution.plan.created", now)
+            .unwrap();
+        let plan_ref = artifact_ref(&plan);
+        let context = permit_artifact(
+            store,
+            permit,
+            ArtifactKind::ExecutionContext,
+            &ExecutionContext {
+                schema_version: REBUILD_SCHEMA_VERSION,
+                run_id: permit.run_id.clone(),
+                decision_context: decision_context.clone(),
+                account_snapshot: Some(account_snapshot.clone()),
+                quote_snapshot: Some(quote_snapshot.clone()),
+                market_clock_snapshot: Some(market_clock_snapshot.clone()),
+                execution_plan: Some(plan_ref.clone()),
+                factor_exposure: Some(plan_payload.factor_exposure.clone()),
+                turnover_ppm: Some(plan_payload.turnover_ppm),
+                plan_hash: Some(plan_hash.clone()),
+                broker_session: Some(session_key.to_owned()),
+                frozen: false,
+                created_at: now,
+            },
+            vec![
+                decision_context,
+                account_snapshot,
+                quote_snapshot,
+                market_clock_snapshot,
+                plan_ref,
+            ],
+            ArtifactLifecycle::RunScoped,
+            now,
+        );
+        store
+            .write_task_artifact(permit, &context, "execution.context.created", now)
+            .unwrap();
+        let context_ref = artifact_ref(&context);
+        let verdict = permit_artifact(
+            store,
+            permit,
+            ArtifactKind::ExecutionVerdict,
+            &ExecutionVerdict::Accepted {
+                execution_context: context_ref.clone(),
+            },
+            vec![context_ref.clone()],
+            ArtifactLifecycle::RunScoped,
+            now,
+        );
+        store
+            .write_task_artifact(permit, &verdict, "execution.verdict.created", now)
+            .unwrap();
+        permit_artifact(
+            store,
+            permit,
+            ArtifactKind::ExecutionCommitment,
+            &PaperCommitment {
+                commitment_id: PaperCommitmentId::new(),
+                execution_context: context_ref.clone(),
+                plan_hash,
+                broker_session: session_key.to_owned(),
+                client_order_ids: std::collections::BTreeMap::from([(
+                    Asset::Qqq,
+                    "fixture-order".to_owned(),
+                )]),
+                created_at: now,
+            },
+            vec![artifact_ref(&verdict), context_ref],
+            ArtifactLifecycle::Canonical,
+            now,
+        )
+    }
+
+    struct ExecutionCommitFixture {
+        _root: tempfile::TempDir,
+        store: RebuildStore,
+        lease: DaemonLease,
+        permit: TaskWritePermit,
+        commitment: Artifact,
+        now: DateTime<Utc>,
+    }
+
+    fn execution_commit_fixture() -> ExecutionCommitFixture {
+        let root = tempdir().unwrap();
+        let store = RebuildStore::open(root.path()).unwrap();
+        let now = Utc::now();
+        let lease = store
+            .acquire_daemon_lease(
+                "scheduler",
+                "fixture-daemon",
+                now,
+                now + Duration::seconds(30),
+            )
+            .unwrap()
+            .unwrap();
+        let graph = graph();
+        let graph_artifact = artifact(
+            &store,
+            ArtifactKind::WorkflowGraph,
+            &serde_json::to_string(&graph).unwrap(),
+            None,
+        );
+        let reservation = store
+            .reserve_session_slot(
+                &lease,
+                &SessionReservation {
+                    session_key: "paper:fixture".to_owned(),
+                    workflow: WorkflowCommit {
+                        run: RebuildRun {
+                            run_id: RunId::new(),
+                            purpose: RunPurpose::Paper,
+                            topology_id: graph.topology_id.clone(),
+                            graph_artifact_id: graph_artifact.artifact_id.clone(),
+                            created_at: now,
+                        },
+                        graph: graph_artifact,
+                        nodes: graph.nodes,
+                    },
+                    reserved_at: now,
+                },
+            )
+            .unwrap();
+        store.commit_workflow(&reservation.slot.workflow).unwrap();
+        let permit = store
+            .claim_next_task("fixture-worker", now, Duration::seconds(30))
+            .unwrap()
+            .unwrap()
+            .permit;
+        let commitment = valid_execution_commitment(&store, &permit, "paper:fixture", now);
+        ExecutionCommitFixture {
+            _root: root,
+            store,
+            lease,
+            permit,
+            commitment,
+            now,
         }
     }
 
@@ -7355,6 +7782,340 @@ mod tests {
     }
 
     #[test]
+    fn execution_commitment_lineage_fails_closed() {
+        let fixture = execution_commit_fixture();
+        let mut commitment = fixture.commitment.clone();
+        commitment.lifecycle = ArtifactLifecycle::RunScoped;
+        assert!(fixture
+            .store
+            .commit_execution(
+                &fixture.lease,
+                &ExecutionCommit {
+                    session_key: "paper:fixture".to_owned(),
+                    permit: fixture.permit.clone(),
+                    commitment,
+                    committed_at: fixture.now,
+                },
+            )
+            .is_err());
+
+        let fixture = execution_commit_fixture();
+        let mut commitment = fixture.commitment.clone();
+        commitment
+            .source_refs
+            .retain(|source| source.kind != ArtifactKind::ExecutionVerdict);
+        assert!(fixture
+            .store
+            .commit_execution(
+                &fixture.lease,
+                &ExecutionCommit {
+                    session_key: "paper:fixture".to_owned(),
+                    permit: fixture.permit.clone(),
+                    commitment,
+                    committed_at: fixture.now,
+                },
+            )
+            .is_err());
+
+        let fixture = execution_commit_fixture();
+        let mut commitment = fixture.commitment.clone();
+        let verdict = commitment
+            .source_refs
+            .iter()
+            .find(|source| source.kind == ArtifactKind::ExecutionVerdict)
+            .unwrap()
+            .clone();
+        commitment.source_refs.push(verdict);
+        assert!(fixture
+            .store
+            .commit_execution(
+                &fixture.lease,
+                &ExecutionCommit {
+                    session_key: "paper:fixture".to_owned(),
+                    permit: fixture.permit.clone(),
+                    commitment,
+                    committed_at: fixture.now,
+                },
+            )
+            .is_err());
+
+        let fixture = execution_commit_fixture();
+        let mut commitment = fixture.commitment.clone();
+        let context = commitment
+            .source_refs
+            .iter()
+            .find(|source| source.kind == ArtifactKind::ExecutionContext)
+            .unwrap()
+            .clone();
+        let no_order = permit_artifact(
+            &fixture.store,
+            &fixture.permit,
+            ArtifactKind::ExecutionVerdict,
+            &ExecutionVerdict::NoOrder {
+                no_order: NoOrder {
+                    execution_context: context.clone(),
+                    blockers: vec![HardBlocker::Frozen],
+                    created_at: fixture.now,
+                },
+            },
+            vec![context.clone()],
+            ArtifactLifecycle::RunScoped,
+            fixture.now,
+        );
+        fixture
+            .store
+            .write_task_artifact(
+                &fixture.permit,
+                &no_order,
+                "execution.verdict.no_order",
+                fixture.now,
+            )
+            .unwrap();
+        commitment.source_refs = vec![artifact_ref(&no_order), context];
+        assert!(fixture
+            .store
+            .commit_execution(
+                &fixture.lease,
+                &ExecutionCommit {
+                    session_key: "paper:fixture".to_owned(),
+                    permit: fixture.permit.clone(),
+                    commitment,
+                    committed_at: fixture.now,
+                },
+            )
+            .is_err());
+
+        let fixture = execution_commit_fixture();
+        let mut commitment = fixture.commitment.clone();
+        let context_index = commitment
+            .source_refs
+            .iter()
+            .position(|source| source.kind == ArtifactKind::ExecutionContext)
+            .unwrap();
+        commitment.source_refs[context_index] = ArtifactRef {
+            artifact_id: ArtifactId(ContentHash::of_bytes(b"wrong-context")),
+            kind: ArtifactKind::ExecutionContext,
+        };
+        assert!(fixture
+            .store
+            .commit_execution(
+                &fixture.lease,
+                &ExecutionCommit {
+                    session_key: "paper:fixture".to_owned(),
+                    permit: fixture.permit.clone(),
+                    commitment,
+                    committed_at: fixture.now,
+                },
+            )
+            .is_err());
+
+        let fixture = execution_commit_fixture();
+        let context_ref = fixture
+            .commitment
+            .source_refs
+            .iter()
+            .find(|source| source.kind == ArtifactKind::ExecutionContext)
+            .unwrap();
+        let context = fixture.store.artifact(&context_ref.artifact_id).unwrap();
+        let plan_ref = context
+            .source_refs
+            .iter()
+            .find(|source| source.kind == ArtifactKind::ExecutionPlan)
+            .unwrap();
+        let wrong_plan = fixture
+            .store
+            .put_json(&serde_json::json!({
+                "plan_hash": ContentHash::of_bytes(b"wrong-plan")
+            }))
+            .unwrap();
+        fixture
+            .store
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE rebuild_artifacts SET blob_hash = ?1, media_type = ?2, bytes = ?3 WHERE artifact_id = ?4",
+                params![
+                    wrong_plan.hash.as_str(),
+                    wrong_plan.media_type,
+                    wrong_plan.bytes,
+                    plan_ref.artifact_id.0.as_str(),
+                ],
+            )
+            .unwrap();
+        assert!(fixture
+            .store
+            .commit_execution(
+                &fixture.lease,
+                &ExecutionCommit {
+                    session_key: "paper:fixture".to_owned(),
+                    permit: fixture.permit.clone(),
+                    commitment: fixture.commitment,
+                    committed_at: fixture.now,
+                },
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn daemon_lease_validation_and_fenced_attempt_fail_closed() {
+        let fixture = execution_commit_fixture();
+        fixture
+            .store
+            .validate_daemon_lease(&fixture.lease, fixture.now)
+            .unwrap();
+        let successor_now = fixture.now + Duration::seconds(31);
+        let successor = fixture
+            .store
+            .acquire_daemon_lease(
+                "scheduler",
+                "successor",
+                successor_now,
+                successor_now + Duration::seconds(30),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            fixture
+                .store
+                .validate_daemon_lease(&fixture.lease, successor_now),
+            Err(RebuildStoreError::SchedulerFenced(_))
+        ));
+        fixture
+            .store
+            .validate_daemon_lease(&successor, successor_now)
+            .unwrap();
+
+        let receipt = permit_artifact(
+            &fixture.store,
+            &fixture.permit,
+            ArtifactKind::OrderReceipt,
+            &serde_json::json!({"receipt": true}),
+            vec![],
+            ArtifactLifecycle::Canonical,
+            successor_now,
+        );
+        assert!(matches!(
+            fixture.store.commit_fenced_attempt(
+                &fixture.lease,
+                &fixture.permit,
+                std::slice::from_ref(&receipt),
+                TaskStatus::Succeeded,
+                successor_now,
+            ),
+            Err(RebuildStoreError::SchedulerFenced(_))
+        ));
+        assert!(matches!(
+            fixture.store.artifact(&receipt.artifact_id),
+            Err(RebuildStoreError::MissingArtifact(_))
+        ));
+        fixture.store.validate_task_permit(&fixture.permit).unwrap();
+
+        fixture
+            .store
+            .commit_fenced_attempt(
+                &successor,
+                &fixture.permit,
+                std::slice::from_ref(&receipt),
+                TaskStatus::Succeeded,
+                successor_now,
+            )
+            .unwrap();
+        assert_eq!(
+            fixture.store.artifact(&receipt.artifact_id).unwrap().kind,
+            ArtifactKind::OrderReceipt
+        );
+    }
+
+    #[test]
+    fn doctor_rejects_corrupt_execution_lineage() {
+        let fixture = execution_commit_fixture();
+        let payload: PaperCommitment =
+            serde_json::from_slice(&fixture.store.read_blob(&fixture.commitment.blob).unwrap())
+                .unwrap();
+        let context = fixture
+            .commitment
+            .source_refs
+            .iter()
+            .find(|source| source.kind == ArtifactKind::ExecutionContext)
+            .unwrap()
+            .clone();
+        let invalid = permit_artifact(
+            &fixture.store,
+            &fixture.permit,
+            ArtifactKind::ExecutionCommitment,
+            &payload,
+            vec![context],
+            ArtifactLifecycle::Canonical,
+            fixture.now,
+        );
+        {
+            let mut connection = fixture.store.connection.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            insert_artifact(&transaction, &invalid).unwrap();
+            transaction
+                .execute(
+                    "UPDATE rebuild_session_slots SET commitment_artifact_id = ?1, committed_at = ?2 WHERE session_key = ?3",
+                    params![
+                        invalid.artifact_id.0.as_str(),
+                        fixture.now.to_rfc3339(),
+                        "paper:fixture",
+                    ],
+                )
+                .unwrap();
+            transaction.commit().unwrap();
+        }
+        let error = fixture.store.verify_integrity().unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                RebuildStoreError::Integrity(message)
+                    if message.contains("commitment lineage is invalid")
+            ),
+            "{error}"
+        );
+
+        let fixture = execution_commit_fixture();
+        let payload: PaperCommitment =
+            serde_json::from_slice(&fixture.store.read_blob(&fixture.commitment.blob).unwrap())
+                .unwrap();
+        let invalid = permit_artifact(
+            &fixture.store,
+            &fixture.permit,
+            ArtifactKind::ExecutionCommitment,
+            &payload,
+            fixture.commitment.source_refs.clone(),
+            ArtifactLifecycle::RunScoped,
+            fixture.now,
+        );
+        {
+            let mut connection = fixture.store.connection.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            insert_artifact(&transaction, &invalid).unwrap();
+            transaction
+                .execute(
+                    "UPDATE rebuild_session_slots SET commitment_artifact_id = ?1, committed_at = ?2 WHERE session_key = ?3",
+                    params![
+                        invalid.artifact_id.0.as_str(),
+                        fixture.now.to_rfc3339(),
+                        "paper:fixture",
+                    ],
+                )
+                .unwrap();
+            transaction.commit().unwrap();
+        }
+        let error = fixture.store.verify_integrity().unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                RebuildStoreError::Integrity(message)
+                    if message.contains("commitment lineage is invalid")
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn session_slot_is_fenced_and_reuses_the_frozen_workflow() {
         let root = tempdir().unwrap();
         let store = RebuildStore::open(root.path()).unwrap();
@@ -7438,63 +8199,8 @@ mod tests {
             .claim_next_task("execution-worker", now, Duration::seconds(30))
             .unwrap()
             .unwrap();
-        let execution_context = artifact(
-            &store,
-            ArtifactKind::ExecutionContext,
-            "execution-context",
-            Some(ArtifactOrigin {
-                run_id: Some(claimed.permit.run_id.clone()),
-                task_id: Some(claimed.permit.task_id.clone()),
-                attempt_id: Some(claimed.permit.attempt_id.clone()),
-                contract_hash: claimed.permit.contract_hash.clone(),
-            }),
-        );
-        store
-            .write_task_artifact(
-                &claimed.permit,
-                &execution_context,
-                "execution.context.created",
-                now,
-            )
-            .unwrap();
-        let execution_context_ref = ArtifactRef {
-            artifact_id: execution_context.artifact_id.clone(),
-            kind: ArtifactKind::ExecutionContext,
-        };
-        let payload = PaperCommitment {
-            commitment_id: PaperCommitmentId::new(),
-            execution_context: execution_context_ref.clone(),
-            plan_hash: ContentHash::of_bytes(b"fixture-plan"),
-            broker_session: "paper:fixture-a".to_owned(),
-            client_order_ids: std::collections::BTreeMap::from([(
-                Asset::Qqq,
-                "fixture-order".to_owned(),
-            )]),
-            created_at: now,
-        };
-        let commitment = Artifact::new(
-            ArtifactKind::ExecutionCommitment,
-            store.put_json(&payload).unwrap(),
-            "akzio.execution.fixture",
-            ArtifactLifecycle::RunScoped,
-            ArtifactProvenance {
-                source_family: "akzio.execution".to_owned(),
-                observed_at: None,
-                retrieved_at: now,
-                source_uri: None,
-                confidence_ppm: 1_000_000,
-                producer_contract_hash: None,
-            },
-            Some(ArtifactOrigin {
-                run_id: Some(claimed.permit.run_id.clone()),
-                task_id: Some(claimed.permit.task_id.clone()),
-                attempt_id: Some(claimed.permit.attempt_id.clone()),
-                contract_hash: claimed.permit.contract_hash.clone(),
-            }),
-            vec![execution_context_ref],
-            now,
-        )
-        .unwrap();
+        let commitment =
+            valid_execution_commitment(&store, &claimed.permit, "paper:fixture-a", now);
         {
             let connection = store.connection.lock().unwrap();
             connection

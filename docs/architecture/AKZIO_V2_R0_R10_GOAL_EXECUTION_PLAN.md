@@ -1,9 +1,9 @@
 # Akzio v2 R0–R10 Goal 执行计划
 
-日期：2026-08-10
+日期：2026-08-11
 
-状态：**R0–R6 complete / R7 ready**
-适用 checkout：`codex/akzio-v2-max-refactor`，R6 阶段快照（基线 HEAD `faf493c8ba40e0c839ab221d8435757db1a319f6`）
+状态：**R0 verified / R1–R3 narrow regression verified / R4 durable catalogue lifecycle pending / R5 core verified, event-reducer replay pending / R6 complete pending final R10 review / R7 in progress**
+适用 checkout：当前 workspace；`faf493c8ba40e0c839ab221d8435757db1a319f6` 仅是历史 R6 阶段快照，不是当前基线。
 
 ## 1. Goal objective
 
@@ -20,7 +20,7 @@
 - 唯一业务控制面为 loopback HTTP + SSE；删除 Unix JSON-line 业务协议；
 - R10 完成完整验证和删除清单后，Goal 才可标记 complete。
 
-本文件是当前 active Goal 的执行记录。R0–R6 已按顺序实现并重新认证；只有阶段 exit gate 的当前源码、测试和运行证据才能推进状态，不能仅凭 commit message 或历史描述快进。
+本文件是当前 active Goal 的执行记录。阶段状态以本文件第 9 节和当前源码、测试、运行证据为准；历史快照不能替代当前 regression 认证，也不能仅凭 commit message 或历史描述快进。
 
 ## 2. Source of truth 与冲突优先级
 
@@ -37,7 +37,9 @@
 
 ## 3. 当前事实基线
 
-### 3.0 R6 完成快照（2026-08-10）
+### 3.0 R6 历史完成快照（2026-08-10，已失效）
+
+> 此节保留当时的审计记录，不描述当前 tree 或当前阶段状态；以第 9 节的 refresh 状态和本轮命令结果为准。
 
 - 分支：`codex/akzio-v2-max-refactor`；R6 基线 HEAD：`faf493c8ba40e0c839ab221d8435757db1a319f6`。
 - R0–R5 已完成差分回归，不需要返工；R6 的 Domain/Store/Context/Learning/Execution 改动未削弱前置 invariant。
@@ -124,7 +126,7 @@
 
 - `cargo check --workspace --offline`：通过，有 warning；
 - `cargo clippy --workspace --all-targets --offline`：退出码 0，但有 14 个唯一 warning；
-- `cargo fmt --all -- --check`：失败，差异只在五个 `rebuild.rs` 原型；
+- `cargo fmt --all -- --check`：失败，差异在当时的 cross-crate `rebuild.rs` 原型集合；该历史 inventory 已失效，不可用于描述当前 tree；
 - 78 个测试已确认通过；
 - 2 个 scheduler 测试确定性死锁：
   - Store：`paper_schedule_slot_is_singleton_fenced_and_doctor_checked`；
@@ -134,7 +136,7 @@
 
 ### 3.7 2026-08-09 历史架构差距（已失效）
 
-- 五个 `rebuild.rs` 仅被公开 re-export，active Daemon/CLI/Execution 没有消费其新 runtime；
+- 历史 snapshot 中的 cross-crate `rebuild.rs` 原型仅被公开 re-export，active Daemon/CLI/Execution 没有消费其新 runtime；该描述已失效，当前 tree 不再保留该集合；
 - active path 仍存在固定 `AgentRole`、`PlannedResearchRole`、Phase-like `TaskKind` 和旧 `WorkflowCompiler`；
 - workflow install、attempt completion、artifact 和 event 仍存在 split transaction crash window；
 - `register_document` 不验证 attempt/lease/epoch/contract permit；
@@ -145,6 +147,14 @@
 - execution commitment 不携带 daemon lease/epoch；
 - Daemon 同时保留 HTTP/SSE 与 Unix JSON-line；CLI 仍使用 `UnixStream`；
 - 没有完整进程级 crash/recovery、multi-run、atomic failure-injection 和 canonicality E2E harness。
+
+### 3.8 2026-08-11 R0–R5 复核 checkpoint
+
+- 仅使用本地 workspace 与离线依赖，已通过 `cargo metadata --offline --format-version 1 --no-deps`、`git diff --check`、两个 Store 窄测（含 frozen session-slot / epoch fencing）、Runtime terminal-gate 窄测，以及 R1–R5 owner crates 的 `132 passed` 窄回归；这些都是 fixture、静态或本地测试证据，不是市场、broker 或真实 Paper 验证。
+- R0 的 invariants、删除图、测试矩阵与当前静态 inventory 一致；R1 Domain、R2 V2Store、R3 Context/Evidence 的本轮受影响面已通过窄回归，无需在后续每个阶段重复回看。
+- R4 仍缺 Store-owned、可重启查询的 Candidate/Active Contract 安装与激活历史；当前 `RebuildContractCatalogue` 只在进程内维护索引并写 bootstrap Contract artifact。
+- R5 的 lowering、gate、patch、retry/cancel 与 crash-reclaim 已有测试；`replay_revision` 仍只是读取并重验 durable revision，不是从 durable event/task history 重建并比对 snapshot 的 reducer。
+- 因此下一实现顺序固定为补齐 R4 durable catalogue lifecycle，再补齐 R5 deterministic event replay；R0–R3 不再逐阶段重审，R0–R10 完成后执行一次整体终局复核。
 
 ## 4. 从官方网站吸收的原则
 
@@ -714,7 +724,7 @@ Entry gate：逐项结果
 
 **Current-state focus（2026-08-10）**
 
-- 当前尚无覆盖全部强制场景的进程级 harness，且 legacy modules、五个 `rebuild.rs`、旧 vocabulary 与兼容文字仍存在；R10 负责最终吸收和删除，不提前删除仍被 active consumer 使用的实现；
+- 当前尚无覆盖全部强制场景的进程级 harness，且 legacy modules、剩余 `crates/akzio-learning/src/rebuild.rs`、旧 vocabulary 与兼容文字仍需清理；R10 负责最终吸收和删除，不提前删除仍被 active consumer 使用的实现；
 - 全套验证必须在离线、fresh 临时 Store Root 下实际终止；Daemon 卡住按失败或阻塞记录，不能用局部测试替代；
 - 只有 legacy inventory、完整验证矩阵和 fixture/debug/dry-run 证据分类全部满足，才允许将整个 Goal 标记 complete。
 
@@ -731,7 +741,7 @@ Entry gate：逐项结果
 
 **Deletions**
 
-- 五个临时 `rebuild.rs`；
+- 剩余 compatibility-named implementation（当前为 `crates/akzio-learning/src/rebuild.rs`）；
 - 被替换的 monolithic active implementation；
 - v1/Phase/FileStore/Unix 代码和过时文档；
 - dead adapters、features、dependencies、legacy output assumptions。
@@ -809,18 +819,18 @@ cargo run --offline -p akzio-cli -- store doctor
 
 ## 9. Goal 进度表
 
-阶段状态只由当前 exit gate 证据推进。R0–R6 已完成；R7 是下一阶段。
+阶段状态只由当前 exit gate 证据推进。下表 supersedes 所有“R0–R6 已完成 / R7 ready”的历史描述。
 
 | 阶段 | 当前状态 | 进入条件 | 完成证据 |
 | --- | --- | --- | --- |
-| R0 | complete | 已完成 | invariants/test/deletion docs 与当前离线基线已重新认证 |
-| R1 | complete | R0 complete | Domain v7、四资产、canonicality、authority 与下游编译边界通过 |
-| R2 | complete | R1 complete | CAS、atomic/fencing/cursor/Doctor/OutcomeSchedule closure；Store 35 tests |
-| R3 | complete | R2 complete | Manifest/Grant/repair/source closure 与 policy influence 越权拒绝；Context 14 tests |
-| R4 | complete | R3 complete | Contract Catalogue、AgentRuntime、budget/tool grant 与 capability ceiling 通过 |
-| R5 | complete | R4 complete | DAG/Task/recovery/replay 与 mandatory terminal owner-dispatch 边界通过 |
-| R6 | complete | R5 complete | sealed Outcome/Shadow/canary/no-op cursor/noncanonical tests；workspace 170 tests、fixture/Doctor 通过 |
-| R7 | ready / audit in progress | R6 complete | Decision/Execution/Paper owner tests；typed dispatch surface 可供 Daemon 接入 |
+| R0 | verified | 本地架构输入与 checkout 已复核 | invariants/test/deletion docs、inventory 与当前窄基线一致 |
+| R1 | narrow regression verified | R0 verified | Domain v7、四资产、canonicality、authority 窄测通过；全量最终回归留给 R10 |
+| R2 | narrow regression verified | R1 verified | CAS、atomic/fencing/cursor/Doctor/OutcomeSchedule closure 窄测通过；全量最终回归留给 R10 |
+| R3 | narrow regression verified | R2 verified | Manifest/Grant/repair/source closure、policy influence 越权拒绝和 typed governed evidence adapters 窄测通过 |
+| R4 | lifecycle pending | R3 verified | Contract Catalogue、AgentRuntime、budget/tool grant 与 capability ceiling 已有窄测；仍缺 durable Candidate/Active 安装与激活历史 |
+| R5 | core verified / replay pending | R4 lifecycle complete | DAG/Task/recovery 核心已通过窄测；deterministic event reducer 仍待实现与认证 |
+| R6 | complete | R5 核心完成 | sealed Outcome/Shadow/canary/no-op cursor/noncanonical owner surface 已完成；全量 regression 不得凭历史快照宣称 |
+| R7 | in progress | R6 complete | Decision/Execution/Paper owner tests 与 current-tree 编译/集成修复 |
 | R8 | partial | R7 complete | Daemon 接通全部 terminal owner runtime；scheduler、crash/concurrency、epoch fencing、HTTP/SSE、freeze tests；Unix path 不再 active |
 | R9 | not started | R8 complete | HTTP-only CLI/config/help/incompatibility tests |
 | R10 | not started | R9 complete | full offline matrix、fixture harness 和 deletion inventory |

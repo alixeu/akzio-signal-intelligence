@@ -20,7 +20,7 @@ use crate::{
 
 /// A Store Root with this schema is intentionally incompatible with the previous
 /// v2 database. It is a rebuild, not a migration layer.
-pub const REBUILD_SCHEMA_VERSION: u32 = 7;
+pub const REBUILD_SCHEMA_VERSION: u32 = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]

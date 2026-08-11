@@ -40,7 +40,9 @@ pub enum DomainError {
     InvalidTargetUniverse,
     #[error("decision confidence must be at most one million ppm")]
     InvalidDecisionConfidence,
-    #[error("decision forecasts must cover 1, 3, and 5 trading days exactly")]
+    #[error(
+        "decision forecasts must cover every executable asset at 1, 3, and 5 trading days exactly"
+    )]
     InvalidDecisionForecastHorizons,
     #[error("decision forecast probability must be at most one million ppm")]
     InvalidDecisionForecastProbability,
@@ -50,6 +52,8 @@ pub enum DomainError {
     RawEvidenceDirectContext,
     #[error("Paper reprice must be the single deterministic r0 to r1 lineage")]
     InvalidRepriceLineage,
+    #[error("execution plan hash does not match its payload")]
+    ExecutionPlanHashMismatch,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]

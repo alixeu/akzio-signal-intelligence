@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     artifact::{ArtifactKind, ArtifactRef},
-    DecisionId, DomainError, RunId, TargetPortfolio, V2_DOMAIN_SCHEMA_VERSION,
+    Asset, ContentHash, DecisionId, DomainError, RunId, TargetPortfolio, V2_DOMAIN_SCHEMA_VERSION,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -78,6 +78,9 @@ pub struct DecisionContext {
     pub material_conflicts: Vec<MaterialConflict>,
     pub hard_blockers: Vec<HardBlocker>,
     pub soft_warnings: Vec<SoftWarning>,
+    /// Hash of the Rust-owned policy that converted model forecasts into the
+    /// target portfolio. The model never supplies this value.
+    pub decision_policy_hash: ContentHash,
     pub target: TargetPortfolio,
     pub created_at: DateTime<Utc>,
 }
@@ -145,6 +148,7 @@ pub enum DecisionHorizon {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Forecast {
+    pub asset: Asset,
     pub horizon: DecisionHorizon,
     pub positive_return_probability_ppm: u32,
     pub expected_return_ppm: i64,
@@ -164,12 +168,12 @@ impl Forecast {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DecisionDraft {
     pub summary: String,
-    pub targets: TargetPortfolio,
     pub confidence_ppm: u32,
     pub forecasts: Vec<Forecast>,
     pub claims: Vec<ArtifactRef>,
     pub critiques: Vec<ArtifactRef>,
     pub evidence: Vec<ArtifactRef>,
+    pub material_conflicts: Vec<MaterialConflict>,
     pub hard_blockers: Vec<HardBlocker>,
     pub soft_warnings: Vec<SoftWarning>,
 }
@@ -208,24 +212,84 @@ impl DecisionDraft {
                 field: "decision_draft.claims_or_blockers",
             });
         }
-        let mut horizons = [false; 3];
-        for forecast in &self.forecasts {
-            forecast.validate()?;
-            let index = match forecast.horizon {
-                DecisionHorizon::T1 => 0,
-                DecisionHorizon::T3 => 1,
-                DecisionHorizon::T5 => 2,
-            };
-            if horizons[index] {
-                return Err(DomainError::InvalidDecisionForecastHorizons);
+        for conflict in &self.material_conflicts {
+            conflict.validate()?;
+            if !self.claims.contains(&conflict.claim)
+                || !self.critiques.contains(&conflict.critique)
+            {
+                return Err(DomainError::EmptyField {
+                    field: "decision_draft.material_conflicts",
+                });
             }
-            horizons[index] = true;
         }
-        if !horizons.into_iter().all(|present| present) {
-            return Err(DomainError::InvalidDecisionForecastHorizons);
+        validate_forecasts(&self.forecasts)
+    }
+}
+
+/// Rust-bound decision. It carries no execution authority; the referenced
+/// `DecisionContext` is the complete provenance and blocker surface.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Decision {
+    pub schema_version: u32,
+    pub decision_context: ArtifactRef,
+    pub summary: String,
+    pub targets: TargetPortfolio,
+    pub confidence_ppm: u32,
+    pub forecasts: Vec<Forecast>,
+    pub created_at: DateTime<Utc>,
+}
+
+impl Decision {
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if self.schema_version != V2_DOMAIN_SCHEMA_VERSION {
+            return Err(DomainError::EmptyField {
+                field: "decision.schema_version",
+            });
         }
+        if self.decision_context.kind != ArtifactKind::DecisionContext
+            || self.summary.trim().is_empty()
+        {
+            return Err(DomainError::EmptyField {
+                field: "decision.context_or_summary",
+            });
+        }
+        if self.confidence_ppm > 1_000_000 {
+            return Err(DomainError::InvalidDecisionConfidence);
+        }
+        validate_forecasts(&self.forecasts)?;
         self.targets.validate_universe()
     }
+}
+
+fn validate_forecasts(forecasts: &[Forecast]) -> Result<(), DomainError> {
+    let mut coverage = std::collections::BTreeSet::new();
+    for forecast in forecasts {
+        forecast.validate()?;
+        if !coverage.insert((forecast.asset, forecast.horizon)) {
+            return Err(DomainError::InvalidDecisionForecastHorizons);
+        }
+    }
+    if coverage.len()
+        != Asset::EXECUTABLE.len()
+            * [
+                DecisionHorizon::T1,
+                DecisionHorizon::T3,
+                DecisionHorizon::T5,
+            ]
+            .len()
+        || Asset::EXECUTABLE.into_iter().any(|asset| {
+            [
+                DecisionHorizon::T1,
+                DecisionHorizon::T3,
+                DecisionHorizon::T5,
+            ]
+            .into_iter()
+            .any(|horizon| !coverage.contains(&(asset, horizon)))
+        })
+    {
+        return Err(DomainError::InvalidDecisionForecastHorizons);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -233,11 +297,12 @@ mod tests {
     use chrono::Utc;
 
     use super::{
-        DecisionContext, DecisionDraft, DecisionHorizon, Forecast, HardBlocker, MaterialConflict,
+        Decision, DecisionContext, DecisionDraft, DecisionHorizon, Forecast, HardBlocker,
+        MaterialConflict,
     };
     use crate::{
         artifact::{ArtifactId, ArtifactKind, ArtifactRef},
-        ContentHash, DecisionId, RunId, TargetPortfolio,
+        Asset, ContentHash, DecisionId, RunId, TargetPortfolio,
     };
 
     fn reference(kind: ArtifactKind, value: &[u8]) -> ArtifactRef {
@@ -245,6 +310,26 @@ mod tests {
             artifact_id: ArtifactId(ContentHash::of_bytes(value)),
             kind,
         }
+    }
+
+    fn valid_forecasts() -> Vec<Forecast> {
+        Asset::EXECUTABLE
+            .into_iter()
+            .flat_map(|asset| {
+                [
+                    DecisionHorizon::T1,
+                    DecisionHorizon::T3,
+                    DecisionHorizon::T5,
+                ]
+                .into_iter()
+                .map(move |horizon| Forecast {
+                    asset,
+                    horizon,
+                    positive_return_probability_ppm: 500_000,
+                    expected_return_ppm: 1,
+                })
+            })
+            .collect()
     }
 
     #[test]
@@ -272,6 +357,7 @@ mod tests {
             material_conflicts: vec![],
             hard_blockers: vec![HardBlocker::Frozen],
             soft_warnings: vec![],
+            decision_policy_hash: ContentHash::of_bytes(b"fixture-policy"),
             target: TargetPortfolio::zeroed(),
             created_at: Utc::now(),
         };
@@ -293,6 +379,7 @@ mod tests {
             material_conflicts: vec![],
             hard_blockers: vec![HardBlocker::Frozen],
             soft_warnings: vec![],
+            decision_policy_hash: ContentHash::of_bytes(b"fixture-policy"),
             target: TargetPortfolio::zeroed(),
             created_at: Utc::now(),
         };
@@ -306,20 +393,22 @@ mod tests {
     fn decision_draft_requires_each_typed_horizon_once() {
         let draft = DecisionDraft {
             summary: "evidence-backed draft".to_owned(),
-            targets: TargetPortfolio::zeroed(),
             confidence_ppm: 500_000,
             forecasts: vec![
                 Forecast {
+                    asset: Asset::Tqqq,
                     horizon: DecisionHorizon::T1,
                     positive_return_probability_ppm: 500_000,
                     expected_return_ppm: 1,
                 },
                 Forecast {
+                    asset: Asset::Tqqq,
                     horizon: DecisionHorizon::T3,
                     positive_return_probability_ppm: 500_000,
                     expected_return_ppm: 1,
                 },
                 Forecast {
+                    asset: Asset::Tqqq,
                     horizon: DecisionHorizon::T3,
                     positive_return_probability_ppm: 500_000,
                     expected_return_ppm: 1,
@@ -328,6 +417,7 @@ mod tests {
             claims: vec![reference(ArtifactKind::Claim, b"claim")],
             critiques: vec![],
             evidence: vec![reference(ArtifactKind::NormalizedEvidence, b"evidence")],
+            material_conflicts: vec![],
             hard_blockers: vec![],
             soft_warnings: vec![],
         };
@@ -336,5 +426,20 @@ mod tests {
             draft.validate(),
             Err(crate::DomainError::InvalidDecisionForecastHorizons)
         );
+    }
+
+    #[test]
+    fn decision_binds_typed_context_and_three_horizons() {
+        let decision = Decision {
+            schema_version: crate::V2_DOMAIN_SCHEMA_VERSION,
+            decision_context: reference(ArtifactKind::DecisionContext, b"context"),
+            summary: "accepted decision".to_owned(),
+            targets: TargetPortfolio::zeroed(),
+            confidence_ppm: 500_000,
+            forecasts: valid_forecasts(),
+            created_at: Utc::now(),
+        };
+
+        decision.validate().unwrap();
     }
 }

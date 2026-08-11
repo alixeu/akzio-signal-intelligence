@@ -109,6 +109,7 @@ impl V2PaperCommitmentRuntime {
         let context: ExecutionContext =
             serde_json::from_slice(&self.store.read_blob(&context_artifact.blob)?)?;
         context.validate()?;
+        context.validate_complete_plan_closure()?;
         if context.run_id != input.permit.run_id
             || !verdict_artifact
                 .source_refs
@@ -117,28 +118,38 @@ impl V2PaperCommitmentRuntime {
         {
             return Err(PaperCommitmentError::VerdictContextMismatch);
         }
-        if context.broker_session != input.session_key {
+        if context.broker_session.as_deref() != Some(input.session_key.as_str()) {
             return Err(PaperCommitmentError::SessionMismatch);
         }
         if context.frozen {
             return Err(PaperCommitmentError::Frozen);
         }
-        let allocation_reference = context_artifact
-            .source_refs
-            .iter()
-            .find(|reference| reference.kind == ArtifactKind::ExecutionPlan)
-            .cloned()
+        let allocation_reference = context
+            .execution_plan
+            .clone()
             .ok_or(PaperCommitmentError::MissingAllocationPlan)?;
+        if !context_artifact.source_refs.contains(&allocation_reference) {
+            return Err(PaperCommitmentError::MissingAllocationPlan);
+        }
         let allocation_artifact =
             self.load_expected(&allocation_reference, ArtifactKind::ExecutionPlan)?;
         let allocation: crate::ExecutionPlan =
             serde_json::from_slice(&self.store.read_blob(&allocation_artifact.blob)?)?;
-        if allocation.plan_hash != context.plan_hash {
+        allocation.validate()?;
+        if allocation.plan_hash
+            != context
+                .plan_hash
+                .as_ref()
+                .ok_or(PaperCommitmentError::PlanHashMismatch)?
+                .clone()
+            || allocation.broker_session != input.session_key
+        {
             return Err(PaperCommitmentError::PlanHashMismatch);
         }
         let mut client_order_ids = std::collections::BTreeMap::new();
         for (index, order) in allocation.orders.iter().enumerate() {
-            let client_order_id = crate::paper::client_order_id(&allocation.plan_hash, index, 0);
+            let client_order_id =
+                crate::paper::client_order_id(&input.session_key, &allocation.plan_hash, index, 0);
             if client_order_ids
                 .insert(order.asset, client_order_id)
                 .is_some()
@@ -160,7 +171,12 @@ impl V2PaperCommitmentRuntime {
                     serde_json::from_slice(&self.store.read_blob(&existing_artifact.blob)?)?;
                 existing.validate()?;
                 if existing.execution_context != execution_context
-                    || existing.plan_hash != context.plan_hash
+                    || existing.plan_hash
+                        != context
+                            .plan_hash
+                            .as_ref()
+                            .ok_or(PaperCommitmentError::PlanHashMismatch)?
+                            .clone()
                     || existing.broker_session != input.session_key
                     || existing.client_order_ids != client_order_ids
                 {
@@ -176,7 +192,10 @@ impl V2PaperCommitmentRuntime {
         let payload = PaperCommitment {
             commitment_id: PaperCommitmentId::new(),
             execution_context: execution_context.clone(),
-            plan_hash: context.plan_hash.clone(),
+            plan_hash: context
+                .plan_hash
+                .clone()
+                .ok_or(PaperCommitmentError::PlanHashMismatch)?,
             broker_session: input.session_key.clone(),
             client_order_ids,
             created_at: input.now,
@@ -210,7 +229,7 @@ impl V2PaperCommitmentRuntime {
                 session_key: input.session_key.clone(),
                 permit: input.permit.clone(),
                 commitment: commitment.clone(),
-                committed_at: input.now,
+                committed_at: Utc::now(),
             },
         )?;
         let commitment = if result.newly_committed {
@@ -248,7 +267,8 @@ mod tests {
 
     use akzio_domain::{
         ArtifactId, ContentHash, FactorExposure, FailureDisposition, RetryPolicy, RunId,
-        TaskBudget, TaskId, TaskRecipeId, WorkflowGraph, WorkflowNode, REBUILD_SCHEMA_VERSION,
+        TargetPortfolio, TaskBudget, TaskId, TaskRecipeId, WeightPpm, WorkflowGraph, WorkflowNode,
+        REBUILD_SCHEMA_VERSION,
     };
     use akzio_store::v2::{SessionReservation, StoredRun, WorkflowCommit};
 
@@ -313,6 +333,70 @@ mod tests {
         }
     }
 
+    fn write_source(
+        store: &V2Store,
+        permit: &TaskWritePermit,
+        kind: ArtifactKind,
+        label: &str,
+        now: DateTime<Utc>,
+    ) -> ArtifactRef {
+        let artifact = Artifact::new(
+            kind,
+            store
+                .put_json(&serde_json::json!({ "fixture": label }))
+                .unwrap(),
+            "fixture.execution_source",
+            ArtifactLifecycle::RunScoped,
+            provenance(now),
+            Some(origin(permit)),
+            vec![],
+            now,
+        )
+        .unwrap();
+        store
+            .write_task_artifact(permit, &artifact, "fixture.execution_source_created", now)
+            .unwrap();
+        ArtifactRef {
+            artifact_id: artifact.artifact_id,
+            kind: artifact.kind,
+        }
+    }
+
+    fn fixture_plan(
+        now: DateTime<Utc>,
+        decision_context: ArtifactRef,
+        account_snapshot: ArtifactRef,
+        quote_snapshot: ArtifactRef,
+        market_clock_snapshot: ArtifactRef,
+    ) -> crate::ExecutionPlan {
+        let mut target = TargetPortfolio::zeroed();
+        target.weights.insert(Asset::Qqq, WeightPpm(100_000));
+        let mut plan = crate::ExecutionPlan {
+            schema_version: REBUILD_SCHEMA_VERSION,
+            decision_context,
+            account_snapshot,
+            quote_snapshot,
+            market_clock_snapshot,
+            policy_hash: ContentHash::of_bytes(b"fixture-policy"),
+            target: target.clone(),
+            orders: vec![crate::OrderIntent {
+                asset: Asset::Qqq,
+                side: crate::OrderSide::Buy,
+                notional: crate::MoneyMicros::from_usd_cents(10_000),
+                limit_price: crate::MoneyMicros::from_usd_cents(2_500),
+            }],
+            gross_exposure_ppm: 100_000,
+            net_exposure_ppm: 100_000,
+            factor_exposure: FactorExposure::from_target(&target).unwrap(),
+            turnover_ppm: 100_000,
+            broker_session: "paper:fixture".to_owned(),
+            created_at: now,
+            plan_hash: ContentHash::of_bytes(b"pending"),
+        };
+        plan.refresh_hash().unwrap();
+        plan
+    }
+
     #[test]
     fn accepted_verdict_creates_one_fenced_commitment_and_reuses_it() {
         let directory = tempdir().unwrap();
@@ -367,17 +451,41 @@ mod tests {
             .unwrap()
             .permit;
 
-        let allocation = crate::ExecutionPlan {
-            policy: crate::ExecutionPolicy::default(),
-            targets: vec![],
-            orders: vec![crate::OrderIntent {
-                asset: Asset::Qqq,
-                side: crate::OrderSide::Buy,
-                notional: crate::MoneyMicros::from_usd_cents(10_000),
-                limit_price: crate::MoneyMicros::from_usd_cents(2_500),
-            }],
-            plan_hash: ContentHash::of_bytes(b"plan"),
-        };
+        let decision_context = write_source(
+            &store,
+            &permit,
+            ArtifactKind::DecisionContext,
+            "decision-context",
+            now,
+        );
+        let account_snapshot = write_source(
+            &store,
+            &permit,
+            ArtifactKind::NormalizedEvidence,
+            "account",
+            now,
+        );
+        let quote_snapshot = write_source(
+            &store,
+            &permit,
+            ArtifactKind::NormalizedEvidence,
+            "quote",
+            now,
+        );
+        let market_clock_snapshot = write_source(
+            &store,
+            &permit,
+            ArtifactKind::NormalizedEvidence,
+            "clock",
+            now,
+        );
+        let allocation = fixture_plan(
+            now,
+            decision_context,
+            account_snapshot,
+            quote_snapshot,
+            market_clock_snapshot,
+        );
         let allocation_artifact = Artifact::new(
             ArtifactKind::ExecutionPlan,
             store.put_json(&allocation).unwrap(),
@@ -385,7 +493,12 @@ mod tests {
             ArtifactLifecycle::RunScoped,
             provenance(now),
             Some(origin(&permit)),
-            vec![],
+            vec![
+                allocation.decision_context.clone(),
+                allocation.account_snapshot.clone(),
+                allocation.quote_snapshot.clone(),
+                allocation.market_clock_snapshot.clone(),
+            ],
             now,
         )
         .unwrap();
@@ -404,28 +517,15 @@ mod tests {
         let execution_context_payload = ExecutionContext {
             schema_version: REBUILD_SCHEMA_VERSION,
             run_id: permit.run_id.clone(),
-            decision_context: ArtifactRef {
-                artifact_id: ArtifactId(ContentHash::of_bytes(b"decision")),
-                kind: ArtifactKind::DecisionContext,
-            },
-            account_snapshot: ArtifactRef {
-                artifact_id: ArtifactId(ContentHash::of_bytes(b"account")),
-                kind: ArtifactKind::NormalizedEvidence,
-            },
-            quote_snapshot: ArtifactRef {
-                artifact_id: ArtifactId(ContentHash::of_bytes(b"quote")),
-                kind: ArtifactKind::NormalizedEvidence,
-            },
-            factor_exposure: FactorExposure {
-                leveraged_equity_ppm: 0,
-                nasdaq_ppm: 0,
-                semiconductor_ppm: 0,
-                tqqq_qqq_pair_ppm: 0,
-                soxl_soxx_pair_ppm: 0,
-            },
-            turnover_ppm: 0,
-            plan_hash: allocation.plan_hash.clone(),
-            broker_session: "paper:fixture".to_owned(),
+            decision_context: allocation.decision_context.clone(),
+            account_snapshot: Some(allocation.account_snapshot.clone()),
+            quote_snapshot: Some(allocation.quote_snapshot.clone()),
+            market_clock_snapshot: Some(allocation.market_clock_snapshot.clone()),
+            execution_plan: Some(allocation_ref.clone()),
+            factor_exposure: Some(allocation.factor_exposure.clone()),
+            turnover_ppm: Some(allocation.turnover_ppm),
+            plan_hash: Some(allocation.plan_hash.clone()),
+            broker_session: Some(allocation.broker_session.clone()),
             frozen: false,
             created_at: now,
         };
@@ -436,7 +536,16 @@ mod tests {
             ArtifactLifecycle::RunScoped,
             provenance(now),
             Some(origin(&permit)),
-            vec![allocation_ref],
+            vec![
+                execution_context_payload.decision_context.clone(),
+                execution_context_payload.account_snapshot.clone().unwrap(),
+                execution_context_payload.quote_snapshot.clone().unwrap(),
+                execution_context_payload
+                    .market_clock_snapshot
+                    .clone()
+                    .unwrap(),
+                allocation_ref,
+            ],
             now,
         )
         .unwrap();
