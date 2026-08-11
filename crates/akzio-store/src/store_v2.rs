@@ -3972,9 +3972,85 @@ impl RebuildStore {
             let snapshot = self.workflow_snapshot_with_connection(&connection, &run_id)?;
             self.verify_workflow_history(&connection, &snapshot)?;
         }
+        self.verify_outcome_schedule_history(&connection)?;
         self.verify_contract_catalogue_history(&connection)?;
         self.verify_policy_evaluation_history(&connection)?;
         self.verify_candidate_policy_history(&connection)?;
+        Ok(())
+    }
+
+    fn verify_outcome_schedule_history(&self, connection: &Connection) -> RebuildStoreResult<()> {
+        let artifact_ids = connection
+            .prepare(
+                "SELECT artifact_id FROM rebuild_artifacts WHERE kind = ?1 ORDER BY artifact_id",
+            )?
+            .query_map(params![enum_name(ArtifactKind::OutcomeSchedule)], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        for value in artifact_ids {
+            let artifact_id = ArtifactId(ContentHash::new(value)?);
+            let artifact = read_artifact(connection, &artifact_id)?;
+            let (expected_lifecycle, allowed_purposes) =
+                match artifact_run_purpose(connection, &artifact)? {
+                    RunPurpose::Paper => (ArtifactLifecycle::Canonical, vec![RunPurpose::Paper]),
+                    RunPurpose::Shadow => (
+                        ArtifactLifecycle::RunScoped,
+                        vec![RunPurpose::Paper, RunPurpose::Shadow],
+                    ),
+                    purpose => {
+                        return Err(RebuildStoreError::Integrity(format!(
+                            "outcome schedule {artifact_id} has invalid run purpose {purpose:?}"
+                        )));
+                    }
+                };
+            if artifact.lifecycle != expected_lifecycle {
+                return Err(RebuildStoreError::Integrity(format!(
+                    "outcome schedule {artifact_id} has invalid lifecycle"
+                )));
+            }
+            let schedule: OutcomeSchedule =
+                serde_json::from_slice(&self.read_blob(&artifact.blob)?).map_err(|error| {
+                    RebuildStoreError::Integrity(format!(
+                        "outcome schedule {artifact_id} has invalid payload: {error}"
+                    ))
+                })?;
+            schedule.validate().map_err(|error| {
+                RebuildStoreError::Integrity(format!(
+                    "outcome schedule {artifact_id} fails validation: {error}"
+                ))
+            })?;
+            let expected_sources = outcome_schedule_source_refs(&schedule);
+            if !has_exact_source_refs(&artifact, &expected_sources) {
+                return Err(RebuildStoreError::Integrity(format!(
+                    "outcome schedule {artifact_id} has invalid source closure"
+                )));
+            }
+            for reference in &expected_sources {
+                let source = read_artifact(connection, &reference.artifact_id)?;
+                if source.kind != reference.kind {
+                    return Err(RebuildStoreError::Integrity(format!(
+                        "outcome schedule {artifact_id} source kind is invalid"
+                    )));
+                }
+                assert_artifact_from_allowed_purposes(connection, &source, &allowed_purposes)
+                    .map_err(|error| {
+                        RebuildStoreError::Integrity(format!(
+                            "outcome schedule {artifact_id} source origin is invalid: {error}"
+                        ))
+                    })?;
+            }
+            self.validate_outcome_schedule_execution_lineage(
+                connection,
+                &schedule,
+                &allowed_purposes,
+            )
+            .map_err(|error| {
+                RebuildStoreError::Integrity(format!(
+                    "outcome schedule {artifact_id} execution lineage is invalid: {error}"
+                ))
+            })?;
+        }
         Ok(())
     }
 
@@ -10042,6 +10118,59 @@ mod tests {
             Err(RebuildStoreError::Integrity(_)) => {}
             other => panic!("unexpected Doctor result: {other:?}"),
         }
+    }
+
+    #[test]
+    fn doctor_rejects_no_order_schedule_with_accepted_verdict() {
+        let fixture = PolicyCommitFixture::memory();
+        fixture.store.verify_integrity().unwrap();
+        let schedule = fixture
+            .store
+            .latest_artifact_by_kind(ArtifactKind::OutcomeSchedule)
+            .unwrap()
+            .unwrap();
+        let execution_context = fixture
+            .store
+            .latest_artifact_by_kind(ArtifactKind::ExecutionContext)
+            .unwrap()
+            .unwrap();
+        let accepted_verdict = permit_artifact(
+            &fixture.store,
+            &fixture.permit,
+            ArtifactKind::ExecutionVerdict,
+            &ExecutionVerdict::Accepted {
+                execution_context: artifact_ref(&execution_context),
+            },
+            vec![artifact_ref(&execution_context)],
+            ArtifactLifecycle::RunScoped,
+            fixture.now,
+        );
+        let mut payload: OutcomeSchedule =
+            serde_json::from_slice(&fixture.store.read_blob(&schedule.blob).unwrap()).unwrap();
+        payload.execution = OutcomeExecutionLineage::NoOrder {
+            execution_verdict: artifact_ref(&accepted_verdict),
+        };
+        let forged_schedule = permit_artifact(
+            &fixture.store,
+            &fixture.permit,
+            ArtifactKind::OutcomeSchedule,
+            &payload,
+            outcome_schedule_source_refs(&payload),
+            ArtifactLifecycle::Canonical,
+            fixture.now,
+        );
+        {
+            let mut connection = fixture.store.connection.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            insert_artifact(&transaction, &accepted_verdict).unwrap();
+            insert_artifact(&transaction, &forged_schedule).unwrap();
+            transaction.commit().unwrap();
+        }
+
+        assert!(matches!(
+            fixture.store.verify_integrity(),
+            Err(RebuildStoreError::Integrity(message)) if message.contains("execution lineage")
+        ));
     }
 
     #[test]
