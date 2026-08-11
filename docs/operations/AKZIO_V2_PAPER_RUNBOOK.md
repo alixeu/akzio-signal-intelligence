@@ -22,7 +22,7 @@ cargo run --offline -p akzio-cli -- run fixture-debug
 
 检查结果必须明确区分 fixture/离线证据与 Paper sandbox 证据。`fixture-debug` 成功只能证明当前 Store、权限、契约和工作流边界，不证明 Alpaca 或真实市场可用。
 
-当前 fixture workflow 可能在 evidence gate 进入 `Failed`；`run paper-dry-run` 的验收条件是 `canonical_learning_events == 0`，不能把 `status: Failed` 或命令返回当成 Paper 成功。当前 Store 只持久化 `task.failed`，具体失败原因若未在 artifact/event 中出现，保持“待验证”。
+当前 fixture workflow 可能在 evidence gate 进入 `Failed`；`run paper-dry-run` 的验收条件是 `canonical_learning_events == 0`，不能把 `status: Failed` 或命令返回当成 Paper 成功。具体失败原因若未在 artifact/event 中出现，保持“待验证”。
 
 ## 日常控制
 
@@ -34,7 +34,7 @@ cargo run --offline -p akzio-cli -- run replay <run-id>
 cargo run --offline -p akzio-cli -- run events <run-id>
 ```
 
-冻结期间不得产生新的 Paper commitment。解除冻结前必须完成 Store Doctor、replay、告警处置和人工审批。
+冻结期间不得产生新的 Paper commitment。解除冻结前必须完成 Store Doctor、replay、告警处置和人工审批。CLI 的 replay/events 通过已认证 loopback HTTP 控制面调用；没有 daemon/token 时命令应失败关闭。
 
 ## 证据等级
 
@@ -86,7 +86,7 @@ cargo run --offline -p akzio-cli -- run replay <run-id>
 
 ## 离线故障演练
 
-```text
+```bash
 cargo run --offline -p akzio-cli -- test crash-recovery
 cargo run --offline -p akzio-cli -- test concurrent-runs
 cargo run --offline -p akzio-cli -- test evidence-integrity
