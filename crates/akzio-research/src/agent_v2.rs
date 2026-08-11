@@ -9,11 +9,12 @@ use akzio_context::v2::{ContextBroker, ContextError, ContextManifest};
 use akzio_domain::{
     AgentContract, Artifact, ArtifactId, ArtifactKind, ArtifactLifecycle, ArtifactOrigin,
     ArtifactProvenance, ArtifactRef, ContextPolicy, ContractId, ContractPurpose, DomainError,
-    FailureDisposition, OutputContract, ReadGrant, RetryPolicy, RuntimeTaskClass, TaskBudget,
-    TaskRecipe, TaskRecipeId, TaskWritePermit, TerminationPolicy, ToolGrant, ToolKind,
-    WorkflowNode, V2_SCHEMA_VERSION,
+    FailureDisposition, OutputContract, PromptBundle, ReadGrant, ResearchClaim, ResearchCritique,
+    ResearchResolution, RetryPolicy, RuntimeTaskClass, TaskBudget, TaskRecipe, TaskRecipeId,
+    TaskWritePermit, TerminationPolicy, ToolGrant, ToolKind, ToolSpec, WorkflowNode,
+    V2_SCHEMA_VERSION,
 };
-use akzio_model::{ModelClient, ModelError, ModelRequest, ModelToolDefinition};
+use akzio_model::{ModelCallTrace, ModelClient, ModelError, ModelRequest, ModelToolDefinition};
 use akzio_runtime::v2::{RecipeCatalogue, RuntimeError, TerminalRecipeSet};
 use akzio_store::v2::{StoreError, StoredContract, V2Store};
 use chrono::{DateTime, Duration, Utc};
@@ -77,8 +78,16 @@ pub enum ResearchError {
     Model(String),
     #[error("Agent model rate limited: {0}")]
     RateLimited(String),
+    #[error("Agent model {error_class} failed: {message}")]
+    ModelDebug {
+        error_class: &'static str,
+        message: String,
+        trace: ModelCallTrace,
+    },
     #[error("tool {0} is not granted by the Agent Contract")]
     ToolNotGranted(String),
+    #[error("invalid model ToolSpec: {0}")]
+    InvalidToolSpec(String),
     #[error("tool {tool} is not granted for source family {source_family}")]
     ToolSourceNotGranted { tool: String, source_family: String },
     #[error("Agent exceeded its Contract tool-call budget")]
@@ -143,14 +152,12 @@ impl ActiveResearchCatalogue {
 pub const ACTIVE_RESEARCH_MAX_NODES: usize = 32;
 
 const ACTIVE_CONTRACT_VERSION: u32 = 1;
+const ACTIVE_PROMPT_BUNDLE_VERSION: u32 = 1;
+const SHARED_GOVERNANCE_PROMPT: &str = "Follow the installed Akzio Contract exactly. Rust owns state, evidence access, budgets, workflow gates, and Paper-only execution. Use only ContextManifest-granted artifacts and the declared tools. Never access arbitrary files, network resources, credentials, databases, or execution controls. Return only the requested strict JSON output.";
 const PLANNER_RECIPE_ID: &str = "research.planner";
-const PLANNER_CHILD_RECIPE_IDS: [&str; 3] = [
-    "research.analyst",
-    "research.critic",
-    "research.synthesizer",
-];
+const PLANNER_CHILD_RECIPE_IDS: [&str; 2] = ["research.analyst", "research.synthesizer"];
 const GOVERNED_EVIDENCE_SOURCE_FAMILIES: [&str; 4] = ["alpaca", "sec_edgar", "fred", "news_web"];
-const PLANNER_MAX_DRAFT_TASKS: u16 = 8;
+const PLANNER_MAX_DRAFT_TASKS: u16 = 7;
 const EVIDENCE_GATE_RECIPE_ID: &str = "gate.evidence";
 const DECISION_GATE_RECIPE_ID: &str = "gate.decision";
 const EXECUTION_GATE_RECIPE_ID: &str = "gate.execution";
@@ -211,6 +218,7 @@ impl ContractCatalogue {
             };
             let contract = stored.contract;
             contract.validate()?;
+            model_tool_definitions(store, &contract)?;
             if by_hash.contains_key(&contract.contract_hash) {
                 return Err(ResearchError::DuplicateContract(
                     contract.contract_hash.clone(),
@@ -363,6 +371,7 @@ impl ContractCatalogue {
         now: DateTime<Utc>,
     ) -> ResearchResult<InstalledContract> {
         self.validate_candidate(active_contract_hash, candidate)?;
+        model_tool_definitions(store, candidate)?;
         let stored = store.install_candidate_contract(active_contract_hash, candidate, now)?;
         Ok(installed_contract(stored))
     }
@@ -421,7 +430,7 @@ fn canonical_active_contracts(store: &V2Store) -> ResearchResult<Vec<AgentContra
         CanonicalContractDefinition {
             purpose: PLANNER_RECIPE_ID,
             responsibility: "Lower a bounded research objective into a WorkflowProposalDraft using only installed research recipes and inline EvidenceNeed requests.",
-            prompt: "You are Akzio's bounded research planner. Return only JSON matching the WorkflowProposalDraft schema. You may name only research.analyst, research.critic, and research.synthesizer recipes, and express evidence needs inline. Do not construct ArtifactRef values, request sources or tools beyond the contract, submit a decision, or submit an order.",
+            prompt: "You are Akzio's bounded research planner. Return only JSON matching the WorkflowProposalDraft schema. You may name only research.analyst and research.synthesizer recipes, and express evidence needs inline. Rust may insert one conditional critic only for the structured-critique candidate topology. Do not construct ArtifactRef values, request sources or tools beyond the contract, submit a decision, or submit an order.",
             output_kind: ArtifactKind::WorkflowProposalDraft,
             output_schema: planner_draft_output_schema(),
             permitted_kinds: BTreeSet::from([
@@ -529,7 +538,11 @@ fn canonical_active_contract(
     store: &V2Store,
     definition: CanonicalContractDefinition,
 ) -> ResearchResult<AgentContract> {
-    let prompt = store.put_bytes(definition.prompt.as_bytes(), "text/plain")?;
+    let prompt = PromptBundle {
+        version: ACTIVE_PROMPT_BUNDLE_VERSION,
+        governance: store.put_bytes(SHARED_GOVERNANCE_PROMPT.as_bytes(), "text/plain")?,
+        role: store.put_bytes(definition.prompt.as_bytes(), "text/plain")?,
+    };
     let schema = store.put_json(&definition.output_schema)?;
     Ok(AgentContract::new(
         ContractId(format!("akzio.v2.{}", definition.purpose)),
@@ -547,6 +560,7 @@ fn canonical_active_contract(
             allow_raw_reread: false,
         },
         evidence_read_grants(),
+        evidence_read_tool_specs(store)?,
         OutputContract {
             artifact_kind: definition.output_kind,
             schema,
@@ -574,6 +588,25 @@ fn evidence_read_grants() -> Vec<ToolGrant> {
             .map(str::to_owned)
             .collect(),
     }]
+}
+
+fn artifact_id_tool_input_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {"artifact_id": {"type": "string", "minLength": 1}},
+        "required": ["artifact_id"],
+        "additionalProperties": false,
+    })
+}
+
+fn evidence_read_tool_specs(store: &V2Store) -> ResearchResult<Vec<ToolSpec>> {
+    Ok(vec![ToolSpec {
+        name: "read_artifact".to_owned(),
+        description: "Read one artifact explicitly granted by ContextManifest.".to_owned(),
+        kind: ToolKind::ReadEvidence,
+        input_schema: store.put_json(&artifact_id_tool_input_schema())?,
+        strict: true,
+    }])
 }
 
 fn recipe_evidence_sources(contract: &AgentContract) -> BTreeSet<String> {
@@ -702,11 +735,29 @@ fn claim_output_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "summary": { "type": "string" },
-            "confidence_ppm": { "type": "integer" },
-            "rationale": { "type": "string" }
+            "schema_version": { "type": "integer", "enum": [V2_SCHEMA_VERSION] },
+            "topic": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "statement": { "type": "string", "minLength": 1, "maxLength": 2048 },
+            "horizon": { "type": "string", "enum": ["t1", "t3", "t5"] },
+            "stance": { "type": "string", "enum": ["bullish", "bearish", "neutral"] },
+            "materiality_ppm": { "type": "integer", "minimum": 0, "maximum": 1_000_000 },
+            "confidence_ppm": { "type": "integer", "minimum": 0, "maximum": 1_000_000 },
+            "grounds": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 8,
+                "items": evidence_ground_schema()
+            },
+            "evidence_gaps": {
+                "type": "array",
+                "maxItems": 2,
+                "items": evidence_gap_schema()
+            }
         },
-        "required": ["summary", "confidence_ppm"],
+        "required": [
+            "schema_version", "topic", "statement", "horizon", "stance", "materiality_ppm",
+            "confidence_ppm", "grounds", "evidence_gaps"
+        ],
         "additionalProperties": false
     })
 }
@@ -715,11 +766,80 @@ fn critique_output_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "summary": { "type": "string" },
+            "schema_version": { "type": "integer", "enum": [V2_SCHEMA_VERSION] },
+            "target": artifact_ref_schema(&["claim"]),
+            "topic": { "type": "string", "minLength": 1, "maxLength": 128 },
             "severity": { "type": "string", "enum": ["low", "medium", "high"] },
-            "blocker": { "type": "boolean" }
+            "blocker": { "type": "boolean" },
+            "rationale": { "type": "string", "minLength": 1, "maxLength": 2048 },
+            "grounds": {
+                "type": "array",
+                "maxItems": 8,
+                "items": evidence_ground_schema()
+            },
+            "evidence_gaps": {
+                "type": "array",
+                "maxItems": 2,
+                "items": evidence_gap_schema()
+            }
         },
-        "required": ["summary", "severity", "blocker"],
+        "required": [
+            "schema_version", "target", "topic", "severity", "blocker", "rationale", "grounds",
+            "evidence_gaps"
+        ],
+        "additionalProperties": false
+    })
+}
+
+fn resolution_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "schema_version": { "type": "integer", "enum": [V2_SCHEMA_VERSION] },
+            "claim": artifact_ref_schema(&["claim"]),
+            "critique": artifact_ref_schema(&["critique"]),
+            "disposition": { "type": "string", "enum": ["accepted", "rebutted", "unresolved"] },
+            "rationale": { "type": "string", "minLength": 1, "maxLength": 2048 },
+            "grounds": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 8,
+                "items": evidence_ground_schema()
+            },
+            "remaining_gaps": {
+                "type": "array",
+                "maxItems": 2,
+                "items": evidence_gap_schema()
+            }
+        },
+        "required": [
+            "schema_version", "claim", "critique", "disposition", "rationale", "grounds",
+            "remaining_gaps"
+        ],
+        "additionalProperties": false
+    })
+}
+
+fn evidence_ground_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "evidence": artifact_ref_schema(&["normalized_evidence", "semantic_detail"]),
+            "support": { "type": "string", "minLength": 1, "maxLength": 2048 }
+        },
+        "required": ["evidence", "support"],
+        "additionalProperties": false
+    })
+}
+
+fn evidence_gap_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "topic": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "rationale": { "type": "string", "minLength": 1, "maxLength": 2048 }
+        },
+        "required": ["topic", "rationale"],
         "additionalProperties": false
     })
 }
@@ -823,6 +943,59 @@ fn artifact_ref_schema(kinds: &[&str]) -> Value {
     })
 }
 
+fn research_output_source_refs(
+    kind: ArtifactKind,
+    output: &Value,
+    manifest: &ContextManifest,
+) -> ResearchResult<Vec<ArtifactRef>> {
+    let refs = match kind {
+        ArtifactKind::Claim => {
+            let claim: ResearchClaim = serde_json::from_value(output.clone()).map_err(|error| {
+                ResearchError::InvalidOutput(format!("invalid Claim payload: {error}"))
+            })?;
+            claim
+                .validate()
+                .map_err(|error| ResearchError::InvalidOutput(error.to_string()))?;
+            claim.source_refs()
+        }
+        ArtifactKind::Critique => {
+            let critique: ResearchCritique =
+                serde_json::from_value(output.clone()).map_err(|error| {
+                    ResearchError::InvalidOutput(format!("invalid Critique payload: {error}"))
+                })?;
+            critique
+                .validate()
+                .map_err(|error| ResearchError::InvalidOutput(error.to_string()))?;
+            critique.source_refs()
+        }
+        ArtifactKind::Resolution => {
+            validate_schema_value(output, &resolution_output_schema(), "$")
+                .map_err(ResearchError::InvalidOutput)?;
+            let resolution: ResearchResolution =
+                serde_json::from_value(output.clone()).map_err(|error| {
+                    ResearchError::InvalidOutput(format!("invalid Resolution payload: {error}"))
+                })?;
+            resolution
+                .validate()
+                .map_err(|error| ResearchError::InvalidOutput(error.to_string()))?;
+            resolution.source_refs()
+        }
+        _ => return Ok(vec![]),
+    };
+    let selected = manifest
+        .payload
+        .selections
+        .iter()
+        .map(|selection| selection.artifact.clone())
+        .collect::<BTreeSet<_>>();
+    if refs.iter().any(|reference| !selected.contains(reference)) {
+        return Err(ResearchError::InvalidOutput(
+            "research artifact cited an artifact outside ContextManifest".to_owned(),
+        ));
+    }
+    Ok(refs)
+}
+
 fn rust_terminal_recipes() -> ResearchResult<(Vec<TaskRecipe>, TerminalRecipeSet)> {
     let evidence = rust_gate_recipe(EVIDENCE_GATE_RECIPE_ID, RuntimeTaskClass::Evidence)?;
     let decision = rust_gate_recipe(DECISION_GATE_RECIPE_ID, RuntimeTaskClass::DecisionGate)?;
@@ -869,7 +1042,7 @@ fn rust_gate_recipe(recipe_id: &str, task_class: RuntimeTaskClass) -> ResearchRe
 pub struct AgentToolCall {
     pub call_id: String,
     pub name: String,
-    pub artifact_id: ArtifactId,
+    pub arguments: Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -891,12 +1064,15 @@ pub struct AgentToolDefinition {
     pub name: String,
     pub description: String,
     pub input_schema: Value,
+    pub strict: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentModelTurn {
     pub output: Option<Value>,
     pub tool_calls: Vec<AgentToolCall>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_debug: Option<ModelCallTrace>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -926,11 +1102,16 @@ pub trait AgentModel: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct ModelClientAdapter {
     client: ModelClient,
+    debug: bool,
 }
 
 impl ModelClientAdapter {
     pub fn new(client: ModelClient) -> Self {
-        Self { client }
+        Self::with_debug(client, false)
+    }
+
+    pub fn with_debug(client: ModelClient, debug: bool) -> Self {
+        Self { client, debug }
     }
 }
 
@@ -940,59 +1121,60 @@ impl AgentModel for ModelClientAdapter {
         request: AgentModelRequest,
     ) -> BoxFuture<'a, ResearchResult<AgentModelTurn>> {
         Box::pin(async move {
-            let response = self
-                .client
-                .respond(ModelRequest {
-                    instructions: request.prompt,
-                    input: serde_json::to_string(&json!({
-                        "objective": request.objective,
-                        "context_manifest": request.manifest_artifact_id,
-                        "context": request.context,
-                        "prior_tool_results": request.prior_tool_results,
-                    }))?,
-                    schema_name: Some(request.purpose),
-                    schema: Some(request.output_schema),
-                    max_output_tokens: request.max_output_tokens,
-                    tools: request
-                        .tools
-                        .into_iter()
-                        .map(|tool| ModelToolDefinition {
-                            name: tool.name,
-                            description: tool.description,
-                            input_schema: tool.input_schema,
-                        })
-                        .collect(),
-                })
-                .await
-                .map_err(model_client_error)?;
+            let request = ModelRequest {
+                instructions: request.prompt,
+                input: serde_json::to_string(&json!({
+                    "objective": request.objective,
+                    "context_manifest": request.manifest_artifact_id,
+                    "context": request.context,
+                    "prior_tool_results": request.prior_tool_results,
+                }))?,
+                schema_name: Some(request.purpose),
+                schema: Some(request.output_schema),
+                max_output_tokens: request.max_output_tokens,
+                tools: request
+                    .tools
+                    .into_iter()
+                    .map(|tool| ModelToolDefinition {
+                        name: tool.name,
+                        description: tool.description,
+                        input_schema: tool.input_schema,
+                        strict: tool.strict,
+                    })
+                    .collect(),
+            };
+            let debug_request = self.debug.then(|| self.client.request_body(&request));
+            let response = self.client.respond(request).await.map_err(|error| {
+                let trace = debug_request.map(|request| ModelCallTrace {
+                    request,
+                    result: model_error_result(&error),
+                });
+                model_client_error(error, trace)
+            })?;
+            let model_debug = self.debug.then(|| ModelCallTrace {
+                request: response.request_body.clone(),
+                result: response.raw.clone(),
+            });
             let output = (!response.output_text.trim().is_empty())
                 .then(|| serde_json::from_str(&response.output_text))
                 .transpose()
                 .map_err(|error| {
-                    ResearchError::InvalidOutput(format!("model output JSON: {error}"))
+                    model_output_error(format!("model output JSON: {error}"), model_debug.clone())
                 })?;
             let tool_calls = response
                 .tool_calls
                 .into_iter()
-                .map(|call| {
-                    let artifact_id = call
-                        .arguments
-                        .get("artifact_id")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| {
-                            ResearchError::InvalidOutput(format!(
-                                "tool {} omitted artifact_id",
-                                call.name
-                            ))
-                        })?;
-                    Ok(AgentToolCall {
-                        call_id: call.call_id,
-                        name: call.name,
-                        artifact_id: ArtifactId(akzio_domain::ContentHash::new(artifact_id)?),
-                    })
+                .map(|call| AgentToolCall {
+                    call_id: call.call_id,
+                    name: call.name,
+                    arguments: call.arguments,
                 })
-                .collect::<ResearchResult<Vec<_>>>()?;
-            Ok(AgentModelTurn { output, tool_calls })
+                .collect();
+            Ok(AgentModelTurn {
+                output,
+                tool_calls,
+                model_debug,
+            })
         })
     }
 }
@@ -1048,11 +1230,17 @@ impl AgentRuntime {
             return Err(ResearchError::GrantPermitMismatch);
         }
         let context = self.context_values(permit, &manifest, now)?;
-        let prompt = String::from_utf8(self.store.read_blob(&installed.contract.prompt)?)
-            .map_err(|_| ResearchError::InvalidOutput("prompt is not UTF-8".to_owned()))?;
+        let governance = String::from_utf8(
+            self.store
+                .read_blob(&installed.contract.prompt.governance)?,
+        )
+        .map_err(|_| ResearchError::InvalidOutput("governance prompt is not UTF-8".to_owned()))?;
+        let role = String::from_utf8(self.store.read_blob(&installed.contract.prompt.role)?)
+            .map_err(|_| ResearchError::InvalidOutput("role prompt is not UTF-8".to_owned()))?;
+        let prompt = format!("{governance}\n\n{role}");
         let output_schema: Value =
             serde_json::from_slice(&self.store.read_blob(&installed.contract.output.schema)?)?;
-        let tools = model_tool_definitions(&installed.contract);
+        let tools = model_tool_definitions(&self.store, &installed.contract)?;
         let mut tool_results = Vec::new();
         let mut trace_refs = Vec::new();
         let mut tool_calls = 0_u16;
@@ -1085,6 +1273,7 @@ impl AgentRuntime {
                     maximum: installed.contract.budget.max_input_tokens,
                 });
             }
+            let request_hash = model_request_hash(&request)?;
             let mut turn_attempt = 1_u8;
             let turn = loop {
                 match model.turn(request.clone()).await {
@@ -1103,7 +1292,9 @@ impl AgentRuntime {
                                 attempt: turn_attempt,
                                 now: turn_now,
                             },
+                            &request,
                             model_error_class(&error),
+                            model_debug_trace(&error),
                             will_retry,
                         )?;
                         trace_refs.push(ArtifactRef {
@@ -1143,7 +1334,9 @@ impl AgentRuntime {
                         attempt: turn_attempt,
                         now: turn_now,
                     },
+                    &request,
                     "wall_time",
+                    None,
                     false,
                 )?;
                 trace_refs.push(ArtifactRef {
@@ -1164,6 +1357,7 @@ impl AgentRuntime {
                     attempt: turn_attempt,
                     now: turn_now,
                 },
+                &request,
                 &turn,
             )?;
             trace_refs.push(ArtifactRef {
@@ -1181,6 +1375,7 @@ impl AgentRuntime {
                         &installed.contract,
                         &manifest.grant,
                         &call,
+                        &request_hash,
                         turn_now,
                     )?;
                     trace_refs.push(ArtifactRef {
@@ -1202,6 +1397,11 @@ impl AgentRuntime {
                 });
             }
             validate_output_schema(&self.store, &installed.contract, &output)?;
+            let research_sources = research_output_source_refs(
+                installed.contract.output.artifact_kind,
+                &output,
+                &manifest,
+            )?;
             let output_artifact = Artifact::new(
                 installed.contract.output.artifact_kind,
                 self.store.put_json(&output)?,
@@ -1221,6 +1421,7 @@ impl AgentRuntime {
                     kind: ArtifactKind::ContextManifest,
                 })
                 .chain(trace_refs)
+                .chain(research_sources)
                 .collect(),
                 turn_now,
             )?;
@@ -1262,8 +1463,10 @@ impl AgentRuntime {
     fn record_turn(
         &self,
         record: &TurnRecord<'_>,
+        request: &AgentModelRequest,
         response: &AgentModelTurn,
     ) -> ResearchResult<Artifact> {
+        let request_hash = model_request_hash(request)?;
         let artifact = Artifact::new(
             ArtifactKind::AgentTurn,
             self.store.put_json(&json!({
@@ -1271,6 +1474,8 @@ impl AgentRuntime {
                 "attempt": record.attempt,
                 "contract_hash": record.contract.contract_hash,
                 "context_manifest": record.manifest.artifact.artifact_id,
+                "request_hash": request_hash,
+                "request": request,
                 "response": response,
             }))?,
             format!("agent.turn.{}", record.contract.purpose.as_str()),
@@ -1302,19 +1507,28 @@ impl AgentRuntime {
     fn record_failed_turn(
         &self,
         record: &TurnRecord<'_>,
+        request: &AgentModelRequest,
         error_class: &str,
+        model_debug: Option<&ModelCallTrace>,
         will_retry: bool,
     ) -> ResearchResult<Artifact> {
+        let request_hash = model_request_hash(request)?;
+        let mut trace = json!({
+            "turn": record.turn,
+            "attempt": record.attempt,
+            "contract_hash": record.contract.contract_hash,
+            "context_manifest": record.manifest.artifact.artifact_id,
+            "request_hash": request_hash,
+            "request": request,
+            "error_class": error_class,
+            "will_retry": will_retry,
+        });
+        if let Some(model_debug) = model_debug {
+            trace["model_debug"] = serde_json::to_value(model_debug)?;
+        }
         let artifact = Artifact::new(
             ArtifactKind::AgentTurn,
-            self.store.put_json(&json!({
-                "turn": record.turn,
-                "attempt": record.attempt,
-                "contract_hash": record.contract.contract_hash,
-                "context_manifest": record.manifest.artifact.artifact_id,
-                "error_class": error_class,
-                "will_retry": will_retry,
-            }))?,
+            self.store.put_json(&trace)?,
             format!("agent.turn.{}", record.contract.purpose.as_str()),
             ArtifactLifecycle::RunScoped,
             ArtifactProvenance {
@@ -1351,48 +1565,15 @@ impl AgentRuntime {
         contract: &AgentContract,
         grant: &ReadGrant,
         call: &AgentToolCall,
+        request_hash: &akzio_domain::ContentHash,
         now: DateTime<Utc>,
     ) -> ResearchResult<ToolResult> {
-        if !grant.matches_permit(permit) {
-            return Err(ResearchError::GrantPermitMismatch);
-        }
-        let tool = match call.name.as_str() {
-            "read_artifact" => akzio_domain::ToolKind::ReadEvidence,
-            "read_raw_evidence" => akzio_domain::ToolKind::ReadRawEvidence,
-            _ => return Err(ResearchError::ToolNotGranted(call.name.clone())),
-        };
-        if !contract.tool_grants.iter().any(|grant| grant.kind == tool) {
-            return Err(ResearchError::ToolNotGranted(call.name.clone()));
-        }
-        let raw = tool == akzio_domain::ToolKind::ReadRawEvidence;
-        let artifact = if raw {
-            self.context.read_raw(grant, &call.artifact_id, now)?
-        } else {
-            self.context.read(grant, &call.artifact_id, now)?
-        };
-        if !contract
-            .tool_grants
-            .iter()
-            .filter(|tool_grant| tool_grant.kind == tool)
-            .any(|tool_grant| {
-                tool_grant.allowed_sources.is_empty()
-                    || tool_grant
-                        .allowed_sources
-                        .iter()
-                        .any(|source| source == &artifact.provenance.source_family)
-            })
-        {
-            return Err(ResearchError::ToolSourceNotGranted {
-                tool: call.name.clone(),
-                source_family: artifact.provenance.source_family.clone(),
-            });
-        }
-        let bytes = self.store.read_blob(&artifact.blob)?;
-        let value = serde_json::from_slice(&bytes)
-            .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()));
         let call_artifact = Artifact::new(
             ArtifactKind::ToolCall,
-            self.store.put_json(call)?,
+            self.store.put_json(&json!({
+                "request_hash": request_hash,
+                "call": call,
+            }))?,
             "agent.tool",
             ArtifactLifecycle::RunScoped,
             ArtifactProvenance {
@@ -1412,44 +1593,174 @@ impl AgentRuntime {
         )?;
         self.store
             .write_task_artifact(permit, &call_artifact, "tool.called", now)?;
-        let result_artifact = Artifact::new(
-            ArtifactKind::ToolResult,
-            self.store.put_json(&value)?,
-            "agent.tool",
-            ArtifactLifecycle::RunScoped,
-            ArtifactProvenance {
-                source_family: "akzio.tool".to_owned(),
-                observed_at: None,
-                retrieved_at: now,
-                source_uri: None,
-                confidence_ppm: 1_000_000,
-                producer_contract_hash: Some(contract.contract_hash.clone()),
-            },
-            Some(task_origin(permit)),
-            vec![
-                ArtifactRef {
-                    artifact_id: call_artifact.artifact_id.clone(),
-                    kind: ArtifactKind::ToolCall,
-                },
-                ArtifactRef {
-                    artifact_id: artifact.artifact_id.clone(),
-                    kind: artifact.kind,
-                },
-            ],
-            now,
-        )?;
-        self.store
-            .write_task_artifact(permit, &result_artifact, "tool.completed", now)?;
-        Ok(ToolResult {
-            value: json!({
-                "call_id": call.call_id,
-                "artifact_id": artifact.artifact_id,
-                "kind": artifact.kind,
-                "value": value,
-            }),
-            artifact: result_artifact,
-        })
+
+        match self.execute_tool_inner(permit, contract, grant, call, now) {
+            Ok((artifact, value)) => {
+                let result_artifact = Artifact::new(
+                    ArtifactKind::ToolResult,
+                    self.store.put_json(&json!({
+                        "request_hash": request_hash,
+                        "call_id": call.call_id,
+                        "name": call.name,
+                        "ok": true,
+                        "value": value,
+                    }))?,
+                    "agent.tool",
+                    ArtifactLifecycle::RunScoped,
+                    ArtifactProvenance {
+                        source_family: "akzio.tool".to_owned(),
+                        observed_at: None,
+                        retrieved_at: now,
+                        source_uri: None,
+                        confidence_ppm: 1_000_000,
+                        producer_contract_hash: Some(contract.contract_hash.clone()),
+                    },
+                    Some(task_origin(permit)),
+                    vec![
+                        ArtifactRef {
+                            artifact_id: call_artifact.artifact_id.clone(),
+                            kind: ArtifactKind::ToolCall,
+                        },
+                        ArtifactRef {
+                            artifact_id: artifact.artifact_id.clone(),
+                            kind: artifact.kind,
+                        },
+                    ],
+                    now,
+                )?;
+                self.store
+                    .write_task_artifact(permit, &result_artifact, "tool.completed", now)?;
+                Ok(ToolResult {
+                    value: json!({
+                        "call_id": call.call_id,
+                        "artifact_id": artifact.artifact_id,
+                        "kind": artifact.kind,
+                        "ok": true,
+                        "value": value,
+                    }),
+                    artifact: result_artifact,
+                })
+            }
+            Err(error) => {
+                let result_artifact = Artifact::new(
+                    ArtifactKind::ToolResult,
+                    self.store.put_json(&json!({
+                        "request_hash": request_hash,
+                        "call_id": call.call_id,
+                        "name": call.name,
+                        "ok": false,
+                        "error": {
+                            "code": tool_error_code(&error),
+                            "message": error.to_string(),
+                        },
+                    }))?,
+                    "agent.tool",
+                    ArtifactLifecycle::RunScoped,
+                    ArtifactProvenance {
+                        source_family: "akzio.tool".to_owned(),
+                        observed_at: None,
+                        retrieved_at: now,
+                        source_uri: None,
+                        confidence_ppm: 1_000_000,
+                        producer_contract_hash: Some(contract.contract_hash.clone()),
+                    },
+                    Some(task_origin(permit)),
+                    vec![ArtifactRef {
+                        artifact_id: call_artifact.artifact_id.clone(),
+                        kind: ArtifactKind::ToolCall,
+                    }],
+                    now,
+                )?;
+                self.store
+                    .write_task_artifact(permit, &result_artifact, "tool.failed", now)?;
+                Err(error)
+            }
+        }
     }
+
+    fn execute_tool_inner(
+        &self,
+        permit: &TaskWritePermit,
+        contract: &AgentContract,
+        grant: &ReadGrant,
+        call: &AgentToolCall,
+        now: DateTime<Utc>,
+    ) -> ResearchResult<(Artifact, Value)> {
+        if !grant.matches_permit(permit) {
+            return Err(ResearchError::GrantPermitMismatch);
+        }
+        let tool = contract
+            .tool_specs
+            .iter()
+            .find(|spec| spec.name == call.name)
+            .ok_or_else(|| ResearchError::ToolNotGranted(call.name.clone()))?;
+        let artifact_id = strict_artifact_id_argument(&call.arguments, &call.name)?;
+        if !contract
+            .tool_grants
+            .iter()
+            .any(|grant| grant.kind == tool.kind)
+        {
+            return Err(ResearchError::ToolNotGranted(call.name.clone()));
+        }
+        let raw = tool.kind == akzio_domain::ToolKind::ReadRawEvidence;
+        let artifact = if raw {
+            self.context.read_raw(grant, &artifact_id, now)?
+        } else {
+            self.context.read(grant, &artifact_id, now)?
+        };
+        if !contract
+            .tool_grants
+            .iter()
+            .filter(|tool_grant| tool_grant.kind == tool.kind)
+            .any(|tool_grant| {
+                tool_grant.allowed_sources.is_empty()
+                    || tool_grant
+                        .allowed_sources
+                        .iter()
+                        .any(|source| source == &artifact.provenance.source_family)
+            })
+        {
+            return Err(ResearchError::ToolSourceNotGranted {
+                tool: call.name.clone(),
+                source_family: artifact.provenance.source_family.clone(),
+            });
+        }
+        let bytes = self.store.read_blob(&artifact.blob)?;
+        let value = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()));
+        Ok((artifact, value))
+    }
+}
+
+fn tool_error_code(error: &ResearchError) -> &'static str {
+    match error {
+        ResearchError::GrantPermitMismatch => "grant_permit_mismatch",
+        ResearchError::ToolNotGranted(_) => "tool_not_granted",
+        ResearchError::ToolSourceNotGranted { .. } => "tool_source_not_granted",
+        ResearchError::InvalidOutput(_) => "invalid_tool_arguments",
+        ResearchError::Context(_) => "context_read_rejected",
+        _ => "tool_execution_failed",
+    }
+}
+
+fn strict_artifact_id_argument(arguments: &Value, tool_name: &str) -> ResearchResult<ArtifactId> {
+    let object = arguments.as_object().ok_or_else(|| {
+        ResearchError::InvalidOutput(format!(
+            "tool {tool_name} arguments do not match its strict schema"
+        ))
+    })?;
+    if object.len() != 1 {
+        return Err(ResearchError::InvalidOutput(format!(
+            "tool {tool_name} arguments do not match its strict schema"
+        )));
+    }
+    let artifact_id = object
+        .get("artifact_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            ResearchError::InvalidOutput(format!("tool {tool_name} omitted artifact_id"))
+        })?;
+    Ok(ArtifactId(akzio_domain::ContentHash::new(artifact_id)?))
 }
 
 fn estimate_tokens<T: Serialize>(value: &T) -> ResearchResult<u32> {
@@ -1457,51 +1768,100 @@ fn estimate_tokens<T: Serialize>(value: &T) -> ResearchResult<u32> {
     Ok(u32::try_from(bytes.div_ceil(4).max(1)).unwrap_or(u32::MAX))
 }
 
-fn model_tool_definitions(contract: &AgentContract) -> Vec<AgentToolDefinition> {
+fn model_request_hash(request: &AgentModelRequest) -> ResearchResult<akzio_domain::ContentHash> {
+    Ok(akzio_domain::content_hash_json(&serde_json::to_value(
+        request,
+    )?)?)
+}
+
+fn model_tool_definitions(
+    store: &V2Store,
+    contract: &AgentContract,
+) -> ResearchResult<Vec<AgentToolDefinition>> {
     contract
-        .tool_grants
+        .tool_specs
         .iter()
-        .filter_map(|grant| match grant.kind {
-            akzio_domain::ToolKind::ReadEvidence => Some((
-                "read_artifact",
-                "Read one artifact explicitly granted by the ContextManifest.",
-            )),
-            akzio_domain::ToolKind::ReadRawEvidence => Some((
-                "read_raw_evidence",
-                "Read one explicitly granted raw evidence artifact.",
-            )),
-            _ => None,
-        })
-        .map(|(name, description)| AgentToolDefinition {
-            name: name.to_owned(),
-            description: description.to_owned(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {"artifact_id": {"type": "string"}},
-                "required": ["artifact_id"],
-                "additionalProperties": false,
-            }),
+        .map(|spec| {
+            let input_schema: Value =
+                serde_json::from_slice(&store.read_blob(&spec.input_schema)?)?;
+            if input_schema != artifact_id_tool_input_schema() {
+                return Err(ResearchError::InvalidToolSpec(format!(
+                    "{} must use the strict artifact_id input schema",
+                    spec.name
+                )));
+            }
+            Ok(AgentToolDefinition {
+                name: spec.name.clone(),
+                description: spec.description.clone(),
+                input_schema,
+                strict: spec.strict,
+            })
         })
         .collect()
 }
 
-fn model_client_error(error: ModelError) -> ResearchError {
+fn model_error_result(error: &ModelError) -> Value {
     match error {
-        ModelError::Transport(_) => ResearchError::Model("transport".to_owned()),
+        ModelError::Http { status, body } => json!({
+            "status": status.as_u16(),
+            "body": serde_json::from_str::<Value>(body)
+                .unwrap_or_else(|_| Value::String(body.clone())),
+        }),
+        ModelError::Transport(_) => json!({"error": "transport"}),
+        ModelError::MissingOutput => json!({"error": "missing_output"}),
+        ModelError::FixtureExhausted => json!({"error": "fixture_exhausted"}),
+        ModelError::EmptyBaseUrl
+        | ModelError::EmptyApiKey
+        | ModelError::EmptyModel
+        | ModelError::EmptyReasoningEffort => json!({"error": "configuration"}),
+    }
+}
+
+fn model_client_error(error: ModelError, trace: Option<ModelCallTrace>) -> ResearchError {
+    let (error_class, message) = match error {
+        ModelError::Transport(_) => ("transport", "transport".to_owned()),
         ModelError::Http { status, .. } if status.as_u16() == 429 => {
-            ResearchError::RateLimited("HTTP 429".to_owned())
+            ("rate_limited", "HTTP 429".to_owned())
         }
-        ModelError::Http { status, .. } => {
-            ResearchError::Model(format!("HTTP {}", status.as_u16()))
+        ModelError::Http { status, .. } => ("transport", format!("HTTP {}", status.as_u16())),
+        ModelError::EmptyBaseUrl => ("configuration", "invalid base URL".to_owned()),
+        ModelError::EmptyApiKey => ("configuration", "missing API key".to_owned()),
+        ModelError::EmptyModel => ("configuration", "missing model name".to_owned()),
+        ModelError::EmptyReasoningEffort => {
+            ("configuration", "missing reasoning effort".to_owned())
         }
-        ModelError::EmptyBaseUrl => ResearchError::Model("invalid base URL".to_owned()),
-        ModelError::MissingOutput => ResearchError::Model("missing model output".to_owned()),
-        ModelError::FixtureExhausted => {
-            ResearchError::Model("fixture sequence exhausted".to_owned())
-        }
-        ModelError::MissingEnvironment(_) => {
-            ResearchError::Model("model configuration missing".to_owned())
-        }
+        ModelError::MissingOutput => ("invalid_output", "missing model output".to_owned()),
+        ModelError::FixtureExhausted => ("transport", "fixture sequence exhausted".to_owned()),
+    };
+    if let Some(trace) = trace {
+        return ResearchError::ModelDebug {
+            error_class,
+            message,
+            trace,
+        };
+    }
+    if error_class == "rate_limited" {
+        ResearchError::RateLimited(message)
+    } else {
+        ResearchError::Model(message)
+    }
+}
+
+fn model_output_error(message: String, trace: Option<ModelCallTrace>) -> ResearchError {
+    match trace {
+        Some(trace) => ResearchError::ModelDebug {
+            error_class: "invalid_output",
+            message,
+            trace,
+        },
+        None => ResearchError::InvalidOutput(message),
+    }
+}
+
+fn model_debug_trace(error: &ResearchError) -> Option<&ModelCallTrace> {
+    match error {
+        ResearchError::ModelDebug { trace, .. } => Some(trace),
+        _ => None,
     }
 }
 
@@ -1510,28 +1870,24 @@ fn logical_now(start: DateTime<Utc>, elapsed: StdDuration) -> DateTime<Utc> {
 }
 
 fn retryable_model_error(error: &ResearchError, retry: &akzio_domain::RetryPolicy) -> bool {
-    matches!(
-        (error, retry),
-        (
-            ResearchError::Model(_),
-            akzio_domain::RetryPolicy {
-                retry_transport: true,
-                ..
-            }
-        ) | (
-            ResearchError::RateLimited(_),
-            akzio_domain::RetryPolicy {
-                retry_rate_limited: true,
-                ..
-            }
-        )
-    )
+    match error {
+        ResearchError::Model(_) => retry.retry_transport,
+        ResearchError::RateLimited(_) => retry.retry_rate_limited,
+        ResearchError::ModelDebug { error_class, .. } if *error_class == "transport" => {
+            retry.retry_transport
+        }
+        ResearchError::ModelDebug { error_class, .. } if *error_class == "rate_limited" => {
+            retry.retry_rate_limited
+        }
+        _ => false,
+    }
 }
 
 fn model_error_class(error: &ResearchError) -> &'static str {
     match error {
         ResearchError::Model(_) => "transport",
         ResearchError::RateLimited(_) => "rate_limited",
+        ResearchError::ModelDebug { error_class, .. } => error_class,
         _ => "other",
     }
 }
@@ -1881,8 +2237,9 @@ mod tests {
 
     use akzio_domain::{
         ArtifactLifecycle, ContextPolicy, ContractId, ContractPurpose, FailureDisposition,
-        OutputContract, RetryPolicy, TaskBudget, TaskRecipeId, TaskStatus, TerminationPolicy,
-        ToolGrant, ToolKind, WorkflowGraph, WorkflowNode, V2_SCHEMA_VERSION,
+        OutputContract, PromptBundle, RetryPolicy, TaskBudget, TaskRecipeId, TaskStatus,
+        TerminationPolicy, ToolGrant, ToolKind, ToolSpec, WorkflowGraph, WorkflowNode,
+        V2_SCHEMA_VERSION,
     };
     use akzio_store::v2::{StoredRun, WorkflowCommit};
     use tempfile::tempdir;
@@ -1902,7 +2259,14 @@ mod tests {
         ) -> BoxFuture<'a, ResearchResult<AgentModelTurn>> {
             Box::pin(async move {
                 match self.calls.fetch_add(1, Ordering::SeqCst) {
-                    0 => Err(ResearchError::Model("transient fixture failure".to_owned())),
+                    0 => Err(ResearchError::ModelDebug {
+                        error_class: "transport",
+                        message: "transient fixture failure".to_owned(),
+                        trace: ModelCallTrace {
+                            request: json!({"fixture": "failed-provider-request"}),
+                            result: json!({"error": "fixture-transport"}),
+                        },
+                    }),
                     1 => {
                         assert!(request.prior_tool_results.is_empty());
                         Ok(AgentModelTurn {
@@ -1910,8 +2274,12 @@ mod tests {
                             tool_calls: vec![AgentToolCall {
                                 call_id: "fixture-read-evidence".to_owned(),
                                 name: "read_artifact".to_owned(),
-                                artifact_id: self.evidence_id.clone(),
+                                arguments: json!({"artifact_id": self.evidence_id.0.as_str()}),
                             }],
+                            model_debug: Some(ModelCallTrace {
+                                request: json!({"fixture": "provider-request"}),
+                                result: json!({"fixture": "provider-result"}),
+                            }),
                         })
                     }
                     2 => {
@@ -1921,8 +2289,25 @@ mod tests {
                             json!({"price": 100})
                         );
                         Ok(AgentModelTurn {
-                            output: Some(json!({"summary":"source-linked claim"})),
+                            output: Some(json!({
+                                        "schema_version": V2_SCHEMA_VERSION,
+                                        "topic": "market_regime",
+                                        "statement": "The selected price evidence supports the stated regime claim.",
+                                        "horizon": "t5",
+                                        "stance": "bullish",
+                                        "materiality_ppm": 800_000,
+                                        "confidence_ppm": 700_000,
+                                        "grounds": [{
+                                            "evidence": {
+                                                "artifact_id": self.evidence_id.0.as_str(),
+                                                "kind": "normalized_evidence"
+                                            },
+                                            "support": "The governed evidence supplied the price used in this claim."
+                                        }],
+                                        "evidence_gaps": []
+                            })),
                             tool_calls: vec![],
+                            model_debug: None,
                         })
                     }
                     _ => panic!("runtime requested an unexpected extra model turn"),
@@ -1961,8 +2346,9 @@ mod tests {
                     tool_calls: vec![AgentToolCall {
                         call_id: "fixture-expired-grant".to_owned(),
                         name: "read_artifact".to_owned(),
-                        artifact_id: evidence_id,
+                        arguments: json!({"artifact_id": evidence_id.0.as_str()}),
                     }],
+                    model_debug: None,
                 })
             })
         }
@@ -1981,6 +2367,7 @@ mod tests {
                 Ok(AgentModelTurn {
                     output: Some(json!({"summary":"too late"})),
                     tool_calls: vec![],
+                    model_debug: None,
                 })
             })
         }
@@ -1992,12 +2379,16 @@ mod tests {
             1,
             ContractPurpose::new("research.analyst").unwrap(),
             "produce a claim",
-            store.put_bytes(b"prompt", "text/plain").unwrap(),
-        ContextPolicy {
-            permitted_kinds: BTreeSet::from([ArtifactKind::NormalizedEvidence]),
-            permitted_source_families: BTreeSet::from(["market".to_owned()]),
-            min_artifacts: 1,
-            max_artifacts: 4,
+            PromptBundle {
+                version: 1,
+                governance: store.put_bytes(b"governance", "text/plain").unwrap(),
+                role: store.put_bytes(b"prompt", "text/plain").unwrap(),
+            },
+            ContextPolicy {
+                permitted_kinds: BTreeSet::from([ArtifactKind::NormalizedEvidence]),
+                permitted_source_families: BTreeSet::from(["market".to_owned()]),
+                min_artifacts: 1,
+                max_artifacts: 4,
                 max_bytes: 4096,
                 max_tokens: 1024,
                 allow_raw_reread: false,
@@ -2006,14 +2397,16 @@ mod tests {
                 kind: ToolKind::ReadEvidence,
                 allowed_sources: vec!["market".to_owned()],
             }],
+            vec![ToolSpec {
+                name: "read_artifact".to_owned(),
+                description: "read granted artifact".to_owned(),
+                kind: ToolKind::ReadEvidence,
+                input_schema: store.put_json(&artifact_id_tool_input_schema()).unwrap(),
+                strict: true,
+            }],
             OutputContract {
                 artifact_kind: ArtifactKind::Claim,
-                schema: store
-                    .put_bytes(
-                        br#"{"type":"object","properties":{"summary":{"type":"string"}},"required":["summary"],"additionalProperties":false}"#,
-                        "application/json",
-                    )
-                    .unwrap(),
+                schema: store.put_json(&claim_output_schema()).unwrap(),
             },
             TaskBudget {
                 max_input_tokens: 1024,
@@ -2545,16 +2938,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn model_client_adapter_decodes_only_the_contract_tool_shape() {
+    async fn model_client_adapter_debug_trace_retains_the_provider_request_and_result() {
         let artifact_hash = akzio_domain::ContentHash::of_bytes(b"fixture-artifact");
-        let adapter = ModelClientAdapter::new(akzio_model::ModelClient::Fixture(json!({
-            "output_text": "",
-            "tool_calls": [{
-                "call_id": "fixture-tool",
-                "name": "read_artifact",
-                "arguments": {"artifact_id": artifact_hash.as_str()},
-            }],
-        })));
+        let adapter = ModelClientAdapter::with_debug(
+            akzio_model::ModelClient::Fixture(json!({
+                "output_text": "",
+                "tool_calls": [{
+                    "call_id": "fixture-tool",
+                    "name": "read_artifact",
+                    "arguments": {"artifact_id": artifact_hash.as_str()},
+                }],
+            })),
+            true,
+        );
         let response = adapter
             .turn(AgentModelRequest {
                 contract_hash: akzio_domain::ContentHash::of_bytes(b"fixture-contract"),
@@ -2582,6 +2978,7 @@ mod tests {
                         "required": ["artifact_id"],
                         "additionalProperties": false,
                     }),
+                    strict: true,
                 }],
             })
             .await
@@ -2590,7 +2987,14 @@ mod tests {
         assert!(response.output.is_none());
         assert_eq!(response.tool_calls.len(), 1);
         assert_eq!(response.tool_calls[0].name, "read_artifact");
-        assert_eq!(response.tool_calls[0].artifact_id.0, artifact_hash);
+        assert_eq!(
+            response.tool_calls[0].arguments["artifact_id"],
+            artifact_hash.to_string()
+        );
+        let trace = response.model_debug.expect("debug trace is retained");
+        assert_eq!(trace.request["model"], "fixture");
+        assert_eq!(trace.request["tools"][0]["strict"], true);
+        assert_eq!(trace.result["tool_calls"][0]["call_id"], "fixture-tool");
     }
 
     #[tokio::test]
@@ -2664,8 +3068,9 @@ mod tests {
             tool_calls: vec![AgentToolCall {
                 call_id: "fixture-news-denied".to_owned(),
                 name: "read_artifact".to_owned(),
-                artifact_id: news.artifact_id.clone(),
+                arguments: json!({"artifact_id": news.artifact_id.0.as_str()}),
             }],
+            model_debug: None,
         });
 
         assert!(matches!(
@@ -2683,7 +3088,82 @@ mod tests {
                 .await,
             Err(ResearchError::ToolSourceNotGranted { .. })
         ));
+        let failure_id = store
+            .events_after(&claimed.run_id, 0, 100)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.event_type == "tool.failed")
+            .and_then(|event| event.artifact_id)
+            .expect("failed tool result is durable");
+        let failure = store.artifact(&failure_id).unwrap();
+        let trace: Value =
+            serde_json::from_slice(&store.read_blob(&failure.blob).unwrap()).unwrap();
+        assert_eq!(trace["ok"], false);
+        assert_eq!(trace["error"]["code"], "tool_source_not_granted");
+        assert!(failure
+            .source_refs
+            .iter()
+            .any(|reference| reference.kind == ArtifactKind::ToolCall));
         store.verify_integrity().unwrap();
+    }
+
+    #[tokio::test]
+    async fn agent_runtime_records_invalid_tool_arguments_before_rejecting() {
+        let Fixture {
+            _root,
+            store,
+            catalogue,
+            claimed,
+            evidence,
+        } = fixture_with(|_| {});
+        let runtime = AgentRuntime::new(store.clone(), catalogue, Duration::minutes(5));
+        let model = FixedModel(AgentModelTurn {
+            output: None,
+            tool_calls: vec![AgentToolCall {
+                call_id: "fixture-invalid-arguments".to_owned(),
+                name: "read_artifact".to_owned(),
+                arguments: json!({"unexpected": true}),
+            }],
+            model_debug: None,
+        });
+
+        assert!(matches!(
+            runtime
+                .run(
+                    &claimed.permit,
+                    &claimed.node,
+                    [ArtifactRef {
+                        artifact_id: evidence.artifact_id,
+                        kind: ArtifactKind::NormalizedEvidence,
+                    }],
+                    &model,
+                    Utc::now(),
+                )
+                .await,
+            Err(ResearchError::InvalidOutput(_))
+        ));
+
+        let failure_id = store
+            .events_after(&claimed.run_id, 0, 100)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.event_type == "tool.failed")
+            .and_then(|event| event.artifact_id)
+            .expect("invalid tool result is durable");
+        let failure = store.artifact(&failure_id).unwrap();
+        let trace: Value =
+            serde_json::from_slice(&store.read_blob(&failure.blob).unwrap()).unwrap();
+        assert_eq!(trace["ok"], false);
+        assert_eq!(trace["error"]["code"], "invalid_tool_arguments");
+        let call = failure
+            .source_refs
+            .iter()
+            .find(|reference| reference.kind == ArtifactKind::ToolCall)
+            .and_then(|reference| store.artifact(&reference.artifact_id).ok())
+            .expect("invalid tool call is durable");
+        let call_trace: Value =
+            serde_json::from_slice(&store.read_blob(&call.blob).unwrap()).unwrap();
+        assert_eq!(call_trace["call"]["arguments"], json!({"unexpected": true}));
     }
 
     #[tokio::test]
@@ -2821,6 +3301,10 @@ mod tests {
             .source_refs
             .iter()
             .any(|source| source.kind == ArtifactKind::AgentTurn));
+        assert!(output.source_refs.iter().any(|source| {
+            source.kind == ArtifactKind::NormalizedEvidence
+                && source.artifact_id == evidence.artifact_id
+        }));
         let tool_result = output
             .source_refs
             .iter()
@@ -2835,10 +3319,66 @@ mod tests {
             .source_refs
             .iter()
             .any(|source| source.artifact_id == evidence.artifact_id));
+        let tool_trace: Value =
+            serde_json::from_slice(&store.read_blob(&tool_result.blob).unwrap()).unwrap();
+        assert!(tool_trace["request_hash"].as_str().is_some());
+        let tool_call = tool_result
+            .source_refs
+            .iter()
+            .find(|source| source.kind == ArtifactKind::ToolCall)
+            .and_then(|source| store.artifact(&source.artifact_id).ok())
+            .expect("tool call trace is durable");
+        let tool_call_trace: Value =
+            serde_json::from_slice(&store.read_blob(&tool_call.blob).unwrap()).unwrap();
+        assert_eq!(
+            tool_call_trace["call"]["arguments"]["artifact_id"],
+            evidence.artifact_id.0.as_str()
+        );
+        let turn_trace = output
+            .source_refs
+            .iter()
+            .filter(|source| source.kind == ArtifactKind::AgentTurn)
+            .filter_map(|source| store.artifact(&source.artifact_id).ok())
+            .map(|artifact| {
+                serde_json::from_slice::<Value>(&store.read_blob(&artifact.blob).unwrap()).unwrap()
+            })
+            .find(|trace| {
+                trace["response"]["model_debug"]["request"]["fixture"] == "provider-request"
+            })
+            .expect("agent turn trace retains request and response");
+        assert!(turn_trace["request_hash"].as_str().is_some());
+        assert_eq!(turn_trace["request"]["tools"][0]["strict"], true);
+        assert_eq!(
+            turn_trace["response"]["model_debug"]["request"]["fixture"],
+            "provider-request"
+        );
+        assert_eq!(
+            turn_trace["response"]["model_debug"]["result"]["fixture"],
+            "provider-result"
+        );
+        let failed_turn_trace = output
+            .source_refs
+            .iter()
+            .filter(|source| source.kind == ArtifactKind::AgentTurn)
+            .filter_map(|source| store.artifact(&source.artifact_id).ok())
+            .map(|artifact| {
+                serde_json::from_slice::<Value>(&store.read_blob(&artifact.blob).unwrap()).unwrap()
+            })
+            .find(|trace| trace["error_class"] == "transport")
+            .expect("failed agent turn trace is durable");
+        assert_eq!(
+            failed_turn_trace["model_debug"]["request"]["fixture"],
+            "failed-provider-request"
+        );
+        assert_eq!(
+            failed_turn_trace["model_debug"]["result"]["error"],
+            "fixture-transport"
+        );
 
         let malformed = FixedModel(AgentModelTurn {
             output: Some(json!({"summary": 42})),
             tool_calls: vec![],
+            model_debug: None,
         });
         assert!(matches!(
             runtime
@@ -2861,8 +3401,9 @@ mod tests {
             tool_calls: vec![AgentToolCall {
                 call_id: "fixture-denied-raw".to_owned(),
                 name: "read_raw_evidence".to_owned(),
-                artifact_id: evidence.artifact_id.clone(),
+                arguments: json!({"artifact_id": evidence.artifact_id.0.as_str()}),
             }],
+            model_debug: None,
         });
         assert!(matches!(
             runtime
@@ -2886,9 +3427,10 @@ mod tests {
                 .map(|index| AgentToolCall {
                     call_id: format!("fixture-over-budget-{index}"),
                     name: "read_artifact".to_owned(),
-                    artifact_id: evidence.artifact_id.clone(),
+                    arguments: json!({"artifact_id": evidence.artifact_id.0.as_str()}),
                 })
                 .collect(),
+            model_debug: None,
         });
         assert!(matches!(
             runtime
@@ -2947,6 +3489,7 @@ mod tests {
         let output = FixedModel(AgentModelTurn {
             output: Some(json!({"summary":"source-linked claim"})),
             tool_calls: vec![],
+            model_debug: None,
         });
         let result = runtime
             .run(

@@ -10,6 +10,7 @@
 /outputs/
 /config/local*.yaml
 /config/*.local.yaml
+/config/*.local.toml
 *.log
 
 # Environment and secrets

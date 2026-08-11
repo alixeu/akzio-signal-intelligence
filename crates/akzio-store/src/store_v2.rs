@@ -6992,9 +6992,9 @@ mod tests {
     use akzio_domain::{
         ArtifactLifecycle, ArtifactProvenance, Asset, ContextPolicy, ExecutionPlan, FactorExposure,
         FailureDisposition, HardBlocker, MoneyMicros, NoOrder, OrderIntent, OrderSide,
-        OutputContract, PaperCommitment, PaperCommitmentId, RetryPolicy, TargetPortfolio,
-        TaskBudget, TaskRecipeId, TerminationPolicy, ToolGrant, ToolKind, WeightPpm,
-        WorkflowProposalTask,
+        OutputContract, PaperCommitment, PaperCommitmentId, PromptBundle, RetryPolicy,
+        TargetPortfolio, TaskBudget, TaskRecipeId, TerminationPolicy, ToolGrant, ToolKind,
+        ToolSpec, WeightPpm, WorkflowProposalTask,
     };
     use tempfile::tempdir;
 
@@ -7022,10 +7022,14 @@ mod tests {
     fn contract(store: &V2Store, version: u32) -> AgentContract {
         AgentContract::new(
             ContractId::new(),
-            version,
-            ContractPurpose::new("research.fixture").unwrap(),
-            "fixture contract",
-            store.put_bytes(b"fixture prompt", "text/plain").unwrap(),
+        version,
+        ContractPurpose::new("research.fixture").unwrap(),
+        "fixture contract",
+        PromptBundle {
+            version: 1,
+            governance: store.put_bytes(b"fixture governance", "text/plain").unwrap(),
+            role: store.put_bytes(b"fixture prompt", "text/plain").unwrap(),
+        },
             ContextPolicy {
                 permitted_kinds: BTreeSet::from([ArtifactKind::NormalizedEvidence]),
                 permitted_source_families: BTreeSet::from(["fixture".to_owned()]),
@@ -7035,11 +7039,18 @@ mod tests {
                 max_tokens: 1024,
                 allow_raw_reread: false,
             },
-            vec![ToolGrant {
-                kind: ToolKind::ReadEvidence,
-                allowed_sources: vec!["fixture".to_owned()],
-            }],
-            OutputContract {
+        vec![ToolGrant {
+            kind: ToolKind::ReadEvidence,
+            allowed_sources: vec!["fixture".to_owned()],
+        }],
+        vec![ToolSpec {
+            name: "read_artifact".to_owned(),
+            description: "read fixture artifact".to_owned(),
+            kind: ToolKind::ReadEvidence,
+            input_schema: store.put_bytes(b"fixture tool schema", "application/json").unwrap(),
+            strict: true,
+        }],
+        OutputContract {
                 artifact_kind: ArtifactKind::Claim,
                 schema: store
                     .put_bytes(
@@ -7563,6 +7574,16 @@ mod tests {
         value: &str,
         origin: Option<ArtifactOrigin>,
     ) -> Artifact {
+        artifact_with_refs(store, kind, value, origin, vec![])
+    }
+
+    fn artifact_with_refs(
+        store: &V2Store,
+        kind: ArtifactKind,
+        value: &str,
+        origin: Option<ArtifactOrigin>,
+        source_refs: Vec<ArtifactRef>,
+    ) -> Artifact {
         let producer_contract_hash = origin
             .as_ref()
             .and_then(|origin| origin.contract_hash.clone());
@@ -7582,7 +7603,7 @@ mod tests {
                 producer_contract_hash,
             },
             origin,
-            vec![],
+            source_refs,
             Utc::now(),
         )
         .unwrap()
@@ -8461,7 +8482,18 @@ mod tests {
             store.committed_attempt_outputs(&claimed.permit.task_id, &claimed.permit.attempt_id),
             Err(StoreError::CommittedOutputAttempt { .. })
         ));
-        let output = artifact(
+        let evidence = artifact(
+            &store,
+            ArtifactKind::NormalizedEvidence,
+            "claim evidence",
+            Some(ArtifactOrigin {
+                run_id: Some(claimed.permit.run_id.clone()),
+                task_id: Some(claimed.permit.task_id.clone()),
+                attempt_id: Some(claimed.permit.attempt_id.clone()),
+                contract_hash: None,
+            }),
+        );
+        let output = artifact_with_refs(
             &store,
             ArtifactKind::Claim,
             "claim",
@@ -8471,12 +8503,13 @@ mod tests {
                 attempt_id: Some(claimed.permit.attempt_id.clone()),
                 contract_hash: None,
             }),
+            vec![artifact_ref(&evidence)],
         );
 
         store
             .commit_attempt(
                 &claimed.permit,
-                std::slice::from_ref(&output),
+                &[evidence.clone(), output.clone()],
                 TaskStatus::Succeeded,
                 Utc::now(),
             )
@@ -8486,15 +8519,15 @@ mod tests {
             store
                 .committed_attempt_outputs(&claimed.permit.task_id, &claimed.permit.attempt_id)
                 .unwrap(),
-            vec![output.clone()]
+            vec![evidence.clone(), output.clone()]
         );
         assert_eq!(
             store
                 .committed_task_outputs(&run.run_id, &claimed.permit.task_id)
                 .unwrap(),
-            vec![output]
+            vec![evidence, output]
         );
-        assert_eq!(store.events_after(&run.run_id, 0, 10).unwrap().len(), 5);
+        assert_eq!(store.events_after(&run.run_id, 0, 10).unwrap().len(), 6);
         assert!(store
             .claim_next_task("worker", Utc::now(), Duration::seconds(30))
             .unwrap()
@@ -8627,7 +8660,18 @@ mod tests {
             .claim_next_task("worker", Utc::now(), Duration::seconds(30))
             .unwrap()
             .unwrap();
-        let output = artifact(
+        let evidence = artifact(
+            &store,
+            ArtifactKind::NormalizedEvidence,
+            "claim evidence",
+            Some(ArtifactOrigin {
+                run_id: Some(claimed.permit.run_id.clone()),
+                task_id: Some(claimed.permit.task_id.clone()),
+                attempt_id: Some(claimed.permit.attempt_id.clone()),
+                contract_hash: None,
+            }),
+        );
+        let output = artifact_with_refs(
             &store,
             ArtifactKind::Claim,
             "claim",
@@ -8637,6 +8681,7 @@ mod tests {
                 attempt_id: Some(claimed.permit.attempt_id.clone()),
                 contract_hash: None,
             }),
+            vec![artifact_ref(&evidence)],
         );
         {
             let connection = store.connection.lock().unwrap();
@@ -8651,7 +8696,7 @@ mod tests {
         assert!(matches!(
             store.commit_attempt(
                 &claimed.permit,
-                std::slice::from_ref(&output),
+                &[evidence.clone(), output.clone()],
                 TaskStatus::Succeeded,
                 Utc::now()
             ),
@@ -8671,7 +8716,7 @@ mod tests {
         store
             .commit_attempt(
                 &claimed.permit,
-                &[output],
+                &[evidence, output],
                 TaskStatus::Succeeded,
                 Utc::now(),
             )
@@ -9091,7 +9136,18 @@ mod tests {
             .unwrap()
             .unwrap();
         store.recover_expired_tasks(Utc::now()).unwrap();
-        let artifact = artifact(
+        let evidence = artifact(
+            &store,
+            ArtifactKind::NormalizedEvidence,
+            "claim evidence",
+            Some(ArtifactOrigin {
+                run_id: Some(claimed.permit.run_id.clone()),
+                task_id: Some(claimed.permit.task_id.clone()),
+                attempt_id: Some(claimed.permit.attempt_id.clone()),
+                contract_hash: None,
+            }),
+        );
+        let artifact = artifact_with_refs(
             &store,
             ArtifactKind::Claim,
             "claim",
@@ -9101,6 +9157,7 @@ mod tests {
                 attempt_id: Some(claimed.permit.attempt_id.clone()),
                 contract_hash: None,
             }),
+            vec![artifact_ref(&evidence)],
         );
         assert!(matches!(
             store.write_task_artifact(&claimed.permit, &artifact, "claim.created", Utc::now()),

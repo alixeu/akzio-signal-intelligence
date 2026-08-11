@@ -29,6 +29,7 @@ version = "0.2.0"
 dependencies = [
  "akzio-daemon",
  "akzio-domain",
+ "akzio-model",
  "akzio-store",
  "anyhow",
  "clap",

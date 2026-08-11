@@ -20,7 +20,7 @@ use crate::{
 
 /// A Store Root with this schema is intentionally incompatible with the previous
 /// v2 database. It is a fresh schema, not a migration layer.
-pub const V2_SCHEMA_VERSION: u32 = 9;
+pub const V2_SCHEMA_VERSION: u32 = 10;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -56,6 +56,7 @@ pub enum ArtifactKind {
     ToolResult,
     Claim,
     Critique,
+    Resolution,
     DecisionProposal,
     DecisionContext,
     Decision,
@@ -316,6 +317,42 @@ impl Artifact {
                     field: "artifact.detail_source_refs",
                 })
             }
+            ArtifactKind::Claim
+                if !self.source_refs.iter().any(|reference| {
+                    matches!(
+                        reference.kind,
+                        ArtifactKind::NormalizedEvidence | ArtifactKind::SemanticDetail
+                    )
+                }) =>
+            {
+                Err(DomainError::EmptyField {
+                    field: "artifact.claim_source_refs",
+                })
+            }
+            ArtifactKind::Critique
+                if !self
+                    .source_refs
+                    .iter()
+                    .any(|reference| reference.kind == ArtifactKind::Claim) =>
+            {
+                Err(DomainError::EmptyField {
+                    field: "artifact.critique_source_refs",
+                })
+            }
+            ArtifactKind::Resolution
+                if !self
+                    .source_refs
+                    .iter()
+                    .any(|reference| reference.kind == ArtifactKind::Claim)
+                    || !self
+                        .source_refs
+                        .iter()
+                        .any(|reference| reference.kind == ArtifactKind::Critique) =>
+            {
+                Err(DomainError::EmptyField {
+                    field: "artifact.resolution_source_refs",
+                })
+            }
             _ => Ok(()),
         }
     }
@@ -397,6 +434,53 @@ pub struct OutputContract {
     pub schema: BlobRef,
 }
 
+/// Versioned model instructions composed from shared governance and a
+/// contract-specific role prompt. Both blobs contribute to the Contract hash.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptBundle {
+    pub version: u32,
+    pub governance: BlobRef,
+    pub role: BlobRef,
+}
+
+impl PromptBundle {
+    fn validate(&self) -> Result<(), DomainError> {
+        if self.version == 0 {
+            return Err(DomainError::EmptyField {
+                field: "contract.prompt.version",
+            });
+        }
+        self.governance.validate()?;
+        self.role.validate()
+    }
+}
+
+/// A model-visible function declaration. Rust binds it to an already granted
+/// tool kind; a contract cannot advertise a function it is not allowed to run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolSpec {
+    pub name: String,
+    pub description: String,
+    pub kind: ToolKind,
+    pub input_schema: BlobRef,
+    pub strict: bool,
+}
+
+impl ToolSpec {
+    fn validate(&self) -> Result<(), DomainError> {
+        let valid_name = self.name.bytes().enumerate().all(|(index, byte)| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || (index > 0 && byte == b'_')
+        });
+        if self.name.is_empty() || !valid_name || self.description.trim().is_empty() || !self.strict
+        {
+            return Err(DomainError::EmptyField {
+                field: "contract.tool_specs",
+            });
+        }
+        self.input_schema.validate()
+    }
+}
+
 impl CandidateCapabilityCeiling {
     pub fn validate(&self) -> Result<(), DomainError> {
         self.context.validate()?;
@@ -448,6 +532,34 @@ fn validate_tool_grants(
     Ok(())
 }
 
+fn validate_tool_specs(
+    tool_specs: &[ToolSpec],
+    tool_grants: &[ToolGrant],
+) -> Result<(), DomainError> {
+    let mut names = BTreeSet::new();
+    let mut kinds = BTreeSet::new();
+    for spec in tool_specs {
+        spec.validate()?;
+        if !names.insert(spec.name.as_str())
+            || !kinds.insert(spec.kind)
+            || !tool_grants.iter().any(|grant| grant.kind == spec.kind)
+        {
+            return Err(DomainError::EmptyField {
+                field: "contract.tool_specs",
+            });
+        }
+    }
+    if tool_grants
+        .iter()
+        .any(|grant| !tool_specs.iter().any(|spec| spec.kind == grant.kind))
+    {
+        return Err(DomainError::EmptyField {
+            field: "contract.tool_specs",
+        });
+    }
+    Ok(())
+}
+
 impl OutputContract {
     fn validate(&self) -> Result<(), DomainError> {
         self.schema.validate()
@@ -463,9 +575,10 @@ pub struct AgentContract {
     pub version: u32,
     pub purpose: ContractPurpose,
     pub responsibility: String,
-    pub prompt: BlobRef,
+    pub prompt: PromptBundle,
     pub context: ContextPolicy,
     pub tool_grants: Vec<ToolGrant>,
+    pub tool_specs: Vec<ToolSpec>,
     pub candidate_capability_ceiling: CandidateCapabilityCeiling,
     pub output: OutputContract,
     pub budget: TaskBudget,
@@ -482,9 +595,10 @@ impl AgentContract {
         version: u32,
         purpose: ContractPurpose,
         responsibility: impl Into<String>,
-        prompt: BlobRef,
+        prompt: PromptBundle,
         context: ContextPolicy,
         tool_grants: Vec<ToolGrant>,
+        tool_specs: Vec<ToolSpec>,
         output: OutputContract,
         budget: TaskBudget,
         retry: RetryPolicy,
@@ -505,6 +619,7 @@ impl AgentContract {
             },
             context,
             tool_grants,
+            tool_specs,
             output,
             budget,
             retry,
@@ -571,6 +686,7 @@ impl AgentContract {
         self.budget.validate()?;
         self.retry.validate()?;
         validate_tool_grants(&self.tool_grants, &self.context)?;
+        validate_tool_specs(&self.tool_specs, &self.tool_grants)?;
         if !matches!(
             self.output.artifact_kind,
             ArtifactKind::EvidenceNeed
@@ -578,6 +694,7 @@ impl AgentContract {
                 | ArtifactKind::WorkflowProposal
                 | ArtifactKind::Claim
                 | ArtifactKind::Critique
+                | ArtifactKind::Resolution
                 | ArtifactKind::DecisionProposal
         ) {
             return Err(DomainError::EmptyField {
@@ -1271,7 +1388,11 @@ mod tests {
             1,
             ContractPurpose::new("research.analyst").unwrap(),
             "derive claims",
-            blob(b"prompt"),
+            PromptBundle {
+                version: 1,
+                governance: blob(b"governance"),
+                role: blob(b"prompt"),
+            },
             ContextPolicy {
                 permitted_kinds: BTreeSet::from([ArtifactKind::NormalizedEvidence]),
                 permitted_source_families: BTreeSet::from(["market".to_owned()]),
@@ -1284,6 +1405,13 @@ mod tests {
             vec![ToolGrant {
                 kind: ToolKind::ReadEvidence,
                 allowed_sources: vec!["market".to_owned()],
+            }],
+            vec![ToolSpec {
+                name: "read_artifact".to_owned(),
+                description: "read granted artifact".to_owned(),
+                kind: ToolKind::ReadEvidence,
+                input_schema: blob(b"tool schema"),
+                strict: true,
             }],
             OutputContract {
                 artifact_kind: ArtifactKind::Claim,
@@ -1309,8 +1437,15 @@ mod tests {
         contract.validate().unwrap();
 
         let mut substituted = contract.clone();
-        substituted.prompt = blob(b"different prompt");
+        substituted.prompt.role = blob(b"different prompt");
         assert_eq!(substituted.validate(), Err(DomainError::InvalidContentHash));
+
+        let mut substituted_tool = contract.clone();
+        substituted_tool.tool_specs[0].description = "different tool description".to_owned();
+        assert_eq!(
+            substituted_tool.validate(),
+            Err(DomainError::InvalidContentHash)
+        );
 
         let mut expanded = contract.clone();
         expanded.tool_grants = vec![ToolGrant {

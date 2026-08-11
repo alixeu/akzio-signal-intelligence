@@ -5,6 +5,7 @@ use akzio_daemon::{
     RunCancellationResponse, RunRetryResponse, RunSubmissionResponse,
 };
 use akzio_domain::{Asset, RunPurpose};
+use akzio_model::ModelConfig;
 use akzio_store::V2Store;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -85,6 +86,7 @@ enum PurposeArg {
 struct Config {
     daemon: DaemonSettings,
     execution: ExecutionSettings,
+    model: Option<ModelConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -386,12 +388,19 @@ async fn serve(config: Config) -> Result<()> {
         );
     }
     let token = daemon_token(&config.daemon)?;
-    let daemon = Arc::new(Daemon::open(DaemonConfig {
-        store_root: config.daemon.store_root,
-        http_token: token,
-        worker_count: config.daemon.worker_count.unwrap_or(4),
-        auto_paper: false,
-    })?);
+    let model = config
+        .model
+        .clone()
+        .context("missing [model] configuration for daemon serve")?;
+    let daemon = Arc::new(Daemon::open(
+        DaemonConfig {
+            store_root: config.daemon.store_root,
+            http_token: token,
+            worker_count: config.daemon.worker_count.unwrap_or(4),
+            auto_paper: false,
+        },
+        model,
+    )?);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     tokio::spawn(async move {
         let _ = tokio::signal::ctrl_c().await;
@@ -477,6 +486,27 @@ mod tests {
         );
 
         assert!(load_config(&path).is_err());
+    }
+
+    #[test]
+    fn config_reads_local_model_settings() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = write_config(
+            &directory,
+            "http_addr='127.0.0.1:1'",
+            "['TQQQ', 'QQQ', 'SOXX', 'SOXL']",
+        );
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str(
+            "[model]\nbase_url='http://fixture/v1'\nmodel='fixture-model'\napi_key='fixture-key'\nreasoning_effort='high'\ndebug=true\n",
+        );
+        std::fs::write(&path, text).unwrap();
+
+        let model = load_config(&path).unwrap().model.unwrap();
+        assert_eq!(model.base_url, "http://fixture/v1");
+        assert_eq!(model.model, "fixture-model");
+        assert_eq!(model.reasoning_effort, "high");
+        assert!(model.debug);
     }
 
     #[test]

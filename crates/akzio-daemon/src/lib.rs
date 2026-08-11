@@ -27,7 +27,8 @@ use akzio_domain::{
     AccountSnapshot, Artifact, ArtifactId, ArtifactKind, ArtifactLifecycle, ArtifactOrigin,
     ArtifactProvenance, ArtifactRef, ContextPolicy, EvidenceNeed, ExecutionContext,
     ExecutionVerdict, FreezeState, MarketClockSnapshot, OutcomeExecutionLineage, QuoteSnapshot,
-    RunId, RunPurpose, RuntimeTaskClass, TaskId, TaskStatus, WorkflowProposal, WorkflowStatus,
+    ResearchClaim, RunId, RunPurpose, RuntimeTaskClass, TaskId, TaskStatus, WorkflowProposal,
+    WorkflowStatus,
 };
 use akzio_execution::{
     paper::CommittedPaperBroker, DecisionGateError, DecisionGateInput, ExecutionGateError,
@@ -40,11 +41,13 @@ use akzio_ingest::{
     FixtureEvidenceAdapter,
 };
 use akzio_learning::{OutcomeScheduleError, OutcomeScheduleInput, OutcomeSchedulingRuntime};
-use akzio_model::{ModelClient, ModelError};
+use akzio_model::{ModelClient, ModelConfig, ModelError};
 use akzio_research::v2::{
     ActiveResearchCatalogue, AgentRuntime, ModelClientAdapter, ResearchError,
 };
-use akzio_runtime::{RuntimeError, TaskCompletion, TaskRuntime, WorkflowRuntime};
+use akzio_runtime::{
+    should_run_structured_critique, RuntimeError, TaskCompletion, TaskRuntime, WorkflowRuntime,
+};
 use akzio_store::v2::{ClaimedAttempt, StoreError, StoredEvent, V2Store};
 use async_stream::stream;
 use axum::{
@@ -197,10 +200,16 @@ struct FreezeRequest {
 }
 
 impl Daemon {
-    /// Construct the local daemon with its production model adapter. Credentials
-    /// remain in the environment and are never persisted by this crate.
-    pub fn open(config: DaemonConfig) -> Result<Self> {
-        Self::with_model(config, ModelClient::from_env()?)
+    /// Construct the local daemon with its production model adapter. Model
+    /// credentials stay in local configuration and are never persisted.
+    pub fn open(config: DaemonConfig, model_config: ModelConfig) -> Result<Self> {
+        let debug = model_config.debug;
+        Self::with_fixture_evidence_debug(
+            config,
+            ModelClient::from_config(&model_config)?,
+            FixtureEvidence::new(),
+            debug,
+        )
     }
 
     /// Injecting a model keeps fixture and production dispatch on the same v2
@@ -216,6 +225,15 @@ impl Daemon {
         config: DaemonConfig,
         model: ModelClient,
         fixture_evidence: FixtureEvidence,
+    ) -> Result<Self> {
+        Self::with_fixture_evidence_debug(config, model, fixture_evidence, false)
+    }
+
+    fn with_fixture_evidence_debug(
+        config: DaemonConfig,
+        model: ModelClient,
+        fixture_evidence: FixtureEvidence,
+        model_debug: bool,
     ) -> Result<Self> {
         let store = V2Store::open(&config.store_root)?;
         let active = ActiveResearchCatalogue::install(&store, Utc::now())?;
@@ -234,7 +252,7 @@ impl Daemon {
             task_runtime: TaskRuntime::new(store.clone()),
             workflow,
             agents,
-            model: ModelClientAdapter::new(model),
+            model: ModelClientAdapter::with_debug(model, model_debug),
             fixture_evidence: Arc::new(fixture_evidence),
             decision_runtime,
             execution_runtime,
@@ -554,6 +572,16 @@ impl Daemon {
         match recipe.task_class {
             RuntimeTaskClass::Agent => {
                 let candidates = self.context_candidates(task)?;
+                if task.node.recipe_id.as_str() == "research.critic" {
+                    let claims = candidates
+                        .iter()
+                        .filter(|reference| reference.kind == ArtifactKind::Claim)
+                        .map(|reference| self.read_artifact_payload::<ResearchClaim>(reference))
+                        .collect::<Result<Vec<_>>>()?;
+                    if !should_run_structured_critique(&claims) {
+                        return Ok(TaskCompletion::NoOutput);
+                    }
+                }
                 let output = self
                     .agents
                     .run(&task.permit, &task.node, candidates, &self.model, now)
@@ -1370,6 +1398,45 @@ fn authorize(daemon: &Daemon, headers: &HeaderMap) -> std::result::Result<(), St
         .ok_or(StatusCode::UNAUTHORIZED)
 }
 
+fn fixture_claim_output() -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": akzio_domain::V2_DOMAIN_SCHEMA_VERSION,
+        "topic": "fixture_market_regime",
+        "statement": "The governed fixture evidence supports a neutral fixture claim.",
+        "horizon": "t5",
+        "stance": "neutral",
+        "materiality_ppm": 500_000,
+        "confidence_ppm": 500_000,
+        "grounds": [{
+            "evidence": {
+                "artifact_id": akzio_model::FIXTURE_CONTEXT_EVIDENCE_ID,
+                "kind": "normalized_evidence"
+            },
+            "support": "The selected governed fixture evidence is the stated support."
+        }],
+        "evidence_gaps": []
+    })
+}
+
+fn fixture_critique_output() -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": akzio_domain::V2_DOMAIN_SCHEMA_VERSION,
+        "target": {
+            "artifact_id": akzio_model::FIXTURE_CONTEXT_CLAIM_ID,
+            "kind": "claim"
+        },
+        "topic": "fixture_market_regime",
+        "severity": "low",
+        "blocker": false,
+        "rationale": "The fixture records an explicit evidence gap rather than inventing a rebuttal.",
+        "grounds": [],
+        "evidence_gaps": [{
+            "topic": "fixture_depth",
+            "rationale": "No additional governed detail was selected for the fixture critique."
+        }]
+    })
+}
+
 pub fn fixture_model_client() -> ModelClient {
     let planner = serde_json::json!({
         "schema_version": akzio_domain::V2_DOMAIN_SCHEMA_VERSION,
@@ -1407,19 +1474,11 @@ pub fn fixture_model_client() -> ModelClient {
         ("research.planner".to_owned(), response(planner)),
         (
             "research.analyst".to_owned(),
-            response(serde_json::json!({
-                "summary": "fixture claim",
-                "confidence_ppm": 500000,
-                "rationale": "fixture-only"
-            })),
+            response(fixture_claim_output()),
         ),
         (
             "research.critic".to_owned(),
-            response(serde_json::json!({
-                "summary": "fixture critique",
-                "severity": "low",
-                "blocker": false
-            })),
+            response(fixture_critique_output()),
         ),
         (
             "research.synthesizer".to_owned(),
@@ -1511,11 +1570,11 @@ mod tests {
             ),
             (
                 "research.analyst".to_owned(),
-                response(serde_json::json!({
-                    "summary": "fixture claim",
-                    "confidence_ppm": 500000,
-                    "rationale": "normalized fixture evidence"
-                })),
+                response(fixture_claim_output()),
+            ),
+            (
+                "research.critic".to_owned(),
+                response(fixture_critique_output()),
             ),
         ]))
     }
@@ -1944,11 +2003,9 @@ mod tests {
             )
         })
         .collect::<BTreeMap<_, _>>();
-        let responses = Arc::new(Mutex::new(VecDeque::from([response(serde_json::json!({
-            "summary": "fixture accepted Paper claim",
-            "confidence_ppm": 900000,
-            "rationale": "governed Paper snapshots"
-        }))])));
+        let responses = Arc::new(Mutex::new(VecDeque::from([response(
+            fixture_claim_output(),
+        )])));
         let broker = Arc::new(FakePaperBroker::default());
         let daemon = Daemon::with_fixture_evidence(
             config(directory.path().to_path_buf()),

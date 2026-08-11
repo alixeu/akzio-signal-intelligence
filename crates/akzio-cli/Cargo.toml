@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 akzio-daemon = { path = "../akzio-daemon" }
 akzio-domain = { path = "../akzio-domain" }
+akzio-model = { path = "../akzio-model" }
 akzio-store = { path = "../akzio-store" }
 anyhow.workspace = true
 clap.workspace = true

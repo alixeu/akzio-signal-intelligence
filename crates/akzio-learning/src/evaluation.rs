@@ -173,6 +173,13 @@ impl EvaluationRuntime {
         observation: ShadowObservation,
     ) -> EvaluationRuntimeResult<ShadowPairWriteResult> {
         self.require_paper(&permit.run_id)?;
+        if let PolicySubject::Topology(topology_id) = subject {
+            if observation.candidate_topology_id != topology_id.0 {
+                return Err(EvaluationError::InvalidCandidatePolicy(
+                    "shadow_topology_id",
+                ));
+            }
+        }
         Ok(self.store.complete_shadow_pair(
             permit,
             &ShadowPairCompletion {
@@ -702,11 +709,13 @@ mod tests {
     use akzio_context::ContextBroker;
     use akzio_domain::{
         AgentContract, ArtifactId, ContextPolicy, ContractId, ContractPurpose, ExecutionVerdict,
-        FailureDisposition, HardBlocker, NoOrder, OutputContract, RetryPolicy, RunId, TaskBudget,
-        TaskId, TaskRecipeId, TaskStatus, TaskWritePermit, TerminationPolicy, WeightPpm,
-        WorkflowGraph, WorkflowNode,
+        FailureDisposition, HardBlocker, NoOrder, OutputContract, PromptBundle, RetryPolicy, RunId,
+        TaskBudget, TaskId, TaskRecipeId, TaskStatus, TaskWritePermit, TerminationPolicy,
+        WeightPpm, WorkflowGraph, WorkflowNode,
     };
-    use akzio_domain::{DecisionHorizon, Forecast, MemoryId, OutcomeId};
+    use akzio_domain::{
+        DecisionHorizon, Forecast, MemoryId, OutcomeId, STRUCTURED_CRITIQUE_CANDIDATE_TOPOLOGY_ID,
+    };
     use akzio_store::v2::{StoredRun, WorkflowCommit};
     use chrono::{Duration, NaiveDate, TimeZone, Utc};
     use tempfile::{tempdir, TempDir};
@@ -858,9 +867,15 @@ mod tests {
             1,
             ContractPurpose::new("research.analyst").unwrap(),
             format!("{label} contract"),
-            store
-                .put_bytes(format!("{label} prompt").as_bytes(), "text/plain")
-                .unwrap(),
+            PromptBundle {
+                version: 1,
+                governance: store
+                    .put_bytes(format!("{label} governance").as_bytes(), "text/plain")
+                    .unwrap(),
+                role: store
+                    .put_bytes(format!("{label} prompt").as_bytes(), "text/plain")
+                    .unwrap(),
+            },
             ContextPolicy {
                 permitted_kinds: BTreeSet::from([ArtifactKind::NormalizedEvidence]),
                 permitted_source_families: BTreeSet::from(["market".to_owned()]),
@@ -870,6 +885,7 @@ mod tests {
                 max_tokens: 1024,
                 allow_raw_reread: false,
             },
+            vec![],
             vec![],
             OutputContract {
                 artifact_kind: ArtifactKind::Claim,
@@ -1632,6 +1648,38 @@ mod tests {
             .iter()
             .any(|event| event.artifact_id.as_ref() == Some(&noop.evaluation.artifact_id)));
         fixture.store.verify_integrity().unwrap();
+    }
+
+    #[test]
+    fn topology_shadow_pair_must_name_the_candidate_subject() {
+        let fixture = RuntimeFixture::new();
+        let permit = fixture.claim_evaluation("structured-critique-mismatch");
+        let subject = PolicySubject::Topology(TopologyId(
+            STRUCTURED_CRITIQUE_CANDIDATE_TOPOLOGY_ID.to_owned(),
+        ));
+        let (candidate_decision, candidate_outcome) = &fixture.candidates[0];
+
+        assert!(matches!(
+            fixture.runtime.record_shadow_pair(
+                &permit,
+                &subject,
+                ShadowObservation {
+                    parent_decision: fixture.parent_decision.clone(),
+                    execution_context: fixture.execution_context.clone(),
+                    candidate_decision: candidate_decision.clone(),
+                    candidate_contract_hash: fixture.candidate_contract_hash.clone(),
+                    candidate_topology_id: fixture.candidate_topology_id.clone(),
+                    horizon: OutcomeHorizon::T1,
+                    parent_outcome: fixture.parent_outcome.clone(),
+                    candidate_outcome: candidate_outcome.clone(),
+                    completed_at: fixture.pair_completed_at,
+                },
+            ),
+            Err(EvaluationError::InvalidCandidatePolicy(
+                "shadow_topology_id"
+            ))
+        ));
+        assert!(fixture.store.policy_head(&subject).unwrap().is_none());
     }
 
     #[test]

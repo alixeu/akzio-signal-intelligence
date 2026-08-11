@@ -807,6 +807,19 @@ mod tests {
             .unwrap()
             .unwrap()
             .permit;
+        let evidence = Artifact::new(
+            ArtifactKind::NormalizedEvidence,
+            store
+                .put_json(&serde_json::json!({"evidence": "fixture"}))
+                .unwrap(),
+            "fixture.evidence",
+            ArtifactLifecycle::RunScoped,
+            provenance("fixture.evidence", None, now),
+            Some(origin(&source_permit)),
+            vec![],
+            now,
+        )
+        .unwrap();
         let claim = Artifact::new(
             ArtifactKind::Claim,
             store
@@ -816,14 +829,14 @@ mod tests {
             ArtifactLifecycle::RunScoped,
             provenance("akzio.agent", None, now),
             Some(origin(&source_permit)),
-            vec![],
+            vec![reference(&evidence)],
             now,
         )
         .unwrap();
         store
             .commit_attempt(
                 &source_permit,
-                std::slice::from_ref(&claim),
+                &[evidence, claim.clone()],
                 TaskStatus::Succeeded,
                 now,
             )

@@ -834,14 +834,6 @@ mod tests {
             .unwrap()
             .permit;
 
-        let claim = source_artifact(
-            &store,
-            &source_permit,
-            ArtifactKind::Claim,
-            &serde_json::json!({"claim": "typed execution fixture"}),
-            vec![],
-            now,
-        );
         let account = source_artifact(
             &store,
             &source_permit,
@@ -891,6 +883,14 @@ mod tests {
                 observed_at: now,
             },
             vec![],
+            now,
+        );
+        let claim = source_artifact(
+            &store,
+            &source_permit,
+            ArtifactKind::Claim,
+            &serde_json::json!({"claim": "typed execution fixture"}),
+            vec![as_ref(&account)],
             now,
         );
         let claim_ref = as_ref(&claim);

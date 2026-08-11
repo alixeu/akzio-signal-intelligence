@@ -2,5 +2,5 @@
 
 pub use crate::schema::{
     AgentContract, CandidateCapabilityCeiling, ContextPolicy, ContractPurpose, OutputContract,
-    TaskRecipe, TaskRecipeId,
+    PromptBundle, TaskRecipe, TaskRecipeId, ToolSpec,
 };

@@ -575,8 +575,9 @@ mod tests {
 
     use akzio_domain::{
         ArtifactKind, CandidatePolicyState, ContractId, ContractPurpose, FailureDisposition,
-        MemoryLifecycle, OutputContract, RetryPolicy, RunPurpose, TaskBudget, TerminationPolicy,
-        ToolGrant, ToolKind, WorkflowGraph, WorkflowNode, V2_SCHEMA_VERSION,
+        MemoryLifecycle, OutputContract, PromptBundle, RetryPolicy, RunPurpose, TaskBudget,
+        TerminationPolicy, ToolGrant, ToolKind, ToolSpec, WorkflowGraph, WorkflowNode,
+        V2_SCHEMA_VERSION,
     };
     use akzio_store::v2::{StoredRun, WorkflowCommit};
     use tempfile::tempdir;
@@ -589,7 +590,11 @@ mod tests {
             1,
             ContractPurpose::new("research.analyst").unwrap(),
             "analyze",
-            store.put_bytes(b"prompt", "text/plain").unwrap(),
+            PromptBundle {
+                version: 1,
+                governance: store.put_bytes(b"governance", "text/plain").unwrap(),
+                role: store.put_bytes(b"prompt", "text/plain").unwrap(),
+            },
             ContextPolicy {
                 permitted_kinds: BTreeSet::from([ArtifactKind::NormalizedEvidence]),
                 permitted_source_families: BTreeSet::from(["market".to_owned()]),
@@ -602,6 +607,13 @@ mod tests {
             vec![ToolGrant {
                 kind: ToolKind::ReadRawEvidence,
                 allowed_sources: vec!["market".to_owned()],
+            }],
+            vec![ToolSpec {
+                name: "read_raw_evidence".to_owned(),
+                description: "read granted raw evidence".to_owned(),
+                kind: ToolKind::ReadRawEvidence,
+                input_schema: store.put_bytes(b"tool schema", "application/json").unwrap(),
+                strict: true,
             }],
             OutputContract {
                 artifact_kind: ArtifactKind::Claim,

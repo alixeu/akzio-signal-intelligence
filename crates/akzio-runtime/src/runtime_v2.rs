@@ -8,9 +8,10 @@ use std::{
 
 use akzio_domain::{
     Artifact, ArtifactKind, ArtifactLifecycle, ArtifactOrigin, ArtifactProvenance, ArtifactRef,
-    AttemptId, DomainError, EvidenceNeed, RunId, RunPurpose, RuntimeTaskClass, TaskId, TaskRecipe,
-    TaskRecipeId, TaskStatus, WorkflowGraph, WorkflowNode, WorkflowProposal, WorkflowProposalDraft,
-    WorkflowProposalTask, WorkflowStatus, V2_SCHEMA_VERSION,
+    AttemptId, ClaimStance, DomainError, EvidenceNeed, ResearchClaim, RunId, RunPurpose,
+    RuntimeTaskClass, TaskId, TaskRecipe, TaskRecipeId, TaskStatus, WorkflowGraph, WorkflowNode,
+    WorkflowProposal, WorkflowProposalDraft, WorkflowProposalTask, WorkflowStatus,
+    STRUCTURED_CRITIQUE_CANDIDATE_TOPOLOGY_ID, V2_SCHEMA_VERSION,
 };
 use akzio_store::v2::{
     ClaimedAttempt, DaemonLease, RetryTaskResult, SessionReservation, SessionSlotReservation,
@@ -32,6 +33,12 @@ pub enum RuntimeError {
     MissingRecipe(TaskRecipeId),
     #[error("Planner may not schedule Rust terminal recipe {0}")]
     TerminalRecipeInProposal(TaskRecipeId),
+    #[error(
+        "planner may not schedule research.critic; Rust inserts at most one conditional critic"
+    )]
+    PlannerSchedulesCritic,
+    #[error("planner may not schedule more than one research.synthesizer")]
+    PlannerSchedulesMultipleSynthesizers,
     #[error("terminal recipe {recipe} has class {actual:?}, expected {expected:?}")]
     InvalidTerminalRecipe {
         recipe: TaskRecipeId,
@@ -85,6 +92,33 @@ pub enum RuntimeError {
 }
 
 pub type RuntimeResult<T> = Result<T, RuntimeError>;
+
+const ANALYST_RECIPE_ID: &str = "research.analyst";
+const CRITIC_RECIPE_ID: &str = "research.critic";
+const SYNTHESIZER_RECIPE_ID: &str = "research.synthesizer";
+const STRUCTURED_CRITIC_ALIAS_PREFIX: &str = "structured_critic";
+pub const STRUCTURED_CRITIQUE_MATERIALITY_PPM: u32 = 500_000;
+pub const STRUCTURED_CRITIQUE_CONFIDENCE_PPM: u32 = 500_000;
+
+/// Returns whether the bounded Critic task should consume the supplied claims.
+/// Rust owns this decision so a planner or model cannot add debate rounds.
+pub fn should_run_structured_critique(claims: &[ResearchClaim]) -> bool {
+    claims.iter().any(|claim| {
+        claim.materiality_ppm >= STRUCTURED_CRITIQUE_MATERIALITY_PPM
+            && (!claim.evidence_gaps.is_empty()
+                || claim.confidence_ppm <= STRUCTURED_CRITIQUE_CONFIDENCE_PPM)
+    }) || claims.iter().enumerate().any(|(index, claim)| {
+        claims[index + 1..].iter().any(|other| {
+            claim.topic == other.topic
+                && claim.horizon == other.horizon
+                && matches!(
+                    (claim.stance, other.stance),
+                    (ClaimStance::Bullish, ClaimStance::Bearish)
+                        | (ClaimStance::Bearish, ClaimStance::Bullish)
+                )
+        })
+    })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ReplayedWorkflowRevision {
@@ -1053,9 +1087,10 @@ impl WorkflowRuntime {
         &self,
         planner: &ClaimedAttempt,
         planner_output: &Artifact,
-        draft: WorkflowProposalDraft,
+        mut draft: WorkflowProposalDraft,
         now: DateTime<Utc>,
     ) -> RuntimeResult<(WorkflowProposal, Vec<Artifact>, Artifact)> {
+        self.insert_structured_critic(&mut draft)?;
         let planner_output_ref = ArtifactRef {
             artifact_id: planner_output.artifact_id.clone(),
             kind: ArtifactKind::WorkflowProposalDraft,
@@ -1140,6 +1175,77 @@ impl WorkflowRuntime {
             now,
         )?;
         Ok((proposal, evidence_needs, proposal_artifact))
+    }
+
+    fn insert_structured_critic(&self, draft: &mut WorkflowProposalDraft) -> RuntimeResult<()> {
+        if draft.topology_id != STRUCTURED_CRITIQUE_CANDIDATE_TOPOLOGY_ID {
+            return Ok(());
+        }
+        let analyst_aliases = draft
+            .tasks
+            .iter()
+            .filter_map(|(alias, task)| {
+                (task.recipe_id.as_str() == ANALYST_RECIPE_ID).then_some(alias.clone())
+            })
+            .collect::<Vec<_>>();
+        if analyst_aliases.is_empty() {
+            return Ok(());
+        }
+        if draft
+            .tasks
+            .values()
+            .any(|task| task.recipe_id.as_str() == CRITIC_RECIPE_ID)
+        {
+            return Err(RuntimeError::PlannerSchedulesCritic);
+        }
+        if draft
+            .tasks
+            .values()
+            .filter(|task| task.recipe_id.as_str() == SYNTHESIZER_RECIPE_ID)
+            .count()
+            > 1
+        {
+            return Err(RuntimeError::PlannerSchedulesMultipleSynthesizers);
+        }
+
+        let critic_recipe_id = TaskRecipeId::new(CRITIC_RECIPE_ID)?;
+        let critic_recipe = self.catalogue.recipe(&critic_recipe_id)?;
+        let mut suffix = 0;
+        let critic_alias = loop {
+            let alias = if suffix == 0 {
+                STRUCTURED_CRITIC_ALIAS_PREFIX.to_owned()
+            } else {
+                format!("{STRUCTURED_CRITIC_ALIAS_PREFIX}_{suffix}")
+            };
+            if !draft.tasks.contains_key(&alias) {
+                break alias;
+            }
+            suffix += 1;
+        };
+
+        draft.tasks.insert(
+            critic_alias.clone(),
+            akzio_domain::WorkflowProposalDraftTask {
+                recipe_id: critic_recipe_id,
+                objective: "Perform one evidence-bound critique of the analyst claims when Rust detects material uncertainty or directional conflict.".to_owned(),
+                depends_on: analyst_aliases.clone(),
+                priority: critic_recipe.priority_ceiling,
+                evidence_needs: Vec::new(),
+            },
+        );
+        for task in draft
+            .tasks
+            .values_mut()
+            .filter(|task| task.recipe_id.as_str() == SYNTHESIZER_RECIPE_ID)
+        {
+            task.depends_on
+                .retain(|dependency| !analyst_aliases.contains(dependency));
+            task.depends_on.push(critic_alias.clone());
+            task.depends_on.sort();
+            task.depends_on.dedup();
+        }
+        draft.validate(&self.catalogue.recipes)?;
+        Ok(())
     }
 
     fn assert_planner_attempt(&self, planner: &ClaimedAttempt) -> RuntimeResult<()> {
@@ -1794,9 +1900,9 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use akzio_domain::{
-        ArtifactOrigin, ContentHash, ContractPurpose, EvidenceNeed, FailureDisposition,
-        RetryPolicy, TaskBudget, WorkflowProposalDraft, WorkflowProposalDraftTask,
-        WorkflowProposalTask,
+        ArtifactOrigin, ClaimStance, ContentHash, ContractPurpose, DecisionHorizon, EvidenceGap,
+        EvidenceNeed, FailureDisposition, ResearchClaim, RetryPolicy, TaskBudget,
+        WorkflowProposalDraft, WorkflowProposalDraftTask, WorkflowProposalTask,
     };
     use tempfile::tempdir;
 
@@ -1818,6 +1924,31 @@ mod tests {
             retry_transport: true,
             retry_rate_limited: true,
             retry_invalid_output: false,
+        }
+    }
+
+    fn claim(
+        stance: ClaimStance,
+        materiality_ppm: u32,
+        confidence_ppm: u32,
+        has_gap: bool,
+    ) -> ResearchClaim {
+        ResearchClaim {
+            schema_version: V2_SCHEMA_VERSION,
+            topic: "TQQQ regime".to_owned(),
+            statement: "fixture claim".to_owned(),
+            horizon: DecisionHorizon::T5,
+            stance,
+            materiality_ppm,
+            confidence_ppm,
+            grounds: vec![],
+            evidence_gaps: has_gap
+                .then(|| EvidenceGap {
+                    topic: "fixture gap".to_owned(),
+                    rationale: "fixture uncertainty".to_owned(),
+                })
+                .into_iter()
+                .collect(),
         }
     }
 
@@ -1909,33 +2040,21 @@ mod tests {
         let draft = WorkflowProposalDraft {
             schema_version: V2_SCHEMA_VERSION,
             topology_id: "active".to_owned(),
-            tasks: BTreeMap::from([
-                (
-                    "analyst".to_owned(),
-                    WorkflowProposalDraftTask {
-                        recipe_id: TaskRecipeId::new("research.analyst").unwrap(),
-                        objective: "analyse evidence".to_owned(),
-                        depends_on: vec![],
-                        priority: 80,
-                        evidence_needs: vec![EvidenceNeed {
-                            schema_version: V2_SCHEMA_VERSION,
-                            source_family: "alpaca".to_owned(),
-                            resource: "bars:TQQQ:1d".to_owned(),
-                            max_age_secs: 86_400,
-                        }],
-                    },
-                ),
-                (
-                    "critic".to_owned(),
-                    WorkflowProposalDraftTask {
-                        recipe_id: TaskRecipeId::new("research.critic").unwrap(),
-                        objective: "challenge claim".to_owned(),
-                        depends_on: vec!["analyst".to_owned()],
-                        priority: 70,
-                        evidence_needs: vec![],
-                    },
-                ),
-            ]),
+            tasks: BTreeMap::from([(
+                "analyst".to_owned(),
+                WorkflowProposalDraftTask {
+                    recipe_id: TaskRecipeId::new("research.analyst").unwrap(),
+                    objective: "analyse evidence".to_owned(),
+                    depends_on: vec![],
+                    priority: 80,
+                    evidence_needs: vec![EvidenceNeed {
+                        schema_version: V2_SCHEMA_VERSION,
+                        source_family: "alpaca".to_owned(),
+                        resource: "bars:TQQQ:1d".to_owned(),
+                        max_age_secs: 86_400,
+                    }],
+                },
+            )]),
             stop_reason: None,
         };
         Artifact::new(
@@ -2011,6 +2130,94 @@ mod tests {
             .iter()
             .any(|node| node.recipe_id.as_str() == "gate.paper"));
         graph.validate().unwrap();
+    }
+
+    #[test]
+    fn structured_critique_requires_material_uncertainty_or_opposed_stances() {
+        let clean = claim(ClaimStance::Neutral, 499_999, 500_001, false);
+        assert!(!should_run_structured_critique(&[clean]));
+
+        let gap = claim(ClaimStance::Neutral, 500_000, 900_000, true);
+        assert!(should_run_structured_critique(&[gap]));
+
+        let low_confidence = claim(ClaimStance::Neutral, 500_000, 500_000, false);
+        assert!(should_run_structured_critique(&[low_confidence]));
+
+        let bullish = claim(ClaimStance::Bullish, 1, 1_000_000, false);
+        let bearish = claim(ClaimStance::Bearish, 1, 1_000_000, false);
+        assert!(should_run_structured_critique(&[bullish, bearish]));
+    }
+
+    #[test]
+    fn planner_cannot_schedule_critic_directly() {
+        let root = tempdir().unwrap();
+        let runtime = WorkflowRuntime::new(V2Store::open(root.path()).unwrap(), catalogue());
+        let mut draft = WorkflowProposalDraft {
+            schema_version: V2_SCHEMA_VERSION,
+            topology_id: STRUCTURED_CRITIQUE_CANDIDATE_TOPOLOGY_ID.to_owned(),
+            tasks: BTreeMap::from([
+                (
+                    "analyst".to_owned(),
+                    WorkflowProposalDraftTask {
+                        recipe_id: TaskRecipeId::new(ANALYST_RECIPE_ID).unwrap(),
+                        objective: "analyse evidence".to_owned(),
+                        depends_on: vec![],
+                        priority: 80,
+                        evidence_needs: vec![],
+                    },
+                ),
+                (
+                    "critic".to_owned(),
+                    WorkflowProposalDraftTask {
+                        recipe_id: TaskRecipeId::new(CRITIC_RECIPE_ID).unwrap(),
+                        objective: "challenge claim".to_owned(),
+                        depends_on: vec!["analyst".to_owned()],
+                        priority: 70,
+                        evidence_needs: vec![],
+                    },
+                ),
+            ]),
+            stop_reason: None,
+        };
+        assert!(matches!(
+            runtime.insert_structured_critic(&mut draft),
+            Err(RuntimeError::PlannerSchedulesCritic)
+        ));
+    }
+
+    #[test]
+    fn structured_critique_is_reserved_for_the_candidate_topology() {
+        let root = tempdir().unwrap();
+        let runtime = WorkflowRuntime::new(V2Store::open(root.path()).unwrap(), catalogue());
+        let analyst = WorkflowProposalDraftTask {
+            recipe_id: TaskRecipeId::new(ANALYST_RECIPE_ID).unwrap(),
+            objective: "analyse evidence".to_owned(),
+            depends_on: vec![],
+            priority: 80,
+            evidence_needs: vec![],
+        };
+        let mut active = WorkflowProposalDraft {
+            schema_version: V2_SCHEMA_VERSION,
+            topology_id: "active".to_owned(),
+            tasks: BTreeMap::from([("analyst".to_owned(), analyst.clone())]),
+            stop_reason: None,
+        };
+        runtime.insert_structured_critic(&mut active).unwrap();
+        assert_eq!(active.tasks.len(), 1);
+
+        let mut candidate = WorkflowProposalDraft {
+            schema_version: V2_SCHEMA_VERSION,
+            topology_id: STRUCTURED_CRITIQUE_CANDIDATE_TOPOLOGY_ID.to_owned(),
+            tasks: BTreeMap::from([("analyst".to_owned(), analyst)]),
+            stop_reason: None,
+        };
+        runtime.insert_structured_critic(&mut candidate).unwrap();
+        let critic = candidate
+            .tasks
+            .values()
+            .find(|task| task.recipe_id.as_str() == CRITIC_RECIPE_ID)
+            .unwrap();
+        assert_eq!(critic.depends_on, vec!["analyst"]);
     }
 
     #[test]

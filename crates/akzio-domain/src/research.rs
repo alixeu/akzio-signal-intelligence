@@ -1,0 +1,310 @@
+//! Typed, evidence-bound research artifacts.
+
+use std::collections::BTreeSet;
+
+use serde::{Deserialize, Serialize};
+
+use crate::{ArtifactKind, ArtifactRef, DecisionHorizon, DomainError, V2_DOMAIN_SCHEMA_VERSION};
+
+pub const MAX_EVIDENCE_GAPS: usize = 2;
+pub const STRUCTURED_CRITIQUE_CANDIDATE_TOPOLOGY_ID: &str = "candidate.structured_critique";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaimStance {
+    Bullish,
+    Bearish,
+    Neutral,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CritiqueSeverity {
+    Low,
+    Medium,
+    High,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResolutionDisposition {
+    Accepted,
+    Rebutted,
+    Unresolved,
+}
+
+/// A concrete statement of support attached to one governed evidence artifact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvidenceGround {
+    pub evidence: ArtifactRef,
+    pub support: String,
+}
+
+impl EvidenceGround {
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if !matches!(
+            self.evidence.kind,
+            ArtifactKind::NormalizedEvidence | ArtifactKind::SemanticDetail
+        ) || self.support.trim().is_empty()
+        {
+            return Err(DomainError::EmptyField {
+                field: "research.ground",
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvidenceGap {
+    pub topic: String,
+    pub rationale: String,
+}
+
+impl EvidenceGap {
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if self.topic.trim().is_empty() || self.rationale.trim().is_empty() {
+            return Err(DomainError::EmptyField {
+                field: "research.evidence_gap",
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResearchClaim {
+    pub schema_version: u32,
+    pub topic: String,
+    pub statement: String,
+    pub horizon: DecisionHorizon,
+    pub stance: ClaimStance,
+    pub materiality_ppm: u32,
+    pub confidence_ppm: u32,
+    pub grounds: Vec<EvidenceGround>,
+    pub evidence_gaps: Vec<EvidenceGap>,
+}
+
+impl ResearchClaim {
+    pub fn validate(&self) -> Result<(), DomainError> {
+        validate_research_identity(self.schema_version, &self.topic, &self.statement)?;
+        validate_ppm(self.materiality_ppm, "research.claim.materiality_ppm")?;
+        validate_ppm(self.confidence_ppm, "research.claim.confidence_ppm")?;
+        validate_grounds(&self.grounds)?;
+        validate_gaps(&self.evidence_gaps)
+    }
+
+    pub fn source_refs(&self) -> Vec<ArtifactRef> {
+        ground_refs(&self.grounds)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResearchCritique {
+    pub schema_version: u32,
+    pub target: ArtifactRef,
+    pub topic: String,
+    pub severity: CritiqueSeverity,
+    pub blocker: bool,
+    pub rationale: String,
+    pub grounds: Vec<EvidenceGround>,
+    pub evidence_gaps: Vec<EvidenceGap>,
+}
+
+impl ResearchCritique {
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if self.schema_version != V2_DOMAIN_SCHEMA_VERSION
+            || self.target.kind != ArtifactKind::Claim
+            || self.topic.trim().is_empty()
+            || self.rationale.trim().is_empty()
+        {
+            return Err(DomainError::EmptyField {
+                field: "research.critique",
+            });
+        }
+        if self.grounds.is_empty() && self.evidence_gaps.is_empty() {
+            return Err(DomainError::EmptyField {
+                field: "research.critique.grounds_or_gaps",
+            });
+        }
+        if !self.grounds.is_empty() {
+            validate_grounds(&self.grounds)?;
+        }
+        validate_gaps(&self.evidence_gaps)
+    }
+
+    pub fn source_refs(&self) -> Vec<ArtifactRef> {
+        let mut refs = BTreeSet::from([self.target.clone()]);
+        refs.extend(ground_refs(&self.grounds));
+        refs.into_iter().collect()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResearchResolution {
+    pub schema_version: u32,
+    pub claim: ArtifactRef,
+    pub critique: ArtifactRef,
+    pub disposition: ResolutionDisposition,
+    pub rationale: String,
+    pub grounds: Vec<EvidenceGround>,
+    pub remaining_gaps: Vec<EvidenceGap>,
+}
+
+impl ResearchResolution {
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if self.schema_version != V2_DOMAIN_SCHEMA_VERSION
+            || self.claim.kind != ArtifactKind::Claim
+            || self.critique.kind != ArtifactKind::Critique
+            || self.rationale.trim().is_empty()
+        {
+            return Err(DomainError::EmptyField {
+                field: "research.resolution",
+            });
+        }
+        validate_grounds(&self.grounds)?;
+        validate_gaps(&self.remaining_gaps)
+    }
+
+    pub fn source_refs(&self) -> Vec<ArtifactRef> {
+        let mut refs = BTreeSet::from([self.claim.clone(), self.critique.clone()]);
+        refs.extend(ground_refs(&self.grounds));
+        refs.into_iter().collect()
+    }
+}
+
+fn validate_research_identity(
+    schema_version: u32,
+    topic: &str,
+    statement: &str,
+) -> Result<(), DomainError> {
+    if schema_version != V2_DOMAIN_SCHEMA_VERSION
+        || topic.trim().is_empty()
+        || statement.trim().is_empty()
+    {
+        return Err(DomainError::EmptyField {
+            field: "research.claim",
+        });
+    }
+    Ok(())
+}
+
+fn validate_ppm(value: u32, field: &'static str) -> Result<(), DomainError> {
+    if value > 1_000_000 {
+        return Err(DomainError::InvalidBudget { field });
+    }
+    Ok(())
+}
+
+fn validate_grounds(grounds: &[EvidenceGround]) -> Result<(), DomainError> {
+    if grounds.is_empty() {
+        return Err(DomainError::EmptyField {
+            field: "research.grounds",
+        });
+    }
+    let mut evidence = BTreeSet::new();
+    for ground in grounds {
+        ground.validate()?;
+        if !evidence.insert(ground.evidence.clone()) {
+            return Err(DomainError::EmptyField {
+                field: "research.grounds",
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_gaps(gaps: &[EvidenceGap]) -> Result<(), DomainError> {
+    if gaps.len() > MAX_EVIDENCE_GAPS {
+        return Err(DomainError::InvalidBudget {
+            field: "research.evidence_gaps",
+        });
+    }
+    for gap in gaps {
+        gap.validate()?;
+    }
+    Ok(())
+}
+
+fn ground_refs(grounds: &[EvidenceGround]) -> Vec<ArtifactRef> {
+    grounds
+        .iter()
+        .map(|ground| ground.evidence.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ArtifactId, ContentHash};
+
+    fn reference(kind: ArtifactKind, value: &[u8]) -> ArtifactRef {
+        ArtifactRef {
+            artifact_id: ArtifactId(ContentHash::of_bytes(value)),
+            kind,
+        }
+    }
+
+    fn ground() -> EvidenceGround {
+        EvidenceGround {
+            evidence: reference(ArtifactKind::NormalizedEvidence, b"evidence"),
+            support: "reported price and date support the claim".to_owned(),
+        }
+    }
+
+    #[test]
+    fn claim_requires_governed_evidence_and_bounded_ppm() {
+        let claim = ResearchClaim {
+            schema_version: V2_DOMAIN_SCHEMA_VERSION,
+            topic: "market_regime".to_owned(),
+            statement: "Trend remains positive at the stated horizon.".to_owned(),
+            horizon: DecisionHorizon::T5,
+            stance: ClaimStance::Bullish,
+            materiality_ppm: 800_000,
+            confidence_ppm: 700_000,
+            grounds: vec![ground()],
+            evidence_gaps: vec![],
+        };
+        claim.validate().unwrap();
+        assert_eq!(claim.source_refs(), vec![ground().evidence]);
+
+        let mut invalid = claim;
+        invalid.grounds[0].evidence.kind = ArtifactKind::Claim;
+        assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn critique_and_resolution_close_over_claim_and_evidence() {
+        let critique = ResearchCritique {
+            schema_version: V2_DOMAIN_SCHEMA_VERSION,
+            target: reference(ArtifactKind::Claim, b"claim"),
+            topic: "market_regime".to_owned(),
+            severity: CritiqueSeverity::High,
+            blocker: true,
+            rationale: "The cited series is stale for the requested horizon.".to_owned(),
+            grounds: vec![ground()],
+            evidence_gaps: vec![],
+        };
+        critique.validate().unwrap();
+
+        let resolution = ResearchResolution {
+            schema_version: V2_DOMAIN_SCHEMA_VERSION,
+            claim: critique.target.clone(),
+            critique: reference(ArtifactKind::Critique, b"critique"),
+            disposition: ResolutionDisposition::Unresolved,
+            rationale: "Fresh evidence is required before the conflict can close.".to_owned(),
+            grounds: vec![ground()],
+            remaining_gaps: vec![EvidenceGap {
+                topic: "freshness".to_owned(),
+                rationale: "No current session observation is available.".to_owned(),
+            }],
+        };
+        resolution.validate().unwrap();
+        assert!(resolution
+            .source_refs()
+            .iter()
+            .any(|reference| reference.kind == ArtifactKind::Critique));
+    }
+}
