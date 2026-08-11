@@ -86,11 +86,18 @@ enum TestCommand {
     EvidenceIntegrity,
     LearningTransitions,
     FrozenEvidence,
+    StoreCorruption,
+    FreezeRecovery,
+    LeaseTakeover,
 }
 
 #[derive(Debug, Subcommand)]
 enum StoreCommand {
     Doctor,
+    Metrics,
+    Alerts,
+    Backup { target: PathBuf },
+    Restore { source: PathBuf, target: PathBuf },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -366,6 +373,24 @@ async fn main() -> Result<()> {
             V2Store::open(&config.daemon.store_root)?.verify_integrity()?;
             println!("{{\"ok\":true}}");
             Ok(())
+        }
+        Command::Store {
+            command: StoreCommand::Metrics,
+        } => print_json(&V2Store::open(&config.daemon.store_root)?.metrics(Utc::now())?),
+        Command::Store {
+            command: StoreCommand::Alerts,
+        } => {
+            let metrics = V2Store::open(&config.daemon.store_root)?.metrics(Utc::now())?;
+            print_json(&metrics.alerts())
+        }
+        Command::Store {
+            command: StoreCommand::Backup { target },
+        } => print_json(&V2Store::open(&config.daemon.store_root)?.backup_to(target)?),
+        Command::Store {
+            command: StoreCommand::Restore { source, target },
+        } => {
+            let store = V2Store::restore_from(source, target)?;
+            print_json(&store.metrics(Utc::now())?)
         }
     }
 }
@@ -659,6 +684,121 @@ async fn diagnostic_test(config: Config, command: TestCommand) -> Result<()> {
                     "fixture": true,
                     "evidence": "offline/frozen-evidence",
                     "metrics": metrics,
+                })
+            );
+        }
+        TestCommand::StoreCorruption => {
+            let daemon = fixture_daemon(&config)?;
+            let run_id = daemon.submit_default(RunPurpose::Debug)?;
+            while daemon.run_one("store-corruption-fixture").await? {}
+            let artifact_ref = daemon
+                .store()
+                .events_after(&run_id, 0, 10_000)?
+                .into_iter()
+                .find_map(|event| event.artifact_id)
+                .context("fixture run produced no artifact to corrupt")?;
+            let artifact = daemon.store().artifact(&artifact_ref)?;
+            let blob_path = daemon
+                .store()
+                .root()
+                .join("blobs")
+                .join(&artifact.blob.hash.as_str()[..2])
+                .join(artifact.blob.hash.as_str());
+            std::fs::write(&blob_path, b"corrupt-fixture")
+                .with_context(|| format!("corrupt fixture blob {}", blob_path.display()))?;
+            let doctor = daemon.store().verify_integrity();
+            if doctor.is_ok() {
+                bail!("Store Doctor accepted a corrupted CAS blob");
+            }
+            println!(
+                "{}",
+                serde_json::json!({
+                    "test": "store-corruption",
+                    "run_id": run_id,
+                    "fixture": true,
+                    "evidence": "offline/store-doctor-corruption",
+                    "doctor_rejected": true,
+                })
+            );
+        }
+        TestCommand::FreezeRecovery => {
+            let daemon = fixture_daemon(&config)?;
+            daemon
+                .store()
+                .write_freeze_state(true, "fixture freeze", Utc::now())?;
+            let frozen_store = V2Store::open(&config.daemon.store_root)?;
+            let frozen = frozen_store
+                .latest_artifact_by_kind(ArtifactKind::FreezeState)?
+                .context("freeze artifact missing after reopen")?;
+            daemon
+                .store()
+                .write_freeze_state(false, "fixture unfreeze", Utc::now())?;
+            let unfrozen_store = V2Store::open(&config.daemon.store_root)?;
+            let unfrozen = unfrozen_store
+                .latest_artifact_by_kind(ArtifactKind::FreezeState)?
+                .context("unfreeze artifact missing after reopen")?;
+            daemon.store().verify_integrity()?;
+            println!(
+                "{}",
+                serde_json::json!({
+                    "test": "freeze-recovery",
+                    "fixture": true,
+                    "evidence": "offline/freeze-persistence",
+                    "frozen_artifact": frozen.artifact_id,
+                    "unfrozen_artifact": unfrozen.artifact_id,
+                })
+            );
+        }
+        TestCommand::LeaseTakeover => {
+            let daemon = fixture_daemon(&config)?;
+            let now = Utc::now();
+            let first = daemon
+                .store()
+                .acquire_daemon_lease(
+                    "paper-scheduler",
+                    "fixture-owner-a",
+                    now,
+                    now + ChronoDuration::seconds(10),
+                )?
+                .context("first fixture lease was not acquired")?;
+            if daemon
+                .store()
+                .acquire_daemon_lease(
+                    "paper-scheduler",
+                    "fixture-owner-b",
+                    now + ChronoDuration::seconds(1),
+                    now + ChronoDuration::seconds(5),
+                )?
+                .is_some()
+            {
+                bail!("live daemon lease was incorrectly stolen");
+            }
+            let successor = daemon
+                .store()
+                .acquire_daemon_lease(
+                    "paper-scheduler",
+                    "fixture-owner-b",
+                    now + ChronoDuration::seconds(11),
+                    now + ChronoDuration::seconds(21),
+                )?
+                .context("expired fixture lease was not taken over")?;
+            if successor.epoch <= first.epoch
+                || daemon
+                    .store()
+                    .validate_daemon_lease(&first, now + ChronoDuration::seconds(11))
+                    .is_ok()
+            {
+                bail!("stale daemon lease remained valid after takeover");
+            }
+            daemon.store().verify_integrity()?;
+            println!(
+                "{}",
+                serde_json::json!({
+                    "test": "lease-takeover",
+                    "fixture": true,
+                    "evidence": "offline/daemon-lease-fence",
+                    "old_epoch": first.epoch,
+                    "new_epoch": successor.epoch,
                 })
             );
         }

@@ -72,3 +72,27 @@ cargo run -p akzio-cli -- daemon unfreeze "approved recovery"
 - 至少一轮 T+1/T+3/T+5 Outcome worker 由真实 Paper bars 完成并通过 EvaluationRuntime；
 - 强杀、Store 损坏、lease takeover、网络分区和重复回执演练有人工记录；
 - 仍无 Live Trading 声明、无真实资本成功声明。
+
+## P2 本地运维命令
+
+以下命令只操作当前配置指向的 V2Store；`AKZIO_STORE_ROOT` 可用于把演练隔离到临时 Store Root：
+
+```text
+cargo run --offline -p akzio-cli -- store metrics
+cargo run --offline -p akzio-cli -- store alerts
+cargo run --offline -p akzio-cli -- store backup <new-backup-root>
+cargo run --offline -p akzio-cli -- store restore <backup-root> <new-store-root>
+```
+
+`store backup` 使用 SQLite 一致性快照并复制 CAS；目标目录必须不存在且不能位于活动 Store Root 内。`store restore` 拒绝覆盖既有目录，并在返回前自动运行 Store Doctor。
+
+离线故障演练命令：
+
+```text
+cargo run --offline -p akzio-cli -- test crash-recovery
+cargo run --offline -p akzio-cli -- test store-corruption
+cargo run --offline -p akzio-cli -- test freeze-recovery
+cargo run --offline -p akzio-cli -- test lease-takeover
+```
+
+这些命令的输出均标记 `fixture: true` 或 `evidence: offline/...`，不能替代真实 Alpaca Paper、真实市场数据或生产故障演练记录。

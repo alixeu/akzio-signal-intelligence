@@ -3,11 +3,12 @@
 //! The crate root re-exports this exact surface.
 
 pub use crate::store_v2::{
-    ClaimedAttempt, DaemonLease, ExecutionCommit, ExecutionCommitResult, PolicyEvaluationCommit,
-    PolicyEvaluationResult, PolicyHead, PolicyShadowPairSnapshot, PolicyTransitionRecord,
-    RepriceCommit, RepriceCommitResult, RetryTaskResult, SessionReservation, SessionSlot,
-    SessionSlotReservation, ShadowPairCompletion, ShadowPairWriteResult, StoreError, StoreMetrics,
-    StoreResult as Result, StoredActiveAttempt, StoredContract, StoredEvent, StoredRun,
-    StoredShadowPair, StoredTask, StoredTaskSnapshot, V2Store, WorkflowCommit, WorkflowPatchCommit,
-    WorkflowRevision, WorkflowSnapshot,
+    AlertSeverity, BackupManifest, ClaimedAttempt, DaemonLease, ExecutionCommit,
+    ExecutionCommitResult, PolicyEvaluationCommit, PolicyEvaluationResult, PolicyHead,
+    PolicyShadowPairSnapshot, PolicyTransitionRecord, RepriceCommit, RepriceCommitResult,
+    RetryTaskResult, SessionReservation, SessionSlot, SessionSlotReservation, ShadowPairCompletion,
+    ShadowPairWriteResult, StoreAlert, StoreError, StoreMetrics, StoreResult as Result,
+    StoredActiveAttempt, StoredContract, StoredEvent, StoredRun, StoredShadowPair, StoredTask,
+    StoredTaskSnapshot, V2Store, WorkflowCommit, WorkflowPatchCommit, WorkflowRevision,
+    WorkflowSnapshot,
 };

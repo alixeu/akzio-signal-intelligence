@@ -129,6 +129,12 @@ pub enum StoreError {
     ShadowPairConflict(String),
     #[error("Store Doctor: {0}")]
     Integrity(String),
+    #[error("backup target already exists: {0}")]
+    BackupTargetExists(PathBuf),
+    #[error("backup target cannot be inside Store Root: {0}")]
+    BackupInsideStoreRoot(PathBuf),
+    #[error("invalid backup source: {0}")]
+    InvalidBackup(PathBuf),
 }
 
 pub type StoreResult<T> = Result<T, StoreError>;
@@ -138,6 +144,16 @@ pub struct V2Store {
     root: Arc<PathBuf>,
     blobs: Arc<PathBuf>,
     connection: Arc<Mutex<Connection>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupManifest {
+    pub schema_version: u32,
+    pub database_hash: ContentHash,
+    pub database_bytes: u64,
+    pub blob_count: u64,
+    pub blob_bytes: u64,
+    pub created_at: DateTime<Utc>,
 }
 
 /// Immutable Contract installation. `activated_at` is derived from the
@@ -256,6 +272,64 @@ pub struct StoreMetrics {
     pub attempt_counts: BTreeMap<String, u64>,
     pub event_count: u64,
     pub active_daemon_leases: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AlertSeverity {
+    Warning,
+    Critical,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoreAlert {
+    pub code: String,
+    pub severity: AlertSeverity,
+    pub count: u64,
+}
+
+impl StoreMetrics {
+    pub fn alerts(&self) -> Vec<StoreAlert> {
+        let mut alerts = Vec::new();
+        push_alert(
+            &mut alerts,
+            "failed_runs",
+            "failed",
+            AlertSeverity::Critical,
+            &self.run_counts,
+        );
+        push_alert(
+            &mut alerts,
+            "failed_tasks",
+            "failed",
+            AlertSeverity::Critical,
+            &self.task_counts,
+        );
+        push_alert(
+            &mut alerts,
+            "failed_attempts",
+            "failed",
+            AlertSeverity::Warning,
+            &self.attempt_counts,
+        );
+        alerts
+    }
+}
+
+fn push_alert(
+    alerts: &mut Vec<StoreAlert>,
+    code: &str,
+    status: &str,
+    severity: AlertSeverity,
+    counts: &BTreeMap<String, u64>,
+) {
+    if let Some(&count) = counts.get(status).filter(|count| **count > 0) {
+        alerts.push(StoreAlert {
+            code: code.to_owned(),
+            severity,
+            count,
+        });
+    }
 }
 
 /// Fenced singleton lease for daemon-owned scheduling work. Task attempts use
@@ -521,6 +595,117 @@ impl V2Store {
 
     pub fn root(&self) -> &Path {
         self.root.as_ref()
+    }
+
+    /// Create a consistent SQLite snapshot plus immutable CAS blobs.
+    ///
+    /// The target must be new and outside the active Store Root. The
+    /// database snapshot is produced by SQLite's `VACUUM INTO`, so a backup
+    /// never observes a partially committed transaction.
+    pub fn backup_to(&self, target: impl AsRef<Path>) -> StoreResult<BackupManifest> {
+        self.verify_integrity()?;
+        let target = target.as_ref().to_path_buf();
+        if target.starts_with(self.root()) {
+            return Err(StoreError::BackupInsideStoreRoot(target));
+        }
+        if target.exists() {
+            return Err(StoreError::BackupTargetExists(target));
+        }
+        fs::create_dir_all(target.join("blobs")).map_err(|source| StoreError::Io {
+            path: target.join("blobs"),
+            source,
+        })?;
+
+        let database = target.join(DATABASE_FILE);
+        {
+            let connection = self.connection.lock().expect("store connection poisoned");
+            let database_sql = database.to_string_lossy().into_owned();
+            connection.execute("VACUUM INTO ?1", [&database_sql])?;
+        }
+        let (blob_count, blob_bytes) = copy_blob_tree(self.blobs(), &target.join("blobs"))?;
+        let database_bytes = fs::metadata(&database)
+            .map_err(|source| StoreError::Io {
+                path: database.clone(),
+                source,
+            })?
+            .len();
+        let database_content = fs::read(&database).map_err(|source| StoreError::Io {
+            path: database.clone(),
+            source,
+        })?;
+        let manifest = BackupManifest {
+            schema_version: V2_DOMAIN_SCHEMA_VERSION,
+            database_hash: ContentHash::of_bytes(&database_content),
+            database_bytes,
+            blob_count,
+            blob_bytes,
+            created_at: Utc::now(),
+        };
+        let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
+        fs::write(target.join("manifest.json"), manifest_bytes).map_err(|source| {
+            StoreError::Io {
+                path: target.join("manifest.json"),
+                source,
+            }
+        })?;
+        sync_file(&database)?;
+        sync_file(&target.join("manifest.json"))?;
+        Ok(manifest)
+    }
+
+    /// Restore a backup into a new Store Root and run Store Doctor before
+    /// returning. Existing targets are rejected to avoid overwriting a
+    /// user's durable state.
+    pub fn restore_from(source: impl AsRef<Path>, target: impl AsRef<Path>) -> StoreResult<Self> {
+        let source = source.as_ref().to_path_buf();
+        let target = target.as_ref().to_path_buf();
+        if target.exists() {
+            return Err(StoreError::BackupTargetExists(target));
+        }
+        let manifest_path = source.join("manifest.json");
+        let database = source.join(DATABASE_FILE);
+        let blobs = source.join("blobs");
+        if !manifest_path.is_file() || !database.is_file() || !blobs.is_dir() {
+            return Err(StoreError::InvalidBackup(source));
+        }
+        let manifest: BackupManifest =
+            serde_json::from_slice(&fs::read(&manifest_path).map_err(|source_error| {
+                StoreError::Io {
+                    path: manifest_path.clone(),
+                    source: source_error,
+                }
+            })?)?;
+        let database_bytes = fs::read(&database).map_err(|source_error| StoreError::Io {
+            path: database.clone(),
+            source: source_error,
+        })?;
+        if database_bytes.len() as u64 != manifest.database_bytes
+            || ContentHash::of_bytes(&database_bytes) != manifest.database_hash
+        {
+            return Err(StoreError::InvalidBackup(source));
+        }
+        fs::create_dir_all(target.join("blobs")).map_err(|source_error| StoreError::Io {
+            path: target.join("blobs"),
+            source: source_error,
+        })?;
+        fs::copy(&database, target.join(DATABASE_FILE)).map_err(|source_error| StoreError::Io {
+            path: target.join(DATABASE_FILE),
+            source: source_error,
+        })?;
+        copy_blob_tree(&blobs, &target.join("blobs"))?;
+        fs::copy(&manifest_path, target.join("manifest.json")).map_err(|source_error| {
+            StoreError::Io {
+                path: target.join("manifest.json"),
+                source: source_error,
+            }
+        })?;
+        let store = Self::open(&target)?;
+        store.verify_integrity()?;
+        Ok(store)
+    }
+
+    fn blobs(&self) -> &Path {
+        self.blobs.as_ref()
     }
 
     pub fn put_bytes(&self, bytes: &[u8], media_type: impl Into<String>) -> StoreResult<BlobRef> {
@@ -5204,6 +5389,74 @@ impl V2Store {
     fn blob_path(&self, hash: &ContentHash) -> PathBuf {
         self.blobs.join(&hash.as_str()[..2]).join(hash.as_str())
     }
+}
+
+fn sync_file(path: &Path) -> StoreResult<()> {
+    let file = fs::File::open(path).map_err(|source| StoreError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    file.sync_all().map_err(|source| StoreError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(())
+}
+
+fn copy_blob_tree(source: &Path, target: &Path) -> StoreResult<(u64, u64)> {
+    let mut blob_count = 0_u64;
+    let mut blob_bytes = 0_u64;
+    let entries = fs::read_dir(source).map_err(|source_error| StoreError::Io {
+        path: source.to_path_buf(),
+        source: source_error,
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|source_error| StoreError::Io {
+            path: source.to_path_buf(),
+            source: source_error,
+        })?;
+        let source_path = entry.path();
+        if !source_path.is_dir() {
+            continue;
+        }
+        let shard = entry.file_name();
+        let target_shard = target.join(shard);
+        fs::create_dir_all(&target_shard).map_err(|source_error| StoreError::Io {
+            path: target_shard.clone(),
+            source: source_error,
+        })?;
+        for blob in fs::read_dir(&source_path).map_err(|source_error| StoreError::Io {
+            path: source_path.clone(),
+            source: source_error,
+        })? {
+            let blob = blob.map_err(|source_error| StoreError::Io {
+                path: source_path.clone(),
+                source: source_error,
+            })?;
+            let blob_path = blob.path();
+            if !blob_path.is_file() {
+                continue;
+            }
+            let bytes = fs::metadata(&blob_path)
+                .map_err(|source_error| StoreError::Io {
+                    path: blob_path.clone(),
+                    source: source_error,
+                })?
+                .len();
+            let target_blob = target_shard.join(blob.file_name());
+            fs::copy(&blob_path, &target_blob).map_err(|source_error| StoreError::Io {
+                path: target_blob,
+                source: source_error,
+            })?;
+            blob_count = blob_count
+                .checked_add(1)
+                .ok_or_else(|| StoreError::Integrity("backup blob count overflow".to_owned()))?;
+            blob_bytes = blob_bytes
+                .checked_add(bytes)
+                .ok_or_else(|| StoreError::Integrity("backup blob bytes overflow".to_owned()))?;
+        }
+    }
+    Ok((blob_count, blob_bytes))
 }
 
 fn initialize(connection: &mut Connection, root: &Path) -> StoreResult<()> {
@@ -10493,5 +10746,40 @@ mod tests {
         assert!(metrics.attempt_counts.is_empty());
         assert_eq!(metrics.event_count, 0);
         assert_eq!(metrics.active_daemon_leases, 0);
+    }
+
+    #[test]
+    fn metrics_expose_failed_run_and_attempt_alerts() {
+        let metrics = StoreMetrics {
+            run_counts: BTreeMap::from([("failed".to_owned(), 2)]),
+            task_counts: BTreeMap::new(),
+            attempt_counts: BTreeMap::from([("failed".to_owned(), 1)]),
+            event_count: 0,
+            active_daemon_leases: 0,
+        };
+        let alerts = metrics.alerts();
+        assert_eq!(alerts.len(), 2);
+        assert_eq!(alerts[0].code, "failed_runs");
+        assert_eq!(alerts[1].code, "failed_attempts");
+    }
+
+    #[test]
+    fn backup_restore_round_trip_runs_store_doctor() {
+        let source_directory = tempdir().unwrap();
+        let store = V2Store::open(source_directory.path()).unwrap();
+        let blob = store.put_bytes(b"backup-fixture", "text/plain").unwrap();
+
+        let backup_parent = tempdir().unwrap();
+        let backup_root = backup_parent.path().join("backup");
+        let manifest = store.backup_to(&backup_root).unwrap();
+        assert_eq!(manifest.blob_count, 1);
+        assert_eq!(manifest.blob_bytes, blob.bytes);
+
+        let restore_parent = tempdir().unwrap();
+        let restore_root = restore_parent.path().join("restored");
+        let restored = V2Store::restore_from(&backup_root, &restore_root).unwrap();
+        let restored_blob = restored.read_blob(&blob).unwrap();
+        assert_eq!(restored_blob, b"backup-fixture");
+        restored.verify_integrity().unwrap();
     }
 }
