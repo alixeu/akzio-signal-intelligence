@@ -115,6 +115,7 @@ dependencies = [
  "akzio-domain",
  "akzio-store",
  "chrono",
+ "futures",
  "reqwest",
  "serde",
  "serde_json",

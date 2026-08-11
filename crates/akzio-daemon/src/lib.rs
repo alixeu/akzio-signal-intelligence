@@ -1518,7 +1518,7 @@ mod tests {
     use akzio_execution::paper::{
         CommittedPaperBroker, PaperError, PaperExecution, PaperOrderReceipt,
     };
-    use akzio_ingest::NormalizedEvidencePayload;
+    use akzio_ingest::{EvidenceProvenance, EvidenceQuality, NormalizedEvidencePayload};
     use axum::{
         body::{to_bytes, Body},
         http::{Request, StatusCode},
@@ -1784,6 +1784,16 @@ mod tests {
                     source_uri: "fixture://alpaca/bars/TQQQ/1d".to_owned(),
                     observed_at,
                     normalized: serde_json::json!({"close": 100}),
+                    provenance: EvidenceProvenance {
+                        document_id: Some("fixture-bars".to_owned()),
+                        published_at: None,
+                        observed_at,
+                        revision: Some("1".to_owned()),
+                        source_uri: "fixture://alpaca/bars/TQQQ/1d".to_owned(),
+                        dedupe_key: "fixture:alpaca:bars:TQQQ:1d".to_owned(),
+                        citations: vec![],
+                    },
+                    quality: EvidenceQuality::default(),
                 },
             )]),
         )]);
@@ -1836,6 +1846,7 @@ mod tests {
     #[tokio::test]
     async fn scheduler_owned_paper_run_forwards_no_order_and_schedules_outcome() {
         let directory = tempdir().unwrap();
+        let observed_at = Utc::now();
         let fixture_evidence = BTreeMap::from([(
             EvidenceSource::Alpaca,
             BTreeMap::from([(
@@ -1844,8 +1855,18 @@ mod tests {
                     raw: br#"{\"bars\":[{\"close\":100}]}"#.to_vec(),
                     media_type: "application/json".to_owned(),
                     source_uri: "fixture://alpaca/bars/TQQQ/1d".to_owned(),
-                    observed_at: Utc::now(),
+                    observed_at,
                     normalized: serde_json::json!({"close": 100}),
+                    provenance: EvidenceProvenance {
+                        document_id: Some("fixture-bars".to_owned()),
+                        published_at: None,
+                        observed_at,
+                        revision: Some("1".to_owned()),
+                        source_uri: "fixture://alpaca/bars/TQQQ/1d".to_owned(),
+                        dedupe_key: "fixture:alpaca:bars:TQQQ:1d".to_owned(),
+                        citations: vec![],
+                    },
+                    quality: EvidenceQuality::default(),
                 },
             )]),
         )]);
@@ -1999,6 +2020,16 @@ mod tests {
                     source_uri: format!("fixture://alpaca/{resource}"),
                     observed_at: now,
                     normalized,
+                    provenance: EvidenceProvenance {
+                        document_id: Some(format!("fixture-{resource}")),
+                        published_at: None,
+                        observed_at: now,
+                        revision: Some("1".to_owned()),
+                        source_uri: format!("fixture://alpaca/{resource}"),
+                        dedupe_key: format!("fixture:alpaca:{resource}"),
+                        citations: vec![],
+                    },
+                    quality: EvidenceQuality::default(),
                 },
             )
         })

@@ -2,9 +2,13 @@
 
 use std::collections::BTreeSet;
 
+use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{ArtifactKind, ArtifactRef, DecisionHorizon, DomainError, V2_DOMAIN_SCHEMA_VERSION};
+use crate::{
+    ArtifactKind, ArtifactRef, Asset, DecisionHorizon, DomainError, EvidenceNeed,
+    V2_DOMAIN_SCHEMA_VERSION,
+};
 
 pub const MAX_EVIDENCE_GAPS: usize = 2;
 pub const STRUCTURED_CRITIQUE_CANDIDATE_TOPOLOGY_ID: &str = "candidate.structured_critique";
@@ -31,6 +35,66 @@ pub enum ResolutionDisposition {
     Accepted,
     Rebutted,
     Unresolved,
+}
+
+/// Rust-owned research request. It is lowered to an `EvidenceNeed` before a
+/// workflow is installed; models may propose values but cannot widen them at
+/// execution time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResearchIntent {
+    pub schema_version: u32,
+    pub source_family: String,
+    pub resource: String,
+    pub query: String,
+    pub assets: BTreeSet<Asset>,
+    pub window_start: Option<DateTime<Utc>>,
+    pub window_end: Option<DateTime<Utc>>,
+    pub max_age_secs: u64,
+    pub max_results: u16,
+}
+
+impl ResearchIntent {
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if self.schema_version != V2_DOMAIN_SCHEMA_VERSION
+            || self.source_family.trim().is_empty()
+            || self.resource.trim().is_empty()
+            || self.query.trim().is_empty()
+            || self.resource.chars().count() > 2_048
+            || self.query.chars().count() > 2_000
+            || !(1..=86_400 * 7).contains(&self.max_age_secs)
+            || !(1..=32).contains(&self.max_results)
+        {
+            return Err(DomainError::EmptyField {
+                field: "research.intent",
+            });
+        }
+        if !matches!(
+            self.source_family.as_str(),
+            "alpaca" | "sec_edgar" | "fred" | "news_web"
+        ) {
+            return Err(DomainError::EvidenceSourceNotAllowed(
+                self.source_family.clone(),
+            ));
+        }
+        if let (Some(start), Some(end)) = (self.window_start, self.window_end) {
+            if end < start || end.signed_duration_since(start) > Duration::days(366) {
+                return Err(DomainError::InvalidBudget {
+                    field: "research.intent.window",
+                });
+            }
+        }
+        Ok(())
+    }
+
+    pub fn evidence_need(&self) -> Result<EvidenceNeed, DomainError> {
+        self.validate()?;
+        Ok(EvidenceNeed {
+            schema_version: crate::V2_SCHEMA_VERSION,
+            source_family: self.source_family.clone(),
+            resource: self.resource.clone(),
+            max_age_secs: self.max_age_secs,
+        })
+    }
 }
 
 /// A concrete statement of support attached to one governed evidence artifact.
@@ -306,5 +370,27 @@ mod tests {
             .source_refs()
             .iter()
             .any(|reference| reference.kind == ArtifactKind::Critique));
+    }
+
+    #[test]
+    fn research_intent_is_bounded_before_lowering_to_evidence_need() {
+        let intent = ResearchIntent {
+            schema_version: V2_DOMAIN_SCHEMA_VERSION,
+            source_family: "fred".to_owned(),
+            resource: "series:DFII10".to_owned(),
+            query: "real yield regime".to_owned(),
+            assets: BTreeSet::new(),
+            window_start: None,
+            window_end: None,
+            max_age_secs: 86_400,
+            max_results: 4,
+        };
+        let need = intent.evidence_need().unwrap();
+        assert_eq!(need.source_family, "fred");
+        assert_eq!(need.resource, "series:DFII10");
+
+        let mut invalid = intent;
+        invalid.source_family = "arbitrary_http".to_owned();
+        assert!(invalid.validate().is_err());
     }
 }

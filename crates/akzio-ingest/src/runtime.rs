@@ -7,11 +7,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use akzio_domain::{
     Artifact, ArtifactKind, ArtifactLifecycle, ArtifactOrigin, ArtifactProvenance, ArtifactRef,
-    DomainError, EvidenceNeed, TaskWritePermit, V2_DOMAIN_SCHEMA_VERSION,
+    Asset, ContentHash, DomainError, EvidenceNeed, TaskWritePermit, V2_DOMAIN_SCHEMA_VERSION,
 };
 use akzio_store::v2::{StoreError, V2Store};
 use chrono::{DateTime, Duration, Utc};
-use reqwest::Url;
+use futures::future::BoxFuture;
+use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -52,6 +53,86 @@ impl EvidenceRequest {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EvidenceCitation {
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub quote: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EvidenceProvenance {
+    pub document_id: Option<String>,
+    pub published_at: Option<DateTime<Utc>>,
+    pub observed_at: DateTime<Utc>,
+    pub revision: Option<String>,
+    pub source_uri: String,
+    pub dedupe_key: String,
+    pub citations: Vec<EvidenceCitation>,
+}
+
+impl EvidenceProvenance {
+    fn validate(
+        &self,
+        raw_len: usize,
+        source_uri: &str,
+        observed_at: DateTime<Utc>,
+    ) -> Result<(), EvidenceRuntimeError> {
+        if self.source_uri != source_uri
+            || self.observed_at != observed_at
+            || self.dedupe_key.trim().is_empty()
+        {
+            return Err(EvidenceRuntimeError::InvalidProvenance);
+        }
+        if self
+            .document_id
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+            || self
+                .revision
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty())
+        {
+            return Err(EvidenceRuntimeError::InvalidProvenance);
+        }
+        for citation in &self.citations {
+            if citation.start_byte >= citation.end_byte
+                || citation.end_byte > raw_len
+                || citation.quote.trim().is_empty()
+            {
+                return Err(EvidenceRuntimeError::InvalidCitation);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EvidenceQuality {
+    pub completeness_ppm: u32,
+    pub citations_complete: bool,
+    pub normalized: bool,
+}
+
+impl Default for EvidenceQuality {
+    fn default() -> Self {
+        Self {
+            completeness_ppm: 1_000_000,
+            citations_complete: true,
+            normalized: true,
+        }
+    }
+}
+
+impl EvidenceQuality {
+    fn validate(&self) -> Result<(), EvidenceRuntimeError> {
+        if self.completeness_ppm > 1_000_000 || !self.normalized {
+            return Err(EvidenceRuntimeError::InvalidQuality);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct AcquiredEvidence {
     pub raw: Vec<u8>,
@@ -59,6 +140,8 @@ pub struct AcquiredEvidence {
     pub source_uri: String,
     pub observed_at: DateTime<Utc>,
     pub normalized: Value,
+    pub provenance: EvidenceProvenance,
+    pub quality: EvidenceQuality,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -70,6 +153,8 @@ pub struct NormalizedEvidencePayload {
     pub raw: ArtifactRef,
     pub observed_at: DateTime<Utc>,
     pub value: Value,
+    pub provenance: EvidenceProvenance,
+    pub quality: EvidenceQuality,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -100,6 +185,15 @@ pub trait EvidenceAdapter: Send + Sync {
     fn acquire(&self, request: &EvidenceRequest) -> Result<AcquiredEvidence, EvidenceAdapterError>;
 }
 
+pub trait AsyncEvidenceAdapter: Send + Sync {
+    fn source(&self) -> EvidenceSource;
+
+    fn acquire<'a>(
+        &'a self,
+        request: &'a EvidenceRequest,
+    ) -> BoxFuture<'a, Result<AcquiredEvidence, EvidenceAdapterError>>;
+}
+
 /// Rust-injected transport for governed evidence adapters. It accepts a
 /// source enum and resource instead of an arbitrary URL, so model code never
 /// gets a route to network access.
@@ -109,6 +203,199 @@ pub trait GovernedEvidenceTransport: Send + Sync {
         source: EvidenceSource,
         resource: &str,
     ) -> Result<AcquiredEvidence, EvidenceAdapterError>;
+}
+
+pub trait AsyncGovernedEvidenceTransport: Send + Sync {
+    fn acquire<'a>(
+        &'a self,
+        source: EvidenceSource,
+        resource: &'a str,
+    ) -> BoxFuture<'a, Result<AcquiredEvidence, EvidenceAdapterError>>;
+}
+
+/// Rust-owned Alpaca Paper market-data transport. The resource language is
+/// deliberately finite; callers cannot pass an arbitrary URL or endpoint.
+#[derive(Clone)]
+pub struct AlpacaPaperEvidenceTransport {
+    client: Client,
+    base_url: String,
+    key_id: String,
+    secret_key: String,
+}
+
+impl std::fmt::Debug for AlpacaPaperEvidenceTransport {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AlpacaPaperEvidenceTransport")
+            .field("base_url", &self.base_url)
+            .field("key_id", &"<redacted>")
+            .field("secret_key", &"<redacted>")
+            .finish()
+    }
+}
+
+impl AlpacaPaperEvidenceTransport {
+    pub fn new(
+        base_url: impl Into<String>,
+        key_id: impl Into<String>,
+        secret_key: impl Into<String>,
+    ) -> Result<Self, EvidenceAdapterError> {
+        let supplied = base_url.into();
+        let parsed = Url::parse(supplied.trim())
+            .map_err(|_| EvidenceAdapterError::Transport("non-Paper Alpaca endpoint".to_owned()))?;
+        if parsed.scheme() != "https"
+            || parsed.host_str() != Some("paper-api.alpaca.markets")
+            || parsed.port().is_some()
+            || parsed.username() != ""
+            || parsed.password().is_some()
+            || parsed.path() != "/"
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+        {
+            return Err(EvidenceAdapterError::Transport(
+                "non-Paper Alpaca endpoint".to_owned(),
+            ));
+        }
+        let key_id = key_id.into();
+        let secret_key = secret_key.into();
+        if key_id.trim().is_empty() || secret_key.trim().is_empty() {
+            return Err(EvidenceAdapterError::Transport(
+                "Alpaca credentials are empty".to_owned(),
+            ));
+        }
+        Ok(Self {
+            client: Client::new(),
+            base_url: "https://paper-api.alpaca.markets".to_owned(),
+            key_id,
+            secret_key,
+        })
+    }
+
+    fn path_for(resource: &str) -> Result<String, EvidenceAdapterError> {
+        match resource {
+            "paper.account" => Ok("/v2/account".to_owned()),
+            "paper.clock" => Ok("/v2/clock".to_owned()),
+            "paper.quotes" => Ok("/v2/stocks/quotes/latest?symbols=TQQQ,QQQ,SOXX,SOXL".to_owned()),
+            value if value.starts_with("quote:") => {
+                let asset = value.strip_prefix("quote:").unwrap_or_default();
+                let asset = Asset::try_from(asset).map_err(|_| {
+                    EvidenceAdapterError::Transport("asset is outside the v2 universe".to_owned())
+                })?;
+                Ok(format!("/v2/stocks/{}/quotes/latest", asset.symbol()))
+            }
+            value if value.starts_with("bars:") => {
+                let mut parts = value.split(':');
+                let _ = parts.next();
+                let asset = parts.next().ok_or_else(|| {
+                    EvidenceAdapterError::Transport("invalid Alpaca bars resource".to_owned())
+                })?;
+                let timeframe = parts.next().ok_or_else(|| {
+                    EvidenceAdapterError::Transport("invalid Alpaca bars resource".to_owned())
+                })?;
+                if parts.next().is_some() || timeframe != "1d" {
+                    return Err(EvidenceAdapterError::Transport(
+                        "only one-day bars are allowed".to_owned(),
+                    ));
+                }
+                let asset = Asset::try_from(asset).map_err(|_| {
+                    EvidenceAdapterError::Transport("asset is outside the v2 universe".to_owned())
+                })?;
+                Ok(format!(
+                    "/v2/stocks/{}/bars?timeframe=1Day&limit=1",
+                    asset.symbol()
+                ))
+            }
+            _ => Err(EvidenceAdapterError::Transport(
+                "Alpaca resource is not allowlisted".to_owned(),
+            )),
+        }
+    }
+
+    async fn acquire_inner(
+        &self,
+        source: EvidenceSource,
+        resource: &str,
+    ) -> Result<AcquiredEvidence, EvidenceAdapterError> {
+        if source != EvidenceSource::Alpaca {
+            return Err(EvidenceAdapterError::SourceMismatch);
+        }
+        let path = Self::path_for(resource)?;
+        let url = format!("{}{}", self.base_url, path);
+        let response = self
+            .client
+            .get(&url)
+            .header("APCA-API-KEY-ID", &self.key_id)
+            .header("APCA-API-SECRET-KEY", &self.secret_key)
+            .send()
+            .await
+            .map_err(|error| EvidenceAdapterError::Transport(error.to_string()))?;
+        let status = response.status();
+        let body = response
+            .bytes()
+            .await
+            .map_err(|error| EvidenceAdapterError::Transport(error.to_string()))?;
+        if !status.is_success() {
+            return Err(EvidenceAdapterError::Transport(format!(
+                "Alpaca returned HTTP {}",
+                status.as_u16()
+            )));
+        }
+        let normalized: Value = serde_json::from_slice(&body)
+            .map_err(|error| EvidenceAdapterError::Transport(error.to_string()))?;
+        let observed_at = Utc::now();
+        let source_uri = format!(
+            "{}{}",
+            self.base_url,
+            Url::parse(&url)
+                .map_err(|_| EvidenceAdapterError::Transport("invalid Alpaca URL".to_owned()))?
+                .path()
+        );
+        Ok(AcquiredEvidence {
+            raw: body.to_vec(),
+            media_type: "application/json".to_owned(),
+            source_uri: source_uri.clone(),
+            observed_at,
+            normalized,
+            provenance: EvidenceProvenance {
+                document_id: Some(resource.to_owned()),
+                published_at: None,
+                observed_at,
+                revision: None,
+                source_uri,
+                dedupe_key: format!("alpaca:{}", ContentHash::of_bytes(&body)),
+                citations: vec![],
+            },
+            quality: EvidenceQuality::default(),
+        })
+    }
+}
+
+impl AsyncGovernedEvidenceTransport for AlpacaPaperEvidenceTransport {
+    fn acquire<'a>(
+        &'a self,
+        source: EvidenceSource,
+        resource: &'a str,
+    ) -> BoxFuture<'a, Result<AcquiredEvidence, EvidenceAdapterError>> {
+        Box::pin(self.acquire_inner(source, resource))
+    }
+}
+
+impl AsyncEvidenceAdapter for AlpacaPaperEvidenceTransport {
+    fn source(&self) -> EvidenceSource {
+        EvidenceSource::Alpaca
+    }
+
+    fn acquire<'a>(
+        &'a self,
+        request: &'a EvidenceRequest,
+    ) -> BoxFuture<'a, Result<AcquiredEvidence, EvidenceAdapterError>> {
+        Box::pin(async move {
+            if request.source != EvidenceSource::Alpaca {
+                return Err(EvidenceAdapterError::SourceMismatch);
+            }
+            self.acquire_inner(request.source, &request.resource).await
+        })
+    }
 }
 
 macro_rules! governed_adapter {
@@ -211,6 +498,12 @@ pub enum EvidenceRuntimeError {
     InvalidAcquisition,
     #[error("acquired evidence source URI is invalid or contains credentials")]
     UnsafeSourceUri,
+    #[error("acquired evidence provenance is invalid")]
+    InvalidProvenance,
+    #[error("acquired evidence citation is invalid")]
+    InvalidCitation,
+    #[error("acquired evidence quality is invalid")]
+    InvalidQuality,
     #[error("semantic detail must cite normalized evidence")]
     DetailRequiresNormalizedEvidence,
 }
@@ -284,6 +577,12 @@ impl EvidenceRuntime {
         {
             return Err(EvidenceRuntimeError::InvalidAcquisition);
         }
+        acquired.provenance.validate(
+            acquired.raw.len(),
+            &acquired.source_uri,
+            acquired.observed_at,
+        )?;
+        acquired.quality.validate()?;
         Self::validate_source_uri(&acquired.source_uri)?;
         if now.signed_duration_since(acquired.observed_at) > request.max_age {
             return Err(EvidenceRuntimeError::StaleEvidence);
@@ -318,6 +617,8 @@ impl EvidenceRuntime {
             raw: raw_ref.clone(),
             observed_at: acquired.observed_at,
             value: acquired.normalized,
+            provenance: acquired.provenance,
+            quality: acquired.quality,
         };
         let normalized = Artifact::new(
             ArtifactKind::NormalizedEvidence,
@@ -330,6 +631,116 @@ impl EvidenceRuntime {
                 retrieved_at: now,
                 source_uri: Some(acquired.source_uri),
                 confidence_ppm: 1_000_000,
+                producer_contract_hash: permit.contract_hash.clone(),
+            },
+            task_origin(permit),
+            vec![raw_ref, need.clone()],
+            now,
+        )?;
+        Ok(EvidenceBundle { raw, normalized })
+    }
+
+    pub async fn acquire_and_normalize_async<A: AsyncEvidenceAdapter + ?Sized>(
+        &self,
+        permit: &TaskWritePermit,
+        need: &ArtifactRef,
+        request: &EvidenceRequest,
+        adapter: &A,
+        now: DateTime<Utc>,
+    ) -> EvidenceRuntimeResult<EvidenceBundle> {
+        request.validate()?;
+        if need.kind != ArtifactKind::EvidenceNeed {
+            return Err(EvidenceRuntimeError::InvalidEvidenceNeed);
+        }
+        let need_artifact = self.store.artifact(&need.artifact_id)?;
+        if need_artifact.kind != ArtifactKind::EvidenceNeed
+            || need_artifact
+                .origin
+                .as_ref()
+                .and_then(|origin| origin.run_id.as_ref())
+                != Some(&permit.run_id)
+        {
+            return Err(EvidenceRuntimeError::InvalidEvidenceNeed);
+        }
+        let declared: EvidenceNeed =
+            serde_json::from_slice(&self.store.read_blob(&need_artifact.blob)?)?;
+        declared.validate()?;
+        let declared_max_age = i64::try_from(declared.max_age_secs)
+            .map(Duration::seconds)
+            .map_err(|_| EvidenceRuntimeError::InvalidEvidenceNeed)?;
+        if declared.source_family != request.source.as_str()
+            || declared.resource != request.resource
+            || declared_max_age != request.max_age
+        {
+            return Err(EvidenceRuntimeError::InvalidEvidenceNeed);
+        }
+        if !self.allowed_sources.contains(&request.source) {
+            return Err(EvidenceRuntimeError::SourceNotAllowed(request.source));
+        }
+        if adapter.source() != request.source {
+            return Err(EvidenceAdapterError::SourceMismatch.into());
+        }
+        let acquired = adapter.acquire(request).await?;
+        if acquired.raw.is_empty()
+            || acquired.media_type.trim().is_empty()
+            || acquired.source_uri.trim().is_empty()
+        {
+            return Err(EvidenceRuntimeError::InvalidAcquisition);
+        }
+        acquired.provenance.validate(
+            acquired.raw.len(),
+            &acquired.source_uri,
+            acquired.observed_at,
+        )?;
+        acquired.quality.validate()?;
+        Self::validate_source_uri(&acquired.source_uri)?;
+        if now.signed_duration_since(acquired.observed_at) > request.max_age {
+            return Err(EvidenceRuntimeError::StaleEvidence);
+        }
+        let raw = Artifact::new(
+            ArtifactKind::RawEvidence,
+            self.store.put_bytes(&acquired.raw, &acquired.media_type)?,
+            format!("akzio.ingest.{}.raw", request.source.as_str()),
+            ArtifactLifecycle::RunScoped,
+            ArtifactProvenance {
+                source_family: request.source.as_str().to_owned(),
+                observed_at: Some(acquired.observed_at),
+                retrieved_at: now,
+                source_uri: Some(acquired.source_uri.clone()),
+                confidence_ppm: 1_000_000,
+                producer_contract_hash: permit.contract_hash.clone(),
+            },
+            task_origin(permit),
+            vec![need.clone()],
+            now,
+        )?;
+        let raw_ref = ArtifactRef {
+            artifact_id: raw.artifact_id.clone(),
+            kind: ArtifactKind::RawEvidence,
+        };
+        let normalized_payload = NormalizedEvidencePayload {
+            schema_version: V2_DOMAIN_SCHEMA_VERSION,
+            source: request.source,
+            resource: request.resource.clone(),
+            need: need.clone(),
+            raw: raw_ref.clone(),
+            observed_at: acquired.observed_at,
+            value: acquired.normalized,
+            provenance: acquired.provenance,
+            quality: acquired.quality,
+        };
+        let quality_ppm = normalized_payload.quality.completeness_ppm;
+        let normalized = Artifact::new(
+            ArtifactKind::NormalizedEvidence,
+            self.store.put_json(&normalized_payload)?,
+            format!("akzio.ingest.{}.normalized", request.source.as_str()),
+            ArtifactLifecycle::RunScoped,
+            ArtifactProvenance {
+                source_family: request.source.as_str().to_owned(),
+                observed_at: Some(acquired.observed_at),
+                retrieved_at: now,
+                source_uri: Some(acquired.source_uri),
+                confidence_ppm: quality_ppm,
                 producer_contract_hash: permit.contract_hash.clone(),
             },
             task_origin(permit),
@@ -438,13 +849,28 @@ mod tests {
     }
 
     fn transport() -> FixtureTransport {
+        let observed_at = Utc::now();
         FixtureTransport {
             evidence: AcquiredEvidence {
                 raw: br#"{\"fixture\":true}"#.to_vec(),
                 media_type: "application/json".to_owned(),
                 source_uri: "fixture://governed/resource".to_owned(),
-                observed_at: Utc::now(),
+                observed_at,
                 normalized: serde_json::json!({"fixture": true}),
+                provenance: EvidenceProvenance {
+                    document_id: Some("fixture-governed".to_owned()),
+                    published_at: None,
+                    observed_at,
+                    revision: Some("1".to_owned()),
+                    source_uri: "fixture://governed/resource".to_owned(),
+                    dedupe_key: "fixture:governed:resource".to_owned(),
+                    citations: vec![EvidenceCitation {
+                        start_byte: 0,
+                        end_byte: 18,
+                        quote: "{\"fixture\":true}".to_owned(),
+                    }],
+                },
+                quality: EvidenceQuality::default(),
             },
         }
     }
@@ -577,6 +1003,16 @@ mod tests {
                     source_uri: "fixture://alpaca/quote".to_owned(),
                     observed_at: now,
                     normalized: serde_json::json!({"symbol": "QQQ", "price": 1}),
+                    provenance: EvidenceProvenance {
+                        document_id: Some("fixture-quote".to_owned()),
+                        published_at: None,
+                        observed_at: now,
+                        revision: Some("1".to_owned()),
+                        source_uri: "fixture://alpaca/quote".to_owned(),
+                        dedupe_key: "fixture:alpaca:quote".to_owned(),
+                        citations: vec![],
+                    },
+                    quality: EvidenceQuality::default(),
                 },
             )],
         )
@@ -732,6 +1168,16 @@ mod tests {
                     source_uri: "fixture://alpaca/quote".to_owned(),
                     observed_at: now - Duration::minutes(5),
                     normalized: serde_json::json!({}),
+                    provenance: EvidenceProvenance {
+                        document_id: Some("fixture-stale".to_owned()),
+                        published_at: None,
+                        observed_at: now - Duration::minutes(5),
+                        revision: Some("1".to_owned()),
+                        source_uri: "fixture://alpaca/quote".to_owned(),
+                        dedupe_key: "fixture:alpaca:stale".to_owned(),
+                        citations: vec![],
+                    },
+                    quality: EvidenceQuality::default(),
                 },
             )],
         );
@@ -849,5 +1295,20 @@ mod tests {
             .unwrap();
         assert_eq!(store.artifact(&detail.artifact_id).unwrap(), detail);
         store.verify_integrity().unwrap();
+    }
+
+    #[test]
+    fn alpaca_paper_transport_is_endpoint_and_resource_fenced() {
+        assert!(
+            AlpacaPaperEvidenceTransport::new("https://api.alpaca.markets", "key", "secret")
+                .is_err()
+        );
+        assert_eq!(
+            AlpacaPaperEvidenceTransport::path_for("bars:QQQ:1d").unwrap(),
+            "/v2/stocks/QQQ/bars?timeframe=1Day&limit=1"
+        );
+        assert!(AlpacaPaperEvidenceTransport::path_for("bars:SPY:1d").is_err());
+        assert!(AlpacaPaperEvidenceTransport::path_for("bars:QQQ:5m").is_err());
+        assert!(AlpacaPaperEvidenceTransport::path_for("https://example.com").is_err());
     }
 }

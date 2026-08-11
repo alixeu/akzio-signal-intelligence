@@ -1810,6 +1810,12 @@ fn model_error_result(error: &ModelError) -> Value {
         ModelError::Transport(_) => json!({"error": "transport"}),
         ModelError::MissingOutput => json!({"error": "missing_output"}),
         ModelError::FixtureExhausted => json!({"error": "fixture_exhausted"}),
+        ModelError::NativeWebUnavailable
+        | ModelError::NativeWebToolNotAllowed
+        | ModelError::NativeWebArgumentsInvalid
+        | ModelError::NativeWebCitationsMissing
+        | ModelError::NativeWebUnsafeCitation
+        | ModelError::NativeWebLimitExceeded => json!({"error": "native_web_contract"}),
         ModelError::EmptyBaseUrl
         | ModelError::EmptyApiKey
         | ModelError::EmptyModel
@@ -1830,6 +1836,15 @@ fn model_client_error(error: ModelError, trace: Option<ModelCallTrace>) -> Resea
         ModelError::EmptyReasoningEffort => {
             ("configuration", "missing reasoning effort".to_owned())
         }
+        ModelError::NativeWebUnavailable
+        | ModelError::NativeWebToolNotAllowed
+        | ModelError::NativeWebArgumentsInvalid
+        | ModelError::NativeWebCitationsMissing
+        | ModelError::NativeWebUnsafeCitation
+        | ModelError::NativeWebLimitExceeded => (
+            "native_web_contract",
+            "native web contract rejected response".to_owned(),
+        ),
         ModelError::MissingOutput => ("invalid_output", "missing model output".to_owned()),
         ModelError::FixtureExhausted => ("transport", "fixture sequence exhausted".to_owned()),
     };

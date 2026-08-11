@@ -6,8 +6,10 @@
 pub mod runtime;
 
 pub use runtime::{
-    AcquiredEvidence, AlpacaEvidenceAdapter, DetailInput, EvidenceAdapter, EvidenceBundle,
-    EvidenceRequest, EvidenceRuntime, EvidenceRuntimeError, EvidenceRuntimeResult, EvidenceSource,
-    FixtureEvidenceAdapter, FredEvidenceAdapter, GovernedEvidenceTransport, NewsWebEvidenceAdapter,
-    NormalizedEvidencePayload, SecEdgarEvidenceAdapter,
+    AcquiredEvidence, AlpacaEvidenceAdapter, AlpacaPaperEvidenceTransport, AsyncEvidenceAdapter,
+    AsyncGovernedEvidenceTransport, DetailInput, EvidenceAdapter, EvidenceBundle, EvidenceCitation,
+    EvidenceProvenance, EvidenceQuality, EvidenceRequest, EvidenceRuntime, EvidenceRuntimeError,
+    EvidenceRuntimeResult, EvidenceSource, FixtureEvidenceAdapter, FredEvidenceAdapter,
+    GovernedEvidenceTransport, NewsWebEvidenceAdapter, NormalizedEvidencePayload,
+    SecEdgarEvidenceAdapter,
 };
