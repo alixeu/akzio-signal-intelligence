@@ -1995,6 +1995,7 @@ mod tests {
                 recipe("gate.paper", RuntimeTaskClass::PaperCommit, false),
                 recipe("gate.reconcile", RuntimeTaskClass::Reconcile, false),
                 recipe("gate.evaluate", RuntimeTaskClass::Evaluate, false),
+                recipe("learning.outcome_worker", RuntimeTaskClass::Evaluate, false),
             ],
             TaskRecipeId::new("research.planner").unwrap(),
             TerminalRecipeSet {

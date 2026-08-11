@@ -25,10 +25,11 @@ use std::{
 
 use akzio_domain::{
     AccountSnapshot, Artifact, ArtifactId, ArtifactKind, ArtifactLifecycle, ArtifactOrigin,
-    ArtifactProvenance, ArtifactRef, ContextPolicy, EvidenceNeed, ExecutionContext,
-    ExecutionVerdict, FreezeState, MarketClockSnapshot, OutcomeExecutionLineage, QuoteSnapshot,
-    ResearchClaim, RunId, RunPurpose, RuntimeTaskClass, TaskId, TaskStatus, WorkflowProposal,
-    WorkflowStatus,
+    ArtifactProvenance, ArtifactRef, Asset, ContentHash, ContextPolicy, Decision, DecisionContext,
+    DomainError, EvidenceNeed, ExecutionContext, ExecutionVerdict, FreezeState,
+    MarketClockSnapshot, MemoryId, MoneyMicros, OutcomeExecutionLineage, OutcomeHorizon,
+    OutcomeSchedule, PolicySubject, QuoteSnapshot, ResearchClaim, RunId, RunPurpose,
+    RuntimeTaskClass, TaskId, TaskStatus, TopologyId, WorkflowProposal, WorkflowStatus,
 };
 use akzio_execution::{
     paper::CommittedPaperBroker, DecisionGateError, DecisionGateInput, ExecutionGateError,
@@ -39,17 +40,22 @@ use akzio_execution::{
 use akzio_ingest::{
     AcquiredEvidence, AlpacaPaperEvidenceTransport, AsyncEvidenceAdapter, EvidenceRequest,
     EvidenceRuntime, EvidenceRuntimeError, EvidenceSource, FixtureEvidenceAdapter,
-    ModelNativeWebEvidenceTransport,
+    ModelNativeWebEvidenceTransport, NormalizedEvidencePayload,
 };
-use akzio_learning::{OutcomeScheduleError, OutcomeScheduleInput, OutcomeSchedulingRuntime};
+use akzio_learning::{
+    EvaluationError, EvaluationInput, EvaluationPolicy, EvaluationRuntime,
+    GovernedHorizonObservation, OutcomeMaterializationInput, OutcomeScheduleError,
+    OutcomeScheduleInput, OutcomeSchedulingRuntime,
+};
 use akzio_model::{ModelClient, ModelConfig, ModelError};
 use akzio_research::v2::{
     ActiveResearchCatalogue, AgentRuntime, ModelClientAdapter, ResearchError,
 };
 use akzio_runtime::{
-    should_run_structured_critique, RuntimeError, TaskCompletion, TaskRuntime, WorkflowRuntime,
+    should_run_structured_critique, RetryCause, RuntimeError, TaskCompletion, TaskRuntime,
+    WorkflowRuntime,
 };
-use akzio_store::v2::{ClaimedAttempt, StoreError, StoredEvent, V2Store};
+use akzio_store::v2::{ClaimedAttempt, StoreError, StoreMetrics, StoredEvent, V2Store};
 use async_stream::stream;
 use axum::{
     extract::{Path, Query, State},
@@ -60,6 +66,7 @@ use axum::{
 };
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use thiserror::Error;
 use tokio::{net::TcpListener, sync::watch};
 
@@ -67,13 +74,22 @@ const EVENT_PAGE_SIZE: usize = 256;
 const PAPER_ACCOUNT_RESOURCE: &str = "paper.account";
 const PAPER_QUOTES_RESOURCE: &str = "paper.quotes";
 const PAPER_CLOCK_RESOURCE: &str = "paper.clock";
+const OUTCOME_WORKER_RECIPE_ID: &str = "learning.outcome_worker";
+const OUTCOME_WORKER_LEASE_NAME: &str = "akzio.local.outcome_worker";
 
 pub type FixtureEvidence = BTreeMap<EvidenceSource, BTreeMap<String, AcquiredEvidence>>;
+
+struct CollectedOutcome {
+    materialization: OutcomeMaterializationInput,
+    evidence_artifacts: Vec<Artifact>,
+}
 
 #[derive(Debug, Error)]
 pub enum DaemonError {
     #[error(transparent)]
     Store(#[from] StoreError),
+    #[error(transparent)]
+    Domain(#[from] DomainError),
     #[error(transparent)]
     Runtime(#[from] RuntimeError),
     #[error(transparent)]
@@ -94,6 +110,8 @@ pub enum DaemonError {
     PaperDispatch(#[from] PaperDispatchError),
     #[error(transparent)]
     OutcomeSchedule(#[from] OutcomeScheduleError),
+    #[error(transparent)]
+    Evaluation(#[from] EvaluationError),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error(transparent)]
@@ -147,6 +165,7 @@ pub struct DaemonHealth {
     pub frozen: bool,
     pub scheduler_owner: Option<String>,
     pub scheduler_epoch: Option<u64>,
+    pub metrics: StoreMetrics,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -206,6 +225,7 @@ impl Daemon {
     /// credentials stay in local configuration and are never persisted.
     pub fn open(config: DaemonConfig, model_config: ModelConfig) -> Result<Self> {
         let debug = model_config.debug;
+        let auto_paper = config.auto_paper;
         let model = ModelClient::from_config(&model_config)?;
         let mut daemon = Self::with_fixture_evidence_debug(
             config,
@@ -231,7 +251,11 @@ impl Daemon {
                 )),
             );
         }
+        let outcome_worker_enabled =
+            auto_paper && production_evidence.contains_key(&EvidenceSource::Alpaca);
         daemon.production_evidence = Arc::new(production_evidence);
+        daemon.outcome_scheduling_runtime = OutcomeSchedulingRuntime::new(daemon.store.clone())
+            .with_worker_enabled(outcome_worker_enabled);
         Ok(daemon)
     }
 
@@ -539,6 +563,7 @@ impl Daemon {
             frozen,
             scheduler_owner: lease.as_ref().map(|lease| lease.owner_id.clone()),
             scheduler_epoch: lease.map(|lease| lease.epoch),
+            metrics: self.store.metrics(Utc::now())?,
         })
     }
 
@@ -593,6 +618,9 @@ impl Daemon {
         now: DateTime<Utc>,
     ) -> Result<TaskCompletion> {
         let recipe = self.workflow.catalogue().recipe(&task.node.recipe_id)?;
+        if task.node.recipe_id.as_str() == OUTCOME_WORKER_RECIPE_ID {
+            return self.execute_outcome_worker(task, now).await;
+        }
         match recipe.task_class {
             RuntimeTaskClass::Agent => {
                 let candidates = self.context_candidates(task)?;
@@ -787,6 +815,242 @@ impl Daemon {
         self.outcome_scheduling_runtime
             .commit(&task.permit, &output, now)?;
         Ok(TaskCompletion::Committed)
+    }
+
+    async fn execute_outcome_worker(
+        &self,
+        task: &ClaimedAttempt,
+        now: DateTime<Utc>,
+    ) -> Result<TaskCompletion> {
+        if self.store.run_purpose(&task.run_id)? != RunPurpose::Paper {
+            return Ok(TaskCompletion::NoOutput);
+        }
+        let Some(outcome_lease) = self.store.acquire_daemon_lease(
+            OUTCOME_WORKER_LEASE_NAME,
+            self.scheduler.owner_id(),
+            now,
+            now + Duration::minutes(5),
+        )?
+        else {
+            return Ok(TaskCompletion::Retry(RetryCause::Transport));
+        };
+        let schedule_reference = task
+            .node
+            .input_artifacts
+            .iter()
+            .find(|reference| reference.kind == ArtifactKind::OutcomeSchedule)
+            .cloned()
+            .ok_or_else(|| {
+                DaemonError::InvalidInput("outcome worker schedule input missing".to_owned())
+            })?;
+        let schedule: OutcomeSchedule = self.read_artifact_payload(&schedule_reference)?;
+        let Some(collected) = self
+            .collect_outcome_materialization(task, &schedule_reference, &schedule, now)
+            .await?
+        else {
+            return Ok(TaskCompletion::Retry(RetryCause::Timeout));
+        };
+
+        self.store
+            .validate_daemon_lease(&outcome_lease, Utc::now())?;
+        for artifact in collected.evidence_artifacts {
+            self.store
+                .write_task_artifact(&task.permit, &artifact, "outcome.evidence", now)?;
+        }
+        let contract_hash = task
+            .permit
+            .contract_hash
+            .clone()
+            .unwrap_or_else(|| ContentHash::of_bytes(OUTCOME_WORKER_RECIPE_ID.as_bytes()));
+        let evaluation = EvaluationRuntime::new(self.store.clone(), EvaluationPolicy::default())?;
+        evaluation.evaluate(EvaluationInput {
+            permit: task.permit.clone(),
+            subject: PolicySubject::Memory(MemoryId(format!("paper:{}", task.run_id.0))),
+            hypothesis_id: format!("paper-outcome:{}", schedule.outcome_id.0),
+            materialization: collected.materialization,
+            contract_hash,
+            topology_id: TopologyId("paper-outcome".to_owned()),
+            candidate_policy: None,
+            token_cost: 0,
+            latency_millis: 0,
+        })?;
+        Ok(TaskCompletion::Committed)
+    }
+
+    async fn collect_outcome_materialization(
+        &self,
+        task: &ClaimedAttempt,
+        schedule_reference: &ArtifactRef,
+        schedule: &OutcomeSchedule,
+        now: DateTime<Utc>,
+    ) -> Result<Option<CollectedOutcome>> {
+        let adapter = self
+            .production_evidence
+            .get(&EvidenceSource::Alpaca)
+            .ok_or_else(|| {
+                DaemonError::Unavailable(
+                    "Paper outcome worker requires Alpaca Paper evidence adapter".to_owned(),
+                )
+            })?;
+        let decision: Decision = self.read_artifact_payload(&schedule.decision)?;
+        let decision_context: DecisionContext =
+            self.read_artifact_payload(&schedule.decision_context)?;
+        let execution_context: ExecutionContext =
+            self.read_artifact_payload(&schedule.execution_context)?;
+        let quote_reference = execution_context.quote_snapshot.clone().ok_or_else(|| {
+            DaemonError::Unavailable("Paper outcome baseline quote snapshot missing".to_owned())
+        })?;
+        let quote_artifact = self.store.artifact(&quote_reference.artifact_id)?;
+        let quote_payload: NormalizedEvidencePayload =
+            serde_json::from_slice(&self.store.read_blob(&quote_artifact.blob)?)?;
+        let quotes: QuoteSnapshot = serde_json::from_value(quote_payload.value)?;
+        quotes.validate()?;
+        let baseline_prices = quotes
+            .quotes
+            .into_iter()
+            .map(|(asset, quote)| {
+                let midpoint = quote
+                    .bid
+                    .0
+                    .checked_add(quote.ask.0)
+                    .and_then(|value| value.checked_div(2))
+                    .unwrap_or_default();
+                (asset, MoneyMicros(midpoint))
+            })
+            .collect::<BTreeMap<_, _>>();
+        if Asset::EXECUTABLE
+            .into_iter()
+            .any(|asset| baseline_prices.get(&asset).is_none_or(|price| price.0 <= 0))
+        {
+            return Err(DaemonError::Unavailable(
+                "Paper outcome baseline quotes are incomplete".to_owned(),
+            ));
+        }
+
+        let mut bars_by_asset = BTreeMap::<Asset, BTreeMap<NaiveDate, MoneyMicros>>::new();
+        let mut evidence_artifacts = Vec::new();
+        let runtime = EvidenceRuntime::new(self.store.clone(), [EvidenceSource::Alpaca]);
+        for asset in Asset::EXECUTABLE {
+            let resource = format!(
+                "bars:{}:1d:{}:6",
+                asset.symbol(),
+                schedule.baseline_trading_day
+            );
+            let need = EvidenceNeed {
+                schema_version: akzio_domain::V2_SCHEMA_VERSION,
+                source_family: EvidenceSource::Alpaca.as_str().to_owned(),
+                resource: resource.clone(),
+                max_age_secs: 604_800,
+            };
+            let need_artifact = Artifact::new(
+                ArtifactKind::EvidenceNeed,
+                self.store.put_json(&need)?,
+                "learning.outcome_worker.need",
+                ArtifactLifecycle::RunScoped,
+                ArtifactProvenance {
+                    source_family: "akzio-learning".to_owned(),
+                    observed_at: Some(now),
+                    retrieved_at: now,
+                    source_uri: None,
+                    confidence_ppm: 1_000_000,
+                    producer_contract_hash: task.permit.contract_hash.clone(),
+                },
+                Some(ArtifactOrigin {
+                    run_id: Some(task.run_id.clone()),
+                    task_id: Some(task.node.task_id.clone()),
+                    attempt_id: Some(task.permit.attempt_id.clone()),
+                    contract_hash: task.permit.contract_hash.clone(),
+                }),
+                vec![schedule_reference.clone()],
+                now,
+            )?;
+            self.store
+                .write_task_artifact(&task.permit, &need_artifact, "outcome.need", now)?;
+            let bundle = runtime
+                .acquire_and_normalize_async(
+                    &task.permit,
+                    &ArtifactRef {
+                        artifact_id: need_artifact.artifact_id.clone(),
+                        kind: ArtifactKind::EvidenceNeed,
+                    },
+                    &EvidenceRequest {
+                        source: EvidenceSource::Alpaca,
+                        resource,
+                        max_age: Duration::days(7),
+                    },
+                    adapter.as_ref(),
+                    now,
+                )
+                .await?;
+            let envelope: NormalizedEvidencePayload =
+                serde_json::from_slice(&self.store.read_blob(&bundle.normalized.blob)?)?;
+            let bars = parse_daily_bars(&envelope.value, envelope.observed_at)?;
+            if bars.is_empty() {
+                return Ok(None);
+            }
+            bars_by_asset.insert(asset, bars);
+            evidence_artifacts.extend([bundle.raw, bundle.normalized]);
+        }
+
+        let common_dates = common_bar_dates(&bars_by_asset, schedule.baseline_trading_day);
+        if common_dates.len() < usize::from(OutcomeHorizon::T5.trading_days()) {
+            return Ok(None);
+        }
+        let observations = OutcomeHorizon::ALL
+            .into_iter()
+            .map(|horizon| {
+                let index = usize::from(horizon.trading_days()) - 1;
+                let observed_trading_day = common_dates[index];
+                let future_prices = Asset::EXECUTABLE.into_iter().try_fold(
+                    BTreeMap::new(),
+                    |mut prices, asset| {
+                        let price = bars_by_asset
+                            .get(&asset)
+                            .and_then(|bars| bars.get(&observed_trading_day))
+                            .copied()
+                            .ok_or_else(|| {
+                                DaemonError::Unavailable(
+                                    "Paper outcome bars are not aligned".to_owned(),
+                                )
+                            })?;
+                        prices.insert(asset, price);
+                        Ok::<_, DaemonError>(prices)
+                    },
+                )?;
+                Ok(GovernedHorizonObservation {
+                    horizon,
+                    completed_trading_sessions: horizon.trading_days(),
+                    observed_trading_day,
+                    future_prices,
+                    expected_evidence_count: Asset::EXECUTABLE.len() as u64,
+                    observed_evidence_count: Asset::EXECUTABLE.len() as u64,
+                    expected_risk_count: (decision_context.hard_blockers.len()
+                        + decision_context.material_conflicts.len())
+                        as u64,
+                    detected_risk_count: 0,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Some(CollectedOutcome {
+            materialization: OutcomeMaterializationInput {
+                schedule: schedule.clone(),
+                schedule_artifact: schedule_reference.clone(),
+                target: decision.targets,
+                forecasts: decision.forecasts,
+                baseline_prices,
+                observations,
+                market_evidence: evidence_artifacts
+                    .iter()
+                    .filter(|artifact| artifact.kind == ArtifactKind::NormalizedEvidence)
+                    .map(|artifact| ArtifactRef {
+                        artifact_id: artifact.artifact_id.clone(),
+                        kind: artifact.kind,
+                    })
+                    .collect(),
+                sealed_at: now,
+            },
+            evidence_artifacts,
+        }))
     }
 
     fn paper_baseline_day(&self, run_id: &RunId) -> Result<NaiveDate> {
@@ -1106,6 +1370,99 @@ impl Daemon {
         }
         Ok(artifacts.into_values().collect())
     }
+}
+
+fn parse_daily_bars(
+    value: &Value,
+    observed_at: DateTime<Utc>,
+) -> Result<BTreeMap<NaiveDate, MoneyMicros>> {
+    let Some(items) = value.get("bars").and_then(Value::as_array) else {
+        let close = value
+            .get("close")
+            .and_then(parse_money_micros)
+            .ok_or_else(|| DaemonError::Unavailable("daily bars close is missing".to_owned()))?;
+        return Ok(BTreeMap::from([(observed_at.date_naive(), close)]));
+    };
+    let mut bars = BTreeMap::new();
+    for item in items {
+        let close = item
+            .get("c")
+            .or_else(|| item.get("close"))
+            .and_then(parse_money_micros)
+            .ok_or_else(|| DaemonError::Unavailable("daily bar close is invalid".to_owned()))?;
+        let date = item
+            .get("t")
+            .or_else(|| item.get("timestamp"))
+            .and_then(Value::as_str)
+            .and_then(|timestamp| {
+                DateTime::parse_from_rfc3339(timestamp)
+                    .map(|value| value.date_naive())
+                    .or_else(|_| NaiveDate::parse_from_str(timestamp, "%Y-%m-%d").map_err(|_| ()))
+                    .ok()
+            })
+            .unwrap_or_else(|| observed_at.date_naive());
+        if bars.insert(date, close).is_some() {
+            return Err(DaemonError::Unavailable(
+                "daily bar date is duplicated".to_owned(),
+            ));
+        }
+    }
+    Ok(bars)
+}
+
+fn parse_money_micros(value: &Value) -> Option<MoneyMicros> {
+    let raw = value
+        .as_str()
+        .map(str::to_owned)
+        .or_else(|| value.as_number().map(ToString::to_string))?;
+    let raw = raw.trim();
+    let (negative, unsigned) = if let Some(value) = raw.strip_prefix('-') {
+        (true, value)
+    } else if let Some(value) = raw.strip_prefix('+') {
+        (false, value)
+    } else {
+        (false, raw)
+    };
+    if unsigned.is_empty() || unsigned.contains(['e', 'E']) {
+        return None;
+    }
+    let (whole, fraction) = unsigned.split_once('.').unwrap_or((unsigned, ""));
+    if (!whole.is_empty() && !whole.chars().all(|character| character.is_ascii_digit()))
+        || !fraction.chars().all(|character| character.is_ascii_digit())
+    {
+        return None;
+    }
+    let whole = if whole.is_empty() {
+        0
+    } else {
+        whole.parse::<i64>().ok()?
+    };
+    let mut fraction = fraction.chars().take(6).collect::<String>();
+    while fraction.len() < 6 {
+        fraction.push('0');
+    }
+    let fraction = fraction.parse::<i64>().ok()?;
+    let magnitude = whole.checked_mul(1_000_000)?.checked_add(fraction)?;
+    Some(MoneyMicros(if negative {
+        magnitude.checked_neg()?
+    } else {
+        magnitude
+    }))
+}
+
+fn common_bar_dates(
+    bars_by_asset: &BTreeMap<Asset, BTreeMap<NaiveDate, MoneyMicros>>,
+    baseline: NaiveDate,
+) -> Vec<NaiveDate> {
+    let Some((_, first)) = bars_by_asset.iter().next() else {
+        return Vec::new();
+    };
+    first
+        .keys()
+        .copied()
+        .filter(|date| *date > baseline)
+        .filter(|date| bars_by_asset.values().all(|bars| bars.get(date).is_some()))
+        .collect()
 }
 
 fn execution_snapshot_artifact(
@@ -2674,5 +3031,44 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn daily_bar_parser_is_decimal_safe_and_rejects_duplicate_dates() {
+        let observed_at = DateTime::parse_from_rfc3339("2026-08-11T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let bars = parse_daily_bars(
+            &serde_json::json!({
+                "bars": [
+                    {"t": "2026-08-10T20:00:00Z", "c": 100.25},
+                    {"t": "2026-08-11T20:00:00Z", "c": "-0.5"}
+                ]
+            }),
+            observed_at,
+        )
+        .unwrap();
+        assert_eq!(
+            bars[&NaiveDate::from_ymd_opt(2026, 8, 10).unwrap()],
+            MoneyMicros(100_250_000)
+        );
+        assert_eq!(
+            bars[&NaiveDate::from_ymd_opt(2026, 8, 11).unwrap()],
+            MoneyMicros(-500_000)
+        );
+
+        let duplicate = parse_daily_bars(
+            &serde_json::json!({
+                "bars": [
+                    {"t": "2026-08-10T20:00:00Z", "c": 100.25},
+                    {"t": "2026-08-10T20:00:00Z", "c": 101.25}
+                ]
+            }),
+            observed_at,
+        );
+        assert!(matches!(
+            duplicate,
+            Err(DaemonError::Unavailable(message)) if message == "daily bar date is duplicated"
+        ));
     }
 }

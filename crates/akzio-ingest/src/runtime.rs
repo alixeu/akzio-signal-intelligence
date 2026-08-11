@@ -48,7 +48,11 @@ pub struct EvidenceRequest {
 
 impl EvidenceRequest {
     fn validate(&self) -> Result<(), EvidenceRuntimeError> {
-        if self.resource.trim().is_empty() || self.max_age <= Duration::zero() {
+        if self.resource.trim().is_empty()
+            || self.resource.chars().count() > 2_048
+            || self.max_age <= Duration::zero()
+            || self.max_age > Duration::days(7)
+        {
             return Err(EvidenceRuntimeError::InvalidRequest);
         }
         Ok(())
@@ -276,8 +280,12 @@ impl AlpacaPaperEvidenceTransport {
                 "Alpaca credentials are empty".to_owned(),
             ));
         }
+        let client = Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|error| EvidenceAdapterError::Transport(error.to_string()))?;
         Ok(Self {
-            client: Client::new(),
+            client,
             base_url: "https://paper-api.alpaca.markets".to_owned(),
             key_id,
             secret_key,
@@ -305,7 +313,7 @@ impl AlpacaPaperEvidenceTransport {
                 let timeframe = parts.next().ok_or_else(|| {
                     EvidenceAdapterError::Transport("invalid Alpaca bars resource".to_owned())
                 })?;
-                if parts.next().is_some() || timeframe != "1d" {
+                if timeframe != "1d" {
                     return Err(EvidenceAdapterError::Transport(
                         "only one-day bars are allowed".to_owned(),
                     ));
@@ -313,10 +321,35 @@ impl AlpacaPaperEvidenceTransport {
                 let asset = Asset::try_from(asset).map_err(|_| {
                     EvidenceAdapterError::Transport("asset is outside the v2 universe".to_owned())
                 })?;
-                Ok(format!(
-                    "/v2/stocks/{}/bars?timeframe=1Day&limit=1",
+                let start = parts.next();
+                let limit = parts.next().unwrap_or("1");
+                if parts.next().is_some() {
+                    return Err(EvidenceAdapterError::Transport(
+                        "invalid Alpaca bars resource".to_owned(),
+                    ));
+                }
+                let limit = limit.parse::<u8>().map_err(|_| {
+                    EvidenceAdapterError::Transport("invalid Alpaca bars limit".to_owned())
+                })?;
+                if !(1..=32).contains(&limit) {
+                    return Err(EvidenceAdapterError::Transport(
+                        "Alpaca bars limit outside 1..=32".to_owned(),
+                    ));
+                }
+                if let Some(start) = start {
+                    chrono::NaiveDate::parse_from_str(start, "%Y-%m-%d").map_err(|_| {
+                        EvidenceAdapterError::Transport("invalid Alpaca bars start date".to_owned())
+                    })?;
+                }
+                let mut path = format!(
+                    "/v2/stocks/{}/bars?timeframe=1Day&limit={limit}&adjustment=all",
                     asset.symbol()
-                ))
+                );
+                if let Some(start) = start {
+                    path.push_str("&start=");
+                    path.push_str(start);
+                }
+                Ok(path)
             }
             _ => Err(EvidenceAdapterError::Transport(
                 "Alpaca resource is not allowlisted".to_owned(),
@@ -356,13 +389,7 @@ impl AlpacaPaperEvidenceTransport {
         let normalized: Value = serde_json::from_slice(&body)
             .map_err(|error| EvidenceAdapterError::Transport(error.to_string()))?;
         let observed_at = Utc::now();
-        let source_uri = format!(
-            "{}{}",
-            self.base_url,
-            Url::parse(&url)
-                .map_err(|_| EvidenceAdapterError::Transport("invalid Alpaca URL".to_owned()))?
-                .path()
-        );
+        let source_uri = url;
         Ok(AcquiredEvidence {
             raw: body.to_vec(),
             media_type: "application/json".to_owned(),
@@ -511,9 +538,15 @@ impl ModelNativeWebEvidenceTransport {
             .map(|citation| EvidenceCitation {
                 start_byte: 0,
                 end_byte: raw.len(),
-                quote: citation.uri.clone(),
+                quote: citation
+                    .excerpt
+                    .clone()
+                    .unwrap_or_else(|| citation.uri.clone()),
             })
             .collect();
+        let primary = citations
+            .first()
+            .ok_or_else(|| EvidenceAdapterError::Transport("missing citation URI".to_owned()))?;
         Ok(AcquiredEvidence {
             raw: raw.clone(),
             media_type: "application/json".to_owned(),
@@ -521,12 +554,23 @@ impl ModelNativeWebEvidenceTransport {
             observed_at,
             normalized: raw_value,
             provenance: EvidenceProvenance {
-                document_id: Some(resource.to_owned()),
-                published_at: None,
+                document_id: primary
+                    .document_id
+                    .clone()
+                    .or_else(|| Some(resource.to_owned())),
+                published_at: primary
+                    .published_at
+                    .as_deref()
+                    .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                    .map(|value| value.with_timezone(&Utc)),
                 observed_at,
-                revision: None,
+                revision: primary.revision.clone(),
                 source_uri,
-                dedupe_key: format!("native-web:{}", ContentHash::of_bytes(&raw)),
+                dedupe_key: format!(
+                    "native-web:{}:{}",
+                    primary.document_id.as_deref().unwrap_or(resource),
+                    primary.revision.as_deref().unwrap_or("latest")
+                ),
                 citations: provenance_citations,
             },
             quality: EvidenceQuality {
@@ -1479,8 +1523,13 @@ mod tests {
         );
         assert_eq!(
             AlpacaPaperEvidenceTransport::path_for("bars:QQQ:1d").unwrap(),
-            "/v2/stocks/QQQ/bars?timeframe=1Day&limit=1"
+            "/v2/stocks/QQQ/bars?timeframe=1Day&limit=1&adjustment=all"
         );
+        assert_eq!(
+            AlpacaPaperEvidenceTransport::path_for("bars:QQQ:1d:2026-08-01:6").unwrap(),
+            "/v2/stocks/QQQ/bars?timeframe=1Day&limit=6&adjustment=all&start=2026-08-01"
+        );
+        assert!(AlpacaPaperEvidenceTransport::path_for("bars:QQQ:1d:2026-08-01:33").is_err());
         assert!(AlpacaPaperEvidenceTransport::path_for("bars:SPY:1d").is_err());
         assert!(AlpacaPaperEvidenceTransport::path_for("bars:QQQ:5m").is_err());
         assert!(AlpacaPaperEvidenceTransport::path_for("https://example.com").is_err());

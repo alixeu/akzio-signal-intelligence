@@ -19,13 +19,13 @@ use akzio_domain::{
     ExecutionContext, ExecutionPlan, ExecutionVerdict, Experience, FailureDisposition, FreezeState,
     LeaseId, OrderReceipt, OrderReceiptState, Outcome, OutcomeExecutionLineage, OutcomeHorizon,
     OutcomeSchedule, PaperCommitment, PaperReprice, PolicyState, PolicySubject, PolicyTransition,
-    PolicyTransitionId, Reconciliation, RetryPolicy, RunId, RunPurpose, TaskId, TaskRecipeId,
-    TaskStatus, TaskWritePermit, WorkflowGraph, WorkflowNode, WorkflowProposal, WorkflowStatus,
-    V2_DOMAIN_SCHEMA_VERSION, V2_SCHEMA_VERSION,
+    PolicyTransitionId, Reconciliation, RetryPolicy, RunId, RunPurpose, TaskBudget, TaskId,
+    TaskRecipeId, TaskStatus, TaskWritePermit, WorkflowGraph, WorkflowNode, WorkflowProposal,
+    WorkflowStatus, V2_DOMAIN_SCHEMA_VERSION, V2_SCHEMA_VERSION,
 };
 use chrono::{DateTime, Duration, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use thiserror::Error;
 
 const DATABASE_FILE: &str = "akzio.sqlite3";
@@ -247,6 +247,15 @@ pub struct StoredEvent {
     pub event_type: String,
     pub artifact_id: Option<ArtifactId>,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoreMetrics {
+    pub run_counts: BTreeMap<String, u64>,
+    pub task_counts: BTreeMap<String, u64>,
+    pub attempt_counts: BTreeMap<String, u64>,
+    pub event_count: u64,
+    pub active_daemon_leases: u64,
 }
 
 /// Fenced singleton lease for daemon-owned scheduling work. Task attempts use
@@ -1690,6 +1699,29 @@ impl V2Store {
             .transpose()
     }
 
+    pub fn metrics(&self, now: DateTime<Utc>) -> StoreResult<StoreMetrics> {
+        let connection = self.connection.lock().expect("store connection poisoned");
+        let run_counts = status_counts(&connection, "rebuild_runs")?;
+        let task_counts = status_counts(&connection, "rebuild_tasks")?;
+        let attempt_counts = status_counts(&connection, "rebuild_attempts")?;
+        let event_count =
+            connection.query_row("SELECT COUNT(*) FROM rebuild_events", [], |row| {
+                row.get::<_, u64>(0)
+            })?;
+        let active_daemon_leases = connection.query_row(
+            "SELECT COUNT(*) FROM rebuild_daemon_leases WHERE expires_at > ?1",
+            params![now.to_rfc3339()],
+            |row| row.get::<_, u64>(0),
+        )?;
+        Ok(StoreMetrics {
+            run_counts,
+            task_counts,
+            attempt_counts,
+            event_count,
+            active_daemon_leases,
+        })
+    }
+
     /// Atomically installs the single Rust-owned reprice intent for one
     /// commitment/asset lineage and terminally completes its task. The broker
     /// adapter may receive only the returned immutable intent afterwards.
@@ -2525,6 +2557,76 @@ impl V2Store {
         let mut connection = self.connection.lock().expect("store connection poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         commit_attempt_transaction(&transaction, permit, artifacts, status, now)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Commits the terminal `OutcomeSchedule` and installs the scheduler-owned
+    /// learning task in the same SQLite transaction. The learning task is not
+    /// part of the frozen research graph; it is a post-terminal durable worker
+    /// attached to the Paper run and cannot be created by a planner or agent.
+    pub fn commit_outcome_schedule_with_worker(
+        &self,
+        permit: &TaskWritePermit,
+        schedule: &Artifact,
+        now: DateTime<Utc>,
+    ) -> StoreResult<()> {
+        self.validate_attempt_commit(
+            permit,
+            std::slice::from_ref(schedule),
+            TaskStatus::Succeeded,
+        )?;
+        if schedule.kind != ArtifactKind::OutcomeSchedule {
+            return Err(StoreError::InvalidLearningCommit(
+                "outcome_schedule.worker_kind",
+            ));
+        }
+        let mut connection = self.connection.lock().expect("store connection poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let worker = WorkflowNode {
+            task_id: TaskId::new(),
+            recipe_id: TaskRecipeId::new("learning.outcome_worker")?,
+            contract_hash: schedule.provenance.producer_contract_hash.clone(),
+            objective: "Seal governed T+1/T+3/T+5 Paper outcome and record evaluation.".to_owned(),
+            dependencies: Vec::new(),
+            input_artifacts: vec![ArtifactRef {
+                artifact_id: schedule.artifact_id.clone(),
+                kind: ArtifactKind::OutcomeSchedule,
+            }],
+            priority: 100,
+            budget: TaskBudget {
+                max_input_tokens: 1_024,
+                max_output_tokens: 1_024,
+                max_wall_time_secs: 120,
+                max_tool_calls: 0,
+            },
+            retry: RetryPolicy {
+                max_attempts: u8::MAX,
+                initial_backoff_ms: 3_600_000,
+                retry_transport: true,
+                retry_rate_limited: true,
+                retry_invalid_output: false,
+            },
+            on_failure: FailureDisposition::FailRun,
+            parent_task_id: None,
+        };
+        insert_task_node(&transaction, &permit.run_id, &worker, now)?;
+        commit_attempt_transaction(
+            &transaction,
+            permit,
+            std::slice::from_ref(schedule),
+            TaskStatus::Succeeded,
+            now,
+        )?;
+        append_event(
+            &transaction,
+            &permit.run_id,
+            Some(&worker.task_id),
+            None,
+            "outcome.worker.enqueued",
+            Some(&schedule.artifact_id),
+            now,
+        )?;
         transaction.commit()?;
         Ok(())
     }
@@ -6969,6 +7071,16 @@ fn enum_name<T: Serialize>(value: T) -> String {
         .to_owned()
 }
 
+fn status_counts(connection: &Connection, table: &str) -> StoreResult<BTreeMap<String, u64>> {
+    let sql = format!("SELECT status, COUNT(*) FROM {table} GROUP BY status ORDER BY status");
+    let mut statement = connection.prepare(&sql)?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
+    })?;
+    rows.collect::<Result<BTreeMap<_, _>, _>>()
+        .map_err(Into::into)
+}
+
 fn parse_enum<T: for<'de> serde::Deserialize<'de>>(value: &str) -> StoreResult<T> {
     serde_json::from_value(serde_json::Value::String(value.to_owned())).map_err(StoreError::Json)
 }
@@ -10369,5 +10481,17 @@ mod tests {
             &corrupted,
             Err(StoreError::Integrity(message)) if message.contains("stale")
         ));
+    }
+
+    #[test]
+    fn metrics_are_empty_for_a_new_store() {
+        let directory = tempdir().unwrap();
+        let store = V2Store::open(directory.path()).unwrap();
+        let metrics = store.metrics(Utc::now()).unwrap();
+        assert!(metrics.run_counts.is_empty());
+        assert!(metrics.task_counts.is_empty());
+        assert!(metrics.attempt_counts.is_empty());
+        assert_eq!(metrics.event_count, 0);
+        assert_eq!(metrics.active_daemon_leases, 0);
     }
 }

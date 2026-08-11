@@ -141,6 +141,12 @@ pub struct NativeWebCitation {
     pub uri: String,
     pub title: Option<String>,
     pub excerpt: Option<String>,
+    #[serde(default)]
+    pub published_at: Option<String>,
+    #[serde(default)]
+    pub revision: Option<String>,
+    #[serde(default)]
+    pub document_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -301,6 +307,21 @@ fn collect_citations(value: &Value, output: &mut Vec<NativeWebCitation>, limit: 
                         .or_else(|| object.get("excerpt"))
                         .and_then(Value::as_str)
                         .map(str::to_owned),
+                    published_at: object
+                        .get("published_at")
+                        .or_else(|| object.get("publishedAt"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    revision: object
+                        .get("revision")
+                        .or_else(|| object.get("version"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    document_id: object
+                        .get("document_id")
+                        .or_else(|| object.get("documentId"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
                 });
             }
             object
@@ -318,6 +339,7 @@ pub struct ResponsesClient {
     api_key: String,
     model: String,
     reasoning_effort: String,
+    timeout: std::time::Duration,
 }
 
 impl std::fmt::Debug for ResponsesClient {
@@ -361,6 +383,7 @@ impl ResponsesClient {
             api_key,
             model,
             reasoning_effort,
+            timeout: std::time::Duration::from_secs(30),
         })
     }
 
@@ -374,6 +397,7 @@ impl ResponsesClient {
             .http
             .post(format!("{}/responses", self.base_url))
             .bearer_auth(&self.api_key)
+            .timeout(self.timeout)
             .json(&body)
             .send()
             .await?;

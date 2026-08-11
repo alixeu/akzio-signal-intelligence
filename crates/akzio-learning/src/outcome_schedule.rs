@@ -57,11 +57,20 @@ pub struct OutcomeScheduleOutput {
 #[derive(Debug, Clone)]
 pub struct OutcomeSchedulingRuntime {
     store: V2Store,
+    enqueue_worker: bool,
 }
 
 impl OutcomeSchedulingRuntime {
     pub fn new(store: V2Store) -> Self {
-        Self { store }
+        Self {
+            store,
+            enqueue_worker: false,
+        }
+    }
+
+    pub fn with_worker_enabled(mut self, enabled: bool) -> Self {
+        self.enqueue_worker = enabled;
+        self
     }
 
     pub fn schedule(
@@ -168,12 +177,17 @@ impl OutcomeSchedulingRuntime {
         output: &OutcomeScheduleOutput,
         now: DateTime<Utc>,
     ) -> OutcomeScheduleResult<()> {
-        self.store.commit_attempt(
-            permit,
-            std::slice::from_ref(&output.schedule),
-            TaskStatus::Succeeded,
-            now,
-        )?;
+        if self.enqueue_worker {
+            self.store
+                .commit_outcome_schedule_with_worker(permit, &output.schedule, now)?;
+        } else {
+            self.store.commit_attempt(
+                permit,
+                std::slice::from_ref(&output.schedule),
+                TaskStatus::Succeeded,
+                now,
+            )?;
+        }
         Ok(())
     }
 
