@@ -5,11 +5,12 @@ use akzio_daemon::{
     ReplayReport, RunCancellationResponse, RunRetryResponse, RunSubmissionResponse,
     StorePaperWorkflowSource,
 };
-use akzio_domain::{Asset, RunPurpose};
+use akzio_domain::{ArtifactKind, Asset, RunPurpose, WorkflowStatus};
 use akzio_execution::paper::AlpacaPaper;
 use akzio_model::ModelConfig;
 use akzio_store::V2Store;
 use anyhow::{bail, Context, Result};
+use chrono::{Duration as ChronoDuration, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
 use futures::StreamExt;
 use reqwest::{Client, Method, RequestBuilder, Response, Url};
@@ -34,6 +35,10 @@ enum Command {
     Run {
         #[command(subcommand)]
         command: RunCommand,
+    },
+    Test {
+        #[command(subcommand)]
+        command: TestCommand,
     },
     Store {
         #[command(subcommand)]
@@ -70,6 +75,15 @@ enum RunCommand {
         run_id: String,
     },
     FixtureDebug,
+    PaperDryRun,
+}
+
+#[derive(Debug, Subcommand)]
+enum TestCommand {
+    CrashRecovery,
+    ConcurrentRuns,
+    EvidenceIntegrity,
+    LearningTransitions,
 }
 
 #[derive(Debug, Subcommand)]
@@ -340,6 +354,10 @@ async fn main() -> Result<()> {
         Command::Run {
             command: RunCommand::FixtureDebug,
         } => fixture_debug(config).await,
+        Command::Run {
+            command: RunCommand::PaperDryRun,
+        } => paper_dry_run(config).await,
+        Command::Test { command } => diagnostic_test(config, command).await,
         Command::Store {
             command: StoreCommand::Doctor,
         } => {
@@ -351,9 +369,12 @@ async fn main() -> Result<()> {
 }
 
 fn load_config(path: &PathBuf) -> Result<Config> {
-    let config = std::fs::read_to_string(path)
+    let mut config = std::fs::read_to_string(path)
         .with_context(|| format!("read v2 config {}", path.display()))
         .and_then(|text| toml::from_str::<Config>(&text).context("parse v2 TOML"))?;
+    if let Some(store_root) = std::env::var_os("AKZIO_STORE_ROOT") {
+        config.daemon.store_root = PathBuf::from(store_root);
+    }
     if !config.daemon.http_addr.ip().is_loopback() {
         bail!("daemon.http_addr must be a loopback address");
     }
@@ -429,18 +450,179 @@ async fn serve(config: Config) -> Result<()> {
 }
 
 async fn fixture_debug(config: Config) -> Result<()> {
-    let daemon = Daemon::with_model(
+    let daemon = fixture_daemon(&config)?;
+    let run_id = daemon.submit_default(RunPurpose::Debug)?;
+    while daemon.run_one("fixture").await? {}
+    println!(
+        "{}",
+        serde_json::json!({
+            "run_id": run_id,
+            "fixture": true,
+            "evidence": "fixture/offline"
+        })
+    );
+    Ok(())
+}
+
+async fn paper_dry_run(config: Config) -> Result<()> {
+    let daemon = fixture_daemon(&config)?;
+    let run_id = daemon.submit_default(RunPurpose::PaperDryRun)?;
+    while daemon.run_one("paper-dry-run-fixture").await? {}
+    let snapshot = daemon.store().workflow_snapshot(&run_id)?;
+    let events = daemon.store().events_after(&run_id, 0, 10_000)?;
+    let canonical_learning_events = events
+        .iter()
+        .filter(|event| event.event_type == "policy.transitioned")
+        .count();
+    if canonical_learning_events != 0 {
+        bail!("Paper Dry Run produced canonical learning transition");
+    }
+    daemon.store().verify_integrity()?;
+    println!(
+        "{}",
+        serde_json::json!({
+            "run_id": run_id,
+            "purpose": "paper_dry_run",
+            "status": format!("{:?}", snapshot.status),
+            "canonical_learning_events": canonical_learning_events,
+            "fixture": true,
+            "evidence": "fixture/offline"
+        })
+    );
+    Ok(())
+}
+
+fn fixture_daemon(config: &Config) -> Result<Daemon> {
+    Ok(Daemon::with_model(
         DaemonConfig {
-            store_root: config.daemon.store_root,
+            store_root: config.daemon.store_root.clone(),
             http_token: "fixture-only".to_owned(),
             worker_count: config.daemon.worker_count.unwrap_or(2),
             auto_paper: false,
         },
         fixture_model_client(),
-    )?;
-    let run_id = daemon.submit_default(RunPurpose::Debug)?;
-    while daemon.run_one("fixture").await? {}
-    println!("{}", serde_json::json!({"run_id": run_id, "fixture": true}));
+    )?)
+}
+
+async fn diagnostic_test(config: Config, command: TestCommand) -> Result<()> {
+    match command {
+        TestCommand::CrashRecovery => {
+            let daemon = fixture_daemon(&config)?;
+            let run_id = daemon.submit_default(RunPurpose::Debug)?;
+            let now = Utc::now();
+            let _claimed = daemon
+                .store()
+                .claim_next_task("crash-recovery-fixture", now, ChronoDuration::seconds(30))?
+                .context("fixture run had no claimable task")?;
+            let recovered = daemon
+                .store()
+                .recover_expired_tasks(now + ChronoDuration::seconds(31))?;
+            if recovered == 0 {
+                bail!("expired fixture attempt was not recovered");
+            }
+            daemon.store().verify_integrity()?;
+            println!(
+                "{}",
+                serde_json::json!({
+                    "test": "crash-recovery",
+                    "run_id": run_id,
+                    "recovered_attempts": recovered,
+                    "fixture": true,
+                    "evidence": "offline/store-recovery"
+                })
+            );
+        }
+        TestCommand::ConcurrentRuns => {
+            let daemon = fixture_daemon(&config)?;
+            let first = daemon.submit_default(RunPurpose::Debug)?;
+            let second = daemon.submit_default(RunPurpose::Debug)?;
+            if first == second {
+                bail!("fixture runs unexpectedly share a RunId");
+            }
+            while daemon.run_one("concurrent-runs-fixture").await? {}
+            let first_snapshot = daemon.store().workflow_snapshot(&first)?;
+            let second_snapshot = daemon.store().workflow_snapshot(&second)?;
+            if !matches!(
+                first_snapshot.status,
+                WorkflowStatus::Completed
+                    | WorkflowStatus::CompletedWithExecutionRejection
+                    | WorkflowStatus::Failed
+            ) || !matches!(
+                second_snapshot.status,
+                WorkflowStatus::Completed
+                    | WorkflowStatus::CompletedWithExecutionRejection
+                    | WorkflowStatus::Failed
+            ) {
+                bail!("concurrent fixture runs did not reach terminal status");
+            }
+            daemon.store().verify_integrity()?;
+            println!(
+                "{}",
+                serde_json::json!({
+                    "test": "concurrent-runs",
+                    "run_ids": [first, second],
+                    "fixture": true,
+                    "evidence": "offline/store-concurrency"
+                })
+            );
+        }
+        TestCommand::EvidenceIntegrity => {
+            let daemon = fixture_daemon(&config)?;
+            let run_id = daemon.submit_default(RunPurpose::Debug)?;
+            while daemon.run_one("evidence-integrity-fixture").await? {}
+            let events = daemon.store().events_after(&run_id, 0, 10_000)?;
+            let artifact_events = events
+                .iter()
+                .filter(|event| event.artifact_id.is_some())
+                .count();
+            if artifact_events == 0 {
+                bail!("fixture run produced no artifact closure to audit");
+            }
+            for event in events.iter().filter_map(|event| event.artifact_id.as_ref()) {
+                let artifact = daemon.store().artifact(event)?;
+                if matches!(artifact.kind, ArtifactKind::RawEvidence)
+                    && artifact.lifecycle == akzio_domain::ArtifactLifecycle::Canonical
+                {
+                    bail!("raw evidence unexpectedly became canonical");
+                }
+            }
+            daemon.store().verify_integrity()?;
+            println!(
+                "{}",
+                serde_json::json!({
+                    "test": "evidence-integrity",
+                    "run_id": run_id,
+                    "artifact_events": artifact_events,
+                    "fixture": true,
+                    "evidence": "offline/store-closure"
+                })
+            );
+        }
+        TestCommand::LearningTransitions => {
+            let daemon = fixture_daemon(&config)?;
+            let run_id = daemon.submit_default(RunPurpose::PaperDryRun)?;
+            while daemon.run_one("learning-transition-fixture").await? {}
+            let events = daemon.store().events_after(&run_id, 0, 10_000)?;
+            let transitions = events
+                .iter()
+                .filter(|event| event.event_type == "policy.transitioned")
+                .count();
+            if transitions != 0 {
+                bail!("noncanonical fixture run transitioned policy state");
+            }
+            daemon.store().verify_integrity()?;
+            println!(
+                "{}",
+                serde_json::json!({
+                    "test": "learning-transitions",
+                    "run_id": run_id,
+                    "policy_transitions": transitions,
+                    "fixture": true,
+                    "evidence": "offline/noncanonical-boundary"
+                })
+            );
+        }
+    }
     Ok(())
 }
 

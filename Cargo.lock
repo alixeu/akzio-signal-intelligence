@@ -33,6 +33,7 @@ dependencies = [
  "akzio-model",
  "akzio-store",
  "anyhow",
+ "chrono",
  "clap",
  "futures",
  "reqwest",

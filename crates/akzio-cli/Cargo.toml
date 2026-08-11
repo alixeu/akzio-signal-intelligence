@@ -16,6 +16,7 @@ akzio-execution = { path = "../akzio-execution" }
 akzio-model = { path = "../akzio-model" }
 akzio-store = { path = "../akzio-store" }
 anyhow.workspace = true
+chrono.workspace = true
 clap.workspace = true
 futures.workspace = true
 reqwest.workspace = true
