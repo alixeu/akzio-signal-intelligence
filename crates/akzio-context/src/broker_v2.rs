@@ -14,7 +14,7 @@ use serde::{de::DeserializeOwned, Serialize};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
-pub enum RebuildContextError {
+pub enum ContextError {
     #[error(transparent)]
     Store(#[from] StoreError),
     #[error(transparent)]
@@ -40,21 +40,21 @@ pub enum RebuildContextError {
     InvalidManifestClosure,
 }
 
-pub type RebuildContextResult<T> = Result<T, RebuildContextError>;
+pub type ContextResult<T> = Result<T, ContextError>;
 
 #[derive(Debug, Clone)]
-pub struct RebuildContextBroker {
+pub struct ContextBroker {
     store: V2Store,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RebuildContextManifest {
+pub struct ContextManifest {
     pub artifact: Artifact,
     pub payload: ContextManifestPayload,
     pub grant: ReadGrant,
 }
 
-impl RebuildContextBroker {
+impl ContextBroker {
     pub fn new(store: V2Store) -> Self {
         Self { store }
     }
@@ -69,23 +69,23 @@ impl RebuildContextBroker {
         &self,
         permit: &TaskWritePermit,
         contract: &AgentContract,
-        manifest: &RebuildContextManifest,
+        manifest: &ContextManifest,
         now: DateTime<Utc>,
-    ) -> RebuildContextResult<Vec<ArtifactRef>> {
+    ) -> ContextResult<Vec<ArtifactRef>> {
         contract.validate()?;
         if !manifest.grant.matches_permit(permit)
             || manifest.grant.contract_hash != contract.contract_hash
             || manifest.payload.contract_hash != contract.contract_hash
             || manifest.grant.expires_at <= now
         {
-            return Err(RebuildContextError::InvalidManifestClosure);
+            return Err(ContextError::InvalidManifestClosure);
         }
 
         let persisted = self.store.artifact(&manifest.grant.manifest_artifact_id)?;
         persisted.validate()?;
         let expected_producer = format!("context.{}", contract.purpose.as_str());
         let Some(origin) = persisted.origin.as_ref() else {
-            return Err(RebuildContextError::InvalidManifestClosure);
+            return Err(ContextError::InvalidManifestClosure);
         };
         if persisted != manifest.artifact
             || persisted.kind != ArtifactKind::ContextManifest
@@ -98,14 +98,14 @@ impl RebuildContextBroker {
             || origin.attempt_id.as_ref() != Some(&permit.attempt_id)
             || origin.contract_hash.as_ref() != Some(&contract.contract_hash)
         {
-            return Err(RebuildContextError::InvalidManifestClosure);
+            return Err(ContextError::InvalidManifestClosure);
         }
 
         let persisted_payload: ContextManifestPayload = self.read_payload(&persisted)?;
         if persisted_payload != manifest.payload
             || persisted_payload.validate(&contract.context).is_err()
         {
-            return Err(RebuildContextError::InvalidManifestClosure);
+            return Err(ContextError::InvalidManifestClosure);
         }
 
         let mut selected = Vec::with_capacity(persisted_payload.selections.len());
@@ -114,17 +114,17 @@ impl RebuildContextBroker {
         let mut estimated_tokens = 0_u32;
         for selection in &persisted_payload.selections {
             if !readable.insert(selection.artifact.artifact_id.clone()) {
-                return Err(RebuildContextError::InvalidManifestClosure);
+                return Err(ContextError::InvalidManifestClosure);
             }
             let artifact = self.store.artifact(&selection.artifact.artifact_id)?;
             artifact.validate()?;
             if artifact.kind != selection.artifact.kind {
-                return Err(RebuildContextError::InvalidManifestClosure);
+                return Err(ContextError::InvalidManifestClosure);
             }
             self.assert_context_permitted(&contract.context, &artifact)?;
             let tokens = estimate_tokens(artifact.blob.bytes);
             if selection.estimated_tokens != tokens {
-                return Err(RebuildContextError::InvalidManifestClosure);
+                return Err(ContextError::InvalidManifestClosure);
             }
             total_bytes = total_bytes.saturating_add(artifact.blob.bytes);
             estimated_tokens = estimated_tokens.saturating_add(tokens);
@@ -139,7 +139,7 @@ impl RebuildContextBroker {
             || persisted_payload.estimated_tokens != estimated_tokens
             || persisted_payload.input_hash != manifest_input_hash(&persisted_payload.selections)?
         {
-            return Err(RebuildContextError::InvalidManifestClosure);
+            return Err(ContextError::InvalidManifestClosure);
         }
 
         let mut influences = Vec::new();
@@ -152,7 +152,7 @@ impl RebuildContextBroker {
             }
             let artifact = self.store.artifact(&reference.artifact_id)?;
             if artifact.kind != reference.kind || !self.overlay_is_eligible(&artifact)? {
-                return Err(RebuildContextError::ForbiddenArtifact {
+                return Err(ContextError::ForbiddenArtifact {
                     artifact_id: reference.artifact_id,
                 });
             }
@@ -171,7 +171,7 @@ impl RebuildContextBroker {
         candidates: impl IntoIterator<Item = ArtifactRef>,
         now: DateTime<Utc>,
         grant_ttl: Duration,
-    ) -> RebuildContextResult<RebuildContextManifest> {
+    ) -> ContextResult<ContextManifest> {
         contract.validate()?;
         let policy = &contract.context;
         let mut seen = BTreeSet::new();
@@ -225,7 +225,7 @@ impl RebuildContextBroker {
             });
         }
         if selections.len() < usize::from(policy.min_artifacts) {
-            return Err(RebuildContextError::BudgetExceeded);
+            return Err(ContextError::BudgetExceeded);
         }
 
         let mut revalidated = Vec::with_capacity(selections.len());
@@ -245,7 +245,7 @@ impl RebuildContextBroker {
         }
         let selections = revalidated;
         if selections.len() < usize::from(policy.min_artifacts) {
-            return Err(RebuildContextError::BudgetExceeded);
+            return Err(ContextError::BudgetExceeded);
         }
 
         let input_hash = manifest_input_hash(&selections)?;
@@ -301,7 +301,7 @@ impl RebuildContextBroker {
             raw_source_closure: self.raw_closure(policy, &selections)?,
             expires_at: now + grant_ttl,
         };
-        Ok(RebuildContextManifest {
+        Ok(ContextManifest {
             artifact,
             payload,
             grant,
@@ -313,16 +313,16 @@ impl RebuildContextBroker {
         grant: &ReadGrant,
         artifact_id: &ArtifactId,
         now: DateTime<Utc>,
-    ) -> RebuildContextResult<Artifact> {
+    ) -> ContextResult<Artifact> {
         if !grant.permits(artifact_id, false, now) {
-            return Err(RebuildContextError::GrantDenied {
+            return Err(ContextError::GrantDenied {
                 manifest_id: grant.manifest_artifact_id.clone(),
                 artifact_id: artifact_id.clone(),
             });
         }
         let artifact = self.store.artifact(artifact_id)?;
         if artifact.kind == ArtifactKind::RawEvidence {
-            return Err(RebuildContextError::RawEvidenceRequiresExplicitRead);
+            return Err(ContextError::RawEvidenceRequiresExplicitRead);
         }
         Ok(artifact)
     }
@@ -332,16 +332,16 @@ impl RebuildContextBroker {
         grant: &ReadGrant,
         artifact_id: &ArtifactId,
         now: DateTime<Utc>,
-    ) -> RebuildContextResult<Artifact> {
+    ) -> ContextResult<Artifact> {
         if !grant.permits(artifact_id, true, now) {
-            return Err(RebuildContextError::GrantDenied {
+            return Err(ContextError::GrantDenied {
                 manifest_id: grant.manifest_artifact_id.clone(),
                 artifact_id: artifact_id.clone(),
             });
         }
         let artifact = self.store.artifact(artifact_id)?;
         if artifact.kind != ArtifactKind::RawEvidence {
-            return Err(RebuildContextError::ExpectedRawEvidence);
+            return Err(ContextError::ExpectedRawEvidence);
         }
         Ok(artifact)
     }
@@ -356,14 +356,14 @@ impl RebuildContextBroker {
         source_refs: Vec<ArtifactRef>,
         value: &T,
         now: DateTime<Utc>,
-    ) -> RebuildContextResult<Artifact> {
+    ) -> ContextResult<Artifact> {
         for source in &source_refs {
             if !grant.permits(
                 &source.artifact_id,
                 source.kind == ArtifactKind::RawEvidence,
                 now,
             ) {
-                return Err(RebuildContextError::GrantDenied {
+                return Err(ContextError::GrantDenied {
                     manifest_id: grant.manifest_artifact_id.clone(),
                     artifact_id: source.artifact_id.clone(),
                 });
@@ -400,9 +400,9 @@ impl RebuildContextBroker {
         &self,
         policy: &ContextPolicy,
         artifact: &Artifact,
-    ) -> RebuildContextResult<()> {
+    ) -> ContextResult<()> {
         if artifact.kind == ArtifactKind::RawEvidence {
-            return Err(RebuildContextError::RawEvidenceInManifest);
+            return Err(ContextError::RawEvidenceInManifest);
         }
         if !policy.permitted_kinds.contains(&artifact.kind)
             || (!policy.permitted_source_families.is_empty()
@@ -410,14 +410,14 @@ impl RebuildContextBroker {
                     .permitted_source_families
                     .contains(&artifact.provenance.source_family))
         {
-            return Err(RebuildContextError::ForbiddenArtifact {
+            return Err(ContextError::ForbiddenArtifact {
                 artifact_id: artifact.artifact_id.clone(),
             });
         }
         Ok(())
     }
 
-    fn overlay_is_eligible(&self, artifact: &Artifact) -> RebuildContextResult<bool> {
+    fn overlay_is_eligible(&self, artifact: &Artifact) -> ContextResult<bool> {
         match artifact.kind {
             ArtifactKind::Experience => {
                 if !self.is_canonical_paper_artifact(artifact)? {
@@ -469,7 +469,7 @@ impl RebuildContextBroker {
         }
     }
 
-    fn is_canonical_paper_artifact(&self, artifact: &Artifact) -> RebuildContextResult<bool> {
+    fn is_canonical_paper_artifact(&self, artifact: &Artifact) -> ContextResult<bool> {
         if artifact.lifecycle != ArtifactLifecycle::Canonical {
             return Ok(false);
         }
@@ -483,7 +483,7 @@ impl RebuildContextBroker {
         Ok(self.store.run_purpose(run_id)?.is_canonical_learning())
     }
 
-    fn read_payload<T: DeserializeOwned>(&self, artifact: &Artifact) -> RebuildContextResult<T> {
+    fn read_payload<T: DeserializeOwned>(&self, artifact: &Artifact) -> ContextResult<T> {
         Ok(serde_json::from_slice(
             &self.store.read_blob(&artifact.blob)?,
         )?)
@@ -493,7 +493,7 @@ impl RebuildContextBroker {
         &self,
         policy: &ContextPolicy,
         selections: &[ContextSelection],
-    ) -> RebuildContextResult<BTreeSet<ArtifactId>> {
+    ) -> ContextResult<BTreeSet<ArtifactId>> {
         if !policy.allow_raw_reread {
             return Ok(BTreeSet::new());
         }
@@ -576,7 +576,7 @@ mod tests {
     use akzio_domain::{
         ArtifactKind, CandidatePolicyState, ContractId, ContractPurpose, FailureDisposition,
         MemoryLifecycle, OutputContract, RetryPolicy, RunPurpose, TaskBudget, TerminationPolicy,
-        ToolGrant, ToolKind, WorkflowGraph, WorkflowNode, REBUILD_SCHEMA_VERSION,
+        ToolGrant, ToolKind, WorkflowGraph, WorkflowNode, V2_SCHEMA_VERSION,
     };
     use akzio_store::v2::{StoredRun, WorkflowCommit};
     use tempfile::tempdir;
@@ -664,7 +664,7 @@ mod tests {
             parent_task_id: None,
         };
         let graph = WorkflowGraph {
-            schema_version: REBUILD_SCHEMA_VERSION,
+            schema_version: V2_SCHEMA_VERSION,
             topology_id: "test".to_owned(),
             nodes: vec![node.clone()],
         };
@@ -743,7 +743,7 @@ mod tests {
         V2Store,
         TaskWritePermit,
         AgentContract,
-        RebuildContextManifest,
+        ContextManifest,
         ArtifactRef,
         DateTime<Utc>,
     ) {
@@ -774,7 +774,7 @@ mod tests {
         store
             .write_task_artifact(&permit, &normalized, "evidence.normalized", now)
             .unwrap();
-        let manifest = RebuildContextBroker::new(store.clone())
+        let manifest = ContextBroker::new(store.clone())
             .assemble(
                 &permit,
                 &contract,
@@ -792,10 +792,10 @@ mod tests {
     fn persist_manifest_payload(
         store: &V2Store,
         permit: &TaskWritePermit,
-        original: &RebuildContextManifest,
+        original: &ContextManifest,
         payload: ContextManifestPayload,
         now: DateTime<Utc>,
-    ) -> RebuildContextManifest {
+    ) -> ContextManifest {
         let artifact = Artifact::new(
             ArtifactKind::ContextManifest,
             store.put_json(&payload).unwrap(),
@@ -812,7 +812,7 @@ mod tests {
             .unwrap();
         let mut grant = original.grant.clone();
         grant.manifest_artifact_id = artifact.artifact_id.clone();
-        RebuildContextManifest {
+        ContextManifest {
             artifact,
             payload,
             grant,
@@ -842,7 +842,7 @@ mod tests {
             .write_task_artifact(&permit, &normalized, "evidence.normalized", Utc::now())
             .unwrap();
 
-        let broker = RebuildContextBroker::new(store.clone());
+        let broker = ContextBroker::new(store.clone());
         let contract = contract(&store);
         let manifest = broker
             .assemble(
@@ -866,7 +866,7 @@ mod tests {
         );
         assert!(matches!(
             broker.read(&manifest.grant, &raw.artifact_id, Utc::now()),
-            Err(RebuildContextError::GrantDenied { .. })
+            Err(ContextError::GrantDenied { .. })
         ));
     }
 
@@ -895,7 +895,7 @@ mod tests {
         store
             .write_task_artifact(&permit, &second, "evidence", Utc::now())
             .unwrap();
-        let broker = RebuildContextBroker::new(store.clone());
+        let broker = ContextBroker::new(store.clone());
         let contract = contract(&store);
         let manifest = broker
             .assemble(
@@ -911,7 +911,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             broker.read(&manifest.grant, &second.artifact_id, Utc::now()),
-            Err(RebuildContextError::GrantDenied { .. })
+            Err(ContextError::GrantDenied { .. })
         ));
     }
 
@@ -920,7 +920,7 @@ mod tests {
         let root = tempdir().unwrap();
         let store = V2Store::open(root.path()).unwrap();
         let permit = permit(&store);
-        let broker = RebuildContextBroker::new(store.clone());
+        let broker = ContextBroker::new(store.clone());
 
         assert!(matches!(
             broker.assemble(
@@ -930,7 +930,7 @@ mod tests {
                 Utc::now(),
                 Duration::minutes(5),
             ),
-            Err(RebuildContextError::BudgetExceeded)
+            Err(ContextError::BudgetExceeded)
         ));
 
         let mut bootstrap = contract(&store);
@@ -979,7 +979,7 @@ mod tests {
         store
             .write_task_artifact(&permit, &unrelated, "evidence", Utc::now())
             .unwrap();
-        let broker = RebuildContextBroker::new(store.clone());
+        let broker = ContextBroker::new(store.clone());
         let contract = contract(&store);
         let manifest = broker
             .assemble(
@@ -1020,7 +1020,7 @@ mod tests {
                 &serde_json::json!({"repair": "forbidden"}),
                 Utc::now(),
             ),
-            Err(RebuildContextError::GrantDenied { .. })
+            Err(ContextError::GrantDenied { .. })
         ));
         store.verify_integrity().unwrap();
     }
@@ -1028,7 +1028,7 @@ mod tests {
     #[test]
     fn policy_influences_accepts_only_the_persisted_manifest() {
         let (_root, store, permit, manifest_contract, manifest, _raw, now) = manifest_fixture();
-        let broker = RebuildContextBroker::new(store);
+        let broker = ContextBroker::new(store);
         assert!(broker
             .policy_influences(&permit, &manifest_contract, &manifest, now)
             .unwrap()
@@ -1063,27 +1063,27 @@ mod tests {
         forged.grant.readable = BTreeSet::from([second_ref.artifact_id]);
 
         assert!(matches!(
-            RebuildContextBroker::new(store).policy_influences(&permit, &contract, &forged, now,),
-            Err(RebuildContextError::InvalidManifestClosure)
+            ContextBroker::new(store).policy_influences(&permit, &contract, &forged, now,),
+            Err(ContextError::InvalidManifestClosure)
         ));
     }
 
     #[test]
     fn policy_influences_rejects_wrong_permit_contract_and_expiry() {
         let (_root, store, permit, manifest_contract, manifest, _raw, now) = manifest_fixture();
-        let broker = RebuildContextBroker::new(store.clone());
+        let broker = ContextBroker::new(store.clone());
 
         let mut wrong_permit = permit.clone();
         wrong_permit.epoch = wrong_permit.epoch.saturating_add(1);
         assert!(matches!(
             broker.policy_influences(&wrong_permit, &manifest_contract, &manifest, now),
-            Err(RebuildContextError::InvalidManifestClosure)
+            Err(ContextError::InvalidManifestClosure)
         ));
 
         let wrong_contract = contract(&store);
         assert!(matches!(
             broker.policy_influences(&permit, &wrong_contract, &manifest, now),
-            Err(RebuildContextError::InvalidManifestClosure)
+            Err(ContextError::InvalidManifestClosure)
         ));
 
         assert!(matches!(
@@ -1093,28 +1093,28 @@ mod tests {
                 &manifest,
                 manifest.grant.expires_at,
             ),
-            Err(RebuildContextError::InvalidManifestClosure)
+            Err(ContextError::InvalidManifestClosure)
         ));
     }
 
     #[test]
     fn policy_influences_rejects_payload_artifact_and_raw_closure_mismatch() {
         let (_root, store, permit, contract, manifest, _raw, now) = manifest_fixture();
-        let broker = RebuildContextBroker::new(store);
+        let broker = ContextBroker::new(store);
 
         let mut payload_mismatch = manifest.clone();
         payload_mismatch.payload.total_bytes =
             payload_mismatch.payload.total_bytes.saturating_add(1);
         assert!(matches!(
             broker.policy_influences(&permit, &contract, &payload_mismatch, now),
-            Err(RebuildContextError::InvalidManifestClosure)
+            Err(ContextError::InvalidManifestClosure)
         ));
 
         let mut artifact_mismatch = manifest.clone();
         artifact_mismatch.artifact.source_refs.clear();
         assert!(matches!(
             broker.policy_influences(&permit, &contract, &artifact_mismatch, now),
-            Err(RebuildContextError::InvalidManifestClosure)
+            Err(ContextError::InvalidManifestClosure)
         ));
 
         let mut closure_mismatch = manifest;
@@ -1122,7 +1122,7 @@ mod tests {
         closure_mismatch.grant.raw_source_closure.clear();
         assert!(matches!(
             broker.policy_influences(&permit, &contract, &closure_mismatch, now),
-            Err(RebuildContextError::InvalidManifestClosure)
+            Err(ContextError::InvalidManifestClosure)
         ));
     }
 
@@ -1134,8 +1134,8 @@ mod tests {
         let forged = persist_manifest_payload(&store, &permit, &manifest, payload, now);
 
         assert!(matches!(
-            RebuildContextBroker::new(store).policy_influences(&permit, &contract, &forged, now,),
-            Err(RebuildContextError::InvalidManifestClosure)
+            ContextBroker::new(store).policy_influences(&permit, &contract, &forged, now,),
+            Err(ContextError::InvalidManifestClosure)
         ));
     }
 

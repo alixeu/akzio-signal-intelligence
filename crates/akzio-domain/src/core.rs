@@ -4,8 +4,7 @@
 //! dependency.  It is the single source of truth for contracts, workflow
 //! state, evidence references, and execution intent.
 
-//! Foundational scalar types and legacy records pending replacement by their
-//! owner phases.
+//! Foundational scalar types shared by the v2 domain graph.
 
 use std::{collections::BTreeMap, fmt};
 

@@ -27,7 +27,7 @@ use akzio_domain::{
     AccountSnapshot, Artifact, ArtifactId, ArtifactKind, ArtifactLifecycle, ArtifactOrigin,
     ArtifactProvenance, ArtifactRef, ContextPolicy, EvidenceNeed, ExecutionContext,
     ExecutionVerdict, FreezeState, MarketClockSnapshot, OutcomeExecutionLineage, QuoteSnapshot,
-    RunId, RunPurpose, RuntimeTaskClass, TaskId, TaskStatus, WorkflowProposal,
+    RunId, RunPurpose, RuntimeTaskClass, TaskId, TaskStatus, WorkflowProposal, WorkflowStatus,
 };
 use akzio_execution::{
     paper::CommittedPaperBroker, DecisionGateError, DecisionGateInput, ExecutionGateError,
@@ -159,6 +159,18 @@ pub struct RunCancellationResponse {
 pub struct RunRetryResponse {
     pub source_run_id: RunId,
     pub run_id: RunId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplayReport {
+    pub run_id: RunId,
+    pub purpose: RunPurpose,
+    pub status: WorkflowStatus,
+    pub revision: u64,
+    pub task_count: usize,
+    pub terminal_task_count: usize,
+    pub event_cursor: i64,
+    pub cancel_requested: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -369,6 +381,32 @@ impl Daemon {
         Ok(self.workflow.retry_run(source_run_id, Utc::now())?)
     }
 
+    fn replay_report(&self, run_id: &RunId) -> Result<ReplayReport> {
+        let snapshot = self.workflow.replay_run(run_id)?;
+        Ok(ReplayReport {
+            run_id: snapshot.run.run_id,
+            purpose: snapshot.run.purpose,
+            status: snapshot.status,
+            revision: snapshot.revision.revision,
+            task_count: snapshot.tasks.len(),
+            terminal_task_count: snapshot
+                .tasks
+                .iter()
+                .filter(|task| {
+                    matches!(
+                        task.status,
+                        TaskStatus::Succeeded
+                            | TaskStatus::Failed
+                            | TaskStatus::Cancelled
+                            | TaskStatus::Skipped
+                    )
+                })
+                .count(),
+            event_cursor: snapshot.event_cursor,
+            cancel_requested: snapshot.cancel_requested,
+        })
+    }
+
     fn set_freeze(&self, frozen: bool, reason: String) -> Result<DaemonHealth> {
         self.store.write_freeze_state(frozen, reason, Utc::now())?;
         self.health()
@@ -466,6 +504,7 @@ impl Daemon {
         Router::new()
             .route("/health", get(http_health))
             .route("/runs/{run_id}/events", get(http_events))
+            .route("/runs/{run_id}/replay", get(http_replay))
             .route("/runs", post(http_submit))
             .route("/runs/{run_id}/cancel", post(http_cancel))
             .route("/runs/{run_id}/retry", post(http_retry))
@@ -1220,6 +1259,18 @@ async fn http_events(
         }
     };
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+async fn http_replay(
+    State(daemon): State<Arc<Daemon>>,
+    Path(run_id): Path<String>,
+    headers: HeaderMap,
+) -> std::result::Result<Json<ReplayReport>, StatusCode> {
+    authorize(&daemon, &headers)?;
+    daemon
+        .replay_report(&RunId(run_id))
+        .map(Json)
+        .map_err(invalid_input_or_conflict)
 }
 
 async fn http_submit(
@@ -2358,6 +2409,38 @@ mod tests {
         let frame = String::from_utf8(frame.to_vec()).unwrap();
         assert!(frame.contains(&format!("id: {}", expected.cursor)));
         assert!(frame.contains(&expected.event_type));
+    }
+
+    #[tokio::test]
+    async fn http_replay_reports_the_durable_snapshot() {
+        let directory = tempdir().unwrap();
+        let daemon = Daemon::with_model(
+            config(directory.path().to_path_buf()),
+            fixture_model_client(),
+        )
+        .unwrap();
+        let run_id = daemon.submit_default(RunPurpose::Debug).unwrap();
+
+        let response = daemon
+            .router()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/runs/{run_id}/replay"))
+                    .header("x-akzio-token", "fixture-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let report = serde_json::from_slice::<ReplayReport>(
+            &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(report.run_id, run_id);
+        assert_eq!(report.purpose, RunPurpose::Debug);
+        assert!(report.task_count > 0);
+        assert_eq!(report.revision, 0);
     }
 
     #[test]

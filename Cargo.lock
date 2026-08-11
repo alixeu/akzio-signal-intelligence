@@ -29,7 +29,6 @@ version = "0.2.0"
 dependencies = [
  "akzio-daemon",
  "akzio-domain",
- "akzio-model",
  "akzio-store",
  "anyhow",
  "clap",
@@ -99,7 +98,6 @@ version = "0.2.0"
 dependencies = [
  "akzio-domain",
  "akzio-store",
- "axum",
  "chrono",
  "reqwest",
  "serde",
@@ -113,7 +111,6 @@ dependencies = [
 name = "akzio-ingest"
 version = "0.2.0"
 dependencies = [
- "akzio-context",
  "akzio-domain",
  "akzio-store",
  "chrono",
@@ -176,7 +173,6 @@ dependencies = [
  "akzio-domain",
  "akzio-store",
  "chrono",
- "serde",
  "serde_json",
  "tempfile",
  "thiserror",
@@ -194,7 +190,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
- "uuid",
 ]
 
 [[package]]

@@ -184,7 +184,7 @@ impl V2ExecutionRuntime {
         let execution_plan_ref = execution_plan.as_ref().map(artifact_ref);
 
         let execution_context_payload = ExecutionContext {
-            schema_version: akzio_domain::REBUILD_SCHEMA_VERSION,
+            schema_version: akzio_domain::V2_SCHEMA_VERSION,
             run_id: input.permit.run_id.clone(),
             decision_context: input.decision_context.clone(),
             account_snapshot: input.account_snapshot.clone(),
@@ -666,7 +666,7 @@ mod tests {
     use akzio_domain::{
         ArtifactId, Asset, ContentHash, DecisionId, FactorLimits, FailureDisposition, MoneyMicros,
         Position, Quote, RetryPolicy, RunId, SoftWarning, TargetPortfolio, TaskBudget, TaskId,
-        TaskRecipeId, WeightPpm, WorkflowGraph, WorkflowNode, REBUILD_SCHEMA_VERSION,
+        TaskRecipeId, WeightPpm, WorkflowGraph, WorkflowNode, V2_SCHEMA_VERSION,
     };
     use akzio_store::v2::{StoredRun, WorkflowCommit};
     use tempfile::tempdir;
@@ -736,7 +736,7 @@ mod tests {
             parent_task_id: None,
         };
         WorkflowGraph {
-            schema_version: REBUILD_SCHEMA_VERSION,
+            schema_version: V2_SCHEMA_VERSION,
             topology_id: "typed-execution-fixture".to_owned(),
             nodes: vec![source, gate],
         }
@@ -847,7 +847,7 @@ mod tests {
             &source_permit,
             ArtifactKind::NormalizedEvidence,
             &AccountSnapshot {
-                schema_version: REBUILD_SCHEMA_VERSION,
+                schema_version: V2_SCHEMA_VERSION,
                 broker_session: "2026-08-10".to_owned(),
                 observed_at: now - Duration::seconds(account_age_secs),
                 equity: MoneyMicros::from_usd_cents(1_000_000),
@@ -865,7 +865,7 @@ mod tests {
             &source_permit,
             ArtifactKind::NormalizedEvidence,
             &QuoteSnapshot {
-                schema_version: REBUILD_SCHEMA_VERSION,
+                schema_version: V2_SCHEMA_VERSION,
                 broker_session: "2026-08-10".to_owned(),
                 observed_at: now - Duration::seconds(quote_age_secs),
                 quotes: BTreeMap::from([(
@@ -885,7 +885,7 @@ mod tests {
             &source_permit,
             ArtifactKind::NormalizedEvidence,
             &MarketClockSnapshot {
-                schema_version: REBUILD_SCHEMA_VERSION,
+                schema_version: V2_SCHEMA_VERSION,
                 broker_session: "2026-08-10".to_owned(),
                 is_open: clock_open,
                 observed_at: now,
@@ -900,7 +900,7 @@ mod tests {
         let mut target = TargetPortfolio::zeroed();
         target.weights.insert(Asset::Tqqq, WeightPpm(100_000));
         let decision = DecisionContext {
-            schema_version: REBUILD_SCHEMA_VERSION,
+            schema_version: V2_SCHEMA_VERSION,
             decision_id: DecisionId::new(),
             run_id: source_permit.run_id.clone(),
             claims: vec![claim_ref.clone()],

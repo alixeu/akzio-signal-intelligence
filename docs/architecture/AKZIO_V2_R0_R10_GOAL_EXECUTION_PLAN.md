@@ -2,7 +2,7 @@
 
 日期：2026-08-11
 
-状态：**R0 verified / R1–R3 narrow regression verified / R4 lifecycle complete / R5 deterministic replay complete / R6 complete pending final R10 review / R7 owner runtime complete / R8 complete**
+状态：**R0–R10 complete；当前 tree 已完成一次离线终局复核**
 适用 checkout：当前 workspace；`faf493c8ba40e0c839ab221d8435757db1a319f6` 仅是历史 R6 阶段快照，不是当前基线。
 
 ## 1. Goal objective
@@ -195,6 +195,16 @@
 - README、config 和 deletion graph 已同步到 HTTP-only surface。未调用网络、broker、模型或真实 Paper endpoint；所有新测试均为本地 TCP/axum fixture。
 - 已实际通过 cargo fmt --all、cargo test --offline -p akzio-daemon -p akzio-cli（23 passed）、cargo check --offline --workspace、相关 crates cargo clippy --offline --all-targets -- -D warnings，以及 CLI root/daemon help。R10 的全 workspace test、fixture-debug 与 Doctor 终局验收仍未在本阶段执行。
 - 下一阶段为 R10：补齐最终 harness、删除其余 dead code，并在 R0-R10 全部完成后进行唯一一次整体复核。
+
+### 3.14 2026-08-11 R10 cleanup and final offline review
+
+- 删除五个旧 `legacy.rs`、research 的旧 `tools.rs` 与 learning 的 `rebuild.rs`；学习模块改为 `evaluation.rs`，并移除所有活跃 `Rebuild*` public type/constant 名称。
+- 新增只读 `GET /runs/{run_id}/replay` 与 `akzio run replay <run-id>`。它从耐久事件重建 snapshot，只报告诊断，不创建 workflow、memory 或 execution state。
+- 删除未使用 direct dependencies；没有新增依赖、compatibility wrapper、Store 外 SQLite 写入或平行 JSON state。
+- 最终验证实际通过：`cargo fmt --all -- --check`、`cargo check --offline --workspace`、`cargo clippy --offline --workspace --all-targets -- -D warnings`、`cargo test --offline --workspace`（181 passed / 22 suites）；fresh temporary Store Root 的 `run fixture-debug` 与 `store doctor`（`{"ok":true}`）。
+- 静态 inventory：无活跃 `legacy.rs`、`rebuild.rs`、`Rebuild*`、Unix transport、Live、old Store Root、`orchestrator` 或 `FileStore` surface。唯一 `unix_socket` 命中为 CLI 的旧配置拒绝测试。
+- 架构纠偏：`/Users/alixeu/Downloads/PLAN.md` 中的 TQQQ-only 与 Unix 建议与当前 `AGENTS.md`、源码/测试及计划-续冲突，按既定优先级不采用；最终系统保持四资产闭集与 HTTP/SSE 单一控制面。
+- 证据分类：全部是本地 static/test/fixture/fake broker/model 证据；没有真实市场、Alpaca、订单、模型服务或生产验证。
 
 ## 4. 从官方网站吸收的原则
 
@@ -869,7 +879,7 @@ cargo run --offline -p akzio-cli -- store doctor
 | R7 | owner runtime complete | R6 complete | Decision/Execution gates、Paper-only adapter、commitment/reprice/reconciliation、NoOrder/Dry Run isolation 与 OutcomeSchedule Doctor closure 已通过离线窄测 |
 | R8 | complete | R7 complete | terminal owner runtime、accepted fake Paper chain、fenced session recovery、injected scheduler supervisor、loopback HTTP/SSE 与 Store-owned freeze 已通过离线窄测；Unix 删除留给 R9 |
 | R9 | complete | R8 complete | HTTP-only CLI/config/help, loopback rejection, legacy-config incompatibility, token-auth client, and Paper retry rejection pass narrow offline tests |
-| R10 | not started | R9 complete | full offline matrix、fixture harness 和 deletion inventory |
+| R10 | complete | R9 complete | replay route/CLI、legacy/prototype/dependency cleanup、full offline matrix、fresh-root fixture/Doctor、一次性 R0–R10 final review |
 
 ## 10. 全程禁止事项
 

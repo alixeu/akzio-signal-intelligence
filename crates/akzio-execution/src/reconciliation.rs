@@ -266,7 +266,7 @@ mod tests {
 
     use akzio_domain::{
         ArtifactId, ContentHash, FailureDisposition, PaperCommitmentId, RetryPolicy, RunId,
-        TaskBudget, TaskId, TaskRecipeId, WorkflowGraph, WorkflowNode, REBUILD_SCHEMA_VERSION,
+        TaskBudget, TaskId, TaskRecipeId, WorkflowGraph, WorkflowNode, V2_SCHEMA_VERSION,
     };
     use akzio_store::v2::{StoredRun, WorkflowCommit};
 
@@ -313,7 +313,7 @@ mod tests {
 
     fn claimed_paper_task(store: &V2Store, now: DateTime<Utc>) -> TaskWritePermit {
         let graph = WorkflowGraph {
-            schema_version: REBUILD_SCHEMA_VERSION,
+            schema_version: V2_SCHEMA_VERSION,
             topology_id: "reconciliation-fixture".to_owned(),
             nodes: vec![WorkflowNode {
                 task_id: TaskId::new(),

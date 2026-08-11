@@ -1,8 +1,8 @@
 use std::{collections::BTreeSet, net::SocketAddr, path::PathBuf, sync::Arc};
 
 use akzio_daemon::{
-    fixture_model_client, Daemon, DaemonConfig, DaemonHealth, RunCancellationResponse,
-    RunRetryResponse, RunSubmissionResponse,
+    fixture_model_client, Daemon, DaemonConfig, DaemonHealth, ReplayReport,
+    RunCancellationResponse, RunRetryResponse, RunSubmissionResponse,
 };
 use akzio_domain::{Asset, RunPurpose};
 use akzio_store::V2Store;
@@ -51,6 +51,9 @@ enum RunCommand {
     Submit {
         #[arg(value_enum)]
         purpose: PurposeArg,
+    },
+    Replay {
+        run_id: String,
     },
     Events {
         run_id: String,
@@ -194,6 +197,11 @@ impl ControlApiClient {
         .await
     }
 
+    async fn replay(&self, run_id: &str) -> Result<ReplayReport> {
+        self.json(self.request(Method::GET, self.endpoint(&["runs", run_id, "replay"])))
+            .await
+    }
+
     async fn cancel(&self, run_id: &str) -> Result<RunCancellationResponse> {
         self.json(self.request(Method::POST, self.endpoint(&["runs", run_id, "cancel"])))
             .await
@@ -295,6 +303,13 @@ async fn main() -> Result<()> {
         } => print_json(
             &ControlApiClient::from_config(&config)?
                 .submit(purpose.into())
+                .await?,
+        ),
+        Command::Run {
+            command: RunCommand::Replay { run_id },
+        } => print_json(
+            &ControlApiClient::from_config(&config)?
+                .replay(&run_id)
                 .await?,
         ),
         Command::Run {

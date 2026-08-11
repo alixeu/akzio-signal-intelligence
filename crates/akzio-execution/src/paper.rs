@@ -1098,7 +1098,7 @@ mod tests {
     use crate::{ExecutionPlan, MoneyMicros, OrderIntent};
     use akzio_domain::{
         ArtifactId, ArtifactKind, ArtifactRef, Asset, ContentHash, FactorExposure,
-        PaperCommitmentId, TargetPortfolio, WeightPpm, REBUILD_SCHEMA_VERSION,
+        PaperCommitmentId, TargetPortfolio, WeightPpm, V2_SCHEMA_VERSION,
     };
     use chrono::Utc;
 
@@ -1106,7 +1106,7 @@ mod tests {
         let mut target = TargetPortfolio::zeroed();
         target.weights.insert(Asset::Tqqq, WeightPpm(100_000));
         let mut plan = ExecutionPlan {
-            schema_version: REBUILD_SCHEMA_VERSION,
+            schema_version: V2_SCHEMA_VERSION,
             decision_context: ArtifactRef {
                 artifact_id: ArtifactId(ContentHash::of_bytes(b"decision")),
                 kind: ArtifactKind::DecisionContext,

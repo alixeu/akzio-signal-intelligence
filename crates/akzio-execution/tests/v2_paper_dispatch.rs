@@ -13,7 +13,7 @@ use akzio_domain::{
     ArtifactRef, Asset, ContentHash, ExecutionContext, ExecutionVerdict, FactorExposure,
     FailureDisposition, PaperCommitment, PaperCommitmentId, Reconciliation, ReconciliationState,
     RetryPolicy, RunId, RunPurpose, TargetPortfolio, TaskBudget, TaskId, TaskRecipeId,
-    TaskWritePermit, WeightPpm, WorkflowGraph, WorkflowNode, REBUILD_SCHEMA_VERSION,
+    TaskWritePermit, WeightPpm, WorkflowGraph, WorkflowNode, V2_SCHEMA_VERSION,
 };
 use akzio_execution::{
     paper::{
@@ -55,7 +55,7 @@ fn workflow() -> WorkflowGraph {
     let reprice_task_id = TaskId::new();
     let reprice_dispatch_task_id = TaskId::new();
     WorkflowGraph {
-        schema_version: REBUILD_SCHEMA_VERSION,
+        schema_version: V2_SCHEMA_VERSION,
         topology_id: "paper-dispatch-fixture".to_owned(),
         nodes: vec![
             WorkflowNode {
@@ -151,7 +151,7 @@ fn plan(
     let mut target = TargetPortfolio::zeroed();
     target.weights.insert(Asset::Qqq, WeightPpm(100_000));
     let mut plan = ExecutionPlan {
-        schema_version: REBUILD_SCHEMA_VERSION,
+        schema_version: V2_SCHEMA_VERSION,
         decision_context,
         account_snapshot,
         quote_snapshot,
@@ -554,7 +554,7 @@ fn prepared_commitment() -> PreparedCommitment {
         .unwrap();
     let allocation_ref = artifact_ref(&allocation_artifact);
     let context = ExecutionContext {
-        schema_version: REBUILD_SCHEMA_VERSION,
+        schema_version: V2_SCHEMA_VERSION,
         run_id: permit.run_id.clone(),
         decision_context: allocation.decision_context.clone(),
         account_snapshot: Some(allocation.account_snapshot.clone()),

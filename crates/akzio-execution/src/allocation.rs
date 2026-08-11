@@ -89,7 +89,7 @@ mod tests {
 
     use akzio_domain::{
         ArtifactId, ArtifactKind, Asset, ContentHash, DecisionId, HardBlocker, MoneyMicros,
-        Position, Quote, RunId, TargetPortfolio, WeightPpm, REBUILD_SCHEMA_VERSION,
+        Position, Quote, RunId, TargetPortfolio, WeightPpm, V2_SCHEMA_VERSION,
     };
     use chrono::Utc;
 
@@ -123,7 +123,7 @@ mod tests {
         AllocationInput {
             decision_context_ref: reference(ArtifactKind::DecisionContext, b"decision"),
             decision_context: DecisionContext {
-                schema_version: REBUILD_SCHEMA_VERSION,
+                schema_version: V2_SCHEMA_VERSION,
                 decision_id: DecisionId::new(),
                 run_id: RunId::new(),
                 claims: vec![reference(ArtifactKind::Claim, b"claim")],
@@ -139,7 +139,7 @@ mod tests {
             },
             account_snapshot_ref: reference(ArtifactKind::NormalizedEvidence, b"account"),
             account: AccountSnapshot {
-                schema_version: REBUILD_SCHEMA_VERSION,
+                schema_version: V2_SCHEMA_VERSION,
                 broker_session: "2026-08-10".to_owned(),
                 observed_at: now,
                 equity: MoneyMicros::from_usd_cents(1_000_000),
@@ -151,7 +151,7 @@ mod tests {
             },
             quote_snapshot_ref: reference(ArtifactKind::NormalizedEvidence, b"quotes"),
             quotes: QuoteSnapshot {
-                schema_version: REBUILD_SCHEMA_VERSION,
+                schema_version: V2_SCHEMA_VERSION,
                 broker_session: "2026-08-10".to_owned(),
                 observed_at: now,
                 quotes: BTreeMap::from([(
@@ -165,7 +165,7 @@ mod tests {
             },
             market_clock_snapshot_ref: reference(ArtifactKind::NormalizedEvidence, b"clock"),
             clock: MarketClockSnapshot {
-                schema_version: REBUILD_SCHEMA_VERSION,
+                schema_version: V2_SCHEMA_VERSION,
                 broker_session: "2026-08-10".to_owned(),
                 is_open: true,
                 observed_at: now,

@@ -19,8 +19,8 @@ use crate::{
 };
 
 /// A Store Root with this schema is intentionally incompatible with the previous
-/// v2 database. It is a rebuild, not a migration layer.
-pub const REBUILD_SCHEMA_VERSION: u32 = 9;
+/// v2 database. It is a fresh schema, not a migration layer.
+pub const V2_SCHEMA_VERSION: u32 = 9;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -211,7 +211,7 @@ impl Artifact {
         let mut source_refs = source_refs;
         source_refs.sort();
         let mut artifact = Self {
-            schema_version: REBUILD_SCHEMA_VERSION,
+            schema_version: V2_SCHEMA_VERSION,
             artifact_id: ArtifactId(ContentHash::of_bytes(b"uninitialized artifact")),
             kind,
             blob,
@@ -243,7 +243,7 @@ impl Artifact {
     }
 
     pub fn validate(&self) -> Result<(), DomainError> {
-        if self.schema_version != REBUILD_SCHEMA_VERSION {
+        if self.schema_version != V2_SCHEMA_VERSION {
             return Err(DomainError::EmptyField {
                 field: "artifact.schema_version",
             });
@@ -493,7 +493,7 @@ impl AgentContract {
     ) -> Result<Self, DomainError> {
         let responsibility = responsibility.into();
         let mut contract = Self {
-            schema_version: REBUILD_SCHEMA_VERSION,
+            schema_version: V2_SCHEMA_VERSION,
             contract_id,
             version,
             purpose,
@@ -546,7 +546,7 @@ impl AgentContract {
     }
 
     pub fn validate(&self) -> Result<(), DomainError> {
-        if self.schema_version != REBUILD_SCHEMA_VERSION {
+        if self.schema_version != V2_SCHEMA_VERSION {
             return Err(DomainError::EmptyField {
                 field: "contract.schema_version",
             });
@@ -681,7 +681,7 @@ pub struct EvidenceNeed {
 
 impl EvidenceNeed {
     pub fn validate(&self) -> Result<(), DomainError> {
-        if self.schema_version != REBUILD_SCHEMA_VERSION
+        if self.schema_version != V2_SCHEMA_VERSION
             || self.source_family.trim().is_empty()
             || self.resource.trim().is_empty()
             || self.max_age_secs == 0
@@ -716,7 +716,7 @@ impl WorkflowProposalDraft {
         &self,
         recipes: &BTreeMap<TaskRecipeId, TaskRecipe>,
     ) -> Result<(), DomainError> {
-        if self.schema_version != REBUILD_SCHEMA_VERSION || self.topology_id.trim().is_empty() {
+        if self.schema_version != V2_SCHEMA_VERSION || self.topology_id.trim().is_empty() {
             return Err(DomainError::EmptyField {
                 field: "workflow_proposal_draft.identity",
             });
@@ -819,7 +819,7 @@ impl WorkflowProposal {
         &self,
         recipes: &BTreeMap<TaskRecipeId, TaskRecipe>,
     ) -> Result<(), DomainError> {
-        if self.schema_version != REBUILD_SCHEMA_VERSION || self.topology_id.trim().is_empty() {
+        if self.schema_version != V2_SCHEMA_VERSION || self.topology_id.trim().is_empty() {
             return Err(DomainError::EmptyField {
                 field: "workflow_proposal.identity",
             });
@@ -924,7 +924,7 @@ pub struct WorkflowGraph {
 
 impl WorkflowGraph {
     pub fn validate(&self) -> Result<(), DomainError> {
-        if self.schema_version != REBUILD_SCHEMA_VERSION || self.topology_id.trim().is_empty() {
+        if self.schema_version != V2_SCHEMA_VERSION || self.topology_id.trim().is_empty() {
             return Err(DomainError::EmptyField {
                 field: "workflow_graph.identity",
             });
@@ -1013,7 +1013,7 @@ pub struct ContextManifestPayload {
 
 impl ContextManifestPayload {
     pub fn validate(&self, policy: &ContextPolicy) -> Result<(), DomainError> {
-        if self.schema_version != REBUILD_SCHEMA_VERSION
+        if self.schema_version != V2_SCHEMA_VERSION
             || self.selections.len() < usize::from(policy.min_artifacts)
             || self.selections.len() > usize::from(policy.max_artifacts)
             || self.total_bytes > policy.max_bytes
@@ -1432,7 +1432,7 @@ mod tests {
         };
         let recipes = BTreeMap::from([(recipe_id.clone(), recipe)]);
         let mut proposal = WorkflowProposal {
-            schema_version: REBUILD_SCHEMA_VERSION,
+            schema_version: V2_SCHEMA_VERSION,
             topology_id: "fixture".to_owned(),
             tasks: BTreeMap::from([
                 (
@@ -1513,7 +1513,7 @@ mod tests {
         };
         let recipes = BTreeMap::from([(recipe_id.clone(), recipe)]);
         let mut draft = WorkflowProposalDraft {
-            schema_version: REBUILD_SCHEMA_VERSION,
+            schema_version: V2_SCHEMA_VERSION,
             topology_id: "fixture".to_owned(),
             tasks: BTreeMap::from([(
                 "analyst".to_owned(),
@@ -1523,7 +1523,7 @@ mod tests {
                     depends_on: vec![],
                     priority: 50,
                     evidence_needs: vec![EvidenceNeed {
-                        schema_version: REBUILD_SCHEMA_VERSION,
+                        schema_version: V2_SCHEMA_VERSION,
                         source_family: "alpaca".to_owned(),
                         resource: "bars:TQQQ:1d".to_owned(),
                         max_age_secs: 86_400,

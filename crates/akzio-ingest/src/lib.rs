@@ -11,6 +11,3 @@ pub use runtime::{
     FixtureEvidenceAdapter, FredEvidenceAdapter, GovernedEvidenceTransport, NewsWebEvidenceAdapter,
     NormalizedEvidencePayload, SecEdgarEvidenceAdapter,
 };
-
-#[doc(hidden)]
-pub mod legacy;

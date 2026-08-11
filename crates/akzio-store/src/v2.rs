@@ -1,16 +1,13 @@
 //! The source-incompatible v2 Store surface.
 //!
-//! The crate root re-exports this exact surface. New runtime code may import
-//! either path; the only old implementation is isolated under the legacy
-//! module until its owning replacement phase removes it.
+//! The crate root re-exports this exact surface.
 
 pub use crate::store_v2::{
-    ClaimedRebuildTask as ClaimedAttempt, DaemonLease, ExecutionCommit, ExecutionCommitResult,
-    PolicyEvaluationCommit, PolicyEvaluationResult, PolicyHead, PolicyShadowPairSnapshot,
-    PolicyTransitionRecord, RebuildRun as StoredRun, RebuildStore as V2Store,
-    RebuildStoreError as StoreError, RebuildStoreResult as Result, RebuildTask as StoredTask,
+    ClaimedAttempt, DaemonLease, ExecutionCommit, ExecutionCommitResult, PolicyEvaluationCommit,
+    PolicyEvaluationResult, PolicyHead, PolicyShadowPairSnapshot, PolicyTransitionRecord,
     RepriceCommit, RepriceCommitResult, RetryTaskResult, SessionReservation, SessionSlot,
-    SessionSlotReservation, ShadowPairCompletion, ShadowPairWriteResult, StoredActiveAttempt,
-    StoredContract, StoredRebuildEvent as StoredEvent, StoredShadowPair, StoredTaskSnapshot,
-    WorkflowCommit, WorkflowPatchCommit, WorkflowRevision, WorkflowSnapshot,
+    SessionSlotReservation, ShadowPairCompletion, ShadowPairWriteResult, StoreError,
+    StoreResult as Result, StoredActiveAttempt, StoredContract, StoredEvent, StoredRun,
+    StoredShadowPair, StoredTask, StoredTaskSnapshot, V2Store, WorkflowCommit, WorkflowPatchCommit,
+    WorkflowRevision, WorkflowSnapshot,
 };

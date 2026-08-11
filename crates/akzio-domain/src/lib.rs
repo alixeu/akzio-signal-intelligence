@@ -33,9 +33,5 @@ pub use policy::*;
 pub use workflow::*;
 
 /// Formal schema identity for the source-incompatible v2 domain graph.
-///
-/// The older constant name remains re-exported only while downstream v2
-/// modules migrate their imports in R1-R7; it is not a storage compatibility
-/// path.
-pub const V2_DOMAIN_SCHEMA_VERSION: u32 = schema::REBUILD_SCHEMA_VERSION;
-pub use schema::REBUILD_SCHEMA_VERSION;
+pub const V2_DOMAIN_SCHEMA_VERSION: u32 = schema::V2_SCHEMA_VERSION;
+pub use schema::V2_SCHEMA_VERSION;

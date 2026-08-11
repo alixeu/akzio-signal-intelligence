@@ -268,7 +268,7 @@ mod tests {
     use akzio_domain::{
         ArtifactId, ContentHash, FactorExposure, FailureDisposition, RetryPolicy, RunId,
         TargetPortfolio, TaskBudget, TaskId, TaskRecipeId, WeightPpm, WorkflowGraph, WorkflowNode,
-        REBUILD_SCHEMA_VERSION,
+        V2_SCHEMA_VERSION,
     };
     use akzio_store::v2::{SessionReservation, StoredRun, WorkflowCommit};
 
@@ -295,7 +295,7 @@ mod tests {
 
     fn workflow() -> WorkflowGraph {
         WorkflowGraph {
-            schema_version: REBUILD_SCHEMA_VERSION,
+            schema_version: V2_SCHEMA_VERSION,
             topology_id: "paper-commitment-fixture".to_owned(),
             nodes: vec![WorkflowNode {
                 task_id: TaskId::new(),
@@ -372,7 +372,7 @@ mod tests {
         let mut target = TargetPortfolio::zeroed();
         target.weights.insert(Asset::Qqq, WeightPpm(100_000));
         let mut plan = crate::ExecutionPlan {
-            schema_version: REBUILD_SCHEMA_VERSION,
+            schema_version: V2_SCHEMA_VERSION,
             decision_context,
             account_snapshot,
             quote_snapshot,
@@ -515,7 +515,7 @@ mod tests {
             kind: ArtifactKind::ExecutionPlan,
         };
         let execution_context_payload = ExecutionContext {
-            schema_version: REBUILD_SCHEMA_VERSION,
+            schema_version: V2_SCHEMA_VERSION,
             run_id: permit.run_id.clone(),
             decision_context: allocation.decision_context.clone(),
             account_snapshot: Some(allocation.account_snapshot.clone()),
@@ -714,7 +714,7 @@ mod tests {
             ArtifactKind::FreezeState,
             store
                 .put_json(&FreezeState {
-                    schema_version: REBUILD_SCHEMA_VERSION,
+                    schema_version: V2_SCHEMA_VERSION,
                     frozen: true,
                     reason: "fixture safety freeze".to_owned(),
                     changed_at: now,

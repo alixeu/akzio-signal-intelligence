@@ -1,4 +1,4 @@
-//! Canonical, outcome-backed learning runtime v2 rebuild path.
+//! Canonical, outcome-backed learning runtime for Akzio v2.
 //!
 //! Callers provide governed observations, never precomputed learning metrics.
 //! Rust materializes T+1/T+3/T+5 windows and Store-owned run purpose remains
@@ -17,7 +17,7 @@ use akzio_domain::{
     MemoryLifecycle, MoneyMicros, Outcome, OutcomeExecutionLineage, OutcomeHorizon,
     OutcomeSchedule, OutcomeWindow, PolicyState, PolicySubject, PolicyTransition,
     PolicyTransitionId, RunPurpose, TargetPortfolio, TaskWritePermit, TopologyId,
-    REBUILD_SCHEMA_VERSION,
+    V2_SCHEMA_VERSION,
 };
 use akzio_store::v2::{
     PolicyEvaluationCommit, PolicyHead, ShadowPairCompletion, ShadowPairWriteResult, StoreError,
@@ -44,12 +44,12 @@ impl Default for EvaluationPolicy {
 }
 
 impl EvaluationPolicy {
-    fn validate(&self) -> Result<(), RebuildEvaluationError> {
+    fn validate(&self) -> Result<(), EvaluationError> {
         if self.minimum_evidence_completeness_ppm > PPM_ONE
             || self.minimum_risk_recall_ppm > PPM_ONE
             || self.minimum_fresh_pairs_per_horizon == 0
         {
-            return Err(RebuildEvaluationError::InvalidPolicy);
+            return Err(EvaluationError::InvalidPolicy);
         }
         Ok(())
     }
@@ -124,7 +124,7 @@ pub struct EvaluationResult {
 }
 
 #[derive(Debug, Error)]
-pub enum RebuildEvaluationError {
+pub enum EvaluationError {
     #[error(transparent)]
     Domain(#[from] DomainError),
     #[error(transparent)]
@@ -147,16 +147,16 @@ pub enum RebuildEvaluationError {
     ArithmeticOverflow,
 }
 
-pub type RebuildEvaluationResult<T> = Result<T, RebuildEvaluationError>;
+pub type EvaluationRuntimeResult<T> = Result<T, EvaluationError>;
 
 #[derive(Debug, Clone)]
-pub struct RebuildEvaluationRuntime {
+pub struct EvaluationRuntime {
     store: V2Store,
     policy: EvaluationPolicy,
 }
 
-impl RebuildEvaluationRuntime {
-    pub fn new(store: V2Store, policy: EvaluationPolicy) -> RebuildEvaluationResult<Self> {
+impl EvaluationRuntime {
+    pub fn new(store: V2Store, policy: EvaluationPolicy) -> EvaluationRuntimeResult<Self> {
         policy.validate()?;
         Ok(Self { store, policy })
     }
@@ -171,7 +171,7 @@ impl RebuildEvaluationRuntime {
         permit: &TaskWritePermit,
         subject: &PolicySubject,
         observation: ShadowObservation,
-    ) -> RebuildEvaluationResult<ShadowPairWriteResult> {
+    ) -> EvaluationRuntimeResult<ShadowPairWriteResult> {
         self.require_paper(&permit.run_id)?;
         Ok(self.store.complete_shadow_pair(
             permit,
@@ -192,24 +192,20 @@ impl RebuildEvaluationRuntime {
 
     /// Materializes governed observations, then commits immutable learning
     /// artifacts. Schedule creation is a separate earlier step.
-    pub fn evaluate(&self, input: EvaluationInput) -> RebuildEvaluationResult<EvaluationResult> {
+    pub fn evaluate(&self, input: EvaluationInput) -> EvaluationRuntimeResult<EvaluationResult> {
         self.require_paper(&input.permit.run_id)?;
         if input.hypothesis_id.trim().is_empty() {
-            return Err(RebuildEvaluationError::EmptyHypothesis);
+            return Err(EvaluationError::EmptyHypothesis);
         }
         match (&input.subject, &input.candidate_policy) {
             (PolicySubject::Memory(_), None)
             | (PolicySubject::Contract(_), Some(_))
             | (PolicySubject::Topology(_), Some(_)) => {}
             (PolicySubject::Memory(_), Some(_)) => {
-                return Err(RebuildEvaluationError::InvalidCandidatePolicy(
-                    "memory_subject",
-                ));
+                return Err(EvaluationError::InvalidCandidatePolicy("memory_subject"));
             }
             (PolicySubject::Contract(_) | PolicySubject::Topology(_), None) => {
-                return Err(RebuildEvaluationError::InvalidCandidatePolicy(
-                    "missing_candidate",
-                ));
+                return Err(EvaluationError::InvalidCandidatePolicy("missing_candidate"));
             }
         }
         let outcome = materialize_outcome(&input.materialization)?;
@@ -221,7 +217,7 @@ impl RebuildEvaluationRuntime {
             .map(|head| head.state)
             .unwrap_or_else(|| input.subject.initial_state());
         if !input.subject.accepts_state(current) {
-            return Err(RebuildEvaluationError::SubjectStateMismatch);
+            return Err(EvaluationError::SubjectStateMismatch);
         }
 
         let created_at = outcome
@@ -267,7 +263,7 @@ impl RebuildEvaluationRuntime {
         let schedule = &input.materialization.schedule;
         let policy_verdict = execution_verdict(&schedule.execution).clone();
         let experience = Experience {
-            schema_version: REBUILD_SCHEMA_VERSION,
+            schema_version: V2_SCHEMA_VERSION,
             experience_id: ExperienceId(stable_id(&serde_json::json!({
                 "subject": &input.subject,
                 "hypothesis_id": &input.hypothesis_id,
@@ -305,7 +301,7 @@ impl RebuildEvaluationRuntime {
         )?;
         let experience_ref = reference(&experience_artifact);
         let evaluation = Evaluation {
-            schema_version: REBUILD_SCHEMA_VERSION,
+            schema_version: V2_SCHEMA_VERSION,
             evaluation_id: EvaluationId(stable_id(&serde_json::json!({
                 "subject": &input.subject,
                 "outcome": &outcome_ref,
@@ -335,7 +331,7 @@ impl RebuildEvaluationRuntime {
             .as_ref()
             .map(|candidate| {
                 let policy = CandidatePolicy {
-                    schema_version: REBUILD_SCHEMA_VERSION,
+                    schema_version: V2_SCHEMA_VERSION,
                     subject: input.subject.clone(),
                     baseline: candidate.baseline.clone(),
                     candidate: candidate.candidate.clone(),
@@ -364,7 +360,7 @@ impl RebuildEvaluationRuntime {
             None
         } else {
             Some(PolicyTransition {
-                schema_version: REBUILD_SCHEMA_VERSION,
+                schema_version: V2_SCHEMA_VERSION,
                 transition_id: PolicyTransitionId(stable_id(&serde_json::json!({
                     "subject": &input.subject,
                     "from": current,
@@ -405,7 +401,7 @@ impl RebuildEvaluationRuntime {
         })
     }
 
-    fn require_paper(&self, run_id: &akzio_domain::RunId) -> RebuildEvaluationResult<()> {
+    fn require_paper(&self, run_id: &akzio_domain::RunId) -> EvaluationRuntimeResult<()> {
         require_canonical_purpose(self.store.run_purpose(run_id)?)
     }
 
@@ -417,7 +413,7 @@ impl RebuildEvaluationRuntime {
         origin: &ArtifactOrigin,
         provenance: &ArtifactProvenance,
         created_at: DateTime<Utc>,
-    ) -> RebuildEvaluationResult<Artifact> {
+    ) -> EvaluationRuntimeResult<Artifact> {
         let blob = self.store.put_json(payload)?;
         Ok(Artifact::new(
             kind,
@@ -435,10 +431,10 @@ impl RebuildEvaluationRuntime {
 /// Deterministically derives all OutcomeWindow metrics from governed facts.
 pub fn materialize_outcome(
     input: &OutcomeMaterializationInput,
-) -> RebuildEvaluationResult<Outcome> {
+) -> EvaluationRuntimeResult<Outcome> {
     input.schedule.validate()?;
     if input.schedule_artifact.kind != ArtifactKind::OutcomeSchedule {
-        return Err(RebuildEvaluationError::InvalidMaterialization(
+        return Err(EvaluationError::InvalidMaterialization(
             "schedule artifact kind",
         ));
     }
@@ -470,7 +466,7 @@ pub fn materialize_outcome(
         )?;
         let utility_ppm = portfolio_return_ppm
             .checked_sub(benchmark_return_ppm)
-            .ok_or(RebuildEvaluationError::ArithmeticOverflow)?;
+            .ok_or(EvaluationError::ArithmeticOverflow)?;
         windows.push(OutcomeWindow {
             horizon,
             observed_trading_day: observation.observed_trading_day,
@@ -493,7 +489,7 @@ pub fn materialize_outcome(
     }
 
     let outcome = Outcome {
-        schema_version: REBUILD_SCHEMA_VERSION,
+        schema_version: V2_SCHEMA_VERSION,
         outcome_id: input.schedule.outcome_id.clone(),
         schedule: input.schedule_artifact.clone(),
         market_evidence,
@@ -506,7 +502,7 @@ pub fn materialize_outcome(
 
 fn index_forecasts(
     forecasts: &[Forecast],
-) -> RebuildEvaluationResult<BTreeMap<OutcomeHorizon, Forecast>> {
+) -> EvaluationRuntimeResult<BTreeMap<OutcomeHorizon, Forecast>> {
     let mut indexed = BTreeMap::new();
     for forecast in forecasts {
         forecast.validate()?;
@@ -516,13 +512,13 @@ fn index_forecasts(
             DecisionHorizon::T5 => OutcomeHorizon::T5,
         };
         if indexed.insert(horizon, forecast.clone()).is_some() {
-            return Err(RebuildEvaluationError::InvalidMaterialization(
+            return Err(EvaluationError::InvalidMaterialization(
                 "duplicate forecast horizon",
             ));
         }
     }
     if indexed.len() != OutcomeHorizon::ALL.len() {
-        return Err(RebuildEvaluationError::InvalidMaterialization(
+        return Err(EvaluationError::InvalidMaterialization(
             "missing forecast horizon",
         ));
     }
@@ -532,7 +528,7 @@ fn index_forecasts(
 fn index_observations<'a>(
     schedule: &OutcomeSchedule,
     observations: &'a [GovernedHorizonObservation],
-) -> RebuildEvaluationResult<BTreeMap<OutcomeHorizon, &'a GovernedHorizonObservation>> {
+) -> EvaluationRuntimeResult<BTreeMap<OutcomeHorizon, &'a GovernedHorizonObservation>> {
     let mut indexed = BTreeMap::new();
     for observation in observations {
         if !observation
@@ -540,32 +536,32 @@ fn index_observations<'a>(
             .is_due_after(observation.completed_trading_sessions)
             || observation.observed_trading_day <= schedule.baseline_trading_day
         {
-            return Err(RebuildEvaluationError::InvalidMaterialization(
+            return Err(EvaluationError::InvalidMaterialization(
                 "horizon is not due",
             ));
         }
         validate_prices(&observation.future_prices)?;
         if indexed.insert(observation.horizon, observation).is_some() {
-            return Err(RebuildEvaluationError::InvalidMaterialization(
+            return Err(EvaluationError::InvalidMaterialization(
                 "duplicate observation horizon",
             ));
         }
     }
     if indexed.len() != OutcomeHorizon::ALL.len() {
-        return Err(RebuildEvaluationError::InvalidMaterialization(
+        return Err(EvaluationError::InvalidMaterialization(
             "missing observation horizon",
         ));
     }
     Ok(indexed)
 }
 
-fn validate_prices(prices: &BTreeMap<Asset, MoneyMicros>) -> RebuildEvaluationResult<()> {
+fn validate_prices(prices: &BTreeMap<Asset, MoneyMicros>) -> EvaluationRuntimeResult<()> {
     if prices.len() != Asset::EXECUTABLE.len()
         || Asset::EXECUTABLE
             .into_iter()
             .any(|asset| prices.get(&asset).is_none_or(|price| price.0 <= 0))
     {
-        return Err(RebuildEvaluationError::InvalidMaterialization(
+        return Err(EvaluationError::InvalidMaterialization(
             "price surface must contain positive prices for the exact universe",
         ));
     }
@@ -575,18 +571,18 @@ fn validate_prices(prices: &BTreeMap<Asset, MoneyMicros>) -> RebuildEvaluationRe
 fn price(
     prices: &BTreeMap<Asset, MoneyMicros>,
     asset: Asset,
-) -> RebuildEvaluationResult<MoneyMicros> {
+) -> EvaluationRuntimeResult<MoneyMicros> {
     prices
         .get(&asset)
         .copied()
-        .ok_or(RebuildEvaluationError::InvalidMaterialization(
+        .ok_or(EvaluationError::InvalidMaterialization(
             "price surface is incomplete",
         ))
 }
 
-fn return_ppm(baseline: MoneyMicros, future: MoneyMicros) -> RebuildEvaluationResult<i64> {
+fn return_ppm(baseline: MoneyMicros, future: MoneyMicros) -> EvaluationRuntimeResult<i64> {
     if baseline.0 <= 0 || future.0 <= 0 {
-        return Err(RebuildEvaluationError::InvalidMaterialization(
+        return Err(EvaluationError::InvalidMaterialization(
             "prices must be positive",
         ));
     }
@@ -594,24 +590,23 @@ fn return_ppm(baseline: MoneyMicros, future: MoneyMicros) -> RebuildEvaluationRe
         (i128::from(future.0) - i128::from(baseline.0)) * i128::from(PPM_ONE)
             / i128::from(baseline.0),
     )
-    .map_err(|_| RebuildEvaluationError::ArithmeticOverflow)
+    .map_err(|_| EvaluationError::ArithmeticOverflow)
 }
 
 fn portfolio_return_ppm(
     target: &TargetPortfolio,
     baseline: &BTreeMap<Asset, MoneyMicros>,
     future: &BTreeMap<Asset, MoneyMicros>,
-) -> RebuildEvaluationResult<i64> {
+) -> EvaluationRuntimeResult<i64> {
     let weighted = target
         .weights
         .iter()
         .try_fold(0_i128, |sum, (asset, weight)| {
             let asset_return = return_ppm(price(baseline, *asset)?, price(future, *asset)?)?;
             sum.checked_add(i128::from(weight.0) * i128::from(asset_return))
-                .ok_or(RebuildEvaluationError::ArithmeticOverflow)
+                .ok_or(EvaluationError::ArithmeticOverflow)
         })?;
-    i64::try_from(weighted / i128::from(PPM_ONE))
-        .map_err(|_| RebuildEvaluationError::ArithmeticOverflow)
+    i64::try_from(weighted / i128::from(PPM_ONE)).map_err(|_| EvaluationError::ArithmeticOverflow)
 }
 
 fn directional_calibration_ppm(probability_ppm: u32, realized_return_ppm: i64) -> u32 {
@@ -636,11 +631,11 @@ fn execution_verdict(lineage: &OutcomeExecutionLineage) -> &ArtifactRef {
     }
 }
 
-fn require_canonical_purpose(purpose: RunPurpose) -> RebuildEvaluationResult<()> {
+fn require_canonical_purpose(purpose: RunPurpose) -> EvaluationRuntimeResult<()> {
     if purpose.is_canonical_learning() {
         Ok(())
     } else {
-        Err(RebuildEvaluationError::NonCanonicalPurpose(purpose))
+        Err(EvaluationError::NonCanonicalPurpose(purpose))
     }
 }
 
@@ -651,7 +646,7 @@ fn reference(artifact: &Artifact) -> ArtifactRef {
     }
 }
 
-fn stable_id(value: &serde_json::Value) -> RebuildEvaluationResult<String> {
+fn stable_id(value: &serde_json::Value) -> EvaluationRuntimeResult<String> {
     Ok(content_hash_json(value)?.as_str().to_owned())
 }
 
@@ -769,7 +764,7 @@ mod tests {
         let outcome_id = OutcomeId::new();
         OutcomeMaterializationInput {
             schedule: OutcomeSchedule {
-                schema_version: REBUILD_SCHEMA_VERSION,
+                schema_version: V2_SCHEMA_VERSION,
                 outcome_id,
                 decision: reference(ArtifactKind::Decision, b"decision"),
                 decision_context: reference(ArtifactKind::DecisionContext, b"decision-context"),
@@ -970,7 +965,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let graph = WorkflowGraph {
-            schema_version: REBUILD_SCHEMA_VERSION,
+            schema_version: V2_SCHEMA_VERSION,
             topology_id: topology_id.clone(),
             nodes: nodes.clone(),
         };
@@ -1011,7 +1006,7 @@ mod tests {
     struct RuntimeFixture {
         _root: TempDir,
         store: V2Store,
-        runtime: RebuildEvaluationRuntime,
+        runtime: EvaluationRuntime,
         paper_run_id: RunId,
         subject: PolicySubject,
         materialization: OutcomeMaterializationInput,
@@ -1124,7 +1119,7 @@ mod tests {
             );
             let verdict_ref = artifact_reference(&verdict);
             let parent_schedule = OutcomeSchedule {
-                schema_version: REBUILD_SCHEMA_VERSION,
+                schema_version: V2_SCHEMA_VERSION,
                 outcome_id: OutcomeId::new(),
                 decision: artifact_reference(&parent_decision),
                 decision_context: artifact_reference(&decision_context),
@@ -1178,7 +1173,7 @@ mod tests {
                 .iter()
                 .map(|candidate_decision| {
                     let schedule = OutcomeSchedule {
-                        schema_version: REBUILD_SCHEMA_VERSION,
+                        schema_version: V2_SCHEMA_VERSION,
                         outcome_id: OutcomeId::new(),
                         decision: artifact_reference(candidate_decision),
                         decision_context: artifact_reference(&decision_context),
@@ -1271,7 +1266,7 @@ mod tests {
                 })
                 .collect();
             let runtime =
-                RebuildEvaluationRuntime::new(store.clone(), EvaluationPolicy::default()).unwrap();
+                EvaluationRuntime::new(store.clone(), EvaluationPolicy::default()).unwrap();
             let active_topology = ArtifactRef {
                 artifact_id: paper_run.graph_artifact_id.clone(),
                 kind: ArtifactKind::WorkflowGraph,
@@ -1406,7 +1401,7 @@ mod tests {
         missing.observations.pop();
         assert!(matches!(
             materialize_outcome(&missing),
-            Err(RebuildEvaluationError::InvalidMaterialization(
+            Err(EvaluationError::InvalidMaterialization(
                 "missing observation horizon"
             ))
         ));
@@ -1417,7 +1412,7 @@ mod tests {
             .push(duplicate.observations[0].clone());
         assert!(matches!(
             materialize_outcome(&duplicate),
-            Err(RebuildEvaluationError::InvalidMaterialization(
+            Err(EvaluationError::InvalidMaterialization(
                 "duplicate observation horizon"
             ))
         ));
@@ -1428,7 +1423,7 @@ mod tests {
             .push(forecast(DecisionHorizon::T1, 500_000));
         assert!(matches!(
             materialize_outcome(&duplicate_forecast),
-            Err(RebuildEvaluationError::InvalidMaterialization(
+            Err(EvaluationError::InvalidMaterialization(
                 "duplicate forecast horizon"
             ))
         ));
@@ -1440,7 +1435,7 @@ mod tests {
         not_due.observations[2].completed_trading_sessions = 4;
         assert!(matches!(
             materialize_outcome(&not_due),
-            Err(RebuildEvaluationError::InvalidMaterialization(
+            Err(EvaluationError::InvalidMaterialization(
                 "horizon is not due"
             ))
         ));
@@ -1449,7 +1444,7 @@ mod tests {
         incomplete.observations[0].future_prices.remove(&Asset::Qqq);
         assert!(matches!(
             materialize_outcome(&incomplete),
-            Err(RebuildEvaluationError::InvalidMaterialization(_))
+            Err(EvaluationError::InvalidMaterialization(_))
         ));
     }
 
@@ -1463,7 +1458,7 @@ mod tests {
         ] {
             assert!(matches!(
                 require_canonical_purpose(purpose),
-                Err(RebuildEvaluationError::NonCanonicalPurpose(actual)) if actual == purpose
+                Err(EvaluationError::NonCanonicalPurpose(actual)) if actual == purpose
             ));
         }
         require_canonical_purpose(RunPurpose::Paper).unwrap();
@@ -1503,7 +1498,7 @@ mod tests {
                 .unwrap_err();
             assert!(matches!(
                 error,
-                RebuildEvaluationError::NonCanonicalPurpose(actual) if actual == purpose
+                EvaluationError::NonCanonicalPurpose(actual) if actual == purpose
             ));
             assert!(fixture.store.policy_head(&subject).unwrap().is_none());
             assert_eq!(

@@ -5,19 +5,16 @@ use std::{
     time::{Duration as StdDuration, Instant},
 };
 
-use akzio_context::v2::{
-    ContextBroker as RebuildContextBroker, ContextError as RebuildContextError,
-    ContextManifest as RebuildContextManifest,
-};
+use akzio_context::v2::{ContextBroker, ContextError, ContextManifest};
 use akzio_domain::{
     AgentContract, Artifact, ArtifactId, ArtifactKind, ArtifactLifecycle, ArtifactOrigin,
     ArtifactProvenance, ArtifactRef, ContextPolicy, ContractId, ContractPurpose, DomainError,
     FailureDisposition, OutputContract, ReadGrant, RetryPolicy, RuntimeTaskClass, TaskBudget,
     TaskRecipe, TaskRecipeId, TaskWritePermit, TerminationPolicy, ToolGrant, ToolKind,
-    WorkflowNode, REBUILD_SCHEMA_VERSION,
+    WorkflowNode, V2_SCHEMA_VERSION,
 };
 use akzio_model::{ModelClient, ModelError, ModelRequest, ModelToolDefinition};
-use akzio_runtime::v2::{RecipeCatalogue, RuntimeError as RebuildRuntimeError, TerminalRecipeSet};
+use akzio_runtime::v2::{RecipeCatalogue, RuntimeError, TerminalRecipeSet};
 use akzio_store::v2::{StoreError, StoredContract, V2Store};
 use chrono::{DateTime, Duration, Utc};
 use futures::future::BoxFuture;
@@ -27,9 +24,9 @@ use serde_json::{json, Value};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
-pub enum RebuildResearchError {
+pub enum ResearchError {
     #[error(transparent)]
-    Context(#[from] RebuildContextError),
+    Context(#[from] ContextError),
     #[error(transparent)]
     Store(#[from] StoreError),
     #[error(transparent)]
@@ -37,7 +34,7 @@ pub enum RebuildResearchError {
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error(transparent)]
-    Runtime(#[from] RebuildRuntimeError),
+    Runtime(#[from] RuntimeError),
     #[error("task has no Agent Contract hash")]
     MissingContractHash,
     #[error("Agent Contract {0} is not installed")]
@@ -96,7 +93,7 @@ pub enum RebuildResearchError {
     MissingFinalOutput,
 }
 
-pub type RebuildResearchResult<T> = Result<T, RebuildResearchError>;
+pub type ResearchResult<T> = Result<T, ResearchError>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstalledContract {
@@ -109,7 +106,7 @@ pub struct InstalledContract {
 /// boundary: contracts drive model turns; recipes drive Rust DAG lowering.
 #[derive(Debug, Clone)]
 pub struct ActiveResearchCatalogue {
-    pub contracts: RebuildContractCatalogue,
+    pub contracts: ContractCatalogue,
     pub recipes: RecipeCatalogue,
 }
 
@@ -118,8 +115,8 @@ impl ActiveResearchCatalogue {
     /// with the immutable Rust-defined defaults. Candidates deliberately have
     /// no execution path until a canonical Paper-backed transition promotes
     /// their persisted head.
-    pub fn install(store: &V2Store, now: DateTime<Utc>) -> RebuildResearchResult<Self> {
-        let contracts = RebuildContractCatalogue::load_or_bootstrap_active(
+    pub fn install(store: &V2Store, now: DateTime<Utc>) -> ResearchResult<Self> {
+        let contracts = ContractCatalogue::load_or_bootstrap_active(
             store,
             canonical_active_contracts(store)?,
             now,
@@ -137,7 +134,7 @@ impl ActiveResearchCatalogue {
         active_contract_hash: &akzio_domain::ContentHash,
         candidate: &AgentContract,
         now: DateTime<Utc>,
-    ) -> RebuildResearchResult<InstalledContract> {
+    ) -> ResearchResult<InstalledContract> {
         self.contracts
             .install_candidate(store, active_contract_hash, candidate, now)
     }
@@ -192,17 +189,17 @@ const ACTIVE_RECIPE_POLICIES: [ActiveRecipePolicy; 4] = [
 ];
 
 #[derive(Debug, Clone, Default)]
-pub struct RebuildContractCatalogue {
+pub struct ContractCatalogue {
     by_hash: BTreeMap<akzio_domain::ContentHash, InstalledContract>,
     by_identity: BTreeMap<(akzio_domain::ContractId, u32), akzio_domain::ContentHash>,
 }
 
-impl RebuildContractCatalogue {
+impl ContractCatalogue {
     fn load_or_bootstrap_active(
         store: &V2Store,
         contracts: impl IntoIterator<Item = AgentContract>,
         now: DateTime<Utc>,
-    ) -> RebuildResearchResult<Self> {
+    ) -> ResearchResult<Self> {
         let contracts = contracts.into_iter().collect::<Vec<_>>();
         validate_unique_contracts(&contracts)?;
         let mut by_hash = BTreeMap::new();
@@ -215,13 +212,13 @@ impl RebuildContractCatalogue {
             let contract = stored.contract;
             contract.validate()?;
             if by_hash.contains_key(&contract.contract_hash) {
-                return Err(RebuildResearchError::DuplicateContract(
+                return Err(ResearchError::DuplicateContract(
                     contract.contract_hash.clone(),
                 ));
             }
             let identity = (contract.contract_id.clone(), contract.version);
             if by_identity.contains_key(&identity) {
-                return Err(RebuildResearchError::DuplicateContractVersion {
+                return Err(ResearchError::DuplicateContractVersion {
                     contract_id: contract.contract_id.clone(),
                     version: contract.version,
                 });
@@ -247,17 +244,14 @@ impl RebuildContractCatalogue {
         store: &V2Store,
         contracts: impl IntoIterator<Item = AgentContract>,
         now: DateTime<Utc>,
-    ) -> RebuildResearchResult<Self> {
+    ) -> ResearchResult<Self> {
         Self::load_or_bootstrap_active(store, contracts, now)
     }
 
-    pub fn get(
-        &self,
-        hash: &akzio_domain::ContentHash,
-    ) -> RebuildResearchResult<&InstalledContract> {
+    pub fn get(&self, hash: &akzio_domain::ContentHash) -> ResearchResult<&InstalledContract> {
         self.by_hash
             .get(hash)
-            .ok_or_else(|| RebuildResearchError::UnknownContract(hash.clone()))
+            .ok_or_else(|| ResearchError::UnknownContract(hash.clone()))
     }
 
     pub fn contracts(&self) -> impl Iterator<Item = &InstalledContract> {
@@ -278,25 +272,22 @@ impl RebuildContractCatalogue {
     ///
     /// This method rejects unknown purposes and candidates that are not the
     /// current durable head rather than silently granting a new recipe.
-    pub fn active_recipe_catalogue(
-        &self,
-        store: &V2Store,
-    ) -> RebuildResearchResult<RecipeCatalogue> {
+    pub fn active_recipe_catalogue(&self, store: &V2Store) -> ResearchResult<RecipeCatalogue> {
         let mut installed_purposes = BTreeSet::new();
         let mut recipes = Vec::with_capacity(ACTIVE_RECIPE_POLICIES.len() + 6);
 
         for installed in self.contracts() {
             let purpose = installed.contract.purpose.as_str();
             let policy = active_recipe_policy(purpose).ok_or_else(|| {
-                RebuildResearchError::UnexpectedActiveContractPurpose(purpose.to_owned())
+                ResearchError::UnexpectedActiveContractPurpose(purpose.to_owned())
             })?;
             if !installed_purposes.insert(purpose.to_owned()) {
-                return Err(RebuildResearchError::DuplicateActiveContractPurpose(
+                return Err(ResearchError::DuplicateActiveContractPurpose(
                     purpose.to_owned(),
                 ));
             }
             if installed.contract.output.artifact_kind != policy.output_kind {
-                return Err(RebuildResearchError::ActiveContractOutputMismatch {
+                return Err(ResearchError::ActiveContractOutputMismatch {
                     purpose: purpose.to_owned(),
                     expected: policy.output_kind,
                     actual: installed.contract.output.artifact_kind,
@@ -304,13 +295,11 @@ impl RebuildContractCatalogue {
             }
             let active = store
                 .active_contract(&installed.contract.purpose)?
-                .ok_or_else(|| {
-                    RebuildResearchError::NonCanonicalActiveContract(purpose.to_owned())
-                })?;
+                .ok_or_else(|| ResearchError::NonCanonicalActiveContract(purpose.to_owned()))?;
             if active.contract.contract_hash != installed.contract.contract_hash
                 || active.artifact != installed.artifact
             {
-                return Err(RebuildResearchError::NonCanonicalActiveContract(
+                return Err(ResearchError::NonCanonicalActiveContract(
                     purpose.to_owned(),
                 ));
             }
@@ -332,7 +321,7 @@ impl RebuildContractCatalogue {
 
         for policy in ACTIVE_RECIPE_POLICIES {
             if !installed_purposes.contains(policy.purpose) {
-                return Err(RebuildResearchError::MissingActiveContract(policy.purpose));
+                return Err(ResearchError::MissingActiveContract(policy.purpose));
             }
         }
 
@@ -353,13 +342,13 @@ impl RebuildContractCatalogue {
         &self,
         active_hash: &akzio_domain::ContentHash,
         candidate: &AgentContract,
-    ) -> RebuildResearchResult<()> {
+    ) -> ResearchResult<()> {
         candidate.validate()?;
         let active = self.get(active_hash)?;
         if active.contract.permits_candidate(candidate) {
             Ok(())
         } else {
-            Err(RebuildResearchError::CandidateCapabilityExpansion {
+            Err(ResearchError::CandidateCapabilityExpansion {
                 active: active_hash.clone(),
                 candidate: candidate.contract_hash.clone(),
             })
@@ -372,7 +361,7 @@ impl RebuildContractCatalogue {
         active_contract_hash: &akzio_domain::ContentHash,
         candidate: &AgentContract,
         now: DateTime<Utc>,
-    ) -> RebuildResearchResult<InstalledContract> {
+    ) -> ResearchResult<InstalledContract> {
         self.validate_candidate(active_contract_hash, candidate)?;
         let stored = store.install_candidate_contract(active_contract_hash, candidate, now)?;
         Ok(installed_contract(stored))
@@ -386,19 +375,19 @@ fn installed_contract(stored: StoredContract) -> InstalledContract {
     }
 }
 
-fn validate_unique_contracts(contracts: &[AgentContract]) -> RebuildResearchResult<()> {
+fn validate_unique_contracts(contracts: &[AgentContract]) -> ResearchResult<()> {
     let mut hashes = BTreeSet::new();
     let mut identities = BTreeSet::new();
     for contract in contracts {
         contract.validate()?;
         if !hashes.insert(contract.contract_hash.clone()) {
-            return Err(RebuildResearchError::DuplicateContract(
+            return Err(ResearchError::DuplicateContract(
                 contract.contract_hash.clone(),
             ));
         }
         let identity = (contract.contract_id.clone(), contract.version);
         if !identities.insert(identity) {
-            return Err(RebuildResearchError::DuplicateContractVersion {
+            return Err(ResearchError::DuplicateContractVersion {
                 contract_id: contract.contract_id.clone(),
                 version: contract.version,
             });
@@ -427,7 +416,7 @@ struct CanonicalContractDefinition {
     on_failure: FailureDisposition,
 }
 
-fn canonical_active_contracts(store: &V2Store) -> RebuildResearchResult<Vec<AgentContract>> {
+fn canonical_active_contracts(store: &V2Store) -> ResearchResult<Vec<AgentContract>> {
     [
         CanonicalContractDefinition {
             purpose: PLANNER_RECIPE_ID,
@@ -539,7 +528,7 @@ fn canonical_active_contracts(store: &V2Store) -> RebuildResearchResult<Vec<Agen
 fn canonical_active_contract(
     store: &V2Store,
     definition: CanonicalContractDefinition,
-) -> RebuildResearchResult<AgentContract> {
+) -> ResearchResult<AgentContract> {
     let prompt = store.put_bytes(definition.prompt.as_bytes(), "text/plain")?;
     let schema = store.put_json(&definition.output_schema)?;
     Ok(AgentContract::new(
@@ -612,7 +601,7 @@ fn planner_draft_output_schema() -> Value {
         "properties": {
             "schema_version": {
                 "type": "integer",
-                "enum": [REBUILD_SCHEMA_VERSION]
+                "enum": [V2_SCHEMA_VERSION]
             },
             "topology_id": {
                 "type": "string",
@@ -688,7 +677,7 @@ fn evidence_need_output_schema() -> Value {
         "properties": {
             "schema_version": {
                 "type": "integer",
-                "enum": [REBUILD_SCHEMA_VERSION]
+                "enum": [V2_SCHEMA_VERSION]
             },
             "source_family": {
                 "type": "string",
@@ -834,7 +823,7 @@ fn artifact_ref_schema(kinds: &[&str]) -> Value {
     })
 }
 
-fn rust_terminal_recipes() -> RebuildResearchResult<(Vec<TaskRecipe>, TerminalRecipeSet)> {
+fn rust_terminal_recipes() -> ResearchResult<(Vec<TaskRecipe>, TerminalRecipeSet)> {
     let evidence = rust_gate_recipe(EVIDENCE_GATE_RECIPE_ID, RuntimeTaskClass::Evidence)?;
     let decision = rust_gate_recipe(DECISION_GATE_RECIPE_ID, RuntimeTaskClass::DecisionGate)?;
     let execution = rust_gate_recipe(EXECUTION_GATE_RECIPE_ID, RuntimeTaskClass::ExecutionGate)?;
@@ -855,10 +844,7 @@ fn rust_terminal_recipes() -> RebuildResearchResult<(Vec<TaskRecipe>, TerminalRe
     ))
 }
 
-fn rust_gate_recipe(
-    recipe_id: &str,
-    task_class: RuntimeTaskClass,
-) -> RebuildResearchResult<TaskRecipe> {
+fn rust_gate_recipe(recipe_id: &str, task_class: RuntimeTaskClass) -> ResearchResult<TaskRecipe> {
     Ok(TaskRecipe {
         recipe_id: TaskRecipeId::new(recipe_id)?,
         purpose: ContractPurpose::new(recipe_id)?,
@@ -922,7 +908,7 @@ struct ToolResult {
 struct TurnRecord<'a> {
     permit: &'a TaskWritePermit,
     contract: &'a AgentContract,
-    manifest: &'a RebuildContextManifest,
+    manifest: &'a ContextManifest,
     turn: u16,
     attempt: u8,
     now: DateTime<Utc>,
@@ -934,7 +920,7 @@ pub trait AgentModel: Send + Sync {
     fn turn<'a>(
         &'a self,
         request: AgentModelRequest,
-    ) -> BoxFuture<'a, RebuildResearchResult<AgentModelTurn>>;
+    ) -> BoxFuture<'a, ResearchResult<AgentModelTurn>>;
 }
 
 #[derive(Debug, Clone)]
@@ -952,7 +938,7 @@ impl AgentModel for ModelClientAdapter {
     fn turn<'a>(
         &'a self,
         request: AgentModelRequest,
-    ) -> BoxFuture<'a, RebuildResearchResult<AgentModelTurn>> {
+    ) -> BoxFuture<'a, ResearchResult<AgentModelTurn>> {
         Box::pin(async move {
             let response = self
                 .client
@@ -983,7 +969,7 @@ impl AgentModel for ModelClientAdapter {
                 .then(|| serde_json::from_str(&response.output_text))
                 .transpose()
                 .map_err(|error| {
-                    RebuildResearchError::InvalidOutput(format!("model output JSON: {error}"))
+                    ResearchError::InvalidOutput(format!("model output JSON: {error}"))
                 })?;
             let tool_calls = response
                 .tool_calls
@@ -994,7 +980,7 @@ impl AgentModel for ModelClientAdapter {
                         .get("artifact_id")
                         .and_then(Value::as_str)
                         .ok_or_else(|| {
-                            RebuildResearchError::InvalidOutput(format!(
+                            ResearchError::InvalidOutput(format!(
                                 "tool {} omitted artifact_id",
                                 call.name
                             ))
@@ -1005,31 +991,31 @@ impl AgentModel for ModelClientAdapter {
                         artifact_id: ArtifactId(akzio_domain::ContentHash::new(artifact_id)?),
                     })
                 })
-                .collect::<RebuildResearchResult<Vec<_>>>()?;
+                .collect::<ResearchResult<Vec<_>>>()?;
             Ok(AgentModelTurn { output, tool_calls })
         })
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct RebuildAgentRuntime {
+pub struct AgentRuntime {
     store: V2Store,
-    context: RebuildContextBroker,
-    catalogue: RebuildContractCatalogue,
+    context: ContextBroker,
+    catalogue: ContractCatalogue,
     grant_ttl: Duration,
 }
 
-impl RebuildAgentRuntime {
-    pub fn new(store: V2Store, catalogue: RebuildContractCatalogue, grant_ttl: Duration) -> Self {
+impl AgentRuntime {
+    pub fn new(store: V2Store, catalogue: ContractCatalogue, grant_ttl: Duration) -> Self {
         Self {
-            context: RebuildContextBroker::new(store.clone()),
+            context: ContextBroker::new(store.clone()),
             store,
             catalogue,
             grant_ttl,
         }
     }
 
-    pub fn catalogue(&self) -> &RebuildContractCatalogue {
+    pub fn catalogue(&self) -> &ContractCatalogue {
         &self.catalogue
     }
 
@@ -1040,30 +1026,30 @@ impl RebuildAgentRuntime {
         candidates: impl IntoIterator<Item = ArtifactRef>,
         model: &dyn AgentModel,
         now: DateTime<Utc>,
-    ) -> RebuildResearchResult<Artifact> {
+    ) -> ResearchResult<Artifact> {
         let contract_hash = node
             .contract_hash
             .as_ref()
-            .ok_or(RebuildResearchError::MissingContractHash)?;
+            .ok_or(ResearchError::MissingContractHash)?;
         if permit.contract_hash.as_ref() != Some(contract_hash) {
-            return Err(RebuildResearchError::ContractMismatch);
+            return Err(ResearchError::ContractMismatch);
         }
         let installed = self.catalogue.get(contract_hash)?;
         if node.budget != installed.contract.budget
             || node.retry != installed.contract.retry
             || node.on_failure != installed.contract.on_failure
         {
-            return Err(RebuildResearchError::NodePolicyMismatch);
+            return Err(ResearchError::NodePolicyMismatch);
         }
         let manifest =
             self.context
                 .assemble(permit, &installed.contract, candidates, now, self.grant_ttl)?;
         if !manifest.grant.matches_permit(permit) {
-            return Err(RebuildResearchError::GrantPermitMismatch);
+            return Err(ResearchError::GrantPermitMismatch);
         }
         let context = self.context_values(permit, &manifest, now)?;
         let prompt = String::from_utf8(self.store.read_blob(&installed.contract.prompt)?)
-            .map_err(|_| RebuildResearchError::InvalidOutput("prompt is not UTF-8".to_owned()))?;
+            .map_err(|_| ResearchError::InvalidOutput("prompt is not UTF-8".to_owned()))?;
         let output_schema: Value =
             serde_json::from_slice(&self.store.read_blob(&installed.contract.output.schema)?)?;
         let tools = model_tool_definitions(&installed.contract);
@@ -1076,7 +1062,7 @@ impl RebuildAgentRuntime {
             StdDuration::from_secs(u64::from(installed.contract.budget.max_wall_time_secs));
         loop {
             if started.elapsed() > wall_time {
-                return Err(RebuildResearchError::WallTimeExceeded {
+                return Err(ResearchError::WallTimeExceeded {
                     maximum_secs: installed.contract.budget.max_wall_time_secs,
                 });
             }
@@ -1094,7 +1080,7 @@ impl RebuildAgentRuntime {
             };
             let input_tokens = estimate_tokens(&request)?;
             if input_tokens > installed.contract.budget.max_input_tokens {
-                return Err(RebuildResearchError::InputBudgetExceeded {
+                return Err(ResearchError::InputBudgetExceeded {
                     actual: input_tokens,
                     maximum: installed.contract.budget.max_input_tokens,
                 });
@@ -1135,7 +1121,7 @@ impl RebuildAgentRuntime {
                                 .saturating_mul(u64::from(turn_attempt)),
                         );
                         if backoff > wall_time.saturating_sub(started.elapsed()) {
-                            return Err(RebuildResearchError::WallTimeExceeded {
+                            return Err(ResearchError::WallTimeExceeded {
                                 maximum_secs: installed.contract.budget.max_wall_time_secs,
                             });
                         }
@@ -1164,7 +1150,7 @@ impl RebuildAgentRuntime {
                     artifact_id: failed_turn.artifact_id,
                     kind: ArtifactKind::AgentTurn,
                 });
-                return Err(RebuildResearchError::WallTimeExceeded {
+                return Err(ResearchError::WallTimeExceeded {
                     maximum_secs: installed.contract.budget.max_wall_time_secs,
                 });
             }
@@ -1187,7 +1173,7 @@ impl RebuildAgentRuntime {
             if !turn.tool_calls.is_empty() {
                 let next = tool_calls.saturating_add(turn.tool_calls.len() as u16);
                 if next > installed.contract.budget.max_tool_calls {
-                    return Err(RebuildResearchError::ToolBudgetExceeded);
+                    return Err(ResearchError::ToolBudgetExceeded);
                 }
                 for call in turn.tool_calls {
                     let tool_result = self.execute_tool(
@@ -1207,12 +1193,10 @@ impl RebuildAgentRuntime {
                 model_turn = model_turn.saturating_add(1);
                 continue;
             }
-            let output = turn
-                .output
-                .ok_or(RebuildResearchError::MissingFinalOutput)?;
+            let output = turn.output.ok_or(ResearchError::MissingFinalOutput)?;
             let output_tokens = estimate_tokens(&output)?;
             if output_tokens > installed.contract.budget.max_output_tokens {
-                return Err(RebuildResearchError::OutputBudgetExceeded {
+                return Err(ResearchError::OutputBudgetExceeded {
                     actual: output_tokens,
                     maximum: installed.contract.budget.max_output_tokens,
                 });
@@ -1247,11 +1231,11 @@ impl RebuildAgentRuntime {
     fn context_values(
         &self,
         permit: &TaskWritePermit,
-        manifest: &RebuildContextManifest,
+        manifest: &ContextManifest,
         now: DateTime<Utc>,
-    ) -> RebuildResearchResult<Vec<Value>> {
+    ) -> ResearchResult<Vec<Value>> {
         if !manifest.grant.matches_permit(permit) {
-            return Err(RebuildResearchError::GrantPermitMismatch);
+            return Err(ResearchError::GrantPermitMismatch);
         }
         manifest
             .payload
@@ -1279,7 +1263,7 @@ impl RebuildAgentRuntime {
         &self,
         record: &TurnRecord<'_>,
         response: &AgentModelTurn,
-    ) -> RebuildResearchResult<Artifact> {
+    ) -> ResearchResult<Artifact> {
         let artifact = Artifact::new(
             ArtifactKind::AgentTurn,
             self.store.put_json(&json!({
@@ -1320,7 +1304,7 @@ impl RebuildAgentRuntime {
         record: &TurnRecord<'_>,
         error_class: &str,
         will_retry: bool,
-    ) -> RebuildResearchResult<Artifact> {
+    ) -> ResearchResult<Artifact> {
         let artifact = Artifact::new(
             ArtifactKind::AgentTurn,
             self.store.put_json(&json!({
@@ -1368,17 +1352,17 @@ impl RebuildAgentRuntime {
         grant: &ReadGrant,
         call: &AgentToolCall,
         now: DateTime<Utc>,
-    ) -> RebuildResearchResult<ToolResult> {
+    ) -> ResearchResult<ToolResult> {
         if !grant.matches_permit(permit) {
-            return Err(RebuildResearchError::GrantPermitMismatch);
+            return Err(ResearchError::GrantPermitMismatch);
         }
         let tool = match call.name.as_str() {
             "read_artifact" => akzio_domain::ToolKind::ReadEvidence,
             "read_raw_evidence" => akzio_domain::ToolKind::ReadRawEvidence,
-            _ => return Err(RebuildResearchError::ToolNotGranted(call.name.clone())),
+            _ => return Err(ResearchError::ToolNotGranted(call.name.clone())),
         };
         if !contract.tool_grants.iter().any(|grant| grant.kind == tool) {
-            return Err(RebuildResearchError::ToolNotGranted(call.name.clone()));
+            return Err(ResearchError::ToolNotGranted(call.name.clone()));
         }
         let raw = tool == akzio_domain::ToolKind::ReadRawEvidence;
         let artifact = if raw {
@@ -1398,7 +1382,7 @@ impl RebuildAgentRuntime {
                         .any(|source| source == &artifact.provenance.source_family)
             })
         {
-            return Err(RebuildResearchError::ToolSourceNotGranted {
+            return Err(ResearchError::ToolSourceNotGranted {
                 tool: call.name.clone(),
                 source_family: artifact.provenance.source_family.clone(),
             });
@@ -1468,7 +1452,7 @@ impl RebuildAgentRuntime {
     }
 }
 
-fn estimate_tokens<T: Serialize>(value: &T) -> RebuildResearchResult<u32> {
+fn estimate_tokens<T: Serialize>(value: &T) -> ResearchResult<u32> {
     let bytes = serde_json::to_vec(value)?.len() as u64;
     Ok(u32::try_from(bytes.div_ceil(4).max(1)).unwrap_or(u32::MAX))
 }
@@ -1501,22 +1485,22 @@ fn model_tool_definitions(contract: &AgentContract) -> Vec<AgentToolDefinition> 
         .collect()
 }
 
-fn model_client_error(error: ModelError) -> RebuildResearchError {
+fn model_client_error(error: ModelError) -> ResearchError {
     match error {
-        ModelError::Transport(_) => RebuildResearchError::Model("transport".to_owned()),
+        ModelError::Transport(_) => ResearchError::Model("transport".to_owned()),
         ModelError::Http { status, .. } if status.as_u16() == 429 => {
-            RebuildResearchError::RateLimited("HTTP 429".to_owned())
+            ResearchError::RateLimited("HTTP 429".to_owned())
         }
         ModelError::Http { status, .. } => {
-            RebuildResearchError::Model(format!("HTTP {}", status.as_u16()))
+            ResearchError::Model(format!("HTTP {}", status.as_u16()))
         }
-        ModelError::EmptyBaseUrl => RebuildResearchError::Model("invalid base URL".to_owned()),
-        ModelError::MissingOutput => RebuildResearchError::Model("missing model output".to_owned()),
+        ModelError::EmptyBaseUrl => ResearchError::Model("invalid base URL".to_owned()),
+        ModelError::MissingOutput => ResearchError::Model("missing model output".to_owned()),
         ModelError::FixtureExhausted => {
-            RebuildResearchError::Model("fixture sequence exhausted".to_owned())
+            ResearchError::Model("fixture sequence exhausted".to_owned())
         }
         ModelError::MissingEnvironment(_) => {
-            RebuildResearchError::Model("model configuration missing".to_owned())
+            ResearchError::Model("model configuration missing".to_owned())
         }
     }
 }
@@ -1525,17 +1509,17 @@ fn logical_now(start: DateTime<Utc>, elapsed: StdDuration) -> DateTime<Utc> {
     start + Duration::from_std(elapsed).unwrap_or_else(|_| Duration::seconds(i64::MAX))
 }
 
-fn retryable_model_error(error: &RebuildResearchError, retry: &akzio_domain::RetryPolicy) -> bool {
+fn retryable_model_error(error: &ResearchError, retry: &akzio_domain::RetryPolicy) -> bool {
     matches!(
         (error, retry),
         (
-            RebuildResearchError::Model(_),
+            ResearchError::Model(_),
             akzio_domain::RetryPolicy {
                 retry_transport: true,
                 ..
             }
         ) | (
-            RebuildResearchError::RateLimited(_),
+            ResearchError::RateLimited(_),
             akzio_domain::RetryPolicy {
                 retry_rate_limited: true,
                 ..
@@ -1544,10 +1528,10 @@ fn retryable_model_error(error: &RebuildResearchError, retry: &akzio_domain::Ret
     )
 }
 
-fn model_error_class(error: &RebuildResearchError) -> &'static str {
+fn model_error_class(error: &ResearchError) -> &'static str {
     match error {
-        RebuildResearchError::Model(_) => "transport",
-        RebuildResearchError::RateLimited(_) => "rate_limited",
+        ResearchError::Model(_) => "transport",
+        ResearchError::RateLimited(_) => "rate_limited",
         _ => "other",
     }
 }
@@ -1568,26 +1552,26 @@ fn validate_output_schema(
     store: &V2Store,
     contract: &AgentContract,
     output: &Value,
-) -> RebuildResearchResult<()> {
+) -> ResearchResult<()> {
     let schema: Value = serde_json::from_slice(&store.read_blob(&contract.output.schema)?)?;
-    validate_schema_value(output, &schema, "$").map_err(RebuildResearchError::InvalidOutput)?;
+    validate_schema_value(output, &schema, "$").map_err(ResearchError::InvalidOutput)?;
     if schema.get("type").and_then(Value::as_str) != Some("object") || !output.is_object() {
-        return Err(RebuildResearchError::InvalidOutput(
+        return Err(ResearchError::InvalidOutput(
             "schema and output must both be JSON objects".to_owned(),
         ));
     }
     let required = schema
         .get("required")
         .and_then(Value::as_array)
-        .ok_or_else(|| RebuildResearchError::InvalidOutput("schema.required missing".to_owned()))?;
+        .ok_or_else(|| ResearchError::InvalidOutput("schema.required missing".to_owned()))?;
     for field in required {
         let Some(field) = field.as_str() else {
-            return Err(RebuildResearchError::InvalidOutput(
+            return Err(ResearchError::InvalidOutput(
                 "schema.required must contain strings".to_owned(),
             ));
         };
         if output.get(field).is_none() {
-            return Err(RebuildResearchError::InvalidOutput(format!(
+            return Err(ResearchError::InvalidOutput(format!(
                 "required field {field} is missing"
             )));
         }
@@ -1898,7 +1882,7 @@ mod tests {
     use akzio_domain::{
         ArtifactLifecycle, ContextPolicy, ContractId, ContractPurpose, FailureDisposition,
         OutputContract, RetryPolicy, TaskBudget, TaskRecipeId, TaskStatus, TerminationPolicy,
-        ToolGrant, ToolKind, WorkflowGraph, WorkflowNode, REBUILD_SCHEMA_VERSION,
+        ToolGrant, ToolKind, WorkflowGraph, WorkflowNode, V2_SCHEMA_VERSION,
     };
     use akzio_store::v2::{StoredRun, WorkflowCommit};
     use tempfile::tempdir;
@@ -1915,12 +1899,10 @@ mod tests {
         fn turn<'a>(
             &'a self,
             request: AgentModelRequest,
-        ) -> BoxFuture<'a, RebuildResearchResult<AgentModelTurn>> {
+        ) -> BoxFuture<'a, ResearchResult<AgentModelTurn>> {
             Box::pin(async move {
                 match self.calls.fetch_add(1, Ordering::SeqCst) {
-                    0 => Err(RebuildResearchError::Model(
-                        "transient fixture failure".to_owned(),
-                    )),
+                    0 => Err(ResearchError::Model("transient fixture failure".to_owned())),
                     1 => {
                         assert!(request.prior_tool_results.is_empty());
                         Ok(AgentModelTurn {
@@ -1956,7 +1938,7 @@ mod tests {
         fn turn<'a>(
             &'a self,
             _: AgentModelRequest,
-        ) -> BoxFuture<'a, RebuildResearchResult<AgentModelTurn>> {
+        ) -> BoxFuture<'a, ResearchResult<AgentModelTurn>> {
             Box::pin(async move { Ok(self.0.clone()) })
         }
     }
@@ -1970,7 +1952,7 @@ mod tests {
         fn turn<'a>(
             &'a self,
             _: AgentModelRequest,
-        ) -> BoxFuture<'a, RebuildResearchResult<AgentModelTurn>> {
+        ) -> BoxFuture<'a, ResearchResult<AgentModelTurn>> {
             let evidence_id = self.evidence_id.clone();
             Box::pin(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -1993,7 +1975,7 @@ mod tests {
         fn turn<'a>(
             &'a self,
             _: AgentModelRequest,
-        ) -> BoxFuture<'a, RebuildResearchResult<AgentModelTurn>> {
+        ) -> BoxFuture<'a, ResearchResult<AgentModelTurn>> {
             Box::pin(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
                 Ok(AgentModelTurn {
@@ -2066,7 +2048,7 @@ mod tests {
     struct Fixture {
         _root: tempfile::TempDir,
         store: V2Store,
-        catalogue: RebuildContractCatalogue,
+        catalogue: ContractCatalogue,
         claimed: akzio_store::v2::ClaimedAttempt,
         evidence: Artifact,
     }
@@ -2080,8 +2062,7 @@ mod tests {
         contract.candidate_capability_ceiling.tool_grants = contract.tool_grants.clone();
         contract.contract_hash = contract.expected_hash().unwrap();
         contract.validate().unwrap();
-        let catalogue =
-            RebuildContractCatalogue::install(&store, [contract.clone()], Utc::now()).unwrap();
+        let catalogue = ContractCatalogue::install(&store, [contract.clone()], Utc::now()).unwrap();
         let node = WorkflowNode {
             task_id: akzio_domain::TaskId::new(),
             recipe_id: TaskRecipeId::new("research.analyst").unwrap(),
@@ -2096,7 +2077,7 @@ mod tests {
             parent_task_id: None,
         };
         let graph = WorkflowGraph {
-            schema_version: REBUILD_SCHEMA_VERSION,
+            schema_version: V2_SCHEMA_VERSION,
             topology_id: "test".to_owned(),
             nodes: vec![node.clone()],
         };
@@ -2163,7 +2144,7 @@ mod tests {
     fn planner_draft_schema_is_closed_and_governed() {
         let schema = planner_draft_output_schema();
         let valid = serde_json::json!({
-            "schema_version": REBUILD_SCHEMA_VERSION,
+            "schema_version": V2_SCHEMA_VERSION,
             "topology_id": "active",
             "tasks": {
                 "analyst": {
@@ -2172,7 +2153,7 @@ mod tests {
                     "depends_on": [],
                     "priority": 50,
                     "evidence_needs": [{
-                        "schema_version": REBUILD_SCHEMA_VERSION,
+                        "schema_version": V2_SCHEMA_VERSION,
                         "source_family": "alpaca",
                         "resource": "bars:TQQQ:1d",
                         "max_age_secs": 86400
@@ -2183,7 +2164,7 @@ mod tests {
         validate_schema_value(&valid, &schema, "$").unwrap();
 
         let mut invalid_version = valid.clone();
-        invalid_version["schema_version"] = serde_json::json!(REBUILD_SCHEMA_VERSION + 1);
+        invalid_version["schema_version"] = serde_json::json!(V2_SCHEMA_VERSION + 1);
         assert!(validate_schema_value(&invalid_version, &schema, "$").is_err());
 
         let mut invalid_recipe = valid.clone();
@@ -2369,7 +2350,7 @@ mod tests {
         expanded.validate().unwrap();
         assert!(matches!(
             active.install_candidate(&store, &baseline.contract_hash, &expanded, now),
-            Err(RebuildResearchError::CandidateCapabilityExpansion { .. })
+            Err(ResearchError::CandidateCapabilityExpansion { .. })
         ));
         store.verify_integrity().unwrap();
     }
@@ -2409,7 +2390,7 @@ mod tests {
             .unwrap();
         for invalid in [
             json!({
-                "summary": "legacy",
+                "summary": "invalid",
                 "confidence_ppm": 500000,
                 "blockers": ["anything"],
                 "asset_views": {}
@@ -2462,11 +2443,11 @@ mod tests {
         planner.output.artifact_kind = ArtifactKind::WorkflowProposal;
         planner.contract_hash = planner.expected_hash().unwrap();
         planner.validate().unwrap();
-        let catalogue = RebuildContractCatalogue::install(&store, contracts, Utc::now()).unwrap();
+        let catalogue = ContractCatalogue::install(&store, contracts, Utc::now()).unwrap();
 
         assert!(matches!(
             catalogue.active_recipe_catalogue(&store),
-            Err(RebuildResearchError::ActiveContractOutputMismatch {
+            Err(ResearchError::ActiveContractOutputMismatch {
                 purpose,
                 expected: ArtifactKind::WorkflowProposalDraft,
                 actual: ArtifactKind::WorkflowProposal,
@@ -2491,11 +2472,11 @@ mod tests {
         candidate.contract_hash = candidate.expected_hash().unwrap();
         candidate.validate().unwrap();
         contracts.push(candidate);
-        let catalogue = RebuildContractCatalogue::install(&store, contracts, Utc::now()).unwrap();
+        let catalogue = ContractCatalogue::install(&store, contracts, Utc::now()).unwrap();
 
         assert!(matches!(
             catalogue.active_recipe_catalogue(&store),
-            Err(RebuildResearchError::UnexpectedActiveContractPurpose(purpose))
+            Err(ResearchError::UnexpectedActiveContractPurpose(purpose))
                 if purpose == "research.candidate"
         ));
     }
@@ -2506,20 +2487,15 @@ mod tests {
         let store = V2Store::open(root.path()).unwrap();
         let contract = contract(&store);
 
-        let catalogue =
-            RebuildContractCatalogue::install(&store, [contract.clone()], Utc::now()).unwrap();
+        let catalogue = ContractCatalogue::install(&store, [contract.clone()], Utc::now()).unwrap();
         assert_eq!(
             catalogue.contract_hash_for(&contract.contract_id, contract.version),
             Some(&contract.contract_hash)
         );
 
         assert!(matches!(
-            RebuildContractCatalogue::install(
-                &store,
-                [contract.clone(), contract.clone()],
-                Utc::now(),
-            ),
-            Err(RebuildResearchError::DuplicateContract(_))
+            ContractCatalogue::install(&store, [contract.clone(), contract.clone()], Utc::now(),),
+            Err(ResearchError::DuplicateContract(_))
         ));
 
         let mut changed = contract.clone();
@@ -2527,8 +2503,8 @@ mod tests {
         changed.contract_hash = changed.expected_hash().unwrap();
         changed.validate().unwrap();
         assert!(matches!(
-            RebuildContractCatalogue::install(&store, [contract, changed], Utc::now()),
-            Err(RebuildResearchError::DuplicateContractVersion { .. })
+            ContractCatalogue::install(&store, [contract, changed], Utc::now()),
+            Err(ResearchError::DuplicateContractVersion { .. })
         ));
     }
 
@@ -2537,8 +2513,7 @@ mod tests {
         let root = tempdir().unwrap();
         let store = V2Store::open(root.path()).unwrap();
         let active = contract(&store);
-        let catalogue =
-            RebuildContractCatalogue::install(&store, [active.clone()], Utc::now()).unwrap();
+        let catalogue = ContractCatalogue::install(&store, [active.clone()], Utc::now()).unwrap();
 
         let mut candidate = active.clone();
         candidate
@@ -2557,7 +2532,7 @@ mod tests {
 
         assert!(matches!(
             catalogue.validate_candidate(&active.contract_hash, &candidate),
-            Err(RebuildResearchError::CandidateCapabilityExpansion { .. })
+            Err(ResearchError::CandidateCapabilityExpansion { .. })
         ));
 
         let mut narrowed = active.clone();
@@ -2627,7 +2602,7 @@ mod tests {
             claimed,
             evidence,
         } = fixture_with(|_| {});
-        let runtime = RebuildAgentRuntime::new(store.clone(), catalogue, Duration::milliseconds(1));
+        let runtime = AgentRuntime::new(store.clone(), catalogue, Duration::milliseconds(1));
         let model = DelayedToolModel {
             evidence_id: evidence.artifact_id.clone(),
         };
@@ -2645,9 +2620,7 @@ mod tests {
                     Utc::now(),
                 )
                 .await,
-            Err(RebuildResearchError::Context(
-                RebuildContextError::GrantDenied { .. }
-            ))
+            Err(ResearchError::Context(ContextError::GrantDenied { .. }))
         ));
         store.verify_integrity().unwrap();
     }
@@ -2685,7 +2658,7 @@ mod tests {
         store
             .write_task_artifact(&claimed.permit, &news, "evidence.normalized", Utc::now())
             .unwrap();
-        let runtime = RebuildAgentRuntime::new(store.clone(), catalogue, Duration::minutes(5));
+        let runtime = AgentRuntime::new(store.clone(), catalogue, Duration::minutes(5));
         let model = FixedModel(AgentModelTurn {
             output: None,
             tool_calls: vec![AgentToolCall {
@@ -2708,7 +2681,7 @@ mod tests {
                     Utc::now(),
                 )
                 .await,
-            Err(RebuildResearchError::ToolSourceNotGranted { .. })
+            Err(ResearchError::ToolSourceNotGranted { .. })
         ));
         store.verify_integrity().unwrap();
     }
@@ -2722,7 +2695,7 @@ mod tests {
             claimed,
             evidence,
         } = fixture_with(|contract| contract.budget.max_wall_time_secs = 1);
-        let runtime = RebuildAgentRuntime::new(store.clone(), catalogue, Duration::minutes(5));
+        let runtime = AgentRuntime::new(store.clone(), catalogue, Duration::minutes(5));
 
         assert!(matches!(
             runtime
@@ -2737,7 +2710,7 @@ mod tests {
                     Utc::now(),
                 )
                 .await,
-            Err(RebuildResearchError::WallTimeExceeded { maximum_secs: 1 })
+            Err(ResearchError::WallTimeExceeded { maximum_secs: 1 })
         ));
         store.verify_integrity().unwrap();
     }
@@ -2747,8 +2720,7 @@ mod tests {
         let root = tempdir().unwrap();
         let store = V2Store::open(root.path()).unwrap();
         let contract = contract(&store);
-        let catalogue =
-            RebuildContractCatalogue::install(&store, [contract.clone()], Utc::now()).unwrap();
+        let catalogue = ContractCatalogue::install(&store, [contract.clone()], Utc::now()).unwrap();
         let node = WorkflowNode {
             task_id: akzio_domain::TaskId::new(),
             recipe_id: TaskRecipeId::new("research.analyst").unwrap(),
@@ -2763,7 +2735,7 @@ mod tests {
             parent_task_id: None,
         };
         let graph = WorkflowGraph {
-            schema_version: REBUILD_SCHEMA_VERSION,
+            schema_version: V2_SCHEMA_VERSION,
             topology_id: "test".to_owned(),
             nodes: vec![node.clone()],
         };
@@ -2817,7 +2789,7 @@ mod tests {
                 Utc::now(),
             )
             .unwrap();
-        let runtime = RebuildAgentRuntime::new(store.clone(), catalogue, Duration::minutes(5));
+        let runtime = AgentRuntime::new(store.clone(), catalogue, Duration::minutes(5));
         let model = ToolThenOutputModel {
             evidence_id: evidence.artifact_id.clone(),
             calls: AtomicU8::new(0),
@@ -2881,7 +2853,7 @@ mod tests {
                     Utc::now(),
                 )
                 .await,
-            Err(RebuildResearchError::InvalidOutput(_))
+            Err(ResearchError::InvalidOutput(_))
         ));
 
         let denied_tool = FixedModel(AgentModelTurn {
@@ -2905,7 +2877,7 @@ mod tests {
                     Utc::now(),
                 )
                 .await,
-            Err(RebuildResearchError::ToolNotGranted(_))
+            Err(ResearchError::ToolNotGranted(_))
         ));
 
         let over_budget_tools = FixedModel(AgentModelTurn {
@@ -2931,7 +2903,7 @@ mod tests {
                     Utc::now(),
                 )
                 .await,
-            Err(RebuildResearchError::ToolBudgetExceeded)
+            Err(ResearchError::ToolBudgetExceeded)
         ));
 
         let mut mismatched_node = claimed.node.clone();
@@ -2946,7 +2918,7 @@ mod tests {
                     Utc::now(),
                 )
                 .await,
-            Err(RebuildResearchError::NodePolicyMismatch)
+            Err(ResearchError::NodePolicyMismatch)
         ));
         store
             .commit_attempt(
@@ -2971,7 +2943,7 @@ mod tests {
             claimed,
             evidence,
         } = fixture_with(|contract| contract.budget.max_input_tokens = 1);
-        let runtime = RebuildAgentRuntime::new(store.clone(), catalogue, Duration::minutes(5));
+        let runtime = AgentRuntime::new(store.clone(), catalogue, Duration::minutes(5));
         let output = FixedModel(AgentModelTurn {
             output: Some(json!({"summary":"source-linked claim"})),
             tool_calls: vec![],
@@ -2989,10 +2961,7 @@ mod tests {
             )
             .await;
         assert!(
-            matches!(
-                &result,
-                Err(RebuildResearchError::InputBudgetExceeded { .. })
-            ),
+            matches!(&result, Err(ResearchError::InputBudgetExceeded { .. })),
             "{result:?}"
         );
         store.verify_integrity().unwrap();
@@ -3004,7 +2973,7 @@ mod tests {
             claimed,
             evidence,
         } = fixture_with(|contract| contract.budget.max_output_tokens = 1);
-        let runtime = RebuildAgentRuntime::new(store.clone(), catalogue, Duration::minutes(5));
+        let runtime = AgentRuntime::new(store.clone(), catalogue, Duration::minutes(5));
         assert!(matches!(
             runtime
                 .run(
@@ -3018,7 +2987,7 @@ mod tests {
                     Utc::now(),
                 )
                 .await,
-            Err(RebuildResearchError::OutputBudgetExceeded { .. })
+            Err(ResearchError::OutputBudgetExceeded { .. })
         ));
         store.verify_integrity().unwrap();
     }

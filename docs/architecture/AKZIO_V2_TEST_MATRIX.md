@@ -60,3 +60,11 @@ cargo run -p akzio-cli --offline -- store doctor
 ```
 
 In addition, R10 must retain repeatable harnesses for the ten required security/durability cases above and a static inventory showing no active v1/Phase/FileStore/old Store Root/Unix business protocol/direct Paper submission compatibility path.
+
+## R10 completion evidence (2026-08-11)
+
+- `cargo fmt --all -- --check`, `cargo check --offline --workspace`, and `cargo clippy --offline --workspace --all-targets -- -D warnings` passed.
+- `cargo test --offline --workspace` passed: 181 tests across 22 suites.
+- A fresh temporary Store Root completed `run fixture-debug`; the following `store doctor` returned `{"ok":true}`.
+- Static source inventory found no active `legacy.rs`, `rebuild.rs`, `Rebuild*`, Unix transport, Live path, old Store Root, `orchestrator` or `FileStore` surface. The sole `unix_socket` hit is the CLI rejection test.
+- These are local/offline fixture and static results only; they are not broker, market, model, real Paper, or production evidence.

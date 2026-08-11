@@ -1,6 +1,6 @@
 //! Store implementation for the source-incompatible Akzio v2 authority.
 //!
-//! `RebuildStore` deliberately uses a different database filename and metadata
+//! `V2Store` deliberately uses a different database filename and metadata
 //! marker from `V2Store`; callers must choose a new Store Root rather than run a
 //! silent in-place migration.
 
@@ -21,7 +21,7 @@ use akzio_domain::{
     OutcomeSchedule, PaperCommitment, PaperReprice, PolicyState, PolicySubject, PolicyTransition,
     PolicyTransitionId, Reconciliation, RetryPolicy, RunId, RunPurpose, TaskId, TaskRecipeId,
     TaskStatus, TaskWritePermit, WorkflowGraph, WorkflowNode, WorkflowProposal, WorkflowStatus,
-    REBUILD_SCHEMA_VERSION, V2_DOMAIN_SCHEMA_VERSION,
+    V2_DOMAIN_SCHEMA_VERSION, V2_SCHEMA_VERSION,
 };
 use chrono::{DateTime, Duration, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
@@ -29,10 +29,10 @@ use serde::{de::DeserializeOwned, Serialize};
 use thiserror::Error;
 
 const DATABASE_FILE: &str = "akzio.sqlite3";
-const LEGACY_DATABASE_FILE: &str = "control.sqlite3";
+const INCOMPATIBLE_DATABASE_FILE: &str = "control.sqlite3";
 
 #[derive(Debug, Error)]
-pub enum RebuildStoreError {
+pub enum StoreError {
     #[error(transparent)]
     Sql(#[from] rusqlite::Error),
     #[error("I/O at {path}: {source}")]
@@ -131,10 +131,10 @@ pub enum RebuildStoreError {
     Integrity(String),
 }
 
-pub type RebuildStoreResult<T> = Result<T, RebuildStoreError>;
+pub type StoreResult<T> = Result<T, StoreError>;
 
 #[derive(Debug, Clone)]
-pub struct RebuildStore {
+pub struct V2Store {
     root: Arc<PathBuf>,
     blobs: Arc<PathBuf>,
     connection: Arc<Mutex<Connection>>,
@@ -152,7 +152,7 @@ pub struct StoredContract {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RebuildRun {
+pub struct StoredRun {
     pub run_id: RunId,
     pub purpose: RunPurpose,
     pub topology_id: String,
@@ -161,14 +161,14 @@ pub struct RebuildRun {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RebuildTask {
+pub struct StoredTask {
     pub run_id: RunId,
     pub node: WorkflowNode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkflowCommit {
-    pub run: RebuildRun,
+    pub run: StoredRun,
     pub graph: Artifact,
     pub nodes: Vec<WorkflowNode>,
 }
@@ -214,7 +214,7 @@ pub struct StoredTaskSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkflowSnapshot {
-    pub run: RebuildRun,
+    pub run: StoredRun,
     pub status: WorkflowStatus,
     pub finished_at: Option<DateTime<Utc>>,
     pub revision: WorkflowRevision,
@@ -224,7 +224,7 @@ pub struct WorkflowSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ClaimedRebuildTask {
+pub struct ClaimedAttempt {
     pub run_id: RunId,
     pub node: WorkflowNode,
     pub permit: TaskWritePermit,
@@ -239,7 +239,7 @@ pub enum RetryTaskResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StoredRebuildEvent {
+pub struct StoredEvent {
     pub cursor: i64,
     pub run_id: RunId,
     pub task_id: Option<TaskId>,
@@ -430,7 +430,7 @@ pub struct ShadowPairCompletion {
 }
 
 impl ShadowPairCompletion {
-    pub fn pair_key(&self) -> RebuildStoreResult<ContentHash> {
+    pub fn pair_key(&self) -> StoreResult<ContentHash> {
         let key = serde_json::json!({
             "subject": &self.subject,
             "parent_decision": &self.parent_decision,
@@ -443,23 +443,21 @@ impl ShadowPairCompletion {
         Ok(akzio_domain::content_hash_json(&key)?)
     }
 
-    fn validate(&self) -> RebuildStoreResult<()> {
+    fn validate(&self) -> StoreResult<()> {
         self.subject.validate()?;
         if self.candidate_topology_id.trim().is_empty() {
-            return Err(RebuildStoreError::InvalidLearningCommit(
-                "shadow_pair.identity",
-            ));
+            return Err(StoreError::InvalidLearningCommit("shadow_pair.identity"));
         }
         match &self.subject {
             PolicySubject::Contract(contract_hash)
                 if contract_hash != &self.candidate_contract_hash =>
             {
-                return Err(RebuildStoreError::InvalidLearningCommit(
+                return Err(StoreError::InvalidLearningCommit(
                     "shadow_pair.contract_subject",
                 ));
             }
             PolicySubject::Topology(topology_id) if topology_id.0 != self.candidate_topology_id => {
-                return Err(RebuildStoreError::InvalidLearningCommit(
+                return Err(StoreError::InvalidLearningCommit(
                     "shadow_pair.topology_subject",
                 ));
             }
@@ -471,9 +469,7 @@ impl ShadowPairCompletion {
             || self.parent_outcome.kind != ArtifactKind::Outcome
             || self.candidate_outcome.kind != ArtifactKind::Outcome
         {
-            return Err(RebuildStoreError::InvalidLearningCommit(
-                "shadow_pair.references",
-            ));
+            return Err(StoreError::InvalidLearningCommit("shadow_pair.references"));
         }
         Ok(())
     }
@@ -493,13 +489,13 @@ pub enum ShadowPairWriteResult {
     Existing(StoredShadowPair),
 }
 
-impl RebuildStore {
-    pub fn open(root: impl AsRef<Path>) -> RebuildStoreResult<Self> {
+impl V2Store {
+    pub fn open(root: impl AsRef<Path>) -> StoreResult<Self> {
         let root = root.as_ref().to_path_buf();
-        if root.join(LEGACY_DATABASE_FILE).exists() && !root.join(DATABASE_FILE).exists() {
-            return Err(RebuildStoreError::IncompatibleStoreRoot(root));
+        if root.join(INCOMPATIBLE_DATABASE_FILE).exists() && !root.join(DATABASE_FILE).exists() {
+            return Err(StoreError::IncompatibleStoreRoot(root));
         }
-        fs::create_dir_all(root.join("blobs")).map_err(|source| RebuildStoreError::Io {
+        fs::create_dir_all(root.join("blobs")).map_err(|source| StoreError::Io {
             path: root.join("blobs"),
             source,
         })?;
@@ -518,14 +514,10 @@ impl RebuildStore {
         self.root.as_ref()
     }
 
-    pub fn put_bytes(
-        &self,
-        bytes: &[u8],
-        media_type: impl Into<String>,
-    ) -> RebuildStoreResult<BlobRef> {
+    pub fn put_bytes(&self, bytes: &[u8], media_type: impl Into<String>) -> StoreResult<BlobRef> {
         let media_type = media_type.into();
         if media_type.trim().is_empty() {
-            return Err(RebuildStoreError::Domain(DomainError::EmptyField {
+            return Err(StoreError::Domain(DomainError::EmptyField {
                 field: "blob_ref.media_type",
             }));
         }
@@ -533,24 +525,23 @@ impl RebuildStore {
         let path = self.blob_path(&hash);
         if !path.exists() {
             let parent = path.parent().expect("content addressed blob has parent");
-            fs::create_dir_all(parent).map_err(|source| RebuildStoreError::Io {
+            fs::create_dir_all(parent).map_err(|source| StoreError::Io {
                 path: parent.to_path_buf(),
                 source,
             })?;
             match OpenOptions::new().create_new(true).write(true).open(&path) {
                 Ok(mut file) => {
-                    file.write_all(bytes)
-                        .map_err(|source| RebuildStoreError::Io {
-                            path: path.clone(),
-                            source,
-                        })?;
-                    file.sync_all().map_err(|source| RebuildStoreError::Io {
+                    file.write_all(bytes).map_err(|source| StoreError::Io {
+                        path: path.clone(),
+                        source,
+                    })?;
+                    file.sync_all().map_err(|source| StoreError::Io {
                         path: path.clone(),
                         source,
                     })?;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(source) => return Err(RebuildStoreError::Io { path, source }),
+                Err(source) => return Err(StoreError::Io { path, source }),
             }
         }
         Ok(BlobRef {
@@ -560,25 +551,25 @@ impl RebuildStore {
         })
     }
 
-    pub fn put_json<T: Serialize>(&self, value: &T) -> RebuildStoreResult<BlobRef> {
+    pub fn put_json<T: Serialize>(&self, value: &T) -> StoreResult<BlobRef> {
         self.put_bytes(&serde_json::to_vec(value)?, "application/json")
     }
 
-    pub fn read_blob(&self, blob: &BlobRef) -> RebuildStoreResult<Vec<u8>> {
+    pub fn read_blob(&self, blob: &BlobRef) -> StoreResult<Vec<u8>> {
         let path = self.blob_path(&blob.hash);
-        let bytes = fs::read(&path).map_err(|source| RebuildStoreError::Io {
+        let bytes = fs::read(&path).map_err(|source| StoreError::Io {
             path: path.clone(),
             source,
         })?;
         if bytes.len() as u64 != blob.bytes || ContentHash::of_bytes(&bytes) != blob.hash {
-            return Err(RebuildStoreError::MissingBlob(blob.hash.clone()));
+            return Err(StoreError::MissingBlob(blob.hash.clone()));
         }
         Ok(bytes)
     }
 
     /// Writes a root artifact such as an installed Contract. Bootstrap is deliberately
     /// narrow: a task-origin artifact must use `write_task_artifact` instead.
-    pub fn write_bootstrap_artifact(&self, artifact: &Artifact) -> RebuildStoreResult<()> {
+    pub fn write_bootstrap_artifact(&self, artifact: &Artifact) -> StoreResult<()> {
         artifact.validate()?;
         if artifact.origin.is_some()
             || !matches!(
@@ -586,7 +577,7 @@ impl RebuildStore {
                 ArtifactKind::Contract | ArtifactKind::FreezeState
             )
         {
-            return Err(RebuildStoreError::PermitOriginMismatch);
+            return Err(StoreError::PermitOriginMismatch);
         }
         self.read_blob(&artifact.blob)?;
         let mut connection = self.connection.lock().expect("store connection poisoned");
@@ -606,7 +597,7 @@ impl RebuildStore {
         frozen: bool,
         reason: impl Into<String>,
         changed_at: DateTime<Utc>,
-    ) -> RebuildStoreResult<Artifact> {
+    ) -> StoreResult<Artifact> {
         let payload = FreezeState {
             schema_version: V2_DOMAIN_SCHEMA_VERSION,
             frozen,
@@ -638,7 +629,7 @@ impl RebuildStore {
     pub fn active_contract(
         &self,
         purpose: &ContractPurpose,
-    ) -> RebuildStoreResult<Option<StoredContract>> {
+    ) -> StoreResult<Option<StoredContract>> {
         let connection = self.connection.lock().expect("store connection poisoned");
         let Some((contract_hash, _)) = contract_catalogue_head(&connection, purpose)? else {
             return Ok(None);
@@ -651,7 +642,7 @@ impl RebuildStore {
     pub fn contract_installation(
         &self,
         contract_hash: &ContentHash,
-    ) -> RebuildStoreResult<Option<StoredContract>> {
+    ) -> StoreResult<Option<StoredContract>> {
         let connection = self.connection.lock().expect("store connection poisoned");
         self.stored_contract_with_connection(&connection, contract_hash)
     }
@@ -663,7 +654,7 @@ impl RebuildStore {
         &self,
         contract: &AgentContract,
         now: DateTime<Utc>,
-    ) -> RebuildStoreResult<StoredContract> {
+    ) -> StoreResult<StoredContract> {
         contract.validate()?;
         let artifact = self.contract_artifact(contract, now)?;
         let mut connection = self.connection.lock().expect("store connection poisoned");
@@ -673,7 +664,7 @@ impl RebuildStore {
             self.stored_contract_with_connection(&transaction, &contract.contract_hash)?
         {
             if existing.contract != *contract || existing.activated_at.is_none() {
-                return Err(RebuildStoreError::ContractActivationConflict(
+                return Err(StoreError::ContractActivationConflict(
                     contract.purpose.clone(),
                 ));
             }
@@ -682,7 +673,7 @@ impl RebuildStore {
         }
         assert_contract_identity_available(&transaction, contract)?;
         if contract_catalogue_head(&transaction, &contract.purpose)?.is_some() {
-            return Err(RebuildStoreError::ContractActivationConflict(
+            return Err(StoreError::ContractActivationConflict(
                 contract.purpose.clone(),
             ));
         }
@@ -705,9 +696,7 @@ impl RebuildStore {
         transaction.commit()?;
         drop(connection);
         self.contract_installation(&contract.contract_hash)?
-            .ok_or_else(|| {
-                RebuildStoreError::MissingContractInstallation(contract.contract_hash.clone())
-            })
+            .ok_or_else(|| StoreError::MissingContractInstallation(contract.contract_hash.clone()))
     }
 
     /// Persist a candidate relative to the current active Contract. This is an
@@ -718,18 +707,16 @@ impl RebuildStore {
         active_contract_hash: &ContentHash,
         candidate: &AgentContract,
         now: DateTime<Utc>,
-    ) -> RebuildStoreResult<StoredContract> {
+    ) -> StoreResult<StoredContract> {
         candidate.validate()?;
         let artifact = self.contract_artifact(candidate, now)?;
         let mut connection = self.connection.lock().expect("store connection poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let active = self
             .stored_contract_with_connection(&transaction, active_contract_hash)?
-            .ok_or_else(|| {
-                RebuildStoreError::MissingContractInstallation(active_contract_hash.clone())
-            })?;
+            .ok_or_else(|| StoreError::MissingContractInstallation(active_contract_hash.clone()))?;
         if active.activated_at.is_none() || !candidate_is_bounded(&active.contract, candidate) {
-            return Err(RebuildStoreError::ContractCapabilityExpansion {
+            return Err(StoreError::ContractCapabilityExpansion {
                 active: active_contract_hash.clone(),
                 candidate: candidate.contract_hash.clone(),
             });
@@ -744,7 +731,7 @@ impl RebuildStore {
                 transaction.commit()?;
                 return Ok(existing);
             }
-            return Err(RebuildStoreError::ContractActivationConflict(
+            return Err(StoreError::ContractActivationConflict(
                 candidate.purpose.clone(),
             ));
         }
@@ -760,16 +747,14 @@ impl RebuildStore {
         transaction.commit()?;
         drop(connection);
         self.contract_installation(&candidate.contract_hash)?
-            .ok_or_else(|| {
-                RebuildStoreError::MissingContractInstallation(candidate.contract_hash.clone())
-            })
+            .ok_or_else(|| StoreError::MissingContractInstallation(candidate.contract_hash.clone()))
     }
 
     fn contract_artifact(
         &self,
         contract: &AgentContract,
         now: DateTime<Utc>,
-    ) -> RebuildStoreResult<Artifact> {
+    ) -> StoreResult<Artifact> {
         Ok(Artifact::new(
             ArtifactKind::Contract,
             self.put_json(contract)?,
@@ -793,7 +778,7 @@ impl RebuildStore {
         &self,
         connection: &Connection,
         contract_hash: &ContentHash,
-    ) -> RebuildStoreResult<Option<StoredContract>> {
+    ) -> StoreResult<Option<StoredContract>> {
         let row = connection
             .query_row(
                 r#"SELECT contract_artifact_id, baseline_contract_hash, installed_at,
@@ -820,14 +805,14 @@ impl RebuildStore {
             if artifact.kind != ArtifactKind::Contract
                 || artifact.lifecycle != ArtifactLifecycle::Canonical
             {
-                return Err(RebuildStoreError::Integrity(format!(
+                return Err(StoreError::Integrity(format!(
                     "contract {contract_hash} has an invalid artifact"
                 )));
             }
             let contract: AgentContract = self.read_artifact_payload(&artifact)?;
             contract.validate()?;
             if contract.contract_hash != *contract_hash {
-                return Err(RebuildStoreError::Integrity(format!(
+                return Err(StoreError::Integrity(format!(
                     "contract installation {contract_hash} payload hash diverges"
                 )));
             }
@@ -847,53 +832,53 @@ impl RebuildStore {
         transaction: &Transaction<'_>,
         commit: &PolicyEvaluationCommit,
         transition: &PolicyTransition,
-    ) -> RebuildStoreResult<()> {
+    ) -> StoreResult<()> {
         let PolicySubject::Contract(candidate_hash) = &commit.subject else {
             return Ok(());
         };
         let candidate = self
             .stored_contract_with_connection(transaction, candidate_hash)?
-            .ok_or_else(|| {
-                RebuildStoreError::MissingContractInstallation(candidate_hash.clone())
-            })?;
+            .ok_or_else(|| StoreError::MissingContractInstallation(candidate_hash.clone()))?;
         let Some(baseline_hash) = candidate.baseline_contract_hash.as_ref() else {
-            return Err(RebuildStoreError::ContractActivationConflict(
+            return Err(StoreError::ContractActivationConflict(
                 candidate.contract.purpose.clone(),
             ));
         };
 
         match (transition.from, transition.to) {
             (_, PolicyState::Contract(CandidatePolicyState::Active)) => {
-                let candidate_policy_artifact = commit.candidate_policy.as_ref().ok_or(
-                    RebuildStoreError::InvalidLearningCommit("contract_catalogue.candidate_policy"),
-                )?;
+                let candidate_policy_artifact =
+                    commit
+                        .candidate_policy
+                        .as_ref()
+                        .ok_or(StoreError::InvalidLearningCommit(
+                            "contract_catalogue.candidate_policy",
+                        ))?;
                 let candidate_policy: CandidatePolicy =
                     self.read_artifact_payload(candidate_policy_artifact)?;
                 if candidate_policy.candidate.artifact_id != candidate.artifact.artifact_id
                     || candidate_policy.baseline.kind != ArtifactKind::Contract
                     || candidate_policy.subject != commit.subject
                 {
-                    return Err(RebuildStoreError::InvalidLearningCommit(
+                    return Err(StoreError::InvalidLearningCommit(
                         "contract_catalogue.candidate_policy_binding",
                     ));
                 }
                 let Some((current_hash, _)) =
                     contract_catalogue_head(transaction, &candidate.contract.purpose)?
                 else {
-                    return Err(RebuildStoreError::ContractActivationConflict(
+                    return Err(StoreError::ContractActivationConflict(
                         candidate.contract.purpose.clone(),
                     ));
                 };
                 let current = self
                     .stored_contract_with_connection(transaction, &current_hash)?
-                    .ok_or_else(|| {
-                        RebuildStoreError::MissingContractInstallation(current_hash.clone())
-                    })?;
+                    .ok_or_else(|| StoreError::MissingContractInstallation(current_hash.clone()))?;
                 if current.contract.contract_hash != *baseline_hash
                     || candidate_policy.baseline.artifact_id != current.artifact.artifact_id
                     || !candidate_is_bounded(&current.contract, &candidate.contract)
                 {
-                    return Err(RebuildStoreError::ContractActivationConflict(
+                    return Err(StoreError::ContractActivationConflict(
                         candidate.contract.purpose.clone(),
                     ));
                 }
@@ -916,22 +901,22 @@ impl RebuildStore {
                 let Some((current_hash, _)) =
                     contract_catalogue_head(transaction, &candidate.contract.purpose)?
                 else {
-                    return Err(RebuildStoreError::ContractActivationConflict(
+                    return Err(StoreError::ContractActivationConflict(
                         candidate.contract.purpose.clone(),
                     ));
                 };
                 if current_hash != *candidate_hash {
-                    return Err(RebuildStoreError::ContractActivationConflict(
+                    return Err(StoreError::ContractActivationConflict(
                         candidate.contract.purpose.clone(),
                     ));
                 }
                 let baseline = self
                     .stored_contract_with_connection(transaction, baseline_hash)?
                     .ok_or_else(|| {
-                        RebuildStoreError::MissingContractInstallation(baseline_hash.clone())
+                        StoreError::MissingContractInstallation(baseline_hash.clone())
                     })?;
                 if baseline.contract.purpose != candidate.contract.purpose {
-                    return Err(RebuildStoreError::ContractActivationConflict(
+                    return Err(StoreError::ContractActivationConflict(
                         candidate.contract.purpose.clone(),
                     ));
                 }
@@ -957,18 +942,18 @@ impl RebuildStore {
 
     /// Commits the frozen workflow graph, Run row, nodes, dependencies, and creation
     /// event as one transaction. A process cannot observe a half-submitted graph.
-    pub fn commit_workflow(&self, commit: &WorkflowCommit) -> RebuildStoreResult<()> {
+    pub fn commit_workflow(&self, commit: &WorkflowCommit) -> StoreResult<()> {
         if commit.graph.kind != ArtifactKind::WorkflowGraph
             || commit.graph.artifact_id != commit.run.graph_artifact_id
         {
-            return Err(RebuildStoreError::InvalidWorkflowGraphArtifact);
+            return Err(StoreError::InvalidWorkflowGraphArtifact);
         }
         commit.graph.validate()?;
         self.read_blob(&commit.graph.blob)?;
         let graph: WorkflowGraph = serde_json::from_slice(&self.read_blob(&commit.graph.blob)?)?;
         graph.validate()?;
         if graph.nodes != commit.nodes || graph.topology_id != commit.run.topology_id {
-            return Err(RebuildStoreError::WorkflowGraphMismatch);
+            return Err(StoreError::WorkflowGraphMismatch);
         }
 
         let mut connection = self.connection.lock().expect("store connection poisoned");
@@ -981,7 +966,7 @@ impl RebuildStore {
     fn commit_workflow_transaction(
         transaction: &Transaction<'_>,
         commit: &WorkflowCommit,
-    ) -> RebuildStoreResult<()> {
+    ) -> StoreResult<()> {
         assert_workflow_input_artifacts(transaction, &commit.nodes)?;
         insert_artifact(transaction, &commit.graph)?;
         let inserted = transaction.execute(
@@ -997,7 +982,7 @@ impl RebuildStore {
             ],
         )?;
         if inserted != 1 {
-            return Err(RebuildStoreError::DuplicateRun(commit.run.run_id.clone()));
+            return Err(StoreError::DuplicateRun(commit.run.run_id.clone()));
         }
         for node in &commit.nodes {
             insert_task_node(transaction, &commit.run.run_id, node, commit.run.created_at)?;
@@ -1035,9 +1020,9 @@ impl RebuildStore {
         owner_id: &str,
         now: DateTime<Utc>,
         expires_at: DateTime<Utc>,
-    ) -> RebuildStoreResult<Option<DaemonLease>> {
+    ) -> StoreResult<Option<DaemonLease>> {
         if lease_name.trim().is_empty() || owner_id.trim().is_empty() || expires_at <= now {
-            return Err(RebuildStoreError::InvalidDaemonLease(lease_name.to_owned()));
+            return Err(StoreError::InvalidDaemonLease(lease_name.to_owned()));
         }
         let mut connection = self.connection.lock().expect("store connection poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1088,11 +1073,9 @@ impl RebuildStore {
         lease: &DaemonLease,
         now: DateTime<Utc>,
         expires_at: DateTime<Utc>,
-    ) -> RebuildStoreResult<bool> {
+    ) -> StoreResult<bool> {
         if expires_at <= now {
-            return Err(RebuildStoreError::InvalidDaemonLease(
-                lease.lease_name.clone(),
-            ));
+            return Err(StoreError::InvalidDaemonLease(lease.lease_name.clone()));
         }
         let connection = self.connection.lock().expect("store connection poisoned");
         let changed = connection.execute(
@@ -1102,7 +1085,7 @@ impl RebuildStore {
         Ok(changed == 1)
     }
 
-    pub fn release_daemon_lease(&self, lease: &DaemonLease) -> RebuildStoreResult<bool> {
+    pub fn release_daemon_lease(&self, lease: &DaemonLease) -> StoreResult<bool> {
         let connection = self.connection.lock().expect("store connection poisoned");
         let changed = connection.execute(
             "DELETE FROM rebuild_daemon_leases WHERE lease_name = ?1 AND owner_id = ?2 AND epoch = ?3",
@@ -1111,7 +1094,7 @@ impl RebuildStore {
         Ok(changed == 1)
     }
 
-    pub fn daemon_lease(&self, lease_name: &str) -> RebuildStoreResult<Option<DaemonLease>> {
+    pub fn daemon_lease(&self, lease_name: &str) -> StoreResult<Option<DaemonLease>> {
         let connection = self.connection.lock().expect("store connection poisoned");
         connection
             .query_row(
@@ -1138,7 +1121,7 @@ impl RebuildStore {
         &self,
         lease: &DaemonLease,
         now: DateTime<Utc>,
-    ) -> RebuildStoreResult<()> {
+    ) -> StoreResult<()> {
         let mut connection = self.connection.lock().expect("store connection poisoned");
         let transaction = connection.transaction()?;
         assert_daemon_lease(&transaction, lease, now)?;
@@ -1153,13 +1136,13 @@ impl RebuildStore {
         &self,
         lease: &DaemonLease,
         reservation: &SessionReservation,
-    ) -> RebuildStoreResult<SessionSlotReservation> {
+    ) -> StoreResult<SessionSlotReservation> {
         if reservation.session_key.trim().is_empty()
             || reservation.workflow.run.purpose != RunPurpose::Paper
             || reservation.workflow.graph.kind != ArtifactKind::WorkflowGraph
             || reservation.workflow.graph.artifact_id != reservation.workflow.run.graph_artifact_id
         {
-            return Err(RebuildStoreError::InvalidSessionSlot(
+            return Err(StoreError::InvalidSessionSlot(
                 reservation.session_key.clone(),
             ));
         }
@@ -1170,7 +1153,7 @@ impl RebuildStore {
         if graph.nodes != reservation.workflow.nodes
             || graph.topology_id != reservation.workflow.run.topology_id
         {
-            return Err(RebuildStoreError::WorkflowGraphMismatch);
+            return Err(StoreError::WorkflowGraphMismatch);
         }
         for artifact in &reservation.setup_artifacts {
             artifact.validate()?;
@@ -1182,7 +1165,7 @@ impl RebuildStore {
                     .and_then(|origin| origin.run_id.as_ref())
                     != Some(&reservation.workflow.run.run_id)
             {
-                return Err(RebuildStoreError::InvalidSessionSlot(
+                return Err(StoreError::InvalidSessionSlot(
                     reservation.session_key.clone(),
                 ));
             }
@@ -1227,14 +1210,14 @@ impl RebuildStore {
         };
         let slot = self
             .session_slot(&reservation.session_key)?
-            .ok_or_else(|| RebuildStoreError::Integrity("session slot disappeared".to_owned()))?;
+            .ok_or_else(|| StoreError::Integrity("session slot disappeared".to_owned()))?;
         Ok(SessionSlotReservation {
             slot,
             newly_reserved,
         })
     }
 
-    pub fn session_slot(&self, session_key: &str) -> RebuildStoreResult<Option<SessionSlot>> {
+    pub fn session_slot(&self, session_key: &str) -> StoreResult<Option<SessionSlot>> {
         let row = {
             let connection = self.connection.lock().expect("store connection poisoned");
             connection
@@ -1270,20 +1253,18 @@ impl RebuildStore {
                 let graph_artifact_id = ArtifactId(ContentHash::new(graph_artifact_id)?);
                 let graph_artifact = self.artifact(&graph_artifact_id)?;
                 if graph_artifact.kind != ArtifactKind::WorkflowGraph {
-                    return Err(RebuildStoreError::InvalidSessionSlot(
-                        session_key.to_owned(),
-                    ));
+                    return Err(StoreError::InvalidSessionSlot(session_key.to_owned()));
                 }
                 let graph: WorkflowGraph =
                     serde_json::from_slice(&self.read_blob(&graph_artifact.blob)?)?;
                 graph.validate()?;
                 if graph.topology_id != topology_id {
-                    return Err(RebuildStoreError::WorkflowGraphMismatch);
+                    return Err(StoreError::WorkflowGraphMismatch);
                 }
                 Ok(SessionSlot {
                     session_key: session_key.to_owned(),
                     workflow: WorkflowCommit {
-                        run: RebuildRun {
+                        run: StoredRun {
                             run_id: RunId(run_id),
                             purpose: RunPurpose::Paper,
                             topology_id,
@@ -1312,7 +1293,7 @@ impl RebuildStore {
     /// paired with an active commitment task.
     /// Returns the frozen broker-session slot for one scheduler-owned Paper
     /// run. A run may never have more than one such slot.
-    pub fn session_slot_for_run(&self, run_id: &RunId) -> RebuildStoreResult<Option<SessionSlot>> {
+    pub fn session_slot_for_run(&self, run_id: &RunId) -> StoreResult<Option<SessionSlot>> {
         let session_key = {
             let connection = self.connection.lock().expect("store connection poisoned");
             connection
@@ -1334,13 +1315,11 @@ impl RebuildStore {
         &self,
         lease: &DaemonLease,
         commit: &ExecutionCommit,
-    ) -> RebuildStoreResult<ExecutionCommitResult> {
+    ) -> StoreResult<ExecutionCommitResult> {
         if commit.session_key.trim().is_empty()
             || commit.commitment.kind != ArtifactKind::ExecutionCommitment
         {
-            return Err(RebuildStoreError::InvalidSessionSlot(
-                commit.session_key.clone(),
-            ));
+            return Err(StoreError::InvalidSessionSlot(commit.session_key.clone()));
         }
         commit.commitment.validate()?;
         let payload: PaperCommitment =
@@ -1353,9 +1332,7 @@ impl RebuildStore {
                 .iter()
                 .any(|source| source == &payload.execution_context)
         {
-            return Err(RebuildStoreError::InvalidSessionSlot(
-                commit.session_key.clone(),
-            ));
+            return Err(StoreError::InvalidSessionSlot(commit.session_key.clone()));
         }
 
         let mut connection = self.connection.lock().expect("store connection poisoned");
@@ -1380,14 +1357,10 @@ impl RebuildStore {
             )
             .optional()?;
         let Some((run_id, existing_commitment)) = slot else {
-            return Err(RebuildStoreError::InvalidSessionSlot(
-                commit.session_key.clone(),
-            ));
+            return Err(StoreError::InvalidSessionSlot(commit.session_key.clone()));
         };
         if run_id != commit.permit.run_id.0 {
-            return Err(RebuildStoreError::InvalidSessionSlot(
-                commit.session_key.clone(),
-            ));
+            return Err(StoreError::InvalidSessionSlot(commit.session_key.clone()));
         }
         if let Some(existing_commitment) = existing_commitment {
             if existing_commitment == commit.commitment.artifact_id.0.as_str() {
@@ -1494,7 +1467,7 @@ impl RebuildStore {
                     });
                 }
             }
-            return Err(RebuildStoreError::DuplicateExecutionCommitment(
+            return Err(StoreError::DuplicateExecutionCommitment(
                 commit.session_key.clone(),
             ));
         }
@@ -1553,8 +1526,8 @@ impl RebuildStore {
         commitment: &PaperCommitment,
         run_id: &RunId,
         session_key: &str,
-    ) -> RebuildStoreResult<()> {
-        let invalid = || RebuildStoreError::InvalidSessionSlot(session_key.to_owned());
+    ) -> StoreResult<()> {
+        let invalid = || StoreError::InvalidSessionSlot(session_key.to_owned());
         if commitment_artifact.kind != ArtifactKind::ExecutionCommitment
             || commitment_artifact.lifecycle != ArtifactLifecycle::Canonical
             || commitment.broker_session != session_key
@@ -1696,9 +1669,9 @@ impl RebuildStore {
         &self,
         commitment: &ArtifactRef,
         asset: Asset,
-    ) -> RebuildStoreResult<Option<Artifact>> {
+    ) -> StoreResult<Option<Artifact>> {
         if commitment.kind != ArtifactKind::ExecutionCommitment {
-            return Err(RebuildStoreError::InvalidExecutionReprice);
+            return Err(StoreError::InvalidExecutionReprice);
         }
         let connection = self.connection.lock().expect("store connection poisoned");
         let artifact_id = connection
@@ -1724,9 +1697,9 @@ impl RebuildStore {
         &self,
         lease: &DaemonLease,
         commit: &RepriceCommit,
-    ) -> RebuildStoreResult<RepriceCommitResult> {
+    ) -> StoreResult<RepriceCommitResult> {
         if commit.reprice.kind != ArtifactKind::ExecutionReprice {
-            return Err(RebuildStoreError::InvalidExecutionReprice);
+            return Err(StoreError::InvalidExecutionReprice);
         }
         commit.reprice.validate()?;
         let payload: PaperReprice = serde_json::from_slice(&self.read_blob(&commit.reprice.blob)?)?;
@@ -1742,7 +1715,7 @@ impl RebuildStore {
                 .iter()
                 .any(|source| source == &payload.prior_receipt)
         {
-            return Err(RebuildStoreError::InvalidExecutionReprice);
+            return Err(StoreError::InvalidExecutionReprice);
         }
 
         let mut connection = self.connection.lock().expect("store connection poisoned");
@@ -1755,7 +1728,7 @@ impl RebuildStore {
 
         let commitment_artifact = read_artifact(&transaction, &payload.commitment.artifact_id)?;
         if commitment_artifact.kind != ArtifactKind::ExecutionCommitment {
-            return Err(RebuildStoreError::InvalidExecutionReprice);
+            return Err(StoreError::InvalidExecutionReprice);
         }
         let commitment: PaperCommitment =
             serde_json::from_slice(&self.read_blob(&commitment_artifact.blob)?)?;
@@ -1768,7 +1741,7 @@ impl RebuildStore {
                 .iter()
                 .any(|source| source == &payload.commitment)
         {
-            return Err(RebuildStoreError::InvalidExecutionReprice);
+            return Err(StoreError::InvalidExecutionReprice);
         }
         let prior_receipt: OrderReceipt =
             serde_json::from_slice(&self.read_blob(&prior_receipt_artifact.blob)?)?;
@@ -1784,7 +1757,7 @@ impl RebuildStore {
                 OrderReceiptState::Accepted | OrderReceiptState::PartiallyFilled
             )
         {
-            return Err(RebuildStoreError::InvalidExecutionReprice);
+            return Err(StoreError::InvalidExecutionReprice);
         }
 
         let slot = transaction
@@ -1795,14 +1768,14 @@ impl RebuildStore {
             )
             .optional()?;
         let Some((run_id, commitment_artifact_id)) = slot else {
-            return Err(RebuildStoreError::InvalidSessionSlot(
+            return Err(StoreError::InvalidSessionSlot(
                 commitment.broker_session.clone(),
             ));
         };
         if run_id != commit.permit.run_id.0
             || commitment_artifact_id.as_deref() != Some(payload.commitment.artifact_id.0.as_str())
         {
-            return Err(RebuildStoreError::InvalidSessionSlot(
+            return Err(StoreError::InvalidSessionSlot(
                 commitment.broker_session.clone(),
             ));
         }
@@ -1849,7 +1822,7 @@ impl RebuildStore {
                     });
                 }
             }
-            return Err(RebuildStoreError::DuplicateExecutionReprice(format!(
+            return Err(StoreError::DuplicateExecutionReprice(format!(
                 "{}:{}",
                 payload.commitment.artifact_id,
                 payload.asset.symbol()
@@ -1894,7 +1867,7 @@ impl RebuildStore {
 
     /// Commit a Planner proposal and the graph revision it lowers. The proposal,
     /// graph, task rows, events, and Planner completion become visible together.
-    pub fn commit_workflow_patch(&self, commit: &WorkflowPatchCommit) -> RebuildStoreResult<()> {
+    pub fn commit_workflow_patch(&self, commit: &WorkflowPatchCommit) -> StoreResult<()> {
         let permit = &commit.permit;
         let planner_output = &commit.planner_output;
         let evidence_needs = &commit.evidence_needs;
@@ -1910,10 +1883,10 @@ impl RebuildStore {
                 .iter()
                 .any(|artifact| artifact.kind != ArtifactKind::EvidenceNeed)
         {
-            return Err(RebuildStoreError::InvalidWorkflowProposalArtifact);
+            return Err(StoreError::InvalidWorkflowProposalArtifact);
         }
         if next_graph.kind != ArtifactKind::WorkflowGraph {
-            return Err(RebuildStoreError::InvalidWorkflowGraphArtifact);
+            return Err(StoreError::InvalidWorkflowGraphArtifact);
         }
         if planner_output.lifecycle != ArtifactLifecycle::RunScoped
             || evidence_needs
@@ -1922,7 +1895,7 @@ impl RebuildStore {
             || proposal_artifact.lifecycle != ArtifactLifecycle::RunScoped
             || next_graph.lifecycle != ArtifactLifecycle::RunScoped
         {
-            return Err(RebuildStoreError::InvalidWorkflowProposalArtifact);
+            return Err(StoreError::InvalidWorkflowProposalArtifact);
         }
         planner_output.validate()?;
         proposal_artifact.validate()?;
@@ -1938,7 +1911,7 @@ impl RebuildStore {
         let graph: WorkflowGraph = serde_json::from_slice(&self.read_blob(&next_graph.blob)?)?;
         graph.validate()?;
         if proposal.topology_id != graph.topology_id {
-            return Err(RebuildStoreError::WorkflowGraphMismatch);
+            return Err(StoreError::WorkflowGraphMismatch);
         }
         let expected_proposal_sources = std::iter::once(ArtifactRef {
             artifact_id: planner_output.artifact_id.clone(),
@@ -1968,7 +1941,7 @@ impl RebuildStore {
                     && reference.kind == ArtifactKind::WorkflowProposal
             })
         {
-            return Err(RebuildStoreError::InvalidWorkflowProposalArtifact);
+            return Err(StoreError::InvalidWorkflowProposalArtifact);
         }
         let added_ids = added_nodes
             .iter()
@@ -1987,7 +1960,7 @@ impl RebuildStore {
                 .iter()
                 .all(|node| graph.nodes.iter().any(|item| item == node))
         {
-            return Err(RebuildStoreError::WorkflowGraphMismatch);
+            return Err(StoreError::WorkflowGraphMismatch);
         }
 
         let mut connection = self.connection.lock().expect("store connection poisoned");
@@ -2030,17 +2003,17 @@ impl RebuildStore {
             )
             .optional()?;
         let Some((current, purpose)) = current else {
-            return Err(RebuildStoreError::MissingRun(run_id.clone()));
+            return Err(StoreError::MissingRun(run_id.clone()));
         };
         if parse_enum::<RunPurpose>(&purpose)? == RunPurpose::Paper {
-            return Err(RebuildStoreError::FrozenPaperWorkflow(run_id.clone()));
+            return Err(StoreError::FrozenPaperWorkflow(run_id.clone()));
         }
         if current != previous_graph_artifact_id.0.as_str() {
-            return Err(RebuildStoreError::StaleWorkflowGraph);
+            return Err(StoreError::StaleWorkflowGraph);
         }
         let previous_graph_artifact = read_artifact(&transaction, previous_graph_artifact_id)?;
         if previous_graph_artifact.kind != ArtifactKind::WorkflowGraph {
-            return Err(RebuildStoreError::InvalidWorkflowGraphArtifact);
+            return Err(StoreError::InvalidWorkflowGraphArtifact);
         }
         let previous_graph: WorkflowGraph =
             serde_json::from_slice(&self.read_blob(&previous_graph_artifact.blob)?)?;
@@ -2056,7 +2029,7 @@ impl RebuildStore {
                 .any(|id| !previous_nodes.contains_key(id))
             || !added_ids.is_disjoint(&updated_ids)
         {
-            return Err(RebuildStoreError::WorkflowGraphMismatch);
+            return Err(StoreError::WorkflowGraphMismatch);
         }
         for previous in &previous_graph.nodes {
             let Some(next) = graph
@@ -2064,17 +2037,17 @@ impl RebuildStore {
                 .iter()
                 .find(|node| node.task_id == previous.task_id)
             else {
-                return Err(RebuildStoreError::WorkflowGraphMismatch);
+                return Err(StoreError::WorkflowGraphMismatch);
             };
             if next != previous {
                 if !updated_ids.contains(&previous.task_id) {
-                    return Err(RebuildStoreError::WorkflowGraphMismatch);
+                    return Err(StoreError::WorkflowGraphMismatch);
                 }
                 let mut permitted_update = previous.clone();
                 permitted_update.dependencies = next.dependencies.clone();
                 permitted_update.input_artifacts = next.input_artifacts.clone();
                 if permitted_update != *next {
-                    return Err(RebuildStoreError::WorkflowGraphMismatch);
+                    return Err(StoreError::WorkflowGraphMismatch);
                 }
             }
         }
@@ -2093,7 +2066,7 @@ impl RebuildStore {
             .chain(added_ids.iter().map(|id| id.0.clone()))
             .collect::<std::collections::BTreeSet<_>>();
         if next_ids != expected {
-            return Err(RebuildStoreError::WorkflowGraphMismatch);
+            return Err(StoreError::WorkflowGraphMismatch);
         }
         insert_artifact(&transaction, proposal_artifact)?;
         let proposal_event_id = append_event(
@@ -2125,7 +2098,7 @@ impl RebuildStore {
                 |row| row.get::<_, String>(0),
             )?;
             if status != "queued" {
-                return Err(RebuildStoreError::TaskNotRunnable(node.task_id.clone()));
+                return Err(StoreError::TaskNotRunnable(node.task_id.clone()));
             }
             transaction.execute(
                 "UPDATE rebuild_tasks SET input_artifacts_json = ?1 WHERE task_id = ?2",
@@ -2195,9 +2168,9 @@ impl RebuildStore {
         run_id: &RunId,
         reason: &str,
         now: DateTime<Utc>,
-    ) -> RebuildStoreResult<bool> {
+    ) -> StoreResult<bool> {
         if reason.trim().is_empty() {
-            return Err(RebuildStoreError::Domain(DomainError::EmptyField {
+            return Err(StoreError::Domain(DomainError::EmptyField {
                 field: "run_cancel.reason",
             }));
         }
@@ -2211,7 +2184,7 @@ impl RebuildStore {
             )
             .optional()?;
         if exists.is_none() {
-            return Err(RebuildStoreError::MissingRun(run_id.clone()));
+            return Err(StoreError::MissingRun(run_id.clone()));
         }
         let inserted = transaction.execute(
             r#"INSERT OR IGNORE INTO rebuild_run_cancellations (run_id, reason, requested_at)
@@ -2237,7 +2210,7 @@ impl RebuildStore {
         Ok(true)
     }
 
-    pub fn run_cancel_requested(&self, run_id: &RunId) -> RebuildStoreResult<bool> {
+    pub fn run_cancel_requested(&self, run_id: &RunId) -> StoreResult<bool> {
         let connection = self.connection.lock().expect("store connection poisoned");
         Ok(connection
             .query_row(
@@ -2257,7 +2230,7 @@ impl RebuildStore {
         permit: &TaskWritePermit,
         retry_at: DateTime<Utc>,
         now: DateTime<Utc>,
-    ) -> RebuildStoreResult<RetryTaskResult> {
+    ) -> StoreResult<RetryTaskResult> {
         let mut connection = self.connection.lock().expect("store connection poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         assert_permit(&transaction, permit)?;
@@ -2318,9 +2291,9 @@ impl RebuildStore {
         worker_id: &str,
         now: DateTime<Utc>,
         lease_for: Duration,
-    ) -> RebuildStoreResult<Option<ClaimedRebuildTask>> {
+    ) -> StoreResult<Option<ClaimedAttempt>> {
         if worker_id.trim().is_empty() {
-            return Err(RebuildStoreError::Domain(DomainError::EmptyField {
+            return Err(StoreError::Domain(DomainError::EmptyField {
                 field: "worker_id",
             }));
         }
@@ -2378,7 +2351,7 @@ impl RebuildStore {
             ],
         )?;
         if updated != 1 {
-            return Err(RebuildStoreError::TaskNotRunnable(permit.task_id));
+            return Err(StoreError::TaskNotRunnable(permit.task_id));
         }
         transaction.execute(
             r#"INSERT INTO rebuild_attempts
@@ -2408,7 +2381,7 @@ impl RebuildStore {
             now,
         )?;
         transaction.commit()?;
-        Ok(Some(ClaimedRebuildTask {
+        Ok(Some(ClaimedAttempt {
             run_id,
             node,
             permit,
@@ -2419,7 +2392,7 @@ impl RebuildStore {
         &self,
         permit: &TaskWritePermit,
         expires_at: DateTime<Utc>,
-    ) -> RebuildStoreResult<()> {
+    ) -> StoreResult<()> {
         let connection = self.connection.lock().expect("store connection poisoned");
         let updated = connection.execute(
             r#"UPDATE rebuild_tasks SET lease_until = ?1
@@ -2434,7 +2407,7 @@ impl RebuildStore {
             ],
         )?;
         if updated != 1 {
-            return Err(RebuildStoreError::StalePermit(permit.task_id.clone()));
+            return Err(StoreError::StalePermit(permit.task_id.clone()));
         }
         Ok(())
     }
@@ -2443,7 +2416,7 @@ impl RebuildStore {
     /// creating an artifact or changing task state. External adapters use
     /// this immediately before side effects; final persistence rechecks the
     /// same permit in its own transaction.
-    pub fn validate_task_permit(&self, permit: &TaskWritePermit) -> RebuildStoreResult<()> {
+    pub fn validate_task_permit(&self, permit: &TaskWritePermit) -> StoreResult<()> {
         let mut connection = self.connection.lock().expect("store connection poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         assert_permit(&transaction, permit)?;
@@ -2458,9 +2431,9 @@ impl RebuildStore {
         &self,
         permit: &TaskWritePermit,
         status: TaskStatus,
-    ) -> RebuildStoreResult<()> {
+    ) -> StoreResult<()> {
         if !status.is_terminal() {
-            return Err(RebuildStoreError::TaskNotRunnable(permit.task_id.clone()));
+            return Err(StoreError::TaskNotRunnable(permit.task_id.clone()));
         }
         let connection = self.connection.lock().expect("store connection poisoned");
         let current = connection
@@ -2487,7 +2460,7 @@ impl RebuildStore {
             )
             .optional()?;
         let Some(current) = current else {
-            return Err(RebuildStoreError::StalePermit(permit.task_id.clone()));
+            return Err(StoreError::StalePermit(permit.task_id.clone()));
         };
         let expected_contract = permit.contract_hash.as_ref().map(ContentHash::as_str);
         if current.0 != permit.run_id.0
@@ -2500,7 +2473,7 @@ impl RebuildStore {
             || current.7 != permit.epoch
             || current.8 != enum_name(status)
         {
-            return Err(RebuildStoreError::StalePermit(permit.task_id.clone()));
+            return Err(StoreError::StalePermit(permit.task_id.clone()));
         }
         Ok(())
     }
@@ -2511,12 +2484,12 @@ impl RebuildStore {
         artifact: &Artifact,
         event_type: &str,
         now: DateTime<Utc>,
-    ) -> RebuildStoreResult<()> {
+    ) -> StoreResult<()> {
         artifact.validate()?;
         reject_generic_learning_artifact(artifact)?;
         self.read_blob(&artifact.blob)?;
         if event_type.trim().is_empty() {
-            return Err(RebuildStoreError::Domain(DomainError::EmptyField {
+            return Err(StoreError::Domain(DomainError::EmptyField {
                 field: "event_type",
             }));
         }
@@ -2547,7 +2520,7 @@ impl RebuildStore {
         artifacts: &[Artifact],
         status: TaskStatus,
         now: DateTime<Utc>,
-    ) -> RebuildStoreResult<()> {
+    ) -> StoreResult<()> {
         self.validate_attempt_commit(permit, artifacts, status)?;
         let mut connection = self.connection.lock().expect("store connection poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2565,7 +2538,7 @@ impl RebuildStore {
         artifacts: &[Artifact],
         status: TaskStatus,
         now: DateTime<Utc>,
-    ) -> RebuildStoreResult<()> {
+    ) -> StoreResult<()> {
         self.validate_attempt_commit(permit, artifacts, status)?;
         let mut connection = self.connection.lock().expect("store connection poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2580,12 +2553,12 @@ impl RebuildStore {
         permit: &TaskWritePermit,
         artifacts: &[Artifact],
         status: TaskStatus,
-    ) -> RebuildStoreResult<()> {
+    ) -> StoreResult<()> {
         if !status.is_terminal() {
-            return Err(RebuildStoreError::TaskNotRunnable(permit.task_id.clone()));
+            return Err(StoreError::TaskNotRunnable(permit.task_id.clone()));
         }
         if status == TaskStatus::Succeeded && artifacts.is_empty() {
-            return Err(RebuildStoreError::Domain(DomainError::EmptyField {
+            return Err(StoreError::Domain(DomainError::EmptyField {
                 field: "commit_attempt.artifacts",
             }));
         }
@@ -2605,9 +2578,9 @@ impl RebuildStore {
         permit: &TaskWritePermit,
         outcomes: &[Artifact],
         now: DateTime<Utc>,
-    ) -> RebuildStoreResult<()> {
+    ) -> StoreResult<()> {
         if outcomes.is_empty() {
-            return Err(RebuildStoreError::Domain(DomainError::EmptyField {
+            return Err(StoreError::Domain(DomainError::EmptyField {
                 field: "commit_outcomes.outcomes",
             }));
         }
@@ -2617,15 +2590,13 @@ impl RebuildStore {
                 artifact.validate()?;
                 self.read_blob(&artifact.blob)?;
                 if artifact.kind != ArtifactKind::Outcome {
-                    return Err(RebuildStoreError::InvalidLearningCommit(
-                        "commit_outcomes.kind",
-                    ));
+                    return Err(StoreError::InvalidLearningCommit("commit_outcomes.kind"));
                 }
                 let outcome: Outcome = self.read_artifact_payload(artifact)?;
                 outcome.validate_sealed()?;
                 Ok(outcome)
             })
-            .collect::<RebuildStoreResult<Vec<_>>>()?;
+            .collect::<StoreResult<Vec<_>>>()?;
 
         let mut connection = self.connection.lock().expect("store connection poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2634,7 +2605,7 @@ impl RebuildStore {
         let expected_lifecycle = match purpose {
             RunPurpose::Paper => ArtifactLifecycle::Canonical,
             RunPurpose::Shadow => ArtifactLifecycle::RunScoped,
-            _ => return Err(RebuildStoreError::NonCanonicalLearningPurpose(purpose)),
+            _ => return Err(StoreError::NonCanonicalLearningPurpose(purpose)),
         };
         let allowed_schedule_purposes: &[RunPurpose] = match purpose {
             RunPurpose::Paper => &[RunPurpose::Paper],
@@ -2643,7 +2614,7 @@ impl RebuildStore {
         };
         for (artifact, outcome) in outcomes.iter().zip(&payloads) {
             if artifact.lifecycle != expected_lifecycle {
-                return Err(RebuildStoreError::InvalidLearningCommit(
+                return Err(StoreError::InvalidLearningCommit(
                     "commit_outcomes.lifecycle",
                 ));
             }
@@ -2660,7 +2631,7 @@ impl RebuildStore {
                     .chain(outcome.market_evidence.iter().cloned())
                     .collect::<Vec<_>>(),
             ) {
-                return Err(RebuildStoreError::InvalidLearningCommit(
+                return Err(StoreError::InvalidLearningCommit(
                     "commit_outcomes.source_refs",
                 ));
             }
@@ -2700,7 +2671,7 @@ impl RebuildStore {
         &self,
         permit: &TaskWritePermit,
         completion: &ShadowPairCompletion,
-    ) -> RebuildStoreResult<ShadowPairWriteResult> {
+    ) -> StoreResult<ShadowPairWriteResult> {
         completion.validate()?;
         let pair_key = completion.pair_key()?;
         let subject_id = completion.subject.subject_id();
@@ -2718,7 +2689,7 @@ impl RebuildStore {
                 transaction.commit()?;
                 return Ok(ShadowPairWriteResult::Existing(existing));
             }
-            return Err(RebuildStoreError::ShadowPairConflict(pair_key.to_string()));
+            return Err(StoreError::ShadowPairConflict(pair_key.to_string()));
         }
 
         let completion_cursor = append_event(
@@ -2767,10 +2738,10 @@ impl RebuildStore {
     pub fn record_policy_evaluation(
         &self,
         commit: &PolicyEvaluationCommit,
-    ) -> RebuildStoreResult<PolicyEvaluationResult> {
+    ) -> StoreResult<PolicyEvaluationResult> {
         commit.subject.validate()?;
         if !commit.subject.accepts_state(commit.from) || !commit.subject.accepts_state(commit.to) {
-            return Err(RebuildStoreError::InvalidLearningCommit(
+            return Err(StoreError::InvalidLearningCommit(
                 "policy_evaluation.subject_state",
             ));
         }
@@ -2785,27 +2756,27 @@ impl RebuildStore {
             read_policy_evaluation(&transaction, &commit.evaluation.artifact_id)?
         {
             if !same_policy_evaluation(&existing, commit) {
-                return Err(RebuildStoreError::PolicyEvaluationConflict(
+                return Err(StoreError::PolicyEvaluationConflict(
                     commit.evaluation.artifact_id.to_string(),
                 ));
             }
             if let Some(candidate_policy) = &commit.candidate_policy {
                 let stored = read_artifact(&transaction, &candidate_policy.artifact_id)?;
                 if stored != *candidate_policy {
-                    return Err(RebuildStoreError::PolicyEvaluationConflict(
+                    return Err(StoreError::PolicyEvaluationConflict(
                         commit.evaluation.artifact_id.to_string(),
                     ));
                 }
             }
             let consumption = read_policy_consumption_head(&transaction, &commit.subject)?
                 .ok_or_else(|| {
-                    RebuildStoreError::Integrity(format!(
+                    StoreError::Integrity(format!(
                         "policy evaluation {} has no consumption head",
                         commit.evaluation.artifact_id
                     ))
                 })?;
             if consumption.consumed_pair_cursor < existing.consumed_pair_cursor {
-                return Err(RebuildStoreError::Integrity(format!(
+                return Err(StoreError::Integrity(format!(
                     "policy evaluation {} consumption cursor regressed",
                     commit.evaluation.artifact_id
                 )));
@@ -2825,10 +2796,10 @@ impl RebuildStore {
         let previous = read_policy_head(&transaction, &commit.subject)?;
         match &previous {
             Some(head) if head.state != commit.from => {
-                return Err(RebuildStoreError::PolicyHeadMismatch(subject_id));
+                return Err(StoreError::PolicyHeadMismatch(subject_id));
             }
             None if commit.subject.initial_state() != commit.from => {
-                return Err(RebuildStoreError::PolicyHeadMismatch(subject_id));
+                return Err(StoreError::PolicyHeadMismatch(subject_id));
             }
             _ => {}
         }
@@ -2836,18 +2807,16 @@ impl RebuildStore {
             Some(transition) => {
                 if commit.from == commit.to || !is_allowed_policy_transition(commit.from, commit.to)
                 {
-                    return Err(RebuildStoreError::InvalidLearningCommit(
-                        "policy_transition.path",
-                    ));
+                    return Err(StoreError::InvalidLearningCommit("policy_transition.path"));
                 }
                 if read_policy_transition(&transaction, &transition.transition_id)?.is_some() {
-                    return Err(RebuildStoreError::PolicyTransitionConflict(
+                    return Err(StoreError::PolicyTransitionConflict(
                         transition.transition_id.to_string(),
                     ));
                 }
             }
             None if commit.from != commit.to => {
-                return Err(RebuildStoreError::InvalidLearningCommit(
+                return Err(StoreError::InvalidLearningCommit(
                     "policy_evaluation.noop_state",
                 ));
             }
@@ -3041,9 +3010,9 @@ impl RebuildStore {
         permit: &TaskWritePermit,
         status: TaskStatus,
         now: DateTime<Utc>,
-    ) -> RebuildStoreResult<()> {
+    ) -> StoreResult<()> {
         if !status.is_terminal() {
-            return Err(RebuildStoreError::TaskNotRunnable(permit.task_id.clone()));
+            return Err(StoreError::TaskNotRunnable(permit.task_id.clone()));
         }
         let mut connection = self.connection.lock().expect("store connection poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -3054,7 +3023,7 @@ impl RebuildStore {
         Ok(())
     }
 
-    pub fn recover_expired_tasks(&self, now: DateTime<Utc>) -> RebuildStoreResult<u64> {
+    pub fn recover_expired_tasks(&self, now: DateTime<Utc>) -> StoreResult<u64> {
         let mut connection = self.connection.lock().expect("store connection poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let expired = {
@@ -3157,7 +3126,7 @@ impl RebuildStore {
         Ok(expired.len() as u64)
     }
 
-    pub fn artifact(&self, artifact_id: &ArtifactId) -> RebuildStoreResult<Artifact> {
+    pub fn artifact(&self, artifact_id: &ArtifactId) -> StoreResult<Artifact> {
         let connection = self.connection.lock().expect("store connection poisoned");
         read_artifact(&connection, artifact_id)
     }
@@ -3169,7 +3138,7 @@ impl RebuildStore {
         &self,
         run_id: &RunId,
         task_id: &TaskId,
-    ) -> RebuildStoreResult<Vec<Artifact>> {
+    ) -> StoreResult<Vec<Artifact>> {
         let connection = self.connection.lock().expect("store connection poisoned");
         let attempt_id = connection
             .query_row(
@@ -3186,7 +3155,7 @@ impl RebuildStore {
                 |row| row.get::<_, String>(0),
             )
             .optional()?
-            .ok_or_else(|| RebuildStoreError::CommittedOutputTask {
+            .ok_or_else(|| StoreError::CommittedOutputTask {
                 run_id: run_id.clone(),
                 task_id: task_id.clone(),
             })?;
@@ -3203,10 +3172,10 @@ impl RebuildStore {
         &self,
         run_id: &RunId,
         task_id: &TaskId,
-    ) -> RebuildStoreResult<Vec<Artifact>> {
+    ) -> StoreResult<Vec<Artifact>> {
         match self.committed_task_outputs(run_id, task_id) {
             Ok(artifacts) => Ok(artifacts),
-            Err(RebuildStoreError::CommittedOutputAttempt { .. }) => Ok(Vec::new()),
+            Err(StoreError::CommittedOutputAttempt { .. }) => Ok(Vec::new()),
             Err(error) => Err(error),
         }
     }
@@ -3215,7 +3184,7 @@ impl RebuildStore {
         &self,
         task_id: &TaskId,
         attempt_id: &AttemptId,
-    ) -> RebuildStoreResult<Vec<Artifact>> {
+    ) -> StoreResult<Vec<Artifact>> {
         let connection = self.connection.lock().expect("store connection poisoned");
         read_committed_attempt_outputs(&connection, None, task_id, attempt_id)
     }
@@ -3224,7 +3193,7 @@ impl RebuildStore {
         &self,
         source_artifact_id: &ArtifactId,
         kind: Option<ArtifactKind>,
-    ) -> RebuildStoreResult<Vec<Artifact>> {
+    ) -> StoreResult<Vec<Artifact>> {
         let connection = self.connection.lock().expect("store connection poisoned");
         let kind = kind.map(enum_name);
         self.verify_contract_catalogue_history(&connection)?;
@@ -3251,10 +3220,7 @@ impl RebuildStore {
     /// Return the newest immutable artifact of a kind. Mutable state such as
     /// execution freeze is represented as an append-only artifact history;
     /// callers never receive a writable row handle.
-    pub fn latest_artifact_by_kind(
-        &self,
-        kind: ArtifactKind,
-    ) -> RebuildStoreResult<Option<Artifact>> {
+    pub fn latest_artifact_by_kind(&self, kind: ArtifactKind) -> StoreResult<Option<Artifact>> {
         let connection = self.connection.lock().expect("store connection poisoned");
         let artifact_id = connection
             .query_row(
@@ -3273,7 +3239,7 @@ impl RebuildStore {
 
     /// Returns the durable purpose recorded with a run. Learning uses this
     /// instead of accepting a caller-provided purpose flag.
-    pub fn run_purpose(&self, run_id: &RunId) -> RebuildStoreResult<RunPurpose> {
+    pub fn run_purpose(&self, run_id: &RunId) -> StoreResult<RunPurpose> {
         let connection = self.connection.lock().expect("store connection poisoned");
         let purpose = connection
             .query_row(
@@ -3282,7 +3248,7 @@ impl RebuildStore {
                 |row| row.get::<_, String>(0),
             )
             .optional()?
-            .ok_or_else(|| RebuildStoreError::MissingRun(run_id.clone()))?;
+            .ok_or_else(|| StoreError::MissingRun(run_id.clone()))?;
         parse_enum(&purpose)
     }
 
@@ -3290,7 +3256,7 @@ impl RebuildStore {
         &self,
         run_id: &RunId,
         revision: u64,
-    ) -> RebuildStoreResult<WorkflowRevision> {
+    ) -> StoreResult<WorkflowRevision> {
         let connection = self.connection.lock().expect("store connection poisoned");
         self.workflow_revision_with_connection(&connection, run_id, revision)
     }
@@ -3300,7 +3266,7 @@ impl RebuildStore {
         connection: &Connection,
         run_id: &RunId,
         revision: u64,
-    ) -> RebuildStoreResult<WorkflowRevision> {
+    ) -> StoreResult<WorkflowRevision> {
         let row = connection
             .query_row(
                 r#"SELECT revision, graph_artifact_id, created_at
@@ -3316,14 +3282,14 @@ impl RebuildStore {
                 },
             )
             .optional()?
-            .ok_or_else(|| RebuildStoreError::MissingWorkflowRevision {
+            .ok_or_else(|| StoreError::MissingWorkflowRevision {
                 run_id: run_id.clone(),
                 revision,
             })?;
         self.hydrate_workflow_revision(connection, row)
     }
 
-    pub fn workflow_snapshot(&self, run_id: &RunId) -> RebuildStoreResult<WorkflowSnapshot> {
+    pub fn workflow_snapshot(&self, run_id: &RunId) -> StoreResult<WorkflowSnapshot> {
         let connection = self.connection.lock().expect("store connection poisoned");
         self.workflow_snapshot_with_connection(&connection, run_id)
     }
@@ -3332,7 +3298,7 @@ impl RebuildStore {
         &self,
         connection: &Connection,
         run_id: &RunId,
-    ) -> RebuildStoreResult<WorkflowSnapshot> {
+    ) -> StoreResult<WorkflowSnapshot> {
         let run_row = connection
             .query_row(
                 r#"SELECT purpose, topology_id, graph_artifact_id, status, created_at, finished_at
@@ -3350,9 +3316,9 @@ impl RebuildStore {
                 },
             )
             .optional()?
-            .ok_or_else(|| RebuildStoreError::MissingRun(run_id.clone()))?;
+            .ok_or_else(|| StoreError::MissingRun(run_id.clone()))?;
         let (purpose, topology_id, graph_artifact_id, status, created_at, finished_at) = run_row;
-        let run = RebuildRun {
+        let run = StoredRun {
             run_id: run_id.clone(),
             purpose: parse_enum(&purpose)?,
             topology_id,
@@ -3375,13 +3341,13 @@ impl RebuildStore {
             )
             .optional()?
             .ok_or_else(|| {
-                RebuildStoreError::Integrity(format!("run {run_id} has no workflow revision"))
+                StoreError::Integrity(format!("run {run_id} has no workflow revision"))
             })?;
         let revision = self.hydrate_workflow_revision(connection, revision_row)?;
         if revision.graph_artifact.artifact_id != run.graph_artifact_id
             || revision.graph.topology_id != run.topology_id
         {
-            return Err(RebuildStoreError::WorkflowGraphMismatch);
+            return Err(StoreError::WorkflowGraphMismatch);
         }
 
         let raw_tasks = connection
@@ -3425,7 +3391,7 @@ impl RebuildStore {
         ) in raw_tasks
         {
             if task_run_id != *run_id {
-                return Err(RebuildStoreError::WorkflowGraphMismatch);
+                return Err(StoreError::WorkflowGraphMismatch);
             }
             node.dependencies = task_dependencies(connection, &node.task_id)?;
             let task_status = parse_task_status(&task_status)?;
@@ -3452,7 +3418,7 @@ impl RebuildStore {
                         )
                         .optional()?
                         .ok_or_else(|| {
-                            RebuildStoreError::Integrity(format!(
+                            StoreError::Integrity(format!(
                                 "active attempt {attempt_id} does not exist"
                             ))
                         })?;
@@ -3463,7 +3429,7 @@ impl RebuildStore {
                         || attempt.4 != worker_id
                         || attempt.5 != "running"
                     {
-                        return Err(RebuildStoreError::Integrity(format!(
+                        return Err(StoreError::Integrity(format!(
                             "active attempt {attempt_id} does not match task {}",
                             node.task_id
                         )));
@@ -3484,7 +3450,7 @@ impl RebuildStore {
                 }
                 (None, None, None, None) if task_status != TaskStatus::Running => None,
                 _ => {
-                    return Err(RebuildStoreError::Integrity(format!(
+                    return Err(StoreError::Integrity(format!(
                         "task {} has partial active attempt state",
                         node.task_id
                     )))
@@ -3511,7 +3477,7 @@ impl RebuildStore {
             .map(|task| (task.node.task_id.clone(), task.node.clone()))
             .collect::<std::collections::BTreeMap<_, _>>();
         if graph_nodes != stored_nodes {
-            return Err(RebuildStoreError::WorkflowGraphMismatch);
+            return Err(StoreError::WorkflowGraphMismatch);
         }
         let event_cursor = connection.query_row(
             "SELECT COALESCE(MAX(event_id), 0) FROM rebuild_events WHERE run_id = ?1",
@@ -3541,13 +3507,12 @@ impl RebuildStore {
         &self,
         connection: &Connection,
         row: (i64, String, String),
-    ) -> RebuildStoreResult<WorkflowRevision> {
-        let revision = u64::try_from(row.0).map_err(|_| {
-            RebuildStoreError::Integrity(format!("invalid workflow revision {}", row.0))
-        })?;
+    ) -> StoreResult<WorkflowRevision> {
+        let revision = u64::try_from(row.0)
+            .map_err(|_| StoreError::Integrity(format!("invalid workflow revision {}", row.0)))?;
         let graph_artifact = read_artifact(connection, &ArtifactId(ContentHash::new(row.1)?))?;
         if graph_artifact.kind != ArtifactKind::WorkflowGraph {
-            return Err(RebuildStoreError::InvalidWorkflowGraphArtifact);
+            return Err(StoreError::InvalidWorkflowGraphArtifact);
         }
         let graph: WorkflowGraph = serde_json::from_slice(&self.read_blob(&graph_artifact.blob)?)?;
         graph.validate()?;
@@ -3563,7 +3528,7 @@ impl RebuildStore {
         &self,
         connection: &Connection,
         snapshot: &WorkflowSnapshot,
-    ) -> RebuildStoreResult<()> {
+    ) -> StoreResult<()> {
         let mut previous: Option<WorkflowRevision> = None;
         for revision_number in 0..=snapshot.revision.revision {
             let revision = self.workflow_revision_with_connection(
@@ -3572,7 +3537,7 @@ impl RebuildStore {
                 revision_number,
             )?;
             if revision.graph.topology_id != snapshot.run.topology_id {
-                return Err(RebuildStoreError::WorkflowGraphMismatch);
+                return Err(StoreError::WorkflowGraphMismatch);
             }
             if let Some(previous) = &previous {
                 if revision.created_at < previous.created_at
@@ -3587,20 +3552,20 @@ impl RebuildStore {
                         .iter()
                         .any(|reference| reference.kind == ArtifactKind::WorkflowProposal)
                 {
-                    return Err(RebuildStoreError::WorkflowGraphMismatch);
+                    return Err(StoreError::WorkflowGraphMismatch);
                 }
             }
             previous = Some(revision);
         }
         if previous.as_ref() != Some(&snapshot.revision) {
-            return Err(RebuildStoreError::WorkflowGraphMismatch);
+            return Err(StoreError::WorkflowGraphMismatch);
         }
         Ok(())
     }
 
     /// Reads the current policy head without exposing mutable storage to
     /// callers. Previous policy versions remain in `rebuild_policy_transitions`.
-    pub fn policy_head(&self, subject: &PolicySubject) -> RebuildStoreResult<Option<PolicyHead>> {
+    pub fn policy_head(&self, subject: &PolicySubject) -> StoreResult<Option<PolicyHead>> {
         subject.validate()?;
         let connection = self.connection.lock().expect("store connection poisoned");
         read_policy_head(&connection, subject)
@@ -3612,7 +3577,7 @@ impl RebuildStore {
     pub fn policy_shadow_pair_snapshot(
         &self,
         subject: &PolicySubject,
-    ) -> RebuildStoreResult<PolicyShadowPairSnapshot> {
+    ) -> StoreResult<PolicyShadowPairSnapshot> {
         subject.validate()?;
         let mut connection = self.connection.lock().expect("store connection poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
@@ -3635,7 +3600,7 @@ impl RebuildStore {
     pub fn recorded_policy_influence_subject(
         &self,
         artifact_id: &ArtifactId,
-    ) -> RebuildStoreResult<Option<PolicySubject>> {
+    ) -> StoreResult<Option<PolicySubject>> {
         let connection = self.connection.lock().expect("store connection poisoned");
         let mut statement = connection.prepare(
             r#"SELECT subject_id, subject_json, 'experience'
@@ -3665,13 +3630,13 @@ impl RebuildStore {
                 _ => unreachable!("query emits fixed influence kinds"),
             };
             if artifact.kind != expected_kind {
-                return Err(RebuildStoreError::Integrity(format!(
+                return Err(StoreError::Integrity(format!(
                     "policy influence {artifact_id} has invalid kind"
                 )));
             }
             let subject = parse_persisted_subject(&subject_id, &subject_json)?;
             if resolved.as_ref().is_some_and(|current| current != &subject) {
-                return Err(RebuildStoreError::Integrity(format!(
+                return Err(StoreError::Integrity(format!(
                     "policy influence {artifact_id} has conflicting subjects"
                 )));
             }
@@ -3686,7 +3651,7 @@ impl RebuildStore {
     pub fn policy_transitions(
         &self,
         subject: &PolicySubject,
-    ) -> RebuildStoreResult<Vec<PolicyTransitionRecord>> {
+    ) -> StoreResult<Vec<PolicyTransitionRecord>> {
         subject.validate()?;
         let connection = self.connection.lock().expect("store connection poisoned");
         read_policy_transitions(&connection, subject)
@@ -3697,7 +3662,7 @@ impl RebuildStore {
         run_id: &RunId,
         after: i64,
         limit: usize,
-    ) -> RebuildStoreResult<Vec<StoredRebuildEvent>> {
+    ) -> StoreResult<Vec<StoredEvent>> {
         let connection = self.connection.lock().expect("store connection poisoned");
         let mut statement = connection.prepare(
             r#"SELECT event_id, run_id, task_id, attempt_id, event_type, artifact_id, created_at
@@ -3705,7 +3670,7 @@ impl RebuildStore {
                ORDER BY event_id ASC LIMIT ?3"#,
         )?;
         let rows = statement.query_map(params![run_id.0, after, limit as i64], |row| {
-            Ok(StoredRebuildEvent {
+            Ok(StoredEvent {
                 cursor: row.get(0)?,
                 run_id: RunId(row.get(1)?),
                 task_id: row.get::<_, Option<String>>(2)?.map(TaskId),
@@ -3726,15 +3691,13 @@ impl RebuildStore {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    pub fn verify_integrity(&self) -> RebuildStoreResult<()> {
+    pub fn verify_integrity(&self) -> StoreResult<()> {
         let connection = self.connection.lock().expect("store connection poisoned");
         let fk = connection
             .query_row("PRAGMA foreign_key_check", [], |_| Ok(()))
             .optional()?;
         if fk.is_some() {
-            return Err(RebuildStoreError::Integrity(
-                "foreign key check failed".to_owned(),
-            ));
+            return Err(StoreError::Integrity("foreign key check failed".to_owned()));
         }
         let invalid_attempt_output = connection
             .query_row(
@@ -3757,7 +3720,7 @@ impl RebuildStore {
             )
             .optional()?;
         if invalid_attempt_output.is_some() {
-            return Err(RebuildStoreError::Integrity(
+            return Err(StoreError::Integrity(
                 "attempt output has invalid terminal-event lineage".to_owned(),
             ));
         }
@@ -3800,13 +3763,13 @@ impl RebuildStore {
             .collect::<Result<Vec<_>, _>>()?;
         for (lease_name, owner_id, epoch, expires_at, heartbeat_at) in leases {
             if lease_name.trim().is_empty() || owner_id.trim().is_empty() || epoch == 0 {
-                return Err(RebuildStoreError::Integrity(format!(
+                return Err(StoreError::Integrity(format!(
                     "invalid daemon lease {lease_name}"
                 )));
             }
             let expires_at = parse_time(&expires_at)?;
             if parse_time(&heartbeat_at)? > expires_at {
-                return Err(RebuildStoreError::Integrity(format!(
+                return Err(StoreError::Integrity(format!(
                     "daemon lease {lease_name} heartbeat exceeds expiry"
                 )));
             }
@@ -3843,14 +3806,14 @@ impl RebuildStore {
         ) in slots
         {
             if session_key.trim().is_empty() || scheduler_epoch == 0 {
-                return Err(RebuildStoreError::Integrity(format!(
+                return Err(StoreError::Integrity(format!(
                     "invalid session slot {session_key}"
                 )));
             }
             let graph_artifact_id = ArtifactId(ContentHash::new(graph_artifact_id)?);
             let graph_artifact = read_artifact(&connection, &graph_artifact_id)?;
             if graph_artifact.kind != ArtifactKind::WorkflowGraph {
-                return Err(RebuildStoreError::Integrity(format!(
+                return Err(StoreError::Integrity(format!(
                     "session slot {session_key} graph kind is invalid"
                 )));
             }
@@ -3858,7 +3821,7 @@ impl RebuildStore {
                 serde_json::from_slice(&self.read_blob(&graph_artifact.blob)?)?;
             graph.validate()?;
             if graph.topology_id != topology_id {
-                return Err(RebuildStoreError::Integrity(format!(
+                return Err(StoreError::Integrity(format!(
                     "session slot {session_key} graph topology mismatch"
                 )));
             }
@@ -3867,7 +3830,7 @@ impl RebuildStore {
             match (commitment_artifact_id, committed_at) {
                 (None, None) => {}
                 (Some(_), None) | (None, Some(_)) => {
-                    return Err(RebuildStoreError::Integrity(format!(
+                    return Err(StoreError::Integrity(format!(
                         "session slot {session_key} has incomplete commitment state"
                     )));
                 }
@@ -3876,7 +3839,7 @@ impl RebuildStore {
                         ArtifactId(ContentHash::new(commitment_artifact_id)?);
                     let commitment_artifact = read_artifact(&connection, &commitment_artifact_id)?;
                     if commitment_artifact.kind != ArtifactKind::ExecutionCommitment {
-                        return Err(RebuildStoreError::Integrity(format!(
+                        return Err(StoreError::Integrity(format!(
                             "session slot {session_key} commitment kind is invalid"
                         )));
                     }
@@ -3891,7 +3854,7 @@ impl RebuildStore {
                         &session_key,
                     )
                     .map_err(|error| {
-                        RebuildStoreError::Integrity(format!(
+                        StoreError::Integrity(format!(
                             "session slot {session_key} commitment lineage is invalid: {error}"
                         ))
                     })?;
@@ -3923,7 +3886,7 @@ impl RebuildStore {
             if commitment_artifact.kind != ArtifactKind::ExecutionCommitment
                 || reprice_artifact.kind != ArtifactKind::ExecutionReprice
             {
-                return Err(RebuildStoreError::Integrity(
+                return Err(StoreError::Integrity(
                     "execution reprice artifact kind is invalid".to_owned(),
                 ));
             }
@@ -3944,7 +3907,7 @@ impl RebuildStore {
                     .iter()
                     .any(|source| source == &reprice.prior_receipt)
             {
-                return Err(RebuildStoreError::Integrity(
+                return Err(StoreError::Integrity(
                     "execution reprice provenance is invalid".to_owned(),
                 ));
             }
@@ -3955,7 +3918,7 @@ impl RebuildStore {
                     .iter()
                     .any(|source| source == &reprice.commitment)
             {
-                return Err(RebuildStoreError::Integrity(
+                return Err(StoreError::Integrity(
                     "execution reprice prior receipt is invalid".to_owned(),
                 ));
             }
@@ -3968,7 +3931,7 @@ impl RebuildStore {
                 || commitment.client_order_ids.get(&reprice.asset)
                     != Some(&reprice.prior_client_order_id)
             {
-                return Err(RebuildStoreError::Integrity(
+                return Err(StoreError::Integrity(
                     "execution reprice receipt lineage is invalid".to_owned(),
                 ));
             }
@@ -3981,7 +3944,7 @@ impl RebuildStore {
                 )
                 .optional()?;
             if durable.is_none() {
-                return Err(RebuildStoreError::Integrity(
+                return Err(StoreError::Integrity(
                     "execution reprice commitment is not durable".to_owned(),
                 ));
             }
@@ -4009,7 +3972,7 @@ impl RebuildStore {
             heads
         {
             if subject_id.trim().is_empty() || revision == 0 {
-                return Err(RebuildStoreError::Integrity(format!(
+                return Err(StoreError::Integrity(format!(
                     "policy head {subject_id} is invalid"
                 )));
             }
@@ -4017,7 +3980,7 @@ impl RebuildStore {
             let transition =
                 read_policy_transition(&connection, &PolicyTransitionId(transition_id.clone()))?
                     .ok_or_else(|| {
-                        RebuildStoreError::Integrity(format!(
+                        StoreError::Integrity(format!(
                     "policy head {subject_id} references missing transition {transition_id}"
                 ))
                     })?;
@@ -4027,7 +3990,7 @@ impl RebuildStore {
                 || transition.transition_cursor != transition_cursor
                 || transition.transition.created_at != parse_time(&updated_at)?
             {
-                return Err(RebuildStoreError::Integrity(format!(
+                return Err(StoreError::Integrity(format!(
                     "policy head {subject_id} disagrees with its transition"
                 )));
             }
@@ -4038,7 +4001,7 @@ impl RebuildStore {
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?)),
             )?;
             if latest != (transition_id.clone(), revision) {
-                return Err(RebuildStoreError::Integrity(format!(
+                return Err(StoreError::Integrity(format!(
                     "policy head {subject_id} is stale"
                 )));
             }
@@ -4047,7 +4010,7 @@ impl RebuildStore {
             if evaluation.kind != ArtifactKind::Evaluation
                 || artifact_run_purpose(&connection, &evaluation)? != RunPurpose::Paper
             {
-                return Err(RebuildStoreError::Integrity(format!(
+                return Err(StoreError::Integrity(format!(
                     "policy transition {transition_id} is not Paper-backed"
                 )));
             }
@@ -4062,7 +4025,7 @@ impl RebuildStore {
             )
             .optional()?;
         if let Some(transition_id) = orphan_transition {
-            return Err(RebuildStoreError::Integrity(format!(
+            return Err(StoreError::Integrity(format!(
                 "policy transition {transition_id} has no head"
             )));
         }
@@ -4075,17 +4038,17 @@ impl RebuildStore {
         for value in pair_keys {
             let pair_key = ContentHash::new(value)?;
             let pair = read_shadow_pair(&connection, &pair_key)?.ok_or_else(|| {
-                RebuildStoreError::Integrity(format!("shadow pair {pair_key} disappeared"))
+                StoreError::Integrity(format!("shadow pair {pair_key} disappeared"))
             })?;
             pair.completion.validate()?;
             if pair.completion.pair_key()? != pair_key {
-                return Err(RebuildStoreError::Integrity(format!(
+                return Err(StoreError::Integrity(format!(
                     "shadow pair {pair_key} key mismatch"
                 )));
             }
             self.assert_shadow_pair_sources_with_connection(&connection, &pair.completion)
                 .map_err(|error| {
-                    RebuildStoreError::Integrity(format!(
+                    StoreError::Integrity(format!(
                         "shadow pair {pair_key} lineage is invalid: {error}"
                     ))
                 })?;
@@ -4101,9 +4064,7 @@ impl RebuildStore {
             )
             .optional()?;
         if let Some(task_id) = orphan {
-            return Err(RebuildStoreError::Integrity(format!(
-                "task {task_id} has no run"
-            )));
+            return Err(StoreError::Integrity(format!("task {task_id} has no run")));
         }
         let run_ids = connection
             .prepare("SELECT run_id FROM rebuild_runs ORDER BY run_id")?
@@ -4120,7 +4081,7 @@ impl RebuildStore {
         Ok(())
     }
 
-    fn verify_outcome_schedule_history(&self, connection: &Connection) -> RebuildStoreResult<()> {
+    fn verify_outcome_schedule_history(&self, connection: &Connection) -> StoreResult<()> {
         let artifact_ids = connection
             .prepare(
                 "SELECT artifact_id FROM rebuild_artifacts WHERE kind = ?1 ORDER BY artifact_id",
@@ -4140,43 +4101,43 @@ impl RebuildStore {
                         vec![RunPurpose::Paper, RunPurpose::Shadow],
                     ),
                     purpose => {
-                        return Err(RebuildStoreError::Integrity(format!(
+                        return Err(StoreError::Integrity(format!(
                             "outcome schedule {artifact_id} has invalid run purpose {purpose:?}"
                         )));
                     }
                 };
             if artifact.lifecycle != expected_lifecycle {
-                return Err(RebuildStoreError::Integrity(format!(
+                return Err(StoreError::Integrity(format!(
                     "outcome schedule {artifact_id} has invalid lifecycle"
                 )));
             }
             let schedule: OutcomeSchedule =
                 serde_json::from_slice(&self.read_blob(&artifact.blob)?).map_err(|error| {
-                    RebuildStoreError::Integrity(format!(
+                    StoreError::Integrity(format!(
                         "outcome schedule {artifact_id} has invalid payload: {error}"
                     ))
                 })?;
             schedule.validate().map_err(|error| {
-                RebuildStoreError::Integrity(format!(
+                StoreError::Integrity(format!(
                     "outcome schedule {artifact_id} fails validation: {error}"
                 ))
             })?;
             let expected_sources = outcome_schedule_source_refs(&schedule);
             if !has_exact_source_refs(&artifact, &expected_sources) {
-                return Err(RebuildStoreError::Integrity(format!(
+                return Err(StoreError::Integrity(format!(
                     "outcome schedule {artifact_id} has invalid source closure"
                 )));
             }
             for reference in &expected_sources {
                 let source = read_artifact(connection, &reference.artifact_id)?;
                 if source.kind != reference.kind {
-                    return Err(RebuildStoreError::Integrity(format!(
+                    return Err(StoreError::Integrity(format!(
                         "outcome schedule {artifact_id} source kind is invalid"
                     )));
                 }
                 assert_artifact_from_allowed_purposes(connection, &source, &allowed_purposes)
                     .map_err(|error| {
-                        RebuildStoreError::Integrity(format!(
+                        StoreError::Integrity(format!(
                             "outcome schedule {artifact_id} source origin is invalid: {error}"
                         ))
                     })?;
@@ -4187,7 +4148,7 @@ impl RebuildStore {
                 &allowed_purposes,
             )
             .map_err(|error| {
-                RebuildStoreError::Integrity(format!(
+                StoreError::Integrity(format!(
                     "outcome schedule {artifact_id} execution lineage is invalid: {error}"
                 ))
             })?;
@@ -4195,7 +4156,7 @@ impl RebuildStore {
         Ok(())
     }
 
-    fn verify_contract_catalogue_history(&self, connection: &Connection) -> RebuildStoreResult<()> {
+    fn verify_contract_catalogue_history(&self, connection: &Connection) -> StoreResult<()> {
         let installations = connection
             .prepare(
                 "SELECT contract_hash, contract_artifact_id, contract_id, contract_version, purpose, baseline_contract_hash FROM rebuild_contract_installations ORDER BY installed_at, contract_hash",
@@ -4217,7 +4178,7 @@ impl RebuildStore {
             let stored = self
                 .stored_contract_with_connection(connection, &contract_hash)?
                 .ok_or_else(|| {
-                    RebuildStoreError::Integrity(format!(
+                    StoreError::Integrity(format!(
                         "contract installation {contract_hash} disappeared"
                     ))
                 })?;
@@ -4231,7 +4192,7 @@ impl RebuildStore {
                     .map(ContentHash::as_str)
                     != baseline.as_deref()
             {
-                return Err(RebuildStoreError::Integrity(format!(
+                return Err(StoreError::Integrity(format!(
                     "contract installation {contract_hash} metadata disagrees with payload"
                 )));
             }
@@ -4239,12 +4200,12 @@ impl RebuildStore {
                 let baseline_contract = self
                     .stored_contract_with_connection(connection, baseline_hash)?
                     .ok_or_else(|| {
-                        RebuildStoreError::Integrity(format!(
+                        StoreError::Integrity(format!(
                             "candidate contract {contract_hash} has missing baseline {baseline_hash}"
                         ))
                     })?;
                 if !candidate_is_bounded(&baseline_contract.contract, &stored.contract) {
-                    return Err(RebuildStoreError::Integrity(format!(
+                    return Err(StoreError::Integrity(format!(
                         "candidate contract {contract_hash} exceeds its installed baseline"
                     )));
                 }
@@ -4272,17 +4233,17 @@ impl RebuildStore {
             let previous = previous.map(ContentHash::new).transpose()?;
             let expected_previous = latest.get(&purpose).map(|(_, hash)| hash.clone());
             if previous != expected_previous {
-                return Err(RebuildStoreError::Integrity(format!(
+                return Err(StoreError::Integrity(format!(
                     "contract activation {activation_id} is not the next history entry for {purpose}"
                 )));
             }
             let contract = contracts.get(&contract_hash).ok_or_else(|| {
-                RebuildStoreError::Integrity(format!(
+                StoreError::Integrity(format!(
                     "contract activation {activation_id} references unknown contract {contract_hash}"
                 ))
             })?;
             if contract.contract.purpose.as_str() != purpose {
-                return Err(RebuildStoreError::Integrity(format!(
+                return Err(StoreError::Integrity(format!(
                     "contract activation {activation_id} purpose disagrees with its contract"
                 )));
             }
@@ -4292,7 +4253,7 @@ impl RebuildStore {
                     let transition =
                         read_policy_transition(connection, &PolicyTransitionId(transition_id))?
                             .ok_or_else(|| {
-                                RebuildStoreError::Integrity(format!(
+                                StoreError::Integrity(format!(
                                     "contract activation {activation_id} has no policy transition"
                                 ))
                             })?;
@@ -4311,18 +4272,18 @@ impl RebuildStore {
                                 .and_then(|candidate| candidate.baseline_contract_hash.as_ref())
                                 .cloned()
                                 .ok_or_else(|| {
-                                    RebuildStoreError::Integrity(format!(
+                                    StoreError::Integrity(format!(
                                         "contract activation {activation_id} rollback has no baseline"
                                     ))
                                 })?;
                     if !promoted && !rolled_back {
-                        return Err(RebuildStoreError::Integrity(format!(
+                        return Err(StoreError::Integrity(format!(
                             "contract activation {activation_id} is not a valid promotion or rollback"
                         )));
                     }
                 }
                 _ => {
-                    return Err(RebuildStoreError::Integrity(format!(
+                    return Err(StoreError::Integrity(format!(
                         "contract activation {activation_id} has an invalid history binding"
                     )));
                 }
@@ -4343,14 +4304,14 @@ impl RebuildStore {
             })?
             .collect::<Result<Vec<_>, _>>()?;
         if heads.len() != latest.len() {
-            return Err(RebuildStoreError::Integrity(
+            return Err(StoreError::Integrity(
                 "contract catalogue head count disagrees with activation history".to_owned(),
             ));
         }
         for (purpose, contract_hash, activation_id) in heads {
             let contract_hash = ContentHash::new(contract_hash)?;
             if latest.get(&purpose) != Some(&(activation_id, contract_hash)) {
-                return Err(RebuildStoreError::Integrity(format!(
+                return Err(StoreError::Integrity(format!(
                     "contract catalogue head for {purpose} is stale"
                 )));
             }
@@ -4358,7 +4319,7 @@ impl RebuildStore {
         Ok(())
     }
 
-    fn verify_policy_evaluation_history(&self, connection: &Connection) -> RebuildStoreResult<()> {
+    fn verify_policy_evaluation_history(&self, connection: &Connection) -> StoreResult<()> {
         let evaluation_ids = connection
             .prepare(
                 "SELECT evaluation_artifact_id FROM rebuild_policy_evaluations \
@@ -4372,7 +4333,7 @@ impl RebuildStore {
             let evaluation_artifact_id = ArtifactId(ContentHash::new(value)?);
             let stored =
                 read_policy_evaluation(connection, &evaluation_artifact_id)?.ok_or_else(|| {
-                    RebuildStoreError::Integrity(format!(
+                    StoreError::Integrity(format!(
                         "policy evaluation {evaluation_artifact_id} disappeared"
                     ))
                 })?;
@@ -4380,7 +4341,7 @@ impl RebuildStore {
             if !stored.subject.accepts_state(stored.from)
                 || !stored.subject.accepts_state(stored.to)
             {
-                return Err(RebuildStoreError::Integrity(format!(
+                return Err(StoreError::Integrity(format!(
                     "policy evaluation {evaluation_artifact_id} has incompatible subject state"
                 )));
             }
@@ -4392,7 +4353,7 @@ impl RebuildStore {
             if stored.from != expected_from
                 || stored.consumed_pair_cursor < previous_consumed_cursor
             {
-                return Err(RebuildStoreError::Integrity(format!(
+                return Err(StoreError::Integrity(format!(
                     "policy evaluation {evaluation_artifact_id} breaks subject history"
                 )));
             }
@@ -4409,7 +4370,7 @@ impl RebuildStore {
                     || artifact.lifecycle != ArtifactLifecycle::Canonical
                     || artifact_run_purpose(connection, artifact)? != RunPurpose::Paper
                 {
-                    return Err(RebuildStoreError::Integrity(format!(
+                    return Err(StoreError::Integrity(format!(
                         "policy evaluation {evaluation_artifact_id} has invalid canonical artifact"
                     )));
                 }
@@ -4447,7 +4408,7 @@ impl RebuildStore {
                 || evaluation.outcome != outcome_ref
                 || evaluation.experience != experience_ref
             {
-                return Err(RebuildStoreError::Integrity(format!(
+                return Err(StoreError::Integrity(format!(
                     "policy evaluation {evaluation_artifact_id} lineage is invalid"
                 )));
             }
@@ -4455,12 +4416,12 @@ impl RebuildStore {
             match (&stored.subject, &stored.candidate_policy_artifact_id) {
                 (PolicySubject::Memory(_), None) => {}
                 (PolicySubject::Memory(_), Some(_)) => {
-                    return Err(RebuildStoreError::Integrity(format!(
+                    return Err(StoreError::Integrity(format!(
                         "policy evaluation {evaluation_artifact_id} binds a memory candidate"
                     )));
                 }
                 (PolicySubject::Contract(_) | PolicySubject::Topology(_), None) => {
-                    return Err(RebuildStoreError::Integrity(format!(
+                    return Err(StoreError::Integrity(format!(
                         "policy evaluation {evaluation_artifact_id} has no candidate policy"
                     )));
                 }
@@ -4470,7 +4431,7 @@ impl RebuildStore {
                         || candidate.lifecycle != ArtifactLifecycle::Canonical
                         || artifact_run_purpose(connection, &candidate)? != RunPurpose::Paper
                     {
-                        return Err(RebuildStoreError::Integrity(format!(
+                        return Err(StoreError::Integrity(format!(
                             "policy evaluation {evaluation_artifact_id} has invalid candidate policy"
                         )));
                     }
@@ -4481,7 +4442,7 @@ impl RebuildStore {
                 Some(transition_id) => {
                     let transition = read_policy_transition(connection, transition_id)?
                         .ok_or_else(|| {
-                            RebuildStoreError::Integrity(format!(
+                            StoreError::Integrity(format!(
                                 "policy evaluation {evaluation_artifact_id} references missing transition {transition_id}"
                             ))
                         })?;
@@ -4492,13 +4453,13 @@ impl RebuildStore {
                             != stored.evaluation_artifact_id
                         || transition.run_id != stored.run_id
                     {
-                        return Err(RebuildStoreError::Integrity(format!(
+                        return Err(StoreError::Integrity(format!(
                             "policy evaluation {evaluation_artifact_id} disagrees with transition {transition_id}"
                         )));
                     }
                 }
                 None if stored.from != stored.to => {
-                    return Err(RebuildStoreError::Integrity(format!(
+                    return Err(StoreError::Integrity(format!(
                         "policy evaluation {evaluation_artifact_id} changed state without transition"
                     )));
                 }
@@ -4521,7 +4482,7 @@ impl RebuildStore {
                 )
                 .optional()?
                 .ok_or_else(|| {
-                    RebuildStoreError::Integrity(format!(
+                    StoreError::Integrity(format!(
                         "policy evaluation {evaluation_artifact_id} has no durable event"
                     ))
                 })?;
@@ -4530,7 +4491,7 @@ impl RebuildStore {
                 || event.2.as_deref() != Some(stored.evaluation_artifact_id.0.as_str())
                 || parse_time(&event.3)? != stored.completed_at
             {
-                return Err(RebuildStoreError::Integrity(format!(
+                return Err(StoreError::Integrity(format!(
                     "policy evaluation {evaluation_artifact_id} event is invalid"
                 )));
             }
@@ -4539,7 +4500,7 @@ impl RebuildStore {
                 || (stored.consumed_pair_cursor != 0
                     && stored.consumed_pair_cursor >= stored.event_cursor)
             {
-                return Err(RebuildStoreError::Integrity(format!(
+                return Err(StoreError::Integrity(format!(
                     "policy evaluation {evaluation_artifact_id} consumed invalid shadow cursor"
                 )));
             }
@@ -4554,7 +4515,7 @@ impl RebuildStore {
                     .optional()?
                     .is_some();
                 if !boundary_exists {
-                    return Err(RebuildStoreError::Integrity(format!(
+                    return Err(StoreError::Integrity(format!(
                         "policy evaluation {evaluation_artifact_id} consumed non-pair cursor"
                     )));
                 }
@@ -4572,7 +4533,7 @@ impl RebuildStore {
             let subject: PolicySubject = serde_json::from_str(&subject_json)?;
             subject.validate()?;
             let head = read_policy_consumption_head(connection, &subject)?.ok_or_else(|| {
-                RebuildStoreError::Integrity(format!(
+                StoreError::Integrity(format!(
                     "policy consumption head {} disappeared",
                     subject.subject_id()
                 ))
@@ -4586,7 +4547,7 @@ impl RebuildStore {
             let latest =
                 read_policy_evaluation(connection, &ArtifactId(ContentHash::new(latest_id)?))?
                     .ok_or_else(|| {
-                        RebuildStoreError::Integrity(format!(
+                        StoreError::Integrity(format!(
                             "policy consumption head {} has no evaluation",
                             subject.subject_id()
                         ))
@@ -4597,7 +4558,7 @@ impl RebuildStore {
                 || head.evaluation_cursor != latest.event_cursor
                 || head.updated_at != latest.completed_at
             {
-                return Err(RebuildStoreError::Integrity(format!(
+                return Err(StoreError::Integrity(format!(
                     "policy consumption head {} does not match latest evaluation",
                     subject.subject_id()
                 )));
@@ -4616,7 +4577,7 @@ impl RebuildStore {
             )
             .optional()?;
         if let Some(evaluation_id) = orphan_evaluation {
-            return Err(RebuildStoreError::Integrity(format!(
+            return Err(StoreError::Integrity(format!(
                 "policy evaluation {evaluation_id} has no consumption head"
             )));
         }
@@ -4624,7 +4585,7 @@ impl RebuildStore {
         Ok(())
     }
 
-    fn verify_candidate_policy_history(&self, connection: &Connection) -> RebuildStoreResult<()> {
+    fn verify_candidate_policy_history(&self, connection: &Connection) -> StoreResult<()> {
         let artifact_ids = connection
             .prepare(
                 "SELECT artifact_id FROM rebuild_artifacts WHERE kind = ?1 ORDER BY artifact_id",
@@ -4637,12 +4598,12 @@ impl RebuildStore {
             let artifact_id = ArtifactId(ContentHash::new(value)?);
             let artifact = read_artifact(connection, &artifact_id)?;
             if artifact.lifecycle != ArtifactLifecycle::Canonical {
-                return Err(RebuildStoreError::Integrity(format!(
+                return Err(StoreError::Integrity(format!(
                     "candidate policy {artifact_id} is noncanonical"
                 )));
             }
             assert_artifact_from_paper_with_connection(connection, &artifact).map_err(|error| {
-                RebuildStoreError::Integrity(format!(
+                StoreError::Integrity(format!(
                     "candidate policy {artifact_id} has invalid origin: {error}"
                 ))
             })?;
@@ -4656,14 +4617,14 @@ impl RebuildStore {
                     policy.source_evaluation.clone(),
                 ],
             ) {
-                return Err(RebuildStoreError::Integrity(format!(
+                return Err(StoreError::Integrity(format!(
                     "candidate policy {artifact_id} has invalid source closure"
                 )));
             }
             let evaluation =
                 read_policy_evaluation(connection, &policy.source_evaluation.artifact_id)?
                     .ok_or_else(|| {
-                        RebuildStoreError::Integrity(format!(
+                        StoreError::Integrity(format!(
                             "candidate policy {artifact_id} has no source evaluation"
                         ))
                     })?;
@@ -4671,13 +4632,13 @@ impl RebuildStore {
                 || evaluation.completed_at != policy.created_at
                 || evaluation.candidate_policy_artifact_id.as_ref() != Some(&artifact_id)
             {
-                return Err(RebuildStoreError::Integrity(format!(
+                return Err(StoreError::Integrity(format!(
                     "candidate policy {artifact_id} disagrees with source evaluation"
                 )));
             }
             self.validate_candidate_policy_sources(connection, &policy)
                 .map_err(|error| {
-                    RebuildStoreError::Integrity(format!(
+                    StoreError::Integrity(format!(
                         "candidate policy {artifact_id} has invalid binding: {error}"
                     ))
                 })?;
@@ -4689,7 +4650,7 @@ impl RebuildStore {
         &self,
         connection: &Connection,
         commit: &PolicyEvaluationCommit,
-    ) -> RebuildStoreResult<()> {
+    ) -> StoreResult<()> {
         for (artifact, kind) in [
             (&commit.outcome, ArtifactKind::Outcome),
             (&commit.experience, ArtifactKind::Experience),
@@ -4698,7 +4659,7 @@ impl RebuildStore {
             artifact.validate()?;
             self.read_blob(&artifact.blob)?;
             if artifact.kind != kind || artifact.lifecycle != ArtifactLifecycle::Canonical {
-                return Err(RebuildStoreError::InvalidLearningCommit(
+                return Err(StoreError::InvalidLearningCommit(
                     "learning_artifact.kind_or_lifecycle",
                 ));
             }
@@ -4709,7 +4670,7 @@ impl RebuildStore {
             if candidate_policy.kind != ArtifactKind::CandidatePolicy
                 || candidate_policy.lifecycle != ArtifactLifecycle::Canonical
             {
-                return Err(RebuildStoreError::InvalidLearningCommit(
+                return Err(StoreError::InvalidLearningCommit(
                     "candidate_policy.kind_or_lifecycle",
                 ));
             }
@@ -4717,7 +4678,7 @@ impl RebuildStore {
         let outcome: Outcome = self.read_artifact_payload(&commit.outcome)?;
         outcome.validate()?;
         if !outcome.is_sealed() {
-            return Err(RebuildStoreError::UnsealedOutcome(
+            return Err(StoreError::UnsealedOutcome(
                 commit.outcome.artifact_id.clone(),
             ));
         }
@@ -4739,7 +4700,7 @@ impl RebuildStore {
         {
             let source = read_artifact(connection, &reference.artifact_id)?;
             if source.kind != reference.kind {
-                return Err(RebuildStoreError::InvalidLearningCommit(
+                return Err(StoreError::InvalidLearningCommit(
                     "learning_artifact.source_kind",
                 ));
             }
@@ -4761,12 +4722,12 @@ impl RebuildStore {
         match (&commit.subject, &commit.candidate_policy) {
             (PolicySubject::Memory(_), None) => {}
             (PolicySubject::Memory(_), Some(_)) => {
-                return Err(RebuildStoreError::InvalidLearningCommit(
+                return Err(StoreError::InvalidLearningCommit(
                     "candidate_policy.memory_subject",
                 ));
             }
             (PolicySubject::Contract(_) | PolicySubject::Topology(_), None) => {
-                return Err(RebuildStoreError::InvalidLearningCommit(
+                return Err(StoreError::InvalidLearningCommit(
                     "candidate_policy.missing",
                 ));
             }
@@ -4785,16 +4746,14 @@ impl RebuildStore {
                         ],
                     )
                 {
-                    return Err(RebuildStoreError::InvalidLearningCommit(
-                        "candidate_policy.links",
-                    ));
+                    return Err(StoreError::InvalidLearningCommit("candidate_policy.links"));
                 }
                 self.validate_candidate_policy_sources(connection, &candidate_policy)?;
             }
         }
         commit.subject.validate()?;
         if !commit.subject.accepts_state(commit.from) || !commit.subject.accepts_state(commit.to) {
-            return Err(RebuildStoreError::InvalidLearningCommit(
+            return Err(StoreError::InvalidLearningCommit(
                 "policy_evaluation.subject_state",
             ));
         }
@@ -4819,9 +4778,7 @@ impl RebuildStore {
             || experience.decision_context != schedule.decision_context
             || experience.execution_context != schedule.execution_context
         {
-            return Err(RebuildStoreError::InvalidLearningCommit(
-                "learning_artifact.links",
-            ));
+            return Err(StoreError::InvalidLearningCommit("learning_artifact.links"));
         }
         if !has_exact_source_refs(
             &commit.outcome,
@@ -4841,7 +4798,7 @@ impl RebuildStore {
             &commit.evaluation,
             &[evaluation.outcome.clone(), evaluation.experience.clone()],
         ) {
-            return Err(RebuildStoreError::InvalidLearningCommit(
+            return Err(StoreError::InvalidLearningCommit(
                 "learning_artifact.source_refs",
             ));
         }
@@ -4852,20 +4809,20 @@ impl RebuildStore {
         &self,
         connection: &Connection,
         policy: &CandidatePolicy,
-    ) -> RebuildStoreResult<()> {
+    ) -> StoreResult<()> {
         let baseline =
             read_required_artifact(connection, &policy.baseline, "candidate_policy.baseline")?;
         let candidate =
             read_required_artifact(connection, &policy.candidate, "candidate_policy.candidate")?;
         match &policy.subject {
-            PolicySubject::Memory(_) => Err(RebuildStoreError::InvalidLearningCommit(
+            PolicySubject::Memory(_) => Err(StoreError::InvalidLearningCommit(
                 "candidate_policy.memory_subject",
             )),
             PolicySubject::Contract(candidate_hash) => {
                 if baseline.lifecycle != ArtifactLifecycle::Canonical
                     || candidate.lifecycle != ArtifactLifecycle::Canonical
                 {
-                    return Err(RebuildStoreError::InvalidLearningCommit(
+                    return Err(StoreError::InvalidLearningCommit(
                         "candidate_policy.contract_lifecycle",
                     ));
                 }
@@ -4876,7 +4833,7 @@ impl RebuildStore {
                 if &candidate_contract.contract_hash != candidate_hash
                     || !baseline_contract.permits_candidate(&candidate_contract)
                 {
-                    return Err(RebuildStoreError::InvalidLearningCommit(
+                    return Err(StoreError::InvalidLearningCommit(
                         "candidate_policy.contract_binding",
                     ));
                 }
@@ -4893,7 +4850,7 @@ impl RebuildStore {
                     || workflow_graph_run_purpose(connection, &candidate.artifact_id)?
                         != RunPurpose::Shadow
                 {
-                    return Err(RebuildStoreError::InvalidLearningCommit(
+                    return Err(StoreError::InvalidLearningCommit(
                         "candidate_policy.topology_binding",
                     ));
                 }
@@ -4906,7 +4863,7 @@ impl RebuildStore {
         &self,
         connection: &Connection,
         completion: &ShadowPairCompletion,
-    ) -> RebuildStoreResult<()> {
+    ) -> StoreResult<()> {
         let parent_decision = read_required_artifact(
             connection,
             &completion.parent_decision,
@@ -4962,17 +4919,14 @@ impl RebuildStore {
             || parent_schedule.execution_context != completion.execution_context
             || candidate_schedule.execution_context != completion.execution_context
         {
-            return Err(RebuildStoreError::InvalidLearningCommit(
+            return Err(StoreError::InvalidLearningCommit(
                 "shadow_pair.schedule_binding",
             ));
         }
         Ok(())
     }
 
-    fn read_artifact_payload<T: DeserializeOwned>(
-        &self,
-        artifact: &Artifact,
-    ) -> RebuildStoreResult<T> {
+    fn read_artifact_payload<T: DeserializeOwned>(&self, artifact: &Artifact) -> StoreResult<T> {
         Ok(serde_json::from_slice(&self.read_blob(&artifact.blob)?)?)
     }
 
@@ -4981,15 +4935,13 @@ impl RebuildStore {
         connection: &Connection,
         outcome: &Outcome,
         allowed_purposes: &[RunPurpose],
-    ) -> RebuildStoreResult<OutcomeSchedule> {
+    ) -> StoreResult<OutcomeSchedule> {
         if outcome.schedule.kind != ArtifactKind::OutcomeSchedule {
-            return Err(RebuildStoreError::InvalidLearningCommit(
-                "outcome.schedule_kind",
-            ));
+            return Err(StoreError::InvalidLearningCommit("outcome.schedule_kind"));
         }
         let schedule_artifact = read_artifact(connection, &outcome.schedule.artifact_id)?;
         if schedule_artifact.kind != ArtifactKind::OutcomeSchedule {
-            return Err(RebuildStoreError::InvalidLearningCommit(
+            return Err(StoreError::InvalidLearningCommit(
                 "outcome.schedule_artifact",
             ));
         }
@@ -4998,13 +4950,13 @@ impl RebuildStore {
             RunPurpose::Paper => ArtifactLifecycle::Canonical,
             RunPurpose::Shadow => ArtifactLifecycle::RunScoped,
             _ => {
-                return Err(RebuildStoreError::InvalidLearningCommit(
+                return Err(StoreError::InvalidLearningCommit(
                     "outcome.schedule_artifact",
                 ));
             }
         };
         if schedule_artifact.lifecycle != expected_lifecycle {
-            return Err(RebuildStoreError::InvalidLearningCommit(
+            return Err(StoreError::InvalidLearningCommit(
                 "outcome.schedule_artifact",
             ));
         }
@@ -5013,21 +4965,21 @@ impl RebuildStore {
             serde_json::from_slice(&self.read_blob(&schedule_artifact.blob)?)?;
         schedule.validate()?;
         if schedule.outcome_id != outcome.outcome_id {
-            return Err(RebuildStoreError::InvalidLearningCommit(
+            return Err(StoreError::InvalidLearningCommit(
                 "outcome.schedule_identity",
             ));
         }
 
         let expected = outcome_schedule_source_refs(&schedule);
         if !has_exact_source_refs(&schedule_artifact, &expected) {
-            return Err(RebuildStoreError::InvalidLearningCommit(
+            return Err(StoreError::InvalidLearningCommit(
                 "outcome_schedule.source_refs",
             ));
         }
         for reference in &expected {
             let artifact = read_artifact(connection, &reference.artifact_id)?;
             if artifact.kind != reference.kind {
-                return Err(RebuildStoreError::InvalidLearningCommit(
+                return Err(StoreError::InvalidLearningCommit(
                     "outcome_schedule.source_kind",
                 ));
             }
@@ -5042,7 +4994,7 @@ impl RebuildStore {
         connection: &Connection,
         schedule: &OutcomeSchedule,
         allowed_purposes: &[RunPurpose],
-    ) -> RebuildStoreResult<()> {
+    ) -> StoreResult<()> {
         let verdict_ref = match &schedule.execution {
             OutcomeExecutionLineage::NoOrder { execution_verdict } => execution_verdict,
             OutcomeExecutionLineage::ReconciledPaper {
@@ -5051,7 +5003,7 @@ impl RebuildStore {
         };
         let verdict_artifact = read_artifact(connection, &verdict_ref.artifact_id)?;
         if verdict_artifact.kind != ArtifactKind::ExecutionVerdict {
-            return Err(RebuildStoreError::InvalidLearningCommit(
+            return Err(StoreError::InvalidLearningCommit(
                 "outcome_schedule.execution_verdict_kind",
             ));
         }
@@ -5072,7 +5024,7 @@ impl RebuildStore {
                     .iter()
                     .any(|reference| reference == &schedule.execution_context)
                 {
-                    return Err(RebuildStoreError::InvalidLearningCommit(
+                    return Err(StoreError::InvalidLearningCommit(
                         "outcome_schedule.no_order_context",
                     ));
                 }
@@ -5089,7 +5041,7 @@ impl RebuildStore {
             {
                 let commitment_artifact = read_artifact(connection, &commitment.artifact_id)?;
                 if commitment_artifact.kind != ArtifactKind::ExecutionCommitment {
-                    return Err(RebuildStoreError::InvalidLearningCommit(
+                    return Err(StoreError::InvalidLearningCommit(
                         "outcome_schedule.commitment_kind",
                     ));
                 }
@@ -5107,7 +5059,7 @@ impl RebuildStore {
                         .iter()
                         .any(|reference| reference == execution_verdict)
                 {
-                    return Err(RebuildStoreError::InvalidLearningCommit(
+                    return Err(StoreError::InvalidLearningCommit(
                         "outcome_schedule.commitment_lineage",
                     ));
                 }
@@ -5115,7 +5067,7 @@ impl RebuildStore {
                 let reconciliation_artifact =
                     read_artifact(connection, &reconciliation.artifact_id)?;
                 if reconciliation_artifact.kind != ArtifactKind::Reconciliation {
-                    return Err(RebuildStoreError::InvalidLearningCommit(
+                    return Err(StoreError::InvalidLearningCommit(
                         "outcome_schedule.reconciliation_kind",
                     ));
                 }
@@ -5133,13 +5085,13 @@ impl RebuildStore {
                         .iter()
                         .any(|reference| reference == commitment)
                 {
-                    return Err(RebuildStoreError::InvalidLearningCommit(
+                    return Err(StoreError::InvalidLearningCommit(
                         "outcome_schedule.reconciliation_lineage",
                     ));
                 }
             }
             _ => {
-                return Err(RebuildStoreError::InvalidLearningCommit(
+                return Err(StoreError::InvalidLearningCommit(
                     "outcome_schedule.execution_lineage",
                 ));
             }
@@ -5152,7 +5104,7 @@ impl RebuildStore {
     }
 }
 
-fn initialize(connection: &mut Connection, root: &Path) -> RebuildStoreResult<()> {
+fn initialize(connection: &mut Connection, root: &Path) -> StoreResult<()> {
     connection.execute_batch(
         "CREATE TABLE IF NOT EXISTS rebuild_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
     )?;
@@ -5170,11 +5122,11 @@ fn initialize(connection: &mut Connection, root: &Path) -> RebuildStoreResult<()
             "candidate_policy_artifact_id",
         )?
     {
-        return Err(RebuildStoreError::IncompatibleStoreRoot(root.to_path_buf()));
+        return Err(StoreError::IncompatibleStoreRoot(root.to_path_buf()));
     }
     if let Some(value) = version.as_deref() {
-        if value != REBUILD_SCHEMA_VERSION.to_string() {
-            return Err(RebuildStoreError::IncompatibleStoreRoot(PathBuf::from(
+        if value != V2_SCHEMA_VERSION.to_string() {
+            return Err(StoreError::IncompatibleStoreRoot(PathBuf::from(
                 DATABASE_FILE,
             )));
         }
@@ -5402,12 +5354,12 @@ COMMIT;",
         "rebuild_policy_evaluations",
         "candidate_policy_artifact_id",
     )? {
-        return Err(RebuildStoreError::IncompatibleStoreRoot(root.to_path_buf()));
+        return Err(StoreError::IncompatibleStoreRoot(root.to_path_buf()));
     }
     if version.is_none() {
         connection.execute(
             "INSERT INTO rebuild_metadata (key, value) VALUES ('schema_version', ?1)",
-            params![REBUILD_SCHEMA_VERSION.to_string()],
+            params![V2_SCHEMA_VERSION.to_string()],
         )?;
     }
     Ok(())
@@ -5417,7 +5369,7 @@ fn table_has_column(
     connection: &Connection,
     table: &str,
     required_column: &str,
-) -> RebuildStoreResult<bool> {
+) -> StoreResult<bool> {
     let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
     let columns = statement
         .query_map([], |row| row.get::<_, String>(1))?
@@ -5428,7 +5380,7 @@ fn table_has_column(
 fn contract_catalogue_head(
     connection: &Connection,
     purpose: &ContractPurpose,
-) -> RebuildStoreResult<Option<(ContentHash, i64)>> {
+) -> StoreResult<Option<(ContentHash, i64)>> {
     let row = connection
         .query_row(
             "SELECT contract_hash, activation_id FROM rebuild_contract_catalogue_heads WHERE purpose = ?1",
@@ -5443,7 +5395,7 @@ fn contract_catalogue_head(
 fn assert_contract_identity_available(
     connection: &Connection,
     contract: &AgentContract,
-) -> RebuildStoreResult<()> {
+) -> StoreResult<()> {
     let existing = connection
         .query_row(
             "SELECT contract_hash FROM rebuild_contract_installations WHERE contract_id = ?1 AND contract_version = ?2",
@@ -5452,7 +5404,7 @@ fn assert_contract_identity_available(
         )
         .optional()?;
     if existing.is_some() {
-        return Err(RebuildStoreError::DuplicateContractVersion {
+        return Err(StoreError::DuplicateContractVersion {
             contract_id: contract.contract_id.clone(),
             version: contract.version,
         });
@@ -5466,7 +5418,7 @@ fn insert_contract_installation(
     artifact: &Artifact,
     baseline_contract_hash: Option<&ContentHash>,
     installed_at: DateTime<Utc>,
-) -> RebuildStoreResult<()> {
+) -> StoreResult<()> {
     transaction.execute(
         r#"INSERT INTO rebuild_contract_installations
            (contract_hash, contract_artifact_id, contract_id, contract_version, purpose,
@@ -5492,7 +5444,7 @@ fn append_contract_activation(
     contract_hash: &ContentHash,
     policy_transition_id: Option<&PolicyTransitionId>,
     activated_at: DateTime<Utc>,
-) -> RebuildStoreResult<i64> {
+) -> StoreResult<i64> {
     transaction.execute(
         r#"INSERT INTO rebuild_contract_activations
            (purpose, previous_contract_hash, contract_hash, policy_transition_id, activated_at)
@@ -5513,7 +5465,7 @@ fn set_contract_catalogue_head(
     purpose: &ContractPurpose,
     contract_hash: &ContentHash,
     activation_id: i64,
-) -> RebuildStoreResult<()> {
+) -> StoreResult<()> {
     transaction.execute(
         r#"INSERT INTO rebuild_contract_catalogue_heads (purpose, contract_hash, activation_id)
            VALUES (?1, ?2, ?3)
@@ -5534,7 +5486,7 @@ fn candidate_is_bounded(active: &AgentContract, candidate: &AgentContract) -> bo
         && candidate.termination.max_depth <= active.termination.max_depth
 }
 
-fn insert_artifact(transaction: &Transaction<'_>, artifact: &Artifact) -> RebuildStoreResult<()> {
+fn insert_artifact(transaction: &Transaction<'_>, artifact: &Artifact) -> StoreResult<()> {
     artifact.validate()?;
     for source in &artifact.source_refs {
         let exists = transaction
@@ -5545,7 +5497,7 @@ fn insert_artifact(transaction: &Transaction<'_>, artifact: &Artifact) -> Rebuil
             )
             .optional()?;
         if exists.as_deref() != Some(&enum_name(source.kind)) {
-            return Err(RebuildStoreError::InvalidArtifactClosure(
+            return Err(StoreError::InvalidArtifactClosure(
                 artifact.artifact_id.clone(),
             ));
         }
@@ -5570,7 +5522,7 @@ fn insert_artifact(transaction: &Transaction<'_>, artifact: &Artifact) -> Rebuil
     if inserted == 0 {
         let existing = read_artifact(transaction, &artifact.artifact_id)?;
         if &existing != artifact {
-            return Err(RebuildStoreError::Integrity(format!(
+            return Err(StoreError::Integrity(format!(
                 "artifact hash collision {}",
                 artifact.artifact_id.0
             )));
@@ -5595,16 +5547,13 @@ fn insert_artifact(transaction: &Transaction<'_>, artifact: &Artifact) -> Rebuil
 /// Inserts a completion batch in source-closure order. A task may create a
 /// RawEvidence artifact and its NormalizedEvidence dependent in the same
 /// atomic attempt; callers need not rely on input ordering for correctness.
-fn insert_artifact_batch(
-    transaction: &Transaction<'_>,
-    artifacts: &[Artifact],
-) -> RebuildStoreResult<()> {
+fn insert_artifact_batch(transaction: &Transaction<'_>, artifacts: &[Artifact]) -> StoreResult<()> {
     let mut pending = BTreeMap::<ArtifactId, &Artifact>::new();
     for artifact in artifacts {
         artifact.validate()?;
         if let Some(existing) = pending.insert(artifact.artifact_id.clone(), artifact) {
             if existing != artifact {
-                return Err(RebuildStoreError::Integrity(format!(
+                return Err(StoreError::Integrity(format!(
                     "conflicting completion artifacts for {}",
                     artifact.artifact_id
                 )));
@@ -5623,7 +5572,7 @@ fn insert_artifact_batch(
             })
             .map(|(artifact_id, _)| artifact_id.clone());
         let Some(artifact_id) = ready else {
-            return Err(RebuildStoreError::InvalidArtifactClosure(
+            return Err(StoreError::InvalidArtifactClosure(
                 pending
                     .first_key_value()
                     .expect("pending batch is non-empty")
@@ -5642,7 +5591,7 @@ fn insert_artifact_batch(
 fn assert_workflow_input_artifacts(
     transaction: &Transaction<'_>,
     nodes: &[WorkflowNode],
-) -> RebuildStoreResult<()> {
+) -> StoreResult<()> {
     let mut visited = BTreeSet::new();
     for reference in nodes.iter().flat_map(|node| &node.input_artifacts) {
         assert_artifact_reference_closure(transaction, reference, &mut visited)?;
@@ -5654,10 +5603,10 @@ fn assert_artifact_reference_closure(
     transaction: &Transaction<'_>,
     reference: &ArtifactRef,
     visited: &mut BTreeSet<ArtifactId>,
-) -> RebuildStoreResult<()> {
+) -> StoreResult<()> {
     let artifact = read_artifact(transaction, &reference.artifact_id)?;
     if artifact.kind != reference.kind {
-        return Err(RebuildStoreError::InvalidArtifactClosure(
+        return Err(StoreError::InvalidArtifactClosure(
             reference.artifact_id.clone(),
         ));
     }
@@ -5675,7 +5624,7 @@ fn insert_task_node(
     run_id: &RunId,
     node: &WorkflowNode,
     created_at: DateTime<Utc>,
-) -> RebuildStoreResult<()> {
+) -> StoreResult<()> {
     let inserted = transaction.execute(
         r#"INSERT INTO rebuild_tasks
  (task_id, run_id, recipe_id, objective, contract_hash, priority, budget_json, retry_json, on_failure,
@@ -5697,15 +5646,12 @@ fn insert_task_node(
         ],
     )?;
     if inserted != 1 {
-        return Err(RebuildStoreError::DuplicateTask(node.task_id.clone()));
+        return Err(StoreError::DuplicateTask(node.task_id.clone()));
     }
     Ok(())
 }
 
-fn insert_node_dependencies(
-    transaction: &Transaction<'_>,
-    node: &WorkflowNode,
-) -> RebuildStoreResult<()> {
+fn insert_node_dependencies(transaction: &Transaction<'_>, node: &WorkflowNode) -> StoreResult<()> {
     for dependency in &node.dependencies {
         transaction.execute(
             "INSERT INTO rebuild_task_dependencies (task_id, depends_on_task_id) VALUES (?1, ?2)",
@@ -5715,7 +5661,7 @@ fn insert_node_dependencies(
     Ok(())
 }
 
-fn task_dependencies(connection: &Connection, task_id: &TaskId) -> RebuildStoreResult<Vec<TaskId>> {
+fn task_dependencies(connection: &Connection, task_id: &TaskId) -> StoreResult<Vec<TaskId>> {
     let dependencies = connection
         .prepare(
             "SELECT depends_on_task_id FROM rebuild_task_dependencies \
@@ -5726,10 +5672,7 @@ fn task_dependencies(connection: &Connection, task_id: &TaskId) -> RebuildStoreR
     Ok(dependencies)
 }
 
-fn assert_permit(
-    transaction: &Transaction<'_>,
-    permit: &TaskWritePermit,
-) -> RebuildStoreResult<()> {
+fn assert_permit(transaction: &Transaction<'_>, permit: &TaskWritePermit) -> StoreResult<()> {
     let current = transaction
         .query_row(
             r#"SELECT run_id, status, lease_id, lease_epoch, active_attempt_id, contract_hash
@@ -5748,7 +5691,7 @@ fn assert_permit(
         )
         .optional()?;
     let Some((run_id, status, lease_id, epoch, attempt_id, contract_hash)) = current else {
-        return Err(RebuildStoreError::MissingTask(permit.task_id.clone()));
+        return Err(StoreError::MissingTask(permit.task_id.clone()));
     };
     if run_id != permit.run_id.0
         || status != "running"
@@ -5757,7 +5700,7 @@ fn assert_permit(
         || attempt_id.as_deref() != Some(permit.attempt_id.0.as_str())
         || contract_hash.as_deref().map(ContentHash::new).transpose()? != permit.contract_hash
     {
-        return Err(RebuildStoreError::StalePermit(permit.task_id.clone()));
+        return Err(StoreError::StalePermit(permit.task_id.clone()));
     }
     Ok(())
 }
@@ -5766,7 +5709,7 @@ fn assert_daemon_lease(
     transaction: &Transaction<'_>,
     lease: &DaemonLease,
     now: DateTime<Utc>,
-) -> RebuildStoreResult<()> {
+) -> StoreResult<()> {
     let current = transaction
         .query_row(
             "SELECT owner_id, epoch, expires_at FROM rebuild_daemon_leases WHERE lease_name = ?1",
@@ -5781,10 +5724,10 @@ fn assert_daemon_lease(
         )
         .optional()?;
     let Some((owner_id, epoch, expires_at)) = current else {
-        return Err(RebuildStoreError::SchedulerFenced(lease.lease_name.clone()));
+        return Err(StoreError::SchedulerFenced(lease.lease_name.clone()));
     };
     if owner_id != lease.owner_id || epoch != lease.epoch || parse_time(&expires_at)? <= now {
-        return Err(RebuildStoreError::SchedulerFenced(lease.lease_name.clone()));
+        return Err(StoreError::SchedulerFenced(lease.lease_name.clone()));
     }
     Ok(())
 }
@@ -5792,16 +5735,16 @@ fn assert_daemon_lease(
 fn assert_origin_matches(
     origin: Option<&ArtifactOrigin>,
     permit: &TaskWritePermit,
-) -> RebuildStoreResult<()> {
+) -> StoreResult<()> {
     let Some(origin) = origin else {
-        return Err(RebuildStoreError::PermitOriginMismatch);
+        return Err(StoreError::PermitOriginMismatch);
     };
     if origin.run_id.as_ref() != Some(&permit.run_id)
         || origin.task_id.as_ref() != Some(&permit.task_id)
         || origin.attempt_id.as_ref() != Some(&permit.attempt_id)
         || origin.contract_hash != permit.contract_hash
     {
-        return Err(RebuildStoreError::PermitOriginMismatch);
+        return Err(StoreError::PermitOriginMismatch);
     }
     Ok(())
 }
@@ -5809,7 +5752,7 @@ fn assert_origin_matches(
 fn task_retry_policy(
     transaction: &Transaction<'_>,
     task_id: &TaskId,
-) -> RebuildStoreResult<(RetryPolicy, FailureDisposition)> {
+) -> StoreResult<(RetryPolicy, FailureDisposition)> {
     let (retry_json, on_failure) = transaction
         .query_row(
             "SELECT retry_json, on_failure FROM rebuild_tasks WHERE task_id = ?1",
@@ -5817,7 +5760,7 @@ fn task_retry_policy(
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )
         .optional()?
-        .ok_or_else(|| RebuildStoreError::MissingTask(task_id.clone()))?;
+        .ok_or_else(|| StoreError::MissingTask(task_id.clone()))?;
     Ok((serde_json::from_str(&retry_json)?, parse_enum(&on_failure)?))
 }
 
@@ -5827,7 +5770,7 @@ fn commit_attempt_transaction(
     artifacts: &[Artifact],
     status: TaskStatus,
     now: DateTime<Utc>,
-) -> RebuildStoreResult<()> {
+) -> StoreResult<()> {
     assert_permit(transaction, permit)?;
     let (_, on_failure) = task_retry_policy(transaction, &permit.task_id)?;
     for artifact in artifacts {
@@ -5868,7 +5811,7 @@ fn finish_permitted_task(
     on_failure: FailureDisposition,
     terminal_artifact_id: Option<&ArtifactId>,
     now: DateTime<Utc>,
-) -> RebuildStoreResult<TaskStatus> {
+) -> StoreResult<TaskStatus> {
     let status =
         if requested_status == TaskStatus::Failed && on_failure == FailureDisposition::SkipTask {
             TaskStatus::Skipped
@@ -5918,7 +5861,7 @@ fn cancel_queued_tasks(
     transaction: &Transaction<'_>,
     run_id: &RunId,
     now: DateTime<Utc>,
-) -> RebuildStoreResult<()> {
+) -> StoreResult<()> {
     let task_ids = {
         let mut statement = transaction.prepare(
             "SELECT task_id FROM rebuild_tasks WHERE run_id = ?1 AND status = 'queued' ORDER BY task_id",
@@ -5953,7 +5896,7 @@ fn cancel_failed_dependents(
     transaction: &Transaction<'_>,
     run_id: &RunId,
     now: DateTime<Utc>,
-) -> RebuildStoreResult<()> {
+) -> StoreResult<()> {
     loop {
         let task_ids = {
             let mut statement = transaction.prepare(
@@ -6005,7 +5948,7 @@ fn append_event(
     event_type: &str,
     artifact_id: Option<&ArtifactId>,
     created_at: DateTime<Utc>,
-) -> RebuildStoreResult<i64> {
+) -> StoreResult<i64> {
     transaction.execute(
         r#"INSERT INTO rebuild_events
            (run_id, task_id, attempt_id, event_type, artifact_id, created_at)
@@ -6027,7 +5970,7 @@ fn record_attempt_output(
     permit: &TaskWritePermit,
     artifact_id: &ArtifactId,
     event_id: i64,
-) -> RebuildStoreResult<()> {
+) -> StoreResult<()> {
     transaction.execute(
         r#"INSERT OR IGNORE INTO rebuild_attempt_outputs
             (attempt_id, task_id, artifact_id, event_id)
@@ -6047,7 +5990,7 @@ fn read_committed_attempt_outputs(
     expected_run_id: Option<&RunId>,
     task_id: &TaskId,
     attempt_id: &AttemptId,
-) -> RebuildStoreResult<Vec<Artifact>> {
+) -> StoreResult<Vec<Artifact>> {
     let attempt = connection
         .query_row(
             r#"SELECT a.run_id, a.task_id, a.status, t.status
@@ -6066,7 +6009,7 @@ fn read_committed_attempt_outputs(
         )
         .optional()?;
     let Some((attempt_run_id, attempt_task_id, attempt_status, task_status)) = attempt else {
-        return Err(RebuildStoreError::CommittedOutputAttempt {
+        return Err(StoreError::CommittedOutputAttempt {
             task_id: task_id.clone(),
             attempt_id: attempt_id.clone(),
         });
@@ -6076,7 +6019,7 @@ fn read_committed_attempt_outputs(
         || task_status != "succeeded"
         || expected_run_id.is_some_and(|run_id| attempt_run_id != run_id.0)
     {
-        return Err(RebuildStoreError::CommittedOutputAttempt {
+        return Err(StoreError::CommittedOutputAttempt {
             task_id: task_id.clone(),
             attempt_id: attempt_id.clone(),
         });
@@ -6101,7 +6044,7 @@ fn read_committed_attempt_outputs(
         })?
         .collect::<Result<Vec<_>, _>>()?;
     if ids.is_empty() {
-        return Err(RebuildStoreError::CommittedOutputAttempt {
+        return Err(StoreError::CommittedOutputAttempt {
             task_id: task_id.clone(),
             attempt_id: attempt_id.clone(),
         });
@@ -6116,7 +6059,7 @@ fn refresh_run_status(
     transaction: &Transaction<'_>,
     run_id: &RunId,
     now: DateTime<Utc>,
-) -> RebuildStoreResult<()> {
+) -> StoreResult<()> {
     let statuses = transaction
         .prepare("SELECT status FROM rebuild_tasks WHERE run_id = ?1")?
         .query_map(params![run_id.0], |row| row.get::<_, String>(0))?
@@ -6142,10 +6085,7 @@ fn refresh_run_status(
     Ok(())
 }
 
-fn read_artifact(
-    connection: &Connection,
-    artifact_id: &ArtifactId,
-) -> RebuildStoreResult<Artifact> {
+fn read_artifact(connection: &Connection, artifact_id: &ArtifactId) -> StoreResult<Artifact> {
     let row = connection
         .query_row(
             r#"SELECT kind, blob_hash, media_type, bytes, producer, lifecycle, provenance_json, origin_json, created_at
@@ -6169,7 +6109,7 @@ fn read_artifact(
     let Some((kind, hash, media_type, bytes, producer, lifecycle, provenance, origin, created_at)) =
         row
     else {
-        return Err(RebuildStoreError::MissingArtifact(artifact_id.clone()));
+        return Err(StoreError::MissingArtifact(artifact_id.clone()));
     };
     let mut statement = connection.prepare(
         r#"SELECT source_artifact_id, source_kind
@@ -6190,7 +6130,7 @@ fn read_artifact(
         })?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Artifact {
-        schema_version: REBUILD_SCHEMA_VERSION,
+        schema_version: V2_SCHEMA_VERSION,
         artifact_id: artifact_id.clone(),
         kind: parse_enum(&kind)?,
         blob: BlobRef {
@@ -6244,23 +6184,20 @@ fn row_to_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<(RunId, WorkflowNode
     ))
 }
 
-fn parse_time(value: &str) -> RebuildStoreResult<DateTime<Utc>> {
+fn parse_time(value: &str) -> StoreResult<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(value)
         .map(|value| value.with_timezone(&Utc))
-        .map_err(|error| RebuildStoreError::Integrity(format!("invalid time {value}: {error}")))
+        .map_err(|error| StoreError::Integrity(format!("invalid time {value}: {error}")))
 }
 
 /// The indexed subject ID is derived from this typed JSON, never accepted as
 /// an independent authority. A corrupt or hand-edited row must therefore
 /// fail closed rather than silently changing a policy namespace.
-fn parse_persisted_subject(
-    subject_id: &str,
-    subject_json: &str,
-) -> RebuildStoreResult<PolicySubject> {
+fn parse_persisted_subject(subject_id: &str, subject_json: &str) -> StoreResult<PolicySubject> {
     let subject: PolicySubject = serde_json::from_str(subject_json)?;
     subject.validate()?;
     if subject.subject_id() != subject_id {
-        return Err(RebuildStoreError::Integrity(format!(
+        return Err(StoreError::Integrity(format!(
             "policy subject JSON does not match indexed identity {subject_id}"
         )));
     }
@@ -6270,7 +6207,7 @@ fn parse_persisted_subject(
 fn read_policy_evaluation(
     connection: &Connection,
     evaluation_artifact_id: &ArtifactId,
-) -> RebuildStoreResult<Option<StoredPolicyEvaluation>> {
+) -> StoreResult<Option<StoredPolicyEvaluation>> {
     let row = connection
         .query_row(
             r#"SELECT subject_id, subject_json, outcome_artifact_id, experience_artifact_id,
@@ -6335,7 +6272,7 @@ fn read_policy_evaluation(
 fn read_policy_consumption_head(
     connection: &Connection,
     expected_subject: &PolicySubject,
-) -> RebuildStoreResult<Option<PolicyConsumptionHead>> {
+) -> StoreResult<Option<PolicyConsumptionHead>> {
     let subject_id = expected_subject.subject_id();
     let row = connection
         .query_row(
@@ -6366,7 +6303,7 @@ fn read_policy_consumption_head(
     };
     let subject = parse_persisted_subject(&subject_id, &subject_json)?;
     if &subject != expected_subject {
-        return Err(RebuildStoreError::Integrity(format!(
+        return Err(StoreError::Integrity(format!(
             "policy consumption head {subject_id} subject identity disagrees with lookup"
         )));
     }
@@ -6379,10 +6316,7 @@ fn read_policy_consumption_head(
     }))
 }
 
-fn max_shadow_pair_cursor(
-    connection: &Connection,
-    subject: &PolicySubject,
-) -> RebuildStoreResult<i64> {
+fn max_shadow_pair_cursor(connection: &Connection, subject: &PolicySubject) -> StoreResult<i64> {
     connection
         .query_row(
             "SELECT COALESCE(MAX(pair_event_cursor), 0) FROM rebuild_shadow_pairs WHERE subject_id = ?1",
@@ -6397,9 +6331,9 @@ fn shadow_pair_counts_between(
     subject: &PolicySubject,
     after_cursor: i64,
     through_cursor: i64,
-) -> RebuildStoreResult<[u64; 3]> {
+) -> StoreResult<[u64; 3]> {
     if after_cursor < 0 || through_cursor < after_cursor {
-        return Err(RebuildStoreError::InvalidLearningCommit(
+        return Err(StoreError::InvalidLearningCommit(
             "shadow_pair.snapshot_cursor",
         ));
     }
@@ -6425,17 +6359,17 @@ fn validate_policy_shadow_pair_snapshot(
     connection: &Connection,
     subject: &PolicySubject,
     snapshot: PolicyShadowPairSnapshot,
-) -> RebuildStoreResult<()> {
+) -> StoreResult<()> {
     let current_after = read_policy_consumption_head(connection, subject)?
         .map_or(0, |head| head.consumed_pair_cursor);
     if snapshot.after_cursor != current_after {
-        return Err(RebuildStoreError::InvalidLearningCommit(
+        return Err(StoreError::InvalidLearningCommit(
             "policy_evaluation.pair_snapshot_stale",
         ));
     }
     let current_max = max_shadow_pair_cursor(connection, subject)?;
     if snapshot.through_cursor < snapshot.after_cursor || snapshot.through_cursor > current_max {
-        return Err(RebuildStoreError::InvalidLearningCommit(
+        return Err(StoreError::InvalidLearningCommit(
             "policy_evaluation.pair_snapshot_boundary",
         ));
     }
@@ -6450,7 +6384,7 @@ fn validate_policy_shadow_pair_snapshot(
             .optional()?
             .is_some();
         if !boundary_exists {
-            return Err(RebuildStoreError::InvalidLearningCommit(
+            return Err(StoreError::InvalidLearningCommit(
                 "policy_evaluation.pair_snapshot_boundary",
             ));
         }
@@ -6462,14 +6396,14 @@ fn validate_policy_shadow_pair_snapshot(
         snapshot.through_cursor,
     )? != snapshot.counts_by_horizon
     {
-        return Err(RebuildStoreError::InvalidLearningCommit(
+        return Err(StoreError::InvalidLearningCommit(
             "policy_evaluation.pair_snapshot_counts",
         ));
     }
     Ok(())
 }
 
-fn reject_generic_learning_artifact(artifact: &Artifact) -> RebuildStoreResult<()> {
+fn reject_generic_learning_artifact(artifact: &Artifact) -> StoreResult<()> {
     if matches!(
         artifact.kind,
         ArtifactKind::Outcome
@@ -6477,7 +6411,7 @@ fn reject_generic_learning_artifact(artifact: &Artifact) -> RebuildStoreResult<(
             | ArtifactKind::Evaluation
             | ArtifactKind::CandidatePolicy
     ) {
-        return Err(RebuildStoreError::InvalidLearningCommit(
+        return Err(StoreError::InvalidLearningCommit(
             "learning_artifact.atomic_commit_required",
         ));
     }
@@ -6512,7 +6446,7 @@ fn same_policy_evaluation(
 fn read_policy_head(
     connection: &Connection,
     expected_subject: &PolicySubject,
-) -> RebuildStoreResult<Option<PolicyHead>> {
+) -> StoreResult<Option<PolicyHead>> {
     let subject_id = expected_subject.subject_id();
     let row = connection
         .query_row(
@@ -6536,7 +6470,7 @@ fn read_policy_head(
     };
     let subject = parse_persisted_subject(&subject_id, &subject_json)?;
     if &subject != expected_subject {
-        return Err(RebuildStoreError::Integrity(format!(
+        return Err(StoreError::Integrity(format!(
             "policy head {subject_id} subject identity disagrees with lookup"
         )));
     }
@@ -6553,7 +6487,7 @@ fn read_policy_head(
 fn read_policy_transition(
     connection: &Connection,
     transition_id: &PolicyTransitionId,
-) -> RebuildStoreResult<Option<PolicyTransitionRecord>> {
+) -> StoreResult<Option<PolicyTransitionRecord>> {
     let row = connection
         .query_row(
             r#"SELECT subject_id, subject_json, from_state_json, to_state_json,
@@ -6592,7 +6526,7 @@ fn read_policy_transition(
     let subject = parse_persisted_subject(&subject_id, &subject_json)?;
     Ok(Some(PolicyTransitionRecord {
         transition: PolicyTransition {
-            schema_version: REBUILD_SCHEMA_VERSION,
+            schema_version: V2_SCHEMA_VERSION,
             transition_id: transition_id.clone(),
             subject,
             from: serde_json::from_str(&from)?,
@@ -6612,7 +6546,7 @@ fn read_policy_transition(
 fn read_policy_transitions(
     connection: &Connection,
     expected_subject: &PolicySubject,
-) -> RebuildStoreResult<Vec<PolicyTransitionRecord>> {
+) -> StoreResult<Vec<PolicyTransitionRecord>> {
     let subject_id = expected_subject.subject_id();
     let mut statement = connection.prepare(
         r#"SELECT transition_id, subject_json, from_state_json, to_state_json,
@@ -6638,13 +6572,13 @@ fn read_policy_transitions(
         .map(|(transition_id, subject_json, from, to, evaluation_id, run_id, revision, created_at, transition_cursor)| {
             let subject = parse_persisted_subject(&subject_id, &subject_json)?;
             if &subject != expected_subject {
-                return Err(RebuildStoreError::Integrity(format!(
+                return Err(StoreError::Integrity(format!(
                     "policy transition {transition_id} subject identity disagrees with key {subject_id}"
                 )));
             }
             Ok(PolicyTransitionRecord {
                 transition: PolicyTransition {
-                    schema_version: REBUILD_SCHEMA_VERSION,
+                    schema_version: V2_SCHEMA_VERSION,
                     transition_id: PolicyTransitionId(transition_id),
                     subject,
                     from: serde_json::from_str(&from)?,
@@ -6666,7 +6600,7 @@ fn read_policy_transitions(
 fn read_shadow_pair(
     connection: &Connection,
     pair_key: &ContentHash,
-) -> RebuildStoreResult<Option<StoredShadowPair>> {
+) -> StoreResult<Option<StoredShadowPair>> {
     let row = connection
         .query_row(
             r#"SELECT subject_id, subject_json, parent_decision_artifact_id, execution_context_artifact_id,
@@ -6755,10 +6689,7 @@ fn same_shadow_pair(left: &ShadowPairCompletion, right: &ShadowPairCompletion) -
         && left.candidate_outcome == right.candidate_outcome
 }
 
-fn run_purpose_from_connection(
-    connection: &Connection,
-    run_id: &RunId,
-) -> RebuildStoreResult<RunPurpose> {
+fn run_purpose_from_connection(connection: &Connection, run_id: &RunId) -> StoreResult<RunPurpose> {
     let purpose = connection
         .query_row(
             "SELECT purpose FROM rebuild_runs WHERE run_id = ?1",
@@ -6766,14 +6697,14 @@ fn run_purpose_from_connection(
             |row| row.get::<_, String>(0),
         )
         .optional()?
-        .ok_or_else(|| RebuildStoreError::MissingRun(run_id.clone()))?;
+        .ok_or_else(|| StoreError::MissingRun(run_id.clone()))?;
     parse_enum(&purpose)
 }
 
 fn workflow_graph_run_purpose(
     connection: &Connection,
     artifact_id: &ArtifactId,
-) -> RebuildStoreResult<RunPurpose> {
+) -> StoreResult<RunPurpose> {
     let purpose = connection
         .query_row(
             "SELECT purpose FROM rebuild_runs WHERE graph_artifact_id = ?1",
@@ -6781,19 +6712,16 @@ fn workflow_graph_run_purpose(
             |row| row.get::<_, String>(0),
         )
         .optional()?
-        .ok_or_else(|| RebuildStoreError::MissingArtifact(artifact_id.clone()))?;
+        .ok_or_else(|| StoreError::MissingArtifact(artifact_id.clone()))?;
     parse_enum(&purpose)
 }
 
-fn artifact_run_purpose(
-    connection: &Connection,
-    artifact: &Artifact,
-) -> RebuildStoreResult<RunPurpose> {
+fn artifact_run_purpose(connection: &Connection, artifact: &Artifact) -> StoreResult<RunPurpose> {
     let run_id = artifact
         .origin
         .as_ref()
         .and_then(|origin| origin.run_id.as_ref())
-        .ok_or(RebuildStoreError::InvalidLearningCommit(
+        .ok_or(StoreError::InvalidLearningCommit(
             "learning_artifact.origin",
         ))?;
     run_purpose_from_connection(connection, run_id)
@@ -6803,15 +6731,15 @@ fn assert_artifact_from_allowed_purposes(
     connection: &Connection,
     artifact: &Artifact,
     allowed_purposes: &[RunPurpose],
-) -> RebuildStoreResult<()> {
+) -> StoreResult<()> {
     let purpose = artifact_run_purpose(connection, artifact)?;
     if allowed_purposes.contains(&purpose) {
         return Ok(());
     }
     if allowed_purposes == [RunPurpose::Paper] {
-        return Err(RebuildStoreError::NonCanonicalLearningPurpose(purpose));
+        return Err(StoreError::NonCanonicalLearningPurpose(purpose));
     }
-    Err(RebuildStoreError::InvalidLearningCommit(
+    Err(StoreError::InvalidLearningCommit(
         "learning_artifact.run_purpose",
     ))
 }
@@ -6819,14 +6747,14 @@ fn assert_artifact_from_allowed_purposes(
 fn assert_artifact_from_paper_with_connection(
     connection: &Connection,
     artifact: &Artifact,
-) -> RebuildStoreResult<()> {
+) -> StoreResult<()> {
     assert_artifact_from_allowed_purposes(connection, artifact, &[RunPurpose::Paper])
 }
 
-fn assert_paper_run(transaction: &Transaction<'_>, run_id: &RunId) -> RebuildStoreResult<()> {
+fn assert_paper_run(transaction: &Transaction<'_>, run_id: &RunId) -> StoreResult<()> {
     let purpose = run_purpose_from_connection(transaction, run_id)?;
     if purpose != RunPurpose::Paper {
-        return Err(RebuildStoreError::NonCanonicalLearningPurpose(purpose));
+        return Err(StoreError::NonCanonicalLearningPurpose(purpose));
     }
     Ok(())
 }
@@ -6835,10 +6763,10 @@ fn read_required_artifact(
     connection: &Connection,
     reference: &ArtifactRef,
     error: &'static str,
-) -> RebuildStoreResult<Artifact> {
+) -> StoreResult<Artifact> {
     let artifact = read_artifact(connection, &reference.artifact_id)?;
     if artifact.kind != reference.kind {
-        return Err(RebuildStoreError::InvalidLearningCommit(error));
+        return Err(StoreError::InvalidLearningCommit(error));
     }
     Ok(artifact)
 }
@@ -6846,9 +6774,9 @@ fn read_required_artifact(
 fn assert_canonical_paper_artifact(
     connection: &Connection,
     artifact: &Artifact,
-) -> RebuildStoreResult<()> {
+) -> StoreResult<()> {
     if artifact.lifecycle != ArtifactLifecycle::Canonical {
-        return Err(RebuildStoreError::InvalidLearningCommit(
+        return Err(StoreError::InvalidLearningCommit(
             "shadow_pair.parent_lifecycle",
         ));
     }
@@ -6858,14 +6786,14 @@ fn assert_canonical_paper_artifact(
 fn assert_shadow_candidate_artifact(
     connection: &Connection,
     artifact: &Artifact,
-) -> RebuildStoreResult<()> {
+) -> StoreResult<()> {
     match artifact_run_purpose(connection, artifact)? {
         RunPurpose::Paper => Ok(()),
         RunPurpose::Shadow if artifact.lifecycle != ArtifactLifecycle::Canonical => Ok(()),
-        RunPurpose::Shadow => Err(RebuildStoreError::InvalidLearningCommit(
+        RunPurpose::Shadow => Err(StoreError::InvalidLearningCommit(
             "shadow_pair.candidate_shadow_canonical",
         )),
-        _ => Err(RebuildStoreError::InvalidLearningCommit(
+        _ => Err(StoreError::InvalidLearningCommit(
             "shadow_pair.candidate_purpose",
         )),
     }
@@ -6875,23 +6803,22 @@ fn assert_candidate_decision_binding(
     connection: &Connection,
     candidate_decision: &Artifact,
     completion: &ShadowPairCompletion,
-) -> RebuildStoreResult<()> {
-    let origin =
-        candidate_decision
-            .origin
-            .as_ref()
-            .ok_or(RebuildStoreError::InvalidLearningCommit(
-                "shadow_pair.candidate_origin",
-            ))?;
+) -> StoreResult<()> {
+    let origin = candidate_decision
+        .origin
+        .as_ref()
+        .ok_or(StoreError::InvalidLearningCommit(
+            "shadow_pair.candidate_origin",
+        ))?;
     if origin.contract_hash.as_ref() != Some(&completion.candidate_contract_hash) {
-        return Err(RebuildStoreError::InvalidLearningCommit(
+        return Err(StoreError::InvalidLearningCommit(
             "shadow_pair.candidate_contract",
         ));
     }
     let run_id = origin
         .run_id
         .as_ref()
-        .ok_or(RebuildStoreError::InvalidLearningCommit(
+        .ok_or(StoreError::InvalidLearningCommit(
             "shadow_pair.candidate_run",
         ))?;
     let topology_id = connection
@@ -6901,9 +6828,9 @@ fn assert_candidate_decision_binding(
             |row| row.get::<_, String>(0),
         )
         .optional()?
-        .ok_or_else(|| RebuildStoreError::MissingRun(run_id.clone()))?;
+        .ok_or_else(|| StoreError::MissingRun(run_id.clone()))?;
     if topology_id != completion.candidate_topology_id {
-        return Err(RebuildStoreError::InvalidLearningCommit(
+        return Err(StoreError::InvalidLearningCommit(
             "shadow_pair.candidate_topology",
         ));
     }
@@ -7042,12 +6969,11 @@ fn enum_name<T: Serialize>(value: T) -> String {
         .to_owned()
 }
 
-fn parse_enum<T: for<'de> serde::Deserialize<'de>>(value: &str) -> RebuildStoreResult<T> {
-    serde_json::from_value(serde_json::Value::String(value.to_owned()))
-        .map_err(RebuildStoreError::Json)
+fn parse_enum<T: for<'de> serde::Deserialize<'de>>(value: &str) -> StoreResult<T> {
+    serde_json::from_value(serde_json::Value::String(value.to_owned())).map_err(StoreError::Json)
 }
 
-fn parse_task_status(value: &str) -> RebuildStoreResult<TaskStatus> {
+fn parse_task_status(value: &str) -> StoreResult<TaskStatus> {
     match value {
         "queued" => Ok(TaskStatus::Pending),
         "running" => Ok(TaskStatus::Running),
@@ -7055,7 +6981,7 @@ fn parse_task_status(value: &str) -> RebuildStoreResult<TaskStatus> {
         "failed" => Ok(TaskStatus::Failed),
         "cancelled" => Ok(TaskStatus::Cancelled),
         "skipped" => Ok(TaskStatus::Skipped),
-        other => Err(RebuildStoreError::Integrity(format!(
+        other => Err(StoreError::Integrity(format!(
             "invalid task status {other}"
         ))),
     }
@@ -7093,7 +7019,7 @@ mod tests {
         }
     }
 
-    fn contract(store: &RebuildStore, version: u32) -> AgentContract {
+    fn contract(store: &V2Store, version: u32) -> AgentContract {
         AgentContract::new(
             ContractId::new(),
             version,
@@ -7133,7 +7059,7 @@ mod tests {
     #[test]
     fn contract_catalogue_rejects_duplicate_or_expanded_installations_and_doctor_corruption() {
         let root = tempdir().unwrap();
-        let store = RebuildStore::open(root.path()).unwrap();
+        let store = V2Store::open(root.path()).unwrap();
         let now = Utc::now();
         let active = contract(&store, 1);
         store.install_active_contract(&active, now).unwrap();
@@ -7144,7 +7070,7 @@ mod tests {
         duplicate.validate().unwrap();
         assert!(matches!(
             store.install_active_contract(&duplicate, now),
-            Err(RebuildStoreError::DuplicateContractVersion { .. })
+            Err(StoreError::DuplicateContractVersion { .. })
         ));
 
         let mut expanded = active.clone();
@@ -7161,7 +7087,7 @@ mod tests {
         expanded.validate().unwrap();
         assert!(matches!(
             store.install_candidate_contract(&active.contract_hash, &expanded, now),
-            Err(RebuildStoreError::ContractCapabilityExpansion { .. })
+            Err(StoreError::ContractCapabilityExpansion { .. })
         ));
 
         let mut candidate = active.clone();
@@ -7195,7 +7121,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             store.verify_integrity(),
-            Err(RebuildStoreError::Integrity(_))
+            Err(StoreError::Integrity(_))
         ));
     }
 
@@ -7225,7 +7151,7 @@ mod tests {
                 &serde_json::to_string(&workflow).unwrap(),
                 None,
             );
-            let run = RebuildRun {
+            let run = StoredRun {
                 run_id: RunId::new(),
                 purpose: RunPurpose::Paper,
                 topology_id: workflow.topology_id.clone(),
@@ -7321,7 +7247,7 @@ mod tests {
             fixture.now,
         );
         let candidate_policy = CandidatePolicy {
-            schema_version: REBUILD_SCHEMA_VERSION,
+            schema_version: V2_SCHEMA_VERSION,
             subject: subject.clone(),
             baseline: artifact_ref(&active_installation.artifact),
             candidate: artifact_ref(&candidate_installation.artifact),
@@ -7342,7 +7268,7 @@ mod tests {
             ArtifactLifecycle::Canonical,
             fixture.now,
         );
-        let record_canary = |from, to, completed_at| -> RebuildStoreResult<()> {
+        let record_canary = |from, to, completed_at| -> StoreResult<()> {
             let permit = fresh_permit(&format!("canary-{from:?}-{to:?}"), completed_at);
             let outcome = fresh_outcome(&permit, completed_at);
             let mut experience: Experience =
@@ -7386,7 +7312,7 @@ mod tests {
                 completed_at,
             );
             let candidate_policy = CandidatePolicy {
-                schema_version: REBUILD_SCHEMA_VERSION,
+                schema_version: V2_SCHEMA_VERSION,
                 subject: subject.clone(),
                 baseline: artifact_ref(&active_installation.artifact),
                 candidate: artifact_ref(&candidate_installation.artifact),
@@ -7408,7 +7334,7 @@ mod tests {
                 completed_at,
             );
             let transition = PolicyTransition {
-                schema_version: REBUILD_SCHEMA_VERSION,
+                schema_version: V2_SCHEMA_VERSION,
                 transition_id: PolicyTransitionId::new(),
                 subject: subject.clone(),
                 from: PolicyState::Contract(from),
@@ -7452,7 +7378,7 @@ mod tests {
         )
         .unwrap();
         let promote_transition = PolicyTransition {
-            schema_version: REBUILD_SCHEMA_VERSION,
+            schema_version: V2_SCHEMA_VERSION,
             transition_id: PolicyTransitionId::new(),
             subject: subject.clone(),
             from: PolicyState::Contract(akzio_domain::CandidatePolicyState::Canary50),
@@ -7571,7 +7497,7 @@ mod tests {
             rollback_at,
         );
         let rollback_candidate_policy = CandidatePolicy {
-            schema_version: REBUILD_SCHEMA_VERSION,
+            schema_version: V2_SCHEMA_VERSION,
             subject: subject.clone(),
             baseline: artifact_ref(&active_installation.artifact),
             candidate: artifact_ref(&candidate_installation.artifact),
@@ -7593,7 +7519,7 @@ mod tests {
             rollback_at,
         );
         let rollback_transition = PolicyTransition {
-            schema_version: REBUILD_SCHEMA_VERSION,
+            schema_version: V2_SCHEMA_VERSION,
             transition_id: PolicyTransitionId::new(),
             subject: subject.clone(),
             from: PolicyState::Contract(akzio_domain::CandidatePolicyState::Active),
@@ -7632,7 +7558,7 @@ mod tests {
     }
 
     fn artifact(
-        store: &RebuildStore,
+        store: &V2Store,
         kind: ArtifactKind,
         value: &str,
         origin: Option<ArtifactOrigin>,
@@ -7664,7 +7590,7 @@ mod tests {
 
     fn graph() -> WorkflowGraph {
         WorkflowGraph {
-            schema_version: REBUILD_SCHEMA_VERSION,
+            schema_version: V2_SCHEMA_VERSION,
             topology_id: "active".to_owned(),
             nodes: vec![WorkflowNode {
                 task_id: TaskId::new(),
@@ -7683,7 +7609,7 @@ mod tests {
     }
 
     fn permit_artifact<T: Serialize>(
-        store: &RebuildStore,
+        store: &V2Store,
         permit: &TaskWritePermit,
         kind: ArtifactKind,
         payload: &T,
@@ -7724,7 +7650,7 @@ mod tests {
     }
 
     fn valid_execution_commitment(
-        store: &RebuildStore,
+        store: &V2Store,
         permit: &TaskWritePermit,
         session_key: &str,
         now: DateTime<Utc>,
@@ -7752,7 +7678,7 @@ mod tests {
         let mut target = TargetPortfolio::zeroed();
         target.weights.insert(Asset::Qqq, WeightPpm(100_000));
         let mut plan_payload = ExecutionPlan {
-            schema_version: REBUILD_SCHEMA_VERSION,
+            schema_version: V2_SCHEMA_VERSION,
             decision_context: decision_context.clone(),
             account_snapshot: account_snapshot.clone(),
             quote_snapshot: quote_snapshot.clone(),
@@ -7798,7 +7724,7 @@ mod tests {
             permit,
             ArtifactKind::ExecutionContext,
             &ExecutionContext {
-                schema_version: REBUILD_SCHEMA_VERSION,
+                schema_version: V2_SCHEMA_VERSION,
                 run_id: permit.run_id.clone(),
                 decision_context: decision_context.clone(),
                 account_snapshot: Some(account_snapshot.clone()),
@@ -7863,7 +7789,7 @@ mod tests {
 
     struct ExecutionCommitFixture {
         _root: tempfile::TempDir,
-        store: RebuildStore,
+        store: V2Store,
         lease: DaemonLease,
         permit: TaskWritePermit,
         commitment: Artifact,
@@ -7872,7 +7798,7 @@ mod tests {
 
     fn execution_commit_fixture() -> ExecutionCommitFixture {
         let root = tempdir().unwrap();
-        let store = RebuildStore::open(root.path()).unwrap();
+        let store = V2Store::open(root.path()).unwrap();
         let now = Utc::now();
         let lease = store
             .acquire_daemon_lease(
@@ -7896,7 +7822,7 @@ mod tests {
                 &SessionReservation {
                     session_key: "paper:fixture".to_owned(),
                     workflow: WorkflowCommit {
-                        run: RebuildRun {
+                        run: StoredRun {
                             run_id: RunId::new(),
                             purpose: RunPurpose::Paper,
                             topology_id: graph.topology_id.clone(),
@@ -7929,8 +7855,8 @@ mod tests {
 
     struct PolicyCommitFixture {
         _root: tempfile::TempDir,
-        store: RebuildStore,
-        run: RebuildRun,
+        store: V2Store,
+        run: StoredRun,
         permit: TaskWritePermit,
         subject: PolicySubject,
         outcome: Artifact,
@@ -7953,7 +7879,7 @@ mod tests {
 
         fn new(with_candidate: bool) -> Self {
             let root = tempdir().unwrap();
-            let store = RebuildStore::open(root.path()).unwrap();
+            let store = V2Store::open(root.path()).unwrap();
             let now = Utc::now();
 
             let mut paper_graph = graph();
@@ -7972,7 +7898,7 @@ mod tests {
                 None,
             );
             let paper_graph_ref = artifact_ref(&paper_graph_artifact);
-            let run = RebuildRun {
+            let run = StoredRun {
                 run_id: RunId::new(),
                 purpose: RunPurpose::Paper,
                 topology_id: paper_graph.topology_id.clone(),
@@ -8046,7 +7972,7 @@ mod tests {
             );
             let outcome_id = akzio_domain::OutcomeId::new();
             let schedule_payload = OutcomeSchedule {
-                schema_version: REBUILD_SCHEMA_VERSION,
+                schema_version: V2_SCHEMA_VERSION,
                 outcome_id: outcome_id.clone(),
                 decision: artifact_ref(&decision),
                 decision_context: artifact_ref(&decision_context),
@@ -8103,7 +8029,7 @@ mod tests {
                     None,
                 );
                 let reference = artifact_ref(&candidate_graph_artifact);
-                let candidate_run = RebuildRun {
+                let candidate_run = StoredRun {
                     run_id: RunId::new(),
                     purpose: RunPurpose::Shadow,
                     topology_id: candidate_graph.topology_id.clone(),
@@ -8138,7 +8064,7 @@ mod tests {
                 PolicySubject::Contract(_) => unreachable!(),
             };
             let outcome_payload = Outcome {
-                schema_version: REBUILD_SCHEMA_VERSION,
+                schema_version: V2_SCHEMA_VERSION,
                 outcome_id,
                 schedule: artifact_ref(&schedule),
                 market_evidence: vec![artifact_ref(&normalized)],
@@ -8168,7 +8094,7 @@ mod tests {
                 now,
             );
             let experience_payload = Experience {
-                schema_version: REBUILD_SCHEMA_VERSION,
+                schema_version: V2_SCHEMA_VERSION,
                 experience_id: akzio_domain::ExperienceId::new(),
                 subject: subject.clone(),
                 hypothesis_id: "fixture".to_owned(),
@@ -8201,7 +8127,7 @@ mod tests {
                 now,
             );
             let evaluation_payload = Evaluation {
-                schema_version: REBUILD_SCHEMA_VERSION,
+                schema_version: V2_SCHEMA_VERSION,
                 evaluation_id: akzio_domain::EvaluationId::new(),
                 outcome: artifact_ref(&outcome),
                 experience: artifact_ref(&experience),
@@ -8221,7 +8147,7 @@ mod tests {
             );
             let candidate_policy = candidate_graph.map(|(candidate, _)| {
                 let payload = CandidatePolicy {
-                    schema_version: REBUILD_SCHEMA_VERSION,
+                    schema_version: V2_SCHEMA_VERSION,
                     subject: subject.clone(),
                     baseline: paper_graph_ref,
                     candidate,
@@ -8243,7 +8169,7 @@ mod tests {
                 )
             });
             let transition = PolicyTransition {
-                schema_version: REBUILD_SCHEMA_VERSION,
+                schema_version: V2_SCHEMA_VERSION,
                 transition_id: PolicyTransitionId::new(),
                 subject: subject.clone(),
                 from,
@@ -8339,7 +8265,7 @@ mod tests {
     #[test]
     fn workflow_commit_accepts_out_of_order_nodes_and_preserves_dependencies() {
         let root = tempdir().unwrap();
-        let store = RebuildStore::open(root.path()).unwrap();
+        let store = V2Store::open(root.path()).unwrap();
         let mut graph = graph();
         let parent = graph.nodes[0].clone();
         let mut child = parent.clone();
@@ -8354,7 +8280,7 @@ mod tests {
             &serde_json::to_string(&graph).unwrap(),
             None,
         );
-        let run = RebuildRun {
+        let run = StoredRun {
             run_id: RunId::new(),
             purpose: RunPurpose::Debug,
             topology_id: graph.topology_id.clone(),
@@ -8379,7 +8305,7 @@ mod tests {
     #[test]
     fn retry_and_cancellation_are_durable_and_fenced() {
         let root = tempdir().unwrap();
-        let store = RebuildStore::open(root.path()).unwrap();
+        let store = V2Store::open(root.path()).unwrap();
         let mut graph = graph();
         graph.nodes[0].retry.max_attempts = 2;
         graph.nodes[0].retry.initial_backoff_ms = 0;
@@ -8389,7 +8315,7 @@ mod tests {
             &serde_json::to_string(&graph).unwrap(),
             None,
         );
-        let run = RebuildRun {
+        let run = StoredRun {
             run_id: RunId::new(),
             purpose: RunPurpose::Debug,
             topology_id: graph.topology_id.clone(),
@@ -8424,7 +8350,7 @@ mod tests {
         assert!(store.run_cancel_requested(&run.run_id).unwrap());
         assert!(matches!(
             store.finish_task(&first.permit, TaskStatus::Cancelled, Utc::now()),
-            Err(RebuildStoreError::StalePermit(_))
+            Err(StoreError::StalePermit(_))
         ));
         store
             .finish_task(&second.permit, TaskStatus::Cancelled, Utc::now())
@@ -8442,17 +8368,21 @@ mod tests {
     #[test]
     fn legacy_root_is_rejected_instead_of_migrated() {
         let root = tempdir().unwrap();
-        fs::write(root.path().join(LEGACY_DATABASE_FILE), b"legacy").unwrap();
+        fs::write(
+            root.path().join(INCOMPATIBLE_DATABASE_FILE),
+            b"incompatible",
+        )
+        .unwrap();
         assert!(matches!(
-            RebuildStore::open(root.path()),
-            Err(RebuildStoreError::IncompatibleStoreRoot(_))
+            V2Store::open(root.path()),
+            Err(StoreError::IncompatibleStoreRoot(_))
         ));
     }
 
     #[test]
     fn workflow_commit_is_atomic_and_claim_yields_a_permit() {
         let root = tempdir().unwrap();
-        let store = RebuildStore::open(root.path()).unwrap();
+        let store = V2Store::open(root.path()).unwrap();
         let graph = graph();
         let graph_artifact = artifact(
             &store,
@@ -8460,7 +8390,7 @@ mod tests {
             &serde_json::to_string(&graph).unwrap(),
             None,
         );
-        let run = RebuildRun {
+        let run = StoredRun {
             run_id: RunId::new(),
             purpose: RunPurpose::Debug,
             topology_id: graph.topology_id.clone(),
@@ -8487,7 +8417,7 @@ mod tests {
     #[test]
     fn attempt_commit_is_atomic_with_outputs_and_terminal_event() {
         let root = tempdir().unwrap();
-        let store = RebuildStore::open(root.path()).unwrap();
+        let store = V2Store::open(root.path()).unwrap();
         let graph = graph();
         let graph_artifact = artifact(
             &store,
@@ -8495,7 +8425,7 @@ mod tests {
             &serde_json::to_string(&graph).unwrap(),
             None,
         );
-        let run = RebuildRun {
+        let run = StoredRun {
             run_id: RunId::new(),
             purpose: RunPurpose::Debug,
             topology_id: graph.topology_id.clone(),
@@ -8529,7 +8459,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             store.committed_attempt_outputs(&claimed.permit.task_id, &claimed.permit.attempt_id),
-            Err(RebuildStoreError::CommittedOutputAttempt { .. })
+            Err(StoreError::CommittedOutputAttempt { .. })
         ));
         let output = artifact(
             &store,
@@ -8575,7 +8505,7 @@ mod tests {
     #[test]
     fn attempt_commit_resolves_same_batch_evidence_closure_before_persisting() {
         let root = tempdir().unwrap();
-        let store = RebuildStore::open(root.path()).unwrap();
+        let store = V2Store::open(root.path()).unwrap();
         let graph = graph();
         let graph_artifact = artifact(
             &store,
@@ -8583,7 +8513,7 @@ mod tests {
             &serde_json::to_string(&graph).unwrap(),
             None,
         );
-        let run = RebuildRun {
+        let run = StoredRun {
             run_id: RunId::new(),
             purpose: RunPurpose::Debug,
             topology_id: graph.topology_id.clone(),
@@ -8644,11 +8574,11 @@ mod tests {
                 TaskStatus::Succeeded,
                 Utc::now(),
             ),
-            Err(RebuildStoreError::InvalidArtifactClosure(_))
+            Err(StoreError::InvalidArtifactClosure(_))
         ));
         assert!(matches!(
             store.artifact(&missing.artifact_id),
-            Err(RebuildStoreError::MissingArtifact(_))
+            Err(StoreError::MissingArtifact(_))
         ));
 
         store
@@ -8671,7 +8601,7 @@ mod tests {
     #[test]
     fn attempt_commit_rolls_back_when_terminal_event_write_fails() {
         let root = tempdir().unwrap();
-        let store = RebuildStore::open(root.path()).unwrap();
+        let store = V2Store::open(root.path()).unwrap();
         let graph = graph();
         let graph_artifact = artifact(
             &store,
@@ -8679,7 +8609,7 @@ mod tests {
             &serde_json::to_string(&graph).unwrap(),
             None,
         );
-        let run = RebuildRun {
+        let run = StoredRun {
             run_id: RunId::new(),
             purpose: RunPurpose::Debug,
             topology_id: graph.topology_id.clone(),
@@ -8725,7 +8655,7 @@ mod tests {
                 TaskStatus::Succeeded,
                 Utc::now()
             ),
-            Err(RebuildStoreError::Sql(_))
+            Err(StoreError::Sql(_))
         ));
         {
             let connection = store.connection.lock().unwrap();
@@ -8735,7 +8665,7 @@ mod tests {
         }
         assert!(matches!(
             store.artifact(&output.artifact_id),
-            Err(RebuildStoreError::MissingArtifact(_))
+            Err(StoreError::MissingArtifact(_))
         ));
         assert_eq!(store.events_after(&run.run_id, 0, 10).unwrap().len(), 2);
         store
@@ -8752,7 +8682,7 @@ mod tests {
     #[test]
     fn workflow_patch_rolls_back_proposal_graph_tasks_events_and_planner_completion() {
         let root = tempdir().unwrap();
-        let store = RebuildStore::open(root.path()).unwrap();
+        let store = V2Store::open(root.path()).unwrap();
         let now = Utc::now();
         let planner_contract = ContentHash::of_bytes(b"planner-contract");
         let planner = WorkflowNode {
@@ -8796,7 +8726,7 @@ mod tests {
             parent_task_id: None,
         };
         let graph = WorkflowGraph {
-            schema_version: REBUILD_SCHEMA_VERSION,
+            schema_version: V2_SCHEMA_VERSION,
             topology_id: "active".to_owned(),
             nodes: vec![planner.clone(), evidence.clone(), decision.clone()],
         };
@@ -8819,7 +8749,7 @@ mod tests {
             now,
         )
         .unwrap();
-        let run = RebuildRun {
+        let run = StoredRun {
             run_id: RunId::new(),
             purpose: RunPurpose::Debug,
             topology_id: graph.topology_id.clone(),
@@ -8865,7 +8795,7 @@ mod tests {
         );
 
         let proposal = WorkflowProposal {
-            schema_version: REBUILD_SCHEMA_VERSION,
+            schema_version: V2_SCHEMA_VERSION,
             topology_id: "active".to_owned(),
             tasks: std::collections::BTreeMap::from([(
                 "analyst".to_owned(),
@@ -8926,7 +8856,7 @@ mod tests {
         let mut updated_decision = decision;
         updated_decision.dependencies = vec![added.task_id.clone()];
         let next_graph = WorkflowGraph {
-            schema_version: REBUILD_SCHEMA_VERSION,
+            schema_version: V2_SCHEMA_VERSION,
             topology_id: "active".to_owned(),
             nodes: vec![
                 planner,
@@ -8987,7 +8917,7 @@ mod tests {
         }
         assert!(matches!(
             store.commit_workflow_patch(&patch),
-            Err(RebuildStoreError::Sql(_))
+            Err(StoreError::Sql(_))
         ));
         {
             let connection = store.connection.lock().unwrap();
@@ -9013,19 +8943,19 @@ mod tests {
         }
         assert!(matches!(
             store.artifact(&planner_output.artifact_id),
-            Err(RebuildStoreError::MissingArtifact(_))
+            Err(StoreError::MissingArtifact(_))
         ));
         assert!(matches!(
             store.artifact(&evidence_need.artifact_id),
-            Err(RebuildStoreError::MissingArtifact(_))
+            Err(StoreError::MissingArtifact(_))
         ));
         assert!(matches!(
             store.artifact(&proposal_artifact.artifact_id),
-            Err(RebuildStoreError::MissingArtifact(_))
+            Err(StoreError::MissingArtifact(_))
         ));
         assert!(matches!(
             store.artifact(&next_graph_artifact.artifact_id),
-            Err(RebuildStoreError::MissingArtifact(_))
+            Err(StoreError::MissingArtifact(_))
         ));
         assert_eq!(store.events_after(&run.run_id, 0, 100).unwrap().len(), 2);
         store.validate_task_permit(&claimed.permit).unwrap();
@@ -9072,7 +9002,7 @@ mod tests {
         assert_eq!(stored_refs, expected_refs);
         assert!(matches!(
             store.validate_task_permit(&claimed.permit),
-            Err(RebuildStoreError::StalePermit(_))
+            Err(StoreError::StalePermit(_))
         ));
         let claimed_evidence = store
             .claim_next_task("evidence-worker", now, Duration::seconds(30))
@@ -9134,7 +9064,7 @@ mod tests {
     #[test]
     fn stale_permit_cannot_write_an_artifact() {
         let root = tempdir().unwrap();
-        let store = RebuildStore::open(root.path()).unwrap();
+        let store = V2Store::open(root.path()).unwrap();
         let graph = graph();
         let graph_artifact = artifact(
             &store,
@@ -9142,7 +9072,7 @@ mod tests {
             &serde_json::to_string(&graph).unwrap(),
             None,
         );
-        let run = RebuildRun {
+        let run = StoredRun {
             run_id: RunId::new(),
             purpose: RunPurpose::Debug,
             topology_id: graph.topology_id.clone(),
@@ -9174,14 +9104,14 @@ mod tests {
         );
         assert!(matches!(
             store.write_task_artifact(&claimed.permit, &artifact, "claim.created", Utc::now()),
-            Err(RebuildStoreError::StalePermit(_))
+            Err(StoreError::StalePermit(_))
         ));
     }
 
     #[test]
     fn bootstrapped_contract_must_not_carry_task_origin() {
         let root = tempdir().unwrap();
-        let store = RebuildStore::open(root.path()).unwrap();
+        let store = V2Store::open(root.path()).unwrap();
         let artifact = artifact(&store, ArtifactKind::Contract, "contract", None);
         store.write_bootstrap_artifact(&artifact).unwrap();
         store.verify_integrity().unwrap();
@@ -9385,7 +9315,7 @@ mod tests {
             fixture
                 .store
                 .validate_daemon_lease(&fixture.lease, successor_now),
-            Err(RebuildStoreError::SchedulerFenced(_))
+            Err(StoreError::SchedulerFenced(_))
         ));
         fixture
             .store
@@ -9409,11 +9339,11 @@ mod tests {
                 TaskStatus::Succeeded,
                 successor_now,
             ),
-            Err(RebuildStoreError::SchedulerFenced(_))
+            Err(StoreError::SchedulerFenced(_))
         ));
         assert!(matches!(
             fixture.store.artifact(&receipt.artifact_id),
-            Err(RebuildStoreError::MissingArtifact(_))
+            Err(StoreError::MissingArtifact(_))
         ));
         fixture.store.validate_task_permit(&fixture.permit).unwrap();
 
@@ -9475,7 +9405,7 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                RebuildStoreError::Integrity(message)
+                StoreError::Integrity(message)
                     if message.contains("commitment lineage is invalid")
             ),
             "{error}"
@@ -9514,7 +9444,7 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                RebuildStoreError::Integrity(message)
+                StoreError::Integrity(message)
                     if message.contains("commitment lineage is invalid")
             ),
             "{error}"
@@ -9524,7 +9454,7 @@ mod tests {
     #[test]
     fn session_slot_is_fenced_and_reuses_the_frozen_workflow() {
         let root = tempdir().unwrap();
-        let store = RebuildStore::open(root.path()).unwrap();
+        let store = V2Store::open(root.path()).unwrap();
         let now = Utc::now();
         let first_lease = store
             .acquire_daemon_lease("scheduler", "daemon-a", now, now + Duration::seconds(30))
@@ -9539,7 +9469,7 @@ mod tests {
             None,
         );
         let first_workflow = WorkflowCommit {
-            run: RebuildRun {
+            run: StoredRun {
                 run_id: RunId::new(),
                 purpose: RunPurpose::Paper,
                 topology_id: first_graph.topology_id.clone(),
@@ -9571,7 +9501,7 @@ mod tests {
             None,
         );
         let replacement_workflow = WorkflowCommit {
-            run: RebuildRun {
+            run: StoredRun {
                 run_id: RunId::new(),
                 purpose: RunPurpose::Paper,
                 topology_id: replacement_graph.topology_id.clone(),
@@ -9628,7 +9558,7 @@ mod tests {
                     committed_at: now,
                 },
             ),
-            Err(RebuildStoreError::Sql(_))
+            Err(StoreError::Sql(_))
         ));
         assert_eq!(
             store
@@ -9640,7 +9570,7 @@ mod tests {
         );
         assert!(matches!(
             store.artifact(&commitment.artifact_id),
-            Err(RebuildStoreError::MissingArtifact(_))
+            Err(StoreError::MissingArtifact(_))
         ));
         assert!(store
             .events_after(&claimed.permit.run_id, 0, 20)
@@ -9680,7 +9610,7 @@ mod tests {
                     committed_at: now,
                 },
             ),
-            Err(RebuildStoreError::StalePermit(_))
+            Err(StoreError::StalePermit(_))
         ));
         let events = store.events_after(&claimed.permit.run_id, 0, 20).unwrap();
         assert!(events.iter().any(|event| {
@@ -9724,7 +9654,7 @@ mod tests {
                     committed_at: successor_now,
                 },
             ),
-            Err(RebuildStoreError::SchedulerFenced(_))
+            Err(StoreError::SchedulerFenced(_))
         ));
         assert!(matches!(
             store.reserve_session_slot(
@@ -9736,14 +9666,14 @@ mod tests {
                     reserved_at: successor_now,
                 },
             ),
-            Err(RebuildStoreError::SchedulerFenced(_))
+            Err(StoreError::SchedulerFenced(_))
         ));
     }
 
     #[test]
     fn doctor_rejects_a_corrupt_session_slot() {
         let root = tempdir().unwrap();
-        let store = RebuildStore::open(root.path()).unwrap();
+        let store = V2Store::open(root.path()).unwrap();
         let now = Utc::now();
         let lease = store
             .acquire_daemon_lease("scheduler", "daemon-a", now, now + Duration::seconds(30))
@@ -9762,7 +9692,7 @@ mod tests {
                 &SessionReservation {
                     session_key: "paper:fixture-corrupt".to_owned(),
                     workflow: WorkflowCommit {
-                        run: RebuildRun {
+                        run: StoredRun {
                             run_id: RunId::new(),
                             purpose: RunPurpose::Paper,
                             topology_id: graph.topology_id.clone(),
@@ -9788,14 +9718,14 @@ mod tests {
         }
         assert!(matches!(
             store.verify_integrity(),
-            Err(RebuildStoreError::Integrity(message)) if message.contains("topology mismatch")
+            Err(StoreError::Integrity(message)) if message.contains("topology mismatch")
         ));
     }
 
     #[test]
     fn policy_transition_is_atomic_with_learning_artifacts_and_terminal_event() {
         let root = tempdir().unwrap();
-        let store = RebuildStore::open(root.path()).unwrap();
+        let store = V2Store::open(root.path()).unwrap();
         let now = Utc::now();
         let mut graph = graph();
         let seed = graph.nodes[0].clone();
@@ -9810,7 +9740,7 @@ mod tests {
             &serde_json::to_string(&graph).unwrap(),
             None,
         );
-        let run = RebuildRun {
+        let run = StoredRun {
             run_id: RunId::new(),
             purpose: RunPurpose::Paper,
             topology_id: graph.topology_id.clone(),
@@ -9914,7 +9844,7 @@ mod tests {
         );
         let outcome_id = akzio_domain::OutcomeId::new();
         let schedule_payload = OutcomeSchedule {
-            schema_version: REBUILD_SCHEMA_VERSION,
+            schema_version: V2_SCHEMA_VERSION,
             outcome_id: outcome_id.clone(),
             decision: reference(&decision),
             decision_context: reference(&decision_context),
@@ -9962,7 +9892,7 @@ mod tests {
         let execution_ref = reference(&execution_context);
         let evidence_ref = reference(&normalized);
         let outcome_payload = Outcome {
-            schema_version: REBUILD_SCHEMA_VERSION,
+            schema_version: V2_SCHEMA_VERSION,
             outcome_id,
             schedule: reference(&schedule),
             market_evidence: vec![evidence_ref.clone()],
@@ -9996,7 +9926,7 @@ mod tests {
         let outcome_ref = reference(&outcome);
         let subject = PolicySubject::Memory(akzio_domain::MemoryId::new());
         let experience_payload = Experience {
-            schema_version: REBUILD_SCHEMA_VERSION,
+            schema_version: V2_SCHEMA_VERSION,
             experience_id: akzio_domain::ExperienceId::new(),
             subject: subject.clone(),
             hypothesis_id: "fixture".to_owned(),
@@ -10025,7 +9955,7 @@ mod tests {
         );
         let experience_ref = reference(&experience);
         let evaluation_payload = Evaluation {
-            schema_version: REBUILD_SCHEMA_VERSION,
+            schema_version: V2_SCHEMA_VERSION,
             evaluation_id: akzio_domain::EvaluationId::new(),
             outcome: outcome_ref.clone(),
             experience: experience_ref.clone(),
@@ -10053,7 +9983,7 @@ mod tests {
             to: PolicyState::Memory(akzio_domain::MemoryLifecycle::Active),
             pair_snapshot,
             transition: Some(PolicyTransition {
-                schema_version: REBUILD_SCHEMA_VERSION,
+                schema_version: V2_SCHEMA_VERSION,
                 transition_id: PolicyTransitionId::new(),
                 subject: subject.clone(),
                 from: PolicyState::Memory(akzio_domain::MemoryLifecycle::Candidate),
@@ -10075,7 +10005,7 @@ mod tests {
         }
         let failed = store.record_policy_evaluation(&commit);
         assert!(
-            matches!(&failed, Err(RebuildStoreError::Sql(_))),
+            matches!(&failed, Err(StoreError::Sql(_))),
             "unexpected policy transition result: {failed:?}"
         );
         {
@@ -10087,7 +10017,7 @@ mod tests {
         assert!(store.policy_head(&subject).unwrap().is_none());
         assert!(matches!(
             store.artifact(&outcome.artifact_id),
-            Err(RebuildStoreError::MissingArtifact(_))
+            Err(StoreError::MissingArtifact(_))
         ));
         assert!(store
             .events_after(&run.run_id, 0, 100)
@@ -10113,7 +10043,7 @@ mod tests {
             .unwrap();
         let corrupted = store.verify_integrity();
         assert!(
-            matches!(&corrupted, Err(RebuildStoreError::Integrity(_))),
+            matches!(&corrupted, Err(StoreError::Integrity(_))),
             "unexpected Doctor result after policy cursor corruption: {corrupted:?}"
         );
     }
@@ -10144,7 +10074,7 @@ mod tests {
                     "fixture.generic_write",
                     fixture.now,
                 ),
-                Err(RebuildStoreError::InvalidLearningCommit(
+                Err(StoreError::InvalidLearningCommit(
                     "learning_artifact.atomic_commit_required"
                 ))
             ));
@@ -10155,7 +10085,7 @@ mod tests {
                     TaskStatus::Succeeded,
                     fixture.now,
                 ),
-                Err(RebuildStoreError::InvalidLearningCommit(
+                Err(StoreError::InvalidLearningCommit(
                     "learning_artifact.atomic_commit_required"
                 ))
             ));
@@ -10182,8 +10112,8 @@ mod tests {
         drop(connection);
 
         assert!(matches!(
-            RebuildStore::open(root.path()),
-            Err(RebuildStoreError::IncompatibleStoreRoot(path)) if path == root.path()
+            V2Store::open(root.path()),
+            Err(StoreError::IncompatibleStoreRoot(path)) if path == root.path()
         ));
     }
 
@@ -10264,7 +10194,7 @@ mod tests {
         }
 
         match fixture.store.verify_integrity() {
-            Err(RebuildStoreError::Integrity(_)) => {}
+            Err(StoreError::Integrity(_)) => {}
             other => panic!("unexpected Doctor result: {other:?}"),
         }
     }
@@ -10318,7 +10248,7 @@ mod tests {
 
         assert!(matches!(
             fixture.store.verify_integrity(),
-            Err(RebuildStoreError::Integrity(message)) if message.contains("execution lineage")
+            Err(StoreError::Integrity(message)) if message.contains("execution lineage")
         ));
     }
 
@@ -10380,7 +10310,7 @@ mod tests {
         let corrupted = fixture.store.verify_integrity();
         assert!(matches!(
             &corrupted,
-            Err(RebuildStoreError::Integrity(message)) if message.contains("stale")
+            Err(StoreError::Integrity(message)) if message.contains("stale")
         ));
     }
 }
