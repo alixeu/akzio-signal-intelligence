@@ -86,6 +86,17 @@ cargo run --offline -p akzio-cli -- run events <run-id>
 
 不足五个共同交易日、baseline quote 缺失、bar 重复/缺失、公司行动调整无法确认或证据质量不足时，worker 只重试或保持 NoOrder 边界，不封存 canonical Outcome，不触发 canonical learning。
 
+### 真实 Outcome sealing 记录
+
+真实 Paper 运行必须等到对应交易日实际结束后再记录结果，不能用当前预测、fixture bars 或 Replay 推算未来窗口。每个 `run_id` 单独记录：
+
+- baseline trading day、baseline `QuoteSnapshot` 和执行/对账引用；
+- T+1、T+3、T+5 的实际共同交易日、Alpaca bars resource、原始 URI、dedupe key、revision、source refs 和质量门结果；
+- 每个 horizon 的收益、相对 QQQ、交易成本、滑点、校准度、证据完整度、风险召回率和 regime 标签；
+- `Outcome`、`Evaluation`、`Experience`/`PolicyTransition` 的 artifact ID 及对应 event cursor。
+
+验收条件是三个 horizon 均由可追溯 Paper evidence 封存，`OutcomeSchedule` 与 terminal execution lineage 一致，且 Store Doctor/replay 通过。任一 horizon 缺数据、重复、过期或无法确认调整时，只允许 worker 重试或保持 `NoOrder`；不得创建 sealed canonical Outcome，也不得产生 canonical learning 或 candidate promotion。
+
 ## 备份与恢复
 
 ```bash
