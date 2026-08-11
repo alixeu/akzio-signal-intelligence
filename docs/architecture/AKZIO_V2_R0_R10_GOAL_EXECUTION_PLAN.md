@@ -2,7 +2,7 @@
 
 日期：2026-08-11
 
-状态：**R0 verified / R1–R3 narrow regression verified / R4 durable catalogue lifecycle pending / R5 core verified, event-reducer replay pending / R6 complete pending final R10 review / R7 in progress**
+状态：**R0 verified / R1–R3 narrow regression verified / R4 lifecycle complete / R5 deterministic replay complete / R6 complete pending final R10 review / R7 in progress**
 适用 checkout：当前 workspace；`faf493c8ba40e0c839ab221d8435757db1a319f6` 仅是历史 R6 阶段快照，不是当前基线。
 
 ## 1. Goal objective
@@ -163,6 +163,13 @@
 - 本轮修复了安装事务提交后递归持锁和 Doctor 未调用 catalogue history verifier 两个 fail-closed 缺口；未增加旧 role 或 bootstrap compatibility path。
 - 已实际通过 `cargo fmt --all`、`cargo test --offline -p akzio-store`、`cargo test --offline -p akzio-research`、`cargo test --offline -p akzio-learning`、`cargo check --offline --workspace`、相关 crates `cargo clippy --offline --all-targets -- -D warnings`。这些均为本地 fixture/离线验证，不代表市场、broker 或真实 Paper 验证。
 - 下一阶段为 R5 durable event/task-history reducer；R0–R4 不再逐阶段回看，R0–R10 完成后统一终局复核。
+
+### 3.10 2026-08-11 R5 deterministic replay checkpoint
+
+- `RebuildWorkflowRuntime::replay_run` 现在从 `V2Store` append-only event stream 归约 graph revision、attempt/retry/recovery/cancel 状态，并与 durable snapshot、revision 和当前 gate invariants 逐项比对；未知且无 artifact 的事件 fail-closed。
+- artifact-bearing task trace event 不依赖静态 event-type allowlist：replay 要求 task、attempt、artifact 与 ArtifactOrigin（含 contract hash）一致且当时 attempt 仍 active，覆盖 Agent/Context/Evidence/Execution 等已受 Store permit 约束的 trace 写入。
+- 已实际通过 `cargo fmt --all`、`cargo test --offline -p akzio-runtime`（21 passed）、`cargo clippy --offline -p akzio-runtime --all-targets -- -D warnings` 与 `cargo check --offline --workspace`。
+- 下一阶段为 R7；R6 已有 current-tree completion checkpoint，不重复回看。R0–R10 完成后统一终局复核。
 
 ## 4. 从官方网站吸收的原则
 
@@ -836,7 +843,7 @@ cargo run --offline -p akzio-cli -- store doctor
 | R2 | narrow regression verified | R1 verified | CAS、atomic/fencing/cursor/Doctor/OutcomeSchedule closure 窄测通过；全量最终回归留给 R10 |
 | R3 | narrow regression verified | R2 verified | Manifest/Grant/repair/source closure、policy influence 越权拒绝和 typed governed evidence adapters 窄测通过 |
 | R4 | lifecycle complete | R3 verified | Store-owned immutable Active/Candidate installation、restart head recovery、capability ceiling、canary activation/rollback history 与 Doctor corruption rejection 已通过离线窄测 |
-| R5 | core verified / replay pending | R4 lifecycle complete | DAG/Task/recovery 核心已通过窄测；deterministic event reducer 仍待实现与认证 |
+| R5 | deterministic replay complete | R4 lifecycle complete | DAG/Task/recovery、dynamic patch、retry/cancel、crash recovery、artifact trace 与 snapshot divergence replay 已通过离线窄测 |
 | R6 | complete | R5 核心完成 | sealed Outcome/Shadow/canary/no-op cursor/noncanonical owner surface 已完成；全量 regression 不得凭历史快照宣称 |
 | R7 | in progress | R6 complete | Decision/Execution/Paper owner tests 与 current-tree 编译/集成修复 |
 | R8 | partial | R7 complete | Daemon 接通全部 terminal owner runtime；scheduler、crash/concurrency、epoch fencing、HTTP/SSE、freeze tests；Unix path 不再 active |

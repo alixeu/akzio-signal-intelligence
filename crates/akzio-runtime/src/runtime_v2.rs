@@ -8,12 +8,12 @@ use std::{
 
 use akzio_domain::{
     Artifact, ArtifactKind, ArtifactLifecycle, ArtifactOrigin, ArtifactProvenance, ArtifactRef,
-    DomainError, EvidenceNeed, RunId, RunPurpose, RuntimeTaskClass, TaskRecipe, TaskRecipeId,
-    TaskStatus, WorkflowGraph, WorkflowNode, WorkflowProposal, WorkflowProposalDraft,
-    WorkflowProposalTask, REBUILD_SCHEMA_VERSION,
+    AttemptId, DomainError, EvidenceNeed, RunId, RunPurpose, RuntimeTaskClass, TaskId, TaskRecipe,
+    TaskRecipeId, TaskStatus, WorkflowGraph, WorkflowNode, WorkflowProposal, WorkflowProposalDraft,
+    WorkflowProposalTask, WorkflowStatus, REBUILD_SCHEMA_VERSION,
 };
 use akzio_store::v2::{
-    ClaimedAttempt, RetryTaskResult, StoreError, StoredRun, V2Store, WorkflowCommit,
+    ClaimedAttempt, RetryTaskResult, StoreError, StoredEvent, StoredRun, V2Store, WorkflowCommit,
     WorkflowPatchCommit, WorkflowRevision, WorkflowSnapshot,
 };
 use chrono::{DateTime, Duration, Utc};
@@ -75,9 +75,37 @@ pub enum RebuildRuntimeError {
     PlannerPermitRequired,
     #[error("Paper workflows require a precompiled proposal")]
     PaperWorkflowRequiresPrecompiledProposal,
+    #[error("workflow replay for run {run_id} diverged: {reason}")]
+    ReplayDiverged { run_id: RunId, reason: String },
 }
 
 pub type RebuildRuntimeResult<T> = Result<T, RebuildRuntimeError>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReplayedWorkflowRevision {
+    cursor: i64,
+    graph_artifact: Artifact,
+    graph: WorkflowGraph,
+    created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReplayedTask {
+    node: WorkflowNode,
+    status: TaskStatus,
+    active_attempt_id: Option<AttemptId>,
+    attempt_count: u64,
+    finished_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct ReplayedWorkflow {
+    revisions: Vec<ReplayedWorkflowRevision>,
+    tasks: BTreeMap<TaskId, ReplayedTask>,
+    cancel_requested: bool,
+    saw_task_start: bool,
+    event_cursor: i64,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TerminalRecipeSet {
@@ -282,15 +310,535 @@ impl RebuildWorkflowRuntime {
         Ok(snapshot)
     }
 
-    /// Replay an immutable graph revision through the current v2 invariants.
+    /// Rebuild a Run from its append-only event stream and durable task
+    /// history, rejecting a snapshot that cannot be derived from that history.
+    pub fn replay_run(&self, run_id: &RunId) -> RebuildRuntimeResult<WorkflowSnapshot> {
+        let replay = self.reduce_history(run_id)?;
+        self.validate_replay_revisions(run_id, &replay)?;
+        let snapshot = self.store.workflow_snapshot(run_id)?;
+        self.validate_replay_snapshot(run_id, &replay, &snapshot)?;
+        self.validate_compiled_graph(snapshot.run.purpose, &snapshot.revision.graph)?;
+        Ok(snapshot)
+    }
+
+    /// Replay an immutable graph revision through the event reducer and the
+    /// current v2 invariants. This never trusts a revision row by itself.
     pub fn replay_revision(
         &self,
         run_id: &RunId,
         revision: u64,
     ) -> RebuildRuntimeResult<WorkflowRevision> {
-        let revision = self.store.workflow_revision(run_id, revision)?;
-        self.validate_compiled_graph(self.store.run_purpose(run_id)?, &revision.graph)?;
-        Ok(revision)
+        let replay = self.reduce_history(run_id)?;
+        self.validate_replay_revisions(run_id, &replay)?;
+        let reduced = replay.revisions.get(revision as usize).ok_or_else(|| {
+            Self::replay_error(
+                run_id,
+                format!("missing graph revision {revision} in event stream"),
+            )
+        })?;
+        let durable = self.store.workflow_revision(run_id, revision)?;
+        if durable.graph_artifact != reduced.graph_artifact
+            || durable.graph != reduced.graph
+            || durable.created_at != reduced.created_at
+        {
+            return Err(Self::replay_error(
+                run_id,
+                format!("revision {revision} differs from its workflow event"),
+            ));
+        }
+        self.validate_compiled_graph(self.store.run_purpose(run_id)?, &durable.graph)?;
+        Ok(durable)
+    }
+
+    fn reduce_history(&self, run_id: &RunId) -> RebuildRuntimeResult<ReplayedWorkflow> {
+        let events = self.replay_events(run_id)?;
+        let mut replay = ReplayedWorkflow::default();
+        for event in &events {
+            self.reduce_event(run_id, &mut replay, event)?;
+        }
+        if replay.revisions.is_empty() {
+            return Err(Self::replay_error(
+                run_id,
+                "workflow.created is missing from durable event history",
+            ));
+        }
+        Ok(replay)
+    }
+
+    fn replay_events(&self, run_id: &RunId) -> RebuildRuntimeResult<Vec<StoredEvent>> {
+        const PAGE_SIZE: usize = 256;
+
+        let mut events = Vec::new();
+        let mut after = 0;
+        loop {
+            let page = self.store.events_after(run_id, after, PAGE_SIZE)?;
+            let Some(last) = page.last() else {
+                break;
+            };
+            if last.cursor <= after {
+                return Err(Self::replay_error(
+                    run_id,
+                    "event cursor did not advance while paging history",
+                ));
+            }
+            after = last.cursor;
+            events.extend(page);
+        }
+        Ok(events)
+    }
+
+    fn reduce_event(
+        &self,
+        run_id: &RunId,
+        replay: &mut ReplayedWorkflow,
+        event: &StoredEvent,
+    ) -> RebuildRuntimeResult<()> {
+        if event.run_id != *run_id {
+            return Err(Self::replay_error(
+                run_id,
+                format!("event {} belongs to another run", event.cursor),
+            ));
+        }
+        match event.event_type.as_str() {
+            "workflow.created" => self.reduce_graph_event(run_id, replay, event, true)?,
+            "workflow.patched" => self.reduce_graph_event(run_id, replay, event, false)?,
+            "task.started" => {
+                let task = Self::replay_task_mut(run_id, replay, event)?;
+                let attempt_id = event.attempt_id.clone().ok_or_else(|| {
+                    Self::replay_error(run_id, "task.started is missing its attempt id")
+                })?;
+                if task.status != TaskStatus::Pending || task.active_attempt_id.is_some() {
+                    return Err(Self::replay_error(
+                        run_id,
+                        format!(
+                            "task {} started from a non-pending state",
+                            task.node.task_id
+                        ),
+                    ));
+                }
+                task.status = TaskStatus::Running;
+                task.active_attempt_id = Some(attempt_id);
+                task.attempt_count += 1;
+                task.finished_at = None;
+                replay.saw_task_start = true;
+            }
+            "task.retry_scheduled" | "task.recovered" => {
+                let task = Self::replay_task_mut(run_id, replay, event)?;
+                Self::assert_active_attempt(run_id, task, event)?;
+                task.status = TaskStatus::Pending;
+                task.active_attempt_id = None;
+                task.finished_at = None;
+            }
+            "task.succeeded" | "task.failed" | "task.skipped" => {
+                let task = Self::replay_task_mut(run_id, replay, event)?;
+                Self::assert_active_attempt(run_id, task, event)?;
+                task.status = match event.event_type.as_str() {
+                    "task.succeeded" => TaskStatus::Succeeded,
+                    "task.failed" => TaskStatus::Failed,
+                    "task.skipped" => TaskStatus::Skipped,
+                    _ => unreachable!("matched terminal task event"),
+                };
+                task.active_attempt_id = None;
+                task.finished_at = Some(event.created_at);
+            }
+            "task.cancelled" => {
+                let task = Self::replay_task_mut(run_id, replay, event)?;
+                if event.attempt_id.is_some() {
+                    Self::assert_active_attempt(run_id, task, event)?;
+                } else if task.status != TaskStatus::Pending {
+                    return Err(Self::replay_error(
+                        run_id,
+                        format!(
+                            "queued cancellation for non-pending task {}",
+                            task.node.task_id
+                        ),
+                    ));
+                }
+                task.status = TaskStatus::Cancelled;
+                task.active_attempt_id = None;
+                task.finished_at = Some(event.created_at);
+            }
+            "task.retry_exhausted" | "task.recovery_exhausted" => {
+                let task = Self::replay_task_mut(run_id, replay, event)?;
+                if !task.status.is_terminal() {
+                    return Err(Self::replay_error(
+                        run_id,
+                        format!("{} precedes a terminal task state", event.event_type),
+                    ));
+                }
+            }
+            "run.cancel_requested" => {
+                if event.task_id.is_some() || event.attempt_id.is_some() {
+                    return Err(Self::replay_error(
+                        run_id,
+                        "run.cancel_requested unexpectedly names a task attempt",
+                    ));
+                }
+                if replay.cancel_requested {
+                    return Err(Self::replay_error(
+                        run_id,
+                        "run.cancel_requested appears more than once",
+                    ));
+                }
+                replay.cancel_requested = true;
+            }
+            _ if event.artifact_id.is_some() => {
+                self.reduce_artifact_trace_event(run_id, replay, event)?;
+            }
+            other => {
+                return Err(Self::replay_error(
+                    run_id,
+                    format!("unknown durable event type {other}"),
+                ));
+            }
+        }
+        replay.event_cursor = event.cursor;
+        Ok(())
+    }
+
+    /// Artifact-bearing events are intentionally extensible: task runtimes
+    /// emit domain-specific trace events through `write_task_artifact`. Their
+    /// authority is the artifact origin, never an event-type allowlist.
+    fn reduce_artifact_trace_event(
+        &self,
+        run_id: &RunId,
+        replay: &ReplayedWorkflow,
+        event: &StoredEvent,
+    ) -> RebuildRuntimeResult<()> {
+        if event.event_type.trim().is_empty() {
+            return Err(Self::replay_error(
+                run_id,
+                "artifact trace event has an empty event type",
+            ));
+        }
+        let task_id = event.task_id.as_ref().ok_or_else(|| {
+            Self::replay_error(
+                run_id,
+                format!("{} is missing its task id", event.event_type),
+            )
+        })?;
+        let attempt_id = event.attempt_id.as_ref().ok_or_else(|| {
+            Self::replay_error(
+                run_id,
+                format!("{} is missing its attempt id", event.event_type),
+            )
+        })?;
+        let artifact_id = event.artifact_id.as_ref().ok_or_else(|| {
+            Self::replay_error(
+                run_id,
+                format!("{} is missing its artifact id", event.event_type),
+            )
+        })?;
+        let task = replay.tasks.get(task_id).ok_or_else(|| {
+            Self::replay_error(
+                run_id,
+                format!("{} references unknown task {task_id}", event.event_type),
+            )
+        })?;
+        Self::assert_active_attempt(run_id, task, event)?;
+        let artifact = self.store.artifact(artifact_id)?;
+        artifact.validate()?;
+        let origin = artifact.origin.as_ref().ok_or_else(|| {
+            Self::replay_error(
+                run_id,
+                format!("{} artifact has no task origin", event.event_type),
+            )
+        })?;
+        if origin.run_id.as_ref() != Some(run_id)
+            || origin.task_id.as_ref() != Some(task_id)
+            || origin.attempt_id.as_ref() != Some(attempt_id)
+            || origin.contract_hash.as_ref() != task.node.contract_hash.as_ref()
+        {
+            return Err(Self::replay_error(
+                run_id,
+                format!(
+                    "{} artifact origin does not match task attempt",
+                    event.event_type
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    fn reduce_graph_event(
+        &self,
+        run_id: &RunId,
+        replay: &mut ReplayedWorkflow,
+        event: &StoredEvent,
+        initial: bool,
+    ) -> RebuildRuntimeResult<()> {
+        if initial && (event.task_id.is_some() || event.attempt_id.is_some()) {
+            return Err(Self::replay_error(
+                run_id,
+                format!("{} unexpectedly names a task attempt", event.event_type),
+            ));
+        }
+        if !initial && (event.task_id.is_some() || event.attempt_id.is_some()) {
+            let task = Self::replay_task_mut(run_id, replay, event)?;
+            Self::assert_active_attempt(run_id, task, event)?;
+        }
+        if initial != replay.revisions.is_empty() {
+            return Err(Self::replay_error(
+                run_id,
+                format!("{} appears out of graph revision order", event.event_type),
+            ));
+        }
+        let artifact_id = event.artifact_id.as_ref().ok_or_else(|| {
+            Self::replay_error(
+                run_id,
+                format!("{} is missing its graph artifact", event.event_type),
+            )
+        })?;
+        let graph_artifact = self.store.artifact(artifact_id)?;
+        if graph_artifact.kind != ArtifactKind::WorkflowGraph {
+            return Err(Self::replay_error(
+                run_id,
+                format!(
+                    "{} references a non-workflow graph artifact",
+                    event.event_type
+                ),
+            ));
+        }
+        let graph: WorkflowGraph =
+            serde_json::from_slice(&self.store.read_blob(&graph_artifact.blob)?)?;
+        graph.validate()?;
+
+        if let Some(previous) = replay.revisions.last() {
+            if previous.graph.topology_id != graph.topology_id {
+                return Err(Self::replay_error(
+                    run_id,
+                    "workflow.patched changed the topology id",
+                ));
+            }
+            let next_ids = graph
+                .nodes
+                .iter()
+                .map(|node| node.task_id.clone())
+                .collect::<BTreeSet<_>>();
+            for node in &previous.graph.nodes {
+                if !next_ids.contains(&node.task_id) {
+                    return Err(Self::replay_error(
+                        run_id,
+                        format!("workflow.patched removed task {}", node.task_id),
+                    ));
+                }
+            }
+        }
+
+        for node in &graph.nodes {
+            match replay.tasks.get_mut(&node.task_id) {
+                Some(task) => {
+                    if task.status != TaskStatus::Pending && task.node != *node {
+                        return Err(Self::replay_error(
+                            run_id,
+                            format!("workflow.patched rewrote non-pending task {}", node.task_id),
+                        ));
+                    }
+                    task.node = node.clone();
+                }
+                None => {
+                    replay.tasks.insert(
+                        node.task_id.clone(),
+                        ReplayedTask {
+                            node: node.clone(),
+                            status: TaskStatus::Pending,
+                            active_attempt_id: None,
+                            attempt_count: 0,
+                            finished_at: None,
+                        },
+                    );
+                }
+            }
+        }
+        replay.revisions.push(ReplayedWorkflowRevision {
+            cursor: event.cursor,
+            graph_artifact,
+            graph,
+            created_at: event.created_at,
+        });
+        Ok(())
+    }
+
+    fn replay_task_mut<'a>(
+        run_id: &RunId,
+        replay: &'a mut ReplayedWorkflow,
+        event: &StoredEvent,
+    ) -> RebuildRuntimeResult<&'a mut ReplayedTask> {
+        let task_id = event.task_id.as_ref().ok_or_else(|| {
+            Self::replay_error(
+                run_id,
+                format!("{} is missing its task id", event.event_type),
+            )
+        })?;
+        replay.tasks.get_mut(task_id).ok_or_else(|| {
+            Self::replay_error(
+                run_id,
+                format!("{} references unknown task {task_id}", event.event_type),
+            )
+        })
+    }
+
+    fn assert_active_attempt(
+        run_id: &RunId,
+        task: &ReplayedTask,
+        event: &StoredEvent,
+    ) -> RebuildRuntimeResult<()> {
+        let attempt_id = event.attempt_id.as_ref().ok_or_else(|| {
+            Self::replay_error(
+                run_id,
+                format!("{} is missing its attempt id", event.event_type),
+            )
+        })?;
+        if task.status != TaskStatus::Running || task.active_attempt_id.as_ref() != Some(attempt_id)
+        {
+            return Err(Self::replay_error(
+                run_id,
+                format!(
+                    "{} does not match task {} active attempt",
+                    event.event_type, task.node.task_id
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_replay_revisions(
+        &self,
+        run_id: &RunId,
+        replay: &ReplayedWorkflow,
+    ) -> RebuildRuntimeResult<()> {
+        let purpose = self.store.run_purpose(run_id)?;
+        for (index, reduced) in replay.revisions.iter().enumerate() {
+            let revision = u64::try_from(index).map_err(|_| {
+                Self::replay_error(run_id, "workflow revision index does not fit u64")
+            })?;
+            let durable = self.store.workflow_revision(run_id, revision)?;
+            if durable.graph_artifact != reduced.graph_artifact
+                || durable.graph != reduced.graph
+                || durable.created_at != reduced.created_at
+            {
+                return Err(Self::replay_error(
+                    run_id,
+                    format!("revision {revision} differs from event history"),
+                ));
+            }
+            self.validate_compiled_graph(purpose, &reduced.graph)?;
+        }
+        Ok(())
+    }
+
+    fn validate_replay_snapshot(
+        &self,
+        run_id: &RunId,
+        replay: &ReplayedWorkflow,
+        snapshot: &WorkflowSnapshot,
+    ) -> RebuildRuntimeResult<()> {
+        let latest = replay.revisions.last().ok_or_else(|| {
+            Self::replay_error(run_id, "workflow snapshot has no reduced graph revision")
+        })?;
+        let expected_revision = u64::try_from(replay.revisions.len() - 1)
+            .map_err(|_| Self::replay_error(run_id, "workflow revision count does not fit u64"))?;
+        if snapshot.revision.revision != expected_revision
+            || snapshot.revision.graph_artifact != latest.graph_artifact
+            || snapshot.revision.graph != latest.graph
+            || snapshot.revision.created_at != latest.created_at
+        {
+            return Err(Self::replay_error(
+                run_id,
+                "latest workflow snapshot differs from reduced graph history",
+            ));
+        }
+        if snapshot.event_cursor != replay.event_cursor {
+            return Err(Self::replay_error(
+                run_id,
+                "workflow snapshot event cursor differs from reduced history",
+            ));
+        }
+        if snapshot.cancel_requested != replay.cancel_requested {
+            return Err(Self::replay_error(
+                run_id,
+                "workflow cancellation marker differs from reduced history",
+            ));
+        }
+
+        let stored_tasks = snapshot
+            .tasks
+            .iter()
+            .map(|task| (task.node.task_id.clone(), task))
+            .collect::<BTreeMap<_, _>>();
+        if stored_tasks.len() != replay.tasks.len() {
+            return Err(Self::replay_error(
+                run_id,
+                "workflow task count differs from reduced graph history",
+            ));
+        }
+        for (task_id, reduced) in &replay.tasks {
+            let stored = stored_tasks.get(task_id).ok_or_else(|| {
+                Self::replay_error(run_id, format!("snapshot is missing task {task_id}"))
+            })?;
+            let stored_attempt = stored
+                .active_attempt
+                .as_ref()
+                .map(|attempt| attempt.permit.attempt_id.clone());
+            if stored.node != reduced.node
+                || stored.status != reduced.status
+                || stored.attempt_count != reduced.attempt_count
+                || stored_attempt != reduced.active_attempt_id
+                || stored.finished_at != reduced.finished_at
+            {
+                return Err(Self::replay_error(
+                    run_id,
+                    format!("task {task_id} differs from reduced event/task history"),
+                ));
+            }
+        }
+
+        let expected_status = if replay
+            .tasks
+            .values()
+            .any(|task| matches!(task.status, TaskStatus::Pending | TaskStatus::Running))
+        {
+            if replay.saw_task_start {
+                WorkflowStatus::Running
+            } else {
+                WorkflowStatus::Queued
+            }
+        } else if replay
+            .tasks
+            .values()
+            .any(|task| task.status == TaskStatus::Failed)
+        {
+            WorkflowStatus::Failed
+        } else if replay
+            .tasks
+            .values()
+            .all(|task| task.status == TaskStatus::Cancelled)
+        {
+            WorkflowStatus::Cancelled
+        } else {
+            WorkflowStatus::Completed
+        };
+        if snapshot.status != expected_status
+            || (expected_status == WorkflowStatus::Running && snapshot.finished_at.is_some())
+            || (expected_status == WorkflowStatus::Queued && snapshot.finished_at.is_some())
+            || (matches!(
+                expected_status,
+                WorkflowStatus::Completed | WorkflowStatus::Failed | WorkflowStatus::Cancelled
+            ) && snapshot.finished_at.is_none())
+        {
+            return Err(Self::replay_error(
+                run_id,
+                "workflow status differs from reduced task history",
+            ));
+        }
+        Ok(())
+    }
+
+    fn replay_error(run_id: &RunId, reason: impl Into<String>) -> RebuildRuntimeError {
+        RebuildRuntimeError::ReplayDiverged {
+            run_id: run_id.clone(),
+            reason: reason.into(),
+        }
     }
 
     /// Applies a Planner proposal to a bootstrap graph. It adds all research nodes
@@ -1575,6 +2123,7 @@ mod tests {
         let recovered = runtime.recover(&run_id).unwrap();
         assert_eq!(recovered.revision.revision, 1);
         assert_eq!(recovered.revision.graph, patched);
+        assert_eq!(runtime.replay_run(&run_id).unwrap(), recovered);
         assert_eq!(runtime.replay_revision(&run_id, 0).unwrap().graph, graph);
         assert_eq!(
             recovered
@@ -1629,6 +2178,77 @@ mod tests {
         assert!(matches!(
             runtime.bootstrap(RunPurpose::Paper, "active"),
             Err(RebuildRuntimeError::PaperWorkflowRequiresPrecompiledProposal)
+        ));
+    }
+
+    #[test]
+    fn replay_rejects_unknown_durable_event_types() {
+        let root = tempdir().unwrap();
+        let runtime = RebuildWorkflowRuntime::new(V2Store::open(root.path()).unwrap(), catalogue());
+        let run_id = RunId::new();
+        let event = StoredEvent {
+            cursor: 1,
+            run_id: run_id.clone(),
+            task_id: None,
+            attempt_id: None,
+            event_type: "unknown.replay.event".to_owned(),
+            artifact_id: None,
+            created_at: Utc::now(),
+        };
+
+        assert!(matches!(
+            runtime.reduce_event(&run_id, &mut ReplayedWorkflow::default(), &event),
+            Err(RebuildRuntimeError::ReplayDiverged { .. })
+        ));
+    }
+
+    #[test]
+    fn replay_accepts_task_artifact_trace_events_with_matching_origin() {
+        let root = tempdir().unwrap();
+        let store = V2Store::open(root.path()).unwrap();
+        let runtime = RebuildWorkflowRuntime::new(store.clone(), catalogue());
+        let run_id = RunId::new();
+        let now = Utc::now();
+        runtime
+            .submit(
+                run_id.clone(),
+                RunPurpose::Debug,
+                runtime.bootstrap(RunPurpose::Debug, "active").unwrap(),
+                now,
+            )
+            .unwrap();
+        let claimed = store
+            .claim_next_task("trace-worker", now, Duration::seconds(30))
+            .unwrap()
+            .unwrap();
+        let artifact = task_artifact(&store, &claimed, now);
+        store
+            .write_task_artifact(&claimed.permit, &artifact, "agent.turn_completed", now)
+            .unwrap();
+
+        assert_eq!(
+            runtime.replay_run(&run_id).unwrap(),
+            store.workflow_snapshot(&run_id).unwrap()
+        );
+    }
+
+    #[test]
+    fn replay_rejects_snapshot_task_divergence() {
+        let root = tempdir().unwrap();
+        let store = V2Store::open(root.path()).unwrap();
+        let runtime = RebuildWorkflowRuntime::new(store.clone(), catalogue());
+        let graph = runtime.lower(RunPurpose::Debug, &proposal()).unwrap();
+        let run_id = RunId::new();
+        runtime
+            .submit(run_id.clone(), RunPurpose::Debug, graph, Utc::now())
+            .unwrap();
+        let replay = runtime.reduce_history(&run_id).unwrap();
+        let mut forged = store.workflow_snapshot(&run_id).unwrap();
+        forged.tasks[0].status = TaskStatus::Succeeded;
+
+        assert!(matches!(
+            runtime.validate_replay_snapshot(&run_id, &replay, &forged),
+            Err(RebuildRuntimeError::ReplayDiverged { .. })
         ));
     }
 
@@ -1749,6 +2369,10 @@ mod tests {
         let mut replay = first_page;
         replay.extend(tasks.store().events_after(&run_id, cursor, 100).unwrap());
         assert_eq!(replay, events);
+        assert_eq!(
+            workflow.replay_run(&run_id).unwrap(),
+            tasks.store().workflow_snapshot(&run_id).unwrap()
+        );
     }
 
     #[tokio::test]
@@ -1816,6 +2440,7 @@ mod tests {
         assert_eq!(recovered_task.status, TaskStatus::Succeeded);
         assert_eq!(recovered_task.attempt_count, 2);
         assert!(recovered_task.active_attempt.is_none());
+        assert_eq!(workflow.replay_run(&run_id).unwrap(), after_recovery);
         assert!(matches!(
             tasks
                 .store()
@@ -1843,6 +2468,10 @@ mod tests {
         assert!(events
             .iter()
             .any(|event| event.event_type == "run.cancel_requested"));
+        assert_eq!(
+            workflow.replay_run(&run_id).unwrap(),
+            tasks.store().workflow_snapshot(&run_id).unwrap()
+        );
     }
 
     #[test]
