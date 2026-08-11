@@ -18,7 +18,7 @@ use akzio_domain::{
 };
 use akzio_model::{ModelClient, ModelError, ModelRequest, ModelToolDefinition};
 use akzio_runtime::v2::{RecipeCatalogue, RuntimeError as RebuildRuntimeError, TerminalRecipeSet};
-use akzio_store::v2::{StoreError, V2Store};
+use akzio_store::v2::{StoreError, StoredContract, V2Store};
 use chrono::{DateTime, Duration, Utc};
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
@@ -113,14 +113,32 @@ pub struct ActiveResearchCatalogue {
 }
 
 impl ActiveResearchCatalogue {
-    /// Install exactly the immutable, locally-defined Active research
-    /// contracts and derive the only RecipeCatalogue that can execute them.
-    /// Candidate contracts deliberately have no path through this constructor.
+    /// Restore the Store-owned active heads, bootstrapping only a fresh Store
+    /// with the immutable Rust-defined defaults. Candidates deliberately have
+    /// no execution path until a canonical Paper-backed transition promotes
+    /// their persisted head.
     pub fn install(store: &V2Store, now: DateTime<Utc>) -> RebuildResearchResult<Self> {
-        let contracts =
-            RebuildContractCatalogue::install(store, canonical_active_contracts(store)?, now)?;
+        let contracts = RebuildContractCatalogue::load_or_bootstrap_active(
+            store,
+            canonical_active_contracts(store)?,
+            now,
+        )?;
         let recipes = contracts.active_recipe_catalogue(store)?;
         Ok(Self { contracts, recipes })
+    }
+
+    /// Persist a capability-bounded candidate beneath an installed Active
+    /// Contract. The Store, rather than this process-local catalogue, owns its
+    /// immutable installation and later policy-driven activation.
+    pub fn install_candidate(
+        &self,
+        store: &V2Store,
+        active_contract_hash: &akzio_domain::ContentHash,
+        candidate: &AgentContract,
+        now: DateTime<Utc>,
+    ) -> RebuildResearchResult<InstalledContract> {
+        self.contracts
+            .install_candidate(store, active_contract_hash, candidate, now)
     }
 }
 
@@ -179,14 +197,21 @@ pub struct RebuildContractCatalogue {
 }
 
 impl RebuildContractCatalogue {
-    pub fn install(
+    fn load_or_bootstrap_active(
         store: &V2Store,
         contracts: impl IntoIterator<Item = AgentContract>,
         now: DateTime<Utc>,
     ) -> RebuildResearchResult<Self> {
+        let contracts = contracts.into_iter().collect::<Vec<_>>();
+        validate_unique_contracts(&contracts)?;
         let mut by_hash = BTreeMap::new();
         let mut by_identity = BTreeMap::new();
         for contract in contracts {
+            let stored = match store.active_contract(&contract.purpose)? {
+                Some(stored) => stored,
+                None => store.install_active_contract(&contract, now)?,
+            };
+            let contract = stored.contract;
             contract.validate()?;
             if by_hash.contains_key(&contract.contract_hash) {
                 return Err(RebuildResearchError::DuplicateContract(
@@ -194,34 +219,19 @@ impl RebuildContractCatalogue {
                 ));
             }
             let identity = (contract.contract_id.clone(), contract.version);
-            let contract_hash = contract.contract_hash.clone();
             if by_identity.contains_key(&identity) {
                 return Err(RebuildResearchError::DuplicateContractVersion {
                     contract_id: contract.contract_id.clone(),
                     version: contract.version,
                 });
             }
-            let artifact = Artifact::new(
-                ArtifactKind::Contract,
-                store.put_json(&contract)?,
-                "research.contract_catalogue",
-                ArtifactLifecycle::Canonical,
-                ArtifactProvenance {
-                    source_family: "akzio.contract_catalogue".to_owned(),
-                    observed_at: None,
-                    retrieved_at: now,
-                    source_uri: None,
-                    confidence_ppm: 1_000_000,
-                    producer_contract_hash: None,
-                },
-                None,
-                vec![],
-                now,
-            )?;
-            store.write_bootstrap_artifact(&artifact)?;
+            let contract_hash = contract.contract_hash.clone();
             by_hash.insert(
                 contract_hash.clone(),
-                InstalledContract { contract, artifact },
+                InstalledContract {
+                    contract,
+                    artifact: stored.artifact,
+                },
             );
             by_identity.insert(identity, contract_hash);
         }
@@ -229,6 +239,15 @@ impl RebuildContractCatalogue {
             by_hash,
             by_identity,
         })
+    }
+
+    #[cfg(test)]
+    fn install(
+        store: &V2Store,
+        contracts: impl IntoIterator<Item = AgentContract>,
+        now: DateTime<Utc>,
+    ) -> RebuildResearchResult<Self> {
+        Self::load_or_bootstrap_active(store, contracts, now)
     }
 
     pub fn get(
@@ -252,20 +271,16 @@ impl RebuildContractCatalogue {
         self.by_identity.get(&(contract_id.clone(), version))
     }
 
-    /// Lower only the canonical initial Active contracts into agent recipes.
+    /// Lower only Store-owned Active Contract heads into agent recipes.
     /// The recipe limits come from each contract's termination/budget/retry
     /// policy; Rust owns the fixed priority ceilings and terminal gate recipes.
     ///
-    /// This method rejects both altered Active contracts and additional
-    /// candidate/unknown contracts rather than silently granting a new recipe.
+    /// This method rejects unknown purposes and candidates that are not the
+    /// current durable head rather than silently granting a new recipe.
     pub fn active_recipe_catalogue(
         &self,
         store: &V2Store,
     ) -> RebuildResearchResult<RecipeCatalogue> {
-        let expected_by_purpose = canonical_active_contracts(store)?
-            .into_iter()
-            .map(|contract| (contract.purpose.as_str().to_owned(), contract))
-            .collect::<BTreeMap<_, _>>();
         let mut installed_purposes = BTreeSet::new();
         let mut recipes = Vec::with_capacity(ACTIVE_RECIPE_POLICIES.len() + 6);
 
@@ -286,10 +301,14 @@ impl RebuildContractCatalogue {
                     actual: installed.contract.output.artifact_kind,
                 });
             }
-            let expected = expected_by_purpose
-                .get(purpose)
-                .expect("active recipe policy has a canonical contract");
-            if installed.contract.contract_hash != expected.contract_hash {
+            let active = store
+                .active_contract(&installed.contract.purpose)?
+                .ok_or_else(|| {
+                    RebuildResearchError::NonCanonicalActiveContract(purpose.to_owned())
+                })?;
+            if active.contract.contract_hash != installed.contract.contract_hash
+                || active.artifact != installed.artifact
+            {
                 return Err(RebuildResearchError::NonCanonicalActiveContract(
                     purpose.to_owned(),
                 ));
@@ -345,6 +364,46 @@ impl RebuildContractCatalogue {
             })
         }
     }
+
+    pub fn install_candidate(
+        &self,
+        store: &V2Store,
+        active_contract_hash: &akzio_domain::ContentHash,
+        candidate: &AgentContract,
+        now: DateTime<Utc>,
+    ) -> RebuildResearchResult<InstalledContract> {
+        self.validate_candidate(active_contract_hash, candidate)?;
+        let stored = store.install_candidate_contract(active_contract_hash, candidate, now)?;
+        Ok(installed_contract(stored))
+    }
+}
+
+fn installed_contract(stored: StoredContract) -> InstalledContract {
+    InstalledContract {
+        contract: stored.contract,
+        artifact: stored.artifact,
+    }
+}
+
+fn validate_unique_contracts(contracts: &[AgentContract]) -> RebuildResearchResult<()> {
+    let mut hashes = BTreeSet::new();
+    let mut identities = BTreeSet::new();
+    for contract in contracts {
+        contract.validate()?;
+        if !hashes.insert(contract.contract_hash.clone()) {
+            return Err(RebuildResearchError::DuplicateContract(
+                contract.contract_hash.clone(),
+            ));
+        }
+        let identity = (contract.contract_id.clone(), contract.version);
+        if !identities.insert(identity) {
+            return Err(RebuildResearchError::DuplicateContractVersion {
+                contract_id: contract.contract_id.clone(),
+                version: contract.version,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn active_recipe_policy(purpose: &str) -> Option<ActiveRecipePolicy> {
@@ -2199,6 +2258,103 @@ mod tests {
             assert_eq!(recipe.contract_hash, None);
             assert!(recipe.allowed_evidence_sources.is_empty());
         }
+        store.verify_integrity().unwrap();
+    }
+
+    #[test]
+    fn active_catalogue_restores_store_owned_heads_after_restart() {
+        let root = tempdir().unwrap();
+        let now = Utc::now();
+        let store = V2Store::open(root.path()).unwrap();
+        let first = ActiveResearchCatalogue::install(&store, now).unwrap();
+        let expected = first
+            .contracts
+            .contracts()
+            .map(|installed| {
+                (
+                    installed.contract.purpose.as_str().to_owned(),
+                    installed.contract.contract_hash.clone(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        drop(first);
+        drop(store);
+
+        let reopened = V2Store::open(root.path()).unwrap();
+        let restored =
+            ActiveResearchCatalogue::install(&reopened, now + Duration::seconds(1)).unwrap();
+        let actual = restored
+            .contracts
+            .contracts()
+            .map(|installed| {
+                (
+                    installed.contract.purpose.as_str().to_owned(),
+                    installed.contract.contract_hash.clone(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        assert_eq!(actual, expected);
+        reopened.verify_integrity().unwrap();
+    }
+
+    #[test]
+    fn candidate_install_is_durable_bounded_and_non_executable() {
+        let root = tempdir().unwrap();
+        let store = V2Store::open(root.path()).unwrap();
+        let now = Utc::now();
+        let active = ActiveResearchCatalogue::install(&store, now).unwrap();
+        let baseline = active
+            .contracts
+            .contracts()
+            .find(|installed| installed.contract.purpose.as_str() == PLANNER_RECIPE_ID)
+            .unwrap()
+            .contract
+            .clone();
+        let mut candidate = baseline.clone();
+        candidate.version += 1;
+        candidate.contract_hash = candidate.expected_hash().unwrap();
+        candidate.validate().unwrap();
+
+        let installed = active
+            .install_candidate(&store, &baseline.contract_hash, &candidate, now)
+            .unwrap();
+        assert_eq!(installed.contract, candidate);
+        assert_eq!(
+            store
+                .active_contract(&baseline.purpose)
+                .unwrap()
+                .unwrap()
+                .contract
+                .contract_hash,
+            baseline.contract_hash
+        );
+        assert_eq!(
+            store
+                .contract_installation(&candidate.contract_hash)
+                .unwrap()
+                .unwrap()
+                .baseline_contract_hash,
+            Some(baseline.contract_hash.clone())
+        );
+        assert!(active.contracts.get(&candidate.contract_hash).is_err());
+
+        let mut expanded = candidate;
+        expanded.version += 1;
+        expanded
+            .context
+            .permitted_source_families
+            .insert("unapproved_source".to_owned());
+        expanded.candidate_capability_ceiling = akzio_domain::CandidateCapabilityCeiling {
+            context: expanded.context.clone(),
+            tool_grants: expanded.tool_grants.clone(),
+        };
+        expanded.contract_hash = expanded.expected_hash().unwrap();
+        expanded.validate().unwrap();
+        assert!(matches!(
+            active.install_candidate(&store, &baseline.contract_hash, &expanded, now),
+            Err(RebuildResearchError::CandidateCapabilityExpansion { .. })
+        ));
         store.verify_integrity().unwrap();
     }
 

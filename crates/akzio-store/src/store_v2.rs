@@ -14,7 +14,8 @@ use std::{
 
 use akzio_domain::{
     AgentContract, Artifact, ArtifactId, ArtifactKind, ArtifactLifecycle, ArtifactOrigin,
-    ArtifactRef, Asset, AttemptId, BlobRef, CandidatePolicy, ContentHash, DomainError, Evaluation,
+    ArtifactProvenance, ArtifactRef, Asset, AttemptId, BlobRef, CandidatePolicy,
+    CandidatePolicyState, ContentHash, ContractId, ContractPurpose, DomainError, Evaluation,
     ExecutionContext, ExecutionPlan, ExecutionVerdict, Experience, FailureDisposition, LeaseId,
     OrderReceipt, OrderReceiptState, Outcome, OutcomeExecutionLineage, OutcomeHorizon,
     OutcomeSchedule, PaperCommitment, PaperReprice, PolicyState, PolicySubject, PolicyTransition,
@@ -104,6 +105,20 @@ pub enum RebuildStoreError {
     UnsealedOutcome(ArtifactId),
     #[error("invalid canonical learning commit: {0}")]
     InvalidLearningCommit(&'static str),
+    #[error("contract {0} is not installed")]
+    MissingContractInstallation(ContentHash),
+    #[error("contract identity {contract_id:?} version {version} is already installed")]
+    DuplicateContractVersion {
+        contract_id: ContractId,
+        version: u32,
+    },
+    #[error("candidate contract {candidate} exceeds active contract {active}'s capability")]
+    ContractCapabilityExpansion {
+        active: ContentHash,
+        candidate: ContentHash,
+    },
+    #[error("contract catalogue activation conflicts for purpose {0:?}")]
+    ContractActivationConflict(ContractPurpose),
     #[error("policy head for {0} does not match transition predecessor")]
     PolicyHeadMismatch(String),
     #[error("policy transition {0} conflicts with a prior immutable transition")]
@@ -123,6 +138,17 @@ pub struct RebuildStore {
     root: Arc<PathBuf>,
     blobs: Arc<PathBuf>,
     connection: Arc<Mutex<Connection>>,
+}
+
+/// Immutable Contract installation. `activated_at` is derived from the
+/// catalogue head; the installation row itself is never rewritten.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredContract {
+    pub contract: AgentContract,
+    pub artifact: Artifact,
+    pub baseline_contract_hash: Option<ContentHash>,
+    pub installed_at: DateTime<Utc>,
+    pub activated_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -564,6 +590,329 @@ impl RebuildStore {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         insert_artifact(&transaction, artifact)?;
         transaction.commit()?;
+        Ok(())
+    }
+
+    /// Return the immutable Contract currently selected for a purpose.
+    /// The mutable head is only a reconstruction cursor; each activation stays
+    /// in `rebuild_contract_activations` for Doctor and restart recovery.
+    pub fn active_contract(
+        &self,
+        purpose: &ContractPurpose,
+    ) -> RebuildStoreResult<Option<StoredContract>> {
+        let connection = self.connection.lock().expect("store connection poisoned");
+        let Some((contract_hash, _)) = contract_catalogue_head(&connection, purpose)? else {
+            return Ok(None);
+        };
+        self.stored_contract_with_connection(&connection, &contract_hash)
+    }
+
+    /// Return an installed Contract, whether it is an active head or a bounded
+    /// candidate awaiting Paper-backed promotion.
+    pub fn contract_installation(
+        &self,
+        contract_hash: &ContentHash,
+    ) -> RebuildStoreResult<Option<StoredContract>> {
+        let connection = self.connection.lock().expect("store connection poisoned");
+        self.stored_contract_with_connection(&connection, contract_hash)
+    }
+
+    /// Install the first Rust-defined active Contract for a purpose. A later
+    /// version must enter through `install_candidate_contract` and a canonical
+    /// policy transition; this prevents a restart from silently replacing it.
+    pub fn install_active_contract(
+        &self,
+        contract: &AgentContract,
+        now: DateTime<Utc>,
+    ) -> RebuildStoreResult<StoredContract> {
+        contract.validate()?;
+        let artifact = self.contract_artifact(contract, now)?;
+        let mut connection = self.connection.lock().expect("store connection poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        if let Some(existing) =
+            self.stored_contract_with_connection(&transaction, &contract.contract_hash)?
+        {
+            if existing.contract != *contract || existing.activated_at.is_none() {
+                return Err(RebuildStoreError::ContractActivationConflict(
+                    contract.purpose.clone(),
+                ));
+            }
+            transaction.commit()?;
+            return Ok(existing);
+        }
+        assert_contract_identity_available(&transaction, contract)?;
+        if contract_catalogue_head(&transaction, &contract.purpose)?.is_some() {
+            return Err(RebuildStoreError::ContractActivationConflict(
+                contract.purpose.clone(),
+            ));
+        }
+        insert_artifact(&transaction, &artifact)?;
+        insert_contract_installation(&transaction, contract, &artifact, None, now)?;
+        let activation_id = append_contract_activation(
+            &transaction,
+            &contract.purpose,
+            None,
+            &contract.contract_hash,
+            None,
+            now,
+        )?;
+        set_contract_catalogue_head(
+            &transaction,
+            &contract.purpose,
+            &contract.contract_hash,
+            activation_id,
+        )?;
+        transaction.commit()?;
+        drop(connection);
+        self.contract_installation(&contract.contract_hash)?
+            .ok_or_else(|| {
+                RebuildStoreError::MissingContractInstallation(contract.contract_hash.clone())
+            })
+    }
+
+    /// Persist a candidate relative to the current active Contract. This is an
+    /// immutable install only: activation is coupled atomically to the
+    /// candidate's canonical PolicyTransition in `record_policy_evaluation`.
+    pub fn install_candidate_contract(
+        &self,
+        active_contract_hash: &ContentHash,
+        candidate: &AgentContract,
+        now: DateTime<Utc>,
+    ) -> RebuildStoreResult<StoredContract> {
+        candidate.validate()?;
+        let artifact = self.contract_artifact(candidate, now)?;
+        let mut connection = self.connection.lock().expect("store connection poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let active = self
+            .stored_contract_with_connection(&transaction, active_contract_hash)?
+            .ok_or_else(|| {
+                RebuildStoreError::MissingContractInstallation(active_contract_hash.clone())
+            })?;
+        if active.activated_at.is_none() || !candidate_is_bounded(&active.contract, candidate) {
+            return Err(RebuildStoreError::ContractCapabilityExpansion {
+                active: active_contract_hash.clone(),
+                candidate: candidate.contract_hash.clone(),
+            });
+        }
+        if let Some(existing) =
+            self.stored_contract_with_connection(&transaction, &candidate.contract_hash)?
+        {
+            if existing.contract == *candidate
+                && existing.baseline_contract_hash.as_ref() == Some(active_contract_hash)
+                && existing.activated_at.is_none()
+            {
+                transaction.commit()?;
+                return Ok(existing);
+            }
+            return Err(RebuildStoreError::ContractActivationConflict(
+                candidate.purpose.clone(),
+            ));
+        }
+        assert_contract_identity_available(&transaction, candidate)?;
+        insert_artifact(&transaction, &artifact)?;
+        insert_contract_installation(
+            &transaction,
+            candidate,
+            &artifact,
+            Some(active_contract_hash),
+            now,
+        )?;
+        transaction.commit()?;
+        drop(connection);
+        self.contract_installation(&candidate.contract_hash)?
+            .ok_or_else(|| {
+                RebuildStoreError::MissingContractInstallation(candidate.contract_hash.clone())
+            })
+    }
+
+    fn contract_artifact(
+        &self,
+        contract: &AgentContract,
+        now: DateTime<Utc>,
+    ) -> RebuildStoreResult<Artifact> {
+        Ok(Artifact::new(
+            ArtifactKind::Contract,
+            self.put_json(contract)?,
+            "research.contract_catalogue",
+            ArtifactLifecycle::Canonical,
+            ArtifactProvenance {
+                source_family: "akzio.contract_catalogue".to_owned(),
+                observed_at: None,
+                retrieved_at: now,
+                source_uri: None,
+                confidence_ppm: 1_000_000,
+                producer_contract_hash: None,
+            },
+            None,
+            vec![],
+            now,
+        )?)
+    }
+
+    fn stored_contract_with_connection(
+        &self,
+        connection: &Connection,
+        contract_hash: &ContentHash,
+    ) -> RebuildStoreResult<Option<StoredContract>> {
+        let row = connection
+            .query_row(
+                r#"SELECT contract_artifact_id, baseline_contract_hash, installed_at,
+                          activation.activated_at
+                   FROM rebuild_contract_installations AS installation
+                   LEFT JOIN rebuild_contract_catalogue_heads AS head
+                     ON head.contract_hash = installation.contract_hash
+                   LEFT JOIN rebuild_contract_activations AS activation
+                     ON activation.activation_id = head.activation_id
+                   WHERE installation.contract_hash = ?1"#,
+                params![contract_hash.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        row.map(|(artifact_id, baseline, installed_at, activated_at)| {
+            let artifact = read_artifact(connection, &ArtifactId(ContentHash::new(artifact_id)?))?;
+            if artifact.kind != ArtifactKind::Contract
+                || artifact.lifecycle != ArtifactLifecycle::Canonical
+            {
+                return Err(RebuildStoreError::Integrity(format!(
+                    "contract {contract_hash} has an invalid artifact"
+                )));
+            }
+            let contract: AgentContract = self.read_artifact_payload(&artifact)?;
+            contract.validate()?;
+            if contract.contract_hash != *contract_hash {
+                return Err(RebuildStoreError::Integrity(format!(
+                    "contract installation {contract_hash} payload hash diverges"
+                )));
+            }
+            Ok(StoredContract {
+                contract,
+                artifact,
+                baseline_contract_hash: baseline.map(ContentHash::new).transpose()?,
+                installed_at: parse_time(&installed_at)?,
+                activated_at: activated_at.map(|value| parse_time(&value)).transpose()?,
+            })
+        })
+        .transpose()
+    }
+
+    fn apply_contract_catalogue_transition(
+        &self,
+        transaction: &Transaction<'_>,
+        commit: &PolicyEvaluationCommit,
+        transition: &PolicyTransition,
+    ) -> RebuildStoreResult<()> {
+        let PolicySubject::Contract(candidate_hash) = &commit.subject else {
+            return Ok(());
+        };
+        let candidate = self
+            .stored_contract_with_connection(transaction, candidate_hash)?
+            .ok_or_else(|| {
+                RebuildStoreError::MissingContractInstallation(candidate_hash.clone())
+            })?;
+        let Some(baseline_hash) = candidate.baseline_contract_hash.as_ref() else {
+            return Err(RebuildStoreError::ContractActivationConflict(
+                candidate.contract.purpose.clone(),
+            ));
+        };
+
+        match (transition.from, transition.to) {
+            (_, PolicyState::Contract(CandidatePolicyState::Active)) => {
+                let candidate_policy_artifact = commit.candidate_policy.as_ref().ok_or(
+                    RebuildStoreError::InvalidLearningCommit("contract_catalogue.candidate_policy"),
+                )?;
+                let candidate_policy: CandidatePolicy =
+                    self.read_artifact_payload(candidate_policy_artifact)?;
+                if candidate_policy.candidate.artifact_id != candidate.artifact.artifact_id
+                    || candidate_policy.baseline.kind != ArtifactKind::Contract
+                    || candidate_policy.subject != commit.subject
+                {
+                    return Err(RebuildStoreError::InvalidLearningCommit(
+                        "contract_catalogue.candidate_policy_binding",
+                    ));
+                }
+                let Some((current_hash, _)) =
+                    contract_catalogue_head(transaction, &candidate.contract.purpose)?
+                else {
+                    return Err(RebuildStoreError::ContractActivationConflict(
+                        candidate.contract.purpose.clone(),
+                    ));
+                };
+                let current = self
+                    .stored_contract_with_connection(transaction, &current_hash)?
+                    .ok_or_else(|| {
+                        RebuildStoreError::MissingContractInstallation(current_hash.clone())
+                    })?;
+                if current.contract.contract_hash != *baseline_hash
+                    || candidate_policy.baseline.artifact_id != current.artifact.artifact_id
+                    || !candidate_is_bounded(&current.contract, &candidate.contract)
+                {
+                    return Err(RebuildStoreError::ContractActivationConflict(
+                        candidate.contract.purpose.clone(),
+                    ));
+                }
+                let activation_id = append_contract_activation(
+                    transaction,
+                    &candidate.contract.purpose,
+                    Some(&current_hash),
+                    candidate_hash,
+                    Some(&transition.transition_id),
+                    transition.created_at,
+                )?;
+                set_contract_catalogue_head(
+                    transaction,
+                    &candidate.contract.purpose,
+                    candidate_hash,
+                    activation_id,
+                )?;
+            }
+            (PolicyState::Contract(CandidatePolicyState::Active), PolicyState::Contract(_)) => {
+                let Some((current_hash, _)) =
+                    contract_catalogue_head(transaction, &candidate.contract.purpose)?
+                else {
+                    return Err(RebuildStoreError::ContractActivationConflict(
+                        candidate.contract.purpose.clone(),
+                    ));
+                };
+                if current_hash != *candidate_hash {
+                    return Err(RebuildStoreError::ContractActivationConflict(
+                        candidate.contract.purpose.clone(),
+                    ));
+                }
+                let baseline = self
+                    .stored_contract_with_connection(transaction, baseline_hash)?
+                    .ok_or_else(|| {
+                        RebuildStoreError::MissingContractInstallation(baseline_hash.clone())
+                    })?;
+                if baseline.contract.purpose != candidate.contract.purpose {
+                    return Err(RebuildStoreError::ContractActivationConflict(
+                        candidate.contract.purpose.clone(),
+                    ));
+                }
+                let activation_id = append_contract_activation(
+                    transaction,
+                    &candidate.contract.purpose,
+                    Some(candidate_hash),
+                    baseline_hash,
+                    Some(&transition.transition_id),
+                    transition.created_at,
+                )?;
+                set_contract_catalogue_head(
+                    transaction,
+                    &candidate.contract.purpose,
+                    baseline_hash,
+                    activation_id,
+                )?;
+            }
+            _ => {}
+        }
         Ok(())
     }
 
@@ -2491,6 +2840,10 @@ impl RebuildStore {
             previous
         };
 
+        if let Some(transition) = &commit.transition {
+            self.apply_contract_catalogue_transition(&transaction, commit, transition)?;
+        }
+
         transaction.execute(
             r#"INSERT INTO rebuild_policy_evaluations
                 (evaluation_artifact_id, subject_id, subject_json, outcome_artifact_id,
@@ -2733,6 +3086,7 @@ impl RebuildStore {
     ) -> RebuildStoreResult<Vec<Artifact>> {
         let connection = self.connection.lock().expect("store connection poisoned");
         let kind = kind.map(enum_name);
+        self.verify_contract_catalogue_history(&connection)?;
         self.verify_policy_evaluation_history(&connection)?;
 
         let mut statement = connection.prepare(
@@ -3618,8 +3972,172 @@ impl RebuildStore {
             let snapshot = self.workflow_snapshot_with_connection(&connection, &run_id)?;
             self.verify_workflow_history(&connection, &snapshot)?;
         }
+        self.verify_contract_catalogue_history(&connection)?;
         self.verify_policy_evaluation_history(&connection)?;
         self.verify_candidate_policy_history(&connection)?;
+        Ok(())
+    }
+
+    fn verify_contract_catalogue_history(&self, connection: &Connection) -> RebuildStoreResult<()> {
+        let installations = connection
+            .prepare(
+                "SELECT contract_hash, contract_artifact_id, contract_id, contract_version, purpose, baseline_contract_hash FROM rebuild_contract_installations ORDER BY installed_at, contract_hash",
+            )?
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut contracts = BTreeMap::new();
+        for (hash, artifact_id, contract_id, version, purpose, baseline) in installations {
+            let contract_hash = ContentHash::new(hash)?;
+            let stored = self
+                .stored_contract_with_connection(connection, &contract_hash)?
+                .ok_or_else(|| {
+                    RebuildStoreError::Integrity(format!(
+                        "contract installation {contract_hash} disappeared"
+                    ))
+                })?;
+            if stored.artifact.artifact_id.0.as_str() != artifact_id
+                || stored.contract.contract_id.0 != contract_id
+                || i64::from(stored.contract.version) != version
+                || stored.contract.purpose.as_str() != purpose
+                || stored
+                    .baseline_contract_hash
+                    .as_ref()
+                    .map(ContentHash::as_str)
+                    != baseline.as_deref()
+            {
+                return Err(RebuildStoreError::Integrity(format!(
+                    "contract installation {contract_hash} metadata disagrees with payload"
+                )));
+            }
+            if let Some(baseline_hash) = &stored.baseline_contract_hash {
+                let baseline_contract = self
+                    .stored_contract_with_connection(connection, baseline_hash)?
+                    .ok_or_else(|| {
+                        RebuildStoreError::Integrity(format!(
+                            "candidate contract {contract_hash} has missing baseline {baseline_hash}"
+                        ))
+                    })?;
+                if !candidate_is_bounded(&baseline_contract.contract, &stored.contract) {
+                    return Err(RebuildStoreError::Integrity(format!(
+                        "candidate contract {contract_hash} exceeds its installed baseline"
+                    )));
+                }
+            }
+            contracts.insert(contract_hash, stored);
+        }
+
+        let activations = connection
+            .prepare(
+                "SELECT activation_id, purpose, previous_contract_hash, contract_hash, policy_transition_id FROM rebuild_contract_activations ORDER BY activation_id",
+            )?
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut latest = BTreeMap::<String, (i64, ContentHash)>::new();
+        for (activation_id, purpose, previous, hash, transition_id) in activations {
+            let contract_hash = ContentHash::new(hash)?;
+            let previous = previous.map(ContentHash::new).transpose()?;
+            let expected_previous = latest.get(&purpose).map(|(_, hash)| hash.clone());
+            if previous != expected_previous {
+                return Err(RebuildStoreError::Integrity(format!(
+                    "contract activation {activation_id} is not the next history entry for {purpose}"
+                )));
+            }
+            let contract = contracts.get(&contract_hash).ok_or_else(|| {
+                RebuildStoreError::Integrity(format!(
+                    "contract activation {activation_id} references unknown contract {contract_hash}"
+                ))
+            })?;
+            if contract.contract.purpose.as_str() != purpose {
+                return Err(RebuildStoreError::Integrity(format!(
+                    "contract activation {activation_id} purpose disagrees with its contract"
+                )));
+            }
+            match (previous.as_ref(), transition_id) {
+                (None, None) if contract.baseline_contract_hash.is_none() => {}
+                (Some(previous_hash), Some(transition_id)) => {
+                    let transition =
+                        read_policy_transition(connection, &PolicyTransitionId(transition_id))?
+                            .ok_or_else(|| {
+                                RebuildStoreError::Integrity(format!(
+                                    "contract activation {activation_id} has no policy transition"
+                                ))
+                            })?;
+                    let promoted = transition.transition.subject
+                        == PolicySubject::Contract(contract_hash.clone())
+                        && transition.transition.to
+                            == PolicyState::Contract(CandidatePolicyState::Active)
+                        && contract.baseline_contract_hash.as_ref() == Some(previous_hash);
+                    let rolled_back = transition.transition.subject
+                        == PolicySubject::Contract(previous_hash.clone())
+                        && transition.transition.from
+                            == PolicyState::Contract(CandidatePolicyState::Active)
+                        && contract_hash
+                            == contracts
+                                .get(previous_hash)
+                                .and_then(|candidate| candidate.baseline_contract_hash.as_ref())
+                                .cloned()
+                                .ok_or_else(|| {
+                                    RebuildStoreError::Integrity(format!(
+                                        "contract activation {activation_id} rollback has no baseline"
+                                    ))
+                                })?;
+                    if !promoted && !rolled_back {
+                        return Err(RebuildStoreError::Integrity(format!(
+                            "contract activation {activation_id} is not a valid promotion or rollback"
+                        )));
+                    }
+                }
+                _ => {
+                    return Err(RebuildStoreError::Integrity(format!(
+                        "contract activation {activation_id} has an invalid history binding"
+                    )));
+                }
+            }
+            latest.insert(purpose, (activation_id, contract_hash));
+        }
+
+        let heads = connection
+            .prepare(
+                "SELECT purpose, contract_hash, activation_id FROM rebuild_contract_catalogue_heads ORDER BY purpose",
+            )?
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        if heads.len() != latest.len() {
+            return Err(RebuildStoreError::Integrity(
+                "contract catalogue head count disagrees with activation history".to_owned(),
+            ));
+        }
+        for (purpose, contract_hash, activation_id) in heads {
+            let contract_hash = ContentHash::new(contract_hash)?;
+            if latest.get(&purpose) != Some(&(activation_id, contract_hash)) {
+                return Err(RebuildStoreError::Integrity(format!(
+                    "contract catalogue head for {purpose} is stale"
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -4577,6 +5095,29 @@ CREATE TABLE IF NOT EXISTS rebuild_policy_transitions (
     event_cursor INTEGER NOT NULL UNIQUE REFERENCES rebuild_events(event_id),
     UNIQUE(subject_id, revision)
 );
+CREATE TABLE IF NOT EXISTS rebuild_contract_installations (
+    contract_hash TEXT PRIMARY KEY,
+    contract_artifact_id TEXT NOT NULL UNIQUE REFERENCES rebuild_artifacts(artifact_id),
+    contract_id TEXT NOT NULL,
+    contract_version INTEGER NOT NULL,
+    purpose TEXT NOT NULL,
+    baseline_contract_hash TEXT REFERENCES rebuild_contract_installations(contract_hash),
+    installed_at TEXT NOT NULL,
+    UNIQUE(contract_id, contract_version)
+);
+CREATE TABLE IF NOT EXISTS rebuild_contract_activations (
+    activation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    purpose TEXT NOT NULL,
+    previous_contract_hash TEXT REFERENCES rebuild_contract_installations(contract_hash),
+    contract_hash TEXT NOT NULL REFERENCES rebuild_contract_installations(contract_hash),
+    policy_transition_id TEXT UNIQUE REFERENCES rebuild_policy_transitions(transition_id),
+    activated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS rebuild_contract_catalogue_heads (
+    purpose TEXT PRIMARY KEY,
+    contract_hash TEXT NOT NULL REFERENCES rebuild_contract_installations(contract_hash),
+    activation_id INTEGER NOT NULL UNIQUE REFERENCES rebuild_contract_activations(activation_id)
+);
 CREATE TABLE IF NOT EXISTS rebuild_policy_evaluations (
     evaluation_artifact_id TEXT PRIMARY KEY REFERENCES rebuild_artifacts(artifact_id),
     subject_id TEXT NOT NULL,
@@ -4665,6 +5206,115 @@ fn table_has_column(
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(columns.iter().any(|column| column == required_column))
+}
+
+fn contract_catalogue_head(
+    connection: &Connection,
+    purpose: &ContractPurpose,
+) -> RebuildStoreResult<Option<(ContentHash, i64)>> {
+    let row = connection
+        .query_row(
+            "SELECT contract_hash, activation_id FROM rebuild_contract_catalogue_heads WHERE purpose = ?1",
+            params![purpose.as_str()],
+            |row| Ok((row.get::<_, String>(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    row.map(|(hash, activation_id)| Ok((ContentHash::new(hash)?, activation_id)))
+        .transpose()
+}
+
+fn assert_contract_identity_available(
+    connection: &Connection,
+    contract: &AgentContract,
+) -> RebuildStoreResult<()> {
+    let existing = connection
+        .query_row(
+            "SELECT contract_hash FROM rebuild_contract_installations WHERE contract_id = ?1 AND contract_version = ?2",
+            params![contract.contract_id.0.as_str(), i64::from(contract.version)],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if existing.is_some() {
+        return Err(RebuildStoreError::DuplicateContractVersion {
+            contract_id: contract.contract_id.clone(),
+            version: contract.version,
+        });
+    }
+    Ok(())
+}
+
+fn insert_contract_installation(
+    transaction: &Transaction<'_>,
+    contract: &AgentContract,
+    artifact: &Artifact,
+    baseline_contract_hash: Option<&ContentHash>,
+    installed_at: DateTime<Utc>,
+) -> RebuildStoreResult<()> {
+    transaction.execute(
+        r#"INSERT INTO rebuild_contract_installations
+           (contract_hash, contract_artifact_id, contract_id, contract_version, purpose,
+            baseline_contract_hash, installed_at)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"#,
+        params![
+            contract.contract_hash.as_str(),
+            artifact.artifact_id.0.as_str(),
+            contract.contract_id.0.as_str(),
+            i64::from(contract.version),
+            contract.purpose.as_str(),
+            baseline_contract_hash.map(ContentHash::as_str),
+            installed_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn append_contract_activation(
+    transaction: &Transaction<'_>,
+    purpose: &ContractPurpose,
+    previous_contract_hash: Option<&ContentHash>,
+    contract_hash: &ContentHash,
+    policy_transition_id: Option<&PolicyTransitionId>,
+    activated_at: DateTime<Utc>,
+) -> RebuildStoreResult<i64> {
+    transaction.execute(
+        r#"INSERT INTO rebuild_contract_activations
+           (purpose, previous_contract_hash, contract_hash, policy_transition_id, activated_at)
+           VALUES (?1, ?2, ?3, ?4, ?5)"#,
+        params![
+            purpose.as_str(),
+            previous_contract_hash.map(ContentHash::as_str),
+            contract_hash.as_str(),
+            policy_transition_id.map(|id| id.0.as_str()),
+            activated_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(transaction.last_insert_rowid())
+}
+
+fn set_contract_catalogue_head(
+    transaction: &Transaction<'_>,
+    purpose: &ContractPurpose,
+    contract_hash: &ContentHash,
+    activation_id: i64,
+) -> RebuildStoreResult<()> {
+    transaction.execute(
+        r#"INSERT INTO rebuild_contract_catalogue_heads (purpose, contract_hash, activation_id)
+           VALUES (?1, ?2, ?3)
+           ON CONFLICT(purpose) DO UPDATE SET
+             contract_hash = excluded.contract_hash,
+             activation_id = excluded.activation_id"#,
+        params![purpose.as_str(), contract_hash.as_str(), activation_id],
+    )?;
+    Ok(())
+}
+
+fn candidate_is_bounded(active: &AgentContract, candidate: &AgentContract) -> bool {
+    active.permits_candidate(candidate)
+        && active.purpose == candidate.purpose
+        && active.output.artifact_kind == candidate.output.artifact_kind
+        && (!active.termination.require_evidence || candidate.termination.require_evidence)
+        && candidate.termination.max_child_tasks <= active.termination.max_child_tasks
+        && candidate.termination.max_depth <= active.termination.max_depth
 }
 
 fn insert_artifact(transaction: &Transaction<'_>, artifact: &Artifact) -> RebuildStoreResult<()> {
@@ -6197,10 +6847,11 @@ fn parse_task_status(value: &str) -> RebuildStoreResult<TaskStatus> {
 #[cfg(test)]
 mod tests {
     use akzio_domain::{
-        ArtifactLifecycle, ArtifactProvenance, Asset, ExecutionPlan, FactorExposure,
+        ArtifactLifecycle, ArtifactProvenance, Asset, ContextPolicy, ExecutionPlan, FactorExposure,
         FailureDisposition, HardBlocker, MoneyMicros, NoOrder, OrderIntent, OrderSide,
-        PaperCommitment, PaperCommitmentId, RetryPolicy, TargetPortfolio, TaskBudget, TaskRecipeId,
-        WeightPpm, WorkflowProposalTask,
+        OutputContract, PaperCommitment, PaperCommitmentId, RetryPolicy, TargetPortfolio,
+        TaskBudget, TaskRecipeId, TerminationPolicy, ToolGrant, ToolKind, WeightPpm,
+        WorkflowProposalTask,
     };
     use tempfile::tempdir;
 
@@ -6223,6 +6874,544 @@ mod tests {
             retry_rate_limited: true,
             retry_invalid_output: false,
         }
+    }
+
+    fn contract(store: &RebuildStore, version: u32) -> AgentContract {
+        AgentContract::new(
+            ContractId::new(),
+            version,
+            ContractPurpose::new("research.fixture").unwrap(),
+            "fixture contract",
+            store.put_bytes(b"fixture prompt", "text/plain").unwrap(),
+            ContextPolicy {
+                permitted_kinds: BTreeSet::from([ArtifactKind::NormalizedEvidence]),
+                permitted_source_families: BTreeSet::from(["fixture".to_owned()]),
+                min_artifacts: 1,
+                max_artifacts: 4,
+                max_bytes: 4096,
+                max_tokens: 1024,
+                allow_raw_reread: false,
+            },
+            vec![ToolGrant {
+                kind: ToolKind::ReadEvidence,
+                allowed_sources: vec!["fixture".to_owned()],
+            }],
+            OutputContract {
+                artifact_kind: ArtifactKind::Claim,
+                schema: store
+                    .put_bytes(
+                        br#"{"type":"object","properties":{"summary":{"type":"string"}},"required":["summary"],"additionalProperties":false}"#,
+                        "application/json",
+                    )
+                    .unwrap(),
+            },
+            budget(),
+            retry(),
+            TerminationPolicy::leaf(),
+            FailureDisposition::FailRun,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn contract_catalogue_rejects_duplicate_or_expanded_installations_and_doctor_corruption() {
+        let root = tempdir().unwrap();
+        let store = RebuildStore::open(root.path()).unwrap();
+        let now = Utc::now();
+        let active = contract(&store, 1);
+        store.install_active_contract(&active, now).unwrap();
+
+        let mut duplicate = active.clone();
+        duplicate.responsibility = "same identity, different contract".to_owned();
+        duplicate.contract_hash = duplicate.expected_hash().unwrap();
+        duplicate.validate().unwrap();
+        assert!(matches!(
+            store.install_active_contract(&duplicate, now),
+            Err(RebuildStoreError::DuplicateContractVersion { .. })
+        ));
+
+        let mut expanded = active.clone();
+        expanded.version = 2;
+        expanded
+            .context
+            .permitted_source_families
+            .insert("unapproved".to_owned());
+        expanded.candidate_capability_ceiling = akzio_domain::CandidateCapabilityCeiling {
+            context: expanded.context.clone(),
+            tool_grants: expanded.tool_grants.clone(),
+        };
+        expanded.contract_hash = expanded.expected_hash().unwrap();
+        expanded.validate().unwrap();
+        assert!(matches!(
+            store.install_candidate_contract(&active.contract_hash, &expanded, now),
+            Err(RebuildStoreError::ContractCapabilityExpansion { .. })
+        ));
+
+        let mut candidate = active.clone();
+        candidate.version = 2;
+        candidate.contract_hash = candidate.expected_hash().unwrap();
+        candidate.validate().unwrap();
+        let stored_candidate = store
+            .install_candidate_contract(&active.contract_hash, &candidate, now)
+            .unwrap();
+        assert_eq!(stored_candidate.contract, candidate);
+        assert_eq!(
+            store
+                .active_contract(&active.purpose)
+                .unwrap()
+                .unwrap()
+                .contract
+                .contract_hash,
+            active.contract_hash
+        );
+        store.verify_integrity().unwrap();
+
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE rebuild_contract_installations \
+                 SET contract_id = ?1 WHERE contract_hash = ?2",
+                params!["forged-contract-id", active.contract_hash.as_str()],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.verify_integrity(),
+            Err(RebuildStoreError::Integrity(_))
+        ));
+    }
+
+    #[test]
+    fn contract_policy_transitions_activate_and_rollback_catalogue_history() {
+        let fixture = PolicyCommitFixture::memory();
+        let active = contract(&fixture.store, 1);
+        let active_installation = fixture
+            .store
+            .install_active_contract(&active, fixture.now)
+            .unwrap();
+        let mut candidate = active.clone();
+        candidate.version = 2;
+        candidate.contract_hash = candidate.expected_hash().unwrap();
+        candidate.validate().unwrap();
+        let candidate_installation = fixture
+            .store
+            .install_candidate_contract(&active.contract_hash, &candidate, fixture.now)
+            .unwrap();
+        let subject = PolicySubject::Contract(candidate.contract_hash.clone());
+        let fresh_permit = |label: &str, now: DateTime<Utc>| {
+            let mut workflow = graph();
+            workflow.topology_id = format!("contract-policy-{label}");
+            let graph_artifact = artifact(
+                &fixture.store,
+                ArtifactKind::WorkflowGraph,
+                &serde_json::to_string(&workflow).unwrap(),
+                None,
+            );
+            let run = RebuildRun {
+                run_id: RunId::new(),
+                purpose: RunPurpose::Paper,
+                topology_id: workflow.topology_id.clone(),
+                graph_artifact_id: graph_artifact.artifact_id.clone(),
+                created_at: now,
+            };
+            fixture
+                .store
+                .commit_workflow(&WorkflowCommit {
+                    run,
+                    graph: graph_artifact,
+                    nodes: workflow.nodes,
+                })
+                .unwrap();
+            fixture
+                .store
+                .claim_next_task(
+                    &format!("contract-policy-{label}"),
+                    now,
+                    Duration::seconds(30),
+                )
+                .unwrap()
+                .unwrap()
+                .permit
+        };
+        let fresh_outcome = |permit: &TaskWritePermit, now: DateTime<Utc>| {
+            let mut provenance = fixture.outcome.provenance.clone();
+            provenance.producer_contract_hash = permit.contract_hash.clone();
+            Artifact::new(
+                ArtifactKind::Outcome,
+                fixture.outcome.blob.clone(),
+                fixture.outcome.producer.clone(),
+                ArtifactLifecycle::Canonical,
+                provenance,
+                Some(ArtifactOrigin {
+                    run_id: Some(permit.run_id.clone()),
+                    task_id: Some(permit.task_id.clone()),
+                    attempt_id: Some(permit.attempt_id.clone()),
+                    contract_hash: permit.contract_hash.clone(),
+                }),
+                fixture.outcome.source_refs.clone(),
+                now,
+            )
+            .unwrap()
+        };
+        let promotion_permit = fresh_permit("promotion", fixture.now);
+        let promotion_outcome = fresh_outcome(&promotion_permit, fixture.now);
+
+        let mut promoted_experience: Experience = fixture
+            .store
+            .read_artifact_payload(&fixture.experience)
+            .unwrap();
+        promoted_experience.experience_id = akzio_domain::ExperienceId::new();
+        promoted_experience.subject = subject.clone();
+        promoted_experience.contract_hash = candidate.contract_hash.clone();
+        promoted_experience.outcome = artifact_ref(&promotion_outcome);
+        promoted_experience.policy_state =
+            PolicyState::Contract(akzio_domain::CandidatePolicyState::Canary50);
+        promoted_experience.validate().unwrap();
+        let promoted_experience_artifact = permit_artifact(
+            &fixture.store,
+            &promotion_permit,
+            ArtifactKind::Experience,
+            &promoted_experience,
+            vec![
+                promoted_experience.decision.clone(),
+                promoted_experience.decision_context.clone(),
+                promoted_experience.execution_context.clone(),
+                promoted_experience.policy_verdict.clone(),
+                promoted_experience.outcome.clone(),
+            ],
+            ArtifactLifecycle::Canonical,
+            fixture.now,
+        );
+        let mut promoted_evaluation: Evaluation = fixture
+            .store
+            .read_artifact_payload(&fixture.evaluation)
+            .unwrap();
+        promoted_evaluation.evaluation_id = akzio_domain::EvaluationId::new();
+        promoted_evaluation.outcome = artifact_ref(&promotion_outcome);
+        promoted_evaluation.experience = artifact_ref(&promoted_experience_artifact);
+        promoted_evaluation.validate().unwrap();
+        let promoted_evaluation_artifact = permit_artifact(
+            &fixture.store,
+            &promotion_permit,
+            ArtifactKind::Evaluation,
+            &promoted_evaluation,
+            vec![
+                promoted_evaluation.outcome.clone(),
+                promoted_evaluation.experience.clone(),
+            ],
+            ArtifactLifecycle::Canonical,
+            fixture.now,
+        );
+        let candidate_policy = CandidatePolicy {
+            schema_version: REBUILD_SCHEMA_VERSION,
+            subject: subject.clone(),
+            baseline: artifact_ref(&active_installation.artifact),
+            candidate: artifact_ref(&candidate_installation.artifact),
+            source_evaluation: artifact_ref(&promoted_evaluation_artifact),
+            created_at: fixture.now,
+        };
+        candidate_policy.validate().unwrap();
+        let candidate_policy_artifact = permit_artifact(
+            &fixture.store,
+            &promotion_permit,
+            ArtifactKind::CandidatePolicy,
+            &candidate_policy,
+            vec![
+                candidate_policy.baseline.clone(),
+                candidate_policy.candidate.clone(),
+                candidate_policy.source_evaluation.clone(),
+            ],
+            ArtifactLifecycle::Canonical,
+            fixture.now,
+        );
+        let record_canary = |from, to, completed_at| -> RebuildStoreResult<()> {
+            let permit = fresh_permit(&format!("canary-{from:?}-{to:?}"), completed_at);
+            let outcome = fresh_outcome(&permit, completed_at);
+            let mut experience: Experience =
+                fixture.store.read_artifact_payload(&fixture.experience)?;
+            experience.experience_id = akzio_domain::ExperienceId::new();
+            experience.subject = subject.clone();
+            experience.contract_hash = candidate.contract_hash.clone();
+            experience.outcome = artifact_ref(&outcome);
+            experience.policy_state = PolicyState::Contract(from);
+            experience.created_at = completed_at;
+            experience.validate()?;
+            let experience_artifact = permit_artifact(
+                &fixture.store,
+                &permit,
+                ArtifactKind::Experience,
+                &experience,
+                vec![
+                    experience.decision.clone(),
+                    experience.decision_context.clone(),
+                    experience.execution_context.clone(),
+                    experience.policy_verdict.clone(),
+                    experience.outcome.clone(),
+                ],
+                ArtifactLifecycle::Canonical,
+                completed_at,
+            );
+            let mut evaluation: Evaluation =
+                fixture.store.read_artifact_payload(&fixture.evaluation)?;
+            evaluation.evaluation_id = akzio_domain::EvaluationId::new();
+            evaluation.outcome = artifact_ref(&outcome);
+            evaluation.experience = artifact_ref(&experience_artifact);
+            evaluation.created_at = completed_at;
+            evaluation.validate()?;
+            let evaluation_artifact = permit_artifact(
+                &fixture.store,
+                &permit,
+                ArtifactKind::Evaluation,
+                &evaluation,
+                vec![evaluation.outcome.clone(), evaluation.experience.clone()],
+                ArtifactLifecycle::Canonical,
+                completed_at,
+            );
+            let candidate_policy = CandidatePolicy {
+                schema_version: REBUILD_SCHEMA_VERSION,
+                subject: subject.clone(),
+                baseline: artifact_ref(&active_installation.artifact),
+                candidate: artifact_ref(&candidate_installation.artifact),
+                source_evaluation: artifact_ref(&evaluation_artifact),
+                created_at: completed_at,
+            };
+            candidate_policy.validate()?;
+            let candidate_policy_artifact = permit_artifact(
+                &fixture.store,
+                &permit,
+                ArtifactKind::CandidatePolicy,
+                &candidate_policy,
+                vec![
+                    candidate_policy.baseline.clone(),
+                    candidate_policy.candidate.clone(),
+                    candidate_policy.source_evaluation.clone(),
+                ],
+                ArtifactLifecycle::Canonical,
+                completed_at,
+            );
+            let transition = PolicyTransition {
+                schema_version: REBUILD_SCHEMA_VERSION,
+                transition_id: PolicyTransitionId::new(),
+                subject: subject.clone(),
+                from: PolicyState::Contract(from),
+                to: PolicyState::Contract(to),
+                evaluation: artifact_ref(&evaluation_artifact),
+                created_at: completed_at,
+            };
+            fixture
+                .store
+                .record_policy_evaluation(&PolicyEvaluationCommit {
+                    permit,
+                    outcome,
+                    experience: experience_artifact,
+                    evaluation: evaluation_artifact,
+                    candidate_policy: Some(candidate_policy_artifact),
+                    subject: subject.clone(),
+                    from: transition.from,
+                    to: transition.to,
+                    pair_snapshot: fixture.store.policy_shadow_pair_snapshot(&subject)?,
+                    transition: Some(transition),
+                    completed_at,
+                })?;
+            Ok(())
+        };
+        record_canary(
+            akzio_domain::CandidatePolicyState::Candidate,
+            akzio_domain::CandidatePolicyState::Canary10,
+            fixture.now,
+        )
+        .unwrap();
+        record_canary(
+            akzio_domain::CandidatePolicyState::Canary10,
+            akzio_domain::CandidatePolicyState::Canary25,
+            fixture.now + Duration::microseconds(1),
+        )
+        .unwrap();
+        record_canary(
+            akzio_domain::CandidatePolicyState::Canary25,
+            akzio_domain::CandidatePolicyState::Canary50,
+            fixture.now + Duration::microseconds(2),
+        )
+        .unwrap();
+        let promote_transition = PolicyTransition {
+            schema_version: REBUILD_SCHEMA_VERSION,
+            transition_id: PolicyTransitionId::new(),
+            subject: subject.clone(),
+            from: PolicyState::Contract(akzio_domain::CandidatePolicyState::Canary50),
+            to: PolicyState::Contract(akzio_domain::CandidatePolicyState::Active),
+            evaluation: artifact_ref(&promoted_evaluation_artifact),
+            created_at: fixture.now,
+        };
+        let promoted_outcome_payload: Outcome = fixture
+            .store
+            .read_artifact_payload(&promotion_outcome)
+            .unwrap();
+        let schedule_artifact = fixture
+            .store
+            .artifact(&promoted_outcome_payload.schedule.artifact_id)
+            .unwrap();
+        let schedule_payload: OutcomeSchedule = fixture
+            .store
+            .read_artifact_payload(&schedule_artifact)
+            .unwrap();
+        assert_eq!(
+            promoted_experience.outcome,
+            artifact_ref(&promotion_outcome)
+        );
+        assert_eq!(
+            promoted_evaluation.outcome,
+            artifact_ref(&promotion_outcome)
+        );
+        assert_eq!(
+            promoted_evaluation.experience,
+            artifact_ref(&promoted_experience_artifact)
+        );
+        assert_eq!(promoted_experience.decision, schedule_payload.decision);
+        assert_eq!(
+            promoted_experience.decision_context,
+            schedule_payload.decision_context
+        );
+        assert_eq!(
+            promoted_experience.execution_context,
+            schedule_payload.execution_context
+        );
+        fixture
+            .store
+            .record_policy_evaluation(&PolicyEvaluationCommit {
+                permit: promotion_permit,
+                outcome: promotion_outcome,
+                experience: promoted_experience_artifact,
+                evaluation: promoted_evaluation_artifact,
+                candidate_policy: Some(candidate_policy_artifact),
+                subject: subject.clone(),
+                from: promote_transition.from,
+                to: promote_transition.to,
+                pair_snapshot: fixture.store.policy_shadow_pair_snapshot(&subject).unwrap(),
+                transition: Some(promote_transition),
+                completed_at: fixture.now,
+            })
+            .unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .active_contract(&active.purpose)
+                .unwrap()
+                .unwrap()
+                .contract
+                .contract_hash,
+            candidate.contract_hash
+        );
+
+        let rollback_at = fixture.now + Duration::microseconds(4);
+        let rollback_permit = fresh_permit("rollback", rollback_at);
+        let rollback_outcome = fresh_outcome(&rollback_permit, rollback_at);
+        let mut rollback_experience: Experience = fixture
+            .store
+            .read_artifact_payload(&fixture.experience)
+            .unwrap();
+        rollback_experience.experience_id = akzio_domain::ExperienceId::new();
+        rollback_experience.subject = subject.clone();
+        rollback_experience.contract_hash = candidate.contract_hash.clone();
+        rollback_experience.outcome = artifact_ref(&rollback_outcome);
+        rollback_experience.policy_state =
+            PolicyState::Contract(akzio_domain::CandidatePolicyState::Active);
+        rollback_experience.validate().unwrap();
+        let rollback_experience_artifact = permit_artifact(
+            &fixture.store,
+            &rollback_permit,
+            ArtifactKind::Experience,
+            &rollback_experience,
+            vec![
+                rollback_experience.decision.clone(),
+                rollback_experience.decision_context.clone(),
+                rollback_experience.execution_context.clone(),
+                rollback_experience.policy_verdict.clone(),
+                rollback_experience.outcome.clone(),
+            ],
+            ArtifactLifecycle::Canonical,
+            fixture.now + Duration::microseconds(1),
+        );
+        let mut rollback_evaluation: Evaluation = fixture
+            .store
+            .read_artifact_payload(&fixture.evaluation)
+            .unwrap();
+        rollback_evaluation.evaluation_id = akzio_domain::EvaluationId::new();
+        rollback_evaluation.outcome = artifact_ref(&rollback_outcome);
+        rollback_evaluation.experience = artifact_ref(&rollback_experience_artifact);
+        rollback_evaluation.created_at = rollback_at;
+        rollback_evaluation.validate().unwrap();
+        let rollback_evaluation_artifact = permit_artifact(
+            &fixture.store,
+            &rollback_permit,
+            ArtifactKind::Evaluation,
+            &rollback_evaluation,
+            vec![
+                rollback_evaluation.outcome.clone(),
+                rollback_evaluation.experience.clone(),
+            ],
+            ArtifactLifecycle::Canonical,
+            rollback_at,
+        );
+        let rollback_candidate_policy = CandidatePolicy {
+            schema_version: REBUILD_SCHEMA_VERSION,
+            subject: subject.clone(),
+            baseline: artifact_ref(&active_installation.artifact),
+            candidate: artifact_ref(&candidate_installation.artifact),
+            source_evaluation: artifact_ref(&rollback_evaluation_artifact),
+            created_at: rollback_at,
+        };
+        rollback_candidate_policy.validate().unwrap();
+        let rollback_candidate_policy_artifact = permit_artifact(
+            &fixture.store,
+            &rollback_permit,
+            ArtifactKind::CandidatePolicy,
+            &rollback_candidate_policy,
+            vec![
+                rollback_candidate_policy.baseline.clone(),
+                rollback_candidate_policy.candidate.clone(),
+                rollback_candidate_policy.source_evaluation.clone(),
+            ],
+            ArtifactLifecycle::Canonical,
+            rollback_at,
+        );
+        let rollback_transition = PolicyTransition {
+            schema_version: REBUILD_SCHEMA_VERSION,
+            transition_id: PolicyTransitionId::new(),
+            subject: subject.clone(),
+            from: PolicyState::Contract(akzio_domain::CandidatePolicyState::Active),
+            to: PolicyState::Contract(akzio_domain::CandidatePolicyState::Candidate),
+            evaluation: artifact_ref(&rollback_evaluation_artifact),
+            created_at: rollback_at,
+        };
+        fixture
+            .store
+            .record_policy_evaluation(&PolicyEvaluationCommit {
+                permit: rollback_permit,
+                outcome: rollback_outcome,
+                experience: rollback_experience_artifact,
+                evaluation: rollback_evaluation_artifact,
+                candidate_policy: Some(rollback_candidate_policy_artifact),
+                subject: subject.clone(),
+                from: rollback_transition.from,
+                to: rollback_transition.to,
+                pair_snapshot: fixture.store.policy_shadow_pair_snapshot(&subject).unwrap(),
+                transition: Some(rollback_transition),
+                completed_at: rollback_at,
+            })
+            .unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .active_contract(&active.purpose)
+                .unwrap()
+                .unwrap()
+                .contract
+                .contract_hash,
+            active.contract_hash
+        );
+        assert_eq!(fixture.store.policy_transitions(&subject).unwrap().len(), 5);
+        fixture.store.verify_integrity().unwrap();
     }
 
     fn artifact(

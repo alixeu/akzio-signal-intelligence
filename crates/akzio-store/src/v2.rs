@@ -11,6 +11,6 @@ pub use crate::store_v2::{
     RebuildStoreError as StoreError, RebuildStoreResult as Result, RebuildTask as StoredTask,
     RepriceCommit, RepriceCommitResult, RetryTaskResult, SessionReservation, SessionSlot,
     SessionSlotReservation, ShadowPairCompletion, ShadowPairWriteResult, StoredActiveAttempt,
-    StoredRebuildEvent as StoredEvent, StoredShadowPair, StoredTaskSnapshot, WorkflowCommit,
-    WorkflowPatchCommit, WorkflowRevision, WorkflowSnapshot,
+    StoredContract, StoredRebuildEvent as StoredEvent, StoredShadowPair, StoredTaskSnapshot,
+    WorkflowCommit, WorkflowPatchCommit, WorkflowRevision, WorkflowSnapshot,
 };

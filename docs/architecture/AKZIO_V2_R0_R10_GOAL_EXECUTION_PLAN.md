@@ -156,6 +156,14 @@
 - R5 的 lowering、gate、patch、retry/cancel 与 crash-reclaim 已有测试；`replay_revision` 仍只是读取并重验 durable revision，不是从 durable event/task history 重建并比对 snapshot 的 reducer。
 - 因此下一实现顺序固定为补齐 R4 durable catalogue lifecycle，再补齐 R5 deterministic event replay；R0–R3 不再逐阶段重审，R0–R10 完成后执行一次整体终局复核。
 
+### 3.9 2026-08-11 R4 durable catalogue lifecycle checkpoint
+
+- `V2Store` 现在持久化 immutable Active/Candidate Contract 安装、purpose head 与 activation history；启动只在缺失 head 时安装 Rust-defined 默认 Contract，重启从 Store 恢复 active head。
+- Candidate 安装受 active capability ceiling 约束；canonical Paper policy canary 进入 `Active` 时切换 head，`Active → Candidate` 回滚恢复 baseline。Doctor 校验安装、activation 与 head history。
+- 本轮修复了安装事务提交后递归持锁和 Doctor 未调用 catalogue history verifier 两个 fail-closed 缺口；未增加旧 role 或 bootstrap compatibility path。
+- 已实际通过 `cargo fmt --all`、`cargo test --offline -p akzio-store`、`cargo test --offline -p akzio-research`、`cargo test --offline -p akzio-learning`、`cargo check --offline --workspace`、相关 crates `cargo clippy --offline --all-targets -- -D warnings`。这些均为本地 fixture/离线验证，不代表市场、broker 或真实 Paper 验证。
+- 下一阶段为 R5 durable event/task-history reducer；R0–R4 不再逐阶段回看，R0–R10 完成后统一终局复核。
+
 ## 4. 从官方网站吸收的原则
 
 | 主题 | 采用原则 | Akzio 落点 | 不照搬 |
@@ -827,7 +835,7 @@ cargo run --offline -p akzio-cli -- store doctor
 | R1 | narrow regression verified | R0 verified | Domain v7、四资产、canonicality、authority 窄测通过；全量最终回归留给 R10 |
 | R2 | narrow regression verified | R1 verified | CAS、atomic/fencing/cursor/Doctor/OutcomeSchedule closure 窄测通过；全量最终回归留给 R10 |
 | R3 | narrow regression verified | R2 verified | Manifest/Grant/repair/source closure、policy influence 越权拒绝和 typed governed evidence adapters 窄测通过 |
-| R4 | lifecycle pending | R3 verified | Contract Catalogue、AgentRuntime、budget/tool grant 与 capability ceiling 已有窄测；仍缺 durable Candidate/Active 安装与激活历史 |
+| R4 | lifecycle complete | R3 verified | Store-owned immutable Active/Candidate installation、restart head recovery、capability ceiling、canary activation/rollback history 与 Doctor corruption rejection 已通过离线窄测 |
 | R5 | core verified / replay pending | R4 lifecycle complete | DAG/Task/recovery 核心已通过窄测；deterministic event reducer 仍待实现与认证 |
 | R6 | complete | R5 核心完成 | sealed Outcome/Shadow/canary/no-op cursor/noncanonical owner surface 已完成；全量 regression 不得凭历史快照宣称 |
 | R7 | in progress | R6 complete | Decision/Execution/Paper owner tests 与 current-tree 编译/集成修复 |
