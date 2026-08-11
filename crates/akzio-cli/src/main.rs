@@ -1,10 +1,12 @@
-use std::{collections::BTreeSet, net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{collections::BTreeSet, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use akzio_daemon::{
-    fixture_model_client, Daemon, DaemonConfig, DaemonHealth, ReplayReport,
-    RunCancellationResponse, RunRetryResponse, RunSubmissionResponse,
+    fixture_model_client, AlpacaPaperSessionClock, Daemon, DaemonConfig, DaemonHealth,
+    ReplayReport, RunCancellationResponse, RunRetryResponse, RunSubmissionResponse,
+    StorePaperWorkflowSource,
 };
 use akzio_domain::{Asset, RunPurpose};
+use akzio_execution::paper::AlpacaPaper;
 use akzio_model::ModelConfig;
 use akzio_store::V2Store;
 use anyhow::{bail, Context, Result};
@@ -382,35 +384,47 @@ fn daemon_token(settings: &DaemonSettings) -> Result<String> {
 }
 
 async fn serve(config: Config) -> Result<()> {
-    if config.daemon.auto_paper.unwrap_or(false) {
-        bail!(
-            "daemon.auto_paper=true requires an injected scheduler loop; akzio daemon serve refuses to construct one"
-        );
-    }
+    let auto_paper = config.daemon.auto_paper.unwrap_or(false);
     let token = daemon_token(&config.daemon)?;
     let model = config
         .model
         .clone()
         .context("missing [model] configuration for daemon serve")?;
-    let daemon = Arc::new(Daemon::open(
+    let daemon = Daemon::open(
         DaemonConfig {
             store_root: config.daemon.store_root,
             http_token: token,
             worker_count: config.daemon.worker_count.unwrap_or(4),
-            auto_paper: false,
+            auto_paper,
         },
         model,
-    )?);
+    )?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     tokio::spawn(async move {
         let _ = tokio::signal::ctrl_c().await;
         let _ = shutdown_tx.send(true);
     });
-    let http_daemon = daemon.clone();
-    tokio::try_join!(
-        http_daemon.serve_http(config.daemon.http_addr, shutdown_rx.clone()),
-        daemon.serve_workers(shutdown_rx),
-    )?;
+    let http_daemon = Arc::new(daemon.clone());
+    if auto_paper {
+        let paper = AlpacaPaper::from_env().context("construct Alpaca Paper client")?;
+        let clock = AlpacaPaperSessionClock::new(paper.clone());
+        let source = StorePaperWorkflowSource::new(daemon.store().clone());
+        let scheduler_daemon = Arc::new(daemon.with_paper_broker(Arc::new(paper)));
+        tokio::try_join!(
+            http_daemon.serve_http(config.daemon.http_addr, shutdown_rx.clone()),
+            scheduler_daemon.serve_with_paper_scheduler(
+                &clock,
+                &source,
+                Duration::from_secs(30),
+                shutdown_rx,
+            ),
+        )?;
+    } else {
+        tokio::try_join!(
+            http_daemon.serve_http(config.daemon.http_addr, shutdown_rx.clone()),
+            http_daemon.serve_workers(shutdown_rx),
+        )?;
+    }
     Ok(())
 }
 

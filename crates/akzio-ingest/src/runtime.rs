@@ -4,11 +4,13 @@
 //! enclosing `TaskRuntime` commits a completed task attempt through `V2Store`.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::env;
 
 use akzio_domain::{
     Artifact, ArtifactKind, ArtifactLifecycle, ArtifactOrigin, ArtifactProvenance, ArtifactRef,
     Asset, ContentHash, DomainError, EvidenceNeed, TaskWritePermit, V2_DOMAIN_SCHEMA_VERSION,
 };
+use akzio_model::{ModelClient, ModelRequest, NativeWebPolicy};
 use akzio_store::v2::{StoreError, V2Store};
 use chrono::{DateTime, Duration, Utc};
 use futures::future::BoxFuture;
@@ -235,6 +237,17 @@ impl std::fmt::Debug for AlpacaPaperEvidenceTransport {
 }
 
 impl AlpacaPaperEvidenceTransport {
+    pub fn from_env() -> Result<Self, EvidenceAdapterError> {
+        let base_url = env::var("ALPACA_PAPER_BASE_URL")
+            .unwrap_or_else(|_| "https://paper-api.alpaca.markets".to_owned());
+        let key_id = env::var("ALPACA_API_KEY")
+            .map_err(|_| EvidenceAdapterError::Transport("ALPACA_API_KEY is not set".to_owned()))?;
+        let secret_key = env::var("ALPACA_API_SECRET").map_err(|_| {
+            EvidenceAdapterError::Transport("ALPACA_API_SECRET is not set".to_owned())
+        })?;
+        Self::new(base_url, key_id, secret_key)
+    }
+
     pub fn new(
         base_url: impl Into<String>,
         key_id: impl Into<String>,
@@ -391,6 +404,151 @@ impl AsyncEvidenceAdapter for AlpacaPaperEvidenceTransport {
     ) -> BoxFuture<'a, Result<AcquiredEvidence, EvidenceAdapterError>> {
         Box::pin(async move {
             if request.source != EvidenceSource::Alpaca {
+                return Err(EvidenceAdapterError::SourceMismatch);
+            }
+            self.acquire_inner(request.source, &request.resource).await
+        })
+    }
+}
+
+#[derive(Clone)]
+pub struct ModelNativeWebEvidenceTransport {
+    client: ModelClient,
+    policy: NativeWebPolicy,
+    source: EvidenceSource,
+}
+
+impl std::fmt::Debug for ModelNativeWebEvidenceTransport {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ModelNativeWebEvidenceTransport")
+            .field("policy", &self.policy)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ModelNativeWebEvidenceTransport {
+    pub fn new(client: ModelClient, policy: NativeWebPolicy) -> Self {
+        Self {
+            client,
+            policy,
+            source: EvidenceSource::NewsWeb,
+        }
+    }
+
+    pub fn for_source(client: ModelClient, source: EvidenceSource) -> Self {
+        let policy = NativeWebPolicy {
+            allowed_hosts: match source {
+                EvidenceSource::SecEdgar => vec!["sec.gov".to_owned(), "www.sec.gov".to_owned()],
+                EvidenceSource::Fred => vec!["fred.stlouisfed.org".to_owned()],
+                EvidenceSource::NewsWeb => vec![
+                    "reuters.com".to_owned(),
+                    "www.reuters.com".to_owned(),
+                    "apnews.com".to_owned(),
+                    "www.apnews.com".to_owned(),
+                ],
+                EvidenceSource::Alpaca => Vec::new(),
+            },
+            ..NativeWebPolicy::default()
+        };
+        Self {
+            client,
+            policy,
+            source,
+        }
+    }
+
+    async fn acquire_inner(
+        &self,
+        source: EvidenceSource,
+        resource: &str,
+    ) -> Result<AcquiredEvidence, EvidenceAdapterError> {
+        if source == EvidenceSource::Alpaca {
+            return Err(EvidenceAdapterError::SourceMismatch);
+        }
+        let request = ModelRequest {
+            instructions: "Use only the Rust-approved native web tool. Return verifiable citations for every material fact.".to_owned(),
+            input: serde_json::json!({
+                "source_family": source.as_str(),
+                "research_intent": resource,
+            })
+            .to_string(),
+            schema_name: None,
+            schema: None,
+            max_output_tokens: 2_000,
+            tools: vec![self.policy.tool_definition()],
+        };
+        let response = self
+            .client
+            .respond(request)
+            .await
+            .map_err(|error| EvidenceAdapterError::Transport(error.to_string()))?;
+        if !response.tool_calls.is_empty() {
+            self.policy
+                .validate_tool_calls(&response.tool_calls)
+                .map_err(|error| EvidenceAdapterError::Transport(error.to_string()))?;
+        }
+        let citations = self
+            .policy
+            .extract_citations(&response.raw)
+            .map_err(|error| EvidenceAdapterError::Transport(error.to_string()))?;
+        let raw_value = serde_json::json!({
+            "source_family": source,
+            "resource": resource,
+            "output_text": response.output_text,
+            "citations": citations,
+            "provider_result": response.raw,
+        });
+        let raw = serde_json::to_vec(&raw_value)
+            .map_err(|error| EvidenceAdapterError::Transport(error.to_string()))?;
+        let observed_at = Utc::now();
+        let source_uri = citations
+            .first()
+            .map(|citation| citation.uri.clone())
+            .ok_or_else(|| EvidenceAdapterError::Transport("missing citation URI".to_owned()))?;
+        let provenance_citations = citations
+            .iter()
+            .map(|citation| EvidenceCitation {
+                start_byte: 0,
+                end_byte: raw.len(),
+                quote: citation.uri.clone(),
+            })
+            .collect();
+        Ok(AcquiredEvidence {
+            raw: raw.clone(),
+            media_type: "application/json".to_owned(),
+            source_uri: source_uri.clone(),
+            observed_at,
+            normalized: raw_value,
+            provenance: EvidenceProvenance {
+                document_id: Some(resource.to_owned()),
+                published_at: None,
+                observed_at,
+                revision: None,
+                source_uri,
+                dedupe_key: format!("native-web:{}", ContentHash::of_bytes(&raw)),
+                citations: provenance_citations,
+            },
+            quality: EvidenceQuality {
+                completeness_ppm: 1_000_000,
+                citations_complete: true,
+                normalized: true,
+            },
+        })
+    }
+}
+
+impl AsyncEvidenceAdapter for ModelNativeWebEvidenceTransport {
+    fn source(&self) -> EvidenceSource {
+        self.source
+    }
+
+    fn acquire<'a>(
+        &'a self,
+        request: &'a EvidenceRequest,
+    ) -> BoxFuture<'a, Result<AcquiredEvidence, EvidenceAdapterError>> {
+        Box::pin(async move {
+            if request.source != self.source {
                 return Err(EvidenceAdapterError::SourceMismatch);
             }
             self.acquire_inner(request.source, &request.resource).await
@@ -787,7 +945,19 @@ impl EvidenceRuntime {
 
     fn validate_source_uri(source_uri: &str) -> EvidenceRuntimeResult<()> {
         let parsed = Url::parse(source_uri).map_err(|_| EvidenceRuntimeError::UnsafeSourceUri)?;
-        if parsed.username() != "" || parsed.password().is_some() || parsed.query().is_some() {
+        if parsed.username() != ""
+            || parsed.password().is_some()
+            || parsed.fragment().is_some()
+            || parsed.query_pairs().any(|(key, _)| {
+                let key = key.to_ascii_lowercase();
+                key.contains("token")
+                    || key.contains("secret")
+                    || key.contains("password")
+                    || key.contains("api_key")
+                    || key == "key"
+                    || key.contains("authorization")
+            })
+        {
             return Err(EvidenceRuntimeError::UnsafeSourceUri);
         }
         Ok(())
@@ -935,6 +1105,10 @@ mod tests {
             EvidenceRuntime::validate_source_uri("https://example.test/evidence?token=secret"),
             Err(EvidenceRuntimeError::UnsafeSourceUri)
         ));
+        assert!(EvidenceRuntime::validate_source_uri(
+            "https://fred.stlouisfed.org/series/DFII10?cosd=2020-01-01"
+        )
+        .is_ok());
     }
 
     fn install_run(store: &V2Store, now: DateTime<Utc>, tasks: usize) -> RunId {
@@ -1310,5 +1484,32 @@ mod tests {
         assert!(AlpacaPaperEvidenceTransport::path_for("bars:SPY:1d").is_err());
         assert!(AlpacaPaperEvidenceTransport::path_for("bars:QQQ:5m").is_err());
         assert!(AlpacaPaperEvidenceTransport::path_for("https://example.com").is_err());
+    }
+
+    #[tokio::test]
+    async fn native_web_transport_requires_allowlisted_citations() {
+        let client = ModelClient::Fixture(serde_json::json!({
+            "output_text": "DFII10 evidence",
+            "citations": [{
+                "url": "https://fred.stlouisfed.org/series/DFII10",
+                "title": "FRED",
+                "text": "real yield"
+            }]
+        }));
+        let transport = ModelNativeWebEvidenceTransport::for_source(client, EvidenceSource::Fred);
+        let evidence = transport
+            .acquire(&EvidenceRequest {
+                source: EvidenceSource::Fred,
+                resource: "series:DFII10".to_owned(),
+                max_age: Duration::minutes(5),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            evidence.provenance.source_uri,
+            "https://fred.stlouisfed.org/series/DFII10"
+        );
+        assert_eq!(evidence.provenance.citations.len(), 1);
+        assert_eq!(evidence.quality.completeness_ppm, 1_000_000);
     }
 }

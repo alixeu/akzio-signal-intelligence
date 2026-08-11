@@ -1113,8 +1113,15 @@ impl WorkflowRuntime {
         let mut need_artifacts = BTreeMap::<EvidenceNeed, Artifact>::new();
         let mut tasks = BTreeMap::new();
         for (alias, task) in draft.tasks {
-            let mut evidence_needs = Vec::with_capacity(task.evidence_needs.len());
-            for need in task.evidence_needs {
+            let mut declared_needs = task.evidence_needs;
+            declared_needs.extend(
+                task.research_intents
+                    .into_iter()
+                    .map(|intent| intent.evidence_need())
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+            let mut evidence_needs = Vec::with_capacity(declared_needs.len());
+            for need in declared_needs {
                 let artifact = if let Some(artifact) = need_artifacts.get(&need) {
                     artifact.clone()
                 } else {
@@ -1229,9 +1236,10 @@ impl WorkflowRuntime {
                 recipe_id: critic_recipe_id,
                 objective: "Perform one evidence-bound critique of the analyst claims when Rust detects material uncertainty or directional conflict.".to_owned(),
                 depends_on: analyst_aliases.clone(),
-                priority: critic_recipe.priority_ceiling,
-                evidence_needs: Vec::new(),
-            },
+            priority: critic_recipe.priority_ceiling,
+            evidence_needs: Vec::new(),
+            research_intents: Vec::new(),
+        },
         );
         for task in draft
             .tasks
@@ -2053,6 +2061,7 @@ mod tests {
                         resource: "bars:TQQQ:1d".to_owned(),
                         max_age_secs: 86_400,
                     }],
+                    research_intents: vec![],
                 },
             )]),
             stop_reason: None,
@@ -2164,6 +2173,7 @@ mod tests {
                         depends_on: vec![],
                         priority: 80,
                         evidence_needs: vec![],
+                        research_intents: vec![],
                     },
                 ),
                 (
@@ -2174,6 +2184,7 @@ mod tests {
                         depends_on: vec!["analyst".to_owned()],
                         priority: 70,
                         evidence_needs: vec![],
+                        research_intents: vec![],
                     },
                 ),
             ]),
@@ -2195,6 +2206,7 @@ mod tests {
             depends_on: vec![],
             priority: 80,
             evidence_needs: vec![],
+            research_intents: vec![],
         };
         let mut active = WorkflowProposalDraft {
             schema_version: V2_SCHEMA_VERSION,

@@ -10,7 +10,7 @@ mod worker;
 
 pub use scheduler::{
     AlpacaPaperSessionClock, BrokerSessionClock, PaperScheduler, PaperWorkflowSource,
-    SchedulerError, StaticPaperWorkflowSource, SCHEDULER_LEASE_NAME,
+    SchedulerError, StaticPaperWorkflowSource, StorePaperWorkflowSource, SCHEDULER_LEASE_NAME,
 };
 
 pub use worker::{TaskHandler, WorkerPool, WorkerPoolConfig};
@@ -37,8 +37,9 @@ use akzio_execution::{
     V2PaperDispatchRuntime,
 };
 use akzio_ingest::{
-    AcquiredEvidence, EvidenceRequest, EvidenceRuntime, EvidenceRuntimeError, EvidenceSource,
-    FixtureEvidenceAdapter,
+    AcquiredEvidence, AlpacaPaperEvidenceTransport, AsyncEvidenceAdapter, EvidenceRequest,
+    EvidenceRuntime, EvidenceRuntimeError, EvidenceSource, FixtureEvidenceAdapter,
+    ModelNativeWebEvidenceTransport,
 };
 use akzio_learning::{OutcomeScheduleError, OutcomeScheduleInput, OutcomeSchedulingRuntime};
 use akzio_model::{ModelClient, ModelConfig, ModelError};
@@ -127,6 +128,7 @@ pub struct Daemon {
     agents: AgentRuntime,
     model: ModelClientAdapter,
     fixture_evidence: Arc<FixtureEvidence>,
+    production_evidence: Arc<BTreeMap<EvidenceSource, Arc<dyn AsyncEvidenceAdapter>>>,
     decision_runtime: V2DecisionRuntime,
     execution_runtime: V2ExecutionRuntime,
     paper_commitment_runtime: V2PaperCommitmentRuntime,
@@ -204,12 +206,33 @@ impl Daemon {
     /// credentials stay in local configuration and are never persisted.
     pub fn open(config: DaemonConfig, model_config: ModelConfig) -> Result<Self> {
         let debug = model_config.debug;
-        Self::with_fixture_evidence_debug(
+        let model = ModelClient::from_config(&model_config)?;
+        let mut daemon = Self::with_fixture_evidence_debug(
             config,
-            ModelClient::from_config(&model_config)?,
+            model.clone(),
             FixtureEvidence::new(),
             debug,
-        )
+        )?;
+        let mut production_evidence: BTreeMap<EvidenceSource, Arc<dyn AsyncEvidenceAdapter>> =
+            BTreeMap::new();
+        if let Ok(alpaca) = AlpacaPaperEvidenceTransport::from_env() {
+            production_evidence.insert(EvidenceSource::Alpaca, Arc::new(alpaca));
+        }
+        for source in [
+            EvidenceSource::SecEdgar,
+            EvidenceSource::Fred,
+            EvidenceSource::NewsWeb,
+        ] {
+            production_evidence.insert(
+                source,
+                Arc::new(ModelNativeWebEvidenceTransport::for_source(
+                    model.clone(),
+                    source,
+                )),
+            );
+        }
+        daemon.production_evidence = Arc::new(production_evidence);
+        Ok(daemon)
     }
 
     /// Injecting a model keeps fixture and production dispatch on the same v2
@@ -254,6 +277,7 @@ impl Daemon {
             agents,
             model: ModelClientAdapter::with_debug(model, model_debug),
             fixture_evidence: Arc::new(fixture_evidence),
+            production_evidence: Arc::new(BTreeMap::new()),
             decision_runtime,
             execution_runtime,
             paper_commitment_runtime: V2PaperCommitmentRuntime::new(store.clone()),
@@ -600,9 +624,9 @@ impl Daemon {
                     Ok(TaskCompletion::Succeeded(vec![output]))
                 }
             }
-            RuntimeTaskClass::Evidence => {
-                Ok(TaskCompletion::Succeeded(self.acquire_evidence(task, now)?))
-            }
+            RuntimeTaskClass::Evidence => Ok(TaskCompletion::Succeeded(
+                self.acquire_evidence(task, now).await?,
+            )),
             RuntimeTaskClass::DecisionGate => self.execute_decision_gate(task, now),
             RuntimeTaskClass::ExecutionGate => self.execute_execution_gate(task, now),
             RuntimeTaskClass::PaperCommit => self.execute_paper_commit(task, now),
@@ -1002,7 +1026,7 @@ impl Daemon {
         Ok(())
     }
 
-    fn acquire_evidence(
+    async fn acquire_evidence(
         &self,
         task: &ClaimedAttempt,
         now: DateTime<Utc>,
@@ -1024,30 +1048,43 @@ impl Daemon {
             let max_age_secs = i64::try_from(need.max_age_secs).map_err(|_| {
                 DaemonError::InvalidInput("EvidenceNeed max_age_secs exceeds i64".to_owned())
             })?;
-            let responses = self.fixture_evidence.get(&source).ok_or_else(|| {
-                DaemonError::Unavailable(format!(
-                    "no local fixture adapter configured for evidence source {}",
-                    source.as_str()
-                ))
-            })?;
-            let adapter = FixtureEvidenceAdapter::new(
-                source,
-                responses
-                    .iter()
-                    .map(|(resource, evidence)| (resource.clone(), evidence.clone())),
-            );
             let runtime = EvidenceRuntime::new(self.store.clone(), [source]);
-            let bundle = runtime.acquire_and_normalize(
-                &task.permit,
-                need_reference,
-                &EvidenceRequest {
+            let request = EvidenceRequest {
+                source,
+                resource: need.resource.clone(),
+                max_age: Duration::seconds(max_age_secs),
+            };
+            let bundle = if let Some(adapter) = self.production_evidence.get(&source) {
+                runtime
+                    .acquire_and_normalize_async(
+                        &task.permit,
+                        need_reference,
+                        &request,
+                        adapter.as_ref(),
+                        now,
+                    )
+                    .await?
+            } else {
+                let responses = self.fixture_evidence.get(&source).ok_or_else(|| {
+                    DaemonError::Unavailable(format!(
+                        "no governed evidence adapter configured for source {}",
+                        source.as_str()
+                    ))
+                })?;
+                let adapter = FixtureEvidenceAdapter::new(
                     source,
-                    resource: need.resource.clone(),
-                    max_age: Duration::seconds(max_age_secs),
-                },
-                &adapter,
-                now,
-            )?;
+                    responses
+                        .iter()
+                        .map(|(resource, evidence)| (resource.clone(), evidence.clone())),
+                );
+                runtime.acquire_and_normalize(
+                    &task.permit,
+                    need_reference,
+                    &request,
+                    &adapter,
+                    now,
+                )?
+            };
             if let Some(snapshot) = execution_snapshot_artifact(
                 &self.store,
                 task,
@@ -1559,6 +1596,7 @@ mod tests {
                         resource: "bars:TQQQ:1d".to_owned(),
                         max_age_secs: 86_400,
                     }],
+                    research_intents: vec![],
                 },
             )]),
             stop_reason: Some("fixture".to_owned()),
@@ -2088,6 +2126,7 @@ mod tests {
             .unwrap();
         let evidence_outputs = daemon
             .acquire_evidence(&evidence_task, now)
+            .await
             .expect("fixture snapshots must be valid governed evidence");
         daemon
             .store()

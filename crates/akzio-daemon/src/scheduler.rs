@@ -11,7 +11,7 @@ use std::{
     time::Duration as StdDuration,
 };
 
-use akzio_domain::{Artifact, RunId, WorkflowProposal};
+use akzio_domain::{Artifact, ArtifactKind, RunId, RunPurpose, WorkflowProposal};
 use akzio_execution::paper::AlpacaPaper;
 use akzio_runtime::{RuntimeError, WorkflowRuntime};
 use akzio_store::v2::{DaemonLease, SessionSlotReservation, StoreError, V2Store};
@@ -26,6 +26,8 @@ pub enum SchedulerError {
     #[error(transparent)]
     Store(#[from] StoreError),
     #[error(transparent)]
+    Json(#[from] serde_json::Error),
+    #[error(transparent)]
     Runtime(#[from] RuntimeError),
     #[error("invalid scheduler owner")]
     InvalidOwner,
@@ -35,6 +37,10 @@ pub enum SchedulerError {
     InvalidSessionKey(String),
     #[error("broker session clock failed: {0}")]
     Clock(String),
+    #[error("no durable Paper workflow proposal is available")]
+    WorkflowUnavailable,
+    #[error("workflow proposal is not owned by a Paper run")]
+    WorkflowNotPaper,
 }
 
 pub type SchedulerResult<T> = std::result::Result<T, SchedulerError>;
@@ -86,9 +92,41 @@ pub struct StaticPaperWorkflowSource {
     proposal: WorkflowProposal,
 }
 
+/// Reads only a durable `WorkflowProposal` from `V2Store`; it never builds a
+/// replacement plan after a session slot has been reserved.
+pub struct StorePaperWorkflowSource {
+    store: V2Store,
+}
+
 impl StaticPaperWorkflowSource {
     pub fn new(proposal: WorkflowProposal) -> Self {
         Self { proposal }
+    }
+}
+
+impl StorePaperWorkflowSource {
+    pub fn new(store: V2Store) -> Self {
+        Self { store }
+    }
+}
+
+impl PaperWorkflowSource for StorePaperWorkflowSource {
+    fn proposal(&self, _session_key: &str) -> SchedulerResult<WorkflowProposal> {
+        let artifact = self
+            .store
+            .latest_artifact_by_kind(ArtifactKind::WorkflowProposal)?
+            .ok_or(SchedulerError::WorkflowUnavailable)?;
+        let run_id = artifact
+            .origin
+            .as_ref()
+            .and_then(|origin| origin.run_id.as_ref())
+            .ok_or(SchedulerError::WorkflowNotPaper)?;
+        if self.store.run_purpose(run_id)? != RunPurpose::Paper {
+            return Err(SchedulerError::WorkflowNotPaper);
+        }
+        Ok(serde_json::from_slice(
+            &self.store.read_blob(&artifact.blob)?,
+        )?)
     }
 }
 

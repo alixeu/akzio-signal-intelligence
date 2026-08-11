@@ -14,8 +14,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     content_hash_json, BlobRef, ContentHash, ContractId, DocumentLifecycle, DomainError,
-    FailureDisposition, LeaseId, RetryPolicy, RunId, TaskBudget, TaskId, TerminationPolicy,
-    ToolGrant, ToolKind,
+    FailureDisposition, LeaseId, ResearchIntent, RetryPolicy, RunId, TaskBudget, TaskId,
+    TerminationPolicy, ToolGrant, ToolKind,
 };
 
 /// A Store Root with this schema is intentionally incompatible with the previous
@@ -818,6 +818,8 @@ pub struct WorkflowProposalDraftTask {
     pub depends_on: Vec<String>,
     pub priority: u8,
     pub evidence_needs: Vec<EvidenceNeed>,
+    #[serde(default)]
+    pub research_intents: Vec<ResearchIntent>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -874,6 +876,22 @@ impl WorkflowProposalDraft {
                     return Err(DomainError::EvidenceSourceNotAllowed(
                         need.source_family.clone(),
                     ));
+                }
+            }
+            let mut unique_intents = BTreeSet::new();
+            for intent in &task.research_intents {
+                intent.validate()?;
+                let need = intent.evidence_need()?;
+                if !unique_intents.insert(need.clone()) {
+                    return Err(DomainError::EmptyField {
+                        field: "workflow_proposal_draft.research_intents",
+                    });
+                }
+                if !recipe
+                    .allowed_evidence_sources
+                    .contains(&need.source_family)
+                {
+                    return Err(DomainError::EvidenceSourceNotAllowed(need.source_family));
                 }
             }
             if task
@@ -1663,6 +1681,7 @@ mod tests {
                         resource: "bars:TQQQ:1d".to_owned(),
                         max_age_secs: 86_400,
                     }],
+                    research_intents: vec![],
                 },
             )]),
             stop_reason: None,

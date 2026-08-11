@@ -687,11 +687,16 @@ fn planner_draft_task_schema() -> Value {
                 "minimum": 0,
                 "maximum": 100
             },
-            "evidence_needs": {
-                "type": "array",
-                "items": evidence_need_output_schema(),
-                "maxItems": PLANNER_MAX_DRAFT_TASKS
-            }
+        "evidence_needs": {
+            "type": "array",
+            "items": evidence_need_output_schema(),
+            "maxItems": PLANNER_MAX_DRAFT_TASKS
+        },
+        "research_intents": {
+            "type": "array",
+            "items": research_intent_output_schema(),
+            "maxItems": PLANNER_MAX_DRAFT_TASKS
+        }
         },
         "required": [
             "recipe_id",
@@ -699,6 +704,33 @@ fn planner_draft_task_schema() -> Value {
             "depends_on",
             "priority",
             "evidence_needs"
+        ],
+        "additionalProperties": false
+    })
+}
+
+fn research_intent_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "schema_version": {"type": "integer", "enum": [V2_SCHEMA_VERSION]},
+            "source_family": {"type": "string", "enum": GOVERNED_EVIDENCE_SOURCE_FAMILIES},
+            "resource": {"type": "string", "minLength": 1, "maxLength": 2048},
+            "query": {"type": "string", "minLength": 1, "maxLength": 2000},
+            "assets": {
+                "type": "array",
+                "uniqueItems": true,
+                "maxItems": 4,
+                "items": {"type": "string", "enum": ["TQQQ", "QQQ", "SOXX", "SOXL"]}
+            },
+            "window_start": {"type": ["string", "null"]},
+            "window_end": {"type": ["string", "null"]},
+            "max_age_secs": {"type": "integer", "minimum": 1, "maximum": 604800},
+            "max_results": {"type": "integer", "minimum": 1, "maximum": 32}
+        },
+        "required": [
+            "schema_version", "source_family", "resource", "query", "assets",
+            "window_start", "window_end", "max_age_secs", "max_results"
         ],
         "additionalProperties": false
     })

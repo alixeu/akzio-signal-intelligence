@@ -10,6 +10,6 @@ pub use runtime::{
     AsyncGovernedEvidenceTransport, DetailInput, EvidenceAdapter, EvidenceBundle, EvidenceCitation,
     EvidenceProvenance, EvidenceQuality, EvidenceRequest, EvidenceRuntime, EvidenceRuntimeError,
     EvidenceRuntimeResult, EvidenceSource, FixtureEvidenceAdapter, FredEvidenceAdapter,
-    GovernedEvidenceTransport, NewsWebEvidenceAdapter, NormalizedEvidencePayload,
-    SecEdgarEvidenceAdapter,
+    GovernedEvidenceTransport, ModelNativeWebEvidenceTransport, NewsWebEvidenceAdapter,
+    NormalizedEvidencePayload, SecEdgarEvidenceAdapter,
 };

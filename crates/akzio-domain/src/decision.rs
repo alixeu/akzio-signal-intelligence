@@ -178,6 +178,11 @@ pub struct DecisionDraft {
     pub soft_warnings: Vec<SoftWarning>,
 }
 
+/// Public vocabulary for the proposal emitted by the research synthesizer.
+/// The wire shape remains `DecisionDraft`; Rust gates it before creating a
+/// durable `DecisionContext`.
+pub type DecisionProposal = DecisionDraft;
+
 impl DecisionDraft {
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.summary.trim().is_empty() {

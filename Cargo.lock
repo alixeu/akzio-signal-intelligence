@@ -29,6 +29,7 @@ version = "0.2.0"
 dependencies = [
  "akzio-daemon",
  "akzio-domain",
+ "akzio-execution",
  "akzio-model",
  "akzio-store",
  "anyhow",
@@ -113,6 +114,7 @@ name = "akzio-ingest"
 version = "0.2.0"
 dependencies = [
  "akzio-domain",
+ "akzio-model",
  "akzio-store",
  "chrono",
  "futures",
