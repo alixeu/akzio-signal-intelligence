@@ -24,6 +24,19 @@ cargo run --offline -p akzio-cli -- run fixture-debug
 
 当前 fixture workflow 可能在 evidence gate 进入 `Failed`；`run paper-dry-run` 的验收条件是 `canonical_learning_events == 0`，不能把 `status: Failed` 或命令返回当成 Paper 成功。具体失败原因若未在 artifact/event 中出现，保持“待验证”。
 
+## 真实 Paper sandbox 执行记录
+
+此节只适用于已获批准的独立 Paper sandbox；不得在本地 fixture 或生产 Store Root 上替代执行。凭据只通过环境变量注入，不写入配置、Store 或日志。
+
+1. 使用全新的、已备份的 Store Root，配置 `daemon.auto_paper=true`，并为 `transaction_cost_ppm` 或 `slippage_ppm` 设置已审批的非零值。
+2. 仅允许 `ALPACA_PAPER_BASE_URL=https://paper-api.alpaca.markets`，并在环境中设置 `ALPACA_API_KEY`、`ALPACA_API_SECRET`；启动前保存 Store manifest/hash 和 `store doctor` 结果。
+3. 启动 daemon 后记录 `daemon health`：必须看到 Paper scheduler、lease owner/epoch、未冻结状态和无未处理 critical alert；任何配置或凭据错误都应停止，不得降级到 fixture。
+4. 记录首个 broker session date、`run replay <run-id>`、`run events <run-id>` 和 Store session slot。重启 daemon 后，必须复用同一 plan hash、task IDs、session slot 和 client-order IDs。
+5. 在独立记录中逐项确认：market clock、account、四资产 quote、一次性 durable commitment、每个 client-order ID、broker receipt、reconciliation、freeze/unfreeze，以及进程强杀后的恢复。任一项缺证据，结果为未通过。
+6. Paper sandbox 证据只能标记为 `Paper sandbox`；没有真实 Outcome sealing 和人工审批前，不得标记为“Paper 生产试运行”。
+
+建议记录字段：`store_root`、`session_date`、`run_id`、`plan_hash`、lease epoch、commitment ID、client/broker order IDs、reconciliation state、freeze/unfreeze timestamps、重启时间、Doctor/replay 摘要、operator 和结论。
+
 ## 日常控制
 
 ```bash
