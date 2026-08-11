@@ -908,7 +908,7 @@ mod tests {
                 }
                 request.push(line);
             }
-            let body = r#"{"status":"ok","frozen":false,"scheduler_owner":null,"scheduler_epoch":null,"metrics":{"run_counts":{},"task_counts":{},"attempt_counts":{},"event_count":0,"active_daemon_leases":0}}"#;
+            let body = r#"{"status":"ok","frozen":false,"scheduler_owner":null,"scheduler_epoch":null,"metrics":{"run_counts":{},"task_counts":{},"attempt_counts":{},"event_count":0,"active_daemon_leases":0},"alerts":[]}"#;
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()

@@ -55,7 +55,7 @@ use akzio_runtime::{
     should_run_structured_critique, RetryCause, RuntimeError, TaskCompletion, TaskRuntime,
     WorkflowRuntime,
 };
-use akzio_store::v2::{ClaimedAttempt, StoreError, StoreMetrics, StoredEvent, V2Store};
+use akzio_store::v2::{ClaimedAttempt, StoreAlert, StoreError, StoreMetrics, StoredEvent, V2Store};
 use async_stream::stream;
 use axum::{
     extract::{Path, Query, State},
@@ -166,6 +166,7 @@ pub struct DaemonHealth {
     pub scheduler_owner: Option<String>,
     pub scheduler_epoch: Option<u64>,
     pub metrics: StoreMetrics,
+    pub alerts: Vec<StoreAlert>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -554,6 +555,7 @@ impl Daemon {
             })
             .transpose()?
             .unwrap_or(false);
+        let metrics = self.store.metrics(Utc::now())?;
         Ok(DaemonHealth {
             status: if self.auto_paper {
                 "paper_scheduler_fail_closed".to_owned()
@@ -563,7 +565,8 @@ impl Daemon {
             frozen,
             scheduler_owner: lease.as_ref().map(|lease| lease.owner_id.clone()),
             scheduler_epoch: lease.map(|lease| lease.epoch),
-            metrics: self.store.metrics(Utc::now())?,
+            alerts: metrics.alerts(),
+            metrics,
         })
     }
 
