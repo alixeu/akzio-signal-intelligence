@@ -123,6 +123,16 @@ cargo run --offline -p akzio-cli -- test lease-takeover
 
 这些命令输出会标记 `fixture: true` 或 `evidence: offline/...`，不能替代真实 Alpaca Paper、真实市场数据、网络分区或生产故障演练记录。
 
+Paper 合约的离线窄测还应覆盖 commitment、reconciliation、幂等 client-order、scheduler epoch 和 Outcome materialization：
+
+```bash
+cargo test --offline -p akzio-execution --test v2_paper_dispatch -- --nocapture
+cargo test --offline -p akzio-daemon paper_fixture_snapshots_reach_accepted_commit_reconcile_and_outcome_schedule -- --nocapture
+cargo test --offline -p akzio-learning -- --nocapture
+```
+
+这些测试只能证明 Rust gate、Store 事务和 fixture broker/Outcome worker 的契约行为；它们仍不证明 Alpaca endpoint、真实 market clock、真实回执或真实 T+1/T+3/T+5。
+
 ## Paper 试运行审批门
 
 只有以下条件全部满足，才可宣布 Paper 生产试运行：
