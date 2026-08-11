@@ -434,17 +434,17 @@ mod tests {
             graph: graph_artifact,
             nodes: graph.nodes,
         };
-        let reservation = store
+        store
             .reserve_session_slot(
                 &lease,
                 &SessionReservation {
                     session_key: "paper:fixture".to_owned(),
                     workflow,
+                    setup_artifacts: vec![],
                     reserved_at: now,
                 },
             )
             .unwrap();
-        store.commit_workflow(&reservation.slot.workflow).unwrap();
         let permit = store
             .claim_next_task("fixture", now, Duration::seconds(30))
             .unwrap()

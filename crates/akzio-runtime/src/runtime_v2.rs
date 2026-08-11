@@ -13,8 +13,9 @@ use akzio_domain::{
     WorkflowProposalTask, WorkflowStatus, REBUILD_SCHEMA_VERSION,
 };
 use akzio_store::v2::{
-    ClaimedAttempt, RetryTaskResult, StoreError, StoredEvent, StoredRun, V2Store, WorkflowCommit,
-    WorkflowPatchCommit, WorkflowRevision, WorkflowSnapshot,
+    ClaimedAttempt, DaemonLease, RetryTaskResult, SessionReservation, SessionSlotReservation,
+    StoreError, StoredEvent, StoredRun, V2Store, WorkflowCommit, WorkflowPatchCommit,
+    WorkflowRevision, WorkflowSnapshot,
 };
 use chrono::{DateTime, Duration, Utc};
 use thiserror::Error;
@@ -43,6 +44,10 @@ pub enum RebuildRuntimeError {
     WorkflowNodeLimit,
     #[error("Paper workflow {0} is frozen once submitted")]
     FrozenPaperWorkflow(RunId),
+    #[error("run {0} must be terminal before it can be retried")]
+    RetryRunNotTerminal(RunId),
+    #[error("run purpose {0:?} cannot be retried through the operator surface")]
+    RetryPurpose(RunPurpose),
     #[error("planner task {task} exceeds child limit for recipe {recipe}")]
     WorkflowFanoutLimit { task: String, recipe: TaskRecipeId },
     #[error("planner task {task} exceeds depth limit for recipe {recipe}")]
@@ -304,6 +309,84 @@ impl RebuildWorkflowRuntime {
 
     /// Load the exact durable graph/task state for crash recovery. Recovery
     /// never re-lowers a proposal or allocates replacement task IDs.
+    /// Freeze one fully compiled Paper workflow into its broker-session slot.
+    /// A duplicate session returns the already durable graph and task IDs; it
+    /// never regenerates a replacement graph after a scheduler restart.
+    pub fn reserve_paper_session(
+        &self,
+        lease: &DaemonLease,
+        session_key: impl Into<String>,
+        proposal: &WorkflowProposal,
+        now: DateTime<Utc>,
+    ) -> RebuildRuntimeResult<SessionSlotReservation> {
+        self.reserve_paper_session_with_inputs(lease, session_key, proposal, &[], now)
+    }
+
+    /// As [`Self::reserve_paper_session`], but atomically installs the
+    /// scheduler-owned immutable `EvidenceNeed` artifacts referenced by the
+    /// compiled graph.
+    pub fn reserve_paper_session_with_inputs(
+        &self,
+        lease: &DaemonLease,
+        session_key: impl Into<String>,
+        proposal: &WorkflowProposal,
+        setup_artifacts: &[Artifact],
+        now: DateTime<Utc>,
+    ) -> RebuildRuntimeResult<SessionSlotReservation> {
+        self.reserve_paper_session_with_inputs_for_run(
+            lease,
+            RunId::new(),
+            session_key,
+            proposal,
+            setup_artifacts,
+            now,
+        )
+    }
+
+    /// Reserve the exact caller-allocated run identity. This exists for the
+    /// scheduler's preflight transaction, which binds immutable evidence need
+    /// artifacts to the same Run before it becomes visible.
+    pub fn reserve_paper_session_with_inputs_for_run(
+        &self,
+        lease: &DaemonLease,
+        run_id: RunId,
+        session_key: impl Into<String>,
+        proposal: &WorkflowProposal,
+        setup_artifacts: &[Artifact],
+        now: DateTime<Utc>,
+    ) -> RebuildRuntimeResult<SessionSlotReservation> {
+        let session_key = session_key.into();
+        if let Some(slot) = self.store.session_slot(&session_key)? {
+            return Ok(SessionSlotReservation {
+                slot,
+                newly_reserved: false,
+            });
+        }
+
+        let graph = self.lower(RunPurpose::Paper, proposal)?;
+        let graph_artifact = self.graph_artifact(&graph, Vec::new(), now)?;
+        let workflow = WorkflowCommit {
+            run: StoredRun {
+                run_id,
+                purpose: RunPurpose::Paper,
+                topology_id: graph.topology_id.clone(),
+                graph_artifact_id: graph_artifact.artifact_id.clone(),
+                created_at: now,
+            },
+            graph: graph_artifact,
+            nodes: graph.nodes,
+        };
+        Ok(self.store.reserve_session_slot(
+            lease,
+            &SessionReservation {
+                session_key,
+                workflow,
+                setup_artifacts: setup_artifacts.to_vec(),
+                reserved_at: now,
+            },
+        )?)
+    }
+
     pub fn recover(&self, run_id: &RunId) -> RebuildRuntimeResult<WorkflowSnapshot> {
         let snapshot = self.store.workflow_snapshot(run_id)?;
         self.validate_compiled_graph(snapshot.run.purpose, &snapshot.revision.graph)?;
@@ -312,6 +395,37 @@ impl RebuildWorkflowRuntime {
 
     /// Rebuild a Run from its append-only event stream and durable task
     /// history, rejecting a snapshot that cannot be derived from that history.
+    /// Create a fresh noncanonical rerun. Paper, Shadow and Replay workloads
+    /// have distinct owner flows and can never be retried through HTTP.
+    pub fn retry_run(
+        &self,
+        source_run_id: &RunId,
+        now: DateTime<Utc>,
+    ) -> RebuildRuntimeResult<RunId> {
+        let source = self.replay_run(source_run_id)?;
+        if !matches!(
+            source.status,
+            WorkflowStatus::Completed
+                | WorkflowStatus::CompletedWithExecutionRejection
+                | WorkflowStatus::Failed
+                | WorkflowStatus::Cancelled
+        ) {
+            return Err(RebuildRuntimeError::RetryRunNotTerminal(
+                source_run_id.clone(),
+            ));
+        }
+        if !matches!(
+            source.run.purpose,
+            RunPurpose::Debug | RunPurpose::PaperDryRun
+        ) {
+            return Err(RebuildRuntimeError::RetryPurpose(source.run.purpose));
+        }
+        let run_id = RunId::new();
+        let graph = self.bootstrap(source.run.purpose, source.run.topology_id.clone())?;
+        self.submit(run_id.clone(), source.run.purpose, graph, now)?;
+        Ok(run_id)
+    }
+
     pub fn replay_run(&self, run_id: &RunId) -> RebuildRuntimeResult<WorkflowSnapshot> {
         let replay = self.reduce_history(run_id)?;
         self.validate_replay_revisions(run_id, &replay)?;
@@ -1515,6 +1629,10 @@ pub enum RebuildRetryCause {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RebuildTaskCompletion {
     Succeeded(Vec<Artifact>),
+    /// A Rust gate can succeed after forwarding already durable lineage without
+    /// manufacturing a duplicate artifact. The task transition remains in the
+    /// Store event log; the upstream artifact remains the source of truth.
+    NoOutput,
     Committed,
     Failed,
     Skipped,
@@ -1546,6 +1664,17 @@ impl RebuildTaskRuntime {
 
     pub fn store(&self) -> &V2Store {
         &self.store
+    }
+
+    /// Request cooperative cancellation through the Store-owned task state
+    /// machine. A worker observes the durable flag between heartbeats.
+    pub fn request_cancel(
+        &self,
+        run_id: &RunId,
+        reason: &str,
+        now: DateTime<Utc>,
+    ) -> RebuildRuntimeResult<bool> {
+        Ok(self.store.request_run_cancel(run_id, reason, now)?)
     }
 
     pub async fn run_one<F, Fut>(&self, worker_id: &str, handle: F) -> RebuildRuntimeResult<bool>
@@ -1607,6 +1736,10 @@ impl RebuildTaskRuntime {
             RebuildTaskCompletion::Succeeded(artifacts) => {
                 self.store
                     .commit_attempt(&task.permit, &artifacts, TaskStatus::Succeeded, now)?;
+            }
+            RebuildTaskCompletion::NoOutput => {
+                self.store
+                    .finish_task(&task.permit, TaskStatus::Succeeded, now)?;
             }
             RebuildTaskCompletion::Committed => {
                 self.store

@@ -21,6 +21,7 @@ use akzio_runtime::v2::{RecipeCatalogue, RuntimeError as RebuildRuntimeError, Te
 use akzio_store::v2::{StoreError, StoredContract, V2Store};
 use chrono::{DateTime, Duration, Utc};
 use futures::future::BoxFuture;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use thiserror::Error;
@@ -1609,6 +1610,7 @@ fn validate_schema_value(value: &Value, schema: &Value, path: &str) -> Result<()
                 | "items"
                 | "minimum"
                 | "maximum"
+                | "pattern"
                 | "minLength"
                 | "maxLength"
                 | "minItems"
@@ -1704,6 +1706,7 @@ fn validate_schema_bounds(
             }
             if definition.contains_key("minLength")
                 || definition.contains_key("maxLength")
+                || definition.contains_key("pattern")
                 || definition.contains_key("minItems")
                 || definition.contains_key("maxItems")
                 || definition.contains_key("minProperties")
@@ -1722,6 +1725,16 @@ fn validate_schema_bounds(
                 "maxLength",
                 path,
             )?;
+            if let Some(pattern) = definition.get("pattern") {
+                let pattern = pattern
+                    .as_str()
+                    .ok_or_else(|| format!("{path} schema.pattern must be a string"))?;
+                let pattern = Regex::new(pattern)
+                    .map_err(|error| format!("{path} schema.pattern is invalid: {error}"))?;
+                if !pattern.is_match(value.as_str().expect("validated string")) {
+                    return Err(format!("{path} violates schema.pattern"));
+                }
+            }
             if definition.contains_key("minimum")
                 || definition.contains_key("maximum")
                 || definition.contains_key("minItems")
@@ -1744,6 +1757,7 @@ fn validate_schema_bounds(
                 || definition.contains_key("maximum")
                 || definition.contains_key("minLength")
                 || definition.contains_key("maxLength")
+                || definition.contains_key("pattern")
                 || definition.contains_key("minProperties")
                 || definition.contains_key("maxProperties")
             {
@@ -1762,6 +1776,7 @@ fn validate_schema_bounds(
                 || definition.contains_key("maximum")
                 || definition.contains_key("minLength")
                 || definition.contains_key("maxLength")
+                || definition.contains_key("pattern")
                 || definition.contains_key("minItems")
                 || definition.contains_key("maxItems")
             {
@@ -1773,6 +1788,7 @@ fn validate_schema_bounds(
                 || definition.contains_key("maximum")
                 || definition.contains_key("minLength")
                 || definition.contains_key("maxLength")
+                || definition.contains_key("pattern")
                 || definition.contains_key("minItems")
                 || definition.contains_key("maxItems")
                 || definition.contains_key("minProperties")
@@ -2416,6 +2432,22 @@ mod tests {
         ] {
             assert!(validate_schema_value(&invalid, &schema, "$").is_err());
         }
+    }
+
+    #[test]
+    fn artifact_reference_schema_enforces_sha256_pattern() {
+        let schema = artifact_ref_schema(&["claim"]);
+        let valid = json!({
+            "artifact_id": "a".repeat(64),
+            "kind": "claim",
+        });
+        validate_schema_value(&valid, &schema, "$").unwrap();
+
+        let invalid = json!({
+            "artifact_id": "not-a-content-hash",
+            "kind": "claim",
+        });
+        assert!(validate_schema_value(&invalid, &schema, "$").is_err());
     }
 
     #[test]

@@ -177,6 +177,20 @@ impl DecisionPolicy {
     }
 }
 
+impl Default for DecisionPolicy {
+    fn default() -> Self {
+        Self {
+            min_confidence_ppm: 250_000,
+            max_gross_weight: WeightPpm(500_000),
+            horizon_weights: BTreeMap::from([
+                (DecisionHorizon::T1, WeightPpm(333_333)),
+                (DecisionHorizon::T3, WeightPpm(333_333)),
+                (DecisionHorizon::T5, WeightPpm(333_334)),
+            ]),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct V2DecisionRuntime {
     store: V2Store,

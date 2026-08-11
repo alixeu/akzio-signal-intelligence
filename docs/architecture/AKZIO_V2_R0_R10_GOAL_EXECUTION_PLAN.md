@@ -2,7 +2,7 @@
 
 日期：2026-08-11
 
-状态：**R0 verified / R1–R3 narrow regression verified / R4 lifecycle complete / R5 deterministic replay complete / R6 complete pending final R10 review / R7 owner runtime complete / R8 in progress**
+状态：**R0 verified / R1–R3 narrow regression verified / R4 lifecycle complete / R5 deterministic replay complete / R6 complete pending final R10 review / R7 owner runtime complete / R8 complete**
 适用 checkout：当前 workspace；`faf493c8ba40e0c839ab221d8435757db1a319f6` 仅是历史 R6 阶段快照，不是当前基线。
 
 ## 1. Goal objective
@@ -177,6 +177,15 @@
 - `V2Store::verify_integrity` 现扫描每个 durable `OutcomeSchedule`，验证 Paper/Shadow lifecycle、完整 source closure、允许的 provenance 以及 `NoOrder` / reconciled Paper execution lineage；伪造的 accepted verdict 不能伪装为 NoOrder schedule。
 - 已实际通过 `cargo fmt --all`、`cargo test --offline -p akzio-store`（41 passed）、`cargo test --offline -p akzio-execution`（33 passed）、`cargo clippy --offline -p akzio-store -p akzio-execution --all-targets -- -D warnings` 与 `cargo check --offline --workspace`。测试只使用本地 fixture/fake broker；未触发真实市场、Alpaca 或订单 I/O。
 - 下一阶段为 R8 daemon/scheduler/HTTP-SSE integration；R0–R7 不重复回看，R0–R10 完成后统一终局复核。
+
+### 3.12 2026-08-11 R8 daemon、scheduler 与 HTTP/SSE checkpoint
+
+- Daemon 现将 Agent、Evidence、Decision、Execution、PaperCommit、Reconcile 与 Evaluate task class 路由到各自的 owner runtime；接受型 Paper fixture 从受治理的 scheduler snapshot 生成 Claim，再以真实 Claim artifact ref 形成 Decision Draft，经 Rust gate、fake Paper broker、reconciliation 和 OutcomeSchedule 闭环。没有放宽 Claim/blocker 或 Contract schema 约束。
+- `V2Store::commit_execution` 在同一 fenced transaction 内同时持久化 commitment、`artifact.committed` output index、execution event 与 task terminal state；下游 terminal task 可从 durable attempt output 读取 commitment，幂等恢复分支同样保持该闭包。Contract schema validator 现实际验证已声明的 SHA-256 artifact-id pattern。
+- `auto_paper=true` 必须经注入的 broker session clock 与 Rust-validated Paper workflow source 进入 supervisor；缺少 loop source 的 worker-only 启动 fail closed。双 Daemon stale-lease/epoch fixture 复用冻结的 session workflow；每个 session slot 只保留一次 durable reservation。
+- loopback HTTP router 已有本地测试覆盖 token rejection/success、cancel/retry、freeze/unfreeze 与 SSE `after` cursor resume；freeze 仍是 Store-owned append-only artifact state。全部证据为临时 Store、fixture、fake broker 和静态 model response，未访问市场、Alpaca、模型或其他网络服务。
+- 已实际通过 `cargo fmt --all`、六个相关 crate 的 `cargo test --offline --lib`（138 passed）、`cargo test --offline -p akzio-execution`（33 passed）、`cargo check --offline --workspace` 和相关 crate 的 `cargo clippy --offline --all-targets -- -D warnings`。这不是 R10 的全 workspace test/CLI/Doctor 验收。
+- Unix JSON-line listener/client 与 CLI/config 改写仍在 R9；因此不在 R8 声称删除它们。下一阶段为 R9，R0–R8 不再回看，R10 后统一终局复核。
 
 ## 4. 从官方网站吸收的原则
 
@@ -664,15 +673,12 @@ Entry gate：逐项结果
 - SSE durable cursor/resume；
 - freeze/unfreeze、cancel/retry、replay/Doctor endpoints；
 - thin dispatch，只路由到 owner runtime；
-- CLI 在本阶段切换到 HTTP client，保证删除 Unix 后 workspace 可运行。
+- auto Paper 未提供 scheduler loop source 时 fail closed；HTTP-only CLI/config 切换属于 R9。
 
 **Deletions**
 
-- `serve_unix`；
-- Unix JSON `DaemonCommand` business protocol；
-- socket path 与清理逻辑；
-- Daemon 内 research/learning/execution policy；
-- 重复 command reducer。
+- R8 不删除 Unix surface；`serve_unix`、Unix JSON business protocol、socket path/cleanup 与旧 command reducer 的删除全部属于 R9。
+- Daemon 内 research/learning/execution policy 仍不得出现。
 
 **Tests**
 
@@ -680,16 +686,15 @@ Entry gate：逐项结果
 - SSE resume；
 - cancel/retry；
 - two-daemon epoch fencing；
-- process crash/recovery；
-- multi-run concurrency；
+- lease-expiry recovery 与 frozen workflow reuse；
 - scheduler slot uniqueness/recovery；
-- stale leader broker commitment rejection；
+- accepted Paper fixture 的 fenced commitment/reconciliation；
 - freeze persistence。
 
 **Exit gate**
 
-- CLI/未来 UI 使用同一 HTTP/SSE API；
-- Unix 业务协议没有 reachable path；
+- Daemon 提供 authenticated loopback HTTP/SSE API；
+- auto Paper 只能由 injected scheduler loop 启动，缺少 source 时 fail closed；
 - 每个 runtime transition 可由 Store events/artifacts 重建。
 
 ### R9 — 重写 CLI/config 和操作表面
@@ -853,7 +858,7 @@ cargo run --offline -p akzio-cli -- store doctor
 | R5 | deterministic replay complete | R4 lifecycle complete | DAG/Task/recovery、dynamic patch、retry/cancel、crash recovery、artifact trace 与 snapshot divergence replay 已通过离线窄测 |
 | R6 | complete | R5 核心完成 | sealed Outcome/Shadow/canary/no-op cursor/noncanonical owner surface 已完成；全量 regression 不得凭历史快照宣称 |
 | R7 | owner runtime complete | R6 complete | Decision/Execution gates、Paper-only adapter、commitment/reprice/reconciliation、NoOrder/Dry Run isolation 与 OutcomeSchedule Doctor closure 已通过离线窄测 |
-| R8 | partial | R7 complete | Daemon 接通全部 terminal owner runtime；scheduler、crash/concurrency、epoch fencing、HTTP/SSE、freeze tests；Unix path 不再 active |
+| R8 | complete | R7 complete | terminal owner runtime、accepted fake Paper chain、fenced session recovery、injected scheduler supervisor、loopback HTTP/SSE 与 Store-owned freeze 已通过离线窄测；Unix 删除留给 R9 |
 | R9 | not started | R8 complete | HTTP-only CLI/config/help/incompatibility tests |
 | R10 | not started | R9 complete | full offline matrix、fixture harness 和 deletion inventory |
 

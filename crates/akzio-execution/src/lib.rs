@@ -116,6 +116,22 @@ impl ExecutionPolicy {
     }
 }
 
+impl Default for ExecutionPolicy {
+    fn default() -> Self {
+        Self {
+            assets: Asset::EXECUTABLE.into_iter().collect(),
+            max_gross_weight: WeightPpm(1_000_000),
+            max_new_notional: MoneyMicros::from_usd_cents(2_000_000),
+            max_daily_turnover: WeightPpm(1_000_000),
+            max_account_age_secs: 5,
+            max_quote_age_secs: 5,
+            max_clock_age_secs: 5,
+            max_spread_bps: 20,
+            limit_protection_bps: 10,
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn build_execution_plan(
     policy: &ExecutionPolicy,

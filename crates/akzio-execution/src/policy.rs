@@ -43,6 +43,20 @@ impl ExecutionGatePolicy {
     }
 }
 
+impl Default for ExecutionGatePolicy {
+    fn default() -> Self {
+        Self {
+            factor_limits: FactorLimits {
+                global_leveraged_equity_ppm: 1_000_000,
+                nasdaq_ppm: 1_000_000,
+                semiconductor_ppm: 1_000_000,
+                paired_index_ppm: 1_000_000,
+            },
+            max_turnover_ppm: 1_000_000,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use akzio_domain::{FactorExposure, FactorLimits, HardBlocker};

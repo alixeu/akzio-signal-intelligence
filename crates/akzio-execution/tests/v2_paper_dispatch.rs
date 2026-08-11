@@ -467,7 +467,7 @@ fn prepared_commitment() -> PreparedCommitment {
         now,
     )
     .unwrap();
-    let reservation = store
+    store
         .reserve_session_slot(
             &lease,
             &SessionReservation {
@@ -483,11 +483,11 @@ fn prepared_commitment() -> PreparedCommitment {
                     graph: graph_artifact,
                     nodes: graph.nodes,
                 },
+                setup_artifacts: vec![],
                 reserved_at: now,
             },
         )
         .unwrap();
-    store.commit_workflow(&reservation.slot.workflow).unwrap();
     let permit = store
         .claim_next_task("commitment-worker", now, Duration::seconds(30))
         .unwrap()

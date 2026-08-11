@@ -16,12 +16,12 @@ use akzio_domain::{
     AgentContract, Artifact, ArtifactId, ArtifactKind, ArtifactLifecycle, ArtifactOrigin,
     ArtifactProvenance, ArtifactRef, Asset, AttemptId, BlobRef, CandidatePolicy,
     CandidatePolicyState, ContentHash, ContractId, ContractPurpose, DomainError, Evaluation,
-    ExecutionContext, ExecutionPlan, ExecutionVerdict, Experience, FailureDisposition, LeaseId,
-    OrderReceipt, OrderReceiptState, Outcome, OutcomeExecutionLineage, OutcomeHorizon,
+    ExecutionContext, ExecutionPlan, ExecutionVerdict, Experience, FailureDisposition, FreezeState,
+    LeaseId, OrderReceipt, OrderReceiptState, Outcome, OutcomeExecutionLineage, OutcomeHorizon,
     OutcomeSchedule, PaperCommitment, PaperReprice, PolicyState, PolicySubject, PolicyTransition,
     PolicyTransitionId, Reconciliation, RetryPolicy, RunId, RunPurpose, TaskId, TaskRecipeId,
     TaskStatus, TaskWritePermit, WorkflowGraph, WorkflowNode, WorkflowProposal, WorkflowStatus,
-    REBUILD_SCHEMA_VERSION,
+    REBUILD_SCHEMA_VERSION, V2_DOMAIN_SCHEMA_VERSION,
 };
 use chrono::{DateTime, Duration, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
@@ -266,6 +266,9 @@ pub struct DaemonLease {
 pub struct SessionReservation {
     pub session_key: String,
     pub workflow: WorkflowCommit,
+    /// Immutable scheduler-owned `EvidenceNeed` inputs installed atomically
+    /// with the frozen Paper graph, before any Run becomes visible.
+    pub setup_artifacts: Vec<Artifact>,
     pub reserved_at: DateTime<Utc>,
 }
 
@@ -596,6 +599,42 @@ impl RebuildStore {
     /// Return the immutable Contract currently selected for a purpose.
     /// The mutable head is only a reconstruction cursor; each activation stays
     /// in `rebuild_contract_activations` for Doctor and restart recovery.
+    /// Persist an immutable operator freeze transition. There is no mutable
+    /// switch: execution consults the latest canonical `FreezeState` artifact.
+    pub fn write_freeze_state(
+        &self,
+        frozen: bool,
+        reason: impl Into<String>,
+        changed_at: DateTime<Utc>,
+    ) -> RebuildStoreResult<Artifact> {
+        let payload = FreezeState {
+            schema_version: V2_DOMAIN_SCHEMA_VERSION,
+            frozen,
+            reason: reason.into(),
+            changed_at,
+        };
+        payload.validate()?;
+        let artifact = Artifact::new(
+            ArtifactKind::FreezeState,
+            self.put_json(&payload)?,
+            "store.freeze_state",
+            ArtifactLifecycle::Canonical,
+            ArtifactProvenance {
+                source_family: "akzio.operator".to_owned(),
+                observed_at: Some(changed_at),
+                retrieved_at: changed_at,
+                source_uri: None,
+                confidence_ppm: 1_000_000,
+                producer_contract_hash: None,
+            },
+            None,
+            Vec::new(),
+            changed_at,
+        )?;
+        self.write_bootstrap_artifact(&artifact)?;
+        Ok(artifact)
+    }
+
     pub fn active_contract(
         &self,
         purpose: &ContractPurpose,
@@ -934,12 +973,21 @@ impl RebuildStore {
 
         let mut connection = self.connection.lock().expect("store connection poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        assert_workflow_input_artifacts(&transaction, &commit.nodes)?;
-        insert_artifact(&transaction, &commit.graph)?;
+        Self::commit_workflow_transaction(&transaction, commit)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn commit_workflow_transaction(
+        transaction: &Transaction<'_>,
+        commit: &WorkflowCommit,
+    ) -> RebuildStoreResult<()> {
+        assert_workflow_input_artifacts(transaction, &commit.nodes)?;
+        insert_artifact(transaction, &commit.graph)?;
         let inserted = transaction.execute(
             r#"INSERT INTO rebuild_runs
-               (run_id, purpose, topology_id, graph_artifact_id, status, created_at)
-               VALUES (?1, ?2, ?3, ?4, 'queued', ?5)"#,
+                (run_id, purpose, topology_id, graph_artifact_id, status, created_at)
+                VALUES (?1, ?2, ?3, ?4, 'queued', ?5)"#,
             params![
                 commit.run.run_id.0,
                 enum_name(commit.run.purpose),
@@ -952,20 +1000,15 @@ impl RebuildStore {
             return Err(RebuildStoreError::DuplicateRun(commit.run.run_id.clone()));
         }
         for node in &commit.nodes {
-            insert_task_node(
-                &transaction,
-                &commit.run.run_id,
-                node,
-                commit.run.created_at,
-            )?;
+            insert_task_node(transaction, &commit.run.run_id, node, commit.run.created_at)?;
         }
         for node in &commit.nodes {
-            insert_node_dependencies(&transaction, node)?;
+            insert_node_dependencies(transaction, node)?;
         }
         transaction.execute(
             r#"INSERT INTO rebuild_workflow_revisions
-               (run_id, revision, graph_artifact_id, created_at)
-               VALUES (?1, 0, ?2, ?3)"#,
+                (run_id, revision, graph_artifact_id, created_at)
+                VALUES (?1, 0, ?2, ?3)"#,
             params![
                 commit.run.run_id.0,
                 commit.run.graph_artifact_id.0.as_str(),
@@ -973,7 +1016,7 @@ impl RebuildStore {
             ],
         )?;
         append_event(
-            &transaction,
+            transaction,
             &commit.run.run_id,
             None,
             None,
@@ -981,7 +1024,6 @@ impl RebuildStore {
             Some(&commit.graph.artifact_id),
             commit.run.created_at,
         )?;
-        transaction.commit()?;
         Ok(())
     }
 
@@ -1130,6 +1172,22 @@ impl RebuildStore {
         {
             return Err(RebuildStoreError::WorkflowGraphMismatch);
         }
+        for artifact in &reservation.setup_artifacts {
+            artifact.validate()?;
+            if artifact.kind != ArtifactKind::EvidenceNeed
+                || artifact.lifecycle != ArtifactLifecycle::RunScoped
+                || artifact
+                    .origin
+                    .as_ref()
+                    .and_then(|origin| origin.run_id.as_ref())
+                    != Some(&reservation.workflow.run.run_id)
+            {
+                return Err(RebuildStoreError::InvalidSessionSlot(
+                    reservation.session_key.clone(),
+                ));
+            }
+            self.read_blob(&artifact.blob)?;
+        }
 
         let newly_reserved = {
             let mut connection = self.connection.lock().expect("store connection poisoned");
@@ -1147,7 +1205,10 @@ impl RebuildStore {
                 transaction.commit()?;
                 false
             } else {
-                insert_artifact(&transaction, &reservation.workflow.graph)?;
+                for artifact in &reservation.setup_artifacts {
+                    insert_artifact(&transaction, artifact)?;
+                }
+                Self::commit_workflow_transaction(&transaction, &reservation.workflow)?;
                 transaction.execute(
                     "INSERT INTO rebuild_session_slots (session_key, run_id, topology_id, graph_artifact_id, run_created_at, scheduler_epoch, reserved_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                     params![
@@ -1249,6 +1310,26 @@ impl RebuildStore {
     /// session and terminally completes the active task attempt in the same
     /// transaction. A crash therefore cannot leave a committed session slot
     /// paired with an active commitment task.
+    /// Returns the frozen broker-session slot for one scheduler-owned Paper
+    /// run. A run may never have more than one such slot.
+    pub fn session_slot_for_run(&self, run_id: &RunId) -> RebuildStoreResult<Option<SessionSlot>> {
+        let session_key = {
+            let connection = self.connection.lock().expect("store connection poisoned");
+            connection
+                .query_row(
+                    "SELECT session_key FROM rebuild_session_slots WHERE run_id = ?1",
+                    params![run_id.0],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+        };
+        Ok(session_key
+            .as_deref()
+            .map(|session_key| self.session_slot(session_key))
+            .transpose()?
+            .flatten())
+    }
+
     pub fn commit_execution(
         &self,
         lease: &DaemonLease,
@@ -1323,6 +1404,21 @@ impl RebuildStore {
                     &commit.permit.run_id,
                     &commit.session_key,
                 )?;
+                let event_id = append_event(
+                    &transaction,
+                    &commit.permit.run_id,
+                    Some(&commit.permit.task_id),
+                    Some(&commit.permit.attempt_id),
+                    "artifact.committed",
+                    Some(&commit.commitment.artifact_id),
+                    commit.committed_at,
+                )?;
+                record_attempt_output(
+                    &transaction,
+                    &commit.permit,
+                    &commit.commitment.artifact_id,
+                    event_id,
+                )?;
                 append_event(
                     &transaction,
                     &commit.permit.run_id,
@@ -1359,6 +1455,21 @@ impl RebuildStore {
                     &commit.session_key,
                 )?;
                 if same_paper_commitment(&existing_payload, &payload) {
+                    let event_id = append_event(
+                        &transaction,
+                        &commit.permit.run_id,
+                        Some(&commit.permit.task_id),
+                        Some(&commit.permit.attempt_id),
+                        "artifact.committed",
+                        Some(&existing_artifact_id),
+                        commit.committed_at,
+                    )?;
+                    record_attempt_output(
+                        &transaction,
+                        &commit.permit,
+                        &existing_artifact_id,
+                        event_id,
+                    )?;
                     append_event(
                         &transaction,
                         &commit.permit.run_id,
@@ -1395,6 +1506,21 @@ impl RebuildStore {
                 commit.committed_at.to_rfc3339(),
                 commit.session_key,
             ],
+        )?;
+        let event_id = append_event(
+            &transaction,
+            &commit.permit.run_id,
+            Some(&commit.permit.task_id),
+            Some(&commit.permit.attempt_id),
+            "artifact.committed",
+            Some(&commit.commitment.artifact_id),
+            commit.committed_at,
+        )?;
+        record_attempt_output(
+            &transaction,
+            &commit.permit,
+            &commit.commitment.artifact_id,
+            event_id,
         )?;
         append_event(
             &transaction,
@@ -3070,6 +3196,21 @@ impl RebuildStore {
     /// Returns final artifacts for one exact succeeded task attempt. This is
     /// intentionally stricter than an event-log query so callers cannot feed
     /// an AgentTurn, ToolCall, or failed-attempt artifact into another task.
+    /// As [`Self::committed_task_outputs`], but permits an explicitly
+    /// successful no-output gate. The task/attempt still had to reach durable
+    /// `succeeded`; callers must never use this for arbitrary running work.
+    pub fn succeeded_task_outputs_or_empty(
+        &self,
+        run_id: &RunId,
+        task_id: &TaskId,
+    ) -> RebuildStoreResult<Vec<Artifact>> {
+        match self.committed_task_outputs(run_id, task_id) {
+            Ok(artifacts) => Ok(artifacts),
+            Err(RebuildStoreError::CommittedOutputAttempt { .. }) => Ok(Vec::new()),
+            Err(error) => Err(error),
+        }
+    }
+
     pub fn committed_attempt_outputs(
         &self,
         task_id: &TaskId,
@@ -7749,7 +7890,7 @@ mod tests {
             &serde_json::to_string(&graph).unwrap(),
             None,
         );
-        let reservation = store
+        let _reservation = store
             .reserve_session_slot(
                 &lease,
                 &SessionReservation {
@@ -7765,11 +7906,11 @@ mod tests {
                         graph: graph_artifact,
                         nodes: graph.nodes,
                     },
+                    setup_artifacts: vec![],
                     reserved_at: now,
                 },
             )
             .unwrap();
-        store.commit_workflow(&reservation.slot.workflow).unwrap();
         let permit = store
             .claim_next_task("fixture-worker", now, Duration::seconds(30))
             .unwrap()
@@ -9414,6 +9555,7 @@ mod tests {
                 &SessionReservation {
                     session_key: "paper:fixture-a".to_owned(),
                     workflow: first_workflow.clone(),
+                    setup_artifacts: vec![],
                     reserved_at: now,
                 },
             )
@@ -9445,6 +9587,7 @@ mod tests {
                 &SessionReservation {
                     session_key: "paper:fixture-a".to_owned(),
                     workflow: replacement_workflow.clone(),
+                    setup_artifacts: vec![],
                     reserved_at: now,
                 },
             )
@@ -9459,7 +9602,6 @@ mod tests {
             first_workflow.graph.artifact_id
         );
 
-        store.commit_workflow(&first.slot.workflow).unwrap();
         let claimed = store
             .claim_next_task("execution-worker", now, Duration::seconds(30))
             .unwrap()
@@ -9523,6 +9665,11 @@ mod tests {
             )
             .unwrap();
         assert!(committed.newly_committed);
+        let outputs = store
+            .committed_task_outputs(&claimed.permit.run_id, &claimed.permit.task_id)
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].artifact_id, commitment.artifact_id);
         assert!(matches!(
             store.commit_execution(
                 &first_lease,
@@ -9585,6 +9732,7 @@ mod tests {
                 &SessionReservation {
                     session_key: "paper:fixture-b".to_owned(),
                     workflow: replacement_workflow,
+                    setup_artifacts: vec![],
                     reserved_at: successor_now,
                 },
             ),
@@ -9624,6 +9772,7 @@ mod tests {
                         graph: graph_artifact,
                         nodes: graph.nodes,
                     },
+                    setup_artifacts: vec![],
                     reserved_at: now,
                 },
             )
