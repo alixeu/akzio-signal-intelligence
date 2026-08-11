@@ -7,6 +7,7 @@ use akzio_daemon::{
 };
 use akzio_domain::{ArtifactKind, Asset, RunPurpose, WorkflowStatus};
 use akzio_execution::paper::AlpacaPaper;
+use akzio_learning::{evaluate_frozen_evidence, FrozenEvidenceRecord, FrozenEvidenceSet};
 use akzio_model::ModelConfig;
 use akzio_store::V2Store;
 use anyhow::{bail, Context, Result};
@@ -84,6 +85,7 @@ enum TestCommand {
     ConcurrentRuns,
     EvidenceIntegrity,
     LearningTransitions,
+    FrozenEvidence,
 }
 
 #[derive(Debug, Subcommand)]
@@ -619,6 +621,44 @@ async fn diagnostic_test(config: Config, command: TestCommand) -> Result<()> {
                     "policy_transitions": transitions,
                     "fixture": true,
                     "evidence": "offline/noncanonical-boundary"
+                })
+            );
+        }
+        TestCommand::FrozenEvidence => {
+            let hash = |seed: &str| akzio_domain::ContentHash::of_bytes(seed.as_bytes());
+            let record = |case_id: &str, schema_ok: bool| FrozenEvidenceRecord {
+                case_id: case_id.to_owned(),
+                model_version: "fixture-model-v1".to_owned(),
+                prompt_hash: hash("fixture-prompt-v1"),
+                contract_hash: hash("fixture-contract-v1"),
+                planner_schema_ok: schema_ok,
+                claim_schema_ok: schema_ok,
+                critique_schema_ok: schema_ok,
+                decision_proposal_schema_ok: schema_ok,
+                expected_evidence: 4,
+                observed_evidence: if schema_ok { 4 } else { 3 },
+                expected_blockers: BTreeSet::from([akzio_domain::HardBlocker::MissingEvidence]),
+                detected_blockers: if schema_ok {
+                    BTreeSet::from([akzio_domain::HardBlocker::MissingEvidence])
+                } else {
+                    BTreeSet::new()
+                },
+                input_tokens: 120,
+                output_tokens: 80,
+                cost_micros: 15,
+                latency_millis: if schema_ok { 240 } else { 310 },
+            };
+            let metrics = evaluate_frozen_evidence(&FrozenEvidenceSet {
+                set_id: "cli-frozen-evidence-fixture".to_owned(),
+                records: vec![record("case-accepted", true), record("case-blocked", false)],
+            })?;
+            println!(
+                "{}",
+                serde_json::json!({
+                    "test": "frozen-evidence",
+                    "fixture": true,
+                    "evidence": "offline/frozen-evidence",
+                    "metrics": metrics,
                 })
             );
         }

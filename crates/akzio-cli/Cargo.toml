@@ -13,6 +13,7 @@ path = "src/main.rs"
 akzio-daemon = { path = "../akzio-daemon" }
 akzio-domain = { path = "../akzio-domain" }
 akzio-execution = { path = "../akzio-execution" }
+akzio-learning = { path = "../akzio-learning" }
 akzio-model = { path = "../akzio-model" }
 akzio-store = { path = "../akzio-store" }
 anyhow.workspace = true

@@ -30,6 +30,7 @@ dependencies = [
  "akzio-daemon",
  "akzio-domain",
  "akzio-execution",
+ "akzio-learning",
  "akzio-model",
  "akzio-store",
  "anyhow",
