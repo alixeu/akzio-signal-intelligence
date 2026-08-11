@@ -37,6 +37,18 @@ pub enum ResolutionDisposition {
     Unresolved,
 }
 
+/// Rust-owned Planner research lanes. A Planner may select a bounded subset
+/// of these lanes, but it cannot invent a new source family or lane at run
+/// time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResearchShard {
+    PriceMarketStructure,
+    Macro,
+    FundamentalsSemiconductor,
+    NewsEvent,
+}
+
 /// Rust-owned research request. It is lowered to an `EvidenceNeed` before a
 /// workflow is installed; models may propose values but cannot widen them at
 /// execution time.
@@ -54,6 +66,16 @@ pub struct ResearchIntent {
 }
 
 impl ResearchIntent {
+    pub fn shard(&self) -> ResearchShard {
+        match self.source_family.as_str() {
+            "alpaca" => ResearchShard::PriceMarketStructure,
+            "fred" => ResearchShard::Macro,
+            "sec_edgar" => ResearchShard::FundamentalsSemiconductor,
+            "news_web" => ResearchShard::NewsEvent,
+            _ => ResearchShard::NewsEvent,
+        }
+    }
+
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.schema_version != V2_DOMAIN_SCHEMA_VERSION
             || self.source_family.trim().is_empty()

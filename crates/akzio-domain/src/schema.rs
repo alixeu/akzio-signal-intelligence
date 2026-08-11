@@ -14,8 +14,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     content_hash_json, BlobRef, ContentHash, ContractId, DocumentLifecycle, DomainError,
-    FailureDisposition, LeaseId, ResearchIntent, RetryPolicy, RunId, TaskBudget, TaskId,
-    TerminationPolicy, ToolGrant, ToolKind,
+    FailureDisposition, LeaseId, ResearchIntent, ResearchShard, RetryPolicy, RunId, TaskBudget,
+    TaskId, TerminationPolicy, ToolGrant, ToolKind,
 };
 
 /// A Store Root with this schema is intentionally incompatible with the previous
@@ -879,6 +879,7 @@ impl WorkflowProposalDraft {
                 }
             }
             let mut unique_intents = BTreeSet::new();
+            let mut shard_counts = BTreeMap::<ResearchShard, usize>::new();
             for intent in &task.research_intents {
                 intent.validate()?;
                 let need = intent.evidence_need()?;
@@ -892,6 +893,13 @@ impl WorkflowProposalDraft {
                     .contains(&need.source_family)
                 {
                     return Err(DomainError::EvidenceSourceNotAllowed(need.source_family));
+                }
+                let count = shard_counts.entry(intent.shard()).or_default();
+                *count += 1;
+                if *count > 4 || task.research_intents.len() > 8 {
+                    return Err(DomainError::InvalidBudget {
+                        field: "workflow_proposal_draft.research_shards",
+                    });
                 }
             }
             if task

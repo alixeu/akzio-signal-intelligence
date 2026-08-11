@@ -6,10 +6,11 @@
 pub mod runtime;
 
 pub use runtime::{
-    AcquiredEvidence, AlpacaEvidenceAdapter, AlpacaPaperEvidenceTransport, AsyncEvidenceAdapter,
-    AsyncGovernedEvidenceTransport, DetailInput, EvidenceAdapter, EvidenceBundle, EvidenceCitation,
-    EvidenceProvenance, EvidenceQuality, EvidenceRequest, EvidenceRuntime, EvidenceRuntimeError,
-    EvidenceRuntimeResult, EvidenceSource, FixtureEvidenceAdapter, FredEvidenceAdapter,
-    GovernedEvidenceTransport, ModelNativeWebEvidenceTransport, NewsWebEvidenceAdapter,
+    validate_daily_bar_payload, AcquiredEvidence, AlpacaEvidenceAdapter,
+    AlpacaPaperEvidenceTransport, AsyncEvidenceAdapter, AsyncGovernedEvidenceTransport,
+    DetailInput, EvidenceAdapter, EvidenceBundle, EvidenceCitation, EvidenceProvenance,
+    EvidenceQuality, EvidenceRequest, EvidenceRuntime, EvidenceRuntimeError, EvidenceRuntimeResult,
+    EvidenceSource, FixtureEvidenceAdapter, FredEvidenceAdapter, GovernedEvidenceTransport,
+    GovernedResource, ModelNativeWebEvidenceTransport, NewsWebEvidenceAdapter,
     NormalizedEvidencePayload, SecEdgarEvidenceAdapter,
 };

@@ -12,7 +12,7 @@ use akzio_domain::{
 };
 use akzio_model::{ModelClient, ModelRequest, NativeWebPolicy};
 use akzio_store::v2::{StoreError, V2Store};
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc, Weekday};
 use futures::future::BoxFuture;
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
@@ -55,8 +55,225 @@ impl EvidenceRequest {
         {
             return Err(EvidenceRuntimeError::InvalidRequest);
         }
+        GovernedResource::parse(self.source, &self.resource)?;
         Ok(())
     }
+}
+
+/// Finite, Rust-owned resource vocabulary. The persisted `EvidenceNeed`
+/// remains a canonical string, but every adapter request is parsed into one
+/// of these bounded forms before transport.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GovernedResource {
+    AlpacaAccount,
+    AlpacaClock,
+    AlpacaQuotes,
+    AlpacaQuote {
+        asset: Asset,
+    },
+    AlpacaBars {
+        asset: Asset,
+        start: Option<NaiveDate>,
+        limit: u8,
+    },
+    SecEdgar {
+        locator: String,
+    },
+    Fred {
+        series_id: String,
+        window_start: Option<NaiveDate>,
+        window_end: Option<NaiveDate>,
+    },
+    NewsWeb {
+        query: String,
+    },
+    LegacyFixture {
+        source: EvidenceSource,
+        resource: String,
+    },
+}
+
+impl GovernedResource {
+    pub fn parse(source: EvidenceSource, resource: &str) -> Result<Self, EvidenceRuntimeError> {
+        let resource = resource.trim();
+        if resource.is_empty() || resource.chars().count() > 2_048 {
+            return Err(EvidenceRuntimeError::InvalidRequest);
+        }
+        match source {
+            EvidenceSource::Alpaca => Self::parse_alpaca(resource),
+            EvidenceSource::SecEdgar => {
+                let (prefix, locator) = resource
+                    .split_once(':')
+                    .ok_or(EvidenceRuntimeError::InvalidRequest)?;
+                if !matches!(prefix, "sec" | "filing" | "companyfacts")
+                    || locator.is_empty()
+                    || locator.chars().count() > 256
+                    || !locator.chars().all(|character| {
+                        character.is_ascii_alphanumeric() || "._-".contains(character)
+                    })
+                {
+                    return Err(EvidenceRuntimeError::InvalidRequest);
+                }
+                Ok(Self::SecEdgar {
+                    locator: locator.to_owned(),
+                })
+            }
+            EvidenceSource::Fred => Self::parse_fred(resource),
+            EvidenceSource::NewsWeb => {
+                let query = resource
+                    .strip_prefix("news:")
+                    .or_else(|| resource.strip_prefix("query:"))
+                    .unwrap_or(resource)
+                    .trim();
+                if query.is_empty() || query.chars().count() > 2_000 {
+                    return Err(EvidenceRuntimeError::InvalidRequest);
+                }
+                Ok(Self::NewsWeb {
+                    query: query.to_owned(),
+                })
+            }
+        }
+    }
+
+    fn parse_alpaca(resource: &str) -> Result<Self, EvidenceRuntimeError> {
+        match resource {
+            "paper.account" => return Ok(Self::AlpacaAccount),
+            "paper.clock" => return Ok(Self::AlpacaClock),
+            "paper.quotes" => return Ok(Self::AlpacaQuotes),
+            "quote" | "bars" => {
+                return Ok(Self::LegacyFixture {
+                    source: EvidenceSource::Alpaca,
+                    resource: resource.to_owned(),
+                })
+            }
+            _ => {}
+        }
+        let parts = resource.split(':').collect::<Vec<_>>();
+        match parts.as_slice() {
+            ["quote", symbol] => Ok(Self::AlpacaQuote {
+                asset: Asset::try_from(*symbol)
+                    .map_err(|_| EvidenceRuntimeError::InvalidRequest)?,
+            }),
+            ["bars", symbol, timeframe] if *timeframe == "1d" => Ok(Self::AlpacaBars {
+                asset: Asset::try_from(*symbol)
+                    .map_err(|_| EvidenceRuntimeError::InvalidRequest)?,
+                start: None,
+                limit: 1,
+            }),
+            ["bars", symbol, timeframe, start] if *timeframe == "1d" => Ok(Self::AlpacaBars {
+                asset: Asset::try_from(*symbol)
+                    .map_err(|_| EvidenceRuntimeError::InvalidRequest)?,
+                start: Some(
+                    NaiveDate::parse_from_str(start, "%Y-%m-%d")
+                        .map_err(|_| EvidenceRuntimeError::InvalidRequest)?,
+                ),
+                limit: 1,
+            }),
+            ["bars", symbol, timeframe, start, limit] if *timeframe == "1d" => {
+                let limit = limit
+                    .parse::<u8>()
+                    .map_err(|_| EvidenceRuntimeError::InvalidRequest)?;
+                if !(1..=32).contains(&limit) {
+                    return Err(EvidenceRuntimeError::InvalidRequest);
+                }
+                Ok(Self::AlpacaBars {
+                    asset: Asset::try_from(*symbol)
+                        .map_err(|_| EvidenceRuntimeError::InvalidRequest)?,
+                    start: Some(
+                        NaiveDate::parse_from_str(start, "%Y-%m-%d")
+                            .map_err(|_| EvidenceRuntimeError::InvalidRequest)?,
+                    ),
+                    limit,
+                })
+            }
+            _ => Err(EvidenceRuntimeError::InvalidRequest),
+        }
+    }
+
+    fn parse_fred(resource: &str) -> Result<Self, EvidenceRuntimeError> {
+        let parts = resource.split(':').collect::<Vec<_>>();
+        if !(2..=4).contains(&parts.len()) || parts[0] != "series" {
+            return Err(EvidenceRuntimeError::InvalidRequest);
+        }
+        let series_id = parts[1];
+        if series_id.is_empty()
+            || series_id.chars().count() > 64
+            || !series_id
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || "._-".contains(character))
+        {
+            return Err(EvidenceRuntimeError::InvalidRequest);
+        }
+        let window_start = parts
+            .get(2)
+            .map(|value| NaiveDate::parse_from_str(value, "%Y-%m-%d"))
+            .transpose()
+            .map_err(|_| EvidenceRuntimeError::InvalidRequest)?;
+        let window_end = parts
+            .get(3)
+            .map(|value| NaiveDate::parse_from_str(value, "%Y-%m-%d"))
+            .transpose()
+            .map_err(|_| EvidenceRuntimeError::InvalidRequest)?;
+        if let (Some(start), Some(end)) = (window_start, window_end) {
+            if end < start || end.signed_duration_since(start) > Duration::days(366) {
+                return Err(EvidenceRuntimeError::InvalidRequest);
+            }
+        }
+        Ok(Self::Fred {
+            series_id: series_id.to_owned(),
+            window_start,
+            window_end,
+        })
+    }
+}
+
+/// Strict OHLCV quality gate used by the production Alpaca adapter. Fixture
+/// payloads may still use a minimal close-only shape, but provider data must
+/// carry a timestamped, positive and internally consistent daily bar.
+pub fn validate_daily_bar_payload(value: &Value) -> Result<(), EvidenceRuntimeError> {
+    let bars = value
+        .get("bars")
+        .and_then(Value::as_array)
+        .filter(|bars| !bars.is_empty())
+        .ok_or(EvidenceRuntimeError::InvalidAcquisition)?;
+    let mut dates = BTreeSet::new();
+    for bar in bars {
+        let timestamp = bar
+            .get("t")
+            .or_else(|| bar.get("timestamp"))
+            .and_then(Value::as_str)
+            .ok_or(EvidenceRuntimeError::InvalidAcquisition)?;
+        let date = DateTime::parse_from_rfc3339(timestamp)
+            .map_err(|_| EvidenceRuntimeError::InvalidAcquisition)?
+            .date_naive();
+        if matches!(date.weekday(), Weekday::Sat | Weekday::Sun) || !dates.insert(date) {
+            return Err(EvidenceRuntimeError::InvalidAcquisition);
+        }
+        let open = positive_market_number(bar.get("o"))?;
+        let high = positive_market_number(bar.get("h"))?;
+        let low = positive_market_number(bar.get("l"))?;
+        let close = positive_market_number(bar.get("c"))?;
+        let volume = positive_market_number(bar.get("v"))?;
+        if high < open.max(close) || low > open.min(close) || volume <= 0.0 {
+            return Err(EvidenceRuntimeError::InvalidAcquisition);
+        }
+        if let Some(adjustment) = bar.get("adjustment").and_then(Value::as_str) {
+            if adjustment != "all" {
+                return Err(EvidenceRuntimeError::InvalidAcquisition);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn positive_market_number(value: Option<&Value>) -> Result<f64, EvidenceRuntimeError> {
+    let value = value.ok_or(EvidenceRuntimeError::InvalidAcquisition)?;
+    let number = value
+        .as_f64()
+        .or_else(|| value.as_str().and_then(|value| value.parse::<f64>().ok()))
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .ok_or(EvidenceRuntimeError::InvalidAcquisition)?;
+    Ok(number)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -388,6 +605,10 @@ impl AlpacaPaperEvidenceTransport {
         }
         let normalized: Value = serde_json::from_slice(&body)
             .map_err(|error| EvidenceAdapterError::Transport(error.to_string()))?;
+        if resource.starts_with("bars:") {
+            validate_daily_bar_payload(&normalized)
+                .map_err(|error| EvidenceAdapterError::Transport(error.to_string()))?;
+        }
         let observed_at = Utc::now();
         let source_uri = url;
         Ok(AcquiredEvidence {
@@ -520,11 +741,12 @@ impl ModelNativeWebEvidenceTransport {
             .extract_citations(&response.raw)
             .map_err(|error| EvidenceAdapterError::Transport(error.to_string()))?;
         let raw_value = serde_json::json!({
-            "source_family": source,
-            "resource": resource,
-            "output_text": response.output_text,
-            "citations": citations,
-            "provider_result": response.raw,
+                "source_family": source,
+                "resource": resource,
+                "provider_request": response.request_body,
+                "output_text": response.output_text,
+                "citations": citations,
+                "provider_result": response.raw,
         });
         let raw = serde_json::to_vec(&raw_value)
             .map_err(|error| EvidenceAdapterError::Transport(error.to_string()))?;
@@ -1560,5 +1782,73 @@ mod tests {
         );
         assert_eq!(evidence.provenance.citations.len(), 1);
         assert_eq!(evidence.quality.completeness_ppm, 1_000_000);
+    }
+
+    #[test]
+    fn governed_resource_schema_bounds_sources_windows_and_assets() {
+        assert_eq!(
+            GovernedResource::parse(EvidenceSource::Alpaca, "bars:QQQ:1d:2026-08-01:6").unwrap(),
+            GovernedResource::AlpacaBars {
+                asset: Asset::Qqq,
+                start: Some(NaiveDate::from_ymd_opt(2026, 8, 1).unwrap()),
+                limit: 6,
+            }
+        );
+        assert!(GovernedResource::parse(EvidenceSource::Alpaca, "bars:SPY:1d").is_err());
+        assert!(GovernedResource::parse(EvidenceSource::Alpaca, "bars:QQQ:5m").is_err());
+        assert!(GovernedResource::parse(
+            EvidenceSource::Fred,
+            "series:DFII10:2026-08-01:2028-08-01"
+        )
+        .is_err());
+        assert_eq!(
+            GovernedResource::parse(EvidenceSource::NewsWeb, "news:semiconductor supply chain")
+                .unwrap(),
+            GovernedResource::NewsWeb {
+                query: "semiconductor supply chain".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn daily_bar_quality_gate_rejects_missing_ohlcv_weekends_and_duplicates() {
+        let valid = serde_json::json!({
+            "bars": [
+                {
+                    "t": "2026-08-10T20:00:00Z",
+                    "o": 100.0,
+                    "h": 105.0,
+                    "l": 99.0,
+                    "c": 103.0,
+                    "v": 1000,
+                    "adjustment": "all"
+                }
+            ]
+        });
+        validate_daily_bar_payload(&valid).unwrap();
+
+        let mut missing = valid.clone();
+        missing["bars"][0].as_object_mut().unwrap().remove("v");
+        assert!(validate_daily_bar_payload(&missing).is_err());
+
+        let weekend = serde_json::json!({
+            "bars": [{
+                "t": "2026-08-09T20:00:00Z",
+                "o": 100.0,
+                "h": 105.0,
+                "l": 99.0,
+                "c": 103.0,
+                "v": 1000
+            }]
+        });
+        assert!(validate_daily_bar_payload(&weekend).is_err());
+
+        let duplicate = serde_json::json!({
+            "bars": [
+                {"t":"2026-08-10T20:00:00Z","o":100,"h":105,"l":99,"c":103,"v":1000},
+                {"t":"2026-08-10T21:00:00Z","o":100,"h":106,"l":98,"c":104,"v":1100}
+            ]
+        });
+        assert!(validate_daily_bar_payload(&duplicate).is_err());
     }
 }
