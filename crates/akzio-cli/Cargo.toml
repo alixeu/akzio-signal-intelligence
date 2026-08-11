@@ -16,6 +16,8 @@ akzio-model = { path = "../akzio-model" }
 akzio-store = { path = "../akzio-store" }
 anyhow.workspace = true
 clap.workspace = true
+futures.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

@@ -1,6 +1,6 @@
-# Akzio v2 Deletion Graph
+# Akzio v2 Deletion Graph — R9 checkpoint
 
-状态：R0 refresh。该图指定删除顺序；它不授权提前删除仍由 active path 使用的代码，也不允许新增 compatibility wrapper。
+状态：R9 complete。该图指定删除顺序；它不授权提前删除仍由 active path 使用的代码，也不允许新增 compatibility wrapper。
 
 ```mermaid
 flowchart LR
@@ -28,7 +28,7 @@ flowchart LR
 | mutable or purpose-only learning attribution | active learning path | sealed Outcome + immutable state history | R6 | noncanonical and transition tests |
 | direct decision/execution input, weak endpoint validation | active execution/daemon flow | Rust DecisionGate + strict Paper adapter | R7 | fail-closed and idempotency tests |
 | daemon dispatch owns cross-domain policy | `akzio-daemon` dispatch modules | owner-crate runtime APIs | R8 | daemon only coordinates/dispatches |
-| Unix JSON-line business transport and `UnixStream` CLI | `akzio-cli/src/main.rs`, README/config transitional references | loopback HTTP/SSE control API | R9 | no Unix business command, socket config or caller |
+| Unix JSON-line business transport and UnixStream CLI | Removed from Daemon, CLI, config and README; CLI rejects the former socket setting | loopback HTTP/SSE control API | R9 | HTTP client tests plus static inventory have no Unix transport implementation or caller |
 | `outputs/v2-store` and old output compatibility claim | README/config active default | fresh `outputs/akzio-v2-rebuild`; old root rejects | R9 | incompatibility test and zero active defaults |
 | remaining compatibility-named implementation | current tree only retains `crates/akzio-learning/src/rebuild.rs`; the former cross-crate prototype set is gone | active v2 modules | R10 | remaining file removed or renamed only after its owner replacement is active; no re-export/dead code |
 | old `orchestrator-*`, Phase 0–8, FileStore, old prompts/docs | source/docs inventory | none | R10 | static inventory has zero active support claims |

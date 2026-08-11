@@ -1,10 +1,9 @@
 [daemon]
 store_root = "outputs/akzio-v2-rebuild"
 http_addr = "127.0.0.1:7342"
-# Transitional internal setting. R9 removes the Unix business transport; do not add callers.
-unix_socket = "outputs/akzio-v2-rebuild/akzio.sock"
 token_env = "AKZIO_DAEMON_TOKEN"
 worker_count = 4
+# Paper sessions require an injected scheduler loop. The CLI fails closed if this is true.
 auto_paper = false
 
 [execution]

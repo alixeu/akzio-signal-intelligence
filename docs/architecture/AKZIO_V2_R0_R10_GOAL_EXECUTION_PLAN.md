@@ -187,6 +187,15 @@
 - 已实际通过 `cargo fmt --all`、六个相关 crate 的 `cargo test --offline --lib`（138 passed）、`cargo test --offline -p akzio-execution`（33 passed）、`cargo check --offline --workspace` 和相关 crate 的 `cargo clippy --offline --all-targets -- -D warnings`。这不是 R10 的全 workspace test/CLI/Doctor 验收。
 - Unix JSON-line listener/client 与 CLI/config 改写仍在 R9；因此不在 R8 声称删除它们。下一阶段为 R9，R0–R8 不再回看，R10 后统一终局复核。
 
+### 3.13 2026-08-11 R9 HTTP-only CLI/config checkpoint
+
+- Daemon 已删除 Unix JSON-line listener、DaemonCommand reducer 和 DaemonReply envelope；HTTP handlers 直接调用 owner runtime，并以专用 JSON response schema 返回 health、submit、cancel、retry。
+- CLI 已改用仅 loopback 的 HTTP/SSE client：禁用 proxy 和 redirect，token 只从环境读取，run ID 作为 URL path segment 编码。freeze/unfreeze、cancel/retry 都通过同一 operator API；Fixture Debug 与 Store Doctor 保持明确的本地诊断例外。
+- config 删除 socket 设置、拒绝未知旧字段和非 loopback bind，并持续要求四资产全集。CLI 对 auto_paper=true 在没有 injected scheduler loop 时 fail closed；operator retry 同样拒绝任何 Paper run。
+- README、config 和 deletion graph 已同步到 HTTP-only surface。未调用网络、broker、模型或真实 Paper endpoint；所有新测试均为本地 TCP/axum fixture。
+- 已实际通过 cargo fmt --all、cargo test --offline -p akzio-daemon -p akzio-cli（23 passed）、cargo check --offline --workspace、相关 crates cargo clippy --offline --all-targets -- -D warnings，以及 CLI root/daemon help。R10 的全 workspace test、fixture-debug 与 Doctor 终局验收仍未在本阶段执行。
+- 下一阶段为 R10：补齐最终 harness、删除其余 dead code，并在 R0-R10 全部完成后进行唯一一次整体复核。
+
 ## 4. 从官方网站吸收的原则
 
 | 主题 | 采用原则 | Akzio 落点 | 不照搬 |
@@ -859,7 +868,7 @@ cargo run --offline -p akzio-cli -- store doctor
 | R6 | complete | R5 核心完成 | sealed Outcome/Shadow/canary/no-op cursor/noncanonical owner surface 已完成；全量 regression 不得凭历史快照宣称 |
 | R7 | owner runtime complete | R6 complete | Decision/Execution gates、Paper-only adapter、commitment/reprice/reconciliation、NoOrder/Dry Run isolation 与 OutcomeSchedule Doctor closure 已通过离线窄测 |
 | R8 | complete | R7 complete | terminal owner runtime、accepted fake Paper chain、fenced session recovery、injected scheduler supervisor、loopback HTTP/SSE 与 Store-owned freeze 已通过离线窄测；Unix 删除留给 R9 |
-| R9 | not started | R8 complete | HTTP-only CLI/config/help/incompatibility tests |
+| R9 | complete | R8 complete | HTTP-only CLI/config/help, loopback rejection, legacy-config incompatibility, token-auth client, and Paper retry rejection pass narrow offline tests |
 | R10 | not started | R9 complete | full offline matrix、fixture harness 和 deletion inventory |
 
 ## 10. 全程禁止事项

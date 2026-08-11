@@ -57,11 +57,7 @@ use axum::{
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    net::{TcpListener, UnixListener},
-    sync::watch,
-};
+use tokio::{net::TcpListener, sync::watch};
 
 const EVENT_PAGE_SIZE: usize = 256;
 const PAPER_ACCOUNT_RESOURCE: &str = "paper.account";
@@ -140,7 +136,7 @@ pub struct Daemon {
     worker_pool: WorkerPoolConfig,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonHealth {
     pub status: String,
     pub frozen: bool,
@@ -149,38 +145,20 @@ pub struct DaemonHealth {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "command", rename_all = "snake_case")]
-pub enum DaemonCommand {
-    Health,
-    Events { run_id: RunId, after: i64 },
-    Submit { purpose: RunPurpose },
-    Cancel { run_id: RunId },
-    Retry { run_id: RunId },
+pub struct RunSubmissionResponse {
+    pub run_id: RunId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "reply", rename_all = "snake_case")]
-pub enum DaemonReply {
-    Health {
-        status: String,
-        frozen: bool,
-        scheduler_owner: Option<String>,
-        scheduler_epoch: Option<u64>,
-    },
-    Events {
-        events: Vec<EventView>,
-    },
-    Submitted {
-        run_id: RunId,
-    },
-    Cancelled {
-        run_id: RunId,
-        cancelled_tasks: u64,
-    },
-    Retried {
-        source_run_id: RunId,
-        run_id: RunId,
-    },
+pub struct RunCancellationResponse {
+    pub run_id: RunId,
+    pub cancelled_tasks: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunRetryResponse {
+    pub source_run_id: RunId,
+    pub run_id: RunId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -374,6 +352,20 @@ impl Daemon {
     }
 
     fn retry_run(&self, source_run_id: &RunId) -> Result<RunId> {
+        match self.store.run_purpose(source_run_id)? {
+            RunPurpose::Debug | RunPurpose::PaperDryRun => {}
+            RunPurpose::Paper => {
+                return Err(DaemonError::InvalidInput(
+                    "Paper runs are scheduler-owned and cannot be retried by an operator"
+                        .to_owned(),
+                ));
+            }
+            RunPurpose::Replay | RunPurpose::Shadow => {
+                return Err(DaemonError::InvalidInput(
+                    "only Debug and Paper Dry Run runs may be retried by an operator".to_owned(),
+                ));
+            }
+        }
         Ok(self.workflow.retry_run(source_run_id, Utc::now())?)
     }
 
@@ -470,39 +462,6 @@ impl Daemon {
         })
     }
 
-    pub fn handle(&self, command: DaemonCommand) -> Result<DaemonReply> {
-        match command {
-            DaemonCommand::Health => {
-                let health = self.health()?;
-                Ok(DaemonReply::Health {
-                    status: health.status,
-                    frozen: health.frozen,
-                    scheduler_owner: health.scheduler_owner,
-                    scheduler_epoch: health.scheduler_epoch,
-                })
-            }
-            DaemonCommand::Events { run_id, after } => Ok(DaemonReply::Events {
-                events: self
-                    .store
-                    .events_after(&run_id, after, EVENT_PAGE_SIZE)?
-                    .into_iter()
-                    .map(EventView::from)
-                    .collect(),
-            }),
-            DaemonCommand::Submit { purpose } => Ok(DaemonReply::Submitted {
-                run_id: self.submit_default(purpose)?,
-            }),
-            DaemonCommand::Cancel { run_id } => Ok(DaemonReply::Cancelled {
-                cancelled_tasks: self.request_cancel(&run_id, "operator cancellation request")?,
-                run_id,
-            }),
-            DaemonCommand::Retry { run_id } => Ok(DaemonReply::Retried {
-                source_run_id: run_id.clone(),
-                run_id: self.retry_run(&run_id)?,
-            }),
-        }
-    }
-
     pub fn router(&self) -> Router {
         Router::new()
             .route("/health", get(http_health))
@@ -531,62 +490,6 @@ impl Daemon {
             .await
             .map_err(DaemonError::Io)
     }
-
-    /// Transitional local Unix JSON transport retained until R8/R9. Its
-    /// commands call the same v2 Daemon API as HTTP and never bypass it.
-    pub async fn serve_unix(
-        &self,
-        path: PathBuf,
-        mut shutdown: watch::Receiver<bool>,
-    ) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        if path.exists() {
-            tokio::fs::remove_file(&path).await?;
-        }
-        let listener = UnixListener::bind(&path)?;
-
-        loop {
-            tokio::select! {
-                accepted = listener.accept() => {
-                    let (stream, _) = accepted?;
-                    let daemon = self.clone();
-                    tokio::spawn(async move {
-                        let (read, mut write) = stream.into_split();
-                        let mut lines = BufReader::new(read).lines();
-                        while let Ok(Some(line)) = lines.next_line().await {
-                            let payload = match serde_json::from_str::<DaemonCommand>(&line)
-                                .map_err(DaemonError::from)
-                                .and_then(|command| daemon.handle(command))
-                            {
-                                Ok(reply) => serde_json::to_string(&reply),
-                                Err(error) => serde_json::to_string(&serde_json::json!({
-                                    "error": error.to_string(),
-                                })),
-                            };
-                            let Ok(payload) = payload else {
-                                break;
-                            };
-                            if write
-                                .write_all(format!("{payload}\n").as_bytes())
-                                .await
-                                .is_err()
-                            {
-                                break;
-                            }
-                        }
-                    });
-                }
-                changed = shutdown.changed() => {
-                    if changed.is_err() || *shutdown.borrow() {
-                        return Ok(());
-                    }
-                }
-            }
-        }
-    }
-
     pub(crate) async fn execute_task(&self, task: ClaimedAttempt) -> TaskCompletion {
         match self.execute_task_inner(&task, Utc::now()).await {
             Ok(completion) => completion,
@@ -1323,42 +1226,64 @@ async fn http_submit(
     State(daemon): State<Arc<Daemon>>,
     headers: HeaderMap,
     Json(request): Json<SubmitRequest>,
-) -> std::result::Result<Json<DaemonReply>, StatusCode> {
+) -> std::result::Result<Json<RunSubmissionResponse>, StatusCode> {
     authorize(&daemon, &headers)?;
     daemon
-        .handle(DaemonCommand::Submit {
-            purpose: request.purpose,
-        })
-        .map(Json)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        .submit_default(request.purpose)
+        .map(|run_id| Json(RunSubmissionResponse { run_id }))
+        .map_err(invalid_input_or_internal)
 }
 
 async fn http_cancel(
     State(daemon): State<Arc<Daemon>>,
     Path(run_id): Path<String>,
     headers: HeaderMap,
-) -> std::result::Result<Json<DaemonReply>, StatusCode> {
+) -> std::result::Result<Json<RunCancellationResponse>, StatusCode> {
     authorize(&daemon, &headers)?;
+    let run_id = RunId(run_id);
     daemon
-        .handle(DaemonCommand::Cancel {
-            run_id: RunId(run_id),
+        .request_cancel(&run_id, "operator cancellation request")
+        .map(|cancelled_tasks| {
+            Json(RunCancellationResponse {
+                run_id,
+                cancelled_tasks,
+            })
         })
-        .map(Json)
-        .map_err(|_| StatusCode::CONFLICT)
+        .map_err(invalid_input_or_conflict)
 }
 
 async fn http_retry(
     State(daemon): State<Arc<Daemon>>,
     Path(run_id): Path<String>,
     headers: HeaderMap,
-) -> std::result::Result<Json<DaemonReply>, StatusCode> {
+) -> std::result::Result<Json<RunRetryResponse>, StatusCode> {
     authorize(&daemon, &headers)?;
+    let source_run_id = RunId(run_id);
     daemon
-        .handle(DaemonCommand::Retry {
-            run_id: RunId(run_id),
+        .retry_run(&source_run_id)
+        .map(|run_id| {
+            Json(RunRetryResponse {
+                source_run_id,
+                run_id,
+            })
         })
-        .map(Json)
-        .map_err(|_| StatusCode::CONFLICT)
+        .map_err(invalid_input_or_conflict)
+}
+
+fn invalid_input_or_internal(error: DaemonError) -> StatusCode {
+    if matches!(error, DaemonError::InvalidInput(_)) {
+        StatusCode::BAD_REQUEST
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
+}
+
+fn invalid_input_or_conflict(error: DaemonError) -> StatusCode {
+    if matches!(error, DaemonError::InvalidInput(_)) {
+        StatusCode::BAD_REQUEST
+    } else {
+        StatusCode::CONFLICT
+    }
 }
 
 async fn http_freeze(
@@ -2208,15 +2133,12 @@ mod tests {
         )
         .unwrap();
         let run_id = daemon.submit_default(RunPurpose::Debug).unwrap();
-        assert!(matches!(
-            daemon.handle(DaemonCommand::Cancel {
-                run_id: run_id.clone(),
-            }),
-            Ok(DaemonReply::Cancelled {
-                cancelled_tasks: 1,
-                ..
-            })
-        ));
+        assert_eq!(
+            daemon
+                .request_cancel(&run_id, "fixture cancellation request")
+                .unwrap(),
+            1
+        );
         assert!(daemon.store().run_cancel_requested(&run_id).unwrap());
 
         assert!(
@@ -2305,14 +2227,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(submitted.status(), StatusCode::OK);
-        let run_id = match serde_json::from_slice::<DaemonReply>(
+        let run_id = serde_json::from_slice::<RunSubmissionResponse>(
             &to_bytes(submitted.into_body(), usize::MAX).await.unwrap(),
         )
         .unwrap()
-        {
-            DaemonReply::Submitted { run_id } => run_id,
-            reply => panic!("unexpected submit reply: {reply:?}"),
-        };
+        .run_id;
 
         let cancelled = daemon
             .router()
@@ -2342,20 +2261,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(retried.status(), StatusCode::OK);
-        let retry_run_id = match serde_json::from_slice::<DaemonReply>(
+        let retry = serde_json::from_slice::<RunRetryResponse>(
             &to_bytes(retried.into_body(), usize::MAX).await.unwrap(),
         )
-        .unwrap()
-        {
-            DaemonReply::Retried {
-                source_run_id,
-                run_id: retry_run_id,
-            } => {
-                assert_eq!(source_run_id, run_id);
-                retry_run_id
-            }
-            reply => panic!("unexpected retry reply: {reply:?}"),
-        };
+        .unwrap();
+        assert_eq!(retry.source_run_id, run_id);
+        let retry_run_id = retry.run_id;
         assert_eq!(
             daemon.store().run_purpose(&retry_run_id).unwrap(),
             RunPurpose::Debug
@@ -2419,9 +2330,7 @@ mod tests {
         .unwrap();
         let run_id = daemon.submit_default(RunPurpose::Debug).unwrap();
         daemon
-            .handle(DaemonCommand::Cancel {
-                run_id: run_id.clone(),
-            })
+            .request_cancel(&run_id, "fixture cancellation request")
             .unwrap();
         let events = daemon.store().events_after(&run_id, 0, 16).unwrap();
         assert!(events.len() >= 2);
@@ -2463,11 +2372,7 @@ mod tests {
             daemon.submit_default(RunPurpose::Paper),
             Err(DaemonError::InvalidInput(_))
         ));
-        assert!(daemon
-            .handle(DaemonCommand::Retry {
-                run_id: RunId::new(),
-            })
-            .is_err());
+        assert!(daemon.retry_run(&RunId::new()).is_err());
     }
 
     #[tokio::test]
@@ -2480,25 +2385,11 @@ mod tests {
         .unwrap();
         let source_run_id = daemon.submit_default(RunPurpose::Debug).unwrap();
         daemon
-            .handle(DaemonCommand::Cancel {
-                run_id: source_run_id.clone(),
-            })
+            .request_cancel(&source_run_id, "fixture cancellation request")
             .unwrap();
 
-        let reply = daemon
-            .handle(DaemonCommand::Retry {
-                run_id: source_run_id.clone(),
-            })
-            .unwrap();
-        let DaemonReply::Retried {
-            source_run_id: source,
-            run_id,
-        } = reply
-        else {
-            panic!("retry must return a fresh run");
-        };
-        assert_eq!(source, source_run_id);
-        assert_ne!(run_id, source);
+        let run_id = daemon.retry_run(&source_run_id).unwrap();
+        assert_ne!(run_id, source_run_id);
         assert_eq!(
             daemon.store().run_purpose(&run_id).unwrap(),
             RunPurpose::Debug
@@ -2527,19 +2418,51 @@ mod tests {
     }
 
     #[test]
-    fn json_submit_rejects_replay_before_workflow_creation() {
+    fn operator_retry_rejects_paper_run() {
         let directory = tempdir().unwrap();
         let daemon = Daemon::with_model(
             config(directory.path().to_path_buf()),
             fixture_model_client(),
         )
         .unwrap();
-        let command: DaemonCommand =
-            serde_json::from_str(r#"{"command":"submit","purpose":"replay"}"#).unwrap();
+        let now = Utc::now();
+        let session_key = now.date_naive().to_string();
+        let run_id = daemon
+            .reserve_paper_session(&session_key, &paper_proposal(), now)
+            .unwrap()
+            .slot
+            .workflow
+            .run
+            .run_id;
 
         assert!(matches!(
-            daemon.handle(command),
-            Err(DaemonError::InvalidInput(_))
+            daemon.retry_run(&run_id),
+            Err(DaemonError::InvalidInput(message)) if message.contains("scheduler-owned")
         ));
+    }
+
+    #[tokio::test]
+    async fn http_submit_rejects_replay_before_workflow_creation() {
+        let directory = tempdir().unwrap();
+        let daemon = Daemon::with_model(
+            config(directory.path().to_path_buf()),
+            fixture_model_client(),
+        )
+        .unwrap();
+
+        let response = daemon
+            .router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/runs")
+                    .header("x-akzio-token", "fixture-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"purpose":"replay"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }

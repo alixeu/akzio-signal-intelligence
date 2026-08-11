@@ -1,59 +1,55 @@
 # Akzio Signal Intelligence v2
 
-Akzio v2 是本地常驻、Rust 受控、Paper-only 的 Multi-Agent Research System。可执行资产严格为 `TQQQ`、`QQQ`、`SOXX`、`SOXL`；Live Trading 永不实现。
+Akzio v2 是本地常驻、Rust 受控、Paper-only 的 Multi-Agent Research System。可执行资产严格为 TQQQ、QQQ、SOXX、SOXL；Live Trading 永不实现。
 
-这是 source-incompatible 的 v2-only 重构：不读取、迁移或兼容旧 `orchestrator-*`、Phase 0–8、FileStore、旧 prompt 或 `outputs/store`。canonical 状态只属于 `V2Store`，新的 Store Root 是 `outputs/akzio-v2-rebuild`。
+这是 source-incompatible 的 v2-only 重构：不读取、迁移或兼容旧 orchestrator-*、Phase 0–8、FileStore、旧 prompt 或 outputs/store。canonical 状态只属于 V2Store，新的 Store Root 是 outputs/akzio-v2-rebuild。
 
-## 目标架构
-
-```mermaid
+~~~mermaid
 flowchart LR
-  CLI[akzio CLI] --> API[Loopback HTTP Control API]
-  API --> D[Daemon supervisor\nlease / epoch / scheduler / SSE]
-  D --> WR[WorkflowRuntime]
-  WR --> TR[TaskRuntime]
-  TR --> AR[AgentRuntime]
-  TR --> IR[EvidenceRuntime]
-  TR --> ER[EvaluationRuntime]
-  TR --> XR[ExecutionRuntime]
-  AR --> CB[ContextBroker\nmanifest + grants]
-  CB --> S[(V2Store\nCAS + SQLite + events)]
+  CLI["akzio CLI"] --> API["Loopback HTTP + SSE Control API"]
+  API --> D["Daemon supervisor"]
+  D --> WR["WorkflowRuntime"]
+  WR --> TR["TaskRuntime"]
+  TR --> AR["AgentRuntime"]
+  TR --> IR["EvidenceRuntime"]
+  TR --> ER["EvaluationRuntime"]
+  TR --> XR["ExecutionRuntime"]
+  AR --> CB["ContextBroker"]
+  CB --> S[("V2Store")]
   IR --> S
   ER --> S
   XR --> S
-```
+~~~
 
-Rust 是状态、权限、Contract、预算、workflow gate、持久化、学习迁移和执行策略的唯一权威。模型只能输出 schema 限制的研究提案、证据需求、claim、critique 与 decision draft；它没有任意文件、HTTP、Raw Evidence、SQLite 或交易权限。
+Rust 是状态、权限、Contract、预算、workflow gate、持久化、学习迁移和执行策略的唯一权威。模型不能访问任意文件、HTTP、Raw Evidence、SQLite 或交易凭据；ContextManifest 与 task/attempt-bound ReadGrant 是唯一资料通道。Debug、Replay、Shadow 与 Paper Dry Run 永远 noncanonical；只有 sealed Paper Outcome 可推动 memory 或 topology。
 
-`ContextManifest` 与 task/attempt-bound `ReadGrant` 是 Agent 获得资料的唯一通道。Debug、Replay、Shadow 与 Paper Dry Run 永远 noncanonical；只有 sealed Paper Outcome 可推动 memory 或 topology 状态。
+## 操作面
 
-## 当前重构状态
+唯一业务控制面是带 x-akzio-token 认证的 loopback HTTP/SSE。CLI 和未来本地 UI 都调用它；没有 socket 回退、直接 Store 写入或 direct Paper submit/retry。
 
-R0 已验证；不变量、测试矩阵和删除图仍是当前执行入口：
+~~~bash
+# 令牌只从环境变量读取；不要写入配置文件或提交到 Git。
+cargo run -p akzio-cli -- daemon serve
+cargo run -p akzio-cli -- daemon health
+cargo run -p akzio-cli -- daemon freeze "operator reason"
+cargo run -p akzio-cli -- daemon unfreeze "operator reason"
+cargo run -p akzio-cli -- run submit debug
+cargo run -p akzio-cli -- run events <run-id>
+cargo run -p akzio-cli -- run cancel <run-id>
+cargo run -p akzio-cli -- run retry <run-id>
+~~~
+
+run submit 只接受 debug 或 paper-dry-run。Paper 创建和 Paper retry 只能由带 lease/epoch fencing 的注入 scheduler loop 完成；akzio daemon serve 不会从配置构造该 loop，并对 auto_paper = true fail closed。
+
+run fixture-debug 是明确标记的本地 fixture diagnostic，不访问市场、模型或 broker。store doctor 是本地 V2Store 完整性诊断；旧 Store Root 会报不兼容错误，不会迁移或读取。
+
+## 重构状态
+
+R0–R8 的阶段 checkpoint 已完成。R9 现已将 CLI/config 切为 HTTP/SSE，并删除 Unix JSON-line 业务传输；R10 仍负责最终 harness、其余 dead-code 删除和一次全仓终局复核。
 
 - [v2 invariants](docs/architecture/AKZIO_V2_INVARIANTS.md)
 - [test matrix](docs/architecture/AKZIO_V2_TEST_MATRIX.md)
 - [deletion graph](docs/architecture/AKZIO_V2_DELETION_GRAPH.md)
+- [goal execution plan](docs/architecture/AKZIO_V2_R0_R10_GOAL_EXECUTION_PLAN.md)
 
-当前 tree 已不再保留 domain/store/context/runtime/research 的 `rebuild.rs` 原型集合；仅 `crates/akzio-learning/src/rebuild.rs` 仍在删除清单中。它不是 v2 完成证据。阶段状态以 Goal 执行计划为准：R1/R2 为 complete pending regression，R3/R4 为 partial，R5 为 core complete 且 replay pending，R6 为 complete，R7 为 in progress。当前 Unix transport 仍是待删除的内部过渡实现：它不是 v2 public control plane，也不得为它新增调用者或兼容层。
-
-> 2026-08-11 checkpoint: the phase-status sentence immediately above is superseded by the Goal plan: R0 verified; R1–R3 narrow regression verified; R4 durable catalogue lifecycle pending; R5 event-reducer replay pending; R6 awaits R10 final review; R7 remains in progress.
-
-## 安全边界
-
-- `AlpacaPaper::new` 必须在发起任何 HTTP I/O 前拒绝非 Paper endpoint。
-- Paper commitment 仅归 scheduler 所有；每个 broker session 最多一个 durable slot，且所有 slot 写入均以 daemon lease owner/epoch fenced。
-- Rust 可自动 freeze；只能通过 loopback operator HTTP API 或经该 API 的 CLI unfreeze。
-- 不存在 direct CLI/API Paper submit 或 retry 路径。
-
-R0 配置把 `auto_paper` 默认关闭。后续只有 R7/R8 的 decision gate、scheduler fencing 和恢复测试全部通过后，才可在受控本地环境显式启用自动 Paper；本仓库的 fixture 验证从不构成真实市场、模型或 Paper order 验证。
-
-## R0 refresh local baseline
-
-```bash
-cargo metadata --offline --format-version 1 --no-deps
-cargo test --offline -p akzio-store workflow_commit_accepts_out_of_order_nodes_and_preserves_dependencies
-cargo test --offline -p akzio-runtime planner_graph_gets_non_bypassable_terminal_gates
-```
-
-以上是当前 tree 可重复的窄 v2 基线，不等同于完整验收。全 workspace、`fixture-debug` 与 `store doctor` 仍是 R10 终局 gate；R7 in progress 时不得把它们表述为已通过。任何 fixture 结果都不证明 gateway 可用、broker 连通、市场状态或 Paper execution。
+所有本地 fixture 结果只说明离线代码路径，不证明市场、broker、模型或真实 Paper execution。
