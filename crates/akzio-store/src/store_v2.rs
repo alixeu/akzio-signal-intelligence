@@ -2834,6 +2834,20 @@ impl V2Store {
         event_type: &str,
         now: DateTime<Utc>,
     ) -> StoreResult<()> {
+        self.write_task_artifact_fenced(None, permit, artifact, event_type, now)
+    }
+
+    /// Persist a task artifact while optionally fencing a daemon-owned worker.
+    /// The lease check is in the same transaction as the artifact/event write,
+    /// so a takeover cannot leave a stale worker's output committed.
+    pub fn write_task_artifact_fenced(
+        &self,
+        lease: Option<&DaemonLease>,
+        permit: &TaskWritePermit,
+        artifact: &Artifact,
+        event_type: &str,
+        now: DateTime<Utc>,
+    ) -> StoreResult<()> {
         artifact.validate()?;
         reject_generic_learning_artifact(artifact)?;
         self.read_blob(&artifact.blob)?;
@@ -2844,6 +2858,9 @@ impl V2Store {
         }
         let mut connection = self.connection.lock().expect("store connection poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(lease) = lease {
+            assert_daemon_lease(&transaction, lease, Utc::now())?;
+        }
         assert_permit(&transaction, permit)?;
         assert_origin_matches(artifact.origin.as_ref(), permit)?;
         insert_artifact(&transaction, artifact)?;
@@ -2888,28 +2905,49 @@ impl V2Store {
         schedule: &Artifact,
         now: DateTime<Utc>,
     ) -> StoreResult<()> {
-        self.validate_attempt_commit(
-            permit,
-            std::slice::from_ref(schedule),
-            TaskStatus::Succeeded,
-        )?;
         if schedule.kind != ArtifactKind::OutcomeSchedule {
             return Err(StoreError::InvalidLearningCommit(
                 "outcome_schedule.worker_kind",
             ));
         }
+        schedule.validate()?;
+        self.read_blob(&schedule.blob)?;
         let mut connection = self.connection.lock().expect("store connection poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let schedule_ref = ArtifactRef {
+            artifact_id: schedule.artifact_id.clone(),
+            kind: ArtifactKind::OutcomeSchedule,
+        };
+        self.validate_attempt_commit(
+            permit,
+            std::slice::from_ref(schedule),
+            TaskStatus::Succeeded,
+        )?;
+        let existing_worker = transaction
+            .query_row(
+                r#"SELECT task_id FROM rebuild_tasks
+                   WHERE run_id = ?1 AND recipe_id = ?2
+                     AND input_artifacts_json = ?3"#,
+                params![
+                    permit.run_id.0,
+                    POST_TERMINAL_WORKER_RECIPE_ID,
+                    serde_json::to_string(std::slice::from_ref(&schedule_ref))?,
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if existing_worker.is_some() {
+            assert_idempotent_outcome_schedule_commit(&transaction, permit, schedule)?;
+            transaction.commit()?;
+            return Ok(());
+        }
         let worker = WorkflowNode {
             task_id: TaskId::new(),
             recipe_id: TaskRecipeId::new("learning.outcome_worker")?,
             contract_hash: schedule.provenance.producer_contract_hash.clone(),
             objective: "Seal governed T+1/T+3/T+5 Paper outcome and record evaluation.".to_owned(),
             dependencies: Vec::new(),
-            input_artifacts: vec![ArtifactRef {
-                artifact_id: schedule.artifact_id.clone(),
-                kind: ArtifactKind::OutcomeSchedule,
-            }],
+            input_artifacts: vec![schedule_ref],
             priority: 100,
             budget: TaskBudget {
                 max_input_tokens: 1_024,
@@ -3158,6 +3196,16 @@ impl V2Store {
         &self,
         commit: &PolicyEvaluationCommit,
     ) -> StoreResult<PolicyEvaluationResult> {
+        self.record_policy_evaluation_fenced(None, commit)
+    }
+
+    /// Commit canonical learning while fencing an optional daemon worker in
+    /// the same SQLite transaction as the policy/evaluation writes.
+    pub fn record_policy_evaluation_fenced(
+        &self,
+        lease: Option<&DaemonLease>,
+        commit: &PolicyEvaluationCommit,
+    ) -> StoreResult<PolicyEvaluationResult> {
         commit.subject.validate()?;
         if !commit.subject.accepts_state(commit.from) || !commit.subject.accepts_state(commit.to) {
             return Err(StoreError::InvalidLearningCommit(
@@ -3169,6 +3217,9 @@ impl V2Store {
 
         let mut connection = self.connection.lock().expect("store connection poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(lease) = lease {
+            assert_daemon_lease(&transaction, lease, Utc::now())?;
+        }
         self.validate_policy_evaluation_commit_with_connection(&transaction, commit)?;
 
         if let Some(existing) =
@@ -6216,6 +6267,73 @@ fn assert_daemon_lease(
     };
     if owner_id != lease.owner_id || epoch != lease.epoch || parse_time(&expires_at)? <= now {
         return Err(StoreError::SchedulerFenced(lease.lease_name.clone()));
+    }
+    Ok(())
+}
+
+fn assert_idempotent_outcome_schedule_commit(
+    transaction: &Transaction<'_>,
+    permit: &TaskWritePermit,
+    schedule: &Artifact,
+) -> StoreResult<()> {
+    let attempt = transaction
+        .query_row(
+            r#"SELECT a.run_id, a.task_id, a.lease_id, a.epoch, a.status,
+                      t.status, t.contract_hash
+                 FROM rebuild_attempts AS a
+                 JOIN rebuild_tasks AS t ON t.task_id = a.task_id
+                WHERE a.attempt_id = ?1"#,
+            params![permit.attempt_id.0],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, u64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((run_id, task_id, lease_id, epoch, attempt_status, task_status, contract_hash)) =
+        attempt
+    else {
+        return Err(StoreError::StalePermit(permit.task_id.clone()));
+    };
+    if run_id != permit.run_id.0
+        || task_id != permit.task_id.0
+        || lease_id != permit.lease_id.0
+        || epoch != permit.epoch
+        || attempt_status != "succeeded"
+        || task_status != "succeeded"
+        || contract_hash.as_deref().map(ContentHash::new).transpose()? != permit.contract_hash
+    {
+        return Err(StoreError::StalePermit(permit.task_id.clone()));
+    }
+    assert_origin_matches(schedule.origin.as_ref(), permit)?;
+    let stored = read_artifact(transaction, &schedule.artifact_id)?;
+    if stored != *schedule {
+        return Err(StoreError::Integrity(
+            "outcome schedule retry does not match committed artifact".to_owned(),
+        ));
+    }
+    let output_count = transaction.query_row(
+        r#"SELECT COUNT(*) FROM rebuild_attempt_outputs
+           WHERE attempt_id = ?1 AND task_id = ?2 AND artifact_id = ?3"#,
+        params![
+            permit.attempt_id.0,
+            permit.task_id.0,
+            schedule.artifact_id.0.as_str()
+        ],
+        |row| row.get::<_, u64>(0),
+    )?;
+    if output_count != 1 {
+        return Err(StoreError::CommittedOutputAttempt {
+            task_id: permit.task_id.clone(),
+            attempt_id: permit.attempt_id.clone(),
+        });
     }
     Ok(())
 }
@@ -9848,6 +9966,170 @@ mod tests {
                 },
             )
             .is_err());
+    }
+
+    #[test]
+    fn stale_outcome_lease_rejects_artifact_write_without_partial_commit() {
+        let fixture = execution_commit_fixture();
+        let stale = fixture.now + Duration::seconds(31);
+        let successor = fixture
+            .store
+            .acquire_daemon_lease(
+                "scheduler",
+                "successor",
+                stale,
+                stale + Duration::seconds(30),
+            )
+            .unwrap()
+            .unwrap();
+        let evidence = permit_artifact(
+            &fixture.store,
+            &fixture.permit,
+            ArtifactKind::NormalizedEvidence,
+            &serde_json::json!({"outcome": true}),
+            vec![],
+            ArtifactLifecycle::RunScoped,
+            stale,
+        );
+        assert!(matches!(
+            fixture.store.write_task_artifact_fenced(
+                Some(&fixture.lease),
+                &fixture.permit,
+                &evidence,
+                "outcome.evidence",
+                stale,
+            ),
+            Err(StoreError::SchedulerFenced(_))
+        ));
+        assert!(matches!(
+            fixture.store.artifact(&evidence.artifact_id),
+            Err(StoreError::MissingArtifact(_))
+        ));
+        fixture
+            .store
+            .write_task_artifact_fenced(
+                Some(&successor),
+                &fixture.permit,
+                &evidence,
+                "outcome.evidence",
+                stale,
+            )
+            .unwrap();
+        assert_eq!(
+            fixture.store.artifact(&evidence.artifact_id).unwrap().kind,
+            ArtifactKind::NormalizedEvidence
+        );
+    }
+
+    #[test]
+    fn stale_outcome_lease_rejects_canonical_policy_evaluation() {
+        let fixture = PolicyCommitFixture::memory();
+        let lease_now = fixture.now;
+        let lease = fixture
+            .store
+            .acquire_daemon_lease(
+                "outcome-worker",
+                "worker-a",
+                lease_now,
+                lease_now + Duration::seconds(30),
+            )
+            .unwrap()
+            .unwrap();
+        let stale = lease_now + Duration::seconds(31);
+        fixture
+            .store
+            .acquire_daemon_lease(
+                "outcome-worker",
+                "worker-b",
+                stale,
+                stale + Duration::seconds(30),
+            )
+            .unwrap()
+            .unwrap();
+        let commit = fixture.commit(
+            fixture
+                .store
+                .policy_shadow_pair_snapshot(&fixture.subject)
+                .unwrap(),
+        );
+        assert!(matches!(
+            fixture
+                .store
+                .record_policy_evaluation_fenced(Some(&lease), &commit),
+            Err(StoreError::SchedulerFenced(_))
+        ));
+        assert!(fixture
+            .store
+            .policy_head(&fixture.subject)
+            .unwrap()
+            .is_none());
+        assert!(matches!(
+            fixture.store.artifact(&commit.evaluation.artifact_id),
+            Err(StoreError::MissingArtifact(_))
+        ));
+    }
+
+    #[test]
+    fn outcome_schedule_worker_enqueue_is_idempotent_for_same_permit() {
+        let fixture = PolicyCommitFixture::memory();
+        let outcome_payload: Outcome = fixture
+            .store
+            .read_artifact_payload(&fixture.outcome)
+            .unwrap();
+        let stored_schedule = fixture
+            .store
+            .artifact(&outcome_payload.schedule.artifact_id)
+            .unwrap();
+        let mut payload: OutcomeSchedule = fixture
+            .store
+            .read_artifact_payload(&stored_schedule)
+            .unwrap();
+        payload.outcome_id = akzio_domain::OutcomeId::new();
+        payload.created_at = fixture.now + Duration::seconds(1);
+        let schedule = permit_artifact(
+            &fixture.store,
+            &fixture.permit,
+            ArtifactKind::OutcomeSchedule,
+            &payload,
+            outcome_schedule_source_refs(&payload),
+            ArtifactLifecycle::Canonical,
+            payload.created_at,
+        );
+
+        fixture
+            .store
+            .commit_outcome_schedule_with_worker(&fixture.permit, &schedule, fixture.now)
+            .unwrap();
+        fixture
+            .store
+            .commit_outcome_schedule_with_worker(
+                &fixture.permit,
+                &schedule,
+                fixture.now + Duration::seconds(1),
+            )
+            .unwrap();
+
+        let worker_count = fixture
+            .store
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM rebuild_tasks WHERE run_id = ?1 AND recipe_id = ?2",
+                params![fixture.run.run_id.0, POST_TERMINAL_WORKER_RECIPE_ID],
+                |row| row.get::<_, u64>(0),
+            )
+            .unwrap();
+        assert_eq!(worker_count, 1);
+        let enqueued_events = fixture
+            .store
+            .events_after(&fixture.run.run_id, 0, 100)
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.event_type == "outcome.worker.enqueued")
+            .count();
+        assert_eq!(enqueued_events, 1);
+        fixture.store.verify_integrity().unwrap();
     }
 
     #[test]

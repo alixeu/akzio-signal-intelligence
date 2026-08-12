@@ -55,7 +55,9 @@ use akzio_runtime::{
     should_run_structured_critique, RetryCause, RuntimeError, TaskCompletion, TaskRuntime,
     WorkflowRuntime,
 };
-use akzio_store::v2::{ClaimedAttempt, StoreAlert, StoreError, StoreMetrics, StoredEvent, V2Store};
+use akzio_store::v2::{
+    ClaimedAttempt, DaemonLease, StoreAlert, StoreError, StoreMetrics, StoredEvent, V2Store,
+};
 use async_stream::stream;
 use axum::{
     extract::{Path, Query, State},
@@ -851,7 +853,13 @@ impl Daemon {
             })?;
         let schedule: OutcomeSchedule = self.read_artifact_payload(&schedule_reference)?;
         let Some(collected) = self
-            .collect_outcome_materialization(task, &schedule_reference, &schedule, now)
+            .collect_outcome_materialization(
+                &outcome_lease,
+                task,
+                &schedule_reference,
+                &schedule,
+                now,
+            )
             .await?
         else {
             return Ok(TaskCompletion::Retry(RetryCause::Timeout));
@@ -860,8 +868,13 @@ impl Daemon {
         self.store
             .validate_daemon_lease(&outcome_lease, Utc::now())?;
         for artifact in collected.evidence_artifacts {
-            self.store
-                .write_task_artifact(&task.permit, &artifact, "outcome.evidence", now)?;
+            self.store.write_task_artifact_fenced(
+                Some(&outcome_lease),
+                &task.permit,
+                &artifact,
+                "outcome.evidence",
+                now,
+            )?;
         }
         let contract_hash = task
             .permit
@@ -869,22 +882,26 @@ impl Daemon {
             .clone()
             .unwrap_or_else(|| ContentHash::of_bytes(OUTCOME_WORKER_RECIPE_ID.as_bytes()));
         let evaluation = EvaluationRuntime::new(self.store.clone(), EvaluationPolicy::default())?;
-        evaluation.evaluate(EvaluationInput {
-            permit: task.permit.clone(),
-            subject: PolicySubject::Memory(MemoryId(format!("paper:{}", task.run_id.0))),
-            hypothesis_id: format!("paper-outcome:{}", schedule.outcome_id.0),
-            materialization: collected.materialization,
-            contract_hash,
-            topology_id: TopologyId("paper-outcome".to_owned()),
-            candidate_policy: None,
-            token_cost: 0,
-            latency_millis: 0,
-        })?;
+        evaluation.evaluate_with_lease(
+            Some(&outcome_lease),
+            EvaluationInput {
+                permit: task.permit.clone(),
+                subject: PolicySubject::Memory(MemoryId(format!("paper:{}", task.run_id.0))),
+                hypothesis_id: format!("paper-outcome:{}", schedule.outcome_id.0),
+                materialization: collected.materialization,
+                contract_hash,
+                topology_id: TopologyId("paper-outcome".to_owned()),
+                candidate_policy: None,
+                token_cost: 0,
+                latency_millis: 0,
+            },
+        )?;
         Ok(TaskCompletion::Committed)
     }
 
     async fn collect_outcome_materialization(
         &self,
+        outcome_lease: &DaemonLease,
         task: &ClaimedAttempt,
         schedule_reference: &ArtifactRef,
         schedule: &OutcomeSchedule,
@@ -969,8 +986,13 @@ impl Daemon {
                 vec![schedule_reference.clone()],
                 now,
             )?;
-            self.store
-                .write_task_artifact(&task.permit, &need_artifact, "outcome.need", now)?;
+            self.store.write_task_artifact_fenced(
+                Some(outcome_lease),
+                &task.permit,
+                &need_artifact,
+                "outcome.need",
+                now,
+            )?;
             let bundle = runtime
                 .acquire_and_normalize_async(
                     &task.permit,
@@ -2969,6 +2991,84 @@ mod tests {
             Err(SchedulerError::WorkflowUnavailable)
         ));
         assert!(daemon.store().session_slot(&session_key).unwrap().is_none());
+        daemon.store().verify_integrity().unwrap();
+    }
+
+    #[tokio::test]
+    async fn paper_scheduler_does_not_carry_scheduler_snapshots_into_new_run() {
+        let directory = tempdir().unwrap();
+        let daemon = Daemon::with_model(
+            config(directory.path().to_path_buf()),
+            fixture_model_client(),
+        )
+        .unwrap();
+        let now = Utc::now();
+        let old_session = now.date_naive().to_string();
+        let old_run_id = RunId::new();
+        let old_snapshot =
+            scheduler_snapshot_need(daemon.store(), &old_run_id, PAPER_ACCOUNT_RESOURCE, now);
+        daemon
+            .reserve_paper_session_with_inputs_for_run(
+                old_run_id.clone(),
+                &old_session,
+                &paper_proposal(),
+                std::slice::from_ref(&old_snapshot),
+                now,
+            )
+            .unwrap();
+
+        let old_snapshot_ref = ArtifactRef {
+            artifact_id: old_snapshot.artifact_id.clone(),
+            kind: ArtifactKind::EvidenceNeed,
+        };
+        let mut new_proposal = paper_proposal();
+        new_proposal.tasks.insert(
+            "analyst".to_owned(),
+            WorkflowProposalTask {
+                recipe_id: TaskRecipeId::new("research.analyst").unwrap(),
+                objective: "Refresh scheduler-owned Paper snapshots".to_owned(),
+                depends_on: vec![],
+                priority: 90,
+                evidence_needs: vec![old_snapshot_ref.clone()],
+            },
+        );
+        new_proposal
+            .tasks
+            .get_mut("synthesizer")
+            .unwrap()
+            .depends_on = vec!["analyst".to_owned()];
+
+        let new_session = (now.date_naive() + chrono::Days::new(1)).to_string();
+        let clock = StaticSessionClock(Some(new_session));
+        let source = StaticPaperWorkflowSource::new(new_proposal);
+        let reservation = daemon
+            .scheduler
+            .tick(&clock, &source, now + Duration::seconds(1))
+            .await
+            .unwrap()
+            .expect("new Paper session must be reserved");
+        let new_run_id = reservation.slot.workflow.run.run_id;
+        assert_ne!(new_run_id, old_run_id);
+
+        let snapshot = daemon.store().workflow_snapshot(&new_run_id).unwrap();
+        let snapshot_refs = snapshot
+            .tasks
+            .iter()
+            .flat_map(|task| task.node.input_artifacts.iter())
+            .filter(|reference| reference.kind == ArtifactKind::EvidenceNeed)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(!snapshot_refs.contains(&old_snapshot_ref));
+        assert!(snapshot_refs.iter().all(|reference| {
+            daemon
+                .store()
+                .artifact(&reference.artifact_id)
+                .unwrap()
+                .origin
+                .as_ref()
+                .and_then(|origin| origin.run_id.as_ref())
+                == Some(&new_run_id)
+        }));
         daemon.store().verify_integrity().unwrap();
     }
 

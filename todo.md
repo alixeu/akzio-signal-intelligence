@@ -1,38 +1,42 @@
 # Akzio v2 生产化 TODO
 
-> 当前目标：Paper-only；可执行资产仅为 TQQQ、QQQ、SOXX、SOXL。不得恢复 Live Trading、旧 orchestrator、旧 Store/Prompt 兼容层，也不得让 Agent 直接访问网络、文件系统、数据库或凭据。
+当前目标：Paper-only；可执行资产仅为 `TQQQ`、`QQQ`、`SOXX`、`SOXL`。
+
+状态判断以当前 Rust 源码、Cargo 配置、测试和 `V2Store` 持久化事实为准。
 
 ## P0：生产阻断项
 
-- [x] 修复当前工作树编译失败：补齐所有 `AgentModelTurn` 测试构造器的 `model_debug` 字段。
-- [x] 重新通过 `cargo fmt --all -- --check`、`cargo check --offline --workspace`、`cargo clippy --offline --workspace --all-targets -- -D warnings` 和 `cargo test --offline --workspace`。
-- [x] 确定并实现生产 Evidence 路径：通过 Rust-owned Responses/model-native transport 完成受治理证据检索；保留来源 allowlist、查询/资源约束、超时与失败关闭、证据归档、provenance、`ContextManifest`/`ReadGrant` 和 canonical learning 边界。`FixtureEvidenceAdapter` 仅用于 Debug/Replay。（源码与离线测试完成；真实 provider 可用性待验证。）
-- [x] 为模型原生联网补齐受治理 tool contract：限定 source/resource、记录请求与原始结果及引用来源，验证 `RawEvidence`/`NormalizedEvidence`，能力缺失、来源越权、引用不完整或结果不可验证时 fail-closed。（源码与离线测试完成。）
-- [x] 为 `alpaca`、`sec_edgar`、`fred`、`news_web` 定义 typed resource schema、参数上限、分页/时间窗规则、URI 规范化和错误分类。（源码与离线测试完成。）
-- [x] 增加 Rust 校验的 `ResearchIntent` / Run 输入：明确资产范围、研究问题、预测期限、数据新鲜度和允许来源，替换泛化 Planner objective。（源码与离线测试完成。）
-- [x] 组装 scheduler-owned Paper 入口：注入 Alpaca Paper session clock、`PaperWorkflowSource`、`CommittedPaperBroker` 和 scheduler-owned snapshots。（源码与离线测试完成；真实 Paper sandbox 待验证。）
-- [ ] 在独立 Paper sandbox 完成端到端验证：市场时钟、账户、报价、一次性 durable commitment、client-order 幂等、broker reconciliation、freeze/unfreeze 和重启恢复。（本地执行规则禁止连接真实 broker，待人工执行。）
+- [x] `AgentModelTurn` 测试构造器已修复；fmt、check、clippy 和 workspace tests 已通过。
+- [x] Rust-owned Evidence 路径、allowlist、超时、失败关闭、provenance、`ContextManifest`/`ReadGrant` 已落地；真实 provider 待验证。
+- [x] `alpaca`、`sec_edgar`、`fred`、`news_web` typed resource schema 与错误分类已落地；真实来源回执待验证。
+- [x] `ResearchIntent` / Run 输入已由 Rust 校验，资产范围固定为四 ETF。
+- [x] scheduler-owned Paper 入口、Paper clock、`PaperWorkflowSource`、`CommittedPaperBroker`、原子 session provisioning 和跨 Run evidence 拒绝已落地；真实 sandbox 待验证。
+- [x] Outcome worker 的 `outcome.need`、evidence 和 canonical evaluation 均在 Store 事务内重新验证 outcome-worker lease；旧 lease 不得写 learning。
+- [ ] 独立 Paper sandbox 端到端验证：clock、account、quotes、durable commitment、client-order 幂等、reconciliation、freeze/unfreeze、重启恢复。
 
-## P1：上线前的研究与风险质量
+## P1：研究与风险质量
 
-- [x] 为标准化市场数据建立严格 Schema 与质量门：OHLCV/报价、交易时段、时区、公司行动与拆分、重复/缺失 bar、异常价格/点差和过期数据。（当前源码覆盖 RFC3339/工作日、重复日期、`adjustment=all`、Quote/Execution spread-age；真实 provider 数据分布待验证。）
-- [x] 为 SEC、FRED、新闻证据建立可追溯结构：文档/系列标识、发布时间、观察时间、修订版本、原始 URI、去重键和引用片段。（源码与离线测试完成；真实来源回执待验证。）
-- [x] 为 Planner 增加受约束的研究分片规则：价格/市场结构、宏观、公司基本面/半导体链条、新闻事件按条件选择。（源码与离线测试完成。）
-- [x] 建立冻结证据集离线评测：覆盖 Planner、Claim、Critique、DecisionProposal，记录模型版本、Prompt/Contract hash、成本、延迟、Schema 成功率和 blocker 召回率。（`test frozen-evidence` fixture/offline 已通过。）
-- [ ] 用真实 Paper Outcome 完成 T+1/T+3/T+5 评估：收益、相对 QQQ、交易成本、滑点、校准度、证据完整度、风险召回率和 regime 分层。（OutcomeCostModel 与离线 materialization 已完成；真实 Paper bars/Outcome sealing 待人工验证。）
-- [x] 实现 scheduler-owned 到期 Outcome worker：扫描 `OutcomeSchedule`，获取受治理的未来价格/风险观测，封存 Outcome，调用 `EvaluationRuntime`，并原子记录 Policy Evaluation。（源码与 fixture/offline worker 链已通过；真实 Paper worker 运行待验证。）
-- [x] 对模型和证据供应故障建立 NoOrder / 降级规则：限流、超时、空响应、来源延迟、provider 中断和部分来源不可用都不能用猜测数据填补。（源码与离线测试完成。）
+- [x] 市场数据 Schema/质量门：OHLCV、报价、交易时段、时区、公司行动、重复/缺失 bar、异常价格/点差和过期数据；真实 provider 分布待验证。
+- [x] SEC、FRED、新闻证据追溯字段：标识、发布时间、观察时间、修订版本、原始 URI、去重键和引用片段；真实来源回执待验证。
+- [x] Planner 研究分片：价格/市场结构、宏观、基本面/半导体链条、新闻事件按条件选择。
+- [x] 冻结证据集离线评测覆盖 Planner、Claim、Critique、DecisionProposal，并记录模型版本、Prompt/Contract hash、成本、延迟、Schema 成功率和 blocker 召回率。
+- [ ] 真实 Paper T+1/T+3/T+5 Outcome：收益、相对 QQQ、成本、滑点、校准度、证据完整度、风险召回率和 regime 分层。
+- [x] scheduler-owned Outcome worker、受治理未来观测、Outcome sealing、`EvaluationRuntime` 和原子 Policy Evaluation 已落地；真实 Paper worker 待验证。
+- [x] NoOrder/降级规则已落地：限流、超时、空响应、来源延迟、provider 中断和部分来源不可用不得用猜测数据填补。
+- [x] 补充专门的 scheduler snapshot 跨 Run 回归证据。
+- [x] 补充同一 `OutcomeSchedule`/permit 重复调度不得生成第二个 worker 的回归证据。
 
-## P2：可运维性、恢复与治理
+## P2：运维、恢复与治理
 
-- [x] 增加 Run/Task/Attempt 的结构化指标：耗时、token、模型/工具错误、来源时效、Gate blocker、Paper commitment 和 reconciliation。（Store metrics/health alerts 已覆盖可持久化指标；真实长期运行基线待验证。）
-- [x] 增加告警和运行手册：模型不可用、证据源不可用、scheduler lease 抖动、快照过期、订单拒绝、对账延迟、Store Doctor 失败和长期冻结。（运行手册与 `store alerts` 已完成。）
-- [x] 演练进程强杀、SQLite/CAS 损坏、网络分区、Alpaca 超时/重复回执、时钟边界和 lease takeover 的离线等价状态机。（离线 fixture 已通过；真实 OS 强杀、网络分区、Alpaca timeout/重复回执待人工验证。）
-- [x] 定义 Store Root 备份、恢复、保留和密钥轮换方案；恢复后运行 Store Doctor、replay 和 Paper commitment 一致性核对。（SQLite/CAS backup/restore、Doctor、HTTP replay 已通过；真实密钥轮换和 Paper commitment 核对待人工验证。）
-- [x] 增加上线审批清单：仅 Paper endpoint、四 ETF universe、真实适配器健康、sandbox 回归、operator freeze/unfreeze 演练、无 Hard Blocker、无未验证 candidate promotion。（清单已定义；人工审批尚未完成。）
+- [x] Run/Task/Attempt 指标、耗时、token、模型/工具错误、来源时效、Gate blocker、Paper commitment 和 reconciliation 已落地；长期基线待验证。
+- [x] 告警和运行手册已覆盖模型/证据源不可用、lease 抖动、快照过期、订单拒绝、对账延迟、Doctor 失败和长期冻结。
+- [x] 离线等价演练已通过：crash recovery、SQLite/CAS 损坏、lease takeover、freeze/unfreeze、backup/restore、replay 和 Doctor。
+- [ ] 人工故障演练：进程强杀、网络分区、Alpaca timeout/重复回执、时钟边界、真实 lease takeover 和 Paper commitment 一致性核对。
+- [x] Store Root 备份/恢复/保留边界已定义；离线 backup/restore、Doctor/replay 已通过，真实密钥轮换待验证。
+- [ ] 人工完成上线审批：仅 Paper endpoint、四 ETF、真实适配器健康、sandbox 回归、freeze/unfreeze 演练、无 Hard Blocker、无未验证 candidate promotion。
 
 ## 完成定义
 
-- [ ] 所有 P0 完成，P1 的数据质量、离线评测、真实 Paper sandbox 和真实 Outcome worker 验收完成。
-- [x] P2 的最低运行手册、告警和离线恢复演练可复现；真实人工演练完成前不得声明“Paper 生产可试运行”。
-- [x] Debug、Replay、Shadow、Paper Dry Run 和 fixture 结果永远不能直接驱动 canonical learning、拓扑晋升或真实 Paper 成功声明。（源码边界、`test learning-transitions` 和 `paper-dry-run` 的 `canonical_learning_events: 0` 已验证。）
+- [ ] 所有 P0 完成，且真实 Paper sandbox 与真实 T+1/T+3/T+5 Outcome worker 验收完成。
+- [ ] P2 人工演练和上线审批完成前，不得宣布 Paper 生产试运行或生产就绪。
+- [x] Debug、Replay、Shadow、Paper Dry Run 和 fixture 结果不得直接驱动 canonical learning、拓扑晋升或真实 Paper 成功声明。

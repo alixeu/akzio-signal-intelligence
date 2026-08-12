@@ -20,8 +20,8 @@ use akzio_domain::{
     V2_SCHEMA_VERSION,
 };
 use akzio_store::v2::{
-    PolicyEvaluationCommit, PolicyHead, ShadowPairCompletion, ShadowPairWriteResult, StoreError,
-    V2Store,
+    DaemonLease, PolicyEvaluationCommit, PolicyHead, ShadowPairCompletion, ShadowPairWriteResult,
+    StoreError, V2Store,
 };
 
 const PPM_ONE: u32 = 1_000_000;
@@ -201,6 +201,16 @@ impl EvaluationRuntime {
     /// Materializes governed observations, then commits immutable learning
     /// artifacts. Schedule creation is a separate earlier step.
     pub fn evaluate(&self, input: EvaluationInput) -> EvaluationRuntimeResult<EvaluationResult> {
+        self.evaluate_with_lease(None, input)
+    }
+
+    /// Materializes and commits learning while optionally fencing a daemon
+    /// worker lease in the Store transaction.
+    pub fn evaluate_with_lease(
+        &self,
+        lease: Option<&DaemonLease>,
+        input: EvaluationInput,
+    ) -> EvaluationRuntimeResult<EvaluationResult> {
         self.require_paper(&input.permit.run_id)?;
         if input.hypothesis_id.trim().is_empty() {
             return Err(EvaluationError::EmptyHypothesis);
@@ -384,19 +394,22 @@ impl EvaluationRuntime {
         };
         let policy_head = self
             .store
-            .record_policy_evaluation(&PolicyEvaluationCommit {
-                permit: input.permit,
-                outcome: outcome_artifact,
-                experience: experience_artifact,
-                evaluation: evaluation_artifact,
-                candidate_policy: candidate_policy_artifact,
-                subject: input.subject,
-                from: current,
-                to: next,
-                pair_snapshot,
-                transition,
-                completed_at: created_at,
-            })?
+            .record_policy_evaluation_fenced(
+                lease,
+                &PolicyEvaluationCommit {
+                    permit: input.permit,
+                    outcome: outcome_artifact,
+                    experience: experience_artifact,
+                    evaluation: evaluation_artifact,
+                    candidate_policy: candidate_policy_artifact,
+                    subject: input.subject,
+                    from: current,
+                    to: next,
+                    pair_snapshot,
+                    transition,
+                    completed_at: created_at,
+                },
+            )?
             .policy_head;
 
         Ok(EvaluationResult {

@@ -336,10 +336,18 @@ impl PaperScheduler {
                         .origin
                         .as_ref()
                         .and_then(|origin| origin.run_id.as_ref());
-                    if artifact.producer != "scheduler.paper_snapshot" || origin_run.is_none() {
+                    if artifact.producer == "scheduler.paper_snapshot" {
+                        // Snapshot inputs are session-specific. A new slot must
+                        // acquire fresh account/quotes/clock evidence below,
+                        // never carry a prior Run's scheduler snapshot forward.
+                        if origin_run.is_none() {
+                            return Err(SchedulerError::WorkflowUnavailable);
+                        }
+                        continue;
+                    }
+                    if origin_run.is_some() {
                         return Err(SchedulerError::WorkflowUnavailable);
                     }
-                    continue;
                 }
                 retained.push(reference);
             }
