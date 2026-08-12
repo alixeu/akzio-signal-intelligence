@@ -1179,9 +1179,41 @@ impl ContextManifestPayload {
     }
 }
 
+/// Rust-owned attenuation contract for projecting one persisted context
+/// manifest into a child task. It carries artifact references only; raw
+/// evidence and model transcripts are never delegation inputs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextProjection {
+    pub parent_manifest: ArtifactRef,
+    pub allowed: Vec<ArtifactRef>,
+    pub reason: String,
+}
+
+impl ContextProjection {
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if self.parent_manifest.kind != ArtifactKind::ContextManifest
+            || self.reason.trim().is_empty()
+        {
+            return Err(DomainError::EmptyField {
+                field: "context_projection",
+            });
+        }
+
+        let mut seen = BTreeSet::new();
+        if self.allowed.iter().any(|reference| {
+            reference.kind == ArtifactKind::RawEvidence
+                || !seen.insert(reference.artifact_id.clone())
+        }) {
+            return Err(DomainError::EmptyField {
+                field: "context_projection.allowed",
+            });
+        }
+
+        Ok(())
+    }
+}
+
 /// Ephemeral, task-scoped authorization derived from a persisted manifest. It is
-/// never model-produced and never grants a broader artifact surface than the
-/// manifest selection/closure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadGrant {
     pub manifest_artifact_id: ArtifactId,

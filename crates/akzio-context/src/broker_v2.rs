@@ -5,8 +5,8 @@ use std::collections::{BTreeSet, VecDeque};
 use akzio_domain::{
     content_hash_json, AgentContract, Artifact, ArtifactId, ArtifactKind, ArtifactLifecycle,
     ArtifactOrigin, ArtifactProvenance, ArtifactRef, CandidatePolicy, ContextManifestPayload,
-    ContextPolicy, ContextSelection, DomainError, Experience, PolicyState, ReadGrant,
-    TaskWritePermit, V2_DOMAIN_SCHEMA_VERSION,
+    ContextPolicy, ContextProjection, ContextSelection, DomainError, Experience, PolicyState,
+    ReadGrant, TaskWritePermit, V2_DOMAIN_SCHEMA_VERSION,
 };
 use akzio_store::v2::{StoreError, V2Store};
 use chrono::{DateTime, Duration, Utc};
@@ -299,6 +299,155 @@ impl ContextBroker {
                 .map(|selection| selection.artifact.artifact_id.clone())
                 .collect(),
             raw_source_closure: self.raw_closure(policy, &selections)?,
+            expires_at: now + grant_ttl,
+        };
+        Ok(ContextManifest {
+            artifact,
+            payload,
+            grant,
+        })
+    }
+
+    /// Attenuate a persisted parent manifest into a child attempt grant.
+    /// Projection never adds artifacts: only parent-readable references that
+    /// the child contract also permits survive the intersection.
+    pub fn assemble_child(
+        &self,
+        parent_permit: &TaskWritePermit,
+        parent_contract: &AgentContract,
+        parent: &ContextManifest,
+        projection: &ContextProjection,
+        child_permit: &TaskWritePermit,
+        child_contract: &AgentContract,
+        now: DateTime<Utc>,
+        grant_ttl: Duration,
+    ) -> ContextResult<ContextManifest> {
+        projection.validate()?;
+        child_contract.validate()?;
+        if child_permit.contract_hash.as_ref() != Some(&child_contract.contract_hash) {
+            return Err(ContextError::InvalidManifestClosure);
+        }
+        if projection.parent_manifest.artifact_id != parent.artifact.artifact_id
+            || projection.parent_manifest.kind != ArtifactKind::ContextManifest
+        {
+            return Err(ContextError::InvalidManifestClosure);
+        }
+
+        // Reuse the canonical persisted-manifest validation before projecting.
+        self.policy_influences(parent_permit, parent_contract, parent, now)?;
+
+        let parent_readable = parent
+            .payload
+            .selections
+            .iter()
+            .map(|selection| selection.artifact.clone())
+            .collect::<BTreeSet<_>>();
+        if let Some(reference) = projection
+            .allowed
+            .iter()
+            .find(|reference| !parent_readable.contains(*reference))
+        {
+            return Err(ContextError::GrantDenied {
+                manifest_id: parent.artifact.artifact_id.clone(),
+                artifact_id: reference.artifact_id.clone(),
+            });
+        }
+        let allowed = projection
+            .allowed
+            .iter()
+            .filter(|reference| parent_readable.contains(*reference))
+            .cloned()
+            .collect::<Vec<_>>();
+        let policy = &child_contract.context;
+        let mut selections = Vec::with_capacity(allowed.len());
+        let mut total_bytes = 0_u64;
+        let mut estimated_tokens = 0_u32;
+        for reference in allowed {
+            let artifact = self.store.artifact(&reference.artifact_id)?;
+            if artifact.kind != reference.kind {
+                return Err(ContextError::InvalidManifestClosure);
+            }
+            self.assert_context_permitted(policy, &artifact)?;
+            if !self.overlay_is_eligible(&artifact)? {
+                continue;
+            }
+            let tokens = estimate_tokens(artifact.blob.bytes);
+            total_bytes = total_bytes.saturating_add(artifact.blob.bytes);
+            estimated_tokens = estimated_tokens.saturating_add(tokens);
+            selections.push(ContextSelection {
+                artifact: reference,
+                reason: projection.reason.clone(),
+                estimated_tokens: tokens,
+            });
+        }
+        if selections.len() < usize::from(policy.min_artifacts)
+            || selections.len() > usize::from(policy.max_artifacts)
+            || total_bytes > policy.max_bytes
+            || estimated_tokens > policy.max_tokens
+        {
+            return Err(ContextError::BudgetExceeded);
+        }
+
+        let raw_source_closure = self.raw_closure(policy, &selections)?;
+        if !raw_source_closure.is_subset(&parent.grant.raw_source_closure) {
+            return Err(ContextError::InvalidManifestClosure);
+        }
+        let payload = ContextManifestPayload {
+            schema_version: V2_DOMAIN_SCHEMA_VERSION,
+            contract_hash: child_contract.contract_hash.clone(),
+            input_hash: manifest_input_hash(&selections)?,
+            selections: selections.clone(),
+            total_bytes,
+            estimated_tokens,
+        };
+        payload.validate(policy)?;
+        let artifact = Artifact::new(
+            ArtifactKind::ContextManifest,
+            self.store.put_json(&payload)?,
+            format!("context.{}", child_contract.purpose.as_str()),
+            ArtifactLifecycle::RunScoped,
+            ArtifactProvenance {
+                source_family: "akzio.context".to_owned(),
+                observed_at: None,
+                retrieved_at: now,
+                source_uri: None,
+                confidence_ppm: 1_000_000,
+                producer_contract_hash: Some(child_contract.contract_hash.clone()),
+            },
+            Some(ArtifactOrigin {
+                run_id: Some(child_permit.run_id.clone()),
+                task_id: Some(child_permit.task_id.clone()),
+                attempt_id: Some(child_permit.attempt_id.clone()),
+                contract_hash: child_permit.contract_hash.clone(),
+            }),
+            std::iter::once(projection.parent_manifest.clone())
+                .chain(
+                    selections
+                        .iter()
+                        .map(|selection| selection.artifact.clone()),
+                )
+                .collect(),
+            now,
+        )?;
+        self.store.write_task_artifact(
+            child_permit,
+            &artifact,
+            "context.child_manifest_created",
+            now,
+        )?;
+        let grant = ReadGrant {
+            manifest_artifact_id: artifact.artifact_id.clone(),
+            run_id: child_permit.run_id.clone(),
+            task_id: child_permit.task_id.clone(),
+            attempt_id: child_permit.attempt_id.clone(),
+            lease_id: child_permit.lease_id.clone(),
+            epoch: child_permit.epoch,
+            contract_hash: child_contract.contract_hash.clone(),
+            readable: selections
+                .iter()
+                .map(|selection| selection.artifact.artifact_id.clone())
+                .collect(),
+            raw_source_closure,
             expires_at: now + grant_ttl,
         };
         Ok(ContextManifest {
