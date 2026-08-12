@@ -808,6 +808,9 @@ impl ContextBroker {
         value: &T,
         now: DateTime<Utc>,
     ) -> ContextResult<Artifact> {
+        if !grant.matches_permit(permit) || grant.contract_hash != contract.contract_hash {
+            return Err(ContextError::InvalidManifestClosure);
+        }
         for source in &source_refs {
             if !grant.permits(
                 &source.artifact_id,
@@ -1387,6 +1390,27 @@ mod tests {
     }
 
     #[test]
+    fn read_grant_expiry_is_exclusive_for_context_reads() {
+        let (_root, store, _permit, _contract, manifest, raw, _now) = manifest_fixture();
+        let broker = ContextBroker::new(store);
+        let selected = manifest.payload.selections[0].artifact.artifact_id.clone();
+        let just_before = manifest.grant.expires_at - Duration::nanoseconds(1);
+
+        assert!(broker.read(&manifest.grant, &selected, just_before).is_ok());
+        assert!(broker
+            .read_raw(&manifest.grant, &raw.artifact_id, just_before)
+            .is_ok());
+        assert!(matches!(
+            broker.read(&manifest.grant, &selected, manifest.grant.expires_at),
+            Err(ContextError::GrantDenied { .. })
+        ));
+        assert!(matches!(
+            broker.read_raw(&manifest.grant, &raw.artifact_id, manifest.grant.expires_at),
+            Err(ContextError::GrantDenied { .. })
+        ));
+    }
+
+    #[test]
     fn unrelated_artifact_is_not_visible_to_the_grant() {
         let root = tempdir().unwrap();
         let store = V2Store::open(root.path()).unwrap();
@@ -1474,7 +1498,12 @@ mod tests {
     fn repair_is_explicit_and_cannot_expand_a_grant() {
         let root = tempdir().unwrap();
         let store = V2Store::open(root.path()).unwrap();
-        let permit = permit(&store);
+        let contract = contract(&store);
+        let permit = permit_for_contract(
+            &store,
+            RunPurpose::Debug,
+            Some(contract.contract_hash.clone()),
+        );
         let normalized = task_artifact(
             &store,
             &permit,
@@ -1496,7 +1525,6 @@ mod tests {
             .write_task_artifact(&permit, &unrelated, "evidence", Utc::now())
             .unwrap();
         let broker = ContextBroker::new(store.clone());
-        let contract = contract(&store);
         let manifest = broker
             .assemble(
                 &permit,
@@ -1524,6 +1552,41 @@ mod tests {
             .unwrap();
         assert_eq!(repair.kind, ArtifactKind::ContextRepair);
         assert_eq!(repair.source_refs[0].artifact_id, normalized.artifact_id);
+
+        let mut stale_grant = manifest.grant.clone();
+        stale_grant.epoch = stale_grant.epoch.saturating_add(1);
+        assert!(matches!(
+            broker.record_repair(
+                &permit,
+                &contract,
+                &stale_grant,
+                vec![ArtifactRef {
+                    artifact_id: normalized.artifact_id.clone(),
+                    kind: ArtifactKind::NormalizedEvidence,
+                }],
+                &serde_json::json!({"repair": "stale-grant"}),
+                Utc::now(),
+            ),
+            Err(ContextError::InvalidManifestClosure)
+        ));
+
+        let mut wrong_contract = contract.clone();
+        wrong_contract.context.max_tokens = wrong_contract.context.max_tokens.saturating_sub(1);
+        wrong_contract.contract_hash = wrong_contract.expected_hash().unwrap();
+        assert!(matches!(
+            broker.record_repair(
+                &permit,
+                &wrong_contract,
+                &manifest.grant,
+                vec![ArtifactRef {
+                    artifact_id: normalized.artifact_id.clone(),
+                    kind: ArtifactKind::NormalizedEvidence,
+                }],
+                &serde_json::json!({"repair": "wrong-contract"}),
+                Utc::now(),
+            ),
+            Err(ContextError::InvalidManifestClosure)
+        ));
         assert!(matches!(
             broker.record_repair(
                 &permit,

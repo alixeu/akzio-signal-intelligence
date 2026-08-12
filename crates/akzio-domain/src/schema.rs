@@ -1239,7 +1239,7 @@ impl ReadGrant {
     }
 
     pub fn permits(&self, artifact_id: &ArtifactId, raw: bool, now: DateTime<Utc>) -> bool {
-        now <= self.expires_at
+        now < self.expires_at
             && if raw {
                 self.raw_source_closure.contains(artifact_id)
             } else {
