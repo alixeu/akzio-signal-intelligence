@@ -29,6 +29,8 @@ pub enum DomainError {
     DuplicateTaskId(TaskId),
     #[error("task {task} references unknown dependency {dependency}")]
     UnknownDependency { task: TaskId, dependency: TaskId },
+    #[error("unknown lifecycle event type {0}")]
+    UnknownLifecycleEventType(String),
     #[error("evidence source {0} is not allowed by the installed recipe")]
     EvidenceSourceNotAllowed(String),
     #[error("task graph contains a cycle")]

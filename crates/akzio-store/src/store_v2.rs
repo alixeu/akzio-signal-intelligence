@@ -17,11 +17,11 @@ use akzio_domain::{
     ArtifactProvenance, ArtifactRef, Asset, AttemptId, BlobRef, CandidatePolicy,
     CandidatePolicyState, ContentHash, ContractId, ContractPurpose, DomainError, Evaluation,
     ExecutionContext, ExecutionPlan, ExecutionVerdict, Experience, FailureDisposition, FreezeState,
-    LeaseId, OrderReceipt, OrderReceiptState, Outcome, OutcomeExecutionLineage, OutcomeHorizon,
-    OutcomeSchedule, PaperCommitment, PaperReprice, PolicyState, PolicySubject, PolicyTransition,
-    PolicyTransitionId, Reconciliation, RetryPolicy, RunId, RunPurpose, TaskBudget, TaskId,
-    TaskRecipeId, TaskStatus, TaskWritePermit, WorkflowGraph, WorkflowNode, WorkflowProposal,
-    WorkflowStatus, V2_DOMAIN_SCHEMA_VERSION, V2_SCHEMA_VERSION,
+    LeaseId, LifecycleEventType, OrderReceipt, OrderReceiptState, Outcome, OutcomeExecutionLineage,
+    OutcomeHorizon, OutcomeSchedule, PaperCommitment, PaperReprice, PolicyState, PolicySubject,
+    PolicyTransition, PolicyTransitionId, Reconciliation, RetryPolicy, RunId, RunPurpose,
+    TaskBudget, TaskId, TaskRecipeId, TaskStatus, TaskWritePermit, WorkflowGraph, WorkflowNode,
+    WorkflowProposal, WorkflowStatus, V2_DOMAIN_SCHEMA_VERSION, V2_SCHEMA_VERSION,
 };
 use chrono::{DateTime, Duration, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
@@ -279,6 +279,12 @@ pub struct StoredEvent {
     pub event_type: String,
     pub artifact_id: Option<ArtifactId>,
     pub created_at: DateTime<Utc>,
+}
+
+impl StoredEvent {
+    pub fn lifecycle_kind(&self) -> Result<LifecycleEventType, DomainError> {
+        LifecycleEventType::parse(&self.event_type)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2864,14 +2870,10 @@ impl V2Store {
         event_type: &str,
         now: DateTime<Utc>,
     ) -> StoreResult<()> {
+        validate_event_type(event_type)?;
         artifact.validate()?;
         reject_generic_learning_artifact(artifact)?;
         self.read_blob(&artifact.blob)?;
-        if event_type.trim().is_empty() {
-            return Err(StoreError::Domain(DomainError::EmptyField {
-                field: "event_type",
-            }));
-        }
         let mut connection = self.connection.lock().expect("store connection poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Some(lease) = lease {
@@ -4249,11 +4251,28 @@ impl V2Store {
                     .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?,
             })
         })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        let events = rows.collect::<Result<Vec<_>, _>>()?;
+        for event in &events {
+            event.lifecycle_kind()?;
+        }
+        Ok(events)
     }
 
     pub fn verify_integrity(&self) -> StoreResult<()> {
         let connection = self.connection.lock().expect("store connection poisoned");
+        let mut event_statement = connection
+            .prepare("SELECT event_id, event_type FROM rebuild_events ORDER BY event_id ASC")?;
+        let event_rows = event_statement.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in event_rows {
+            let (cursor, event_type) = row?;
+            LifecycleEventType::parse(&event_type).map_err(|error| {
+                StoreError::Integrity(format!(
+                    "event {cursor} has invalid lifecycle type: {error}"
+                ))
+            })?;
+        }
         let fk = connection
             .query_row("PRAGMA foreign_key_check", [], |_| Ok(()))
             .optional()?;
@@ -6645,6 +6664,10 @@ fn append_event(
     artifact_id: Option<&ArtifactId>,
     created_at: DateTime<Utc>,
 ) -> StoreResult<i64> {
+    validate_event_type(event_type)?;
+    if attempt_id.is_some() && task_id.is_none() {
+        return Err(StoreError::Domain(DomainError::AttemptOriginWithoutTask));
+    }
     transaction.execute(
         r#"INSERT INTO rebuild_events
            (run_id, task_id, attempt_id, event_type, artifact_id, created_at)
@@ -6659,6 +6682,16 @@ fn append_event(
         ],
     )?;
     Ok(transaction.last_insert_rowid())
+}
+
+fn validate_event_type(event_type: &str) -> StoreResult<()> {
+    if event_type.trim().is_empty() {
+        return Err(StoreError::Domain(DomainError::EmptyField {
+            field: "event_type",
+        }));
+    }
+    LifecycleEventType::parse(event_type)?;
+    Ok(())
 }
 
 fn record_attempt_output(
