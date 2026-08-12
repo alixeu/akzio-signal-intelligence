@@ -797,6 +797,24 @@ impl ContextBroker {
         Ok(artifact)
     }
 
+    fn validate_persisted_grant(
+        &self,
+        permit: &TaskWritePermit,
+        contract: &AgentContract,
+        grant: &ReadGrant,
+        now: DateTime<Utc>,
+    ) -> ContextResult<()> {
+        let artifact = self.store.artifact(&grant.manifest_artifact_id)?;
+        let payload: ContextManifestPayload = self.read_payload(&artifact)?;
+        let manifest = ContextManifest {
+            artifact,
+            payload,
+            grant: grant.clone(),
+        };
+        self.policy_influences_internal(permit, contract, &manifest, now, true)
+            .map(|_| ())
+    }
+
     /// Record an explicitly source-linked Context repair. This is intentionally a
     /// normal artifact write, so repair is observable and may itself be cited.
     pub fn record_repair<T: Serialize>(
@@ -811,6 +829,7 @@ impl ContextBroker {
         if !grant.matches_permit(permit) || grant.contract_hash != contract.contract_hash {
             return Err(ContextError::InvalidManifestClosure);
         }
+        self.validate_persisted_grant(permit, contract, grant, now)?;
         for source in &source_refs {
             if !grant.permits(
                 &source.artifact_id,
@@ -1583,6 +1602,23 @@ mod tests {
                     kind: ArtifactKind::NormalizedEvidence,
                 }],
                 &serde_json::json!({"repair": "wrong-contract"}),
+                Utc::now(),
+            ),
+            Err(ContextError::InvalidManifestClosure)
+        ));
+
+        let mut forged_grant = manifest.grant.clone();
+        forged_grant.readable.insert(unrelated.artifact_id.clone());
+        assert!(matches!(
+            broker.record_repair(
+                &permit,
+                &contract,
+                &forged_grant,
+                vec![ArtifactRef {
+                    artifact_id: unrelated.artifact_id.clone(),
+                    kind: ArtifactKind::NormalizedEvidence,
+                }],
+                &serde_json::json!({"repair": "forged-closure"}),
                 Utc::now(),
             ),
             Err(ContextError::InvalidManifestClosure)
