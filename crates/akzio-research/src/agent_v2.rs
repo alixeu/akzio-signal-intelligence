@@ -14,7 +14,10 @@ use akzio_domain::{
     TaskWritePermit, TerminationPolicy, ToolGrant, ToolKind, ToolSpec, WorkflowNode,
     V2_SCHEMA_VERSION,
 };
-use akzio_model::{ModelCallTrace, ModelClient, ModelError, ModelRequest, ModelToolDefinition};
+use akzio_model::{
+    ModelCallTrace, ModelCapabilitySnapshot, ModelClient, ModelError, ModelRequest,
+    ModelToolDefinition,
+};
 use akzio_runtime::v2::{RecipeCatalogue, RuntimeError, TerminalRecipeSet};
 use akzio_store::v2::{StoreError, StoredContract, V2Store};
 use chrono::{DateTime, Duration, Utc};
@@ -1125,6 +1128,10 @@ struct TurnRecord<'a> {
 /// Deliberately tiny seam. The production `akzio-model` adapter and fixture tests
 /// both implement this; no execution/policy authority crosses it.
 pub trait AgentModel: Send + Sync {
+    fn capability_snapshot(&self) -> ModelCapabilitySnapshot {
+        ModelCapabilitySnapshot::unknown()
+    }
+
     fn turn<'a>(
         &'a self,
         request: AgentModelRequest,
@@ -1148,6 +1155,10 @@ impl ModelClientAdapter {
 }
 
 impl AgentModel for ModelClientAdapter {
+    fn capability_snapshot(&self) -> ModelCapabilitySnapshot {
+        self.client.capability_snapshot()
+    }
+
     fn turn<'a>(
         &'a self,
         request: AgentModelRequest,
@@ -1327,6 +1338,9 @@ impl AgentRuntime {
                     maximum: installed.contract.budget.max_input_tokens,
                 });
             }
+            let capability_snapshot = model.capability_snapshot();
+            let capability_snapshot_hash = capability_snapshot_hash(&capability_snapshot)?;
+            let tool_set_hash = tool_set_hash(&request.tools)?;
             let request_hash = model_request_hash(&request)?;
             let mut turn_attempt = 1_u8;
             let turn = loop {
@@ -1350,6 +1364,9 @@ impl AgentRuntime {
                             model_error_class(&error),
                             model_debug_trace(&error),
                             will_retry,
+                            &capability_snapshot,
+                            &capability_snapshot_hash,
+                            &tool_set_hash,
                         )?;
                         trace_refs.push(ArtifactRef {
                             artifact_id: failed_turn.artifact_id,
@@ -1392,6 +1409,9 @@ impl AgentRuntime {
                     "wall_time",
                     None,
                     false,
+                    &capability_snapshot,
+                    &capability_snapshot_hash,
+                    &tool_set_hash,
                 )?;
                 trace_refs.push(ArtifactRef {
                     artifact_id: failed_turn.artifact_id,
@@ -1413,6 +1433,9 @@ impl AgentRuntime {
                 },
                 &request,
                 &turn,
+                &capability_snapshot,
+                &capability_snapshot_hash,
+                &tool_set_hash,
             )?;
             trace_refs.push(ArtifactRef {
                 artifact_id: turn_artifact.artifact_id,
@@ -1519,6 +1542,9 @@ impl AgentRuntime {
         record: &TurnRecord<'_>,
         request: &AgentModelRequest,
         response: &AgentModelTurn,
+        capability_snapshot: &ModelCapabilitySnapshot,
+        capability_snapshot_hash: &akzio_domain::ContentHash,
+        tool_set_hash: &akzio_domain::ContentHash,
     ) -> ResearchResult<Artifact> {
         let request_hash = model_request_hash(request)?;
         let artifact = Artifact::new(
@@ -1529,6 +1555,9 @@ impl AgentRuntime {
                 "contract_hash": record.contract.contract_hash,
                 "context_manifest": record.manifest.artifact.artifact_id,
                 "request_hash": request_hash,
+                "capability_snapshot": capability_snapshot,
+                "capability_snapshot_hash": capability_snapshot_hash,
+                "tool_set_hash": tool_set_hash,
                 "request": request,
                 "response": response,
             }))?,
@@ -1565,6 +1594,9 @@ impl AgentRuntime {
         error_class: &str,
         model_debug: Option<&ModelCallTrace>,
         will_retry: bool,
+        capability_snapshot: &ModelCapabilitySnapshot,
+        capability_snapshot_hash: &akzio_domain::ContentHash,
+        tool_set_hash: &akzio_domain::ContentHash,
     ) -> ResearchResult<Artifact> {
         let request_hash = model_request_hash(request)?;
         let mut trace = json!({
@@ -1573,6 +1605,9 @@ impl AgentRuntime {
             "contract_hash": record.contract.contract_hash,
             "context_manifest": record.manifest.artifact.artifact_id,
             "request_hash": request_hash,
+            "capability_snapshot": capability_snapshot,
+            "capability_snapshot_hash": capability_snapshot_hash,
+            "tool_set_hash": tool_set_hash,
             "request": request,
             "error_class": error_class,
             "will_retry": will_retry,
@@ -1825,6 +1860,20 @@ fn estimate_tokens<T: Serialize>(value: &T) -> ResearchResult<u32> {
 fn model_request_hash(request: &AgentModelRequest) -> ResearchResult<akzio_domain::ContentHash> {
     Ok(akzio_domain::content_hash_json(&serde_json::to_value(
         request,
+    )?)?)
+}
+
+fn capability_snapshot_hash(
+    snapshot: &ModelCapabilitySnapshot,
+) -> ResearchResult<akzio_domain::ContentHash> {
+    Ok(akzio_domain::content_hash_json(&serde_json::to_value(
+        snapshot,
+    )?)?)
+}
+
+fn tool_set_hash(tools: &[AgentToolDefinition]) -> ResearchResult<akzio_domain::ContentHash> {
+    Ok(akzio_domain::content_hash_json(&serde_json::to_value(
+        tools,
     )?)?)
 }
 
@@ -3416,6 +3465,16 @@ mod tests {
             })
             .expect("agent turn trace retains request and response");
         assert!(turn_trace["request_hash"].as_str().is_some());
+        let capability_snapshot = turn_trace["capability_snapshot"].clone();
+        assert_eq!(capability_snapshot["provider_id"], "unknown");
+        assert_eq!(
+            turn_trace["capability_snapshot_hash"],
+            serde_json::to_value(
+                capability_snapshot_hash(&ModelCapabilitySnapshot::unknown()).unwrap()
+            )
+            .unwrap()
+        );
+        assert!(turn_trace["tool_set_hash"].as_str().is_some());
         assert_eq!(turn_trace["request"]["tools"][0]["strict"], true);
         assert_eq!(
             turn_trace["response"]["model_debug"]["request"]["fixture"],
@@ -3442,6 +3501,14 @@ mod tests {
         assert_eq!(
             failed_turn_trace["model_debug"]["result"]["error"],
             "fixture-transport"
+        );
+        assert_eq!(
+            failed_turn_trace["capability_snapshot"],
+            capability_snapshot
+        );
+        assert_eq!(
+            failed_turn_trace["capability_snapshot_hash"],
+            turn_trace["capability_snapshot_hash"]
         );
 
         let malformed = FixedModel(AgentModelTurn {

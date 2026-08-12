@@ -159,6 +159,44 @@ pub struct ModelRequest {
     pub tools: Vec<ModelToolDefinition>,
 }
 
+/// Adapter-declared capabilities for one model client.
+///
+/// This is descriptive metadata only: it is not a provider handshake and
+/// never grants tools, context, or execution authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelCapabilitySnapshot {
+    pub provider_id: String,
+    pub model_id: String,
+    pub reasoning_effort: String,
+    pub supports_structured_output: bool,
+    pub supports_tool_calls: bool,
+    pub native_web_tool: bool,
+    #[serde(default)]
+    pub streaming: Option<bool>,
+    #[serde(default)]
+    pub declared_context_limit: Option<u32>,
+    #[serde(default)]
+    pub declared_max_output_tokens: Option<u32>,
+    pub source: String,
+}
+
+impl ModelCapabilitySnapshot {
+    pub fn unknown() -> Self {
+        Self {
+            provider_id: "unknown".to_owned(),
+            model_id: "unknown".to_owned(),
+            reasoning_effort: "unknown".to_owned(),
+            supports_structured_output: false,
+            supports_tool_calls: false,
+            native_web_tool: false,
+            streaming: None,
+            declared_context_limit: None,
+            declared_max_output_tokens: None,
+            source: "unknown".to_owned(),
+        }
+    }
+}
+
 /// Provider-facing request/result pair retained only inside a RunScoped
 /// AgentTurn when local model debugging is enabled.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -479,6 +517,37 @@ impl ModelClient {
         )?))
     }
 
+    pub fn capability_snapshot(&self) -> ModelCapabilitySnapshot {
+        match self {
+            Self::Responses(client) => ModelCapabilitySnapshot {
+                provider_id: "responses".to_owned(),
+                model_id: client.model.clone(),
+                reasoning_effort: client.reasoning_effort.clone(),
+                supports_structured_output: true,
+                supports_tool_calls: true,
+                native_web_tool: true,
+                streaming: Some(false),
+                declared_context_limit: None,
+                declared_max_output_tokens: None,
+                source: "adapter_declared".to_owned(),
+            },
+            Self::Fixture(_) | Self::FixtureBySchema(_) | Self::FixtureSequence(_) => {
+                ModelCapabilitySnapshot {
+                    provider_id: "fixture".to_owned(),
+                    model_id: "fixture".to_owned(),
+                    reasoning_effort: "none".to_owned(),
+                    supports_structured_output: true,
+                    supports_tool_calls: true,
+                    native_web_tool: true,
+                    streaming: Some(false),
+                    declared_context_limit: None,
+                    declared_max_output_tokens: None,
+                    source: "adapter_declared".to_owned(),
+                }
+            }
+        }
+    }
+
     /// Exact provider payload used for an individual turn, excluding auth.
     pub fn request_body(&self, request: &ModelRequest) -> Value {
         match self {
@@ -724,6 +793,42 @@ mod tests {
             ModelClient::from_config(&missing_key),
             Err(ModelError::EmptyApiKey)
         ));
+    }
+
+    #[test]
+    fn capability_snapshot_is_stable_and_redacted() {
+        let config = ModelConfig {
+            base_url: "https://example.invalid/v1".to_owned(),
+            model: "fixture-model".to_owned(),
+            api_key: "secret-key".to_owned(),
+            reasoning_effort: "high".to_owned(),
+            debug: false,
+        };
+        let client = ModelClient::from_config(&config).unwrap();
+        let snapshot = client.capability_snapshot();
+        assert_eq!(snapshot.provider_id, "responses");
+        assert_eq!(snapshot.model_id, "fixture-model");
+        assert_eq!(snapshot.reasoning_effort, "high");
+        assert_eq!(snapshot.source, "adapter_declared");
+
+        let encoded = serde_json::to_string(&snapshot).unwrap();
+        assert!(!encoded.contains("secret-key"));
+        assert!(!encoded.contains("example.invalid"));
+        assert_eq!(snapshot, client.capability_snapshot());
+    }
+
+    #[test]
+    fn fixture_and_unknown_capability_snapshots_are_explicit() {
+        let fixture = ModelClient::Fixture(json!({"output_text": "{}"}));
+        let snapshot = fixture.capability_snapshot();
+        assert_eq!(snapshot.provider_id, "fixture");
+        assert_eq!(snapshot.model_id, "fixture");
+        assert_eq!(snapshot.reasoning_effort, "none");
+        assert!(snapshot.supports_tool_calls);
+
+        let unknown = ModelCapabilitySnapshot::unknown();
+        assert_eq!(unknown.provider_id, "unknown");
+        assert!(!unknown.supports_tool_calls);
     }
 
     #[test]
