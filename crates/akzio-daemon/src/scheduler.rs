@@ -11,7 +11,10 @@ use std::{
     time::Duration as StdDuration,
 };
 
-use akzio_domain::{Artifact, ArtifactKind, RunId, RunPurpose, WorkflowProposal};
+use akzio_domain::{
+    Artifact, ArtifactKind, ArtifactLifecycle, ArtifactOrigin, ArtifactProvenance, ArtifactRef,
+    DomainError, EvidenceNeed, RunId, RunPurpose, WorkflowProposal, V2_DOMAIN_SCHEMA_VERSION,
+};
 use akzio_execution::paper::AlpacaPaper;
 use akzio_runtime::{RuntimeError, WorkflowRuntime};
 use akzio_store::v2::{DaemonLease, SessionSlotReservation, StoreError, V2Store};
@@ -29,6 +32,8 @@ pub enum SchedulerError {
     Json(#[from] serde_json::Error),
     #[error(transparent)]
     Runtime(#[from] RuntimeError),
+    #[error(transparent)]
+    Domain(#[from] DomainError),
     #[error("invalid scheduler owner")]
     InvalidOwner,
     #[error("scheduler is not the active leader")]
@@ -44,6 +49,10 @@ pub enum SchedulerError {
 }
 
 pub type SchedulerResult<T> = std::result::Result<T, SchedulerError>;
+
+const PAPER_ACCOUNT_RESOURCE: &str = "paper.account";
+const PAPER_QUOTES_RESOURCE: &str = "paper.quotes";
+const PAPER_CLOCK_RESOURCE: &str = "paper.clock";
 
 /// A broker-authoritative clock returns an open session date; local wall-clock
 /// dates and hand-maintained market calendars never create Paper slots.
@@ -241,8 +250,98 @@ impl PaperScheduler {
         let Some(session_key) = clock.open_session_key().await? else {
             return Ok(None);
         };
+        if let Some(slot) = self.store.session_slot(&session_key)? {
+            return Ok(Some(SessionSlotReservation {
+                slot,
+                newly_reserved: false,
+            }));
+        }
         let proposal = source.proposal(&session_key)?;
-        self.reserve_session(&session_key, &proposal, now).map(Some)
+        let lease = self.acquire_or_renew(now)?;
+        let run_id = RunId::new();
+        let mut setup_artifacts = Vec::new();
+        let mut proposal = proposal;
+
+        for task in proposal.tasks.values_mut() {
+            let mut retained = Vec::with_capacity(task.evidence_needs.len());
+            for reference in task.evidence_needs.drain(..) {
+                let artifact = self.store.artifact(&reference.artifact_id)?;
+                let scheduler_snapshot = artifact.kind == ArtifactKind::EvidenceNeed
+                    && artifact.producer == "scheduler.paper_snapshot";
+                if !scheduler_snapshot {
+                    retained.push(reference);
+                }
+            }
+            task.evidence_needs = retained;
+        }
+
+        let snapshot_alias = proposal
+            .tasks
+            .iter()
+            .find_map(|(alias, task)| {
+                self.workflow
+                    .catalogue()
+                    .recipe(&task.recipe_id)
+                    .ok()
+                    .filter(|recipe| recipe.allowed_evidence_sources.contains("alpaca"))
+                    .map(|_| alias.clone())
+            })
+            .ok_or(SchedulerError::WorkflowUnavailable)?;
+        let first_task = proposal
+            .tasks
+            .get_mut(&snapshot_alias)
+            .ok_or(SchedulerError::WorkflowUnavailable)?;
+        for resource in [
+            PAPER_ACCOUNT_RESOURCE,
+            PAPER_QUOTES_RESOURCE,
+            PAPER_CLOCK_RESOURCE,
+        ] {
+            let need = EvidenceNeed {
+                schema_version: V2_DOMAIN_SCHEMA_VERSION,
+                source_family: "alpaca".to_owned(),
+                resource: resource.to_owned(),
+                max_age_secs: 5,
+            };
+            need.validate()?;
+            let artifact = Artifact::new(
+                ArtifactKind::EvidenceNeed,
+                self.store.put_json(&need)?,
+                "scheduler.paper_snapshot",
+                ArtifactLifecycle::RunScoped,
+                ArtifactProvenance {
+                    source_family: "akzio.scheduler".to_owned(),
+                    observed_at: None,
+                    retrieved_at: now,
+                    source_uri: None,
+                    confidence_ppm: 1_000_000,
+                    producer_contract_hash: None,
+                },
+                Some(ArtifactOrigin {
+                    run_id: Some(run_id.clone()),
+                    task_id: None,
+                    attempt_id: None,
+                    contract_hash: None,
+                }),
+                Vec::new(),
+                now,
+            )?;
+            first_task.evidence_needs.push(ArtifactRef {
+                artifact_id: artifact.artifact_id.clone(),
+                kind: ArtifactKind::EvidenceNeed,
+            });
+            setup_artifacts.push(artifact);
+        }
+
+        Ok(Some(
+            self.workflow.reserve_paper_session_with_inputs_for_run(
+                &lease,
+                run_id,
+                &session_key,
+                &proposal,
+                &setup_artifacts,
+                now,
+            )?,
+        ))
     }
 
     pub async fn serve<C, P>(

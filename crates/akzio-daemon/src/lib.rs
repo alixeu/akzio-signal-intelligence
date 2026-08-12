@@ -2780,6 +2780,37 @@ mod tests {
         shutdown.send(true).unwrap();
         assert!(task.await.unwrap().is_ok());
         assert!(reserved.is_some());
+        let run_id = reserved.unwrap().workflow.run.run_id;
+        let snapshot = daemon.store().workflow_snapshot(&run_id).unwrap();
+        let snapshot_resources = snapshot
+            .tasks
+            .iter()
+            .flat_map(|task| task.node.input_artifacts.iter())
+            .filter_map(|reference| {
+                let artifact = daemon.store().artifact(&reference.artifact_id).unwrap();
+                (artifact.producer == "scheduler.paper_snapshot").then(|| {
+                    let need: EvidenceNeed =
+                        serde_json::from_slice(&daemon.store().read_blob(&artifact.blob).unwrap())
+                            .unwrap();
+                    assert_eq!(
+                        artifact
+                            .origin
+                            .as_ref()
+                            .and_then(|origin| origin.run_id.as_ref()),
+                        Some(&run_id)
+                    );
+                    need.resource
+                })
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            snapshot_resources,
+            BTreeSet::from([
+                "paper.account".to_owned(),
+                "paper.clock".to_owned(),
+                "paper.quotes".to_owned(),
+            ])
+        );
         daemon.store().verify_integrity().unwrap();
     }
 
