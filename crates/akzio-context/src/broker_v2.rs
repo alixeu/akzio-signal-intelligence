@@ -327,6 +327,9 @@ impl ContextBroker {
         if child_permit.contract_hash.as_ref() != Some(&child_contract.contract_hash) {
             return Err(ContextError::InvalidManifestClosure);
         }
+        if child_permit.run_id != parent_permit.run_id {
+            return Err(ContextError::InvalidManifestClosure);
+        }
         if projection.parent_manifest.artifact_id != parent.artifact.artifact_id
             || projection.parent_manifest.kind != ArtifactKind::ContextManifest
         {
@@ -342,6 +345,13 @@ impl ContextBroker {
             .iter()
             .map(|selection| selection.artifact.clone())
             .collect::<BTreeSet<_>>();
+        let parent_readable_ids = parent_readable
+            .iter()
+            .map(|reference| reference.artifact_id.clone())
+            .collect::<BTreeSet<_>>();
+        if parent.grant.readable != parent_readable_ids {
+            return Err(ContextError::InvalidManifestClosure);
+        }
         if let Some(reference) = projection
             .allowed
             .iter()
