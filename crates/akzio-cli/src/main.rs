@@ -3,7 +3,7 @@ use std::{collections::BTreeSet, net::SocketAddr, path::PathBuf, sync::Arc, time
 use akzio_daemon::{
     fixture_model_client, AlpacaPaperSessionClock, Daemon, DaemonConfig, DaemonHealth,
     PaperWorkflowSource, ReplayReport, RunCancellationResponse, RunRetryResponse,
-    RunSubmissionResponse, StorePaperWorkflowSource,
+    RunSubmissionResponse, SchedulerError, StorePaperWorkflowSource,
 };
 use akzio_domain::{ArtifactKind, Asset, RunPurpose, WorkflowStatus};
 use akzio_execution::paper::AlpacaPaper;
@@ -477,9 +477,12 @@ async fn serve(config: Config) -> Result<()> {
     let http_daemon = Arc::new(daemon.clone());
     if auto_paper {
         let source = StorePaperWorkflowSource::new(daemon.store().clone());
-        source
-            .proposal("preflight")
-            .context("load durable Paper workflow proposal")?;
+        if let Err(error) = source.proposal("preflight") {
+            if !matches!(error, SchedulerError::WorkflowUnavailable) {
+                return Err(anyhow::anyhow!(error.to_string()))
+                    .context("load durable Paper workflow proposal");
+            }
+        }
         let paper = AlpacaPaper::from_env().context("construct Alpaca Paper client")?;
         let clock = AlpacaPaperSessionClock::new(paper.clone());
         let scheduler_daemon = Arc::new(daemon.with_paper_broker(Arc::new(paper)));

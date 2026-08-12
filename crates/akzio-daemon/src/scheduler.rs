@@ -237,6 +237,61 @@ impl PaperScheduler {
         )?)
     }
 
+    pub fn reserve_approved_session(
+        &self,
+        run_id: RunId,
+        session_key: &str,
+        now: DateTime<Utc>,
+    ) -> SchedulerResult<SessionSlotReservation> {
+        NaiveDate::parse_from_str(session_key, "%Y-%m-%d")
+            .map_err(|_| SchedulerError::InvalidSessionKey(session_key.to_owned()))?;
+        let lease = self.acquire_or_renew(now)?;
+        let mut setup_artifacts = Vec::new();
+        for resource in [
+            PAPER_ACCOUNT_RESOURCE,
+            PAPER_QUOTES_RESOURCE,
+            PAPER_CLOCK_RESOURCE,
+        ] {
+            let need = EvidenceNeed {
+                schema_version: V2_DOMAIN_SCHEMA_VERSION,
+                source_family: "alpaca".to_owned(),
+                resource: resource.to_owned(),
+                max_age_secs: 5,
+            };
+            need.validate()?;
+            setup_artifacts.push(Artifact::new(
+                ArtifactKind::EvidenceNeed,
+                self.store.put_json(&need)?,
+                "scheduler.paper_snapshot",
+                ArtifactLifecycle::RunScoped,
+                ArtifactProvenance {
+                    source_family: "akzio.scheduler".to_owned(),
+                    observed_at: None,
+                    retrieved_at: now,
+                    source_uri: None,
+                    confidence_ppm: 1_000_000,
+                    producer_contract_hash: None,
+                },
+                Some(ArtifactOrigin {
+                    run_id: Some(run_id.clone()),
+                    task_id: None,
+                    attempt_id: None,
+                    contract_hash: None,
+                }),
+                Vec::new(),
+                now,
+            )?);
+        }
+        Ok(self.workflow.reserve_approved_paper_session(
+            &lease,
+            run_id,
+            session_key,
+            "paper.approved.v1",
+            &setup_artifacts,
+            now,
+        )?)
+    }
+
     pub async fn tick<C, P>(
         &self,
         clock: &C,
@@ -256,7 +311,15 @@ impl PaperScheduler {
                 newly_reserved: false,
             }));
         }
-        let proposal = source.proposal(&session_key)?;
+        let proposal = match source.proposal(&session_key) {
+            Ok(proposal) => proposal,
+            Err(SchedulerError::WorkflowUnavailable) => {
+                return self
+                    .reserve_approved_session(RunId::new(), &session_key, now)
+                    .map(Some);
+            }
+            Err(error) => return Err(error),
+        };
         let lease = self.acquire_or_renew(now)?;
         let run_id = RunId::new();
         let mut setup_artifacts = Vec::new();
@@ -266,11 +329,19 @@ impl PaperScheduler {
             let mut retained = Vec::with_capacity(task.evidence_needs.len());
             for reference in task.evidence_needs.drain(..) {
                 let artifact = self.store.artifact(&reference.artifact_id)?;
-                let scheduler_snapshot = artifact.kind == ArtifactKind::EvidenceNeed
-                    && artifact.producer == "scheduler.paper_snapshot";
-                if !scheduler_snapshot {
-                    retained.push(reference);
+                if artifact.kind == ArtifactKind::EvidenceNeed
+                    && artifact.lifecycle == ArtifactLifecycle::RunScoped
+                {
+                    let origin_run = artifact
+                        .origin
+                        .as_ref()
+                        .and_then(|origin| origin.run_id.as_ref());
+                    if artifact.producer != "scheduler.paper_snapshot" || origin_run.is_none() {
+                        return Err(SchedulerError::WorkflowUnavailable);
+                    }
+                    continue;
                 }
+                retained.push(reference);
             }
             task.evidence_needs = retained;
         }

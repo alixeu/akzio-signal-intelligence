@@ -2814,6 +2814,164 @@ mod tests {
         daemon.store().verify_integrity().unwrap();
     }
 
+    #[tokio::test]
+    async fn auto_paper_supervisor_provisions_fresh_store_with_approved_workflow() {
+        let directory = tempdir().unwrap();
+        let mut daemon_config = config(directory.path().to_path_buf());
+        daemon_config.auto_paper = true;
+        let daemon = Daemon::with_model(daemon_config, fixture_model_client()).unwrap();
+        let session_key = Utc::now().date_naive().to_string();
+        let clock = Arc::new(StaticSessionClock(Some(session_key.clone())));
+        let source = Arc::new(StorePaperWorkflowSource::new(daemon.store().clone()));
+        assert!(matches!(
+            source.proposal("preflight"),
+            Err(SchedulerError::WorkflowUnavailable)
+        ));
+        let (shutdown, receiver) = watch::channel(false);
+        let supervised = daemon.clone();
+        let task = tokio::spawn(async move {
+            supervised
+                .serve_with_paper_scheduler(
+                    clock.as_ref(),
+                    source.as_ref(),
+                    std::time::Duration::from_millis(1),
+                    receiver,
+                )
+                .await
+        });
+
+        let mut reserved = None;
+        for _ in 0..50 {
+            reserved = daemon.store().session_slot(&session_key).unwrap();
+            if reserved.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        shutdown.send(true).unwrap();
+        assert!(task.await.unwrap().is_ok());
+
+        let reservation = reserved.expect("fresh Store must be provisioned by scheduler");
+        let run_id = reservation.workflow.run.run_id.clone();
+        assert_eq!(
+            daemon.store().run_purpose(&run_id).unwrap(),
+            RunPurpose::Paper
+        );
+
+        let proposal = daemon
+            .store()
+            .latest_artifact_by_kind(ArtifactKind::WorkflowProposal)
+            .unwrap()
+            .expect("approved Paper proposal must be durable");
+        assert_eq!(proposal.producer, "runtime.paper_provisioning");
+        assert_eq!(
+            proposal
+                .origin
+                .as_ref()
+                .and_then(|origin| origin.run_id.as_ref()),
+            Some(&run_id)
+        );
+        let proposal_payload: WorkflowProposal =
+            serde_json::from_slice(&daemon.store().read_blob(&proposal.blob).unwrap()).unwrap();
+        assert_eq!(proposal_payload.topology_id, "paper.approved.v1");
+        assert!(proposal_payload.tasks.contains_key("analyst"));
+        assert!(proposal_payload.tasks.contains_key("synthesizer"));
+        assert_eq!(proposal.source_refs.len(), 3);
+        assert_eq!(
+            daemon
+                .store()
+                .session_slot(&session_key)
+                .unwrap()
+                .unwrap()
+                .workflow
+                .run
+                .run_id,
+            run_id
+        );
+        daemon.store().verify_integrity().unwrap();
+    }
+
+    #[tokio::test]
+    async fn paper_scheduler_rejects_cross_run_run_scoped_evidence_needs() {
+        let directory = tempdir().unwrap();
+        let daemon = Daemon::with_model(
+            config(directory.path().to_path_buf()),
+            fixture_model_client(),
+        )
+        .unwrap();
+        let old_run_id = daemon.submit_default(RunPurpose::Debug).unwrap();
+        let now = Utc::now();
+        let claimed = daemon
+            .store()
+            .claim_next_task("cross-run-fixture", now, Duration::seconds(30))
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.run_id, old_run_id);
+        let need = EvidenceNeed {
+            schema_version: akzio_domain::V2_DOMAIN_SCHEMA_VERSION,
+            source_family: "alpaca".to_owned(),
+            resource: "bars:TQQQ:1d".to_owned(),
+            max_age_secs: 86_400,
+        };
+        let need_artifact = Artifact::new(
+            ArtifactKind::EvidenceNeed,
+            daemon.store().put_json(&need).unwrap(),
+            "runtime.planner.evidence_need",
+            ArtifactLifecycle::RunScoped,
+            ArtifactProvenance {
+                source_family: "akzio.workflow.planner".to_owned(),
+                observed_at: None,
+                retrieved_at: now,
+                source_uri: None,
+                confidence_ppm: 1_000_000,
+                producer_contract_hash: claimed.permit.contract_hash.clone(),
+            },
+            Some(ArtifactOrigin {
+                run_id: Some(old_run_id.clone()),
+                task_id: Some(claimed.permit.task_id.clone()),
+                attempt_id: Some(claimed.permit.attempt_id.clone()),
+                contract_hash: claimed.permit.contract_hash.clone(),
+            }),
+            Vec::new(),
+            now,
+        )
+        .unwrap();
+        daemon
+            .store()
+            .write_task_artifact(
+                &claimed.permit,
+                &need_artifact,
+                "planner.evidence_need",
+                now,
+            )
+            .unwrap();
+
+        let mut proposal = paper_proposal();
+        proposal.tasks.insert(
+            "analyst".to_owned(),
+            WorkflowProposalTask {
+                recipe_id: TaskRecipeId::new("research.analyst").unwrap(),
+                objective: "Assess stale fixture evidence".to_owned(),
+                depends_on: vec![],
+                priority: 90,
+                evidence_needs: vec![ArtifactRef {
+                    artifact_id: need_artifact.artifact_id,
+                    kind: ArtifactKind::EvidenceNeed,
+                }],
+            },
+        );
+        proposal.tasks.get_mut("synthesizer").unwrap().depends_on = vec!["analyst".to_owned()];
+        let session_key = now.date_naive().to_string();
+        let clock = StaticSessionClock(Some(session_key.clone()));
+        let source = StaticPaperWorkflowSource::new(proposal);
+        assert!(matches!(
+            daemon.scheduler.tick(&clock, &source, now).await,
+            Err(SchedulerError::WorkflowUnavailable)
+        ));
+        assert!(daemon.store().session_slot(&session_key).unwrap().is_none());
+        daemon.store().verify_integrity().unwrap();
+    }
+
     #[test]
     fn cancellation_and_freeze_are_durable_store_owned_transitions() {
         let directory = tempdir().unwrap();

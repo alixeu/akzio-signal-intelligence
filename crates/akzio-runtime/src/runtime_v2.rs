@@ -421,6 +421,138 @@ impl WorkflowRuntime {
         )?)
     }
 
+    /// Build the Rust-owned, precompiled Paper proposal used for the first
+    /// scheduler session. It contains no model output and cannot be patched
+    /// after the Paper graph is frozen.
+    pub fn approved_paper_proposal(
+        &self,
+        topology_id: impl Into<String>,
+    ) -> RuntimeResult<WorkflowProposal> {
+        let analyst = self
+            .catalogue
+            .recipe(&TaskRecipeId::new(ANALYST_RECIPE_ID)?)?;
+        let synthesizer = self
+            .catalogue
+            .recipe(&TaskRecipeId::new(SYNTHESIZER_RECIPE_ID)?)?;
+        let proposal = WorkflowProposal {
+            schema_version: V2_SCHEMA_VERSION,
+            topology_id: topology_id.into(),
+            tasks: BTreeMap::from([
+                (
+                    "analyst".to_owned(),
+                    akzio_domain::WorkflowProposalTask {
+                        recipe_id: analyst.recipe_id.clone(),
+                        objective: "Assess governed Paper market evidence".to_owned(),
+                        depends_on: Vec::new(),
+                        priority: analyst.priority_ceiling,
+                        evidence_needs: Vec::new(),
+                    },
+                ),
+                (
+                    "synthesizer".to_owned(),
+                    akzio_domain::WorkflowProposalTask {
+                        recipe_id: synthesizer.recipe_id.clone(),
+                        objective:
+                            "Synthesize approved Paper research into a bounded decision proposal"
+                                .to_owned(),
+                        depends_on: vec!["analyst".to_owned()],
+                        priority: synthesizer.priority_ceiling,
+                        evidence_needs: Vec::new(),
+                    },
+                ),
+            ]),
+            stop_reason: Some("rust-approved Paper provisioning".to_owned()),
+        };
+        proposal.validate(&self.catalogue.recipes)?;
+        self.validate_proposal_limits(&proposal)?;
+        Ok(proposal)
+    }
+
+    pub fn reserve_approved_paper_session(
+        &self,
+        lease: &DaemonLease,
+        run_id: RunId,
+        session_key: impl Into<String>,
+        topology_id: impl Into<String>,
+        setup_artifacts: &[Artifact],
+        now: DateTime<Utc>,
+    ) -> RuntimeResult<SessionSlotReservation> {
+        let mut proposal = self.approved_paper_proposal(topology_id)?;
+        let snapshot_refs = setup_artifacts
+            .iter()
+            .map(|artifact| ArtifactRef {
+                artifact_id: artifact.artifact_id.clone(),
+                kind: artifact.kind,
+            })
+            .collect::<Vec<_>>();
+        proposal
+            .tasks
+            .get_mut("analyst")
+            .ok_or(RuntimeError::MissingRecipe(TaskRecipeId::new(
+                ANALYST_RECIPE_ID,
+            )?))?
+            .evidence_needs = snapshot_refs;
+        proposal.validate(&self.catalogue.recipes)?;
+        self.validate_proposal_limits(&proposal)?;
+        let proposal_artifact = Artifact::new(
+            ArtifactKind::WorkflowProposal,
+            self.store.put_json(&proposal)?,
+            "runtime.paper_provisioning",
+            ArtifactLifecycle::RunScoped,
+            ArtifactProvenance {
+                source_family: "akzio.runtime".to_owned(),
+                observed_at: None,
+                retrieved_at: now,
+                source_uri: None,
+                confidence_ppm: 1_000_000,
+                producer_contract_hash: None,
+            },
+            Some(ArtifactOrigin {
+                run_id: Some(run_id.clone()),
+                task_id: None,
+                attempt_id: None,
+                contract_hash: None,
+            }),
+            proposal
+                .tasks
+                .values()
+                .flat_map(|task| task.evidence_needs.iter().cloned())
+                .collect(),
+            now,
+        )?;
+        let session_key = session_key.into();
+        let graph = self.lower(RunPurpose::Paper, &proposal)?;
+        let graph_artifact = self.graph_artifact(
+            &graph,
+            vec![ArtifactRef {
+                artifact_id: proposal_artifact.artifact_id.clone(),
+                kind: ArtifactKind::WorkflowProposal,
+            }],
+            now,
+        )?;
+        let workflow = WorkflowCommit {
+            run: StoredRun {
+                run_id,
+                purpose: RunPurpose::Paper,
+                topology_id: graph.topology_id.clone(),
+                graph_artifact_id: graph_artifact.artifact_id.clone(),
+                created_at: now,
+            },
+            graph: graph_artifact,
+            nodes: graph.nodes,
+        };
+        Ok(self.store.reserve_paper_session_with_proposal(
+            lease,
+            &SessionReservation {
+                session_key,
+                workflow,
+                setup_artifacts: setup_artifacts.to_vec(),
+                reserved_at: now,
+            },
+            &proposal_artifact,
+        )?)
+    }
+
     pub fn recover(&self, run_id: &RunId) -> RuntimeResult<WorkflowSnapshot> {
         let snapshot = self.store.workflow_snapshot(run_id)?;
         self.validate_compiled_graph(snapshot.run.purpose, &snapshot.revision.graph)?;

@@ -1143,6 +1143,131 @@ impl V2Store {
 
     /// Commits the frozen workflow graph, Run row, nodes, dependencies, and creation
     /// event as one transaction. A process cannot observe a half-submitted graph.
+    /// Atomically installs the approved Paper workflow, its proposal, its
+    /// run-scoped inputs, and the broker session slot.
+    pub fn reserve_paper_session_with_proposal(
+        &self,
+        lease: &DaemonLease,
+        reservation: &SessionReservation,
+        proposal: &Artifact,
+    ) -> StoreResult<SessionSlotReservation> {
+        if reservation.session_key.trim().is_empty()
+            || reservation.workflow.run.purpose != RunPurpose::Paper
+            || reservation.workflow.graph.kind != ArtifactKind::WorkflowGraph
+            || reservation.workflow.graph.artifact_id != reservation.workflow.run.graph_artifact_id
+            || proposal.kind != ArtifactKind::WorkflowProposal
+            || proposal.producer != "runtime.paper_provisioning"
+            || proposal.lifecycle != ArtifactLifecycle::RunScoped
+            || proposal
+                .origin
+                .as_ref()
+                .and_then(|origin| origin.run_id.as_ref())
+                != Some(&reservation.workflow.run.run_id)
+            || reservation.setup_artifacts.iter().any(|artifact| {
+                artifact.kind != ArtifactKind::EvidenceNeed
+                    || artifact.lifecycle != ArtifactLifecycle::RunScoped
+                    || artifact
+                        .origin
+                        .as_ref()
+                        .and_then(|origin| origin.run_id.as_ref())
+                        != Some(&reservation.workflow.run.run_id)
+            })
+        {
+            return Err(StoreError::InvalidSessionSlot(
+                reservation.session_key.clone(),
+            ));
+        }
+        reservation.workflow.graph.validate()?;
+        let graph: WorkflowGraph =
+            serde_json::from_slice(&self.read_blob(&reservation.workflow.graph.blob)?)?;
+        graph.validate()?;
+        if graph.nodes != reservation.workflow.nodes
+            || graph.topology_id != reservation.workflow.run.topology_id
+        {
+            return Err(StoreError::WorkflowGraphMismatch);
+        }
+        let proposal_payload: WorkflowProposal =
+            serde_json::from_slice(&self.read_blob(&proposal.blob)?)?;
+        let expected_sources = reservation
+            .setup_artifacts
+            .iter()
+            .map(|artifact| ArtifactRef {
+                artifact_id: artifact.artifact_id.clone(),
+                kind: artifact.kind,
+            })
+            .collect::<BTreeSet<_>>();
+        let actual_sources = proposal
+            .source_refs
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let payload_needs = proposal_payload
+            .tasks
+            .values()
+            .flat_map(|task| task.evidence_needs.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        let expected_sources = expected_sources
+            .into_iter()
+            .chain(payload_needs)
+            .collect::<BTreeSet<_>>();
+        if actual_sources != expected_sources {
+            return Err(StoreError::InvalidWorkflowProposalArtifact);
+        }
+        if proposal_payload.topology_id != reservation.workflow.run.topology_id {
+            return Err(StoreError::WorkflowGraphMismatch);
+        }
+        proposal.validate()?;
+        for artifact in &reservation.setup_artifacts {
+            artifact.validate()?;
+            self.read_blob(&artifact.blob)?;
+        }
+
+        let newly_reserved = {
+            let mut connection = self.connection.lock().expect("store connection poisoned");
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            assert_daemon_lease(&transaction, lease, reservation.reserved_at)?;
+            let exists = transaction
+                .query_row(
+                    "SELECT 1 FROM rebuild_session_slots WHERE session_key = ?1",
+                    params![reservation.session_key],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?;
+            if exists.is_some() {
+                transaction.commit()?;
+                false
+            } else {
+                for artifact in &reservation.setup_artifacts {
+                    insert_artifact(&transaction, artifact)?;
+                }
+                insert_artifact(&transaction, proposal)?;
+                Self::commit_workflow_transaction(&transaction, &reservation.workflow)?;
+                transaction.execute(
+                    "INSERT INTO rebuild_session_slots (session_key, run_id, topology_id, graph_artifact_id, run_created_at, scheduler_epoch, reserved_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        reservation.session_key,
+                        reservation.workflow.run.run_id.0,
+                        reservation.workflow.run.topology_id,
+                        reservation.workflow.run.graph_artifact_id.0.as_str(),
+                        reservation.workflow.run.created_at.to_rfc3339(),
+                        lease.epoch,
+                        reservation.reserved_at.to_rfc3339(),
+                    ],
+                )?;
+                transaction.commit()?;
+                true
+            }
+        };
+        let slot = self
+            .session_slot(&reservation.session_key)?
+            .ok_or_else(|| StoreError::Integrity("session slot missing after commit".to_owned()))?;
+        Ok(SessionSlotReservation {
+            slot,
+            newly_reserved,
+        })
+    }
+
     pub fn commit_workflow(&self, commit: &WorkflowCommit) -> StoreResult<()> {
         if commit.graph.kind != ArtifactKind::WorkflowGraph
             || commit.graph.artifact_id != commit.run.graph_artifact_id
@@ -9881,6 +10006,267 @@ mod tests {
             ),
             "{error}"
         );
+    }
+
+    #[test]
+    fn approved_paper_reservation_rejects_mismatched_proposal_and_keeps_store_atomic() {
+        let root = tempdir().unwrap();
+        let store = V2Store::open(root.path()).unwrap();
+        let now = Utc::now();
+        let lease = store
+            .acquire_daemon_lease("scheduler", "daemon-a", now, now + Duration::seconds(30))
+            .unwrap()
+            .unwrap();
+        let graph = graph();
+        let graph_artifact = artifact(
+            &store,
+            ArtifactKind::WorkflowGraph,
+            &serde_json::to_string(&graph).unwrap(),
+            None,
+        );
+        let run = StoredRun {
+            run_id: RunId::new(),
+            purpose: RunPurpose::Paper,
+            topology_id: graph.topology_id.clone(),
+            graph_artifact_id: graph_artifact.artifact_id.clone(),
+            created_at: now,
+        };
+        let workflow = WorkflowCommit {
+            run: run.clone(),
+            graph: graph_artifact,
+            nodes: graph.nodes,
+        };
+        let proposal_payload = WorkflowProposal {
+            schema_version: V2_SCHEMA_VERSION,
+            topology_id: run.topology_id.clone(),
+            tasks: BTreeMap::from([(
+                "analyst".to_owned(),
+                WorkflowProposalTask {
+                    recipe_id: TaskRecipeId::new("research.analyst").unwrap(),
+                    objective: "analyze".to_owned(),
+                    depends_on: vec![],
+                    priority: 50,
+                    evidence_needs: vec![],
+                },
+            )]),
+            stop_reason: Some("fixture".to_owned()),
+        };
+        let mut proposal = artifact(
+            &store,
+            ArtifactKind::WorkflowProposal,
+            &serde_json::to_string(&proposal_payload).unwrap(),
+            Some(ArtifactOrigin {
+                run_id: Some(run.run_id.clone()),
+                task_id: None,
+                attempt_id: None,
+                contract_hash: None,
+            }),
+        );
+        proposal.producer = "runtime.paper_provisioning".to_owned();
+        proposal.lifecycle = ArtifactLifecycle::RunScoped;
+        let reservation = SessionReservation {
+            session_key: "2026-08-12".to_owned(),
+            workflow,
+            setup_artifacts: vec![],
+            reserved_at: now,
+        };
+        let mut wrong_proposal = proposal.clone();
+        wrong_proposal.origin = Some(ArtifactOrigin {
+            run_id: Some(RunId::new()),
+            task_id: None,
+            attempt_id: None,
+            contract_hash: None,
+        });
+        assert!(matches!(
+            store.reserve_paper_session_with_proposal(&lease, &reservation, &wrong_proposal),
+            Err(StoreError::InvalidSessionSlot(_))
+        ));
+        assert!(store.session_slot("2026-08-12").unwrap().is_none());
+        assert!(matches!(
+            store.run_purpose(&run.run_id),
+            Err(StoreError::MissingRun(_))
+        ));
+        store.verify_integrity().unwrap();
+    }
+
+    #[test]
+    fn approved_paper_reservation_rejects_source_closure_mismatch_atomically() {
+        let root = tempdir().unwrap();
+        let store = V2Store::open(root.path()).unwrap();
+        let now = Utc::now();
+        let lease = store
+            .acquire_daemon_lease("scheduler", "daemon-a", now, now + Duration::seconds(30))
+            .unwrap()
+            .unwrap();
+        let graph = graph();
+        let graph_artifact = artifact(
+            &store,
+            ArtifactKind::WorkflowGraph,
+            &serde_json::to_string(&graph).unwrap(),
+            None,
+        );
+        let run = StoredRun {
+            run_id: RunId::new(),
+            purpose: RunPurpose::Paper,
+            topology_id: graph.topology_id.clone(),
+            graph_artifact_id: graph_artifact.artifact_id.clone(),
+            created_at: now,
+        };
+        let workflow = WorkflowCommit {
+            run: run.clone(),
+            graph: graph_artifact,
+            nodes: graph.nodes,
+        };
+        let setup = artifact(
+            &store,
+            ArtifactKind::EvidenceNeed,
+            "{}",
+            Some(ArtifactOrigin {
+                run_id: Some(run.run_id.clone()),
+                task_id: None,
+                attempt_id: None,
+                contract_hash: None,
+            }),
+        );
+        let proposal_payload = WorkflowProposal {
+            schema_version: V2_SCHEMA_VERSION,
+            topology_id: run.topology_id.clone(),
+            tasks: BTreeMap::from([(
+                "analyst".to_owned(),
+                WorkflowProposalTask {
+                    recipe_id: TaskRecipeId::new("research.analyst").unwrap(),
+                    objective: "analyze".to_owned(),
+                    depends_on: vec![],
+                    priority: 50,
+                    evidence_needs: vec![],
+                },
+            )]),
+            stop_reason: Some("fixture".to_owned()),
+        };
+        let mut proposal = artifact_with_refs(
+            &store,
+            ArtifactKind::WorkflowProposal,
+            &serde_json::to_string(&proposal_payload).unwrap(),
+            Some(ArtifactOrigin {
+                run_id: Some(run.run_id.clone()),
+                task_id: None,
+                attempt_id: None,
+                contract_hash: None,
+            }),
+            vec![],
+        );
+        proposal.producer = "runtime.paper_provisioning".to_owned();
+        proposal.artifact_id = ArtifactId(proposal.expected_hash().unwrap());
+        let reservation = SessionReservation {
+            session_key: "2026-08-12-source-closure".to_owned(),
+            workflow,
+            setup_artifacts: vec![setup],
+            reserved_at: now,
+        };
+        assert!(matches!(
+            store.reserve_paper_session_with_proposal(&lease, &reservation, &proposal),
+            Err(StoreError::InvalidWorkflowProposalArtifact)
+        ));
+        assert!(store
+            .session_slot("2026-08-12-source-closure")
+            .unwrap()
+            .is_none());
+        assert!(matches!(
+            store.run_purpose(&run.run_id),
+            Err(StoreError::MissingRun(_))
+        ));
+        store.verify_integrity().unwrap();
+    }
+
+    #[test]
+    fn approved_paper_reservation_is_idempotent_for_duplicate_session() {
+        let root = tempdir().unwrap();
+        let store = V2Store::open(root.path()).unwrap();
+        let now = Utc::now();
+        let lease = store
+            .acquire_daemon_lease("scheduler", "daemon-a", now, now + Duration::seconds(30))
+            .unwrap()
+            .unwrap();
+        let graph = graph();
+        let graph_artifact = artifact(
+            &store,
+            ArtifactKind::WorkflowGraph,
+            &serde_json::to_string(&graph).unwrap(),
+            None,
+        );
+        let run = StoredRun {
+            run_id: RunId::new(),
+            purpose: RunPurpose::Paper,
+            topology_id: graph.topology_id.clone(),
+            graph_artifact_id: graph_artifact.artifact_id.clone(),
+            created_at: now,
+        };
+        let workflow = WorkflowCommit {
+            run: run.clone(),
+            graph: graph_artifact,
+            nodes: graph.nodes,
+        };
+        let proposal_payload = WorkflowProposal {
+            schema_version: V2_SCHEMA_VERSION,
+            topology_id: run.topology_id.clone(),
+            tasks: BTreeMap::from([(
+                "analyst".to_owned(),
+                WorkflowProposalTask {
+                    recipe_id: TaskRecipeId::new("research.analyst").unwrap(),
+                    objective: "analyze".to_owned(),
+                    depends_on: vec![],
+                    priority: 50,
+                    evidence_needs: vec![],
+                },
+            )]),
+            stop_reason: Some("fixture".to_owned()),
+        };
+        let mut proposal = artifact(
+            &store,
+            ArtifactKind::WorkflowProposal,
+            &serde_json::to_string(&proposal_payload).unwrap(),
+            Some(ArtifactOrigin {
+                run_id: Some(run.run_id.clone()),
+                task_id: None,
+                attempt_id: None,
+                contract_hash: None,
+            }),
+        );
+        proposal.producer = "runtime.paper_provisioning".to_owned();
+        proposal.artifact_id = ArtifactId(proposal.expected_hash().unwrap());
+        let reservation = SessionReservation {
+            session_key: "2026-08-12".to_owned(),
+            workflow,
+            setup_artifacts: vec![],
+            reserved_at: now,
+        };
+        let first = store
+            .reserve_paper_session_with_proposal(&lease, &reservation, &proposal)
+            .unwrap();
+        let second = store
+            .reserve_paper_session_with_proposal(&lease, &reservation, &proposal)
+            .unwrap();
+        assert!(first.newly_reserved);
+        assert!(!second.newly_reserved);
+        assert_eq!(
+            first.slot.workflow.run.run_id,
+            second.slot.workflow.run.run_id
+        );
+        let successor = store
+            .acquire_daemon_lease(
+                "scheduler",
+                "daemon-b",
+                now + Duration::seconds(31),
+                now + Duration::seconds(61),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(successor.epoch, lease.epoch + 1);
+        assert!(matches!(
+            store.reserve_paper_session_with_proposal(&lease, &reservation, &proposal),
+            Err(StoreError::SchedulerFenced(_))
+        ));
+        store.verify_integrity().unwrap();
     }
 
     #[test]
