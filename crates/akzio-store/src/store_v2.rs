@@ -247,6 +247,21 @@ pub struct ClaimedAttempt {
     pub permit: TaskWritePermit,
 }
 
+/// Read-only proof of the task attempt that currently owns the succeeded
+/// task state. This is deliberately not a [`TaskWritePermit`]: completed
+/// parent attempts must never be revived as write authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SucceededAttemptProof {
+    pub run_id: RunId,
+    pub task_id: TaskId,
+    pub attempt_id: AttemptId,
+    pub lease_id: LeaseId,
+    pub epoch: u64,
+    pub contract_hash: Option<ContentHash>,
+    pub context_manifest: Option<ArtifactRef>,
+    pub outputs: Vec<Artifact>,
+}
+
 /// Result of atomically closing a failed attempt. The Store—not a handler—
 /// decides whether the retry budget allows another attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2784,8 +2799,9 @@ impl V2Store {
         if !status.is_terminal() {
             return Err(StoreError::TaskNotRunnable(permit.task_id.clone()));
         }
-        let connection = self.connection.lock().expect("store connection poisoned");
-        let current = connection
+        let mut connection = self.connection.lock().expect("store connection poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let current = transaction
             .query_row(
                 r#"SELECT t.run_id, t.status, t.active_attempt_id, t.contract_hash,
                           a.task_id, a.run_id, a.lease_id, a.epoch, a.status
@@ -3657,6 +3673,80 @@ impl V2Store {
     ) -> StoreResult<Vec<Artifact>> {
         let connection = self.connection.lock().expect("store connection poisoned");
         read_committed_attempt_outputs(&connection, None, task_id, attempt_id)
+    }
+
+    /// Returns the latest succeeded attempt for the task, including only
+    /// artifacts committed by that exact attempt. The query is intentionally
+    /// task-level and attempt-level in one read so an older parent attempt
+    /// cannot be projected after a later retry succeeds.
+    pub fn current_succeeded_attempt(
+        &self,
+        run_id: &RunId,
+        task_id: &TaskId,
+    ) -> StoreResult<SucceededAttemptProof> {
+        let mut connection = self.connection.lock().expect("store connection poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let current = transaction
+            .query_row(
+                r#"SELECT t.status, t.contract_hash, a.attempt_id, a.lease_id, a.epoch
+                   FROM rebuild_tasks AS t
+                   JOIN rebuild_attempts AS a ON a.task_id = t.task_id
+                   WHERE t.run_id = ?1 AND t.task_id = ?2
+                     AND t.status = 'succeeded' AND a.status = 'succeeded'
+                   ORDER BY a.finished_at DESC, a.attempt_id DESC
+                   LIMIT 1"#,
+                params![run_id.0, task_id.0],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, u64>(4)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::CommittedOutputTask {
+                run_id: run_id.clone(),
+                task_id: task_id.clone(),
+            })?;
+        let attempt_id = AttemptId(current.2);
+        let outputs =
+            read_committed_attempt_outputs(&transaction, Some(run_id), task_id, &attempt_id)?;
+        let context_manifest = transaction
+            .query_row(
+                r#"SELECT artifact_id
+                   FROM rebuild_events
+                   WHERE run_id = ?1 AND task_id = ?2 AND attempt_id = ?3
+                     AND event_type IN ('context.manifest_created',
+                                        'context.child_manifest_created')
+                     AND artifact_id IS NOT NULL
+                   ORDER BY event_id DESC
+                   LIMIT 1"#,
+                params![run_id.0, task_id.0, attempt_id.0],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|artifact_id| {
+                ContentHash::new(artifact_id).map(|artifact_id| ArtifactRef {
+                    artifact_id: ArtifactId(artifact_id),
+                    kind: ArtifactKind::ContextManifest,
+                })
+            })
+            .transpose()?;
+        let proof = SucceededAttemptProof {
+            run_id: run_id.clone(),
+            task_id: task_id.clone(),
+            attempt_id,
+            lease_id: LeaseId(current.3),
+            epoch: current.4,
+            contract_hash: current.1.map(ContentHash::new).transpose()?,
+            context_manifest,
+            outputs,
+        };
+        drop(transaction);
+        Ok(proof)
     }
 
     pub fn artifacts_referencing(

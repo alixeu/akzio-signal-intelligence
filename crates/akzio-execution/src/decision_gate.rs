@@ -375,19 +375,55 @@ impl V2DecisionRuntime {
             return Err(DecisionGateError::InvalidManifestClosure);
         }
 
+        self.validate_manifest_source_closure(manifest, &payload, permit, &mut BTreeSet::new())?;
         let selected = payload
             .selections
             .iter()
             .map(|selection| selection.artifact.clone())
+            .collect::<BTreeSet<_>>();
+        Ok(selected)
+    }
+
+    fn validate_manifest_source_closure(
+        &self,
+        manifest: &Artifact,
+        payload: &ContextManifestPayload,
+        permit: &TaskWritePermit,
+        visiting: &mut BTreeSet<ArtifactId>,
+    ) -> DecisionGateResult<()> {
+        if !visiting.insert(manifest.artifact_id.clone()) {
+            return Err(DecisionGateError::InvalidManifestClosure);
+        }
+        if payload.schema_version != V2_DOMAIN_SCHEMA_VERSION
+            || payload.selections.is_empty()
+            || payload.selections.iter().any(|selection| {
+                selection.reason.trim().is_empty() || selection.estimated_tokens == 0
+            })
+        {
+            return Err(DecisionGateError::InvalidManifestClosure);
+        }
+
+        let selected = payload
+            .selections
+            .iter()
+            .map(|selection| selection.artifact.clone())
+            .collect::<BTreeSet<_>>();
+        let ancestors = manifest
+            .source_refs
+            .iter()
+            .filter(|reference| reference.kind == ArtifactKind::ContextManifest)
+            .cloned()
             .collect::<BTreeSet<_>>();
         let declared = manifest
             .source_refs
             .iter()
             .cloned()
             .collect::<BTreeSet<_>>();
+        let mut expected = selected.clone();
+        expected.extend(ancestors.iter().cloned());
         if selected.len() != payload.selections.len()
             || declared.len() != manifest.source_refs.len()
-            || selected != declared
+            || declared != expected
             || payload.input_hash != manifest_input_hash(&payload.selections)?
         {
             return Err(DecisionGateError::InvalidManifestClosure);
@@ -397,7 +433,15 @@ impl V2DecisionRuntime {
         let mut estimated_tokens = 0_u32;
         for selection in &payload.selections {
             let artifact = self.store.artifact(&selection.artifact.artifact_id)?;
-            if artifact.kind != selection.artifact.kind {
+            if artifact.kind != selection.artifact.kind
+                || matches!(
+                    artifact.kind,
+                    ArtifactKind::RawEvidence
+                        | ArtifactKind::AgentTurn
+                        | ArtifactKind::ToolCall
+                        | ArtifactKind::ToolResult
+                )
+            {
                 return Err(DecisionGateError::InvalidManifestClosure);
             }
             let tokens = estimate_tokens(artifact.blob.bytes);
@@ -410,7 +454,35 @@ impl V2DecisionRuntime {
         if total_bytes != payload.total_bytes || estimated_tokens != payload.estimated_tokens {
             return Err(DecisionGateError::InvalidManifestClosure);
         }
-        Ok(selected)
+
+        for parent_ref in ancestors {
+            if selected.contains(&parent_ref) {
+                return Err(DecisionGateError::InvalidManifestClosure);
+            }
+            let parent = self.load_expected(&parent_ref, ArtifactKind::ContextManifest)?;
+            let Some(origin) = parent.origin.as_ref() else {
+                return Err(DecisionGateError::InvalidManifestClosure);
+            };
+            if parent.lifecycle != ArtifactLifecycle::RunScoped
+                || !parent.producer.starts_with("context.")
+                || parent.provenance.source_family != "akzio.context"
+                || origin.run_id.as_ref() != Some(&permit.run_id)
+                || origin.task_id.is_none()
+                || origin.attempt_id.is_none()
+                || origin.contract_hash.is_none()
+                || parent.provenance.producer_contract_hash != origin.contract_hash
+            {
+                return Err(DecisionGateError::InvalidManifestClosure);
+            }
+            let parent_payload: ContextManifestPayload =
+                serde_json::from_slice(&self.store.read_blob(&parent.blob)?)?;
+            if parent_payload.contract_hash != origin.contract_hash.clone().unwrap() {
+                return Err(DecisionGateError::InvalidManifestClosure);
+            }
+            self.validate_manifest_source_closure(&parent, &parent_payload, permit, visiting)?;
+        }
+        visiting.remove(&manifest.artifact_id);
+        Ok(())
     }
 
     fn validate_draft_closure(

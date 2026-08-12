@@ -1255,9 +1255,31 @@ impl AgentRuntime {
         {
             return Err(ResearchError::NodePolicyMismatch);
         }
-        let manifest =
+        let manifest = if let Some(parent_task_id) = &node.parent_task_id {
+            if !node.dependencies.contains(parent_task_id) {
+                return Err(ResearchError::InvalidOutput(
+                    "parent task is not a declared dependency".to_owned(),
+                ));
+            }
+            let proof = self
+                .store
+                .current_succeeded_attempt(&permit.run_id, parent_task_id)?;
+            let parent_contract_hash = proof.contract_hash.as_ref().ok_or_else(|| {
+                ResearchError::InvalidOutput("parent attempt has no contract hash".to_owned())
+            })?;
+            let parent_contract = &self.catalogue.get(parent_contract_hash)?.contract;
+            self.context.assemble_child_from_proof(
+                &proof,
+                parent_contract,
+                permit,
+                &installed.contract,
+                now,
+                self.grant_ttl,
+            )?
+        } else {
             self.context
-                .assemble(permit, &installed.contract, candidates, now, self.grant_ttl)?;
+                .assemble(permit, &installed.contract, candidates, now, self.grant_ttl)?
+        };
         if !manifest.grant.matches_permit(permit) {
             return Err(ResearchError::GrantPermitMismatch);
         }

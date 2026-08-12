@@ -59,6 +59,8 @@ pub enum RuntimeError {
     WorkflowFanoutLimit { task: String, recipe: TaskRecipeId },
     #[error("planner task {task} exceeds depth limit for recipe {recipe}")]
     WorkflowDepthLimit { task: String, recipe: TaskRecipeId },
+    #[error("agent task {task} has multiple direct agent dependencies")]
+    MultipleAgentParents { task: String },
     #[error("task lease duration must be positive")]
     InvalidTaskLeaseDuration,
     #[error("task retry backoff exceeds supported duration")]
@@ -1612,6 +1614,22 @@ impl WorkflowRuntime {
                         task.recipe_id.clone(),
                     ));
                 }
+                let agent_parents = task
+                    .depends_on
+                    .iter()
+                    .filter(|dependency| {
+                        proposal
+                            .tasks
+                            .get(*dependency)
+                            .and_then(|parent| self.catalogue.recipe(&parent.recipe_id).ok())
+                            .is_some_and(|parent| parent.task_class == RuntimeTaskClass::Agent)
+                    })
+                    .collect::<Vec<_>>();
+                if agent_parents.len() > 1 {
+                    return Err(RuntimeError::MultipleAgentParents {
+                        task: alias.clone(),
+                    });
+                }
                 Ok(WorkflowNode {
                     task_id: ids[alias].clone(),
                     recipe_id: recipe.recipe_id.clone(),
@@ -1627,7 +1645,9 @@ impl WorkflowRuntime {
                     budget: recipe.budget.clone(),
                     retry: recipe.retry.clone(),
                     on_failure: recipe.on_failure,
-                    parent_task_id: None,
+                    parent_task_id: agent_parents
+                        .first()
+                        .map(|dependency| ids[*dependency].clone()),
                 })
             })
             .collect()

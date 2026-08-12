@@ -8,7 +8,7 @@ use akzio_domain::{
     ContextPolicy, ContextProjection, ContextSelection, DomainError, Experience, PolicyState,
     ReadGrant, TaskWritePermit, V2_DOMAIN_SCHEMA_VERSION,
 };
-use akzio_store::v2::{StoreError, V2Store};
+use akzio_store::v2::{StoreError, SucceededAttemptProof, V2Store};
 use chrono::{DateTime, Duration, Utc};
 use serde::{de::DeserializeOwned, Serialize};
 use thiserror::Error;
@@ -72,11 +72,22 @@ impl ContextBroker {
         manifest: &ContextManifest,
         now: DateTime<Utc>,
     ) -> ContextResult<Vec<ArtifactRef>> {
+        self.policy_influences_internal(permit, contract, manifest, now, true)
+    }
+
+    fn policy_influences_internal(
+        &self,
+        permit: &TaskWritePermit,
+        contract: &AgentContract,
+        manifest: &ContextManifest,
+        now: DateTime<Utc>,
+        require_live_grant: bool,
+    ) -> ContextResult<Vec<ArtifactRef>> {
         contract.validate()?;
         if !manifest.grant.matches_permit(permit)
             || manifest.grant.contract_hash != contract.contract_hash
             || manifest.payload.contract_hash != contract.contract_hash
-            || manifest.grant.expires_at <= now
+            || (require_live_grant && manifest.grant.expires_at <= now)
         {
             return Err(ContextError::InvalidManifestClosure);
         }
@@ -131,7 +142,17 @@ impl ContextBroker {
             selected.push(selection.artifact.clone());
         }
         selected.sort();
-        if selected != persisted.source_refs
+        let mut expected_source_refs = selected.clone();
+        expected_source_refs.extend(
+            persisted
+                .source_refs
+                .iter()
+                .filter(|reference| reference.kind == ArtifactKind::ContextManifest)
+                .cloned(),
+        );
+        expected_source_refs.sort();
+        expected_source_refs.dedup();
+        if expected_source_refs != persisted.source_refs
             || manifest.grant.readable != readable
             || manifest.grant.raw_source_closure
                 != self.raw_closure(&contract.context, &persisted_payload.selections)?
@@ -309,8 +330,8 @@ impl ContextBroker {
     }
 
     /// Attenuate a persisted parent manifest into a child attempt grant.
-    /// Projection never adds artifacts: only parent-readable references that
-    /// the child contract also permits survive the intersection.
+    /// Projection may include parent outputs, but only from the current
+    /// succeeded attempt and only when their provenance closes to the parent.
     pub fn assemble_child(
         &self,
         parent_permit: &TaskWritePermit,
@@ -330,6 +351,16 @@ impl ContextBroker {
         if child_permit.run_id != parent_permit.run_id {
             return Err(ContextError::InvalidManifestClosure);
         }
+        let succeeded = self
+            .store
+            .current_succeeded_attempt(&parent_permit.run_id, &parent_permit.task_id)?;
+        if succeeded.attempt_id != parent_permit.attempt_id
+            || succeeded.lease_id != parent_permit.lease_id
+            || succeeded.epoch != parent_permit.epoch
+            || succeeded.contract_hash != parent_permit.contract_hash
+        {
+            return Err(ContextError::InvalidManifestClosure);
+        }
         if projection.parent_manifest.artifact_id != parent.artifact.artifact_id
             || projection.parent_manifest.kind != ArtifactKind::ContextManifest
         {
@@ -337,7 +368,7 @@ impl ContextBroker {
         }
 
         // Reuse the canonical persisted-manifest validation before projecting.
-        self.policy_influences(parent_permit, parent_contract, parent, now)?;
+        self.policy_influences_internal(parent_permit, parent_contract, parent, now, false)?;
 
         let parent_readable = parent
             .payload
@@ -352,31 +383,56 @@ impl ContextBroker {
         if parent.grant.readable != parent_readable_ids {
             return Err(ContextError::InvalidManifestClosure);
         }
-        if let Some(reference) = projection
+        let parent_raw_closure =
+            self.raw_closure(&parent_contract.context, &parent.payload.selections)?;
+        let needs_parent_outputs = projection
             .allowed
             .iter()
-            .find(|reference| !parent_readable.contains(*reference))
-        {
-            return Err(ContextError::GrantDenied {
-                manifest_id: parent.artifact.artifact_id.clone(),
-                artifact_id: reference.artifact_id.clone(),
-            });
+            .any(|reference| !parent_readable.contains(reference));
+        let parent_outputs = if needs_parent_outputs {
+            succeeded.outputs.clone()
+        } else {
+            Vec::new()
+        };
+        let mut allowed = Vec::with_capacity(projection.allowed.len());
+        for reference in &projection.allowed {
+            if is_trace_kind(reference.kind) {
+                return Err(ContextError::GrantDenied {
+                    manifest_id: parent.artifact.artifact_id.clone(),
+                    artifact_id: reference.artifact_id.clone(),
+                });
+            }
+            if parent_readable.contains(reference) {
+                allowed.push(self.store.artifact(&reference.artifact_id)?);
+                continue;
+            }
+            let Some(output) = parent_outputs.iter().find(|artifact| {
+                artifact.artifact_id == reference.artifact_id && artifact.kind == reference.kind
+            }) else {
+                return Err(ContextError::GrantDenied {
+                    manifest_id: parent.artifact.artifact_id.clone(),
+                    artifact_id: reference.artifact_id.clone(),
+                });
+            };
+            self.validate_parent_output_provenance(
+                output,
+                &projection.parent_manifest,
+                &parent_readable,
+                &parent_raw_closure,
+                parent_permit,
+                parent_contract,
+            )?;
+            allowed.push(output.clone());
         }
-        let allowed = projection
-            .allowed
-            .iter()
-            .filter(|reference| parent_readable.contains(*reference))
-            .cloned()
-            .collect::<Vec<_>>();
         let policy = &child_contract.context;
         let mut selections = Vec::with_capacity(allowed.len());
         let mut total_bytes = 0_u64;
         let mut estimated_tokens = 0_u32;
-        for reference in allowed {
-            let artifact = self.store.artifact(&reference.artifact_id)?;
-            if artifact.kind != reference.kind {
-                return Err(ContextError::InvalidManifestClosure);
-            }
+        for artifact in allowed {
+            let reference = ArtifactRef {
+                artifact_id: artifact.artifact_id.clone(),
+                kind: artifact.kind,
+            };
             self.assert_context_permitted(policy, &artifact)?;
             if !self.overlay_is_eligible(&artifact)? {
                 continue;
@@ -399,7 +455,7 @@ impl ContextBroker {
         }
 
         let raw_source_closure = self.raw_closure(policy, &selections)?;
-        if !raw_source_closure.is_subset(&parent.grant.raw_source_closure) {
+        if !raw_source_closure.is_subset(&parent_raw_closure) {
             return Err(ContextError::InvalidManifestClosure);
         }
         let payload = ContextManifestPayload {
@@ -467,6 +523,230 @@ impl ContextBroker {
         })
     }
 
+    /// Project the current succeeded parent attempt without reviving its
+    /// write permit. The proof is read-only Store state; the synthetic permit
+    /// exists only inside this validation path.
+    pub fn assemble_child_from_proof(
+        &self,
+        proof: &SucceededAttemptProof,
+        parent_contract: &AgentContract,
+        child_permit: &TaskWritePermit,
+        child_contract: &AgentContract,
+        now: DateTime<Utc>,
+        grant_ttl: Duration,
+    ) -> ContextResult<ContextManifest> {
+        let current = self
+            .store
+            .current_succeeded_attempt(&proof.run_id, &proof.task_id)?;
+        if &current != proof {
+            return Err(ContextError::InvalidManifestClosure);
+        }
+        let manifest_ref = proof
+            .context_manifest
+            .clone()
+            .ok_or(ContextError::InvalidManifestClosure)?;
+        let artifact = self.store.artifact(&manifest_ref.artifact_id)?;
+        if artifact.kind != ArtifactKind::ContextManifest {
+            return Err(ContextError::InvalidManifestClosure);
+        }
+        let payload: ContextManifestPayload = self.read_payload(&artifact)?;
+        // Parent manifest proves provenance; committed outputs are the child data surface.
+        let readable = proof
+            .outputs
+            .iter()
+            .map(|output| ArtifactRef {
+                artifact_id: output.artifact_id.clone(),
+                kind: output.kind,
+            })
+            .collect::<BTreeSet<_>>();
+        let projection = ContextProjection {
+            parent_manifest: manifest_ref,
+            allowed: readable.into_iter().collect(),
+            reason: "parent_attempt_projection".to_owned(),
+        };
+        let parent_permit = TaskWritePermit {
+            run_id: proof.run_id.clone(),
+            task_id: proof.task_id.clone(),
+            attempt_id: proof.attempt_id.clone(),
+            lease_id: proof.lease_id.clone(),
+            epoch: proof.epoch,
+            contract_hash: proof.contract_hash.clone(),
+        };
+        let parent =
+            self.restore_manifest_for_proof(proof, parent_contract, artifact, payload, now)?;
+        self.assemble_child(
+            &parent_permit,
+            parent_contract,
+            &parent,
+            &projection,
+            child_permit,
+            child_contract,
+            now,
+            grant_ttl,
+        )
+    }
+
+    fn validate_parent_output_provenance(
+        &self,
+        output: &Artifact,
+        parent_manifest: &ArtifactRef,
+        parent_readable: &BTreeSet<ArtifactRef>,
+        parent_raw_closure: &BTreeSet<ArtifactId>,
+        parent_permit: &TaskWritePermit,
+        parent_contract: &AgentContract,
+    ) -> ContextResult<()> {
+        if output.kind == ArtifactKind::RawEvidence || is_trace_kind(output.kind) {
+            return Err(ContextError::InvalidManifestClosure);
+        }
+        self.validate_parent_attempt_artifact(output, parent_permit, parent_contract)?;
+        self.validate_parent_output_sources(
+            output,
+            parent_manifest,
+            parent_readable,
+            parent_raw_closure,
+            parent_permit,
+            parent_contract,
+            &mut BTreeSet::new(),
+        )
+    }
+
+    fn validate_parent_output_sources(
+        &self,
+        artifact: &Artifact,
+        parent_manifest: &ArtifactRef,
+        parent_readable: &BTreeSet<ArtifactRef>,
+        parent_raw_closure: &BTreeSet<ArtifactId>,
+        parent_permit: &TaskWritePermit,
+        parent_contract: &AgentContract,
+        visiting: &mut BTreeSet<ArtifactId>,
+    ) -> ContextResult<()> {
+        if !visiting.insert(artifact.artifact_id.clone()) {
+            return Err(ContextError::InvalidManifestClosure);
+        }
+        for source in &artifact.source_refs {
+            let source_artifact = self.store.artifact(&source.artifact_id)?;
+            if source_artifact.kind != source.kind {
+                return Err(ContextError::InvalidManifestClosure);
+            }
+            if source == parent_manifest {
+                if source_artifact.kind != ArtifactKind::ContextManifest {
+                    return Err(ContextError::InvalidManifestClosure);
+                }
+                continue;
+            }
+            if source.kind == ArtifactKind::RawEvidence {
+                if !parent_raw_closure.contains(&source.artifact_id) {
+                    return Err(ContextError::InvalidManifestClosure);
+                }
+                continue;
+            }
+            if !is_trace_kind(source.kind) && parent_readable.contains(source) {
+                continue;
+            }
+            if !is_trace_kind(source.kind) {
+                return Err(ContextError::InvalidManifestClosure);
+            }
+            self.validate_parent_attempt_artifact(
+                &source_artifact,
+                parent_permit,
+                parent_contract,
+            )?;
+            self.validate_parent_output_sources(
+                &source_artifact,
+                parent_manifest,
+                parent_readable,
+                parent_raw_closure,
+                parent_permit,
+                parent_contract,
+                visiting,
+            )?;
+        }
+        visiting.remove(&artifact.artifact_id);
+        Ok(())
+    }
+
+    fn validate_parent_attempt_artifact(
+        &self,
+        artifact: &Artifact,
+        parent_permit: &TaskWritePermit,
+        parent_contract: &AgentContract,
+    ) -> ContextResult<()> {
+        artifact.validate()?;
+        if self.store.artifact(&artifact.artifact_id)? != *artifact {
+            return Err(ContextError::InvalidManifestClosure);
+        }
+        let Some(origin) = artifact.origin.as_ref() else {
+            return Err(ContextError::InvalidManifestClosure);
+        };
+        if origin.run_id.as_ref() != Some(&parent_permit.run_id)
+            || origin.task_id.as_ref() != Some(&parent_permit.task_id)
+            || origin.attempt_id.as_ref() != Some(&parent_permit.attempt_id)
+            || origin.contract_hash.as_ref() != Some(&parent_contract.contract_hash)
+            || artifact.provenance.producer_contract_hash.as_ref()
+                != Some(&parent_contract.contract_hash)
+        {
+            return Err(ContextError::InvalidManifestClosure);
+        }
+        Ok(())
+    }
+
+    fn restore_manifest_for_proof(
+        &self,
+        proof: &SucceededAttemptProof,
+        contract: &AgentContract,
+        artifact: Artifact,
+        payload: ContextManifestPayload,
+        now: DateTime<Utc>,
+    ) -> ContextResult<ContextManifest> {
+        contract.validate()?;
+        payload.validate(&contract.context)?;
+        let selected = payload
+            .selections
+            .iter()
+            .map(|selection| selection.artifact.clone())
+            .collect::<BTreeSet<_>>();
+        let mut expected_source_refs = selected.clone();
+        expected_source_refs.extend(
+            artifact
+                .source_refs
+                .iter()
+                .filter(|reference| reference.kind == ArtifactKind::ContextManifest)
+                .cloned(),
+        );
+        if artifact.kind != ArtifactKind::ContextManifest
+            || expected_source_refs != artifact.source_refs.iter().cloned().collect()
+        {
+            return Err(ContextError::InvalidManifestClosure);
+        }
+        let readable = payload
+            .selections
+            .iter()
+            .map(|selection| selection.artifact.artifact_id.clone())
+            .collect::<BTreeSet<_>>();
+        let raw_source_closure = self.raw_closure(&contract.context, &payload.selections)?;
+        Ok(ContextManifest {
+            artifact,
+            payload,
+            grant: ReadGrant {
+                manifest_artifact_id: proof
+                    .context_manifest
+                    .as_ref()
+                    .ok_or(ContextError::InvalidManifestClosure)?
+                    .artifact_id
+                    .clone(),
+                run_id: proof.run_id.clone(),
+                task_id: proof.task_id.clone(),
+                attempt_id: proof.attempt_id.clone(),
+                lease_id: proof.lease_id.clone(),
+                epoch: proof.epoch,
+                contract_hash: contract.contract_hash.clone(),
+                readable,
+                raw_source_closure,
+                expires_at: now,
+            },
+        })
+    }
+
     pub fn read(
         &self,
         grant: &ReadGrant,
@@ -480,6 +760,12 @@ impl ContextBroker {
             });
         }
         let artifact = self.store.artifact(artifact_id)?;
+        if is_trace_kind(artifact.kind) {
+            return Err(ContextError::GrantDenied {
+                manifest_id: grant.manifest_artifact_id.clone(),
+                artifact_id: artifact.artifact_id,
+            });
+        }
         if artifact.kind == ArtifactKind::RawEvidence {
             return Err(ContextError::RawEvidenceRequiresExplicitRead);
         }
@@ -499,6 +785,12 @@ impl ContextBroker {
             });
         }
         let artifact = self.store.artifact(artifact_id)?;
+        if is_trace_kind(artifact.kind) {
+            return Err(ContextError::GrantDenied {
+                manifest_id: grant.manifest_artifact_id.clone(),
+                artifact_id: artifact.artifact_id,
+            });
+        }
         if artifact.kind != ArtifactKind::RawEvidence {
             return Err(ContextError::ExpectedRawEvidence);
         }
@@ -694,6 +986,13 @@ fn context_rank(artifact: &Artifact) -> u8 {
         ArtifactKind::Experience | ArtifactKind::CandidatePolicy | ArtifactKind::Evaluation => 3,
         _ => 4,
     }
+}
+
+fn is_trace_kind(kind: ArtifactKind) -> bool {
+    matches!(
+        kind,
+        ArtifactKind::AgentTurn | ArtifactKind::ToolCall | ArtifactKind::ToolResult
+    )
 }
 
 fn overlay_state_is_eligible(kind: ArtifactKind, state: PolicyState) -> bool {
@@ -988,6 +1287,52 @@ mod tests {
             payload,
             grant,
         }
+    }
+
+    #[test]
+    fn restore_manifest_for_proof_accepts_parent_manifest_source_ref() {
+        let (_root, store, permit, contract, parent, _raw, now) = manifest_fixture();
+        let parent_ref = ArtifactRef {
+            artifact_id: parent.artifact.artifact_id.clone(),
+            kind: ArtifactKind::ContextManifest,
+        };
+        let nested = Artifact::new(
+            ArtifactKind::ContextManifest,
+            store.put_json(&parent.payload).unwrap(),
+            parent.artifact.producer.clone(),
+            ArtifactLifecycle::RunScoped,
+            parent.artifact.provenance.clone(),
+            parent.artifact.origin.clone(),
+            parent
+                .payload
+                .selections
+                .iter()
+                .map(|selection| selection.artifact.clone())
+                .chain(std::iter::once(parent_ref.clone()))
+                .collect(),
+            now,
+        )
+        .unwrap();
+        let proof = SucceededAttemptProof {
+            run_id: permit.run_id.clone(),
+            task_id: permit.task_id.clone(),
+            attempt_id: permit.attempt_id.clone(),
+            lease_id: permit.lease_id.clone(),
+            epoch: permit.epoch,
+            contract_hash: permit.contract_hash.clone(),
+            context_manifest: Some(ArtifactRef {
+                artifact_id: nested.artifact_id.clone(),
+                kind: ArtifactKind::ContextManifest,
+            }),
+            outputs: Vec::new(),
+        };
+
+        let restored = ContextBroker::new(store)
+            .restore_manifest_for_proof(&proof, &contract, nested, parent.payload, now)
+            .unwrap();
+
+        assert_eq!(restored.grant.readable.len(), 1);
+        assert!(!restored.grant.readable.contains(&parent_ref.artifact_id));
     }
 
     #[test]

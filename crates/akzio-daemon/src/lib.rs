@@ -1242,51 +1242,81 @@ impl Daemon {
             self.admit_context_candidate(&mut candidates, policy, reference)?;
         }
 
-        let dependencies = task
-            .node
-            .dependencies
-            .iter()
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        if !dependencies.is_empty() {
-            let snapshot = self.store.workflow_snapshot(&task.run_id)?;
-            for dependency in &dependencies {
-                let dependency_task = snapshot
-                    .tasks
-                    .iter()
-                    .find(|stored| stored.node.task_id == *dependency)
-                    .ok_or_else(|| {
-                        DaemonError::InvalidInput(format!(
-                            "task {} references missing dependency {dependency}",
-                            task.node.task_id
-                        ))
-                    })?;
-                if dependency_task.status != TaskStatus::Succeeded {
-                    return Err(DaemonError::UnfinishedDependency {
-                        task_id: task.node.task_id.clone(),
-                        dependency: dependency.clone(),
-                    });
-                }
+        if let Some(parent_task_id) = &task.node.parent_task_id {
+            if !task.node.dependencies.contains(parent_task_id) {
+                return Err(DaemonError::InvalidInput(format!(
+                    "agent task {} parent {parent_task_id} is not a dependency",
+                    task.node.task_id
+                )));
             }
-
-            for dependency in dependencies {
-                for artifact in self
-                    .store
-                    .committed_task_outputs(&task.run_id, &dependency)?
-                {
-                    self.admit_context_candidate(
-                        &mut candidates,
-                        policy,
-                        &ArtifactRef {
-                            artifact_id: artifact.artifact_id,
-                            kind: artifact.kind,
-                        },
-                    )?;
+            let snapshot = self.store.workflow_snapshot(&task.run_id)?;
+            let parent = snapshot
+                .tasks
+                .iter()
+                .find(|stored| stored.node.task_id == *parent_task_id)
+                .ok_or_else(|| {
+                    DaemonError::InvalidInput(format!(
+                        "task {} references missing parent {parent_task_id}",
+                        task.node.task_id
+                    ))
+                })?;
+            if parent.status != TaskStatus::Succeeded {
+                return Err(DaemonError::UnfinishedDependency {
+                    task_id: task.node.task_id.clone(),
+                    dependency: parent_task_id.clone(),
+                });
+            }
+            // AgentRuntime performs the durable parent proof and child projection.
+            // Keep daemon dispatch limited to dependency status/fencing checks.
+        } else {
+            let dependencies = task
+                .node
+                .dependencies
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            if !dependencies.is_empty() {
+                let snapshot = self.store.workflow_snapshot(&task.run_id)?;
+                for dependency in &dependencies {
+                    let dependency_task = snapshot
+                        .tasks
+                        .iter()
+                        .find(|stored| stored.node.task_id == *dependency)
+                        .ok_or_else(|| {
+                            DaemonError::InvalidInput(format!(
+                                "task {} references missing dependency {dependency}",
+                                task.node.task_id
+                            ))
+                        })?;
+                    if dependency_task.status != TaskStatus::Succeeded {
+                        return Err(DaemonError::UnfinishedDependency {
+                            task_id: task.node.task_id.clone(),
+                            dependency: dependency.clone(),
+                        });
+                    }
+                }
+                for dependency in dependencies {
+                    for artifact in self
+                        .store
+                        .committed_task_outputs(&task.run_id, &dependency)?
+                    {
+                        self.admit_context_candidate(
+                            &mut candidates,
+                            policy,
+                            &ArtifactRef {
+                                artifact_id: artifact.artifact_id,
+                                kind: artifact.kind,
+                            },
+                        )?;
+                    }
                 }
             }
         }
 
-        if candidates.is_empty() && task.node.recipe_id.as_str() != "research.planner" {
+        if candidates.is_empty()
+            && task.node.recipe_id.as_str() != "research.planner"
+            && task.node.parent_task_id.is_none()
+        {
             return Err(DaemonError::MissingTaskContext(task.node.task_id.clone()));
         }
         Ok(candidates.into_values().collect())

@@ -9,6 +9,6 @@ pub use crate::store_v2::{
     RetryTaskResult, SessionReservation, SessionSlot, SessionSlotReservation, ShadowPairCompletion,
     ShadowPairWriteResult, StoreAlert, StoreError, StoreMetrics, StoreResult as Result,
     StoredActiveAttempt, StoredContract, StoredEvent, StoredRun, StoredShadowPair, StoredTask,
-    StoredTaskSnapshot, V2Store, WorkflowCommit, WorkflowPatchCommit, WorkflowRevision,
-    WorkflowSnapshot,
+    StoredTaskSnapshot, SucceededAttemptProof, V2Store, WorkflowCommit, WorkflowPatchCommit,
+    WorkflowRevision, WorkflowSnapshot,
 };
