@@ -100,6 +100,10 @@ pub enum StoreError {
     DuplicateExecutionReprice(String),
     #[error("invalid Paper reprice intent")]
     InvalidExecutionReprice,
+    #[error("invalid Paper effect artifact {0}")]
+    InvalidPaperEffect(ArtifactId),
+    #[error("Paper effect {0} has no durable intent")]
+    MissingPaperEffectIntent(ArtifactId),
     #[error("canonical learning requires a Paper run, got {0:?}")]
     NonCanonicalLearningPurpose(RunPurpose),
     #[error("outcome artifact {0} is not sealed")]
@@ -3020,6 +3024,119 @@ impl V2Store {
         assert_daemon_lease(&transaction, lease, now)?;
         commit_attempt_transaction(&transaction, permit, artifacts, status, now)?;
         transaction.commit()?;
+        Ok(())
+    }
+
+    /// Record a broker effect intent before any Paper adapter I/O. The event
+    /// is audit-only; it never grants broker authority or claims exactly-once.
+    pub fn record_paper_effect_intent(
+        &self,
+        lease: &DaemonLease,
+        permit: &TaskWritePermit,
+        effect: &ArtifactRef,
+        now: DateTime<Utc>,
+    ) -> StoreResult<bool> {
+        self.validate_paper_effect_artifact(effect, &permit.run_id)?;
+        let mut connection = self.connection.lock().expect("store connection poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        assert_daemon_lease(&transaction, lease, now)?;
+        assert_permit(&transaction, permit)?;
+        assert_paper_run(&transaction, &permit.run_id)?;
+        assert_paper_effect_artifact(&transaction, effect, &permit.run_id)?;
+        let already_recorded =
+            paper_effect_intent_exists(&transaction, &permit.run_id, &effect.artifact_id)?;
+        if already_recorded {
+            transaction.commit()?;
+            return Ok(true);
+        }
+        append_event(
+            &transaction,
+            &permit.run_id,
+            Some(&permit.task_id),
+            Some(&permit.attempt_id),
+            LifecycleEventType::ExecutionEffectIntent.as_str(),
+            Some(&effect.artifact_id),
+            now,
+        )?;
+        transaction.commit()?;
+        Ok(false)
+    }
+
+    /// Commit Paper reconciliation artifacts and the effect settlement marker
+    /// under the same daemon lease/attempt fence and SQLite transaction.
+    pub fn commit_fenced_attempt_with_effect(
+        &self,
+        lease: &DaemonLease,
+        permit: &TaskWritePermit,
+        artifacts: &[Artifact],
+        effect: &ArtifactRef,
+        recovered: bool,
+        now: DateTime<Utc>,
+    ) -> StoreResult<()> {
+        self.validate_attempt_commit(permit, artifacts, TaskStatus::Succeeded)?;
+        self.validate_paper_effect_artifact(effect, &permit.run_id)?;
+        let mut connection = self.connection.lock().expect("store connection poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        assert_daemon_lease(&transaction, lease, now)?;
+        assert_permit(&transaction, permit)?;
+        assert_paper_effect_artifact(&transaction, effect, &permit.run_id)?;
+        if !paper_effect_intent_exists(&transaction, &permit.run_id, &effect.artifact_id)? {
+            return Err(StoreError::MissingPaperEffectIntent(
+                effect.artifact_id.clone(),
+            ));
+        }
+        commit_attempt_transaction_with_effect(
+            &transaction,
+            permit,
+            artifacts,
+            TaskStatus::Succeeded,
+            Some((
+                effect,
+                if recovered {
+                    LifecycleEventType::ExecutionEffectRecovered
+                } else {
+                    LifecycleEventType::ExecutionEffectSettled
+                },
+            )),
+            now,
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn validate_paper_effect_artifact(
+        &self,
+        effect: &ArtifactRef,
+        run_id: &RunId,
+    ) -> StoreResult<()> {
+        let artifact = self.artifact(&effect.artifact_id)?;
+        if effect.kind != artifact.kind
+            || !matches!(
+                artifact.kind,
+                ArtifactKind::ExecutionCommitment | ArtifactKind::ExecutionReprice
+            )
+            || artifact.lifecycle != ArtifactLifecycle::Canonical
+            || artifact
+                .origin
+                .as_ref()
+                .and_then(|origin| origin.run_id.as_ref())
+                != Some(run_id)
+        {
+            return Err(StoreError::InvalidPaperEffect(effect.artifact_id.clone()));
+        }
+        match artifact.kind {
+            ArtifactKind::ExecutionCommitment => {
+                let payload: PaperCommitment =
+                    serde_json::from_slice(&self.read_blob(&artifact.blob)?)?;
+                payload.validate()?;
+            }
+            ArtifactKind::ExecutionReprice => {
+                let payload: PaperReprice =
+                    serde_json::from_slice(&self.read_blob(&artifact.blob)?)?;
+                payload.validate()?;
+            }
+            _ => unreachable!("validated Paper effect kind"),
+        }
         Ok(())
     }
 
@@ -6380,6 +6497,46 @@ fn assert_daemon_lease(
     Ok(())
 }
 
+fn assert_paper_effect_artifact(
+    transaction: &Transaction<'_>,
+    effect: &ArtifactRef,
+    run_id: &RunId,
+) -> StoreResult<()> {
+    let artifact = read_artifact(transaction, &effect.artifact_id)?;
+    if effect.kind != artifact.kind
+        || !matches!(
+            artifact.kind,
+            ArtifactKind::ExecutionCommitment | ArtifactKind::ExecutionReprice
+        )
+        || artifact.lifecycle != ArtifactLifecycle::Canonical
+        || artifact
+            .origin
+            .as_ref()
+            .and_then(|origin| origin.run_id.as_ref())
+            != Some(run_id)
+    {
+        return Err(StoreError::InvalidPaperEffect(effect.artifact_id.clone()));
+    }
+    Ok(())
+}
+
+fn paper_effect_intent_exists(
+    transaction: &Transaction<'_>,
+    run_id: &RunId,
+    effect_id: &ArtifactId,
+) -> StoreResult<bool> {
+    let found = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM rebuild_events WHERE run_id = ?1 AND event_type = ?2 AND artifact_id = ?3)",
+        params![
+            run_id.0,
+            LifecycleEventType::ExecutionEffectIntent.as_str(),
+            effect_id.0.as_str(),
+        ],
+        |row| row.get::<_, i64>(0),
+    )?;
+    Ok(found != 0)
+}
+
 fn assert_idempotent_outcome_schedule_commit(
     transaction: &Transaction<'_>,
     permit: &TaskWritePermit,
@@ -6486,6 +6643,17 @@ fn commit_attempt_transaction(
     status: TaskStatus,
     now: DateTime<Utc>,
 ) -> StoreResult<()> {
+    commit_attempt_transaction_with_effect(transaction, permit, artifacts, status, None, now)
+}
+
+fn commit_attempt_transaction_with_effect(
+    transaction: &Transaction<'_>,
+    permit: &TaskWritePermit,
+    artifacts: &[Artifact],
+    status: TaskStatus,
+    effect_event: Option<(&ArtifactRef, LifecycleEventType)>,
+    now: DateTime<Utc>,
+) -> StoreResult<()> {
     assert_permit(transaction, permit)?;
     let (_, on_failure) = task_retry_policy(transaction, &permit.task_id)?;
     for artifact in artifacts {
@@ -6507,6 +6675,17 @@ fn commit_attempt_transaction(
         if status == TaskStatus::Succeeded {
             record_attempt_output(transaction, permit, &artifact.artifact_id, event_id)?;
         }
+    }
+    if let Some((effect, event_type)) = effect_event {
+        append_event(
+            transaction,
+            &permit.run_id,
+            Some(&permit.task_id),
+            Some(&permit.attempt_id),
+            event_type.as_str(),
+            Some(&effect.artifact_id),
+            now,
+        )?;
     }
     finish_permitted_task(
         transaction,

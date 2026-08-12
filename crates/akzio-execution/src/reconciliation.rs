@@ -179,6 +179,22 @@ impl V2ReconciliationRuntime {
         Ok(())
     }
 
+    pub fn commit_with_effect(
+        &self,
+        lease: &DaemonLease,
+        permit: &TaskWritePermit,
+        output: &ReconciliationOutput,
+        effect: &ArtifactRef,
+        recovered: bool,
+        now: DateTime<Utc>,
+    ) -> ReconciliationResult<()> {
+        let mut artifacts = output.receipts.clone();
+        artifacts.push(output.reconciliation.clone());
+        self.store
+            .commit_fenced_attempt_with_effect(lease, permit, &artifacts, effect, recovered, now)?;
+        Ok(())
+    }
+
     fn load_expected(
         &self,
         reference: &ArtifactRef,

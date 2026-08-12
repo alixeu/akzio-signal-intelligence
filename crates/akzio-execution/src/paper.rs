@@ -278,6 +278,12 @@ impl V2PaperDispatchRuntime {
         self.ensure_unfrozen()?;
         self.store.validate_daemon_lease(&input.lease, Utc::now())?;
         self.store.validate_task_permit(&input.permit)?;
+        let recovered = self.store.record_paper_effect_intent(
+            &input.lease,
+            &input.permit,
+            &input.commitment,
+            input.now,
+        )?;
         let submitted = broker.execute_commitment(&commitment, &plan).await?;
         if submitted.plan_hash != commitment.plan_hash {
             return Err(PaperDispatchError::BrokerPlanHashMismatch);
@@ -300,7 +306,14 @@ impl V2PaperDispatchRuntime {
             broker_receipts,
             now: input.now,
         })?;
-        reconciliation_runtime.commit(&input.lease, &input.permit, &reconciliation, Utc::now())?;
+        reconciliation_runtime.commit_with_effect(
+            &input.lease,
+            &input.permit,
+            &reconciliation,
+            &input.commitment,
+            recovered,
+            Utc::now(),
+        )?;
 
         Ok(PaperDispatchOutput {
             commitment: commitment_artifact,
@@ -406,6 +419,12 @@ impl V2PaperDispatchRuntime {
         self.ensure_unfrozen()?;
         self.store.validate_daemon_lease(&input.lease, Utc::now())?;
         self.store.validate_task_permit(&input.permit)?;
+        let recovered = self.store.record_paper_effect_intent(
+            &input.lease,
+            &input.permit,
+            &input.reprice,
+            input.now,
+        )?;
         let receipt = broker
             .replace_commitment_once(&commitment, &reprice, &replacement)
             .await?;
@@ -431,7 +450,14 @@ impl V2PaperDispatchRuntime {
             broker_receipts,
             now: input.now,
         })?;
-        reconciliation_runtime.commit(&input.lease, &input.permit, &reconciliation, Utc::now())?;
+        reconciliation_runtime.commit_with_effect(
+            &input.lease,
+            &input.permit,
+            &reconciliation,
+            &input.reprice,
+            recovered,
+            Utc::now(),
+        )?;
 
         Ok(PaperDispatchOutput {
             commitment: commitment_artifact,

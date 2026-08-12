@@ -11,9 +11,9 @@ use std::{
 use akzio_domain::{
     Artifact, ArtifactId, ArtifactKind, ArtifactLifecycle, ArtifactOrigin, ArtifactProvenance,
     ArtifactRef, Asset, ContentHash, ExecutionContext, ExecutionVerdict, FactorExposure,
-    FailureDisposition, PaperCommitment, PaperCommitmentId, Reconciliation, ReconciliationState,
-    RetryPolicy, RunId, RunPurpose, TargetPortfolio, TaskBudget, TaskId, TaskRecipeId,
-    TaskWritePermit, WeightPpm, WorkflowGraph, WorkflowNode, V2_SCHEMA_VERSION,
+    FailureDisposition, LifecycleEventType, PaperCommitment, PaperCommitmentId, Reconciliation,
+    ReconciliationState, RetryPolicy, RunId, RunPurpose, TargetPortfolio, TaskBudget, TaskId,
+    TaskRecipeId, TaskWritePermit, WeightPpm, WorkflowGraph, WorkflowNode, V2_SCHEMA_VERSION,
 };
 use akzio_execution::{
     paper::{
@@ -641,6 +641,7 @@ async fn partial_then_filled_reprice_uses_one_durable_lineage() {
         .unwrap()
         .unwrap()
         .permit;
+    let run_id = dispatch_permit.run_id.clone();
     let broker = FakeCommittedBroker::new(["partially_filled", "filled"]);
     let runtime = V2PaperDispatchRuntime::new(store.clone());
     let output = runtime
@@ -671,6 +672,14 @@ async fn partial_then_filled_reprice_uses_one_durable_lineage() {
         receipt.state,
         akzio_domain::OrderReceiptState::PartiallyFilled
     );
+    assert!(store
+        .events_after(&run_id, 0, 100)
+        .unwrap()
+        .iter()
+        .any(|event| {
+            event.artifact_id.as_ref() == Some(&commitment.artifact_id)
+                && event.event_type == LifecycleEventType::ExecutionEffectSettled.as_str()
+        }));
 
     let reprice_permit = store
         .claim_next_task("reprice-worker", now, Duration::seconds(30))
@@ -718,6 +727,14 @@ async fn partial_then_filled_reprice_uses_one_durable_lineage() {
     assert_eq!(reconciliation.state, ReconciliationState::Complete);
     assert_eq!(broker.actual_submit_calls.load(Ordering::SeqCst), 1);
     assert_eq!(broker.reprice_calls.load(Ordering::SeqCst), 1);
+    assert!(store
+        .events_after(&run_id, 0, 100)
+        .unwrap()
+        .iter()
+        .any(|event| {
+            event.artifact_id.as_ref() == Some(&reprice.reprice.artifact_id)
+                && event.event_type == LifecycleEventType::ExecutionEffectSettled.as_str()
+        }));
 
     let duplicate_permit = store
         .claim_next_task("duplicate-worker", now, Duration::seconds(30))
@@ -758,6 +775,7 @@ async fn stale_scheduler_epoch_never_calls_broker() {
         .unwrap()
         .unwrap()
         .permit;
+    let run_id = dispatch_permit.run_id.clone();
     let takeover_at = now + Duration::seconds(31);
     store
         .acquire_daemon_lease(
@@ -786,6 +804,14 @@ async fn stale_scheduler_epoch_never_calls_broker() {
     assert_eq!(broker.execute_calls.load(Ordering::SeqCst), 0);
     assert_eq!(broker.reconcile_calls.load(Ordering::SeqCst), 0);
     assert_eq!(broker.reprice_calls.load(Ordering::SeqCst), 0);
+    assert!(!store
+        .events_after(&run_id, 0, 100)
+        .unwrap()
+        .iter()
+        .any(|event| {
+            event.artifact_id.as_ref() == Some(&commitment.artifact_id)
+                && event.event_type == LifecycleEventType::ExecutionEffectIntent.as_str()
+        }));
 }
 
 #[tokio::test]
@@ -802,6 +828,7 @@ async fn crash_after_submit_reuses_durable_client_order_id() {
         .unwrap()
         .unwrap()
         .permit;
+    let run_id = first_permit.run_id.clone();
     let broker = FakeCommittedBroker::new(["filled"]);
     broker.fail_next_reconcile();
     let runtime = V2PaperDispatchRuntime::new(store.clone());
@@ -858,6 +885,32 @@ async fn crash_after_submit_reuses_durable_client_order_id() {
     assert_eq!(broker.lookup_calls.load(Ordering::SeqCst), 1);
     assert_eq!(broker.execute_calls.load(Ordering::SeqCst), 2);
     assert_eq!(broker.reconcile_calls.load(Ordering::SeqCst), 2);
+    let events = store.events_after(&run_id, 0, 100).unwrap();
+    let intent = events
+        .iter()
+        .find(|event| {
+            event.artifact_id.as_ref() == Some(&commitment.artifact_id)
+                && event.event_type == LifecycleEventType::ExecutionEffectIntent.as_str()
+        })
+        .expect("Paper effect intent is durable before broker I/O");
+    let recovered = events
+        .iter()
+        .find(|event| {
+            event.artifact_id.as_ref() == Some(&commitment.artifact_id)
+                && event.event_type == LifecycleEventType::ExecutionEffectRecovered.as_str()
+        })
+        .expect("retry settles the existing Paper effect as recovered");
+    assert!(intent.cursor < recovered.cursor);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| {
+                event.artifact_id.as_ref() == Some(&commitment.artifact_id)
+                    && event.event_type == LifecycleEventType::ExecutionEffectIntent.as_str()
+            })
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]
