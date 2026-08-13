@@ -1252,6 +1252,7 @@ impl AgentRuntime {
         model: &dyn AgentModel,
         now: DateTime<Utc>,
     ) -> ResearchResult<Artifact> {
+        self.store.validate_task_permit(permit)?;
         let contract_hash = node
             .contract_hash
             .as_ref()
@@ -1344,6 +1345,7 @@ impl AgentRuntime {
             let request_hash = model_request_hash(&request)?;
             let mut turn_attempt = 1_u8;
             let turn = loop {
+                self.store.validate_task_permit(permit)?;
                 match model.turn(request.clone()).await {
                     Ok(turn) => break turn,
                     Err(error) => {
@@ -3152,6 +3154,41 @@ mod tests {
             Err(ResearchError::Context(ContextError::GrantDenied { .. }))
         ));
         store.verify_integrity().unwrap();
+    }
+
+    #[tokio::test]
+    async fn agent_runtime_rejects_a_stale_permit_before_model_call() {
+        let Fixture {
+            _root,
+            store,
+            catalogue,
+            claimed,
+            evidence,
+        } = fixture_with(|_| {});
+        let runtime = AgentRuntime::new(store, catalogue, Duration::minutes(5));
+        let model = ToolThenOutputModel {
+            evidence_id: evidence.artifact_id.clone(),
+            calls: AtomicU8::new(0),
+        };
+        let mut stale_permit = claimed.permit.clone();
+        stale_permit.epoch = stale_permit.epoch.saturating_add(1);
+
+        assert!(matches!(
+            runtime
+                .run(
+                    &stale_permit,
+                    &claimed.node,
+                    [ArtifactRef {
+                        artifact_id: evidence.artifact_id,
+                        kind: ArtifactKind::NormalizedEvidence,
+                    }],
+                    &model,
+                    Utc::now(),
+                )
+                .await,
+            Err(ResearchError::Store(StoreError::StalePermit(_)))
+        ));
+        assert_eq!(model.calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
