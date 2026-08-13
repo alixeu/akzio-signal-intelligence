@@ -12312,6 +12312,147 @@ mod tests {
     }
 
     #[test]
+    fn paper_effect_intent_is_idempotent_and_settlement_requires_intent() {
+        let fixture = execution_commit_fixture();
+        let effect = artifact_ref(&fixture.commitment);
+        fixture
+            .store
+            .write_task_artifact(
+                &fixture.permit,
+                &fixture.commitment,
+                LifecycleEventType::ExecutionCommitted,
+                fixture.now,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            fixture.store.commit_fenced_attempt_with_effect(
+                &fixture.lease,
+                &fixture.permit,
+                std::slice::from_ref(&fixture.commitment),
+                &effect,
+                false,
+                fixture.now,
+            ),
+            Err(StoreError::MissingPaperEffectIntent(_))
+        ));
+
+        assert!(!fixture
+            .store
+            .record_paper_effect_intent(
+                &fixture.lease,
+                &fixture.permit,
+                &effect,
+                fixture.now,
+            )
+            .unwrap());
+        assert!(fixture
+            .store
+            .record_paper_effect_intent(
+                &fixture.lease,
+                &fixture.permit,
+                &effect,
+                fixture.now,
+            )
+            .unwrap());
+
+        let intent_count = fixture
+            .store
+            .events_after(&fixture.permit.run_id, 0, 100)
+            .unwrap()
+            .into_iter()
+            .filter(|event| {
+                event.event_type == LifecycleEventType::ExecutionEffectIntent.as_str()
+                    && event.artifact_id.as_ref() == Some(&effect.artifact_id)
+            })
+            .count();
+        assert_eq!(intent_count, 1);
+    }
+
+    #[test]
+    fn paper_effect_settlement_rolls_back_and_can_retry_after_failure() {
+        let fixture = execution_commit_fixture();
+        let effect = artifact_ref(&fixture.commitment);
+        fixture
+            .store
+            .write_task_artifact(
+                &fixture.permit,
+                &fixture.commitment,
+                LifecycleEventType::ExecutionCommitted,
+                fixture.now,
+            )
+            .unwrap();
+        fixture
+            .store
+            .record_paper_effect_intent(
+                &fixture.lease,
+                &fixture.permit,
+                &effect,
+                fixture.now,
+            )
+            .unwrap();
+        {
+            let connection = fixture.store.connection.lock().unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TRIGGER fail_paper_effect_settlement BEFORE INSERT ON rebuild_events \
+                     WHEN NEW.event_type = 'execution.effect.settled' \
+                     BEGIN SELECT RAISE(ABORT, 'injected settlement failure'); END;",
+                )
+                .unwrap();
+        }
+
+        assert!(matches!(
+            fixture.store.commit_fenced_attempt_with_effect(
+                &fixture.lease,
+                &fixture.permit,
+                std::slice::from_ref(&fixture.commitment),
+                &effect,
+                false,
+                fixture.now,
+            ),
+            Err(StoreError::Sql(_))
+        ));
+        assert!(fixture
+            .store
+            .events_after(&fixture.permit.run_id, 0, 100)
+            .unwrap()
+            .iter()
+            .all(|event| event.event_type != LifecycleEventType::ExecutionEffectSettled.as_str()));
+
+        {
+            let connection = fixture.store.connection.lock().unwrap();
+            connection
+                .execute_batch("DROP TRIGGER fail_paper_effect_settlement;")
+                .unwrap();
+        }
+        fixture
+            .store
+            .commit_fenced_attempt_with_effect(
+                &fixture.lease,
+                &fixture.permit,
+                std::slice::from_ref(&fixture.commitment),
+                &effect,
+                false,
+                fixture.now,
+            )
+            .unwrap();
+        assert!(matches!(
+            fixture.store.commit_fenced_attempt_with_effect(
+                &fixture.lease,
+                &fixture.permit,
+                std::slice::from_ref(&fixture.commitment),
+                &effect,
+                false,
+                fixture.now,
+            ),
+            Err(StoreError::StalePermit(_))
+                | Err(StoreError::PaperEffectAlreadySettled(_))
+        ));
+        fixture.store.verify_integrity().unwrap();
+    }
+
+    #[test]
     fn metrics_are_empty_for_a_new_store() {
         let directory = tempdir().unwrap();
         let store = V2Store::open(directory.path()).unwrap();
