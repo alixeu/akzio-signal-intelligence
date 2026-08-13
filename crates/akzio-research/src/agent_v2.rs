@@ -18,7 +18,7 @@ use akzio_model::{
     ModelCallTrace, ModelCapabilitySnapshot, ModelClient, ModelError, ModelRequest,
     ModelToolDefinition,
 };
-use akzio_runtime::v2::{RecipeCatalogue, RuntimeError, TerminalRecipeSet};
+use akzio_runtime::v2::{RecipeCatalogue, RetryCause, RuntimeError, TerminalRecipeSet};
 use akzio_store::v2::{StoreError, StoredContract, V2Store};
 use chrono::{DateTime, Duration, Utc};
 use futures::future::BoxFuture;
@@ -105,6 +105,19 @@ pub enum ResearchError {
     WallTimeExceeded { maximum_secs: u32 },
     #[error("Agent completed without a final output")]
     MissingFinalOutput,
+}
+
+impl ResearchError {
+    pub fn retry_cause(&self) -> Option<RetryCause> {
+        match self {
+            Self::InvalidOutput(_) | Self::MissingFinalOutput => Some(RetryCause::InvalidOutput),
+            Self::ModelDebug {
+                error_class: "invalid_output",
+                ..
+            } => Some(RetryCause::InvalidOutput),
+            _ => None,
+        }
+    }
 }
 
 pub type ResearchResult<T> = Result<T, ResearchError>;
@@ -1972,10 +1985,10 @@ fn model_client_error(error: ModelError, trace: Option<ModelCallTrace>) -> Resea
             trace,
         };
     }
-    if error_class == "rate_limited" {
-        ResearchError::RateLimited(message)
-    } else {
-        ResearchError::Model(message)
+    match error_class {
+        "rate_limited" => ResearchError::RateLimited(message),
+        "invalid_output" => ResearchError::InvalidOutput(message),
+        _ => ResearchError::Model(message),
     }
 }
 
@@ -2377,6 +2390,42 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn missing_model_output_keeps_invalid_output_classification() {
+        assert!(matches!(
+            model_client_error(ModelError::MissingOutput, None),
+            ResearchError::InvalidOutput(_)
+        ));
+    }
+
+    #[test]
+    fn only_invalid_output_errors_request_task_retry() {
+        let invalid = [
+            ResearchError::InvalidOutput("invalid JSON".to_owned()),
+            ResearchError::MissingFinalOutput,
+            ResearchError::ModelDebug {
+                error_class: "invalid_output",
+                message: "missing field".to_owned(),
+                trace: ModelCallTrace {
+                    request: json!({}),
+                    result: json!({}),
+                },
+            },
+        ];
+
+        assert!(invalid
+            .iter()
+            .all(|error| error.retry_cause() == Some(RetryCause::InvalidOutput)));
+        assert_eq!(
+            ResearchError::Model("transport".to_owned()).retry_cause(),
+            None
+        );
+        assert_eq!(
+            ResearchError::ToolNotGranted("read_artifact".to_owned()).retry_cause(),
+            None
+        );
+    }
 
     #[derive(Debug)]
     struct ToolThenOutputModel {

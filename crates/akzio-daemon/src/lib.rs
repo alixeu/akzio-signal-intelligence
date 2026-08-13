@@ -615,7 +615,12 @@ impl Daemon {
                     error = %error,
                     "v2 daemon task failed closed"
                 );
-                TaskCompletion::Failed
+                match error {
+                    DaemonError::Research(error) => error
+                        .retry_cause()
+                        .map_or(TaskCompletion::Failed, TaskCompletion::Retry),
+                    _ => TaskCompletion::Failed,
+                }
             }
         }
     }
@@ -2312,6 +2317,41 @@ mod tests {
             .unwrap()
             .iter()
             .any(|event| event.event_type == "task.succeeded"));
+        daemon.store().verify_integrity().unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_agent_output_requests_task_retry() {
+        let directory = tempdir().unwrap();
+        let daemon = Daemon::with_model(
+            config(directory.path().to_path_buf()),
+            ModelClient::fixture_sequence([response(serde_json::json!({}))]),
+        )
+        .unwrap();
+        let run_id = daemon.submit_default(RunPurpose::Debug).unwrap();
+        let task = daemon
+            .store()
+            .claim_next_task("invalid-output", Utc::now(), ChronoDuration::seconds(30))
+            .unwrap()
+            .expect("planner task");
+
+        assert_eq!(task.node.recipe_id.as_str(), "research.planner");
+        assert_eq!(
+            daemon.execute_task(task).await,
+            TaskCompletion::Retry(RetryCause::InvalidOutput)
+        );
+        assert!(daemon
+            .store()
+            .events_after(&run_id, 0, 64)
+            .unwrap()
+            .iter()
+            .any(|event| event.event_type == "agent.turn_completed"));
+        assert!(!daemon
+            .store()
+            .events_after(&run_id, 0, 64)
+            .unwrap()
+            .iter()
+            .any(|event| event.event_type == "task.failed"));
         daemon.store().verify_integrity().unwrap();
     }
 
