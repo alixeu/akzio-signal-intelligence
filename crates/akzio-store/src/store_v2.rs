@@ -73,6 +73,11 @@ pub enum StoreError {
     StalePermit(TaskId),
     #[error("task write permit origin does not match artifact")]
     PermitOriginMismatch,
+    #[error("task artifact lifecycle {lifecycle:?} is not allowed for {purpose:?} run")]
+    InvalidTaskArtifactLifecycle {
+        purpose: RunPurpose,
+        lifecycle: ArtifactLifecycle,
+    },
     #[error("task {0} has unresolved dependencies")]
     UnresolvedDependencies(TaskId),
     #[error("task {0} is not runnable")]
@@ -2887,6 +2892,7 @@ impl V2Store {
             assert_daemon_lease(&transaction, lease, Utc::now())?;
         }
         assert_permit(&transaction, permit)?;
+        assert_task_artifact_lifecycle(&transaction, &permit.run_id, artifact)?;
         assert_origin_matches(artifact.origin.as_ref(), permit)?;
         insert_artifact(&transaction, artifact)?;
         append_event(
@@ -6712,6 +6718,9 @@ fn commit_attempt_transaction_with_effect(
     now: DateTime<Utc>,
 ) -> StoreResult<()> {
     assert_permit(transaction, permit)?;
+    for artifact in artifacts {
+        assert_task_artifact_lifecycle(transaction, &permit.run_id, artifact)?;
+    }
     let (_, on_failure) = task_retry_policy(transaction, &permit.task_id)?;
     for artifact in artifacts {
         assert_origin_matches(artifact.origin.as_ref(), permit)?;
@@ -7710,6 +7719,26 @@ fn run_purpose_from_connection(connection: &Connection, run_id: &RunId) -> Store
     parse_enum(&purpose)
 }
 
+fn assert_task_artifact_lifecycle(
+    transaction: &Transaction<'_>,
+    run_id: &RunId,
+    artifact: &Artifact,
+) -> StoreResult<()> {
+    let purpose = run_purpose_from_connection(transaction, run_id)?;
+    let allowed = match artifact.lifecycle {
+        ArtifactLifecycle::Ephemeral => false,
+        ArtifactLifecycle::RunScoped => true,
+        ArtifactLifecycle::Canonical => purpose == RunPurpose::Paper,
+    };
+    if allowed {
+        return Ok(());
+    }
+    Err(StoreError::InvalidTaskArtifactLifecycle {
+        purpose,
+        lifecycle: artifact.lifecycle,
+    })
+}
+
 fn workflow_graph_run_purpose(
     connection: &Connection,
     artifact_id: &ArtifactId,
@@ -8680,6 +8709,270 @@ mod tests {
             now,
         )
         .unwrap()
+    }
+
+    struct TaskArtifactFixture {
+        _root: tempfile::TempDir,
+        store: V2Store,
+        run: StoredRun,
+        permit: TaskWritePermit,
+        now: DateTime<Utc>,
+    }
+
+    fn task_artifact_fixture(purpose: RunPurpose) -> TaskArtifactFixture {
+        let root = tempdir().unwrap();
+        let store = V2Store::open(root.path()).unwrap();
+        let now = Utc::now();
+        let graph = graph();
+        let graph_artifact = artifact(
+            &store,
+            ArtifactKind::WorkflowGraph,
+            &serde_json::to_string(&graph).unwrap(),
+            None,
+        );
+        let run = StoredRun {
+            run_id: RunId::new(),
+            purpose,
+            topology_id: graph.topology_id.clone(),
+            graph_artifact_id: graph_artifact.artifact_id.clone(),
+            created_at: now,
+        };
+        store
+            .commit_workflow(&WorkflowCommit {
+                run: run.clone(),
+                graph: graph_artifact,
+                nodes: graph.nodes,
+            })
+            .unwrap();
+        let permit = store
+            .claim_next_task("lifecycle-worker", now, Duration::seconds(30))
+            .unwrap()
+            .unwrap()
+            .permit;
+        TaskArtifactFixture {
+            _root: root,
+            store,
+            run,
+            permit,
+            now,
+        }
+    }
+
+    fn lifecycle_test_artifact(
+        fixture: &TaskArtifactFixture,
+        lifecycle: ArtifactLifecycle,
+        label: &str,
+    ) -> Artifact {
+        permit_artifact(
+            &fixture.store,
+            &fixture.permit,
+            ArtifactKind::Decision,
+            &serde_json::json!({"label": label}),
+            vec![],
+            lifecycle,
+            fixture.now,
+        )
+    }
+
+    #[test]
+    fn task_artifact_lifecycle_matrix_is_enforced_without_partial_writes() {
+        for purpose in [
+            RunPurpose::Debug,
+            RunPurpose::PaperDryRun,
+            RunPurpose::Replay,
+            RunPurpose::Shadow,
+        ] {
+            for lifecycle in [ArtifactLifecycle::Ephemeral, ArtifactLifecycle::Canonical] {
+                let fixture = task_artifact_fixture(purpose);
+                let artifact = lifecycle_test_artifact(&fixture, lifecycle, "rejected");
+                let event_count = fixture
+                    .store
+                    .events_after(&fixture.run.run_id, 0, 100)
+                    .unwrap()
+                    .len();
+
+                assert!(matches!(
+                    fixture.store.write_task_artifact(
+                        &fixture.permit,
+                        &artifact,
+                        LifecycleEventType::ClaimCreated,
+                        fixture.now,
+                    ),
+                    Err(StoreError::InvalidTaskArtifactLifecycle { purpose: actual, lifecycle: rejected })
+                        if actual == purpose && rejected == lifecycle
+                ));
+                assert!(matches!(
+                    fixture.store.artifact(&artifact.artifact_id),
+                    Err(StoreError::MissingArtifact(_))
+                ));
+                assert_eq!(
+                    fixture
+                        .store
+                        .events_after(&fixture.run.run_id, 0, 100)
+                        .unwrap()
+                        .len(),
+                    event_count
+                );
+                fixture.store.verify_integrity().unwrap();
+            }
+        }
+
+        for purpose in [
+            RunPurpose::Debug,
+            RunPurpose::Paper,
+            RunPurpose::PaperDryRun,
+            RunPurpose::Replay,
+            RunPurpose::Shadow,
+        ] {
+            let fixture = task_artifact_fixture(purpose);
+            let artifact =
+                lifecycle_test_artifact(&fixture, ArtifactLifecycle::RunScoped, "accepted");
+            fixture
+                .store
+                .write_task_artifact(
+                    &fixture.permit,
+                    &artifact,
+                    LifecycleEventType::ClaimCreated,
+                    fixture.now,
+                )
+                .unwrap();
+            assert_eq!(
+                fixture.store.artifact(&artifact.artifact_id).unwrap(),
+                artifact
+            );
+            fixture.store.verify_integrity().unwrap();
+        }
+
+        let fixture = task_artifact_fixture(RunPurpose::Paper);
+        let artifact = lifecycle_test_artifact(&fixture, ArtifactLifecycle::Canonical, "paper");
+        fixture
+            .store
+            .write_task_artifact(
+                &fixture.permit,
+                &artifact,
+                LifecycleEventType::ClaimCreated,
+                fixture.now,
+            )
+            .unwrap();
+        assert_eq!(
+            fixture.store.artifact(&artifact.artifact_id).unwrap(),
+            artifact
+        );
+        fixture.store.verify_integrity().unwrap();
+    }
+
+    #[test]
+    fn attempt_commit_lifecycle_rejection_is_atomic_and_paper_canonical_is_allowed() {
+        for purpose in [
+            RunPurpose::Debug,
+            RunPurpose::PaperDryRun,
+            RunPurpose::Replay,
+            RunPurpose::Shadow,
+        ] {
+            let fixture = task_artifact_fixture(purpose);
+            let artifact =
+                lifecycle_test_artifact(&fixture, ArtifactLifecycle::Canonical, "rejected");
+            let event_count = fixture
+                .store
+                .events_after(&fixture.run.run_id, 0, 100)
+                .unwrap()
+                .len();
+
+            assert!(matches!(
+                fixture.store.commit_attempt(
+                    &fixture.permit,
+                    std::slice::from_ref(&artifact),
+                    TaskStatus::Succeeded,
+                    fixture.now,
+                ),
+                Err(StoreError::InvalidTaskArtifactLifecycle { purpose: actual, lifecycle: ArtifactLifecycle::Canonical })
+                    if actual == purpose
+            ));
+            assert!(matches!(
+                fixture.store.artifact(&artifact.artifact_id),
+                Err(StoreError::MissingArtifact(_))
+            ));
+            assert!(matches!(
+                fixture
+                    .store
+                    .committed_task_outputs(&fixture.run.run_id, &fixture.permit.task_id),
+                Err(StoreError::CommittedOutputTask { .. })
+            ));
+            assert_eq!(
+                fixture
+                    .store
+                    .events_after(&fixture.run.run_id, 0, 100)
+                    .unwrap()
+                    .len(),
+                event_count
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .workflow_snapshot(&fixture.run.run_id)
+                    .unwrap()
+                    .tasks[0]
+                    .status,
+                TaskStatus::Running
+            );
+            fixture.store.verify_integrity().unwrap();
+        }
+
+        let fixture = task_artifact_fixture(RunPurpose::Paper);
+        let artifact = lifecycle_test_artifact(&fixture, ArtifactLifecycle::Canonical, "paper");
+        fixture
+            .store
+            .commit_attempt(
+                &fixture.permit,
+                std::slice::from_ref(&artifact),
+                TaskStatus::Succeeded,
+                fixture.now,
+            )
+            .unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .committed_task_outputs(&fixture.run.run_id, &fixture.permit.task_id)
+                .unwrap(),
+            vec![artifact]
+        );
+        fixture.store.verify_integrity().unwrap();
+    }
+
+    #[test]
+    fn stale_permit_rejects_before_task_artifact_lifecycle() {
+        let fixture = task_artifact_fixture(RunPurpose::Debug);
+        let stale = fixture.permit.clone();
+        fixture
+            .store
+            .recover_expired_tasks(fixture.now + Duration::seconds(31))
+            .unwrap();
+        let artifact = lifecycle_test_artifact(&fixture, ArtifactLifecycle::Canonical, "stale");
+
+        assert!(matches!(
+            fixture.store.write_task_artifact(
+                &stale,
+                &artifact,
+                LifecycleEventType::ClaimCreated,
+                fixture.now,
+            ),
+            Err(StoreError::StalePermit(_))
+        ));
+        fixture.store.verify_integrity().unwrap();
+    }
+
+    #[test]
+    fn bootstrap_freeze_state_remains_outside_task_artifact_firewall() {
+        let fixture = task_artifact_fixture(RunPurpose::Debug);
+        let freeze = fixture
+            .store
+            .write_freeze_state(true, "lifecycle firewall test", fixture.now)
+            .unwrap();
+
+        assert_eq!(freeze.kind, ArtifactKind::FreezeState);
+        assert_eq!(freeze.lifecycle, ArtifactLifecycle::Canonical);
+        assert_eq!(fixture.store.artifact(&freeze.artifact_id).unwrap(), freeze);
+        fixture.store.verify_integrity().unwrap();
     }
 
     fn artifact_ref(artifact: &Artifact) -> ArtifactRef {

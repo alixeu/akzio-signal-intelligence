@@ -1997,7 +1997,8 @@ mod tests {
             .unwrap();
 
         let build_outcome = |decision_context: ArtifactRef,
-                             schedule_lifecycle: ArtifactLifecycle| {
+                             schedule_lifecycle: ArtifactLifecycle|
+         -> Result<(Artifact, Artifact), StoreError> {
             let mut schedule = fixture.materialization.schedule.clone();
             schedule.outcome_id = OutcomeId::new();
             schedule.decision = artifact_reference(&candidate_decision);
@@ -2017,15 +2018,12 @@ mod tests {
                 ],
                 now,
             );
-            fixture
-                .store
-                .write_task_artifact(
-                    &shadow_permit,
-                    &schedule_artifact,
-                    LifecycleEventType::ShadowOutcomeScheduleCreated,
-                    now,
-                )
-                .unwrap();
+            fixture.store.write_task_artifact(
+                &shadow_permit,
+                &schedule_artifact,
+                LifecycleEventType::ShadowOutcomeScheduleCreated,
+                now,
+            )?;
 
             let mut materialization = fixture.materialization.clone();
             materialization.schedule = schedule;
@@ -2042,27 +2040,23 @@ mod tests {
                     .collect(),
                 materialization.sealed_at,
             );
-            (schedule_artifact, outcome_artifact)
+            Ok((schedule_artifact, outcome_artifact))
         };
 
         let paper_decision_context = fixture.materialization.schedule.decision_context.clone();
-        let (_, canonical_schedule_outcome) =
-            build_outcome(paper_decision_context.clone(), ArtifactLifecycle::Canonical);
         assert!(matches!(
-            fixture.store.commit_outcomes(
-                &shadow_permit,
-                &[canonical_schedule_outcome],
-                fixture.materialization.sealed_at,
-            ),
-            Err(StoreError::InvalidLearningCommit(
-                "outcome.schedule_artifact"
-            ))
+            build_outcome(paper_decision_context.clone(), ArtifactLifecycle::Canonical),
+            Err(StoreError::InvalidTaskArtifactLifecycle {
+                purpose: RunPurpose::Shadow,
+                lifecycle: ArtifactLifecycle::Canonical,
+            })
         ));
 
         let (_, debug_closure_outcome) = build_outcome(
             artifact_reference(&debug_context),
             ArtifactLifecycle::RunScoped,
-        );
+        )
+        .unwrap();
         assert!(matches!(
             fixture.store.commit_outcomes(
                 &shadow_permit,
@@ -2075,7 +2069,7 @@ mod tests {
         ));
 
         let (mixed_schedule_artifact, mixed_outcome) =
-            build_outcome(paper_decision_context, ArtifactLifecycle::RunScoped);
+            build_outcome(paper_decision_context, ArtifactLifecycle::RunScoped).unwrap();
         fixture
             .store
             .commit_outcomes(

@@ -761,11 +761,15 @@ mod tests {
         source_refs: Vec<ArtifactRef>,
         now: DateTime<Utc>,
     ) -> Artifact {
+        let lifecycle = match store.run_purpose(&permit.run_id).unwrap() {
+            RunPurpose::Paper => ArtifactLifecycle::Canonical,
+            _ => ArtifactLifecycle::RunScoped,
+        };
         Artifact::new(
             kind,
             store.put_json(payload).unwrap(),
             "fixture.source",
-            ArtifactLifecycle::Canonical,
+            lifecycle,
             provenance(now),
             Some(ArtifactOrigin {
                 run_id: Some(permit.run_id.clone()),
