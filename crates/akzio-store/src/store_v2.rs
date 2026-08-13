@@ -102,6 +102,8 @@ pub enum StoreError {
     InvalidExecutionReprice,
     #[error("invalid Paper effect artifact {0}")]
     InvalidPaperEffect(ArtifactId),
+    #[error("lifecycle event {event_type} requires task, attempt and artifact lineage")]
+    InvalidLifecycleEventShape { event_type: String },
     #[error("Paper effect {0} has no durable intent")]
     MissingPaperEffectIntent(ArtifactId),
     #[error("Paper effect {0} already has a terminal settlement")]
@@ -4390,15 +4392,35 @@ impl V2Store {
     pub fn verify_integrity(&self) -> StoreResult<()> {
         let connection = self.connection.lock().expect("store connection poisoned");
         let mut event_statement = connection
-            .prepare("SELECT event_id, event_type FROM rebuild_events ORDER BY event_id ASC")?;
+            .prepare(
+                "SELECT event_id, run_id, task_id, attempt_id, event_type, artifact_id FROM rebuild_events ORDER BY event_id ASC",
+            )?;
         let event_rows = event_statement.query_map([], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+            ))
         })?;
         for row in event_rows {
-            let (cursor, event_type) = row?;
+            let (cursor, run_id, task_id, attempt_id, event_type, artifact_id) = row?;
             LifecycleEventType::parse(&event_type).map_err(|error| {
                 StoreError::Integrity(format!(
                     "event {cursor} has invalid lifecycle type: {error}"
+                ))
+            })?;
+            validate_event_shape(
+                &event_type,
+                task_id.is_some(),
+                attempt_id.is_some(),
+                artifact_id.is_some(),
+            )
+            .map_err(|error| {
+                StoreError::Integrity(format!(
+                    "event {cursor} in run {run_id} has invalid shape: {error}"
                 ))
             })?;
         }
@@ -6874,9 +6896,12 @@ fn append_event(
     created_at: DateTime<Utc>,
 ) -> StoreResult<i64> {
     validate_event_type(event_type)?;
-    if attempt_id.is_some() && task_id.is_none() {
-        return Err(StoreError::Domain(DomainError::AttemptOriginWithoutTask));
-    }
+    validate_event_shape(
+        event_type,
+        task_id.is_some(),
+        attempt_id.is_some(),
+        artifact_id.is_some(),
+    )?;
     transaction.execute(
         r#"INSERT INTO rebuild_events
            (run_id, task_id, attempt_id, event_type, artifact_id, created_at)
@@ -6900,6 +6925,29 @@ fn validate_event_type(event_type: &str) -> StoreResult<()> {
         }));
     }
     LifecycleEventType::parse(event_type)?;
+    Ok(())
+}
+
+fn validate_event_shape(
+    event_type: &str,
+    has_task_id: bool,
+    has_attempt_id: bool,
+    has_artifact_id: bool,
+) -> StoreResult<()> {
+    if matches!(
+        LifecycleEventType::parse(event_type)?,
+        LifecycleEventType::ExecutionEffectIntent
+            | LifecycleEventType::ExecutionEffectRecovered
+            | LifecycleEventType::ExecutionEffectSettled
+    ) && !(has_task_id && has_attempt_id && has_artifact_id)
+    {
+        return Err(StoreError::InvalidLifecycleEventShape {
+            event_type: event_type.to_owned(),
+        });
+    }
+    if has_attempt_id && !has_task_id {
+        return Err(StoreError::Domain(DomainError::AttemptOriginWithoutTask));
+    }
     Ok(())
 }
 
@@ -11745,6 +11793,87 @@ mod tests {
         assert!(matches!(
             &corrupted,
             Err(StoreError::Integrity(message)) if message.contains("stale")
+        ));
+    }
+
+    #[test]
+    fn paper_effect_events_require_complete_lineage_at_append_boundary() {
+        let fixture = execution_commit_fixture();
+        let event_types = [
+            LifecycleEventType::ExecutionEffectIntent,
+            LifecycleEventType::ExecutionEffectRecovered,
+            LifecycleEventType::ExecutionEffectSettled,
+        ];
+        let cases = [
+            (
+                None,
+                Some(&fixture.permit.attempt_id),
+                Some(&fixture.commitment.artifact_id),
+            ),
+            (
+                Some(&fixture.permit.task_id),
+                None,
+                Some(&fixture.commitment.artifact_id),
+            ),
+            (
+                Some(&fixture.permit.task_id),
+                Some(&fixture.permit.attempt_id),
+                None,
+            ),
+        ];
+
+        for lifecycle_type in event_types {
+            let event_type = lifecycle_type.as_str();
+            for (task_id, attempt_id, artifact_id) in cases {
+                let mut connection = fixture.store.connection.lock().unwrap();
+                let transaction = connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .unwrap();
+                assert!(matches!(
+                    append_event(
+                        &transaction,
+                        &fixture.permit.run_id,
+                        task_id,
+                        attempt_id,
+                        event_type,
+                        artifact_id,
+                        fixture.now,
+                    ),
+                    Err(StoreError::InvalidLifecycleEventShape { event_type: value })
+                        if value == event_type
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn doctor_rejects_forged_paper_effect_event_shape() {
+        let fixture = execution_commit_fixture();
+        {
+            let mut connection = fixture.store.connection.lock().unwrap();
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            transaction
+                .execute(
+                    r#"INSERT INTO rebuild_events
+                       (run_id, task_id, attempt_id, event_type, artifact_id, created_at)
+                       VALUES (?1, NULL, NULL, ?2, NULL, ?3)"#,
+                    params![
+                        fixture.permit.run_id.0,
+                        LifecycleEventType::ExecutionEffectIntent.as_str(),
+                        fixture.now.to_rfc3339(),
+                    ],
+                )
+                .unwrap();
+            transaction.commit().unwrap();
+        }
+
+        assert!(matches!(
+            fixture.store.verify_integrity(),
+            Err(StoreError::Integrity(message))
+                if message.contains("invalid shape")
+                    && message.contains("execution.effect.intent")
         ));
     }
 
