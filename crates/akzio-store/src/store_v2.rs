@@ -3052,6 +3052,7 @@ impl V2Store {
         assert_permit(&transaction, permit)?;
         assert_paper_run(&transaction, &permit.run_id)?;
         assert_paper_effect_artifact(&transaction, effect, &permit.run_id)?;
+        validate_paper_effect_events(&transaction, Some(&permit.run_id))?;
         if paper_effect_terminal_exists(&transaction, &permit.run_id, &effect.artifact_id)? {
             return Err(StoreError::PaperEffectAlreadySettled(
                 effect.artifact_id.clone(),
@@ -3095,6 +3096,7 @@ impl V2Store {
         assert_permit(&transaction, permit)?;
         assert_paper_run(&transaction, &permit.run_id)?;
         assert_paper_effect_artifact(&transaction, effect, &permit.run_id)?;
+        validate_paper_effect_events(&transaction, Some(&permit.run_id))?;
         if paper_effect_terminal_exists(&transaction, &permit.run_id, &effect.artifact_id)? {
             return Err(StoreError::PaperEffectAlreadySettled(
                 effect.artifact_id.clone(),
@@ -4398,6 +4400,7 @@ impl V2Store {
                 event.artifact_id.is_some(),
             )?;
         }
+        validate_paper_effect_events(&connection, Some(run_id))?;
         Ok(events)
     }
 
@@ -4436,6 +4439,7 @@ impl V2Store {
                 ))
             })?;
         }
+        validate_paper_effect_events(&connection, None)?;
         let fk = connection
             .query_row("PRAGMA foreign_key_check", [], |_| Ok(()))
             .optional()?;
@@ -6581,6 +6585,81 @@ fn paper_effect_intent_exists(
         |row| row.get::<_, i64>(0),
     )?;
     Ok(found != 0)
+}
+
+fn validate_paper_effect_events(
+    connection: &Connection,
+    run_id: Option<&RunId>,
+) -> StoreResult<()> {
+    let mut statement = connection.prepare(
+        r#"SELECT event_id, run_id, event_type, artifact_id
+           FROM rebuild_events
+           WHERE (?1 IS NULL OR run_id = ?1)
+             AND artifact_id IS NOT NULL
+             AND event_type IN (?2, ?3, ?4)
+           ORDER BY event_id ASC"#,
+    )?;
+    let rows =
+        statement.query_map(
+            params![
+                run_id.map(|value| value.0.as_str()),
+                LifecycleEventType::ExecutionEffectIntent.as_str(),
+                LifecycleEventType::ExecutionEffectSettled.as_str(),
+                LifecycleEventType::ExecutionEffectRecovered.as_str(),
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    RunId(row.get::<_, String>(1)?),
+                    row.get::<_, String>(2)?,
+                    ArtifactId(ContentHash::new(row.get::<_, String>(3)?).map_err(|error| {
+                        rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+                    })?),
+                ))
+            },
+        )?;
+    let mut intents = BTreeMap::<(RunId, ArtifactId), i64>::new();
+    let mut terminals = BTreeMap::<(RunId, ArtifactId), i64>::new();
+    for row in rows {
+        let (cursor, event_run_id, event_type, effect_id) = row?;
+        let key = (event_run_id, effect_id.clone());
+        match event_type.as_str() {
+            value if value == LifecycleEventType::ExecutionEffectIntent.as_str() => {
+                if terminals.contains_key(&key) {
+                    return Err(StoreError::Integrity(format!(
+                        "Paper effect {effect_id} has intent after terminal event at cursor {cursor}"
+                    )));
+                }
+                if intents.insert(key, cursor).is_some() {
+                    return Err(StoreError::Integrity(format!(
+                        "Paper effect {effect_id} has duplicate intent at cursor {cursor}"
+                    )));
+                }
+            }
+            value
+                if value == LifecycleEventType::ExecutionEffectSettled.as_str()
+                    || value == LifecycleEventType::ExecutionEffectRecovered.as_str() =>
+            {
+                let Some(intent_cursor) = intents.get(&key).copied() else {
+                    return Err(StoreError::Integrity(format!(
+                        "Paper effect {effect_id} terminal event at cursor {cursor} has no prior intent"
+                    )));
+                };
+                if cursor <= intent_cursor {
+                    return Err(StoreError::Integrity(format!(
+                        "Paper effect {effect_id} terminal cursor {cursor} is not after intent cursor {intent_cursor}"
+                    )));
+                }
+                if terminals.insert(key, cursor).is_some() {
+                    return Err(StoreError::Integrity(format!(
+                        "Paper effect {effect_id} has duplicate terminal event at cursor {cursor}"
+                    )));
+                }
+            }
+            _ => unreachable!("effect query emits fixed lifecycle types"),
+        }
+    }
+    Ok(())
 }
 
 fn paper_effect_terminal_exists(
@@ -12310,6 +12389,134 @@ mod tests {
             Err(StoreError::InvalidLifecycleEventShape { event_type })
                 if event_type == LifecycleEventType::ExecutionEffectSettled.as_str()
         ));
+    }
+
+    fn insert_paper_effect_event(
+        fixture: &ExecutionCommitFixture,
+        effect: &ArtifactRef,
+        event_type: LifecycleEventType,
+    ) {
+        let mut connection = fixture.store.connection.lock().unwrap();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        transaction
+            .execute(
+                r#"INSERT INTO rebuild_events
+                   (run_id, task_id, attempt_id, event_type, artifact_id, created_at)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6)"#,
+                params![
+                    fixture.permit.run_id.0,
+                    fixture.permit.task_id.0,
+                    fixture.permit.attempt_id.0,
+                    event_type.as_str(),
+                    effect.artifact_id.0.as_str(),
+                    fixture.now.to_rfc3339(),
+                ],
+            )
+            .unwrap();
+        transaction.commit().unwrap();
+    }
+
+    #[test]
+    fn paper_effect_history_requires_prior_intent_and_single_terminal() {
+        let fixture = execution_commit_fixture();
+        let effect = artifact_ref(&fixture.commitment);
+        fixture
+            .store
+            .write_task_artifact(
+                &fixture.permit,
+                &fixture.commitment,
+                LifecycleEventType::ExecutionCommitted,
+                fixture.now,
+            )
+            .unwrap();
+        insert_paper_effect_event(
+            &fixture,
+            &effect,
+            LifecycleEventType::ExecutionEffectSettled,
+        );
+        assert!(matches!(
+            fixture.store.events_after(&fixture.permit.run_id, 0, 100),
+            Err(StoreError::Integrity(message))
+                if message.contains("has no prior intent")
+        ));
+
+        let fixture = execution_commit_fixture();
+        let effect = artifact_ref(&fixture.commitment);
+        fixture
+            .store
+            .write_task_artifact(
+                &fixture.permit,
+                &fixture.commitment,
+                LifecycleEventType::ExecutionCommitted,
+                fixture.now,
+            )
+            .unwrap();
+        insert_paper_effect_event(&fixture, &effect, LifecycleEventType::ExecutionEffectIntent);
+        insert_paper_effect_event(
+            &fixture,
+            &effect,
+            LifecycleEventType::ExecutionEffectSettled,
+        );
+        insert_paper_effect_event(&fixture, &effect, LifecycleEventType::ExecutionEffectIntent);
+        assert!(matches!(
+            fixture.store.verify_integrity(),
+            Err(StoreError::Integrity(message))
+                if message.contains("intent after terminal")
+        ));
+
+        let fixture = execution_commit_fixture();
+        let effect = artifact_ref(&fixture.commitment);
+        fixture
+            .store
+            .write_task_artifact(
+                &fixture.permit,
+                &fixture.commitment,
+                LifecycleEventType::ExecutionCommitted,
+                fixture.now,
+            )
+            .unwrap();
+        insert_paper_effect_event(&fixture, &effect, LifecycleEventType::ExecutionEffectIntent);
+        insert_paper_effect_event(
+            &fixture,
+            &effect,
+            LifecycleEventType::ExecutionEffectSettled,
+        );
+        insert_paper_effect_event(
+            &fixture,
+            &effect,
+            LifecycleEventType::ExecutionEffectRecovered,
+        );
+        assert!(matches!(
+            fixture.store.verify_integrity(),
+            Err(StoreError::Integrity(message))
+                if message.contains("duplicate terminal event")
+        ));
+    }
+
+    #[test]
+    fn events_after_validates_effect_history_beyond_page() {
+        let fixture = execution_commit_fixture();
+        let effect = artifact_ref(&fixture.commitment);
+        fixture
+            .store
+            .write_task_artifact(
+                &fixture.permit,
+                &fixture.commitment,
+                LifecycleEventType::ExecutionCommitted,
+                fixture.now,
+            )
+            .unwrap();
+        insert_paper_effect_event(
+            &fixture,
+            &effect,
+            LifecycleEventType::ExecutionEffectSettled,
+        );
+        assert!(fixture
+            .store
+            .events_after(&fixture.permit.run_id, i64::MAX, 1)
+            .is_err());
     }
 
     #[test]
