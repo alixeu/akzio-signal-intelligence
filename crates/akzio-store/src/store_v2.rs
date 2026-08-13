@@ -2859,6 +2859,15 @@ impl V2Store {
         {
             return Err(StoreError::StalePermit(permit.task_id.clone()));
         }
+        validate_tool_lifecycle_events(&transaction, Some(&permit.run_id))?;
+        if status == TaskStatus::Succeeded {
+            ensure_no_pending_tool_calls(
+                &transaction,
+                &permit.run_id,
+                &permit.task_id,
+                &permit.attempt_id,
+            )?;
+        }
         Ok(())
     }
 
@@ -2904,6 +2913,7 @@ impl V2Store {
             Some(&artifact.artifact_id),
             now,
         )?;
+        validate_tool_lifecycle_events(&transaction, Some(&permit.run_id))?;
         transaction.commit()?;
         Ok(())
     }
@@ -4400,6 +4410,7 @@ impl V2Store {
                 event.artifact_id.is_some(),
             )?;
         }
+        validate_tool_lifecycle_events(&connection, Some(run_id))?;
         validate_paper_effect_events(&connection, Some(run_id))?;
         Ok(events)
     }
@@ -4439,6 +4450,7 @@ impl V2Store {
                 ))
             })?;
         }
+        validate_tool_lifecycle_events(&connection, None)?;
         validate_paper_effect_events(&connection, None)?;
         let fk = connection
             .query_row("PRAGMA foreign_key_check", [], |_| Ok(()))
@@ -6662,6 +6674,211 @@ fn validate_paper_effect_events(
     Ok(())
 }
 
+fn validate_tool_lifecycle_events(
+    connection: &Connection,
+    run_id: Option<&RunId>,
+) -> StoreResult<()> {
+    let mut statement = connection.prepare(
+        r#"SELECT event_id, run_id, task_id, attempt_id, event_type, artifact_id
+           FROM rebuild_events
+           WHERE (?1 IS NULL OR run_id = ?1)
+             AND event_type IN (?2, ?3, ?4)
+           ORDER BY event_id ASC"#,
+    )?;
+    let rows = statement.query_map(
+        params![
+            run_id.map(|value| value.0.as_str()),
+            LifecycleEventType::ToolCalled.as_str(),
+            LifecycleEventType::ToolCompleted.as_str(),
+            LifecycleEventType::ToolFailed.as_str(),
+        ],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                RunId(row.get::<_, String>(1)?),
+                row.get::<_, Option<String>>(2)?.map(TaskId),
+                row.get::<_, Option<String>>(3)?
+                    .map(akzio_domain::AttemptId),
+                LifecycleEventType::parse(&row.get::<_, String>(4)?)
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?,
+                row.get::<_, Option<String>>(5)?
+                    .map(|value| {
+                        ContentHash::new(value).map(ArtifactId).map_err(|error| {
+                            rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+                        })
+                    })
+                    .transpose()?,
+            ))
+        },
+    )?;
+
+    #[derive(Clone)]
+    struct CalledEvent {
+        cursor: i64,
+        run_id: RunId,
+        task_id: TaskId,
+        attempt_id: akzio_domain::AttemptId,
+    }
+
+    let mut called_by_key =
+        BTreeMap::<(RunId, TaskId, akzio_domain::AttemptId, ArtifactId), CalledEvent>::new();
+    let mut terminal_by_call = BTreeSet::new();
+
+    for row in rows {
+        let (cursor, event_run_id, task_id, attempt_id, event_type, artifact_id) = row?;
+        let Some(task_id) = task_id else {
+            return Err(StoreError::Integrity(format!(
+                "tool event at cursor {cursor} has no task"
+            )));
+        };
+        let Some(attempt_id) = attempt_id else {
+            return Err(StoreError::Integrity(format!(
+                "tool event at cursor {cursor} has no attempt"
+            )));
+        };
+        let Some(artifact_id) = artifact_id else {
+            return Err(StoreError::Integrity(format!(
+                "tool event at cursor {cursor} has no artifact"
+            )));
+        };
+        let event_key = (
+            event_run_id.clone(),
+            task_id.clone(),
+            attempt_id.clone(),
+            artifact_id.clone(),
+        );
+
+        match event_type {
+            LifecycleEventType::ToolCalled => {
+                let artifact = read_artifact(connection, &artifact_id)?;
+                if artifact.kind != ArtifactKind::ToolCall {
+                    return Err(StoreError::Integrity(format!(
+                        "tool.called cursor {cursor} references {:?}, expected tool_call",
+                        artifact.kind
+                    )));
+                }
+                if called_by_key
+                    .insert(
+                        event_key,
+                        CalledEvent {
+                            cursor,
+                            run_id: event_run_id,
+                            task_id,
+                            attempt_id,
+                        },
+                    )
+                    .is_some()
+                {
+                    return Err(StoreError::Integrity(format!(
+                        "duplicate tool.called event for {} at cursor {cursor}",
+                        artifact_id.0
+                    )));
+                }
+            }
+            LifecycleEventType::ToolCompleted | LifecycleEventType::ToolFailed => {
+                let artifact = read_artifact(connection, &artifact_id)?;
+                if artifact.kind != ArtifactKind::ToolResult {
+                    return Err(StoreError::Integrity(format!(
+                        "{} cursor {cursor} references {:?}, expected tool_result",
+                        event_type.as_str(),
+                        artifact.kind
+                    )));
+                }
+                let tool_call_refs = artifact
+                    .source_refs
+                    .iter()
+                    .filter(|reference| reference.kind == ArtifactKind::ToolCall)
+                    .collect::<Vec<_>>();
+                if tool_call_refs.len() != 1 {
+                    return Err(StoreError::Integrity(format!(
+                        "{} cursor {cursor} must reference exactly one tool_call",
+                        event_type.as_str()
+                    )));
+                }
+                let call_artifact_id = tool_call_refs[0].artifact_id.clone();
+                let call_key = (
+                    event_run_id.clone(),
+                    task_id.clone(),
+                    attempt_id.clone(),
+                    call_artifact_id.clone(),
+                );
+                let Some(called) = called_by_key.get(&call_key) else {
+                    return Err(StoreError::Integrity(format!(
+                        "{} cursor {cursor} has no prior tool.called for {}",
+                        event_type.as_str(),
+                        call_artifact_id.0
+                    )));
+                };
+                if called.cursor >= cursor
+                    || called.run_id != event_run_id
+                    || called.task_id != task_id
+                    || called.attempt_id != attempt_id
+                {
+                    return Err(StoreError::Integrity(format!(
+                        "{} cursor {cursor} does not match its tool.called lineage",
+                        event_type.as_str()
+                    )));
+                }
+                let terminal_key = (event_run_id, task_id, attempt_id, call_artifact_id);
+                if !terminal_by_call.insert(terminal_key) {
+                    return Err(StoreError::Integrity(format!(
+                        "tool call already has a terminal event at cursor {cursor}"
+                    )));
+                }
+            }
+            _ => unreachable!("tool lifecycle query emits fixed event types"),
+        }
+    }
+    Ok(())
+}
+
+fn ensure_no_pending_tool_calls(
+    connection: &Connection,
+    run_id: &RunId,
+    task_id: &TaskId,
+    attempt_id: &akzio_domain::AttemptId,
+) -> StoreResult<()> {
+    let called = connection.query_row(
+        r#"SELECT COUNT(*)
+               FROM rebuild_events
+               WHERE run_id = ?1 AND task_id = ?2 AND attempt_id = ?3
+                 AND event_type = ?4"#,
+        params![
+            run_id.0,
+            task_id.0,
+            attempt_id.0,
+            LifecycleEventType::ToolCalled.as_str(),
+        ],
+        |row| row.get::<_, u64>(0),
+    )?;
+    let terminal = connection.query_row(
+        r#"SELECT COUNT(*)
+               FROM rebuild_events AS terminal
+               JOIN rebuild_artifact_refs AS reference
+                 ON reference.artifact_id = terminal.artifact_id
+               WHERE terminal.run_id = ?1
+                 AND terminal.task_id = ?2
+                 AND terminal.attempt_id = ?3
+                 AND terminal.event_type IN (?4, ?5)
+                 AND reference.source_kind = ?6"#,
+        params![
+            run_id.0,
+            task_id.0,
+            attempt_id.0,
+            LifecycleEventType::ToolCompleted.as_str(),
+            LifecycleEventType::ToolFailed.as_str(),
+            enum_name(ArtifactKind::ToolCall),
+        ],
+        |row| row.get::<_, u64>(0),
+    )?;
+    if called > terminal {
+        return Err(StoreError::Integrity(format!(
+            "attempt {attempt_id} has pending tool calls"
+        )));
+    }
+    Ok(())
+}
+
 fn paper_effect_terminal_exists(
     transaction: &Transaction<'_>,
     run_id: &RunId,
@@ -6858,6 +7075,15 @@ fn finish_permitted_task(
         } else {
             requested_status
         };
+    validate_tool_lifecycle_events(transaction, Some(&permit.run_id))?;
+    if status == TaskStatus::Succeeded {
+        ensure_no_pending_tool_calls(
+            transaction,
+            &permit.run_id,
+            &permit.task_id,
+            &permit.attempt_id,
+        )?;
+    }
     transaction.execute(
         r#"UPDATE rebuild_tasks
            SET status = ?1, lease_id = NULL, active_attempt_id = NULL, worker_id = NULL,
@@ -12496,6 +12722,127 @@ mod tests {
     }
 
     #[test]
+    fn tool_lifecycle_allows_completed_call_and_blocks_pending_success() {
+        let fixture = task_artifact_fixture(RunPurpose::Debug);
+        let call = permit_artifact(
+            &fixture.store,
+            &fixture.permit,
+            ArtifactKind::ToolCall,
+            &serde_json::json!({"call_id": "fixture-call"}),
+            vec![],
+            ArtifactLifecycle::RunScoped,
+            fixture.now,
+        );
+        fixture
+            .store
+            .write_task_artifact(
+                &fixture.permit,
+                &call,
+                LifecycleEventType::ToolCalled,
+                fixture.now,
+            )
+            .unwrap();
+        let result = permit_artifact(
+            &fixture.store,
+            &fixture.permit,
+            ArtifactKind::ToolResult,
+            &serde_json::json!({"call_id": "fixture-call", "ok": true}),
+            vec![artifact_ref(&call)],
+            ArtifactLifecycle::RunScoped,
+            fixture.now,
+        );
+        fixture
+            .store
+            .write_task_artifact(
+                &fixture.permit,
+                &result,
+                LifecycleEventType::ToolCompleted,
+                fixture.now,
+            )
+            .unwrap();
+        let output = lifecycle_test_artifact(&fixture, ArtifactLifecycle::RunScoped, "output");
+        fixture
+            .store
+            .commit_attempt(
+                &fixture.permit,
+                std::slice::from_ref(&output),
+                TaskStatus::Succeeded,
+                fixture.now,
+            )
+            .unwrap();
+        fixture.store.verify_integrity().unwrap();
+
+        let pending = task_artifact_fixture(RunPurpose::Debug);
+        let pending_call = permit_artifact(
+            &pending.store,
+            &pending.permit,
+            ArtifactKind::ToolCall,
+            &serde_json::json!({"call_id": "pending-call"}),
+            vec![],
+            ArtifactLifecycle::RunScoped,
+            pending.now,
+        );
+        pending
+            .store
+            .write_task_artifact(
+                &pending.permit,
+                &pending_call,
+                LifecycleEventType::ToolCalled,
+                pending.now,
+            )
+            .unwrap();
+        let output =
+            lifecycle_test_artifact(&pending, ArtifactLifecycle::RunScoped, "pending-output");
+        assert!(matches!(
+            pending.store.commit_attempt(
+                &pending.permit,
+                std::slice::from_ref(&output),
+                TaskStatus::Succeeded,
+                pending.now,
+            ),
+            Err(StoreError::Integrity(message)) if message.contains("pending tool calls")
+        ));
+        assert!(matches!(
+            pending.store.artifact(&output.artifact_id),
+            Err(StoreError::MissingArtifact(_))
+        ));
+        assert!(pending
+            .store
+            .events_after(&pending.run.run_id, 0, 100)
+            .unwrap()
+            .iter()
+            .all(|event| event.event_type != LifecycleEventType::TaskSucceeded.as_str()));
+    }
+
+    #[test]
+    fn tool_lifecycle_failure_can_close_pending_call() {
+        let fixture = task_artifact_fixture(RunPurpose::Debug);
+        let call = permit_artifact(
+            &fixture.store,
+            &fixture.permit,
+            ArtifactKind::ToolCall,
+            &serde_json::json!({"call_id": "failed-call"}),
+            vec![],
+            ArtifactLifecycle::RunScoped,
+            fixture.now,
+        );
+        fixture
+            .store
+            .write_task_artifact(
+                &fixture.permit,
+                &call,
+                LifecycleEventType::ToolCalled,
+                fixture.now,
+            )
+            .unwrap();
+        fixture
+            .store
+            .finish_task(&fixture.permit, TaskStatus::Failed, fixture.now)
+            .unwrap();
+        fixture.store.verify_integrity().unwrap();
+    }
+
+    #[test]
     fn events_after_validates_effect_history_beyond_page() {
         let fixture = execution_commit_fixture();
         let effect = artifact_ref(&fixture.commitment);
@@ -12517,6 +12864,36 @@ mod tests {
             .store
             .events_after(&fixture.permit.run_id, i64::MAX, 1)
             .is_err());
+    }
+
+    #[test]
+    fn events_after_rejects_tool_history_beyond_page() {
+        let fixture = task_artifact_fixture(RunPurpose::Debug);
+        {
+            let mut connection = fixture.store.connection.lock().unwrap();
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            transaction
+                .execute(
+                    r#"INSERT INTO rebuild_events
+                       (run_id, task_id, attempt_id, event_type, artifact_id, created_at)
+                       VALUES (?1, ?2, ?3, ?4, NULL, ?5)"#,
+                    params![
+                        fixture.permit.run_id.0,
+                        fixture.permit.task_id.0,
+                        fixture.permit.attempt_id.0,
+                        LifecycleEventType::ToolCalled.as_str(),
+                        fixture.now.to_rfc3339(),
+                    ],
+                )
+                .unwrap();
+            transaction.commit().unwrap();
+        }
+        assert!(matches!(
+            fixture.store.events_after(&fixture.run.run_id, i64::MAX, 1),
+            Err(StoreError::Integrity(message)) if message.contains("has no artifact")
+        ));
     }
 
     #[test]

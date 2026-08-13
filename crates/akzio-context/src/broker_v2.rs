@@ -2075,15 +2075,33 @@ mod tests {
         child_permit.contract_hash = Some(child_contract.contract_hash.clone());
         let broker = ContextBroker::new(store.clone());
 
+        let call = task_artifact(
+            &store,
+            &parent_permit,
+            ArtifactKind::ToolCall,
+            vec![],
+            "trace-call",
+        );
+        store
+            .write_task_artifact(&parent_permit, &call, LifecycleEventType::ToolCalled, now)
+            .unwrap();
         let trace = task_artifact(
             &store,
             &parent_permit,
             ArtifactKind::ToolResult,
-            vec![],
+            vec![ArtifactRef {
+                artifact_id: call.artifact_id.clone(),
+                kind: ArtifactKind::ToolCall,
+            }],
             "trace",
         );
         store
-            .write_task_artifact(&parent_permit, &trace, LifecycleEventType::ToolCompleted, now)
+            .write_task_artifact(
+                &parent_permit,
+                &trace,
+                LifecycleEventType::ToolCompleted,
+                now,
+            )
             .unwrap();
         store
             .commit_attempt(
