@@ -4385,6 +4385,12 @@ impl V2Store {
         let events = rows.collect::<Result<Vec<_>, _>>()?;
         for event in &events {
             event.lifecycle_kind()?;
+            validate_event_shape(
+                &event.event_type,
+                event.task_id.is_some(),
+                event.attempt_id.is_some(),
+                event.artifact_id.is_some(),
+            )?;
         }
         Ok(events)
     }
@@ -11874,6 +11880,36 @@ mod tests {
             Err(StoreError::Integrity(message))
                 if message.contains("invalid shape")
                     && message.contains("execution.effect.intent")
+        ));
+    }
+
+    #[test]
+    fn events_after_rejects_forged_paper_effect_event_shape() {
+        let fixture = execution_commit_fixture();
+        {
+            let mut connection = fixture.store.connection.lock().unwrap();
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            transaction
+                .execute(
+                    r#"INSERT INTO rebuild_events
+                       (run_id, task_id, attempt_id, event_type, artifact_id, created_at)
+                       VALUES (?1, NULL, NULL, ?2, NULL, ?3)"#,
+                    params![
+                        fixture.permit.run_id.0,
+                        LifecycleEventType::ExecutionEffectSettled.as_str(),
+                        fixture.now.to_rfc3339(),
+                    ],
+                )
+                .unwrap();
+            transaction.commit().unwrap();
+        }
+
+        assert!(matches!(
+            fixture.store.events_after(&fixture.permit.run_id, 0, 100),
+            Err(StoreError::InvalidLifecycleEventShape { event_type })
+                if event_type == LifecycleEventType::ExecutionEffectSettled.as_str()
         ));
     }
 
