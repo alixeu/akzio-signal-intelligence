@@ -75,7 +75,7 @@ impl ContextBroker {
         self.policy_influences_internal(permit, contract, manifest, now, true)
     }
 
-    fn policy_influences_internal(
+    fn validate_manifest_closure(
         &self,
         permit: &TaskWritePermit,
         contract: &AgentContract,
@@ -163,6 +163,19 @@ impl ContextBroker {
             return Err(ContextError::InvalidManifestClosure);
         }
 
+        Ok(selected)
+    }
+
+    fn policy_influences_internal(
+        &self,
+        permit: &TaskWritePermit,
+        contract: &AgentContract,
+        manifest: &ContextManifest,
+        now: DateTime<Utc>,
+        require_live_grant: bool,
+    ) -> ContextResult<Vec<ArtifactRef>> {
+        let selected =
+            self.validate_manifest_closure(permit, contract, manifest, now, require_live_grant)?;
         let mut influences = Vec::new();
         for reference in selected {
             if !matches!(
@@ -749,16 +762,22 @@ impl ContextBroker {
 
     pub fn read(
         &self,
+        permit: &TaskWritePermit,
+        contract: &AgentContract,
         grant: &ReadGrant,
         artifact_id: &ArtifactId,
         now: DateTime<Utc>,
     ) -> ContextResult<Artifact> {
+        if !grant.matches_permit(permit) || grant.contract_hash != contract.contract_hash {
+            return Err(ContextError::InvalidManifestClosure);
+        }
         if !grant.permits(artifact_id, false, now) {
             return Err(ContextError::GrantDenied {
                 manifest_id: grant.manifest_artifact_id.clone(),
                 artifact_id: artifact_id.clone(),
             });
         }
+        self.validate_persisted_grant(permit, contract, grant, now)?;
         let artifact = self.store.artifact(artifact_id)?;
         if is_trace_kind(artifact.kind) {
             return Err(ContextError::GrantDenied {
@@ -774,16 +793,22 @@ impl ContextBroker {
 
     pub fn read_raw(
         &self,
+        permit: &TaskWritePermit,
+        contract: &AgentContract,
         grant: &ReadGrant,
         artifact_id: &ArtifactId,
         now: DateTime<Utc>,
     ) -> ContextResult<Artifact> {
+        if !grant.matches_permit(permit) || grant.contract_hash != contract.contract_hash {
+            return Err(ContextError::InvalidManifestClosure);
+        }
         if !grant.permits(artifact_id, true, now) {
             return Err(ContextError::GrantDenied {
                 manifest_id: grant.manifest_artifact_id.clone(),
                 artifact_id: artifact_id.clone(),
             });
         }
+        self.validate_persisted_grant(permit, contract, grant, now)?;
         let artifact = self.store.artifact(artifact_id)?;
         if is_trace_kind(artifact.kind) {
             return Err(ContextError::GrantDenied {
@@ -811,7 +836,7 @@ impl ContextBroker {
             payload,
             grant: grant.clone(),
         };
-        self.policy_influences_internal(permit, contract, &manifest, now, true)
+        self.validate_manifest_closure(permit, contract, &manifest, now, true)
             .map(|_| ())
     }
 
@@ -1361,7 +1386,12 @@ mod tests {
     fn context_is_explicit_and_raw_is_only_granted_by_closure() {
         let root = tempdir().unwrap();
         let store = V2Store::open(root.path()).unwrap();
-        let permit = permit(&store);
+        let contract = contract(&store);
+        let permit = permit_for_contract(
+            &store,
+            RunPurpose::Debug,
+            Some(contract.contract_hash.clone()),
+        );
         let raw = task_artifact(&store, &permit, ArtifactKind::RawEvidence, vec![], "raw");
         store
             .write_task_artifact(&permit, &raw, "evidence.raw", Utc::now())
@@ -1381,7 +1411,6 @@ mod tests {
             .unwrap();
 
         let broker = ContextBroker::new(store.clone());
-        let contract = contract(&store);
         let manifest = broker
             .assemble(
                 &permit,
@@ -1397,34 +1426,66 @@ mod tests {
         assert_eq!(manifest.payload.selections.len(), 1);
         assert_eq!(
             broker
-                .read_raw(&manifest.grant, &raw.artifact_id, Utc::now())
+                .read_raw(
+                    &permit,
+                    &contract,
+                    &manifest.grant,
+                    &raw.artifact_id,
+                    Utc::now()
+                )
                 .unwrap()
                 .kind,
             ArtifactKind::RawEvidence
         );
         assert!(matches!(
-            broker.read(&manifest.grant, &raw.artifact_id, Utc::now()),
+            broker.read(
+                &permit,
+                &contract,
+                &manifest.grant,
+                &raw.artifact_id,
+                Utc::now()
+            ),
             Err(ContextError::GrantDenied { .. })
         ));
     }
 
     #[test]
     fn read_grant_expiry_is_exclusive_for_context_reads() {
-        let (_root, store, _permit, _contract, manifest, raw, _now) = manifest_fixture();
+        let (_root, store, permit, contract, manifest, raw, _now) = manifest_fixture();
         let broker = ContextBroker::new(store);
         let selected = manifest.payload.selections[0].artifact.artifact_id.clone();
         let just_before = manifest.grant.expires_at - Duration::nanoseconds(1);
 
-        assert!(broker.read(&manifest.grant, &selected, just_before).is_ok());
         assert!(broker
-            .read_raw(&manifest.grant, &raw.artifact_id, just_before)
+            .read(&permit, &contract, &manifest.grant, &selected, just_before)
+            .is_ok());
+        assert!(broker
+            .read_raw(
+                &permit,
+                &contract,
+                &manifest.grant,
+                &raw.artifact_id,
+                just_before
+            )
             .is_ok());
         assert!(matches!(
-            broker.read(&manifest.grant, &selected, manifest.grant.expires_at),
+            broker.read(
+                &permit,
+                &contract,
+                &manifest.grant,
+                &selected,
+                manifest.grant.expires_at
+            ),
             Err(ContextError::GrantDenied { .. })
         ));
         assert!(matches!(
-            broker.read_raw(&manifest.grant, &raw.artifact_id, manifest.grant.expires_at),
+            broker.read_raw(
+                &permit,
+                &contract,
+                &manifest.grant,
+                &raw.artifact_id,
+                manifest.grant.expires_at,
+            ),
             Err(ContextError::GrantDenied { .. })
         ));
     }
@@ -1433,7 +1494,12 @@ mod tests {
     fn unrelated_artifact_is_not_visible_to_the_grant() {
         let root = tempdir().unwrap();
         let store = V2Store::open(root.path()).unwrap();
-        let permit = permit(&store);
+        let contract = contract(&store);
+        let permit = permit_for_contract(
+            &store,
+            RunPurpose::Debug,
+            Some(contract.contract_hash.clone()),
+        );
         let first = task_artifact(
             &store,
             &permit,
@@ -1455,7 +1521,6 @@ mod tests {
             .write_task_artifact(&permit, &second, "evidence", Utc::now())
             .unwrap();
         let broker = ContextBroker::new(store.clone());
-        let contract = contract(&store);
         let manifest = broker
             .assemble(
                 &permit,
@@ -1469,8 +1534,93 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(
-            broker.read(&manifest.grant, &second.artifact_id, Utc::now()),
+            broker.read(
+                &permit,
+                &contract,
+                &manifest.grant,
+                &second.artifact_id,
+                Utc::now()
+            ),
             Err(ContextError::GrantDenied { .. })
+        ));
+    }
+
+    #[test]
+    fn read_rejects_a_forged_readable_set() {
+        let (_root, store, permit, contract, manifest, raw, now) = manifest_fixture();
+        let broker = ContextBroker::new(store);
+        let mut forged_grant = manifest.grant.clone();
+        forged_grant.readable.insert(raw.artifact_id.clone());
+
+        assert!(matches!(
+            broker.read(&permit, &contract, &forged_grant, &raw.artifact_id, now),
+            Err(ContextError::InvalidManifestClosure)
+        ));
+    }
+
+    #[test]
+    fn read_raw_rejects_a_forged_raw_source_closure() {
+        let (_root, store, permit, contract, manifest, raw, now) = manifest_fixture();
+        let broker = ContextBroker::new(store);
+        let selected = manifest.payload.selections[0].artifact.artifact_id.clone();
+        let mut forged_grant = manifest.grant.clone();
+        forged_grant.raw_source_closure.insert(selected);
+
+        assert!(matches!(
+            broker.read_raw(&permit, &contract, &forged_grant, &raw.artifact_id, now),
+            Err(ContextError::InvalidManifestClosure)
+        ));
+    }
+
+    #[test]
+    fn reads_reject_stale_attempt_identity_and_contract() {
+        let (_root, store, permit, manifest_contract, manifest, _raw, now) = manifest_fixture();
+        let broker = ContextBroker::new(store.clone());
+        let selected = &manifest.payload.selections[0].artifact.artifact_id;
+
+        let mut wrong_epoch = permit.clone();
+        wrong_epoch.epoch = wrong_epoch.epoch.saturating_add(1);
+        assert!(matches!(
+            broker.read(
+                &wrong_epoch,
+                &manifest_contract,
+                &manifest.grant,
+                selected,
+                now
+            ),
+            Err(ContextError::InvalidManifestClosure)
+        ));
+
+        let mut wrong_attempt = permit.clone();
+        wrong_attempt.attempt_id = akzio_domain::AttemptId::new();
+        assert!(matches!(
+            broker.read(
+                &wrong_attempt,
+                &manifest_contract,
+                &manifest.grant,
+                selected,
+                now
+            ),
+            Err(ContextError::InvalidManifestClosure)
+        ));
+
+        let mut wrong_lease = permit.clone();
+        wrong_lease.lease_id = akzio_domain::LeaseId::new();
+        assert!(matches!(
+            broker.read(
+                &wrong_lease,
+                &manifest_contract,
+                &manifest.grant,
+                selected,
+                now
+            ),
+            Err(ContextError::InvalidManifestClosure)
+        ));
+
+        let wrong_contract = contract(&store);
+        assert!(matches!(
+            broker.read(&permit, &wrong_contract, &manifest.grant, selected, now),
+            Err(ContextError::InvalidManifestClosure)
         ));
     }
 

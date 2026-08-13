@@ -1294,7 +1294,7 @@ impl AgentRuntime {
         if !manifest.grant.matches_permit(permit) {
             return Err(ResearchError::GrantPermitMismatch);
         }
-        let context = self.context_values(permit, &manifest, now)?;
+        let context = self.context_values(permit, &installed.contract, &manifest, now)?;
         let governance = String::from_utf8(
             self.store
                 .read_blob(&installed.contract.prompt.governance)?,
@@ -1509,6 +1509,7 @@ impl AgentRuntime {
     fn context_values(
         &self,
         permit: &TaskWritePermit,
+        contract: &AgentContract,
         manifest: &ContextManifest,
         now: DateTime<Utc>,
     ) -> ResearchResult<Vec<Value>> {
@@ -1520,9 +1521,13 @@ impl AgentRuntime {
             .selections
             .iter()
             .map(|selection| {
-                let artifact =
-                    self.context
-                        .read(&manifest.grant, &selection.artifact.artifact_id, now)?;
+                let artifact = self.context.read(
+                    permit,
+                    contract,
+                    &manifest.grant,
+                    &selection.artifact.artifact_id,
+                    now,
+                )?;
                 let bytes = self.store.read_blob(&artifact.blob)?;
                 let value = serde_json::from_slice(&bytes).unwrap_or_else(|_| {
                     Value::String(String::from_utf8_lossy(&bytes).into_owned())
@@ -1793,9 +1798,11 @@ impl AgentRuntime {
         }
         let raw = tool.kind == akzio_domain::ToolKind::ReadRawEvidence;
         let artifact = if raw {
-            self.context.read_raw(grant, &artifact_id, now)?
+            self.context
+                .read_raw(permit, contract, grant, &artifact_id, now)?
         } else {
-            self.context.read(grant, &artifact_id, now)?
+            self.context
+                .read(permit, contract, grant, &artifact_id, now)?
         };
         if !contract
             .tool_grants
