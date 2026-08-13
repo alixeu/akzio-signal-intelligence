@@ -6940,20 +6940,50 @@ fn validate_event_shape(
     has_attempt_id: bool,
     has_artifact_id: bool,
 ) -> StoreResult<()> {
-    if matches!(
-        LifecycleEventType::parse(event_type)?,
+    let event_type = LifecycleEventType::parse(event_type)?;
+    let effect_event = matches!(
+        event_type,
         LifecycleEventType::ExecutionEffectIntent
             | LifecycleEventType::ExecutionEffectRecovered
             | LifecycleEventType::ExecutionEffectSettled
-    ) && !(has_task_id && has_attempt_id && has_artifact_id)
-    {
+    );
+    if effect_event && !(has_task_id && has_attempt_id && has_artifact_id) {
         return Err(StoreError::InvalidLifecycleEventShape {
-            event_type: event_type.to_owned(),
+            event_type: event_type.as_str().to_owned(),
         });
     }
     if has_attempt_id && !has_task_id {
         return Err(StoreError::Domain(DomainError::AttemptOriginWithoutTask));
     }
+
+    let valid = match event_type {
+        LifecycleEventType::WorkflowCreated => !has_task_id && !has_attempt_id && has_artifact_id,
+        LifecycleEventType::RunCancelRequested => {
+            !has_task_id && !has_attempt_id && !has_artifact_id
+        }
+        LifecycleEventType::OutcomeWorkerEnqueued => {
+            has_task_id && !has_attempt_id && has_artifact_id
+        }
+        LifecycleEventType::TaskCancelled => has_task_id && (!has_artifact_id || has_attempt_id),
+        LifecycleEventType::TaskStarted
+        | LifecycleEventType::TaskRecovered
+        | LifecycleEventType::TaskRecoveryExhausted
+        | LifecycleEventType::TaskRetryExhausted
+        | LifecycleEventType::TaskRetryScheduled => {
+            has_task_id && has_attempt_id && !has_artifact_id
+        }
+        LifecycleEventType::TaskFailed
+        | LifecycleEventType::TaskSkipped
+        | LifecycleEventType::TaskSucceeded => has_task_id && has_attempt_id,
+        _ => has_task_id && has_attempt_id && has_artifact_id,
+    };
+
+    if !valid {
+        return Err(StoreError::InvalidLifecycleEventShape {
+            event_type: event_type.as_str().to_owned(),
+        });
+    }
+
     Ok(())
 }
 
@@ -11850,6 +11880,68 @@ mod tests {
                 ));
             }
         }
+    }
+
+    #[test]
+    fn lifecycle_event_shapes_accept_current_store_exceptions() {
+        let fixture = execution_commit_fixture();
+        let valid_cases = [
+            ("workflow.created", false, false, true),
+            ("run.cancel_requested", false, false, false),
+            ("outcome.worker.enqueued", true, false, true),
+            ("task.cancelled", true, false, false),
+            ("task.started", true, true, false),
+            ("task.retry_scheduled", true, true, false),
+            ("task.succeeded", true, true, true),
+            ("artifact.committed", true, true, true),
+            ("execution.committed", true, true, true),
+            ("policy.evaluated", true, true, true),
+            ("shadow_pair.completed", true, true, true),
+        ];
+
+        for (event_type, has_task_id, has_attempt_id, has_artifact_id) in valid_cases {
+            assert!(
+                validate_event_shape(event_type, has_task_id, has_attempt_id, has_artifact_id)
+                    .is_ok(),
+                "unexpectedly rejected {event_type}"
+            );
+        }
+
+        let invalid_cases = [
+            ("workflow.created", true, false, true),
+            ("run.cancel_requested", false, false, true),
+            ("outcome.worker.enqueued", true, true, true),
+            ("task.started", true, false, false),
+            ("artifact.committed", true, false, true),
+        ];
+
+        for (event_type, has_task_id, has_attempt_id, has_artifact_id) in invalid_cases {
+            assert!(
+                matches!(
+                    validate_event_shape(event_type, has_task_id, has_attempt_id, has_artifact_id),
+                    Err(StoreError::InvalidLifecycleEventShape { event_type: value })
+                        if value == event_type
+                ),
+                "unexpectedly accepted {event_type}"
+            );
+        }
+
+        let mut connection = fixture.store.connection.lock().unwrap();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        assert!(matches!(
+            append_event(
+                &transaction,
+                &fixture.permit.run_id,
+                None,
+                Some(&fixture.permit.attempt_id),
+                "artifact.committed",
+                None,
+                fixture.now,
+            ),
+            Err(StoreError::Domain(DomainError::AttemptOriginWithoutTask))
+        ));
     }
 
     #[test]
