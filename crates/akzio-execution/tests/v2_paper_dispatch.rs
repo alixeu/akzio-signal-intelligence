@@ -54,6 +54,7 @@ fn workflow() -> WorkflowGraph {
     let dispatch_task_id = TaskId::new();
     let reprice_task_id = TaskId::new();
     let reprice_dispatch_task_id = TaskId::new();
+    let duplicate_dispatch_task_id = TaskId::new();
     WorkflowGraph {
         schema_version: V2_SCHEMA_VERSION,
         topology_id: "paper-dispatch-fixture".to_owned(),
@@ -111,11 +112,24 @@ fn workflow() -> WorkflowGraph {
                 parent_task_id: None,
             },
             WorkflowNode {
+                task_id: duplicate_dispatch_task_id.clone(),
+                recipe_id: TaskRecipeId::new("execution.dispatch.duplicate").unwrap(),
+                contract_hash: None,
+                objective: "reject duplicate paper dispatch".to_owned(),
+                dependencies: vec![reprice_dispatch_task_id.clone()],
+                input_artifacts: vec![],
+                priority: 65,
+                budget: budget(),
+                retry: retry(),
+                on_failure: FailureDisposition::FailRun,
+                parent_task_id: None,
+            },
+            WorkflowNode {
                 task_id: TaskId::new(),
                 recipe_id: TaskRecipeId::new("execution.reprice.duplicate").unwrap(),
                 contract_hash: None,
                 objective: "reject duplicate paper reprice".to_owned(),
-                dependencies: vec![reprice_dispatch_task_id],
+                dependencies: vec![reprice_dispatch_task_id.clone()],
                 input_artifacts: vec![],
                 priority: 60,
                 budget: budget(),
@@ -735,6 +749,50 @@ async fn partial_then_filled_reprice_uses_one_durable_lineage() {
             event.artifact_id.as_ref() == Some(&reprice.reprice.artifact_id)
                 && event.event_type == LifecycleEventType::ExecutionEffectSettled.as_str()
         }));
+
+    let duplicate_dispatch_permit = store
+        .claim_next_task("duplicate-dispatch-worker", now, Duration::seconds(30))
+        .unwrap()
+        .unwrap()
+        .permit;
+    let execute_calls = broker.execute_calls.load(Ordering::SeqCst);
+    let reconcile_calls = broker.reconcile_calls.load(Ordering::SeqCst);
+    assert!(matches!(
+        runtime
+            .dispatch(
+                &broker,
+                &PaperDispatchInput {
+                    lease: lease.clone(),
+                    permit: duplicate_dispatch_permit,
+                    commitment: artifact_ref(&commitment),
+                    now,
+                },
+            )
+            .await,
+        Err(PaperDispatchError::Store(
+            StoreError::PaperEffectAlreadySettled(_)
+        ))
+    ));
+    assert_eq!(broker.execute_calls.load(Ordering::SeqCst), execute_calls);
+    assert_eq!(
+        broker.reconcile_calls.load(Ordering::SeqCst),
+        reconcile_calls
+    );
+    assert_eq!(
+        store
+            .events_after(&run_id, 0, 100)
+            .unwrap()
+            .iter()
+            .filter(|event| {
+                event.artifact_id.as_ref() == Some(&commitment.artifact_id)
+                    && matches!(
+                        event.event_type.as_str(),
+                        "execution.effect.settled" | "execution.effect.recovered"
+                    )
+            })
+            .count(),
+        1
+    );
 
     let duplicate_permit = store
         .claim_next_task("duplicate-worker", now, Duration::seconds(30))

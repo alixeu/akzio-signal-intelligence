@@ -104,6 +104,8 @@ pub enum StoreError {
     InvalidPaperEffect(ArtifactId),
     #[error("Paper effect {0} has no durable intent")]
     MissingPaperEffectIntent(ArtifactId),
+    #[error("Paper effect {0} already has a terminal settlement")]
+    PaperEffectAlreadySettled(ArtifactId),
     #[error("canonical learning requires a Paper run, got {0:?}")]
     NonCanonicalLearningPurpose(RunPurpose),
     #[error("outcome artifact {0} is not sealed")]
@@ -3043,6 +3045,11 @@ impl V2Store {
         assert_permit(&transaction, permit)?;
         assert_paper_run(&transaction, &permit.run_id)?;
         assert_paper_effect_artifact(&transaction, effect, &permit.run_id)?;
+        if paper_effect_terminal_exists(&transaction, &permit.run_id, &effect.artifact_id)? {
+            return Err(StoreError::PaperEffectAlreadySettled(
+                effect.artifact_id.clone(),
+            ));
+        }
         let already_recorded =
             paper_effect_intent_exists(&transaction, &permit.run_id, &effect.artifact_id)?;
         if already_recorded {
@@ -3080,6 +3087,11 @@ impl V2Store {
         assert_daemon_lease(&transaction, lease, now)?;
         assert_permit(&transaction, permit)?;
         assert_paper_effect_artifact(&transaction, effect, &permit.run_id)?;
+        if paper_effect_terminal_exists(&transaction, &permit.run_id, &effect.artifact_id)? {
+            return Err(StoreError::PaperEffectAlreadySettled(
+                effect.artifact_id.clone(),
+            ));
+        }
         if !paper_effect_intent_exists(&transaction, &permit.run_id, &effect.artifact_id)? {
             return Err(StoreError::MissingPaperEffectIntent(
                 effect.artifact_id.clone(),
@@ -6531,6 +6543,24 @@ fn paper_effect_intent_exists(
             run_id.0,
             LifecycleEventType::ExecutionEffectIntent.as_str(),
             effect_id.0.as_str(),
+        ],
+        |row| row.get::<_, i64>(0),
+    )?;
+    Ok(found != 0)
+}
+
+fn paper_effect_terminal_exists(
+    transaction: &Transaction<'_>,
+    run_id: &RunId,
+    effect_id: &ArtifactId,
+) -> StoreResult<bool> {
+    let found = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM rebuild_events WHERE run_id = ?1 AND artifact_id = ?2 AND event_type IN (?3, ?4))",
+        params![
+            run_id.0,
+            effect_id.0.as_str(),
+            LifecycleEventType::ExecutionEffectSettled.as_str(),
+            LifecycleEventType::ExecutionEffectRecovered.as_str(),
         ],
         |row| row.get::<_, i64>(0),
     )?;
