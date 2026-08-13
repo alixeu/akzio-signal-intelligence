@@ -3093,6 +3093,7 @@ impl V2Store {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         assert_daemon_lease(&transaction, lease, now)?;
         assert_permit(&transaction, permit)?;
+        assert_paper_run(&transaction, &permit.run_id)?;
         assert_paper_effect_artifact(&transaction, effect, &permit.run_id)?;
         if paper_effect_terminal_exists(&transaction, &permit.run_id, &effect.artifact_id)? {
             return Err(StoreError::PaperEffectAlreadySettled(
@@ -12367,6 +12368,69 @@ mod tests {
             })
             .count();
         assert_eq!(intent_count, 1);
+    }
+
+    #[test]
+    fn paper_effect_settlement_rejects_non_paper_run() {
+        let fixture = execution_commit_fixture();
+        let effect = artifact_ref(&fixture.commitment);
+        fixture
+            .store
+            .write_task_artifact(
+                &fixture.permit,
+                &fixture.commitment,
+                LifecycleEventType::ExecutionCommitted,
+                fixture.now,
+            )
+            .unwrap();
+        fixture
+            .store
+            .record_paper_effect_intent(&fixture.lease, &fixture.permit, &effect, fixture.now)
+            .unwrap();
+        fixture
+            .store
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE rebuild_runs SET purpose = ?1 WHERE run_id = ?2",
+                params![enum_name(RunPurpose::Debug), fixture.permit.run_id.0],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            fixture.store.commit_fenced_attempt_with_effect(
+                &fixture.lease,
+                &fixture.permit,
+                std::slice::from_ref(&fixture.commitment),
+                &effect,
+                false,
+                fixture.now,
+            ),
+            Err(StoreError::NonCanonicalLearningPurpose(RunPurpose::Debug))
+        ));
+
+        let events = fixture
+            .store
+            .events_after(&fixture.permit.run_id, 0, 100)
+            .unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.artifact_id.as_ref() == Some(&effect.artifact_id))
+                .filter(|event| {
+                    matches!(
+                        event.event_type.as_str(),
+                        "execution.effect.intent"
+                            | "execution.effect.settled"
+                            | "execution.effect.recovered"
+                    )
+                })
+                .map(|event| event.event_type.as_str())
+                .collect::<Vec<_>>(),
+            vec!["execution.effect.intent"]
+        );
+        fixture.store.verify_integrity().unwrap();
     }
 
     #[test]
