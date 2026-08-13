@@ -5,8 +5,8 @@ use std::collections::{BTreeSet, VecDeque};
 use akzio_domain::{
     content_hash_json, AgentContract, Artifact, ArtifactId, ArtifactKind, ArtifactLifecycle,
     ArtifactOrigin, ArtifactProvenance, ArtifactRef, CandidatePolicy, ContextManifestPayload,
-    ContextPolicy, ContextProjection, ContextSelection, DomainError, Experience, PolicyState,
-    ReadGrant, TaskWritePermit, V2_DOMAIN_SCHEMA_VERSION,
+    ContextPolicy, ContextProjection, ContextSelection, DomainError, Experience,
+    LifecycleEventType, PolicyState, ReadGrant, TaskWritePermit, V2_DOMAIN_SCHEMA_VERSION,
 };
 use akzio_store::v2::{StoreError, SucceededAttemptProof, V2Store};
 use chrono::{DateTime, Duration, Utc};
@@ -318,8 +318,12 @@ impl ContextBroker {
                 .collect(),
             now,
         )?;
-        self.store
-            .write_task_artifact(permit, &artifact, "context.manifest_created", now)?;
+        self.store.write_task_artifact(
+            permit,
+            &artifact,
+            LifecycleEventType::ContextManifestCreated,
+            now,
+        )?;
         let grant = ReadGrant {
             manifest_artifact_id: artifact.artifact_id.clone(),
             run_id: permit.run_id.clone(),
@@ -511,7 +515,7 @@ impl ContextBroker {
         self.store.write_task_artifact(
             child_permit,
             &artifact,
-            "context.child_manifest_created",
+            LifecycleEventType::ContextChildManifestCreated,
             now,
         )?;
         let grant = ReadGrant {
@@ -889,8 +893,12 @@ impl ContextBroker {
             source_refs,
             now,
         )?;
-        self.store
-            .write_task_artifact(permit, &artifact, "context.repaired", now)?;
+        self.store.write_task_artifact(
+            permit,
+            &artifact,
+            LifecycleEventType::ContextRepaired,
+            now,
+        )?;
         Ok(artifact)
     }
 
@@ -1275,7 +1283,7 @@ mod tests {
         let now = Utc::now();
         let raw = task_artifact(&store, &permit, ArtifactKind::RawEvidence, vec![], "raw");
         store
-            .write_task_artifact(&permit, &raw, "evidence.raw", now)
+            .write_task_artifact(&permit, &raw, LifecycleEventType::EvidenceRaw, now)
             .unwrap();
         let raw_ref = ArtifactRef {
             artifact_id: raw.artifact_id,
@@ -1289,7 +1297,12 @@ mod tests {
             "normalized",
         );
         store
-            .write_task_artifact(&permit, &normalized, "evidence.normalized", now)
+            .write_task_artifact(
+                &permit,
+                &normalized,
+                LifecycleEventType::EvidenceNormalized,
+                now,
+            )
             .unwrap();
         let manifest = ContextBroker::new(store.clone())
             .assemble(
@@ -1325,7 +1338,12 @@ mod tests {
         )
         .unwrap();
         store
-            .write_task_artifact(permit, &artifact, "context.manifest_created", now)
+            .write_task_artifact(
+                permit,
+                &artifact,
+                LifecycleEventType::ContextManifestCreated,
+                now,
+            )
             .unwrap();
         let mut grant = original.grant.clone();
         grant.manifest_artifact_id = artifact.artifact_id.clone();
@@ -1394,7 +1412,7 @@ mod tests {
         );
         let raw = task_artifact(&store, &permit, ArtifactKind::RawEvidence, vec![], "raw");
         store
-            .write_task_artifact(&permit, &raw, "evidence.raw", Utc::now())
+            .write_task_artifact(&permit, &raw, LifecycleEventType::EvidenceRaw, Utc::now())
             .unwrap();
         let normalized = task_artifact(
             &store,
@@ -1407,7 +1425,12 @@ mod tests {
             "normalized",
         );
         store
-            .write_task_artifact(&permit, &normalized, "evidence.normalized", Utc::now())
+            .write_task_artifact(
+                &permit,
+                &normalized,
+                LifecycleEventType::EvidenceNormalized,
+                Utc::now(),
+            )
             .unwrap();
 
         let broker = ContextBroker::new(store.clone());
@@ -1515,10 +1538,10 @@ mod tests {
             "second",
         );
         store
-            .write_task_artifact(&permit, &first, "evidence", Utc::now())
+            .write_task_artifact(&permit, &first, LifecycleEventType::Evidence, Utc::now())
             .unwrap();
         store
-            .write_task_artifact(&permit, &second, "evidence", Utc::now())
+            .write_task_artifact(&permit, &second, LifecycleEventType::Evidence, Utc::now())
             .unwrap();
         let broker = ContextBroker::new(store.clone());
         let manifest = broker
@@ -1688,10 +1711,20 @@ mod tests {
             "unrelated",
         );
         store
-            .write_task_artifact(&permit, &normalized, "evidence", Utc::now())
+            .write_task_artifact(
+                &permit,
+                &normalized,
+                LifecycleEventType::Evidence,
+                Utc::now(),
+            )
             .unwrap();
         store
-            .write_task_artifact(&permit, &unrelated, "evidence", Utc::now())
+            .write_task_artifact(
+                &permit,
+                &unrelated,
+                LifecycleEventType::Evidence,
+                Utc::now(),
+            )
             .unwrap();
         let broker = ContextBroker::new(store.clone());
         let manifest = broker
@@ -1811,7 +1844,12 @@ mod tests {
             "second normalized",
         );
         store
-            .write_task_artifact(&permit, &second, "evidence.normalized", now)
+            .write_task_artifact(
+                &permit,
+                &second,
+                LifecycleEventType::EvidenceNormalized,
+                now,
+            )
             .unwrap();
 
         let second_ref = ArtifactRef {
@@ -1982,7 +2020,12 @@ mod tests {
                 )
                 .unwrap();
                 assert!(matches!(
-                    store.write_task_artifact(&permit, &overlay, "learning.overlay", now),
+                    store.write_task_artifact(
+                        &permit,
+                        &overlay,
+                        LifecycleEventType::LearningOverlay,
+                        now
+                    ),
                     Err(StoreError::InvalidLearningCommit(
                         "learning_artifact.atomic_commit_required"
                     ))

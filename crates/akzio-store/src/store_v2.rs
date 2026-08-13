@@ -1360,7 +1360,7 @@ impl V2Store {
             &commit.run.run_id,
             None,
             None,
-            "workflow.created",
+            LifecycleEventType::WorkflowCreated,
             Some(&commit.graph.artifact_id),
             commit.run.created_at,
         )?;
@@ -1737,7 +1737,7 @@ impl V2Store {
                     &commit.permit.run_id,
                     Some(&commit.permit.task_id),
                     Some(&commit.permit.attempt_id),
-                    "artifact.committed",
+                    LifecycleEventType::ArtifactCommitted,
                     Some(&commit.commitment.artifact_id),
                     commit.committed_at,
                 )?;
@@ -1752,7 +1752,7 @@ impl V2Store {
                     &commit.permit.run_id,
                     Some(&commit.permit.task_id),
                     Some(&commit.permit.attempt_id),
-                    "execution.commitment.recovered",
+                    LifecycleEventType::ExecutionCommitmentRecovered,
                     Some(&commit.commitment.artifact_id),
                     commit.committed_at,
                 )?;
@@ -1788,7 +1788,7 @@ impl V2Store {
                         &commit.permit.run_id,
                         Some(&commit.permit.task_id),
                         Some(&commit.permit.attempt_id),
-                        "artifact.committed",
+                        LifecycleEventType::ArtifactCommitted,
                         Some(&existing_artifact_id),
                         commit.committed_at,
                     )?;
@@ -1803,7 +1803,7 @@ impl V2Store {
                         &commit.permit.run_id,
                         Some(&commit.permit.task_id),
                         Some(&commit.permit.attempt_id),
-                        "execution.commitment.recovered",
+                        LifecycleEventType::ExecutionCommitmentRecovered,
                         Some(&existing_artifact_id),
                         commit.committed_at,
                     )?;
@@ -1840,7 +1840,7 @@ impl V2Store {
             &commit.permit.run_id,
             Some(&commit.permit.task_id),
             Some(&commit.permit.attempt_id),
-            "artifact.committed",
+            LifecycleEventType::ArtifactCommitted,
             Some(&commit.commitment.artifact_id),
             commit.committed_at,
         )?;
@@ -1855,7 +1855,7 @@ impl V2Store {
             &commit.permit.run_id,
             Some(&commit.permit.task_id),
             Some(&commit.permit.attempt_id),
-            "execution.committed",
+            LifecycleEventType::ExecutionCommitted,
             Some(&commit.commitment.artifact_id),
             commit.committed_at,
         )?;
@@ -2181,7 +2181,7 @@ impl V2Store {
                         &commit.permit.run_id,
                         Some(&commit.permit.task_id),
                         Some(&commit.permit.attempt_id),
-                        "execution.reprice.recovered",
+                        LifecycleEventType::ExecutionRepriceRecovered,
                         Some(&existing_artifact_id),
                         commit.committed_at,
                     )?;
@@ -2224,7 +2224,7 @@ impl V2Store {
             &commit.permit.run_id,
             Some(&commit.permit.task_id),
             Some(&commit.permit.attempt_id),
-            "execution.reprice.committed",
+            LifecycleEventType::ExecutionRepriceCommitted,
             Some(&commit.reprice.artifact_id),
             commit.committed_at,
         )?;
@@ -2356,7 +2356,7 @@ impl V2Store {
             run_id,
             Some(&permit.task_id),
             Some(&permit.attempt_id),
-            "artifact.committed",
+            LifecycleEventType::ArtifactCommitted,
             Some(&planner_output.artifact_id),
             now,
         )?;
@@ -2367,7 +2367,7 @@ impl V2Store {
                 run_id,
                 Some(&permit.task_id),
                 Some(&permit.attempt_id),
-                "artifact.committed",
+                LifecycleEventType::ArtifactCommitted,
                 Some(&evidence_need.artifact_id),
                 now,
             )?;
@@ -2452,7 +2452,7 @@ impl V2Store {
             run_id,
             Some(&permit.task_id),
             Some(&permit.attempt_id),
-            "artifact.committed",
+            LifecycleEventType::ArtifactCommitted,
             Some(&proposal_artifact.artifact_id),
             now,
         )?;
@@ -2521,7 +2521,7 @@ impl V2Store {
             run_id,
             Some(&permit.task_id),
             Some(&permit.attempt_id),
-            "workflow.patched",
+            LifecycleEventType::WorkflowPatched,
             Some(&next_graph.artifact_id),
             now,
         )?;
@@ -2578,7 +2578,7 @@ impl V2Store {
             run_id,
             None,
             None,
-            "run.cancel_requested",
+            LifecycleEventType::RunCancelRequested,
             None,
             now,
         )?;
@@ -2635,7 +2635,7 @@ impl V2Store {
                 &permit.run_id,
                 Some(&permit.task_id),
                 Some(&permit.attempt_id),
-                "task.retry_scheduled",
+                LifecycleEventType::TaskRetryScheduled,
                 None,
                 now,
             )?;
@@ -2648,7 +2648,7 @@ impl V2Store {
             &permit.run_id,
             Some(&permit.task_id),
             Some(&permit.attempt_id),
-            "task.retry_exhausted",
+            LifecycleEventType::TaskRetryExhausted,
             None,
             now,
         )?;
@@ -2754,7 +2754,7 @@ impl V2Store {
             &permit.run_id,
             Some(&permit.task_id),
             Some(&permit.attempt_id),
-            "task.started",
+            LifecycleEventType::TaskStarted,
             None,
             now,
         )?;
@@ -2861,7 +2861,7 @@ impl V2Store {
         &self,
         permit: &TaskWritePermit,
         artifact: &Artifact,
-        event_type: &str,
+        event_type: LifecycleEventType,
         now: DateTime<Utc>,
     ) -> StoreResult<()> {
         self.write_task_artifact_fenced(None, permit, artifact, event_type, now)
@@ -2875,10 +2875,9 @@ impl V2Store {
         lease: Option<&DaemonLease>,
         permit: &TaskWritePermit,
         artifact: &Artifact,
-        event_type: &str,
+        event_type: LifecycleEventType,
         now: DateTime<Utc>,
     ) -> StoreResult<()> {
-        validate_event_type(event_type)?;
         artifact.validate()?;
         reject_generic_learning_artifact(artifact)?;
         self.read_blob(&artifact.blob)?;
@@ -3004,7 +3003,7 @@ impl V2Store {
             &permit.run_id,
             Some(&worker.task_id),
             None,
-            "outcome.worker.enqueued",
+            LifecycleEventType::OutcomeWorkerEnqueued,
             Some(&schedule.artifact_id),
             now,
         )?;
@@ -3063,7 +3062,7 @@ impl V2Store {
             &permit.run_id,
             Some(&permit.task_id),
             Some(&permit.attempt_id),
-            LifecycleEventType::ExecutionEffectIntent.as_str(),
+            LifecycleEventType::ExecutionEffectIntent,
             Some(&effect.artifact_id),
             now,
         )?;
@@ -3252,7 +3251,7 @@ impl V2Store {
                 &permit.run_id,
                 Some(&permit.task_id),
                 Some(&permit.attempt_id),
-                "artifact.committed",
+                LifecycleEventType::ArtifactCommitted,
                 Some(&artifact.artifact_id),
                 now,
             )?;
@@ -3303,7 +3302,7 @@ impl V2Store {
             &permit.run_id,
             Some(&permit.task_id),
             Some(&permit.attempt_id),
-            "shadow_pair.completed",
+            LifecycleEventType::ShadowPairCompleted,
             Some(&completion.candidate_outcome.artifact_id),
             completion.completed_at,
         )?;
@@ -3455,7 +3454,7 @@ impl V2Store {
                 &commit.permit.run_id,
                 Some(&commit.permit.task_id),
                 Some(&commit.permit.attempt_id),
-                "artifact.committed",
+                LifecycleEventType::ArtifactCommitted,
                 Some(&artifact.artifact_id),
                 commit.completed_at,
             )?;
@@ -3473,7 +3472,7 @@ impl V2Store {
             &commit.permit.run_id,
             Some(&commit.permit.task_id),
             Some(&commit.permit.attempt_id),
-            "policy.evaluated",
+            LifecycleEventType::PolicyEvaluated,
             Some(&commit.evaluation.artifact_id),
             commit.completed_at,
         )?;
@@ -3487,7 +3486,7 @@ impl V2Store {
                 &commit.permit.run_id,
                 Some(&commit.permit.task_id),
                 Some(&commit.permit.attempt_id),
-                "policy.transitioned",
+                LifecycleEventType::PolicyTransitioned,
                 Some(&commit.evaluation.artifact_id),
                 commit.completed_at,
             )?;
@@ -3717,7 +3716,7 @@ impl V2Store {
                     run_id,
                     Some(task_id),
                     Some(attempt_id),
-                    "task.recovered",
+                    LifecycleEventType::TaskRecovered,
                     None,
                     now,
                 )?;
@@ -3727,7 +3726,7 @@ impl V2Store {
                     run_id,
                     Some(task_id),
                     Some(attempt_id),
-                    "task.recovery_exhausted",
+                    LifecycleEventType::TaskRecoveryExhausted,
                     None,
                     now,
                 )?;
@@ -4384,9 +4383,9 @@ impl V2Store {
         })?;
         let events = rows.collect::<Result<Vec<_>, _>>()?;
         for event in &events {
-            event.lifecycle_kind()?;
+            let event_type = event.lifecycle_kind()?;
             validate_event_shape(
-                &event.event_type,
+                event_type,
                 event.task_id.is_some(),
                 event.attempt_id.is_some(),
                 event.artifact_id.is_some(),
@@ -4413,13 +4412,13 @@ impl V2Store {
         })?;
         for row in event_rows {
             let (cursor, run_id, task_id, attempt_id, event_type, artifact_id) = row?;
-            LifecycleEventType::parse(&event_type).map_err(|error| {
+            let event_type = LifecycleEventType::parse(&event_type).map_err(|error| {
                 StoreError::Integrity(format!(
                     "event {cursor} has invalid lifecycle type: {error}"
                 ))
             })?;
             validate_event_shape(
-                &event_type,
+                event_type,
                 task_id.is_some(),
                 attempt_id.is_some(),
                 artifact_id.is_some(),
@@ -6726,7 +6725,7 @@ fn commit_attempt_transaction_with_effect(
             &permit.run_id,
             Some(&permit.task_id),
             Some(&permit.attempt_id),
-            "artifact.committed",
+            LifecycleEventType::ArtifactCommitted,
             Some(&artifact.artifact_id),
             now,
         )?;
@@ -6740,7 +6739,7 @@ fn commit_attempt_transaction_with_effect(
             &permit.run_id,
             Some(&permit.task_id),
             Some(&permit.attempt_id),
-            event_type.as_str(),
+            event_type,
             Some(&effect.artifact_id),
             now,
         )?;
@@ -6787,10 +6786,10 @@ fn finish_permitted_task(
         Some(&permit.task_id),
         Some(&permit.attempt_id),
         match status {
-            TaskStatus::Succeeded => "task.succeeded",
-            TaskStatus::Failed => "task.failed",
-            TaskStatus::Cancelled => "task.cancelled",
-            TaskStatus::Skipped => "task.skipped",
+            TaskStatus::Succeeded => LifecycleEventType::TaskSucceeded,
+            TaskStatus::Failed => LifecycleEventType::TaskFailed,
+            TaskStatus::Cancelled => LifecycleEventType::TaskCancelled,
+            TaskStatus::Skipped => LifecycleEventType::TaskSkipped,
             _ => unreachable!("terminal status checked above"),
         },
         terminal_artifact_id,
@@ -6835,7 +6834,7 @@ fn cancel_queued_tasks(
                 run_id,
                 Some(&task_id),
                 None,
-                "task.cancelled",
+                LifecycleEventType::TaskCancelled,
                 None,
                 now,
             )?;
@@ -6883,7 +6882,7 @@ fn cancel_failed_dependents(
                     run_id,
                     Some(&task_id),
                     None,
-                    "task.cancelled",
+                    LifecycleEventType::TaskCancelled,
                     None,
                     now,
                 )?;
@@ -6897,11 +6896,10 @@ fn append_event(
     run_id: &RunId,
     task_id: Option<&TaskId>,
     attempt_id: Option<&akzio_domain::AttemptId>,
-    event_type: &str,
+    event_type: LifecycleEventType,
     artifact_id: Option<&ArtifactId>,
     created_at: DateTime<Utc>,
 ) -> StoreResult<i64> {
-    validate_event_type(event_type)?;
     validate_event_shape(
         event_type,
         task_id.is_some(),
@@ -6916,7 +6914,7 @@ fn append_event(
             run_id.0,
             task_id.map(|id| id.0.as_str()),
             attempt_id.map(|id| id.0.as_str()),
-            event_type,
+            event_type.as_str(),
             artifact_id.map(|id| id.0.as_str()),
             created_at.to_rfc3339(),
         ],
@@ -6924,23 +6922,12 @@ fn append_event(
     Ok(transaction.last_insert_rowid())
 }
 
-fn validate_event_type(event_type: &str) -> StoreResult<()> {
-    if event_type.trim().is_empty() {
-        return Err(StoreError::Domain(DomainError::EmptyField {
-            field: "event_type",
-        }));
-    }
-    LifecycleEventType::parse(event_type)?;
-    Ok(())
-}
-
 fn validate_event_shape(
-    event_type: &str,
+    event_type: LifecycleEventType,
     has_task_id: bool,
     has_attempt_id: bool,
     has_artifact_id: bool,
 ) -> StoreResult<()> {
-    let event_type = LifecycleEventType::parse(event_type)?;
     let effect_event = matches!(
         event_type,
         LifecycleEventType::ExecutionEffectIntent
@@ -8719,7 +8706,12 @@ mod tests {
                 now,
             );
             store
-                .write_task_artifact(permit, &artifact, "fixture.source.created", now)
+                .write_task_artifact(
+                    permit,
+                    &artifact,
+                    LifecycleEventType::FixtureSourceCreated,
+                    now,
+                )
                 .unwrap();
             artifact_ref(&artifact)
         };
@@ -8769,7 +8761,7 @@ mod tests {
             now,
         );
         store
-            .write_task_artifact(permit, &plan, "execution.plan.created", now)
+            .write_task_artifact(permit, &plan, LifecycleEventType::ExecutionPlanCreated, now)
             .unwrap();
         let plan_ref = artifact_ref(&plan);
         let context = permit_artifact(
@@ -8802,7 +8794,12 @@ mod tests {
             now,
         );
         store
-            .write_task_artifact(permit, &context, "execution.context.created", now)
+            .write_task_artifact(
+                permit,
+                &context,
+                LifecycleEventType::ExecutionContextCreated,
+                now,
+            )
             .unwrap();
         let context_ref = artifact_ref(&context);
         let verdict = permit_artifact(
@@ -8817,7 +8814,12 @@ mod tests {
             now,
         );
         store
-            .write_task_artifact(permit, &verdict, "execution.verdict.created", now)
+            .write_task_artifact(
+                permit,
+                &verdict,
+                LifecycleEventType::ExecutionVerdictCreated,
+                now,
+            )
             .unwrap();
         permit_artifact(
             store,
@@ -9281,7 +9283,7 @@ mod tests {
                 &self.run.run_id,
                 Some(&self.permit.task_id),
                 Some(&self.permit.attempt_id),
-                "shadow_pair.completed",
+                LifecycleEventType::ShadowPairCompleted,
                 Some(&self.seed_artifact_id),
                 completed_at,
             )
@@ -9510,7 +9512,12 @@ mod tests {
             }),
         );
         store
-            .write_task_artifact(&claimed.permit, &turn, "agent.turn", Utc::now())
+            .write_task_artifact(
+                &claimed.permit,
+                &turn,
+                LifecycleEventType::AgentTurn,
+                Utc::now(),
+            )
             .unwrap();
         assert!(matches!(
             store.committed_attempt_outputs(&claimed.permit.task_id, &claimed.permit.attempt_id),
@@ -10194,7 +10201,12 @@ mod tests {
             vec![artifact_ref(&evidence)],
         );
         assert!(matches!(
-            store.write_task_artifact(&claimed.permit, &artifact, "claim.created", Utc::now()),
+            store.write_task_artifact(
+                &claimed.permit,
+                &artifact,
+                LifecycleEventType::ClaimCreated,
+                Utc::now()
+            ),
             Err(StoreError::StalePermit(_))
         ));
     }
@@ -10294,7 +10306,7 @@ mod tests {
             .write_task_artifact(
                 &fixture.permit,
                 &no_order,
-                "execution.verdict.no_order",
+                LifecycleEventType::ExecutionVerdictNoOrder,
                 fixture.now,
             )
             .unwrap();
@@ -10412,7 +10424,7 @@ mod tests {
                 Some(&fixture.lease),
                 &fixture.permit,
                 &evidence,
-                "outcome.evidence",
+                LifecycleEventType::OutcomeEvidence,
                 stale,
             ),
             Err(StoreError::SchedulerFenced(_))
@@ -10427,7 +10439,7 @@ mod tests {
                 Some(&successor),
                 &fixture.permit,
                 &evidence,
-                "outcome.evidence",
+                LifecycleEventType::OutcomeEvidence,
                 stale,
             )
             .unwrap();
@@ -11589,7 +11601,7 @@ mod tests {
                 fixture.store.write_task_artifact(
                     &fixture.permit,
                     &protected,
-                    "fixture.generic_write",
+                    LifecycleEventType::FixtureGenericWrite,
                     fixture.now,
                 ),
                 Err(StoreError::InvalidLearningCommit(
@@ -11797,7 +11809,7 @@ mod tests {
                 &fixture.run.run_id,
                 Some(&fixture.permit.task_id),
                 Some(&fixture.permit.attempt_id),
-                "policy.transitioned",
+                LifecycleEventType::PolicyTransitioned,
                 Some(&fixture.evaluation.artifact_id),
                 stale_transition.created_at,
             )
@@ -11859,7 +11871,6 @@ mod tests {
         ];
 
         for lifecycle_type in event_types {
-            let event_type = lifecycle_type.as_str();
             for (task_id, attempt_id, artifact_id) in cases {
                 let mut connection = fixture.store.connection.lock().unwrap();
                 let transaction = connection
@@ -11871,12 +11882,12 @@ mod tests {
                         &fixture.permit.run_id,
                         task_id,
                         attempt_id,
-                        event_type,
+                        lifecycle_type,
                         artifact_id,
                         fixture.now,
                     ),
                     Err(StoreError::InvalidLifecycleEventShape { event_type: value })
-                        if value == event_type
+                    if value == lifecycle_type.as_str()
                 ));
             }
         }
@@ -11886,33 +11897,34 @@ mod tests {
     fn lifecycle_event_shapes_accept_current_store_exceptions() {
         let fixture = execution_commit_fixture();
         let valid_cases = [
-            ("workflow.created", false, false, true),
-            ("run.cancel_requested", false, false, false),
-            ("outcome.worker.enqueued", true, false, true),
-            ("task.cancelled", true, false, false),
-            ("task.started", true, true, false),
-            ("task.retry_scheduled", true, true, false),
-            ("task.succeeded", true, true, true),
-            ("artifact.committed", true, true, true),
-            ("execution.committed", true, true, true),
-            ("policy.evaluated", true, true, true),
-            ("shadow_pair.completed", true, true, true),
+            (LifecycleEventType::WorkflowCreated, false, false, true),
+            (LifecycleEventType::RunCancelRequested, false, false, false),
+            (LifecycleEventType::OutcomeWorkerEnqueued, true, false, true),
+            (LifecycleEventType::TaskCancelled, true, false, false),
+            (LifecycleEventType::TaskStarted, true, true, false),
+            (LifecycleEventType::TaskRetryScheduled, true, true, false),
+            (LifecycleEventType::TaskSucceeded, true, true, true),
+            (LifecycleEventType::ArtifactCommitted, true, true, true),
+            (LifecycleEventType::ExecutionCommitted, true, true, true),
+            (LifecycleEventType::PolicyEvaluated, true, true, true),
+            (LifecycleEventType::ShadowPairCompleted, true, true, true),
         ];
 
         for (event_type, has_task_id, has_attempt_id, has_artifact_id) in valid_cases {
             assert!(
                 validate_event_shape(event_type, has_task_id, has_attempt_id, has_artifact_id)
                     .is_ok(),
-                "unexpectedly rejected {event_type}"
+                "unexpectedly rejected {:?}",
+                event_type
             );
         }
 
         let invalid_cases = [
-            ("workflow.created", true, false, true),
-            ("run.cancel_requested", false, false, true),
-            ("outcome.worker.enqueued", true, true, true),
-            ("task.started", true, false, false),
-            ("artifact.committed", true, false, true),
+            (LifecycleEventType::WorkflowCreated, true, false, true),
+            (LifecycleEventType::RunCancelRequested, false, false, true),
+            (LifecycleEventType::OutcomeWorkerEnqueued, true, true, true),
+            (LifecycleEventType::TaskStarted, true, false, false),
+            (LifecycleEventType::ArtifactCommitted, true, false, true),
         ];
 
         for (event_type, has_task_id, has_attempt_id, has_artifact_id) in invalid_cases {
@@ -11920,9 +11932,10 @@ mod tests {
                 matches!(
                     validate_event_shape(event_type, has_task_id, has_attempt_id, has_artifact_id),
                     Err(StoreError::InvalidLifecycleEventShape { event_type: value })
-                        if value == event_type
+                if value == event_type.as_str()
                 ),
-                "unexpectedly accepted {event_type}"
+                "unexpectedly accepted {:?}",
+                event_type
             );
         }
 
@@ -11936,7 +11949,7 @@ mod tests {
                 &fixture.permit.run_id,
                 None,
                 Some(&fixture.permit.attempt_id),
-                "artifact.committed",
+                LifecycleEventType::ArtifactCommitted,
                 None,
                 fixture.now,
             ),

@@ -9,9 +9,9 @@ use akzio_context::v2::{ContextBroker, ContextError, ContextManifest};
 use akzio_domain::{
     AgentContract, Artifact, ArtifactId, ArtifactKind, ArtifactLifecycle, ArtifactOrigin,
     ArtifactProvenance, ArtifactRef, ContextPolicy, ContractId, ContractPurpose, DomainError,
-    FailureDisposition, OutputContract, PromptBundle, ReadGrant, ResearchClaim, ResearchCritique,
-    ResearchResolution, RetryPolicy, RuntimeTaskClass, TaskBudget, TaskRecipe, TaskRecipeId,
-    TaskWritePermit, TerminationPolicy, ToolGrant, ToolKind, ToolSpec, WorkflowNode,
+    FailureDisposition, LifecycleEventType, OutputContract, PromptBundle, ReadGrant, ResearchClaim,
+    ResearchCritique, ResearchResolution, RetryPolicy, RuntimeTaskClass, TaskBudget, TaskRecipe,
+    TaskRecipeId, TaskWritePermit, TerminationPolicy, ToolGrant, ToolKind, ToolSpec, WorkflowNode,
     V2_SCHEMA_VERSION,
 };
 use akzio_model::{
@@ -1606,7 +1606,7 @@ impl AgentRuntime {
         self.store.write_task_artifact(
             record.permit,
             &artifact,
-            "agent.turn_completed",
+            LifecycleEventType::AgentTurnCompleted,
             record.now,
         )?;
         Ok(artifact)
@@ -1664,9 +1664,9 @@ impl AgentRuntime {
             record.permit,
             &artifact,
             if will_retry {
-                "agent.turn_retryable_failed"
+                LifecycleEventType::AgentTurnRetryableFailed
             } else {
-                "agent.turn_failed"
+                LifecycleEventType::AgentTurnFailed
             },
             record.now,
         )?;
@@ -1705,8 +1705,12 @@ impl AgentRuntime {
             }],
             now,
         )?;
-        self.store
-            .write_task_artifact(permit, &call_artifact, "tool.called", now)?;
+        self.store.write_task_artifact(
+            permit,
+            &call_artifact,
+            LifecycleEventType::ToolCalled,
+            now,
+        )?;
 
         match self.execute_tool_inner(permit, contract, grant, call, now) {
             Ok((artifact, value)) => {
@@ -1742,8 +1746,12 @@ impl AgentRuntime {
                     ],
                     now,
                 )?;
-                self.store
-                    .write_task_artifact(permit, &result_artifact, "tool.completed", now)?;
+                self.store.write_task_artifact(
+                    permit,
+                    &result_artifact,
+                    LifecycleEventType::ToolCompleted,
+                    now,
+                )?;
                 Ok(ToolResult {
                     value: json!({
                         "call_id": call.call_id,
@@ -1785,8 +1793,12 @@ impl AgentRuntime {
                     }],
                     now,
                 )?;
-                self.store
-                    .write_task_artifact(permit, &result_artifact, "tool.failed", now)?;
+                self.store.write_task_artifact(
+                    permit,
+                    &result_artifact,
+                    LifecycleEventType::ToolFailed,
+                    now,
+                )?;
                 Err(error)
             }
         }
@@ -2701,7 +2713,7 @@ mod tests {
             .write_task_artifact(
                 &claimed.permit,
                 &evidence,
-                "evidence.normalized",
+                LifecycleEventType::EvidenceNormalized,
                 Utc::now(),
             )
             .unwrap();
@@ -3311,7 +3323,12 @@ mod tests {
         )
         .unwrap();
         store
-            .write_task_artifact(&claimed.permit, &news, "evidence.normalized", Utc::now())
+            .write_task_artifact(
+                &claimed.permit,
+                &news,
+                LifecycleEventType::EvidenceNormalized,
+                Utc::now(),
+            )
             .unwrap();
         let runtime = AgentRuntime::new(store.clone(), catalogue, Duration::minutes(5));
         let model = FixedModel(AgentModelTurn {
@@ -3516,7 +3533,7 @@ mod tests {
             .write_task_artifact(
                 &claimed.permit,
                 &evidence,
-                "evidence.normalized",
+                LifecycleEventType::EvidenceNormalized,
                 Utc::now(),
             )
             .unwrap();

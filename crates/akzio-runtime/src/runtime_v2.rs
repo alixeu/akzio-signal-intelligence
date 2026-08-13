@@ -2056,8 +2056,8 @@ mod tests {
 
     use akzio_domain::{
         ArtifactOrigin, ClaimStance, ContentHash, ContractPurpose, DecisionHorizon, EvidenceGap,
-        EvidenceNeed, FailureDisposition, ResearchClaim, RetryPolicy, TaskBudget,
-        WorkflowProposalDraft, WorkflowProposalDraftTask, WorkflowProposalTask,
+        EvidenceNeed, FailureDisposition, LifecycleEventType, ResearchClaim, RetryPolicy,
+        TaskBudget, WorkflowProposalDraft, WorkflowProposalDraftTask, WorkflowProposalTask,
     };
     use tempfile::tempdir;
 
@@ -2694,7 +2694,12 @@ mod tests {
             .unwrap();
         let artifact = task_artifact(&store, &claimed, now);
         store
-            .write_task_artifact(&claimed.permit, &artifact, "agent.turn_completed", now)
+            .write_task_artifact(
+                &claimed.permit,
+                &artifact,
+                LifecycleEventType::AgentTurnCompleted,
+                now,
+            )
             .unwrap();
 
         assert_eq!(

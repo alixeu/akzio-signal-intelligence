@@ -26,7 +26,7 @@ use std::{
 use akzio_domain::{
     AccountSnapshot, Artifact, ArtifactId, ArtifactKind, ArtifactLifecycle, ArtifactOrigin,
     ArtifactProvenance, ArtifactRef, Asset, ContentHash, ContextPolicy, Decision, DecisionContext,
-    DomainError, EvidenceNeed, ExecutionContext, ExecutionVerdict, FreezeState,
+    DomainError, EvidenceNeed, ExecutionContext, ExecutionVerdict, FreezeState, LifecycleEventType,
     MarketClockSnapshot, MemoryId, MoneyMicros, OutcomeExecutionLineage, OutcomeHorizon,
     OutcomeSchedule, PolicySubject, QuoteSnapshot, ResearchClaim, RunId, RunPurpose,
     RuntimeTaskClass, TaskId, TaskStatus, TopologyId, WorkflowProposal, WorkflowStatus,
@@ -877,7 +877,7 @@ impl Daemon {
                 Some(&outcome_lease),
                 &task.permit,
                 &artifact,
-                "outcome.evidence",
+                LifecycleEventType::OutcomeEvidence,
                 now,
             )?;
         }
@@ -995,7 +995,7 @@ impl Daemon {
                 Some(outcome_lease),
                 &task.permit,
                 &need_artifact,
-                "outcome.need",
+                LifecycleEventType::OutcomeNeed,
                 now,
             )?;
             let bundle = runtime
@@ -3033,7 +3033,7 @@ mod tests {
             .write_task_artifact(
                 &claimed.permit,
                 &need_artifact,
-                "planner.evidence_need",
+                LifecycleEventType::PlannerEvidenceNeed,
                 now,
             )
             .unwrap();

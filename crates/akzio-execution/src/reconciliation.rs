@@ -281,8 +281,9 @@ mod tests {
     use tempfile::tempdir;
 
     use akzio_domain::{
-        ArtifactId, ContentHash, FailureDisposition, PaperCommitmentId, RetryPolicy, RunId,
-        TaskBudget, TaskId, TaskRecipeId, WorkflowGraph, WorkflowNode, V2_SCHEMA_VERSION,
+        ArtifactId, ContentHash, FailureDisposition, LifecycleEventType, PaperCommitmentId,
+        RetryPolicy, RunId, TaskBudget, TaskId, TaskRecipeId, WorkflowGraph, WorkflowNode,
+        V2_SCHEMA_VERSION,
     };
     use akzio_store::v2::{StoredRun, WorkflowCommit};
 
@@ -420,7 +421,12 @@ mod tests {
         )
         .unwrap();
         store
-            .write_task_artifact(&permit, &commitment, "execution.committed", now)
+            .write_task_artifact(
+                &permit,
+                &commitment,
+                LifecycleEventType::ExecutionCommitted,
+                now,
+            )
             .unwrap();
         let output = V2ReconciliationRuntime::new(store.clone())
             .reconcile(&ReconciliationInput {

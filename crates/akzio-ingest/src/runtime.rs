@@ -1244,8 +1244,8 @@ fn task_origin(permit: &TaskWritePermit) -> Option<ArtifactOrigin> {
 #[cfg(test)]
 mod tests {
     use akzio_domain::{
-        FailureDisposition, RetryPolicy, RunId, RunPurpose, TaskBudget, TaskId, TaskRecipeId,
-        TaskStatus, WorkflowGraph, WorkflowNode,
+        FailureDisposition, LifecycleEventType, RetryPolicy, RunId, RunPurpose, TaskBudget, TaskId,
+        TaskRecipeId, TaskStatus, WorkflowGraph, WorkflowNode,
     };
     use akzio_store::v2::{StoredRun, WorkflowCommit};
     use tempfile::tempdir;
@@ -1498,7 +1498,7 @@ mod tests {
             .write_task_artifact(
                 &task.permit,
                 &artifact,
-                "planner.evidence_need_created",
+                LifecycleEventType::PlannerEvidenceNeedCreated,
                 now,
             )
             .unwrap();

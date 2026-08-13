@@ -773,9 +773,9 @@ mod tests {
     use akzio_context::ContextBroker;
     use akzio_domain::{
         AgentContract, ArtifactId, ContextPolicy, ContractId, ContractPurpose, ExecutionVerdict,
-        FailureDisposition, HardBlocker, NoOrder, OutputContract, PromptBundle, RetryPolicy, RunId,
-        TaskBudget, TaskId, TaskRecipeId, TaskStatus, TaskWritePermit, TerminationPolicy,
-        WeightPpm, WorkflowGraph, WorkflowNode,
+        FailureDisposition, HardBlocker, LifecycleEventType, NoOrder, OutputContract, PromptBundle,
+        RetryPolicy, RunId, TaskBudget, TaskId, TaskRecipeId, TaskStatus, TaskWritePermit,
+        TerminationPolicy, WeightPpm, WorkflowGraph, WorkflowNode,
     };
     use akzio_domain::{
         DecisionHorizon, Forecast, MemoryId, OutcomeId, STRUCTURED_CRITIQUE_CANDIDATE_TOPOLOGY_ID,
@@ -1137,7 +1137,7 @@ mod tests {
                         .write_task_artifact(
                             &shadow_permit,
                             &artifact,
-                            "shadow.decision.created",
+                            LifecycleEventType::ShadowDecisionCreated,
                             now,
                         )
                         .unwrap();
@@ -1296,7 +1296,12 @@ mod tests {
             ];
             for artifact in &seed_artifacts {
                 store
-                    .write_task_artifact(&seed_permit, artifact, "paper.seed_artifact.created", now)
+                    .write_task_artifact(
+                        &seed_permit,
+                        artifact,
+                        LifecycleEventType::PaperSeedArtifactCreated,
+                        now,
+                    )
                     .unwrap();
             }
             store
@@ -1312,7 +1317,7 @@ mod tests {
                     .write_task_artifact(
                         &shadow_permit,
                         artifact,
-                        "shadow.outcome_schedule.created",
+                        LifecycleEventType::ShadowOutcomeScheduleCreated,
                         now,
                     )
                     .unwrap();
@@ -1986,7 +1991,7 @@ mod tests {
             .write_task_artifact(
                 &shadow_permit,
                 &candidate_decision,
-                "shadow.decision.created",
+                LifecycleEventType::ShadowDecisionCreated,
                 now,
             )
             .unwrap();
@@ -2017,7 +2022,7 @@ mod tests {
                 .write_task_artifact(
                     &shadow_permit,
                     &schedule_artifact,
-                    "shadow.outcome_schedule.created",
+                    LifecycleEventType::ShadowOutcomeScheduleCreated,
                     now,
                 )
                 .unwrap();

@@ -266,9 +266,9 @@ mod tests {
     use tempfile::tempdir;
 
     use akzio_domain::{
-        ArtifactId, ContentHash, FactorExposure, FailureDisposition, RetryPolicy, RunId,
-        TargetPortfolio, TaskBudget, TaskId, TaskRecipeId, WeightPpm, WorkflowGraph, WorkflowNode,
-        V2_SCHEMA_VERSION,
+        ArtifactId, ContentHash, FactorExposure, FailureDisposition, LifecycleEventType,
+        RetryPolicy, RunId, TargetPortfolio, TaskBudget, TaskId, TaskRecipeId, WeightPpm,
+        WorkflowGraph, WorkflowNode, V2_SCHEMA_VERSION,
     };
     use akzio_store::v2::{SessionReservation, StoredRun, WorkflowCommit};
 
@@ -354,7 +354,12 @@ mod tests {
         )
         .unwrap();
         store
-            .write_task_artifact(permit, &artifact, "fixture.execution_source_created", now)
+            .write_task_artifact(
+                permit,
+                &artifact,
+                LifecycleEventType::FixtureExecutionSourceCreated,
+                now,
+            )
             .unwrap();
         ArtifactRef {
             artifact_id: artifact.artifact_id,
@@ -506,7 +511,7 @@ mod tests {
             .write_task_artifact(
                 &permit,
                 &allocation_artifact,
-                "execution.allocation_created",
+                LifecycleEventType::ExecutionAllocationCreated,
                 now,
             )
             .unwrap();
@@ -550,7 +555,12 @@ mod tests {
         )
         .unwrap();
         store
-            .write_task_artifact(&permit, &context, "execution.context_created", now)
+            .write_task_artifact(
+                &permit,
+                &context,
+                LifecycleEventType::ExecutionContextCreatedLegacy,
+                now,
+            )
             .unwrap();
         let context_ref = ArtifactRef {
             artifact_id: context.artifact_id.clone(),
@@ -572,7 +582,12 @@ mod tests {
         )
         .unwrap();
         store
-            .write_task_artifact(&permit, &verdict, "execution.verdict_created", now)
+            .write_task_artifact(
+                &permit,
+                &verdict,
+                LifecycleEventType::ExecutionVerdictCreatedLegacy,
+                now,
+            )
             .unwrap();
         let verdict_ref = ArtifactRef {
             artifact_id: verdict.artifact_id.clone(),

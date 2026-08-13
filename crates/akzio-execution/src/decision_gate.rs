@@ -655,8 +655,8 @@ fn estimate_tokens(bytes: u64) -> u32 {
 mod tests {
     use akzio_domain::{
         ArtifactLifecycle, Asset, ContentHash, ContextSelection, DecisionHorizon,
-        FailureDisposition, Forecast, RetryPolicy, RunId, TaskBudget, TaskId, TaskRecipeId,
-        WeightPpm, WorkflowGraph, WorkflowNode,
+        FailureDisposition, Forecast, LifecycleEventType, RetryPolicy, RunId, TaskBudget, TaskId,
+        TaskRecipeId, WeightPpm, WorkflowGraph, WorkflowNode,
     };
     use akzio_store::v2::{StoredRun, WorkflowCommit};
     use chrono::Duration;
@@ -955,7 +955,12 @@ mod tests {
         )
         .unwrap();
         store
-            .write_task_artifact(&synth_permit, &manifest, "context.manifest", now)
+            .write_task_artifact(
+                &synth_permit,
+                &manifest,
+                LifecycleEventType::ContextManifest,
+                now,
+            )
             .unwrap();
 
         let proposal = Artifact::new(

@@ -245,7 +245,12 @@ fn write_source(
     )
     .unwrap();
     store
-        .write_task_artifact(permit, &artifact, "fixture.execution_source_created", now)
+        .write_task_artifact(
+            permit,
+            &artifact,
+            LifecycleEventType::FixtureExecutionSourceCreated,
+            now,
+        )
         .unwrap();
     artifact_ref(&artifact)
 }
@@ -562,7 +567,7 @@ fn prepared_commitment() -> PreparedCommitment {
         .write_task_artifact(
             &permit,
             &allocation_artifact,
-            "execution.allocation_created",
+            LifecycleEventType::ExecutionAllocationCreated,
             now,
         )
         .unwrap();
@@ -601,7 +606,12 @@ fn prepared_commitment() -> PreparedCommitment {
     )
     .unwrap();
     store
-        .write_task_artifact(&permit, &context_artifact, "execution.context_created", now)
+        .write_task_artifact(
+            &permit,
+            &context_artifact,
+            LifecycleEventType::ExecutionContextCreatedLegacy,
+            now,
+        )
         .unwrap();
     let context_ref = artifact_ref(&context_artifact);
     let verdict = Artifact::new(
@@ -620,7 +630,12 @@ fn prepared_commitment() -> PreparedCommitment {
     )
     .unwrap();
     store
-        .write_task_artifact(&permit, &verdict, "execution.verdict_created", now)
+        .write_task_artifact(
+            &permit,
+            &verdict,
+            LifecycleEventType::ExecutionVerdictCreatedLegacy,
+            now,
+        )
         .unwrap();
     let commitment = V2PaperCommitmentRuntime::new(store.clone())
         .commit(&PaperCommitmentInput {
