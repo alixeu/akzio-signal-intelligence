@@ -736,12 +736,7 @@ impl WorkflowRuntime {
             }
             "task.retry_exhausted" | "task.recovery_exhausted" => {
                 let task = Self::replay_task_mut(run_id, replay, event)?;
-                if !task.status.is_terminal() {
-                    return Err(Self::replay_error(
-                        run_id,
-                        format!("{} precedes a terminal task state", event.event_type),
-                    ));
-                }
+                Self::assert_active_attempt(run_id, task, event)?;
             }
             "run.cancel_requested" => {
                 if event.task_id.is_some() || event.attempt_id.is_some() {
@@ -2850,6 +2845,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn task_runtime_replays_exhausted_retry_as_terminal_failure() {
+        let root = tempdir().unwrap();
+        let store = V2Store::open(root.path()).unwrap();
+        let mut recipes = catalogue();
+        recipes
+            .recipes
+            .values_mut()
+            .for_each(|recipe| recipe.retry.max_attempts = 1);
+        let workflow = WorkflowRuntime::new(store.clone(), recipes);
+        let graph = workflow.lower(RunPurpose::Debug, &proposal()).unwrap();
+        let run_id = RunId::new();
+        workflow
+            .submit(run_id.clone(), RunPurpose::Debug, graph, Utc::now())
+            .unwrap();
+        let tasks = TaskRuntime::new(store);
+
+        assert!(tasks
+            .run_one("worker", |_| async {
+                TaskCompletion::Retry(RetryCause::Transport)
+            })
+            .await
+            .unwrap());
+
+        let events = tasks.store().events_after(&run_id, 0, 100).unwrap();
+        let exhausted = events
+            .iter()
+            .find(|event| event.event_type == "task.retry_exhausted")
+            .unwrap();
+        let task_id = exhausted.task_id.as_ref().unwrap();
+        let attempt_id = exhausted.attempt_id.as_ref().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.task_id.as_ref() == Some(task_id))
+                .map(|event| event.event_type.as_str())
+                .collect::<Vec<_>>(),
+            vec!["task.started", "task.retry_exhausted", "task.failed"]
+        );
+        assert_eq!(
+            events
+                .iter()
+                .find(|event| {
+                    event.task_id.as_ref() == Some(task_id) && event.event_type == "task.failed"
+                })
+                .unwrap()
+                .attempt_id
+                .as_ref(),
+            Some(attempt_id)
+        );
+        let snapshot = tasks.store().workflow_snapshot(&run_id).unwrap();
+        let failed = snapshot
+            .tasks
+            .iter()
+            .find(|task| &task.node.task_id == task_id)
+            .unwrap();
+        assert_eq!(failed.status, TaskStatus::Failed);
+        assert_eq!(failed.attempt_count, 1);
+        assert_eq!(workflow.replay_run(&run_id).unwrap(), snapshot);
+    }
+
+    #[tokio::test]
     async fn task_runtime_recovers_expired_attempt_and_honors_cancel_requests() {
         let root = tempdir().unwrap();
         let store = V2Store::open(root.path()).unwrap();
@@ -2946,6 +3002,58 @@ mod tests {
             workflow.replay_run(&run_id).unwrap(),
             tasks.store().workflow_snapshot(&run_id).unwrap()
         );
+    }
+
+    #[test]
+    fn task_runtime_replays_exhausted_recovery_as_terminal_failure() {
+        let root = tempdir().unwrap();
+        let store = V2Store::open(root.path()).unwrap();
+        let mut recipes = catalogue();
+        recipes
+            .recipes
+            .values_mut()
+            .for_each(|recipe| recipe.retry.max_attempts = 1);
+        let workflow = WorkflowRuntime::new(store.clone(), recipes);
+        let graph = workflow.lower(RunPurpose::Debug, &proposal()).unwrap();
+        let run_id = RunId::new();
+        workflow
+            .submit(run_id.clone(), RunPurpose::Debug, graph, Utc::now())
+            .unwrap();
+        let abandoned = store
+            .claim_next_task("crashed-worker", Utc::now(), Duration::milliseconds(-1))
+            .unwrap()
+            .unwrap();
+        store.recover_expired_tasks(Utc::now()).unwrap();
+
+        let events = store.events_after(&run_id, 0, 100).unwrap();
+        let task_events = events
+            .iter()
+            .filter(|event| event.task_id.as_ref() == Some(&abandoned.node.task_id))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            task_events
+                .iter()
+                .map(|event| event.event_type.as_str())
+                .collect::<Vec<_>>(),
+            vec!["task.started", "task.recovery_exhausted", "task.failed"]
+        );
+        assert_eq!(
+            task_events[1].attempt_id.as_ref(),
+            Some(&abandoned.permit.attempt_id)
+        );
+        assert_eq!(
+            task_events[2].attempt_id.as_ref(),
+            Some(&abandoned.permit.attempt_id)
+        );
+        let snapshot = store.workflow_snapshot(&run_id).unwrap();
+        let failed = snapshot
+            .tasks
+            .iter()
+            .find(|task| task.node.task_id == abandoned.node.task_id)
+            .unwrap();
+        assert_eq!(failed.status, TaskStatus::Failed);
+        assert_eq!(failed.attempt_count, 1);
+        assert_eq!(workflow.replay_run(&run_id).unwrap(), snapshot);
     }
 
     #[test]
