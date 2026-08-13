@@ -45,6 +45,8 @@ pub enum ResearchError {
     UnknownContract(akzio_domain::ContentHash),
     #[error("task contract hash and recipe contract hash do not match")]
     ContractMismatch,
+    #[error("workflow node task does not match the write permit task")]
+    TaskMismatch,
     #[error("workflow node policy diverges from its installed Agent Contract")]
     NodePolicyMismatch,
     #[error("Agent Contract {0} appears more than once in the catalogue")]
@@ -1253,6 +1255,9 @@ impl AgentRuntime {
         now: DateTime<Utc>,
     ) -> ResearchResult<Artifact> {
         self.store.validate_task_permit(permit)?;
+        if permit.task_id != node.task_id {
+            return Err(ResearchError::TaskMismatch);
+        }
         let contract_hash = node
             .contract_hash
             .as_ref()
@@ -3189,6 +3194,41 @@ mod tests {
             Err(ResearchError::Store(StoreError::StalePermit(_)))
         ));
         assert_eq!(model.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn agent_runtime_rejects_a_node_from_another_task() {
+        let Fixture {
+            _root,
+            store,
+            catalogue,
+            claimed,
+            evidence,
+        } = fixture_with(|_| {});
+        let runtime = AgentRuntime::new(store, catalogue, Duration::minutes(5));
+        let model = FixedModel(AgentModelTurn {
+            output: Some(json!({"summary": "should not run"})),
+            tool_calls: vec![],
+            model_debug: None,
+        });
+        let mut foreign_node = claimed.node.clone();
+        foreign_node.task_id = akzio_domain::TaskId::new();
+
+        assert!(matches!(
+            runtime
+                .run(
+                    &claimed.permit,
+                    &foreign_node,
+                    [ArtifactRef {
+                        artifact_id: evidence.artifact_id,
+                        kind: ArtifactKind::NormalizedEvidence,
+                    }],
+                    &model,
+                    Utc::now(),
+                )
+                .await,
+            Err(ResearchError::TaskMismatch)
+        ));
     }
 
     #[tokio::test]
