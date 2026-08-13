@@ -8,9 +8,9 @@ use std::{
 
 use akzio_domain::{
     Artifact, ArtifactKind, ArtifactLifecycle, ArtifactOrigin, ArtifactProvenance, ArtifactRef,
-    AttemptId, ClaimStance, DomainError, EvidenceNeed, ResearchClaim, RunId, RunPurpose,
-    RuntimeTaskClass, TaskId, TaskRecipe, TaskRecipeId, TaskStatus, WorkflowGraph, WorkflowNode,
-    WorkflowProposal, WorkflowProposalDraft, WorkflowProposalTask, WorkflowStatus,
+    AttemptId, ClaimStance, DomainError, EvidenceNeed, LifecycleEventType, ResearchClaim, RunId,
+    RunPurpose, RuntimeTaskClass, TaskId, TaskRecipe, TaskRecipeId, TaskStatus, WorkflowGraph,
+    WorkflowNode, WorkflowProposal, WorkflowProposalDraft, WorkflowProposalTask, WorkflowStatus,
     STRUCTURED_CRITIQUE_CANDIDATE_TOPOLOGY_ID, V2_SCHEMA_VERSION,
 };
 use akzio_store::v2::{
@@ -675,10 +675,20 @@ impl WorkflowRuntime {
                 format!("event {} belongs to another run", event.cursor),
             ));
         }
-        match event.event_type.as_str() {
-            "workflow.created" => self.reduce_graph_event(run_id, replay, event, true)?,
-            "workflow.patched" => self.reduce_graph_event(run_id, replay, event, false)?,
-            "task.started" => {
+        let event_type = event.lifecycle_kind().map_err(|error| {
+            Self::replay_error(
+                run_id,
+                format!("invalid lifecycle event {}: {error}", event.cursor),
+            )
+        })?;
+        match event_type {
+            LifecycleEventType::WorkflowCreated => {
+                self.reduce_graph_event(run_id, replay, event, true)?
+            }
+            LifecycleEventType::WorkflowPatched => {
+                self.reduce_graph_event(run_id, replay, event, false)?
+            }
+            LifecycleEventType::TaskStarted => {
                 let task = Self::replay_task_mut(run_id, replay, event)?;
                 let attempt_id = event.attempt_id.clone().ok_or_else(|| {
                     Self::replay_error(run_id, "task.started is missing its attempt id")
@@ -698,26 +708,28 @@ impl WorkflowRuntime {
                 task.finished_at = None;
                 replay.saw_task_start = true;
             }
-            "task.retry_scheduled" | "task.recovered" => {
+            LifecycleEventType::TaskRetryScheduled | LifecycleEventType::TaskRecovered => {
                 let task = Self::replay_task_mut(run_id, replay, event)?;
                 Self::assert_active_attempt(run_id, task, event)?;
                 task.status = TaskStatus::Pending;
                 task.active_attempt_id = None;
                 task.finished_at = None;
             }
-            "task.succeeded" | "task.failed" | "task.skipped" => {
+            LifecycleEventType::TaskSucceeded
+            | LifecycleEventType::TaskFailed
+            | LifecycleEventType::TaskSkipped => {
                 let task = Self::replay_task_mut(run_id, replay, event)?;
                 Self::assert_active_attempt(run_id, task, event)?;
-                task.status = match event.event_type.as_str() {
-                    "task.succeeded" => TaskStatus::Succeeded,
-                    "task.failed" => TaskStatus::Failed,
-                    "task.skipped" => TaskStatus::Skipped,
+                task.status = match event_type {
+                    LifecycleEventType::TaskSucceeded => TaskStatus::Succeeded,
+                    LifecycleEventType::TaskFailed => TaskStatus::Failed,
+                    LifecycleEventType::TaskSkipped => TaskStatus::Skipped,
                     _ => unreachable!("matched terminal task event"),
                 };
                 task.active_attempt_id = None;
                 task.finished_at = Some(event.created_at);
             }
-            "task.cancelled" => {
+            LifecycleEventType::TaskCancelled => {
                 let task = Self::replay_task_mut(run_id, replay, event)?;
                 if event.attempt_id.is_some() {
                     Self::assert_active_attempt(run_id, task, event)?;
@@ -734,11 +746,11 @@ impl WorkflowRuntime {
                 task.active_attempt_id = None;
                 task.finished_at = Some(event.created_at);
             }
-            "task.retry_exhausted" | "task.recovery_exhausted" => {
+            LifecycleEventType::TaskRetryExhausted | LifecycleEventType::TaskRecoveryExhausted => {
                 let task = Self::replay_task_mut(run_id, replay, event)?;
                 Self::assert_active_attempt(run_id, task, event)?;
             }
-            "run.cancel_requested" => {
+            LifecycleEventType::RunCancelRequested => {
                 if event.task_id.is_some() || event.attempt_id.is_some() {
                     return Err(Self::replay_error(
                         run_id,
@@ -756,10 +768,10 @@ impl WorkflowRuntime {
             _ if event.artifact_id.is_some() => {
                 self.reduce_artifact_trace_event(run_id, replay, event)?;
             }
-            other => {
+            _ => {
                 return Err(Self::replay_error(
                     run_id,
-                    format!("unknown durable event type {other}"),
+                    format!("unhandled durable event type {}", event.event_type),
                 ));
             }
         }
