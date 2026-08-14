@@ -444,6 +444,7 @@ pub trait AsyncGovernedEvidenceTransport: Send + Sync {
 pub struct AlpacaPaperEvidenceTransport {
     client: Client,
     base_url: String,
+    market_data_url: String,
     key_id: String,
     secret_key: String,
 }
@@ -453,6 +454,7 @@ impl std::fmt::Debug for AlpacaPaperEvidenceTransport {
         formatter
             .debug_struct("AlpacaPaperEvidenceTransport")
             .field("base_url", &self.base_url)
+            .field("market_data_url", &self.market_data_url)
             .field("key_id", &"<redacted>")
             .field("secret_key", &"<redacted>")
             .finish()
@@ -506,6 +508,7 @@ impl AlpacaPaperEvidenceTransport {
         Ok(Self {
             client,
             base_url: "https://paper-api.alpaca.markets".to_owned(),
+            market_data_url: "https://data.alpaca.markets".to_owned(),
             key_id,
             secret_key,
         })
@@ -576,6 +579,20 @@ impl AlpacaPaperEvidenceTransport {
         }
     }
 
+    fn uses_market_data(resource: &str) -> bool {
+        resource == "paper.quotes"
+            || resource.starts_with("quote:")
+            || resource.starts_with("bars:")
+    }
+
+    fn base_url_for(&self, resource: &str) -> &str {
+        if Self::uses_market_data(resource) {
+            &self.market_data_url
+        } else {
+            &self.base_url
+        }
+    }
+
     async fn acquire_inner(
         &self,
         source: EvidenceSource,
@@ -585,7 +602,7 @@ impl AlpacaPaperEvidenceTransport {
             return Err(EvidenceAdapterError::SourceMismatch);
         }
         let path = Self::path_for(resource)?;
-        let url = format!("{}{}", self.base_url, path);
+        let url = format!("{}{}", self.base_url_for(resource), path);
         let response = self
             .client
             .get(&url)
@@ -1757,6 +1774,26 @@ mod tests {
         assert!(AlpacaPaperEvidenceTransport::path_for("bars:SPY:1d").is_err());
         assert!(AlpacaPaperEvidenceTransport::path_for("bars:QQQ:5m").is_err());
         assert!(AlpacaPaperEvidenceTransport::path_for("https://example.com").is_err());
+
+        let transport =
+            AlpacaPaperEvidenceTransport::new("https://paper-api.alpaca.markets", "key", "secret")
+                .unwrap();
+        assert_eq!(
+            transport.base_url_for("paper.account"),
+            "https://paper-api.alpaca.markets"
+        );
+        assert_eq!(
+            transport.base_url_for("paper.clock"),
+            "https://paper-api.alpaca.markets"
+        );
+        assert_eq!(
+            transport.base_url_for("paper.quotes"),
+            "https://data.alpaca.markets"
+        );
+        assert_eq!(
+            transport.base_url_for("bars:QQQ:1d"),
+            "https://data.alpaca.markets"
+        );
     }
 
     #[tokio::test]
