@@ -629,10 +629,18 @@ fn canonical_active_contract(
     store: &V2Store,
     definition: CanonicalContractDefinition,
 ) -> ResearchResult<AgentContract> {
+    let role_prompt = if definition.purpose == "research.synthesizer" {
+        format!(
+            "{}\n\nAlways return exactly 12 forecasts: one for each executable asset (TQQQ, QQQ, SOXX, SOXL) at each horizon (t1, t3, t5), even when the proposal is blocked; for blocked proposals use neutral zero forecasts and explain the blocker in hard_blockers and summary.",
+            definition.prompt
+        )
+    } else {
+        definition.prompt.to_owned()
+    };
     let prompt = PromptBundle {
         version: ACTIVE_PROMPT_BUNDLE_VERSION,
         governance: store.put_bytes(SHARED_GOVERNANCE_PROMPT.as_bytes(), "text/plain")?,
-        role: store.put_bytes(definition.prompt.as_bytes(), "text/plain")?,
+        role: store.put_bytes(role_prompt.as_bytes(), "text/plain")?,
     };
     let schema = store.put_json(&deliberation_output_schema(&definition.output_schema))?;
     let mut contract = AgentContract::new(
