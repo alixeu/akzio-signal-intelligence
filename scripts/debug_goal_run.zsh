@@ -35,6 +35,7 @@ fi
 command -v cargo >/dev/null || { print -u2 -- "cargo is required"; exit 2; }
 command -v jq >/dev/null || { print -u2 -- "jq is required"; exit 2; }
 command -v openssl >/dev/null || { print -u2 -- "openssl is required"; exit 2; }
+command -v rg >/dev/null || { print -u2 -- "rg is required"; exit 2; }
 
 if [[ -z "${LLM_GATEWAY_BASE_URL:-}" || -z "${LLM_GATEWAY_API_KEY:-}" ]]; then
   print -u2 -- "real Debug requires LLM_GATEWAY_BASE_URL and LLM_GATEWAY_API_KEY"
@@ -48,8 +49,10 @@ fi
 write_manifest() {
   local llm_gateway_configured=false
   local alpaca_configured=false
+  local auto_paper=false
   [[ -n "${LLM_GATEWAY_BASE_URL:-}" && -n "${LLM_GATEWAY_API_KEY:-}" ]] && llm_gateway_configured=true
   [[ -n "${ALPACA_API_KEY:-}" && -n "${ALPACA_API_SECRET:-}" ]] && alpaca_configured=true
+  rg -q '^[[:space:]]*auto_paper[[:space:]]*=[[:space:]]*true' "${goal_runtime_config}" && auto_paper=true || true
 
   jq -n \
     --arg stage "${goal_stage}" \
@@ -65,7 +68,8 @@ write_manifest() {
     --arg model "gpt-5.6-luna" \
     --argjson llm_gateway_configured "${llm_gateway_configured}" \
     --argjson alpaca_configured "${alpaca_configured}" \
-    '{stage:$stage,created_at:$created_at,config:$config,runtime_config:$runtime_config,target_dir:$target_dir,store_root:$store_root,commit:$commit,branch:$branch,rustc:$rustc,cargo:$cargo,model:$model,llm_gateway_configured:$llm_gateway_configured,alpaca_configured:$alpaca_configured}' \
+    --argjson auto_paper "${auto_paper}" \
+    '{stage:$stage,created_at:$created_at,config:$config,runtime_config:$runtime_config,target_dir:$target_dir,store_root:$store_root,commit:$commit,branch:$branch,rustc:$rustc,cargo:$cargo,model:$model,expected_model:$model,real_llm:true,auto_paper:$auto_paper,llm_gateway_configured:$llm_gateway_configured,alpaca_configured:$alpaca_configured}' \
     > "${goal_bundle}/manifest.json"
 }
 
@@ -78,16 +82,51 @@ write_runtime_config() {
 cleanup() {
   local exit_code=$?
   set +e
+  local cargo_clean_exit=0
+  local rm_exit=0
+  local disk_exit=0
+  local target_exists=false
+  local cleanup_ok=false
+  local final_exit_code="${exit_code}"
   if [[ -n "${goal_pid}" ]] && kill -0 "${goal_pid}" 2>/dev/null; then
     kill -TERM "${goal_pid}" 2>/dev/null
     wait "${goal_pid}" 2>/dev/null
   fi
   if [[ -d "${goal_target}" ]]; then
     cargo clean --target-dir "${goal_target}" > "${goal_bundle}/commands/cargo-clean.log" 2>&1
+    cargo_clean_exit=$?
     rm -rf -- "${goal_target}"
+    rm_exit=$?
   fi
-  print -r -- "${exit_code}" > "${goal_bundle}/commands/script-exit-code.txt"
-  exit "${exit_code}"
+  [[ -d "${goal_target}" ]] && target_exists=true
+  du -sh target outputs report > "${goal_bundle}/commands/disk-after.txt" 2>&1
+  disk_exit=$?
+  if (( cargo_clean_exit == 0 && rm_exit == 0 && disk_exit == 0 )) && [[ "${target_exists}" == false ]]; then
+    cleanup_ok=true
+  fi
+  if [[ ! -f "${goal_bundle}/summary.json" ]]; then
+    jq -n \
+      --arg run_id "${goal_run_id}" \
+      --arg status failed \
+      --arg bundle "${goal_bundle}" \
+      '{run_id:$run_id,status:$status,bundle:$bundle,terminal:false,raw_model_export:false}' \
+      > "${goal_bundle}/summary.json"
+  fi
+  if (( cargo_clean_exit != 0 || rm_exit != 0 || disk_exit != 0 )) || [[ "${target_exists}" == true ]]; then
+    (( final_exit_code == 0 )) && final_exit_code=21
+  fi
+  jq -n \
+    --arg target_dir "${goal_target}" \
+    --argjson original_exit "${exit_code}" \
+    --argjson cargo_clean_exit "${cargo_clean_exit}" \
+    --argjson rm_exit "${rm_exit}" \
+    --argjson disk_after_exit "${disk_exit}" \
+    --argjson target_exists "${target_exists}" \
+    --argjson cleanup_ok "${cleanup_ok}" \
+    '{target_dir:$target_dir,original_exit:$original_exit,cargo_clean_exit:$cargo_clean_exit,rm_exit:$rm_exit,disk_after_exit:$disk_after_exit,target_exists:$target_exists,cleanup_ok:$cleanup_ok}' \
+    > "${goal_bundle}/commands/cleanup.json"
+  print -r -- "${final_exit_code}" > "${goal_bundle}/commands/script-exit-code.txt"
+  exit "${final_exit_code}"
 }
 
 trap cleanup EXIT
@@ -95,6 +134,10 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 write_runtime_config
+if ! rg -q '^[[:space:]]*auto_paper[[:space:]]*=[[:space:]]*false' "${goal_runtime_config}"; then
+  print -u2 -- "real Debug requires auto_paper=false"
+  exit 2
+fi
 write_manifest
 du -sh target outputs report > "${goal_bundle}/commands/disk-before.txt" 2>&1 || true
 
@@ -136,6 +179,9 @@ for attempt in {1..300}; do
   fi
   if "${goal_target}/debug/akzio" --config "${goal_runtime_config}" run replay "${goal_run_id}" \
     > "${goal_bundle}/commands/replay.json" 2>&1; then
+    if jq -e . "${goal_bundle}/commands/replay.json" >/dev/null 2>&1; then
+      jq -c . "${goal_bundle}/commands/replay.json" >> "${goal_bundle}/commands/replay-history.jsonl"
+    fi
     goal_status="$(jq -r '.status // empty' "${goal_bundle}/commands/replay.json" 2>/dev/null || true)"
     case "${goal_status:l}" in
       completed|completed_with_execution_rejection|failed|cancelled)
@@ -165,6 +211,19 @@ fi
   "${goal_export}" --include-raw-model \
   > "${goal_bundle}/commands/export-run.json" 2>&1
 
+if ! jq -e --arg model "gpt-5.6-luna" '
+  ([.[] | select(.event_type == "agent.turn_completed" and .model != null)] | length >= 3)
+  and all(.[] | select(.event_type == "agent.turn_completed" and .model != null) | .model.model_id == $model)
+  and all(.[] | select(.event_type == "agent.turn_completed" and .model != null) | .tool == null)
+' "${goal_bundle}/commands/trajectory.json" >/dev/null; then
+  print -u2 -- "trajectory did not prove the expected real model and tool boundary"
+  exit 22
+fi
+jq -n \
+  --arg expected_model "gpt-5.6-luna" \
+  '{expected_model:$expected_model,auto_paper:false,trajectory_model_check:true,debug_tools_exposed:false}' \
+  > "${goal_bundle}/commands/harness-validation.json"
+
 jq -n \
   --arg run_id "${goal_run_id}" \
   --arg status "${goal_status}" \
@@ -172,7 +231,6 @@ jq -n \
   '{run_id:$run_id,status:$status,bundle:$bundle,terminal:true,raw_model_export:true}' \
   > "${goal_bundle}/summary.json"
 
-du -sh target outputs report > "${goal_bundle}/commands/disk-after.txt" 2>&1 || true
 print -r -- "${goal_run_id}"
 
 if [[ "${goal_status:l}" != completed ]]; then
