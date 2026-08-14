@@ -2933,6 +2933,7 @@ impl V2Store {
         )?;
         validate_tool_lifecycle_events(&transaction, Some(&permit.run_id))?;
         validate_agent_turn_lifecycle_events(&transaction, Some(&permit.run_id))?;
+        validate_context_lifecycle_events(&transaction, Some(&permit.run_id))?;
         transaction.commit()?;
         Ok(())
     }
@@ -3889,7 +3890,8 @@ impl V2Store {
                 r#"SELECT artifact_id
                    FROM rebuild_events
                    WHERE run_id = ?1 AND task_id = ?2 AND attempt_id = ?3
-                     AND event_type IN ('context.manifest_created',
+                     AND event_type IN ('context.manifest',
+                                        'context.manifest_created',
                                         'context.child_manifest_created')
                      AND artifact_id IS NOT NULL
                    ORDER BY event_id DESC
@@ -4431,6 +4433,7 @@ impl V2Store {
         }
         validate_tool_lifecycle_events(&connection, Some(run_id))?;
         validate_agent_turn_lifecycle_events(&connection, Some(run_id))?;
+        validate_context_lifecycle_events(&connection, Some(run_id))?;
         validate_paper_effect_events(&connection, Some(run_id))?;
         Ok(events)
     }
@@ -4472,6 +4475,7 @@ impl V2Store {
         }
         validate_tool_lifecycle_events(&connection, None)?;
         validate_agent_turn_lifecycle_events(&connection, None)?;
+        validate_context_lifecycle_events(&connection, None)?;
         validate_paper_effect_events(&connection, None)?;
         let fk = connection
             .query_row("PRAGMA foreign_key_check", [], |_| Ok(()))
@@ -7027,6 +7031,140 @@ fn validate_agent_turn_lifecycle_events(
     Ok(())
 }
 
+fn validate_context_lifecycle_events(
+    connection: &Connection,
+    run_id: Option<&RunId>,
+) -> StoreResult<()> {
+    let mut statement = connection.prepare(
+        r#"SELECT event_id, run_id, task_id, attempt_id, event_type, artifact_id
+           FROM rebuild_events
+           WHERE (?1 IS NULL OR run_id = ?1)
+             AND event_type IN (?2, ?3, ?4, ?5)
+           ORDER BY event_id ASC"#,
+    )?;
+    let rows = statement.query_map(
+        params![
+            run_id.map(|value| value.0.as_str()),
+            LifecycleEventType::ContextManifest.as_str(),
+            LifecycleEventType::ContextManifestCreated.as_str(),
+            LifecycleEventType::ContextChildManifestCreated.as_str(),
+            LifecycleEventType::ContextRepaired.as_str(),
+        ],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                RunId(row.get::<_, String>(1)?),
+                row.get::<_, Option<String>>(2)?.map(TaskId),
+                row.get::<_, Option<String>>(3)?
+                    .map(akzio_domain::AttemptId),
+                LifecycleEventType::parse(&row.get::<_, String>(4)?)
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?,
+                row.get::<_, Option<String>>(5)?
+                    .map(|value| {
+                        ContentHash::new(value).map(ArtifactId).map_err(|error| {
+                            rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+                        })
+                    })
+                    .transpose()?,
+            ))
+        },
+    )?;
+    let mut seen = BTreeSet::<ArtifactId>::new();
+
+    for row in rows {
+        let (cursor, event_run_id, task_id, attempt_id, event_type, artifact_id) = row?;
+        let task_id = task_id.ok_or_else(|| {
+            StoreError::Integrity(format!(
+                "{} cursor {cursor} has no task lineage",
+                event_type.as_str()
+            ))
+        })?;
+        let attempt_id = attempt_id.ok_or_else(|| {
+            StoreError::Integrity(format!(
+                "{} cursor {cursor} has no attempt lineage",
+                event_type.as_str()
+            ))
+        })?;
+        let artifact_id = artifact_id.ok_or_else(|| {
+            StoreError::Integrity(format!(
+                "{} cursor {cursor} has no artifact",
+                event_type.as_str()
+            ))
+        })?;
+        if !seen.insert(artifact_id.clone()) {
+            return Err(StoreError::Integrity(format!(
+                "{} cursor {cursor} repeats artifact {}",
+                event_type.as_str(),
+                artifact_id.0
+            )));
+        }
+        let artifact = read_artifact(connection, &artifact_id)?;
+        let expected_kind = if event_type == LifecycleEventType::ContextRepaired {
+            ArtifactKind::ContextRepair
+        } else {
+            ArtifactKind::ContextManifest
+        };
+        if artifact.kind != expected_kind {
+            return Err(StoreError::Integrity(format!(
+                "{} cursor {cursor} references {:?}, expected {:?}",
+                event_type.as_str(),
+                artifact.kind,
+                expected_kind
+            )));
+        }
+        let origin = artifact.origin.as_ref().ok_or_else(|| {
+            StoreError::Integrity(format!(
+                "{} cursor {cursor} artifact has no origin",
+                event_type.as_str()
+            ))
+        })?;
+        if origin.run_id.as_ref() != Some(&event_run_id)
+            || origin.task_id.as_ref() != Some(&task_id)
+            || origin.attempt_id.as_ref() != Some(&attempt_id)
+        {
+            return Err(StoreError::Integrity(format!(
+                "{} cursor {cursor} artifact origin does not match task attempt",
+                event_type.as_str()
+            )));
+        }
+        if event_type == LifecycleEventType::ContextChildManifestCreated {
+            let parents = artifact
+                .source_refs
+                .iter()
+                .filter(|reference| reference.kind == ArtifactKind::ContextManifest)
+                .collect::<Vec<_>>();
+            if parents.len() != 1 {
+                return Err(StoreError::Integrity(format!(
+                    "{} cursor {cursor} must reference exactly one parent context manifest",
+                    event_type.as_str()
+                )));
+            }
+            let parent = read_artifact(connection, &parents[0].artifact_id)?;
+            let parent_origin = parent.origin.as_ref().ok_or_else(|| {
+                StoreError::Integrity(format!(
+                    "{} cursor {cursor} parent context manifest has no origin",
+                    event_type.as_str()
+                ))
+            })?;
+            if parent.kind != ArtifactKind::ContextManifest
+                || parent_origin.run_id.as_ref() != Some(&event_run_id)
+            {
+                return Err(StoreError::Integrity(format!(
+                    "{} cursor {cursor} parent context manifest is from another run",
+                    event_type.as_str()
+                )));
+            }
+        }
+        if event_type == LifecycleEventType::ContextRepaired && artifact.source_refs.is_empty() {
+            return Err(StoreError::Integrity(format!(
+                "{} cursor {cursor} repair has no source refs",
+                event_type.as_str()
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn ensure_no_pending_tool_calls(
     connection: &Connection,
     run_id: &RunId,
@@ -7292,6 +7430,7 @@ fn finish_permitted_task(
     )?;
     validate_tool_lifecycle_events(transaction, Some(&permit.run_id))?;
     validate_agent_turn_lifecycle_events(transaction, Some(&permit.run_id))?;
+    validate_context_lifecycle_events(transaction, Some(&permit.run_id))?;
     if status == TaskStatus::Succeeded {
         ensure_no_pending_tool_calls(
             transaction,
@@ -13779,5 +13918,298 @@ mod tests {
             TaskStatus::Cancelled
         );
         cancelled.store.verify_integrity().unwrap();
+    }
+
+    #[test]
+    fn context_lifecycle_validator_rejects_wrong_kind_and_preserves_legacy_manifest() {
+        let fixture = task_artifact_fixture(RunPurpose::Debug);
+        let wrong = permit_artifact(
+            &fixture.store,
+            &fixture.permit,
+            ArtifactKind::Decision,
+            &serde_json::json!({"wrong": true}),
+            vec![],
+            ArtifactLifecycle::RunScoped,
+            fixture.now,
+        );
+        let before = fixture
+            .store
+            .events_after(&fixture.run.run_id, 0, 100)
+            .unwrap()
+            .len();
+        assert!(matches!(
+            fixture.store.write_task_artifact(
+                &fixture.permit,
+                &wrong,
+                LifecycleEventType::ContextManifestCreated,
+                fixture.now,
+            ),
+            Err(StoreError::Integrity(_))
+        ));
+        assert_eq!(
+            fixture
+                .store
+                .events_after(&fixture.run.run_id, 0, 100)
+                .unwrap()
+                .len(),
+            before
+        );
+        assert!(matches!(
+            fixture.store.artifact(&wrong.artifact_id),
+            Err(StoreError::MissingArtifact(_))
+        ));
+
+        let manifest = permit_artifact(
+            &fixture.store,
+            &fixture.permit,
+            ArtifactKind::ContextManifest,
+            &serde_json::json!({"manifest": true}),
+            vec![],
+            ArtifactLifecycle::RunScoped,
+            fixture.now,
+        );
+        fixture
+            .store
+            .write_task_artifact(
+                &fixture.permit,
+                &manifest,
+                LifecycleEventType::ContextManifest,
+                fixture.now,
+            )
+            .unwrap();
+        fixture
+            .store
+            .commit_attempt(
+                &fixture.permit,
+                std::slice::from_ref(&manifest),
+                TaskStatus::Succeeded,
+                fixture.now,
+            )
+            .unwrap();
+        let proof = fixture
+            .store
+            .current_succeeded_attempt(&fixture.run.run_id, &fixture.permit.task_id)
+            .unwrap();
+        assert_eq!(
+            proof.context_manifest,
+            Some(ArtifactRef {
+                artifact_id: manifest.artifact_id,
+                kind: ArtifactKind::ContextManifest,
+            })
+        );
+        fixture.store.verify_integrity().unwrap();
+    }
+
+    #[test]
+    fn context_child_and_repair_lifecycle_validator_enforces_lineage_and_sources() {
+        let fixture = task_artifact_fixture(RunPurpose::Debug);
+        let parent = permit_artifact(
+            &fixture.store,
+            &fixture.permit,
+            ArtifactKind::ContextManifest,
+            &serde_json::json!({"parent": true}),
+            vec![],
+            ArtifactLifecycle::RunScoped,
+            fixture.now,
+        );
+        fixture
+            .store
+            .write_task_artifact(
+                &fixture.permit,
+                &parent,
+                LifecycleEventType::ContextManifestCreated,
+                fixture.now,
+            )
+            .unwrap();
+        let parent_ref = ArtifactRef {
+            artifact_id: parent.artifact_id.clone(),
+            kind: ArtifactKind::ContextManifest,
+        };
+
+        let missing_parent = permit_artifact(
+            &fixture.store,
+            &fixture.permit,
+            ArtifactKind::ContextManifest,
+            &serde_json::json!({"missing_parent": true}),
+            vec![],
+            ArtifactLifecycle::RunScoped,
+            fixture.now,
+        );
+        assert!(matches!(
+            fixture.store.write_task_artifact(
+                &fixture.permit,
+                &missing_parent,
+                LifecycleEventType::ContextChildManifestCreated,
+                fixture.now,
+            ),
+            Err(StoreError::Integrity(_))
+        ));
+        assert!(matches!(
+            fixture.store.artifact(&missing_parent.artifact_id),
+            Err(StoreError::MissingArtifact(_))
+        ));
+
+        let foreign_run = RunId::new();
+        let foreign_parent = Artifact::new(
+            ArtifactKind::ContextManifest,
+            fixture
+                .store
+                .put_json(&serde_json::json!({"foreign": true}))
+                .unwrap(),
+            "fixture.foreign",
+            ArtifactLifecycle::RunScoped,
+            ArtifactProvenance {
+                source_family: "fixture".to_owned(),
+                observed_at: None,
+                retrieved_at: fixture.now,
+                source_uri: None,
+                confidence_ppm: 1_000_000,
+                producer_contract_hash: fixture.permit.contract_hash.clone(),
+            },
+            Some(ArtifactOrigin {
+                run_id: Some(foreign_run),
+                task_id: Some(fixture.permit.task_id.clone()),
+                attempt_id: Some(fixture.permit.attempt_id.clone()),
+                contract_hash: fixture.permit.contract_hash.clone(),
+            }),
+            vec![],
+            fixture.now,
+        )
+        .unwrap();
+        {
+            let mut connection = fixture.store.connection.lock().unwrap();
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            insert_artifact(&transaction, &foreign_parent).unwrap();
+            transaction.commit().unwrap();
+        }
+        let foreign_child = permit_artifact(
+            &fixture.store,
+            &fixture.permit,
+            ArtifactKind::ContextManifest,
+            &serde_json::json!({"foreign_parent": true}),
+            vec![ArtifactRef {
+                artifact_id: foreign_parent.artifact_id.clone(),
+                kind: ArtifactKind::ContextManifest,
+            }],
+            ArtifactLifecycle::RunScoped,
+            fixture.now,
+        );
+        assert!(matches!(
+            fixture.store.write_task_artifact(
+                &fixture.permit,
+                &foreign_child,
+                LifecycleEventType::ContextChildManifestCreated,
+                fixture.now,
+            ),
+            Err(StoreError::Integrity(_))
+        ));
+        assert!(matches!(
+            fixture.store.artifact(&foreign_child.artifact_id),
+            Err(StoreError::MissingArtifact(_))
+        ));
+
+        let child = permit_artifact(
+            &fixture.store,
+            &fixture.permit,
+            ArtifactKind::ContextManifest,
+            &serde_json::json!({"child": true}),
+            vec![parent_ref],
+            ArtifactLifecycle::RunScoped,
+            fixture.now,
+        );
+        fixture
+            .store
+            .write_task_artifact(
+                &fixture.permit,
+                &child,
+                LifecycleEventType::ContextChildManifestCreated,
+                fixture.now,
+            )
+            .unwrap();
+        assert!(matches!(
+            fixture.store.write_task_artifact(
+                &fixture.permit,
+                &child,
+                LifecycleEventType::ContextChildManifestCreated,
+                fixture.now,
+            ),
+            Err(StoreError::Integrity(_))
+        ));
+
+        assert!(matches!(
+            fixture.store.write_task_artifact(
+                &fixture.permit,
+                &parent,
+                LifecycleEventType::ContextManifest,
+                fixture.now,
+            ),
+            Err(StoreError::Integrity(_))
+        ));
+
+        let empty_repair = permit_artifact(
+            &fixture.store,
+            &fixture.permit,
+            ArtifactKind::ContextRepair,
+            &serde_json::json!({"empty": true}),
+            vec![],
+            ArtifactLifecycle::RunScoped,
+            fixture.now,
+        );
+        assert!(matches!(
+            fixture.store.write_task_artifact(
+                &fixture.permit,
+                &empty_repair,
+                LifecycleEventType::ContextRepaired,
+                fixture.now,
+            ),
+            Err(StoreError::Integrity(_))
+        ));
+        assert!(matches!(
+            fixture.store.artifact(&empty_repair.artifact_id),
+            Err(StoreError::MissingArtifact(_))
+        ));
+
+        let source = permit_artifact(
+            &fixture.store,
+            &fixture.permit,
+            ArtifactKind::NormalizedEvidence,
+            &serde_json::json!({"source": true}),
+            vec![],
+            ArtifactLifecycle::RunScoped,
+            fixture.now,
+        );
+        fixture
+            .store
+            .write_task_artifact(
+                &fixture.permit,
+                &source,
+                LifecycleEventType::Evidence,
+                fixture.now,
+            )
+            .unwrap();
+        let repair = permit_artifact(
+            &fixture.store,
+            &fixture.permit,
+            ArtifactKind::ContextRepair,
+            &serde_json::json!({"repair": true}),
+            vec![ArtifactRef {
+                artifact_id: source.artifact_id,
+                kind: ArtifactKind::NormalizedEvidence,
+            }],
+            ArtifactLifecycle::RunScoped,
+            fixture.now,
+        );
+        fixture
+            .store
+            .write_task_artifact(
+                &fixture.permit,
+                &repair,
+                LifecycleEventType::ContextRepaired,
+                fixture.now,
+            )
+            .unwrap();
+        fixture.store.verify_integrity().unwrap();
     }
 }
