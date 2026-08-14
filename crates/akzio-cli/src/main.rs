@@ -11,7 +11,7 @@ use akzio_learning::{
     evaluate_frozen_evidence, FrozenEvidenceRecord, FrozenEvidenceSet, OutcomeCostModel,
 };
 use akzio_model::ModelConfig;
-use akzio_store::V2Store;
+use akzio_store::{v2::TrajectoryEntry, V2Store};
 use anyhow::{bail, Context, Result};
 use chrono::{Duration as ChronoDuration, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -67,6 +67,9 @@ enum RunCommand {
         run_id: String,
     },
     Retrospectives {
+        run_id: String,
+    },
+    Trajectory {
         run_id: String,
     },
     Events {
@@ -247,6 +250,11 @@ impl ControlApiClient {
         .await
     }
 
+    async fn trajectory(&self, run_id: &str) -> Result<Vec<TrajectoryEntry>> {
+        self.json(self.request(Method::GET, self.endpoint(&["runs", run_id, "trajectory"])))
+            .await
+    }
+
     async fn cancel(&self, run_id: &str) -> Result<RunCancellationResponse> {
         self.json(self.request(Method::POST, self.endpoint(&["runs", run_id, "cancel"])))
             .await
@@ -362,6 +370,13 @@ async fn main() -> Result<()> {
         } => print_json(
             &ControlApiClient::from_config(&config)?
                 .retrospectives(&run_id)
+                .await?,
+        ),
+        Command::Run {
+            command: RunCommand::Trajectory { run_id },
+        } => print_json(
+            &ControlApiClient::from_config(&config)?
+                .trajectory(&run_id)
                 .await?,
         ),
         Command::Run {

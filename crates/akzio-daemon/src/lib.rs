@@ -57,7 +57,8 @@ use akzio_runtime::{
     WorkflowRuntime,
 };
 use akzio_store::v2::{
-    ClaimedAttempt, DaemonLease, StoreAlert, StoreError, StoreMetrics, StoredEvent, V2Store,
+    ClaimedAttempt, DaemonLease, StoreAlert, StoreError, StoreMetrics, StoredEvent,
+    TrajectoryEntry, V2Store,
 };
 use async_stream::stream;
 use axum::{
@@ -510,6 +511,10 @@ impl Daemon {
             .collect()
     }
 
+    fn trajectory(&self, run_id: &RunId) -> Result<Vec<TrajectoryEntry>> {
+        Ok(self.store.trajectory(run_id)?)
+    }
+
     fn set_freeze(&self, frozen: bool, reason: String) -> Result<DaemonHealth> {
         self.store.write_freeze_state(frozen, reason, Utc::now())?;
         self.health()
@@ -610,6 +615,7 @@ impl Daemon {
         Router::new()
             .route("/health", get(http_health))
             .route("/runs/{run_id}/events", get(http_events))
+            .route("/runs/{run_id}/trajectory", get(http_trajectory))
             .route("/runs/{run_id}/retrospectives", get(http_retrospectives))
             .route("/runs/{run_id}/replay", get(http_replay))
             .route("/runs", post(http_submit))
@@ -1925,6 +1931,18 @@ async fn http_replay(
         .map_err(invalid_input_or_conflict)
 }
 
+async fn http_trajectory(
+    State(daemon): State<Arc<Daemon>>,
+    Path(run_id): Path<String>,
+    headers: HeaderMap,
+) -> std::result::Result<Json<Vec<TrajectoryEntry>>, StatusCode> {
+    authorize(&daemon, &headers)?;
+    daemon
+        .trajectory(&RunId(run_id))
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
 async fn http_retrospectives(
     State(daemon): State<Arc<Daemon>>,
     Path(run_id): Path<String>,
@@ -2157,10 +2175,10 @@ mod tests {
 
     use super::*;
     use akzio_domain::{
-        ArtifactLifecycle, ArtifactOrigin, ArtifactProvenance, ArtifactRef, Asset, EvidenceNeed,
-        MoneyMicros, Outcome, OutcomeExecutionLineage, OutcomeSchedule, Quote, RetrospectiveStatus,
-        TaskRecipeId, WorkflowProposal, WorkflowProposalDraft, WorkflowProposalDraftTask,
-        WorkflowProposalTask,
+        ArtifactLifecycle, ArtifactOrigin, ArtifactProvenance, ArtifactRef, Asset,
+        ContextManifestPayload, EvidenceNeed, MoneyMicros, Outcome, OutcomeExecutionLineage,
+        OutcomeSchedule, Quote, RetrospectiveStatus, TaskRecipeId, WorkflowProposal,
+        WorkflowProposalDraft, WorkflowProposalDraftTask, WorkflowProposalTask,
     };
     use akzio_execution::paper::{
         CommittedPaperBroker, PaperError, PaperExecution, PaperOrderReceipt,
@@ -2504,7 +2522,6 @@ mod tests {
         assert!(daemon.run_one("fixture").await.unwrap());
 
         let snapshot = daemon.store().workflow_snapshot(&run_id).unwrap();
-        eprintln!("{snapshot:#?}");
         assert!(snapshot
             .revision
             .graph
@@ -2943,6 +2960,56 @@ mod tests {
                 .map(|task| format!("{}={:?}", task.node.recipe_id, task.status))
                 .collect::<Vec<_>>()
         );
+        let outcome_task = snapshot
+            .tasks
+            .iter()
+            .find(|task| task.node.recipe_id.as_str() == OUTCOME_WORKER_RECIPE_ID)
+            .expect("Paper run must retain an outcome worker task");
+        let outcome_contract_hash = outcome_task
+            .node
+            .contract_hash
+            .as_ref()
+            .expect("Paper outcome worker must retain its contract hash");
+        let outcome_contract = daemon
+            .agents
+            .catalogue()
+            .get(outcome_contract_hash)
+            .unwrap();
+        assert_eq!(outcome_task.node.budget, outcome_contract.contract.budget);
+        assert_eq!(outcome_task.node.retry, outcome_contract.contract.retry);
+        assert_eq!(
+            outcome_task.node.on_failure,
+            outcome_contract.contract.on_failure
+        );
+        assert!(outcome_task
+            .node
+            .input_artifacts
+            .iter()
+            .any(|reference| reference.kind == ArtifactKind::DeliberationNote));
+        let outcome_manifest_artifact = daemon
+            .store()
+            .events_after(&run_id, 0, 256)
+            .unwrap()
+            .into_iter()
+            .filter(|event| {
+                event.task_id.as_ref() == Some(&outcome_task.node.task_id)
+                    && event.event_type == LifecycleEventType::ContextManifestCreated.as_str()
+            })
+            .filter_map(|event| event.artifact_id)
+            .next_back()
+            .and_then(|artifact_id| daemon.store().artifact(&artifact_id).ok())
+            .expect("outcome worker must assemble a governed context manifest");
+        let outcome_manifest_payload: ContextManifestPayload = serde_json::from_slice(
+            &daemon
+                .store()
+                .read_blob(&outcome_manifest_artifact.blob)
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(outcome_manifest_payload
+            .selections
+            .iter()
+            .any(|selection| selection.artifact.kind == ArtifactKind::DeliberationNote));
         assert_eq!(broker.submissions.load(Ordering::SeqCst), 1);
         let schedule = daemon
             .store()
@@ -3606,6 +3673,49 @@ mod tests {
         let frame = String::from_utf8(frame.to_vec()).unwrap();
         assert!(frame.contains(&format!("id: {}", expected.cursor)));
         assert!(frame.contains(&expected.event_type));
+    }
+
+    #[tokio::test]
+    async fn http_trajectory_is_authenticated_and_read_only() {
+        let directory = tempdir().unwrap();
+        let daemon = Daemon::with_model(
+            config(directory.path().to_path_buf()),
+            fixture_model_client(),
+        )
+        .unwrap();
+        let run_id = daemon.submit_default(RunPurpose::Debug).unwrap();
+        let before = daemon.store().events_after(&run_id, 0, 32).unwrap();
+
+        let unauthorized = daemon
+            .router()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/runs/{run_id}/trajectory"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let response = daemon
+            .router()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/runs/{run_id}/trajectory"))
+                    .header("x-akzio-token", "fixture-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let entries: Vec<akzio_store::v2::TrajectoryEntry> =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert!(entries.is_empty());
+        let after = daemon.store().events_after(&run_id, 0, 32).unwrap();
+        assert_eq!(before, after);
     }
 
     #[tokio::test]

@@ -408,7 +408,22 @@ impl ContextBroker {
             .iter()
             .any(|reference| !parent_readable.contains(reference));
         let parent_outputs = if needs_parent_outputs {
-            succeeded.outputs.clone()
+            let mut outputs = succeeded.outputs.clone();
+            let deliberation_sources = succeeded
+                .outputs
+                .iter()
+                .flat_map(|output| output.source_refs.iter())
+                .filter(|source| is_safe_deliberation_summary(source.kind))
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            for source in deliberation_sources {
+                let artifact = self.store.artifact(&source.artifact_id)?;
+                if artifact.kind != source.kind {
+                    return Err(ContextError::InvalidManifestClosure);
+                }
+                outputs.push(artifact);
+            }
+            outputs
         } else {
             Vec::new()
         };
@@ -649,6 +664,23 @@ impl ContextBroker {
                 continue;
             }
             if !is_trace_kind(source.kind) && parent_readable.contains(source) {
+                continue;
+            }
+            if is_safe_deliberation_summary(source.kind) {
+                self.validate_parent_attempt_artifact(
+                    &source_artifact,
+                    parent_permit,
+                    parent_contract,
+                )?;
+                self.validate_parent_output_sources(
+                    &source_artifact,
+                    parent_manifest,
+                    parent_readable,
+                    parent_raw_closure,
+                    parent_permit,
+                    parent_contract,
+                    visiting,
+                )?;
                 continue;
             }
             if !is_trace_kind(source.kind) {
@@ -1037,11 +1069,12 @@ fn context_rank(artifact: &Artifact) -> u8 {
 fn is_trace_kind(kind: ArtifactKind) -> bool {
     matches!(
         kind,
-        ArtifactKind::AgentTurn
-            | ArtifactKind::DeliberationNote
-            | ArtifactKind::ToolCall
-            | ArtifactKind::ToolResult
+        ArtifactKind::AgentTurn | ArtifactKind::ToolCall | ArtifactKind::ToolResult
     )
+}
+
+fn is_safe_deliberation_summary(kind: ArtifactKind) -> bool {
+    kind == ArtifactKind::DeliberationNote
 }
 
 fn overlay_state_is_eligible(kind: ArtifactKind, state: PolicyState) -> bool {
@@ -1063,24 +1096,35 @@ fn derive_child_projection(
     child_contract: &AgentContract,
 ) -> ContextProjection {
     let policy = &child_contract.context;
-    let allowed = proof
-        .outputs
-        .iter()
-        .filter(|output| {
-            output.kind != ArtifactKind::RawEvidence
-                && output.kind != ArtifactKind::ContextManifest
-                && !is_trace_kind(output.kind)
-                && policy.permitted_kinds.contains(&output.kind)
-                && (policy.permitted_source_families.is_empty()
-                    || policy
-                        .permitted_source_families
-                        .contains(&output.provenance.source_family))
-        })
-        .map(|output| ArtifactRef {
-            artifact_id: output.artifact_id.clone(),
-            kind: output.kind,
-        })
-        .collect::<BTreeSet<_>>();
+    let mut allowed = BTreeSet::new();
+    for output in &proof.outputs {
+        if output.kind != ArtifactKind::RawEvidence
+            && output.kind != ArtifactKind::ContextManifest
+            && !is_trace_kind(output.kind)
+            && policy.permitted_kinds.contains(&output.kind)
+            && (policy.permitted_source_families.is_empty()
+                || policy
+                    .permitted_source_families
+                    .contains(&output.provenance.source_family))
+        {
+            allowed.insert(ArtifactRef {
+                artifact_id: output.artifact_id.clone(),
+                kind: output.kind,
+            });
+        }
+        if policy
+            .permitted_kinds
+            .contains(&ArtifactKind::DeliberationNote)
+        {
+            allowed.extend(
+                output
+                    .source_refs
+                    .iter()
+                    .filter(|source| is_safe_deliberation_summary(source.kind))
+                    .cloned(),
+            );
+        }
+    }
 
     ContextProjection {
         parent_manifest,
@@ -2191,6 +2235,261 @@ mod tests {
                 &child_contract,
                 now,
                 Duration::minutes(5),
+            ),
+            Err(ContextError::GrantDenied { .. })
+        ));
+    }
+
+    #[test]
+    fn deliberation_note_is_projectable_but_agent_turn_is_not() {
+        let (_root, store, parent_permit, parent_contract, parent, _raw, now) = manifest_fixture();
+        let broker = ContextBroker::new(store.clone());
+        let agent_artifact = |kind: ArtifactKind, source_refs: Vec<ArtifactRef>, value: &str| {
+            Artifact::new(
+                kind,
+                store
+                    .put_bytes(value.as_bytes(), "application/json")
+                    .unwrap(),
+                "agent.research.analyst",
+                ArtifactLifecycle::RunScoped,
+                ArtifactProvenance {
+                    source_family: "akzio.agent".to_owned(),
+                    observed_at: None,
+                    retrieved_at: now,
+                    source_uri: None,
+                    confidence_ppm: 1_000_000,
+                    producer_contract_hash: Some(parent_contract.contract_hash.clone()),
+                },
+                Some(ArtifactOrigin {
+                    run_id: Some(parent_permit.run_id.clone()),
+                    task_id: Some(parent_permit.task_id.clone()),
+                    attempt_id: Some(parent_permit.attempt_id.clone()),
+                    contract_hash: parent_permit.contract_hash.clone(),
+                }),
+                source_refs,
+                now,
+            )
+            .unwrap()
+        };
+        let note = agent_artifact(
+            ArtifactKind::DeliberationNote,
+            vec![
+                ArtifactRef {
+                    artifact_id: parent.artifact.artifact_id.clone(),
+                    kind: ArtifactKind::ContextManifest,
+                },
+                parent.payload.selections[0].artifact.clone(),
+            ],
+            "{\"selected_path\":\"use evidence\",\"alternatives\":[],\"uncertainties\":[],\"basis_artifact_ids\":[],\"confidence_ppm\":750000}",
+        );
+        store
+            .write_task_artifact(
+                &parent_permit,
+                &note,
+                LifecycleEventType::DeliberationNoteCreated,
+                now,
+            )
+            .unwrap();
+        let output = agent_artifact(
+            ArtifactKind::DecisionProposal,
+            vec![
+                ArtifactRef {
+                    artifact_id: parent.artifact.artifact_id.clone(),
+                    kind: ArtifactKind::ContextManifest,
+                },
+                ArtifactRef {
+                    artifact_id: note.artifact_id.clone(),
+                    kind: ArtifactKind::DeliberationNote,
+                },
+            ],
+            "decision proposal",
+        );
+        store
+            .commit_attempt(
+                &parent_permit,
+                std::slice::from_ref(&output),
+                akzio_domain::TaskStatus::Succeeded,
+                now,
+            )
+            .unwrap();
+
+        let mut child_contract = contract(&store);
+        child_contract
+            .context
+            .permitted_kinds
+            .insert(ArtifactKind::DeliberationNote);
+        child_contract
+            .context
+            .permitted_source_families
+            .insert("akzio.agent".to_owned());
+        child_contract.candidate_capability_ceiling.context = child_contract.context.clone();
+        child_contract.contract_hash = child_contract.expected_hash().unwrap();
+        let mut child_permit = parent_permit.clone();
+        child_permit.task_id = akzio_domain::TaskId::new();
+        child_permit.attempt_id = akzio_domain::AttemptId::new();
+        child_permit.lease_id = akzio_domain::LeaseId::new();
+        child_permit.contract_hash = Some(child_contract.contract_hash.clone());
+
+        let proof = store
+            .current_succeeded_attempt(&parent_permit.run_id, &parent_permit.task_id)
+            .unwrap();
+        let projection = derive_child_projection(
+            &proof,
+            proof.context_manifest.clone().unwrap(),
+            &child_contract,
+        );
+        assert_eq!(projection.allowed.len(), 1);
+        assert_eq!(projection.allowed[0].artifact_id, note.artifact_id);
+        broker
+            .validate_parent_output_provenance(
+                &output,
+                &projection.parent_manifest,
+                &BTreeSet::from([parent.payload.selections[0].artifact.clone()]),
+                &BTreeSet::new(),
+                &parent_permit,
+                &parent_contract,
+            )
+            .unwrap();
+
+        let agent_turn = task_artifact(
+            &store,
+            &parent_permit,
+            ArtifactKind::AgentTurn,
+            vec![],
+            "raw agent turn",
+        );
+        let trace_projection = ContextProjection {
+            parent_manifest: ArtifactRef {
+                artifact_id: parent.artifact.artifact_id.clone(),
+                kind: ArtifactKind::ContextManifest,
+            },
+            allowed: vec![ArtifactRef {
+                artifact_id: agent_turn.artifact_id,
+                kind: ArtifactKind::AgentTurn,
+            }],
+            reason: "agent-turn-trace".to_owned(),
+        };
+        assert!(matches!(
+            broker.assemble_child(
+                &parent_permit,
+                &parent_contract,
+                &parent,
+                &trace_projection,
+                &child_permit,
+                &child_contract,
+                now,
+                Duration::minutes(5),
+            ),
+            Err(ContextError::GrantDenied { .. })
+        ));
+    }
+
+    #[test]
+    fn deliberation_note_can_be_read_but_agent_turn_cannot() {
+        let root = tempdir().unwrap();
+        let store = V2Store::open(root.path()).unwrap();
+        let mut read_contract = contract(&store);
+        read_contract
+            .context
+            .permitted_kinds
+            .extend([ArtifactKind::DeliberationNote, ArtifactKind::AgentTurn]);
+        read_contract
+            .context
+            .permitted_source_families
+            .insert("akzio.agent".to_owned());
+        read_contract.candidate_capability_ceiling.context = read_contract.context.clone();
+        read_contract.contract_hash = read_contract.expected_hash().unwrap();
+        let permit = permit_for_contract(
+            &store,
+            RunPurpose::Debug,
+            Some(read_contract.contract_hash.clone()),
+        );
+        let now = Utc::now();
+        let make_agent_artifact = |kind: ArtifactKind, value: &str| {
+            Artifact::new(
+                kind,
+                store
+                    .put_bytes(value.as_bytes(), "application/json")
+                    .unwrap(),
+                "agent.research.analyst",
+                ArtifactLifecycle::RunScoped,
+                ArtifactProvenance {
+                    source_family: "akzio.agent".to_owned(),
+                    observed_at: None,
+                    retrieved_at: now,
+                    source_uri: None,
+                    confidence_ppm: 1_000_000,
+                    producer_contract_hash: Some(read_contract.contract_hash.clone()),
+                },
+                Some(ArtifactOrigin {
+                    run_id: Some(permit.run_id.clone()),
+                    task_id: Some(permit.task_id.clone()),
+                    attempt_id: Some(permit.attempt_id.clone()),
+                    contract_hash: permit.contract_hash.clone(),
+                }),
+                vec![],
+                now,
+            )
+            .unwrap()
+        };
+        let note = make_agent_artifact(
+            ArtifactKind::DeliberationNote,
+            "{\"selected_path\":\"readable summary\",\"alternatives\":[],\"uncertainties\":[],\"basis_artifact_ids\":[],\"confidence_ppm\":900000}",
+        );
+        store
+            .write_task_artifact(
+                &permit,
+                &note,
+                LifecycleEventType::DeliberationNoteCreated,
+                now,
+            )
+            .unwrap();
+        let turn = make_agent_artifact(ArtifactKind::AgentTurn, "agent turn");
+        store
+            .append_task_event(&permit, LifecycleEventType::AgentTurnStarted, now)
+            .unwrap();
+        store
+            .write_task_artifact(&permit, &turn, LifecycleEventType::AgentTurnCompleted, now)
+            .unwrap();
+        let broker = ContextBroker::new(store);
+        let manifest = broker
+            .assemble(
+                &permit,
+                &read_contract,
+                [
+                    ArtifactRef {
+                        artifact_id: note.artifact_id.clone(),
+                        kind: ArtifactKind::DeliberationNote,
+                    },
+                    ArtifactRef {
+                        artifact_id: turn.artifact_id.clone(),
+                        kind: ArtifactKind::AgentTurn,
+                    },
+                ],
+                now,
+                Duration::minutes(5),
+            )
+            .unwrap();
+        assert_eq!(
+            broker
+                .read(
+                    &permit,
+                    &read_contract,
+                    &manifest.grant,
+                    &note.artifact_id,
+                    now,
+                )
+                .unwrap()
+                .artifact_id,
+            note.artifact_id
+        );
+        assert!(matches!(
+            broker.read(
+                &permit,
+                &read_contract,
+                &manifest.grant,
+                &turn.artifact_id,
+                now,
             ),
             Err(ContextError::GrantDenied { .. })
         ));

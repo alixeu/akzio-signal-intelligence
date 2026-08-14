@@ -16,14 +16,14 @@ use akzio_domain::AttemptRelationKind;
 use akzio_domain::{
     AgentContract, Artifact, ArtifactId, ArtifactKind, ArtifactLifecycle, ArtifactOrigin,
     ArtifactProvenance, ArtifactRef, Asset, AttemptId, AttemptRelation, BlobRef, CandidatePolicy,
-    CandidatePolicyState, ContentHash, ContractId, ContractPurpose, DomainError, Evaluation,
-    ExecutionContext, ExecutionPlan, ExecutionVerdict, Experience, FailureDisposition, FreezeState,
-    LeaseId, LifecycleEventType, OrderReceipt, OrderReceiptState, Outcome, OutcomeExecutionLineage,
-    OutcomeHorizon, OutcomeId, OutcomeSchedule, PaperCommitment, PaperReprice, PolicyState,
-    PolicySubject, PolicyTransition, PolicyTransitionId, Reconciliation, Retrospective,
-    RetrospectiveDraft, RetrospectiveStatus, RetryPolicy, RunId, RunPurpose, TaskBudget, TaskId,
-    TaskRecipeId, TaskStatus, TaskWritePermit, WorkflowGraph, WorkflowNode, WorkflowProposal,
-    WorkflowStatus, V2_DOMAIN_SCHEMA_VERSION, V2_SCHEMA_VERSION,
+    CandidatePolicyState, ContentHash, ContractId, ContractPurpose, DeliberationSummary,
+    DomainError, Evaluation, ExecutionContext, ExecutionPlan, ExecutionVerdict, Experience,
+    FailureDisposition, FreezeState, LeaseId, LifecycleEventType, OrderReceipt, OrderReceiptState,
+    Outcome, OutcomeExecutionLineage, OutcomeHorizon, OutcomeId, OutcomeSchedule, PaperCommitment,
+    PaperReprice, PolicyState, PolicySubject, PolicyTransition, PolicyTransitionId, Reconciliation,
+    Retrospective, RetrospectiveDraft, RetrospectiveStatus, RetryPolicy, RunId, RunPurpose,
+    TaskBudget, TaskId, TaskRecipeId, TaskStatus, TaskWritePermit, WorkflowGraph, WorkflowNode,
+    WorkflowProposal, WorkflowStatus, V2_DOMAIN_SCHEMA_VERSION, V2_SCHEMA_VERSION,
 };
 use chrono::{DateTime, Duration, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
@@ -294,6 +294,72 @@ pub struct StoredEvent {
     pub event_type: String,
     pub artifact_id: Option<ArtifactId>,
     pub created_at: DateTime<Utc>,
+}
+
+/// Read-only, redacted projection of one durable agent trajectory fact.
+/// Provider request/result bodies and tool arguments/results never cross this
+/// boundary; only bounded metadata and structured deliberation summaries do.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrajectoryEntry {
+    pub cursor: i64,
+    pub task_id: Option<TaskId>,
+    pub attempt_id: Option<AttemptId>,
+    pub turn: Option<u32>,
+    pub event_type: String,
+    pub artifact_id: Option<ArtifactId>,
+    pub artifact_kind: Option<ArtifactKind>,
+    pub model: Option<TrajectoryModelMetadata>,
+    pub tool: Option<TrajectoryToolLifecycle>,
+    pub deliberation: Option<DeliberationSummary>,
+    pub output_refs: Vec<ArtifactRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct TrajectoryModelMetadata {
+    pub provider_id: Option<String>,
+    pub model_id: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub supports_structured_output: Option<bool>,
+    pub supports_tool_calls: Option<bool>,
+    pub native_web_tool: Option<bool>,
+    pub streaming: Option<bool>,
+    pub declared_context_limit: Option<u32>,
+    pub declared_max_output_tokens: Option<u32>,
+    pub source: Option<String>,
+    pub contract_hash: Option<ContentHash>,
+    pub request_hash: Option<ContentHash>,
+    pub capability_snapshot_hash: Option<ContentHash>,
+    pub tool_set_hash: Option<ContentHash>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrajectoryToolLifecycle {
+    pub call_id: Option<String>,
+    pub name: Option<String>,
+    pub lifecycle: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct StoredTrajectoryTurn {
+    turn: Option<u32>,
+    contract_hash: Option<ContentHash>,
+    request_hash: Option<ContentHash>,
+    capability_snapshot: Option<TrajectoryModelMetadata>,
+    capability_snapshot_hash: Option<ContentHash>,
+    tool_set_hash: Option<ContentHash>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct StoredTrajectoryToolCall {
+    call_id: Option<String>,
+    name: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct StoredTrajectoryToolArtifact {
+    call: Option<StoredTrajectoryToolCall>,
+    call_id: Option<String>,
+    name: Option<String>,
 }
 
 impl StoredEvent {
@@ -3090,8 +3156,85 @@ impl V2Store {
         )?
         .map(|(hash, _)| hash)
         .or_else(|| schedule.provenance.producer_contract_hash.clone());
+        // AgentRuntime rejects a task whose durable policy diverges from its contract.
+        let worker_policy = worker_contract_hash
+            .as_ref()
+            .map(|contract_hash| {
+                self.stored_contract_with_connection(&transaction, contract_hash)?
+                    .ok_or_else(|| StoreError::MissingContractInstallation(contract_hash.clone()))
+            })
+            .transpose()?;
+        let (worker_budget, worker_retry, worker_on_failure) = worker_policy
+            .map(|stored| {
+                (
+                    stored.contract.budget,
+                    stored.contract.retry,
+                    stored.contract.on_failure,
+                )
+            })
+            .unwrap_or_else(|| {
+                (
+                    TaskBudget {
+                        max_input_tokens: 1_024,
+                        max_output_tokens: 1_024,
+                        max_wall_time_secs: 120,
+                        max_tool_calls: 0,
+                    },
+                    RetryPolicy {
+                        max_attempts: u8::MAX,
+                        initial_backoff_ms: 3_600_000,
+                        retry_transport: true,
+                        retry_rate_limited: true,
+                        retry_invalid_output: false,
+                    },
+                    FailureDisposition::FailRun,
+                )
+            });
         let mut worker_inputs = vec![schedule_ref];
         worker_inputs.extend(schedule.source_refs.clone());
+        let deliberation_note_ids = transaction
+            .prepare(
+                r#"
+                SELECT DISTINCT e.artifact_id
+                FROM rebuild_events AS e
+                JOIN rebuild_tasks AS t
+                  ON t.run_id = e.run_id
+                 AND t.task_id = e.task_id
+                JOIN rebuild_attempts AS a
+                  ON a.run_id = e.run_id
+                 AND a.task_id = e.task_id
+                 AND a.attempt_id = e.attempt_id
+                JOIN rebuild_artifacts AS artifact
+                  ON artifact.artifact_id = e.artifact_id
+                WHERE e.run_id = ?1
+                  AND e.event_type = ?2
+                  AND e.artifact_id IS NOT NULL
+                  AND t.status = 'succeeded'
+                  AND a.status = 'succeeded'
+                  AND artifact.kind = ?3
+                ORDER BY e.artifact_id ASC
+                "#,
+            )?
+            .query_map(
+                params![
+                    permit.run_id.0,
+                    LifecycleEventType::DeliberationNoteCreated.as_str(),
+                    enum_name(ArtifactKind::DeliberationNote),
+                ],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        worker_inputs.extend(
+            deliberation_note_ids
+                .into_iter()
+                .map(|artifact_id| {
+                    Ok(ArtifactRef {
+                        artifact_id: ArtifactId(ContentHash::new(artifact_id)?),
+                        kind: ArtifactKind::DeliberationNote,
+                    })
+                })
+                .collect::<StoreResult<Vec<_>>>()?,
+        );
         worker_inputs.sort();
         worker_inputs.dedup();
         let worker = WorkflowNode {
@@ -3102,20 +3245,9 @@ impl V2Store {
             dependencies: Vec::new(),
             input_artifacts: worker_inputs,
             priority: 100,
-            budget: TaskBudget {
-                max_input_tokens: 1_024,
-                max_output_tokens: 1_024,
-                max_wall_time_secs: 120,
-                max_tool_calls: 0,
-            },
-            retry: RetryPolicy {
-                max_attempts: u8::MAX,
-                initial_backoff_ms: 3_600_000,
-                retry_transport: true,
-                retry_rate_limited: true,
-                retry_invalid_output: false,
-            },
-            on_failure: FailureDisposition::FailRun,
+            budget: worker_budget,
+            retry: worker_retry,
+            on_failure: worker_on_failure,
             parent_task_id: None,
         };
         insert_task_node(&transaction, &permit.run_id, &worker, now)?;
@@ -5170,6 +5302,154 @@ impl V2Store {
         validate_gate_lifecycle_events(&connection, Some(run_id))?;
         validate_paper_effect_events(&connection, Some(run_id))?;
         Ok(events)
+    }
+
+    /// Return a read-only, redacted trajectory projection for one run.
+    /// Pagination follows the durable event cursor; no model, market, broker,
+    /// task, or artifact mutation is performed by this query.
+    pub fn trajectory(&self, run_id: &RunId) -> StoreResult<Vec<TrajectoryEntry>> {
+        const PAGE_SIZE: usize = 256;
+        let mut after = 0_i64;
+        let mut entries = Vec::new();
+        loop {
+            let page = self.events_after(run_id, after, PAGE_SIZE)?;
+            if page.is_empty() {
+                break;
+            }
+            after = page.last().expect("non-empty trajectory page").cursor;
+            for event in &page {
+                if let Some(entry) = self.trajectory_entry(event)? {
+                    entries.push(entry);
+                }
+            }
+            if page.len() < PAGE_SIZE {
+                break;
+            }
+        }
+        entries.sort_by(|left, right| {
+            left.cursor
+                .cmp(&right.cursor)
+                .then_with(|| left.task_id.cmp(&right.task_id))
+                .then_with(|| left.attempt_id.cmp(&right.attempt_id))
+                .then_with(|| left.turn.cmp(&right.turn))
+        });
+        Ok(entries)
+    }
+
+    fn trajectory_entry(&self, event: &StoredEvent) -> StoreResult<Option<TrajectoryEntry>> {
+        let lifecycle = event.lifecycle_kind()?;
+        let base = |artifact: Option<&Artifact>| TrajectoryEntry {
+            cursor: event.cursor,
+            task_id: event.task_id.clone(),
+            attempt_id: event.attempt_id.clone(),
+            turn: None,
+            event_type: event.event_type.clone(),
+            artifact_id: event.artifact_id.clone(),
+            artifact_kind: artifact.map(|value| value.kind),
+            model: None,
+            tool: None,
+            deliberation: None,
+            output_refs: Vec::new(),
+        };
+
+        match lifecycle {
+            LifecycleEventType::AgentTurnStarted => Ok(Some(base(None))),
+            LifecycleEventType::AgentTurn
+            | LifecycleEventType::AgentTurnCompleted
+            | LifecycleEventType::AgentTurnFailed
+            | LifecycleEventType::AgentTurnRetryableFailed => {
+                let Some(artifact_id) = event.artifact_id.as_ref() else {
+                    return Ok(Some(base(None)));
+                };
+                let artifact = self.artifact(artifact_id)?;
+                if artifact.kind != ArtifactKind::AgentTurn {
+                    return Err(StoreError::Integrity(format!(
+                        "trajectory event {} references {:?}, expected agent_turn",
+                        event.cursor, artifact.kind
+                    )));
+                }
+                let payload: StoredTrajectoryTurn =
+                    match serde_json::from_slice(&self.read_blob(&artifact.blob)?) {
+                        Ok(payload) => payload,
+                        Err(_) => return Ok(Some(base(Some(&artifact)))),
+                    };
+                let mut model = payload.capability_snapshot.unwrap_or_default();
+                model.contract_hash = payload.contract_hash;
+                model.request_hash = payload.request_hash;
+                model.capability_snapshot_hash = payload.capability_snapshot_hash;
+                model.tool_set_hash = payload.tool_set_hash;
+                let mut entry = base(Some(&artifact));
+                entry.turn = payload.turn;
+                entry.model = Some(model);
+                Ok(Some(entry))
+            }
+            LifecycleEventType::ToolCalled
+            | LifecycleEventType::ToolCompleted
+            | LifecycleEventType::ToolFailed => {
+                let Some(artifact_id) = event.artifact_id.as_ref() else {
+                    return Ok(None);
+                };
+                let artifact = self.artifact(artifact_id)?;
+                if !matches!(
+                    artifact.kind,
+                    ArtifactKind::ToolCall | ArtifactKind::ToolResult
+                ) {
+                    return Err(StoreError::Integrity(format!(
+                        "trajectory event {} references {:?}, expected tool artifact",
+                        event.cursor, artifact.kind
+                    )));
+                }
+                let payload: StoredTrajectoryToolArtifact =
+                    match serde_json::from_slice(&self.read_blob(&artifact.blob)?) {
+                        Ok(payload) => payload,
+                        Err(_) => return Ok(Some(base(Some(&artifact)))),
+                    };
+                let call_id = payload
+                    .call_id
+                    .or_else(|| payload.call.as_ref().and_then(|call| call.call_id.clone()));
+                let name = payload
+                    .name
+                    .or_else(|| payload.call.as_ref().and_then(|call| call.name.clone()));
+                let mut entry = base(Some(&artifact));
+                entry.tool = Some(TrajectoryToolLifecycle {
+                    call_id,
+                    name,
+                    lifecycle: event.event_type.clone(),
+                });
+                Ok(Some(entry))
+            }
+            LifecycleEventType::DeliberationNoteCreated => {
+                let Some(artifact_id) = event.artifact_id.as_ref() else {
+                    return Ok(None);
+                };
+                let artifact = self.artifact(artifact_id)?;
+                if artifact.kind != ArtifactKind::DeliberationNote {
+                    return Err(StoreError::Integrity(format!(
+                        "trajectory event {} references {:?}, expected deliberation_note",
+                        event.cursor, artifact.kind
+                    )));
+                }
+                let deliberation: DeliberationSummary =
+                    serde_json::from_slice(&self.read_blob(&artifact.blob)?)?;
+                deliberation.validate()?;
+                let mut entry = base(Some(&artifact));
+                entry.deliberation = Some(deliberation);
+                Ok(Some(entry))
+            }
+            LifecycleEventType::ArtifactCommitted => {
+                let Some(artifact_id) = event.artifact_id.as_ref() else {
+                    return Ok(None);
+                };
+                let artifact = self.artifact(artifact_id)?;
+                if is_trajectory_redacted_kind(artifact.kind) {
+                    return Ok(None);
+                }
+                let mut entry = base(Some(&artifact));
+                entry.output_refs = trajectory_output_refs(&artifact);
+                Ok(Some(entry))
+            }
+            _ => Ok(None),
+        }
     }
 
     pub fn verify_integrity(&self) -> StoreResult<()> {
@@ -9855,6 +10135,33 @@ fn parse_task_status(value: &str) -> StoreResult<TaskStatus> {
     }
 }
 
+fn is_trajectory_redacted_kind(kind: ArtifactKind) -> bool {
+    matches!(
+        kind,
+        ArtifactKind::AgentTurn | ArtifactKind::ToolCall | ArtifactKind::ToolResult
+    )
+}
+
+fn trajectory_output_refs(artifact: &Artifact) -> Vec<ArtifactRef> {
+    let mut refs = vec![ArtifactRef {
+        artifact_id: artifact.artifact_id.clone(),
+        kind: artifact.kind,
+    }];
+    refs.extend(
+        artifact
+            .source_refs
+            .iter()
+            .filter(|reference| {
+                reference.kind != ArtifactKind::RawEvidence
+                    && !is_trajectory_redacted_kind(reference.kind)
+            })
+            .cloned(),
+    );
+    refs.sort();
+    refs.dedup();
+    refs
+}
+
 #[cfg(test)]
 mod tests {
     use akzio_domain::{
@@ -14047,6 +14354,233 @@ mod tests {
                 ));
             }
         }
+    }
+
+    #[test]
+    fn trajectory_redacts_provider_and_tool_payloads() {
+        let fixture = task_artifact_fixture(RunPurpose::Debug);
+        fixture
+            .store
+            .append_task_event(
+                &fixture.permit,
+                LifecycleEventType::AgentTurnStarted,
+                fixture.now,
+            )
+            .unwrap();
+        let turn = permit_artifact(
+            &fixture.store,
+            &fixture.permit,
+            ArtifactKind::AgentTurn,
+            &serde_json::json!({
+                "turn": 1,
+                "attempt": 1,
+                "contract_hash": "contract",
+                "request_hash": "request-hash",
+                "capability_snapshot": {
+                    "provider_id": "fixture-provider",
+                    "model_id": "fixture-model",
+                    "reasoning_effort": "high",
+                    "supports_structured_output": true,
+                    "supports_tool_calls": true,
+                    "native_web_tool": false,
+                    "source": "fixture"
+                },
+                "capability_snapshot_hash": "capability-hash",
+                "tool_set_hash": "tool-hash",
+                "request": {"secret": "provider-request"},
+                "response": {"secret": "provider-result"}
+            }),
+            vec![],
+            ArtifactLifecycle::RunScoped,
+            fixture.now,
+        );
+        fixture
+            .store
+            .write_task_artifact(
+                &fixture.permit,
+                &turn,
+                LifecycleEventType::AgentTurnCompleted,
+                fixture.now,
+            )
+            .unwrap();
+
+        let call = permit_artifact(
+            &fixture.store,
+            &fixture.permit,
+            ArtifactKind::ToolCall,
+            &serde_json::json!({
+                "call": {
+                    "call_id": "call-1",
+                    "name": "read_artifact",
+                    "arguments": {"secret": "tool-arguments"}
+                }
+            }),
+            vec![],
+            ArtifactLifecycle::RunScoped,
+            fixture.now,
+        );
+        fixture
+            .store
+            .write_task_artifact(
+                &fixture.permit,
+                &call,
+                LifecycleEventType::ToolCalled,
+                fixture.now,
+            )
+            .unwrap();
+        let result = permit_artifact(
+            &fixture.store,
+            &fixture.permit,
+            ArtifactKind::ToolResult,
+            &serde_json::json!({
+                "call_id": "call-1",
+                "name": "read_artifact",
+                "ok": true,
+                "value": {"secret": "tool-result"}
+            }),
+            vec![artifact_ref(&call)],
+            ArtifactLifecycle::RunScoped,
+            fixture.now,
+        );
+        fixture
+            .store
+            .write_task_artifact(
+                &fixture.permit,
+                &result,
+                LifecycleEventType::ToolCompleted,
+                fixture.now,
+            )
+            .unwrap();
+
+        let note = permit_artifact(
+            &fixture.store,
+            &fixture.permit,
+            ArtifactKind::DeliberationNote,
+            &serde_json::json!({
+                "selected_path": "use the governed evidence",
+                "alternatives": ["defer"],
+                "uncertainties": ["fixture uncertainty"],
+                "basis_artifact_ids": [],
+                "confidence_ppm": 750_000
+            }),
+            vec![],
+            ArtifactLifecycle::RunScoped,
+            fixture.now,
+        );
+        fixture
+            .store
+            .write_task_artifact(
+                &fixture.permit,
+                &note,
+                LifecycleEventType::DeliberationNoteCreated,
+                fixture.now,
+            )
+            .unwrap();
+        let output = permit_artifact(
+            &fixture.store,
+            &fixture.permit,
+            ArtifactKind::DecisionProposal,
+            &serde_json::json!({"statement": "fixture output"}),
+            vec![artifact_ref(&note)],
+            ArtifactLifecycle::RunScoped,
+            fixture.now,
+        );
+        fixture
+            .store
+            .commit_attempt(
+                &fixture.permit,
+                std::slice::from_ref(&output),
+                TaskStatus::Succeeded,
+                fixture.now,
+            )
+            .unwrap();
+
+        let entries = fixture.store.trajectory(&fixture.run.run_id).unwrap();
+        assert!(entries
+            .windows(2)
+            .all(|pair| pair[0].cursor < pair[1].cursor));
+        let model = entries
+            .iter()
+            .find(|entry| entry.artifact_kind == Some(ArtifactKind::AgentTurn))
+            .expect("model trajectory entry");
+        assert_eq!(
+            model
+                .model
+                .as_ref()
+                .and_then(|value| value.model_id.as_deref()),
+            Some("fixture-model")
+        );
+        let model_json = serde_json::to_string(model).unwrap();
+        assert!(!model_json.contains("provider-request"));
+        assert!(!model_json.contains("provider-result"));
+
+        let tool = entries
+            .iter()
+            .find(|entry| entry.tool.is_some())
+            .expect("tool trajectory entry");
+        assert_eq!(
+            tool.tool
+                .as_ref()
+                .and_then(|value| value.call_id.as_deref()),
+            Some("call-1")
+        );
+        let tool_json = serde_json::to_string(tool).unwrap();
+        assert!(!tool_json.contains("tool-arguments"));
+        assert!(!tool_json.contains("tool-result"));
+
+        assert!(entries.iter().any(|entry| {
+            entry
+                .deliberation
+                .as_ref()
+                .is_some_and(|value| value.selected_path == "use the governed evidence")
+        }));
+        let output_entry = entries
+            .iter()
+            .find(|entry| entry.artifact_id.as_ref() == Some(&output.artifact_id))
+            .expect("output trajectory entry");
+        assert!(output_entry
+            .output_refs
+            .iter()
+            .any(|reference| reference.artifact_id == note.artifact_id));
+    }
+
+    #[test]
+    fn trajectory_handles_opaque_agent_turn_payload() {
+        let fixture = task_artifact_fixture(RunPurpose::Debug);
+        fixture
+            .store
+            .append_task_event(
+                &fixture.permit,
+                LifecycleEventType::AgentTurnStarted,
+                fixture.now,
+            )
+            .unwrap();
+        let turn = permit_artifact(
+            &fixture.store,
+            &fixture.permit,
+            ArtifactKind::AgentTurn,
+            &serde_json::json!("opaque fixture turn"),
+            vec![],
+            ArtifactLifecycle::RunScoped,
+            fixture.now,
+        );
+        fixture
+            .store
+            .write_task_artifact(
+                &fixture.permit,
+                &turn,
+                LifecycleEventType::AgentTurnCompleted,
+                fixture.now,
+            )
+            .unwrap();
+
+        let entries = fixture.store.trajectory(&fixture.run.run_id).unwrap();
+        let entry = entries
+            .iter()
+            .find(|entry| entry.artifact_id.as_ref() == Some(&turn.artifact_id))
+            .expect("opaque agent turn trajectory entry");
+        assert_eq!(entry.artifact_kind, Some(ArtifactKind::AgentTurn));
+        assert!(entry.model.is_none());
     }
 
     #[test]
