@@ -629,13 +629,16 @@ fn canonical_active_contract(
     store: &V2Store,
     definition: CanonicalContractDefinition,
 ) -> ResearchResult<AgentContract> {
-    let role_prompt = if definition.purpose == "research.synthesizer" {
-        format!(
+    let role_prompt = match definition.purpose {
+        "research.synthesizer" => format!(
             "{}\n\nAlways return exactly 12 forecasts: one for each executable asset (TQQQ, QQQ, SOXX, SOXL) at each horizon (t1, t3, t5), even when the proposal is blocked; for blocked proposals use neutral zero forecasts and explain the blocker in hard_blockers and summary.",
             definition.prompt
-        )
-    } else {
-        definition.prompt.to_owned()
+        ),
+        "research.analyst" => format!(
+            "{}\n\nKeep evidence_gaps to at most 2 items; combine overlapping limitations into concise, evidence-grounded gaps.",
+            definition.prompt
+        ),
+        _ => definition.prompt.to_owned(),
     };
     let prompt = PromptBundle {
         version: ACTIVE_PROMPT_BUNDLE_VERSION,
@@ -2429,6 +2432,19 @@ fn validate_output_schema(
     Ok(())
 }
 
+fn value_matches_schema_kind(value: &Value, kind: &str) -> bool {
+    match kind {
+        "object" => value.is_object(),
+        "array" => value.is_array(),
+        "string" => value.is_string(),
+        "boolean" => value.is_boolean(),
+        "number" => value.is_number(),
+        "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+        "null" => value.is_null(),
+        _ => false,
+    }
+}
+
 fn validate_schema_value(value: &Value, schema: &Value, path: &str) -> Result<(), String> {
     let definition = schema
         .as_object()
@@ -2455,21 +2471,22 @@ fn validate_schema_value(value: &Value, schema: &Value, path: &str) -> Result<()
             return Err(format!("{path} schema keyword {key} is unsupported"));
         }
     }
-    let kind = definition
-        .get("type")
-        .and_then(Value::as_str)
-        .ok_or_else(|| format!("{path} schema.type must be a string"))?;
-    let valid_kind = match kind {
-        "object" => value.is_object(),
-        "array" => value.is_array(),
-        "string" => value.is_string(),
-        "boolean" => value.is_boolean(),
-        "number" => value.is_number(),
-        "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
-        "null" => value.is_null(),
-        _ => return Err(format!("{path} schema.type {kind} is unsupported")),
+    let kind = match definition.get("type") {
+        Some(Value::String(kind)) => kind.as_str(),
+        Some(Value::Array(kinds)) => kinds
+            .iter()
+            .map(|kind| {
+                kind.as_str()
+                    .ok_or_else(|| format!("{path} schema.type entries must be strings"))
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .find(|kind| value_matches_schema_kind(value, kind))
+            .ok_or_else(|| format!("{path} does not match any schema.type option"))?,
+        Some(_) => return Err(format!("{path} schema.type must be a string or array")),
+        None => return Err(format!("{path} schema.type is missing")),
     };
-    if !valid_kind {
+    if !value_matches_schema_kind(value, kind) {
         return Err(format!("{path} must be a {kind}"));
     }
     validate_schema_bounds(value, definition, kind, path)?;
@@ -3695,6 +3712,15 @@ mod tests {
         ] {
             assert!(validate_schema_value(&invalid, &schema, "$").is_err());
         }
+    }
+
+    #[test]
+    fn schema_validator_accepts_nullable_union_types() {
+        let schema = json!({"type": ["string", "null"]});
+
+        validate_schema_value(&Value::Null, &schema, "$").unwrap();
+        validate_schema_value(&json!("fixture"), &schema, "$").unwrap();
+        assert!(validate_schema_value(&json!(42), &schema, "$").is_err());
     }
 
     #[test]
