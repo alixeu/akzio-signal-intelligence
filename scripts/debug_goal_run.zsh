@@ -212,9 +212,10 @@ fi
   > "${goal_bundle}/commands/export-run.json" 2>&1
 
 if ! jq -e --arg model "gpt-5.6-luna" '
-  ([.[] | select(.event_type == "agent.turn_completed" and .model != null)] | length >= 3)
-  and all(.[] | select(.event_type == "agent.turn_completed" and .model != null) | .model.model_id == $model)
-  and all(.[] | select(.event_type == "agent.turn_completed" and .model != null) | .tool == null)
+  [.[] | select(type == "object" and .event_type == "agent.turn_completed" and .model != null)] as $turns
+  | ($turns | length >= 3)
+  and ($turns | all(.model.model_id == $model))
+  and ($turns | all(.tool == null))
 ' "${goal_bundle}/commands/trajectory.json" >/dev/null; then
   print -u2 -- "trajectory did not prove the expected real model and tool boundary"
   exit 22
