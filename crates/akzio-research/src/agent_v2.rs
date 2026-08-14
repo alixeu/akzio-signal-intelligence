@@ -75,6 +75,12 @@ pub enum ResearchError {
         active: akzio_domain::ContentHash,
         candidate: akzio_domain::ContentHash,
     },
+    #[error("model capability mismatch for {capability} ({provider_id}/{model_id})")]
+    CapabilityMismatch {
+        capability: &'static str,
+        provider_id: String,
+        model_id: String,
+    },
     #[error("ReadGrant does not match the active task permit")]
     GrantPermitMismatch,
     #[error("Agent output did not satisfy Contract schema: {0}")]
@@ -1357,15 +1363,48 @@ impl AgentRuntime {
                     maximum: installed.contract.budget.max_input_tokens,
                 });
             }
-            let capability_snapshot = model.capability_snapshot();
-            let capability_snapshot_hash = capability_snapshot_hash(&capability_snapshot)?;
             let tool_set_hash = tool_set_hash(&request.tools)?;
-            let request_hash = model_request_hash(&request)?;
             let mut turn_attempt = 1_u8;
-            let turn = loop {
+            let (turn, capability_snapshot, capability_snapshot_hash, request_hash) = loop {
+                let capability_snapshot = model.capability_snapshot();
+                let capability_snapshot_hash = capability_snapshot_hash(&capability_snapshot)?;
+                if let Err(capability) = validate_model_capabilities(&capability_snapshot, &request)
+                {
+                    let turn_now = logical_now(now, started.elapsed());
+                    let failed_turn = self.record_failed_turn(
+                        &TurnRecord {
+                            permit,
+                            contract: &installed.contract,
+                            manifest: &manifest,
+                            turn: model_turn,
+                            attempt: turn_attempt,
+                            now: turn_now,
+                        },
+                        &request,
+                        "capability_mismatch",
+                        None,
+                        false,
+                        &capability_snapshot,
+                        &capability_snapshot_hash,
+                        &tool_set_hash,
+                    )?;
+                    trace_refs.push(ArtifactRef {
+                        artifact_id: failed_turn.artifact_id,
+                        kind: ArtifactKind::AgentTurn,
+                    });
+                    return Err(capability);
+                }
+                let request_hash = model_request_hash(&request)?;
                 self.store.validate_task_permit(permit)?;
                 match model.turn(request.clone()).await {
-                    Ok(turn) => break turn,
+                    Ok(turn) => {
+                        break (
+                            turn,
+                            capability_snapshot,
+                            capability_snapshot_hash,
+                            request_hash,
+                        );
+                    }
                     Err(error) => {
                         let retryable = retryable_model_error(&error, &installed.contract.retry);
                         let will_retry =
@@ -1910,6 +1949,27 @@ fn capability_snapshot_hash(
     )?)?)
 }
 
+fn validate_model_capabilities(
+    snapshot: &ModelCapabilitySnapshot,
+    request: &AgentModelRequest,
+) -> ResearchResult<()> {
+    if !request.output_schema.is_null() && !snapshot.supports_structured_output {
+        return Err(ResearchError::CapabilityMismatch {
+            capability: "structured_output",
+            provider_id: snapshot.provider_id.clone(),
+            model_id: snapshot.model_id.clone(),
+        });
+    }
+    if !request.tools.is_empty() && !snapshot.supports_tool_calls {
+        return Err(ResearchError::CapabilityMismatch {
+            capability: "tool_calls",
+            provider_id: snapshot.provider_id.clone(),
+            model_id: snapshot.model_id.clone(),
+        });
+    }
+    Ok(())
+}
+
 fn tool_set_hash(tools: &[AgentToolDefinition]) -> ResearchResult<akzio_domain::ContentHash> {
     Ok(akzio_domain::content_hash_json(&serde_json::to_value(
         tools,
@@ -2439,6 +2499,258 @@ mod tests {
         );
     }
 
+    fn fixture_capabilities() -> ModelCapabilitySnapshot {
+        ModelCapabilitySnapshot {
+            provider_id: "fixture".to_owned(),
+            model_id: "fixture".to_owned(),
+            reasoning_effort: "none".to_owned(),
+            supports_structured_output: true,
+            supports_tool_calls: true,
+            native_web_tool: false,
+            streaming: Some(false),
+            declared_context_limit: None,
+            declared_max_output_tokens: None,
+            source: "test_declared".to_owned(),
+        }
+    }
+
+    fn capability_request(
+        output_schema: Value,
+        tools: Vec<AgentToolDefinition>,
+    ) -> AgentModelRequest {
+        AgentModelRequest {
+            contract_hash: akzio_domain::ContentHash::of_bytes(b"capability-contract"),
+            purpose: "research.analyst".to_owned(),
+            prompt: "capability test".to_owned(),
+            objective: "capability test".to_owned(),
+            manifest_artifact_id: ArtifactId(akzio_domain::ContentHash::of_bytes(
+                b"capability-manifest",
+            )),
+            context: vec![],
+            prior_tool_results: vec![],
+            output_schema,
+            max_output_tokens: 32,
+            tools,
+        }
+    }
+
+    fn capability_tool() -> AgentToolDefinition {
+        AgentToolDefinition {
+            name: "read_artifact".to_owned(),
+            description: "capability test".to_owned(),
+            input_schema: json!({"type": "object"}),
+            strict: true,
+        }
+    }
+
+    #[test]
+    fn capability_preflight_is_fail_closed_for_unknown_and_missing_features() {
+        let structured_request = capability_request(json!({"type": "object"}), vec![]);
+        assert!(matches!(
+            validate_model_capabilities(&ModelCapabilitySnapshot::unknown(), &structured_request),
+            Err(ResearchError::CapabilityMismatch {
+                capability: "structured_output",
+                provider_id,
+                model_id,
+            }) if provider_id == "unknown" && model_id == "unknown"
+        ));
+
+        let mut no_structured = fixture_capabilities();
+        no_structured.supports_structured_output = false;
+        assert!(matches!(
+            validate_model_capabilities(&no_structured, &structured_request),
+            Err(ResearchError::CapabilityMismatch {
+                capability: "structured_output",
+                ..
+            })
+        ));
+
+        let tool_request = capability_request(Value::Null, vec![capability_tool()]);
+        let mut no_tools = fixture_capabilities();
+        no_tools.supports_tool_calls = false;
+        assert!(matches!(
+            validate_model_capabilities(&no_tools, &tool_request),
+            Err(ResearchError::CapabilityMismatch {
+                capability: "tool_calls",
+                ..
+            })
+        ));
+    }
+
+    #[derive(Debug)]
+    struct CapabilityProbeModel {
+        snapshot: ModelCapabilitySnapshot,
+        calls: AtomicU8,
+    }
+
+    impl AgentModel for CapabilityProbeModel {
+        fn capability_snapshot(&self) -> ModelCapabilitySnapshot {
+            self.snapshot.clone()
+        }
+
+        fn turn<'a>(
+            &'a self,
+            _: AgentModelRequest,
+        ) -> BoxFuture<'a, ResearchResult<AgentModelTurn>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                Err(ResearchError::Model(
+                    "capability preflight bypassed".to_owned(),
+                ))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn capability_mismatch_is_durable_and_makes_zero_model_calls() {
+        let Fixture {
+            _root,
+            store,
+            catalogue,
+            claimed,
+            evidence,
+        } = fixture_with(|_| {});
+        let runtime = AgentRuntime::new(store.clone(), catalogue, Duration::minutes(5));
+        let model = CapabilityProbeModel {
+            snapshot: ModelCapabilitySnapshot::unknown(),
+            calls: AtomicU8::new(0),
+        };
+
+        assert!(matches!(
+            runtime
+                .run(
+                    &claimed.permit,
+                    &claimed.node,
+                    [ArtifactRef {
+                        artifact_id: evidence.artifact_id,
+                        kind: ArtifactKind::NormalizedEvidence,
+                    }],
+                    &model,
+                    Utc::now(),
+                )
+                .await,
+            Err(ResearchError::CapabilityMismatch {
+                capability: "structured_output",
+                ..
+            })
+        ));
+        assert_eq!(model.calls.load(Ordering::SeqCst), 0);
+
+        let failure_id = store
+            .events_after(&claimed.run_id, 0, 100)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.event_type == "agent.turn_failed")
+            .and_then(|event| event.artifact_id)
+            .expect("capability mismatch is durable");
+        let failure = store.artifact(&failure_id).unwrap();
+        let trace: Value =
+            serde_json::from_slice(&store.read_blob(&failure.blob).unwrap()).unwrap();
+        assert_eq!(trace["error_class"], "capability_mismatch");
+        assert_eq!(trace["capability_snapshot"]["provider_id"], "unknown");
+        store.verify_integrity().unwrap();
+    }
+
+    #[derive(Debug)]
+    struct CapabilityDriftModel {
+        snapshots: AtomicU8,
+        calls: AtomicU8,
+    }
+
+    impl AgentModel for CapabilityDriftModel {
+        fn capability_snapshot(&self) -> ModelCapabilitySnapshot {
+            if self.snapshots.fetch_add(1, Ordering::SeqCst) == 0 {
+                fixture_capabilities()
+            } else {
+                let mut snapshot = fixture_capabilities();
+                snapshot.model_id = "fixture-drifted".to_owned();
+                snapshot.supports_structured_output = false;
+                snapshot
+            }
+        }
+
+        fn turn<'a>(
+            &'a self,
+            _: AgentModelRequest,
+        ) -> BoxFuture<'a, ResearchResult<AgentModelTurn>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                Err(ResearchError::ModelDebug {
+                    error_class: "transport",
+                    message: "retry fixture failure".to_owned(),
+                    trace: ModelCallTrace {
+                        request: json!({"fixture": "retry-request"}),
+                        result: json!({"error": "retry-transport"}),
+                    },
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn capability_drift_stops_retry_before_the_second_model_call() {
+        let Fixture {
+            _root,
+            store,
+            catalogue,
+            claimed,
+            evidence,
+        } = fixture_with(|_| {});
+        let runtime = AgentRuntime::new(store.clone(), catalogue, Duration::minutes(5));
+        let model = CapabilityDriftModel {
+            snapshots: AtomicU8::new(0),
+            calls: AtomicU8::new(0),
+        };
+
+        assert!(matches!(
+            runtime
+                .run(
+                    &claimed.permit,
+                    &claimed.node,
+                    [ArtifactRef {
+                        artifact_id: evidence.artifact_id,
+                        kind: ArtifactKind::NormalizedEvidence,
+                    }],
+                    &model,
+                    Utc::now(),
+                )
+                .await,
+            Err(ResearchError::CapabilityMismatch {
+                capability: "structured_output",
+                provider_id,
+                model_id,
+            }) if provider_id == "fixture" && model_id == "fixture-drifted"
+        ));
+        assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(model.snapshots.load(Ordering::SeqCst), 2);
+
+        let traces: Vec<Value> = store
+            .events_after(&claimed.run_id, 0, 100)
+            .unwrap()
+            .into_iter()
+            .filter(|event| {
+                event.event_type == "agent.turn_retryable_failed"
+                    || event.event_type == "agent.turn_failed"
+            })
+            .filter_map(|event| event.artifact_id)
+            .map(|artifact_id| {
+                let artifact = store.artifact(&artifact_id).unwrap();
+                serde_json::from_slice(&store.read_blob(&artifact.blob).unwrap()).unwrap()
+            })
+            .collect();
+        assert_eq!(traces.len(), 2);
+        assert_eq!(traces[0]["capability_snapshot"]["model_id"], "fixture");
+        assert_eq!(
+            traces[1]["capability_snapshot"]["model_id"],
+            "fixture-drifted"
+        );
+        assert_ne!(
+            traces[0]["capability_snapshot_hash"],
+            traces[1]["capability_snapshot_hash"]
+        );
+        store.verify_integrity().unwrap();
+    }
+
     #[derive(Debug)]
     struct ToolThenOutputModel {
         evidence_id: ArtifactId,
@@ -2446,6 +2758,10 @@ mod tests {
     }
 
     impl AgentModel for ToolThenOutputModel {
+        fn capability_snapshot(&self) -> ModelCapabilitySnapshot {
+            fixture_capabilities()
+        }
+
         fn turn<'a>(
             &'a self,
             request: AgentModelRequest,
@@ -2513,6 +2829,10 @@ mod tests {
     struct FixedModel(AgentModelTurn);
 
     impl AgentModel for FixedModel {
+        fn capability_snapshot(&self) -> ModelCapabilitySnapshot {
+            fixture_capabilities()
+        }
+
         fn turn<'a>(
             &'a self,
             _: AgentModelRequest,
@@ -2527,6 +2847,10 @@ mod tests {
     }
 
     impl AgentModel for DelayedToolModel {
+        fn capability_snapshot(&self) -> ModelCapabilitySnapshot {
+            fixture_capabilities()
+        }
+
         fn turn<'a>(
             &'a self,
             _: AgentModelRequest,
@@ -2551,6 +2875,10 @@ mod tests {
     struct SlowOutputModel;
 
     impl AgentModel for SlowOutputModel {
+        fn capability_snapshot(&self) -> ModelCapabilitySnapshot {
+            fixture_capabilities()
+        }
+
         fn turn<'a>(
             &'a self,
             _: AgentModelRequest,
@@ -3616,13 +3944,11 @@ mod tests {
             .expect("agent turn trace retains request and response");
         assert!(turn_trace["request_hash"].as_str().is_some());
         let capability_snapshot = turn_trace["capability_snapshot"].clone();
-        assert_eq!(capability_snapshot["provider_id"], "unknown");
+        assert_eq!(capability_snapshot["provider_id"], "fixture");
         assert_eq!(
             turn_trace["capability_snapshot_hash"],
-            serde_json::to_value(
-                capability_snapshot_hash(&ModelCapabilitySnapshot::unknown()).unwrap()
-            )
-            .unwrap()
+            serde_json::to_value(capability_snapshot_hash(&fixture_capabilities()).unwrap())
+                .unwrap()
         );
         assert!(turn_trace["tool_set_hash"].as_str().is_some());
         assert_eq!(turn_trace["request"]["tools"][0]["strict"], true);
