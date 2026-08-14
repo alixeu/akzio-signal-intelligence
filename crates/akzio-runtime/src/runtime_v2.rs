@@ -109,6 +109,35 @@ fn prepare_debug_draft(
     draft: &mut WorkflowProposalDraft,
     has_synthesizer_recipe: bool,
 ) -> RuntimeResult<()> {
+    if draft.tasks.is_empty() {
+        draft.tasks.insert(
+            "debug_analyst".to_owned(),
+            akzio_domain::WorkflowProposalDraftTask {
+                recipe_id: TaskRecipeId::new(ANALYST_RECIPE_ID)?,
+                objective: "Inspect the governed TQQQ debug fixture evidence.".to_owned(),
+                depends_on: Vec::new(),
+                priority: 80,
+                evidence_needs: Vec::new(),
+                research_intents: Vec::new(),
+            },
+        );
+    }
+    let aliases = draft.tasks.keys().cloned().collect::<BTreeSet<_>>();
+    for task in draft.tasks.values_mut() {
+        task.depends_on
+            .retain(|dependency| aliases.contains(dependency));
+        if task.recipe_id.as_str() == ANALYST_RECIPE_ID {
+            task.evidence_needs.retain(|need| {
+                need.source_family == DEBUG_FIXTURE_SOURCE
+                    && need.resource == DEBUG_FIXTURE_RESOURCE
+                    && need.max_age_secs > 0
+            });
+            task.research_intents.clear();
+        } else if task.recipe_id.as_str() == SYNTHESIZER_RECIPE_ID {
+            task.evidence_needs.clear();
+            task.research_intents.clear();
+        }
+    }
     let analyst_aliases = draft
         .tasks
         .iter()
@@ -1223,12 +1252,20 @@ impl WorkflowRuntime {
         }
         let draft: WorkflowProposalDraft =
             serde_json::from_slice(&self.store.read_blob(&planner_output.blob)?)?;
-        draft.validate(&self.catalogue.recipes)?;
         let run_id = &planner.run_id;
         let purpose = self.store.run_purpose(run_id)?;
         if purpose == RunPurpose::Paper {
             return Err(RuntimeError::FrozenPaperWorkflow(run_id.clone()));
         }
+        let mut draft = draft;
+        if matches!(purpose, RunPurpose::Debug | RunPurpose::PaperDryRun) {
+            let synthesizer_recipe = TaskRecipeId::new(SYNTHESIZER_RECIPE_ID)?;
+            prepare_debug_draft(
+                &mut draft,
+                self.catalogue.recipe(&synthesizer_recipe).is_ok(),
+            )?;
+        }
+        draft.validate(&self.catalogue.recipes)?;
         let (proposal, evidence_needs, proposal_artifact) =
             self.materialize_planner_output(planner, planner_output, draft, purpose, now)?;
         previous_graph.validate()?;
