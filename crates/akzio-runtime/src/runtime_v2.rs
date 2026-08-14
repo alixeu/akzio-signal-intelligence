@@ -99,8 +99,79 @@ const ANALYST_RECIPE_ID: &str = "research.analyst";
 const CRITIC_RECIPE_ID: &str = "research.critic";
 const SYNTHESIZER_RECIPE_ID: &str = "research.synthesizer";
 const STRUCTURED_CRITIC_ALIAS_PREFIX: &str = "structured_critic";
+const DEBUG_FIXTURE_SOURCE: &str = "alpaca";
+const DEBUG_FIXTURE_RESOURCE: &str = "bars:TQQQ:1d";
+const DEBUG_FIXTURE_MAX_AGE_SECS: u64 = 86_400;
 pub const STRUCTURED_CRITIQUE_MATERIALITY_PPM: u32 = 500_000;
 pub const STRUCTURED_CRITIQUE_CONFIDENCE_PPM: u32 = 500_000;
+
+fn prepare_debug_draft(
+    draft: &mut WorkflowProposalDraft,
+    has_synthesizer_recipe: bool,
+) -> RuntimeResult<()> {
+    let analyst_aliases = draft
+        .tasks
+        .iter()
+        .filter(|(_, task)| task.recipe_id.as_str() == ANALYST_RECIPE_ID)
+        .map(|(alias, _)| alias.clone())
+        .collect::<Vec<_>>();
+    if analyst_aliases.is_empty() {
+        return Ok(());
+    }
+
+    let debug_need = EvidenceNeed {
+        schema_version: V2_SCHEMA_VERSION,
+        source_family: DEBUG_FIXTURE_SOURCE.to_owned(),
+        resource: DEBUG_FIXTURE_RESOURCE.to_owned(),
+        max_age_secs: DEBUG_FIXTURE_MAX_AGE_SECS,
+    };
+    let mut injected_need = false;
+    for task in draft
+        .tasks
+        .values_mut()
+        .filter(|task| task.recipe_id.as_str() == ANALYST_RECIPE_ID)
+    {
+        if task.evidence_needs.is_empty() && task.research_intents.is_empty() {
+            task.evidence_needs.push(debug_need.clone());
+            injected_need = true;
+        }
+    }
+
+    if !injected_need
+        || !has_synthesizer_recipe
+        || draft
+            .tasks
+            .values()
+            .any(|task| task.recipe_id.as_str() == SYNTHESIZER_RECIPE_ID)
+    {
+        return Ok(());
+    }
+
+    let synthesizer_recipe = TaskRecipeId::new(SYNTHESIZER_RECIPE_ID)?;
+    let alias = (0..)
+        .map(|suffix| {
+            if suffix == 0 {
+                "debug_synthesizer".to_owned()
+            } else {
+                format!("debug_synthesizer_{suffix}")
+            }
+        })
+        .find(|candidate| !draft.tasks.contains_key(candidate))
+        .expect("unbounded alias search must find a free debug synthesizer alias");
+    draft.tasks.insert(
+        alias,
+        akzio_domain::WorkflowProposalDraftTask {
+            recipe_id: synthesizer_recipe,
+            objective: "Synthesize the debug analyst claim into a blocked decision proposal."
+                .to_owned(),
+            depends_on: analyst_aliases,
+            priority: 100,
+            evidence_needs: Vec::new(),
+            research_intents: Vec::new(),
+        },
+    );
+    Ok(())
+}
 
 /// Returns whether the bounded Critic task should consume the supplied claims.
 /// Rust owns this decision so a planner or model cannot add debate rounds.
@@ -303,11 +374,17 @@ impl WorkflowRuntime {
             }));
         }
         let recipe = self.catalogue.recipe(&self.catalogue.planner)?;
+        let objective = match purpose {
+            RunPurpose::Debug | RunPurpose::PaperDryRun => {
+                "Run a bounded real-LLM debug workflow against governed TQQQ fixture evidence."
+            }
+            _ => "Produce bounded workflow proposal",
+        };
         let planner = WorkflowNode {
             task_id: akzio_domain::TaskId::new(),
             recipe_id: recipe.recipe_id.clone(),
             contract_hash: recipe.contract_hash.clone(),
-            objective: "Produce a bounded workflow proposal".to_owned(),
+            objective: objective.to_owned(),
             dependencies: vec![],
             input_artifacts: vec![],
             priority: recipe.priority_ceiling,
@@ -1147,13 +1224,13 @@ impl WorkflowRuntime {
         let draft: WorkflowProposalDraft =
             serde_json::from_slice(&self.store.read_blob(&planner_output.blob)?)?;
         draft.validate(&self.catalogue.recipes)?;
-        let (proposal, evidence_needs, proposal_artifact) =
-            self.materialize_planner_output(planner, planner_output, draft, now)?;
         let run_id = &planner.run_id;
         let purpose = self.store.run_purpose(run_id)?;
         if purpose == RunPurpose::Paper {
             return Err(RuntimeError::FrozenPaperWorkflow(run_id.clone()));
         }
+        let (proposal, evidence_needs, proposal_artifact) =
+            self.materialize_planner_output(planner, planner_output, draft, purpose, now)?;
         previous_graph.validate()?;
         self.validate_compiled_graph(purpose, previous_graph)?;
         if previous_graph.topology_id != proposal.topology_id {
@@ -1233,8 +1310,16 @@ impl WorkflowRuntime {
         planner: &ClaimedAttempt,
         planner_output: &Artifact,
         mut draft: WorkflowProposalDraft,
+        purpose: RunPurpose,
         now: DateTime<Utc>,
     ) -> RuntimeResult<(WorkflowProposal, Vec<Artifact>, Artifact)> {
+        if matches!(purpose, RunPurpose::Debug | RunPurpose::PaperDryRun) {
+            let synthesizer_recipe = TaskRecipeId::new(SYNTHESIZER_RECIPE_ID)?;
+            prepare_debug_draft(
+                &mut draft,
+                self.catalogue.recipe(&synthesizer_recipe).is_ok(),
+            )?;
+        }
         self.insert_structured_critic(&mut draft)?;
         let planner_output_ref = ArtifactRef {
             artifact_id: planner_output.artifact_id.clone(),

@@ -39,9 +39,9 @@ use akzio_execution::{
     V2PaperDispatchRuntime,
 };
 use akzio_ingest::{
-    AcquiredEvidence, AlpacaPaperEvidenceTransport, AsyncEvidenceAdapter, EvidenceRequest,
-    EvidenceRuntime, EvidenceRuntimeError, EvidenceSource, FixtureEvidenceAdapter,
-    ModelNativeWebEvidenceTransport, NormalizedEvidencePayload,
+    AcquiredEvidence, AlpacaPaperEvidenceTransport, AsyncEvidenceAdapter, EvidenceProvenance,
+    EvidenceQuality, EvidenceRequest, EvidenceRuntime, EvidenceRuntimeError, EvidenceSource,
+    FixtureEvidenceAdapter, ModelNativeWebEvidenceTransport, NormalizedEvidencePayload,
 };
 use akzio_learning::{
     EvaluationError, EvaluationInput, EvaluationPolicy, EvaluationRuntime,
@@ -1592,7 +1592,14 @@ impl Daemon {
                 resource: need.resource.clone(),
                 max_age: Duration::seconds(max_age_secs),
             };
-            let bundle = if let Some(adapter) = self.production_evidence.get(&source) {
+            let use_debug_fixture = matches!(
+                self.store.run_purpose(&task.run_id)?,
+                RunPurpose::Debug | RunPurpose::PaperDryRun
+            ) && source == EvidenceSource::Alpaca;
+            let production_adapter = (!use_debug_fixture)
+                .then(|| self.production_evidence.get(&source))
+                .flatten();
+            let bundle = if let Some(adapter) = production_adapter {
                 runtime
                     .acquire_and_normalize_async(
                         &task.permit,
@@ -1603,12 +1610,26 @@ impl Daemon {
                     )
                     .await?
             } else {
-                let responses = self.fixture_evidence.get(&source).ok_or_else(|| {
-                    DaemonError::Unavailable(format!(
+                let mut responses = self
+                    .fixture_evidence
+                    .get(&source)
+                    .cloned()
+                    .unwrap_or_default();
+                if matches!(
+                    self.store.run_purpose(&task.run_id)?,
+                    RunPurpose::Debug | RunPurpose::PaperDryRun
+                ) && source == EvidenceSource::Alpaca
+                {
+                    responses
+                        .entry(need.resource.clone())
+                        .or_insert_with(|| debug_fixture_evidence(&need.resource, now));
+                }
+                if responses.is_empty() {
+                    return Err(DaemonError::Unavailable(format!(
                         "no governed evidence adapter configured for source {}",
                         source.as_str()
-                    ))
-                })?;
+                    )));
+                }
                 let adapter = FixtureEvidenceAdapter::new(
                     source,
                     responses
@@ -1737,6 +1758,34 @@ fn common_bar_dates(
         .filter(|date| *date > baseline)
         .filter(|date| bars_by_asset.values().all(|bars| bars.get(date).is_some()))
         .collect()
+}
+
+fn debug_fixture_evidence(resource: &str, now: DateTime<Utc>) -> AcquiredEvidence {
+    let source_uri = format!("fixture://alpaca/{resource}");
+    AcquiredEvidence {
+        raw: serde_json::to_vec(&serde_json::json!({
+            "resource": resource,
+            "bars": [{"asset": "TQQQ", "close": 100}],
+        }))
+        .expect("static debug fixture JSON must serialize"),
+        media_type: "application/json".to_owned(),
+        source_uri: source_uri.clone(),
+        observed_at: now,
+        normalized: serde_json::json!({
+            "resource": resource,
+            "bars": [{"asset": "TQQQ", "close": 100}],
+        }),
+        provenance: EvidenceProvenance {
+            document_id: Some("akzio-debug-fixture".to_owned()),
+            published_at: None,
+            observed_at: now,
+            revision: Some("debug-v1".to_owned()),
+            source_uri: source_uri.clone(),
+            dedupe_key: format!("akzio-debug-fixture:{resource}"),
+            citations: Vec::new(),
+        },
+        quality: EvidenceQuality::default(),
+    }
 }
 
 fn execution_snapshot_artifact(
@@ -2622,7 +2671,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn evidence_gate_without_needs_is_a_debug_noop() {
+    async fn debug_evidence_gate_uses_controlled_fixture_when_planner_has_no_needs() {
         let directory = tempdir().unwrap();
         let daemon = Daemon::with_model(
             config(directory.path().to_path_buf()),
@@ -2637,7 +2686,9 @@ mod tests {
             .unwrap()
             .expect("evidence gate task");
         let artifacts = daemon.acquire_evidence(&task, Utc::now()).await.unwrap();
-        assert!(artifacts.is_empty());
+        assert!(artifacts
+            .iter()
+            .any(|artifact| artifact.kind == ArtifactKind::NormalizedEvidence));
     }
 
     #[tokio::test]
