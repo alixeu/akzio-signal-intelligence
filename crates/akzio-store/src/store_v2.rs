@@ -2934,6 +2934,7 @@ impl V2Store {
         validate_tool_lifecycle_events(&transaction, Some(&permit.run_id))?;
         validate_agent_turn_lifecycle_events(&transaction, Some(&permit.run_id))?;
         validate_context_lifecycle_events(&transaction, Some(&permit.run_id))?;
+        validate_gate_lifecycle_events(&transaction, Some(&permit.run_id))?;
         transaction.commit()?;
         Ok(())
     }
@@ -4434,6 +4435,7 @@ impl V2Store {
         validate_tool_lifecycle_events(&connection, Some(run_id))?;
         validate_agent_turn_lifecycle_events(&connection, Some(run_id))?;
         validate_context_lifecycle_events(&connection, Some(run_id))?;
+        validate_gate_lifecycle_events(&connection, Some(run_id))?;
         validate_paper_effect_events(&connection, Some(run_id))?;
         Ok(events)
     }
@@ -4476,6 +4478,7 @@ impl V2Store {
         validate_tool_lifecycle_events(&connection, None)?;
         validate_agent_turn_lifecycle_events(&connection, None)?;
         validate_context_lifecycle_events(&connection, None)?;
+        validate_gate_lifecycle_events(&connection, None)?;
         validate_paper_effect_events(&connection, None)?;
         let fk = connection
             .query_row("PRAGMA foreign_key_check", [], |_| Ok(()))
@@ -7165,6 +7168,134 @@ fn validate_context_lifecycle_events(
     Ok(())
 }
 
+fn validate_gate_lifecycle_events(
+    connection: &Connection,
+    run_id: Option<&RunId>,
+) -> StoreResult<()> {
+    let mut statement = connection.prepare(
+        r#"SELECT event_id, run_id, task_id, attempt_id, event_type, artifact_id
+           FROM rebuild_events
+           WHERE (?1 IS NULL OR run_id = ?1)
+             AND event_type IN (
+                 ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12
+             )
+           ORDER BY event_id ASC"#,
+    )?;
+    let rows = statement.query_map(
+        params![
+            run_id.map(|value| value.0.as_str()),
+            LifecycleEventType::ExecutionAllocationCreated.as_str(),
+            LifecycleEventType::ExecutionCommitted.as_str(),
+            LifecycleEventType::ExecutionCommitmentRecovered.as_str(),
+            LifecycleEventType::ExecutionContextCreated.as_str(),
+            LifecycleEventType::ExecutionContextCreatedLegacy.as_str(),
+            LifecycleEventType::ExecutionPlanCreated.as_str(),
+            LifecycleEventType::ExecutionRepriceCommitted.as_str(),
+            LifecycleEventType::ExecutionRepriceRecovered.as_str(),
+            LifecycleEventType::ExecutionVerdictCreated.as_str(),
+            LifecycleEventType::ExecutionVerdictNoOrder.as_str(),
+            LifecycleEventType::ExecutionVerdictCreatedLegacy.as_str(),
+        ],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                RunId(row.get::<_, String>(1)?),
+                row.get::<_, Option<String>>(2)?.map(TaskId),
+                row.get::<_, Option<String>>(3)?
+                    .map(akzio_domain::AttemptId),
+                LifecycleEventType::parse(&row.get::<_, String>(4)?)
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?,
+                row.get::<_, Option<String>>(5)?
+                    .map(|value| {
+                        ContentHash::new(value).map(ArtifactId).map_err(|error| {
+                            rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+                        })
+                    })
+                    .transpose()?,
+            ))
+        },
+    )?;
+
+    for row in rows {
+        let (cursor, event_run_id, task_id, attempt_id, event_type, artifact_id) = row?;
+        let task_id = task_id.ok_or_else(|| {
+            StoreError::Integrity(format!(
+                "{} cursor {cursor} has no task lineage",
+                event_type.as_str()
+            ))
+        })?;
+        let attempt_id = attempt_id.ok_or_else(|| {
+            StoreError::Integrity(format!(
+                "{} cursor {cursor} has no attempt lineage",
+                event_type.as_str()
+            ))
+        })?;
+        let artifact_id = artifact_id.ok_or_else(|| {
+            StoreError::Integrity(format!(
+                "{} cursor {cursor} has no artifact",
+                event_type.as_str()
+            ))
+        })?;
+        let expected_kind = match event_type {
+            LifecycleEventType::ExecutionAllocationCreated
+            | LifecycleEventType::ExecutionPlanCreated => ArtifactKind::ExecutionPlan,
+            LifecycleEventType::ExecutionContextCreated
+            | LifecycleEventType::ExecutionContextCreatedLegacy => ArtifactKind::ExecutionContext,
+            LifecycleEventType::ExecutionVerdictCreated
+            | LifecycleEventType::ExecutionVerdictNoOrder
+            | LifecycleEventType::ExecutionVerdictCreatedLegacy => ArtifactKind::ExecutionVerdict,
+            LifecycleEventType::ExecutionCommitted
+            | LifecycleEventType::ExecutionCommitmentRecovered => ArtifactKind::ExecutionCommitment,
+            LifecycleEventType::ExecutionRepriceCommitted
+            | LifecycleEventType::ExecutionRepriceRecovered => ArtifactKind::ExecutionReprice,
+            _ => unreachable!("gate lifecycle query emits fixed event types"),
+        };
+        let artifact = read_artifact(connection, &artifact_id)?;
+        artifact.validate()?;
+        if artifact.kind != expected_kind {
+            return Err(StoreError::Integrity(format!(
+                "{} cursor {cursor} references {:?}, expected {:?}",
+                event_type.as_str(),
+                artifact.kind,
+                expected_kind
+            )));
+        }
+        let origin = artifact.origin.as_ref().ok_or_else(|| {
+            StoreError::Integrity(format!(
+                "{} cursor {cursor} artifact has no origin",
+                event_type.as_str()
+            ))
+        })?;
+        let recovered = matches!(
+            event_type,
+            LifecycleEventType::ExecutionCommitmentRecovered
+                | LifecycleEventType::ExecutionRepriceRecovered
+        );
+        if origin.run_id.as_ref() != Some(&event_run_id)
+            || origin.task_id.as_ref() != Some(&task_id)
+            || (!recovered && origin.attempt_id.as_ref() != Some(&attempt_id))
+        {
+            return Err(StoreError::Integrity(format!(
+                "{} cursor {cursor} artifact origin does not match event lineage",
+                event_type.as_str()
+            )));
+        }
+        for source in &artifact.source_refs {
+            let source_artifact = read_artifact(connection, &source.artifact_id)?;
+            if source_artifact.kind != source.kind {
+                return Err(StoreError::Integrity(format!(
+                    "{} cursor {cursor} source {} kind {:?} disagrees with ref {:?}",
+                    event_type.as_str(),
+                    source.artifact_id.0,
+                    source_artifact.kind,
+                    source.kind
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn ensure_no_pending_tool_calls(
     connection: &Connection,
     run_id: &RunId,
@@ -7431,6 +7562,7 @@ fn finish_permitted_task(
     validate_tool_lifecycle_events(transaction, Some(&permit.run_id))?;
     validate_agent_turn_lifecycle_events(transaction, Some(&permit.run_id))?;
     validate_context_lifecycle_events(transaction, Some(&permit.run_id))?;
+    validate_gate_lifecycle_events(transaction, Some(&permit.run_id))?;
     if status == TaskStatus::Succeeded {
         ensure_no_pending_tool_calls(
             transaction,
@@ -13998,6 +14130,150 @@ mod tests {
             })
         );
         fixture.store.verify_integrity().unwrap();
+    }
+
+    #[test]
+    fn gate_lifecycle_validator_enforces_event_kind_and_legacy_aliases() {
+        let fixture = task_artifact_fixture(RunPurpose::Debug);
+        let wrong = permit_artifact(
+            &fixture.store,
+            &fixture.permit,
+            ArtifactKind::Decision,
+            &serde_json::json!({"wrong": true}),
+            vec![],
+            ArtifactLifecycle::RunScoped,
+            fixture.now,
+        );
+        let before = fixture
+            .store
+            .events_after(&fixture.run.run_id, 0, 100)
+            .unwrap()
+            .len();
+        assert!(matches!(
+            fixture.store.write_task_artifact(
+                &fixture.permit,
+                &wrong,
+                LifecycleEventType::ExecutionPlanCreated,
+                fixture.now,
+            ),
+            Err(StoreError::Integrity(_))
+        ));
+        assert_eq!(
+            fixture
+                .store
+                .events_after(&fixture.run.run_id, 0, 100)
+                .unwrap()
+                .len(),
+            before
+        );
+        assert!(matches!(
+            fixture.store.artifact(&wrong.artifact_id),
+            Err(StoreError::MissingArtifact(_))
+        ));
+
+        let context = permit_artifact(
+            &fixture.store,
+            &fixture.permit,
+            ArtifactKind::ExecutionContext,
+            &serde_json::json!({"context": true}),
+            vec![],
+            ArtifactLifecycle::RunScoped,
+            fixture.now,
+        );
+        fixture
+            .store
+            .write_task_artifact(
+                &fixture.permit,
+                &context,
+                LifecycleEventType::ExecutionContextCreatedLegacy,
+                fixture.now,
+            )
+            .unwrap();
+
+        let verdict = permit_artifact(
+            &fixture.store,
+            &fixture.permit,
+            ArtifactKind::ExecutionVerdict,
+            &serde_json::json!({"verdict": true}),
+            vec![],
+            ArtifactLifecycle::RunScoped,
+            fixture.now,
+        );
+        fixture
+            .store
+            .write_task_artifact(
+                &fixture.permit,
+                &verdict,
+                LifecycleEventType::ExecutionVerdictCreatedLegacy,
+                fixture.now,
+            )
+            .unwrap();
+        fixture.store.verify_integrity().unwrap();
+    }
+
+    #[test]
+    fn gate_lifecycle_validator_rejects_forged_origin() {
+        let fixture = task_artifact_fixture(RunPurpose::Debug);
+        let foreign_run = RunId::new();
+        let forged = Artifact::new(
+            ArtifactKind::ExecutionPlan,
+            fixture
+                .store
+                .put_json(&serde_json::json!({"plan": true}))
+                .unwrap(),
+            "fixture.plan",
+            ArtifactLifecycle::RunScoped,
+            ArtifactProvenance {
+                source_family: "fixture".to_owned(),
+                observed_at: None,
+                retrieved_at: fixture.now,
+                source_uri: None,
+                confidence_ppm: 1_000_000,
+                producer_contract_hash: fixture.permit.contract_hash.clone(),
+            },
+            Some(ArtifactOrigin {
+                run_id: Some(foreign_run),
+                task_id: Some(fixture.permit.task_id.clone()),
+                attempt_id: Some(fixture.permit.attempt_id.clone()),
+                contract_hash: fixture.permit.contract_hash.clone(),
+            }),
+            vec![],
+            fixture.now,
+        )
+        .unwrap();
+        {
+            let mut connection = fixture.store.connection.lock().unwrap();
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            insert_artifact(&transaction, &forged).unwrap();
+            transaction
+                .execute(
+                    r#"INSERT INTO rebuild_events
+                       (run_id, task_id, attempt_id, event_type, artifact_id, created_at)
+                       VALUES (?1, ?2, ?3, ?4, ?5, ?6)"#,
+                    params![
+                        fixture.run.run_id.0,
+                        fixture.permit.task_id.0,
+                        fixture.permit.attempt_id.0,
+                        LifecycleEventType::ExecutionPlanCreated.as_str(),
+                        forged.artifact_id.0.as_str(),
+                        fixture.now.to_rfc3339(),
+                    ],
+                )
+                .unwrap();
+            transaction.commit().unwrap();
+        }
+        assert!(matches!(
+            fixture.store.events_after(&fixture.run.run_id, 0, 100),
+            Err(StoreError::Integrity(message))
+                if message.contains("origin")
+        ));
+        assert!(matches!(
+            fixture.store.verify_integrity(),
+            Err(StoreError::Integrity(message))
+                if message.contains("origin")
+        ));
     }
 
     #[test]
