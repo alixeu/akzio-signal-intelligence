@@ -883,8 +883,8 @@ fn research_intent_output_schema() -> Value {
             },
             "window_start": {"type": ["string", "null"]},
             "window_end": {"type": ["string", "null"]},
-            "max_age_secs": {"type": "integer", "minimum": 1, "maximum": 604800},
-            "max_results": {"type": "integer", "minimum": 1, "maximum": 32}
+        "max_age_secs": {"type": "integer", "maximum": 604800},
+        "max_results": {"type": "integer", "maximum": 32}
         },
         "required": [
             "schema_version", "source_family", "resource", "query", "assets",
@@ -911,10 +911,7 @@ fn evidence_need_output_schema() -> Value {
                 "minLength": 1,
                 "maxLength": 512
             },
-            "max_age_secs": {
-                "type": "integer",
-                "minimum": 1
-            }
+            "max_age_secs": {"type": "integer"}
         },
         "required": ["schema_version", "source_family", "resource", "max_age_secs"],
         "additionalProperties": false
