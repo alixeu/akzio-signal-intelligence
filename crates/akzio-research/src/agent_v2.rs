@@ -631,11 +631,11 @@ fn canonical_active_contract(
 ) -> ResearchResult<AgentContract> {
     let role_prompt = match definition.purpose {
         "research.synthesizer" => format!(
-            "{}\n\nAlways return exactly 12 forecasts: one for each executable asset (TQQQ, QQQ, SOXX, SOXL) at each horizon (t1, t3, t5), even when the proposal is blocked; for blocked proposals use neutral zero forecasts and explain the blocker in hard_blockers and summary. In deliberation.basis_artifact_ids and result references, use only artifact IDs that appear as top-level selections in the current ContextManifest; do not copy nested evidence IDs unless they are also selected.",
+            "{}\n\nAlways return exactly 12 forecasts: one for each executable asset (TQQQ, QQQ, SOXX, SOXL) at each horizon (t1, t3, t5), even when the proposal is blocked; for blocked proposals use neutral zero forecasts and explain the blocker in hard_blockers and summary. In deliberation.basis_artifact_ids and result references, use only artifact IDs that appear as top-level selections in the current ContextManifest; do not copy nested evidence IDs unless they are also selected. Preserve each selected artifact's exact kind: use claim only for claim refs, critique only for critique refs, and normalized_evidence or semantic_detail only when that exact kind is selected. ContextManifest deliberation_note selections may appear in basis_artifact_ids but must not be relabeled as result claims, critiques, or evidence.",
             definition.prompt
         ),
         "research.analyst" => format!(
-            "{}\n\nKeep evidence_gaps to at most 2 items; combine overlapping limitations into concise, evidence-grounded gaps.",
+            "{}\n\nKeep evidence_gaps to at most 2 items; combine overlapping limitations into concise, evidence-grounded gaps. Preserve the exact artifact kind shown in ContextManifest selections; do not relabel normalized_evidence as semantic_detail or vice versa.",
             definition.prompt
         ),
         _ => definition.prompt.to_owned(),
