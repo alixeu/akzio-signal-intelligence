@@ -804,7 +804,6 @@ fn planner_draft_output_schema() -> Value {
                 "type": "object",
                 "properties": {},
                 "required": [],
-                "minProperties": 1,
                 "maxProperties": PLANNER_MAX_DRAFT_TASKS,
                 "additionalProperties": planner_draft_task_schema()
             },

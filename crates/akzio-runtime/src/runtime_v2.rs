@@ -122,6 +122,16 @@ fn prepare_debug_draft(
             },
         );
     }
+    let first_analyst = draft
+        .tasks
+        .iter()
+        .find(|(_, task)| task.recipe_id.as_str() == ANALYST_RECIPE_ID)
+        .map(|(alias, _)| alias.clone());
+    if let Some(first_analyst) = first_analyst.as_ref() {
+        draft.tasks.retain(|alias, task| {
+            task.recipe_id.as_str() != ANALYST_RECIPE_ID || alias == first_analyst
+        });
+    }
     let aliases = draft.tasks.keys().cloned().collect::<BTreeSet<_>>();
     for task in draft.tasks.values_mut() {
         task.depends_on
