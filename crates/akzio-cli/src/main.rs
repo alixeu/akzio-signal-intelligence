@@ -424,6 +424,10 @@ fn load_config(path: &PathBuf) -> Result<Config> {
     let mut config = std::fs::read_to_string(path)
         .with_context(|| format!("read v2 config {}", path.display()))
         .and_then(|text| toml::from_str::<Config>(&text).context("parse v2 TOML"))?;
+    if let Some(model) = config.model.as_mut() {
+        model.base_url = resolve_env_placeholder(&model.base_url, "model.base_url")?;
+        model.api_key = resolve_env_placeholder(&model.api_key, "model.api_key")?;
+    }
     if let Some(store_root) = std::env::var_os("AKZIO_STORE_ROOT") {
         config.daemon.store_root = PathBuf::from(store_root);
     }
@@ -457,6 +461,16 @@ fn load_config(path: &PathBuf) -> Result<Config> {
         bail!("Paper scheduler requires explicit transaction_cost_ppm or slippage_ppm");
     }
     Ok(config)
+}
+
+fn resolve_env_placeholder(value: &str, field: &str) -> Result<String> {
+    let Some(name) = value.strip_prefix('$') else {
+        return Ok(value.to_owned());
+    };
+    if name.is_empty() {
+        bail!("{field} environment placeholder is empty");
+    }
+    std::env::var(name).with_context(|| format!("missing environment variable {name} for {field}"))
 }
 
 fn daemon_token(settings: &DaemonSettings) -> Result<String> {
@@ -971,6 +985,30 @@ mod tests {
         assert_eq!(model.model, "fixture-model");
         assert_eq!(model.reasoning_effort, "high");
         assert!(model.debug);
+    }
+
+    #[test]
+    fn config_resolves_model_environment_placeholders() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = write_config(
+            &directory,
+            "http_addr='127.0.0.1:1'",
+            "['TQQQ', 'QQQ', 'SOXX', 'SOXL']",
+        );
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str(
+            "[model]\nbase_url='$AKZIO_TEST_MODEL_URL'\nmodel='fixture-model'\napi_key='$AKZIO_TEST_MODEL_KEY'\n",
+        );
+        std::fs::write(&path, text).unwrap();
+        std::env::set_var("AKZIO_TEST_MODEL_URL", "http://fixture/v1");
+        std::env::set_var("AKZIO_TEST_MODEL_KEY", "fixture-key");
+
+        let model = load_config(&path).unwrap().model.unwrap();
+
+        assert_eq!(model.base_url, "http://fixture/v1");
+        assert_eq!(model.api_key, "fixture-key");
+        std::env::remove_var("AKZIO_TEST_MODEL_URL");
+        std::env::remove_var("AKZIO_TEST_MODEL_KEY");
     }
 
     #[test]
