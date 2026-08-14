@@ -7,12 +7,12 @@ use std::{
 
 use akzio_context::v2::{ContextBroker, ContextError, ContextManifest};
 use akzio_domain::{
-    AgentContract, Artifact, ArtifactId, ArtifactKind, ArtifactLifecycle, ArtifactOrigin,
-    ArtifactProvenance, ArtifactRef, ContextPolicy, ContractId, ContractPurpose, DomainError,
-    FailureDisposition, LifecycleEventType, OutputContract, PromptBundle, ReadGrant, ResearchClaim,
-    ResearchCritique, ResearchResolution, RetryPolicy, RuntimeTaskClass, TaskBudget, TaskRecipe,
-    TaskRecipeId, TaskWritePermit, TerminationPolicy, ToolGrant, ToolKind, ToolSpec, WorkflowNode,
-    V2_SCHEMA_VERSION,
+    AgentContract, AgentOutputEnvelope, Artifact, ArtifactId, ArtifactKind, ArtifactLifecycle,
+    ArtifactOrigin, ArtifactProvenance, ArtifactRef, ContextPolicy, ContractId, ContractPurpose,
+    DeliberationPolicy, DomainError, FailureDisposition, LifecycleEventType, OutputContract,
+    PromptBundle, ReadGrant, ResearchClaim, ResearchCritique, ResearchResolution, RetryPolicy,
+    RuntimeTaskClass, TaskBudget, TaskRecipe, TaskRecipeId, TaskWritePermit, TerminationPolicy,
+    ToolGrant, ToolKind, ToolSpec, WorkflowNode, V2_SCHEMA_VERSION,
 };
 use akzio_model::{
     ModelCallTrace, ModelCapabilitySnapshot, ModelClient, ModelError, ModelRequest,
@@ -176,7 +176,7 @@ impl ActiveResearchCatalogue {
 pub const ACTIVE_RESEARCH_MAX_NODES: usize = 32;
 
 const ACTIVE_CONTRACT_VERSION: u32 = 1;
-const ACTIVE_PROMPT_BUNDLE_VERSION: u32 = 1;
+const ACTIVE_PROMPT_BUNDLE_VERSION: u32 = 2;
 const SHARED_GOVERNANCE_PROMPT: &str = "Follow the installed Akzio Contract exactly. Rust owns state, evidence access, budgets, workflow gates, and Paper-only execution. Use only ContextManifest-granted artifacts and the declared tools. Never access arbitrary files, network resources, credentials, databases, or execution controls. Return only the requested strict JSON output.";
 const PLANNER_RECIPE_ID: &str = "research.planner";
 const PLANNER_CHILD_RECIPE_IDS: [&str; 2] = ["research.analyst", "research.synthesizer"];
@@ -509,10 +509,11 @@ fn canonical_active_contracts(store: &V2Store) -> ResearchResult<Vec<AgentContra
             prompt: "You are Akzio's research critic. Return only a JSON Critique. Challenge supplied claims using granted context. Do not invent evidence, widen sources or tools, alter the workflow, produce a decision, or submit an order.",
             output_kind: ArtifactKind::Critique,
             output_schema: critique_output_schema(),
-            permitted_kinds: BTreeSet::from([
-                ArtifactKind::Claim,
-                ArtifactKind::SemanticDetail,
-            ]),
+ permitted_kinds: BTreeSet::from([
+ ArtifactKind::Claim,
+ ArtifactKind::SemanticDetail,
+ ArtifactKind::DeliberationNote,
+ ]),
             min_context_artifacts: 1,
             budget: TaskBudget {
                 max_input_tokens: 6_000,
@@ -534,14 +535,15 @@ fn canonical_active_contracts(store: &V2Store) -> ResearchResult<Vec<AgentContra
             prompt: "You are Akzio's research synthesizer. Return only a JSON DecisionProposal matching the supplied schema. Use only artifacts selected by the ContextManifest. Do not change evidence, bypass the DecisionGate, submit an order, or expand any capability.",
             output_kind: ArtifactKind::DecisionProposal,
             output_schema: decision_proposal_output_schema(),
-                permitted_kinds: BTreeSet::from([
-                    ArtifactKind::Claim,
-                    ArtifactKind::Critique,
-                    ArtifactKind::Experience,
-                    ArtifactKind::CandidatePolicy,
-                    ArtifactKind::NormalizedEvidence,
-                    ArtifactKind::SemanticDetail,
-                ]),
+ permitted_kinds: BTreeSet::from([
+ ArtifactKind::Claim,
+ ArtifactKind::Critique,
+ ArtifactKind::Experience,
+ ArtifactKind::CandidatePolicy,
+ ArtifactKind::NormalizedEvidence,
+ ArtifactKind::SemanticDetail,
+ ArtifactKind::DeliberationNote,
+ ]),
             min_context_artifacts: 1,
             budget: TaskBudget {
                 max_input_tokens: 12_000,
@@ -567,8 +569,8 @@ fn canonical_active_contract(
         governance: store.put_bytes(SHARED_GOVERNANCE_PROMPT.as_bytes(), "text/plain")?,
         role: store.put_bytes(definition.prompt.as_bytes(), "text/plain")?,
     };
-    let schema = store.put_json(&definition.output_schema)?;
-    Ok(AgentContract::new(
+    let schema = store.put_json(&deliberation_output_schema(&definition.output_schema))?;
+    let mut contract = AgentContract::new(
         ContractId(format!("akzio.v2.{}", definition.purpose)),
         ACTIVE_CONTRACT_VERSION,
         ContractPurpose::new(definition.purpose)?,
@@ -593,7 +595,34 @@ fn canonical_active_contract(
         active_retry_policy(),
         definition.termination,
         definition.on_failure,
-    )?)
+    )?;
+    contract.deliberation_policy = DeliberationPolicy::Required;
+    contract.contract_hash = contract.expected_hash()?;
+    contract.validate()?;
+    Ok(contract)
+}
+
+fn deliberation_output_schema(result_schema: &Value) -> Value {
+    json!({
+        "type": "object",
+        "required": ["result", "deliberation"],
+        "properties": {
+            "result": result_schema,
+            "deliberation": {
+                "type": "object",
+                "required": ["selected_path", "alternatives", "uncertainties", "basis_artifact_ids", "confidence_ppm"],
+                "properties": {
+                    "selected_path": {"type": "string", "maxLength": 1000},
+                    "alternatives": {"type": "array", "maxItems": 3, "items": {"type": "string", "maxLength": 500}},
+                    "uncertainties": {"type": "array", "maxItems": 3, "items": {"type": "string", "maxLength": 500}},
+                    "basis_artifact_ids": {"type": "array", "maxItems": 8, "items": {"type": "string"}},
+                    "confidence_ppm": {"type": "integer", "minimum": 0, "maximum": 1000000}
+                },
+                "additionalProperties": false
+            }
+        },
+        "additionalProperties": false
+    })
 }
 
 fn governed_context_sources() -> BTreeSet<String> {
@@ -1529,20 +1558,39 @@ impl AgentRuntime {
                 model_turn = model_turn.saturating_add(1);
                 continue;
             }
-            let output = turn.output.ok_or(ResearchError::MissingFinalOutput)?;
-            let output_tokens = estimate_tokens(&output)?;
+            let raw_output = turn.output.ok_or(ResearchError::MissingFinalOutput)?;
+            let output_tokens = estimate_tokens(&raw_output)?;
             if output_tokens > installed.contract.budget.max_output_tokens {
                 return Err(ResearchError::OutputBudgetExceeded {
                     actual: output_tokens,
                     maximum: installed.contract.budget.max_output_tokens,
                 });
             }
+            let (output, deliberation_note) = self.extract_deliberation(
+                permit,
+                &installed.contract,
+                &manifest,
+                raw_output,
+                turn_now,
+            )?;
             validate_output_schema(&self.store, &installed.contract, &output)?;
             let research_sources = research_output_source_refs(
                 installed.contract.output.artifact_kind,
                 &output,
                 &manifest,
             )?;
+            if let Some(note) = deliberation_note {
+                self.store.write_task_artifact(
+                    permit,
+                    &note,
+                    LifecycleEventType::DeliberationNoteCreated,
+                    turn_now,
+                )?;
+                trace_refs.push(ArtifactRef {
+                    artifact_id: note.artifact_id,
+                    kind: ArtifactKind::DeliberationNote,
+                });
+            }
             let output_artifact = Artifact::new(
                 installed.contract.output.artifact_kind,
                 self.store.put_json(&output)?,
@@ -1568,6 +1616,78 @@ impl AgentRuntime {
             )?;
             return Ok(output_artifact);
         }
+    }
+
+    fn extract_deliberation(
+        &self,
+        permit: &TaskWritePermit,
+        contract: &AgentContract,
+        manifest: &ContextManifest,
+        output: Value,
+        now: DateTime<Utc>,
+    ) -> ResearchResult<(Value, Option<Artifact>)> {
+        if contract.deliberation_policy == DeliberationPolicy::Disabled {
+            return Ok((output, None));
+        }
+        let envelope: AgentOutputEnvelope = serde_json::from_value(output).map_err(|error| {
+            ResearchError::InvalidOutput(format!("deliberation envelope: {error}"))
+        })?;
+        envelope
+            .deliberation
+            .validate()
+            .map_err(ResearchError::Domain)?;
+
+        let selected = manifest
+            .payload
+            .selections
+            .iter()
+            .map(|selection| {
+                (
+                    selection.artifact.artifact_id.clone(),
+                    selection.artifact.clone(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut basis_refs = Vec::new();
+        for basis_id in &envelope.deliberation.basis_artifact_ids {
+            if *basis_id == manifest.artifact.artifact_id {
+                basis_refs.push(ArtifactRef {
+                    artifact_id: basis_id.clone(),
+                    kind: ArtifactKind::ContextManifest,
+                });
+            } else if let Some(reference) = selected.get(basis_id) {
+                basis_refs.push(reference.clone());
+            } else {
+                return Err(ResearchError::InvalidOutput(
+                    "deliberation basis is outside the ContextManifest".to_owned(),
+                ));
+            }
+        }
+        let note = Artifact::new(
+            ArtifactKind::DeliberationNote,
+            self.store.put_json(&envelope.deliberation)?,
+            format!("agent.deliberation.{}", contract.purpose.as_str()),
+            ArtifactLifecycle::RunScoped,
+            ArtifactProvenance {
+                source_family: "akzio.agent".to_owned(),
+                observed_at: None,
+                retrieved_at: now,
+                source_uri: None,
+                confidence_ppm: envelope.deliberation.confidence_ppm,
+                producer_contract_hash: Some(contract.contract_hash.clone()),
+            },
+            Some(task_origin(permit)),
+            std::iter::once(ArtifactRef {
+                artifact_id: manifest.artifact.artifact_id.clone(),
+                kind: ArtifactKind::ContextManifest,
+            })
+            .chain(basis_refs)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect(),
+            now,
+        )?;
+        Ok((envelope.result, Some(note)))
     }
 
     fn context_values(
@@ -1656,6 +1776,7 @@ impl AgentRuntime {
         Ok(artifact)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn record_failed_turn(
         &self,
         record: &TurnRecord<'_>,
@@ -2132,6 +2253,19 @@ fn validate_output_schema(
     output: &Value,
 ) -> ResearchResult<()> {
     let schema: Value = serde_json::from_slice(&store.read_blob(&contract.output.schema)?)?;
+    let schema = if contract.deliberation_policy == DeliberationPolicy::Required {
+        schema
+            .get("properties")
+            .and_then(|properties| properties.get("result"))
+            .cloned()
+            .ok_or_else(|| {
+                ResearchError::InvalidOutput(
+                    "required deliberation schema.result missing".to_owned(),
+                )
+            })?
+    } else {
+        schema
+    };
     validate_schema_value(output, &schema, "$").map_err(ResearchError::InvalidOutput)?;
     if schema.get("type").and_then(Value::as_str) != Some("object") || !output.is_object() {
         return Err(ResearchError::InvalidOutput(

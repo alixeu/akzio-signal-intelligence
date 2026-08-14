@@ -16,8 +16,8 @@ use akzio_domain::{
     DecisionHorizon, DomainError, Evaluation, EvaluationId, Experience, ExperienceId, Forecast,
     MemoryLifecycle, MoneyMicros, Outcome, OutcomeCostModel, OutcomeExecutionLineage,
     OutcomeHorizon, OutcomeSchedule, OutcomeWindow, PolicyState, PolicySubject, PolicyTransition,
-    PolicyTransitionId, RunPurpose, TargetPortfolio, TaskWritePermit, TopologyId,
-    V2_SCHEMA_VERSION,
+    PolicyTransitionId, Retrospective, RetrospectiveStatus, RunPurpose, TargetPortfolio,
+    TaskWritePermit, TopologyId, V2_DOMAIN_SCHEMA_VERSION, V2_SCHEMA_VERSION,
 };
 use akzio_store::v2::{
     DaemonLease, PolicyEvaluationCommit, PolicyHead, ShadowPairCompletion, ShadowPairWriteResult,
@@ -266,18 +266,62 @@ impl EvaluationRuntime {
             producer_contract_hash: input.permit.contract_hash.clone(),
         };
 
-        let outcome_sources = std::iter::once(input.materialization.schedule_artifact.clone())
-            .chain(outcome.market_evidence.iter().cloned())
-            .collect();
-        let outcome_artifact = self.artifact(
-            ArtifactKind::Outcome,
-            &outcome,
-            outcome_sources,
-            &origin,
-            &provenance,
-            created_at,
-        )?;
+        let outcome_artifact = if let Some(existing) = self
+            .store
+            .outcome_for(&input.permit.run_id, &outcome.outcome_id)?
+        {
+            existing
+        } else {
+            let outcome_sources = std::iter::once(input.materialization.schedule_artifact.clone())
+                .chain(outcome.market_evidence.iter().cloned())
+                .collect();
+            self.artifact(
+                ArtifactKind::Outcome,
+                &outcome,
+                outcome_sources,
+                &origin,
+                &provenance,
+                created_at,
+            )?
+        };
         let outcome_ref = reference(&outcome_artifact);
+        let retrospective_artifact = if let Some(existing) = self.store.retrospective_for(
+            &input.permit.run_id,
+            &outcome.outcome_id,
+            OutcomeHorizon::T5,
+        )? {
+            existing
+        } else {
+            let retrospective = Retrospective {
+                schema_version: V2_DOMAIN_SCHEMA_VERSION,
+                outcome_id: outcome.outcome_id.clone(),
+                horizon: OutcomeHorizon::T5,
+                status: RetrospectiveStatus::Complete,
+                summary:
+                    "Rust-sealed outcome retrospective; model narrative unavailable in this commit"
+                        .to_owned(),
+                findings: Vec::new(),
+                counterfactuals: Vec::new(),
+                lesson_candidates: Vec::new(),
+                diagnostic_gaps: vec![
+                    "governed retrospective model narrative not installed".to_owned()
+                ],
+                source_refs: vec![outcome_ref.clone()],
+                outcome: outcome_ref.clone(),
+                created_at,
+                sealed_at: Some(created_at),
+            };
+            retrospective.validate()?;
+            self.artifact(
+                ArtifactKind::Retrospective,
+                &retrospective,
+                vec![outcome_ref.clone()],
+                &origin,
+                &provenance,
+                created_at,
+            )?
+        };
+        let retrospective_ref = reference(&retrospective_artifact);
         let schedule = &input.materialization.schedule;
         let policy_verdict = execution_verdict(&schedule.execution).clone();
         let experience = Experience {
@@ -312,6 +356,7 @@ impl EvaluationRuntime {
                 experience.execution_context.clone(),
                 experience.policy_verdict.clone(),
                 experience.outcome.clone(),
+                retrospective_ref.clone(),
             ],
             &origin,
             &provenance,
@@ -338,7 +383,11 @@ impl EvaluationRuntime {
         let evaluation_artifact = self.artifact(
             ArtifactKind::Evaluation,
             &evaluation,
-            vec![evaluation.outcome.clone(), evaluation.experience.clone()],
+            vec![
+                evaluation.outcome.clone(),
+                evaluation.experience.clone(),
+                retrospective_ref.clone(),
+            ],
             &origin,
             &provenance,
             created_at,
@@ -399,6 +448,7 @@ impl EvaluationRuntime {
                 &PolicyEvaluationCommit {
                     permit: input.permit,
                     outcome: outcome_artifact,
+                    final_retrospective: retrospective_artifact,
                     experience: experience_artifact,
                     evaluation: evaluation_artifact,
                     candidate_policy: candidate_policy_artifact,

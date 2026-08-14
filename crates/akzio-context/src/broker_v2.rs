@@ -349,6 +349,7 @@ impl ContextBroker {
     /// Attenuate a persisted parent manifest into a child attempt grant.
     /// Projection may include parent outputs, but only from the current
     /// succeeded attempt and only when their provenance closes to the parent.
+    #[allow(clippy::too_many_arguments)]
     pub fn assemble_child(
         &self,
         parent_permit: &TaskWritePermit,
@@ -616,6 +617,7 @@ impl ContextBroker {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn validate_parent_output_sources(
         &self,
         artifact: &Artifact,
@@ -1035,7 +1037,10 @@ fn context_rank(artifact: &Artifact) -> u8 {
 fn is_trace_kind(kind: ArtifactKind) -> bool {
     matches!(
         kind,
-        ArtifactKind::AgentTurn | ArtifactKind::ToolCall | ArtifactKind::ToolResult
+        ArtifactKind::AgentTurn
+            | ArtifactKind::DeliberationNote
+            | ArtifactKind::ToolCall
+            | ArtifactKind::ToolResult
     )
 }
 

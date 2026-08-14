@@ -14,14 +14,15 @@ use std::{
 
 use akzio_domain::{
     AgentContract, Artifact, ArtifactId, ArtifactKind, ArtifactLifecycle, ArtifactOrigin,
-    ArtifactProvenance, ArtifactRef, Asset, AttemptId, BlobRef, CandidatePolicy,
+    ArtifactProvenance, ArtifactRef, Asset, AttemptId, AttemptRelation, BlobRef, CandidatePolicy,
     CandidatePolicyState, ContentHash, ContractId, ContractPurpose, DomainError, Evaluation,
     ExecutionContext, ExecutionPlan, ExecutionVerdict, Experience, FailureDisposition, FreezeState,
     LeaseId, LifecycleEventType, OrderReceipt, OrderReceiptState, Outcome, OutcomeExecutionLineage,
-    OutcomeHorizon, OutcomeSchedule, PaperCommitment, PaperReprice, PolicyState, PolicySubject,
-    PolicyTransition, PolicyTransitionId, Reconciliation, RetryPolicy, RunId, RunPurpose,
-    TaskBudget, TaskId, TaskRecipeId, TaskStatus, TaskWritePermit, WorkflowGraph, WorkflowNode,
-    WorkflowProposal, WorkflowStatus, V2_DOMAIN_SCHEMA_VERSION, V2_SCHEMA_VERSION,
+    OutcomeHorizon, OutcomeId, OutcomeSchedule, PaperCommitment, PaperReprice, PolicyState,
+    PolicySubject, PolicyTransition, PolicyTransitionId, Reconciliation, Retrospective,
+    RetrospectiveDraft, RetrospectiveStatus, RetryPolicy, RunId, RunPurpose, TaskBudget, TaskId,
+    TaskRecipeId, TaskStatus, TaskWritePermit, WorkflowGraph, WorkflowNode, WorkflowProposal,
+    WorkflowStatus, V2_DOMAIN_SCHEMA_VERSION, V2_SCHEMA_VERSION,
 };
 use chrono::{DateTime, Duration, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
@@ -456,6 +457,7 @@ pub struct PolicyHead {
 pub struct PolicyEvaluationCommit {
     pub permit: TaskWritePermit,
     pub outcome: Artifact,
+    pub final_retrospective: Artifact,
     pub experience: Artifact,
     pub evaluation: Artifact,
     pub candidate_policy: Option<Artifact>,
@@ -2913,6 +2915,7 @@ impl V2Store {
         artifact.validate()?;
         reject_generic_learning_artifact(artifact)?;
         self.read_blob(&artifact.blob)?;
+        self.validate_specialized_artifact(artifact)?;
         let mut connection = self.connection.lock().expect("store connection poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Some(lease) = lease {
@@ -2954,6 +2957,58 @@ impl V2Store {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         commit_attempt_transaction(&transaction, permit, artifacts, status, now)?;
         transaction.commit()?;
+        Ok(())
+    }
+
+    fn validate_specialized_artifact(&self, artifact: &Artifact) -> StoreResult<()> {
+        match artifact.kind {
+            ArtifactKind::DeliberationNote => {
+                let summary: akzio_domain::DeliberationSummary =
+                    self.read_artifact_payload(artifact)?;
+                summary.validate()?;
+            }
+            ArtifactKind::RetrospectiveDraft => {
+                let draft: RetrospectiveDraft = self.read_artifact_payload(artifact)?;
+                draft.validate()?;
+                if artifact.lifecycle != ArtifactLifecycle::RunScoped {
+                    return Err(StoreError::InvalidLearningCommit(
+                        "retrospective_draft.lifecycle",
+                    ));
+                }
+                let run_id = artifact
+                    .origin
+                    .as_ref()
+                    .and_then(|origin| origin.run_id.as_ref())
+                    .ok_or(StoreError::PermitOriginMismatch)?;
+                for source in &artifact.source_refs {
+                    let source_artifact = self.artifact(&source.artifact_id)?;
+                    if source_artifact
+                        .origin
+                        .as_ref()
+                        .and_then(|origin| origin.run_id.as_ref())
+                        .is_some_and(|source_run| source_run != run_id)
+                    {
+                        return Err(StoreError::InvalidLearningCommit(
+                            "retrospective_draft.cross_run_source",
+                        ));
+                    }
+                }
+            }
+            ArtifactKind::Retrospective => {
+                let retrospective: Retrospective = self.read_artifact_payload(artifact)?;
+                retrospective.validate()?;
+            }
+            ArtifactKind::AttemptRelation => {
+                let relation: AttemptRelation = self.read_artifact_payload(artifact)?;
+                relation.validate()?;
+                if artifact.lifecycle != ArtifactLifecycle::RunScoped {
+                    return Err(StoreError::InvalidLearningCommit(
+                        "attempt_relation.lifecycle",
+                    ));
+                }
+            }
+            _ => {}
+        }
         Ok(())
     }
 
@@ -3211,6 +3266,7 @@ impl V2Store {
             artifact.validate()?;
             reject_generic_learning_artifact(artifact)?;
             self.read_blob(&artifact.blob)?;
+            self.validate_specialized_artifact(artifact)?;
         }
         Ok(())
     }
@@ -3483,12 +3539,31 @@ impl V2Store {
         validate_policy_shadow_pair_snapshot(&transaction, &commit.subject, commit.pair_snapshot)?;
 
         let (_, on_failure) = task_retry_policy(&transaction, &commit.permit.task_id)?;
-        for artifact in [&commit.outcome, &commit.experience, &commit.evaluation]
-            .into_iter()
-            .chain(commit.candidate_policy.iter())
+        for artifact in [
+            &commit.outcome,
+            &commit.final_retrospective,
+            &commit.experience,
+            &commit.evaluation,
+        ]
+        .into_iter()
+        .chain(commit.candidate_policy.iter())
         {
-            assert_origin_matches(artifact.origin.as_ref(), &commit.permit)?;
-            insert_artifact(&transaction, artifact)?;
+            let existing = match read_artifact(&transaction, &artifact.artifact_id) {
+                Ok(existing) => Some(existing),
+                Err(StoreError::MissingArtifact(_)) => None,
+                Err(error) => return Err(error),
+            };
+            if let Some(existing) = &existing {
+                if *existing != *artifact {
+                    return Err(StoreError::Integrity(format!(
+                        "conflicting learning artifact {}",
+                        artifact.artifact_id
+                    )));
+                }
+            } else {
+                assert_origin_matches(artifact.origin.as_ref(), &commit.permit)?;
+                insert_artifact(&transaction, artifact)?;
+            }
             let event_id = append_event(
                 &transaction,
                 &commit.permit.run_id,
@@ -3787,6 +3862,269 @@ impl V2Store {
     pub fn artifact(&self, artifact_id: &ArtifactId) -> StoreResult<Artifact> {
         let connection = self.connection.lock().expect("store connection poisoned");
         read_artifact(&connection, artifact_id)
+    }
+
+    /// Atomically records a governed retrospective diagnostic. The
+    /// `(run_id, outcome_id, horizon)` identity is reconstructed from the
+    /// immutable artifact history, so retries are idempotent without another
+    /// table or index.
+    pub fn record_retrospective_diagnostic_fenced(
+        &self,
+        lease: &DaemonLease,
+        permit: &TaskWritePermit,
+        artifact: &Artifact,
+        now: DateTime<Utc>,
+    ) -> StoreResult<bool> {
+        if artifact.kind != ArtifactKind::Retrospective {
+            return Err(StoreError::InvalidLearningCommit("retrospective.kind"));
+        }
+        artifact.validate()?;
+        self.read_blob(&artifact.blob)?;
+        let payload: Retrospective = self.read_artifact_payload(artifact)?;
+        payload.validate()?;
+        if payload.horizon == OutcomeHorizon::T5
+            && payload.status == RetrospectiveStatus::Complete
+            && artifact.lifecycle != ArtifactLifecycle::Canonical
+        {
+            return Err(StoreError::InvalidLearningCommit(
+                "retrospective.t5_lifecycle",
+            ));
+        }
+        if payload.horizon != OutcomeHorizon::T5
+            && artifact.lifecycle != ArtifactLifecycle::RunScoped
+        {
+            return Err(StoreError::InvalidLearningCommit(
+                "retrospective.intermediate_lifecycle",
+            ));
+        }
+        assert_origin_matches(artifact.origin.as_ref(), permit)?;
+        if payload.outcome.kind != ArtifactKind::Outcome {
+            return Err(StoreError::InvalidLearningCommit(
+                "retrospective.outcome_kind",
+            ));
+        }
+
+        let mut connection = self.connection.lock().expect("store connection poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        assert_daemon_lease(&transaction, lease, now)?;
+        assert_permit(&transaction, permit)?;
+        let outcome = read_artifact(&transaction, &payload.outcome.artifact_id)?;
+        if outcome.kind != ArtifactKind::Outcome {
+            return Err(StoreError::InvalidLearningCommit(
+                "retrospective.outcome_kind",
+            ));
+        }
+        assert_artifact_from_paper_with_connection(&transaction, &outcome)?;
+
+        for existing in read_kind_artifacts(&transaction, ArtifactKind::Retrospective)? {
+            if existing
+                .origin
+                .as_ref()
+                .and_then(|origin| origin.run_id.as_ref())
+                != Some(&permit.run_id)
+            {
+                continue;
+            }
+            let existing_payload: Retrospective = self.read_artifact_payload(&existing)?;
+            if existing_payload.outcome_id == payload.outcome_id
+                && existing_payload.horizon == payload.horizon
+            {
+                if existing == *artifact {
+                    transaction.commit()?;
+                    return Ok(false);
+                }
+                return Err(StoreError::Integrity(
+                    "duplicate retrospective identity has different payload".to_owned(),
+                ));
+            }
+        }
+
+        insert_artifact(&transaction, artifact)?;
+        append_event(
+            &transaction,
+            &permit.run_id,
+            Some(&permit.task_id),
+            Some(&permit.attempt_id),
+            LifecycleEventType::RetrospectiveCreated,
+            Some(&artifact.artifact_id),
+            now,
+        )?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    /// Records retry/recovery/replay/shadow lineage as an immutable
+    /// RunScoped artifact. Parent attempts must already exist and the
+    /// resulting graph is checked for cycles inside the same transaction.
+    pub fn record_attempt_relation_fenced(
+        &self,
+        lease: &DaemonLease,
+        permit: &TaskWritePermit,
+        artifact: &Artifact,
+        now: DateTime<Utc>,
+    ) -> StoreResult<bool> {
+        if artifact.kind != ArtifactKind::AttemptRelation
+            || artifact.lifecycle != ArtifactLifecycle::RunScoped
+        {
+            return Err(StoreError::InvalidLearningCommit(
+                "attempt_relation.kind_or_lifecycle",
+            ));
+        }
+        artifact.validate()?;
+        self.read_blob(&artifact.blob)?;
+        let payload: AttemptRelation = self.read_artifact_payload(artifact)?;
+        payload.validate()?;
+        if payload.run_id != permit.run_id || payload.task_id != permit.task_id {
+            return Err(StoreError::PermitOriginMismatch);
+        }
+        assert_origin_matches(artifact.origin.as_ref(), permit)?;
+
+        let mut connection = self.connection.lock().expect("store connection poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        assert_daemon_lease(&transaction, lease, now)?;
+        assert_permit(&transaction, permit)?;
+        let parent_exists = transaction
+            .query_row(
+                "SELECT 1 FROM rebuild_attempts WHERE run_id = ?1 AND task_id = ?2 AND attempt_id = ?3",
+                params![payload.run_id.0, payload.task_id.0, payload.parent_attempt_id.0],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !parent_exists {
+            return Err(StoreError::InvalidLearningCommit(
+                "attempt_relation.parent_missing",
+            ));
+        }
+
+        let mut parent_by_child = BTreeMap::<AttemptId, AttemptId>::new();
+        for existing in read_kind_artifacts(&transaction, ArtifactKind::AttemptRelation)? {
+            let existing_payload: AttemptRelation = self.read_artifact_payload(&existing)?;
+            if existing_payload.run_id == payload.run_id
+                && existing_payload.task_id == payload.task_id
+            {
+                if existing_payload.child_attempt_id == payload.child_attempt_id {
+                    if existing_payload.parent_attempt_id == payload.parent_attempt_id
+                        && existing_payload.relation == payload.relation
+                        && existing == *artifact
+                    {
+                        transaction.commit()?;
+                        return Ok(false);
+                    }
+                    return Err(StoreError::Integrity(
+                        "attempt_relation.child_has_multiple_parents".to_owned(),
+                    ));
+                }
+                parent_by_child.insert(
+                    existing_payload.child_attempt_id,
+                    existing_payload.parent_attempt_id,
+                );
+            }
+        }
+        let mut cursor = payload.parent_attempt_id.clone();
+        let mut hops = 0_u16;
+        while let Some(parent) = parent_by_child.get(&cursor) {
+            if *parent == payload.child_attempt_id {
+                return Err(StoreError::Integrity("attempt_relation.cycle".to_owned()));
+            }
+            cursor = parent.clone();
+            hops = hops.saturating_add(1);
+            if hops > 1_024 {
+                return Err(StoreError::Integrity("attempt_relation.cycle".to_owned()));
+            }
+        }
+
+        insert_artifact(&transaction, artifact)?;
+        append_event(
+            &transaction,
+            &permit.run_id,
+            Some(&permit.task_id),
+            Some(&permit.attempt_id),
+            LifecycleEventType::AttemptRelationCreated,
+            Some(&artifact.artifact_id),
+            now,
+        )?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    /// Read only accepted retrospective artifacts for a run. Drafts and
+    /// AgentTurn/provider payloads never cross this query boundary.
+    pub fn retrospectives(&self, run_id: &RunId) -> StoreResult<Vec<Artifact>> {
+        let connection = self.connection.lock().expect("store connection poisoned");
+        let mut artifacts = read_kind_artifacts(&connection, ArtifactKind::Retrospective)?
+            .into_iter()
+            .filter(|artifact| {
+                artifact
+                    .origin
+                    .as_ref()
+                    .and_then(|origin| origin.run_id.as_ref())
+                    == Some(run_id)
+            })
+            .collect::<Vec<_>>();
+        artifacts.sort_by_key(|artifact| artifact.created_at);
+        Ok(artifacts)
+    }
+
+    /// Returns the accepted retrospective for one run/outcome/horizon identity.
+    /// The integrity gate guarantees that at most one artifact can match.
+    pub fn retrospective_for(
+        &self,
+        run_id: &RunId,
+        outcome_id: &OutcomeId,
+        horizon: OutcomeHorizon,
+    ) -> StoreResult<Option<Artifact>> {
+        let connection = self.connection.lock().expect("store connection poisoned");
+        let mut matching = Vec::new();
+        for artifact in read_kind_artifacts(&connection, ArtifactKind::Retrospective)? {
+            let Some(origin) = artifact.origin.as_ref() else {
+                continue;
+            };
+            if origin.run_id.as_ref() != Some(run_id) {
+                continue;
+            }
+            let payload: Retrospective = self.read_artifact_payload(&artifact)?;
+            if payload.outcome_id == *outcome_id && payload.horizon == horizon {
+                matching.push(artifact);
+            }
+        }
+        match matching.len() {
+            0 => Ok(None),
+            1 => Ok(matching.pop()),
+            _ => Err(StoreError::Integrity(
+                "duplicate retrospective identity".to_owned(),
+            )),
+        }
+    }
+
+    /// Returns the accepted outcome for one run/outcome identity.
+    /// Repeated evaluation attempts reuse this immutable materialization.
+    pub fn outcome_for(
+        &self,
+        run_id: &RunId,
+        outcome_id: &OutcomeId,
+    ) -> StoreResult<Option<Artifact>> {
+        let connection = self.connection.lock().expect("store connection poisoned");
+        let mut matching = Vec::new();
+        for artifact in read_kind_artifacts(&connection, ArtifactKind::Outcome)? {
+            let Some(origin) = artifact.origin.as_ref() else {
+                continue;
+            };
+            if origin.run_id.as_ref() != Some(run_id) {
+                continue;
+            }
+            let payload: Outcome = self.read_artifact_payload(&artifact)?;
+            if payload.outcome_id == *outcome_id {
+                matching.push(artifact);
+            }
+        }
+        match matching.len() {
+            0 => Ok(None),
+            1 => Ok(matching.pop()),
+            _ => Err(StoreError::Integrity(
+                "duplicate outcome identity".to_owned(),
+            )),
+        }
     }
 
     /// Returns final artifacts for the only succeeded attempt of an exact task
@@ -4480,6 +4818,8 @@ impl V2Store {
         validate_context_lifecycle_events(&connection, None)?;
         validate_gate_lifecycle_events(&connection, None)?;
         validate_paper_effect_events(&connection, None)?;
+        verify_retrospective_history(self, &connection)?;
+        verify_attempt_relation_history(self, &connection)?;
         let fk = connection
             .query_row("PRAGMA foreign_key_check", [], |_| Ok(()))
             .optional()?;
@@ -5440,6 +5780,7 @@ impl V2Store {
     ) -> StoreResult<()> {
         for (artifact, kind) in [
             (&commit.outcome, ArtifactKind::Outcome),
+            (&commit.final_retrospective, ArtifactKind::Retrospective),
             (&commit.experience, ArtifactKind::Experience),
             (&commit.evaluation, ArtifactKind::Evaluation),
         ] {
@@ -5471,6 +5812,18 @@ impl V2Store {
         }
         let schedule =
             self.read_outcome_schedule_with_connection(connection, &outcome, &[RunPurpose::Paper])?;
+        let final_retrospective: akzio_domain::Retrospective =
+            self.read_artifact_payload(&commit.final_retrospective)?;
+        final_retrospective.validate()?;
+        if final_retrospective.horizon != OutcomeHorizon::T5
+            || final_retrospective.status != akzio_domain::RetrospectiveStatus::Complete
+            || final_retrospective.outcome.artifact_id != commit.outcome.artifact_id
+            || final_retrospective.outcome.kind != ArtifactKind::Outcome
+        {
+            return Err(StoreError::InvalidLearningCommit(
+                "learning_artifact.final_retrospective",
+            ));
+        }
         let experience: Experience = self.read_artifact_payload(&commit.experience)?;
         experience.validate()?;
         let evaluation: Evaluation = self.read_artifact_payload(&commit.evaluation)?;
@@ -5506,6 +5859,19 @@ impl V2Store {
             artifact_id: commit.evaluation.artifact_id.clone(),
             kind: ArtifactKind::Evaluation,
         };
+        let retrospective_ref = ArtifactRef {
+            artifact_id: commit.final_retrospective.artifact_id.clone(),
+            kind: ArtifactKind::Retrospective,
+        };
+        if !commit
+            .final_retrospective
+            .source_refs
+            .contains(&outcome_ref)
+        {
+            return Err(StoreError::InvalidLearningCommit(
+                "learning_artifact.final_retrospective_source_refs",
+            ));
+        }
         match (&commit.subject, &commit.candidate_policy) {
             (PolicySubject::Memory(_), None) => {}
             (PolicySubject::Memory(_), Some(_)) => {
@@ -5580,10 +5946,15 @@ impl V2Store {
                 experience.execution_context.clone(),
                 experience.policy_verdict.clone(),
                 experience.outcome.clone(),
+                retrospective_ref.clone(),
             ],
         ) || !has_exact_source_refs(
             &commit.evaluation,
-            &[evaluation.outcome.clone(), evaluation.experience.clone()],
+            &[
+                evaluation.outcome.clone(),
+                evaluation.experience.clone(),
+                retrospective_ref,
+            ],
         ) {
             return Err(StoreError::InvalidLearningCommit(
                 "learning_artifact.source_refs",
@@ -8023,6 +8394,102 @@ fn read_artifact(connection: &Connection, artifact_id: &ArtifactId) -> StoreResu
     })
 }
 
+fn read_kind_artifacts(connection: &Connection, kind: ArtifactKind) -> StoreResult<Vec<Artifact>> {
+    let mut statement = connection.prepare(
+        "SELECT artifact_id FROM rebuild_artifacts WHERE kind = ?1 ORDER BY created_at ASC, artifact_id ASC",
+    )?;
+    let ids = statement
+        .query_map(params![enum_name(kind)], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    ids.into_iter()
+        .map(|id| read_artifact(connection, &ArtifactId(ContentHash::new(id)?)))
+        .collect()
+}
+
+fn verify_retrospective_history(store: &V2Store, connection: &Connection) -> StoreResult<()> {
+    let mut identities = BTreeSet::new();
+    for artifact in read_kind_artifacts(connection, ArtifactKind::Retrospective)? {
+        artifact.validate()?;
+        let payload: Retrospective = store.read_artifact_payload(&artifact)?;
+        payload.validate()?;
+        let run_id = artifact
+            .origin
+            .as_ref()
+            .and_then(|origin| origin.run_id.as_ref())
+            .ok_or_else(|| StoreError::Integrity("retrospective has no run lineage".to_owned()))?;
+        let identity = (run_id.clone(), payload.outcome_id.clone(), payload.horizon);
+        if !identities.insert(identity) {
+            return Err(StoreError::Integrity(
+                "duplicate retrospective identity".to_owned(),
+            ));
+        }
+        let outcome = read_artifact(connection, &payload.outcome.artifact_id)?;
+        if outcome.kind != ArtifactKind::Outcome {
+            return Err(StoreError::Integrity(
+                "retrospective outcome closure is invalid".to_owned(),
+            ));
+        }
+        if payload.horizon == OutcomeHorizon::T5
+            && payload.status == RetrospectiveStatus::Complete
+            && artifact.lifecycle != ArtifactLifecycle::Canonical
+        {
+            return Err(StoreError::Integrity(
+                "complete T5 retrospective is not canonical".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn verify_attempt_relation_history(store: &V2Store, connection: &Connection) -> StoreResult<()> {
+    let mut parent_by_child = BTreeMap::<(RunId, TaskId, AttemptId), AttemptId>::new();
+    for artifact in read_kind_artifacts(connection, ArtifactKind::AttemptRelation)? {
+        artifact.validate()?;
+        let relation: AttemptRelation = store.read_artifact_payload(&artifact)?;
+        relation.validate()?;
+        let parent_exists = connection
+            .query_row(
+                "SELECT 1 FROM rebuild_attempts WHERE run_id = ?1 AND task_id = ?2 AND attempt_id = ?3",
+                params![relation.run_id.0, relation.task_id.0, relation.parent_attempt_id.0],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !parent_exists {
+            return Err(StoreError::Integrity(
+                "attempt relation parent is missing".to_owned(),
+            ));
+        }
+        let key = (
+            relation.run_id.clone(),
+            relation.task_id.clone(),
+            relation.child_attempt_id.clone(),
+        );
+        if parent_by_child
+            .insert(key.clone(), relation.parent_attempt_id.clone())
+            .is_some()
+        {
+            return Err(StoreError::Integrity(
+                "attempt relation child has multiple parents".to_owned(),
+            ));
+        }
+    }
+    for (run_id, task_id, child) in parent_by_child.keys() {
+        let mut cursor = child.clone();
+        let mut hops = 0_u16;
+        while let Some(parent) =
+            parent_by_child.get(&(run_id.clone(), task_id.clone(), cursor.clone()))
+        {
+            cursor = parent.clone();
+            hops = hops.saturating_add(1);
+            if cursor == *child || hops > 1_024 {
+                return Err(StoreError::Integrity("attempt relation cycle".to_owned()));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn row_to_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<(RunId, WorkflowNode)> {
     let task_id = TaskId(row.get(0)?);
     let run_id = RunId(row.get(1)?);
@@ -9113,6 +9580,13 @@ mod tests {
         };
         let promotion_permit = fresh_permit("promotion", fixture.now);
         let promotion_outcome = fresh_outcome(&promotion_permit, fixture.now);
+        let promotion_retrospective = retrospective_artifact(
+            &fixture.store,
+            &promotion_permit,
+            &promotion_outcome,
+            fixture.now,
+        );
+        let promotion_retrospective_ref = artifact_ref(&promotion_retrospective);
 
         let mut promoted_experience: Experience = fixture
             .store
@@ -9136,6 +9610,7 @@ mod tests {
                 promoted_experience.execution_context.clone(),
                 promoted_experience.policy_verdict.clone(),
                 promoted_experience.outcome.clone(),
+                promotion_retrospective_ref.clone(),
             ],
             ArtifactLifecycle::Canonical,
             fixture.now,
@@ -9156,6 +9631,7 @@ mod tests {
             vec![
                 promoted_evaluation.outcome.clone(),
                 promoted_evaluation.experience.clone(),
+                promotion_retrospective_ref,
             ],
             ArtifactLifecycle::Canonical,
             fixture.now,
@@ -9185,6 +9661,9 @@ mod tests {
         let record_canary = |from, to, completed_at| -> StoreResult<()> {
             let permit = fresh_permit(&format!("canary-{from:?}-{to:?}"), completed_at);
             let outcome = fresh_outcome(&permit, completed_at);
+            let retrospective =
+                retrospective_artifact(&fixture.store, &permit, &outcome, completed_at);
+            let retrospective_ref = artifact_ref(&retrospective);
             let mut experience: Experience =
                 fixture.store.read_artifact_payload(&fixture.experience)?;
             experience.experience_id = akzio_domain::ExperienceId::new();
@@ -9205,6 +9684,7 @@ mod tests {
                     experience.execution_context.clone(),
                     experience.policy_verdict.clone(),
                     experience.outcome.clone(),
+                    retrospective_ref.clone(),
                 ],
                 ArtifactLifecycle::Canonical,
                 completed_at,
@@ -9221,7 +9701,11 @@ mod tests {
                 &permit,
                 ArtifactKind::Evaluation,
                 &evaluation,
-                vec![evaluation.outcome.clone(), evaluation.experience.clone()],
+                vec![
+                    evaluation.outcome.clone(),
+                    evaluation.experience.clone(),
+                    retrospective_ref,
+                ],
                 ArtifactLifecycle::Canonical,
                 completed_at,
             );
@@ -9259,7 +9743,8 @@ mod tests {
             fixture
                 .store
                 .record_policy_evaluation(&PolicyEvaluationCommit {
-                    permit,
+                    permit: permit.clone(),
+                    final_retrospective: retrospective,
                     outcome,
                     experience: experience_artifact,
                     evaluation: evaluation_artifact,
@@ -9336,7 +9821,8 @@ mod tests {
         fixture
             .store
             .record_policy_evaluation(&PolicyEvaluationCommit {
-                permit: promotion_permit,
+                permit: promotion_permit.clone(),
+                final_retrospective: promotion_retrospective,
                 outcome: promotion_outcome,
                 experience: promoted_experience_artifact,
                 evaluation: promoted_evaluation_artifact,
@@ -9363,6 +9849,13 @@ mod tests {
         let rollback_at = fixture.now + Duration::microseconds(4);
         let rollback_permit = fresh_permit("rollback", rollback_at);
         let rollback_outcome = fresh_outcome(&rollback_permit, rollback_at);
+        let rollback_retrospective = retrospective_artifact(
+            &fixture.store,
+            &rollback_permit,
+            &rollback_outcome,
+            rollback_at,
+        );
+        let rollback_retrospective_ref = artifact_ref(&rollback_retrospective);
         let mut rollback_experience: Experience = fixture
             .store
             .read_artifact_payload(&fixture.experience)
@@ -9385,6 +9878,7 @@ mod tests {
                 rollback_experience.execution_context.clone(),
                 rollback_experience.policy_verdict.clone(),
                 rollback_experience.outcome.clone(),
+                rollback_retrospective_ref.clone(),
             ],
             ArtifactLifecycle::Canonical,
             fixture.now + Duration::microseconds(1),
@@ -9406,6 +9900,7 @@ mod tests {
             vec![
                 rollback_evaluation.outcome.clone(),
                 rollback_evaluation.experience.clone(),
+                rollback_retrospective_ref,
             ],
             ArtifactLifecycle::Canonical,
             rollback_at,
@@ -9444,7 +9939,8 @@ mod tests {
         fixture
             .store
             .record_policy_evaluation(&PolicyEvaluationCommit {
-                permit: rollback_permit,
+                permit: rollback_permit.clone(),
+                final_retrospective: rollback_retrospective,
                 outcome: rollback_outcome,
                 experience: rollback_experience_artifact,
                 evaluation: rollback_evaluation_artifact,
@@ -10063,6 +10559,7 @@ mod tests {
         permit: TaskWritePermit,
         subject: PolicySubject,
         outcome: Artifact,
+        final_retrospective: Artifact,
         experience: Artifact,
         evaluation: Artifact,
         candidate_policy: Option<Artifact>,
@@ -10298,6 +10795,8 @@ mod tests {
                 ArtifactLifecycle::Canonical,
                 now,
             );
+            let final_retrospective = retrospective_artifact(&store, &permit, &outcome, now);
+            let retrospective_ref = artifact_ref(&final_retrospective);
             let experience_payload = Experience {
                 schema_version: V2_SCHEMA_VERSION,
                 experience_id: akzio_domain::ExperienceId::new(),
@@ -10327,6 +10826,7 @@ mod tests {
                     experience_payload.execution_context.clone(),
                     experience_payload.policy_verdict.clone(),
                     experience_payload.outcome.clone(),
+                    retrospective_ref.clone(),
                 ],
                 ArtifactLifecycle::Canonical,
                 now,
@@ -10346,7 +10846,11 @@ mod tests {
                 &permit,
                 ArtifactKind::Evaluation,
                 &evaluation_payload,
-                vec![artifact_ref(&outcome), artifact_ref(&experience)],
+                vec![
+                    artifact_ref(&outcome),
+                    artifact_ref(&experience),
+                    retrospective_ref,
+                ],
                 ArtifactLifecycle::Canonical,
                 now,
             );
@@ -10390,6 +10894,7 @@ mod tests {
                 permit,
                 subject,
                 outcome,
+                final_retrospective,
                 experience,
                 evaluation,
                 candidate_policy,
@@ -10403,6 +10908,7 @@ mod tests {
             PolicyEvaluationCommit {
                 permit: self.permit.clone(),
                 outcome: self.outcome.clone(),
+                final_retrospective: self.final_retrospective.clone(),
                 experience: self.experience.clone(),
                 evaluation: self.evaluation.clone(),
                 candidate_policy: self.candidate_policy.clone(),
@@ -12602,6 +13108,8 @@ mod tests {
             ArtifactLifecycle::Canonical,
         );
         let outcome_ref = reference(&outcome);
+        let final_retrospective = retrospective_artifact(&store, &evaluation_permit, &outcome, now);
+        let retrospective_ref = reference(&final_retrospective);
         let subject = PolicySubject::Memory(akzio_domain::MemoryId::new());
         let experience_payload = Experience {
             schema_version: V2_SCHEMA_VERSION,
@@ -12628,6 +13136,7 @@ mod tests {
                 experience_payload.execution_context.clone(),
                 experience_payload.policy_verdict.clone(),
                 experience_payload.outcome.clone(),
+                retrospective_ref.clone(),
             ],
             ArtifactLifecycle::Canonical,
         );
@@ -12646,13 +13155,14 @@ mod tests {
             &evaluation_permit,
             ArtifactKind::Evaluation,
             serde_json::to_value(&evaluation_payload).unwrap(),
-            vec![outcome_ref, experience_ref],
+            vec![outcome_ref, experience_ref, retrospective_ref],
             ArtifactLifecycle::Canonical,
         );
         let pair_snapshot = store.policy_shadow_pair_snapshot(&subject).unwrap();
         let commit = PolicyEvaluationCommit {
             permit: evaluation_permit,
             outcome: outcome.clone(),
+            final_retrospective,
             experience,
             evaluation: evaluation.clone(),
             candidate_policy: None,
@@ -14526,4 +15036,58 @@ mod tests {
             .unwrap();
         fixture.store.verify_integrity().unwrap();
     }
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+fn retrospective_artifact(
+    store: &V2Store,
+    permit: &TaskWritePermit,
+    outcome: &Artifact,
+    now: DateTime<Utc>,
+) -> Artifact {
+    let outcome_ref = ArtifactRef {
+        artifact_id: outcome.artifact_id.clone(),
+        kind: ArtifactKind::Outcome,
+    };
+    let payload = akzio_domain::Retrospective {
+        schema_version: V2_DOMAIN_SCHEMA_VERSION,
+        outcome_id: akzio_domain::OutcomeId::new(),
+        horizon: OutcomeHorizon::T5,
+        status: akzio_domain::RetrospectiveStatus::Complete,
+        summary: "fixture retrospective".to_owned(),
+        findings: Vec::new(),
+        counterfactuals: Vec::new(),
+        lesson_candidates: Vec::new(),
+        diagnostic_gaps: Vec::new(),
+        source_refs: vec![outcome_ref.clone()],
+        outcome: outcome_ref.clone(),
+        created_at: now,
+        sealed_at: Some(now),
+    };
+    Artifact::new(
+        ArtifactKind::Retrospective,
+        store
+            .put_json(&payload)
+            .expect("fixture retrospective payload"),
+        "fixture.policy",
+        ArtifactLifecycle::Canonical,
+        ArtifactProvenance {
+            source_family: "fixture.policy".to_owned(),
+            observed_at: Some(now),
+            retrieved_at: now,
+            source_uri: None,
+            confidence_ppm: 1_000_000,
+            producer_contract_hash: permit.contract_hash.clone(),
+        },
+        Some(ArtifactOrigin {
+            run_id: Some(permit.run_id.clone()),
+            task_id: Some(permit.task_id.clone()),
+            attempt_id: Some(permit.attempt_id.clone()),
+            contract_hash: permit.contract_hash.clone(),
+        }),
+        vec![outcome_ref],
+        now,
+    )
+    .expect("fixture retrospective artifact")
 }

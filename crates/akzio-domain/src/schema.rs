@@ -11,6 +11,7 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::{
     content_hash_json, BlobRef, ContentHash, ContractId, DocumentLifecycle, DomainError,
@@ -52,6 +53,7 @@ pub enum ArtifactKind {
     WorkflowProposal,
     WorkflowGraph,
     AgentTurn,
+    DeliberationNote,
     ToolCall,
     ToolResult,
     Claim,
@@ -68,6 +70,9 @@ pub enum ArtifactKind {
     OrderReceipt,
     Reconciliation,
     OutcomeSchedule,
+    RetrospectiveDraft,
+    Retrospective,
+    AttemptRelation,
     Experience,
     Outcome,
     Evaluation,
@@ -102,6 +107,7 @@ impl ArtifactKind {
                 | Self::OrderReceipt
                 | Self::Reconciliation
                 | Self::OutcomeSchedule
+                | Self::Retrospective
                 | Self::Experience
                 | Self::Outcome
                 | Self::Evaluation
@@ -263,6 +269,23 @@ impl Artifact {
         if self.lifecycle == ArtifactLifecycle::Canonical && !self.kind.can_be_canonical() {
             return Err(DomainError::EmptyField {
                 field: "artifact.canonical_kind",
+            });
+        }
+        let lifecycle_allowed = match self.kind {
+            ArtifactKind::DeliberationNote
+            | ArtifactKind::RetrospectiveDraft
+            | ArtifactKind::AttemptRelation => self.lifecycle == ArtifactLifecycle::RunScoped,
+            ArtifactKind::Retrospective => {
+                matches!(
+                    self.lifecycle,
+                    ArtifactLifecycle::RunScoped | ArtifactLifecycle::Canonical
+                )
+            }
+            _ => true,
+        };
+        if !lifecycle_allowed {
+            return Err(DomainError::EmptyField {
+                field: "artifact.lifecycle",
             });
         }
         if self.artifact_id.0 != self.expected_hash()? {
@@ -443,6 +466,67 @@ pub struct PromptBundle {
     pub role: BlobRef,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliberationPolicy {
+    #[default]
+    Disabled,
+    Required,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeliberationSummary {
+    pub selected_path: String,
+    #[serde(default)]
+    pub alternatives: Vec<String>,
+    #[serde(default)]
+    pub uncertainties: Vec<String>,
+    #[serde(default)]
+    pub basis_artifact_ids: Vec<ArtifactId>,
+    pub confidence_ppm: u32,
+}
+
+impl DeliberationSummary {
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if self.selected_path.trim().is_empty()
+            || self.selected_path.chars().count() > 1_000
+            || self.alternatives.len() > 3
+            || self.uncertainties.len() > 3
+            || self.basis_artifact_ids.len() > 8
+            || self.confidence_ppm > 1_000_000
+            || self
+                .alternatives
+                .iter()
+                .any(|item| item.trim().is_empty() || item.chars().count() > 500)
+            || self
+                .uncertainties
+                .iter()
+                .any(|item| item.trim().is_empty() || item.chars().count() > 500)
+        {
+            return Err(DomainError::InvalidBudget {
+                field: "deliberation.summary",
+            });
+        }
+        let mut basis = BTreeSet::new();
+        if self
+            .basis_artifact_ids
+            .iter()
+            .any(|artifact_id| !basis.insert(artifact_id.clone()))
+        {
+            return Err(DomainError::EmptyField {
+                field: "deliberation.basis_artifact_ids",
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentOutputEnvelope {
+    pub result: Value,
+    pub deliberation: DeliberationSummary,
+}
+
 impl PromptBundle {
     fn validate(&self) -> Result<(), DomainError> {
         if self.version == 0 {
@@ -581,6 +665,8 @@ pub struct AgentContract {
     pub tool_specs: Vec<ToolSpec>,
     pub candidate_capability_ceiling: CandidateCapabilityCeiling,
     pub output: OutputContract,
+    #[serde(default)]
+    pub deliberation_policy: DeliberationPolicy,
     pub budget: TaskBudget,
     pub retry: RetryPolicy,
     pub termination: TerminationPolicy,
@@ -621,6 +707,7 @@ impl AgentContract {
             tool_grants,
             tool_specs,
             output,
+            deliberation_policy: DeliberationPolicy::Disabled,
             budget,
             retry,
             termination,

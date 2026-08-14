@@ -28,8 +28,9 @@ use akzio_domain::{
     ArtifactProvenance, ArtifactRef, Asset, ContentHash, ContextPolicy, Decision, DecisionContext,
     DomainError, EvidenceNeed, ExecutionContext, ExecutionVerdict, FreezeState, LifecycleEventType,
     MarketClockSnapshot, MemoryId, MoneyMicros, OutcomeExecutionLineage, OutcomeHorizon,
-    OutcomeSchedule, PolicySubject, QuoteSnapshot, ResearchClaim, RunId, RunPurpose,
-    RuntimeTaskClass, TaskId, TaskStatus, TopologyId, WorkflowProposal, WorkflowStatus,
+    OutcomeSchedule, PolicySubject, QuoteSnapshot, ResearchClaim, Retrospective,
+    RetrospectiveStatus, RunId, RunPurpose, RuntimeTaskClass, TaskId, TaskStatus, TopologyId,
+    WorkflowProposal, WorkflowStatus,
 };
 use akzio_execution::{
     paper::CommittedPaperBroker, DecisionGateError, DecisionGateInput, ExecutionGateError,
@@ -200,6 +201,12 @@ pub struct ReplayReport {
     pub terminal_task_count: usize,
     pub event_cursor: i64,
     pub cancel_requested: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetrospectiveView {
+    pub artifact_id: ArtifactId,
+    pub payload: Retrospective,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -479,6 +486,30 @@ impl Daemon {
         })
     }
 
+    fn retrospectives(&self, run_id: &RunId) -> Result<Vec<RetrospectiveView>> {
+        let run_purpose = self.store.run_purpose(run_id)?;
+        if !matches!(run_purpose, RunPurpose::Paper) {
+            return Ok(Vec::new());
+        }
+        self.store
+            .retrospectives(run_id)?
+            .into_iter()
+            .map(|artifact| {
+                let payload: Retrospective =
+                    serde_json::from_slice(&self.store.read_blob(&artifact.blob)?)?;
+                if payload.status != RetrospectiveStatus::Complete {
+                    return Err(DaemonError::InvalidInput(
+                        "incomplete retrospective crossed query gate".to_owned(),
+                    ));
+                }
+                Ok(RetrospectiveView {
+                    artifact_id: artifact.artifact_id,
+                    payload,
+                })
+            })
+            .collect()
+    }
+
     fn set_freeze(&self, frozen: bool, reason: String) -> Result<DaemonHealth> {
         self.store.write_freeze_state(frozen, reason, Utc::now())?;
         self.health()
@@ -579,6 +610,7 @@ impl Daemon {
         Router::new()
             .route("/health", get(http_health))
             .route("/runs/{run_id}/events", get(http_events))
+            .route("/runs/{run_id}/retrospectives", get(http_retrospectives))
             .route("/runs/{run_id}/replay", get(http_replay))
             .route("/runs", post(http_submit))
             .route("/runs/{run_id}/cancel", post(http_cancel))
@@ -1758,6 +1790,18 @@ async fn http_replay(
         .map_err(invalid_input_or_conflict)
 }
 
+async fn http_retrospectives(
+    State(daemon): State<Arc<Daemon>>,
+    Path(run_id): Path<String>,
+    headers: HeaderMap,
+) -> std::result::Result<Json<Vec<RetrospectiveView>>, StatusCode> {
+    authorize(&daemon, &headers)?;
+    daemon
+        .retrospectives(&RunId(run_id))
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
 async fn http_submit(
     State(daemon): State<Arc<Daemon>>,
     headers: HeaderMap,
@@ -1923,6 +1967,16 @@ pub fn fixture_model_client() -> ModelClient {
         })
         .collect::<Vec<_>>();
     let response = |output: serde_json::Value| {
+        let output = serde_json::json!({
+            "result": output,
+            "deliberation": {
+                "selected_path": "fixture path",
+                "alternatives": [],
+                "uncertainties": [],
+                "basis_artifact_ids": [],
+                "confidence_ppm": 500000
+            }
+        });
         serde_json::json!({
             "output_text": serde_json::to_string(&output).expect("static fixture JSON"),
         })
@@ -1999,6 +2053,16 @@ mod tests {
     }
 
     fn response(output: serde_json::Value) -> serde_json::Value {
+        let output = serde_json::json!({
+            "result": output,
+            "deliberation": {
+                "selected_path": "fixture path",
+                "alternatives": [],
+                "uncertainties": [],
+                "basis_artifact_ids": [],
+                "confidence_ppm": 500000
+            }
+        });
         serde_json::json!({
             "output_text": serde_json::to_string(&output).unwrap(),
         })

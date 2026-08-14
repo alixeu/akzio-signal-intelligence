@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     artifact::{ArtifactKind, ArtifactRef},
-    ids::{EvaluationId, ExperienceId, OutcomeId, PolicyTransitionId},
-    ContentHash, DomainError, MemoryId, TopologyId, V2_DOMAIN_SCHEMA_VERSION,
+    ids::{AttemptId, EvaluationId, ExperienceId, OutcomeId, PolicyTransitionId},
+    ContentHash, DomainError, MemoryId, RunId, TaskId, TopologyId, V2_DOMAIN_SCHEMA_VERSION,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -167,6 +167,202 @@ impl OutcomeWindow {
 pub struct OutcomeCostModel {
     pub transaction_cost_ppm: u32,
     pub slippage_ppm: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetrospectiveCategory {
+    Research,
+    Evidence,
+    Risk,
+    Decision,
+    Execution,
+    Topology,
+    Contract,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetrospectiveConclusion {
+    Worked,
+    Failed,
+    Mixed,
+    Unresolved,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetrospectiveStatus {
+    Complete,
+    ModelUnavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetrospectiveFinding {
+    pub category: RetrospectiveCategory,
+    pub conclusion: RetrospectiveConclusion,
+    pub statement: String,
+    #[serde(default)]
+    pub artifact_refs: Vec<ArtifactRef>,
+    pub confidence_ppm: u32,
+}
+
+impl RetrospectiveFinding {
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if self.statement.trim().is_empty()
+            || self.statement.chars().count() > 4_000
+            || self.artifact_refs.len() > 8
+            || self.confidence_ppm > 1_000_000
+        {
+            return Err(DomainError::InvalidBudget {
+                field: "retrospective.finding",
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetrospectiveDraft {
+    pub schema_version: u32,
+    pub outcome_id: OutcomeId,
+    pub horizon: OutcomeHorizon,
+    pub summary: String,
+    #[serde(default)]
+    pub findings: Vec<RetrospectiveFinding>,
+    #[serde(default)]
+    pub counterfactuals: Vec<String>,
+    #[serde(default)]
+    pub lesson_candidates: Vec<String>,
+    #[serde(default)]
+    pub diagnostic_gaps: Vec<String>,
+    #[serde(default)]
+    pub source_refs: Vec<ArtifactRef>,
+    pub created_at: DateTime<Utc>,
+}
+
+impl RetrospectiveDraft {
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if self.schema_version != V2_DOMAIN_SCHEMA_VERSION
+            || self.outcome_id.0.trim().is_empty()
+            || self.summary.chars().count() > 4_000
+            || self.findings.len() > 12
+            || self.counterfactuals.len() > 3
+            || self.lesson_candidates.len() > 8
+            || self.diagnostic_gaps.len() > 8
+            || self
+                .counterfactuals
+                .iter()
+                .any(|item| item.chars().count() > 4_000)
+            || self
+                .lesson_candidates
+                .iter()
+                .any(|item| item.chars().count() > 4_000)
+            || self
+                .diagnostic_gaps
+                .iter()
+                .any(|item| item.chars().count() > 4_000)
+        {
+            return Err(DomainError::InvalidBudget {
+                field: "retrospective.draft",
+            });
+        }
+        for finding in &self.findings {
+            finding.validate()?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Retrospective {
+    pub schema_version: u32,
+    pub outcome_id: OutcomeId,
+    pub horizon: OutcomeHorizon,
+    pub status: RetrospectiveStatus,
+    pub summary: String,
+    #[serde(default)]
+    pub findings: Vec<RetrospectiveFinding>,
+    #[serde(default)]
+    pub counterfactuals: Vec<String>,
+    #[serde(default)]
+    pub lesson_candidates: Vec<String>,
+    #[serde(default)]
+    pub diagnostic_gaps: Vec<String>,
+    #[serde(default)]
+    pub source_refs: Vec<ArtifactRef>,
+    pub outcome: ArtifactRef,
+    pub created_at: DateTime<Utc>,
+    pub sealed_at: Option<DateTime<Utc>>,
+}
+
+impl Retrospective {
+    pub fn validate(&self) -> Result<(), DomainError> {
+        let draft = RetrospectiveDraft {
+            schema_version: self.schema_version,
+            outcome_id: self.outcome_id.clone(),
+            horizon: self.horizon,
+            summary: self.summary.clone(),
+            findings: self.findings.clone(),
+            counterfactuals: self.counterfactuals.clone(),
+            lesson_candidates: self.lesson_candidates.clone(),
+            diagnostic_gaps: self.diagnostic_gaps.clone(),
+            source_refs: self.source_refs.clone(),
+            created_at: self.created_at,
+        };
+        draft.validate()?;
+        if self.outcome.kind != ArtifactKind::Outcome {
+            return Err(DomainError::EmptyField {
+                field: "retrospective.outcome",
+            });
+        }
+        if self.horizon == OutcomeHorizon::T5
+            && self.status == RetrospectiveStatus::Complete
+            && self.sealed_at.is_none()
+        {
+            return Err(DomainError::EmptyField {
+                field: "retrospective.sealed_at",
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttemptRelationKind {
+    Retry,
+    Recovery,
+    Replay,
+    Shadow,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttemptRelation {
+    pub schema_version: u32,
+    pub run_id: RunId,
+    pub task_id: TaskId,
+    pub parent_attempt_id: AttemptId,
+    pub child_attempt_id: AttemptId,
+    pub relation: AttemptRelationKind,
+    pub created_at: DateTime<Utc>,
+}
+
+impl AttemptRelation {
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if self.schema_version != V2_DOMAIN_SCHEMA_VERSION
+            || self.run_id.0.trim().is_empty()
+            || self.task_id.0.trim().is_empty()
+            || self.parent_attempt_id.0.trim().is_empty()
+            || self.child_attempt_id.0.trim().is_empty()
+            || self.parent_attempt_id == self.child_attempt_id
+        {
+            return Err(DomainError::EmptyField {
+                field: "attempt_relation.identity",
+            });
+        }
+        Ok(())
+    }
 }
 
 impl OutcomeCostModel {

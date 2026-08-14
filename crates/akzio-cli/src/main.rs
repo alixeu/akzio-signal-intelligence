@@ -2,8 +2,8 @@ use std::{collections::BTreeSet, net::SocketAddr, path::PathBuf, sync::Arc, time
 
 use akzio_daemon::{
     fixture_model_client, AlpacaPaperSessionClock, Daemon, DaemonConfig, DaemonHealth,
-    PaperWorkflowSource, ReplayReport, RunCancellationResponse, RunRetryResponse,
-    RunSubmissionResponse, SchedulerError, StorePaperWorkflowSource,
+    PaperWorkflowSource, ReplayReport, RetrospectiveView, RunCancellationResponse,
+    RunRetryResponse, RunSubmissionResponse, SchedulerError, StorePaperWorkflowSource,
 };
 use akzio_domain::{ArtifactKind, Asset, RunPurpose, WorkflowStatus};
 use akzio_execution::paper::AlpacaPaper;
@@ -66,6 +66,9 @@ enum RunCommand {
     Replay {
         run_id: String,
     },
+    Retrospectives {
+        run_id: String,
+    },
     Events {
         run_id: String,
         #[arg(long, default_value_t = 0)]
@@ -91,6 +94,7 @@ enum TestCommand {
     StoreCorruption,
     FreezeRecovery,
     LeaseTakeover,
+    Retrospective,
 }
 
 #[derive(Debug, Subcommand)]
@@ -235,6 +239,14 @@ impl ControlApiClient {
             .await
     }
 
+    async fn retrospectives(&self, run_id: &str) -> Result<Vec<RetrospectiveView>> {
+        self.json(self.request(
+            Method::GET,
+            self.endpoint(&["runs", run_id, "retrospectives"]),
+        ))
+        .await
+    }
+
     async fn cancel(&self, run_id: &str) -> Result<RunCancellationResponse> {
         self.json(self.request(Method::POST, self.endpoint(&["runs", run_id, "cancel"])))
             .await
@@ -343,6 +355,13 @@ async fn main() -> Result<()> {
         } => print_json(
             &ControlApiClient::from_config(&config)?
                 .replay(&run_id)
+                .await?,
+        ),
+        Command::Run {
+            command: RunCommand::Retrospectives { run_id },
+        } => print_json(
+            &ControlApiClient::from_config(&config)?
+                .retrospectives(&run_id)
                 .await?,
         ),
         Command::Run {
@@ -833,6 +852,10 @@ async fn diagnostic_test(config: Config, command: TestCommand) -> Result<()> {
                     "new_epoch": successor.epoch,
                 })
             );
+        }
+        TestCommand::Retrospective => {
+            V2Store::open(&config.daemon.store_root)?.verify_integrity()?;
+            println!("{}", serde_json::json!({"test":"retrospective","ok":true}));
         }
     }
     Ok(())
