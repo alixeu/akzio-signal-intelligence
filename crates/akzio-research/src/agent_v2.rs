@@ -11,8 +11,9 @@ use akzio_domain::{
     ArtifactOrigin, ArtifactProvenance, ArtifactRef, ContextPolicy, ContractId, ContractPurpose,
     DeliberationPolicy, DomainError, FailureDisposition, LifecycleEventType, OutputContract,
     PromptBundle, ReadGrant, ResearchClaim, ResearchCritique, ResearchResolution, RetryPolicy,
-    RuntimeTaskClass, TaskBudget, TaskRecipe, TaskRecipeId, TaskWritePermit, TerminationPolicy,
-    ToolGrant, ToolKind, ToolSpec, WorkflowNode, V2_DOMAIN_SCHEMA_VERSION, V2_SCHEMA_VERSION,
+    RunPurpose, RuntimeTaskClass, TaskBudget, TaskRecipe, TaskRecipeId, TaskWritePermit,
+    TerminationPolicy, ToolGrant, ToolKind, ToolSpec, WorkflowNode, V2_DOMAIN_SCHEMA_VERSION,
+    V2_SCHEMA_VERSION,
 };
 use akzio_model::{
     ModelCallTrace, ModelCapabilitySnapshot, ModelClient, ModelError, ModelRequest,
@@ -877,14 +878,13 @@ fn research_intent_output_schema() -> Value {
             "query": {"type": "string", "minLength": 1, "maxLength": 2000},
             "assets": {
                 "type": "array",
-                "uniqueItems": true,
                 "maxItems": 4,
                 "items": {"type": "string", "enum": ["TQQQ", "QQQ", "SOXX", "SOXL"]}
             },
             "window_start": {"type": ["string", "null"]},
             "window_end": {"type": ["string", "null"]},
-        "max_age_secs": {"type": "integer", "maximum": 604800},
-        "max_results": {"type": "integer", "maximum": 32}
+            "max_age_secs": {"type": "integer", "maximum": 604800},
+            "max_results": {"type": "integer", "maximum": 32}
         },
         "required": [
             "schema_version", "source_family", "resource", "query", "assets",
@@ -1482,7 +1482,10 @@ impl AgentRuntime {
         let prompt = format!("{governance}\n\n{role}");
         let output_schema: Value =
             serde_json::from_slice(&self.store.read_blob(&installed.contract.output.schema)?)?;
-        let tools = if context.is_empty() {
+        let run_purpose = self.store.run_purpose(&permit.run_id)?;
+        let tools = if context.is_empty()
+            || matches!(run_purpose, RunPurpose::Debug | RunPurpose::PaperDryRun)
+        {
             Vec::new()
         } else {
             model_tool_definitions(&self.store, &installed.contract)?
@@ -2715,7 +2718,10 @@ fn validate_object_schema(
 mod tests {
     use std::{
         collections::BTreeSet,
-        sync::atomic::{AtomicU8, Ordering},
+        sync::{
+            atomic::{AtomicU8, Ordering},
+            Arc,
+        },
     };
 
     use akzio_domain::{
@@ -3110,6 +3116,82 @@ mod tests {
         ) -> BoxFuture<'a, ResearchResult<AgentModelTurn>> {
             Box::pin(async move { Ok(self.0.clone()) })
         }
+    }
+
+    #[derive(Debug)]
+    struct ToolCountModel {
+        tool_count: Arc<AtomicU8>,
+        evidence_id: ArtifactId,
+    }
+
+    impl AgentModel for ToolCountModel {
+        fn capability_snapshot(&self) -> ModelCapabilitySnapshot {
+            fixture_capabilities()
+        }
+
+        fn turn<'a>(
+            &'a self,
+            request: AgentModelRequest,
+        ) -> BoxFuture<'a, ResearchResult<AgentModelTurn>> {
+            let tool_count = Arc::clone(&self.tool_count);
+            let evidence_id = self.evidence_id.clone();
+            Box::pin(async move {
+                tool_count.store(request.tools.len() as u8, Ordering::SeqCst);
+                Ok(AgentModelTurn {
+                    output: Some(json!({
+                        "schema_version": V2_SCHEMA_VERSION,
+                        "topic": "debug",
+                        "statement": "Debug context is sufficient without a model tool call.",
+                        "horizon": "t1",
+                        "stance": "neutral",
+                        "materiality_ppm": 100_000,
+                        "confidence_ppm": 900_000,
+                        "grounds": [{
+                            "evidence": {
+                                "artifact_id": evidence_id.0.as_str(),
+                                "kind": "normalized_evidence"
+                            },
+                            "support": "The debug fixture is already present in the authorized context."
+                        }],
+                        "evidence_gaps": []
+                    })),
+                    tool_calls: vec![],
+                    model_debug: None,
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn debug_run_does_not_advertise_read_artifact_tool() {
+        let fixture = fixture_with(|_| {});
+        let tool_count = Arc::new(AtomicU8::new(u8::MAX));
+        let model = ToolCountModel {
+            tool_count: Arc::clone(&tool_count),
+            evidence_id: fixture.evidence.artifact_id.clone(),
+        };
+        let runtime = AgentRuntime::new(
+            fixture.store.clone(),
+            fixture.catalogue,
+            Duration::minutes(5),
+        );
+
+        let output = runtime
+            .run(
+                &fixture.claimed.permit,
+                &fixture.claimed.node,
+                [ArtifactRef {
+                    artifact_id: fixture.evidence.artifact_id.clone(),
+                    kind: ArtifactKind::NormalizedEvidence,
+                }],
+                &model,
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(output.kind, ArtifactKind::Claim);
+        assert_eq!(tool_count.load(Ordering::SeqCst), 0);
     }
 
     #[derive(Debug)]
@@ -4107,7 +4189,7 @@ mod tests {
         .unwrap();
         let run = StoredRun {
             run_id: akzio_domain::RunId::new(),
-            purpose: akzio_domain::RunPurpose::Debug,
+            purpose: RunPurpose::Paper,
             topology_id: graph.topology_id.clone(),
             graph_artifact_id: graph_artifact.artifact_id.clone(),
             created_at: Utc::now(),
