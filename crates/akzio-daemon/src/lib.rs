@@ -668,6 +668,10 @@ impl Daemon {
         match self.execute_task_inner(&task, Utc::now()).await {
             Ok(completion) => completion,
             Err(error) => {
+                eprintln!(
+                    "v2 daemon task failed closed run_id={} task_id={} recipe={} error={error}",
+                    task.run_id, task.node.task_id, task.node.recipe_id
+                );
                 tracing::warn!(
                     run_id = %task.run_id,
                     task_id = %task.node.task_id,
