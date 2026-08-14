@@ -618,10 +618,18 @@ async fn fixture_debug(config: Config) -> Result<()> {
     let daemon = fixture_daemon(&config)?;
     let run_id = daemon.submit_default(RunPurpose::Debug)?;
     while daemon.run_one("fixture").await? {}
+    let snapshot = daemon.store().workflow_snapshot(&run_id)?;
+    if snapshot.status != WorkflowStatus::Completed {
+        bail!(
+            "fixture Debug workflow did not complete: {:?}",
+            snapshot.status
+        );
+    }
     println!(
         "{}",
         serde_json::json!({
             "run_id": run_id,
+            "status": snapshot.status,
             "fixture": true,
             "evidence": "fixture/offline"
         })
@@ -634,6 +642,12 @@ async fn paper_dry_run(config: Config) -> Result<()> {
     let run_id = daemon.submit_default(RunPurpose::PaperDryRun)?;
     while daemon.run_one("paper-dry-run-fixture").await? {}
     let snapshot = daemon.store().workflow_snapshot(&run_id)?;
+    if snapshot.status != WorkflowStatus::Completed {
+        bail!(
+            "Paper Dry Run workflow did not complete: {:?}",
+            snapshot.status
+        );
+    }
     let events = daemon.store().events_after(&run_id, 0, 10_000)?;
     let canonical_learning_events = events
         .iter()
