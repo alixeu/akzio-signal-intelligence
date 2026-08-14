@@ -6710,7 +6710,7 @@ fn validate_tool_lifecycle_events(
         r#"SELECT event_id, run_id, task_id, attempt_id, event_type, artifact_id
            FROM rebuild_events
            WHERE (?1 IS NULL OR run_id = ?1)
-             AND event_type IN (?2, ?3, ?4)
+             AND event_type IN (?2, ?3, ?4, ?5)
            ORDER BY event_id ASC"#,
     )?;
     let rows = statement.query_map(
@@ -6719,6 +6719,7 @@ fn validate_tool_lifecycle_events(
             LifecycleEventType::ToolCalled.as_str(),
             LifecycleEventType::ToolCompleted.as_str(),
             LifecycleEventType::ToolFailed.as_str(),
+            LifecycleEventType::TaskSucceeded.as_str(),
         ],
         |row| {
             Ok((
@@ -6751,6 +6752,9 @@ fn validate_tool_lifecycle_events(
     let mut called_by_key =
         BTreeMap::<(RunId, TaskId, akzio_domain::AttemptId, ArtifactId), CalledEvent>::new();
     let mut terminal_by_call = BTreeSet::new();
+    let mut pending_by_task =
+        BTreeMap::<(RunId, TaskId, akzio_domain::AttemptId), BTreeSet<ArtifactId>>::new();
+    let mut succeeded_tasks = BTreeSet::<(RunId, TaskId, akzio_domain::AttemptId)>::new();
 
     for row in rows {
         let (cursor, event_run_id, task_id, attempt_id, event_type, artifact_id) = row?;
@@ -6764,20 +6768,40 @@ fn validate_tool_lifecycle_events(
                 "tool event at cursor {cursor} has no attempt"
             )));
         };
-        let Some(artifact_id) = artifact_id else {
-            return Err(StoreError::Integrity(format!(
-                "tool event at cursor {cursor} has no artifact"
-            )));
-        };
-        let event_key = (
-            event_run_id.clone(),
-            task_id.clone(),
-            attempt_id.clone(),
-            artifact_id.clone(),
-        );
-
+        let task_key = (event_run_id.clone(), task_id.clone(), attempt_id.clone());
         match event_type {
+            LifecycleEventType::TaskSucceeded => {
+                if pending_by_task
+                    .get(&task_key)
+                    .is_some_and(|pending| !pending.is_empty())
+                {
+                    return Err(StoreError::Integrity(format!(
+                        "task.succeeded cursor {cursor} has pending tool calls"
+                    )));
+                }
+                if !succeeded_tasks.insert(task_key) {
+                    return Err(StoreError::Integrity(format!(
+                        "task.succeeded cursor {cursor} repeats task terminal"
+                    )));
+                }
+            }
             LifecycleEventType::ToolCalled => {
+                let Some(artifact_id) = artifact_id else {
+                    return Err(StoreError::Integrity(format!(
+                        "tool event at cursor {cursor} has no artifact"
+                    )));
+                };
+                if succeeded_tasks.contains(&task_key) {
+                    return Err(StoreError::Integrity(format!(
+                        "tool.called cursor {cursor} occurs after task.succeeded"
+                    )));
+                }
+                let event_key = (
+                    event_run_id.clone(),
+                    task_id.clone(),
+                    attempt_id.clone(),
+                    artifact_id.clone(),
+                );
                 let artifact = read_artifact(connection, &artifact_id)?;
                 if artifact.kind != ArtifactKind::ToolCall {
                     return Err(StoreError::Integrity(format!(
@@ -6802,8 +6826,23 @@ fn validate_tool_lifecycle_events(
                         artifact_id.0
                     )));
                 }
+                pending_by_task
+                    .entry(task_key.clone())
+                    .or_default()
+                    .insert(artifact_id.clone());
             }
             LifecycleEventType::ToolCompleted | LifecycleEventType::ToolFailed => {
+                let Some(artifact_id) = artifact_id else {
+                    return Err(StoreError::Integrity(format!(
+                        "tool event at cursor {cursor} has no artifact"
+                    )));
+                };
+                if succeeded_tasks.contains(&task_key) {
+                    return Err(StoreError::Integrity(format!(
+                        "{} cursor {cursor} occurs after task.succeeded",
+                        event_type.as_str()
+                    )));
+                }
                 let artifact = read_artifact(connection, &artifact_id)?;
                 if artifact.kind != ArtifactKind::ToolResult {
                     return Err(StoreError::Integrity(format!(
@@ -6847,11 +6886,26 @@ fn validate_tool_lifecycle_events(
                         event_type.as_str()
                     )));
                 }
-                let terminal_key = (event_run_id, task_id, attempt_id, call_artifact_id);
+                let terminal_key = (event_run_id, task_id, attempt_id, call_artifact_id.clone());
                 if !terminal_by_call.insert(terminal_key) {
                     return Err(StoreError::Integrity(format!(
                         "tool call already has a terminal event at cursor {cursor}"
                     )));
+                }
+                let Some(pending) = pending_by_task.get_mut(&task_key) else {
+                    return Err(StoreError::Integrity(format!(
+                        "{} cursor {cursor} has no pending tool call",
+                        event_type.as_str()
+                    )));
+                };
+                if !pending.remove(&call_artifact_id) {
+                    return Err(StoreError::Integrity(format!(
+                        "{} cursor {cursor} repeats or misses pending tool call",
+                        event_type.as_str()
+                    )));
+                }
+                if pending.is_empty() {
+                    pending_by_task.remove(&task_key);
                 }
             }
             _ => unreachable!("tool lifecycle query emits fixed event types"),
@@ -13419,21 +13473,11 @@ mod tests {
 
         assert!(!fixture
             .store
-            .record_paper_effect_intent(
-                &fixture.lease,
-                &fixture.permit,
-                &effect,
-                fixture.now,
-            )
+            .record_paper_effect_intent(&fixture.lease, &fixture.permit, &effect, fixture.now,)
             .unwrap());
         assert!(fixture
             .store
-            .record_paper_effect_intent(
-                &fixture.lease,
-                &fixture.permit,
-                &effect,
-                fixture.now,
-            )
+            .record_paper_effect_intent(&fixture.lease, &fixture.permit, &effect, fixture.now,)
             .unwrap());
 
         let intent_count = fixture
@@ -13464,12 +13508,7 @@ mod tests {
             .unwrap();
         fixture
             .store
-            .record_paper_effect_intent(
-                &fixture.lease,
-                &fixture.permit,
-                &effect,
-                fixture.now,
-            )
+            .record_paper_effect_intent(&fixture.lease, &fixture.permit, &effect, fixture.now)
             .unwrap();
         fixture
             .store
@@ -13589,8 +13628,7 @@ mod tests {
                 false,
                 fixture.now,
             ),
-            Err(StoreError::StalePermit(_))
-                | Err(StoreError::PaperEffectAlreadySettled(_))
+            Err(StoreError::StalePermit(_)) | Err(StoreError::PaperEffectAlreadySettled(_))
         ));
         fixture.store.verify_integrity().unwrap();
     }
