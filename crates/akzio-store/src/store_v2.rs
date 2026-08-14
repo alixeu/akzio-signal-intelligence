@@ -26,7 +26,9 @@ use akzio_domain::{
     WorkflowProposal, WorkflowStatus, V2_DOMAIN_SCHEMA_VERSION, V2_SCHEMA_VERSION,
 };
 use chrono::{DateTime, Duration, Utc};
-use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{
+    params, Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
+};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use thiserror::Error;
 
@@ -151,6 +153,8 @@ pub enum StoreError {
     BackupInsideStoreRoot(PathBuf),
     #[error("invalid backup source: {0}")]
     InvalidBackup(PathBuf),
+    #[error("raw model export is only allowed for Debug runs, got {0:?}")]
+    RawModelExportNotAllowed(RunPurpose),
 }
 
 pub type StoreResult<T> = Result<T, StoreError>;
@@ -183,7 +187,7 @@ pub struct StoredContract {
     pub activated_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StoredRun {
     pub run_id: RunId,
     pub purpose: RunPurpose,
@@ -192,13 +196,13 @@ pub struct StoredRun {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StoredTask {
     pub run_id: RunId,
     pub node: WorkflowNode,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct WorkflowCommit {
     pub run: StoredRun,
     pub graph: Artifact,
@@ -218,7 +222,7 @@ pub struct WorkflowPatchCommit {
     pub completed_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct WorkflowRevision {
     pub revision: u64,
     pub graph_artifact: Artifact,
@@ -226,15 +230,16 @@ pub struct WorkflowRevision {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StoredActiveAttempt {
+    #[serde(skip)]
     pub permit: TaskWritePermit,
     pub worker_id: String,
     pub lease_until: DateTime<Utc>,
     pub started_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StoredTaskSnapshot {
     pub node: WorkflowNode,
     pub status: TaskStatus,
@@ -244,7 +249,7 @@ pub struct StoredTaskSnapshot {
     pub finished_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct WorkflowSnapshot {
     pub run: StoredRun,
     pub status: WorkflowStatus,
@@ -285,7 +290,7 @@ pub enum RetryTaskResult {
     Terminal(TaskStatus),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StoredEvent {
     pub cursor: i64,
     pub run_id: RunId,
@@ -294,6 +299,24 @@ pub struct StoredEvent {
     pub event_type: String,
     pub artifact_id: Option<ArtifactId>,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RunExportArtifact {
+    pub artifact: Artifact,
+    pub payload_file: Option<String>,
+    pub raw_model: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RunExportManifest {
+    pub schema_version: u32,
+    pub exported_at: DateTime<Utc>,
+    pub include_raw_model: bool,
+    pub workflow: WorkflowSnapshot,
+    pub events: Vec<StoredEvent>,
+    pub trajectory: Vec<TrajectoryEntry>,
+    pub artifacts: Vec<RunExportArtifact>,
 }
 
 /// Read-only, redacted projection of one durable agent trajectory fact.
@@ -686,10 +709,13 @@ impl V2Store {
             path: root.join("blobs"),
             source,
         })?;
+        secure_directory(&root)?;
+        secure_directory(&root.join("blobs"))?;
         let database = root.join(DATABASE_FILE);
         let mut connection = Connection::open(&database)?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         initialize(&mut connection, &root)?;
+        secure_file(&database)?;
         Ok(Self {
             blobs: Arc::new(root.join("blobs")),
             root: Arc::new(root),
@@ -697,8 +723,171 @@ impl V2Store {
         })
     }
 
+    /// Open an already initialized Store Root without creating directories or
+    /// mutating the SQLite schema. Read-only CLI commands must use this seam.
+    pub fn open_existing(root: impl AsRef<Path>) -> StoreResult<Self> {
+        let root = root.as_ref().to_path_buf();
+        let database = root.join(DATABASE_FILE);
+        let blobs = root.join("blobs");
+        if root.join(INCOMPATIBLE_DATABASE_FILE).exists() && !database.exists() {
+            return Err(StoreError::IncompatibleStoreRoot(root));
+        }
+        if !root.is_dir() {
+            return Err(StoreError::Io {
+                path: root,
+                source: std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "Store Root directory does not exist",
+                ),
+            });
+        }
+        if !database.is_file() || !blobs.is_dir() {
+            return Err(StoreError::IncompatibleStoreRoot(root));
+        }
+
+        let connection = Connection::open_with_flags(&database, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let version = connection
+            .query_row(
+                "SELECT value FROM rebuild_metadata WHERE key = 'schema_version'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let expected_version = V2_SCHEMA_VERSION.to_string();
+        if version.as_deref() != Some(expected_version.as_str()) {
+            return Err(StoreError::IncompatibleStoreRoot(root));
+        }
+
+        Ok(Self {
+            blobs: Arc::new(blobs),
+            root: Arc::new(root),
+            connection: Arc::new(Mutex::new(connection)),
+        })
+    }
+
     pub fn root(&self) -> &Path {
         self.root.as_ref()
+    }
+
+    /// Export one run's durable workflow, events, redacted trajectory and
+    /// artifact closure into a new directory. Provider/tool payloads are
+    /// omitted by default; raw model artifacts require an explicit Debug-only
+    /// opt-in.
+    pub fn export_run(
+        &self,
+        run_id: &RunId,
+        target: impl AsRef<Path>,
+        include_raw_model: bool,
+    ) -> StoreResult<RunExportManifest> {
+        self.verify_integrity()?;
+        let workflow = self.workflow_snapshot(run_id)?;
+        if include_raw_model && workflow.run.purpose != RunPurpose::Debug {
+            return Err(StoreError::RawModelExportNotAllowed(workflow.run.purpose));
+        }
+        let target = target.as_ref().to_path_buf();
+        if target.starts_with(self.root()) {
+            return Err(StoreError::BackupInsideStoreRoot(target));
+        }
+        if target.exists() {
+            return Err(StoreError::BackupTargetExists(target));
+        }
+
+        let events = self.read_all_events(run_id)?;
+        let trajectory = self.trajectory(run_id)?;
+        let mut pending = BTreeSet::new();
+        pending.insert(workflow.run.graph_artifact_id.clone());
+        for task in &workflow.tasks {
+            pending.extend(
+                task.node
+                    .input_artifacts
+                    .iter()
+                    .map(|reference| reference.artifact_id.clone()),
+            );
+        }
+        pending.extend(events.iter().filter_map(|event| event.artifact_id.clone()));
+
+        let connection = self.connection.lock().expect("store connection poisoned");
+        let mut visited = BTreeSet::new();
+        let mut artifacts = Vec::new();
+        let mut payloads = Vec::new();
+        while let Some(artifact_id) = pending.pop_first() {
+            if !visited.insert(artifact_id.clone()) {
+                continue;
+            }
+            let artifact = read_artifact(&connection, &artifact_id)?;
+            pending.extend(
+                artifact
+                    .source_refs
+                    .iter()
+                    .map(|reference| reference.artifact_id.clone()),
+            );
+            let raw_model = is_trajectory_redacted_kind(artifact.kind);
+            let payload_file = if !raw_model || include_raw_model {
+                let relative =
+                    PathBuf::from("artifacts").join(format!("{}.bin", artifact.artifact_id));
+                payloads.push((relative.clone(), self.read_blob(&artifact.blob)?));
+                Some(relative.to_string_lossy().into_owned())
+            } else {
+                None
+            };
+            artifacts.push(RunExportArtifact {
+                artifact,
+                payload_file,
+                raw_model,
+            });
+        }
+        drop(connection);
+
+        artifacts.sort_by(|left, right| left.artifact.artifact_id.cmp(&right.artifact.artifact_id));
+        fs::create_dir_all(target.join("artifacts")).map_err(|source| StoreError::Io {
+            path: target.join("artifacts"),
+            source,
+        })?;
+        for (relative, bytes) in &payloads {
+            let path = target.join(relative);
+            fs::write(&path, bytes).map_err(|source| StoreError::Io {
+                path: path.clone(),
+                source,
+            })?;
+            sync_file(&path)?;
+            secure_file(&path)?;
+        }
+
+        let manifest = RunExportManifest {
+            schema_version: V2_SCHEMA_VERSION,
+            exported_at: Utc::now(),
+            include_raw_model,
+            workflow,
+            events,
+            trajectory,
+            artifacts,
+        };
+        let manifest_path = target.join("manifest.json");
+        let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
+        fs::write(&manifest_path, manifest_bytes).map_err(|source| StoreError::Io {
+            path: manifest_path.clone(),
+            source,
+        })?;
+        sync_file(&manifest_path)?;
+        Ok(manifest)
+    }
+
+    fn read_all_events(&self, run_id: &RunId) -> StoreResult<Vec<StoredEvent>> {
+        const PAGE_SIZE: usize = 256;
+        let mut after = 0_i64;
+        let mut events = Vec::new();
+        loop {
+            let page = self.events_after(run_id, after, PAGE_SIZE)?;
+            if page.is_empty() {
+                break;
+            }
+            after = page.last().expect("non-empty event page").cursor;
+            events.extend(page);
+            if events.len() < PAGE_SIZE {
+                break;
+            }
+        }
+        Ok(events)
     }
 
     /// Create a consistent SQLite snapshot plus immutable CAS blobs.
@@ -6945,6 +7134,46 @@ fn sync_file(path: &Path) -> StoreResult<()> {
         path: path.to_path_buf(),
         source,
     })?;
+    Ok(())
+}
+
+fn secure_directory(path: &Path) -> StoreResult<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = fs::metadata(path)
+            .map_err(|source| StoreError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?
+            .permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(path, permissions).map_err(|source| StoreError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    }
+    Ok(())
+}
+
+fn secure_file(path: &Path) -> StoreResult<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = fs::metadata(path)
+            .map_err(|source| StoreError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?
+            .permissions();
+        permissions.set_mode(0o600);
+        fs::set_permissions(path, permissions).map_err(|source| StoreError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    }
     Ok(())
 }
 
@@ -15220,6 +15449,65 @@ mod tests {
         let restored_blob = restored.read_blob(&blob).unwrap();
         assert_eq!(restored_blob, b"backup-fixture");
         restored.verify_integrity().unwrap();
+    }
+
+    #[test]
+    fn open_existing_does_not_create_a_missing_store_root() {
+        let parent = tempdir().unwrap();
+        let root = parent.path().join("missing");
+        assert!(matches!(
+            V2Store::open_existing(&root),
+            Err(StoreError::Io { .. })
+        ));
+        assert!(!root.exists());
+
+        let initialized = parent.path().join("initialized");
+        V2Store::open(&initialized).unwrap();
+        let existing = V2Store::open_existing(&initialized).unwrap();
+        assert!(existing.metrics(Utc::now()).unwrap().run_counts.is_empty());
+    }
+
+    #[test]
+    fn export_run_writes_manifest_and_non_model_payloads() {
+        let fixture = task_artifact_fixture(RunPurpose::Debug);
+        let export_parent = tempdir().unwrap();
+        let target = export_parent.path().join("run-export");
+
+        let manifest = fixture
+            .store
+            .export_run(&fixture.run.run_id, &target, false)
+            .unwrap();
+
+        assert_eq!(manifest.workflow.run.run_id, fixture.run.run_id);
+        assert!(!manifest.include_raw_model);
+        assert!(target.join("manifest.json").is_file());
+        assert!(manifest
+            .artifacts
+            .iter()
+            .any(|entry| entry.payload_file.is_some()));
+
+        let existing = export_parent.path().join("existing");
+        std::fs::create_dir(&existing).unwrap();
+        assert!(matches!(
+            fixture
+                .store
+                .export_run(&fixture.run.run_id, &existing, false),
+            Err(StoreError::BackupTargetExists(_))
+        ));
+    }
+
+    #[test]
+    fn export_run_rejects_raw_model_payloads_for_non_debug_runs() {
+        let fixture = task_artifact_fixture(RunPurpose::PaperDryRun);
+        let export_parent = tempdir().unwrap();
+        let target = export_parent.path().join("run-export");
+
+        assert!(matches!(
+            fixture.store.export_run(&fixture.run.run_id, &target, true),
+            Err(StoreError::RawModelExportNotAllowed(
+                RunPurpose::PaperDryRun
+            ))
+        ));
     }
 
     fn task_artifact_fixture_with_retry(

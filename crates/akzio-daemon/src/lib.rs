@@ -57,7 +57,7 @@ use akzio_runtime::{
     WorkflowRuntime,
 };
 use akzio_store::v2::{
-    ClaimedAttempt, DaemonLease, StoreAlert, StoreError, StoreMetrics, StoredEvent,
+    AlertSeverity, ClaimedAttempt, DaemonLease, StoreAlert, StoreError, StoreMetrics, StoredEvent,
     TrajectoryEntry, V2Store,
 };
 use async_stream::stream;
@@ -611,9 +611,31 @@ impl Daemon {
         })
     }
 
+    /// Readiness is stricter than liveness: critical durable alerts and an
+    /// unconfigured Paper broker keep the daemon out of service.
+    pub fn ready(&self) -> Result<DaemonHealth> {
+        let health = self.health()?;
+        if health
+            .alerts
+            .iter()
+            .any(|alert| matches!(alert.severity, AlertSeverity::Critical))
+        {
+            return Err(DaemonError::Unavailable(
+                "daemon has critical store alerts".to_owned(),
+            ));
+        }
+        if self.auto_paper && self.paper_broker.is_none() {
+            return Err(DaemonError::Unavailable(
+                "Paper broker is not injected".to_owned(),
+            ));
+        }
+        Ok(health)
+    }
+
     pub fn router(&self) -> Router {
         Router::new()
             .route("/health", get(http_health))
+            .route("/ready", get(http_ready))
             .route("/runs/{run_id}/events", get(http_events))
             .route("/runs/{run_id}/trajectory", get(http_trajectory))
             .route("/runs/{run_id}/retrospectives", get(http_retrospectives))
@@ -703,9 +725,14 @@ impl Daemon {
                     Ok(TaskCompletion::Succeeded(vec![output]))
                 }
             }
-            RuntimeTaskClass::Evidence => Ok(TaskCompletion::Succeeded(
-                self.acquire_evidence(task, now).await?,
-            )),
+            RuntimeTaskClass::Evidence => {
+                let artifacts = self.acquire_evidence(task, now).await?;
+                Ok(if artifacts.is_empty() {
+                    TaskCompletion::NoOutput
+                } else {
+                    TaskCompletion::Succeeded(artifacts)
+                })
+            }
             RuntimeTaskClass::DecisionGate => self.execute_decision_gate(task, now),
             RuntimeTaskClass::ExecutionGate => self.execute_execution_gate(task, now),
             RuntimeTaskClass::PaperCommit => self.execute_paper_commit(task, now),
@@ -1531,6 +1558,17 @@ impl Daemon {
         task: &ClaimedAttempt,
         now: DateTime<Utc>,
     ) -> Result<Vec<akzio_domain::Artifact>> {
+        if task.node.input_artifacts.is_empty() {
+            return match self.store.run_purpose(&task.run_id)? {
+                RunPurpose::Debug | RunPurpose::PaperDryRun => Ok(Vec::new()),
+                RunPurpose::Paper => Err(DaemonError::InvalidInput(
+                    "Paper evidence gate requires at least one EvidenceNeed".to_owned(),
+                )),
+                purpose => Err(DaemonError::InvalidInput(format!(
+                    "unsupported empty evidence gate for {purpose:?} run"
+                ))),
+            };
+        }
         let mut artifacts = BTreeMap::new();
         for need_reference in &task.node.input_artifacts {
             if need_reference.kind != ArtifactKind::EvidenceNeed {
@@ -1876,6 +1914,17 @@ async fn http_health(
         .health()
         .map(Json)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn http_ready(
+    State(daemon): State<Arc<Daemon>>,
+    headers: HeaderMap,
+) -> std::result::Result<Json<DaemonHealth>, StatusCode> {
+    authorize(&daemon, &headers)?;
+    daemon.ready().map(Json).map_err(|error| match error {
+        DaemonError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    })
 }
 
 async fn http_events(
@@ -2535,6 +2584,60 @@ mod tests {
             .iter()
             .any(|event| event.event_type == "task.succeeded"));
         daemon.store().verify_integrity().unwrap();
+    }
+
+    #[tokio::test]
+    async fn planner_accepts_a_real_debug_shape_with_one_analyst_task() {
+        let directory = tempdir().unwrap();
+        let planner = serde_json::json!({
+            "schema_version": akzio_domain::V2_DOMAIN_SCHEMA_VERSION,
+        "topology_id": "active",
+            "tasks": {
+                "research_analyst": {
+                    "depends_on": [],
+                    "evidence_needs": [],
+                    "objective": "Identify bounded evidence needs.",
+                    "priority": 1,
+                    "recipe_id": "research.analyst",
+                    "research_intents": [],
+                },
+            },
+            "stop_reason": "proposal_complete",
+        });
+        let model = ModelClient::FixtureBySchema(BTreeMap::from([(
+            "research.planner".to_owned(),
+            response(planner),
+        )]));
+        let daemon = Daemon::with_model(config(directory.path().to_path_buf()), model).unwrap();
+        let run_id = daemon.submit_default(RunPurpose::Debug).unwrap();
+        let task = daemon
+            .store()
+            .claim_next_task("fixture", Utc::now(), ChronoDuration::seconds(30))
+            .unwrap()
+            .expect("planner task");
+        let result = daemon.execute_task_inner(&task, Utc::now()).await;
+        println!("planner result: {result:?}");
+        assert!(result.is_ok(), "planner result: {result:?}");
+        daemon.store().workflow_snapshot(&run_id).unwrap();
+    }
+
+    #[tokio::test]
+    async fn evidence_gate_without_needs_is_a_debug_noop() {
+        let directory = tempdir().unwrap();
+        let daemon = Daemon::with_model(
+            config(directory.path().to_path_buf()),
+            fixture_model_client(),
+        )
+        .unwrap();
+        daemon.submit_default(RunPurpose::Debug).unwrap();
+        assert!(daemon.run_one("fixture").await.unwrap());
+        let task = daemon
+            .store()
+            .claim_next_task("fixture", Utc::now(), ChronoDuration::seconds(30))
+            .unwrap()
+            .expect("evidence gate task");
+        let artifacts = daemon.acquire_evidence(&task, Utc::now()).await.unwrap();
+        assert!(artifacts.is_empty());
     }
 
     #[tokio::test]
@@ -3492,6 +3595,53 @@ mod tests {
                 .await,
             Err(DaemonError::InvalidInput(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn readiness_requires_auth_and_injected_paper_broker() {
+        let directory = tempdir().unwrap();
+        let mut daemon_config = config(directory.path().to_path_buf());
+        daemon_config.auto_paper = true;
+        let daemon = Daemon::with_model(daemon_config, fixture_model_client()).unwrap();
+
+        let unauthorized = daemon
+            .router()
+            .oneshot(
+                Request::builder()
+                    .uri("/ready")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let not_ready = daemon
+            .router()
+            .oneshot(
+                Request::builder()
+                    .uri("/ready")
+                    .header("x-akzio-token", "fixture-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(not_ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let daemon = daemon.with_paper_broker(Arc::new(FakePaperBroker::default()));
+        let ready = daemon
+            .router()
+            .oneshot(
+                Request::builder()
+                    .uri("/ready")
+                    .header("x-akzio-token", "fixture-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ready.status(), StatusCode::OK);
     }
 
     #[tokio::test]

@@ -451,6 +451,75 @@ impl ResponsesClient {
     }
 }
 
+fn provider_schema_name(name: &str) -> String {
+    let name = name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '_' | '-') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if name.is_empty() {
+        "akzio_output".to_owned()
+    } else {
+        name
+    }
+}
+
+fn provider_schema(value: &Value) -> Value {
+    match value {
+        Value::Object(object) => {
+            let properties = object.get("properties").and_then(Value::as_object);
+            let mut sanitized = serde_json::Map::new();
+            for (key, value) in object {
+                if matches!(
+                    key.as_str(),
+                    "minLength"
+                        | "maxLength"
+                        | "pattern"
+                        | "format"
+                        | "minimum"
+                        | "maximum"
+                        | "exclusiveMinimum"
+                        | "exclusiveMaximum"
+                        | "multipleOf"
+                        | "minItems"
+                        | "maxItems"
+                        | "uniqueItems"
+                        | "minProperties"
+                        | "maxProperties"
+                        | "patternProperties"
+                ) || (properties.is_some() && key == "required")
+                {
+                    continue;
+                }
+                if key == "properties" {
+                    let sanitized_properties = properties
+                        .expect("object properties were checked above")
+                        .iter()
+                        .map(|(name, schema)| (name.clone(), provider_schema(schema)))
+                        .collect();
+                    sanitized.insert(key.clone(), Value::Object(sanitized_properties));
+                } else {
+                    sanitized.insert(key.clone(), provider_schema(value));
+                }
+            }
+            if let Some(properties) = properties {
+                sanitized.insert(
+                    "required".to_owned(),
+                    Value::Array(properties.keys().cloned().map(Value::String).collect()),
+                );
+            }
+            Value::Object(sanitized)
+        }
+        Value::Array(values) => values.iter().map(provider_schema).collect(),
+        value => value.clone(),
+    }
+}
+
 fn responses_request_body(model: &str, reasoning_effort: &str, request: &ModelRequest) -> Value {
     let mut body = json!({
         "model": model,
@@ -464,8 +533,8 @@ fn responses_request_body(model: &str, reasoning_effort: &str, request: &ModelRe
         body["text"] = json!({
             "format": {
                 "type": "json_schema",
-                "name": name,
-                "schema": schema,
+                "name": provider_schema_name(name),
+                "schema": provider_schema(schema),
                 "strict": true,
             }
         });
@@ -483,7 +552,7 @@ fn responses_request_body(model: &str, reasoning_effort: &str, request: &ModelRe
                             "type": "function",
                             "name": tool.name,
                             "description": tool.description,
-                            "parameters": tool.input_schema,
+                            "parameters": provider_schema(&tool.input_schema),
                             "strict": tool.strict,
                         })
                     }
@@ -761,6 +830,39 @@ mod tests {
         assert_eq!(body["text"]["format"]["strict"], true);
         assert_eq!(body["tools"][0]["strict"], true);
         assert_eq!(body["reasoning"]["effort"], "high");
+    }
+
+    #[test]
+    fn response_request_body_drops_provider_unsupported_object_bounds() {
+        let mut request = request();
+        request.schema = Some(json!({
+            "type": "object",
+            "properties": {
+                "tasks": {
+                    "type": "object",
+                    "minProperties": 1,
+                    "maxProperties": 4,
+                    "properties": {
+                        "assets": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": 4,
+                            "uniqueItems": true,
+                        },
+                    },
+                    "patternProperties": {},
+                },
+            },
+        }));
+
+        let body = responses_request_body("fixture", "high", &request);
+        let tasks = &body["text"]["format"]["schema"]["properties"]["tasks"];
+        assert!(tasks.get("minProperties").is_none());
+        assert!(tasks.get("maxProperties").is_none());
+        assert!(tasks.get("patternProperties").is_none());
+        assert!(tasks["properties"]["assets"].get("minItems").is_none());
+        assert!(tasks["properties"]["assets"].get("maxItems").is_none());
+        assert!(tasks["properties"]["assets"].get("uniqueItems").is_none());
     }
 
     #[test]

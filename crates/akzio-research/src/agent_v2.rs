@@ -799,11 +799,7 @@ fn planner_draft_output_schema() -> Value {
                 "type": "integer",
                 "enum": [V2_SCHEMA_VERSION]
             },
-            "topology_id": {
-                "type": "string",
-                "minLength": 1,
-                "maxLength": 128
-            },
+            "topology_id": {"type": "string", "enum": ["active"]},
             "tasks": {
                 "type": "object",
                 "properties": {},
@@ -1490,7 +1486,11 @@ impl AgentRuntime {
         let prompt = format!("{governance}\n\n{role}");
         let output_schema: Value =
             serde_json::from_slice(&self.store.read_blob(&installed.contract.output.schema)?)?;
-        let tools = model_tool_definitions(&self.store, &installed.contract)?;
+        let tools = if context.is_empty() {
+            Vec::new()
+        } else {
+            model_tool_definitions(&self.store, &installed.contract)?
+        };
         let mut tool_results = Vec::new();
         let mut trace_refs = Vec::new();
         let mut tool_calls = 0_u16;
@@ -3796,6 +3796,7 @@ mod tests {
         );
         let trace = response.model_debug.expect("debug trace is retained");
         assert_eq!(trace.request["model"], "fixture");
+        assert_eq!(trace.request["text"]["format"]["name"], "research_analyst");
         assert_eq!(trace.request["tools"][0]["strict"], true);
         assert_eq!(trace.result["tool_calls"][0]["call_id"], "fixture-tool");
     }

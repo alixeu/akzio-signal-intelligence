@@ -5,7 +5,7 @@ use akzio_daemon::{
     PaperWorkflowSource, ReplayReport, RetrospectiveView, RunCancellationResponse,
     RunRetryResponse, RunSubmissionResponse, SchedulerError, StorePaperWorkflowSource,
 };
-use akzio_domain::{ArtifactKind, Asset, Retrospective, RunPurpose, WorkflowStatus};
+use akzio_domain::{ArtifactKind, Asset, Retrospective, RunId, RunPurpose, WorkflowStatus};
 use akzio_execution::paper::AlpacaPaper;
 use akzio_learning::{
     evaluate_frozen_evidence, FrozenEvidenceRecord, FrozenEvidenceSet, OutcomeCostModel,
@@ -53,6 +53,7 @@ enum Command {
 enum DaemonAction {
     Serve,
     Health,
+    Ready,
     Freeze { reason: String },
     Unfreeze { reason: String },
 }
@@ -105,8 +106,19 @@ enum StoreCommand {
     Doctor,
     Metrics,
     Alerts,
-    Backup { target: PathBuf },
-    Restore { source: PathBuf, target: PathBuf },
+    Backup {
+        target: PathBuf,
+    },
+    Restore {
+        source: PathBuf,
+        target: PathBuf,
+    },
+    ExportRun {
+        run_id: String,
+        target: PathBuf,
+        #[arg(long)]
+        include_raw_model: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -229,6 +241,11 @@ impl ControlApiClient {
             .await
     }
 
+    async fn ready(&self) -> Result<DaemonHealth> {
+        self.json(self.request(Method::GET, self.endpoint(&["ready"])))
+            .await
+    }
+
     async fn submit(&self, purpose: RunPurpose) -> Result<RunSubmissionResponse> {
         self.json(
             self.request(Method::POST, self.endpoint(&["runs"]))
@@ -338,6 +355,9 @@ async fn main() -> Result<()> {
             command: DaemonAction::Health,
         } => print_json(&ControlApiClient::from_config(&config)?.health().await?),
         Command::Daemon {
+            command: DaemonAction::Ready,
+        } => print_json(&ControlApiClient::from_config(&config)?.ready().await?),
+        Command::Daemon {
             command: DaemonAction::Freeze { reason },
         } => print_json(
             &ControlApiClient::from_config(&config)?
@@ -410,22 +430,36 @@ async fn main() -> Result<()> {
         Command::Store {
             command: StoreCommand::Doctor,
         } => {
-            V2Store::open(&config.daemon.store_root)?.verify_integrity()?;
+            V2Store::open_existing(&config.daemon.store_root)?.verify_integrity()?;
             println!("{{\"ok\":true}}");
             Ok(())
         }
         Command::Store {
             command: StoreCommand::Metrics,
-        } => print_json(&V2Store::open(&config.daemon.store_root)?.metrics(Utc::now())?),
+        } => print_json(&V2Store::open_existing(&config.daemon.store_root)?.metrics(Utc::now())?),
         Command::Store {
             command: StoreCommand::Alerts,
         } => {
-            let metrics = V2Store::open(&config.daemon.store_root)?.metrics(Utc::now())?;
+            let metrics = V2Store::open_existing(&config.daemon.store_root)?.metrics(Utc::now())?;
             print_json(&metrics.alerts())
         }
         Command::Store {
             command: StoreCommand::Backup { target },
-        } => print_json(&V2Store::open(&config.daemon.store_root)?.backup_to(target)?),
+        } => print_json(&V2Store::open_existing(&config.daemon.store_root)?.backup_to(target)?),
+        Command::Store {
+            command:
+                StoreCommand::ExportRun {
+                    run_id,
+                    target,
+                    include_raw_model,
+                },
+        } => print_json(
+            &V2Store::open_existing(&config.daemon.store_root)?.export_run(
+                &RunId(run_id),
+                target,
+                include_raw_model,
+            )?,
+        ),
         Command::Store {
             command: StoreCommand::Restore { source, target },
         } => {
@@ -519,10 +553,24 @@ async fn serve(config: Config) -> Result<()> {
     )?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
+        if let Err(error) = wait_for_shutdown_signal().await {
+            eprintln!("daemon shutdown signal handler failed: {error}");
+        }
         let _ = shutdown_tx.send(true);
     });
-    let http_daemon = Arc::new(daemon.clone());
+    let paper = if auto_paper {
+        Some(AlpacaPaper::from_env().context("construct Alpaca Paper client")?)
+    } else {
+        None
+    };
+    let clock = paper
+        .as_ref()
+        .map(|paper| AlpacaPaperSessionClock::new(paper.clone()));
+    let daemon = match paper {
+        Some(paper) => Arc::new(daemon.with_paper_broker(Arc::new(paper))),
+        None => Arc::new(daemon),
+    };
+    let http_daemon = daemon.clone();
     if auto_paper {
         let source = StorePaperWorkflowSource::new(daemon.store().clone());
         if let Err(error) = source.proposal("preflight") {
@@ -531,17 +579,13 @@ async fn serve(config: Config) -> Result<()> {
                     .context("load durable Paper workflow proposal");
             }
         }
-        let paper = AlpacaPaper::from_env().context("construct Alpaca Paper client")?;
-        let clock = AlpacaPaperSessionClock::new(paper.clone());
-        let scheduler_daemon = Arc::new(daemon.with_paper_broker(Arc::new(paper)));
+        let clock = clock
+            .as_ref()
+            .context("Paper scheduler clock was not initialized")?;
         tokio::try_join!(
             http_daemon.serve_http(config.daemon.http_addr, shutdown_rx.clone()),
-            scheduler_daemon.serve_with_paper_scheduler(
-                &clock,
-                &source,
-                Duration::from_secs(30),
-                shutdown_rx,
-            ),
+            daemon
+                .serve_with_paper_scheduler(clock, &source, Duration::from_secs(30), shutdown_rx,),
         )?;
     } else {
         tokio::try_join!(
@@ -550,6 +594,24 @@ async fn serve(config: Config) -> Result<()> {
         )?;
     }
     Ok(())
+}
+
+async fn wait_for_shutdown_signal() -> Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        let mut terminate = signal(SignalKind::terminate()).context("install SIGTERM handler")?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result.context("wait for Ctrl-C"),
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await.context("wait for Ctrl-C")
+    }
 }
 
 async fn fixture_debug(config: Config) -> Result<()> {
