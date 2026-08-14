@@ -29,7 +29,7 @@ use akzio_domain::{
     DomainError, EvidenceNeed, ExecutionContext, ExecutionVerdict, FreezeState, LifecycleEventType,
     MarketClockSnapshot, MemoryId, MoneyMicros, OutcomeExecutionLineage, OutcomeHorizon,
     OutcomeSchedule, PolicySubject, QuoteSnapshot, ResearchClaim, Retrospective,
-    RetrospectiveStatus, RunId, RunPurpose, RuntimeTaskClass, TaskId, TaskStatus, TopologyId,
+    RetrospectiveDraft, RunId, RunPurpose, RuntimeTaskClass, TaskId, TaskStatus, TopologyId,
     WorkflowProposal, WorkflowStatus,
 };
 use akzio_execution::{
@@ -497,11 +497,11 @@ impl Daemon {
             .map(|artifact| {
                 let payload: Retrospective =
                     serde_json::from_slice(&self.store.read_blob(&artifact.blob)?)?;
-                if payload.status != RetrospectiveStatus::Complete {
-                    return Err(DaemonError::InvalidInput(
-                        "incomplete retrospective crossed query gate".to_owned(),
-                    ));
-                }
+                payload.validate().map_err(|error| {
+                    DaemonError::InvalidInput(format!(
+                        "invalid retrospective crossed query gate: {error}"
+                    ))
+                })?;
                 Ok(RetrospectiveView {
                     artifact_id: artifact.artifact_id,
                     payload,
@@ -913,26 +913,159 @@ impl Daemon {
                 now,
             )?;
         }
+        let mut due_horizons = collected
+            .materialization
+            .observations
+            .iter()
+            .map(|observation| observation.horizon)
+            .collect::<Vec<_>>();
+        due_horizons.sort();
+        due_horizons.dedup();
+        let highest_due = due_horizons
+            .last()
+            .copied()
+            .ok_or_else(|| DaemonError::Unavailable("no due outcome horizon".to_owned()))?;
+        let prior_retrospectives = self
+            .store
+            .retrospectives(&task.run_id)?
+            .into_iter()
+            .map(|artifact| ArtifactRef {
+                artifact_id: artifact.artifact_id,
+                kind: ArtifactKind::Retrospective,
+            })
+            .collect::<Vec<_>>();
+        let market_evidence = collected.materialization.market_evidence.clone();
+        let retrospective_draft = if task.node.contract_hash.is_some() {
+            match self.context_candidates(task) {
+                Ok(mut candidates) => {
+                    candidates.extend(market_evidence.iter().cloned());
+                    candidates.extend(prior_retrospectives.iter().cloned());
+                    candidates.sort();
+                    candidates.dedup();
+                    match self
+                        .agents
+                        .run(&task.permit, &task.node, candidates, &self.model, now)
+                        .await
+                    {
+                        Ok(draft_artifact) => {
+                            let draft_ref = ArtifactRef {
+                                artifact_id: draft_artifact.artifact_id,
+                                kind: draft_artifact.kind,
+                            };
+                            let draft =
+                                self.read_artifact_payload::<RetrospectiveDraft>(&draft_ref)?;
+                            if draft.horizon == highest_due {
+                                Some(draft)
+                            } else {
+                                tracing::warn!(
+                                    run_id = %task.run_id,
+                                    expected = ?highest_due,
+                                    actual = ?draft.horizon,
+                                    "governed retrospective draft horizon did not match due horizon"
+                                );
+                                None
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                run_id = %task.run_id,
+                                error = %error,
+                                "governed retrospective model unavailable; sealing Rust-only diagnostic"
+                            );
+                            None
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        run_id = %task.run_id,
+                        error = %error,
+                        "retrospective context unavailable; sealing Rust-only diagnostic"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let contract_hash = task
             .permit
             .contract_hash
             .clone()
             .unwrap_or_else(|| ContentHash::of_bytes(OUTCOME_WORKER_RECIPE_ID.as_bytes()));
         let evaluation = EvaluationRuntime::new(self.store.clone(), EvaluationPolicy::default())?;
-        evaluation.evaluate_with_lease(
-            Some(&outcome_lease),
-            EvaluationInput {
-                permit: task.permit.clone(),
-                subject: PolicySubject::Memory(MemoryId(format!("paper:{}", task.run_id.0))),
-                hypothesis_id: format!("paper-outcome:{}", schedule.outcome_id.0),
-                materialization: collected.materialization,
-                contract_hash,
-                topology_id: TopologyId("paper-outcome".to_owned()),
-                candidate_policy: None,
-                token_cost: 0,
-                latency_millis: 0,
-            },
-        )?;
+        for horizon in due_horizons
+            .iter()
+            .copied()
+            .filter(|horizon| *horizon != OutcomeHorizon::T5)
+        {
+            if self
+                .store
+                .retrospective_for(&task.run_id, &schedule.outcome_id, horizon)?
+                .is_some()
+            {
+                continue;
+            }
+            let mut partial = collected.materialization.clone();
+            partial
+                .observations
+                .retain(|observation| observation.horizon <= horizon);
+            let prior = if horizon == OutcomeHorizon::T3 {
+                self.store
+                    .retrospective_for(&task.run_id, &schedule.outcome_id, OutcomeHorizon::T1)?
+                    .map(|artifact| {
+                        vec![ArtifactRef {
+                            artifact_id: artifact.artifact_id,
+                            kind: ArtifactKind::Retrospective,
+                        }]
+                    })
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let draft = (horizon == highest_due)
+                .then_some(retrospective_draft.as_ref())
+                .flatten();
+            evaluation.record_partial_retrospective_fenced(
+                &outcome_lease,
+                &task.permit,
+                partial,
+                horizon,
+                draft,
+                &prior,
+                now,
+            )?;
+        }
+        if highest_due != OutcomeHorizon::T5 {
+            return Ok(TaskCompletion::Retry(RetryCause::Timeout));
+        }
+        let input = EvaluationInput {
+            permit: task.permit.clone(),
+            subject: PolicySubject::Memory(MemoryId(format!("paper:{}", task.run_id.0))),
+            hypothesis_id: format!("paper-outcome:{}", schedule.outcome_id.0),
+            materialization: collected.materialization,
+            contract_hash,
+            topology_id: TopologyId("paper-outcome".to_owned()),
+            candidate_policy: None,
+            token_cost: 0,
+            latency_millis: 0,
+        };
+        if let Some(draft) = retrospective_draft.as_ref() {
+            let result = evaluation.evaluate_with_lease_and_retrospective(
+                Some(&outcome_lease),
+                input,
+                draft,
+            )?;
+            let _ = result;
+        } else {
+            let _ = evaluation.seal_outcome_with_rust_retrospective_fenced(
+                &outcome_lease,
+                &task.permit,
+                input.materialization,
+                "governed retrospective model unavailable",
+                now,
+            )?;
+        }
         Ok(TaskCompletion::Committed)
     }
 
@@ -1057,11 +1190,13 @@ impl Daemon {
         }
 
         let common_dates = common_bar_dates(&bars_by_asset, schedule.baseline_trading_day);
-        if common_dates.len() < usize::from(OutcomeHorizon::T5.trading_days()) {
+        if common_dates.is_empty() {
             return Ok(None);
         }
+        let completed_sessions = u8::try_from(common_dates.len()).unwrap_or(u8::MAX);
         let observations = OutcomeHorizon::ALL
             .into_iter()
+            .filter(|horizon| horizon.is_due_after(completed_sessions))
             .map(|horizon| {
                 let index = usize::from(horizon.trading_days()) - 1;
                 let observed_trading_day = common_dates[index];
@@ -1083,7 +1218,7 @@ impl Daemon {
                 )?;
                 Ok(GovernedHorizonObservation {
                     horizon,
-                    completed_trading_sessions: horizon.trading_days(),
+                    completed_trading_sessions: completed_sessions,
                     observed_trading_day,
                     future_prices,
                     expected_evidence_count: Asset::EXECUTABLE.len() as u64,
@@ -2023,8 +2158,9 @@ mod tests {
     use super::*;
     use akzio_domain::{
         ArtifactLifecycle, ArtifactOrigin, ArtifactProvenance, ArtifactRef, Asset, EvidenceNeed,
-        MoneyMicros, Outcome, OutcomeExecutionLineage, OutcomeSchedule, Quote, TaskRecipeId,
-        WorkflowProposal, WorkflowProposalDraft, WorkflowProposalDraftTask, WorkflowProposalTask,
+        MoneyMicros, Outcome, OutcomeExecutionLineage, OutcomeSchedule, Quote, RetrospectiveStatus,
+        TaskRecipeId, WorkflowProposal, WorkflowProposalDraft, WorkflowProposalDraftTask,
+        WorkflowProposalTask,
     };
     use akzio_execution::paper::{
         CommittedPaperBroker, PaperError, PaperExecution, PaperOrderReceipt,
@@ -2837,7 +2973,37 @@ mod tests {
             .store()
             .latest_artifact_by_kind(ArtifactKind::Evaluation)
             .unwrap()
-            .is_some());
+            .is_none());
+        let final_retrospective = daemon
+            .store()
+            .latest_artifact_by_kind(ArtifactKind::Retrospective)
+            .unwrap()
+            .expect("model-unavailable Paper run must retain a final retrospective");
+        let final_retrospective: Retrospective =
+            serde_json::from_slice(&daemon.store().read_blob(&final_retrospective.blob).unwrap())
+                .unwrap();
+        assert_eq!(
+            final_retrospective.status,
+            RetrospectiveStatus::ModelUnavailable
+        );
+        let retrospectives = daemon.store().retrospectives(&run_id).unwrap();
+        let mut horizons = retrospectives
+            .iter()
+            .map(|artifact| {
+                let payload: Retrospective =
+                    serde_json::from_slice(&daemon.store().read_blob(&artifact.blob).unwrap())
+                        .unwrap();
+                (payload.horizon, artifact.lifecycle)
+            })
+            .collect::<Vec<_>>();
+        horizons.sort_by_key(|(horizon, _)| *horizon);
+        assert_eq!(horizons.len(), 3);
+        assert_eq!(horizons[0].0, OutcomeHorizon::T1);
+        assert_eq!(horizons[1].0, OutcomeHorizon::T3);
+        assert_eq!(horizons[2].0, OutcomeHorizon::T5);
+        assert_eq!(horizons[0].1, ArtifactLifecycle::RunScoped);
+        assert_eq!(horizons[1].1, ArtifactLifecycle::RunScoped);
+        assert_eq!(horizons[2].1, ArtifactLifecycle::Canonical);
         assert!(daemon
             .store()
             .events_after(&run_id, 0, 256)

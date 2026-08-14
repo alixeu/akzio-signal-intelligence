@@ -5,7 +5,7 @@ use akzio_daemon::{
     PaperWorkflowSource, ReplayReport, RetrospectiveView, RunCancellationResponse,
     RunRetryResponse, RunSubmissionResponse, SchedulerError, StorePaperWorkflowSource,
 };
-use akzio_domain::{ArtifactKind, Asset, RunPurpose, WorkflowStatus};
+use akzio_domain::{ArtifactKind, Asset, Retrospective, RunPurpose, WorkflowStatus};
 use akzio_execution::paper::AlpacaPaper;
 use akzio_learning::{
     evaluate_frozen_evidence, FrozenEvidenceRecord, FrozenEvidenceSet, OutcomeCostModel,
@@ -854,8 +854,27 @@ async fn diagnostic_test(config: Config, command: TestCommand) -> Result<()> {
             );
         }
         TestCommand::Retrospective => {
-            V2Store::open(&config.daemon.store_root)?.verify_integrity()?;
-            println!("{}", serde_json::json!({"test":"retrospective","ok":true}));
+            let store = V2Store::open(&config.daemon.store_root)?;
+            store.verify_integrity()?;
+            let latest = store.latest_artifact_by_kind(ArtifactKind::Retrospective)?;
+            let latest_horizon = latest
+                .as_ref()
+                .map(|artifact| {
+                    let payload: Retrospective =
+                        serde_json::from_slice(&store.read_blob(&artifact.blob)?)?;
+                    payload.validate()?;
+                    Ok::<_, anyhow::Error>(payload.horizon)
+                })
+                .transpose()?;
+            println!(
+                "{}",
+                serde_json::json!({
+                    "test": "retrospective",
+                    "ok": true,
+                    "latest_horizon": latest_horizon,
+                    "evidence": "offline/store-doctor"
+                })
+            );
         }
     }
     Ok(())

@@ -12,6 +12,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use akzio_domain::AttemptRelationKind;
 use akzio_domain::{
     AgentContract, Artifact, ArtifactId, ArtifactKind, ArtifactLifecycle, ArtifactOrigin,
     ArtifactProvenance, ArtifactRef, Asset, AttemptId, AttemptRelation, BlobRef, CandidatePolicy,
@@ -2721,6 +2722,13 @@ impl V2Store {
             )?,
             contract_hash: node.contract_hash.clone(),
         };
+        let previous_attempt = transaction
+            .query_row(
+                "SELECT attempt_id, status FROM rebuild_attempts WHERE task_id = ?1 ORDER BY started_at DESC, attempt_id DESC LIMIT 1",
+                params![node.task_id.0],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
         let updated = transaction.execute(
             r#"UPDATE rebuild_tasks
                SET status = 'running', lease_id = ?1, lease_epoch = ?2, active_attempt_id = ?3,
@@ -2765,6 +2773,20 @@ impl V2Store {
             None,
             now,
         )?;
+        if let Some((parent_attempt_id, parent_status)) = previous_attempt {
+            let relation = if parent_status == "abandoned" {
+                AttemptRelationKind::Recovery
+            } else {
+                AttemptRelationKind::Retry
+            };
+            self.record_attempt_relation_in_transaction(
+                &transaction,
+                &permit,
+                &AttemptId(parent_attempt_id),
+                relation,
+                now,
+            )?;
+        }
         transaction.commit()?;
         Ok(Some(ClaimedAttempt {
             run_id,
@@ -3041,30 +3063,44 @@ impl V2Store {
             TaskStatus::Succeeded,
         )?;
         let existing_worker = transaction
-            .query_row(
-                r#"SELECT task_id FROM rebuild_tasks
-                   WHERE run_id = ?1 AND recipe_id = ?2
-                     AND input_artifacts_json = ?3"#,
-                params![
-                    permit.run_id.0,
-                    POST_TERMINAL_WORKER_RECIPE_ID,
-                    serde_json::to_string(std::slice::from_ref(&schedule_ref))?,
-                ],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
+            .prepare(
+                "SELECT task_id, input_artifacts_json FROM rebuild_tasks WHERE run_id = ?1 AND recipe_id = ?2",
+            )?
+            .query_map(
+                params![permit.run_id.0, POST_TERMINAL_WORKER_RECIPE_ID],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )?
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .find_map(|(task_id, input_json)| {
+                let inputs = serde_json::from_str::<Vec<ArtifactRef>>(&input_json).ok()?;
+                inputs
+                    .iter()
+                    .any(|reference| reference == &schedule_ref)
+                    .then_some(task_id)
+            });
         if existing_worker.is_some() {
             assert_idempotent_outcome_schedule_commit(&transaction, permit, schedule)?;
             transaction.commit()?;
             return Ok(());
         }
+        let worker_contract_hash = contract_catalogue_head(
+            &transaction,
+            &ContractPurpose::new(POST_TERMINAL_WORKER_RECIPE_ID)?,
+        )?
+        .map(|(hash, _)| hash)
+        .or_else(|| schedule.provenance.producer_contract_hash.clone());
+        let mut worker_inputs = vec![schedule_ref];
+        worker_inputs.extend(schedule.source_refs.clone());
+        worker_inputs.sort();
+        worker_inputs.dedup();
         let worker = WorkflowNode {
             task_id: TaskId::new(),
             recipe_id: TaskRecipeId::new("learning.outcome_worker")?,
-            contract_hash: schedule.provenance.producer_contract_hash.clone(),
+            contract_hash: worker_contract_hash,
             objective: "Seal governed T+1/T+3/T+5 Paper outcome and record evaluation.".to_owned(),
             dependencies: Vec::new(),
-            input_artifacts: vec![schedule_ref],
+            input_artifacts: worker_inputs,
             priority: 100,
             budget: TaskBudget {
                 max_input_tokens: 1_024,
@@ -3365,6 +3401,153 @@ impl V2Store {
         Ok(())
     }
 
+    /// Atomically seals one Paper outcome and its final retrospective while
+    /// leaving no window where a worker can finish with only one of them.
+    pub fn commit_outcome_retrospective_fenced(
+        &self,
+        lease: &DaemonLease,
+        permit: &TaskWritePermit,
+        outcome_artifact: &Artifact,
+        retrospective_artifact: &Artifact,
+        now: DateTime<Utc>,
+    ) -> StoreResult<()> {
+        outcome_artifact.validate()?;
+        retrospective_artifact.validate()?;
+        self.read_blob(&outcome_artifact.blob)?;
+        self.read_blob(&retrospective_artifact.blob)?;
+        if outcome_artifact.kind != ArtifactKind::Outcome
+            || outcome_artifact.lifecycle != ArtifactLifecycle::Canonical
+            || retrospective_artifact.kind != ArtifactKind::Retrospective
+            || retrospective_artifact.lifecycle != ArtifactLifecycle::Canonical
+        {
+            return Err(StoreError::InvalidLearningCommit(
+                "outcome_retrospective.kind_or_lifecycle",
+            ));
+        }
+        let outcome: Outcome = self.read_artifact_payload(outcome_artifact)?;
+        outcome.validate_sealed()?;
+        let retrospective: Retrospective = self.read_artifact_payload(retrospective_artifact)?;
+        retrospective.validate()?;
+        if retrospective.horizon != OutcomeHorizon::T5
+            || retrospective.outcome.artifact_id != outcome_artifact.artifact_id
+            || retrospective.outcome.kind != ArtifactKind::Outcome
+        {
+            return Err(StoreError::InvalidLearningCommit(
+                "outcome_retrospective.links",
+            ));
+        }
+        let mut connection = self.connection.lock().expect("store connection poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        assert_daemon_lease(&transaction, lease, now)?;
+        assert_permit(&transaction, permit)?;
+        for artifact in [outcome_artifact, retrospective_artifact] {
+            match read_artifact(&transaction, &artifact.artifact_id) {
+                Ok(existing) if existing != *artifact => {
+                    return Err(StoreError::Integrity(format!(
+                        "conflicting learning artifact {}",
+                        artifact.artifact_id
+                    )));
+                }
+                Ok(_) => {}
+                Err(StoreError::MissingArtifact(_)) => {
+                    assert_origin_matches(artifact.origin.as_ref(), permit)?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if run_purpose_from_connection(&transaction, &permit.run_id)? != RunPurpose::Paper {
+            return Err(StoreError::NonCanonicalLearningPurpose(
+                run_purpose_from_connection(&transaction, &permit.run_id)?,
+            ));
+        }
+        let schedule = self.read_outcome_schedule_with_connection(
+            &transaction,
+            &outcome,
+            &[RunPurpose::Paper],
+        )?;
+        let expected_sources = std::iter::once(outcome.schedule.clone())
+            .chain(outcome.market_evidence.iter().cloned())
+            .collect::<Vec<_>>();
+        if !has_exact_source_refs(outcome_artifact, &expected_sources) {
+            return Err(StoreError::InvalidLearningCommit(
+                "outcome_retrospective.outcome_source_refs",
+            ));
+        }
+        let outcome_ref = ArtifactRef {
+            artifact_id: outcome_artifact.artifact_id.clone(),
+            kind: ArtifactKind::Outcome,
+        };
+        if !retrospective_artifact.source_refs.contains(&outcome_ref) {
+            return Err(StoreError::InvalidLearningCommit(
+                "outcome_retrospective.source_refs",
+            ));
+        }
+        for source in &retrospective_artifact.source_refs {
+            if source.artifact_id == outcome_artifact.artifact_id {
+                continue;
+            }
+            read_artifact(&transaction, &source.artifact_id)?;
+        }
+        for existing in read_kind_artifacts(&transaction, ArtifactKind::Retrospective)? {
+            let Some(origin) = existing.origin.as_ref() else {
+                continue;
+            };
+            if origin.run_id.as_ref() != Some(&permit.run_id) {
+                continue;
+            }
+            let existing_payload: Retrospective = self.read_artifact_payload(&existing)?;
+            if existing_payload.outcome_id == retrospective.outcome_id
+                && existing_payload.horizon == retrospective.horizon
+                && existing != *retrospective_artifact
+            {
+                return Err(StoreError::Integrity(
+                    "duplicate retrospective identity different payload".to_owned(),
+                ));
+            }
+        }
+        let _ = schedule;
+        for artifact in [outcome_artifact, retrospective_artifact] {
+            let already_exists = read_artifact(&transaction, &artifact.artifact_id).is_ok();
+            if already_exists {
+                continue;
+            }
+            insert_artifact(&transaction, artifact)?;
+            let event_type = if artifact.kind == ArtifactKind::Retrospective {
+                LifecycleEventType::RetrospectiveCreated
+            } else {
+                LifecycleEventType::ArtifactCommitted
+            };
+            let event_id = append_event(
+                &transaction,
+                &permit.run_id,
+                Some(&permit.task_id),
+                Some(&permit.attempt_id),
+                event_type,
+                Some(&artifact.artifact_id),
+                now,
+            )?;
+            // `rebuild_attempt_outputs` is the task-output index used by
+            // replay and Doctor.  A retrospective has its own typed
+            // lifecycle event and is supporting material, not a second task
+            // output.  Recording only the Outcome keeps that index's
+            // artifact.committed invariant intact.
+            if event_type == LifecycleEventType::ArtifactCommitted {
+                record_attempt_output(&transaction, permit, &artifact.artifact_id, event_id)?;
+            }
+        }
+        let (_, on_failure) = task_retry_policy(&transaction, &permit.task_id)?;
+        finish_permitted_task(
+            &transaction,
+            permit,
+            TaskStatus::Succeeded,
+            on_failure,
+            Some(&outcome_artifact.artifact_id),
+            now,
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Records an immutable outcome-backed comparison. Completion is keyed by
     /// the compared decisions/context/candidate/horizon, never by wall-clock
     /// time, so a recovered attempt cannot create a second pair.
@@ -3579,6 +3762,17 @@ impl V2Store {
                 &artifact.artifact_id,
                 event_id,
             )?;
+            if artifact.kind == ArtifactKind::Retrospective {
+                append_event(
+                    &transaction,
+                    &commit.permit.run_id,
+                    Some(&commit.permit.task_id),
+                    Some(&commit.permit.attempt_id),
+                    LifecycleEventType::RetrospectiveCreated,
+                    Some(&artifact.artifact_id),
+                    commit.completed_at,
+                )?;
+            }
         }
 
         let consumed_pair_cursor = commit.pair_snapshot.through_cursor;
@@ -3914,6 +4108,27 @@ impl V2Store {
                 "retrospective.outcome_kind",
             ));
         }
+        let outcome_payload: Outcome = self.read_artifact_payload(&outcome)?;
+        if payload.horizon == OutcomeHorizon::T5 {
+            outcome_payload.validate_sealed()?;
+            if artifact.lifecycle != ArtifactLifecycle::Canonical
+                || outcome.lifecycle != ArtifactLifecycle::Canonical
+            {
+                return Err(StoreError::InvalidLearningCommit(
+                    "retrospective.t5_lifecycle",
+                ));
+            }
+        } else {
+            outcome_payload.validate()?;
+            if artifact.lifecycle != ArtifactLifecycle::RunScoped
+                || outcome.lifecycle != ArtifactLifecycle::RunScoped
+                || outcome_payload.sealed_at.is_some()
+            {
+                return Err(StoreError::InvalidLearningCommit(
+                    "retrospective.intermediate_lifecycle",
+                ));
+            }
+        }
         assert_artifact_from_paper_with_connection(&transaction, &outcome)?;
 
         for existing in read_kind_artifacts(&transaction, ArtifactKind::Retrospective)? {
@@ -3956,6 +4171,166 @@ impl V2Store {
     /// Records retry/recovery/replay/shadow lineage as an immutable
     /// RunScoped artifact. Parent attempts must already exist and the
     /// resulting graph is checked for cycles inside the same transaction.
+    /// Atomically records one RunScoped partial Outcome snapshot and its
+    /// T+1/T+3 retrospective. The snapshot is not indexed as a committed
+    /// task output because this worker remains retryable until T+5.
+    pub fn record_partial_outcome_retrospective_fenced(
+        &self,
+        lease: &DaemonLease,
+        permit: &TaskWritePermit,
+        outcome_artifact: &Artifact,
+        retrospective_artifact: &Artifact,
+        now: DateTime<Utc>,
+    ) -> StoreResult<bool> {
+        if outcome_artifact.kind != ArtifactKind::Outcome
+            || outcome_artifact.lifecycle != ArtifactLifecycle::RunScoped
+            || retrospective_artifact.kind != ArtifactKind::Retrospective
+            || retrospective_artifact.lifecycle != ArtifactLifecycle::RunScoped
+        {
+            return Err(StoreError::InvalidLearningCommit(
+                "partial_retrospective.kind_or_lifecycle",
+            ));
+        }
+        outcome_artifact.validate()?;
+        retrospective_artifact.validate()?;
+        self.read_blob(&outcome_artifact.blob)?;
+        self.read_blob(&retrospective_artifact.blob)?;
+        let outcome: Outcome = self.read_artifact_payload(outcome_artifact)?;
+        outcome.validate()?;
+        if outcome.sealed_at.is_some() || outcome.windows.is_empty() {
+            return Err(StoreError::InvalidLearningCommit(
+                "partial_retrospective.outcome_must_be_unsealed",
+            ));
+        }
+        let retrospective: Retrospective = self.read_artifact_payload(retrospective_artifact)?;
+        retrospective.validate()?;
+        if retrospective.horizon == OutcomeHorizon::T5
+            || retrospective.outcome.artifact_id != outcome_artifact.artifact_id
+            || retrospective.outcome.kind != ArtifactKind::Outcome
+        {
+            return Err(StoreError::InvalidLearningCommit(
+                "partial_retrospective.links",
+            ));
+        }
+        if !outcome
+            .windows
+            .iter()
+            .any(|window| window.horizon == retrospective.horizon)
+        {
+            return Err(StoreError::InvalidLearningCommit(
+                "partial_retrospective.horizon_window",
+            ));
+        }
+        let expected_windows = match retrospective.horizon {
+            OutcomeHorizon::T1 => 1,
+            OutcomeHorizon::T3 => 2,
+            OutcomeHorizon::T5 => 0,
+        };
+        if outcome.windows.len() != expected_windows
+            || (retrospective.horizon == OutcomeHorizon::T3
+                && !outcome
+                    .windows
+                    .iter()
+                    .any(|window| window.horizon == OutcomeHorizon::T1))
+        {
+            return Err(StoreError::InvalidLearningCommit(
+                "partial_retrospective.prefix_windows",
+            ));
+        }
+        assert_origin_matches(outcome_artifact.origin.as_ref(), permit)?;
+        assert_origin_matches(retrospective_artifact.origin.as_ref(), permit)?;
+
+        let mut connection = self.connection.lock().expect("store connection poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        assert_daemon_lease(&transaction, lease, now)?;
+        assert_permit(&transaction, permit)?;
+        assert_paper_run(&transaction, &permit.run_id)?;
+
+        let schedule = read_artifact(&transaction, &outcome.schedule.artifact_id)?;
+        if schedule.kind != ArtifactKind::OutcomeSchedule {
+            return Err(StoreError::InvalidLearningCommit(
+                "partial_retrospective.schedule_kind",
+            ));
+        }
+        for source in &outcome.market_evidence {
+            let evidence = read_artifact(&transaction, &source.artifact_id)?;
+            if evidence.kind != source.kind {
+                return Err(StoreError::InvalidLearningCommit(
+                    "partial_retrospective.market_evidence_kind",
+                ));
+            }
+        }
+        if !has_exact_source_refs(
+            outcome_artifact,
+            &std::iter::once(outcome.schedule.clone())
+                .chain(outcome.market_evidence.iter().cloned())
+                .collect::<Vec<_>>(),
+        ) {
+            return Err(StoreError::InvalidLearningCommit(
+                "partial_retrospective.outcome_source_refs",
+            ));
+        }
+        let outcome_ref = ArtifactRef {
+            artifact_id: outcome_artifact.artifact_id.clone(),
+            kind: ArtifactKind::Outcome,
+        };
+        if !retrospective_artifact.source_refs.contains(&outcome_ref) {
+            return Err(StoreError::InvalidLearningCommit(
+                "partial_retrospective.source_refs",
+            ));
+        }
+        for source in &retrospective_artifact.source_refs {
+            if source.artifact_id == outcome_artifact.artifact_id {
+                continue;
+            }
+            read_artifact(&transaction, &source.artifact_id)?;
+        }
+
+        for existing in read_kind_artifacts(&transaction, ArtifactKind::Retrospective)? {
+            let Some(origin) = existing.origin.as_ref() else {
+                continue;
+            };
+            if origin.run_id.as_ref() != Some(&permit.run_id) {
+                continue;
+            }
+            let existing_payload: Retrospective = self.read_artifact_payload(&existing)?;
+            if existing_payload.outcome_id == retrospective.outcome_id
+                && existing_payload.horizon == retrospective.horizon
+            {
+                if existing == *retrospective_artifact {
+                    transaction.commit()?;
+                    return Ok(false);
+                }
+                return Err(StoreError::Integrity(
+                    "duplicate retrospective identity different payload".to_owned(),
+                ));
+            }
+        }
+
+        insert_artifact(&transaction, outcome_artifact)?;
+        append_event(
+            &transaction,
+            &permit.run_id,
+            Some(&permit.task_id),
+            Some(&permit.attempt_id),
+            LifecycleEventType::ArtifactCommitted,
+            Some(&outcome_artifact.artifact_id),
+            now,
+        )?;
+        insert_artifact(&transaction, retrospective_artifact)?;
+        append_event(
+            &transaction,
+            &permit.run_id,
+            Some(&permit.task_id),
+            Some(&permit.attempt_id),
+            LifecycleEventType::RetrospectiveCreated,
+            Some(&retrospective_artifact.artifact_id),
+            now,
+        )?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
     pub fn record_attempt_relation_fenced(
         &self,
         lease: &DaemonLease,
@@ -3974,7 +4349,10 @@ impl V2Store {
         self.read_blob(&artifact.blob)?;
         let payload: AttemptRelation = self.read_artifact_payload(artifact)?;
         payload.validate()?;
-        if payload.run_id != permit.run_id || payload.task_id != permit.task_id {
+        if payload.run_id != permit.run_id
+            || payload.task_id != permit.task_id
+            || payload.child_attempt_id != permit.attempt_id
+        {
             return Err(StoreError::PermitOriginMismatch);
         }
         assert_origin_matches(artifact.origin.as_ref(), permit)?;
@@ -3994,6 +4372,19 @@ impl V2Store {
         if !parent_exists {
             return Err(StoreError::InvalidLearningCommit(
                 "attempt_relation.parent_missing",
+            ));
+        }
+        let child_exists = transaction
+            .query_row(
+                "SELECT 1 FROM rebuild_attempts WHERE run_id = ?1 AND task_id = ?2 AND attempt_id = ?3",
+                params![payload.run_id.0, payload.task_id.0, payload.child_attempt_id.0],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !child_exists {
+            return Err(StoreError::InvalidLearningCommit(
+                "attempt_relation.child_missing",
             ));
         }
 
@@ -4114,7 +4505,10 @@ impl V2Store {
                 continue;
             }
             let payload: Outcome = self.read_artifact_payload(&artifact)?;
-            if payload.outcome_id == *outcome_id {
+            if artifact.lifecycle == ArtifactLifecycle::Canonical
+                && payload.is_sealed()
+                && payload.outcome_id == *outcome_id
+            {
                 matching.push(artifact);
             }
         }
@@ -4295,7 +4689,7 @@ impl V2Store {
         let connection = self.connection.lock().expect("store connection poisoned");
         let artifact_id = connection
             .query_row(
-                "SELECT artifact_id FROM rebuild_artifacts WHERE kind = ?1 ORDER BY created_at DESC, artifact_id DESC LIMIT 1",
+            "SELECT artifact_id FROM rebuild_artifacts WHERE kind = ?1 ORDER BY CASE WHEN lifecycle = 'canonical' THEN 0 ELSE 1 END, created_at DESC, artifact_id DESC LIMIT 1",
                 params![enum_name(kind)],
                 |row| row.get::<_, String>(0),
             )
@@ -8209,6 +8603,61 @@ fn validate_event_shape(
     Ok(())
 }
 
+impl V2Store {
+    fn record_attempt_relation_in_transaction(
+        &self,
+        transaction: &Transaction<'_>,
+        permit: &TaskWritePermit,
+        parent_attempt_id: &AttemptId,
+        relation: AttemptRelationKind,
+        now: DateTime<Utc>,
+    ) -> StoreResult<()> {
+        let payload = AttemptRelation {
+            schema_version: V2_DOMAIN_SCHEMA_VERSION,
+            run_id: permit.run_id.clone(),
+            task_id: permit.task_id.clone(),
+            parent_attempt_id: parent_attempt_id.clone(),
+            child_attempt_id: permit.attempt_id.clone(),
+            relation,
+            created_at: now,
+        };
+        payload.validate()?;
+        let artifact = Artifact::new(
+            ArtifactKind::AttemptRelation,
+            self.put_json(&payload)?,
+            "akzio-store.attempt_relation",
+            ArtifactLifecycle::RunScoped,
+            ArtifactProvenance {
+                source_family: "akzio-store".to_owned(),
+                observed_at: Some(now),
+                retrieved_at: now,
+                source_uri: None,
+                confidence_ppm: 1_000_000,
+                producer_contract_hash: permit.contract_hash.clone(),
+            },
+            Some(ArtifactOrigin {
+                run_id: Some(permit.run_id.clone()),
+                task_id: Some(permit.task_id.clone()),
+                attempt_id: Some(permit.attempt_id.clone()),
+                contract_hash: permit.contract_hash.clone(),
+            }),
+            Vec::new(),
+            now,
+        )?;
+        insert_artifact(transaction, &artifact)?;
+        append_event(
+            transaction,
+            &permit.run_id,
+            Some(&permit.task_id),
+            Some(&permit.attempt_id),
+            LifecycleEventType::AttemptRelationCreated,
+            Some(&artifact.artifact_id),
+            now,
+        )?;
+        Ok(())
+    }
+}
+
 fn record_attempt_output(
     transaction: &Transaction<'_>,
     permit: &TaskWritePermit,
@@ -8423,11 +8872,47 @@ fn verify_retrospective_history(store: &V2Store, connection: &Connection) -> Sto
                 "duplicate retrospective identity".to_owned(),
             ));
         }
+        if payload.horizon == OutcomeHorizon::T5
+            && artifact.lifecycle != ArtifactLifecycle::Canonical
+        {
+            return Err(StoreError::Integrity(
+                "T5 retrospective is not canonical".to_owned(),
+            ));
+        }
+        if payload.horizon != OutcomeHorizon::T5
+            && artifact.lifecycle != ArtifactLifecycle::RunScoped
+        {
+            return Err(StoreError::Integrity(
+                "intermediate retrospective is not RunScoped".to_owned(),
+            ));
+        }
         let outcome = read_artifact(connection, &payload.outcome.artifact_id)?;
         if outcome.kind != ArtifactKind::Outcome {
             return Err(StoreError::Integrity(
                 "retrospective outcome closure is invalid".to_owned(),
             ));
+        }
+        let outcome_payload: Outcome = store.read_artifact_payload(&outcome)?;
+        if payload.horizon == OutcomeHorizon::T5 {
+            outcome_payload.validate_sealed().map_err(|error| {
+                StoreError::Integrity(format!("sealed outcome is invalid: {error}"))
+            })?;
+            if outcome.lifecycle != ArtifactLifecycle::Canonical {
+                return Err(StoreError::Integrity(
+                    "T5 retrospective points to non-canonical outcome".to_owned(),
+                ));
+            }
+        } else {
+            outcome_payload.validate().map_err(|error| {
+                StoreError::Integrity(format!("partial outcome is invalid: {error}"))
+            })?;
+            if outcome.lifecycle != ArtifactLifecycle::RunScoped
+                || outcome_payload.sealed_at.is_some()
+            {
+                return Err(StoreError::Integrity(
+                    "intermediate retrospective points to sealed outcome".to_owned(),
+                ));
+            }
         }
         if payload.horizon == OutcomeHorizon::T5
             && payload.status == RetrospectiveStatus::Complete
@@ -8458,6 +8943,19 @@ fn verify_attempt_relation_history(store: &V2Store, connection: &Connection) -> 
         if !parent_exists {
             return Err(StoreError::Integrity(
                 "attempt relation parent is missing".to_owned(),
+            ));
+        }
+        let child_exists = connection
+            .query_row(
+                "SELECT 1 FROM rebuild_attempts WHERE run_id = ?1 AND task_id = ?2 AND attempt_id = ?3",
+                params![relation.run_id.0, relation.task_id.0, relation.child_attempt_id.0],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !child_exists {
+            return Err(StoreError::Integrity(
+                "attempt relation child missing".to_owned(),
             ));
         }
         let key = (

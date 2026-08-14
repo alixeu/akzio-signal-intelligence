@@ -12,7 +12,7 @@ use akzio_domain::{
     DeliberationPolicy, DomainError, FailureDisposition, LifecycleEventType, OutputContract,
     PromptBundle, ReadGrant, ResearchClaim, ResearchCritique, ResearchResolution, RetryPolicy,
     RuntimeTaskClass, TaskBudget, TaskRecipe, TaskRecipeId, TaskWritePermit, TerminationPolicy,
-    ToolGrant, ToolKind, ToolSpec, WorkflowNode, V2_SCHEMA_VERSION,
+    ToolGrant, ToolKind, ToolSpec, WorkflowNode, V2_DOMAIN_SCHEMA_VERSION, V2_SCHEMA_VERSION,
 };
 use akzio_model::{
     ModelCallTrace, ModelCapabilitySnapshot, ModelClient, ModelError, ModelRequest,
@@ -175,7 +175,7 @@ impl ActiveResearchCatalogue {
 
 pub const ACTIVE_RESEARCH_MAX_NODES: usize = 32;
 
-const ACTIVE_CONTRACT_VERSION: u32 = 1;
+const ACTIVE_CONTRACT_VERSION: u32 = 2;
 const ACTIVE_PROMPT_BUNDLE_VERSION: u32 = 2;
 const SHARED_GOVERNANCE_PROMPT: &str = "Follow the installed Akzio Contract exactly. Rust owns state, evidence access, budgets, workflow gates, and Paper-only execution. Use only ContextManifest-granted artifacts and the declared tools. Never access arbitrary files, network resources, credentials, databases, or execution controls. Return only the requested strict JSON output.";
 const PLANNER_RECIPE_ID: &str = "research.planner";
@@ -188,6 +188,7 @@ const EXECUTION_GATE_RECIPE_ID: &str = "gate.execution";
 const PAPER_COMMIT_RECIPE_ID: &str = "gate.paper";
 const RECONCILE_RECIPE_ID: &str = "gate.reconcile";
 const EVALUATE_RECIPE_ID: &str = "gate.evaluate";
+const OUTCOME_WORKER_RECIPE_ID: &str = "learning.outcome_worker";
 
 #[derive(Debug, Clone, Copy)]
 struct ActiveRecipePolicy {
@@ -308,11 +309,38 @@ impl ContractCatalogue {
         let mut installed_purposes = BTreeSet::new();
         let mut recipes = Vec::with_capacity(ACTIVE_RECIPE_POLICIES.len() + 6);
 
+        let mut outcome_worker_installed = false;
         for installed in self.contracts() {
             let purpose = installed.contract.purpose.as_str();
-            let policy = active_recipe_policy(purpose).ok_or_else(|| {
-                ResearchError::UnexpectedActiveContractPurpose(purpose.to_owned())
-            })?;
+            let Some(policy) = active_recipe_policy(purpose) else {
+                if purpose != OUTCOME_WORKER_RECIPE_ID {
+                    return Err(ResearchError::UnexpectedActiveContractPurpose(
+                        purpose.to_owned(),
+                    ));
+                }
+                if installed.contract.output.artifact_kind != ArtifactKind::RetrospectiveDraft {
+                    return Err(ResearchError::ActiveContractOutputMismatch {
+                        purpose: purpose.to_owned(),
+                        expected: ArtifactKind::RetrospectiveDraft,
+                        actual: installed.contract.output.artifact_kind,
+                    });
+                }
+                outcome_worker_installed = true;
+                recipes.push(TaskRecipe {
+                    recipe_id: TaskRecipeId::new(purpose)?,
+                    purpose: installed.contract.purpose.clone(),
+                    contract_hash: Some(installed.contract.contract_hash.clone()),
+                    task_class: RuntimeTaskClass::Evaluate,
+                    allowed_evidence_sources: recipe_evidence_sources(&installed.contract),
+                    max_children: 0,
+                    max_depth: 0,
+                    priority_ceiling: 100,
+                    budget: installed.contract.budget.clone(),
+                    retry: installed.contract.retry.clone(),
+                    on_failure: installed.contract.on_failure,
+                });
+                continue;
+            };
             if !installed_purposes.insert(purpose.to_owned()) {
                 return Err(ResearchError::DuplicateActiveContractPurpose(
                     purpose.to_owned(),
@@ -355,6 +383,11 @@ impl ContractCatalogue {
             if !installed_purposes.contains(policy.purpose) {
                 return Err(ResearchError::MissingActiveContract(policy.purpose));
             }
+        }
+        if !outcome_worker_installed {
+            return Err(ResearchError::MissingActiveContract(
+                OUTCOME_WORKER_RECIPE_ID,
+            ));
         }
 
         let (terminal_recipes, terminals) = rust_terminal_recipes()?;
@@ -554,6 +587,37 @@ fn canonical_active_contracts(store: &V2Store) -> ResearchResult<Vec<AgentContra
             termination: TerminationPolicy::leaf(),
             on_failure: FailureDisposition::FailRun,
         },
+        CanonicalContractDefinition {
+            purpose: OUTCOME_WORKER_RECIPE_ID,
+            responsibility: "Produce a bounded retrospective draft from the governed Paper decision and outcome evidence chain.",
+            prompt: "You are Akzio's governed outcome reviewer. Return only a RetrospectiveDraft envelope. Use only the granted decision, execution, outcome schedule, market evidence, deliberation notes, and prior retrospectives. Never emit authoritative returns, calibration, slippage, risk recall, or policy decisions.",
+            output_kind: ArtifactKind::RetrospectiveDraft,
+            output_schema: retrospective_draft_output_schema(),
+            permitted_kinds: BTreeSet::from([
+                ArtifactKind::Decision,
+                ArtifactKind::DecisionContext,
+                ArtifactKind::ExecutionContext,
+                ArtifactKind::ExecutionVerdict,
+                ArtifactKind::ExecutionCommitment,
+                ArtifactKind::OrderReceipt,
+                ArtifactKind::Reconciliation,
+                ArtifactKind::OutcomeSchedule,
+                ArtifactKind::Outcome,
+                ArtifactKind::NormalizedEvidence,
+                ArtifactKind::SemanticDetail,
+                ArtifactKind::DeliberationNote,
+                ArtifactKind::Retrospective,
+            ]),
+            min_context_artifacts: 1,
+            budget: TaskBudget {
+                max_input_tokens: 12_000,
+                max_output_tokens: 2_500,
+                max_wall_time_secs: 90,
+                max_tool_calls: 2,
+            },
+            termination: TerminationPolicy::leaf(),
+            on_failure: FailureDisposition::FailTask,
+        },
     ]
     .into_iter()
     .map(|definition| canonical_active_contract(store, definition))
@@ -679,6 +743,52 @@ fn active_retry_policy() -> RetryPolicy {
         retry_rate_limited: true,
         retry_invalid_output: true,
     }
+}
+
+fn retrospective_draft_output_schema() -> Value {
+    let reference_kinds = [
+        "decision",
+        "decision_context",
+        "execution_context",
+        "execution_verdict",
+        "execution_commitment",
+        "order_receipt",
+        "reconciliation",
+        "outcome_schedule",
+        "outcome",
+        "normalized_evidence",
+        "semantic_detail",
+        "deliberation_note",
+        "retrospective",
+    ];
+    json!({
+        "type": "object",
+        "properties": {
+            "schema_version": {"type": "integer", "enum": [V2_DOMAIN_SCHEMA_VERSION]},
+            "outcome_id": {"type": "string", "minLength": 1},
+            "horizon": {"type": "string", "enum": ["t1", "t3", "t5"]},
+            "summary": {"type": "string", "maxLength": 4000},
+            "findings": {"type": "array", "maxItems": 12, "items": {
+                "type": "object",
+                "properties": {
+                    "category": {"type": "string", "enum": ["research", "evidence", "risk", "decision", "execution", "topology", "contract"]},
+                    "conclusion": {"type": "string", "enum": ["worked", "failed", "mixed", "unresolved"]},
+                    "statement": {"type": "string", "minLength": 1, "maxLength": 4000},
+                    "artifact_refs": {"type": "array", "maxItems": 8, "items": artifact_ref_schema(&reference_kinds)},
+                    "confidence_ppm": {"type": "integer", "minimum": 0, "maximum": 1000000}
+                },
+                "required": ["category", "conclusion", "statement", "artifact_refs", "confidence_ppm"],
+                "additionalProperties": false
+            }},
+            "counterfactuals": {"type": "array", "maxItems": 3, "items": {"type": "string", "maxLength": 4000}},
+            "lesson_candidates": {"type": "array", "maxItems": 8, "items": {"type": "string", "maxLength": 4000}},
+            "diagnostic_gaps": {"type": "array", "maxItems": 8, "items": {"type": "string", "maxLength": 4000}},
+            "source_refs": {"type": "array", "maxItems": 8, "items": artifact_ref_schema(&reference_kinds)},
+            "created_at": {"type": "string", "format": "date-time"}
+        },
+        "required": ["schema_version", "outcome_id", "horizon", "summary", "findings", "counterfactuals", "lesson_candidates", "diagnostic_gaps", "source_refs", "created_at"],
+        "additionalProperties": false
+    })
 }
 
 fn planner_draft_output_schema() -> Value {
@@ -1064,6 +1174,27 @@ fn research_output_source_refs(
                 .validate()
                 .map_err(|error| ResearchError::InvalidOutput(error.to_string()))?;
             resolution.source_refs()
+        }
+        ArtifactKind::RetrospectiveDraft => {
+            let draft: akzio_domain::RetrospectiveDraft = serde_json::from_value(output.clone())
+                .map_err(|error| {
+                    ResearchError::InvalidOutput(format!(
+                        "invalid RetrospectiveDraft payload: {error}"
+                    ))
+                })?;
+            draft
+                .validate()
+                .map_err(|error| ResearchError::InvalidOutput(error.to_string()))?;
+            let mut refs = draft.source_refs.clone();
+            refs.extend(
+                draft
+                    .findings
+                    .iter()
+                    .flat_map(|finding| finding.artifact_refs.iter().cloned()),
+            );
+            refs.sort();
+            refs.dedup();
+            refs
         }
         _ => return Ok(vec![]),
     };
@@ -3257,6 +3388,7 @@ mod tests {
             ("research.analyst", ArtifactKind::Claim),
             ("research.critic", ArtifactKind::Critique),
             ("research.synthesizer", ArtifactKind::DecisionProposal),
+            (OUTCOME_WORKER_RECIPE_ID, ArtifactKind::RetrospectiveDraft),
         ];
 
         assert_eq!(active.contracts.contracts().count(), expected.len());
@@ -3313,6 +3445,12 @@ mod tests {
             assert_eq!(recipe.contract_hash, None);
             assert!(recipe.allowed_evidence_sources.is_empty());
         }
+        let worker_recipe = active
+            .recipes
+            .recipe(&TaskRecipeId::new(OUTCOME_WORKER_RECIPE_ID).unwrap())
+            .unwrap();
+        assert_eq!(worker_recipe.task_class, RuntimeTaskClass::Evaluate);
+        assert!(worker_recipe.contract_hash.is_some());
         store.verify_integrity().unwrap();
     }
 

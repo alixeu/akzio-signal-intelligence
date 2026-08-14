@@ -247,6 +247,7 @@ impl RetrospectiveDraft {
             || self.outcome_id.0.trim().is_empty()
             || self.summary.chars().count() > 4_000
             || self.findings.len() > 12
+            || self.source_refs.len() > 8
             || self.counterfactuals.len() > 3
             || self.lesson_candidates.len() > 8
             || self.diagnostic_gaps.len() > 8
@@ -316,10 +317,7 @@ impl Retrospective {
                 field: "retrospective.outcome",
             });
         }
-        if self.horizon == OutcomeHorizon::T5
-            && self.status == RetrospectiveStatus::Complete
-            && self.sealed_at.is_none()
-        {
+        if self.horizon == OutcomeHorizon::T5 && self.sealed_at.is_none() {
             return Err(DomainError::EmptyField {
                 field: "retrospective.sealed_at",
             });
@@ -411,6 +409,11 @@ impl Outcome {
             });
         }
 
+        if self.windows.is_empty() || self.windows.len() > OutcomeHorizon::ALL.len() {
+            return Err(DomainError::InvalidBudget {
+                field: "outcome.windows",
+            });
+        }
         let mut observed_days = [None; 3];
         for window in &self.windows {
             window.validate()?;
@@ -426,21 +429,25 @@ impl Outcome {
             }
             observed_days[index] = Some(window.observed_trading_day);
         }
-        let [Some(t1), Some(t3), Some(t5)] = observed_days else {
-            return Err(DomainError::InvalidBudget {
-                field: "outcome.windows",
-            });
-        };
-        if !(t1 < t3 && t3 < t5) {
-            return Err(DomainError::InvalidBudget {
-                field: "outcome.window_trading_days",
-            });
+        let mut previous_day = None;
+        for day in observed_days.into_iter().flatten() {
+            if previous_day.is_some_and(|previous| previous >= day) {
+                return Err(DomainError::InvalidBudget {
+                    field: "outcome.window_trading_days",
+                });
+            }
+            previous_day = Some(day);
         }
         Ok(())
     }
 
     pub fn validate_sealed(&self) -> Result<(), DomainError> {
         self.validate()?;
+        if self.windows.len() != OutcomeHorizon::ALL.len() {
+            return Err(DomainError::InvalidBudget {
+                field: "outcome.windows",
+            });
+        }
         self.sealed_at.ok_or(DomainError::EmptyField {
             field: "outcome.sealed_at",
         })?;
@@ -749,7 +756,7 @@ mod tests {
     use super::{
         CandidatePolicy, CandidatePolicyState, Experience, Outcome, OutcomeCostModel,
         OutcomeExecutionLineage, OutcomeHorizon, OutcomeSchedule, OutcomeWindow, PolicyState,
-        PolicySubject, PolicyTransition,
+        PolicySubject, PolicyTransition, Retrospective, RetrospectiveStatus,
     };
     use crate::{
         artifact::{ArtifactId, ArtifactKind, ArtifactRef},
@@ -877,6 +884,44 @@ mod tests {
             ..outcome
         };
         sealed.validate_sealed().unwrap();
+    }
+
+    #[test]
+    fn unsealed_outcome_accepts_a_due_prefix_but_not_canonical_sealing() {
+        let partial = Outcome {
+            schema_version: crate::V2_DOMAIN_SCHEMA_VERSION,
+            outcome_id: OutcomeId::new(),
+            schedule: reference(ArtifactKind::OutcomeSchedule, b"partial-schedule"),
+            market_evidence: vec![reference(
+                ArtifactKind::NormalizedEvidence,
+                b"partial-market",
+            )],
+            windows: vec![window(OutcomeHorizon::T1, 11)],
+            sealed_at: None,
+        };
+        partial.validate().unwrap();
+        assert!(partial.validate_sealed().is_err());
+    }
+
+    #[test]
+    fn model_unavailable_t5_retrospective_still_requires_sealing() {
+        let outcome = reference(ArtifactKind::Outcome, b"sealed-outcome");
+        let retrospective = Retrospective {
+            schema_version: crate::V2_DOMAIN_SCHEMA_VERSION,
+            outcome_id: OutcomeId::new(),
+            horizon: OutcomeHorizon::T5,
+            status: RetrospectiveStatus::ModelUnavailable,
+            summary: "model unavailable".to_owned(),
+            findings: Vec::new(),
+            counterfactuals: Vec::new(),
+            lesson_candidates: Vec::new(),
+            diagnostic_gaps: vec!["model unavailable".to_owned()],
+            source_refs: vec![outcome.clone()],
+            outcome,
+            created_at: Utc::now(),
+            sealed_at: None,
+        };
+        assert!(retrospective.validate().is_err());
     }
 
     #[test]

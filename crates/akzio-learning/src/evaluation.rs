@@ -16,8 +16,8 @@ use akzio_domain::{
     DecisionHorizon, DomainError, Evaluation, EvaluationId, Experience, ExperienceId, Forecast,
     MemoryLifecycle, MoneyMicros, Outcome, OutcomeCostModel, OutcomeExecutionLineage,
     OutcomeHorizon, OutcomeSchedule, OutcomeWindow, PolicyState, PolicySubject, PolicyTransition,
-    PolicyTransitionId, Retrospective, RetrospectiveStatus, RunPurpose, TargetPortfolio,
-    TaskWritePermit, TopologyId, V2_DOMAIN_SCHEMA_VERSION, V2_SCHEMA_VERSION,
+    PolicyTransitionId, Retrospective, RetrospectiveDraft, RetrospectiveStatus, RunPurpose,
+    TargetPortfolio, TaskWritePermit, TopologyId, V2_DOMAIN_SCHEMA_VERSION, V2_SCHEMA_VERSION,
 };
 use akzio_store::v2::{
     DaemonLease, PolicyEvaluationCommit, PolicyHead, ShadowPairCompletion, ShadowPairWriteResult,
@@ -211,6 +211,24 @@ impl EvaluationRuntime {
         lease: Option<&DaemonLease>,
         input: EvaluationInput,
     ) -> EvaluationRuntimeResult<EvaluationResult> {
+        self.evaluate_with_retrospective(lease, input, None)
+    }
+
+    pub fn evaluate_with_lease_and_retrospective(
+        &self,
+        lease: Option<&DaemonLease>,
+        input: EvaluationInput,
+        draft: &RetrospectiveDraft,
+    ) -> EvaluationRuntimeResult<EvaluationResult> {
+        self.evaluate_with_retrospective(lease, input, Some(draft))
+    }
+
+    fn evaluate_with_retrospective(
+        &self,
+        lease: Option<&DaemonLease>,
+        input: EvaluationInput,
+        retrospective_draft: Option<&RetrospectiveDraft>,
+    ) -> EvaluationRuntimeResult<EvaluationResult> {
         self.require_paper(&input.permit.run_id)?;
         if input.hypothesis_id.trim().is_empty() {
             return Err(EvaluationError::EmptyHypothesis);
@@ -292,7 +310,7 @@ impl EvaluationRuntime {
         )? {
             existing
         } else {
-            let retrospective = Retrospective {
+            let mut retrospective = Retrospective {
                 schema_version: V2_DOMAIN_SCHEMA_VERSION,
                 outcome_id: outcome.outcome_id.clone(),
                 horizon: OutcomeHorizon::T5,
@@ -311,11 +329,38 @@ impl EvaluationRuntime {
                 created_at,
                 sealed_at: Some(created_at),
             };
+            if let Some(draft) = retrospective_draft {
+                if draft.outcome_id != outcome.outcome_id || draft.horizon != OutcomeHorizon::T5 {
+                    return Err(EvaluationError::InvalidMaterialization(
+                        "retrospective draft identity",
+                    ));
+                }
+                retrospective.summary = draft.summary.clone();
+                retrospective.findings = draft.findings.clone();
+                retrospective.counterfactuals = draft.counterfactuals.clone();
+                retrospective.lesson_candidates = draft.lesson_candidates.clone();
+                retrospective.diagnostic_gaps = draft.diagnostic_gaps.clone();
+                retrospective.source_refs = draft.source_refs.clone();
+                retrospective.source_refs.extend(
+                    draft
+                        .findings
+                        .iter()
+                        .flat_map(|finding| finding.artifact_refs.iter().cloned()),
+                );
+                retrospective.source_refs.push(outcome_ref.clone());
+                retrospective.source_refs.sort();
+                retrospective.source_refs.dedup();
+            }
+            for prior in self.store.retrospectives(&input.permit.run_id)? {
+                retrospective.source_refs.push(reference(&prior));
+            }
+            retrospective.source_refs.sort();
+            retrospective.source_refs.dedup();
             retrospective.validate()?;
             self.artifact(
                 ArtifactKind::Retrospective,
                 &retrospective,
-                vec![outcome_ref.clone()],
+                retrospective.source_refs.clone(),
                 &origin,
                 &provenance,
                 created_at,
@@ -476,6 +521,219 @@ impl EvaluationRuntime {
         require_canonical_purpose(self.store.run_purpose(run_id)?)
     }
 
+    /// Seal an outcome and a Rust-only retrospective without creating any
+    /// Experience, Evaluation, or policy influence.
+    pub fn seal_outcome_with_rust_retrospective_fenced(
+        &self,
+        lease: &DaemonLease,
+        permit: &TaskWritePermit,
+        materialization: OutcomeMaterializationInput,
+        diagnostic_gap: &str,
+        now: DateTime<Utc>,
+    ) -> EvaluationRuntimeResult<(Artifact, Artifact)> {
+        self.require_paper(&permit.run_id)?;
+        let outcome = materialize_outcome(&materialization)?;
+        outcome.validate_sealed()?;
+        let origin = ArtifactOrigin {
+            run_id: Some(permit.run_id.clone()),
+            task_id: Some(permit.task_id.clone()),
+            attempt_id: Some(permit.attempt_id.clone()),
+            contract_hash: permit.contract_hash.clone(),
+        };
+        let provenance = ArtifactProvenance {
+            source_family: "akzio-learning".to_owned(),
+            observed_at: Some(now),
+            retrieved_at: now,
+            source_uri: None,
+            confidence_ppm: PPM_ONE,
+            producer_contract_hash: permit.contract_hash.clone(),
+        };
+        let outcome_artifact = if let Some(existing) = self
+            .store
+            .outcome_for(&permit.run_id, &outcome.outcome_id)?
+        {
+            existing
+        } else {
+            let sources = std::iter::once(materialization.schedule_artifact.clone())
+                .chain(outcome.market_evidence.iter().cloned())
+                .collect();
+            self.artifact(
+                ArtifactKind::Outcome,
+                &outcome,
+                sources,
+                &origin,
+                &provenance,
+                now,
+            )?
+        };
+        let outcome_ref = reference(&outcome_artifact);
+        let mut retrospective_source_refs = vec![outcome_ref.clone()];
+        retrospective_source_refs.extend(
+            self.store
+                .retrospectives(&permit.run_id)?
+                .into_iter()
+                .map(|artifact| reference(&artifact)),
+        );
+        retrospective_source_refs.sort();
+        retrospective_source_refs.dedup();
+        let retrospective = Retrospective {
+            schema_version: V2_DOMAIN_SCHEMA_VERSION,
+            outcome_id: outcome.outcome_id.clone(),
+            horizon: OutcomeHorizon::T5,
+            status: RetrospectiveStatus::ModelUnavailable,
+            summary: "Rust-sealed retrospective; governed model unavailable".to_owned(),
+            findings: Vec::new(),
+            counterfactuals: Vec::new(),
+            lesson_candidates: Vec::new(),
+            diagnostic_gaps: vec![diagnostic_gap.to_owned()],
+            source_refs: retrospective_source_refs,
+            outcome: outcome_ref,
+            created_at: now,
+            sealed_at: Some(now),
+        };
+        retrospective.validate()?;
+        let retrospective_artifact = if let Some(existing) =
+            self.store
+                .retrospective_for(&permit.run_id, &outcome.outcome_id, OutcomeHorizon::T5)?
+        {
+            existing
+        } else {
+            self.artifact(
+                ArtifactKind::Retrospective,
+                &retrospective,
+                retrospective.source_refs.clone(),
+                &origin,
+                &provenance,
+                now,
+            )?
+        };
+        self.store.commit_outcome_retrospective_fenced(
+            lease,
+            permit,
+            &outcome_artifact,
+            &retrospective_artifact,
+            now,
+        )?;
+        Ok((outcome_artifact, retrospective_artifact))
+    }
+
+    /// Materializes and atomically records a RunScoped T+1/T+3 snapshot with
+    /// its bounded retrospective narrative. No Experience or Evaluation is
+    /// created from this path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_partial_retrospective_fenced(
+        &self,
+        lease: &DaemonLease,
+        permit: &TaskWritePermit,
+        materialization: OutcomeMaterializationInput,
+        horizon: OutcomeHorizon,
+        draft: Option<&RetrospectiveDraft>,
+        prior_retrospectives: &[ArtifactRef],
+        now: DateTime<Utc>,
+    ) -> EvaluationRuntimeResult<(Artifact, Artifact)> {
+        let outcome = materialize_partial_outcome(&materialization)?;
+        if !outcome
+            .windows
+            .iter()
+            .any(|window| window.horizon == horizon)
+        {
+            return Err(EvaluationError::InvalidMaterialization(
+                "partial retrospective horizon",
+            ));
+        }
+        let origin = ArtifactOrigin {
+            run_id: Some(permit.run_id.clone()),
+            task_id: Some(permit.task_id.clone()),
+            attempt_id: Some(permit.attempt_id.clone()),
+            contract_hash: permit.contract_hash.clone(),
+        };
+        let provenance = ArtifactProvenance {
+            source_family: "akzio-learning".to_owned(),
+            observed_at: Some(now),
+            retrieved_at: now,
+            source_uri: None,
+            confidence_ppm: PPM_ONE,
+            producer_contract_hash: permit.contract_hash.clone(),
+        };
+        let outcome_artifact = self.artifact_with_lifecycle(
+            ArtifactKind::Outcome,
+            &outcome,
+            std::iter::once(materialization.schedule_artifact.clone())
+                .chain(outcome.market_evidence.iter().cloned())
+                .collect(),
+            ArtifactLifecycle::RunScoped,
+            &origin,
+            &provenance,
+            now,
+        )?;
+        let outcome_ref = reference(&outcome_artifact);
+
+        let mut status = RetrospectiveStatus::ModelUnavailable;
+        let mut summary = format!("Rust-sealed {horizon:?} retrospective");
+        let mut findings = Vec::new();
+        let mut counterfactuals = Vec::new();
+        let mut lesson_candidates = Vec::new();
+        let mut diagnostic_gaps =
+            vec!["governed retrospective model unavailable for this horizon".to_owned()];
+        let mut source_refs = prior_retrospectives.to_vec();
+        if let Some(draft) = draft {
+            if draft.outcome_id != outcome.outcome_id || draft.horizon != horizon {
+                return Err(EvaluationError::InvalidMaterialization(
+                    "retrospective draft identity",
+                ));
+            }
+            status = RetrospectiveStatus::Complete;
+            summary = draft.summary.clone();
+            findings = draft.findings.clone();
+            counterfactuals = draft.counterfactuals.clone();
+            lesson_candidates = draft.lesson_candidates.clone();
+            diagnostic_gaps = draft.diagnostic_gaps.clone();
+            source_refs.extend(draft.source_refs.clone());
+            source_refs.extend(
+                draft
+                    .findings
+                    .iter()
+                    .flat_map(|finding| finding.artifact_refs.iter().cloned()),
+            );
+        }
+        source_refs.push(outcome_ref.clone());
+        source_refs.sort();
+        source_refs.dedup();
+        let retrospective = Retrospective {
+            schema_version: V2_DOMAIN_SCHEMA_VERSION,
+            outcome_id: outcome.outcome_id.clone(),
+            horizon,
+            status,
+            summary,
+            findings,
+            counterfactuals,
+            lesson_candidates,
+            diagnostic_gaps,
+            source_refs: source_refs.clone(),
+            outcome: outcome_ref,
+            created_at: now,
+            sealed_at: Some(now),
+        };
+        retrospective.validate()?;
+        let retrospective_artifact = self.artifact_with_lifecycle(
+            ArtifactKind::Retrospective,
+            &retrospective,
+            source_refs,
+            ArtifactLifecycle::RunScoped,
+            &origin,
+            &provenance,
+            now,
+        )?;
+        self.store.record_partial_outcome_retrospective_fenced(
+            lease,
+            permit,
+            &outcome_artifact,
+            &retrospective_artifact,
+            now,
+        )?;
+        Ok((outcome_artifact, retrospective_artifact))
+    }
+
     fn artifact<T: Serialize>(
         &self,
         kind: ArtifactKind,
@@ -485,12 +743,34 @@ impl EvaluationRuntime {
         provenance: &ArtifactProvenance,
         created_at: DateTime<Utc>,
     ) -> EvaluationRuntimeResult<Artifact> {
+        self.artifact_with_lifecycle(
+            kind,
+            payload,
+            source_refs,
+            ArtifactLifecycle::Canonical,
+            origin,
+            provenance,
+            created_at,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn artifact_with_lifecycle<T: Serialize>(
+        &self,
+        kind: ArtifactKind,
+        payload: &T,
+        source_refs: Vec<ArtifactRef>,
+        lifecycle: ArtifactLifecycle,
+        origin: &ArtifactOrigin,
+        provenance: &ArtifactProvenance,
+        created_at: DateTime<Utc>,
+    ) -> EvaluationRuntimeResult<Artifact> {
         let blob = self.store.put_json(payload)?;
         Ok(Artifact::new(
             kind,
             blob,
             "akzio-learning.evaluation",
-            ArtifactLifecycle::Canonical,
+            lifecycle,
             provenance.clone(),
             Some(origin.clone()),
             source_refs,
@@ -573,6 +853,106 @@ pub fn materialize_outcome(
         sealed_at: Some(input.sealed_at),
     };
     outcome.validate_sealed()?;
+    Ok(outcome)
+}
+
+/// Materializes the currently due prefix of an outcome for T+1/T+3
+/// diagnostics.  These snapshots remain RunScoped and unsealed; only the
+/// complete three-window result is eligible for canonical learning.
+pub fn materialize_partial_outcome(
+    input: &OutcomeMaterializationInput,
+) -> EvaluationRuntimeResult<Outcome> {
+    input.schedule.validate()?;
+    if input.schedule_artifact.kind != ArtifactKind::OutcomeSchedule {
+        return Err(EvaluationError::InvalidMaterialization(
+            "schedule artifact kind",
+        ));
+    }
+    input.target.validate_universe()?;
+    input.cost_model.validate()?;
+    validate_prices(&input.baseline_prices)?;
+
+    let forecasts = index_forecasts(&input.target, &input.forecasts)?;
+    let mut observations = BTreeMap::new();
+    for observation in &input.observations {
+        if !observation
+            .horizon
+            .is_due_after(observation.completed_trading_sessions)
+            || observation.observed_trading_day <= input.schedule.baseline_trading_day
+        {
+            return Err(EvaluationError::InvalidMaterialization("horizon not due"));
+        }
+        validate_prices(&observation.future_prices)?;
+        if observations
+            .insert(observation.horizon, observation)
+            .is_some()
+        {
+            return Err(EvaluationError::InvalidMaterialization(
+                "duplicate observation horizon",
+            ));
+        }
+    }
+    if observations.is_empty() {
+        return Err(EvaluationError::InvalidMaterialization(
+            "missing due observation",
+        ));
+    }
+
+    let mut market_evidence = input.market_evidence.clone();
+    market_evidence.sort();
+    market_evidence.dedup();
+    let mut windows = Vec::with_capacity(observations.len());
+    for (horizon, observation) in observations {
+        let forecast_probability_ppm = forecasts
+            .get(&horizon)
+            .expect("index_forecasts requires all horizons");
+        let portfolio_return_ppm = portfolio_return_ppm(
+            &input.target,
+            &input.baseline_prices,
+            &observation.future_prices,
+        )?;
+        let benchmark_return_ppm = return_ppm(
+            price(&input.baseline_prices, Asset::Qqq)?,
+            price(&observation.future_prices, Asset::Qqq)?,
+        )?;
+        let utility_ppm = portfolio_return_ppm
+            .checked_sub(benchmark_return_ppm)
+            .and_then(|value| value.checked_sub(i64::from(input.cost_model.transaction_cost_ppm)))
+            .and_then(|value| value.checked_sub(i64::from(input.cost_model.slippage_ppm)))
+            .ok_or(EvaluationError::ArithmeticOverflow)?;
+        windows.push(OutcomeWindow {
+            horizon,
+            observed_trading_day: observation.observed_trading_day,
+            portfolio_return_ppm,
+            benchmark_return_ppm,
+            transaction_cost_ppm: input.cost_model.transaction_cost_ppm,
+            slippage_ppm: input.cost_model.slippage_ppm,
+            utility_ppm,
+            calibration_ppm: directional_calibration_ppm(
+                *forecast_probability_ppm,
+                portfolio_return_ppm,
+            ),
+            evidence_completeness_ppm: bounded_ratio_ppm(
+                observation.expected_evidence_count,
+                observation.observed_evidence_count,
+            ),
+            risk_recall_ppm: bounded_ratio_ppm(
+                observation.expected_risk_count,
+                observation.detected_risk_count,
+            ),
+        });
+    }
+    windows.sort_by_key(|window| window.horizon);
+
+    let outcome = Outcome {
+        schema_version: V2_DOMAIN_SCHEMA_VERSION,
+        outcome_id: input.schedule.outcome_id.clone(),
+        schedule: input.schedule_artifact.clone(),
+        market_evidence,
+        windows,
+        sealed_at: None,
+    };
+    outcome.validate()?;
     Ok(outcome)
 }
 
@@ -1534,6 +1914,19 @@ mod tests {
         assert_eq!(t3.benchmark_return_ppm, -50_000);
         assert_eq!(t3.utility_ppm, -50_150);
         assert_eq!(t3.calibration_ppm, 800_000);
+    }
+
+    #[test]
+    fn partial_materializer_seals_only_the_due_prefix() {
+        let mut input = materialization();
+        input
+            .observations
+            .retain(|observation| observation.horizon == OutcomeHorizon::T1);
+        let outcome = materialize_partial_outcome(&input).unwrap();
+        assert_eq!(outcome.windows.len(), 1);
+        assert_eq!(outcome.windows[0].horizon, OutcomeHorizon::T1);
+        assert!(outcome.sealed_at.is_none());
+        assert!(materialize_outcome(&input).is_err());
     }
 
     #[test]

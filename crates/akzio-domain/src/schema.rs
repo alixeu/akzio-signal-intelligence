@@ -720,13 +720,23 @@ impl AgentContract {
     }
 
     pub fn expected_hash(&self) -> Result<ContentHash, DomainError> {
+        self.expected_hash_with_fields(true)
+    }
+
+    fn expected_hash_with_fields(
+        &self,
+        include_deliberation_policy: bool,
+    ) -> Result<ContentHash, DomainError> {
         let mut value = serde_json::to_value(self).map_err(|_| DomainError::EmptyField {
             field: "contract.serialize",
         })?;
-        value
+        let object = value
             .as_object_mut()
-            .expect("contract serializes to object")
-            .remove("contract_hash");
+            .expect("contract serializes to object");
+        object.remove("contract_hash");
+        if !include_deliberation_policy {
+            object.remove("deliberation_policy");
+        }
         content_hash_json(&value).map_err(|_| DomainError::EmptyField {
             field: "contract.serialize",
         })
@@ -783,12 +793,18 @@ impl AgentContract {
                 | ArtifactKind::Critique
                 | ArtifactKind::Resolution
                 | ArtifactKind::DecisionProposal
+                | ArtifactKind::RetrospectiveDraft
         ) {
             return Err(DomainError::EmptyField {
                 field: "contract.output.artifact_kind",
             });
         }
-        if self.contract_hash != self.expected_hash()? {
+        let expected_hash = self.expected_hash()?;
+        let legacy_hash = (self.deliberation_policy == DeliberationPolicy::Disabled)
+            .then(|| self.expected_hash_with_fields(false))
+            .transpose()?;
+        if self.contract_hash != expected_hash && legacy_hash.as_ref() != Some(&self.contract_hash)
+        {
             return Err(DomainError::InvalidContentHash);
         }
         Ok(())
@@ -1864,5 +1880,78 @@ mod tests {
         assert!(grant.matches_permit(&permit));
         grant.epoch += 1;
         assert!(!grant.matches_permit(&permit));
+    }
+
+    #[test]
+    fn disabled_deliberation_contracts_keep_legacy_hashes_valid() {
+        let contract = AgentContract::new(
+            ContractId::new(),
+            1,
+            ContractPurpose::new("research.analyst").unwrap(),
+            "derive claims",
+            PromptBundle {
+                version: 1,
+                governance: blob(b"governance"),
+                role: blob(b"prompt"),
+            },
+            ContextPolicy {
+                permitted_kinds: BTreeSet::from([ArtifactKind::NormalizedEvidence]),
+                permitted_source_families: BTreeSet::from(["market".to_owned()]),
+                min_artifacts: 1,
+                max_artifacts: 4,
+                max_bytes: 1024,
+                max_tokens: 256,
+                allow_raw_reread: true,
+            },
+            vec![ToolGrant {
+                kind: ToolKind::ReadEvidence,
+                allowed_sources: vec!["market".to_owned()],
+            }],
+            vec![ToolSpec {
+                name: "read_artifact".to_owned(),
+                description: "read granted artifact".to_owned(),
+                kind: ToolKind::ReadEvidence,
+                input_schema: blob(b"tool schema"),
+                strict: true,
+            }],
+            OutputContract {
+                artifact_kind: ArtifactKind::Claim,
+                schema: blob(b"schema"),
+            },
+            TaskBudget {
+                max_input_tokens: 256,
+                max_output_tokens: 128,
+                max_wall_time_secs: 30,
+                max_tool_calls: 2,
+            },
+            RetryPolicy {
+                max_attempts: 1,
+                initial_backoff_ms: 1,
+                retry_transport: true,
+                retry_rate_limited: true,
+                retry_invalid_output: false,
+            },
+            TerminationPolicy::leaf(),
+            FailureDisposition::FailTask,
+        )
+        .unwrap();
+
+        let mut legacy_value = serde_json::to_value(&contract).unwrap();
+        legacy_value
+            .as_object_mut()
+            .unwrap()
+            .remove("deliberation_policy");
+        legacy_value
+            .as_object_mut()
+            .unwrap()
+            .remove("contract_hash");
+        let legacy_hash = content_hash_json(&legacy_value).unwrap();
+        legacy_value.as_object_mut().unwrap().insert(
+            "contract_hash".to_owned(),
+            serde_json::Value::String(legacy_hash.as_str().to_owned()),
+        );
+        let legacy: AgentContract = serde_json::from_value(legacy_value).unwrap();
+        assert_eq!(legacy.deliberation_policy, DeliberationPolicy::Disabled);
+        legacy.validate().unwrap();
     }
 }
