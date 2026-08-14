@@ -15,6 +15,7 @@ use crate::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LifecycleEventType {
     AgentTurn,
+    AgentTurnStarted,
     AgentTurnCompleted,
     AgentTurnFailed,
     AgentTurnRetryableFailed,
@@ -77,6 +78,7 @@ impl LifecycleEventType {
     pub fn parse(value: &str) -> Result<Self, DomainError> {
         let event = match value {
             "agent.turn" => Self::AgentTurn,
+            "agent.turn_started" => Self::AgentTurnStarted,
             "agent.turn_completed" => Self::AgentTurnCompleted,
             "agent.turn_failed" => Self::AgentTurnFailed,
             "agent.turn_retryable_failed" => Self::AgentTurnRetryableFailed,
@@ -141,6 +143,7 @@ impl LifecycleEventType {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::AgentTurn => "agent.turn",
+            Self::AgentTurnStarted => "agent.turn_started",
             Self::AgentTurnCompleted => "agent.turn_completed",
             Self::AgentTurnFailed => "agent.turn_failed",
             Self::AgentTurnRetryableFailed => "agent.turn_retryable_failed",
@@ -292,6 +295,7 @@ mod tests {
     fn lifecycle_event_types_round_trip_all_allowlisted_values() {
         let values = [
             "agent.turn",
+            "agent.turn_started",
             "agent.turn_completed",
             "agent.turn_failed",
             "agent.turn_retryable_failed",

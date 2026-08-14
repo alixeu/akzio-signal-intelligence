@@ -1396,6 +1396,11 @@ impl AgentRuntime {
                 }
                 let request_hash = model_request_hash(&request)?;
                 self.store.validate_task_permit(permit)?;
+                self.store.append_task_event(
+                    permit,
+                    LifecycleEventType::AgentTurnStarted,
+                    logical_now(now, started.elapsed()),
+                )?;
                 match model.turn(request.clone()).await {
                     Ok(turn) => {
                         break (
@@ -2643,6 +2648,11 @@ mod tests {
             .find(|event| event.event_type == "agent.turn_failed")
             .and_then(|event| event.artifact_id)
             .expect("capability mismatch is durable");
+        assert!(!store
+            .events_after(&claimed.run_id, 0, 100)
+            .unwrap()
+            .iter()
+            .any(|event| event.event_type == LifecycleEventType::AgentTurnStarted.as_str()));
         let failure = store.artifact(&failure_id).unwrap();
         let trace: Value =
             serde_json::from_slice(&store.read_blob(&failure.blob).unwrap()).unwrap();

@@ -2807,6 +2807,24 @@ impl V2Store {
         Ok(())
     }
 
+    /// Append a task-scoped lifecycle fact without creating an artifact.
+    /// The permit check and event insert share one transaction so a stale
+    /// attempt cannot publish an AgentTurnStarted fact after takeover.
+    pub fn append_task_event(
+        &self,
+        permit: &TaskWritePermit,
+        event_type: LifecycleEventType,
+        now: DateTime<Utc>,
+    ) -> StoreResult<()> {
+        let mut connection = self.connection.lock().expect("store connection poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        assert_permit(&transaction, permit)?;
+        append_task_event(&transaction, permit, event_type, now)?;
+        validate_agent_turn_lifecycle_events(&transaction, Some(&permit.run_id))?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Verify a handler-owned transaction already closed this exact attempt.
     /// A merely stale permit is insufficient: task and attempt terminal state,
     /// run, lease, epoch, and contract must all still identify the caller.
@@ -2914,6 +2932,7 @@ impl V2Store {
             now,
         )?;
         validate_tool_lifecycle_events(&transaction, Some(&permit.run_id))?;
+        validate_agent_turn_lifecycle_events(&transaction, Some(&permit.run_id))?;
         transaction.commit()?;
         Ok(())
     }
@@ -4411,6 +4430,7 @@ impl V2Store {
             )?;
         }
         validate_tool_lifecycle_events(&connection, Some(run_id))?;
+        validate_agent_turn_lifecycle_events(&connection, Some(run_id))?;
         validate_paper_effect_events(&connection, Some(run_id))?;
         Ok(events)
     }
@@ -4451,6 +4471,7 @@ impl V2Store {
             })?;
         }
         validate_tool_lifecycle_events(&connection, None)?;
+        validate_agent_turn_lifecycle_events(&connection, None)?;
         validate_paper_effect_events(&connection, None)?;
         let fk = connection
             .query_row("PRAGMA foreign_key_check", [], |_| Ok(()))
@@ -6832,6 +6853,180 @@ fn validate_tool_lifecycle_events(
     Ok(())
 }
 
+fn validate_agent_turn_lifecycle_events(
+    connection: &Connection,
+    run_id: Option<&RunId>,
+) -> StoreResult<()> {
+    let mut statement = connection.prepare(
+        r#"SELECT event_id, run_id, task_id, attempt_id, event_type, artifact_id
+           FROM rebuild_events
+           WHERE (?1 IS NULL OR run_id = ?1)
+             AND event_type IN (?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+           ORDER BY event_id ASC"#,
+    )?;
+    let rows = statement.query_map(
+        params![
+            run_id.map(|value| value.0.as_str()),
+            LifecycleEventType::AgentTurnStarted.as_str(),
+            LifecycleEventType::AgentTurnCompleted.as_str(),
+            LifecycleEventType::AgentTurnRetryableFailed.as_str(),
+            LifecycleEventType::AgentTurnFailed.as_str(),
+            LifecycleEventType::TaskRetryScheduled.as_str(),
+            LifecycleEventType::TaskRetryExhausted.as_str(),
+            LifecycleEventType::TaskRecovered.as_str(),
+            LifecycleEventType::TaskRecoveryExhausted.as_str(),
+            LifecycleEventType::TaskCancelled.as_str(),
+            LifecycleEventType::TaskSucceeded.as_str(),
+            LifecycleEventType::TaskFailed.as_str(),
+            LifecycleEventType::TaskSkipped.as_str(),
+        ],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                RunId(row.get::<_, String>(1)?),
+                row.get::<_, Option<String>>(2)?.map(TaskId),
+                row.get::<_, Option<String>>(3)?
+                    .map(akzio_domain::AttemptId),
+                LifecycleEventType::parse(&row.get::<_, String>(4)?)
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?,
+                row.get::<_, Option<String>>(5)?
+                    .map(|value| {
+                        ContentHash::new(value).map(ArtifactId).map_err(|error| {
+                            rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+                        })
+                    })
+                    .transpose()?,
+            ))
+        },
+    )?;
+
+    #[derive(Default)]
+    struct TurnState {
+        pending_start: bool,
+        saw_started: bool,
+        terminal_artifacts: BTreeSet<ArtifactId>,
+        last_terminal: Option<LifecycleEventType>,
+    }
+
+    let mut states = BTreeMap::<(RunId, TaskId, akzio_domain::AttemptId), TurnState>::new();
+    for row in rows {
+        let (cursor, event_run_id, task_id, attempt_id, event_type, artifact_id) = row?;
+        let key = match (&task_id, &attempt_id) {
+            (Some(task_id), Some(attempt_id)) => {
+                (event_run_id.clone(), task_id.clone(), attempt_id.clone())
+            }
+            _ => {
+                if matches!(
+                    event_type,
+                    LifecycleEventType::AgentTurnStarted
+                        | LifecycleEventType::AgentTurnCompleted
+                        | LifecycleEventType::AgentTurnRetryableFailed
+                        | LifecycleEventType::AgentTurnFailed
+                ) {
+                    return Err(StoreError::Integrity(format!(
+                        "agent lifecycle event at cursor {cursor} has incomplete task attempt lineage"
+                    )));
+                }
+                continue;
+            }
+        };
+        let state = states.entry(key.clone()).or_default();
+        match event_type {
+            LifecycleEventType::AgentTurnStarted => {
+                if artifact_id.is_some() {
+                    return Err(StoreError::Integrity(format!(
+                        "agent.turn_started cursor {cursor} unexpectedly has an artifact"
+                    )));
+                }
+                if state.pending_start {
+                    return Err(StoreError::Integrity(format!(
+                        "agent.turn_started cursor {cursor} follows an unresolved model turn"
+                    )));
+                }
+                state.pending_start = true;
+                state.saw_started = true;
+            }
+            LifecycleEventType::AgentTurnCompleted
+            | LifecycleEventType::AgentTurnRetryableFailed
+            | LifecycleEventType::AgentTurnFailed => {
+                let Some(artifact_id) = artifact_id else {
+                    return Err(StoreError::Integrity(format!(
+                        "{} cursor {cursor} has no AgentTurn artifact",
+                        event_type.as_str()
+                    )));
+                };
+                let artifact = read_artifact(connection, &artifact_id)?;
+                if artifact.kind != ArtifactKind::AgentTurn {
+                    return Err(StoreError::Integrity(format!(
+                        "{} cursor {cursor} references {:?}, expected agent_turn",
+                        event_type.as_str(),
+                        artifact.kind
+                    )));
+                }
+                let origin = artifact.origin.as_ref().ok_or_else(|| {
+                    StoreError::Integrity(format!(
+                        "{} cursor {cursor} AgentTurn artifact has no origin",
+                        event_type.as_str()
+                    ))
+                })?;
+                if origin.run_id.as_ref() != Some(&key.0)
+                    || origin.task_id.as_ref() != Some(&key.1)
+                    || origin.attempt_id.as_ref() != Some(&key.2)
+                {
+                    return Err(StoreError::Integrity(format!(
+                        "{} cursor {cursor} AgentTurn artifact origin does not match task attempt",
+                        event_type.as_str()
+                    )));
+                }
+                if !state.terminal_artifacts.insert(artifact_id) {
+                    return Err(StoreError::Integrity(format!(
+                        "{} cursor {cursor} repeats an AgentTurn terminal artifact",
+                        event_type.as_str()
+                    )));
+                }
+                // Legacy/audit terminal artifacts without a started event remain
+                // readable for existing v2 stores.  The current no-model retry
+                // path is a capability preflight failure after a retryable
+                // terminal; retain that one compatibility exception without
+                // coupling the store to research artifact payloads.
+                let capability_preflight_retry = state.last_terminal
+                    == Some(LifecycleEventType::AgentTurnRetryableFailed)
+                    && event_type == LifecycleEventType::AgentTurnFailed;
+                if !state.pending_start && state.saw_started && !capability_preflight_retry {
+                    return Err(StoreError::Integrity(format!(
+                        "{} cursor {cursor} has no pending AgentTurn start",
+                        event_type.as_str()
+                    )));
+                }
+                state.pending_start = false;
+                state.last_terminal = Some(event_type);
+            }
+            LifecycleEventType::TaskRetryScheduled
+            | LifecycleEventType::TaskRetryExhausted
+            | LifecycleEventType::TaskRecovered
+            | LifecycleEventType::TaskRecoveryExhausted
+            | LifecycleEventType::TaskCancelled => {
+                // These events abandon the in-flight attempt during retry or
+                // recovery; they are the durable close for a crashed turn.
+                state.pending_start = false;
+                state.last_terminal = None;
+            }
+            LifecycleEventType::TaskSucceeded
+            | LifecycleEventType::TaskFailed
+            | LifecycleEventType::TaskSkipped => {
+                if state.pending_start {
+                    return Err(StoreError::Integrity(format!(
+                        "{} cursor {cursor} closes a task with a pending AgentTurn",
+                        event_type.as_str()
+                    )));
+                }
+            }
+            _ => unreachable!("agent lifecycle query emits fixed event types"),
+        }
+    }
+    Ok(())
+}
+
 fn ensure_no_pending_tool_calls(
     connection: &Connection,
     run_id: &RunId,
@@ -7075,7 +7270,28 @@ fn finish_permitted_task(
         } else {
             requested_status
         };
+    let terminal_event = match status {
+        TaskStatus::Succeeded => LifecycleEventType::TaskSucceeded,
+        TaskStatus::Failed => LifecycleEventType::TaskFailed,
+        TaskStatus::Cancelled => LifecycleEventType::TaskCancelled,
+        TaskStatus::Skipped => LifecycleEventType::TaskSkipped,
+        _ => unreachable!("terminal status checked above"),
+    };
+    // Append the task terminal inside this transaction before lifecycle
+    // validation.  The validator must see the terminal event itself so it can
+    // reject a normal terminal status that leaves an AgentTurnStarted pending;
+    // cancellation is the explicit abort-close for a crashed turn.
+    append_event(
+        transaction,
+        &permit.run_id,
+        Some(&permit.task_id),
+        Some(&permit.attempt_id),
+        terminal_event,
+        terminal_artifact_id,
+        now,
+    )?;
     validate_tool_lifecycle_events(transaction, Some(&permit.run_id))?;
+    validate_agent_turn_lifecycle_events(transaction, Some(&permit.run_id))?;
     if status == TaskStatus::Succeeded {
         ensure_no_pending_tool_calls(
             transaction,
@@ -7094,21 +7310,6 @@ fn finish_permitted_task(
     transaction.execute(
         "UPDATE rebuild_attempts SET status = ?1, finished_at = ?2 WHERE attempt_id = ?3",
         params![enum_name(status), now.to_rfc3339(), permit.attempt_id.0],
-    )?;
-    append_event(
-        transaction,
-        &permit.run_id,
-        Some(&permit.task_id),
-        Some(&permit.attempt_id),
-        match status {
-            TaskStatus::Succeeded => LifecycleEventType::TaskSucceeded,
-            TaskStatus::Failed => LifecycleEventType::TaskFailed,
-            TaskStatus::Cancelled => LifecycleEventType::TaskCancelled,
-            TaskStatus::Skipped => LifecycleEventType::TaskSkipped,
-            _ => unreachable!("terminal status checked above"),
-        },
-        terminal_artifact_id,
-        now,
     )?;
     if status == TaskStatus::Failed {
         match on_failure {
@@ -7237,6 +7438,28 @@ fn append_event(
     Ok(transaction.last_insert_rowid())
 }
 
+fn append_task_event(
+    transaction: &Transaction<'_>,
+    permit: &TaskWritePermit,
+    event_type: LifecycleEventType,
+    created_at: DateTime<Utc>,
+) -> StoreResult<i64> {
+    if event_type != LifecycleEventType::AgentTurnStarted {
+        return Err(StoreError::InvalidLifecycleEventShape {
+            event_type: event_type.as_str().to_owned(),
+        });
+    }
+    append_event(
+        transaction,
+        &permit.run_id,
+        Some(&permit.task_id),
+        Some(&permit.attempt_id),
+        event_type,
+        None,
+        created_at,
+    )
+}
+
 fn validate_event_shape(
     event_type: LifecycleEventType,
     has_task_id: bool,
@@ -7268,6 +7491,7 @@ fn validate_event_shape(
         }
         LifecycleEventType::TaskCancelled => has_task_id && (!has_artifact_id || has_attempt_id),
         LifecycleEventType::TaskStarted
+        | LifecycleEventType::AgentTurnStarted
         | LifecycleEventType::TaskRecovered
         | LifecycleEventType::TaskRecoveryExhausted
         | LifecycleEventType::TaskRetryExhausted
@@ -12969,7 +13193,12 @@ mod tests {
             .unwrap();
         fixture
             .store
-            .record_paper_effect_intent(&fixture.lease, &fixture.permit, &effect, fixture.now)
+            .record_paper_effect_intent(
+                &fixture.lease,
+                &fixture.permit,
+                &effect,
+                fixture.now,
+            )
             .unwrap();
         fixture
             .store
@@ -13032,12 +13261,7 @@ mod tests {
             .unwrap();
         fixture
             .store
-            .record_paper_effect_intent(
-                &fixture.lease,
-                &fixture.permit,
-                &effect,
-                fixture.now,
-            )
+            .record_paper_effect_intent(&fixture.lease, &fixture.permit, &effect, fixture.now)
             .unwrap();
         {
             let connection = fixture.store.connection.lock().unwrap();
@@ -13145,5 +13369,415 @@ mod tests {
         let restored_blob = restored.read_blob(&blob).unwrap();
         assert_eq!(restored_blob, b"backup-fixture");
         restored.verify_integrity().unwrap();
+    }
+
+    fn task_artifact_fixture_with_retry(
+        purpose: RunPurpose,
+        max_attempts: u8,
+    ) -> TaskArtifactFixture {
+        let root = tempdir().unwrap();
+        let store = V2Store::open(root.path()).unwrap();
+        let now = Utc::now();
+        let mut graph = graph();
+        graph.nodes[0].retry.max_attempts = max_attempts;
+        let graph_artifact = artifact(
+            &store,
+            ArtifactKind::WorkflowGraph,
+            &serde_json::to_string(&graph).unwrap(),
+            None,
+        );
+        let run = StoredRun {
+            run_id: RunId::new(),
+            purpose,
+            topology_id: graph.topology_id.clone(),
+            graph_artifact_id: graph_artifact.artifact_id.clone(),
+            created_at: now,
+        };
+        store
+            .commit_workflow(&WorkflowCommit {
+                run: run.clone(),
+                graph: graph_artifact,
+                nodes: graph.nodes,
+            })
+            .unwrap();
+        let permit = store
+            .claim_next_task("lifecycle-worker", now, Duration::seconds(30))
+            .unwrap()
+            .unwrap()
+            .permit;
+        TaskArtifactFixture {
+            _root: root,
+            store,
+            run,
+            permit,
+            now,
+        }
+    }
+
+    fn agent_turn_artifact(fixture: &TaskArtifactFixture, label: &str) -> Artifact {
+        permit_artifact(
+            &fixture.store,
+            &fixture.permit,
+            ArtifactKind::AgentTurn,
+            &serde_json::json!({"label": label}),
+            vec![],
+            ArtifactLifecycle::RunScoped,
+            fixture.now,
+        )
+    }
+
+    #[test]
+    fn agent_turn_started_is_durable_and_duplicate_write_rolls_back() {
+        let fixture = task_artifact_fixture(RunPurpose::Debug);
+        fixture
+            .store
+            .append_task_event(
+                &fixture.permit,
+                LifecycleEventType::AgentTurnStarted,
+                fixture.now,
+            )
+            .unwrap();
+
+        let events = fixture
+            .store
+            .events_after(&fixture.run.run_id, 0, 100)
+            .unwrap();
+        assert_eq!(events.len(), 3);
+        let started = events
+            .iter()
+            .find(|event| event.event_type == LifecycleEventType::AgentTurnStarted.as_str())
+            .unwrap();
+        assert_eq!(started.task_id, Some(fixture.permit.task_id.clone()));
+        assert_eq!(started.attempt_id, Some(fixture.permit.attempt_id.clone()));
+        assert!(started.artifact_id.is_none());
+
+        assert!(matches!(
+            fixture.store.append_task_event(
+                &fixture.permit,
+                LifecycleEventType::AgentTurnStarted,
+                fixture.now,
+            ),
+            Err(StoreError::Integrity(_))
+        ));
+        let after_duplicate = fixture
+            .store
+            .events_after(&fixture.run.run_id, 0, 100)
+            .unwrap();
+        assert_eq!(after_duplicate.len(), events.len());
+        assert_eq!(
+            after_duplicate
+                .iter()
+                .filter(|event| event.event_type == LifecycleEventType::AgentTurnStarted.as_str())
+                .count(),
+            1
+        );
+        fixture.store.verify_integrity().unwrap();
+    }
+
+    #[test]
+    fn agent_turn_rejects_distinct_terminal_without_new_start() {
+        let fixture = task_artifact_fixture(RunPurpose::Debug);
+        fixture
+            .store
+            .append_task_event(
+                &fixture.permit,
+                LifecycleEventType::AgentTurnStarted,
+                fixture.now,
+            )
+            .unwrap();
+
+        let completed = agent_turn_artifact(&fixture, "completed");
+        fixture
+            .store
+            .write_task_artifact(
+                &fixture.permit,
+                &completed,
+                LifecycleEventType::AgentTurnCompleted,
+                fixture.now,
+            )
+            .unwrap();
+
+        let failed = agent_turn_artifact(&fixture, "failed");
+        assert!(matches!(
+            fixture.store.write_task_artifact(
+                &fixture.permit,
+                &failed,
+                LifecycleEventType::AgentTurnFailed,
+                fixture.now,
+            ),
+            Err(StoreError::Integrity(_))
+        ));
+
+        let events = fixture
+            .store
+            .events_after(&fixture.run.run_id, 0, 100)
+            .unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == LifecycleEventType::AgentTurnFailed.as_str())
+                .count(),
+            0
+        );
+        assert!(matches!(
+            fixture.store.artifact(&failed.artifact_id),
+            Err(StoreError::MissingArtifact(_))
+        ));
+        fixture.store.verify_integrity().unwrap();
+    }
+
+    #[test]
+    fn agent_turn_started_rejects_stale_epoch_without_writing() {
+        let fixture = task_artifact_fixture(RunPurpose::Debug);
+        let mut stale = fixture.permit.clone();
+        stale.epoch += 1;
+        let before = fixture
+            .store
+            .events_after(&fixture.run.run_id, 0, 100)
+            .unwrap()
+            .len();
+
+        assert!(matches!(
+            fixture.store.append_task_event(
+                &stale,
+                LifecycleEventType::AgentTurnStarted,
+                fixture.now,
+            ),
+            Err(StoreError::StalePermit(_))
+        ));
+        assert_eq!(
+            fixture
+                .store
+                .events_after(&fixture.run.run_id, 0, 100)
+                .unwrap()
+                .len(),
+            before
+        );
+        assert_eq!(
+            fixture
+                .store
+                .workflow_snapshot(&fixture.run.run_id)
+                .unwrap()
+                .tasks[0]
+                .status,
+            TaskStatus::Running
+        );
+        fixture.store.verify_integrity().unwrap();
+    }
+
+    #[test]
+    fn pending_agent_turn_blocks_success_until_completed() {
+        let fixture = task_artifact_fixture(RunPurpose::Debug);
+        fixture
+            .store
+            .append_task_event(
+                &fixture.permit,
+                LifecycleEventType::AgentTurnStarted,
+                fixture.now,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            fixture
+                .store
+                .finish_task(&fixture.permit, TaskStatus::Succeeded, fixture.now),
+            Err(StoreError::Integrity(_))
+        ));
+        assert_eq!(
+            fixture
+                .store
+                .workflow_snapshot(&fixture.run.run_id)
+                .unwrap()
+                .tasks[0]
+                .status,
+            TaskStatus::Running
+        );
+
+        let turn = agent_turn_artifact(&fixture, "completed");
+        fixture
+            .store
+            .write_task_artifact(
+                &fixture.permit,
+                &turn,
+                LifecycleEventType::AgentTurnCompleted,
+                fixture.now,
+            )
+            .unwrap();
+        fixture
+            .store
+            .finish_task(&fixture.permit, TaskStatus::Succeeded, fixture.now)
+            .unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .workflow_snapshot(&fixture.run.run_id)
+                .unwrap()
+                .tasks[0]
+                .status,
+            TaskStatus::Succeeded
+        );
+        fixture.store.verify_integrity().unwrap();
+    }
+
+    #[test]
+    fn retry_attempts_close_started_turns_and_preserve_attempt_order() {
+        let fixture = task_artifact_fixture_with_retry(RunPurpose::Debug, 2);
+        fixture
+            .store
+            .append_task_event(
+                &fixture.permit,
+                LifecycleEventType::AgentTurnStarted,
+                fixture.now,
+            )
+            .unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .retry_task(&fixture.permit, fixture.now, fixture.now)
+                .unwrap(),
+            RetryTaskResult::Requeued
+        );
+
+        let second = fixture
+            .store
+            .claim_next_task(
+                "lifecycle-worker-2",
+                fixture.now + Duration::seconds(1),
+                Duration::seconds(30),
+            )
+            .unwrap()
+            .unwrap();
+        assert_ne!(fixture.permit.attempt_id, second.permit.attempt_id);
+        fixture
+            .store
+            .append_task_event(
+                &second.permit,
+                LifecycleEventType::AgentTurnStarted,
+                fixture.now + Duration::seconds(1),
+            )
+            .unwrap();
+        let second_fixture = TaskArtifactFixture {
+            _root: fixture._root,
+            store: fixture.store,
+            run: fixture.run,
+            permit: second.permit,
+            now: fixture.now + Duration::seconds(1),
+        };
+        let turn = agent_turn_artifact(&second_fixture, "retry-completed");
+        second_fixture
+            .store
+            .write_task_artifact(
+                &second_fixture.permit,
+                &turn,
+                LifecycleEventType::AgentTurnCompleted,
+                second_fixture.now,
+            )
+            .unwrap();
+        second_fixture
+            .store
+            .finish_task(
+                &second_fixture.permit,
+                TaskStatus::Succeeded,
+                second_fixture.now,
+            )
+            .unwrap();
+
+        let events = second_fixture
+            .store
+            .events_after(&second_fixture.run.run_id, 0, 100)
+            .unwrap();
+        let lifecycle: Vec<_> = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.lifecycle_kind().unwrap(),
+                    LifecycleEventType::AgentTurnStarted
+                        | LifecycleEventType::AgentTurnCompleted
+                        | LifecycleEventType::TaskRetryScheduled
+                        | LifecycleEventType::TaskSucceeded
+                )
+            })
+            .collect();
+        assert_eq!(
+            lifecycle
+                .iter()
+                .map(|event| event.event_type.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                LifecycleEventType::AgentTurnStarted.as_str(),
+                LifecycleEventType::TaskRetryScheduled.as_str(),
+                LifecycleEventType::AgentTurnStarted.as_str(),
+                LifecycleEventType::AgentTurnCompleted.as_str(),
+                LifecycleEventType::TaskSucceeded.as_str(),
+            ]
+        );
+        assert_eq!(
+            lifecycle[0].attempt_id,
+            Some(fixture.permit.attempt_id.clone())
+        );
+        assert_eq!(
+            lifecycle[2].attempt_id,
+            Some(second_fixture.permit.attempt_id.clone())
+        );
+        assert_eq!(
+            lifecycle[3].attempt_id,
+            Some(second_fixture.permit.attempt_id.clone())
+        );
+        second_fixture.store.verify_integrity().unwrap();
+    }
+
+    #[test]
+    fn recovery_and_cancel_close_unfinished_agent_turns() {
+        let recovered = task_artifact_fixture(RunPurpose::Debug);
+        recovered
+            .store
+            .append_task_event(
+                &recovered.permit,
+                LifecycleEventType::AgentTurnStarted,
+                recovered.now,
+            )
+            .unwrap();
+        assert_eq!(
+            recovered
+                .store
+                .recover_expired_tasks(recovered.now + Duration::seconds(31))
+                .unwrap(),
+            1
+        );
+        let recovery_events = recovered
+            .store
+            .events_after(&recovered.run.run_id, 0, 100)
+            .unwrap();
+        assert!(recovery_events.iter().any(|event| {
+            matches!(
+                event.lifecycle_kind().unwrap(),
+                LifecycleEventType::TaskRecovered | LifecycleEventType::TaskRecoveryExhausted
+            )
+        }));
+        recovered.store.verify_integrity().unwrap();
+
+        let cancelled = task_artifact_fixture(RunPurpose::Debug);
+        cancelled
+            .store
+            .append_task_event(
+                &cancelled.permit,
+                LifecycleEventType::AgentTurnStarted,
+                cancelled.now,
+            )
+            .unwrap();
+        cancelled
+            .store
+            .finish_task(&cancelled.permit, TaskStatus::Cancelled, cancelled.now)
+            .unwrap();
+        assert_eq!(
+            cancelled
+                .store
+                .workflow_snapshot(&cancelled.run.run_id)
+                .unwrap()
+                .tasks[0]
+                .status,
+            TaskStatus::Cancelled
+        );
+        cancelled.store.verify_integrity().unwrap();
     }
 }

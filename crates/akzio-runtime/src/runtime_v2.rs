@@ -708,6 +708,10 @@ impl WorkflowRuntime {
                 task.finished_at = None;
                 replay.saw_task_start = true;
             }
+            LifecycleEventType::AgentTurnStarted => {
+                let task = Self::replay_task_mut(run_id, replay, event)?;
+                Self::assert_active_attempt(run_id, task, event)?;
+            }
             LifecycleEventType::TaskRetryScheduled | LifecycleEventType::TaskRecovered => {
                 let task = Self::replay_task_mut(run_id, replay, event)?;
                 Self::assert_active_attempt(run_id, task, event)?;
@@ -2703,6 +2707,9 @@ mod tests {
         let claimed = store
             .claim_next_task("trace-worker", now, Duration::seconds(30))
             .unwrap()
+            .unwrap();
+        store
+            .append_task_event(&claimed.permit, LifecycleEventType::AgentTurnStarted, now)
             .unwrap();
         let artifact = task_artifact(&store, &claimed, now);
         store
