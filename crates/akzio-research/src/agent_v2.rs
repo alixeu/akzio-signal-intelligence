@@ -183,6 +183,8 @@ const PLANNER_RECIPE_ID: &str = "research.planner";
 const PLANNER_CHILD_RECIPE_IDS: [&str; 2] = ["research.analyst", "research.synthesizer"];
 const GOVERNED_EVIDENCE_SOURCE_FAMILIES: [&str; 4] = ["alpaca", "sec_edgar", "fred", "news_web"];
 const PLANNER_MAX_DRAFT_TASKS: u16 = 7;
+const RFC3339_TIMESTAMP_PATTERN: &str =
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$";
 const EVIDENCE_GATE_RECIPE_ID: &str = "gate.evidence";
 const DECISION_GATE_RECIPE_ID: &str = "gate.decision";
 const EXECUTION_GATE_RECIPE_ID: &str = "gate.execution";
@@ -488,7 +490,7 @@ fn canonical_active_contracts(store: &V2Store) -> ResearchResult<Vec<AgentContra
         CanonicalContractDefinition {
             purpose: PLANNER_RECIPE_ID,
             responsibility: "Lower a bounded research objective into a WorkflowProposalDraft using only installed research recipes and inline EvidenceNeed requests.",
-            prompt: "You are Akzio's bounded research planner. Return only JSON matching the WorkflowProposalDraft schema. You may name only research.analyst and research.synthesizer recipes, and express evidence needs inline. Rust may insert one conditional critic only for the structured-critique candidate topology. Do not construct ArtifactRef values, request sources or tools beyond the contract, submit a decision, or submit an order.",
+            prompt: "You are Akzio's bounded research planner. Return only JSON matching the WorkflowProposalDraft schema. You may name only research.analyst and research.synthesizer recipes, and express evidence needs inline. Numeric bounds are strict: priority 0-100, max_age_secs 1-604800, max_results 1-32 (prefer 1-20), at most 4 assets and 7 tasks. window_start and window_end must be null or RFC3339 timestamps; never use natural-language values such as latest. Rust may insert one conditional critic only for the structured-critique candidate topology. Do not construct ArtifactRef values, request sources or tools beyond the contract, submit a decision, or submit an order.",
             output_kind: ArtifactKind::WorkflowProposalDraft,
             output_schema: planner_draft_output_schema(),
             permitted_kinds: BTreeSet::from([
@@ -892,8 +894,14 @@ fn research_intent_output_schema() -> Value {
                 "maxItems": 4,
                 "items": {"type": "string", "enum": ["TQQQ", "QQQ", "SOXX", "SOXL"]}
             },
-            "window_start": {"type": ["string", "null"]},
-            "window_end": {"type": ["string", "null"]},
+                    "window_start": {
+                        "type": ["string", "null"],
+                        "pattern": RFC3339_TIMESTAMP_PATTERN,
+                    },
+                    "window_end": {
+                        "type": ["string", "null"],
+                        "pattern": RFC3339_TIMESTAMP_PATTERN,
+                    },
             "max_age_secs": {"type": "integer", "maximum": 604800},
             "max_results": {"type": "integer", "maximum": 32}
         },
@@ -2355,8 +2363,14 @@ fn logical_now(start: DateTime<Utc>, elapsed: StdDuration) -> DateTime<Utc> {
 
 fn retryable_model_error(error: &ResearchError, retry: &akzio_domain::RetryPolicy) -> bool {
     match error {
+        ResearchError::InvalidOutput(_) | ResearchError::MissingFinalOutput => {
+            retry.retry_invalid_output
+        }
         ResearchError::Model(_) => retry.retry_transport,
         ResearchError::RateLimited(_) => retry.retry_rate_limited,
+        ResearchError::ModelDebug { error_class, .. } if *error_class == "invalid_output" => {
+            retry.retry_invalid_output
+        }
         ResearchError::ModelDebug { error_class, .. } if *error_class == "transport" => {
             retry.retry_transport
         }
@@ -2634,6 +2648,7 @@ fn validate_schema_bounds(
                 return Err(format!("{path} object schema contains incompatible bounds"));
             }
         }
+        "null" => {}
         _ => {
             if definition.contains_key("minimum")
                 || definition.contains_key("maximum")
@@ -2793,6 +2808,74 @@ mod tests {
         assert_eq!(
             ResearchError::ToolNotGranted("read_artifact".to_owned()).retry_cause(),
             None
+        );
+    }
+
+    #[test]
+    fn invalid_output_retry_respects_contract_policy() {
+        let invalid = [
+            ResearchError::InvalidOutput("invalid JSON".to_owned()),
+            ResearchError::MissingFinalOutput,
+            ResearchError::ModelDebug {
+                error_class: "invalid_output",
+                message: "missing field".to_owned(),
+                trace: ModelCallTrace {
+                    request: json!({}),
+                    result: json!({}),
+                },
+            },
+        ];
+        let retry = RetryPolicy {
+            max_attempts: 2,
+            initial_backoff_ms: 0,
+            retry_transport: false,
+            retry_rate_limited: false,
+            retry_invalid_output: true,
+        };
+        assert!(invalid
+            .iter()
+            .all(|error| retryable_model_error(error, &retry)));
+
+        let no_retry = RetryPolicy {
+            retry_invalid_output: false,
+            ..retry
+        };
+        assert!(invalid
+            .iter()
+            .all(|error| !retryable_model_error(error, &no_retry)));
+        assert!(!retryable_model_error(
+            &ResearchError::Model("transport".to_owned()),
+            &retry,
+        ));
+    }
+
+    #[test]
+    fn planner_prompt_states_research_intent_bounds() {
+        let root = tempdir().unwrap();
+        let store = V2Store::open(root.path()).unwrap();
+        let planner = canonical_active_contracts(&store)
+            .unwrap()
+            .into_iter()
+            .find(|contract| contract.purpose.as_str() == PLANNER_RECIPE_ID)
+            .unwrap();
+        let prompt = String::from_utf8(store.read_blob(&planner.prompt.role).unwrap()).unwrap();
+        assert!(prompt.contains("max_results 1-32"));
+        assert!(prompt.contains("priority 0-100"));
+        assert!(prompt.contains("max_age_secs 1-604800"));
+        assert!(prompt.contains("window_start and window_end must be null or RFC3339 timestamps"));
+    }
+
+    #[test]
+    fn planner_schema_rejects_natural_language_windows() {
+        let schema = planner_draft_output_schema();
+        let window = &schema["properties"]["tasks"]["additionalProperties"]["properties"]
+            ["research_intents"]["items"]["properties"]["window_start"];
+
+        assert!(validate_schema_value(&json!("latest"), window, "$.window_start").is_err());
+        assert!(validate_schema_value(&Value::Null, window, "$.window_start").is_ok());
+        assert!(
+            validate_schema_value(&json!("2026-08-15T00:00:00Z"), window, "$.window_start",)
+                .is_ok()
         );
     }
 

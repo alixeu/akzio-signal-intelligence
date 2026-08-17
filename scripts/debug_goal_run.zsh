@@ -98,8 +98,15 @@ cleanup() {
     rm -rf -- "${goal_target}"
     rm_exit=$?
   fi
-  [[ -d "${goal_target}" ]] && target_exists=true
-  du -sh target outputs report > "${goal_bundle}/commands/disk-after.txt" 2>&1
+    [[ -d "${goal_target}" ]] && target_exists=true
+    {
+        if [[ -e target ]]; then
+            du -sh target
+        else
+            print -- "target: absent"
+        fi
+        du -sh outputs report
+    } > "${goal_bundle}/commands/disk-after.txt" 2>&1
   disk_exit=$?
   if (( cargo_clean_exit == 0 && rm_exit == 0 && disk_exit == 0 )) && [[ "${target_exists}" == false ]]; then
     cleanup_ok=true

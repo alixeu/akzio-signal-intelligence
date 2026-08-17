@@ -11,7 +11,10 @@ use akzio_learning::{
     evaluate_frozen_evidence, FrozenEvidenceRecord, FrozenEvidenceSet, OutcomeCostModel,
 };
 use akzio_model::ModelConfig;
-use akzio_store::{v2::TrajectoryEntry, V2Store};
+use akzio_store::{
+    v2::{SessionSlot, StoredRun, TrajectoryEntry},
+    V2Store,
+};
 use anyhow::{bail, Context, Result};
 use chrono::{Duration as ChronoDuration, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -106,6 +109,9 @@ enum StoreCommand {
     Doctor,
     Metrics,
     Alerts,
+    PaperSession {
+        session_key: String,
+    },
     Backup {
         target: PathBuf,
     },
@@ -119,6 +125,29 @@ enum StoreCommand {
         #[arg(long)]
         include_raw_model: bool,
     },
+}
+
+#[derive(Debug, Serialize)]
+struct PaperSessionView {
+    session_key: String,
+    workflow: StoredRun,
+    scheduler_epoch: u64,
+    reserved_at: chrono::DateTime<Utc>,
+    commitment_artifact_id: Option<akzio_domain::ArtifactId>,
+    committed_at: Option<chrono::DateTime<Utc>>,
+}
+
+impl From<SessionSlot> for PaperSessionView {
+    fn from(slot: SessionSlot) -> Self {
+        Self {
+            session_key: slot.session_key,
+            workflow: slot.workflow.run,
+            scheduler_epoch: slot.scheduler_epoch,
+            reserved_at: slot.reserved_at,
+            commitment_artifact_id: slot.commitment_artifact_id,
+            committed_at: slot.committed_at,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -442,6 +471,14 @@ async fn main() -> Result<()> {
         } => {
             let metrics = V2Store::open_existing(&config.daemon.store_root)?.metrics(Utc::now())?;
             print_json(&metrics.alerts())
+        }
+        Command::Store {
+            command: StoreCommand::PaperSession { session_key },
+        } => {
+            let slot = V2Store::open_existing(&config.daemon.store_root)?
+                .session_slot(&session_key)?
+                .map(PaperSessionView::from);
+            print_json(&slot)
         }
         Command::Store {
             command: StoreCommand::Backup { target },
@@ -1017,6 +1054,11 @@ mod tests {
         let path = write_config(&directory, "http_addr='127.0.0.1:1'", "['TQQQ']");
 
         assert!(load_config(&path).is_err());
+    }
+
+    #[test]
+    fn paper_session_command_accepts_broker_session_key() {
+        assert!(Cli::try_parse_from(["akzio", "store", "paper-session", "2026-08-17",]).is_ok());
     }
 
     #[test]

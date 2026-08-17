@@ -584,8 +584,16 @@ impl AlpacaPaper {
         {
             return Err(PaperError::NonPaperEndpoint(supplied));
         }
+        let client = Client::builder()
+            .http1_only()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|source| PaperError::Transport {
+                url: supplied.clone(),
+                source,
+            })?;
         Ok(Self {
-            client: Client::new(),
+            client,
             base_url: "https://paper-api.alpaca.markets".to_owned(),
             credentials,
         })

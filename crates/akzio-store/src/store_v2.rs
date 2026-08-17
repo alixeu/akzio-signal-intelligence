@@ -5256,12 +5256,14 @@ impl V2Store {
             .nodes
             .iter()
             .cloned()
+            .map(canonical_workflow_node)
             .map(|node| (node.task_id.clone(), node))
             .collect::<std::collections::BTreeMap<_, _>>();
         let stored_nodes = tasks
             .iter()
             .filter(|task| task.node.recipe_id.as_str() != POST_TERMINAL_WORKER_RECIPE_ID)
-            .map(|task| (task.node.task_id.clone(), task.node.clone()))
+            .map(|task| canonical_workflow_node(task.node.clone()))
+            .map(|node| (node.task_id.clone(), node))
             .collect::<std::collections::BTreeMap<_, _>>();
         if graph_nodes != stored_nodes {
             return Err(StoreError::WorkflowGraphMismatch);
@@ -7799,6 +7801,11 @@ fn task_dependencies(connection: &Connection, task_id: &TaskId) -> StoreResult<V
         .query_map(params![task_id.0], |row| Ok(TaskId(row.get(0)?)))?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(dependencies)
+}
+
+fn canonical_workflow_node(mut node: WorkflowNode) -> WorkflowNode {
+    node.dependencies.sort();
+    node
 }
 
 fn assert_permit(transaction: &Transaction<'_>, permit: &TaskWritePermit) -> StoreResult<()> {
@@ -12108,6 +12115,56 @@ mod tests {
             .iter()
             .any(|event| event.event_type == "run.cancel_requested"));
         store.verify_integrity().unwrap();
+    }
+
+    #[test]
+    fn workflow_snapshot_ignores_dependency_ordering() {
+        let root = tempdir().unwrap();
+        let store = V2Store::open(root.path()).unwrap();
+        let mut graph = graph();
+        let mut first = graph.nodes.remove(0);
+        first.task_id = TaskId("task-b".to_owned());
+        let mut second = first.clone();
+        second.task_id = TaskId("task-a".to_owned());
+        second.recipe_id = TaskRecipeId::new("research.synthesizer").unwrap();
+        let mut child = first.clone();
+        child.task_id = TaskId("task-c".to_owned());
+        child.recipe_id = TaskRecipeId::new("gate.decision").unwrap();
+        child.dependencies = vec![first.task_id.clone(), second.task_id.clone()];
+        graph.nodes = vec![first.clone(), second.clone(), child.clone()];
+        graph.validate().unwrap();
+
+        let graph_artifact = artifact(
+            &store,
+            ArtifactKind::WorkflowGraph,
+            &serde_json::to_string(&graph).unwrap(),
+            None,
+        );
+        let run = StoredRun {
+            run_id: RunId::new(),
+            purpose: RunPurpose::Debug,
+            topology_id: graph.topology_id.clone(),
+            graph_artifact_id: graph_artifact.artifact_id.clone(),
+            created_at: Utc::now(),
+        };
+        store
+            .commit_workflow(&WorkflowCommit {
+                run: run.clone(),
+                graph: graph_artifact,
+                nodes: graph.nodes,
+            })
+            .unwrap();
+
+        let snapshot = store.workflow_snapshot(&run.run_id).unwrap();
+        let stored_child = snapshot
+            .tasks
+            .iter()
+            .find(|task| task.node.task_id == child.task_id)
+            .unwrap();
+        assert_eq!(
+            stored_child.node.dependencies,
+            vec![second.task_id, first.task_id]
+        );
     }
 
     #[test]

@@ -28,7 +28,7 @@ use akzio_domain::{
     ArtifactProvenance, ArtifactRef, Asset, ContentHash, ContextPolicy, Decision, DecisionContext,
     DomainError, EvidenceNeed, ExecutionContext, ExecutionVerdict, FreezeState, LifecycleEventType,
     MarketClockSnapshot, MemoryId, MoneyMicros, OutcomeExecutionLineage, OutcomeHorizon,
-    OutcomeSchedule, PolicySubject, QuoteSnapshot, ResearchClaim, Retrospective,
+    OutcomeSchedule, PolicySubject, Quote, QuoteSnapshot, ResearchClaim, Retrospective,
     RetrospectiveDraft, RunId, RunPurpose, RuntimeTaskClass, TaskId, TaskStatus, TopologyId,
     WorkflowProposal, WorkflowStatus,
 };
@@ -679,12 +679,8 @@ impl Daemon {
                     error = %error,
                     "v2 daemon task failed closed"
                 );
-                match error {
-                    DaemonError::Research(error) => error
-                        .retry_cause()
-                        .map_or(TaskCompletion::Failed, TaskCompletion::Retry),
-                    _ => TaskCompletion::Failed,
-                }
+                retry_cause_for_daemon_error(&error)
+                    .map_or(TaskCompletion::Failed, TaskCompletion::Retry)
             }
         }
     }
@@ -1671,6 +1667,16 @@ impl Daemon {
     }
 }
 
+fn retry_cause_for_daemon_error(error: &DaemonError) -> Option<RetryCause> {
+    match error {
+        DaemonError::Research(error) => error.retry_cause(),
+        DaemonError::Evidence(EvidenceRuntimeError::Adapter(
+            akzio_ingest::runtime::EvidenceAdapterError::Transport(_),
+        )) => Some(RetryCause::Transport),
+        _ => None,
+    }
+}
+
 fn parse_daily_bars(
     value: &Value,
     observed_at: DateTime<Utc>,
@@ -1823,9 +1829,19 @@ fn execution_snapshot_artifact(
 
     let envelope: akzio_ingest::NormalizedEvidencePayload =
         serde_json::from_slice(&store.read_blob(&normalized.blob)?)?;
+    let broker_session = store
+        .session_slot_for_run(&task.run_id)?
+        .map(|slot| slot.session_key)
+        .ok_or_else(|| {
+            DaemonError::InvalidInput("Paper run has no scheduler session slot".to_owned())
+        })?;
     match resource {
         PAPER_ACCOUNT_RESOURCE => {
-            let payload: AccountSnapshot = serde_json::from_value(envelope.value)?;
+            let payload = decode_paper_account(
+                &envelope.value,
+                broker_session.clone(),
+                envelope.observed_at,
+            )?;
             payload
                 .validate()
                 .map_err(|error| DaemonError::InvalidInput(error.to_string()))?;
@@ -1840,7 +1856,11 @@ fn execution_snapshot_artifact(
             .map(Some)
         }
         PAPER_QUOTES_RESOURCE => {
-            let payload: QuoteSnapshot = serde_json::from_value(envelope.value)?;
+            let payload = decode_paper_quotes(
+                &envelope.value,
+                broker_session.clone(),
+                envelope.observed_at,
+            )?;
             payload
                 .validate()
                 .map_err(|error| DaemonError::InvalidInput(error.to_string()))?;
@@ -1855,7 +1875,8 @@ fn execution_snapshot_artifact(
             .map(Some)
         }
         PAPER_CLOCK_RESOURCE => {
-            let payload: MarketClockSnapshot = serde_json::from_value(envelope.value)?;
+            let payload =
+                decode_paper_clock(&envelope.value, broker_session, envelope.observed_at)?;
             payload
                 .validate()
                 .map_err(|error| DaemonError::InvalidInput(error.to_string()))?;
@@ -1871,6 +1892,124 @@ fn execution_snapshot_artifact(
         }
         _ => unreachable!("resource match was checked above"),
     }
+}
+
+fn decode_paper_account(
+    value: &Value,
+    broker_session: String,
+    observed_at: DateTime<Utc>,
+) -> Result<AccountSnapshot> {
+    if value.get("schema_version").is_some() {
+        return Ok(serde_json::from_value(value.clone())?);
+    }
+    let status = value
+        .get("status")
+        .and_then(Value::as_str)
+        .ok_or_else(|| DaemonError::InvalidInput("Paper account status missing".to_owned()))?;
+    Ok(AccountSnapshot {
+        schema_version: akzio_domain::V2_DOMAIN_SCHEMA_VERSION,
+        broker_session,
+        observed_at,
+        equity: provider_money(value, "equity")?,
+        buying_power: provider_money(value, "buying_power")?,
+        day_turnover: MoneyMicros::ZERO,
+        active: status.eq_ignore_ascii_case("ACTIVE"),
+        trading_blocked: value
+            .get("trading_blocked")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| {
+                DaemonError::InvalidInput("Paper account trading_blocked missing".to_owned())
+            })?,
+        positions: BTreeMap::new(),
+    })
+}
+
+fn decode_paper_quotes(
+    value: &Value,
+    broker_session: String,
+    observed_at: DateTime<Utc>,
+) -> Result<QuoteSnapshot> {
+    if value.get("schema_version").is_some() {
+        return Ok(serde_json::from_value(value.clone())?);
+    }
+    let quotes = value
+        .get("quotes")
+        .and_then(Value::as_object)
+        .ok_or_else(|| DaemonError::InvalidInput("Paper quotes payload missing quotes".to_owned()))?
+        .iter()
+        .map(|(symbol, quote)| {
+            let asset = Asset::try_from(symbol.as_str()).map_err(|_| {
+                DaemonError::InvalidInput(format!(
+                    "Paper quote asset outside v2 universe: {symbol}"
+                ))
+            })?;
+            let quote_observed_at = quote
+                .get("t")
+                .map(|timestamp| provider_timestamp(timestamp, "quote.t"))
+                .transpose()?
+                .unwrap_or(observed_at);
+            Ok((
+                asset,
+                Quote {
+                    bid: provider_money(quote, "bp")?,
+                    ask: provider_money(quote, "ap")?,
+                    observed_at: quote_observed_at,
+                },
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    if quotes.is_empty() {
+        return Err(DaemonError::InvalidInput(
+            "Paper quotes payload contains no executable assets".to_owned(),
+        ));
+    }
+    Ok(QuoteSnapshot {
+        schema_version: akzio_domain::V2_DOMAIN_SCHEMA_VERSION,
+        broker_session,
+        observed_at,
+        quotes,
+    })
+}
+
+fn decode_paper_clock(
+    value: &Value,
+    broker_session: String,
+    observed_at: DateTime<Utc>,
+) -> Result<MarketClockSnapshot> {
+    if value.get("schema_version").is_some() {
+        return Ok(serde_json::from_value(value.clone())?);
+    }
+    Ok(MarketClockSnapshot {
+        schema_version: akzio_domain::V2_DOMAIN_SCHEMA_VERSION,
+        broker_session,
+        is_open: value
+            .get("is_open")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| DaemonError::InvalidInput("Paper clock is_open missing".to_owned()))?,
+        observed_at: value
+            .get("timestamp")
+            .map(|timestamp| provider_timestamp(timestamp, "clock.timestamp"))
+            .transpose()?
+            .unwrap_or(observed_at),
+    })
+}
+
+fn provider_money(value: &Value, field: &str) -> Result<MoneyMicros> {
+    value
+        .get(field)
+        .and_then(parse_money_micros)
+        .ok_or_else(|| DaemonError::InvalidInput(format!("Paper provider field {field} invalid")))
+}
+
+fn provider_timestamp(value: &Value, field: &str) -> Result<DateTime<Utc>> {
+    let raw = value.as_str().ok_or_else(|| {
+        DaemonError::InvalidInput(format!("Paper provider field {field} invalid"))
+    })?;
+    DateTime::parse_from_rfc3339(raw)
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+        .map_err(|error| {
+            DaemonError::InvalidInput(format!("Paper provider field {field}: {error}"))
+        })
 }
 
 fn seal_execution_snapshot<T: serde::Serialize>(
@@ -2306,6 +2445,64 @@ mod tests {
             auto_paper: false,
             outcome_cost_model: OutcomeCostModel::default(),
         }
+    }
+
+    #[test]
+    fn evidence_transport_failure_requests_transport_retry() {
+        let error = DaemonError::Evidence(EvidenceRuntimeError::Adapter(
+            akzio_ingest::runtime::EvidenceAdapterError::Transport("connection reset".to_owned()),
+        ));
+
+        assert_eq!(
+            retry_cause_for_daemon_error(&error),
+            Some(RetryCause::Transport)
+        );
+    }
+
+    #[test]
+    fn evidence_quality_failure_stays_terminal() {
+        let error = DaemonError::Evidence(EvidenceRuntimeError::InvalidAcquisition);
+
+        assert_eq!(retry_cause_for_daemon_error(&error), None);
+    }
+
+    #[test]
+    fn paper_provider_payloads_are_mapped_to_domain_snapshots() {
+        let now = Utc::now();
+        let session = "2026-08-14".to_owned();
+        let account = serde_json::json!({
+            "equity": "100000",
+            "buying_power": "400000",
+            "status": "ACTIVE",
+            "trading_blocked": false,
+        });
+        let account = decode_paper_account(&account, session.clone(), now).unwrap();
+        assert_eq!(
+            account.schema_version,
+            akzio_domain::V2_DOMAIN_SCHEMA_VERSION
+        );
+        assert!(account.validate().is_ok());
+
+        let quotes = serde_json::json!({
+            "quotes": {
+                "TQQQ": { "bp": 76.28, "ap": 76.29, "t": "2026-08-14T18:02:07Z" },
+                "QQQ": { "bp": 729.38, "ap": 729.41, "t": "2026-08-14T18:02:07Z" },
+                "SOXX": { "bp": 544.54, "ap": 544.78, "t": "2026-08-14T18:02:08Z" },
+                "SOXL": { "bp": 140.14, "ap": 140.22, "t": "2026-08-14T18:02:07Z" },
+            },
+        });
+        let quotes = decode_paper_quotes(&quotes, session.clone(), now).unwrap();
+        assert_eq!(quotes.quotes.len(), 4);
+        assert!(quotes.validate().is_ok());
+
+        let clock = serde_json::json!({
+            "is_open": true,
+            "timestamp": "2026-08-14T18:02:08Z",
+            "next_close": "2026-08-14T20:00:00Z",
+        });
+        let clock = decode_paper_clock(&clock, session, now).unwrap();
+        assert!(clock.is_open);
+        assert!(clock.validate().is_ok());
     }
 
     fn response(output: serde_json::Value) -> serde_json::Value {
@@ -3292,6 +3489,28 @@ mod tests {
             daemon.serve_workers(receiver).await,
             Err(DaemonError::InvalidInput(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn paper_scheduler_does_not_reserve_when_clock_is_closed() {
+        let directory = tempdir().unwrap();
+        let daemon = Daemon::with_model(
+            config(directory.path().to_path_buf()),
+            fixture_model_client(),
+        )
+        .unwrap();
+        let session_key = Utc::now().date_naive().to_string();
+        let clock = StaticSessionClock(None);
+        let source = StaticPaperWorkflowSource::new(paper_proposal());
+
+        let reservation = daemon
+            .scheduler
+            .tick(&clock, &source, Utc::now())
+            .await
+            .unwrap();
+
+        assert!(reservation.is_none());
+        assert!(daemon.store().session_slot(&session_key).unwrap().is_none());
     }
 
     #[tokio::test]

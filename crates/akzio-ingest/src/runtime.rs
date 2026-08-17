@@ -502,6 +502,7 @@ impl AlpacaPaperEvidenceTransport {
             ));
         }
         let client = Client::builder()
+            .http1_only()
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .map_err(|error| EvidenceAdapterError::Transport(error.to_string()))?;
