@@ -16,6 +16,7 @@ pub mod execution;
 pub mod ids;
 pub mod policy;
 pub mod research;
+pub mod runtime_manifest;
 pub mod workflow;
 
 pub use artifact::*;
@@ -32,6 +33,7 @@ pub use ids::{
 };
 pub use policy::*;
 pub use research::*;
+pub use runtime_manifest::*;
 pub use workflow::*;
 
 /// Formal schema identity for the source-incompatible v2 domain graph.

@@ -52,6 +52,8 @@ pub enum ArtifactKind {
     WorkflowProposalDraft,
     WorkflowProposal,
     WorkflowGraph,
+    RuntimeManifest,
+    PaperLaunchApproval,
     AgentTurn,
     DeliberationNote,
     ToolCall,
@@ -113,6 +115,8 @@ impl ArtifactKind {
                 | Self::Evaluation
                 | Self::CandidatePolicy
                 | Self::FreezeState
+                | Self::RuntimeManifest
+                | Self::PaperLaunchApproval
         )
     }
 }

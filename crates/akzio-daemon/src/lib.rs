@@ -27,21 +27,24 @@ use akzio_domain::{
     AccountSnapshot, Artifact, ArtifactId, ArtifactKind, ArtifactLifecycle, ArtifactOrigin,
     ArtifactProvenance, ArtifactRef, Asset, ContentHash, ContextPolicy, Decision, DecisionContext,
     DomainError, EvidenceNeed, ExecutionContext, ExecutionVerdict, FreezeState, LifecycleEventType,
-    MarketClockSnapshot, MemoryId, MoneyMicros, OutcomeExecutionLineage, OutcomeHorizon,
-    OutcomeSchedule, PolicySubject, Quote, QuoteSnapshot, ResearchClaim, Retrospective,
-    RetrospectiveDraft, RunId, RunPurpose, RuntimeTaskClass, TaskId, TaskStatus, TopologyId,
+    MarketClockSnapshot, MemoryId, MoneyMicros, OrderReceipt, OrderReceiptState,
+    OutcomeExecutionLineage, OutcomeHorizon, OutcomeSchedule, PolicySubject, Quote, QuoteSnapshot,
+    Reconciliation, ReconciliationState, ResearchClaim, Retrospective, RetrospectiveDraft, RunId,
+    RunPurpose, RuntimeTaskClass, TargetPortfolio, TaskId, TaskStatus, TopologyId, WeightPpm,
     WorkflowProposal, WorkflowStatus,
 };
 use akzio_execution::{
     paper::CommittedPaperBroker, DecisionGateError, DecisionGateInput, ExecutionGateError,
-    ExecutionGateInput, PaperCommitmentError, PaperCommitmentInput, PaperDispatchError,
-    PaperDispatchInput, V2DecisionRuntime, V2ExecutionRuntime, V2PaperCommitmentRuntime,
-    V2PaperDispatchRuntime,
+    ExecutionGateInput, ExecutionPlan, OrderSide, PaperCommitmentError, PaperCommitmentInput,
+    PaperDispatchError, PaperDispatchInput, V2DecisionRuntime, V2ExecutionRuntime,
+    V2PaperCommitmentRuntime, V2PaperDispatchRuntime,
 };
+pub use akzio_ingest::AlpacaMarketDataFeed;
 use akzio_ingest::{
     AcquiredEvidence, AlpacaPaperEvidenceTransport, AsyncEvidenceAdapter, EvidenceProvenance,
     EvidenceQuality, EvidenceRequest, EvidenceRuntime, EvidenceRuntimeError, EvidenceSource,
-    FixtureEvidenceAdapter, ModelNativeWebEvidenceTransport, NormalizedEvidencePayload,
+    FixtureEvidenceAdapter, FredDirectTransport, ModelNativeWebEvidenceTransport,
+    NormalizedEvidencePayload, SecEdgarDirectTransport,
 };
 use akzio_learning::{
     EvaluationError, EvaluationInput, EvaluationPolicy, EvaluationRuntime,
@@ -76,6 +79,8 @@ use tokio::{net::TcpListener, sync::watch};
 
 const EVENT_PAGE_SIZE: usize = 256;
 const PAPER_ACCOUNT_RESOURCE: &str = "paper.account";
+const PAPER_POSITIONS_RESOURCE: &str = "paper.positions";
+const PAPER_OPEN_ORDERS_RESOURCE: &str = "paper.open_orders";
 const PAPER_QUOTES_RESOURCE: &str = "paper.quotes";
 const PAPER_CLOCK_RESOURCE: &str = "paper.clock";
 const OUTCOME_WORKER_RECIPE_ID: &str = "learning.outcome_worker";
@@ -140,7 +145,9 @@ pub struct DaemonConfig {
     pub http_token: String,
     pub worker_count: usize,
     pub auto_paper: bool,
+    pub market_data_feed: Option<AlpacaMarketDataFeed>,
     pub outcome_cost_model: OutcomeCostModel,
+    pub runtime_identity_hash: Option<ContentHash>,
 }
 
 #[derive(Clone)]
@@ -239,6 +246,12 @@ impl Daemon {
     pub fn open(config: DaemonConfig, model_config: ModelConfig) -> Result<Self> {
         let debug = model_config.debug;
         let auto_paper = config.auto_paper;
+        let market_data_feed = config.market_data_feed;
+        if auto_paper && market_data_feed.is_none() {
+            return Err(DaemonError::InvalidInput(
+                "auto_paper requires an explicit Alpaca market-data feed".to_owned(),
+            ));
+        }
         let model = ModelClient::from_config(&model_config)?;
         let mut daemon = Self::with_fixture_evidence_debug(
             config,
@@ -248,22 +261,22 @@ impl Daemon {
         )?;
         let mut production_evidence: BTreeMap<EvidenceSource, Arc<dyn AsyncEvidenceAdapter>> =
             BTreeMap::new();
-        if let Ok(alpaca) = AlpacaPaperEvidenceTransport::from_env() {
+        if let Ok(alpaca) = AlpacaPaperEvidenceTransport::from_env(market_data_feed) {
             production_evidence.insert(EvidenceSource::Alpaca, Arc::new(alpaca));
         }
-        for source in [
-            EvidenceSource::SecEdgar,
-            EvidenceSource::Fred,
-            EvidenceSource::NewsWeb,
-        ] {
-            production_evidence.insert(
-                source,
-                Arc::new(ModelNativeWebEvidenceTransport::for_source(
-                    model.clone(),
-                    source,
-                )),
-            );
+        if let Ok(sec) = SecEdgarDirectTransport::from_env() {
+            production_evidence.insert(EvidenceSource::SecEdgar, Arc::new(sec));
         }
+        if let Ok(fred) = FredDirectTransport::from_env() {
+            production_evidence.insert(EvidenceSource::Fred, Arc::new(fred));
+        }
+        production_evidence.insert(
+            EvidenceSource::NewsWeb,
+            Arc::new(ModelNativeWebEvidenceTransport::for_source(
+                model.clone(),
+                EvidenceSource::NewsWeb,
+            )),
+        );
         let outcome_worker_enabled =
             auto_paper && production_evidence.contains_key(&EvidenceSource::Alpaca);
         daemon.production_evidence = Arc::new(production_evidence);
@@ -306,7 +319,9 @@ impl Daemon {
             store.clone(),
             workflow.clone(),
             format!("akzio-daemon-{}", RunId::new()),
-        )?;
+        )?
+        .with_market_data_feed(config.market_data_feed)
+        .with_runtime_identity_hash(config.runtime_identity_hash.clone());
 
         Ok(Self {
             task_runtime: TaskRuntime::new(store.clone()),
@@ -803,6 +818,32 @@ impl Daemon {
         let session_key = context.broker_session.ok_or_else(|| {
             DaemonError::InvalidInput("accepted execution verdict has no broker session".to_owned())
         })?;
+        if let Some((manifest, approval)) = self.store.paper_approval_for_run(&task.run_id)? {
+            if approval.expires_at < now {
+                return Err(DaemonError::InvalidInput(
+                    "Paper approval expired before commitment".to_owned(),
+                ));
+            }
+            let execution_plan = context
+                .execution_plan
+                .as_ref()
+                .ok_or_else(|| DaemonError::InvalidInput("execution plan is missing".to_owned()))?;
+            let plan: ExecutionPlan = self.read_artifact_payload(execution_plan)?;
+            let total_notional = plan.orders.iter().try_fold(0_i64, |total, order| {
+                total.checked_add(order.notional.0).ok_or_else(|| {
+                    DaemonError::InvalidInput("execution plan notional overflow".to_owned())
+                })
+            })?;
+            if total_notional > manifest.maximum_notional.0 {
+                return Err(DaemonError::InvalidInput(
+                    "execution plan exceeds approved maximum notional".to_owned(),
+                ));
+            }
+        } else if self.auto_paper {
+            return Err(DaemonError::InvalidInput(
+                "Paper approval is missing".to_owned(),
+            ));
+        }
         let lease = self.scheduler.active_lease(now)?;
         self.paper_commitment_runtime
             .commit(&PaperCommitmentInput {
@@ -1080,8 +1121,8 @@ impl Daemon {
             contract_hash,
             topology_id: TopologyId("paper-outcome".to_owned()),
             candidate_policy: None,
-            token_cost: 0,
-            latency_millis: 0,
+            token_cost: None,
+            latency_millis: None,
         };
         if let Some(draft) = retrospective_draft.as_ref() {
             let result = evaluation.evaluate_with_lease_and_retrospective(
@@ -1100,6 +1141,100 @@ impl Daemon {
             )?;
         }
         Ok(TaskCompletion::Committed)
+    }
+
+    fn realized_execution_target(
+        &self,
+        schedule: &OutcomeSchedule,
+        execution_context: &ExecutionContext,
+    ) -> Result<TargetPortfolio> {
+        let account_reference = execution_context.account_snapshot.as_ref().ok_or_else(|| {
+            DaemonError::InvalidInput(
+                "Outcome execution context has no account snapshot".to_owned(),
+            )
+        })?;
+        let account: AccountSnapshot = self.read_artifact_payload(account_reference)?;
+        account
+            .validate()
+            .map_err(|error| DaemonError::InvalidInput(error.to_string()))?;
+        let mut values = Asset::EXECUTABLE
+            .into_iter()
+            .map(|asset| {
+                let value = account
+                    .positions
+                    .get(&asset)
+                    .map_or(0_i128, |position| i128::from(position.market_value.0));
+                (asset, value)
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        if let OutcomeExecutionLineage::ReconciledPaper { reconciliation, .. } = &schedule.execution
+        {
+            let reconciliation: Reconciliation = self.read_artifact_payload(reconciliation)?;
+            if reconciliation.state != ReconciliationState::Complete {
+                return Err(DaemonError::InvalidInput(
+                    "Outcome requires complete reconciliation".to_owned(),
+                ));
+            }
+            let plan_reference = execution_context.execution_plan.as_ref().ok_or_else(|| {
+                DaemonError::InvalidInput("Outcome execution context has no plan".to_owned())
+            })?;
+            let plan: ExecutionPlan = self.read_artifact_payload(plan_reference)?;
+            for receipt_reference in &reconciliation.broker_receipts {
+                let receipt: OrderReceipt = self.read_artifact_payload(receipt_reference)?;
+                if receipt.state != OrderReceiptState::Filled {
+                    return Err(DaemonError::InvalidInput(
+                        "Outcome reconciliation contains non-filled receipt".to_owned(),
+                    ));
+                }
+                let fill_price = receipt.average_fill_price.ok_or_else(|| {
+                    DaemonError::InvalidInput("Filled receipt has no average price".to_owned())
+                })?;
+                let order = plan
+                    .orders
+                    .iter()
+                    .find(|order| order.asset == receipt.asset)
+                    .ok_or_else(|| {
+                        DaemonError::InvalidInput(
+                            "Filled receipt is not in execution plan".to_owned(),
+                        )
+                    })?;
+                let fill_value = i128::from(receipt.filled_quantity_micros)
+                    .saturating_mul(i128::from(fill_price.0))
+                    .saturating_div(1_000_000);
+                let signed = match order.side {
+                    OrderSide::Buy => fill_value,
+                    OrderSide::Sell => -fill_value,
+                };
+                let value = values.get_mut(&receipt.asset).expect("v2 asset is indexed");
+                *value = value.saturating_add(signed);
+                if *value < 0 {
+                    return Err(DaemonError::InvalidInput(
+                        "Execution fills produce a short realized position".to_owned(),
+                    ));
+                }
+            }
+        }
+
+        let equity = i128::from(account.equity.0);
+        let weights = values
+            .into_iter()
+            .map(|(asset, value)| {
+                let ppm = value
+                    .saturating_mul(1_000_000)
+                    .checked_div(equity)
+                    .and_then(|value| u32::try_from(value).ok())
+                    .ok_or_else(|| {
+                        DaemonError::InvalidInput("Realized position weight invalid".to_owned())
+                    })?;
+                Ok((asset, WeightPpm(ppm)))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        let target = TargetPortfolio { weights };
+        target
+            .validate_universe()
+            .map_err(|error| DaemonError::InvalidInput(error.to_string()))?;
+        Ok(target)
     }
 
     async fn collect_outcome_materialization(
@@ -1123,6 +1258,7 @@ impl Daemon {
             self.read_artifact_payload(&schedule.decision_context)?;
         let execution_context: ExecutionContext =
             self.read_artifact_payload(&schedule.execution_context)?;
+        let realized_target = self.realized_execution_target(schedule, &execution_context)?;
         let quote_reference = execution_context.quote_snapshot.clone().ok_or_else(|| {
             DaemonError::Unavailable("Paper outcome baseline quote snapshot missing".to_owned())
         })?;
@@ -1259,7 +1395,7 @@ impl Daemon {
                     expected_risk_count: (decision_context.hard_blockers.len()
                         + decision_context.material_conflicts.len())
                         as u64,
-                    detected_risk_count: 0,
+                    detected_risk_count: None,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1267,7 +1403,7 @@ impl Daemon {
             materialization: OutcomeMaterializationInput {
                 schedule: schedule.clone(),
                 schedule_artifact: schedule_reference.clone(),
-                target: decision.targets,
+                target: realized_target,
                 forecasts: decision.forecasts,
                 baseline_prices,
                 observations,
@@ -1570,6 +1706,7 @@ impl Daemon {
             };
         }
         let mut artifacts = BTreeMap::new();
+        let mut paper_account_components = BTreeMap::new();
         for need_reference in &task.node.input_artifacts {
             if need_reference.kind != ArtifactKind::EvidenceNeed {
                 return Err(DaemonError::InvalidInput(format!(
@@ -1644,7 +1781,16 @@ impl Daemon {
                     now,
                 )?
             };
-            if let Some(snapshot) = execution_snapshot_artifact(
+            if matches!(
+                need.resource.as_str(),
+                PAPER_ACCOUNT_RESOURCE | PAPER_POSITIONS_RESOURCE | PAPER_OPEN_ORDERS_RESOURCE
+            ) || need.resource.starts_with("paper.fills:")
+            {
+                paper_account_components.insert(
+                    need.resource.clone(),
+                    (need_artifact.clone(), bundle.normalized.clone()),
+                );
+            } else if let Some(snapshot) = execution_snapshot_artifact(
                 &self.store,
                 task,
                 &need_artifact,
@@ -1656,6 +1802,11 @@ impl Daemon {
             }
             artifacts.insert(bundle.raw.artifact_id.clone(), bundle.raw);
             artifacts.insert(bundle.normalized.artifact_id.clone(), bundle.normalized);
+        }
+        if !paper_account_components.is_empty() {
+            let snapshot =
+                paper_account_snapshot_artifact(&self.store, task, &paper_account_components, now)?;
+            artifacts.insert(snapshot.artifact_id.clone(), snapshot);
         }
         if artifacts.is_empty() {
             return Err(DaemonError::InvalidInput(format!(
@@ -1798,6 +1949,165 @@ fn debug_fixture_evidence(resource: &str, now: DateTime<Utc>) -> AcquiredEvidenc
     }
 }
 
+fn paper_account_snapshot_artifact(
+    store: &V2Store,
+    task: &ClaimedAttempt,
+    components: &BTreeMap<String, (Artifact, Artifact)>,
+    now: DateTime<Utc>,
+) -> Result<Artifact> {
+    let broker_session = store
+        .session_slot_for_run(&task.run_id)?
+        .map(|slot| slot.session_key)
+        .ok_or_else(|| {
+            DaemonError::InvalidInput("Paper run has no scheduler session slot".to_owned())
+        })?;
+    let fills_resource = format!("paper.fills:{broker_session}");
+    let expected = [
+        PAPER_ACCOUNT_RESOURCE,
+        PAPER_POSITIONS_RESOURCE,
+        PAPER_OPEN_ORDERS_RESOURCE,
+        fills_resource.as_str(),
+    ];
+    if components.len() != expected.len() {
+        return Err(DaemonError::InvalidInput(
+            "Paper account snapshot is missing broker truth components".to_owned(),
+        ));
+    }
+
+    let mut envelopes = BTreeMap::new();
+    let mut normalized_sources = Vec::new();
+    for resource in expected {
+        let (need_artifact, normalized) = components.get(resource).ok_or_else(|| {
+            DaemonError::InvalidInput(format!("Paper account snapshot missing {resource}"))
+        })?;
+        let need: EvidenceNeed = serde_json::from_slice(&store.read_blob(&need_artifact.blob)?)?;
+        if need.source_family != "alpaca"
+            || need.resource != resource
+            || need_artifact.producer != "scheduler.paper_snapshot"
+            || need_artifact
+                .origin
+                .as_ref()
+                .and_then(|origin| origin.run_id.as_ref())
+                != Some(&task.run_id)
+        {
+            return Err(DaemonError::InvalidInput(
+                "Paper account snapshot requires scheduler-owned Alpaca evidence".to_owned(),
+            ));
+        }
+        let envelope: NormalizedEvidencePayload =
+            serde_json::from_slice(&store.read_blob(&normalized.blob)?)?;
+        envelopes.insert(resource.to_owned(), envelope);
+        normalized_sources.push(normalized);
+    }
+
+    let observed_at = envelopes
+        .values()
+        .map(|envelope| envelope.observed_at)
+        .max()
+        .ok_or_else(|| DaemonError::InvalidInput("Paper account snapshot is empty".to_owned()))?;
+    let account_value = &envelopes[PAPER_ACCOUNT_RESOURCE].value;
+    let mut account = decode_paper_account(account_value, broker_session, observed_at)?;
+    if account_value.get("schema_version").is_none() {
+        account.positions.clear();
+        account.external_positions.clear();
+        for position in envelopes[PAPER_POSITIONS_RESOURCE]
+            .value
+            .as_array()
+            .ok_or_else(|| {
+                DaemonError::InvalidInput("Paper positions must be an array".to_owned())
+            })?
+        {
+            let symbol = position
+                .get("symbol")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    DaemonError::InvalidInput("Paper position symbol missing".to_owned())
+                })?;
+            let quantity_micros = position
+                .get("qty")
+                .and_then(parse_money_micros)
+                .map(|quantity| quantity.0)
+                .ok_or_else(|| {
+                    DaemonError::InvalidInput("Paper position qty invalid".to_owned())
+                })?;
+            let market_value = provider_money(position, "market_value")?;
+            match Asset::try_from(symbol) {
+                Ok(asset) => {
+                    account.positions.insert(
+                        asset,
+                        akzio_domain::Position {
+                            quantity_micros,
+                            market_value,
+                        },
+                    );
+                }
+                Err(_) => {
+                    account.external_positions.insert(symbol.to_owned());
+                }
+            }
+        }
+
+        account.open_order_ids = envelopes[PAPER_OPEN_ORDERS_RESOURCE]
+            .value
+            .as_array()
+            .ok_or_else(|| {
+                DaemonError::InvalidInput("Paper open orders must be an array".to_owned())
+            })?
+            .iter()
+            .map(|order| {
+                order
+                    .get("client_order_id")
+                    .or_else(|| order.get("id"))
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                    .map(ToOwned::to_owned)
+                    .ok_or_else(|| {
+                        DaemonError::InvalidInput("Paper open order ID missing".to_owned())
+                    })
+            })
+            .collect::<Result<BTreeSet<_>>>()?;
+
+        let fills = envelopes[&fills_resource]
+            .value
+            .as_array()
+            .ok_or_else(|| DaemonError::InvalidInput("Paper fills must be an array".to_owned()))?;
+        if fills.len() >= 100 {
+            return Err(DaemonError::InvalidInput(
+                "Paper fills require pagination before execution".to_owned(),
+            ));
+        }
+        let turnover = fills.iter().try_fold(0_i128, |sum, fill| {
+            let quantity = fill
+                .get("qty")
+                .and_then(parse_money_micros)
+                .map(|value| i128::from(value.0).abs())
+                .ok_or_else(|| DaemonError::InvalidInput("Paper fill qty invalid".to_owned()))?;
+            let price = i128::from(provider_money(fill, "price")?.0).abs();
+            Ok::<_, DaemonError>(
+                sum.saturating_add(quantity.saturating_mul(price).saturating_div(1_000_000)),
+            )
+        })?;
+        account.day_turnover =
+            MoneyMicros(i64::try_from(turnover).map_err(|_| {
+                DaemonError::InvalidInput("Paper day turnover exceeds i64".to_owned())
+            })?);
+    }
+    account
+        .validate()
+        .map_err(|error| DaemonError::InvalidInput(error.to_string()))?;
+
+    seal_execution_snapshot_sources(
+        store,
+        task,
+        &normalized_sources,
+        "execution.snapshot.account",
+        &account,
+        observed_at,
+        None,
+        now,
+    )
+}
+
 fn execution_snapshot_artifact(
     store: &V2Store,
     task: &ClaimedAttempt,
@@ -1921,6 +2231,8 @@ fn decode_paper_account(
                 DaemonError::InvalidInput("Paper account trading_blocked missing".to_owned())
             })?,
         positions: BTreeMap::new(),
+        external_positions: BTreeSet::new(),
+        open_order_ids: BTreeSet::new(),
     })
 }
 
@@ -2020,17 +2332,65 @@ fn seal_execution_snapshot<T: serde::Serialize>(
     payload: &T,
     now: DateTime<Utc>,
 ) -> Result<Artifact> {
+    seal_execution_snapshot_sources(
+        store,
+        task,
+        &[normalized],
+        producer,
+        payload,
+        normalized.provenance.observed_at.unwrap_or(now),
+        normalized.provenance.source_uri.clone(),
+        now,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn seal_execution_snapshot_sources<T: serde::Serialize>(
+    store: &V2Store,
+    task: &ClaimedAttempt,
+    normalized_sources: &[&Artifact],
+    producer: &str,
+    payload: &T,
+    observed_at: DateTime<Utc>,
+    source_uri: Option<String>,
+    now: DateTime<Utc>,
+) -> Result<Artifact> {
+    let primary = normalized_sources.first().ok_or_else(|| {
+        DaemonError::InvalidInput("execution snapshot has no normalized sources".to_owned())
+    })?;
+    let mut source_refs = Vec::new();
+    for normalized in normalized_sources {
+        let raw = normalized
+            .source_refs
+            .iter()
+            .find(|source| source.kind == ArtifactKind::RawEvidence)
+            .cloned()
+            .ok_or_else(|| {
+                DaemonError::InvalidInput(
+                    "governed normalized evidence has no RawEvidence source".to_owned(),
+                )
+            })?;
+        source_refs.extend([
+            raw,
+            ArtifactRef {
+                artifact_id: normalized.artifact_id.clone(),
+                kind: ArtifactKind::NormalizedEvidence,
+            },
+        ]);
+    }
+    source_refs.sort();
+    source_refs.dedup();
     Artifact::new(
         ArtifactKind::NormalizedEvidence,
         store.put_json(payload)?,
         producer,
         ArtifactLifecycle::Canonical,
         ArtifactProvenance {
-            source_family: normalized.provenance.source_family.clone(),
-            observed_at: normalized.provenance.observed_at,
+            source_family: primary.provenance.source_family.clone(),
+            observed_at: Some(observed_at),
             retrieved_at: now,
-            source_uri: normalized.provenance.source_uri.clone(),
-            confidence_ppm: normalized.provenance.confidence_ppm,
+            source_uri,
+            confidence_ppm: primary.provenance.confidence_ppm,
             producer_contract_hash: task.permit.contract_hash.clone(),
         },
         Some(ArtifactOrigin {
@@ -2039,25 +2399,7 @@ fn seal_execution_snapshot<T: serde::Serialize>(
             attempt_id: Some(task.permit.attempt_id.clone()),
             contract_hash: task.permit.contract_hash.clone(),
         }),
-        {
-            let raw = normalized
-                .source_refs
-                .iter()
-                .find(|source| source.kind == ArtifactKind::RawEvidence)
-                .cloned()
-                .ok_or_else(|| {
-                    DaemonError::InvalidInput(
-                        "governed normalized evidence has no RawEvidence source".to_owned(),
-                    )
-                })?;
-            vec![
-                raw,
-                ArtifactRef {
-                    artifact_id: normalized.artifact_id.clone(),
-                    kind: ArtifactKind::NormalizedEvidence,
-                },
-            ]
-        },
+        source_refs,
         now,
     )
     .map_err(|error| DaemonError::InvalidInput(error.to_string()))
@@ -2418,8 +2760,9 @@ mod tests {
     use akzio_domain::{
         ArtifactLifecycle, ArtifactOrigin, ArtifactProvenance, ArtifactRef, Asset,
         ContextManifestPayload, EvidenceNeed, MoneyMicros, Outcome, OutcomeExecutionLineage,
-        OutcomeSchedule, Quote, RetrospectiveStatus, TaskRecipeId, WorkflowProposal,
-        WorkflowProposalDraft, WorkflowProposalDraftTask, WorkflowProposalTask,
+        OutcomeSchedule, PaperApprovalScope, PaperLaunchApproval, Quote, RetrospectiveStatus,
+        RuntimeManifest, TaskRecipeId, WorkflowProposal, WorkflowProposalDraft,
+        WorkflowProposalDraftTask, WorkflowProposalTask, V2_DOMAIN_SCHEMA_VERSION,
     };
     use akzio_execution::paper::{
         CommittedPaperBroker, PaperError, PaperExecution, PaperOrderReceipt,
@@ -2443,8 +2786,88 @@ mod tests {
             http_token: "fixture-token".to_owned(),
             worker_count: 1,
             auto_paper: false,
+            market_data_feed: Some(AlpacaMarketDataFeed::Iex),
             outcome_cost_model: OutcomeCostModel::default(),
+            runtime_identity_hash: None,
         }
+    }
+
+    fn install_test_paper_approval(store: &V2Store, session: NaiveDate, now: DateTime<Utc>) {
+        let manifest_payload = RuntimeManifest {
+            schema_version: V2_DOMAIN_SCHEMA_VERSION,
+            code_revision: "fixture-revision".to_owned(),
+            cargo_lock_hash: ContentHash::of_bytes(b"fixture-cargo-lock"),
+            config_hash: ContentHash::of_bytes(b"fixture-config"),
+            provider_id: "fixture-provider".to_owned(),
+            model_id: "fixture-model".to_owned(),
+            prompt_hash: ContentHash::of_bytes(b"fixture-prompts"),
+            contract_hash: ContentHash::of_bytes(b"fixture-contracts"),
+            topology_hash: ContentHash::of_bytes(b"fixture-topology"),
+            decision_policy_hash: ContentHash::of_bytes(b"fixture-decision-policy"),
+            execution_policy_hash: ContentHash::of_bytes(b"fixture-execution-policy"),
+            evaluation_policy_hash: ContentHash::of_bytes(b"fixture-evaluation-policy"),
+            market_data_feed: "iex".to_owned(),
+            broker_account_id: "fixture-paper-account".to_owned(),
+            maximum_notional: MoneyMicros::from_usd_cents(10_000),
+            allowed_session_start: session,
+            allowed_session_end: session,
+            expires_at: now + ChronoDuration::hours(8),
+            created_at: now,
+        };
+        let manifest_hash = manifest_payload.manifest_hash().unwrap();
+        let manifest = Artifact::new(
+            ArtifactKind::RuntimeManifest,
+            store.put_json(&manifest_payload).unwrap(),
+            "runtime.manifest",
+            ArtifactLifecycle::Canonical,
+            ArtifactProvenance {
+                source_family: "akzio.operator".to_owned(),
+                observed_at: None,
+                retrieved_at: now,
+                source_uri: None,
+                confidence_ppm: 1_000_000,
+                producer_contract_hash: None,
+            },
+            None,
+            vec![],
+            now,
+        )
+        .unwrap();
+        store.write_bootstrap_artifact(&manifest).unwrap();
+        let mut approval_payload = PaperLaunchApproval {
+            schema_version: V2_DOMAIN_SCHEMA_VERSION,
+            operator_identity: "fixture-operator".to_owned(),
+            runtime_manifest: ArtifactRef {
+                artifact_id: manifest.artifact_id.clone(),
+                kind: ArtifactKind::RuntimeManifest,
+            },
+            runtime_manifest_hash: manifest_hash,
+            scope: PaperApprovalScope::Canary,
+            reason: "fixture canary".to_owned(),
+            approved_at: now,
+            expires_at: now + ChronoDuration::hours(8),
+            approval_hash: ContentHash::of_bytes(b"pending"),
+        };
+        approval_payload.approval_hash = approval_payload.unsigned_hash().unwrap();
+        let approval = Artifact::new(
+            ArtifactKind::PaperLaunchApproval,
+            store.put_json(&approval_payload).unwrap(),
+            "operator.paper_approval",
+            ArtifactLifecycle::Canonical,
+            ArtifactProvenance {
+                source_family: "akzio.operator".to_owned(),
+                observed_at: None,
+                retrieved_at: now,
+                source_uri: None,
+                confidence_ppm: 1_000_000,
+                producer_contract_hash: None,
+            },
+            None,
+            vec![approval_payload.runtime_manifest.clone()],
+            now,
+        )
+        .unwrap();
+        store.write_bootstrap_artifact(&approval).unwrap();
     }
 
     #[test]
@@ -2655,6 +3078,13 @@ mod tests {
             >,
         > {
             Box::pin(async move { Ok(self.0.clone()) })
+        }
+
+        fn paper_account_id<'a>(
+            &'a self,
+        ) -> Pin<Box<dyn Future<Output = std::result::Result<String, SchedulerError>> + Send + 'a>>
+        {
+            Box::pin(async move { Ok("fixture-paper-account".to_owned()) })
         }
     }
 
@@ -3126,17 +3556,12 @@ mod tests {
         let directory = tempdir().unwrap();
         let now = Utc::now();
         let session_key = now.date_naive().to_string();
-        let account = AccountSnapshot {
-            schema_version: akzio_domain::V2_DOMAIN_SCHEMA_VERSION,
-            broker_session: session_key.clone(),
-            observed_at: now,
-            equity: MoneyMicros::from_usd_cents(1_000_000),
-            buying_power: MoneyMicros::from_usd_cents(1_000_000),
-            day_turnover: MoneyMicros::ZERO,
-            active: true,
-            trading_blocked: false,
-            positions: BTreeMap::new(),
-        };
+        let account = serde_json::json!({
+            "status": "ACTIVE",
+            "equity": "10000",
+            "buying_power": "10000",
+            "trading_blocked": false
+        });
         let quotes = QuoteSnapshot {
             schema_version: akzio_domain::V2_DOMAIN_SCHEMA_VERSION,
             broker_session: session_key.clone(),
@@ -3161,7 +3586,7 @@ mod tests {
             is_open: true,
             observed_at: now,
         };
-        let evidence = [
+        let mut evidence = [
             (
                 PAPER_ACCOUNT_RESOURCE,
                 serde_json::to_value(&account).unwrap(),
@@ -3196,6 +3621,34 @@ mod tests {
             )
         })
         .collect::<BTreeMap<_, _>>();
+        let fills_resource = format!("paper.fills:{session_key}");
+        for resource in [
+            PAPER_POSITIONS_RESOURCE.to_owned(),
+            PAPER_OPEN_ORDERS_RESOURCE.to_owned(),
+            fills_resource.clone(),
+        ] {
+            let normalized = serde_json::json!([]);
+            evidence.insert(
+                resource.clone(),
+                AcquiredEvidence {
+                    raw: serde_json::to_vec(&normalized).unwrap(),
+                    media_type: "application/json".to_owned(),
+                    source_uri: format!("fixture://alpaca/{resource}"),
+                    observed_at: now,
+                    normalized,
+                    provenance: EvidenceProvenance {
+                        document_id: Some(format!("fixture-{resource}")),
+                        published_at: None,
+                        observed_at: now,
+                        revision: Some("1".to_owned()),
+                        source_uri: format!("fixture://alpaca/{resource}"),
+                        dedupe_key: format!("fixture:alpaca:{resource}"),
+                        citations: vec![],
+                    },
+                    quality: EvidenceQuality::default(),
+                },
+            );
+        }
         let responses = Arc::new(Mutex::new(VecDeque::from([response(
             fixture_claim_output(),
         )])));
@@ -3210,6 +3663,14 @@ mod tests {
         let paper_run_id = RunId::new();
         let setup_artifacts = [
             scheduler_snapshot_need(daemon.store(), &paper_run_id, PAPER_ACCOUNT_RESOURCE, now),
+            scheduler_snapshot_need(daemon.store(), &paper_run_id, PAPER_POSITIONS_RESOURCE, now),
+            scheduler_snapshot_need(
+                daemon.store(),
+                &paper_run_id,
+                PAPER_OPEN_ORDERS_RESOURCE,
+                now,
+            ),
+            scheduler_snapshot_need(daemon.store(), &paper_run_id, &fills_resource, now),
             scheduler_snapshot_need(daemon.store(), &paper_run_id, PAPER_QUOTES_RESOURCE, now),
             scheduler_snapshot_need(daemon.store(), &paper_run_id, PAPER_CLOCK_RESOURCE, now),
         ];
@@ -3520,6 +3981,11 @@ mod tests {
         daemon_config.auto_paper = true;
         let daemon = Daemon::with_model(daemon_config, fixture_model_client()).unwrap();
         let session_key = Utc::now().date_naive().to_string();
+        install_test_paper_approval(
+            daemon.store(),
+            NaiveDate::parse_from_str(&session_key, "%Y-%m-%d").unwrap(),
+            Utc::now(),
+        );
         let clock = Arc::new(StaticSessionClock(Some(session_key.clone())));
         let source = Arc::new(StaticPaperWorkflowSource::new(paper_proposal()));
         let (shutdown, receiver) = watch::channel(false);
@@ -3574,6 +4040,9 @@ mod tests {
             BTreeSet::from([
                 "paper.account".to_owned(),
                 "paper.clock".to_owned(),
+                format!("paper.fills:{session_key}"),
+                "paper.open_orders".to_owned(),
+                "paper.positions".to_owned(),
                 "paper.quotes".to_owned(),
             ])
         );
@@ -3581,79 +4050,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auto_paper_supervisor_provisions_fresh_store_with_approved_workflow() {
+    async fn auto_paper_requires_a_durable_workflow_proposal() {
         let directory = tempdir().unwrap();
         let mut daemon_config = config(directory.path().to_path_buf());
         daemon_config.auto_paper = true;
         let daemon = Daemon::with_model(daemon_config, fixture_model_client()).unwrap();
         let session_key = Utc::now().date_naive().to_string();
-        let clock = Arc::new(StaticSessionClock(Some(session_key.clone())));
-        let source = Arc::new(StorePaperWorkflowSource::new(daemon.store().clone()));
+        let clock = StaticSessionClock(Some(session_key.clone()));
+        let source = StorePaperWorkflowSource::new(daemon.store().clone());
+
         assert!(matches!(
             source.proposal("preflight"),
             Err(SchedulerError::WorkflowUnavailable)
         ));
-        let (shutdown, receiver) = watch::channel(false);
-        let supervised = daemon.clone();
-        let task = tokio::spawn(async move {
-            supervised
-                .serve_with_paper_scheduler(
-                    clock.as_ref(),
-                    source.as_ref(),
-                    std::time::Duration::from_millis(1),
-                    receiver,
-                )
-                .await
-        });
-
-        let mut reserved = None;
-        for _ in 0..50 {
-            reserved = daemon.store().session_slot(&session_key).unwrap();
-            if reserved.is_some() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        shutdown.send(true).unwrap();
-        assert!(task.await.unwrap().is_ok());
-
-        let reservation = reserved.expect("fresh Store must be provisioned by scheduler");
-        let run_id = reservation.workflow.run.run_id.clone();
-        assert_eq!(
-            daemon.store().run_purpose(&run_id).unwrap(),
-            RunPurpose::Paper
-        );
-
-        let proposal = daemon
-            .store()
-            .latest_artifact_by_kind(ArtifactKind::WorkflowProposal)
+        assert!(daemon
+            .scheduler
+            .tick(&clock, &source, Utc::now())
+            .await
             .unwrap()
-            .expect("approved Paper proposal must be durable");
-        assert_eq!(proposal.producer, "runtime.paper_provisioning");
-        assert_eq!(
-            proposal
-                .origin
-                .as_ref()
-                .and_then(|origin| origin.run_id.as_ref()),
-            Some(&run_id)
-        );
-        let proposal_payload: WorkflowProposal =
-            serde_json::from_slice(&daemon.store().read_blob(&proposal.blob).unwrap()).unwrap();
-        assert_eq!(proposal_payload.topology_id, "paper.approved.v1");
-        assert!(proposal_payload.tasks.contains_key("analyst"));
-        assert!(proposal_payload.tasks.contains_key("synthesizer"));
-        assert_eq!(proposal.source_refs.len(), 3);
-        assert_eq!(
-            daemon
-                .store()
-                .session_slot(&session_key)
-                .unwrap()
-                .unwrap()
-                .workflow
-                .run
-                .run_id,
-            run_id
-        );
+            .is_none());
+        assert!(daemon.store().session_slot(&session_key).unwrap().is_none());
         daemon.store().verify_integrity().unwrap();
     }
 
@@ -3728,6 +4144,7 @@ mod tests {
         );
         proposal.tasks.get_mut("synthesizer").unwrap().depends_on = vec!["analyst".to_owned()];
         let session_key = now.date_naive().to_string();
+        install_test_paper_approval(daemon.store(), now.date_naive(), now);
         let clock = StaticSessionClock(Some(session_key.clone()));
         let source = StaticPaperWorkflowSource::new(proposal);
         assert!(matches!(
@@ -3783,6 +4200,11 @@ mod tests {
             .depends_on = vec!["analyst".to_owned()];
 
         let new_session = (now.date_naive() + chrono::Days::new(1)).to_string();
+        install_test_paper_approval(
+            daemon.store(),
+            NaiveDate::parse_from_str(&new_session, "%Y-%m-%d").unwrap(),
+            now,
+        );
         let clock = StaticSessionClock(Some(new_session));
         let source = StaticPaperWorkflowSource::new(new_proposal);
         let reservation = daemon

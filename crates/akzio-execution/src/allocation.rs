@@ -111,6 +111,8 @@ mod tests {
             max_account_age_secs: 5,
             max_quote_age_secs: 5,
             max_clock_age_secs: 5,
+            max_future_skew_secs: 1,
+            max_snapshot_skew_secs: 2,
             max_spread_bps: 20,
             limit_protection_bps: 10,
         }
@@ -148,6 +150,8 @@ mod tests {
                 active: true,
                 trading_blocked: false,
                 positions: BTreeMap::<Asset, Position>::new(),
+                external_positions: BTreeSet::new(),
+                open_order_ids: BTreeSet::new(),
             },
             quote_snapshot_ref: reference(ArtifactKind::NormalizedEvidence, b"quotes"),
             quotes: QuoteSnapshot {

@@ -30,6 +30,8 @@ pub enum HardBlocker {
     NonPaperEndpoint,
     NonCanonicalRun,
     RecoveryIncomplete,
+    ExternalPosition,
+    UnmanagedOpenOrder,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]

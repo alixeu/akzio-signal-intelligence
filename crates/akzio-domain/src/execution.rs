@@ -15,6 +15,7 @@ use crate::{
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Position {
+    pub quantity_micros: i64,
     pub market_value: MoneyMicros,
 }
 
@@ -29,6 +30,8 @@ pub struct AccountSnapshot {
     pub active: bool,
     pub trading_blocked: bool,
     pub positions: BTreeMap<Asset, Position>,
+    pub external_positions: BTreeSet<String>,
+    pub open_order_ids: BTreeSet<String>,
 }
 
 impl AccountSnapshot {
@@ -42,6 +45,23 @@ impl AccountSnapshot {
         if self.equity.0 <= 0 || self.buying_power.0 < 0 || self.day_turnover.0 < 0 {
             return Err(DomainError::InvalidBudget {
                 field: "account_snapshot.money",
+            });
+        }
+        if self
+            .positions
+            .values()
+            .any(|position| position.quantity_micros < 0 || position.market_value.0 < 0)
+            || self
+                .external_positions
+                .iter()
+                .any(|symbol| symbol.trim().is_empty())
+            || self
+                .open_order_ids
+                .iter()
+                .any(|order_id| order_id.trim().is_empty())
+        {
+            return Err(DomainError::InvalidBudget {
+                field: "account_snapshot.positions",
             });
         }
         Ok(())

@@ -13,9 +13,11 @@ use std::{
 
 use akzio_domain::{
     Artifact, ArtifactKind, ArtifactLifecycle, ArtifactOrigin, ArtifactProvenance, ArtifactRef,
-    DomainError, EvidenceNeed, RunId, RunPurpose, WorkflowProposal, V2_DOMAIN_SCHEMA_VERSION,
+    DomainError, EvidenceNeed, RunId, RunPurpose, RuntimeManifest, WorkflowProposal,
+    V2_DOMAIN_SCHEMA_VERSION,
 };
 use akzio_execution::paper::AlpacaPaper;
+use akzio_ingest::AlpacaMarketDataFeed;
 use akzio_runtime::{RuntimeError, WorkflowRuntime};
 use akzio_store::v2::{DaemonLease, SessionSlotReservation, StoreError, V2Store};
 use chrono::{DateTime, Duration, NaiveDate, Utc};
@@ -51,8 +53,21 @@ pub enum SchedulerError {
 pub type SchedulerResult<T> = std::result::Result<T, SchedulerError>;
 
 const PAPER_ACCOUNT_RESOURCE: &str = "paper.account";
+const PAPER_POSITIONS_RESOURCE: &str = "paper.positions";
+const PAPER_OPEN_ORDERS_RESOURCE: &str = "paper.open_orders";
 const PAPER_QUOTES_RESOURCE: &str = "paper.quotes";
 const PAPER_CLOCK_RESOURCE: &str = "paper.clock";
+
+fn paper_snapshot_resources(session_key: &str) -> Vec<String> {
+    vec![
+        PAPER_ACCOUNT_RESOURCE.to_owned(),
+        PAPER_POSITIONS_RESOURCE.to_owned(),
+        PAPER_OPEN_ORDERS_RESOURCE.to_owned(),
+        format!("paper.fills:{session_key}"),
+        PAPER_QUOTES_RESOURCE.to_owned(),
+        PAPER_CLOCK_RESOURCE.to_owned(),
+    ]
+}
 
 /// A broker-authoritative clock returns an open session date; local wall-clock
 /// dates and hand-maintained market calendars never create Paper slots.
@@ -60,6 +75,10 @@ pub trait BrokerSessionClock: Send + Sync {
     fn open_session_key<'a>(
         &'a self,
     ) -> Pin<Box<dyn Future<Output = SchedulerResult<Option<String>>> + Send + 'a>>;
+
+    fn paper_account_id<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = SchedulerResult<String>> + Send + 'a>>;
 }
 
 /// Production adapter over the already fail-closed Alpaca Paper client. Its
@@ -86,6 +105,22 @@ impl BrokerSessionClock for AlpacaPaperSessionClock {
                 .await
                 .map_err(|error| SchedulerError::Clock(error.to_string()))?;
             Ok(clock.is_open.then(|| clock.session_date.to_string()))
+        })
+    }
+
+    fn paper_account_id<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = SchedulerResult<String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.paper
+                .account()
+                .await
+                .map_err(|error| SchedulerError::Clock(error.to_string()))?
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| SchedulerError::Clock("broker account id missing".to_owned()))
         })
     }
 }
@@ -152,6 +187,8 @@ pub struct PaperScheduler {
     owner_id: String,
     lease_duration: Duration,
     lease: Arc<Mutex<Option<DaemonLease>>>,
+    market_data_feed: Option<AlpacaMarketDataFeed>,
+    runtime_identity_hash: Option<akzio_domain::ContentHash>,
 }
 
 impl PaperScheduler {
@@ -169,7 +206,22 @@ impl PaperScheduler {
             owner_id,
             lease_duration: Duration::seconds(30),
             lease: Arc::new(Mutex::new(None)),
+            market_data_feed: None,
+            runtime_identity_hash: None,
         })
+    }
+
+    pub fn with_market_data_feed(mut self, market_data_feed: Option<AlpacaMarketDataFeed>) -> Self {
+        self.market_data_feed = market_data_feed;
+        self
+    }
+
+    pub fn with_runtime_identity_hash(
+        mut self,
+        runtime_identity_hash: Option<akzio_domain::ContentHash>,
+    ) -> Self {
+        self.runtime_identity_hash = runtime_identity_hash;
+        self
     }
 
     pub fn with_lease_duration(mut self, lease_duration: Duration) -> SchedulerResult<Self> {
@@ -178,6 +230,22 @@ impl PaperScheduler {
         }
         self.lease_duration = lease_duration;
         Ok(self)
+    }
+
+    fn current_approval_binding(&self) -> SchedulerResult<Option<(Artifact, Artifact)>> {
+        let Some(approval) = self
+            .store
+            .latest_artifact_by_kind(ArtifactKind::PaperLaunchApproval)?
+        else {
+            return Ok(None);
+        };
+        let manifest_ref = approval
+            .source_refs
+            .first()
+            .filter(|reference| reference.kind == ArtifactKind::RuntimeManifest)
+            .ok_or(SchedulerError::WorkflowUnavailable)?;
+        let manifest = self.store.artifact(&manifest_ref.artifact_id)?;
+        Ok(Some((manifest, approval)))
     }
 
     pub fn owner_id(&self) -> &str {
@@ -247,15 +315,11 @@ impl PaperScheduler {
             .map_err(|_| SchedulerError::InvalidSessionKey(session_key.to_owned()))?;
         let lease = self.acquire_or_renew(now)?;
         let mut setup_artifacts = Vec::new();
-        for resource in [
-            PAPER_ACCOUNT_RESOURCE,
-            PAPER_QUOTES_RESOURCE,
-            PAPER_CLOCK_RESOURCE,
-        ] {
+        for resource in paper_snapshot_resources(session_key) {
             let need = EvidenceNeed {
                 schema_version: V2_DOMAIN_SCHEMA_VERSION,
                 source_family: "alpaca".to_owned(),
-                resource: resource.to_owned(),
+                resource,
                 max_age_secs: 5,
             };
             need.validate()?;
@@ -311,13 +375,27 @@ impl PaperScheduler {
                 newly_reserved: false,
             }));
         }
+        let Some((runtime_manifest, approval)) = self.current_approval_binding()? else {
+            return Ok(None);
+        };
+        let manifest_payload: RuntimeManifest =
+            serde_json::from_slice(&self.store.read_blob(&runtime_manifest.blob)?)?;
+        if let Some(expected) = &self.runtime_identity_hash {
+            if manifest_payload.runtime_identity_hash()? != *expected {
+                return Ok(None);
+            }
+        }
+        let account_id = clock.paper_account_id().await?;
+        if manifest_payload.broker_account_id != account_id
+            || self
+                .market_data_feed
+                .is_none_or(|feed| manifest_payload.market_data_feed != feed.as_str())
+        {
+            return Ok(None);
+        }
         let proposal = match source.proposal(&session_key) {
             Ok(proposal) => proposal,
-            Err(SchedulerError::WorkflowUnavailable) => {
-                return self
-                    .reserve_approved_session(RunId::new(), &session_key, now)
-                    .map(Some);
-            }
+            Err(SchedulerError::WorkflowUnavailable) => return Ok(None),
             Err(error) => return Err(error),
         };
         let lease = self.acquire_or_renew(now)?;
@@ -370,15 +448,11 @@ impl PaperScheduler {
             .tasks
             .get_mut(&snapshot_alias)
             .ok_or(SchedulerError::WorkflowUnavailable)?;
-        for resource in [
-            PAPER_ACCOUNT_RESOURCE,
-            PAPER_QUOTES_RESOURCE,
-            PAPER_CLOCK_RESOURCE,
-        ] {
+        for resource in paper_snapshot_resources(&session_key) {
             let need = EvidenceNeed {
                 schema_version: V2_DOMAIN_SCHEMA_VERSION,
                 source_family: "alpaca".to_owned(),
-                resource: resource.to_owned(),
+                resource,
                 max_age_secs: 5,
             };
             need.validate()?;
@@ -412,14 +486,17 @@ impl PaperScheduler {
         }
 
         Ok(Some(
-            self.workflow.reserve_paper_session_with_inputs_for_run(
-                &lease,
-                run_id,
-                &session_key,
-                &proposal,
-                &setup_artifacts,
-                now,
-            )?,
+            self.workflow
+                .reserve_paper_session_with_inputs_for_run_approved(
+                    &lease,
+                    run_id,
+                    &session_key,
+                    &proposal,
+                    &setup_artifacts,
+                    &runtime_manifest,
+                    &approval,
+                    now,
+                )?,
         ))
     }
 

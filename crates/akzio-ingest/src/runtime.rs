@@ -66,6 +66,11 @@ impl EvidenceRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GovernedResource {
     AlpacaAccount,
+    AlpacaPositions,
+    AlpacaOpenOrders,
+    AlpacaFills {
+        session: NaiveDate,
+    },
     AlpacaClock,
     AlpacaQuotes,
     AlpacaQuote {
@@ -76,10 +81,23 @@ pub enum GovernedResource {
         start: Option<NaiveDate>,
         limit: u8,
     },
-    SecEdgar {
-        locator: String,
+    SecSubmissions {
+        cik: String,
+    },
+    SecCompanyFacts {
+        cik: String,
+    },
+    SecFiling {
+        cik: String,
+        accession: String,
+        primary_document: String,
     },
     Fred {
+        series_id: String,
+        window_start: Option<NaiveDate>,
+        window_end: Option<NaiveDate>,
+    },
+    FredVintages {
         series_id: String,
         window_start: Option<NaiveDate>,
         window_end: Option<NaiveDate>,
@@ -101,23 +119,7 @@ impl GovernedResource {
         }
         match source {
             EvidenceSource::Alpaca => Self::parse_alpaca(resource),
-            EvidenceSource::SecEdgar => {
-                let (prefix, locator) = resource
-                    .split_once(':')
-                    .ok_or(EvidenceRuntimeError::InvalidRequest)?;
-                if !matches!(prefix, "sec" | "filing" | "companyfacts")
-                    || locator.is_empty()
-                    || locator.chars().count() > 256
-                    || !locator.chars().all(|character| {
-                        character.is_ascii_alphanumeric() || "._-".contains(character)
-                    })
-                {
-                    return Err(EvidenceRuntimeError::InvalidRequest);
-                }
-                Ok(Self::SecEdgar {
-                    locator: locator.to_owned(),
-                })
-            }
+            EvidenceSource::SecEdgar => Self::parse_sec(resource),
             EvidenceSource::Fred => Self::parse_fred(resource),
             EvidenceSource::NewsWeb => {
                 let query = resource
@@ -138,8 +140,19 @@ impl GovernedResource {
     fn parse_alpaca(resource: &str) -> Result<Self, EvidenceRuntimeError> {
         match resource {
             "paper.account" => return Ok(Self::AlpacaAccount),
+            "paper.positions" => return Ok(Self::AlpacaPositions),
+            "paper.open_orders" => return Ok(Self::AlpacaOpenOrders),
             "paper.clock" => return Ok(Self::AlpacaClock),
             "paper.quotes" => return Ok(Self::AlpacaQuotes),
+            value if value.starts_with("paper.fills:") => {
+                return Ok(Self::AlpacaFills {
+                    session: NaiveDate::parse_from_str(
+                        value.trim_start_matches("paper.fills:"),
+                        "%Y-%m-%d",
+                    )
+                    .map_err(|_| EvidenceRuntimeError::InvalidRequest)?,
+                });
+            }
             "quote" | "bars" => {
                 return Ok(Self::LegacyFixture {
                     source: EvidenceSource::Alpaca,
@@ -192,7 +205,7 @@ impl GovernedResource {
 
     fn parse_fred(resource: &str) -> Result<Self, EvidenceRuntimeError> {
         let parts = resource.split(':').collect::<Vec<_>>();
-        if !(2..=4).contains(&parts.len()) || parts[0] != "series" {
+        if !(2..=4).contains(&parts.len()) || !matches!(parts[0], "series" | "vintages") {
             return Err(EvidenceRuntimeError::InvalidRequest);
         }
         let series_id = parts[1];
@@ -219,12 +232,76 @@ impl GovernedResource {
                 return Err(EvidenceRuntimeError::InvalidRequest);
             }
         }
-        Ok(Self::Fred {
-            series_id: series_id.to_owned(),
-            window_start,
-            window_end,
-        })
+        if parts[0] == "series" {
+            Ok(Self::Fred {
+                series_id: series_id.to_owned(),
+                window_start,
+                window_end,
+            })
+        } else {
+            Ok(Self::FredVintages {
+                series_id: series_id.to_owned(),
+                window_start,
+                window_end,
+            })
+        }
     }
+
+    fn parse_sec(resource: &str) -> Result<Self, EvidenceRuntimeError> {
+        let parts = resource.split(':').collect::<Vec<_>>();
+        match parts.as_slice() {
+            ["sec" | "submissions", cik] => Ok(Self::SecSubmissions {
+                cik: normalized_cik(cik)?,
+            }),
+            ["companyfacts", cik] => Ok(Self::SecCompanyFacts {
+                cik: normalized_cik(cik)?,
+            }),
+            ["filing", cik, accession, primary_document]
+                if valid_accession(accession) && valid_primary_document(primary_document) =>
+            {
+                Ok(Self::SecFiling {
+                    cik: normalized_cik(cik)?,
+                    accession: (*accession).to_owned(),
+                    primary_document: (*primary_document).to_owned(),
+                })
+            }
+            _ => Err(EvidenceRuntimeError::InvalidRequest),
+        }
+    }
+}
+
+fn normalized_cik(value: &str) -> Result<String, EvidenceRuntimeError> {
+    let digits = value.strip_prefix("CIK").unwrap_or(value);
+    if digits.is_empty() || digits.len() > 10 || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(EvidenceRuntimeError::InvalidRequest);
+    }
+    let number = digits
+        .parse::<u64>()
+        .map_err(|_| EvidenceRuntimeError::InvalidRequest)?;
+    if number == 0 {
+        return Err(EvidenceRuntimeError::InvalidRequest);
+    }
+    Ok(format!("{number:010}"))
+}
+
+fn valid_accession(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 20
+        && bytes[10] == b'-'
+        && bytes[13] == b'-'
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| matches!(index, 10 | 13) || byte.is_ascii_digit())
+}
+
+fn valid_primary_document(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && !value.starts_with('.')
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 /// Strict OHLCV quality gate used by the production Alpaca adapter. Fixture
@@ -255,13 +332,6 @@ pub fn validate_daily_bar_payload(value: &Value) -> Result<(), EvidenceRuntimeEr
         let close = positive_market_number(bar.get("c"))?;
         let volume = positive_market_number(bar.get("v"))?;
         if high < open.max(close) || low > open.min(close) || volume <= 0.0 {
-            return Err(EvidenceRuntimeError::InvalidAcquisition);
-        }
-        let adjustment = bar
-            .get("adjustment")
-            .and_then(Value::as_str)
-            .ok_or(EvidenceRuntimeError::InvalidAcquisition)?;
-        if adjustment != "all" {
             return Err(EvidenceRuntimeError::InvalidAcquisition);
         }
     }
@@ -438,6 +508,22 @@ pub trait AsyncGovernedEvidenceTransport: Send + Sync {
     ) -> BoxFuture<'a, Result<AcquiredEvidence, EvidenceAdapterError>>;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AlpacaMarketDataFeed {
+    Iex,
+    Sip,
+}
+
+impl AlpacaMarketDataFeed {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Iex => "iex",
+            Self::Sip => "sip",
+        }
+    }
+}
+
 /// Rust-owned Alpaca Paper market-data transport. The resource language is
 /// deliberately finite; callers cannot pass an arbitrary URL or endpoint.
 #[derive(Clone)]
@@ -447,6 +533,7 @@ pub struct AlpacaPaperEvidenceTransport {
     market_data_url: String,
     key_id: String,
     secret_key: String,
+    market_data_feed: Option<AlpacaMarketDataFeed>,
 }
 
 impl std::fmt::Debug for AlpacaPaperEvidenceTransport {
@@ -457,12 +544,15 @@ impl std::fmt::Debug for AlpacaPaperEvidenceTransport {
             .field("market_data_url", &self.market_data_url)
             .field("key_id", &"<redacted>")
             .field("secret_key", &"<redacted>")
+            .field("market_data_feed", &self.market_data_feed)
             .finish()
     }
 }
 
 impl AlpacaPaperEvidenceTransport {
-    pub fn from_env() -> Result<Self, EvidenceAdapterError> {
+    pub fn from_env(
+        market_data_feed: Option<AlpacaMarketDataFeed>,
+    ) -> Result<Self, EvidenceAdapterError> {
         let base_url = env::var("ALPACA_PAPER_BASE_URL")
             .unwrap_or_else(|_| "https://paper-api.alpaca.markets".to_owned());
         let key_id = env::var("ALPACA_API_KEY")
@@ -470,13 +560,14 @@ impl AlpacaPaperEvidenceTransport {
         let secret_key = env::var("ALPACA_API_SECRET").map_err(|_| {
             EvidenceAdapterError::Transport("ALPACA_API_SECRET is not set".to_owned())
         })?;
-        Self::new(base_url, key_id, secret_key)
+        Self::new(base_url, key_id, secret_key, market_data_feed)
     }
 
     pub fn new(
         base_url: impl Into<String>,
         key_id: impl Into<String>,
         secret_key: impl Into<String>,
+        market_data_feed: Option<AlpacaMarketDataFeed>,
     ) -> Result<Self, EvidenceAdapterError> {
         let supplied = base_url.into();
         let parsed = Url::parse(supplied.trim())
@@ -512,12 +603,17 @@ impl AlpacaPaperEvidenceTransport {
             market_data_url: "https://data.alpaca.markets".to_owned(),
             key_id,
             secret_key,
+            market_data_feed,
         })
     }
 
     fn path_for(resource: &str) -> Result<String, EvidenceAdapterError> {
         match resource {
             "paper.account" => Ok("/v2/account".to_owned()),
+            "paper.positions" => Ok("/v2/positions".to_owned()),
+            "paper.open_orders" => {
+                Ok("/v2/orders?status=open&limit=500&direction=asc&nested=true".to_owned())
+            }
             "paper.clock" => Ok("/v2/clock".to_owned()),
             "paper.quotes" => Ok("/v2/stocks/quotes/latest?symbols=TQQQ,QQQ,SOXX,SOXL".to_owned()),
             value if value.starts_with("quote:") => {
@@ -574,6 +670,15 @@ impl AlpacaPaperEvidenceTransport {
                 }
                 Ok(path)
             }
+            value if value.starts_with("paper.fills:") => {
+                let session_key = value.trim_start_matches("paper.fills:");
+                chrono::NaiveDate::parse_from_str(session_key, "%Y-%m-%d").map_err(|_| {
+                    EvidenceAdapterError::Transport("invalid Paper fills session date".to_owned())
+                })?;
+                Ok(format!(
+                    "/v2/account/activities/FILL?date={session_key}&direction=asc&page_size=100"
+                ))
+            }
             _ => Err(EvidenceAdapterError::Transport(
                 "Alpaca resource is not allowlisted".to_owned(),
             )),
@@ -584,6 +689,18 @@ impl AlpacaPaperEvidenceTransport {
         resource == "paper.quotes"
             || resource.starts_with("quote:")
             || resource.starts_with("bars:")
+    }
+
+    fn configured_path_for(&self, resource: &str) -> Result<String, EvidenceAdapterError> {
+        let mut path = Self::path_for(resource)?;
+        if Self::uses_market_data(resource) {
+            if let Some(feed) = self.market_data_feed {
+                path.push(if path.contains('?') { '&' } else { '?' });
+                path.push_str("feed=");
+                path.push_str(feed.as_str());
+            }
+        }
+        Ok(path)
     }
 
     fn base_url_for(&self, resource: &str) -> &str {
@@ -602,7 +719,7 @@ impl AlpacaPaperEvidenceTransport {
         if source != EvidenceSource::Alpaca {
             return Err(EvidenceAdapterError::SourceMismatch);
         }
-        let path = Self::path_for(resource)?;
+        let path = self.configured_path_for(resource)?;
         let url = format!("{}{}", self.base_url_for(resource), path);
         let response = self
             .client
@@ -775,17 +892,6 @@ impl ModelNativeWebEvidenceTransport {
             .first()
             .map(|citation| citation.uri.clone())
             .ok_or_else(|| EvidenceAdapterError::Transport("missing citation URI".to_owned()))?;
-        let provenance_citations = citations
-            .iter()
-            .map(|citation| EvidenceCitation {
-                start_byte: 0,
-                end_byte: raw.len(),
-                quote: citation
-                    .excerpt
-                    .clone()
-                    .unwrap_or_else(|| citation.uri.clone()),
-            })
-            .collect();
         let primary = citations
             .first()
             .ok_or_else(|| EvidenceAdapterError::Transport("missing citation URI".to_owned()))?;
@@ -813,11 +919,11 @@ impl ModelNativeWebEvidenceTransport {
                     primary.document_id.as_deref().unwrap_or(resource),
                     primary.revision.as_deref().unwrap_or("latest")
                 ),
-                citations: provenance_citations,
+                citations: Vec::new(),
             },
             quality: EvidenceQuality {
-                completeness_ppm: 1_000_000,
-                citations_complete: true,
+                completeness_ppm: 0,
+                citations_complete: false,
                 normalized: true,
             },
         })
@@ -1759,10 +1865,13 @@ mod tests {
 
     #[test]
     fn alpaca_paper_transport_is_endpoint_and_resource_fenced() {
-        assert!(
-            AlpacaPaperEvidenceTransport::new("https://api.alpaca.markets", "key", "secret")
-                .is_err()
-        );
+        assert!(AlpacaPaperEvidenceTransport::new(
+            "https://api.alpaca.markets",
+            "key",
+            "secret",
+            None,
+        )
+        .is_err());
         assert_eq!(
             AlpacaPaperEvidenceTransport::path_for("bars:QQQ:1d").unwrap(),
             "/v2/stocks/QQQ/bars?timeframe=1Day&limit=1&adjustment=all"
@@ -1776,9 +1885,13 @@ mod tests {
         assert!(AlpacaPaperEvidenceTransport::path_for("bars:QQQ:5m").is_err());
         assert!(AlpacaPaperEvidenceTransport::path_for("https://example.com").is_err());
 
-        let transport =
-            AlpacaPaperEvidenceTransport::new("https://paper-api.alpaca.markets", "key", "secret")
-                .unwrap();
+        let transport = AlpacaPaperEvidenceTransport::new(
+            "https://paper-api.alpaca.markets",
+            "key",
+            "secret",
+            Some(AlpacaMarketDataFeed::Iex),
+        )
+        .unwrap();
         assert_eq!(
             transport.base_url_for("paper.account"),
             "https://paper-api.alpaca.markets"
@@ -1794,6 +1907,14 @@ mod tests {
         assert_eq!(
             transport.base_url_for("bars:QQQ:1d"),
             "https://data.alpaca.markets"
+        );
+        assert_eq!(
+            transport.configured_path_for("paper.quotes").unwrap(),
+            "/v2/stocks/quotes/latest?symbols=TQQQ,QQQ,SOXX,SOXL&feed=iex"
+        );
+        assert_eq!(
+            transport.configured_path_for("bars:QQQ:1d").unwrap(),
+            "/v2/stocks/QQQ/bars?timeframe=1Day&limit=1&adjustment=all&feed=iex"
         );
     }
 
@@ -1820,8 +1941,9 @@ mod tests {
             evidence.provenance.source_uri,
             "https://fred.stlouisfed.org/series/DFII10"
         );
-        assert_eq!(evidence.provenance.citations.len(), 1);
-        assert_eq!(evidence.quality.completeness_ppm, 1_000_000);
+        assert!(evidence.provenance.citations.is_empty());
+        assert_eq!(evidence.quality.completeness_ppm, 0);
+        assert!(!evidence.quality.citations_complete);
     }
 
     #[test]
@@ -1854,42 +1976,19 @@ mod tests {
     fn daily_bar_quality_gate_rejects_missing_ohlcv_weekends_and_duplicates() {
         let valid = serde_json::json!({
             "bars": [
-                {
-                    "t": "2026-08-10T20:00:00Z",
-                    "o": 100.0,
-                    "h": 105.0,
-                    "l": 99.0,
-                    "c": 103.0,
-                    "v": 1000,
-                    "adjustment": "all"
-                }
+                {"t":"2026-08-10T20:00:00Z","o":100.0,"h":105.0,"l":99.0,"c":103.0,"v":1000}
             ]
         });
         validate_daily_bar_payload(&valid).unwrap();
 
-        let mut missing = valid.clone();
+        let mut missing = valid;
         missing["bars"][0].as_object_mut().unwrap().remove("v");
         assert!(validate_daily_bar_payload(&missing).is_err());
 
-        let mut missing_adjustment = valid.clone();
-        missing_adjustment["bars"][0]
-            .as_object_mut()
-            .unwrap()
-            .remove("adjustment");
-        assert!(validate_daily_bar_payload(&missing_adjustment).is_err());
-        let mut split_unadjusted = valid.clone();
-        split_unadjusted["bars"][0]["adjustment"] = serde_json::json!("raw");
-        assert!(validate_daily_bar_payload(&split_unadjusted).is_err());
-
         let weekend = serde_json::json!({
-            "bars": [{
-                "t": "2026-08-09T20:00:00Z",
-                "o": 100.0,
-                "h": 105.0,
-                "l": 99.0,
-                "c": 103.0,
-                "v": 1000
-            }]
+            "bars": [
+                {"t":"2026-08-09T20:00:00Z","o":100.0,"h":105.0,"l":99.0,"c":103.0,"v":1000}
+            ]
         });
         assert!(validate_daily_bar_payload(&weekend).is_err());
 

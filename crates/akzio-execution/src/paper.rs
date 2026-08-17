@@ -717,14 +717,20 @@ impl AlpacaPaper {
             | "pending_replace"
             | "pending_cancel"
             | "partially_filled" => {
-                self.delete(&format!("/v2/orders/{}", reprice.prior_broker_order_id))
+                let value = self
+                    .patch_json(
+                        &format!("/v2/orders/{}", reprice.prior_broker_order_id),
+                        reprice_request(
+                            replacement.limit_price,
+                            &reprice.replacement_client_order_id,
+                        ),
+                    )
                     .await?;
+                receipt_from_value(value, &reprice.replacement_client_order_id, false, 1)
             }
-            "canceled" | "expired" | "done_for_day" => {}
-            _ => return Err(PaperError::RepricePriorClosed),
+            "canceled" | "expired" | "done_for_day" => Err(PaperError::RepricePriorClosed),
+            _ => Err(PaperError::RepricePriorClosed),
         }
-        self.submit_order(replacement, &reprice.replacement_client_order_id, 1)
-            .await
     }
 
     fn validate_commitment(
@@ -880,28 +886,17 @@ impl AlpacaPaper {
         self.response_json(url.to_owned(), response).await
     }
 
-    async fn delete(&self, path: &str) -> Result<()> {
+    async fn patch_json(&self, path: &str, body: Value) -> Result<Value> {
         let url = self.url(path);
         let response = self
-            .authorized(self.client.delete(&url))
+            .authorized(self.client.patch(&url).json(&body))
             .send()
             .await
             .map_err(|source| PaperError::Transport {
                 url: url.clone(),
                 source,
             })?;
-        let status = response.status();
-        let body = response
-            .text()
-            .await
-            .map_err(|source| PaperError::Transport {
-                url: url.clone(),
-                source,
-            })?;
-        if !status.is_success() {
-            return Err(PaperError::Http { url, status, body });
-        }
-        Ok(())
+        self.response_json(url, response).await
     }
 
     async fn response_json(&self, url: String, response: reqwest::Response) -> Result<Value> {
@@ -1092,6 +1087,13 @@ fn money_string(value: MoneyMicros) -> String {
     format!("{whole}.{fraction:06}")
 }
 
+fn reprice_request(limit_price: MoneyMicros, client_order_id: &str) -> Value {
+    serde_json::json!({
+        "limit_price": money_string(limit_price),
+        "client_order_id": client_order_id,
+    })
+}
+
 fn quantity_string(order: &OrderIntent) -> Result<String> {
     let quantity_millionths = order
         .notional
@@ -1200,6 +1202,14 @@ mod tests {
             limit_price: MoneyMicros::from_usd_cents(2_500),
         };
         assert_eq!(quantity_string(&order).unwrap(), "4.000000");
+    }
+
+    #[test]
+    fn broker_native_reprice_never_resubmits_quantity() {
+        let request = reprice_request(MoneyMicros::from_usd_cents(2_500), "replacement-id");
+        assert_eq!(request["client_order_id"], "replacement-id");
+        assert!(request.get("qty").is_none());
+        assert!(request.get("notional").is_none());
     }
 
     #[test]

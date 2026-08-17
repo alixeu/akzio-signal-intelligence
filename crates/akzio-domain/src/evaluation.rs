@@ -135,17 +135,17 @@ pub struct OutcomeWindow {
     pub transaction_cost_ppm: u32,
     pub slippage_ppm: u32,
     pub utility_ppm: i64,
-    pub calibration_ppm: u32,
+    pub calibration_ppm: Option<u32>,
     pub evidence_completeness_ppm: u32,
-    pub risk_recall_ppm: u32,
+    pub risk_recall_ppm: Option<u32>,
 }
 
 impl OutcomeWindow {
     pub fn validate(&self) -> Result<(), DomainError> {
         if [
-            self.calibration_ppm,
+            self.calibration_ppm.unwrap_or_default(),
             self.evidence_completeness_ppm,
-            self.risk_recall_ppm,
+            self.risk_recall_ppm.unwrap_or_default(),
             self.transaction_cost_ppm,
             self.slippage_ppm,
         ]
@@ -693,8 +693,8 @@ pub struct Evaluation {
     pub outcome: ArtifactRef,
     pub experience: ArtifactRef,
     pub marginal_utility_ppm: i64,
-    pub token_cost: u64,
-    pub latency_millis: u64,
+    pub token_cost: Option<u64>,
+    pub latency_millis: Option<u64>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -799,9 +799,9 @@ mod tests {
             transaction_cost_ppm: 0,
             slippage_ppm: 0,
             utility_ppm: 1,
-            calibration_ppm: 1,
+            calibration_ppm: Some(1),
             evidence_completeness_ppm: 1_000_000,
-            risk_recall_ppm: 1_000_000,
+            risk_recall_ppm: Some(1_000_000),
         }
     }
 

@@ -155,6 +155,12 @@ rg -q '^[[:space:]]*assets[[:space:]]*=.*TQQQ.*QQQ.*SOXX.*SOXL' "${config}" || {
   exit 2
 }
 
+market_data_feed="$(sed -nE 's/^[[:space:]]*market_data_feed[[:space:]]*=[[:space:]]*"(iex|sip)"[[:space:]]*$/\1/p' "${config}" | head -n 1)"
+[[ -n "${market_data_feed}" ]] || {
+  print -u2 -- "Paper canary requires market_data_feed=iex or sip"
+  exit 2
+}
+
 git rev-parse HEAD > "${bundle}/commands/commit.txt"
 git status --short --untracked-files=all > "${bundle}/commands/git-status.txt"
 {
@@ -162,6 +168,7 @@ git status --short --untracked-files=all > "${bundle}/commands/git-status.txt"
   print -- "model=gpt-5.6-luna"
   print -- "paper_endpoint=https://paper-api.alpaca.markets"
   print -- "market_data_endpoint=https://data.alpaca.markets"
+  print -- "market_data_feed=${market_data_feed}"
   print -- "raw_model_export=false"
 } > "${bundle}/manifest.txt"
 jq -n \
@@ -170,7 +177,8 @@ jq -n \
   --arg model "gpt-5.6-luna" \
   --arg paper_endpoint "https://paper-api.alpaca.markets" \
   --arg market_data_endpoint "https://data.alpaca.markets" \
-  '{mode:"paper-canary",commit:$commit,config:$config,model:$model,paper_endpoint:$paper_endpoint,market_data_endpoint:$market_data_endpoint,assets:["TQQQ","QQQ","SOXX","SOXL"],raw_model_export:false}' \
+  --arg market_data_feed "${market_data_feed}" \
+  '{mode:"paper-canary",commit:$commit,config:$config,model:$model,paper_endpoint:$paper_endpoint,market_data_endpoint:$market_data_endpoint,market_data_feed:$market_data_feed,assets:["TQQQ","QQQ","SOXX","SOXL"],raw_model_export:false}' \
   > "${bundle}/manifest.json"
 
 {
@@ -294,6 +302,19 @@ if ! CARGO_TARGET_DIR="${target_dir}" cargo build --offline -p akzio-cli \
   exit 11
 fi
 binary="${target_dir}/debug/akzio"
+
+paper_approver="${AKZIO_PAPER_APPROVER:-${USER:-local-operator}}"
+paper_max_notional_usd_cents="${AKZIO_PAPER_MAX_NOTIONAL_USD_CENTS:-100000}"
+if ! "${binary}" --config "${runtime_config}" store approve-paper "${session_key}" \
+  --operator "${paper_approver}" \
+  --reason "one-session scheduler-owned Paper canary" \
+  --max-notional-usd-cents "${paper_max_notional_usd_cents}" \
+  --valid-hours 8 \
+  > "${bundle}/commands/paper-approval.json" 2> "${bundle}/commands/paper-approval.stderr"; then
+  summary_status=paper_approval_failed
+  write_summary
+  exit 12
+fi
 
 "${binary}" --config "${runtime_config}" daemon serve \
   > "${bundle}/commands/daemon.log" 2>&1 &

@@ -178,6 +178,7 @@ impl V2RepriceRuntime {
             .ok_or(RepriceError::MissingOrder)?;
         validate_quote(
             self.policy.max_quote_age_secs,
+            self.policy.max_future_skew_secs,
             self.policy.max_spread_bps,
             prior.asset,
             input.quote,

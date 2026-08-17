@@ -9,7 +9,10 @@ use std::{
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
 };
 
 use akzio_domain::AttemptRelationKind;
@@ -20,10 +23,11 @@ use akzio_domain::{
     DomainError, Evaluation, ExecutionContext, ExecutionPlan, ExecutionVerdict, Experience,
     FailureDisposition, FreezeState, LeaseId, LifecycleEventType, OrderReceipt, OrderReceiptState,
     Outcome, OutcomeExecutionLineage, OutcomeHorizon, OutcomeId, OutcomeSchedule, PaperCommitment,
-    PaperReprice, PolicyState, PolicySubject, PolicyTransition, PolicyTransitionId, Reconciliation,
-    Retrospective, RetrospectiveDraft, RetrospectiveStatus, RetryPolicy, RunId, RunPurpose,
-    TaskBudget, TaskId, TaskRecipeId, TaskStatus, TaskWritePermit, WorkflowGraph, WorkflowNode,
-    WorkflowProposal, WorkflowStatus, V2_DOMAIN_SCHEMA_VERSION, V2_SCHEMA_VERSION,
+    PaperLaunchApproval, PaperReprice, PolicyState, PolicySubject, PolicyTransition,
+    PolicyTransitionId, Reconciliation, Retrospective, RetrospectiveDraft, RetrospectiveStatus,
+    RetryPolicy, RunId, RunPurpose, RuntimeManifest, TaskBudget, TaskId, TaskRecipeId, TaskStatus,
+    TaskWritePermit, WorkflowGraph, WorkflowNode, WorkflowProposal, WorkflowStatus,
+    V2_DOMAIN_SCHEMA_VERSION, V2_SCHEMA_VERSION,
 };
 use chrono::{DateTime, Duration, Utc};
 use rusqlite::{
@@ -35,6 +39,7 @@ use thiserror::Error;
 const DATABASE_FILE: &str = "akzio.sqlite3";
 const INCOMPATIBLE_DATABASE_FILE: &str = "control.sqlite3";
 const POST_TERMINAL_WORKER_RECIPE_ID: &str = "learning.outcome_worker";
+static BLOB_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -1022,20 +1027,46 @@ impl V2Store {
                 path: parent.to_path_buf(),
                 source,
             })?;
-            match OpenOptions::new().create_new(true).write(true).open(&path) {
-                Ok(mut file) => {
-                    file.write_all(bytes).map_err(|source| StoreError::Io {
-                        path: path.clone(),
+            let sequence = BLOB_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let temporary = parent.join(format!(
+                ".{}.{}.{}.tmp",
+                hash.as_str(),
+                std::process::id(),
+                sequence
+            ));
+            let publish = (|| -> StoreResult<()> {
+                let mut file = OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(&temporary)
+                    .map_err(|source| StoreError::Io {
+                        path: temporary.clone(),
                         source,
                     })?;
-                    file.sync_all().map_err(|source| StoreError::Io {
-                        path: path.clone(),
+                file.write_all(bytes).map_err(|source| StoreError::Io {
+                    path: temporary.clone(),
+                    source,
+                })?;
+                file.sync_all().map_err(|source| StoreError::Io {
+                    path: temporary.clone(),
+                    source,
+                })?;
+                fs::rename(&temporary, &path).map_err(|source| StoreError::Io {
+                    path: path.clone(),
+                    source,
+                })?;
+                fs::File::open(parent)
+                    .and_then(|directory| directory.sync_all())
+                    .map_err(|source| StoreError::Io {
+                        path: parent.to_path_buf(),
                         source,
                     })?;
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(source) => return Err(StoreError::Io { path, source }),
+                Ok(())
+            })();
+            if publish.is_err() {
+                let _ = fs::remove_file(&temporary);
             }
+            publish?;
         }
         Ok(BlobRef {
             hash,
@@ -1067,7 +1098,10 @@ impl V2Store {
         if artifact.origin.is_some()
             || !matches!(
                 artifact.kind,
-                ArtifactKind::Contract | ArtifactKind::FreezeState
+                ArtifactKind::Contract
+                    | ArtifactKind::FreezeState
+                    | ArtifactKind::RuntimeManifest
+                    | ArtifactKind::PaperLaunchApproval
             )
         {
             return Err(StoreError::PermitOriginMismatch);
@@ -1443,6 +1477,65 @@ impl V2Store {
         reservation: &SessionReservation,
         proposal: &Artifact,
     ) -> StoreResult<SessionSlotReservation> {
+        self.reserve_paper_session_with_binding(lease, reservation, proposal, None)
+    }
+
+    pub fn reserve_paper_session_with_approval(
+        &self,
+        lease: &DaemonLease,
+        reservation: &SessionReservation,
+        proposal: &Artifact,
+        runtime_manifest: &Artifact,
+        approval: &Artifact,
+    ) -> StoreResult<SessionSlotReservation> {
+        if runtime_manifest.kind != ArtifactKind::RuntimeManifest
+            || approval.kind != ArtifactKind::PaperLaunchApproval
+            || runtime_manifest.lifecycle != ArtifactLifecycle::Canonical
+            || approval.lifecycle != ArtifactLifecycle::Canonical
+            || approval.source_refs
+                != vec![ArtifactRef {
+                    artifact_id: runtime_manifest.artifact_id.clone(),
+                    kind: ArtifactKind::RuntimeManifest,
+                }]
+        {
+            return Err(StoreError::InvalidSessionSlot(
+                reservation.session_key.clone(),
+            ));
+        }
+        runtime_manifest.validate()?;
+        approval.validate()?;
+        let manifest_payload: RuntimeManifest =
+            serde_json::from_slice(&self.read_blob(&runtime_manifest.blob)?)?;
+        let approval_payload: PaperLaunchApproval =
+            serde_json::from_slice(&self.read_blob(&approval.blob)?)?;
+        manifest_payload.validate()?;
+        approval_payload.validate()?;
+        let session = chrono::NaiveDate::parse_from_str(&reservation.session_key, "%Y-%m-%d")
+            .map_err(|_| StoreError::InvalidSessionSlot(reservation.session_key.clone()))?;
+        if approval_payload.runtime_manifest.artifact_id != runtime_manifest.artifact_id
+            || approval_payload.runtime_manifest_hash != manifest_payload.manifest_hash()?
+            || !manifest_payload.permits(session, reservation.reserved_at)
+            || approval_payload.expires_at < reservation.reserved_at
+        {
+            return Err(StoreError::InvalidSessionSlot(
+                reservation.session_key.clone(),
+            ));
+        }
+        self.reserve_paper_session_with_binding(
+            lease,
+            reservation,
+            proposal,
+            Some((runtime_manifest, approval)),
+        )
+    }
+
+    fn reserve_paper_session_with_binding(
+        &self,
+        lease: &DaemonLease,
+        reservation: &SessionReservation,
+        proposal: &Artifact,
+        binding: Option<(&Artifact, &Artifact)>,
+    ) -> StoreResult<SessionSlotReservation> {
         if reservation.session_key.trim().is_empty()
             || reservation.workflow.run.purpose != RunPurpose::Paper
             || reservation.workflow.graph.kind != ArtifactKind::WorkflowGraph
@@ -1534,6 +1627,10 @@ impl V2Store {
                     insert_artifact(&transaction, artifact)?;
                 }
                 insert_artifact(&transaction, proposal)?;
+                if let Some((runtime_manifest, approval)) = binding {
+                    insert_artifact(&transaction, runtime_manifest)?;
+                    insert_artifact(&transaction, approval)?;
+                }
                 Self::commit_workflow_transaction(&transaction, &reservation.workflow)?;
                 transaction.execute(
                     "INSERT INTO rebuild_session_slots (session_key, run_id, topology_id, graph_artifact_id, run_created_at, scheduler_epoch, reserved_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -1547,6 +1644,17 @@ impl V2Store {
                         reservation.reserved_at.to_rfc3339(),
                     ],
                 )?;
+                if let Some((runtime_manifest, approval)) = binding {
+                    transaction.execute(
+                        "INSERT INTO rebuild_paper_approval_consumptions (approval_artifact_id, runtime_manifest_artifact_id, session_key, consumed_at) VALUES (?1, ?2, ?3, ?4)",
+                        params![
+                            approval.artifact_id.0.as_str(),
+                            runtime_manifest.artifact_id.0.as_str(),
+                            reservation.session_key,
+                            reservation.reserved_at.to_rfc3339(),
+                        ],
+                    )?;
+                }
                 transaction.commit()?;
                 true
             }
@@ -1903,6 +2011,39 @@ impl V2Store {
             },
         )
         .transpose()
+    }
+
+    pub fn paper_approval_for_run(
+        &self,
+        run_id: &RunId,
+    ) -> StoreResult<Option<(RuntimeManifest, PaperLaunchApproval)>> {
+        let row = {
+            let connection = self.connection.lock().expect("store connection poisoned");
+            connection
+                .query_row(
+                    "SELECT c.runtime_manifest_artifact_id, c.approval_artifact_id FROM rebuild_paper_approval_consumptions c JOIN rebuild_session_slots s ON s.session_key = c.session_key WHERE s.run_id = ?1",
+                    params![run_id.0],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?
+        };
+        let Some((manifest_id, approval_id)) = row else {
+            return Ok(None);
+        };
+        let manifest_artifact = self.artifact(&ArtifactId(ContentHash::new(manifest_id)?))?;
+        let approval_artifact = self.artifact(&ArtifactId(ContentHash::new(approval_id)?))?;
+        let manifest: RuntimeManifest =
+            serde_json::from_slice(&self.read_blob(&manifest_artifact.blob)?)?;
+        let approval: PaperLaunchApproval =
+            serde_json::from_slice(&self.read_blob(&approval_artifact.blob)?)?;
+        manifest.validate()?;
+        approval.validate()?;
+        if approval.runtime_manifest.artifact_id != manifest_artifact.artifact_id
+            || approval.runtime_manifest_hash != manifest.manifest_hash()?
+        {
+            return Err(StoreError::InvalidSessionSlot(run_id.0.clone()));
+        }
+        Ok(Some((manifest, approval)))
     }
 
     /// Durably reserve the single broker-visible commitment for a Paper
@@ -7374,6 +7515,12 @@ CREATE TABLE IF NOT EXISTS rebuild_session_slots (
     commitment_artifact_id TEXT REFERENCES rebuild_artifacts(artifact_id),
     committed_at TEXT
 );
+CREATE TABLE IF NOT EXISTS rebuild_paper_approval_consumptions (
+    approval_artifact_id TEXT PRIMARY KEY REFERENCES rebuild_artifacts(artifact_id),
+    runtime_manifest_artifact_id TEXT NOT NULL REFERENCES rebuild_artifacts(artifact_id),
+    session_key TEXT NOT NULL UNIQUE REFERENCES rebuild_session_slots(session_key),
+    consumed_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS rebuild_execution_reprices (
     commitment_artifact_id TEXT NOT NULL REFERENCES rebuild_artifacts(artifact_id),
     asset TEXT NOT NULL,
@@ -11820,9 +11967,9 @@ mod tests {
                         transaction_cost_ppm: 0,
                         slippage_ppm: 0,
                         utility_ppm: 1,
-                        calibration_ppm: 1_000_000,
+                        calibration_ppm: Some(1_000_000),
                         evidence_completeness_ppm: 1_000_000,
-                        risk_recall_ppm: 1_000_000,
+                        risk_recall_ppm: Some(1_000_000),
                     })
                     .collect(),
                 sealed_at: Some(now),
@@ -11878,8 +12025,8 @@ mod tests {
                 outcome: artifact_ref(&outcome),
                 experience: artifact_ref(&experience),
                 marginal_utility_ppm: 1,
-                token_cost: 1,
-                latency_millis: 1,
+                token_cost: Some(1),
+                latency_millis: Some(1),
                 created_at: now,
             };
             let evaluation = permit_artifact(
@@ -14184,9 +14331,9 @@ mod tests {
                 transaction_cost_ppm: 0,
                 slippage_ppm: 0,
                 utility_ppm: 1,
-                calibration_ppm: 1_000_000,
+                calibration_ppm: Some(1_000_000),
                 evidence_completeness_ppm: 1_000_000,
-                risk_recall_ppm: 1_000_000,
+                risk_recall_ppm: Some(1_000_000),
             })
             .collect(),
             sealed_at: Some(now),
@@ -14238,8 +14385,8 @@ mod tests {
             outcome: outcome_ref.clone(),
             experience: experience_ref.clone(),
             marginal_utility_ppm: 1,
-            token_cost: 1,
-            latency_millis: 1,
+            token_cost: Some(1),
+            latency_millis: Some(1),
             created_at: now,
         };
         let evaluation = make_artifact(

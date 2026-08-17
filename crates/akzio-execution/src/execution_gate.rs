@@ -348,29 +348,38 @@ impl V2ExecutionRuntime {
         blockers: &mut BTreeSet<HardBlocker>,
     ) {
         if let Some(account) = account {
-            if stale(
+            if outside_freshness_window(
                 account.observed_at,
                 now,
                 self.execution_policy().max_account_age_secs,
+                self.execution_policy().max_future_skew_secs,
             ) {
                 blockers.insert(HardBlocker::StaleAccount);
             }
+            if !account.external_positions.is_empty() {
+                blockers.insert(HardBlocker::ExternalPosition);
+            }
+            if !account.open_order_ids.is_empty() {
+                blockers.insert(HardBlocker::UnmanagedOpenOrder);
+            }
         }
         if let Some(quotes) = quotes {
-            if stale(
+            if outside_freshness_window(
                 quotes.observed_at,
                 now,
                 self.execution_policy().max_quote_age_secs,
+                self.execution_policy().max_future_skew_secs,
             ) {
                 blockers.insert(HardBlocker::StaleQuote);
             }
         }
         if let Some(clock) = clock {
             if !clock.is_open
-                || stale(
+                || outside_freshness_window(
                     clock.observed_at,
                     now,
                     self.execution_policy().max_clock_age_secs,
+                    self.execution_policy().max_future_skew_secs,
                 )
             {
                 blockers.insert(HardBlocker::MarketClosed);
@@ -384,6 +393,14 @@ impl V2ExecutionRuntime {
         if let (Some(account), Some(clock)) = (account, clock) {
             if account.broker_session != clock.broker_session {
                 blockers.insert(HardBlocker::MarketClosed);
+            }
+        }
+        if let (Some(account), Some(quotes), Some(clock)) = (account, quotes, clock) {
+            if snapshot_skewed(
+                [account.observed_at, quotes.observed_at, clock.observed_at],
+                self.execution_policy().max_snapshot_skew_secs,
+            ) {
+                blockers.insert(HardBlocker::InvalidProvenance);
             }
         }
     }
@@ -655,8 +672,20 @@ fn artifact_ref(artifact: &Artifact) -> ArtifactRef {
     }
 }
 
-fn stale(observed_at: DateTime<Utc>, now: DateTime<Utc>, max_age_secs: i64) -> bool {
-    now.signed_duration_since(observed_at) > Duration::seconds(max_age_secs)
+fn outside_freshness_window(
+    observed_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+    max_age_secs: i64,
+    max_future_skew_secs: i64,
+) -> bool {
+    let age = now.signed_duration_since(observed_at);
+    age > Duration::seconds(max_age_secs) || age < -Duration::seconds(max_future_skew_secs)
+}
+
+fn snapshot_skewed(observed_at: [DateTime<Utc>; 3], max_skew_secs: i64) -> bool {
+    let oldest = observed_at.into_iter().min().expect("three snapshots");
+    let newest = observed_at.into_iter().max().expect("three snapshots");
+    newest.signed_duration_since(oldest) > Duration::seconds(max_skew_secs)
 }
 
 #[cfg(test)]
@@ -673,6 +702,37 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn freshness_window_rejects_stale_and_future_snapshots() {
+        let now = Utc::now();
+        assert!(!outside_freshness_window(now, now, 5, 1));
+        assert!(outside_freshness_window(
+            now - Duration::seconds(6),
+            now,
+            5,
+            1,
+        ));
+        assert!(outside_freshness_window(
+            now + Duration::seconds(2),
+            now,
+            5,
+            1,
+        ));
+    }
+
+    #[test]
+    fn snapshot_window_rejects_cross_acquisition_skew() {
+        let now = Utc::now();
+        assert!(!snapshot_skewed(
+            [now, now + Duration::seconds(1), now + Duration::seconds(2)],
+            2,
+        ));
+        assert!(snapshot_skewed(
+            [now, now + Duration::seconds(1), now + Duration::seconds(3)],
+            2,
+        ));
+    }
+
     fn execution_policy() -> ExecutionPolicy {
         ExecutionPolicy {
             assets: Asset::EXECUTABLE.into_iter().collect::<BTreeSet<_>>(),
@@ -682,6 +742,8 @@ mod tests {
             max_account_age_secs: 5,
             max_quote_age_secs: 5,
             max_clock_age_secs: 5,
+            max_future_skew_secs: 1,
+            max_snapshot_skew_secs: 2,
             max_spread_bps: 20,
             limit_protection_bps: 10,
         }
@@ -852,6 +914,8 @@ mod tests {
                 active: true,
                 trading_blocked: false,
                 positions: BTreeMap::<Asset, Position>::new(),
+                external_positions: BTreeSet::new(),
+                open_order_ids: BTreeSet::new(),
             },
             vec![],
             now,

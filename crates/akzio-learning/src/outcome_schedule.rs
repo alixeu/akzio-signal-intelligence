@@ -8,7 +8,7 @@ use akzio_domain::{
     Artifact, ArtifactKind, ArtifactLifecycle, ArtifactOrigin, ArtifactProvenance, ArtifactRef,
     Decision, DecisionContext, DomainError, ExecutionContext, ExecutionVerdict,
     OutcomeExecutionLineage, OutcomeId, OutcomeSchedule, PaperCommitment, Reconciliation,
-    RunPurpose, TaskStatus, TaskWritePermit, V2_DOMAIN_SCHEMA_VERSION,
+    ReconciliationState, RunPurpose, TaskStatus, TaskWritePermit, V2_DOMAIN_SCHEMA_VERSION,
 };
 use akzio_store::v2::{StoreError, V2Store};
 use chrono::{DateTime, NaiveDate, Utc};
@@ -248,6 +248,7 @@ impl OutcomeSchedulingRuntime {
                 let reconciliation_payload: Reconciliation =
                     self.read_payload(&reconciliation_artifact)?;
                 reconciliation_payload.validate()?;
+                require_complete_reconciliation(reconciliation_payload.state)?;
                 if reconciliation_payload.commitment != *commitment
                     || !reconciliation_artifact.source_refs.contains(commitment)
                 {
@@ -277,5 +278,36 @@ impl OutcomeSchedulingRuntime {
         Ok(serde_json::from_slice(
             &self.store.read_blob(&artifact.blob)?,
         )?)
+    }
+}
+
+fn require_complete_reconciliation(state: ReconciliationState) -> OutcomeScheduleResult<()> {
+    if state != ReconciliationState::Complete {
+        return Err(OutcomeScheduleError::InvalidLineage(
+            "reconciliation_not_complete",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canonical_outcome_requires_complete_reconciliation() {
+        assert!(require_complete_reconciliation(ReconciliationState::Complete).is_ok());
+        for state in [
+            ReconciliationState::Pending,
+            ReconciliationState::Partial,
+            ReconciliationState::Failed,
+        ] {
+            assert!(matches!(
+                require_complete_reconciliation(state),
+                Err(OutcomeScheduleError::InvalidLineage(
+                    "reconciliation_not_complete"
+                ))
+            ));
+        }
     }
 }

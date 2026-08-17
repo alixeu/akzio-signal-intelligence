@@ -507,6 +507,51 @@ impl WorkflowRuntime {
         setup_artifacts: &[Artifact],
         now: DateTime<Utc>,
     ) -> RuntimeResult<SessionSlotReservation> {
+        self.reserve_paper_session_with_inputs_for_run_binding(
+            lease,
+            run_id,
+            session_key,
+            proposal,
+            setup_artifacts,
+            None,
+            now,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn reserve_paper_session_with_inputs_for_run_approved(
+        &self,
+        lease: &DaemonLease,
+        run_id: RunId,
+        session_key: impl Into<String>,
+        proposal: &WorkflowProposal,
+        setup_artifacts: &[Artifact],
+        runtime_manifest: &Artifact,
+        approval: &Artifact,
+        now: DateTime<Utc>,
+    ) -> RuntimeResult<SessionSlotReservation> {
+        self.reserve_paper_session_with_inputs_for_run_binding(
+            lease,
+            run_id,
+            session_key,
+            proposal,
+            setup_artifacts,
+            Some((runtime_manifest, approval)),
+            now,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn reserve_paper_session_with_inputs_for_run_binding(
+        &self,
+        lease: &DaemonLease,
+        run_id: RunId,
+        session_key: impl Into<String>,
+        proposal: &WorkflowProposal,
+        setup_artifacts: &[Artifact],
+        binding: Option<(&Artifact, &Artifact)>,
+        now: DateTime<Utc>,
+    ) -> RuntimeResult<SessionSlotReservation> {
         let session_key = session_key.into();
         if let Some(slot) = self.store.session_slot(&session_key)? {
             return Ok(SessionSlotReservation {
@@ -515,8 +560,48 @@ impl WorkflowRuntime {
             });
         }
 
+        let proposal_artifact = if binding.is_some() {
+            Some(Artifact::new(
+                ArtifactKind::WorkflowProposal,
+                self.store.put_json(proposal)?,
+                "runtime.paper_provisioning",
+                ArtifactLifecycle::RunScoped,
+                ArtifactProvenance {
+                    source_family: "akzio.runtime".to_owned(),
+                    observed_at: None,
+                    retrieved_at: now,
+                    source_uri: None,
+                    confidence_ppm: 1_000_000,
+                    producer_contract_hash: None,
+                },
+                Some(ArtifactOrigin {
+                    run_id: Some(run_id.clone()),
+                    task_id: None,
+                    attempt_id: None,
+                    contract_hash: None,
+                }),
+                proposal
+                    .tasks
+                    .values()
+                    .flat_map(|task| task.evidence_needs.iter().cloned())
+                    .collect(),
+                now,
+            )?)
+        } else {
+            None
+        };
         let graph = self.lower(RunPurpose::Paper, proposal)?;
-        let graph_artifact = self.graph_artifact(&graph, Vec::new(), now)?;
+        let graph_artifact = self.graph_artifact(
+            &graph,
+            proposal_artifact
+                .iter()
+                .map(|artifact| ArtifactRef {
+                    artifact_id: artifact.artifact_id.clone(),
+                    kind: ArtifactKind::WorkflowProposal,
+                })
+                .collect(),
+            now,
+        )?;
         let workflow = WorkflowCommit {
             run: StoredRun {
                 run_id,
@@ -528,15 +613,24 @@ impl WorkflowRuntime {
             graph: graph_artifact,
             nodes: graph.nodes,
         };
-        Ok(self.store.reserve_session_slot(
-            lease,
-            &SessionReservation {
-                session_key,
-                workflow,
-                setup_artifacts: setup_artifacts.to_vec(),
-                reserved_at: now,
-            },
-        )?)
+        let reservation = SessionReservation {
+            session_key,
+            workflow,
+            setup_artifacts: setup_artifacts.to_vec(),
+            reserved_at: now,
+        };
+        Ok(match (binding, proposal_artifact.as_ref()) {
+            (Some((runtime_manifest, approval)), Some(proposal_artifact)) => {
+                self.store.reserve_paper_session_with_approval(
+                    lease,
+                    &reservation,
+                    proposal_artifact,
+                    runtime_manifest,
+                    approval,
+                )?
+            }
+            _ => self.store.reserve_session_slot(lease, &reservation)?,
+        })
     }
 
     /// Build the Rust-owned, precompiled Paper proposal used for the first

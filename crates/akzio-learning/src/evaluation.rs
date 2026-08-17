@@ -65,7 +65,7 @@ pub struct GovernedHorizonObservation {
     pub expected_evidence_count: u64,
     pub observed_evidence_count: u64,
     pub expected_risk_count: u64,
-    pub detected_risk_count: u64,
+    pub detected_risk_count: Option<u64>,
 }
 
 /// Raw inputs from which Rust deterministically materializes a sealed Outcome.
@@ -110,8 +110,8 @@ pub struct EvaluationInput {
     pub contract_hash: ContentHash,
     pub topology_id: TopologyId,
     pub candidate_policy: Option<CandidatePolicyInput>,
-    pub token_cost: u64,
-    pub latency_millis: u64,
+    pub token_cost: Option<u64>,
+    pub latency_millis: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -266,7 +266,9 @@ impl EvaluationRuntime {
             .all(|count| *count >= self.policy.minimum_fresh_pairs_per_horizon);
         let degraded = outcome.windows.iter().any(|window| {
             window.evidence_completeness_ppm < self.policy.minimum_evidence_completeness_ppm
-                || window.risk_recall_ppm < self.policy.minimum_risk_recall_ppm
+                || window
+                    .risk_recall_ppm
+                    .is_none_or(|value| value < self.policy.minimum_risk_recall_ppm)
         });
 
         let origin = ArtifactOrigin {
@@ -801,7 +803,7 @@ pub fn materialize_outcome(
 
     let mut windows = Vec::with_capacity(OutcomeHorizon::ALL.len());
     for horizon in OutcomeHorizon::ALL {
-        let forecast_probability_ppm = forecasts
+        let _forecast_probability_ppm = forecasts
             .get(&horizon)
             .expect("index_forecasts requires all horizons");
         let observation = observations
@@ -829,18 +831,14 @@ pub fn materialize_outcome(
             transaction_cost_ppm: input.cost_model.transaction_cost_ppm,
             slippage_ppm: input.cost_model.slippage_ppm,
             utility_ppm,
-            calibration_ppm: directional_calibration_ppm(
-                *forecast_probability_ppm,
-                portfolio_return_ppm,
-            ),
+            calibration_ppm: None,
             evidence_completeness_ppm: bounded_ratio_ppm(
                 observation.expected_evidence_count,
                 observation.observed_evidence_count,
             ),
-            risk_recall_ppm: bounded_ratio_ppm(
-                observation.expected_risk_count,
-                observation.detected_risk_count,
-            ),
+            risk_recall_ppm: observation
+                .detected_risk_count
+                .map(|detected| bounded_ratio_ppm(observation.expected_risk_count, detected)),
         });
     }
 
@@ -903,7 +901,7 @@ pub fn materialize_partial_outcome(
     market_evidence.dedup();
     let mut windows = Vec::with_capacity(observations.len());
     for (horizon, observation) in observations {
-        let forecast_probability_ppm = forecasts
+        let _forecast_probability_ppm = forecasts
             .get(&horizon)
             .expect("index_forecasts requires all horizons");
         let portfolio_return_ppm = portfolio_return_ppm(
@@ -928,18 +926,14 @@ pub fn materialize_partial_outcome(
             transaction_cost_ppm: input.cost_model.transaction_cost_ppm,
             slippage_ppm: input.cost_model.slippage_ppm,
             utility_ppm,
-            calibration_ppm: directional_calibration_ppm(
-                *forecast_probability_ppm,
-                portfolio_return_ppm,
-            ),
+            calibration_ppm: None,
             evidence_completeness_ppm: bounded_ratio_ppm(
                 observation.expected_evidence_count,
                 observation.observed_evidence_count,
             ),
-            risk_recall_ppm: bounded_ratio_ppm(
-                observation.expected_risk_count,
-                observation.detected_risk_count,
-            ),
+            risk_recall_ppm: observation
+                .detected_risk_count
+                .map(|detected| bounded_ratio_ppm(observation.expected_risk_count, detected)),
         });
     }
     windows.sort_by_key(|window| window.horizon);
@@ -1110,11 +1104,6 @@ fn portfolio_return_ppm(
     i64::try_from(weighted / i128::from(PPM_ONE)).map_err(|_| EvaluationError::ArithmeticOverflow)
 }
 
-fn directional_calibration_ppm(probability_ppm: u32, realized_return_ppm: i64) -> u32 {
-    let realized = if realized_return_ppm > 0 { PPM_ONE } else { 0 };
-    PPM_ONE - probability_ppm.abs_diff(realized)
-}
-
 fn bounded_ratio_ppm(expected: u64, observed: u64) -> u32 {
     if expected == 0 {
         return PPM_ONE;
@@ -1160,7 +1149,7 @@ fn marginal_utility(outcome: &Outcome) -> i64 {
     average.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
 }
 
-fn next_state(current: PolicyState, has_fresh_pairs: bool, degraded: bool) -> PolicyState {
+fn next_state(current: PolicyState, _has_fresh_pairs: bool, degraded: bool) -> PolicyState {
     use CandidatePolicyState as Candidate;
     use MemoryLifecycle as Memory;
 
@@ -1175,32 +1164,13 @@ fn next_state(current: PolicyState, has_fresh_pairs: bool, degraded: bool) -> Po
             PolicyState::Topology(_) => PolicyState::Topology(Candidate::Candidate),
         };
     }
-    if !has_fresh_pairs {
-        return current;
-    }
-    match current {
-        PolicyState::Memory(Memory::Candidate) => PolicyState::Memory(Memory::Active),
-        PolicyState::Memory(Memory::Active) => PolicyState::Memory(Memory::Proven),
-        PolicyState::Memory(Memory::Contested) => PolicyState::Memory(Memory::Active),
-        PolicyState::Memory(Memory::Proven | Memory::Retired) => current,
-        PolicyState::Contract(Candidate::Candidate) => PolicyState::Contract(Candidate::Canary10),
-        PolicyState::Contract(Candidate::Canary10) => PolicyState::Contract(Candidate::Canary25),
-        PolicyState::Contract(Candidate::Canary25) => PolicyState::Contract(Candidate::Canary50),
-        PolicyState::Contract(Candidate::Canary50) => PolicyState::Contract(Candidate::Active),
-        PolicyState::Contract(Candidate::Active) => current,
-        PolicyState::Topology(Candidate::Candidate) => PolicyState::Topology(Candidate::Canary10),
-        PolicyState::Topology(Candidate::Canary10) => PolicyState::Topology(Candidate::Canary25),
-        PolicyState::Topology(Candidate::Canary25) => PolicyState::Topology(Candidate::Canary50),
-        PolicyState::Topology(Candidate::Canary50) => PolicyState::Topology(Candidate::Active),
-        PolicyState::Topology(Candidate::Active) => current,
-    }
+    current
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
-    use akzio_context::ContextBroker;
     use akzio_domain::{
         AgentContract, ArtifactId, ContextPolicy, ContractId, ContractPurpose, ExecutionVerdict,
         FailureDisposition, HardBlocker, LifecycleEventType, NoOrder, OutputContract, PromptBundle,
@@ -1259,7 +1229,7 @@ mod tests {
             expected_evidence_count: 4,
             observed_evidence_count: 3,
             expected_risk_count: 2,
-            detected_risk_count: 1,
+            detected_risk_count: Some(1),
         }
     }
 
@@ -1422,25 +1392,6 @@ mod tests {
         .unwrap();
         store.write_bootstrap_artifact(&artifact).unwrap();
         (contract, artifact_reference(&artifact))
-    }
-
-    fn fixture_overlay_contract(store: &V2Store, now: DateTime<Utc>) -> AgentContract {
-        let (mut contract, _) = fixture_contract(store, "overlay", now);
-        contract.context = ContextPolicy {
-            permitted_kinds: BTreeSet::from([ArtifactKind::CandidatePolicy]),
-            permitted_source_families: BTreeSet::from(["akzio-learning".to_owned()]),
-            min_artifacts: 1,
-            max_artifacts: 4,
-            max_bytes: 4096,
-            max_tokens: 1024,
-            allow_raw_reread: false,
-        };
-        contract.tool_grants.clear();
-        contract.candidate_capability_ceiling.context = contract.context.clone();
-        contract.candidate_capability_ceiling.tool_grants.clear();
-        contract.contract_hash = contract.expected_hash().unwrap();
-        contract.validate().unwrap();
-        contract
     }
 
     fn fixture_workflow(
@@ -1667,7 +1618,7 @@ mod tests {
             parent_materialization.sealed_at = sealed_at;
             for observation in &mut parent_materialization.observations {
                 observation.observed_evidence_count = observation.expected_evidence_count;
-                observation.detected_risk_count = observation.expected_risk_count;
+                observation.detected_risk_count = Some(observation.expected_risk_count);
             }
             let parent_outcome_payload = materialize_outcome(&parent_materialization).unwrap();
             let parent_outcome = fixture_artifact(
@@ -1886,8 +1837,8 @@ mod tests {
                     contract_hash,
                     topology_id,
                     candidate_policy,
-                    token_cost: 10,
-                    latency_millis: 20,
+                    token_cost: Some(10),
+                    latency_millis: Some(20),
                 })
                 .unwrap()
         }
@@ -1905,15 +1856,15 @@ mod tests {
         assert_eq!(t1.transaction_cost_ppm, 100);
         assert_eq!(t1.slippage_ppm, 50);
         assert_eq!(t1.utility_ppm, 49_850);
-        assert_eq!(t1.calibration_ppm, 800_000);
+        assert_eq!(t1.calibration_ppm, None);
         assert_eq!(t1.evidence_completeness_ppm, 750_000);
-        assert_eq!(t1.risk_recall_ppm, 500_000);
+        assert_eq!(t1.risk_recall_ppm, Some(500_000));
 
         let t3 = &outcome.windows[1];
         assert_eq!(t3.portfolio_return_ppm, -100_000);
         assert_eq!(t3.benchmark_return_ppm, -50_000);
         assert_eq!(t3.utility_ppm, -50_150);
-        assert_eq!(t3.calibration_ppm, 800_000);
+        assert_eq!(t3.calibration_ppm, None);
     }
 
     #[test]
@@ -2039,8 +1990,8 @@ mod tests {
                     contract_hash: ContentHash::of_bytes(b"active-contract"),
                     topology_id: TopologyId("active-topology".to_owned()),
                     candidate_policy: None,
-                    token_cost: 1,
-                    latency_millis: 1,
+                    token_cost: Some(1),
+                    latency_millis: Some(1),
                 })
                 .unwrap_err();
             assert!(matches!(
@@ -2082,11 +2033,11 @@ mod tests {
         );
         assert_eq!(
             next_state(subject.initial_state(), true, false),
-            PolicyState::Memory(MemoryLifecycle::Active)
+            PolicyState::Memory(MemoryLifecycle::Candidate)
         );
         assert_eq!(
             next_state(PolicyState::Memory(MemoryLifecycle::Active), true, false),
-            PolicyState::Memory(MemoryLifecycle::Proven)
+            PolicyState::Memory(MemoryLifecycle::Active)
         );
         assert_eq!(
             next_state(PolicyState::Memory(MemoryLifecycle::Proven), false, true),
@@ -2099,73 +2050,35 @@ mod tests {
     }
 
     #[test]
-    fn noop_canonical_evaluation_consumes_fresh_pairs_once() {
+    fn canonical_evaluation_consumes_fresh_pairs_without_promoting() {
         let fixture = RuntimeFixture::new();
+        let mut prior_cursor = 0;
 
-        let first_permit = fixture.claim_evaluation("evaluation-1");
-        fixture.record_pair_batch(&first_permit, 0);
-        let first = fixture.evaluate(first_permit, "candidate-to-active");
-        assert_eq!(first.fresh_pairs_by_horizon, [1, 1, 1]);
-        assert_eq!(
-            first.policy_head.as_ref().unwrap().state,
-            PolicyState::Memory(MemoryLifecycle::Active)
-        );
+        for batch in 0..3 {
+            let permit = fixture.claim_evaluation(&format!("evaluation-disabled-{batch}"));
+            fixture.record_pair_batch(&permit, batch);
+            let result = fixture.evaluate(permit, "forward-transition-disabled");
+            assert_eq!(result.fresh_pairs_by_horizon, [1, 1, 1]);
+            assert!(result.policy_head.is_none());
 
-        let second_permit = fixture.claim_evaluation("evaluation-2");
-        fixture.record_pair_batch(&second_permit, 1);
-        let second = fixture.evaluate(second_permit, "active-to-proven");
-        assert_eq!(second.fresh_pairs_by_horizon, [1, 1, 1]);
-        assert_eq!(
-            second.policy_head.as_ref().unwrap().state,
-            PolicyState::Memory(MemoryLifecycle::Proven)
-        );
-        let cursor_before_noop = fixture
-            .store
-            .policy_shadow_pair_snapshot(&fixture.subject)
-            .unwrap()
-            .through_cursor;
-
-        let noop_permit = fixture.claim_evaluation("evaluation-noop");
-        fixture.record_pair_batch(&noop_permit, 2);
-        let noop = fixture.evaluate(noop_permit, "proven-noop");
-        let cursor_after_noop = fixture
-            .store
-            .policy_shadow_pair_snapshot(&fixture.subject)
-            .unwrap()
-            .through_cursor;
-        assert_eq!(noop.fresh_pairs_by_horizon, [1, 1, 1]);
-        assert_eq!(noop.policy_head, second.policy_head);
-        assert!(cursor_after_noop > cursor_before_noop);
-        assert_eq!(
-            fixture
+            let cursor = fixture
                 .store
-                .artifact(&noop.evaluation.artifact_id)
+                .policy_shadow_pair_snapshot(&fixture.subject)
                 .unwrap()
-                .kind,
-            ArtifactKind::Evaluation
-        );
+                .through_cursor;
+            assert!(cursor > prior_cursor);
+            prior_cursor = cursor;
+        }
 
         let replay_permit = fixture.claim_evaluation("evaluation-old-pairs");
         let old_pairs = fixture.evaluate(replay_permit, "old-pairs-cannot-replay");
         assert_eq!(old_pairs.fresh_pairs_by_horizon, [0, 0, 0]);
-        assert_eq!(old_pairs.policy_head, noop.policy_head);
-        assert_ne!(old_pairs.evaluation, noop.evaluation);
-        assert_eq!(
-            fixture
-                .store
-                .policy_shadow_pair_snapshot(&fixture.subject)
-                .unwrap()
-                .through_cursor,
-            cursor_after_noop
-        );
-        assert_eq!(
-            fixture
-                .store
-                .policy_transitions(&fixture.subject)
-                .unwrap()
-                .len(),
-            2
-        );
+        assert!(old_pairs.policy_head.is_none());
+        assert!(fixture
+            .store
+            .policy_transitions(&fixture.subject)
+            .unwrap()
+            .is_empty());
 
         let evaluated = fixture
             .store
@@ -2173,11 +2086,8 @@ mod tests {
             .unwrap()
             .into_iter()
             .filter(|event| event.event_type == "policy.evaluated")
-            .collect::<Vec<_>>();
-        assert_eq!(evaluated.len(), 4);
-        assert!(evaluated
-            .iter()
-            .any(|event| event.artifact_id.as_ref() == Some(&noop.evaluation.artifact_id)));
+            .count();
+        assert_eq!(evaluated, 4);
         fixture.store.verify_integrity().unwrap();
     }
 
@@ -2214,124 +2124,39 @@ mod tests {
     }
 
     #[test]
-    fn topology_canary_requires_fresh_pairs_and_rolls_back_on_degradation() {
+    fn topology_forward_promotion_is_disabled_and_degradation_rolls_back() {
         let fixture = RuntimeFixture::new();
         let subject = PolicySubject::Topology(TopologyId(fixture.candidate_topology_id.clone()));
-        let candidate_policy = CandidatePolicyInput {
-            baseline: fixture.active_topology.clone(),
-            candidate: fixture.candidate_topology.clone(),
-        };
-        let expected = [
-            CandidatePolicyState::Canary10,
-            CandidatePolicyState::Canary25,
-            CandidatePolicyState::Canary50,
-            CandidatePolicyState::Active,
-        ];
+        let permit = fixture.claim_evaluation("topology-forward-disabled");
+        fixture.record_pair_batch_for(&permit, 0, &subject);
 
-        let mut active_policy = None;
-        for (batch, state) in expected.into_iter().enumerate() {
-            let permit = fixture.claim_evaluation(&format!("topology-canary-{batch}"));
-            fixture.record_pair_batch_for(&permit, batch, &subject);
-            if batch == 0 {
-                fixture.record_pair_batch_for(&permit, batch, &subject);
-            }
-            let task_id = permit.task_id.clone();
-            let result = fixture.evaluate_for(
-                permit,
-                &format!("topology-canary-{batch}"),
-                subject.clone(),
-                Some(candidate_policy.clone()),
-                fixture.materialization.clone(),
-            );
-            assert_eq!(result.fresh_pairs_by_horizon, [1, 1, 1]);
-            assert_eq!(
-                result.policy_head.as_ref().unwrap().state,
-                PolicyState::Topology(state)
-            );
-            let policy_ref = result.candidate_policy.unwrap();
-            let policy_artifact = fixture.store.artifact(&policy_ref.artifact_id).unwrap();
-            let policy: CandidatePolicy =
-                serde_json::from_slice(&fixture.store.read_blob(&policy_artifact.blob).unwrap())
-                    .unwrap();
-            policy.validate().unwrap();
-            assert_eq!(policy.subject, subject);
-            assert_eq!(policy.source_evaluation, result.evaluation);
-            assert!(fixture
-                .store
-                .committed_task_outputs(&fixture.paper_run_id, &task_id)
-                .unwrap()
-                .iter()
-                .any(|artifact| artifact.artifact_id == policy_ref.artifact_id));
-            if state == CandidatePolicyState::Active {
-                active_policy = Some(policy_ref);
-            }
-        }
-        let rollback_permit = fixture.claim_evaluation("topology-rollback");
-        let active_policy = active_policy.unwrap();
-        let broker = ContextBroker::new(fixture.store.clone());
-        let overlay_contract = fixture_overlay_contract(&fixture.store, fixture_time());
-        let overlay_run = fixture_workflow(
-            &fixture.store,
-            RunPurpose::Paper,
-            1,
-            Some(overlay_contract.contract_hash.clone()),
-            fixture_time(),
-        );
-        let overlay_permit = claim_fixture_task(&fixture.store, "topology-overlay", fixture_time());
-        assert_eq!(overlay_permit.run_id, overlay_run.run_id);
-        let manifest = broker
-            .assemble(
-                &overlay_permit,
-                &overlay_contract,
-                [active_policy.clone()],
-                fixture_time(),
-                Duration::minutes(5),
-            )
-            .unwrap();
-        assert_eq!(
-            broker
-                .policy_influences(
-                    &overlay_permit,
-                    &overlay_contract,
-                    &manifest,
-                    fixture_time(),
-                )
-                .unwrap(),
-            vec![active_policy]
-        );
-        let mut forged = manifest.clone();
-        forged.payload.selections.clear();
-        assert!(matches!(
-            broker.policy_influences(&overlay_permit, &overlay_contract, &forged, fixture_time(),),
-            Err(akzio_context::ContextError::InvalidManifestClosure)
-        ));
-
-        fixture.record_pair_batch_for(&rollback_permit, 4, &subject);
-        let mut degraded = fixture.materialization.clone();
-        for observation in &mut degraded.observations {
-            observation.expected_risk_count = 1;
-            observation.detected_risk_count = 0;
-        }
-        let rollback = fixture.evaluate_for(
-            rollback_permit,
-            "topology-rollback",
+        let result = fixture.evaluate_for(
+            permit,
+            "topology-forward-disabled",
             subject.clone(),
-            Some(candidate_policy),
-            degraded,
+            Some(CandidatePolicyInput {
+                baseline: fixture.active_topology.clone(),
+                candidate: fixture.candidate_topology.clone(),
+            }),
+            fixture.materialization.clone(),
         );
+
+        assert_eq!(result.fresh_pairs_by_horizon, [1, 1, 1]);
+        assert!(result.policy_head.is_none());
+        assert!(result.candidate_policy.is_some());
+        assert!(fixture
+            .store
+            .policy_transitions(&subject)
+            .unwrap()
+            .is_empty());
         assert_eq!(
-            rollback.policy_head.unwrap().state,
+            next_state(
+                PolicyState::Topology(CandidatePolicyState::Canary50),
+                false,
+                true,
+            ),
             PolicyState::Topology(CandidatePolicyState::Candidate)
         );
-        assert_eq!(fixture.store.policy_transitions(&subject).unwrap().len(), 5);
-        let completed_pairs = fixture
-            .store
-            .events_after(&fixture.paper_run_id, 0, 500)
-            .unwrap()
-            .into_iter()
-            .filter(|event| event.event_type == "shadow_pair.completed")
-            .count();
-        assert_eq!(completed_pairs, 15);
         fixture.store.verify_integrity().unwrap();
     }
 

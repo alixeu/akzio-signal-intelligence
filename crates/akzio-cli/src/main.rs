@@ -1,14 +1,27 @@
-use std::{collections::BTreeSet, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeSet,
+    fs,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    process::Command as ProcessCommand,
+    sync::Arc,
+    time::Duration,
+};
 
 use akzio_daemon::{
-    fixture_model_client, AlpacaPaperSessionClock, Daemon, DaemonConfig, DaemonHealth,
-    PaperWorkflowSource, ReplayReport, RetrospectiveView, RunCancellationResponse,
+    fixture_model_client, AlpacaMarketDataFeed, AlpacaPaperSessionClock, Daemon, DaemonConfig,
+    DaemonHealth, PaperWorkflowSource, ReplayReport, RetrospectiveView, RunCancellationResponse,
     RunRetryResponse, RunSubmissionResponse, SchedulerError, StorePaperWorkflowSource,
 };
-use akzio_domain::{ArtifactKind, Asset, Retrospective, RunId, RunPurpose, WorkflowStatus};
-use akzio_execution::paper::AlpacaPaper;
+use akzio_domain::{
+    content_hash_json, Artifact, ArtifactKind, ArtifactLifecycle, ArtifactProvenance, ArtifactRef,
+    Asset, ContentHash, MoneyMicros, PaperApprovalScope, PaperLaunchApproval, Retrospective, RunId,
+    RunPurpose, RuntimeManifest, WorkflowStatus, V2_DOMAIN_SCHEMA_VERSION,
+};
+use akzio_execution::{paper::AlpacaPaper, DecisionPolicy, ExecutionPolicy};
 use akzio_learning::{
-    evaluate_frozen_evidence, FrozenEvidenceRecord, FrozenEvidenceSet, OutcomeCostModel,
+    evaluate_frozen_evidence, EvaluationPolicy, FrozenEvidenceRecord, FrozenEvidenceSet,
+    OutcomeCostModel,
 };
 use akzio_model::ModelConfig;
 use akzio_store::{
@@ -112,6 +125,17 @@ enum StoreCommand {
     PaperSession {
         session_key: String,
     },
+    ApprovePaper {
+        session_key: String,
+        #[arg(long)]
+        operator: String,
+        #[arg(long)]
+        reason: String,
+        #[arg(long)]
+        max_notional_usd_cents: i64,
+        #[arg(long, default_value_t = 8)]
+        valid_hours: i64,
+    },
     Backup {
         target: PathBuf,
     },
@@ -178,6 +202,7 @@ struct DaemonSettings {
 #[serde(deny_unknown_fields)]
 struct ExecutionSettings {
     assets: Vec<Asset>,
+    market_data_feed: Option<AlpacaMarketDataFeed>,
     #[serde(default)]
     transaction_cost_ppm: u32,
     #[serde(default)]
@@ -374,12 +399,13 @@ fn print_sse_data(event_data: &mut Vec<String>) {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let config = load_config(&cli.config)?;
+    let config_path = cli.config.clone();
+    let config = load_config(&config_path)?;
 
     match cli.command {
         Command::Daemon {
             command: DaemonAction::Serve,
-        } => serve(config).await,
+        } => serve(config, &config_path).await,
         Command::Daemon {
             command: DaemonAction::Health,
         } => print_json(&ControlApiClient::from_config(&config)?.health().await?),
@@ -481,6 +507,27 @@ async fn main() -> Result<()> {
             print_json(&slot)
         }
         Command::Store {
+            command:
+                StoreCommand::ApprovePaper {
+                    session_key,
+                    operator,
+                    reason,
+                    max_notional_usd_cents,
+                    valid_hours,
+                },
+        } => {
+            approve_paper(
+                &config,
+                &config_path,
+                &session_key,
+                &operator,
+                &reason,
+                max_notional_usd_cents,
+                valid_hours,
+            )
+            .await
+        }
+        Command::Store {
             command: StoreCommand::Backup { target },
         } => print_json(&V2Store::open_existing(&config.daemon.store_root)?.backup_to(target)?),
         Command::Store {
@@ -503,6 +550,249 @@ async fn main() -> Result<()> {
             let store = V2Store::restore_from(source, target)?;
             print_json(&store.metrics(Utc::now())?)
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn approve_paper(
+    config: &Config,
+    config_path: &Path,
+    session_key: &str,
+    operator: &str,
+    reason: &str,
+    max_notional_usd_cents: i64,
+    valid_hours: i64,
+) -> Result<()> {
+    let session = chrono::NaiveDate::parse_from_str(session_key, "%Y-%m-%d")
+        .context("session_key must be YYYY-MM-DD")?;
+    if operator.trim().is_empty()
+        || reason.trim().is_empty()
+        || max_notional_usd_cents <= 0
+        || valid_hours <= 0
+        || valid_hours > 24 * 7
+    {
+        bail!("invalid Paper approval scope");
+    }
+    let model = config
+        .model
+        .as_ref()
+        .context("missing [model] configuration")?;
+    let feed = config
+        .execution
+        .market_data_feed
+        .context("Paper approval requires execution.market_data_feed")?;
+    let execution_policy = ExecutionPolicy::default();
+    let maximum_notional = MoneyMicros::from_usd_cents(max_notional_usd_cents);
+    if maximum_notional.0 > execution_policy.max_new_notional.0 {
+        bail!("approval max notional exceeds execution policy");
+    }
+    let paper = AlpacaPaper::from_env().context("construct Paper broker for approval")?;
+    let account = paper
+        .account()
+        .await
+        .context("read Paper account for approval")?;
+    let broker_account_id = account
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .context("Paper account id missing")?
+        .to_owned();
+    let now = Utc::now();
+    let provider_id = Url::parse(&model.base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .unwrap_or_else(|| model.base_url.clone());
+    let manifest_payload = RuntimeManifest {
+        schema_version: V2_DOMAIN_SCHEMA_VERSION,
+        code_revision: source_revision()?,
+        cargo_lock_hash: ContentHash::of_bytes(&fs::read("Cargo.lock").context("read Cargo.lock")?),
+        config_hash: ContentHash::of_bytes(&fs::read(config_path).context("read config")?),
+        provider_id,
+        model_id: model.model.clone(),
+        prompt_hash: component_hash(&[
+            "crates/akzio-research/src/agent_v2.rs",
+            "crates/akzio-research/src/v2.rs",
+        ])?,
+        contract_hash: component_hash(&[
+            "crates/akzio-research/src/v2.rs",
+            "crates/akzio-domain/src/contract.rs",
+        ])?,
+        topology_hash: component_hash(&["crates/akzio-runtime/src/runtime_v2.rs"])?,
+        decision_policy_hash: DecisionPolicy::default().policy_hash()?,
+        execution_policy_hash: execution_policy.policy_hash()?,
+        evaluation_policy_hash: {
+            let policy = EvaluationPolicy::default();
+            content_hash_json(&serde_json::json!({
+                "minimum_evidence_completeness_ppm": policy.minimum_evidence_completeness_ppm,
+                "minimum_risk_recall_ppm": policy.minimum_risk_recall_ppm,
+                "minimum_fresh_pairs_per_horizon": policy.minimum_fresh_pairs_per_horizon,
+            }))?
+        },
+        market_data_feed: feed.as_str().to_owned(),
+        broker_account_id,
+        maximum_notional,
+        allowed_session_start: session,
+        allowed_session_end: session,
+        expires_at: now + ChronoDuration::hours(valid_hours),
+        created_at: now,
+    };
+    let manifest_hash = manifest_payload.manifest_hash()?;
+    let store = V2Store::open(&config.daemon.store_root)?;
+    let manifest = Artifact::new(
+        ArtifactKind::RuntimeManifest,
+        store.put_json(&manifest_payload)?,
+        "runtime.manifest",
+        ArtifactLifecycle::Canonical,
+        ArtifactProvenance {
+            source_family: "akzio.operator".to_owned(),
+            observed_at: None,
+            retrieved_at: now,
+            source_uri: None,
+            confidence_ppm: 1_000_000,
+            producer_contract_hash: None,
+        },
+        None,
+        vec![],
+        now,
+    )?;
+    store.write_bootstrap_artifact(&manifest)?;
+    let mut approval_payload = PaperLaunchApproval {
+        schema_version: V2_DOMAIN_SCHEMA_VERSION,
+        operator_identity: operator.to_owned(),
+        runtime_manifest: ArtifactRef {
+            artifact_id: manifest.artifact_id.clone(),
+            kind: ArtifactKind::RuntimeManifest,
+        },
+        runtime_manifest_hash: manifest_hash.clone(),
+        scope: PaperApprovalScope::Canary,
+        reason: reason.to_owned(),
+        approved_at: now,
+        expires_at: manifest_payload.expires_at,
+        approval_hash: ContentHash::of_bytes(b"pending"),
+    };
+    approval_payload.approval_hash = approval_payload.unsigned_hash()?;
+    let approval = Artifact::new(
+        ArtifactKind::PaperLaunchApproval,
+        store.put_json(&approval_payload)?,
+        "operator.paper_approval",
+        ArtifactLifecycle::Canonical,
+        ArtifactProvenance {
+            source_family: "akzio.operator".to_owned(),
+            observed_at: None,
+            retrieved_at: now,
+            source_uri: None,
+            confidence_ppm: 1_000_000,
+            producer_contract_hash: None,
+        },
+        None,
+        vec![approval_payload.runtime_manifest.clone()],
+        now,
+    )?;
+    store.write_bootstrap_artifact(&approval)?;
+    print_json(&serde_json::json!({
+        "session_key": session_key,
+        "runtime_manifest_artifact_id": manifest.artifact_id,
+        "runtime_manifest_hash": manifest_hash,
+        "approval_artifact_id": approval.artifact_id,
+        "approval_hash": approval_payload.approval_hash,
+        "expires_at": approval_payload.expires_at,
+    }))
+}
+
+fn component_hash(paths: &[&str]) -> Result<ContentHash> {
+    let mut bytes = Vec::new();
+    for path in paths {
+        bytes.extend_from_slice(path.as_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(&fs::read(path).with_context(|| format!("read {path}"))?);
+        bytes.push(0);
+    }
+    Ok(ContentHash::of_bytes(&bytes))
+}
+
+fn runtime_identity_hash_from_config(config: &Config, config_path: &Path) -> Result<ContentHash> {
+    let model = config
+        .model
+        .as_ref()
+        .context("missing [model] configuration")?;
+    let feed = config
+        .execution
+        .market_data_feed
+        .context("Paper runtime requires execution.market_data_feed")?;
+    let provider_id = Url::parse(&model.base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .unwrap_or_else(|| model.base_url.clone());
+    let execution_policy = ExecutionPolicy::default();
+    let evaluation_policy = EvaluationPolicy::default();
+    content_hash_json(&serde_json::json!({
+        "code_revision": source_revision()?,
+        "cargo_lock_hash": ContentHash::of_bytes(&fs::read("Cargo.lock").context("read Cargo.lock")?),
+        "config_hash": ContentHash::of_bytes(&fs::read(config_path).context("read config")?),
+        "provider_id": provider_id,
+        "model_id": model.model,
+        "prompt_hash": component_hash(&[
+            "crates/akzio-research/src/agent_v2.rs",
+            "crates/akzio-research/src/v2.rs",
+        ])?,
+        "contract_hash": component_hash(&[
+            "crates/akzio-research/src/v2.rs",
+            "crates/akzio-domain/src/contract.rs",
+        ])?,
+        "topology_hash": component_hash(&["crates/akzio-runtime/src/runtime_v2.rs"])?,
+        "decision_policy_hash": DecisionPolicy::default().policy_hash()?,
+        "execution_policy_hash": execution_policy.policy_hash()?,
+        "evaluation_policy_hash": content_hash_json(&serde_json::json!({
+            "minimum_evidence_completeness_ppm": evaluation_policy.minimum_evidence_completeness_ppm,
+            "minimum_risk_recall_ppm": evaluation_policy.minimum_risk_recall_ppm,
+            "minimum_fresh_pairs_per_horizon": evaluation_policy.minimum_fresh_pairs_per_horizon,
+        }))?,
+        "market_data_feed": feed.as_str(),
+    }))
+    .map_err(Into::into)
+}
+
+fn source_revision() -> Result<String> {
+    let head = ProcessCommand::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .context("run git rev-parse")?;
+    if !head.status.success() {
+        bail!("git rev-parse failed");
+    }
+    let head = String::from_utf8(head.stdout)?.trim().to_owned();
+    let diff = ProcessCommand::new("git")
+        .args(["diff", "--binary", "HEAD", "--"])
+        .output()
+        .context("run git diff")?;
+    if !diff.status.success() {
+        bail!("git diff failed");
+    }
+    let untracked = ProcessCommand::new("git")
+        .args(["ls-files", "--others", "--exclude-standard", "-z"])
+        .output()
+        .context("list untracked files")?;
+    if !untracked.status.success() {
+        bail!("git untracked scan failed");
+    }
+    let mut state = diff.stdout;
+    for path in untracked
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+    {
+        let path = PathBuf::from(String::from_utf8(path.to_vec())?);
+        state.extend_from_slice(path.as_os_str().as_encoded_bytes());
+        state.push(0);
+        state.extend_from_slice(
+            &fs::read(&path).with_context(|| format!("read {}", path.display()))?,
+        );
+        state.push(0);
+    }
+    if state.is_empty() {
+        Ok(head)
+    } else {
+        Ok(format!("{head}+worktree:{}", ContentHash::of_bytes(&state)))
     }
 }
 
@@ -546,6 +836,9 @@ fn load_config(path: &PathBuf) -> Result<Config> {
     {
         bail!("Paper scheduler requires explicit transaction_cost_ppm or slippage_ppm");
     }
+    if config.daemon.auto_paper.unwrap_or(false) && config.execution.market_data_feed.is_none() {
+        bail!("Paper scheduler requires execution.market_data_feed");
+    }
     Ok(config)
 }
 
@@ -568,23 +861,28 @@ fn daemon_token(settings: &DaemonSettings) -> Result<String> {
     })
 }
 
-async fn serve(config: Config) -> Result<()> {
+async fn serve(config: Config, config_path: &Path) -> Result<()> {
     let auto_paper = config.daemon.auto_paper.unwrap_or(false);
     let token = daemon_token(&config.daemon)?;
     let model = config
         .model
         .clone()
         .context("missing [model] configuration for daemon serve")?;
+    let runtime_identity_hash = auto_paper
+        .then(|| runtime_identity_hash_from_config(&config, config_path))
+        .transpose()?;
     let daemon = Daemon::open(
         DaemonConfig {
             store_root: config.daemon.store_root,
             http_token: token,
             worker_count: config.daemon.worker_count.unwrap_or(4),
             auto_paper,
+            market_data_feed: config.execution.market_data_feed,
             outcome_cost_model: OutcomeCostModel {
                 transaction_cost_ppm: config.execution.transaction_cost_ppm,
                 slippage_ppm: config.execution.slippage_ppm,
             },
+            runtime_identity_hash,
         },
         model,
     )?;
@@ -715,10 +1013,12 @@ fn fixture_daemon(config: &Config) -> Result<Daemon> {
             http_token: "fixture-only".to_owned(),
             worker_count: config.daemon.worker_count.unwrap_or(2),
             auto_paper: false,
+            market_data_feed: config.execution.market_data_feed,
             outcome_cost_model: OutcomeCostModel {
                 transaction_cost_ppm: config.execution.transaction_cost_ppm,
                 slippage_ppm: config.execution.slippage_ppm,
             },
+            runtime_identity_hash: None,
         },
         fixture_model_client(),
     )?)
@@ -1073,6 +1373,20 @@ mod tests {
 
         let error = load_config(&path).unwrap_err().to_string();
         assert!(error.contains("transaction_cost_ppm or slippage_ppm"));
+    }
+
+    #[test]
+    fn config_rejects_auto_paper_without_market_data_feed() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("akzio.toml");
+        std::fs::write(
+            &path,
+            "[daemon]\nstore_root='store'\nauto_paper=true\nhttp_addr='127.0.0.1:1'\ntoken_env='TOKEN'\n[execution]\nassets=['TQQQ', 'QQQ', 'SOXX', 'SOXL']\ntransaction_cost_ppm=1\nslippage_ppm=1\n",
+        )
+        .unwrap();
+
+        let error = load_config(&path).unwrap_err().to_string();
+        assert!(error.contains("execution.market_data_feed"));
     }
 
     #[test]

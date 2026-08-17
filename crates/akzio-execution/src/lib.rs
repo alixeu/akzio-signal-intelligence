@@ -87,6 +87,8 @@ pub struct ExecutionPolicy {
     pub max_account_age_secs: i64,
     pub max_quote_age_secs: i64,
     pub max_clock_age_secs: i64,
+    pub max_future_skew_secs: i64,
+    pub max_snapshot_skew_secs: i64,
     pub max_spread_bps: u32,
     pub limit_protection_bps: u32,
 }
@@ -101,6 +103,8 @@ impl ExecutionPolicy {
             || self.max_account_age_secs < 0
             || self.max_quote_age_secs < 0
             || self.max_clock_age_secs < 0
+            || self.max_future_skew_secs < 0
+            || self.max_snapshot_skew_secs < 0
             || self.max_spread_bps > 10_000
             || self.limit_protection_bps > 10_000
         {
@@ -126,6 +130,8 @@ impl Default for ExecutionPolicy {
             max_account_age_secs: 5,
             max_quote_age_secs: 5,
             max_clock_age_secs: 5,
+            max_future_skew_secs: 1,
+            max_snapshot_skew_secs: 2,
             max_spread_bps: 20,
             limit_protection_bps: 10,
         }
@@ -195,6 +201,7 @@ pub fn build_execution_plan(
             .ok_or(ExecutionError::MissingQuote(asset))?;
         validate_quote(
             policy.max_quote_age_secs,
+            policy.max_future_skew_secs,
             policy.max_spread_bps,
             asset,
             quote,
@@ -272,12 +279,16 @@ fn scaled_weight(equity: MoneyMicros, weight: WeightPpm) -> MoneyMicros {
 
 pub(crate) fn validate_quote(
     max_age_secs: i64,
+    max_future_skew_secs: i64,
     max_spread_bps: u32,
     asset: Asset,
     quote: Quote,
     now: DateTime<Utc>,
 ) -> Result<()> {
-    if now.signed_duration_since(quote.observed_at) > chrono::Duration::seconds(max_age_secs) {
+    let age = now.signed_duration_since(quote.observed_at);
+    if age > chrono::Duration::seconds(max_age_secs)
+        || age < -chrono::Duration::seconds(max_future_skew_secs)
+    {
         return Err(ExecutionError::StaleQuote(asset));
     }
     if quote.bid.0 <= 0 || quote.ask.0 <= quote.bid.0 {
@@ -320,6 +331,8 @@ mod policy_tests {
             max_account_age_secs: 1,
             max_quote_age_secs: 1,
             max_clock_age_secs: 1,
+            max_future_skew_secs: 1,
+            max_snapshot_skew_secs: 1,
             max_spread_bps: 1,
             limit_protection_bps: 1,
         }
@@ -332,5 +345,25 @@ mod policy_tests {
 
         valid.assets.remove(&Asset::Soxl);
         assert_eq!(valid.validate(), Err(ExecutionError::InvalidPolicy));
+    }
+
+    #[test]
+    fn quote_validation_rejects_future_provider_timestamps() {
+        let now = Utc::now();
+        assert_eq!(
+            validate_quote(
+                5,
+                1,
+                20,
+                Asset::Qqq,
+                Quote {
+                    bid: MoneyMicros::from_usd_cents(10_000),
+                    ask: MoneyMicros::from_usd_cents(10_001),
+                    observed_at: now + chrono::Duration::seconds(2),
+                },
+                now,
+            ),
+            Err(ExecutionError::StaleQuote(Asset::Qqq))
+        );
     }
 }
