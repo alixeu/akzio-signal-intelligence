@@ -13,7 +13,7 @@ use std::{
 
 use akzio_domain::{
     Artifact, ArtifactKind, ArtifactLifecycle, ArtifactOrigin, ArtifactProvenance, ArtifactRef,
-    DomainError, EvidenceNeed, RunId, RunPurpose, RuntimeManifest, WorkflowProposal,
+    Asset, DomainError, EvidenceNeed, RunId, RunPurpose, RuntimeManifest, WorkflowProposal,
     V2_DOMAIN_SCHEMA_VERSION,
 };
 use akzio_execution::paper::AlpacaPaper;
@@ -40,6 +40,8 @@ pub enum SchedulerError {
     InvalidOwner,
     #[error("scheduler is not the active leader")]
     NotLeader,
+    #[error("scheduler lease state poisoned")]
+    LeasePoisoned,
     #[error("broker session key must be an ISO-8601 trading date: {0}")]
     InvalidSessionKey(String),
     #[error("broker session clock failed: {0}")]
@@ -58,15 +60,26 @@ const PAPER_OPEN_ORDERS_RESOURCE: &str = "paper.open_orders";
 const PAPER_QUOTES_RESOURCE: &str = "paper.quotes";
 const PAPER_CLOCK_RESOURCE: &str = "paper.clock";
 
-fn paper_snapshot_resources(session_key: &str) -> Vec<String> {
-    vec![
+pub(super) fn paper_snapshot_resources(session_key: &str) -> Vec<String> {
+    let start = NaiveDate::parse_from_str(session_key, "%Y-%m-%d")
+        .ok()
+        .and_then(|date| date.checked_sub_signed(Duration::days(28)))
+        .map(|date| date.format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| session_key.to_owned());
+    let mut resources = vec![
         PAPER_ACCOUNT_RESOURCE.to_owned(),
         PAPER_POSITIONS_RESOURCE.to_owned(),
         PAPER_OPEN_ORDERS_RESOURCE.to_owned(),
         format!("paper.fills:{session_key}"),
         PAPER_QUOTES_RESOURCE.to_owned(),
         PAPER_CLOCK_RESOURCE.to_owned(),
-    ]
+    ];
+    resources.extend(
+        Asset::EXECUTABLE
+            .into_iter()
+            .map(|asset| format!("bars:{}:1d:{start}:12", asset.symbol())),
+    );
+    resources
 }
 
 /// A broker-authoritative clock returns an open session date; local wall-clock
@@ -136,10 +149,13 @@ pub struct StaticPaperWorkflowSource {
     proposal: WorkflowProposal,
 }
 
-/// Reads only a durable `WorkflowProposal` from `V2Store`; it never builds a
-/// replacement plan after a session slot has been reserved.
+/// Prefers a durable Paper `WorkflowProposal` from `V2Store`. A bounded,
+/// Rust-compiled bootstrap may be supplied for the first scheduler session;
+/// reservation persists that proposal atomically with the Paper run.
+#[derive(Clone)]
 pub struct StorePaperWorkflowSource {
     store: V2Store,
+    bootstrap: Option<(WorkflowRuntime, String)>,
 }
 
 impl StaticPaperWorkflowSource {
@@ -150,16 +166,37 @@ impl StaticPaperWorkflowSource {
 
 impl StorePaperWorkflowSource {
     pub fn new(store: V2Store) -> Self {
-        Self { store }
+        Self {
+            store,
+            bootstrap: None,
+        }
+    }
+
+    pub fn with_bootstrap(
+        mut self,
+        workflow: WorkflowRuntime,
+        topology_id: impl Into<String>,
+    ) -> Self {
+        self.bootstrap = Some((workflow, topology_id.into()));
+        self
     }
 }
 
 impl PaperWorkflowSource for StorePaperWorkflowSource {
     fn proposal(&self, _session_key: &str) -> SchedulerResult<WorkflowProposal> {
-        let artifact = self
+        let Some(artifact) = self
             .store
             .latest_artifact_by_kind(ArtifactKind::WorkflowProposal)?
-            .ok_or(SchedulerError::WorkflowUnavailable)?;
+        else {
+            return self
+                .bootstrap
+                .as_ref()
+                .map(|(workflow, topology_id)| {
+                    workflow.approved_paper_proposal(topology_id.clone())
+                })
+                .transpose()?
+                .ok_or(SchedulerError::WorkflowUnavailable);
+        };
         let run_id = artifact
             .origin
             .as_ref()
@@ -367,6 +404,7 @@ impl PaperScheduler {
         P: PaperWorkflowSource + ?Sized,
     {
         let Some(session_key) = clock.open_session_key().await? else {
+            eprintln!("Paper scheduler waiting: broker market is closed");
             return Ok(None);
         };
         if let Some(slot) = self.store.session_slot(&session_key)? {
@@ -376,12 +414,14 @@ impl PaperScheduler {
             }));
         }
         let Some((runtime_manifest, approval)) = self.current_approval_binding()? else {
+            eprintln!("Paper scheduler waiting: no current Paper approval binding");
             return Ok(None);
         };
         let manifest_payload: RuntimeManifest =
             serde_json::from_slice(&self.store.read_blob(&runtime_manifest.blob)?)?;
         if let Some(expected) = &self.runtime_identity_hash {
             if manifest_payload.runtime_identity_hash()? != *expected {
+                eprintln!("Paper scheduler waiting: runtime identity does not match approval");
                 return Ok(None);
             }
         }
@@ -391,11 +431,15 @@ impl PaperScheduler {
                 .market_data_feed
                 .is_none_or(|feed| manifest_payload.market_data_feed != feed.as_str())
         {
+            eprintln!("Paper scheduler waiting: broker account or market-data feed mismatch");
             return Ok(None);
         }
         let proposal = match source.proposal(&session_key) {
             Ok(proposal) => proposal,
-            Err(SchedulerError::WorkflowUnavailable) => return Ok(None),
+            Err(SchedulerError::WorkflowUnavailable) => {
+                eprintln!("Paper scheduler waiting: workflow proposal unavailable");
+                return Ok(None);
+            }
             Err(error) => return Err(error),
         };
         let lease = self.acquire_or_renew(now)?;
@@ -531,7 +575,10 @@ impl PaperScheduler {
 
     fn acquire_or_renew(&self, now: DateTime<Utc>) -> SchedulerResult<DaemonLease> {
         let expires_at = now + self.lease_duration;
-        let mut held = self.lease.lock().expect("scheduler lease state poisoned");
+        let mut held = self
+            .lease
+            .lock()
+            .map_err(|_| SchedulerError::LeasePoisoned)?;
         if let Some(lease) = held.as_mut() {
             if self.store.heartbeat_daemon_lease(lease, now, expires_at)? {
                 lease.expires_at = expires_at;

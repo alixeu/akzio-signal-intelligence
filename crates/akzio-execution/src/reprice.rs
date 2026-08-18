@@ -6,9 +6,9 @@
 //! dispatch boundary.
 
 use akzio_domain::{
-    Artifact, ArtifactKind, ArtifactLifecycle, ArtifactOrigin, ArtifactProvenance, ArtifactRef,
-    DomainError, ExecutionContext, FreezeState, OrderReceipt, OrderReceiptState, PaperCommitment,
-    PaperReprice, PaperRepriceId, RunPurpose, TaskWritePermit, V2_SCHEMA_VERSION,
+    Artifact, ArtifactKind, ArtifactLifecycle, ArtifactRef, DomainError, ExecutionContext,
+    FreezeState, OrderReceipt, OrderReceiptState, PaperCommitment, PaperReprice, PaperRepriceId,
+    RunPurpose, TaskWritePermit, V2_SCHEMA_VERSION,
 };
 use akzio_store::v2::{DaemonLease, RepriceCommit, StoreError, V2Store};
 use chrono::{DateTime, Utc};
@@ -218,20 +218,8 @@ impl V2RepriceRuntime {
             self.store.put_json(&reprice_payload)?,
             "execution.paper_reprice",
             ArtifactLifecycle::Canonical,
-            ArtifactProvenance {
-                source_family: "akzio.execution".to_owned(),
-                observed_at: Some(input.now),
-                retrieved_at: input.now,
-                source_uri: None,
-                confidence_ppm: 1_000_000,
-                producer_contract_hash: input.permit.contract_hash.clone(),
-            },
-            Some(ArtifactOrigin {
-                run_id: Some(input.permit.run_id.clone()),
-                task_id: Some(input.permit.task_id.clone()),
-                attempt_id: Some(input.permit.attempt_id.clone()),
-                contract_hash: input.permit.contract_hash.clone(),
-            }),
+            crate::trusted_execution_provenance(&input.permit, input.now),
+            Some(input.permit.artifact_origin()),
             vec![
                 input.commitment.clone(),
                 input.prior_receipt.clone(),

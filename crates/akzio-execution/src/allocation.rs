@@ -1,13 +1,17 @@
 //! Model-free conversion from a typed decision and broker snapshots to orders.
 
 use akzio_domain::{
-    AccountSnapshot, ArtifactRef, DecisionContext, DomainError, ExecutionPlan, MarketClockSnapshot,
-    QuoteSnapshot,
+    AccountSnapshot, ArtifactRef, Asset, ContentHash, DecisionContext, DomainError, ExecutionPlan,
+    FactorExposure, MarketClockSnapshot, MoneyMicros, OrderIntent, OrderSide, QuoteSnapshot,
+    WeightPpm, V2_DOMAIN_SCHEMA_VERSION,
 };
 use chrono::{DateTime, Utc};
 use thiserror::Error;
 
-use crate::{build_execution_plan, ExecutionError, ExecutionPolicy};
+use crate::{
+    protected_limit_price, scaled_weight, validate_quote, ExecutionError, ExecutionPolicy,
+    WEIGHT_SCALE,
+};
 
 #[derive(Debug, Error)]
 pub enum AllocationError {
@@ -69,18 +73,138 @@ impl V2AllocationRuntime {
         if !input.clock.is_open {
             return Err(AllocationError::MarketClosed);
         }
-        Ok(build_execution_plan(
-            &self.policy,
-            input.decision_context_ref.clone(),
-            input.account_snapshot_ref.clone(),
-            input.quote_snapshot_ref.clone(),
-            input.market_clock_snapshot_ref.clone(),
-            &input.decision_context.target,
-            &input.account,
-            &input.quotes,
-            input.now,
-        )?)
+        Ok(build_execution_plan(&self.policy, input)?)
     }
+}
+
+fn build_execution_plan(
+    policy: &ExecutionPolicy,
+    input: &AllocationInput,
+) -> std::result::Result<ExecutionPlan, ExecutionError> {
+    let target = &input.decision_context.target;
+    let account = &input.account;
+    let quotes = &input.quotes;
+    let now = input.now;
+    policy.validate()?;
+    if !account.active || account.trading_blocked || account.equity.0 <= 0 {
+        return Err(ExecutionError::AccountBlocked);
+    }
+
+    target
+        .validate_universe()
+        .map_err(|_| ExecutionError::InvalidPolicy)?;
+    let gross = target
+        .weights
+        .iter()
+        .try_fold(0_u32, |sum, (asset, weight)| {
+            if !policy.assets.contains(asset) {
+                return Err(ExecutionError::ForbiddenAsset(*asset));
+            }
+            if weight.0 > WeightPpm::SCALE {
+                return Err(ExecutionError::InvalidWeight(*asset));
+            }
+            sum.checked_add(weight.0)
+                .ok_or(ExecutionError::GrossExposureExceeded(
+                    policy.max_gross_weight.0,
+                ))
+        })?;
+    if gross > policy.max_gross_weight.0 {
+        return Err(ExecutionError::GrossExposureExceeded(
+            policy.max_gross_weight.0,
+        ));
+    }
+
+    let mut orders = Vec::new();
+    let mut new_notional = 0_i128;
+    let mut order_turnover = 0_i128;
+    for asset in Asset::EXECUTABLE {
+        let target_value = scaled_weight(account.equity, target.weights[&asset]);
+        let current_value = account
+            .positions
+            .get(&asset)
+            .map_or(MoneyMicros::ZERO, |position| position.market_value);
+        let delta = i128::from(target_value.0) - i128::from(current_value.0);
+        if delta == 0 {
+            continue;
+        }
+        if target_value.0 < 0 || current_value.0 < 0 {
+            return Err(ExecutionError::ShortPosition(asset));
+        }
+        let quote = *quotes
+            .quotes
+            .get(&asset)
+            .ok_or(ExecutionError::MissingQuote(asset))?;
+        validate_quote(
+            policy.max_quote_age_secs,
+            policy.max_future_skew_secs,
+            policy.max_spread_bps,
+            asset,
+            quote,
+            now,
+        )?;
+        let side = if delta > 0 {
+            OrderSide::Buy
+        } else {
+            OrderSide::Sell
+        };
+        let notional = MoneyMicros(
+            i64::try_from(delta.unsigned_abs()).map_err(|_| ExecutionError::NewNotionalExceeded)?,
+        );
+        if side == OrderSide::Buy {
+            new_notional = new_notional.saturating_add(i128::from(notional.0));
+        }
+        order_turnover = order_turnover.saturating_add(i128::from(notional.0));
+        orders.push(OrderIntent {
+            asset,
+            side,
+            notional,
+            limit_price: protected_limit_price(quote, side, policy.limit_protection_bps),
+        });
+    }
+
+    if orders.is_empty() {
+        return Err(ExecutionError::NoExecutableOrder);
+    }
+    if new_notional > i128::from(policy.max_new_notional.0) {
+        return Err(ExecutionError::NewNotionalExceeded);
+    }
+    if new_notional > i128::from(account.buying_power.0) {
+        return Err(ExecutionError::InsufficientBuyingPower);
+    }
+
+    let total_turnover = i128::from(account.day_turnover.0).saturating_add(order_turnover);
+    let turnover_ppm = total_turnover
+        .saturating_mul(WEIGHT_SCALE)
+        .checked_div(i128::from(account.equity.0))
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or(ExecutionError::DailyTurnoverExceeded)?;
+    if turnover_ppm > policy.max_daily_turnover.0 {
+        return Err(ExecutionError::DailyTurnoverExceeded);
+    }
+
+    orders.sort_by_key(|order| (matches!(order.side, OrderSide::Buy), order.asset));
+    let factor_exposure =
+        FactorExposure::from_target(target).map_err(|_| ExecutionError::InvalidPolicy)?;
+    let mut plan = ExecutionPlan {
+        schema_version: V2_DOMAIN_SCHEMA_VERSION,
+        decision_context: input.decision_context_ref.clone(),
+        account_snapshot: input.account_snapshot_ref.clone(),
+        quote_snapshot: input.quote_snapshot_ref.clone(),
+        market_clock_snapshot: input.market_clock_snapshot_ref.clone(),
+        policy_hash: policy.policy_hash()?,
+        target: target.clone(),
+        orders,
+        gross_exposure_ppm: gross,
+        net_exposure_ppm: i64::from(gross),
+        factor_exposure,
+        turnover_ppm,
+        broker_session: account.broker_session.clone(),
+        created_at: now,
+        plan_hash: ContentHash::of_bytes(b"pending execution plan hash"),
+    };
+    plan.refresh_hash()
+        .map_err(|_| ExecutionError::InvalidPolicy)?;
+    Ok(plan)
 }
 
 #[cfg(test)]

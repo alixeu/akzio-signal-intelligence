@@ -611,7 +611,7 @@ fn prepared_commitment() -> PreparedCommitment {
         .write_task_artifact(
             &permit,
             &context_artifact,
-            LifecycleEventType::ExecutionContextCreatedLegacy,
+            LifecycleEventType::ExecutionContextCreated,
             now,
         )
         .unwrap();
@@ -635,7 +635,7 @@ fn prepared_commitment() -> PreparedCommitment {
         .write_task_artifact(
             &permit,
             &verdict,
-            LifecycleEventType::ExecutionVerdictCreatedLegacy,
+            LifecycleEventType::ExecutionVerdictCreated,
             now,
         )
         .unwrap();
@@ -673,7 +673,8 @@ async fn partial_fill_reprice_uses_one_durable_replacement() {
         .unwrap()
         .permit;
     let broker = FakeCommittedBroker::new(["partially_filled", "filled"]);
-    let runtime = V2PaperDispatchRuntime::new(store.clone());
+    let runtime = V2PaperDispatchRuntime::new(store.clone())
+        .with_settlement_timeout(std::time::Duration::ZERO);
     let output = runtime
         .dispatch(
             &broker,

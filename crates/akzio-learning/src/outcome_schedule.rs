@@ -5,10 +5,10 @@
 //! later governed market observations may seal an `Outcome` and affect policy.
 
 use akzio_domain::{
-    Artifact, ArtifactKind, ArtifactLifecycle, ArtifactOrigin, ArtifactProvenance, ArtifactRef,
-    Decision, DecisionContext, DomainError, ExecutionContext, ExecutionVerdict,
-    OutcomeExecutionLineage, OutcomeId, OutcomeSchedule, PaperCommitment, Reconciliation,
-    ReconciliationState, RunPurpose, TaskStatus, TaskWritePermit, V2_DOMAIN_SCHEMA_VERSION,
+    Artifact, ArtifactKind, ArtifactLifecycle, ArtifactRef, Decision, DecisionContext, DomainError,
+    ExecutionContext, ExecutionVerdict, OutcomeExecutionLineage, OutcomeId, OutcomeSchedule,
+    PaperCommitment, Reconciliation, ReconciliationState, RunPurpose, TaskStatus, TaskWritePermit,
+    V2_DOMAIN_SCHEMA_VERSION,
 };
 use akzio_store::v2::{StoreError, V2Store};
 use chrono::{DateTime, NaiveDate, Utc};
@@ -151,20 +151,8 @@ impl OutcomeSchedulingRuntime {
             self.store.put_json(&payload)?,
             "learning.outcome_schedule",
             ArtifactLifecycle::Canonical,
-            ArtifactProvenance {
-                source_family: "akzio-learning".to_owned(),
-                observed_at: Some(input.now),
-                retrieved_at: input.now,
-                source_uri: None,
-                confidence_ppm: 1_000_000,
-                producer_contract_hash: input.permit.contract_hash.clone(),
-            },
-            Some(ArtifactOrigin {
-                run_id: Some(input.permit.run_id.clone()),
-                task_id: Some(input.permit.task_id.clone()),
-                attempt_id: Some(input.permit.attempt_id.clone()),
-                contract_hash: input.permit.contract_hash.clone(),
-            }),
+            crate::trusted_learning_provenance(&input.permit, input.now),
+            Some(input.permit.artifact_origin()),
             source_refs,
             input.now,
         )?;

@@ -7,16 +7,18 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use akzio_domain::{
-    content_hash_json, Artifact, ArtifactId, ArtifactKind, ArtifactLifecycle, ArtifactOrigin,
-    ArtifactProvenance, ArtifactRef, Asset, CandidatePolicy, ContextManifestPayload, Decision,
-    DecisionContext, DecisionDraft, DecisionHorizon, DomainError, Experience, Forecast,
-    HardBlocker, PolicySubject, RunPurpose, TargetPortfolio, TaskStatus, TaskWritePermit,
-    WeightPpm, V2_DOMAIN_SCHEMA_VERSION,
+    content_hash_json, Artifact, ArtifactId, ArtifactKind, ArtifactLifecycle, ArtifactRef, Asset,
+    CandidatePolicy, ContextManifestPayload, Decision, DecisionContext, DecisionDraft,
+    DecisionHorizon, DomainError, Experience, Forecast, HardBlocker, PolicySubject, RunPurpose,
+    TargetPortfolio, TaskStatus, TaskWritePermit, WeightPpm, V2_DOMAIN_SCHEMA_VERSION,
 };
 use akzio_store::v2::{StoreError, V2Store};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+#[cfg(test)]
+use akzio_domain::{ArtifactOrigin, ArtifactProvenance};
 
 #[derive(Debug, Error)]
 pub enum DecisionGateError {
@@ -602,20 +604,8 @@ impl V2DecisionRuntime {
             self.store.put_json(payload)?,
             producer,
             lifecycle,
-            ArtifactProvenance {
-                source_family: "akzio.execution".to_owned(),
-                observed_at: Some(input.now),
-                retrieved_at: input.now,
-                source_uri: None,
-                confidence_ppm: 1_000_000,
-                producer_contract_hash: input.permit.contract_hash.clone(),
-            },
-            Some(ArtifactOrigin {
-                run_id: Some(input.permit.run_id.clone()),
-                task_id: Some(input.permit.task_id.clone()),
-                attempt_id: Some(input.permit.attempt_id.clone()),
-                contract_hash: input.permit.contract_hash.clone(),
-            }),
+            crate::trusted_execution_provenance(&input.permit, input.now),
+            Some(input.permit.artifact_origin()),
             source_refs,
             input.now,
         )?)
@@ -958,7 +948,7 @@ mod tests {
             .write_task_artifact(
                 &synth_permit,
                 &manifest,
-                LifecycleEventType::ContextManifest,
+                LifecycleEventType::ContextManifestCreated,
                 now,
             )
             .unwrap();

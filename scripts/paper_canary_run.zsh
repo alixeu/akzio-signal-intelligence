@@ -194,10 +194,10 @@ alpaca_get() {
   local url="$2"
   local output="${tmp_dir}/${name}.json"
   local attempt
-  for attempt in {1..3}; do
+  for attempt in {1..6}; do
     : > "${output}"
     if curl --ipv4 --http1.1 --silent --show-error --fail-with-body \
-      --connect-timeout 8 --max-time 30 \
+      --connect-timeout 15 --max-time 45 \
       -H "APCA-API-KEY-ID: ${ALPACA_API_KEY}" \
       -H "APCA-API-SECRET-KEY: ${ALPACA_API_SECRET}" \
       "${url}" > "${output}" 2>> "${bundle}/commands/preflight-${name}.stderr" \
@@ -226,6 +226,11 @@ quotes_file="$(alpaca_get quotes 'https://data.alpaca.markets/v2/stocks/quotes/l
   write_summary
   exit 10
 }
+orders_file="$(alpaca_get open-orders 'https://paper-api.alpaca.markets/v2/orders?status=open&limit=500&direction=desc')" || {
+  summary_status=preflight_error
+  write_summary
+  exit 10
+}
 
 jq '{status,account_blocked,trading_blocked}' "${account_file}" \
   > "${bundle}/commands/preflight-account.json"
@@ -233,6 +238,8 @@ jq '{is_open,timestamp,next_open,next_close}' "${clock_file}" \
   > "${bundle}/commands/preflight-clock.json"
 jq '{quotes:(.quotes // {} | with_entries(.value |= {ap,as,bp,bs,t}))}' "${quotes_file}" \
   > "${bundle}/commands/preflight-quotes.json"
+jq '[.[] | select(.symbol == "TQQQ" or .symbol == "QQQ" or .symbol == "SOXX" or .symbol == "SOXL") | {id,client_order_id,symbol,side,status,qty,filled_qty,created_at,updated_at}]' "${orders_file}" \
+  > "${bundle}/commands/preflight-open-orders.json"
 
 account_ok="$(jq -r '(.status == "ACTIVE" and .account_blocked == false and .trading_blocked == false)' "${account_file}")"
 clock_open="$(jq -r '.is_open // false' "${clock_file}")"
@@ -245,12 +252,14 @@ for asset in TQQQ QQQ SOXX SOXL; do
   fi
 done
 
+open_order_count="$(jq 'length' "${bundle}/commands/preflight-open-orders.json")"
 jq -n \
   --arg account_status "$(jq -r '.status // "unknown"' "${account_file}")" \
   --argjson account_ok "${account_ok}" \
   --argjson is_open "${clock_open}" \
   --argjson quotes_executable "${quotes_executable}" \
-  '{account_status:$account_status,account_ok:$account_ok,is_open:$is_open,quotes_executable:$quotes_executable,orders_submitted:0,live_trading:false}' \
+  --argjson open_order_count "${open_order_count}" \
+  '{account_status:$account_status,account_ok:$account_ok,is_open:$is_open,quotes_executable:$quotes_executable,open_order_count:$open_order_count,orders_submitted:0,live_trading:false}' \
   > "${bundle}/commands/preflight-summary.json"
 
 if [[ "${clock_open}" != true ]]; then
@@ -421,10 +430,10 @@ if ! "${binary}" --config "${runtime_config}" store doctor \
 if ! "${binary}" --config "${runtime_config}" store export-run "${run_id}" "${export_root}" \
   > "${bundle}/commands/export-run.json" 2>&1; then collect_failed=true; fi
 
-if [[ -f "${export_root}/manifest.json" ]]; then
+if [[ -f "${export_root}/akzio-export.sqlite3" ]]; then
   export_checked=true
-  export_raw_model="$(jq -r '.include_raw_model // true' "${export_root}/manifest.json" 2>/dev/null || print true)"
-  order_receipts="$(jq '[.artifacts[]? | select(.artifact.kind == "order_receipt")] | length' "${export_root}/manifest.json" 2>/dev/null || print 0)"
+  export_raw_model="$(jq -r '.include_raw_model // true' "${bundle}/commands/export-run.json" 2>/dev/null || print true)"
+  order_receipts="$(jq '[.artifacts[]? | select(.artifact.kind == "order_receipt")] | length' "${bundle}/commands/export-run.json" 2>/dev/null || print 0)"
 else
   collect_failed=true
 fi

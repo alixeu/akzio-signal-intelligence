@@ -18,7 +18,7 @@ This repository is a Rust 2021 workspace for a local, Paper-only Multi-Agent Res
 | Area | Owns |
 | --- | --- |
 | `akzio-domain` | Stable schemas and validation, no I/O |
-| `akzio-store` | CAS, SQLite, event log, task/daemon leases, Doctor |
+| `akzio-store` | SQLite-embedded CAS BLOBs, event log, task/daemon leases, Doctor |
 | `akzio-runtime` | Workflow compilation, planner patches, task lifecycle/recovery |
 | `akzio-research` | Agent contracts and model-mediated research only |
 | `akzio-execution` | Rust decision/execution gates and Paper broker protocol |
@@ -41,6 +41,32 @@ Do not combine these concerns in `akzio-daemon` dispatch code. If a change is a 
 - Memory and topology state are immutable-document histories; do not mutate a prior record in place.
 - Shadow pairs must reference parent Decision, ExecutionContext and candidate Decision. Pair completion must remain idempotent even when timestamps collide.
 - Promotion requires fresh paired outcomes at each canary level. Lower risk recall or evidence completeness rolls a candidate back.
+
+## Execution waves and code-generation discipline
+
+Follow the plan in order. Do not reopen a completed wave unless current evidence shows a regression.
+
+- **R0–R10 implementation wave:** domain, Store, Context/Evidence, contracts, workflow/replay, learning, execution, daemon/HTTP, CLI and final offline cleanup. Treat these as complete only when the current tree passes their exit evidence; historical prose is not proof.
+- **Paper canary wave:** a real Alpaca Paper run may validate broker/session/receipt/reconciliation behavior, but only that run and its durable evidence are canonical proof. Fixture, Debug, Dry Run and Replay are never real-Paper proof.
+- **Outcome wave:** after a real Paper run, the scheduler must wait for real T+1, T+3 and T+5 sessions. Only sealed Paper outcomes may create Retrospective, Experience, Evaluation or Policy Transition. Never fabricate, backfill or mock these artifacts.
+- **Approval wave:** final human launch approval remains separate from code, offline tests and a Paper canary.
+
+Current checkpoint (2026-08-18; refresh from Store before relying on it):
+
+- Run `77395cfd-8d03-405d-9b47-ca99b19525f1` completed a real Paper canary on 2026-08-17; four orders filled and reconciliation completed.
+- Its `learning.outcome_worker` is still queued for `2026-08-18T22:00:00Z`; only `OutcomeSchedule` exists so far.
+- T+1/T+3/T+5 sealing, Retrospective, Experience, Policy Evaluation/Transition and final human approval are not complete.
+
+For every code-generation task:
+
+1. Start with a narrow inventory and identify the current wave and owner crate.
+2. Reuse existing types/helpers; make the smallest change that satisfies the wave exit gate.
+3. Keep policy in its owner crate and durable invariants in `akzio-store`; do not introduce speculative abstractions, parallel state, or compatibility layers.
+4. Preserve serialization, hashes, provenance, source closure, lifecycle, transaction boundaries, leases, gates and replay semantics unless the plan explicitly changes them.
+5. Run the narrowest relevant test immediately, then the required workspace checks before declaring the wave complete.
+6. Report four separate states: implemented, offline-verified, real-Paper-verified and outcome/learning-verified. Never collapse them into one “done”.
+
+When a task is only a refactor or storage change, prove behavioral equivalence first; do not mix it with schema-version, `ExecutionPlan` serde/hash, Paper gate, transaction-boundary or learning-policy changes.
 
 ## Code navigation
 

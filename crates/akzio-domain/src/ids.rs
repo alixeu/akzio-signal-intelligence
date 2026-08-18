@@ -5,10 +5,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub use crate::{
-    AttemptId, ContractId, DecisionId, DocumentId, ExecutionPlanId, LeaseId, MemoryId, RunId,
-    TaskId, TopologyId,
-};
+pub use crate::{AttemptId, ContractId, DecisionId, LeaseId, MemoryId, RunId, TaskId, TopologyId};
 
 macro_rules! id_type {
     ($name:ident) => {
@@ -18,7 +15,16 @@ macro_rules! id_type {
 
         impl $name {
             pub fn new() -> Self {
-                Self(Uuid::new_v4().to_string())
+                let value = Uuid::new_v4().simple().to_string();
+                Self(value[..16].to_owned())
+            }
+
+            pub fn short_id(&self) -> String {
+                self.0
+                    .chars()
+                    .filter(|character| *character != '-')
+                    .take(16)
+                    .collect()
             }
         }
 
@@ -44,3 +50,21 @@ id_type!(PolicyTransitionId);
 id_type!(PaperCommitmentId);
 id_type!(PaperRepriceId);
 id_type!(ReconciliationId);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generated_domain_ids_are_sixteen_lowercase_hex_characters() {
+        for value in [
+            EventId::new().0,
+            OutcomeId::new().0,
+            PolicyTransitionId::new().0,
+        ] {
+            assert_eq!(value.len(), 16);
+            assert!(value.bytes().all(|byte| byte.is_ascii_hexdigit()));
+            assert_eq!(value, value.to_ascii_lowercase());
+        }
+    }
+}

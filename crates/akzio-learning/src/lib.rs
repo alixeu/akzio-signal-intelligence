@@ -6,6 +6,23 @@ mod evaluation;
 mod frozen_eval;
 mod outcome_schedule;
 
+use akzio_domain::{ArtifactProvenance, TaskWritePermit};
+use chrono::{DateTime, Utc};
+
+pub(crate) fn trusted_learning_provenance(
+    permit: &TaskWritePermit,
+    now: DateTime<Utc>,
+) -> ArtifactProvenance {
+    ArtifactProvenance {
+        source_family: "akzio-learning".to_owned(),
+        observed_at: Some(now),
+        retrieved_at: now,
+        source_uri: None,
+        confidence_ppm: 1_000_000,
+        producer_contract_hash: permit.contract_hash.clone(),
+    }
+}
+
 pub use akzio_domain::{OutcomeCostModel, PolicySubject};
 pub use evaluation::{
     materialize_outcome, materialize_partial_outcome, CandidatePolicyInput, EvaluationError,

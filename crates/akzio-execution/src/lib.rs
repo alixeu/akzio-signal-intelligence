@@ -31,10 +31,7 @@ pub use reprice::{RepriceError, RepriceInput, RepriceOutput, V2RepriceRuntime};
 
 use std::collections::BTreeSet;
 
-use akzio_domain::{
-    content_hash_json, ArtifactRef, Asset, ContentHash, FactorExposure, TargetPortfolio,
-    V2_DOMAIN_SCHEMA_VERSION,
-};
+use akzio_domain::{content_hash_json, ArtifactProvenance, Asset, ContentHash, TaskWritePermit};
 pub use akzio_domain::{
     AccountSnapshot, ExecutionPlan, MarketClockSnapshot, MoneyMicros, OrderIntent, OrderSide,
     Position, Quote, QuoteSnapshot, WeightPpm,
@@ -43,8 +40,23 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub(crate) fn trusted_execution_provenance(
+    permit: &TaskWritePermit,
+    now: DateTime<Utc>,
+) -> ArtifactProvenance {
+    ArtifactProvenance {
+        source_family: "akzio.execution".to_owned(),
+        observed_at: Some(now),
+        retrieved_at: now,
+        source_uri: None,
+        confidence_ppm: 1_000_000,
+        producer_contract_hash: permit.contract_hash.clone(),
+    }
+}
+
 const WEIGHT_SCALE: i128 = 1_000_000;
 const BPS_SCALE: i64 = 10_000;
+const PAPER_PRICE_TICK_MICROS: i64 = 10_000;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ExecutionError {
@@ -130,146 +142,12 @@ impl Default for ExecutionPolicy {
             max_account_age_secs: 5,
             max_quote_age_secs: 5,
             max_clock_age_secs: 5,
-            max_future_skew_secs: 1,
-            max_snapshot_skew_secs: 2,
+            max_future_skew_secs: 15,
+            max_snapshot_skew_secs: 15,
             max_spread_bps: 20,
             limit_protection_bps: 10,
         }
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn build_execution_plan(
-    policy: &ExecutionPolicy,
-    decision_context: ArtifactRef,
-    account_snapshot: ArtifactRef,
-    quote_snapshot: ArtifactRef,
-    market_clock_snapshot: ArtifactRef,
-    target: &TargetPortfolio,
-    account: &AccountSnapshot,
-    quotes: &QuoteSnapshot,
-    now: DateTime<Utc>,
-) -> Result<ExecutionPlan> {
-    policy.validate()?;
-    if !account.active || account.trading_blocked || account.equity.0 <= 0 {
-        return Err(ExecutionError::AccountBlocked);
-    }
-
-    target
-        .validate_universe()
-        .map_err(|_| ExecutionError::InvalidPolicy)?;
-    let gross = target
-        .weights
-        .iter()
-        .try_fold(0_u32, |sum, (asset, weight)| {
-            if !policy.assets.contains(asset) {
-                return Err(ExecutionError::ForbiddenAsset(*asset));
-            }
-            if weight.0 > WeightPpm::SCALE {
-                return Err(ExecutionError::InvalidWeight(*asset));
-            }
-            sum.checked_add(weight.0)
-                .ok_or(ExecutionError::GrossExposureExceeded(
-                    policy.max_gross_weight.0,
-                ))
-        })?;
-    if gross > policy.max_gross_weight.0 {
-        return Err(ExecutionError::GrossExposureExceeded(
-            policy.max_gross_weight.0,
-        ));
-    }
-
-    let mut orders = Vec::new();
-    let mut new_notional = 0_i128;
-    let mut order_turnover = 0_i128;
-    for asset in Asset::EXECUTABLE {
-        let target_value = scaled_weight(account.equity, target.weights[&asset]);
-        let current_value = account
-            .positions
-            .get(&asset)
-            .map_or(MoneyMicros::ZERO, |position| position.market_value);
-        let delta = i128::from(target_value.0) - i128::from(current_value.0);
-        if delta == 0 {
-            continue;
-        }
-        if target_value.0 < 0 || current_value.0 < 0 {
-            return Err(ExecutionError::ShortPosition(asset));
-        }
-        let quote = *quotes
-            .quotes
-            .get(&asset)
-            .ok_or(ExecutionError::MissingQuote(asset))?;
-        validate_quote(
-            policy.max_quote_age_secs,
-            policy.max_future_skew_secs,
-            policy.max_spread_bps,
-            asset,
-            quote,
-            now,
-        )?;
-        let side = if delta > 0 {
-            OrderSide::Buy
-        } else {
-            OrderSide::Sell
-        };
-        let notional = MoneyMicros(
-            i64::try_from(delta.unsigned_abs()).map_err(|_| ExecutionError::NewNotionalExceeded)?,
-        );
-        if side == OrderSide::Buy {
-            new_notional = new_notional.saturating_add(i128::from(notional.0));
-        }
-        order_turnover = order_turnover.saturating_add(i128::from(notional.0));
-        orders.push(OrderIntent {
-            asset,
-            side,
-            notional,
-            limit_price: protected_limit_price(quote, side, policy.limit_protection_bps),
-        });
-    }
-
-    if orders.is_empty() {
-        return Err(ExecutionError::NoExecutableOrder);
-    }
-    if new_notional > i128::from(policy.max_new_notional.0) {
-        return Err(ExecutionError::NewNotionalExceeded);
-    }
-    if new_notional > i128::from(account.buying_power.0) {
-        return Err(ExecutionError::InsufficientBuyingPower);
-    }
-
-    let total_turnover = i128::from(account.day_turnover.0).saturating_add(order_turnover);
-    let turnover_ppm = total_turnover
-        .saturating_mul(WEIGHT_SCALE)
-        .checked_div(i128::from(account.equity.0))
-        .and_then(|value| u32::try_from(value).ok())
-        .ok_or(ExecutionError::DailyTurnoverExceeded)?;
-    if turnover_ppm > policy.max_daily_turnover.0 {
-        return Err(ExecutionError::DailyTurnoverExceeded);
-    }
-
-    orders.sort_by_key(|order| (matches!(order.side, OrderSide::Buy), order.asset));
-    let factor_exposure =
-        FactorExposure::from_target(target).map_err(|_| ExecutionError::InvalidPolicy)?;
-    let mut plan = ExecutionPlan {
-        schema_version: V2_DOMAIN_SCHEMA_VERSION,
-        decision_context,
-        account_snapshot,
-        quote_snapshot,
-        market_clock_snapshot,
-        policy_hash: policy.policy_hash()?,
-        target: target.clone(),
-        orders,
-        gross_exposure_ppm: gross,
-        net_exposure_ppm: i64::from(gross),
-        factor_exposure,
-        turnover_ppm,
-        broker_session: account.broker_session.clone(),
-        created_at: now,
-        plan_hash: ContentHash::of_bytes(b"pending execution plan hash"),
-    };
-    plan.refresh_hash()
-        .map_err(|_| ExecutionError::InvalidPolicy)?;
-    Ok(plan)
 }
 
 fn scaled_weight(equity: MoneyMicros, weight: WeightPpm) -> MoneyMicros {
@@ -308,14 +186,19 @@ pub(crate) fn protected_limit_price(
     protection_bps: u32,
 ) -> MoneyMicros {
     let protection = i64::from(protection_bps);
-    match side {
-        OrderSide::Buy => {
-            MoneyMicros(quote.ask.0.saturating_mul(BPS_SCALE + protection) / BPS_SCALE)
-        }
+    let raw = match side {
+        OrderSide::Buy => quote.ask.0.saturating_mul(BPS_SCALE + protection) / BPS_SCALE,
+        OrderSide::Sell => quote.bid.0.saturating_mul(BPS_SCALE - protection) / BPS_SCALE,
+    };
+    let rounded = match side {
+        OrderSide::Buy => raw / PAPER_PRICE_TICK_MICROS * PAPER_PRICE_TICK_MICROS,
         OrderSide::Sell => {
-            MoneyMicros(quote.bid.0.saturating_mul(BPS_SCALE - protection) / BPS_SCALE)
+            let ticks = raw / PAPER_PRICE_TICK_MICROS;
+            let ticks = ticks.saturating_add(i64::from(raw % PAPER_PRICE_TICK_MICROS != 0));
+            ticks.saturating_mul(PAPER_PRICE_TICK_MICROS)
         }
-    }
+    };
+    MoneyMicros(rounded)
 }
 
 #[cfg(test)]
@@ -364,6 +247,55 @@ mod policy_tests {
                 now,
             ),
             Err(ExecutionError::StaleQuote(Asset::Qqq))
+        );
+    }
+
+    #[test]
+    fn default_policy_tolerates_bounded_broker_clock_skew() {
+        let now = Utc::now();
+        let policy = ExecutionPolicy::default();
+        let quote = |seconds| Quote {
+            bid: MoneyMicros::from_usd_cents(10_000),
+            ask: MoneyMicros::from_usd_cents(10_001),
+            observed_at: now + chrono::Duration::seconds(seconds),
+        };
+        assert!(validate_quote(
+            policy.max_quote_age_secs,
+            policy.max_future_skew_secs,
+            policy.max_spread_bps,
+            Asset::Qqq,
+            quote(10),
+            now,
+        )
+        .is_ok());
+        assert_eq!(
+            validate_quote(
+                policy.max_quote_age_secs,
+                policy.max_future_skew_secs,
+                policy.max_spread_bps,
+                Asset::Qqq,
+                quote(16),
+                now,
+            ),
+            Err(ExecutionError::StaleQuote(Asset::Qqq))
+        );
+        assert_eq!(policy.max_snapshot_skew_secs, 15);
+    }
+
+    #[test]
+    fn protected_limits_round_to_broker_ticks_without_weakening_protection() {
+        let quote = Quote {
+            bid: MoneyMicros(76_500_000),
+            ask: MoneyMicros(76_510_000),
+            observed_at: Utc::now(),
+        };
+        assert_eq!(
+            protected_limit_price(quote, OrderSide::Buy, 10),
+            MoneyMicros(76_580_000)
+        );
+        assert_eq!(
+            protected_limit_price(quote, OrderSide::Sell, 10),
+            MoneyMicros(76_430_000)
         );
     }
 }

@@ -6,13 +6,15 @@
 //! a commitment returned from here.
 
 use akzio_domain::{
-    Artifact, ArtifactKind, ArtifactLifecycle, ArtifactOrigin, ArtifactProvenance, ArtifactRef,
-    Asset, DomainError, ExecutionContext, ExecutionVerdict, FreezeState, PaperCommitment,
-    PaperCommitmentId, RunPurpose, TaskWritePermit,
+    Artifact, ArtifactKind, ArtifactLifecycle, ArtifactRef, Asset, DomainError, ExecutionContext,
+    ExecutionVerdict, FreezeState, PaperCommitment, PaperCommitmentId, RunPurpose, TaskWritePermit,
 };
 use akzio_store::v2::{DaemonLease, ExecutionCommit, StoreError, V2Store};
 use chrono::{DateTime, Utc};
 use thiserror::Error;
+
+#[cfg(test)]
+use akzio_domain::{ArtifactOrigin, ArtifactProvenance};
 
 #[derive(Debug, Error)]
 pub enum PaperCommitmentError {
@@ -206,20 +208,8 @@ impl V2PaperCommitmentRuntime {
             self.store.put_json(&payload)?,
             "execution.paper_commitment",
             ArtifactLifecycle::Canonical,
-            ArtifactProvenance {
-                source_family: "akzio.execution".to_owned(),
-                observed_at: Some(input.now),
-                retrieved_at: input.now,
-                source_uri: None,
-                confidence_ppm: 1_000_000,
-                producer_contract_hash: input.permit.contract_hash.clone(),
-            },
-            Some(ArtifactOrigin {
-                run_id: Some(input.permit.run_id.clone()),
-                task_id: Some(input.permit.task_id.clone()),
-                attempt_id: Some(input.permit.attempt_id.clone()),
-                contract_hash: input.permit.contract_hash.clone(),
-            }),
+            crate::trusted_execution_provenance(&input.permit, input.now),
+            Some(input.permit.artifact_origin()),
             vec![input.verdict.clone(), execution_context],
             input.now,
         )?;
@@ -558,7 +548,7 @@ mod tests {
             .write_task_artifact(
                 &permit,
                 &context,
-                LifecycleEventType::ExecutionContextCreatedLegacy,
+                LifecycleEventType::ExecutionContextCreated,
                 now,
             )
             .unwrap();
@@ -585,7 +575,7 @@ mod tests {
             .write_task_artifact(
                 &permit,
                 &verdict,
-                LifecycleEventType::ExecutionVerdictCreatedLegacy,
+                LifecycleEventType::ExecutionVerdictCreated,
                 now,
             )
             .unwrap();

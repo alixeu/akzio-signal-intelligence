@@ -3,15 +3,18 @@
 use std::collections::BTreeSet;
 
 use akzio_domain::{
-    AccountSnapshot, Artifact, ArtifactKind, ArtifactLifecycle, ArtifactOrigin, ArtifactProvenance,
-    ArtifactRef, CandidatePolicy, ContextManifestPayload, DecisionContext, DomainError,
-    ExecutionContext, ExecutionVerdict, Experience, FreezeState, HardBlocker, MarketClockSnapshot,
-    NoOrder, PolicySubject, QuoteSnapshot, RunPurpose, TaskStatus, TaskWritePermit,
+    AccountSnapshot, Artifact, ArtifactKind, ArtifactLifecycle, ArtifactRef, CandidatePolicy,
+    ContextManifestPayload, DecisionContext, DomainError, ExecutionContext, ExecutionVerdict,
+    Experience, FreezeState, HardBlocker, MarketClockSnapshot, NoOrder, PolicySubject,
+    QuoteSnapshot, RunPurpose, TaskStatus, TaskWritePermit,
 };
 use akzio_store::v2::{StoreError, V2Store};
 use chrono::{DateTime, Duration, Utc};
 use serde::de::DeserializeOwned;
 use thiserror::Error;
+
+#[cfg(test)]
+use akzio_domain::{ArtifactOrigin, ArtifactProvenance};
 
 use crate::{
     AllocationError, AllocationInput, ExecutionError, ExecutionGatePolicy, ExecutionPolicy,
@@ -645,20 +648,8 @@ impl V2ExecutionRuntime {
             self.store.put_json(payload)?,
             producer,
             ArtifactLifecycle::RunScoped,
-            ArtifactProvenance {
-                source_family: "akzio.execution".to_owned(),
-                observed_at: Some(input.now),
-                retrieved_at: input.now,
-                source_uri: None,
-                confidence_ppm: 1_000_000,
-                producer_contract_hash: input.permit.contract_hash.clone(),
-            },
-            Some(ArtifactOrigin {
-                run_id: Some(input.permit.run_id.clone()),
-                task_id: Some(input.permit.task_id.clone()),
-                attempt_id: Some(input.permit.attempt_id.clone()),
-                contract_hash: input.permit.contract_hash.clone(),
-            }),
+            crate::trusted_execution_provenance(&input.permit, input.now),
+            Some(input.permit.artifact_origin()),
             source_refs,
             input.now,
         )?)

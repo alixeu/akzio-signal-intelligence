@@ -11,6 +11,11 @@
 - Alpaca 凭据只从 `ALPACA_API_KEY`、`ALPACA_API_SECRET` 环境注入；`ALPACA_PAPER_BASE_URL` 为空或必须为 `https://paper-api.alpaca.markets`。
 - `auto_paper=true` 时必须配置经过审批的非零 `transaction_cost_ppm` 或 `slippage_ppm`；零成本只可用于 fixture/离线验证。
 
+当前 Store Root 只有 `akzio.sqlite3`。Artifact payload 以 SHA-256 为键存入
+`rebuild_blobs`，Artifact metadata、关系、事件和运行状态存入同一数据库；不再有
+filesystem CAS sidecar。`store backup`、`store restore` 和 `store export-run` 也只生成
+SQLite 文件。
+
 ## 启动前检查
 
 ```bash
@@ -63,7 +68,7 @@ cargo run --offline -p akzio-cli -- run events <run-id>
 ### 进程强杀与恢复
 
 1. 记录退出时间、`daemon health`、最近的 run/task/attempt event cursor。
-2. 使用同一 `Store Root` 重启，不删除 SQLite 或 CAS。
+2. 使用同一 `Store Root` 重启，不删除 `akzio.sqlite3`。
 3. 检查 stale attempt recovery、scheduler lease epoch、Paper session slot 和原冻结 workflow plan。
 4. 已存在的 commitment 只能走 scheduler-owned reconciliation；不得手工重建 plan 或 client order id。
 5. 在解除冻结前运行 `store doctor`、`run replay`，并完成 Paper sandbox 对账。
@@ -106,7 +111,7 @@ cargo run --offline -p akzio-cli -- store doctor
 cargo run --offline -p akzio-cli -- run replay <run-id>
 ```
 
-备份使用 SQLite 一致性快照并复制 CAS。恢复目标必须不存在且不能位于活动 Store Root 内；恢复后自动运行 Store Doctor，运维仍需核对 manifest hash/count/version 与 Paper commitment 一致性。
+备份使用 SQLite 一致性快照，数据库已包含全部 CAS payload。恢复目标必须不存在且不能位于活动 Store Root 内；恢复后自动运行 Store Doctor，运维仍需核对 database hash、blob count、schema version 与 Paper commitment 一致性。
 
 ## 离线故障演练
 
