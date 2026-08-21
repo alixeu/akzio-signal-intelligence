@@ -327,7 +327,7 @@ fn canonical_active_contract(
         _ => definition.prompt.to_owned(),
     };
     let role_prompt = format!(
-        "{role_prompt}\n\nUse at most 8 evidence-relevant IDs in deliberation.basis_artifact_ids."
+        "{role_prompt}\n\nUse at most 8 evidence-relevant IDs in deliberation.basis_artifact_ids. When the output schema contains applied_learning_refs and rejected_learning_refs, list only top-level ContextManifest learning artifacts: applied_learning_refs are lessons or experiences you actually relied on, rejected_learning_refs are reviewed learning artifacts you intentionally did not apply, and both arrays must be empty when no learning artifact was used. Never invent or copy nested artifact IDs."
     );
     let prompt = PromptBundle {
         version: ACTIVE_PROMPT_BUNDLE_VERSION,
