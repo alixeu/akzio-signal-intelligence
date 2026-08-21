@@ -6,8 +6,9 @@ use std::{
 };
 
 use akzio_domain::{
-    Artifact, ArtifactKind, ArtifactLifecycle, ArtifactProvenance, Asset, DecisionHorizon, Lesson,
-    LessonId, LessonLifecycle, LessonOrigin, LessonScope, V2_DOMAIN_SCHEMA_VERSION,
+    Artifact, ArtifactId, ArtifactKind, ArtifactLifecycle, ArtifactProvenance, ArtifactRef, Asset,
+    ContentHash, DecisionHorizon, Lesson, LessonId, LessonLifecycle, LessonOrigin, LessonScope,
+    V2_DOMAIN_SCHEMA_VERSION,
 };
 use akzio_store::{v2::StoredLesson, V2Store};
 use anyhow::{bail, Context, Result};
@@ -80,6 +81,10 @@ struct LessonInput {
     regimes: Vec<String>,
     #[serde(default)]
     decision_stages: Vec<String>,
+    #[serde(default)]
+    supersedes: Vec<String>,
+    #[serde(default)]
+    conflicts_with: Vec<String>,
     #[serde(default = "default_confidence")]
     confidence_ppm: u32,
     authored_by: String,
@@ -191,8 +196,8 @@ fn add(store_root: &PathBuf, file: &PathBuf) -> Result<()> {
             artifact_id: source.artifact_id.clone(),
             kind: source.kind,
         }],
-        supersedes: vec![],
-        conflicts_with: vec![],
+        supersedes: parse_lesson_refs(&input.supersedes)?,
+        conflicts_with: parse_lesson_refs(&input.conflicts_with)?,
         confidence_ppm: input.confidence_ppm,
         authored_by: Some(input.authored_by),
         approved_by: None,
@@ -243,6 +248,18 @@ fn parse_horizon(value: &str) -> Result<DecisionHorizon> {
         "t5" => Ok(DecisionHorizon::T5),
         other => bail!("unsupported horizon {other}; expected t1, t3 or t5"),
     }
+}
+
+fn parse_lesson_refs(values: &[String]) -> Result<Vec<ArtifactRef>> {
+    values
+        .iter()
+        .map(|value| {
+            Ok(ArtifactRef {
+                artifact_id: ArtifactId(ContentHash::new(value.trim())?),
+                kind: ArtifactKind::Lesson,
+            })
+        })
+        .collect()
 }
 
 fn parse_lifecycle(value: &str) -> Result<LessonLifecycle> {
