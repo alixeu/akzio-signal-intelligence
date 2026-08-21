@@ -4,10 +4,10 @@ use std::collections::{BTreeSet, VecDeque};
 
 use akzio_domain::{
     content_hash_json, AgentContract, Artifact, ArtifactId, ArtifactKind, ArtifactLifecycle,
-    ArtifactOrigin, ArtifactProvenance, ArtifactRef, CandidatePolicy, ContextManifestPayload,
-    ContextPolicy, ContextProjection, ContextSelection, DomainError, Experience, Lesson,
-    LessonLifecycle,
-    LifecycleEventType, PolicyState, ReadGrant, TaskWritePermit, V2_DOMAIN_SCHEMA_VERSION,
+    ArtifactOrigin, ArtifactProvenance, ArtifactRef, Asset, CandidatePolicy,
+    ContextManifestPayload, ContextPolicy, ContextProjection, ContextSelection, DecisionHorizon,
+    DomainError, Experience, Lesson, LessonLifecycle, LessonScope, LifecycleEventType, PolicyState,
+    ReadGrant, TaskWritePermit, V2_DOMAIN_SCHEMA_VERSION,
 };
 use akzio_store::v2::{StoreError, SucceededAttemptProof, V2Store};
 use chrono::{DateTime, Duration, Utc};
@@ -219,7 +219,8 @@ impl ContextBroker {
         let policy = &contract.context;
         let mut seen = BTreeSet::new();
         let mut candidate_refs = candidates.into_iter().collect::<Vec<_>>();
-        candidate_refs.extend(self.learning_candidates(policy)?);
+        let learning_scope = self.infer_learning_scope(&candidate_refs)?;
+        candidate_refs.extend(self.learning_candidates(policy, &learning_scope)?);
         let artifacts = candidate_refs
             .into_iter()
             .filter(|reference| seen.insert(reference.artifact_id.clone()))
@@ -362,12 +363,24 @@ impl ContextBroker {
     /// Attenuate a persisted parent manifest into a child attempt grant.
     /// Projection may include parent outputs, but only from the current
     /// succeeded attempt and only when their provenance closes to the parent.
-    fn learning_candidates(&self, policy: &ContextPolicy) -> ContextResult<Vec<ArtifactRef>> {
+    fn learning_candidates(
+        &self,
+        policy: &ContextPolicy,
+        scope: &LessonScope,
+    ) -> ContextResult<Vec<ArtifactRef>> {
         let mut candidates = Vec::new();
         if policy.permitted_kinds.contains(&ArtifactKind::Lesson) {
             let mut lesson_count = 0;
             for stored in self.store.lessons(Some(LessonLifecycle::Active), 50)? {
                 let artifact = stored.artifact;
+                if !stored.lesson.scope.matches(
+                    &scope.assets,
+                    &scope.horizons,
+                    &scope.regimes,
+                    &scope.decision_stages,
+                ) {
+                    continue;
+                }
                 if (policy.permitted_source_families.is_empty()
                     || policy
                         .permitted_source_families
@@ -409,6 +422,49 @@ impl ContextBroker {
             }
         }
         Ok(candidates)
+    }
+
+    fn infer_learning_scope(&self, references: &[ArtifactRef]) -> ContextResult<LessonScope> {
+        let mut scope = LessonScope::default();
+        for reference in references {
+            let artifact = self.store.artifact(&reference.artifact_id)?;
+            if !matches!(
+                artifact.kind,
+                ArtifactKind::NormalizedEvidence | ArtifactKind::SemanticDetail
+            ) {
+                continue;
+            }
+            let bytes = self.store.read_blob(&artifact.blob)?;
+            let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+                continue;
+            };
+            let mut strings = Vec::new();
+            collect_strings(&value, &mut strings);
+            for value in strings {
+                if let Ok(asset) = Asset::try_from(value.as_str()) {
+                    scope.assets.insert(asset);
+                }
+                match value.to_ascii_lowercase().as_str() {
+                    "t1" => {
+                        scope.horizons.insert(DecisionHorizon::T1);
+                    }
+                    "t3" => {
+                        scope.horizons.insert(DecisionHorizon::T3);
+                    }
+                    "t5" => {
+                        scope.horizons.insert(DecisionHorizon::T5);
+                    }
+                    value if value.starts_with("regime:") => {
+                        scope.regimes.insert(value[7..].to_owned());
+                    }
+                    value if value.starts_with("stage:") => {
+                        scope.decision_stages.insert(value[6..].to_owned());
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(scope)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1093,6 +1149,23 @@ impl ContextBroker {
             }
         }
         Ok(closure)
+    }
+}
+
+fn collect_strings(value: &serde_json::Value, output: &mut Vec<String>) {
+    match value {
+        serde_json::Value::String(value) => output.push(value.clone()),
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_strings(value, output);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for value in values.values() {
+                collect_strings(value, output);
+            }
+        }
+        _ => {}
     }
 }
 

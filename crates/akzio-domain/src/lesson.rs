@@ -70,7 +70,10 @@ impl LessonScope {
             || self.assets.iter().any(|asset| assets.contains(asset)))
             && (self.horizons.is_empty()
                 || horizons.is_empty()
-                || self.horizons.iter().any(|horizon| horizons.contains(horizon)))
+                || self
+                    .horizons
+                    .iter()
+                    .any(|horizon| horizons.contains(horizon)))
             && (self.regimes.is_empty()
                 || regimes.is_empty()
                 || self.regimes.iter().any(|regime| regimes.contains(regime)))
@@ -237,5 +240,26 @@ mod tests {
         let mut value = lesson();
         value.supersedes = vec![reference(ArtifactKind::Claim)];
         assert!(value.validate().is_err());
+    }
+
+    #[test]
+    fn scope_matching_filters_known_assets_and_horizons() {
+        let scope = LessonScope {
+            assets: BTreeSet::from([Asset::Tqqq]),
+            horizons: BTreeSet::from([DecisionHorizon::T1]),
+            ..LessonScope::default()
+        };
+        assert!(scope.matches(
+            &BTreeSet::from([Asset::Tqqq]),
+            &BTreeSet::from([DecisionHorizon::T1]),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        ));
+        assert!(!scope.matches(
+            &BTreeSet::from([Asset::Qqq]),
+            &BTreeSet::from([DecisionHorizon::T1]),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        ));
     }
 }
