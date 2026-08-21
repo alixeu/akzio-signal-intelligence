@@ -65,7 +65,13 @@ impl V2Store {
                 producer_contract_hash: None,
             },
             None,
-            lesson.source_refs.clone(),
+            lesson
+                .source_refs
+                .iter()
+                .cloned()
+                .chain(lesson.supersedes.iter().cloned())
+                .chain(lesson.conflicts_with.iter().cloned())
+                .collect(),
             now,
         )?;
 
@@ -91,6 +97,7 @@ impl V2Store {
         }
 
         insert_artifact(&transaction, source)?;
+        self.validate_related_refs(&transaction, lesson)?;
         insert_artifact(&transaction, &artifact)?;
         transaction.execute(
             "INSERT INTO rebuild_lesson_heads (lesson_id, artifact_id, lifecycle, revision, updated_at) VALUES (?1, ?2, ?3, 1, ?4)",
@@ -222,10 +229,8 @@ impl V2Store {
                 .source_refs
                 .iter()
                 .cloned()
-                .chain(std::iter::once(ArtifactRef {
-                    artifact_id: current.artifact.artifact_id.clone(),
-                    kind: ArtifactKind::Lesson,
-                }))
+                .chain(next.supersedes.iter().cloned())
+                .chain(next.conflicts_with.iter().cloned())
                 .collect(),
             now,
         )?;
@@ -245,6 +250,23 @@ impl V2Store {
             return Err(StoreError::Integrity(
                 "lesson head changed concurrently".to_owned(),
             ));
+        }
+        self.validate_related_refs(&transaction, &next)?;
+        if lifecycle == LessonLifecycle::Active {
+            for conflict in &next.conflicts_with {
+                let conflict_lesson = self.read_lesson_artifact(&transaction, conflict)?;
+                let active = transaction
+                    .query_row(
+                        "SELECT 1 FROM rebuild_lesson_heads WHERE lesson_id = ?1 AND lifecycle = 'active'",
+                        params![conflict_lesson.lesson.lesson_id.0.as_str()],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()?
+                    .is_some();
+                if active && conflict_lesson.lesson.lesson_id != next.lesson_id {
+                    return Err(StoreError::InvalidLearningCommit("lesson.active_conflict"));
+                }
+            }
         }
         insert_artifact(&transaction, &artifact)?;
         transaction.execute(
@@ -335,6 +357,42 @@ impl V2Store {
                 created_at.to_rfc3339(),
             ],
         )?;
+        Ok(())
+    }
+
+    fn read_lesson_artifact(
+        &self,
+        transaction: &rusqlite::Transaction<'_>,
+        reference: &ArtifactRef,
+    ) -> StoreResult<StoredLesson> {
+        if reference.kind != ArtifactKind::Lesson {
+            return Err(StoreError::InvalidLearningCommit("lesson.related_refs"));
+        }
+        let artifact = read_artifact(transaction, &reference.artifact_id)?;
+        if artifact.kind != ArtifactKind::Lesson {
+            return Err(StoreError::InvalidLearningCommit("lesson.related_refs"));
+        }
+        let lesson: Lesson = serde_json::from_slice(&blob::read_blob_bytes(
+            transaction,
+            &artifact.blob.hash,
+            artifact.blob.bytes,
+        )?)?;
+        lesson.validate()?;
+        Ok(StoredLesson {
+            artifact,
+            lesson,
+            revision: 0,
+        })
+    }
+
+    fn validate_related_refs(
+        &self,
+        transaction: &rusqlite::Transaction<'_>,
+        lesson: &Lesson,
+    ) -> StoreResult<()> {
+        for reference in lesson.supersedes.iter().chain(lesson.conflicts_with.iter()) {
+            self.read_lesson_artifact(transaction, reference)?;
+        }
         Ok(())
     }
 

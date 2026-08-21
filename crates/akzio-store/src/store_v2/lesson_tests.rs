@@ -107,6 +107,43 @@ fn lesson_write_is_idempotent_and_lifecycle_is_immutable_history() {
 }
 
 #[test]
+fn active_conflicting_lesson_is_rejected() {
+    let root = tempdir().unwrap();
+    let store = V2Store::open(root.path()).unwrap();
+    let now = Utc::now();
+    let source = source(&store, now);
+    let first = lesson(&source, now);
+    let first = store.write_lesson(&first, &source, now).unwrap();
+    store
+        .transition_lesson(
+            &first.lesson.lesson.lesson_id,
+            LessonLifecycle::Active,
+            "operator:reviewer",
+            "approved",
+            now + chrono::Duration::seconds(1),
+        )
+        .unwrap();
+
+    let mut second = lesson(&source, now + chrono::Duration::seconds(2));
+    second.lesson_id = LessonId::new();
+    second.conflicts_with = vec![ArtifactRef {
+        artifact_id: first.lesson.artifact.artifact_id,
+        kind: ArtifactKind::Lesson,
+    }];
+    store.write_lesson(&second, &source, now).unwrap();
+    assert!(matches!(
+        store.transition_lesson(
+            &second.lesson_id,
+            LessonLifecycle::Active,
+            "operator:reviewer",
+            "conflicts with prior rule",
+            now + chrono::Duration::seconds(3),
+        ),
+        Err(StoreError::InvalidLearningCommit("lesson.active_conflict"))
+    ));
+}
+
+#[test]
 fn missing_source_closure_is_rejected() {
     let root = tempdir().unwrap();
     let store = V2Store::open(root.path()).unwrap();
