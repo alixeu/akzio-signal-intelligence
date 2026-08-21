@@ -42,7 +42,7 @@ mod schema;
 mod trajectory;
 mod workflow;
 
-pub use lesson::{LessonWriteResult, StoredLesson};
+pub use lesson::{LessonUsage, LessonWriteResult, StoredLesson};
 
 const DATABASE_FILE: &str = "akzio.sqlite3";
 const EXPORT_DATABASE_FILE: &str = "akzio-export.sqlite3";

@@ -15,6 +15,13 @@ pub struct LessonWriteResult {
     pub newly_created: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LessonUsage {
+    pub context_manifests: u64,
+    pub decision_contexts: u64,
+    pub latest_used_at: Option<DateTime<Utc>>,
+}
+
 #[cfg(test)]
 #[path = "lesson_tests.rs"]
 mod tests;
@@ -162,6 +169,30 @@ impl V2Store {
             }
         }
         Ok(lessons)
+    }
+
+    pub fn lesson_usage(&self, lesson_id: &LessonId) -> StoreResult<LessonUsage> {
+        let lesson = self
+            .lesson(lesson_id)?
+            .ok_or_else(|| StoreError::Integrity(format!("missing lesson {lesson_id}")))?;
+        let manifests = self.artifacts_referencing(
+            &lesson.artifact.artifact_id,
+            Some(ArtifactKind::ContextManifest),
+        )?;
+        let decisions = self.artifacts_referencing(
+            &lesson.artifact.artifact_id,
+            Some(ArtifactKind::DecisionContext),
+        )?;
+        let latest_used_at = manifests
+            .iter()
+            .chain(decisions.iter())
+            .map(|artifact| artifact.created_at)
+            .max();
+        Ok(LessonUsage {
+            context_manifests: manifests.len() as u64,
+            decision_contexts: decisions.len() as u64,
+            latest_used_at,
+        })
     }
 
     /// Lifecycle changes create a successor artifact; prior revisions remain

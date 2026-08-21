@@ -40,6 +40,9 @@ enum Command {
     Show {
         lesson_id: String,
     },
+    Usage {
+        lesson_id: String,
+    },
     Approve {
         lesson_id: String,
         #[arg(long)]
@@ -107,6 +110,7 @@ fn main() -> Result<()> {
         Command::Add { file } => add(&cli.store_root, &file),
         Command::List { lifecycle, limit } => list(&cli.store_root, lifecycle.as_deref(), limit),
         Command::Show { lesson_id } => show(&cli.store_root, &lesson_id),
+        Command::Usage { lesson_id } => usage(&cli.store_root, &lesson_id),
         Command::Approve {
             lesson_id,
             actor,
@@ -221,6 +225,11 @@ fn show(store_root: &PathBuf, lesson_id: &str) -> Result<()> {
         .lesson(&LessonId(lesson_id.to_owned()))?
         .with_context(|| format!("lesson {lesson_id} not found"))?;
     print_json(&view(&lesson))
+}
+
+fn usage(store_root: &PathBuf, lesson_id: &str) -> Result<()> {
+    let store = V2Store::open_existing(store_root)?;
+    print_json(&store.lesson_usage(&LessonId(lesson_id.to_owned()))?)
 }
 
 fn transition(
