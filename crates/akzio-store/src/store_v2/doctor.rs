@@ -2,7 +2,6 @@ use super::*;
 
 impl V2Store {
     pub fn verify_integrity(&self) -> StoreResult<()> {
-        self.ensure_lesson_tables()?;
         let connection = self.connection()?;
         let quick_check =
             connection.query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))?;

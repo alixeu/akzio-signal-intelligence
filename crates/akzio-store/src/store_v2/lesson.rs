@@ -460,6 +460,21 @@ impl V2Store {
     }
 
     pub(super) fn verify_lesson_history(&self, connection: &Connection) -> StoreResult<()> {
+        let table_count = connection.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('rebuild_lesson_heads', 'rebuild_lesson_events')",
+            [],
+            |row| row.get::<_, u64>(0),
+        )?;
+        match table_count {
+            0 => return Ok(()),
+            2 => {}
+            _ => {
+                return Err(StoreError::Integrity(
+                    "lesson table set is incomplete".to_owned(),
+                ));
+            }
+        }
+
         let mut statement = connection.prepare(
             "SELECT lesson_id, artifact_id, lifecycle, revision, updated_at FROM rebuild_lesson_heads ORDER BY lesson_id",
         )?;

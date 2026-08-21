@@ -202,3 +202,13 @@ fn store_doctor_rejects_tampered_lesson_head() {
             if message.contains("head disagrees with its payload")
     ));
 }
+
+#[test]
+fn store_doctor_is_read_only_before_lessons_exist() {
+    let root = tempdir().unwrap();
+    V2Store::open(root.path()).unwrap();
+    V2Store::open_existing(root.path())
+        .unwrap()
+        .verify_integrity()
+        .unwrap();
+}
