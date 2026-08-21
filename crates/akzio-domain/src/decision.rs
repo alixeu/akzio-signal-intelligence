@@ -77,6 +77,10 @@ pub struct DecisionContext {
     pub critiques: Vec<ArtifactRef>,
     pub evidence: Vec<ArtifactRef>,
     pub policy_influences: Vec<ArtifactRef>,
+    #[serde(default)]
+    pub applied_learning_refs: Vec<ArtifactRef>,
+    #[serde(default)]
+    pub rejected_learning_refs: Vec<ArtifactRef>,
     pub material_conflicts: Vec<MaterialConflict>,
     pub hard_blockers: Vec<HardBlocker>,
     pub soft_warnings: Vec<SoftWarning>,
@@ -126,6 +130,29 @@ impl DecisionContext {
         {
             return Err(DomainError::EmptyField {
                 field: "decision_context.references",
+            });
+        }
+        for reference in self
+            .applied_learning_refs
+            .iter()
+            .chain(self.rejected_learning_refs.iter())
+        {
+            if !matches!(
+                reference.kind,
+                ArtifactKind::Lesson | ArtifactKind::Experience | ArtifactKind::CandidatePolicy
+            ) {
+                return Err(DomainError::EmptyField {
+                    field: "decision_context.learning_refs",
+                });
+            }
+        }
+        if self
+            .applied_learning_refs
+            .iter()
+            .any(|reference| self.rejected_learning_refs.contains(reference))
+        {
+            return Err(DomainError::EmptyField {
+                field: "decision_context.learning_refs_overlap",
             });
         }
         if self.claims.is_empty() && self.hard_blockers.is_empty() {
@@ -178,6 +205,10 @@ pub struct DecisionDraft {
     pub material_conflicts: Vec<MaterialConflict>,
     pub hard_blockers: Vec<HardBlocker>,
     pub soft_warnings: Vec<SoftWarning>,
+    #[serde(default)]
+    pub applied_learning_refs: Vec<ArtifactRef>,
+    #[serde(default)]
+    pub rejected_learning_refs: Vec<ArtifactRef>,
 }
 
 /// Public vocabulary for the proposal emitted by the research synthesizer.
@@ -217,6 +248,29 @@ impl DecisionDraft {
         if self.claims.is_empty() && self.hard_blockers.is_empty() {
             return Err(DomainError::EmptyField {
                 field: "decision_draft.claims_or_blockers",
+            });
+        }
+        for reference in self
+            .applied_learning_refs
+            .iter()
+            .chain(self.rejected_learning_refs.iter())
+        {
+            if !matches!(
+                reference.kind,
+                ArtifactKind::Lesson | ArtifactKind::Experience | ArtifactKind::CandidatePolicy
+            ) {
+                return Err(DomainError::EmptyField {
+                    field: "decision_draft.learning_refs",
+                });
+            }
+        }
+        if self
+            .applied_learning_refs
+            .iter()
+            .any(|reference| self.rejected_learning_refs.contains(reference))
+        {
+            return Err(DomainError::EmptyField {
+                field: "decision_draft.learning_refs_overlap",
             });
         }
         for conflict in &self.material_conflicts {
@@ -361,6 +415,8 @@ mod tests {
             critiques: vec![],
             evidence: vec![],
             policy_influences: vec![],
+            applied_learning_refs: vec![],
+            rejected_learning_refs: vec![],
             material_conflicts: vec![],
             hard_blockers: vec![HardBlocker::Frozen],
             soft_warnings: vec![],
@@ -383,6 +439,8 @@ mod tests {
             critiques: vec![],
             evidence: vec![],
             policy_influences: vec![reference(ArtifactKind::Experience, b"experience")],
+            applied_learning_refs: vec![],
+            rejected_learning_refs: vec![],
             material_conflicts: vec![],
             hard_blockers: vec![HardBlocker::Frozen],
             soft_warnings: vec![],
@@ -424,6 +482,8 @@ mod tests {
             claims: vec![reference(ArtifactKind::Claim, b"claim")],
             critiques: vec![],
             evidence: vec![reference(ArtifactKind::NormalizedEvidence, b"evidence")],
+            applied_learning_refs: vec![],
+            rejected_learning_refs: vec![],
             material_conflicts: vec![],
             hard_blockers: vec![],
             soft_warnings: vec![],

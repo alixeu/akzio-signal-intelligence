@@ -256,6 +256,8 @@ mod tests {
                 critiques: vec![],
                 evidence: vec![],
                 policy_influences: vec![],
+                applied_learning_refs: vec![],
+                rejected_learning_refs: vec![],
                 material_conflicts: vec![],
                 hard_blockers: blockers,
                 soft_warnings: vec![],

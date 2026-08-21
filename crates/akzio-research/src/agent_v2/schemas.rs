@@ -370,6 +370,14 @@ pub(super) fn decision_proposal_output_schema() -> Value {
                 "type": "array",
                 "items": artifact_ref_schema(&["normalized_evidence", "semantic_detail"])
             },
+            "applied_learning_refs": {
+                "type": "array",
+                "items": artifact_ref_schema(&["lesson", "experience", "candidate_policy"])
+            },
+            "rejected_learning_refs": {
+                "type": "array",
+                "items": artifact_ref_schema(&["lesson", "experience", "candidate_policy"])
+            },
             "material_conflicts": {
                 "type": "array",
                 "items": {

@@ -224,7 +224,8 @@ impl V2DecisionRuntime {
         draft.validate()?;
         self.validate_draft_closure(&draft, &selected)?;
 
-        let policy_influences = selected
+        let policy_influences = draft
+            .applied_learning_refs
             .iter()
             .filter(|reference| {
                 matches!(
@@ -255,6 +256,8 @@ impl V2DecisionRuntime {
             critiques: draft.critiques.clone(),
             evidence: draft.evidence.clone(),
             policy_influences,
+            applied_learning_refs: draft.applied_learning_refs.clone(),
+            rejected_learning_refs: draft.rejected_learning_refs.clone(),
             material_conflicts: draft.material_conflicts.clone(),
             hard_blockers: hard_blockers.into_iter().collect(),
             soft_warnings: draft.soft_warnings.clone(),
@@ -497,6 +500,8 @@ impl V2DecisionRuntime {
             .iter()
             .chain(draft.critiques.iter())
             .chain(draft.evidence.iter())
+            .chain(draft.applied_learning_refs.iter())
+            .chain(draft.rejected_learning_refs.iter())
             .chain(
                 draft
                     .material_conflicts
@@ -806,6 +811,8 @@ mod tests {
             claims,
             critiques: vec![],
             evidence: vec![],
+            applied_learning_refs: vec![],
+            rejected_learning_refs: vec![],
             material_conflicts: vec![],
             hard_blockers: matches!(mode, DraftMode::Blocked)
                 .then_some(HardBlocker::MissingEvidence)

@@ -492,6 +492,8 @@ impl V2ExecutionRuntime {
             .chain(decision.critiques.iter())
             .chain(decision.evidence.iter())
             .chain(decision.policy_influences.iter())
+            .chain(decision.applied_learning_refs.iter())
+            .chain(decision.rejected_learning_refs.iter())
             .chain(
                 decision
                     .material_conflicts
@@ -965,6 +967,8 @@ mod tests {
             critiques: vec![],
             evidence: vec![account_ref.clone(), quote_ref.clone(), clock_ref.clone()],
             policy_influences: vec![],
+            applied_learning_refs: vec![],
+            rejected_learning_refs: vec![],
             material_conflicts: vec![],
             hard_blockers: vec![],
             soft_warnings: Vec::<SoftWarning>::new(),
