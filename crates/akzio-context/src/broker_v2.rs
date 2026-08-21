@@ -360,9 +360,6 @@ impl ContextBroker {
         })
     }
 
-    /// Attenuate a persisted parent manifest into a child attempt grant.
-    /// Projection may include parent outputs, but only from the current
-    /// succeeded attempt and only when their provenance closes to the parent.
     fn learning_candidates(
         &self,
         policy: &ContextPolicy,
@@ -381,19 +378,21 @@ impl ContextBroker {
                 ) {
                     continue;
                 }
-                if (policy.permitted_source_families.is_empty()
+                if policy.permitted_source_families.is_empty()
                     || policy
                         .permitted_source_families
-                        .contains(&artifact.provenance.source_family))
-                    && self.overlay_is_eligible(&artifact)?
+                        .contains(&artifact.provenance.source_family)
                 {
-                    candidates.push(ArtifactRef {
-                        artifact_id: artifact.artifact_id,
-                        kind: artifact.kind,
-                    });
-                    lesson_count += 1;
-                    if lesson_count >= 4 {
-                        break;
+                    self.assert_context_permitted(policy, &artifact)?;
+                    if self.overlay_is_eligible(&artifact)? {
+                        candidates.push(ArtifactRef {
+                            artifact_id: artifact.artifact_id,
+                            kind: artifact.kind,
+                        });
+                        lesson_count += 1;
+                        if lesson_count >= 4 {
+                            break;
+                        }
                     }
                 }
             }
@@ -404,24 +403,26 @@ impl ContextBroker {
                 .store
                 .recent_artifacts_by_kind(ArtifactKind::Experience, 100)?
             {
-                if (policy.permitted_source_families.is_empty()
+                if policy.permitted_source_families.is_empty()
                     || policy
                         .permitted_source_families
-                        .contains(&artifact.provenance.source_family))
-                    && self.overlay_is_eligible(&artifact)?
+                        .contains(&artifact.provenance.source_family)
                 {
-                    candidates.push(ArtifactRef {
-                        artifact_id: artifact.artifact_id,
-                        kind: artifact.kind,
-                    });
-                    for source in &artifact.source_refs {
-                        if source.kind == ArtifactKind::Retrospective
-                            && policy.permitted_kinds.contains(&source.kind)
-                        {
-                            candidates.push(source.clone());
+                    self.assert_context_permitted(policy, &artifact)?;
+                    if self.overlay_is_eligible(&artifact)? {
+                        candidates.push(ArtifactRef {
+                            artifact_id: artifact.artifact_id,
+                            kind: artifact.kind,
+                        });
+                        for source in &artifact.source_refs {
+                            if source.kind == ArtifactKind::Retrospective
+                                && policy.permitted_kinds.contains(&source.kind)
+                            {
+                                candidates.push(source.clone());
+                            }
                         }
+                        experience_count += 1;
                     }
-                    experience_count += 1;
                 }
                 if experience_count >= 4 {
                     break;
@@ -474,6 +475,9 @@ impl ContextBroker {
         Ok(scope)
     }
 
+    /// Attenuate a persisted parent manifest into a child attempt grant.
+    /// Projection may include parent outputs, but only from the current
+    /// succeeded attempt and only when their provenance closes to the parent.
     #[allow(clippy::too_many_arguments)]
     pub fn assemble_child(
         &self,
@@ -710,7 +714,24 @@ impl ContextBroker {
         let payload: ContextManifestPayload = self.read_payload(&artifact)?;
         // Parent manifest proves provenance; committed outputs are the child data surface
         // only after Rust applies the child's policy-owned projection.
-        let projection = derive_child_projection(proof, manifest_ref, child_contract);
+        let mut projection = derive_child_projection(proof, manifest_ref, child_contract);
+        for selection in &payload.selections {
+            let artifact = self.store.artifact(&selection.artifact.artifact_id)?;
+            let kind_allowed = child_contract
+                .context
+                .permitted_kinds
+                .contains(&artifact.kind);
+            let source_allowed = child_contract.context.permitted_source_families.is_empty()
+                || child_contract
+                    .context
+                    .permitted_source_families
+                    .contains(&artifact.provenance.source_family);
+            if kind_allowed && source_allowed {
+                projection.allowed.push(selection.artifact.clone());
+            }
+        }
+        projection.allowed.sort();
+        projection.allowed.dedup();
         let parent_permit = TaskWritePermit {
             run_id: proof.run_id.clone(),
             task_id: proof.task_id.clone(),
