@@ -14,6 +14,7 @@ pub mod evaluation;
 pub mod event;
 pub mod execution;
 pub mod ids;
+pub mod lesson;
 pub mod policy;
 pub mod research;
 pub mod runtime_manifest;
@@ -28,9 +29,10 @@ pub use evaluation::*;
 pub use event::*;
 pub use execution::*;
 pub use ids::{
-    EvaluationId, EventId, ExperienceId, OutcomeId, PaperCommitmentId, PaperRepriceId,
+    EvaluationId, EventId, ExperienceId, LessonId, OutcomeId, PaperCommitmentId, PaperRepriceId,
     PolicyTransitionId, ReconciliationId,
 };
+pub use lesson::*;
 pub use policy::*;
 pub use research::*;
 pub use runtime_manifest::*;

@@ -68,6 +68,7 @@ pub enum ArtifactKind {
     Outcome,
     Evaluation,
     CandidatePolicy,
+    Lesson,
     FreezeState,
 }
 
@@ -103,6 +104,7 @@ impl ArtifactKind {
                 | Self::Outcome
                 | Self::Evaluation
                 | Self::CandidatePolicy
+                | Self::Lesson
                 | Self::FreezeState
                 | Self::RuntimeManifest
                 | Self::PaperLaunchApproval
