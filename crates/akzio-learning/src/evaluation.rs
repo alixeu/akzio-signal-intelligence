@@ -454,7 +454,7 @@ impl EvaluationRuntime {
             })
             .transpose()?;
         let candidate_policy_ref = candidate_policy_artifact.as_ref().map(reference);
-        let next = next_state(current, degraded);
+        let next = next_state_with_fresh_pairs(current, degraded, fresh_pairs_by_horizon);
 
         let transition = if next == current {
             None
@@ -965,8 +965,8 @@ pub fn materialize_partial_outcome(
 mod metrics;
 use metrics::{
     bounded_ratio_ppm, execution_verdict, index_forecasts, index_observations, marginal_utility,
-    next_state, portfolio_return_ppm, price, reference, require_canonical_purpose, return_ppm,
-    stable_id, validate_prices,
+    next_state_with_fresh_pairs, portfolio_return_ppm, price, reference, require_canonical_purpose,
+    return_ppm, stable_id, validate_prices,
 };
 #[cfg(test)]
 #[path = "tests.rs"]

@@ -857,25 +857,37 @@ fn memory_lifecycle_requires_pairs_and_degrades_to_retirement() {
         PolicyState::Memory(MemoryLifecycle::Candidate)
     );
     assert_eq!(
-        next_state(subject.initial_state(), false),
+        next_state_with_fresh_pairs(subject.initial_state(), false, [0, 0, 0]),
         PolicyState::Memory(MemoryLifecycle::Candidate)
     );
     assert_eq!(
-        next_state(PolicyState::Memory(MemoryLifecycle::Active), false),
-        PolicyState::Memory(MemoryLifecycle::Active)
+        next_state_with_fresh_pairs(
+            PolicyState::Memory(MemoryLifecycle::Active),
+            false,
+            [1, 1, 1],
+        ),
+        PolicyState::Memory(MemoryLifecycle::Proven)
     );
     assert_eq!(
-        next_state(PolicyState::Memory(MemoryLifecycle::Proven), true),
+        next_state_with_fresh_pairs(
+            PolicyState::Memory(MemoryLifecycle::Proven),
+            true,
+            [1, 1, 1],
+        ),
         PolicyState::Memory(MemoryLifecycle::Contested)
     );
     assert_eq!(
-        next_state(PolicyState::Memory(MemoryLifecycle::Contested), true),
+        next_state_with_fresh_pairs(
+            PolicyState::Memory(MemoryLifecycle::Contested),
+            true,
+            [1, 1, 1],
+        ),
         PolicyState::Memory(MemoryLifecycle::Retired)
     );
 }
 
 #[test]
-fn canonical_evaluation_consumes_fresh_pairs_without_promoting() {
+fn canonical_evaluation_promotes_memory_only_after_fresh_pairs() {
     let fixture = RuntimeFixture::new();
     let mut prior_cursor = 0;
 
@@ -884,7 +896,15 @@ fn canonical_evaluation_consumes_fresh_pairs_without_promoting() {
         fixture.record_pair_batch(&permit, batch);
         let result = fixture.evaluate(permit, "forward-transition-disabled");
         assert_eq!(result.fresh_pairs_by_horizon, [1, 1, 1]);
-        assert!(result.policy_head.is_none());
+        let expected_state = if batch == 0 {
+            PolicyState::Memory(MemoryLifecycle::Active)
+        } else {
+            PolicyState::Memory(MemoryLifecycle::Proven)
+        };
+        assert_eq!(
+            result.policy_head.as_ref().map(|head| head.state),
+            Some(expected_state)
+        );
 
         let cursor = fixture
             .store
@@ -898,12 +918,18 @@ fn canonical_evaluation_consumes_fresh_pairs_without_promoting() {
     let replay_permit = fixture.claim_evaluation("evaluation-old-pairs");
     let old_pairs = fixture.evaluate(replay_permit, "old-pairs-cannot-replay");
     assert_eq!(old_pairs.fresh_pairs_by_horizon, [0, 0, 0]);
-    assert!(old_pairs.policy_head.is_none());
-    assert!(fixture
-        .store
-        .policy_transitions(&fixture.subject)
-        .unwrap()
-        .is_empty());
+    assert_eq!(
+        old_pairs.policy_head.as_ref().map(|head| head.state),
+        Some(PolicyState::Memory(MemoryLifecycle::Proven))
+    );
+    assert_eq!(
+        fixture
+            .store
+            .policy_transitions(&fixture.subject)
+            .unwrap()
+            .len(),
+        2
+    );
 
     let evaluated = fixture
         .store
@@ -975,7 +1001,11 @@ fn topology_forward_promotion_is_disabled_and_degradation_rolls_back() {
         .unwrap()
         .is_empty());
     assert_eq!(
-        next_state(PolicyState::Topology(CandidatePolicyState::Canary50), true,),
+        next_state_with_fresh_pairs(
+            PolicyState::Topology(CandidatePolicyState::Canary50),
+            true,
+            [1, 1, 1],
+        ),
         PolicyState::Topology(CandidatePolicyState::Candidate)
     );
     fixture.store.verify_integrity().unwrap();

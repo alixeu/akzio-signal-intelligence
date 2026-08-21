@@ -204,9 +204,13 @@ pub(super) fn marginal_utility(outcome: &Outcome) -> i64 {
     average.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
 }
 
-// Forward promotion remains deliberately disabled. Fresh-pair counts stay
-// persisted for a later policy change; this function only performs rollback.
-pub(super) fn next_state(current: PolicyState, degraded: bool) -> PolicyState {
+/// Promote memory only after a fresh T+1/T+3/T+5 evaluation passes quality
+/// gates; contract/topology promotion remains owned by their canary policy.
+pub(super) fn next_state_with_fresh_pairs(
+    current: PolicyState,
+    degraded: bool,
+    fresh_pairs_by_horizon: [u64; 3],
+) -> PolicyState {
     use CandidatePolicyState as Candidate;
     use MemoryLifecycle as Memory;
 
@@ -221,5 +225,13 @@ pub(super) fn next_state(current: PolicyState, degraded: bool) -> PolicyState {
             PolicyState::Topology(_) => PolicyState::Topology(Candidate::Candidate),
         };
     }
-    current
+    if fresh_pairs_by_horizon.iter().all(|count| *count > 0) {
+        match current {
+            PolicyState::Memory(Memory::Candidate) => PolicyState::Memory(Memory::Active),
+            PolicyState::Memory(Memory::Active) => PolicyState::Memory(Memory::Proven),
+            _ => current,
+        }
+    } else {
+        current
+    }
 }

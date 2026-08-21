@@ -182,7 +182,7 @@ impl Daemon {
         }
         let input = EvaluationInput {
             permit: task.permit.clone(),
-            subject: PolicySubject::Memory(MemoryId(format!("paper:{}", task.run_id.0))),
+            subject: PolicySubject::Memory(MemoryId("paper:default".to_owned())),
             hypothesis_id: format!("paper-outcome:{}", schedule.outcome_id.0),
             materialization: collected.materialization,
             contract_hash,
