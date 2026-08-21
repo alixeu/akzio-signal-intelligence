@@ -365,7 +365,8 @@ impl ContextBroker {
     fn learning_candidates(&self, policy: &ContextPolicy) -> ContextResult<Vec<ArtifactRef>> {
         let mut candidates = Vec::new();
         if policy.permitted_kinds.contains(&ArtifactKind::Lesson) {
-            for stored in self.store.lessons(Some(LessonLifecycle::Active), 8)? {
+            let mut lesson_count = 0;
+            for stored in self.store.lessons(Some(LessonLifecycle::Active), 50)? {
                 let artifact = stored.artifact;
                 if (policy.permitted_source_families.is_empty()
                     || policy
@@ -377,10 +378,15 @@ impl ContextBroker {
                         artifact_id: artifact.artifact_id,
                         kind: artifact.kind,
                     });
+                    lesson_count += 1;
+                    if lesson_count >= 4 {
+                        break;
+                    }
                 }
             }
         }
         if policy.permitted_kinds.contains(&ArtifactKind::Experience) {
+            let mut experience_count = 0;
             for artifact in self
                 .store
                 .recent_artifacts_by_kind(ArtifactKind::Experience, 100)?
@@ -395,8 +401,9 @@ impl ContextBroker {
                         artifact_id: artifact.artifact_id,
                         kind: artifact.kind,
                     });
+                    experience_count += 1;
                 }
-                if candidates.len() >= 12 {
+                if experience_count >= 4 {
                     break;
                 }
             }
