@@ -14,10 +14,11 @@ use akzio_domain::{
     content_hash_json, Artifact, ArtifactKind, ArtifactLifecycle, ArtifactOrigin,
     ArtifactProvenance, ArtifactRef, Asset, CandidatePolicy, CandidatePolicyState, ContentHash,
     DecisionHorizon, DomainError, Evaluation, EvaluationId, Experience, ExperienceId, Forecast,
-    MemoryLifecycle, MoneyMicros, Outcome, OutcomeCostModel, OutcomeExecutionLineage,
-    OutcomeHorizon, OutcomeSchedule, OutcomeWindow, PolicyState, PolicySubject, PolicyTransition,
-    PolicyTransitionId, Retrospective, RetrospectiveDraft, RetrospectiveStatus, RunPurpose,
-    TargetPortfolio, TaskWritePermit, TopologyId, V2_DOMAIN_SCHEMA_VERSION, V2_SCHEMA_VERSION,
+    Lesson, LessonId, LessonLifecycle, LessonOrigin, LessonScope, MemoryLifecycle, MoneyMicros,
+    Outcome, OutcomeCostModel, OutcomeExecutionLineage, OutcomeHorizon, OutcomeSchedule,
+    OutcomeWindow, PolicyState, PolicySubject, PolicyTransition, PolicyTransitionId, Retrospective,
+    RetrospectiveDraft, RetrospectiveStatus, RunPurpose, TargetPortfolio, TaskWritePermit,
+    TopologyId, V2_DOMAIN_SCHEMA_VERSION, V2_SCHEMA_VERSION,
 };
 use akzio_store::v2::{
     DaemonLease, PolicyEvaluationCommit, PolicyHead, ShadowPairCompletion, ShadowPairWriteResult,
@@ -473,6 +474,9 @@ impl EvaluationRuntime {
                 created_at,
             })
         };
+        let retrospective_for_lessons = retrospective_artifact.clone();
+        let retrospective_payload: Retrospective =
+            serde_json::from_slice(&self.store.read_blob(&retrospective_for_lessons.blob)?)?;
         let policy_head = self
             .store
             .record_policy_evaluation_fenced(
@@ -493,6 +497,11 @@ impl EvaluationRuntime {
                 },
             )?
             .policy_head;
+        self.materialize_retrospective_lessons(
+            &retrospective_for_lessons,
+            &retrospective_payload,
+            created_at,
+        )?;
 
         Ok(EvaluationResult {
             outcome: outcome_ref,
@@ -502,6 +511,47 @@ impl EvaluationRuntime {
             policy_head,
             fresh_pairs_by_horizon,
         })
+    }
+
+    fn materialize_retrospective_lessons(
+        &self,
+        retrospective_artifact: &Artifact,
+        retrospective: &Retrospective,
+        created_at: DateTime<Utc>,
+    ) -> EvaluationRuntimeResult<()> {
+        for (index, candidate) in retrospective.lesson_candidates.iter().enumerate() {
+            let statement = candidate.trim();
+            if statement.is_empty() {
+                continue;
+            }
+            let lesson = Lesson {
+                schema_version: V2_SCHEMA_VERSION,
+                lesson_id: LessonId(stable_id(&serde_json::json!({
+                    "retrospective": retrospective_artifact.artifact_id,
+                    "index": index,
+                    "statement": statement,
+                }))?),
+                origin: LessonOrigin::OutcomeDerived,
+                lifecycle: LessonLifecycle::Draft,
+                title: format!("Outcome lesson {}", index + 1),
+                statement: statement.to_owned(),
+                rationale: retrospective.summary.clone(),
+                recommended_behavior: "Treat as a hypothesis until a reviewer approves it and Paper outcomes support it.".to_owned(),
+                exclusions: retrospective.diagnostic_gaps.clone(),
+                scope: LessonScope::default(),
+                source_refs: vec![reference(retrospective_artifact)],
+                supersedes: Vec::new(),
+                conflicts_with: Vec::new(),
+                confidence_ppm: 500_000,
+                authored_by: None,
+                approved_by: None,
+                created_at,
+                updated_at: created_at,
+            };
+            self.store
+                .write_lesson(&lesson, retrospective_artifact, created_at)?;
+        }
+        Ok(())
     }
 
     fn require_paper(&self, run_id: &akzio_domain::RunId) -> EvaluationRuntimeResult<()> {
