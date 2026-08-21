@@ -73,6 +73,8 @@ pub enum LifecycleEventType {
     ToolFailed,
     WorkflowCreated,
     WorkflowPatched,
+    LessonCreated,
+    LessonLifecycleChanged,
 }
 
 impl LifecycleEventType {
@@ -137,6 +139,8 @@ impl LifecycleEventType {
             "tool.failed" => Self::ToolFailed,
             "workflow.created" => Self::WorkflowCreated,
             "workflow.patched" => Self::WorkflowPatched,
+            "lesson.created" => Self::LessonCreated,
+            "lesson.lifecycle_changed" => Self::LessonLifecycleChanged,
             other => return Err(DomainError::UnknownLifecycleEventType(other.to_owned())),
         };
         Ok(event)
@@ -203,6 +207,8 @@ impl LifecycleEventType {
             Self::ToolFailed => "tool.failed",
             Self::WorkflowCreated => "workflow.created",
             Self::WorkflowPatched => "workflow.patched",
+            Self::LessonCreated => "lesson.created",
+            Self::LessonLifecycleChanged => "lesson.lifecycle_changed",
         }
     }
 }

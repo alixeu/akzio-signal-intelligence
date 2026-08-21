@@ -17,7 +17,7 @@ use akzio_domain::{
     ArtifactProvenance, ArtifactRef, Asset, AttemptId, AttemptRelation, BlobRef, CandidatePolicy,
     CandidatePolicyState, ContentHash, ContractId, ContractPurpose, DeliberationSummary,
     DomainError, Evaluation, ExecutionContext, ExecutionPlan, ExecutionVerdict, Experience,
-    FailureDisposition, FreezeState, LeaseId, LifecycleEventType, OrderReceipt, OrderReceiptState,
+    FailureDisposition, FreezeState, LeaseId, Lesson, LessonId, LessonLifecycle, LifecycleEventType, OrderReceipt, OrderReceiptState,
     Outcome, OutcomeExecutionLineage, OutcomeHorizon, OutcomeId, OutcomeSchedule, PaperCommitment,
     PaperLaunchApproval, PaperReprice, PolicyState, PolicySubject, PolicyTransition,
     PolicyTransitionId, Reconciliation, Retrospective, RetrospectiveDraft, RetrospectiveStatus,
@@ -37,9 +37,12 @@ mod doctor;
 mod execution;
 mod learning;
 mod lease;
+mod lesson;
 mod schema;
 mod trajectory;
 mod workflow;
+
+pub use lesson::{LessonWriteResult, StoredLesson};
 
 const DATABASE_FILE: &str = "akzio.sqlite3";
 const EXPORT_DATABASE_FILE: &str = "akzio-export.sqlite3";

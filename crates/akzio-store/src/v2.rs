@@ -12,4 +12,5 @@ pub use crate::store_v2::{
     StoredContract, StoredEvent, StoredRun, StoredShadowPair, StoredTask, StoredTaskSnapshot,
     SucceededAttemptProof, TrajectoryEntry, TrajectoryModelMetadata, TrajectoryToolLifecycle,
     V2Store, WorkflowCommit, WorkflowPatchCommit, WorkflowRevision, WorkflowSnapshot,
+    LessonWriteResult, StoredLesson,
 };
