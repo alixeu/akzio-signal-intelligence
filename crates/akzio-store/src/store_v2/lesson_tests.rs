@@ -156,3 +156,49 @@ fn missing_source_closure_is_rejected() {
         Err(StoreError::InvalidLearningCommit("lesson.source_refs"))
     ));
 }
+
+#[test]
+fn immutable_lesson_identity_rejects_different_content() {
+    let root = tempdir().unwrap();
+    let store = V2Store::open(root.path()).unwrap();
+    let now = Utc::now();
+    let source = source(&store, now);
+    let original = lesson(&source, now);
+    store.write_lesson(&original, &source, now).unwrap();
+
+    let mut conflicting = original.clone();
+    conflicting.statement = "A different statement with the same identity.".to_owned();
+    assert!(matches!(
+        store.write_lesson(&conflicting, &source, now + chrono::Duration::seconds(1)),
+        Err(StoreError::Integrity(message)) if message.contains("conflicts with its immutable head")
+    ));
+    assert_eq!(
+        store.lesson(&original.lesson_id).unwrap().unwrap().lesson,
+        original
+    );
+}
+
+#[test]
+fn store_doctor_rejects_tampered_lesson_head() {
+    let root = tempdir().unwrap();
+    let store = V2Store::open(root.path()).unwrap();
+    let now = Utc::now();
+    let source = source(&store, now);
+    let lesson = lesson(&source, now);
+    store.write_lesson(&lesson, &source, now).unwrap();
+
+    store
+        .connection()
+        .unwrap()
+        .execute(
+            "UPDATE rebuild_lesson_heads SET lifecycle = 'active' WHERE lesson_id = ?1",
+            rusqlite::params![lesson.lesson_id.0.as_str()],
+        )
+        .unwrap();
+
+    assert!(matches!(
+        store.verify_integrity(),
+        Err(StoreError::Integrity(message))
+            if message.contains("head disagrees with its payload")
+    ));
+}
