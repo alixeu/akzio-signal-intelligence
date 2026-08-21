@@ -57,6 +57,30 @@ impl LessonScope {
         }
         Ok(())
     }
+
+    pub fn matches(
+        &self,
+        assets: &BTreeSet<Asset>,
+        horizons: &BTreeSet<DecisionHorizon>,
+        regimes: &BTreeSet<String>,
+        decision_stages: &BTreeSet<String>,
+    ) -> bool {
+        (self.assets.is_empty()
+            || assets.is_empty()
+            || self.assets.iter().any(|asset| assets.contains(asset)))
+            && (self.horizons.is_empty()
+                || horizons.is_empty()
+                || self.horizons.iter().any(|horizon| horizons.contains(horizon)))
+            && (self.regimes.is_empty()
+                || regimes.is_empty()
+                || self.regimes.iter().any(|regime| regimes.contains(regime)))
+            && (self.decision_stages.is_empty()
+                || decision_stages.is_empty()
+                || self
+                    .decision_stages
+                    .iter()
+                    .any(|stage| decision_stages.contains(stage)))
+    }
 }
 
 /// A reusable, auditable statement. It is not a Paper experience and cannot

@@ -561,8 +561,7 @@ impl V2DecisionRuntime {
         if self
             .store
             .recorded_policy_influence_subject(&reference.artifact_id)?
-            .as_ref()
-            != Some(subject)
+            .is_some_and(|recorded| recorded != *subject)
             || !self
                 .store
                 .policy_head(subject)?

@@ -254,10 +254,11 @@ fn canonical_active_contracts(store: &V2Store) -> ResearchResult<Vec<AgentContra
             prompt: "You are Akzio's research synthesizer. Return only a JSON DecisionProposal matching the supplied schema. Use only artifacts selected by the ContextManifest. Do not change evidence, bypass the DecisionGate, submit an order, or expand any capability.",
             output_kind: ArtifactKind::DecisionProposal,
             output_schema: decision_proposal_output_schema(),
- permitted_kinds: BTreeSet::from([
- ArtifactKind::Claim,
- ArtifactKind::Critique,
- ArtifactKind::Experience,
+            permitted_kinds: BTreeSet::from([
+                ArtifactKind::Claim,
+                ArtifactKind::Critique,
+                ArtifactKind::Lesson,
+                ArtifactKind::Experience,
  ArtifactKind::CandidatePolicy,
  ArtifactKind::NormalizedEvidence,
  ArtifactKind::SemanticDetail,
@@ -369,7 +370,7 @@ fn canonical_active_contract(
 fn governed_context_sources() -> BTreeSet<String> {
     GOVERNED_EVIDENCE_SOURCE_FAMILIES
         .into_iter()
-        .chain(["akzio.agent"])
+        .chain(["akzio.agent", "akzio.operator"])
         .map(str::to_owned)
         .collect()
 }

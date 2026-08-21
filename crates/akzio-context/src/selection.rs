@@ -5,7 +5,10 @@ pub(super) fn context_rank(artifact: &Artifact) -> u8 {
         ArtifactKind::NormalizedEvidence => 0,
         ArtifactKind::SemanticDetail => 1,
         ArtifactKind::Claim | ArtifactKind::Critique => 2,
-        ArtifactKind::Experience | ArtifactKind::CandidatePolicy | ArtifactKind::Evaluation => 3,
+        ArtifactKind::Lesson
+        | ArtifactKind::Experience
+        | ArtifactKind::CandidatePolicy
+        | ArtifactKind::Evaluation => 3,
         _ => 4,
     }
 }
@@ -84,6 +87,7 @@ pub(super) fn selection_reason(kind: ArtifactKind) -> &'static str {
         ArtifactKind::Claim => "claim",
         ArtifactKind::Critique => "critique",
         ArtifactKind::Experience => "experience",
+        ArtifactKind::Lesson => "lesson",
         ArtifactKind::CandidatePolicy => "candidate_policy",
         ArtifactKind::Evaluation => "evaluation",
         _ => "contract_permitted",

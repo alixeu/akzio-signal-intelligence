@@ -5,7 +5,8 @@ use std::collections::{BTreeSet, VecDeque};
 use akzio_domain::{
     content_hash_json, AgentContract, Artifact, ArtifactId, ArtifactKind, ArtifactLifecycle,
     ArtifactOrigin, ArtifactProvenance, ArtifactRef, CandidatePolicy, ContextManifestPayload,
-    ContextPolicy, ContextProjection, ContextSelection, DomainError, Experience,
+    ContextPolicy, ContextProjection, ContextSelection, DomainError, Experience, Lesson,
+    LessonLifecycle,
     LifecycleEventType, PolicyState, ReadGrant, TaskWritePermit, V2_DOMAIN_SCHEMA_VERSION,
 };
 use akzio_store::v2::{StoreError, SucceededAttemptProof, V2Store};
@@ -217,7 +218,9 @@ impl ContextBroker {
         contract.validate()?;
         let policy = &contract.context;
         let mut seen = BTreeSet::new();
-        let artifacts = candidates
+        let mut candidate_refs = candidates.into_iter().collect::<Vec<_>>();
+        candidate_refs.extend(self.learning_candidates(policy)?);
+        let artifacts = candidate_refs
             .into_iter()
             .filter(|reference| seen.insert(reference.artifact_id.clone()))
             .map(|reference| self.store.artifact(&reference.artifact_id))
@@ -359,6 +362,48 @@ impl ContextBroker {
     /// Attenuate a persisted parent manifest into a child attempt grant.
     /// Projection may include parent outputs, but only from the current
     /// succeeded attempt and only when their provenance closes to the parent.
+    fn learning_candidates(&self, policy: &ContextPolicy) -> ContextResult<Vec<ArtifactRef>> {
+        let mut candidates = Vec::new();
+        if policy.permitted_kinds.contains(&ArtifactKind::Lesson) {
+            for stored in self.store.lessons(Some(LessonLifecycle::Active), 8)? {
+                let artifact = stored.artifact;
+                if (policy.permitted_source_families.is_empty()
+                    || policy
+                        .permitted_source_families
+                        .contains(&artifact.provenance.source_family))
+                    && self.overlay_is_eligible(&artifact)?
+                {
+                    candidates.push(ArtifactRef {
+                        artifact_id: artifact.artifact_id,
+                        kind: artifact.kind,
+                    });
+                }
+            }
+        }
+        if policy.permitted_kinds.contains(&ArtifactKind::Experience) {
+            for artifact in self
+                .store
+                .recent_artifacts_by_kind(ArtifactKind::Experience, 100)?
+            {
+                if (policy.permitted_source_families.is_empty()
+                    || policy
+                        .permitted_source_families
+                        .contains(&artifact.provenance.source_family))
+                    && self.overlay_is_eligible(&artifact)?
+                {
+                    candidates.push(ArtifactRef {
+                        artifact_id: artifact.artifact_id,
+                        kind: artifact.kind,
+                    });
+                }
+                if candidates.len() >= 12 {
+                    break;
+                }
+            }
+        }
+        Ok(candidates)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn assemble_child(
         &self,
@@ -932,6 +977,11 @@ impl ContextBroker {
 
     fn overlay_is_eligible(&self, artifact: &Artifact) -> ContextResult<bool> {
         match artifact.kind {
+            ArtifactKind::Lesson => {
+                let lesson: Lesson = self.read_payload(artifact)?;
+                lesson.validate()?;
+                Ok(lesson.lifecycle == LessonLifecycle::Active)
+            }
             ArtifactKind::Experience => {
                 if !self.is_canonical_paper_artifact(artifact)? {
                     return Ok(false);
@@ -941,8 +991,7 @@ impl ContextBroker {
                 if self
                     .store
                     .recorded_policy_influence_subject(&artifact.artifact_id)?
-                    .as_ref()
-                    != Some(&experience.subject)
+                    .is_some_and(|subject| subject != experience.subject)
                 {
                     return Ok(false);
                 }
