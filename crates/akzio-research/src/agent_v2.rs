@@ -258,6 +258,7 @@ fn canonical_active_contracts(store: &V2Store) -> ResearchResult<Vec<AgentContra
                 ArtifactKind::Claim,
                 ArtifactKind::Critique,
                 ArtifactKind::Lesson,
+                ArtifactKind::Retrospective,
                 ArtifactKind::Experience,
  ArtifactKind::CandidatePolicy,
  ArtifactKind::NormalizedEvidence,
@@ -370,7 +371,7 @@ fn canonical_active_contract(
 fn governed_context_sources() -> BTreeSet<String> {
     GOVERNED_EVIDENCE_SOURCE_FAMILIES
         .into_iter()
-        .chain(["akzio.agent", "akzio.operator"])
+        .chain(["akzio.agent", "akzio.operator", "akzio.learning"])
         .map(str::to_owned)
         .collect()
 }

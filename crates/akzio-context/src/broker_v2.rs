@@ -414,6 +414,13 @@ impl ContextBroker {
                         artifact_id: artifact.artifact_id,
                         kind: artifact.kind,
                     });
+                    for source in &artifact.source_refs {
+                        if source.kind == ArtifactKind::Retrospective
+                            && policy.permitted_kinds.contains(&source.kind)
+                        {
+                            candidates.push(source.clone());
+                        }
+                    }
                     experience_count += 1;
                 }
                 if experience_count >= 4 {
