@@ -212,3 +212,19 @@ fn store_doctor_is_read_only_before_lessons_exist() {
         .verify_integrity()
         .unwrap();
 }
+
+#[test]
+fn store_doctor_is_read_only_with_lessons_present() {
+    let root = tempdir().unwrap();
+    let store = V2Store::open(root.path()).unwrap();
+    let now = Utc::now();
+    let source = source(&store, now);
+    let lesson = lesson(&source, now);
+    store.write_lesson(&lesson, &source, now).unwrap();
+    drop(store);
+
+    V2Store::open_existing(root.path())
+        .unwrap()
+        .verify_integrity()
+        .unwrap();
+}
