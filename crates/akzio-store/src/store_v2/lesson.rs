@@ -142,8 +142,10 @@ impl V2Store {
     }
 
     pub fn lesson(&self, lesson_id: &LessonId) -> StoreResult<Option<StoredLesson>> {
-        self.ensure_lesson_tables()?;
         let mut connection = self.connection()?;
+        if ensure_lesson_table_set(&connection)? == 0 {
+            return Ok(None);
+        }
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
         let value = self.read_lesson_from_transaction(&transaction, lesson_id)?;
         transaction.commit()?;
@@ -155,8 +157,10 @@ impl V2Store {
         lifecycle: Option<LessonLifecycle>,
         limit: usize,
     ) -> StoreResult<Vec<StoredLesson>> {
-        self.ensure_lesson_tables()?;
         let connection = self.connection()?;
+        if ensure_lesson_table_set(&connection)? == 0 {
+            return Ok(Vec::new());
+        }
         let limit = i64::try_from(limit.clamp(1, 500)).expect("bounded lesson limit fits i64");
         let mut statement = connection.prepare(
             "SELECT lesson_id FROM rebuild_lesson_heads WHERE (?1 IS NULL OR lifecycle = ?1) ORDER BY updated_at DESC, lesson_id DESC LIMIT ?2",
@@ -460,19 +464,8 @@ impl V2Store {
     }
 
     pub(super) fn verify_lesson_history(&self, connection: &Connection) -> StoreResult<()> {
-        let table_count = connection.query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('rebuild_lesson_heads', 'rebuild_lesson_events')",
-            [],
-            |row| row.get::<_, u64>(0),
-        )?;
-        match table_count {
-            0 => return Ok(()),
-            2 => {}
-            _ => {
-                return Err(StoreError::Integrity(
-                    "lesson table set is incomplete".to_owned(),
-                ));
-            }
+        if ensure_lesson_table_set(connection)? == 0 {
+            return Ok(());
         }
 
         let mut statement = connection.prepare(
@@ -652,5 +645,19 @@ impl V2Store {
             )));
         }
         Ok(())
+    }
+}
+
+fn ensure_lesson_table_set(connection: &Connection) -> StoreResult<u64> {
+    let table_count = connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('rebuild_lesson_heads', 'rebuild_lesson_events')",
+        [],
+        |row| row.get::<_, u64>(0),
+    )?;
+    match table_count {
+        0 | 2 => Ok(table_count),
+        _ => Err(StoreError::Integrity(
+            "lesson table set is incomplete".to_owned(),
+        )),
     }
 }

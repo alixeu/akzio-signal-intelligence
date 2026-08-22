@@ -228,3 +228,16 @@ fn store_doctor_is_read_only_with_lessons_present() {
         .verify_integrity()
         .unwrap();
 }
+
+#[test]
+fn read_only_lesson_queries_are_empty_before_lessons_exist() {
+    let root = tempdir().unwrap();
+    V2Store::open(root.path()).unwrap();
+    let store = V2Store::open_existing(root.path()).unwrap();
+
+    assert!(store.lessons(None, 10).unwrap().is_empty());
+    assert!(store
+        .lesson(&LessonId("missing-lesson".to_owned()))
+        .unwrap()
+        .is_none());
+}
