@@ -116,6 +116,6 @@ cargo run -p akzio-cli -- store doctor
 
 ## 7. 设计依据
 
-- [LLM 输出协议调研](../architecture/2026-08-21-llm-output-protocol-research.md)：自然语言说明与机器可消费字段分离，Rust 保持权限、验证和持久化权威。
+- [目标与来源调研](../architecture/2026-08-09-v2-goal-source-research.md)：Paper-only、来源闭包、可回滚学习和 Rust 权威边界。
 - [Paper Runbook](./AKZIO_V2_PAPER_RUNBOOK.md)：Paper-only、审批、冻结、reconciliation 和 outcome 证据边界。
-- [Rubric Scoring 调研](../research/rubric-scoring-llm-agent-evaluation.md)：模型自报 confidence 不等同于外部可验证的 evaluation/rubric 结果。
+- [Prompt 与 Debate 调研](../architecture/2026-08-11-v2-prompt-debate-research.md)：OpenAI/Anthropic tool-use 经验与受控评测、paired outcome、canary、rollback 约束。
