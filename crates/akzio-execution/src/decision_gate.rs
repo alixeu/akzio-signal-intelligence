@@ -43,6 +43,8 @@ pub enum DecisionGateError {
     ReferenceOutsideManifest(ArtifactId),
     #[error("policy influence {0} is not eligible")]
     InvalidPolicyInfluence(ArtifactId),
+    #[error("learning artifact {0} was selected but not explicitly applied or rejected")]
+    MissingLearningAttribution(ArtifactId),
 }
 
 pub type DecisionGateResult<T> = std::result::Result<T, DecisionGateError>;
@@ -511,6 +513,20 @@ impl V2DecisionRuntime {
         {
             if !selected.contains(reference) {
                 return Err(DecisionGateError::ReferenceOutsideManifest(
+                    reference.artifact_id.clone(),
+                ));
+            }
+        }
+        for reference in selected.iter().filter(|reference| {
+            matches!(
+                reference.kind,
+                ArtifactKind::Lesson | ArtifactKind::Experience
+            )
+        }) {
+            if !draft.applied_learning_refs.contains(reference)
+                && !draft.rejected_learning_refs.contains(reference)
+            {
+                return Err(DecisionGateError::MissingLearningAttribution(
                     reference.artifact_id.clone(),
                 ));
             }
@@ -1179,5 +1195,34 @@ mod tests {
             ArtifactLifecycle::RunScoped
         );
         assert_eq!(output.decision.lifecycle, ArtifactLifecycle::RunScoped);
+    }
+
+    #[test]
+    fn selected_learning_requires_explicit_attribution() {
+        let root = tempdir().unwrap();
+        let store = V2Store::open(root.path()).unwrap();
+        let runtime = V2DecisionRuntime::new(store, decision_policy()).unwrap();
+        let claim = ArtifactRef {
+            artifact_id: ArtifactId(ContentHash::of_bytes(b"claim")),
+            kind: ArtifactKind::Claim,
+        };
+        let lesson = ArtifactRef {
+            artifact_id: ArtifactId(ContentHash::of_bytes(b"lesson")),
+            kind: ArtifactKind::Lesson,
+        };
+        let selected = BTreeSet::from([claim.clone(), lesson.clone()]);
+        let draft_without_attribution = draft(&claim, DraftMode::Accepted);
+
+        assert!(matches!(
+            runtime.validate_draft_closure(&draft_without_attribution, &selected),
+            Err(DecisionGateError::MissingLearningAttribution(artifact_id))
+                if artifact_id == lesson.artifact_id
+        ));
+
+        let mut draft_with_rejection = draft_without_attribution;
+        draft_with_rejection.rejected_learning_refs.push(lesson);
+        runtime
+            .validate_draft_closure(&draft_with_rejection, &selected)
+            .unwrap();
     }
 }
