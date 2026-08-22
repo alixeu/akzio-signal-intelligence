@@ -239,7 +239,7 @@ fn transition(
     actor: &str,
     reason: &str,
 ) -> Result<()> {
-    let store = V2Store::open_existing(store_root)?;
+    let store = V2Store::open(store_root)?;
     let lesson = store.transition_lesson(
         &LessonId(lesson_id.to_owned()),
         lifecycle,
@@ -296,5 +296,81 @@ fn view(value: &StoredLesson) -> LessonView<'_> {
         artifact: &value.artifact,
         lesson: &value.lesson,
         revision: value.revision,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use akzio_domain::{ArtifactProvenance, LessonScope};
+    use tempfile::tempdir;
+
+    #[test]
+    fn transition_command_reopens_the_store_for_writes() {
+        let root = tempdir().unwrap();
+        let root_path = root.path().to_path_buf();
+        let store = V2Store::open(&root_path).unwrap();
+        let now = Utc::now();
+        let source = Artifact::new(
+            ArtifactKind::SemanticDetail,
+            store
+                .put_json(&serde_json::json!({"note": "operator source"}))
+                .unwrap(),
+            "operator.lesson.source",
+            ArtifactLifecycle::Canonical,
+            ArtifactProvenance {
+                source_family: "akzio.operator".to_owned(),
+                observed_at: None,
+                retrieved_at: now,
+                source_uri: None,
+                confidence_ppm: 1_000_000,
+                producer_contract_hash: None,
+            },
+            None,
+            vec![],
+            now,
+        )
+        .unwrap();
+        let lesson = Lesson {
+            schema_version: V2_DOMAIN_SCHEMA_VERSION,
+            lesson_id: LessonId::new(),
+            origin: LessonOrigin::Operator,
+            lifecycle: LessonLifecycle::Draft,
+            title: "Opening volatility".to_owned(),
+            statement: "Require stronger evidence at the open.".to_owned(),
+            rationale: "The first quote window is noisy.".to_owned(),
+            recommended_behavior: "Wait for confirmation.".to_owned(),
+            exclusions: vec![],
+            scope: LessonScope::default(),
+            source_refs: vec![ArtifactRef {
+                artifact_id: source.artifact_id.clone(),
+                kind: source.kind,
+            }],
+            supersedes: vec![],
+            conflicts_with: vec![],
+            confidence_ppm: 700_000,
+            authored_by: Some("operator:test".to_owned()),
+            approved_by: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let lesson_id = lesson.lesson_id.0.clone();
+        store.write_lesson(&lesson, &source, now).unwrap();
+
+        transition(
+            &root_path,
+            &lesson_id,
+            LessonLifecycle::Active,
+            "operator:reviewer",
+            "approved",
+        )
+        .unwrap();
+
+        let stored = V2Store::open_existing(&root_path)
+            .unwrap()
+            .lesson(&LessonId(lesson_id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.lesson.lifecycle, LessonLifecycle::Active);
     }
 }
