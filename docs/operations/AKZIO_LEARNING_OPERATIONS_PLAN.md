@@ -2,6 +2,19 @@
 
 本文件是经验系统的操作规程和完成标准。它把“人工加入经验”“系统如何使用经验”“经验过多时如何处理”“如何组织经验”落实为可执行的 Store/CLI/审核流程。
 
+## 0. 初始缺口与修复状态
+
+| 初始缺口 | 当前修复 | 验收证据 |
+| --- | --- | --- |
+| `Experience` 和可复用规则混为一谈 | 新增独立 `Lesson` 类型和生命周期 | `akzio-domain/src/lesson.rs`、domain tests |
+| 没有人工录入、审核和撤回流程 | `lesson` CLI + Draft/Active/Contested/Retired | CLI add/approve/list/show/usage 流程 |
+| 模型看见经验后无法区分“采用”和“拒绝” | `applied_learning_refs` / `rejected_learning_refs`，DecisionGate 强制归因 | `akzio-execution` DecisionGate tests |
+| 来源、替代和冲突关系不受 Store 约束 | immutable revision、source closure、`supersedes`、`conflicts_with` | Store lesson tests + Doctor |
+| 经验会无限进入 prompt | scope/source-family 过滤和每类最多 4 条 | Context bound test |
+| 经验使用效果不可观测 | ContextManifest/DecisionContext usage metrics | `lesson usage` CLI |
+| outcome 复盘可能直接污染 active memory | 候选只生成 Draft，且只接受 sealed Paper T+1/T+3/T+5 | learning lifecycle tests |
+| Doctor/CLI 读路径会误写只读 Store | 读取纯读，写入单独使用可写 Store | read-only Store tests + CLI Doctor |
+
 ## 1. 先区分两类记忆
 
 | 类型 | 含义 | 谁产生 | 是否可人工直接改写 | 进入模型上下文的条件 |
