@@ -74,6 +74,90 @@ impl V2Store {
             .ok_or_else(|| StoreError::MissingContractInstallation(contract.contract_hash.clone()))
     }
 
+    /// Activate an explicitly versioned Rust canonical Contract upgrade without
+    /// mutating the prior installation. Capability expansion remains forbidden,
+    /// and the activation history records no learning PolicyTransition.
+    pub fn install_canonical_contract_upgrade(
+        &self,
+        active_contract_hash: &ContentHash,
+        contract: &AgentContract,
+        now: DateTime<Utc>,
+    ) -> StoreResult<StoredContract> {
+        contract.validate()?;
+        let artifact = self.contract_artifact(contract, now)?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let active = self
+            .stored_contract_with_connection(&transaction, active_contract_hash)?
+            .ok_or_else(|| StoreError::MissingContractInstallation(active_contract_hash.clone()))?;
+        let current_head =
+            contract_catalogue_head(&transaction, &active.contract.purpose)?.map(|(hash, _)| hash);
+        if current_head.as_ref() != Some(active_contract_hash)
+            || active.activated_at.is_none()
+            || contract.contract_id != active.contract.contract_id
+            || contract.purpose != active.contract.purpose
+            || contract.version <= active.contract.version
+        {
+            return Err(StoreError::ContractActivationConflict(
+                contract.purpose.clone(),
+            ));
+        }
+        if !candidate_is_bounded(&active.contract, contract) {
+            return Err(StoreError::ContractCapabilityExpansion {
+                active: active_contract_hash.clone(),
+                candidate: contract.contract_hash.clone(),
+            });
+        }
+        let blockers = contract_upgrade_blockers(&transaction, active_contract_hash)?;
+        if !blockers.is_empty() {
+            return Err(StoreError::ContractUpgradeBlocked {
+                active: active_contract_hash.clone(),
+                blockers: blockers.join(", "),
+            });
+        }
+
+        match self.stored_contract_with_connection(&transaction, &contract.contract_hash)? {
+            Some(existing)
+                if existing.contract == *contract
+                    && existing.baseline_contract_hash.as_ref() == Some(active_contract_hash)
+                    && existing.activated_at.is_none() => {}
+            Some(_) => {
+                return Err(StoreError::ContractActivationConflict(
+                    contract.purpose.clone(),
+                ));
+            }
+            None => {
+                assert_contract_identity_available(&transaction, contract)?;
+                insert_artifact(&transaction, &artifact)?;
+                insert_contract_installation(
+                    &transaction,
+                    contract,
+                    &artifact,
+                    Some(active_contract_hash),
+                    now,
+                )?;
+            }
+        }
+        let activation_id = append_contract_activation(
+            &transaction,
+            &contract.purpose,
+            Some(active_contract_hash),
+            &contract.contract_hash,
+            None,
+            now,
+        )?;
+        set_contract_catalogue_head(
+            &transaction,
+            &contract.purpose,
+            &contract.contract_hash,
+            activation_id,
+        )?;
+        transaction.commit()?;
+        drop(connection);
+        self.contract_installation(&contract.contract_hash)?
+            .ok_or_else(|| StoreError::MissingContractInstallation(contract.contract_hash.clone()))
+    }
+
     /// Persist a candidate relative to the current active Contract. This is an
     /// immutable install only: activation is coupled atomically to the
     /// candidate's canonical PolicyTransition in `record_policy_evaluation`.
@@ -1217,4 +1301,67 @@ impl V2Store {
         let connection = self.connection()?;
         self.workflow_snapshot_with_connection(&connection, run_id)
     }
+
+    /// Returns newest workflow snapshots for read-only observer clients.
+    /// The Store remains the sole authority and bounds the query even when a
+    /// caller supplies an excessive limit.
+    pub fn recent_workflows(&self, limit: usize) -> StoreResult<Vec<WorkflowSnapshot>> {
+        let connection = self.connection()?;
+        let limit = i64::try_from(limit.clamp(1, 100)).expect("bounded observer limit fits i64");
+        let run_ids = {
+            let mut statement = connection.prepare(
+                "SELECT run_id FROM rebuild_runs \
+                 ORDER BY created_at DESC, run_id DESC LIMIT ?1",
+            )?;
+            let rows = statement
+                .query_map(params![limit], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
+
+        run_ids
+            .into_iter()
+            .map(|run_id| self.workflow_snapshot_with_connection(&connection, &RunId(run_id)))
+            .collect()
+    }
+
+    /// Monotonic cursor used by observer SSE as an invalidation signal.
+    pub fn event_cursor(&self) -> StoreResult<i64> {
+        let connection = self.connection()?;
+        connection
+            .query_row(
+                "SELECT COALESCE(MAX(event_id), 0) FROM rebuild_events",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(StoreError::from)
+    }
+}
+
+fn contract_upgrade_blockers(
+    connection: &Connection,
+    active_contract_hash: &ContentHash,
+) -> StoreResult<Vec<String>> {
+    let mut statement = connection.prepare(
+        r#"
+        SELECT 'task:' || run_id || ':' || task_id || ':' || status
+        FROM rebuild_tasks
+        WHERE contract_hash = ?1
+          AND status IN ('queued', 'leased', 'running')
+        UNION ALL
+        SELECT 'session:' || session_key || ':' || run_id
+        FROM rebuild_session_slots AS slot
+        WHERE committed_at IS NULL
+          AND EXISTS (
+              SELECT 1
+              FROM rebuild_tasks AS task
+              WHERE task.run_id = slot.run_id
+                AND task.contract_hash = ?1
+          )
+        ORDER BY 1
+        "#,
+    )?;
+    let rows = statement.query_map(params![active_contract_hash.as_str()], |row| row.get(0))?;
+    let blockers = rows.collect::<Result<Vec<String>, _>>()?;
+    Ok(blockers)
 }

@@ -1,12 +1,28 @@
 //! Authenticated loopback HTTP transport.
 
 use super::*;
+use crate::observer::{
+    ObserverPortfolioHistory, ObserverPortfolioRange, ObserverRunDetail, ObserverSection,
+    ObserverSnapshot,
+};
+
+#[derive(Debug, Deserialize)]
+struct ObserverPortfolioHistoryQuery {
+    range: ObserverPortfolioRange,
+}
 
 impl Daemon {
     pub fn router(&self) -> Router {
         Router::new()
             .route("/health", get(http_health))
             .route("/ready", get(http_ready))
+            .route("/v1/observer/snapshot", get(http_observer_snapshot))
+            .route("/v1/observer/runs/{run_id}", get(http_observer_run))
+            .route(
+                "/v1/observer/portfolio/history",
+                get(http_observer_portfolio_history),
+            )
+            .route("/v1/observer/events", get(http_observer_events))
             .route("/runs/{run_id}/events", get(http_events))
             .route("/runs/{run_id}/trajectory", get(http_trajectory))
             .route("/runs/{run_id}/retrospectives", get(http_retrospectives))
@@ -70,6 +86,99 @@ async fn http_ready(
     })
 }
 
+async fn http_observer_snapshot(
+    State(daemon): State<Arc<Daemon>>,
+    headers: HeaderMap,
+) -> std::result::Result<Json<ObserverSnapshot>, StatusCode> {
+    authorize_observer(&daemon, &headers)?;
+    daemon.observer_snapshot().await.map(Json).map_err(|error| {
+        eprintln!("observer snapshot failed: {error}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
+}
+
+async fn http_observer_run(
+    State(daemon): State<Arc<Daemon>>,
+    Path(run_id): Path<String>,
+    headers: HeaderMap,
+) -> std::result::Result<Json<ObserverRunDetail>, StatusCode> {
+    authorize_observer(&daemon, &headers)?;
+    let run_id = RunId(run_id);
+    daemon
+        .observer_run_detail(&run_id)
+        .map(Json)
+        .map_err(|error| {
+            eprintln!("observer run detail failed for {run_id}: {error}");
+            match error {
+                DaemonError::Store(StoreError::MissingRun(_)) => StatusCode::NOT_FOUND,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            }
+        })
+}
+
+async fn http_observer_portfolio_history(
+    State(daemon): State<Arc<Daemon>>,
+    Query(query): Query<ObserverPortfolioHistoryQuery>,
+    headers: HeaderMap,
+) -> std::result::Result<Json<ObserverSection<ObserverPortfolioHistory>>, StatusCode> {
+    authorize_observer(&daemon, &headers)?;
+    Ok(Json(daemon.observer_portfolio_history(query.range).await))
+}
+
+async fn http_observer_events(
+    State(daemon): State<Arc<Daemon>>,
+    Query(query): Query<EventQuery>,
+    headers: HeaderMap,
+) -> std::result::Result<
+    Sse<impl futures::Stream<Item = std::result::Result<Event, Infallible>>>,
+    StatusCode,
+> {
+    authorize_observer(&daemon, &headers)?;
+    let mut cursor = query.after.unwrap_or(0);
+    let mut reasoning_events = daemon.reasoning_events.subscribe();
+    let mut poll = tokio::time::interval(std::time::Duration::from_millis(500));
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let stream = stream! {
+        loop {
+            tokio::select! {
+                event = reasoning_events.recv() => match event {
+                    Ok(event) => match serde_json::to_string(&event) {
+                        Ok(data) => yield Ok(Event::default()
+                            .event(event.event_name())
+                            .data(data)),
+                        Err(error) => yield Ok(Event::default()
+                            .event("error")
+                            .data(error.to_string())),
+                    },
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => yield Ok(Event::default()
+                        .event("error")
+                        .data(format!("reasoning stream lagged by {skipped} events"))),
+                    Err(broadcast::error::RecvError::Closed) => {}
+                },
+                _ = poll.tick() => match daemon.store.event_cursor() {
+                    Ok(next) if next > cursor => {
+                        cursor = next;
+                        match serde_json::to_string(&ObserverInvalidation { cursor }) {
+                            Ok(data) => yield Ok(Event::default()
+                                .id(cursor.to_string())
+                                .event("invalidate")
+                                .data(data)),
+                            Err(error) => yield Ok(Event::default()
+                                .event("error")
+                                .data(error.to_string())),
+                        }
+                    }
+                    Ok(_) => yield Ok(Event::default().comment("keepalive")),
+                    Err(error) => yield Ok(Event::default()
+                        .event("error")
+                        .data(error.to_string())),
+                }
+            }
+        }
+    };
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
 async fn http_events(
     State(daemon): State<Arc<Daemon>>,
     Path(run_id): Path<String>,
@@ -82,30 +191,51 @@ async fn http_events(
     authorize(&daemon, &headers)?;
     let run_id = RunId(run_id);
     let mut cursor = query.after.unwrap_or(0);
+    let mut reasoning_events = daemon.reasoning_events.subscribe();
+    let mut poll = tokio::time::interval(std::time::Duration::from_millis(200));
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let stream = stream! {
         loop {
-            match daemon.store.events_after(&run_id, cursor, EVENT_PAGE_SIZE) {
-                Ok(events) if events.is_empty() => {
-                    yield Ok(Event::default().comment("keepalive"));
-                }
-                Ok(events) => {
-                    for event in events {
-                        cursor = event.cursor;
-                        match serde_json::to_string(&EventView::from(event)) {
-                            Ok(data) => {
-                                yield Ok(Event::default().id(cursor.to_string()).event("akzio").data(data));
-                            }
-                            Err(error) => {
-                                yield Ok(Event::default().event("error").data(error.to_string()));
+            tokio::select! {
+                event = reasoning_events.recv() => match event {
+                    Ok(event) if event.run_id() == &run_id => {
+                        match serde_json::to_string(&event) {
+                            Ok(data) => yield Ok(Event::default()
+                                .event(event.event_name())
+                                .data(data)),
+                            Err(error) => yield Ok(Event::default()
+                                .event("error")
+                                .data(error.to_string())),
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => yield Ok(Event::default()
+                        .event("error")
+                        .data(format!("reasoning stream lagged by {skipped} events"))),
+                    Err(broadcast::error::RecvError::Closed) => {}
+                },
+                _ = poll.tick() => match daemon.store.events_after(&run_id, cursor, EVENT_PAGE_SIZE) {
+                    Ok(events) if events.is_empty() => {
+                        yield Ok(Event::default().comment("keepalive"));
+                    }
+                    Ok(events) => {
+                        for event in events {
+                            cursor = event.cursor;
+                            match serde_json::to_string(&EventView::from(event)) {
+                                Ok(data) => {
+                                    yield Ok(Event::default().id(cursor.to_string()).event("akzio").data(data));
+                                }
+                                Err(error) => {
+                                    yield Ok(Event::default().event("error").data(error.to_string()));
+                                }
                             }
                         }
                     }
-                }
-                Err(error) => {
-                    yield Ok(Event::default().event("error").data(error.to_string()));
+                    Err(error) => {
+                        yield Ok(Event::default().event("error").data(error.to_string()));
+                    }
                 }
             }
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
     };
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
@@ -240,6 +370,16 @@ fn authorize(daemon: &Daemon, headers: &HeaderMap) -> std::result::Result<(), St
         .get("x-akzio-token")
         .and_then(|value| value.to_str().ok())
         .filter(|value| *value == daemon.http_token)
+        .map(|_| ())
+        .ok_or(StatusCode::UNAUTHORIZED)
+}
+
+fn authorize_observer(daemon: &Daemon, headers: &HeaderMap) -> std::result::Result<(), StatusCode> {
+    headers
+        .get("x-akzio-observer-token")
+        .and_then(|value| value.to_str().ok())
+        .zip(daemon.observer_token.as_deref())
+        .filter(|(provided, expected)| provided == expected)
         .map(|_| ())
         .ok_or(StatusCode::UNAUTHORIZED)
 }

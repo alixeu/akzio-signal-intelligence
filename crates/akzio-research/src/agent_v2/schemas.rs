@@ -8,12 +8,14 @@ pub(super) fn deliberation_output_schema(result_schema: &Value) -> Value {
             "result": result_schema,
             "deliberation": {
                 "type": "object",
-                "required": ["selected_path", "alternatives", "uncertainties", "basis_artifact_ids", "confidence_ppm"],
-                "properties": {
-                    "selected_path": {"type": "string", "maxLength": 1000},
-                    "alternatives": {"type": "array", "maxItems": 3, "items": {"type": "string", "maxLength": 500}},
-                    "uncertainties": {"type": "array", "maxItems": 3, "items": {"type": "string", "maxLength": 500}},
-                    "basis_artifact_ids": {"type": "array", "maxItems": 8, "items": {"type": "string"}},
+                    "required": ["selected_path", "alternatives", "alternative_match_ppm", "uncertainties", "uncertainty_weight_ppm", "basis_artifact_ids", "confidence_ppm"],
+                    "properties": {
+                        "selected_path": {"type": "string", "maxLength": 1000},
+                "alternatives": {"type": "array", "description": "Return at most 3 alternatives.", "maxItems": 3, "items": {"type": "string", "maxLength": 500}},
+                "alternative_match_ppm": {"type": "array", "description": "Return exactly one model-assessed score per alternative.", "maxItems": 3, "items": {"type": "integer", "minimum": 0, "maximum": 1000000}},
+                "uncertainties": {"type": "array", "description": "Return at most 3 uncertainties.", "maxItems": 3, "items": {"type": "string", "maxLength": 500}},
+                "uncertainty_weight_ppm": {"type": "array", "description": "Return exactly one weight per uncertainty; weights sum to 1000000 minus confidence_ppm.", "maxItems": 3, "items": {"type": "integer", "minimum": 0, "maximum": 1000000}},
+                        "basis_artifact_ids": {"type": "array", "maxItems": 8, "items": {"type": "string"}},
                     "confidence_ppm": {"type": "integer", "minimum": 0, "maximum": 1000000}
                 },
                 "additionalProperties": false
@@ -366,18 +368,18 @@ pub(super) fn decision_proposal_output_schema() -> Value {
             },
             "claims": { "type": "array", "items": artifact_ref_schema(&["claim"]) },
             "critiques": { "type": "array", "items": artifact_ref_schema(&["critique"]) },
-            "evidence": {
-                "type": "array",
-                "items": artifact_ref_schema(&["normalized_evidence", "semantic_detail"])
-            },
-            "applied_learning_refs": {
-                "type": "array",
-                "items": artifact_ref_schema(&["lesson", "experience", "candidate_policy"])
-            },
-            "rejected_learning_refs": {
-                "type": "array",
-                "items": artifact_ref_schema(&["lesson", "experience", "candidate_policy"])
-            },
+    "evidence": {
+      "type": "array",
+      "items": artifact_ref_schema(&["normalized_evidence", "semantic_detail"])
+    },
+    "applied_learning_refs": {
+      "type": "array",
+      "items": artifact_ref_schema(&["lesson", "experience", "candidate_policy"])
+    },
+    "rejected_learning_refs": {
+      "type": "array",
+      "items": artifact_ref_schema(&["lesson", "experience", "candidate_policy"])
+    },
             "material_conflicts": {
                 "type": "array",
                 "items": {

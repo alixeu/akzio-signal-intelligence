@@ -223,11 +223,12 @@ pub(super) fn strict_artifact_id_argument(
 }
 
 pub(super) fn tool_set_hash(
-    tools: &[AgentToolDefinition],
+    request: &AgentModelRequest,
 ) -> ResearchResult<akzio_domain::ContentHash> {
-    Ok(akzio_domain::content_hash_json(&serde_json::to_value(
-        tools,
-    )?)?)
+    Ok(akzio_domain::content_hash_json(&json!({
+        "tools": request.tools,
+        "terminal": request.terminal,
+    }))?)
 }
 
 pub(super) fn model_tool_definitions(
@@ -238,6 +239,12 @@ pub(super) fn model_tool_definitions(
         .tool_specs
         .iter()
         .map(|spec| {
+            if spec.name == TERMINAL_SUBMISSION_TOOL {
+                return Err(ResearchError::InvalidToolSpec(format!(
+                    "{} is reserved for terminal submission",
+                    spec.name
+                )));
+            }
             let input_schema: Value =
                 serde_json::from_slice(&store.read_blob(&spec.input_schema)?)?;
             if input_schema != artifact_id_tool_input_schema() {

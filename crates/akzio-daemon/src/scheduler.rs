@@ -184,10 +184,25 @@ impl StorePaperWorkflowSource {
 
 impl PaperWorkflowSource for StorePaperWorkflowSource {
     fn proposal(&self, _session_key: &str) -> SchedulerResult<WorkflowProposal> {
-        let Some(artifact) = self
+        let mut latest_paper = None;
+        for artifact in self
             .store
-            .latest_artifact_by_kind(ArtifactKind::WorkflowProposal)?
-        else {
+            .recent_artifacts_by_kind(ArtifactKind::WorkflowProposal, 500)?
+        {
+            let Some(run_id) = artifact
+                .origin
+                .as_ref()
+                .and_then(|origin| origin.run_id.as_ref())
+            else {
+                continue;
+            };
+            if self.store.run_purpose(run_id)? == RunPurpose::Paper {
+                latest_paper = Some(artifact);
+                break;
+            }
+        }
+
+        let Some(artifact) = latest_paper else {
             return self
                 .bootstrap
                 .as_ref()
@@ -197,14 +212,6 @@ impl PaperWorkflowSource for StorePaperWorkflowSource {
                 .transpose()?
                 .ok_or(SchedulerError::WorkflowUnavailable);
         };
-        let run_id = artifact
-            .origin
-            .as_ref()
-            .and_then(|origin| origin.run_id.as_ref())
-            .ok_or(SchedulerError::WorkflowNotPaper)?;
-        if self.store.run_purpose(run_id)? != RunPurpose::Paper {
-            return Err(SchedulerError::WorkflowNotPaper);
-        }
         Ok(serde_json::from_slice(
             &self.store.read_blob(&artifact.blob)?,
         )?)

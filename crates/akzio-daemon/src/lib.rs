@@ -7,6 +7,8 @@
 mod dispatch;
 mod evidence;
 mod http;
+mod observer;
+mod observer_analytics;
 mod outcome;
 mod scheduler;
 mod worker;
@@ -37,9 +39,10 @@ use akzio_domain::{
     WorkflowProposal, WorkflowStatus,
 };
 use akzio_execution::{
-    paper::CommittedPaperBroker, DecisionGateError, DecisionGateInput, ExecutionGateError,
-    ExecutionGateInput, ExecutionPlan, OrderSide, PaperCommitmentError, PaperCommitmentInput,
-    PaperDispatchError, PaperDispatchInput, V2DecisionRuntime, V2ExecutionRuntime,
+    paper::{AlpacaPaper, CommittedPaperBroker, PortfolioHistoryRange},
+    DecisionGateError, DecisionGateInput, ExecutionGateError, ExecutionGateInput, ExecutionPlan,
+    OrderSide, PaperCommitmentError, PaperCommitmentInput, PaperDispatchError,
+    PaperDispatchFailpoint, PaperDispatchInput, V2DecisionRuntime, V2ExecutionRuntime,
     V2PaperCommitmentRuntime, V2PaperDispatchRuntime,
 };
 pub use akzio_ingest::AlpacaMarketDataFeed;
@@ -56,15 +59,15 @@ use akzio_learning::{
 };
 use akzio_model::{ModelClient, ModelConfig, ModelError};
 use akzio_research::v2::{
-    ActiveResearchCatalogue, AgentRuntime, ModelClientAdapter, ResearchError,
+    ActiveResearchCatalogue, AgentReasoningEvent, AgentRuntime, ModelClientAdapter, ResearchError,
 };
 use akzio_runtime::{
     should_run_structured_critique, RetryCause, RuntimeError, TaskCompletion, TaskRuntime,
     WorkflowRuntime,
 };
 use akzio_store::v2::{
-    AlertSeverity, ClaimedAttempt, DaemonLease, StoreAlert, StoreError, StoreMetrics, StoredEvent,
-    TrajectoryEntry, V2Store,
+    ClaimedAttempt, DaemonLease, StoreAlert, StoreError, StoreMetrics, StoredEvent,
+    TrajectoryEntry, V2Store, WorkflowSnapshot,
 };
 use async_stream::stream;
 use axum::{
@@ -78,7 +81,10 @@ use chrono::{DateTime, Duration, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
-use tokio::{net::TcpListener, sync::watch};
+use tokio::{
+    net::TcpListener,
+    sync::{broadcast, watch},
+};
 
 const EVENT_PAGE_SIZE: usize = 256;
 const PAPER_ACCOUNT_RESOURCE: &str = "paper.account";
@@ -146,6 +152,7 @@ pub type Result<T> = std::result::Result<T, DaemonError>;
 pub struct DaemonConfig {
     pub store_root: PathBuf,
     pub http_token: String,
+    pub observer_token: Option<String>,
     pub worker_count: usize,
     pub auto_paper: bool,
     pub market_data_feed: Option<AlpacaMarketDataFeed>,
@@ -160,6 +167,8 @@ pub struct Daemon {
     task_runtime: TaskRuntime,
     agents: AgentRuntime,
     model: ModelClientAdapter,
+    stage_models: Arc<BTreeMap<String, ModelClientAdapter>>,
+    reasoning_events: broadcast::Sender<AgentReasoningEvent>,
     fixture_evidence: Arc<FixtureEvidence>,
     production_evidence: Arc<BTreeMap<EvidenceSource, Arc<dyn AsyncEvidenceAdapter>>>,
     decision_runtime: V2DecisionRuntime,
@@ -168,11 +177,20 @@ pub struct Daemon {
     paper_dispatch_runtime: V2PaperDispatchRuntime,
     outcome_scheduling_runtime: OutcomeSchedulingRuntime,
     paper_broker: Option<Arc<dyn CommittedPaperBroker>>,
+    paper_observer: Option<AlpacaPaper>,
     scheduler: PaperScheduler,
     http_token: String,
+    observer_token: Option<String>,
     auto_paper: bool,
+    runtime_identity_hash: Option<ContentHash>,
     outcome_cost_model: OutcomeCostModel,
     worker_pool: WorkerPoolConfig,
+}
+
+impl Daemon {
+    fn model_for(&self, purpose: &str) -> &ModelClientAdapter {
+        self.stage_models.get(purpose).unwrap_or(&self.model)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -183,6 +201,11 @@ pub struct DaemonHealth {
     pub scheduler_epoch: Option<u64>,
     pub metrics: StoreMetrics,
     pub alerts: Vec<StoreAlert>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ObserverInvalidation {
+    pub cursor: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -921,42 +944,63 @@ pub fn fixture_model_client() -> ModelClient {
             })
         })
         .collect::<Vec<_>>();
-    let response = |output: serde_json::Value| {
+    let responses = |output: serde_json::Value| {
         let output = serde_json::json!({
             "result": output,
             "deliberation": {
                 "selected_path": "fixture path",
                 "alternatives": [],
+                "alternative_match_ppm": [],
                 "uncertainties": [],
+                "uncertainty_weight_ppm": [],
                 "basis_artifact_ids": [],
-                "confidence_ppm": 500000
+                "confidence_ppm": 1000000
             }
         });
-        serde_json::json!({
-            "output_text": serde_json::to_string(&output).expect("static fixture JSON"),
-        })
+        vec![
+            serde_json::json!({
+                "output": [{
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "fixture research memo"}]
+                }]
+            }),
+            serde_json::json!({
+                "output": [{
+                    "type": "function_call",
+                    "call_id": "fixture-submit",
+                    "name": "submit_result",
+                    "arguments": serde_json::to_string(&output).expect("static fixture JSON")
+                }]
+            }),
+        ]
     };
-    ModelClient::FixtureBySchema(BTreeMap::from([
-        ("research.planner".to_owned(), response(planner)),
+    ModelClient::fixture_by_purpose(BTreeMap::from([
+        ("research.planner".to_owned(), responses(planner)),
         (
             "research.analyst".to_owned(),
-            response(fixture_claim_output()),
+            responses(fixture_claim_output()),
         ),
         (
             "research.critic".to_owned(),
-            response(fixture_critique_output()),
+            responses(fixture_critique_output()),
         ),
         (
             "research.synthesizer".to_owned(),
-            response(serde_json::json!({
-                    "summary": "fixture decision draft",
-                    "confidence_ppm": 500000,
-                    "forecasts": forecasts,
-                "claims": [],
+            responses(serde_json::json!({
+                "summary": "fixture decision draft",
+                "confidence_ppm": 500000,
+                "forecasts": forecasts,
+                "claims": [{
+                    "artifact_id": akzio_model::FIXTURE_CONTEXT_CLAIM_ID,
+                    "kind": "claim"
+                }],
                 "critiques": [],
-                "evidence": [],
+                "evidence": [{
+                    "artifact_id": akzio_model::FIXTURE_CONTEXT_EVIDENCE_ID,
+                    "kind": "normalized_evidence"
+                }],
                 "material_conflicts": [],
-                "hard_blockers": ["missing_evidence"],
+                "hard_blockers": [],
                 "soft_warnings": []
             })),
         ),

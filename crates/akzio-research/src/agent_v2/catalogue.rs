@@ -47,9 +47,9 @@ impl ActiveResearchCatalogue {
 
 pub const ACTIVE_RESEARCH_MAX_NODES: usize = 32;
 
-pub(super) const ACTIVE_CONTRACT_VERSION: u32 = 2;
-pub(super) const ACTIVE_PROMPT_BUNDLE_VERSION: u32 = 2;
-pub(super) const SHARED_GOVERNANCE_PROMPT: &str = "Follow the installed Akzio Contract exactly. Rust owns state, evidence access, budgets, workflow gates, and Paper-only execution. Use only ContextManifest-granted artifacts and the declared tools. Never access arbitrary files, network resources, credentials, databases, or execution controls. Return only the requested strict JSON output.";
+pub(super) const ACTIVE_CONTRACT_VERSION: u32 = 4;
+pub(super) const ACTIVE_PROMPT_BUNDLE_VERSION: u32 = 4;
+pub(super) const SHARED_GOVERNANCE_PROMPT: &str = "Follow the installed Akzio Contract exactly. Rust owns state, evidence access, budgets, workflow gates, and Paper-only execution. Use only ContextManifest-granted artifacts and the declared tools. Never access arbitrary files, network resources, credentials, databases, or execution controls. Work in two phases: produce an auditable natural-language research memo, then call submit_result exactly once when Rust requests submission. submit_result is a zero-side-effect proposal channel; Rust alone validates and persists the result.";
 pub(super) const PLANNER_RECIPE_ID: &str = "research.planner";
 pub(super) const PLANNER_CHILD_RECIPE_IDS: [&str; 2] = ["research.analyst", "research.synthesizer"];
 pub(super) const GOVERNED_EVIDENCE_SOURCE_FAMILIES: [&str; 4] =
@@ -113,7 +113,18 @@ impl ContractCatalogue {
         let mut by_identity = BTreeMap::new();
         for contract in contracts {
             let stored = match store.active_contract(&contract.purpose)? {
-                Some(stored) => stored,
+                Some(stored) if stored.contract.contract_hash == contract.contract_hash => stored,
+                Some(stored) if stored.contract.version < contract.version => store
+                    .install_canonical_contract_upgrade(
+                        &stored.contract.contract_hash,
+                        &contract,
+                        now,
+                    )?,
+                Some(_) => {
+                    return Err(ResearchError::NonCanonicalActiveContract(
+                        contract.purpose.as_str().to_owned(),
+                    ));
+                }
                 None => store.install_active_contract(&contract, now)?,
             };
             let contract = stored.contract;

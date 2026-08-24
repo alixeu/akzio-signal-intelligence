@@ -164,6 +164,154 @@ fn contract_catalogue_rejects_duplicate_or_expanded_installations_and_doctor_cor
 }
 
 #[test]
+fn observatory_configuration_round_trips_and_clears() {
+    let root = tempdir().unwrap();
+    let store = V2Store::open(root.path()).unwrap();
+    let configuration = serde_json::json!({
+        "llm_api_key": "fixture-llm-key",
+        "alpaca_api_secret": "fixture-alpaca-secret",
+        "model": "fixture-model"
+    });
+
+    assert_eq!(
+        store
+            .observatory_configuration::<serde_json::Value>()
+            .unwrap(),
+        None
+    );
+    store.set_observatory_configuration(&configuration).unwrap();
+    assert_eq!(
+        store
+            .observatory_configuration::<serde_json::Value>()
+            .unwrap(),
+        Some(configuration)
+    );
+    assert!(store.clear_observatory_configuration().unwrap());
+    assert!(!store.clear_observatory_configuration().unwrap());
+    assert_eq!(
+        store
+            .observatory_configuration::<serde_json::Value>()
+            .unwrap(),
+        None
+    );
+}
+
+#[test]
+fn canonical_contract_upgrade_is_monotonic_bounded_and_preserves_history() {
+    let root = tempdir().unwrap();
+    let store = V2Store::open(root.path()).unwrap();
+    let now = Utc::now();
+    let active = contract(&store, 1);
+    store.install_active_contract(&active, now).unwrap();
+
+    let mut upgraded = active.clone();
+    upgraded.version = 2;
+    upgraded.responsibility = "bounded canonical runtime upgrade".to_owned();
+    upgraded.contract_hash = upgraded.expected_hash().unwrap();
+    upgraded.validate().unwrap();
+    let stored = store
+        .install_canonical_contract_upgrade(
+            &active.contract_hash,
+            &upgraded,
+            now + Duration::seconds(1),
+        )
+        .unwrap();
+
+    assert_eq!(stored.contract, upgraded);
+    assert_eq!(
+        stored.baseline_contract_hash,
+        Some(active.contract_hash.clone())
+    );
+    assert!(stored.activated_at.is_some());
+    assert_eq!(
+        store
+            .active_contract(&active.purpose)
+            .unwrap()
+            .unwrap()
+            .contract
+            .contract_hash,
+        upgraded.contract_hash
+    );
+    assert!(store
+        .contract_installation(&active.contract_hash)
+        .unwrap()
+        .is_some());
+
+    let mut expanded = upgraded.clone();
+    expanded.version = 3;
+    expanded
+        .context
+        .permitted_source_families
+        .insert("unapproved".to_owned());
+    expanded.candidate_capability_ceiling = akzio_domain::CandidateCapabilityCeiling {
+        context: expanded.context.clone(),
+        tool_grants: expanded.tool_grants.clone(),
+    };
+    expanded.contract_hash = expanded.expected_hash().unwrap();
+    expanded.validate().unwrap();
+    assert!(matches!(
+        store.install_canonical_contract_upgrade(
+            &upgraded.contract_hash,
+            &expanded,
+            now + Duration::seconds(2),
+        ),
+        Err(StoreError::ContractCapabilityExpansion { .. })
+    ));
+    store.verify_integrity().unwrap();
+}
+
+#[test]
+fn canonical_contract_upgrade_rejects_nonterminal_tasks_and_lists_blockers() {
+    let root = tempdir().unwrap();
+    let store = V2Store::open(root.path()).unwrap();
+    let now = Utc::now();
+    let active = contract(&store, 1);
+    store.install_active_contract(&active, now).unwrap();
+
+    let mut graph = graph();
+    graph.nodes[0].contract_hash = Some(active.contract_hash.clone());
+    let graph_artifact = artifact(
+        &store,
+        ArtifactKind::WorkflowGraph,
+        &serde_json::to_string(&graph).unwrap(),
+        None,
+    );
+    let run = StoredRun {
+        run_id: RunId::new(),
+        purpose: RunPurpose::Debug,
+        topology_id: graph.topology_id.clone(),
+        graph_artifact_id: graph_artifact.artifact_id.clone(),
+        created_at: now,
+    };
+    store
+        .commit_workflow(&WorkflowCommit {
+            run: run.clone(),
+            graph: graph_artifact,
+            nodes: graph.nodes.clone(),
+        })
+        .unwrap();
+
+    let mut upgraded = active.clone();
+    upgraded.version = 2;
+    upgraded.responsibility = "blocked upgrade".to_owned();
+    upgraded.contract_hash = upgraded.expected_hash().unwrap();
+    let error = store
+        .install_canonical_contract_upgrade(
+            &active.contract_hash,
+            &upgraded,
+            now + Duration::seconds(1),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        StoreError::ContractUpgradeBlocked { active: hash, blockers }
+            if hash == active.contract_hash
+                && blockers.contains(run.run_id.0.as_str())
+                && blockers.contains(graph.nodes[0].task_id.0.as_str())
+    ));
+}
+
+#[test]
 fn contract_policy_transitions_activate_and_rollback_catalogue_history() {
     let fixture = PolicyCommitFixture::memory();
     let active = contract(&fixture.store, 1);
@@ -4367,15 +4515,23 @@ fn trajectory_redacts_provider_and_tool_payloads() {
                 "provider_id": "fixture-provider",
                 "model_id": "fixture-model",
                 "reasoning_effort": "high",
-                "supports_structured_output": true,
                 "supports_tool_calls": true,
+                "supports_stateless_continuation": true,
                 "native_web_tool": false,
                 "source": "fixture"
-            },
-            "capability_snapshot_hash": "capability-hash",
-            "tool_set_hash": "tool-hash",
-            "request": {"secret": "provider-request"},
-            "response": {"secret": "provider-result"}
+                },
+                "capability_snapshot_hash": "capability-hash",
+                "tool_set_hash": "tool-hash",
+            "request": {"phase": "draft", "secret": "provider-request"},
+            "response": {
+                "assistant_text": "bounded fixture research memo",
+                "telemetry": {
+                    "latency_millis": 321,
+                    "input_tokens": 123,
+                    "output_tokens": 45
+                },
+                "secret": "provider-result"
+            }
         }),
         vec![],
         ArtifactLifecycle::RunScoped,
@@ -4483,6 +4639,23 @@ fn trajectory_redacts_provider_and_tool_payloads() {
         .unwrap();
 
     let entries = fixture.store.trajectory(&fixture.run.run_id).unwrap();
+    let recent = fixture
+        .store
+        .recent_trajectory(&fixture.run.run_id, 2)
+        .unwrap();
+    assert!(recent.len() <= 2);
+    assert_eq!(
+        recent,
+        entries[entries.len().saturating_sub(recent.len())..]
+    );
+    let recent_outputs = fixture
+        .store
+        .recent_artifacts_by_kind(ArtifactKind::DecisionProposal, 1)
+        .unwrap();
+    assert_eq!(
+        recent_outputs.first().map(|artifact| &artifact.artifact_id),
+        Some(&output.artifact_id)
+    );
     assert!(entries
         .windows(2)
         .all(|pair| pair[0].cursor < pair[1].cursor));
@@ -4496,6 +4669,14 @@ fn trajectory_redacts_provider_and_tool_payloads() {
             .as_ref()
             .and_then(|value| value.model_id.as_deref()),
         Some("fixture-model")
+    );
+    assert_eq!(model.latency_millis, Some(321));
+    assert_eq!(model.input_tokens, Some(123));
+    assert_eq!(model.output_tokens, Some(45));
+    assert_eq!(model.phase.as_deref(), Some("draft"));
+    assert_eq!(
+        model.assistant_text.as_deref(),
+        Some("bounded fixture research memo")
     );
     let model_json = serde_json::to_string(model).unwrap();
     assert!(!model_json.contains("provider-request"));

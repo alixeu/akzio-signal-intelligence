@@ -13,12 +13,33 @@ impl Daemon {
             ));
         }
         let model = ModelClient::from_config(&model_config)?;
+        let stage_models = model_config
+            .routes
+            .iter()
+            .map(|(purpose, route)| {
+                let route_config = model_config.for_route(route);
+                Ok((
+                    purpose.clone(),
+                    ModelClientAdapter::with_response_language(
+                        ModelClient::from_config(&route_config)?,
+                        debug,
+                        route_config.response_language,
+                    ),
+                ))
+            })
+            .collect::<std::result::Result<BTreeMap<_, _>, ModelError>>()?;
         let mut daemon = Self::with_fixture_evidence_debug(
             config,
             model.clone(),
             FixtureEvidence::new(),
             debug,
         )?;
+        daemon.model = ModelClientAdapter::with_response_language(
+            model.clone(),
+            debug,
+            model_config.response_language,
+        );
+        daemon.stage_models = Arc::new(stage_models);
         let mut production_evidence: BTreeMap<EvidenceSource, Arc<dyn AsyncEvidenceAdapter>> =
             BTreeMap::new();
         if let Ok(alpaca) = AlpacaPaperEvidenceTransport::from_env(market_data_feed) {
@@ -71,7 +92,9 @@ impl Daemon {
         let store = V2Store::open(&config.store_root)?;
         let active = ActiveResearchCatalogue::install(&store, Utc::now())?;
         let workflow = WorkflowRuntime::new(store.clone(), active.recipes);
-        let agents = AgentRuntime::new(store.clone(), active.contracts, Duration::minutes(5));
+        let (reasoning_events, _) = broadcast::channel(1_024);
+        let agents = AgentRuntime::new(store.clone(), active.contracts, Duration::minutes(5))
+            .with_reasoning_events(reasoning_events.clone());
         let decision_runtime = V2DecisionRuntime::new(store.clone(), Default::default())?;
         let execution_runtime =
             V2ExecutionRuntime::new(store.clone(), Default::default(), Default::default())?;
@@ -88,17 +111,23 @@ impl Daemon {
             workflow,
             agents,
             model: ModelClientAdapter::with_debug(model, model_debug),
+            stage_models: Arc::new(BTreeMap::new()),
+            reasoning_events,
             fixture_evidence: Arc::new(fixture_evidence),
             production_evidence: Arc::new(BTreeMap::new()),
             decision_runtime,
             execution_runtime,
             paper_commitment_runtime: V2PaperCommitmentRuntime::new(store.clone()),
-            paper_dispatch_runtime: V2PaperDispatchRuntime::new(store.clone()),
+            paper_dispatch_runtime: V2PaperDispatchRuntime::new(store.clone())
+                .with_failpoint(PaperDispatchFailpoint::from_env()),
             outcome_scheduling_runtime: OutcomeSchedulingRuntime::new(store.clone()),
             paper_broker: None,
+            paper_observer: None,
             scheduler,
             http_token: config.http_token,
+            observer_token: config.observer_token,
             auto_paper: config.auto_paper,
+            runtime_identity_hash: config.runtime_identity_hash,
             outcome_cost_model: config.outcome_cost_model,
             worker_pool: WorkerPoolConfig {
                 worker_count: config.worker_count.max(1),
@@ -121,6 +150,11 @@ impl Daemon {
     /// daemon itself never reads credentials or performs network I/O.
     pub fn with_paper_broker(mut self, broker: Arc<dyn CommittedPaperBroker>) -> Self {
         self.paper_broker = Some(broker);
+        self
+    }
+
+    pub fn with_paper_observer(mut self, paper: AlpacaPaper) -> Self {
+        self.paper_observer = Some(paper);
         self
     }
 
@@ -391,19 +425,11 @@ impl Daemon {
         })
     }
 
-    /// Readiness is stricter than liveness: critical durable alerts and an
-    /// unconfigured Paper broker keep the daemon out of service.
+    /// Readiness covers process configuration. Durable run/task failures stay
+    /// visible in health and Observer data, but must not prevent inspection or
+    /// recovery after a restart.
     pub fn ready(&self) -> Result<DaemonHealth> {
         let health = self.health()?;
-        if health
-            .alerts
-            .iter()
-            .any(|alert| matches!(alert.severity, AlertSeverity::Critical))
-        {
-            return Err(DaemonError::Unavailable(
-                "daemon has critical store alerts".to_owned(),
-            ));
-        }
         if self.auto_paper && self.paper_broker.is_none() {
             return Err(DaemonError::Unavailable(
                 "Paper broker is not injected".to_owned(),

@@ -112,7 +112,13 @@ pub struct DeliberationSummary {
     #[serde(default)]
     pub alternatives: Vec<String>,
     #[serde(default)]
+    pub alternative_match_ppm: Vec<u32>,
+    #[serde(default)]
     pub uncertainties: Vec<String>,
+    #[serde(default)]
+    pub uncertainty_weight_ppm: Vec<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assessment_source: Option<String>,
     #[serde(default)]
     pub basis_artifact_ids: Vec<ArtifactId>,
     pub confidence_ppm: u32,
@@ -122,10 +128,26 @@ impl DeliberationSummary {
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.selected_path.trim().is_empty()
             || self.selected_path.chars().count() > 1_000
-            || self.alternatives.len() > 3
-            || self.uncertainties.len() > 3
+            || (!self.alternative_match_ppm.is_empty() && self.alternatives.len() > 3)
+            || (!self.alternative_match_ppm.is_empty()
+                && self.alternative_match_ppm.len() != self.alternatives.len())
+            || (!self.uncertainty_weight_ppm.is_empty() && self.uncertainties.len() > 3)
+            || (!self.uncertainty_weight_ppm.is_empty()
+                && self.uncertainty_weight_ppm.len() != self.uncertainties.len())
             || self.basis_artifact_ids.len() > 8
             || self.confidence_ppm > 1_000_000
+            || self
+                .alternative_match_ppm
+                .iter()
+                .any(|value| *value > 1_000_000)
+            || self
+                .uncertainty_weight_ppm
+                .iter()
+                .any(|value| *value > 1_000_000)
+            || self
+                .assessment_source
+                .as_deref()
+                .is_some_and(|source| source != "model_assessed")
             || self
                 .alternatives
                 .iter()
@@ -139,6 +161,17 @@ impl DeliberationSummary {
                 field: "deliberation.summary",
             });
         }
+        if !self.uncertainty_weight_ppm.is_empty()
+            && self
+                .uncertainty_weight_ppm
+                .iter()
+                .try_fold(0_u32, |sum, value| sum.checked_add(*value))
+                != Some(1_000_000 - self.confidence_ppm)
+        {
+            return Err(DomainError::InvalidBudget {
+                field: "deliberation.uncertainty_weight_ppm",
+            });
+        }
         let mut basis = BTreeSet::new();
         if self
             .basis_artifact_ids
@@ -147,6 +180,31 @@ impl DeliberationSummary {
         {
             return Err(DomainError::EmptyField {
                 field: "deliberation.basis_artifact_ids",
+            });
+        }
+        Ok(())
+    }
+
+    pub fn validate_model_assessment(&self) -> Result<(), DomainError> {
+        self.validate()?;
+        if self.assessment_source.as_deref() != Some("model_assessed")
+            || self.alternatives.len() > 3
+            || self.alternative_match_ppm.len() != self.alternatives.len()
+            || self.uncertainties.len() > 3
+            || self.uncertainty_weight_ppm.len() != self.uncertainties.len()
+        {
+            return Err(DomainError::InvalidBudget {
+                field: "deliberation.summary",
+            });
+        }
+        if self
+            .uncertainty_weight_ppm
+            .iter()
+            .try_fold(0_u32, |sum, value| sum.checked_add(*value))
+            != Some(1_000_000 - self.confidence_ppm)
+        {
+            return Err(DomainError::InvalidBudget {
+                field: "deliberation.uncertainty_weight_ppm",
             });
         }
         Ok(())

@@ -48,7 +48,13 @@ impl Daemon {
                 }
                 let output = self
                     .agents
-                    .run(&task.permit, &task.node, candidates, &self.model, now)
+                    .run(
+                        &task.permit,
+                        &task.node,
+                        candidates,
+                        self.model_for(task.node.recipe_id.as_str()),
+                        now,
+                    )
                     .await?;
                 if task.node.recipe_id.as_str() == "research.planner" {
                     let revision = self.workflow.recover(&task.run_id)?.revision;

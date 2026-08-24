@@ -1,0 +1,75 @@
+    |                                     `- error: 'ArchiveRowPresentation' is ambiguous for type lookup in this context
+    |                                `- error: 'ArchiveStageProgress' is ambiguous for type lookup in this context
+    |                           `- error: 'ImpactAreaPresentation' is ambiguous for type lookup in this context
+    |                         `- error: 'ArchiveStageProgress' is ambiguous for type lookup in this context
+    |                        `- error: 'ImpactAreaPresentation' is ambiguous for type lookup in this context
+    |                        `- error: 'ImpactSummaryPresentation' is ambiguous for type lookup in this context
+    |                       `- error: 'ArchiveRowPresentation' is ambiguous for type lookup in this context
+    |                    `- error: 'ImpactAreaPresentation' is ambiguous for type lookup in this context
+    |                 `- error: 'ImpactAreaPresentation' is ambiguous for type lookup in this context
+    |                 `- error: 'ImpactSummaryPresentation' is ambiguous for type lookup in this context
+    |                `- error: 'ArchiveRowPresentation' is ambiguous for type lookup in this context
+    |               `- error: invalid redeclaration of 'ArchivePresentation'
+    |               `- error: invalid redeclaration of 'ArchiveRowPresentation'
+    |               `- error: invalid redeclaration of 'ArchiveStageProgress'
+    |               `- error: invalid redeclaration of 'ImpactAreaPresentation'
+    |               `- error: invalid redeclaration of 'ImpactSummaryPresentation'
+    |               `- error: invalid redeclaration of 'LearningPresentation'
+    |               `- error: type 'ArchivePresentation' does not conform to protocol 'Hashable'
+    |               `- error: type 'ImpactSummaryPresentation' does not conform to protocol 'Hashable'
+    |               `- error: type 'LearningPresentation' does not conform to protocol 'Hashable'
+    |               |- error: type 'ArchivePresentation' does not conform to protocol 'Equatable'
+    |               |- error: type 'ImpactSummaryPresentation' does not conform to protocol 'Equatable'
+    |               |- error: type 'LearningPresentation' does not conform to protocol 'Equatable'
+   |                          `- error: 'LearningPresentation' is ambiguous for type lookup in this context
+   |                         `- error: 'ArchivePresentation' is ambiguous for type lookup in this context
+   |                   `- error: 'LearningPresentation' is ambiguous for type lookup in this context
+   |                  `- error: 'ArchivePresentation' is ambiguous for type lookup in this context
+   |               |- error: type 'ObservatorySnapshot' does not conform to protocol 'Equatable'
+PresentationModels/ArchivePresentation.swift:130:15: error: invalid redeclaration of 'ArchiveStageProgress'
+PresentationModels/ArchivePresentation.swift:144:15: error: invalid redeclaration of 'ArchivePresentation'
+PresentationModels/ArchivePresentation.swift:144:15: error: type 'ArchivePresentation' does not conform to protocol 'Equatable'
+PresentationModels/ArchivePresentation.swift:144:15: error: type 'ArchivePresentation' does not conform to protocol 'Hashable'
+PresentationModels/ArchivePresentation.swift:145:23: error: 'ArchiveRowPresentation' is ambiguous for type lookup in this context
+PresentationModels/ArchivePresentation.swift:151:32: error: 'ArchiveStageProgress' is ambiguous for type lookup in this context
+PresentationModels/ArchivePresentation.swift:155:16: error: 'ArchiveRowPresentation' is ambiguous for type lookup in this context
+PresentationModels/ArchivePresentation.swift:161:25: error: 'ArchiveStageProgress' is ambiguous for type lookup in this context
+PresentationModels/ArchivePresentation.swift:175:37: error: 'ArchiveRowPresentation' is ambiguous for type lookup in this context
+PresentationModels/ArchivePresentation.swift:17:15: error: invalid redeclaration of 'ImpactSummaryPresentation'
+PresentationModels/ArchivePresentation.swift:17:15: error: type 'ImpactSummaryPresentation' does not conform to protocol 'Equatable'
+PresentationModels/ArchivePresentation.swift:17:15: error: type 'ImpactSummaryPresentation' does not conform to protocol 'Hashable'
+PresentationModels/ArchivePresentation.swift:24:27: error: 'ImpactAreaPresentation' is ambiguous for type lookup in this context
+PresentationModels/ArchivePresentation.swift:33:20: error: 'ImpactAreaPresentation' is ambiguous for type lookup in this context
+PresentationModels/ArchivePresentation.swift:45:15: error: invalid redeclaration of 'LearningPresentation'
+PresentationModels/ArchivePresentation.swift:45:15: error: type 'LearningPresentation' does not conform to protocol 'Equatable'
+PresentationModels/ArchivePresentation.swift:45:15: error: type 'LearningPresentation' does not conform to protocol 'Hashable'
+PresentationModels/ArchivePresentation.swift:5:15: error: invalid redeclaration of 'ImpactAreaPresentation'
+PresentationModels/ArchivePresentation.swift:68:24: error: 'ImpactSummaryPresentation' is ambiguous for type lookup in this context
+PresentationModels/ArchivePresentation.swift:76:17: error: 'ImpactSummaryPresentation' is ambiguous for type lookup in this context
+PresentationModels/ArchivePresentation.swift:93:15: error: invalid redeclaration of 'ArchiveRowPresentation'
+PresentationModels/LearningPresentation.swift:135:15: error: invalid redeclaration of 'ArchiveStageProgress'
+PresentationModels/LearningPresentation.swift:149:15: error: invalid redeclaration of 'ArchivePresentation'
+PresentationModels/LearningPresentation.swift:149:15: error: type 'ArchivePresentation' does not conform to protocol 'Equatable'
+PresentationModels/LearningPresentation.swift:149:15: error: type 'ArchivePresentation' does not conform to protocol 'Hashable'
+PresentationModels/LearningPresentation.swift:150:23: error: 'ArchiveRowPresentation' is ambiguous for type lookup in this context
+PresentationModels/LearningPresentation.swift:156:32: error: 'ArchiveStageProgress' is ambiguous for type lookup in this context
+PresentationModels/LearningPresentation.swift:160:16: error: 'ArchiveRowPresentation' is ambiguous for type lookup in this context
+PresentationModels/LearningPresentation.swift:166:25: error: 'ArchiveStageProgress' is ambiguous for type lookup in this context
+PresentationModels/LearningPresentation.swift:17:15: error: invalid redeclaration of 'ImpactSummaryPresentation'
+PresentationModels/LearningPresentation.swift:17:15: error: type 'ImpactSummaryPresentation' does not conform to protocol 'Equatable'
+PresentationModels/LearningPresentation.swift:17:15: error: type 'ImpactSummaryPresentation' does not conform to protocol 'Hashable'
+PresentationModels/LearningPresentation.swift:24:24: error: 'ImpactAreaPresentation' is ambiguous for type lookup in this context
+PresentationModels/LearningPresentation.swift:33:17: error: 'ImpactAreaPresentation' is ambiguous for type lookup in this context
+PresentationModels/LearningPresentation.swift:45:15: error: invalid redeclaration of 'LearningPresentation'
+PresentationModels/LearningPresentation.swift:45:15: error: type 'LearningPresentation' does not conform to protocol 'Equatable'
+PresentationModels/LearningPresentation.swift:45:15: error: type 'LearningPresentation' does not conform to protocol 'Hashable'
+PresentationModels/LearningPresentation.swift:5:15: error: invalid redeclaration of 'ImpactAreaPresentation'
+PresentationModels/LearningPresentation.swift:68:24: error: 'ImpactSummaryPresentation' is ambiguous for type lookup in this context
+PresentationModels/LearningPresentation.swift:76:17: error: 'ImpactSummaryPresentation' is ambiguous for type lookup in this context
+PresentationModels/LearningPresentation.swift:95:15: error: invalid redeclaration of 'ArchiveRowPresentation'
+PresentationModels/ObservatorySnapshot.swift:10:15: error: type 'ObservatorySnapshot' does not conform to protocol 'Equatable'
+PresentationModels/ObservatorySnapshot.swift:23:26: error: 'LearningPresentation' is ambiguous for type lookup in this context
+PresentationModels/ObservatorySnapshot.swift:24:25: error: 'ArchivePresentation' is ambiguous for type lookup in this context
+PresentationModels/ObservatorySnapshot.swift:39:19: error: 'LearningPresentation' is ambiguous for type lookup in this context
+PresentationModels/ObservatorySnapshot.swift:40:18: error: 'ArchivePresentation' is ambiguous for type lookup in this context
+error: emit-module command failed with exit code 1 (use -v to see invocation)

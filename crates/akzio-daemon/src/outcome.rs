@@ -85,7 +85,13 @@ impl Daemon {
                     candidates.dedup();
                     match self
                         .agents
-                        .run(&task.permit, &task.node, candidates, &self.model, now)
+                        .run(
+                            &task.permit,
+                            &task.node,
+                            candidates,
+                            self.model_for(task.node.recipe_id.as_str()),
+                            now,
+                        )
                         .await
                     {
                         Ok(draft_artifact) => {

@@ -217,6 +217,37 @@ impl AlpacaPaperEvidenceTransport {
                     "/v2/account/activities/FILL?date={session_key}&direction=asc&page_size=100"
                 ))
             }
+            value if value.starts_with("observer.qqq_history:") => {
+                let mut parts = value.split(':');
+                let _ = parts.next();
+                let range = parts.next().ok_or_else(|| {
+                    EvidenceAdapterError::Transport("invalid observer QQQ range".to_owned())
+                })?;
+                let start = parts.next().ok_or_else(|| {
+                    EvidenceAdapterError::Transport("invalid observer QQQ start".to_owned())
+                })?;
+                if parts.next().is_some() {
+                    return Err(EvidenceAdapterError::Transport(
+                        "invalid observer QQQ resource".to_owned(),
+                    ));
+                }
+                chrono::NaiveDate::parse_from_str(start, "%Y-%m-%d").map_err(|_| {
+                    EvidenceAdapterError::Transport("invalid observer QQQ start".to_owned())
+                })?;
+                let timeframe = match range {
+                    "1d" => "5Min",
+                    "1w" => "1Hour",
+                    "1m" | "3m" => "1Day",
+                    _ => {
+                        return Err(EvidenceAdapterError::Transport(
+                            "invalid observer QQQ range".to_owned(),
+                        ));
+                    }
+                };
+                Ok(format!(
+                "/v2/stocks/QQQ/bars?timeframe={timeframe}&limit=1000&adjustment=all&start={start}"
+            ))
+            }
             _ => Err(EvidenceAdapterError::Transport(
                 "Alpaca resource is not allowlisted".to_owned(),
             )),
@@ -227,6 +258,7 @@ impl AlpacaPaperEvidenceTransport {
         resource == "paper.quotes"
             || resource.starts_with("quote:")
             || resource.starts_with("bars:")
+            || resource.starts_with("observer.qqq_history:")
     }
 
     pub(super) fn configured_path_for(
@@ -408,15 +440,17 @@ impl ModelNativeWebEvidenceTransport {
         }
         let request = ModelRequest {
             instructions: "Use only the Rust-approved native web tool. Return verifiable citations for every material fact.".to_owned(),
-            input: serde_json::json!({
-                "source_family": source.as_str(),
-                "research_intent": resource,
-            })
-            .to_string(),
-            schema_name: None,
-            schema: None,
+            input: ModelInput::Fresh {
+                text: serde_json::json!({
+                    "source_family": source.as_str(),
+                    "research_intent": resource,
+                })
+                .to_string(),
+            },
             max_output_tokens: 2_000,
             tools: vec![self.policy.tool_definition()],
+            tool_choice: ModelToolChoice::Auto,
+            fixture_key: None,
         };
         let response = self
             .client

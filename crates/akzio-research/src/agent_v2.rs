@@ -1,14 +1,18 @@
 //! Contract-driven Agent runtime for the v2 system.
 
+use akzio_domain::{AttemptId, RunId, TaskId};
+use akzio_model::ModelStreamEvent;
+use std::sync::Arc;
 use std::{
     collections::{BTreeMap, BTreeSet},
     time::{Duration as StdDuration, Instant},
 };
+use tokio::sync::broadcast;
 
 use akzio_context::v2::{ContextBroker, ContextError, ContextManifest};
 use akzio_domain::{
     AgentContract, AgentOutputEnvelope, Artifact, ArtifactId, ArtifactKind, ArtifactLifecycle,
-    ArtifactProvenance, ArtifactRef, ContextPolicy, ContractId, ContractPurpose,
+    ArtifactProvenance, ArtifactRef, ContextPolicy, ContractId, ContractPurpose, DecisionDraft,
     DeliberationPolicy, DomainError, FailureDisposition, LifecycleEventType, OutputContract,
     PromptBundle, ReadGrant, ResearchClaim, ResearchCritique, ResearchResolution, RetryPolicy,
     RunPurpose, RuntimeTaskClass, TaskBudget, TaskRecipe, TaskRecipeId, TaskWritePermit,
@@ -16,8 +20,8 @@ use akzio_domain::{
     V2_SCHEMA_VERSION,
 };
 use akzio_model::{
-    ModelCallTrace, ModelCapabilitySnapshot, ModelClient, ModelError, ModelRequest,
-    ModelToolDefinition,
+    ModelCallTrace, ModelCapabilitySnapshot, ModelClient, ModelContinuation, ModelError,
+    ModelInput, ModelRequest, ModelToolChoice, ModelToolDefinition, ModelToolOutput,
 };
 use akzio_runtime::v2::{RecipeCatalogue, RetryCause, RuntimeError, TerminalRecipeSet};
 use akzio_store::v2::{StoreError, StoredContract, V2Store};
@@ -123,6 +127,8 @@ pub enum ResearchError {
     ToolSourceNotGranted { tool: String, source_family: String },
     #[error("Agent exceeded its Contract tool-call budget")]
     ToolBudgetExceeded,
+    #[error("Agent exceeded its derived provider-call budget")]
+    ModelCallBudgetExceeded,
     #[error("Agent request used {actual} tokens but Contract permits at most {maximum}")]
     InputBudgetExceeded { actual: u32, maximum: u32 },
     #[error("Agent output used {actual} tokens but Contract permits at most {maximum}")]
@@ -131,6 +137,10 @@ pub enum ResearchError {
     WallTimeExceeded { maximum_secs: u32 },
     #[error("Agent completed without a final output")]
     MissingFinalOutput,
+    #[error("Agent submission response is ambiguous")]
+    AmbiguousSubmission,
+    #[error("Agent model refused the task: {0}")]
+    ModelRefused(String),
 }
 
 impl ResearchError {
@@ -158,7 +168,6 @@ fn active_recipe_policy(purpose: &str) -> Option<ActiveRecipePolicy> {
 struct CanonicalContractDefinition {
     purpose: &'static str,
     responsibility: &'static str,
-    prompt: &'static str,
     output_kind: ArtifactKind,
     output_schema: Value,
     permitted_kinds: BTreeSet<ArtifactKind>,
@@ -173,7 +182,6 @@ fn canonical_active_contracts(store: &V2Store) -> ResearchResult<Vec<AgentContra
         CanonicalContractDefinition {
             purpose: PLANNER_RECIPE_ID,
             responsibility: "Lower a bounded research objective into a WorkflowProposalDraft using only installed research recipes and inline EvidenceNeed requests.",
-            prompt: "You are Akzio's bounded research planner. Return only JSON matching the WorkflowProposalDraft schema. You may name only research.analyst and research.synthesizer recipes, and express evidence needs inline. Numeric bounds are strict: priority 0-100, max_age_secs 1-604800, max_results 1-32 (prefer 1-20), at most 4 assets and 7 tasks. window_start and window_end must be null or RFC3339 timestamps; never use natural-language values such as latest. Rust may insert one conditional critic only for the structured-critique candidate topology. Do not construct ArtifactRef values, request sources or tools beyond the contract, submit a decision, or submit an order.",
             output_kind: ArtifactKind::WorkflowProposalDraft,
             output_schema: planner_draft_output_schema(),
             permitted_kinds: BTreeSet::from([
@@ -186,7 +194,7 @@ fn canonical_active_contracts(store: &V2Store) -> ResearchResult<Vec<AgentContra
             budget: TaskBudget {
                 max_input_tokens: 12_000,
                 max_output_tokens: 2_000,
-                max_wall_time_secs: 60,
+                max_wall_time_secs: 120,
                 max_tool_calls: 4,
             },
             termination: TerminationPolicy {
@@ -200,7 +208,6 @@ fn canonical_active_contracts(store: &V2Store) -> ResearchResult<Vec<AgentContra
         CanonicalContractDefinition {
             purpose: "research.analyst",
             responsibility: "Produce evidence-linked, bounded research claims for one shard of the approved workflow.",
-            prompt: "You are Akzio's research analyst. Return only a JSON Claim. Use granted context and read only artifacts named by the ContextManifest. Do not call external systems, widen sources, change topology, submit decisions, or submit orders.",
             output_kind: ArtifactKind::Claim,
             output_schema: claim_output_schema(),
             permitted_kinds: BTreeSet::from([
@@ -211,7 +218,7 @@ fn canonical_active_contracts(store: &V2Store) -> ResearchResult<Vec<AgentContra
             budget: TaskBudget {
                 max_input_tokens: 8_000,
                 max_output_tokens: 1_500,
-                max_wall_time_secs: 60,
+                max_wall_time_secs: 120,
                 max_tool_calls: 4,
             },
             termination: TerminationPolicy {
@@ -225,7 +232,6 @@ fn canonical_active_contracts(store: &V2Store) -> ResearchResult<Vec<AgentContra
         CanonicalContractDefinition {
             purpose: "research.critic",
             responsibility: "Challenge material claims and surface evidence or risk gaps without changing facts or execution authority.",
-            prompt: "You are Akzio's research critic. Return only a JSON Critique. Challenge supplied claims using granted context. Do not invent evidence, widen sources or tools, alter the workflow, produce a decision, or submit an order.",
             output_kind: ArtifactKind::Critique,
             output_schema: critique_output_schema(),
  permitted_kinds: BTreeSet::from([
@@ -237,7 +243,7 @@ fn canonical_active_contracts(store: &V2Store) -> ResearchResult<Vec<AgentContra
             budget: TaskBudget {
                 max_input_tokens: 6_000,
                 max_output_tokens: 1_500,
-                max_wall_time_secs: 45,
+                max_wall_time_secs: 90,
                 max_tool_calls: 2,
             },
             termination: TerminationPolicy {
@@ -251,14 +257,12 @@ fn canonical_active_contracts(store: &V2Store) -> ResearchResult<Vec<AgentContra
         CanonicalContractDefinition {
             purpose: "research.synthesizer",
             responsibility: "Synthesize approved claims and critiques into a DecisionProposal with typed blockers for Rust-owned gates.",
-            prompt: "You are Akzio's research synthesizer. Return only a JSON DecisionProposal matching the supplied schema. Use only artifacts selected by the ContextManifest. Do not change evidence, bypass the DecisionGate, submit an order, or expand any capability.",
             output_kind: ArtifactKind::DecisionProposal,
             output_schema: decision_proposal_output_schema(),
-            permitted_kinds: BTreeSet::from([
+ permitted_kinds: BTreeSet::from([
                 ArtifactKind::Claim,
                 ArtifactKind::Critique,
                 ArtifactKind::Lesson,
-                ArtifactKind::Retrospective,
                 ArtifactKind::Experience,
  ArtifactKind::CandidatePolicy,
  ArtifactKind::NormalizedEvidence,
@@ -269,7 +273,7 @@ fn canonical_active_contracts(store: &V2Store) -> ResearchResult<Vec<AgentContra
             budget: TaskBudget {
                 max_input_tokens: 12_000,
                 max_output_tokens: 2_000,
-                max_wall_time_secs: 60,
+                max_wall_time_secs: 120,
                 max_tool_calls: 2,
             },
             termination: TerminationPolicy::leaf(),
@@ -278,7 +282,6 @@ fn canonical_active_contracts(store: &V2Store) -> ResearchResult<Vec<AgentContra
         CanonicalContractDefinition {
             purpose: OUTCOME_WORKER_RECIPE_ID,
             responsibility: "Produce a bounded retrospective draft from the governed Paper decision and outcome evidence chain.",
-            prompt: "You are Akzio's governed outcome reviewer. Return only a RetrospectiveDraft envelope. Use only the granted decision, execution, outcome schedule, market evidence, deliberation notes, and prior retrospectives. Never emit authoritative returns, calibration, slippage, risk recall, or policy decisions.",
             output_kind: ArtifactKind::RetrospectiveDraft,
             output_schema: retrospective_draft_output_schema(),
             permitted_kinds: BTreeSet::from([
@@ -300,7 +303,7 @@ fn canonical_active_contracts(store: &V2Store) -> ResearchResult<Vec<AgentContra
             budget: TaskBudget {
                 max_input_tokens: 12_000,
                 max_output_tokens: 2_500,
-                max_wall_time_secs: 90,
+                max_wall_time_secs: 180,
                 max_tool_calls: 2,
             },
             termination: TerminationPolicy::leaf(),
@@ -316,19 +319,20 @@ fn canonical_active_contract(
     store: &V2Store,
     definition: CanonicalContractDefinition,
 ) -> ResearchResult<AgentContract> {
+    let base_prompt = two_phase_role_prompt(definition.purpose)?;
     let role_prompt = match definition.purpose {
         "research.synthesizer" => format!(
             "{}\n\nAlways return exactly 12 forecasts: one for each executable asset (TQQQ, QQQ, SOXX, SOXL) at each horizon (t1, t3, t5), even when the proposal is blocked; for blocked proposals use neutral zero forecasts and explain the blocker in hard_blockers and summary. In deliberation.basis_artifact_ids and result references, use only artifact IDs that appear as top-level selections in the current ContextManifest; do not copy nested evidence IDs unless they are also selected. Preserve each selected artifact's exact kind: use claim only for claim refs, critique only for critique refs, and normalized_evidence or semantic_detail only when that exact kind is selected. ContextManifest deliberation_note selections may appear in basis_artifact_ids but must not be relabeled as result claims, critiques, or evidence.",
-            definition.prompt
+            base_prompt
         ),
         "research.analyst" => format!(
             "{}\n\nKeep evidence_gaps to at most 2 items; combine overlapping limitations into concise, evidence-grounded gaps. Preserve the exact artifact kind shown in ContextManifest selections; do not relabel normalized_evidence as semantic_detail or vice versa.",
-            definition.prompt
+            base_prompt
         ),
-        _ => definition.prompt.to_owned(),
+        _ => base_prompt,
     };
     let role_prompt = format!(
-        "{role_prompt}\n\nUse at most 8 evidence-relevant IDs in deliberation.basis_artifact_ids. When the output schema contains applied_learning_refs and rejected_learning_refs, list only top-level ContextManifest learning artifacts: applied_learning_refs are lessons or experiences you actually relied on, rejected_learning_refs are reviewed learning artifacts you intentionally did not apply, and both arrays must be empty when no learning artifact was used. Never invent or copy nested artifact IDs."
+        "{role_prompt}\n\nUse at most 3 alternatives and at most 3 uncertainties. Use at most 8 evidence-relevant IDs in deliberation.basis_artifact_ids. Provide one alternative_match_ppm value for each alternative. Provide one uncertainty_weight_ppm value for each uncertainty; those weights must sum exactly to 1000000 - confidence_ppm. Use empty score arrays when the corresponding text array is empty. These scores are model-assessed metadata, not observed market facts."
     );
     let prompt = PromptBundle {
         version: ACTIVE_PROMPT_BUNDLE_VERSION,
@@ -368,10 +372,22 @@ fn canonical_active_contract(
     Ok(contract)
 }
 
+fn two_phase_role_prompt(purpose: &str) -> ResearchResult<String> {
+    let prompt = match purpose {
+        PLANNER_RECIPE_ID => "You are Akzio's bounded research planner. In Draft, explain the bounded workflow, required evidence, dependencies, and uncertainty. In Submit, produce WorkflowProposalDraft through submit_result. You may name only research.analyst and research.synthesizer recipes and express evidence needs inline. Numeric bounds are strict: priority 0-100, max_age_secs 1-604800, max_results 1-32, at most 4 assets and 7 tasks. window_start and window_end must be null or RFC3339 timestamps. Do not construct ArtifactRef values, widen capabilities, submit a decision, or submit an order.",
+        "research.analyst" => "You are Akzio's research analyst. In Draft, write an evidence-grounded memo covering the claim, support, counter-evidence, gaps, and uncertainty. In Submit, produce Claim through submit_result. Use only granted context artifacts. Do not call external systems, widen sources, change topology, submit decisions, or submit orders.",
+        "research.critic" => "You are Akzio's research critic. In Draft, write a concise critique memo covering counter-evidence, unsupported assumptions, gaps, and uncertainty. In Submit, produce Critique through submit_result. Challenge supplied claims using granted context. Do not invent evidence, widen sources or tools, alter workflow, produce a decision, or submit an order.",
+        "research.synthesizer" => "You are Akzio's research synthesizer. In Draft, write a decision memo reconciling claims, critiques, blockers, alternatives, and uncertainty. In Submit, produce DecisionProposal through submit_result. Use only artifacts selected by ContextManifest. Do not change evidence, bypass DecisionGate, submit an order, or expand any capability.",
+        OUTCOME_WORKER_RECIPE_ID => "You are Akzio's governed outcome reviewer. In Draft, write a bounded retrospective memo from granted decision, execution, outcomes, market evidence, deliberation notes, and prior retrospectives. In Submit, produce RetrospectiveDraft through submit_result. Never emit authoritative returns, calibration, slippage, risk recall, or policy decisions.",
+        _ => return Err(ResearchError::UnexpectedActiveContractPurpose(purpose.to_owned())),
+    };
+    Ok(prompt.to_owned())
+}
+
 fn governed_context_sources() -> BTreeSet<String> {
     GOVERNED_EVIDENCE_SOURCE_FAMILIES
         .into_iter()
-        .chain(["akzio.agent", "akzio.operator", "akzio.learning"])
+        .chain(["akzio.agent", "akzio.operator"])
         .map(str::to_owned)
         .collect()
 }
@@ -406,6 +422,7 @@ fn active_retry_policy() -> RetryPolicy {
 }
 
 fn research_output_source_refs(
+    store: &V2Store,
     kind: ArtifactKind,
     output: &Value,
     manifest: &ContextManifest,
@@ -463,6 +480,98 @@ fn research_output_source_refs(
             refs.dedup();
             refs
         }
+        ArtifactKind::DecisionProposal => {
+            let proposal: DecisionDraft =
+                serde_json::from_value(output.clone()).map_err(|error| {
+                    ResearchError::InvalidOutput(format!(
+                        "invalid DecisionProposal payload: {error}"
+                    ))
+                })?;
+            proposal
+                .validate()
+                .map_err(|error| ResearchError::InvalidOutput(error.to_string()))?;
+
+            let selected = manifest
+                .payload
+                .selections
+                .iter()
+                .map(|selection| selection.artifact.clone())
+                .collect::<BTreeSet<_>>();
+            let selected_claims = selected
+                .iter()
+                .filter(|reference| reference.kind == ArtifactKind::Claim)
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            let selected_critiques = selected
+                .iter()
+                .filter(|reference| reference.kind == ArtifactKind::Critique)
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            let submitted_claims = proposal.claims.iter().cloned().collect::<BTreeSet<_>>();
+            let submitted_critiques = proposal.critiques.iter().cloned().collect::<BTreeSet<_>>();
+
+            if submitted_claims.is_empty()
+                && (!selected_claims.is_empty() || !proposal.evidence.is_empty())
+            {
+                return Err(ResearchError::InvalidOutput(
+                    "DecisionProposal dropped all claims selected by ContextManifest".to_owned(),
+                ));
+            }
+            if !selected_claims.is_subset(&submitted_claims) {
+                return Err(ResearchError::InvalidOutput(
+                    "DecisionProposal claims do not close over ContextManifest".to_owned(),
+                ));
+            }
+            if !selected_critiques.is_subset(&submitted_critiques) {
+                return Err(ResearchError::InvalidOutput(
+                    "DecisionProposal critiques do not close over ContextManifest".to_owned(),
+                ));
+            }
+
+            let declared_evidence = proposal.evidence.iter().cloned().collect::<BTreeSet<_>>();
+            let mut refs = proposal
+                .claims
+                .iter()
+                .chain(proposal.critiques.iter())
+                .chain(proposal.evidence.iter())
+                .cloned()
+                .collect::<Vec<_>>();
+
+            for reference in proposal.claims.iter().chain(proposal.critiques.iter()) {
+                let artifact = store.artifact(&reference.artifact_id)?;
+                let payload = store.read_blob(&artifact.blob)?;
+                let source_refs = match reference.kind {
+                    ArtifactKind::Claim => {
+                        let claim: ResearchClaim = serde_json::from_slice(&payload)?;
+                        claim
+                            .validate()
+                            .map_err(|error| ResearchError::InvalidOutput(error.to_string()))?;
+                        claim.source_refs()
+                    }
+                    ArtifactKind::Critique => {
+                        let critique: ResearchCritique = serde_json::from_slice(&payload)?;
+                        critique
+                            .validate()
+                            .map_err(|error| ResearchError::InvalidOutput(error.to_string()))?;
+                        critique.source_refs()
+                    }
+                    _ => unreachable!("DecisionProposal references are schema-bounded"),
+                };
+                if source_refs
+                    .iter()
+                    .any(|source| !declared_evidence.contains(source))
+                {
+                    return Err(ResearchError::InvalidOutput(
+                        "DecisionProposal evidence does not close over claim/critique grounds"
+                            .to_owned(),
+                    ));
+                }
+                refs.extend(source_refs);
+            }
+            refs.sort();
+            refs.dedup();
+            refs
+        }
         _ => return Ok(vec![]),
     };
     let selected = manifest
@@ -501,16 +610,27 @@ fn rust_terminal_recipes() -> ResearchResult<(Vec<TaskRecipe>, TerminalRecipeSet
 }
 
 fn rust_gate_recipe(recipe_id: &str, task_class: RuntimeTaskClass) -> ResearchResult<TaskRecipe> {
-    let retry = if task_class == RuntimeTaskClass::Evidence {
-        RetryPolicy {
+    let retry = match task_class {
+        RuntimeTaskClass::Evidence => RetryPolicy {
             max_attempts: 5,
             initial_backoff_ms: 1_000,
             retry_transport: true,
             retry_rate_limited: true,
             retry_invalid_output: false,
-        }
+        },
+        RuntimeTaskClass::ExecutionGate => RetryPolicy {
+            max_attempts: 2,
+            initial_backoff_ms: 1_000,
+            retry_transport: true,
+            retry_rate_limited: true,
+            retry_invalid_output: false,
+        },
+        _ => RetryPolicy::none(),
+    };
+    let max_wall_time_secs = if task_class == RuntimeTaskClass::ExecutionGate {
+        90
     } else {
-        RetryPolicy::none()
+        30
     };
     Ok(TaskRecipe {
         recipe_id: TaskRecipeId::new(recipe_id)?,
@@ -524,7 +644,7 @@ fn rust_gate_recipe(recipe_id: &str, task_class: RuntimeTaskClass) -> ResearchRe
         budget: TaskBudget {
             max_input_tokens: 1,
             max_output_tokens: 1,
-            max_wall_time_secs: 30,
+            max_wall_time_secs,
             max_tool_calls: 0,
         },
         retry,
@@ -539,18 +659,42 @@ pub struct AgentToolCall {
     pub arguments: Value,
 }
 
+pub const TERMINAL_SUBMISSION_TOOL: &str = "submit_result";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentTurnPhase {
+    Draft,
+    Submit,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentTerminalDefinition {
+    pub description: String,
+    pub input_schema: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentTerminalSubmission {
+    pub call_id: String,
+    pub arguments: Value,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentModelRequest {
     pub contract_hash: akzio_domain::ContentHash,
     pub purpose: String,
+    pub phase: AgentTurnPhase,
     pub prompt: String,
     pub objective: String,
     pub manifest_artifact_id: ArtifactId,
     pub context: Vec<Value>,
-    pub prior_tool_results: Vec<Value>,
-    pub output_schema: Value,
+    pub continuation: Option<ModelContinuation>,
+    pub tool_outputs: Vec<ModelToolOutput>,
+    pub continuation_instruction: Option<String>,
     pub max_output_tokens: u32,
     pub tools: Vec<AgentToolDefinition>,
+    pub terminal: Option<AgentTerminalDefinition>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -562,12 +706,70 @@ pub struct AgentToolDefinition {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentTurnTelemetry {
+    pub latency_millis: u64,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentModelTurn {
-    pub output: Option<Value>,
+    pub assistant_text: Option<String>,
     pub tool_calls: Vec<AgentToolCall>,
+    pub terminal_submission: Option<AgentTerminalSubmission>,
+    pub continuation: ModelContinuation,
+    pub telemetry: Option<AgentTurnTelemetry>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_debug: Option<ModelCallTrace>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+#[allow(clippy::enum_variant_names)]
+pub enum AgentReasoningEvent {
+    ReasoningStart {
+        run_id: RunId,
+        task_id: TaskId,
+        attempt_id: AttemptId,
+        purpose: String,
+        turn: u16,
+    },
+    ReasoningDelta {
+        run_id: RunId,
+        task_id: TaskId,
+        attempt_id: AttemptId,
+        purpose: String,
+        turn: u16,
+        delta: String,
+    },
+    ReasoningEnd {
+        run_id: RunId,
+        task_id: TaskId,
+        attempt_id: AttemptId,
+        purpose: String,
+        turn: u16,
+    },
+}
+
+impl AgentReasoningEvent {
+    pub fn event_name(&self) -> &'static str {
+        match self {
+            Self::ReasoningStart { .. } => "reasoning-start",
+            Self::ReasoningDelta { .. } => "reasoning-delta",
+            Self::ReasoningEnd { .. } => "reasoning-end",
+        }
+    }
+
+    pub fn run_id(&self) -> &RunId {
+        match self {
+            Self::ReasoningStart { run_id, .. }
+            | Self::ReasoningDelta { run_id, .. }
+            | Self::ReasoningEnd { run_id, .. } => run_id,
+        }
+    }
+}
+
+type ModelEventSink = Arc<dyn Fn(ModelStreamEvent) + Send + Sync>;
 
 #[derive(Debug, Clone, PartialEq)]
 struct ToolResult {
@@ -591,16 +793,29 @@ pub trait AgentModel: Send + Sync {
         ModelCapabilitySnapshot::unknown()
     }
 
+    fn response_language(&self) -> Option<&str> {
+        None
+    }
+
     fn turn<'a>(
         &'a self,
         request: AgentModelRequest,
     ) -> BoxFuture<'a, ResearchResult<AgentModelTurn>>;
+
+    fn turn_with_events<'a>(
+        &'a self,
+        request: AgentModelRequest,
+        _on_event: ModelEventSink,
+    ) -> BoxFuture<'a, ResearchResult<AgentModelTurn>> {
+        self.turn(request)
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct ModelClientAdapter {
     client: ModelClient,
     debug: bool,
+    response_language: String,
 }
 
 impl ModelClientAdapter {
@@ -609,7 +824,19 @@ impl ModelClientAdapter {
     }
 
     pub fn with_debug(client: ModelClient, debug: bool) -> Self {
-        Self { client, debug }
+        Self::with_response_language(client, debug, "简体中文")
+    }
+
+    pub fn with_response_language(
+        client: ModelClient,
+        debug: bool,
+        response_language: impl Into<String>,
+    ) -> Self {
+        Self {
+            client,
+            debug,
+            response_language: response_language.into(),
+        }
     }
 }
 
@@ -618,63 +845,127 @@ impl AgentModel for ModelClientAdapter {
         self.client.capability_snapshot()
     }
 
+    fn response_language(&self) -> Option<&str> {
+        Some(&self.response_language)
+    }
+
     fn turn<'a>(
         &'a self,
         request: AgentModelRequest,
     ) -> BoxFuture<'a, ResearchResult<AgentModelTurn>> {
+        self.turn_with_events(request, Arc::new(|_| {}))
+    }
+
+    fn turn_with_events<'a>(
+        &'a self,
+        request: AgentModelRequest,
+        on_event: ModelEventSink,
+    ) -> BoxFuture<'a, ResearchResult<AgentModelTurn>> {
         Box::pin(async move {
+            let terminal_name = request
+                .terminal
+                .as_ref()
+                .map(|_| TERMINAL_SUBMISSION_TOOL.to_owned());
+            let input = match request.continuation {
+                Some(continuation) => ModelInput::Continue {
+                    continuation,
+                    tool_outputs: request.tool_outputs,
+                    instruction: request.continuation_instruction,
+                },
+                None => ModelInput::Fresh {
+                    text: serde_json::to_string(&json!({
+                        "objective": request.objective,
+                        "context_manifest": request.manifest_artifact_id,
+                        "context": request.context,
+                    }))?,
+                },
+            };
+            let mut tools = request
+                .tools
+                .into_iter()
+                .map(|tool| ModelToolDefinition {
+                    name: tool.name,
+                    description: tool.description,
+                    input_schema: tool.input_schema,
+                    strict: tool.strict,
+                })
+                .collect::<Vec<_>>();
+            if let Some(terminal) = request.terminal {
+                tools.push(ModelToolDefinition {
+                    name: TERMINAL_SUBMISSION_TOOL.to_owned(),
+                    description: terminal.description,
+                    input_schema: terminal.input_schema,
+                    strict: true,
+                });
+            }
+            let tool_choice = match terminal_name {
+                Some(name) => ModelToolChoice::RequiredFunction(name),
+                None if tools.is_empty() => ModelToolChoice::None,
+                None => ModelToolChoice::Auto,
+            };
             let request = ModelRequest {
                 instructions: request.prompt,
-                input: serde_json::to_string(&json!({
-                    "objective": request.objective,
-                    "context_manifest": request.manifest_artifact_id,
-                    "context": request.context,
-                    "prior_tool_results": request.prior_tool_results,
-                }))?,
-                schema_name: Some(request.purpose),
-                schema: Some(request.output_schema),
+                input,
                 max_output_tokens: request.max_output_tokens,
-                tools: request
-                    .tools
-                    .into_iter()
-                    .map(|tool| ModelToolDefinition {
-                        name: tool.name,
-                        description: tool.description,
-                        input_schema: tool.input_schema,
-                        strict: tool.strict,
-                    })
-                    .collect(),
+                tools,
+                tool_choice,
+                fixture_key: Some(request.purpose),
             };
             let debug_request = self.debug.then(|| self.client.request_body(&request));
-            let response = self.client.respond(request).await.map_err(|error| {
-                let trace = debug_request.map(|request| ModelCallTrace {
-                    request,
-                    result: model_error_result(&error),
-                });
-                model_client_error(error, trace)
-            })?;
+            let started = Instant::now();
+            let response = self
+                .client
+                .respond_with_events(request, move |event| on_event(event))
+                .await
+                .map_err(|error| {
+                    let trace = debug_request.map(|request| ModelCallTrace {
+                        request,
+                        result: model_error_result(&error),
+                    });
+                    model_client_error(error, trace)
+                })?;
+            let telemetry = AgentTurnTelemetry {
+                latency_millis: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                input_tokens: response
+                    .raw
+                    .pointer("/usage/input_tokens")
+                    .and_then(Value::as_u64),
+                output_tokens: response
+                    .raw
+                    .pointer("/usage/output_tokens")
+                    .and_then(Value::as_u64),
+            };
             let model_debug = self.debug.then(|| ModelCallTrace {
                 request: response.request_body.clone(),
                 result: response.raw.clone(),
             });
-            let output = (!response.output_text.trim().is_empty())
-                .then(|| serde_json::from_str(&response.output_text))
-                .transpose()
-                .map_err(|error| {
-                    model_output_error(format!("model output JSON: {error}"), model_debug.clone())
-                })?;
-            let tool_calls = response
-                .tool_calls
-                .into_iter()
-                .map(|call| AgentToolCall {
-                    call_id: call.call_id,
-                    name: call.name,
-                    arguments: call.arguments,
-                })
-                .collect();
+            let assistant_text = (!response.output_text.trim().is_empty())
+                .then(|| response.output_text.trim().to_owned());
+            let mut terminal_submission = None;
+            let mut tool_calls = Vec::new();
+            for call in response.tool_calls {
+                if call.name == TERMINAL_SUBMISSION_TOOL {
+                    if terminal_submission.is_some() {
+                        return Err(ResearchError::AmbiguousSubmission);
+                    }
+                    terminal_submission = Some(AgentTerminalSubmission {
+                        call_id: call.call_id,
+                        arguments: call.arguments,
+                    });
+                } else {
+                    tool_calls.push(AgentToolCall {
+                        call_id: call.call_id,
+                        name: call.name,
+                        arguments: call.arguments,
+                    });
+                }
+            }
             Ok(AgentModelTurn {
-                output,
+                assistant_text,
                 tool_calls,
+                terminal_submission,
+                continuation: response.continuation,
+                telemetry: Some(telemetry),
                 model_debug,
             })
         })
@@ -687,6 +978,7 @@ pub struct AgentRuntime {
     context: ContextBroker,
     catalogue: ContractCatalogue,
     grant_ttl: Duration,
+    reasoning_events: Option<broadcast::Sender<AgentReasoningEvent>>,
 }
 
 impl AgentRuntime {
@@ -696,7 +988,16 @@ impl AgentRuntime {
             store,
             catalogue,
             grant_ttl,
+            reasoning_events: None,
         }
+    }
+
+    pub fn with_reasoning_events(
+        mut self,
+        reasoning_events: broadcast::Sender<AgentReasoningEvent>,
+    ) -> Self {
+        self.reasoning_events = Some(reasoning_events);
+        self
     }
 
     pub fn catalogue(&self) -> &ContractCatalogue {
@@ -765,7 +1066,10 @@ impl AgentRuntime {
         .map_err(|_| ResearchError::InvalidOutput("governance prompt is not UTF-8".to_owned()))?;
         let role = String::from_utf8(self.store.read_blob(&installed.contract.prompt.role)?)
             .map_err(|_| ResearchError::InvalidOutput("role prompt is not UTF-8".to_owned()))?;
-        let prompt = format!("{governance}\n\n{role}");
+        let response_language = model.response_language().unwrap_or("简体中文").trim();
+        let prompt = format!(
+            "{governance}\n\n{role}\n\nDuring Draft, use granted read tools as needed, then return a concise, auditable research memo in {response_language}. State conclusions, evidence, counter-evidence, and uncertainty without exposing hidden chain-of-thought. During Submit, call submit_result exactly once; keep JSON property names, enum literals, identifiers, symbols, and cited source text unchanged."
+        );
         let output_schema: Value =
             serde_json::from_slice(&self.store.read_blob(&installed.contract.output.schema)?)?;
         let run_purpose = self.store.run_purpose(&permit.run_id)?;
@@ -778,10 +1082,16 @@ impl AgentRuntime {
         } else {
             model_tool_definitions(&self.store, &installed.contract)?
         };
-        let mut tool_results = Vec::new();
+        let mut continuation = None;
+        let mut pending_tool_outputs = Vec::new();
         let mut trace_refs = Vec::new();
         let mut tool_calls = 0_u16;
         let mut model_turn = 0_u16;
+        let mut provider_calls = 0_u32;
+        let max_provider_calls = u32::from(installed.contract.retry.max_attempts)
+            .saturating_mul(u32::from(installed.contract.budget.max_tool_calls) + 3);
+        let mut phase = AgentTurnPhase::Draft;
+        let mut submission_attempts = 0_u8;
         let started = Instant::now();
         let wall_time =
             StdDuration::from_secs(u64::from(installed.contract.budget.max_wall_time_secs));
@@ -794,14 +1104,36 @@ impl AgentRuntime {
             let request = AgentModelRequest {
                 contract_hash: installed.contract.contract_hash.clone(),
                 purpose: installed.contract.purpose.as_str().to_owned(),
+                phase,
                 prompt: prompt.clone(),
                 objective: node.objective.clone(),
                 manifest_artifact_id: manifest.artifact.artifact_id.clone(),
-                context: context.clone(),
-                prior_tool_results: tool_results.clone(),
-                output_schema: output_schema.clone(),
+                context: if continuation.is_none() {
+                    context.clone()
+                } else {
+                    Vec::new()
+                },
+                continuation: continuation.clone(),
+                tool_outputs: pending_tool_outputs.clone(),
+                continuation_instruction: (phase == AgentTurnPhase::Submit
+                    && pending_tool_outputs.is_empty())
+                .then(|| {
+                    "The research memo is complete. Call submit_result exactly once with the final contract output. Do not call any other tool or add assistant text."
+                        .to_owned()
+                }),
                 max_output_tokens: installed.contract.budget.max_output_tokens,
-                tools: tools.clone(),
+                tools: if phase == AgentTurnPhase::Draft {
+                    tools.clone()
+                } else {
+                    Vec::new()
+                },
+                terminal: (phase == AgentTurnPhase::Submit).then(|| AgentTerminalDefinition {
+                    description: format!(
+                        "Submit the final {} contract output for Rust validation. This has no side effects.",
+                        installed.contract.purpose.as_str()
+                    ),
+                    input_schema: output_schema.clone(),
+                }),
             };
             let input_tokens = estimate_tokens(&request)?;
             if input_tokens > installed.contract.budget.max_input_tokens {
@@ -810,7 +1142,7 @@ impl AgentRuntime {
                     maximum: installed.contract.budget.max_input_tokens,
                 });
             }
-            let tool_set_hash = tool_set_hash(&request.tools)?;
+            let tool_set_hash = tool_set_hash(&request)?;
             let mut turn_attempt = 1_u8;
             let (turn, capability_snapshot, capability_snapshot_hash, request_hash) = loop {
                 let capability_snapshot = model.capability_snapshot();
@@ -848,7 +1180,48 @@ impl AgentRuntime {
                     LifecycleEventType::AgentTurnStarted,
                     logical_now(now, started.elapsed()),
                 )?;
-                match model.turn(request.clone()).await {
+                let sender = self.reasoning_events.clone();
+                let run_id = permit.run_id.clone();
+                let task_id = permit.task_id.clone();
+                let attempt_id = permit.attempt_id.clone();
+                let purpose = request.purpose.clone();
+                let on_event: ModelEventSink = Arc::new(move |event| {
+                    let Some(sender) = &sender else {
+                        return;
+                    };
+                    let event = match event {
+                        ModelStreamEvent::ReasoningStart => AgentReasoningEvent::ReasoningStart {
+                            run_id: run_id.clone(),
+                            task_id: task_id.clone(),
+                            attempt_id: attempt_id.clone(),
+                            purpose: purpose.clone(),
+                            turn: model_turn,
+                        },
+                        ModelStreamEvent::ReasoningDelta(delta) => {
+                            AgentReasoningEvent::ReasoningDelta {
+                                run_id: run_id.clone(),
+                                task_id: task_id.clone(),
+                                attempt_id: attempt_id.clone(),
+                                purpose: purpose.clone(),
+                                turn: model_turn,
+                                delta,
+                            }
+                        }
+                        ModelStreamEvent::ReasoningEnd => AgentReasoningEvent::ReasoningEnd {
+                            run_id: run_id.clone(),
+                            task_id: task_id.clone(),
+                            attempt_id: attempt_id.clone(),
+                            purpose: purpose.clone(),
+                            turn: model_turn,
+                        },
+                    };
+                    let _ = sender.send(event);
+                });
+                if provider_calls >= max_provider_calls {
+                    return Err(ResearchError::ModelCallBudgetExceeded);
+                }
+                provider_calls = provider_calls.saturating_add(1);
+                match model.turn_with_events(request.clone(), on_event).await {
                     Ok(turn) => {
                         break (
                             turn,
@@ -952,12 +1325,18 @@ impl AgentRuntime {
                 artifact_id: turn_artifact.artifact_id,
                 kind: ArtifactKind::AgentTurn,
             });
-            if !turn.tool_calls.is_empty() {
+            continuation = Some(turn.continuation.clone());
+            pending_tool_outputs.clear();
+            if phase == AgentTurnPhase::Draft && turn.terminal_submission.is_some() {
+                return Err(ResearchError::AmbiguousSubmission);
+            }
+            if phase == AgentTurnPhase::Draft && !turn.tool_calls.is_empty() {
                 let next = tool_calls.saturating_add(turn.tool_calls.len() as u16);
                 if next > installed.contract.budget.max_tool_calls {
                     return Err(ResearchError::ToolBudgetExceeded);
                 }
                 for call in turn.tool_calls {
+                    let call_id = call.call_id.clone();
                     let tool_result = self.execute_tool(
                         permit,
                         &installed.contract,
@@ -970,33 +1349,90 @@ impl AgentRuntime {
                         artifact_id: tool_result.artifact.artifact_id.clone(),
                         kind: ArtifactKind::ToolResult,
                     });
-                    tool_results.push(tool_result.value);
+                    pending_tool_outputs.push(ModelToolOutput {
+                        call_id,
+                        output: tool_result.value,
+                    });
                 }
                 tool_calls = next;
                 model_turn = model_turn.saturating_add(1);
                 continue;
             }
-            let raw_output = turn.output.ok_or(ResearchError::MissingFinalOutput)?;
-            let output_tokens = estimate_tokens(&raw_output)?;
+            if phase == AgentTurnPhase::Draft {
+                let memo = turn
+                    .assistant_text
+                    .as_deref()
+                    .filter(|text| !text.trim().is_empty())
+                    .ok_or(ResearchError::MissingFinalOutput)?;
+                let output_tokens = estimate_tokens(&memo)?;
+                if output_tokens > installed.contract.budget.max_output_tokens {
+                    return Err(ResearchError::OutputBudgetExceeded {
+                        actual: output_tokens,
+                        maximum: installed.contract.budget.max_output_tokens,
+                    });
+                }
+                phase = AgentTurnPhase::Submit;
+                model_turn = model_turn.saturating_add(1);
+                continue;
+            }
+
+            if !turn.tool_calls.is_empty() || turn.assistant_text.is_some() {
+                return Err(ResearchError::AmbiguousSubmission);
+            }
+            let submission = turn
+                .terminal_submission
+                .ok_or(ResearchError::MissingFinalOutput)?;
+            let output_tokens = estimate_tokens(&submission.arguments)?;
             if output_tokens > installed.contract.budget.max_output_tokens {
                 return Err(ResearchError::OutputBudgetExceeded {
                     actual: output_tokens,
                     maximum: installed.contract.budget.max_output_tokens,
                 });
             }
-            let (output, deliberation_note) = self.extract_deliberation(
-                permit,
-                &installed.contract,
-                &manifest,
-                raw_output,
-                turn_now,
-            )?;
-            validate_output_schema(&self.store, &installed.contract, &output)?;
-            let research_sources = research_output_source_refs(
-                installed.contract.output.artifact_kind,
-                &output,
-                &manifest,
-            )?;
+
+            let validated = (|| {
+                validate_submission_schema(
+                    &self.store,
+                    &installed.contract,
+                    &submission.arguments,
+                )?;
+                let (output, deliberation_note) = self.extract_deliberation(
+                    permit,
+                    &installed.contract,
+                    &manifest,
+                    submission.arguments.clone(),
+                    turn_now,
+                )?;
+                validate_output_schema(&self.store, &installed.contract, &output)?;
+                let research_sources = research_output_source_refs(
+                    &self.store,
+                    installed.contract.output.artifact_kind,
+                    &output,
+                    &manifest,
+                )?;
+                Ok::<_, ResearchError>((output, deliberation_note, research_sources))
+            })();
+
+            let (output, deliberation_note, research_sources) = match validated {
+                Ok(validated) => validated,
+                Err(error @ ResearchError::InvalidOutput(_))
+                    if submission_attempts.saturating_add(1)
+                        < installed.contract.retry.max_attempts =>
+                {
+                    submission_attempts = submission_attempts.saturating_add(1);
+                    pending_tool_outputs.push(ModelToolOutput {
+                        call_id: submission.call_id,
+                        output: json!({
+                            "ok": false,
+                            "error": "invalid_submission",
+                            "message": error.to_string(),
+                        }),
+                    });
+                    model_turn = model_turn.saturating_add(1);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             if let Some(note) = deliberation_note {
                 self.store.write_task_artifact(
                     permit,
@@ -1047,12 +1483,14 @@ impl AgentRuntime {
         if contract.deliberation_policy == DeliberationPolicy::Disabled {
             return Ok((output, None));
         }
-        let envelope: AgentOutputEnvelope = serde_json::from_value(output).map_err(|error| {
-            ResearchError::InvalidOutput(format!("deliberation envelope: {error}"))
-        })?;
+        let mut envelope: AgentOutputEnvelope =
+            serde_json::from_value(output).map_err(|error| {
+                ResearchError::InvalidOutput(format!("deliberation envelope: {error}"))
+            })?;
+        envelope.deliberation.assessment_source = Some("model_assessed".to_owned());
         envelope
             .deliberation
-            .validate()
+            .validate_model_assessment()
             .map_err(|error| ResearchError::InvalidOutput(error.to_string()))?;
 
         let selected = manifest
@@ -1294,6 +1732,9 @@ fn model_error_result(error: &ModelError) -> Value {
                 .unwrap_or_else(|_| Value::String(body.clone())),
         }),
         ModelError::Transport(_) => json!({"error": "transport"}),
+        ModelError::InvalidStream(_) => json!({"error": "invalid_stream"}),
+        ModelError::Refused(message) => json!({"error": "refused", "message": message}),
+        ModelError::Incomplete(reason) => json!({"error": "incomplete", "reason": reason}),
         ModelError::MissingOutput => json!({"error": "missing_output"}),
         ModelError::FixtureExhausted => json!({"error": "fixture_exhausted"}),
         ModelError::NativeWebUnavailable
@@ -1322,6 +1763,9 @@ fn model_client_error(error: ModelError, trace: Option<ModelCallTrace>) -> Resea
         ModelError::EmptyReasoningEffort => {
             ("configuration", "missing reasoning effort".to_owned())
         }
+        ModelError::InvalidStream(_) => ("invalid_output", "invalid response stream".to_owned()),
+        ModelError::Refused(message) => return ResearchError::ModelRefused(message),
+        ModelError::Incomplete(reason) => ("invalid_output", format!("incomplete: {reason}")),
         ModelError::NativeWebUnavailable
         | ModelError::NativeWebToolNotAllowed
         | ModelError::NativeWebArgumentsInvalid
@@ -1345,17 +1789,6 @@ fn model_client_error(error: ModelError, trace: Option<ModelCallTrace>) -> Resea
         "rate_limited" => ResearchError::RateLimited(message),
         "invalid_output" => ResearchError::InvalidOutput(message),
         _ => ResearchError::Model(message),
-    }
-}
-
-fn model_output_error(message: String, trace: Option<ModelCallTrace>) -> ResearchError {
-    match trace {
-        Some(trace) => ResearchError::ModelDebug {
-            error_class: "invalid_output",
-            message,
-            trace,
-        },
-        None => ResearchError::InvalidOutput(message),
     }
 }
 
@@ -1396,6 +1829,171 @@ fn model_error_class(error: &ResearchError) -> &'static str {
         ResearchError::RateLimited(_) => "rate_limited",
         ResearchError::ModelDebug { error_class, .. } => error_class,
         _ => "other",
+    }
+}
+
+#[cfg(test)]
+mod decision_proposal_tests {
+    use super::*;
+
+    fn provenance() -> ArtifactProvenance {
+        ArtifactProvenance {
+            source_family: "fixture".to_owned(),
+            observed_at: None,
+            retrieved_at: Utc::now(),
+            source_uri: None,
+            confidence_ppm: 1_000_000,
+            producer_contract_hash: None,
+        }
+    }
+
+    fn proposal(
+        claims: Vec<ArtifactRef>,
+        evidence: Vec<ArtifactRef>,
+        hard_blockers: Vec<akzio_domain::HardBlocker>,
+    ) -> DecisionDraft {
+        let forecasts = akzio_domain::Asset::EXECUTABLE
+            .into_iter()
+            .flat_map(|asset| {
+                [
+                    akzio_domain::DecisionHorizon::T1,
+                    akzio_domain::DecisionHorizon::T3,
+                    akzio_domain::DecisionHorizon::T5,
+                ]
+                .into_iter()
+                .map(move |horizon| akzio_domain::Forecast {
+                    asset,
+                    horizon,
+                    positive_return_probability_ppm: 500_000,
+                    expected_return_ppm: 0,
+                })
+            })
+            .collect();
+        DecisionDraft {
+            summary: "bounded decision".to_owned(),
+            confidence_ppm: 700_000,
+            forecasts,
+            claims,
+            critiques: Vec::new(),
+            evidence,
+            applied_learning_refs: Vec::new(),
+            rejected_learning_refs: Vec::new(),
+            material_conflicts: Vec::new(),
+            hard_blockers,
+            soft_warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn decision_proposal_requires_claim_and_evidence_closure() {
+        let root = tempfile::tempdir().unwrap();
+        let store = V2Store::open(root.path()).unwrap();
+        let now = Utc::now();
+        let evidence = Artifact::new(
+            ArtifactKind::NormalizedEvidence,
+            store.put_json(&serde_json::json!({"price": 100})).unwrap(),
+            "fixture.evidence",
+            ArtifactLifecycle::RunScoped,
+            provenance(),
+            None,
+            Vec::new(),
+            now,
+        )
+        .unwrap();
+        let evidence_ref = ArtifactRef {
+            artifact_id: evidence.artifact_id.clone(),
+            kind: ArtifactKind::NormalizedEvidence,
+        };
+        let claim_payload = ResearchClaim {
+            schema_version: V2_DOMAIN_SCHEMA_VERSION,
+            topic: "market".to_owned(),
+            statement: "Evidence is neutral.".to_owned(),
+            horizon: akzio_domain::DecisionHorizon::T1,
+            stance: akzio_domain::ClaimStance::Neutral,
+            materiality_ppm: 700_000,
+            confidence_ppm: 700_000,
+            grounds: vec![akzio_domain::EvidenceGround {
+                evidence: evidence_ref.clone(),
+                support: "Observed fixture evidence.".to_owned(),
+            }],
+            evidence_gaps: Vec::new(),
+        };
+        let claim = Artifact::new(
+            ArtifactKind::Claim,
+            store.put_json(&claim_payload).unwrap(),
+            "fixture.claim",
+            ArtifactLifecycle::RunScoped,
+            provenance(),
+            None,
+            claim_payload.source_refs(),
+            now,
+        )
+        .unwrap();
+        let claim_ref = ArtifactRef {
+            artifact_id: claim.artifact_id.clone(),
+            kind: ArtifactKind::Claim,
+        };
+        let contract_hash = akzio_domain::ContentHash::of_bytes(b"contract");
+        let manifest_payload = akzio_domain::ContextManifestPayload {
+            schema_version: V2_SCHEMA_VERSION,
+            contract_hash: contract_hash.clone(),
+            selections: vec![
+                akzio_domain::ContextSelection {
+                    artifact: claim_ref.clone(),
+                    reason: "approved claim".to_owned(),
+                    estimated_tokens: 1,
+                },
+                akzio_domain::ContextSelection {
+                    artifact: evidence_ref.clone(),
+                    reason: "claim ground".to_owned(),
+                    estimated_tokens: 1,
+                },
+            ],
+            total_bytes: 2,
+            estimated_tokens: 2,
+            input_hash: akzio_domain::ContentHash::of_bytes(b"input"),
+        };
+        let manifest_artifact = Artifact::new(
+            ArtifactKind::ContextManifest,
+            store.put_json(&manifest_payload).unwrap(),
+            "fixture.manifest",
+            ArtifactLifecycle::RunScoped,
+            provenance(),
+            None,
+            Vec::new(),
+            now,
+        )
+        .unwrap();
+        let manifest = ContextManifest {
+            artifact: manifest_artifact.clone(),
+            payload: manifest_payload,
+            grant: akzio_domain::ReadGrant {
+                manifest_artifact_id: manifest_artifact.artifact_id.clone(),
+                run_id: RunId::new(),
+                task_id: TaskId::new(),
+                attempt_id: akzio_domain::AttemptId::new(),
+                lease_id: akzio_domain::LeaseId::new(),
+                epoch: 1,
+                contract_hash,
+                readable: BTreeSet::from([claim.artifact_id.clone(), evidence.artifact_id.clone()]),
+                raw_source_closure: BTreeSet::new(),
+                expires_at: now + Duration::hours(1),
+            },
+        };
+
+        let dropped = proposal(
+            Vec::new(),
+            vec![evidence_ref.clone()],
+            vec![akzio_domain::HardBlocker::MissingEvidence],
+        );
+        let dropped_error = research_output_source_refs(
+            &store,
+            ArtifactKind::DecisionProposal,
+            &serde_json::to_value(dropped).unwrap(),
+            &manifest,
+        )
+        .unwrap_err();
+        assert!(dropped_error.to_string().contains("dropped all claims"));
     }
 }
 

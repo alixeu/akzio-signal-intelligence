@@ -42,6 +42,18 @@ cargo run -p akzio-cli -- run cancel <run-id>
 cargo run -p akzio-cli -- run retry <run-id>
 ```
 
+Akzio Observatory 使用单一用户目录保存桌面运行数据：
+
+```text
+~/.akzio/
+├── config.toml       # Core 配置与 API key，权限 0600
+├── store/akzio.sqlite3
+└── logs/core.log
+```
+
+首次启动会从内置模板生成 `config.toml`，并通过 `V2Store` backup 将旧的
+`~/Library/Application Support/Akzio/Store/schema-11` 复制到新 Store；旧目录不会自动删除。
+
 `run submit` 只接受 `debug` 或 `paper-dry-run`。Paper 创建和 Paper retry 只能由带 lease/epoch fencing 的注入 scheduler loop 完成；普通 `daemon serve` 不会从配置构造真实 Paper loop，并对缺少适配器或不合规配置 fail closed。
 
 `run replay` 从耐久事件重建并校验 run snapshot；它是只读诊断，不创建 workflow、memory 或 execution state。`run fixture-debug` 是明确标记的本地 fixture diagnostic，不访问市场、模型或 broker。`store doctor` 是本地 V2Store 完整性诊断；旧 Store Root 会报不兼容错误，不会迁移或读取。

@@ -1,0 +1,31 @@
+[daemon]
+# Overridden at launch with AKZIO_STORE_ROOT so Finder launches never depend
+# on the current working directory.
+store_root = "outputs/akzio-observatory-unused"
+http_addr = "127.0.0.1:7342"
+token_env = "AKZIO_DAEMON_TOKEN"
+observer_token_env = "AKZIO_OBSERVER_TOKEN"
+worker_count = 4
+auto_paper = true
+
+[execution]
+assets = ["TQQQ", "QQQ", "SOXX", "SOXL"]
+market_data_feed = "iex"
+transaction_cost_ppm = 100
+slippage_ppm = 50
+
+[model]
+base_url = "$LLM_GATEWAY_BASE_URL"
+model = "gpt-5.6-luna"
+api_key = "$LLM_GATEWAY_API_KEY"
+reasoning_effort = "low"
+response_language = "简体中文"
+debug = false
+
+# App initialization copies this template to ~/.akzio/config.toml, replaces
+# environment placeholders, and enforces owner-only file permissions.
+[credentials]
+alpaca_api_key = ""
+alpaca_api_secret = ""
+
+[observatory]

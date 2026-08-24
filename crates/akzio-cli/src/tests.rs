@@ -20,7 +20,7 @@ fn write_config(directory: &tempfile::TempDir, daemon: &str, assets: &str) -> Pa
 #[test]
 fn runtime_identity_components_cover_split_modules() {
     let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    for path in PROMPT_COMPONENTS
+    for (path, bytes) in PROMPT_COMPONENTS
         .iter()
         .chain(CONTRACT_COMPONENTS)
         .chain(TOPOLOGY_COMPONENTS)
@@ -29,11 +29,21 @@ fn runtime_identity_components_cover_split_modules() {
             workspace_root.join(path).is_file(),
             "missing runtime identity component {path}"
         );
+        assert!(!bytes.is_empty(), "empty embedded runtime component {path}");
     }
-    assert!(PROMPT_COMPONENTS.contains(&"crates/akzio-research/src/agent_v2/schemas.rs"));
-    assert!(CONTRACT_COMPONENTS.contains(&"crates/akzio-research/src/agent_v2/catalogue.rs"));
-    assert!(TOPOLOGY_COMPONENTS.contains(&"crates/akzio-runtime/src/runtime_v2/planner.rs"));
-    assert!(TOPOLOGY_COMPONENTS.contains(&"crates/akzio-runtime/src/runtime_v2/workflow.rs"));
+    assert!(PROMPT_COMPONENTS
+        .iter()
+        .any(|(path, _)| *path == "crates/akzio-research/src/agent_v2/schemas.rs"));
+    assert!(CONTRACT_COMPONENTS
+        .iter()
+        .any(|(path, _)| *path == "crates/akzio-research/src/agent_v2/catalogue.rs"));
+    assert!(TOPOLOGY_COMPONENTS
+        .iter()
+        .any(|(path, _)| *path == "crates/akzio-runtime/src/runtime_v2/planner.rs"));
+    assert!(TOPOLOGY_COMPONENTS
+        .iter()
+        .any(|(path, _)| *path == "crates/akzio-runtime/src/runtime_v2/workflow.rs"));
+    assert!(source_revision().unwrap().contains('+'));
 }
 
 #[test]
@@ -120,6 +130,164 @@ fn config_reads_local_model_settings() {
     assert_eq!(model.model, "fixture-model");
     assert_eq!(model.reasoning_effort, "high");
     assert!(model.debug);
+}
+
+#[test]
+fn observatory_configuration_and_credentials_live_in_private_toml() {
+    let directory = tempfile::tempdir().unwrap();
+    let template = write_config(
+        &directory,
+        "http_addr='127.0.0.1:7342'",
+        "['TQQQ', 'QQQ', 'SOXX', 'SOXL']",
+    );
+    let mut text = std::fs::read_to_string(&template).unwrap();
+    text.push_str(
+        "[model]\nbase_url='$LLM_GATEWAY_BASE_URL'\nmodel='fixture-model'\napi_key='$LLM_GATEWAY_API_KEY'\nreasoning_effort='low'\nresponse_language='简体中文'\n",
+    );
+    std::fs::write(&template, text).unwrap();
+
+    let home = directory.path().join(".akzio");
+    let config_path = home.join("config.toml");
+    let store_root = home.join("store");
+    handle_observatory_config(
+        &config_path,
+        &ObservatoryConfigCommand::Init {
+            template,
+            store_root: store_root.clone(),
+            legacy_store: None,
+        },
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&config_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    let configuration = ObservatoryEditableConfiguration {
+        llm_base_url: "https://llm.example/v1".to_owned(),
+        llm_api_key: "fixture-llm-key".to_owned(),
+        global_model: "gpt-fixture".to_owned(),
+        global_reasoning_effort: "high".to_owned(),
+        global_response_language: "简体中文".to_owned(),
+        stage_models: BTreeMap::from([(
+            "research.critic".to_owned(),
+            akzio_model::ModelRouteConfig {
+                model: "critic-fixture".to_owned(),
+                reasoning_effort: "medium".to_owned(),
+                response_language: None,
+            },
+        )]),
+        alpaca_api_key: "fixture-alpaca-key".to_owned(),
+        alpaca_api_secret: "fixture-alpaca-secret".to_owned(),
+        fred_api_key: Some("fixture-fred-key".to_owned()),
+        sec_user_agent: Some("Akzio test@example.com".to_owned()),
+    };
+    update_observatory_configuration(&config_path, configuration).unwrap();
+
+    let saved = read_config_file(&config_path).unwrap();
+    let model = saved.model.unwrap();
+    assert_eq!(saved.daemon.store_root, store_root);
+    assert_eq!(model.base_url, "https://llm.example/v1");
+    assert_eq!(model.api_key, "fixture-llm-key");
+    assert_eq!(model.routes["research.critic"].model, "critic-fixture");
+    assert_eq!(
+        saved.observatory.sec_user_agent.as_deref(),
+        Some("Akzio test@example.com")
+    );
+    let rendered = std::fs::read_to_string(config_path).unwrap();
+    assert_eq!(saved.credentials.alpaca_api_key, "fixture-alpaca-key");
+    assert_eq!(saved.credentials.alpaca_api_secret, "fixture-alpaca-secret");
+    assert!(rendered.contains("fixture-llm-key"));
+}
+
+#[test]
+fn config_rejects_unknown_or_empty_model_routes() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = write_config(
+        &directory,
+        "http_addr='127.0.0.1:1'",
+        "['TQQQ', 'QQQ', 'SOXX', 'SOXL']",
+    );
+    let mut text = std::fs::read_to_string(&path).unwrap();
+    text.push_str(
+        "[model]\nbase_url='http://fixture/v1'\nmodel='fixture-model'\napi_key='fixture-key'\n\
+         [model.routes.'research.unknown']\nmodel='route-model'\nreasoning_effort='low'\n",
+    );
+    std::fs::write(&path, text).unwrap();
+
+    let error = load_config(&path).unwrap_err().to_string();
+    assert!(error.contains("unsupported model route research.unknown"));
+
+    let mut text = std::fs::read_to_string(&path).unwrap();
+    text = text.replace("research.unknown", "research.critic");
+    text = text.replace("model='route-model'", "model=''");
+    std::fs::write(&path, text).unwrap();
+    let error = load_config(&path).unwrap_err().to_string();
+    assert!(error.contains("model route research.critic contains an empty value"));
+}
+
+#[test]
+fn runtime_identity_binds_effective_model_routes() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = write_config(
+        &directory,
+        "http_addr='127.0.0.1:1'",
+        "['TQQQ', 'QQQ', 'SOXX', 'SOXL']",
+    );
+    let mut text = std::fs::read_to_string(&path).unwrap();
+    text.push_str(
+        "[model]\nbase_url='http://fixture/v1'\nmodel='fixture-model'\napi_key='fixture-key'\n",
+    );
+    std::fs::write(&path, text).unwrap();
+
+    let mut config = load_config(&path).unwrap();
+    config.execution.market_data_feed = Some(AlpacaMarketDataFeed::Iex);
+    let baseline = runtime_identity_from_config(&config, &path).unwrap();
+    config.model.as_mut().unwrap().routes.insert(
+        "research.critic".to_owned(),
+        akzio_model::ModelRouteConfig {
+            model: "critic-model".to_owned(),
+            reasoning_effort: "high".to_owned(),
+            response_language: Some("简体中文".to_owned()),
+        },
+    );
+    let routed = runtime_identity_from_config(&config, &path).unwrap();
+
+    assert_ne!(baseline.config_hash, routed.config_hash);
+}
+
+#[test]
+fn runtime_identity_redacts_rotated_credentials() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = write_config(
+        &directory,
+        "http_addr='127.0.0.1:1'",
+        "['TQQQ', 'QQQ', 'SOXX', 'SOXL']",
+    );
+    let mut text = std::fs::read_to_string(&path).unwrap();
+    text.push_str(
+        "[model]\nbase_url='http://fixture/v1'\nmodel='fixture-model'\napi_key='first-key'\n",
+    );
+    std::fs::write(&path, &text).unwrap();
+
+    let mut first = load_config(&path).unwrap();
+    first.execution.market_data_feed = Some(AlpacaMarketDataFeed::Iex);
+    let first_identity = runtime_identity_from_config(&first, &path).unwrap();
+
+    std::fs::write(&path, text.replace("first-key", "rotated-key")).unwrap();
+    let mut rotated = load_config(&path).unwrap();
+    rotated.execution.market_data_feed = Some(AlpacaMarketDataFeed::Iex);
+    let rotated_identity = runtime_identity_from_config(&rotated, &path).unwrap();
+
+    assert_eq!(first_identity.config_hash, rotated_identity.config_hash);
 }
 
 #[test]

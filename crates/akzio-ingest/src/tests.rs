@@ -598,6 +598,15 @@ fn alpaca_paper_transport_is_endpoint_and_resource_fenced() {
         AlpacaPaperEvidenceTransport::path_for("bars:QQQ:1d:2026-08-01:6").unwrap(),
         "/v2/stocks/QQQ/bars?timeframe=1Day&limit=6&adjustment=all&start=2026-08-01"
     );
+    assert_eq!(
+        AlpacaPaperEvidenceTransport::path_for("observer.qqq_history:1d:2026-08-20").unwrap(),
+        "/v2/stocks/QQQ/bars?timeframe=5Min&limit=1000&adjustment=all&start=2026-08-20"
+    );
+    assert_eq!(
+        AlpacaPaperEvidenceTransport::path_for("observer.qqq_history:3m:2026-05-12").unwrap(),
+        "/v2/stocks/QQQ/bars?timeframe=1Day&limit=1000&adjustment=all&start=2026-05-12"
+    );
+    assert!(AlpacaPaperEvidenceTransport::path_for("observer.qqq_history:all:2026-05-12").is_err());
     assert!(AlpacaPaperEvidenceTransport::path_for("bars:QQQ:1d:2026-08-01:33").is_err());
     assert!(AlpacaPaperEvidenceTransport::path_for("bars:SPY:1d").is_err());
     assert!(AlpacaPaperEvidenceTransport::path_for("bars:QQQ:5m").is_err());
@@ -676,6 +685,10 @@ fn governed_resource_schema_bounds_sources_windows_and_assets() {
     );
     assert!(GovernedResource::parse(EvidenceSource::Alpaca, "bars:SPY:1d").is_err());
     assert!(GovernedResource::parse(EvidenceSource::Alpaca, "bars:QQQ:5m").is_err());
+    assert!(
+        GovernedResource::parse(EvidenceSource::Alpaca, "observer.qqq_history:1d:2026-08-20")
+            .is_err()
+    );
     assert!(
         GovernedResource::parse(EvidenceSource::Fred, "series:DFII10:2026-08-01:2028-08-01")
             .is_err()

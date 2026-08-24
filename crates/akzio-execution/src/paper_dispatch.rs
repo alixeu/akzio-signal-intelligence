@@ -69,6 +69,60 @@ pub enum PaperDispatchError {
 
 pub type PaperDispatchResult<T> = std::result::Result<T, PaperDispatchError>;
 
+/// Explicit, opt-in process crash used to verify recovery after the durable
+/// broker effect intent commits and before the first broker request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PaperDispatchFailpoint {
+    #[default]
+    Disabled,
+    ExitAfterEffectIntent,
+}
+
+impl PaperDispatchFailpoint {
+    pub fn from_env() -> Self {
+        Self::from_value(
+            std::env::var("AKZIO_DIAGNOSTIC_CRASH_AFTER_EFFECT_INTENT")
+                .ok()
+                .as_deref(),
+        )
+    }
+
+    fn from_value(value: Option<&str>) -> Self {
+        match value {
+            Some("1") => Self::ExitAfterEffectIntent,
+            _ => Self::Disabled,
+        }
+    }
+
+    fn trigger_after_effect_intent(self) {
+        if matches!(self, Self::ExitAfterEffectIntent) {
+            eprintln!("[akzio-diagnostic] exiting after durable execution.effect.intent (code 86)");
+            std::process::exit(86);
+        }
+    }
+}
+
+#[cfg(test)]
+mod failpoint_tests {
+    use super::PaperDispatchFailpoint;
+
+    #[test]
+    fn failpoint_is_disabled_unless_explicitly_enabled() {
+        assert_eq!(
+            PaperDispatchFailpoint::from_value(None),
+            PaperDispatchFailpoint::Disabled
+        );
+        assert_eq!(
+            PaperDispatchFailpoint::from_value(Some("0")),
+            PaperDispatchFailpoint::Disabled
+        );
+        assert_eq!(
+            PaperDispatchFailpoint::from_value(Some("1")),
+            PaperDispatchFailpoint::ExitAfterEffectIntent
+        );
+    }
+}
+
 /// Dispatches only a persisted commitment, then atomically persists the
 /// resulting receipt/reconciliation artifacts and closes the dispatch task.
 /// If the process dies after broker I/O but before the final Store transaction,
@@ -77,6 +131,7 @@ pub type PaperDispatchResult<T> = std::result::Result<T, PaperDispatchError>;
 pub struct V2PaperDispatchRuntime {
     store: V2Store,
     settlement_timeout: std::time::Duration,
+    failpoint: PaperDispatchFailpoint,
 }
 
 struct CommittedPlanContext {
@@ -90,11 +145,17 @@ impl V2PaperDispatchRuntime {
         Self {
             store,
             settlement_timeout: std::time::Duration::from_secs(15),
+            failpoint: PaperDispatchFailpoint::Disabled,
         }
     }
 
     pub fn with_settlement_timeout(mut self, settlement_timeout: std::time::Duration) -> Self {
         self.settlement_timeout = settlement_timeout;
+        self
+    }
+
+    pub fn with_failpoint(mut self, failpoint: PaperDispatchFailpoint) -> Self {
+        self.failpoint = failpoint;
         self
     }
 
@@ -119,6 +180,7 @@ impl V2PaperDispatchRuntime {
             &input.commitment,
             input.now,
         )?;
+        self.failpoint.trigger_after_effect_intent();
         let submitted = broker.execute_commitment(&commitment, &plan).await?;
         if submitted.plan_hash != commitment.plan_hash {
             return Err(PaperDispatchError::BrokerPlanHashMismatch);

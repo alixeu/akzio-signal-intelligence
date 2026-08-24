@@ -17,13 +17,13 @@ use akzio_domain::{
     ArtifactProvenance, ArtifactRef, Asset, AttemptId, AttemptRelation, BlobRef, CandidatePolicy,
     CandidatePolicyState, ContentHash, ContractId, ContractPurpose, DeliberationSummary,
     DomainError, Evaluation, ExecutionContext, ExecutionPlan, ExecutionVerdict, Experience,
-    FailureDisposition, FreezeState, LeaseId, Lesson, LessonId, LessonLifecycle, LifecycleEventType, OrderReceipt, OrderReceiptState,
-    Outcome, OutcomeExecutionLineage, OutcomeHorizon, OutcomeId, OutcomeSchedule, PaperCommitment,
-    PaperLaunchApproval, PaperReprice, PolicyState, PolicySubject, PolicyTransition,
-    PolicyTransitionId, Reconciliation, Retrospective, RetrospectiveDraft, RetrospectiveStatus,
-    RetryPolicy, RunId, RunPurpose, RuntimeManifest, TaskBudget, TaskId, TaskRecipeId, TaskStatus,
-    TaskWritePermit, WorkflowGraph, WorkflowNode, WorkflowProposal, WorkflowStatus,
-    V2_DOMAIN_SCHEMA_VERSION, V2_SCHEMA_VERSION,
+    FailureDisposition, FreezeState, LeaseId, Lesson, LessonId, LessonLifecycle,
+    LifecycleEventType, OrderReceipt, OrderReceiptState, Outcome, OutcomeExecutionLineage,
+    OutcomeHorizon, OutcomeId, OutcomeSchedule, PaperCommitment, PaperLaunchApproval, PaperReprice,
+    PolicyState, PolicySubject, PolicyTransition, PolicyTransitionId, Reconciliation,
+    Retrospective, RetrospectiveDraft, RetrospectiveStatus, RetryPolicy, RunId, RunPurpose,
+    RuntimeManifest, TaskBudget, TaskId, TaskRecipeId, TaskStatus, TaskWritePermit, WorkflowGraph,
+    WorkflowNode, WorkflowProposal, WorkflowStatus, V2_DOMAIN_SCHEMA_VERSION, V2_SCHEMA_VERSION,
 };
 use chrono::{DateTime, Duration, Utc};
 use rusqlite::{
@@ -156,6 +156,11 @@ pub enum StoreError {
     },
     #[error("contract catalogue activation conflicts for purpose {0:?}")]
     ContractActivationConflict(ContractPurpose),
+    #[error("contract upgrade from {active} is blocked by {blockers}")]
+    ContractUpgradeBlocked {
+        active: ContentHash,
+        blockers: String,
+    },
     #[error("policy head for {0} does not match transition predecessor")]
     PolicyHeadMismatch(String),
     #[error("policy transition {0} conflicts with a prior immutable transition")]
@@ -359,10 +364,15 @@ pub struct TrajectoryEntry {
     pub task_id: Option<TaskId>,
     pub attempt_id: Option<AttemptId>,
     pub turn: Option<u32>,
+    pub phase: Option<String>,
+    pub assistant_text: Option<String>,
     pub event_type: String,
     pub artifact_id: Option<ArtifactId>,
     pub artifact_kind: Option<ArtifactKind>,
     pub model: Option<TrajectoryModelMetadata>,
+    pub latency_millis: Option<u64>,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
     pub tool: Option<TrajectoryToolLifecycle>,
     pub deliberation: Option<DeliberationSummary>,
     pub output_refs: Vec<ArtifactRef>,
@@ -373,8 +383,8 @@ pub struct TrajectoryModelMetadata {
     pub provider_id: Option<String>,
     pub model_id: Option<String>,
     pub reasoning_effort: Option<String>,
-    pub supports_structured_output: Option<bool>,
     pub supports_tool_calls: Option<bool>,
+    pub supports_stateless_continuation: Option<bool>,
     pub native_web_tool: Option<bool>,
     pub streaming: Option<bool>,
     pub declared_context_limit: Option<u32>,
@@ -401,6 +411,27 @@ struct StoredTrajectoryTurn {
     capability_snapshot: Option<TrajectoryModelMetadata>,
     capability_snapshot_hash: Option<ContentHash>,
     tool_set_hash: Option<ContentHash>,
+    request: Option<StoredTrajectoryRequest>,
+    telemetry: Option<StoredTrajectoryTelemetry>,
+    response: Option<StoredTrajectoryResponse>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StoredTrajectoryRequest {
+    phase: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StoredTrajectoryResponse {
+    assistant_text: Option<String>,
+    telemetry: Option<StoredTrajectoryTelemetry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StoredTrajectoryTelemetry {
+    latency_millis: Option<u64>,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -739,6 +770,40 @@ impl V2Store {
         self.connection
             .lock()
             .map_err(|_| StoreError::Integrity("store connection poisoned".to_owned()))
+    }
+
+    pub fn observatory_configuration<T: DeserializeOwned>(&self) -> StoreResult<Option<T>> {
+        let payload = self
+            .connection()?
+            .query_row(
+                "SELECT configuration_json FROM rebuild_observatory_configuration WHERE singleton = 1",
+                [],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?;
+        payload
+            .map(|payload| serde_json::from_slice(&payload))
+            .transpose()
+            .map_err(StoreError::from)
+    }
+
+    pub fn set_observatory_configuration<T: Serialize>(
+        &self,
+        configuration: &T,
+    ) -> StoreResult<()> {
+        let payload = serde_json::to_vec(configuration)?;
+        self.connection()?.execute(
+            "INSERT INTO rebuild_observatory_configuration (singleton, configuration_json) VALUES (1, ?1) ON CONFLICT(singleton) DO UPDATE SET configuration_json = excluded.configuration_json",
+            params![payload],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_observatory_configuration(&self) -> StoreResult<bool> {
+        Ok(self.connection()?.execute(
+            "DELETE FROM rebuild_observatory_configuration WHERE singleton = 1",
+            [],
+        )? > 0)
     }
 
     fn read_all_events(&self, run_id: &RunId) -> StoreResult<Vec<StoredEvent>> {
@@ -1506,6 +1571,28 @@ impl V2Store {
             .transpose()
     }
 
+    /// Return newest immutable artifacts of one kind, newest first.
+    /// Observer callers cannot request an unbounded Store scan.
+    pub fn recent_artifacts_by_kind(
+        &self,
+        kind: ArtifactKind,
+        limit: usize,
+    ) -> StoreResult<Vec<Artifact>> {
+        let connection = self.connection()?;
+        let limit = i64::try_from(limit.clamp(1, 500)).expect("bounded artifact limit fits i64");
+        let mut statement = connection.prepare(
+            "SELECT artifact_id FROM rebuild_artifacts WHERE kind = ?1 ORDER BY created_at DESC, artifact_id DESC LIMIT ?2",
+        )?;
+        let ids = statement
+            .query_map(params![enum_name(kind), limit], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        ids.into_iter()
+            .map(|id| read_artifact(&connection, &ArtifactId(ContentHash::new(id)?)))
+            .collect()
+    }
+
     fn workflow_revision_with_connection(
         &self,
         connection: &Connection,
@@ -1813,10 +1900,15 @@ impl V2Store {
             task_id: event.task_id.clone(),
             attempt_id: event.attempt_id.clone(),
             turn: None,
+            phase: None,
+            assistant_text: None,
             event_type: event.event_type.clone(),
             artifact_id: event.artifact_id.clone(),
             artifact_kind: artifact.map(|value| value.kind),
             model: None,
+            latency_millis: None,
+            input_tokens: None,
+            output_tokens: None,
             tool: None,
             deliberation: None,
             output_refs: Vec::new(),
@@ -1850,7 +1942,20 @@ impl V2Store {
                 model.tool_set_hash = payload.tool_set_hash;
                 let mut entry = base(Some(&artifact));
                 entry.turn = payload.turn;
+                entry.phase = payload.request.and_then(|request| request.phase);
+                entry.assistant_text = payload
+                    .response
+                    .as_ref()
+                    .and_then(|response| response.assistant_text.clone());
                 entry.model = Some(model);
+                let telemetry = payload
+                    .response
+                    .as_ref()
+                    .and_then(|response| response.telemetry.as_ref())
+                    .or(payload.telemetry.as_ref());
+                entry.latency_millis = telemetry.and_then(|telemetry| telemetry.latency_millis);
+                entry.input_tokens = telemetry.and_then(|telemetry| telemetry.input_tokens);
+                entry.output_tokens = telemetry.and_then(|telemetry| telemetry.output_tokens);
                 Ok(Some(entry))
             }
             LifecycleEventType::ToolCalled
@@ -2090,6 +2195,22 @@ impl V2Store {
             }
             match (previous.as_ref(), transition_id) {
                 (None, None) if contract.baseline_contract_hash.is_none() => {}
+                (Some(previous_hash), None) => {
+                    let previous_contract = contracts.get(previous_hash).ok_or_else(|| {
+                        StoreError::Integrity(format!(
+                            "contract activation {activation_id} canonical upgrade has no previous contract"
+                        ))
+                    })?;
+                    if contract.baseline_contract_hash.as_ref() != Some(previous_hash)
+                        || contract.contract.contract_id != previous_contract.contract.contract_id
+                        || contract.contract.version <= previous_contract.contract.version
+                        || !candidate_is_bounded(&previous_contract.contract, &contract.contract)
+                    {
+                        return Err(StoreError::Integrity(format!(
+                            "contract activation {activation_id} is not a valid canonical upgrade"
+                        )));
+                    }
+                }
                 (Some(previous_hash), Some(transition_id)) => {
                     let transition =
                         read_policy_transition(connection, &PolicyTransitionId(transition_id))?
@@ -3274,6 +3395,10 @@ CREATE TABLE IF NOT EXISTS rebuild_shadow_pairs (
     candidate_outcome_artifact_id TEXT NOT NULL REFERENCES rebuild_artifacts(artifact_id),
     completed_at TEXT NOT NULL,
     pair_event_cursor INTEGER NOT NULL UNIQUE REFERENCES rebuild_events(event_id)
+);
+CREATE TABLE IF NOT EXISTS rebuild_observatory_configuration (
+    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+    configuration_json BLOB NOT NULL
 );
 CREATE INDEX IF NOT EXISTS rebuild_tasks_claimable
     ON rebuild_tasks(status, ready_at, priority);

@@ -25,3 +25,8 @@
 # Editor state
 .idea/
 .vscode/
+
+# Akzio Observatory (SwiftUI presentation shell)
+apps/AkzioMac/.build/
+apps/AkzioMac/dist/
+outputs/observatory-shots/

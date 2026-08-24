@@ -3,9 +3,10 @@
 use super::*;
 
 pub(super) fn materialize_fixture(mut raw: Value, request: &ModelRequest) -> Value {
-    let evidence_id = fixture_context_artifact_id(&request.input, "normalized_evidence")
-        .or_else(|| fixture_context_artifact_id(&request.input, "semantic_detail"));
-    let claim_id = fixture_context_artifact_id(&request.input, "claim");
+    let input = fixture_input(request).unwrap_or_default();
+    let evidence_id = fixture_context_artifact_id(&input, "normalized_evidence")
+        .or_else(|| fixture_context_artifact_id(&input, "semantic_detail"));
+    let claim_id = fixture_context_artifact_id(&input, "claim");
     if evidence_id.is_none() && claim_id.is_none() {
         return raw;
     }
@@ -17,8 +18,28 @@ pub(super) fn materialize_fixture(mut raw: Value, request: &ModelRequest) -> Val
             }
         }
     }
+    if let Some(items) = raw.get_mut("output").and_then(Value::as_array_mut) {
+        for item in items {
+            let Some(Value::String(arguments)) = item.get_mut("arguments") else {
+                continue;
+            };
+            if let Ok(mut value) = serde_json::from_str(arguments) {
+                materialize_fixture_value(&mut value, evidence_id.as_deref(), claim_id.as_deref());
+                if let Ok(text) = serde_json::to_string(&value) {
+                    *arguments = text;
+                }
+            }
+        }
+    }
     materialize_fixture_value(&mut raw, evidence_id.as_deref(), claim_id.as_deref());
     raw
+}
+
+pub(super) fn fixture_input(request: &ModelRequest) -> Option<String> {
+    match &request.input {
+        ModelInput::Fresh { text } => Some(text.clone()),
+        ModelInput::Continue { continuation, .. } => continuation.fixture_input.clone(),
+    }
 }
 
 pub(super) fn fixture_context_artifact_id(input: &str, kind: &str) -> Option<String> {

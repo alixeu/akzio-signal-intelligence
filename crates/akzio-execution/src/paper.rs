@@ -137,8 +137,8 @@ pub trait CommittedPaperBroker: Send + Sync {
 #[path = "paper_dispatch.rs"]
 mod paper_dispatch;
 pub use paper_dispatch::{
-    PaperDispatchError, PaperDispatchInput, PaperDispatchOutput, PaperDispatchResult,
-    PaperRepriceDispatchInput, V2PaperDispatchRuntime,
+    PaperDispatchError, PaperDispatchFailpoint, PaperDispatchInput, PaperDispatchOutput,
+    PaperDispatchResult, PaperRepriceDispatchInput, V2PaperDispatchRuntime,
 };
 fn receipt_state(status: &str) -> PaperDispatchResult<OrderReceiptState> {
     match status.trim().to_ascii_lowercase().as_str() {
@@ -168,6 +168,25 @@ fn receipt_state(status: &str) -> PaperDispatchResult<OrderReceiptState> {
 pub struct MarketClock {
     pub is_open: bool,
     pub session_date: NaiveDate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortfolioHistoryRange {
+    OneDay,
+    OneWeek,
+    OneMonth,
+    ThreeMonths,
+}
+
+impl PortfolioHistoryRange {
+    fn path(self) -> &'static str {
+        match self {
+            Self::OneDay => "/v2/account/portfolio/history?period=1D&timeframe=5Min",
+            Self::OneWeek => "/v2/account/portfolio/history?period=1W&timeframe=1H",
+            Self::OneMonth => "/v2/account/portfolio/history?period=1M&timeframe=1D",
+            Self::ThreeMonths => "/v2/account/portfolio/history?period=3M&timeframe=1D",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -221,6 +240,10 @@ impl AlpacaPaper {
 
     pub async fn positions(&self) -> Result<Value> {
         self.get_json("/v2/positions").await
+    }
+
+    pub async fn portfolio_history(&self, range: PortfolioHistoryRange) -> Result<Value> {
+        self.get_json(range.path()).await
     }
 
     pub async fn market_clock(&self) -> Result<MarketClock> {

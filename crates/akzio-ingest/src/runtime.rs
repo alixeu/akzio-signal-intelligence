@@ -10,7 +10,7 @@ use akzio_domain::{
     Artifact, ArtifactKind, ArtifactLifecycle, ArtifactProvenance, ArtifactRef, Asset, ContentHash,
     DomainError, EvidenceNeed, TaskWritePermit, V2_DOMAIN_SCHEMA_VERSION,
 };
-use akzio_model::{ModelClient, ModelRequest, NativeWebPolicy};
+use akzio_model::{ModelClient, ModelInput, ModelRequest, ModelToolChoice, NativeWebPolicy};
 use akzio_store::v2::{StoreError, V2Store};
 use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc, Weekday};
 use futures::future::BoxFuture;

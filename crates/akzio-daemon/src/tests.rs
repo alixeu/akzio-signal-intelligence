@@ -22,6 +22,8 @@ use akzio_ingest::{
     runtime::EvidenceAdapterError, AcquiredEvidence, AsyncEvidenceAdapter, EvidenceProvenance,
     EvidenceQuality, EvidenceRequest, NormalizedEvidencePayload,
 };
+use akzio_research::AgentModel;
+use akzio_store::v2::AlertSeverity;
 use axum::{
     body::{to_bytes, Body},
     http::{Request, StatusCode},
@@ -35,12 +37,53 @@ fn config(root: PathBuf) -> DaemonConfig {
     DaemonConfig {
         store_root: root,
         http_token: "fixture-token".to_owned(),
+        observer_token: Some("fixture-observer-token".to_owned()),
         worker_count: 1,
         auto_paper: false,
         market_data_feed: Some(AlpacaMarketDataFeed::Iex),
         outcome_cost_model: OutcomeCostModel::default(),
         runtime_identity_hash: None,
     }
+}
+
+#[test]
+fn daemon_selects_the_configured_model_for_each_stage() {
+    let directory = tempdir().unwrap();
+    let daemon = Daemon::open(
+        config(directory.path().to_path_buf()),
+        akzio_model::ModelConfig {
+            base_url: "http://fixture/v1".to_owned(),
+            model: "global-model".to_owned(),
+            api_key: "fixture-key".to_owned(),
+            reasoning_effort: "low".to_owned(),
+            response_language: "English".to_owned(),
+            debug: false,
+            routes: std::collections::BTreeMap::from([(
+                "research.critic".to_owned(),
+                akzio_model::ModelRouteConfig {
+                    model: "critic-model".to_owned(),
+                    reasoning_effort: "high".to_owned(),
+                    response_language: Some("简体中文".to_owned()),
+                },
+            )]),
+        },
+    )
+    .unwrap();
+
+    let global = daemon.model_for("research.planner").capability_snapshot();
+    let critic = daemon.model_for("research.critic").capability_snapshot();
+    assert_eq!(global.model_id, "global-model");
+    assert_eq!(global.reasoning_effort, "low");
+    assert_eq!(critic.model_id, "critic-model");
+    assert_eq!(critic.reasoning_effort, "high");
+    assert_eq!(
+        daemon.model_for("research.planner").response_language(),
+        Some("English")
+    );
+    assert_eq!(
+        daemon.model_for("research.critic").response_language(),
+        Some("简体中文")
+    );
 }
 
 fn install_test_paper_approval(store: &V2Store, session: NaiveDate, now: DateTime<Utc>) {
@@ -188,20 +231,35 @@ fn paper_session_inputs_include_bounded_directional_bars() {
     }
 }
 
-fn response(output: serde_json::Value) -> serde_json::Value {
+fn two_phase_responses(output: serde_json::Value) -> Vec<serde_json::Value> {
     let output = serde_json::json!({
         "result": output,
         "deliberation": {
             "selected_path": "fixture path",
             "alternatives": [],
+            "alternative_match_ppm": [],
             "uncertainties": [],
+            "uncertainty_weight_ppm": [],
             "basis_artifact_ids": [],
-            "confidence_ppm": 500000
+            "confidence_ppm": 1000000
         }
     });
-    serde_json::json!({
-        "output_text": serde_json::to_string(&output).unwrap(),
-    })
+    vec![
+        serde_json::json!({
+            "output": [{
+                "type": "message",
+                "content": [{"type": "output_text", "text": "fixture research memo"}]
+            }]
+        }),
+        serde_json::json!({
+            "output": [{
+                "type": "function_call",
+                "call_id": "fixture-submit",
+                "name": "submit_result",
+                "arguments": serde_json::to_string(&output).unwrap()
+            }]
+        }),
+    ]
 }
 
 fn planner_with_alpaca_need() -> ModelClient {
@@ -226,18 +284,18 @@ fn planner_with_alpaca_need() -> ModelClient {
         )]),
         stop_reason: Some("fixture".to_owned()),
     };
-    ModelClient::FixtureBySchema(BTreeMap::from([
+    ModelClient::fixture_by_purpose(BTreeMap::from([
         (
             "research.planner".to_owned(),
-            response(serde_json::to_value(draft).unwrap()),
+            two_phase_responses(serde_json::to_value(draft).unwrap()),
         ),
         (
             "research.analyst".to_owned(),
-            response(fixture_claim_output()),
+            two_phase_responses(fixture_claim_output()),
         ),
         (
             "research.critic".to_owned(),
-            response(fixture_critique_output()),
+            two_phase_responses(fixture_critique_output()),
         ),
     ]))
 }
@@ -260,7 +318,10 @@ fn paper_proposal() -> WorkflowProposal {
     }
 }
 
-fn accepted_paper_decision(claim: ArtifactRef) -> serde_json::Value {
+fn accepted_paper_decision(
+    claim: ArtifactRef,
+    evidence: Vec<ArtifactRef>,
+) -> Vec<serde_json::Value> {
     let forecasts = Asset::EXECUTABLE
             .into_iter()
             .flat_map(|asset| {
@@ -274,17 +335,51 @@ fn accepted_paper_decision(claim: ArtifactRef) -> serde_json::Value {
                 })
             })
             .collect::<Vec<_>>();
-    response(serde_json::json!({
+    two_phase_responses(serde_json::json!({
         "summary": "fixture accepted Paper decision",
         "confidence_ppm": 900000,
         "forecasts": forecasts,
         "claims": [claim],
         "critiques": [],
-        "evidence": [],
+            "evidence": evidence,
         "material_conflicts": [],
         "hard_blockers": [],
         "soft_warnings": []
     }))
+}
+
+fn blocked_paper_decision() -> Vec<serde_json::Value> {
+    let forecasts = Asset::EXECUTABLE
+        .into_iter()
+        .flat_map(|asset| {
+            ["t1", "t3", "t5"].into_iter().map(move |horizon| {
+                serde_json::json!({
+                    "asset": asset.symbol(),
+                    "horizon": horizon,
+                    "positive_return_probability_ppm": 500000,
+                    "expected_return_ppm": 0,
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    two_phase_responses(serde_json::json!({
+        "summary": "fixture blocked Paper decision",
+        "confidence_ppm": 0,
+        "forecasts": forecasts,
+        "claims": [],
+        "critiques": [],
+        "evidence": [],
+        "material_conflicts": [],
+        "hard_blockers": ["missing_evidence"],
+        "soft_warnings": []
+    }))
+}
+
+fn scheduler_fixture_model_client() -> ModelClient {
+    ModelClient::fixture_by_purpose(BTreeMap::from([(
+        "research.synthesizer".to_owned(),
+        blocked_paper_decision(),
+    )]))
 }
 
 fn scheduler_snapshot_need(
@@ -544,9 +639,9 @@ async fn planner_accepts_a_real_debug_shape_with_one_analyst_task() {
         },
         "stop_reason": "proposal_complete",
     });
-    let model = ModelClient::FixtureBySchema(BTreeMap::from([(
+    let model = ModelClient::fixture_by_purpose(BTreeMap::from([(
         "research.planner".to_owned(),
-        response(planner),
+        two_phase_responses(planner),
     )]));
     let daemon = Daemon::with_model(config(directory.path().to_path_buf()), model).unwrap();
     let run_id = daemon.submit_default(RunPurpose::Debug).unwrap();
@@ -587,7 +682,11 @@ async fn invalid_agent_output_requests_task_retry() {
     let directory = tempdir().unwrap();
     let daemon = Daemon::with_model(
         config(directory.path().to_path_buf()),
-        ModelClient::fixture_sequence([response(serde_json::json!({}))]),
+        ModelClient::fixture_sequence({
+            let mut responses = two_phase_responses(serde_json::json!({}));
+            responses.push(responses[1].clone());
+            responses
+        }),
     )
     .unwrap();
     let run_id = daemon.submit_default(RunPurpose::Debug).unwrap();
@@ -719,7 +818,7 @@ async fn scheduler_owned_paper_run_forwards_no_order_and_schedules_outcome() {
     )]);
     let daemon = Daemon::with_fixture_evidence(
         config(directory.path().to_path_buf()),
-        fixture_model_client(),
+        scheduler_fixture_model_client(),
         fixture_evidence,
     )
     .unwrap();
@@ -911,9 +1010,9 @@ async fn paper_fixture_snapshots_reach_accepted_commit_reconcile_and_outcome_sch
         );
     }
     let execution_evidence = evidence.clone();
-    let responses = Arc::new(Mutex::new(VecDeque::from([response(
+    let responses = Arc::new(Mutex::new(VecDeque::from(two_phase_responses(
         fixture_claim_output(),
-    )])));
+    ))));
     let broker = Arc::new(FakePaperBroker::default());
     let daemon = Daemon::with_fixture_evidence(
         config(directory.path().to_path_buf()),
@@ -1010,13 +1109,15 @@ async fn paper_fixture_snapshots_reach_accepted_commit_reconcile_and_outcome_sch
         .into_iter()
         .find(|artifact| artifact.kind == ArtifactKind::Claim)
         .expect("analyst must emit a Claim");
-    responses
-        .lock()
-        .unwrap()
-        .push_back(accepted_paper_decision(ArtifactRef {
+    let claim_payload: akzio_domain::ResearchClaim =
+        serde_json::from_slice(&daemon.store().read_blob(&claim.blob).unwrap()).unwrap();
+    responses.lock().unwrap().extend(accepted_paper_decision(
+        ArtifactRef {
             artifact_id: claim.artifact_id,
             kind: ArtifactKind::Claim,
-        }));
+        },
+        claim_payload.source_refs(),
+    ));
     assert!(daemon.run_one("accepted-paper-synthesizer").await.unwrap());
     let synthesizer_task = daemon
         .store()
@@ -1190,6 +1291,24 @@ async fn paper_fixture_snapshots_reach_accepted_commit_reconcile_and_outcome_sch
         .unwrap()
         .iter()
         .any(|event| event.event_type == "execution.committed"));
+    let observer = daemon.observer_snapshot().await.unwrap();
+    let observer_outcome = observer.outcome.data.expect("sealed Outcome is observable");
+    assert!(observer_outcome
+        .horizons
+        .iter()
+        .all(|horizon| horizon.window.is_some()));
+    let observer_learning = observer
+        .learning
+        .data
+        .expect("durable learning artifacts are observable");
+    assert!(observer_learning
+        .artifacts
+        .iter()
+        .any(|artifact| artifact.kind == ArtifactKind::Outcome));
+    assert!(observer_learning
+        .artifacts
+        .iter()
+        .any(|artifact| artifact.kind == ArtifactKind::Retrospective));
     daemon.store().verify_integrity().unwrap();
 }
 
@@ -1383,6 +1502,25 @@ fn auto_paper_source_bootstraps_the_first_approved_proposal() {
         proposal.tasks["synthesizer"].recipe_id.as_str(),
         "research.synthesizer"
     );
+    daemon.store().verify_integrity().unwrap();
+}
+
+#[tokio::test]
+async fn auto_paper_source_ignores_a_newer_debug_proposal() {
+    let directory = tempdir().unwrap();
+    let mut daemon_config = config(directory.path().to_path_buf());
+    daemon_config.auto_paper = true;
+    let daemon = Daemon::with_model(daemon_config, fixture_model_client()).unwrap();
+    daemon.submit_default(RunPurpose::Debug).unwrap();
+    assert!(daemon.run_one("debug-proposal-fixture").await.unwrap());
+
+    let proposal = daemon
+        .paper_workflow_source()
+        .proposal("preflight")
+        .unwrap();
+
+    assert_eq!(proposal.topology_id, "active");
+    assert_eq!(proposal.tasks.len(), 2);
     daemon.store().verify_integrity().unwrap();
 }
 
@@ -1654,6 +1792,34 @@ async fn readiness_requires_auth_and_injected_paper_broker() {
 }
 
 #[tokio::test]
+async fn readiness_keeps_historical_failures_observable() {
+    let directory = tempdir().unwrap();
+    let mut daemon_config = config(directory.path().to_path_buf());
+    daemon_config.auto_paper = true;
+    let daemon = Daemon::with_model(
+        daemon_config,
+        ModelClient::fixture_sequence({
+            let mut responses = two_phase_responses(serde_json::json!({}));
+            responses.push(responses[1].clone());
+            responses
+        }),
+    )
+    .unwrap();
+    daemon.submit_default(RunPurpose::Debug).unwrap();
+    assert!(daemon.run_one("failed-run-fixture").await.unwrap());
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(daemon.run_one("failed-run-fixture").await.unwrap());
+    let daemon = daemon.with_paper_broker(Arc::new(FakePaperBroker::default()));
+
+    let health = daemon.health().unwrap();
+    assert!(health
+        .alerts
+        .iter()
+        .any(|alert| matches!(alert.severity, AlertSeverity::Critical)));
+    assert!(daemon.ready().is_ok());
+}
+
+#[tokio::test]
 async fn http_control_auth_cancel_retry_and_freeze_are_governed() {
     let directory = tempdir().unwrap();
     let daemon = Daemon::with_model(
@@ -1795,6 +1961,86 @@ async fn http_control_auth_cancel_retry_and_freeze_are_governed() {
 }
 
 #[tokio::test]
+async fn observer_snapshot_uses_a_separate_read_only_credential() {
+    let directory = tempdir().unwrap();
+    let daemon = Daemon::with_model(
+        config(directory.path().to_path_buf()),
+        fixture_model_client(),
+    )
+    .unwrap();
+    let run_id = daemon.submit_default(RunPurpose::Debug).unwrap();
+
+    let control_token = daemon
+        .router()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/observer/snapshot")
+                .header("x-akzio-observer-token", "fixture-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(control_token.status(), StatusCode::UNAUTHORIZED);
+
+    let response = daemon
+        .router()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/observer/snapshot")
+                .header("x-akzio-observer-token", "fixture-observer-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = serde_json::from_slice::<serde_json::Value>(
+        &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["schema_version"].as_u64(), Some(2));
+    assert!(body["core"]["readiness_ppm"].as_u64().is_some());
+    assert_eq!(body["recent_runs"].as_array().map(Vec::len), Some(1));
+    assert_eq!(body["run_summaries"].as_array().map(Vec::len), Some(1));
+    assert_eq!(body["outcome"]["status"], "pending");
+    assert_eq!(body["recent_runs"][0]["run"]["run_id"], run_id.0);
+    assert_eq!(body["current_run"]["workflow"]["run"]["run_id"], run_id.0);
+    assert_eq!(body["portfolio"]["status"], "unavailable");
+    assert_eq!(body["core"]["approval"]["status"], "missing");
+    assert!(body["event_cursor"].as_i64().unwrap() > 0);
+
+    let run_detail = daemon
+        .router()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/observer/runs/{run_id}"))
+                .header("x-akzio-observer-token", "fixture-observer-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(run_detail.status(), StatusCode::OK);
+
+    let observer_cannot_use_control_api = daemon
+        .router()
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .header("x-akzio-observer-token", "fixture-observer-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        observer_cannot_use_control_api.status(),
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
 async fn http_sse_resumes_from_the_requested_cursor() {
     let directory = tempdir().unwrap();
     let daemon = Daemon::with_model(
@@ -1832,6 +2078,56 @@ async fn http_sse_resumes_from_the_requested_cursor() {
     let frame = String::from_utf8(frame.to_vec()).unwrap();
     assert!(frame.contains(&format!("id: {}", expected.cursor)));
     assert!(frame.contains(&expected.event_type));
+}
+
+#[tokio::test]
+async fn http_sse_forwards_transient_reasoning_events() {
+    let directory = tempdir().unwrap();
+    let daemon = Daemon::with_model(
+        config(directory.path().to_path_buf()),
+        fixture_model_client(),
+    )
+    .unwrap();
+    let run_id = daemon.submit_default(RunPurpose::Debug).unwrap();
+    let after = daemon.store().event_cursor().unwrap();
+    let response = daemon
+        .router()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/runs/{run_id}/events?after={after}"))
+                .header("x-akzio-token", "fixture-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    daemon
+        .reasoning_events
+        .send(AgentReasoningEvent::ReasoningDelta {
+            run_id,
+            task_id: TaskId::new(),
+            attempt_id: akzio_domain::AttemptId::new(),
+            purpose: "research.analyst".to_owned(),
+            turn: 0,
+            delta: "bounded summary".to_owned(),
+        })
+        .unwrap();
+
+    let mut body = response.into_body().into_data_stream();
+    let frame = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            let frame = body.next().await.unwrap().unwrap();
+            let frame = String::from_utf8(frame.to_vec()).unwrap();
+            if frame.contains("event: reasoning-delta") {
+                break frame;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(frame.contains("bounded summary"));
+    assert!(frame.contains("research.analyst"));
 }
 
 #[tokio::test]

@@ -4,14 +4,14 @@ pub(super) fn validate_model_capabilities(
     snapshot: &ModelCapabilitySnapshot,
     request: &AgentModelRequest,
 ) -> ResearchResult<()> {
-    if !request.output_schema.is_null() && !snapshot.supports_structured_output {
+    if !snapshot.supports_stateless_continuation {
         return Err(ResearchError::CapabilityMismatch {
-            capability: "structured_output",
+            capability: "stateless_continuation",
             provider_id: snapshot.provider_id.clone(),
             model_id: snapshot.model_id.clone(),
         });
     }
-    if !request.tools.is_empty() && !snapshot.supports_tool_calls {
+    if (!request.tools.is_empty() || request.terminal.is_some()) && !snapshot.supports_tool_calls {
         return Err(ResearchError::CapabilityMismatch {
             capability: "tool_calls",
             provider_id: snapshot.provider_id.clone(),
@@ -68,6 +68,15 @@ pub(super) fn validate_output_schema(
     Ok(())
 }
 
+pub(super) fn validate_submission_schema(
+    store: &V2Store,
+    contract: &AgentContract,
+    submission: &Value,
+) -> ResearchResult<()> {
+    let schema: Value = serde_json::from_slice(&store.read_blob(&contract.output.schema)?)?;
+    validate_schema_value(submission, &schema, "$").map_err(ResearchError::InvalidOutput)
+}
+
 pub(super) fn value_matches_schema_kind(value: &Value, kind: &str) -> bool {
     match kind {
         "object" => value.is_object(),
@@ -93,6 +102,7 @@ pub(super) fn validate_schema_value(
         if !matches!(
             key.as_str(),
             "type"
+                | "description"
                 | "enum"
                 | "properties"
                 | "required"

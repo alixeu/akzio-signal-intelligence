@@ -2,24 +2,6 @@
 
 use super::*;
 
-pub(super) fn provider_schema_name(name: &str) -> String {
-    let name = name
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '_' | '-') {
-                character
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>();
-    if name.is_empty() {
-        "akzio_output".to_owned()
-    } else {
-        name
-    }
-}
-
 pub(super) fn provider_schema(value: &Value) -> Value {
     match value {
         Value::Object(object) => {

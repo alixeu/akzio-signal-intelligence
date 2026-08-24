@@ -17,8 +17,8 @@ pub use execution_gate::{
     ExecutionGateError, ExecutionGateInput, ExecutionGateOutput, V2ExecutionRuntime,
 };
 pub use paper::{
-    PaperDispatchError, PaperDispatchInput, PaperDispatchOutput, PaperRepriceDispatchInput,
-    V2PaperDispatchRuntime,
+    PaperDispatchError, PaperDispatchFailpoint, PaperDispatchInput, PaperDispatchOutput,
+    PaperRepriceDispatchInput, V2PaperDispatchRuntime,
 };
 pub use paper_commitment::{
     PaperCommitmentError, PaperCommitmentInput, PaperCommitmentOutput, V2PaperCommitmentRuntime,

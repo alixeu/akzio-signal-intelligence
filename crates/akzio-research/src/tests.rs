@@ -18,6 +18,60 @@ use tempfile::tempdir;
 use super::*;
 
 #[test]
+fn deliberation_scores_are_additive_for_old_records_and_validated_for_new_runs() {
+    let old: AgentOutputEnvelope = serde_json::from_value(json!({
+        "result": {},
+        "deliberation": {
+            "selected_path": "hold",
+            "alternatives": ["defer"],
+            "uncertainties": ["market gap"],
+            "basis_artifact_ids": [],
+            "confidence_ppm": 750000
+        }
+    }))
+    .unwrap();
+    assert!(old.deliberation.alternative_match_ppm.is_empty());
+    assert!(old.deliberation.uncertainty_weight_ppm.is_empty());
+    old.deliberation.validate().unwrap();
+
+    let mut legacy_oversized = old.deliberation.clone();
+    legacy_oversized.uncertainties = vec![
+        "market gap".to_owned(),
+        "macro release".to_owned(),
+        "liquidity".to_owned(),
+        "overnight move".to_owned(),
+    ];
+    legacy_oversized.validate().unwrap();
+
+    let mut unscored_new_output = old.deliberation.clone();
+    unscored_new_output.assessment_source = Some("model_assessed".to_owned());
+    assert!(unscored_new_output.validate_model_assessment().is_err());
+    legacy_oversized.assessment_source = Some("model_assessed".to_owned());
+    legacy_oversized.validate().unwrap();
+    assert!(legacy_oversized.validate_model_assessment().is_err());
+
+    let scored: AgentOutputEnvelope = serde_json::from_value(json!({
+        "result": {},
+        "deliberation": {
+            "selected_path": "hold",
+            "alternatives": ["defer"],
+            "alternative_match_ppm": [400000],
+            "uncertainties": ["market gap"],
+            "uncertainty_weight_ppm": [250000],
+            "assessment_source": "model_assessed",
+            "basis_artifact_ids": [],
+            "confidence_ppm": 750000
+        }
+    }))
+    .unwrap();
+    scored.deliberation.validate_model_assessment().unwrap();
+
+    let mut invalid = scored.deliberation;
+    invalid.uncertainty_weight_ppm = vec![249999];
+    assert!(invalid.validate().is_err());
+}
+
+#[test]
 fn missing_model_output_keeps_invalid_output_classification() {
     assert!(matches!(
         model_client_error(ModelError::MissingOutput, None),
@@ -132,13 +186,56 @@ fn fixture_capabilities() -> ModelCapabilitySnapshot {
         provider_id: "fixture".to_owned(),
         model_id: "fixture".to_owned(),
         reasoning_effort: "none".to_owned(),
-        supports_structured_output: true,
         supports_tool_calls: true,
+        supports_stateless_continuation: true,
         native_web_tool: false,
         streaming: Some(false),
         declared_context_limit: None,
         declared_max_output_tokens: None,
         source: "test_declared".to_owned(),
+    }
+}
+
+fn fixture_continuation(label: &str) -> ModelContinuation {
+    ModelContinuation::from_items(vec![json!({
+        "type": "message",
+        "content": [{"type": "output_text", "text": label}],
+    })])
+}
+
+fn draft_turn(text: &str) -> AgentModelTurn {
+    AgentModelTurn {
+        assistant_text: Some(text.to_owned()),
+        tool_calls: vec![],
+        terminal_submission: None,
+        continuation: fixture_continuation(text),
+        telemetry: None,
+        model_debug: None,
+    }
+}
+
+fn tool_turn(call: AgentToolCall) -> AgentModelTurn {
+    AgentModelTurn {
+        assistant_text: None,
+        tool_calls: vec![call],
+        terminal_submission: None,
+        continuation: fixture_continuation("tool call"),
+        telemetry: None,
+        model_debug: None,
+    }
+}
+
+fn submission_turn(output: Value) -> AgentModelTurn {
+    AgentModelTurn {
+        assistant_text: None,
+        tool_calls: vec![],
+        terminal_submission: Some(AgentTerminalSubmission {
+            call_id: "fixture-submit".to_owned(),
+            arguments: output,
+        }),
+        continuation: fixture_continuation("submission"),
+        telemetry: None,
+        model_debug: None,
     }
 }
 
@@ -152,10 +249,16 @@ fn capability_request(output_schema: Value, tools: Vec<AgentToolDefinition>) -> 
             b"capability-manifest",
         )),
         context: vec![],
-        prior_tool_results: vec![],
-        output_schema,
+        phase: AgentTurnPhase::Submit,
+        continuation: Some(ModelContinuation::from_items(vec![])),
+        tool_outputs: vec![],
+        continuation_instruction: Some("submit".to_owned()),
         max_output_tokens: 32,
         tools,
+        terminal: Some(AgentTerminalDefinition {
+            description: "submit".to_owned(),
+            input_schema: output_schema,
+        }),
     }
 }
 
@@ -174,18 +277,18 @@ fn capability_preflight_is_fail_closed_for_unknown_and_missing_features() {
     assert!(matches!(
         validate_model_capabilities(&ModelCapabilitySnapshot::unknown(), &structured_request),
         Err(ResearchError::CapabilityMismatch {
-            capability: "structured_output",
+            capability: "stateless_continuation",
             provider_id,
             model_id,
         }) if provider_id == "unknown" && model_id == "unknown"
     ));
 
-    let mut no_structured = fixture_capabilities();
-    no_structured.supports_structured_output = false;
+    let mut no_continuation = fixture_capabilities();
+    no_continuation.supports_stateless_continuation = false;
     assert!(matches!(
-        validate_model_capabilities(&no_structured, &structured_request),
+        validate_model_capabilities(&no_continuation, &structured_request),
         Err(ResearchError::CapabilityMismatch {
-            capability: "structured_output",
+            capability: "stateless_continuation",
             ..
         })
     ));
@@ -252,7 +355,7 @@ async fn capability_mismatch_is_durable_and_makes_zero_model_calls() {
             )
             .await,
         Err(ResearchError::CapabilityMismatch {
-            capability: "structured_output",
+            capability: "stateless_continuation",
             ..
         })
     ));
@@ -290,7 +393,7 @@ impl AgentModel for CapabilityDriftModel {
         } else {
             let mut snapshot = fixture_capabilities();
             snapshot.model_id = "fixture-drifted".to_owned();
-            snapshot.supports_structured_output = false;
+            snapshot.supports_stateless_continuation = false;
             snapshot
         }
     }
@@ -339,7 +442,7 @@ async fn capability_drift_stops_retry_before_the_second_model_call() {
             )
             .await,
         Err(ResearchError::CapabilityMismatch {
-            capability: "structured_output",
+                capability: "stateless_continuation",
             provider_id,
             model_id,
         }) if provider_id == "fixture" && model_id == "fixture-drifted"
@@ -400,47 +503,47 @@ impl AgentModel for ToolThenOutputModel {
                     },
                 }),
                 1 => {
-                    assert!(request.prior_tool_results.is_empty());
-                    Ok(AgentModelTurn {
-                        output: None,
-                        tool_calls: vec![AgentToolCall {
-                            call_id: "fixture-read-evidence".to_owned(),
-                            name: "read_artifact".to_owned(),
-                            arguments: json!({"artifact_id": self.evidence_id.0.as_str()}),
-                        }],
-                        model_debug: Some(ModelCallTrace {
-                            request: json!({"fixture": "provider-request"}),
-                            result: json!({"fixture": "provider-result"}),
-                        }),
-                    })
+                    assert_eq!(request.phase, AgentTurnPhase::Draft);
+                    assert!(request.tool_outputs.is_empty());
+                    let mut turn = tool_turn(AgentToolCall {
+                        call_id: "fixture-read-evidence".to_owned(),
+                        name: "read_artifact".to_owned(),
+                        arguments: json!({"artifact_id": self.evidence_id.0.as_str()}),
+                    });
+                    turn.model_debug = Some(ModelCallTrace {
+                        request: json!({"fixture": "provider-request"}),
+                        result: json!({"fixture": "provider-result"}),
+                    });
+                    Ok(turn)
                 }
                 2 => {
-                    assert_eq!(request.prior_tool_results.len(), 1);
+                    assert_eq!(request.phase, AgentTurnPhase::Draft);
+                    assert_eq!(request.tool_outputs.len(), 1);
                     assert_eq!(
-                        request.prior_tool_results[0]["value"],
+                        request.tool_outputs[0].output["value"],
                         json!({"price": 100})
                     );
-                    Ok(AgentModelTurn {
-                        output: Some(json!({
-                                    "schema_version": V2_SCHEMA_VERSION,
-                                    "topic": "market_regime",
-                                    "statement": "The selected price evidence supports the stated regime claim.",
-                                    "horizon": "t5",
-                                    "stance": "bullish",
-                                    "materiality_ppm": 800_000,
-                                    "confidence_ppm": 700_000,
-                                    "grounds": [{
-                                        "evidence": {
-                                            "artifact_id": self.evidence_id.0.as_str(),
-                                            "kind": "normalized_evidence"
-                                        },
-                                        "support": "The governed evidence supplied the price used in this claim."
-                                    }],
-                                    "evidence_gaps": []
-                        })),
-                        tool_calls: vec![],
-                        model_debug: None,
-                    })
+                    Ok(draft_turn("fixture evidence supports the claim"))
+                }
+                3 => {
+                    assert_eq!(request.phase, AgentTurnPhase::Submit);
+                    Ok(submission_turn(json!({
+                        "schema_version": V2_SCHEMA_VERSION,
+                                        "topic": "market_regime",
+                                        "statement": "The selected price evidence supports the stated regime claim.",
+                                        "horizon": "t5",
+                                        "stance": "bullish",
+                                        "materiality_ppm": 800_000,
+                                        "confidence_ppm": 700_000,
+                                        "grounds": [{
+                                            "evidence": {
+                                                "artifact_id": self.evidence_id.0.as_str(),
+                                                "kind": "normalized_evidence"
+                                            },
+                                            "support": "The governed evidence supplied the price used in this claim."
+                        }],
+                        "evidence_gaps": []
+                    })))
                 }
                 _ => panic!("runtime requested an unexpected extra model turn"),
             }
@@ -456,9 +559,113 @@ impl AgentModel for FixedModel {
         fixture_capabilities()
     }
 
-    fn turn<'a>(&'a self, _: AgentModelRequest) -> BoxFuture<'a, ResearchResult<AgentModelTurn>> {
-        Box::pin(async move { Ok(self.0.clone()) })
+    fn turn<'a>(
+        &'a self,
+        request: AgentModelRequest,
+    ) -> BoxFuture<'a, ResearchResult<AgentModelTurn>> {
+        Box::pin(async move {
+            if request.phase == AgentTurnPhase::Draft
+                && self.0.terminal_submission.is_some()
+                && self.0.tool_calls.is_empty()
+            {
+                Ok(draft_turn("fixed fixture research memo"))
+            } else {
+                Ok(self.0.clone())
+            }
+        })
     }
+}
+
+#[derive(Debug)]
+struct RepairSubmissionModel {
+    evidence_id: ArtifactId,
+    calls: AtomicU8,
+}
+
+impl AgentModel for RepairSubmissionModel {
+    fn capability_snapshot(&self) -> ModelCapabilitySnapshot {
+        fixture_capabilities()
+    }
+
+    fn turn<'a>(
+        &'a self,
+        request: AgentModelRequest,
+    ) -> BoxFuture<'a, ResearchResult<AgentModelTurn>> {
+        Box::pin(async move {
+            match self.calls.fetch_add(1, Ordering::SeqCst) {
+                0 => {
+                    assert_eq!(request.phase, AgentTurnPhase::Draft);
+                    Ok(draft_turn("fixture memo before repaired submission"))
+                }
+                1 => {
+                    assert_eq!(request.phase, AgentTurnPhase::Submit);
+                    Ok(submission_turn(json!({"summary": 42})))
+                }
+                2 => {
+                    assert_eq!(request.phase, AgentTurnPhase::Submit);
+                    assert_eq!(request.tool_outputs.len(), 1);
+                    assert_eq!(
+                        request.tool_outputs[0].output["error"],
+                        "invalid_submission"
+                    );
+                    Ok(submission_turn(json!({
+                        "schema_version": V2_SCHEMA_VERSION,
+                        "topic": "repaired",
+                        "statement": "The repaired submission uses governed evidence.",
+                        "horizon": "t1",
+                        "stance": "neutral",
+                        "materiality_ppm": 100_000,
+                        "confidence_ppm": 900_000,
+                        "grounds": [{
+                            "evidence": {
+                                "artifact_id": self.evidence_id.0.as_str(),
+                                "kind": "normalized_evidence"
+                            },
+                            "support": "Governed fixture evidence."
+                        }],
+                        "evidence_gaps": []
+                    })))
+                }
+                _ => panic!("unexpected repair fixture turn"),
+            }
+        })
+    }
+}
+
+#[tokio::test]
+async fn invalid_terminal_submission_repairs_once_without_tool_side_effects() {
+    let fixture = fixture_with(|_| {});
+    let model = RepairSubmissionModel {
+        evidence_id: fixture.evidence.artifact_id.clone(),
+        calls: AtomicU8::new(0),
+    };
+    let runtime = AgentRuntime::new(
+        fixture.store.clone(),
+        fixture.catalogue,
+        Duration::minutes(5),
+    );
+    let output = runtime
+        .run(
+            &fixture.claimed.permit,
+            &fixture.claimed.node,
+            [ArtifactRef {
+                artifact_id: fixture.evidence.artifact_id,
+                kind: ArtifactKind::NormalizedEvidence,
+            }],
+            &model,
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(output.kind, ArtifactKind::Claim);
+    assert_eq!(model.calls.load(Ordering::SeqCst), 3);
+    assert!(!fixture
+        .store
+        .events_after(&fixture.claimed.run_id, 0, 100)
+        .unwrap()
+        .iter()
+        .any(|event| event.event_type == LifecycleEventType::ToolCalled.as_str()));
 }
 
 #[derive(Debug)]
@@ -479,28 +686,27 @@ impl AgentModel for ToolCountModel {
         let tool_count = Arc::clone(&self.tool_count);
         let evidence_id = self.evidence_id.clone();
         Box::pin(async move {
-            tool_count.store(request.tools.len() as u8, Ordering::SeqCst);
-            Ok(AgentModelTurn {
-                output: Some(json!({
-                    "schema_version": V2_SCHEMA_VERSION,
-                    "topic": "debug",
-                    "statement": "Debug context is sufficient without a model tool call.",
-                    "horizon": "t1",
-                    "stance": "neutral",
-                    "materiality_ppm": 100_000,
-                    "confidence_ppm": 900_000,
-                    "grounds": [{
-                        "evidence": {
-                            "artifact_id": evidence_id.0.as_str(),
-                            "kind": "normalized_evidence"
-                        },
-                        "support": "The debug fixture is already present in the authorized context."
-                    }],
-                    "evidence_gaps": []
-                })),
-                tool_calls: vec![],
-                model_debug: None,
-            })
+            if request.phase == AgentTurnPhase::Draft {
+                tool_count.store(request.tools.len() as u8, Ordering::SeqCst);
+                return Ok(draft_turn("debug fixture research memo"));
+            }
+            Ok(submission_turn(json!({
+                "schema_version": V2_SCHEMA_VERSION,
+                "topic": "debug",
+                "statement": "Debug context is sufficient without a model tool call.",
+                "horizon": "t1",
+                "stance": "neutral",
+                "materiality_ppm": 100_000,
+                "confidence_ppm": 900_000,
+                "grounds": [{
+                    "evidence": {
+                        "artifact_id": evidence_id.0.as_str(),
+                        "kind": "normalized_evidence"
+                    },
+                    "support": "The debug fixture is already present in the authorized context."
+                }],
+                "evidence_gaps": []
+            })))
         })
     }
 }
@@ -551,15 +757,11 @@ impl AgentModel for DelayedToolModel {
         let evidence_id = self.evidence_id.clone();
         Box::pin(async move {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-            Ok(AgentModelTurn {
-                output: None,
-                tool_calls: vec![AgentToolCall {
-                    call_id: "fixture-expired-grant".to_owned(),
-                    name: "read_artifact".to_owned(),
-                    arguments: json!({"artifact_id": evidence_id.0.as_str()}),
-                }],
-                model_debug: None,
-            })
+            Ok(tool_turn(AgentToolCall {
+                call_id: "fixture-expired-grant".to_owned(),
+                name: "read_artifact".to_owned(),
+                arguments: json!({"artifact_id": evidence_id.0.as_str()}),
+            }))
         })
     }
 }
@@ -575,11 +777,7 @@ impl AgentModel for SlowOutputModel {
     fn turn<'a>(&'a self, _: AgentModelRequest) -> BoxFuture<'a, ResearchResult<AgentModelTurn>> {
         Box::pin(async move {
             tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
-            Ok(AgentModelTurn {
-                output: Some(json!({"summary":"too late"})),
-                tool_calls: vec![],
-                model_debug: None,
-            })
+            Ok(draft_turn("too late"))
         })
     }
 }
@@ -865,8 +1063,16 @@ fn active_catalogue_installs_canonical_contracts_and_bounded_recipes() {
             assert!(recipe.retry.retry_transport);
             assert!(recipe.retry.retry_rate_limited);
             assert!(!recipe.retry.retry_invalid_output);
+        } else if task_class == RuntimeTaskClass::ExecutionGate {
+            assert_eq!(recipe.retry.max_attempts, 2);
+            assert_eq!(recipe.retry.initial_backoff_ms, 1_000);
+            assert!(recipe.retry.retry_transport);
+            assert!(recipe.retry.retry_rate_limited);
+            assert!(!recipe.retry.retry_invalid_output);
+            assert_eq!(recipe.budget.max_wall_time_secs, 90);
         } else {
             assert_eq!(recipe.retry, RetryPolicy::none());
+            assert_eq!(recipe.budget.max_wall_time_secs, 30);
         }
     }
     let worker_recipe = active
@@ -912,6 +1118,40 @@ fn active_catalogue_restores_store_owned_heads_after_restart() {
 
     assert_eq!(actual, expected);
     reopened.verify_integrity().unwrap();
+}
+
+#[test]
+fn active_catalogue_upgrades_an_older_bounded_canonical_version() {
+    let root = tempdir().unwrap();
+    let now = Utc::now();
+    let store = V2Store::open(root.path()).unwrap();
+    let mut older = canonical_active_contracts(&store).unwrap();
+    for contract in &mut older {
+        contract.version = ACTIVE_CONTRACT_VERSION - 1;
+        contract.prompt.version = ACTIVE_PROMPT_BUNDLE_VERSION - 1;
+        contract.contract_hash = contract.expected_hash().unwrap();
+        contract.validate().unwrap();
+        store.install_active_contract(contract, now).unwrap();
+    }
+
+    let upgraded = ActiveResearchCatalogue::install(&store, now + Duration::seconds(1)).unwrap();
+    for installed in upgraded.contracts.contracts() {
+        assert_eq!(installed.contract.version, ACTIVE_CONTRACT_VERSION);
+        assert_eq!(
+            installed.contract.prompt.version,
+            ACTIVE_PROMPT_BUNDLE_VERSION
+        );
+        assert_eq!(
+            store
+                .active_contract(&installed.contract.purpose)
+                .unwrap()
+                .unwrap()
+                .contract
+                .contract_hash,
+            installed.contract.contract_hash
+        );
+    }
+    store.verify_integrity().unwrap();
 }
 
 #[test]
@@ -1189,19 +1429,16 @@ async fn model_client_adapter_debug_trace_retains_the_provider_request_and_resul
         .turn(AgentModelRequest {
             contract_hash: akzio_domain::ContentHash::of_bytes(b"fixture-contract"),
             purpose: "research.analyst".to_owned(),
+            phase: AgentTurnPhase::Draft,
             prompt: "fixture prompt".to_owned(),
             objective: "fixture objective".to_owned(),
             manifest_artifact_id: ArtifactId(akzio_domain::ContentHash::of_bytes(
                 b"fixture-manifest",
             )),
             context: vec![],
-            prior_tool_results: vec![],
-            output_schema: json!({
-                "type": "object",
-                "properties": {"summary": {"type": "string"}},
-                "required": ["summary"],
-                "additionalProperties": false,
-            }),
+            continuation: None,
+            tool_outputs: vec![],
+            continuation_instruction: None,
             max_output_tokens: 32,
             tools: vec![AgentToolDefinition {
                 name: "read_artifact".to_owned(),
@@ -1214,11 +1451,12 @@ async fn model_client_adapter_debug_trace_retains_the_provider_request_and_resul
                 }),
                 strict: true,
             }],
+            terminal: None,
         })
         .await
         .unwrap();
 
-    assert!(response.output.is_none());
+    assert!(response.assistant_text.is_none());
     assert_eq!(response.tool_calls.len(), 1);
     assert_eq!(response.tool_calls[0].name, "read_artifact");
     assert_eq!(
@@ -1227,7 +1465,7 @@ async fn model_client_adapter_debug_trace_retains_the_provider_request_and_resul
     );
     let trace = response.model_debug.expect("debug trace is retained");
     assert_eq!(trace.request["model"], "fixture");
-    assert_eq!(trace.request["text"]["format"]["name"], "research_analyst");
+    assert_eq!(trace.request["tool_choice"], "auto");
     assert_eq!(trace.request["tools"][0]["strict"], true);
     assert_eq!(trace.result["tool_calls"][0]["call_id"], "fixture-tool");
 }
@@ -1309,11 +1547,7 @@ async fn agent_runtime_rejects_a_node_from_another_task() {
         evidence,
     } = fixture_with(|_| {});
     let runtime = AgentRuntime::new(store, catalogue, Duration::minutes(5));
-    let model = FixedModel(AgentModelTurn {
-        output: Some(json!({"summary": "should not run"})),
-        tool_calls: vec![],
-        model_debug: None,
-    });
+    let model = FixedModel(submission_turn(json!({"summary": "should not run"})));
     let mut foreign_node = claimed.node.clone();
     foreign_node.task_id = akzio_domain::TaskId::new();
 
@@ -1373,15 +1607,11 @@ async fn agent_runtime_enforces_tool_source_family_scope() {
         )
         .unwrap();
     let runtime = AgentRuntime::new(store.clone(), catalogue, Duration::minutes(5));
-    let model = FixedModel(AgentModelTurn {
-        output: None,
-        tool_calls: vec![AgentToolCall {
-            call_id: "fixture-news-denied".to_owned(),
-            name: "read_artifact".to_owned(),
-            arguments: json!({"artifact_id": news.artifact_id.0.as_str()}),
-        }],
-        model_debug: None,
-    });
+    let model = FixedModel(tool_turn(AgentToolCall {
+        call_id: "fixture-news-denied".to_owned(),
+        name: "read_artifact".to_owned(),
+        arguments: json!({"artifact_id": news.artifact_id.0.as_str()}),
+    }));
 
     assert!(matches!(
         runtime
@@ -1426,15 +1656,11 @@ async fn agent_runtime_records_invalid_tool_arguments_before_rejecting() {
         evidence,
     } = fixture_with(|_| {});
     let runtime = AgentRuntime::new(store.clone(), catalogue, Duration::minutes(5));
-    let model = FixedModel(AgentModelTurn {
-        output: None,
-        tool_calls: vec![AgentToolCall {
-            call_id: "fixture-invalid-arguments".to_owned(),
-            name: "read_artifact".to_owned(),
-            arguments: json!({"unexpected": true}),
-        }],
-        model_debug: None,
-    });
+    let model = FixedModel(tool_turn(AgentToolCall {
+        call_id: "fixture-invalid-arguments".to_owned(),
+        name: "read_artifact".to_owned(),
+        arguments: json!({"unexpected": true}),
+    }));
 
     assert!(matches!(
         runtime
@@ -1601,7 +1827,7 @@ async fn agent_runtime_records_complete_tool_trace_and_contract_validated_claim(
         store.artifact(&output.artifact_id),
         Err(StoreError::MissingArtifact(id)) if id == output.artifact_id
     ));
-    assert_eq!(model.calls.load(Ordering::SeqCst), 3);
+    assert_eq!(model.calls.load(Ordering::SeqCst), 4);
     assert!(output
         .source_refs
         .iter()
@@ -1697,11 +1923,7 @@ async fn agent_runtime_records_complete_tool_trace_and_contract_validated_claim(
         turn_trace["capability_snapshot_hash"]
     );
 
-    let malformed = FixedModel(AgentModelTurn {
-        output: Some(json!({"summary": 42})),
-        tool_calls: vec![],
-        model_debug: None,
-    });
+    let malformed = FixedModel(submission_turn(json!({"summary": 42})));
     assert!(matches!(
         runtime
             .run(
@@ -1718,36 +1940,34 @@ async fn agent_runtime_records_complete_tool_trace_and_contract_validated_claim(
         Err(ResearchError::InvalidOutput(_))
     ));
 
-    let too_many_basis_ids = FixedModel(AgentModelTurn {
-        output: Some(json!({
-            "result": {
-                "schema_version": V2_SCHEMA_VERSION,
-                "topic": "bounded deliberation",
-                "statement": "The governed evidence supports a bounded neutral claim.",
-                "horizon": "t1",
-                "stance": "neutral",
-                "materiality_ppm": 100_000,
-                "confidence_ppm": 900_000,
-                "grounds": [{
-                    "evidence": {
-                        "artifact_id": evidence.artifact_id.0.as_str(),
-                        "kind": "normalized_evidence"
-                    },
-                    "support": "The governed evidence is selected."
-                }],
-                "evidence_gaps": []
-            },
-            "deliberation": {
-                "selected_path": "Use governed evidence.",
-                "alternatives": [],
-                "uncertainties": [],
-                "basis_artifact_ids": vec![evidence.artifact_id.0.as_str(); 9],
-                "confidence_ppm": 900_000
-            }
-        })),
-        tool_calls: vec![],
-        model_debug: None,
-    });
+    let too_many_basis_ids = FixedModel(submission_turn(json!({
+        "result": {
+            "schema_version": V2_SCHEMA_VERSION,
+            "topic": "bounded deliberation",
+            "statement": "The governed evidence supports a bounded neutral claim.",
+            "horizon": "t1",
+            "stance": "neutral",
+            "materiality_ppm": 100_000,
+            "confidence_ppm": 900_000,
+            "grounds": [{
+                "evidence": {
+                    "artifact_id": evidence.artifact_id.0.as_str(),
+                    "kind": "normalized_evidence"
+                },
+                "support": "The governed evidence is selected."
+            }],
+            "evidence_gaps": []
+        },
+        "deliberation": {
+            "selected_path": "Use governed evidence.",
+            "alternatives": [],
+            "alternative_match_ppm": [],
+            "uncertainties": [],
+            "uncertainty_weight_ppm": [],
+            "basis_artifact_ids": vec![evidence.artifact_id.0.as_str(); 9],
+            "confidence_ppm": 900_000
+        }
+    })));
     let error = runtime
         .run(
             &claimed.permit,
@@ -1766,15 +1986,11 @@ async fn agent_runtime_records_complete_tool_trace_and_contract_validated_claim(
         "{error:?}"
     );
 
-    let denied_tool = FixedModel(AgentModelTurn {
-        output: None,
-        tool_calls: vec![AgentToolCall {
-            call_id: "fixture-denied-raw".to_owned(),
-            name: "read_raw_evidence".to_owned(),
-            arguments: json!({"artifact_id": evidence.artifact_id.0.as_str()}),
-        }],
-        model_debug: None,
-    });
+    let denied_tool = FixedModel(tool_turn(AgentToolCall {
+        call_id: "fixture-denied-raw".to_owned(),
+        name: "read_raw_evidence".to_owned(),
+        arguments: json!({"artifact_id": evidence.artifact_id.0.as_str()}),
+    }));
     assert!(matches!(
         runtime
             .run(
@@ -1792,7 +2008,7 @@ async fn agent_runtime_records_complete_tool_trace_and_contract_validated_claim(
     ));
 
     let over_budget_tools = FixedModel(AgentModelTurn {
-        output: None,
+        assistant_text: None,
         tool_calls: (0..3)
             .map(|index| AgentToolCall {
                 call_id: format!("fixture-over-budget-{index}"),
@@ -1800,6 +2016,9 @@ async fn agent_runtime_records_complete_tool_trace_and_contract_validated_claim(
                 arguments: json!({"artifact_id": evidence.artifact_id.0.as_str()}),
             })
             .collect(),
+        terminal_submission: None,
+        continuation: fixture_continuation("over budget tools"),
+        telemetry: None,
         model_debug: None,
     });
     assert!(matches!(
@@ -1856,11 +2075,7 @@ async fn agent_runtime_enforces_input_and_output_token_budgets() {
         evidence,
     } = fixture_with(|contract| contract.budget.max_input_tokens = 1);
     let runtime = AgentRuntime::new(store.clone(), catalogue, Duration::minutes(5));
-    let output = FixedModel(AgentModelTurn {
-        output: Some(json!({"summary":"source-linked claim"})),
-        tool_calls: vec![],
-        model_debug: None,
-    });
+    let output = FixedModel(submission_turn(json!({"summary":"source-linked claim"})));
     let result = runtime
         .run(
             &claimed.permit,

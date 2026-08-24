@@ -1,9 +1,9 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
+    io::{self, Read},
     net::SocketAddr,
     path::{Path, PathBuf},
-    process::Command as ProcessCommand,
     sync::Arc,
     time::Duration,
 };
@@ -47,6 +47,12 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    ObservatoryConfig {
+        #[arg(long)]
+        config: PathBuf,
+        #[command(subcommand)]
+        command: ObservatoryConfigCommand,
+    },
     Daemon {
         #[command(subcommand)]
         command: DaemonAction,
@@ -63,6 +69,20 @@ enum Command {
         #[command(subcommand)]
         command: StoreCommand,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum ObservatoryConfigCommand {
+    Init {
+        #[arg(long)]
+        template: PathBuf,
+        #[arg(long)]
+        store_root: PathBuf,
+        #[arg(long)]
+        legacy_store: Option<PathBuf>,
+    },
+    Get,
+    Set,
 }
 
 #[derive(Debug, Subcommand)]
@@ -187,6 +207,10 @@ struct Config {
     daemon: DaemonSettings,
     execution: ExecutionSettings,
     model: Option<ModelConfig>,
+    #[serde(default)]
+    credentials: CredentialsSettings,
+    #[serde(default)]
+    observatory: ObservatorySettings,
 }
 
 #[derive(Debug, Deserialize)]
@@ -195,6 +219,7 @@ struct DaemonSettings {
     store_root: PathBuf,
     http_addr: SocketAddr,
     token_env: String,
+    observer_token_env: Option<String>,
     worker_count: Option<usize>,
     auto_paper: Option<bool>,
 }
@@ -208,6 +233,58 @@ struct ExecutionSettings {
     transaction_cost_ppm: u32,
     #[serde(default)]
     slippage_ppm: u32,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ObservatorySettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sec_user_agent: Option<String>,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CredentialsSettings {
+    #[serde(default)]
+    alpaca_api_key: String,
+    #[serde(default)]
+    alpaca_api_secret: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fred_api_key: Option<String>,
+}
+
+impl std::fmt::Debug for CredentialsSettings {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CredentialsSettings")
+            .field("alpaca_api_key", &"<redacted>")
+            .field("alpaca_api_secret", &"<redacted>")
+            .field(
+                "fred_api_key",
+                &self.fred_api_key.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ObservatoryEditableConfiguration {
+    #[serde(rename = "llmBaseURL")]
+    llm_base_url: String,
+    #[serde(rename = "llmAPIKey")]
+    llm_api_key: String,
+    global_model: String,
+    global_reasoning_effort: String,
+    global_response_language: String,
+    stage_models: BTreeMap<String, akzio_model::ModelRouteConfig>,
+    #[serde(rename = "alpacaAPIKey")]
+    alpaca_api_key: String,
+    #[serde(rename = "alpacaAPISecret")]
+    alpaca_api_secret: String,
+    #[serde(rename = "fredAPIKey")]
+    fred_api_key: Option<String>,
+    sec_user_agent: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -225,10 +302,14 @@ use http_client::ControlApiClient;
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    if let Command::ObservatoryConfig { config, command } = &cli.command {
+        return handle_observatory_config(config, command);
+    }
     let config_path = cli.config.clone();
     let config = load_config(&config_path)?;
 
     match cli.command {
+        Command::ObservatoryConfig { .. } => unreachable!("handled before config loading"),
         Command::Daemon {
             command: DaemonAction::Serve,
         } => serve(config, &config_path).await,
@@ -382,6 +463,156 @@ async fn main() -> Result<()> {
     }
 }
 
+fn handle_observatory_config(config_path: &Path, command: &ObservatoryConfigCommand) -> Result<()> {
+    match command {
+        ObservatoryConfigCommand::Init {
+            template,
+            store_root,
+            legacy_store,
+        } => {
+            if config_path.exists() {
+                return print_json(&serde_json::json!({ "created": false }));
+            }
+            if !store_root.exists()
+                && legacy_store
+                    .as_ref()
+                    .is_some_and(|legacy| legacy.join("akzio.sqlite3").is_file())
+            {
+                let legacy = legacy_store.as_ref().expect("checked above");
+                V2Store::open_existing(legacy)?.backup_to(store_root)?;
+                V2Store::open(store_root)?.clear_observatory_configuration()?;
+            }
+            let template_config = read_config_file(template)?;
+            let mut document = read_config_document(template)?;
+            toml_section_mut(&mut document, "daemon")?.insert(
+                "store_root".to_owned(),
+                toml::Value::String(store_root.to_string_lossy().into_owned()),
+            );
+            if let Some(model) = template_config.model.as_ref() {
+                let model_table = toml_section_mut(&mut document, "model")?;
+                model_table.insert(
+                    "base_url".to_owned(),
+                    toml::Value::String(initial_config_value(&model.base_url)),
+                );
+                model_table.insert(
+                    "api_key".to_owned(),
+                    toml::Value::String(initial_config_value(&model.api_key)),
+                );
+            }
+            let credentials = toml_section_mut(&mut document, "credentials")?;
+            credentials.insert(
+                "alpaca_api_key".to_owned(),
+                toml::Value::String(std::env::var("ALPACA_API_KEY").unwrap_or_default()),
+            );
+            credentials.insert(
+                "alpaca_api_secret".to_owned(),
+                toml::Value::String(std::env::var("ALPACA_API_SECRET").unwrap_or_default()),
+            );
+            set_optional_toml_string(
+                credentials,
+                "fred_api_key",
+                std::env::var("FRED_API_KEY").ok(),
+            );
+            set_optional_toml_string(
+                toml_section_mut(&mut document, "observatory")?,
+                "sec_user_agent",
+                std::env::var("SEC_USER_AGENT").ok(),
+            );
+            write_config_file(config_path, &document)?;
+            print_json(&serde_json::json!({ "created": true }))
+        }
+        ObservatoryConfigCommand::Get => {
+            let config = read_config_file(config_path)?;
+            print_json(&editable_observatory_configuration(&config)?)
+        }
+        ObservatoryConfigCommand::Set => {
+            let mut payload = String::new();
+            io::stdin()
+                .read_to_string(&mut payload)
+                .context("read Observatory configuration from stdin")?;
+            let configuration: ObservatoryEditableConfiguration =
+                serde_json::from_str(&payload).context("parse Observatory configuration JSON")?;
+            update_observatory_configuration(config_path, configuration)?;
+            print_json(&serde_json::json!({ "ok": true }))
+        }
+    }
+}
+
+fn editable_observatory_configuration(config: &Config) -> Result<ObservatoryEditableConfiguration> {
+    let model = config
+        .model
+        .as_ref()
+        .context("Observatory configuration requires [model]")?;
+    Ok(ObservatoryEditableConfiguration {
+        llm_base_url: model.base_url.clone(),
+        llm_api_key: model.api_key.clone(),
+        global_model: model.model.clone(),
+        global_reasoning_effort: model.reasoning_effort.clone(),
+        global_response_language: model.response_language.clone(),
+        stage_models: model.routes.clone(),
+        alpaca_api_key: config.credentials.alpaca_api_key.clone(),
+        alpaca_api_secret: config.credentials.alpaca_api_secret.clone(),
+        fred_api_key: config.credentials.fred_api_key.clone(),
+        sec_user_agent: config.observatory.sec_user_agent.clone(),
+    })
+}
+
+fn update_observatory_configuration(
+    config_path: &Path,
+    configuration: ObservatoryEditableConfiguration,
+) -> Result<()> {
+    let config = read_config_file(config_path)?;
+    let current_model = config
+        .model
+        .as_ref()
+        .context("Observatory configuration requires [model]")?;
+    let model = ModelConfig {
+        base_url: configuration.llm_base_url.trim().to_owned(),
+        model: configuration.global_model.trim().to_owned(),
+        api_key: configuration.llm_api_key,
+        reasoning_effort: configuration.global_reasoning_effort.trim().to_owned(),
+        response_language: configuration.global_response_language.trim().to_owned(),
+        debug: current_model.debug,
+        routes: configuration.stage_models,
+    };
+    validate_model_settings(&model)?;
+
+    let mut document = read_config_document(config_path)?;
+    let model_table = toml_section_mut(&mut document, "model")?;
+    model_table.insert("base_url".to_owned(), toml::Value::String(model.base_url));
+    model_table.insert("model".to_owned(), toml::Value::String(model.model));
+    model_table.insert("api_key".to_owned(), toml::Value::String(model.api_key));
+    model_table.insert(
+        "reasoning_effort".to_owned(),
+        toml::Value::String(model.reasoning_effort),
+    );
+    model_table.insert(
+        "response_language".to_owned(),
+        toml::Value::String(model.response_language),
+    );
+    model_table.insert(
+        "routes".to_owned(),
+        toml::Value::try_from(model.routes).context("serialize model routes")?,
+    );
+
+    let credentials = toml_section_mut(&mut document, "credentials")?;
+    credentials.insert(
+        "alpaca_api_key".to_owned(),
+        toml::Value::String(configuration.alpaca_api_key),
+    );
+    credentials.insert(
+        "alpaca_api_secret".to_owned(),
+        toml::Value::String(configuration.alpaca_api_secret),
+    );
+    set_optional_toml_string(credentials, "fred_api_key", configuration.fred_api_key);
+    set_optional_toml_string(
+        toml_section_mut(&mut document, "observatory")?,
+        "sec_user_agent",
+        configuration.sec_user_agent,
+    );
+    write_config_file(config_path, &document)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn approve_paper(
     config: &Config,
@@ -504,40 +735,78 @@ async fn approve_paper(
     }))
 }
 
-fn component_hash(paths: &[&str]) -> Result<ContentHash> {
+type EmbeddedComponent = (&'static str, &'static [u8]);
+
+fn component_hash(components: &[EmbeddedComponent]) -> Result<ContentHash> {
     let mut bytes = Vec::new();
-    for path in paths {
+    for (path, component) in components {
         bytes.extend_from_slice(path.as_bytes());
         bytes.push(0);
-        bytes.extend_from_slice(&fs::read(path).with_context(|| format!("read {path}"))?);
+        bytes.extend_from_slice(component);
         bytes.push(0);
     }
     Ok(ContentHash::of_bytes(&bytes))
 }
 
-const PROMPT_COMPONENTS: &[&str] = &[
-    "crates/akzio-research/src/agent_v2.rs",
-    "crates/akzio-research/src/agent_v2/catalogue.rs",
-    "crates/akzio-research/src/agent_v2/schemas.rs",
-    "crates/akzio-research/src/v2.rs",
+const PROMPT_COMPONENTS: &[EmbeddedComponent] = &[
+    (
+        "crates/akzio-research/src/agent_v2.rs",
+        include_bytes!("../../akzio-research/src/agent_v2.rs"),
+    ),
+    (
+        "crates/akzio-research/src/agent_v2/catalogue.rs",
+        include_bytes!("../../akzio-research/src/agent_v2/catalogue.rs"),
+    ),
+    (
+        "crates/akzio-research/src/agent_v2/schemas.rs",
+        include_bytes!("../../akzio-research/src/agent_v2/schemas.rs"),
+    ),
+    (
+        "crates/akzio-research/src/v2.rs",
+        include_bytes!("../../akzio-research/src/v2.rs"),
+    ),
 ];
 
-const CONTRACT_COMPONENTS: &[&str] = &[
-    "crates/akzio-domain/src/contract.rs",
-    "crates/akzio-research/src/agent_v2.rs",
-    "crates/akzio-research/src/agent_v2/catalogue.rs",
-    "crates/akzio-research/src/agent_v2/schemas.rs",
-    "crates/akzio-research/src/v2.rs",
+const CONTRACT_COMPONENTS: &[EmbeddedComponent] = &[
+    (
+        "crates/akzio-domain/src/contract.rs",
+        include_bytes!("../../akzio-domain/src/contract.rs"),
+    ),
+    PROMPT_COMPONENTS[0],
+    PROMPT_COMPONENTS[1],
+    PROMPT_COMPONENTS[2],
+    PROMPT_COMPONENTS[3],
 ];
 
-const TOPOLOGY_COMPONENTS: &[&str] = &[
-    "crates/akzio-runtime/src/runtime_v2.rs",
-    "crates/akzio-runtime/src/runtime_v2/catalogue.rs",
-    "crates/akzio-runtime/src/runtime_v2/planner.rs",
-    "crates/akzio-runtime/src/runtime_v2/reducer.rs",
-    "crates/akzio-runtime/src/runtime_v2/replay.rs",
-    "crates/akzio-runtime/src/runtime_v2/task.rs",
-    "crates/akzio-runtime/src/runtime_v2/workflow.rs",
+const TOPOLOGY_COMPONENTS: &[EmbeddedComponent] = &[
+    (
+        "crates/akzio-runtime/src/runtime_v2.rs",
+        include_bytes!("../../akzio-runtime/src/runtime_v2.rs"),
+    ),
+    (
+        "crates/akzio-runtime/src/runtime_v2/catalogue.rs",
+        include_bytes!("../../akzio-runtime/src/runtime_v2/catalogue.rs"),
+    ),
+    (
+        "crates/akzio-runtime/src/runtime_v2/planner.rs",
+        include_bytes!("../../akzio-runtime/src/runtime_v2/planner.rs"),
+    ),
+    (
+        "crates/akzio-runtime/src/runtime_v2/reducer.rs",
+        include_bytes!("../../akzio-runtime/src/runtime_v2/reducer.rs"),
+    ),
+    (
+        "crates/akzio-runtime/src/runtime_v2/replay.rs",
+        include_bytes!("../../akzio-runtime/src/runtime_v2/replay.rs"),
+    ),
+    (
+        "crates/akzio-runtime/src/runtime_v2/task.rs",
+        include_bytes!("../../akzio-runtime/src/runtime_v2/task.rs"),
+    ),
+    (
+        "crates/akzio-runtime/src/runtime_v2/workflow.rs",
+        include_bytes!("../../akzio-runtime/src/runtime_v2/workflow.rs"),
+    ),
 ];
 
 fn runtime_identity_from_config(config: &Config, config_path: &Path) -> Result<RuntimeIdentity> {
@@ -557,8 +826,27 @@ fn runtime_identity_from_config(config: &Config, config_path: &Path) -> Result<R
     let evaluation_policy = EvaluationPolicy::default();
     Ok(RuntimeIdentity {
         code_revision: source_revision()?,
-        cargo_lock_hash: ContentHash::of_bytes(&fs::read("Cargo.lock").context("read Cargo.lock")?),
-        config_hash: ContentHash::of_bytes(&fs::read(config_path).context("read config")?),
+        cargo_lock_hash: ContentHash::of_bytes(include_bytes!("../../../Cargo.lock")),
+        config_hash: content_hash_json(&serde_json::json!({
+            "config_file_hash": redacted_config_hash(config_path)?,
+            "daemon": {
+                "http_addr": config.daemon.http_addr.to_string(),
+                "worker_count": config.daemon.worker_count,
+                "auto_paper": config.daemon.auto_paper,
+            },
+            "execution": {
+                "assets": config.execution.assets,
+                "market_data_feed": config.execution.market_data_feed,
+                "transaction_cost_ppm": config.execution.transaction_cost_ppm,
+                "slippage_ppm": config.execution.slippage_ppm,
+            },
+            "model": {
+                "base_url": model.base_url,
+                "model": model.model,
+                "reasoning_effort": model.reasoning_effort,
+                "routes": model.routes,
+            },
+        }))?,
         provider_id,
         model_id: model.model.clone(),
         prompt_hash: component_hash(PROMPT_COMPONENTS)?,
@@ -575,61 +863,220 @@ fn runtime_identity_from_config(config: &Config, config_path: &Path) -> Result<R
     })
 }
 
+fn redacted_config_hash(config_path: &Path) -> Result<ContentHash> {
+    let mut document = read_config_document(config_path)?;
+    if let Some(root) = document.as_table_mut() {
+        root.remove("credentials");
+        if let Some(model) = root.get_mut("model").and_then(toml::Value::as_table_mut) {
+            model.remove("api_key");
+        }
+    }
+    Ok(ContentHash::of_bytes(
+        toml::to_string(&document)
+            .context("serialize redacted v2 TOML")?
+            .as_bytes(),
+    ))
+}
+
 fn source_revision() -> Result<String> {
-    let head = ProcessCommand::new("git")
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .context("run git rev-parse")?;
-    if !head.status.success() {
-        bail!("git rev-parse failed");
-    }
-    let head = String::from_utf8(head.stdout)?.trim().to_owned();
-    let diff = ProcessCommand::new("git")
-        .args(["diff", "--binary", "HEAD", "--"])
-        .output()
-        .context("run git diff")?;
-    if !diff.status.success() {
-        bail!("git diff failed");
-    }
-    let untracked = ProcessCommand::new("git")
-        .args(["ls-files", "--others", "--exclude-standard", "-z"])
-        .output()
-        .context("list untracked files")?;
-    if !untracked.status.success() {
-        bail!("git untracked scan failed");
-    }
-    let mut state = diff.stdout;
-    for path in untracked
-        .stdout
-        .split(|byte| *byte == 0)
-        .filter(|path| !path.is_empty())
+    Ok(env!("AKZIO_SOURCE_REVISION").to_owned())
+}
+
+fn read_config_file(path: &Path) -> Result<Config> {
+    fs::read_to_string(path)
+        .with_context(|| format!("read v2 config {}", path.display()))
+        .and_then(|text| toml::from_str::<Config>(&text).context("parse v2 TOML"))
+}
+
+fn read_config_document(path: &Path) -> Result<toml::Value> {
+    fs::read_to_string(path)
+        .with_context(|| format!("read v2 config {}", path.display()))
+        .and_then(|text| toml::from_str::<toml::Value>(&text).context("parse v2 TOML"))
+}
+
+fn write_config_file(path: &Path, document: &toml::Value) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("Akzio configuration path has no parent directory")?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("create Akzio configuration directory {}", parent.display()))?;
+    #[cfg(unix)]
     {
-        let path = PathBuf::from(String::from_utf8(path.to_vec())?);
-        state.extend_from_slice(path.as_os_str().as_encoded_bytes());
-        state.push(0);
-        state.extend_from_slice(
-            &fs::read(&path).with_context(|| format!("read {}", path.display()))?,
-        );
-        state.push(0);
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).with_context(|| {
+            format!("secure Akzio configuration directory {}", parent.display())
+        })?;
     }
-    if state.is_empty() {
-        Ok(head)
+
+    let temporary = path.with_extension("toml.tmp");
+    let rendered = toml::to_string_pretty(document).context("serialize v2 TOML")?;
+    fs::write(&temporary, rendered)
+        .with_context(|| format!("write Akzio configuration {}", temporary.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("secure Akzio configuration {}", temporary.display()))?;
+    }
+    fs::rename(&temporary, path)
+        .with_context(|| format!("install Akzio configuration {}", path.display()))?;
+    Ok(())
+}
+
+fn toml_section_mut<'a>(
+    document: &'a mut toml::Value,
+    name: &str,
+) -> Result<&'a mut toml::map::Map<String, toml::Value>> {
+    let root = document
+        .as_table_mut()
+        .context("Akzio configuration root must be a TOML table")?;
+    root.entry(name.to_owned())
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+        .as_table_mut()
+        .with_context(|| format!("Akzio configuration [{name}] must be a TOML table"))
+}
+
+fn set_optional_toml_string(
+    table: &mut toml::map::Map<String, toml::Value>,
+    key: &str,
+    value: Option<String>,
+) {
+    if let Some(value) = value
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+    {
+        table.insert(key.to_owned(), toml::Value::String(value));
     } else {
-        Ok(format!("{head}+worktree:{}", ContentHash::of_bytes(&state)))
+        table.remove(key);
     }
 }
 
-fn load_config(path: &PathBuf) -> Result<Config> {
-    let mut config = std::fs::read_to_string(path)
-        .with_context(|| format!("read v2 config {}", path.display()))
-        .and_then(|text| toml::from_str::<Config>(&text).context("parse v2 TOML"))?;
+fn validate_model_settings(model: &ModelConfig) -> Result<()> {
+    if model.base_url.trim().is_empty()
+        || model.model.trim().is_empty()
+        || model.reasoning_effort.trim().is_empty()
+        || model.response_language.trim().is_empty()
+    {
+        bail!("model base_url, model, reasoning_effort, and response_language must be non-empty");
+    }
+    for (purpose, route) in &model.routes {
+        if !matches!(
+            purpose.as_str(),
+            "research.planner"
+                | "research.analyst"
+                | "research.critic"
+                | "research.synthesizer"
+                | "learning.outcome_worker"
+        ) {
+            bail!("unsupported model route {purpose}");
+        }
+        if route.model.trim().is_empty() || route.reasoning_effort.trim().is_empty() {
+            bail!("model route {purpose} contains an empty value");
+        }
+        if route
+            .response_language
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            bail!("model route {purpose} contains empty response_language");
+        }
+    }
+    Ok(())
+}
+
+fn initial_config_value(value: &str) -> String {
+    value
+        .strip_prefix('$')
+        .and_then(|name| std::env::var(name).ok())
+        .unwrap_or_else(|| {
+            if value.starts_with('$') {
+                String::new()
+            } else {
+                value.to_owned()
+            }
+        })
+}
+
+fn apply_config_environment(config: &Config) {
+    for (name, value) in [
+        ("ALPACA_API_KEY", config.credentials.alpaca_api_key.as_str()),
+        (
+            "ALPACA_API_SECRET",
+            config.credentials.alpaca_api_secret.as_str(),
+        ),
+        (
+            "FRED_API_KEY",
+            config
+                .credentials
+                .fred_api_key
+                .as_deref()
+                .unwrap_or_default(),
+        ),
+        (
+            "SEC_USER_AGENT",
+            config
+                .observatory
+                .sec_user_agent
+                .as_deref()
+                .unwrap_or_default(),
+        ),
+    ] {
+        if std::env::var_os(name).is_none() && !value.is_empty() {
+            std::env::set_var(name, value);
+        }
+    }
+}
+
+fn load_config(path: &Path) -> Result<Config> {
+    let mut config = read_config_file(path)?;
     if let Some(model) = config.model.as_mut() {
         model.base_url = resolve_env_placeholder(&model.base_url, "model.base_url")?;
         model.api_key = resolve_env_placeholder(&model.api_key, "model.api_key")?;
+        if let Ok(value) = std::env::var("AKZIO_MODEL") {
+            model.model = value;
+        }
+        if let Ok(value) = std::env::var("AKZIO_REASONING_EFFORT") {
+            model.reasoning_effort = value;
+        }
+        if let Ok(value) = std::env::var("AKZIO_RESPONSE_LANGUAGE") {
+            model.response_language = value;
+        }
+        if let Ok(value) = std::env::var("AKZIO_MODEL_ROUTES_JSON") {
+            model.routes = serde_json::from_str(&value).context("parse AKZIO_MODEL_ROUTES_JSON")?;
+        }
+        if model.model.trim().is_empty()
+            || model.reasoning_effort.trim().is_empty()
+            || model.response_language.trim().is_empty()
+        {
+            bail!("model, reasoning_effort, and response_language must be non-empty");
+        }
+        for (purpose, route) in &model.routes {
+            if !matches!(
+                purpose.as_str(),
+                "research.planner"
+                    | "research.analyst"
+                    | "research.critic"
+                    | "research.synthesizer"
+                    | "learning.outcome_worker"
+            ) {
+                bail!("unsupported model route {purpose}");
+            }
+            if route.model.trim().is_empty() || route.reasoning_effort.trim().is_empty() {
+                bail!("model route {purpose} contains an empty value");
+            }
+            if route
+                .response_language
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty())
+            {
+                bail!("model route {purpose} contains an empty response_language");
+            }
+        }
     }
     if let Some(store_root) = std::env::var_os("AKZIO_STORE_ROOT") {
         config.daemon.store_root = PathBuf::from(store_root);
     }
+    apply_config_environment(&config);
     if !config.daemon.http_addr.ip().is_loopback() {
         bail!("daemon.http_addr must be a loopback address");
     }
@@ -687,6 +1134,18 @@ fn daemon_token(settings: &DaemonSettings) -> Result<String> {
 async fn serve(config: Config, config_path: &Path) -> Result<()> {
     let auto_paper = config.daemon.auto_paper.unwrap_or(false);
     let token = daemon_token(&config.daemon)?;
+    let observer_token = config
+        .daemon
+        .observer_token_env
+        .as_deref()
+        .map(|name| {
+            std::env::var(name)
+                .with_context(|| format!("missing observer token environment variable {name}"))
+        })
+        .transpose()?;
+    if observer_token.as_deref().is_some_and(str::is_empty) {
+        bail!("observer token environment variable must not be empty");
+    }
     let model = config
         .model
         .clone()
@@ -700,6 +1159,7 @@ async fn serve(config: Config, config_path: &Path) -> Result<()> {
         DaemonConfig {
             store_root: config.daemon.store_root,
             http_token: token,
+            observer_token,
             worker_count: config.daemon.worker_count.unwrap_or(4),
             auto_paper,
             market_data_feed: config.execution.market_data_feed,
@@ -727,7 +1187,11 @@ async fn serve(config: Config, config_path: &Path) -> Result<()> {
         .as_ref()
         .map(|paper| AlpacaPaperSessionClock::new(paper.clone()));
     let daemon = match paper {
-        Some(paper) => Arc::new(daemon.with_paper_broker(Arc::new(paper))),
+        Some(paper) => Arc::new(
+            daemon
+                .with_paper_observer(paper.clone())
+                .with_paper_broker(Arc::new(paper)),
+        ),
         None => Arc::new(daemon),
     };
     let http_daemon = daemon.clone();
@@ -763,13 +1227,34 @@ async fn wait_for_shutdown_signal() -> Result<()> {
         tokio::select! {
             result = tokio::signal::ctrl_c() => result.context("wait for Ctrl-C"),
             _ = terminate.recv() => Ok(()),
+            result = wait_for_parent_stdin_eof() => result,
         }
     }
 
     #[cfg(not(unix))]
     {
-        tokio::signal::ctrl_c().await.context("wait for Ctrl-C")
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result.context("wait for Ctrl-C"),
+            result = wait_for_parent_stdin_eof() => result,
+        }
     }
+}
+
+async fn wait_for_parent_stdin_eof() -> Result<()> {
+    if std::env::var_os("AKZIO_EXIT_ON_STDIN_EOF").as_deref() != Some(std::ffi::OsStr::new("1")) {
+        std::future::pending::<()>().await;
+        unreachable!();
+    }
+    use tokio::io::AsyncReadExt;
+    let mut stdin = tokio::io::stdin();
+    let mut byte = [0_u8; 1];
+    while stdin
+        .read(&mut byte)
+        .await
+        .context("wait for parent stdin EOF")?
+        != 0
+    {}
+    Ok(())
 }
 
 async fn fixture_debug(config: Config) -> Result<()> {
@@ -834,6 +1319,7 @@ fn fixture_daemon(config: &Config) -> Result<Daemon> {
         DaemonConfig {
             store_root: config.daemon.store_root.clone(),
             http_token: "fixture-only".to_owned(),
+            observer_token: None,
             worker_count: config.daemon.worker_count.unwrap_or(2),
             auto_paper: false,
             market_data_feed: config.execution.market_data_feed,
