@@ -77,7 +77,7 @@ pub(super) fn paper_snapshot_resources(session_key: &str) -> Vec<String> {
     resources.extend(
         Asset::EXECUTABLE
             .into_iter()
-            .map(|asset| format!("bars:{}:1d:{start}:12", asset.symbol())),
+            .map(|asset| format!("bars:{}:1d:{start}:32", asset.symbol())),
     );
     resources
 }

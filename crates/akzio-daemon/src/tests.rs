@@ -227,7 +227,7 @@ fn paper_session_inputs_include_bounded_directional_bars() {
     let resources = paper_snapshot_resources("2026-08-17");
     assert_eq!(resources.len(), 10);
     for asset in Asset::EXECUTABLE {
-        assert!(resources.contains(&format!("bars:{}:1d:2026-07-20:12", asset.symbol())));
+        assert!(resources.contains(&format!("bars:{}:1d:2026-07-20:32", asset.symbol())));
     }
 }
 
