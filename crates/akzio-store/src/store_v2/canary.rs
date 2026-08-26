@@ -5,17 +5,17 @@
 //! calculation; this module only persists the validated result.
 
 use akzio_domain::{
-    ArtifactKind, ArtifactLifecycle, CanaryCampaignSpec, CanaryCampaignStatus,
+    Artifact, ArtifactKind, ArtifactLifecycle, CanaryCampaignSpec, CanaryCampaignStatus,
     CanarySessionReservation, CanaryVerdict, ContentHash, PaperApprovalScope, PaperLaunchApproval,
     RunPurpose, RuntimeManifest,
 };
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    assert_daemon_lease, parse_time, run_purpose_from_connection, DaemonLease, StoreError,
-    StoreResult, V2Store,
+    assert_daemon_lease, parse_time, run_purpose_from_connection, DaemonLease, SessionReservation,
+    SessionSlotReservation, StoreError, StoreResult, V2Store, WorkflowCommit,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -370,6 +370,145 @@ impl V2Store {
         transaction.commit()?;
         Ok(StoredCanarySession {
             reservation: reservation.clone(),
+        })
+    }
+
+    pub(super) fn commit_canary_session_transaction(
+        transaction: &Transaction<'_>,
+        reservation: &CanarySessionReservation,
+    ) -> StoreResult<()> {
+        let current = read_campaign(transaction, &reservation.campaign_id)?.ok_or_else(|| {
+            StoreError::MissingCanaryCampaign(reservation.campaign_id.to_string())
+        })?;
+        if current.status != reservation.level {
+            return Err(StoreError::CanaryCampaignConflict(format!(
+                "{} session level {:?} does not match campaign {:?}",
+                reservation.campaign_id, reservation.level, current.status
+            )));
+        }
+        if run_purpose_from_connection(transaction, &reservation.parent_run_id)?
+            != RunPurpose::Paper
+            || run_purpose_from_connection(transaction, &reservation.contract_shadow_run_id)?
+                != RunPurpose::Shadow
+            || run_purpose_from_connection(transaction, &reservation.topology_shadow_run_id)?
+                != RunPurpose::Shadow
+            || run_purpose_from_connection(transaction, &reservation.bundle_shadow_run_id)?
+                != RunPurpose::Shadow
+        {
+            return Err(StoreError::CanaryCampaignConflict(
+                "canary session run purposes".to_owned(),
+            ));
+        }
+        if let Some(existing) =
+            read_session(transaction, &reservation.campaign_id, reservation.level)?
+        {
+            if existing.reservation != *reservation {
+                return Err(StoreError::CanaryCampaignConflict(format!(
+                    "{} already has a different {:?} session",
+                    reservation.campaign_id, reservation.level
+                )));
+            }
+            return Ok(());
+        }
+        let duplicate_session: Option<String> = transaction
+            .query_row(
+                "SELECT campaign_id FROM rebuild_canary_sessions WHERE session_key = ?1",
+                params![reservation.session_key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if duplicate_session.is_some() {
+            return Err(StoreError::CanaryCampaignConflict(
+                reservation.session_key.clone(),
+            ));
+        }
+        transaction.execute(
+            "INSERT INTO rebuild_canary_sessions (campaign_id, level_json, session_key, parent_run_id, contract_shadow_run_id, topology_shadow_run_id, bundle_shadow_run_id, scheduler_epoch, reserved_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                reservation.campaign_id.as_str(),
+                serde_json::to_string(&reservation.level)?,
+                reservation.session_key,
+                reservation.parent_run_id.0,
+                reservation.contract_shadow_run_id.0,
+                reservation.topology_shadow_run_id.0,
+                reservation.bundle_shadow_run_id.0,
+                reservation.scheduler_epoch,
+                reservation.reserved_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn reserve_canary_session_with_workflows(
+        &self,
+        lease: &DaemonLease,
+        parent: &SessionReservation,
+        proposal: &Artifact,
+        runtime_manifest: &Artifact,
+        approval: &Artifact,
+        shadow_workflows: &[WorkflowCommit],
+        reservation: &CanarySessionReservation,
+    ) -> StoreResult<SessionSlotReservation> {
+        if shadow_workflows.len() != 3 {
+            return Err(StoreError::CanaryCampaignConflict(
+                "canary session requires three shadow workflows".to_owned(),
+            ));
+        }
+        self.validate_paper_session_reservation(parent, proposal)?;
+        self.validate_paper_approval_binding(runtime_manifest, approval)?;
+        reservation.validate()?;
+        if reservation.scheduler_epoch != lease.epoch
+            || reservation.session_key != parent.session_key
+            || reservation.parent_run_id != parent.workflow.run.run_id
+            || shadow_workflows
+                .iter()
+                .zip([
+                    &reservation.contract_shadow_run_id,
+                    &reservation.topology_shadow_run_id,
+                    &reservation.bundle_shadow_run_id,
+                ])
+                .any(|(commit, expected)| {
+                    commit.run.run_id != *expected
+                        || commit.run.purpose != RunPurpose::Shadow
+                        || commit.graph.kind != ArtifactKind::WorkflowGraph
+                        || commit.graph.artifact_id != commit.run.graph_artifact_id
+                })
+        {
+            return Err(StoreError::CanaryCampaignConflict(
+                "canary workflow reservation binding".to_owned(),
+            ));
+        }
+        for shadow in shadow_workflows {
+            self.validate_workflow_commit(shadow)?;
+        }
+        if self.session_slot(&parent.session_key)?.is_some() {
+            return Err(StoreError::CanaryCampaignConflict(
+                "Paper session already exists without canary reservation".to_owned(),
+            ));
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        assert_daemon_lease(&transaction, lease, parent.reserved_at)?;
+        Self::commit_session_slot_transaction(
+            &transaction,
+            lease,
+            parent,
+            proposal,
+            Some((runtime_manifest, approval)),
+        )?;
+        for shadow in shadow_workflows {
+            Self::commit_workflow_transaction(&transaction, shadow)?;
+        }
+        Self::commit_canary_session_transaction(&transaction, reservation)?;
+        transaction.commit()?;
+        drop(connection);
+        let slot = self
+            .session_slot(&parent.session_key)?
+            .ok_or_else(|| StoreError::Integrity("session slot missing after commit".to_owned()))?;
+        Ok(SessionSlotReservation {
+            slot,
+            newly_reserved: true,
         })
     }
 

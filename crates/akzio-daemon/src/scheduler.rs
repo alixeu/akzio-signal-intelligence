@@ -680,22 +680,29 @@ impl PaperScheduler {
 
         let lease = self.acquire_or_renew(now)?;
         let parent_run_id = RunId::new();
-        let parent_proposal = self.workflow.approved_paper_proposal("active")?;
         let setup_artifacts = self.paper_snapshot_artifacts(&parent_run_id, session_key, now)?;
-        let parent = self
+        let mut parent_proposal = self.workflow.approved_paper_proposal("active")?;
+        parent_proposal
+            .tasks
+            .get_mut("analyst")
+            .ok_or(SchedulerError::WorkflowUnavailable)?
+            .evidence_needs = setup_artifacts
+            .iter()
+            .map(|artifact| ArtifactRef {
+                artifact_id: artifact.artifact_id.clone(),
+                kind: ArtifactKind::EvidenceNeed,
+            })
+            .collect();
+        let (parent_reservation, parent_proposal_artifact) = self
             .workflow
-            .reserve_paper_session_with_inputs_for_run_approved(
-                &lease,
+            .prepare_approved_paper_session_with_inputs_for_run(
                 parent_run_id.clone(),
                 session_key,
                 &parent_proposal,
                 &setup_artifacts,
-                &runtime_manifest,
-                &approval,
                 now,
             )?;
-        let snapshot_refs = parent
-            .slot
+        let snapshot_refs = parent_reservation
             .workflow
             .nodes
             .iter()
@@ -721,20 +728,20 @@ impl PaperScheduler {
         let contract_shadow_run_id = RunId::new();
         let topology_shadow_run_id = RunId::new();
         let bundle_shadow_run_id = RunId::new();
-        self.workflow.submit(
+        let contract_shadow = self.workflow.prepare_workflow_commit(
             contract_shadow_run_id.clone(),
             RunPurpose::Shadow,
             self.workflow
                 .lower_shadow(&contract_proposal, Some(&candidate.contract_hash))?,
             now,
         )?;
-        self.workflow.submit(
+        let topology_shadow = self.workflow.prepare_workflow_commit(
             topology_shadow_run_id.clone(),
             RunPurpose::Shadow,
             self.workflow.lower_shadow(&topology_proposal, None)?,
             now,
         )?;
-        self.workflow.submit(
+        let bundle_shadow = self.workflow.prepare_workflow_commit(
             bundle_shadow_run_id.clone(),
             RunPurpose::Shadow,
             self.workflow
@@ -742,7 +749,7 @@ impl PaperScheduler {
             now,
         )?;
 
-        let reservation = CanarySessionReservation {
+        let canary_reservation = CanarySessionReservation {
             schema_version: V2_DOMAIN_SCHEMA_VERSION,
             campaign_id: campaign.spec.campaign_id.clone(),
             level: campaign.status,
@@ -754,7 +761,15 @@ impl PaperScheduler {
             scheduler_epoch: lease.epoch,
             reserved_at: now,
         };
-        self.reserve_canary_session(&reservation)?;
+        let parent = self.store.reserve_canary_session_with_workflows(
+            &lease,
+            &parent_reservation,
+            &parent_proposal_artifact,
+            &runtime_manifest,
+            &approval,
+            &[contract_shadow, topology_shadow, bundle_shadow],
+            &canary_reservation,
+        )?;
         Ok(Some(parent))
     }
 

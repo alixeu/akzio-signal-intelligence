@@ -210,18 +210,7 @@ impl V2Store {
     }
 
     pub fn commit_workflow(&self, commit: &WorkflowCommit) -> StoreResult<()> {
-        if commit.graph.kind != ArtifactKind::WorkflowGraph
-            || commit.graph.artifact_id != commit.run.graph_artifact_id
-        {
-            return Err(StoreError::InvalidWorkflowGraphArtifact);
-        }
-        commit.graph.validate()?;
-        self.read_blob(&commit.graph.blob)?;
-        let graph: WorkflowGraph = serde_json::from_slice(&self.read_blob(&commit.graph.blob)?)?;
-        graph.validate()?;
-        if graph.nodes != commit.nodes || graph.topology_id != commit.run.topology_id {
-            return Err(StoreError::WorkflowGraphMismatch);
-        }
+        self.validate_workflow_commit(commit)?;
 
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;

@@ -870,6 +870,99 @@ impl V2Store {
         Ok((manifest_payload, approval_payload))
     }
 
+    pub(super) fn validate_paper_session_reservation(
+        &self,
+        reservation: &SessionReservation,
+        proposal: &Artifact,
+    ) -> StoreResult<()> {
+        if reservation.session_key.trim().is_empty()
+            || reservation.workflow.run.purpose != RunPurpose::Paper
+            || reservation.workflow.graph.kind != ArtifactKind::WorkflowGraph
+            || reservation.workflow.graph.artifact_id != reservation.workflow.run.graph_artifact_id
+            || proposal.kind != ArtifactKind::WorkflowProposal
+            || proposal.producer != "runtime.paper_provisioning"
+            || proposal.lifecycle != ArtifactLifecycle::RunScoped
+            || proposal
+                .origin
+                .as_ref()
+                .and_then(|origin| origin.run_id.as_ref())
+                != Some(&reservation.workflow.run.run_id)
+            || reservation.setup_artifacts.iter().any(|artifact| {
+                artifact.kind != ArtifactKind::EvidenceNeed
+                    || artifact.lifecycle != ArtifactLifecycle::RunScoped
+                    || artifact
+                        .origin
+                        .as_ref()
+                        .and_then(|origin| origin.run_id.as_ref())
+                        != Some(&reservation.workflow.run.run_id)
+            })
+        {
+            return Err(StoreError::InvalidSessionSlot(
+                reservation.session_key.clone(),
+            ));
+        }
+        reservation.workflow.graph.validate()?;
+        let graph: WorkflowGraph =
+            serde_json::from_slice(&self.read_blob(&reservation.workflow.graph.blob)?)?;
+        graph.validate()?;
+        if graph.nodes != reservation.workflow.nodes
+            || graph.topology_id != reservation.workflow.run.topology_id
+        {
+            return Err(StoreError::WorkflowGraphMismatch);
+        }
+        let proposal_payload: WorkflowProposal =
+            serde_json::from_slice(&self.read_blob(&proposal.blob)?)?;
+        let expected_sources = reservation
+            .setup_artifacts
+            .iter()
+            .map(|artifact| ArtifactRef {
+                artifact_id: artifact.artifact_id.clone(),
+                kind: artifact.kind,
+            })
+            .collect::<BTreeSet<_>>();
+        let actual_sources = proposal
+            .source_refs
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let payload_needs = proposal_payload
+            .tasks
+            .values()
+            .flat_map(|task| task.evidence_needs.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        let expected_sources = expected_sources
+            .into_iter()
+            .chain(payload_needs)
+            .collect::<BTreeSet<_>>();
+        if actual_sources != expected_sources {
+            return Err(StoreError::InvalidWorkflowProposalArtifact);
+        }
+        if proposal_payload.topology_id != reservation.workflow.run.topology_id {
+            return Err(StoreError::WorkflowGraphMismatch);
+        }
+        proposal.validate()?;
+        for artifact in &reservation.setup_artifacts {
+            artifact.validate()?;
+            self.read_blob(&artifact.blob)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn validate_workflow_commit(&self, commit: &WorkflowCommit) -> StoreResult<()> {
+        if commit.graph.kind != ArtifactKind::WorkflowGraph
+            || commit.graph.artifact_id != commit.run.graph_artifact_id
+        {
+            return Err(StoreError::InvalidWorkflowGraphArtifact);
+        }
+        commit.graph.validate()?;
+        let graph: WorkflowGraph = serde_json::from_slice(&self.read_blob(&commit.graph.blob)?)?;
+        graph.validate()?;
+        if graph.nodes != commit.nodes || graph.topology_id != commit.run.topology_id {
+            return Err(StoreError::WorkflowGraphMismatch);
+        }
+        Ok(())
+    }
+
     /// Atomically publishes one runtime manifest and its operator approval.
     /// A scheduler can never observe a half-written approval binding.
     pub fn write_paper_approval_binding(
@@ -1272,6 +1365,49 @@ impl V2Store {
             slot,
             newly_reserved,
         })
+    }
+
+    pub(super) fn commit_session_slot_transaction(
+        transaction: &Transaction<'_>,
+        lease: &DaemonLease,
+        reservation: &SessionReservation,
+        proposal: &Artifact,
+        binding: Option<(&Artifact, &Artifact)>,
+    ) -> StoreResult<()> {
+        assert_daemon_lease(transaction, lease, reservation.reserved_at)?;
+        for artifact in &reservation.setup_artifacts {
+            insert_artifact(transaction, artifact)?;
+        }
+        insert_artifact(transaction, proposal)?;
+        if let Some((runtime_manifest, approval)) = binding {
+            insert_artifact(transaction, runtime_manifest)?;
+            insert_artifact(transaction, approval)?;
+        }
+        Self::commit_workflow_transaction(transaction, &reservation.workflow)?;
+        transaction.execute(
+            "INSERT INTO rebuild_session_slots (session_key, run_id, topology_id, graph_artifact_id, run_created_at, scheduler_epoch, reserved_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                reservation.session_key,
+                reservation.workflow.run.run_id.0,
+                reservation.workflow.run.topology_id,
+                reservation.workflow.run.graph_artifact_id.0.as_str(),
+                reservation.workflow.run.created_at.to_rfc3339(),
+                lease.epoch,
+                reservation.reserved_at.to_rfc3339(),
+            ],
+        )?;
+        if let Some((runtime_manifest, approval)) = binding {
+            transaction.execute(
+                "INSERT INTO rebuild_paper_approval_consumptions (approval_artifact_id, runtime_manifest_artifact_id, session_key, consumed_at) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    approval.artifact_id.0.as_str(),
+                    runtime_manifest.artifact_id.0.as_str(),
+                    reservation.session_key,
+                    reservation.reserved_at.to_rfc3339(),
+                ],
+            )?;
+        }
+        Ok(())
     }
 
     fn commit_workflow_transaction(

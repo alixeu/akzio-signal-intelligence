@@ -54,10 +54,23 @@ impl WorkflowRuntime {
         graph: WorkflowGraph,
         now: DateTime<Utc>,
     ) -> RuntimeResult<Artifact> {
+        let commit = self.prepare_workflow_commit(run_id, purpose, graph, now)?;
+        let graph_artifact = commit.graph.clone();
+        self.store.commit_workflow(&commit)?;
+        Ok(graph_artifact)
+    }
+
+    pub fn prepare_workflow_commit(
+        &self,
+        run_id: RunId,
+        purpose: RunPurpose,
+        graph: WorkflowGraph,
+        now: DateTime<Utc>,
+    ) -> RuntimeResult<WorkflowCommit> {
         graph.validate()?;
         self.validate_compiled_graph(purpose, &graph)?;
         let graph_artifact = self.graph_artifact(&graph, vec![], now)?;
-        self.store.commit_workflow(&WorkflowCommit {
+        Ok(WorkflowCommit {
             run: StoredRun {
                 run_id,
                 purpose,
@@ -67,8 +80,7 @@ impl WorkflowRuntime {
             },
             graph: graph_artifact.clone(),
             nodes: graph.nodes,
-        })?;
-        Ok(graph_artifact)
+        })
     }
 
     /// Load the exact durable graph/task state for crash recovery. Recovery
@@ -151,6 +163,76 @@ impl WorkflowRuntime {
             Some((runtime_manifest, approval)),
             now,
         )
+    }
+
+    /// Prepare an approved Paper session without publishing it. The caller
+    /// may combine the returned immutable reservation with other workflow
+    /// commits in one Store transaction.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_approved_paper_session_with_inputs_for_run(
+        &self,
+        run_id: RunId,
+        session_key: impl Into<String>,
+        proposal: &WorkflowProposal,
+        setup_artifacts: &[Artifact],
+        now: DateTime<Utc>,
+    ) -> RuntimeResult<(SessionReservation, Artifact)> {
+        let session_key = session_key.into();
+        let proposal_artifact = Artifact::new(
+            ArtifactKind::WorkflowProposal,
+            self.store.put_json(proposal)?,
+            "runtime.paper_provisioning",
+            ArtifactLifecycle::RunScoped,
+            ArtifactProvenance {
+                source_family: "akzio.runtime".to_owned(),
+                observed_at: None,
+                retrieved_at: now,
+                source_uri: None,
+                confidence_ppm: 1_000_000,
+                producer_contract_hash: None,
+            },
+            Some(ArtifactOrigin {
+                run_id: Some(run_id.clone()),
+                task_id: None,
+                attempt_id: None,
+                contract_hash: None,
+            }),
+            proposal
+                .tasks
+                .values()
+                .flat_map(|task| task.evidence_needs.iter().cloned())
+                .collect(),
+            now,
+        )?;
+        let graph = self.lower(RunPurpose::Paper, proposal)?;
+        let graph_artifact = self.graph_artifact(
+            &graph,
+            vec![ArtifactRef {
+                artifact_id: proposal_artifact.artifact_id.clone(),
+                kind: ArtifactKind::WorkflowProposal,
+            }],
+            now,
+        )?;
+        let workflow = WorkflowCommit {
+            run: StoredRun {
+                run_id,
+                purpose: RunPurpose::Paper,
+                topology_id: graph.topology_id.clone(),
+                graph_artifact_id: graph_artifact.artifact_id.clone(),
+                created_at: now,
+            },
+            graph: graph_artifact,
+            nodes: graph.nodes,
+        };
+        Ok((
+            SessionReservation {
+                session_key,
+                workflow,
+                setup_artifacts: setup_artifacts.to_vec(),
+                reserved_at: now,
+            },
+            proposal_artifact,
+        ))
     }
 
     #[allow(clippy::too_many_arguments)]
