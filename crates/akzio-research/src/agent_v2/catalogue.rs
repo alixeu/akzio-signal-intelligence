@@ -44,12 +44,38 @@ impl ActiveResearchCatalogue {
         self.contracts
             .install_candidate(store, active_contract_hash, candidate, now)
     }
+
+    pub fn install_analyst_freshness_candidate(
+        &self,
+        store: &V2Store,
+        now: DateTime<Utc>,
+    ) -> ResearchResult<InstalledContract> {
+        let active = self
+            .contracts
+            .contracts()
+            .find(|installed| installed.contract.purpose.as_str() == RESEARCH_ANALYST_RECIPE_ID)
+            .ok_or(ResearchError::MissingActiveContract(
+                RESEARCH_ANALYST_RECIPE_ID,
+            ))?;
+        let mut candidate = active.contract.clone();
+        candidate.version = ANALYST_FRESHNESS_CANDIDATE_VERSION;
+        candidate.prompt.version = ANALYST_FRESHNESS_CANDIDATE_VERSION;
+        let mut role = store.read_blob(&candidate.prompt.role)?;
+        role.extend_from_slice(
+            b"\n\nCandidate freshness v5: treat each selected evidence item's observed_at and max_age_secs as hard freshness inputs. State stale or mixed-time evidence explicitly in evidence_gaps and never use stale evidence as support.",
+        );
+        candidate.prompt.role = store.put_bytes(&role, "text/plain")?;
+        candidate.contract_hash = candidate.expected_hash()?;
+        candidate.validate()?;
+        self.install_candidate(store, &active.contract.contract_hash, &candidate, now)
+    }
 }
 
 pub const ACTIVE_RESEARCH_MAX_NODES: usize = 32;
 
 pub(super) const ACTIVE_CONTRACT_VERSION: u32 = 4;
 pub(super) const ACTIVE_PROMPT_BUNDLE_VERSION: u32 = 4;
+pub const ANALYST_FRESHNESS_CANDIDATE_VERSION: u32 = 5;
 pub(super) const SHARED_GOVERNANCE_PROMPT: &str = "Follow the installed Akzio Contract exactly. Rust owns state, evidence access, budgets, workflow gates, and Paper-only execution. Use only ContextManifest-granted artifacts and the declared tools. Never access arbitrary files, network resources, credentials, databases, or execution controls. Work in two phases: produce an auditable natural-language research memo, then call submit_result exactly once when Rust requests submission. submit_result is a zero-side-effect proposal channel; Rust alone validates and persists the result.";
 pub(super) const PLANNER_RECIPE_ID: &str = akzio_domain::RESEARCH_PLANNER_RECIPE_ID;
 pub(super) const PLANNER_CHILD_RECIPE_IDS: [&str; 2] = [
@@ -170,6 +196,33 @@ impl ContractCatalogue {
 
     pub fn contracts(&self) -> impl Iterator<Item = &InstalledContract> {
         self.by_hash.values()
+    }
+
+    pub fn with_installed_candidate(&self, installed: InstalledContract) -> ResearchResult<Self> {
+        let mut catalogue = self.clone();
+        if catalogue
+            .by_hash
+            .contains_key(&installed.contract.contract_hash)
+        {
+            return Ok(catalogue);
+        }
+        let identity = (
+            installed.contract.contract_id.clone(),
+            installed.contract.version,
+        );
+        if catalogue.by_identity.contains_key(&identity) {
+            return Err(ResearchError::DuplicateContractVersion {
+                contract_id: identity.0,
+                version: identity.1,
+            });
+        }
+        catalogue
+            .by_identity
+            .insert(identity, installed.contract.contract_hash.clone());
+        catalogue
+            .by_hash
+            .insert(installed.contract.contract_hash.clone(), installed);
+        Ok(catalogue)
     }
 
     pub fn contract_hash_for(

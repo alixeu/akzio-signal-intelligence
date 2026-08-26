@@ -93,10 +93,16 @@ impl Daemon {
     ) -> Result<Self> {
         let store = V2Store::open(&config.store_root)?;
         let active = ActiveResearchCatalogue::install(&store, Utc::now())?;
+        let agent_catalogue = if fixture_mode {
+            active.contracts.clone()
+        } else {
+            let candidate = active.install_analyst_freshness_candidate(&store, Utc::now())?;
+            active.contracts.with_installed_candidate(candidate)?
+        };
         let workflow =
             WorkflowRuntime::new(store.clone(), active.recipes).with_fixture_mode(fixture_mode);
         let (reasoning_events, _) = broadcast::channel(1_024);
-        let agents = AgentRuntime::new(store.clone(), active.contracts, Duration::minutes(5))
+        let agents = AgentRuntime::new(store.clone(), agent_catalogue, Duration::minutes(5))
             .with_reasoning_events(reasoning_events.clone());
         let decision_runtime = V2DecisionRuntime::new(store.clone(), Default::default())?;
         let execution_runtime =

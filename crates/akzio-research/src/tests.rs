@@ -189,6 +189,42 @@ fn analyst_prompt_requires_exact_context_artifact_refs() {
 }
 
 #[test]
+fn analyst_freshness_candidate_is_inactive_and_capability_bounded() {
+    let root = tempdir().unwrap();
+    let store = V2Store::open(root.path()).unwrap();
+    let active = ActiveResearchCatalogue::install(&store, Utc::now()).unwrap();
+    let baseline = active
+        .contracts
+        .contracts()
+        .find(|installed| installed.contract.purpose.as_str() == RESEARCH_ANALYST_RECIPE_ID)
+        .unwrap()
+        .contract
+        .clone();
+
+    let candidate = active
+        .install_analyst_freshness_candidate(&store, Utc::now())
+        .unwrap();
+
+    assert_eq!(candidate.contract.version, 5);
+    assert!(baseline.permits_candidate(&candidate.contract));
+    assert!(store
+        .active_contract(&candidate.contract.purpose)
+        .unwrap()
+        .is_some_and(|stored| stored.contract.contract_hash == baseline.contract_hash));
+    assert!(store
+        .contract_installation(&candidate.contract.contract_hash)
+        .unwrap()
+        .is_some_and(|stored| stored.activated_at.is_none()));
+    assert!(active
+        .contracts
+        .with_installed_candidate(candidate.clone())
+        .unwrap()
+        .get(&candidate.contract.contract_hash)
+        .is_ok());
+    store.verify_integrity().unwrap();
+}
+
+#[test]
 fn planner_schema_rejects_natural_language_windows() {
     let schema = planner_draft_output_schema();
     let window = &schema["properties"]["tasks"]["additionalProperties"]["properties"]
