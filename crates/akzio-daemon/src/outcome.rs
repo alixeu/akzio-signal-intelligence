@@ -201,7 +201,6 @@ impl Daemon {
                 &parent_outcome,
                 materialization,
                 retrospective_draft.as_ref(),
-                now,
             )? {
                 return Ok(TaskCompletion::DeferredUntil(next_outcome_check_at(now)?));
             }
@@ -246,7 +245,6 @@ impl Daemon {
         parent_outcome_artifact: &Artifact,
         materialization: OutcomeMaterializationInput,
         retrospective_draft: Option<&RetrospectiveDraft>,
-        now: DateTime<Utc>,
     ) -> Result<bool> {
         let campaign = self
             .store
@@ -286,6 +284,7 @@ impl Daemon {
         let parent_outcome: Outcome = self.read_artifact_payload(&parent_outcome_ref)?;
         parent_outcome.validate_sealed()?;
         let parent_schedule = materialization.schedule.clone();
+        let completed_at = materialization.sealed_at;
 
         let candidate_contract_artifact = self
             .store
@@ -518,7 +517,7 @@ impl Daemon {
             &session.reservation.campaign_id,
             session.reservation.level,
             &comparison,
-            now,
+            completed_at,
         )?;
         Ok(true)
     }
