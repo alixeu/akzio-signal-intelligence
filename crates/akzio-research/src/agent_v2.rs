@@ -327,7 +327,7 @@ fn canonical_active_contract(
             base_prompt
         ),
         RESEARCH_ANALYST_RECIPE_ID => format!(
-            "{}\n\nKeep evidence_gaps to at most 2 items; combine overlapping limitations into concise, evidence-grounded gaps. Preserve the exact artifact kind shown in ContextManifest selections; do not relabel normalized_evidence as semantic_detail or vice versa.",
+            "{}\n\nKeep evidence_gaps to at most 2 items; combine overlapping limitations into concise, evidence-grounded gaps. Preserve the exact artifact kind shown in ContextManifest selections; do not relabel normalized_evidence as semantic_detail or vice versa. For every grounds.evidence reference, copy the exact 64-character artifact_id and exact kind from a top-level context item. Never use the ContextManifest ID, a resource name, or an alias as an evidence artifact_id. Include at least one ground when readable evidence is present.",
             base_prompt
         ),
         _ => base_prompt,

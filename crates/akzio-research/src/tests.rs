@@ -173,6 +173,22 @@ fn planner_prompt_states_research_intent_bounds() {
 }
 
 #[test]
+fn analyst_prompt_requires_exact_context_artifact_refs() {
+    let root = tempdir().unwrap();
+    let store = V2Store::open(root.path()).unwrap();
+    let analyst = canonical_active_contracts(&store)
+        .unwrap()
+        .into_iter()
+        .find(|contract| contract.purpose.as_str() == RESEARCH_ANALYST_RECIPE_ID)
+        .unwrap();
+    let prompt = String::from_utf8(store.read_blob(&analyst.prompt.role).unwrap()).unwrap();
+
+    assert!(prompt.contains("exact 64-character artifact_id"));
+    assert!(prompt.contains("Never use the ContextManifest ID"));
+    assert!(prompt.contains("Include at least one ground"));
+}
+
+#[test]
 fn planner_schema_rejects_natural_language_windows() {
     let schema = planner_draft_output_schema();
     let window = &schema["properties"]["tasks"]["additionalProperties"]["properties"]
