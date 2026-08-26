@@ -18,7 +18,7 @@ const OBSERVER_RUN_LIMIT: usize = 20;
 const OBSERVER_EVENT_LIMIT: usize = 100;
 const OBSERVER_TRAJECTORY_LIMIT: usize = 200;
 const OBSERVER_LEARNING_LIMIT: usize = 100;
-const OBSERVER_BROKER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const OBSERVER_BROKER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]

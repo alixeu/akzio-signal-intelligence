@@ -9,10 +9,10 @@ public enum ObservatoryDataMode: String, Sendable, CaseIterable, Identifiable {
 }
 
 public enum ObserverTransportPolicy {
-    /// Rust bounds individual Observer subrequests at five seconds. The client
-    /// keeps margin so it receives the server's availability downgrade.
-    public static let standardRequestTimeout: TimeInterval = 8
-    public static let snapshotRequestTimeout: TimeInterval = 15
+    /// Rust bounds individual Observer broker groups at twenty seconds. The
+    /// client keeps margin so it receives the server's availability downgrade.
+    public static let standardRequestTimeout: TimeInterval = 25
+    public static let snapshotRequestTimeout: TimeInterval = 45
 }
 
 public enum ObserverConnectionState: Sendable, Equatable {
