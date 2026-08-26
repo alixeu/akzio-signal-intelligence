@@ -29,14 +29,15 @@ use std::{
 };
 
 use akzio_domain::{
-    AccountSnapshot, Artifact, ArtifactId, ArtifactKind, ArtifactLifecycle, ArtifactOrigin,
-    ArtifactProvenance, ArtifactRef, Asset, ContentHash, ContextPolicy, Decision, DecisionContext,
-    DomainError, EvidenceNeed, ExecutionContext, ExecutionVerdict, FreezeState, LifecycleEventType,
-    MemoryId, MoneyMicros, OrderReceipt, OrderReceiptState, OutcomeExecutionLineage,
-    OutcomeHorizon, OutcomeId, OutcomeSchedule, PaperApprovalScope, PaperLaunchApproval,
-    PolicySubject, QuoteSnapshot, Reconciliation, ReconciliationState, ResearchClaim,
-    Retrospective, RetrospectiveDraft, RunId, RunPurpose, RuntimeIdentity, RuntimeManifest,
-    RuntimeTaskClass, TargetPortfolio, TaskId, TaskStatus, TopologyId, WeightPpm, WorkflowProposal,
+    AccountSnapshot, AgentContract, Artifact, ArtifactId, ArtifactKind, ArtifactLifecycle,
+    ArtifactOrigin, ArtifactProvenance, ArtifactRef, Asset, CandidatePolicyState, ContentHash,
+    ContextPolicy, ContractPurpose, Decision, DecisionContext, DomainError, EvidenceNeed,
+    ExecutionContext, ExecutionVerdict, FreezeState, LifecycleEventType, MemoryId, MoneyMicros,
+    OrderReceipt, OrderReceiptState, Outcome, OutcomeExecutionLineage, OutcomeHorizon, OutcomeId,
+    OutcomeSchedule, PaperApprovalScope, PaperLaunchApproval, PolicyState, PolicySubject,
+    QuoteSnapshot, Reconciliation, ReconciliationState, ResearchClaim, Retrospective,
+    RetrospectiveDraft, RunId, RunPurpose, RuntimeIdentity, RuntimeManifest, RuntimeTaskClass,
+    TargetPortfolio, TaskId, TaskStatus, TopologyId, WeightPpm, WorkflowGraph, WorkflowProposal,
     WorkflowStatus,
 };
 use akzio_execution::{
@@ -56,9 +57,10 @@ use akzio_ingest::{
     PaperDecodeError, SecEdgarDirectTransport,
 };
 use akzio_learning::{
-    horizon_observations, EvaluationError, EvaluationInput, EvaluationPolicy, EvaluationRuntime,
-    OutcomeCostModel, OutcomeMaterializationInput, OutcomeScheduleError, OutcomeScheduleInput,
-    OutcomeSchedulingRuntime,
+    horizon_observations, CanaryBundleComparison, CanaryCampaignRuntime, CanaryError,
+    CanarySubjectComparison, CandidatePolicyInput, EvaluationError, EvaluationInput,
+    EvaluationPolicy, EvaluationRuntime, OutcomeCostModel, OutcomeMaterializationInput,
+    OutcomeScheduleError, OutcomeScheduleInput, OutcomeSchedulingRuntime, ShadowObservation,
 };
 use akzio_model::{ModelClient, ModelConfig, ModelError};
 pub use akzio_research::fixture_model_client;
@@ -131,6 +133,8 @@ pub enum DaemonError {
     PaperDispatch(#[from] PaperDispatchError),
     #[error(transparent)]
     OutcomeSchedule(#[from] OutcomeScheduleError),
+    #[error(transparent)]
+    Canary(#[from] CanaryError),
     #[error(transparent)]
     Evaluation(#[from] EvaluationError),
     #[error(transparent)]

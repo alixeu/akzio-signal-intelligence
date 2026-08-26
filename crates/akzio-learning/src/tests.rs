@@ -1012,6 +1012,44 @@ fn topology_forward_promotion_is_disabled_and_degradation_rolls_back() {
 }
 
 #[test]
+fn forced_canary_state_records_topology_policy_transition() {
+    let fixture = RuntimeFixture::new();
+    let subject = PolicySubject::Topology(TopologyId(fixture.candidate_topology_id.clone()));
+    let permit = fixture.claim_evaluation("topology-canary-transition");
+    fixture.record_pair_batch_for(&permit, 0, &subject);
+
+    let result = fixture
+        .runtime
+        .evaluate_with_lease_at_state(
+            None,
+            EvaluationInput {
+                permit,
+                subject: subject.clone(),
+                hypothesis_id: "topology-canary-transition".to_owned(),
+                materialization: fixture.materialization.clone(),
+                contract_hash: fixture.candidate_contract_hash.clone(),
+                topology_id: TopologyId(fixture.candidate_topology_id.clone()),
+                candidate_policy: Some(CandidatePolicyInput {
+                    baseline: fixture.active_topology.clone(),
+                    candidate: fixture.candidate_topology.clone(),
+                }),
+                token_cost: None,
+                latency_millis: None,
+            },
+            None,
+            PolicyState::Topology(CandidatePolicyState::Canary10),
+        )
+        .unwrap();
+
+    assert_eq!(
+        result.policy_head.as_ref().map(|head| head.state),
+        Some(PolicyState::Topology(CandidatePolicyState::Canary10))
+    );
+    assert_eq!(fixture.store.policy_transitions(&subject).unwrap().len(), 1);
+    fixture.store.verify_integrity().unwrap();
+}
+
+#[test]
 fn contract_candidate_materializes_a_bound_policy_artifact() {
     let fixture = RuntimeFixture::new();
     let now = fixture_time();

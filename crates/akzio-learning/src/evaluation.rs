@@ -275,11 +275,36 @@ impl EvaluationRuntime {
         self.evaluate_with_retrospective(lease, input, Some(draft))
     }
 
+    pub fn evaluate_with_lease_at_state(
+        &self,
+        lease: Option<&DaemonLease>,
+        input: EvaluationInput,
+        retrospective_draft: Option<&RetrospectiveDraft>,
+        target_state: PolicyState,
+    ) -> EvaluationRuntimeResult<EvaluationResult> {
+        self.evaluate_with_retrospective_at_state(
+            lease,
+            input,
+            retrospective_draft,
+            Some(target_state),
+        )
+    }
+
     fn evaluate_with_retrospective(
         &self,
         lease: Option<&DaemonLease>,
         input: EvaluationInput,
         retrospective_draft: Option<&RetrospectiveDraft>,
+    ) -> EvaluationRuntimeResult<EvaluationResult> {
+        self.evaluate_with_retrospective_at_state(lease, input, retrospective_draft, None)
+    }
+
+    fn evaluate_with_retrospective_at_state(
+        &self,
+        lease: Option<&DaemonLease>,
+        input: EvaluationInput,
+        retrospective_draft: Option<&RetrospectiveDraft>,
+        target_state: Option<PolicyState>,
     ) -> EvaluationRuntimeResult<EvaluationResult> {
         self.require_paper(&input.permit.run_id)?;
         if input.hypothesis_id.trim().is_empty() {
@@ -500,7 +525,12 @@ impl EvaluationRuntime {
             })
             .transpose()?;
         let candidate_policy_ref = candidate_policy_artifact.as_ref().map(reference);
-        let next = next_state_with_fresh_pairs(current, degraded, fresh_pairs_by_horizon);
+        let next = target_state.unwrap_or_else(|| {
+            next_state_with_fresh_pairs(current, degraded, fresh_pairs_by_horizon)
+        });
+        if !input.subject.accepts_state(next) {
+            return Err(EvaluationError::SubjectStateMismatch);
+        }
 
         let transition = if next == current {
             None

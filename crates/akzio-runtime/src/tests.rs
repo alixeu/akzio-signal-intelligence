@@ -1,9 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use akzio_domain::{
-    ArtifactOrigin, ClaimStance, ContentHash, ContractPurpose, DecisionHorizon, EvidenceGap,
-    EvidenceNeed, FailureDisposition, LifecycleEventType, ResearchClaim, RetryPolicy, TaskBudget,
-    WorkflowProposalDraft, WorkflowProposalDraftTask, WorkflowProposalTask,
+    ArtifactId, ArtifactOrigin, ArtifactRef, ClaimStance, ContentHash, ContractPurpose,
+    DecisionHorizon, EvidenceGap, EvidenceNeed, FailureDisposition, LifecycleEventType,
+    ResearchClaim, RetryPolicy, TaskBudget, WorkflowProposalDraft, WorkflowProposalDraftTask,
+    WorkflowProposalTask,
 };
 use tempfile::tempdir;
 
@@ -275,6 +276,64 @@ fn approved_candidate_topology_adds_one_structured_critic() {
     assert_eq!(
         proposal.tasks["synthesizer"].depends_on,
         vec!["structured_critic".to_owned()]
+    );
+}
+
+#[test]
+fn shadow_graph_rebinds_candidate_topology_and_session_inputs() {
+    let root = tempdir().unwrap();
+    let mut recipes = catalogue();
+    recipes
+        .recipes
+        .get_mut(&TaskRecipeId::new(ANALYST_RECIPE_ID).unwrap())
+        .unwrap()
+        .max_depth = 2;
+    let runtime = WorkflowRuntime::new(V2Store::open(root.path()).unwrap(), recipes);
+    let candidate = runtime
+        .lower_shadow(
+            &runtime
+                .approved_paper_proposal(STRUCTURED_CRITIQUE_CANDIDATE_TOPOLOGY_ID)
+                .unwrap(),
+            None,
+        )
+        .unwrap();
+    let evidence_inputs = vec![ArtifactRef {
+        artifact_id: ArtifactId(ContentHash::of_bytes(b"evidence-input")),
+        kind: ArtifactKind::EvidenceNeed,
+    }];
+    let rebound = runtime
+        .lower_shadow_from_graph(&candidate, &evidence_inputs, None)
+        .unwrap();
+
+    assert_eq!(rebound.topology_id, candidate.topology_id);
+    assert!(rebound
+        .nodes
+        .iter()
+        .zip(candidate.nodes.iter())
+        .all(|(rebound, candidate)| rebound.task_id != candidate.task_id));
+    assert!(rebound
+        .nodes
+        .iter()
+        .filter(|node| {
+            node.recipe_id.as_str() == ANALYST_RECIPE_ID
+                || node.recipe_id.as_str() == SYNTHESIZER_RECIPE_ID
+                || node.recipe_id.as_str() == CRITIC_RECIPE_ID
+                || node.recipe_id.as_str() == EVIDENCE_GATE_RECIPE_ID
+        })
+        .all(|node| node.input_artifacts == evidence_inputs));
+    assert_eq!(
+        rebound
+            .nodes
+            .iter()
+            .find(|node| node.recipe_id.as_str() == ANALYST_RECIPE_ID)
+            .unwrap()
+            .contract_hash,
+        candidate
+            .nodes
+            .iter()
+            .find(|node| node.recipe_id.as_str() == ANALYST_RECIPE_ID)
+            .unwrap()
+            .contract_hash,
     );
 }
 

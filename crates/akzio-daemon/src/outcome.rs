@@ -184,6 +184,30 @@ impl Daemon {
         if highest_due != OutcomeHorizon::T5 {
             return Ok(TaskCompletion::DeferredUntil(next_outcome_check_at(now)?));
         }
+        if let Some(session) = self.store.canary_session_for_run(&task.run_id)? {
+            let materialization = collected.materialization;
+            let (parent_outcome, _) = evaluation.seal_outcome_with_retrospective_fenced(
+                &outcome_lease,
+                &task.permit,
+                materialization.clone(),
+                retrospective_draft.as_ref(),
+                "canary parent outcome sealed",
+                now,
+            )?;
+            if !self.complete_canary_session(
+                &outcome_lease,
+                task,
+                &session,
+                &parent_outcome,
+                materialization,
+                retrospective_draft.as_ref(),
+                now,
+            )? {
+                return Ok(TaskCompletion::DeferredUntil(next_outcome_check_at(now)?));
+            }
+            return Ok(TaskCompletion::Committed);
+        }
+
         let input = EvaluationInput {
             permit: task.permit.clone(),
             subject: PolicySubject::Memory(MemoryId("paper:default".to_owned())),
@@ -212,6 +236,291 @@ impl Daemon {
             )?;
         }
         Ok(TaskCompletion::Committed)
+    }
+
+    fn complete_canary_session(
+        &self,
+        lease: &DaemonLease,
+        task: &ClaimedAttempt,
+        session: &akzio_store::v2::StoredCanarySession,
+        parent_outcome_artifact: &Artifact,
+        materialization: OutcomeMaterializationInput,
+        retrospective_draft: Option<&RetrospectiveDraft>,
+        now: DateTime<Utc>,
+    ) -> Result<bool> {
+        let campaign = self
+            .store
+            .canary_campaign(&session.reservation.campaign_id)?
+            .ok_or_else(|| {
+                DaemonError::InvalidInput("canary campaign disappeared during outcome".to_owned())
+            })?;
+        if campaign.status != session.reservation.level {
+            return Ok(true);
+        }
+
+        let shadow_run_ids = [
+            &session.reservation.contract_shadow_run_id,
+            &session.reservation.topology_shadow_run_id,
+            &session.reservation.bundle_shadow_run_id,
+        ];
+        let mut shadow_outcomes = Vec::with_capacity(shadow_run_ids.len());
+        for run_id in shadow_run_ids {
+            let Some(artifact) = self.store.outcome_for_run(run_id)? else {
+                return Ok(false);
+            };
+            let reference = ArtifactRef {
+                artifact_id: artifact.artifact_id.clone(),
+                kind: ArtifactKind::Outcome,
+            };
+            let outcome: Outcome = self.read_artifact_payload(&reference)?;
+            outcome.validate_sealed()?;
+            let schedule: OutcomeSchedule = self.read_artifact_payload(&outcome.schedule)?;
+            schedule.validate()?;
+            shadow_outcomes.push((artifact, outcome, schedule));
+        }
+
+        let parent_outcome_ref = ArtifactRef {
+            artifact_id: parent_outcome_artifact.artifact_id.clone(),
+            kind: ArtifactKind::Outcome,
+        };
+        let parent_outcome: Outcome = self.read_artifact_payload(&parent_outcome_ref)?;
+        parent_outcome.validate_sealed()?;
+        let parent_schedule = materialization.schedule.clone();
+
+        let candidate_contract_artifact = self
+            .store
+            .artifact(&campaign.spec.candidate_contract.artifact_id)?;
+        let candidate_contract: AgentContract =
+            self.read_artifact_payload(&campaign.spec.candidate_contract)?;
+        candidate_contract.validate()?;
+        if candidate_contract_artifact.kind != ArtifactKind::Contract
+            || candidate_contract_artifact.lifecycle != ArtifactLifecycle::Canonical
+            || candidate_contract.contract_hash == campaign.spec.active_contract_hash
+        {
+            return Err(DaemonError::InvalidInput(
+                "canary candidate contract binding changed".to_owned(),
+            ));
+        }
+
+        let candidate_topology_artifact = self
+            .store
+            .artifact(&campaign.spec.candidate_topology.artifact_id)?;
+        let candidate_topology: WorkflowGraph =
+            self.read_artifact_payload(&campaign.spec.candidate_topology)?;
+        candidate_topology.validate()?;
+        if candidate_topology_artifact.kind != ArtifactKind::WorkflowGraph
+            || candidate_topology_artifact.lifecycle != ArtifactLifecycle::RunScoped
+        {
+            return Err(DaemonError::InvalidInput(
+                "canary candidate topology binding changed".to_owned(),
+            ));
+        }
+
+        let active_contract = self
+            .store
+            .active_contract(&ContractPurpose::new("research.analyst")?)?
+            .ok_or_else(|| {
+                DaemonError::Unavailable("active analyst contract missing".to_owned())
+            })?;
+        if active_contract.contract.contract_hash != campaign.spec.active_contract_hash {
+            return Err(DaemonError::InvalidInput(
+                "canary active contract binding changed".to_owned(),
+            ));
+        }
+        let parent_snapshot = self.store.workflow_snapshot(&task.run_id)?;
+        let parent_topology = ArtifactRef {
+            artifact_id: parent_snapshot.revision.graph_artifact.artifact_id.clone(),
+            kind: ArtifactKind::WorkflowGraph,
+        };
+        let candidate_contract_hash = candidate_contract.contract_hash.clone();
+        let candidate_topology_id = candidate_topology.topology_id.clone();
+        let contract_subject = PolicySubject::Contract(candidate_contract_hash.clone());
+        let topology_subject = PolicySubject::Topology(TopologyId(candidate_topology_id.clone()));
+        let bundle_subject = PolicySubject::Memory(MemoryId("paper:default".to_owned()));
+        let evaluation_policy = EvaluationPolicy::default();
+        let evaluation = EvaluationRuntime::new(self.store.clone(), evaluation_policy.clone())?;
+
+        let pair_subjects = [
+            (&contract_subject, 0_usize),
+            (&topology_subject, 1_usize),
+            (&bundle_subject, 2_usize),
+        ];
+        for (subject, index) in pair_subjects {
+            let candidate_schedule = &shadow_outcomes[index].2;
+            let candidate_outcome = &shadow_outcomes[index].1;
+            for horizon in OutcomeHorizon::ALL {
+                evaluation.record_shadow_pair(
+                    &task.permit,
+                    subject,
+                    ShadowObservation {
+                        parent_decision: parent_schedule.decision.clone(),
+                        execution_context: parent_schedule.execution_context.clone(),
+                        candidate_decision: candidate_schedule.decision.clone(),
+                        candidate_contract_hash: candidate_contract_hash.clone(),
+                        candidate_topology_id: candidate_topology_id.clone(),
+                        horizon,
+                        parent_outcome: parent_outcome_ref.clone(),
+                        candidate_outcome: ArtifactRef {
+                            artifact_id: shadow_outcomes[index].0.artifact_id.clone(),
+                            kind: ArtifactKind::Outcome,
+                        },
+                        completed_at: candidate_outcome
+                            .sealed_at
+                            .expect("validated shadow outcome is sealed"),
+                    },
+                )?;
+            }
+        }
+
+        let comparison = CanaryBundleComparison {
+            contract: CanarySubjectComparison::from_outcomes(
+                &parent_outcome,
+                &shadow_outcomes[0].1,
+            )?,
+            topology: CanarySubjectComparison::from_outcomes(
+                &parent_outcome,
+                &shadow_outcomes[1].1,
+            )?,
+            bundle: CanarySubjectComparison::from_outcomes(&parent_outcome, &shadow_outcomes[2].1)?,
+        };
+        let canary = CanaryCampaignRuntime::new(
+            self.store.clone(),
+            evaluation_policy
+                .minimum_evidence_completeness_ppm
+                .min(evaluation_policy.minimum_risk_recall_ppm),
+        )?;
+        let verdict = canary.compare(&comparison);
+
+        let target_for = |subject: &PolicySubject, current: PolicyState| -> PolicyState {
+            match verdict {
+                akzio_domain::CanaryVerdict::Advance => session
+                    .reservation
+                    .level
+                    .policy_state()
+                    .map(|state| match subject {
+                        PolicySubject::Contract(_) => PolicyState::Contract(state),
+                        PolicySubject::Topology(_) => PolicyState::Topology(state),
+                        PolicySubject::Memory(_) => current,
+                    })
+                    .unwrap_or(current),
+                akzio_domain::CanaryVerdict::Rollback => match subject {
+                    PolicySubject::Contract(_) => {
+                        PolicyState::Contract(CandidatePolicyState::Candidate)
+                    }
+                    PolicySubject::Topology(_) => {
+                        PolicyState::Topology(CandidatePolicyState::Candidate)
+                    }
+                    PolicySubject::Memory(_) => current,
+                },
+                akzio_domain::CanaryVerdict::Hold | akzio_domain::CanaryVerdict::Defer => current,
+            }
+        };
+
+        let current_contract = self
+            .store
+            .policy_head(&contract_subject)?
+            .map(|head| head.state)
+            .unwrap_or_else(|| contract_subject.initial_state());
+        evaluation.evaluate_with_lease_at_state(
+            Some(lease),
+            EvaluationInput {
+                permit: task.permit.clone(),
+                subject: contract_subject.clone(),
+                hypothesis_id: format!(
+                    "canary-contract:{}:{}",
+                    session.reservation.campaign_id, session.reservation.session_key
+                ),
+                materialization: materialization.clone(),
+                contract_hash: candidate_contract_hash.clone(),
+                topology_id: TopologyId(candidate_topology_id.clone()),
+                candidate_policy: Some(CandidatePolicyInput {
+                    baseline: ArtifactRef {
+                        artifact_id: active_contract.artifact.artifact_id.clone(),
+                        kind: ArtifactKind::Contract,
+                    },
+                    candidate: campaign.spec.candidate_contract.clone(),
+                }),
+                token_cost: None,
+                latency_millis: None,
+            },
+            retrospective_draft,
+            target_for(&contract_subject, current_contract),
+        )?;
+
+        let current_topology = self
+            .store
+            .policy_head(&topology_subject)?
+            .map(|head| head.state)
+            .unwrap_or_else(|| topology_subject.initial_state());
+        evaluation.evaluate_with_lease_at_state(
+            Some(lease),
+            EvaluationInput {
+                permit: task.permit.clone(),
+                subject: topology_subject.clone(),
+                hypothesis_id: format!(
+                    "canary-topology:{}:{}",
+                    session.reservation.campaign_id, session.reservation.session_key
+                ),
+                materialization: materialization.clone(),
+                contract_hash: candidate_contract_hash.clone(),
+                topology_id: TopologyId(candidate_topology_id.clone()),
+                candidate_policy: Some(CandidatePolicyInput {
+                    baseline: parent_topology,
+                    candidate: campaign.spec.candidate_topology.clone(),
+                }),
+                token_cost: None,
+                latency_millis: None,
+            },
+            retrospective_draft,
+            target_for(&topology_subject, current_topology),
+        )?;
+
+        let current_memory = self
+            .store
+            .policy_head(&bundle_subject)?
+            .map(|head| head.state)
+            .unwrap_or_else(|| bundle_subject.initial_state());
+        let bundle_input = EvaluationInput {
+            permit: task.permit.clone(),
+            subject: bundle_subject.clone(),
+            hypothesis_id: format!(
+                "canary-bundle:{}:{}",
+                session.reservation.campaign_id, session.reservation.session_key
+            ),
+            materialization,
+            contract_hash: candidate_contract_hash,
+            topology_id: TopologyId(candidate_topology_id),
+            candidate_policy: None,
+            token_cost: None,
+            latency_millis: None,
+        };
+        if verdict == akzio_domain::CanaryVerdict::Advance {
+            if let Some(draft) = retrospective_draft {
+                evaluation.evaluate_with_lease_and_retrospective(
+                    Some(lease),
+                    bundle_input,
+                    draft,
+                )?;
+            } else {
+                evaluation.evaluate_with_lease(Some(lease), bundle_input)?;
+            }
+        } else {
+            evaluation.evaluate_with_lease_at_state(
+                Some(lease),
+                bundle_input,
+                retrospective_draft,
+                current_memory,
+            )?;
+        }
+
+        canary.apply_verdict(
+            lease,
+            &session.reservation.campaign_id,
+            session.reservation.level,
+            &comparison,
+            now,
+        )?;
+        Ok(true)
     }
 
     pub(super) async fn execute_shadow_evaluate(

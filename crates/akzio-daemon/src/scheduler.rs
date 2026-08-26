@@ -716,14 +716,10 @@ impl PaperScheduler {
             .get_mut("analyst")
             .ok_or(SchedulerError::WorkflowUnavailable)?
             .evidence_needs = snapshot_refs.clone();
-        let mut topology_proposal = self
-            .workflow
-            .approved_paper_proposal(STRUCTURED_CRITIQUE_CANDIDATE_TOPOLOGY_ID)?;
-        topology_proposal
-            .tasks
-            .get_mut("analyst")
-            .ok_or(SchedulerError::WorkflowUnavailable)?
-            .evidence_needs = snapshot_refs;
+        let active_contract_hash = active_analyst
+            .contract_hash
+            .as_ref()
+            .ok_or(SchedulerError::WorkflowUnavailable)?;
 
         let contract_shadow_run_id = RunId::new();
         let topology_shadow_run_id = RunId::new();
@@ -738,14 +734,21 @@ impl PaperScheduler {
         let topology_shadow = self.workflow.prepare_workflow_commit(
             topology_shadow_run_id.clone(),
             RunPurpose::Shadow,
-            self.workflow.lower_shadow(&topology_proposal, None)?,
+            self.workflow.lower_shadow_from_graph(
+                &candidate_topology,
+                &snapshot_refs,
+                Some(active_contract_hash),
+            )?,
             now,
         )?;
         let bundle_shadow = self.workflow.prepare_workflow_commit(
             bundle_shadow_run_id.clone(),
             RunPurpose::Shadow,
-            self.workflow
-                .lower_shadow(&topology_proposal, Some(&candidate.contract_hash))?,
+            self.workflow.lower_shadow_from_graph(
+                &candidate_topology,
+                &snapshot_refs,
+                Some(&candidate.contract_hash),
+            )?,
             now,
         )?;
 
