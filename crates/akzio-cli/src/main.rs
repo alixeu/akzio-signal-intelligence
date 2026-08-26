@@ -948,31 +948,9 @@ fn initial_config_value(value: &str) -> String {
 }
 
 fn apply_config_environment(config: &Config) {
-    for (name, value) in [
-        ("ALPACA_API_KEY", config.credentials.alpaca_api_key.as_str()),
-        (
-            "ALPACA_API_SECRET",
-            config.credentials.alpaca_api_secret.as_str(),
-        ),
-        (
-            "FRED_API_KEY",
-            config
-                .credentials
-                .fred_api_key
-                .as_deref()
-                .unwrap_or_default(),
-        ),
-        (
-            "SEC_USER_AGENT",
-            config
-                .observatory
-                .sec_user_agent
-                .as_deref()
-                .unwrap_or_default(),
-        ),
-    ] {
-        if std::env::var_os(name).is_none() && !value.is_empty() {
-            std::env::set_var(name, value);
+    if let Some(value) = config.observatory.sec_user_agent.as_deref() {
+        if std::env::var_os("SEC_USER_AGENT").is_none() && !value.is_empty() {
+            std::env::set_var("SEC_USER_AGENT", value);
         }
     }
 }
