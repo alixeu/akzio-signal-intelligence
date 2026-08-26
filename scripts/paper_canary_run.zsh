@@ -196,10 +196,11 @@ alpaca_get() {
   local attempt
   for attempt in {1..6}; do
     : > "${output}"
-    if curl --ipv4 --http1.1 --silent --show-error --fail-with-body \
-      --connect-timeout 15 --max-time 45 \
-      -H "APCA-API-KEY-ID: ${ALPACA_API_KEY}" \
-      -H "APCA-API-SECRET-KEY: ${ALPACA_API_SECRET}" \
+    if {
+      print -r -- "header = \"APCA-API-KEY-ID: ${ALPACA_API_KEY}\""
+      print -r -- "header = \"APCA-API-SECRET-KEY: ${ALPACA_API_SECRET}\""
+    } | curl --ipv4 --http1.1 --silent --show-error --fail-with-body \
+      --config - --connect-timeout 15 --max-time 45 \
       "${url}" > "${output}" 2>> "${bundle}/commands/preflight-${name}.stderr" \
       && jq -e . "${output}" >/dev/null; then
       print -r -- "${output}"
