@@ -12,10 +12,10 @@ use std::{
 };
 
 use akzio_domain::{
-    Artifact, ArtifactKind, ArtifactLifecycle, ArtifactOrigin, ArtifactProvenance, ArtifactRef,
-    Asset, DomainError, EvidenceNeed, PolicySubject, RunId, RunPurpose, RuntimeManifest,
-    TopologyId, WorkflowProposal, STRUCTURED_CRITIQUE_CANDIDATE_TOPOLOGY_ID,
-    V2_DOMAIN_SCHEMA_VERSION,
+    AgentContract, Artifact, ArtifactKind, ArtifactLifecycle, ArtifactOrigin, ArtifactProvenance,
+    ArtifactRef, Asset, CanaryCampaignStatus, CanarySessionReservation, DomainError, EvidenceNeed,
+    PolicySubject, RunId, RunPurpose, RuntimeManifest, TopologyId, WorkflowProposal,
+    STRUCTURED_CRITIQUE_CANDIDATE_TOPOLOGY_ID, V2_DOMAIN_SCHEMA_VERSION,
 };
 use akzio_execution::paper::AlpacaPaper;
 use akzio_ingest::AlpacaMarketDataFeed;
@@ -330,6 +330,48 @@ impl PaperScheduler {
         Ok(self.store.reserve_canary_session(&lease, reservation)?)
     }
 
+    fn paper_snapshot_artifacts(
+        &self,
+        run_id: &RunId,
+        session_key: &str,
+        now: DateTime<Utc>,
+    ) -> SchedulerResult<Vec<Artifact>> {
+        paper_snapshot_resources(session_key)
+            .into_iter()
+            .map(|resource| {
+                let need = EvidenceNeed {
+                    schema_version: V2_DOMAIN_SCHEMA_VERSION,
+                    source_family: "alpaca".to_owned(),
+                    resource,
+                    max_age_secs: 5,
+                };
+                need.validate()?;
+                Ok(Artifact::new(
+                    ArtifactKind::EvidenceNeed,
+                    self.store.put_json(&need)?,
+                    "scheduler.paper_snapshot",
+                    ArtifactLifecycle::RunScoped,
+                    ArtifactProvenance {
+                        source_family: "akzio.scheduler".to_owned(),
+                        observed_at: None,
+                        retrieved_at: now,
+                        source_uri: None,
+                        confidence_ppm: 1_000_000,
+                        producer_contract_hash: None,
+                    },
+                    Some(ArtifactOrigin {
+                        run_id: Some(run_id.clone()),
+                        task_id: None,
+                        attempt_id: None,
+                        contract_hash: None,
+                    }),
+                    Vec::new(),
+                    now,
+                )?)
+            })
+            .collect()
+    }
+
     pub fn reserve_session(
         &self,
         session_key: &str,
@@ -388,38 +430,7 @@ impl PaperScheduler {
         NaiveDate::parse_from_str(session_key, "%Y-%m-%d")
             .map_err(|_| SchedulerError::InvalidSessionKey(session_key.to_owned()))?;
         let lease = self.acquire_or_renew(now)?;
-        let mut setup_artifacts = Vec::new();
-        for resource in paper_snapshot_resources(session_key) {
-            let need = EvidenceNeed {
-                schema_version: V2_DOMAIN_SCHEMA_VERSION,
-                source_family: "alpaca".to_owned(),
-                resource,
-                max_age_secs: 5,
-            };
-            need.validate()?;
-            setup_artifacts.push(Artifact::new(
-                ArtifactKind::EvidenceNeed,
-                self.store.put_json(&need)?,
-                "scheduler.paper_snapshot",
-                ArtifactLifecycle::RunScoped,
-                ArtifactProvenance {
-                    source_family: "akzio.scheduler".to_owned(),
-                    observed_at: None,
-                    retrieved_at: now,
-                    source_uri: None,
-                    confidence_ppm: 1_000_000,
-                    producer_contract_hash: None,
-                },
-                Some(ArtifactOrigin {
-                    run_id: Some(run_id.clone()),
-                    task_id: None,
-                    attempt_id: None,
-                    contract_hash: None,
-                }),
-                Vec::new(),
-                now,
-            )?);
-        }
+        let setup_artifacts = self.paper_snapshot_artifacts(&run_id, session_key, now)?;
         Ok(self.workflow.reserve_approved_paper_session(
             &lease,
             run_id,
@@ -449,6 +460,14 @@ impl PaperScheduler {
                 slot,
                 newly_reserved: false,
             }));
+        }
+        if let Some(campaign) = self.store.active_canary_campaign()? {
+            if campaign.status == CanaryCampaignStatus::Staged {
+                return Ok(None);
+            }
+            if campaign.status.is_level() {
+                return self.tick_canary(&campaign, &session_key, clock, now).await;
+            }
         }
         let Some((runtime_manifest, approval)) = self.current_approval_binding()? else {
             eprintln!("Paper scheduler waiting: no current Paper approval binding");
@@ -579,6 +598,164 @@ impl PaperScheduler {
                     now,
                 )?,
         ))
+    }
+
+    async fn tick_canary<C>(
+        &self,
+        campaign: &akzio_store::v2::CanaryCampaignHead,
+        session_key: &str,
+        clock: &C,
+        now: DateTime<Utc>,
+    ) -> SchedulerResult<Option<SessionSlotReservation>>
+    where
+        C: BrokerSessionClock + ?Sized,
+    {
+        if self
+            .store
+            .canary_session(&campaign.spec.campaign_id, campaign.status)?
+            .is_some()
+        {
+            return Err(SchedulerError::WorkflowUnavailable);
+        }
+        let Some((runtime_manifest, approval)) = self.current_approval_binding()? else {
+            return Ok(None);
+        };
+        let manifest_payload: RuntimeManifest =
+            serde_json::from_slice(&self.store.read_blob(&runtime_manifest.blob)?)?;
+        if let Some(expected) = &self.runtime_identity_hash {
+            if manifest_payload.runtime_identity_hash()? != *expected {
+                return Ok(None);
+            }
+        }
+        let account_id = clock.paper_account_id().await?;
+        if manifest_payload.broker_account_id != account_id
+            || self
+                .market_data_feed
+                .is_some_and(|feed| manifest_payload.market_data_feed != feed.as_str())
+        {
+            return Ok(None);
+        }
+
+        let candidate_artifact = self
+            .store
+            .artifact(&campaign.spec.candidate_contract.artifact_id)?;
+        let candidate: AgentContract =
+            serde_json::from_slice(&self.store.read_blob(&candidate_artifact.blob)?)?;
+        candidate.validate()?;
+        let candidate_installation = self
+            .store
+            .contract_installation(&candidate.contract_hash)?
+            .ok_or(SchedulerError::WorkflowUnavailable)?;
+        if candidate_artifact.kind != ArtifactKind::Contract
+            || candidate_artifact.lifecycle != ArtifactLifecycle::Canonical
+            || candidate.purpose.as_str() != "research.analyst"
+            || candidate.contract_hash == campaign.spec.active_contract_hash
+            || candidate_installation.activated_at.is_some()
+            || candidate_installation.baseline_contract_hash.as_ref()
+                != Some(&campaign.spec.active_contract_hash)
+        {
+            return Err(SchedulerError::WorkflowUnavailable);
+        }
+
+        let candidate_topology_artifact = self
+            .store
+            .artifact(&campaign.spec.candidate_topology.artifact_id)?;
+        let candidate_topology: akzio_domain::WorkflowGraph =
+            serde_json::from_slice(&self.store.read_blob(&candidate_topology_artifact.blob)?)?;
+        candidate_topology.validate()?;
+        if candidate_topology_artifact.kind != ArtifactKind::WorkflowGraph
+            || candidate_topology_artifact.lifecycle != ArtifactLifecycle::RunScoped
+            || candidate_topology.topology_id != STRUCTURED_CRITIQUE_CANDIDATE_TOPOLOGY_ID
+        {
+            return Err(SchedulerError::WorkflowUnavailable);
+        }
+
+        let active_analyst = self
+            .workflow
+            .catalogue()
+            .recipe(&akzio_domain::TaskRecipeId::new("research.analyst")?)?;
+        if active_analyst.contract_hash.as_ref() != Some(&campaign.spec.active_contract_hash) {
+            return Err(SchedulerError::WorkflowUnavailable);
+        }
+
+        let lease = self.acquire_or_renew(now)?;
+        let parent_run_id = RunId::new();
+        let parent_proposal = self.workflow.approved_paper_proposal("active")?;
+        let setup_artifacts = self.paper_snapshot_artifacts(&parent_run_id, session_key, now)?;
+        let parent = self
+            .workflow
+            .reserve_paper_session_with_inputs_for_run_approved(
+                &lease,
+                parent_run_id.clone(),
+                session_key,
+                &parent_proposal,
+                &setup_artifacts,
+                &runtime_manifest,
+                &approval,
+                now,
+            )?;
+        let snapshot_refs = parent
+            .slot
+            .workflow
+            .nodes
+            .iter()
+            .find(|node| node.recipe_id.as_str() == "research.analyst")
+            .map(|node| node.input_artifacts.clone())
+            .ok_or(SchedulerError::WorkflowUnavailable)?;
+
+        let mut contract_proposal = parent_proposal.clone();
+        contract_proposal
+            .tasks
+            .get_mut("analyst")
+            .ok_or(SchedulerError::WorkflowUnavailable)?
+            .evidence_needs = snapshot_refs.clone();
+        let mut topology_proposal = self
+            .workflow
+            .approved_paper_proposal(STRUCTURED_CRITIQUE_CANDIDATE_TOPOLOGY_ID)?;
+        topology_proposal
+            .tasks
+            .get_mut("analyst")
+            .ok_or(SchedulerError::WorkflowUnavailable)?
+            .evidence_needs = snapshot_refs;
+
+        let contract_shadow_run_id = RunId::new();
+        let topology_shadow_run_id = RunId::new();
+        let bundle_shadow_run_id = RunId::new();
+        self.workflow.submit(
+            contract_shadow_run_id.clone(),
+            RunPurpose::Shadow,
+            self.workflow
+                .lower_shadow(&contract_proposal, Some(&candidate.contract_hash))?,
+            now,
+        )?;
+        self.workflow.submit(
+            topology_shadow_run_id.clone(),
+            RunPurpose::Shadow,
+            self.workflow.lower_shadow(&topology_proposal, None)?,
+            now,
+        )?;
+        self.workflow.submit(
+            bundle_shadow_run_id.clone(),
+            RunPurpose::Shadow,
+            self.workflow
+                .lower_shadow(&topology_proposal, Some(&candidate.contract_hash))?,
+            now,
+        )?;
+
+        let reservation = CanarySessionReservation {
+            schema_version: V2_DOMAIN_SCHEMA_VERSION,
+            campaign_id: campaign.spec.campaign_id.clone(),
+            level: campaign.status,
+            session_key: session_key.to_owned(),
+            parent_run_id,
+            contract_shadow_run_id,
+            topology_shadow_run_id,
+            bundle_shadow_run_id,
+            scheduler_epoch: lease.epoch,
+            reserved_at: now,
+        };
+        self.reserve_canary_session(&reservation)?;
+        Ok(Some(parent))
     }
 
     pub async fn serve<C, P>(

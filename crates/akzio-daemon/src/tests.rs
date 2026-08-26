@@ -156,7 +156,7 @@ fn install_test_paper_approval(
         evaluation_policy_hash: ContentHash::of_bytes(b"fixture-evaluation-policy"),
         market_data_feed: "iex".to_owned(),
         broker_account_id: "fixture-paper-account".to_owned(),
-        maximum_notional: MoneyMicros::from_usd_cents(2_000_000),
+        maximum_notional: MoneyMicros::from_usd_cents(100_000),
         allowed_session_start: session,
         allowed_session_end: session,
         expires_at: now + ChronoDuration::hours(8),
@@ -1416,6 +1416,84 @@ fn scheduler_fences_stale_daemon_and_reuses_frozen_session_workflow() {
         Err(DaemonError::Scheduler(SchedulerError::NotLeader))
     ));
     first.store().verify_integrity().unwrap();
+}
+
+#[tokio::test]
+async fn staged_canary_campaign_blocks_paper_scheduler() {
+    let directory = tempdir().unwrap();
+    let daemon = Daemon::with_model(
+        config(directory.path().to_path_buf()),
+        fixture_model_client(),
+    )
+    .unwrap();
+    let now = Utc::now();
+    let (manifest, approval) = install_test_paper_approval(daemon.store(), now.date_naive(), now);
+    let active_contract = daemon
+        .store()
+        .active_contract(&akzio_domain::ContractPurpose::new("research.analyst").unwrap())
+        .unwrap()
+        .unwrap();
+    let candidate_topology = daemon
+        .workflow
+        .submit(
+            RunId::new(),
+            RunPurpose::Debug,
+            daemon
+                .workflow
+                .bootstrap(RunPurpose::Debug, "canary-candidate")
+                .unwrap(),
+            now,
+        )
+        .unwrap();
+    let spec = akzio_domain::CanaryCampaignSpec {
+        schema_version: V2_DOMAIN_SCHEMA_VERSION,
+        campaign_id: ContentHash::of_bytes(b"staged-canary"),
+        active_contract_hash: active_contract.contract.contract_hash.clone(),
+        candidate_contract: ArtifactRef {
+            artifact_id: active_contract.artifact.artifact_id.clone(),
+            kind: ArtifactKind::Contract,
+        },
+        active_topology_id: akzio_domain::TopologyId("paper-fixture".to_owned()),
+        candidate_topology: ArtifactRef {
+            artifact_id: candidate_topology.artifact_id.clone(),
+            kind: ArtifactKind::WorkflowGraph,
+        },
+        runtime_manifest: ArtifactRef {
+            artifact_id: manifest.artifact_id.clone(),
+            kind: ArtifactKind::RuntimeManifest,
+        },
+        paper_approval: ArtifactRef {
+            artifact_id: approval.artifact_id.clone(),
+            kind: ArtifactKind::PaperLaunchApproval,
+        },
+        source_revision: "fixture-revision".to_owned(),
+        maximum_total_notional: MoneyMicros::from_usd_cents(100_000),
+        created_at: now,
+    };
+    let staged = daemon.stage_canary_campaign(spec.clone()).unwrap();
+    assert_eq!(staged.status, akzio_domain::CanaryCampaignStatus::Staged);
+
+    let session_key = now.date_naive().to_string();
+    let clock = StaticSessionClock(Some(session_key.clone()));
+    let source = StaticPaperWorkflowSource::new(paper_proposal());
+    let reservation = daemon
+        .paper
+        .scheduler
+        .tick(&clock, &source, now)
+        .await
+        .unwrap();
+
+    assert!(reservation.is_none());
+    assert!(daemon.store().session_slot(&session_key).unwrap().is_none());
+    assert!(daemon
+        .store()
+        .canary_session(
+            &spec.campaign_id,
+            akzio_domain::CanaryCampaignStatus::Staged
+        )
+        .unwrap()
+        .is_none());
+    daemon.store().verify_integrity().unwrap();
 }
 
 #[tokio::test]
