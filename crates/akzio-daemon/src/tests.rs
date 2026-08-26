@@ -1523,25 +1523,25 @@ async fn canary_scheduler_commits_parent_and_shadow_workflows_atomically() {
             now,
         )
         .unwrap();
+    let mut candidate_graph = daemon
+        .workflow
+        .lower_shadow(
+            &daemon
+                .workflow
+                .approved_paper_proposal(akzio_domain::STRUCTURED_CRITIQUE_CANDIDATE_TOPOLOGY_ID)
+                .unwrap(),
+            None,
+        )
+        .unwrap();
+    candidate_graph
+        .nodes
+        .iter_mut()
+        .find(|node| node.recipe_id.as_str() == akzio_domain::RESEARCH_CRITIC_RECIPE_ID)
+        .unwrap()
+        .objective = "candidate-topology-marker".to_owned();
     let candidate_topology = daemon
         .workflow
-        .submit(
-            RunId::new(),
-            RunPurpose::Shadow,
-            daemon
-                .workflow
-                .lower_shadow(
-                    &daemon
-                        .workflow
-                        .approved_paper_proposal(
-                            akzio_domain::STRUCTURED_CRITIQUE_CANDIDATE_TOPOLOGY_ID,
-                        )
-                        .unwrap(),
-                    None,
-                )
-                .unwrap(),
-            now,
-        )
+        .submit(RunId::new(), RunPurpose::Shadow, candidate_graph, now)
         .unwrap();
     let spec = akzio_domain::CanaryCampaignSpec {
         schema_version: V2_DOMAIN_SCHEMA_VERSION,
@@ -1617,6 +1617,15 @@ async fn canary_scheduler_commits_parent_and_shadow_workflows_atomically() {
             .unwrap(),
         RunPurpose::Shadow
     );
+    assert!(daemon
+        .store()
+        .workflow_snapshot(&stored_canary.reservation.topology_shadow_run_id)
+        .unwrap()
+        .revision
+        .graph
+        .nodes
+        .iter()
+        .any(|node| node.objective == "candidate-topology-marker"));
     daemon.store().verify_integrity().unwrap();
 }
 
