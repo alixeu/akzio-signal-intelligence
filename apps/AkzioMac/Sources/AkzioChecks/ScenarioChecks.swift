@@ -281,6 +281,7 @@ func runScenarioChecks() {
                 scenario.reduceMotionPreferred,
                 "\(scenario.code) reduce-motion override"
             )
+            Check.equal(settings.glassTransparency, 0.5, "\(scenario.code) glass transparency")
         }
     }
 }

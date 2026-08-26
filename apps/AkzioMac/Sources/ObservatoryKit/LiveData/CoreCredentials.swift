@@ -216,16 +216,6 @@ enum CoreRuntimePaths {
         return candidate
     }
 
-    private static func legacyStoreURL() throws -> URL {
-        let base = try FileManager.default.url(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask,
-            appropriateFor: nil,
-            create: false
-        )
-        return base.appending(path: "Akzio/Store/schema-11", directoryHint: .isDirectory)
-    }
-
     private static func initializeConfiguration(at config: URL) throws {
         let process = Process()
         process.executableURL = try executableURL()
@@ -235,7 +225,6 @@ enum CoreRuntimePaths {
             "init",
             "--template", try bundledConfigURL().path,
             "--store-root", try storeURL().path,
-            "--legacy-store", try legacyStoreURL().path,
         ]
         let stdout = Pipe()
         let stderr = Pipe()

@@ -65,10 +65,10 @@ struct ModelGalleryView: View {
         }
         .padding(AkzioLayout.s2)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(
-            RoundedRectangle(cornerRadius: AkzioLayout.chipRadius, style: .continuous)
-                .fill(distance == 0 ? AkzioColor.elevatedSurface : AkzioColor.deepBackground)
-        )
+            .akzioGlassBackdrop(
+                distance == 0 ? AkzioColor.elevatedSurface : AkzioColor.deepBackground,
+                radius: AkzioLayout.chipRadius
+            )
         .overlay(
             RoundedRectangle(cornerRadius: AkzioLayout.chipRadius, style: .continuous)
                 .strokeBorder(distance == 0 ? AkzioColor.goldHairline : AkzioColor.hairline, lineWidth: 1)

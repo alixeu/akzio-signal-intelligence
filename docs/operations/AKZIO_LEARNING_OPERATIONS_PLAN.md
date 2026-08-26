@@ -42,8 +42,8 @@ printf '%s\n' '{
   "conflicts_with": [],
   "confidence_ppm": 700000,
   "authored_by": "operator:alice"
-}' | cargo run -p akzio-cli --bin lesson -- \
-  --store-root outputs/akzio-v2-rebuild add
+}' | AKZIO_STORE_ROOT=outputs/akzio-v2-rebuild \
+  cargo run -p akzio-cli -- store lesson add
 ```
 
 `add` 原子写入 source artifact 和 Lesson，初始生命周期总是 `Draft`。输出中的 `lesson.lesson_id` 用于生命周期命令；输出中的 `artifact.artifact_id` 用于后续 `supersedes` 或 `conflicts_with`。
@@ -51,17 +51,18 @@ printf '%s\n' '{
 ### 2.2 审核和维护
 
 ```bash
-cargo run -p akzio-cli --bin lesson -- --store-root outputs/akzio-v2-rebuild \
-  list --lifecycle draft
+AKZIO_STORE_ROOT=outputs/akzio-v2-rebuild \
+  cargo run -p akzio-cli -- store lesson list --lifecycle draft
 
-cargo run -p akzio-cli --bin lesson -- --store-root outputs/akzio-v2-rebuild \
-  approve <lesson_id> --actor operator:alice --reason "人工审核通过"
+AKZIO_STORE_ROOT=outputs/akzio-v2-rebuild \
+  cargo run -p akzio-cli -- store lesson approve <lesson_id> \
+  --actor operator:alice --reason "人工审核通过"
 
-cargo run -p akzio-cli --bin lesson -- --store-root outputs/akzio-v2-rebuild \
-  show <lesson_id>
+AKZIO_STORE_ROOT=outputs/akzio-v2-rebuild \
+  cargo run -p akzio-cli -- store lesson show <lesson_id>
 
-cargo run -p akzio-cli --bin lesson -- --store-root outputs/akzio-v2-rebuild \
-  usage <lesson_id>
+AKZIO_STORE_ROOT=outputs/akzio-v2-rebuild \
+  cargo run -p akzio-cli -- store lesson usage <lesson_id>
 ```
 
 有证据冲突时使用 `contest`；规则失效时使用 `retire`。不直接修改历史 JSON，不删除 canonical artifact。

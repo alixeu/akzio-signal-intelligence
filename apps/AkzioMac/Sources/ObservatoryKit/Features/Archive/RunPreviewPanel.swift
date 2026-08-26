@@ -184,10 +184,7 @@ struct RunPreviewPanel: View {
                 }
                 .frame(maxWidth: .infinity)
                 .frame(height: 28)
-                .background(
-                    RoundedRectangle(cornerRadius: AkzioLayout.chipRadius, style: .continuous)
-                        .fill(AkzioColor.deepBackground)
-                )
+                .akzioGlassBackdrop(AkzioColor.deepBackground, radius: AkzioLayout.chipRadius)
                 .overlay(
                     RoundedRectangle(cornerRadius: AkzioLayout.chipRadius, style: .continuous)
                         .strokeBorder(AkzioColor.hairline, lineWidth: 1)

@@ -59,7 +59,7 @@ struct AppearanceSection: View {
                     "Transparency",
                     detail: "Higher lets more of the page through.",
                     value: $settings.glassTransparency,
-                    range: 0.10...0.40
+                    range: 0.10...0.50
                 )
             }
         }
@@ -120,10 +120,7 @@ struct ThemePreviewTile: View {
         }
         .frame(height: 116)
         .frame(maxWidth: .infinity)
-        .background(
-            RoundedRectangle(cornerRadius: AkzioLayout.cardRadius, style: .continuous)
-                .fill(AkzioColor.background(for: theme))
-        )
+        .akzioGlassBackdrop(AkzioColor.background(for: theme), radius: AkzioLayout.cardRadius)
         .overlay(
             RoundedRectangle(cornerRadius: AkzioLayout.cardRadius, style: .continuous)
                 .strokeBorder(AkzioColor.hairline, lineWidth: 1)

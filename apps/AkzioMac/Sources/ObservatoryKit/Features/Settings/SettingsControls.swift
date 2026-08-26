@@ -166,9 +166,7 @@ struct SettingsSegmented<Value: Hashable>: View {
                 }
             }
             .padding(2)
-            .background(
-                Capsule(style: .continuous).fill(AkzioColor.deepBackground)
-            )
+        .akzioGlassBackdrop(AkzioColor.deepBackground, radius: 99)
         }
     }
 }

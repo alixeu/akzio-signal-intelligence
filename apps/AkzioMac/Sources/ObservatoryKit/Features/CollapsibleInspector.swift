@@ -59,10 +59,7 @@ struct CollapsibleInspector<Content: View>: View {
             .foregroundStyle(presented ? AkzioColor.primaryGold : AkzioColor.secondaryText)
             .frame(width: 34)
             .padding(.vertical, AkzioLayout.s3)
-            .background(
-                RoundedRectangle(cornerRadius: AkzioLayout.cardRadius, style: .continuous)
-                    .fill(AkzioColor.raisedSurface)
-            )
+            .akzioGlassBackdrop(AkzioColor.raisedSurface, radius: AkzioLayout.cardRadius)
             .overlay(
                 RoundedRectangle(cornerRadius: AkzioLayout.cardRadius, style: .continuous)
                     .strokeBorder(
@@ -81,7 +78,7 @@ struct CollapsibleInspector<Content: View>: View {
                     .padding(AkzioLayout.s2)
             }
             .frame(width: width + AkzioLayout.s4, height: 460)
-            .background(AkzioColor.raisedSurface)
+            .akzioGlassBackdrop(AkzioColor.raisedSurface, radius: AkzioLayout.cardRadius)
         }
     }
 }

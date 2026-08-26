@@ -63,8 +63,7 @@ struct IntelligencePage: View {
                                 .textSelection(.enabled)
                         }
                         .padding(AkzioLayout.s2)
-                        .background(AkzioColor.deepBackground.opacity(0.58))
-                        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                        .akzioGlassBackdrop(AkzioColor.deepBackground, radius: 8)
                     }
                 }
             }

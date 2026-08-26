@@ -194,10 +194,7 @@ struct RunArchivePage: View {
         }
         .padding(AkzioLayout.s3)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(
-            RoundedRectangle(cornerRadius: AkzioLayout.cardRadius, style: .continuous)
-                .fill(AkzioColor.raisedSurface)
-        )
+        .akzioGlassBackdrop(AkzioColor.raisedSurface, radius: AkzioLayout.cardRadius)
         .overlay(
             RoundedRectangle(cornerRadius: AkzioLayout.cardRadius, style: .continuous)
                 .strokeBorder(isSelected ? AkzioColor.goldHairline : AkzioColor.hairline, lineWidth: 1)

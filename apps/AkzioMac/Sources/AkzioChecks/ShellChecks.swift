@@ -10,7 +10,7 @@ func runShellChecks() {
         Check.equal(AppRoute.primary.count, 7, "primary route count")
         Check.equal(
             WindowChromeLayout.buttonOriginY(containerHeight: 32, buttonHeight: 14),
-            3,
+            0,
             "native traffic lights align with the 44pt sidebar toolbar"
         )
         Check.expect(

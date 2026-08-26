@@ -6,7 +6,6 @@ import SwiftUI
 // then the routes used to inspect the live Core.
 struct PageSidebar: View {
     let route: AppRoute
-    let run: RunPresentation
     let onSelect: (AppRoute) -> Void
     let onOpenSettings: () -> Void
 
@@ -22,8 +21,6 @@ struct PageSidebar: View {
             sectionLabel("SYSTEM")
             row(.scenarioGallery)
             settingsRow
-            HairlineDivider().padding(.vertical, AkzioLayout.s2)
-            footer
         }
         .padding(.horizontal, AkzioLayout.s2)
         .padding(.bottom, AkzioLayout.s3)
@@ -31,7 +28,7 @@ struct PageSidebar: View {
             width: AkzioLayout.sidebarWidth,
             alignment: .leading
         )
-        .background(AkzioColor.raisedSurface)
+        .akzioGlassBackdrop(AkzioColor.raisedSurface)
         .overlay(alignment: .trailing) { HairlineDivider(.vertical) }
     }
 
@@ -121,30 +118,4 @@ struct PageSidebar: View {
         .help(L10n.text("Settings", language: language))
     }
 
-    private var footer: some View {
-        VStack(spacing: 6) {
-            footerRow(
-                "Market",
-                run.marketOpen
-                    ? L10n.text("Market Open", language: language)
-                    : L10n.text("Market Closed", language: language),
-                run.marketOpen ? .gold : .muted
-            )
-            footerRow(
-                "Data",
-                run.dataStale ? MissingValue.unavailable.rawValue : L10n.text("Data Live", language: language),
-                run.dataStale ? .coral : .gold
-            )
-            footerRow("Latency", PpmFormatter.latency(millis: run.latencyMillis), .muted)
-        }
-        .padding(.horizontal, AkzioLayout.s2)
-    }
-
-    private func footerRow(_ label: String, _ value: String, _ tone: AkzioTone) -> some View {
-        HStack(spacing: 6) {
-            Text(L10n.text(label, language: language)).akzioText(.caption)
-            Spacer(minLength: 4)
-            Text(value).akzioMono(10, color: tone.color)
-        }
-    }
 }

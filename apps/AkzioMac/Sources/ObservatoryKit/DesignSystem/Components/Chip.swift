@@ -116,10 +116,7 @@ public struct AkzioSegmentedControl<Value: Hashable>: View {
             }
         }
         .padding(2)
-        .background(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(AkzioColor.deepBackground.opacity(0.6))
-        )
+    .akzioGlassBackdrop(AkzioColor.deepBackground, radius: 8)
         .overlay(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .strokeBorder(AkzioColor.hairline, lineWidth: AkzioLayout.hairlineWidth)

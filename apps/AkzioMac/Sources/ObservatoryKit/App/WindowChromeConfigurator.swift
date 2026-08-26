@@ -3,7 +3,7 @@ import SwiftUI
 
 public enum WindowChromeLayout {
     public static func buttonOriginY(containerHeight: CGFloat, buttonHeight: CGFloat) -> CGFloat {
-        max(0, containerHeight - AkzioLayout.statusBarHeight / 2 - buttonHeight / 2)
+        max(0, containerHeight - AkzioLayout.statusBarHeight / 2 - buttonHeight / 2 - 3)
     }
 }
 
@@ -28,6 +28,8 @@ private final class ChromeProbeView: NSView {
         window.titleVisibility = .hidden
         window.titlebarAppearsTransparent = true
         window.titlebarSeparatorStyle = .none
+        window.isOpaque = false
+        window.backgroundColor = .clear
         window.isMovableByWindowBackground = true
 
         for kind in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {

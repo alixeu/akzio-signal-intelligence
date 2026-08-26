@@ -88,7 +88,8 @@ struct DetachedRunWindow: View {
         }
         .padding(AkzioLayout.s5)
         .frame(minWidth: 680, minHeight: 500)
-        .background(AkzioColor.background(for: .dark))
+        .akzioGlassBackdrop(AkzioColor.background(for: .dark))
+        .background(WindowChromeConfigurator())
         .preferredColorScheme(.dark)
     }
 

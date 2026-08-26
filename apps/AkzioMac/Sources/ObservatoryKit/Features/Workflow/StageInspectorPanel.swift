@@ -231,7 +231,7 @@ struct AnalysisRecordRow: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .background {
             ZStack {
-                AkzioColor.raisedSurface
+                AkzioColor.raisedSurface.opacity(0.50)
                 accent.opacity(record.kind == .tool ? 0.025 : 0.075)
             }
         }

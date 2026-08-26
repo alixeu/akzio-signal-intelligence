@@ -36,7 +36,7 @@ private struct HighContrastKey: EnvironmentKey { static let defaultValue = false
 private struct CompactLayoutKey: EnvironmentKey { static let defaultValue = false }
 private struct ColorIndependentStatusKey: EnvironmentKey { static let defaultValue = true }
 private struct GlassIntensityKey: EnvironmentKey { static let defaultValue = GlassIntensity.medium }
-private struct GlassTransparencyKey: EnvironmentKey { static let defaultValue = 0.4 }
+private struct GlassTransparencyKey: EnvironmentKey { static let defaultValue = 0.5 }
 private struct ReduceTransparencyOverrideKey: EnvironmentKey { static let defaultValue = false }
 
 extension EnvironmentValues {
@@ -50,7 +50,7 @@ extension EnvironmentValues {
         set { self[GlassIntensityKey.self] = newValue }
     }
 
-    /// 0.10–0.40 from Settings; higher means more see-through.
+    /// 0.10–0.50 from Settings; higher means more see-through.
     public var glassTransparency: Double {
         get { self[GlassTransparencyKey.self] }
         set { self[GlassTransparencyKey.self] = newValue }
@@ -102,9 +102,7 @@ struct GlassSurfaceModifier: ViewModifier {
             variant = .regular
         }
 
-        // Keep the default card essentially untinted. Only an explicitly low
-        // transparency setting adds a restrained dark tint for legibility.
-        let tintOpacity = max(0, min(0.05, (0.28 - transparency) * 0.18))
+        let tintOpacity = max(0.50, min(0.90, 1 - transparency))
         return variant.tint(AkzioColor.deepBackground.opacity(tintOpacity))
     }
 
@@ -169,6 +167,36 @@ struct GlassSurfaceModifier: ViewModifier {
     }
 }
 
+private struct GlassBackdropModifier: ViewModifier {
+    let tint: Color
+    let radius: CGFloat
+
+    @Environment(\.insideGlass) private var insideGlass
+    @Environment(\.glassTransparency) private var transparency
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.akzioReduceTransparencyOverride) private var reduceTransparencyOverride
+    @Environment(\.akzioHighContrast) private var highContrast
+    @Environment(\.akzioRendersOffscreen) private var rendersOffscreen
+
+    private var surfaceOpacity: Double {
+        max(0.50, min(0.90, 1 - transparency))
+    }
+
+    func body(content: Content) -> some View {
+        let shape = RoundedRectangle(cornerRadius: radius, style: .continuous)
+
+        content.background {
+            if reduceTransparency || reduceTransparencyOverride || highContrast || rendersOffscreen || insideGlass {
+                shape.fill(tint)
+            } else {
+                shape
+                    .fill(tint.opacity(surfaceOpacity))
+                    .glassEffect(.regular, in: shape)
+            }
+        }
+    }
+}
+
 enum GlassAudit {
     nonisolated(unsafe) private static var reported = Set<String>()
 
@@ -183,5 +211,9 @@ enum GlassAudit {
 extension View {
     public func akzioGlass(_ level: GlassLevel, radius: CGFloat = AkzioLayout.cardRadius) -> some View {
         modifier(GlassSurfaceModifier(level: level, radius: radius))
+    }
+
+    public func akzioGlassBackdrop(_ tint: Color, radius: CGFloat = 0) -> some View {
+        modifier(GlassBackdropModifier(tint: tint, radius: radius))
     }
 }

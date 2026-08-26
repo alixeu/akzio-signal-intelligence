@@ -54,7 +54,6 @@ public struct AppShell: View {
                 HStack(alignment: .top, spacing: 0) {
                     PageSidebar(
                     route: store.route,
-                    run: store.displayRun,
                     onSelect: { store.navigate(to: $0) },
                         onOpenSettings: store.toggleSettings
                     )
@@ -88,7 +87,7 @@ public struct AppShell: View {
             .frame(width: proxy.size.width, height: proxy.size.height)
         }
         .frame(minWidth: 1280)
-        .background(AkzioColor.background(for: store.settings.theme))
+        .akzioGlassBackdrop(AkzioColor.background(for: store.settings.theme))
         .animation(store.motionPolicy.resolve(Motion.themeCrossfade), value: store.settings.theme)
         .environment(\.sharedNamespace, shared)
         .environment(\.appLanguage, store.settings.language)

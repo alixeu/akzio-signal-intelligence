@@ -8,6 +8,7 @@
 # Local runtime outputs
 /report/
 /outputs/
+/tmp/
 /config/local*.yaml
 /config/*.local.yaml
 /config/*.local.toml
