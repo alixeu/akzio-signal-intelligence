@@ -82,6 +82,7 @@ fn catalogue() -> RecipeCatalogue {
             recipe("research.planner", RuntimeTaskClass::Agent, true),
             analyst,
             recipe("research.critic", RuntimeTaskClass::Agent, true),
+            recipe("research.synthesizer", RuntimeTaskClass::Agent, true),
             recipe("gate.evidence", RuntimeTaskClass::Evidence, false),
             recipe("gate.decision", RuntimeTaskClass::DecisionGate, false),
             recipe("gate.execution", RuntimeTaskClass::ExecutionGate, false),
@@ -249,6 +250,32 @@ fn structured_critique_requires_material_uncertainty_or_opposed_stances() {
     let bullish = claim(ClaimStance::Bullish, 1, 1_000_000, false);
     let bearish = claim(ClaimStance::Bearish, 1, 1_000_000, false);
     assert!(should_run_structured_critique(&[bullish, bearish]));
+}
+
+#[test]
+fn approved_candidate_topology_adds_one_structured_critic() {
+    let root = tempdir().unwrap();
+    let mut recipes = catalogue();
+    recipes
+        .recipes
+        .get_mut(&TaskRecipeId::new(ANALYST_RECIPE_ID).unwrap())
+        .unwrap()
+        .max_depth = 2;
+    let runtime = WorkflowRuntime::new(V2Store::open(root.path()).unwrap(), recipes);
+
+    let proposal = runtime
+        .approved_paper_proposal(STRUCTURED_CRITIQUE_CANDIDATE_TOPOLOGY_ID)
+        .unwrap();
+
+    assert_eq!(proposal.tasks.len(), 3);
+    assert_eq!(
+        proposal.tasks["structured_critic"].depends_on,
+        vec!["analyst".to_owned()]
+    );
+    assert_eq!(
+        proposal.tasks["synthesizer"].depends_on,
+        vec!["structured_critic".to_owned()]
+    );
 }
 
 #[test]

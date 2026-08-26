@@ -8,10 +8,10 @@ use std::{
 
 use akzio_domain::{
     Artifact, ArtifactKind, ArtifactLifecycle, ArtifactOrigin, ArtifactProvenance, ArtifactRef,
-    Asset, AttemptId, ClaimStance, ContractPurpose, DomainError, EvidenceNeed, FailureDisposition,
-    LifecycleEventType, ResearchClaim, RetryPolicy, RunId, RunPurpose, RuntimeTaskClass,
-    TaskBudget, TaskId, TaskRecipe, TaskRecipeId, TaskStatus, WorkflowGraph, WorkflowNode,
-    WorkflowProposal, WorkflowProposalDraft, WorkflowProposalTask, WorkflowStatus,
+    Asset, AttemptId, ClaimStance, ContentHash, ContractPurpose, DomainError, EvidenceNeed,
+    FailureDisposition, LifecycleEventType, ResearchClaim, RetryPolicy, RunId, RunPurpose,
+    RuntimeTaskClass, TaskBudget, TaskId, TaskRecipe, TaskRecipeId, TaskStatus, WorkflowGraph,
+    WorkflowNode, WorkflowProposal, WorkflowProposalDraft, WorkflowProposalTask, WorkflowStatus,
     STRUCTURED_CRITIQUE_CANDIDATE_TOPOLOGY_ID, V2_DOMAIN_SCHEMA_VERSION,
 };
 use akzio_store::v2::{

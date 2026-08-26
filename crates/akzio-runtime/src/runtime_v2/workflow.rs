@@ -252,15 +252,16 @@ impl WorkflowRuntime {
         &self,
         topology_id: impl Into<String>,
     ) -> RuntimeResult<WorkflowProposal> {
+        let topology_id = topology_id.into();
         let analyst = self
             .catalogue
             .recipe(&TaskRecipeId::new(ANALYST_RECIPE_ID)?)?;
         let synthesizer = self
             .catalogue
             .recipe(&TaskRecipeId::new(SYNTHESIZER_RECIPE_ID)?)?;
-        let proposal = WorkflowProposal {
+        let mut proposal = WorkflowProposal {
             schema_version: V2_DOMAIN_SCHEMA_VERSION,
-            topology_id: topology_id.into(),
+            topology_id: topology_id.clone(),
             tasks: BTreeMap::from([
                 (
                     "analyst".to_owned(),
@@ -287,6 +288,27 @@ impl WorkflowRuntime {
             ]),
             stop_reason: Some("rust-approved Paper provisioning".to_owned()),
         };
+        if topology_id == STRUCTURED_CRITIQUE_CANDIDATE_TOPOLOGY_ID {
+            let critic = self
+                .catalogue
+                .recipe(&TaskRecipeId::new(CRITIC_RECIPE_ID)?)?;
+            proposal.tasks.insert(
+                "structured_critic".to_owned(),
+                akzio_domain::WorkflowProposalTask {
+                    recipe_id: critic.recipe_id.clone(),
+                    objective: "Critique approved Paper analyst claims before synthesis."
+                        .to_owned(),
+                    depends_on: vec!["analyst".to_owned()],
+                    priority: critic.priority_ceiling,
+                    evidence_needs: Vec::new(),
+                },
+            );
+            proposal
+                .tasks
+                .get_mut("synthesizer")
+                .expect("approved Paper proposal always has synthesizer")
+                .depends_on = vec!["structured_critic".to_owned()];
+        }
         proposal.validate(&self.catalogue.recipes)?;
         self.validate_proposal_limits(&proposal)?;
         Ok(proposal)

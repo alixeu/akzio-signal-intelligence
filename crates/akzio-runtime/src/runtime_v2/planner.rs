@@ -13,6 +13,26 @@ impl WorkflowRuntime {
         self.with_terminal_gates(purpose, proposal.topology_id.clone(), nodes)
     }
 
+    pub fn lower_shadow(
+        &self,
+        proposal: &WorkflowProposal,
+        candidate_contract_hash: Option<&ContentHash>,
+    ) -> RuntimeResult<WorkflowGraph> {
+        let mut graph = self.lower(RunPurpose::Shadow, proposal)?;
+        if let Some(candidate_contract_hash) = candidate_contract_hash {
+            for node in graph
+                .nodes
+                .iter_mut()
+                .filter(|node| node.recipe_id.as_str() == ANALYST_RECIPE_ID)
+            {
+                node.contract_hash = Some(candidate_contract_hash.clone());
+            }
+        }
+        graph.validate()?;
+        self.validate_compiled_graph(RunPurpose::Shadow, &graph)?;
+        Ok(graph)
+    }
+
     /// Applies a Planner proposal to a bootstrap graph. It adds all research nodes
     /// and then one immutable terminal chain; a later Planner cannot patch gates.
     pub fn apply_planner_output(
@@ -351,7 +371,28 @@ impl WorkflowRuntime {
         let mut research = Vec::new();
         for node in &graph.nodes {
             let recipe = self.catalogue.recipe(&node.recipe_id)?;
-            if node.contract_hash != recipe.contract_hash
+            let candidate_contract = if purpose == RunPurpose::Shadow {
+                node.contract_hash
+                    .as_ref()
+                    .filter(|hash| recipe.contract_hash.as_ref() != Some(*hash))
+                    .map(|hash| self.store.contract_installation(hash))
+                    .transpose()?
+                    .flatten()
+                    .filter(|stored| {
+                        stored.activated_at.is_none()
+                            && stored.baseline_contract_hash.as_ref()
+                                == recipe.contract_hash.as_ref()
+                            && stored.contract.purpose == recipe.purpose
+                            && stored.contract.budget == recipe.budget
+                            && stored.contract.retry == recipe.retry
+                            && stored.contract.on_failure == recipe.on_failure
+                            && stored.contract.termination.max_child_tasks == recipe.max_children
+                            && stored.contract.termination.max_depth == recipe.max_depth
+                    })
+            } else {
+                None
+            };
+            if (node.contract_hash != recipe.contract_hash && candidate_contract.is_none())
                 || node.budget != recipe.budget
                 || node.retry != recipe.retry
                 || node.on_failure != recipe.on_failure
